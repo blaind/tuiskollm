@@ -11,7 +11,7 @@ const DTYPE: &str = "bfloat16";
 
 #[derive(Debug, Deserialize)]
 struct ModelConfig {
-    architectures: [String; 1],
+    architectures: Vec<String>,
     dtype: String,
     head_dim: usize,
     language_model_only: bool,
@@ -55,6 +55,8 @@ pub fn validate_config<A: Arch>(path: &Path) -> CheckpointResult<()> {
 }
 
 fn validate<A: Arch>(path: &Path, config: &ModelConfig) -> CheckpointResult<()> {
+    require(path, "architectures length", config.architectures.len(), 1)?;
+
     require(
         path,
         "architectures[0]",
@@ -330,6 +332,36 @@ mod tests {
                 .to_string();
 
             assert!(error.contains(field), "{error}");
+
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_architecture_cardinality_with_field_context() {
+        for (label, architectures, count) in [
+            ("no-architectures", json!([]), 0),
+            (
+                "multiple-architectures",
+                json!(["Qwen3_5ForConditionalGeneration", "OtherArchitecture"]),
+                2,
+            ),
+        ] {
+            let mut config = valid_config();
+            config["architectures"] = architectures;
+            let path = write_config(label, &config);
+
+            let error = validate_config::<Qwen38_27B>(&path)
+                .err()
+                .unwrap()
+                .to_string();
+
+            assert!(
+                error.contains(&format!(
+                    "config field `architectures length` is {count}, expected 1"
+                )),
+                "{error}"
+            );
 
             fs::remove_file(path).unwrap();
         }
