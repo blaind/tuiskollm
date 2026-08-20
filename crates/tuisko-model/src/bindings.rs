@@ -232,7 +232,11 @@ fn require_adjacent(
     Ok(())
 }
 
-fn validate_nvfp4_scales(layer: usize, role: &str, scales: &[u8]) -> CheckpointResult<()> {
+pub(crate) fn validate_nvfp4_scales(
+    layer: usize,
+    role: &str,
+    scales: &[u8],
+) -> CheckpointResult<()> {
     if scales
         .iter()
         .any(|&scale| scale & 0x80 != 0 || scale == 0x7f)
