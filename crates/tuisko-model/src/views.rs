@@ -191,14 +191,14 @@ fn validate<'a, const RANK: usize>(
     expected_shape: [u64; RANK],
 ) -> CheckpointResult<ValidatedView<'a, RANK>> {
     if tensor.dtype != expected_dtype {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::tensor(format!(
             "tensor `{}` has dtype `{}`, expected `{expected_dtype}`",
             tensor.name, tensor.dtype
         )));
     }
 
     if tensor.shape != expected_shape {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::tensor(format!(
             "tensor `{}` has shape {:?}, expected {expected_shape:?}",
             tensor.name, tensor.shape
         )));
@@ -206,23 +206,23 @@ fn validate<'a, const RANK: usize>(
 
     let elements = expected_shape.iter().try_fold(1u64, |count, &dimension| {
         count.checked_mul(dimension).ok_or_else(|| {
-            CheckpointError::invalid(format!("tensor `{}` shape overflows", tensor.name))
+            CheckpointError::tensor(format!("tensor `{}` shape overflows", tensor.name))
         })
     })?;
     let expected_bytes = elements
         .checked_mul(expected_dtype.byte_width())
         .ok_or_else(|| {
-            CheckpointError::invalid(format!("tensor `{}` byte length overflows", tensor.name))
+            CheckpointError::tensor(format!("tensor `{}` byte length overflows", tensor.name))
         })?;
     let actual_bytes = u64::try_from(tensor.bytes.len()).map_err(|_| {
-        CheckpointError::invalid(format!(
+        CheckpointError::tensor(format!(
             "tensor `{}` is too large for this host",
             tensor.name
         ))
     })?;
 
     if actual_bytes != expected_bytes {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::tensor(format!(
             "tensor `{}` has {actual_bytes} bytes, expected {expected_bytes}",
             tensor.name
         )));
@@ -238,7 +238,7 @@ fn validate<'a, const RANK: usize>(
 #[cfg(test)]
 mod tests {
     use super::{Bf16View, F32View, Fp8E4M3View, U8View};
-    use crate::{DType, TensorView};
+    use crate::{CheckpointErrorCode, DType, TensorView};
 
     #[test]
     fn bf16_words_preserve_little_endian_source_bits() {
@@ -275,17 +275,21 @@ mod tests {
             data_range: 0..2,
         };
 
-        let dtype_error = Fp8E4M3View::bind(wrong_dtype, [2])
-            .err()
-            .unwrap()
-            .to_string();
-        let shape_error = Fp8E4M3View::bind(wrong_shape, [1, 2])
-            .err()
-            .unwrap()
-            .to_string();
+        let dtype_error = Fp8E4M3View::bind(wrong_dtype, [2]).err().unwrap();
+        let shape_error = Fp8E4M3View::bind(wrong_shape, [1, 2]).err().unwrap();
 
-        assert!(dtype_error.contains("dtype `U8`, expected `F8_E4M3`"));
-        assert!(shape_error.contains("shape [2], expected [1, 2]"));
+        assert_eq!(dtype_error.code(), CheckpointErrorCode::Tensor);
+        assert_eq!(shape_error.code(), CheckpointErrorCode::Tensor);
+        assert!(
+            dtype_error
+                .to_string()
+                .contains("dtype `U8`, expected `F8_E4M3`")
+        );
+        assert!(
+            shape_error
+                .to_string()
+                .contains("shape [2], expected [1, 2]")
+        );
     }
 
     #[test]

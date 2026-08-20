@@ -74,7 +74,7 @@ impl<A: Arch> CheckpointSnapshot<A> {
         match self.tensors.get(name) {
             Some(Shard::Model) => self.model.tensor(name),
             Some(Shard::Mtp) => self.mtp.tensor(name),
-            None => Err(CheckpointError::invalid(format!(
+            None => Err(CheckpointError::tensor(format!(
                 "{} index is missing tensor `{name}`",
                 self.root.join(INDEX_FILE).display()
             ))),
@@ -97,7 +97,7 @@ impl<A: Arch> CheckpointSnapshot<A> {
         let total_bytes = spec
             .model_bytes
             .checked_add(spec.mtp_bytes)
-            .ok_or_else(|| CheckpointError::invalid("checkpoint shard lengths overflow"))?;
+            .ok_or_else(|| CheckpointError::inventory("checkpoint shard lengths overflow"))?;
 
         require_count(
             &index_path,
@@ -139,7 +139,7 @@ fn validate_revision<A: Arch>(root: &Path) -> CheckpointResult<()> {
     let actual = root.file_name().and_then(|name| name.to_str());
 
     if actual != Some(A::REVISION) {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::revision(format!(
             "{} is revision {actual:?}, expected {:?}",
             root.display(),
             A::REVISION
@@ -155,7 +155,7 @@ fn validate_file_length(path: &Path, expected: u64) -> CheckpointResult<()> {
         .len();
 
     if actual != expected {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::inventory(format!(
             "{} has {actual} bytes, expected {expected}",
             path.display()
         )));
@@ -167,10 +167,7 @@ fn validate_file_length(path: &Path, expected: u64) -> CheckpointResult<()> {
 fn read_index(path: &Path) -> CheckpointResult<Index> {
     let bytes = fs::read(path).map_err(|source| CheckpointError::io("reading", path, source))?;
 
-    serde_json::from_slice(&bytes).map_err(|source| CheckpointError::Json {
-        path: path.to_owned(),
-        source,
-    })
+    serde_json::from_slice(&bytes).map_err(|source| CheckpointError::json(path, source))
 }
 
 fn validate_weight_map(
@@ -197,7 +194,7 @@ fn validate_weight_map(
                 Shard::Mtp
             }
             _ => {
-                return Err(CheckpointError::invalid(format!(
+                return Err(CheckpointError::inventory(format!(
                     "{} maps tensor `{name}` to unsupported shard `{file}`",
                     index_path.display()
                 )));
@@ -218,7 +215,7 @@ where
     T: Copy + std::fmt::Display + PartialEq,
 {
     if actual != expected {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::inventory(format!(
             "{} {field} is {actual}, expected {expected}",
             path.display()
         )));
@@ -230,7 +227,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{CheckpointSnapshot, INDEX_FILE, InventorySpec, MODEL_FILE, MTP_FILE};
-    use crate::Arch;
+    use crate::{Arch, CheckpointErrorCode};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use std::fs::{self, File};
@@ -413,10 +410,10 @@ mod tests {
 
         let error = CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, fixture.spec)
             .err()
-            .unwrap()
-            .to_string();
+            .unwrap();
 
-        assert!(error.contains("model.safetensors has"));
+        assert_eq!(error.code(), CheckpointErrorCode::Inventory);
+        assert!(error.to_string().contains("model.safetensors has"));
     }
 
     #[test]
@@ -436,10 +433,10 @@ mod tests {
         ] {
             let error = CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, spec)
                 .err()
-                .unwrap()
-                .to_string();
+                .unwrap();
 
-            assert!(error.contains(field), "{error}");
+            assert_eq!(error.code(), CheckpointErrorCode::Inventory);
+            assert!(error.to_string().contains(field), "{error}");
         }
     }
 
@@ -466,10 +463,14 @@ mod tests {
 
         let error = CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, fixture.spec)
             .err()
-            .unwrap()
-            .to_string();
+            .unwrap();
 
-        assert!(error.contains("model.safetensors is missing tensor `mtp.a`"));
+        assert_eq!(error.code(), CheckpointErrorCode::Tensor);
+        assert!(
+            error
+                .to_string()
+                .contains("model.safetensors is missing tensor `mtp.a`")
+        );
     }
 
     #[test]
@@ -479,9 +480,9 @@ mod tests {
 
         let error = CheckpointSnapshot::<TestArch>::open_with_spec(&root, fixture.spec)
             .err()
-            .unwrap()
-            .to_string();
+            .unwrap();
 
-        assert!(error.contains("expected \"test-revision\""));
+        assert_eq!(error.code(), CheckpointErrorCode::Revision);
+        assert!(error.to_string().contains("expected \"test-revision\""));
     }
 }

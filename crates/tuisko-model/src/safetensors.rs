@@ -38,7 +38,7 @@ impl SafeTensorFile {
             .len();
 
         if file_len < 8 {
-            return Err(CheckpointError::invalid(format!(
+            return Err(CheckpointError::safetensors(format!(
                 "{} is too small to be a safetensors file",
                 path.display()
             )));
@@ -52,36 +52,32 @@ impl SafeTensorFile {
         let header_len = u64::from_le_bytes(mmap[..8].try_into().expect("eight bytes checked"));
 
         if header_len == 0 || header_len % 8 != 0 {
-            return Err(CheckpointError::invalid(format!(
+            return Err(CheckpointError::safetensors(format!(
                 "{} has invalid safetensors header length {header_len}",
                 path.display()
             )));
         }
 
         let data_start_u64 = 8u64.checked_add(header_len).ok_or_else(|| {
-            CheckpointError::invalid(format!("{} header length overflows", path.display()))
+            CheckpointError::safetensors(format!("{} header length overflows", path.display()))
         })?;
 
         if data_start_u64 > file_len {
-            return Err(CheckpointError::invalid(format!(
+            return Err(CheckpointError::safetensors(format!(
                 "{} declares a {header_len}-byte header beyond its {file_len}-byte file",
                 path.display()
             )));
         }
 
         let data_start = usize::try_from(data_start_u64).map_err(|_| {
-            CheckpointError::invalid(format!("{} is too large for this host", path.display()))
+            CheckpointError::safetensors(format!("{} is too large for this host", path.display()))
         })?;
 
-        let header: Value = serde_json::from_slice(&mmap[8..data_start]).map_err(|source| {
-            CheckpointError::Json {
-                path: path.to_owned(),
-                source,
-            }
-        })?;
+        let header: Value = serde_json::from_slice(&mmap[8..data_start])
+            .map_err(|source| CheckpointError::json(path, source))?;
 
         let object = header.as_object().ok_or_else(|| {
-            CheckpointError::invalid(format!(
+            CheckpointError::safetensors(format!(
                 "{} safetensors header is not a JSON object",
                 path.display()
             ))
@@ -96,11 +92,8 @@ impl SafeTensorFile {
                 continue;
             }
 
-            let descriptor: TensorDescriptor =
-                serde_json::from_value(value.clone()).map_err(|source| CheckpointError::Json {
-                    path: path.to_owned(),
-                    source,
-                })?;
+            let descriptor: TensorDescriptor = serde_json::from_value(value.clone())
+                .map_err(|source| CheckpointError::json(path, source))?;
 
             validate_descriptor(path, name, &descriptor, payload_len)?;
             ranges.push((descriptor.data_offsets[0], descriptor.data_offsets[1], name));
@@ -111,7 +104,7 @@ impl SafeTensorFile {
 
         for pair in ranges.windows(2) {
             if pair[0].1 > pair[1].0 {
-                return Err(CheckpointError::invalid(format!(
+                return Err(CheckpointError::safetensors(format!(
                     "{} tensors `{}` and `{}` overlap",
                     path.display(),
                     pair[0].2,
@@ -138,7 +131,7 @@ impl SafeTensorFile {
 
     pub fn tensor(&self, name: &str) -> CheckpointResult<TensorView<'_>> {
         let (stored_name, descriptor) = self.tensors.get_key_value(name).ok_or_else(|| {
-            CheckpointError::invalid(format!(
+            CheckpointError::tensor(format!(
                 "{} is missing tensor `{name}`",
                 self.path.display()
             ))
@@ -159,15 +152,19 @@ impl SafeTensorFile {
         let begin = usize::try_from(range.start)
             .ok()
             .and_then(|offset| self.data_start.checked_add(offset))
-            .ok_or_else(|| CheckpointError::invalid("safetensors byte offset overflows host"))?;
+            .ok_or_else(|| {
+                CheckpointError::safetensors("safetensors byte offset overflows host")
+            })?;
 
         let end = usize::try_from(range.end)
             .ok()
             .and_then(|offset| self.data_start.checked_add(offset))
-            .ok_or_else(|| CheckpointError::invalid("safetensors byte offset overflows host"))?;
+            .ok_or_else(|| {
+                CheckpointError::safetensors("safetensors byte offset overflows host")
+            })?;
 
         self.mmap.get(begin..end).ok_or_else(|| {
-            CheckpointError::invalid(format!(
+            CheckpointError::safetensors(format!(
                 "{} tensor byte range {}..{} is outside the mapping",
                 self.path.display(),
                 range.start,
@@ -201,7 +198,7 @@ fn validate_descriptor(
     let [begin, end] = descriptor.data_offsets;
 
     if begin > end || end > payload_len {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::safetensors(format!(
             "{} tensor `{name}` has invalid byte range {begin}..{end} for a {payload_len}-byte payload",
             path.display()
         )));
@@ -214,7 +211,7 @@ fn validate_descriptor(
         .iter()
         .try_fold(1u64, |count, &dimension| {
             count.checked_mul(dimension).ok_or_else(|| {
-                CheckpointError::invalid(format!(
+                CheckpointError::safetensors(format!(
                     "{} tensor `{name}` shape overflows",
                     path.display()
                 ))
@@ -222,14 +219,14 @@ fn validate_descriptor(
         })?;
 
     let expected_bytes = elements.checked_mul(width).ok_or_else(|| {
-        CheckpointError::invalid(format!(
+        CheckpointError::safetensors(format!(
             "{} tensor `{name}` byte length overflows",
             path.display()
         ))
     })?;
 
     if end - begin != expected_bytes {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::safetensors(format!(
             "{} tensor `{name}` dtype {} shape {:?} requires {expected_bytes} bytes, not {}",
             path.display(),
             descriptor.dtype,
@@ -244,7 +241,7 @@ fn validate_descriptor(
 #[cfg(test)]
 mod tests {
     use super::SafeTensorFile;
-    use crate::DType;
+    use crate::{CheckpointErrorCode, DType};
     use serde_json::{Value, json};
     use std::fs::{self, File};
     use std::io::Write;
@@ -311,9 +308,10 @@ mod tests {
             &[0; 4],
         );
 
-        let error = SafeTensorFile::open(&path).err().unwrap().to_string();
+        let error = SafeTensorFile::open(&path).err().unwrap();
 
-        assert!(error.contains("requires 6 bytes, not 4"));
+        assert_eq!(error.code(), CheckpointErrorCode::Safetensors);
+        assert!(error.to_string().contains("requires 6 bytes, not 4"));
 
         fs::remove_file(path).unwrap();
     }
@@ -330,9 +328,10 @@ mod tests {
             &[0; 6],
         );
 
-        let error = SafeTensorFile::open(&path).err().unwrap().to_string();
+        let error = SafeTensorFile::open(&path).err().unwrap();
 
-        assert!(error.contains("overlap"));
+        assert_eq!(error.code(), CheckpointErrorCode::Safetensors);
+        assert!(error.to_string().contains("overlap"));
 
         fs::remove_file(path).unwrap();
     }
@@ -346,9 +345,14 @@ mod tests {
             &[0; 2],
         );
 
-        let error = SafeTensorFile::open(&path).err().unwrap().to_string();
+        let error = SafeTensorFile::open(&path).err().unwrap();
 
-        assert!(error.contains("unsupported checkpoint dtype `F16`"));
+        assert_eq!(error.code(), CheckpointErrorCode::Json);
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported checkpoint dtype `F16`")
+        );
 
         fs::remove_file(path).unwrap();
     }

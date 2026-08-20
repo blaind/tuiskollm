@@ -199,7 +199,7 @@ impl<'a> TextEndpointBindings<'a> {
 
 fn require_nvfp4_mlp_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
     if layer >= A::LAYERS || layer >= NVFP4_MLP_LAYER_END {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::source_binding(format!(
             "layer {layer} does not use the admitted NVFP4 MLP source contract"
         )));
     }
@@ -209,7 +209,7 @@ fn require_nvfp4_mlp_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
 
 fn codec_columns(width: usize, divisor: usize, role: &str) -> CheckpointResult<u64> {
     if !width.is_multiple_of(divisor) {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::source_binding(format!(
             "architecture width {width} is not divisible by the {role} divisor {divisor}"
         )));
     }
@@ -224,7 +224,7 @@ fn require_adjacent(
     second: &TensorView<'_>,
 ) -> CheckpointResult<()> {
     if first.data_range.end != second.data_range.start {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::source_binding(format!(
             "layer-{layer} {role} are not source-adjacent"
         )));
     }
@@ -237,7 +237,7 @@ fn validate_nvfp4_scales(layer: usize, role: &str, scales: &[u8]) -> CheckpointR
         .iter()
         .any(|&scale| scale & 0x80 != 0 || scale == 0x7f)
     {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::source_binding(format!(
             "layer-{layer} NVFP4 {role} scale plane contains a negative or NaN E4M3FN code"
         )));
     }
@@ -250,7 +250,7 @@ fn positive_f32(tensor: TensorView<'_>) -> CheckpointResult<f32> {
     let value = view.value(0).expect("validated scalar has one value");
 
     if !value.is_finite() || value <= 0.0 {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::source_binding(format!(
             "tensor `{}` must contain a finite positive divisor, observed {value}",
             view.name()
         )));
@@ -261,7 +261,7 @@ fn positive_f32(tensor: TensorView<'_>) -> CheckpointResult<f32> {
 
 fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> CheckpointResult<()> {
     if gate.to_bits() != up.to_bits() {
-        return Err(CheckpointError::invalid(format!(
+        return Err(CheckpointError::source_binding(format!(
             "layer-{layer} gate/up {role} words differ and cannot share one fused operator"
         )));
     }
@@ -275,7 +275,7 @@ mod tests {
         Nvfp4DownBindings, Nvfp4GateUpBindings, TextEndpointBindings, require_adjacent,
         require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
-    use crate::{Arch, DType, SafeTensorFile, TensorView};
+    use crate::{Arch, CheckpointErrorCode, DType, SafeTensorFile, TensorView};
     use serde_json::{Value, json};
     use std::fs::{self, File};
     use std::io::Write;
@@ -462,11 +462,11 @@ mod tests {
 
         let error = TextEndpointBindings::bind_from::<TestArch>(|name| file.tensor(name))
             .err()
-            .unwrap()
-            .to_string();
+            .unwrap();
 
-        assert!(error.contains("lm_head.weight"));
-        assert!(error.contains("dtype `U8`, expected `F8_E4M3`"));
+        assert_eq!(error.code(), CheckpointErrorCode::Tensor);
+        assert!(error.to_string().contains("lm_head.weight"));
+        assert!(error.to_string().contains("dtype `U8`, expected `F8_E4M3`"));
 
         fs::remove_file(path).unwrap();
     }
@@ -537,10 +537,14 @@ mod tests {
 
         let error = Nvfp4GateUpBindings::bind_from::<Nvfp4Arch>(55, |name| file.tensor(name))
             .err()
-            .unwrap()
-            .to_string();
+            .unwrap();
 
-        assert!(error.contains("input_global_scale words differ"));
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            error
+                .to_string()
+                .contains("input_global_scale words differ")
+        );
 
         fs::remove_file(path).unwrap();
     }
@@ -549,10 +553,10 @@ mod tests {
     fn rejects_invalid_nvfp4_scale_codes() {
         let error = validate_nvfp4_scales(55, "gate", &[0x38, 0x7f])
             .err()
-            .unwrap()
-            .to_string();
+            .unwrap();
 
-        assert!(error.contains("negative or NaN E4M3FN code"));
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("negative or NaN E4M3FN code"));
     }
 
     #[test]
@@ -574,9 +578,9 @@ mod tests {
 
         let error = require_adjacent(55, "packed gate/up weights", &first, &second)
             .err()
-            .unwrap()
-            .to_string();
+            .unwrap();
 
-        assert!(error.contains("not source-adjacent"));
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("not source-adjacent"));
     }
 }
