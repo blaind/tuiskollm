@@ -61,8 +61,11 @@ impl<'a> DenseFp8GateUpBindings<'a> {
 
         Fp8E4M3View::bind(tensor(&gate_weight_name)?, [intermediate, hidden])?;
         Fp8E4M3View::bind(tensor(&up_weight_name)?, [intermediate, hidden])?;
-        Bf16View::bind(tensor(&gate_scale_name)?, [intermediate, 1])?;
-        Bf16View::bind(tensor(&up_scale_name)?, [intermediate, 1])?;
+        let gate_scale = Bf16View::bind(tensor(&gate_scale_name)?, [intermediate, 1])?;
+        let up_scale = Bf16View::bind(tensor(&up_scale_name)?, [intermediate, 1])?;
+
+        validate_positive_bf16_scales(&gate_scale)?;
+        validate_positive_bf16_scales(&up_scale)?;
 
         let weight_e4m3 = adjacent(
             &gate_weight_name,
@@ -123,6 +126,8 @@ impl<'a> DenseFp8DownBindings<'a> {
             Fp8E4M3View::bind(tensor(&format!("{prefix}.weight"))?, [hidden, intermediate])?;
         let scale = Bf16View::bind(tensor(&format!("{prefix}.weight_scale"))?, [hidden, 1])?;
 
+        validate_positive_bf16_scales(&scale)?;
+
         Ok(Self {
             weight,
             scale,
@@ -148,6 +153,8 @@ pub struct FullAttentionQkvBindings<'a> {
     pub value_scale: Bf16View<'a, 2>,
     /// Decoder layer owning these planes.
     pub layer: usize,
+    pub(crate) layer_count: usize,
+    pub(crate) full_attention_interval: usize,
 }
 
 impl<'a> FullAttentionQkvBindings<'a> {
@@ -163,7 +170,7 @@ impl<'a> FullAttentionQkvBindings<'a> {
         layer: usize,
         mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
     ) -> CheckpointResult<Self> {
-        require_full_attention_layer::<A>(layer)?;
+        require_full_attention_layer(layer, A::LAYERS, A::FULL_ATTENTION_INTERVAL)?;
 
         let query_rows = A::ATTENTION_QUERY_ROWS as u64;
         let kv_rows = A::ATTENTION_KV_ROWS as u64;
@@ -194,6 +201,10 @@ impl<'a> FullAttentionQkvBindings<'a> {
             [kv_rows, 1],
         )?;
 
+        validate_positive_bf16_scales(&query_gate_scale)?;
+        validate_positive_bf16_scales(&key_scale)?;
+        validate_positive_bf16_scales(&value_scale)?;
+
         Ok(Self {
             query_gate_weight,
             key_weight,
@@ -202,6 +213,8 @@ impl<'a> FullAttentionQkvBindings<'a> {
             key_scale,
             value_scale,
             layer,
+            layer_count: A::LAYERS,
+            full_attention_interval: A::FULL_ATTENTION_INTERVAL,
         })
     }
 }
@@ -242,7 +255,7 @@ impl<'a> FullAttentionPostBindings<'a> {
         layer: usize,
         mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
     ) -> CheckpointResult<Self> {
-        require_full_attention_layer::<A>(layer)?;
+        require_full_attention_layer(layer, A::LAYERS, A::FULL_ATTENTION_INTERVAL)?;
 
         let hidden = A::HIDDEN as u64;
         let output_columns = A::ATTENTION_OUTPUT_COLUMNS as u64;
@@ -257,6 +270,9 @@ impl<'a> FullAttentionPostBindings<'a> {
             tensor(&format!("{prefix}.o_proj.weight_scale"))?,
             [hidden, 1],
         )?;
+
+        validate_positive_bf16_scales(&output_scale)?;
+
         let input_norm = Bf16View::bind(
             tensor(&format!("{layer_prefix}.input_layernorm.weight"))?,
             [hidden],
@@ -462,6 +478,8 @@ impl<'a> TextEndpointBindings<'a> {
         let lm_head = Fp8E4M3View::bind(tensor(LM_HEAD)?, [vocab, hidden])?;
         let lm_head_scale = Bf16View::bind(tensor(LM_HEAD_SCALE)?, [vocab, 1])?;
 
+        validate_positive_bf16_scales(&lm_head_scale)?;
+
         Ok(Self {
             embedding,
             final_norm,
@@ -491,10 +509,12 @@ fn require_dense_fp8_mlp_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
     Ok(())
 }
 
-fn require_full_attention_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
-    let interval = A::FULL_ATTENTION_INTERVAL;
-
-    if interval == 0 || layer >= A::LAYERS || layer % interval != interval - 1 {
+pub(crate) fn require_full_attention_layer(
+    layer: usize,
+    layer_count: usize,
+    interval: usize,
+) -> CheckpointResult<()> {
+    if interval == 0 || layer >= layer_count || layer % interval != interval - 1 {
         return Err(CheckpointError::source_binding(format!(
             "layer {layer} does not use the admitted full-attention source contract"
         )));
@@ -561,17 +581,26 @@ fn positive_f32(tensor: TensorView<'_>) -> CheckpointResult<f32> {
 
 fn positive_bf16(tensor: TensorView<'_>) -> CheckpointResult<u16> {
     let view = Bf16View::bind(tensor, [1])?;
-    let bits = view.word(0).expect("validated scalar has one value");
-    let value = f32::from_bits(u32::from(bits) << 16);
+    validate_positive_bf16_scales(&view)?;
 
-    if !value.is_finite() || value <= 0.0 {
-        return Err(CheckpointError::source_binding(format!(
-            "tensor `{}` must contain a finite positive BF16 scale, observed {value}",
-            view.name()
-        )));
+    Ok(view.word(0).expect("validated scalar has one value"))
+}
+
+fn validate_positive_bf16_scales<const RANK: usize>(
+    scales: &Bf16View<'_, RANK>,
+) -> CheckpointResult<()> {
+    for (index, bits) in scales.words().enumerate() {
+        let value = f32::from_bits(u32::from(bits) << 16);
+
+        if !value.is_finite() || value <= 0.0 {
+            return Err(CheckpointError::source_binding(format!(
+                "tensor `{}` must contain a finite positive BF16 scale, observed {value} at index {index}",
+                scales.name()
+            )));
+        }
     }
 
-    Ok(bits)
+    Ok(())
 }
 
 fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> CheckpointResult<()> {
@@ -592,7 +621,7 @@ mod tests {
         positive_bf16, require_adjacent, require_dense_fp8_mlp_layer, require_full_attention_layer,
         require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
-    use crate::{Arch, CheckpointErrorCode, DType, SafeTensorFile, TensorView};
+    use crate::{Arch, CheckpointErrorCode, CheckpointResult, DType, SafeTensorFile, TensorView};
     use serde_json::{Value, json};
     use std::fs::{self, File};
     use std::io::Write;
@@ -799,6 +828,10 @@ mod tests {
         payload[132..134].fill(0x50);
         payload[134..136].fill(0x60);
         payload[136..168].fill(0x70);
+        payload[168..232]
+            .as_chunks_mut::<2>()
+            .0
+            .fill(0x3f80u16.to_le_bytes());
         payload[364..366].copy_from_slice(&0x3f80u16.to_le_bytes());
         payload[366..368].copy_from_slice(&0x3f00u16.to_le_bytes());
 
@@ -849,6 +882,33 @@ mod tests {
             }),
             payload,
         )
+    }
+
+    fn assert_rejects_bf16_scale(
+        label: &str,
+        header: Value,
+        mut payload: Vec<u8>,
+        offset: usize,
+        tensor_name: &str,
+        bind: impl FnOnce(&SafeTensorFile) -> CheckpointResult<()>,
+    ) {
+        payload[offset..offset + 2].copy_from_slice(&0x7fc0u16.to_le_bytes());
+
+        let path = fixture_path(label);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let error = bind(&file).err().unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains(tensor_name), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("must contain a finite positive BF16 scale"),
+            "{error}"
+        );
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1008,6 +1068,77 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_fp8_bf16_scale_planes() {
+        let endpoint_payload = (0u8..50).collect::<Vec<_>>();
+        assert_rejects_bf16_scale(
+            "endpoint-scale",
+            endpoint_header(),
+            endpoint_payload,
+            44,
+            "lm_head.weight_scale",
+            |file| {
+                TextEndpointBindings::bind_from::<TestArch>(|name| file.tensor(name)).map(|_| ())
+            },
+        );
+
+        let (header, payload) = dense_fp8_mlp_fixture(56);
+        assert_rejects_bf16_scale(
+            "dense-gate-scale",
+            header,
+            payload,
+            1_024,
+            "gate_proj.weight_scale",
+            |file| {
+                DenseFp8GateUpBindings::bind_from::<Nvfp4Arch>(
+                    56,
+                    |name| file.tensor(name),
+                    |first, second, role| file.adjacent_tensor_bytes(first, second, role),
+                )
+                .map(|_| ())
+            },
+        );
+
+        let (header, payload) = dense_fp8_mlp_fixture(56);
+        assert_rejects_bf16_scale(
+            "dense-down-scale",
+            header,
+            payload,
+            1_600,
+            "down_proj.weight_scale",
+            |file| {
+                DenseFp8DownBindings::bind_from::<Nvfp4Arch>(56, |name| file.tensor(name))
+                    .map(|_| ())
+            },
+        );
+
+        let (header, payload) = full_attention_fixture(63);
+        assert_rejects_bf16_scale(
+            "attention-qkv-scale",
+            header,
+            payload,
+            128,
+            "q_proj.weight_scale",
+            |file| {
+                FullAttentionQkvBindings::bind_from::<Nvfp4Arch>(63, |name| file.tensor(name))
+                    .map(|_| ())
+            },
+        );
+
+        let (header, payload) = full_attention_fixture(63);
+        assert_rejects_bf16_scale(
+            "attention-output-scale",
+            header,
+            payload,
+            168,
+            "o_proj.weight_scale",
+            |file| {
+                FullAttentionPostBindings::bind_from::<Nvfp4Arch>(63, |name| file.tensor(name))
+                    .map(|_| ())
+            },
+        );
+    }
+
+    #[test]
     fn nvfp4_layer_route_is_exact() {
         for (layer, admitted) in [(0, true), (55, true), (56, false), (63, false), (64, false)] {
             assert_eq!(
@@ -1041,7 +1172,12 @@ mod tests {
             (64, false),
         ] {
             assert_eq!(
-                require_full_attention_layer::<Nvfp4Arch>(layer).is_ok(),
+                require_full_attention_layer(
+                    layer,
+                    Nvfp4Arch::LAYERS,
+                    Nvfp4Arch::FULL_ATTENTION_INTERVAL,
+                )
+                .is_ok(),
                 admitted,
                 "layer {layer}"
             );
