@@ -1,3 +1,5 @@
+//! Shape- and dtype-checked zero-copy views over admitted tensor bytes.
+
 use crate::{CheckpointError, CheckpointResult, DType, TensorView};
 
 #[derive(Clone, Copy, Debug)]
@@ -23,26 +25,32 @@ impl<'a, const RANK: usize> Bf16View<'a, RANK> {
         })
     }
 
+    /// Returns the source tensor name.
     pub fn name(&self) -> &'a str {
         self.view.name
     }
 
+    /// Returns the validated tensor shape.
     pub fn shape(&self) -> &[u64; RANK] {
         &self.view.shape
     }
 
+    /// Returns the unmodified little-endian BF16 bytes.
     pub fn bytes(&self) -> &'a [u8] {
         self.view.bytes
     }
 
+    /// Returns the number of BF16 words.
     pub fn len(&self) -> usize {
         self.view.bytes.len() / 2
     }
 
+    /// Returns whether the view contains no BF16 words.
     pub fn is_empty(&self) -> bool {
         self.view.bytes.is_empty()
     }
 
+    /// Returns the source BF16 word at `index`.
     pub fn word(&self, index: usize) -> Option<u16> {
         let begin = index.checked_mul(2)?;
         let end = begin.checked_add(2)?;
@@ -51,6 +59,7 @@ impl<'a, const RANK: usize> Bf16View<'a, RANK> {
         Some(u16::from_le_bytes(bytes))
     }
 
+    /// Iterates over the source BF16 words.
     pub fn words(&self) -> impl DoubleEndedIterator<Item = u16> + ExactSizeIterator + '_ {
         self.view
             .bytes
@@ -78,26 +87,32 @@ impl<'a, const RANK: usize> F32View<'a, RANK> {
         })
     }
 
+    /// Returns the source tensor name.
     pub fn name(&self) -> &'a str {
         self.view.name
     }
 
+    /// Returns the validated tensor shape.
     pub fn shape(&self) -> &[u64; RANK] {
         &self.view.shape
     }
 
+    /// Returns the unmodified little-endian F32 bytes.
     pub fn bytes(&self) -> &'a [u8] {
         self.view.bytes
     }
 
+    /// Returns the number of F32 values.
     pub fn len(&self) -> usize {
         self.view.bytes.len() / 4
     }
 
+    /// Returns whether the view contains no F32 values.
     pub fn is_empty(&self) -> bool {
         self.view.bytes.is_empty()
     }
 
+    /// Returns the source F32 bits at `index`.
     pub fn bits(&self, index: usize) -> Option<u32> {
         let begin = index.checked_mul(4)?;
         let end = begin.checked_add(4)?;
@@ -106,6 +121,7 @@ impl<'a, const RANK: usize> F32View<'a, RANK> {
         Some(u32::from_le_bytes(bytes))
     }
 
+    /// Returns the F32 value at `index`.
     pub fn value(&self, index: usize) -> Option<f32> {
         self.bits(index).map(f32::from_bits)
     }
@@ -127,22 +143,27 @@ impl<'a, const RANK: usize> Fp8E4M3View<'a, RANK> {
         })
     }
 
+    /// Returns the source tensor name.
     pub fn name(&self) -> &'a str {
         self.view.name
     }
 
+    /// Returns the validated tensor shape.
     pub fn shape(&self) -> &[u64; RANK] {
         &self.view.shape
     }
 
+    /// Returns the unmodified FP8 E4M3 source codes.
     pub fn codes(&self) -> &'a [u8] {
         self.view.bytes
     }
 
+    /// Returns the number of FP8 E4M3 codes.
     pub fn len(&self) -> usize {
         self.view.bytes.len()
     }
 
+    /// Returns whether the view contains no FP8 E4M3 codes.
     pub fn is_empty(&self) -> bool {
         self.view.bytes.is_empty()
     }
@@ -164,22 +185,27 @@ impl<'a, const RANK: usize> U8View<'a, RANK> {
         })
     }
 
+    /// Returns the source tensor name.
     pub fn name(&self) -> &'a str {
         self.view.name
     }
 
+    /// Returns the validated tensor shape.
     pub fn shape(&self) -> &[u64; RANK] {
         &self.view.shape
     }
 
+    /// Returns the unmodified U8 source elements.
     pub fn bytes(&self) -> &'a [u8] {
         self.view.bytes
     }
 
+    /// Returns the number of U8 elements.
     pub fn len(&self) -> usize {
         self.view.bytes.len()
     }
 
+    /// Returns whether the view contains no U8 elements.
     pub fn is_empty(&self) -> bool {
         self.view.bytes.is_empty()
     }

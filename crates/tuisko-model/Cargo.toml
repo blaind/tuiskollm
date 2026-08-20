@@ -19,4 +19,8 @@ name = "checkpoint"
 harness = false
 
 [lints.rust]
+missing_docs = "warn"
 unsafe_code = "allow"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"

@@ -1,3 +1,5 @@
+//! Shape- and dtype-checked bindings from checkpoint tensors to model roles.
+
 use crate::{
     Arch, Bf16View, CheckpointError, CheckpointResult, CheckpointSnapshot, F32View, Fp8E4M3View,
     TensorView, U8View,
@@ -30,6 +32,7 @@ pub struct DenseFp8GateUpBindings<'a> {
 }
 
 impl<'a> DenseFp8GateUpBindings<'a> {
+    /// Binds one admitted dense-FP8 gate/up source family.
     pub fn bind<A: Arch>(
         snapshot: &'a CheckpointSnapshot<A>,
         layer: usize,
@@ -99,6 +102,7 @@ pub struct DenseFp8DownBindings<'a> {
 }
 
 impl<'a> DenseFp8DownBindings<'a> {
+    /// Binds one admitted dense-FP8 down-projection source family.
     pub fn bind<A: Arch>(
         snapshot: &'a CheckpointSnapshot<A>,
         layer: usize,
@@ -147,6 +151,7 @@ pub struct FullAttentionQkvBindings<'a> {
 }
 
 impl<'a> FullAttentionQkvBindings<'a> {
+    /// Binds one admitted full-attention QKV source family.
     pub fn bind<A: Arch>(
         snapshot: &'a CheckpointSnapshot<A>,
         layer: usize,
@@ -225,6 +230,7 @@ pub struct FullAttentionPostBindings<'a> {
 }
 
 impl<'a> FullAttentionPostBindings<'a> {
+    /// Binds one admitted full-attention post-projection source family.
     pub fn bind<A: Arch>(
         snapshot: &'a CheckpointSnapshot<A>,
         layer: usize,
@@ -298,6 +304,7 @@ pub struct Nvfp4GateUpBindings<'a> {
 }
 
 impl<'a> Nvfp4GateUpBindings<'a> {
+    /// Binds one admitted NVFP4 gate/up source family.
     pub fn bind<A: Arch>(
         snapshot: &'a CheckpointSnapshot<A>,
         layer: usize,
@@ -382,6 +389,7 @@ pub struct Nvfp4DownBindings<'a> {
 }
 
 impl<'a> Nvfp4DownBindings<'a> {
+    /// Binds one admitted NVFP4 down-projection source family.
     pub fn bind<A: Arch>(
         snapshot: &'a CheckpointSnapshot<A>,
         layer: usize,
@@ -438,6 +446,7 @@ pub struct TextEndpointBindings<'a> {
 }
 
 impl<'a> TextEndpointBindings<'a> {
+    /// Binds the admitted embedding, final-norm, and LM-head sources.
     pub fn bind<A: Arch>(snapshot: &'a CheckpointSnapshot<A>) -> CheckpointResult<Self> {
         Self::bind_from::<A>(|name| snapshot.tensor(name))
     }

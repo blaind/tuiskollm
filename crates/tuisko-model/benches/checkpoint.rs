@@ -1,3 +1,5 @@
+//! Admission benchmarks for config and safetensors header fixtures.
+
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use serde_json::{Value, json};
 use std::fs::{self, File};

@@ -1,3 +1,5 @@
+//! Exact snapshot inventory admission and mmap-backed tensor lookup.
+
 use crate::{Arch, CheckpointError, CheckpointResult, SafeTensorFile, TensorView, validate_config};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -58,18 +60,22 @@ pub struct CheckpointSnapshot<A: Arch> {
 }
 
 impl<A: Arch> CheckpointSnapshot<A> {
+    /// Opens and validates the pinned snapshot rooted at `root`.
     pub fn open(root: &Path) -> CheckpointResult<Self> {
         Self::open_with_spec(root, TARGET_INVENTORY)
     }
 
+    /// Returns the admitted snapshot root.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Returns the number of indexed tensors across both shards.
     pub fn tensor_count(&self) -> usize {
         self.tensors.len()
     }
 
+    /// Returns a validated source view for an indexed tensor.
     pub fn tensor(&self, name: &str) -> CheckpointResult<TensorView<'_>> {
         match self.shard(name)? {
             Shard::Model => self.model.tensor(name),

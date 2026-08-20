@@ -1,3 +1,5 @@
+//! Exact admission contract for model geometry and quantization routes.
+
 use crate::bindings::NVFP4_MLP_LAYER_END;
 use crate::{Arch, CheckpointError, CheckpointResult};
 use serde::Deserialize;

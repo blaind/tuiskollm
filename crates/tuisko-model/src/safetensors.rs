@@ -1,3 +1,5 @@
+//! Validated mmap access to safetensors headers and tensor byte ranges.
+
 use crate::{CheckpointError, CheckpointResult, DType};
 use memmap2::{Mmap, MmapOptions};
 use serde::Deserialize;
@@ -29,6 +31,7 @@ pub struct SafeTensorFile {
 }
 
 impl SafeTensorFile {
+    /// Opens and validates one immutable safetensors file.
     pub fn open(path: &Path) -> CheckpointResult<Self> {
         let file = File::open(path).map_err(|error| CheckpointError::io("opening", path, error))?;
 
@@ -121,14 +124,17 @@ impl SafeTensorFile {
         })
     }
 
+    /// Returns the mapped file path.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Returns the number of validated tensor descriptors.
     pub fn tensor_count(&self) -> usize {
         self.tensors.len()
     }
 
+    /// Returns a validated source view for `name`.
     pub fn tensor(&self, name: &str) -> CheckpointResult<TensorView<'_>> {
         let (stored_name, descriptor) = self.tensors.get_key_value(name).ok_or_else(|| {
             CheckpointError::tensor(format!(

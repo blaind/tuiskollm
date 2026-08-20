@@ -1,3 +1,5 @@
+//! Element representations admitted from checkpoint shards.
+
 use serde::{Deserialize, Deserializer, de};
 use std::fmt::{self, Display, Formatter};
 
