@@ -9,6 +9,7 @@ const EMBEDDING: &str = "model.language_model.embed_tokens.weight";
 const FINAL_NORM: &str = "model.language_model.norm.weight";
 const LM_HEAD: &str = "lm_head.weight";
 const LM_HEAD_SCALE: &str = "lm_head.weight_scale";
+const MTP_LAYER: usize = 0;
 
 // These are source-codec facts, not architecture geometry.
 pub(crate) const NVFP4_MLP_LAYER_END: usize = 56;
@@ -442,6 +443,139 @@ impl<'a> GdnBindings<'a> {
     }
 }
 
+/// Complete BF16 source planes for the single admitted MTP draft layer.
+#[derive(Clone, Copy, Debug)]
+pub struct MtpBindings<'a> {
+    /// Projection combining draft hidden and base embedding inputs `[hidden, 2 * hidden]`.
+    pub input_projection: Bf16View<'a, 2>,
+    /// Normalization for the base embedding input `[hidden]`.
+    pub embedding_norm: Bf16View<'a, 1>,
+    /// Normalization for the draft hidden input `[hidden]`.
+    pub hidden_norm: Bf16View<'a, 1>,
+    /// Query rows followed by gate rows `[attention_query_rows, hidden]`.
+    pub query_gate_weight: Bf16View<'a, 2>,
+    /// Key projection `[attention_kv_rows, hidden]`.
+    pub key_weight: Bf16View<'a, 2>,
+    /// Value projection `[attention_kv_rows, hidden]`.
+    pub value_weight: Bf16View<'a, 2>,
+    /// Attention output projection `[hidden, attention_output_columns]`.
+    pub attention_output_weight: Bf16View<'a, 2>,
+    /// Per-head query RMSNorm weights `[head_dim]`.
+    pub query_norm: Bf16View<'a, 1>,
+    /// Per-head key RMSNorm weights `[head_dim]`.
+    pub key_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before attention `[hidden]`.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Gate rows followed by up rows as one BF16 source span `[2 * intermediate, hidden]`.
+    pub gate_up_weight_bf16: &'a [u8],
+    /// Fused gate/up row count.
+    pub gate_up_rows: usize,
+    /// Logical MLP input width.
+    pub gate_up_columns: usize,
+    /// MLP down projection `[hidden, intermediate]`.
+    pub down_weight: Bf16View<'a, 2>,
+    /// Zero-centered RMSNorm weights before the MLP `[hidden]`.
+    pub post_attention_norm: Bf16View<'a, 1>,
+    /// Final draft hidden-state normalization `[hidden]`.
+    pub final_norm: Bf16View<'a, 1>,
+}
+
+impl<'a> MtpBindings<'a> {
+    /// Binds the complete admitted MTP source family.
+    pub fn bind<A: Arch>(snapshot: &'a CheckpointSnapshot<A>) -> CheckpointResult<Self> {
+        Self::bind_from::<A>(
+            |name| snapshot.tensor(name),
+            |first, second, role| snapshot.adjacent_tensor_bytes(first, second, role),
+        )
+    }
+
+    fn bind_from<A: Arch>(
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+        mut adjacent: impl FnMut(&str, &str, &str) -> CheckpointResult<&'a [u8]>,
+    ) -> CheckpointResult<Self> {
+        require_mtp_contract(A::MTP_LAYERS, A::MTP_USES_DEDICATED_EMBEDDINGS)?;
+
+        let hidden = A::HIDDEN as u64;
+        let intermediate = A::INTERMEDIATE as u64;
+        let query_rows = A::ATTENTION_QUERY_ROWS as u64;
+        let kv_rows = A::ATTENTION_KV_ROWS as u64;
+        let output_columns = A::ATTENTION_OUTPUT_COLUMNS as u64;
+        let head_dim = A::HEAD_DIM as u64;
+        let input_columns = hidden.checked_mul(2).ok_or_else(|| {
+            CheckpointError::source_binding("MTP input projection width overflows")
+        })?;
+        let prefix = format!("mtp.layers.{MTP_LAYER}");
+        let attention = format!("{prefix}.self_attn");
+        let mlp = format!("{prefix}.mlp");
+        let gate_weight_name = format!("{mlp}.gate_proj.weight");
+        let up_weight_name = format!("{mlp}.up_proj.weight");
+
+        let input_projection = Bf16View::bind(tensor("mtp.fc.weight")?, [hidden, input_columns])?;
+        let embedding_norm = Bf16View::bind(tensor("mtp.pre_fc_norm_embedding.weight")?, [hidden])?;
+        let hidden_norm = Bf16View::bind(tensor("mtp.pre_fc_norm_hidden.weight")?, [hidden])?;
+        let query_gate_weight = Bf16View::bind(
+            tensor(&format!("{attention}.q_proj.weight"))?,
+            [query_rows, hidden],
+        )?;
+        let key_weight = Bf16View::bind(
+            tensor(&format!("{attention}.k_proj.weight"))?,
+            [kv_rows, hidden],
+        )?;
+        let value_weight = Bf16View::bind(
+            tensor(&format!("{attention}.v_proj.weight"))?,
+            [kv_rows, hidden],
+        )?;
+        let attention_output_weight = Bf16View::bind(
+            tensor(&format!("{attention}.o_proj.weight"))?,
+            [hidden, output_columns],
+        )?;
+        let query_norm =
+            Bf16View::bind(tensor(&format!("{attention}.q_norm.weight"))?, [head_dim])?;
+        let key_norm = Bf16View::bind(tensor(&format!("{attention}.k_norm.weight"))?, [head_dim])?;
+        let input_norm = Bf16View::bind(
+            tensor(&format!("{prefix}.input_layernorm.weight"))?,
+            [hidden],
+        )?;
+
+        Bf16View::bind(tensor(&gate_weight_name)?, [intermediate, hidden])?;
+        Bf16View::bind(tensor(&up_weight_name)?, [intermediate, hidden])?;
+
+        let gate_up_weight_bf16 =
+            adjacent(&gate_weight_name, &up_weight_name, "MTP gate/up weights")?;
+        let gate_up_rows = A::INTERMEDIATE
+            .checked_mul(2)
+            .ok_or_else(|| CheckpointError::source_binding("MTP gate/up row count overflows"))?;
+        let down_weight = Bf16View::bind(
+            tensor(&format!("{mlp}.down_proj.weight"))?,
+            [hidden, intermediate],
+        )?;
+        let post_attention_norm = Bf16View::bind(
+            tensor(&format!("{prefix}.post_attention_layernorm.weight"))?,
+            [hidden],
+        )?;
+        let final_norm = Bf16View::bind(tensor("mtp.norm.weight")?, [hidden])?;
+
+        Ok(Self {
+            input_projection,
+            embedding_norm,
+            hidden_norm,
+            query_gate_weight,
+            key_weight,
+            value_weight,
+            attention_output_weight,
+            query_norm,
+            key_norm,
+            input_norm,
+            gate_up_weight_bf16,
+            gate_up_rows,
+            gate_up_columns: A::HIDDEN,
+            down_weight,
+            post_attention_norm,
+            final_norm,
+        })
+    }
+}
+
 /// Exact packed gate/up source planes for one NVFP4 MLP layer.
 #[derive(Clone, Copy, Debug)]
 pub struct Nvfp4GateUpBindings<'a> {
@@ -663,6 +797,16 @@ fn require_gdn_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
     Ok(())
 }
 
+fn require_mtp_contract(layers: usize, dedicated_embeddings: bool) -> CheckpointResult<()> {
+    if layers != 1 || dedicated_embeddings {
+        return Err(CheckpointError::source_binding(format!(
+            "MTP source contract requires one layer without dedicated embeddings, observed {layers} layers and dedicated_embeddings={dedicated_embeddings}"
+        )));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn require_full_attention_layer(
     layer: usize,
     layer_count: usize,
@@ -771,10 +915,10 @@ fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> Checkpo
 mod tests {
     use super::{
         DenseFp8DownBindings, DenseFp8GateUpBindings, FullAttentionPostBindings,
-        FullAttentionQkvBindings, GdnBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
+        FullAttentionQkvBindings, GdnBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
         TextEndpointBindings, positive_bf16, require_adjacent, require_dense_fp8_mlp_layer,
-        require_full_attention_layer, require_gdn_layer, require_nvfp4_mlp_layer,
-        validate_nvfp4_scales,
+        require_full_attention_layer, require_gdn_layer, require_mtp_contract,
+        require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
     use crate::{Arch, CheckpointErrorCode, CheckpointResult, DType, SafeTensorFile, TensorView};
     use serde_json::{Value, json};
@@ -803,6 +947,8 @@ mod tests {
         const LINEAR_VALUE_HEADS: usize = 1;
         const LINEAR_HEAD_DIM: usize = 1;
         const LINEAR_CONV_KERNEL_DIM: usize = 1;
+        const MTP_LAYERS: usize = 1;
+        const MTP_USES_DEDICATED_EMBEDDINGS: bool = false;
     }
 
     #[derive(Clone, Copy)]
@@ -823,6 +969,8 @@ mod tests {
         const LINEAR_VALUE_HEADS: usize = 1;
         const LINEAR_HEAD_DIM: usize = 1;
         const LINEAR_CONV_KERNEL_DIM: usize = 4;
+        const MTP_LAYERS: usize = 1;
+        const MTP_USES_DEDICATED_EMBEDDINGS: bool = false;
     }
 
     fn fixture_path(label: &str) -> PathBuf {
@@ -1105,6 +1253,69 @@ mod tests {
         )
     }
 
+    fn mtp_fixture() -> (Value, Vec<u8>) {
+        let mut payload = vec![0x80; 7_812];
+
+        payload[0..4_096].fill(0x10);
+        payload[5_184..6_208].fill(0x20);
+        payload[6_208..7_232].fill(0x30);
+        payload[7_298..7_362].fill(0x40);
+        payload[7_362..7_426].fill(0x50);
+        payload[7_428..7_556].fill(0x60);
+        payload[7_556..7_620].fill(0x70);
+
+        (
+            json!({
+                "mtp.fc.weight": {
+                    "dtype":"BF16", "shape":[32,64], "data_offsets":[0,4096]
+                },
+                "mtp.layers.0.input_layernorm.weight": {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[4096,4160]
+                },
+                "mtp.layers.0.mlp.down_proj.weight": {
+                    "dtype":"BF16", "shape":[32,16], "data_offsets":[4160,5184]
+                },
+                "mtp.layers.0.mlp.gate_proj.weight": {
+                    "dtype":"BF16", "shape":[16,32], "data_offsets":[5184,6208]
+                },
+                "mtp.layers.0.mlp.up_proj.weight": {
+                    "dtype":"BF16", "shape":[16,32], "data_offsets":[6208,7232]
+                },
+                "mtp.layers.0.post_attention_layernorm.weight": {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[7232,7296]
+                },
+                "mtp.layers.0.self_attn.k_norm.weight": {
+                    "dtype":"BF16", "shape":[1], "data_offsets":[7296,7298]
+                },
+                "mtp.layers.0.self_attn.k_proj.weight": {
+                    "dtype":"BF16", "shape":[1,32], "data_offsets":[7298,7362]
+                },
+                "mtp.layers.0.self_attn.o_proj.weight": {
+                    "dtype":"BF16", "shape":[32,1], "data_offsets":[7362,7426]
+                },
+                "mtp.layers.0.self_attn.q_norm.weight": {
+                    "dtype":"BF16", "shape":[1], "data_offsets":[7426,7428]
+                },
+                "mtp.layers.0.self_attn.q_proj.weight": {
+                    "dtype":"BF16", "shape":[2,32], "data_offsets":[7428,7556]
+                },
+                "mtp.layers.0.self_attn.v_proj.weight": {
+                    "dtype":"BF16", "shape":[1,32], "data_offsets":[7556,7620]
+                },
+                "mtp.norm.weight": {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[7620,7684]
+                },
+                "mtp.pre_fc_norm_embedding.weight": {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[7684,7748]
+                },
+                "mtp.pre_fc_norm_hidden.weight": {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[7748,7812]
+                }
+            }),
+            payload,
+        )
+    }
+
     fn assert_rejects_bf16_scale(
         label: &str,
         header: Value,
@@ -1347,6 +1558,72 @@ mod tests {
     }
 
     #[test]
+    fn binds_and_materializes_exact_mtp_source_contract() {
+        let path = fixture_path("mtp");
+        let (header, payload) = mtp_fixture();
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let bindings = MtpBindings::bind_from::<Nvfp4Arch>(
+            |name| file.tensor(name),
+            |first, second, role| file.adjacent_tensor_bytes(first, second, role),
+        )
+        .unwrap();
+
+        assert_eq!(bindings.input_projection.shape(), &[32, 64]);
+        assert_eq!(bindings.embedding_norm.shape(), &[32]);
+        assert_eq!(bindings.hidden_norm.shape(), &[32]);
+        assert_eq!(bindings.query_gate_weight.shape(), &[2, 32]);
+        assert_eq!(bindings.key_weight.shape(), &[1, 32]);
+        assert_eq!(bindings.value_weight.shape(), &[1, 32]);
+        assert_eq!(bindings.attention_output_weight.shape(), &[32, 1]);
+        assert_eq!(bindings.query_norm.shape(), &[1]);
+        assert_eq!(bindings.key_norm.shape(), &[1]);
+        assert_eq!(bindings.input_norm.shape(), &[32]);
+        assert_eq!(bindings.gate_up_weight_bf16.len(), 2_048);
+        assert_eq!(bindings.gate_up_weight_bf16[0], 0x20);
+        assert_eq!(bindings.gate_up_weight_bf16[1_024], 0x30);
+        assert_eq!((bindings.gate_up_rows, bindings.gate_up_columns), (32, 32));
+        assert_eq!(bindings.down_weight.shape(), &[32, 16]);
+        assert_eq!(bindings.post_attention_norm.shape(), &[32]);
+        assert_eq!(bindings.final_norm.shape(), &[32]);
+
+        let materialized = bindings.materialize_qkv().unwrap();
+        let query_bytes = bindings.query_gate_weight.bytes();
+        let key_bytes = bindings.key_weight.bytes();
+        let value_bytes = bindings.value_weight.bytes();
+        let query_end = query_bytes.len();
+        let key_end = query_end + key_bytes.len();
+
+        assert_eq!(&materialized.weight_bf16[..query_end], query_bytes);
+        assert_eq!(&materialized.weight_bf16[query_end..key_end], key_bytes);
+        assert_eq!(&materialized.weight_bf16[key_end..], value_bytes);
+        assert_eq!((materialized.rows, materialized.columns), (4, 32));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_mtp_input_projection_shape_mismatch() {
+        let path = fixture_path("mtp-input-shape");
+        let (mut header, payload) = mtp_fixture();
+        header["mtp.fc.weight"]["shape"] = json!([64, 32]);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let error = MtpBindings::bind_from::<Nvfp4Arch>(
+            |name| file.tensor(name),
+            |first, second, role| file.adjacent_tensor_bytes(first, second, role),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::Tensor);
+        assert!(error.to_string().contains("mtp.fc.weight"));
+        assert!(error.to_string().contains("expected [32, 64]"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn rejects_invalid_fp8_bf16_scale_planes() {
         let endpoint_payload = (0u8..50).collect::<Vec<_>>();
         assert_rejects_bf16_scale(
@@ -1513,6 +1790,22 @@ mod tests {
                 require_gdn_layer::<Nvfp4Arch>(layer).is_ok(),
                 admitted,
                 "layer {layer}"
+            );
+        }
+    }
+
+    #[test]
+    fn mtp_source_route_is_exact() {
+        for (layers, dedicated_embeddings, admitted) in [
+            (0, false, false),
+            (1, false, true),
+            (2, false, false),
+            (1, true, false),
+        ] {
+            assert_eq!(
+                require_mtp_contract(layers, dedicated_embeddings).is_ok(),
+                admitted,
+                "layers={layers}, dedicated_embeddings={dedicated_embeddings}"
             );
         }
     }

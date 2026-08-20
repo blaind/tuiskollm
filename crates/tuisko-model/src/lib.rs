@@ -11,7 +11,7 @@ mod views;
 
 pub use bindings::{
     DenseFp8DownBindings, DenseFp8GateUpBindings, FullAttentionPostBindings,
-    FullAttentionQkvBindings, GdnBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
+    FullAttentionQkvBindings, GdnBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
     TextEndpointBindings,
 };
 pub use config::validate_config;
@@ -19,7 +19,8 @@ pub use dtype::DType;
 pub use error::{CheckpointError, CheckpointErrorCode, CheckpointResult};
 pub use inventory::CheckpointSnapshot;
 pub use materialize::{
-    MaterializedFullAttentionQkv, MaterializedNvfp4Down, MaterializedNvfp4GateUp,
+    MaterializedFullAttentionQkv, MaterializedMtpQkv, MaterializedNvfp4Down,
+    MaterializedNvfp4GateUp,
 };
 pub use safetensors::{SafeTensorFile, TensorView};
 pub use views::{Bf16View, F32View, Fp8E4M3View, U8View};
@@ -54,6 +55,10 @@ pub trait Arch: Copy + 'static {
     const LINEAR_HEAD_DIM: usize;
     /// Width of the GDN causal convolution.
     const LINEAR_CONV_KERNEL_DIM: usize;
+    /// Number of draft layers in the MTP checkpoint shard.
+    const MTP_LAYERS: usize;
+    /// Whether MTP owns embeddings separate from the base model.
+    const MTP_USES_DEDICATED_EMBEDDINGS: bool;
 
     /// Rows in the fused full-attention query and gate plane.
     const ATTENTION_QUERY_ROWS: usize = 2 * Self::NUM_ATTENTION_HEADS * Self::HEAD_DIM;
@@ -94,6 +99,8 @@ impl Arch for Qwen38_27B {
     const LINEAR_VALUE_HEADS: usize = 48;
     const LINEAR_HEAD_DIM: usize = 128;
     const LINEAR_CONV_KERNEL_DIM: usize = 4;
+    const MTP_LAYERS: usize = 1;
+    const MTP_USES_DEDICATED_EMBEDDINGS: bool = false;
 }
 
 #[cfg(test)]
@@ -117,6 +124,7 @@ mod tests {
             ("linear_value_heads", A::LINEAR_VALUE_HEADS, 48),
             ("linear_head_dim", A::LINEAR_HEAD_DIM, 128),
             ("linear_conv_kernel_dim", A::LINEAR_CONV_KERNEL_DIM, 4),
+            ("mtp_layers", A::MTP_LAYERS, 1),
             ("attention_query_rows", A::ATTENTION_QUERY_ROWS, 12_288),
             (
                 "attention_output_columns",
@@ -132,6 +140,10 @@ mod tests {
             ("gdn_control_rows", A::GDN_CONTROL_ROWS, 48),
         ] {
             assert_eq!(actual, expected, "{field}");
+        }
+
+        const {
+            assert!(!Qwen38_27B::MTP_USES_DEDICATED_EMBEDDINGS);
         }
     }
 

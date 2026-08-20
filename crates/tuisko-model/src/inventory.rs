@@ -288,6 +288,8 @@ mod tests {
         const LINEAR_VALUE_HEADS: usize = 1;
         const LINEAR_HEAD_DIM: usize = 1;
         const LINEAR_CONV_KERNEL_DIM: usize = 1;
+        const MTP_LAYERS: usize = 1;
+        const MTP_USES_DEDICATED_EMBEDDINGS: bool = false;
     }
 
     struct Fixture {
@@ -381,6 +383,8 @@ mod tests {
                 "linear_num_value_heads": 1,
                 "linear_value_head_dim": 1,
                 "model_type": "qwen3_5_text",
+                "mtp_num_hidden_layers": 1,
+                "mtp_use_dedicated_embeddings": false,
                 "num_attention_heads": 1,
                 "num_hidden_layers": 64,
                 "num_key_value_heads": 1,
