@@ -148,6 +148,24 @@ impl SafeTensorFile {
         })
     }
 
+    pub(crate) fn adjacent_tensor_bytes(
+        &self,
+        first_name: &str,
+        second_name: &str,
+        role: &str,
+    ) -> CheckpointResult<&[u8]> {
+        let first = self.tensor(first_name)?;
+        let second = self.tensor(second_name)?;
+
+        if first.data_range.end != second.data_range.start {
+            return Err(CheckpointError::source_binding(format!(
+                "{role} are not source-adjacent"
+            )));
+        }
+
+        self.bytes(first.data_range.start..second.data_range.end)
+    }
+
     fn bytes(&self, range: Range<u64>) -> CheckpointResult<&[u8]> {
         let begin = usize::try_from(range.start)
             .ok()
@@ -332,6 +350,35 @@ mod tests {
 
         assert_eq!(error.code(), CheckpointErrorCode::Safetensors);
         assert!(error.to_string().contains("overlap"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_nonadjacent_tensor_span() {
+        let path = fixture_path("nonadjacent-span");
+        write_safetensors(
+            &path,
+            json!({
+                "first": {"dtype":"U8", "shape":[1], "data_offsets":[0,1]},
+                "middle": {"dtype":"U8", "shape":[1], "data_offsets":[1,2]},
+                "second": {"dtype":"U8", "shape":[1], "data_offsets":[2,3]}
+            }),
+            &[0x10, 0x20, 0x30],
+        );
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let error = file
+            .adjacent_tensor_bytes("first", "second", "test planes")
+            .err()
+            .unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            error
+                .to_string()
+                .contains("test planes are not source-adjacent")
+        );
 
         fs::remove_file(path).unwrap();
     }

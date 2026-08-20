@@ -71,14 +71,40 @@ impl<A: Arch> CheckpointSnapshot<A> {
     }
 
     pub fn tensor(&self, name: &str) -> CheckpointResult<TensorView<'_>> {
-        match self.tensors.get(name) {
-            Some(Shard::Model) => self.model.tensor(name),
-            Some(Shard::Mtp) => self.mtp.tensor(name),
-            None => Err(CheckpointError::tensor(format!(
-                "{} index is missing tensor `{name}`",
-                self.root.join(INDEX_FILE).display()
+        match self.shard(name)? {
+            Shard::Model => self.model.tensor(name),
+            Shard::Mtp => self.mtp.tensor(name),
+        }
+    }
+
+    pub(crate) fn adjacent_tensor_bytes(
+        &self,
+        first_name: &str,
+        second_name: &str,
+        role: &str,
+    ) -> CheckpointResult<&[u8]> {
+        match (self.shard(first_name)?, self.shard(second_name)?) {
+            (Shard::Model, Shard::Model) => {
+                self.model
+                    .adjacent_tensor_bytes(first_name, second_name, role)
+            }
+            (Shard::Mtp, Shard::Mtp) => {
+                self.mtp
+                    .adjacent_tensor_bytes(first_name, second_name, role)
+            }
+            _ => Err(CheckpointError::source_binding(format!(
+                "{role} are split across checkpoint shards"
             ))),
         }
+    }
+
+    fn shard(&self, name: &str) -> CheckpointResult<Shard> {
+        self.tensors.get(name).copied().ok_or_else(|| {
+            CheckpointError::tensor(format!(
+                "{} index is missing tensor `{name}`",
+                self.root.join(INDEX_FILE).display()
+            ))
+        })
     }
 
     fn open_with_spec(root: &Path, spec: InventorySpec) -> CheckpointResult<Self> {
@@ -401,6 +427,27 @@ mod tests {
         assert_eq!(snapshot.tensor_count(), 3);
         assert_eq!(snapshot.tensor("main.b").unwrap().bytes, &[0]);
         assert_eq!(snapshot.tensor("mtp.a").unwrap().bytes, &[0]);
+        assert_eq!(
+            snapshot
+                .adjacent_tensor_bytes("main.a", "main.b", "main pair")
+                .unwrap(),
+            &[0, 0]
+        );
+    }
+
+    #[test]
+    fn rejects_tensor_span_across_shards() {
+        let fixture = Fixture::new();
+        let snapshot =
+            CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, fixture.spec).unwrap();
+
+        let error = snapshot
+            .adjacent_tensor_bytes("main.b", "mtp.a", "cross-shard pair")
+            .err()
+            .unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("split across checkpoint shards"));
     }
 
     #[test]

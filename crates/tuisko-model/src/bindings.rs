@@ -10,8 +10,122 @@ const LM_HEAD_SCALE: &str = "lm_head.weight_scale";
 
 // These are source-codec facts, not architecture geometry.
 const NVFP4_MLP_LAYER_END: usize = 56;
+const DENSE_FP8_MLP_LAYER_START: usize = NVFP4_MLP_LAYER_END;
 const NVFP4_GROUP_SIZE: usize = 16;
 const E2M1_VALUES_PER_BYTE: usize = 2;
+
+/// Source-native fused gate/up planes for one dense-FP8 MLP layer.
+#[derive(Clone, Copy, Debug)]
+pub struct DenseFp8GateUpBindings<'a> {
+    /// Gate rows followed by up rows as one E4M3 source span `[2 * intermediate, hidden]`.
+    pub weight_e4m3: &'a [u8],
+    /// Gate rows followed by up rows as one little-endian BF16 source span.
+    pub scale_bf16: &'a [u8],
+    /// Fused gate/up row count.
+    pub rows: usize,
+    /// Logical input width.
+    pub columns: usize,
+    /// Decoder layer owning these planes.
+    pub layer: usize,
+}
+
+impl<'a> DenseFp8GateUpBindings<'a> {
+    pub fn bind<A: Arch>(
+        snapshot: &'a CheckpointSnapshot<A>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from::<A>(
+            layer,
+            |name| snapshot.tensor(name),
+            |first, second, role| snapshot.adjacent_tensor_bytes(first, second, role),
+        )
+    }
+
+    fn bind_from<A: Arch>(
+        layer: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+        mut adjacent: impl FnMut(&str, &str, &str) -> CheckpointResult<&'a [u8]>,
+    ) -> CheckpointResult<Self> {
+        require_dense_fp8_mlp_layer::<A>(layer)?;
+
+        let intermediate = A::INTERMEDIATE as u64;
+        let hidden = A::HIDDEN as u64;
+        let prefix = format!("model.language_model.layers.{layer}.mlp");
+        let gate_weight_name = format!("{prefix}.gate_proj.weight");
+        let up_weight_name = format!("{prefix}.up_proj.weight");
+        let gate_scale_name = format!("{prefix}.gate_proj.weight_scale");
+        let up_scale_name = format!("{prefix}.up_proj.weight_scale");
+
+        Fp8E4M3View::bind(tensor(&gate_weight_name)?, [intermediate, hidden])?;
+        Fp8E4M3View::bind(tensor(&up_weight_name)?, [intermediate, hidden])?;
+        Bf16View::bind(tensor(&gate_scale_name)?, [intermediate, 1])?;
+        Bf16View::bind(tensor(&up_scale_name)?, [intermediate, 1])?;
+
+        let weight_e4m3 = adjacent(
+            &gate_weight_name,
+            &up_weight_name,
+            &format!("layer-{layer} FP8 gate/up weights"),
+        )?;
+        let scale_bf16 = adjacent(
+            &gate_scale_name,
+            &up_scale_name,
+            &format!("layer-{layer} FP8 gate/up scales"),
+        )?;
+        let rows = A::INTERMEDIATE.checked_mul(2).ok_or_else(|| {
+            CheckpointError::source_binding(format!(
+                "layer-{layer} dense-FP8 gate/up row count overflows"
+            ))
+        })?;
+
+        Ok(Self {
+            weight_e4m3,
+            scale_bf16,
+            rows,
+            columns: A::HIDDEN,
+            layer,
+        })
+    }
+}
+
+/// Source-native down-projection planes for one dense-FP8 MLP layer.
+#[derive(Clone, Copy, Debug)]
+pub struct DenseFp8DownBindings<'a> {
+    /// E4M3 weights `[hidden, intermediate]`.
+    pub weight: Fp8E4M3View<'a, 2>,
+    /// One little-endian BF16 scale per output row `[hidden, 1]`.
+    pub scale: Bf16View<'a, 2>,
+    /// Decoder layer owning these planes.
+    pub layer: usize,
+}
+
+impl<'a> DenseFp8DownBindings<'a> {
+    pub fn bind<A: Arch>(
+        snapshot: &'a CheckpointSnapshot<A>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from::<A>(layer, |name| snapshot.tensor(name))
+    }
+
+    fn bind_from<A: Arch>(
+        layer: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        require_dense_fp8_mlp_layer::<A>(layer)?;
+
+        let hidden = A::HIDDEN as u64;
+        let intermediate = A::INTERMEDIATE as u64;
+        let prefix = format!("model.language_model.layers.{layer}.mlp.down_proj");
+        let weight =
+            Fp8E4M3View::bind(tensor(&format!("{prefix}.weight"))?, [hidden, intermediate])?;
+        let scale = Bf16View::bind(tensor(&format!("{prefix}.weight_scale"))?, [hidden, 1])?;
+
+        Ok(Self {
+            weight,
+            scale,
+            layer,
+        })
+    }
+}
 
 /// Exact packed gate/up source planes for one NVFP4 MLP layer.
 #[derive(Clone, Copy, Debug)]
@@ -207,6 +321,16 @@ fn require_nvfp4_mlp_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
     Ok(())
 }
 
+fn require_dense_fp8_mlp_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
+    if !(DENSE_FP8_MLP_LAYER_START..A::LAYERS).contains(&layer) {
+        return Err(CheckpointError::source_binding(format!(
+            "layer {layer} does not use the admitted dense-FP8 MLP source contract"
+        )));
+    }
+
+    Ok(())
+}
+
 fn codec_columns(width: usize, divisor: usize, role: &str) -> CheckpointResult<u64> {
     if !width.is_multiple_of(divisor) {
         return Err(CheckpointError::source_binding(format!(
@@ -276,7 +400,8 @@ fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> Checkpo
 #[cfg(test)]
 mod tests {
     use super::{
-        Nvfp4DownBindings, Nvfp4GateUpBindings, TextEndpointBindings, require_adjacent,
+        DenseFp8DownBindings, DenseFp8GateUpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
+        TextEndpointBindings, require_adjacent, require_dense_fp8_mlp_layer,
         require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
     use crate::{Arch, CheckpointErrorCode, DType, SafeTensorFile, TensorView};
@@ -437,6 +562,43 @@ mod tests {
         )
     }
 
+    fn dense_fp8_mlp_fixture(layer: usize) -> (Value, Vec<u8>) {
+        let prefix = format!("model.language_model.layers.{layer}.mlp");
+        let down = format!("{prefix}.down_proj");
+        let mut payload = vec![0; 1_664];
+
+        payload[0..512].fill(0x10);
+        payload[512..1_024].fill(0x20);
+        payload[1_024..1_056].fill(0x30);
+        payload[1_056..1_088].fill(0x40);
+        payload[1_088..1_600].fill(0x50);
+        payload[1_600..1_664].fill(0x60);
+
+        (
+            json!({
+                format!("{prefix}.gate_proj.weight"): {
+                    "dtype":"F8_E4M3", "shape":[16,32], "data_offsets":[0,512]
+                },
+                format!("{prefix}.up_proj.weight"): {
+                    "dtype":"F8_E4M3", "shape":[16,32], "data_offsets":[512,1024]
+                },
+                format!("{prefix}.gate_proj.weight_scale"): {
+                    "dtype":"BF16", "shape":[16,1], "data_offsets":[1024,1056]
+                },
+                format!("{prefix}.up_proj.weight_scale"): {
+                    "dtype":"BF16", "shape":[16,1], "data_offsets":[1056,1088]
+                },
+                format!("{down}.weight"): {
+                    "dtype":"F8_E4M3", "shape":[32,16], "data_offsets":[1088,1600]
+                },
+                format!("{down}.weight_scale"): {
+                    "dtype":"BF16", "shape":[32,1], "data_offsets":[1600,1664]
+                }
+            }),
+            payload,
+        )
+    }
+
     #[test]
     fn binds_exact_text_endpoint_contract() {
         let path = fixture_path("valid");
@@ -521,6 +683,42 @@ mod tests {
     }
 
     #[test]
+    fn binds_exact_dense_fp8_mlp_source_contract() {
+        let path = fixture_path("dense-fp8-mlp");
+        let (header, payload) = dense_fp8_mlp_fixture(56);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let gate_up = DenseFp8GateUpBindings::bind_from::<Nvfp4Arch>(
+            56,
+            |name| file.tensor(name),
+            |first, second, role| file.adjacent_tensor_bytes(first, second, role),
+        )
+        .unwrap();
+        let down =
+            DenseFp8DownBindings::bind_from::<Nvfp4Arch>(56, |name| file.tensor(name)).unwrap();
+        let gate = file
+            .tensor("model.language_model.layers.56.mlp.gate_proj.weight")
+            .unwrap();
+
+        assert_eq!(gate_up.weight_e4m3.len(), 1_024);
+        assert_eq!(gate_up.weight_e4m3[0], 0x10);
+        assert_eq!(gate_up.weight_e4m3[512], 0x20);
+        assert_eq!(gate_up.weight_e4m3.as_ptr(), gate.bytes.as_ptr());
+        assert_eq!(gate_up.scale_bf16.len(), 64);
+        assert_eq!(gate_up.scale_bf16[0], 0x30);
+        assert_eq!(gate_up.scale_bf16[32], 0x40);
+        assert_eq!((gate_up.rows, gate_up.columns, gate_up.layer), (32, 32, 56));
+        assert_eq!(down.weight.shape(), &[32, 16]);
+        assert_eq!(down.weight.codes()[0], 0x50);
+        assert_eq!(down.scale.shape(), &[32, 1]);
+        assert_eq!(down.scale.bytes()[0], 0x60);
+        assert_eq!(down.layer, 56);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn nvfp4_layer_route_is_exact() {
         for (layer, admitted) in [(0, true), (55, true), (56, false), (63, false), (64, false)] {
             assert_eq!(
@@ -529,6 +727,39 @@ mod tests {
                 "layer {layer}"
             );
         }
+    }
+
+    #[test]
+    fn dense_fp8_layer_route_is_exact() {
+        for (layer, admitted) in [(0, false), (55, false), (56, true), (63, true), (64, false)] {
+            assert_eq!(
+                require_dense_fp8_mlp_layer::<Nvfp4Arch>(layer).is_ok(),
+                admitted,
+                "layer {layer}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_dense_fp8_weight_dtype_mismatch() {
+        let path = fixture_path("dense-fp8-dtype");
+        let (mut header, payload) = dense_fp8_mlp_fixture(56);
+        header["model.language_model.layers.56.mlp.gate_proj.weight"]["dtype"] = json!("U8");
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let error = DenseFp8GateUpBindings::bind_from::<Nvfp4Arch>(
+            56,
+            |name| file.tensor(name),
+            |first, second, role| file.adjacent_tensor_bytes(first, second, role),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::Tensor);
+        assert!(error.to_string().contains("dtype `U8`, expected `F8_E4M3`"));
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

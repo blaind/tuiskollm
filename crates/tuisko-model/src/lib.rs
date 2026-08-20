@@ -7,7 +7,10 @@ mod materialize;
 mod safetensors;
 mod views;
 
-pub use bindings::{Nvfp4DownBindings, Nvfp4GateUpBindings, TextEndpointBindings};
+pub use bindings::{
+    DenseFp8DownBindings, DenseFp8GateUpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
+    TextEndpointBindings,
+};
 pub use config::validate_config;
 pub use dtype::DType;
 pub use error::{CheckpointError, CheckpointErrorCode, CheckpointResult};
