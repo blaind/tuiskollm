@@ -9,7 +9,7 @@ const LM_HEAD: &str = "lm_head.weight";
 const LM_HEAD_SCALE: &str = "lm_head.weight_scale";
 
 // These are source-codec facts, not architecture geometry.
-const NVFP4_MLP_LAYER_END: usize = 56;
+pub(crate) const NVFP4_MLP_LAYER_END: usize = 56;
 const DENSE_FP8_MLP_LAYER_START: usize = NVFP4_MLP_LAYER_END;
 const NVFP4_GROUP_SIZE: usize = 16;
 const E2M1_VALUES_PER_BYTE: usize = 2;
@@ -309,7 +309,7 @@ impl<'a> Nvfp4GateUpBindings<'a> {
         layer: usize,
         mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
     ) -> CheckpointResult<Self> {
-        require_nvfp4_mlp_layer::<A>(layer)?;
+        require_nvfp4_mlp_layer(layer, A::LAYERS)?;
 
         let intermediate = A::INTERMEDIATE as u64;
         let packed_columns = codec_columns(A::HIDDEN, E2M1_VALUES_PER_BYTE, "packed E2M1")?;
@@ -393,7 +393,7 @@ impl<'a> Nvfp4DownBindings<'a> {
         layer: usize,
         mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
     ) -> CheckpointResult<Self> {
-        require_nvfp4_mlp_layer::<A>(layer)?;
+        require_nvfp4_mlp_layer(layer, A::LAYERS)?;
 
         let hidden = A::HIDDEN as u64;
         let packed_columns = codec_columns(A::INTERMEDIATE, E2M1_VALUES_PER_BYTE, "packed E2M1")?;
@@ -462,8 +462,8 @@ impl<'a> TextEndpointBindings<'a> {
     }
 }
 
-fn require_nvfp4_mlp_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
-    if layer >= A::LAYERS || layer >= NVFP4_MLP_LAYER_END {
+pub(crate) fn require_nvfp4_mlp_layer(layer: usize, layer_count: usize) -> CheckpointResult<()> {
+    if layer >= layer_count || layer >= NVFP4_MLP_LAYER_END {
         return Err(CheckpointError::source_binding(format!(
             "layer {layer} does not use the admitted NVFP4 MLP source contract"
         )));
@@ -1002,7 +1002,7 @@ mod tests {
     fn nvfp4_layer_route_is_exact() {
         for (layer, admitted) in [(0, true), (55, true), (56, false), (63, false), (64, false)] {
             assert_eq!(
-                require_nvfp4_mlp_layer::<Nvfp4Arch>(layer).is_ok(),
+                require_nvfp4_mlp_layer(layer, Nvfp4Arch::LAYERS).is_ok(),
                 admitted,
                 "layer {layer}"
             );
@@ -1131,12 +1131,17 @@ mod tests {
 
     #[test]
     fn rejects_invalid_nvfp4_scale_codes() {
-        let error = validate_nvfp4_scales(55, "gate", &[0x38, 0x7f])
-            .err()
-            .unwrap();
+        assert!(validate_nvfp4_scales(55, "gate", &[0x7e]).is_ok());
 
-        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
-        assert!(error.to_string().contains("negative or NaN E4M3FN code"));
+        for code in [0x7f, 0x80, 0xfe, 0xff] {
+            let error = validate_nvfp4_scales(55, "gate", &[code]).err().unwrap();
+
+            assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+            assert!(
+                error.to_string().contains("negative or NaN E4M3FN code"),
+                "code {code:#04x}: {error}"
+            );
+        }
     }
 
     #[test]

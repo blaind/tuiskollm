@@ -253,6 +253,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{CheckpointSnapshot, INDEX_FILE, InventorySpec, MODEL_FILE, MTP_FILE};
+    use crate::config::test_quantization_config;
     use crate::{Arch, CheckpointErrorCode};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -272,8 +273,8 @@ mod tests {
         const HIDDEN: usize = 1;
         const INTERMEDIATE: usize = 1;
         const VOCAB: usize = 1;
-        const LAYERS: usize = 1;
-        const FULL_ATTENTION_INTERVAL: usize = 1;
+        const LAYERS: usize = 64;
+        const FULL_ATTENTION_INTERVAL: usize = 4;
         const NUM_ATTENTION_HEADS: usize = 1;
         const NUM_KV_HEADS: usize = 1;
         const HEAD_DIM: usize = 1;
@@ -343,6 +344,15 @@ mod tests {
     }
 
     fn write_config(root: &Path) {
+        let layer_types = (0usize..64)
+            .map(|layer| {
+                if (layer + 1).is_multiple_of(4) {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                }
+            })
+            .collect::<Vec<_>>();
         let config = json!({
             "architectures": ["Qwen3_5ForConditionalGeneration"],
             "dtype": "bfloat16",
@@ -351,13 +361,14 @@ mod tests {
             "model_type": "qwen3_5",
             "num_attention_heads": 1,
             "num_key_value_heads": 1,
+            "quantization_config": test_quantization_config(),
             "text_config": {
                 "dtype": "bfloat16",
-                "full_attention_interval": 1,
+                "full_attention_interval": 4,
                 "head_dim": 1,
                 "hidden_size": 1,
                 "intermediate_size": 1,
-                "layer_types": ["full_attention"],
+                "layer_types": layer_types,
                 "linear_conv_kernel_dim": 1,
                 "linear_key_head_dim": 1,
                 "linear_num_key_heads": 1,
@@ -365,7 +376,7 @@ mod tests {
                 "linear_value_head_dim": 1,
                 "model_type": "qwen3_5_text",
                 "num_attention_heads": 1,
-                "num_hidden_layers": 1,
+                "num_hidden_layers": 64,
                 "num_key_value_heads": 1,
                 "vocab_size": 1
             }

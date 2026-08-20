@@ -64,6 +64,9 @@ fn write_config(path: &Path) {
         "model_type": "qwen3_5",
         "num_attention_heads": 24,
         "num_key_value_heads": 4,
+        "quantization_config": serde_json::from_str::<Value>(include_str!(
+            "../fixtures/quantization-config.json"
+        )).unwrap(),
         "text_config": {
             "dtype": "bfloat16",
             "full_attention_interval": 4,

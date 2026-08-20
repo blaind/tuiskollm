@@ -1,0 +1,58 @@
+{
+  "config_groups": {
+    "group_0": {
+      "format": "float-quantized",
+      "input_activations": {
+        "dynamic": true,
+        "group_size": null,
+        "num_bits": 8,
+        "scale_dtype": null,
+        "strategy": "token",
+        "symmetric": true,
+        "type": "float"
+      },
+      "targets": [
+        "re:.*self_attn\\.(q|k|v|o)_proj$",
+        "re:.*linear_attn\\.(in_proj_qkv|in_proj_z|out_proj)$",
+        "re:.*lm_head",
+        "re:.*layers\\.(56|57|58|59|60|61|62|63)\\.mlp\\.(gate|up|down)_proj$"
+      ],
+      "weights": {
+        "dynamic": false,
+        "group_size": null,
+        "num_bits": 8,
+        "scale_dtype": null,
+        "strategy": "channel",
+        "symmetric": true,
+        "type": "float"
+      }
+    },
+    "group_1": {
+      "format": "nvfp4-pack-quantized",
+      "input_activations": {
+        "dynamic": "local",
+        "group_size": 16,
+        "num_bits": 4,
+        "scale_dtype": "torch.float8_e4m3fn",
+        "strategy": "tensor_group",
+        "symmetric": true,
+        "type": "float"
+      },
+      "targets": [
+        "re:.*mlp\\.(gate|up|down)_proj$"
+      ],
+      "weights": {
+        "dynamic": false,
+        "group_size": 16,
+        "num_bits": 4,
+        "scale_dtype": "torch.float8_e4m3fn",
+        "strategy": "tensor_group",
+        "symmetric": true,
+        "type": "float"
+      }
+    }
+  },
+  "format": "mixed-precision",
+  "quant_method": "compressed-tensors",
+  "quantization_status": "compressed"
+}
