@@ -1,5 +1,6 @@
 mod bindings;
 mod config;
+mod dtype;
 mod error;
 mod inventory;
 mod safetensors;
@@ -7,37 +8,62 @@ mod views;
 
 pub use bindings::TextEndpointBindings;
 pub use config::validate_config;
+pub use dtype::DType;
 pub use error::{CheckpointError, CheckpointResult};
 pub use inventory::CheckpointSnapshot;
 pub use safetensors::{SafeTensorFile, TensorView};
 pub use views::{Bf16View, Fp8E4M3View};
 
+/// Compile-time identity and geometry of an admitted model target.
 pub trait Arch: Copy + 'static {
+    /// Hugging Face repository identifier.
     const MODEL_ID: &'static str;
+    /// Immutable Hugging Face snapshot revision.
     const REVISION: &'static str;
+    /// Residual stream width.
     const HIDDEN: usize;
+    /// Dense MLP intermediate width.
     const INTERMEDIATE: usize;
+    /// Token vocabulary size.
     const VOCAB: usize;
+    /// Number of decoder layers.
     const LAYERS: usize;
+    /// Distance between full-attention layers.
     const FULL_ATTENTION_INTERVAL: usize;
+    /// Number of full-attention query heads.
     const NUM_ATTENTION_HEADS: usize;
+    /// Number of full-attention key/value heads.
     const NUM_KV_HEADS: usize;
+    /// Width of each full-attention head.
     const HEAD_DIM: usize;
+    /// Number of GDN query/key heads.
     const LINEAR_KEY_HEADS: usize;
+    /// Number of GDN value heads.
     const LINEAR_VALUE_HEADS: usize;
+    /// Width of each GDN head.
     const LINEAR_HEAD_DIM: usize;
+    /// Width of the GDN causal convolution.
     const LINEAR_CONV_KERNEL_DIM: usize;
 
+    /// Rows in the fused full-attention query and gate plane.
     const ATTENTION_QUERY_ROWS: usize = 2 * Self::NUM_ATTENTION_HEADS * Self::HEAD_DIM;
+    /// Rows in one full-attention key or value plane.
     const ATTENTION_KV_ROWS: usize = Self::NUM_KV_HEADS * Self::HEAD_DIM;
+    /// Rows in the fused full-attention query/gate, key, and value projection.
     const ATTENTION_QKV_ROWS: usize = Self::ATTENTION_QUERY_ROWS + 2 * Self::ATTENTION_KV_ROWS;
+    /// Rows in one GDN query or key plane.
     const GDN_QK_ROWS: usize = Self::LINEAR_KEY_HEADS * Self::LINEAR_HEAD_DIM;
+    /// Rows in one GDN value or Z plane.
     const GDN_VALUE_ROWS: usize = Self::LINEAR_VALUE_HEADS * Self::LINEAR_HEAD_DIM;
+    /// Rows in the fused GDN query, key, and value projection.
     const GDN_QKV_ROWS: usize = 2 * Self::GDN_QK_ROWS + Self::GDN_VALUE_ROWS;
+    /// Rows in the fused GDN query, key, value, and Z projection.
     const GDN_INPUT_ROWS: usize = Self::GDN_QKV_ROWS + Self::GDN_VALUE_ROWS;
+    /// Per-value-head GDN control width.
     const GDN_CONTROL_ROWS: usize = Self::LINEAR_VALUE_HEADS;
 }
 
+/// Geometry and pinned identity of `unsloth/Qwen3.8-27B-NVFP4`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Qwen38_27B;
 

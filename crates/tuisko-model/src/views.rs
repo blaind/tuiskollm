@@ -1,4 +1,4 @@
-use crate::{CheckpointError, CheckpointResult, TensorView};
+use crate::{CheckpointError, CheckpointResult, DType, TensorView};
 
 #[derive(Clone, Copy, Debug)]
 struct ValidatedView<'a, const RANK: usize> {
@@ -7,6 +7,7 @@ struct ValidatedView<'a, const RANK: usize> {
     bytes: &'a [u8],
 }
 
+/// Validated zero-copy view of little-endian BF16 source words.
 #[derive(Clone, Copy, Debug)]
 pub struct Bf16View<'a, const RANK: usize> {
     view: ValidatedView<'a, RANK>,
@@ -18,7 +19,7 @@ impl<'a, const RANK: usize> Bf16View<'a, RANK> {
         expected_shape: [u64; RANK],
     ) -> CheckpointResult<Self> {
         Ok(Self {
-            view: validate(tensor, "BF16", expected_shape, 2)?,
+            view: validate(tensor, DType::Bf16, expected_shape)?,
         })
     }
 
@@ -53,11 +54,15 @@ impl<'a, const RANK: usize> Bf16View<'a, RANK> {
     pub fn words(&self) -> impl DoubleEndedIterator<Item = u16> + ExactSizeIterator + '_ {
         self.view
             .bytes
-            .chunks_exact(2)
-            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .copied()
+            .map(u16::from_le_bytes)
     }
 }
 
+/// Validated zero-copy view of FP8 E4M3 source codes.
 #[derive(Clone, Copy, Debug)]
 pub struct Fp8E4M3View<'a, const RANK: usize> {
     view: ValidatedView<'a, RANK>,
@@ -69,7 +74,7 @@ impl<'a, const RANK: usize> Fp8E4M3View<'a, RANK> {
         expected_shape: [u64; RANK],
     ) -> CheckpointResult<Self> {
         Ok(Self {
-            view: validate(tensor, "F8_E4M3", expected_shape, 1)?,
+            view: validate(tensor, DType::Fp8E4M3, expected_shape)?,
         })
     }
 
@@ -96,9 +101,8 @@ impl<'a, const RANK: usize> Fp8E4M3View<'a, RANK> {
 
 fn validate<'a, const RANK: usize>(
     tensor: TensorView<'a>,
-    expected_dtype: &str,
+    expected_dtype: DType,
     expected_shape: [u64; RANK],
-    element_bytes: u64,
 ) -> CheckpointResult<ValidatedView<'a, RANK>> {
     if tensor.dtype != expected_dtype {
         return Err(CheckpointError::invalid(format!(
@@ -119,9 +123,11 @@ fn validate<'a, const RANK: usize>(
             CheckpointError::invalid(format!("tensor `{}` shape overflows", tensor.name))
         })
     })?;
-    let expected_bytes = elements.checked_mul(element_bytes).ok_or_else(|| {
-        CheckpointError::invalid(format!("tensor `{}` byte length overflows", tensor.name))
-    })?;
+    let expected_bytes = elements
+        .checked_mul(expected_dtype.byte_width())
+        .ok_or_else(|| {
+            CheckpointError::invalid(format!("tensor `{}` byte length overflows", tensor.name))
+        })?;
     let actual_bytes = u64::try_from(tensor.bytes.len()).map_err(|_| {
         CheckpointError::invalid(format!(
             "tensor `{}` is too large for this host",
@@ -146,13 +152,13 @@ fn validate<'a, const RANK: usize>(
 #[cfg(test)]
 mod tests {
     use super::{Bf16View, Fp8E4M3View};
-    use crate::TensorView;
+    use crate::{DType, TensorView};
 
     #[test]
     fn bf16_words_preserve_little_endian_source_bits() {
         let tensor = TensorView {
             name: "bf16",
-            dtype: "BF16",
+            dtype: DType::Bf16,
             shape: &[2],
             bytes: &[0x80, 0x3f, 0x00, 0x40],
             data_range: 0..4,
@@ -170,14 +176,14 @@ mod tests {
     fn typed_views_reject_dtype_and_shape_mismatches() {
         let wrong_dtype = TensorView {
             name: "codes",
-            dtype: "U8",
+            dtype: DType::U8,
             shape: &[2],
             bytes: &[1, 2],
             data_range: 0..2,
         };
         let wrong_shape = TensorView {
             name: "codes",
-            dtype: "F8_E4M3",
+            dtype: DType::Fp8E4M3,
             shape: &[2],
             bytes: &[1, 2],
             data_range: 0..2,
@@ -200,7 +206,7 @@ mod tests {
     fn typed_views_reject_byte_length_mismatch() {
         let tensor = TensorView {
             name: "bf16",
-            dtype: "BF16",
+            dtype: DType::Bf16,
             shape: &[2],
             bytes: &[0x80, 0x3f],
             data_range: 0..2,
