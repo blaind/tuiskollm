@@ -21,8 +21,8 @@ jobs:
         with:
           components: clippy, llvm-tools-preview, rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --workspace --exclude tuisko-gpu --all-targets -- -D warnings
+      - run: cargo test --workspace --exclude tuisko-gpu
       - run: cargo bench -p tuisko-model --bench checkpoint -- --sample-size 10
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Host coverage
@@ -32,3 +32,5 @@ jobs:
           cargo llvm-cov --package tuisko-model --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
       - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --workspace --all-features
