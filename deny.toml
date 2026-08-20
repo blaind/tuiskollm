@@ -1,0 +1,15 @@
+[advisories]
+unmaintained = "workspace"
+unsound = "all"
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+
+[licenses]
+confidence-threshold = 0.93
+allow = ["Apache-2.0", "MIT"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
