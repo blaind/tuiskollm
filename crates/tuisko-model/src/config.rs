@@ -46,10 +46,7 @@ pub fn validate_config<A: Arch>(path: &Path) -> CheckpointResult<()> {
     let bytes = fs::read(path).map_err(|source| CheckpointError::io("reading", path, source))?;
 
     let config: ModelConfig =
-        serde_json::from_slice(&bytes).map_err(|source| CheckpointError::Json {
-            path: path.to_owned(),
-            source,
-        })?;
+        serde_json::from_slice(&bytes).map_err(|source| CheckpointError::json(path, source))?;
 
     validate::<A>(path, &config)
 }
@@ -215,7 +212,7 @@ fn invalid_field(
     actual: impl Debug,
     expected: impl Debug,
 ) -> CheckpointError {
-    CheckpointError::invalid(format!(
+    CheckpointError::config(format!(
         "{} config field `{field}` is {actual:?}, expected {expected:?}",
         path.display()
     ))
@@ -224,7 +221,7 @@ fn invalid_field(
 #[cfg(test)]
 mod tests {
     use super::validate_config;
-    use crate::Qwen38_27B;
+    use crate::{CheckpointErrorCode, Qwen38_27B};
     use serde_json::{Value, json};
     use std::fs;
     use std::path::PathBuf;
@@ -326,12 +323,10 @@ mod tests {
         for (label, config, field) in cases {
             let path = write_config(label, &config);
 
-            let error = validate_config::<Qwen38_27B>(&path)
-                .err()
-                .unwrap()
-                .to_string();
+            let error = validate_config::<Qwen38_27B>(&path).err().unwrap();
 
-            assert!(error.contains(field), "{error}");
+            assert_eq!(error.code(), CheckpointErrorCode::Config);
+            assert!(error.to_string().contains(field), "{error}");
 
             fs::remove_file(path).unwrap();
         }
@@ -351,13 +346,11 @@ mod tests {
             config["architectures"] = architectures;
             let path = write_config(label, &config);
 
-            let error = validate_config::<Qwen38_27B>(&path)
-                .err()
-                .unwrap()
-                .to_string();
+            let error = validate_config::<Qwen38_27B>(&path).err().unwrap();
 
+            assert_eq!(error.code(), CheckpointErrorCode::Config);
             assert!(
-                error.contains(&format!(
+                error.to_string().contains(&format!(
                     "config field `architectures length` is {count}, expected 1"
                 )),
                 "{error}"

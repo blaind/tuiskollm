@@ -9,7 +9,7 @@ mod views;
 pub use bindings::{Nvfp4DownBindings, Nvfp4GateUpBindings, TextEndpointBindings};
 pub use config::validate_config;
 pub use dtype::DType;
-pub use error::{CheckpointError, CheckpointResult};
+pub use error::{CheckpointError, CheckpointErrorCode, CheckpointResult};
 pub use inventory::CheckpointSnapshot;
 pub use safetensors::{SafeTensorFile, TensorView};
 pub use views::{Bf16View, F32View, Fp8E4M3View, U8View};
