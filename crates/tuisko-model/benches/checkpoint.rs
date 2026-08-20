@@ -82,6 +82,8 @@ fn write_config(path: &Path) {
             "linear_num_value_heads": 48,
             "linear_value_head_dim": 128,
             "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 1,
+            "mtp_use_dedicated_embeddings": false,
             "num_attention_heads": 24,
             "num_hidden_layers": 64,
             "num_key_value_heads": 4,

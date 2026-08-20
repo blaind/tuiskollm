@@ -5,7 +5,7 @@ use crate::bindings::{
     validate_nvfp4_scales,
 };
 use crate::{
-    CheckpointError, CheckpointResult, FullAttentionQkvBindings, Nvfp4DownBindings,
+    CheckpointError, CheckpointResult, FullAttentionQkvBindings, MtpBindings, Nvfp4DownBindings,
     Nvfp4GateUpBindings,
 };
 
@@ -81,8 +81,7 @@ impl FullAttentionQkvBindings<'_> {
                 self.key_weight.codes(),
                 self.value_weight.codes(),
             ],
-            self.layer,
-            "QKV weights",
+            &format!("layer-{} full-attention QKV weights", self.layer),
         )?;
         let scale_bf16 = gather_source_planes(
             &[
@@ -90,8 +89,7 @@ impl FullAttentionQkvBindings<'_> {
                 self.key_scale.bytes(),
                 self.value_scale.bytes(),
             ],
-            self.layer,
-            "QKV scales",
+            &format!("layer-{} full-attention QKV scales", self.layer),
         )?;
 
         Ok(MaterializedFullAttentionQkv {
@@ -100,6 +98,54 @@ impl FullAttentionQkvBindings<'_> {
             rows,
             columns,
             layer: self.layer,
+        })
+    }
+}
+
+/// Runtime-native fused BF16 MTP QKV plane in query/gate, key, value row order.
+#[derive(Debug)]
+pub struct MaterializedMtpQkv {
+    /// Losslessly gathered little-endian BF16 weights `[rows, columns]`.
+    pub weight_bf16: Vec<u8>,
+    /// Fused query/gate, key, and value row count.
+    pub rows: usize,
+    /// Logical input width.
+    pub columns: usize,
+}
+
+impl MtpBindings<'_> {
+    /// Gathers the non-contiguous draft QKV planes without changing BF16 words.
+    pub fn materialize_qkv(&self) -> CheckpointResult<MaterializedMtpQkv> {
+        let [query_rows, columns] =
+            host_shape(self.query_gate_weight.shape(), "MTP query/gate weights")?;
+        let [key_rows, key_columns] = host_shape(self.key_weight.shape(), "MTP key weights")?;
+        let [value_rows, value_columns] =
+            host_shape(self.value_weight.shape(), "MTP value weights")?;
+
+        if key_rows != value_rows || columns != key_columns || columns != value_columns {
+            return Err(CheckpointError::source_binding(
+                "MTP QKV source planes have incompatible shapes",
+            ));
+        }
+
+        let rows = query_rows
+            .checked_add(key_rows)
+            .and_then(|rows| rows.checked_add(value_rows))
+            .ok_or_else(|| CheckpointError::source_binding("MTP QKV row count overflows"))?;
+
+        let weight_bf16 = gather_source_planes(
+            &[
+                self.query_gate_weight.bytes(),
+                self.key_weight.bytes(),
+                self.value_weight.bytes(),
+            ],
+            "MTP QKV weights",
+        )?;
+
+        Ok(MaterializedMtpQkv {
+            weight_bf16,
+            rows,
+            columns,
         })
     }
 }
@@ -246,21 +292,17 @@ fn host_shape(shape: &[u64; 2], role: &str) -> CheckpointResult<[usize; 2]> {
     Ok([rows, columns])
 }
 
-fn gather_source_planes(planes: &[&[u8]], layer: usize, role: &str) -> CheckpointResult<Vec<u8>> {
+fn gather_source_planes(planes: &[&[u8]], role: &str) -> CheckpointResult<Vec<u8>> {
     let bytes = planes.iter().try_fold(0usize, |bytes, plane| {
-        bytes.checked_add(plane.len()).ok_or_else(|| {
-            CheckpointError::source_binding(format!(
-                "layer-{layer} full-attention {role} length overflows"
-            ))
-        })
+        bytes
+            .checked_add(plane.len())
+            .ok_or_else(|| CheckpointError::source_binding(format!("{role} length overflows")))
     })?;
 
     let mut gathered = Vec::new();
 
     gathered.try_reserve_exact(bytes).map_err(|_| {
-        CheckpointError::source_binding(format!(
-            "layer-{layer} full-attention {role} cannot reserve {bytes} host bytes"
-        ))
+        CheckpointError::source_binding(format!("{role} cannot reserve {bytes} host bytes"))
     })?;
 
     for plane in planes {

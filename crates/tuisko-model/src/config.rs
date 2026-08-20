@@ -89,6 +89,8 @@ struct TextConfig {
     linear_num_value_heads: usize,
     linear_value_head_dim: usize,
     model_type: String,
+    mtp_num_hidden_layers: usize,
+    mtp_use_dedicated_embeddings: bool,
     num_attention_heads: usize,
     num_hidden_layers: usize,
     num_key_value_heads: usize,
@@ -188,6 +190,18 @@ fn validate<A: Arch>(path: &Path, config: &ModelConfig) -> CheckpointResult<()> 
         "text_config.model_type",
         text.model_type.as_str(),
         TEXT_MODEL_TYPE,
+    )?;
+    require(
+        path,
+        "text_config.mtp_num_hidden_layers",
+        text.mtp_num_hidden_layers,
+        A::MTP_LAYERS,
+    )?;
+    require(
+        path,
+        "text_config.mtp_use_dedicated_embeddings",
+        text.mtp_use_dedicated_embeddings,
+        A::MTP_USES_DEDICATED_EMBEDDINGS,
     )?;
     require(
         path,
@@ -491,6 +505,8 @@ mod tests {
                 "linear_num_value_heads": 48,
                 "linear_value_head_dim": 128,
                 "model_type": "qwen3_5_text",
+                "mtp_num_hidden_layers": 1,
+                "mtp_use_dedicated_embeddings": false,
                 "num_attention_heads": 24,
                 "num_hidden_layers": 64,
                 "num_key_value_heads": 4,
@@ -627,6 +643,36 @@ mod tests {
 
             fs::remove_file(path).unwrap();
         }
+
+        let mut config = valid_config();
+        config["text_config"]["mtp_num_hidden_layers"] = json!(2);
+        let path = write_config("mtp_num_hidden_layers", &config);
+        let error = validate_config::<Qwen38_27B>(&path)
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            error.contains("text_config.mtp_num_hidden_layers"),
+            "{error}"
+        );
+
+        fs::remove_file(path).unwrap();
+
+        let mut config = valid_config();
+        config["text_config"]["mtp_use_dedicated_embeddings"] = json!(true);
+        let path = write_config("mtp_use_dedicated_embeddings", &config);
+        let error = validate_config::<Qwen38_27B>(&path)
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            error.contains("text_config.mtp_use_dedicated_embeddings"),
+            "{error}"
+        );
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
