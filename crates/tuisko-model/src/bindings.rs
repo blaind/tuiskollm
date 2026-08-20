@@ -5,11 +5,16 @@ const FINAL_NORM: &str = "model.language_model.norm.weight";
 const LM_HEAD: &str = "lm_head.weight";
 const LM_HEAD_SCALE: &str = "lm_head.weight_scale";
 
+/// Shape- and dtype-checked source views for the text input and output endpoints.
 #[derive(Clone, Copy, Debug)]
 pub struct TextEndpointBindings<'a> {
+    /// BF16 token embedding matrix `[vocab, hidden]`.
     pub embedding: Bf16View<'a, 2>,
+    /// BF16 final RMSNorm weights `[hidden]`.
     pub final_norm: Bf16View<'a, 1>,
+    /// FP8 E4M3 language-model head `[vocab, hidden]`.
     pub lm_head: Fp8E4M3View<'a, 2>,
+    /// Per-vocabulary-row BF16 language-model head scales `[vocab, 1]`.
     pub lm_head_scale: Bf16View<'a, 2>,
 }
 

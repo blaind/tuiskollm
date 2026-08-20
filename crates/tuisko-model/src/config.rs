@@ -41,6 +41,7 @@ struct TextConfig {
     vocab_size: usize,
 }
 
+/// Validates a checkpoint config against the selected architecture.
 pub fn validate_config<A: Arch>(path: &Path) -> CheckpointResult<()> {
     let bytes = fs::read(path).map_err(|source| CheckpointError::io("reading", path, source))?;
 

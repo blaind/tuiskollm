@@ -1,4 +1,4 @@
-use crate::{CheckpointError, CheckpointResult};
+use crate::{CheckpointError, CheckpointResult, DType};
 use memmap2::{Mmap, MmapOptions};
 use serde::Deserialize;
 use serde_json::Value;
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct TensorDescriptor {
-    dtype: String,
+    dtype: DType,
     shape: Vec<u64>,
     data_offsets: [u64; 2],
 }
@@ -148,7 +148,7 @@ impl SafeTensorFile {
 
         Ok(TensorView {
             name: stored_name,
-            dtype: &descriptor.dtype,
+            dtype: descriptor.dtype,
             shape: &descriptor.shape,
             bytes,
             data_range: descriptor.range(),
@@ -177,12 +177,18 @@ impl SafeTensorFile {
     }
 }
 
+/// Borrowed source tensor whose descriptor and byte range have been validated.
 #[derive(Clone, Debug)]
 pub struct TensorView<'a> {
+    /// Exact tensor name from the safetensors header.
     pub name: &'a str,
-    pub dtype: &'a str,
+    /// Stored element representation.
+    pub dtype: DType,
+    /// Row-major dimensions from the safetensors header.
     pub shape: &'a [u64],
+    /// Unmodified source bytes.
     pub bytes: &'a [u8],
+    /// Byte offsets relative to the shard's data section.
     pub data_range: Range<u64>,
 }
 
@@ -201,13 +207,7 @@ fn validate_descriptor(
         )));
     }
 
-    let width = dtype_width(&descriptor.dtype).ok_or_else(|| {
-        CheckpointError::invalid(format!(
-            "{} tensor `{name}` uses unsupported dtype `{}`",
-            path.display(),
-            descriptor.dtype
-        ))
-    })?;
+    let width = descriptor.dtype.byte_width();
 
     let elements = descriptor
         .shape
@@ -241,19 +241,10 @@ fn validate_descriptor(
     Ok(())
 }
 
-fn dtype_width(dtype: &str) -> Option<u64> {
-    match dtype {
-        "BOOL" | "I8" | "U8" | "F8_E4M3" | "F8_E5M2" => Some(1),
-        "I16" | "U16" | "F16" | "BF16" => Some(2),
-        "I32" | "U32" | "F32" => Some(4),
-        "I64" | "U64" | "F64" => Some(8),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::SafeTensorFile;
+    use crate::DType;
     use serde_json::{Value, json};
     use std::fs::{self, File};
     use std::io::Write;
@@ -300,7 +291,7 @@ mod tests {
         let file = SafeTensorFile::open(&path).unwrap();
         let codes = file.tensor("codes").unwrap();
 
-        assert_eq!(codes.dtype, "F8_E4M3");
+        assert_eq!(codes.dtype, DType::Fp8E4M3);
         assert_eq!(codes.shape, &[2, 2]);
         assert_eq!(codes.bytes, &[0x38, 0xb8, 0x01, 0x7e]);
 
@@ -342,6 +333,22 @@ mod tests {
         let error = SafeTensorFile::open(&path).err().unwrap().to_string();
 
         assert!(error.contains("overlap"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_dtype_outside_checkpoint_contract() {
+        let path = fixture_path("unsupported-dtype");
+        write_safetensors(
+            &path,
+            json!({"x": {"dtype":"F16", "shape":[1], "data_offsets":[0,2]}}),
+            &[0; 2],
+        );
+
+        let error = SafeTensorFile::open(&path).err().unwrap().to_string();
+
+        assert!(error.contains("unsupported checkpoint dtype `F16`"));
 
         fs::remove_file(path).unwrap();
     }

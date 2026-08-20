@@ -48,6 +48,7 @@ enum Shard {
     Mtp,
 }
 
+/// Exact-inventory, mmap-backed view of an admitted checkpoint snapshot.
 pub struct CheckpointSnapshot<A: Arch> {
     root: PathBuf,
     tensors: BTreeMap<String, Shard>,
