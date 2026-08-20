@@ -1,6 +1,8 @@
+mod config;
 mod error;
 mod safetensors;
 
+pub use config::validate_config;
 pub use error::{CheckpointError, CheckpointResult};
 pub use safetensors::{SafeTensorFile, TensorView};
 
