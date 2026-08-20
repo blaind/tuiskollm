@@ -1,9 +1,11 @@
 mod config;
 mod error;
+mod inventory;
 mod safetensors;
 
 pub use config::validate_config;
 pub use error::{CheckpointError, CheckpointResult};
+pub use inventory::CheckpointSnapshot;
 pub use safetensors::{SafeTensorFile, TensorView};
 
 pub trait Arch: Copy + 'static {
