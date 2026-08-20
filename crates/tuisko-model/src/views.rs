@@ -62,6 +62,55 @@ impl<'a, const RANK: usize> Bf16View<'a, RANK> {
     }
 }
 
+/// Validated zero-copy view of little-endian F32 source values.
+#[derive(Clone, Copy, Debug)]
+pub struct F32View<'a, const RANK: usize> {
+    view: ValidatedView<'a, RANK>,
+}
+
+impl<'a, const RANK: usize> F32View<'a, RANK> {
+    pub(crate) fn bind(
+        tensor: TensorView<'a>,
+        expected_shape: [u64; RANK],
+    ) -> CheckpointResult<Self> {
+        Ok(Self {
+            view: validate(tensor, DType::F32, expected_shape)?,
+        })
+    }
+
+    pub fn name(&self) -> &'a str {
+        self.view.name
+    }
+
+    pub fn shape(&self) -> &[u64; RANK] {
+        &self.view.shape
+    }
+
+    pub fn bytes(&self) -> &'a [u8] {
+        self.view.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.view.bytes.len() / 4
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.view.bytes.is_empty()
+    }
+
+    pub fn bits(&self, index: usize) -> Option<u32> {
+        let begin = index.checked_mul(4)?;
+        let end = begin.checked_add(4)?;
+        let bytes: [u8; 4] = self.view.bytes.get(begin..end)?.try_into().ok()?;
+
+        Some(u32::from_le_bytes(bytes))
+    }
+
+    pub fn value(&self, index: usize) -> Option<f32> {
+        self.bits(index).map(f32::from_bits)
+    }
+}
+
 /// Validated zero-copy view of FP8 E4M3 source codes.
 #[derive(Clone, Copy, Debug)]
 pub struct Fp8E4M3View<'a, const RANK: usize> {
@@ -87,6 +136,43 @@ impl<'a, const RANK: usize> Fp8E4M3View<'a, RANK> {
     }
 
     pub fn codes(&self) -> &'a [u8] {
+        self.view.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.view.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.view.bytes.is_empty()
+    }
+}
+
+/// Validated zero-copy view of raw U8 source elements.
+#[derive(Clone, Copy, Debug)]
+pub struct U8View<'a, const RANK: usize> {
+    view: ValidatedView<'a, RANK>,
+}
+
+impl<'a, const RANK: usize> U8View<'a, RANK> {
+    pub(crate) fn bind(
+        tensor: TensorView<'a>,
+        expected_shape: [u64; RANK],
+    ) -> CheckpointResult<Self> {
+        Ok(Self {
+            view: validate(tensor, DType::U8, expected_shape)?,
+        })
+    }
+
+    pub fn name(&self) -> &'a str {
+        self.view.name
+    }
+
+    pub fn shape(&self) -> &[u64; RANK] {
+        &self.view.shape
+    }
+
+    pub fn bytes(&self) -> &'a [u8] {
         self.view.bytes
     }
 
@@ -151,7 +237,7 @@ fn validate<'a, const RANK: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Bf16View, Fp8E4M3View};
+    use super::{Bf16View, F32View, Fp8E4M3View, U8View};
     use crate::{DType, TensorView};
 
     #[test]
@@ -215,5 +301,38 @@ mod tests {
         let error = Bf16View::bind(tensor, [2]).err().unwrap().to_string();
 
         assert!(error.contains("has 2 bytes, expected 4"));
+    }
+
+    #[test]
+    fn f32_values_preserve_little_endian_source_bits() {
+        let tensor = TensorView {
+            name: "f32",
+            dtype: DType::F32,
+            shape: &[2],
+            bytes: &[0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x00, 0xbf],
+            data_range: 0..8,
+        };
+
+        let view = F32View::bind(tensor, [2]).unwrap();
+
+        assert_eq!(view.bits(0), Some(3.0f32.to_bits()));
+        assert_eq!(view.value(1), Some(-0.5));
+        assert_eq!(view.value(2), None);
+    }
+
+    #[test]
+    fn u8_view_preserves_source_bytes() {
+        let tensor = TensorView {
+            name: "packed",
+            dtype: DType::U8,
+            shape: &[2, 2],
+            bytes: &[0x10, 0x32, 0x54, 0x76],
+            data_range: 0..4,
+        };
+
+        let view = U8View::bind(tensor, [2, 2]).unwrap();
+
+        assert_eq!(view.shape(), &[2, 2]);
+        assert_eq!(view.bytes(), &[0x10, 0x32, 0x54, 0x76]);
     }
 }

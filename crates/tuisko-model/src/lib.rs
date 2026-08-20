@@ -6,13 +6,13 @@ mod inventory;
 mod safetensors;
 mod views;
 
-pub use bindings::TextEndpointBindings;
+pub use bindings::{Nvfp4DownBindings, Nvfp4GateUpBindings, TextEndpointBindings};
 pub use config::validate_config;
 pub use dtype::DType;
 pub use error::{CheckpointError, CheckpointResult};
 pub use inventory::CheckpointSnapshot;
 pub use safetensors::{SafeTensorFile, TensorView};
-pub use views::{Bf16View, Fp8E4M3View};
+pub use views::{Bf16View, F32View, Fp8E4M3View, U8View};
 
 /// Compile-time identity and geometry of an admitted model target.
 pub trait Arch: Copy + 'static {
