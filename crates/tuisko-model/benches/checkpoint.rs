@@ -1,4 +1,4 @@
-//! Admission benchmarks for config and safetensors header fixtures.
+//! Host benchmarks for checkpoint admission and NVFP4 scale materialization.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use serde_json::{Value, json};
@@ -7,7 +7,10 @@ use std::hint::black_box;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tuisko_model::{Qwen38_27B, SafeTensorFile, validate_config};
+use tuisko_model::{
+    Arch, DType, Fp8E4M3View, Nvfp4DownBindings, Nvfp4GateUpBindings, Qwen38_27B, SafeTensorFile,
+    TensorView, U8View, validate_config,
+};
 
 const TENSOR_COUNT: usize = 1_953;
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -137,6 +140,94 @@ fn checkpoint_benches(criterion: &mut Criterion) {
 
             black_box(file.tensor_count());
         });
+    });
+    group.finish();
+
+    nvfp4_materialization_benches(criterion);
+}
+
+fn tensor_view<'a>(
+    name: &'a str,
+    dtype: DType,
+    shape: &'a [u64],
+    bytes: &'a [u8],
+) -> TensorView<'a> {
+    TensorView {
+        name,
+        dtype,
+        shape,
+        bytes,
+        data_range: 0..bytes.len() as u64,
+    }
+}
+
+fn nvfp4_materialization_benches(criterion: &mut Criterion) {
+    let hidden = Qwen38_27B::HIDDEN as u64;
+    let intermediate = Qwen38_27B::INTERMEDIATE as u64;
+
+    let gate_weight = vec![0x5a; (intermediate * (hidden / 2)) as usize];
+    let up_weight = vec![0x5a; (intermediate * (hidden / 2)) as usize];
+    let gate_scale = vec![0x30; (intermediate * (hidden / 16)) as usize];
+    let up_scale = vec![0x30; (intermediate * (hidden / 16)) as usize];
+    let down_weight = vec![0x5a; (hidden * (intermediate / 2)) as usize];
+    let down_scale = vec![0x30; (hidden * (intermediate / 16)) as usize];
+
+    let gate_shape = [intermediate, hidden / 2];
+    let gate_scale_shape = [intermediate, hidden / 16];
+    let down_shape = [hidden, intermediate / 2];
+    let down_scale_shape = [hidden, intermediate / 16];
+
+    let gate_up = Nvfp4GateUpBindings {
+        gate_weight: U8View::bind(
+            tensor_view("gate", DType::U8, &gate_shape, &gate_weight),
+            gate_shape,
+        )
+        .unwrap(),
+        up_weight: U8View::bind(
+            tensor_view("up", DType::U8, &gate_shape, &up_weight),
+            gate_shape,
+        )
+        .unwrap(),
+        gate_scale: Fp8E4M3View::bind(
+            tensor_view("gate_scale", DType::Fp8E4M3, &gate_scale_shape, &gate_scale),
+            gate_scale_shape,
+        )
+        .unwrap(),
+        up_scale: Fp8E4M3View::bind(
+            tensor_view("up_scale", DType::Fp8E4M3, &gate_scale_shape, &up_scale),
+            gate_scale_shape,
+        )
+        .unwrap(),
+        input_scale_divisor: 1.0,
+        weight_scale_divisor: 1.0,
+        layer: 0,
+    };
+
+    let down = Nvfp4DownBindings {
+        weight: U8View::bind(
+            tensor_view("down", DType::U8, &down_shape, &down_weight),
+            down_shape,
+        )
+        .unwrap(),
+        scale: Fp8E4M3View::bind(
+            tensor_view("down_scale", DType::Fp8E4M3, &down_scale_shape, &down_scale),
+            down_scale_shape,
+        )
+        .unwrap(),
+        input_scale_divisor: 1.0,
+        weight_scale_divisor: 1.0,
+        layer: 0,
+    };
+
+    let mut group = criterion.benchmark_group("checkpoint/nvfp4-scale-materialization");
+    group.sample_size(60);
+    group.throughput(Throughput::Bytes(gate_scale.len() as u64 * 2));
+    group.bench_function("gate-up", |bencher| {
+        bencher.iter(|| black_box(gate_up.materialize().unwrap()));
+    });
+    group.throughput(Throughput::Bytes(down_scale.len() as u64));
+    group.bench_function("down", |bencher| {
+        bencher.iter(|| black_box(down.materialize().unwrap()));
     });
     group.finish();
 }

@@ -134,10 +134,8 @@ pub struct Fp8E4M3View<'a, const RANK: usize> {
 }
 
 impl<'a, const RANK: usize> Fp8E4M3View<'a, RANK> {
-    pub(crate) fn bind(
-        tensor: TensorView<'a>,
-        expected_shape: [u64; RANK],
-    ) -> CheckpointResult<Self> {
+    /// Binds a validated view from an admitted tensor descriptor.
+    pub fn bind(tensor: TensorView<'a>, expected_shape: [u64; RANK]) -> CheckpointResult<Self> {
         Ok(Self {
             view: validate(tensor, DType::Fp8E4M3, expected_shape)?,
         })
@@ -176,10 +174,8 @@ pub struct U8View<'a, const RANK: usize> {
 }
 
 impl<'a, const RANK: usize> U8View<'a, RANK> {
-    pub(crate) fn bind(
-        tensor: TensorView<'a>,
-        expected_shape: [u64; RANK],
-    ) -> CheckpointResult<Self> {
+    /// Binds a validated view from an admitted tensor descriptor.
+    pub fn bind(tensor: TensorView<'a>, expected_shape: [u64; RANK]) -> CheckpointResult<Self> {
         Ok(Self {
             view: validate(tensor, DType::U8, expected_shape)?,
         })
