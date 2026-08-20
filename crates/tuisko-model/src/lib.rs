@@ -1,3 +1,9 @@
+mod error;
+mod safetensors;
+
+pub use error::{CheckpointError, CheckpointResult};
+pub use safetensors::{SafeTensorFile, TensorView};
+
 pub trait Arch: Copy + 'static {
     const MODEL_ID: &'static str;
     const REVISION: &'static str;

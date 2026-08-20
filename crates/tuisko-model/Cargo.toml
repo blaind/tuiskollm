@@ -5,5 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+memmap2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
 [lints.rust]
 unsafe_code = "allow"
