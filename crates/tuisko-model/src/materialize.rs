@@ -1,13 +1,108 @@
 //! Lossless conversion from source bindings to runtime-native host layouts.
 
-use crate::bindings::{NVFP4_MLP_LAYER_END, require_nvfp4_mlp_layer, validate_nvfp4_scales};
-use crate::{CheckpointError, CheckpointResult, Nvfp4DownBindings, Nvfp4GateUpBindings};
+use crate::bindings::{
+    NVFP4_MLP_LAYER_END, require_full_attention_layer, require_nvfp4_mlp_layer,
+    validate_nvfp4_scales,
+};
+use crate::{
+    CheckpointError, CheckpointResult, FullAttentionQkvBindings, Nvfp4DownBindings,
+    Nvfp4GateUpBindings,
+};
 
 const SCALE_TILE_ROWS: usize = 128;
 const SCALE_TILE_GROUPS: usize = 4;
 const SCALE_TILE_BYTES: usize = SCALE_TILE_ROWS * SCALE_TILE_GROUPS;
 const NVFP4_GROUP_SIZE: usize = 16;
 const E2M1_VALUES_PER_BYTE: usize = 2;
+
+/// Runtime-native fused QKV planes in query/gate, key, value row order.
+#[derive(Debug)]
+pub struct MaterializedFullAttentionQkv {
+    /// Losslessly gathered E4M3 weights `[rows, columns]`.
+    pub weight_e4m3: Vec<u8>,
+    /// Losslessly gathered little-endian BF16 row scales `[rows, 1]`.
+    pub scale_bf16: Vec<u8>,
+    /// Fused query/gate, key, and value row count.
+    pub rows: usize,
+    /// Logical input width.
+    pub columns: usize,
+    /// Decoder layer owning this layout.
+    pub layer: usize,
+}
+
+impl FullAttentionQkvBindings<'_> {
+    /// Gathers the non-contiguous source planes without requantizing represented values.
+    pub fn materialize(self) -> CheckpointResult<MaterializedFullAttentionQkv> {
+        require_full_attention_layer(self.layer, self.layer_count, self.full_attention_interval)?;
+
+        let [query_rows, columns] = host_shape(
+            self.query_gate_weight.shape(),
+            "full-attention query/gate weights",
+        )?;
+        let [key_rows, key_columns] =
+            host_shape(self.key_weight.shape(), "full-attention key weights")?;
+        let [value_rows, value_columns] =
+            host_shape(self.value_weight.shape(), "full-attention value weights")?;
+
+        let query_scale_shape = host_shape(
+            self.query_gate_scale.shape(),
+            "full-attention query/gate scales",
+        )?;
+        let key_scale_shape = host_shape(self.key_scale.shape(), "full-attention key scales")?;
+        let value_scale_shape =
+            host_shape(self.value_scale.shape(), "full-attention value scales")?;
+
+        if key_rows != value_rows
+            || columns != key_columns
+            || columns != value_columns
+            || query_scale_shape != [query_rows, 1]
+            || key_scale_shape != [key_rows, 1]
+            || value_scale_shape != [value_rows, 1]
+        {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{} full-attention QKV source planes have incompatible shapes",
+                self.layer
+            )));
+        }
+
+        let rows = query_rows
+            .checked_add(key_rows)
+            .and_then(|rows| rows.checked_add(value_rows))
+            .ok_or_else(|| {
+                CheckpointError::source_binding(format!(
+                    "layer-{} full-attention QKV row count overflows",
+                    self.layer
+                ))
+            })?;
+
+        let weight_e4m3 = gather_source_planes(
+            &[
+                self.query_gate_weight.codes(),
+                self.key_weight.codes(),
+                self.value_weight.codes(),
+            ],
+            self.layer,
+            "QKV weights",
+        )?;
+        let scale_bf16 = gather_source_planes(
+            &[
+                self.query_gate_scale.bytes(),
+                self.key_scale.bytes(),
+                self.value_scale.bytes(),
+            ],
+            self.layer,
+            "QKV scales",
+        )?;
+
+        Ok(MaterializedFullAttentionQkv {
+            weight_e4m3,
+            scale_bf16,
+            rows,
+            columns,
+            layer: self.layer,
+        })
+    }
+}
 
 /// Runtime-native NVFP4 gate/up layout with source packed weights retained zero-copy.
 #[derive(Debug)]
@@ -35,10 +130,11 @@ impl<'a> Nvfp4GateUpBindings<'a> {
     pub fn materialize(self) -> CheckpointResult<MaterializedNvfp4GateUp<'a>> {
         require_nvfp4_mlp_layer(self.layer, NVFP4_MLP_LAYER_END)?;
 
-        let [gate_rows, packed_columns] = host_shape(self.gate_weight.shape(), "gate weights")?;
-        let up_shape = host_shape(self.up_weight.shape(), "up weights")?;
-        let [gate_scale_rows, groups] = host_shape(self.gate_scale.shape(), "gate scales")?;
-        let up_scale_shape = host_shape(self.up_scale.shape(), "up scales")?;
+        let [gate_rows, packed_columns] =
+            host_shape(self.gate_weight.shape(), "NVFP4 gate weights")?;
+        let up_shape = host_shape(self.up_weight.shape(), "NVFP4 up weights")?;
+        let [gate_scale_rows, groups] = host_shape(self.gate_scale.shape(), "NVFP4 gate scales")?;
+        let up_scale_shape = host_shape(self.up_scale.shape(), "NVFP4 up scales")?;
 
         if [gate_rows, packed_columns] != up_shape
             || [gate_scale_rows, groups] != up_scale_shape
@@ -108,8 +204,8 @@ impl<'a> Nvfp4DownBindings<'a> {
     pub fn materialize(self) -> CheckpointResult<MaterializedNvfp4Down<'a>> {
         require_nvfp4_mlp_layer(self.layer, NVFP4_MLP_LAYER_END)?;
 
-        let [rows, packed_columns] = host_shape(self.weight.shape(), "down weights")?;
-        let [scale_rows, groups] = host_shape(self.scale.shape(), "down scales")?;
+        let [rows, packed_columns] = host_shape(self.weight.shape(), "NVFP4 down weights")?;
+        let [scale_rows, groups] = host_shape(self.scale.shape(), "NVFP4 down scales")?;
 
         if rows != scale_rows {
             return Err(CheckpointError::source_binding(format!(
@@ -141,13 +237,37 @@ impl<'a> Nvfp4DownBindings<'a> {
 
 fn host_shape(shape: &[u64; 2], role: &str) -> CheckpointResult<[usize; 2]> {
     let rows = usize::try_from(shape[0]).map_err(|_| {
-        CheckpointError::source_binding(format!("NVFP4 {role} row count exceeds this host"))
+        CheckpointError::source_binding(format!("{role} row count exceeds this host"))
     })?;
     let columns = usize::try_from(shape[1]).map_err(|_| {
-        CheckpointError::source_binding(format!("NVFP4 {role} column count exceeds this host"))
+        CheckpointError::source_binding(format!("{role} column count exceeds this host"))
     })?;
 
     Ok([rows, columns])
+}
+
+fn gather_source_planes(planes: &[&[u8]], layer: usize, role: &str) -> CheckpointResult<Vec<u8>> {
+    let bytes = planes.iter().try_fold(0usize, |bytes, plane| {
+        bytes.checked_add(plane.len()).ok_or_else(|| {
+            CheckpointError::source_binding(format!(
+                "layer-{layer} full-attention {role} length overflows"
+            ))
+        })
+    })?;
+
+    let mut gathered = Vec::new();
+
+    gathered.try_reserve_exact(bytes).map_err(|_| {
+        CheckpointError::source_binding(format!(
+            "layer-{layer} full-attention {role} cannot reserve {bytes} host bytes"
+        ))
+    })?;
+
+    for plane in planes {
+        gathered.extend_from_slice(plane);
+    }
+
+    Ok(gathered)
 }
 
 fn logical_columns(
@@ -263,8 +383,8 @@ fn nvfp4_scale_offset(row: usize, group: usize, groups_per_row: usize) -> usize 
 mod tests {
     use super::{SCALE_TILE_GROUPS, SCALE_TILE_ROWS, swizzle_scale_planes, validate_divisor};
     use crate::{
-        CheckpointErrorCode, DType, Fp8E4M3View, Nvfp4DownBindings, Nvfp4GateUpBindings,
-        TensorView, U8View,
+        Bf16View, CheckpointErrorCode, DType, Fp8E4M3View, FullAttentionQkvBindings,
+        Nvfp4DownBindings, Nvfp4GateUpBindings, TensorView, U8View,
     };
 
     const ROWS: usize = 128;
@@ -300,6 +420,24 @@ mod tests {
         .unwrap()
     }
 
+    fn bf16_view<'a>(name: &'a str, shape: &'a [u64; 2], bytes: &'a [u8]) -> Bf16View<'a, 2> {
+        Bf16View::bind(
+            TensorView {
+                name,
+                dtype: DType::Bf16,
+                shape,
+                bytes,
+                data_range: 0..bytes.len() as u64,
+            },
+            *shape,
+        )
+        .unwrap()
+    }
+
+    fn bf16_bytes(words: &[u16]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
     fn scale_codes(seed: usize) -> Vec<u8> {
         (0..ROWS * GROUPS)
             .map(|index| ((index * 37 + seed) % 0x7f) as u8)
@@ -324,6 +462,96 @@ mod tests {
         }
 
         expected
+    }
+
+    #[test]
+    fn full_attention_qkv_materialization_gathers_exact_source_words() {
+        let query_shape = [4, 3];
+        let kv_shape = [1, 3];
+        let query_scale_shape = [4, 1];
+        let kv_scale_shape = [1, 1];
+        let query_weight = (0x10..0x1c).collect::<Vec<_>>();
+        let key_weight = (0x30..0x33).collect::<Vec<_>>();
+        let value_weight = (0x50..0x53).collect::<Vec<_>>();
+        let query_scale = bf16_bytes(&[0x3f80, 0x4000, 0x4040, 0x4080]);
+        let key_scale = bf16_bytes(&[0x40a0]);
+        let value_scale = bf16_bytes(&[0x40c0]);
+        let bindings = FullAttentionQkvBindings {
+            query_gate_weight: fp8_view("query", &query_shape, &query_weight),
+            key_weight: fp8_view("key", &kv_shape, &key_weight),
+            value_weight: fp8_view("value", &kv_shape, &value_weight),
+            query_gate_scale: bf16_view("query-scale", &query_scale_shape, &query_scale),
+            key_scale: bf16_view("key-scale", &kv_scale_shape, &key_scale),
+            value_scale: bf16_view("value-scale", &kv_scale_shape, &value_scale),
+            layer: 3,
+            layer_count: 8,
+            full_attention_interval: 4,
+        };
+
+        let error = FullAttentionQkvBindings {
+            layer: 4,
+            ..bindings
+        }
+        .materialize()
+        .err()
+        .unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            error
+                .to_string()
+                .contains("does not use the admitted full-attention")
+        );
+
+        let materialized = bindings.materialize().unwrap();
+        let query_end = query_weight.len();
+        let key_end = query_end + key_weight.len();
+        let query_scale_end = query_scale.len();
+        let key_scale_end = query_scale_end + key_scale.len();
+
+        assert_eq!(&materialized.weight_e4m3[..query_end], query_weight);
+        assert_eq!(&materialized.weight_e4m3[query_end..key_end], key_weight);
+        assert_eq!(&materialized.weight_e4m3[key_end..], value_weight);
+        assert_eq!(&materialized.scale_bf16[..query_scale_end], query_scale);
+        assert_eq!(
+            &materialized.scale_bf16[query_scale_end..key_scale_end],
+            key_scale
+        );
+        assert_eq!(&materialized.scale_bf16[key_scale_end..], value_scale);
+        assert_eq!((materialized.rows, materialized.columns), (6, 3));
+        assert_eq!(materialized.layer, 3);
+    }
+
+    #[test]
+    fn full_attention_qkv_materialization_rejects_incompatible_shapes() {
+        let query_shape = [4, 3];
+        let key_shape = [1, 2];
+        let value_shape = [1, 3];
+        let query_scale_shape = [4, 1];
+        let kv_scale_shape = [1, 1];
+        let query_weight = vec![0x10; 12];
+        let key_weight = vec![0x20; 2];
+        let value_weight = vec![0x30; 3];
+        let query_scale = bf16_bytes(&[0x3f80; 4]);
+        let key_scale = bf16_bytes(&[0x3f80]);
+        let value_scale = bf16_bytes(&[0x3f80]);
+        let error = FullAttentionQkvBindings {
+            query_gate_weight: fp8_view("query", &query_shape, &query_weight),
+            key_weight: fp8_view("key", &key_shape, &key_weight),
+            value_weight: fp8_view("value", &value_shape, &value_weight),
+            query_gate_scale: bf16_view("query-scale", &query_scale_shape, &query_scale),
+            key_scale: bf16_view("key-scale", &kv_scale_shape, &key_scale),
+            value_scale: bf16_view("value-scale", &kv_scale_shape, &value_scale),
+            layer: 3,
+            layer_count: 8,
+            full_attention_interval: 4,
+        }
+        .materialize()
+        .err()
+        .unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("incompatible shapes"));
     }
 
     #[test]
