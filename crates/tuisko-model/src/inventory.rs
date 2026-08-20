@@ -2,6 +2,7 @@ use crate::{Arch, CheckpointError, CheckpointResult, SafeTensorFile, TensorView,
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 const CONFIG_FILE: &str = "config.json";
@@ -47,16 +48,17 @@ enum Shard {
     Mtp,
 }
 
-pub struct CheckpointSnapshot {
+pub struct CheckpointSnapshot<A: Arch> {
     root: PathBuf,
     tensors: BTreeMap<String, Shard>,
     model: SafeTensorFile,
     mtp: SafeTensorFile,
+    arch: PhantomData<A>,
 }
 
-impl CheckpointSnapshot {
-    pub fn open<A: Arch>(root: &Path) -> CheckpointResult<Self> {
-        Self::open_with_spec::<A>(root, TARGET_INVENTORY)
+impl<A: Arch> CheckpointSnapshot<A> {
+    pub fn open(root: &Path) -> CheckpointResult<Self> {
+        Self::open_with_spec(root, TARGET_INVENTORY)
     }
 
     pub fn root(&self) -> &Path {
@@ -78,7 +80,7 @@ impl CheckpointSnapshot {
         }
     }
 
-    fn open_with_spec<A: Arch>(root: &Path, spec: InventorySpec) -> CheckpointResult<Self> {
+    fn open_with_spec(root: &Path, spec: InventorySpec) -> CheckpointResult<Self> {
         validate_revision::<A>(root)?;
         validate_config::<A>(&root.join(CONFIG_FILE))?;
 
@@ -127,6 +129,7 @@ impl CheckpointSnapshot {
             tensors,
             model,
             mtp,
+            arch: PhantomData,
         })
     }
 }
@@ -394,7 +397,7 @@ mod tests {
         let fixture = Fixture::new();
 
         let snapshot =
-            CheckpointSnapshot::open_with_spec::<TestArch>(&fixture.root, fixture.spec).unwrap();
+            CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, fixture.spec).unwrap();
 
         assert_eq!(snapshot.root(), fixture.root);
         assert_eq!(snapshot.tensor_count(), 3);
@@ -407,7 +410,7 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.spec.model_bytes += 1;
 
-        let error = CheckpointSnapshot::open_with_spec::<TestArch>(&fixture.root, fixture.spec)
+        let error = CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, fixture.spec)
             .err()
             .unwrap()
             .to_string();
@@ -430,7 +433,7 @@ mod tests {
             (model_spec, "model.safetensors tensors"),
             (mtp_spec, "model_mtp.safetensors tensors"),
         ] {
-            let error = CheckpointSnapshot::open_with_spec::<TestArch>(&fixture.root, spec)
+            let error = CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, spec)
                 .err()
                 .unwrap()
                 .to_string();
@@ -444,7 +447,7 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.rewrite_index(fixture.spec.model_bytes + fixture.spec.mtp_bytes + 1);
 
-        let error = CheckpointSnapshot::open_with_spec::<TestArch>(&fixture.root, fixture.spec)
+        let error = CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, fixture.spec)
             .err()
             .unwrap()
             .to_string();
@@ -460,7 +463,7 @@ mod tests {
             .insert("mtp.a".to_owned(), MODEL_FILE.to_owned());
         fixture.rewrite_index(fixture.spec.model_bytes + fixture.spec.mtp_bytes);
 
-        let error = CheckpointSnapshot::open_with_spec::<TestArch>(&fixture.root, fixture.spec)
+        let error = CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, fixture.spec)
             .err()
             .unwrap()
             .to_string();
@@ -473,7 +476,7 @@ mod tests {
         let fixture = Fixture::new();
         let root = fixture.base.join("other-revision");
 
-        let error = CheckpointSnapshot::open_with_spec::<TestArch>(&root, fixture.spec)
+        let error = CheckpointSnapshot::<TestArch>::open_with_spec(&root, fixture.spec)
             .err()
             .unwrap()
             .to_string();

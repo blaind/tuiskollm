@@ -1,12 +1,16 @@
+mod bindings;
 mod config;
 mod error;
 mod inventory;
 mod safetensors;
+mod views;
 
+pub use bindings::TextEndpointBindings;
 pub use config::validate_config;
 pub use error::{CheckpointError, CheckpointResult};
 pub use inventory::CheckpointSnapshot;
 pub use safetensors::{SafeTensorFile, TensorView};
+pub use views::{Bf16View, Fp8E4M3View};
 
 pub trait Arch: Copy + 'static {
     const MODEL_ID: &'static str;
