@@ -11,7 +11,8 @@ mod views;
 
 pub use bindings::{
     DenseFp8DownBindings, DenseFp8GateUpBindings, FullAttentionPostBindings,
-    FullAttentionQkvBindings, Nvfp4DownBindings, Nvfp4GateUpBindings, TextEndpointBindings,
+    FullAttentionQkvBindings, GdnBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
+    TextEndpointBindings,
 };
 pub use config::validate_config;
 pub use dtype::DType;
