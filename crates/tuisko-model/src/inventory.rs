@@ -290,6 +290,16 @@ mod tests {
         const LINEAR_CONV_KERNEL_DIM: usize = 1;
         const MTP_LAYERS: usize = 1;
         const MTP_USES_DEDICATED_EMBEDDINGS: bool = false;
+        const VISION_DEPTH: usize = 1;
+        const VISION_HIDDEN: usize = 1;
+        const VISION_INTERMEDIATE: usize = 1;
+        const VISION_NUM_HEADS: usize = 1;
+        const VISION_POSITIONS: usize = 1;
+        const VISION_OUTPUT_HIDDEN: usize = 1;
+        const VISION_INPUT_CHANNELS: usize = 1;
+        const VISION_PATCH_SIZE: usize = 1;
+        const VISION_SPATIAL_MERGE_SIZE: usize = 1;
+        const VISION_TEMPORAL_PATCH_SIZE: usize = 1;
     }
 
     struct Fixture {
@@ -365,6 +375,7 @@ mod tests {
             "architectures": ["Qwen3_5ForConditionalGeneration"],
             "dtype": "bfloat16",
             "head_dim": 1,
+            "image_token_id": 248056,
             "language_model_only": false,
             "model_type": "qwen3_5",
             "num_attention_heads": 1,
@@ -389,7 +400,27 @@ mod tests {
                 "num_hidden_layers": 64,
                 "num_key_value_heads": 1,
                 "vocab_size": 1
-            }
+            },
+            "video_token_id": 248057,
+            "vision_config": {
+                "deepstack_visual_indexes": [],
+                "depth": 1,
+                "dtype": "bfloat16",
+                "hidden_act": "gelu_pytorch_tanh",
+                "hidden_size": 1,
+                "in_channels": 1,
+                "initializer_range": 0.02,
+                "intermediate_size": 1,
+                "model_type": "qwen3_5_vision",
+                "num_heads": 1,
+                "num_position_embeddings": 1,
+                "out_hidden_size": 1,
+                "patch_size": 1,
+                "spatial_merge_size": 1,
+                "temporal_patch_size": 1
+            },
+            "vision_end_token_id": 248054,
+            "vision_start_token_id": 248053
         });
 
         fs::write(

@@ -12,7 +12,7 @@ mod views;
 pub use bindings::{
     DenseFp8DownBindings, DenseFp8GateUpBindings, FullAttentionPostBindings,
     FullAttentionQkvBindings, GdnBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
-    TextEndpointBindings,
+    TextEndpointBindings, VisionBindings, VisionBlockBindings,
 };
 pub use config::validate_config;
 pub use dtype::DType;
@@ -59,6 +59,26 @@ pub trait Arch: Copy + 'static {
     const MTP_LAYERS: usize;
     /// Whether MTP owns embeddings separate from the base model.
     const MTP_USES_DEDICATED_EMBEDDINGS: bool;
+    /// Number of transformer blocks in the Vision encoder.
+    const VISION_DEPTH: usize;
+    /// Vision encoder channel width.
+    const VISION_HIDDEN: usize;
+    /// Vision encoder MLP intermediate width.
+    const VISION_INTERMEDIATE: usize;
+    /// Number of Vision attention heads.
+    const VISION_NUM_HEADS: usize;
+    /// Number of learned Vision position embeddings.
+    const VISION_POSITIONS: usize;
+    /// Width projected from Vision into the text residual stream.
+    const VISION_OUTPUT_HIDDEN: usize;
+    /// Number of image channels consumed by the patch projection.
+    const VISION_INPUT_CHANNELS: usize;
+    /// Spatial extent of one Vision patch.
+    const VISION_PATCH_SIZE: usize;
+    /// Spatial patch-grid reduction performed by the merger.
+    const VISION_SPATIAL_MERGE_SIZE: usize;
+    /// Frames grouped by one temporal patch.
+    const VISION_TEMPORAL_PATCH_SIZE: usize;
 
     /// Rows in the fused full-attention query and gate plane.
     const ATTENTION_QUERY_ROWS: usize = 2 * Self::NUM_ATTENTION_HEADS * Self::HEAD_DIM;
@@ -101,6 +121,16 @@ impl Arch for Qwen38_27B {
     const LINEAR_CONV_KERNEL_DIM: usize = 4;
     const MTP_LAYERS: usize = 1;
     const MTP_USES_DEDICATED_EMBEDDINGS: bool = false;
+    const VISION_DEPTH: usize = 27;
+    const VISION_HIDDEN: usize = 1_152;
+    const VISION_INTERMEDIATE: usize = 4_304;
+    const VISION_NUM_HEADS: usize = 16;
+    const VISION_POSITIONS: usize = 2_304;
+    const VISION_OUTPUT_HIDDEN: usize = 5_120;
+    const VISION_INPUT_CHANNELS: usize = 3;
+    const VISION_PATCH_SIZE: usize = 16;
+    const VISION_SPATIAL_MERGE_SIZE: usize = 2;
+    const VISION_TEMPORAL_PATCH_SIZE: usize = 2;
 }
 
 #[cfg(test)]
@@ -125,6 +155,20 @@ mod tests {
             ("linear_head_dim", A::LINEAR_HEAD_DIM, 128),
             ("linear_conv_kernel_dim", A::LINEAR_CONV_KERNEL_DIM, 4),
             ("mtp_layers", A::MTP_LAYERS, 1),
+            ("vision_depth", A::VISION_DEPTH, 27),
+            ("vision_hidden", A::VISION_HIDDEN, 1_152),
+            ("vision_intermediate", A::VISION_INTERMEDIATE, 4_304),
+            ("vision_num_heads", A::VISION_NUM_HEADS, 16),
+            ("vision_positions", A::VISION_POSITIONS, 2_304),
+            ("vision_output_hidden", A::VISION_OUTPUT_HIDDEN, 5_120),
+            ("vision_input_channels", A::VISION_INPUT_CHANNELS, 3),
+            ("vision_patch_size", A::VISION_PATCH_SIZE, 16),
+            ("vision_spatial_merge_size", A::VISION_SPATIAL_MERGE_SIZE, 2),
+            (
+                "vision_temporal_patch_size",
+                A::VISION_TEMPORAL_PATCH_SIZE,
+                2,
+            ),
             ("attention_query_rows", A::ATTENTION_QUERY_ROWS, 12_288),
             (
                 "attention_output_columns",

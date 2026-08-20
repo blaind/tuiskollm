@@ -11,7 +11,13 @@ use std::path::Path;
 const ARCHITECTURE: &str = "Qwen3_5ForConditionalGeneration";
 const MODEL_TYPE: &str = "qwen3_5";
 const TEXT_MODEL_TYPE: &str = "qwen3_5_text";
+const VISION_MODEL_TYPE: &str = "qwen3_5_vision";
+const VISION_HIDDEN_ACT: &str = "gelu_pytorch_tanh";
 const DTYPE: &str = "bfloat16";
+const IMAGE_TOKEN_ID: usize = 248_056;
+const VIDEO_TOKEN_ID: usize = 248_057;
+const VISION_START_TOKEN_ID: usize = 248_053;
+const VISION_END_TOKEN_ID: usize = 248_054;
 const MIXED_PRECISION_FORMAT: &str = "mixed-precision";
 const QUANT_METHOD: &str = "compressed-tensors";
 const QUANTIZATION_STATUS: &str = "compressed";
@@ -25,12 +31,17 @@ struct ModelConfig {
     architectures: Vec<String>,
     dtype: String,
     head_dim: usize,
+    image_token_id: usize,
     language_model_only: bool,
     model_type: String,
     num_attention_heads: usize,
     num_key_value_heads: usize,
     quantization_config: QuantizationConfig,
     text_config: TextConfig,
+    video_token_id: usize,
+    vision_config: VisionConfig,
+    vision_end_token_id: usize,
+    vision_start_token_id: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +108,24 @@ struct TextConfig {
     vocab_size: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct VisionConfig {
+    deepstack_visual_indexes: Vec<usize>,
+    depth: usize,
+    dtype: String,
+    hidden_act: String,
+    hidden_size: usize,
+    in_channels: usize,
+    intermediate_size: usize,
+    model_type: String,
+    num_heads: usize,
+    num_position_embeddings: usize,
+    out_hidden_size: usize,
+    patch_size: usize,
+    spatial_merge_size: usize,
+    temporal_patch_size: usize,
+}
+
 /// Validates a checkpoint config against the selected architecture.
 pub fn validate_config<A: Arch>(path: &Path) -> CheckpointResult<()> {
     let bytes = fs::read(path).map_err(|source| CheckpointError::io("reading", path, source))?;
@@ -120,6 +149,12 @@ fn validate<A: Arch>(path: &Path, config: &ModelConfig) -> CheckpointResult<()> 
     require(path, "head_dim", config.head_dim, A::HEAD_DIM)?;
     require(
         path,
+        "image_token_id",
+        config.image_token_id,
+        IMAGE_TOKEN_ID,
+    )?;
+    require(
+        path,
         "language_model_only",
         config.language_model_only,
         false,
@@ -136,6 +171,24 @@ fn validate<A: Arch>(path: &Path, config: &ModelConfig) -> CheckpointResult<()> 
         "num_key_value_heads",
         config.num_key_value_heads,
         A::NUM_KV_HEADS,
+    )?;
+    require(
+        path,
+        "video_token_id",
+        config.video_token_id,
+        VIDEO_TOKEN_ID,
+    )?;
+    require(
+        path,
+        "vision_end_token_id",
+        config.vision_end_token_id,
+        VISION_END_TOKEN_ID,
+    )?;
+    require(
+        path,
+        "vision_start_token_id",
+        config.vision_start_token_id,
+        VISION_START_TOKEN_ID,
     )?;
 
     let text = &config.text_config;
@@ -224,7 +277,85 @@ fn validate<A: Arch>(path: &Path, config: &ModelConfig) -> CheckpointResult<()> 
     require(path, "text_config.vocab_size", text.vocab_size, A::VOCAB)?;
 
     validate_layer_types::<A>(path, &text.layer_types)?;
+    validate_vision::<A>(path, &config.vision_config)?;
     validate_quantization::<A>(path, &config.quantization_config)
+}
+
+fn validate_vision<A: Arch>(path: &Path, vision: &VisionConfig) -> CheckpointResult<()> {
+    require(
+        path,
+        "vision_config.deepstack_visual_indexes",
+        vision.deepstack_visual_indexes.as_slice(),
+        &[],
+    )?;
+    require(path, "vision_config.depth", vision.depth, A::VISION_DEPTH)?;
+    require(path, "vision_config.dtype", vision.dtype.as_str(), DTYPE)?;
+    require(
+        path,
+        "vision_config.hidden_act",
+        vision.hidden_act.as_str(),
+        VISION_HIDDEN_ACT,
+    )?;
+    require(
+        path,
+        "vision_config.hidden_size",
+        vision.hidden_size,
+        A::VISION_HIDDEN,
+    )?;
+    require(
+        path,
+        "vision_config.in_channels",
+        vision.in_channels,
+        A::VISION_INPUT_CHANNELS,
+    )?;
+    require(
+        path,
+        "vision_config.intermediate_size",
+        vision.intermediate_size,
+        A::VISION_INTERMEDIATE,
+    )?;
+    require(
+        path,
+        "vision_config.model_type",
+        vision.model_type.as_str(),
+        VISION_MODEL_TYPE,
+    )?;
+    require(
+        path,
+        "vision_config.num_heads",
+        vision.num_heads,
+        A::VISION_NUM_HEADS,
+    )?;
+    require(
+        path,
+        "vision_config.num_position_embeddings",
+        vision.num_position_embeddings,
+        A::VISION_POSITIONS,
+    )?;
+    require(
+        path,
+        "vision_config.out_hidden_size",
+        vision.out_hidden_size,
+        A::VISION_OUTPUT_HIDDEN,
+    )?;
+    require(
+        path,
+        "vision_config.patch_size",
+        vision.patch_size,
+        A::VISION_PATCH_SIZE,
+    )?;
+    require(
+        path,
+        "vision_config.spatial_merge_size",
+        vision.spatial_merge_size,
+        A::VISION_SPATIAL_MERGE_SIZE,
+    )?;
+    require(
+        path,
+        "vision_config.temporal_patch_size",
+        vision.temporal_patch_size,
+        A::VISION_TEMPORAL_PATCH_SIZE,
+    )
 }
 
 fn validate_layer_types<A: Arch>(path: &Path, layer_types: &[String]) -> CheckpointResult<()> {
@@ -487,6 +618,7 @@ mod tests {
             "architectures": ["Qwen3_5ForConditionalGeneration"],
             "dtype": "bfloat16",
             "head_dim": 256,
+            "image_token_id": 248056,
             "language_model_only": false,
             "model_type": "qwen3_5",
             "num_attention_heads": 24,
@@ -511,7 +643,27 @@ mod tests {
                 "num_hidden_layers": 64,
                 "num_key_value_heads": 4,
                 "vocab_size": 248320
-            }
+            },
+            "video_token_id": 248057,
+            "vision_config": {
+                "deepstack_visual_indexes": [],
+                "depth": 27,
+                "dtype": "bfloat16",
+                "hidden_act": "gelu_pytorch_tanh",
+                "hidden_size": 1152,
+                "in_channels": 3,
+                "initializer_range": 0.02,
+                "intermediate_size": 4304,
+                "model_type": "qwen3_5_vision",
+                "num_heads": 16,
+                "num_position_embeddings": 2304,
+                "out_hidden_size": 5120,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2
+            },
+            "vision_end_token_id": 248054,
+            "vision_start_token_id": 248053
         })
     }
 
@@ -557,6 +709,26 @@ mod tests {
         let mut config = valid_config();
         config["text_config"]["model_type"] = json!("other");
         cases.push(("text-model-type", config, "text_config.model_type"));
+
+        let mut config = valid_config();
+        config["vision_config"]["dtype"] = json!("float16");
+        cases.push(("vision-dtype", config, "vision_config.dtype"));
+
+        let mut config = valid_config();
+        config["vision_config"]["hidden_act"] = json!("other");
+        cases.push(("vision-hidden-act", config, "vision_config.hidden_act"));
+
+        let mut config = valid_config();
+        config["vision_config"]["model_type"] = json!("other");
+        cases.push(("vision-model-type", config, "vision_config.model_type"));
+
+        let mut config = valid_config();
+        config["vision_config"]["deepstack_visual_indexes"] = json!([3, 7, 15]);
+        cases.push((
+            "vision-deepstack",
+            config,
+            "vision_config.deepstack_visual_indexes",
+        ));
 
         for (label, config, field) in cases {
             let path = write_config(label, &config);
@@ -673,6 +845,55 @@ mod tests {
         );
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_vision_token_and_geometry_mismatches() {
+        for field in [
+            "image_token_id",
+            "video_token_id",
+            "vision_end_token_id",
+            "vision_start_token_id",
+        ] {
+            let mut config = valid_config();
+            config[field] = json!(1);
+            let path = write_config(field, &config);
+
+            let error = validate_config::<Qwen38_27B>(&path)
+                .err()
+                .unwrap()
+                .to_string();
+
+            assert!(error.contains(&format!("field `{field}`")), "{error}");
+
+            fs::remove_file(path).unwrap();
+        }
+
+        for field in [
+            "depth",
+            "hidden_size",
+            "in_channels",
+            "intermediate_size",
+            "num_heads",
+            "num_position_embeddings",
+            "out_hidden_size",
+            "patch_size",
+            "spatial_merge_size",
+            "temporal_patch_size",
+        ] {
+            let mut config = valid_config();
+            config["vision_config"][field] = json!(1);
+            let path = write_config(field, &config);
+
+            let error = validate_config::<Qwen38_27B>(&path)
+                .err()
+                .unwrap()
+                .to_string();
+
+            assert!(error.contains(&format!("vision_config.{field}")), "{error}");
+
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
