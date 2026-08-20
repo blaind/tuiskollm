@@ -1,3 +1,5 @@
+//! Stable checkpoint error categories with contextual failure details.
+
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 
@@ -52,22 +54,29 @@ pub enum CheckpointError {
     /// Filesystem or memory-mapping operation failed.
     #[error("[checkpoint.io] {action} {path}: {source}", path = .path.display())]
     Io {
+        /// Operation that failed.
         action: &'static str,
+        /// Path involved in the operation.
         path: PathBuf,
+        /// Underlying I/O failure.
         source: std::io::Error,
     },
 
     /// JSON syntax or schema validation failed.
     #[error("[checkpoint.json] parsing JSON in {path}: {source}", path = .path.display())]
     Json {
+        /// JSON file being parsed.
         path: PathBuf,
+        /// Underlying JSON failure.
         source: serde_json::Error,
     },
 
     /// An admitted checkpoint contract was violated.
     #[error("[{code}] {message}")]
     Contract {
+        /// Stable external error category.
         code: CheckpointErrorCode,
+        /// Contextual failure detail.
         message: String,
     },
 }
@@ -129,6 +138,7 @@ impl CheckpointError {
     }
 }
 
+/// Result returned by checkpoint admission and source-layout operations.
 pub type CheckpointResult<T> = Result<T, CheckpointError>;
 
 #[cfg(test)]

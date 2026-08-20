@@ -1,3 +1,5 @@
+//! Exact-target checkpoint admission and source-layout ownership.
+
 mod bindings;
 mod config;
 mod dtype;

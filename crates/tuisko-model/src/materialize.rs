@@ -1,3 +1,5 @@
+//! Lossless conversion from source bindings to runtime-native host layouts.
+
 use crate::bindings::{NVFP4_MLP_LAYER_END, require_nvfp4_mlp_layer, validate_nvfp4_scales};
 use crate::{CheckpointError, CheckpointResult, Nvfp4DownBindings, Nvfp4GateUpBindings};
 
@@ -29,6 +31,7 @@ pub struct MaterializedNvfp4GateUp<'a> {
 }
 
 impl<'a> Nvfp4GateUpBindings<'a> {
+    /// Materializes the fused gate/up scale layout without requantizing source values.
     pub fn materialize(self) -> CheckpointResult<MaterializedNvfp4GateUp<'a>> {
         require_nvfp4_mlp_layer(self.layer, NVFP4_MLP_LAYER_END)?;
 
@@ -101,6 +104,7 @@ pub struct MaterializedNvfp4Down<'a> {
 }
 
 impl<'a> Nvfp4DownBindings<'a> {
+    /// Materializes the down-projection scale layout without requantizing source values.
     pub fn materialize(self) -> CheckpointResult<MaterializedNvfp4Down<'a>> {
         require_nvfp4_mlp_layer(self.layer, NVFP4_MLP_LAYER_END)?;
 
