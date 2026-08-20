@@ -11,5 +11,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "checkpoint"
+harness = false
+
 [lints.rust]
 unsafe_code = "allow"
