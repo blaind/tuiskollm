@@ -8,8 +8,8 @@ mod safetensors;
 mod views;
 
 pub use bindings::{
-    DenseFp8DownBindings, DenseFp8GateUpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
-    TextEndpointBindings,
+    DenseFp8DownBindings, DenseFp8GateUpBindings, FullAttentionPostBindings,
+    FullAttentionQkvBindings, Nvfp4DownBindings, Nvfp4GateUpBindings, TextEndpointBindings,
 };
 pub use config::validate_config;
 pub use dtype::DType;
@@ -52,6 +52,8 @@ pub trait Arch: Copy + 'static {
 
     /// Rows in the fused full-attention query and gate plane.
     const ATTENTION_QUERY_ROWS: usize = 2 * Self::NUM_ATTENTION_HEADS * Self::HEAD_DIM;
+    /// Width returned by full attention before its output projection.
+    const ATTENTION_OUTPUT_COLUMNS: usize = Self::NUM_ATTENTION_HEADS * Self::HEAD_DIM;
     /// Rows in one full-attention key or value plane.
     const ATTENTION_KV_ROWS: usize = Self::NUM_KV_HEADS * Self::HEAD_DIM;
     /// Rows in the fused full-attention query/gate, key, and value projection.
@@ -111,6 +113,11 @@ mod tests {
             ("linear_head_dim", A::LINEAR_HEAD_DIM, 128),
             ("linear_conv_kernel_dim", A::LINEAR_CONV_KERNEL_DIM, 4),
             ("attention_query_rows", A::ATTENTION_QUERY_ROWS, 12_288),
+            (
+                "attention_output_columns",
+                A::ATTENTION_OUTPUT_COLUMNS,
+                6_144,
+            ),
             ("attention_kv_rows", A::ATTENTION_KV_ROWS, 1_024),
             ("attention_qkv_rows", A::ATTENTION_QKV_ROWS, 14_336),
             ("gdn_qk_rows", A::GDN_QK_ROWS, 2_048),

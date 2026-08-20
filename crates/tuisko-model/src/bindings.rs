@@ -127,6 +127,157 @@ impl<'a> DenseFp8DownBindings<'a> {
     }
 }
 
+/// Exact FP8 query/gate, key, and value source planes for one full-attention layer.
+#[derive(Clone, Copy, Debug)]
+pub struct FullAttentionQkvBindings<'a> {
+    /// Query rows followed by gate rows `[attention_query_rows, hidden]`.
+    pub query_gate_weight: Fp8E4M3View<'a, 2>,
+    /// Key projection `[attention_kv_rows, hidden]`.
+    pub key_weight: Fp8E4M3View<'a, 2>,
+    /// Value projection `[attention_kv_rows, hidden]`.
+    pub value_weight: Fp8E4M3View<'a, 2>,
+    /// One little-endian BF16 scale per query/gate row.
+    pub query_gate_scale: Bf16View<'a, 2>,
+    /// One little-endian BF16 scale per key row.
+    pub key_scale: Bf16View<'a, 2>,
+    /// One little-endian BF16 scale per value row.
+    pub value_scale: Bf16View<'a, 2>,
+    /// Decoder layer owning these planes.
+    pub layer: usize,
+}
+
+impl<'a> FullAttentionQkvBindings<'a> {
+    pub fn bind<A: Arch>(
+        snapshot: &'a CheckpointSnapshot<A>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from::<A>(layer, |name| snapshot.tensor(name))
+    }
+
+    fn bind_from<A: Arch>(
+        layer: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        require_full_attention_layer::<A>(layer)?;
+
+        let query_rows = A::ATTENTION_QUERY_ROWS as u64;
+        let kv_rows = A::ATTENTION_KV_ROWS as u64;
+        let hidden = A::HIDDEN as u64;
+        let prefix = format!("model.language_model.layers.{layer}.self_attn");
+        let query_gate_weight = Fp8E4M3View::bind(
+            tensor(&format!("{prefix}.q_proj.weight"))?,
+            [query_rows, hidden],
+        )?;
+        let key_weight = Fp8E4M3View::bind(
+            tensor(&format!("{prefix}.k_proj.weight"))?,
+            [kv_rows, hidden],
+        )?;
+        let value_weight = Fp8E4M3View::bind(
+            tensor(&format!("{prefix}.v_proj.weight"))?,
+            [kv_rows, hidden],
+        )?;
+        let query_gate_scale = Bf16View::bind(
+            tensor(&format!("{prefix}.q_proj.weight_scale"))?,
+            [query_rows, 1],
+        )?;
+        let key_scale = Bf16View::bind(
+            tensor(&format!("{prefix}.k_proj.weight_scale"))?,
+            [kv_rows, 1],
+        )?;
+        let value_scale = Bf16View::bind(
+            tensor(&format!("{prefix}.v_proj.weight_scale"))?,
+            [kv_rows, 1],
+        )?;
+
+        Ok(Self {
+            query_gate_weight,
+            key_weight,
+            value_weight,
+            query_gate_scale,
+            key_scale,
+            value_scale,
+            layer,
+        })
+    }
+}
+
+/// Output projection, normalization, and cache-scale sources for one full-attention layer.
+#[derive(Clone, Copy, Debug)]
+pub struct FullAttentionPostBindings<'a> {
+    /// Source-native output projection `[hidden, attention_output_columns]`.
+    pub output_weight: Fp8E4M3View<'a, 2>,
+    /// One little-endian BF16 scale per output row `[hidden, 1]`.
+    pub output_scale: Bf16View<'a, 2>,
+    /// Zero-centered RMSNorm weights before attention `[hidden]`.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the MLP `[hidden]`.
+    pub post_attention_norm: Bf16View<'a, 1>,
+    /// Per-head query RMSNorm weights `[head_dim]`.
+    pub query_norm: Bf16View<'a, 1>,
+    /// Per-head key RMSNorm weights `[head_dim]`.
+    pub key_norm: Bf16View<'a, 1>,
+    /// Exact finite positive BF16 key-cache scale word.
+    pub key_cache_scale_bf16: u16,
+    /// Exact finite positive BF16 value-cache scale word.
+    pub value_cache_scale_bf16: u16,
+    /// Decoder layer owning these sources.
+    pub layer: usize,
+}
+
+impl<'a> FullAttentionPostBindings<'a> {
+    pub fn bind<A: Arch>(
+        snapshot: &'a CheckpointSnapshot<A>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from::<A>(layer, |name| snapshot.tensor(name))
+    }
+
+    fn bind_from<A: Arch>(
+        layer: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        require_full_attention_layer::<A>(layer)?;
+
+        let hidden = A::HIDDEN as u64;
+        let output_columns = A::ATTENTION_OUTPUT_COLUMNS as u64;
+        let head_dim = A::HEAD_DIM as u64;
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let prefix = format!("{layer_prefix}.self_attn");
+        let output_weight = Fp8E4M3View::bind(
+            tensor(&format!("{prefix}.o_proj.weight"))?,
+            [hidden, output_columns],
+        )?;
+        let output_scale = Bf16View::bind(
+            tensor(&format!("{prefix}.o_proj.weight_scale"))?,
+            [hidden, 1],
+        )?;
+        let input_norm = Bf16View::bind(
+            tensor(&format!("{layer_prefix}.input_layernorm.weight"))?,
+            [hidden],
+        )?;
+        let post_attention_norm = Bf16View::bind(
+            tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+            [hidden],
+        )?;
+        let query_norm = Bf16View::bind(tensor(&format!("{prefix}.q_norm.weight"))?, [head_dim])?;
+        let key_norm = Bf16View::bind(tensor(&format!("{prefix}.k_norm.weight"))?, [head_dim])?;
+        let key_cache_scale_bf16 = positive_bf16(tensor(&format!("{prefix}.k_scale"))?)?;
+        let value_cache_scale_bf16 = positive_bf16(tensor(&format!("{prefix}.v_scale"))?)?;
+
+        Ok(Self {
+            output_weight,
+            output_scale,
+            input_norm,
+            post_attention_norm,
+            query_norm,
+            key_norm,
+            key_cache_scale_bf16,
+            value_cache_scale_bf16,
+            layer,
+        })
+    }
+}
+
 /// Exact packed gate/up source planes for one NVFP4 MLP layer.
 #[derive(Clone, Copy, Debug)]
 pub struct Nvfp4GateUpBindings<'a> {
@@ -331,6 +482,18 @@ fn require_dense_fp8_mlp_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
     Ok(())
 }
 
+fn require_full_attention_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
+    let interval = A::FULL_ATTENTION_INTERVAL;
+
+    if interval == 0 || layer >= A::LAYERS || layer % interval != interval - 1 {
+        return Err(CheckpointError::source_binding(format!(
+            "layer {layer} does not use the admitted full-attention source contract"
+        )));
+    }
+
+    Ok(())
+}
+
 fn codec_columns(width: usize, divisor: usize, role: &str) -> CheckpointResult<u64> {
     if !width.is_multiple_of(divisor) {
         return Err(CheckpointError::source_binding(format!(
@@ -387,6 +550,21 @@ fn positive_f32(tensor: TensorView<'_>) -> CheckpointResult<f32> {
     Ok(value)
 }
 
+fn positive_bf16(tensor: TensorView<'_>) -> CheckpointResult<u16> {
+    let view = Bf16View::bind(tensor, [1])?;
+    let bits = view.word(0).expect("validated scalar has one value");
+    let value = f32::from_bits(u32::from(bits) << 16);
+
+    if !value.is_finite() || value <= 0.0 {
+        return Err(CheckpointError::source_binding(format!(
+            "tensor `{}` must contain a finite positive BF16 scale, observed {value}",
+            view.name()
+        )));
+    }
+
+    Ok(bits)
+}
+
 fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> CheckpointResult<()> {
     if gate.to_bits() != up.to_bits() {
         return Err(CheckpointError::source_binding(format!(
@@ -400,8 +578,9 @@ fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> Checkpo
 #[cfg(test)]
 mod tests {
     use super::{
-        DenseFp8DownBindings, DenseFp8GateUpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
-        TextEndpointBindings, require_adjacent, require_dense_fp8_mlp_layer,
+        DenseFp8DownBindings, DenseFp8GateUpBindings, FullAttentionPostBindings,
+        FullAttentionQkvBindings, Nvfp4DownBindings, Nvfp4GateUpBindings, TextEndpointBindings,
+        positive_bf16, require_adjacent, require_dense_fp8_mlp_layer, require_full_attention_layer,
         require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
     use crate::{Arch, CheckpointErrorCode, DType, SafeTensorFile, TensorView};
@@ -599,6 +778,70 @@ mod tests {
         )
     }
 
+    fn full_attention_fixture(layer: usize) -> (Value, Vec<u8>) {
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let prefix = format!("{layer_prefix}.self_attn");
+        let mut payload = vec![0x80; 368];
+
+        payload[0..64].fill(0x10);
+        payload[64..96].fill(0x20);
+        payload[96..128].fill(0x30);
+        payload[128..132].fill(0x40);
+        payload[132..134].fill(0x50);
+        payload[134..136].fill(0x60);
+        payload[136..168].fill(0x70);
+        payload[364..366].copy_from_slice(&0x3f80u16.to_le_bytes());
+        payload[366..368].copy_from_slice(&0x3f00u16.to_le_bytes());
+
+        (
+            json!({
+                format!("{prefix}.q_proj.weight"): {
+                    "dtype":"F8_E4M3", "shape":[2,32], "data_offsets":[0,64]
+                },
+                format!("{prefix}.k_proj.weight"): {
+                    "dtype":"F8_E4M3", "shape":[1,32], "data_offsets":[64,96]
+                },
+                format!("{prefix}.v_proj.weight"): {
+                    "dtype":"F8_E4M3", "shape":[1,32], "data_offsets":[96,128]
+                },
+                format!("{prefix}.q_proj.weight_scale"): {
+                    "dtype":"BF16", "shape":[2,1], "data_offsets":[128,132]
+                },
+                format!("{prefix}.k_proj.weight_scale"): {
+                    "dtype":"BF16", "shape":[1,1], "data_offsets":[132,134]
+                },
+                format!("{prefix}.v_proj.weight_scale"): {
+                    "dtype":"BF16", "shape":[1,1], "data_offsets":[134,136]
+                },
+                format!("{prefix}.o_proj.weight"): {
+                    "dtype":"F8_E4M3", "shape":[32,1], "data_offsets":[136,168]
+                },
+                format!("{prefix}.o_proj.weight_scale"): {
+                    "dtype":"BF16", "shape":[32,1], "data_offsets":[168,232]
+                },
+                format!("{layer_prefix}.input_layernorm.weight"): {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[232,296]
+                },
+                format!("{layer_prefix}.post_attention_layernorm.weight"): {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[296,360]
+                },
+                format!("{prefix}.q_norm.weight"): {
+                    "dtype":"BF16", "shape":[1], "data_offsets":[360,362]
+                },
+                format!("{prefix}.k_norm.weight"): {
+                    "dtype":"BF16", "shape":[1], "data_offsets":[362,364]
+                },
+                format!("{prefix}.k_scale"): {
+                    "dtype":"BF16", "shape":[1], "data_offsets":[364,366]
+                },
+                format!("{prefix}.v_scale"): {
+                    "dtype":"BF16", "shape":[1], "data_offsets":[366,368]
+                }
+            }),
+            payload,
+        )
+    }
+
     #[test]
     fn binds_exact_text_endpoint_contract() {
         let path = fixture_path("valid");
@@ -719,6 +962,43 @@ mod tests {
     }
 
     #[test]
+    fn binds_exact_full_attention_source_contract() {
+        let path = fixture_path("full-attention");
+        let (header, payload) = full_attention_fixture(63);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let qkv =
+            FullAttentionQkvBindings::bind_from::<Nvfp4Arch>(63, |name| file.tensor(name)).unwrap();
+        let post = FullAttentionPostBindings::bind_from::<Nvfp4Arch>(63, |name| file.tensor(name))
+            .unwrap();
+
+        assert_eq!(qkv.query_gate_weight.shape(), &[2, 32]);
+        assert_eq!(qkv.query_gate_weight.codes()[0], 0x10);
+        assert_eq!(qkv.key_weight.shape(), &[1, 32]);
+        assert_eq!(qkv.key_weight.codes()[0], 0x20);
+        assert_eq!(qkv.value_weight.shape(), &[1, 32]);
+        assert_eq!(qkv.value_weight.codes()[0], 0x30);
+        assert_eq!(qkv.query_gate_scale.shape(), &[2, 1]);
+        assert_eq!(qkv.query_gate_scale.bytes()[0], 0x40);
+        assert_eq!(qkv.key_scale.bytes()[0], 0x50);
+        assert_eq!(qkv.value_scale.bytes()[0], 0x60);
+        assert_eq!(qkv.layer, 63);
+        assert_eq!(post.output_weight.shape(), &[32, 1]);
+        assert_eq!(post.output_weight.codes()[0], 0x70);
+        assert_eq!(post.output_scale.shape(), &[32, 1]);
+        assert_eq!(post.input_norm.shape(), &[32]);
+        assert_eq!(post.post_attention_norm.shape(), &[32]);
+        assert_eq!(post.query_norm.shape(), &[1]);
+        assert_eq!(post.key_norm.shape(), &[1]);
+        assert_eq!(post.key_cache_scale_bf16, 0x3f80);
+        assert_eq!(post.value_cache_scale_bf16, 0x3f00);
+        assert_eq!(post.layer, 63);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn nvfp4_layer_route_is_exact() {
         for (layer, admitted) in [(0, true), (55, true), (56, false), (63, false), (64, false)] {
             assert_eq!(
@@ -736,6 +1016,71 @@ mod tests {
                 require_dense_fp8_mlp_layer::<Nvfp4Arch>(layer).is_ok(),
                 admitted,
                 "layer {layer}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_attention_layer_route_is_exact() {
+        for (layer, admitted) in [
+            (0, false),
+            (2, false),
+            (3, true),
+            (4, false),
+            (59, true),
+            (63, true),
+            (64, false),
+        ] {
+            assert_eq!(
+                require_full_attention_layer::<Nvfp4Arch>(layer).is_ok(),
+                admitted,
+                "layer {layer}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_full_attention_projection_shape_mismatch() {
+        let path = fixture_path("full-attention-shape");
+        let (mut header, payload) = full_attention_fixture(63);
+        header["model.language_model.layers.63.self_attn.q_proj.weight"]["shape"] = json!([1, 64]);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let error = FullAttentionQkvBindings::bind_from::<Nvfp4Arch>(63, |name| file.tensor(name))
+            .err()
+            .unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::Tensor);
+        assert!(
+            error
+                .to_string()
+                .contains("shape [1, 64], expected [2, 32]")
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_bf16_cache_scales() {
+        for bits in [0x0000u16, 0x8000, 0x7f80, 0x7fc0] {
+            let bytes = bits.to_le_bytes();
+            let error = positive_bf16(TensorView {
+                name: "cache_scale",
+                dtype: DType::Bf16,
+                shape: &[1],
+                bytes: &bytes,
+                data_range: 0..2,
+            })
+            .err()
+            .unwrap();
+
+            assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+            assert!(
+                error
+                    .to_string()
+                    .contains("must contain a finite positive BF16 scale"),
+                "{error}"
             );
         }
     }
