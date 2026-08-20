@@ -1,5 +1,7 @@
+use crate::bindings::NVFP4_MLP_LAYER_END;
 use crate::{Arch, CheckpointError, CheckpointResult};
 use serde::Deserialize;
+use serde_json::Value;
 use std::fmt::Debug;
 use std::fs;
 use std::path::Path;
@@ -8,6 +10,13 @@ const ARCHITECTURE: &str = "Qwen3_5ForConditionalGeneration";
 const MODEL_TYPE: &str = "qwen3_5";
 const TEXT_MODEL_TYPE: &str = "qwen3_5_text";
 const DTYPE: &str = "bfloat16";
+const MIXED_PRECISION_FORMAT: &str = "mixed-precision";
+const QUANT_METHOD: &str = "compressed-tensors";
+const QUANTIZATION_STATUS: &str = "compressed";
+const FP8_FORMAT: &str = "float-quantized";
+const NVFP4_FORMAT: &str = "nvfp4-pack-quantized";
+const FLOAT_TYPE: &str = "float";
+const E4M3FN_DTYPE: &str = "torch.float8_e4m3fn";
 
 #[derive(Debug, Deserialize)]
 struct ModelConfig {
@@ -18,7 +27,50 @@ struct ModelConfig {
     model_type: String,
     num_attention_heads: usize,
     num_key_value_heads: usize,
+    quantization_config: QuantizationConfig,
     text_config: TextConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuantizationConfig {
+    config_groups: ConfigGroups,
+    format: String,
+    quant_method: String,
+    quantization_status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigGroups {
+    group_0: QuantizationGroup,
+    group_1: QuantizationGroup,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuantizationGroup {
+    format: String,
+    input_activations: QuantizationScheme,
+    targets: Vec<String>,
+    weights: QuantizationScheme,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuantizationScheme {
+    dynamic: Value,
+    group_size: Option<usize>,
+    num_bits: usize,
+    scale_dtype: Option<String>,
+    strategy: String,
+    symmetric: bool,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+struct SchemeContract<'a> {
+    dynamic: Value,
+    group_size: Option<usize>,
+    num_bits: usize,
+    scale_dtype: Option<&'a str>,
+    strategy: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,7 +207,8 @@ fn validate<A: Arch>(path: &Path, config: &ModelConfig) -> CheckpointResult<()> 
     )?;
     require(path, "text_config.vocab_size", text.vocab_size, A::VOCAB)?;
 
-    validate_layer_types::<A>(path, &text.layer_types)
+    validate_layer_types::<A>(path, &text.layer_types)?;
+    validate_quantization::<A>(path, &config.quantization_config)
 }
 
 fn validate_layer_types<A: Arch>(path: &Path, layer_types: &[String]) -> CheckpointResult<()> {
@@ -195,6 +248,172 @@ fn validate_layer_types<A: Arch>(path: &Path, layer_types: &[String]) -> Checkpo
     Ok(())
 }
 
+fn validate_quantization<A: Arch>(
+    path: &Path,
+    config: &QuantizationConfig,
+) -> CheckpointResult<()> {
+    require(
+        path,
+        "quantization_config.format",
+        config.format.as_str(),
+        MIXED_PRECISION_FORMAT,
+    )?;
+    require(
+        path,
+        "quantization_config.quant_method",
+        config.quant_method.as_str(),
+        QUANT_METHOD,
+    )?;
+    require(
+        path,
+        "quantization_config.quantization_status",
+        config.quantization_status.as_str(),
+        QUANTIZATION_STATUS,
+    )?;
+
+    let fp8 = &config.config_groups.group_0;
+    require(
+        path,
+        "quantization_config.config_groups.group_0.format",
+        fp8.format.as_str(),
+        FP8_FORMAT,
+    )?;
+    let fp8_targets = fp8_targets::<A>();
+    require(
+        path,
+        "quantization_config.config_groups.group_0.targets",
+        fp8.targets.as_slice(),
+        fp8_targets.as_slice(),
+    )?;
+    validate_scheme(
+        path,
+        "quantization_config.config_groups.group_0.input_activations",
+        &fp8.input_activations,
+        SchemeContract {
+            dynamic: Value::Bool(true),
+            group_size: None,
+            num_bits: 8,
+            scale_dtype: None,
+            strategy: "token",
+        },
+    )?;
+    validate_scheme(
+        path,
+        "quantization_config.config_groups.group_0.weights",
+        &fp8.weights,
+        SchemeContract {
+            dynamic: Value::Bool(false),
+            group_size: None,
+            num_bits: 8,
+            scale_dtype: None,
+            strategy: "channel",
+        },
+    )?;
+
+    let nvfp4 = &config.config_groups.group_1;
+    require(
+        path,
+        "quantization_config.config_groups.group_1.format",
+        nvfp4.format.as_str(),
+        NVFP4_FORMAT,
+    )?;
+    let nvfp4_targets = vec![String::from(r"re:.*mlp\.(gate|up|down)_proj$")];
+    require(
+        path,
+        "quantization_config.config_groups.group_1.targets",
+        nvfp4.targets.as_slice(),
+        nvfp4_targets.as_slice(),
+    )?;
+    validate_scheme(
+        path,
+        "quantization_config.config_groups.group_1.input_activations",
+        &nvfp4.input_activations,
+        SchemeContract {
+            dynamic: Value::String(String::from("local")),
+            group_size: Some(16),
+            num_bits: 4,
+            scale_dtype: Some(E4M3FN_DTYPE),
+            strategy: "tensor_group",
+        },
+    )?;
+    validate_scheme(
+        path,
+        "quantization_config.config_groups.group_1.weights",
+        &nvfp4.weights,
+        SchemeContract {
+            dynamic: Value::Bool(false),
+            group_size: Some(16),
+            num_bits: 4,
+            scale_dtype: Some(E4M3FN_DTYPE),
+            strategy: "tensor_group",
+        },
+    )
+}
+
+fn validate_scheme(
+    path: &Path,
+    field: &str,
+    actual: &QuantizationScheme,
+    expected: SchemeContract<'_>,
+) -> CheckpointResult<()> {
+    require(
+        path,
+        &format!("{field}.dynamic"),
+        &actual.dynamic,
+        &expected.dynamic,
+    )?;
+    require(
+        path,
+        &format!("{field}.group_size"),
+        actual.group_size,
+        expected.group_size,
+    )?;
+    require(
+        path,
+        &format!("{field}.num_bits"),
+        actual.num_bits,
+        expected.num_bits,
+    )?;
+    require(
+        path,
+        &format!("{field}.scale_dtype"),
+        actual.scale_dtype.as_deref(),
+        expected.scale_dtype,
+    )?;
+    require(
+        path,
+        &format!("{field}.strategy"),
+        actual.strategy.as_str(),
+        expected.strategy,
+    )?;
+    require(path, &format!("{field}.symmetric"), actual.symmetric, true)?;
+    require(
+        path,
+        &format!("{field}.type"),
+        actual.kind.as_str(),
+        FLOAT_TYPE,
+    )
+}
+
+fn fp8_targets<A: Arch>() -> Vec<String> {
+    let late_layers = (NVFP4_MLP_LAYER_END..A::LAYERS)
+        .map(|layer| layer.to_string())
+        .collect::<Vec<_>>()
+        .join("|");
+
+    vec![
+        String::from(r"re:.*self_attn\.(q|k|v|o)_proj$"),
+        String::from(r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$"),
+        String::from(r"re:.*lm_head"),
+        format!(r"re:.*layers\.({late_layers})\.mlp\.(gate|up|down)_proj$"),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn test_quantization_config() -> Value {
+    serde_json::from_str(include_str!("../fixtures/quantization-config.json")).unwrap()
+}
+
 fn require<T>(path: &Path, field: &str, actual: T, expected: T) -> CheckpointResult<()>
 where
     T: Debug + PartialEq,
@@ -220,7 +439,7 @@ fn invalid_field(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_config;
+    use super::{test_quantization_config, validate_config};
     use crate::{CheckpointErrorCode, Qwen38_27B};
     use serde_json::{Value, json};
     use std::fs;
@@ -256,6 +475,7 @@ mod tests {
             "model_type": "qwen3_5",
             "num_attention_heads": 24,
             "num_key_value_heads": 4,
+            "quantization_config": test_quantization_config(),
             "text_config": {
                 "dtype": "bfloat16",
                 "full_attention_interval": 4,
@@ -447,6 +667,71 @@ mod tests {
             .to_string();
 
         assert!(error.contains("text_config.layer_types length"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_quantization_route_and_codec_mismatches() {
+        for (label, pointer, replacement, field) in [
+            (
+                "quant-format",
+                "/quantization_config/format",
+                json!("other"),
+                "quantization_config.format",
+            ),
+            (
+                "fp8-layer-route",
+                "/quantization_config/config_groups/group_0/targets/3",
+                json!(r"re:.*layers\.(55|56|57|58|59|60|61|62|63)\.mlp\.(gate|up|down)_proj$"),
+                "group_0.targets",
+            ),
+            (
+                "nvfp4-route",
+                "/quantization_config/config_groups/group_1/targets/0",
+                json!(r"re:.*layers\.0\.mlp\.(gate|up|down)_proj$"),
+                "group_1.targets",
+            ),
+            (
+                "fp8-weight-bits",
+                "/quantization_config/config_groups/group_0/weights/num_bits",
+                json!(4),
+                "group_0.weights.num_bits",
+            ),
+            (
+                "nvfp4-group-size",
+                "/quantization_config/config_groups/group_1/weights/group_size",
+                json!(32),
+                "group_1.weights.group_size",
+            ),
+            (
+                "nvfp4-scale-dtype",
+                "/quantization_config/config_groups/group_1/input_activations/scale_dtype",
+                json!("torch.float16"),
+                "group_1.input_activations.scale_dtype",
+            ),
+        ] {
+            let mut config = valid_config();
+            *config.pointer_mut(pointer).unwrap() = replacement;
+            let path = write_config(label, &config);
+
+            let error = validate_config::<Qwen38_27B>(&path).err().unwrap();
+
+            assert_eq!(error.code(), CheckpointErrorCode::Config);
+            assert!(error.to_string().contains(field), "{error}");
+
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn admits_observer_only_quantization_metadata_change() {
+        let mut config = valid_config();
+        config["quantization_config"]["config_groups"]["group_1"]["weights"]["observer"] =
+            json!("imatrix_mse");
+        let path = write_config("observer-metadata", &config);
+
+        validate_config::<Qwen38_27B>(&path).unwrap();
 
         fs::remove_file(path).unwrap();
     }

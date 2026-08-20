@@ -1,4 +1,4 @@
-use crate::bindings::validate_nvfp4_scales;
+use crate::bindings::{NVFP4_MLP_LAYER_END, require_nvfp4_mlp_layer, validate_nvfp4_scales};
 use crate::{CheckpointError, CheckpointResult, Nvfp4DownBindings, Nvfp4GateUpBindings};
 
 const SCALE_TILE_ROWS: usize = 128;
@@ -30,6 +30,8 @@ pub struct MaterializedNvfp4GateUp<'a> {
 
 impl<'a> Nvfp4GateUpBindings<'a> {
     pub fn materialize(self) -> CheckpointResult<MaterializedNvfp4GateUp<'a>> {
+        require_nvfp4_mlp_layer(self.layer, NVFP4_MLP_LAYER_END)?;
+
         let [gate_rows, packed_columns] = host_shape(self.gate_weight.shape(), "gate weights")?;
         let up_shape = host_shape(self.up_weight.shape(), "up weights")?;
         let [gate_scale_rows, groups] = host_shape(self.gate_scale.shape(), "gate scales")?;
@@ -100,6 +102,8 @@ pub struct MaterializedNvfp4Down<'a> {
 
 impl<'a> Nvfp4DownBindings<'a> {
     pub fn materialize(self) -> CheckpointResult<MaterializedNvfp4Down<'a>> {
+        require_nvfp4_mlp_layer(self.layer, NVFP4_MLP_LAYER_END)?;
+
         let [rows, packed_columns] = host_shape(self.weight.shape(), "down weights")?;
         let [scale_rows, groups] = host_shape(self.scale.shape(), "down scales")?;
 
@@ -336,6 +340,21 @@ mod tests {
             layer: 55,
         };
 
+        let error = Nvfp4GateUpBindings {
+            layer: 56,
+            ..bindings
+        }
+        .materialize()
+        .err()
+        .unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            error
+                .to_string()
+                .contains("does not use the admitted NVFP4")
+        );
+
         let materialized = bindings.materialize().unwrap();
         let source = [gate_scale.as_slice(), up_scale.as_slice()].concat();
         let expected = block_scale_oracle(&source, 2 * ROWS, GROUPS);
@@ -367,6 +386,21 @@ mod tests {
             weight_scale_divisor: 3_376.0,
             layer: 55,
         };
+
+        let error = Nvfp4DownBindings {
+            layer: 56,
+            ..bindings
+        }
+        .materialize()
+        .err()
+        .unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            error
+                .to_string()
+                .contains("does not use the admitted NVFP4")
+        );
 
         let materialized = bindings.materialize().unwrap();
         let expected = block_scale_oracle(&scale, ROWS, GROUPS);
