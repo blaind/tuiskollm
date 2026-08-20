@@ -300,6 +300,148 @@ impl<'a> FullAttentionPostBindings<'a> {
     }
 }
 
+/// Complete source-native planes for one GDN mixer layer.
+#[derive(Clone, Copy, Debug)]
+pub struct GdnBindings<'a> {
+    /// QKV rows followed by Z rows as one E4M3 source span `[gdn_input_rows, hidden]`.
+    pub input_weight_e4m3: &'a [u8],
+    /// QKV row scales followed by Z row scales as one little-endian BF16 source span.
+    pub input_scale_bf16: &'a [u8],
+    /// Fused QKV/Z row count.
+    pub input_rows: usize,
+    /// Logical input width.
+    pub input_columns: usize,
+    /// Per-value-head A-control projection `[gdn_control_rows, hidden]`.
+    pub a_control_weight: Bf16View<'a, 2>,
+    /// Per-value-head B-control projection `[gdn_control_rows, hidden]`.
+    pub b_control_weight: Bf16View<'a, 2>,
+    /// Width-four causal-convolution weights `[gdn_qkv_rows, 1, kernel]`.
+    pub convolution_weight: Bf16View<'a, 3>,
+    /// Log-space recurrence decay parameters `[gdn_control_rows]`.
+    pub a_log: Bf16View<'a, 1>,
+    /// Recurrence time-step bias `[gdn_control_rows]`.
+    pub dt_bias: Bf16View<'a, 1>,
+    /// Per-head gated RMSNorm weights `[linear_head_dim]`.
+    pub norm: Bf16View<'a, 1>,
+    /// Source-native output projection `[hidden, gdn_value_rows]`.
+    pub output_weight: Fp8E4M3View<'a, 2>,
+    /// One positive little-endian BF16 scale per output row `[hidden, 1]`.
+    pub output_scale: Bf16View<'a, 2>,
+    /// Zero-centered RMSNorm weights before the mixer `[hidden]`.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the MLP `[hidden]`.
+    pub post_attention_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning these sources.
+    pub layer: usize,
+}
+
+impl<'a> GdnBindings<'a> {
+    /// Binds one admitted GDN mixer source family.
+    pub fn bind<A: Arch>(
+        snapshot: &'a CheckpointSnapshot<A>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from::<A>(
+            layer,
+            |name| snapshot.tensor(name),
+            |first, second, role| snapshot.adjacent_tensor_bytes(first, second, role),
+        )
+    }
+
+    fn bind_from<A: Arch>(
+        layer: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+        mut adjacent: impl FnMut(&str, &str, &str) -> CheckpointResult<&'a [u8]>,
+    ) -> CheckpointResult<Self> {
+        require_gdn_layer::<A>(layer)?;
+
+        let hidden = A::HIDDEN as u64;
+        let qkv_rows = A::GDN_QKV_ROWS as u64;
+        let value_rows = A::GDN_VALUE_ROWS as u64;
+        let control_rows = A::GDN_CONTROL_ROWS as u64;
+        let head_dim = A::LINEAR_HEAD_DIM as u64;
+        let convolution = A::LINEAR_CONV_KERNEL_DIM as u64;
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let prefix = format!("{layer_prefix}.linear_attn");
+        let qkv_weight_name = format!("{prefix}.in_proj_qkv.weight");
+        let z_weight_name = format!("{prefix}.in_proj_z.weight");
+        let qkv_scale_name = format!("{prefix}.in_proj_qkv.weight_scale");
+        let z_scale_name = format!("{prefix}.in_proj_z.weight_scale");
+
+        Fp8E4M3View::bind(tensor(&qkv_weight_name)?, [qkv_rows, hidden])?;
+        Fp8E4M3View::bind(tensor(&z_weight_name)?, [value_rows, hidden])?;
+
+        let input_weight_e4m3 = adjacent(
+            &qkv_weight_name,
+            &z_weight_name,
+            &format!("layer-{layer} GDN QKV/Z weights"),
+        )?;
+        let qkv_scale = Bf16View::bind(tensor(&qkv_scale_name)?, [qkv_rows, 1])?;
+        let z_scale = Bf16View::bind(tensor(&z_scale_name)?, [value_rows, 1])?;
+
+        validate_positive_bf16_scales(&qkv_scale)?;
+        validate_positive_bf16_scales(&z_scale)?;
+
+        let input_scale_bf16 = adjacent(
+            &qkv_scale_name,
+            &z_scale_name,
+            &format!("layer-{layer} GDN QKV/Z scales"),
+        )?;
+        let a_control_weight = Bf16View::bind(
+            tensor(&format!("{prefix}.in_proj_a.weight"))?,
+            [control_rows, hidden],
+        )?;
+        let b_control_weight = Bf16View::bind(
+            tensor(&format!("{prefix}.in_proj_b.weight"))?,
+            [control_rows, hidden],
+        )?;
+        let convolution_weight = Bf16View::bind(
+            tensor(&format!("{prefix}.conv1d.weight"))?,
+            [qkv_rows, 1, convolution],
+        )?;
+        let a_log = Bf16View::bind(tensor(&format!("{prefix}.A_log"))?, [control_rows])?;
+        let dt_bias = Bf16View::bind(tensor(&format!("{prefix}.dt_bias"))?, [control_rows])?;
+        let norm = Bf16View::bind(tensor(&format!("{prefix}.norm.weight"))?, [head_dim])?;
+        let output_weight = Fp8E4M3View::bind(
+            tensor(&format!("{prefix}.out_proj.weight"))?,
+            [hidden, value_rows],
+        )?;
+        let output_scale = Bf16View::bind(
+            tensor(&format!("{prefix}.out_proj.weight_scale"))?,
+            [hidden, 1],
+        )?;
+
+        validate_positive_bf16_scales(&output_scale)?;
+
+        let input_norm = Bf16View::bind(
+            tensor(&format!("{layer_prefix}.input_layernorm.weight"))?,
+            [hidden],
+        )?;
+        let post_attention_norm = Bf16View::bind(
+            tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+            [hidden],
+        )?;
+
+        Ok(Self {
+            input_weight_e4m3,
+            input_scale_bf16,
+            input_rows: A::GDN_INPUT_ROWS,
+            input_columns: A::HIDDEN,
+            a_control_weight,
+            b_control_weight,
+            convolution_weight,
+            a_log,
+            dt_bias,
+            norm,
+            output_weight,
+            output_scale,
+            input_norm,
+            post_attention_norm,
+            layer,
+        })
+    }
+}
+
 /// Exact packed gate/up source planes for one NVFP4 MLP layer.
 #[derive(Clone, Copy, Debug)]
 pub struct Nvfp4GateUpBindings<'a> {
@@ -509,6 +651,18 @@ fn require_dense_fp8_mlp_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
     Ok(())
 }
 
+fn require_gdn_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
+    let interval = A::FULL_ATTENTION_INTERVAL;
+
+    if interval == 0 || layer >= A::LAYERS || layer % interval == interval - 1 {
+        return Err(CheckpointError::source_binding(format!(
+            "layer {layer} does not use the admitted GDN source contract"
+        )));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn require_full_attention_layer(
     layer: usize,
     layer_count: usize,
@@ -617,9 +771,10 @@ fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> Checkpo
 mod tests {
     use super::{
         DenseFp8DownBindings, DenseFp8GateUpBindings, FullAttentionPostBindings,
-        FullAttentionQkvBindings, Nvfp4DownBindings, Nvfp4GateUpBindings, TextEndpointBindings,
-        positive_bf16, require_adjacent, require_dense_fp8_mlp_layer, require_full_attention_layer,
-        require_nvfp4_mlp_layer, validate_nvfp4_scales,
+        FullAttentionQkvBindings, GdnBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
+        TextEndpointBindings, positive_bf16, require_adjacent, require_dense_fp8_mlp_layer,
+        require_full_attention_layer, require_gdn_layer, require_nvfp4_mlp_layer,
+        validate_nvfp4_scales,
     };
     use crate::{Arch, CheckpointErrorCode, CheckpointResult, DType, SafeTensorFile, TensorView};
     use serde_json::{Value, json};
@@ -667,7 +822,7 @@ mod tests {
         const LINEAR_KEY_HEADS: usize = 1;
         const LINEAR_VALUE_HEADS: usize = 1;
         const LINEAR_HEAD_DIM: usize = 1;
-        const LINEAR_CONV_KERNEL_DIM: usize = 1;
+        const LINEAR_CONV_KERNEL_DIM: usize = 4;
     }
 
     fn fixture_path(label: &str) -> PathBuf {
@@ -884,6 +1039,72 @@ mod tests {
         )
     }
 
+    fn gdn_fixture(layer: usize) -> (Value, Vec<u8>) {
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let prefix = format!("{layer_prefix}.linear_attn");
+        let mut payload = vec![0x80; 518];
+
+        payload[0..96].fill(0x10);
+        payload[96..128].fill(0x20);
+        payload[128..160].fill(0x30);
+        payload[160..168]
+            .as_chunks_mut::<2>()
+            .0
+            .fill(0x3f80u16.to_le_bytes());
+        payload[168..232]
+            .as_chunks_mut::<2>()
+            .0
+            .fill(0x3f00u16.to_le_bytes());
+
+        (
+            json!({
+                format!("{prefix}.in_proj_qkv.weight"): {
+                    "dtype":"F8_E4M3", "shape":[3,32], "data_offsets":[0,96]
+                },
+                format!("{prefix}.in_proj_z.weight"): {
+                    "dtype":"F8_E4M3", "shape":[1,32], "data_offsets":[96,128]
+                },
+                format!("{prefix}.out_proj.weight"): {
+                    "dtype":"F8_E4M3", "shape":[32,1], "data_offsets":[128,160]
+                },
+                format!("{prefix}.in_proj_qkv.weight_scale"): {
+                    "dtype":"BF16", "shape":[3,1], "data_offsets":[160,166]
+                },
+                format!("{prefix}.in_proj_z.weight_scale"): {
+                    "dtype":"BF16", "shape":[1,1], "data_offsets":[166,168]
+                },
+                format!("{prefix}.out_proj.weight_scale"): {
+                    "dtype":"BF16", "shape":[32,1], "data_offsets":[168,232]
+                },
+                format!("{prefix}.in_proj_a.weight"): {
+                    "dtype":"BF16", "shape":[1,32], "data_offsets":[232,296]
+                },
+                format!("{prefix}.in_proj_b.weight"): {
+                    "dtype":"BF16", "shape":[1,32], "data_offsets":[296,360]
+                },
+                format!("{prefix}.conv1d.weight"): {
+                    "dtype":"BF16", "shape":[3,1,4], "data_offsets":[360,384]
+                },
+                format!("{prefix}.A_log"): {
+                    "dtype":"BF16", "shape":[1], "data_offsets":[384,386]
+                },
+                format!("{prefix}.dt_bias"): {
+                    "dtype":"BF16", "shape":[1], "data_offsets":[386,388]
+                },
+                format!("{prefix}.norm.weight"): {
+                    "dtype":"BF16", "shape":[1], "data_offsets":[388,390]
+                },
+                format!("{layer_prefix}.input_layernorm.weight"): {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[390,454]
+                },
+                format!("{layer_prefix}.post_attention_layernorm.weight"): {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[454,518]
+                }
+            }),
+            payload,
+        )
+    }
+
     fn assert_rejects_bf16_scale(
         label: &str,
         header: Value,
@@ -1068,6 +1289,64 @@ mod tests {
     }
 
     #[test]
+    fn binds_exact_gdn_source_contract() {
+        let path = fixture_path("gdn");
+        let (header, payload) = gdn_fixture(62);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let bindings = GdnBindings::bind_from::<Nvfp4Arch>(
+            62,
+            |name| file.tensor(name),
+            |first, second, role| file.adjacent_tensor_bytes(first, second, role),
+        )
+        .unwrap();
+
+        assert_eq!(bindings.input_weight_e4m3.len(), 128);
+        assert_eq!(bindings.input_weight_e4m3[0], 0x10);
+        assert_eq!(bindings.input_weight_e4m3[96], 0x20);
+        assert_eq!(bindings.input_scale_bf16.len(), 8);
+        assert_eq!(bindings.input_scale_bf16[0], 0x80);
+        assert_eq!(bindings.input_scale_bf16[6], 0x80);
+        assert_eq!((bindings.input_rows, bindings.input_columns), (4, 32));
+        assert_eq!(bindings.a_control_weight.shape(), &[1, 32]);
+        assert_eq!(bindings.b_control_weight.shape(), &[1, 32]);
+        assert_eq!(bindings.convolution_weight.shape(), &[3, 1, 4]);
+        assert_eq!(bindings.a_log.shape(), &[1]);
+        assert_eq!(bindings.dt_bias.shape(), &[1]);
+        assert_eq!(bindings.norm.shape(), &[1]);
+        assert_eq!(bindings.output_weight.shape(), &[32, 1]);
+        assert_eq!(bindings.output_weight.codes()[0], 0x30);
+        assert_eq!(bindings.output_scale.shape(), &[32, 1]);
+        assert_eq!(bindings.input_norm.shape(), &[32]);
+        assert_eq!(bindings.post_attention_norm.shape(), &[32]);
+        assert_eq!(bindings.layer, 62);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_gdn_convolution_shape_mismatch() {
+        let path = fixture_path("gdn-convolution-shape");
+        let (mut header, payload) = gdn_fixture(62);
+        header["model.language_model.layers.62.linear_attn.conv1d.weight"]["shape"] = json!([3, 4]);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let error = GdnBindings::bind_from::<Nvfp4Arch>(
+            62,
+            |name| file.tensor(name),
+            |first, second, role| file.adjacent_tensor_bytes(first, second, role),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::Tensor);
+        assert!(error.to_string().contains("conv1d.weight"));
+        assert!(error.to_string().contains("expected [3, 1, 4]"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn rejects_invalid_fp8_bf16_scale_planes() {
         let endpoint_payload = (0u8..50).collect::<Vec<_>>();
         assert_rejects_bf16_scale(
@@ -1136,6 +1415,40 @@ mod tests {
                     .map(|_| ())
             },
         );
+
+        let (header, payload) = gdn_fixture(62);
+        assert_rejects_bf16_scale(
+            "gdn-input-scale",
+            header,
+            payload,
+            160,
+            "in_proj_qkv.weight_scale",
+            |file| {
+                GdnBindings::bind_from::<Nvfp4Arch>(
+                    62,
+                    |name| file.tensor(name),
+                    |first, second, role| file.adjacent_tensor_bytes(first, second, role),
+                )
+                .map(|_| ())
+            },
+        );
+
+        let (header, payload) = gdn_fixture(62);
+        assert_rejects_bf16_scale(
+            "gdn-output-scale",
+            header,
+            payload,
+            168,
+            "out_proj.weight_scale",
+            |file| {
+                GdnBindings::bind_from::<Nvfp4Arch>(
+                    62,
+                    |name| file.tensor(name),
+                    |first, second, role| file.adjacent_tensor_bytes(first, second, role),
+                )
+                .map(|_| ())
+            },
+        );
     }
 
     #[test]
@@ -1178,6 +1491,26 @@ mod tests {
                     Nvfp4Arch::FULL_ATTENTION_INTERVAL,
                 )
                 .is_ok(),
+                admitted,
+                "layer {layer}"
+            );
+        }
+    }
+
+    #[test]
+    fn gdn_layer_route_is_exact() {
+        for (layer, admitted) in [
+            (0, true),
+            (2, true),
+            (3, false),
+            (4, true),
+            (59, false),
+            (62, true),
+            (63, false),
+            (64, false),
+        ] {
+            assert_eq!(
+                require_gdn_layer::<Nvfp4Arch>(layer).is_ok(),
                 admitted,
                 "layer {layer}"
             );
