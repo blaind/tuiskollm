@@ -78,6 +78,8 @@ impl BenchmarkMeasurement {
 pub enum BenchmarkScope {
     /// One closed operator.
     Operator,
+    /// A model input or output endpoint.
+    Endpoint,
     /// One composed model layer.
     Layer,
     /// The resident model graph.
@@ -189,6 +191,22 @@ impl BenchmarkWorkload {
             batch_size: None,
             concurrency: None,
             active_tokens: Some(active_tokens),
+            prompt_tokens: None,
+            context_tokens: None,
+            output_tokens: None,
+            device_cache: DeviceCacheRegime::Warm,
+            prefix_cache: None,
+            execution: BenchmarkExecution::CudaGraph,
+        }
+    }
+
+    pub(crate) fn warm_endpoint_decode(batch_size: u32) -> Self {
+        Self {
+            scope: BenchmarkScope::Endpoint,
+            phase: BenchmarkPhase::Decode,
+            batch_size: Some(batch_size),
+            concurrency: None,
+            active_tokens: Some(u64::from(batch_size)),
             prompt_tokens: None,
             context_tokens: None,
             output_tokens: None,
@@ -445,6 +463,14 @@ pub enum DeviceBenchmarkError {
     /// GPU ownership, launch, or driver failure.
     #[error(transparent)]
     Gpu(#[from] tuisko_gpu::GpuError),
+
+    /// Resident engine ownership or execution failure.
+    #[error(transparent)]
+    Engine(#[from] tuisko_engine::EngineError),
+
+    /// Snapshot admission or source binding failure.
+    #[error(transparent)]
+    Checkpoint(#[from] tuisko_model::CheckpointError),
 
     /// Host filesystem or process failure.
     #[error(transparent)]

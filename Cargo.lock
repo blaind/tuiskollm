@@ -721,6 +721,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuisko-engine"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tuisko-gpu",
+ "tuisko-kernels-sm120",
+ "tuisko-model",
+]
+
+[[package]]
 name = "tuisko-gpu"
 version = "0.1.0"
 dependencies = [
@@ -760,6 +770,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "tuisko-engine",
  "tuisko-gpu",
  "tuisko-kernels-sm120",
  "tuisko-model",

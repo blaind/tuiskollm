@@ -2,7 +2,7 @@
 
 use crate::{CudaStream, DeviceBuffer, DeviceCopy, GpuError, GpuResult};
 use std::marker::PhantomData;
-use std::mem::{align_of, size_of};
+use std::mem::{align_of, size_of, size_of_val};
 
 /// A typed byte range reserved within a device arena.
 #[derive(Clone, Copy, Debug)]
@@ -237,8 +237,28 @@ impl DeviceArena {
                 region.len
             )));
         }
+
+        self.copy_prefix_from_host(stream, region, source)
+    }
+
+    /// Copies a typed host slice into the beginning of one region.
+    pub fn copy_prefix_from_host<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        source: &[T],
+    ) -> GpuResult<()> {
+        self.require_stream_context(stream, "copying a host slice into a device arena")?;
+        if source.len() > region.len {
+            return Err(GpuError::arena(format!(
+                "host source has {} elements for an arena region of {} elements",
+                source.len(),
+                region.len
+            )));
+        }
         let address = self.address(region)? as u64;
-        if region.bytes == 0 {
+        let bytes = size_of_val(source);
+        if bytes == 0 {
             return Ok(());
         }
 
@@ -251,7 +271,7 @@ impl DeviceArena {
             cuda_core::memory::memcpy_htod_async(
                 address,
                 source.as_ptr(),
-                region.bytes,
+                bytes,
                 stream.cu_stream(),
             )
         }
@@ -267,10 +287,29 @@ impl DeviceArena {
         stream: &CudaStream,
         region: ArenaRegion<T>,
     ) -> GpuResult<Vec<T>> {
+        self.copy_prefix_to_host(stream, region, region.len)
+    }
+
+    /// Copies the beginning of one region into an owned host vector.
+    pub fn copy_prefix_to_host<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        len: usize,
+    ) -> GpuResult<Vec<T>> {
         self.require_stream_context(stream, "copying a device arena region to the host")?;
+        if len > region.len {
+            return Err(GpuError::arena(format!(
+                "requested {len} elements from an arena region of {} elements",
+                region.len
+            )));
+        }
         let address = self.address(region)? as u64;
-        let mut host = Vec::with_capacity(region.len);
-        if region.bytes == 0 {
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena("arena copy byte count overflows"))?;
+        let mut host = Vec::with_capacity(len);
+        if bytes == 0 {
             return Ok(host);
         }
 
@@ -278,12 +317,12 @@ impl DeviceArena {
             .context()
             .bind_to_thread()
             .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
-        // SAFETY: the checked region and reserved vector capacity both cover `region.bytes`.
+        // SAFETY: the checked region and reserved vector capacity both cover `bytes`.
         unsafe {
             cuda_core::memory::memcpy_dtoh_async(
                 host.as_mut_ptr(),
                 address,
-                region.bytes,
+                bytes,
                 stream.cu_stream(),
             )
         }
@@ -291,8 +330,8 @@ impl DeviceArena {
         stream
             .synchronize()
             .map_err(|source| GpuError::driver("synchronizing a device arena download", source))?;
-        // SAFETY: the completed copy initialized all `region.len` elements.
-        unsafe { host.set_len(region.len) };
+        // SAFETY: the completed copy initialized all `len` elements.
+        unsafe { host.set_len(len) };
 
         Ok(host)
     }

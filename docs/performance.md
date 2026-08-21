@@ -4,10 +4,11 @@ TuiskoLLM uses a custom device runner for GPU measurements and Criterion for pur
 results are valid only on the exact RTX 5090 target under an exclusive, recorded environment.
 
 The registered device suites cover zero-centered residual/RMSNorm at exact `B=1..8`, and
-dynamic-quantize FP8 QKV at exact `B=1..8` plus `T=16` and GDN Q/K/V/Z input projection at exact
-`B=1..8`, and the full-vocabulary FP8 LM head at exact `B=1..8`. The report schema is already shaped
-for future layer, whole-model, and serving cases, but those measurements do not exist until their
-production owners land.
+dynamic-quantize FP8 QKV at exact `B=1..8` plus `T=16`, GDN Q/K/V/Z input projection at exact
+`B=1..8`, the full-vocabulary FP8 LM head at exact `B=1..8`, and the source-backed final-norm plus
+LM-head endpoint at exact `B=1..8`. The report schema is already shaped for future layer,
+whole-model, and serving cases, but those measurements do not exist until their production owners
+land.
 
 ## Quick start
 
@@ -53,6 +54,8 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- qualify-fp8-qkv` | Run the independent represented-value QKV oracle and benchmark-accounting test | terminal |
 | `cargo run -p xtask -- qualify-fp8-gdn-input` | Run the independent represented-value GDN input oracle and benchmark-accounting test | terminal |
 | `cargo run -p xtask -- qualify-fp8-lm-head` | Run the independent represented-value full-vocabulary LM-head oracle and benchmark-accounting test | terminal |
+| `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
+| `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
 | `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
 | `cargo run -p xtask -- perf energy` | Full leaf reports plus a sustained power window per route | `target/benchmarks/perf-energy/*.json` |
@@ -75,6 +78,9 @@ cargo run -p xtask -- bench-residual-norm \
 Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, or `bench-fp8-lm-head` with the
 same options for one projection suite only.
 
+`bench-text-endpoint SNAPSHOT` accepts the same options. It is intentionally separate from the
+leaf-wide `perf` commands until its first reviewed baseline is blessed.
+
 Add `--energy-seconds 2` for sustained energy sampling. At least three samples, one launch per
 sample, and a two-second energy window are required.
 
@@ -91,7 +97,9 @@ Each exact route reports four boundaries:
 
 `device_graph` is the production graph-replay cost. `device_path` reduces CUDA-event timer
 quantization for a short operation; it is not a different production route. A residual-norm path is
-one kernel. An FP8 projection path is its production quantization and projection pair.
+one kernel. An FP8 projection path is its production quantization and projection pair. The text
+endpoint path is final RMSNorm followed by dynamic activation quantization and the LM-head
+projection over the production graph's stable addresses.
 
 The reusable timer records two events around a repeated interval and synchronizes once after it.
 It does not insert events into or mutate the production graph, and its fixed boundary cost is
@@ -110,7 +118,7 @@ arena for the complete session.
 
 A timing key is more than `(route, shape)`. The report and baseline bind each metric to:
 
-- scope: `operator`, `layer`, `model`, or `server`;
+- scope: `operator`, `endpoint`, `layer`, `model`, or `server`;
 - phase: `startup`, `prefill`, `decode`, `mtp`, or `request`;
 - compiled batch size;
 - external concurrency;

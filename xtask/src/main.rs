@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|perf>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|perf>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -101,10 +101,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-fp8-qkv") if remaining.is_empty() => qualify_fp8_qkv(root),
         Some("qualify-fp8-gdn-input") if remaining.is_empty() => qualify_fp8_gdn_input(root),
         Some("qualify-fp8-lm-head") if remaining.is_empty() => qualify_fp8_lm_head(root),
+        Some("qualify-text-endpoint") => qualify_text_endpoint(root, &remaining),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
         Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
         Some("bench-fp8-gdn-input") => bench_fp8_gdn_input(root, &remaining),
         Some("bench-fp8-lm-head") => bench_fp8_lm_head(root, &remaining),
+        Some("bench-text-endpoint") => bench_text_endpoint(root, &remaining),
         Some("gate-residual-norm") if remaining.is_empty() => gate_residual_norm(root),
         Some("gate-fp8-qkv") if remaining.is_empty() => gate_fp8_qkv(root),
         Some("gate-fp8-gdn-input") if remaining.is_empty() => gate_fp8_gdn_input(root),
@@ -313,6 +315,39 @@ fn qualify_fp8_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_fp8_lm_head(root)
 }
 
+fn qualify_text_endpoint(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-text-endpoint SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "text_endpoint::tests::source_endpoint_matches_independent_oracles_and_graph_replay",
+            "--include-ignored",
+            "--nocapture",
+        ],
+        Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_residual_norm(root)?;
+    gate_fp8_lm_head(root)
+}
+
 fn bench_residual_norm(
     root: &Path,
     arguments: &[std::ffi::OsString],
@@ -333,6 +368,35 @@ fn bench_fp8_gdn_input(
 
 fn bench_fp8_lm_head(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
     bench_suite(root, PerformanceSuite::Fp8LmHead, arguments)
+}
+
+fn bench_text_endpoint(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err("usage: cargo run -p xtask -- bench-text-endpoint SNAPSHOT [options]".into());
+    };
+    build_sm120(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = fs::read(root.join(RESIDUAL_NORM_RESOURCE_BASELINE))?;
+    baselines.extend_from_slice(&fs::read(root.join(FP8_LM_HEAD_RESOURCE_BASELINE))?);
+    run_visible(
+        Command::new(executable)
+            .arg("text-endpoint")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
 }
 
 fn bench_suite(
@@ -497,6 +561,14 @@ fn performance_report_path(root: &Path, mode: &str, suite: PerformanceSuite) -> 
 }
 
 fn run_oxide(root: &Path, arguments: &[&str]) -> Result<(), Box<dyn Error>> {
+    run_oxide_with_env(root, arguments, None)
+}
+
+fn run_oxide_with_env(
+    root: &Path,
+    arguments: &[&str],
+    environment: Option<(&str, &OsStr)>,
+) -> Result<(), Box<dyn Error>> {
     let source = local_cuda_oxide_source(root);
     require_cuda_oxide_revision(&source)?;
     let wrapper = root.join("target/cuda-oxide-driver/debug/cargo-oxide");
@@ -509,17 +581,21 @@ fn run_oxide(root: &Path, arguments: &[&str]) -> Result<(), Box<dyn Error>> {
     let backend = local_backend(root)?;
     let backend_rustflags = encoded_backend_rustflags(root, &source)?;
     fs::create_dir_all(root.join("target/tmp"))?;
-    run_visible(
-        Command::new(wrapper)
-            .args(arguments)
-            .current_dir(root)
-            .env("CARGO_HOME", task_cargo_home(root))
-            .env("CUDA_OXIDE_BACKEND", backend)
-            .env("CUDA_OXIDE_SOURCE", source)
-            .env("CARGO_ENCODED_RUSTFLAGS", backend_rustflags)
-            .env_remove("RUSTFLAGS")
-            .env("TMPDIR", root.join("target/tmp")),
-    )
+    let mut command = Command::new(wrapper);
+    command
+        .args(arguments)
+        .current_dir(root)
+        .env("CARGO_HOME", task_cargo_home(root))
+        .env("CUDA_OXIDE_BACKEND", backend)
+        .env("CUDA_OXIDE_SOURCE", source)
+        .env("CARGO_ENCODED_RUSTFLAGS", backend_rustflags)
+        .env_remove("RUSTFLAGS")
+        .env("TMPDIR", root.join("target/tmp"));
+    if let Some((name, value)) = environment {
+        command.env(name, value);
+    }
+
+    run_visible(&mut command)
 }
 
 fn run_visible(command: &mut Command) -> Result<(), Box<dyn Error>> {

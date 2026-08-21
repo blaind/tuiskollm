@@ -78,7 +78,7 @@ fn encode_e4m3fn(value: f32) -> Result<u8, String> {
     Ok(best)
 }
 
-fn decode_e4m3fn(code: u8) -> Result<f32, String> {
+pub(crate) fn decode_e4m3fn(code: u8) -> Result<f32, String> {
     let sign = if code & 0x80 == 0 { 1.0 } else { -1.0 };
     let exponent = (code >> 3) & 0x0f;
     let fraction = code & 0x07;
