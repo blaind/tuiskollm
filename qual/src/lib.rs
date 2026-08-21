@@ -1,6 +1,7 @@
 //! Independent operator qualification for the exact SM120 target.
 
 mod device_benchmark;
+mod fp8_qkv;
 mod residual_norm;
 mod residual_norm_benchmark;
 
@@ -11,6 +12,7 @@ pub use device_benchmark::{
     DeviceMemoryMetric, DeviceMemoryReport, DeviceMemorySnapshot, MemoryComparison,
     PrefixCacheRegime,
 };
+pub use fp8_qkv::{Fp8QkvQualification, Fp8QkvQualificationError, qualify_fp8_qkv};
 pub use residual_norm::{
     ResidualNormQualification, ResidualNormQualificationError, qualify_residual_norm,
 };

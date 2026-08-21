@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const BASELINE: &str = "qual/baselines/residual-norm-sm120.txt";
+const FP8_QKV_BASELINE: &str = "qual/baselines/fp8-qkv-sm120.txt";
 const PERFORMANCE_BASELINE: &str = "qual/baselines/sm120-qwen38.json";
 const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
 const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build";
@@ -23,7 +24,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-residual-norm|bench-residual-norm|gate-residual-norm|perf>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-residual-norm|qualify-fp8-qkv|bench-residual-norm|gate-residual-norm|gate-fp8-qkv|perf>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -32,8 +33,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bootstrap-cuda-oxide") if remaining.is_empty() => bootstrap_cuda_oxide(root),
         Some("build-sm120") if remaining.is_empty() => build_sm120(root),
         Some("qualify-residual-norm") if remaining.is_empty() => qualify_residual_norm(root),
+        Some("qualify-fp8-qkv") if remaining.is_empty() => qualify_fp8_qkv(root),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
         Some("gate-residual-norm") if remaining.is_empty() => gate_residual_norm(root),
+        Some("gate-fp8-qkv") if remaining.is_empty() => gate_fp8_qkv(root),
         Some("perf") => perf(root, &remaining),
         Some(known)
             if matches!(
@@ -41,7 +44,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "bootstrap-cuda-oxide"
                     | "build-sm120"
                     | "qualify-residual-norm"
+                    | "qualify-fp8-qkv"
                     | "gate-residual-norm"
+                    | "gate-fp8-qkv"
             ) =>
         {
             Err(format!("`{known}` takes no arguments").into())
@@ -126,7 +131,8 @@ fn build_sm120(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
         ],
     )?;
-    gate_residual_norm(root)
+    gate_residual_norm(root)?;
+    gate_fp8_qkv(root)
 }
 
 fn qualify_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -146,11 +152,37 @@ fn qualify_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
+            "residual_norm::tests",
             "--include-ignored",
             "--nocapture",
         ],
     )?;
     gate_residual_norm(root)
+}
+
+fn qualify_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "fp8_qkv::tests",
+            "--include-ignored",
+            "--nocapture",
+        ],
+    )?;
+    gate_fp8_qkv(root)
 }
 
 fn bench_residual_norm(
@@ -359,6 +391,90 @@ fn gate_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
     println!(
         "residual-norm gate passed: 8 plain + 8 residual entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}",
         plain_registers, residual_registers, shared
+    );
+    Ok(())
+}
+
+fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(root.join(FP8_QKV_BASELINE))?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; run the pinned release device build first",
+            ptx_path.display()
+        )
+    })?;
+    let entries = parse_entries(&ptx);
+    let quantize = entries
+        .iter()
+        .filter(|entry| entry.name == "quantize_activation_e4m3")
+        .collect::<Vec<_>>();
+    let qkv = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("fp8_qkv_TID_"))
+        .collect::<Vec<_>>();
+    require_count("FP8 activation quantization", quantize.len(), 1)?;
+    require_count("FP8 QKV", qkv.len(), 8)?;
+
+    for entry in quantize.iter().chain(&qkv) {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let temporary = root.join("target/tmp");
+    fs::create_dir_all(&temporary)?;
+    let cubin = temporary.join("fp8-qkv-gate.cubin");
+    let ptxas = cuda_tool("ptxas");
+    require_success(
+        &ptxas,
+        &[
+            OsStr::new("-O3"),
+            OsStr::new("--gpu-name"),
+            OsStr::new("sm_120a"),
+            ptx_path.as_os_str(),
+            OsStr::new("--output-file"),
+            cubin.as_os_str(),
+        ],
+    )?;
+    let cuobjdump = cuda_tool("cuobjdump");
+    let resources = require_success(
+        &cuobjdump,
+        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+    )?;
+    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let quantize_resource = resources
+        .get(quantize[0].name)
+        .ok_or("cuobjdump omitted FP8 activation quantization")?;
+    require_spill_free(quantize[0].name, quantize_resource)?;
+    require_registers(
+        &baseline,
+        "quantize_registers",
+        &[quantize_resource.registers],
+    )?;
+
+    let mut qkv_registers = Vec::new();
+    let mut qkv_shared = Vec::new();
+    for entry in qkv {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted FP8 QKV entry `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        qkv_registers.push(resource.registers);
+        qkv_shared.push(resource.shared);
+    }
+    qkv_registers.sort_unstable();
+    require_registers(&baseline, "qkv_registers", &qkv_registers)?;
+
+    println!(
+        "FP8 QKV gate passed: 1 quantize + 8 projection entries, REG {} / {:?}, STACK:0 LOCAL:0, SHARED {} / {:?}",
+        quantize_resource.registers, qkv_registers, quantize_resource.shared, qkv_shared
     );
     Ok(())
 }
