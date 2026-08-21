@@ -1,4 +1,4 @@
-use crate::fp8::{fp8_gdn_input_ptx_names, fp8_qkv_ptx_names};
+use crate::fp8::{fp8_gdn_input_ptx_names, fp8_lm_head_ptx_names, fp8_qkv_ptx_names};
 use crate::residual_norm::residual_norm_ptx_names;
 
 /// Stable semantic inventory of every admitted SM120 entry.
@@ -7,6 +7,7 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .into_iter()
         .chain(fp8_qkv_ptx_names())
         .chain(fp8_gdn_input_ptx_names())
+        .chain(fp8_lm_head_ptx_names())
         .collect()
 }
 
@@ -20,7 +21,7 @@ mod tests {
         let names = kernel_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 34);
+        assert_eq!(names.len(), 42);
         assert_eq!(unique.len(), names.len());
     }
 }
