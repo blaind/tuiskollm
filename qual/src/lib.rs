@@ -3,6 +3,8 @@
 #![cfg(feature = "device")]
 
 mod device_benchmark;
+mod fp8_down;
+mod fp8_down_benchmark;
 mod fp8_gdn_input;
 mod fp8_gdn_input_benchmark;
 mod fp8_lm_head;
@@ -24,6 +26,8 @@ pub use device_benchmark::{
     DeviceMemoryMetric, DeviceMemoryReport, DeviceMemorySnapshot, MemoryComparison,
     PrefixCacheRegime,
 };
+pub use fp8_down::{Fp8DownQualification, Fp8DownQualificationError, qualify_fp8_down};
+pub use fp8_down_benchmark::benchmark_fp8_down;
 pub use fp8_gdn_input::{
     Fp8GdnInputQualification, Fp8GdnInputQualificationError, qualify_fp8_gdn_input,
 };
