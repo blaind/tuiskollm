@@ -5,3 +5,4 @@ cuda_toolkit_release=13.3
 cuda_toolkit_version=13.3.73
 quantize_registers=25
 qkv_registers=33,53,63,66,72,80,87,94
+qkv_t16_registers=50

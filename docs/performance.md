@@ -3,9 +3,10 @@
 TuiskoLLM uses a custom device runner for GPU measurements and Criterion for pure host work. GPU
 results are valid only on the exact RTX 5090 target under an exclusive, recorded environment.
 
-The registered device suites cover zero-centered residual/RMSNorm and dynamic-quantize-plus-FP8-QKV
-at every exact `B=1..8` route. The report schema is already shaped for future layer, whole-model, and
-serving cases, but those measurements do not exist until their production owners land.
+The registered device suites cover zero-centered residual/RMSNorm at exact `B=1..8`, and
+dynamic-quantize-plus-FP8-QKV at exact `B=1..8` plus `T=16`. The report schema is already shaped
+for future layer, whole-model, and serving cases, but those measurements do not exist until their
+production owners land.
 
 ## Quick start
 
@@ -95,8 +96,8 @@ Every metric records median, p10, p90, operations per measured interval, logical
 operation, and logical GiB/s for device timings. Logical GiB/s uses the operation's minimum declared
 reads and writes. It is not an `ncu` measurement of physical DRAM traffic.
 
-Cases are measured in rotating and reversing order so a fixed `B=1..8` sequence cannot absorb clock
-or thermal drift. All exact routes share one context, stream, prepared operation, and address-stable
+Cases are measured in rotating and reversing order so a fixed route sequence cannot absorb clock or
+thermal drift. All exact routes share one context, stream, prepared operation, and address-stable
 arena for the complete session.
 
 ## Workload identity
@@ -116,9 +117,10 @@ Unused dimensions are `null`, not zero. A comparison refuses when any workload d
 inventory differs. This prevents, for example, a warm short-context operator result from being
 compared with a cold long-context model result that shares a route name.
 
-The current residual-norm and FP8-QKV suites are `operator/decode`, warm-cache, CUDA-Graph
-workloads. They set batch and active tokens to each exact `B=1..8`; context, prompt, concurrency,
-output, and prefix cache do not apply.
+The residual-norm suite and FP8-QKV `B=1..8` cases are `operator/decode`, warm-cache, CUDA-Graph
+workloads. They set batch and active tokens to the exact batch. FP8-QKV `T=16` is an `operator/mtp`
+case with 16 active tokens and no batch dimension. Context, prompt, concurrency, output, and prefix
+cache do not apply to these leaf suites.
 
 ## Memory and capacity
 
@@ -225,6 +227,9 @@ The runner records clocks; it does not change clock or power settings. Clock loc
 machine-administration step outside the repository and must remain identical between baseline and
 candidate runs.
 
+Multi-suite `perf` commands wait up to ten seconds between their own benchmark processes for NVML's
+utilization sample to return idle. Direct single-suite commands retain immediate refusal behavior.
+
 For the retained 2,200 MHz target clock and the card's 14,001 MHz memory clock, lock both before the
 run:
 
@@ -320,7 +325,7 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 
 ## Current limitations
 
-- Only residual/RMSNorm and FP8-QKV `B=1..8` leaf cases are registered.
+- Only residual/RMSNorm `B=1..8` and FP8-QKV `B=1..8,T=16` leaf cases are registered.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
 - There is no whole-layer, whole-model, TTFT, inter-token-latency, concurrency, long-context, prefix-
   cache, or end-to-end MTP benchmark in this repository yet.
