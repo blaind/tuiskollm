@@ -1,5 +1,6 @@
 //! Source-native FP8 projections with dynamic E4M3 activation quantization.
 
+use crate::Sm120Arch;
 use crate::device::fp8_projection::{fp8_projection, qkv_projection_mma_t16, quantize_activation};
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
@@ -14,9 +15,6 @@ const QUANTIZE_THREADS: u32 = (QUANTIZE_WARPS * 32) as u32;
 // 90.65% measured DRAM throughput without changing the per-row accumulation order.
 const DECODE_PROJECTION_WARPS: usize = 8;
 const DECODE_PROJECTION_THREADS: u32 = (DECODE_PROJECTION_WARPS * 32) as u32;
-const QKV_ROWS: usize = Qwen38_27B::ATTENTION_QKV_ROWS;
-const GDN_INPUT_ROWS: usize = Qwen38_27B::GDN_INPUT_ROWS;
-const LM_HEAD_ROWS: usize = Qwen38_27B::VOCAB;
 // The MTP boundary is exactly 16 rows. Two warps cover one 16x64 output tile,
 // with 128 K bytes per stage split into four m16n8k32 subtiles.
 const QKV_MMA_TOKENS: usize = 16;
@@ -25,6 +23,45 @@ const QKV_MMA_K_WORDS: usize = 32;
 const QKV_MMA_THREADS: u32 = 64;
 const QKV_MMA_SHARED_BYTES: u32 =
     (2 * (QKV_MMA_TOKENS + QKV_MMA_OUTPUT_ROWS) * QKV_MMA_K_WORDS * size_of::<u32>()) as u32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Fp8Geometry {
+    quantize_pairs_per_thread: usize,
+    qkv_decode_blocks: usize,
+    gdn_decode_blocks: usize,
+    lm_head_decode_blocks: usize,
+    qkv_mma_blocks: usize,
+    qkv_mma_k_tiles: usize,
+}
+
+fn fp8_geometry<A: Arch>() -> Option<Fp8Geometry> {
+    let decode_rows = 2 * DECODE_PROJECTION_WARPS;
+    if A::HIDDEN == 0
+        || !A::HIDDEN.is_multiple_of(512)
+        || !A::ATTENTION_QKV_ROWS.is_multiple_of(decode_rows)
+        || !A::GDN_INPUT_ROWS.is_multiple_of(decode_rows)
+        || !A::VOCAB.is_multiple_of(decode_rows)
+        || !A::ATTENTION_QKV_ROWS.is_multiple_of(QKV_MMA_OUTPUT_ROWS)
+        || !(A::HIDDEN / 4).is_multiple_of(QKV_MMA_K_WORDS)
+    {
+        return None;
+    }
+
+    Some(Fp8Geometry {
+        quantize_pairs_per_thread: (A::HIDDEN / 2).div_ceil(QUANTIZE_THREADS as usize),
+        qkv_decode_blocks: A::ATTENTION_QKV_ROWS / decode_rows,
+        gdn_decode_blocks: A::GDN_INPUT_ROWS / decode_rows,
+        lm_head_decode_blocks: A::VOCAB / decode_rows,
+        qkv_mma_blocks: A::ATTENTION_QKV_ROWS / QKV_MMA_OUTPUT_ROWS,
+        qkv_mma_k_tiles: A::HIDDEN / 4 / QKV_MMA_K_WORDS,
+    })
+}
+
+fn require_fp8_geometry<A: Arch>() -> GpuResult<Fp8Geometry> {
+    fp8_geometry::<A>().ok_or_else(|| {
+        GpuError::invalid_launch("architecture geometry is incompatible with the FP8 schedules")
+    })
+}
 
 #[cuda_module]
 mod kernels {
@@ -69,12 +106,13 @@ mod kernels {
     ) {
         // SAFETY: the prepared exact-B grid covers every QKV row pair once.
         unsafe {
-            fp8_projection::<A, TOKENS, QKV_ROWS, DECODE_PROJECTION_WARPS>(
+            fp8_projection::<A, TOKENS, DECODE_PROJECTION_WARPS>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
                 weight_scales,
                 output,
+                A::ATTENTION_QKV_ROWS,
             );
         }
     }
@@ -98,12 +136,13 @@ mod kernels {
     ) {
         // SAFETY: the prepared exact-B grid covers every GDN input row pair once.
         unsafe {
-            fp8_projection::<A, TOKENS, GDN_INPUT_ROWS, DECODE_PROJECTION_WARPS>(
+            fp8_projection::<A, TOKENS, DECODE_PROJECTION_WARPS>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
                 weight_scales,
                 output,
+                A::GDN_INPUT_ROWS,
             );
         }
     }
@@ -127,12 +166,13 @@ mod kernels {
     ) {
         // SAFETY: the prepared exact-B grid covers every vocabulary row pair once.
         unsafe {
-            fp8_projection::<A, TOKENS, LM_HEAD_ROWS, DECODE_PROJECTION_WARPS>(
+            fp8_projection::<A, TOKENS, DECODE_PROJECTION_WARPS>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
                 weight_scales,
                 output,
+                A::VOCAB,
             );
         }
     }
@@ -241,19 +281,19 @@ impl<A: Arch, const TOKENS: usize> PreparedQkvRoute<A, TOKENS> {
     }
 }
 
-struct PreparedGdnInputRoute<const TOKENS: usize> {
+struct PreparedGdnInputRoute<A: Arch, const TOKENS: usize> {
     quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
-    projection: PreparedLaunch<kernels::__fp8_gdn_input_CudaKernel<Qwen38_27B, TOKENS>>,
+    projection: PreparedLaunch<kernels::__fp8_gdn_input_CudaKernel<A, TOKENS>>,
 }
 
-impl<const TOKENS: usize> PreparedGdnInputRoute<TOKENS> {
+impl<A: Arch, const TOKENS: usize> PreparedGdnInputRoute<A, TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         let row_pairs_per_block = 2 * DECODE_PROJECTION_WARPS;
-        let projection_blocks = GDN_INPUT_ROWS / row_pairs_per_block;
+        let projection_blocks = A::GDN_INPUT_ROWS / row_pairs_per_block;
         let projection_blocks = u32::try_from(projection_blocks)
             .map_err(|_| GpuError::invalid_launch("GDN input rows exceed CUDA grid width"))?;
         let projection = module
-            .prepare_fp8_gdn_input::<Qwen38_27B, TOKENS>(LaunchConfig1D::new(
+            .prepare_fp8_gdn_input::<A, TOKENS>(LaunchConfig1D::new(
                 projection_blocks,
                 DECODE_PROJECTION_THREADS,
                 0,
@@ -288,7 +328,7 @@ impl<const TOKENS: usize> PreparedGdnInputRoute<TOKENS> {
             )
             .map_err(|source| GpuError::launch("launching FP8 activation quantization", source))?;
         module
-            .fp8_gdn_input::<Qwen38_27B, TOKENS>(
+            .fp8_gdn_input::<A, TOKENS>(
                 stream,
                 &self.projection,
                 activation_codes.cast::<u32>(),
@@ -301,19 +341,19 @@ impl<const TOKENS: usize> PreparedGdnInputRoute<TOKENS> {
     }
 }
 
-struct PreparedLmHeadRoute<const TOKENS: usize> {
+struct PreparedLmHeadRoute<A: Arch, const TOKENS: usize> {
     quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
-    projection: PreparedLaunch<kernels::__fp8_lm_head_CudaKernel<Qwen38_27B, TOKENS>>,
+    projection: PreparedLaunch<kernels::__fp8_lm_head_CudaKernel<A, TOKENS>>,
 }
 
-impl<const TOKENS: usize> PreparedLmHeadRoute<TOKENS> {
+impl<A: Arch, const TOKENS: usize> PreparedLmHeadRoute<A, TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         let row_pairs_per_block = 2 * DECODE_PROJECTION_WARPS;
-        let projection_blocks = LM_HEAD_ROWS / row_pairs_per_block;
+        let projection_blocks = A::VOCAB / row_pairs_per_block;
         let projection_blocks = u32::try_from(projection_blocks)
             .map_err(|_| GpuError::invalid_launch("LM-head rows exceed CUDA grid width"))?;
         let projection = module
-            .prepare_fp8_lm_head::<Qwen38_27B, TOKENS>(LaunchConfig1D::new(
+            .prepare_fp8_lm_head::<A, TOKENS>(LaunchConfig1D::new(
                 projection_blocks,
                 DECODE_PROJECTION_THREADS,
                 0,
@@ -348,7 +388,7 @@ impl<const TOKENS: usize> PreparedLmHeadRoute<TOKENS> {
             )
             .map_err(|source| GpuError::launch("launching FP8 activation quantization", source))?;
         module
-            .fp8_lm_head::<Qwen38_27B, TOKENS>(
+            .fp8_lm_head::<A, TOKENS>(
                 stream,
                 &self.projection,
                 activation_codes.cast::<u32>(),
@@ -367,8 +407,8 @@ struct PreparedQkvT16Route {
 }
 
 impl PreparedQkvT16Route {
-    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let projection_blocks = Qwen38_27B::ATTENTION_QKV_ROWS / QKV_MMA_OUTPUT_ROWS;
+    fn prepare<A: Arch>(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let projection_blocks = A::ATTENTION_QKV_ROWS / QKV_MMA_OUTPUT_ROWS;
         let projection_blocks = u32::try_from(projection_blocks)
             .map_err(|_| GpuError::invalid_launch("FP8 QKV rows exceed CUDA grid width"))?;
         let projection = module
@@ -386,7 +426,7 @@ impl PreparedQkvT16Route {
     }
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn launch(
+    unsafe fn launch<A: Arch>(
         &self,
         module: &kernels::LoadedModule,
         stream: &CudaStream,
@@ -406,7 +446,7 @@ impl PreparedQkvT16Route {
                 activation_scales,
             )
             .map_err(|source| GpuError::launch("launching FP8 activation quantization", source))?;
-        let k_tiles = Qwen38_27B::HIDDEN / 4 / QKV_MMA_K_WORDS;
+        let k_tiles = A::HIDDEN / 4 / QKV_MMA_K_WORDS;
         module
             .fp8_qkv_mma_t16(
                 stream,
@@ -467,22 +507,23 @@ pub(crate) fn fp8_lm_head_ptx_names() -> [&'static str; 8] {
 }
 
 /// Prepared dynamic-quantize plus source-native QKV routes for exact `B=1..=8` and `T=16`.
-pub struct FullAttentionQkvOp {
+pub struct FullAttentionQkvOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
-    b1: PreparedQkvRoute<Qwen38_27B, 1>,
-    b2: PreparedQkvRoute<Qwen38_27B, 2>,
-    b3: PreparedQkvRoute<Qwen38_27B, 3>,
-    b4: PreparedQkvRoute<Qwen38_27B, 4>,
-    b5: PreparedQkvRoute<Qwen38_27B, 5>,
-    b6: PreparedQkvRoute<Qwen38_27B, 6>,
-    b7: PreparedQkvRoute<Qwen38_27B, 7>,
-    b8: PreparedQkvRoute<Qwen38_27B, 8>,
+    b1: PreparedQkvRoute<A, 1>,
+    b2: PreparedQkvRoute<A, 2>,
+    b3: PreparedQkvRoute<A, 3>,
+    b4: PreparedQkvRoute<A, 4>,
+    b5: PreparedQkvRoute<A, 5>,
+    b6: PreparedQkvRoute<A, 6>,
+    b7: PreparedQkvRoute<A, 7>,
+    b8: PreparedQkvRoute<A, 8>,
     t16: PreparedQkvT16Route,
 }
 
-impl FullAttentionQkvOp {
+impl<A: Sm120Arch> FullAttentionQkvOp<A> {
     /// Loads the embedded SM120 module and prepares every admitted route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        require_fp8_geometry::<A>()?;
         let _ = fp8_qkv_ptx_names();
         // SAFETY: this crate owns the embedded cuda-oxide module artifact.
         let module = unsafe { kernels::load(context) }
@@ -497,7 +538,7 @@ impl FullAttentionQkvOp {
             b6: PreparedQkvRoute::prepare(&module)?,
             b7: PreparedQkvRoute::prepare(&module)?,
             b8: PreparedQkvRoute::prepare(&module)?,
-            t16: PreparedQkvT16Route::prepare(&module)?,
+            t16: PreparedQkvT16Route::prepare::<A>(&module)?,
             module,
         })
     }
@@ -506,10 +547,10 @@ impl FullAttentionQkvOp {
     ///
     /// # Safety
     ///
-    /// `input` covers `rows * 5_120` BF16 values; `activation_codes` covers
-    /// `rows * 5_120` bytes; `activation_scales` covers `rows` FP32 values;
-    /// `weight_codes` and `weight_scales` cover `[14_336, 5_120]` E4M3 codes and
-    /// 14,336 BF16 scales; and `output` covers `rows * 14_336` BF16 values.
+    /// `input` covers `rows * A::HIDDEN` BF16 values; `activation_codes` covers
+    /// the same number of bytes; `activation_scales` covers `rows` FP32 values;
+    /// weights cover `[A::ATTENTION_QKV_ROWS, A::HIDDEN]` E4M3 codes and one
+    /// BF16 scale per output row; and `output` covers all projected rows.
     /// Four-byte-loaded planes must be four-byte aligned. All allocations must
     /// belong to `stream`'s context, remain live through completion, and not overlap.
     #[allow(clippy::too_many_arguments)]
@@ -551,7 +592,18 @@ impl FullAttentionQkvOp {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
-            16 => launch!(t16),
+            16 => unsafe {
+                self.t16.launch::<A>(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
             _ => Err(GpuError::invalid_launch(format!(
                 "FP8 QKV row count {rows} is outside the admitted routes 1..={MAX_BATCH} and 16"
             ))),
@@ -560,21 +612,22 @@ impl FullAttentionQkvOp {
 }
 
 /// Prepared dynamic-quantize plus source-native GDN Q/K/V/Z routes for exact `B=1..=8`.
-pub struct GdnInputProjectionOp {
+pub struct GdnInputProjectionOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
-    b1: PreparedGdnInputRoute<1>,
-    b2: PreparedGdnInputRoute<2>,
-    b3: PreparedGdnInputRoute<3>,
-    b4: PreparedGdnInputRoute<4>,
-    b5: PreparedGdnInputRoute<5>,
-    b6: PreparedGdnInputRoute<6>,
-    b7: PreparedGdnInputRoute<7>,
-    b8: PreparedGdnInputRoute<8>,
+    b1: PreparedGdnInputRoute<A, 1>,
+    b2: PreparedGdnInputRoute<A, 2>,
+    b3: PreparedGdnInputRoute<A, 3>,
+    b4: PreparedGdnInputRoute<A, 4>,
+    b5: PreparedGdnInputRoute<A, 5>,
+    b6: PreparedGdnInputRoute<A, 6>,
+    b7: PreparedGdnInputRoute<A, 7>,
+    b8: PreparedGdnInputRoute<A, 8>,
 }
 
-impl GdnInputProjectionOp {
+impl<A: Sm120Arch> GdnInputProjectionOp<A> {
     /// Loads the embedded SM120 module and prepares every exact-batch route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        require_fp8_geometry::<A>()?;
         let _ = fp8_gdn_input_ptx_names();
         // SAFETY: this crate owns the embedded cuda-oxide module artifact.
         let module = unsafe { kernels::load(context) }
@@ -597,10 +650,10 @@ impl GdnInputProjectionOp {
     ///
     /// # Safety
     ///
-    /// `input` covers `batch * 5_120` BF16 values; `activation_codes` covers
-    /// `batch * 5_120` bytes; `activation_scales` covers `batch` FP32 values;
-    /// `weight_codes` and `weight_scales` cover `[16_384, 5_120]` E4M3 codes and
-    /// 16,384 BF16 scales; and `output` covers `batch * 16_384` BF16 values.
+    /// `input` covers `batch * A::HIDDEN` BF16 values; `activation_codes` covers
+    /// the same number of bytes; `activation_scales` covers `batch` FP32 values;
+    /// weights cover `[A::GDN_INPUT_ROWS, A::HIDDEN]` E4M3 codes and one BF16
+    /// scale per output row; and `output` covers all projected rows.
     /// Four-byte-loaded planes must be four-byte aligned. All allocations must
     /// belong to `stream`'s context, remain live through completion, and not overlap.
     #[allow(clippy::too_many_arguments)]
@@ -650,21 +703,22 @@ impl GdnInputProjectionOp {
 }
 
 /// Prepared dynamic-quantize plus full-vocabulary LM-head routes for exact `B=1..=8`.
-pub struct LmHeadOp {
+pub struct LmHeadOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
-    b1: PreparedLmHeadRoute<1>,
-    b2: PreparedLmHeadRoute<2>,
-    b3: PreparedLmHeadRoute<3>,
-    b4: PreparedLmHeadRoute<4>,
-    b5: PreparedLmHeadRoute<5>,
-    b6: PreparedLmHeadRoute<6>,
-    b7: PreparedLmHeadRoute<7>,
-    b8: PreparedLmHeadRoute<8>,
+    b1: PreparedLmHeadRoute<A, 1>,
+    b2: PreparedLmHeadRoute<A, 2>,
+    b3: PreparedLmHeadRoute<A, 3>,
+    b4: PreparedLmHeadRoute<A, 4>,
+    b5: PreparedLmHeadRoute<A, 5>,
+    b6: PreparedLmHeadRoute<A, 6>,
+    b7: PreparedLmHeadRoute<A, 7>,
+    b8: PreparedLmHeadRoute<A, 8>,
 }
 
-impl LmHeadOp {
+impl<A: Sm120Arch> LmHeadOp<A> {
     /// Loads the embedded SM120 module and prepares every exact-batch route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        require_fp8_geometry::<A>()?;
         let _ = fp8_lm_head_ptx_names();
         // SAFETY: this crate owns the embedded cuda-oxide module artifact.
         let module = unsafe { kernels::load(context) }
@@ -687,10 +741,10 @@ impl LmHeadOp {
     ///
     /// # Safety
     ///
-    /// `input` covers `batch * 5_120` BF16 values; `activation_codes` covers
-    /// `batch * 5_120` bytes; `activation_scales` covers `batch` FP32 values;
-    /// `weight_codes` and `weight_scales` cover `[248_320, 5_120]` E4M3 codes and
-    /// 248,320 BF16 scales; and `output` covers `batch * 248_320` BF16 values.
+    /// `input` covers `batch * A::HIDDEN` BF16 values; `activation_codes` covers
+    /// the same number of bytes; `activation_scales` covers `batch` FP32 values;
+    /// weights cover `[A::VOCAB, A::HIDDEN]` E4M3 codes and one BF16 scale per
+    /// output row; and `output` covers all logits.
     /// Four-byte-loaded planes must be four-byte aligned. All allocations must
     /// belong to `stream`'s context, remain live through completion, and not overlap.
     #[allow(clippy::too_many_arguments)]
@@ -744,8 +798,10 @@ mod tests {
     use super::{
         DECODE_PROJECTION_THREADS, DECODE_PROJECTION_WARPS, MAX_BATCH, QKV_MMA_K_WORDS,
         QKV_MMA_OUTPUT_ROWS, QKV_MMA_SHARED_BYTES, QKV_MMA_THREADS, QKV_MMA_TOKENS,
-        QUANTIZE_THREADS, fp8_gdn_input_ptx_names, fp8_lm_head_ptx_names, fp8_qkv_ptx_names,
+        QUANTIZE_THREADS, fp8_gdn_input_ptx_names, fp8_geometry, fp8_lm_head_ptx_names,
+        fp8_qkv_ptx_names,
     };
+    use crate::test_arch::TestArch;
     use std::collections::BTreeSet;
     use tuisko_model::{Arch, Qwen38_27B};
 
@@ -777,6 +833,25 @@ mod tests {
         assert_eq!(QKV_MMA_SHARED_BYTES, 20_480);
         assert_eq!(Qwen38_27B::ATTENTION_QKV_ROWS % QKV_MMA_OUTPUT_ROWS, 0);
         assert_eq!((Qwen38_27B::HIDDEN / 4) % QKV_MMA_K_WORDS, 0);
+    }
+
+    #[test]
+    fn geometry_flows_from_the_architecture() {
+        let qwen = fp8_geometry::<Qwen38_27B>().unwrap();
+        let test = fp8_geometry::<TestArch>().unwrap();
+
+        assert_eq!(qwen.quantize_pairs_per_thread, 10);
+        assert_eq!(qwen.qkv_decode_blocks, 896);
+        assert_eq!(qwen.gdn_decode_blocks, 1_024);
+        assert_eq!(qwen.lm_head_decode_blocks, 15_520);
+        assert_eq!(qwen.qkv_mma_blocks, 224);
+        assert_eq!(qwen.qkv_mma_k_tiles, 40);
+        assert_eq!(test.quantize_pairs_per_thread, 2);
+        assert_eq!(test.qkv_decode_blocks, 40);
+        assert_eq!(test.gdn_decode_blocks, 24);
+        assert_eq!(test.lm_head_decode_blocks, 32);
+        assert_eq!(test.qkv_mma_blocks, 10);
+        assert_eq!(test.qkv_mma_k_tiles, 8);
     }
 
     #[test]

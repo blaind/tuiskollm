@@ -1,5 +1,6 @@
 //! Exact-batch zero-centered RMSNorm operators.
 
+use crate::Sm120Arch;
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract, thread};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -10,6 +11,24 @@ const MAX_BATCH: usize = 8;
 // Qualified 512-thread reduction: 16 warps, five packed BF16 pairs per thread.
 const WARPS: usize = 16;
 const THREADS: u32 = (WARPS * 32) as u32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidualNormGeometry {
+    pairs_per_row: usize,
+    pairs_per_thread: usize,
+}
+
+fn residual_norm_geometry<A: Arch>() -> Option<ResidualNormGeometry> {
+    if A::HIDDEN == 0 || !A::HIDDEN.is_multiple_of(2) {
+        return None;
+    }
+
+    let pairs_per_row = A::HIDDEN / 2;
+    Some(ResidualNormGeometry {
+        pairs_per_row,
+        pairs_per_thread: pairs_per_row.div_ceil(THREADS as usize),
+    })
+}
 
 #[cuda_module]
 mod kernels {
@@ -360,21 +379,24 @@ pub(crate) fn residual_norm_ptx_names() -> [&'static str; 16] {
 }
 
 /// Prepared plain and fused-residual RMSNorm routes for every exact batch `1..=8`.
-pub struct ResidualNormOp {
+pub struct ResidualNormOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
     b1: PreparedBatchOneRoute,
-    b2: PreparedBatchRoute<Qwen38_27B, 2>,
-    b3: PreparedBatchRoute<Qwen38_27B, 3>,
-    b4: PreparedBatchRoute<Qwen38_27B, 4>,
-    b5: PreparedBatchRoute<Qwen38_27B, 5>,
-    b6: PreparedBatchRoute<Qwen38_27B, 6>,
-    b7: PreparedBatchRoute<Qwen38_27B, 7>,
-    b8: PreparedBatchRoute<Qwen38_27B, 8>,
+    b2: PreparedBatchRoute<A, 2>,
+    b3: PreparedBatchRoute<A, 3>,
+    b4: PreparedBatchRoute<A, 4>,
+    b5: PreparedBatchRoute<A, 5>,
+    b6: PreparedBatchRoute<A, 6>,
+    b7: PreparedBatchRoute<A, 7>,
+    b8: PreparedBatchRoute<A, 8>,
 }
 
-impl ResidualNormOp {
+impl<A: Sm120Arch> ResidualNormOp<A> {
     /// Loads the embedded SM120 module and prepares every exact-batch route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        residual_norm_geometry::<A>().ok_or_else(|| {
+            GpuError::invalid_launch("RMSNorm requires a positive even hidden width")
+        })?;
         let _ = residual_norm_ptx_names();
         // SAFETY: this crate owns one cuda-oxide module and its embedded artifact.
         let module = unsafe { kernels::load(context) }
@@ -397,8 +419,8 @@ impl ResidualNormOp {
     ///
     /// # Safety
     ///
-    /// The pointers must be four-byte aligned and cover complete Qwen3.8
-    /// hidden rows. Their allocations must belong to `stream`'s context and
+    /// The pointers must be four-byte aligned and cover complete `A::HIDDEN`
+    /// rows. Their allocations must belong to `stream`'s context and
     /// remain live through stream completion. Input and output must not overlap.
     pub unsafe fn launch_plain(
         &self,
@@ -438,7 +460,7 @@ impl ResidualNormOp {
     /// # Safety
     ///
     /// Every pointer must be four-byte aligned. Row planes must cover
-    /// `batch * 5_120` BF16 values and `weight` must cover 5,120 values.
+    /// `batch * A::HIDDEN` BF16 values and `weight` must cover `A::HIDDEN` values.
     /// Allocations must belong to `stream`'s context, remain live through
     /// completion, and not overlap except that the two input planes may alias.
     #[allow(clippy::too_many_arguments)]
@@ -487,7 +509,8 @@ impl ResidualNormOp {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, THREADS, WARPS, residual_norm_ptx_names};
+    use super::{MAX_BATCH, THREADS, WARPS, residual_norm_geometry, residual_norm_ptx_names};
+    use crate::test_arch::TestArch;
     use std::collections::BTreeSet;
     use tuisko_model::{Arch, Qwen38_27B};
 
@@ -499,6 +522,17 @@ mod tests {
         assert_eq!((Qwen38_27B::HIDDEN / 2) % THREADS as usize, 0);
         assert_eq!((Qwen38_27B::HIDDEN / 2) / THREADS as usize, 5);
         assert_eq!(MAX_BATCH, 8);
+    }
+
+    #[test]
+    fn geometry_flows_from_the_architecture() {
+        let qwen = residual_norm_geometry::<Qwen38_27B>().unwrap();
+        let test = residual_norm_geometry::<TestArch>().unwrap();
+
+        assert_eq!(qwen.pairs_per_row, 2_560);
+        assert_eq!(qwen.pairs_per_thread, 5);
+        assert_eq!(test.pairs_per_row, 512);
+        assert_eq!(test.pairs_per_thread, 1);
     }
 
     #[test]
