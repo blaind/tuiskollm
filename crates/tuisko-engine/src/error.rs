@@ -12,6 +12,8 @@ pub enum EngineErrorCode {
     Route,
     /// A resident layout or byte count is invalid.
     Layout,
+    /// Sampling configuration or logits violate the text contract.
+    Sampling,
 }
 
 impl EngineErrorCode {
@@ -20,6 +22,7 @@ impl EngineErrorCode {
         match self {
             Self::Route => "engine.route",
             Self::Layout => "engine.layout",
+            Self::Sampling => "engine.sampling",
         }
     }
 }
@@ -74,6 +77,13 @@ impl EngineError {
             message: message.into(),
         }
     }
+
+    pub(crate) fn sampling(message: impl Into<String>) -> Self {
+        Self::Contract {
+            code: EngineErrorCode::Sampling,
+            message: message.into(),
+        }
+    }
 }
 
 /// Result type for engine operations.
@@ -85,7 +95,11 @@ mod tests {
 
     #[test]
     fn external_error_codes_are_unique_and_stable() {
-        let codes = [EngineErrorCode::Route, EngineErrorCode::Layout];
+        let codes = [
+            EngineErrorCode::Route,
+            EngineErrorCode::Layout,
+            EngineErrorCode::Sampling,
+        ];
         let unique = codes
             .iter()
             .copied()
@@ -95,6 +109,7 @@ mod tests {
         assert_eq!(unique.len(), codes.len());
         assert_eq!(EngineErrorCode::Route.as_str(), "engine.route");
         assert_eq!(EngineErrorCode::Layout.as_str(), "engine.layout");
+        assert_eq!(EngineErrorCode::Sampling.as_str(), "engine.sampling");
     }
 
     #[test]

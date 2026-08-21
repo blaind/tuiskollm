@@ -31,6 +31,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let snapshot = CheckpointSnapshot::<Qwen38_27B>::open(Path::new(&snapshot))?;
     let frontend = TextFrontend::open(&snapshot)?;
     let messages = [ChatMessage::new("user", "Hello")];
+    let generation = frontend.generation_defaults();
+    if generation.temperature != 1.0 || generation.top_p != 0.95 || generation.top_k != 20 {
+        return Err("generation defaults differ from the sampling contract".into());
+    }
 
     let default = frontend.encode_chat(&messages, ChatTemplateOptions::default())?;
     require_equal("default chat template", &default, DEFAULT_HELLO)?;

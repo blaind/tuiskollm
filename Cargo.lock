@@ -1174,6 +1174,7 @@ dependencies = [
 name = "tuisko-engine"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "thiserror",
  "tuisko-gpu",
  "tuisko-kernels-sm120",
