@@ -127,17 +127,13 @@ pub(crate) unsafe fn quantize_activation<A: Arch>(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn fp8_projection<
-    A: Arch,
-    const TOKENS: usize,
-    const OUTPUT_ROWS: usize,
-    const WARPS: usize,
->(
+pub(crate) unsafe fn fp8_projection<A: Arch, const TOKENS: usize, const WARPS: usize>(
     activation_codes: *const u32,
     activation_scales: *const f32,
     weight_codes: *const u32,
     weight_scales: *const u16,
     output: *mut u16,
+    output_rows: usize,
 ) {
     let tid = thread::threadIdx_x() as usize;
     let lane = tid & 31;
@@ -273,9 +269,9 @@ pub(crate) unsafe fn fp8_projection<
                 if lane == 0 {
                     // SAFETY: lane zero writes this warp's unique row pair.
                     unsafe {
-                        *output.add($token * OUTPUT_ROWS + first_row) =
+                        *output.add($token * output_rows + first_row) =
                             tcgen05::cvt_f32x2_bf16x2(first_value, 0.0) as u16;
-                        *output.add($token * OUTPUT_ROWS + first_row + 1) =
+                        *output.add($token * output_rows + first_row + 1) =
                             tcgen05::cvt_f32x2_bf16x2(second_value, 0.0) as u16;
                     }
                 }
