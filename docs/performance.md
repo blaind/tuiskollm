@@ -69,9 +69,9 @@ TUISKO_SNAPSHOT=/path/to/snapshots/16b6615af3548b88e2d8e382457bc705b00479cf \
   cargo bench --package tuisko-frontend --bench text
 ```
 
-This measures chat-template rendering, short and long prompt encoding, batched decoding, and
-streaming decoding. Criterion output remains under ignored `target/criterion`; it is diagnostic
-until a checked host-baseline comparator is added.
+This measures chat-template rendering, short and long prompt encoding, disabled/partial/identical
+prompt-cache routes, batched decoding, and streaming decoding. Criterion output remains under
+ignored `target/criterion`; it is diagnostic until a checked host-baseline comparator is added.
 
 `perf gate` cannot run before each suite has an explicit baseline. A baseline update is a reviewed
 source change; blessing one suite at a time keeps that diff independent, and the command never
@@ -355,7 +355,7 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
   and FP8 LM head `B=1..8` leaf cases are registered.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
 - There is no whole-layer, whole-model, TTFT, inter-token-latency, concurrency, long-context,
-  prefix-cache, or end-to-end MTP benchmark in this repository yet.
+  or end-to-end MTP benchmark in this repository yet.
 - Power and energy are reportable, but energy is most meaningful after sustained model/server cases
   land.
 - `ncu` and Nsight Systems traces are diagnostic artifacts, not produced by the regression runner.
