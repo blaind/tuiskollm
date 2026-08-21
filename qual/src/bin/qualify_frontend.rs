@@ -47,11 +47,50 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("plain-text tokenizer round trip changed the text".into());
     }
 
+    let streaming_text = "Hello! café naïve 中文 テスト тест 🚀 ".repeat(64);
+    let streaming_ids = frontend.encode(&streaming_text)?;
+    require_streaming_equal(&frontend, &streaming_ids)?;
+
+    let mut with_specials = Vec::with_capacity(streaming_ids.len() + 32);
+    for (index, &token) in streaming_ids.iter().enumerate() {
+        if index % 97 == 0 {
+            with_specials.push(frontend.stop_ids()[0]);
+        }
+        with_specials.push(token);
+        if index % 53 == 0 {
+            with_specials.push(frontend.stop_ids()[1]);
+        }
+    }
+    require_streaming_equal(&frontend, &with_specials)?;
+
     println!(
-        "frontend qualification passed: {} exact reference token IDs, stop IDs {:?}",
+        "frontend qualification passed: {} exact reference token IDs, {} streaming IDs, stop IDs {:?}",
         default.len() + no_thinking.len(),
+        streaming_ids.len() + with_specials.len(),
         frontend.stop_ids()
     );
+    Ok(())
+}
+
+fn require_streaming_equal(
+    frontend: &TextFrontend,
+    token_ids: &[u32],
+) -> Result<(), Box<dyn Error>> {
+    let expected = frontend.decode(token_ids, true)?;
+    let mut decoder = frontend.streaming_decoder();
+    let mut deltas = String::new();
+    for &token in token_ids {
+        if let Some(delta) = decoder.push(token)? {
+            deltas.push_str(&delta);
+        }
+    }
+    if let Some(delta) = decoder.finish() {
+        deltas.push_str(&delta);
+    }
+    if decoder.text() != expected || deltas != expected {
+        return Err("streaming decode differs from the batched tokenizer decoder".into());
+    }
+
     Ok(())
 }
 

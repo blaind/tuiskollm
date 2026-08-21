@@ -14,5 +14,12 @@ thiserror.workspace = true
 tokenizers.workspace = true
 tuisko-model.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "text"
+harness = false
+
 [lints]
 workspace = true

@@ -24,6 +24,7 @@ jobs:
       - run: cargo clippy --workspace --exclude tuisko-engine --exclude tuisko-gpu --exclude tuisko-kernels-sm120 --exclude tuisko-qual --all-targets -- -D warnings
       - run: cargo clippy --package tuisko-qual --no-default-features --bin qualify-frontend -- -D warnings
       - run: cargo test --workspace --exclude tuisko-engine --exclude tuisko-gpu --exclude tuisko-kernels-sm120 --exclude tuisko-qual
+      - run: cargo check --package tuisko-frontend --bench text
       - run: cargo bench -p tuisko-model --bench checkpoint -- --sample-size 10
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Host coverage

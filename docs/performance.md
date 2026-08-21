@@ -62,6 +62,17 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- perf gate` | Run every oracle, measure every suite, and compare checked baselines | `target/benchmarks/perf-gate/*.json` |
 | `cargo run -p xtask -- perf bless SUITE` | Run one oracle and explicitly replace that suite's baseline | `qual/baselines/SUITE-sm120.json` |
 
+Host text paths use Criterion with the real snapshot loaded once outside measurement:
+
+```bash
+TUISKO_SNAPSHOT=/path/to/snapshots/16b6615af3548b88e2d8e382457bc705b00479cf \
+  cargo bench --package tuisko-frontend --bench text
+```
+
+This measures chat-template rendering, short and long prompt encoding, batched decoding, and
+streaming decoding. Criterion output remains under ignored `target/criterion`; it is diagnostic
+until a checked host-baseline comparator is added.
+
 `perf gate` cannot run before each suite has an explicit baseline. A baseline update is a reviewed
 source change; blessing one suite at a time keeps that diff independent, and the command never
 commits it.

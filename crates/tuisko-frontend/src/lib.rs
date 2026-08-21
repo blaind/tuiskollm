@@ -5,6 +5,7 @@ mod error;
 use minijinja::{Environment, Error as TemplateError, ErrorKind};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use tokenizers::Tokenizer;
@@ -52,6 +53,16 @@ pub struct TextFrontend {
     tokenizer: Tokenizer,
     template: String,
     stop_ids: [u32; 2],
+    byte_table: HashMap<char, u8>,
+    special_decode_ids: HashSet<u32>,
+}
+
+/// Incremental decoder for one generated text sequence.
+pub struct StreamingDecoder<'a> {
+    frontend: &'a TextFrontend,
+    text: String,
+    pending: Vec<u8>,
+    finished: bool,
 }
 
 impl TextFrontend {
@@ -79,11 +90,18 @@ impl TextFrontend {
         let generation_path = root.join(GENERATION_CONFIG_FILE);
         let generation = read_json(&generation_path)?;
         let stop_ids = parse_stop_ids(&generation)?;
+        let special_decode_ids = tokenizer
+            .get_added_tokens_decoder()
+            .iter()
+            .filter_map(|(&id, token)| token.special.then_some(id))
+            .collect();
 
         Ok(Self {
             tokenizer,
             template,
             stop_ids,
+            byte_table: byte_level_table(),
+            special_decode_ids,
         })
     }
 
@@ -155,6 +173,174 @@ impl TextFrontend {
                 FrontendError::Tokenizer(format!("could not decode token IDs: {source}"))
             })
     }
+
+    /// Starts a special-token-skipping streaming decoder.
+    pub fn streaming_decoder(&self) -> StreamingDecoder<'_> {
+        StreamingDecoder {
+            frontend: self,
+            text: String::new(),
+            pending: Vec::new(),
+            finished: false,
+        }
+    }
+}
+
+impl StreamingDecoder<'_> {
+    /// Decodes one generated token and returns any newly complete text.
+    pub fn push(&mut self, token_id: u32) -> FrontendResult<Option<String>> {
+        if self.finished {
+            return Err(FrontendError::Contract(
+                "cannot push a token after finishing the stream".into(),
+            ));
+        }
+        if self.frontend.special_decode_ids.contains(&token_id) {
+            return Ok(None);
+        }
+
+        let content = self
+            .frontend
+            .tokenizer
+            .id_to_token(token_id)
+            .ok_or_else(|| {
+                FrontendError::Tokenizer(format!("token ID {token_id} has no tokenizer entry"))
+            })?;
+        let mut delta = String::new();
+        for character in content.chars() {
+            let byte = self
+                .frontend
+                .byte_table
+                .get(&character)
+                .copied()
+                .ok_or_else(|| {
+                    FrontendError::Tokenizer(format!(
+                        "token ID {token_id} contains non-byte-level character {character:?}"
+                    ))
+                })?;
+            push_stream_byte(&mut self.pending, &mut delta, byte);
+        }
+
+        if delta.is_empty() {
+            Ok(None)
+        } else {
+            self.text.push_str(&delta);
+            Ok(Some(delta))
+        }
+    }
+
+    /// Finishes the stream and flushes an incomplete UTF-8 suffix.
+    pub fn finish(&mut self) -> Option<String> {
+        if self.finished {
+            return None;
+        }
+        self.finished = true;
+
+        let delta = finish_pending(&mut self.pending);
+        if delta.is_empty() {
+            None
+        } else {
+            self.text.push_str(&delta);
+            Some(delta)
+        }
+    }
+
+    /// Returns all text emitted by this decoder.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+fn byte_level_table() -> HashMap<char, u8> {
+    let mut table = HashMap::with_capacity(256);
+    let mut replacement = 0u32;
+    for byte in 0..=u8::MAX {
+        let character = if (0x21..=0x7e).contains(&byte)
+            || (0xa1..=0xac).contains(&byte)
+            || (0xae..=0xff).contains(&byte)
+        {
+            char::from(byte)
+        } else {
+            let character = char::from_u32(0x100 + replacement).expect("byte-level character");
+            replacement += 1;
+            character
+        };
+        table.insert(character, byte);
+    }
+    table
+}
+
+fn push_stream_byte(pending: &mut Vec<u8>, output: &mut String, byte: u8) {
+    if pending.is_empty() {
+        if byte < 0x80 {
+            output.push(char::from(byte));
+        } else if (0x80..=0xbf).contains(&byte) {
+            output.push('\u{fffd}');
+        } else if utf8_sequence_length(byte).is_some() {
+            pending.push(byte);
+        } else {
+            output.push('\u{fffd}');
+        }
+        return;
+    }
+
+    let mut candidate = pending.clone();
+    candidate.push(byte);
+    if (0x80..=0xbf).contains(&byte) && is_valid_utf8_prefix(&candidate) {
+        if let Ok(text) = std::str::from_utf8(&candidate) {
+            output.push_str(text);
+            pending.clear();
+        } else if candidate.len() == usize::from(utf8_sequence_length(candidate[0]).unwrap()) {
+            output.push_str(&"\u{fffd}".repeat(candidate.len()));
+            pending.clear();
+        } else {
+            *pending = candidate;
+        }
+        return;
+    }
+
+    output.push('\u{fffd}');
+    pending.clear();
+    push_stream_byte(pending, output, byte);
+}
+
+fn finish_pending(pending: &mut Vec<u8>) -> String {
+    let delta = String::from_utf8_lossy(pending).into_owned();
+    pending.clear();
+    delta
+}
+
+fn utf8_sequence_length(lead: u8) -> Option<u8> {
+    match lead {
+        0x00..=0x7f => Some(1),
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
+}
+
+fn is_valid_utf8_prefix(bytes: &[u8]) -> bool {
+    if bytes.is_empty() || bytes.len() > usize::from(utf8_sequence_length(bytes[0]).unwrap_or(0)) {
+        return false;
+    }
+    if bytes.len() >= 2 {
+        let second_is_valid = match bytes[0] {
+            0xc2..=0xdf => (0x80..=0xbf).contains(&bytes[1]),
+            0xe0 => (0xa0..=0xbf).contains(&bytes[1]),
+            0xe1..=0xec | 0xee..=0xef => (0x80..=0xbf).contains(&bytes[1]),
+            0xed => (0x80..=0x9f).contains(&bytes[1]),
+            0xf0..=0xf3 => (0x90..=0xbf).contains(&bytes[1]),
+            0xf4 => (0x80..=0x8f).contains(&bytes[1]),
+            _ => false,
+        };
+        if !second_is_valid {
+            return false;
+        }
+    }
+
+    bytes
+        .iter()
+        .skip(2)
+        .all(|byte| (0x80..=0xbf).contains(byte))
 }
 
 fn validate_tokenizer(tokenizer: &Tokenizer) -> FrontendResult<()> {
@@ -229,8 +415,14 @@ fn parse_stop_ids(generation: &Value) -> FrontendResult<[u32; 2]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatMessage, ChatTemplateOptions, FrontendErrorCode, parse_stop_ids};
+    use super::{
+        ChatMessage, ChatTemplateOptions, FrontendErrorCode, TextFrontend, byte_level_table,
+        finish_pending, parse_stop_ids, push_stream_byte,
+    };
     use serde_json::json;
+    use std::collections::HashSet;
+    use tokenizers::Tokenizer;
+    use tokenizers::models::wordlevel::WordLevel;
 
     #[test]
     fn chat_message_serializes_for_the_template() {
@@ -260,5 +452,85 @@ mod tests {
             let error = parse_stop_ids(&generation).unwrap_err();
             assert_eq!(error.code(), FrontendErrorCode::Contract);
         }
+    }
+
+    #[test]
+    fn streaming_utf8_matches_batch_lossy_decode() {
+        let cases = [
+            vec![],
+            vec![0x41, 0x42, 0x43],
+            vec![0xe4],
+            vec![0xe4, 0x41],
+            vec![0xe4, 0xb0, 0x80],
+            vec![0xf0, 0x9f],
+            vec![0xf0, 0x9f, 0x9a, 0x80],
+            vec![0x80],
+            vec![0xc0, 0x41],
+            vec![0xe4, 0xe4],
+            vec![0xf0, 0x80, 0x80, 0x80],
+            vec![0xed, 0xa0, 0x80],
+            vec![0x41, 0xe4, 0xb0, 0x80, 0x42],
+        ];
+
+        for bytes in cases {
+            let mut pending = Vec::new();
+            let mut actual = String::new();
+            for &byte in &bytes {
+                push_stream_byte(&mut pending, &mut actual, byte);
+            }
+            actual.push_str(&finish_pending(&mut pending));
+
+            assert_eq!(actual, String::from_utf8_lossy(&bytes));
+            assert!(pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn streaming_decoder_skips_specials_across_utf8_boundaries() {
+        let byte_table = byte_level_table();
+        let token = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| {
+                    byte_table
+                        .iter()
+                        .find_map(|(&character, value)| (*value == *byte).then_some(character))
+                        .unwrap()
+                })
+                .collect::<String>()
+        };
+        let vocab = [
+            (token(b"H"), 0),
+            (token(&[0xf0]), 1),
+            (token(&[0x9f, 0x9a, 0x80]), 2),
+            ("<eos>".into(), 3),
+            ("<unk>".into(), 4),
+        ]
+        .into_iter()
+        .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".into())
+            .build()
+            .unwrap();
+        let frontend = TextFrontend {
+            tokenizer: Tokenizer::new(model),
+            template: String::new(),
+            stop_ids: [3, 3],
+            byte_table,
+            special_decode_ids: HashSet::from([3]),
+        };
+
+        let mut decoder = frontend.streaming_decoder();
+        assert_eq!(decoder.push(0).unwrap().as_deref(), Some("H"));
+        assert_eq!(decoder.push(1).unwrap(), None);
+        assert_eq!(decoder.push(3).unwrap(), None);
+        assert_eq!(decoder.push(2).unwrap().as_deref(), Some("🚀"));
+        assert_eq!(decoder.finish(), None);
+        assert_eq!(decoder.text(), "H🚀");
+        assert_eq!(decoder.finish(), None);
+
+        let error = decoder.push(0).unwrap_err();
+        assert_eq!(error.code(), FrontendErrorCode::Contract);
     }
 }
