@@ -181,6 +181,22 @@ impl BenchmarkWorkload {
             execution: BenchmarkExecution::CudaGraph,
         }
     }
+
+    pub(crate) fn warm_operator_mtp(active_tokens: u64) -> Self {
+        Self {
+            scope: BenchmarkScope::Operator,
+            phase: BenchmarkPhase::Mtp,
+            batch_size: None,
+            concurrency: None,
+            active_tokens: Some(active_tokens),
+            prompt_tokens: None,
+            context_tokens: None,
+            output_tokens: None,
+            device_cache: DeviceCacheRegime::Warm,
+            prefix_cache: None,
+            execution: BenchmarkExecution::CudaGraph,
+        }
+    }
 }
 
 /// Kind of resident memory attributed by a benchmark owner.

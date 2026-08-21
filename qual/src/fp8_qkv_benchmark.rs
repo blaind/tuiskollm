@@ -15,9 +15,14 @@ use tuisko_kernels_sm120::FullAttentionQkvOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const MAX_ROWS: usize = 16;
+const EXACT_ROUTES: [usize; MAX_BATCH + 1] = [1, 2, 3, 4, 5, 6, 7, 8, 16];
 const ALIGNMENT: usize = 256;
 const INPUT_PATTERN: [f32; 8] = [0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625];
-const TOKEN_FACTORS: [f32; MAX_BATCH] = [1.0, 0.5, 0.25, 0.125, -1.0, -0.5, -0.25, -0.125];
+const TOKEN_FACTORS: [f32; MAX_ROWS] = [
+    1.0, 0.5, 0.25, 0.125, -1.0, -0.5, -0.25, -0.125, 0.75, -0.75, 0.375, -0.375, 0.1875, -0.1875,
+    0.09375, -0.09375,
+];
 const WEIGHT_CODES: [u8; 4] = [0x38, 0xb0, 0x30, 0x28];
 const SCALE_VALUES: [f32; 4] = [1.0, 0.5, 0.25, 2.0];
 
@@ -32,7 +37,7 @@ struct Regions {
 }
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
@@ -84,13 +89,13 @@ impl Session {
             weight_scales: arena.address(regions.weight_scales)?,
             output: arena.address(regions.output)?,
         };
-        let mut routes = Vec::with_capacity(MAX_BATCH);
-        for batch in 1..=MAX_BATCH {
+        let mut routes = Vec::with_capacity(EXACT_ROUTES.len());
+        for rows in EXACT_ROUTES {
             routes.push(capture_route(
                 &op,
                 &stream,
                 &addresses,
-                batch,
+                rows,
                 repeated_operations,
             )?);
         }
@@ -121,15 +126,22 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_mtp(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     "fp8_qkv/quantize_projection",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
                     &route.leaf,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 )
@@ -146,12 +158,12 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let hidden = Qwen38_27B::HIDDEN;
     let rows = Qwen38_27B::ATTENTION_QKV_ROWS;
     let mut layout = ArenaLayout::new();
-    let input = layout.reserve(MAX_BATCH * hidden, ALIGNMENT)?;
-    let activation_codes = layout.reserve(MAX_BATCH * hidden, ALIGNMENT)?;
-    let activation_scales = layout.reserve(MAX_BATCH, ALIGNMENT)?;
+    let input = layout.reserve(MAX_ROWS * hidden, ALIGNMENT)?;
+    let activation_codes = layout.reserve(MAX_ROWS * hidden, ALIGNMENT)?;
+    let activation_scales = layout.reserve(MAX_ROWS, ALIGNMENT)?;
     let weight_codes = layout.reserve(rows * hidden, ALIGNMENT)?;
     let weight_scales = layout.reserve(rows, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * rows, ALIGNMENT)?;
+    let output = layout.reserve(MAX_ROWS * rows, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -167,7 +179,7 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
 }
 
 fn make_input() -> Vec<u16> {
-    (0..MAX_BATCH * Qwen38_27B::HIDDEN)
+    (0..MAX_ROWS * Qwen38_27B::HIDDEN)
         .map(|index| {
             let token = index / Qwen38_27B::HIDDEN;
             f32_to_bf16(INPUT_PATTERN[index & 7] * TOKEN_FACTORS[token])
@@ -201,20 +213,20 @@ fn capture_route(
     op: &FullAttentionQkvOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, batch))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, batch)?;
+            launch(op, stream, addresses, rows)?;
         }
 
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
         leaf,
         repeated,
     })
@@ -224,13 +236,13 @@ fn launch(
     op: &FullAttentionQkvOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
-    // SAFETY: every pointer names its complete, aligned, maximum-batch arena region.
+    // SAFETY: every pointer names its complete, aligned, maximum-row arena region.
     unsafe {
         op.launch(
             stream,
-            batch,
+            rows,
             addresses.input,
             addresses.activation_codes,
             addresses.activation_scales,
@@ -241,17 +253,17 @@ fn launch(
     }
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(rows: usize) -> usize {
     let hidden = Qwen38_27B::HIDDEN;
-    let rows = Qwen38_27B::ATTENTION_QKV_ROWS;
-    let activation = batch * (2 * hidden + 2 * hidden + 2 * size_of::<f32>());
-    let weights = rows * hidden + rows * size_of::<u16>();
-    let output = batch * rows * size_of::<u16>();
+    let output_rows = Qwen38_27B::ATTENTION_QKV_ROWS;
+    let activation = rows * (2 * hidden + 2 * hidden + 2 * size_of::<f32>());
+    let weights = output_rows * hidden + output_rows * size_of::<u16>();
+    let output = rows * output_rows * size_of::<u16>();
 
     activation + weights + output
 }
 
-/// Measures all exact FP8 QKV batches with paired host/device and repeated-path timings.
+/// Measures exact `B=1..=8` and `T=16` FP8 QKV routes with paired timings.
 pub fn benchmark_fp8_qkv(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
@@ -271,7 +283,7 @@ pub fn benchmark_fp8_qkv(
         "fp8_qkv/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes,
-        "max_batch=8",
+        "max_rows=16",
     )?;
     memory.capture("after_setup")?;
     session.warm(warmup_launches)?;
@@ -307,7 +319,7 @@ fn f32_to_bf16(value: f32) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, logical_bytes};
+    use super::{MAX_BATCH, MAX_ROWS, logical_bytes};
     use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
@@ -318,5 +330,6 @@ mod tests {
 
         assert_eq!(logical_bytes(1), weights + per_token);
         assert_eq!(logical_bytes(MAX_BATCH), weights + MAX_BATCH * per_token);
+        assert_eq!(logical_bytes(MAX_ROWS), weights + MAX_ROWS * per_token);
     }
 }

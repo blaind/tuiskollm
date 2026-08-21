@@ -293,6 +293,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuda-intrinsics"
+version = "0.1.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=1f4d813719012d384f2db12b88efc9314c8bf50c#1f4d813719012d384f2db12b88efc9314c8bf50c"
+
+[[package]]
 name = "cuda-macros"
 version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=1f4d813719012d384f2db12b88efc9314c8bf50c#1f4d813719012d384f2db12b88efc9314c8bf50c"
@@ -731,6 +736,7 @@ dependencies = [
  "cuda-core",
  "cuda-device",
  "cuda-host",
+ "cuda-intrinsics",
  "tuisko-gpu",
  "tuisko-model",
 ]

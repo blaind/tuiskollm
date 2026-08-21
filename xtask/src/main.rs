@@ -10,6 +10,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const RESIDUAL_NORM_RESOURCE_BASELINE: &str = "qual/baselines/residual-norm-sm120.txt";
 const FP8_QKV_RESOURCE_BASELINE: &str = "qual/baselines/fp8-qkv-sm120.txt";
@@ -321,7 +322,10 @@ fn run_performance_suites(
     options: &[std::ffi::OsString],
     compare: bool,
 ) -> Result<(), Box<dyn Error>> {
-    for suite in PERFORMANCE_SUITES {
+    for (index, suite) in PERFORMANCE_SUITES.into_iter().enumerate() {
+        if index != 0 {
+            wait_for_device_idle()?;
+        }
         let report = performance_report_path(root, mode, suite);
         let mut arguments = options.to_vec();
         arguments.push("--json".into());
@@ -336,6 +340,51 @@ fn run_performance_suites(
     }
 
     Ok(())
+}
+
+fn wait_for_device_idle() -> Result<(), Box<dyn Error>> {
+    let timeout = Duration::from_secs(10);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let row = command_text(
+            "nvidia-smi",
+            &[
+                "-i",
+                "0",
+                "--query-gpu=utilization.gpu,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+        )?;
+        let (utilization, memory_mib) = parse_idle_sample(&row)?;
+        if utilization == 0 && memory_mib <= 1_024 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "device zero remained busy for {} seconds between performance suites: utilization={utilization}%, memory={memory_mib} MiB",
+                timeout.as_secs()
+            )
+            .into());
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn parse_idle_sample(row: &str) -> Result<(u32, u64), Box<dyn Error>> {
+    let fields = row.trim().split(',').map(str::trim).collect::<Vec<_>>();
+    let [utilization, memory_mib] = fields.as_slice() else {
+        return Err(format!("unexpected nvidia-smi idle row `{}`", row.trim()).into());
+    };
+
+    Ok((utilization.parse()?, memory_mib.parse()?))
+}
+
+fn sass_function_body<'a>(sass: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!("Function : {name}");
+    let body = &sass[sass.find(&marker)? + marker.len()..];
+
+    Some(body.split("\n\t\tFunction :").next().unwrap_or(body))
 }
 
 fn bless_suite(root: &Path, suite: PerformanceSuite) -> Result<(), Box<dyn Error>> {
@@ -516,8 +565,13 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("fp8_qkv_TID_"))
         .collect::<Vec<_>>();
+    let qkv_t16 = entries
+        .iter()
+        .filter(|entry| entry.name == "fp8_qkv_mma_t16")
+        .collect::<Vec<_>>();
     require_count("FP8 activation quantization", quantize.len(), 1)?;
     require_count("FP8 QKV", qkv.len(), 8)?;
+    require_count("FP8 QKV T=16", qkv_t16.len(), 1)?;
 
     for entry in quantize.iter().chain(&qkv) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
@@ -527,6 +581,11 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
+    }
+    if !qkv_t16[0].body.contains(".reqntid 64, 1, 1")
+        || !qkv_t16[0].body.contains(".minnctapersm 4")
+    {
+        return Err("FP8 QKV T=16 lost its 64-thread/four-CTA launch bounds".into());
     }
 
     let temporary = root.join("target/tmp");
@@ -550,6 +609,13 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
     )?;
     let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
+    let sass = String::from_utf8(sass.stdout)?;
+    let t16_sass =
+        sass_function_body(&sass, qkv_t16[0].name).ok_or("cuobjdump omitted FP8 QKV T=16 SASS")?;
+    if !t16_sass.contains("QMMA.16832.F32.E4M3.E4M3") {
+        return Err("FP8 QKV T=16 lost its native E4M3 tensor-core instruction".into());
+    }
     let quantize_resource = resources
         .get(quantize[0].name)
         .ok_or("cuobjdump omitted FP8 activation quantization")?;
@@ -572,10 +638,24 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
     }
     qkv_registers.sort_unstable();
     require_registers(&baseline, "qkv_registers", &qkv_registers)?;
+    let qkv_t16_resource = resources
+        .get(qkv_t16[0].name)
+        .ok_or("cuobjdump omitted FP8 QKV T=16")?;
+    require_spill_free(qkv_t16[0].name, qkv_t16_resource)?;
+    require_registers(
+        &baseline,
+        "qkv_t16_registers",
+        &[qkv_t16_resource.registers],
+    )?;
 
     println!(
-        "FP8 QKV gate passed: 1 quantize + 8 projection entries, REG {} / {:?}, STACK:0 LOCAL:0, SHARED {} / {:?}",
-        quantize_resource.registers, qkv_registers, quantize_resource.shared, qkv_shared
+        "FP8 QKV gate passed: 1 quantize + 8 decode + 1 T=16 projection entries, REG {} / {:?} / {}, STACK:0 LOCAL:0, SHARED {} / {:?} / {}",
+        quantize_resource.registers,
+        qkv_registers,
+        qkv_t16_resource.registers,
+        quantize_resource.shared,
+        qkv_shared,
+        qkv_t16_resource.shared,
     );
     Ok(())
 }
@@ -963,7 +1043,8 @@ fn require_uniform_value(
 mod tests {
     use super::{
         PERFORMANCE_SUITES, PerformanceSuite, parse_cuda_toolkit_identity, parse_entries,
-        parse_resources, parse_rustc_identity, require_count, require_uniform_value,
+        parse_idle_sample, parse_resources, parse_rustc_identity, require_count,
+        require_uniform_value, sass_function_body,
     };
     use std::collections::BTreeMap;
 
@@ -1046,5 +1127,26 @@ mod tests {
             );
         }
         assert!(PerformanceSuite::parse("unknown").is_err());
+    }
+
+    #[test]
+    fn parses_idle_device_samples() {
+        assert_eq!(parse_idle_sample("0, 234\n").unwrap(), (0, 234));
+        assert_eq!(parse_idle_sample("69, 1024").unwrap(), (69, 1_024));
+        assert!(parse_idle_sample("0, 234, 1").is_err());
+    }
+
+    #[test]
+    fn isolates_one_sass_function() {
+        let sass = "Function : first\nQMMA.16832.F32.E4M3.E4M3 R0, R1, R2, R3;\n\
+                    \t\tFunction : second\nNOP;\n";
+
+        assert!(
+            sass_function_body(sass, "first")
+                .unwrap()
+                .contains("QMMA.16832.F32.E4M3.E4M3")
+        );
+        assert!(!sass_function_body(sass, "second").unwrap().contains("QMMA"));
+        assert!(sass_function_body(sass, "missing").is_none());
     }
 }
