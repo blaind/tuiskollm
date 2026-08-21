@@ -277,6 +277,7 @@ mod tests {
         const MODEL_ID: &'static str = "test/model";
         const REVISION: &'static str = "test-revision";
         const HIDDEN: usize = 1;
+        const RMS_NORM_EPSILON: f32 = 1.0e-6;
         const INTERMEDIATE: usize = 1;
         const VOCAB: usize = 1;
         const LAYERS: usize = 64;
@@ -399,6 +400,7 @@ mod tests {
                 "num_attention_heads": 1,
                 "num_hidden_layers": 64,
                 "num_key_value_heads": 1,
+                "rms_norm_eps": 1e-6,
                 "vocab_size": 1
             },
             "video_token_id": 248057,

@@ -105,6 +105,7 @@ struct TextConfig {
     num_attention_heads: usize,
     num_hidden_layers: usize,
     num_key_value_heads: usize,
+    rms_norm_eps: f32,
     vocab_size: usize,
 }
 
@@ -273,6 +274,12 @@ fn validate<A: Arch>(path: &Path, config: &ModelConfig) -> CheckpointResult<()> 
         "text_config.num_key_value_heads",
         text.num_key_value_heads,
         A::NUM_KV_HEADS,
+    )?;
+    require(
+        path,
+        "text_config.rms_norm_eps",
+        text.rms_norm_eps,
+        A::RMS_NORM_EPSILON,
     )?;
     require(path, "text_config.vocab_size", text.vocab_size, A::VOCAB)?;
 
@@ -642,6 +649,7 @@ mod tests {
                 "num_attention_heads": 24,
                 "num_hidden_layers": 64,
                 "num_key_value_heads": 4,
+                "rms_norm_eps": 1e-6,
                 "vocab_size": 248320
             },
             "video_token_id": 248057,
@@ -800,6 +808,7 @@ mod tests {
             "num_attention_heads",
             "num_hidden_layers",
             "num_key_value_heads",
+            "rms_norm_eps",
             "vocab_size",
         ] {
             let mut config = valid_config();

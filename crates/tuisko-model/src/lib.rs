@@ -33,6 +33,8 @@ pub trait Arch: Copy + 'static {
     const REVISION: &'static str;
     /// Residual stream width.
     const HIDDEN: usize;
+    /// Pinned `text_config.rms_norm_eps` used by RMSNorm.
+    const RMS_NORM_EPSILON: f32;
     /// Dense MLP intermediate width.
     const INTERMEDIATE: usize;
     /// Token vocabulary size.
@@ -108,6 +110,7 @@ impl Arch for Qwen38_27B {
     const MODEL_ID: &'static str = "unsloth/Qwen3.8-27B-NVFP4";
     const REVISION: &'static str = "16b6615af3548b88e2d8e382457bc705b00479cf";
     const HIDDEN: usize = 5_120;
+    const RMS_NORM_EPSILON: f32 = 1.0e-6;
     const INTERMEDIATE: usize = 17_408;
     const VOCAB: usize = 248_320;
     const LAYERS: usize = 64;
@@ -189,6 +192,7 @@ mod tests {
         const {
             assert!(!Qwen38_27B::MTP_USES_DEDICATED_EMBEDDINGS);
         }
+        assert_eq!(Qwen38_27B::RMS_NORM_EPSILON, 1.0e-6);
     }
 
     #[test]

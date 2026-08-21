@@ -1,14 +1,15 @@
 [package]
-name = "tuisko-gpu"
+name = "tuisko-qual"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
-cuda-core.workspace = true
-cuda-host.workspace = true
 thiserror.workspace = true
+tuisko-gpu.workspace = true
+tuisko-kernels-sm120.workspace = true
+tuisko-model.workspace = true
 
 [lints.rust]
 missing_docs = "warn"

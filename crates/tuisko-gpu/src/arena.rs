@@ -222,6 +222,81 @@ impl DeviceArena {
             .map_err(|source| GpuError::driver("copying a device arena to the host", source))
     }
 
+    /// Copies one complete typed region from a host slice.
+    pub fn copy_from_host<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        source: &[T],
+    ) -> GpuResult<()> {
+        self.require_stream_context(stream, "copying a host slice into a device arena")?;
+        if source.len() != region.len {
+            return Err(GpuError::arena(format!(
+                "host source has {} elements for an arena region of {} elements",
+                source.len(),
+                region.len
+            )));
+        }
+        let address = self.address(region)? as u64;
+        if region.bytes == 0 {
+            return Ok(());
+        }
+
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
+        // SAFETY: the checked region and source slice both cover exactly `region.bytes`.
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                address,
+                source.as_ptr(),
+                region.bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|source| GpuError::driver("copying a host slice into a device arena", source))?;
+        stream
+            .synchronize()
+            .map_err(|source| GpuError::driver("synchronizing a device arena upload", source))
+    }
+
+    /// Copies one complete typed region into an owned host vector.
+    pub fn copy_to_host<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+    ) -> GpuResult<Vec<T>> {
+        self.require_stream_context(stream, "copying a device arena region to the host")?;
+        let address = self.address(region)? as u64;
+        let mut host = Vec::with_capacity(region.len);
+        if region.bytes == 0 {
+            return Ok(host);
+        }
+
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
+        // SAFETY: the checked region and reserved vector capacity both cover `region.bytes`.
+        unsafe {
+            cuda_core::memory::memcpy_dtoh_async(
+                host.as_mut_ptr(),
+                address,
+                region.bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|source| GpuError::driver("copying a device arena region to the host", source))?;
+        stream
+            .synchronize()
+            .map_err(|source| GpuError::driver("synchronizing a device arena download", source))?;
+        // SAFETY: the completed copy initialized all `region.len` elements.
+        unsafe { host.set_len(region.len) };
+
+        Ok(host)
+    }
+
     fn require_stream_context(&self, stream: &CudaStream, operation: &str) -> GpuResult<()> {
         if self.storage.context().as_ref() != stream.context().as_ref() {
             return Err(GpuError::context(format!(

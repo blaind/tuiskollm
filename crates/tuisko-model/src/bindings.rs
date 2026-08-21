@@ -1112,6 +1112,7 @@ mod tests {
         const MODEL_ID: &'static str = "test/model";
         const REVISION: &'static str = "test-revision";
         const HIDDEN: usize = 4;
+        const RMS_NORM_EPSILON: f32 = 1.0e-6;
         const INTERMEDIATE: usize = 8;
         const VOCAB: usize = 3;
         const LAYERS: usize = 1;
@@ -1144,6 +1145,7 @@ mod tests {
         const MODEL_ID: &'static str = "test/model";
         const REVISION: &'static str = "test-revision";
         const HIDDEN: usize = 32;
+        const RMS_NORM_EPSILON: f32 = 1.0e-6;
         const INTERMEDIATE: usize = 16;
         const VOCAB: usize = 3;
         const LAYERS: usize = 64;
