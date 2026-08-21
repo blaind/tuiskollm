@@ -10,6 +10,8 @@ mod fp8_qkv;
 mod fp8_qkv_benchmark;
 mod residual_norm;
 mod residual_norm_benchmark;
+mod text_endpoint;
+mod text_endpoint_benchmark;
 
 pub use device_benchmark::{
     BenchmarkExecution, BenchmarkMeasurement, BenchmarkMemoryKind, BenchmarkMemoryMeasurement,
@@ -30,3 +32,7 @@ pub use residual_norm::{
     ResidualNormQualification, ResidualNormQualificationError, qualify_residual_norm,
 };
 pub use residual_norm_benchmark::benchmark_residual_norm;
+pub use text_endpoint::{
+    TextEndpointQualification, TextEndpointQualificationError, qualify_text_endpoint,
+};
+pub use text_endpoint_benchmark::benchmark_text_endpoint;

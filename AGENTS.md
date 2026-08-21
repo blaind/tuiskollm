@@ -18,8 +18,8 @@ TuiskoLLM is an exact-target Rust/SM120 inference server for
 - `tuisko-gpu` owns raw CUDA resources and model-independent checked wrappers.
 - `tuisko-kernels-sm120` owns device code and prepared concrete `*Op` launchers. Operators do not
   allocate their inputs, outputs, weights, or scratch space.
-- Future `tuisko-engine` code owns resident weights, address-stable workspaces, CUDA Graphs, slots,
-  and scheduling. Qualification code never becomes a production dependency.
+- `tuisko-engine` owns resident weights, address-stable workspaces, CUDA Graphs, slots, and
+  scheduling. Qualification code never becomes a production dependency.
 - `qual` owns independent oracles, fixtures, probes, and benchmarks. `xtask` owns device builds,
   artifact inspection, resource gates, and explicit baseline blessing.
 

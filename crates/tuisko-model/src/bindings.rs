@@ -919,6 +919,16 @@ impl<'a> TextEndpointBindings<'a> {
         Self::bind_from::<A>(|name| snapshot.tensor(name))
     }
 
+    /// Binds only the mmap-backed embedding used during token staging.
+    pub fn bind_embedding<A: Arch>(
+        snapshot: &'a CheckpointSnapshot<A>,
+    ) -> CheckpointResult<Bf16View<'a, 2>> {
+        Bf16View::bind(
+            snapshot.tensor(EMBEDDING)?,
+            [A::VOCAB as u64, A::HIDDEN as u64],
+        )
+    }
+
     fn bind_from<A: Arch>(
         mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
     ) -> CheckpointResult<Self> {

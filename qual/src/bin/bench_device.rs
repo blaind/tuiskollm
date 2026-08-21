@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use tuisko_qual::{
     DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_fp8_gdn_input, benchmark_fp8_lm_head,
-    benchmark_fp8_qkv, benchmark_residual_norm,
+    benchmark_fp8_qkv, benchmark_residual_norm, benchmark_text_endpoint,
 };
 
 fn main() -> ExitCode {
@@ -29,17 +29,38 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
     let suite = arguments
         .next()
-        .ok_or("usage: bench-device <residual-norm|fp8-qkv|fp8-gdn-input|fp8-lm-head> [options]")?;
-    let (options, json_path) = parse_options(arguments)?;
+        .ok_or("usage: bench-device <residual-norm|fp8-qkv|fp8-gdn-input|fp8-lm-head|text-endpoint> [SNAPSHOT] [options]")?;
     let report = match suite.as_str() {
-        "residual-norm" => benchmark_residual_norm(options)?,
-        "fp8-qkv" => benchmark_fp8_qkv(options)?,
-        "fp8-gdn-input" => benchmark_fp8_gdn_input(options)?,
-        "fp8-lm-head" => benchmark_fp8_lm_head(options)?,
+        "residual-norm" => {
+            let (options, json_path) = parse_options(arguments)?;
+            (benchmark_residual_norm(options)?, json_path)
+        }
+        "fp8-qkv" => {
+            let (options, json_path) = parse_options(arguments)?;
+            (benchmark_fp8_qkv(options)?, json_path)
+        }
+        "fp8-gdn-input" => {
+            let (options, json_path) = parse_options(arguments)?;
+            (benchmark_fp8_gdn_input(options)?, json_path)
+        }
+        "fp8-lm-head" => {
+            let (options, json_path) = parse_options(arguments)?;
+            (benchmark_fp8_lm_head(options)?, json_path)
+        }
+        "text-endpoint" => {
+            let snapshot = arguments
+                .next()
+                .ok_or("text-endpoint requires the admitted snapshot path")?;
+            let (options, json_path) = parse_options(arguments)?;
+            (
+                benchmark_text_endpoint(&PathBuf::from(snapshot), options)?,
+                json_path,
+            )
+        }
         _ => return Err(format!("unknown benchmark suite `{suite}`").into()),
     };
-    print_report(&report);
-    write_report(&report, json_path)
+    print_report(&report.0);
+    write_report(&report.0, report.1)
 }
 
 fn print_report(report: &DeviceBenchmarkReport) {

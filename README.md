@@ -35,6 +35,13 @@ cargo run -p xtask -- qualify-fp8-lm-head
 cargo run -p xtask -- perf smoke
 ```
 
+The source-backed text endpoint additionally takes the pinned Hugging Face snapshot directory:
+
+```bash
+cargo run -p xtask -- qualify-text-endpoint /path/to/snapshots/16b6615af3548b88e2d8e382457bc705b00479cf
+cargo run -p xtask -- bench-text-endpoint /path/to/snapshots/16b6615af3548b88e2d8e382457bc705b00479cf
+```
+
 `xtask` keeps its cuda-oxide checkout, backend, and nested Cargo home under the ignored `target/`
 tree; no shell-level `CARGO_HOME` override is needed.
 

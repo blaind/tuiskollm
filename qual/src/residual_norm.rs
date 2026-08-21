@@ -322,7 +322,7 @@ fn verify_inactive(
     Ok(())
 }
 
-fn rms_norm_oracle<A: Arch>(input: &[u16], weight: &[u16]) -> Vec<u16> {
+pub(crate) fn rms_norm_oracle<A: Arch>(input: &[u16], weight: &[u16]) -> Vec<u16> {
     let squared_sum = input
         .iter()
         .map(|&bits| {
