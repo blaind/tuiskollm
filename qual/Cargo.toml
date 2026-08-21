@@ -5,19 +5,33 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["device"]
+device = [
+    "dep:tuisko-engine",
+    "dep:tuisko-gpu",
+    "dep:tuisko-kernels-sm120",
+]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tuisko-engine = { workspace = true, features = ["qualification"] }
-tuisko-gpu.workspace = true
-tuisko-kernels-sm120.workspace = true
+tuisko-engine = { workspace = true, features = ["qualification"], optional = true }
+tuisko-frontend.workspace = true
+tuisko-gpu = { workspace = true, optional = true }
+tuisko-kernels-sm120 = { workspace = true, optional = true }
 tuisko-model.workspace = true
 
 [[bin]]
 name = "bench-device"
 path = "src/bin/bench_device.rs"
+required-features = ["device"]
+
+[[bin]]
+name = "qualify-frontend"
+path = "src/bin/qualify_frontend.rs"
 
 [lints.rust]
 missing_docs = "warn"

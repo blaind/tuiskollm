@@ -8,6 +8,7 @@ publish = false
 [workspace]
 members = [
     "crates/tuisko-engine",
+    "crates/tuisko-frontend",
     "crates/tuisko-gpu",
     "crates/tuisko-kernels-sm120",
     "crates/tuisko-model",
@@ -28,11 +29,15 @@ cuda-device = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.g
 cuda-host = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "1f4d813719012d384f2db12b88efc9314c8bf50c" }
 cuda-intrinsics = { version = "0.1.0", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "1f4d813719012d384f2db12b88efc9314c8bf50c" }
 memmap2 = "0.9"
+minijinja = { version = "2", features = ["json"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+tokenizers = { version = "=0.23.1", default-features = false, features = ["onig"] }
 tuisko-engine = { version = "0.1.0", path = "crates/tuisko-engine" }
+tuisko-frontend = { version = "0.1.0", path = "crates/tuisko-frontend" }
 tuisko-gpu = { version = "0.1.0", path = "crates/tuisko-gpu" }
 tuisko-kernels-sm120 = { version = "0.1.0", path = "crates/tuisko-kernels-sm120" }
 tuisko-model = { version = "0.1.0", path = "crates/tuisko-model" }

@@ -1,5 +1,7 @@
 //! Independent operator qualification for the exact SM120 target.
 
+#![cfg(feature = "device")]
+
 mod device_benchmark;
 mod fp8_gdn_input;
 mod fp8_gdn_input_benchmark;

@@ -5,7 +5,11 @@ unsound = "all"
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
-skip = [{ name = "syn", version = "2" }]
+skip = [
+    { name = "itertools", version = "0.14" },
+    { name = "shlex", version = "2" },
+    { name = "syn", version = "2" },
+]
 
 [licenses]
 confidence-threshold = 0.93
