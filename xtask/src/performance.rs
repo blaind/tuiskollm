@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 const BASELINE_SCHEMA: u32 = 3;
-const REPORT_SCHEMA: u32 = 4;
+const REPORT_SCHEMA: u32 = 5;
 const CLOCK_PADDING_MHZ: u32 = 15;
 const MEMORY_CLOCK_PADDING_MHZ: u32 = 50;
 const DEVICE_RELATIVE_TOLERANCE_PERCENT: f64 = 5.0;
@@ -187,7 +187,7 @@ pub(crate) fn compare(report_path: &Path, baseline_path: &Path) -> Result<(), Bo
     let baseline: PerformanceBaseline = serde_json::from_slice(&fs::read(baseline_path).map_err(
         |error| {
             format!(
-                "could not read performance baseline {}: {error}; run `cargo run -p xtask -- perf bless` explicitly",
+                "could not read performance baseline {}: {error}; run the matching `cargo run -p xtask -- perf bless <suite>` explicitly",
                 baseline_path.display()
             )
         },
@@ -314,7 +314,7 @@ pub(crate) fn bless(report_path: &Path, baseline_path: &Path) -> Result<(), Box<
         let retained = previous_metrics.get(&key);
         let device = matches!(
             candidate.measurement.as_str(),
-            "device_graph" | "device_node"
+            "device_graph" | "device_path"
         );
         metrics.push(BaselineMetric {
             route: candidate.route.clone(),

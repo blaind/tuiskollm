@@ -1,10 +1,10 @@
 //! Paired timings for the exact residual-norm graph routes.
 
 use crate::device_benchmark::{
-    BenchmarkMemoryKind, BenchmarkWorkload, DeviceBenchmarkError, DeviceBenchmarkOptions,
-    DeviceBenchmarkReport, ExactDeviceCase, IntrinsicGraph, MemoryRecorder, OperationAccounting,
-    executable_sha256, generator_baseline_sha256, measure_cases, preflight,
-    require_current_process_exclusive,
+    BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
+    DeviceBenchmarkOptions, DeviceBenchmarkReport, ExactDeviceCase, MemoryRecorder,
+    OperationAccounting, RepeatedGraph, finish_report, generator_baseline_sha256, measure_cases,
+    preflight, require_current_process_exclusive, warmup_launches,
 };
 use std::sync::Arc;
 use tuisko_gpu::{
@@ -22,7 +22,7 @@ const WEIGHT_PATTERN: [f32; 8] = [-0.25, -0.125, -0.0625, 0.0, 0.0625, 0.125, 0.
 
 struct GraphPair {
     leaf: CudaGraph,
-    intrinsic: CudaGraph,
+    repeated: CudaGraph,
 }
 
 struct RouteGraphs {
@@ -50,7 +50,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(intrinsic_nodes: u64) -> Result<Self, DeviceBenchmarkError> {
+    fn new(repeated_operations: u64) -> Result<Self, DeviceBenchmarkError> {
         let context = CudaContext::new(0).map_err(GpuError::from)?;
         let capability = context.compute_capability().map_err(GpuError::from)?;
         if capability != (12, 0) {
@@ -97,8 +97,8 @@ impl Session {
         for batch in 1..=MAX_BATCH {
             routes.push(RouteGraphs {
                 batch,
-                plain: capture_plain(&op, &stream, &addresses, batch, intrinsic_nodes)?,
-                residual: capture_residual(&op, &stream, &addresses, batch, intrinsic_nodes)?,
+                plain: capture_plain(&op, &stream, &addresses, batch, repeated_operations)?,
+                residual: capture_residual(&op, &stream, &addresses, batch, repeated_operations)?,
             });
         }
         let timer = GpuTimer::new(&context)?;
@@ -123,7 +123,7 @@ impl Session {
         self.stream.synchronize().map_err(GpuError::from)
     }
 
-    fn cases(&self, intrinsic_nodes: u64) -> Vec<ExactDeviceCase<'_>> {
+    fn cases(&self, repeated_operations: u64) -> Vec<ExactDeviceCase<'_>> {
         let mut cases = Vec::with_capacity(self.routes.len() * 2);
         for route in &self.routes {
             let shape = format!("B={}", route.batch);
@@ -137,7 +137,10 @@ impl Session {
                     "token",
                 ),
                 &route.plain.leaf,
-                Some(IntrinsicGraph::new(&route.plain.intrinsic, intrinsic_nodes)),
+                Some(RepeatedGraph::new(
+                    &route.plain.repeated,
+                    repeated_operations,
+                )),
             ));
             cases.push(ExactDeviceCase::new(
                 "residual_norm/fused_residual",
@@ -149,9 +152,9 @@ impl Session {
                     "token",
                 ),
                 &route.residual.leaf,
-                Some(IntrinsicGraph::new(
-                    &route.residual.intrinsic,
-                    intrinsic_nodes,
+                Some(RepeatedGraph::new(
+                    &route.residual.repeated,
+                    repeated_operations,
                 )),
             ));
         }
@@ -165,7 +168,7 @@ fn capture_plain(
     stream: &CudaStream,
     addresses: &Addresses,
     batch: usize,
-    intrinsic_nodes: u64,
+    repeated_operations: u64,
 ) -> GpuResult<GraphPair> {
     let leaf = CudaGraph::capture(stream, || {
         // SAFETY: every pointer names a complete, aligned arena region.
@@ -179,8 +182,8 @@ fn capture_plain(
             )
         }
     })?;
-    let intrinsic = CudaGraph::capture(stream, || {
-        for _ in 0..intrinsic_nodes {
+    let repeated = CudaGraph::capture(stream, || {
+        for _ in 0..repeated_operations {
             // SAFETY: every pointer names a complete, aligned arena region.
             unsafe {
                 op.launch_plain(
@@ -196,7 +199,7 @@ fn capture_plain(
         Ok(())
     })?;
 
-    Ok(GraphPair { leaf, intrinsic })
+    Ok(GraphPair { leaf, repeated })
 }
 
 fn capture_residual(
@@ -204,7 +207,7 @@ fn capture_residual(
     stream: &CudaStream,
     addresses: &Addresses,
     batch: usize,
-    intrinsic_nodes: u64,
+    repeated_operations: u64,
 ) -> GpuResult<GraphPair> {
     let leaf = CudaGraph::capture(stream, || {
         // SAFETY: every pointer names a complete, aligned arena region.
@@ -220,8 +223,8 @@ fn capture_residual(
             )
         }
     })?;
-    let intrinsic = CudaGraph::capture(stream, || {
-        for _ in 0..intrinsic_nodes {
+    let repeated = CudaGraph::capture(stream, || {
+        for _ in 0..repeated_operations {
             // SAFETY: every pointer names a complete, aligned arena region.
             unsafe {
                 op.launch_residual(
@@ -239,27 +242,15 @@ fn capture_residual(
         Ok(())
     })?;
 
-    Ok(GraphPair { leaf, intrinsic })
+    Ok(GraphPair { leaf, repeated })
 }
 
-/// Measures all exact batches with paired host/device and repeated-node timings.
+/// Measures all exact batches with paired host/device and repeated-path timings.
 pub fn benchmark_residual_norm(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
-    if options.samples < 3 || options.launches_per_sample == 0 {
-        return Err(DeviceBenchmarkError::Precondition(
-            "at least three samples and one launch per sample are required".to_string(),
-        ));
-    }
-
     let baseline_sha256 = generator_baseline_sha256()?;
-    let warmup_launches = options
-        .launches_per_sample
-        .checked_mul(4)
-        .ok_or_else(|| {
-            DeviceBenchmarkError::Precondition("warmup launch count overflows".to_string())
-        })?
-        .max(1_024);
+    let warmup_launches = warmup_launches(options)?;
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(options.launches_per_sample)?;
@@ -277,40 +268,20 @@ pub fn benchmark_residual_norm(
     let (metrics, energy_metrics, telemetry) =
         measure_cases(&session.stream, &session.timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
-    let identity = preflight.identity;
-
-    Ok(DeviceBenchmarkReport {
-        schema_version: 4,
-        suite: "bench-residual-norm",
-        classification: "performance_sensitive_leaf",
-        device: identity.name,
-        device_uuid: identity.uuid,
-        driver_version: identity.driver_version,
-        device_index: 0,
-        compute_capability: "12.0".to_string(),
-        binary_sha256: executable_sha256()?,
-        generator_baseline_sha256: baseline_sha256,
-        sm_clock_min_mhz: telemetry.sm_minimum_mhz,
-        sm_clock_median_mhz: telemetry.sm_median_mhz,
-        sm_clock_max_mhz: telemetry.sm_maximum_mhz,
-        memory_clock_min_mhz: telemetry.memory_minimum_mhz,
-        memory_clock_median_mhz: telemetry.memory_median_mhz,
-        memory_clock_max_mhz: telemetry.memory_maximum_mhz,
-        temperature_min_celsius: telemetry.temperature_minimum_celsius,
-        temperature_max_celsius: telemetry.temperature_maximum_celsius,
-        power_min_watts: telemetry.power_minimum_watts,
-        power_mean_watts: telemetry.power_mean_watts,
-        power_median_watts: telemetry.power_median_watts,
-        power_max_watts: telemetry.power_maximum_watts,
-        telemetry_samples: telemetry.samples,
-        samples: options.samples,
-        launches_per_sample: options.launches_per_sample,
-        timing_scope: "paired Rust submission/completion, repeated leaf graph, and repeated-node graph",
-        power_scope: "nvidia-smi power.draw.instant, whole board",
+    finish_report(
+        BenchmarkReportSpec {
+            suite: "bench-residual-norm",
+            classification: "performance_sensitive_leaf",
+            timing_scope: "paired Rust submission/completion, repeated leaf graph, and repeated-operation graph",
+        },
+        preflight,
+        baseline_sha256,
+        options,
         metrics,
         energy_metrics,
+        telemetry,
         memory,
-    })
+    )
 }
 
 fn f32_to_bf16(value: f32) -> u16 {

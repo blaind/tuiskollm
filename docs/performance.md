@@ -3,9 +3,9 @@
 TuiskoLLM uses a custom device runner for GPU measurements and Criterion for pure host work. GPU
 results are valid only on the exact RTX 5090 target under an exclusive, recorded environment.
 
-The currently registered device suite covers the zero-centered residual/RMSNorm leaf at every exact
-`B=1..8` route. The report schema is already shaped for future layer, whole-model, and serving cases,
-but those measurements do not exist until their production owners land.
+The registered device suites cover zero-centered residual/RMSNorm and dynamic-quantize-plus-FP8-QKV
+at every exact `B=1..8` route. The report schema is already shaped for future layer, whole-model, and
+serving cases, but those measurements do not exist until their production owners land.
 
 ## Quick start
 
@@ -33,7 +33,8 @@ cargo run -p xtask -- perf smoke
 The human-readable table goes to stderr. The machine-readable report is written to:
 
 ```text
-target/benchmarks/perf-smoke.json
+target/benchmarks/perf-smoke/residual-norm.json
+target/benchmarks/perf-smoke/fp8-qkv.json
 ```
 
 Every performance command also executes the release SM120 build and checks the PTX/SASS entry and
@@ -45,14 +46,16 @@ resource inventory before launching the benchmark.
 |---|---|---|
 | `cargo run -p xtask -- build-sm120` | Build the release device artifact and check entries, registers, stack, local, and shared bytes | terminal |
 | `cargo run -p xtask -- qualify-residual-norm` | Run the independent numerical and graph-replay oracle | terminal |
-| `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test | `target/benchmarks/perf-smoke.json` |
-| `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory report | `target/benchmarks/perf-leaf.json` |
-| `cargo run -p xtask -- perf energy` | Full leaf report plus a sustained power window per route | `target/benchmarks/perf-energy.json` |
-| `cargo run -p xtask -- perf gate` | Run correctness, measure, and compare with the checked baseline | `target/benchmarks/perf-gate.json` |
-| `cargo run -p xtask -- perf bless` | Run correctness and explicitly replace the checked baseline | `qual/baselines/sm120-qwen38.json` |
+| `cargo run -p xtask -- qualify-fp8-qkv` | Run the independent represented-value QKV oracle and benchmark-accounting test | terminal |
+| `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
+| `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
+| `cargo run -p xtask -- perf energy` | Full leaf reports plus a sustained power window per route | `target/benchmarks/perf-energy/*.json` |
+| `cargo run -p xtask -- perf gate` | Run every oracle, measure every suite, and compare checked baselines | `target/benchmarks/perf-gate/*.json` |
+| `cargo run -p xtask -- perf bless SUITE` | Run one oracle and explicitly replace that suite's baseline | `qual/baselines/SUITE-sm120.json` |
 
-`perf gate` cannot run before the first explicit `perf bless`. A baseline update is a reviewed source
-change; the command never commits it.
+`perf gate` cannot run before each suite has an explicit baseline. A baseline update is a reviewed
+source change; blessing one suite at a time keeps that diff independent, and the command never
+commits it.
 
 The leaf executable can also be controlled directly through `xtask`:
 
@@ -62,6 +65,8 @@ cargo run -p xtask -- bench-residual-norm \
   --launches-per-sample 256 \
   --json target/benchmarks/residual-norm.json
 ```
+
+Use `cargo run -p xtask -- bench-fp8-qkv` with the same options for QKV only.
 
 Add `--energy-seconds 2` for sustained energy sampling. At least three samples, one launch per
 sample, and a two-second energy window are required.
@@ -74,11 +79,12 @@ Each exact route reports four boundaries:
 |---|---|
 | `host_submit` | Rust time spent submitting repeated CUDA Graph replays |
 | `host_completion` | Rust time from submission through device completion |
-| `device_graph` | CUDA-event time per production graph replay; currently a one-node leaf graph |
-| `device_node` | CUDA-event time per leaf node inside one graph containing many repeated nodes |
+| `device_graph` | CUDA-event time per production graph replay |
+| `device_path` | CUDA-event time per complete operation inside one graph containing many repetitions |
 
-`device_graph` is the production graph-replay cost. `device_node` reduces CUDA-event timer
-quantization for a short kernel; it is not a different production route.
+`device_graph` is the production graph-replay cost. `device_path` reduces CUDA-event timer
+quantization for a short operation; it is not a different production route. A residual-norm path is
+one kernel. An FP8-QKV path is its production quantization and projection pair.
 
 The reusable timer records two events around a repeated interval and synchronizes once after it.
 It does not insert events into or mutate the production graph, and its fixed boundary cost is
@@ -110,9 +116,9 @@ Unused dimensions are `null`, not zero. A comparison refuses when any workload d
 inventory differs. This prevents, for example, a warm short-context operator result from being
 compared with a cold long-context model result that shares a route name.
 
-The current residual-norm suite is an `operator/decode`, warm-cache, CUDA-Graph workload. It sets
-batch and active tokens to each exact `B=1..8`; context, prompt, concurrency, output, and prefix
-cache do not apply.
+The current residual-norm and FP8-QKV suites are `operator/decode`, warm-cache, CUDA-Graph
+workloads. They set batch and active tokens to each exact `B=1..8`; context, prompt, concurrency,
+output, and prefix cache do not apply.
 
 ## Memory and capacity
 
@@ -149,9 +155,10 @@ reports reserved framebuffer memory separately, and on the target card that diff
 of MiB. NVML memory observations have MiB resolution; owner accounting remains the exact authority
 for allocations the program controls.
 
-The residual-norm suite currently attributes its single address-stable arena. CUDA context, module,
-and graph storage remain visible in the setup delta and unattributed remainder because their exact
-allocation sizes are not owned by the program.
+The residual-norm suite attributes its single address-stable arena. FP8-QKV separately attributes
+source-native weights and the remainder of its single address-stable arena as workspace. CUDA
+context, module, and graph storage remain visible in the setup delta and unattributed remainder
+because their exact allocation sizes are not owned by the program.
 
 Owned quantities and post-warmup growth are enforced by default with zero slack. Setup delta,
 timed peak relative to preflight, headroom, driver reservation, RSS, and unattributed setup remain
@@ -186,9 +193,9 @@ units per board joule = 1 / board joules per unit
 ```
 
 The current unit is a token/active row. Each leaf estimate comes from continuous graph replay, not
-one power sample around a microsecond kernel, but it is still a whole-board diagnostic dominated by
-clock, static, dispatch, and runtime power. It is not energy physically attributable to RMSNorm and
-is not a blessed regression metric. Use energy most confidently for sustained full graphs or
+one power sample around a microsecond operation, but it is still a whole-board diagnostic dominated
+by clock, static, dispatch, and runtime power. It is not energy physically attributable to one leaf
+and is not a blessed regression metric. Use energy most confidently for sustained full graphs or
 serving workloads under the same machine and environment.
 
 Future model reports must distinguish joules per prompt token, generated token, and MTP committed
@@ -264,9 +271,9 @@ quantities initially receive 16 MiB of absolute slack and remain informational u
 product budget enables them. Each value, tolerance, direction, and enforcement flag is visible in
 the baseline diff and can be reviewed independently.
 
-`perf bless` retains reviewed tolerances and enforcement flags for existing keys. It updates measured
-references but does not silently loosen a gate. Adding or removing a workload or metric changes the
-inventory and therefore requires an explicit baseline review.
+`perf bless SUITE` retains reviewed tolerances and enforcement flags for that suite's existing keys.
+It updates measured references but does not silently loosen a gate. Adding or removing a workload
+or metric changes the inventory and therefore requires an explicit baseline review.
 
 Do not bless a regression merely to make the gate green. First establish whether the change is an
 intentional schedule improvement, a measurement-environment change, or a real regression. Timings
@@ -294,8 +301,8 @@ A new production owner should extend the existing runner rather than create an u
 loop:
 
 1. prepare one context, stream, operation owner, and address-stable arena for the suite;
-2. capture its production leaf/full graph and, only for timer resolution, an optional repeated-node
-   graph;
+2. capture its production leaf/full graph and, only for timer resolution, an optional
+   repeated-operation graph;
 3. register an exact workload identity and logical-byte/unit accounting;
 4. register every exactly known resident allocation with its owner and scaling rule;
 5. warm or displace caches according to the declared regime;
@@ -313,7 +320,7 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 
 ## Current limitations
 
-- Only residual/RMSNorm `B=1..8` leaf cases are registered.
+- Only residual/RMSNorm and FP8-QKV `B=1..8` leaf cases are registered.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
 - There is no whole-layer, whole-model, TTFT, inter-token-latency, concurrency, long-context, prefix-
   cache, or end-to-end MTP benchmark in this repository yet.
@@ -337,7 +344,8 @@ owners and independent oracles.
   the same clock policy as the baseline. Run the printed reset command when finished.
 
 `performance baseline ... could not read`
-: No reviewed baseline exists. Run `perf leaf`, inspect the report, then use `perf bless` explicitly.
+: No reviewed baseline exists. Run `perf leaf`, inspect the report, then use
+  `perf bless residual-norm` or `perf bless fp8-qkv` explicitly.
 
 `performance report and baseline metric inventories differ`
 : A route, workload dimension, timing boundary, or memory owner changed. Review the inventory change;
