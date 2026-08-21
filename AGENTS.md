@@ -15,6 +15,7 @@ TuiskoLLM is an exact-target Rust/SM120 inference server for
 ## Ownership
 
 - `tuisko-model` owns checkpoint admission, typed source views, and lossless materialization.
+- `tuisko-frontend` owns tokenizer admission, chat templates, prompt encoding, and streaming text.
 - `tuisko-gpu` owns raw CUDA resources and model-independent checked wrappers.
 - `tuisko-kernels-sm120` owns device code and prepared concrete `*Op` launchers. Operators do not
   allocate their inputs, outputs, weights, or scratch space.
