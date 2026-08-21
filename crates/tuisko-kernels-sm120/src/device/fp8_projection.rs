@@ -127,7 +127,12 @@ pub(crate) unsafe fn quantize_activation<A: Arch>(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn qkv_projection<A: Arch, const TOKENS: usize, const WARPS: usize>(
+pub(crate) unsafe fn fp8_projection<
+    A: Arch,
+    const TOKENS: usize,
+    const OUTPUT_ROWS: usize,
+    const WARPS: usize,
+>(
     activation_codes: *const u32,
     activation_scales: *const f32,
     weight_codes: *const u32,
@@ -140,7 +145,7 @@ pub(crate) unsafe fn qkv_projection<A: Arch, const TOKENS: usize, const WARPS: u
     let words_per_row = A::HIDDEN / 4;
     // SAFETY: the exact grid assigns this warp one complete adjacent row pair.
     let first_weight = unsafe { weight_codes.add(first_row * words_per_row) };
-    // SAFETY: QKV rows are even and the row pair is within the admitted plane.
+    // SAFETY: output rows are even and the row pair is within the admitted plane.
     let second_weight = unsafe { first_weight.add(words_per_row) };
     let mut first_sums = [0.0f32; TOKENS];
     let mut second_sums = [0.0f32; TOKENS];
@@ -247,7 +252,7 @@ pub(crate) unsafe fn qkv_projection<A: Arch, const TOKENS: usize, const WARPS: u
         phase += 1;
     }
 
-    // SAFETY: the admitted scale plane has one BF16 scale per QKV row.
+    // SAFETY: the admitted scale plane has one BF16 scale per output row.
     let first_weight_scale =
         f32::from_bits((unsafe { *weight_scales.add(first_row) } as u32) << 16);
     // SAFETY: the paired row has its adjacent BF16 scale.
@@ -268,9 +273,9 @@ pub(crate) unsafe fn qkv_projection<A: Arch, const TOKENS: usize, const WARPS: u
                 if lane == 0 {
                     // SAFETY: lane zero writes this warp's unique row pair.
                     unsafe {
-                        *output.add($token * A::ATTENTION_QKV_ROWS + first_row) =
+                        *output.add($token * OUTPUT_ROWS + first_row) =
                             tcgen05::cvt_f32x2_bf16x2(first_value, 0.0) as u16;
-                        *output.add($token * A::ATTENTION_QKV_ROWS + first_row + 1) =
+                        *output.add($token * OUTPUT_ROWS + first_row + 1) =
                             tcgen05::cvt_f32x2_bf16x2(second_value, 0.0) as u16;
                     }
                 }

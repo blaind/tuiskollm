@@ -1,6 +1,9 @@
 //! Independent operator qualification for the exact SM120 target.
 
 mod device_benchmark;
+mod fp8_gdn_input;
+mod fp8_gdn_input_benchmark;
+mod fp8_projection_oracle;
 mod fp8_qkv;
 mod fp8_qkv_benchmark;
 mod residual_norm;
@@ -13,6 +16,10 @@ pub use device_benchmark::{
     DeviceMemoryMetric, DeviceMemoryReport, DeviceMemorySnapshot, MemoryComparison,
     PrefixCacheRegime,
 };
+pub use fp8_gdn_input::{
+    Fp8GdnInputQualification, Fp8GdnInputQualificationError, qualify_fp8_gdn_input,
+};
+pub use fp8_gdn_input_benchmark::benchmark_fp8_gdn_input;
 pub use fp8_qkv::{Fp8QkvQualification, Fp8QkvQualificationError, qualify_fp8_qkv};
 pub use fp8_qkv_benchmark::benchmark_fp8_qkv;
 pub use residual_norm::{

@@ -5,7 +5,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tuisko_qual::{
-    DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_fp8_qkv, benchmark_residual_norm,
+    DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_fp8_gdn_input, benchmark_fp8_qkv,
+    benchmark_residual_norm,
 };
 
 fn main() -> ExitCode {
@@ -28,11 +29,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
     let suite = arguments
         .next()
-        .ok_or("usage: bench-device <residual-norm|fp8-qkv> [options]")?;
+        .ok_or("usage: bench-device <residual-norm|fp8-qkv|fp8-gdn-input> [options]")?;
     let (options, json_path) = parse_options(arguments)?;
     let report = match suite.as_str() {
         "residual-norm" => benchmark_residual_norm(options)?,
         "fp8-qkv" => benchmark_fp8_qkv(options)?,
+        "fp8-gdn-input" => benchmark_fp8_gdn_input(options)?,
         _ => return Err(format!("unknown benchmark suite `{suite}`").into()),
     };
     print_report(&report);
