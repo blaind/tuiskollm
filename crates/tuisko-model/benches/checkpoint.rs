@@ -91,6 +91,7 @@ fn write_config(path: &Path) {
             "num_attention_heads": 24,
             "num_hidden_layers": 64,
             "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-6,
             "vocab_size": 248320
         },
         "video_token_id": 248057,

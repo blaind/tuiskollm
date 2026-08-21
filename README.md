@@ -21,12 +21,14 @@ cargo build --release --bin tuiskollm
 The output is `target/release/tuiskollm`. The executable is currently a scaffold; serving and its
 checkpoint command line have not landed yet.
 
-## Device compiler
+## Current device slice
 
-Bootstrap the pinned cuda-oxide checkout and compiler backend once:
+Bootstrap the pinned cuda-oxide toolchain, then build and qualify the current device slice:
 
 ```bash
 cargo run -p xtask -- bootstrap-cuda-oxide
+cargo run -p xtask -- build-sm120
+cargo run -p xtask -- qualify-residual-norm
 ```
 
 `xtask` keeps its cuda-oxide checkout, backend, and nested Cargo home under the ignored `target/`

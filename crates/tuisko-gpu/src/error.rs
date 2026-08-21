@@ -1,6 +1,7 @@
 //! Stable GPU error categories with contextual failure details.
 
-use cuda_core::DriverError;
+use cuda_core::{DriverError, LaunchContractError};
+use cuda_host::EmbeddedModuleError;
 use std::fmt::{self, Display, Formatter};
 
 /// Stable category for a GPU ownership or driver failure.
@@ -15,6 +16,10 @@ pub enum GpuErrorCode {
     Graph,
     /// Resources from different CUDA contexts were combined.
     Context,
+    /// A kernel launch contract was rejected.
+    Launch,
+    /// An embedded device module could not be loaded.
+    Module,
 }
 
 impl GpuErrorCode {
@@ -25,6 +30,8 @@ impl GpuErrorCode {
             Self::Arena => "gpu.arena",
             Self::Graph => "gpu.graph",
             Self::Context => "gpu.context",
+            Self::Launch => "gpu.launch",
+            Self::Module => "gpu.module",
         }
     }
 }
@@ -48,6 +55,24 @@ pub enum GpuError {
         source: DriverError,
     },
 
+    /// A prepared kernel launch violated its static or live-device contract.
+    #[error("[gpu.launch] {operation}: {source}")]
+    Launch {
+        /// Operation that failed.
+        operation: &'static str,
+        /// Rejected launch contract.
+        source: LaunchContractError,
+    },
+
+    /// An embedded device module could not be discovered, built, or loaded.
+    #[error("[gpu.module] {operation}: {source}")]
+    Module {
+        /// Operation that failed.
+        operation: &'static str,
+        /// Underlying embedded-module failure.
+        source: EmbeddedModuleError,
+    },
+
     /// A checked GPU ownership contract was violated.
     #[error("[{code}] {message}")]
     Contract {
@@ -63,6 +88,8 @@ impl GpuError {
     pub const fn code(&self) -> GpuErrorCode {
         match self {
             Self::Driver { .. } => GpuErrorCode::Driver,
+            Self::Launch { .. } => GpuErrorCode::Launch,
+            Self::Module { .. } => GpuErrorCode::Module,
             Self::Contract { code, .. } => *code,
         }
     }
@@ -81,6 +108,21 @@ impl GpuError {
 
     pub(crate) fn context(message: impl Into<String>) -> Self {
         Self::contract(GpuErrorCode::Context, message)
+    }
+
+    /// Wraps a rejected kernel launch contract with operation context.
+    pub fn launch(operation: &'static str, source: LaunchContractError) -> Self {
+        Self::Launch { operation, source }
+    }
+
+    /// Creates a launch-contract failure without a driver source.
+    pub fn invalid_launch(message: impl Into<String>) -> Self {
+        Self::contract(GpuErrorCode::Launch, message)
+    }
+
+    /// Wraps an embedded-module failure with operation context.
+    pub fn module(operation: &'static str, source: EmbeddedModuleError) -> Self {
+        Self::Module { operation, source }
     }
 
     fn contract(code: GpuErrorCode, message: impl Into<String>) -> Self {
@@ -111,6 +153,8 @@ mod tests {
             (GpuErrorCode::Arena, "gpu.arena"),
             (GpuErrorCode::Graph, "gpu.graph"),
             (GpuErrorCode::Context, "gpu.context"),
+            (GpuErrorCode::Launch, "gpu.launch"),
+            (GpuErrorCode::Module, "gpu.module"),
         ];
 
         for (index, (code, expected)) in codes.iter().enumerate() {
