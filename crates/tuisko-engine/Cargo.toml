@@ -10,6 +10,7 @@ qualification = []
 
 [dependencies]
 thiserror.workspace = true
+tuisko-frontend.workspace = true
 tuisko-gpu.workspace = true
 tuisko-kernels-sm120.workspace = true
 tuisko-model.workspace = true
@@ -19,6 +20,10 @@ criterion.workspace = true
 
 [[bench]]
 name = "sampling"
+harness = false
+
+[[bench]]
+name = "generation"
 harness = false
 
 [lints.rust]

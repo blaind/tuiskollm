@@ -7,8 +7,9 @@ publish = false
 
 [features]
 default = ["device"]
+engine = ["dep:tuisko-engine"]
 device = [
-    "dep:tuisko-engine",
+    "engine",
     "dep:tuisko-gpu",
     "dep:tuisko-kernels-sm120",
 ]
@@ -32,6 +33,11 @@ required-features = ["device"]
 [[bin]]
 name = "qualify-frontend"
 path = "src/bin/qualify_frontend.rs"
+
+[[bin]]
+name = "qualify-generation"
+path = "src/bin/qualify_generation.rs"
+required-features = ["engine"]
 
 [lints.rust]
 missing_docs = "warn"
