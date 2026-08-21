@@ -338,7 +338,7 @@ impl<A: Arch, const TOKENS: usize> PreparedBatchRoute<A, TOKENS> {
 }
 
 /// PTX symbols retained for both residual-norm families at every exact batch.
-pub fn residual_norm_ptx_names() -> [&'static str; 16] {
+pub(crate) fn residual_norm_ptx_names() -> [&'static str; 16] {
     [
         "rms_norm_b1",
         kernels::rms_norm_ptx_name::<Qwen38_27B, 2>(),

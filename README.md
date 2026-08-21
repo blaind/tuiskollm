@@ -29,6 +29,7 @@ Bootstrap the pinned cuda-oxide toolchain, then build and qualify the current de
 cargo run -p xtask -- bootstrap-cuda-oxide
 cargo run -p xtask -- build-sm120
 cargo run -p xtask -- qualify-residual-norm
+cargo run -p xtask -- qualify-fp8-qkv
 cargo run -p xtask -- perf smoke
 ```
 
