@@ -16,6 +16,7 @@ const RESIDUAL_NORM_RESOURCE_BASELINE: &str = "qual/baselines/residual-norm-sm12
 const FP8_QKV_RESOURCE_BASELINE: &str = "qual/baselines/fp8-qkv-sm120.txt";
 const FP8_GDN_INPUT_RESOURCE_BASELINE: &str = "qual/baselines/fp8-gdn-input-sm120.txt";
 const FP8_LM_HEAD_RESOURCE_BASELINE: &str = "qual/baselines/fp8-lm-head-sm120.txt";
+const FP8_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/fp8-swiglu-sm120.txt";
 const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
 const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
@@ -28,6 +29,7 @@ enum PerformanceSuite {
     Fp8Qkv,
     Fp8GdnInput,
     Fp8LmHead,
+    Fp8SwiGlu,
 }
 
 const PERFORMANCE_SUITES: [PerformanceSuite; 4] = [
@@ -44,6 +46,7 @@ impl PerformanceSuite {
             Self::Fp8Qkv => "fp8-qkv",
             Self::Fp8GdnInput => "fp8-gdn-input",
             Self::Fp8LmHead => "fp8-lm-head",
+            Self::Fp8SwiGlu => "fp8-swiglu",
         }
     }
 
@@ -53,6 +56,7 @@ impl PerformanceSuite {
             Self::Fp8Qkv => FP8_QKV_RESOURCE_BASELINE,
             Self::Fp8GdnInput => FP8_GDN_INPUT_RESOURCE_BASELINE,
             Self::Fp8LmHead => FP8_LM_HEAD_RESOURCE_BASELINE,
+            Self::Fp8SwiGlu => FP8_SWIGLU_RESOURCE_BASELINE,
         }
     }
 
@@ -62,6 +66,7 @@ impl PerformanceSuite {
             Self::Fp8Qkv => "qual/baselines/fp8-qkv-sm120.json",
             Self::Fp8GdnInput => "qual/baselines/fp8-gdn-input-sm120.json",
             Self::Fp8LmHead => "qual/baselines/fp8-lm-head-sm120.json",
+            Self::Fp8SwiGlu => "qual/baselines/fp8-swiglu-sm120.json",
         }
     }
 
@@ -71,6 +76,7 @@ impl PerformanceSuite {
             "fp8-qkv" => Ok(Self::Fp8Qkv),
             "fp8-gdn-input" => Ok(Self::Fp8GdnInput),
             "fp8-lm-head" => Ok(Self::Fp8LmHead),
+            "fp8-swiglu" => Ok(Self::Fp8SwiGlu),
             _ => Err(format!("unknown performance suite `{value}`").into()),
         }
     }
@@ -81,6 +87,7 @@ impl PerformanceSuite {
             Self::Fp8Qkv => qualify_fp8_qkv(root),
             Self::Fp8GdnInput => qualify_fp8_gdn_input(root),
             Self::Fp8LmHead => qualify_fp8_lm_head(root),
+            Self::Fp8SwiGlu => qualify_fp8_swiglu(root),
         }
     }
 }
@@ -89,7 +96,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|perf>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|perf>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -103,16 +110,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-fp8-qkv") if remaining.is_empty() => qualify_fp8_qkv(root),
         Some("qualify-fp8-gdn-input") if remaining.is_empty() => qualify_fp8_gdn_input(root),
         Some("qualify-fp8-lm-head") if remaining.is_empty() => qualify_fp8_lm_head(root),
+        Some("qualify-fp8-swiglu") if remaining.is_empty() => qualify_fp8_swiglu(root),
         Some("qualify-text-endpoint") => qualify_text_endpoint(root, &remaining),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
         Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
         Some("bench-fp8-gdn-input") => bench_fp8_gdn_input(root, &remaining),
         Some("bench-fp8-lm-head") => bench_fp8_lm_head(root, &remaining),
+        Some("bench-fp8-swiglu") => bench_fp8_swiglu(root, &remaining),
         Some("bench-text-endpoint") => bench_text_endpoint(root, &remaining),
         Some("gate-residual-norm") if remaining.is_empty() => gate_residual_norm(root),
         Some("gate-fp8-qkv") if remaining.is_empty() => gate_fp8_qkv(root),
         Some("gate-fp8-gdn-input") if remaining.is_empty() => gate_fp8_gdn_input(root),
         Some("gate-fp8-lm-head") if remaining.is_empty() => gate_fp8_lm_head(root),
+        Some("gate-fp8-swiglu") if remaining.is_empty() => gate_fp8_swiglu(root),
         Some("perf") => perf(root, &remaining),
         Some(known)
             if matches!(
@@ -123,10 +133,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-fp8-qkv"
                     | "qualify-fp8-gdn-input"
                     | "qualify-fp8-lm-head"
+                    | "qualify-fp8-swiglu"
                     | "gate-residual-norm"
                     | "gate-fp8-qkv"
                     | "gate-fp8-gdn-input"
                     | "gate-fp8-lm-head"
+                    | "gate-fp8-swiglu"
             ) =>
         {
             Err(format!("`{known}` takes no arguments").into())
@@ -214,7 +226,8 @@ fn build_sm120(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_residual_norm(root)?;
     gate_fp8_qkv(root)?;
     gate_fp8_gdn_input(root)?;
-    gate_fp8_lm_head(root)
+    gate_fp8_lm_head(root)?;
+    gate_fp8_swiglu(root)
 }
 
 fn qualify_frontend(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
@@ -307,6 +320,31 @@ fn qualify_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     gate_fp8_qkv(root)
+}
+
+fn qualify_fp8_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "fp8_swiglu",
+            "--include-ignored",
+            "--nocapture",
+        ],
+    )?;
+    gate_fp8_swiglu(root)
 }
 
 fn qualify_fp8_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -412,6 +450,10 @@ fn bench_fp8_gdn_input(
 
 fn bench_fp8_lm_head(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
     bench_suite(root, PerformanceSuite::Fp8LmHead, arguments)
+}
+
+fn bench_fp8_swiglu(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    bench_suite(root, PerformanceSuite::Fp8SwiGlu, arguments)
 }
 
 fn bench_text_endpoint(
@@ -1012,6 +1054,125 @@ fn gate_fp8_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
     println!(
         "FP8 LM-head gate passed: 8 projection entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
         registers, shared
+    );
+    Ok(())
+}
+
+fn gate_fp8_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(FP8_SWIGLU_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; run the pinned release device build first",
+            ptx_path.display()
+        )
+    })?;
+    let entries = parse_entries(&ptx);
+    let quantize = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("fp8_swiglu_quantize_TID_"))
+        .collect::<Vec<_>>();
+    let decode = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("fp8_swiglu_decode_TID_"))
+        .collect::<Vec<_>>();
+    let prefill = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.name,
+                "fp8_swiglu_mma_t32" | "fp8_swiglu_mma_t64" | "fp8_swiglu_mma_t128"
+            )
+        })
+        .collect::<Vec<_>>();
+    require_count("dense-FP8 SwiGLU quantization", quantize.len(), 1)?;
+    require_count("dense-FP8 SwiGLU decode", decode.len(), 8)?;
+    require_count("dense-FP8 SwiGLU prefill", prefill.len(), 3)?;
+
+    for entry in quantize.iter().chain(&decode).chain(&prefill) {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let temporary = root.join("target/tmp");
+    fs::create_dir_all(&temporary)?;
+    let cubin = temporary.join("fp8-swiglu-gate.cubin");
+    let ptxas = cuda_tool("ptxas");
+    require_success(
+        &ptxas,
+        &[
+            OsStr::new("-O3"),
+            OsStr::new("--gpu-name"),
+            OsStr::new("sm_120a"),
+            ptx_path.as_os_str(),
+            OsStr::new("--output-file"),
+            cubin.as_os_str(),
+        ],
+    )?;
+    let cuobjdump = cuda_tool("cuobjdump");
+    let resources = require_success(
+        &cuobjdump,
+        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+    )?;
+    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
+    let sass = String::from_utf8(sass.stdout)?;
+    for entry in &prefill {
+        let body = sass_function_body(&sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        if !body.contains("QMMA.16832.F32.E4M3.E4M3") {
+            return Err(format!(
+                "dense-FP8 SwiGLU entry `{}` lost its native E4M3 tensor-core instruction",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let quantize_resource = resources
+        .get(quantize[0].name)
+        .ok_or("cuobjdump omitted dense-FP8 SwiGLU quantization")?;
+    require_spill_free(quantize[0].name, quantize_resource)?;
+    require_registers(
+        &baseline,
+        "quantize_registers",
+        &[quantize_resource.registers],
+    )?;
+
+    let mut decode_registers = Vec::new();
+    for entry in &decode {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        decode_registers.push(resource.registers);
+    }
+    decode_registers.sort_unstable();
+    require_registers(&baseline, "decode_registers", &decode_registers)?;
+
+    let mut prefill_registers = Vec::new();
+    for entry in &prefill {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        prefill_registers.push(resource.registers);
+    }
+    prefill_registers.sort_unstable();
+    require_registers(&baseline, "prefill_registers", &prefill_registers)?;
+
+    println!(
+        "dense-FP8 SwiGLU gate passed: 1 quantize + 8 decode + 3 prefill entries, REG {} / {:?} / {:?}, STACK:0 LOCAL:0",
+        quantize_resource.registers, decode_registers, prefill_registers
     );
     Ok(())
 }

@@ -5,10 +5,10 @@ results are valid only on the exact RTX 5090 target under an exclusive, recorded
 
 The registered device suites cover zero-centered residual/RMSNorm at exact `B=1..8`, and
 dynamic-quantize FP8 QKV at exact `B=1..8` plus `T=16`, GDN Q/K/V/Z input projection at exact
-`B=1..8`, the full-vocabulary FP8 LM head at exact `B=1..8`, and the source-backed final-norm plus
-LM-head endpoint at exact `B=1..8`. The report schema is already shaped for future layer,
-whole-model, and serving cases, but those measurements do not exist until their production owners
-land.
+`B=1..8`, the full-vocabulary FP8 LM head at exact `B=1..8`, dense-FP8 gate/up SwiGLU at exact
+`B=1..8` and `T=32,64,128`, and the source-backed final-norm plus LM-head endpoint at exact
+`B=1..8`. The report schema is already shaped for future layer, whole-model, and serving cases,
+but those measurements do not exist until their production owners land.
 
 ## Quick start
 
@@ -56,6 +56,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- qualify-fp8-qkv` | Run the independent represented-value QKV oracle and benchmark-accounting test | terminal |
 | `cargo run -p xtask -- qualify-fp8-gdn-input` | Run the independent represented-value GDN input oracle and benchmark-accounting test | terminal |
 | `cargo run -p xtask -- qualify-fp8-lm-head` | Run the independent represented-value full-vocabulary LM-head oracle and benchmark-accounting test | terminal |
+| `cargo run -p xtask -- qualify-fp8-swiglu` | Run the exhaustive represented-value gate/up SwiGLU oracle and graph-replay gate | terminal |
 | `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
@@ -103,8 +104,8 @@ cargo run -p xtask -- bench-residual-norm \
   --json target/benchmarks/residual-norm.json
 ```
 
-Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, or `bench-fp8-lm-head` with the
-same options for one projection suite only.
+Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, `bench-fp8-lm-head`, or
+`bench-fp8-swiglu` with the same options for one operator suite only.
 
 `bench-text-endpoint SNAPSHOT` accepts the same options. It is intentionally separate from the
 leaf-wide `perf` commands until its first reviewed baseline is blessed.
@@ -159,10 +160,11 @@ Unused dimensions are `null`, not zero. A comparison refuses when any workload d
 inventory differs. This prevents, for example, a warm short-context operator result from being
 compared with a cold long-context model result that shares a route name.
 
-The residual-norm, FP8-QKV `B=1..8`, FP8-GDN-input, and FP8-LM-head cases are `operator/decode`,
-warm-cache, CUDA-Graph workloads. They set batch and active tokens to the exact batch. FP8-QKV
-`T=16` is an `operator/mtp` case with 16 active tokens and no batch dimension. Context, prompt,
-concurrency, output, and prefix cache do not apply to these leaf suites.
+The residual-norm, FP8-QKV `B=1..8`, FP8-GDN-input, FP8-LM-head, and dense-FP8-SwiGLU `B=1..8`
+cases are `operator/decode`, warm-cache, CUDA-Graph workloads. They set batch and active tokens to
+the exact batch. FP8-QKV `T=16` is an `operator/mtp` case. Dense-FP8-SwiGLU `T=32,64,128` cases are
+`operator/prefill` cases with prompt and context lengths equal to the active rows. Concurrency,
+output, and prefix cache do not apply to these leaf suites.
 
 ## Memory and capacity
 
