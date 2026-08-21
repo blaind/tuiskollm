@@ -6,10 +6,17 @@ license.workspace = true
 publish = false
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tuisko-gpu.workspace = true
 tuisko-kernels-sm120.workspace = true
 tuisko-model.workspace = true
+
+[[bin]]
+name = "bench-residual-norm"
+path = "src/bin/bench_residual_norm.rs"
 
 [lints.rust]
 missing_docs = "warn"

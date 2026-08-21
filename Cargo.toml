@@ -28,6 +28,7 @@ cuda-host = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tuisko-gpu = { path = "crates/tuisko-gpu" }
 tuisko-kernels-sm120 = { path = "crates/tuisko-kernels-sm120" }
