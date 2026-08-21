@@ -29,7 +29,11 @@ Bootstrap the pinned cuda-oxide toolchain, then build and qualify the current de
 cargo run -p xtask -- bootstrap-cuda-oxide
 cargo run -p xtask -- build-sm120
 cargo run -p xtask -- qualify-residual-norm
+cargo run -p xtask -- perf smoke
 ```
 
 `xtask` keeps its cuda-oxide checkout, backend, and nested Cargo home under the ignored `target/`
 tree; no shell-level `CARGO_HOME` override is needed.
+
+See [`docs/performance.md`](docs/performance.md) for the command reference, metric definitions,
+memory, energy, baseline, and refusal contracts.

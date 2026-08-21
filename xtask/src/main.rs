@@ -1,5 +1,7 @@
 //! Repository build and qualification gates.
 
+mod performance;
+
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
@@ -10,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const BASELINE: &str = "qual/baselines/residual-norm-sm120.txt";
+const PERFORMANCE_BASELINE: &str = "qual/baselines/sm120-qwen38.json";
 const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
 const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
@@ -20,7 +23,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-residual-norm|bench-residual-norm|gate-residual-norm>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-residual-norm|bench-residual-norm|gate-residual-norm|perf>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -31,6 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-residual-norm") if remaining.is_empty() => qualify_residual_norm(root),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
         Some("gate-residual-norm") if remaining.is_empty() => gate_residual_norm(root),
+        Some("perf") => perf(root, &remaining),
         Some(known)
             if matches!(
                 known,
@@ -172,6 +176,50 @@ fn bench_residual_norm(
     run_visible(&mut command)?;
 
     Ok(())
+}
+
+fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    let [mode] = arguments else {
+        return Err("usage: cargo run -p xtask -- perf <smoke|leaf|energy|gate|bless>".into());
+    };
+    let mode = mode.to_str().ok_or("perf mode is not UTF-8")?;
+    let report = root.join(format!("target/benchmarks/perf-{mode}.json"));
+    let report_text = path_text(&report)?.to_string();
+
+    match mode {
+        "smoke" => bench_residual_norm(
+            root,
+            &[
+                "--samples".into(),
+                "3".into(),
+                "--launches-per-sample".into(),
+                "1024".into(),
+                "--json".into(),
+                report_text.into(),
+            ],
+        ),
+        "leaf" => bench_residual_norm(root, &["--json".into(), report_text.into()]),
+        "energy" => bench_residual_norm(
+            root,
+            &[
+                "--energy-seconds".into(),
+                "2".into(),
+                "--json".into(),
+                report_text.into(),
+            ],
+        ),
+        "gate" => {
+            qualify_residual_norm(root)?;
+            bench_residual_norm(root, &["--json".into(), report_text.into()])?;
+            performance::compare(&report, &root.join(PERFORMANCE_BASELINE))
+        }
+        "bless" => {
+            qualify_residual_norm(root)?;
+            bench_residual_norm(root, &["--json".into(), report_text.into()])?;
+            performance::bless(&report, &root.join(PERFORMANCE_BASELINE))
+        }
+        _ => Err(format!("unknown perf mode `{mode}`").into()),
+    }
 }
 
 fn run_oxide(root: &Path, arguments: &[&str]) -> Result<(), Box<dyn Error>> {
