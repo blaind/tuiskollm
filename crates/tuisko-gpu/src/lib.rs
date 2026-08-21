@@ -3,6 +3,7 @@
 mod arena;
 mod error;
 mod graph;
+mod timer;
 
 pub use arena::{ArenaLayout, ArenaRegion, DeviceArena};
 pub use cuda_core::{
@@ -11,3 +12,4 @@ pub use cuda_core::{
 };
 pub use error::{GpuError, GpuErrorCode, GpuResult};
 pub use graph::CudaGraph;
+pub use timer::{GpuTimer, GpuTiming};

@@ -1,5 +1,6 @@
 //! Repository build and qualification gates.
 
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
@@ -19,7 +20,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-residual-norm|gate-residual-norm>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-residual-norm|bench-residual-norm|gate-residual-norm>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -28,6 +29,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bootstrap-cuda-oxide") if remaining.is_empty() => bootstrap_cuda_oxide(root),
         Some("build-sm120") if remaining.is_empty() => build_sm120(root),
         Some("qualify-residual-norm") if remaining.is_empty() => qualify_residual_norm(root),
+        Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
         Some("gate-residual-norm") if remaining.is_empty() => gate_residual_norm(root),
         Some(known)
             if matches!(
@@ -115,7 +117,8 @@ fn build_sm120(root: &Path) -> Result<(), Box<dyn Error>> {
             "--",
             "--package",
             "tuisko-qual",
-            "--lib",
+            "--bin",
+            "bench-residual-norm",
             "--release",
         ],
     )?;
@@ -144,6 +147,31 @@ fn qualify_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     gate_residual_norm(root)
+}
+
+fn bench_residual_norm(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-residual-norm");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut command = Command::new(&executable);
+    command.args(arguments).env(
+        "TUISKO_GENERATOR_BASELINE_SHA256",
+        sha256(&fs::read(root.join(BASELINE))?),
+    );
+    run_visible(&mut command)?;
+
+    Ok(())
 }
 
 fn run_oxide(root: &Path, arguments: &[&str]) -> Result<(), Box<dyn Error>> {
@@ -503,6 +531,13 @@ fn require_success(program: &Path, arguments: &[&OsStr]) -> Result<Output, Box<d
     }
 
     Ok(output)
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn parse_baseline(text: &str) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
