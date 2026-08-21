@@ -5,6 +5,6 @@ mod fp8;
 mod inventory;
 mod residual_norm;
 
-pub use fp8::{FullAttentionQkvOp, GdnInputProjectionOp};
+pub use fp8::{FullAttentionQkvOp, GdnInputProjectionOp, LmHeadOp};
 pub use inventory::kernel_ptx_names;
 pub use residual_norm::ResidualNormOp;

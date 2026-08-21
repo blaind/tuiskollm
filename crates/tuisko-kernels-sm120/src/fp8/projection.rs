@@ -16,6 +16,7 @@ const DECODE_PROJECTION_WARPS: usize = 8;
 const DECODE_PROJECTION_THREADS: u32 = (DECODE_PROJECTION_WARPS * 32) as u32;
 const QKV_ROWS: usize = Qwen38_27B::ATTENTION_QKV_ROWS;
 const GDN_INPUT_ROWS: usize = Qwen38_27B::GDN_INPUT_ROWS;
+const LM_HEAD_ROWS: usize = Qwen38_27B::VOCAB;
 // The MTP boundary is exactly 16 rows. Two warps cover one 16x64 output tile,
 // with 128 K bytes per stage split into four m16n8k32 subtiles.
 const QKV_MMA_TOKENS: usize = 16;
@@ -98,6 +99,35 @@ mod kernels {
         // SAFETY: the prepared exact-B grid covers every GDN input row pair once.
         unsafe {
             fp8_projection::<A, TOKENS, GDN_INPUT_ROWS, DECODE_PROJECTION_WARPS>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+            );
+        }
+    }
+
+    /// Projects dynamically quantized rows through the full-vocabulary LM head.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn fp8_lm_head<A: Arch, const TOKENS: usize>(
+        activation_codes: *const u32,
+        activation_scales: *const f32,
+        weight_codes: *const u32,
+        weight_scales: *const u16,
+        output: *mut u16,
+    ) {
+        // SAFETY: the prepared exact-B grid covers every vocabulary row pair once.
+        unsafe {
+            fp8_projection::<A, TOKENS, LM_HEAD_ROWS, DECODE_PROJECTION_WARPS>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
@@ -271,6 +301,66 @@ impl<const TOKENS: usize> PreparedGdnInputRoute<TOKENS> {
     }
 }
 
+struct PreparedLmHeadRoute<const TOKENS: usize> {
+    quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
+    projection: PreparedLaunch<kernels::__fp8_lm_head_CudaKernel<Qwen38_27B, TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedLmHeadRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let row_pairs_per_block = 2 * DECODE_PROJECTION_WARPS;
+        let projection_blocks = LM_HEAD_ROWS / row_pairs_per_block;
+        let projection_blocks = u32::try_from(projection_blocks)
+            .map_err(|_| GpuError::invalid_launch("LM-head rows exceed CUDA grid width"))?;
+        let projection = module
+            .prepare_fp8_lm_head::<Qwen38_27B, TOKENS>(LaunchConfig1D::new(
+                projection_blocks,
+                DECODE_PROJECTION_THREADS,
+                0,
+            ))
+            .map_err(|source| GpuError::launch("preparing the FP8 LM-head projection", source))?;
+
+        Ok(Self {
+            quantize: prepare_quantize::<TOKENS>(module)?,
+            projection,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .quantize_activation_e4m3(
+                stream,
+                &self.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u16>(),
+                activation_scales,
+            )
+            .map_err(|source| GpuError::launch("launching FP8 activation quantization", source))?;
+        module
+            .fp8_lm_head::<Qwen38_27B, TOKENS>(
+                stream,
+                &self.projection,
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                weight_codes.cast::<u32>(),
+                weight_scales,
+                output,
+            )
+            .map_err(|source| GpuError::launch("launching the FP8 LM-head projection", source))
+    }
+}
+
 struct PreparedQkvT16Route {
     quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
     projection: PreparedLaunch<kernels::__fp8_qkv_mma_t16_CudaKernel>,
@@ -359,6 +449,20 @@ pub(crate) fn fp8_gdn_input_ptx_names() -> [&'static str; 8] {
         kernels::fp8_gdn_input_ptx_name::<Qwen38_27B, 6>(),
         kernels::fp8_gdn_input_ptx_name::<Qwen38_27B, 7>(),
         kernels::fp8_gdn_input_ptx_name::<Qwen38_27B, 8>(),
+    ]
+}
+
+/// PTX symbols retained for every exact full-vocabulary LM-head batch.
+pub(crate) fn fp8_lm_head_ptx_names() -> [&'static str; 8] {
+    [
+        kernels::fp8_lm_head_ptx_name::<Qwen38_27B, 1>(),
+        kernels::fp8_lm_head_ptx_name::<Qwen38_27B, 2>(),
+        kernels::fp8_lm_head_ptx_name::<Qwen38_27B, 3>(),
+        kernels::fp8_lm_head_ptx_name::<Qwen38_27B, 4>(),
+        kernels::fp8_lm_head_ptx_name::<Qwen38_27B, 5>(),
+        kernels::fp8_lm_head_ptx_name::<Qwen38_27B, 6>(),
+        kernels::fp8_lm_head_ptx_name::<Qwen38_27B, 7>(),
+        kernels::fp8_lm_head_ptx_name::<Qwen38_27B, 8>(),
     ]
 }
 
@@ -545,12 +649,102 @@ impl GdnInputProjectionOp {
     }
 }
 
+/// Prepared dynamic-quantize plus full-vocabulary LM-head routes for exact `B=1..=8`.
+pub struct LmHeadOp {
+    module: kernels::LoadedModule,
+    b1: PreparedLmHeadRoute<1>,
+    b2: PreparedLmHeadRoute<2>,
+    b3: PreparedLmHeadRoute<3>,
+    b4: PreparedLmHeadRoute<4>,
+    b5: PreparedLmHeadRoute<5>,
+    b6: PreparedLmHeadRoute<6>,
+    b7: PreparedLmHeadRoute<7>,
+    b8: PreparedLmHeadRoute<8>,
+}
+
+impl LmHeadOp {
+    /// Loads the embedded SM120 module and prepares every exact-batch route.
+    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        let _ = fp8_lm_head_ptx_names();
+        // SAFETY: this crate owns the embedded cuda-oxide module artifact.
+        let module = unsafe { kernels::load(context) }
+            .map_err(|source| GpuError::module("loading the FP8 projection module", source))?;
+
+        Ok(Self {
+            b1: PreparedLmHeadRoute::prepare(&module)?,
+            b2: PreparedLmHeadRoute::prepare(&module)?,
+            b3: PreparedLmHeadRoute::prepare(&module)?,
+            b4: PreparedLmHeadRoute::prepare(&module)?,
+            b5: PreparedLmHeadRoute::prepare(&module)?,
+            b6: PreparedLmHeadRoute::prepare(&module)?,
+            b7: PreparedLmHeadRoute::prepare(&module)?,
+            b8: PreparedLmHeadRoute::prepare(&module)?,
+            module,
+        })
+    }
+
+    /// Dynamically quantizes an exact batch and projects full-vocabulary logits.
+    ///
+    /// # Safety
+    ///
+    /// `input` covers `batch * 5_120` BF16 values; `activation_codes` covers
+    /// `batch * 5_120` bytes; `activation_scales` covers `batch` FP32 values;
+    /// `weight_codes` and `weight_scales` cover `[248_320, 5_120]` E4M3 codes and
+    /// 248,320 BF16 scales; and `output` covers `batch * 248_320` BF16 values.
+    /// Four-byte-loaded planes must be four-byte aligned. All allocations must
+    /// belong to `stream`'s context, remain live through completion, and not overlap.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($route:ident) => {
+                // SAFETY: exact-B dispatch preserves the public pointer contract.
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        input,
+                        activation_codes,
+                        activation_scales,
+                        weight_codes,
+                        weight_scales,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match batch {
+            1 => launch!(b1),
+            2 => launch!(b2),
+            3 => launch!(b3),
+            4 => launch!(b4),
+            5 => launch!(b5),
+            6 => launch!(b6),
+            7 => launch!(b7),
+            8 => launch!(b8),
+            _ => Err(GpuError::invalid_launch(format!(
+                "FP8 LM-head batch {batch} is outside the admitted range 1..={MAX_BATCH}"
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DECODE_PROJECTION_THREADS, DECODE_PROJECTION_WARPS, MAX_BATCH, QKV_MMA_K_WORDS,
         QKV_MMA_OUTPUT_ROWS, QKV_MMA_SHARED_BYTES, QKV_MMA_THREADS, QKV_MMA_TOKENS,
-        QUANTIZE_THREADS, fp8_gdn_input_ptx_names, fp8_qkv_ptx_names,
+        QUANTIZE_THREADS, fp8_gdn_input_ptx_names, fp8_lm_head_ptx_names, fp8_qkv_ptx_names,
     };
     use std::collections::BTreeSet;
     use tuisko_model::{Arch, Qwen38_27B};
@@ -569,6 +763,7 @@ mod tests {
             Qwen38_27B::GDN_INPUT_ROWS % (2 * DECODE_PROJECTION_WARPS),
             0
         );
+        assert_eq!(Qwen38_27B::VOCAB % (2 * DECODE_PROJECTION_WARPS), 0);
         assert_eq!(Qwen38_27B::HIDDEN % (32 * 16), 0);
         assert_eq!(MAX_BATCH, 8);
     }
@@ -589,10 +784,11 @@ mod tests {
         let names = fp8_qkv_ptx_names()
             .into_iter()
             .chain(fp8_gdn_input_ptx_names())
+            .chain(fp8_lm_head_ptx_names())
             .collect::<Vec<_>>();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 2 * MAX_BATCH + 2);
+        assert_eq!(names.len(), 3 * MAX_BATCH + 2);
         assert_eq!(unique.len(), names.len());
     }
 }

@@ -5,8 +5,9 @@ results are valid only on the exact RTX 5090 target under an exclusive, recorded
 
 The registered device suites cover zero-centered residual/RMSNorm at exact `B=1..8`, and
 dynamic-quantize FP8 QKV at exact `B=1..8` plus `T=16` and GDN Q/K/V/Z input projection at exact
-`B=1..8`. The report schema is already shaped for future layer, whole-model, and serving cases, but
-those measurements do not exist until their production owners land.
+`B=1..8`, and the full-vocabulary FP8 LM head at exact `B=1..8`. The report schema is already shaped
+for future layer, whole-model, and serving cases, but those measurements do not exist until their
+production owners land.
 
 ## Quick start
 
@@ -37,6 +38,7 @@ The human-readable table goes to stderr. The machine-readable report is written 
 target/benchmarks/perf-smoke/residual-norm.json
 target/benchmarks/perf-smoke/fp8-qkv.json
 target/benchmarks/perf-smoke/fp8-gdn-input.json
+target/benchmarks/perf-smoke/fp8-lm-head.json
 ```
 
 Every performance command also executes the release SM120 build and checks the PTX/SASS entry and
@@ -50,6 +52,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- qualify-residual-norm` | Run the independent numerical and graph-replay oracle | terminal |
 | `cargo run -p xtask -- qualify-fp8-qkv` | Run the independent represented-value QKV oracle and benchmark-accounting test | terminal |
 | `cargo run -p xtask -- qualify-fp8-gdn-input` | Run the independent represented-value GDN input oracle and benchmark-accounting test | terminal |
+| `cargo run -p xtask -- qualify-fp8-lm-head` | Run the independent represented-value full-vocabulary LM-head oracle and benchmark-accounting test | terminal |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
 | `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
 | `cargo run -p xtask -- perf energy` | Full leaf reports plus a sustained power window per route | `target/benchmarks/perf-energy/*.json` |
@@ -69,8 +72,8 @@ cargo run -p xtask -- bench-residual-norm \
   --json target/benchmarks/residual-norm.json
 ```
 
-Use `cargo run -p xtask -- bench-fp8-qkv` or `bench-fp8-gdn-input` with the same options for one
-projection suite only.
+Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, or `bench-fp8-lm-head` with the
+same options for one projection suite only.
 
 Add `--energy-seconds 2` for sustained energy sampling. At least three samples, one launch per
 sample, and a two-second energy window are required.
@@ -120,10 +123,10 @@ Unused dimensions are `null`, not zero. A comparison refuses when any workload d
 inventory differs. This prevents, for example, a warm short-context operator result from being
 compared with a cold long-context model result that shares a route name.
 
-The residual-norm, FP8-QKV `B=1..8`, and FP8-GDN-input cases are `operator/decode`, warm-cache,
-CUDA-Graph workloads. They set batch and active tokens to the exact batch. FP8-QKV `T=16` is an
-`operator/mtp` case with 16 active tokens and no batch dimension. Context, prompt, concurrency,
-output, and prefix cache do not apply to these leaf suites.
+The residual-norm, FP8-QKV `B=1..8`, FP8-GDN-input, and FP8-LM-head cases are `operator/decode`,
+warm-cache, CUDA-Graph workloads. They set batch and active tokens to the exact batch. FP8-QKV
+`T=16` is an `operator/mtp` case with 16 active tokens and no batch dimension. Context, prompt,
+concurrency, output, and prefix cache do not apply to these leaf suites.
 
 ## Memory and capacity
 
@@ -160,10 +163,11 @@ reports reserved framebuffer memory separately, and on the target card that diff
 of MiB. NVML memory observations have MiB resolution; owner accounting remains the exact authority
 for allocations the program controls.
 
-The residual-norm suite attributes its single address-stable arena. Each FP8 projection suite
-separately attributes source-native weights and the remainder of its single address-stable arena as
-workspace. CUDA context, module, and graph storage remain visible in the setup delta and
-unattributed remainder because their exact allocation sizes are not owned by the program.
+The residual-norm suite attributes its single address-stable arena. Each FP8 projection suite,
+including the 1.27 GB full-vocabulary head, separately attributes source-native weights and the
+remainder of its single address-stable arena as workspace. CUDA context, module, and graph storage
+remain visible in the setup delta and unattributed remainder because their exact allocation sizes
+are not owned by the program.
 
 Owned quantities and post-warmup growth are enforced by default with zero slack. Setup delta,
 timed peak relative to preflight, headroom, driver reservation, RSS, and unattributed setup remain
@@ -328,7 +332,8 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 
 ## Current limitations
 
-- Only residual/RMSNorm `B=1..8`, FP8-QKV `B=1..8,T=16`, and FP8 GDN input `B=1..8` leaf cases are registered.
+- Only residual/RMSNorm `B=1..8`, FP8-QKV `B=1..8,T=16`, FP8 GDN input `B=1..8`,
+  and FP8 LM head `B=1..8` leaf cases are registered.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
 - There is no whole-layer, whole-model, TTFT, inter-token-latency, concurrency, long-context,
   prefix-cache, or end-to-end MTP benchmark in this repository yet.
@@ -353,7 +358,8 @@ owners and independent oracles.
 
 `performance baseline ... could not read`
 : No reviewed baseline exists. Run `perf leaf`, inspect the report, then use
-  `perf bless residual-norm`, `perf bless fp8-qkv`, or `perf bless fp8-gdn-input` explicitly.
+  `perf bless residual-norm`, `perf bless fp8-qkv`, `perf bless fp8-gdn-input`, or
+  `perf bless fp8-lm-head` explicitly.
 
 `performance report and baseline metric inventories differ`
 : A route, workload dimension, timing boundary, or memory owner changed. Review the inventory change;
