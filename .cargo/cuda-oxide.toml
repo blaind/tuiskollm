@@ -1,0 +1,4 @@
+default-arch = "sm_120a"
+
+[env]
+CUDA_OXIDE_PTX_DIR = "target/cuda"
