@@ -15,8 +15,8 @@ tuisko-kernels-sm120.workspace = true
 tuisko-model.workspace = true
 
 [[bin]]
-name = "bench-residual-norm"
-path = "src/bin/bench_residual_norm.rs"
+name = "bench-device"
+path = "src/bin/bench_device.rs"
 
 [lints.rust]
 missing_docs = "warn"

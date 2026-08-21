@@ -2,6 +2,7 @@
 
 mod device_benchmark;
 mod fp8_qkv;
+mod fp8_qkv_benchmark;
 mod residual_norm;
 mod residual_norm_benchmark;
 
@@ -13,6 +14,7 @@ pub use device_benchmark::{
     PrefixCacheRegime,
 };
 pub use fp8_qkv::{Fp8QkvQualification, Fp8QkvQualificationError, qualify_fp8_qkv};
+pub use fp8_qkv_benchmark::benchmark_fp8_qkv;
 pub use residual_norm::{
     ResidualNormQualification, ResidualNormQualificationError, qualify_residual_norm,
 };

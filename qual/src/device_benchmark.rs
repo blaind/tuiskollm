@@ -50,10 +50,10 @@ pub enum BenchmarkMeasurement {
     HostSubmit,
     /// Rust time from submission through device completion.
     HostCompletion,
-    /// CUDA-event time around repeated one-node graph replays.
+    /// CUDA-event time around repeated production graph replays.
     DeviceGraph,
-    /// CUDA-event time per node within one repeated-node graph replay.
-    DeviceNode,
+    /// CUDA-event time per operation within one repeated-operation graph replay.
+    DevicePath,
 }
 
 impl BenchmarkMeasurement {
@@ -63,12 +63,12 @@ impl BenchmarkMeasurement {
             Self::HostSubmit => "host_submit",
             Self::HostCompletion => "host_completion",
             Self::DeviceGraph => "device_graph",
-            Self::DeviceNode => "device_node",
+            Self::DevicePath => "device_path",
         }
     }
 
     const fn is_device(self) -> bool {
-        matches!(self, Self::DeviceGraph | Self::DeviceNode)
+        matches!(self, Self::DeviceGraph | Self::DevicePath)
     }
 }
 
@@ -417,6 +417,12 @@ pub struct DeviceBenchmarkReport {
     pub memory: DeviceMemoryReport,
 }
 
+pub(crate) struct BenchmarkReportSpec {
+    pub(crate) suite: &'static str,
+    pub(crate) classification: &'static str,
+    pub(crate) timing_scope: &'static str,
+}
+
 /// Failure to establish or measure a comparable device benchmark.
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceBenchmarkError {
@@ -457,9 +463,9 @@ pub(crate) struct TelemetryEvidence {
     pub(crate) samples: usize,
 }
 
-pub(crate) struct IntrinsicGraph<'a> {
+pub(crate) struct RepeatedGraph<'a> {
     graph: &'a CudaGraph,
-    nodes: u64,
+    operations: u64,
 }
 
 pub(crate) struct OperationAccounting {
@@ -478,9 +484,9 @@ impl OperationAccounting {
     }
 }
 
-impl<'a> IntrinsicGraph<'a> {
-    pub(crate) fn new(graph: &'a CudaGraph, nodes: u64) -> Self {
-        Self { graph, nodes }
+impl<'a> RepeatedGraph<'a> {
+    pub(crate) fn new(graph: &'a CudaGraph, operations: u64) -> Self {
+        Self { graph, operations }
     }
 }
 
@@ -492,7 +498,7 @@ pub(crate) struct ExactDeviceCase<'a> {
     units_per_operation: u64,
     unit: &'static str,
     leaf_graph: &'a CudaGraph,
-    intrinsic: Option<IntrinsicGraph<'a>>,
+    repeated: Option<RepeatedGraph<'a>>,
 }
 
 impl<'a> ExactDeviceCase<'a> {
@@ -502,7 +508,7 @@ impl<'a> ExactDeviceCase<'a> {
         workload: BenchmarkWorkload,
         accounting: OperationAccounting,
         leaf_graph: &'a CudaGraph,
-        intrinsic: Option<IntrinsicGraph<'a>>,
+        repeated: Option<RepeatedGraph<'a>>,
     ) -> Self {
         Self {
             route,
@@ -512,7 +518,7 @@ impl<'a> ExactDeviceCase<'a> {
             units_per_operation: accounting.units_per_operation,
             unit: accounting.unit,
             leaf_graph,
-            intrinsic,
+            repeated,
         }
     }
 }
@@ -522,13 +528,13 @@ struct CaseSamples {
     host_submit: Vec<f64>,
     host_completion: Vec<f64>,
     device_graph: Vec<f64>,
-    device_node: Vec<f64>,
+    device_path: Vec<f64>,
 }
 
 #[derive(Clone, Copy)]
 enum MeasurementTask {
     Leaf(usize),
-    Intrinsic(usize),
+    Repeated(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -833,6 +839,71 @@ pub(crate) fn require_current_process_exclusive() -> Result<(), DeviceBenchmarkE
     require_no_foreign_compute_processes(Some(std::process::id()))
 }
 
+pub(crate) fn warmup_launches(
+    options: DeviceBenchmarkOptions,
+) -> Result<u64, DeviceBenchmarkError> {
+    if options.samples < 3 || options.launches_per_sample == 0 {
+        return Err(DeviceBenchmarkError::Precondition(
+            "at least three samples and one launch per sample are required".to_string(),
+        ));
+    }
+
+    options
+        .launches_per_sample
+        .checked_mul(4)
+        .map(|launches| launches.max(1_024))
+        .ok_or_else(|| {
+            DeviceBenchmarkError::Precondition("warmup launch count overflows".to_string())
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_report(
+    spec: BenchmarkReportSpec,
+    preflight: DevicePreflight,
+    generator_baseline_sha256: String,
+    options: DeviceBenchmarkOptions,
+    metrics: Vec<DeviceBenchmarkMetric>,
+    energy_metrics: Vec<DeviceEnergyMetric>,
+    telemetry: TelemetryEvidence,
+    memory: DeviceMemoryReport,
+) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
+    let identity = preflight.identity;
+
+    Ok(DeviceBenchmarkReport {
+        schema_version: 5,
+        suite: spec.suite,
+        classification: spec.classification,
+        device: identity.name,
+        device_uuid: identity.uuid,
+        driver_version: identity.driver_version,
+        device_index: 0,
+        compute_capability: "12.0".to_string(),
+        binary_sha256: executable_sha256()?,
+        generator_baseline_sha256,
+        sm_clock_min_mhz: telemetry.sm_minimum_mhz,
+        sm_clock_median_mhz: telemetry.sm_median_mhz,
+        sm_clock_max_mhz: telemetry.sm_maximum_mhz,
+        memory_clock_min_mhz: telemetry.memory_minimum_mhz,
+        memory_clock_median_mhz: telemetry.memory_median_mhz,
+        memory_clock_max_mhz: telemetry.memory_maximum_mhz,
+        temperature_min_celsius: telemetry.temperature_minimum_celsius,
+        temperature_max_celsius: telemetry.temperature_maximum_celsius,
+        power_min_watts: telemetry.power_minimum_watts,
+        power_mean_watts: telemetry.power_mean_watts,
+        power_median_watts: telemetry.power_median_watts,
+        power_max_watts: telemetry.power_maximum_watts,
+        telemetry_samples: telemetry.samples,
+        samples: options.samples,
+        launches_per_sample: options.launches_per_sample,
+        timing_scope: spec.timing_scope,
+        power_scope: "nvidia-smi power.draw.instant, whole board",
+        metrics,
+        energy_metrics,
+        memory,
+    })
+}
+
 pub(crate) fn measure_cases(
     stream: &CudaStream,
     timer: &GpuTimer,
@@ -855,8 +926,8 @@ pub(crate) fn measure_cases(
     let mut tasks = Vec::with_capacity(cases.len() * 2);
     for (index, case) in cases.iter().enumerate() {
         tasks.push(MeasurementTask::Leaf(index));
-        if case.intrinsic.is_some() {
-            tasks.push(MeasurementTask::Intrinsic(index));
+        if case.repeated.is_some() {
+            tasks.push(MeasurementTask::Repeated(index));
         }
     }
     let mut samples = (0..cases.len())
@@ -885,15 +956,15 @@ pub(crate) fn measure_cases(
                         .device_graph
                         .push(microseconds_per(timing.device, divisor));
                 }
-                MeasurementTask::Intrinsic(case_index) => {
-                    let intrinsic = cases[case_index]
-                        .intrinsic
+                MeasurementTask::Repeated(case_index) => {
+                    let repeated = cases[case_index]
+                        .repeated
                         .as_ref()
-                        .expect("intrinsic task requires an intrinsic graph");
-                    let elapsed = timer.measure(stream, || intrinsic.graph.launch(stream))?;
+                        .expect("repeated task requires a repeated graph");
+                    let elapsed = timer.measure(stream, || repeated.graph.launch(stream))?;
                     samples[case_index]
-                        .device_node
-                        .push(microseconds_per(elapsed, intrinsic.nodes));
+                        .device_path
+                        .push(microseconds_per(elapsed, repeated.operations));
                 }
             }
         }
@@ -924,12 +995,12 @@ pub(crate) fn measure_cases(
         )?;
         device_graph_medians.push(device_graph.median_microseconds);
         metrics.push(device_graph);
-        if let Some(intrinsic) = &case.intrinsic {
+        if let Some(repeated) = &case.repeated {
             metrics.push(metric(
                 case,
-                BenchmarkMeasurement::DeviceNode,
-                intrinsic.nodes,
-                samples.device_node,
+                BenchmarkMeasurement::DevicePath,
+                repeated.operations,
+                samples.device_path,
             )?);
         }
     }
@@ -1141,7 +1212,7 @@ pub(crate) fn executable_sha256() -> Result<String, DeviceBenchmarkError> {
 pub(crate) fn generator_baseline_sha256() -> Result<String, DeviceBenchmarkError> {
     env::var("TUISKO_GENERATOR_BASELINE_SHA256").map_err(|_| {
         DeviceBenchmarkError::Precondition(
-            "run through `cargo run -p xtask -- bench-residual-norm`".to_string(),
+            "run through the matching `cargo run -p xtask -- bench-...` command".to_string(),
         )
     })
 }

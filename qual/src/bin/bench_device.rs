@@ -1,10 +1,12 @@
-//! SM120 residual-norm device benchmark.
+//! SM120 device benchmark entry point.
 
 use std::error::Error;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use tuisko_qual::{DeviceBenchmarkOptions, benchmark_residual_norm};
+use tuisko_qual::{
+    DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_fp8_qkv, benchmark_residual_norm,
+};
 
 fn main() -> ExitCode {
     match run() {
@@ -23,9 +25,21 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let (options, json_path) = parse_options()?;
-    let report = benchmark_residual_norm(options)?;
+    let mut arguments = std::env::args().skip(1);
+    let suite = arguments
+        .next()
+        .ok_or("usage: bench-device <residual-norm|fp8-qkv> [options]")?;
+    let (options, json_path) = parse_options(arguments)?;
+    let report = match suite.as_str() {
+        "residual-norm" => benchmark_residual_norm(options)?,
+        "fp8-qkv" => benchmark_fp8_qkv(options)?,
+        _ => return Err(format!("unknown benchmark suite `{suite}`").into()),
+    };
+    print_report(&report);
+    write_report(&report, json_path)
+}
 
+fn print_report(report: &DeviceBenchmarkReport) {
     eprintln!(
         "route                            shape metric              median us    p10 us    p90 us    GiB/s"
     );
@@ -75,7 +89,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             metric.bytes as f64 / (1024.0 * 1024.0),
         );
     }
-    let mut json = serde_json::to_vec_pretty(&report)?;
+}
+
+fn write_report(
+    report: &DeviceBenchmarkReport,
+    json_path: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    let mut json = serde_json::to_vec_pretty(report)?;
     json.push(b'\n');
     if let Some(path) = json_path {
         if let Some(parent) = path
@@ -93,10 +113,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn parse_options() -> Result<(DeviceBenchmarkOptions, Option<PathBuf>), Box<dyn Error>> {
+fn parse_options(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(DeviceBenchmarkOptions, Option<PathBuf>), Box<dyn Error>> {
     let mut options = DeviceBenchmarkOptions::default();
     let mut json_path = None;
-    let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         let value = arguments
             .next()

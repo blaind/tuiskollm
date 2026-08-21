@@ -11,20 +11,66 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const BASELINE: &str = "qual/baselines/residual-norm-sm120.txt";
-const FP8_QKV_BASELINE: &str = "qual/baselines/fp8-qkv-sm120.txt";
-const PERFORMANCE_BASELINE: &str = "qual/baselines/sm120-qwen38.json";
+const RESIDUAL_NORM_RESOURCE_BASELINE: &str = "qual/baselines/residual-norm-sm120.txt";
+const FP8_QKV_RESOURCE_BASELINE: &str = "qual/baselines/fp8-qkv-sm120.txt";
 const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
 const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
 const CUDA_OXIDE_REPOSITORY: &str = "https://github.com/NVlabs/cuda-oxide.git";
 const CUDA_OXIDE_REVISION: &str = "1f4d813719012d384f2db12b88efc9314c8bf50c";
 
+#[derive(Clone, Copy)]
+enum PerformanceSuite {
+    ResidualNorm,
+    Fp8Qkv,
+}
+
+const PERFORMANCE_SUITES: [PerformanceSuite; 2] =
+    [PerformanceSuite::ResidualNorm, PerformanceSuite::Fp8Qkv];
+
+impl PerformanceSuite {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ResidualNorm => "residual-norm",
+            Self::Fp8Qkv => "fp8-qkv",
+        }
+    }
+
+    const fn resource_baseline(self) -> &'static str {
+        match self {
+            Self::ResidualNorm => RESIDUAL_NORM_RESOURCE_BASELINE,
+            Self::Fp8Qkv => FP8_QKV_RESOURCE_BASELINE,
+        }
+    }
+
+    const fn performance_baseline(self) -> &'static str {
+        match self {
+            Self::ResidualNorm => "qual/baselines/residual-norm-sm120.json",
+            Self::Fp8Qkv => "qual/baselines/fp8-qkv-sm120.json",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
+        match value {
+            "residual-norm" => Ok(Self::ResidualNorm),
+            "fp8-qkv" => Ok(Self::Fp8Qkv),
+            _ => Err(format!("unknown performance suite `{value}`").into()),
+        }
+    }
+
+    fn qualify(self, root: &Path) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::ResidualNorm => qualify_residual_norm(root),
+            Self::Fp8Qkv => qualify_fp8_qkv(root),
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-residual-norm|qualify-fp8-qkv|bench-residual-norm|gate-residual-norm|gate-fp8-qkv|perf>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-residual-norm|qualify-fp8-qkv|bench-residual-norm|bench-fp8-qkv|gate-residual-norm|gate-fp8-qkv|perf>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -35,6 +81,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-residual-norm") if remaining.is_empty() => qualify_residual_norm(root),
         Some("qualify-fp8-qkv") if remaining.is_empty() => qualify_fp8_qkv(root),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
+        Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
         Some("gate-residual-norm") if remaining.is_empty() => gate_residual_norm(root),
         Some("gate-fp8-qkv") if remaining.is_empty() => gate_fp8_qkv(root),
         Some("perf") => perf(root, &remaining),
@@ -127,7 +174,7 @@ fn build_sm120(root: &Path) -> Result<(), Box<dyn Error>> {
             "--package",
             "tuisko-qual",
             "--bin",
-            "bench-residual-norm",
+            "bench-device",
             "--release",
         ],
     )?;
@@ -177,7 +224,7 @@ fn qualify_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "fp8_qkv::tests",
+            "fp8_qkv",
             "--include-ignored",
             "--nocapture",
         ],
@@ -189,10 +236,30 @@ fn bench_residual_norm(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
+    bench_suite(root, PerformanceSuite::ResidualNorm, arguments)
+}
+
+fn bench_fp8_qkv(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    bench_suite(root, PerformanceSuite::Fp8Qkv, arguments)
+}
+
+fn bench_suite(
+    root: &Path,
+    suite: PerformanceSuite,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
     build_sm120(root)?;
+    run_benchmark_suite(root, suite, arguments)
+}
+
+fn run_benchmark_suite(
+    root: &Path,
+    suite: PerformanceSuite,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-residual-norm");
+        .join("release/bench-device");
     if !executable.is_file() {
         return Err(format!(
             "benchmark executable is missing at {}",
@@ -201,9 +268,9 @@ fn bench_residual_norm(
         .into());
     }
     let mut command = Command::new(&executable);
-    command.args(arguments).env(
+    command.arg(suite.name()).args(arguments).env(
         "TUISKO_GENERATOR_BASELINE_SHA256",
-        sha256(&fs::read(root.join(BASELINE))?),
+        sha256(&fs::read(root.join(suite.resource_baseline()))?),
     );
     run_visible(&mut command)?;
 
@@ -211,47 +278,79 @@ fn bench_residual_norm(
 }
 
 fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
-    let [mode] = arguments else {
-        return Err("usage: cargo run -p xtask -- perf <smoke|leaf|energy|gate|bless>".into());
+    let Some(mode) = arguments.first() else {
+        return Err(
+            "usage: cargo run -p xtask -- perf <smoke|leaf|energy|gate|bless SUITE>".into(),
+        );
     };
     let mode = mode.to_str().ok_or("perf mode is not UTF-8")?;
-    let report = root.join(format!("target/benchmarks/perf-{mode}.json"));
-    let report_text = path_text(&report)?.to_string();
-
-    match mode {
-        "smoke" => bench_residual_norm(
-            root,
-            &[
-                "--samples".into(),
-                "3".into(),
-                "--launches-per-sample".into(),
-                "1024".into(),
-                "--json".into(),
-                report_text.into(),
-            ],
-        ),
-        "leaf" => bench_residual_norm(root, &["--json".into(), report_text.into()]),
-        "energy" => bench_residual_norm(
-            root,
-            &[
-                "--energy-seconds".into(),
-                "2".into(),
-                "--json".into(),
-                report_text.into(),
-            ],
-        ),
-        "gate" => {
-            qualify_residual_norm(root)?;
-            bench_residual_norm(root, &["--json".into(), report_text.into()])?;
-            performance::compare(&report, &root.join(PERFORMANCE_BASELINE))
-        }
-        "bless" => {
-            qualify_residual_norm(root)?;
-            bench_residual_norm(root, &["--json".into(), report_text.into()])?;
-            performance::bless(&report, &root.join(PERFORMANCE_BASELINE))
-        }
-        _ => Err(format!("unknown perf mode `{mode}`").into()),
+    if mode == "bless" {
+        let [_, suite] = arguments else {
+            return Err("usage: cargo run -p xtask -- perf bless <residual-norm|fp8-qkv>".into());
+        };
+        let suite = PerformanceSuite::parse(suite.to_str().ok_or("perf suite is not UTF-8")?)?;
+        return bless_suite(root, suite);
     }
+    if arguments.len() != 1 {
+        return Err(format!("`perf {mode}` takes no additional arguments").into());
+    }
+
+    let options = match mode {
+        "smoke" => vec![
+            "--samples".into(),
+            "3".into(),
+            "--launches-per-sample".into(),
+            "1024".into(),
+        ],
+        "leaf" | "gate" => Vec::new(),
+        "energy" => vec!["--energy-seconds".into(), "2".into()],
+        _ => return Err(format!("unknown perf mode `{mode}`").into()),
+    };
+    if mode == "gate" {
+        for suite in PERFORMANCE_SUITES {
+            suite.qualify(root)?;
+        }
+    }
+    build_sm120(root)?;
+    run_performance_suites(root, mode, &options, mode == "gate")
+}
+
+fn run_performance_suites(
+    root: &Path,
+    mode: &str,
+    options: &[std::ffi::OsString],
+    compare: bool,
+) -> Result<(), Box<dyn Error>> {
+    for suite in PERFORMANCE_SUITES {
+        let report = performance_report_path(root, mode, suite);
+        let mut arguments = options.to_vec();
+        arguments.push("--json".into());
+        arguments.push(path_text(&report)?.into());
+        run_benchmark_suite(root, suite, &arguments)?;
+    }
+    if compare {
+        for suite in PERFORMANCE_SUITES {
+            let report = performance_report_path(root, mode, suite);
+            performance::compare(&report, &root.join(suite.performance_baseline()))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn bless_suite(root: &Path, suite: PerformanceSuite) -> Result<(), Box<dyn Error>> {
+    suite.qualify(root)?;
+    build_sm120(root)?;
+    let report = performance_report_path(root, "bless", suite);
+    run_benchmark_suite(root, suite, &["--json".into(), path_text(&report)?.into()])?;
+    performance::bless(&report, &root.join(suite.performance_baseline()))
+}
+
+fn performance_report_path(root: &Path, mode: &str, suite: PerformanceSuite) -> PathBuf {
+    root.join(format!(
+        "target/benchmarks/perf-{mode}/{}.json",
+        suite.name()
+    ))
 }
 
 fn run_oxide(root: &Path, arguments: &[&str]) -> Result<(), Box<dyn Error>> {
@@ -309,7 +408,9 @@ fn require_cuda_oxide_revision(source: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn gate_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
-    let baseline = parse_baseline(&fs::read_to_string(root.join(BASELINE))?)?;
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(RESIDUAL_NORM_RESOURCE_BASELINE),
+    )?)?;
     verify_generator_stamp(root, &baseline)?;
 
     let ptx_path = root.join(PTX);
@@ -396,7 +497,7 @@ fn gate_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
-    let baseline = parse_baseline(&fs::read_to_string(root.join(FP8_QKV_BASELINE))?)?;
+    let baseline = parse_baseline(&fs::read_to_string(root.join(FP8_QKV_RESOURCE_BASELINE))?)?;
     verify_generator_stamp(root, &baseline)?;
 
     let ptx_path = root.join(PTX);
@@ -861,8 +962,8 @@ fn require_uniform_value(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_cuda_toolkit_identity, parse_entries, parse_resources, parse_rustc_identity,
-        require_count, require_uniform_value,
+        PERFORMANCE_SUITES, PerformanceSuite, parse_cuda_toolkit_identity, parse_entries,
+        parse_resources, parse_rustc_identity, require_count, require_uniform_value,
     };
     use std::collections::BTreeMap;
 
@@ -928,5 +1029,22 @@ mod tests {
 
         require_uniform_value(&baseline, "shared_bytes", &[1_088; 16]).unwrap();
         assert!(require_uniform_value(&baseline, "shared_bytes", &[1_088, 1_024]).is_err());
+    }
+
+    #[test]
+    fn performance_suite_names_select_the_complete_inventory() {
+        let names = PERFORMANCE_SUITES
+            .iter()
+            .map(|suite| suite.name())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["residual-norm", "fp8-qkv"]);
+        for suite in PERFORMANCE_SUITES {
+            assert_eq!(
+                PerformanceSuite::parse(suite.name()).unwrap().name(),
+                suite.name()
+            );
+        }
+        assert!(PerformanceSuite::parse("unknown").is_err());
     }
 }
