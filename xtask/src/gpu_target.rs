@@ -74,7 +74,7 @@ impl GpuTarget {
         }
     }
 
-    #[cfg(feature = "remote")]
+    #[cfg_attr(not(any(feature = "remote", test)), allow(dead_code))]
     pub(crate) const fn has_full_kernel_inventory(self) -> bool {
         matches!(self, Self::Rtx5090)
     }
@@ -84,6 +84,14 @@ impl GpuTarget {
             Self::Rtx5090 => "target/cuda-oxide-test",
             Self::Rtx4090 => "target/cuda-oxide-test-sm89",
             Self::Rtx3090 => "target/cuda-oxide-test-sm86",
+        }
+    }
+
+    pub(crate) const fn oxide_build_target(self) -> &'static str {
+        match self {
+            Self::Rtx5090 => "target/cuda-oxide-build-sm120",
+            Self::Rtx4090 => "target/cuda-oxide-build-sm89",
+            Self::Rtx3090 => "target/cuda-oxide-build-sm86",
         }
     }
 
@@ -125,6 +133,7 @@ mod tests {
                 target.qualification_feature(),
                 target.ptx_path(),
                 target.residual_resource_baseline(),
+                target.oxide_build_target(),
             )
         });
 
@@ -140,6 +149,7 @@ mod tests {
                     "device",
                     "target/cuda/tuisko_kernels_sm120.ptx",
                     "qual/baselines/residual-norm-sm120.txt",
+                    "target/cuda-oxide-build-sm120",
                 ),
                 (
                     "4090",
@@ -150,6 +160,7 @@ mod tests {
                     "sm89-residual",
                     "target/cuda/tuisko_kernels_sm89.ptx",
                     "qual/baselines/residual-norm-sm89.txt",
+                    "target/cuda-oxide-build-sm89",
                 ),
                 (
                     "3090",
@@ -160,6 +171,7 @@ mod tests {
                     "sm86-residual",
                     "target/cuda/tuisko_kernels_sm86.ptx",
                     "qual/baselines/residual-norm-sm86.txt",
+                    "target/cuda-oxide-build-sm86",
                 ),
             ]
         );

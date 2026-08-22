@@ -32,6 +32,8 @@ cargo run -p xtask --features remote -- remote probe --gpu 4090
 cargo run -p xtask --features remote -- remote probe --gpu 3090
 cargo run -p xtask -- build-residual-norm --gpu 4090
 cargo run -p xtask -- build-residual-norm --gpu 3090
+cargo run -p xtask -- build-residual-bench --gpu 4090
+cargo run -p xtask -- build-residual-bench --gpu 3090
 cargo run -p xtask --features remote -- remote qualify-residual-norm
 cargo run -p xtask --features remote -- remote qualify-residual-norm --gpu 4090
 cargo run -p xtask --features remote -- remote qualify-residual-norm --gpu 3090
@@ -39,6 +41,8 @@ cargo run -p xtask --features remote -- remote qualify-fp8-qkv
 cargo run -p xtask --features remote -- remote qualify-fp8-gdn-input
 cargo run -p xtask --features remote -- remote qualify-fp8-lm-head
 cargo run -p xtask --features remote -- remote bench-residual-norm
+cargo run -p xtask --features remote -- remote bench-residual-norm --gpu 4090
+cargo run -p xtask --features remote -- remote bench-residual-norm --gpu 3090
 cargo run -p xtask --features remote -- remote bench-fp8-qkv
 cargo run -p xtask --features remote -- remote bench-fp8-gdn-input
 cargo run -p xtask --features remote -- remote bench-fp8-lm-head
@@ -49,8 +53,8 @@ Qualification accepts `--max-minutes N`, `--image NAME`, and `--keep-on-fail`. T
 retains a failed, billable pod until `remote sweep` or manual deletion.
 
 All provisioning commands accept `--gpu 5090|4090|3090`. Non-SM120 targets currently admit only
-`qualify-residual-norm`; their benchmark loop and remaining operator inventories are separate
-qualification work. `probe` validates the requested device name, compute capability,
+residual-norm qualification and diagnostic benchmarking; their remaining operator inventories are
+separate qualification work. `probe` validates the requested device name, compute capability,
 userland, direct SSH, and cleanup without uploading a CUDA artifact. The runner does not fall back
 to RunPod's proxy shell when a host fails to expose direct SSH.
 
@@ -58,6 +62,11 @@ Benchmarks also accept `--samples N`, `--launches-per-sample N`, and `--energy-s
 does not grant clock-control permission, so remote reports retain the complete observed clock range
 without claiming comparability. The runner downloads `benchmark.out` plus `benchmark.json` under
 `target/remote-reports/`.
+
+The residual-norm benchmark sweeps both route families at every exact `B=1..8` in one process.
+Retune only the selected architecture crate, rerun its numerical gate, then compare diagnostic JSON
+from the same GPU target. SM89 and SM86 do not have blessed clock profiles yet, so their reports
+cannot become checked performance baselines until controlled-clock evidence is established.
 
 Each run:
 

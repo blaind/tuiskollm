@@ -119,10 +119,7 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
     let options = parse_options(&arguments[1..], benchmark.is_some())?;
 
-    let residual_only = qualification
-        .as_ref()
-        .is_some_and(|suite| suite.name == "residual-norm");
-    if !options.gpu.has_full_kernel_inventory() && !residual_only {
+    if !target_supports(options.gpu, command) {
         return Err(format!(
             "GPU {} currently admits only `qualify-residual-norm`; the remaining {} inventory has not been implemented",
             options.gpu.key(),
@@ -134,6 +131,8 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     tuisko_remote::check_credentials().map_err(|error| format!("{error}"))?;
     if options.gpu.has_full_kernel_inventory() {
         crate::build_sm120(root)?;
+    } else {
+        crate::build_residual_benchmark_target(root, options.gpu)?;
     }
     if let Some(qualification) = qualification {
         let prepared = crate::prepare_remote_qualify(root, options.gpu, qualification.filter)?;
@@ -152,7 +151,7 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
         )
         .map_err(|error| format!("{error}"))?;
     } else if let Some(benchmark) = benchmark {
-        let prepared = crate::prepare_remote_benchmark(root, benchmark.suite)?;
+        let prepared = crate::prepare_remote_benchmark(root, options.gpu, benchmark.suite)?;
         tuisko_remote::run_benchmark(
             root,
             &tuisko_remote::BenchmarkOptions {
@@ -170,6 +169,12 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(any(feature = "remote", test))]
+fn target_supports(gpu: GpuTarget, command: &str) -> bool {
+    gpu.has_full_kernel_inventory()
+        || matches!(command, "qualify-residual-norm" | "bench-residual-norm")
 }
 
 #[cfg(any(feature = "remote", test))]
@@ -272,7 +277,7 @@ fn run_impl(_root: &Path, _arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Benchmark, Qualification, parse_options};
+    use super::{Benchmark, Qualification, parse_options, target_supports};
     use crate::gpu_target::GpuTarget;
 
     #[test]
@@ -308,5 +313,23 @@ mod tests {
             GpuTarget::Rtx4090
         );
         assert!(parse_options(&["--gpu".to_owned(), "A100".to_owned()], false).is_err());
+    }
+
+    #[test]
+    fn target_support_is_a_complete_decision_table() {
+        for command in [
+            "qualify-residual-norm",
+            "bench-residual-norm",
+            "qualify-fp8-qkv",
+            "bench-fp8-qkv",
+        ] {
+            assert!(target_supports(GpuTarget::Rtx5090, command));
+        }
+        for gpu in [GpuTarget::Rtx4090, GpuTarget::Rtx3090] {
+            assert!(target_supports(gpu, "qualify-residual-norm"));
+            assert!(target_supports(gpu, "bench-residual-norm"));
+            assert!(!target_supports(gpu, "qualify-fp8-qkv"));
+            assert!(!target_supports(gpu, "bench-fp8-qkv"));
+        }
     }
 }

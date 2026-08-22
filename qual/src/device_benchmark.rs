@@ -1,5 +1,6 @@
-//! Shared controls and reports for exclusive SM120 device measurements.
+//! Shared controls and reports for exclusive device measurements.
 
+use crate::target::{CLOCK_LOCK_COMMAND, EXPECTED_COMPUTE_CAPABILITY_TEXT, EXPECTED_DEVICE_NAME};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -12,13 +13,11 @@ use std::time::Duration;
 use tuisko_gpu::{CudaGraph, CudaStream, GpuTimer};
 
 const DEVICE_INDEX: &str = "0";
-const DEVICE_NAME: &str = "NVIDIA GeForce RTX 5090";
 const MAX_IDLE_MEMORY_MIB: u32 = 1_024;
 const MAX_SM_CLOCK_SPREAD_MHZ: u32 = 30;
 const MAX_MEMORY_CLOCK_SPREAD_MHZ: u32 = 100;
 const MIN_TELEMETRY_SAMPLES: usize = 3;
 const DIAGNOSTIC_CLOCK_ENV: &str = "TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT";
-const CLOCK_LOCK_COMMAND: &str = "sudo nvidia-smi -i 0 --lock-gpu-clocks=2200,2200 && sudo nvidia-smi -i 0 --lock-memory-clocks=14001,14001";
 const CLOCK_RESET_COMMAND: &str =
     "sudo nvidia-smi -i 0 --reset-gpu-clocks && sudo nvidia-smi -i 0 --reset-memory-clocks";
 
@@ -890,9 +889,9 @@ impl MemoryRecorder {
 pub(crate) fn preflight() -> Result<DevicePreflight, DeviceBenchmarkError> {
     require_unmapped_ordinal_zero()?;
     let snapshot = device_snapshot()?;
-    if snapshot.identity.name != DEVICE_NAME {
+    if snapshot.identity.name != EXPECTED_DEVICE_NAME {
         return Err(DeviceBenchmarkError::Precondition(format!(
-            "device zero is `{}`, expected `{DEVICE_NAME}`",
+            "device zero is `{}`, expected `{EXPECTED_DEVICE_NAME}`",
             snapshot.identity.name
         )));
     }
@@ -957,7 +956,7 @@ pub(crate) fn finish_report(
         device_uuid: identity.uuid,
         driver_version: identity.driver_version,
         device_index: 0,
-        compute_capability: "12.0".to_string(),
+        compute_capability: EXPECTED_COMPUTE_CAPABILITY_TEXT.to_string(),
         clock_policy: if diagnostic_clock_drift_allowed() {
             "diagnostic_uncontrolled"
         } else {
@@ -1345,18 +1344,18 @@ fn telemetry_evidence(
 
     let sm_spread = sm[sm.len() - 1] - sm[0];
     if sm_spread > MAX_SM_CLOCK_SPREAD_MHZ && !allow_clock_drift {
-        return Err(DeviceBenchmarkError::Precondition(format!(
-            "SM clock moved from {} to {} MHz\nlock target clocks before the run:\n  {CLOCK_LOCK_COMMAND}\nreset them afterward:\n  {CLOCK_RESET_COMMAND}",
+        return Err(DeviceBenchmarkError::Precondition(clock_drift_message(
+            "SM",
             sm[0],
-            sm[sm.len() - 1]
+            sm[sm.len() - 1],
         )));
     }
     let memory_spread = memory[memory.len() - 1] - memory[0];
     if memory_spread > MAX_MEMORY_CLOCK_SPREAD_MHZ && !allow_clock_drift {
-        return Err(DeviceBenchmarkError::Precondition(format!(
-            "memory clock moved from {} to {} MHz\nlock target clocks before the run:\n  {CLOCK_LOCK_COMMAND}\nreset them afterward:\n  {CLOCK_RESET_COMMAND}",
+        return Err(DeviceBenchmarkError::Precondition(clock_drift_message(
+            "memory",
             memory[0],
-            memory[memory.len() - 1]
+            memory[memory.len() - 1],
         )));
     }
 
@@ -1377,6 +1376,18 @@ fn telemetry_evidence(
         device_memory_minimum_free_bytes: device_free[0],
         samples: samples.len(),
     })
+}
+
+fn clock_drift_message(kind: &str, minimum_mhz: u32, maximum_mhz: u32) -> String {
+    if let Some(lock) = CLOCK_LOCK_COMMAND {
+        format!(
+            "{kind} clock moved from {minimum_mhz} to {maximum_mhz} MHz\nlock target clocks before the run:\n  {lock}\nreset them afterward:\n  {CLOCK_RESET_COMMAND}"
+        )
+    } else {
+        format!(
+            "{kind} clock moved from {minimum_mhz} to {maximum_mhz} MHz\nthis target has no blessed clock-lock profile; use `{DIAGNOSTIC_CLOCK_ENV}=1` only for exploratory tuning"
+        )
+    }
 }
 
 fn diagnostic_clock_drift_allowed() -> bool {
@@ -1639,6 +1650,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "device")]
     fn clock_refusal_prints_lock_and_reset_commands() {
         let sample = |memory_clock_mhz| TelemetrySample {
             sm_clock_mhz: 2_200,
@@ -1664,6 +1676,27 @@ mod tests {
                 .expect("diagnostic runs retain drifting clock evidence");
         assert_eq!(evidence.memory_minimum_mhz, 13_801);
         assert_eq!(evidence.memory_maximum_mhz, 14_001);
+    }
+
+    #[test]
+    #[cfg(not(feature = "device"))]
+    fn unblessed_target_clock_refusal_is_explicitly_diagnostic() {
+        let sample = |memory_clock_mhz| TelemetrySample {
+            sm_clock_mhz: 2_200,
+            memory_clock_mhz,
+            temperature_celsius: 50,
+            power_watts: 220.0,
+            device_memory_used_mib: 100,
+            device_memory_free_mib: 900,
+        };
+        let error =
+            match telemetry_evidence(vec![sample(13_801), sample(14_001), sample(14_001)], false) {
+                Ok(_) => panic!("clock spread must be refused"),
+                Err(error) => error.to_string(),
+            };
+
+        assert!(error.contains("no blessed clock-lock profile"));
+        assert!(error.contains("TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT=1"));
     }
 
     #[test]

@@ -9,12 +9,22 @@ publish = false
 default = ["device"]
 engine = ["dep:tuisko-engine"]
 device = [
+    "residual-benchmark",
     "engine",
     "dep:tuisko-gpu",
     "dep:tuisko-kernels-sm120",
 ]
-sm89-residual = ["dep:tuisko-gpu", "dep:tuisko-kernels-sm89"]
-sm86-residual = ["dep:tuisko-gpu", "dep:tuisko-kernels-sm86"]
+residual-benchmark = []
+sm89-residual = [
+    "residual-benchmark",
+    "dep:tuisko-gpu",
+    "dep:tuisko-kernels-sm89",
+]
+sm86-residual = [
+    "residual-benchmark",
+    "dep:tuisko-gpu",
+    "dep:tuisko-kernels-sm86",
+]
 
 [dependencies]
 serde.workspace = true
@@ -32,7 +42,7 @@ tuisko-model.workspace = true
 [[bin]]
 name = "bench-device"
 path = "src/bin/bench_device.rs"
-required-features = ["device"]
+required-features = ["residual-benchmark"]
 
 [[bin]]
 name = "qualify-frontend"
