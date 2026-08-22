@@ -1,5 +1,7 @@
 //! Repository build and qualification gates.
 
+#[cfg(any(feature = "remote", test))]
+mod gpu_target;
 mod performance;
 mod remote;
 

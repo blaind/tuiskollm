@@ -4,11 +4,14 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::path::Path;
 
+#[cfg(any(feature = "remote", test))]
+use crate::gpu_target::GpuTarget;
+
 #[cfg(feature = "remote")]
 const USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
     <qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
-    bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|check|sweep> \
-    [--max-minutes N] [--image NAME] [--keep-on-fail] \
+    bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|probe|check|sweep> \
+    [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
     [--samples N] [--launches-per-sample N] [--energy-seconds N]";
 
 #[cfg(any(feature = "remote", test))]
@@ -62,6 +65,7 @@ impl Benchmark {
 
 #[cfg(any(feature = "remote", test))]
 struct RemoteOptions {
+    gpu: GpuTarget,
     max_minutes: u32,
     image: String,
     keep_on_fail: bool,
@@ -95,12 +99,39 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
         _ => {}
     }
 
+    if command == "probe" {
+        let options = parse_options(&arguments[1..], false)?;
+        tuisko_remote::check_credentials().map_err(|error| format!("{error}"))?;
+        tuisko_remote::run_probe(&tuisko_remote::ProbeOptions {
+            gpu: options.gpu.remote_gpu(),
+            image: options.image,
+            max_minutes: options.max_minutes,
+            keep_on_fail: options.keep_on_fail,
+        })
+        .map_err(|error| format!("{error}"))?;
+        return Ok(());
+    }
+
     let qualification = Qualification::parse(command);
     let benchmark = Benchmark::parse(command);
     if qualification.is_none() && benchmark.is_none() {
         return Err(USAGE.into());
     }
     let options = parse_options(&arguments[1..], benchmark.is_some())?;
+
+    let kernel_crate = options.gpu.kernel_crate().ok_or_else(|| {
+        format!(
+            "GPU {} ({}, compute capability {}, cuda-oxide {}) has no qualified kernel crate yet; use `remote probe --gpu {}` to test provisioning only",
+            options.gpu.key(),
+            options.gpu.device_name(),
+            options.gpu.compute_capability(),
+            options.gpu.oxide_arch(),
+            options.gpu.key(),
+        )
+    })?;
+    if kernel_crate != "tuisko-kernels-sm120" {
+        return Err(format!("unsupported kernel crate `{kernel_crate}`").into());
+    }
 
     tuisko_remote::check_credentials().map_err(|error| format!("{error}"))?;
     crate::build_sm120(root)?;
@@ -112,6 +143,7 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 suite: qualification.name.to_owned(),
                 executable: prepared.executable,
                 test_args: prepared.test_args,
+                gpu: options.gpu.remote_gpu(),
                 image: options.image,
                 max_minutes: options.max_minutes,
                 keep_on_fail: options.keep_on_fail,
@@ -127,6 +159,7 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 executable: prepared.executable,
                 benchmark_args: options.benchmark_args,
                 generator_baseline_sha256: prepared.generator_baseline_sha256,
+                gpu: options.gpu.remote_gpu(),
                 image: options.image,
                 max_minutes: options.max_minutes,
                 keep_on_fail: options.keep_on_fail,
@@ -141,6 +174,7 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
 #[cfg(any(feature = "remote", test))]
 fn parse_options(arguments: &[String], benchmark: bool) -> Result<RemoteOptions, Box<dyn Error>> {
     let mut options = RemoteOptions {
+        gpu: GpuTarget::Rtx5090,
         max_minutes: 30,
         image: tuisko_remote_default_image(),
         keep_on_fail: false,
@@ -150,6 +184,11 @@ fn parse_options(arguments: &[String], benchmark: bool) -> Result<RemoteOptions,
     while cursor < arguments.len() {
         let argument = arguments[cursor].as_str();
         match argument {
+            "--gpu" => {
+                cursor += 1;
+                options.gpu =
+                    GpuTarget::parse(arguments.get(cursor).ok_or("--gpu requires a value")?)?;
+            }
             "--max-minutes" => {
                 cursor += 1;
                 options.max_minutes = arguments
@@ -233,6 +272,7 @@ fn run_impl(_root: &Path, _arguments: &[String]) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{Benchmark, Qualification, parse_options};
+    use crate::gpu_target::GpuTarget;
 
     #[test]
     fn remote_suite_inventory_is_exact() {
@@ -255,5 +295,17 @@ mod tests {
         assert!(parse_options(&["--samples".to_owned(), "3".to_owned()], true).is_ok());
         assert!(parse_options(&["--samples".to_owned(), "2".to_owned()], true).is_err());
         assert!(parse_options(&["--samples".to_owned(), "3".to_owned()], false).is_err());
+    }
+
+    #[test]
+    fn gpu_target_is_explicit_and_defaults_to_the_product_target() {
+        assert_eq!(parse_options(&[], false).unwrap().gpu, GpuTarget::Rtx5090);
+        assert_eq!(
+            parse_options(&["--gpu".to_owned(), "4090".to_owned()], false)
+                .unwrap()
+                .gpu,
+            GpuTarget::Rtx4090
+        );
+        assert!(parse_options(&["--gpu".to_owned(), "A100".to_owned()], false).is_err());
     }
 }

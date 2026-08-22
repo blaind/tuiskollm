@@ -56,11 +56,22 @@ pub enum RemoteError {
         source: ureq::Error,
     },
 
-    /// The pod never reached RUNNING within its startup budget.
-    #[error("pod did not reach RUNNING within {seconds}s")]
-    PodNotRunning {
+    /// The pod did not expose a direct SSH route within its startup budget.
+    #[error("pod status {status} did not expose direct SSH within {seconds}s")]
+    SshRouteUnavailable {
         /// Seconds waited.
         seconds: u64,
+        /// Last pod status returned by RunPod.
+        status: String,
+    },
+
+    /// The rented GPU did not match the requested target.
+    #[error("wrong remote GPU: expected {expected}, observed {observed}")]
+    WrongGpu {
+        /// Exact requested name and compute capability.
+        expected: String,
+        /// Exact identity reported by `nvidia-smi`.
+        observed: String,
     },
 
     /// Spawning a local process failed.
