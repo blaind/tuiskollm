@@ -73,6 +73,14 @@ This measures chat-template rendering, short and long prompt encoding, disabled/
 prompt-cache routes, batched decoding, and streaming decoding. Criterion output remains under
 ignored `target/criterion`; it is diagnostic until a checked host-baseline comparator is added.
 
+The complete BF16 vocabulary sampling routes are host-only too:
+
+```bash
+cargo bench --package tuisko-engine --bench sampling
+```
+
+This measures greedy and checkpoint-default top-k-20/top-p-0.95 selection over all 248,320 logits.
+
 `perf gate` cannot run before each suite has an explicit baseline. A baseline update is a reviewed
 source change; blessing one suite at a time keeps that diff independent, and the command never
 commits it.

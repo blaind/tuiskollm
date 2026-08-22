@@ -22,6 +22,9 @@ const IM_START_ID: u32 = 248_045;
 const IM_END_ID: u32 = 248_046;
 const END_OF_TEXT_ID: u32 = 248_044;
 const DEFAULT_EOS_IDS: [u32; 2] = [IM_END_ID, END_OF_TEXT_ID];
+const DEFAULT_TEMPERATURE: f32 = 1.0;
+const DEFAULT_TOP_P: f32 = 0.95;
+const DEFAULT_TOP_K: usize = 20;
 const PROMPT_BLOCK_START: &str = "<|im_start|>";
 
 /// One text message supplied to the checkpoint chat template.
@@ -78,6 +81,17 @@ pub struct PromptEncoding {
     pub fresh_bytes: usize,
 }
 
+/// Sampling defaults admitted from `generation_config.json`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GenerationDefaults {
+    /// Default softmax temperature.
+    pub temperature: f32,
+    /// Default nucleus probability.
+    pub top_p: f32,
+    /// Default top-k candidate count.
+    pub top_k: usize,
+}
+
 struct PromptPrefixEntry {
     rendered: String,
     token_ids: Vec<u32>,
@@ -95,6 +109,7 @@ pub struct TextFrontend {
     tokenizer: Tokenizer,
     template: String,
     stop_ids: [u32; 2],
+    generation_defaults: GenerationDefaults,
     byte_table: HashMap<char, u8>,
     special_decode_ids: HashSet<u32>,
     prompt_cache_capacity: usize,
@@ -142,6 +157,7 @@ impl TextFrontend {
         let generation_path = root.join(GENERATION_CONFIG_FILE);
         let generation = read_json(&generation_path)?;
         let stop_ids = parse_stop_ids(&generation)?;
+        let generation_defaults = parse_generation_defaults(&generation)?;
         let special_decode_ids = tokenizer
             .get_added_tokens_decoder()
             .iter()
@@ -152,6 +168,7 @@ impl TextFrontend {
             tokenizer,
             template,
             stop_ids,
+            generation_defaults,
             byte_table: byte_level_table(),
             special_decode_ids,
             prompt_cache_capacity: options.prompt_cache_capacity,
@@ -162,6 +179,11 @@ impl TextFrontend {
     /// Returns the pinned generation stop-token IDs.
     pub fn stop_ids(&self) -> &[u32] {
         &self.stop_ids
+    }
+
+    /// Returns the pinned sampling defaults.
+    pub const fn generation_defaults(&self) -> GenerationDefaults {
+        self.generation_defaults
     }
 
     /// Renders the checkpoint's text-only chat template.
@@ -601,12 +623,51 @@ fn parse_stop_ids(generation: &Value) -> FrontendResult<[u32; 2]> {
     Ok(stop_ids)
 }
 
+fn parse_generation_defaults(generation: &Value) -> FrontendResult<GenerationDefaults> {
+    let temperature = generation
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| {
+            FrontendError::Contract("generation_config.json `temperature` must be a number".into())
+        })? as f32;
+    let top_p = generation
+        .get("top_p")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| {
+            FrontendError::Contract("generation_config.json `top_p` must be a number".into())
+        })? as f32;
+    let top_k = generation
+        .get("top_k")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            FrontendError::Contract("generation_config.json `top_k` must be a usize".into())
+        })?;
+    let defaults = GenerationDefaults {
+        temperature,
+        top_p,
+        top_k,
+    };
+    let expected = GenerationDefaults {
+        temperature: DEFAULT_TEMPERATURE,
+        top_p: DEFAULT_TOP_P,
+        top_k: DEFAULT_TOP_K,
+    };
+    if defaults != expected {
+        return Err(FrontendError::Contract(format!(
+            "generation defaults {defaults:?} do not match {expected:?}"
+        )));
+    }
+
+    Ok(defaults)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CachedPrefix, ChatMessage, ChatTemplateOptions, FrontendErrorCode, PROMPT_BLOCK_START,
         PromptPrefixEntry, TextFrontend, best_cached_prefix, byte_level_table, common_prefix_bytes,
-        finish_pending, parse_stop_ids, push_stream_byte,
+        finish_pending, parse_generation_defaults, parse_stop_ids, push_stream_byte,
     };
     use serde_json::json;
     use std::collections::{HashSet, VecDeque};
@@ -706,6 +767,11 @@ mod tests {
             tokenizer: Tokenizer::new(model),
             template: String::new(),
             stop_ids: [3, 3],
+            generation_defaults: super::GenerationDefaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+            },
             byte_table,
             special_decode_ids: HashSet::from([3]),
             prompt_cache_capacity: 0,
@@ -731,6 +797,24 @@ mod tests {
         assert_eq!(common_prefix_bytes("abc", "abd"), 2);
         assert_eq!(common_prefix_bytes("abc北", "abc南"), 3);
         assert_eq!(common_prefix_bytes("🚀a", "🚀b"), 4);
+    }
+
+    #[test]
+    fn generation_defaults_are_exact() {
+        let exact = json!({"temperature": 1.0, "top_p": 0.95, "top_k": 20});
+        let defaults = parse_generation_defaults(&exact).unwrap();
+
+        assert_eq!(defaults.temperature, 1.0);
+        assert_eq!(defaults.top_p, 0.95);
+        assert_eq!(defaults.top_k, 20);
+
+        for changed in [
+            json!({"temperature": 0.8, "top_p": 0.95, "top_k": 20}),
+            json!({"temperature": 1.0, "top_p": 0.9, "top_k": 20}),
+            json!({"temperature": 1.0, "top_p": 0.95, "top_k": 40}),
+        ] {
+            assert!(parse_generation_defaults(&changed).is_err());
+        }
     }
 
     #[test]

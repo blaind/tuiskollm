@@ -14,6 +14,13 @@ tuisko-gpu.workspace = true
 tuisko-kernels-sm120.workspace = true
 tuisko-model.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "sampling"
+harness = false
+
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "allow"
