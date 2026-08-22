@@ -10,7 +10,7 @@ const WORDS_PER_LANE: usize = VALUES_PER_LANE / 4;
 const FP8_MAX: f32 = 448.0;
 
 #[inline(always)]
-unsafe fn load_u32x4_read_only(source: *const u32) -> (u32, u32, u32, u32) {
+pub(crate) unsafe fn load_u32x4_read_only(source: *const u32) -> (u32, u32, u32, u32) {
     let first: u32;
     let second: u32;
     let third: u32;
@@ -33,14 +33,14 @@ unsafe fn load_u32x4_read_only(source: *const u32) -> (u32, u32, u32, u32) {
 }
 
 #[inline(always)]
-fn e4m3x2_to_f32(packed: u16) -> (f32, f32) {
+pub(crate) fn e4m3x2_to_f32(packed: u16) -> (f32, f32) {
     let packed_f16 = convert::cvt_rn_f16x2_e4m3x2(packed);
 
     convert::cvt_f32x2_f16x2(packed_f16)
 }
 
 #[inline(always)]
-fn reduce_sum_lane_zero(mut value: f32) -> f32 {
+pub(crate) fn reduce_sum_lane_zero(mut value: f32) -> f32 {
     value += warp::shuffle_down_f32(value, 16);
     value += warp::shuffle_down_f32(value, 8);
     value += warp::shuffle_down_f32(value, 4);
