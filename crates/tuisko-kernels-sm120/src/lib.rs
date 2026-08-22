@@ -9,7 +9,7 @@ mod inventory;
 mod residual_norm;
 
 pub use arch::Sm120Arch;
-pub use attention::{ATTENTION_PAGE_SIZE, AttentionQkPrepareOp};
+pub use attention::{ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, PagedGqaOp};
 pub use fp8::{
     DenseFp8DownOp, DenseFp8SwiGluOp, FullAttentionQkvOp, GdnInputProjectionOp,
     GdnOutputProjectionOp, LmHeadOp,
