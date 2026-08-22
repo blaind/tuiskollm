@@ -3173,6 +3173,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuisko-serve"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tuisko-engine",
+ "tuisko-frontend",
+ "tuisko-model",
+]
+
+[[package]]
 name = "tuisko-targets"
 version = "0.1.0"
 
