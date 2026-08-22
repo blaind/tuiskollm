@@ -11,8 +11,9 @@ mod views;
 
 pub use bindings::{
     DenseFp8DownBindings, DenseFp8GateUpBindings, DenseFp8MlpBindings, FullAttentionPostBindings,
-    FullAttentionQkvBindings, GdnBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
-    Nvfp4MlpBindings, TextEndpointBindings, VisionBindings, VisionBlockBindings,
+    FullAttentionQkvBindings, GdnBindings, MtpBindings, NVFP4_MLP_LAYER_END, Nvfp4DownBindings,
+    Nvfp4GateUpBindings, Nvfp4MlpBindings, TextEndpointBindings, VisionBindings,
+    VisionBlockBindings,
 };
 pub use config::validate_config;
 pub use dtype::DType;

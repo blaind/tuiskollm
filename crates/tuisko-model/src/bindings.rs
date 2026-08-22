@@ -12,7 +12,8 @@ const LM_HEAD_SCALE: &str = "lm_head.weight_scale";
 const MTP_LAYER: usize = 0;
 
 // These are source-codec facts, not architecture geometry.
-pub(crate) const NVFP4_MLP_LAYER_END: usize = 56;
+/// Exclusive decoder-layer boundary for the checkpoint's packed NVFP4 MLP planes.
+pub const NVFP4_MLP_LAYER_END: usize = 56;
 const DENSE_FP8_MLP_LAYER_START: usize = NVFP4_MLP_LAYER_END;
 const NVFP4_GROUP_SIZE: usize = 16;
 const E2M1_VALUES_PER_BYTE: usize = 2;
