@@ -12,11 +12,13 @@ dense-FP8 MLP, complete layer-60 GDN, and final-norm plus LM-head owners. The re
 already shaped for future whole-model and serving cases, but those measurements do not exist until
 their production owners land.
 
-SM89 has separate remote-only diagnostic suites for the exact `[34816,5120]` NVFP4 gate/up and
-`[5120,17408]` down owners at `B=1..8`. They decode the admitted E2M1 words and swizzled E4M3 scales
-inside A16 kernels; neither creates a requantized weight artifact nor implies that the partial SM89
-inventory is a usable server. Their numerical and static-resource gates are authoritative, while
-their uncontrolled-clock RunPod timings are feasibility evidence only.
+SM89 has separate remote-only diagnostic suites for the exact `[34816,5120]` NVFP4 gate/up,
+`[5120,17408]` down, and dynamic-quantize FP8 `[14336,5120]` QKV owners at `B=1..8`. The NVFP4
+routes decode the admitted E2M1 words and swizzled E4M3 scales inside A16 kernels; none creates a
+requantized weight artifact or implies that the partial SM89 inventory is a usable server. The
+SM89 QKV inventory deliberately excludes the Blackwell T=16 specialization. These numerical and
+static-resource gates are authoritative, while their uncontrolled-clock RunPod timings are
+feasibility evidence only.
 
 The first RTX 4090 sweep measured 109.984 us / 849.45 logical GiB/s at `B=1` and 184.320 us /
 508.46 logical GiB/s at `B=8`, with observed SM clocks of 2,625--2,700 MHz and a 10,251 MHz memory
@@ -28,6 +30,11 @@ The first SM89 down sweep measured 46.304 us / 1,009.28 logical GiB/s at `B=1` a
 384.92 logical GiB/s at `B=8`, with fixed observed clocks of 2,775 MHz SM and 10,251 MHz memory.
 The route is a viable source-native leaf, but its falling multi-row bandwidth likewise leaves an
 Ada-specific reuse schedule open.
+
+The first SM89 QKV sweep measured 24.800 us / 2,759.35 logical GiB/s at `B=1` and 39.872 us /
+1,724.33 logical GiB/s at `B=8`, with fixed observed clocks of 2,520 MHz SM and 10,251 MHz memory.
+This admits the exact decode route and its graph topology; it is not evidence for the absent T=16
+prefill route or a complete SM89 attention owner.
 
 The corresponding RTX 3090 feasibility sweep measured 177.408 us / 526.62 logical GiB/s at `B=1`
 and 412.896 us / 226.98 logical GiB/s at `B=8`, with fixed observed clocks of 1,800 MHz SM and

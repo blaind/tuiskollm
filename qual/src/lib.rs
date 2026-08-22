@@ -30,11 +30,11 @@ mod fp8_gdn_input_benchmark;
 mod fp8_lm_head;
 #[cfg(feature = "device")]
 mod fp8_lm_head_benchmark;
-#[cfg(feature = "device")]
+#[cfg(any(feature = "device", feature = "sm89"))]
 mod fp8_projection_oracle;
-#[cfg(feature = "device")]
+#[cfg(any(feature = "device", feature = "sm89"))]
 mod fp8_qkv;
-#[cfg(feature = "device")]
+#[cfg(any(feature = "device", feature = "sm89"))]
 mod fp8_qkv_benchmark;
 #[cfg(feature = "device")]
 mod fp8_swiglu;
@@ -101,9 +101,9 @@ pub use fp8_gdn_input_benchmark::benchmark_fp8_gdn_input;
 pub use fp8_lm_head::{Fp8LmHeadQualification, Fp8LmHeadQualificationError, qualify_fp8_lm_head};
 #[cfg(feature = "device")]
 pub use fp8_lm_head_benchmark::benchmark_fp8_lm_head;
-#[cfg(feature = "device")]
+#[cfg(any(feature = "device", feature = "sm89"))]
 pub use fp8_qkv::{Fp8QkvQualification, Fp8QkvQualificationError, qualify_fp8_qkv};
-#[cfg(feature = "device")]
+#[cfg(any(feature = "device", feature = "sm89"))]
 pub use fp8_qkv_benchmark::benchmark_fp8_qkv;
 #[cfg(feature = "device")]
 pub use fp8_swiglu::{Fp8SwiGluQualification, Fp8SwiGluQualificationError, qualify_fp8_swiglu};

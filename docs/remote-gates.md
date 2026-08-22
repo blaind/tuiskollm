@@ -2,8 +2,9 @@
 
 `xtask remote` probes a selected GPU or runs a locally built qualification or benchmark executable
 on a fresh secure RunPod pod. RTX 5090 remains the default and the only GPU with a complete kernel
-inventory. RTX 4090 and RTX 3090 admit residual norm plus separate represented-weight NVFP4 A16
-feasibility routes. Other target/suite pairs reject before provisioning.
+inventory. RTX 4090 admits residual norm, represented-weight NVFP4 A16 feasibility routes, and FP8
+QKV decode; RTX 3090 admits residual norm and NVFP4 gate/up. Other target/suite pairs reject before
+provisioning.
 
 Remote benchmark reports are diagnostic. They record GPU identity, driver, clocks, telemetry,
 binary and resource hashes with `clock_policy: diagnostic_uncontrolled`. Baseline blessing rejects
@@ -41,6 +42,7 @@ cargo run -p xtask --features remote -- remote qualify-nvfp4-swiglu --gpu 4090
 cargo run -p xtask --features remote -- remote qualify-nvfp4-swiglu --gpu 3090
 cargo run -p xtask --features remote -- remote qualify-nvfp4-down --gpu 4090
 cargo run -p xtask --features remote -- remote qualify-fp8-qkv
+cargo run -p xtask --features remote -- remote qualify-fp8-qkv --gpu 4090
 cargo run -p xtask --features remote -- remote qualify-fp8-gdn-input
 cargo run -p xtask --features remote -- remote qualify-fp8-lm-head
 cargo run -p xtask --features remote -- remote bench-residual-norm
@@ -50,6 +52,7 @@ cargo run -p xtask --features remote -- remote bench-nvfp4-swiglu --gpu 4090
 cargo run -p xtask --features remote -- remote bench-nvfp4-swiglu --gpu 3090
 cargo run -p xtask --features remote -- remote bench-nvfp4-down --gpu 4090
 cargo run -p xtask --features remote -- remote bench-fp8-qkv
+cargo run -p xtask --features remote -- remote bench-fp8-qkv --gpu 4090
 cargo run -p xtask --features remote -- remote bench-fp8-gdn-input
 cargo run -p xtask --features remote -- remote bench-fp8-lm-head
 cargo run -p xtask --features remote -- remote sweep
@@ -74,10 +77,12 @@ without claiming comparability. The runner downloads `benchmark.out` plus `bench
 
 The residual-norm benchmark sweeps both route families at every exact `B=1..8` in one process.
 Non-SM120 NVFP4 benchmarks sweep their source-word-preserving A16 routes over the same exact
-batches; SM89 includes gate/up and down while SM86 includes gate/up only. Retune only the selected
-architecture crate, rerun its numerical gate, then compare diagnostic JSON from the same GPU
-target. SM89 and SM86 do not have blessed clock profiles yet, so their reports cannot become
-checked performance baselines until controlled-clock evidence is established.
+batches; SM89 includes gate/up and down while SM86 includes gate/up only. SM89 FP8 QKV also sweeps
+its dynamic-quantize decode routes at exact `B=1..8`; the Blackwell-only T=16 route is not part of
+the partial Ada inventory. Retune only the selected architecture crate, rerun its numerical gate,
+then compare diagnostic JSON from the same GPU target. SM89 and SM86 do not have blessed clock
+profiles yet, so their reports cannot become checked performance baselines until controlled-clock
+evidence is established.
 
 Each run:
 

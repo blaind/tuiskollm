@@ -1,3 +1,4 @@
+use crate::fp8::fp8_qkv_ptx_names;
 use crate::nvfp4::{nvfp4_down_ptx_names, nvfp4_swiglu_ptx_names};
 use crate::residual_norm::residual_norm_ptx_names;
 
@@ -7,6 +8,7 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .into_iter()
         .chain(nvfp4_swiglu_ptx_names())
         .chain(nvfp4_down_ptx_names())
+        .chain(fp8_qkv_ptx_names())
         .collect()
 }
 
@@ -20,7 +22,7 @@ mod tests {
         let names = kernel_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 32);
+        assert_eq!(names.len(), 41);
         assert_eq!(unique.len(), names.len());
     }
 }

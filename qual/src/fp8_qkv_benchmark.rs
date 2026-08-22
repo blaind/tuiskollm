@@ -6,20 +6,30 @@ use crate::device_benchmark::{
     OperationAccounting, RepeatedGraph, finish_report, generator_baseline_sha256, measure_cases,
     preflight, require_current_process_exclusive, warmup_launches,
 };
+use crate::target::{EXPECTED_COMPUTE_CAPABILITY, FullAttentionQkvOp};
 use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     GpuTimer,
 };
-use tuisko_kernels_sm120::FullAttentionQkvOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+#[cfg(feature = "device")]
 const MAX_ROWS: usize = 16;
+#[cfg(feature = "sm89")]
+const MAX_ROWS: usize = MAX_BATCH;
+#[cfg(feature = "device")]
 const EXACT_ROUTES: [usize; MAX_BATCH + 1] = [1, 2, 3, 4, 5, 6, 7, 8, 16];
+#[cfg(feature = "sm89")]
+const EXACT_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
+#[cfg(feature = "device")]
+const MAX_ROWS_DESCRIPTION: &str = "max_rows=16";
+#[cfg(feature = "sm89")]
+const MAX_ROWS_DESCRIPTION: &str = "max_rows=8";
 const ALIGNMENT: usize = 256;
 const INPUT_PATTERN: [f32; 8] = [0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625];
-const TOKEN_FACTORS: [f32; MAX_ROWS] = [
+const TOKEN_FACTORS: [f32; 16] = [
     1.0, 0.5, 0.25, 0.125, -1.0, -0.5, -0.25, -0.125, 0.75, -0.75, 0.375, -0.375, 0.1875, -0.1875,
     0.09375, -0.09375,
 ];
@@ -65,10 +75,13 @@ impl Session {
     fn new(repeated_operations: u64) -> Result<Self, DeviceBenchmarkError> {
         let context = CudaContext::new(0).map_err(GpuError::from)?;
         let capability = context.compute_capability().map_err(GpuError::from)?;
-        if capability != (12, 0) {
+        if capability != EXPECTED_COMPUTE_CAPABILITY {
             return Err(DeviceBenchmarkError::Precondition(format!(
-                "device zero has compute capability {}.{}, expected 12.0",
-                capability.0, capability.1
+                "device zero has compute capability {}.{}, expected {}.{}",
+                capability.0,
+                capability.1,
+                EXPECTED_COMPUTE_CAPABILITY.0,
+                EXPECTED_COMPUTE_CAPABILITY.1,
             )));
         }
 
@@ -263,7 +276,7 @@ fn logical_bytes(rows: usize) -> usize {
     activation + weights + output
 }
 
-/// Measures exact `B=1..=8` and `T=16` FP8 QKV routes with paired timings.
+/// Measures every admitted FP8 QKV route with paired timings.
 pub fn benchmark_fp8_qkv(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
@@ -283,7 +296,7 @@ pub fn benchmark_fp8_qkv(
         "fp8_qkv/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes,
-        "max_rows=16",
+        MAX_ROWS_DESCRIPTION,
     )?;
     memory.capture("after_setup")?;
     session.warm(warmup_launches)?;

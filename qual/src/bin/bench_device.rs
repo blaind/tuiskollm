@@ -4,6 +4,8 @@ use std::error::Error;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+#[cfg(any(feature = "device", feature = "sm89"))]
+use tuisko_qual::benchmark_fp8_qkv;
 #[cfg(feature = "sm89")]
 use tuisko_qual::benchmark_nvfp4_down;
 #[cfg(any(feature = "sm89", feature = "sm86"))]
@@ -12,8 +14,8 @@ use tuisko_qual::{DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_resid
 #[cfg(feature = "device")]
 use tuisko_qual::{
     benchmark_dense_fp8_gdn_layer, benchmark_dense_fp8_mlp, benchmark_fp8_down,
-    benchmark_fp8_gdn_input, benchmark_fp8_lm_head, benchmark_fp8_qkv, benchmark_fp8_swiglu,
-    benchmark_gdn_output, benchmark_gdn_prepare, benchmark_gdn_recurrence, benchmark_text_endpoint,
+    benchmark_fp8_gdn_input, benchmark_fp8_lm_head, benchmark_fp8_swiglu, benchmark_gdn_output,
+    benchmark_gdn_prepare, benchmark_gdn_recurrence, benchmark_text_endpoint,
 };
 
 fn main() -> ExitCode {
@@ -52,7 +54,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_nvfp4_down(options)?, json_path)
         }
-        #[cfg(feature = "device")]
+        #[cfg(any(feature = "device", feature = "sm89"))]
         "fp8-qkv" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_fp8_qkv(options)?, json_path)

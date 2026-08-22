@@ -12,6 +12,7 @@ pub(crate) trait BuildTargetProfile {
     fn residual_resource_baseline(self) -> &'static str;
     fn nvfp4_swiglu_resource_baseline(self) -> Option<&'static str>;
     fn nvfp4_down_resource_baseline(self) -> Option<&'static str>;
+    fn fp8_qkv_resource_baseline(self) -> Option<&'static str>;
 
     #[cfg(feature = "remote")]
     fn remote_gpu(self) -> tuisko_remote::GpuTarget;
@@ -78,6 +79,14 @@ impl BuildTargetProfile for GpuTarget {
         match self {
             Self::Sm89 => Some("qual/baselines/nvfp4-down-sm89.txt"),
             Self::Sm120 | Self::Sm86 => None,
+        }
+    }
+
+    fn fp8_qkv_resource_baseline(self) -> Option<&'static str> {
+        match self {
+            Self::Sm120 => Some("qual/baselines/fp8-qkv-sm120.txt"),
+            Self::Sm89 => Some("qual/baselines/fp8-qkv-sm89.txt"),
+            Self::Sm86 => None,
         }
     }
 
@@ -150,6 +159,14 @@ mod tests {
         assert_eq!(
             GpuTarget::ALL.map(BuildTargetProfile::nvfp4_down_resource_baseline),
             [None, Some("qual/baselines/nvfp4-down-sm89.txt"), None]
+        );
+        assert_eq!(
+            GpuTarget::ALL.map(BuildTargetProfile::fp8_qkv_resource_baseline),
+            [
+                Some("qual/baselines/fp8-qkv-sm120.txt"),
+                Some("qual/baselines/fp8-qkv-sm89.txt"),
+                None,
+            ]
         );
     }
 }

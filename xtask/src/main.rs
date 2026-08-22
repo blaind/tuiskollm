@@ -1188,6 +1188,9 @@ pub(crate) fn prepare_remote_benchmark(
         PerformanceSuite::Nvfp4Down => gpu
             .nvfp4_down_resource_baseline()
             .ok_or_else(|| format!("GPU {} has no NVFP4 down resource baseline", gpu.key()))?,
+        PerformanceSuite::Fp8Qkv => gpu
+            .fp8_qkv_resource_baseline()
+            .ok_or_else(|| format!("GPU {} has no FP8 QKV resource baseline", gpu.key()))?,
         _ => suite.resource_baseline(),
     };
 
@@ -1658,6 +1661,95 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         quantize_resource.shared,
         qkv_shared,
         qkv_t16_resource.shared,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+pub(crate) fn gate_fp8_qkv_sm89(root: &Path) -> Result<(), Box<dyn Error>> {
+    let gpu = gpu_target::GpuTarget::Sm89;
+    let baseline_path = gpu
+        .fp8_qkv_resource_baseline()
+        .ok_or("SM89 has no FP8 QKV resource baseline")?;
+    let baseline = parse_baseline(&fs::read_to_string(root.join(baseline_path))?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let ptx_path = root.join(gpu.ptx_path());
+    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; run the pinned SM89 release build first",
+            ptx_path.display()
+        )
+    })?;
+    let entries = parse_entries(&ptx);
+    let quantize = entries
+        .iter()
+        .filter(|entry| entry.name == "quantize_activation_e4m3")
+        .collect::<Vec<_>>();
+    let qkv = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("fp8_qkv_TID_"))
+        .collect::<Vec<_>>();
+    require_count("SM89 FP8 activation quantization", quantize.len(), 1)?;
+    require_count("SM89 FP8 QKV", qkv.len(), 8)?;
+
+    for entry in quantize.iter().chain(&qkv) {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let temporary = root.join("target/tmp");
+    fs::create_dir_all(&temporary)?;
+    let cubin = temporary.join("fp8-qkv-sm89-gate.cubin");
+    let ptxas = cuda_tool("ptxas");
+    require_success(
+        &ptxas,
+        &[
+            OsStr::new("-O3"),
+            OsStr::new("--gpu-name"),
+            OsStr::new(gpu.oxide_arch()),
+            ptx_path.as_os_str(),
+            OsStr::new("--output-file"),
+            cubin.as_os_str(),
+        ],
+    )?;
+    let cuobjdump = cuda_tool("cuobjdump");
+    let resources = require_success(
+        &cuobjdump,
+        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+    )?;
+    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let quantize_resource = resources
+        .get(quantize[0].name)
+        .ok_or("cuobjdump omitted SM89 FP8 activation quantization")?;
+    require_spill_free(quantize[0].name, quantize_resource)?;
+    require_registers(
+        &baseline,
+        "quantize_registers",
+        &[quantize_resource.registers],
+    )?;
+
+    let mut qkv_registers = Vec::new();
+    let mut qkv_shared = Vec::new();
+    for entry in qkv {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted SM89 FP8 QKV entry `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        qkv_registers.push(resource.registers);
+        qkv_shared.push(resource.shared);
+    }
+    qkv_registers.sort_unstable();
+    require_registers(&baseline, "qkv_registers", &qkv_registers)?;
+
+    println!(
+        "4090 FP8 QKV gate passed: 1 quantize + 8 decode entries, REG {} / {:?}, STACK:0 LOCAL:0, SHARED {} / {:?}",
+        quantize_resource.registers, qkv_registers, quantize_resource.shared, qkv_shared,
     );
     Ok(())
 }

@@ -185,7 +185,10 @@ fn target_supports(gpu: GpuTarget, command: &str) -> bool {
     has_full_kernel_inventory(gpu)
         || matches!(command, "qualify-residual-norm" | "bench-residual-norm")
         || matches!(gpu, GpuTarget::Sm89)
-            && matches!(command, "qualify-nvfp4-down" | "bench-nvfp4-down")
+            && matches!(
+                command,
+                "qualify-nvfp4-down" | "bench-nvfp4-down" | "qualify-fp8-qkv" | "bench-fp8-qkv"
+            )
         || matches!(gpu, GpuTarget::Sm89 | GpuTarget::Sm86)
             && matches!(command, "qualify-nvfp4-swiglu" | "bench-nvfp4-swiglu")
 }
@@ -196,6 +199,8 @@ fn gate_static_resources(root: &Path, gpu: GpuTarget, command: &str) -> Result<(
         crate::gate_nvfp4_swiglu_target(root, gpu)
     } else if command.contains("nvfp4-down") {
         crate::gate_nvfp4_down_target(root, gpu)
+    } else if command.contains("fp8-qkv") && gpu == GpuTarget::Sm89 {
+        crate::gate_fp8_qkv_sm89(root)
     } else {
         crate::gate_residual_norm_target(root, gpu)
     }
@@ -358,16 +363,18 @@ mod tests {
         for gpu in [GpuTarget::Sm89, GpuTarget::Sm86] {
             assert!(target_supports(gpu, "qualify-residual-norm"));
             assert!(target_supports(gpu, "bench-residual-norm"));
-            assert!(!target_supports(gpu, "qualify-fp8-qkv"));
-            assert!(!target_supports(gpu, "bench-fp8-qkv"));
         }
         assert!(target_supports(GpuTarget::Sm89, "qualify-nvfp4-swiglu"));
         assert!(target_supports(GpuTarget::Sm89, "bench-nvfp4-swiglu"));
         assert!(target_supports(GpuTarget::Sm89, "qualify-nvfp4-down"));
         assert!(target_supports(GpuTarget::Sm89, "bench-nvfp4-down"));
+        assert!(target_supports(GpuTarget::Sm89, "qualify-fp8-qkv"));
+        assert!(target_supports(GpuTarget::Sm89, "bench-fp8-qkv"));
         assert!(target_supports(GpuTarget::Sm86, "qualify-nvfp4-swiglu"));
         assert!(target_supports(GpuTarget::Sm86, "bench-nvfp4-swiglu"));
         assert!(!target_supports(GpuTarget::Sm86, "qualify-nvfp4-down"));
         assert!(!target_supports(GpuTarget::Sm86, "bench-nvfp4-down"));
+        assert!(!target_supports(GpuTarget::Sm86, "qualify-fp8-qkv"));
+        assert!(!target_supports(GpuTarget::Sm86, "bench-fp8-qkv"));
     }
 }
