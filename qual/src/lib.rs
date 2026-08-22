@@ -16,6 +16,8 @@ mod fp8_qkv;
 mod fp8_qkv_benchmark;
 mod fp8_swiglu;
 mod fp8_swiglu_benchmark;
+mod gdn_prepare;
+mod gdn_prepare_benchmark;
 mod residual_norm;
 mod residual_norm_benchmark;
 mod text_endpoint;
@@ -44,6 +46,8 @@ pub use fp8_qkv::{Fp8QkvQualification, Fp8QkvQualificationError, qualify_fp8_qkv
 pub use fp8_qkv_benchmark::benchmark_fp8_qkv;
 pub use fp8_swiglu::{Fp8SwiGluQualification, Fp8SwiGluQualificationError, qualify_fp8_swiglu};
 pub use fp8_swiglu_benchmark::benchmark_fp8_swiglu;
+pub use gdn_prepare::{GdnPrepareQualification, GdnPrepareQualificationError, qualify_gdn_prepare};
+pub use gdn_prepare_benchmark::benchmark_gdn_prepare;
 pub use residual_norm::{
     ResidualNormQualification, ResidualNormQualificationError, qualify_residual_norm,
 };
