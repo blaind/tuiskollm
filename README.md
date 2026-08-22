@@ -24,10 +24,10 @@ checkpoint command line have not landed yet.
 The optional `tuisko-llm` Python package exposes the admitted tokenizer and chat-template frontend.
 It does not claim an in-process inference API; see [`docs/python.md`](docs/python.md).
 
-`tuisko-engine` includes a checked host-side plan for the exact 64-layer resident text arena: all
-source-native weights, 48 GDN history/state pairs, 16 current 192-token-per-slot attention KV
-caches, endpoint weights, and one shared `B=1..8` workspace. The executable whole-model owner and
-its CUDA Graphs have not landed.
+`tuisko-engine` owns the exact 64-layer resident text program: all source-native weights, 48 GDN
+history/state pairs, 16 current 192-token-per-slot attention KV caches, endpoint weights, one shared
+workspace, and immutable whole-model CUDA Graphs for every `B=1..8` route. Server wiring has not
+landed.
 
 ## Current device slice
 
@@ -43,6 +43,7 @@ cargo run -p xtask -- qualify-fp8-lm-head
 cargo run -p xtask -- qualify-nvfp4-swiglu
 cargo run -p xtask -- qualify-nvfp4-down
 cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT
+cargo run -p xtask -- qualify-resident-model SNAPSHOT
 cargo run -p xtask -- perf smoke
 ```
 
