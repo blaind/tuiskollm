@@ -12,8 +12,9 @@ use crate::gpu_target::{GpuTarget, has_full_kernel_inventory};
 #[cfg(feature = "remote")]
 const USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
     <qualify-residual-norm|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
-    qualify-attention-qk-prepare|qualify-paged-gqa|bench-residual-norm|bench-nvfp4-swiglu|bench-nvfp4-down|bench-fp8-qkv|\
-    bench-fp8-gdn-input|bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|probe|check|sweep> \
+    qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|bench-residual-norm|bench-nvfp4-swiglu|\
+    bench-nvfp4-down|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|\
+    bench-attention-output|probe|check|sweep> \
     [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
     [--samples N] [--launches-per-sample N] [--energy-seconds N]";
 
@@ -35,6 +36,7 @@ impl Qualification {
             "qualify-fp8-lm-head" => "fp8_lm_head",
             "qualify-attention-qk-prepare" => "attention_qk_prepare::tests",
             "qualify-paged-gqa" => "paged_gqa::tests",
+            "qualify-attention-output" => "attention_output::tests",
             _ => return None,
         };
 
@@ -48,6 +50,7 @@ impl Qualification {
                 "qualify-fp8-lm-head" => "fp8-lm-head",
                 "qualify-attention-qk-prepare" => "attention-qk-prepare",
                 "qualify-paged-gqa" => "paged-gqa",
+                "qualify-attention-output" => "attention-output",
                 _ => unreachable!(),
             },
             filter,
@@ -72,6 +75,7 @@ impl Benchmark {
             "bench-fp8-lm-head" => crate::PerformanceSuite::Fp8LmHead,
             "bench-attention-qk-prepare" => crate::PerformanceSuite::AttentionQkPrepare,
             "bench-paged-gqa" => crate::PerformanceSuite::PagedGqa,
+            "bench-attention-output" => crate::PerformanceSuite::AttentionOutput,
             _ => return None,
         };
         Some(Self { suite })
@@ -333,6 +337,9 @@ mod tests {
         let paged = Qualification::parse("qualify-paged-gqa").expect("known suite");
         assert_eq!(paged.name, "paged-gqa");
         assert_eq!(paged.filter, "paged_gqa::tests");
+        let output = Qualification::parse("qualify-attention-output").expect("known suite");
+        assert_eq!(output.name, "attention-output");
+        assert_eq!(output.filter, "attention_output::tests");
         assert_eq!(
             Benchmark::parse("bench-fp8-qkv")
                 .expect("known benchmark")
@@ -353,6 +360,13 @@ mod tests {
                 .suite
                 .name(),
             "paged-gqa"
+        );
+        assert_eq!(
+            Benchmark::parse("bench-attention-output")
+                .expect("known benchmark")
+                .suite
+                .name(),
+            "attention-output"
         );
         assert!(Qualification::parse("bench-residual-norm").is_none());
         assert!(Benchmark::parse("perf").is_none());
