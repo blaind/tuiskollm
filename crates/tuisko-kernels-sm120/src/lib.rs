@@ -11,7 +11,7 @@ pub use arch::Sm120Arch;
 pub use fp8::{
     DenseFp8DownOp, DenseFp8SwiGluOp, FullAttentionQkvOp, GdnInputProjectionOp, LmHeadOp,
 };
-pub use gdn::GdnPrepareOp;
+pub use gdn::{GdnPrepareOp, GdnRecurrenceOp};
 pub use inventory::kernel_ptx_names;
 pub use residual_norm::ResidualNormOp;
 

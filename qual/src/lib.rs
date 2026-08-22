@@ -18,6 +18,8 @@ mod fp8_swiglu;
 mod fp8_swiglu_benchmark;
 mod gdn_prepare;
 mod gdn_prepare_benchmark;
+mod gdn_recurrence;
+mod gdn_recurrence_benchmark;
 mod residual_norm;
 mod residual_norm_benchmark;
 mod text_endpoint;
@@ -48,6 +50,10 @@ pub use fp8_swiglu::{Fp8SwiGluQualification, Fp8SwiGluQualificationError, qualif
 pub use fp8_swiglu_benchmark::benchmark_fp8_swiglu;
 pub use gdn_prepare::{GdnPrepareQualification, GdnPrepareQualificationError, qualify_gdn_prepare};
 pub use gdn_prepare_benchmark::benchmark_gdn_prepare;
+pub use gdn_recurrence::{
+    GdnRecurrenceQualification, GdnRecurrenceQualificationError, qualify_gdn_recurrence,
+};
+pub use gdn_recurrence_benchmark::benchmark_gdn_recurrence;
 pub use residual_norm::{
     ResidualNormQualification, ResidualNormQualificationError, qualify_residual_norm,
 };
