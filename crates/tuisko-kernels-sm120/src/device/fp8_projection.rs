@@ -126,8 +126,72 @@ pub(crate) unsafe fn quantize_activation<A: Arch>(
 }
 
 #[inline(always)]
+pub(crate) unsafe fn quantize_gdn_output_activation(
+    input: *const u32,
+    codes: *mut u16,
+    scale: *mut f32,
+    warp_maximum: *mut f32,
+) {
+    let threads = thread::blockDim_x() as usize;
+    let tid = thread::threadIdx_x() as usize;
+    let token = thread::blockIdx_x() as usize;
+    let lane = tid & 31;
+    let warp_index = tid >> 5;
+    let pairs = 6_144 / 2;
+    let input = unsafe { input.add(token * pairs) };
+    let codes = unsafe { codes.add(token * pairs) };
+    let scale = unsafe { scale.add(token) };
+    let mut maximum = 0.0f32;
+    let mut pair = tid;
+    while pair < pairs {
+        let (low, high) = convert::cvt_f32x2_bf16x2(unsafe { *input.add(pair) });
+        maximum = maximum.max(low.abs()).max(high.abs());
+        pair += threads;
+    }
+    maximum = warp::reduce_max_f32(maximum);
+    if lane == 0 {
+        unsafe { *warp_maximum.add(warp_index) = maximum };
+    }
+    thread::sync_threads();
+    if warp_index == 0 {
+        maximum = if lane < threads / 32 {
+            unsafe { *warp_maximum.add(lane) }
+        } else {
+            0.0
+        };
+        maximum = warp::reduce_max_f32(maximum);
+        if lane == 0 {
+            unsafe {
+                *scale = if maximum == 0.0 {
+                    1.0
+                } else {
+                    maximum / FP8_MAX
+                }
+            };
+        }
+    }
+    thread::sync_threads();
+    let represented_scale = unsafe { *scale };
+    pair = tid;
+    while pair < pairs {
+        let (low, high) = convert::cvt_f32x2_bf16x2(unsafe { *input.add(pair) });
+        unsafe {
+            *codes.add(pair) = convert::cvt_rn_satfinite_e4m3x2_f32(
+                float::div_rn_f32(low, represented_scale),
+                float::div_rn_f32(high, represented_scale),
+            );
+        }
+        pair += threads;
+    }
+}
+
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn fp8_projection<A: Arch, const TOKENS: usize, const WARPS: usize>(
+pub(crate) unsafe fn fp8_projection<
+    const INPUT_COLUMNS: usize,
+    const TOKENS: usize,
+    const WARPS: usize,
+>(
     activation_codes: *const u32,
     activation_scales: *const f32,
     weight_codes: *const u32,
@@ -138,7 +202,7 @@ pub(crate) unsafe fn fp8_projection<A: Arch, const TOKENS: usize, const WARPS: u
     let tid = thread::threadIdx_x() as usize;
     let lane = tid & 31;
     let first_row = (thread::blockIdx_x() as usize * WARPS + (tid >> 5)) * 2;
-    let words_per_row = A::HIDDEN / 4;
+    let words_per_row = INPUT_COLUMNS / 4;
     // SAFETY: the exact grid assigns this warp one complete adjacent row pair.
     let first_weight = unsafe { weight_codes.add(first_row * words_per_row) };
     // SAFETY: output rows are even and the row pair is within the admitted plane.
@@ -147,7 +211,7 @@ pub(crate) unsafe fn fp8_projection<A: Arch, const TOKENS: usize, const WARPS: u
     let mut second_sums = [0.0f32; TOKENS];
     let mut phase = 0usize;
 
-    while phase < A::HIDDEN / VALUES_PER_PHASE {
+    while phase < INPUT_COLUMNS / VALUES_PER_PHASE {
         let lane_offset = phase * (VALUES_PER_PHASE / 4) + lane * WORDS_PER_LANE;
         // SAFETY: every phase/lane fragment is 16-byte aligned and within one row.
         let first_weight_words = unsafe { load_u32x4_read_only(first_weight.add(lane_offset)) };

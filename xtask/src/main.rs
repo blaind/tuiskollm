@@ -20,6 +20,7 @@ const FP8_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/fp8-swiglu-sm120.txt"
 const FP8_DOWN_RESOURCE_BASELINE: &str = "qual/baselines/fp8-down-sm120.txt";
 const GDN_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-prepare-sm120.txt";
 const GDN_RECURRENCE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-recurrence-sm120.txt";
+const GDN_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/gdn-output-sm120.txt";
 const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
 const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
@@ -36,6 +37,7 @@ enum PerformanceSuite {
     Fp8Down,
     GdnPrepare,
     GdnRecurrence,
+    GdnOutput,
 }
 
 const PERFORMANCE_SUITES: [PerformanceSuite; 4] = [
@@ -56,6 +58,7 @@ impl PerformanceSuite {
             Self::Fp8Down => "fp8-down",
             Self::GdnPrepare => "gdn-prepare",
             Self::GdnRecurrence => "gdn-recurrence",
+            Self::GdnOutput => "gdn-output",
         }
     }
 
@@ -69,6 +72,7 @@ impl PerformanceSuite {
             Self::Fp8Down => FP8_DOWN_RESOURCE_BASELINE,
             Self::GdnPrepare => GDN_PREPARE_RESOURCE_BASELINE,
             Self::GdnRecurrence => GDN_RECURRENCE_RESOURCE_BASELINE,
+            Self::GdnOutput => GDN_OUTPUT_RESOURCE_BASELINE,
         }
     }
 
@@ -82,6 +86,7 @@ impl PerformanceSuite {
             Self::Fp8Down => "qual/baselines/fp8-down-sm120.json",
             Self::GdnPrepare => "qual/baselines/gdn-prepare-sm120.json",
             Self::GdnRecurrence => "qual/baselines/gdn-recurrence-sm120.json",
+            Self::GdnOutput => "qual/baselines/gdn-output-sm120.json",
         }
     }
 
@@ -95,6 +100,7 @@ impl PerformanceSuite {
             "fp8-down" => Ok(Self::Fp8Down),
             "gdn-prepare" => Ok(Self::GdnPrepare),
             "gdn-recurrence" => Ok(Self::GdnRecurrence),
+            "gdn-output" => Ok(Self::GdnOutput),
             _ => Err(format!("unknown performance suite `{value}`").into()),
         }
     }
@@ -109,6 +115,7 @@ impl PerformanceSuite {
             Self::Fp8Down => qualify_fp8_down(root),
             Self::GdnPrepare => qualify_gdn_prepare(root),
             Self::GdnRecurrence => qualify_gdn_recurrence(root),
+            Self::GdnOutput => qualify_gdn_output(root),
         }
     }
 }
@@ -117,7 +124,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-dense-fp8-mlp|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-gdn-prepare|bench-gdn-recurrence|bench-dense-fp8-mlp|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-gdn-prepare|gate-gdn-recurrence|perf>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-dense-fp8-mlp|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-dense-fp8-mlp|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|perf>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -135,6 +142,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-fp8-down") if remaining.is_empty() => qualify_fp8_down(root),
         Some("qualify-gdn-prepare") if remaining.is_empty() => qualify_gdn_prepare(root),
         Some("qualify-gdn-recurrence") if remaining.is_empty() => qualify_gdn_recurrence(root),
+        Some("qualify-gdn-output") if remaining.is_empty() => qualify_gdn_output(root),
         Some("qualify-dense-fp8-mlp") => qualify_dense_fp8_mlp(root, &remaining),
         Some("qualify-text-endpoint") => qualify_text_endpoint(root, &remaining),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
@@ -145,6 +153,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-fp8-down") => bench_fp8_down(root, &remaining),
         Some("bench-gdn-prepare") => bench_gdn_prepare(root, &remaining),
         Some("bench-gdn-recurrence") => bench_gdn_recurrence(root, &remaining),
+        Some("bench-gdn-output") => bench_gdn_output(root, &remaining),
         Some("bench-dense-fp8-mlp") => bench_dense_fp8_mlp(root, &remaining),
         Some("bench-text-endpoint") => bench_text_endpoint(root, &remaining),
         Some("gate-residual-norm") if remaining.is_empty() => gate_residual_norm(root),
@@ -155,6 +164,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("gate-fp8-down") if remaining.is_empty() => gate_fp8_down(root),
         Some("gate-gdn-prepare") if remaining.is_empty() => gate_gdn_prepare(root),
         Some("gate-gdn-recurrence") if remaining.is_empty() => gate_gdn_recurrence(root),
+        Some("gate-gdn-output") if remaining.is_empty() => gate_gdn_output(root),
         Some("perf") => perf(root, &remaining),
         Some(known)
             if matches!(
@@ -169,6 +179,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-fp8-down"
                     | "qualify-gdn-prepare"
                     | "qualify-gdn-recurrence"
+                    | "qualify-gdn-output"
                     | "gate-residual-norm"
                     | "gate-fp8-qkv"
                     | "gate-fp8-gdn-input"
@@ -177,6 +188,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "gate-fp8-down"
                     | "gate-gdn-prepare"
                     | "gate-gdn-recurrence"
+                    | "gate-gdn-output"
             ) =>
         {
             Err(format!("`{known}` takes no arguments").into())
@@ -268,7 +280,8 @@ fn build_sm120(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_fp8_swiglu(root)?;
     gate_fp8_down(root)?;
     gate_gdn_prepare(root)?;
-    gate_gdn_recurrence(root)
+    gate_gdn_recurrence(root)?;
+    gate_gdn_output(root)
 }
 
 fn qualify_frontend(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
@@ -463,6 +476,31 @@ fn qualify_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_gdn_recurrence(root)
 }
 
+fn qualify_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "gdn_output::tests",
+            "--include-ignored",
+            "--nocapture",
+        ],
+    )?;
+    gate_gdn_output(root)
+}
+
 fn qualify_dense_fp8_mlp(
     root: &Path,
     arguments: &[std::ffi::OsString],
@@ -619,6 +657,10 @@ fn bench_gdn_recurrence(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     bench_suite(root, PerformanceSuite::GdnRecurrence, arguments)
+}
+
+fn bench_gdn_output(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    bench_suite(root, PerformanceSuite::GdnOutput, arguments)
 }
 
 fn bench_dense_fp8_mlp(
@@ -1612,6 +1654,85 @@ fn gate_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
     println!(
         "GDN recurrence gate passed: 8 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
         registers, shared
+    );
+    Ok(())
+}
+
+fn gate_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(GDN_OUTPUT_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path)?;
+    let entries = parse_entries(&ptx);
+    let quantize = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("gdn_output_quantize"))
+        .collect::<Vec<_>>();
+    let projection = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("gdn_output_projection_TID_"))
+        .collect::<Vec<_>>();
+    require_count("GDN output quantization", quantize.len(), 1)?;
+    require_count("GDN output projection", projection.len(), 8)?;
+    for entry in quantize.iter().chain(&projection) {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    let temporary = root.join("target/tmp");
+    fs::create_dir_all(&temporary)?;
+    let cubin = temporary.join("gdn-output-gate.cubin");
+    let ptxas = cuda_tool("ptxas");
+    require_success(
+        &ptxas,
+        &[
+            OsStr::new("-O3"),
+            OsStr::new("--gpu-name"),
+            OsStr::new("sm_120a"),
+            ptx_path.as_os_str(),
+            OsStr::new("--output-file"),
+            cubin.as_os_str(),
+        ],
+    )?;
+    let cuobjdump = cuda_tool("cuobjdump");
+    let resources = require_success(
+        &cuobjdump,
+        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+    )?;
+    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let quantize_resource = resources
+        .get(quantize[0].name)
+        .ok_or("cuobjdump omitted GDN output quantization")?;
+    require_spill_free(quantize[0].name, quantize_resource)?;
+    require_registers(
+        &baseline,
+        "quantize_registers",
+        &[quantize_resource.registers],
+    )?;
+    let mut projection_registers = Vec::new();
+    let mut projection_shared = Vec::new();
+    for entry in projection {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        projection_registers.push(resource.registers);
+        projection_shared.push(resource.shared);
+    }
+    projection_registers.sort_unstable();
+    require_registers(&baseline, "projection_registers", &projection_registers)?;
+    println!(
+        "GDN output gate passed: 1 quantize + 8 projection entries, REG {} / {:?}, STACK:0 LOCAL:0, SHARED {} / {:?}",
+        quantize_resource.registers,
+        projection_registers,
+        quantize_resource.shared,
+        projection_shared,
     );
     Ok(())
 }

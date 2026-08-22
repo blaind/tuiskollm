@@ -106,7 +106,7 @@ mod kernels {
     ) {
         // SAFETY: the prepared exact-B grid covers every QKV row pair once.
         unsafe {
-            fp8_projection::<A, TOKENS, DECODE_PROJECTION_WARPS>(
+            fp8_projection::<5_120, TOKENS, DECODE_PROJECTION_WARPS>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
@@ -136,7 +136,7 @@ mod kernels {
     ) {
         // SAFETY: the prepared exact-B grid covers every GDN input row pair once.
         unsafe {
-            fp8_projection::<A, TOKENS, DECODE_PROJECTION_WARPS>(
+            fp8_projection::<5_120, TOKENS, DECODE_PROJECTION_WARPS>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
@@ -166,7 +166,7 @@ mod kernels {
     ) {
         // SAFETY: the prepared exact-B grid covers every vocabulary row pair once.
         unsafe {
-            fp8_projection::<A, TOKENS, DECODE_PROJECTION_WARPS>(
+            fp8_projection::<5_120, TOKENS, DECODE_PROJECTION_WARPS>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
