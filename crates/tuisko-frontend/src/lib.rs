@@ -29,6 +29,7 @@ const PROMPT_BLOCK_START: &str = "<|im_start|>";
 
 /// One text message supplied to the checkpoint chat template.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     /// Template role such as `system`, `user`, or `assistant`.
     pub role: String,
@@ -48,6 +49,7 @@ pub struct ChatMessage {
 
 /// One OpenAI-compatible function call in conversation history.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatToolCall {
     /// Optional transport identity for this call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,6 +63,7 @@ pub struct ChatToolCall {
 
 /// Function name and arguments carried by one historical tool call.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatFunctionCall {
     /// Function name exposed to the model.
     pub name: String,
@@ -129,6 +132,8 @@ struct WireChatContentPart {
     kind: String,
     #[serde(default)]
     text: Option<String>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 fn deserialize_chat_content<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -150,6 +155,11 @@ where
                     return Err(D::Error::custom(format!(
                         "unsupported chat content part `{}`; {detail}",
                         part.kind
+                    )));
+                }
+                if let Some(field) = part.extra.keys().next() {
+                    return Err(D::Error::custom(format!(
+                        "unsupported text content field `{field}`"
                     )));
                 }
                 text.push_str(
