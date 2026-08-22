@@ -50,7 +50,10 @@ cargo run -p xtask --features remote -- remote sweep
 ```
 
 Qualification accepts `--max-minutes N`, `--image NAME`, and `--keep-on-fail`. The last option
-retains a failed, billable pod until `remote sweep` or manual deletion.
+retains a failed, billable pod until a sweep from the creating worktree or manual deletion.
+`remote sweep` immediately deletes pod IDs recorded under the current worktree's `target/` and may
+also delete another worktree's pod only after its encoded run budget plus five-minute cleanup grace
+has expired. It does not infer staleness from the shared `tuiskollm-gate` prefix.
 
 All provisioning commands accept `--gpu 5090|4090|3090`. Non-SM120 targets currently admit only
 residual-norm qualification and diagnostic benchmarking; their remaining operator inventories are

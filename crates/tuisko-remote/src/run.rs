@@ -1,5 +1,6 @@
 //! Lifecycle for one remote executable.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use crate::{GpuTarget, RemoteError, RemoteResult};
 
 const PROVISIONING_DEADLINE: Duration = Duration::from_secs(240);
 const SENTRY_GRACE: Duration = Duration::from_secs(300);
+const OWNED_POD_SUFFIX: &str = ".pod";
 
 /// Inputs for one prebuilt qualification run.
 pub struct QualificationOptions {
@@ -66,14 +68,16 @@ pub struct ProbeOptions {
 
 struct PodGuard {
     pod_id: String,
+    ownership_path: PathBuf,
     keep_on_fail: bool,
     failed: bool,
 }
 
 impl PodGuard {
-    fn new(pod_id: String, keep_on_fail: bool) -> Self {
+    fn new(pod_id: String, ownership_path: PathBuf, keep_on_fail: bool) -> Self {
         Self {
             pod_id,
+            ownership_path,
             keep_on_fail,
             failed: false,
         }
@@ -90,11 +94,14 @@ impl Drop for PodGuard {
             }
             return;
         }
-        if let Err(error) = delete_pod(&self.pod_id) {
-            eprintln!(
-                "warning: pod {} was not deleted ({error}); the watchdog will retry",
-                self.pod_id
-            );
+        match delete_pod(&self.pod_id) {
+            Ok(()) => forget_owned_pod(&self.ownership_path),
+            Err(error) => {
+                eprintln!(
+                    "warning: pod {} was not deleted ({error}); the watchdog will retry",
+                    self.pod_id
+                );
+            }
         }
     }
 }
@@ -319,35 +326,65 @@ pub fn run_benchmark(workspace_root: &Path, options: &BenchmarkOptions) -> Remot
     finish_run(&api, guard, &pod_id, status, started, cost_per_hour)
 }
 
-/// Verifies API authentication and reports stale remote-runner pods.
+/// Verifies API authentication and reports pods owned by this worktree.
 pub fn check() -> RemoteResult<()> {
     let pods = V2::new(resolve_api_key()?).list_pods()?;
-    let stale = pods
+    let owned_ids = owned_pod_ids()?;
+    let now = unix_seconds();
+    let owned = pods
         .iter()
-        .filter(|pod| pod.name.as_deref().is_some_and(is_gate_name))
+        .filter(|pod| {
+            pod.id
+                .as_deref()
+                .is_some_and(|pod_id| owned_ids.contains(pod_id))
+        })
         .collect::<Vec<_>>();
-    for pod in &stale {
+    let expired = pods
+        .iter()
+        .filter(|pod| {
+            pod.name
+                .as_deref()
+                .is_some_and(|name| lease_expired(name, now))
+        })
+        .collect::<Vec<_>>();
+    for pod in &owned {
         println!(
-            "stale remote-runner pod: {} ({:?})",
+            "current-worktree remote pod: {} ({:?})",
+            pod.id.as_deref().unwrap_or("missing-id"),
+            pod.status
+        );
+    }
+    for pod in &expired {
+        println!(
+            "expired remote lease: {} ({:?})",
             pod.id.as_deref().unwrap_or("missing-id"),
             pod.status
         );
     }
     println!(
-        "RunPod API reachable; auth ok: {} pod(s), {} stale remote-runner pod(s)",
+        "RunPod API reachable; auth ok: {} account pod(s), {} owned by this worktree, {} expired lease(s)",
         pods.len(),
-        stale.len()
+        owned.len(),
+        expired.len()
     );
 
     Ok(())
 }
 
-/// Deletes every pod owned by this remote runner.
+/// Deletes pods recorded as owned by this worktree.
 pub fn sweep_stale() -> RemoteResult<u32> {
     let api = V2::new(resolve_api_key()?);
-    let mut swept = 0u32;
+    let now = unix_seconds();
+    let mut targets = owned_pod_ids()?
+        .into_iter()
+        .map(|pod_id| (pod_id, "current-worktree ownership"))
+        .collect::<BTreeMap<_, _>>();
     for pod in api.list_pods()? {
-        if !pod.name.as_deref().is_some_and(is_gate_name) {
+        if !pod
+            .name
+            .as_deref()
+            .is_some_and(|name| lease_expired(name, now))
+        {
             continue;
         }
         let pod_id = pod
@@ -356,14 +393,19 @@ pub fn sweep_stale() -> RemoteResult<u32> {
             .ok_or_else(|| RemoteError::Api {
                 operation: "list pods",
                 status: 0,
-                body: "remote-runner pod is missing its id".to_owned(),
+                body: "expired remote lease is missing its pod id".to_owned(),
             })?;
-        api.delete_pod(&pod_id)?;
+        targets.entry(pod_id).or_insert("expired lease");
+    }
+    let mut swept = 0u32;
+    for (pod_id, reason) in targets {
+        delete_pod(&pod_id)?;
+        forget_owned_pod(&owned_pod_path(&pod_id)?);
         std::fs::remove_file(crate::sentry::keep_file_path(&pod_id)).ok();
-        println!("deleted stale remote-runner pod {pod_id}");
+        println!("deleted remote pod {pod_id} ({reason})");
         swept += 1;
     }
-    println!("swept {swept} stale remote-runner pod(s)");
+    println!("swept {swept} owned or expired remote pod(s)");
 
     Ok(swept)
 }
@@ -377,7 +419,8 @@ fn open_pod(
     budget: Duration,
     deadline: Instant,
 ) -> RemoteResult<(PodGuard, Ssh, String, Option<f64>)> {
-    let name = format!("{POD_NAME_PREFIX}-{}", unix_seconds());
+    let ownership_directory = ownership_directory()?;
+    let name = leased_pod_name(unix_seconds(), budget, keep_on_fail);
     println!("creating {name} (1x secure {})", gpu.device_name());
     let pod = api.create_gate_pod(&name, image, gpu)?;
     let pod_id = pod
@@ -389,7 +432,9 @@ fn open_pod(
             body: "response is missing a pod id".to_owned(),
         })?;
     let cost = pod.extras.get("cost").and_then(serde_json::Value::as_f64);
-    let guard = PodGuard::new(pod_id.clone(), keep_on_fail);
+    let ownership_path = ownership_directory.join(format!("{pod_id}{OWNED_POD_SUFFIX}"));
+    let guard = PodGuard::new(pod_id.clone(), ownership_path.clone(), keep_on_fail);
+    record_owned_pod(&ownership_path)?;
     match spawn_sentry(&pod_id, (budget + SENTRY_GRACE).as_secs()) {
         Ok(pid) => println!("watchdog {pid} guards pod {pod_id}"),
         Err(error) => eprintln!("warning: watchdog did not start ({error})"),
@@ -595,8 +640,90 @@ fn sha256_hex(path: &Path) -> RemoteResult<String> {
         .collect())
 }
 
-fn is_gate_name(name: &str) -> bool {
-    name == POD_NAME_PREFIX || name.starts_with(&format!("{POD_NAME_PREFIX}-"))
+fn ownership_directory() -> RemoteResult<PathBuf> {
+    let current = std::env::current_dir().map_err(|source| RemoteError::Read {
+        what: "current worktree directory".to_owned(),
+        source,
+    })?;
+    Ok(current.join("target/remote-state/pods"))
+}
+
+fn owned_pod_path(pod_id: &str) -> RemoteResult<PathBuf> {
+    Ok(ownership_directory()?.join(format!("{pod_id}{OWNED_POD_SUFFIX}")))
+}
+
+fn record_owned_pod(path: &Path) -> RemoteResult<()> {
+    let directory = path
+        .parent()
+        .expect("owned pod records always have a parent directory");
+    std::fs::create_dir_all(directory).map_err(|source| RemoteError::Write {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    std::fs::write(path, b"owned by this worktree\n").map_err(|source| RemoteError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn forget_owned_pod(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "warning: could not remove remote ownership record {}: {error}",
+            path.display()
+        );
+    }
+}
+
+fn owned_pod_ids() -> RemoteResult<BTreeSet<String>> {
+    let directory = ownership_directory()?;
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(source) => {
+            return Err(RemoteError::Read {
+                what: format!("remote ownership directory {}", directory.display()),
+                source,
+            });
+        }
+    };
+    let mut pod_ids = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| RemoteError::Read {
+            what: format!("remote ownership directory {}", directory.display()),
+            source,
+        })?;
+        if let Some(pod_id) = owned_pod_id(&entry.file_name()) {
+            pod_ids.insert(pod_id);
+        }
+    }
+    Ok(pod_ids)
+}
+
+fn owned_pod_id(file_name: &std::ffi::OsStr) -> Option<String> {
+    let name = file_name.to_str()?;
+    let pod_id = name.strip_suffix(OWNED_POD_SUFFIX)?;
+    (!pod_id.is_empty()).then(|| pod_id.to_owned())
+}
+
+fn leased_pod_name(now: u64, budget: Duration, keep_on_fail: bool) -> String {
+    if keep_on_fail {
+        return format!("{POD_NAME_PREFIX}-retained-{now}");
+    }
+    let expires = now
+        .saturating_add(budget.as_secs())
+        .saturating_add(SENTRY_GRACE.as_secs());
+    format!("{POD_NAME_PREFIX}-lease-{expires}-{now}")
+}
+
+fn lease_expired(name: &str, now: u64) -> bool {
+    let Some(lease) = name.strip_prefix(&format!("{POD_NAME_PREFIX}-lease-")) else {
+        return false;
+    };
+    let expires = lease.split_once('-').map_or(lease, |(expires, _)| expires);
+    expires.parse::<u64>().is_ok_and(|expires| expires <= now)
 }
 
 fn unix_seconds() -> u64 {
@@ -608,7 +735,12 @@ fn unix_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{benchmark_command, is_gate_name, qualification_command, sanitize_arguments};
+    use std::ffi::OsStr;
+
+    use super::{
+        benchmark_command, lease_expired, leased_pod_name, owned_pod_id, qualification_command,
+        sanitize_arguments,
+    };
 
     #[test]
     fn qualification_command_preserves_a_failure_after_printing_the_log() {
@@ -642,8 +774,24 @@ mod tests {
     }
 
     #[test]
-    fn stale_pod_match_does_not_accept_neighboring_names() {
-        assert!(is_gate_name("tuiskollm-gate-123"));
-        assert!(!is_gate_name("tuiskollm-gateway"));
+    fn sweep_inventory_accepts_only_explicit_ownership_records() {
+        assert_eq!(
+            owned_pod_id(OsStr::new("pod-from-this-worktree.pod")),
+            Some("pod-from-this-worktree".to_owned())
+        );
+        assert_eq!(owned_pod_id(OsStr::new("tuiskollm-gate-foreign")), None);
+        assert_eq!(owned_pod_id(OsStr::new(".pod")), None);
+    }
+
+    #[test]
+    fn account_wide_sweep_obeys_declared_leases() {
+        let leased = leased_pod_name(1_000, std::time::Duration::from_secs(600), false);
+        assert!(!lease_expired(&leased, 1_899));
+        assert!(lease_expired(&leased, 1_900));
+
+        let retained = leased_pod_name(1_000, std::time::Duration::from_secs(600), true);
+        assert!(!lease_expired(&retained, u64::MAX));
+        assert!(!lease_expired("tuiskollm-gate-1000", u64::MAX));
+        assert!(!lease_expired("tuiskollm-gateway-lease-1", u64::MAX));
     }
 }
