@@ -4,21 +4,27 @@ use crate::fp8_projection_oracle::{
     BF16_SENTINEL, BYTE_SENTINEL, F32_SENTINEL_BITS, Observed, SCALE_VALUES, TokenOracle,
     WEIGHT_CODES, WEIGHT_VALUES, bf16_to_f32, f32_to_bf16, quantize_oracle,
 };
+use crate::target::{EXPECTED_COMPUTE_CAPABILITY, FullAttentionQkvOp};
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
 };
-use tuisko_kernels_sm120::FullAttentionQkvOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+#[cfg(feature = "device")]
 const MAX_ROWS: usize = 16;
+#[cfg(feature = "sm89")]
+const MAX_ROWS: usize = MAX_BATCH;
+#[cfg(feature = "device")]
 const EXACT_ROUTES: [usize; MAX_BATCH + 1] = [1, 2, 3, 4, 5, 6, 7, 8, 16];
+#[cfg(feature = "sm89")]
+const EXACT_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
 const ALIGNMENT: usize = 256;
 const INPUT_PATTERN: [f32; 16] = [
     0.875, -0.875, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0625, -0.0625, 0.03125, -0.03125, 0.0,
     0.5, -0.25, 0.125,
 ];
-const TOKEN_FACTORS: [f32; MAX_ROWS] = [
+const TOKEN_FACTORS: [f32; 16] = [
     1.0, 0.5, 0.25, 0.125, -1.0, -0.5, -0.25, -0.125, 0.75, -0.75, 0.375, -0.375, 0.1875, -0.1875,
     0.09375, -0.09375,
 ];
@@ -66,10 +72,13 @@ struct Regions {
 pub fn qualify_fp8_qkv() -> Result<Fp8QkvQualification, Fp8QkvQualificationError> {
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
-    if capability != (12, 0) {
+    if capability != EXPECTED_COMPUTE_CAPABILITY {
         return Err(Fp8QkvQualificationError::Mismatch(format!(
-            "device zero has compute capability {}.{}, expected 12.0",
-            capability.0, capability.1
+            "device zero has compute capability {}.{}, expected {}.{}",
+            capability.0,
+            capability.1,
+            EXPECTED_COMPUTE_CAPABILITY.0,
+            EXPECTED_COMPUTE_CAPABILITY.1,
         )));
     }
 
@@ -393,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
+    #[ignore = "requires the selected NVIDIA device target"]
     fn exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), Fp8QkvQualificationError> {
         let report = qualify_fp8_qkv()?;

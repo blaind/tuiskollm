@@ -30,11 +30,11 @@ mod fp8_gdn_input_benchmark;
 mod fp8_lm_head;
 #[cfg(feature = "device")]
 mod fp8_lm_head_benchmark;
-#[cfg(feature = "device")]
+#[cfg(any(feature = "device", feature = "sm89"))]
 mod fp8_projection_oracle;
-#[cfg(feature = "device")]
+#[cfg(any(feature = "device", feature = "sm89"))]
 mod fp8_qkv;
-#[cfg(feature = "device")]
+#[cfg(any(feature = "device", feature = "sm89"))]
 mod fp8_qkv_benchmark;
 #[cfg(feature = "device")]
 mod fp8_swiglu;
@@ -52,6 +52,10 @@ mod gdn_prepare_benchmark;
 mod gdn_recurrence;
 #[cfg(feature = "device")]
 mod gdn_recurrence_benchmark;
+#[cfg(feature = "sm89")]
+mod nvfp4_down;
+#[cfg(feature = "sm89")]
+mod nvfp4_down_benchmark;
 #[cfg(any(feature = "sm89", feature = "sm86"))]
 mod nvfp4_swiglu;
 #[cfg(any(feature = "sm89", feature = "sm86"))]
@@ -97,9 +101,9 @@ pub use fp8_gdn_input_benchmark::benchmark_fp8_gdn_input;
 pub use fp8_lm_head::{Fp8LmHeadQualification, Fp8LmHeadQualificationError, qualify_fp8_lm_head};
 #[cfg(feature = "device")]
 pub use fp8_lm_head_benchmark::benchmark_fp8_lm_head;
-#[cfg(feature = "device")]
+#[cfg(any(feature = "device", feature = "sm89"))]
 pub use fp8_qkv::{Fp8QkvQualification, Fp8QkvQualificationError, qualify_fp8_qkv};
-#[cfg(feature = "device")]
+#[cfg(any(feature = "device", feature = "sm89"))]
 pub use fp8_qkv_benchmark::benchmark_fp8_qkv;
 #[cfg(feature = "device")]
 pub use fp8_swiglu::{Fp8SwiGluQualification, Fp8SwiGluQualificationError, qualify_fp8_swiglu};
@@ -119,6 +123,10 @@ pub use gdn_recurrence::{
 };
 #[cfg(feature = "device")]
 pub use gdn_recurrence_benchmark::benchmark_gdn_recurrence;
+#[cfg(feature = "sm89")]
+pub use nvfp4_down::{Nvfp4DownQualification, Nvfp4DownQualificationError, qualify_nvfp4_down};
+#[cfg(feature = "sm89")]
+pub use nvfp4_down_benchmark::benchmark_nvfp4_down;
 #[cfg(any(feature = "sm89", feature = "sm86"))]
 pub use nvfp4_swiglu::{
     Nvfp4SwiGluQualification, Nvfp4SwiGluQualificationError, qualify_nvfp4_swiglu,

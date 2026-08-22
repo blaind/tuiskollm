@@ -1,13 +1,16 @@
 //! Exact-target SM89 operator kernels and their prepared host launchers.
 
 mod arch;
+mod device;
+mod fp8;
 mod inventory;
 mod nvfp4;
 mod residual_norm;
 
 pub use arch::Sm89Arch;
+pub use fp8::FullAttentionQkvOp;
 pub use inventory::kernel_ptx_names;
-pub use nvfp4::Nvfp4SwiGluOp;
+pub use nvfp4::{Nvfp4DownOp, Nvfp4SwiGluOp};
 pub use residual_norm::ResidualNormOp;
 
 #[cfg(test)]

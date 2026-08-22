@@ -1,4 +1,4 @@
-//! Paired timings for the exact FP8 QKV graph routes.
+//! Paired timings for every exact portable NVFP4 A16 down projection route.
 
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
@@ -6,7 +6,7 @@ use crate::device_benchmark::{
     OperationAccounting, RepeatedGraph, finish_report, generator_baseline_sha256, measure_cases,
     preflight, require_current_process_exclusive, warmup_launches,
 };
-use crate::target::{EXPECTED_COMPUTE_CAPABILITY, FullAttentionQkvOp};
+use crate::target::{EXPECTED_COMPUTE_CAPABILITY, Nvfp4DownOp};
 use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
@@ -15,56 +15,44 @@ use tuisko_gpu::{
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
-#[cfg(feature = "device")]
-const MAX_ROWS: usize = 16;
-#[cfg(feature = "sm89")]
-const MAX_ROWS: usize = MAX_BATCH;
-#[cfg(feature = "device")]
-const EXACT_ROUTES: [usize; MAX_BATCH + 1] = [1, 2, 3, 4, 5, 6, 7, 8, 16];
-#[cfg(feature = "sm89")]
-const EXACT_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
-#[cfg(feature = "device")]
-const MAX_ROWS_DESCRIPTION: &str = "max_rows=16";
-#[cfg(feature = "sm89")]
-const MAX_ROWS_DESCRIPTION: &str = "max_rows=8";
 const ALIGNMENT: usize = 256;
-const INPUT_PATTERN: [f32; 8] = [0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625];
-const TOKEN_FACTORS: [f32; 16] = [
-    1.0, 0.5, 0.25, 0.125, -1.0, -0.5, -0.25, -0.125, 0.75, -0.75, 0.375, -0.375, 0.1875, -0.1875,
-    0.09375, -0.09375,
+const INPUT_COLUMNS: usize = Qwen38_27B::INTERMEDIATE;
+const OUTPUT_ROWS: usize = Qwen38_27B::HIDDEN;
+const GROUP: usize = 16;
+const GROUPS_PER_ROW: usize = INPUT_COLUMNS / GROUP;
+const CODE_BYTES_PER_ROW: usize = INPUT_COLUMNS / 2;
+const WEIGHT_SCALE_DIVISOR: f32 = 0.125;
+const INPUT_PATTERN: [f32; GROUP] = [
+    0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0, 0.5,
+    -0.5,
 ];
-const WEIGHT_CODES: [u8; 4] = [0x38, 0xb0, 0x30, 0x28];
-const SCALE_VALUES: [f32; 4] = [1.0, 0.5, 0.25, 2.0];
+const TOKEN_FACTORS: [f32; MAX_BATCH] = [1.0, 0.5, 0.25, 0.125, 1.0, 0.5, 0.25, 0.125];
 
 #[derive(Clone, Copy)]
 struct Regions {
     input: ArenaRegion<u16>,
-    activation_codes: ArenaRegion<u8>,
-    activation_scales: ArenaRegion<f32>,
     weight_codes: ArenaRegion<u8>,
-    weight_scales: ArenaRegion<u16>,
+    weight_scales: ArenaRegion<u8>,
     output: ArenaRegion<u16>,
 }
 
 struct RouteGraphs {
-    rows: usize,
+    batch: usize,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
 
 struct Addresses {
     input: *const u16,
-    activation_codes: *mut u8,
-    activation_scales: *mut f32,
     weight_codes: *const u8,
-    weight_scales: *const u16,
+    weight_scales: *const u8,
     output: *mut u16,
 }
 
 struct Session {
     routes: Vec<RouteGraphs>,
     timer: GpuTimer,
-    _op: FullAttentionQkvOp,
+    _op: Nvfp4DownOp,
     arena: DeviceArena,
     regions: Regions,
     stream: Arc<CudaStream>,
@@ -93,30 +81,27 @@ impl Session {
         arena.copy_from_host(&stream, regions.weight_scales, &make_weight_scales())?;
         stream.synchronize().map_err(GpuError::from)?;
 
-        let op = FullAttentionQkvOp::new(&context)?;
+        let op = Nvfp4DownOp::new(&context)?;
         let addresses = Addresses {
             input: arena.address(regions.input)?,
-            activation_codes: arena.address(regions.activation_codes)?,
-            activation_scales: arena.address(regions.activation_scales)?,
             weight_codes: arena.address(regions.weight_codes)?,
             weight_scales: arena.address(regions.weight_scales)?,
             output: arena.address(regions.output)?,
         };
-        let mut routes = Vec::with_capacity(EXACT_ROUTES.len());
-        for rows in EXACT_ROUTES {
+        let mut routes = Vec::with_capacity(MAX_BATCH);
+        for batch in 1..=MAX_BATCH {
             routes.push(capture_route(
                 &op,
                 &stream,
                 &addresses,
-                rows,
+                batch,
                 repeated_operations,
             )?);
         }
-        let timer = GpuTimer::new(&context)?;
 
         Ok(Self {
             routes,
-            timer,
+            timer: GpuTimer::new(&context)?,
             _op: op,
             arena,
             regions,
@@ -139,22 +124,15 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
-                let (shape, workload) = if route.rows <= MAX_BATCH {
-                    (
-                        format!("B={}", route.rows),
-                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
-                    )
-                } else {
-                    (
-                        format!("T={}", route.rows),
-                        BenchmarkWorkload::warm_operator_mtp(route.rows as u64),
-                    )
-                };
                 ExactDeviceCase::new(
-                    "fp8_qkv/quantize_projection",
-                    shape,
-                    workload,
-                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
+                    "nvfp4_down/a16",
+                    format!("B={}", route.batch),
+                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
+                    OperationAccounting::new(
+                        logical_bytes(route.batch),
+                        route.batch as u64,
+                        "token",
+                    ),
                     &route.leaf,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 )
@@ -168,22 +146,16 @@ impl Session {
 }
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
-    let hidden = Qwen38_27B::HIDDEN;
-    let rows = Qwen38_27B::ATTENTION_QKV_ROWS;
     let mut layout = ArenaLayout::new();
-    let input = layout.reserve(MAX_ROWS * hidden, ALIGNMENT)?;
-    let activation_codes = layout.reserve(MAX_ROWS * hidden, ALIGNMENT)?;
-    let activation_scales = layout.reserve(MAX_ROWS, ALIGNMENT)?;
-    let weight_codes = layout.reserve(rows * hidden, ALIGNMENT)?;
-    let weight_scales = layout.reserve(rows, ALIGNMENT)?;
-    let output = layout.reserve(MAX_ROWS * rows, ALIGNMENT)?;
+    let input = layout.reserve(MAX_BATCH * INPUT_COLUMNS, ALIGNMENT)?;
+    let weight_codes = layout.reserve(OUTPUT_ROWS * CODE_BYTES_PER_ROW, ALIGNMENT)?;
+    let weight_scales = layout.reserve(OUTPUT_ROWS * GROUPS_PER_ROW, ALIGNMENT)?;
+    let output = layout.reserve(MAX_BATCH * OUTPUT_ROWS, ALIGNMENT)?;
 
     Ok((
         layout,
         Regions {
             input,
-            activation_codes,
-            activation_scales,
             weight_codes,
             weight_scales,
             output,
@@ -192,92 +164,135 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
 }
 
 fn make_input() -> Vec<u16> {
-    (0..MAX_ROWS * Qwen38_27B::HIDDEN)
+    (0..MAX_BATCH * INPUT_COLUMNS)
         .map(|index| {
-            let token = index / Qwen38_27B::HIDDEN;
-            f32_to_bf16(INPUT_PATTERN[index & 7] * TOKEN_FACTORS[token])
+            let token = index / INPUT_COLUMNS;
+            f32_to_bf16(INPUT_PATTERN[index & (GROUP - 1)] * TOKEN_FACTORS[token])
         })
         .collect()
 }
 
 fn make_weight_codes() -> Vec<u8> {
-    let rows = Qwen38_27B::ATTENTION_QKV_ROWS;
-    let mut codes = vec![0; rows * Qwen38_27B::HIDDEN];
-    for (row, values) in codes
-        .as_mut_slice()
-        .as_chunks_mut::<{ Qwen38_27B::HIDDEN }>()
-        .0
-        .iter_mut()
-        .enumerate()
-    {
-        values.fill(WEIGHT_CODES[row & 3]);
+    const BASE: [u8; 8] = [0xf7, 0xd5, 0xb3, 0x70, 0x5f, 0x3d, 0x0b, 0xf7];
+    const SPARSE: [u8; 8] = [0x01, 0, 0, 0, 0, 0, 0, 0];
+    let negative = BASE.map(|byte| byte ^ 0x88);
+    let mut codes = vec![0u8; OUTPUT_ROWS * CODE_BYTES_PER_ROW];
+
+    for row in 0..OUTPUT_ROWS {
+        let base_is_base = row & 1 == 0;
+        let base = if base_is_base { &BASE } else { &negative };
+        let exceptional = if base_is_base { &SPARSE } else { &BASE };
+        let exceptional_group = exceptional_group(row);
+        for group in 0..GROUPS_PER_ROW {
+            let begin = row * CODE_BYTES_PER_ROW + group * (GROUP / 2);
+            let pattern = if group == exceptional_group {
+                exceptional
+            } else {
+                base
+            };
+            codes[begin..begin + GROUP / 2].copy_from_slice(pattern);
+        }
     }
 
     codes
 }
 
-fn make_weight_scales() -> Vec<u16> {
-    (0..Qwen38_27B::ATTENTION_QKV_ROWS)
-        .map(|row| f32_to_bf16(SCALE_VALUES[row & 3]))
-        .collect()
+fn make_weight_scales() -> Vec<u8> {
+    const SCALE_CODES: [u8; 4] = [0x38, 0x01, 0x40, 0x01];
+    let mut scales = vec![0u8; OUTPUT_ROWS * GROUPS_PER_ROW];
+
+    for row in 0..OUTPUT_ROWS {
+        for group in 0..GROUPS_PER_ROW {
+            let scale_index = if group == exceptional_group(row) {
+                (row + 1) & 3
+            } else {
+                row & 3
+            };
+            scales[scale_offset(row, group)] = SCALE_CODES[scale_index];
+        }
+    }
+
+    scales
+}
+
+fn scale_offset(row: usize, group: usize) -> usize {
+    let tile = row / 128;
+    let row_in_tile = row & 127;
+    let scale_tile = group / 4;
+    let scale_lane = group & 3;
+    let row_mod32 = row_in_tile & 31;
+    let row_quartile = row_in_tile >> 5;
+
+    (tile * (GROUPS_PER_ROW / 4) + scale_tile) * 512
+        + row_mod32 * 16
+        + row_quartile * 4
+        + scale_lane
+}
+
+fn exceptional_group(row: usize) -> usize {
+    (row * 17 + row / 128 * 13) % GROUPS_PER_ROW
 }
 
 fn capture_route(
-    op: &FullAttentionQkvOp,
+    op: &Nvfp4DownOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    rows: usize,
+    batch: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, batch))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, rows)?;
+            launch(op, stream, addresses, batch)?;
         }
 
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        rows,
+        batch,
         leaf,
         repeated,
     })
 }
 
 fn launch(
-    op: &FullAttentionQkvOp,
+    op: &Nvfp4DownOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    rows: usize,
+    batch: usize,
 ) -> GpuResult<()> {
-    // SAFETY: every pointer names its complete, aligned, maximum-row arena region.
+    // SAFETY: every pointer names its complete, aligned maximum-batch region.
     unsafe {
         op.launch(
             stream,
-            rows,
+            batch,
             addresses.input,
-            addresses.activation_codes,
-            addresses.activation_scales,
             addresses.weight_codes,
             addresses.weight_scales,
+            WEIGHT_SCALE_DIVISOR,
             addresses.output,
         )
     }
 }
 
-fn logical_bytes(rows: usize) -> usize {
-    let hidden = Qwen38_27B::HIDDEN;
-    let output_rows = Qwen38_27B::ATTENTION_QKV_ROWS;
-    let activation = rows * (2 * hidden + 2 * hidden + 2 * size_of::<f32>());
-    let weights = output_rows * hidden + output_rows * size_of::<u16>();
-    let output = rows * output_rows * size_of::<u16>();
+fn logical_bytes(batch: usize) -> usize {
+    let weights = OUTPUT_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
+    let input = batch * INPUT_COLUMNS * size_of::<u16>();
+    let output = batch * OUTPUT_ROWS * size_of::<u16>();
 
-    activation + weights + output
+    weights + input + output
 }
 
-/// Measures every admitted FP8 QKV route with paired timings.
-pub fn benchmark_fp8_qkv(
+fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+
+    (rounded >> 16) as u16
+}
+
+/// Measures every exact-target NVFP4 down projection route with paired timings.
+pub fn benchmark_nvfp4_down(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
     let baseline_sha256 = generator_baseline_sha256()?;
@@ -287,16 +302,16 @@ pub fn benchmark_fp8_qkv(
     let session = Session::new(options.launches_per_sample)?;
     let weight_bytes = session.weight_bytes();
     memory.register_owned(
-        "fp8_qkv/weights",
+        "nvfp4_down/weights",
         BenchmarkMemoryKind::Weights,
         weight_bytes,
-        "source-native fused QKV",
+        "packed down weights plus swizzled block scales",
     )?;
     memory.register_owned(
-        "fp8_qkv/address_stable_workspace",
+        "nvfp4_down/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes,
-        MAX_ROWS_DESCRIPTION,
+        "max_batch=8",
     )?;
     memory.capture("after_setup")?;
     session.warm(warmup_launches)?;
@@ -309,9 +324,9 @@ pub fn benchmark_fp8_qkv(
 
     finish_report(
         BenchmarkReportSpec {
-            suite: "bench-fp8-qkv",
+            suite: "bench-nvfp4-down",
             classification: "performance_sensitive_leaf",
-            timing_scope: "paired Rust submission/completion, repeated production graph, and repeated-operation graph",
+            timing_scope: "paired Rust submission/completion, repeated leaf graph, and repeated-operation graph",
         },
         preflight,
         baseline_sha256,
@@ -323,26 +338,18 @@ pub fn benchmark_fp8_qkv(
     )
 }
 
-fn f32_to_bf16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-
-    (rounded >> 16) as u16
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, MAX_ROWS, logical_bytes};
-    use tuisko_model::{Arch, Qwen38_27B};
+    use super::{
+        CODE_BYTES_PER_ROW, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_BATCH, OUTPUT_ROWS, logical_bytes,
+    };
 
     #[test]
-    fn byte_accounting_covers_the_complete_quantize_projection_path() {
-        let weights = Qwen38_27B::ATTENTION_QKV_ROWS * (Qwen38_27B::HIDDEN + size_of::<u16>());
-        let per_token =
-            4 * Qwen38_27B::HIDDEN + 2 * size_of::<f32>() + 2 * Qwen38_27B::ATTENTION_QKV_ROWS;
+    fn byte_accounting_covers_the_complete_a16_path() {
+        let weights = OUTPUT_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
+        let b8 = weights
+            + MAX_BATCH * (INPUT_COLUMNS * size_of::<u16>() + OUTPUT_ROWS * size_of::<u16>());
 
-        assert_eq!(logical_bytes(1), weights + per_token);
-        assert_eq!(logical_bytes(MAX_BATCH), weights + MAX_BATCH * per_token);
-        assert_eq!(logical_bytes(MAX_ROWS), weights + MAX_ROWS * per_token);
+        assert_eq!(logical_bytes(MAX_BATCH), b8);
     }
 }
