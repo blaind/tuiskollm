@@ -32,6 +32,7 @@ cargo run -p xtask -- qualify-residual-norm
 cargo run -p xtask -- qualify-fp8-qkv
 cargo run -p xtask -- qualify-fp8-gdn-input
 cargo run -p xtask -- qualify-fp8-lm-head
+cargo run -p xtask -- qualify-nvfp4-swiglu
 cargo run -p xtask -- perf smoke
 ```
 

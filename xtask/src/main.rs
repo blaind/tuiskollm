@@ -21,8 +21,8 @@ const FP8_GDN_INPUT_RESOURCE_BASELINE: &str = "qual/baselines/fp8-gdn-input-sm12
 const FP8_LM_HEAD_RESOURCE_BASELINE: &str = "qual/baselines/fp8-lm-head-sm120.txt";
 const FP8_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/fp8-swiglu-sm120.txt";
 const FP8_DOWN_RESOURCE_BASELINE: &str = "qual/baselines/fp8-down-sm120.txt";
-const NVFP4_SWIGLU_SM89_RESOURCE_BASELINE: &str = "qual/baselines/nvfp4-swiglu-sm89.txt";
 const NVFP4_DOWN_SM89_RESOURCE_BASELINE: &str = "qual/baselines/nvfp4-down-sm89.txt";
+const NVFP4_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/nvfp4-swiglu-sm120.txt";
 const GDN_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-prepare-sm120.txt";
 const GDN_RECURRENCE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-recurrence-sm120.txt";
 const GDN_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/gdn-output-sm120.txt";
@@ -44,23 +44,24 @@ pub(crate) enum PerformanceSuite {
     Fp8LmHead,
     Fp8SwiGlu,
     Fp8Down,
+    Nvfp4SwiGlu,
     GdnPrepare,
     GdnRecurrence,
     GdnOutput,
-    Nvfp4SwiGlu,
     Nvfp4Down,
     AttentionQkPrepare,
     PagedGqa,
     AttentionOutput,
 }
 
-const PERFORMANCE_SUITES: [PerformanceSuite; 12] = [
+const PERFORMANCE_SUITES: [PerformanceSuite; 13] = [
     PerformanceSuite::ResidualNorm,
     PerformanceSuite::Fp8Qkv,
     PerformanceSuite::Fp8GdnInput,
     PerformanceSuite::Fp8LmHead,
     PerformanceSuite::Fp8SwiGlu,
     PerformanceSuite::Fp8Down,
+    PerformanceSuite::Nvfp4SwiGlu,
     PerformanceSuite::GdnPrepare,
     PerformanceSuite::GdnRecurrence,
     PerformanceSuite::GdnOutput,
@@ -78,10 +79,10 @@ impl PerformanceSuite {
             Self::Fp8LmHead => "fp8-lm-head",
             Self::Fp8SwiGlu => "fp8-swiglu",
             Self::Fp8Down => "fp8-down",
+            Self::Nvfp4SwiGlu => "nvfp4-swiglu",
             Self::GdnPrepare => "gdn-prepare",
             Self::GdnRecurrence => "gdn-recurrence",
             Self::GdnOutput => "gdn-output",
-            Self::Nvfp4SwiGlu => "nvfp4-swiglu",
             Self::Nvfp4Down => "nvfp4-down",
             Self::AttentionQkPrepare => "attention-qk-prepare",
             Self::PagedGqa => "paged-gqa",
@@ -97,10 +98,10 @@ impl PerformanceSuite {
             Self::Fp8LmHead => FP8_LM_HEAD_RESOURCE_BASELINE,
             Self::Fp8SwiGlu => FP8_SWIGLU_RESOURCE_BASELINE,
             Self::Fp8Down => FP8_DOWN_RESOURCE_BASELINE,
+            Self::Nvfp4SwiGlu => NVFP4_SWIGLU_RESOURCE_BASELINE,
             Self::GdnPrepare => GDN_PREPARE_RESOURCE_BASELINE,
             Self::GdnRecurrence => GDN_RECURRENCE_RESOURCE_BASELINE,
             Self::GdnOutput => GDN_OUTPUT_RESOURCE_BASELINE,
-            Self::Nvfp4SwiGlu => NVFP4_SWIGLU_SM89_RESOURCE_BASELINE,
             Self::Nvfp4Down => NVFP4_DOWN_SM89_RESOURCE_BASELINE,
             Self::AttentionQkPrepare => ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
             Self::PagedGqa => PAGED_GQA_RESOURCE_BASELINE,
@@ -116,10 +117,10 @@ impl PerformanceSuite {
             Self::Fp8LmHead => "qual/baselines/fp8-lm-head-sm120.json",
             Self::Fp8SwiGlu => "qual/baselines/fp8-swiglu-sm120.json",
             Self::Fp8Down => "qual/baselines/fp8-down-sm120.json",
+            Self::Nvfp4SwiGlu => "qual/baselines/nvfp4-swiglu-sm120.json",
             Self::GdnPrepare => "qual/baselines/gdn-prepare-sm120.json",
             Self::GdnRecurrence => "qual/baselines/gdn-recurrence-sm120.json",
             Self::GdnOutput => "qual/baselines/gdn-output-sm120.json",
-            Self::Nvfp4SwiGlu => "qual/baselines/nvfp4-swiglu-sm89.json",
             Self::Nvfp4Down => "qual/baselines/nvfp4-down-sm89.json",
             Self::AttentionQkPrepare => "qual/baselines/attention-qk-prepare-sm120.json",
             Self::PagedGqa => "qual/baselines/paged-gqa-sm120.json",
@@ -135,10 +136,10 @@ impl PerformanceSuite {
             "fp8-lm-head" => Ok(Self::Fp8LmHead),
             "fp8-swiglu" => Ok(Self::Fp8SwiGlu),
             "fp8-down" => Ok(Self::Fp8Down),
+            "nvfp4-swiglu" => Ok(Self::Nvfp4SwiGlu),
             "gdn-prepare" => Ok(Self::GdnPrepare),
             "gdn-recurrence" => Ok(Self::GdnRecurrence),
             "gdn-output" => Ok(Self::GdnOutput),
-            "nvfp4-swiglu" => Ok(Self::Nvfp4SwiGlu),
             "nvfp4-down" => Ok(Self::Nvfp4Down),
             "attention-qk-prepare" => Ok(Self::AttentionQkPrepare),
             "paged-gqa" => Ok(Self::PagedGqa),
@@ -155,12 +156,9 @@ impl PerformanceSuite {
             Self::Fp8LmHead => qualify_fp8_lm_head(root),
             Self::Fp8SwiGlu => qualify_fp8_swiglu(root),
             Self::Fp8Down => qualify_fp8_down(root),
+            Self::Nvfp4SwiGlu => qualify_nvfp4_swiglu(root),
             Self::GdnPrepare => qualify_gdn_prepare(root),
             Self::GdnRecurrence => qualify_gdn_recurrence(root),
-            Self::Nvfp4SwiGlu => Err(
-                "non-SM120 NVFP4 qualification is available through `remote qualify-nvfp4-swiglu --gpu 4090|3090`"
-                    .into(),
-            ),
             Self::Nvfp4Down => Err(
                 "SM89 NVFP4 down qualification is available through `remote qualify-nvfp4-down --gpu 4090`"
                     .into(),
@@ -177,7 +175,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-attention-output|perf|remote>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-nvfp4-swiglu|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-nvfp4-swiglu|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-nvfp4-swiglu|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-attention-output|perf|remote>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -195,6 +193,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-fp8-lm-head") if remaining.is_empty() => qualify_fp8_lm_head(root),
         Some("qualify-fp8-swiglu") if remaining.is_empty() => qualify_fp8_swiglu(root),
         Some("qualify-fp8-down") if remaining.is_empty() => qualify_fp8_down(root),
+        Some("qualify-nvfp4-swiglu") if remaining.is_empty() => qualify_nvfp4_swiglu(root),
         Some("qualify-gdn-prepare") if remaining.is_empty() => qualify_gdn_prepare(root),
         Some("qualify-gdn-recurrence") if remaining.is_empty() => qualify_gdn_recurrence(root),
         Some("qualify-gdn-output") if remaining.is_empty() => qualify_gdn_output(root),
@@ -213,6 +212,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-fp8-lm-head") => bench_fp8_lm_head(root, &remaining),
         Some("bench-fp8-swiglu") => bench_fp8_swiglu(root, &remaining),
         Some("bench-fp8-down") => bench_fp8_down(root, &remaining),
+        Some("bench-nvfp4-swiglu") => bench_nvfp4_swiglu(root, &remaining),
         Some("bench-gdn-prepare") => bench_gdn_prepare(root, &remaining),
         Some("bench-gdn-recurrence") => bench_gdn_recurrence(root, &remaining),
         Some("bench-gdn-output") => bench_gdn_output(root, &remaining),
@@ -229,6 +229,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("gate-fp8-lm-head") if remaining.is_empty() => gate_fp8_lm_head(root),
         Some("gate-fp8-swiglu") if remaining.is_empty() => gate_fp8_swiglu(root),
         Some("gate-fp8-down") if remaining.is_empty() => gate_fp8_down(root),
+        Some("gate-nvfp4-swiglu") if remaining.is_empty() => gate_nvfp4_swiglu(root),
         Some("gate-gdn-prepare") if remaining.is_empty() => gate_gdn_prepare(root),
         Some("gate-gdn-recurrence") if remaining.is_empty() => gate_gdn_recurrence(root),
         Some("gate-gdn-output") if remaining.is_empty() => gate_gdn_output(root),
@@ -252,6 +253,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-fp8-lm-head"
                     | "qualify-fp8-swiglu"
                     | "qualify-fp8-down"
+                    | "qualify-nvfp4-swiglu"
                     | "qualify-gdn-prepare"
                     | "qualify-gdn-recurrence"
                     | "qualify-gdn-output"
@@ -264,6 +266,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "gate-fp8-lm-head"
                     | "gate-fp8-swiglu"
                     | "gate-fp8-down"
+                    | "gate-nvfp4-swiglu"
                     | "gate-gdn-prepare"
                     | "gate-gdn-recurrence"
                     | "gate-gdn-output"
@@ -360,6 +363,7 @@ fn build_sm120(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_fp8_lm_head(root)?;
     gate_fp8_swiglu(root)?;
     gate_fp8_down(root)?;
+    gate_nvfp4_swiglu(root)?;
     gate_gdn_prepare(root)?;
     gate_gdn_recurrence(root)?;
     gate_gdn_output(root)?;
@@ -587,6 +591,31 @@ fn qualify_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     gate_fp8_down(root)
+}
+
+fn qualify_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "nvfp4_swiglu",
+            "--include-ignored",
+            "--nocapture",
+        ],
+    )?;
+    gate_nvfp4_swiglu(root)
 }
 
 fn qualify_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -962,6 +991,10 @@ fn bench_fp8_down(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), B
     bench_suite(root, PerformanceSuite::Fp8Down, arguments)
 }
 
+fn bench_nvfp4_swiglu(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    bench_suite(root, PerformanceSuite::Nvfp4SwiGlu, arguments)
+}
+
 fn bench_gdn_prepare(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
     bench_suite(root, PerformanceSuite::GdnPrepare, arguments)
 }
@@ -1179,7 +1212,7 @@ fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
     if mode == "bless" {
         let [_, suite] = arguments else {
             return Err(
-                "usage: cargo run -p xtask -- perf bless <residual-norm|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|gdn-prepare|gdn-recurrence|gdn-output|attention-qk-prepare|paged-gqa|attention-output>"
+                "usage: cargo run -p xtask -- perf bless <residual-norm|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|nvfp4-swiglu|gdn-prepare|gdn-recurrence|gdn-output|attention-qk-prepare|paged-gqa|attention-output>"
                     .into(),
             );
         };
@@ -2325,6 +2358,169 @@ fn gate_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn gate_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(NVFP4_SWIGLU_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; run the pinned release device build first",
+            ptx_path.display()
+        )
+    })?;
+    let entries = parse_entries(&ptx);
+    let a16 = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("nvfp4_swiglu_a16_t"))
+        .collect::<Vec<_>>();
+    let quantize = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("nvfp4_quantize_TID_"))
+        .collect::<Vec<_>>();
+    let w4a4 = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("nvfp4_swiglu_w4a4_TID_"))
+        .collect::<Vec<_>>();
+    require_count("NVFP4 SwiGLU A16", a16.len(), 4)?;
+    require_count("NVFP4 activation quantization", quantize.len(), 5)?;
+    require_count("NVFP4 SwiGLU W4A4", w4a4.len(), 5)?;
+
+    for entry in &a16 {
+        let minimum_ctas = if entry.name == "nvfp4_swiglu_a16_t1" {
+            2
+        } else {
+            1
+        };
+        if !entry.body.contains(".reqntid 256, 1, 1")
+            || !entry
+                .body
+                .contains(&format!(".minnctapersm {minimum_ctas}"))
+        {
+            return Err(format!(
+                "entry `{}` lost its retained 256-thread/{minimum_ctas}-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in &quantize {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in &w4a4 {
+        if !entry.body.contains(".reqntid 384, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its retained 384-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        if !entry
+            .body
+            .contains("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X")
+        {
+            return Err(format!(
+                "entry `{}` lost its exact NVFP4 inline PTX instruction",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let temporary = root.join("target/tmp");
+    fs::create_dir_all(&temporary)?;
+    let cubin = temporary.join("nvfp4-swiglu-gate.cubin");
+    let ptxas = cuda_tool("ptxas");
+    require_success(
+        &ptxas,
+        &[
+            OsStr::new("-O3"),
+            OsStr::new("--gpu-name"),
+            OsStr::new("sm_120a"),
+            ptx_path.as_os_str(),
+            OsStr::new("--output-file"),
+            cubin.as_os_str(),
+        ],
+    )?;
+    let cuobjdump = cuda_tool("cuobjdump");
+    let resources = require_success(
+        &cuobjdump,
+        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+    )?;
+    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
+    let sass = String::from_utf8(sass.stdout)?;
+
+    let mut a16_registers = Vec::new();
+    let mut a16_shared = Vec::new();
+    for entry in a16 {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted NVFP4 A16 entry `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        a16_registers.push(resource.registers);
+        a16_shared.push(resource.shared);
+    }
+    a16_registers.sort_unstable();
+    a16_shared.sort_unstable();
+    require_registers(&baseline, "a16_registers", &a16_registers)?;
+    require_registers(&baseline, "a16_shared_bytes", &a16_shared)?;
+
+    let mut quantize_registers = Vec::new();
+    let mut quantize_shared = Vec::new();
+    for entry in quantize {
+        let resource = resources.get(entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted NVFP4 quantization entry `{}`",
+                entry.name
+            )
+        })?;
+        require_spill_free(entry.name, resource)?;
+        quantize_registers.push(resource.registers);
+        quantize_shared.push(resource.shared);
+    }
+    quantize_registers.sort_unstable();
+    require_registers(&baseline, "quantize_registers", &quantize_registers)?;
+    require_uniform_value(&baseline, "quantize_shared_bytes", &quantize_shared)?;
+
+    let mut w4a4_registers = Vec::new();
+    let mut w4a4_shared = Vec::new();
+    for entry in w4a4 {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted NVFP4 W4A4 entry `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(&sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted NVFP4 W4A4 SASS `{}`", entry.name))?;
+        if !body.contains("OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X") {
+            return Err(format!(
+                "entry `{}` lost native Blackwell NVFP4 MMA selection",
+                entry.name
+            )
+            .into());
+        }
+        w4a4_registers.push(resource.registers);
+        w4a4_shared.push(resource.shared);
+    }
+    w4a4_registers.sort_unstable();
+    require_registers(&baseline, "w4a4_registers", &w4a4_registers)?;
+    require_uniform_value(&baseline, "w4a4_shared_bytes", &w4a4_shared)?;
+
+    println!(
+        "NVFP4 SwiGLU gate passed: 4 A16 + 5 quantize + 5 W4A4 entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}",
+        a16_registers, quantize_registers, w4a4_registers, a16_shared, quantize_shared, w4a4_shared,
+    );
+    Ok(())
+}
+
 fn gate_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(
         root.join(GDN_PREPARE_RESOURCE_BASELINE),
@@ -3298,6 +3494,7 @@ mod tests {
                 "fp8-lm-head",
                 "fp8-swiglu",
                 "fp8-down",
+                "nvfp4-swiglu",
                 "gdn-prepare",
                 "gdn-recurrence",
                 "gdn-output",
