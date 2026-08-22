@@ -173,7 +173,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-nvfp4-swiglu|bench-nvfp4-down|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-nvfp4-swiglu|gate-nvfp4-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-attention-output|perf|remote>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-nvfp4-mlp|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-nvfp4-swiglu|gate-nvfp4-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-attention-output|perf|remote>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -193,6 +193,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-fp8-down") if remaining.is_empty() => qualify_fp8_down(root),
         Some("qualify-nvfp4-swiglu") if remaining.is_empty() => qualify_nvfp4_swiglu(root),
         Some("qualify-nvfp4-down") if remaining.is_empty() => qualify_nvfp4_down(root),
+        Some("qualify-nvfp4-mlp") => qualify_nvfp4_mlp(root, &remaining),
         Some("qualify-gdn-prepare") if remaining.is_empty() => qualify_gdn_prepare(root),
         Some("qualify-gdn-recurrence") if remaining.is_empty() => qualify_gdn_recurrence(root),
         Some("qualify-gdn-output") if remaining.is_empty() => qualify_gdn_output(root),
@@ -213,6 +214,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-fp8-down") => bench_fp8_down(root, &remaining),
         Some("bench-nvfp4-swiglu") => bench_nvfp4_swiglu(root, &remaining),
         Some("bench-nvfp4-down") => bench_nvfp4_down(root, &remaining),
+        Some("bench-nvfp4-mlp") => bench_nvfp4_mlp(root, &remaining),
         Some("bench-gdn-prepare") => bench_gdn_prepare(root, &remaining),
         Some("bench-gdn-recurrence") => bench_gdn_recurrence(root, &remaining),
         Some("bench-gdn-output") => bench_gdn_output(root, &remaining),
@@ -647,6 +649,37 @@ fn qualify_nvfp4_down(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_nvfp4_down(root)
 }
 
+fn qualify_nvfp4_mlp(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "nvfp4_mlp::tests::source_layer55_matches_complete_oracles_and_graph_replay",
+            "--include-ignored",
+            "--nocapture",
+        ],
+        Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_residual_norm(root)?;
+    gate_nvfp4_swiglu(root)?;
+    gate_nvfp4_down(root)
+}
+
 fn qualify_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
     run_oxide(
         root,
@@ -1026,6 +1059,33 @@ fn bench_nvfp4_swiglu(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(
 
 fn bench_nvfp4_down(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
     bench_suite(root, PerformanceSuite::Nvfp4Down, arguments)
+}
+
+fn bench_nvfp4_mlp(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err("usage: cargo run -p xtask -- bench-nvfp4-mlp SNAPSHOT [options]".into());
+    };
+    build_sm120(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = fs::read(root.join(RESIDUAL_NORM_RESOURCE_BASELINE))?;
+    baselines.extend_from_slice(&fs::read(root.join(NVFP4_SWIGLU_RESOURCE_BASELINE))?);
+    baselines.extend_from_slice(&fs::read(root.join(NVFP4_DOWN_RESOURCE_BASELINE))?);
+    run_visible(
+        Command::new(executable)
+            .arg("nvfp4-mlp")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
 }
 
 fn bench_gdn_prepare(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
@@ -1464,14 +1524,6 @@ pub(crate) fn prepare_remote_benchmark(
     gpu: gpu_target::GpuTarget,
     suite: PerformanceSuite,
 ) -> Result<RemoteBenchmark, Box<dyn Error>> {
-    let built = root
-        .join(gpu.oxide_build_target())
-        .join("release/bench-device");
-    if !built.is_file() {
-        return Err(format!("benchmark executable is missing at {}", built.display()).into());
-    }
-    let artifact_name = format!("bench-device-{}", gpu.key());
-    let executable = strip_remote_artifact(root, &built, &artifact_name)?;
     let resource_baseline = match suite {
         PerformanceSuite::ResidualNorm => gpu.residual_resource_baseline(),
         PerformanceSuite::Nvfp4SwiGlu => gpu
@@ -1485,10 +1537,47 @@ pub(crate) fn prepare_remote_benchmark(
             .ok_or_else(|| format!("GPU {} has no FP8 QKV resource baseline", gpu.key()))?,
         _ => suite.resource_baseline(),
     };
+    prepare_remote_benchmark_with_baselines(root, gpu, &[resource_baseline])
+}
+
+/// Locates the composed NVFP4 MLP benchmark and binds it to all leaf resources it launches.
+#[cfg(feature = "remote")]
+pub(crate) fn prepare_remote_nvfp4_mlp_benchmark(
+    root: &Path,
+    gpu: gpu_target::GpuTarget,
+) -> Result<RemoteBenchmark, Box<dyn Error>> {
+    prepare_remote_benchmark_with_baselines(
+        root,
+        gpu,
+        &[
+            RESIDUAL_NORM_RESOURCE_BASELINE,
+            NVFP4_SWIGLU_RESOURCE_BASELINE,
+            NVFP4_DOWN_RESOURCE_BASELINE,
+        ],
+    )
+}
+
+fn prepare_remote_benchmark_with_baselines(
+    root: &Path,
+    gpu: gpu_target::GpuTarget,
+    baselines: &[&str],
+) -> Result<RemoteBenchmark, Box<dyn Error>> {
+    let built = root
+        .join(gpu.oxide_build_target())
+        .join("release/bench-device");
+    if !built.is_file() {
+        return Err(format!("benchmark executable is missing at {}", built.display()).into());
+    }
+    let artifact_name = format!("bench-device-{}", gpu.key());
+    let executable = strip_remote_artifact(root, &built, &artifact_name)?;
+    let mut resources = Vec::new();
+    for baseline in baselines {
+        resources.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
 
     Ok(RemoteBenchmark {
         executable,
-        generator_baseline_sha256: sha256(&fs::read(root.join(resource_baseline))?),
+        generator_baseline_sha256: sha256(&resources),
     })
 }
 

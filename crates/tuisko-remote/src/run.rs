@@ -15,6 +15,8 @@ use crate::{GpuTarget, RemoteError, RemoteResult};
 const PROVISIONING_DEADLINE: Duration = Duration::from_secs(240);
 const SENTRY_GRACE: Duration = Duration::from_secs(300);
 const OWNED_POD_SUFFIX: &str = ".pod";
+const SNAPSHOT_REVISION: &str = "16b6615af3548b88e2d8e382457bc705b00479cf";
+const SNAPSHOT_ROOT: &str = "/tmp/tuiskollm/snapshots/16b6615af3548b88e2d8e382457bc705b00479cf";
 
 /// Inputs for one prebuilt qualification run.
 pub struct QualificationOptions {
@@ -26,6 +28,8 @@ pub struct QualificationOptions {
     pub test_args: Vec<String>,
     /// Exact GPU to provision and admit.
     pub gpu: GpuTarget,
+    /// Download and expose the one pinned admitted snapshot before execution.
+    pub source_snapshot: bool,
     /// Container image for the pod.
     pub image: String,
     /// Whole-run budget, including provisioning and report retrieval.
@@ -46,6 +50,8 @@ pub struct BenchmarkOptions {
     pub generator_baseline_sha256: String,
     /// Exact GPU to provision and admit.
     pub gpu: GpuTarget,
+    /// Download and pass the one pinned admitted snapshot before execution.
+    pub source_snapshot: bool,
     /// Container image for the pod.
     pub image: String,
     /// Whole-run budget, including provisioning and report retrieval.
@@ -211,7 +217,11 @@ pub fn run_qualification(
     }
     ssh.put_file(&options.executable, &format!("{REMOTE_WORKDIR}/qual"))?;
 
-    let command = qualification_command(&arguments);
+    if options.source_snapshot {
+        prepare_source_snapshot(&ssh, run_seconds)?;
+    }
+    let run_seconds = remaining_run_seconds(started, budget, options.max_minutes)?;
+    let command = qualification_command(&arguments, options.source_snapshot);
     println!("running {} (budget {run_seconds}s)", options.suite);
     let (status, output) = ssh.run(
         &format!("timeout -k 30 {run_seconds} sh -c '{command}'"),
@@ -244,6 +254,9 @@ pub fn run_benchmark(workspace_root: &Path, options: &BenchmarkOptions) -> Remot
     let mut arguments = vec![options.suite.clone()];
     arguments.extend(options.benchmark_args.iter().cloned());
     arguments = sanitize_arguments(&arguments)?;
+    if options.source_snapshot {
+        arguments.insert(1, SNAPSHOT_ROOT.to_owned());
+    }
     require_sha256(&options.generator_baseline_sha256)?;
     if !options.executable.is_file() {
         return Err(RemoteError::Read {
@@ -296,6 +309,10 @@ pub fn run_benchmark(workspace_root: &Path, options: &BenchmarkOptions) -> Remot
         &format!("{REMOTE_WORKDIR}/bench-device"),
     )?;
 
+    if options.source_snapshot {
+        prepare_source_snapshot(&ssh, run_seconds)?;
+    }
+    let run_seconds = remaining_run_seconds(started, budget, options.max_minutes)?;
     let command = benchmark_command(&arguments, &options.generator_baseline_sha256);
     println!(
         "running {} benchmark (budget {run_seconds}s)",
@@ -514,8 +531,13 @@ fn precheck(ssh: &Ssh, gpu: GpuTarget) -> RemoteResult<()> {
     }
 }
 
-fn qualification_command(arguments: &[String]) -> String {
-    let mut command = format!("cd {REMOTE_WORKDIR} && ./qual");
+fn qualification_command(arguments: &[String], source_snapshot: bool) -> String {
+    let environment = if source_snapshot {
+        format!("TUISKO_SNAPSHOT={SNAPSHOT_ROOT} ")
+    } else {
+        String::new()
+    };
+    let mut command = format!("cd {REMOTE_WORKDIR} && {environment}./qual");
     for argument in arguments {
         command.push(' ');
         command.push_str(argument);
@@ -523,6 +545,51 @@ fn qualification_command(arguments: &[String]) -> String {
     command.push_str(" > gate.out 2>&1; gate_status=$?; cat gate.out; test $gate_status -eq 0");
 
     command
+}
+
+fn prepare_source_snapshot(ssh: &Ssh, timeout_secs: u64) -> RemoteResult<()> {
+    let command = format!(
+        "set -eu; python3 -m pip install --quiet --disable-pip-version-check --no-input \
+           --break-system-packages \
+           'huggingface_hub[hf_xet]==0.34.4'; \
+         mkdir -p {SNAPSHOT_ROOT}; \
+         HF_HOME=/tmp/tuiskollm/hf-home HF_HUB_DISABLE_PROGRESS_BARS=1 \
+         HF_XET_CHUNK_CACHE_SIZE_BYTES=0 hf download unsloth/Qwen3.8-27B-NVFP4 \
+           --revision {SNAPSHOT_REVISION} --local-dir {SNAPSHOT_ROOT} \
+           --include config.json model.safetensors.index.json model.safetensors model_mtp.safetensors; \
+         cd {SNAPSHOT_ROOT}; \
+         test \"$(stat -c %s model.safetensors)\" = 22568192096; \
+         test \"$(stat -c %s model_mtp.safetensors)\" = 849400392; \
+         test \"$(stat -c %s model.safetensors.index.json)\" = 164371"
+    );
+    println!("downloading pinned source snapshot {SNAPSHOT_REVISION}");
+    let (status, output) = ssh.run(&command, timeout_secs)?;
+    if status != 0 {
+        return Err(RemoteError::Precheck {
+            detail: format!("pinned snapshot download exited {status}:\n{output}"),
+        });
+    }
+    println!("pinned source snapshot admitted by exact shard lengths");
+
+    Ok(())
+}
+
+fn remaining_run_seconds(
+    started: Instant,
+    budget: Duration,
+    max_minutes: u32,
+) -> RemoteResult<u64> {
+    let seconds = budget
+        .as_secs()
+        .saturating_sub(started.elapsed().as_secs())
+        .saturating_sub(60);
+    if seconds < 30 {
+        return Err(RemoteError::DeadlineExceeded {
+            minutes: max_minutes,
+        });
+    }
+
+    Ok(seconds)
 }
 
 fn benchmark_command(arguments: &[String], generator_baseline_sha256: &str) -> String {
@@ -744,11 +811,21 @@ mod tests {
 
     #[test]
     fn qualification_command_preserves_a_failure_after_printing_the_log() {
-        let command = qualification_command(&["suite::tests".to_owned(), "--nocapture".to_owned()]);
+        let command = qualification_command(
+            &["suite::tests".to_owned(), "--nocapture".to_owned()],
+            false,
+        );
 
         assert!(command.contains("gate_status=$?"));
         assert!(command.ends_with("test $gate_status -eq 0"));
         assert!(!command.contains("| tee"));
+    }
+
+    #[test]
+    fn source_qualification_exports_only_the_pinned_snapshot() {
+        let command = qualification_command(&["suite::tests".to_owned()], true);
+
+        assert!(command.contains("TUISKO_SNAPSHOT=/tmp/tuiskollm/snapshots/16b6615a"));
     }
 
     #[test]

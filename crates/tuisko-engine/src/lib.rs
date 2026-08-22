@@ -9,6 +9,8 @@ mod full_attention_layer;
 mod full_attention_layer_layout;
 mod generation;
 mod layout;
+mod nvfp4_mlp;
+mod nvfp4_mlp_layout;
 mod program;
 mod sampling;
 
@@ -23,6 +25,8 @@ pub use generation::{
     ChatGenerationRequest, FinishReason, GeneratedText, GenerationSession, GenerationStep,
 };
 pub use layout::{EndpointLayout, MAX_BATCH};
+pub use nvfp4_mlp::Nvfp4MlpProgram;
+pub use nvfp4_mlp_layout::Nvfp4MlpLayout;
 pub use program::TextEndpointProgram;
 pub use sampling::{SampleDecision, Sampler, SamplingOptions};
 
@@ -32,5 +36,7 @@ pub use dense_fp8_gdn_layer::DenseFp8GdnLayerObservables;
 pub use dense_fp8_mlp::DenseFp8MlpObservables;
 #[cfg(feature = "qualification")]
 pub use full_attention_layer::FullAttentionLayerObservables;
+#[cfg(feature = "qualification")]
+pub use nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
 #[cfg(feature = "qualification")]
 pub use program::EndpointObservables;
