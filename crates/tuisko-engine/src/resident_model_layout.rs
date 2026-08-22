@@ -2,9 +2,9 @@
 
 mod program;
 
-#[cfg(feature = "qualification")]
-pub use program::ResidentModelObservables;
 pub use program::ResidentModelProgram;
+#[cfg(feature = "qualification")]
+pub use program::{ResidentEmbeddingStageGraph, ResidentModelObservables};
 
 use crate::{
     EngineError, EngineResult, MAX_BATCH,

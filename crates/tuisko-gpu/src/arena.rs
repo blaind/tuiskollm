@@ -1,6 +1,6 @@
 //! Typed layout and single-allocation ownership for address-stable workspaces.
 
-use crate::{CudaStream, DeviceBuffer, DeviceCopy, GpuError, GpuResult};
+use crate::{CudaStream, DeviceBuffer, DeviceCopy, GpuError, GpuResult, PinnedHostBuffer};
 use std::marker::PhantomData;
 use std::mem::{align_of, size_of, size_of_val};
 
@@ -279,6 +279,57 @@ impl DeviceArena {
         stream
             .synchronize()
             .map_err(|source| GpuError::driver("synchronizing a device arena upload", source))
+    }
+
+    /// Enqueues a pinned-host prefix upload without synchronizing the stream.
+    ///
+    /// # Safety
+    ///
+    /// `source` must remain allocated and immutable until the copy completes. If the copy is
+    /// captured in a CUDA Graph, that requirement extends through the final graph replay.
+    pub unsafe fn copy_prefix_from_pinned_host_async<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        source: &PinnedHostBuffer<T>,
+        len: usize,
+    ) -> GpuResult<()> {
+        self.require_stream_context(stream, "copying a pinned host prefix into a device arena")?;
+        if source.context().as_ref() != stream.context().as_ref() {
+            return Err(GpuError::context(
+                "pinned host source and arena stream must share one CUDA context",
+            ));
+        }
+        if len > source.len() || len > region.len {
+            return Err(GpuError::arena(format!(
+                "pinned upload length {len} exceeds source {} or region {} elements",
+                source.len(),
+                region.len
+            )));
+        }
+        let address = self.address(region)? as u64;
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena("pinned upload byte count overflows"))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
+        // SAFETY: the checked arena region covers `bytes`; the caller owns the pinned-source
+        // lifetime and immutability contract documented by this method.
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                address,
+                source.as_ptr(),
+                bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|source| GpuError::driver("copying a pinned host prefix into an arena", source))
     }
 
     /// Copies one complete typed region into an owned host vector.

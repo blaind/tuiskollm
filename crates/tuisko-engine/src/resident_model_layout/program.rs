@@ -5,6 +5,8 @@ use super::{
     MixerWeights, MlpWeights, ResidentModelLayout, SharedWorkspace,
 };
 use crate::{EngineError, EngineResult, MAX_BATCH};
+#[cfg(feature = "qualification")]
+use std::marker::PhantomData;
 use std::sync::Arc;
 use tuisko_gpu::{
     CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, PinnedHostBuffer,
@@ -47,6 +49,21 @@ pub struct ResidentModelProgram {
     layout: ResidentModelLayout,
     _pointers: ProgramPointers,
     base_address: u64,
+}
+
+#[cfg(feature = "qualification")]
+/// Captured embedding upload borrowing its page-locked source for every replay.
+pub struct ResidentEmbeddingStageGraph<'a> {
+    graph: CudaGraph,
+    source: PhantomData<&'a PinnedHostBuffer<u16>>,
+}
+
+#[cfg(feature = "qualification")]
+impl ResidentEmbeddingStageGraph<'_> {
+    /// Immutable graph whose replay restores represented embedding rows.
+    pub const fn graph(&self) -> &CudaGraph {
+        &self.graph
+    }
 }
 
 impl ResidentModelProgram {
@@ -375,21 +392,29 @@ impl ResidentModelProgram {
         &self,
         stream: &CudaStream,
         batch: usize,
-    ) -> EngineResult<CudaGraph> {
+    ) -> EngineResult<ResidentEmbeddingStageGraph<'_>> {
         require_batch(batch)?;
         let active = product(
             "resident staged embedding elements",
             batch,
             Qwen38_27B::HIDDEN,
         )?;
-        Ok(CudaGraph::capture(stream, || {
-            self.arena.copy_prefix_from_host(
-                stream,
-                self.layout.workspace.residual_a,
-                &self.embedding_stager[..active],
-            )?;
-            Ok(())
-        })?)
+        let graph = CudaGraph::capture(stream, || {
+            // SAFETY: the returned graph borrows `self`, so the page-locked source cannot be
+            // mutated or dropped before this graph and all of its replays are finished.
+            unsafe {
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    self.layout.workspace.residual_a,
+                    &self.embedding_stager,
+                    active,
+                )
+            }
+        })?;
+        Ok(ResidentEmbeddingStageGraph {
+            graph,
+            source: PhantomData,
+        })
     }
 
     #[cfg(feature = "qualification")]

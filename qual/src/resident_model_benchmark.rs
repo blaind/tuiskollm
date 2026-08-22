@@ -8,8 +8,8 @@ use crate::device_benchmark::{
 };
 use std::path::Path;
 use std::sync::Arc;
-use tuisko_engine::{MAX_BATCH, ResidentModelProgram};
-use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, GpuError, GpuTimer};
+use tuisko_engine::{MAX_BATCH, ResidentEmbeddingStageGraph, ResidentModelProgram};
+use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuTimer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
 const CACHE_POSITION: u32 = 130;
@@ -19,7 +19,6 @@ const ROTARY_PAIRS: usize = 32;
 struct Session {
     timer: GpuTimer,
     program: ResidentModelProgram,
-    embedding_graphs: [CudaGraph; MAX_BATCH],
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
 }
@@ -47,29 +46,40 @@ impl Session {
             &rope_cos,
             &rope_sin,
         )?;
-        let embedding_graphs = (1..=MAX_BATCH)
-            .map(|batch| program.qualification_embedding_stage_graph(&stream, batch))
+        let timer = GpuTimer::new(&context)?;
+        Ok(Self {
+            timer,
+            program,
+            stream,
+            _context: context,
+        })
+    }
+
+    fn embedding_graphs(
+        &self,
+    ) -> Result<[ResidentEmbeddingStageGraph<'_>; MAX_BATCH], DeviceBenchmarkError> {
+        (1..=MAX_BATCH)
+            .map(|batch| {
+                self.program
+                    .qualification_embedding_stage_graph(&self.stream, batch)
+            })
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .map_err(|_| {
                 DeviceBenchmarkError::Precondition(
                     "resident embedding graph inventory has wrong cardinality".to_string(),
                 )
-            })?;
-        let timer = GpuTimer::new(&context)?;
-        Ok(Self {
-            timer,
-            program,
-            embedding_graphs,
-            stream,
-            _context: context,
-        })
+            })
     }
 
-    fn warm(&self, launches: u64) -> Result<(), DeviceBenchmarkError> {
+    fn warm(
+        &self,
+        embedding_graphs: &[ResidentEmbeddingStageGraph<'_>; MAX_BATCH],
+        launches: u64,
+    ) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
             for batch in 1..=MAX_BATCH {
-                self.embedding_graphs[batch - 1].launch(&self.stream)?;
+                embedding_graphs[batch - 1].graph().launch(&self.stream)?;
                 self.program
                     .qualification_graph(batch)?
                     .launch(&self.stream)?;
@@ -79,7 +89,10 @@ impl Session {
         Ok(())
     }
 
-    fn cases(&self) -> Result<Vec<ExactDeviceCase<'_>>, DeviceBenchmarkError> {
+    fn cases<'a>(
+        &'a self,
+        embedding_graphs: &'a [ResidentEmbeddingStageGraph<'a>; MAX_BATCH],
+    ) -> Result<Vec<ExactDeviceCase<'a>>, DeviceBenchmarkError> {
         (1..=MAX_BATCH)
             .map(|batch| {
                 Ok(ExactDeviceCase::new(
@@ -90,7 +103,7 @@ impl Session {
                     self.program.qualification_graph(batch)?,
                     None,
                 )
-                .with_preparation(&self.embedding_graphs[batch - 1]))
+                .with_preparation(embedding_graphs[batch - 1].graph()))
             })
             .collect()
     }
@@ -147,6 +160,7 @@ pub fn benchmark_resident_model(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(root)?;
+    let embedding_graphs = session.embedding_graphs()?;
     memory.register_owned(
         "resident_model/resident_weights",
         BenchmarkMemoryKind::Weights,
@@ -184,10 +198,10 @@ pub fn benchmark_resident_model(
         "single 256-byte-aligned resident arena",
     )?;
     memory.capture("after_setup")?;
-    session.warm(warmup_launches)?;
+    session.warm(&embedding_graphs, warmup_launches)?;
     memory.capture("after_warmup")?;
     require_current_process_exclusive()?;
-    let cases = session.cases()?;
+    let cases = session.cases(&embedding_graphs)?;
     let (metrics, energy_metrics, telemetry) =
         measure_cases(&session.stream, &session.timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
