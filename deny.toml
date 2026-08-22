@@ -6,14 +6,17 @@ unsound = "all"
 multiple-versions = "deny"
 wildcards = "deny"
 skip = [
+    { name = "base64", version = "0.23" },
+    { name = "getrandom", version = "0.2" },
     { name = "itertools", version = "0.14" },
     { name = "shlex", version = "2" },
     { name = "syn", version = "2" },
 ]
+skip-tree = [{ name = "russh", version = "0.63" }]
 
 [licenses]
 confidence-threshold = 0.93
-allow = ["Apache-2.0", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0"]
+allow = ["Apache-2.0", "BSD-3-Clause", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0"]
 
 [sources]
 unknown-registry = "deny"

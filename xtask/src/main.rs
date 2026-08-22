@@ -1,6 +1,7 @@
 //! Repository build and qualification gates.
 
 mod performance;
+mod remote;
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -28,7 +29,7 @@ const CUDA_OXIDE_REPOSITORY: &str = "https://github.com/NVlabs/cuda-oxide.git";
 const CUDA_OXIDE_REVISION: &str = "1f4d813719012d384f2db12b88efc9314c8bf50c";
 
 #[derive(Clone, Copy)]
-enum PerformanceSuite {
+pub(crate) enum PerformanceSuite {
     ResidualNorm,
     Fp8Qkv,
     Fp8GdnInput,
@@ -48,7 +49,7 @@ const PERFORMANCE_SUITES: [PerformanceSuite; 4] = [
 ];
 
 impl PerformanceSuite {
-    const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::ResidualNorm => "residual-norm",
             Self::Fp8Qkv => "fp8-qkv",
@@ -124,7 +125,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|perf>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|perf|remote>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -168,6 +169,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("gate-gdn-recurrence") if remaining.is_empty() => gate_gdn_recurrence(root),
         Some("gate-gdn-output") if remaining.is_empty() => gate_gdn_output(root),
         Some("perf") => perf(root, &remaining),
+        Some("remote") => remote::run(root, &remaining),
         Some(known)
             if matches!(
                 known,
@@ -999,6 +1001,174 @@ fn run_oxide_with_env(
     }
 
     run_visible(&mut command)
+}
+
+/// Same as `run_oxide` but captures stdout so the caller can locate
+/// build artifacts (remote prepare builds with `--no-run`).
+fn run_oxide_capture(root: &Path, arguments: &[&str]) -> Result<String, Box<dyn Error>> {
+    let source = local_cuda_oxide_source(root);
+    require_cuda_oxide_revision(&source)?;
+    let wrapper = root.join("target/cuda-oxide-driver/debug/cargo-oxide");
+    if !wrapper.is_file() {
+        return Err(
+            "cuda-oxide is not bootstrapped; run `cargo run -p xtask -- bootstrap-cuda-oxide`"
+                .into(),
+        );
+    }
+    let backend = local_backend(root)?;
+    let backend_rustflags = encoded_backend_rustflags(root, &source)?;
+    fs::create_dir_all(root.join("target/tmp"))?;
+    run_captured(
+        Command::new(wrapper)
+            .args(arguments)
+            .current_dir(root)
+            .env("CARGO_HOME", task_cargo_home(root))
+            .env("CUDA_OXIDE_BACKEND", backend)
+            .env("CUDA_OXIDE_SOURCE", source)
+            .env("CARGO_ENCODED_RUSTFLAGS", backend_rustflags)
+            .env_remove("RUSTFLAGS")
+            .env("TMPDIR", root.join("target/tmp")),
+    )
+}
+
+/// Runs a command with stdout piped (stderr inherited) and returns stdout.
+fn run_captured(command: &mut Command) -> Result<String, Box<dyn Error>> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let output = command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("{program} failed with {}", output.status).into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// A compiled qual test executable ready to ship to a gate pod.
+pub struct RemoteQualify {
+    /// Path to the compiled qual test executable.
+    pub executable: PathBuf,
+    /// Arguments to run the executable with (libtest filters + flags).
+    pub test_args: Vec<String>,
+}
+
+/// A compiled benchmark executable and its matching resource identity.
+#[cfg(feature = "remote")]
+pub(crate) struct RemoteBenchmark {
+    /// Path to the compiled `bench-device` executable.
+    pub executable: PathBuf,
+    /// Hash of the suite's checked static-resource baseline.
+    pub generator_baseline_sha256: String,
+}
+
+/// Locates the already-built benchmark executable and binds it to one suite's resources.
+#[cfg(feature = "remote")]
+pub(crate) fn prepare_remote_benchmark(
+    root: &Path,
+    suite: PerformanceSuite,
+) -> Result<RemoteBenchmark, Box<dyn Error>> {
+    let built = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !built.is_file() {
+        return Err(format!("benchmark executable is missing at {}", built.display()).into());
+    }
+    let executable = strip_remote_artifact(root, &built, "bench-device")?;
+
+    Ok(RemoteBenchmark {
+        executable,
+        generator_baseline_sha256: sha256(&fs::read(root.join(suite.resource_baseline()))?),
+    })
+}
+
+/// Compiles the qual test executable for a remote `qualify-*` gate.
+///
+/// No GPU is needed locally: the cuda-oxide codegen and ptxas steps run
+/// at compile time; the pod only needs the driver to execute the binary.
+pub fn prepare_remote_qualify(
+    root: &Path,
+    test_filter: &str,
+) -> Result<RemoteQualify, Box<dyn Error>> {
+    let test_args = [test_filter, "--include-ignored", "--nocapture"];
+    let mut arguments: Vec<&str> = vec![
+        "test",
+        "--arch",
+        "sm_120a",
+        "--cargo-target-dir",
+        CUDA_OXIDE_TEST_TARGET,
+        "--device-codegen-crate",
+        "tuisko-kernels-sm120",
+        "--",
+        "--package",
+        "tuisko-qual",
+        "--release",
+        "--lib",
+        "--message-format=json-render-diagnostics",
+        "--no-run",
+        "--",
+    ];
+    arguments.extend_from_slice(&test_args);
+    let messages = run_oxide_capture(root, &arguments)?;
+    let built = messages
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|message| {
+            message.get("reason").and_then(serde_json::Value::as_str) == Some("compiler-artifact")
+        })
+        .filter(|message| {
+            message
+                .pointer("/target/name")
+                .and_then(serde_json::Value::as_str)
+                == Some("tuisko_qual")
+        })
+        .filter_map(|message| {
+            message
+                .get("executable")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+        })
+        .next_back()
+        .ok_or("cargo did not report the tuisko-qual test executable")?;
+    if !built.is_file() {
+        return Err(format!(
+            "cargo reported a missing qualification executable at {}",
+            built.display()
+        )
+        .into());
+    }
+    let executable = strip_remote_artifact(root, &built, "tuisko-qual")?;
+    println!("remote test binary: {}", executable.display());
+    Ok(RemoteQualify {
+        executable,
+        test_args: test_args.into_iter().map(String::from).collect(),
+    })
+}
+
+fn strip_remote_artifact(
+    root: &Path,
+    source: &Path,
+    name: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let directory = root.join("target/remote-artifacts");
+    fs::create_dir_all(&directory)?;
+    let output = directory.join(name);
+    run_visible(
+        Command::new("strip")
+            .args(["--strip-all", "-o"])
+            .arg(&output)
+            .arg(source),
+    )?;
+    let source_bytes = fs::metadata(source)?.len();
+    let output_bytes = fs::metadata(&output)?.len();
+    println!(
+        "remote artifact: {} -> {} bytes ({:.1}% smaller)",
+        source_bytes,
+        output_bytes,
+        100.0 * (source_bytes.saturating_sub(output_bytes)) as f64 / source_bytes as f64,
+    );
+
+    Ok(output)
 }
 
 fn run_visible(command: &mut Command) -> Result<(), Box<dyn Error>> {
