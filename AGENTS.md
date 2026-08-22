@@ -80,6 +80,8 @@ With explicit user permission, an agent may instead use `xtask remote`; see
 `docs/remote-gates.md`. Remote runs create billable RunPod resources, and this new runner may still
 have lifecycle bugs. After every attempt, verify that no gate pod remains with
 `cargo run -p xtask --features remote -- remote check`; use the corresponding `remote sweep` if
-needed and report any retained pod immediately. Remote qualification can satisfy numerical and
+needed and report any retained pod immediately. Cleanup is worktree-owned until another runner's
+declared lease and grace period expire; never replace it with prefix-wide deletion. Remote
+qualification can satisfy numerical and
 resource gates, but remote benchmark timings are diagnostic and cannot bless a performance
 baseline.

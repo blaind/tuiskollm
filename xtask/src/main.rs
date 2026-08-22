@@ -21,6 +21,7 @@ const FP8_GDN_INPUT_RESOURCE_BASELINE: &str = "qual/baselines/fp8-gdn-input-sm12
 const FP8_LM_HEAD_RESOURCE_BASELINE: &str = "qual/baselines/fp8-lm-head-sm120.txt";
 const FP8_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/fp8-swiglu-sm120.txt";
 const FP8_DOWN_RESOURCE_BASELINE: &str = "qual/baselines/fp8-down-sm120.txt";
+const NVFP4_SWIGLU_SM89_RESOURCE_BASELINE: &str = "qual/baselines/nvfp4-swiglu-sm89.txt";
 const GDN_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-prepare-sm120.txt";
 const GDN_RECURRENCE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-recurrence-sm120.txt";
 const GDN_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/gdn-output-sm120.txt";
@@ -41,6 +42,7 @@ pub(crate) enum PerformanceSuite {
     GdnPrepare,
     GdnRecurrence,
     GdnOutput,
+    Nvfp4SwiGlu,
 }
 
 const PERFORMANCE_SUITES: [PerformanceSuite; 4] = [
@@ -62,6 +64,7 @@ impl PerformanceSuite {
             Self::GdnPrepare => "gdn-prepare",
             Self::GdnRecurrence => "gdn-recurrence",
             Self::GdnOutput => "gdn-output",
+            Self::Nvfp4SwiGlu => "nvfp4-swiglu",
         }
     }
 
@@ -76,6 +79,7 @@ impl PerformanceSuite {
             Self::GdnPrepare => GDN_PREPARE_RESOURCE_BASELINE,
             Self::GdnRecurrence => GDN_RECURRENCE_RESOURCE_BASELINE,
             Self::GdnOutput => GDN_OUTPUT_RESOURCE_BASELINE,
+            Self::Nvfp4SwiGlu => NVFP4_SWIGLU_SM89_RESOURCE_BASELINE,
         }
     }
 
@@ -90,6 +94,7 @@ impl PerformanceSuite {
             Self::GdnPrepare => "qual/baselines/gdn-prepare-sm120.json",
             Self::GdnRecurrence => "qual/baselines/gdn-recurrence-sm120.json",
             Self::GdnOutput => "qual/baselines/gdn-output-sm120.json",
+            Self::Nvfp4SwiGlu => "qual/baselines/nvfp4-swiglu-sm89.json",
         }
     }
 
@@ -104,6 +109,7 @@ impl PerformanceSuite {
             "gdn-prepare" => Ok(Self::GdnPrepare),
             "gdn-recurrence" => Ok(Self::GdnRecurrence),
             "gdn-output" => Ok(Self::GdnOutput),
+            "nvfp4-swiglu" => Ok(Self::Nvfp4SwiGlu),
             _ => Err(format!("unknown performance suite `{value}`").into()),
         }
     }
@@ -118,6 +124,10 @@ impl PerformanceSuite {
             Self::Fp8Down => qualify_fp8_down(root),
             Self::GdnPrepare => qualify_gdn_prepare(root),
             Self::GdnRecurrence => qualify_gdn_recurrence(root),
+            Self::Nvfp4SwiGlu => Err(
+                "SM89 NVFP4 qualification is available through `remote qualify-nvfp4-swiglu --gpu 4090`"
+                    .into(),
+            ),
             Self::GdnOutput => qualify_gdn_output(root),
         }
     }
@@ -1392,6 +1402,83 @@ pub(crate) fn gate_residual_norm_target(
         plain_registers,
         residual_registers,
         shared
+    );
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+pub(crate) fn gate_nvfp4_swiglu_sm89(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(NVFP4_SWIGLU_SM89_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let gpu = gpu_target::GpuTarget::Sm89;
+    let ptx_path = root.join(gpu.ptx_path());
+    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; run the pinned SM89 release build first",
+            ptx_path.display()
+        )
+    })?;
+    let entries = parse_entries(&ptx);
+    let swiglu = entries
+        .iter()
+        .filter(|entry| {
+            entry.name == "nvfp4_swiglu_a16_b1" || entry.name.starts_with("nvfp4_swiglu_a16_TID_")
+        })
+        .collect::<Vec<_>>();
+    require_count("SM89 NVFP4 SwiGLU", swiglu.len(), 8)?;
+
+    for entry in &swiglu {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 1") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/one-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let temporary = root.join("target/tmp");
+    fs::create_dir_all(&temporary)?;
+    let cubin = temporary.join("nvfp4-swiglu-sm89-gate.cubin");
+    let ptxas = cuda_tool("ptxas");
+    require_success(
+        &ptxas,
+        &[
+            OsStr::new("-O3"),
+            OsStr::new("--gpu-name"),
+            OsStr::new(gpu.oxide_arch()),
+            ptx_path.as_os_str(),
+            OsStr::new("--output-file"),
+            cubin.as_os_str(),
+        ],
+    )?;
+    let cuobjdump = cuda_tool("cuobjdump");
+    let resources = require_success(
+        &cuobjdump,
+        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+    )?;
+    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let mut registers = Vec::new();
+    let mut shared = Vec::new();
+
+    for entry in swiglu {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted SM89 NVFP4 entry `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        registers.push(resource.registers);
+        shared.push(resource.shared);
+    }
+    registers.sort_unstable();
+    require_registers(&baseline, "nvfp4_registers", &registers)?;
+    require_uniform_value(&baseline, "shared_bytes", &shared)?;
+
+    println!(
+        "4090 NVFP4 SwiGLU gate passed: 8 A16 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
+        registers, shared
     );
     Ok(())
 }

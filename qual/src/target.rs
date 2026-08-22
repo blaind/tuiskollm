@@ -1,13 +1,13 @@
 #[cfg(feature = "sm86-residual")]
 pub(crate) use tuisko_kernels_sm86::ResidualNormOp;
-#[cfg(feature = "sm89-residual")]
-pub(crate) use tuisko_kernels_sm89::ResidualNormOp;
+#[cfg(feature = "sm89")]
+pub(crate) use tuisko_kernels_sm89::{Nvfp4SwiGluOp, ResidualNormOp};
 #[cfg(feature = "device")]
 pub(crate) use tuisko_kernels_sm120::ResidualNormOp;
 
 #[cfg(feature = "device")]
 const TARGET_PROFILE: tuisko_targets::TargetProfile = tuisko_targets::TargetProfile::Sm120;
-#[cfg(feature = "sm89-residual")]
+#[cfg(feature = "sm89")]
 const TARGET_PROFILE: tuisko_targets::TargetProfile = tuisko_targets::TargetProfile::Sm89;
 #[cfg(feature = "sm86-residual")]
 const TARGET_PROFILE: tuisko_targets::TargetProfile = tuisko_targets::TargetProfile::Sm86;

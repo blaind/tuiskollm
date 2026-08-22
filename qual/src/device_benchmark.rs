@@ -901,7 +901,7 @@ pub(crate) fn preflight() -> Result<DevicePreflight, DeviceBenchmarkError> {
             snapshot.utilization_percent, snapshot.memory_used_mib
         )));
     }
-    require_no_foreign_compute_processes(None)?;
+    require_compute_process_count(0)?;
 
     Ok(DevicePreflight {
         identity: DeviceIdentity {
@@ -914,7 +914,10 @@ pub(crate) fn preflight() -> Result<DevicePreflight, DeviceBenchmarkError> {
 }
 
 pub(crate) fn require_current_process_exclusive() -> Result<(), DeviceBenchmarkError> {
-    require_no_foreign_compute_processes(Some(std::process::id()))
+    // Preflight admitted an empty GPU immediately before Session created one persistent CUDA
+    // context. Requiring exactly one process here proves exclusivity without assuming that
+    // nvidia-smi's host PID namespace matches the container's PID namespace.
+    require_compute_process_count(1)
 }
 
 pub(crate) fn warmup_launches(
@@ -1549,34 +1552,77 @@ fn parse_nvidia_u32(name: &str, value: &str) -> Result<u32, DeviceBenchmarkError
     })
 }
 
-fn require_no_foreign_compute_processes(
-    allowed_pid: Option<u32>,
-) -> Result<(), DeviceBenchmarkError> {
+fn require_compute_process_count(expected: usize) -> Result<(), DeviceBenchmarkError> {
     let output = require_command(
         "nvidia-smi",
         &[
             "-i",
             DEVICE_INDEX,
-            "--query-compute-apps=pid",
+            "--query-compute-apps=pid,process_name",
             "--format=csv,noheader,nounits",
         ],
     )?;
     let text = String::from_utf8_lossy(&output.stdout);
-    let allowed_pid = allowed_pid.map(|pid| pid.to_string());
-    let foreign = text
-        .lines()
+    let processes = parse_compute_processes(&text).map_err(DeviceBenchmarkError::Precondition)?;
+    validate_compute_process_count(&processes, expected).map_err(DeviceBenchmarkError::Precondition)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ComputeProcess {
+    pid: u32,
+    executable: String,
+}
+
+fn parse_compute_processes(text: &str) -> Result<Vec<ComputeProcess>, String> {
+    text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .filter(|line| allowed_pid.as_deref() != Some(*line))
-        .collect::<Vec<_>>();
-    if !foreign.is_empty() {
-        return Err(DeviceBenchmarkError::Precondition(format!(
-            "foreign compute process IDs: {}",
-            foreign.join(", ")
-        )));
+        .map(|line| {
+            let (pid, executable) = line
+                .split_once(',')
+                .ok_or_else(|| format!("unexpected nvidia-smi compute-process row `{line}`"))?;
+            let pid = pid.trim().parse::<u32>().map_err(|_| {
+                format!(
+                    "nvidia-smi compute-process PID `{}` is not an integer",
+                    pid.trim()
+                )
+            })?;
+            let executable = executable.trim();
+            if executable.is_empty() {
+                return Err(format!(
+                    "nvidia-smi compute-process {pid} has no executable name"
+                ));
+            }
+            Ok(ComputeProcess {
+                pid,
+                executable: executable.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn validate_compute_process_count(
+    processes: &[ComputeProcess],
+    expected: usize,
+) -> Result<(), String> {
+    if processes.len() == expected {
+        return Ok(());
     }
 
-    Ok(())
+    let observed = processes
+        .iter()
+        .map(|process| format!("{} ({})", process.pid, process.executable))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let observed = if observed.is_empty() {
+        "none".to_owned()
+    } else {
+        observed
+    };
+    Err(format!(
+        "expected {expected} compute process(es), observed {}: {observed}",
+        processes.len()
+    ))
 }
 
 fn require_command(program: &str, arguments: &[&str]) -> Result<Output, DeviceBenchmarkError> {
@@ -1601,9 +1647,10 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchmarkMemoryKind, BenchmarkMemoryMeasurement, DeviceMemoryMetric, DeviceMemorySnapshot,
-        MemoryComparison, MemoryRecorder, TelemetryEvidence, TelemetrySample, measurement_order,
-        parse_process_memory, telemetry_evidence,
+        BenchmarkMemoryKind, BenchmarkMemoryMeasurement, ComputeProcess, DeviceMemoryMetric,
+        DeviceMemorySnapshot, MemoryComparison, MemoryRecorder, TelemetryEvidence, TelemetrySample,
+        measurement_order, parse_compute_processes, parse_process_memory, telemetry_evidence,
+        validate_compute_process_count,
     };
 
     const MIB: u64 = 1024 * 1024;
@@ -1708,6 +1755,25 @@ mod tests {
         );
         assert!(parse_process_memory("VmRSS:\t1 MB\nVmHWM:\t2 kB\n").is_err());
         assert!(parse_process_memory("VmRSS:\t1 kB\n").is_err());
+    }
+
+    #[test]
+    fn compute_process_gate_requires_the_empty_to_singleton_transition() {
+        let namespaced = parse_compute_processes("3863838, /tmp/tuiskollm/bench-device\n").unwrap();
+        assert!(validate_compute_process_count(&[], 0).is_ok());
+        assert!(validate_compute_process_count(&namespaced, 0).is_err());
+        assert!(validate_compute_process_count(&namespaced, 1).is_ok());
+
+        let hidden = parse_compute_processes("3549378, [Not Found]\n").unwrap();
+        assert!(validate_compute_process_count(&hidden, 1).is_ok());
+
+        let peer = ComputeProcess {
+            pid: 99,
+            executable: "/tmp/tuiskollm/bench-device".to_owned(),
+        };
+        assert!(validate_compute_process_count(&[namespaced[0].clone(), peer], 1).is_err());
+        assert!(validate_compute_process_count(&[], 1).is_err());
+        assert!(parse_compute_processes("not-a-pid, bench-device\n").is_err());
     }
 
     #[test]
