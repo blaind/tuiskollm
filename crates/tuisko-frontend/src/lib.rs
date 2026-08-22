@@ -5,9 +5,10 @@ mod error;
 use minijinja::{Environment, Error as TemplateError, ErrorKind};
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 use tokenizers::Tokenizer;
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
@@ -21,6 +22,7 @@ const IM_START_ID: u32 = 248_045;
 const IM_END_ID: u32 = 248_046;
 const END_OF_TEXT_ID: u32 = 248_044;
 const DEFAULT_EOS_IDS: [u32; 2] = [IM_END_ID, END_OF_TEXT_ID];
+const PROMPT_BLOCK_START: &str = "<|im_start|>";
 
 /// One text message supplied to the checkpoint chat template.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -48,6 +50,46 @@ pub struct ChatTemplateOptions {
     pub enable_thinking: Option<bool>,
 }
 
+/// Startup options for the text frontend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextFrontendOptions {
+    /// Maximum number of rendered prompts retained for prefix reuse.
+    pub prompt_cache_capacity: usize,
+}
+
+impl Default for TextFrontendOptions {
+    fn default() -> Self {
+        Self {
+            prompt_cache_capacity: 4,
+        }
+    }
+}
+
+/// Result and cache accounting for one encoded chat prompt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptEncoding {
+    /// Exact prompt token IDs.
+    pub token_ids: Vec<u32>,
+    /// Token IDs reused from an earlier rendering.
+    pub reused_tokens: usize,
+    /// Bytes in the complete rendered prompt.
+    pub rendered_bytes: usize,
+    /// Bytes passed through BPE during this call.
+    pub fresh_bytes: usize,
+}
+
+struct PromptPrefixEntry {
+    rendered: String,
+    token_ids: Vec<u32>,
+    token_ends: Vec<usize>,
+}
+
+struct CachedPrefix {
+    split: usize,
+    token_ids: Vec<u32>,
+    token_ends: Vec<usize>,
+}
+
 /// Admitted tokenizer, chat template, and generation stop-token metadata.
 pub struct TextFrontend {
     tokenizer: Tokenizer,
@@ -55,6 +97,8 @@ pub struct TextFrontend {
     stop_ids: [u32; 2],
     byte_table: HashMap<char, u8>,
     special_decode_ids: HashSet<u32>,
+    prompt_cache_capacity: usize,
+    prompt_cache: Mutex<VecDeque<PromptPrefixEntry>>,
 }
 
 /// Incremental decoder for one generated text sequence.
@@ -68,10 +112,18 @@ pub struct StreamingDecoder<'a> {
 impl TextFrontend {
     /// Loads and validates frontend files from an admitted snapshot.
     pub fn open(snapshot: &CheckpointSnapshot<Qwen38_27B>) -> FrontendResult<Self> {
-        Self::open_root(snapshot.root())
+        Self::open_with_options(snapshot, TextFrontendOptions::default())
     }
 
-    fn open_root(root: &Path) -> FrontendResult<Self> {
+    /// Loads the frontend with explicit startup options.
+    pub fn open_with_options(
+        snapshot: &CheckpointSnapshot<Qwen38_27B>,
+        options: TextFrontendOptions,
+    ) -> FrontendResult<Self> {
+        Self::open_root(snapshot.root(), options)
+    }
+
+    fn open_root(root: &Path, options: TextFrontendOptions) -> FrontendResult<Self> {
         let tokenizer_path = root.join(TOKENIZER_FILE);
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|source| {
             FrontendError::Tokenizer(format!(
@@ -102,6 +154,8 @@ impl TextFrontend {
             stop_ids,
             byte_table: byte_level_table(),
             special_decode_ids,
+            prompt_cache_capacity: options.prompt_cache_capacity,
+            prompt_cache: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -161,8 +215,18 @@ impl TextFrontend {
         messages: &[ChatMessage],
         options: ChatTemplateOptions,
     ) -> FrontendResult<Vec<u32>> {
+        self.encode_chat_with_report(messages, options)
+            .map(|encoding| encoding.token_ids)
+    }
+
+    /// Renders and encodes one prompt with prefix-cache accounting.
+    pub fn encode_chat_with_report(
+        &self,
+        messages: &[ChatMessage],
+        options: ChatTemplateOptions,
+    ) -> FrontendResult<PromptEncoding> {
         let rendered = self.render_chat(messages, true, options)?;
-        self.encode(&rendered)
+        self.encode_rendered_with_prefix(&rendered)
     }
 
     /// Decodes token IDs using the admitted tokenizer.
@@ -181,6 +245,82 @@ impl TextFrontend {
             text: String::new(),
             pending: Vec::new(),
             finished: false,
+        }
+    }
+
+    fn encode_rendered_with_prefix(&self, rendered: &str) -> FrontendResult<PromptEncoding> {
+        // Added tokens split before BPE, so restarting at a shared `<|im_start|>`
+        // preserves the full-encode token sequence. Other splits fall back.
+        let cached = {
+            let cache = self
+                .prompt_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            best_cached_prefix(&cache, rendered)
+        };
+
+        if let Some(cached) = cached {
+            let split = cached.split;
+            if split == rendered.len() {
+                return Ok(PromptEncoding {
+                    reused_tokens: cached.token_ids.len(),
+                    token_ids: cached.token_ids,
+                    rendered_bytes: rendered.len(),
+                    fresh_bytes: 0,
+                });
+            }
+
+            let tail = &rendered[split..];
+            let encoding = self.tokenizer.encode(tail, false).map_err(|source| {
+                FrontendError::Tokenizer(format!("could not encode prompt tail: {source}"))
+            })?;
+            let reused_tokens = cached.token_ids.len();
+            let mut token_ids = cached.token_ids;
+            token_ids.extend_from_slice(encoding.get_ids());
+            let mut token_ends = cached.token_ends;
+            token_ends.extend(encoding.get_offsets().iter().map(|&(_, end)| split + end));
+            self.push_prompt_entry(rendered, token_ids.clone(), token_ends);
+
+            return Ok(PromptEncoding {
+                token_ids,
+                reused_tokens,
+                rendered_bytes: rendered.len(),
+                fresh_bytes: tail.len(),
+            });
+        }
+
+        let encoding = self.tokenizer.encode(rendered, false).map_err(|source| {
+            FrontendError::Tokenizer(format!("could not encode prompt: {source}"))
+        })?;
+        let token_ids = encoding.get_ids().to_vec();
+        let token_ends = encoding.get_offsets().iter().map(|&(_, end)| end).collect();
+        self.push_prompt_entry(rendered, token_ids.clone(), token_ends);
+
+        Ok(PromptEncoding {
+            token_ids,
+            reused_tokens: 0,
+            rendered_bytes: rendered.len(),
+            fresh_bytes: rendered.len(),
+        })
+    }
+
+    fn push_prompt_entry(&self, rendered: &str, token_ids: Vec<u32>, token_ends: Vec<usize>) {
+        debug_assert_eq!(token_ids.len(), token_ends.len());
+        if self.prompt_cache_capacity == 0 {
+            return;
+        }
+
+        let mut cache = self
+            .prompt_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.push_back(PromptPrefixEntry {
+            rendered: rendered.into(),
+            token_ids,
+            token_ends,
+        });
+        while cache.len() > self.prompt_cache_capacity {
+            cache.pop_front();
         }
     }
 }
@@ -343,6 +483,54 @@ fn is_valid_utf8_prefix(bytes: &[u8]) -> bool {
         .all(|byte| (0x80..=0xbf).contains(byte))
 }
 
+fn best_cached_prefix(cache: &VecDeque<PromptPrefixEntry>, rendered: &str) -> Option<CachedPrefix> {
+    let mut best = None;
+    for entry in cache {
+        if entry.rendered == rendered {
+            best = Some(CachedPrefix {
+                split: rendered.len(),
+                token_ids: entry.token_ids.clone(),
+                token_ends: entry.token_ends.clone(),
+            });
+            continue;
+        }
+
+        let common = common_prefix_bytes(&entry.rendered, rendered);
+        let Some(split) = rendered[..common].rfind(PROMPT_BLOCK_START) else {
+            continue;
+        };
+        let Some(last_token) = entry.token_ends.iter().position(|&end| end == split) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|cached: &CachedPrefix| cached.split < split)
+        {
+            let reused_tokens = last_token + 1;
+            best = Some(CachedPrefix {
+                split,
+                token_ids: entry.token_ids[..reused_tokens].to_vec(),
+                token_ends: entry.token_ends[..reused_tokens].to_vec(),
+            });
+        }
+    }
+    best
+}
+
+fn common_prefix_bytes(left: &str, right: &str) -> usize {
+    let limit = left.len().min(right.len());
+    let left_bytes = left.as_bytes();
+    let right_bytes = right.as_bytes();
+    let mut length = 0;
+    while length < limit && left_bytes[length] == right_bytes[length] {
+        length += 1;
+    }
+    while length > 0 && !(left.is_char_boundary(length) && right.is_char_boundary(length)) {
+        length -= 1;
+    }
+    length
+}
+
 fn validate_tokenizer(tokenizer: &Tokenizer) -> FrontendResult<()> {
     let entries = tokenizer.get_vocab_size(true);
     if entries != TOKENIZER_ENTRIES {
@@ -416,11 +604,12 @@ fn parse_stop_ids(generation: &Value) -> FrontendResult<[u32; 2]> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatMessage, ChatTemplateOptions, FrontendErrorCode, TextFrontend, byte_level_table,
+        CachedPrefix, ChatMessage, ChatTemplateOptions, FrontendErrorCode, PROMPT_BLOCK_START,
+        PromptPrefixEntry, TextFrontend, best_cached_prefix, byte_level_table, common_prefix_bytes,
         finish_pending, parse_stop_ids, push_stream_byte,
     };
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::{HashSet, VecDeque};
     use tokenizers::Tokenizer;
     use tokenizers::models::wordlevel::WordLevel;
 
@@ -519,6 +708,8 @@ mod tests {
             stop_ids: [3, 3],
             byte_table,
             special_decode_ids: HashSet::from([3]),
+            prompt_cache_capacity: 0,
+            prompt_cache: std::sync::Mutex::new(VecDeque::new()),
         };
 
         let mut decoder = frontend.streaming_decoder();
@@ -532,5 +723,33 @@ mod tests {
 
         let error = decoder.push(0).unwrap_err();
         assert_eq!(error.code(), FrontendErrorCode::Contract);
+    }
+
+    #[test]
+    fn common_prefix_is_a_character_boundary() {
+        assert_eq!(common_prefix_bytes("abc", "abc"), 3);
+        assert_eq!(common_prefix_bytes("abc", "abd"), 2);
+        assert_eq!(common_prefix_bytes("abc北", "abc南"), 3);
+        assert_eq!(common_prefix_bytes("🚀a", "🚀b"), 4);
+    }
+
+    #[test]
+    fn cache_selects_the_latest_shared_message_boundary() {
+        let first = "prefix<|im_start|>one<|im_start|>old";
+        let second_split = first.rfind(PROMPT_BLOCK_START).unwrap();
+        let cache = VecDeque::from([PromptPrefixEntry {
+            rendered: first.into(),
+            token_ids: vec![10, 11],
+            token_ends: vec![6, second_split],
+        }]);
+
+        let CachedPrefix {
+            split,
+            token_ids,
+            token_ends,
+        } = best_cached_prefix(&cache, "prefix<|im_start|>one<|im_start|>new").unwrap();
+        assert_eq!(split, second_split);
+        assert_eq!(token_ids, [10, 11]);
+        assert_eq!(token_ends, [6, second_split]);
     }
 }

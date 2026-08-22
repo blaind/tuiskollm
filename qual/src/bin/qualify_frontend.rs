@@ -3,7 +3,9 @@
 use std::env;
 use std::error::Error;
 use std::path::Path;
-use tuisko_frontend::{ChatMessage, ChatTemplateOptions, TextFrontend};
+use tuisko_frontend::{
+    ChatMessage, ChatTemplateOptions, PromptEncoding, TextFrontend, TextFrontendOptions,
+};
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
 const DEFAULT_HELLO: &[u32] = &[
@@ -62,14 +64,103 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     require_streaming_equal(&frontend, &with_specials)?;
+    let cache_ids = qualify_prompt_cache(&snapshot)?;
 
     println!(
-        "frontend qualification passed: {} exact reference token IDs, {} streaming IDs, stop IDs {:?}",
+        "frontend qualification passed: {} exact reference token IDs, {} streaming IDs, {} cache-case IDs, stop IDs {:?}",
         default.len() + no_thinking.len(),
         streaming_ids.len() + with_specials.len(),
+        cache_ids,
         frontend.stop_ids()
     );
     Ok(())
+}
+
+fn qualify_prompt_cache(
+    snapshot: &CheckpointSnapshot<Qwen38_27B>,
+) -> Result<usize, Box<dyn Error>> {
+    let options = ChatTemplateOptions {
+        enable_thinking: Some(false),
+    };
+    let uncached = TextFrontend::open_with_options(
+        snapshot,
+        TextFrontendOptions {
+            prompt_cache_capacity: 0,
+        },
+    )?;
+    let cached = TextFrontend::open_with_options(
+        snapshot,
+        TextFrontendOptions {
+            prompt_cache_capacity: 4,
+        },
+    )?;
+
+    let first = vec![ChatMessage::new(
+        "user",
+        "Explain why café and 中文 remain valid UTF-8.",
+    )];
+    let mut extended = first.clone();
+    extended.push(ChatMessage::new(
+        "assistant",
+        "They are represented by complete Unicode scalar values.",
+    ));
+    extended.push(ChatMessage::new("user", "Now include テスト and 🚀."));
+    let mut branch = first.clone();
+    branch.push(ChatMessage::new("assistant", "Both are Unicode text."));
+    branch.push(ChatMessage::new("user", "Give the short version."));
+
+    let disabled_first = uncached.encode_chat_with_report(&first, options)?;
+    let disabled_repeat = uncached.encode_chat_with_report(&first, options)?;
+    if disabled_first.token_ids != disabled_repeat.token_ids
+        || disabled_repeat.reused_tokens != 0
+        || disabled_repeat.fresh_bytes != disabled_repeat.rendered_bytes
+    {
+        return Err("zero-capacity prompt cache reused an encoding".into());
+    }
+
+    let mut checked_ids = 0;
+    for messages in [&first, &extended] {
+        let expected = uncached.encode_chat(messages, options)?;
+        let actual = cached.encode_chat_with_report(messages, options)?;
+        if actual.token_ids != expected {
+            return Err("prompt-prefix cache changed encoded token IDs".into());
+        }
+        if actual.reused_tokens > actual.token_ids.len()
+            || actual.fresh_bytes > actual.rendered_bytes
+        {
+            return Err("prompt-prefix cache accounting exceeds the encoded prompt".into());
+        }
+        checked_ids += actual.token_ids.len();
+
+        if messages == &extended && !is_partial_cache_hit(&actual) {
+            return Err("extended prompt did not exercise partial prefix reuse".into());
+        }
+    }
+
+    let identical = cached.encode_chat_with_report(&extended, options)?;
+    if identical.reused_tokens != identical.token_ids.len() || identical.fresh_bytes != 0 {
+        return Err("identical prompt did not reuse its complete encoding".into());
+    }
+    checked_ids += identical.token_ids.len();
+
+    let expected_branch = uncached.encode_chat(&branch, options)?;
+    let actual_branch = cached.encode_chat_with_report(&branch, options)?;
+    if actual_branch.token_ids != expected_branch {
+        return Err("branched prompt-prefix cache changed encoded token IDs".into());
+    }
+    if !is_partial_cache_hit(&actual_branch) {
+        return Err("branched prompt did not exercise partial prefix reuse".into());
+    }
+    checked_ids += actual_branch.token_ids.len();
+
+    Ok(checked_ids)
+}
+
+fn is_partial_cache_hit(encoding: &PromptEncoding) -> bool {
+    encoding.reused_tokens > 0
+        && encoding.reused_tokens < encoding.token_ids.len()
+        && encoding.fresh_bytes > 0
+        && encoding.fresh_bytes < encoding.rendered_bytes
 }
 
 fn require_streaming_equal(

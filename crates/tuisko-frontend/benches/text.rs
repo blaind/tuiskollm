@@ -4,7 +4,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use std::env;
 use std::hint::black_box;
 use std::path::Path;
-use tuisko_frontend::{ChatMessage, ChatTemplateOptions, TextFrontend};
+use tuisko_frontend::{ChatMessage, ChatTemplateOptions, TextFrontend, TextFrontendOptions};
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
 fn text_frontend(criterion: &mut Criterion) {
@@ -47,6 +47,84 @@ fn text_frontend(criterion: &mut Criterion) {
         );
     }
     encode.finish();
+
+    let cache_disabled = TextFrontend::open_with_options(
+        &snapshot,
+        TextFrontendOptions {
+            prompt_cache_capacity: 0,
+        },
+    )
+    .unwrap();
+    let identical_cache = TextFrontend::open(&snapshot).unwrap();
+    let partial_cache = TextFrontend::open_with_options(
+        &snapshot,
+        TextFrontendOptions {
+            prompt_cache_capacity: 4,
+        },
+    )
+    .unwrap();
+    let shared_user = "Explain this Unicode text: café 中文 テスト 🚀. ".repeat(32);
+    let shared_messages = vec![
+        ChatMessage::new("user", shared_user),
+        ChatMessage::new("assistant", "It combines several Unicode scripts."),
+    ];
+    let mut variants = Vec::new();
+    for index in 0..8 {
+        let mut messages = shared_messages.clone();
+        messages.push(ChatMessage::new(
+            "user",
+            format!("Give variation {index} without changing the earlier messages."),
+        ));
+        variants.push(messages);
+    }
+    let expected_tokens = cache_disabled
+        .encode_chat(&variants[0], options)
+        .unwrap()
+        .len() as u64;
+    identical_cache.encode_chat(&variants[0], options).unwrap();
+    let identical_probe = identical_cache
+        .encode_chat_with_report(&variants[0], options)
+        .unwrap();
+    assert_eq!(
+        identical_probe.reused_tokens,
+        identical_probe.token_ids.len()
+    );
+    for messages in variants.iter().take(4) {
+        partial_cache.encode_chat(messages, options).unwrap();
+    }
+    let partial_probe = partial_cache
+        .encode_chat_with_report(&variants[4], options)
+        .unwrap();
+    assert!(partial_probe.reused_tokens > 0);
+    assert!(partial_probe.fresh_bytes > 0);
+
+    let mut encode_chat = criterion.benchmark_group("frontend/encode_chat");
+    encode_chat.throughput(Throughput::Elements(expected_tokens));
+    encode_chat.bench_function("cache-disabled", |bencher| {
+        bencher.iter(|| {
+            cache_disabled
+                .encode_chat(black_box(&variants[0]), options)
+                .unwrap()
+        });
+    });
+    encode_chat.bench_function("identical-hit", |bencher| {
+        bencher.iter(|| {
+            identical_cache
+                .encode_chat_with_report(black_box(&variants[0]), options)
+                .unwrap()
+        });
+    });
+    let mut variant = 0;
+    encode_chat.bench_function("partial-hit", |bencher| {
+        bencher.iter(|| {
+            let messages = &variants[variant % variants.len()];
+            variant += 1;
+            partial_cache
+                .encode_chat_with_report(black_box(messages), options)
+                .unwrap()
+        });
+    });
+    encode_chat.finish();
 
     let mut decode = criterion.benchmark_group("frontend/decode");
     decode.throughput(Throughput::Elements(long_ids.len() as u64));
