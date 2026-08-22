@@ -18,6 +18,17 @@ pub(crate) const EXPECTED_COMPUTE_CAPABILITY: (i32, i32) = TARGET_PROFILE.comput
 pub(crate) const EXPECTED_COMPUTE_CAPABILITY_TEXT: &str = TARGET_PROFILE.compute_capability_text();
 pub(crate) const EXPECTED_DEVICE_NAME: &str = TARGET_PROFILE.device_name();
 
+pub(crate) const MAX_SM_CLOCK_SPREAD_MHZ: u32 = match TARGET_PROFILE {
+    // The RTX 5090 moves between 2,160 and 2,197 MHz under measured light loads.
+    tuisko_targets::TargetProfile::Sm120 => 50,
+    tuisko_targets::TargetProfile::Sm89 | tuisko_targets::TargetProfile::Sm86 => 30,
+};
+pub(crate) const MAX_MEMORY_CLOCK_SPREAD_MHZ: u32 = match TARGET_PROFILE {
+    // The RTX 5090 moves between 14,001 and 13,801 MHz under measured light loads.
+    tuisko_targets::TargetProfile::Sm120 => 250,
+    tuisko_targets::TargetProfile::Sm89 | tuisko_targets::TargetProfile::Sm86 => 100,
+};
+
 pub(crate) const CLOCK_LOCK_COMMAND: Option<&str> = match TARGET_PROFILE {
     tuisko_targets::TargetProfile::Sm120 => Some(
         "sudo nvidia-smi -i 0 --lock-gpu-clocks=2200,2200 && sudo nvidia-smi -i 0 --lock-memory-clocks=14001,14001",

@@ -1,6 +1,9 @@
 //! Shared controls and reports for exclusive device measurements.
 
-use crate::target::{CLOCK_LOCK_COMMAND, EXPECTED_COMPUTE_CAPABILITY_TEXT, EXPECTED_DEVICE_NAME};
+use crate::target::{
+    CLOCK_LOCK_COMMAND, EXPECTED_COMPUTE_CAPABILITY_TEXT, EXPECTED_DEVICE_NAME,
+    MAX_MEMORY_CLOCK_SPREAD_MHZ, MAX_SM_CLOCK_SPREAD_MHZ,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -14,8 +17,6 @@ use tuisko_gpu::{CudaGraph, CudaStream, GpuTimer};
 
 const DEVICE_INDEX: &str = "0";
 const MAX_IDLE_MEMORY_MIB: u32 = 1_024;
-const MAX_SM_CLOCK_SPREAD_MHZ: u32 = 30;
-const MAX_MEMORY_CLOCK_SPREAD_MHZ: u32 = 100;
 const MIN_TELEMETRY_SAMPLES: usize = 3;
 const DIAGNOSTIC_CLOCK_ENV: &str = "TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT";
 const CLOCK_RESET_COMMAND: &str =
@@ -637,11 +638,11 @@ impl TelemetrySampler {
         let thread = thread::spawn(move || {
             let mut samples = Vec::new();
             loop {
-                samples.push(query_telemetry()?);
+                thread::sleep(Duration::from_millis(10));
                 if thread_stop.load(Ordering::Acquire) {
                     break;
                 }
-                thread::sleep(Duration::from_millis(10));
+                samples.push(query_telemetry()?);
             }
 
             Ok(samples)
@@ -1698,6 +1699,52 @@ mod tests {
 
     #[test]
     #[cfg(feature = "device")]
+    fn target_clock_p_state_steps_are_admitted() {
+        let sample = |sm_clock_mhz, memory_clock_mhz| TelemetrySample {
+            sm_clock_mhz,
+            memory_clock_mhz,
+            temperature_celsius: 50,
+            power_watts: 220.0,
+            device_memory_used_mib: 100,
+            device_memory_free_mib: 900,
+        };
+        let evidence = telemetry_evidence(
+            vec![
+                sample(2_160, 13_801),
+                sample(2_197, 14_001),
+                sample(2_190, 13_801),
+            ],
+            false,
+        )
+        .expect("the target's measured clock P-state steps are comparable");
+
+        assert_eq!(evidence.sm_minimum_mhz, 2_160);
+        assert_eq!(evidence.sm_maximum_mhz, 2_197);
+        assert_eq!(evidence.memory_minimum_mhz, 13_801);
+        assert_eq!(evidence.memory_maximum_mhz, 14_001);
+    }
+
+    #[test]
+    fn larger_sm_clock_movement_is_refused() {
+        let sample = |sm_clock_mhz| TelemetrySample {
+            sm_clock_mhz,
+            memory_clock_mhz: 14_001,
+            temperature_celsius: 50,
+            power_watts: 220.0,
+            device_memory_used_mib: 100,
+            device_memory_free_mib: 900,
+        };
+        let error =
+            match telemetry_evidence(vec![sample(2_100), sample(2_200), sample(2_200)], false) {
+                Ok(_) => panic!("larger SM clock movement must be refused"),
+                Err(error) => error.to_string(),
+            };
+
+        assert!(error.contains("SM clock moved from 2100 to 2200 MHz"));
+    }
+
+    #[test]
+    #[cfg(feature = "device")]
     fn clock_refusal_prints_lock_and_reset_commands() {
         let sample = |memory_clock_mhz| TelemetrySample {
             sm_clock_mhz: 2_200,
@@ -1708,7 +1755,7 @@ mod tests {
             device_memory_free_mib: 900,
         };
         let error =
-            match telemetry_evidence(vec![sample(13_801), sample(14_001), sample(14_001)], false) {
+            match telemetry_evidence(vec![sample(13_601), sample(14_001), sample(14_001)], false) {
                 Ok(_) => panic!("clock spread must be refused"),
                 Err(error) => error.to_string(),
             };
@@ -1719,9 +1766,9 @@ mod tests {
         assert!(error.contains("--reset-memory-clocks"));
 
         let evidence =
-            telemetry_evidence(vec![sample(13_801), sample(14_001), sample(14_001)], true)
+            telemetry_evidence(vec![sample(13_601), sample(14_001), sample(14_001)], true)
                 .expect("diagnostic runs retain drifting clock evidence");
-        assert_eq!(evidence.memory_minimum_mhz, 13_801);
+        assert_eq!(evidence.memory_minimum_mhz, 13_601);
         assert_eq!(evidence.memory_maximum_mhz, 14_001);
     }
 
