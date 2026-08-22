@@ -3416,6 +3416,9 @@ version = "0.1.0"
 [[package]]
 name = "tuiskollm"
 version = "0.1.0"
+dependencies = [
+ "tuisko-serve",
+]
 
 [[package]]
 name = "typenum"
