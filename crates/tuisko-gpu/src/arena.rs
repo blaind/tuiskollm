@@ -210,6 +210,50 @@ impl DeviceArena {
         .map_err(|source| GpuError::driver("filling a device arena region", source))
     }
 
+    /// Enqueues a byte fill over one checked typed subrange.
+    pub fn fill_slice<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        start: usize,
+        len: usize,
+        value: u8,
+    ) -> GpuResult<()> {
+        self.require_stream_context(stream, "filling a device arena subrange")?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| GpuError::arena("arena fill subrange overflows"))?;
+        if end > region.len {
+            return Err(GpuError::arena(format!(
+                "arena fill subrange {start}..{end} exceeds a region of {} elements",
+                region.len
+            )));
+        }
+        let element_bytes = size_of::<T>();
+        let byte_start = start
+            .checked_mul(element_bytes)
+            .ok_or_else(|| GpuError::arena("arena fill byte offset overflows"))?;
+        let bytes = len
+            .checked_mul(element_bytes)
+            .ok_or_else(|| GpuError::arena("arena fill byte count overflows"))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let address = (self.address(region)? as u64)
+            .checked_add(u64::try_from(byte_start).map_err(|_| {
+                GpuError::arena("arena fill byte offset exceeds the device address width")
+            })?)
+            .ok_or_else(|| GpuError::arena("arena fill device address overflows"))?;
+
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
+        // SAFETY: the typed element subrange was checked inside the live region.
+        unsafe { cuda_core::memory::memset_d8_async(address, value, bytes, stream.cu_stream()) }
+            .map_err(|source| GpuError::driver("filling a device arena subrange", source))
+    }
+
     /// Copies the complete arena into a host byte vector.
     pub fn to_host_vec(&self, stream: &CudaStream) -> GpuResult<Vec<u8>> {
         self.require_stream_context(stream, "copying a device arena to the host")?;
