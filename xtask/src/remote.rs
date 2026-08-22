@@ -11,8 +11,8 @@ use crate::gpu_target::{GpuTarget, has_full_kernel_inventory};
 
 #[cfg(feature = "remote")]
 const USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
-    <qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
-    bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|probe|check|sweep> \
+    <qualify-residual-norm|qualify-nvfp4-swiglu|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
+    bench-residual-norm|bench-nvfp4-swiglu|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|probe|check|sweep> \
     [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
     [--samples N] [--launches-per-sample N] [--energy-seconds N]";
 
@@ -27,6 +27,7 @@ impl Qualification {
     fn parse(name: &str) -> Option<Self> {
         let filter = match name {
             "qualify-residual-norm" => "residual_norm::tests",
+            "qualify-nvfp4-swiglu" => "nvfp4_swiglu::tests",
             "qualify-fp8-qkv" => "fp8_qkv",
             "qualify-fp8-gdn-input" => "fp8_gdn_input",
             "qualify-fp8-lm-head" => "fp8_lm_head",
@@ -36,6 +37,7 @@ impl Qualification {
         Some(Self {
             name: match name {
                 "qualify-residual-norm" => "residual-norm",
+                "qualify-nvfp4-swiglu" => "nvfp4-swiglu",
                 "qualify-fp8-qkv" => "fp8-qkv",
                 "qualify-fp8-gdn-input" => "fp8-gdn-input",
                 "qualify-fp8-lm-head" => "fp8-lm-head",
@@ -56,6 +58,7 @@ impl Benchmark {
     fn parse(name: &str) -> Option<Self> {
         let suite = match name {
             "bench-residual-norm" => crate::PerformanceSuite::ResidualNorm,
+            "bench-nvfp4-swiglu" => crate::PerformanceSuite::Nvfp4SwiGlu,
             "bench-fp8-qkv" => crate::PerformanceSuite::Fp8Qkv,
             "bench-fp8-gdn-input" => crate::PerformanceSuite::Fp8GdnInput,
             "bench-fp8-lm-head" => crate::PerformanceSuite::Fp8LmHead,
@@ -123,7 +126,7 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     if !target_supports(options.gpu, command) {
         return Err(format!(
-            "GPU {} currently admits only `qualify-residual-norm`; the remaining {} inventory has not been implemented",
+            "GPU {} does not admit `{command}`; the remaining {} inventory has not been implemented",
             options.gpu.key(),
             options.gpu.kernel_crate(),
         )
@@ -133,12 +136,12 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     tuisko_remote::check_credentials().map_err(|error| format!("{error}"))?;
     if has_full_kernel_inventory(options.gpu) {
         crate::build_sm120(root)?;
-    } else {
+    } else if benchmark.is_some() {
         crate::build_residual_benchmark_target(root, options.gpu)?;
     }
     if let Some(qualification) = qualification {
         let prepared = crate::prepare_remote_qualify(root, options.gpu, qualification.filter)?;
-        crate::gate_residual_norm_target(root, options.gpu)?;
+        gate_static_resources(root, options.gpu, command)?;
         tuisko_remote::run_qualification(
             root,
             &tuisko_remote::QualificationOptions {
@@ -153,6 +156,7 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
         )
         .map_err(|error| format!("{error}"))?;
     } else if let Some(benchmark) = benchmark {
+        gate_static_resources(root, options.gpu, command)?;
         let prepared = crate::prepare_remote_benchmark(root, options.gpu, benchmark.suite)?;
         tuisko_remote::run_benchmark(
             root,
@@ -177,6 +181,17 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
 fn target_supports(gpu: GpuTarget, command: &str) -> bool {
     has_full_kernel_inventory(gpu)
         || matches!(command, "qualify-residual-norm" | "bench-residual-norm")
+        || matches!(gpu, GpuTarget::Sm89)
+            && matches!(command, "qualify-nvfp4-swiglu" | "bench-nvfp4-swiglu")
+}
+
+#[cfg(feature = "remote")]
+fn gate_static_resources(root: &Path, gpu: GpuTarget, command: &str) -> Result<(), Box<dyn Error>> {
+    if command.contains("nvfp4-swiglu") {
+        crate::gate_nvfp4_swiglu_sm89(root)
+    } else {
+        crate::gate_residual_norm_target(root, gpu)
+    }
 }
 
 #[cfg(any(feature = "remote", test))]
@@ -287,6 +302,9 @@ mod tests {
         let qualification = Qualification::parse("qualify-residual-norm").expect("known suite");
         assert_eq!(qualification.name, "residual-norm");
         assert_eq!(qualification.filter, "residual_norm::tests");
+        let qualification = Qualification::parse("qualify-nvfp4-swiglu").expect("known suite");
+        assert_eq!(qualification.name, "nvfp4-swiglu");
+        assert_eq!(qualification.filter, "nvfp4_swiglu::tests");
         assert_eq!(
             Benchmark::parse("bench-fp8-qkv")
                 .expect("known benchmark")
@@ -333,5 +351,9 @@ mod tests {
             assert!(!target_supports(gpu, "qualify-fp8-qkv"));
             assert!(!target_supports(gpu, "bench-fp8-qkv"));
         }
+        assert!(target_supports(GpuTarget::Sm89, "qualify-nvfp4-swiglu"));
+        assert!(target_supports(GpuTarget::Sm89, "bench-nvfp4-swiglu"));
+        assert!(!target_supports(GpuTarget::Sm86, "qualify-nvfp4-swiglu"));
+        assert!(!target_supports(GpuTarget::Sm86, "bench-nvfp4-swiglu"));
     }
 }

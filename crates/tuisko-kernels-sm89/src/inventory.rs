@@ -1,8 +1,12 @@
+use crate::nvfp4::nvfp4_swiglu_ptx_names;
 use crate::residual_norm::residual_norm_ptx_names;
 
 /// Stable semantic inventory of every admitted SM89 entry.
 pub fn kernel_ptx_names() -> Vec<&'static str> {
-    residual_norm_ptx_names().into_iter().collect()
+    residual_norm_ptx_names()
+        .into_iter()
+        .chain(nvfp4_swiglu_ptx_names())
+        .collect()
 }
 
 #[cfg(test)]
@@ -15,7 +19,7 @@ mod tests {
         let names = kernel_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 24);
         assert_eq!(unique.len(), names.len());
     }
 }

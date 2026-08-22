@@ -27,7 +27,7 @@ impl BuildTargetProfile for GpuTarget {
     fn qualification_feature(self) -> &'static str {
         match self {
             Self::Sm120 => "device",
-            Self::Sm89 => "sm89-residual",
+            Self::Sm89 => "sm89",
             Self::Sm86 => "sm86-residual",
         }
     }
@@ -106,7 +106,7 @@ mod tests {
                 (
                     GpuTarget::Sm89,
                     "tuisko-kernels-sm89",
-                    "sm89-residual",
+                    "sm89",
                     "target/cuda/tuisko_kernels_sm89.ptx",
                     "qual/baselines/residual-norm-sm89.txt",
                     "target/cuda-oxide-build-sm89",

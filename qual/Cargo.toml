@@ -15,7 +15,7 @@ device = [
     "dep:tuisko-kernels-sm120",
 ]
 residual-benchmark = []
-sm89-residual = [
+sm89 = [
     "residual-benchmark",
     "dep:tuisko-gpu",
     "dep:tuisko-kernels-sm89",
