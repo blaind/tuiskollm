@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 #[cfg(any(feature = "device", feature = "sm89"))]
 use tuisko_qual::benchmark_fp8_qkv;
-#[cfg(feature = "sm89")]
+#[cfg(any(feature = "device", feature = "sm89"))]
 use tuisko_qual::benchmark_nvfp4_down;
 #[cfg(any(feature = "device", feature = "sm89", feature = "sm86"))]
 use tuisko_qual::benchmark_nvfp4_swiglu;
@@ -65,7 +65,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_nvfp4_swiglu(options)?, json_path)
         }
-        #[cfg(feature = "sm89")]
+        #[cfg(any(feature = "device", feature = "sm89"))]
         "nvfp4-down" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_nvfp4_down(options)?, json_path)

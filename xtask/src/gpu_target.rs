@@ -77,8 +77,9 @@ impl BuildTargetProfile for GpuTarget {
 
     fn nvfp4_down_resource_baseline(self) -> Option<&'static str> {
         match self {
+            Self::Sm120 => Some("qual/baselines/nvfp4-down-sm120.txt"),
             Self::Sm89 => Some("qual/baselines/nvfp4-down-sm89.txt"),
-            Self::Sm120 | Self::Sm86 => None,
+            Self::Sm86 => None,
         }
     }
 
@@ -158,7 +159,11 @@ mod tests {
         );
         assert_eq!(
             GpuTarget::ALL.map(BuildTargetProfile::nvfp4_down_resource_baseline),
-            [None, Some("qual/baselines/nvfp4-down-sm89.txt"), None]
+            [
+                Some("qual/baselines/nvfp4-down-sm120.txt"),
+                Some("qual/baselines/nvfp4-down-sm89.txt"),
+                None,
+            ]
         );
         assert_eq!(
             GpuTarget::ALL.map(BuildTargetProfile::fp8_qkv_resource_baseline),
