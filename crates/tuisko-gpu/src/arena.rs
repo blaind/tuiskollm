@@ -336,6 +336,46 @@ impl DeviceArena {
         Ok(host)
     }
 
+    /// Copies the beginning of one region into an existing host slice.
+    pub fn copy_prefix_to_host_slice<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        destination: &mut [T],
+    ) -> GpuResult<()> {
+        self.require_stream_context(stream, "copying a device arena region to the host")?;
+        if destination.len() > region.len {
+            return Err(GpuError::arena(format!(
+                "host destination has {} elements for an arena region of {} elements",
+                destination.len(),
+                region.len
+            )));
+        }
+        let address = self.address(region)? as u64;
+        let bytes = size_of_val(destination);
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
+        // SAFETY: the checked region and initialized destination both cover `bytes`.
+        unsafe {
+            cuda_core::memory::memcpy_dtoh_async(
+                destination.as_mut_ptr(),
+                address,
+                bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|source| GpuError::driver("copying a device arena region to the host", source))?;
+        stream
+            .synchronize()
+            .map_err(|source| GpuError::driver("synchronizing a device arena download", source))
+    }
+
     fn require_stream_context(&self, stream: &CudaStream, operation: &str) -> GpuResult<()> {
         if self.storage.context().as_ref() != stream.context().as_ref() {
             return Err(GpuError::context(format!(

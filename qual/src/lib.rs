@@ -93,6 +93,8 @@ mod paged_gqa;
 #[cfg(feature = "device")]
 mod paged_gqa_benchmark;
 #[cfg(feature = "device")]
+mod resident_generation;
+#[cfg(feature = "device")]
 mod resident_model;
 #[cfg(feature = "device")]
 mod resident_model_benchmark;
@@ -197,6 +199,11 @@ pub use nvfp4_swiglu_benchmark::benchmark_nvfp4_swiglu;
 pub use paged_gqa::{PagedGqaQualification, PagedGqaQualificationError, qualify_paged_gqa};
 #[cfg(feature = "device")]
 pub use paged_gqa_benchmark::benchmark_paged_gqa;
+#[cfg(feature = "device")]
+pub use resident_generation::{
+    ResidentGenerationQualification, ResidentGenerationQualificationError,
+    qualify_resident_generation,
+};
 #[cfg(feature = "device")]
 pub use resident_model::{
     ResidentModelQualification, ResidentModelQualificationError, qualify_resident_model,
