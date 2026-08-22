@@ -181,14 +181,14 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
 fn target_supports(gpu: GpuTarget, command: &str) -> bool {
     has_full_kernel_inventory(gpu)
         || matches!(command, "qualify-residual-norm" | "bench-residual-norm")
-        || matches!(gpu, GpuTarget::Sm89)
+        || matches!(gpu, GpuTarget::Sm89 | GpuTarget::Sm86)
             && matches!(command, "qualify-nvfp4-swiglu" | "bench-nvfp4-swiglu")
 }
 
 #[cfg(feature = "remote")]
 fn gate_static_resources(root: &Path, gpu: GpuTarget, command: &str) -> Result<(), Box<dyn Error>> {
     if command.contains("nvfp4-swiglu") {
-        crate::gate_nvfp4_swiglu_sm89(root)
+        crate::gate_nvfp4_swiglu_target(root, gpu)
     } else {
         crate::gate_residual_norm_target(root, gpu)
     }
@@ -353,7 +353,7 @@ mod tests {
         }
         assert!(target_supports(GpuTarget::Sm89, "qualify-nvfp4-swiglu"));
         assert!(target_supports(GpuTarget::Sm89, "bench-nvfp4-swiglu"));
-        assert!(!target_supports(GpuTarget::Sm86, "qualify-nvfp4-swiglu"));
-        assert!(!target_supports(GpuTarget::Sm86, "bench-nvfp4-swiglu"));
+        assert!(target_supports(GpuTarget::Sm86, "qualify-nvfp4-swiglu"));
+        assert!(target_supports(GpuTarget::Sm86, "bench-nvfp4-swiglu"));
     }
 }

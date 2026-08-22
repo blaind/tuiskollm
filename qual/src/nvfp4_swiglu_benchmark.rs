@@ -1,4 +1,4 @@
-//! Paired timings for every exact SM89 NVFP4 SwiGLU route.
+//! Paired timings for every exact portable NVFP4 A16 SwiGLU route.
 
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
@@ -298,7 +298,7 @@ fn f32_to_bf16(value: f32) -> u16 {
     (rounded >> 16) as u16
 }
 
-/// Measures every exact SM89 NVFP4 SwiGLU route with paired timings.
+/// Measures every exact-target NVFP4 SwiGLU route with paired timings.
 pub fn benchmark_nvfp4_swiglu(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {

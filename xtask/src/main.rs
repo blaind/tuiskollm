@@ -125,7 +125,7 @@ impl PerformanceSuite {
             Self::GdnPrepare => qualify_gdn_prepare(root),
             Self::GdnRecurrence => qualify_gdn_recurrence(root),
             Self::Nvfp4SwiGlu => Err(
-                "SM89 NVFP4 qualification is available through `remote qualify-nvfp4-swiglu --gpu 4090`"
+                "non-SM120 NVFP4 qualification is available through `remote qualify-nvfp4-swiglu --gpu 4090|3090`"
                     .into(),
             ),
             Self::GdnOutput => qualify_gdn_output(root),
@@ -1170,10 +1170,12 @@ pub(crate) fn prepare_remote_benchmark(
     }
     let artifact_name = format!("bench-device-{}", gpu.key());
     let executable = strip_remote_artifact(root, &built, &artifact_name)?;
-    let resource_baseline = if matches!(suite, PerformanceSuite::ResidualNorm) {
-        gpu.residual_resource_baseline()
-    } else {
-        suite.resource_baseline()
+    let resource_baseline = match suite {
+        PerformanceSuite::ResidualNorm => gpu.residual_resource_baseline(),
+        PerformanceSuite::Nvfp4SwiGlu => gpu
+            .nvfp4_swiglu_resource_baseline()
+            .ok_or_else(|| format!("GPU {} has no NVFP4 SwiGLU resource baseline", gpu.key()))?,
+        _ => suite.resource_baseline(),
     };
 
     Ok(RemoteBenchmark {
@@ -1407,18 +1409,22 @@ pub(crate) fn gate_residual_norm_target(
 }
 
 #[cfg(feature = "remote")]
-pub(crate) fn gate_nvfp4_swiglu_sm89(root: &Path) -> Result<(), Box<dyn Error>> {
-    let baseline = parse_baseline(&fs::read_to_string(
-        root.join(NVFP4_SWIGLU_SM89_RESOURCE_BASELINE),
-    )?)?;
+pub(crate) fn gate_nvfp4_swiglu_target(
+    root: &Path,
+    gpu: gpu_target::GpuTarget,
+) -> Result<(), Box<dyn Error>> {
+    let baseline_path = gpu
+        .nvfp4_swiglu_resource_baseline()
+        .ok_or_else(|| format!("GPU {} has no NVFP4 SwiGLU resource baseline", gpu.key()))?;
+    let baseline = parse_baseline(&fs::read_to_string(root.join(baseline_path))?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let gpu = gpu_target::GpuTarget::Sm89;
     let ptx_path = root.join(gpu.ptx_path());
     let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
         format!(
-            "could not read {}: {error}; run the pinned SM89 release build first",
-            ptx_path.display()
+            "could not read {}: {error}; run the pinned {} release build first",
+            ptx_path.display(),
+            gpu.oxide_arch()
         )
     })?;
     let entries = parse_entries(&ptx);
@@ -1428,7 +1434,7 @@ pub(crate) fn gate_nvfp4_swiglu_sm89(root: &Path) -> Result<(), Box<dyn Error>> 
             entry.name == "nvfp4_swiglu_a16_b1" || entry.name.starts_with("nvfp4_swiglu_a16_TID_")
         })
         .collect::<Vec<_>>();
-    require_count("SM89 NVFP4 SwiGLU", swiglu.len(), 8)?;
+    require_count(gpu.oxide_arch(), swiglu.len(), 8)?;
 
     for entry in &swiglu {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 1") {
@@ -1442,7 +1448,7 @@ pub(crate) fn gate_nvfp4_swiglu_sm89(root: &Path) -> Result<(), Box<dyn Error>> 
 
     let temporary = root.join("target/tmp");
     fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("nvfp4-swiglu-sm89-gate.cubin");
+    let cubin = temporary.join(format!("nvfp4-swiglu-{}-gate.cubin", gpu.key()));
     let ptxas = cuda_tool("ptxas");
     require_success(
         &ptxas,
@@ -1465,9 +1471,13 @@ pub(crate) fn gate_nvfp4_swiglu_sm89(root: &Path) -> Result<(), Box<dyn Error>> 
     let mut shared = Vec::new();
 
     for entry in swiglu {
-        let resource = resources
-            .get(entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted SM89 NVFP4 entry `{}`", entry.name))?;
+        let resource = resources.get(entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted {} NVFP4 entry `{}`",
+                gpu.key(),
+                entry.name
+            )
+        })?;
         require_spill_free(entry.name, resource)?;
         registers.push(resource.registers);
         shared.push(resource.shared);
@@ -1477,8 +1487,10 @@ pub(crate) fn gate_nvfp4_swiglu_sm89(root: &Path) -> Result<(), Box<dyn Error>> 
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "4090 NVFP4 SwiGLU gate passed: 8 A16 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
-        registers, shared
+        "{} NVFP4 SwiGLU gate passed: 8 A16 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
+        gpu.key(),
+        registers,
+        shared
     );
     Ok(())
 }
