@@ -8,9 +8,9 @@ dynamic-quantize FP8 QKV at exact `B=1..8` plus `T=16`, GDN Q/K/V/Z input projec
 `B=1..8`, the full-vocabulary FP8 LM head at exact `B=1..8`, dense-FP8 gate/up SwiGLU at exact
 `B=1..8` and `T=32,64,128`, dense-FP8 down and GDN control/convolution at exact `B=1..8`, and the
 GDN recurrence and source-native output projection at exact `B=1..8`, plus the source-backed
-dense-FP8 MLP and final-norm plus LM-head owners. The report schema is already shaped for future
-whole-model and serving cases, but those measurements do not exist until their production owners
-land.
+dense-FP8 MLP, complete layer-60 GDN, and final-norm plus LM-head owners. The report schema is
+already shaped for future whole-model and serving cases, but those measurements do not exist until
+their production owners land.
 
 ## Quick start
 
@@ -64,10 +64,12 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- qualify-gdn-recurrence` | Check mapped FP32 state transitions, gated normalization, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-gdn-output` | Check dynamic E4M3 quantization, source-native output projection, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact-B graph, stable addresses, and owner allocation | terminal |
+| `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact-B graphs, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
 | `cargo run -p xtask -- bench-gdn-prepare` | Measure every exact control-plus-convolution graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-recurrence` | Measure every exact stateful recurrence graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-output` | Measure every exact output quantize-plus-projection graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT` | Measure every complete source-backed layer-60 graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
 | `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
@@ -124,6 +126,10 @@ leaf-wide `perf` commands until its first reviewed baseline is blessed.
 `bench-dense-fp8-mlp SNAPSHOT` measures the complete source-backed layer-60 MLP graph with the same
 options. It stays outside leaf-wide `perf` until the source-backed route receives a reviewed
 baseline.
+
+`bench-dense-fp8-gdn-layer SNAPSHOT` measures the complete stateful layer-60 graph. Repeated samples
+advance its persistent history and FP32 recurrence exactly as serial decode rounds do; setup and
+allocation remain outside the timed region.
 
 Add `--energy-seconds 2` for sustained energy sampling. At least three samples, one launch per
 sample, and a two-second energy window are required.

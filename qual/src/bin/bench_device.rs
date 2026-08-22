@@ -5,10 +5,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tuisko_qual::{
-    DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_dense_fp8_mlp, benchmark_fp8_down,
-    benchmark_fp8_gdn_input, benchmark_fp8_lm_head, benchmark_fp8_qkv, benchmark_fp8_swiglu,
-    benchmark_gdn_output, benchmark_gdn_prepare, benchmark_gdn_recurrence, benchmark_residual_norm,
-    benchmark_text_endpoint,
+    DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_dense_fp8_gdn_layer,
+    benchmark_dense_fp8_mlp, benchmark_fp8_down, benchmark_fp8_gdn_input, benchmark_fp8_lm_head,
+    benchmark_fp8_qkv, benchmark_fp8_swiglu, benchmark_gdn_output, benchmark_gdn_prepare,
+    benchmark_gdn_recurrence, benchmark_residual_norm, benchmark_text_endpoint,
 };
 
 fn main() -> ExitCode {
@@ -31,7 +31,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
     let suite = arguments
         .next()
-        .ok_or("usage: bench-device <residual-norm|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|gdn-prepare|gdn-recurrence|gdn-output|dense-fp8-mlp|text-endpoint> [SNAPSHOT] [options]")?;
+        .ok_or("usage: bench-device <residual-norm|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|gdn-prepare|gdn-recurrence|gdn-output|dense-fp8-mlp|dense-fp8-gdn-layer|text-endpoint> [SNAPSHOT] [options]")?;
     let report = match suite.as_str() {
         "residual-norm" => {
             let (options, json_path) = parse_options(arguments)?;
@@ -76,6 +76,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             let (options, json_path) = parse_options(arguments)?;
             (
                 benchmark_dense_fp8_mlp(&PathBuf::from(snapshot), options)?,
+                json_path,
+            )
+        }
+        "dense-fp8-gdn-layer" => {
+            let snapshot = arguments
+                .next()
+                .ok_or("dense-fp8-gdn-layer requires the admitted snapshot path")?;
+            let (options, json_path) = parse_options(arguments)?;
+            (
+                benchmark_dense_fp8_gdn_layer(&PathBuf::from(snapshot), options)?,
                 json_path,
             )
         }
