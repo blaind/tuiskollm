@@ -72,3 +72,10 @@ cargo run -p xtask -- qualify-<changed-suite>
 ```
 
 If an exclusive RTX 5090 is unavailable, report the device gate as pending rather than passed.
+With explicit user permission, an agent may instead use `xtask remote`; see
+`docs/remote-gates.md`. Remote runs create billable RunPod resources, and this new runner may still
+have lifecycle bugs. After every attempt, verify that no gate pod remains with
+`cargo run -p xtask --features remote -- remote check`; use the corresponding `remote sweep` if
+needed and report any retained pod immediately. Remote qualification can satisfy numerical and
+resource gates, but remote benchmark timings are diagnostic and cannot bless a performance
+baseline.

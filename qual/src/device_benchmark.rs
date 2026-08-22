@@ -17,6 +17,7 @@ const MAX_IDLE_MEMORY_MIB: u32 = 1_024;
 const MAX_SM_CLOCK_SPREAD_MHZ: u32 = 30;
 const MAX_MEMORY_CLOCK_SPREAD_MHZ: u32 = 100;
 const MIN_TELEMETRY_SAMPLES: usize = 3;
+const DIAGNOSTIC_CLOCK_ENV: &str = "TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT";
 const CLOCK_LOCK_COMMAND: &str = "sudo nvidia-smi -i 0 --lock-gpu-clocks=2200,2200 && sudo nvidia-smi -i 0 --lock-memory-clocks=14001,14001";
 const CLOCK_RESET_COMMAND: &str =
     "sudo nvidia-smi -i 0 --reset-gpu-clocks && sudo nvidia-smi -i 0 --reset-memory-clocks";
@@ -437,6 +438,8 @@ pub struct DeviceBenchmarkReport {
     pub device_index: u32,
     /// Compute capability admitted by the runtime.
     pub compute_capability: String,
+    /// Whether clock spread was enforced or merely recorded for a diagnostic run.
+    pub clock_policy: &'static str,
     /// Hash of the benchmark executable.
     pub binary_sha256: String,
     /// Hash of the complete checked generator/resource baseline.
@@ -665,7 +668,7 @@ impl TelemetrySampler {
             })?
             .map_err(DeviceBenchmarkError::Precondition)?;
 
-        telemetry_evidence(samples)
+        telemetry_evidence(samples, diagnostic_clock_drift_allowed())
     }
 }
 
@@ -945,7 +948,7 @@ pub(crate) fn finish_report(
     let identity = preflight.identity;
 
     Ok(DeviceBenchmarkReport {
-        schema_version: 5,
+        schema_version: 6,
         suite: spec.suite,
         classification: spec.classification,
         device: identity.name,
@@ -953,6 +956,11 @@ pub(crate) fn finish_report(
         driver_version: identity.driver_version,
         device_index: 0,
         compute_capability: "12.0".to_string(),
+        clock_policy: if diagnostic_clock_drift_allowed() {
+            "diagnostic_uncontrolled"
+        } else {
+            "controlled"
+        },
         binary_sha256: executable_sha256()?,
         generator_baseline_sha256,
         sm_clock_min_mhz: telemetry.sm_minimum_mhz,
@@ -1293,6 +1301,7 @@ pub(crate) fn generator_baseline_sha256() -> Result<String, DeviceBenchmarkError
 
 fn telemetry_evidence(
     samples: Vec<TelemetrySample>,
+    allow_clock_drift: bool,
 ) -> Result<TelemetryEvidence, DeviceBenchmarkError> {
     if samples.len() < MIN_TELEMETRY_SAMPLES {
         return Err(DeviceBenchmarkError::Precondition(format!(
@@ -1333,7 +1342,7 @@ fn telemetry_evidence(
     device_free.sort_unstable();
 
     let sm_spread = sm[sm.len() - 1] - sm[0];
-    if sm_spread > MAX_SM_CLOCK_SPREAD_MHZ {
+    if sm_spread > MAX_SM_CLOCK_SPREAD_MHZ && !allow_clock_drift {
         return Err(DeviceBenchmarkError::Precondition(format!(
             "SM clock moved from {} to {} MHz\nlock target clocks before the run:\n  {CLOCK_LOCK_COMMAND}\nreset them afterward:\n  {CLOCK_RESET_COMMAND}",
             sm[0],
@@ -1341,7 +1350,7 @@ fn telemetry_evidence(
         )));
     }
     let memory_spread = memory[memory.len() - 1] - memory[0];
-    if memory_spread > MAX_MEMORY_CLOCK_SPREAD_MHZ {
+    if memory_spread > MAX_MEMORY_CLOCK_SPREAD_MHZ && !allow_clock_drift {
         return Err(DeviceBenchmarkError::Precondition(format!(
             "memory clock moved from {} to {} MHz\nlock target clocks before the run:\n  {CLOCK_LOCK_COMMAND}\nreset them afterward:\n  {CLOCK_RESET_COMMAND}",
             memory[0],
@@ -1366,6 +1375,10 @@ fn telemetry_evidence(
         device_memory_minimum_free_bytes: device_free[0],
         samples: samples.len(),
     })
+}
+
+fn diagnostic_clock_drift_allowed() -> bool {
+    env::var(DIAGNOSTIC_CLOCK_ENV).as_deref() == Ok("1")
 }
 
 fn summary_memory_metric(
@@ -1584,32 +1597,35 @@ mod tests {
 
     #[test]
     fn telemetry_statistics_are_deterministic() {
-        let evidence = telemetry_evidence(vec![
-            TelemetrySample {
-                sm_clock_mhz: 2_190,
-                memory_clock_mhz: 14_000,
-                temperature_celsius: 51,
-                power_watts: 220.0,
-                device_memory_used_mib: 100,
-                device_memory_free_mib: 900,
-            },
-            TelemetrySample {
-                sm_clock_mhz: 2_200,
-                memory_clock_mhz: 14_010,
-                temperature_celsius: 53,
-                power_watts: 240.0,
-                device_memory_used_mib: 102,
-                device_memory_free_mib: 898,
-            },
-            TelemetrySample {
-                sm_clock_mhz: 2_195,
-                memory_clock_mhz: 14_005,
-                temperature_celsius: 52,
-                power_watts: 230.0,
-                device_memory_used_mib: 101,
-                device_memory_free_mib: 899,
-            },
-        ])
+        let evidence = telemetry_evidence(
+            vec![
+                TelemetrySample {
+                    sm_clock_mhz: 2_190,
+                    memory_clock_mhz: 14_000,
+                    temperature_celsius: 51,
+                    power_watts: 220.0,
+                    device_memory_used_mib: 100,
+                    device_memory_free_mib: 900,
+                },
+                TelemetrySample {
+                    sm_clock_mhz: 2_200,
+                    memory_clock_mhz: 14_010,
+                    temperature_celsius: 53,
+                    power_watts: 240.0,
+                    device_memory_used_mib: 102,
+                    device_memory_free_mib: 898,
+                },
+                TelemetrySample {
+                    sm_clock_mhz: 2_195,
+                    memory_clock_mhz: 14_005,
+                    temperature_celsius: 52,
+                    power_watts: 230.0,
+                    device_memory_used_mib: 101,
+                    device_memory_free_mib: 899,
+                },
+            ],
+            false,
+        )
         .unwrap();
 
         assert_eq!(evidence.sm_median_mhz, 2_195);
@@ -1630,15 +1646,22 @@ mod tests {
             device_memory_used_mib: 100,
             device_memory_free_mib: 900,
         };
-        let error = match telemetry_evidence(vec![sample(13_801), sample(14_001), sample(14_001)]) {
-            Ok(_) => panic!("clock spread must be refused"),
-            Err(error) => error.to_string(),
-        };
+        let error =
+            match telemetry_evidence(vec![sample(13_801), sample(14_001), sample(14_001)], false) {
+                Ok(_) => panic!("clock spread must be refused"),
+                Err(error) => error.to_string(),
+            };
 
         assert!(error.contains("--lock-gpu-clocks=2200,2200"));
         assert!(error.contains("--lock-memory-clocks=14001,14001"));
         assert!(error.contains("--reset-gpu-clocks"));
         assert!(error.contains("--reset-memory-clocks"));
+
+        let evidence =
+            telemetry_evidence(vec![sample(13_801), sample(14_001), sample(14_001)], true)
+                .expect("diagnostic runs retain drifting clock evidence");
+        assert_eq!(evidence.memory_minimum_mhz, 13_801);
+        assert_eq!(evidence.memory_maximum_mhz, 14_001);
     }
 
     #[test]

@@ -1,18 +1,20 @@
 [package]
-name = "xtask"
+name = "tuisko-remote"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
+flate2.workspace = true
+russh.workspace = true
+russh-sftp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tuisko-remote = { workspace = true, optional = true }
-
-[features]
-remote = ["dep:tuisko-remote"]
+thiserror.workspace = true
+tokio.workspace = true
+ureq.workspace = true
 
 [lints]
 workspace = true

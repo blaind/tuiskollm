@@ -6,8 +6,8 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 
-const BASELINE_SCHEMA: u32 = 3;
-const REPORT_SCHEMA: u32 = 5;
+const BASELINE_SCHEMA: u32 = 4;
+const REPORT_SCHEMA: u32 = 6;
 const CLOCK_PADDING_MHZ: u32 = 15;
 const MEMORY_CLOCK_PADDING_MHZ: u32 = 50;
 const DEVICE_RELATIVE_TOLERANCE_PERCENT: f64 = 5.0;
@@ -23,6 +23,7 @@ struct PerformanceReport {
     device: String,
     driver_version: String,
     compute_capability: String,
+    clock_policy: String,
     binary_sha256: String,
     generator_baseline_sha256: String,
     sm_clock_min_mhz: u32,
@@ -84,6 +85,7 @@ struct PerformanceBaseline {
     device: String,
     driver_version: String,
     compute_capability: String,
+    clock_policy: String,
     blessed_binary_sha256: String,
     generator_baseline_sha256: String,
     sm_clock_band_mhz: ClockBand,
@@ -282,6 +284,13 @@ pub(crate) fn compare(report_path: &Path, baseline_path: &Path) -> Result<(), Bo
 
 pub(crate) fn bless(report_path: &Path, baseline_path: &Path) -> Result<(), Box<dyn Error>> {
     let report = read_report(report_path)?;
+    if report.clock_policy != "controlled" {
+        return Err(format!(
+            "cannot bless a performance report with clock policy `{}`",
+            report.clock_policy
+        )
+        .into());
+    }
     let _ = report_metrics(&report)?;
     let _ = report_memory_metrics(&report.memory)?;
     let previous = if baseline_path.is_file() {
@@ -380,6 +389,7 @@ pub(crate) fn bless(report_path: &Path, baseline_path: &Path) -> Result<(), Box<
         device: report.device,
         driver_version: report.driver_version,
         compute_capability: report.compute_capability,
+        clock_policy: report.clock_policy,
         blessed_binary_sha256: report.binary_sha256,
         generator_baseline_sha256: report.generator_baseline_sha256,
         sm_clock_band_mhz: padded_band(
@@ -448,6 +458,7 @@ fn validate_environment(
             &report.compute_capability,
             &baseline.compute_capability,
         ),
+        ("clock policy", &report.clock_policy, &baseline.clock_policy),
         (
             "generator baseline",
             &report.generator_baseline_sha256,
@@ -844,6 +855,7 @@ mod tests {
             device: "NVIDIA GeForce RTX 5090".to_string(),
             driver_version: "driver".to_string(),
             compute_capability: "12.0".to_string(),
+            clock_policy: "controlled".to_string(),
             blessed_binary_sha256: "a".repeat(64),
             generator_baseline_sha256: "b".repeat(64),
             sm_clock_band_mhz: ClockBand {
@@ -866,6 +878,7 @@ mod tests {
         let json = serde_json::to_value(baseline).unwrap();
 
         assert_eq!(json["blessed_binary_sha256"], "a".repeat(64));
+        assert_eq!(json["clock_policy"], "controlled");
         assert!(json.get("device_uuid").is_none());
         assert!(json.get("runner").is_none());
     }
