@@ -75,6 +75,17 @@ pub struct GeneratedText {
     pub finish_reason: FinishReason,
 }
 
+/// Host-visible output retained when an active request is cancelled.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelledText {
+    /// Prompt encoding and frontend prefix-cache accounting.
+    pub prompt: PromptEncoding,
+    /// Tokens emitted before cancellation.
+    pub token_ids: Vec<u32>,
+    /// Complete text decoded before cancellation.
+    pub text: String,
+}
+
 /// Per-request host state consuming one exact BF16 vocabulary row at a time.
 pub struct GenerationSession {
     prompt: PromptEncoding,
@@ -171,6 +182,21 @@ impl GenerationSession {
             token_ids: self.generated,
             text: self.decoder.text().to_owned(),
             finish_reason,
+        })
+    }
+
+    /// Finishes text decoding and takes the observable state of one active request.
+    pub fn cancel(mut self) -> EngineResult<CancelledText> {
+        if self.finish_reason.is_some() {
+            return Err(EngineError::generation(
+                "cannot cancel a generation session after it finished",
+            ));
+        }
+        let _ = self.decoder.finish();
+        Ok(CancelledText {
+            prompt: self.prompt,
+            token_ids: self.generated,
+            text: self.decoder.text().to_owned(),
         })
     }
 }

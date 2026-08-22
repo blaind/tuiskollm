@@ -24,7 +24,8 @@ pub use error::{EngineError, EngineErrorCode, EngineResult};
 pub use full_attention_layer::FullAttentionLayerProgram;
 pub use full_attention_layer_layout::FullAttentionLayerLayout;
 pub use generation::{
-    ChatGenerationRequest, FinishReason, GeneratedText, GenerationSession, GenerationStep,
+    CancelledText, ChatGenerationRequest, FinishReason, GeneratedText, GenerationSession,
+    GenerationStep,
 };
 pub use layout::{EndpointLayout, MAX_BATCH};
 pub use nvfp4_mlp::Nvfp4MlpProgram;
@@ -32,7 +33,7 @@ pub use nvfp4_mlp_layout::Nvfp4MlpLayout;
 pub use program::TextEndpointProgram;
 pub use resident_generation::{
     ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentBatchGenerator,
-    ResidentGenerationSession, ResidentRequestId, ResidentTextGenerator,
+    ResidentCancellation, ResidentGenerationSession, ResidentRequestId, ResidentTextGenerator,
 };
 pub use resident_model_layout::{ResidentLayerKind, ResidentModelLayout, ResidentModelProgram};
 pub use sampling::{SampleDecision, Sampler, SamplingOptions};

@@ -1,7 +1,7 @@
 //! Single-slot text generation over the exact resident model owner.
 
 use crate::{
-    ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
+    CancelledText, ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
     GenerationSession, GenerationStep, MAX_BATCH, ResidentModelProgram,
 };
 #[cfg(feature = "qualification")]
@@ -31,9 +31,11 @@ pub struct ResidentBatchGenerator {
     stream: Arc<CudaStream>,
     logits: PinnedHostBuffer<u16>,
     sessions: [Option<ResidentBatchSession>; MAX_BATCH],
+    retained: [Option<RetainedSlot>; MAX_BATCH],
     active_slots: [usize; MAX_BATCH],
     active: usize,
     next_request_id: u64,
+    retention_clock: u64,
 }
 
 /// Stable request identity assigned by the compact scheduler.
@@ -46,6 +48,8 @@ pub struct ResidentBatchAdmission {
     pub request_id: ResidentRequestId,
     /// Exact rendered prompt length in tokens.
     pub prompt_tokens: usize,
+    /// Prompt tokens restored from an exact retained device-state prefix.
+    pub device_reused_tokens: usize,
     /// Immediate output for a request with `max_new_tokens == 0`.
     pub completed: Option<GeneratedText>,
 }
@@ -60,6 +64,16 @@ pub struct ResidentBatchEvent {
     pub completed: Option<GeneratedText>,
 }
 
+/// Observable state returned when an active resident request is cancelled.
+pub struct ResidentCancellation {
+    /// Cancelled scheduler request.
+    pub request_id: ResidentRequestId,
+    /// Tokens and text emitted before cancellation.
+    pub output: CancelledText,
+    /// Processed prefix tokens whose device state remains retained.
+    pub device_retained_tokens: usize,
+}
+
 /// At most eight events returned in the scheduler's stable active order.
 pub struct ResidentBatchEvents {
     events: [Option<ResidentBatchEvent>; MAX_BATCH],
@@ -71,6 +85,11 @@ struct ResidentBatchSession {
     control: GenerationSession,
     pending_token: Option<u32>,
     next_position: u32,
+}
+
+struct RetainedSlot {
+    tokens: Vec<u32>,
+    last_used: u64,
 }
 
 /// One streaming generation request borrowing the single resident slot.
@@ -246,13 +265,15 @@ impl ResidentBatchGenerator {
             stream,
             logits,
             sessions: std::array::from_fn(|_| None),
+            retained: std::array::from_fn(|_| None),
             active_slots: [usize::MAX; MAX_BATCH],
             active: 0,
             next_request_id: 1,
+            retention_clock: 0,
         })
     }
 
-    /// Admits and prompt-primes one request, recycling a free physical slot when needed.
+    /// Admits one request, restoring only an exact processed device prefix when available.
     pub fn admit(
         &mut self,
         request: &ChatGenerationRequest,
@@ -273,18 +294,20 @@ impl ResidentBatchGenerator {
             return Ok(ResidentBatchAdmission {
                 request_id,
                 prompt_tokens,
+                device_reused_tokens: 0,
                 completed: Some(control.into_output()?),
             });
         }
-        let slot = self
-            .sessions
-            .iter()
-            .position(Option::is_none)
-            .ok_or_else(|| EngineError::route("all eight resident generation slots are active"))?;
-
-        self.program.reset_slot(&self.stream, slot)?;
+        let (slot, device_reused_tokens, reset) = self.select_slot(control.prompt_token_ids())?;
+        if reset {
+            self.program.reset_slot(&self.stream, slot)?;
+        }
         self.program.load_slot_routes(&self.stream, &[slot])?;
-        for (position, &token) in control.prompt_token_ids().iter().enumerate() {
+        for (offset, &token) in control.prompt_token_ids()[device_reused_tokens..]
+            .iter()
+            .enumerate()
+        {
+            let position = device_reused_tokens + offset;
             replay_token(
                 &mut self.program,
                 &self.stream,
@@ -294,9 +317,11 @@ impl ResidentBatchGenerator {
                 })?,
             )?;
         }
-        let logits = slot_logits(slot);
-        self.program
-            .read_logits_into(&self.stream, 1, &mut self.logits[logits])?;
+        if device_reused_tokens < prompt_tokens {
+            let logits = slot_logits(slot);
+            self.program
+                .read_logits_into(&self.stream, 1, &mut self.logits[logits])?;
+        }
         let next_position = u32::try_from(prompt_tokens)
             .map_err(|_| EngineError::generation("prompt length exceeds the position width"))?;
         self.sessions[slot] = Some(ResidentBatchSession {
@@ -311,6 +336,7 @@ impl ResidentBatchGenerator {
         Ok(ResidentBatchAdmission {
             request_id,
             prompt_tokens,
+            device_reused_tokens,
             completed: None,
         })
     }
@@ -328,7 +354,8 @@ impl ResidentBatchGenerator {
         let mut survivors = [usize::MAX; MAX_BATCH];
         let mut surviving = 0;
         let active = self.active;
-        for (index, &slot) in self.active_slots[..active].iter().enumerate() {
+        for (index, event) in events[..active].iter_mut().enumerate() {
+            let slot = self.active_slots[index];
             let logits = slot_logits(slot);
             let step = {
                 let session = self.sessions[slot].as_mut().ok_or_else(|| {
@@ -348,13 +375,15 @@ impl ResidentBatchGenerator {
                 let session = self.sessions[slot]
                     .take()
                     .expect("terminal resident session exists");
+                let retained = processed_tokens(&session)?;
+                self.store_retained(slot, retained)?;
                 Some(session.control.into_output()?)
             } else {
                 survivors[surviving] = slot;
                 surviving += 1;
                 None
             };
-            events[index] = Some(ResidentBatchEvent {
+            *event = Some(ResidentBatchEvent {
                 request_id,
                 step,
                 completed,
@@ -366,6 +395,39 @@ impl ResidentBatchGenerator {
         Ok(ResidentBatchEvents {
             events,
             len: active,
+        })
+    }
+
+    /// Cancels one active request while retaining its fully processed device prefix.
+    pub fn cancel(&mut self, request_id: ResidentRequestId) -> EngineResult<ResidentCancellation> {
+        let index = self.active_slots[..self.active]
+            .iter()
+            .position(|&slot| {
+                self.sessions[slot]
+                    .as_ref()
+                    .is_some_and(|session| session.request_id == request_id)
+            })
+            .ok_or_else(|| {
+                EngineError::generation("resident cancellation request is not active")
+            })?;
+        let slot = self.active_slots[index];
+        let session = self.sessions[slot]
+            .take()
+            .expect("cancelled resident slot owns a session");
+        let retained = processed_tokens(&session)?;
+        let device_retained_tokens = retained.len();
+        self.store_retained(slot, retained)?;
+        for position in index..self.active - 1 {
+            self.active_slots[position] = self.active_slots[position + 1];
+        }
+        self.active -= 1;
+        self.active_slots[self.active] = usize::MAX;
+        let output = session.control.cancel()?;
+
+        Ok(ResidentCancellation {
+            request_id,
+            output,
+            device_retained_tokens,
         })
     }
 
@@ -416,6 +478,71 @@ impl ResidentBatchGenerator {
                 .as_ref()
                 .is_some_and(|session| session.request_id == request_id)
         })
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Number of exact processed tokens retained in one inactive physical slot.
+    pub fn qualification_retained_tokens(&self, slot: usize) -> Option<usize> {
+        self.retained
+            .get(slot)
+            .and_then(Option::as_ref)
+            .map(|retained| retained.tokens.len())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Drops host retention metadata so an independent scheduler fixture starts cold.
+    pub fn qualification_clear_retained(&mut self) {
+        self.retained.fill_with(|| None);
+    }
+
+    fn select_slot(&mut self, prompt: &[u32]) -> EngineResult<(usize, usize, bool)> {
+        let prefix = self
+            .retained
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, retained)| {
+                retained.as_ref().and_then(|retained| {
+                    prompt.starts_with(&retained.tokens).then_some((
+                        slot,
+                        retained.tokens.len(),
+                        retained.last_used,
+                    ))
+                })
+            })
+            .max_by_key(|&(_, tokens, last_used)| (tokens, last_used));
+        if let Some((slot, tokens, _)) = prefix {
+            self.retained[slot] = None;
+            return Ok((slot, tokens, false));
+        }
+        if let Some(slot) = (0..MAX_BATCH)
+            .find(|&slot| self.sessions[slot].is_none() && self.retained[slot].is_none())
+        {
+            return Ok((slot, 0, true));
+        }
+        let eviction = self
+            .retained
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, retained)| {
+                retained.as_ref().map(|retained| (slot, retained.last_used))
+            })
+            .min_by_key(|&(_, last_used)| last_used)
+            .map(|(slot, _)| slot)
+            .ok_or_else(|| EngineError::route("all eight resident generation slots are active"))?;
+        self.retained[eviction] = None;
+        Ok((eviction, 0, true))
+    }
+
+    fn store_retained(&mut self, slot: usize, tokens: Vec<u32>) -> EngineResult<()> {
+        self.retention_clock = self
+            .retention_clock
+            .checked_add(1)
+            .ok_or_else(|| EngineError::generation("resident retention clock overflows"))?;
+        self.retained[slot] = Some(RetainedSlot {
+            tokens,
+            last_used: self.retention_clock,
+        });
+        Ok(())
     }
 
     fn replay_pending(&mut self) -> EngineResult<()> {
@@ -532,6 +659,26 @@ fn compact_download_logits(rows: usize) -> std::ops::Range<usize> {
 fn compact_download_row(row: usize) -> std::ops::Range<usize> {
     let begin = (MAX_BATCH + row) * Qwen38_27B::VOCAB;
     begin..begin + Qwen38_27B::VOCAB
+}
+
+fn processed_tokens(session: &ResidentBatchSession) -> EngineResult<Vec<u32>> {
+    let processed = usize::try_from(session.next_position)
+        .map_err(|_| EngineError::generation("processed position exceeds host width"))?;
+    let prompt = session.control.prompt_token_ids();
+    let generated = session.control.generated_token_ids();
+    let processed_generated = processed.checked_sub(prompt.len()).ok_or_else(|| {
+        EngineError::generation("resident processed position precedes its prompt")
+    })?;
+    if processed_generated > generated.len() {
+        return Err(EngineError::generation(
+            "resident processed position exceeds emitted generation",
+        ));
+    }
+
+    let mut tokens = Vec::with_capacity(processed);
+    tokens.extend_from_slice(prompt);
+    tokens.extend_from_slice(&generated[..processed_generated]);
+    Ok(tokens)
 }
 
 fn replay_token(

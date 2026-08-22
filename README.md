@@ -31,8 +31,10 @@ address any distinct physical state/cache slots, and one slot can be reset witho
 survivors. Server wiring has not landed. Concrete single-slot and compact eight-request generation
 owners connect the admitted frontend, sampling, streaming decode, and resident graphs for prompts
 within the current 192-token cache. The compact owner preserves the final emitted token as pending,
-packs only requests needing device work, and recycles holes without moving survivor state. Prompt
-priming uses the exact B=1 decode route until optimized prefill routes are admitted.
+packs only requests needing device work, cancels without advancing that pending token, and recycles
+holes without moving survivor state. Inactive slots retain their exact processed token span and may
+skip only a prefix that the next prompt contains in full; divergence falls back to cold priming.
+Prompt priming uses the exact B=1 decode route until optimized prefill routes are admitted.
 
 ## Current device slice
 
