@@ -1,9 +1,9 @@
 //! Numerical and graph qualification for the exact residual-norm routes.
 
+use crate::target::{EXPECTED_COMPUTE_CAPABILITY, ResidualNormOp};
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
 };
-use tuisko_kernels_sm120::ResidualNormOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -62,10 +62,13 @@ pub fn qualify_residual_norm() -> Result<ResidualNormQualification, ResidualNorm
 {
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
-    if capability != (12, 0) {
+    if capability != EXPECTED_COMPUTE_CAPABILITY {
         return Err(ResidualNormQualificationError::Mismatch(format!(
-            "device zero has compute capability {}.{}, expected 12.0",
-            capability.0, capability.1
+            "device zero has compute capability {}.{}, expected {}.{}",
+            capability.0,
+            capability.1,
+            EXPECTED_COMPUTE_CAPABILITY.0,
+            EXPECTED_COMPUTE_CAPABILITY.1,
         )));
     }
 
@@ -397,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
+    #[ignore = "requires the GPU selected by the qualification feature"]
     fn exact_batches_match_independent_oracles_and_graph_replay()
     -> Result<(), ResidualNormQualificationError> {
         let report = qualify_residual_norm()?;
