@@ -52,6 +52,10 @@ mod gdn_prepare_benchmark;
 mod gdn_recurrence;
 #[cfg(feature = "device")]
 mod gdn_recurrence_benchmark;
+#[cfg(feature = "sm89")]
+mod nvfp4_down;
+#[cfg(feature = "sm89")]
+mod nvfp4_down_benchmark;
 #[cfg(any(feature = "sm89", feature = "sm86"))]
 mod nvfp4_swiglu;
 #[cfg(any(feature = "sm89", feature = "sm86"))]
@@ -119,6 +123,10 @@ pub use gdn_recurrence::{
 };
 #[cfg(feature = "device")]
 pub use gdn_recurrence_benchmark::benchmark_gdn_recurrence;
+#[cfg(feature = "sm89")]
+pub use nvfp4_down::{Nvfp4DownQualification, Nvfp4DownQualificationError, qualify_nvfp4_down};
+#[cfg(feature = "sm89")]
+pub use nvfp4_down_benchmark::benchmark_nvfp4_down;
 #[cfg(any(feature = "sm89", feature = "sm86"))]
 pub use nvfp4_swiglu::{
     Nvfp4SwiGluQualification, Nvfp4SwiGluQualificationError, qualify_nvfp4_swiglu,

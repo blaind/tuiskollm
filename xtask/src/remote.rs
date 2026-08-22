@@ -11,8 +11,8 @@ use crate::gpu_target::{GpuTarget, has_full_kernel_inventory};
 
 #[cfg(feature = "remote")]
 const USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
-    <qualify-residual-norm|qualify-nvfp4-swiglu|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
-    bench-residual-norm|bench-nvfp4-swiglu|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|probe|check|sweep> \
+    <qualify-residual-norm|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
+    bench-residual-norm|bench-nvfp4-swiglu|bench-nvfp4-down|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|probe|check|sweep> \
     [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
     [--samples N] [--launches-per-sample N] [--energy-seconds N]";
 
@@ -28,6 +28,7 @@ impl Qualification {
         let filter = match name {
             "qualify-residual-norm" => "residual_norm::tests",
             "qualify-nvfp4-swiglu" => "nvfp4_swiglu::tests",
+            "qualify-nvfp4-down" => "nvfp4_down::tests",
             "qualify-fp8-qkv" => "fp8_qkv",
             "qualify-fp8-gdn-input" => "fp8_gdn_input",
             "qualify-fp8-lm-head" => "fp8_lm_head",
@@ -38,6 +39,7 @@ impl Qualification {
             name: match name {
                 "qualify-residual-norm" => "residual-norm",
                 "qualify-nvfp4-swiglu" => "nvfp4-swiglu",
+                "qualify-nvfp4-down" => "nvfp4-down",
                 "qualify-fp8-qkv" => "fp8-qkv",
                 "qualify-fp8-gdn-input" => "fp8-gdn-input",
                 "qualify-fp8-lm-head" => "fp8-lm-head",
@@ -59,6 +61,7 @@ impl Benchmark {
         let suite = match name {
             "bench-residual-norm" => crate::PerformanceSuite::ResidualNorm,
             "bench-nvfp4-swiglu" => crate::PerformanceSuite::Nvfp4SwiGlu,
+            "bench-nvfp4-down" => crate::PerformanceSuite::Nvfp4Down,
             "bench-fp8-qkv" => crate::PerformanceSuite::Fp8Qkv,
             "bench-fp8-gdn-input" => crate::PerformanceSuite::Fp8GdnInput,
             "bench-fp8-lm-head" => crate::PerformanceSuite::Fp8LmHead,
@@ -181,6 +184,8 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
 fn target_supports(gpu: GpuTarget, command: &str) -> bool {
     has_full_kernel_inventory(gpu)
         || matches!(command, "qualify-residual-norm" | "bench-residual-norm")
+        || matches!(gpu, GpuTarget::Sm89)
+            && matches!(command, "qualify-nvfp4-down" | "bench-nvfp4-down")
         || matches!(gpu, GpuTarget::Sm89 | GpuTarget::Sm86)
             && matches!(command, "qualify-nvfp4-swiglu" | "bench-nvfp4-swiglu")
 }
@@ -189,6 +194,8 @@ fn target_supports(gpu: GpuTarget, command: &str) -> bool {
 fn gate_static_resources(root: &Path, gpu: GpuTarget, command: &str) -> Result<(), Box<dyn Error>> {
     if command.contains("nvfp4-swiglu") {
         crate::gate_nvfp4_swiglu_target(root, gpu)
+    } else if command.contains("nvfp4-down") {
+        crate::gate_nvfp4_down_target(root, gpu)
     } else {
         crate::gate_residual_norm_target(root, gpu)
     }
@@ -305,6 +312,9 @@ mod tests {
         let qualification = Qualification::parse("qualify-nvfp4-swiglu").expect("known suite");
         assert_eq!(qualification.name, "nvfp4-swiglu");
         assert_eq!(qualification.filter, "nvfp4_swiglu::tests");
+        let qualification = Qualification::parse("qualify-nvfp4-down").expect("known suite");
+        assert_eq!(qualification.name, "nvfp4-down");
+        assert_eq!(qualification.filter, "nvfp4_down::tests");
         assert_eq!(
             Benchmark::parse("bench-fp8-qkv")
                 .expect("known benchmark")
@@ -353,7 +363,11 @@ mod tests {
         }
         assert!(target_supports(GpuTarget::Sm89, "qualify-nvfp4-swiglu"));
         assert!(target_supports(GpuTarget::Sm89, "bench-nvfp4-swiglu"));
+        assert!(target_supports(GpuTarget::Sm89, "qualify-nvfp4-down"));
+        assert!(target_supports(GpuTarget::Sm89, "bench-nvfp4-down"));
         assert!(target_supports(GpuTarget::Sm86, "qualify-nvfp4-swiglu"));
         assert!(target_supports(GpuTarget::Sm86, "bench-nvfp4-swiglu"));
+        assert!(!target_supports(GpuTarget::Sm86, "qualify-nvfp4-down"));
+        assert!(!target_supports(GpuTarget::Sm86, "bench-nvfp4-down"));
     }
 }

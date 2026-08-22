@@ -12,17 +12,22 @@ dense-FP8 MLP, complete layer-60 GDN, and final-norm plus LM-head owners. The re
 already shaped for future whole-model and serving cases, but those measurements do not exist until
 their production owners land.
 
-SM89 has a separate remote-only diagnostic suite for the exact `[34816,5120]` NVFP4 gate/up
-owner at `B=1..8`. It decodes the admitted E2M1 words and swizzled E4M3 scales inside an A16 kernel;
-it neither creates a requantized weight artifact nor implies that the partial SM89 inventory is a
-usable server. Its numerical and static-resource gates are authoritative for that route, while its
-uncontrolled-clock RunPod timing is feasibility evidence only.
+SM89 has separate remote-only diagnostic suites for the exact `[34816,5120]` NVFP4 gate/up and
+`[5120,17408]` down owners at `B=1..8`. They decode the admitted E2M1 words and swizzled E4M3 scales
+inside A16 kernels; neither creates a requantized weight artifact nor implies that the partial SM89
+inventory is a usable server. Their numerical and static-resource gates are authoritative, while
+their uncontrolled-clock RunPod timings are feasibility evidence only.
 
 The first RTX 4090 sweep measured 109.984 us / 849.45 logical GiB/s at `B=1` and 184.320 us /
 508.46 logical GiB/s at `B=8`, with observed SM clocks of 2,625--2,700 MHz and a 10,251 MHz memory
 clock. This establishes a viable source-native SM89 decode path, but the falling multi-row
 bandwidth leaves `B=5..8` open for an Ada-specific reuse schedule before the target inventory can
 make a performance-complete claim.
+
+The first SM89 down sweep measured 46.304 us / 1,009.28 logical GiB/s at `B=1` and 122.176 us /
+384.92 logical GiB/s at `B=8`, with fixed observed clocks of 2,775 MHz SM and 10,251 MHz memory.
+The route is a viable source-native leaf, but its falling multi-row bandwidth likewise leaves an
+Ada-specific reuse schedule open.
 
 The corresponding RTX 3090 feasibility sweep measured 177.408 us / 526.62 logical GiB/s at `B=1`
 and 412.896 us / 226.98 logical GiB/s at `B=8`, with fixed observed clocks of 1,800 MHz SM and

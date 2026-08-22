@@ -4,6 +4,8 @@ use std::error::Error;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+#[cfg(feature = "sm89")]
+use tuisko_qual::benchmark_nvfp4_down;
 #[cfg(any(feature = "sm89", feature = "sm86"))]
 use tuisko_qual::benchmark_nvfp4_swiglu;
 use tuisko_qual::{DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_residual_norm};
@@ -34,7 +36,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
     let suite = arguments
         .next()
-        .ok_or("usage: bench-device <residual-norm|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|gdn-prepare|gdn-recurrence|gdn-output|dense-fp8-mlp|dense-fp8-gdn-layer|text-endpoint> [SNAPSHOT] [options]")?;
+        .ok_or("usage: bench-device <residual-norm|nvfp4-swiglu|nvfp4-down|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|gdn-prepare|gdn-recurrence|gdn-output|dense-fp8-mlp|dense-fp8-gdn-layer|text-endpoint> [SNAPSHOT] [options]")?;
     let report = match suite.as_str() {
         "residual-norm" => {
             let (options, json_path) = parse_options(arguments)?;
@@ -44,6 +46,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         "nvfp4-swiglu" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_nvfp4_swiglu(options)?, json_path)
+        }
+        #[cfg(feature = "sm89")]
+        "nvfp4-down" => {
+            let (options, json_path) = parse_options(arguments)?;
+            (benchmark_nvfp4_down(options)?, json_path)
         }
         #[cfg(feature = "device")]
         "fp8-qkv" => {

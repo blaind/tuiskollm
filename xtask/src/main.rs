@@ -22,6 +22,7 @@ const FP8_LM_HEAD_RESOURCE_BASELINE: &str = "qual/baselines/fp8-lm-head-sm120.tx
 const FP8_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/fp8-swiglu-sm120.txt";
 const FP8_DOWN_RESOURCE_BASELINE: &str = "qual/baselines/fp8-down-sm120.txt";
 const NVFP4_SWIGLU_SM89_RESOURCE_BASELINE: &str = "qual/baselines/nvfp4-swiglu-sm89.txt";
+const NVFP4_DOWN_SM89_RESOURCE_BASELINE: &str = "qual/baselines/nvfp4-down-sm89.txt";
 const GDN_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-prepare-sm120.txt";
 const GDN_RECURRENCE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-recurrence-sm120.txt";
 const GDN_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/gdn-output-sm120.txt";
@@ -43,6 +44,7 @@ pub(crate) enum PerformanceSuite {
     GdnRecurrence,
     GdnOutput,
     Nvfp4SwiGlu,
+    Nvfp4Down,
 }
 
 const PERFORMANCE_SUITES: [PerformanceSuite; 4] = [
@@ -65,6 +67,7 @@ impl PerformanceSuite {
             Self::GdnRecurrence => "gdn-recurrence",
             Self::GdnOutput => "gdn-output",
             Self::Nvfp4SwiGlu => "nvfp4-swiglu",
+            Self::Nvfp4Down => "nvfp4-down",
         }
     }
 
@@ -80,6 +83,7 @@ impl PerformanceSuite {
             Self::GdnRecurrence => GDN_RECURRENCE_RESOURCE_BASELINE,
             Self::GdnOutput => GDN_OUTPUT_RESOURCE_BASELINE,
             Self::Nvfp4SwiGlu => NVFP4_SWIGLU_SM89_RESOURCE_BASELINE,
+            Self::Nvfp4Down => NVFP4_DOWN_SM89_RESOURCE_BASELINE,
         }
     }
 
@@ -95,6 +99,7 @@ impl PerformanceSuite {
             Self::GdnRecurrence => "qual/baselines/gdn-recurrence-sm120.json",
             Self::GdnOutput => "qual/baselines/gdn-output-sm120.json",
             Self::Nvfp4SwiGlu => "qual/baselines/nvfp4-swiglu-sm89.json",
+            Self::Nvfp4Down => "qual/baselines/nvfp4-down-sm89.json",
         }
     }
 
@@ -110,6 +115,7 @@ impl PerformanceSuite {
             "gdn-recurrence" => Ok(Self::GdnRecurrence),
             "gdn-output" => Ok(Self::GdnOutput),
             "nvfp4-swiglu" => Ok(Self::Nvfp4SwiGlu),
+            "nvfp4-down" => Ok(Self::Nvfp4Down),
             _ => Err(format!("unknown performance suite `{value}`").into()),
         }
     }
@@ -126,6 +132,10 @@ impl PerformanceSuite {
             Self::GdnRecurrence => qualify_gdn_recurrence(root),
             Self::Nvfp4SwiGlu => Err(
                 "non-SM120 NVFP4 qualification is available through `remote qualify-nvfp4-swiglu --gpu 4090|3090`"
+                    .into(),
+            ),
+            Self::Nvfp4Down => Err(
+                "SM89 NVFP4 down qualification is available through `remote qualify-nvfp4-down --gpu 4090`"
                     .into(),
             ),
             Self::GdnOutput => qualify_gdn_output(root),
@@ -1175,6 +1185,9 @@ pub(crate) fn prepare_remote_benchmark(
         PerformanceSuite::Nvfp4SwiGlu => gpu
             .nvfp4_swiglu_resource_baseline()
             .ok_or_else(|| format!("GPU {} has no NVFP4 SwiGLU resource baseline", gpu.key()))?,
+        PerformanceSuite::Nvfp4Down => gpu
+            .nvfp4_down_resource_baseline()
+            .ok_or_else(|| format!("GPU {} has no NVFP4 down resource baseline", gpu.key()))?,
         _ => suite.resource_baseline(),
     };
 
@@ -1416,6 +1429,47 @@ pub(crate) fn gate_nvfp4_swiglu_target(
     let baseline_path = gpu
         .nvfp4_swiglu_resource_baseline()
         .ok_or_else(|| format!("GPU {} has no NVFP4 SwiGLU resource baseline", gpu.key()))?;
+    gate_nvfp4_a16_target(
+        root,
+        gpu,
+        baseline_path,
+        "nvfp4_swiglu_a16_b1",
+        "nvfp4_swiglu_a16_TID_",
+        "nvfp4-swiglu",
+        "NVFP4 SwiGLU",
+    )
+}
+
+#[cfg(feature = "remote")]
+pub(crate) fn gate_nvfp4_down_target(
+    root: &Path,
+    gpu: gpu_target::GpuTarget,
+) -> Result<(), Box<dyn Error>> {
+    let baseline_path = gpu
+        .nvfp4_down_resource_baseline()
+        .ok_or_else(|| format!("GPU {} has no NVFP4 down resource baseline", gpu.key()))?;
+    gate_nvfp4_a16_target(
+        root,
+        gpu,
+        baseline_path,
+        "nvfp4_down_a16_b1",
+        "nvfp4_down_a16_TID_",
+        "nvfp4-down",
+        "NVFP4 down",
+    )
+}
+
+#[cfg(feature = "remote")]
+#[allow(clippy::too_many_arguments)]
+fn gate_nvfp4_a16_target(
+    root: &Path,
+    gpu: gpu_target::GpuTarget,
+    baseline_path: &str,
+    singleton_name: &str,
+    route_prefix: &str,
+    artifact_stem: &str,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(root.join(baseline_path))?)?;
     verify_generator_stamp(root, &baseline)?;
 
@@ -1428,15 +1482,13 @@ pub(crate) fn gate_nvfp4_swiglu_target(
         )
     })?;
     let entries = parse_entries(&ptx);
-    let swiglu = entries
+    let routes = entries
         .iter()
-        .filter(|entry| {
-            entry.name == "nvfp4_swiglu_a16_b1" || entry.name.starts_with("nvfp4_swiglu_a16_TID_")
-        })
+        .filter(|entry| entry.name == singleton_name || entry.name.starts_with(route_prefix))
         .collect::<Vec<_>>();
-    require_count(gpu.oxide_arch(), swiglu.len(), 8)?;
+    require_count(label, routes.len(), 8)?;
 
-    for entry in &swiglu {
+    for entry in &routes {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 1") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/one-CTA launch bounds",
@@ -1448,7 +1500,7 @@ pub(crate) fn gate_nvfp4_swiglu_target(
 
     let temporary = root.join("target/tmp");
     fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join(format!("nvfp4-swiglu-{}-gate.cubin", gpu.key()));
+    let cubin = temporary.join(format!("{artifact_stem}-{}-gate.cubin", gpu.key()));
     let ptxas = cuda_tool("ptxas");
     require_success(
         &ptxas,
@@ -1470,7 +1522,7 @@ pub(crate) fn gate_nvfp4_swiglu_target(
     let mut registers = Vec::new();
     let mut shared = Vec::new();
 
-    for entry in swiglu {
+    for entry in routes {
         let resource = resources.get(entry.name).ok_or_else(|| {
             format!(
                 "cuobjdump omitted {} NVFP4 entry `{}`",
@@ -1487,7 +1539,7 @@ pub(crate) fn gate_nvfp4_swiglu_target(
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "{} NVFP4 SwiGLU gate passed: 8 A16 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
+        "{} {label} gate passed: 8 A16 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
         gpu.key(),
         registers,
         shared
