@@ -1,0 +1,772 @@
+//! Resident source-backed dense-FP8 GDN decoder layer.
+
+use crate::dense_fp8_gdn_layer_layout::GdnLayerRegions;
+use crate::{DenseFp8GdnLayerLayout, EngineError, EngineResult, MAX_BATCH};
+use std::marker::PhantomData;
+use std::sync::Arc;
+use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
+use tuisko_kernels_sm120::{
+    DenseFp8DownOp, DenseFp8SwiGluOp, GdnInputProjectionOp, GdnOutputProjectionOp, GdnPrepareOp,
+    GdnRecurrenceOp, ResidualNormOp, Sm120Arch,
+};
+use tuisko_model::{CheckpointSnapshot, DenseFp8MlpBindings, GdnBindings, Qwen38_27B};
+
+/// One late dense-FP8 GDN layer with immutable exact-batch graph routes.
+pub struct DenseFp8GdnLayerProgram<A: Sm120Arch = Qwen38_27B> {
+    // Drop graphs before the arena and loaded modules whose handles they retain.
+    graphs: [CudaGraph; MAX_BATCH],
+    arena: DeviceArena,
+    _norm: ResidualNormOp<A>,
+    _input: GdnInputProjectionOp<A>,
+    _prepare: GdnPrepareOp<A>,
+    _recurrence: GdnRecurrenceOp<A>,
+    _output: GdnOutputProjectionOp<A>,
+    _swiglu: DenseFp8SwiGluOp<A>,
+    _down: DenseFp8DownOp<A>,
+    snapshot: Arc<CheckpointSnapshot<A>>,
+    context: Arc<CudaContext>,
+    layout: DenseFp8GdnLayerLayout,
+    base_address: u64,
+    layer: usize,
+    arch: PhantomData<A>,
+}
+
+#[derive(Clone, Copy)]
+struct Pointers {
+    residual_input: *const u16,
+    input_norm: *const u16,
+    mixer_normalized: *mut u16,
+    input_activation_codes: *mut u8,
+    input_activation_scales: *mut f32,
+    input_weight_codes: *const u8,
+    input_weight_scales: *const u16,
+    projected: *mut u16,
+    control_weights: *const u16,
+    a_log: *const u16,
+    dt_bias: *const u16,
+    convolution_weights: *const u16,
+    state_rows: *const u32,
+    history: *mut u16,
+    log_decay: *mut f32,
+    beta: *mut f32,
+    convolved: *mut u16,
+    recurrent_norm: *const u16,
+    state: *mut f32,
+    recurrent_output: *mut u16,
+    output_activation_codes: *mut u8,
+    output_activation_scales: *mut f32,
+    output_weight_codes: *const u8,
+    output_weight_scales: *const u16,
+    mixer_branch: *mut u16,
+    post_attention_norm: *const u16,
+    mixer_residual: *mut u16,
+    mlp_normalized: *mut u16,
+    gate_up_activation_codes: *mut u8,
+    gate_up_activation_scales: *mut f32,
+    gate_up_weight_codes: *const u8,
+    gate_up_weight_scales: *const u16,
+    swiglu: *mut u16,
+    down_activation_codes: *mut u8,
+    down_activation_scales: *mut f32,
+    down_weight_codes: *const u8,
+    down_weight_scales: *const u16,
+    mlp_branch: *mut u16,
+    next_norm: *const u16,
+    residual_output: *mut u16,
+    next_normalized: *mut u16,
+}
+
+impl Pointers {
+    fn bind(arena: &DeviceArena, regions: GdnLayerRegions) -> GpuResult<Self> {
+        Ok(Self {
+            residual_input: arena.address(regions.residual_input)?.cast_const(),
+            input_norm: arena.address(regions.input_norm)?.cast_const(),
+            mixer_normalized: arena.address(regions.mixer_normalized)?,
+            input_activation_codes: arena.address(regions.input_activation_codes)?,
+            input_activation_scales: arena.address(regions.input_activation_scales)?,
+            input_weight_codes: arena.address(regions.input_weight_codes)?.cast_const(),
+            input_weight_scales: arena.address(regions.input_weight_scales)?.cast_const(),
+            projected: arena.address(regions.projected)?,
+            control_weights: arena.address(regions.control_weights)?.cast_const(),
+            a_log: arena.address(regions.a_log)?.cast_const(),
+            dt_bias: arena.address(regions.dt_bias)?.cast_const(),
+            convolution_weights: arena.address(regions.convolution_weights)?.cast_const(),
+            state_rows: arena.address(regions.state_rows)?.cast_const(),
+            history: arena.address(regions.history)?,
+            log_decay: arena.address(regions.log_decay)?,
+            beta: arena.address(regions.beta)?,
+            convolved: arena.address(regions.convolved)?,
+            recurrent_norm: arena.address(regions.recurrent_norm)?.cast_const(),
+            state: arena.address(regions.state)?,
+            recurrent_output: arena.address(regions.recurrent_output)?,
+            output_activation_codes: arena.address(regions.output_activation_codes)?,
+            output_activation_scales: arena.address(regions.output_activation_scales)?,
+            output_weight_codes: arena.address(regions.output_weight_codes)?.cast_const(),
+            output_weight_scales: arena.address(regions.output_weight_scales)?.cast_const(),
+            mixer_branch: arena.address(regions.mixer_branch)?,
+            post_attention_norm: arena.address(regions.post_attention_norm)?.cast_const(),
+            mixer_residual: arena.address(regions.mixer_residual)?,
+            mlp_normalized: arena.address(regions.mlp_normalized)?,
+            gate_up_activation_codes: arena.address(regions.gate_up_activation_codes)?,
+            gate_up_activation_scales: arena.address(regions.gate_up_activation_scales)?,
+            gate_up_weight_codes: arena.address(regions.gate_up_weight_codes)?.cast_const(),
+            gate_up_weight_scales: arena.address(regions.gate_up_weight_scales)?.cast_const(),
+            swiglu: arena.address(regions.swiglu)?,
+            down_activation_codes: arena.address(regions.down_activation_codes)?,
+            down_activation_scales: arena.address(regions.down_activation_scales)?,
+            down_weight_codes: arena.address(regions.down_weight_codes)?.cast_const(),
+            down_weight_scales: arena.address(regions.down_weight_scales)?.cast_const(),
+            mlp_branch: arena.address(regions.mlp_branch)?,
+            next_norm: arena.address(regions.next_norm)?.cast_const(),
+            residual_output: arena.address(regions.residual_output)?,
+            next_normalized: arena.address(regions.next_normalized)?,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
+    fn addresses(self) -> Vec<usize> {
+        vec![
+            self.residual_input.addr(),
+            self.input_norm.addr(),
+            self.mixer_normalized.addr(),
+            self.input_activation_codes.addr(),
+            self.input_activation_scales.addr(),
+            self.input_weight_codes.addr(),
+            self.input_weight_scales.addr(),
+            self.projected.addr(),
+            self.control_weights.addr(),
+            self.a_log.addr(),
+            self.dt_bias.addr(),
+            self.convolution_weights.addr(),
+            self.state_rows.addr(),
+            self.history.addr(),
+            self.log_decay.addr(),
+            self.beta.addr(),
+            self.convolved.addr(),
+            self.recurrent_norm.addr(),
+            self.state.addr(),
+            self.recurrent_output.addr(),
+            self.output_activation_codes.addr(),
+            self.output_activation_scales.addr(),
+            self.output_weight_codes.addr(),
+            self.output_weight_scales.addr(),
+            self.mixer_branch.addr(),
+            self.post_attention_norm.addr(),
+            self.mixer_residual.addr(),
+            self.mlp_normalized.addr(),
+            self.gate_up_activation_codes.addr(),
+            self.gate_up_activation_scales.addr(),
+            self.gate_up_weight_codes.addr(),
+            self.gate_up_weight_scales.addr(),
+            self.swiglu.addr(),
+            self.down_activation_codes.addr(),
+            self.down_activation_scales.addr(),
+            self.down_weight_codes.addr(),
+            self.down_weight_scales.addr(),
+            self.mlp_branch.addr(),
+            self.next_norm.addr(),
+            self.residual_output.addr(),
+            self.next_normalized.addr(),
+        ]
+    }
+}
+
+impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
+    /// Loads one admitted layer into one arena and captures exact `B=1..=8`.
+    pub fn from_snapshot(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<A>>,
+        layer: usize,
+    ) -> EngineResult<Self> {
+        let gdn = GdnBindings::bind(snapshot.as_ref(), layer)?;
+        let mlp = DenseFp8MlpBindings::bind(snapshot.as_ref(), layer)?;
+        let layout = DenseFp8GdnLayerLayout::build::<A>()?;
+        let regions = layout.regions();
+        let stream = context.new_stream().map_err(GpuError::from)?;
+        let arena = DeviceArena::zeroed(&stream, layout.builder())?;
+        let norm = ResidualNormOp::new(context)?;
+        let input = GdnInputProjectionOp::new(context)?;
+        let prepare = GdnPrepareOp::new(context)?;
+        let recurrence = GdnRecurrenceOp::new(context)?;
+        let output = GdnOutputProjectionOp::new(context)?;
+        let swiglu = DenseFp8SwiGluOp::new(context)?;
+        let down = DenseFp8DownOp::new(context)?;
+
+        arena.copy_from_host(
+            &stream,
+            regions.input_norm,
+            &gdn.input_norm.words().collect::<Vec<_>>(),
+        )?;
+        arena.copy_from_host(&stream, regions.input_weight_codes, gdn.input_weight_e4m3)?;
+        arena.copy_from_host(
+            &stream,
+            regions.input_weight_scales,
+            &little_endian_words(gdn.input_scale_bf16)?,
+        )?;
+        let mut control_weights = gdn.a_control_weight.words().collect::<Vec<_>>();
+        control_weights.extend(gdn.b_control_weight.words());
+        arena.copy_from_host(&stream, regions.control_weights, &control_weights)?;
+        arena.copy_from_host(
+            &stream,
+            regions.a_log,
+            &gdn.a_log.words().collect::<Vec<_>>(),
+        )?;
+        arena.copy_from_host(
+            &stream,
+            regions.dt_bias,
+            &gdn.dt_bias.words().collect::<Vec<_>>(),
+        )?;
+        arena.copy_from_host(
+            &stream,
+            regions.convolution_weights,
+            &gdn.convolution_weight.words().collect::<Vec<_>>(),
+        )?;
+        arena.copy_from_host(
+            &stream,
+            regions.recurrent_norm,
+            &gdn.norm.words().collect::<Vec<_>>(),
+        )?;
+        arena.copy_from_host(
+            &stream,
+            regions.output_weight_codes,
+            gdn.output_weight.codes(),
+        )?;
+        arena.copy_from_host(
+            &stream,
+            regions.output_weight_scales,
+            &gdn.output_scale.words().collect::<Vec<_>>(),
+        )?;
+        arena.copy_from_host(
+            &stream,
+            regions.post_attention_norm,
+            &gdn.post_attention_norm.words().collect::<Vec<_>>(),
+        )?;
+        arena.copy_from_host(
+            &stream,
+            regions.gate_up_weight_codes,
+            mlp.gate_up.weight_e4m3,
+        )?;
+        arena.copy_from_host(
+            &stream,
+            regions.gate_up_weight_scales,
+            &little_endian_words(mlp.gate_up.scale_bf16)?,
+        )?;
+        arena.copy_from_host(&stream, regions.down_weight_codes, mlp.down.weight.codes())?;
+        arena.copy_from_host(
+            &stream,
+            regions.down_weight_scales,
+            &mlp.down.scale.words().collect::<Vec<_>>(),
+        )?;
+        arena.copy_from_host(
+            &stream,
+            regions.next_norm,
+            &mlp.next_norm.words().collect::<Vec<_>>(),
+        )?;
+        arena.copy_from_host(
+            &stream,
+            regions.state_rows,
+            &(0..MAX_BATCH as u32).collect::<Vec<_>>(),
+        )?;
+
+        let pointers = Pointers::bind(&arena, regions)?;
+        let base_address = arena.base_address();
+        let ops = Ops {
+            norm: &norm,
+            input: &input,
+            prepare: &prepare,
+            recurrence: &recurrence,
+            output: &output,
+            swiglu: &swiglu,
+            down: &down,
+        };
+        let graphs = capture_routes(&stream, ops, pointers)?;
+
+        Ok(Self {
+            graphs,
+            arena,
+            _norm: norm,
+            _input: input,
+            _prepare: prepare,
+            _recurrence: recurrence,
+            _output: output,
+            _swiglu: swiglu,
+            _down: down,
+            snapshot,
+            context: context.clone(),
+            layout,
+            base_address,
+            layer,
+            arch: PhantomData,
+        })
+    }
+
+    /// Uploads exactly `batch` BF16 residual rows into stable input storage.
+    pub fn load_residual(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        values: &[u16],
+    ) -> EngineResult<()> {
+        require_batch(batch)?;
+        let expected = product("dense-FP8 GDN input elements", batch, A::HIDDEN)?;
+        if values.len() != expected {
+            return Err(EngineError::layout(format!(
+                "dense-FP8 GDN input has {} values, expected {expected} for B={batch}",
+                values.len()
+            )));
+        }
+        self.arena
+            .copy_prefix_from_host(stream, self.layout.regions().residual_input, values)?;
+        Ok(())
+    }
+
+    /// Clears all slot-owned causal-convolution history and recurrent state.
+    pub fn reset_state(&self, stream: &CudaStream) -> EngineResult<()> {
+        let regions = self.layout.regions();
+        self.arena.fill(stream, regions.history, 0)?;
+        self.arena.fill(stream, regions.state, 0)?;
+        Ok(())
+    }
+
+    /// Replays the immutable graph for one exact batch.
+    pub fn replay(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
+        require_batch(batch)?;
+        self.graphs[batch - 1].launch(stream)?;
+        Ok(())
+    }
+
+    /// Reads active BF16 residual output rows.
+    pub fn read_residual(&self, stream: &CudaStream, batch: usize) -> EngineResult<Vec<u16>> {
+        require_batch(batch)?;
+        let values = product("dense-FP8 GDN output elements", batch, A::HIDDEN)?;
+        Ok(self
+            .arena
+            .copy_prefix_to_host(stream, self.layout.regions().residual_output, values)?)
+    }
+
+    /// Decoder layer owned by this program.
+    pub const fn layer(&self) -> usize {
+        self.layer
+    }
+
+    /// CUDA context shared by the arena, graphs, and prepared operators.
+    pub const fn context(&self) -> &Arc<CudaContext> {
+        &self.context
+    }
+
+    /// Stable base address captured by every graph.
+    pub const fn base_address(&self) -> u64 {
+        self.base_address
+    }
+
+    /// Exact source-backed device weight bytes.
+    pub const fn resident_weight_bytes(&self) -> usize {
+        self.layout.resident_weight_bytes()
+    }
+
+    /// Exact address-stable workspace and recurrent-state bytes.
+    pub const fn workspace_bytes(&self) -> usize {
+        self.layout.workspace_bytes()
+    }
+
+    /// Complete single allocation, including alignment padding.
+    pub const fn arena_bytes(&self) -> usize {
+        self.layout.arena_bytes()
+    }
+
+    /// Largest admitted exact batch.
+    pub const fn batch_capacity(&self) -> usize {
+        MAX_BATCH
+    }
+
+    /// Checked owner layout.
+    pub const fn layout(&self) -> &DenseFp8GdnLayerLayout {
+        &self.layout
+    }
+
+    /// Keeps the admitted mmap-backed snapshot alive with the resident owner.
+    pub const fn snapshot(&self) -> &Arc<CheckpointSnapshot<A>> {
+        &self.snapshot
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Launches the production route eagerly for graph-agreement qualification.
+    pub fn launch_eager(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
+        require_batch(batch)?;
+        launch_route(
+            stream,
+            batch,
+            self.ops(),
+            Pointers::bind(&self.arena, self.layout.regions())?,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns one captured production graph.
+    pub fn qualification_graph(&self, batch: usize) -> EngineResult<&CudaGraph> {
+        require_batch(batch)?;
+        Ok(&self.graphs[batch - 1])
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Captures repeated production paths for high-resolution device timing.
+    pub fn qualification_repeated_graph(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        operations: u64,
+    ) -> EngineResult<CudaGraph> {
+        require_batch(batch)?;
+        if operations == 0 {
+            return Err(EngineError::route(
+                "repeated dense-FP8 GDN graph requires at least one operation",
+            ));
+        }
+        let pointers = Pointers::bind(&self.arena, self.layout.regions())?;
+        let ops = self.ops();
+        Ok(CudaGraph::capture(stream, || {
+            for _ in 0..operations {
+                launch_route(stream, batch, ops, pointers)?;
+            }
+            Ok(())
+        })?)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns every stable arena address in layout order.
+    pub fn qualification_addresses(&self) -> EngineResult<Vec<usize>> {
+        Ok(Pointers::bind(&self.arena, self.layout.regions())?.addresses())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Fills every non-state output plane with a byte sentinel.
+    pub fn qualification_reset_outputs(&self, stream: &CudaStream, byte: u8) -> EngineResult<()> {
+        let regions = self.layout.regions();
+        for region in [
+            regions.mixer_normalized,
+            regions.mixer_branch,
+            regions.mixer_residual,
+            regions.mlp_normalized,
+            regions.mlp_branch,
+            regions.residual_output,
+            regions.next_normalized,
+        ] {
+            self.arena.fill(stream, region, byte)?;
+        }
+        for region in [
+            regions.projected,
+            regions.convolved,
+            regions.recurrent_output,
+            regions.swiglu,
+        ] {
+            self.arena.fill(stream, region, byte)?;
+        }
+        for region in [
+            regions.input_activation_codes,
+            regions.output_activation_codes,
+            regions.gate_up_activation_codes,
+            regions.down_activation_codes,
+        ] {
+            self.arena.fill(stream, region, byte)?;
+        }
+        for region in [
+            regions.input_activation_scales,
+            regions.log_decay,
+            regions.beta,
+            regions.output_activation_scales,
+            regions.gate_up_activation_scales,
+            regions.down_activation_scales,
+        ] {
+            self.arena.fill(stream, region, byte)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads all working and persistent planes, including inactive rows.
+    pub fn qualification_observables(
+        &self,
+        stream: &CudaStream,
+    ) -> EngineResult<DenseFp8GdnLayerObservables> {
+        let regions = self.layout.regions();
+        Ok(DenseFp8GdnLayerObservables {
+            mixer_normalized: self.arena.copy_to_host(stream, regions.mixer_normalized)?,
+            input_activation_codes: self
+                .arena
+                .copy_to_host(stream, regions.input_activation_codes)?,
+            input_activation_scales: self
+                .arena
+                .copy_to_host(stream, regions.input_activation_scales)?,
+            projected: self.arena.copy_to_host(stream, regions.projected)?,
+            log_decay: self.arena.copy_to_host(stream, regions.log_decay)?,
+            beta: self.arena.copy_to_host(stream, regions.beta)?,
+            convolved: self.arena.copy_to_host(stream, regions.convolved)?,
+            history: self.arena.copy_to_host(stream, regions.history)?,
+            state: self.arena.copy_to_host(stream, regions.state)?,
+            recurrent_output: self.arena.copy_to_host(stream, regions.recurrent_output)?,
+            output_activation_codes: self
+                .arena
+                .copy_to_host(stream, regions.output_activation_codes)?,
+            output_activation_scales: self
+                .arena
+                .copy_to_host(stream, regions.output_activation_scales)?,
+            mixer_branch: self.arena.copy_to_host(stream, regions.mixer_branch)?,
+            mixer_residual: self.arena.copy_to_host(stream, regions.mixer_residual)?,
+            mlp_normalized: self.arena.copy_to_host(stream, regions.mlp_normalized)?,
+            gate_up_activation_codes: self
+                .arena
+                .copy_to_host(stream, regions.gate_up_activation_codes)?,
+            gate_up_activation_scales: self
+                .arena
+                .copy_to_host(stream, regions.gate_up_activation_scales)?,
+            swiglu: self.arena.copy_to_host(stream, regions.swiglu)?,
+            down_activation_codes: self
+                .arena
+                .copy_to_host(stream, regions.down_activation_codes)?,
+            down_activation_scales: self
+                .arena
+                .copy_to_host(stream, regions.down_activation_scales)?,
+            mlp_branch: self.arena.copy_to_host(stream, regions.mlp_branch)?,
+            residual_output: self.arena.copy_to_host(stream, regions.residual_output)?,
+            next_normalized: self.arena.copy_to_host(stream, regions.next_normalized)?,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
+    fn ops(&self) -> Ops<'_, A> {
+        Ops {
+            norm: &self._norm,
+            input: &self._input,
+            prepare: &self._prepare,
+            recurrence: &self._recurrence,
+            output: &self._output,
+            swiglu: &self._swiglu,
+            down: &self._down,
+        }
+    }
+}
+
+#[cfg(feature = "qualification")]
+/// Complete working and persistent planes exposed to the qualification crate.
+pub struct DenseFp8GdnLayerObservables {
+    /// Pre-mixer normalized rows.
+    pub mixer_normalized: Vec<u16>,
+    /// GDN-input dynamic E4M3 codes.
+    pub input_activation_codes: Vec<u8>,
+    /// GDN-input dynamic FP32 scales.
+    pub input_activation_scales: Vec<f32>,
+    /// Fused Q/K/V/Z projection rows.
+    pub projected: Vec<u16>,
+    /// Per-value-head log decays.
+    pub log_decay: Vec<f32>,
+    /// Per-value-head update gates.
+    pub beta: Vec<f32>,
+    /// Causal-convolved Q/K/V rows.
+    pub convolved: Vec<u16>,
+    /// Slot-owned causal history.
+    pub history: Vec<u16>,
+    /// Slot-owned FP32 recurrent state.
+    pub state: Vec<f32>,
+    /// Gated normalized recurrent values.
+    pub recurrent_output: Vec<u16>,
+    /// GDN-output dynamic E4M3 codes.
+    pub output_activation_codes: Vec<u8>,
+    /// GDN-output dynamic FP32 scales.
+    pub output_activation_scales: Vec<f32>,
+    /// GDN output-projection branch.
+    pub mixer_branch: Vec<u16>,
+    /// Residual after the mixer.
+    pub mixer_residual: Vec<u16>,
+    /// Pre-MLP normalized rows.
+    pub mlp_normalized: Vec<u16>,
+    /// Gate/up dynamic E4M3 codes.
+    pub gate_up_activation_codes: Vec<u8>,
+    /// Gate/up dynamic FP32 scales.
+    pub gate_up_activation_scales: Vec<f32>,
+    /// Fused BF16 SwiGLU rows.
+    pub swiglu: Vec<u16>,
+    /// Down dynamic E4M3 codes.
+    pub down_activation_codes: Vec<u8>,
+    /// Down dynamic FP32 scales.
+    pub down_activation_scales: Vec<f32>,
+    /// Dense-FP8 down-projection branch.
+    pub mlp_branch: Vec<u16>,
+    /// Published layer residual rows.
+    pub residual_output: Vec<u16>,
+    /// Next-boundary normalized rows.
+    pub next_normalized: Vec<u16>,
+}
+
+#[derive(Clone, Copy)]
+struct Ops<'a, A: Sm120Arch> {
+    norm: &'a ResidualNormOp<A>,
+    input: &'a GdnInputProjectionOp<A>,
+    prepare: &'a GdnPrepareOp<A>,
+    recurrence: &'a GdnRecurrenceOp<A>,
+    output: &'a GdnOutputProjectionOp<A>,
+    swiglu: &'a DenseFp8SwiGluOp<A>,
+    down: &'a DenseFp8DownOp<A>,
+}
+
+fn capture_routes<A: Sm120Arch>(
+    stream: &CudaStream,
+    ops: Ops<'_, A>,
+    pointers: Pointers,
+) -> EngineResult<[CudaGraph; MAX_BATCH]> {
+    let mut graphs = Vec::with_capacity(MAX_BATCH);
+    for batch in 1..=MAX_BATCH {
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_route(stream, batch, ops, pointers)
+        })?);
+    }
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("dense-FP8 GDN layer graph inventory has wrong cardinality")
+    })
+}
+
+fn launch_route<A: Sm120Arch>(
+    stream: &CudaStream,
+    batch: usize,
+    ops: Ops<'_, A>,
+    pointers: Pointers,
+) -> GpuResult<()> {
+    // SAFETY: the single arena provides aligned, disjoint maximum-batch
+    // regions, and exact dispatch restricts every launch to `batch` rows.
+    unsafe {
+        ops.norm.launch_plain(
+            stream,
+            batch,
+            pointers.residual_input,
+            pointers.input_norm,
+            pointers.mixer_normalized,
+        )?;
+        ops.input.launch(
+            stream,
+            batch,
+            pointers.mixer_normalized,
+            pointers.input_activation_codes,
+            pointers.input_activation_scales,
+            pointers.input_weight_codes,
+            pointers.input_weight_scales,
+            pointers.projected,
+        )?;
+        ops.prepare.launch(
+            stream,
+            batch,
+            pointers.mixer_normalized,
+            pointers.control_weights,
+            pointers.a_log,
+            pointers.dt_bias,
+            pointers.projected,
+            pointers.convolution_weights,
+            pointers.state_rows,
+            pointers.history,
+            pointers.log_decay,
+            pointers.beta,
+            pointers.convolved,
+        )?;
+        ops.recurrence.launch(
+            stream,
+            batch,
+            pointers.convolved,
+            pointers.projected,
+            pointers.log_decay,
+            pointers.beta,
+            pointers.recurrent_norm,
+            pointers.state_rows,
+            pointers.state,
+            pointers.recurrent_output,
+        )?;
+        ops.output.launch(
+            stream,
+            batch,
+            pointers.recurrent_output,
+            pointers.output_activation_codes,
+            pointers.output_activation_scales,
+            pointers.output_weight_codes,
+            pointers.output_weight_scales,
+            pointers.mixer_branch,
+        )?;
+        ops.norm.launch_residual(
+            stream,
+            batch,
+            pointers.residual_input,
+            pointers.mixer_branch,
+            pointers.post_attention_norm,
+            pointers.mixer_residual,
+            pointers.mlp_normalized,
+        )?;
+        ops.swiglu.launch(
+            stream,
+            batch,
+            pointers.mlp_normalized,
+            pointers.gate_up_activation_codes,
+            pointers.gate_up_activation_scales,
+            pointers.gate_up_weight_codes,
+            pointers.gate_up_weight_scales,
+            pointers.swiglu,
+        )?;
+        ops.down.launch(
+            stream,
+            batch,
+            pointers.swiglu,
+            pointers.down_activation_codes,
+            pointers.down_activation_scales,
+            pointers.down_weight_codes,
+            pointers.down_weight_scales,
+            pointers.mlp_branch,
+        )?;
+        ops.norm.launch_residual(
+            stream,
+            batch,
+            pointers.mixer_residual,
+            pointers.mlp_branch,
+            pointers.next_norm,
+            pointers.residual_output,
+            pointers.next_normalized,
+        )?;
+    }
+    Ok(())
+}
+
+fn require_batch(batch: usize) -> EngineResult<()> {
+    if !(1..=MAX_BATCH).contains(&batch) {
+        return Err(EngineError::route(format!(
+            "dense-FP8 GDN layer batch {batch} is outside 1..={MAX_BATCH}"
+        )));
+    }
+    Ok(())
+}
+
+fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
+    left.checked_mul(right)
+        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
+}
+
+fn little_endian_words(bytes: &[u8]) -> EngineResult<Vec<u16>> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(EngineError::layout(
+            "BF16 source plane has an odd byte length",
+        ));
+    }
+    Ok(bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|word| u16::from_le_bytes(*word))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_BATCH, require_batch};
+
+    #[test]
+    fn exact_batch_table_rejects_every_uncompiled_route() {
+        for (batch, admitted) in [(0, false), (1, true), (8, true), (9, false), (16, false)] {
+            assert_eq!(require_batch(batch).is_ok(), admitted, "batch={batch}");
+        }
+        assert_eq!(MAX_BATCH, 8);
+    }
+}

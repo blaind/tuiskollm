@@ -2,6 +2,8 @@
 
 #![cfg(feature = "device")]
 
+mod dense_fp8_gdn_layer;
+mod dense_fp8_gdn_layer_benchmark;
 mod dense_fp8_mlp;
 mod dense_fp8_mlp_benchmark;
 mod device_benchmark;
@@ -27,6 +29,10 @@ mod residual_norm_benchmark;
 mod text_endpoint;
 mod text_endpoint_benchmark;
 
+pub use dense_fp8_gdn_layer::{
+    DenseFp8GdnLayerQualification, DenseFp8GdnLayerQualificationError, qualify_dense_fp8_gdn_layer,
+};
+pub use dense_fp8_gdn_layer_benchmark::benchmark_dense_fp8_gdn_layer;
 pub use dense_fp8_mlp::{
     DenseFp8MlpQualification, DenseFp8MlpQualificationError, qualify_dense_fp8_mlp,
 };
