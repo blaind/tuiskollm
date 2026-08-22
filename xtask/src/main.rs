@@ -24,7 +24,7 @@ const GDN_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-prepare-sm120.tx
 const GDN_RECURRENCE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-recurrence-sm120.txt";
 const GDN_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/gdn-output-sm120.txt";
 const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
-const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build";
+const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build-sm120";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
 const CUDA_OXIDE_REPOSITORY: &str = "https://github.com/NVlabs/cuda-oxide.git";
 const CUDA_OXIDE_REVISION: &str = "1f4d813719012d384f2db12b88efc9314c8bf50c";
@@ -135,6 +135,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bootstrap-cuda-oxide") if remaining.is_empty() => bootstrap_cuda_oxide(root),
         Some("build-sm120") if remaining.is_empty() => build_sm120(root),
         Some("build-residual-norm") => build_residual_norm(root, &remaining),
+        Some("build-residual-bench") => build_residual_bench(root, &remaining),
         Some("qualify-frontend") => qualify_frontend(root, &remaining),
         Some("qualify-generation") => qualify_generation(root, &remaining),
         Some("qualify-residual-norm") if remaining.is_empty() => qualify_residual_norm(root),
@@ -178,6 +179,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "bootstrap-cuda-oxide"
                     | "build-sm120"
                     | "build-residual-norm"
+                    | "build-residual-bench"
                     | "qualify-residual-norm"
                     | "qualify-fp8-qkv"
                     | "qualify-fp8-gdn-input"
@@ -295,15 +297,7 @@ fn build_residual_norm(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let [flag, value] = arguments else {
-        return Err(
-            "usage: cargo run -p xtask -- build-residual-norm --gpu <5090|4090|3090>".into(),
-        );
-    };
-    if flag != "--gpu" {
-        return Err("build-residual-norm requires `--gpu <5090|4090|3090>`".into());
-    }
-    let gpu = gpu_target::GpuTarget::parse(&value.to_string_lossy())?;
+    let gpu = parse_build_gpu(arguments, "build-residual-norm")?;
     let prepared = prepare_remote_qualify(root, gpu, "residual_norm::tests")?;
     gate_residual_norm_target(root, gpu)?;
     println!(
@@ -314,6 +308,68 @@ fn build_residual_norm(
         prepared.executable.display()
     );
     Ok(())
+}
+
+fn build_residual_bench(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let gpu = parse_build_gpu(arguments, "build-residual-bench")?;
+    build_residual_benchmark_target(root, gpu)?;
+    let prepared = prepare_remote_benchmark(root, gpu, PerformanceSuite::ResidualNorm)?;
+    println!(
+        "{} residual-norm benchmark artifact: {} (resource baseline {})",
+        gpu.key(),
+        prepared.executable.display(),
+        prepared.generator_baseline_sha256,
+    );
+    Ok(())
+}
+
+fn parse_build_gpu(
+    arguments: &[std::ffi::OsString],
+    command: &str,
+) -> Result<gpu_target::GpuTarget, Box<dyn Error>> {
+    let [flag, value] = arguments else {
+        return Err(
+            format!("usage: cargo run -p xtask -- {command} --gpu <5090|4090|3090>").into(),
+        );
+    };
+    if flag != "--gpu" {
+        return Err(format!("{command} requires `--gpu <5090|4090|3090>`").into());
+    }
+    gpu_target::GpuTarget::parse(&value.to_string_lossy())
+}
+
+pub(crate) fn build_residual_benchmark_target(
+    root: &Path,
+    gpu: gpu_target::GpuTarget,
+) -> Result<(), Box<dyn Error>> {
+    if matches!(gpu, gpu_target::GpuTarget::Rtx5090) {
+        return build_sm120(root);
+    }
+    run_oxide(
+        root,
+        &[
+            "build",
+            "--arch",
+            gpu.oxide_arch(),
+            "--cargo-target-dir",
+            gpu.oxide_build_target(),
+            "--device-codegen-crate",
+            gpu.kernel_crate(),
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--bin",
+            "bench-device",
+            "--release",
+            "--no-default-features",
+            "--features",
+            gpu.qualification_feature(),
+        ],
+    )?;
+    gate_residual_norm_target(root, gpu)
 }
 
 fn qualify_frontend(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
@@ -1082,7 +1138,6 @@ pub struct RemoteQualify {
 }
 
 /// A compiled benchmark executable and its matching resource identity.
-#[cfg(feature = "remote")]
 pub(crate) struct RemoteBenchmark {
     /// Path to the compiled `bench-device` executable.
     pub executable: PathBuf,
@@ -1091,22 +1146,28 @@ pub(crate) struct RemoteBenchmark {
 }
 
 /// Locates the already-built benchmark executable and binds it to one suite's resources.
-#[cfg(feature = "remote")]
 pub(crate) fn prepare_remote_benchmark(
     root: &Path,
+    gpu: gpu_target::GpuTarget,
     suite: PerformanceSuite,
 ) -> Result<RemoteBenchmark, Box<dyn Error>> {
     let built = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join(gpu.oxide_build_target())
         .join("release/bench-device");
     if !built.is_file() {
         return Err(format!("benchmark executable is missing at {}", built.display()).into());
     }
-    let executable = strip_remote_artifact(root, &built, "bench-device")?;
+    let artifact_name = format!("bench-device-{}", gpu.key());
+    let executable = strip_remote_artifact(root, &built, &artifact_name)?;
+    let resource_baseline = if matches!(suite, PerformanceSuite::ResidualNorm) {
+        gpu.residual_resource_baseline()
+    } else {
+        suite.resource_baseline()
+    };
 
     Ok(RemoteBenchmark {
         executable,
-        generator_baseline_sha256: sha256(&fs::read(root.join(suite.resource_baseline()))?),
+        generator_baseline_sha256: sha256(&fs::read(root.join(resource_baseline))?),
     })
 }
 

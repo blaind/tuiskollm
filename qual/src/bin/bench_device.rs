@@ -1,14 +1,15 @@
-//! SM120 device benchmark entry point.
+//! Device benchmark entry point for the selected architecture artifact.
 
 use std::error::Error;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use tuisko_qual::{DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_residual_norm};
+#[cfg(feature = "device")]
 use tuisko_qual::{
-    DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_dense_fp8_gdn_layer,
-    benchmark_dense_fp8_mlp, benchmark_fp8_down, benchmark_fp8_gdn_input, benchmark_fp8_lm_head,
-    benchmark_fp8_qkv, benchmark_fp8_swiglu, benchmark_gdn_output, benchmark_gdn_prepare,
-    benchmark_gdn_recurrence, benchmark_residual_norm, benchmark_text_endpoint,
+    benchmark_dense_fp8_gdn_layer, benchmark_dense_fp8_mlp, benchmark_fp8_down,
+    benchmark_fp8_gdn_input, benchmark_fp8_lm_head, benchmark_fp8_qkv, benchmark_fp8_swiglu,
+    benchmark_gdn_output, benchmark_gdn_prepare, benchmark_gdn_recurrence, benchmark_text_endpoint,
 };
 
 fn main() -> ExitCode {
@@ -37,38 +38,47 @@ fn run() -> Result<(), Box<dyn Error>> {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_residual_norm(options)?, json_path)
         }
+        #[cfg(feature = "device")]
         "fp8-qkv" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_fp8_qkv(options)?, json_path)
         }
+        #[cfg(feature = "device")]
         "fp8-gdn-input" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_fp8_gdn_input(options)?, json_path)
         }
+        #[cfg(feature = "device")]
         "fp8-lm-head" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_fp8_lm_head(options)?, json_path)
         }
+        #[cfg(feature = "device")]
         "fp8-swiglu" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_fp8_swiglu(options)?, json_path)
         }
+        #[cfg(feature = "device")]
         "fp8-down" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_fp8_down(options)?, json_path)
         }
+        #[cfg(feature = "device")]
         "gdn-prepare" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_gdn_prepare(options)?, json_path)
         }
+        #[cfg(feature = "device")]
         "gdn-recurrence" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_gdn_recurrence(options)?, json_path)
         }
+        #[cfg(feature = "device")]
         "gdn-output" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_gdn_output(options)?, json_path)
         }
+        #[cfg(feature = "device")]
         "dense-fp8-mlp" => {
             let snapshot = arguments
                 .next()
@@ -79,6 +89,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 json_path,
             )
         }
+        #[cfg(feature = "device")]
         "dense-fp8-gdn-layer" => {
             let snapshot = arguments
                 .next()
@@ -89,6 +100,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 json_path,
             )
         }
+        #[cfg(feature = "device")]
         "text-endpoint" => {
             let snapshot = arguments
                 .next()
