@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
@@ -106,19 +106,23 @@ struct CachedPrefix {
 
 /// Admitted tokenizer, chat template, and generation stop-token metadata.
 pub struct TextFrontend {
-    tokenizer: Tokenizer,
+    decode: Arc<DecodeState>,
     template: String,
     stop_ids: [u32; 2],
     generation_defaults: GenerationDefaults,
-    byte_table: HashMap<char, u8>,
-    special_decode_ids: HashSet<u32>,
     prompt_cache_capacity: usize,
     prompt_cache: Mutex<VecDeque<PromptPrefixEntry>>,
 }
 
+struct DecodeState {
+    tokenizer: Tokenizer,
+    byte_table: HashMap<char, u8>,
+    special_decode_ids: HashSet<u32>,
+}
+
 /// Incremental decoder for one generated text sequence.
-pub struct StreamingDecoder<'a> {
-    frontend: &'a TextFrontend,
+pub struct StreamingDecoder {
+    decode: Arc<DecodeState>,
     text: String,
     pending: Vec<u8>,
     finished: bool,
@@ -165,12 +169,14 @@ impl TextFrontend {
             .collect();
 
         Ok(Self {
-            tokenizer,
+            decode: Arc::new(DecodeState {
+                tokenizer,
+                byte_table: byte_level_table(),
+                special_decode_ids,
+            }),
             template,
             stop_ids,
             generation_defaults,
-            byte_table: byte_level_table(),
-            special_decode_ids,
             prompt_cache_capacity: options.prompt_cache_capacity,
             prompt_cache: Mutex::new(VecDeque::new()),
         })
@@ -225,7 +231,8 @@ impl TextFrontend {
 
     /// Encodes text without adding tokenizer-defined special tokens.
     pub fn encode(&self, text: &str) -> FrontendResult<Vec<u32>> {
-        self.tokenizer
+        self.decode
+            .tokenizer
             .encode(text, false)
             .map(|encoding| encoding.get_ids().to_vec())
             .map_err(|source| FrontendError::Tokenizer(format!("could not encode text: {source}")))
@@ -253,7 +260,8 @@ impl TextFrontend {
 
     /// Decodes token IDs using the admitted tokenizer.
     pub fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> FrontendResult<String> {
-        self.tokenizer
+        self.decode
+            .tokenizer
             .decode(token_ids, skip_special_tokens)
             .map_err(|source| {
                 FrontendError::Tokenizer(format!("could not decode token IDs: {source}"))
@@ -261,9 +269,9 @@ impl TextFrontend {
     }
 
     /// Starts a special-token-skipping streaming decoder.
-    pub fn streaming_decoder(&self) -> StreamingDecoder<'_> {
+    pub fn streaming_decoder(&self) -> StreamingDecoder {
         StreamingDecoder {
-            frontend: self,
+            decode: self.decode.clone(),
             text: String::new(),
             pending: Vec::new(),
             finished: false,
@@ -293,9 +301,13 @@ impl TextFrontend {
             }
 
             let tail = &rendered[split..];
-            let encoding = self.tokenizer.encode(tail, false).map_err(|source| {
-                FrontendError::Tokenizer(format!("could not encode prompt tail: {source}"))
-            })?;
+            let encoding = self
+                .decode
+                .tokenizer
+                .encode(tail, false)
+                .map_err(|source| {
+                    FrontendError::Tokenizer(format!("could not encode prompt tail: {source}"))
+                })?;
             let reused_tokens = cached.token_ids.len();
             let mut token_ids = cached.token_ids;
             token_ids.extend_from_slice(encoding.get_ids());
@@ -311,9 +323,13 @@ impl TextFrontend {
             });
         }
 
-        let encoding = self.tokenizer.encode(rendered, false).map_err(|source| {
-            FrontendError::Tokenizer(format!("could not encode prompt: {source}"))
-        })?;
+        let encoding = self
+            .decode
+            .tokenizer
+            .encode(rendered, false)
+            .map_err(|source| {
+                FrontendError::Tokenizer(format!("could not encode prompt: {source}"))
+            })?;
         let token_ids = encoding.get_ids().to_vec();
         let token_ends = encoding.get_offsets().iter().map(|&(_, end)| end).collect();
         self.push_prompt_entry(rendered, token_ids.clone(), token_ends);
@@ -347,7 +363,7 @@ impl TextFrontend {
     }
 }
 
-impl StreamingDecoder<'_> {
+impl StreamingDecoder {
     /// Decodes one generated token and returns any newly complete text.
     pub fn push(&mut self, token_id: u32) -> FrontendResult<Option<String>> {
         if self.finished {
@@ -355,21 +371,17 @@ impl StreamingDecoder<'_> {
                 "cannot push a token after finishing the stream".into(),
             ));
         }
-        if self.frontend.special_decode_ids.contains(&token_id) {
+        if self.decode.special_decode_ids.contains(&token_id) {
             return Ok(None);
         }
 
-        let content = self
-            .frontend
-            .tokenizer
-            .id_to_token(token_id)
-            .ok_or_else(|| {
-                FrontendError::Tokenizer(format!("token ID {token_id} has no tokenizer entry"))
-            })?;
+        let content = self.decode.tokenizer.id_to_token(token_id).ok_or_else(|| {
+            FrontendError::Tokenizer(format!("token ID {token_id} has no tokenizer entry"))
+        })?;
         let mut delta = String::new();
         for character in content.chars() {
             let byte = self
-                .frontend
+                .decode
                 .byte_table
                 .get(&character)
                 .copied()
@@ -764,7 +776,11 @@ mod tests {
             .build()
             .unwrap();
         let frontend = TextFrontend {
-            tokenizer: Tokenizer::new(model),
+            decode: std::sync::Arc::new(super::DecodeState {
+                tokenizer: Tokenizer::new(model),
+                byte_table,
+                special_decode_ids: HashSet::from([3]),
+            }),
             template: String::new(),
             stop_ids: [3, 3],
             generation_defaults: super::GenerationDefaults {
@@ -772,13 +788,12 @@ mod tests {
                 top_p: 0.95,
                 top_k: 20,
             },
-            byte_table,
-            special_decode_ids: HashSet::from([3]),
             prompt_cache_capacity: 0,
             prompt_cache: std::sync::Mutex::new(VecDeque::new()),
         };
 
         let mut decoder = frontend.streaming_decoder();
+        drop(frontend);
         assert_eq!(decoder.push(0).unwrap().as_deref(), Some("H"));
         assert_eq!(decoder.push(1).unwrap(), None);
         assert_eq!(decoder.push(3).unwrap(), None);

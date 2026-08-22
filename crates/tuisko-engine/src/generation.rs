@@ -76,21 +76,18 @@ pub struct GeneratedText {
 }
 
 /// Per-request host state consuming one exact BF16 vocabulary row at a time.
-pub struct GenerationSession<'a> {
+pub struct GenerationSession {
     prompt: PromptEncoding,
     sampler: Sampler,
-    decoder: StreamingDecoder<'a>,
+    decoder: StreamingDecoder,
     generated: Vec<u32>,
     max_new_tokens: usize,
     finish_reason: Option<FinishReason>,
 }
 
-impl<'a> GenerationSession<'a> {
+impl GenerationSession {
     /// Renders and tokenizes the prompt and initializes sampling state.
-    pub fn start(
-        frontend: &'a TextFrontend,
-        request: &ChatGenerationRequest,
-    ) -> EngineResult<Self> {
+    pub fn start(frontend: &TextFrontend, request: &ChatGenerationRequest) -> EngineResult<Self> {
         let prompt = frontend.encode_chat_with_report(&request.messages, request.template)?;
         let stop_ids: [u32; 2] = frontend
             .stop_ids()
