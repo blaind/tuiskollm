@@ -18,8 +18,10 @@ pub enum GenerationReply {
     Delta(String),
     /// Terminal generated output and accounting.
     Done(GeneratedText),
-    /// Request-local engine or admission failure.
-    Error(String),
+    /// Request admission failed before any device work was scheduled.
+    Rejected(String),
+    /// Resident execution failed after admission.
+    Failed(String),
 }
 
 #[derive(Serialize)]
@@ -78,8 +80,11 @@ pub async fn blocking_response(
                 }))
                 .into_response();
             }
-            GenerationReply::Error(message) => {
+            GenerationReply::Rejected(message) => {
                 return openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
+            }
+            GenerationReply::Failed(message) => {
+                return openai_error(StatusCode::INTERNAL_SERVER_ERROR, message, "server_error");
             }
         }
     }
@@ -160,10 +165,15 @@ pub fn streaming_response(
                     }
                     break;
                 }
-                GenerationReply::Error(message) => {
+                error => {
                     terminal = true;
+                    let (message, error_type) = match error {
+                        GenerationReply::Rejected(message) => (message, "invalid_request_error"),
+                        GenerationReply::Failed(message) => (message, "server_error"),
+                        _ => unreachable!("delta and terminal replies were handled above"),
+                    };
                     let event = json!({
-                        "error": {"message": message, "type": "invalid_request_error"}
+                        "error": {"message": message, "type": error_type}
                     });
                     if events_tx
                         .send(Ok(Event::default().data(event.to_string())))
@@ -408,12 +418,21 @@ mod tests {
         runtime().block_on(async {
             let (sender, receiver) = unbounded_channel();
             sender
-                .send(GenerationReply::Error("bad sampling".into()))
+                .send(GenerationReply::Rejected("bad sampling".into()))
                 .unwrap();
             let response = blocking_response(receiver, "id".into(), 1, false, false).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let error: Value = serde_json::from_str(&body(response).await).unwrap();
             assert_eq!(error["error"]["message"], "bad sampling");
+
+            let (sender, receiver) = unbounded_channel();
+            sender
+                .send(GenerationReply::Failed("device launch failed".into()))
+                .unwrap();
+            let response = blocking_response(receiver, "id".into(), 1, false, false).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let error: Value = serde_json::from_str(&body(response).await).unwrap();
+            assert_eq!(error["error"]["type"], "server_error");
 
             let (sender, receiver) = unbounded_channel::<GenerationReply>();
             drop(sender);
@@ -423,8 +442,21 @@ mod tests {
     }
 
     #[test]
-    fn streaming_disconnect_emits_server_error_before_done() {
+    fn streaming_rejection_and_disconnect_are_distinct() {
         runtime().block_on(async {
+            let (sender, receiver) = unbounded_channel();
+            sender
+                .send(GenerationReply::Rejected("context is full".into()))
+                .unwrap();
+            let response = streaming_response(receiver, "id".into(), 1, false, false);
+            let rejection_body = body(response).await;
+            let data = rejection_body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .collect::<Vec<_>>();
+            let error: Value = serde_json::from_str(data[data.len() - 2]).unwrap();
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+
             let (sender, receiver) = unbounded_channel::<GenerationReply>();
             drop(sender);
             let response = streaming_response(receiver, "id".into(), 1, false, false);

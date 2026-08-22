@@ -7,14 +7,14 @@ use crate::{
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{
@@ -54,6 +54,7 @@ pub enum ServerError {
 struct AppState {
     jobs: Sender<Job>,
     request_ids: Arc<AtomicU64>,
+    worker_ready: Arc<AtomicBool>,
 }
 
 struct Job {
@@ -97,10 +98,12 @@ pub fn run(config: ServerConfig) -> Result<(), ServerError> {
 fn start_worker(snapshot: &Path) -> Result<(AppState, Ready), ServerError> {
     let (jobs_tx, jobs_rx) = channel(MAX_BATCH);
     let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+    let worker_ready = Arc::new(AtomicBool::new(false));
     let snapshot = snapshot.to_owned();
+    let worker_ready_clone = Arc::clone(&worker_ready);
     std::thread::Builder::new()
         .name("tuiskollm-engine".into())
-        .spawn(move || engine_worker(snapshot, jobs_rx, ready_tx))?;
+        .spawn(move || engine_worker(snapshot, jobs_rx, ready_tx, worker_ready_clone))?;
     let ready = ready_rx
         .recv()
         .map_err(|_| ServerError::StartupDisconnected)?
@@ -109,6 +112,7 @@ fn start_worker(snapshot: &Path) -> Result<(AppState, Ready), ServerError> {
         AppState {
             jobs: jobs_tx,
             request_ids: Arc::new(AtomicU64::new(1)),
+            worker_ready,
         },
         ready,
     ))
@@ -118,7 +122,15 @@ fn engine_worker(
     snapshot: PathBuf,
     mut jobs: Receiver<Job>,
     ready: std_mpsc::SyncSender<Result<Ready, String>>,
+    worker_ready: Arc<AtomicBool>,
 ) {
+    struct ReadinessGuard(Arc<AtomicBool>);
+    impl Drop for ReadinessGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _readiness_guard = ReadinessGuard(Arc::clone(&worker_ready));
     let generator = (|| {
         let snapshot = CheckpointSnapshot::<Qwen38_27B>::open(&snapshot)
             .map(Arc::new)
@@ -138,6 +150,7 @@ fn engine_worker(
         host_stager_bytes: generator.host_stager_bytes(),
         context_capacity: generator.context_capacity(),
     };
+    worker_ready.store(true, Ordering::Release);
     if ready.send(Ok(startup)).is_err() {
         return;
     }
@@ -213,7 +226,7 @@ fn admit_job(
             }
         }
         Err(error) => {
-            let _ = job.reply.send(GenerationReply::Error(error.to_string()));
+            let _ = job.reply.send(GenerationReply::Rejected(error.to_string()));
         }
     }
 }
@@ -240,7 +253,7 @@ fn fail_all(
     message: String,
 ) {
     for (_, reply) in replies.drain() {
-        let _ = reply.send(GenerationReply::Error(message.clone()));
+        let _ = reply.send(GenerationReply::Failed(message.clone()));
     }
 }
 
@@ -253,8 +266,16 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+async fn health(State(state): State<AppState>) -> Response {
+    if state.worker_ready.load(Ordering::Acquire) {
+        Json(json!({"status": "ok"})).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "unavailable"})),
+        )
+            .into_response()
+    }
 }
 
 async fn models() -> Json<Value> {
@@ -357,7 +378,7 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::Value;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
     use tokio::runtime::Builder;
     use tokio::sync::mpsc::{channel, unbounded_channel};
     use tuisko_engine::ChatGenerationRequest;
@@ -378,6 +399,14 @@ mod tests {
         )
     }
 
+    fn state(jobs: tokio::sync::mpsc::Sender<Job>, ready: bool) -> AppState {
+        AppState {
+            jobs,
+            request_ids: Arc::new(AtomicU64::new(1)),
+            worker_ready: Arc::new(AtomicBool::new(ready)),
+        }
+    }
+
     #[test]
     fn bounded_ingress_distinguishes_overload_and_worker_shutdown() {
         let (jobs, receiver) = channel(1);
@@ -393,7 +422,16 @@ mod tests {
     #[test]
     fn health_and_model_routes_name_the_exact_product() {
         runtime().block_on(async {
-            assert_eq!(health().await.0["status"], "ok");
+            let (jobs, _receiver) = channel(1);
+            let ready = health(State(state(jobs, true))).await;
+            assert_eq!(ready.status(), StatusCode::OK);
+            let body = to_bytes(ready.into_body(), 1 << 20).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["status"], "ok");
+
+            let (jobs, _receiver) = channel(1);
+            let unavailable = health(State(state(jobs, false))).await;
+            assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
             let models = models().await.0;
             assert_eq!(models["data"][0]["id"], SERVED_MODEL);
             assert_eq!(models["data"][0]["owned_by"], "tuiskollm");
@@ -404,10 +442,7 @@ mod tests {
     fn streaming_handler_enqueues_the_real_request_and_surfaces_worker_errors() {
         runtime().block_on(async {
             let (jobs, mut receiver) = channel(1);
-            let state = AppState {
-                jobs,
-                request_ids: Arc::new(AtomicU64::new(1)),
-            };
+            let state = state(jobs, true);
             let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
                 "model": SERVED_MODEL,
                 "messages": [{"role": "user", "content": "hello"}],
@@ -422,7 +457,7 @@ mod tests {
             assert_eq!(queued.request.max_new_tokens, 7);
             queued
                 .reply
-                .send(GenerationReply::Error("fixture failure".into()))
+                .send(GenerationReply::Failed("fixture failure".into()))
                 .unwrap();
             let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
             let body = String::from_utf8(bytes.to_vec()).unwrap();
@@ -433,6 +468,7 @@ mod tests {
                 .find_map(|value| value.get("error").cloned())
                 .unwrap_or_else(|| panic!("missing streamed error in {body:?}"));
             assert_eq!(error["message"], "fixture failure");
+            assert_eq!(error["type"], "server_error");
         });
     }
 }
