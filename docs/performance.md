@@ -419,8 +419,7 @@ owners and independent oracles.
 
 `performance baseline ... could not read`
 : No reviewed baseline exists. Run `perf leaf`, inspect the report, then use
-  `perf bless residual-norm`, `perf bless fp8-qkv`, `perf bless fp8-gdn-input`, or
-  `perf bless fp8-lm-head` explicitly.
+  `perf bless SUITE` explicitly for one of the registered suites in the command reference.
 
 `performance report and baseline metric inventories differ`
 : A route, workload dimension, timing boundary, or memory owner changed. Review the inventory change;
