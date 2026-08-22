@@ -3,7 +3,7 @@
 mod error;
 
 use minijinja::{Environment, Error as TemplateError, ErrorKind};
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -28,12 +28,48 @@ const DEFAULT_TOP_K: usize = 20;
 const PROMPT_BLOCK_START: &str = "<|im_start|>";
 
 /// One text message supplied to the checkpoint chat template.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ChatMessage {
     /// Template role such as `system`, `user`, or `assistant`.
     pub role: String,
-    /// Message text.
+    /// Text content, accepting OpenAI text parts at the transport boundary.
+    #[serde(default, deserialize_with = "deserialize_chat_content")]
     pub content: String,
+    /// Earlier reasoning supplied when the template is configured to preserve it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    /// Assistant tool calls supplied in conversation history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ChatToolCall>,
+    /// Tool-call identity associated with a `tool` response message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// One OpenAI-compatible function call in conversation history.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChatToolCall {
+    /// Optional transport identity for this call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Tool-call kind; the admitted template expects `function`.
+    #[serde(rename = "type", default = "default_tool_call_type")]
+    pub kind: String,
+    /// Function name and represented JSON arguments.
+    pub function: ChatFunctionCall,
+}
+
+/// Function name and arguments carried by one historical tool call.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChatFunctionCall {
+    /// Function name exposed to the model.
+    pub name: String,
+    /// JSON object accepted either directly or as an encoded JSON string.
+    #[serde(
+        default = "empty_tool_arguments",
+        deserialize_with = "deserialize_tool_arguments"
+    )]
+    pub arguments: Value,
 }
 
 impl ChatMessage {
@@ -42,15 +78,102 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: content.into(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+}
+
+fn default_tool_call_type() -> String {
+    "function".into()
+}
+
+fn empty_tool_arguments() -> Value {
+    Value::Object(Map::new())
+}
+
+fn deserialize_tool_arguments<'de, D>(deserializer: D) -> Result<Value, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let value = match value {
+        None => return Ok(empty_tool_arguments()),
+        Some(Value::String(encoded)) if encoded.trim().is_empty() => {
+            return Ok(empty_tool_arguments());
+        }
+        Some(Value::String(encoded)) => serde_json::from_str(&encoded).map_err(|source| {
+            D::Error::custom(format!("invalid tool-call arguments JSON: {source}"))
+        })?,
+        Some(value) => value,
+    };
+    if !value.is_object() {
+        return Err(D::Error::custom(
+            "tool-call arguments must encode a JSON object",
+        ));
+    }
+    Ok(value)
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WireChatContent {
+    Text(String),
+    Parts(Vec<WireChatContentPart>),
+}
+
+#[derive(Deserialize)]
+struct WireChatContentPart {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+fn deserialize_chat_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<WireChatContent>::deserialize(deserializer)? {
+        None => Ok(String::new()),
+        Some(WireChatContent::Text(text)) => Ok(text),
+        Some(WireChatContent::Parts(parts)) => {
+            let mut text = String::new();
+            for part in parts {
+                if part.kind != "text" {
+                    let detail = if part.kind == "image_url" || part.kind == "image" {
+                        "image parts are not served yet: the vision tower has no device implementation"
+                    } else {
+                        "TuiskoLLM currently accepts text parts only"
+                    };
+                    return Err(D::Error::custom(format!(
+                        "unsupported chat content part `{}`; {detail}",
+                        part.kind
+                    )));
+                }
+                text.push_str(
+                    part.text
+                        .as_deref()
+                        .ok_or_else(|| D::Error::custom("text content part is missing `text`"))?,
+                );
+            }
+            Ok(text)
         }
     }
 }
 
 /// Per-request options admitted by the current text template boundary.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChatTemplateOptions {
     /// Overrides the checkpoint's default thinking mode when present.
     pub enable_thinking: Option<bool>,
+    /// Preserves earlier assistant reasoning when requested by the caller.
+    pub preserve_thinking: Option<bool>,
+    /// Checkpoint-specific reasoning budget name.
+    pub reasoning_effort: Option<String>,
+    /// OpenAI-compatible function definitions rendered by the checkpoint template.
+    pub tools: Vec<Value>,
 }
 
 /// Startup options for the text frontend.
@@ -197,7 +320,7 @@ impl TextFrontend {
         &self,
         messages: &[ChatMessage],
         add_generation_prompt: bool,
-        options: ChatTemplateOptions,
+        options: &ChatTemplateOptions,
     ) -> FrontendResult<String> {
         let mut environment = Environment::new();
         environment
@@ -219,9 +342,18 @@ impl TextFrontend {
             Value::Bool(add_generation_prompt),
         );
         context.insert("add_vision_id".into(), Value::Bool(false));
-        context.insert("tools".into(), Value::Array(Vec::new()));
+        context.insert("tools".into(), Value::Array(options.tools.clone()));
         if let Some(enable_thinking) = options.enable_thinking {
             context.insert("enable_thinking".into(), Value::Bool(enable_thinking));
+        }
+        if let Some(preserve_thinking) = options.preserve_thinking {
+            context.insert("preserve_thinking".into(), Value::Bool(preserve_thinking));
+        }
+        if let Some(reasoning_effort) = &options.reasoning_effort {
+            context.insert(
+                "reasoning_effort".into(),
+                Value::String(reasoning_effort.clone()),
+            );
         }
 
         environment
@@ -242,7 +374,7 @@ impl TextFrontend {
     pub fn encode_chat(
         &self,
         messages: &[ChatMessage],
-        options: ChatTemplateOptions,
+        options: &ChatTemplateOptions,
     ) -> FrontendResult<Vec<u32>> {
         self.encode_chat_with_report(messages, options)
             .map(|encoding| encoding.token_ids)
@@ -252,7 +384,7 @@ impl TextFrontend {
     pub fn encode_chat_with_report(
         &self,
         messages: &[ChatMessage],
-        options: ChatTemplateOptions,
+        options: &ChatTemplateOptions,
     ) -> FrontendResult<PromptEncoding> {
         let rendered = self.render_chat(messages, true, options)?;
         self.encode_rendered_with_prefix(&rendered)
@@ -694,6 +826,78 @@ mod tests {
             json!({"role": "user", "content": "Hello"})
         );
         assert_eq!(ChatTemplateOptions::default().enable_thinking, None);
+    }
+
+    #[test]
+    fn chat_message_accepts_openai_text_content_shapes() {
+        let scalar: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
+        let parts: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"hel"},{"type":"text","text":"lo"}]}"#,
+        )
+        .unwrap();
+        let null: ChatMessage =
+            serde_json::from_str(r#"{"role":"assistant","content":null}"#).unwrap();
+        let missing: ChatMessage = serde_json::from_str(r#"{"role":"assistant"}"#).unwrap();
+
+        assert_eq!(scalar.content, "hello");
+        assert_eq!(parts.content, "hello");
+        assert_eq!(null.content, "");
+        assert_eq!(missing.content, "");
+    }
+
+    #[test]
+    fn chat_message_refuses_unimplemented_image_content() {
+        let error = serde_json::from_str::<ChatMessage>(
+            r#"{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("image_url"), "{error}");
+        assert!(error.contains("not served yet"), "{error}");
+        assert!(error.contains("device"), "{error}");
+    }
+
+    #[test]
+    fn historical_tool_calls_accept_openai_argument_strings() {
+        let message: ChatMessage = serde_json::from_str(
+            r#"{
+                "role":"assistant",
+                "content":null,
+                "reasoning_content":"inspect the directory",
+                "tool_calls":[{
+                    "id":"call_1",
+                    "type":"function",
+                    "function":{"name":"bash","arguments":"{\"command\":\"ls -la\"}"}
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("inspect the directory")
+        );
+        assert_eq!(message.tool_calls[0].function.name, "bash");
+        assert_eq!(
+            message.tool_calls[0].function.arguments,
+            json!({"command": "ls -la"})
+        );
+        assert!(
+            serde_json::to_value(message).unwrap()["tool_calls"][0]["function"]["arguments"]
+                .is_object()
+        );
+    }
+
+    #[test]
+    fn historical_tool_calls_reject_non_object_arguments() {
+        let error = serde_json::from_str::<ChatMessage>(
+            r#"{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"bash","arguments":"[]"}}]}"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must encode a JSON object"));
     }
 
     #[test]
