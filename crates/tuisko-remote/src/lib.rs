@@ -1,6 +1,7 @@
-//! Runs prebuilt qualification and benchmark executables on ephemeral RunPod RTX 5090 pods.
+//! Runs prebuilt qualification and benchmark executables on ephemeral RunPod GPU pods.
 
 mod error;
+mod gpu;
 mod key;
 mod run;
 mod sentry;
@@ -8,9 +9,10 @@ mod ssh;
 mod v2;
 
 pub use error::RemoteError;
+pub use gpu::GpuTarget;
 pub use run::{
-    BenchmarkOptions, QualificationOptions, check, check_credentials, run_benchmark,
-    run_qualification, sweep_stale,
+    BenchmarkOptions, ProbeOptions, QualificationOptions, check, check_credentials, run_benchmark,
+    run_probe, run_qualification, sweep_stale,
 };
 pub use sentry::{mark_keep, run_sentry, spawn_sentry};
 

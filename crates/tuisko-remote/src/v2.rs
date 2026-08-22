@@ -5,14 +5,13 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::{RemoteError, RemoteResult};
+use crate::{GpuTarget, RemoteError, RemoteResult};
 
 pub(crate) const DEFAULT_IMAGE: &str = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404";
 pub(crate) const POD_NAME_PREFIX: &str = "tuiskollm-gate";
 pub(crate) const REMOTE_WORKDIR: &str = "/tmp/tuiskollm";
 
 const API_BASE: &str = "https://api.runpod.io/v2";
-const GPU_TYPE: &str = "NVIDIA GeForce RTX 5090";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -35,7 +34,12 @@ impl V2 {
         }
     }
 
-    pub(crate) fn create_gate_pod(&self, name: &str, image: &str) -> RemoteResult<Pod> {
+    pub(crate) fn create_gate_pod(
+        &self,
+        name: &str,
+        image: &str,
+        gpu: GpuTarget,
+    ) -> RemoteResult<Pod> {
         let response = self
             .agent
             .post(format!("{API_BASE}/pods"))
@@ -43,7 +47,7 @@ impl V2 {
             .send_json(serde_json::json!({
                 "name": name,
                 "image": image,
-                "gpu": { "id": GPU_TYPE, "count": 1 },
+                "gpu": { "id": gpu.device_name(), "count": 1 },
                 "cloud": "SECURE",
                 "disk": 50,
                 "ports": ["22/tcp"],
@@ -143,8 +147,9 @@ pub(crate) fn wait_until_ssh(v2: &V2, pod_id: &str, deadline: Instant) -> Remote
             });
         }
         if Instant::now() >= deadline {
-            return Err(RemoteError::PodNotRunning {
+            return Err(RemoteError::SshRouteUnavailable {
                 seconds: started.elapsed().as_secs(),
+                status: pod.status.unwrap_or_else(|| "missing".to_owned()),
             });
         }
 

@@ -9,7 +9,7 @@ use crate::key::{resolve_api_key, resolve_env};
 use crate::sentry::{delete_pod, mark_keep, spawn_sentry};
 use crate::ssh::Ssh;
 use crate::v2::{POD_NAME_PREFIX, REMOTE_WORKDIR, V2, is_missing, wait_until_ssh};
-use crate::{RemoteError, RemoteResult};
+use crate::{GpuTarget, RemoteError, RemoteResult};
 
 const PROVISIONING_DEADLINE: Duration = Duration::from_secs(240);
 const SENTRY_GRACE: Duration = Duration::from_secs(300);
@@ -22,6 +22,8 @@ pub struct QualificationOptions {
     pub executable: PathBuf,
     /// Fixed libtest arguments selected by `xtask`.
     pub test_args: Vec<String>,
+    /// Exact GPU to provision and admit.
+    pub gpu: GpuTarget,
     /// Container image for the pod.
     pub image: String,
     /// Whole-run budget, including provisioning and report retrieval.
@@ -40,9 +42,23 @@ pub struct BenchmarkOptions {
     pub benchmark_args: Vec<String>,
     /// Hash of the matching checked static-resource baseline.
     pub generator_baseline_sha256: String,
+    /// Exact GPU to provision and admit.
+    pub gpu: GpuTarget,
     /// Container image for the pod.
     pub image: String,
     /// Whole-run budget, including provisioning and report retrieval.
+    pub max_minutes: u32,
+    /// Retain a failed pod for inspection.
+    pub keep_on_fail: bool,
+}
+
+/// Inputs for one transport and device-identity probe.
+pub struct ProbeOptions {
+    /// Exact GPU to provision and admit.
+    pub gpu: GpuTarget,
+    /// Container image for the pod.
+    pub image: String,
+    /// Whole-run budget, including provisioning.
     pub max_minutes: u32,
     /// Retain a failed pod for inspection.
     pub keep_on_fail: bool,
@@ -104,7 +120,33 @@ fn checked_ssh_key() -> RemoteResult<PathBuf> {
     Ok(PathBuf::from(key_file))
 }
 
-/// Runs a prebuilt qualification executable on a fresh RTX 5090 pod.
+/// Provisions and validates a GPU without uploading a device artifact.
+pub fn run_probe(options: &ProbeOptions) -> RemoteResult<()> {
+    if options.max_minutes < 2 {
+        return Err(RemoteError::DeadlineExceeded {
+            minutes: options.max_minutes,
+        });
+    }
+    let key_file = checked_ssh_key()?;
+    let api = V2::new(resolve_api_key()?);
+    let started = Instant::now();
+    let budget = Duration::from_secs(u64::from(options.max_minutes) * 60);
+    let provisioning_deadline = started + PROVISIONING_DEADLINE.min(budget);
+    let (guard, ssh, pod_id, cost_per_hour) = open_pod(
+        &api,
+        options.gpu,
+        &options.image,
+        options.keep_on_fail,
+        key_file,
+        budget,
+        provisioning_deadline,
+    )?;
+    wait_for_precheck(&ssh, options.gpu, provisioning_deadline)?;
+
+    finish_run(&api, guard, &pod_id, 0, started, cost_per_hour)
+}
+
+/// Runs a prebuilt qualification executable on a fresh target GPU pod.
 pub fn run_qualification(
     workspace_root: &Path,
     options: &QualificationOptions,
@@ -134,6 +176,7 @@ pub fn run_qualification(
     let provisioning_deadline = started + PROVISIONING_DEADLINE.min(budget);
     let (mut guard, ssh, pod_id, cost_per_hour) = open_pod(
         &api,
+        options.gpu,
         &options.image,
         options.keep_on_fail,
         key_file,
@@ -141,19 +184,7 @@ pub fn run_qualification(
         provisioning_deadline,
     )?;
 
-    loop {
-        match precheck(&ssh) {
-            Ok(()) => break,
-            Err(RemoteError::Precheck { detail }) if detail.starts_with("wrong remote GPU:") => {
-                return Err(RemoteError::Precheck { detail });
-            }
-            Err(error) if Instant::now() < provisioning_deadline => {
-                eprintln!("pod not ready ({error}); retrying in 5s");
-                std::thread::sleep(Duration::from_secs(5));
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    wait_for_precheck(&ssh, options.gpu, provisioning_deadline)?;
 
     let elapsed = started.elapsed();
     let run_seconds = budget
@@ -193,7 +224,7 @@ pub fn run_qualification(
     finish_run(&api, guard, &pod_id, status, started, cost_per_hour)
 }
 
-/// Runs one prebuilt device benchmark on a fresh RTX 5090 pod.
+/// Runs one prebuilt device benchmark on a fresh target GPU pod.
 ///
 /// The result is diagnostic evidence only. It is never compared with or written to a checked
 /// performance baseline.
@@ -227,6 +258,7 @@ pub fn run_benchmark(workspace_root: &Path, options: &BenchmarkOptions) -> Remot
     let provisioning_deadline = started + PROVISIONING_DEADLINE.min(budget);
     let (mut guard, ssh, pod_id, cost_per_hour) = open_pod(
         &api,
+        options.gpu,
         &options.image,
         options.keep_on_fail,
         key_file,
@@ -234,19 +266,7 @@ pub fn run_benchmark(workspace_root: &Path, options: &BenchmarkOptions) -> Remot
         provisioning_deadline,
     )?;
 
-    loop {
-        match precheck(&ssh) {
-            Ok(()) => break,
-            Err(RemoteError::Precheck { detail }) if detail.starts_with("wrong remote GPU:") => {
-                return Err(RemoteError::Precheck { detail });
-            }
-            Err(error) if Instant::now() < provisioning_deadline => {
-                eprintln!("pod not ready ({error}); retrying in 5s");
-                std::thread::sleep(Duration::from_secs(5));
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    wait_for_precheck(&ssh, options.gpu, provisioning_deadline)?;
 
     let elapsed = started.elapsed();
     let run_seconds = budget
@@ -350,6 +370,7 @@ pub fn sweep_stale() -> RemoteResult<u32> {
 
 fn open_pod(
     api: &V2,
+    gpu: GpuTarget,
     image: &str,
     keep_on_fail: bool,
     key_file: PathBuf,
@@ -357,8 +378,8 @@ fn open_pod(
     deadline: Instant,
 ) -> RemoteResult<(PodGuard, Ssh, String, Option<f64>)> {
     let name = format!("{POD_NAME_PREFIX}-{}", unix_seconds());
-    println!("creating {name} (1x secure RTX 5090)");
-    let pod = api.create_gate_pod(&name, image)?;
+    println!("creating {name} (1x secure {})", gpu.device_name());
+    let pod = api.create_gate_pod(&name, image, gpu)?;
     let pod_id = pod
         .id
         .filter(|id| !id.is_empty())
@@ -407,7 +428,21 @@ fn open_pod(
     Ok((guard, ssh, pod_id, cost))
 }
 
-fn precheck(ssh: &Ssh) -> RemoteResult<()> {
+fn wait_for_precheck(ssh: &Ssh, gpu: GpuTarget, deadline: Instant) -> RemoteResult<()> {
+    loop {
+        match precheck(ssh, gpu) {
+            Ok(()) => return Ok(()),
+            Err(error @ RemoteError::WrongGpu { .. }) => return Err(error),
+            Err(error) if Instant::now() < deadline => {
+                eprintln!("pod not ready ({error}); retrying in 5s");
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn precheck(ssh: &Ssh, gpu: GpuTarget) -> RemoteResult<()> {
     let (status, _) = ssh.run("whoami", 45)?;
     if status != 0 {
         return Err(RemoteError::Precheck {
@@ -417,14 +452,16 @@ fn precheck(ssh: &Ssh) -> RemoteResult<()> {
     let command = "timeout 30 nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader; \
         echo ---; ldd --version 2>&1 | head -n 1; echo ---; nproc";
     let (status, output) = ssh.run(command, 45)?;
-    let gpu = output.lines().find(|line| line.starts_with("NVIDIA "));
-    match gpu {
-        Some("NVIDIA GeForce RTX 5090, 12.0") => {
+    let expected = gpu.expected_identity();
+    let observed_gpu = output.lines().find(|line| line.starts_with("NVIDIA "));
+    match observed_gpu {
+        Some(observed) if observed == expected => {
             println!("precheck ok:\n{output}");
             Ok(())
         }
-        Some(observed) => Err(RemoteError::Precheck {
-            detail: format!("wrong remote GPU: {observed}"),
+        Some(observed) => Err(RemoteError::WrongGpu {
+            expected,
+            observed: observed.to_owned(),
         }),
         None => Err(RemoteError::Precheck {
             detail: format!("GPU not ready (status {status}):\n{output}"),
