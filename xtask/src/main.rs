@@ -1,6 +1,5 @@
 //! Repository build and qualification gates.
 
-#[cfg(any(feature = "remote", test))]
 mod gpu_target;
 mod performance;
 mod remote;
@@ -135,6 +134,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     match command.to_str() {
         Some("bootstrap-cuda-oxide") if remaining.is_empty() => bootstrap_cuda_oxide(root),
         Some("build-sm120") if remaining.is_empty() => build_sm120(root),
+        Some("build-residual-norm") => build_residual_norm(root, &remaining),
         Some("qualify-frontend") => qualify_frontend(root, &remaining),
         Some("qualify-generation") => qualify_generation(root, &remaining),
         Some("qualify-residual-norm") if remaining.is_empty() => qualify_residual_norm(root),
@@ -177,6 +177,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 known,
                 "bootstrap-cuda-oxide"
                     | "build-sm120"
+                    | "build-residual-norm"
                     | "qualify-residual-norm"
                     | "qualify-fp8-qkv"
                     | "qualify-fp8-gdn-input"
@@ -288,6 +289,31 @@ fn build_sm120(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_gdn_prepare(root)?;
     gate_gdn_recurrence(root)?;
     gate_gdn_output(root)
+}
+
+fn build_residual_norm(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [flag, value] = arguments else {
+        return Err(
+            "usage: cargo run -p xtask -- build-residual-norm --gpu <5090|4090|3090>".into(),
+        );
+    };
+    if flag != "--gpu" {
+        return Err("build-residual-norm requires `--gpu <5090|4090|3090>`".into());
+    }
+    let gpu = gpu_target::GpuTarget::parse(&value.to_string_lossy())?;
+    let prepared = prepare_remote_qualify(root, gpu, "residual_norm::tests")?;
+    gate_residual_norm_target(root, gpu)?;
+    println!(
+        "{} ({}, compute capability {}) residual-norm qualification artifact: {}",
+        gpu.key(),
+        gpu.device_name(),
+        gpu.compute_capability(),
+        prepared.executable.display()
+    );
+    Ok(())
 }
 
 fn qualify_frontend(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
@@ -1088,30 +1114,37 @@ pub(crate) fn prepare_remote_benchmark(
 ///
 /// No GPU is needed locally: the cuda-oxide codegen and ptxas steps run
 /// at compile time; the pod only needs the driver to execute the binary.
-pub fn prepare_remote_qualify(
+pub(crate) fn prepare_remote_qualify(
     root: &Path,
+    gpu: gpu_target::GpuTarget,
     test_filter: &str,
 ) -> Result<RemoteQualify, Box<dyn Error>> {
     let test_args = [test_filter, "--include-ignored", "--nocapture"];
-    let mut arguments: Vec<&str> = vec![
-        "test",
-        "--arch",
-        "sm_120a",
-        "--cargo-target-dir",
-        CUDA_OXIDE_TEST_TARGET,
-        "--device-codegen-crate",
-        "tuisko-kernels-sm120",
-        "--",
-        "--package",
-        "tuisko-qual",
-        "--release",
-        "--lib",
-        "--message-format=json-render-diagnostics",
-        "--no-run",
-        "--",
+    let arguments = vec![
+        "test".to_string(),
+        "--arch".to_string(),
+        gpu.oxide_arch().to_string(),
+        "--cargo-target-dir".to_string(),
+        gpu.oxide_test_target().to_string(),
+        "--device-codegen-crate".to_string(),
+        gpu.kernel_crate().to_string(),
+        "--".to_string(),
+        "--package".to_string(),
+        "tuisko-qual".to_string(),
+        "--release".to_string(),
+        "--lib".to_string(),
+        "--no-default-features".to_string(),
+        "--features".to_string(),
+        gpu.qualification_feature().to_string(),
+        "--message-format=json-render-diagnostics".to_string(),
+        "--no-run".to_string(),
+        "--".to_string(),
+        test_args[0].to_string(),
+        test_args[1].to_string(),
+        test_args[2].to_string(),
     ];
-    arguments.extend_from_slice(&test_args);
-    let messages = run_oxide_capture(root, &arguments)?;
+    let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    let messages = run_oxide_capture(root, &argument_refs)?;
     let built = messages
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -1139,7 +1172,8 @@ pub fn prepare_remote_qualify(
         )
         .into());
     }
-    let executable = strip_remote_artifact(root, &built, "tuisko-qual")?;
+    let artifact_name = format!("tuisko-qual-{}", gpu.key());
+    let executable = strip_remote_artifact(root, &built, &artifact_name)?;
     println!("remote test binary: {}", executable.display());
     Ok(RemoteQualify {
         executable,
@@ -1202,12 +1236,19 @@ fn require_cuda_oxide_revision(source: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn gate_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
+    gate_residual_norm_target(root, gpu_target::GpuTarget::Rtx5090)
+}
+
+pub(crate) fn gate_residual_norm_target(
+    root: &Path,
+    gpu: gpu_target::GpuTarget,
+) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(
-        root.join(RESIDUAL_NORM_RESOURCE_BASELINE),
+        root.join(gpu.residual_resource_baseline()),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let ptx_path = root.join(PTX);
+    let ptx_path = root.join(gpu.ptx_path());
     let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
         format!(
             "could not read {}: {error}; run the pinned release device build first",
@@ -1238,14 +1279,14 @@ fn gate_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
 
     let temporary = root.join("target/tmp");
     fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("residual-norm-gate.cubin");
+    let cubin = temporary.join(format!("residual-norm-{}-gate.cubin", gpu.key()));
     let ptxas = cuda_tool("ptxas");
     require_success(
         &ptxas,
         &[
             OsStr::new("-O3"),
             OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
+            OsStr::new(gpu.oxide_arch()),
             ptx_path.as_os_str(),
             OsStr::new("--output-file"),
             cubin.as_os_str(),
@@ -1284,8 +1325,11 @@ fn gate_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "residual-norm gate passed: 8 plain + 8 residual entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}",
-        plain_registers, residual_registers, shared
+        "{} residual-norm gate passed: 8 plain + 8 residual entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}",
+        gpu.key(),
+        plain_registers,
+        residual_registers,
+        shared
     );
     Ok(())
 }

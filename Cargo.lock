@@ -3021,6 +3021,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuisko-kernels-sm86"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+ "cuda-intrinsics",
+ "tuisko-gpu",
+ "tuisko-model",
+]
+
+[[package]]
+name = "tuisko-kernels-sm89"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+ "cuda-intrinsics",
+ "tuisko-gpu",
+ "tuisko-model",
+]
+
+[[package]]
 name = "tuisko-model"
 version = "0.1.0"
 dependencies = [
@@ -3043,6 +3067,8 @@ dependencies = [
  "tuisko-frontend",
  "tuisko-gpu",
  "tuisko-kernels-sm120",
+ "tuisko-kernels-sm86",
+ "tuisko-kernels-sm89",
  "tuisko-model",
 ]
 

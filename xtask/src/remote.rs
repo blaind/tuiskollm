@@ -119,24 +119,25 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
     let options = parse_options(&arguments[1..], benchmark.is_some())?;
 
-    let kernel_crate = options.gpu.kernel_crate().ok_or_else(|| {
-        format!(
-            "GPU {} ({}, compute capability {}, cuda-oxide {}) has no qualified kernel crate yet; use `remote probe --gpu {}` to test provisioning only",
+    let residual_only = qualification
+        .as_ref()
+        .is_some_and(|suite| suite.name == "residual-norm");
+    if !options.gpu.has_full_kernel_inventory() && !residual_only {
+        return Err(format!(
+            "GPU {} currently admits only `qualify-residual-norm`; the remaining {} inventory has not been implemented",
             options.gpu.key(),
-            options.gpu.device_name(),
-            options.gpu.compute_capability(),
-            options.gpu.oxide_arch(),
-            options.gpu.key(),
+            options.gpu.kernel_crate(),
         )
-    })?;
-    if kernel_crate != "tuisko-kernels-sm120" {
-        return Err(format!("unsupported kernel crate `{kernel_crate}`").into());
+        .into());
     }
 
     tuisko_remote::check_credentials().map_err(|error| format!("{error}"))?;
-    crate::build_sm120(root)?;
+    if options.gpu.has_full_kernel_inventory() {
+        crate::build_sm120(root)?;
+    }
     if let Some(qualification) = qualification {
-        let prepared = crate::prepare_remote_qualify(root, qualification.filter)?;
+        let prepared = crate::prepare_remote_qualify(root, options.gpu, qualification.filter)?;
+        crate::gate_residual_norm_target(root, options.gpu)?;
         tuisko_remote::run_qualification(
             root,
             &tuisko_remote::QualificationOptions {

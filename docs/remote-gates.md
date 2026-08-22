@@ -1,9 +1,9 @@
 # Remote qualification
 
 `xtask remote` probes a selected GPU or runs a locally built qualification or benchmark executable
-on a fresh secure RunPod pod. RTX 5090 remains the default and the only GPU with a qualified kernel
-artifact. RTX 4090 and RTX 3090 probes exercise provisioning and transport without claiming kernel
-support.
+on a fresh secure RunPod pod. RTX 5090 remains the default and the only GPU with a complete kernel
+inventory. RTX 4090 and RTX 3090 have separate residual-norm artifacts; the other suites reject
+those targets before provisioning.
 
 Remote benchmark reports are diagnostic. They record GPU identity, driver, clocks, telemetry,
 binary and resource hashes with `clock_policy: diagnostic_uncontrolled`. Baseline blessing rejects
@@ -30,7 +30,11 @@ selected pod image supplies its SSH server and `gzip` decoder.
 cargo run -p xtask --features remote -- remote check
 cargo run -p xtask --features remote -- remote probe --gpu 4090
 cargo run -p xtask --features remote -- remote probe --gpu 3090
+cargo run -p xtask -- build-residual-norm --gpu 4090
+cargo run -p xtask -- build-residual-norm --gpu 3090
 cargo run -p xtask --features remote -- remote qualify-residual-norm
+cargo run -p xtask --features remote -- remote qualify-residual-norm --gpu 4090
+cargo run -p xtask --features remote -- remote qualify-residual-norm --gpu 3090
 cargo run -p xtask --features remote -- remote qualify-fp8-qkv
 cargo run -p xtask --features remote -- remote qualify-fp8-gdn-input
 cargo run -p xtask --features remote -- remote qualify-fp8-lm-head
@@ -44,9 +48,9 @@ cargo run -p xtask --features remote -- remote sweep
 Qualification accepts `--max-minutes N`, `--image NAME`, and `--keep-on-fail`. The last option
 retains a failed, billable pod until `remote sweep` or manual deletion.
 
-All provisioning commands accept `--gpu 5090|4090|3090`. Qualification and benchmark commands
-currently reject 4090 and 3090 before building or renting because those architecture-specific
-kernel crates do not exist yet. `probe` validates the requested device name, compute capability,
+All provisioning commands accept `--gpu 5090|4090|3090`. Non-SM120 targets currently admit only
+`qualify-residual-norm`; their benchmark loop and remaining operator inventories are separate
+qualification work. `probe` validates the requested device name, compute capability,
 userland, direct SSH, and cleanup without uploading a CUDA artifact. The runner does not fall back
 to RunPod's proxy shell when a host fails to expose direct SSH.
 
@@ -57,7 +61,7 @@ without claiming comparability. The runner downloads `benchmark.out` plus `bench
 
 Each run:
 
-1. checks credentials and builds the pinned SM120 artifact locally;
+1. checks credentials and builds the selected architecture artifact locally;
 2. verifies static resource gates and prepares the selected executable;
 3. creates one secure pod for the selected exact GPU through the RunPod v2 API;
 4. starts a detached cleanup watchdog;

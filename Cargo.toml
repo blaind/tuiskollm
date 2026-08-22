@@ -10,6 +10,8 @@ members = [
     "crates/tuisko-engine",
     "crates/tuisko-frontend",
     "crates/tuisko-gpu",
+    "crates/tuisko-kernels-sm86",
+    "crates/tuisko-kernels-sm89",
     "crates/tuisko-kernels-sm120",
     "crates/tuisko-model",
     "crates/tuisko-remote",
@@ -44,6 +46,8 @@ tokenizers = { version = "=0.23.1", default-features = false, features = ["onig"
 tuisko-engine = { version = "0.1.0", path = "crates/tuisko-engine" }
 tuisko-frontend = { version = "0.1.0", path = "crates/tuisko-frontend" }
 tuisko-gpu = { version = "0.1.0", path = "crates/tuisko-gpu" }
+tuisko-kernels-sm86 = { version = "0.1.0", path = "crates/tuisko-kernels-sm86" }
+tuisko-kernels-sm89 = { version = "0.1.0", path = "crates/tuisko-kernels-sm89" }
 tuisko-kernels-sm120 = { version = "0.1.0", path = "crates/tuisko-kernels-sm120" }
 tuisko-model = { version = "0.1.0", path = "crates/tuisko-model" }
 tuisko-remote = { version = "0.1.0", path = "crates/tuisko-remote" }

@@ -13,6 +13,8 @@ device = [
     "dep:tuisko-gpu",
     "dep:tuisko-kernels-sm120",
 ]
+sm89-residual = ["dep:tuisko-gpu", "dep:tuisko-kernels-sm89"]
+sm86-residual = ["dep:tuisko-gpu", "dep:tuisko-kernels-sm86"]
 
 [dependencies]
 serde.workspace = true
@@ -22,6 +24,8 @@ thiserror.workspace = true
 tuisko-engine = { workspace = true, features = ["qualification"], optional = true }
 tuisko-frontend.workspace = true
 tuisko-gpu = { workspace = true, optional = true }
+tuisko-kernels-sm86 = { workspace = true, optional = true }
+tuisko-kernels-sm89 = { workspace = true, optional = true }
 tuisko-kernels-sm120 = { workspace = true, optional = true }
 tuisko-model.workspace = true
 

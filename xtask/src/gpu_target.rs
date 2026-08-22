@@ -58,10 +58,48 @@ impl GpuTarget {
         }
     }
 
-    pub(crate) const fn kernel_crate(self) -> Option<&'static str> {
+    pub(crate) const fn kernel_crate(self) -> &'static str {
         match self {
-            Self::Rtx5090 => Some("tuisko-kernels-sm120"),
-            Self::Rtx4090 | Self::Rtx3090 => None,
+            Self::Rtx5090 => "tuisko-kernels-sm120",
+            Self::Rtx4090 => "tuisko-kernels-sm89",
+            Self::Rtx3090 => "tuisko-kernels-sm86",
+        }
+    }
+
+    pub(crate) const fn qualification_feature(self) -> &'static str {
+        match self {
+            Self::Rtx5090 => "device",
+            Self::Rtx4090 => "sm89-residual",
+            Self::Rtx3090 => "sm86-residual",
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) const fn has_full_kernel_inventory(self) -> bool {
+        matches!(self, Self::Rtx5090)
+    }
+
+    pub(crate) const fn oxide_test_target(self) -> &'static str {
+        match self {
+            Self::Rtx5090 => "target/cuda-oxide-test",
+            Self::Rtx4090 => "target/cuda-oxide-test-sm89",
+            Self::Rtx3090 => "target/cuda-oxide-test-sm86",
+        }
+    }
+
+    pub(crate) const fn ptx_path(self) -> &'static str {
+        match self {
+            Self::Rtx5090 => "target/cuda/tuisko_kernels_sm120.ptx",
+            Self::Rtx4090 => "target/cuda/tuisko_kernels_sm89.ptx",
+            Self::Rtx3090 => "target/cuda/tuisko_kernels_sm86.ptx",
+        }
+    }
+
+    pub(crate) const fn residual_resource_baseline(self) -> &'static str {
+        match self {
+            Self::Rtx5090 => "qual/baselines/residual-norm-sm120.txt",
+            Self::Rtx4090 => "qual/baselines/residual-norm-sm89.txt",
+            Self::Rtx3090 => "qual/baselines/residual-norm-sm86.txt",
         }
     }
 
@@ -84,6 +122,9 @@ mod tests {
                 target.compute_capability(),
                 target.oxide_arch(),
                 target.kernel_crate(),
+                target.qualification_feature(),
+                target.ptx_path(),
+                target.residual_resource_baseline(),
             )
         });
 
@@ -95,10 +136,31 @@ mod tests {
                     "NVIDIA GeForce RTX 5090",
                     "12.0",
                     "sm_120a",
-                    Some("tuisko-kernels-sm120"),
+                    "tuisko-kernels-sm120",
+                    "device",
+                    "target/cuda/tuisko_kernels_sm120.ptx",
+                    "qual/baselines/residual-norm-sm120.txt",
                 ),
-                ("4090", "NVIDIA GeForce RTX 4090", "8.9", "sm_89", None,),
-                ("3090", "NVIDIA GeForce RTX 3090", "8.6", "sm_86", None,),
+                (
+                    "4090",
+                    "NVIDIA GeForce RTX 4090",
+                    "8.9",
+                    "sm_89",
+                    "tuisko-kernels-sm89",
+                    "sm89-residual",
+                    "target/cuda/tuisko_kernels_sm89.ptx",
+                    "qual/baselines/residual-norm-sm89.txt",
+                ),
+                (
+                    "3090",
+                    "NVIDIA GeForce RTX 3090",
+                    "8.6",
+                    "sm_86",
+                    "tuisko-kernels-sm86",
+                    "sm86-residual",
+                    "target/cuda/tuisko_kernels_sm86.ptx",
+                    "qual/baselines/residual-norm-sm86.txt",
+                ),
             ]
         );
     }

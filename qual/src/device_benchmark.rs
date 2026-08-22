@@ -168,6 +168,7 @@ pub struct BenchmarkWorkload {
     pub execution: BenchmarkExecution,
 }
 
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 impl BenchmarkWorkload {
     pub(crate) fn warm_operator_decode(batch_size: u32) -> Self {
         Self {
@@ -500,6 +501,7 @@ pub enum DeviceBenchmarkError {
     Gpu(#[from] tuisko_gpu::GpuError),
 
     /// Resident engine ownership or execution failure.
+    #[cfg(feature = "engine")]
     #[error(transparent)]
     Engine(#[from] tuisko_engine::EngineError),
 

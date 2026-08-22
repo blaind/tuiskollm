@@ -6,11 +6,11 @@ use crate::device_benchmark::{
     OperationAccounting, RepeatedGraph, finish_report, generator_baseline_sha256, measure_cases,
     preflight, require_current_process_exclusive, warmup_launches,
 };
+use crate::target::{EXPECTED_COMPUTE_CAPABILITY, ResidualNormOp};
 use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer,
 };
-use tuisko_kernels_sm120::ResidualNormOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -53,10 +53,13 @@ impl Session {
     fn new(repeated_operations: u64) -> Result<Self, DeviceBenchmarkError> {
         let context = CudaContext::new(0).map_err(GpuError::from)?;
         let capability = context.compute_capability().map_err(GpuError::from)?;
-        if capability != (12, 0) {
+        if capability != EXPECTED_COMPUTE_CAPABILITY {
             return Err(DeviceBenchmarkError::Precondition(format!(
-                "device zero has compute capability {}.{}, expected 12.0",
-                capability.0, capability.1
+                "device zero has compute capability {}.{}, expected {}.{}",
+                capability.0,
+                capability.1,
+                EXPECTED_COMPUTE_CAPABILITY.0,
+                EXPECTED_COMPUTE_CAPABILITY.1,
             )));
         }
 
