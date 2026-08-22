@@ -38,6 +38,7 @@ tuisko-kernels-sm86 = { workspace = true, optional = true }
 tuisko-kernels-sm89 = { workspace = true, optional = true }
 tuisko-kernels-sm120 = { workspace = true, optional = true }
 tuisko-model.workspace = true
+tuisko-targets.workspace = true
 
 [[bin]]
 name = "bench-device"

@@ -1,8 +1,9 @@
 # TuiskoLLM engineering contract
 
-TuiskoLLM is an exact-target Rust/SM120 inference server for
+TuiskoLLM is an exact-model Rust inference server, with SM120 as its complete product target, for
 `unsloth/Qwen3.8-27B-NVFP4` at revision
 `16b6615af3548b88e2d8e382457bc705b00479cf` on one NVIDIA GeForce RTX 5090.
+SM89 and SM86 remain partial qualification targets until their complete inventories close.
 
 ## Scope
 
@@ -17,8 +18,9 @@ TuiskoLLM is an exact-target Rust/SM120 inference server for
 - `tuisko-model` owns checkpoint admission, typed source views, and lossless materialization.
 - `tuisko-frontend` owns tokenizer admission, chat templates, prompt encoding, and streaming text.
 - `tuisko-gpu` owns raw CUDA resources and model-independent checked wrappers.
-- `tuisko-kernels-sm120` owns device code and prepared concrete `*Op` launchers. Operators do not
-  allocate their inputs, outputs, weights, or scratch space.
+- `tuisko-targets` owns exact GPU identity and startup profile selection.
+- Each `tuisko-kernels-sm*` crate owns one architecture's device code, inventories, tuning, and
+  prepared concrete `*Op` launchers. Operators do not allocate inputs, outputs, weights, or scratch.
 - `tuisko-engine` owns resident weights, address-stable workspaces, CUDA Graphs, slots, and
   scheduling. Qualification code never becomes a production dependency.
 - `qual` owns independent oracles, fixtures, probes, and benchmarks. `xtask` owns device builds,
@@ -57,9 +59,11 @@ Run the host checks relevant to every change:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --exclude tuisko-gpu --exclude tuisko-kernels-sm120 \
+cargo clippy --workspace --exclude tuisko-gpu --exclude tuisko-kernels-sm86 \
+  --exclude tuisko-kernels-sm89 --exclude tuisko-kernels-sm120 \
   --exclude tuisko-qual --all-targets -- -D warnings
-cargo test --workspace --exclude tuisko-gpu --exclude tuisko-kernels-sm120 \
+cargo test --workspace --exclude tuisko-gpu --exclude tuisko-kernels-sm86 \
+  --exclude tuisko-kernels-sm89 --exclude tuisko-kernels-sm120 \
   --exclude tuisko-qual
 cargo deny --workspace --all-features check
 ```

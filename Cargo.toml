@@ -15,6 +15,7 @@ members = [
     "crates/tuisko-kernels-sm120",
     "crates/tuisko-model",
     "crates/tuisko-remote",
+    "crates/tuisko-targets",
     "qual",
     "xtask",
 ]
@@ -51,6 +52,7 @@ tuisko-kernels-sm89 = { version = "0.1.0", path = "crates/tuisko-kernels-sm89" }
 tuisko-kernels-sm120 = { version = "0.1.0", path = "crates/tuisko-kernels-sm120" }
 tuisko-model = { version = "0.1.0", path = "crates/tuisko-model" }
 tuisko-remote = { version = "0.1.0", path = "crates/tuisko-remote" }
+tuisko-targets = { version = "0.1.0", path = "crates/tuisko-targets" }
 ureq = { version = "3.4", default-features = false, features = ["json", "rustls"] }
 
 [workspace.lints.rust]
