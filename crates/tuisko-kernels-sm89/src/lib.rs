@@ -7,7 +7,7 @@ mod residual_norm;
 
 pub use arch::Sm89Arch;
 pub use inventory::kernel_ptx_names;
-pub use nvfp4::Nvfp4SwiGluOp;
+pub use nvfp4::{Nvfp4DownOp, Nvfp4SwiGluOp};
 pub use residual_norm::ResidualNormOp;
 
 #[cfg(test)]

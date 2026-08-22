@@ -1,7 +1,7 @@
 #[cfg(feature = "sm86")]
 pub(crate) use tuisko_kernels_sm86::{Nvfp4SwiGluOp, ResidualNormOp};
 #[cfg(feature = "sm89")]
-pub(crate) use tuisko_kernels_sm89::{Nvfp4SwiGluOp, ResidualNormOp};
+pub(crate) use tuisko_kernels_sm89::{Nvfp4DownOp, Nvfp4SwiGluOp, ResidualNormOp};
 #[cfg(feature = "device")]
 pub(crate) use tuisko_kernels_sm120::ResidualNormOp;
 
