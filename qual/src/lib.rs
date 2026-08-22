@@ -1,11 +1,11 @@
 //! Independent operator qualification for one compiled GPU target.
 
-#![cfg(any(feature = "device", feature = "sm89", feature = "sm86-residual"))]
+#![cfg(any(feature = "device", feature = "sm89", feature = "sm86"))]
 
 #[cfg(any(
     all(feature = "device", feature = "sm89"),
-    all(feature = "device", feature = "sm86-residual"),
-    all(feature = "sm89", feature = "sm86-residual")
+    all(feature = "device", feature = "sm86"),
+    all(feature = "sm89", feature = "sm86")
 ))]
 compile_error!("select exactly one device target feature");
 
@@ -52,9 +52,9 @@ mod gdn_prepare_benchmark;
 mod gdn_recurrence;
 #[cfg(feature = "device")]
 mod gdn_recurrence_benchmark;
-#[cfg(feature = "sm89")]
+#[cfg(any(feature = "sm89", feature = "sm86"))]
 mod nvfp4_swiglu;
-#[cfg(feature = "sm89")]
+#[cfg(any(feature = "sm89", feature = "sm86"))]
 mod nvfp4_swiglu_benchmark;
 mod residual_norm;
 mod residual_norm_benchmark;
@@ -119,11 +119,11 @@ pub use gdn_recurrence::{
 };
 #[cfg(feature = "device")]
 pub use gdn_recurrence_benchmark::benchmark_gdn_recurrence;
-#[cfg(feature = "sm89")]
+#[cfg(any(feature = "sm89", feature = "sm86"))]
 pub use nvfp4_swiglu::{
     Nvfp4SwiGluQualification, Nvfp4SwiGluQualificationError, qualify_nvfp4_swiglu,
 };
-#[cfg(feature = "sm89")]
+#[cfg(any(feature = "sm89", feature = "sm86"))]
 pub use nvfp4_swiglu_benchmark::benchmark_nvfp4_swiglu;
 pub use residual_norm::{
     ResidualNormQualification, ResidualNormQualificationError, qualify_residual_norm,

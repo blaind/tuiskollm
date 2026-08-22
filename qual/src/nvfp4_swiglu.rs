@@ -1,4 +1,4 @@
-//! Independent represented-value qualification for SM89 NVFP4 SwiGLU.
+//! Independent represented-value qualification for portable NVFP4 A16 SwiGLU.
 
 use crate::target::{EXPECTED_COMPUTE_CAPABILITY, Nvfp4SwiGluOp};
 use tuisko_gpu::{
@@ -22,7 +22,7 @@ const INPUT_PATTERN: [f32; GROUP] = [
 ];
 const TOKEN_FACTORS: [f32; MAX_BATCH] = [1.0, 0.5, 0.25, 0.125, 1.0, 0.5, 0.25, 0.125];
 
-/// Failure of the exact SM89 NVFP4 SwiGLU qualification gate.
+/// Failure of the exact-target NVFP4 SwiGLU qualification gate.
 #[derive(Debug, thiserror::Error)]
 pub enum Nvfp4SwiGluQualificationError {
     /// GPU ownership, launch, or driver failure.
@@ -30,7 +30,7 @@ pub enum Nvfp4SwiGluQualificationError {
     Gpu(#[from] GpuError),
 
     /// Device behavior disagreed with the independent contract.
-    #[error("SM89 NVFP4 SwiGLU qualification failed: {0}")]
+    #[error("NVFP4 SwiGLU qualification failed: {0}")]
     Mismatch(String),
 }
 

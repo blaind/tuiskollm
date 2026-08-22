@@ -1,5 +1,5 @@
-#[cfg(feature = "sm86-residual")]
-pub(crate) use tuisko_kernels_sm86::ResidualNormOp;
+#[cfg(feature = "sm86")]
+pub(crate) use tuisko_kernels_sm86::{Nvfp4SwiGluOp, ResidualNormOp};
 #[cfg(feature = "sm89")]
 pub(crate) use tuisko_kernels_sm89::{Nvfp4SwiGluOp, ResidualNormOp};
 #[cfg(feature = "device")]
@@ -9,7 +9,7 @@ pub(crate) use tuisko_kernels_sm120::ResidualNormOp;
 const TARGET_PROFILE: tuisko_targets::TargetProfile = tuisko_targets::TargetProfile::Sm120;
 #[cfg(feature = "sm89")]
 const TARGET_PROFILE: tuisko_targets::TargetProfile = tuisko_targets::TargetProfile::Sm89;
-#[cfg(feature = "sm86-residual")]
+#[cfg(feature = "sm86")]
 const TARGET_PROFILE: tuisko_targets::TargetProfile = tuisko_targets::TargetProfile::Sm86;
 
 pub(crate) const EXPECTED_COMPUTE_CAPABILITY: (i32, i32) = TARGET_PROFILE.compute_capability();

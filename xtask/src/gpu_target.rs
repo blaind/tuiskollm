@@ -10,6 +10,7 @@ pub(crate) trait BuildTargetProfile {
     fn oxide_build_target(self) -> &'static str;
     fn ptx_path(self) -> &'static str;
     fn residual_resource_baseline(self) -> &'static str;
+    fn nvfp4_swiglu_resource_baseline(self) -> Option<&'static str>;
 
     #[cfg(feature = "remote")]
     fn remote_gpu(self) -> tuisko_remote::GpuTarget;
@@ -28,7 +29,7 @@ impl BuildTargetProfile for GpuTarget {
         match self {
             Self::Sm120 => "device",
             Self::Sm89 => "sm89",
-            Self::Sm86 => "sm86-residual",
+            Self::Sm86 => "sm86",
         }
     }
 
@@ -61,6 +62,14 @@ impl BuildTargetProfile for GpuTarget {
             Self::Sm120 => "qual/baselines/residual-norm-sm120.txt",
             Self::Sm89 => "qual/baselines/residual-norm-sm89.txt",
             Self::Sm86 => "qual/baselines/residual-norm-sm86.txt",
+        }
+    }
+
+    fn nvfp4_swiglu_resource_baseline(self) -> Option<&'static str> {
+        match self {
+            Self::Sm120 => None,
+            Self::Sm89 => Some("qual/baselines/nvfp4-swiglu-sm89.txt"),
+            Self::Sm86 => Some("qual/baselines/nvfp4-swiglu-sm86.txt"),
         }
     }
 
@@ -114,11 +123,20 @@ mod tests {
                 (
                     GpuTarget::Sm86,
                     "tuisko-kernels-sm86",
-                    "sm86-residual",
+                    "sm86",
                     "target/cuda/tuisko_kernels_sm86.ptx",
                     "qual/baselines/residual-norm-sm86.txt",
                     "target/cuda-oxide-build-sm86",
                 ),
+            ]
+        );
+
+        assert_eq!(
+            GpuTarget::ALL.map(BuildTargetProfile::nvfp4_swiglu_resource_baseline),
+            [
+                None,
+                Some("qual/baselines/nvfp4-swiglu-sm89.txt"),
+                Some("qual/baselines/nvfp4-swiglu-sm86.txt"),
             ]
         );
     }

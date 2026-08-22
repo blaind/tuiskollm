@@ -20,7 +20,7 @@ sm89 = [
     "dep:tuisko-gpu",
     "dep:tuisko-kernels-sm89",
 ]
-sm86-residual = [
+sm86 = [
     "residual-benchmark",
     "dep:tuisko-gpu",
     "dep:tuisko-kernels-sm86",

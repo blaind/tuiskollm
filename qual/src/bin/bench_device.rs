@@ -4,7 +4,7 @@ use std::error::Error;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-#[cfg(feature = "sm89")]
+#[cfg(any(feature = "sm89", feature = "sm86"))]
 use tuisko_qual::benchmark_nvfp4_swiglu;
 use tuisko_qual::{DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_residual_norm};
 #[cfg(feature = "device")]
@@ -40,7 +40,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_residual_norm(options)?, json_path)
         }
-        #[cfg(feature = "sm89")]
+        #[cfg(any(feature = "sm89", feature = "sm86"))]
         "nvfp4-swiglu" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_nvfp4_swiglu(options)?, json_path)

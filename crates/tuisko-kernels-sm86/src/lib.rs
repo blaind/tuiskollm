@@ -2,10 +2,12 @@
 
 mod arch;
 mod inventory;
+mod nvfp4;
 mod residual_norm;
 
 pub use arch::Sm86Arch;
 pub use inventory::kernel_ptx_names;
+pub use nvfp4::Nvfp4SwiGluOp;
 pub use residual_norm::ResidualNormOp;
 
 #[cfg(test)]

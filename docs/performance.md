@@ -24,6 +24,11 @@ clock. This establishes a viable source-native SM89 decode path, but the falling
 bandwidth leaves `B=5..8` open for an Ada-specific reuse schedule before the target inventory can
 make a performance-complete claim.
 
+The corresponding RTX 3090 feasibility sweep measured 177.408 us / 526.62 logical GiB/s at `B=1`
+and 412.896 us / 226.98 logical GiB/s at `B=8`, with fixed observed clocks of 1,800 MHz SM and
+9,501 MHz memory. The represented path is correct, but this first Ampere schedule is not efficient
+enough to justify expanding the complete SM86 inventory before a target-specific retune.
+
 ## Quick start
 
 Run commands from the repository root. Bootstrap cuda-oxide once:
