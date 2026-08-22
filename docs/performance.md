@@ -284,8 +284,10 @@ During measurement it samples SM clock, memory clock, temperature, board power, 
 free memory every 10 ms. A run is refused when:
 
 - fewer than three telemetry samples are captured;
-- the SM clock spreads by more than 30 MHz;
-- the memory clock spreads by more than 100 MHz;
+- the SM clock spreads by more than 50 MHz, admitting the target's measured 2,160-to-2,197 MHz
+  light-load P-state step;
+- the memory clock spreads by more than 250 MHz, admitting the target's measured 13,801-to-14,001
+  MHz loaded P-state step;
 - a timing or derived throughput is non-finite or non-positive; or
 - another compute process appears.
 
