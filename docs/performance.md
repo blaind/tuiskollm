@@ -50,6 +50,8 @@ resource inventory before launching the benchmark.
 | Command | Purpose | Output |
 |---|---|---|
 | `cargo run -p xtask -- build-sm120` | Build the release device artifact and check entries, registers, stack, local, and shared bytes | terminal |
+| `cargo run -p xtask -- qualify-frontend SNAPSHOT` | Check exact template, tokenizer, streaming, and prefix-cache behavior | terminal |
+| `cargo run -p xtask -- qualify-generation SNAPSHOT` | Check prompt-to-sampling-to-streaming state over exact BF16 logit rows | terminal |
 | `cargo run -p xtask -- qualify-residual-norm` | Run the independent numerical and graph-replay oracle | terminal |
 | `cargo run -p xtask -- qualify-fp8-qkv` | Run the independent represented-value QKV oracle and benchmark-accounting test | terminal |
 | `cargo run -p xtask -- qualify-fp8-gdn-input` | Run the independent represented-value GDN input oracle and benchmark-accounting test | terminal |
@@ -80,6 +82,13 @@ cargo bench --package tuisko-engine --bench sampling
 ```
 
 This measures greedy and checkpoint-default top-k-20/top-p-0.95 selection over all 248,320 logits.
+
+The composed prompt-preparation and one-row generation-control paths use the pinned snapshot:
+
+```bash
+TUISKO_SNAPSHOT=/path/to/snapshots/16b6615af3548b88e2d8e382457bc705b00479cf \
+  cargo bench --package tuisko-engine --bench generation
+```
 
 `perf gate` cannot run before each suite has an explicit baseline. A baseline update is a reviewed
 source change; blessing one suite at a time keeps that diff independent, and the command never

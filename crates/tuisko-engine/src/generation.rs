@@ -1,0 +1,234 @@
+//! Host generation state over production logit rows.
+
+use crate::{EngineError, EngineResult, Sampler, SamplingOptions};
+use tuisko_frontend::{
+    ChatMessage, ChatTemplateOptions, PromptEncoding, StreamingDecoder, TextFrontend,
+};
+
+const DEFAULT_MAX_NEW_TOKENS: usize = 128;
+
+/// One text-generation request after transport parsing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatGenerationRequest {
+    /// Ordered text-only chat messages.
+    pub messages: Vec<ChatMessage>,
+    /// Chat-template controls.
+    pub template: ChatTemplateOptions,
+    /// Token selection controls.
+    pub sampling: SamplingOptions,
+    /// Maximum generated tokens, including a selected stop token.
+    pub max_new_tokens: usize,
+}
+
+impl ChatGenerationRequest {
+    /// Creates a request with the admitted checkpoint defaults.
+    pub fn new(messages: Vec<ChatMessage>) -> Self {
+        Self {
+            messages,
+            template: ChatTemplateOptions::default(),
+            sampling: SamplingOptions::default(),
+            max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
+        }
+    }
+}
+
+/// Why a generation session finished.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinishReason {
+    /// An admitted EOS token was selected.
+    Stop,
+    /// The request reached `max_new_tokens`.
+    Length,
+}
+
+impl FinishReason {
+    /// OpenAI-compatible spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+        }
+    }
+}
+
+/// Observable result of one consumed logit row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationStep {
+    /// Selected token.
+    pub token_id: u32,
+    /// Newly complete UTF-8 text, when this token emitted any.
+    pub delta: Option<String>,
+    /// Terminal reason when this step completed the request.
+    pub finish_reason: Option<FinishReason>,
+}
+
+/// Completed generation output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedText {
+    /// Prompt encoding and prefix-cache accounting.
+    pub prompt: PromptEncoding,
+    /// Generated tokens, including a selected stop token.
+    pub token_ids: Vec<u32>,
+    /// Complete decoded text, excluding special tokens.
+    pub text: String,
+    /// Terminal reason.
+    pub finish_reason: FinishReason,
+}
+
+/// Per-request host state consuming one exact BF16 vocabulary row at a time.
+pub struct GenerationSession<'a> {
+    prompt: PromptEncoding,
+    sampler: Sampler,
+    decoder: StreamingDecoder<'a>,
+    generated: Vec<u32>,
+    max_new_tokens: usize,
+    finish_reason: Option<FinishReason>,
+}
+
+impl<'a> GenerationSession<'a> {
+    /// Renders and tokenizes the prompt and initializes sampling state.
+    pub fn start(
+        frontend: &'a TextFrontend,
+        request: &ChatGenerationRequest,
+    ) -> EngineResult<Self> {
+        let prompt = frontend.encode_chat_with_report(&request.messages, request.template)?;
+        let stop_ids: [u32; 2] = frontend
+            .stop_ids()
+            .try_into()
+            .map_err(|_| EngineError::generation("frontend returned the wrong stop-ID count"))?;
+        let sampler = Sampler::new(request.sampling, stop_ids)?;
+
+        Ok(Self {
+            prompt,
+            sampler,
+            decoder: frontend.streaming_decoder(),
+            generated: Vec::with_capacity(request.max_new_tokens.min(4_096)),
+            max_new_tokens: request.max_new_tokens,
+            finish_reason: (request.max_new_tokens == 0).then_some(FinishReason::Length),
+        })
+    }
+
+    /// Exact prompt IDs to prefill before the first logit row is consumed.
+    pub fn prompt_token_ids(&self) -> &[u32] {
+        &self.prompt.token_ids
+    }
+
+    /// Prompt-cache accounting for request instrumentation.
+    pub const fn prompt_encoding(&self) -> &PromptEncoding {
+        &self.prompt
+    }
+
+    /// Tokens selected so far.
+    pub fn generated_token_ids(&self) -> &[u32] {
+        &self.generated
+    }
+
+    /// Current terminal state.
+    pub const fn finish_reason(&self) -> Option<FinishReason> {
+        self.finish_reason
+    }
+
+    /// Consumes one complete production logit row.
+    pub fn accept_logits(&mut self, logits: &[u16]) -> EngineResult<GenerationStep> {
+        if self.finish_reason.is_some() {
+            return Err(EngineError::generation(
+                "cannot consume logits after generation finished",
+            ));
+        }
+
+        let decision = self.sampler.sample(logits)?;
+        let mut delta = if decision.stopped {
+            None
+        } else {
+            self.decoder.push(decision.token_id)?
+        };
+        self.generated.push(decision.token_id);
+
+        let finish_reason =
+            completion_reason(decision.stopped, self.generated.len(), self.max_new_tokens);
+        if finish_reason.is_some()
+            && let Some(tail) = self.decoder.finish()
+        {
+            match &mut delta {
+                Some(delta) => delta.push_str(&tail),
+                None => delta = Some(tail),
+            }
+        }
+        self.finish_reason = finish_reason;
+
+        Ok(GenerationStep {
+            token_id: decision.token_id,
+            delta,
+            finish_reason,
+        })
+    }
+
+    /// Converts a terminal session into its owned output.
+    pub fn into_output(self) -> EngineResult<GeneratedText> {
+        let finish_reason = self.finish_reason.ok_or_else(|| {
+            EngineError::generation("cannot take output before generation finishes")
+        })?;
+
+        Ok(GeneratedText {
+            prompt: self.prompt,
+            token_ids: self.generated,
+            text: self.decoder.text().to_owned(),
+            finish_reason,
+        })
+    }
+}
+
+fn completion_reason(
+    stopped: bool,
+    generated_tokens: usize,
+    max_new_tokens: usize,
+) -> Option<FinishReason> {
+    if stopped {
+        Some(FinishReason::Stop)
+    } else if generated_tokens >= max_new_tokens {
+        Some(FinishReason::Length)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChatGenerationRequest, DEFAULT_MAX_NEW_TOKENS, FinishReason, completion_reason};
+    use tuisko_frontend::ChatMessage;
+
+    #[test]
+    fn request_defaults_are_the_checkpoint_defaults() {
+        let request = ChatGenerationRequest::new(vec![ChatMessage::new("user", "Hello")]);
+
+        assert_eq!(request.max_new_tokens, DEFAULT_MAX_NEW_TOKENS);
+        assert_eq!(request.sampling.temperature, 1.0);
+        assert_eq!(request.sampling.top_p, 0.95);
+        assert_eq!(request.sampling.top_k, 20);
+    }
+
+    #[test]
+    fn completion_route_covers_stop_and_length_boundaries() {
+        let cases = [
+            (false, 0, 4, None),
+            (false, 3, 4, None),
+            (false, 4, 4, Some(FinishReason::Length)),
+            (false, 5, 4, Some(FinishReason::Length)),
+            (true, 1, 4, Some(FinishReason::Stop)),
+            (true, 4, 4, Some(FinishReason::Stop)),
+        ];
+        for (stopped, generated, maximum, expected) in cases {
+            assert_eq!(
+                completion_reason(stopped, generated, maximum),
+                expected,
+                "route ({stopped}, {generated}, {maximum})"
+            );
+        }
+    }
+
+    #[test]
+    fn finish_reason_spellings_are_stable() {
+        assert_eq!(FinishReason::Stop.as_str(), "stop");
+        assert_eq!(FinishReason::Length.as_str(), "length");
+    }
+}

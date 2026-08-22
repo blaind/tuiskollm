@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|perf>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|perf>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -98,6 +98,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bootstrap-cuda-oxide") if remaining.is_empty() => bootstrap_cuda_oxide(root),
         Some("build-sm120") if remaining.is_empty() => build_sm120(root),
         Some("qualify-frontend") => qualify_frontend(root, &remaining),
+        Some("qualify-generation") => qualify_generation(root, &remaining),
         Some("qualify-residual-norm") if remaining.is_empty() => qualify_residual_norm(root),
         Some("qualify-fp8-qkv") if remaining.is_empty() => qualify_fp8_qkv(root),
         Some("qualify-fp8-gdn-input") if remaining.is_empty() => qualify_fp8_gdn_input(root),
@@ -230,6 +231,28 @@ fn qualify_frontend(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(),
                 "--no-default-features",
                 "--bin",
                 "qualify-frontend",
+                "--",
+            ])
+            .arg(snapshot),
+    )
+}
+
+fn qualify_generation(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-generation SNAPSHOT".into());
+    };
+    run_visible(
+        Command::new("cargo")
+            .current_dir(root)
+            .args([
+                "run",
+                "--package",
+                "tuisko-qual",
+                "--no-default-features",
+                "--features",
+                "engine",
+                "--bin",
+                "qualify-generation",
                 "--",
             ])
             .arg(snapshot),

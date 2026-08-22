@@ -1,6 +1,7 @@
 //! Engine error categories.
 
 use std::fmt::{self, Display, Formatter};
+use tuisko_frontend::FrontendError;
 use tuisko_gpu::GpuError;
 use tuisko_model::CheckpointError;
 
@@ -14,6 +15,8 @@ pub enum EngineErrorCode {
     Layout,
     /// Sampling configuration or logits violate the text contract.
     Sampling,
+    /// A generation session entered an invalid state.
+    Generation,
 }
 
 impl EngineErrorCode {
@@ -23,6 +26,7 @@ impl EngineErrorCode {
             Self::Route => "engine.route",
             Self::Layout => "engine.layout",
             Self::Sampling => "engine.sampling",
+            Self::Generation => "engine.generation",
         }
     }
 }
@@ -50,6 +54,10 @@ pub enum EngineError {
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
 
+    /// Frontend admission or text processing failed.
+    #[error(transparent)]
+    Frontend(#[from] FrontendError),
+
     /// GPU ownership or execution failed.
     #[error(transparent)]
     Gpu(#[from] GpuError),
@@ -60,7 +68,7 @@ impl EngineError {
     pub const fn code(&self) -> Option<EngineErrorCode> {
         match self {
             Self::Contract { code, .. } => Some(*code),
-            Self::Checkpoint(_) | Self::Gpu(_) => None,
+            Self::Checkpoint(_) | Self::Frontend(_) | Self::Gpu(_) => None,
         }
     }
 
@@ -84,6 +92,13 @@ impl EngineError {
             message: message.into(),
         }
     }
+
+    pub(crate) fn generation(message: impl Into<String>) -> Self {
+        Self::Contract {
+            code: EngineErrorCode::Generation,
+            message: message.into(),
+        }
+    }
 }
 
 /// Result type for engine operations.
@@ -99,6 +114,7 @@ mod tests {
             EngineErrorCode::Route,
             EngineErrorCode::Layout,
             EngineErrorCode::Sampling,
+            EngineErrorCode::Generation,
         ];
         let unique = codes
             .iter()
@@ -110,6 +126,7 @@ mod tests {
         assert_eq!(EngineErrorCode::Route.as_str(), "engine.route");
         assert_eq!(EngineErrorCode::Layout.as_str(), "engine.layout");
         assert_eq!(EngineErrorCode::Sampling.as_str(), "engine.sampling");
+        assert_eq!(EngineErrorCode::Generation.as_str(), "engine.generation");
     }
 
     #[test]
