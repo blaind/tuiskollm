@@ -49,6 +49,10 @@ mod fp8_swiglu;
 #[cfg(feature = "device")]
 mod fp8_swiglu_benchmark;
 #[cfg(feature = "device")]
+mod full_attention_layer;
+#[cfg(feature = "device")]
+mod full_attention_layer_benchmark;
+#[cfg(feature = "device")]
 mod gdn_output;
 #[cfg(feature = "device")]
 mod gdn_output_benchmark;
@@ -134,6 +138,13 @@ pub use fp8_qkv_benchmark::benchmark_fp8_qkv;
 pub use fp8_swiglu::{Fp8SwiGluQualification, Fp8SwiGluQualificationError, qualify_fp8_swiglu};
 #[cfg(feature = "device")]
 pub use fp8_swiglu_benchmark::benchmark_fp8_swiglu;
+#[cfg(feature = "device")]
+pub use full_attention_layer::{
+    FullAttentionLayerQualification, FullAttentionLayerQualificationError,
+    qualify_full_attention_layer,
+};
+#[cfg(feature = "device")]
+pub use full_attention_layer_benchmark::benchmark_full_attention_layer;
 #[cfg(feature = "device")]
 pub use gdn_output::{GdnOutputQualification, GdnOutputQualificationError, qualify_gdn_output};
 #[cfg(feature = "device")]
