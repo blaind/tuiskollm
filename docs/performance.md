@@ -3,12 +3,13 @@
 TuiskoLLM uses a custom device runner for GPU measurements and Criterion for pure host work. GPU
 results are valid only on the exact RTX 5090 target under an exclusive, recorded environment.
 
-The registered device suites cover zero-centered residual/RMSNorm at exact `B=1..8`, and
+The available device suites cover zero-centered residual/RMSNorm at exact `B=1..8`, and
 dynamic-quantize FP8 QKV at exact `B=1..8` plus `T=16`, GDN Q/K/V/Z input projection at exact
 `B=1..8`, the full-vocabulary FP8 LM head at exact `B=1..8`, dense-FP8 gate/up SwiGLU at exact
-`B=1..8` and `T=32,64,128`, and the source-backed final-norm plus LM-head endpoint at exact
-`B=1..8`. The report schema is already shaped for future layer, whole-model, and serving cases,
-but those measurements do not exist until their production owners land.
+`B=1..8` and `T=32,64,128`, dense-FP8 down and GDN control/convolution at exact `B=1..8`, and the
+source-backed dense-FP8 MLP and final-norm plus LM-head owners. The report schema is already shaped
+for future whole-model and serving cases, but those measurements do not exist until their
+production owners land.
 
 ## Quick start
 
@@ -58,8 +59,10 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- qualify-fp8-lm-head` | Run the independent represented-value full-vocabulary LM-head oracle and benchmark-accounting test | terminal |
 | `cargo run -p xtask -- qualify-fp8-swiglu` | Run the exhaustive represented-value gate/up SwiGLU oracle and graph-replay gate | terminal |
 | `cargo run -p xtask -- qualify-fp8-down` | Run the exhaustive represented-value dense-FP8 down oracle and graph-replay gate | terminal |
+| `cargo run -p xtask -- qualify-gdn-prepare` | Check the two control formulas, mapped width-4 convolution/history updates, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact-B graph, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
+| `cargo run -p xtask -- bench-gdn-prepare` | Measure every exact control-plus-convolution graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
 | `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
@@ -107,7 +110,8 @@ cargo run -p xtask -- bench-residual-norm \
 ```
 
 Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, `bench-fp8-lm-head`,
-`bench-fp8-swiglu`, or `bench-fp8-down` with the same options for one operator suite only.
+`bench-fp8-swiglu`, `bench-fp8-down`, or `bench-gdn-prepare` with the same options for one operator
+suite only.
 
 `bench-text-endpoint SNAPSHOT` accepts the same options. It is intentionally separate from the
 leaf-wide `perf` commands until its first reviewed baseline is blessed.
