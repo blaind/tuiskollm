@@ -4,6 +4,7 @@ mod gpu_target;
 mod performance;
 mod remote;
 
+use gpu_target::BuildTargetProfile;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
@@ -304,7 +305,7 @@ fn build_residual_norm(
         "{} ({}, compute capability {}) residual-norm qualification artifact: {}",
         gpu.key(),
         gpu.device_name(),
-        gpu.compute_capability(),
+        gpu.compute_capability_text(),
         prepared.executable.display()
     );
     Ok(())
@@ -338,14 +339,14 @@ fn parse_build_gpu(
     if flag != "--gpu" {
         return Err(format!("{command} requires `--gpu <5090|4090|3090>`").into());
     }
-    gpu_target::GpuTarget::parse(&value.to_string_lossy())
+    Ok(gpu_target::GpuTarget::parse(&value.to_string_lossy())?)
 }
 
 pub(crate) fn build_residual_benchmark_target(
     root: &Path,
     gpu: gpu_target::GpuTarget,
 ) -> Result<(), Box<dyn Error>> {
-    if matches!(gpu, gpu_target::GpuTarget::Rtx5090) {
+    if matches!(gpu, gpu_target::GpuTarget::Sm120) {
         return build_sm120(root);
     }
     run_oxide(
@@ -1297,7 +1298,7 @@ fn require_cuda_oxide_revision(source: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn gate_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
-    gate_residual_norm_target(root, gpu_target::GpuTarget::Rtx5090)
+    gate_residual_norm_target(root, gpu_target::GpuTarget::Sm120)
 }
 
 pub(crate) fn gate_residual_norm_target(

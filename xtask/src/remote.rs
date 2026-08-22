@@ -4,8 +4,10 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::path::Path;
 
+#[cfg(feature = "remote")]
+use crate::gpu_target::BuildTargetProfile;
 #[cfg(any(feature = "remote", test))]
-use crate::gpu_target::GpuTarget;
+use crate::gpu_target::{GpuTarget, has_full_kernel_inventory};
 
 #[cfg(feature = "remote")]
 const USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
@@ -129,7 +131,7 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     tuisko_remote::check_credentials().map_err(|error| format!("{error}"))?;
-    if options.gpu.has_full_kernel_inventory() {
+    if has_full_kernel_inventory(options.gpu) {
         crate::build_sm120(root)?;
     } else {
         crate::build_residual_benchmark_target(root, options.gpu)?;
@@ -173,14 +175,14 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
 #[cfg(any(feature = "remote", test))]
 fn target_supports(gpu: GpuTarget, command: &str) -> bool {
-    gpu.has_full_kernel_inventory()
+    has_full_kernel_inventory(gpu)
         || matches!(command, "qualify-residual-norm" | "bench-residual-norm")
 }
 
 #[cfg(any(feature = "remote", test))]
 fn parse_options(arguments: &[String], benchmark: bool) -> Result<RemoteOptions, Box<dyn Error>> {
     let mut options = RemoteOptions {
-        gpu: GpuTarget::Rtx5090,
+        gpu: GpuTarget::Sm120,
         max_minutes: 30,
         image: tuisko_remote_default_image(),
         keep_on_fail: false,
@@ -305,12 +307,12 @@ mod tests {
 
     #[test]
     fn gpu_target_is_explicit_and_defaults_to_the_product_target() {
-        assert_eq!(parse_options(&[], false).unwrap().gpu, GpuTarget::Rtx5090);
+        assert_eq!(parse_options(&[], false).unwrap().gpu, GpuTarget::Sm120);
         assert_eq!(
             parse_options(&["--gpu".to_owned(), "4090".to_owned()], false)
                 .unwrap()
                 .gpu,
-            GpuTarget::Rtx4090
+            GpuTarget::Sm89
         );
         assert!(parse_options(&["--gpu".to_owned(), "A100".to_owned()], false).is_err());
     }
@@ -323,9 +325,9 @@ mod tests {
             "qualify-fp8-qkv",
             "bench-fp8-qkv",
         ] {
-            assert!(target_supports(GpuTarget::Rtx5090, command));
+            assert!(target_supports(GpuTarget::Sm120, command));
         }
-        for gpu in [GpuTarget::Rtx4090, GpuTarget::Rtx3090] {
+        for gpu in [GpuTarget::Sm89, GpuTarget::Sm86] {
             assert!(target_supports(gpu, "qualify-residual-norm"));
             assert!(target_supports(gpu, "bench-residual-norm"));
             assert!(!target_supports(gpu, "qualify-fp8-qkv"));

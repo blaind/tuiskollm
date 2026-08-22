@@ -3070,6 +3070,7 @@ dependencies = [
  "tuisko-kernels-sm86",
  "tuisko-kernels-sm89",
  "tuisko-model",
+ "tuisko-targets",
 ]
 
 [[package]]
@@ -3086,6 +3087,10 @@ dependencies = [
  "tokio",
  "ureq",
 ]
+
+[[package]]
+name = "tuisko-targets"
+version = "0.1.0"
 
 [[package]]
 name = "tuiskollm"
@@ -3544,6 +3549,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tuisko-remote",
+ "tuisko-targets",
 ]
 
 [[package]]
