@@ -2,6 +2,8 @@
 
 #![cfg(feature = "device")]
 
+mod dense_fp8_mlp;
+mod dense_fp8_mlp_benchmark;
 mod device_benchmark;
 mod fp8_down;
 mod fp8_down_benchmark;
@@ -19,6 +21,10 @@ mod residual_norm_benchmark;
 mod text_endpoint;
 mod text_endpoint_benchmark;
 
+pub use dense_fp8_mlp::{
+    DenseFp8MlpQualification, DenseFp8MlpQualificationError, qualify_dense_fp8_mlp,
+};
+pub use dense_fp8_mlp_benchmark::benchmark_dense_fp8_mlp;
 pub use device_benchmark::{
     BenchmarkExecution, BenchmarkMeasurement, BenchmarkMemoryKind, BenchmarkMemoryMeasurement,
     BenchmarkPhase, BenchmarkScope, BenchmarkWorkload, DeviceBenchmarkError, DeviceBenchmarkMetric,

@@ -137,6 +137,76 @@ impl<'a> DenseFp8DownBindings<'a> {
     }
 }
 
+/// Complete source planes for one late-layer dense-FP8 MLP boundary.
+#[derive(Clone, Copy, Debug)]
+pub struct DenseFp8MlpBindings<'a> {
+    /// Source-adjacent gate/up weights and scales.
+    pub gate_up: DenseFp8GateUpBindings<'a>,
+    /// Source-native down-projection weights and scales.
+    pub down: DenseFp8DownBindings<'a>,
+    /// Zero-centered RMSNorm weights before the MLP.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights for the next decoder boundary, or final norm at layer 63.
+    pub next_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning this MLP boundary.
+    pub layer: usize,
+}
+
+impl<'a> DenseFp8MlpBindings<'a> {
+    /// Binds one complete admitted dense-FP8 MLP source family.
+    pub fn bind<A: Arch>(
+        snapshot: &'a CheckpointSnapshot<A>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from::<A>(
+            layer,
+            |name| snapshot.tensor(name),
+            |first, second, role| snapshot.adjacent_tensor_bytes(first, second, role),
+        )
+    }
+
+    fn bind_from<A: Arch>(
+        layer: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+        mut adjacent: impl FnMut(&str, &str, &str) -> CheckpointResult<&'a [u8]>,
+    ) -> CheckpointResult<Self> {
+        let gate_up = DenseFp8GateUpBindings::bind_from::<A>(
+            layer,
+            |name| tensor(name),
+            |first, second, role| adjacent(first, second, role),
+        )?;
+        let down = DenseFp8DownBindings::bind_from::<A>(layer, |name| tensor(name))?;
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let input_norm = Bf16View::bind(
+            tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+            [A::HIDDEN as u64],
+        )?;
+        let next_norm_name = dense_fp8_next_norm_name::<A>(layer)?;
+        let next_norm = Bf16View::bind(tensor(&next_norm_name)?, [A::HIDDEN as u64])?;
+
+        Ok(Self {
+            gate_up,
+            down,
+            input_norm,
+            next_norm,
+            layer,
+        })
+    }
+}
+
+fn dense_fp8_next_norm_name<A: Arch>(layer: usize) -> CheckpointResult<String> {
+    require_dense_fp8_mlp_layer::<A>(layer)?;
+    let next_layer = layer
+        .checked_add(1)
+        .ok_or_else(|| CheckpointError::source_binding("dense-FP8 MLP layer overflows"))?;
+
+    Ok(if next_layer == A::LAYERS {
+        FINAL_NORM.to_string()
+    } else {
+        format!("model.language_model.layers.{next_layer}.input_layernorm.weight")
+    })
+}
+
 /// Exact FP8 query/gate, key, and value source planes for one full-attention layer.
 #[derive(Clone, Copy, Debug)]
 pub struct FullAttentionQkvBindings<'a> {
@@ -1100,11 +1170,12 @@ fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> Checkpo
 #[cfg(test)]
 mod tests {
     use super::{
-        DenseFp8DownBindings, DenseFp8GateUpBindings, FullAttentionPostBindings,
-        FullAttentionQkvBindings, GdnBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
-        TextEndpointBindings, VisionBindings, positive_bf16, require_adjacent,
-        require_dense_fp8_mlp_layer, require_full_attention_layer, require_gdn_layer,
-        require_mtp_contract, require_nvfp4_mlp_layer, validate_nvfp4_scales,
+        DenseFp8DownBindings, DenseFp8GateUpBindings, DenseFp8MlpBindings,
+        FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings, MtpBindings,
+        Nvfp4DownBindings, Nvfp4GateUpBindings, TextEndpointBindings, VisionBindings,
+        dense_fp8_next_norm_name, positive_bf16, require_adjacent, require_dense_fp8_mlp_layer,
+        require_full_attention_layer, require_gdn_layer, require_mtp_contract,
+        require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
     use crate::{Arch, CheckpointErrorCode, CheckpointResult, DType, SafeTensorFile, TensorView};
     use serde_json::{Value, json};
@@ -1293,7 +1364,9 @@ mod tests {
     fn dense_fp8_mlp_fixture(layer: usize) -> (Value, Vec<u8>) {
         let prefix = format!("model.language_model.layers.{layer}.mlp");
         let down = format!("{prefix}.down_proj");
-        let mut payload = vec![0; 1_664];
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let next_layer_prefix = format!("model.language_model.layers.{}", layer + 1);
+        let mut payload = vec![0; 1_792];
 
         payload[0..512].fill(0x10);
         payload[512..1_024].fill(0x20);
@@ -1301,6 +1374,8 @@ mod tests {
         payload[1_056..1_088].fill(0x40);
         payload[1_088..1_600].fill(0x50);
         payload[1_600..1_664].fill(0x60);
+        payload[1_664..1_728].fill(0x70);
+        payload[1_728..1_792].fill(0x80);
 
         (
             json!({
@@ -1321,6 +1396,12 @@ mod tests {
                 },
                 format!("{down}.weight_scale"): {
                     "dtype":"BF16", "shape":[32,1], "data_offsets":[1600,1664]
+                },
+                format!("{layer_prefix}.post_attention_layernorm.weight"): {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[1664,1728]
+                },
+                format!("{next_layer_prefix}.input_layernorm.weight"): {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[1728,1792]
                 }
             }),
             payload,
@@ -1738,7 +1819,44 @@ mod tests {
         assert_eq!(down.scale.bytes()[0], 0x60);
         assert_eq!(down.layer, 56);
 
+        let complete = DenseFp8MlpBindings::bind_from::<Nvfp4Arch>(
+            56,
+            |name| file.tensor(name),
+            |first, second, role| file.adjacent_tensor_bytes(first, second, role),
+        )
+        .unwrap();
+        assert_eq!(complete.input_norm.shape(), &[32]);
+        assert_eq!(complete.input_norm.bytes()[0], 0x70);
+        assert_eq!(complete.next_norm.shape(), &[32]);
+        assert_eq!(complete.next_norm.bytes()[0], 0x80);
+        assert_eq!(complete.layer, 56);
+
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dense_fp8_next_norm_route_is_exact() {
+        let cases = [
+            (
+                56,
+                Ok("model.language_model.layers.57.input_layernorm.weight"),
+            ),
+            (
+                62,
+                Ok("model.language_model.layers.63.input_layernorm.weight"),
+            ),
+            (63, Ok("model.language_model.norm.weight")),
+            (55, Err(())),
+            (64, Err(())),
+        ];
+
+        for (layer, expected) in cases {
+            let actual = dense_fp8_next_norm_name::<Nvfp4Arch>(layer);
+            match expected {
+                Ok(name) => assert_eq!(actual.unwrap(), name),
+                Err(()) => assert!(actual.is_err(), "layer={layer}"),
+            }
+        }
     }
 
     #[test]

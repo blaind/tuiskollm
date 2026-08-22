@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|perf>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-dense-fp8-mlp|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-dense-fp8-mlp|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|perf>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -119,6 +119,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-fp8-lm-head") if remaining.is_empty() => qualify_fp8_lm_head(root),
         Some("qualify-fp8-swiglu") if remaining.is_empty() => qualify_fp8_swiglu(root),
         Some("qualify-fp8-down") if remaining.is_empty() => qualify_fp8_down(root),
+        Some("qualify-dense-fp8-mlp") => qualify_dense_fp8_mlp(root, &remaining),
         Some("qualify-text-endpoint") => qualify_text_endpoint(root, &remaining),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
         Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
@@ -126,6 +127,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-fp8-lm-head") => bench_fp8_lm_head(root, &remaining),
         Some("bench-fp8-swiglu") => bench_fp8_swiglu(root, &remaining),
         Some("bench-fp8-down") => bench_fp8_down(root, &remaining),
+        Some("bench-dense-fp8-mlp") => bench_dense_fp8_mlp(root, &remaining),
         Some("bench-text-endpoint") => bench_text_endpoint(root, &remaining),
         Some("gate-residual-norm") if remaining.is_empty() => gate_residual_norm(root),
         Some("gate-fp8-qkv") if remaining.is_empty() => gate_fp8_qkv(root),
@@ -385,6 +387,40 @@ fn qualify_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_fp8_down(root)
 }
 
+fn qualify_dense_fp8_mlp(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "dense_fp8_mlp::tests::source_layer60_matches_complete_oracles_and_graph_replay",
+            "--include-ignored",
+            "--nocapture",
+        ],
+        Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_residual_norm(root)?;
+    gate_fp8_swiglu(root)?;
+    gate_fp8_down(root)
+}
+
 fn qualify_fp8_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
     run_oxide(
         root,
@@ -496,6 +532,36 @@ fn bench_fp8_swiglu(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(),
 
 fn bench_fp8_down(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
     bench_suite(root, PerformanceSuite::Fp8Down, arguments)
+}
+
+fn bench_dense_fp8_mlp(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err("usage: cargo run -p xtask -- bench-dense-fp8-mlp SNAPSHOT [options]".into());
+    };
+    build_sm120(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = fs::read(root.join(RESIDUAL_NORM_RESOURCE_BASELINE))?;
+    baselines.extend_from_slice(&fs::read(root.join(FP8_SWIGLU_RESOURCE_BASELINE))?);
+    baselines.extend_from_slice(&fs::read(root.join(FP8_DOWN_RESOURCE_BASELINE))?);
+    run_visible(
+        Command::new(executable)
+            .arg("dense-fp8-mlp")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
 }
 
 fn bench_text_endpoint(
