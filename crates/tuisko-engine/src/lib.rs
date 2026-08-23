@@ -9,6 +9,7 @@ mod full_attention_layer;
 mod full_attention_layer_layout;
 mod generation;
 mod layout;
+mod long_context_kv_layout;
 mod nvfp4_mlp;
 mod nvfp4_mlp_layout;
 mod program;
@@ -28,6 +29,10 @@ pub use generation::{
     GenerationStep,
 };
 pub use layout::{EndpointLayout, MAX_BATCH};
+pub use long_context_kv_layout::{
+    KvCacheCodec, KvCacheCodecDescriptor, ResidentKvCapacityPlan, SharedPagedKvLayout,
+    plan_resident_kv_capacity,
+};
 pub use nvfp4_mlp::Nvfp4MlpProgram;
 pub use nvfp4_mlp_layout::Nvfp4MlpLayout;
 pub use program::TextEndpointProgram;
