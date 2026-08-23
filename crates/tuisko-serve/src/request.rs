@@ -19,6 +19,8 @@ pub struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
     #[serde(default)]
+    store: Option<bool>,
+    #[serde(default)]
     tools: Vec<FunctionTool>,
     #[serde(default)]
     tool_choice: Option<Value>,
@@ -132,6 +134,11 @@ impl ChatCompletionRequest {
         if self.messages.is_empty() {
             return Err(ChatRequestError::Invalid(
                 "messages must not be empty".into(),
+            ));
+        }
+        if self.store == Some(true) {
+            return Err(ChatRequestError::Invalid(
+                "store=true is not admitted by this self-hosted server".into(),
             ));
         }
         validate_messages(&self.messages)?;
@@ -411,6 +418,7 @@ mod tests {
                 "top_p":0.8,
                 "top_k":9,
                 "seed":17,
+                "store":false,
                 "stream":true,
                 "stream_options":{{"include_usage":true,"include_obfuscation":false}},
                 "chat_template_kwargs":{{
@@ -468,6 +476,10 @@ mod tests {
             (
                 r#""messages":[{"role":"user","content":"x"}],"n":2"#,
                 "one completion",
+            ),
+            (
+                r#""messages":[{"role":"user","content":"x"}],"store":true"#,
+                "store=true",
             ),
             (
                 r#""messages":[{"role":"user","content":"x"}],"presence_penalty":1.5"#,
