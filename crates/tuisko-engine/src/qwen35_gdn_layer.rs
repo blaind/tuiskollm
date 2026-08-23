@@ -438,6 +438,29 @@ impl Qwen35GdnLayerProgram {
         &self.snapshot
     }
 
+    /// Launches this layer from another resident owner's BF16 residual plane.
+    ///
+    /// # Safety
+    /// `input` must address at least `batch * Qwen35_9B::HIDDEN` BF16 values in this context.
+    pub(crate) unsafe fn launch_from(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+    ) -> GpuResult<*const u16> {
+        let mut pointers = Pointers::bind(&self.arena, self.layout.regions())?;
+        pointers.residual_input = input;
+        launch_route(
+            stream,
+            batch,
+            self.ops(),
+            pointers,
+            launch_divisors(self.scale_divisors),
+        )?;
+
+        Ok(pointers.residual_output.cast_const())
+    }
+
     #[cfg(feature = "qualification")]
     /// Launches the production route eagerly for graph-agreement qualification.
     pub fn launch_eager(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {

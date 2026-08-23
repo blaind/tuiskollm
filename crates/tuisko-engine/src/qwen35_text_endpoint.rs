@@ -185,6 +185,27 @@ impl Qwen35TextEndpointProgram {
         &self.layout
     }
 
+    pub(crate) fn input_address(&self) -> GpuResult<*const u16> {
+        Ok(EndpointPointers::bind(&self.arena, &self.layout)?.input)
+    }
+
+    /// Launches the endpoint from another resident owner's BF16 residual plane.
+    ///
+    /// # Safety
+    /// `input` must address at least `batch * Qwen35_9B::HIDDEN` BF16 values in this context.
+    pub(crate) unsafe fn launch_from(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+    ) -> GpuResult<()> {
+        let mut pointers = EndpointPointers::bind(&self.arena, &self.layout)?;
+        pointers.input = input;
+        launch_route(stream, batch, &self.norm, &self.lm_head, pointers)?;
+
+        Ok(())
+    }
+
     #[cfg(feature = "qualification")]
     /// Launches the same route eagerly for graph-agreement checks.
     pub fn launch_eager(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
