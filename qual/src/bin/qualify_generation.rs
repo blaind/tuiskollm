@@ -83,6 +83,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("length-terminated generation output differs from its selected tokens".into());
     }
 
+    let mut cancel_request = ChatGenerationRequest::new(vec![ChatMessage::new("user", "Hello")]);
+    cancel_request.template.enable_thinking = Some(false);
+    cancel_request.sampling = SamplingOptions::greedy();
+    cancel_request.max_new_tokens = 2;
+    let mut cancel_session = GenerationSession::start(&frontend, &cancel_request)?;
+    let cancel_step = cancel_session.accept_logits(&logits_selecting(expected_tokens[0]))?;
+    if cancel_step.finish_reason.is_some() {
+        return Err("cancellation fixture finished before cancellation".into());
+    }
+    let cancelled = cancel_session.cancel()?;
+    if cancelled.token_ids != expected_tokens[..1]
+        || cancelled.text != frontend.decode(&expected_tokens[..1], true)?
+    {
+        return Err("cancelled generation output differs from its emitted token".into());
+    }
+
     let mut empty_request = stop_request;
     empty_request.max_new_tokens = 0;
     let mut empty_session = GenerationSession::start(&frontend, &empty_request)?;

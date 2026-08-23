@@ -7,7 +7,7 @@ use tuisko_engine::{
     ChatGenerationRequest, EngineError, GeneratedText, ResidentBatchGenerator, ResidentRequestId,
     SamplingOptions,
 };
-use tuisko_frontend::{ChatMessage, ChatTemplateOptions};
+use tuisko_frontend::{ChatMessage, ChatTemplateOptions, FrontendError, TextFrontend};
 use tuisko_gpu::{CudaContext, GpuError, device_memory_info};
 use tuisko_model::{CheckpointError, CheckpointSnapshot, Qwen38_27B};
 
@@ -20,6 +20,9 @@ pub enum ResidentBatchGenerationQualificationError {
     /// Frontend, generation, or resident execution failed.
     #[error(transparent)]
     Engine(#[from] EngineError),
+    /// Tokenizer or streaming decode failed.
+    #[error(transparent)]
+    Frontend(#[from] FrontendError),
     /// CUDA context or memory observation failed.
     #[error(transparent)]
     Gpu(#[from] GpuError),
@@ -42,6 +45,12 @@ pub struct ResidentBatchGenerationQualification {
     pub route_batches: usize,
     /// Physical hole recycled while surviving requests remained active.
     pub recycled_slot: usize,
+    /// Active cancellation boundaries exercised.
+    pub cancellations: usize,
+    /// Complete retained prefixes restored without device replay.
+    pub exact_prefix_reuses: usize,
+    /// Divergent retained spans correctly rejected for device reuse.
+    pub safe_cold_fallbacks: usize,
     /// Exact device arena bytes shared by every request.
     pub arena_bytes: usize,
     /// Exact page-locked embedding and double-logit-bank bytes.
@@ -54,6 +63,7 @@ pub fn qualify_resident_batch_generation(
 ) -> Result<ResidentBatchGenerationQualification, ResidentBatchGenerationQualificationError> {
     let _preflight = device_benchmark::preflight()?;
     let snapshot = Arc::new(CheckpointSnapshot::<Qwen38_27B>::open(root)?);
+    let oracle_frontend = TextFrontend::open(snapshot.as_ref())?;
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
     if capability != (12, 0) {
@@ -71,17 +81,19 @@ pub fn qualify_resident_batch_generation(
         greedy_request("Hello", 2),
         greedy_request("Name one color.", 1),
         greedy_request("Reply with one word.", 2),
-        greedy_request("What is 2+2?", 2),
+        greedy_request("Name one color.", 2),
     ];
     let mut expected = Vec::with_capacity(requests.len());
     for request in &requests {
         expected.push(run_alone(&mut generator, request)?);
     }
     verify_exact_batch_inventory(&mut generator, &requests[0], &expected[0])?;
+    generator.qualification_clear_retained();
     let before = device_memory_info(generator.context())?;
 
     let a = generator.admit(&requests[0])?.request_id;
-    let b = generator.admit(&requests[1])?.request_id;
+    let b_admission = generator.admit(&requests[1])?;
+    let b = b_admission.request_id;
     let c = generator.admit(&requests[2])?.request_id;
     require_slot(&generator, a, 0)?;
     require_slot(&generator, b, 1)?;
@@ -101,7 +113,13 @@ pub fn qualify_resident_batch_generation(
         ));
     }
 
-    let d = generator.admit(&requests[3])?.request_id;
+    let d_admission = generator.admit(&requests[3])?;
+    if d_admission.device_reused_tokens != b_admission.prompt_tokens {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "recycled middle slot did not restore its complete retained prompt".to_string(),
+        ));
+    }
+    let d = d_admission.request_id;
     require_slot(&generator, d, 1)?;
     let second = generator.step()?;
     require_round(
@@ -124,6 +142,15 @@ pub fn qualify_resident_batch_generation(
             "completed compact schedule retained an active request".to_string(),
         ));
     }
+    generator.qualification_clear_retained();
+    verify_prefix_reuse_and_cancellation(
+        &mut generator,
+        &oracle_frontend,
+        &requests[0],
+        &expected[0],
+        &requests[2],
+        &expected[2],
+    )?;
 
     let after = device_memory_info(generator.context())?;
     if before != after {
@@ -145,9 +172,102 @@ pub fn qualify_resident_batch_generation(
         rounds: 3,
         route_batches: 8,
         recycled_slot: 1,
+        cancellations: 2,
+        exact_prefix_reuses: 1,
+        safe_cold_fallbacks: 1,
         arena_bytes: generator.arena_bytes(),
         host_stager_bytes: generator.host_stager_bytes(),
     })
+}
+
+fn verify_prefix_reuse_and_cancellation(
+    generator: &mut ResidentBatchGenerator,
+    frontend: &TextFrontend,
+    request: &ChatGenerationRequest,
+    expected: &GeneratedText,
+    survivor_request: &ChatGenerationRequest,
+    survivor_expected: &GeneratedText,
+) -> Result<(), ResidentBatchGenerationQualificationError> {
+    let cold = generator.admit(request)?;
+    let survivor = generator.admit(survivor_request)?;
+    if cold.device_reused_tokens != 0 || survivor.device_reused_tokens != 0 {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "cold cancellation fixture unexpectedly reused device state".to_string(),
+        ));
+    }
+    require_slot(generator, cold.request_id, 0)?;
+    require_slot(generator, survivor.request_id, 1)?;
+    let first = generator.step()?;
+    require_round(
+        &first,
+        &[
+            (cold.request_id, expected, 0),
+            (survivor.request_id, survivor_expected, 0),
+        ],
+    )?;
+
+    let cancelled = generator.cancel(cold.request_id)?;
+    let expected_cancelled_text = frontend.decode(&expected.token_ids[..1], true)?;
+    if cancelled.request_id != cold.request_id
+        || cancelled.device_retained_tokens != cold.prompt_tokens
+        || cancelled.output.prompt.token_ids != expected.prompt.token_ids
+        || cancelled.output.token_ids != expected.token_ids[..1]
+        || cancelled.output.text != expected_cancelled_text
+        || generator.qualification_retained_tokens(0) != Some(cold.prompt_tokens)
+        || generator.active_request_ids().collect::<Vec<_>>() != [survivor.request_id]
+    {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "cancellation did not preserve its exact host output, processed device span, or survivor order"
+                .to_string(),
+        ));
+    }
+
+    let reused = generator.admit(request)?;
+    if reused.device_reused_tokens != cold.prompt_tokens {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "identical prompt did not restore its complete retained device prefix".to_string(),
+        ));
+    }
+    require_slot(generator, reused.request_id, 0)?;
+    let joined = generator.step()?;
+    require_round(
+        &joined,
+        &[
+            (survivor.request_id, survivor_expected, 1),
+            (reused.request_id, expected, 0),
+        ],
+    )?;
+    let terminal = generator.step()?;
+    require_round(&terminal, &[(reused.request_id, expected, 1)])?;
+    if generator.active_requests() != 0
+        || generator.qualification_retained_tokens(0) != Some(cold.prompt_tokens + 1)
+    {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "reused request did not retain exactly the token span processed by the device"
+                .to_string(),
+        ));
+    }
+
+    // The retained state now includes one generated token. The original prompt is
+    // shorter, so treating it as a reusable prefix would silently cross divergence.
+    let divergent = generator.admit(request)?;
+    if divergent.device_reused_tokens != 0 {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "a prompt that diverged before the full retained span reused device state".to_string(),
+        ));
+    }
+    let divergent_first = generator.step()?;
+    require_round(&divergent_first, &[(divergent.request_id, expected, 0)])?;
+    let second_cancel = generator.cancel(divergent.request_id)?;
+    if second_cancel.device_retained_tokens != divergent.prompt_tokens
+        || second_cancel.output.token_ids != expected.token_ids[..1]
+        || generator.active_requests() != 0
+    {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "cold fallback cancellation changed its exact processed boundary".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn verify_exact_batch_inventory(
@@ -352,6 +472,9 @@ mod tests {
         assert_eq!(report.rounds, 3);
         assert_eq!(report.route_batches, 8);
         assert_eq!(report.recycled_slot, 1);
+        assert_eq!(report.cancellations, 2);
+        assert_eq!(report.exact_prefix_reuses, 1);
+        assert_eq!(report.safe_cold_fallbacks, 1);
         assert_eq!(report.arena_bytes, 20_391_493_632);
         assert_eq!(report.host_stager_bytes, 8_028_160);
         Ok(())
