@@ -29,6 +29,8 @@ const GDN_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/gdn-output-sm120.txt"
 const ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/attention-qk-prepare-sm120.txt";
 const PAGED_GQA_RESOURCE_BASELINE: &str = "qual/baselines/paged-gqa-sm120.txt";
+const LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE: &str =
+    "qual/baselines/long-context-paged-gqa-sm120.txt";
 const ATTENTION_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/attention-output-sm120.txt";
 const RESIDENT_MODEL_RESOURCE_BASELINES: &[&str] = &[
     RESIDUAL_NORM_RESOURCE_BASELINE,
@@ -67,10 +69,11 @@ pub(crate) enum PerformanceSuite {
     GdnOutput,
     AttentionQkPrepare,
     PagedGqa,
+    LongContextPagedGqa,
     AttentionOutput,
 }
 
-const PERFORMANCE_SUITES: [PerformanceSuite; 14] = [
+const PERFORMANCE_SUITES: [PerformanceSuite; 15] = [
     PerformanceSuite::ResidualNorm,
     PerformanceSuite::Fp8Qkv,
     PerformanceSuite::Fp8GdnInput,
@@ -84,6 +87,7 @@ const PERFORMANCE_SUITES: [PerformanceSuite; 14] = [
     PerformanceSuite::GdnOutput,
     PerformanceSuite::AttentionQkPrepare,
     PerformanceSuite::PagedGqa,
+    PerformanceSuite::LongContextPagedGqa,
     PerformanceSuite::AttentionOutput,
 ];
 
@@ -103,6 +107,7 @@ impl PerformanceSuite {
             Self::GdnOutput => "gdn-output",
             Self::AttentionQkPrepare => "attention-qk-prepare",
             Self::PagedGqa => "paged-gqa",
+            Self::LongContextPagedGqa => "long-context-paged-gqa",
             Self::AttentionOutput => "attention-output",
         }
     }
@@ -122,6 +127,7 @@ impl PerformanceSuite {
             Self::GdnOutput => GDN_OUTPUT_RESOURCE_BASELINE,
             Self::AttentionQkPrepare => ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
             Self::PagedGqa => PAGED_GQA_RESOURCE_BASELINE,
+            Self::LongContextPagedGqa => LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE,
             Self::AttentionOutput => ATTENTION_OUTPUT_RESOURCE_BASELINE,
         }
     }
@@ -141,6 +147,7 @@ impl PerformanceSuite {
             Self::GdnOutput => "qual/baselines/gdn-output-sm120.json",
             Self::AttentionQkPrepare => "qual/baselines/attention-qk-prepare-sm120.json",
             Self::PagedGqa => "qual/baselines/paged-gqa-sm120.json",
+            Self::LongContextPagedGqa => "qual/baselines/long-context-paged-gqa-sm120.json",
             Self::AttentionOutput => "qual/baselines/attention-output-sm120.json",
         }
     }
@@ -160,6 +167,7 @@ impl PerformanceSuite {
             "gdn-output" => Ok(Self::GdnOutput),
             "attention-qk-prepare" => Ok(Self::AttentionQkPrepare),
             "paged-gqa" => Ok(Self::PagedGqa),
+            "long-context-paged-gqa" => Ok(Self::LongContextPagedGqa),
             "attention-output" => Ok(Self::AttentionOutput),
             _ => Err(format!("unknown performance suite `{value}`").into()),
         }
@@ -180,6 +188,7 @@ impl PerformanceSuite {
             Self::GdnOutput => qualify_gdn_output(root),
             Self::AttentionQkPrepare => qualify_attention_qk_prepare(root),
             Self::PagedGqa => qualify_paged_gqa(root),
+            Self::LongContextPagedGqa => qualify_long_context_paged_gqa(root),
             Self::AttentionOutput => qualify_attention_output(root),
         }
     }
@@ -189,7 +198,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|build-server|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-nvfp4-mlp|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-resident-model|qualify-resident-generation|qualify-resident-batch-generation|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-resident-model|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-nvfp4-swiglu|gate-nvfp4-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-attention-output|perf|remote>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|build-server|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-nvfp4-mlp|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-long-context-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-resident-model|qualify-resident-generation|qualify-resident-batch-generation|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-resident-model|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-nvfp4-swiglu|gate-nvfp4-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-long-context-paged-gqa|gate-attention-output|perf|remote>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -218,6 +227,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             qualify_attention_qk_prepare(root)
         }
         Some("qualify-paged-gqa") if remaining.is_empty() => qualify_paged_gqa(root),
+        Some("qualify-long-context-paged-gqa") if remaining.is_empty() => {
+            qualify_long_context_paged_gqa(root)
+        }
         Some("qualify-attention-output") if remaining.is_empty() => qualify_attention_output(root),
         Some("qualify-dense-fp8-mlp") => qualify_dense_fp8_mlp(root, &remaining),
         Some("qualify-dense-fp8-gdn-layer") => qualify_dense_fp8_gdn_layer(root, &remaining),
@@ -242,6 +254,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-gdn-output") => bench_gdn_output(root, &remaining),
         Some("bench-attention-qk-prepare") => bench_attention_qk_prepare(root, &remaining),
         Some("bench-paged-gqa") => bench_paged_gqa(root, &remaining),
+        Some("bench-long-context-paged-gqa") => bench_long_context_paged_gqa(root, &remaining),
         Some("bench-attention-output") => bench_attention_output(root, &remaining),
         Some("bench-dense-fp8-mlp") => bench_dense_fp8_mlp(root, &remaining),
         Some("bench-dense-fp8-gdn-layer") => bench_dense_fp8_gdn_layer(root, &remaining),
@@ -263,6 +276,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             gate_attention_qk_prepare(root)
         }
         Some("gate-paged-gqa") if remaining.is_empty() => gate_paged_gqa(root),
+        Some("gate-long-context-paged-gqa") if remaining.is_empty() => {
+            gate_long_context_paged_gqa(root)
+        }
         Some("gate-attention-output") if remaining.is_empty() => gate_attention_output(root),
         Some("perf") => perf(root, &remaining),
         Some("remote") => remote::run(root, &remaining),
@@ -287,6 +303,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-gdn-output"
                     | "qualify-attention-qk-prepare"
                     | "qualify-paged-gqa"
+                    | "qualify-long-context-paged-gqa"
                     | "qualify-attention-output"
                     | "gate-residual-norm"
                     | "gate-fp8-qkv"
@@ -301,6 +318,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "gate-gdn-output"
                     | "gate-attention-qk-prepare"
                     | "gate-paged-gqa"
+                    | "gate-long-context-paged-gqa"
                     | "gate-attention-output"
             ) =>
         {
@@ -430,6 +448,7 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_gdn_output(root)?;
     gate_attention_qk_prepare(root)?;
     gate_paged_gqa(root)?;
+    gate_long_context_paged_gqa(root)?;
     gate_attention_output(root)
 }
 
@@ -860,6 +879,31 @@ fn qualify_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_paged_gqa(root)
 }
 
+fn qualify_long_context_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "long_context_paged_gqa",
+            "--include-ignored",
+            "--nocapture",
+        ],
+    )?;
+    gate_long_context_paged_gqa(root)
+}
+
 fn qualify_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
     run_oxide(
         root,
@@ -1284,6 +1328,13 @@ fn bench_paged_gqa(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), 
     bench_suite(root, PerformanceSuite::PagedGqa, arguments)
 }
 
+fn bench_long_context_paged_gqa(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    bench_suite(root, PerformanceSuite::LongContextPagedGqa, arguments)
+}
+
 fn bench_attention_output(
     root: &Path,
     arguments: &[std::ffi::OsString],
@@ -1506,7 +1557,7 @@ fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
     if mode == "bless" {
         let [_, suite] = arguments else {
             return Err(
-                "usage: cargo run -p xtask -- perf bless <residual-norm|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|nvfp4-swiglu|nvfp4-down|gdn-prepare|gdn-recurrence|gdn-output|attention-qk-prepare|paged-gqa|attention-output>"
+                "usage: cargo run -p xtask -- perf bless <residual-norm|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|nvfp4-swiglu|nvfp4-down|gdn-prepare|gdn-recurrence|gdn-output|attention-qk-prepare|paged-gqa|long-context-paged-gqa|attention-output>"
                     .into(),
             );
         };
@@ -3269,6 +3320,123 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn gate_long_context_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path)?;
+    let entries = parse_entries(&ptx);
+    let partials = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("long_context_paged_gqa_partial_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    let reductions = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("long_context_paged_gqa_reduce_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    require_count("long-context paged GQA partial", partials.len(), 8)?;
+    require_count("long-context paged GQA reduction", reductions.len(), 8)?;
+    for entry in partials.iter().chain(&reductions) {
+        if !entry.body.contains(".reqntid 32, 1, 1") || !entry.body.contains(".minnctapersm 16") {
+            return Err(format!(
+                "entry `{}` lost its 32-thread/sixteen-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in &reductions {
+        if !entry.body.contains("__dynamic_smem__") {
+            return Err(format!(
+                "entry `{}` lost its dynamic partition-weight workspace",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let temporary = root.join("target/tmp");
+    fs::create_dir_all(&temporary)?;
+    let cubin = temporary.join("long-context-paged-gqa-gate.cubin");
+    let ptxas = cuda_tool("ptxas");
+    require_success(
+        &ptxas,
+        &[
+            OsStr::new("-O3"),
+            OsStr::new("--gpu-name"),
+            OsStr::new("sm_120a"),
+            ptx_path.as_os_str(),
+            OsStr::new("--output-file"),
+            cubin.as_os_str(),
+        ],
+    )?;
+    let cuobjdump = cuda_tool("cuobjdump");
+    let resources = require_success(
+        &cuobjdump,
+        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+    )?;
+    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
+    let sass = String::from_utf8(sass.stdout)?;
+    let mut partial_registers = Vec::new();
+    let mut reduction_registers = Vec::new();
+    let mut shared = Vec::new();
+    for (entries, registers, instructions) in [
+        (
+            &partials,
+            &mut partial_registers,
+            &["F2FP.F16.E4M3.UNPACK_B", "SHFL.BFLY", "MUFU.EX2"][..],
+        ),
+        (
+            &reductions,
+            &mut reduction_registers,
+            &["SHFL.BFLY", "MUFU.EX2", "STS", "LDS", "BAR.SYNC"][..],
+        ),
+    ] {
+        for entry in entries {
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+            shared.push(resource.shared);
+
+            let body = sass_function_body(&sass, entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+            for instruction in instructions {
+                if !body.contains(instruction) {
+                    return Err(format!(
+                        "entry `{}` lost required `{instruction}` SASS",
+                        entry.name
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    partial_registers.sort_unstable();
+    reduction_registers.sort_unstable();
+    require_registers(&baseline, "partial_registers", &partial_registers)?;
+    require_registers(&baseline, "reduction_registers", &reduction_registers)?;
+    require_uniform_value(&baseline, "shared_bytes", &shared)?;
+
+    println!(
+        "long-context paged GQA gate passed: 8 partial + 8 reduction entries, REG partial {:?}, reduction {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/SHFL/EX2/dynamic-shared present",
+        partial_registers, reduction_registers, shared
+    );
+    Ok(())
+}
+
 fn gate_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(
         root.join(ATTENTION_OUTPUT_RESOURCE_BASELINE),
@@ -3937,6 +4105,7 @@ mod tests {
                 "gdn-output",
                 "attention-qk-prepare",
                 "paged-gqa",
+                "long-context-paged-gqa",
                 "attention-output",
             ]
         );

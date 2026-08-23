@@ -13,8 +13,10 @@ uses the exact retained A16 and W4A4 decode schedules at `B=1..8`; NVFP4 down pr
 the represented E2M1/E4M3 source planes through exact A16 routes at `B=1..8`. Full-attention Q/K
 preparation covers zero-centered normalization, the 64-wide three-axis MRoPE, and represented E4M3
 KV-cache append at exact `B=1..8`. Short-context paged GQA covers exact 24-query/4-KV-head,
-256-wide online-softmax decode across page boundaries at `B=1..8`; long-context partitioned decode
-and prefill remain separate future routes. The resident text owner composes all 48 GDN layers, 16
+256-wide online-softmax decode across page boundaries at `B=1..8`. Long-context paged GQA retains
+the same represented cache contract and partitions contexts through 220,000 positions into
+256-position partial softmaxes plus one exact reduction at `B=1..8`; prefill remains a separate
+future route. The resident text owner composes all 48 GDN layers, 16
 attention layers, source-routed MLPs, and the LM head into one directly timed graph at every exact
 `B=1..8`; serving cases remain future work.
 
@@ -86,6 +88,7 @@ target/benchmarks/perf-smoke/gdn-recurrence.json
 target/benchmarks/perf-smoke/gdn-output.json
 target/benchmarks/perf-smoke/attention-qk-prepare.json
 target/benchmarks/perf-smoke/paged-gqa.json
+target/benchmarks/perf-smoke/long-context-paged-gqa.json
 target/benchmarks/perf-smoke/attention-output.json
 ```
 
@@ -113,6 +116,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- qualify-gdn-output` | Check dynamic E4M3 quantization, source-native output projection, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-attention-qk-prepare` | Check Q/K zero-centered normalization, three-axis MRoPE, represented E4M3 cache append, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-paged-gqa` | Check exact page lookup, grouped-head mapping, represented E4M3 online softmax, and graph replay at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-long-context-paged-gqa` | Check every partition bucket through 220,000 positions, all partial/reduction seams, untouched scratch, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-attention-output` | Check sigmoid gating, the published FP32 seam, dynamic E4M3 quantization, source-native projection, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact-B graph, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact-B graphs, stable addresses, and owner allocation | terminal |
@@ -126,6 +130,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- bench-gdn-output` | Measure every exact output quantize-plus-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-qk-prepare` | Measure every exact Q/K prepare and cache-append graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-paged-gqa` | Measure every exact paged GQA graph at a 130-token, three-page context | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-long-context-paged-gqa` | Measure every exact two-stage paged GQA graph with the complete 3,438-page pool divided among active slots | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-output` | Measure every exact sigmoid-gate, quantize, and output-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-nvfp4-swiglu` | Measure every exact retained A16/W4A4 NVFP4 gate/up SwiGLU graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-nvfp4-down` | Measure every exact represented-weight A16 NVFP4 down-projection graph | terminal or `--json PATH` |
@@ -182,7 +187,8 @@ cargo run -p xtask -- bench-residual-norm \
 Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, `bench-fp8-lm-head`,
 `bench-fp8-swiglu`, `bench-fp8-down`, `bench-gdn-prepare`, `bench-gdn-recurrence`, or
 `bench-gdn-output`, `bench-nvfp4-swiglu`, `bench-nvfp4-down`, `bench-attention-qk-prepare`,
-`bench-paged-gqa`, or `bench-attention-output` with the same options for one operator suite only.
+`bench-paged-gqa`, `bench-long-context-paged-gqa`, or `bench-attention-output` with the same options
+for one operator suite only.
 
 `bench-text-endpoint SNAPSHOT` accepts the same options. It is intentionally separate from the
 leaf-wide `perf` commands until its first reviewed baseline is blessed.

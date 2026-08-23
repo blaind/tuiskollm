@@ -64,6 +64,10 @@ mod gdn_prepare_benchmark;
 mod gdn_recurrence;
 #[cfg(feature = "device")]
 mod gdn_recurrence_benchmark;
+#[cfg(feature = "device")]
+mod long_context_paged_gqa;
+#[cfg(feature = "device")]
+mod long_context_paged_gqa_benchmark;
 #[cfg(feature = "sm89")]
 mod nvfp4_down;
 #[cfg(feature = "device")]
@@ -183,6 +187,13 @@ pub use gdn_recurrence::{
 };
 #[cfg(feature = "device")]
 pub use gdn_recurrence_benchmark::benchmark_gdn_recurrence;
+#[cfg(feature = "device")]
+pub use long_context_paged_gqa::{
+    LongContextPagedGqaQualification, LongContextPagedGqaQualificationError,
+    qualify_long_context_paged_gqa,
+};
+#[cfg(feature = "device")]
+pub use long_context_paged_gqa_benchmark::benchmark_long_context_paged_gqa;
 #[cfg(any(feature = "device", feature = "sm89"))]
 pub use nvfp4_down::{Nvfp4DownQualification, Nvfp4DownQualificationError, qualify_nvfp4_down};
 #[cfg(any(feature = "device", feature = "sm89"))]
