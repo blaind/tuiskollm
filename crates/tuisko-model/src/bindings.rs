@@ -976,6 +976,115 @@ fn modelopt_nvfp4_next_norm_name<A: Arch>(layer: usize) -> CheckpointResult<Stri
     })
 }
 
+/// Complete ModelOpt NVFP4 source planes for one Qwen3.5 full-attention layer.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelOptNvfp4AttentionBindings<'a> {
+    /// Query-plus-gate projection.
+    pub query_gate: ModelOptNvfp4LinearBindings<'a>,
+    /// Key projection.
+    pub key: ModelOptNvfp4LinearBindings<'a>,
+    /// Value projection.
+    pub value: ModelOptNvfp4LinearBindings<'a>,
+    /// Gated attention-output projection.
+    pub output: ModelOptNvfp4LinearBindings<'a>,
+    /// Per-head query RMSNorm weights `[head_dim]`.
+    pub query_norm: Bf16View<'a, 1>,
+    /// Per-head key RMSNorm weights `[head_dim]`.
+    pub key_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before attention `[hidden]`.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the MLP `[hidden]`.
+    pub post_attention_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning these sources.
+    pub layer: usize,
+}
+
+impl<'a> ModelOptNvfp4AttentionBindings<'a> {
+    /// Binds one exact Qwen3.5 ModelOpt NVFP4 full-attention source family.
+    pub fn bind<A: Arch>(
+        snapshot: &'a CheckpointSnapshot<A>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from::<A>(layer, |name| snapshot.tensor(name))
+    }
+
+    fn bind_from<A: Arch>(
+        layer: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        require_modelopt_contract::<A>("full attention")?;
+        require_full_attention_layer(layer, A::LAYERS, A::FULL_ATTENTION_INTERVAL)?;
+
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let prefix = format!("{layer_prefix}.self_attn");
+        let query_gate = ModelOptNvfp4LinearBindings::bind_from(
+            &format!("{prefix}.q_proj"),
+            A::ATTENTION_QUERY_ROWS,
+            A::HIDDEN,
+            layer,
+            |name| tensor(name),
+        )?;
+        let key = ModelOptNvfp4LinearBindings::bind_from(
+            &format!("{prefix}.k_proj"),
+            A::ATTENTION_KV_ROWS,
+            A::HIDDEN,
+            layer,
+            |name| tensor(name),
+        )?;
+        let value = ModelOptNvfp4LinearBindings::bind_from(
+            &format!("{prefix}.v_proj"),
+            A::ATTENTION_KV_ROWS,
+            A::HIDDEN,
+            layer,
+            |name| tensor(name),
+        )?;
+        let output = ModelOptNvfp4LinearBindings::bind_from(
+            &format!("{prefix}.o_proj"),
+            A::HIDDEN,
+            A::ATTENTION_OUTPUT_COLUMNS,
+            layer,
+            |name| tensor(name),
+        )?;
+
+        require_same_rank_zero_f32(
+            layer,
+            "query/key input_scale",
+            &query_gate.input_scale,
+            &key.input_scale,
+        )?;
+        require_same_rank_zero_f32(
+            layer,
+            "query/value input_scale",
+            &query_gate.input_scale,
+            &value.input_scale,
+        )?;
+
+        Ok(Self {
+            query_gate,
+            key,
+            value,
+            output,
+            query_norm: Bf16View::bind(
+                tensor(&format!("{prefix}.q_norm.weight"))?,
+                [A::HEAD_DIM as u64],
+            )?,
+            key_norm: Bf16View::bind(
+                tensor(&format!("{prefix}.k_norm.weight"))?,
+                [A::HEAD_DIM as u64],
+            )?,
+            input_norm: Bf16View::bind(
+                tensor(&format!("{layer_prefix}.input_layernorm.weight"))?,
+                [A::HIDDEN as u64],
+            )?,
+            post_attention_norm: Bf16View::bind(
+                tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+                [A::HIDDEN as u64],
+            )?,
+            layer,
+        })
+    }
+}
+
 /// Complete ModelOpt NVFP4 source planes for one Qwen3.5 GDN mixer layer.
 #[derive(Clone, Copy, Debug)]
 pub struct ModelOptNvfp4GdnBindings<'a> {
@@ -1570,12 +1679,12 @@ fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> Checkpo
 mod tests {
     use super::{
         DenseFp8DownBindings, DenseFp8GateUpBindings, DenseFp8MlpBindings, E2M1_VALUES_PER_BYTE,
-        FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings, ModelOptNvfp4GdnBindings,
-        ModelOptNvfp4MlpBindings, MtpBindings, NVFP4_GROUP_SIZE, Nvfp4DownBindings,
-        Nvfp4GateUpBindings, Nvfp4MlpBindings, TextEndpointBindings, VisionBindings,
-        dense_fp8_next_norm_name, positive_bf16, require_adjacent, require_dense_fp8_mlp_layer,
-        require_full_attention_layer, require_gdn_layer, require_mtp_contract,
-        require_nvfp4_mlp_layer, validate_nvfp4_scales,
+        FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings,
+        ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings,
+        MtpBindings, NVFP4_GROUP_SIZE, Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings,
+        TextEndpointBindings, VisionBindings, dense_fp8_next_norm_name, positive_bf16,
+        require_adjacent, require_dense_fp8_mlp_layer, require_full_attention_layer,
+        require_gdn_layer, require_mtp_contract, require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
     use crate::{
         Arch, CheckpointContract, CheckpointErrorCode, CheckpointResult, DType, SafeTensorFile,
@@ -2235,6 +2344,65 @@ mod tests {
         (Value::Object(header), payload)
     }
 
+    fn modelopt_attention_fixture(layer: usize) -> (Value, Vec<u8>) {
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let prefix = format!("{layer_prefix}.self_attn");
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+
+        for (projection, rows, input_scale, weight_scale, code) in [
+            (
+                "q_proj",
+                ModelOptArch::ATTENTION_QUERY_ROWS,
+                0.25,
+                0.125,
+                0x10,
+            ),
+            ("k_proj", ModelOptArch::ATTENTION_KV_ROWS, 0.25, 0.25, 0x20),
+            ("v_proj", ModelOptArch::ATTENTION_KV_ROWS, 0.25, 0.5, 0x30),
+        ] {
+            append_modelopt_linear(
+                &mut header,
+                &mut payload,
+                &format!("{prefix}.{projection}"),
+                [rows, ModelOptArch::HIDDEN],
+                [input_scale, weight_scale],
+                code,
+            );
+        }
+        append_modelopt_linear(
+            &mut header,
+            &mut payload,
+            &format!("{prefix}.o_proj"),
+            [ModelOptArch::HIDDEN, ModelOptArch::ATTENTION_OUTPUT_COLUMNS],
+            [0.5, 0.0625],
+            0x40,
+        );
+
+        for (name, shape) in [
+            (
+                format!("{prefix}.q_norm.weight"),
+                vec![ModelOptArch::HEAD_DIM],
+            ),
+            (
+                format!("{prefix}.k_norm.weight"),
+                vec![ModelOptArch::HEAD_DIM],
+            ),
+            (
+                format!("{layer_prefix}.input_layernorm.weight"),
+                vec![ModelOptArch::HIDDEN],
+            ),
+            (
+                format!("{layer_prefix}.post_attention_layernorm.weight"),
+                vec![ModelOptArch::HIDDEN],
+            ),
+        ] {
+            append_bf16_tensor(&mut header, &mut payload, name, shape);
+        }
+
+        (Value::Object(header), payload)
+    }
+
     fn append_bf16_tensor(
         header: &mut serde_json::Map<String, Value>,
         payload: &mut Vec<u8>,
@@ -2615,6 +2783,67 @@ mod tests {
         assert_eq!(post.layer, 63);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn binds_exact_modelopt_nvfp4_attention_source_contract() {
+        let path = fixture_path("modelopt-attention");
+        let (header, payload) = modelopt_attention_fixture(1);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let bindings =
+            ModelOptNvfp4AttentionBindings::bind_from::<ModelOptArch>(1, |name| file.tensor(name))
+                .unwrap();
+
+        assert_eq!(bindings.query_gate.weight.shape(), &[32, 16]);
+        assert_eq!(bindings.query_gate.block_scale.shape(), &[32, 2]);
+        assert_eq!(bindings.key.weight.shape(), &[16, 16]);
+        assert_eq!(bindings.value.weight.shape(), &[16, 16]);
+        assert_eq!(bindings.output.weight.shape(), &[32, 8]);
+        assert_eq!(bindings.output.block_scale.shape(), &[32, 1]);
+        assert_eq!(bindings.query_gate.input_scale.value(0), Some(0.25));
+        assert_eq!(bindings.output.input_scale.value(0), Some(0.5));
+        assert_eq!(bindings.query_norm.shape(), &[1]);
+        assert_eq!(bindings.key_norm.shape(), &[1]);
+        assert_eq!(bindings.input_norm.shape(), &[32]);
+        assert_eq!(bindings.post_attention_norm.shape(), &[32]);
+        assert_eq!(bindings.layer, 1);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_modelopt_attention_route_and_shared_input_scale_drift() {
+        let path = fixture_path("modelopt-attention-scale-drift");
+        let (header, mut payload) = modelopt_attention_fixture(1);
+        let offset =
+            header["model.language_model.layers.1.self_attn.k_proj.input_scale"]["data_offsets"][0]
+                .as_u64()
+                .unwrap() as usize;
+        payload[offset..offset + 4].copy_from_slice(&0.5f32.to_le_bytes());
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let error =
+            ModelOptNvfp4AttentionBindings::bind_from::<ModelOptArch>(1, |name| file.tensor(name))
+                .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            error
+                .to_string()
+                .contains("query/key input_scale values differ")
+        );
+        fs::remove_file(path).unwrap();
+
+        let error = ModelOptNvfp4AttentionBindings::bind_from::<ModelOptArch>(0, |_| {
+            panic!("the route check must reject before tensor lookup")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("full-attention source contract"));
     }
 
     #[test]
