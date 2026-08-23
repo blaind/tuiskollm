@@ -4634,9 +4634,23 @@ fn gate_fp8_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("fp8_gdn_input_TID_"))
         .collect::<Vec<_>>();
+    let gdn_input_prefill = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("fp8_gdn_input_mma_TID_"))
+        .collect::<Vec<_>>();
+    let gdn_input_t1024 = entries
+        .iter()
+        .filter(|entry| entry.name == "fp8_gdn_input_mma_t1024")
+        .collect::<Vec<_>>();
     require_count("FP8 GDN input", gdn_input.len(), 8)?;
+    require_count("FP8 GDN input T=32/64/128", gdn_input_prefill.len(), 3)?;
+    require_count("FP8 GDN input T=1024", gdn_input_t1024.len(), 1)?;
 
-    for entry in &gdn_input {
+    for entry in gdn_input
+        .iter()
+        .chain(&gdn_input_prefill)
+        .chain(&gdn_input_t1024)
+    {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
@@ -4646,7 +4660,20 @@ fn gate_fp8_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let resources = &sm120_gate_artifact(root)?.resources;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    for entry in gdn_input_prefill.iter().chain(&gdn_input_t1024) {
+        let body = sass_function_body(sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted FP8 GDN input MMA entry `{}`", entry.name))?;
+        if !body.contains("QMMA.16832.F32.E4M3.E4M3") {
+            return Err(format!(
+                "FP8 GDN input MMA entry `{}` lost its native E4M3 tensor-core instruction",
+                entry.name
+            )
+            .into());
+        }
+    }
     let mut registers = Vec::new();
     let mut shared = Vec::new();
     for entry in gdn_input {
@@ -4659,10 +4686,27 @@ fn gate_fp8_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
     }
     registers.sort_unstable();
     require_registers(&baseline, "gdn_input_registers", &registers)?;
+    let mut prefill_registers = Vec::new();
+    let mut prefill_shared = Vec::new();
+    for entry in gdn_input_prefill.iter().chain(&gdn_input_t1024) {
+        let resource = resources.get(entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted FP8 GDN input prefill entry `{}`",
+                entry.name
+            )
+        })?;
+        require_spill_free(entry.name, resource)?;
+        prefill_registers.push(resource.registers);
+        prefill_shared.push(resource.shared);
+    }
+    prefill_registers.sort_unstable();
+    if baseline.contains_key("gdn_input_prefill_registers") {
+        require_registers(&baseline, "gdn_input_prefill_registers", &prefill_registers)?;
+    }
 
     println!(
-        "FP8 GDN input gate passed: 8 projection entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
-        registers, shared
+        "FP8 GDN input gate passed: 8 decode + 4 prefill projection entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}",
+        registers, prefill_registers, shared, prefill_shared
     );
     Ok(())
 }

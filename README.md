@@ -89,8 +89,10 @@ SwiGLU, down projection, and residual publication into directly qualified graphs
 `B=1..8` and `T=32,64,128,1024`. The source-backed full-attention owner composes that MLP with
 input norm, QKV, Q/K preparation and cache append, paged GQA, gated output projection, and both
 residual seams at the same exact widths. Its prefill graphs own separate from-empty causal metadata,
-the shared 24-page cache row, P4 macro partials, and stable MLP tensor maps. GDN-layer prefill and
-resident/server routing remain separate slices, so these routes do not yet change server priming.
+the shared 24-page cache row, P4 macro partials, and stable MLP tensor maps. The source-native
+dense-FP8 GDN Q/K/V/Z input projection separately admits the same four prefill widths through
+64x64 E4M3 MMA tiles. GDN prepare, recurrence, output, layer composition, and resident/server
+routing remain separate slices, so these routes do not yet change server priming.
 
 ## Current device slice
 
