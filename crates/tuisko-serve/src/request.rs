@@ -1,6 +1,6 @@
 //! OpenAI chat-completion request admission.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use tuisko_engine::{ChatGenerationRequest, SamplingOptions};
@@ -19,7 +19,7 @@ pub struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
     #[serde(default)]
-    tools: Vec<Value>,
+    tools: Vec<FunctionTool>,
     #[serde(default)]
     tool_choice: Option<Value>,
     #[serde(default)]
@@ -50,6 +50,26 @@ pub struct ChatCompletionRequest {
     stream_options: Option<StreamOptions>,
     #[serde(default)]
     chat_template_kwargs: ChatTemplateKwargs,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FunctionTool {
+    #[serde(rename = "type")]
+    kind: String,
+    function: FunctionDefinition,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FunctionDefinition {
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parameters: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -149,7 +169,18 @@ impl ChatCompletionRequest {
             )));
         }
 
-        let mut tools = self.tools;
+        validate_tools(&self.tools)?;
+        let mut tools = self
+            .tools
+            .into_iter()
+            .map(|tool| {
+                serde_json::to_value(tool).map_err(|error| {
+                    ChatRequestError::Invalid(format!(
+                        "function tool could not be represented as JSON: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         match self.tool_choice.as_ref() {
             None | Some(Value::Null) => {}
             Some(Value::String(choice)) if choice == "auto" => {}
@@ -193,6 +224,50 @@ impl ChatCompletionRequest {
                 .is_some_and(|options| options.include_usage),
         })
     }
+}
+
+fn validate_tools(tools: &[FunctionTool]) -> Result<(), ChatRequestError> {
+    let mut names = HashSet::new();
+    for (index, tool) in tools.iter().enumerate() {
+        if tool.kind != "function" {
+            return Err(ChatRequestError::Invalid(format!(
+                "tool {index} has unsupported type `{}`; only function tools are admitted",
+                tool.kind
+            )));
+        }
+        let name = tool.function.name.as_str();
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(ChatRequestError::Invalid(format!(
+                "tool {index} function name must contain 1..=64 ASCII letters, digits, `_`, or `-`"
+            )));
+        }
+        if !names.insert(name) {
+            return Err(ChatRequestError::Invalid(format!(
+                "tool {index} repeats function name `{name}`"
+            )));
+        }
+        if tool
+            .function
+            .parameters
+            .as_ref()
+            .is_some_and(|parameters| !parameters.is_object())
+        {
+            return Err(ChatRequestError::Invalid(format!(
+                "tool {index} function parameters must be a JSON Schema object"
+            )));
+        }
+        if tool.function.strict == Some(true) {
+            return Err(ChatRequestError::Invalid(format!(
+                "tool {index} requests strict schema adherence without a constrained-decoding route"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_messages(messages: &[ChatMessage]) -> Result<(), ChatRequestError> {
@@ -504,5 +579,45 @@ mod tests {
             .expect_err("invalid message sequence must fail before enqueue");
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn validates_the_exact_function_tool_subset() {
+        let cases = [
+            (
+                r#"[{"type":"custom","function":{"name":"x"}}]"#,
+                "only function tools",
+            ),
+            (
+                r#"[{"type":"function","function":{"name":"bad name"}}]"#,
+                "function name",
+            ),
+            (
+                r#"[{"type":"function","function":{"name":"x","parameters":[]}}]"#,
+                "JSON Schema object",
+            ),
+            (
+                r#"[{"type":"function","function":{"name":"x","strict":true}}]"#,
+                "constrained-decoding route",
+            ),
+            (
+                r#"[{"type":"function","function":{"name":"x"}},{"type":"function","function":{"name":"x"}}]"#,
+                "repeats function name",
+            ),
+        ];
+        for (tools, expected) in cases {
+            let error = request(&format!(
+                r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"x"}}],"tools":{tools}}}"#
+            ))
+            .prepare(1)
+            .expect_err("invalid function tools must not reach the template");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+
+        let unknown = format!(
+            r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"x"}}],"tools":[{{"type":"function","function":{{"name":"x","extra":true}}}}]}}"#
+        );
+        serde_json::from_str::<ChatCompletionRequest>(&unknown)
+            .expect_err("unknown function-tool fields must not be ignored");
     }
 }
