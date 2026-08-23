@@ -28,9 +28,14 @@ const CODE_WORDS_PER_PHASE: usize = 32 * (GROUP_K / 2) / size_of::<u32>();
 // 256-thread CTAs fit the measured register and 9,216-byte shared footprints.
 // B=1 pairs the adjacent four-scale words owned by each row pair, reducing 16
 // scale sectors per warp/phase to eight before subgroup broadcast.
+// Its shared activation rows retain one padding word after eight packed pairs.
+// The resulting nine-bank lane stride removes the eight-way conflicts from all
+// eight reuse reads while preserving the represented values and FMA order.
 const WARPS: usize = 8;
 const THREADS: u32 = (WARPS * 32) as u32;
 const PHASE_PACKED_PAIRS: usize = 32 * GROUP_K / 2;
+const B1_SHARED_LANE_STRIDE: usize = GROUP_K / 2 + 1;
+const B1_SHARED_PHASE_U32: usize = 32 * B1_SHARED_LANE_STRIDE;
 const SHARED_U32: usize = MAX_BATCH * PHASE_PACKED_PAIRS;
 
 const _: () = assert!(HIDDEN == 5_120);
@@ -158,7 +163,12 @@ mod kernels {
     }
 
     #[inline(always)]
-    unsafe fn down_body<A: Arch, const TOKENS: usize, const COALESCED_SCALES: bool>(
+    unsafe fn down_body<
+        A: Arch,
+        const TOKENS: usize,
+        const COALESCED_SCALES: bool,
+        const PADDED_ACTIVATIONS: bool,
+    >(
         input: *const u32,
         weight_codes: *const u32,
         weight_scales: *const u8,
@@ -184,7 +194,17 @@ mod kernels {
                 let pair = task - token * PHASE_PACKED_PAIRS;
                 // SAFETY: every exact route supplies `TOKENS` complete input rows.
                 unsafe {
-                    *shared.add(task) =
+                    let shared_pair = if PADDED_ACTIVATIONS {
+                        (pair / 8) * B1_SHARED_LANE_STRIDE + pair % 8
+                    } else {
+                        pair
+                    };
+                    let shared_stride = if PADDED_ACTIVATIONS {
+                        B1_SHARED_PHASE_U32
+                    } else {
+                        PHASE_PACKED_PAIRS
+                    };
+                    *shared.add(token * shared_stride + shared_pair) =
                         *input.add(token * (A::INTERMEDIATE / 2) + phase * 256 + pair);
                 }
                 task += THREADS as usize;
@@ -254,7 +274,17 @@ mod kernels {
                         ($token:literal) => {
                             if $token < TOKENS {
                                 let bits = unsafe {
-                                    *shared.add($token * PHASE_PACKED_PAIRS + lane * 8 + $pair)
+                                    let shared_stride = if PADDED_ACTIVATIONS {
+                                        B1_SHARED_PHASE_U32
+                                    } else {
+                                        PHASE_PACKED_PAIRS
+                                    };
+                                    let lane_stride = if PADDED_ACTIVATIONS {
+                                        B1_SHARED_LANE_STRIDE
+                                    } else {
+                                        8
+                                    };
+                                    *shared.add($token * shared_stride + lane * lane_stride + $pair)
                                 };
                                 let (activation0, activation1) = convert::cvt_f32x2_bf16x2(bits);
                                 first_accumulators[$token] = float::fma_rn_f32(
@@ -350,7 +380,7 @@ mod kernels {
         static mut SHARED: SharedArray<u32, SHARED_U32, 16> = SharedArray::UNINIT;
 
         unsafe {
-            down_body::<Qwen38_27B, 1, true>(
+            down_body::<Qwen38_27B, 1, true, true>(
                 input,
                 weight_codes,
                 weight_scales,
@@ -382,7 +412,7 @@ mod kernels {
         let _ = A::HIDDEN;
 
         unsafe {
-            down_body::<A, TOKENS, false>(
+            down_body::<A, TOKENS, false, false>(
                 input,
                 weight_codes,
                 weight_scales,
@@ -413,7 +443,7 @@ mod kernels {
         static mut SHARED: SharedArray<u32, SHARED_U32, 16> = SharedArray::UNINIT;
 
         unsafe {
-            down_body::<Qwen35_9B, TOKENS, false>(
+            down_body::<Qwen35_9B, TOKENS, false, false>(
                 input,
                 weight_codes,
                 weight_scales,
