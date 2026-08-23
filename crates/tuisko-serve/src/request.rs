@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use tuisko_engine::{ChatGenerationRequest, SamplingOptions};
 use tuisko_frontend::{ChatMessage, ChatTemplateOptions};
 use tuisko_model::{Arch, Qwen38_27B};
@@ -113,6 +114,7 @@ impl ChatCompletionRequest {
                 "messages must not be empty".into(),
             ));
         }
+        validate_messages(&self.messages)?;
         if self.stream_options.is_some() && !self.stream {
             return Err(ChatRequestError::Invalid(
                 "stream_options requires stream=true".into(),
@@ -191,6 +193,101 @@ impl ChatCompletionRequest {
                 .is_some_and(|options| options.include_usage),
         })
     }
+}
+
+fn validate_messages(messages: &[ChatMessage]) -> Result<(), ChatRequestError> {
+    let mut content_started = false;
+    let mut seen_tool_calls = HashSet::new();
+    let mut pending_tool_calls = HashSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        let role = message.role.as_str();
+        if !matches!(role, "system" | "developer" | "user" | "assistant" | "tool") {
+            return Err(ChatRequestError::Invalid(format!(
+                "message {index} has unsupported role `{role}`"
+            )));
+        }
+        if matches!(role, "system" | "developer") {
+            if content_started {
+                return Err(ChatRequestError::Invalid(format!(
+                    "message {index} places `{role}` after conversation content"
+                )));
+            }
+        } else {
+            content_started = true;
+        }
+        if !pending_tool_calls.is_empty() && role != "tool" {
+            return Err(ChatRequestError::Invalid(format!(
+                "message {index} starts before every preceding tool call has a response"
+            )));
+        }
+
+        if role == "assistant" {
+            for call in &message.tool_calls {
+                if call.kind != "function" {
+                    return Err(ChatRequestError::Invalid(format!(
+                        "message {index} has unsupported tool-call type `{}`",
+                        call.kind
+                    )));
+                }
+                if call.function.name.trim().is_empty() {
+                    return Err(ChatRequestError::Invalid(format!(
+                        "message {index} has a tool call without a function name"
+                    )));
+                }
+                let id = call
+                    .id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        ChatRequestError::Invalid(format!(
+                            "message {index} has a tool call without an id"
+                        ))
+                    })?;
+                if !seen_tool_calls.insert(id) {
+                    return Err(ChatRequestError::Invalid(format!(
+                        "message {index} repeats tool-call id `{id}`"
+                    )));
+                }
+                pending_tool_calls.insert(id);
+            }
+        } else if !message.tool_calls.is_empty() {
+            return Err(ChatRequestError::Invalid(format!(
+                "message {index} attaches tool_calls to role `{role}`"
+            )));
+        }
+        if role != "assistant" && message.reasoning_content.is_some() {
+            return Err(ChatRequestError::Invalid(format!(
+                "message {index} attaches reasoning_content to role `{role}`"
+            )));
+        }
+
+        if role == "tool" {
+            let id = message
+                .tool_call_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    ChatRequestError::Invalid(format!(
+                        "message {index} is a tool response without tool_call_id"
+                    ))
+                })?;
+            if !pending_tool_calls.remove(id) {
+                return Err(ChatRequestError::Invalid(format!(
+                    "message {index} responds to unknown or duplicate tool-call id `{id}`"
+                )));
+            }
+        } else if message.tool_call_id.is_some() {
+            return Err(ChatRequestError::Invalid(format!(
+                "message {index} attaches tool_call_id to role `{role}`"
+            )));
+        }
+    }
+    if let Some(id) = pending_tool_calls.into_iter().next() {
+        return Err(ChatRequestError::Invalid(format!(
+            "tool call `{id}` has no response message"
+        )));
+    }
+    Ok(())
 }
 
 fn require_default_float(
@@ -357,6 +454,55 @@ mod tests {
             };
             serde_json::from_str::<ChatCompletionRequest>(&body)
                 .expect_err("unsupported request fields must fail admission");
+        }
+    }
+
+    #[test]
+    fn validates_message_roles_and_tool_response_attribution() {
+        let valid = request(&format!(
+            r#"{{
+                "model":"{SERVED_MODEL}",
+                "messages":[
+                    {{"role":"developer","content":"be precise"}},
+                    {{"role":"user","content":"inspect"}},
+                    {{"role":"assistant","content":null,"tool_calls":[{{
+                        "id":"call_1","type":"function",
+                        "function":{{"name":"inspect","arguments":"{{}}"}}
+                    }}]}},
+                    {{"role":"tool","tool_call_id":"call_1","content":"ok"}},
+                    {{"role":"user","content":"continue"}}
+                ]
+            }}"#
+        ));
+        valid.prepare(1).unwrap();
+
+        let cases = [
+            (r#"[{"role":"alien","content":"x"}]"#, "unsupported role"),
+            (
+                r#"[{"role":"user","content":"x"},{"role":"system","content":"late"}]"#,
+                "after conversation content",
+            ),
+            (
+                r#"[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"custom","function":{"name":"x","arguments":{}}}]}]"#,
+                "tool-call type",
+            ),
+            (
+                r#"[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"x","arguments":{}}}]},{"role":"tool","tool_call_id":"other","content":"x"}]"#,
+                "unknown or duplicate",
+            ),
+            (r#"[{"role":"tool","content":"x"}]"#, "without tool_call_id"),
+            (
+                r#"[{"role":"user","content":"x","reasoning_content":"ignored"}]"#,
+                "reasoning_content",
+            ),
+        ];
+        for (messages, expected) in cases {
+            let error = request(&format!(
+                r#"{{"model":"{SERVED_MODEL}","messages":{messages}}}"#
+            ))
+            .prepare(1)
+            .expect_err("invalid message sequence must fail before enqueue");
+            assert!(error.to_string().contains(expected), "{error}");
         }
     }
 }
