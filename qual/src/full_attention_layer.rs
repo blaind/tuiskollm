@@ -12,14 +12,21 @@ use tuisko_engine::{
     EngineError, FullAttentionLayerObservables, FullAttentionLayerProgram, MAX_BATCH,
 };
 use tuisko_gpu::{CudaContext, GpuError, device_memory_info};
-use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
+use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES};
 use tuisko_model::{
     Arch, CheckpointError, CheckpointSnapshot, DenseFp8MlpBindings, FullAttentionPostBindings,
     FullAttentionQkvBindings, Qwen38_27B,
 };
 
 const SOURCE_LAYER: usize = 63;
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, MAX_ROWS];
 const TABLE_STRIDE: usize = 3;
+const MACRO_PARTITIONS: usize = 4;
+const PARTIAL_VALUES: usize = Qwen38_27B::HEAD_DIM + 2;
+const MACRO_PARTIAL_FLOATS: usize = PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES / size_of::<f32>();
+const ACTIVE_MACRO_PARTIAL_FLOATS: usize =
+    MAX_ROWS * Qwen38_27B::NUM_ATTENTION_HEADS * MACRO_PARTITIONS * PARTIAL_VALUES;
 const ROTARY_PAIRS: usize = 32;
 const ROTARY_DIM: usize = 64;
 const PHYSICAL_PAGES: usize = MAX_BATCH * TABLE_STRIDE;
@@ -49,7 +56,7 @@ pub enum FullAttentionLayerQualificationError {
 /// Observable counts and worst error from one complete source-backed layer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FullAttentionLayerQualification {
-    /// Residual and normalization values checked at every exact batch.
+    /// Residual and normalization values checked at every exact route.
     pub boundary_values: usize,
     /// Q/K query and appended cache values checked by a mathematical oracle.
     pub qk_values: usize,
@@ -59,10 +66,30 @@ pub struct FullAttentionLayerQualification {
     pub activation_scales: usize,
     /// Real-source projection, attention, and MLP values checked through B=1.
     pub source_values: usize,
+    /// Active P4 macro-partial values proved finite and reproduced by replay.
+    pub macro_partial_values: usize,
+    /// Loaded residual, rotary, page-table, position, and length values checked.
+    pub metadata_values: usize,
     /// Complete mutable owner state reproduced by graph replay.
     pub graph_replay_values: usize,
     /// Inactive workspace and cache values verified unchanged.
     pub inactive_values: usize,
+    /// Immutable tensor-map words checked after every route.
+    pub immutable_descriptor_words: usize,
+    /// Exact source-backed device weight bytes.
+    pub resident_weight_bytes: usize,
+    /// Exact represented KV-cache bytes.
+    pub cache_bytes: usize,
+    /// Exact address-stable non-cache workspace bytes.
+    pub workspace_bytes: usize,
+    /// Exact weights, cache, and workspace bytes without padding.
+    pub owner_bytes: usize,
+    /// Complete arena allocation bytes.
+    pub arena_bytes: usize,
+    /// Alignment bytes not assigned to an owner plane.
+    pub padding_bytes: usize,
+    /// Four address-bound tensor-map descriptor bytes.
+    pub descriptor_bytes: usize,
     /// Largest absolute difference from a represented-value or FP64 oracle.
     pub maximum_absolute_error: f32,
 }
@@ -90,7 +117,7 @@ struct Fixture {
     rope_sin: Vec<f32>,
 }
 
-/// Qualifies source-backed late layer 63 at every exact decode batch.
+/// Qualifies source-backed late layer 63 at every exact decode and prefill route.
 pub fn qualify_full_attention_layer(
     root: &Path,
 ) -> Result<FullAttentionLayerQualification, FullAttentionLayerQualificationError> {
@@ -114,16 +141,19 @@ pub fn qualify_full_attention_layer(
         FullAttentionLayerProgram::from_snapshot(&context, snapshot.clone(), SOURCE_LAYER)?;
     let stable_base = program.base_address();
     let stable_addresses = program.qualification_addresses()?;
-    if stable_addresses.len() != 41 {
+    let stable_descriptors = program.qualification_descriptors(&stream)?;
+    if stable_addresses.len() != 51 {
         return Err(FullAttentionLayerQualificationError::Mismatch(format!(
-            "owner exposes {} addresses, expected 41",
+            "owner exposes {} addresses, expected 51",
             stable_addresses.len()
         )));
     }
     if program.resident_weight_bytes() != 372_395_008
         || program.cache_bytes() != 3_145_728
-        || program.workspace_bytes() != 1_829_184
-        || program.arena_bytes() != 377_371_648
+        || program.workspace_bytes() != 639_924_416
+        || program.owner_bytes() != 1_015_465_152
+        || program.arena_bytes() != 1_015_465_984
+        || program.descriptor_bytes() != 512
     {
         return Err(FullAttentionLayerQualificationError::Mismatch(
             "owner byte accounting differs from the admitted layout".to_string(),
@@ -135,43 +165,62 @@ pub fn qualify_full_attention_layer(
         activation_codes: 0,
         activation_scales: 0,
         source_values: 0,
+        macro_partial_values: 0,
+        metadata_values: 0,
         graph_replay_values: 0,
         inactive_values: 0,
+        immutable_descriptor_words: 0,
+        resident_weight_bytes: program.resident_weight_bytes(),
+        cache_bytes: program.cache_bytes(),
+        workspace_bytes: program.workspace_bytes(),
+        owner_bytes: program.owner_bytes(),
+        arena_bytes: program.arena_bytes(),
+        padding_bytes: program.arena_bytes() - program.owner_bytes(),
+        descriptor_bytes: program.descriptor_bytes(),
         maximum_absolute_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
-        let first_input = make_input(batch, 0);
-        prepare_run(&program, &stream, batch, &first_input, &fixture)?;
-        program.launch_eager(&stream, batch)?;
+    for rows in EXACT_ROUTES {
+        let first_input = make_input(rows, 0);
+        prepare_run(&program, &stream, rows, &first_input, &fixture)?;
+        program.launch_eager(&stream, rows)?;
         let first = program.qualification_observables(&stream)?;
 
-        let input = make_input(batch, 1);
-        prepare_run(&program, &stream, batch, &input, &fixture)?;
-        program.replay(&stream, batch)?;
+        let input = make_input(rows, 1);
+        prepare_run(&program, &stream, rows, &input, &fixture)?;
+        program.replay(&stream, rows)?;
         let replay = program.qualification_observables(&stream)?;
 
-        prepare_run(&program, &stream, batch, &input, &fixture)?;
-        program.launch_eager(&stream, batch)?;
+        prepare_run(&program, &stream, rows, &input, &fixture)?;
+        program.launch_eager(&stream, rows)?;
         let eager = program.qualification_observables(&stream)?;
 
-        verify_boundaries(batch, &input, &sources, &replay, &mut report)?;
-        verify_quantization(batch, &replay, &mut report)?;
-        verify_qk_prepare(batch, &sources, &fixture, &replay, &mut report)?;
-        if batch == 1 {
+        verify_metadata(rows, &input, &fixture, &replay, &mut report)?;
+        verify_boundaries(rows, &input, &sources, &replay, &mut report)?;
+        verify_quantization(rows, &replay, &mut report)?;
+        verify_qk_prepare(rows, &sources, &fixture, &replay, &mut report)?;
+        verify_macro_partials(rows, &replay, &mut report)?;
+        if rows == 1 {
             verify_source_formula(mlp, &sources, &fixture, &replay, &mut report)?;
         }
-        verify_replay(batch, &eager, &replay, &mut report)?;
-        verify_replacement_input(batch, &first, &replay)?;
-        verify_inactive(batch, &fixture, &replay, &mut report)?;
-        verify_inactive(batch, &fixture, &eager, &mut report)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
+        verify_replacement_input(rows, &first, &replay)?;
+        verify_inactive(rows, &fixture, &replay, &mut report)?;
+        verify_inactive(rows, &fixture, &eager, &mut report)?;
         if program.base_address() != stable_base
             || program.qualification_addresses()? != stable_addresses
         {
             return Err(FullAttentionLayerQualificationError::Mismatch(format!(
-                "owner addresses changed while qualifying B={batch}"
+                "owner addresses changed while qualifying rows={rows}"
             )));
         }
+        let descriptors = program.qualification_descriptors(&stream)?;
+        if descriptors != stable_descriptors {
+            return Err(FullAttentionLayerQualificationError::Mismatch(format!(
+                "tensor-map descriptors changed while qualifying rows={rows}"
+            )));
+        }
+        report.immutable_descriptor_words += descriptors.iter().map(Vec::len).sum::<usize>();
     }
 
     verify_no_device_allocation(&program, &stream)?;
@@ -230,12 +279,12 @@ fn fixture() -> Fixture {
     }
 }
 
-fn make_input(batch: usize, salt: usize) -> Vec<u16> {
+fn make_input(rows: usize, salt: usize) -> Vec<u16> {
     const PATTERN: [f32; 16] = [
         0.875, -0.875, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0625, -0.0625, 0.03125, -0.03125,
         0.0, 0.5, -0.25, 0.125,
     ];
-    (0..batch * Qwen38_27B::HIDDEN)
+    (0..rows * Qwen38_27B::HIDDEN)
         .map(|index| f32_to_bf16(PATTERN[(index + salt * 5 + index / Qwen38_27B::HIDDEN) & 15]))
         .collect()
 }
@@ -243,20 +292,106 @@ fn make_input(batch: usize, salt: usize) -> Vec<u16> {
 fn prepare_run(
     program: &FullAttentionLayerProgram,
     stream: &tuisko_gpu::CudaStream,
-    batch: usize,
+    rows: usize,
     input: &[u16],
     fixture: &Fixture,
 ) -> Result<(), FullAttentionLayerQualificationError> {
-    program.load_residual(stream, batch, input)?;
+    program.load_residual(stream, rows, input)?;
     program.load_cache(stream, &fixture.key_pages, &fixture.value_pages)?;
-    program.load_decode_state(
-        stream,
-        batch,
-        &CACHE_POSITIONS[..batch],
-        &fixture.rope_cos[..batch * ROTARY_PAIRS],
-        &fixture.rope_sin[..batch * ROTARY_PAIRS],
-    )?;
+    if rows <= MAX_BATCH {
+        program.load_decode_state(
+            stream,
+            rows,
+            &CACHE_POSITIONS[..rows],
+            &fixture.rope_cos[..rows * ROTARY_PAIRS],
+            &fixture.rope_sin[..rows * ROTARY_PAIRS],
+        )?;
+    } else {
+        let (rope_cos, rope_sin) = prefill_rope(rows);
+        program.load_prefill_state(stream, rows, &rope_cos, &rope_sin)?;
+    }
     program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+    Ok(())
+}
+
+fn prefill_rope(tokens: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut cosine = vec![0.0; tokens * ROTARY_PAIRS];
+    let mut sine = vec![0.0; tokens * ROTARY_PAIRS];
+    for token in 0..tokens {
+        for pair in 0..ROTARY_PAIRS {
+            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / ROTARY_DIM as f64);
+            let angle = token as f64 * frequency;
+            let (sin, cos) = angle.sin_cos();
+            cosine[token * ROTARY_PAIRS + pair] = cos as f32;
+            sine[token * ROTARY_PAIRS + pair] = sin as f32;
+        }
+    }
+    (cosine, sine)
+}
+
+fn route_state(rows: usize, fixture: &Fixture) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+    if rows <= MAX_BATCH {
+        return (
+            CACHE_POSITIONS[..rows].to_vec(),
+            fixture.rope_cos[..rows * ROTARY_PAIRS].to_vec(),
+            fixture.rope_sin[..rows * ROTARY_PAIRS].to_vec(),
+        );
+    }
+    let positions = (0..rows as u32).collect::<Vec<_>>();
+    let (cosine, sine) = prefill_rope(rows);
+
+    (positions, cosine, sine)
+}
+
+fn verify_metadata(
+    rows: usize,
+    input: &[u16],
+    fixture: &Fixture,
+    observed: &FullAttentionLayerObservables,
+    report: &mut FullAttentionLayerQualification,
+) -> Result<(), FullAttentionLayerQualificationError> {
+    compare_exact(
+        "residual input",
+        &observed.residual_input[..input.len()],
+        input,
+    )?;
+    let (positions, cosine, sine) = route_state(rows, fixture);
+    let (observed_cosine, observed_sine, observed_rows, observed_positions, observed_lengths) =
+        if rows <= MAX_BATCH {
+            (
+                &observed.rope_cos,
+                &observed.rope_sin,
+                &observed.table_rows,
+                &observed.cache_positions,
+                &observed.lengths,
+            )
+        } else {
+            (
+                &observed.prefill_rope_cos,
+                &observed.prefill_rope_sin,
+                &observed.prefill_table_rows,
+                &observed.prefill_cache_positions,
+                &observed.prefill_lengths,
+            )
+        };
+    compare_exact("rotary cosine", &observed_cosine[..cosine.len()], &cosine)?;
+    compare_exact("rotary sine", &observed_sine[..sine.len()], &sine)?;
+    compare_exact("cache positions", &observed_positions[..rows], &positions)?;
+    let lengths = positions
+        .iter()
+        .map(|position| position + 1)
+        .collect::<Vec<_>>();
+    compare_exact("causal lengths", &observed_lengths[..rows], &lengths)?;
+    let table_rows = if rows <= MAX_BATCH {
+        (0..rows as u32).collect::<Vec<_>>()
+    } else {
+        vec![0u32; rows]
+    };
+    compare_exact("table rows", &observed_rows[..rows], &table_rows)?;
+    let block_tables = (0..PHYSICAL_PAGES as u32).collect::<Vec<_>>();
+    compare_exact("block tables", &observed.block_tables, &block_tables)?;
+    report.metadata_values += input.len() + 2 * cosine.len() + 3 * rows + block_tables.len();
+
     Ok(())
 }
 
@@ -418,9 +553,12 @@ fn quantize_f32(input: &[f32]) -> Result<TokenOracle, FullAttentionLayerQualific
         .iter()
         .fold(0.0f32, |current, value| current.max(value.abs()));
     let scale = if maximum == 0.0 { 1.0 } else { maximum / 448.0 };
+    // The represented seam publishes `scale` and encodes x*(1/scale). Keeping
+    // those two FP32 roundings avoids algebraic reassociation at E4M3 ties.
+    let inverse_scale = 1.0 / scale;
     let codes = input
         .iter()
-        .map(|&value| encode_e4m3fn(value / scale))
+        .map(|&value| encode_e4m3fn(value * inverse_scale))
         .collect::<Result<Vec<_>, _>>()
         .map_err(FullAttentionLayerQualificationError::Mismatch)?;
     let represented_sum = codes
@@ -439,7 +577,7 @@ fn quantize_f32(input: &[f32]) -> Result<TokenOracle, FullAttentionLayerQualific
 }
 
 fn verify_qk_prepare(
-    batch: usize,
+    rows: usize,
     sources: &SourcePlanes,
     fixture: &Fixture,
     observed: &FullAttentionLayerObservables,
@@ -447,10 +585,11 @@ fn verify_qk_prepare(
 ) -> Result<(), FullAttentionLayerQualificationError> {
     let mut expected_key = fixture.key_pages.clone();
     let mut expected_value = fixture.value_pages.clone();
-    for (token, &cache_position) in CACHE_POSITIONS.iter().enumerate().take(batch) {
+    let (positions, rope_cos, rope_sin) = route_state(rows, fixture);
+    for (token, &cache_position) in positions.iter().enumerate() {
         let qkv_base = token * Qwen38_27B::ATTENTION_QKV_ROWS;
-        let cosine = &fixture.rope_cos[token * ROTARY_PAIRS..(token + 1) * ROTARY_PAIRS];
-        let sine = &fixture.rope_sin[token * ROTARY_PAIRS..(token + 1) * ROTARY_PAIRS];
+        let cosine = &rope_cos[token * ROTARY_PAIRS..(token + 1) * ROTARY_PAIRS];
+        let sine = &rope_sin[token * ROTARY_PAIRS..(token + 1) * ROTARY_PAIRS];
         for head in 0..Qwen38_27B::NUM_ATTENTION_HEADS {
             let source = qkv_base + head * 2 * Qwen38_27B::HEAD_DIM;
             let destination =
@@ -473,7 +612,11 @@ fn verify_qk_prepare(
             )?;
         }
         let position = cache_position as usize;
-        let physical_page = token * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE;
+        let physical_page = if rows <= MAX_BATCH {
+            token * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE
+        } else {
+            position / ATTENTION_PAGE_SIZE
+        };
         let key_source = qkv_base + Qwen38_27B::ATTENTION_QUERY_ROWS;
         let value_source = key_source + Qwen38_27B::ATTENTION_KV_ROWS;
         for head in 0..Qwen38_27B::NUM_KV_HEADS {
@@ -503,7 +646,39 @@ fn verify_qk_prepare(
     compare_exact("key cache", &observed.key_pages, &expected_key)?;
     compare_exact("value cache", &observed.value_pages, &expected_value)?;
     report.qk_values +=
-        batch * (Qwen38_27B::ATTENTION_OUTPUT_COLUMNS + 2 * Qwen38_27B::ATTENTION_KV_ROWS);
+        rows * (Qwen38_27B::ATTENTION_OUTPUT_COLUMNS + 2 * Qwen38_27B::ATTENTION_KV_ROWS);
+    Ok(())
+}
+
+fn verify_macro_partials(
+    rows: usize,
+    observed: &FullAttentionLayerObservables,
+    report: &mut FullAttentionLayerQualification,
+) -> Result<(), FullAttentionLayerQualificationError> {
+    let active = if rows == MAX_ROWS {
+        ACTIVE_MACRO_PARTIAL_FLOATS
+    } else {
+        0
+    };
+    if let Some(index) = observed.macro_partials[..active]
+        .iter()
+        .position(|value| !value.is_finite() || value.to_bits() == F32_SENTINEL_BITS)
+    {
+        return Err(FullAttentionLayerQualificationError::Mismatch(format!(
+            "T=1024 macro partial {index} was not produced as a finite value"
+        )));
+    }
+    if let Some(relative) = observed.macro_partials[active..]
+        .iter()
+        .position(|value| value.to_bits() != F32_SENTINEL_BITS)
+    {
+        return Err(FullAttentionLayerQualificationError::Mismatch(format!(
+            "rows={rows} modified inactive macro partial {relative}"
+        )));
+    }
+    report.macro_partial_values += active;
+    report.inactive_values += MACRO_PARTIAL_FLOATS - active;
+
     Ok(())
 }
 
@@ -680,7 +855,7 @@ fn fp8_dot(
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     eager: &FullAttentionLayerObservables,
     replay: &FullAttentionLayerObservables,
     report: &mut FullAttentionLayerQualification,
@@ -694,20 +869,33 @@ fn verify_replay(
                 .position(|(actual, expected)| actual != expected)
             {
                 return Err(FullAttentionLayerQualificationError::Mismatch(format!(
-                    "B={batch} graph plane `{}` differs at value {index}",
+                    "rows={rows} graph plane `{}` differs at value {index}",
                     stringify!($field)
                 )));
             }
         };
     }
+    same!(residual_input);
     same!(mixer_normalized);
     same!(qkv_activation_codes);
     same!(qkv_activation_scales);
     same!(qkv);
+    same!(rope_cos);
+    same!(rope_sin);
+    same!(block_tables);
+    same!(table_rows);
+    same!(cache_positions);
+    same!(lengths);
+    same!(prefill_rope_cos);
+    same!(prefill_rope_sin);
+    same!(prefill_table_rows);
+    same!(prefill_cache_positions);
+    same!(prefill_lengths);
     same!(query);
     same!(key_pages);
     same!(value_pages);
     same!(attention);
+    same!(macro_partials);
     same!(output_activation_codes);
     same!(output_activation_scales);
     same!(mixer_branch);
@@ -726,44 +914,48 @@ fn verify_replay(
 }
 
 fn observable_values() -> usize {
-    MAX_BATCH
-        * (9 * Qwen38_27B::HIDDEN
+    MAX_ROWS
+        * (10 * Qwen38_27B::HIDDEN
             + Qwen38_27B::ATTENTION_QKV_ROWS
             + 3 * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS
             + 2 * Qwen38_27B::INTERMEDIATE
-            + 4)
+            + 2 * ROTARY_PAIRS
+            + 7)
         + 2 * PHYSICAL_PAGES * Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM
+        + PHYSICAL_PAGES
+        + MACRO_PARTIAL_FLOATS
+        + MAX_BATCH * (2 * ROTARY_PAIRS + 3)
 }
 
 fn verify_replacement_input(
-    batch: usize,
+    rows: usize,
     first: &FullAttentionLayerObservables,
     replay: &FullAttentionLayerObservables,
 ) -> Result<(), FullAttentionLayerQualificationError> {
-    let active = batch * Qwen38_27B::HIDDEN;
+    let active = rows * Qwen38_27B::HIDDEN;
     if first.residual_output[..active] == replay.residual_output[..active] {
         return Err(FullAttentionLayerQualificationError::Mismatch(format!(
-            "B={batch} graph ignored replacement input"
+            "rows={rows} graph ignored replacement input"
         )));
     }
     Ok(())
 }
 
 fn verify_inactive(
-    batch: usize,
+    rows: usize,
     fixture: &Fixture,
     observed: &FullAttentionLayerObservables,
     report: &mut FullAttentionLayerQualification,
 ) -> Result<(), FullAttentionLayerQualificationError> {
     macro_rules! sentinel_u16 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|&value| value != BF16_SENTINEL)
             {
                 return Err(FullAttentionLayerQualificationError::Mismatch(format!(
-                    "B={batch} modified inactive `{}` value",
+                    "rows={rows} modified inactive `{}` value",
                     stringify!($field)
                 )));
             }
@@ -772,13 +964,13 @@ fn verify_inactive(
     }
     macro_rules! sentinel_u8 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|&value| value != BYTE_SENTINEL)
             {
                 return Err(FullAttentionLayerQualificationError::Mismatch(format!(
-                    "B={batch} modified inactive `{}` value",
+                    "rows={rows} modified inactive `{}` value",
                     stringify!($field)
                 )));
             }
@@ -787,13 +979,13 @@ fn verify_inactive(
     }
     macro_rules! sentinel_f32 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|value| value.to_bits() != F32_SENTINEL_BITS)
             {
                 return Err(FullAttentionLayerQualificationError::Mismatch(format!(
-                    "B={batch} modified inactive `{}` value",
+                    "rows={rows} modified inactive `{}` value",
                     stringify!($field)
                 )));
             }
@@ -824,7 +1016,11 @@ fn verify_inactive(
     inactive += sentinel_u16!(residual_output, Qwen38_27B::HIDDEN);
     inactive += sentinel_u16!(next_normalized, Qwen38_27B::HIDDEN);
 
-    let first_inactive_page = batch * TABLE_STRIDE;
+    let first_inactive_page = if rows <= MAX_BATCH {
+        rows * TABLE_STRIDE
+    } else {
+        rows.div_ceil(ATTENTION_PAGE_SIZE)
+    };
     let first_inactive_cache =
         first_inactive_page * Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM;
     if observed.key_pages[first_inactive_cache..] != fixture.key_pages[first_inactive_cache..]
@@ -832,7 +1028,7 @@ fn verify_inactive(
             != fixture.value_pages[first_inactive_cache..]
     {
         return Err(FullAttentionLayerQualificationError::Mismatch(format!(
-            "B={batch} modified an inactive slot cache page"
+            "rows={rows} modified an inactive cache page"
         )));
     }
     inactive += 2 * (observed.key_pages.len() - first_inactive_cache);
@@ -950,12 +1146,12 @@ fn verify_no_device_allocation(
     program: &FullAttentionLayerProgram,
     stream: &tuisko_gpu::CudaStream,
 ) -> Result<(), FullAttentionLayerQualificationError> {
-    program.replay(stream, MAX_BATCH)?;
+    program.replay(stream, MAX_ROWS)?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
     for _ in 0..2 {
-        for batch in [1, 8, 3, 6, 2, 7, 4, 5] {
-            program.replay(stream, batch)?;
+        for rows in [1, 32, 8, 64, 3, 128, 6, MAX_ROWS, 2, 7, 4, 5] {
+            program.replay(stream, rows)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -983,13 +1179,21 @@ fn little_endian_words(bytes: &[u8]) -> Result<Vec<u16>, FullAttentionLayerQuali
 
 #[cfg(test)]
 mod tests {
-    use super::{SOURCE_LAYER, observable_values, qualify_full_attention_layer};
+    use super::{
+        EXACT_ROUTES, MAX_ROWS, SOURCE_LAYER, observable_values, qualify_full_attention_layer,
+    };
     use std::path::PathBuf;
     use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
+    fn full_attention_layer_suite_route_inventory_is_exact() {
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
+        assert_eq!(MAX_ROWS, 1_024);
+    }
+
+    #[test]
     #[ignore = "requires the pinned snapshot and an exclusive SM120 device"]
-    fn source_layer63_matches_complete_seam_oracles_and_graph_replay()
+    fn full_attention_layer_suite_source_layer63_matches_complete_seam_oracles_and_graph_replay()
     -> Result<(), super::FullAttentionLayerQualificationError> {
         let root = std::env::var_os("TUISKO_SNAPSHOT").ok_or_else(|| {
             super::FullAttentionLayerQualificationError::Mismatch(
@@ -997,7 +1201,7 @@ mod tests {
             )
         })?;
         let report = qualify_full_attention_layer(&PathBuf::from(root))?;
-        let active = (1..=8).sum::<usize>();
+        let active = EXACT_ROUTES.into_iter().sum::<usize>();
         assert_eq!(SOURCE_LAYER, 63);
         assert_eq!(report.boundary_values, active * 5 * Qwen38_27B::HIDDEN);
         assert_eq!(
@@ -1019,7 +1223,18 @@ mod tests {
                 + 2 * Qwen38_27B::HIDDEN
                 + Qwen38_27B::INTERMEDIATE
         );
-        assert_eq!(report.graph_replay_values, 8 * observable_values());
+        assert_eq!(report.macro_partial_values, 25_362_432);
+        assert_eq!(report.metadata_values, 6_660_396);
+        assert_eq!(report.graph_replay_values, 12 * observable_values());
+        assert!(report.inactive_values > 0);
+        assert_eq!(report.immutable_descriptor_words, 768);
+        assert_eq!(report.resident_weight_bytes, 372_395_008);
+        assert_eq!(report.cache_bytes, 3_145_728);
+        assert_eq!(report.workspace_bytes, 639_924_416);
+        assert_eq!(report.owner_bytes, 1_015_465_152);
+        assert_eq!(report.arena_bytes, 1_015_465_984);
+        assert_eq!(report.padding_bytes, 832);
+        assert_eq!(report.descriptor_bytes, 512);
         assert!(report.maximum_absolute_error.is_finite());
         Ok(())
     }

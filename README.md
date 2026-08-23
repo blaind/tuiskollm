@@ -75,8 +75,9 @@ head, and one partition; dynamically represented E4M3 Q and source E4M3 K feed Q
 while represented F16 probabilities and V feed PV Tensor Cores. P8 uses 64-position tiles through
 32,768 positions, P16 uses 32-position tiles through 220,000, and both publish complete FP32
 softmax states to the existing reducer. The `T=1024` macro leaf reuses the two-CTA K32 producer
-through exact `P=1,2,4,8,16` routes and has a separately specialized reducer for each; the future
-resident schedule will select P4. Gated attention output admits exact `T=32,64,128,1024` routes:
+through exact `P=1,2,4,8,16` routes and has a separately specialized reducer for each; the
+source-backed full-attention owner selects P4. Gated attention output admits exact
+`T=32,64,128,1024` routes:
 one CTA per token publishes the sigmoid-gated FP32 seam and its dynamic E4M3 representation, then
 32x32 or 64x32 native E4M3 MMA tiles project through the source-native output matrix. Dense-FP8
 gate/up SwiGLU also admits exact `T=1024`: a 128x64x64 three-stage TMA route retains the represented
@@ -85,8 +86,11 @@ down projection admits exact `T=32,64,128` K=128 MMA tails plus a separate `T=10
 three-stage TMA route over its source-native `[5120,17408]` weight plane with the same explicit
 descriptor ownership. The source-backed dense-FP8 MLP owner composes residual norms, gate/up,
 SwiGLU, down projection, and residual publication into directly qualified graphs at every
-`B=1..8` and `T=32,64,128,1024`. Full attention/GDN-layer prefill composition and server routing
-remain separate slices, so these routes do not yet change server prompt priming.
+`B=1..8` and `T=32,64,128,1024`. The source-backed full-attention owner composes that MLP with
+input norm, QKV, Q/K preparation and cache append, paged GQA, gated output projection, and both
+residual seams at the same exact widths. Its prefill graphs own separate from-empty causal metadata,
+the shared 24-page cache row, P4 macro partials, and stable MLP tensor maps. GDN-layer prefill and
+resident/server routing remain separate slices, so these routes do not yet change server priming.
 
 ## Current device slice
 

@@ -13,12 +13,14 @@ use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, GpuError, GpuTimer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
 const SOURCE_LAYER: usize = 63;
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, MAX_ROWS];
 const CACHE_POSITION: u32 = 130;
 const CONTEXT_TOKENS: usize = CACHE_POSITION as usize + 1;
 const ROTARY_PAIRS: usize = 32;
 
 struct RouteGraph {
-    batch: usize,
+    rows: usize,
     repeated: CudaGraph,
 }
 
@@ -43,7 +45,7 @@ impl Session {
         }
         let stream = context.new_stream().map_err(GpuError::from)?;
         let program = FullAttentionLayerProgram::from_snapshot(&context, snapshot, SOURCE_LAYER)?;
-        program.load_residual(&stream, MAX_BATCH, &benchmark_input())?;
+        program.load_residual(&stream, MAX_ROWS, &benchmark_input())?;
         program.reset_cache(&stream)?;
         let (rope_cos, rope_sin) = benchmark_rope();
         program.load_decode_state(
@@ -53,15 +55,18 @@ impl Session {
             &rope_cos,
             &rope_sin,
         )?;
+        let (prefill_cos, prefill_sin) = prefill_rope(MAX_ROWS);
+        program.load_prefill_state(&stream, MAX_ROWS, &prefill_cos, &prefill_sin)?;
         // Position 130 crosses both 64-token page seams, so direct timing
         // exercises the initial owner's full three-page route without padding it.
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| {
+        let routes = EXACT_ROUTES
+            .into_iter()
+            .map(|rows| {
                 Ok(RouteGraph {
-                    batch,
+                    rows,
                     repeated: program.qualification_repeated_graph(
                         &stream,
-                        batch,
+                        rows,
                         repeated_operations,
                     )?,
                 })
@@ -79,9 +84,9 @@ impl Session {
 
     fn warm(&self, launches: u64) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
-            for batch in 1..=MAX_BATCH {
+            for rows in EXACT_ROUTES {
                 self.program
-                    .qualification_graph(batch)?
+                    .qualification_graph(rows)?
                     .launch(&self.stream)?;
             }
         }
@@ -96,19 +101,26 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_attention_layer_decode(
+                            route.rows as u32,
+                            CONTEXT_TOKENS as u64,
+                        ),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_attention_layer_prefill(route.rows as u64),
+                    )
+                };
                 Ok(ExactDeviceCase::new(
                     "full_attention_layer/layer63",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_attention_layer_decode(
-                        route.batch as u32,
-                        CONTEXT_TOKENS as u64,
-                    ),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
-                    self.program.qualification_graph(route.batch)?,
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
+                    self.program.qualification_graph(route.rows)?,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 ))
             })
@@ -118,7 +130,7 @@ impl Session {
 
 fn benchmark_input() -> Vec<u16> {
     const PATTERN: [f32; 8] = [0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625];
-    (0..MAX_BATCH * Qwen38_27B::HIDDEN)
+    (0..MAX_ROWS * Qwen38_27B::HIDDEN)
         .map(|index| f32_to_bf16(PATTERN[(index + index / Qwen38_27B::HIDDEN) & 7]))
         .collect()
 }
@@ -138,23 +150,46 @@ fn benchmark_rope() -> (Vec<f32>, Vec<f32>) {
     (cosine, sine)
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn prefill_rope(tokens: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut cosine = vec![0.0; tokens * ROTARY_PAIRS];
+    let mut sine = vec![0.0; tokens * ROTARY_PAIRS];
+    for token in 0..tokens {
+        for pair in 0..ROTARY_PAIRS {
+            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
+            let angle = token as f64 * frequency;
+            let (sin, cos) = angle.sin_cos();
+            cosine[token * ROTARY_PAIRS + pair] = cos as f32;
+            sine[token * ROTARY_PAIRS + pair] = sin as f32;
+        }
+    }
+    (cosine, sine)
+}
+
+fn logical_bytes(rows: usize) -> usize {
     let hidden = Qwen38_27B::HIDDEN;
     let qkv = Qwen38_27B::ATTENTION_QKV_ROWS;
     let attention = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
     let intermediate = Qwen38_27B::INTERMEDIATE;
     let weights = 372_395_008;
-    // The three paged-GQA routes reread one represented key and value byte
-    // per context element and query head. Other terms count every published
+    // Paged GQA rereads one represented key and value byte per causal context
+    // element and query head. Other terms count every published
     // production seam once at its represented element width.
-    let cache_reads = 2 * CONTEXT_TOKENS * attention;
-    let per_token = cache_reads
-        + 18 * hidden
-        + 5 * qkv
-        + 18 * attention
-        + 6 * intermediate
-        + 4 * size_of::<f32>();
-    weights + batch * per_token
+    let cache_reads = if rows <= MAX_BATCH {
+        2 * rows * CONTEXT_TOKENS * attention
+    } else {
+        2 * attention * (rows * (rows + 1) / 2)
+    };
+    let macro_partial_traffic = if rows == MAX_ROWS {
+        let active_partials =
+            rows * Qwen38_27B::NUM_ATTENTION_HEADS * 4 * (Qwen38_27B::HEAD_DIM + 2);
+        2 * active_partials * size_of::<f32>()
+    } else {
+        0
+    };
+    let route_bytes = cache_reads
+        + rows * (18 * hidden + 5 * qkv + 18 * attention + 6 * intermediate + 4 * size_of::<f32>())
+        + macro_partial_traffic;
+    weights + route_bytes
 }
 
 /// Measures every exact graph of one source-backed full-attention layer owner.
@@ -183,7 +218,13 @@ pub fn benchmark_full_attention_layer(
         "full_attention_layer/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.program.workspace_bytes(),
-        "max_batch=8 including metadata and every published seam",
+        "max_rows=1024 including maximum macro partials; production graph uses P4",
+    )?;
+    memory.register_owned(
+        "full_attention_layer/address_bound_tensor_maps",
+        BenchmarkMemoryKind::Other,
+        session.program.descriptor_bytes(),
+        "four 128-byte dense-FP8 MLP tensor maps",
     )?;
     memory.register_owned(
         "full_attention_layer/alignment_padding",
@@ -206,7 +247,7 @@ pub fn benchmark_full_attention_layer(
         BenchmarkReportSpec {
             suite: "bench-full-attention-layer",
             classification: "performance_sensitive_layer",
-            timing_scope: "paired Rust submission/completion, repeated production graph, and repeated-operation graph",
+            timing_scope: "paired Rust production-graph submission/completion and repeated full-attention-layer route",
         },
         preflight,
         baseline_sha256,
@@ -225,15 +266,21 @@ fn f32_to_bf16(value: f32) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTEXT_TOKENS, MAX_BATCH, logical_bytes};
+    use super::{CONTEXT_TOKENS, EXACT_ROUTES, MAX_BATCH, MAX_ROWS, logical_bytes};
 
     #[test]
-    fn byte_accounting_scales_only_per_token_traffic() {
+    fn full_attention_layer_suite_byte_accounting_covers_decode_and_causal_prefill() {
         let one = logical_bytes(1);
         let per_token = logical_bytes(2) - one;
         assert_eq!(CONTEXT_TOKENS, 131);
         assert_eq!(per_token, 1_988_624);
         assert_eq!(one, 374_383_632);
         assert_eq!(logical_bytes(MAX_BATCH), one + (MAX_BATCH - 1) * per_token);
+        assert!(logical_bytes(MAX_ROWS) > logical_bytes(128));
+    }
+
+    #[test]
+    fn full_attention_layer_suite_benchmark_route_inventory_is_exact() {
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
     }
 }
