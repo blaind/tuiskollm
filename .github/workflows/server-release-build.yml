@@ -1,0 +1,116 @@
+name: Server release build
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-release-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CUDA_HOME: /usr/local/cuda-13.3
+  CUDA_TOOLKIT_PATH: /usr/local/cuda-13.3
+  CUDA_OXIDE_LLC: /usr/bin/llc-21
+  LIBCLANG_PATH: /usr/lib/llvm-21/lib
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install CUDA 13.3.1 and LLVM 21
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg
+
+          cuda_keyring="${RUNNER_TEMP}/cuda-keyring_1.1-1_all.deb"
+          curl -fsSL \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
+            -o "${cuda_keyring}"
+          echo "d93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47898ff8df  ${cuda_keyring}" \
+            | sha256sum --check --strict
+          sudo dpkg -i "${cuda_keyring}"
+
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/apt.llvm.org.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/apt.llvm.org.gpg] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-21.list >/dev/null
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            clang-21 \
+            cuda-compiler-13-3=13.3.1-1 \
+            libclang-21-dev \
+            libnvjitlink-dev-13-3=13.3.33-1 \
+            llvm-21
+          echo "${CUDA_HOME}/bin" >> "${GITHUB_PATH}"
+
+      - name: Verify build toolchain
+        run: |
+          set -euo pipefail
+          ptxas --version | tee "${RUNNER_TEMP}/ptxas-version.txt"
+          grep -F "release 13.3, V13.3.73" "${RUNNER_TEMP}/ptxas-version.txt"
+          clang-21 --version | head -1
+          test -f "${CUDA_HOME}/include/cuda.h"
+          test -f "${CUDA_HOME}/lib64/stubs/libcuda.so"
+          test -f "${CUDA_HOME}/nvvm/lib64/libnvvm.so"
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install nightly-2026-04-03 --profile minimal
+          --component clippy,llvm-tools,rust-src,rustc-dev,rustfmt
+
+      - name: Build server and enforce device resources
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          cargo run -p xtask -- bootstrap-cuda-oxide
+          cargo run -p xtask -- build-server
+
+      - id: package
+        name: Package server
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/package_server_release.py version)"
+          epoch="$(git show -s --format=%ct HEAD)"
+          python3 scripts/package_server_release.py package \
+            --binary target/cuda-oxide-build-sm120/release/tuiskollm \
+            --out dist \
+            --expected "${version}" \
+            --source-date-epoch "${epoch}" \
+            --git-commit "${GITHUB_SHA}" \
+            --cuda-oxide-commit 1f4d813719012d384f2db12b88efc9314c8bf50c \
+            --build-host github-actions-ubuntu-22.04-x86_64 \
+            --cuda-stub "${CUDA_HOME}/lib64/stubs/libcuda.so"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest server distribution
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+      - name: Upload server distribution
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: server-distribution
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
