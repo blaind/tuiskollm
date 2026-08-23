@@ -72,8 +72,10 @@ deep `T=128` tails use FP8/F16 flash attention: one 256-thread CTA owns 32 query
 head, and one partition; dynamically represented E4M3 Q and source E4M3 K feed QK Tensor Cores,
 while represented F16 probabilities and V feed PV Tensor Cores. P8 uses 64-position tiles through
 32,768 positions, P16 uses 32-position tiles through 220,000, and both publish complete FP32
-softmax states to the existing reducer. Macro `T=1024` and attention-output prefill remain separate
-future slices, so these leaves do not yet change server prompt priming.
+softmax states to the existing reducer. The `T=1024` macro leaf reuses the two-CTA K32 producer
+through exact `P=1,2,4,8,16` routes and has a separately specialized reducer for each; the future
+resident schedule will select P4. Attention-output prefill and full-layer/server routing remain
+separate slices, so these leaves do not yet change server prompt priming.
 
 ## Current device slice
 

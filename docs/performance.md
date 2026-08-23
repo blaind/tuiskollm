@@ -21,18 +21,12 @@ prefill tails use 256-thread FP8/F16 flash CTAs over 32 query rows and one query
 64-position tiles for contexts 129 through 32,768; P16 uses 32-position tiles through 220,000 so
 its 43,520-byte single buffer preserves two-CTA residency. Both publish complete FP32
 maximum/denominator/numerator states and reduce them into the public output seam. Long-context
-paged GQA retains
-the same represented cache contract and partitions contexts through 220,000 positions into
-256-position partial softmaxes plus one exact reduction at `B=1..8`; macro-prefill attention
-remains a separate future route. The resident text owner composes all 48 GDN layers, 16 attention
-layers, source-routed MLPs, and the LM head into one directly timed graph at every exact `B=1..8`;
-serving cases remain future work.
-
-A controlled three-sample diagnostic at fixed 2,197 MHz SM and 13,801 MHz memory clocks measured
-the flash graph at 1,435.908 microseconds for `T=128/P=8/context=32768` and 2,895.660 microseconds
-for `T=128/P=16/context=98304`. The directly comparable scalar graph measured 9,215.848 and
-26,462.204 microseconds, respectively. These reports remain ignored artifacts under `target/`;
-they are candidate evidence, not a blessed timing baseline.
+`T=1024` macro prefill uses the two-CTA K32 flash producer at exact `P=1,2,4,8,16`, with one
+compile-time reducer per partition count; the intended resident route is P4. Long-context paged
+GQA retains the same represented cache contract and partitions contexts through 220,000 positions
+into 256-position partial softmaxes plus one exact reduction at `B=1..8`. The resident text owner
+composes all 48 GDN layers, 16 attention layers, source-routed MLPs, and the LM head into one
+directly timed graph at every exact `B=1..8`; serving cases remain future work.
 
 SM89 has separate remote-only diagnostic suites for the exact `[34816,5120]` NVFP4 gate/up,
 `[5120,17408]` down, and dynamic-quantize FP8 `[14336,5120]` QKV owners at `B=1..8`. The NVFP4
@@ -183,7 +177,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-gdn-recurrence` | Measure every exact stateful recurrence graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-output` | Measure every exact output quantize-plus-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-qk-prepare` | Measure every exact Q/K prepare and cache-append graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-paged-gqa` | Measure exact B=1..8 graphs at a 130-token context, causal shared T=32/64/128 graphs, and partitioned T=128 graphs at contexts 32,768 and 98,304 | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-paged-gqa` | Measure exact B=1..8 graphs at a 130-token context, causal shared T=32/64/128 graphs, partitioned T=128 tails, and production-P4 T=1024 macro graphs at contexts 32,768 and 98,304 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-paged-gqa` | Measure every exact Qwen3.5 B=1..8 BF16 paged-GQA graph at a 130-token context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-long-context-paged-gqa` | Measure every exact two-stage paged GQA graph with the complete 3,438-page pool divided among active slots | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-output` | Measure every exact sigmoid-gate, quantize, and output-projection graph | terminal or `--json PATH` |
@@ -471,7 +465,8 @@ bytes charge each K/V tile once per adjacent-token/KV-head group rather than dup
 query-head consumers. The partitioned `T=128` P8/P16 cases are also `operator/prefill`; accounting
 includes one query read per active partition, one K/V load per 32-row/query-head group, exact
 length/table/page metadata reads, and both the producer writes and reducer reads of every complete
-FP32 partial state.
+FP32 partial state. Macro `T=1024/P=4` cases use the same accounting at contexts 32,768 and 98,304;
+their resident maximum workspace still covers every qualified `P=1,2,4,8,16` route.
 Dense-FP8-SwiGLU `T=32,64,128` cases are `operator/prefill` cases with prompt and context lengths
 equal to the active rows. Concurrency, output, and prefix cache do not apply to these leaf suites.
 
