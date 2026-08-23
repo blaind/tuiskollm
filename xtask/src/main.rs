@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 const RESIDUAL_NORM_RESOURCE_BASELINE: &str = "qual/baselines/residual-norm-sm120.txt";
 const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-residual-norm-sm120.txt";
+const QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt";
 const FP8_QKV_RESOURCE_BASELINE: &str = "qual/baselines/fp8-qkv-sm120.txt";
 const FP8_GDN_INPUT_RESOURCE_BASELINE: &str = "qual/baselines/fp8-gdn-input-sm120.txt";
 const FP8_LM_HEAD_RESOURCE_BASELINE: &str = "qual/baselines/fp8-lm-head-sm120.txt";
@@ -440,6 +441,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-startup") => bench_startup(root, &remaining),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
         Some("bench-qwen35-residual-norm") => bench_qwen35_residual_norm(root, &remaining),
+        Some("bench-qwen35-nvfp4-swiglu") => bench_qwen35_nvfp4_swiglu(root, &remaining),
         Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
         Some("bench-fp8-gdn-input") => bench_fp8_gdn_input(root, &remaining),
         Some("bench-fp8-lm-head") => bench_fp8_lm_head(root, &remaining),
@@ -873,7 +875,7 @@ fn qualify_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "qwen35_nvfp4_swiglu::tests::exact_batches_and_candidates_match_independent_oracles_and_graph_replay",
+            "qwen35_nvfp4_swiglu",
             "--include-ignored",
             "--nocapture",
         ],
@@ -1553,6 +1555,32 @@ fn bench_qwen35_residual_norm(
                 sha256(&fs::read(
                     root.join(QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE),
                 )?),
+            ),
+    )
+}
+
+fn bench_qwen35_nvfp4_swiglu(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen35-nvfp4-swiglu")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(root.join(QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE))?),
             ),
     )
 }
@@ -4078,6 +4106,10 @@ fn gate_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn gate_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
     let ptx_path = root.join(PTX);
     let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
         format!(
@@ -4189,6 +4221,8 @@ fn gate_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
     }
     a16_registers.sort_unstable();
     a16_shared.sort_unstable();
+    require_registers(&baseline, "a16_registers", &a16_registers)?;
+    require_registers(&baseline, "a16_shared_bytes", &a16_shared)?;
 
     let mut quantize_registers = Vec::new();
     let mut quantize_shared = Vec::new();
@@ -4205,6 +4239,8 @@ fn gate_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
     }
     quantize_registers.sort_unstable();
     quantize_shared.sort_unstable();
+    require_registers(&baseline, "quantize_registers", &quantize_registers)?;
+    require_uniform_value(&baseline, "quantize_shared_bytes", &quantize_shared)?;
 
     let mut w4a4_registers = Vec::new();
     let mut w4a4_shared = Vec::new();
@@ -4230,6 +4266,8 @@ fn gate_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
     }
     w4a4_registers.sort_unstable();
     w4a4_shared.sort_unstable();
+    require_registers(&baseline, "w4a4_registers", &w4a4_registers)?;
+    require_uniform_value(&baseline, "w4a4_shared_bytes", &w4a4_shared)?;
 
     println!(
         "Qwen3.5 NVFP4 SwiGLU gate passed: 4 A16 + 8 quantize + 8 W4A4 entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}",
