@@ -976,6 +976,137 @@ fn modelopt_nvfp4_next_norm_name<A: Arch>(layer: usize) -> CheckpointResult<Stri
     })
 }
 
+/// Complete ModelOpt NVFP4 source planes for one Qwen3.5 GDN mixer layer.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelOptNvfp4GdnBindings<'a> {
+    /// Fused query, key, and value projection.
+    pub qkv: ModelOptNvfp4LinearBindings<'a>,
+    /// Z gate projection.
+    pub z: ModelOptNvfp4LinearBindings<'a>,
+    /// Per-value-head A-control projection.
+    pub a_control: ModelOptNvfp4LinearBindings<'a>,
+    /// Per-value-head B-control projection.
+    pub b_control: ModelOptNvfp4LinearBindings<'a>,
+    /// Recurrent-state output projection.
+    pub output: ModelOptNvfp4LinearBindings<'a>,
+    /// Width-four causal-convolution weights `[gdn_qkv_rows, 1, kernel]`.
+    pub convolution_weight: Bf16View<'a, 3>,
+    /// Log-space recurrence decay parameters `[gdn_control_rows]`.
+    pub a_log: Bf16View<'a, 1>,
+    /// Recurrence time-step bias `[gdn_control_rows]`.
+    pub dt_bias: Bf16View<'a, 1>,
+    /// Per-head gated RMSNorm weights `[linear_head_dim]`.
+    pub norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the mixer `[hidden]`.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the MLP `[hidden]`.
+    pub post_attention_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning these sources.
+    pub layer: usize,
+}
+
+impl<'a> ModelOptNvfp4GdnBindings<'a> {
+    /// Binds one exact Qwen3.5 ModelOpt NVFP4 GDN source family.
+    pub fn bind<A: Arch>(
+        snapshot: &'a CheckpointSnapshot<A>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from::<A>(layer, |name| snapshot.tensor(name))
+    }
+
+    fn bind_from<A: Arch>(
+        layer: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        require_modelopt_contract::<A>("GDN")?;
+        require_gdn_layer::<A>(layer)?;
+
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let prefix = format!("{layer_prefix}.linear_attn");
+        let qkv = ModelOptNvfp4LinearBindings::bind_from(
+            &format!("{prefix}.in_proj_qkv"),
+            A::GDN_QKV_ROWS,
+            A::HIDDEN,
+            layer,
+            |name| tensor(name),
+        )?;
+        let z = ModelOptNvfp4LinearBindings::bind_from(
+            &format!("{prefix}.in_proj_z"),
+            A::GDN_VALUE_ROWS,
+            A::HIDDEN,
+            layer,
+            |name| tensor(name),
+        )?;
+        let a_control = ModelOptNvfp4LinearBindings::bind_from(
+            &format!("{prefix}.in_proj_a"),
+            A::GDN_CONTROL_ROWS,
+            A::HIDDEN,
+            layer,
+            |name| tensor(name),
+        )?;
+        let b_control = ModelOptNvfp4LinearBindings::bind_from(
+            &format!("{prefix}.in_proj_b"),
+            A::GDN_CONTROL_ROWS,
+            A::HIDDEN,
+            layer,
+            |name| tensor(name),
+        )?;
+        let output = ModelOptNvfp4LinearBindings::bind_from(
+            &format!("{prefix}.out_proj"),
+            A::HIDDEN,
+            A::GDN_VALUE_ROWS,
+            layer,
+            |name| tensor(name),
+        )?;
+
+        for (role, scale) in [
+            ("Z", &z.input_scale),
+            ("A-control", &a_control.input_scale),
+            ("B-control", &b_control.input_scale),
+        ] {
+            require_same_rank_zero_f32(
+                layer,
+                &format!("QKV/{role} input_scale"),
+                &qkv.input_scale,
+                scale,
+            )?;
+        }
+
+        Ok(Self {
+            qkv,
+            z,
+            a_control,
+            b_control,
+            output,
+            convolution_weight: Bf16View::bind(
+                tensor(&format!("{prefix}.conv1d.weight"))?,
+                [A::GDN_QKV_ROWS as u64, 1, A::LINEAR_CONV_KERNEL_DIM as u64],
+            )?,
+            a_log: Bf16View::bind(
+                tensor(&format!("{prefix}.A_log"))?,
+                [A::GDN_CONTROL_ROWS as u64],
+            )?,
+            dt_bias: Bf16View::bind(
+                tensor(&format!("{prefix}.dt_bias"))?,
+                [A::GDN_CONTROL_ROWS as u64],
+            )?,
+            norm: Bf16View::bind(
+                tensor(&format!("{prefix}.norm.weight"))?,
+                [A::LINEAR_HEAD_DIM as u64],
+            )?,
+            input_norm: Bf16View::bind(
+                tensor(&format!("{layer_prefix}.input_layernorm.weight"))?,
+                [A::HIDDEN as u64],
+            )?,
+            post_attention_norm: Bf16View::bind(
+                tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+                [A::HIDDEN as u64],
+            )?,
+            layer,
+        })
+    }
+}
+
 /// Exact packed gate/up source planes for one NVFP4 MLP layer.
 #[derive(Clone, Copy, Debug)]
 pub struct Nvfp4GateUpBindings<'a> {
@@ -1249,9 +1380,21 @@ pub(crate) fn require_nvfp4_mlp_layer(layer: usize, layer_count: usize) -> Check
 }
 
 fn require_modelopt_nvfp4_mlp_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
-    if A::CHECKPOINT_CONTRACT != CheckpointContract::ModelOptNvfp4 || layer >= A::LAYERS {
+    require_modelopt_contract::<A>("MLP")?;
+
+    if layer >= A::LAYERS {
         return Err(CheckpointError::source_binding(format!(
             "layer {layer} does not use the admitted ModelOpt NVFP4 MLP source contract"
+        )));
+    }
+
+    Ok(())
+}
+
+fn require_modelopt_contract<A: Arch>(role: &str) -> CheckpointResult<()> {
+    if A::CHECKPOINT_CONTRACT != CheckpointContract::ModelOptNvfp4 {
+        return Err(CheckpointError::source_binding(format!(
+            "{role} does not use the admitted ModelOpt NVFP4 source contract"
         )));
     }
 
@@ -1426,12 +1569,13 @@ fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> Checkpo
 #[cfg(test)]
 mod tests {
     use super::{
-        DenseFp8DownBindings, DenseFp8GateUpBindings, DenseFp8MlpBindings,
-        FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings, ModelOptNvfp4MlpBindings,
-        MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings,
-        TextEndpointBindings, VisionBindings, dense_fp8_next_norm_name, positive_bf16,
-        require_adjacent, require_dense_fp8_mlp_layer, require_full_attention_layer,
-        require_gdn_layer, require_mtp_contract, require_nvfp4_mlp_layer, validate_nvfp4_scales,
+        DenseFp8DownBindings, DenseFp8GateUpBindings, DenseFp8MlpBindings, E2M1_VALUES_PER_BYTE,
+        FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings, ModelOptNvfp4GdnBindings,
+        ModelOptNvfp4MlpBindings, MtpBindings, NVFP4_GROUP_SIZE, Nvfp4DownBindings,
+        Nvfp4GateUpBindings, Nvfp4MlpBindings, TextEndpointBindings, VisionBindings,
+        dense_fp8_next_norm_name, positive_bf16, require_adjacent, require_dense_fp8_mlp_layer,
+        require_full_attention_layer, require_gdn_layer, require_mtp_contract,
+        require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
     use crate::{
         Arch, CheckpointContract, CheckpointErrorCode, CheckpointResult, DType, SafeTensorFile,
@@ -1524,11 +1668,11 @@ mod tests {
         const VOCAB: usize = 3;
         const LAYERS: usize = 2;
         const FULL_ATTENTION_INTERVAL: usize = 2;
-        const NUM_ATTENTION_HEADS: usize = 1;
-        const NUM_KV_HEADS: usize = 1;
+        const NUM_ATTENTION_HEADS: usize = 16;
+        const NUM_KV_HEADS: usize = 16;
         const HEAD_DIM: usize = 1;
-        const LINEAR_KEY_HEADS: usize = 1;
-        const LINEAR_VALUE_HEADS: usize = 1;
+        const LINEAR_KEY_HEADS: usize = 16;
+        const LINEAR_VALUE_HEADS: usize = 16;
         const LINEAR_HEAD_DIM: usize = 1;
         const LINEAR_CONV_KERNEL_DIM: usize = 4;
         const MTP_LAYERS: usize = 1;
@@ -1972,6 +2116,125 @@ mod tests {
         )
     }
 
+    fn append_modelopt_linear(
+        header: &mut serde_json::Map<String, Value>,
+        payload: &mut Vec<u8>,
+        prefix: &str,
+        geometry: [usize; 2],
+        scales: [f32; 2],
+        weight_code: u8,
+    ) {
+        let [rows, columns] = geometry;
+        let [input_scale, weight_scale_2] = scales;
+
+        for (suffix, value) in [
+            ("input_scale", input_scale),
+            ("weight_scale_2", weight_scale_2),
+        ] {
+            let begin = payload.len();
+            payload.extend_from_slice(&value.to_le_bytes());
+            header.insert(
+                format!("{prefix}.{suffix}"),
+                json!({
+                    "dtype": "F32",
+                    "shape": [],
+                    "data_offsets": [begin, payload.len()]
+                }),
+            );
+        }
+
+        let scale_begin = payload.len();
+        payload.resize(scale_begin + rows * (columns / NVFP4_GROUP_SIZE), 0x38);
+        header.insert(
+            format!("{prefix}.weight_scale"),
+            json!({
+                "dtype": "F8_E4M3",
+                "shape": [rows, columns / NVFP4_GROUP_SIZE],
+                "data_offsets": [scale_begin, payload.len()]
+            }),
+        );
+
+        let weight_begin = payload.len();
+        payload.resize(
+            weight_begin + rows * (columns / E2M1_VALUES_PER_BYTE),
+            weight_code,
+        );
+        header.insert(
+            format!("{prefix}.weight"),
+            json!({
+                "dtype": "U8",
+                "shape": [rows, columns / E2M1_VALUES_PER_BYTE],
+                "data_offsets": [weight_begin, payload.len()]
+            }),
+        );
+    }
+
+    fn modelopt_gdn_fixture(layer: usize) -> (Value, Vec<u8>) {
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let prefix = format!("{layer_prefix}.linear_attn");
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+
+        for (projection, rows, input_scale, weight_scale, code) in [
+            ("in_proj_qkv", ModelOptArch::GDN_QKV_ROWS, 0.25, 0.125, 0x10),
+            ("in_proj_z", ModelOptArch::GDN_VALUE_ROWS, 0.25, 0.25, 0x20),
+            ("in_proj_a", ModelOptArch::GDN_CONTROL_ROWS, 0.25, 0.5, 0x30),
+            ("in_proj_b", ModelOptArch::GDN_CONTROL_ROWS, 0.25, 1.0, 0x40),
+        ] {
+            append_modelopt_linear(
+                &mut header,
+                &mut payload,
+                &format!("{prefix}.{projection}"),
+                [rows, ModelOptArch::HIDDEN],
+                [input_scale, weight_scale],
+                code,
+            );
+        }
+        append_modelopt_linear(
+            &mut header,
+            &mut payload,
+            &format!("{prefix}.out_proj"),
+            [ModelOptArch::HIDDEN, ModelOptArch::GDN_VALUE_ROWS],
+            [0.5, 0.0625],
+            0x50,
+        );
+
+        for (name, shape) in [
+            (
+                format!("{prefix}.conv1d.weight"),
+                vec![
+                    ModelOptArch::GDN_QKV_ROWS,
+                    1,
+                    ModelOptArch::LINEAR_CONV_KERNEL_DIM,
+                ],
+            ),
+            (
+                format!("{prefix}.A_log"),
+                vec![ModelOptArch::GDN_CONTROL_ROWS],
+            ),
+            (
+                format!("{prefix}.dt_bias"),
+                vec![ModelOptArch::GDN_CONTROL_ROWS],
+            ),
+            (
+                format!("{prefix}.norm.weight"),
+                vec![ModelOptArch::LINEAR_HEAD_DIM],
+            ),
+            (
+                format!("{layer_prefix}.input_layernorm.weight"),
+                vec![ModelOptArch::HIDDEN],
+            ),
+            (
+                format!("{layer_prefix}.post_attention_layernorm.weight"),
+                vec![ModelOptArch::HIDDEN],
+            ),
+        ] {
+            append_bf16_tensor(&mut header, &mut payload, name, shape);
+        }
+
+        (Value::Object(header), payload)
+    }
+
     fn append_bf16_tensor(
         header: &mut serde_json::Map<String, Value>,
         payload: &mut Vec<u8>,
@@ -2241,7 +2504,7 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
-        assert!(error.to_string().contains("ModelOpt NVFP4 MLP"));
+        assert!(error.to_string().contains("ModelOpt NVFP4 source contract"));
     }
 
     #[test]
@@ -2388,6 +2651,70 @@ mod tests {
         assert_eq!(bindings.layer, 62);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn binds_exact_modelopt_nvfp4_gdn_source_contract() {
+        let path = fixture_path("modelopt-gdn");
+        let (header, payload) = modelopt_gdn_fixture(0);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let bindings =
+            ModelOptNvfp4GdnBindings::bind_from::<ModelOptArch>(0, |name| file.tensor(name))
+                .unwrap();
+
+        assert_eq!(bindings.qkv.weight.shape(), &[48, 16]);
+        assert_eq!(bindings.qkv.block_scale.shape(), &[48, 2]);
+        assert_eq!(bindings.z.weight.shape(), &[16, 16]);
+        assert_eq!(bindings.a_control.weight.shape(), &[16, 16]);
+        assert_eq!(bindings.b_control.weight.shape(), &[16, 16]);
+        assert_eq!(bindings.output.weight.shape(), &[32, 8]);
+        assert_eq!(bindings.output.block_scale.shape(), &[32, 1]);
+        assert_eq!(bindings.qkv.input_scale.value(0), Some(0.25));
+        assert_eq!(bindings.output.input_scale.value(0), Some(0.5));
+        assert_eq!(bindings.convolution_weight.shape(), &[48, 1, 4]);
+        assert_eq!(bindings.a_log.shape(), &[16]);
+        assert_eq!(bindings.dt_bias.shape(), &[16]);
+        assert_eq!(bindings.norm.shape(), &[1]);
+        assert_eq!(bindings.input_norm.shape(), &[32]);
+        assert_eq!(bindings.post_attention_norm.shape(), &[32]);
+        assert_eq!(bindings.layer, 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_modelopt_gdn_route_and_shared_input_scale_drift() {
+        let path = fixture_path("modelopt-gdn-scale-drift");
+        let (header, mut payload) = modelopt_gdn_fixture(0);
+        let offset = header["model.language_model.layers.0.linear_attn.in_proj_z.input_scale"]
+            ["data_offsets"][0]
+            .as_u64()
+            .unwrap() as usize;
+        payload[offset..offset + 4].copy_from_slice(&0.5f32.to_le_bytes());
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let error =
+            ModelOptNvfp4GdnBindings::bind_from::<ModelOptArch>(0, |name| file.tensor(name))
+                .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            error
+                .to_string()
+                .contains("QKV/Z input_scale values differ")
+        );
+        fs::remove_file(path).unwrap();
+
+        let error = ModelOptNvfp4GdnBindings::bind_from::<ModelOptArch>(1, |_| {
+            panic!("the route check must reject before tensor lookup")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("GDN source contract"));
     }
 
     #[test]
