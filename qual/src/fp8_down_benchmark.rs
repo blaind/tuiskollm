@@ -15,7 +15,7 @@ use tuisko_kernels_sm120::{DenseFp8DownOp, DenseFp8DownTmaMaps};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_ROWS: usize = 1_024;
-const EXACT_ROUTES: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 1_024];
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const ALIGNMENT: usize = 256;
 const INPUT_PATTERN: [f32; 8] = [0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625];
 const TOKEN_FACTORS: [f32; 8] = [1.0, 0.5, 0.25, 0.125, -1.0, -0.5, -0.25, -0.125];
@@ -271,6 +271,17 @@ fn launch(
                 addresses.output,
                 maps,
             )
+        } else if rows > 8 {
+            op.launch_tail_prefill(
+                stream,
+                rows,
+                addresses.input,
+                addresses.activation_codes,
+                addresses.activation_scales,
+                addresses.weight_codes,
+                addresses.weight_scales,
+                addresses.output,
+            )
         } else {
             op.launch(
                 stream,
@@ -378,7 +389,7 @@ mod tests {
 
         assert_eq!(logical_bytes(1), weights + per_token);
         assert_eq!(logical_bytes(MAX_ROWS), weights + MAX_ROWS * per_token);
-        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 1_024]);
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
     }
 
     #[test]

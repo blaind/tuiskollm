@@ -1,7 +1,9 @@
 //! Source-native dense-FP8 MLP down projection.
 
 use crate::Sm120Arch;
-use crate::device::fp8_down::{fp8_down_projection, quantize_down_activation};
+use crate::device::fp8_down::{
+    fp8_down_prefill_mma, fp8_down_projection, quantize_down_activation,
+};
 use crate::fp8::down_tma::{
     DenseFp8DownTmaMaps, DenseFp8DownTmaRoute, TOKENS as MACRO_TOKENS, ptx_name as tma_ptx_name,
 };
@@ -13,6 +15,13 @@ use tuisko_model::{Arch, Qwen38_27B};
 const MAX_BATCH: usize = 8;
 const WARPS: usize = 8;
 const THREADS: u32 = (WARPS * 32) as u32;
+const PREFILL_OUTPUT_ROWS: usize = 64;
+const PREFILL_K_WORDS: usize = 32;
+const PREFILL_K_SUBTILES: usize = 4;
+const T32_THREADS: u32 = 128;
+const T64_THREADS: u32 = 256;
+const T32_SHARED_BYTES: u32 = 24_576;
+const T64_SHARED_BYTES: u32 = 32_768;
 
 fn admitted_batch(batch: usize) -> bool {
     (1..=MAX_BATCH).contains(&batch)
@@ -85,6 +94,105 @@ mod kernels {
                 weight_scales,
                 output,
             );
+        }
+    }
+
+    /// Applies the exact 32-row down tail without reading padded activation rows.
+    #[kernel]
+    #[launch_bounds(128, 4)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (128, 1, 1),
+        dynamic_shared = 24576,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn fp8_down_mma_t32(
+        activation_codes: *const u32,
+        activation_scales: *const f32,
+        weight_codes: *const u32,
+        weight_scales: *const u16,
+        output: *mut u16,
+        k_tiles: u32,
+    ) {
+        // Four warps cover the exact 32 token rows, avoiding a padded read;
+        // K=128 uses 24 KiB so four CTAs can remain resident.
+        // SAFETY: the fixed grid covers every 32x64 output tile exactly once.
+        unsafe {
+            fp8_down_prefill_mma::<Qwen38_27B, 32, 32, PREFILL_K_WORDS, PREFILL_K_SUBTILES>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                k_tiles,
+            )
+        }
+    }
+
+    /// Applies the exact 64-row down tail.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 32768,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn fp8_down_mma_t64(
+        activation_codes: *const u32,
+        activation_scales: *const f32,
+        weight_codes: *const u32,
+        weight_scales: *const u16,
+        output: *mut u16,
+        k_tiles: u32,
+    ) {
+        // Eight warps share each 64-row weight tile; K=128 uses 32 KiB and
+        // preserves two-CTA residency with 80 output tiles in flight.
+        // SAFETY: the fixed grid covers every 64x64 output tile exactly once.
+        unsafe {
+            fp8_down_prefill_mma::<Qwen38_27B, 64, 64, PREFILL_K_WORDS, PREFILL_K_SUBTILES>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                k_tiles,
+            )
+        }
+    }
+
+    /// Applies the exact 128-row down tail as two 64-row token tiles.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 32768,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn fp8_down_mma_t128(
+        activation_codes: *const u32,
+        activation_scales: *const f32,
+        weight_codes: *const u32,
+        weight_scales: *const u16,
+        output: *mut u16,
+        k_tiles: u32,
+    ) {
+        // Two exact 64-row token tiles double the T=64 grid while retaining
+        // its 32 KiB, two-CTA K=128 schedule and MMA accumulation order.
+        // SAFETY: the fixed grid covers every active output tile exactly once.
+        unsafe {
+            fp8_down_prefill_mma::<Qwen38_27B, 128, 64, PREFILL_K_WORDS, PREFILL_K_SUBTILES>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                k_tiles,
+            )
         }
     }
 }
@@ -162,6 +270,12 @@ pub struct DenseFp8DownOp<A: Sm120Arch = Qwen38_27B> {
     b6: PreparedRoute<A, 6>,
     b7: PreparedRoute<A, 7>,
     b8: PreparedRoute<A, 8>,
+    t32_quantize: PreparedLaunch<kernels::__fp8_down_quantize_CudaKernel<A>>,
+    t32: PreparedLaunch<kernels::__fp8_down_mma_t32_CudaKernel>,
+    t64_quantize: PreparedLaunch<kernels::__fp8_down_quantize_CudaKernel<A>>,
+    t64: PreparedLaunch<kernels::__fp8_down_mma_t64_CudaKernel>,
+    t128_quantize: PreparedLaunch<kernels::__fp8_down_quantize_CudaKernel<A>>,
+    t128: PreparedLaunch<kernels::__fp8_down_mma_t128_CudaKernel>,
     t1024_quantize: PreparedLaunch<kernels::__fp8_down_quantize_CudaKernel<A>>,
     t1024: DenseFp8DownTmaRoute,
 }
@@ -174,6 +288,8 @@ impl<A: Sm120Arch> DenseFp8DownOp<A> {
         // SAFETY: this crate owns the embedded cuda-oxide module artifact.
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module("loading the dense-FP8 down module", source))?;
+        let output_tiles = u32::try_from(A::HIDDEN / PREFILL_OUTPUT_ROWS)
+            .map_err(|_| GpuError::invalid_launch("dense-FP8 down rows exceed grid width"))?;
 
         Ok(Self {
             b1: PreparedRoute::prepare(&module)?,
@@ -184,6 +300,30 @@ impl<A: Sm120Arch> DenseFp8DownOp<A> {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            t32_quantize: prepare_quantize::<A, 32>(&module)?,
+            t32: module
+                .prepare_fp8_down_mma_t32(LaunchConfig1D::new(
+                    output_tiles,
+                    T32_THREADS,
+                    T32_SHARED_BYTES,
+                ))
+                .map_err(|source| GpuError::launch("preparing dense-FP8 down T=32", source))?,
+            t64_quantize: prepare_quantize::<A, 64>(&module)?,
+            t64: module
+                .prepare_fp8_down_mma_t64(LaunchConfig1D::new(
+                    output_tiles,
+                    T64_THREADS,
+                    T64_SHARED_BYTES,
+                ))
+                .map_err(|source| GpuError::launch("preparing dense-FP8 down T=64", source))?,
+            t128_quantize: prepare_quantize::<A, 128>(&module)?,
+            t128: module
+                .prepare_fp8_down_mma_t128(LaunchConfig1D::new(
+                    2 * output_tiles,
+                    T64_THREADS,
+                    T64_SHARED_BYTES,
+                ))
+                .map_err(|source| GpuError::launch("preparing dense-FP8 down T=128", source))?,
             t1024_quantize: prepare_quantize::<A, MACRO_TOKENS>(&module)?,
             t1024: DenseFp8DownTmaRoute::new(context)?,
             module,
@@ -249,6 +389,62 @@ impl<A: Sm120Arch> DenseFp8DownOp<A> {
         }
     }
 
+    /// Dynamically quantizes and applies an exact T=32/64/128 down tail.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`] with `rows` selecting the
+    /// exact active extent. No route reads or writes outside that extent.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_tail_prefill(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($quantize:ident, $projection:ident, $method:ident) => {{
+                self.module
+                    .fp8_down_quantize::<A>(
+                        stream,
+                        &self.$quantize,
+                        input.cast::<u32>(),
+                        activation_codes.cast::<u16>(),
+                        activation_scales,
+                    )
+                    .map_err(|source| {
+                        GpuError::launch("launching dense-FP8 down quantization", source)
+                    })?;
+                self.module
+                    .$method(
+                        stream,
+                        &self.$projection,
+                        activation_codes.cast::<u32>(),
+                        activation_scales,
+                        weight_codes.cast::<u32>(),
+                        weight_scales,
+                        output,
+                        (A::INTERMEDIATE / 4 / PREFILL_K_WORDS) as u32,
+                    )
+                    .map_err(|source| GpuError::launch("launching dense-FP8 down tail", source))
+            }};
+        }
+
+        match rows {
+            32 => launch!(t32_quantize, t32, fp8_down_mma_t32),
+            64 => launch!(t64_quantize, t64, fp8_down_mma_t64),
+            128 => launch!(t128_quantize, t128, fp8_down_mma_t128),
+            _ => Err(GpuError::invalid_launch(format!(
+                "dense-FP8 down tail row count {rows} is outside the admitted routes 32,64,128"
+            ))),
+        }
+    }
+
     /// Dynamically quantizes and applies the exact T=1024 TMA down route.
     ///
     /// # Safety
@@ -293,7 +489,7 @@ impl<A: Sm120Arch> DenseFp8DownOp<A> {
 }
 
 /// PTX symbols retained for quantization and every exact dense-FP8 down route.
-pub(crate) fn fp8_down_ptx_names() -> [&'static str; 10] {
+pub(crate) fn fp8_down_ptx_names() -> [&'static str; 13] {
     [
         kernels::fp8_down_quantize_ptx_name::<Qwen38_27B>(),
         kernels::fp8_down_ptx_name::<Qwen38_27B, 1>(),
@@ -304,13 +500,19 @@ pub(crate) fn fp8_down_ptx_names() -> [&'static str; 10] {
         kernels::fp8_down_ptx_name::<Qwen38_27B, 6>(),
         kernels::fp8_down_ptx_name::<Qwen38_27B, 7>(),
         kernels::fp8_down_ptx_name::<Qwen38_27B, 8>(),
+        "fp8_down_mma_t32",
+        "fp8_down_mma_t64",
+        "fp8_down_mma_t128",
         tma_ptx_name(),
     ]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{THREADS, WARPS, admitted_batch, fp8_down_ptx_names};
+    use super::{
+        PREFILL_K_SUBTILES, PREFILL_K_WORDS, T32_SHARED_BYTES, T32_THREADS, T64_SHARED_BYTES,
+        T64_THREADS, THREADS, WARPS, admitted_batch, fp8_down_ptx_names,
+    };
     use std::collections::BTreeSet;
     use tuisko_model::{Arch, Qwen38_27B};
 
@@ -339,11 +541,20 @@ mod tests {
     }
 
     #[test]
-    fn ptx_inventory_has_quantization_and_one_entry_per_batch() {
+    fn exact_geometry_matches_the_tail_schedules() {
+        assert_eq!((PREFILL_K_WORDS, PREFILL_K_SUBTILES), (32, 4));
+        assert_eq!((T32_THREADS, T32_SHARED_BYTES), (128, 24_576));
+        assert_eq!((T64_THREADS, T64_SHARED_BYTES), (256, 32_768));
+        assert_eq!(Qwen38_27B::INTERMEDIATE / 4 / PREFILL_K_WORDS, 136);
+        assert_eq!(Qwen38_27B::HIDDEN % 64, 0);
+    }
+
+    #[test]
+    fn ptx_inventory_has_one_entry_per_exact_route() {
         let names = fp8_down_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 13);
         assert_eq!(unique.len(), names.len());
     }
 }

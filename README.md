@@ -81,10 +81,10 @@ one CTA per token publishes the sigmoid-gated FP32 seam and its dynamic E4M3 rep
 32x32 or 64x32 native E4M3 MMA tiles project through the source-native output matrix. Dense-FP8
 gate/up SwiGLU also admits exact `T=1024`: a 128x64x64 three-stage TMA route retains the represented
 E4M3 activation and source-weight planes and owns two stable tensor-map descriptors. Dense-FP8
-down projection admits a separate exact `T=1024` 128x64x64 three-stage TMA route over its
-source-native `[5120,17408]` weight plane with the same explicit descriptor ownership. Full-layer
-prefill composition and server routing remain separate slices, so these leaves do not yet change
-server prompt priming.
+down projection admits exact `T=32,64,128` K=128 MMA tails plus a separate `T=1024` 128x64x64
+three-stage TMA route over its source-native `[5120,17408]` weight plane with the same explicit
+descriptor ownership. Full-layer prefill composition and server routing remain separate slices,
+so these leaves do not yet change server prompt priming.
 
 ## Current device slice
 
