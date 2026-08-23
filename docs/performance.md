@@ -103,6 +103,10 @@ To retain exploratory timings on an intentionally uncontrolled clock, set
 `clock_policy: diagnostic_uncontrolled`; `perf bless` refuses it, so diagnostic evidence cannot
 silently become performance authority.
 
+If clocks pass the loaded probe and drift only later during a long measurement, the runner still
+writes the completed medians with `clock_policy: diagnostic_uncontrolled` and then returns a
+refusal. This preserves tuning evidence without weakening the gate or making it blessable.
+
 ## Command reference
 
 | Command | Purpose | Output |
