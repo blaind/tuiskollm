@@ -22,7 +22,7 @@ pub use dtype::DType;
 pub use error::{CheckpointError, CheckpointErrorCode, CheckpointResult};
 pub use inventory::CheckpointSnapshot;
 pub use materialize::{
-    MaterializedFullAttentionQkv, MaterializedModelOptNvfp4Attention,
+    MaterializedFullAttentionQkv, MaterializedModelOptNvfp4Attention, MaterializedModelOptNvfp4Gdn,
     MaterializedModelOptNvfp4Linear, MaterializedModelOptNvfp4Mlp, MaterializedMtpQkv,
     MaterializedNvfp4Down, MaterializedNvfp4GateUp,
 };

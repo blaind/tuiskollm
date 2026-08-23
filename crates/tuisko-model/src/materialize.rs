@@ -1,13 +1,13 @@
 //! Lossless conversion from source bindings to runtime-native host layouts.
 
 use crate::bindings::{
-    NVFP4_MLP_LAYER_END, require_full_attention_layer, require_nvfp4_mlp_layer,
-    validate_nvfp4_scales,
+    NVFP4_MLP_LAYER_END, require_full_attention_layer, require_gdn_layer_route,
+    require_nvfp4_mlp_layer, validate_nvfp4_scales,
 };
 use crate::{
     Bf16View, CheckpointError, CheckpointResult, F32View, FullAttentionQkvBindings,
-    ModelOptNvfp4AttentionBindings, ModelOptNvfp4LinearBindings, ModelOptNvfp4MlpBindings,
-    MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
+    ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4LinearBindings,
+    ModelOptNvfp4MlpBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
 };
 
 const SCALE_TILE_ROWS: usize = 128;
@@ -323,6 +323,251 @@ pub struct MaterializedModelOptNvfp4Attention<'a> {
     pub post_attention_norm: Bf16View<'a, 1>,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+/// Runtime-native Qwen3.5 GDN source planes.
+#[derive(Debug)]
+pub struct MaterializedModelOptNvfp4Gdn<'a> {
+    /// Fused packed Q/K/V/Z words in projection-row order.
+    pub input_weight_e2m1: Vec<u8>,
+    /// Fused swizzled Q/K/V/Z block scales in the same row order.
+    pub input_scale_e4m3_swizzled: Vec<u8>,
+    /// Exact source activation scale shared by Q/K/V/Z.
+    pub input_scale: f32,
+    /// Exact source second-stage weight scale shared by Q/K/V/Z.
+    pub input_weight_scale_2: f32,
+    /// Reciprocal activation-scale convention consumed by the kernels.
+    pub input_scale_divisor: f32,
+    /// Reciprocal weight-scale convention consumed by the kernels.
+    pub input_weight_scale_divisor: f32,
+    /// Fused Q/K/V/Z output row count.
+    pub input_rows: usize,
+    /// Logical hidden width of the Q/K/V/Z projection.
+    pub input_columns: usize,
+    /// Packed A/B control words followed by zero padding to one scale tile.
+    pub control_weight_e2m1_padded: Vec<u8>,
+    /// Swizzled A/B control scales with zero codes in padded rows.
+    pub control_scale_e4m3_swizzled: Vec<u8>,
+    /// Exact source activation scale shared by A and B controls.
+    pub control_input_scale: f32,
+    /// Exact source second-stage weight scale shared by A and B controls.
+    pub control_weight_scale_2: f32,
+    /// Reciprocal control activation-scale convention consumed by the kernels.
+    pub control_input_scale_divisor: f32,
+    /// Reciprocal control weight-scale convention consumed by the kernels.
+    pub control_weight_scale_divisor: f32,
+    /// Number of represented A/B control rows before padding.
+    pub control_rows: usize,
+    /// Number of rows in the runtime control planes.
+    pub control_padded_rows: usize,
+    /// Logical hidden width of the A/B projections.
+    pub control_columns: usize,
+    /// Recurrent-state output projection.
+    pub output: MaterializedModelOptNvfp4Linear<'a>,
+    /// Width-four causal-convolution weights.
+    pub convolution_weight: Bf16View<'a, 3>,
+    /// Log-space recurrence decay parameters.
+    pub a_log: Bf16View<'a, 1>,
+    /// Recurrence time-step bias.
+    pub dt_bias: Bf16View<'a, 1>,
+    /// Per-head gated RMSNorm weights.
+    pub norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the mixer.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the MLP.
+    pub post_attention_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning this layout.
+    pub layer: usize,
+}
+
+impl<'a> ModelOptNvfp4GdnBindings<'a> {
+    /// Fuses large projections and pads the 64 control rows without changing source values.
+    pub fn materialize(self) -> CheckpointResult<MaterializedModelOptNvfp4Gdn<'a>> {
+        require_gdn_layer_route(self.layer, self.layer_count, self.full_attention_interval)?;
+        for (role, scale) in [
+            ("QKV/Z input_scale", &self.z.input_scale),
+            ("QKV/A-control input_scale", &self.a_control.input_scale),
+            ("QKV/B-control input_scale", &self.b_control.input_scale),
+        ] {
+            require_same_modelopt_scale(self.layer, role, &self.qkv.input_scale, scale)?;
+        }
+        require_same_modelopt_scale(
+            self.layer,
+            "QKV/Z weight_scale_2",
+            &self.qkv.weight_scale_2,
+            &self.z.weight_scale_2,
+        )?;
+        require_same_modelopt_scale(
+            self.layer,
+            "A/B control input_scale",
+            &self.a_control.input_scale,
+            &self.b_control.input_scale,
+        )?;
+        require_same_modelopt_scale(
+            self.layer,
+            "A/B control weight_scale_2",
+            &self.a_control.weight_scale_2,
+            &self.b_control.weight_scale_2,
+        )?;
+
+        let qkv = materialize_modelopt_linear(self.qkv, self.layer, "QKV")?;
+        let z = materialize_modelopt_linear(self.z, self.layer, "Z")?;
+        if qkv.columns != z.columns {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{} ModelOpt NVFP4 QKV/Z input widths differ",
+                self.layer
+            )));
+        }
+
+        let input_rows = qkv.rows.checked_add(z.rows).ok_or_else(|| {
+            CheckpointError::source_binding(format!(
+                "layer-{} ModelOpt NVFP4 QKV/Z row count overflows",
+                self.layer
+            ))
+        })?;
+        let input_weight_e2m1 = gather_source_planes(
+            &[qkv.weight_e2m1, z.weight_e2m1],
+            &format!("layer-{} ModelOpt NVFP4 QKV/Z weights", self.layer),
+        )?;
+        // Both exact row families end on 128-row scale-tile boundaries, so
+        // concatenating their complete swizzled tiles preserves fused row order.
+        let input_scale_e4m3_swizzled = gather_source_planes(
+            &[&qkv.scale_e4m3_swizzled, &z.scale_e4m3_swizzled],
+            &format!("layer-{} ModelOpt NVFP4 QKV/Z scales", self.layer),
+        )?;
+        let controls = materialize_modelopt_controls(self.a_control, self.b_control, self.layer)?;
+        let output = materialize_modelopt_linear(self.output, self.layer, "output")?;
+
+        Ok(MaterializedModelOptNvfp4Gdn {
+            input_weight_e2m1,
+            input_scale_e4m3_swizzled,
+            input_scale: qkv.input_scale,
+            input_weight_scale_2: qkv.weight_scale_2,
+            input_scale_divisor: qkv.input_scale_divisor,
+            input_weight_scale_divisor: qkv.weight_scale_divisor,
+            input_rows,
+            input_columns: qkv.columns,
+            control_weight_e2m1_padded: controls.weight_e2m1_padded,
+            control_scale_e4m3_swizzled: controls.scale_e4m3_swizzled,
+            control_input_scale: controls.input_scale,
+            control_weight_scale_2: controls.weight_scale_2,
+            control_input_scale_divisor: controls.input_scale_divisor,
+            control_weight_scale_divisor: controls.weight_scale_divisor,
+            control_rows: controls.rows,
+            control_padded_rows: controls.padded_rows,
+            control_columns: controls.columns,
+            output,
+            convolution_weight: self.convolution_weight,
+            a_log: self.a_log,
+            dt_bias: self.dt_bias,
+            norm: self.norm,
+            input_norm: self.input_norm,
+            post_attention_norm: self.post_attention_norm,
+            layer: self.layer,
+        })
+    }
+}
+
+struct MaterializedModelOptControls {
+    weight_e2m1_padded: Vec<u8>,
+    scale_e4m3_swizzled: Vec<u8>,
+    input_scale: f32,
+    weight_scale_2: f32,
+    input_scale_divisor: f32,
+    weight_scale_divisor: f32,
+    rows: usize,
+    padded_rows: usize,
+    columns: usize,
+}
+
+fn materialize_modelopt_controls(
+    a: ModelOptNvfp4LinearBindings<'_>,
+    b: ModelOptNvfp4LinearBindings<'_>,
+    layer: usize,
+) -> CheckpointResult<MaterializedModelOptControls> {
+    let [a_rows, packed_columns] = host_shape(a.weight.shape(), "ModelOpt NVFP4 A controls")?;
+    let [b_rows, b_packed_columns] = host_shape(b.weight.shape(), "ModelOpt NVFP4 B controls")?;
+    let [a_scale_rows, groups] =
+        host_shape(a.block_scale.shape(), "ModelOpt NVFP4 A-control scales")?;
+    let [b_scale_rows, b_groups] =
+        host_shape(b.block_scale.shape(), "ModelOpt NVFP4 B-control scales")?;
+    let columns = logical_columns(packed_columns, groups, layer, "A/B controls")?;
+    if a_rows != a_scale_rows
+        || b_rows != b_scale_rows
+        || packed_columns != b_packed_columns
+        || groups != b_groups
+        || a_rows != a.rows
+        || b_rows != b.rows
+        || columns != a.columns
+        || columns != b.columns
+    {
+        return Err(CheckpointError::source_binding(format!(
+            "layer-{layer} ModelOpt NVFP4 A/B control source geometry differs"
+        )));
+    }
+
+    validate_nvfp4_scales(layer, "A control", a.block_scale.codes())?;
+    validate_nvfp4_scales(layer, "B control", b.block_scale.codes())?;
+
+    let rows = a_rows.checked_add(b_rows).ok_or_else(|| {
+        CheckpointError::source_binding(format!(
+            "layer-{layer} ModelOpt NVFP4 A/B control row count overflows"
+        ))
+    })?;
+    let padded_rows = rows
+        .checked_add(SCALE_TILE_ROWS - 1)
+        .map(|rows| rows / SCALE_TILE_ROWS * SCALE_TILE_ROWS)
+        .ok_or_else(|| {
+            CheckpointError::source_binding(format!(
+                "layer-{layer} ModelOpt NVFP4 A/B padded row count overflows"
+            ))
+        })?;
+
+    let padded_weight_bytes = padded_rows.checked_mul(packed_columns).ok_or_else(|| {
+        CheckpointError::source_binding(format!(
+            "layer-{layer} ModelOpt NVFP4 A/B padded weight length overflows"
+        ))
+    })?;
+    let padded_scale_bytes = padded_rows.checked_mul(groups).ok_or_else(|| {
+        CheckpointError::source_binding(format!(
+            "layer-{layer} ModelOpt NVFP4 A/B padded scale length overflows"
+        ))
+    })?;
+
+    // The source has 64 represented control rows while the Blackwell scale
+    // layout owns 128-row tiles. Rows 64..128 are never dispatched.
+    let mut weight_e2m1_padded = gather_source_planes(
+        &[a.weight.bytes(), b.weight.bytes()],
+        &format!("layer-{layer} ModelOpt NVFP4 A/B control weights"),
+    )?;
+    weight_e2m1_padded.resize(padded_weight_bytes, 0);
+    let mut row_major_scales = gather_source_planes(
+        &[a.block_scale.codes(), b.block_scale.codes()],
+        &format!("layer-{layer} ModelOpt NVFP4 A/B control scales"),
+    )?;
+    row_major_scales.resize(padded_scale_bytes, 0);
+    let scale_e4m3_swizzled = swizzle_scale_planes(
+        &[&row_major_scales],
+        padded_rows,
+        groups,
+        layer,
+        "A/B controls",
+    )?;
+
+    let input_scale = modelopt_scale(layer, "A/B control input_scale", &a.input_scale)?;
+    let weight_scale_2 = modelopt_scale(layer, "A/B control weight_scale_2", &a.weight_scale_2)?;
+
+    Ok(MaterializedModelOptControls {
+        weight_e2m1_padded,
+        scale_e4m3_swizzled,
+        input_scale,
+        weight_scale_2,
+        input_scale_divisor: reciprocal_scale(layer, "A/B control input", input_scale)?,
+        weight_scale_divisor: reciprocal_scale(layer, "A/B control weight", weight_scale_2)?,
+        rows,
+        padded_rows,
+        columns,
+    })
 }
 
 impl<'a> ModelOptNvfp4AttentionBindings<'a> {
@@ -748,9 +993,9 @@ mod tests {
     use super::{SCALE_TILE_GROUPS, SCALE_TILE_ROWS, swizzle_scale_planes, validate_divisor};
     use crate::{
         Arch, Bf16View, CheckpointErrorCode, CheckpointSnapshot, DType, F32View, Fp8E4M3View,
-        FullAttentionQkvBindings, ModelOptNvfp4AttentionBindings, ModelOptNvfp4LinearBindings,
-        ModelOptNvfp4MlpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings, Qwen35_9B, TensorView,
-        U8View,
+        FullAttentionQkvBindings, ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings,
+        ModelOptNvfp4LinearBindings, ModelOptNvfp4MlpBindings, Nvfp4DownBindings,
+        Nvfp4GateUpBindings, Qwen35_9B, TensorView, U8View,
     };
 
     const ROWS: usize = 128;
@@ -801,6 +1046,20 @@ mod tests {
     }
 
     fn bf16_vector<'a>(name: &'a str, shape: &'a [u64; 1], bytes: &'a [u8]) -> Bf16View<'a, 1> {
+        Bf16View::bind(
+            TensorView {
+                name,
+                dtype: DType::Bf16,
+                shape,
+                bytes,
+                data_range: 0..bytes.len() as u64,
+            },
+            *shape,
+        )
+        .unwrap()
+    }
+
+    fn bf16_volume<'a>(name: &'a str, shape: &'a [u64; 3], bytes: &'a [u8]) -> Bf16View<'a, 3> {
         Bf16View::bind(
             TensorView {
                 name,
@@ -1306,6 +1565,249 @@ mod tests {
         assert_eq!(materialized.query_norm.word(0), Some(0x4000));
         assert_eq!(materialized.input_norm.word(0), Some(0x3f80));
         assert_eq!(materialized.layer, 3);
+    }
+
+    #[test]
+    fn modelopt_gdn_materialization_preserves_source_words_and_pads_controls() {
+        const CONTROL_ROWS: usize = 32;
+
+        let projection_shape = [ROWS as u64, PACKED_COLUMNS as u64];
+        let projection_scale_shape = [ROWS as u64, GROUPS as u64];
+        let control_shape = [CONTROL_ROWS as u64, PACKED_COLUMNS as u64];
+        let control_scale_shape = [CONTROL_ROWS as u64, GROUPS as u64];
+        let convolution_shape = [ROWS as u64, 1, 4];
+        let control_vector_shape = [CONTROL_ROWS as u64];
+        let norm_shape = [COLUMNS as u64];
+        let head_norm_shape = [1];
+        let qkv_weight = vec![0x10; ROWS * PACKED_COLUMNS];
+        let z_weight = vec![0x20; ROWS * PACKED_COLUMNS];
+        let a_weight = vec![0x30; CONTROL_ROWS * PACKED_COLUMNS];
+        let b_weight = vec![0x40; CONTROL_ROWS * PACKED_COLUMNS];
+        let output_weight = vec![0x50; ROWS * PACKED_COLUMNS];
+        let qkv_scale = scale_codes_for(ROWS, 0);
+        let z_scale = scale_codes_for(ROWS, 11);
+        let a_scale = scale_codes_for(CONTROL_ROWS, 23);
+        let b_scale = scale_codes_for(CONTROL_ROWS, 31);
+        let output_scale = scale_codes_for(ROWS, 43);
+        let input_scale = 0.25f32.to_le_bytes();
+        let input_weight_scale = 0.125f32.to_le_bytes();
+        let control_weight_scale = 0.5f32.to_le_bytes();
+        let output_input_scale = 0.5f32.to_le_bytes();
+        let output_weight_scale = 0.0625f32.to_le_bytes();
+        let convolution = bf16_bytes(&vec![0x3f80; ROWS * 4]);
+        let a_log = bf16_bytes(&[0x4000; CONTROL_ROWS]);
+        let dt_bias = bf16_bytes(&[0x4040; CONTROL_ROWS]);
+        let head_norm = bf16_bytes(&[0x4080]);
+        let input_norm = bf16_bytes(&vec![0x40a0; COLUMNS]);
+        let post_attention_norm = bf16_bytes(&vec![0x40c0; COLUMNS]);
+        let qkv = ModelOptNvfp4LinearBindings {
+            weight: u8_view("qkv", &projection_shape, &qkv_weight),
+            block_scale: fp8_view("qkv-scale", &projection_scale_shape, &qkv_scale),
+            input_scale: f32_scalar_view("qkv-input", &input_scale),
+            weight_scale_2: f32_scalar_view("qkv-weight", &input_weight_scale),
+            rows: ROWS,
+            columns: COLUMNS,
+        };
+        let z = ModelOptNvfp4LinearBindings {
+            weight: u8_view("z", &projection_shape, &z_weight),
+            block_scale: fp8_view("z-scale", &projection_scale_shape, &z_scale),
+            input_scale: f32_scalar_view("z-input", &input_scale),
+            weight_scale_2: f32_scalar_view("z-weight", &input_weight_scale),
+            rows: ROWS,
+            columns: COLUMNS,
+        };
+        let a_control = ModelOptNvfp4LinearBindings {
+            weight: u8_view("a", &control_shape, &a_weight),
+            block_scale: fp8_view("a-scale", &control_scale_shape, &a_scale),
+            input_scale: f32_scalar_view("a-input", &input_scale),
+            weight_scale_2: f32_scalar_view("a-weight", &control_weight_scale),
+            rows: CONTROL_ROWS,
+            columns: COLUMNS,
+        };
+        let b_control = ModelOptNvfp4LinearBindings {
+            weight: u8_view("b", &control_shape, &b_weight),
+            block_scale: fp8_view("b-scale", &control_scale_shape, &b_scale),
+            input_scale: f32_scalar_view("b-input", &input_scale),
+            weight_scale_2: f32_scalar_view("b-weight", &control_weight_scale),
+            rows: CONTROL_ROWS,
+            columns: COLUMNS,
+        };
+        let output = ModelOptNvfp4LinearBindings {
+            weight: u8_view("output", &projection_shape, &output_weight),
+            block_scale: fp8_view("output-scale", &projection_scale_shape, &output_scale),
+            input_scale: f32_scalar_view("output-input", &output_input_scale),
+            weight_scale_2: f32_scalar_view("output-weight", &output_weight_scale),
+            rows: ROWS,
+            columns: COLUMNS,
+        };
+        let bindings = ModelOptNvfp4GdnBindings {
+            qkv,
+            z,
+            a_control,
+            b_control,
+            output,
+            convolution_weight: bf16_volume("convolution", &convolution_shape, &convolution),
+            a_log: bf16_vector("a-log", &control_vector_shape, &a_log),
+            dt_bias: bf16_vector("dt-bias", &control_vector_shape, &dt_bias),
+            norm: bf16_vector("norm", &head_norm_shape, &head_norm),
+            input_norm: bf16_vector("input-norm", &norm_shape, &input_norm),
+            post_attention_norm: bf16_vector(
+                "post-attention-norm",
+                &norm_shape,
+                &post_attention_norm,
+            ),
+            layer: 0,
+            layer_count: 4,
+            full_attention_interval: 4,
+        };
+
+        let route_error = ModelOptNvfp4GdnBindings {
+            layer: 3,
+            ..bindings
+        }
+        .materialize()
+        .unwrap_err();
+        assert_eq!(route_error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(route_error.to_string().contains("GDN source contract"));
+
+        let mismatched_weight_scale = 0.25f32.to_le_bytes();
+        let scale_error = ModelOptNvfp4GdnBindings {
+            z: ModelOptNvfp4LinearBindings {
+                weight_scale_2: f32_scalar_view("z-weight", &mismatched_weight_scale),
+                ..z
+            },
+            ..bindings
+        }
+        .materialize()
+        .unwrap_err();
+        assert_eq!(scale_error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            scale_error
+                .to_string()
+                .contains("QKV/Z weight_scale_2 values differ")
+        );
+
+        let materialized = bindings.materialize().unwrap();
+        let input_weight_source = [qkv_weight.as_slice(), z_weight.as_slice()].concat();
+        let input_scale_source = [qkv_scale.as_slice(), z_scale.as_slice()].concat();
+        let control_weight_source = [a_weight.as_slice(), b_weight.as_slice()].concat();
+        let mut control_scale_source = [a_scale.as_slice(), b_scale.as_slice()].concat();
+        control_scale_source.resize(ROWS * GROUPS, 0);
+
+        assert_eq!(materialized.input_weight_e2m1, input_weight_source);
+        assert_eq!(
+            materialized.input_scale_e4m3_swizzled,
+            block_scale_oracle(&input_scale_source, 2 * ROWS, GROUPS)
+        );
+        assert_eq!(
+            &materialized.control_weight_e2m1_padded[..control_weight_source.len()],
+            control_weight_source
+        );
+        assert!(
+            materialized.control_weight_e2m1_padded[control_weight_source.len()..]
+                .iter()
+                .all(|code| *code == 0)
+        );
+        assert_eq!(
+            materialized.control_scale_e4m3_swizzled,
+            block_scale_oracle(&control_scale_source, ROWS, GROUPS)
+        );
+        assert_eq!(
+            materialized.output.weight_e2m1.as_ptr(),
+            output_weight.as_ptr()
+        );
+        assert_eq!(
+            materialized.output.scale_e4m3_swizzled,
+            block_scale_oracle(&output_scale, ROWS, GROUPS)
+        );
+        assert_eq!(
+            (materialized.input_rows, materialized.input_columns),
+            (256, 128)
+        );
+        assert_eq!(
+            (
+                materialized.control_rows,
+                materialized.control_padded_rows,
+                materialized.control_columns,
+            ),
+            (64, 128, 128)
+        );
+        assert_eq!(materialized.input_scale.to_bits(), 0.25f32.to_bits());
+        assert_eq!(
+            materialized.input_weight_scale_2.to_bits(),
+            0.125f32.to_bits()
+        );
+        assert_eq!(materialized.input_scale_divisor, 4.0);
+        assert_eq!(materialized.input_weight_scale_divisor, 8.0);
+        assert_eq!(materialized.control_input_scale_divisor, 4.0);
+        assert_eq!(materialized.control_weight_scale_divisor, 2.0);
+        assert_eq!(materialized.convolution_weight.word(0), Some(0x3f80));
+        assert_eq!(materialized.a_log.word(0), Some(0x4000));
+        assert_eq!(materialized.dt_bias.word(0), Some(0x4040));
+        assert_eq!(materialized.norm.word(0), Some(0x4080));
+        assert_eq!(materialized.input_norm.word(0), Some(0x40a0));
+        assert_eq!(materialized.post_attention_norm.word(0), Some(0x40c0));
+        assert_eq!(materialized.layer, 0);
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN35_SNAPSHOT with the pinned complete Qwen3.5 checkpoint"]
+    fn qwen35_source_gdn_layer0_materializes_losslessly() {
+        let root = std::env::var_os("TUISKO_QWEN35_SNAPSHOT")
+            .expect("TUISKO_QWEN35_SNAPSHOT is required for the source-backed gate");
+        let snapshot = CheckpointSnapshot::<Qwen35_9B>::open(std::path::Path::new(&root)).unwrap();
+        let bindings = ModelOptNvfp4GdnBindings::bind(&snapshot, 0).unwrap();
+        let input_weight_source = [bindings.qkv.weight.bytes(), bindings.z.weight.bytes()].concat();
+        let input_scale_source = [
+            bindings.qkv.block_scale.codes(),
+            bindings.z.block_scale.codes(),
+        ]
+        .concat();
+        let control_weight_source = [
+            bindings.a_control.weight.bytes(),
+            bindings.b_control.weight.bytes(),
+        ]
+        .concat();
+        let mut control_scale_source = [
+            bindings.a_control.block_scale.codes(),
+            bindings.b_control.block_scale.codes(),
+        ]
+        .concat();
+        let output_weight = bindings.output.weight.bytes();
+        let materialized = bindings.materialize().unwrap();
+        control_scale_source.resize(128 * (Qwen35_9B::HIDDEN / 16), 0);
+
+        assert_eq!(materialized.input_rows, Qwen35_9B::GDN_INPUT_ROWS);
+        assert_eq!(materialized.input_columns, Qwen35_9B::HIDDEN);
+        assert_eq!(materialized.input_weight_e2m1, input_weight_source);
+        assert_eq!(
+            materialized.input_scale_e4m3_swizzled,
+            block_scale_oracle(
+                &input_scale_source,
+                Qwen35_9B::GDN_INPUT_ROWS,
+                Qwen35_9B::HIDDEN / 16,
+            )
+        );
+        assert_eq!(materialized.control_rows, 2 * Qwen35_9B::GDN_CONTROL_ROWS);
+        assert_eq!(materialized.control_padded_rows, 128);
+        assert_eq!(
+            &materialized.control_weight_e2m1_padded[..control_weight_source.len()],
+            control_weight_source
+        );
+        assert!(
+            materialized.control_weight_e2m1_padded[control_weight_source.len()..]
+                .iter()
+                .all(|code| *code == 0)
+        );
+        assert_eq!(
+            materialized.control_scale_e4m3_swizzled,
+            block_scale_oracle(&control_scale_source, 128, Qwen35_9B::HIDDEN / 16,)
+        );
+        assert_eq!(
+            materialized.output.weight_e2m1.as_ptr(),
+            output_weight.as_ptr()
+        );
+        assert_eq!(materialized.layer, 0);
     }
 
     #[test]

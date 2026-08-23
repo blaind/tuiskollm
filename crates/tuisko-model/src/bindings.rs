@@ -1116,6 +1116,8 @@ pub struct ModelOptNvfp4GdnBindings<'a> {
     pub post_attention_norm: Bf16View<'a, 1>,
     /// Decoder layer owning these sources.
     pub layer: usize,
+    pub(crate) layer_count: usize,
+    pub(crate) full_attention_interval: usize,
 }
 
 impl<'a> ModelOptNvfp4GdnBindings<'a> {
@@ -1216,6 +1218,8 @@ impl<'a> ModelOptNvfp4GdnBindings<'a> {
                 [A::HIDDEN as u64],
             )?,
             layer,
+            layer_count: A::LAYERS,
+            full_attention_interval: A::FULL_ATTENTION_INTERVAL,
         })
     }
 }
@@ -1558,9 +1562,15 @@ fn require_dense_fp8_mlp_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
 }
 
 fn require_gdn_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
-    let interval = A::FULL_ATTENTION_INTERVAL;
+    require_gdn_layer_route(layer, A::LAYERS, A::FULL_ATTENTION_INTERVAL)
+}
 
-    if interval == 0 || layer >= A::LAYERS || layer % interval == interval - 1 {
+pub(crate) fn require_gdn_layer_route(
+    layer: usize,
+    layer_count: usize,
+    interval: usize,
+) -> CheckpointResult<()> {
+    if interval == 0 || layer >= layer_count || layer % interval == interval - 1 {
         return Err(CheckpointError::source_binding(format!(
             "layer {layer} does not use the admitted GDN source contract"
         )));
