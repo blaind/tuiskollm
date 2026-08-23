@@ -53,6 +53,11 @@ See `docs/performance.md` for commands and measurement semantics.
 - Count skips separately from passes. A deferred fix needs an `#[ignore]`d acceptance test that
   states the missing condition.
 
+## Releases
+
+- A manual `Release` workflow run builds without publishing; only a matching `vX.Y.Z` tag publishes.
+- Before tagging, qualify the downloaded server archive on the exact RTX 5090 and pinned snapshot.
+
 ## Verification
 
 Run the host checks relevant to every change:
