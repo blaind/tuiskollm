@@ -7,5 +7,7 @@ quantize_registers=25
 down_registers=33,53,63,66,72,80,87,94
 quantize_shared_bytes=1152
 down_shared_bytes=1024
+prefill_registers=54,54,54
+prefill_shared_bytes=1024
 tma_registers=84
 tma_shared_bytes=1024
