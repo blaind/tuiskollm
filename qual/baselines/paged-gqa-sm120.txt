@@ -7,4 +7,6 @@ attention_registers=47,47,47,47,47,47,47,47
 prefill_shared_registers=56,56,56
 prefill_flash_partition_registers=128,226
 prefill_reduce_registers=34,34
+prefill_flash_macro_registers=128
+prefill_macro_reduce_registers=32,34,34,34,38
 shared_bytes=1024
