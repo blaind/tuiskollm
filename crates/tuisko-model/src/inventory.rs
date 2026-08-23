@@ -1,6 +1,9 @@
 //! Exact snapshot inventory admission and mmap-backed tensor lookup.
 
-use crate::{Arch, CheckpointError, CheckpointResult, SafeTensorFile, TensorView, validate_config};
+use crate::{
+    Arch, CheckpointContract, CheckpointError, CheckpointResult, DType, SafeTensorFile, TensorView,
+    validate_config,
+};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -12,7 +15,7 @@ const INDEX_FILE: &str = "model.safetensors.index.json";
 const MODEL_FILE: &str = "model.safetensors";
 const MTP_FILE: &str = "model_mtp.safetensors";
 
-const TARGET_INVENTORY: InventorySpec = InventorySpec {
+const QWEN38_INVENTORY: SplitInventorySpec = SplitInventorySpec {
     model_bytes: 22_568_192_096,
     model_tensors: 1_953,
     mtp_bytes: 849_400_392,
@@ -21,8 +24,12 @@ const TARGET_INVENTORY: InventorySpec = InventorySpec {
     index_entries: 1_968,
 };
 
+const QWEN35_MODEL_BYTES: u64 = 9_361_048_680;
+const QWEN35_HEADER_BYTES: usize = 188_096;
+const QWEN35_TENSORS: usize = 1_519;
+
 #[derive(Clone, Copy)]
-struct InventorySpec {
+struct SplitInventorySpec {
     model_bytes: u64,
     model_tensors: usize,
     mtp_bytes: u64,
@@ -53,16 +60,22 @@ enum Shard {
 /// Exact-inventory, mmap-backed view of an admitted checkpoint snapshot.
 pub struct CheckpointSnapshot<A: Arch> {
     root: PathBuf,
+    inventory_path: PathBuf,
     tensors: BTreeMap<String, Shard>,
     model: SafeTensorFile,
-    mtp: SafeTensorFile,
+    mtp: Option<SafeTensorFile>,
     arch: PhantomData<A>,
 }
 
 impl<A: Arch> CheckpointSnapshot<A> {
     /// Opens and validates the pinned snapshot rooted at `root`.
     pub fn open(root: &Path) -> CheckpointResult<Self> {
-        Self::open_with_spec(root, TARGET_INVENTORY)
+        match A::CHECKPOINT_CONTRACT {
+            CheckpointContract::CompressedTensors => {
+                Self::open_split_with_spec(root, QWEN38_INVENTORY)
+            }
+            CheckpointContract::ModelOptNvfp4 => Self::open_modelopt(root),
+        }
     }
 
     /// Returns the admitted snapshot root.
@@ -79,7 +92,7 @@ impl<A: Arch> CheckpointSnapshot<A> {
     pub fn tensor(&self, name: &str) -> CheckpointResult<TensorView<'_>> {
         match self.shard(name)? {
             Shard::Model => self.model.tensor(name),
-            Shard::Mtp => self.mtp.tensor(name),
+            Shard::Mtp => self.mtp()?.tensor(name),
         }
     }
 
@@ -95,7 +108,7 @@ impl<A: Arch> CheckpointSnapshot<A> {
                     .adjacent_tensor_bytes(first_name, second_name, role)
             }
             (Shard::Mtp, Shard::Mtp) => {
-                self.mtp
+                self.mtp()?
                     .adjacent_tensor_bytes(first_name, second_name, role)
             }
             _ => Err(CheckpointError::source_binding(format!(
@@ -107,13 +120,22 @@ impl<A: Arch> CheckpointSnapshot<A> {
     fn shard(&self, name: &str) -> CheckpointResult<Shard> {
         self.tensors.get(name).copied().ok_or_else(|| {
             CheckpointError::tensor(format!(
-                "{} index is missing tensor `{name}`",
-                self.root.join(INDEX_FILE).display()
+                "{} inventory is missing tensor `{name}`",
+                self.inventory_path.display()
             ))
         })
     }
 
-    fn open_with_spec(root: &Path, spec: InventorySpec) -> CheckpointResult<Self> {
+    fn mtp(&self) -> CheckpointResult<&SafeTensorFile> {
+        self.mtp.as_ref().ok_or_else(|| {
+            CheckpointError::inventory(format!(
+                "{} has no MTP checkpoint shard",
+                self.root.display()
+            ))
+        })
+    }
+
+    fn open_split_with_spec(root: &Path, spec: SplitInventorySpec) -> CheckpointResult<Self> {
         validate_revision::<A>(root)?;
         validate_config::<A>(&root.join(CONFIG_FILE))?;
 
@@ -159,12 +181,454 @@ impl<A: Arch> CheckpointSnapshot<A> {
 
         Ok(Self {
             root: root.to_owned(),
+            inventory_path: index_path,
             tensors,
             model,
-            mtp,
+            mtp: Some(mtp),
             arch: PhantomData,
         })
     }
+
+    fn open_modelopt(root: &Path) -> CheckpointResult<Self> {
+        validate_revision::<A>(root)?;
+        validate_config::<A>(&root.join(CONFIG_FILE))?;
+
+        let model_path = root.join(MODEL_FILE);
+        validate_file_length(&model_path, QWEN35_MODEL_BYTES)?;
+
+        let model = SafeTensorFile::open(&model_path)?;
+        require_count(
+            &model_path,
+            "safetensors header bytes",
+            model.header_bytes(),
+            QWEN35_HEADER_BYTES,
+        )?;
+
+        let expected = qwen35_expected_tensors::<A>()?;
+        require_count(&model_path, "tensors", model.tensor_count(), QWEN35_TENSORS)?;
+        require_count(
+            &model_path,
+            "expected tensors",
+            expected.len(),
+            QWEN35_TENSORS,
+        )?;
+        validate_exact_tensors(&model, &expected)?;
+
+        let tensors = expected
+            .into_keys()
+            .map(|name| (name, Shard::Model))
+            .collect();
+
+        Ok(Self {
+            root: root.to_owned(),
+            inventory_path: model_path,
+            tensors,
+            model,
+            mtp: None,
+            arch: PhantomData,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedTensor {
+    dtype: DType,
+    shape: Vec<u64>,
+}
+
+fn qwen35_expected_tensors<A: Arch>() -> CheckpointResult<BTreeMap<String, ExpectedTensor>> {
+    if A::FULL_ATTENTION_INTERVAL == 0 {
+        return Err(CheckpointError::inventory(
+            "Qwen3.5 full-attention interval must be nonzero",
+        ));
+    }
+
+    let hidden = dimension(A::HIDDEN, "hidden width")?;
+    let intermediate = dimension(A::INTERMEDIATE, "intermediate width")?;
+    let attention_query_rows = dimension(A::ATTENTION_QUERY_ROWS, "attention query rows")?;
+    let attention_kv_rows = dimension(A::ATTENTION_KV_ROWS, "attention KV rows")?;
+    let attention_output_columns =
+        dimension(A::ATTENTION_OUTPUT_COLUMNS, "attention output columns")?;
+    let gdn_control_rows = dimension(A::GDN_CONTROL_ROWS, "GDN control rows")?;
+    let gdn_input_rows = dimension(A::GDN_INPUT_ROWS, "GDN input rows")?;
+    let gdn_value_rows = dimension(A::GDN_VALUE_ROWS, "GDN value rows")?;
+    let linear_head_dim = dimension(A::LINEAR_HEAD_DIM, "linear-attention head width")?;
+    let convolution_width = dimension(A::LINEAR_CONV_KERNEL_DIM, "convolution width")?;
+    let mut expected = BTreeMap::new();
+
+    add_expected(
+        &mut expected,
+        "model.language_model.embed_tokens.weight",
+        DType::Bf16,
+        vec![dimension(A::VOCAB, "vocabulary size")?, hidden],
+    )?;
+    add_expected(
+        &mut expected,
+        "model.language_model.norm.weight",
+        DType::Bf16,
+        vec![hidden],
+    )?;
+    add_expected(
+        &mut expected,
+        "lm_head.weight",
+        DType::Bf16,
+        vec![dimension(A::VOCAB, "vocabulary size")?, hidden],
+    )?;
+
+    for layer in 0..A::LAYERS {
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+
+        for name in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+            add_expected(
+                &mut expected,
+                format!("{layer_prefix}.{name}"),
+                DType::Bf16,
+                vec![hidden],
+            )?;
+        }
+
+        for projection in ["gate_proj", "up_proj"] {
+            add_modelopt_linear(
+                &mut expected,
+                &format!("{layer_prefix}.mlp.{projection}"),
+                intermediate,
+                hidden,
+            )?;
+        }
+        add_modelopt_linear(
+            &mut expected,
+            &format!("{layer_prefix}.mlp.down_proj"),
+            hidden,
+            intermediate,
+        )?;
+
+        if (layer + 1).is_multiple_of(A::FULL_ATTENTION_INTERVAL) {
+            for (projection, rows, columns) in [
+                ("q_proj", attention_query_rows, hidden),
+                ("k_proj", attention_kv_rows, hidden),
+                ("v_proj", attention_kv_rows, hidden),
+                ("o_proj", hidden, attention_output_columns),
+            ] {
+                add_modelopt_linear(
+                    &mut expected,
+                    &format!("{layer_prefix}.self_attn.{projection}"),
+                    rows,
+                    columns,
+                )?;
+            }
+
+            for name in ["q_norm.weight", "k_norm.weight"] {
+                add_expected(
+                    &mut expected,
+                    format!("{layer_prefix}.self_attn.{name}"),
+                    DType::Bf16,
+                    vec![dimension(A::HEAD_DIM, "attention head width")?],
+                )?;
+            }
+        } else {
+            for (projection, rows, columns) in [
+                ("in_proj_a", gdn_control_rows, hidden),
+                ("in_proj_b", gdn_control_rows, hidden),
+                ("in_proj_qkv", gdn_input_rows - gdn_value_rows, hidden),
+                ("in_proj_z", gdn_value_rows, hidden),
+                ("out_proj", hidden, gdn_value_rows),
+            ] {
+                add_modelopt_linear(
+                    &mut expected,
+                    &format!("{layer_prefix}.linear_attn.{projection}"),
+                    rows,
+                    columns,
+                )?;
+            }
+
+            for name in ["A_log", "dt_bias"] {
+                add_expected(
+                    &mut expected,
+                    format!("{layer_prefix}.linear_attn.{name}"),
+                    DType::Bf16,
+                    vec![gdn_control_rows],
+                )?;
+            }
+            add_expected(
+                &mut expected,
+                format!("{layer_prefix}.linear_attn.conv1d.weight"),
+                DType::Bf16,
+                vec![gdn_input_rows - gdn_value_rows, 1, convolution_width],
+            )?;
+            add_expected(
+                &mut expected,
+                format!("{layer_prefix}.linear_attn.norm.weight"),
+                DType::Bf16,
+                vec![linear_head_dim],
+            )?;
+        }
+    }
+
+    add_qwen35_mtp::<A>(&mut expected)?;
+    add_qwen35_vision::<A>(&mut expected)?;
+
+    Ok(expected)
+}
+
+fn add_qwen35_mtp<A: Arch>(
+    expected: &mut BTreeMap<String, ExpectedTensor>,
+) -> CheckpointResult<()> {
+    let hidden = dimension(A::HIDDEN, "hidden width")?;
+    let intermediate = dimension(A::INTERMEDIATE, "intermediate width")?;
+    let attention_query_rows = dimension(A::ATTENTION_QUERY_ROWS, "attention query rows")?;
+    let attention_kv_rows = dimension(A::ATTENTION_KV_ROWS, "attention KV rows")?;
+    let attention_output_columns =
+        dimension(A::ATTENTION_OUTPUT_COLUMNS, "attention output columns")?;
+
+    add_expected(
+        expected,
+        "mtp.fc.weight",
+        DType::Bf16,
+        vec![
+            hidden,
+            hidden
+                .checked_mul(2)
+                .ok_or_else(|| CheckpointError::inventory("MTP input width overflows"))?,
+        ],
+    )?;
+    for name in [
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    ] {
+        add_expected(expected, name, DType::Bf16, vec![hidden])?;
+    }
+
+    for layer in 0..A::MTP_LAYERS {
+        let prefix = format!("mtp.layers.{layer}");
+
+        for name in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+            add_expected(
+                expected,
+                format!("{prefix}.{name}"),
+                DType::Bf16,
+                vec![hidden],
+            )?;
+        }
+        for (projection, rows, columns) in [
+            ("q_proj", attention_query_rows, hidden),
+            ("k_proj", attention_kv_rows, hidden),
+            ("v_proj", attention_kv_rows, hidden),
+            ("o_proj", hidden, attention_output_columns),
+        ] {
+            add_expected(
+                expected,
+                format!("{prefix}.self_attn.{projection}.weight"),
+                DType::Bf16,
+                vec![rows, columns],
+            )?;
+        }
+        for name in ["q_norm.weight", "k_norm.weight"] {
+            add_expected(
+                expected,
+                format!("{prefix}.self_attn.{name}"),
+                DType::Bf16,
+                vec![dimension(A::HEAD_DIM, "attention head width")?],
+            )?;
+        }
+        for (projection, rows, columns) in [
+            ("gate_proj", intermediate, hidden),
+            ("up_proj", intermediate, hidden),
+            ("down_proj", hidden, intermediate),
+        ] {
+            add_expected(
+                expected,
+                format!("{prefix}.mlp.{projection}.weight"),
+                DType::Bf16,
+                vec![rows, columns],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn add_qwen35_vision<A: Arch>(
+    expected: &mut BTreeMap<String, ExpectedTensor>,
+) -> CheckpointResult<()> {
+    let hidden = dimension(A::VISION_HIDDEN, "Vision hidden width")?;
+    let intermediate = dimension(A::VISION_INTERMEDIATE, "Vision intermediate width")?;
+    let qkv_rows = hidden
+        .checked_mul(3)
+        .ok_or_else(|| CheckpointError::inventory("Vision QKV rows overflow"))?;
+
+    for block in 0..A::VISION_DEPTH {
+        let prefix = format!("model.visual.blocks.{block}");
+
+        for norm in ["norm1", "norm2"] {
+            for plane in ["weight", "bias"] {
+                add_expected(
+                    expected,
+                    format!("{prefix}.{norm}.{plane}"),
+                    DType::Bf16,
+                    vec![hidden],
+                )?;
+            }
+        }
+        for (name, shape) in [
+            ("attn.qkv.weight", vec![qkv_rows, hidden]),
+            ("attn.qkv.bias", vec![qkv_rows]),
+            ("attn.proj.weight", vec![hidden, hidden]),
+            ("attn.proj.bias", vec![hidden]),
+            ("mlp.linear_fc1.weight", vec![intermediate, hidden]),
+            ("mlp.linear_fc1.bias", vec![intermediate]),
+            ("mlp.linear_fc2.weight", vec![hidden, intermediate]),
+            ("mlp.linear_fc2.bias", vec![hidden]),
+        ] {
+            add_expected(expected, format!("{prefix}.{name}"), DType::Bf16, shape)?;
+        }
+    }
+
+    let merge_width = A::VISION_HIDDEN
+        .checked_mul(A::VISION_SPATIAL_MERGE_SIZE)
+        .and_then(|width| width.checked_mul(A::VISION_SPATIAL_MERGE_SIZE))
+        .ok_or_else(|| CheckpointError::inventory("Vision merger width overflows"))?;
+    let merge_width = dimension(merge_width, "Vision merger width")?;
+    let output_hidden = dimension(A::VISION_OUTPUT_HIDDEN, "Vision output width")?;
+
+    for plane in ["weight", "bias"] {
+        add_expected(
+            expected,
+            format!("model.visual.merger.norm.{plane}"),
+            DType::Bf16,
+            vec![hidden],
+        )?;
+    }
+    for (name, shape) in [
+        ("linear_fc1.weight", vec![merge_width, merge_width]),
+        ("linear_fc1.bias", vec![merge_width]),
+        ("linear_fc2.weight", vec![output_hidden, merge_width]),
+        ("linear_fc2.bias", vec![output_hidden]),
+    ] {
+        add_expected(
+            expected,
+            format!("model.visual.merger.{name}"),
+            DType::Bf16,
+            shape,
+        )?;
+    }
+    add_expected(
+        expected,
+        "model.visual.patch_embed.proj.weight",
+        DType::Bf16,
+        vec![
+            hidden,
+            dimension(A::VISION_INPUT_CHANNELS, "Vision input channels")?,
+            dimension(A::VISION_TEMPORAL_PATCH_SIZE, "Vision temporal patch size")?,
+            dimension(A::VISION_PATCH_SIZE, "Vision patch size")?,
+            dimension(A::VISION_PATCH_SIZE, "Vision patch size")?,
+        ],
+    )?;
+    add_expected(
+        expected,
+        "model.visual.patch_embed.proj.bias",
+        DType::Bf16,
+        vec![hidden],
+    )?;
+    add_expected(
+        expected,
+        "model.visual.pos_embed.weight",
+        DType::Bf16,
+        vec![dimension(A::VISION_POSITIONS, "Vision positions")?, hidden],
+    )?;
+
+    Ok(())
+}
+
+fn add_modelopt_linear(
+    expected: &mut BTreeMap<String, ExpectedTensor>,
+    prefix: &str,
+    rows: u64,
+    columns: u64,
+) -> CheckpointResult<()> {
+    let packed_columns = divided_dimension(columns, 2, prefix)?;
+    let scale_columns = divided_dimension(columns, 16, prefix)?;
+
+    add_expected(
+        expected,
+        format!("{prefix}.input_scale"),
+        DType::F32,
+        vec![],
+    )?;
+    add_expected(
+        expected,
+        format!("{prefix}.weight"),
+        DType::U8,
+        vec![rows, packed_columns],
+    )?;
+    add_expected(
+        expected,
+        format!("{prefix}.weight_scale"),
+        DType::Fp8E4M3,
+        vec![rows, scale_columns],
+    )?;
+    add_expected(
+        expected,
+        format!("{prefix}.weight_scale_2"),
+        DType::F32,
+        vec![],
+    )
+}
+
+fn add_expected(
+    expected: &mut BTreeMap<String, ExpectedTensor>,
+    name: impl Into<String>,
+    dtype: DType,
+    shape: Vec<u64>,
+) -> CheckpointResult<()> {
+    let name = name.into();
+
+    if expected
+        .insert(name.clone(), ExpectedTensor { dtype, shape })
+        .is_some()
+    {
+        return Err(CheckpointError::inventory(format!(
+            "Qwen3.5 inventory generates duplicate tensor `{name}`"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_exact_tensors(
+    file: &SafeTensorFile,
+    expected: &BTreeMap<String, ExpectedTensor>,
+) -> CheckpointResult<()> {
+    for (name, descriptor) in expected {
+        let tensor = file.tensor(name)?;
+
+        if tensor.dtype != descriptor.dtype || tensor.shape != descriptor.shape {
+            return Err(CheckpointError::tensor(format!(
+                "{} tensor `{name}` is {} {:?}, expected {} {:?}",
+                file.path().display(),
+                tensor.dtype,
+                tensor.shape,
+                descriptor.dtype,
+                descriptor.shape
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn dimension(value: usize, field: &str) -> CheckpointResult<u64> {
+    u64::try_from(value).map_err(|_| CheckpointError::inventory(format!("{field} exceeds u64")))
+}
+
+fn divided_dimension(value: u64, divisor: u64, field: &str) -> CheckpointResult<u64> {
+    if !value.is_multiple_of(divisor) {
+        return Err(CheckpointError::inventory(format!(
+            "{field} width {value} is not divisible by {divisor}"
+        )));
+    }
+
+    Ok(value / divisor)
 }
 
 fn validate_revision<A: Arch>(root: &Path) -> CheckpointResult<()> {
@@ -207,7 +671,7 @@ fn validate_weight_map(
     weight_map: BTreeMap<String, String>,
     model: &SafeTensorFile,
     mtp: &SafeTensorFile,
-    spec: InventorySpec,
+    spec: SplitInventorySpec,
 ) -> CheckpointResult<BTreeMap<String, Shard>> {
     let mut tensors = BTreeMap::new();
     let mut model_entries = 0;
@@ -258,9 +722,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckpointSnapshot, INDEX_FILE, InventorySpec, MODEL_FILE, MTP_FILE};
+    use super::{
+        CheckpointSnapshot, ExpectedTensor, INDEX_FILE, MODEL_FILE, MTP_FILE, QWEN35_TENSORS,
+        SplitInventorySpec, qwen35_expected_tensors, validate_exact_tensors,
+    };
     use crate::config::test_quantization_config;
-    use crate::{Arch, CheckpointErrorCode};
+    use crate::{Arch, CheckpointErrorCode, DType, Qwen35_9B, SafeTensorFile};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use std::fs::{self, File};
@@ -307,7 +774,7 @@ mod tests {
         base: PathBuf,
         root: PathBuf,
         weight_map: BTreeMap<String, String>,
-        spec: InventorySpec,
+        spec: SplitInventorySpec,
     }
 
     impl Fixture {
@@ -340,7 +807,7 @@ mod tests {
                 base,
                 root,
                 weight_map,
-                spec: InventorySpec {
+                spec: SplitInventorySpec {
                     model_bytes,
                     model_tensors: 2,
                     mtp_bytes,
@@ -471,11 +938,84 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_inventory_is_bijective_and_byte_exact() {
+        let expected = qwen35_expected_tensors::<Qwen35_9B>().unwrap();
+        let mut dtype_counts = BTreeMap::new();
+        let mut payload_bytes = 0u64;
+
+        for descriptor in expected.values() {
+            *dtype_counts
+                .entry(descriptor.dtype.as_str())
+                .or_insert(0usize) += 1;
+            let elements = descriptor.shape.iter().copied().product::<u64>();
+            payload_bytes += elements * descriptor.dtype.byte_width();
+        }
+
+        assert_eq!(expected.len(), QWEN35_TENSORS);
+        assert_eq!(
+            dtype_counts,
+            BTreeMap::from([("BF16", 527), ("F32", 496), ("F8_E4M3", 248), ("U8", 248),])
+        );
+        assert_eq!(payload_bytes, 9_360_860_576);
+        assert_eq!(
+            expected["model.language_model.layers.0.linear_attn.in_proj_qkv.weight"],
+            ExpectedTensor {
+                dtype: DType::U8,
+                shape: vec![8_192, 2_048],
+            }
+        );
+        assert_eq!(
+            expected["model.language_model.layers.3.self_attn.q_proj.weight_scale"],
+            ExpectedTensor {
+                dtype: DType::Fp8E4M3,
+                shape: vec![8_192, 256],
+            }
+        );
+        assert_eq!(
+            expected["model.visual.patch_embed.proj.weight"],
+            ExpectedTensor {
+                dtype: DType::Bf16,
+                shape: vec![1_152, 3, 2, 16, 16],
+            }
+        );
+        assert_eq!(
+            expected["mtp.fc.weight"],
+            ExpectedTensor {
+                dtype: DType::Bf16,
+                shape: vec![4_096, 8_192],
+            }
+        );
+        assert!(!expected.contains_key("model.language_model.layers.0.self_attn.q_proj.weight"));
+        assert!(
+            !expected.contains_key("model.language_model.layers.3.linear_attn.in_proj_qkv.weight")
+        );
+    }
+
+    #[test]
+    fn exact_inventory_rejects_descriptor_drift() {
+        let fixture = Fixture::new();
+        let model = SafeTensorFile::open(&fixture.root.join(MODEL_FILE)).unwrap();
+        let expected = BTreeMap::from([(
+            String::from("main.a"),
+            ExpectedTensor {
+                dtype: DType::Bf16,
+                shape: vec![1],
+            },
+        )]);
+
+        let error = validate_exact_tensors(&model, &expected).unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::Tensor);
+        assert!(error.to_string().contains("expected BF16 [1]"));
+    }
+
+    #[test]
     fn admits_complete_inventory_and_routes_tensors() {
         let fixture = Fixture::new();
 
         let snapshot =
-            CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, fixture.spec).unwrap();
+            CheckpointSnapshot::<TestArch>::open_split_with_spec(&fixture.root, fixture.spec)
+                .unwrap();
 
         assert_eq!(snapshot.root(), fixture.root);
         assert_eq!(snapshot.tensor_count(), 3);
@@ -493,7 +1033,8 @@ mod tests {
     fn rejects_tensor_span_across_shards() {
         let fixture = Fixture::new();
         let snapshot =
-            CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, fixture.spec).unwrap();
+            CheckpointSnapshot::<TestArch>::open_split_with_spec(&fixture.root, fixture.spec)
+                .unwrap();
 
         let error = snapshot
             .adjacent_tensor_bytes("main.b", "mtp.a", "cross-shard pair")
@@ -509,9 +1050,10 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.spec.model_bytes += 1;
 
-        let error = CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, fixture.spec)
-            .err()
-            .unwrap();
+        let error =
+            CheckpointSnapshot::<TestArch>::open_split_with_spec(&fixture.root, fixture.spec)
+                .err()
+                .unwrap();
 
         assert_eq!(error.code(), CheckpointErrorCode::Inventory);
         assert!(error.to_string().contains("model.safetensors has"));
@@ -532,7 +1074,7 @@ mod tests {
             (model_spec, "model.safetensors tensors"),
             (mtp_spec, "model_mtp.safetensors tensors"),
         ] {
-            let error = CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, spec)
+            let error = CheckpointSnapshot::<TestArch>::open_split_with_spec(&fixture.root, spec)
                 .err()
                 .unwrap();
 
@@ -546,10 +1088,11 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.rewrite_index(fixture.spec.model_bytes + fixture.spec.mtp_bytes + 1);
 
-        let error = CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, fixture.spec)
-            .err()
-            .unwrap()
-            .to_string();
+        let error =
+            CheckpointSnapshot::<TestArch>::open_split_with_spec(&fixture.root, fixture.spec)
+                .err()
+                .unwrap()
+                .to_string();
 
         assert!(error.contains("metadata.total_size"));
     }
@@ -562,9 +1105,10 @@ mod tests {
             .insert("mtp.a".to_owned(), MODEL_FILE.to_owned());
         fixture.rewrite_index(fixture.spec.model_bytes + fixture.spec.mtp_bytes);
 
-        let error = CheckpointSnapshot::<TestArch>::open_with_spec(&fixture.root, fixture.spec)
-            .err()
-            .unwrap();
+        let error =
+            CheckpointSnapshot::<TestArch>::open_split_with_spec(&fixture.root, fixture.spec)
+                .err()
+                .unwrap();
 
         assert_eq!(error.code(), CheckpointErrorCode::Tensor);
         assert!(
@@ -579,7 +1123,7 @@ mod tests {
         let fixture = Fixture::new();
         let root = fixture.base.join("other-revision");
 
-        let error = CheckpointSnapshot::<TestArch>::open_with_spec(&root, fixture.spec)
+        let error = CheckpointSnapshot::<TestArch>::open_split_with_spec(&root, fixture.spec)
             .err()
             .unwrap();
 

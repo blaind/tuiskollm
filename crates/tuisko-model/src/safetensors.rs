@@ -134,6 +134,10 @@ impl SafeTensorFile {
         self.tensors.len()
     }
 
+    pub(crate) fn header_bytes(&self) -> usize {
+        self.data_start - 8
+    }
+
     /// Returns a validated source view for `name`.
     pub fn tensor(&self, name: &str) -> CheckpointResult<TensorView<'_>> {
         let (stored_name, descriptor) = self.tensors.get_key_value(name).ok_or_else(|| {
