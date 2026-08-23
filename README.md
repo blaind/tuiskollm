@@ -37,6 +37,7 @@ cargo run -p xtask -- qualify-fp8-gdn-input
 cargo run -p xtask -- qualify-fp8-lm-head
 cargo run -p xtask -- qualify-nvfp4-swiglu
 cargo run -p xtask -- qualify-nvfp4-down
+cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT
 cargo run -p xtask -- perf smoke
 ```
 

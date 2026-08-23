@@ -107,6 +107,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- qualify-fp8-down` | Run the exhaustive represented-value dense-FP8 down oracle and graph-replay gate | terminal |
 | `cargo run -p xtask -- qualify-nvfp4-swiglu` | Check represented E2M1/E4M3 seams, A16/W4A4 production routing, immutable weights, graph replay, stable addresses, and post-warmup allocation at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-nvfp4-down` | Check represented E2M1/E4M3 down projection, immutable input/weights, graph replay, stable addresses, and post-warmup allocation at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT` | Check source layer 55, route-specific A16/W4A4 scratch, every observable seam, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-gdn-prepare` | Check the two control formulas, mapped width-4 convolution/history updates, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-gdn-recurrence` | Check mapped FP32 state transitions, gated normalization, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-gdn-output` | Check dynamic E4M3 quantization, source-native output projection, and graph replay at B=1..8 | terminal |
@@ -125,6 +126,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- bench-attention-output` | Measure every exact sigmoid-gate, quantize, and output-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-nvfp4-swiglu` | Measure every exact retained A16/W4A4 NVFP4 gate/up SwiGLU graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-nvfp4-down` | Measure every exact represented-weight A16 NVFP4 down-projection graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed layer-55 MLP graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT` | Measure every complete source-backed layer-60 graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-full-attention-layer SNAPSHOT` | Measure every complete source-backed layer-63 graph at a 131-token, three-page context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
@@ -184,6 +186,12 @@ leaf-wide `perf` commands until its first reviewed baseline is blessed.
 `bench-dense-fp8-mlp SNAPSHOT` measures the complete source-backed layer-60 MLP graph with the same
 options. It stays outside leaf-wide `perf` until the source-backed route receives a reviewed
 baseline.
+
+`bench-nvfp4-mlp SNAPSHOT` directly measures the complete source-backed layer-55 MLP graph. Its
+`B=1,5..8` routes include production E2M1 activation quantization and W4A4 gate/up projection;
+`B=2..4` preserve the BF16 gate/up activation, while every route uses the represented-weight A16
+down projection. It remains outside leaf-wide `perf` until a locked-clock local baseline is
+reviewed.
 
 `bench-dense-fp8-gdn-layer SNAPSHOT` measures the complete stateful layer-60 graph. Repeated samples
 advance its persistent history and FP32 recurrence exactly as serial decode rounds do; setup and

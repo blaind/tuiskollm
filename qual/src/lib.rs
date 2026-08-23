@@ -74,6 +74,10 @@ mod nvfp4_down_benchmark;
 #[cfg(feature = "device")]
 #[path = "nvfp4_down_benchmark_sm120.rs"]
 mod nvfp4_down_benchmark;
+#[cfg(feature = "device")]
+mod nvfp4_mlp;
+#[cfg(feature = "device")]
+mod nvfp4_mlp_benchmark;
 #[cfg(any(feature = "sm89", feature = "sm86"))]
 mod nvfp4_swiglu;
 #[cfg(feature = "device")]
@@ -175,6 +179,10 @@ pub use gdn_recurrence_benchmark::benchmark_gdn_recurrence;
 pub use nvfp4_down::{Nvfp4DownQualification, Nvfp4DownQualificationError, qualify_nvfp4_down};
 #[cfg(any(feature = "device", feature = "sm89"))]
 pub use nvfp4_down_benchmark::benchmark_nvfp4_down;
+#[cfg(feature = "device")]
+pub use nvfp4_mlp::{Nvfp4MlpQualification, Nvfp4MlpQualificationError, qualify_nvfp4_mlp};
+#[cfg(feature = "device")]
+pub use nvfp4_mlp_benchmark::benchmark_nvfp4_mlp;
 #[cfg(any(feature = "device", feature = "sm89", feature = "sm86"))]
 pub use nvfp4_swiglu::{
     Nvfp4SwiGluQualification, Nvfp4SwiGluQualificationError, qualify_nvfp4_swiglu,

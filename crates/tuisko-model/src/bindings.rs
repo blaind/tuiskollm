@@ -926,6 +926,69 @@ pub struct Nvfp4DownBindings<'a> {
     pub layer: usize,
 }
 
+/// Complete source planes for one early-layer NVFP4 MLP boundary.
+#[derive(Clone, Copy, Debug)]
+pub struct Nvfp4MlpBindings<'a> {
+    /// Packed gate/up weights, block scales, and divisors.
+    pub gate_up: Nvfp4GateUpBindings<'a>,
+    /// Packed down-projection weights, block scales, and divisors.
+    pub down: Nvfp4DownBindings<'a>,
+    /// Zero-centered RMSNorm weights before the MLP.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights for the next decoder boundary.
+    pub next_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning this MLP boundary.
+    pub layer: usize,
+}
+
+impl<'a> Nvfp4MlpBindings<'a> {
+    /// Binds one complete admitted NVFP4 MLP source family.
+    pub fn bind<A: Arch>(
+        snapshot: &'a CheckpointSnapshot<A>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from::<A>(layer, |name| snapshot.tensor(name))
+    }
+
+    fn bind_from<A: Arch>(
+        layer: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        let gate_up = Nvfp4GateUpBindings::bind_from::<A>(layer, |name| tensor(name))?;
+        let down = Nvfp4DownBindings::bind_from::<A>(layer, |name| tensor(name))?;
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let input_norm = Bf16View::bind(
+            tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+            [A::HIDDEN as u64],
+        )?;
+        let next_norm = Bf16View::bind(
+            tensor(&nvfp4_next_norm_name::<A>(layer)?)?,
+            [A::HIDDEN as u64],
+        )?;
+
+        Ok(Self {
+            gate_up,
+            down,
+            input_norm,
+            next_norm,
+            layer,
+        })
+    }
+}
+
+fn nvfp4_next_norm_name<A: Arch>(layer: usize) -> CheckpointResult<String> {
+    require_nvfp4_mlp_layer(layer, A::LAYERS)?;
+    let next_layer = layer
+        .checked_add(1)
+        .ok_or_else(|| CheckpointError::source_binding("NVFP4 MLP layer overflows"))?;
+
+    Ok(if next_layer == A::LAYERS {
+        FINAL_NORM.to_string()
+    } else {
+        format!("model.language_model.layers.{next_layer}.input_layernorm.weight")
+    })
+}
+
 impl<'a> Nvfp4DownBindings<'a> {
     /// Binds one admitted NVFP4 down-projection source family.
     pub fn bind<A: Arch>(
@@ -1172,10 +1235,10 @@ mod tests {
     use super::{
         DenseFp8DownBindings, DenseFp8GateUpBindings, DenseFp8MlpBindings,
         FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings, MtpBindings,
-        Nvfp4DownBindings, Nvfp4GateUpBindings, TextEndpointBindings, VisionBindings,
-        dense_fp8_next_norm_name, positive_bf16, require_adjacent, require_dense_fp8_mlp_layer,
-        require_full_attention_layer, require_gdn_layer, require_mtp_contract,
-        require_nvfp4_mlp_layer, validate_nvfp4_scales,
+        Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings, TextEndpointBindings,
+        VisionBindings, dense_fp8_next_norm_name, positive_bf16, require_adjacent,
+        require_dense_fp8_mlp_layer, require_full_attention_layer, require_gdn_layer,
+        require_mtp_contract, require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
     use crate::{Arch, CheckpointErrorCode, CheckpointResult, DType, SafeTensorFile, TensorView};
     use serde_json::{Value, json};
@@ -1309,7 +1372,9 @@ mod tests {
     fn nvfp4_mlp_fixture(layer: usize) -> (Value, Vec<u8>) {
         let prefix = format!("model.language_model.layers.{layer}.mlp");
         let down = format!("{prefix}.down_proj");
-        let mut payload = vec![0x38; 888];
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let next_layer_prefix = format!("model.language_model.layers.{}", layer + 1);
+        let mut payload = vec![0x38; 1_016];
 
         payload[0..4].copy_from_slice(&3.0f32.to_le_bytes());
         payload[4..8].copy_from_slice(&0.125f32.to_le_bytes());
@@ -1317,6 +1382,8 @@ mod tests {
         payload[12..16].copy_from_slice(&0.125f32.to_le_bytes());
         payload[592..596].copy_from_slice(&19.0f32.to_le_bytes());
         payload[596..600].copy_from_slice(&3_376.0f32.to_le_bytes());
+        payload[888..952].fill(0x70);
+        payload[952..1_016].fill(0x80);
 
         (
             json!({
@@ -1355,6 +1422,12 @@ mod tests {
                 },
                 format!("{down}.weight_scale"): {
                     "dtype":"F8_E4M3", "shape":[32,1], "data_offsets":[856,888]
+                },
+                format!("{layer_prefix}.post_attention_layernorm.weight"): {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[888,952]
+                },
+                format!("{next_layer_prefix}.input_layernorm.weight"): {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[952,1016]
                 }
             }),
             payload,
@@ -1770,6 +1843,8 @@ mod tests {
         let gate_up =
             Nvfp4GateUpBindings::bind_from::<Nvfp4Arch>(55, |name| file.tensor(name)).unwrap();
         let down = Nvfp4DownBindings::bind_from::<Nvfp4Arch>(55, |name| file.tensor(name)).unwrap();
+        let complete =
+            Nvfp4MlpBindings::bind_from::<Nvfp4Arch>(55, |name| file.tensor(name)).unwrap();
 
         assert_eq!(gate_up.gate_weight.shape(), &[16, 16]);
         assert_eq!(gate_up.up_weight.shape(), &[16, 16]);
@@ -1782,6 +1857,11 @@ mod tests {
         assert_eq!(down.input_scale_divisor.to_bits(), 19.0f32.to_bits());
         assert_eq!(down.weight_scale_divisor.to_bits(), 3_376.0f32.to_bits());
         assert_eq!((gate_up.layer, down.layer), (55, 55));
+        assert_eq!(complete.input_norm.shape(), &[32]);
+        assert_eq!(complete.input_norm.bytes()[0], 0x70);
+        assert_eq!(complete.next_norm.shape(), &[32]);
+        assert_eq!(complete.next_norm.bytes()[0], 0x80);
+        assert_eq!(complete.layer, 55);
 
         fs::remove_file(path).unwrap();
     }
