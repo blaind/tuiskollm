@@ -359,6 +359,32 @@ impl Qwen35ResidentModelProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Fills the endpoint output planes before a whole-model route.
+    pub fn qualification_reset_outputs(&self, stream: &CudaStream, byte: u8) -> EngineResult<()> {
+        self.endpoint.qualification_reset_outputs(stream, byte)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads the final residual, normalized row, and logits for every batch slot.
+    pub fn qualification_observables(
+        &self,
+        stream: &CudaStream,
+    ) -> EngineResult<Qwen35ResidentModelObservables> {
+        let endpoint = self.endpoint.qualification_observables(stream)?;
+        let final_residual = self
+            .layers
+            .last()
+            .ok_or_else(|| EngineError::layout("Qwen3.5 resident layer inventory is empty"))?
+            .read_residual(stream, MAX_BATCH)?;
+
+        Ok(Qwen35ResidentModelObservables {
+            final_residual,
+            normalized: endpoint.normalized,
+            logits: endpoint.logits,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
     /// Captures repeated whole-model paths for high-resolution timing.
     pub fn qualification_repeated_graph(
         &self,
@@ -401,6 +427,17 @@ impl Qwen35ResidentModelProgram {
         }
         Ok(())
     }
+}
+
+#[cfg(feature = "qualification")]
+/// Complete final planes exposed to the qualification crate.
+pub struct Qwen35ResidentModelObservables {
+    /// BF16 residual emitted by decoder layer 31.
+    pub final_residual: Vec<u16>,
+    /// BF16 endpoint-normalized rows.
+    pub normalized: Vec<u16>,
+    /// BF16 full-vocabulary logits.
+    pub logits: Vec<u16>,
 }
 
 fn capture_routes(
