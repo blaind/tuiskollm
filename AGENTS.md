@@ -58,6 +58,12 @@ An admitted device route requires all of the following in the same feature:
 4. generated PTX/SASS checks, preserved launch bounds, and zero stack/local memory; and
 5. a benchmark using the production operation, allocations, stream, cache regime, and shape.
 
+An `xtask qualify-*` filter must select both the suite's numerical/device oracle and its sibling
+benchmark-accounting tests. A green oracle with those accounting tests filtered out is incomplete.
+If that filter selects multiple device tests, run them with one test thread or sequence them in one
+test; parallel preflights race their CUDA contexts and can falsely report a busy device. Between
+sequential contexts, let process-free residual utilization settle to exactly zero without relaxing
+the memory, process-count, or clock gates.
 Do not infer composed or end-to-end wall time by adding leaf medians. Do not bless a performance
 baseline to hide a regression. Resource or performance baseline changes remain separate commits.
 Run the device preflight before opening a large source snapshot. Numerical summary assertions must
