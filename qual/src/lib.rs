@@ -10,6 +10,10 @@
 compile_error!("select exactly one device target feature");
 
 #[cfg(feature = "device")]
+mod attention_output;
+#[cfg(feature = "device")]
+mod attention_output_benchmark;
+#[cfg(feature = "device")]
 mod attention_qk_prepare;
 #[cfg(feature = "device")]
 mod attention_qk_prepare_benchmark;
@@ -76,6 +80,12 @@ mod text_endpoint;
 #[cfg(feature = "device")]
 mod text_endpoint_benchmark;
 
+#[cfg(feature = "device")]
+pub use attention_output::{
+    AttentionOutputQualification, AttentionOutputQualificationError, qualify_attention_output,
+};
+#[cfg(feature = "device")]
+pub use attention_output_benchmark::benchmark_attention_output;
 #[cfg(feature = "device")]
 pub use attention_qk_prepare::{
     AttentionQkPrepareQualification, AttentionQkPrepareQualificationError,
