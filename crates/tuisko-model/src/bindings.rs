@@ -2,7 +2,7 @@
 
 use crate::{
     Arch, Bf16View, CheckpointContract, CheckpointError, CheckpointResult, CheckpointSnapshot,
-    F32View, Fp8E4M3View, TensorView, U8View,
+    F32View, Fp8E4M3View, Qwen36Moe35B, TensorView, U8View,
 };
 
 pub(crate) const EMBEDDING: &str = "model.language_model.embed_tokens.weight";
@@ -1005,6 +1005,185 @@ impl<'a> ModelOptNvfp4MlpBindings<'a> {
     }
 }
 
+/// Exact NVFP4 planes for one Qwen3.6 routed or shared expert.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen36MoeExpertBindings<'a> {
+    /// Gate projection.
+    pub gate: ModelOptNvfp4LinearBindings<'a>,
+    /// Up projection.
+    pub up: ModelOptNvfp4LinearBindings<'a>,
+    /// Down projection.
+    pub down: ModelOptNvfp4LinearBindings<'a>,
+}
+
+/// Complete Qwen3.6 MoE source family for one decoder layer.
+#[derive(Clone, Debug)]
+pub struct Qwen36MoeLayerBindings<'a> {
+    /// Router weights `[experts, hidden]`.
+    pub router_weight: Bf16View<'a, 2>,
+    /// Shared-expert gate weights `[1, hidden]`.
+    pub shared_expert_gate_weight: Bf16View<'a, 2>,
+    /// Routed experts in numeric expert order.
+    pub experts: Vec<Qwen36MoeExpertBindings<'a>>,
+    /// Always-active shared expert.
+    pub shared_expert: Qwen36MoeExpertBindings<'a>,
+    /// Zero-centered RMSNorm weights before the MoE boundary `[hidden]`.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights for the next decoder boundary `[hidden]`.
+    pub next_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning these sources.
+    pub layer: usize,
+}
+
+impl<'a> Qwen36MoeLayerBindings<'a> {
+    /// Binds one exact Qwen3.6 MoE source family.
+    pub fn bind(
+        snapshot: &'a CheckpointSnapshot<Qwen36Moe35B>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from(
+            layer,
+            Qwen36Moe35B::LAYERS,
+            Qwen36Moe35B::HIDDEN,
+            Qwen36Moe35B::INTERMEDIATE,
+            Qwen36Moe35B::SHARED_EXPERT_INTERMEDIATE,
+            Qwen36Moe35B::NUM_EXPERTS,
+            |name| snapshot.tensor(name),
+        )
+    }
+
+    fn bind_from(
+        layer: usize,
+        layer_count: usize,
+        hidden: usize,
+        expert_intermediate: usize,
+        shared_intermediate: usize,
+        expert_count: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        require_qwen36_moe_layer(layer, layer_count)?;
+
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let mlp_prefix = format!("{layer_prefix}.mlp");
+        let router_weight = Bf16View::bind(
+            tensor(&format!("{mlp_prefix}.gate.weight"))?,
+            [expert_count as u64, hidden as u64],
+        )?;
+        let shared_expert_gate_weight = Bf16View::bind(
+            tensor(&format!("{mlp_prefix}.shared_expert_gate.weight"))?,
+            [1, hidden as u64],
+        )?;
+        let mut experts = Vec::with_capacity(expert_count);
+
+        for expert in 0..expert_count {
+            experts.push(bind_qwen36_expert(
+                &format!("{mlp_prefix}.experts.{expert}"),
+                hidden,
+                expert_intermediate,
+                layer,
+                &format!("expert-{expert}"),
+                |name| tensor(name),
+            )?);
+        }
+
+        let shared_expert = bind_qwen36_expert(
+            &format!("{mlp_prefix}.shared_expert"),
+            hidden,
+            shared_intermediate,
+            layer,
+            "shared expert",
+            |name| tensor(name),
+        )?;
+        let input_norm = Bf16View::bind(
+            tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+            [hidden as u64],
+        )?;
+        let next_norm = Bf16View::bind(
+            tensor(&qwen36_next_norm_name(layer, layer_count)?)?,
+            [hidden as u64],
+        )?;
+
+        Ok(Self {
+            router_weight,
+            shared_expert_gate_weight,
+            experts,
+            shared_expert,
+            input_norm,
+            next_norm,
+            layer,
+        })
+    }
+}
+
+fn bind_qwen36_expert<'a>(
+    prefix: &str,
+    hidden: usize,
+    intermediate: usize,
+    layer: usize,
+    role: &str,
+    mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+) -> CheckpointResult<Qwen36MoeExpertBindings<'a>> {
+    let gate = ModelOptNvfp4LinearBindings::bind_from(
+        &format!("{prefix}.gate_proj"),
+        intermediate,
+        hidden,
+        layer,
+        |name| tensor(name),
+    )?;
+    let up = ModelOptNvfp4LinearBindings::bind_from(
+        &format!("{prefix}.up_proj"),
+        intermediate,
+        hidden,
+        layer,
+        |name| tensor(name),
+    )?;
+    let down = ModelOptNvfp4LinearBindings::bind_from(
+        &format!("{prefix}.down_proj"),
+        hidden,
+        intermediate,
+        layer,
+        |name| tensor(name),
+    )?;
+
+    require_same_rank_zero_f32(
+        layer,
+        &format!("{role} gate/up input_scale"),
+        &gate.input_scale,
+        &up.input_scale,
+    )?;
+    require_same_rank_zero_f32(
+        layer,
+        &format!("{role} gate/up weight_scale_2"),
+        &gate.weight_scale_2,
+        &up.weight_scale_2,
+    )?;
+
+    Ok(Qwen36MoeExpertBindings { gate, up, down })
+}
+
+fn qwen36_next_norm_name(layer: usize, layer_count: usize) -> CheckpointResult<String> {
+    require_qwen36_moe_layer(layer, layer_count)?;
+    let next_layer = layer
+        .checked_add(1)
+        .ok_or_else(|| CheckpointError::source_binding("Qwen3.6 MoE layer overflows"))?;
+
+    Ok(if next_layer == layer_count {
+        FINAL_NORM.to_string()
+    } else {
+        format!("model.language_model.layers.{next_layer}.input_layernorm.weight")
+    })
+}
+
+fn require_qwen36_moe_layer(layer: usize, layer_count: usize) -> CheckpointResult<()> {
+    if layer >= layer_count {
+        return Err(CheckpointError::source_binding(format!(
+            "layer {layer} does not use the admitted Qwen3.6 MoE source contract"
+        )));
+    }
+
+    Ok(())
+}
+
 fn modelopt_nvfp4_next_norm_name<A: Arch>(layer: usize) -> CheckpointResult<String> {
     require_modelopt_nvfp4_mlp_layer::<A>(layer)?;
     let next_layer = layer
@@ -1777,14 +1956,15 @@ mod tests {
         DenseFp8MlpBindings, E2M1_VALUES_PER_BYTE, FullAttentionPostBindings,
         FullAttentionQkvBindings, GdnBindings, ModelOptNvfp4AttentionBindings,
         ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings, MtpBindings, NVFP4_GROUP_SIZE,
-        Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings, TextEndpointBindings,
-        VisionBindings, dense_fp8_next_norm_name, positive_bf16, require_adjacent,
-        require_dense_fp8_mlp_layer, require_full_attention_layer, require_gdn_layer,
-        require_mtp_contract, require_nvfp4_mlp_layer, validate_nvfp4_scales,
+        Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings, Qwen36MoeLayerBindings,
+        TextEndpointBindings, VisionBindings, dense_fp8_next_norm_name, positive_bf16,
+        qwen36_next_norm_name, require_adjacent, require_dense_fp8_mlp_layer,
+        require_full_attention_layer, require_gdn_layer, require_mtp_contract,
+        require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
     use crate::{
-        Arch, CheckpointContract, CheckpointErrorCode, CheckpointResult, DType, SafeTensorFile,
-        TensorView,
+        Arch, CheckpointContract, CheckpointErrorCode, CheckpointResult, CheckpointSnapshot, DType,
+        Qwen36Moe35B, SafeTensorFile, TensorView,
     };
     use serde_json::{Value, json};
     use std::fs::{self, File};
@@ -2099,6 +2279,155 @@ mod tests {
             }),
             payload,
         )
+    }
+
+    fn qwen36_moe_fixture(
+        layer: usize,
+        hidden: usize,
+        intermediate: usize,
+        experts: usize,
+    ) -> (Value, Vec<u8>) {
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let mlp_prefix = format!("{layer_prefix}.mlp");
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+
+        append_bf16_tensor(
+            &mut header,
+            &mut payload,
+            format!("{mlp_prefix}.gate.weight"),
+            vec![experts, hidden],
+        );
+        append_bf16_tensor(
+            &mut header,
+            &mut payload,
+            format!("{mlp_prefix}.shared_expert_gate.weight"),
+            vec![1, hidden],
+        );
+
+        for expert in 0..experts {
+            append_qwen36_expert(
+                &mut header,
+                &mut payload,
+                &format!("{mlp_prefix}.experts.{expert}"),
+                hidden,
+                intermediate,
+                u8::try_from(expert + 1).unwrap(),
+            );
+        }
+        append_qwen36_expert(
+            &mut header,
+            &mut payload,
+            &format!("{mlp_prefix}.shared_expert"),
+            hidden,
+            intermediate,
+            0x40,
+        );
+        append_bf16_tensor(
+            &mut header,
+            &mut payload,
+            format!("{layer_prefix}.post_attention_layernorm.weight"),
+            vec![hidden],
+        );
+        append_bf16_tensor(
+            &mut header,
+            &mut payload,
+            format!(
+                "model.language_model.layers.{}.input_layernorm.weight",
+                layer + 1
+            ),
+            vec![hidden],
+        );
+
+        (Value::Object(header), payload)
+    }
+
+    fn append_qwen36_expert(
+        header: &mut serde_json::Map<String, Value>,
+        payload: &mut Vec<u8>,
+        prefix: &str,
+        hidden: usize,
+        intermediate: usize,
+        marker: u8,
+    ) {
+        for (projection, rows, columns, input_scale, weight_scale_2) in [
+            ("gate_proj", intermediate, hidden, 0.25, 0.125),
+            ("up_proj", intermediate, hidden, 0.25, 0.125),
+            ("down_proj", hidden, intermediate, 0.5, 0.0625),
+        ] {
+            let projection = format!("{prefix}.{projection}");
+
+            append_rank_zero_f32(
+                header,
+                payload,
+                format!("{projection}.input_scale"),
+                input_scale,
+            );
+            append_raw_tensor(
+                header,
+                payload,
+                format!("{projection}.weight"),
+                "U8",
+                vec![rows, columns / E2M1_VALUES_PER_BYTE],
+                marker,
+            );
+            append_raw_tensor(
+                header,
+                payload,
+                format!("{projection}.weight_scale"),
+                "F8_E4M3",
+                vec![rows, columns / NVFP4_GROUP_SIZE],
+                0x38,
+            );
+            append_rank_zero_f32(
+                header,
+                payload,
+                format!("{projection}.weight_scale_2"),
+                weight_scale_2,
+            );
+        }
+    }
+
+    fn append_rank_zero_f32(
+        header: &mut serde_json::Map<String, Value>,
+        payload: &mut Vec<u8>,
+        name: impl Into<String>,
+        value: f32,
+    ) {
+        let begin = payload.len();
+        payload.extend_from_slice(&value.to_le_bytes());
+        header.insert(
+            name.into(),
+            json!({
+                "dtype": "F32",
+                "shape": [],
+                "data_offsets": [begin, payload.len()]
+            }),
+        );
+    }
+
+    fn append_raw_tensor(
+        header: &mut serde_json::Map<String, Value>,
+        payload: &mut Vec<u8>,
+        name: impl Into<String>,
+        dtype: &str,
+        shape: Vec<usize>,
+        value: u8,
+    ) {
+        let begin = payload.len();
+        payload.resize(begin + shape.iter().product::<usize>(), value);
+        header.insert(
+            name.into(),
+            json!({
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [begin, payload.len()]
+            }),
+        );
+    }
+
+    fn tensor_offset(header: &Value, name: &str) -> usize {
+        header[name]["data_offsets"][0].as_u64().unwrap() as usize
     }
 
     fn dense_fp8_mlp_fixture(layer: usize) -> (Value, Vec<u8>) {
@@ -2818,6 +3147,122 @@ mod tests {
 
         assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
         assert!(error.to_string().contains("ModelOpt NVFP4 source contract"));
+    }
+
+    #[test]
+    fn binds_qwen36_moe_experts_in_numeric_order() {
+        let path = fixture_path("qwen36-moe");
+        let (header, payload) = qwen36_moe_fixture(0, 32, 16, 3);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let bindings =
+            Qwen36MoeLayerBindings::bind_from(0, 2, 32, 16, 16, 3, |name| file.tensor(name))
+                .unwrap();
+
+        assert_eq!(bindings.router_weight.shape(), &[3, 32]);
+        assert_eq!(bindings.shared_expert_gate_weight.shape(), &[1, 32]);
+        assert_eq!(bindings.experts.len(), 3);
+        assert_eq!(
+            bindings.experts[2].gate.weight.name(),
+            "model.language_model.layers.0.mlp.experts.2.gate_proj.weight"
+        );
+        assert_eq!(bindings.experts[2].gate.weight.bytes()[0], 3);
+        assert_eq!(bindings.experts[2].up.weight.bytes()[0], 3);
+        assert_eq!(bindings.experts[2].down.weight.bytes()[0], 3);
+        assert_eq!(bindings.shared_expert.gate.weight.bytes()[0], 0x40);
+        assert_eq!(bindings.input_norm.shape(), &[32]);
+        assert_eq!(bindings.next_norm.shape(), &[32]);
+        assert_eq!(bindings.layer, 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn qwen36_next_norm_routes_cover_the_layer_boundary() {
+        for (layer, layers, expected) in [
+            (
+                0,
+                2,
+                Ok("model.language_model.layers.1.input_layernorm.weight"),
+            ),
+            (1, 2, Ok("model.language_model.norm.weight")),
+            (2, 2, Err("Qwen3.6 MoE source contract")),
+        ] {
+            let result = qwen36_next_norm_name(layer, layers);
+
+            match expected {
+                Ok(name) => assert_eq!(result.unwrap(), name),
+                Err(message) => assert!(result.unwrap_err().to_string().contains(message)),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_qwen36_moe_route_shape_and_scale_drift() {
+        let error = Qwen36MoeLayerBindings::bind_from(2, 2, 32, 16, 16, 3, |_| {
+            panic!("the route check must reject before tensor lookup")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("Qwen3.6 MoE source contract"));
+
+        let path = fixture_path("qwen36-moe-shape");
+        let (mut header, payload) = qwen36_moe_fixture(0, 32, 16, 3);
+        header["model.language_model.layers.0.mlp.experts.1.gate_proj.weight"]["shape"] =
+            json!([8, 32]);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let error =
+            Qwen36MoeLayerBindings::bind_from(0, 2, 32, 16, 16, 3, |name| file.tensor(name))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("experts.1.gate_proj.weight"));
+        fs::remove_file(path).unwrap();
+
+        let path = fixture_path("qwen36-moe-scale");
+        let (header, mut payload) = qwen36_moe_fixture(0, 32, 16, 3);
+        let name = "model.language_model.layers.0.mlp.experts.1.up_proj.input_scale";
+        let offset = tensor_offset(&header, name);
+        payload[offset..offset + 4].copy_from_slice(&0.5f32.to_le_bytes());
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let error =
+            Qwen36MoeLayerBindings::bind_from(0, 2, 32, 16, 16, 3, |name| file.tensor(name))
+                .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            error
+                .to_string()
+                .contains("expert-1 gate/up input_scale values differ")
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN36_SNAPSHOT with the exact pinned snapshot"]
+    fn binds_real_qwen36_moe_layer() {
+        let root = std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+            .expect("TUISKO_QWEN36_SNAPSHOT must name the exact pinned snapshot");
+        let snapshot = CheckpointSnapshot::<Qwen36Moe35B>::open(Path::new(&root)).unwrap();
+        let bindings = Qwen36MoeLayerBindings::bind(&snapshot, 0).unwrap();
+
+        assert_eq!(bindings.router_weight.shape(), &[256, 2_048]);
+        assert_eq!(bindings.shared_expert_gate_weight.shape(), &[1, 2_048]);
+        assert_eq!(bindings.experts.len(), 256);
+        assert_eq!(bindings.experts[0].gate.weight.shape(), &[512, 1_024]);
+        assert_eq!(bindings.experts[255].down.weight.shape(), &[2_048, 256]);
+        assert_eq!(
+            bindings.experts[2].gate.weight.name(),
+            "model.language_model.layers.0.mlp.experts.2.gate_proj.weight"
+        );
+        assert_eq!(
+            bindings.experts[10].gate.weight.name(),
+            "model.language_model.layers.0.mlp.experts.10.gate_proj.weight"
+        );
+        assert_eq!(bindings.shared_expert.gate.weight.shape(), &[512, 1_024]);
     }
 
     #[test]
