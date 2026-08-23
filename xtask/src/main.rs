@@ -189,7 +189,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-nvfp4-mlp|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-resident-model|qualify-resident-generation|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-resident-model|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-nvfp4-swiglu|gate-nvfp4-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-attention-output|perf|remote>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-nvfp4-mlp|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-resident-model|qualify-resident-generation|qualify-resident-batch-generation|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-resident-model|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-nvfp4-swiglu|gate-nvfp4-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-attention-output|perf|remote>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -223,6 +223,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-full-attention-layer") => qualify_full_attention_layer(root, &remaining),
         Some("qualify-resident-model") => qualify_resident_model(root, &remaining),
         Some("qualify-resident-generation") => qualify_resident_generation(root, &remaining),
+        Some("qualify-resident-batch-generation") => {
+            qualify_resident_batch_generation(root, &remaining)
+        }
         Some("qualify-text-endpoint") => qualify_text_endpoint(root, &remaining),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
         Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
@@ -1015,6 +1018,40 @@ fn qualify_resident_generation(
             "--lib",
             "--",
             "resident_generation::tests::source_frontend_generation_matches_vllm_tokens_and_streaming",
+            "--include-ignored",
+            "--nocapture",
+        ],
+        Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_resident_model_resources(root)
+}
+
+fn qualify_resident_batch_generation(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err(
+            "usage: cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT".into(),
+        );
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "resident_batch_generation::tests::compact_scheduler_matches_sequential_requests_and_recycles_holes",
             "--include-ignored",
             "--nocapture",
         ],

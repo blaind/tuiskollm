@@ -13,7 +13,7 @@ use crate::gpu_target::{GpuTarget, has_full_kernel_inventory};
 const USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
     <qualify-residual-norm|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
     qualify-nvfp4-mlp|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|qualify-full-attention-layer|\
-    qualify-resident-model|qualify-resident-generation|\
+    qualify-resident-model|qualify-resident-generation|qualify-resident-batch-generation|\
     bench-residual-norm|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-fp8-qkv|bench-fp8-gdn-input|\
     bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|bench-attention-output|bench-full-attention-layer|\
     bench-resident-model|\
@@ -53,6 +53,9 @@ impl Qualification {
             "qualify-resident-generation" => {
                 "resident_generation::tests::source_frontend_generation_matches_vllm_tokens_and_streaming"
             }
+            "qualify-resident-batch-generation" => {
+                "resident_batch_generation::tests::compact_scheduler_matches_sequential_requests_and_recycles_holes"
+            }
             _ => return None,
         };
 
@@ -71,6 +74,7 @@ impl Qualification {
                 "qualify-full-attention-layer" => "full-attention-layer",
                 "qualify-resident-model" => "resident-model",
                 "qualify-resident-generation" => "resident-generation",
+                "qualify-resident-batch-generation" => "resident-batch-generation",
                 _ => unreachable!(),
             },
             filter,
@@ -80,6 +84,7 @@ impl Qualification {
                     | "qualify-full-attention-layer"
                     | "qualify-resident-model"
                     | "qualify-resident-generation"
+                    | "qualify-resident-batch-generation"
             ),
         })
     }
@@ -409,6 +414,9 @@ mod tests {
         let generation = Qualification::parse("qualify-resident-generation").expect("known suite");
         assert_eq!(generation.name, "resident-generation");
         assert!(generation.source_snapshot);
+        let batch = Qualification::parse("qualify-resident-batch-generation").expect("known suite");
+        assert_eq!(batch.name, "resident-batch-generation");
+        assert!(batch.source_snapshot);
         assert_eq!(Benchmark::parse("bench-fp8-qkv").unwrap().name(), "fp8-qkv");
         assert_eq!(
             Benchmark::parse("bench-nvfp4-swiglu").unwrap().name(),

@@ -1,0 +1,359 @@
+//! Source-backed integration gate for compact multi-request resident generation.
+
+use crate::{DeviceBenchmarkError, device_benchmark};
+use std::path::Path;
+use std::sync::Arc;
+use tuisko_engine::{
+    ChatGenerationRequest, EngineError, GeneratedText, ResidentBatchGenerator, ResidentRequestId,
+    SamplingOptions,
+};
+use tuisko_frontend::{ChatMessage, ChatTemplateOptions};
+use tuisko_gpu::{CudaContext, GpuError, device_memory_info};
+use tuisko_model::{CheckpointError, CheckpointSnapshot, Qwen38_27B};
+
+/// Failure of the compact resident-generation integration gate.
+#[derive(Debug, thiserror::Error)]
+pub enum ResidentBatchGenerationQualificationError {
+    /// Snapshot admission or source binding failed.
+    #[error(transparent)]
+    Checkpoint(#[from] CheckpointError),
+    /// Frontend, generation, or resident execution failed.
+    #[error(transparent)]
+    Engine(#[from] EngineError),
+    /// CUDA context or memory observation failed.
+    #[error(transparent)]
+    Gpu(#[from] GpuError),
+    /// The exact target was not available exclusively.
+    #[error(transparent)]
+    Precondition(#[from] DeviceBenchmarkError),
+    /// An externally visible scheduler boundary differed.
+    #[error("resident-batch-generation qualification failed: {0}")]
+    Mismatch(String),
+}
+
+/// Compact scheduling, recycling, and ownership boundaries checked by the gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentBatchGenerationQualification {
+    /// Independent sequential request outputs compared with compact scheduling.
+    pub requests: usize,
+    /// Compact scheduler rounds exercised.
+    pub rounds: usize,
+    /// Exact pending replay batches exercised across B=1..8.
+    pub route_batches: usize,
+    /// Physical hole recycled while surviving requests remained active.
+    pub recycled_slot: usize,
+    /// Exact device arena bytes shared by every request.
+    pub arena_bytes: usize,
+    /// Exact page-locked embedding and double-logit-bank bytes.
+    pub host_stager_bytes: usize,
+}
+
+/// Qualifies mixed-length compact scheduling against independent sequential execution.
+pub fn qualify_resident_batch_generation(
+    root: &Path,
+) -> Result<ResidentBatchGenerationQualification, ResidentBatchGenerationQualificationError> {
+    let _preflight = device_benchmark::preflight()?;
+    let snapshot = Arc::new(CheckpointSnapshot::<Qwen38_27B>::open(root)?);
+    let context = CudaContext::new(0).map_err(GpuError::from)?;
+    let capability = context.compute_capability().map_err(GpuError::from)?;
+    if capability != (12, 0) {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            format!(
+                "device zero has compute capability {}.{}, expected 12.0",
+                capability.0, capability.1
+            ),
+        ));
+    }
+    let mut generator = ResidentBatchGenerator::from_snapshot(&context, snapshot)?;
+    verify_owner(&generator)?;
+    let stable_addresses = generator.qualification_addresses();
+    let requests = [
+        greedy_request("Hello", 2),
+        greedy_request("Name one color.", 1),
+        greedy_request("Reply with one word.", 2),
+        greedy_request("What is 2+2?", 2),
+    ];
+    let mut expected = Vec::with_capacity(requests.len());
+    for request in &requests {
+        expected.push(run_alone(&mut generator, request)?);
+    }
+    verify_exact_batch_inventory(&mut generator, &requests[0], &expected[0])?;
+    let before = device_memory_info(generator.context())?;
+
+    let a = generator.admit(&requests[0])?.request_id;
+    let b = generator.admit(&requests[1])?.request_id;
+    let c = generator.admit(&requests[2])?.request_id;
+    require_slot(&generator, a, 0)?;
+    require_slot(&generator, b, 1)?;
+    require_slot(&generator, c, 2)?;
+    let first = generator.step()?;
+    require_round(
+        &first,
+        &[
+            (a, &expected[0], 0),
+            (b, &expected[1], 0),
+            (c, &expected[2], 0),
+        ],
+    )?;
+    if generator.active_requests() != 2 || generator.qualification_slot(b).is_some() {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "one-token request did not leave a recyclable middle slot".to_string(),
+        ));
+    }
+
+    let d = generator.admit(&requests[3])?.request_id;
+    require_slot(&generator, d, 1)?;
+    let second = generator.step()?;
+    require_round(
+        &second,
+        &[
+            (a, &expected[0], 1),
+            (c, &expected[2], 1),
+            (d, &expected[3], 0),
+        ],
+    )?;
+    if generator.active_request_ids().collect::<Vec<_>>() != [d] {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "terminal survivors did not compact to the recycled request".to_string(),
+        ));
+    }
+    let third = generator.step()?;
+    require_round(&third, &[(d, &expected[3], 1)])?;
+    if generator.active_requests() != 0 {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "completed compact schedule retained an active request".to_string(),
+        ));
+    }
+
+    let after = device_memory_info(generator.context())?;
+    if before != after {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            format!(
+                "device memory changed after scheduler warmup: before={before:?}, after={after:?}"
+            ),
+        ));
+    }
+    if generator.qualification_addresses() != stable_addresses {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "compact scheduler owner addresses changed".to_string(),
+        ));
+    }
+    device_benchmark::require_current_process_exclusive()?;
+
+    Ok(ResidentBatchGenerationQualification {
+        requests: requests.len(),
+        rounds: 3,
+        route_batches: 8,
+        recycled_slot: 1,
+        arena_bytes: generator.arena_bytes(),
+        host_stager_bytes: generator.host_stager_bytes(),
+    })
+}
+
+fn verify_exact_batch_inventory(
+    generator: &mut ResidentBatchGenerator,
+    request: &ChatGenerationRequest,
+    expected: &GeneratedText,
+) -> Result<(), ResidentBatchGenerationQualificationError> {
+    if expected.token_ids.len() != 2 {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "two-token route oracle terminated before the exact batch sweep".to_string(),
+        ));
+    }
+    for batch in 1..=8 {
+        let mut request_ids = [None; 8];
+        for request_id in &mut request_ids[..batch] {
+            *request_id = Some(generator.admit(request)?.request_id);
+        }
+        let first = generator.step()?;
+        let second = generator.step()?;
+        if first.len() != batch || second.len() != batch {
+            return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                format!("B={batch} did not preserve its compact event inventory"),
+            ));
+        }
+        for (index, (first, second)) in first.iter().zip(second.iter()).enumerate() {
+            let request_id = request_ids[index].expect("exact batch request ID exists");
+            if first.request_id != request_id
+                || second.request_id != request_id
+                || first.step.token_id != expected.token_ids[0]
+                || second.step.token_id != expected.token_ids[1]
+                || first.completed.is_some()
+            {
+                return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                    format!("B={batch} request row {index} differs from sequential execution"),
+                ));
+            }
+            let Some(output) = &second.completed else {
+                return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                    format!("B={batch} request row {index} did not complete"),
+                ));
+            };
+            if output.token_ids != expected.token_ids
+                || output.text != expected.text
+                || output.finish_reason != expected.finish_reason
+            {
+                return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                    format!("B={batch} request row {index} output changed"),
+                ));
+            }
+        }
+        if generator.active_requests() != 0 {
+            return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                format!("B={batch} left completed requests active"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn greedy_request(content: &str, maximum: usize) -> ChatGenerationRequest {
+    let mut request = ChatGenerationRequest::new(vec![ChatMessage::new("user", content)]);
+    request.template = ChatTemplateOptions {
+        enable_thinking: Some(false),
+    };
+    request.sampling = SamplingOptions::greedy();
+    request.max_new_tokens = maximum;
+    request
+}
+
+fn run_alone(
+    generator: &mut ResidentBatchGenerator,
+    request: &ChatGenerationRequest,
+) -> Result<GeneratedText, ResidentBatchGenerationQualificationError> {
+    let admission = generator.admit(request)?;
+    if let Some(output) = admission.completed {
+        return Ok(output);
+    }
+    loop {
+        let events = generator.step()?;
+        if events.len() != 1 {
+            return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                "sequential scheduler route produced the wrong event count".to_string(),
+            ));
+        }
+        let event = events.iter().next().expect("one sequential event");
+        if let Some(output) = &event.completed {
+            return Ok(output.clone());
+        }
+    }
+}
+
+fn require_slot(
+    generator: &ResidentBatchGenerator,
+    request: ResidentRequestId,
+    expected: usize,
+) -> Result<(), ResidentBatchGenerationQualificationError> {
+    if generator.qualification_slot(request) != Some(expected) {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            format!(
+                "request {} did not own physical slot {expected}",
+                request.get()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn require_round(
+    events: &tuisko_engine::ResidentBatchEvents,
+    expected: &[(ResidentRequestId, &GeneratedText, usize)],
+) -> Result<(), ResidentBatchGenerationQualificationError> {
+    if events.len() != expected.len() {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            format!(
+                "scheduler round returned {} events, expected {}",
+                events.len(),
+                expected.len()
+            ),
+        ));
+    }
+    for (event, &(request, output, token_index)) in events.iter().zip(expected) {
+        let token = output.token_ids.get(token_index).ok_or_else(|| {
+            ResidentBatchGenerationQualificationError::Mismatch(
+                "sequential oracle has too few output tokens".to_string(),
+            )
+        })?;
+        if event.request_id != request || event.step.token_id != *token {
+            return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                format!(
+                    "request {} differs from its sequential token {token_index}",
+                    request.get()
+                ),
+            ));
+        }
+        let terminal = token_index + 1 == output.token_ids.len();
+        if terminal {
+            let Some(actual) = &event.completed else {
+                return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                    format!(
+                        "request {} did not complete at its oracle boundary",
+                        request.get()
+                    ),
+                ));
+            };
+            if actual.prompt.token_ids != output.prompt.token_ids
+                || actual.token_ids != output.token_ids
+                || actual.text != output.text
+                || actual.finish_reason != output.finish_reason
+            {
+                return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                    format!(
+                        "request {} output differs from sequential execution",
+                        request.get()
+                    ),
+                ));
+            }
+        } else if event.completed.is_some() {
+            return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                format!(
+                    "request {} completed before its sequential boundary",
+                    request.get()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_owner(
+    generator: &ResidentBatchGenerator,
+) -> Result<(), ResidentBatchGenerationQualificationError> {
+    if generator.arena_bytes() != 20_391_493_632 || generator.host_stager_bytes() != 8_028_160 {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "compact scheduler owner byte accounting changed".to_string(),
+        ));
+    }
+    let addresses = generator.qualification_addresses();
+    if addresses[0] == 0 || addresses[1] == 0 || addresses[0] == addresses[1] {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            "compact scheduler owner addresses are invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qualify_resident_batch_generation;
+    use std::path::PathBuf;
+
+    #[test]
+    #[ignore = "requires the pinned snapshot and an exclusive SM120 device"]
+    fn compact_scheduler_matches_sequential_requests_and_recycles_holes()
+    -> Result<(), super::ResidentBatchGenerationQualificationError> {
+        let root = std::env::var_os("TUISKO_SNAPSHOT").ok_or_else(|| {
+            super::ResidentBatchGenerationQualificationError::Mismatch(
+                "set TUISKO_SNAPSHOT to the admitted revision".to_string(),
+            )
+        })?;
+        let report = qualify_resident_batch_generation(&PathBuf::from(root))?;
+        assert_eq!(report.requests, 4);
+        assert_eq!(report.rounds, 3);
+        assert_eq!(report.route_batches, 8);
+        assert_eq!(report.recycled_slot, 1);
+        assert_eq!(report.arena_bytes, 20_391_493_632);
+        assert_eq!(report.host_stager_bytes, 8_028_160);
+        Ok(())
+    }
+}

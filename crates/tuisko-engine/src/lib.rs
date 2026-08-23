@@ -30,7 +30,10 @@ pub use layout::{EndpointLayout, MAX_BATCH};
 pub use nvfp4_mlp::Nvfp4MlpProgram;
 pub use nvfp4_mlp_layout::Nvfp4MlpLayout;
 pub use program::TextEndpointProgram;
-pub use resident_generation::{ResidentGenerationSession, ResidentTextGenerator};
+pub use resident_generation::{
+    ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentBatchGenerator,
+    ResidentGenerationSession, ResidentRequestId, ResidentTextGenerator,
+};
 pub use resident_model_layout::{ResidentLayerKind, ResidentModelLayout, ResidentModelProgram};
 pub use sampling::{SampleDecision, Sampler, SamplingOptions};
 
