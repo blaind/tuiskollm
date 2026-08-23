@@ -38,7 +38,19 @@ An admitted device route requires all of the following in the same feature:
 
 Do not infer composed or end-to-end wall time by adding leaf medians. Do not bless a performance
 baseline to hide a regression. Resource or performance baseline changes remain separate commits.
+Run the device preflight before opening a large source snapshot. Numerical summary assertions must
+respect the represented output dtype and magnitude; they cannot be stricter than the per-value
+acceptance contract at the observed ULP.
+Remote source-backed fixtures must stage and explicitly admit every pinned artifact opened by the
+production path, including frontend files when tokenizer or template ownership is exercised.
+For a reused workspace, inactive-tail checks begin after the widest surviving writer, not
+necessarily the final writer. If an owner's output aliases its next input, a repeated benchmark
+must restore the production input before every measured replay.
 The runner must refuse a busy device or incomparable clocks; it never changes clock or power state.
+After owner warmup, validate clocks under sustained production-graph load before starting a long
+timing matrix. A failed loaded-clock probe ends the run early. If clocks drift only after that
+probe, preserve the completed medians as diagnostic evidence before refusing the run. Explicit
+uncontrolled-clock reports are diagnostic only and can never become performance authority.
 See `docs/performance.md` for commands and measurement semantics.
 
 ## Change discipline
@@ -91,4 +103,9 @@ needed and report any retained pod immediately. Cleanup is worktree-owned until 
 declared lease and grace period expire; never replace it with prefix-wide deletion. Remote
 qualification can satisfy numerical and
 resource gates, but remote benchmark timings are diagnostic and cannot bless a performance
-baseline.
+baseline. Treat provisioning, upload, source staging, and artifact-load errors before the test or
+timing process starts as infrastructure failures, not device evidence. After the same
+pre-execution failure repeats on two billable fresh pods, stop renting equivalent pods; increasing
+`--max-minutes` alone is not a diagnosed change. Ephemeral source pods do not resume the pinned
+23.4 GB snapshot transfer, so another attempt requires a materially different, verified staging
+path. Report that the test ran zero times and diagnose locally.
