@@ -22,6 +22,29 @@ def test_error_hierarchy() -> None:
     assert llm.TuiskoError.__module__ == "tuisko.llm._native"
 
 
+def test_structured_messages_preserve_tool_fields() -> None:
+    function = llm.ChatFunctionCall("lookup_weather", {"city": "Helsinki"})
+    call = llm.ChatToolCall(function, id="call-1")
+    assistant = llm.ChatMessage(
+        "assistant",
+        reasoning_content="I should inspect the weather.",
+        tool_calls=[call],
+    )
+    tool = llm.ChatMessage("tool", "Snow", tool_call_id="call-1")
+
+    assert assistant.role == "assistant"
+    assert assistant.reasoning_content == "I should inspect the weather."
+    assert assistant.tool_calls[0].id == "call-1"
+    assert assistant.tool_calls[0].function.name == "lookup_weather"
+    assert assistant.tool_calls[0].function.arguments == {"city": "Helsinki"}
+    assert tool.tool_call_id == "call-1"
+
+
+def test_tool_arguments_must_be_json_objects() -> None:
+    with pytest.raises(ValueError, match="arguments must be a JSON object"):
+        llm.ChatFunctionCall("bad", [1, 2, 3])  # type: ignore[arg-type]
+
+
 def test_missing_checkpoint_is_rejected(tmp_path: Path) -> None:
     missing = tmp_path / llm.MODEL_REVISION
 
@@ -56,6 +79,67 @@ def test_chat_report_exposes_real_prefix_reuse(frontend: llm.Frontend) -> None:
     assert cold.reused_tokens == 0
     assert warm.reused_tokens == len(warm.token_ids)
     assert warm.fresh_bytes == 0
+
+
+@pytest.mark.checkpoint
+def test_structured_messages_retain_tuple_compatibility(frontend: llm.Frontend) -> None:
+    tuples = [("system", "You are concise."), ("user", "Hello")]
+    structured = [
+        llm.ChatMessage("system", "You are concise."),
+        llm.ChatMessage("user", "Hello"),
+    ]
+
+    assert frontend.render_chat(tuples, enable_thinking=False) == frontend.render_chat(
+        structured, enable_thinking=False
+    )
+
+
+@pytest.mark.checkpoint
+def test_tool_definitions_and_history_reach_the_template(frontend: llm.Frontend) -> None:
+    function = llm.ChatFunctionCall("lookup_weather", {"city": "Helsinki"})
+    messages = [
+        llm.ChatMessage("user", "What is the weather?"),
+        llm.ChatMessage("assistant", tool_calls=[llm.ChatToolCall(function, id="call-1")]),
+        llm.ChatMessage("tool", "Snow", tool_call_id="call-1"),
+    ]
+    tools: list[dict[str, object]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "description": "Get current weather",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    rendered = frontend.render_chat(
+        messages,
+        enable_thinking=False,
+        preserve_thinking=False,
+        reasoning_effort="high",
+        tools=tools,
+    )
+
+    assert "lookup_weather" in rendered
+    assert "Helsinki" in rendered
+    assert "Snow" in rendered
+
+
+@pytest.mark.checkpoint
+def test_streaming_decoder_matches_complete_decode(frontend: llm.Frontend) -> None:
+    token_ids = frontend.encode("Hello, maailma ✨")
+    decoder = frontend.streaming_decoder()
+    deltas = [delta for token_id in token_ids if (delta := decoder.push(token_id)) is not None]
+    final = decoder.finish()
+    if final is not None:
+        deltas.append(final)
+
+    assert "".join(deltas) == frontend.decode(token_ids)
+    assert decoder.text == frontend.decode(token_ids)
+    assert decoder.finish() is None
+    with pytest.raises(llm.FrontendError, match="after finishing"):
+        decoder.push(token_ids[0])
 
 
 @pytest.mark.checkpoint
