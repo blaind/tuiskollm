@@ -19,12 +19,12 @@ cargo run -p xtask -- bootstrap-cuda-oxide
 cargo run -p xtask -- build-server
 ```
 
-The output is `target/cuda-oxide-build/release/tuiskollm`. A plain `cargo build` cannot finalize the
-embedded device artifacts. Start the exact resident server with the pinned snapshot directory and
-an optional numeric listen address:
+The output is `target/cuda-oxide-build-sm120/release/tuiskollm`. A plain `cargo build` cannot
+finalize the embedded device artifacts. Start the exact resident server with the pinned snapshot
+directory and an optional numeric listen address:
 
 ```bash
-target/cuda-oxide-build/release/tuiskollm serve SNAPSHOT 127.0.0.1:8000
+target/cuda-oxide-build-sm120/release/tuiskollm serve SNAPSHOT 127.0.0.1:8000
 ```
 
 It exposes `GET /health`, `GET /v1/models`, and OpenAI-compatible blocking or SSE
