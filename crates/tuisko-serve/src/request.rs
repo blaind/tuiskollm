@@ -13,6 +13,7 @@ pub const SERVED_MODEL: &str = Qwen38_27B::MODEL_ID;
 
 /// OpenAI chat-completion request fields admitted by the current text product.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
@@ -60,6 +61,7 @@ struct StreamOptions {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatTemplateKwargs {
     #[serde(default)]
     enable_thinking: Option<bool>,
@@ -335,5 +337,26 @@ mod tests {
         let error = serde_json::from_str::<ChatCompletionRequest>(&unknown_stream_option)
             .expect_err("unknown stream options must not be ignored");
         assert!(error.to_string().contains("unknown field `usage`"));
+    }
+
+    #[test]
+    fn unsupported_wire_fields_are_never_silently_discarded() {
+        let cases = [
+            r#""response_format":{"type":"json_object"}"#,
+            r#""chat_template_kwargs":{"unknown":true}"#,
+            r#""messages":[{"role":"user","content":"x","name":"alice"}]"#,
+            r#""messages":[{"role":"user","content":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}]}]"#,
+        ];
+        for extra in cases {
+            let body = if extra.starts_with("\"messages\"") {
+                format!(r#"{{"model":"{SERVED_MODEL}",{extra}}}"#)
+            } else {
+                format!(
+                    r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"x"}}],{extra}}}"#
+                )
+            };
+            serde_json::from_str::<ChatCompletionRequest>(&body)
+                .expect_err("unsupported request fields must fail admission");
+        }
     }
 }
