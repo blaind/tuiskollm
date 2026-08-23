@@ -195,6 +195,15 @@ impl ResidentUploadPlan {
         self.initialized_bytes
     }
 
+    /// Source-backed weight bytes requiring one exact host-preparation route.
+    pub fn weight_bytes_for(&self, preparation: ResidentUploadPreparation) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.source.is_weight() && entry.preparation == preparation)
+            .map(|entry| entry.bytes)
+            .sum()
+    }
+
     pub(super) fn preparation_for(
         &self,
         arena: ResidentUploadArena,
@@ -809,6 +818,18 @@ mod tests {
         assert_eq!(count(ResidentUploadPreparation::SwizzledSource), 112);
         assert_eq!(count(ResidentUploadPreparation::HostDerived), 3);
         assert_eq!(count(ResidentUploadPreparation::Zero), 48 * 2 + 27 + 16 * 2);
+        assert_eq!(
+            plan.weight_bytes_for(ResidentUploadPreparation::BorrowedSource),
+            16_945_778_688
+        );
+        assert_eq!(
+            plan.weight_bytes_for(ResidentUploadPreparation::GatheredSource),
+            1_222_049_792
+        );
+        assert_eq!(
+            plan.weight_bytes_for(ResidentUploadPreparation::SwizzledSource),
+            935_854_080
+        );
     }
 
     #[test]

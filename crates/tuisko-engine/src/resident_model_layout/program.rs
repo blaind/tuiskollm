@@ -111,10 +111,17 @@ pub struct ResidentLoadStats {
     arena_allocation_ns: u64,
     operator_setup_ns: u64,
     weight_prepare_ns: u64,
+    source_binding_ns: u64,
+    qkv_gather_ns: u64,
+    nvfp4_materialize_ns: u64,
+    preparation_other_ns: u64,
     weight_copy_ns: u64,
     weight_load_ns: u64,
     nonweight_init_ns: u64,
     graph_capture_ns: u64,
+    borrowed_source_bytes: usize,
+    gathered_source_bytes: usize,
+    swizzled_source_bytes: usize,
 }
 
 impl ResidentLoadStats {
@@ -163,6 +170,26 @@ impl ResidentLoadStats {
         self.weight_prepare_ns
     }
 
+    /// Host nanoseconds spent binding and validating exact source families.
+    pub const fn source_binding_ns(self) -> u64 {
+        self.source_binding_ns
+    }
+
+    /// Host nanoseconds spent gathering separate Q/K/V planes into resident order.
+    pub const fn qkv_gather_ns(self) -> u64 {
+        self.qkv_gather_ns
+    }
+
+    /// Host nanoseconds spent losslessly swizzling NVFP4 scale planes.
+    pub const fn nvfp4_materialize_ns(self) -> u64 {
+        self.nvfp4_materialize_ns
+    }
+
+    /// Remaining host preparation not attributed to binding, QKV gathering, or NVFP4 swizzling.
+    pub const fn preparation_other_ns(self) -> u64 {
+        self.preparation_other_ns
+    }
+
     /// Host nanoseconds spent inside CUDA host-to-device copy calls and their required waits.
     pub const fn weight_copy_ns(self) -> u64 {
         self.weight_copy_ns
@@ -181,6 +208,37 @@ impl ResidentLoadStats {
     /// Host nanoseconds spent binding stable pointers and capturing the graph inventory.
     pub const fn graph_capture_ns(self) -> u64 {
         self.graph_capture_ns
+    }
+
+    /// Weight bytes borrowed directly from admitted mmap-backed source planes.
+    pub const fn borrowed_source_bytes(self) -> usize {
+        self.borrowed_source_bytes
+    }
+
+    /// Weight bytes gathered from multiple admitted source planes.
+    pub const fn gathered_source_bytes(self) -> usize {
+        self.gathered_source_bytes
+    }
+
+    /// Weight bytes losslessly swizzled into kernel scale order.
+    pub const fn swizzled_source_bytes(self) -> usize {
+        self.swizzled_source_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ResidentPreparationStats {
+    source_binding_ns: u64,
+    qkv_gather_ns: u64,
+    nvfp4_materialize_ns: u64,
+}
+
+impl ResidentPreparationStats {
+    fn total_ns(self) -> EngineResult<u64> {
+        self.source_binding_ns
+            .checked_add(self.qkv_gather_ns)
+            .and_then(|total| total.checked_add(self.nvfp4_materialize_ns))
+            .ok_or_else(|| EngineError::layout("resident preparation timing overflows"))
     }
 }
 
@@ -281,6 +339,12 @@ impl ResidentModelProgram {
         let layout_start = Instant::now();
         let layout = ResidentModelLayout::build()?;
         let upload_plan = ResidentUploadPlan::build(&layout)?;
+        let borrowed_source_bytes =
+            upload_plan.weight_bytes_for(ResidentUploadPreparation::BorrowedSource);
+        let gathered_source_bytes =
+            upload_plan.weight_bytes_for(ResidentUploadPreparation::GatheredSource);
+        let swizzled_source_bytes =
+            upload_plan.weight_bytes_for(ResidentUploadPreparation::SwizzledSource);
         let layout_plan_ns = elapsed_ns("resident layout and upload plan", layout_start)?;
 
         let allocation_start = Instant::now();
@@ -333,7 +397,14 @@ impl ResidentModelProgram {
                     arena: &arena,
                     copy_ns: 0,
                 };
-                let scalars = load_source_weights(&mut sink, &stream, &layout, snapshot.as_ref())?;
+                let mut preparation = ResidentPreparationStats::default();
+                let scalars = load_source_weights(
+                    &mut sink,
+                    &stream,
+                    &layout,
+                    snapshot.as_ref(),
+                    &mut preparation,
+                )?;
                 let weight_load_ns = elapsed_ns("resident legacy weight load", weight_start)?;
                 let weight_copy_ns = sink.copy_ns;
                 let weight_prepare_ns =
@@ -342,6 +413,11 @@ impl ResidentModelProgram {
                             "legacy weight-copy time exceeds total weight-load time",
                         )
                     })?;
+                let preparation_other_ns = weight_prepare_ns
+                    .checked_sub(preparation.total_ns()?)
+                    .ok_or_else(|| {
+                    EngineError::layout("classified legacy preparation exceeds total preparation")
+                })?;
 
                 let nonweight_start = Instant::now();
                 initialize_metadata(&arena, &kv_arena, &stream, &layout)?;
@@ -362,10 +438,17 @@ impl ResidentModelProgram {
                     arena_allocation_ns,
                     operator_setup_ns,
                     weight_prepare_ns,
+                    source_binding_ns: preparation.source_binding_ns,
+                    qkv_gather_ns: preparation.qkv_gather_ns,
+                    nvfp4_materialize_ns: preparation.nvfp4_materialize_ns,
+                    preparation_other_ns,
                     weight_copy_ns,
                     weight_load_ns,
                     nonweight_init_ns,
                     graph_capture_ns: 0,
+                    borrowed_source_bytes,
+                    gathered_source_bytes,
+                    swizzled_source_bytes,
                 };
                 (arena, kv_arena, scalars, load_stats)
             }
@@ -374,7 +457,7 @@ impl ResidentModelProgram {
                 mut kv_arena,
             } => {
                 let weight_start = Instant::now();
-                let (scalars, upload_bytes, upload_submissions, weight_copy_ns) = {
+                let (scalars, upload_bytes, upload_submissions, weight_copy_ns, preparation) = {
                     let mut sink = SelectiveWeightSink {
                         arena: &mut arena,
                         plan: &upload_plan,
@@ -382,9 +465,21 @@ impl ResidentModelProgram {
                         submissions: 0,
                         copy_ns: 0,
                     };
-                    let scalars =
-                        load_source_weights(&mut sink, &stream, &layout, snapshot.as_ref())?;
-                    (scalars, sink.bytes, sink.submissions, sink.copy_ns)
+                    let mut preparation = ResidentPreparationStats::default();
+                    let scalars = load_source_weights(
+                        &mut sink,
+                        &stream,
+                        &layout,
+                        snapshot.as_ref(),
+                        &mut preparation,
+                    )?;
+                    (
+                        scalars,
+                        sink.bytes,
+                        sink.submissions,
+                        sink.copy_ns,
+                        preparation,
+                    )
                 };
                 let weight_load_ns = elapsed_ns("resident selective weight load", weight_start)?;
                 let weight_prepare_ns =
@@ -393,6 +488,13 @@ impl ResidentModelProgram {
                             "selective weight-copy time exceeds total weight-load time",
                         )
                     })?;
+                let preparation_other_ns = weight_prepare_ns
+                    .checked_sub(preparation.total_ns()?)
+                    .ok_or_else(|| {
+                    EngineError::layout(
+                        "classified selective preparation exceeds total preparation",
+                    )
+                })?;
 
                 let nonweight_start = Instant::now();
                 let metadata = initialize_selective_nonweights(
@@ -435,10 +537,17 @@ impl ResidentModelProgram {
                     arena_allocation_ns,
                     operator_setup_ns,
                     weight_prepare_ns,
+                    source_binding_ns: preparation.source_binding_ns,
+                    qkv_gather_ns: preparation.qkv_gather_ns,
+                    nvfp4_materialize_ns: preparation.nvfp4_materialize_ns,
+                    preparation_other_ns,
                     weight_copy_ns,
                     weight_load_ns,
                     nonweight_init_ns,
                     graph_capture_ns: 0,
+                    borrowed_source_bytes,
+                    gathered_source_bytes,
+                    swizzled_source_bytes,
                 };
                 (arena, kv_arena, scalars, load_stats)
             }
@@ -2345,14 +2454,26 @@ fn load_source_weights<S: ResidentWeightSink>(
     stream: &CudaStream,
     layout: &ResidentModelLayout,
     snapshot: &CheckpointSnapshot<Qwen38_27B>,
+    preparation: &mut ResidentPreparationStats,
 ) -> EngineResult<Vec<LayerScalars>> {
     let mut scalars = Vec::with_capacity(layout.layers.len());
     for (layer_index, layer) in layout.layers.iter().enumerate() {
-        let mixer = load_mixer(arena, stream, layer_index, layer.mixer, snapshot)?;
-        let mlp = load_mlp(arena, stream, layer_index, layer.mlp, snapshot)?;
+        let mixer = load_mixer(
+            arena,
+            stream,
+            layer_index,
+            layer.mixer,
+            snapshot,
+            preparation,
+        )?;
+        let mlp = load_mlp(arena, stream, layer_index, layer.mlp, snapshot, preparation)?;
         scalars.push(LayerScalars { mixer, mlp });
     }
-    let endpoint = TextEndpointBindings::bind(snapshot)?;
+    let endpoint = measure_preparation(
+        &mut preparation.source_binding_ns,
+        "resident endpoint source binding",
+        || Ok(TextEndpointBindings::bind(snapshot)?),
+    )?;
     arena.copy_from_host(
         stream,
         layout.endpoint.final_norm,
@@ -2378,10 +2499,15 @@ fn load_mixer<S: ResidentWeightSink>(
     layer: usize,
     weights: MixerWeights,
     snapshot: &CheckpointSnapshot<Qwen38_27B>,
+    preparation: &mut ResidentPreparationStats,
 ) -> EngineResult<MixerScalars> {
     match weights {
         MixerWeights::Gdn(weights) => {
-            let source = GdnBindings::bind(snapshot, layer)?;
+            let source = measure_preparation(
+                &mut preparation.source_binding_ns,
+                "resident GDN source binding",
+                || Ok(GdnBindings::bind(snapshot, layer)?),
+            )?;
             arena.copy_from_host(
                 stream,
                 weights.input_norm,
@@ -2434,8 +2560,21 @@ fn load_mixer<S: ResidentWeightSink>(
             Ok(MixerScalars::Gdn)
         }
         MixerWeights::Attention(weights) => {
-            let qkv = FullAttentionQkvBindings::bind(snapshot, layer)?.materialize()?;
-            let source = FullAttentionPostBindings::bind(snapshot, layer)?;
+            let qkv = measure_preparation(
+                &mut preparation.source_binding_ns,
+                "resident attention QKV source binding",
+                || Ok(FullAttentionQkvBindings::bind(snapshot, layer)?),
+            )?;
+            let qkv = measure_preparation(
+                &mut preparation.qkv_gather_ns,
+                "resident attention QKV gather",
+                || Ok(qkv.materialize()?),
+            )?;
+            let source = measure_preparation(
+                &mut preparation.source_binding_ns,
+                "resident attention post source binding",
+                || Ok(FullAttentionPostBindings::bind(snapshot, layer)?),
+            )?;
             arena.copy_from_host(
                 stream,
                 weights.input_norm,
@@ -2486,11 +2625,30 @@ fn load_mlp<S: ResidentWeightSink>(
     layer: usize,
     weights: MlpWeights,
     snapshot: &CheckpointSnapshot<Qwen38_27B>,
+    preparation: &mut ResidentPreparationStats,
 ) -> EngineResult<MlpScalars> {
     match weights {
         MlpWeights::Nvfp4(weights) => {
-            let gate_up = Nvfp4GateUpBindings::bind(snapshot, layer)?.materialize()?;
-            let down = Nvfp4DownBindings::bind(snapshot, layer)?.materialize()?;
+            let gate_up = measure_preparation(
+                &mut preparation.source_binding_ns,
+                "resident NVFP4 gate/up source binding",
+                || Ok(Nvfp4GateUpBindings::bind(snapshot, layer)?),
+            )?;
+            let gate_up = measure_preparation(
+                &mut preparation.nvfp4_materialize_ns,
+                "resident NVFP4 gate/up materialization",
+                || Ok(gate_up.materialize()?),
+            )?;
+            let down = measure_preparation(
+                &mut preparation.source_binding_ns,
+                "resident NVFP4 down source binding",
+                || Ok(Nvfp4DownBindings::bind(snapshot, layer)?),
+            )?;
+            let down = measure_preparation(
+                &mut preparation.nvfp4_materialize_ns,
+                "resident NVFP4 down materialization",
+                || Ok(down.materialize()?),
+            )?;
             arena.copy_from_host(stream, weights.gate_weight_codes, gate_up.gate_weight_e2m1)?;
             arena.copy_from_host(stream, weights.up_weight_codes, gate_up.up_weight_e2m1)?;
             arena.copy_from_host(
@@ -2512,8 +2670,16 @@ fn load_mlp<S: ResidentWeightSink>(
             }))
         }
         MlpWeights::DenseFp8(weights) => {
-            let gate_up = DenseFp8GateUpBindings::bind(snapshot, layer)?;
-            let down = DenseFp8DownBindings::bind(snapshot, layer)?;
+            let gate_up = measure_preparation(
+                &mut preparation.source_binding_ns,
+                "resident dense-FP8 gate/up source binding",
+                || Ok(DenseFp8GateUpBindings::bind(snapshot, layer)?),
+            )?;
+            let down = measure_preparation(
+                &mut preparation.source_binding_ns,
+                "resident dense-FP8 down source binding",
+                || Ok(DenseFp8DownBindings::bind(snapshot, layer)?),
+            )?;
             arena.copy_from_host(stream, weights.gate_up_weight_codes, gate_up.weight_e4m3)?;
             arena.copy_from_host(
                 stream,
@@ -2805,6 +2971,19 @@ fn require_batch(batch: usize) -> EngineResult<()> {
 fn elapsed_ns(phase: &str, started: Instant) -> EngineResult<u64> {
     u64::try_from(started.elapsed().as_nanos())
         .map_err(|_| EngineError::layout(format!("{phase} duration exceeds u64 nanoseconds")))
+}
+
+fn measure_preparation<T>(
+    counter: &mut u64,
+    phase: &str,
+    operation: impl FnOnce() -> EngineResult<T>,
+) -> EngineResult<T> {
+    let started = Instant::now();
+    let result = operation();
+    *counter = counter
+        .checked_add(elapsed_ns(phase, started)?)
+        .ok_or_else(|| EngineError::layout(format!("{phase} timing overflows")))?;
+    result
 }
 
 fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
