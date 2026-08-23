@@ -506,6 +506,11 @@ impl ResidentBatchGenerator {
         self.program.context()
     }
 
+    /// Exact loading work used to construct the shared resident program.
+    pub const fn load_stats(&self) -> crate::ResidentLoadStats {
+        self.program.load_stats()
+    }
+
     #[cfg(feature = "qualification")]
     /// Stable device-arena and pinned-logit addresses owned by this scheduler.
     pub fn qualification_addresses(&self) -> [usize; 3] {
