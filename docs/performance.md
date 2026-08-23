@@ -17,14 +17,22 @@ KV-cache append at exact `B=1..8` and `T=32,64,128,1024`. Short-context paged GQ
 24-query/4-KV-head, 256-wide online-softmax decode across page boundaries at `B=1..8` plus causal
 shared-cache prefill tails at `T=32,64,128`. Each prefill CTA stages one 64-position represented
 E4M3 K/V tile once for two adjacent tokens and their twelve grouped-query warps. Deep `T=128`
-prefill tails select eight partitions for contexts 129 through 32,768 and sixteen partitions
-through 220,000, publish complete FP32 maximum/denominator/numerator states, and reduce them into
-the public output seam. Long-context paged GQA retains
+prefill tails use 256-thread FP8/F16 flash CTAs over 32 query rows and one query head. P8 uses
+64-position tiles for contexts 129 through 32,768; P16 uses 32-position tiles through 220,000 so
+its 43,520-byte single buffer preserves two-CTA residency. Both publish complete FP32
+maximum/denominator/numerator states and reduce them into the public output seam. Long-context
+paged GQA retains
 the same represented cache contract and partitions contexts through 220,000 positions into
 256-position partial softmaxes plus one exact reduction at `B=1..8`; macro-prefill attention
 remains a separate future route. The resident text owner composes all 48 GDN layers, 16 attention
 layers, source-routed MLPs, and the LM head into one directly timed graph at every exact `B=1..8`;
 serving cases remain future work.
+
+A controlled three-sample diagnostic at fixed 2,197 MHz SM and 13,801 MHz memory clocks measured
+the flash graph at 1,435.908 microseconds for `T=128/P=8/context=32768` and 2,895.660 microseconds
+for `T=128/P=16/context=98304`. The directly comparable scalar graph measured 9,215.848 and
+26,462.204 microseconds, respectively. These reports remain ignored artifacts under `target/`;
+they are candidate evidence, not a blessed timing baseline.
 
 SM89 has separate remote-only diagnostic suites for the exact `[34816,5120]` NVFP4 gate/up,
 `[5120,17408]` down, and dynamic-quantize FP8 `[14336,5120]` QKV owners at `B=1..8`. The NVFP4
@@ -461,8 +469,9 @@ Paged GQA `B=1..8` cases are `operator/decode` at context 130. Its shared `T=32,
 `operator/prefill`; token `i` attends a two-token prefix plus the causal span through `i`. Logical
 bytes charge each K/V tile once per adjacent-token/KV-head group rather than duplicating its six
 query-head consumers. The partitioned `T=128` P8/P16 cases are also `operator/prefill`; accounting
-includes repeated per-partition query reads, one K/V load per adjacent-token/KV-head group, and
-both the producer writes and reducer reads of every complete FP32 partial state.
+includes one query read per active partition, one K/V load per 32-row/query-head group, exact
+length/table/page metadata reads, and both the producer writes and reducer reads of every complete
+FP32 partial state.
 Dense-FP8-SwiGLU `T=32,64,128` cases are `operator/prefill` cases with prompt and context lengths
 equal to the active rows. Concurrency, output, and prefix cache do not apply to these leaf suites.
 

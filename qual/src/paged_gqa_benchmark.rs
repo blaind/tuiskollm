@@ -478,15 +478,28 @@ fn shared_prefill_logical_bytes(tokens: usize) -> usize {
 
 fn partitioned_prefill_logical_bytes(context_tokens: usize, partitions: usize) -> usize {
     let first_length = context_tokens - MAX_TOKENS + 1;
-    let shared_positions = (0..MAX_TOKENS)
-        .step_by(2)
-        .map(|first_token| first_length + first_token + 1)
-        .sum::<usize>();
-    let query = MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>() * partitions;
-    let cache = 2 * Qwen38_27B::NUM_KV_HEADS * shared_positions * Qwen38_27B::HEAD_DIM;
-    let metadata = Qwen38_27B::NUM_KV_HEADS
-        * (partitions * (MAX_TOKENS + MAX_TOKENS / 2) + shared_positions)
-        * size_of::<u32>();
+    let key_tile = match partitions {
+        8 => 64,
+        16 => 32,
+        _ => unreachable!(),
+    };
+    let mut query = 0usize;
+    let mut cache = 0usize;
+    let mut metadata = 0usize;
+    for first_token in (0..MAX_TOKENS).step_by(32) {
+        let group_length = first_length + first_token + 31;
+        let key_tiles = group_length.div_ceil(key_tile);
+        let active_partitions = partitions.min(key_tiles);
+        query += active_partitions
+            * 32
+            * Qwen38_27B::NUM_ATTENTION_HEADS
+            * Qwen38_27B::HEAD_DIM
+            * size_of::<f32>();
+        cache += 2 * Qwen38_27B::NUM_ATTENTION_HEADS * group_length * Qwen38_27B::HEAD_DIM;
+        metadata += Qwen38_27B::NUM_ATTENTION_HEADS
+            * (partitions + active_partitions * (1 + 32) + key_tiles)
+            * size_of::<u32>();
+    }
     let partials = MAX_TOKENS
         * Qwen38_27B::NUM_ATTENTION_HEADS
         * partitions
@@ -595,11 +608,29 @@ mod tests {
                 partitions
             );
             let logical = partitioned_prefill_logical_bytes(context_tokens, partitions);
+            let first_length = context_tokens - MAX_TOKENS + 1;
+            let key_tile = if partitions == 8 { 64 } else { 32 };
+            let groups = (0..MAX_TOKENS)
+                .step_by(32)
+                .map(|first_token| first_length + first_token + 31)
+                .collect::<Vec<_>>();
+            let cache = 2
+                * Qwen38_27B::NUM_ATTENTION_HEADS
+                * groups.iter().sum::<usize>()
+                * Qwen38_27B::HEAD_DIM;
+            let query =
+                MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS * partitions * size_of::<f32>();
             let partials = MAX_TOKENS
                 * Qwen38_27B::NUM_ATTENTION_HEADS
                 * partitions
                 * (Qwen38_27B::HEAD_DIM + 2)
                 * 4;
+            assert!(logical > query + cache + 2 * partials);
+            assert!(
+                groups
+                    .iter()
+                    .all(|group_length| group_length.div_ceil(key_tile) >= partitions)
+            );
             assert!(logical > 2 * partials);
             assert!(logical > shared_prefill_logical_bytes(MAX_TOKENS));
         }

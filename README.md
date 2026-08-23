@@ -68,10 +68,12 @@ addition to `B=1..8` decode and `T=16` MTP. Q/K zero-centered normalization, MRo
 E4M3 cache append admit the same four prefill widths alongside `B=1..8` decode. Paged GQA and
 attention now also admits shared-cache causal `T=32,64,128` early-context tails: one 384-thread CTA
 shares each 64-position E4M3 K/V tile across two tokens and their twelve grouped-query warps. Exact
-deep `T=128` tails use eight context partitions through 32,768 positions and sixteen through
-220,000, then merge their complete FP32 softmax states into the public output seam. Macro `T=1024`
-and attention-output prefill remain separate future slices, so these leaves do not yet change
-server prompt priming.
+deep `T=128` tails use FP8/F16 flash attention: one 256-thread CTA owns 32 query rows, one query
+head, and one partition; dynamically represented E4M3 Q and source E4M3 K feed QK Tensor Cores,
+while represented F16 probabilities and V feed PV Tensor Cores. P8 uses 64-position tiles through
+32,768 positions, P16 uses 32-position tiles through 220,000, and both publish complete FP32
+softmax states to the existing reducer. Macro `T=1024` and attention-output prefill remain separate
+future slices, so these leaves do not yet change server prompt priming.
 
 ## Current device slice
 

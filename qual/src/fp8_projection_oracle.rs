@@ -103,6 +103,69 @@ pub(crate) fn f32_to_bf16(value: f32) -> u16 {
     (rounded >> 16) as u16
 }
 
+pub(crate) fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = bits & 0x8000_0000;
+    let exponent = bits & 0x7f80_0000;
+    let mantissa = bits & 0x007f_ffff;
+    if exponent == 0x7f80_0000 {
+        let nan = if mantissa == 0 { 0 } else { 0x0200 };
+        return ((sign >> 16) | 0x7c00 | nan | (mantissa >> 13)) as u16;
+    }
+
+    let half_sign = sign >> 16;
+    let half_exponent = ((exponent >> 23) as i32) - 127 + 15;
+    if half_exponent >= 0x1f {
+        return (half_sign | 0x7c00) as u16;
+    }
+    if half_exponent <= 0 {
+        if 14 - half_exponent > 24 {
+            return half_sign as u16;
+        }
+        let mantissa = mantissa | 0x0080_0000;
+        let mut half_mantissa = mantissa >> (14 - half_exponent);
+        let round_bit = 1 << (13 - half_exponent);
+        if mantissa & round_bit != 0 && mantissa & (3 * round_bit - 1) != 0 {
+            half_mantissa += 1;
+        }
+        return (half_sign | half_mantissa) as u16;
+    }
+
+    let half_exponent = (half_exponent as u32) << 10;
+    let half_mantissa = mantissa >> 13;
+    let round_bit = 0x1000;
+    if mantissa & round_bit != 0 && mantissa & (3 * round_bit - 1) != 0 {
+        (half_sign | half_exponent | half_mantissa) as u16 + 1
+    } else {
+        (half_sign | half_exponent | half_mantissa) as u16
+    }
+}
+
+pub(crate) fn f16_to_f32(bits: u16) -> f32 {
+    if bits & 0x7fff == 0 {
+        return f32::from_bits(u32::from(bits) << 16);
+    }
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = u32::from(bits & 0x7c00);
+    let mantissa = u32::from(bits & 0x03ff);
+    if exponent == 0x7c00 {
+        return if mantissa == 0 {
+            f32::from_bits(sign | 0x7f80_0000)
+        } else {
+            f32::from_bits(sign | 0x7fc0_0000 | (mantissa << 13))
+        };
+    }
+    if exponent == 0 {
+        let adjustment = mantissa.leading_zeros() - 22;
+        let exponent = (127 - 15 - adjustment) << 23;
+        let mantissa = (mantissa << (14 + adjustment)) & 0x007f_ffff;
+        return f32::from_bits(sign | exponent | mantissa);
+    }
+
+    let exponent = (((exponent >> 10) as i32 - 15 + 127) as u32) << 23;
+    f32::from_bits(sign | exponent | (mantissa << 13))
+}
+
 pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
@@ -111,6 +174,8 @@ pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
 pub(crate) fn verify_host_codecs() -> Result<(), String> {
     if f32_to_bf16(1.0 + 0.00390625) != 0x3f80
         || f32_to_bf16(bf16_to_f32(0x3f81) + 0.00390625) != 0x3f82
+        || f32_to_f16(1.0 + 2.0f32.powi(-11)) != 0x3c00
+        || f16_to_f32(0x3c01) != 1.0 + 2.0f32.powi(-10)
         || encode_e4m3fn(1.0)? != 0x38
         || encode_e4m3fn(-0.5)? != 0xb0
         || decode_e4m3fn(0x7e)? != 448.0
