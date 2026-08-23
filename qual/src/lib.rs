@@ -141,7 +141,7 @@ pub use attention_output_benchmark::benchmark_attention_output;
 #[cfg(feature = "device")]
 pub use attention_qk_prepare::{
     AttentionQkPrepareQualification, AttentionQkPrepareQualificationError,
-    qualify_attention_qk_prepare,
+    qualify_attention_qk_prepare, qualify_qwen35_attention_qk_prepare,
 };
 #[cfg(feature = "device")]
 pub use attention_qk_prepare_benchmark::benchmark_attention_qk_prepare;

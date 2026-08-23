@@ -20,8 +20,7 @@ use tuisko_qual::{
     benchmark_nvfp4_mlp, benchmark_paged_gqa, benchmark_qwen35_nvfp4_down,
     benchmark_qwen35_nvfp4_mlp, benchmark_qwen35_nvfp4_qkv, benchmark_qwen35_nvfp4_swiglu,
     benchmark_qwen35_residual_norm, benchmark_resident_long_context_model,
-    benchmark_resident_model, benchmark_text_endpoint,
-    profile_resident_model,
+    benchmark_resident_model, benchmark_text_endpoint, profile_resident_model,
 };
 
 fn main() -> ExitCode {
