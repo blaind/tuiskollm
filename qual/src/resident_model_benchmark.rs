@@ -6,12 +6,14 @@ use crate::device_benchmark::{
     OperationAccounting, finish_report, generator_baseline_sha256, measure_cases, preflight,
     require_current_process_exclusive, warmup_launches,
 };
+use serde::Serialize;
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
-    MAX_BATCH, ResidentDecodeRoute, ResidentEmbeddingStageGraph, ResidentModelProgram,
+    MAX_BATCH, ResidentDecodeRoute, ResidentEmbeddingStageGraph, ResidentLayerKind,
+    ResidentModelLayout, ResidentModelProgram,
 };
-use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuTimer};
+use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuTimer, profiler_start, profiler_stop};
 use tuisko_kernels_sm120::{LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
@@ -25,6 +27,48 @@ const LONG_ROUTE_SLOTS: [usize; MAX_BATCH] = [7, 0, 6, 1, 5, 2, 4, 3];
 enum BenchmarkProfile {
     Short,
     Long,
+}
+
+/// One semantic production-owner range in the resident CUDA Graph.
+#[derive(Debug, Serialize)]
+pub struct ResidentProfileStage {
+    /// Stable stage order within one complete graph replay.
+    pub ordinal: usize,
+    /// One-based first CUDA Graph node expected for this stage.
+    pub first_graph_node_ordinal: usize,
+    /// Number of kernel nodes launched by the production owner.
+    pub kernel_nodes: usize,
+    /// Decoder layer, or `None` for input/endpoint stages.
+    pub layer: Option<usize>,
+    /// Semantic boundary within the layer or endpoint.
+    pub component: &'static str,
+    /// Exact source route selected by the resident layout.
+    pub source_route: &'static str,
+    /// Kernel-name families expected in graph order.
+    pub kernel_families: Vec<&'static str>,
+}
+
+/// Semantic sidecar for joining profiler nodes to exact resident owners.
+#[derive(Debug, Serialize)]
+pub struct ResidentModelProfileManifest {
+    /// Manifest schema revision.
+    pub schema_version: u32,
+    /// Exact profiling boundary.
+    pub suite: &'static str,
+    /// Compiled decode batch.
+    pub batch_size: usize,
+    /// Fixed warmed attention context.
+    pub context_tokens: usize,
+    /// Warmups completed before the captured replays.
+    pub warmup_launches: u64,
+    /// Complete production graph replays requested from the profiler process.
+    pub captured_replays: u64,
+    /// CUDA-generated structural graph inventory.
+    pub graph_dot: String,
+    /// Complete expected kernel-node inventory for one replay.
+    pub graph_kernel_nodes: usize,
+    /// Ordered semantic production-owner ranges.
+    pub stages: Vec<ResidentProfileStage>,
 }
 
 struct Session {
@@ -129,9 +173,13 @@ impl Session {
         &self,
         embedding_graphs: &[ResidentEmbeddingStageGraph<'_>; MAX_BATCH],
         launches: u64,
+        selected_batch_size: Option<u32>,
     ) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
             for batch in 1..=MAX_BATCH {
+                if selected_batch_size.is_some_and(|selected| selected as usize != batch) {
+                    continue;
+                }
                 embedding_graphs[batch - 1].graph().launch(&self.stream)?;
                 self.program
                     .qualification_graph(self.routes[batch - 1])
@@ -265,6 +313,196 @@ fn long_gqa_bytes(context_lengths: &[usize]) -> usize {
         .sum()
 }
 
+/// Replays the exact resident graph under an external profiler and emits its structural inventory.
+pub fn profile_resident_model(
+    root: &Path,
+    batch: usize,
+    warmup_launches: u64,
+    captured_replays: u64,
+    graph_dot: &Path,
+) -> Result<ResidentModelProfileManifest, DeviceBenchmarkError> {
+    if !(1..=MAX_BATCH).contains(&batch) || warmup_launches == 0 || captured_replays == 0 {
+        return Err(DeviceBenchmarkError::Precondition(
+            "resident profile requires B=1..8 and nonzero warmup/captured replay counts"
+                .to_string(),
+        ));
+    }
+    let _preflight = preflight()?;
+    let session = Session::new(root, BenchmarkProfile::Short)?;
+    let embedding_graphs = session.embedding_graphs()?;
+    session.warm(&embedding_graphs, warmup_launches, Some(batch as u32))?;
+    require_current_process_exclusive()?;
+    session
+        .program
+        .qualification_graph(session.routes[batch - 1])
+        .debug_dot(graph_dot)?;
+    profiler_start(&session._context)?;
+    for _ in 0..captured_replays {
+        embedding_graphs[batch - 1]
+            .graph()
+            .launch(&session.stream)?;
+        session.stream.synchronize().map_err(GpuError::from)?;
+        session
+            .program
+            .qualification_graph(session.routes[batch - 1])
+            .launch(&session.stream)?;
+        session.stream.synchronize().map_err(GpuError::from)?;
+    }
+    profiler_stop(&session._context)?;
+    require_current_process_exclusive()?;
+
+    Ok(resident_profile_manifest(
+        session.program.layout(),
+        batch,
+        warmup_launches,
+        captured_replays,
+        graph_dot,
+    ))
+}
+
+fn resident_profile_manifest(
+    layout: &ResidentModelLayout,
+    batch: usize,
+    warmup_launches: u64,
+    captured_replays: u64,
+    graph_dot: &Path,
+) -> ResidentModelProfileManifest {
+    let mut stages = Vec::new();
+    let mut next_node = 1usize;
+    let mut push = |layer, component, source_route, kernel_families: Vec<&'static str>| {
+        let kernel_nodes = kernel_families.len();
+        stages.push(ResidentProfileStage {
+            ordinal: stages.len() + 1,
+            first_graph_node_ordinal: next_node,
+            kernel_nodes,
+            layer,
+            component,
+            source_route,
+            kernel_families,
+        });
+        next_node += kernel_nodes;
+    };
+    push(None, "input_norm", "shared", vec!["rms_norm"]);
+    for layer in 0..layout.layer_count() {
+        let kind = layout
+            .layer_kind(layer)
+            .expect("resident layout layer count and kind inventory agree");
+        let route = match kind {
+            ResidentLayerKind::Nvfp4Gdn => "nvfp4_gdn",
+            ResidentLayerKind::Nvfp4Attention => "nvfp4_attention",
+            ResidentLayerKind::DenseFp8Gdn => "dense_fp8_gdn",
+            ResidentLayerKind::DenseFp8Attention => "dense_fp8_attention",
+        };
+        match kind {
+            ResidentLayerKind::Nvfp4Gdn | ResidentLayerKind::DenseFp8Gdn => {
+                push(
+                    Some(layer),
+                    "gdn_input",
+                    route,
+                    vec!["quantize_activation_e4m3", "fp8_gdn_input"],
+                );
+                push(
+                    Some(layer),
+                    "gdn_prepare",
+                    route,
+                    vec!["gdn_control_exact", "gdn_convolution_exact"],
+                );
+                push(
+                    Some(layer),
+                    "gdn_recurrence",
+                    route,
+                    vec!["gdn_recurrence_exact"],
+                );
+                push(
+                    Some(layer),
+                    "gdn_output",
+                    route,
+                    vec!["gdn_output_quantize", "gdn_output_projection"],
+                );
+            }
+            ResidentLayerKind::Nvfp4Attention | ResidentLayerKind::DenseFp8Attention => {
+                push(
+                    Some(layer),
+                    "attention_qkv",
+                    route,
+                    vec!["quantize_activation_e4m3", "fp8_qkv"],
+                );
+                push(
+                    Some(layer),
+                    "attention_qk_prepare",
+                    route,
+                    vec!["attention_qk_prepare_exact"],
+                );
+                push(Some(layer), "paged_gqa", route, vec!["paged_gqa_exact"]);
+                push(
+                    Some(layer),
+                    "attention_output",
+                    route,
+                    vec![
+                        "attention_gate_quantize_exact",
+                        "attention_output_projection",
+                    ],
+                );
+            }
+        }
+        push(
+            Some(layer),
+            "post_mixer_residual_norm",
+            route,
+            vec!["residual_rms_norm"],
+        );
+        match kind {
+            ResidentLayerKind::Nvfp4Gdn | ResidentLayerKind::Nvfp4Attention => {
+                let swiglu = if batch == 1 || batch >= 5 {
+                    vec!["nvfp4_quantize", "nvfp4_swiglu_w4a4"]
+                } else {
+                    vec!["nvfp4_swiglu_a16"]
+                };
+                push(Some(layer), "mlp_swiglu", route, swiglu);
+                push(Some(layer), "mlp_down", route, vec!["nvfp4_down_a16"]);
+            }
+            ResidentLayerKind::DenseFp8Gdn | ResidentLayerKind::DenseFp8Attention => {
+                push(
+                    Some(layer),
+                    "mlp_swiglu",
+                    route,
+                    vec!["fp8_swiglu_quantize", "fp8_swiglu_decode"],
+                );
+                push(
+                    Some(layer),
+                    "mlp_down",
+                    route,
+                    vec!["fp8_down_quantize", "fp8_down"],
+                );
+            }
+        }
+        push(
+            Some(layer),
+            "post_mlp_residual_norm",
+            route,
+            vec!["residual_rms_norm"],
+        );
+    }
+    push(
+        None,
+        "lm_head",
+        "text_endpoint",
+        vec!["quantize_activation_e4m3", "fp8_lm_head"],
+    );
+
+    ResidentModelProfileManifest {
+        schema_version: 1,
+        suite: "resident_model/text_decode",
+        batch_size: batch,
+        context_tokens: CONTEXT_TOKENS,
+        warmup_launches,
+        captured_replays,
+        graph_dot: graph_dot.display().to_string(),
+        graph_kernel_nodes: next_node - 1,
+        stages,
+    }
+}
+
 /// Measures every exact complete-model graph directly without summing leaf medians.
 pub fn benchmark_resident_model(
     root: &Path,
@@ -369,7 +607,7 @@ fn benchmark_resident_profile(
         "256-byte alignment across the resident and shared-KV arenas",
     )?;
     memory.capture("after_setup")?;
-    session.warm(&embedding_graphs, warmup_launches)?;
+    session.warm(&embedding_graphs, warmup_launches, options.batch_size)?;
     memory.capture("after_warmup")?;
     require_current_process_exclusive()?;
     let cases = session.cases(&embedding_graphs, operation)?;
@@ -394,7 +632,11 @@ fn benchmark_resident_profile(
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTEXT_TOKENS, LONG_CONTEXT_TOKENS, MAX_BATCH, logical_bytes};
+    use super::{
+        CONTEXT_TOKENS, LONG_CONTEXT_TOKENS, MAX_BATCH, logical_bytes, resident_profile_manifest,
+    };
+    use std::path::Path;
+    use tuisko_engine::ResidentModelLayout;
 
     #[test]
     fn byte_accounting_tracks_the_exact_nvfp4_batch_routes() {
@@ -417,5 +659,19 @@ mod tests {
                     > logical_bytes(batch, &[CONTEXT_TOKENS; MAX_BATCH][..batch])
             );
         }
+    }
+
+    #[test]
+    fn semantic_manifest_covers_every_resident_graph_kernel_node() {
+        let layout = ResidentModelLayout::build().unwrap();
+        let b1 = resident_profile_manifest(&layout, 1, 16, 3, Path::new("graph.dot"));
+        let b2 = resident_profile_manifest(&layout, 2, 16, 3, Path::new("graph.dot"));
+
+        assert_eq!(b1.stages.len(), 514);
+        assert_eq!(b1.graph_kernel_nodes, 763);
+        assert_eq!(b2.graph_kernel_nodes, 707);
+        assert_eq!(b1.stages.first().unwrap().first_graph_node_ordinal, 1);
+        let last = b1.stages.last().unwrap();
+        assert_eq!(last.first_graph_node_ordinal + last.kernel_nodes - 1, 763);
     }
 }

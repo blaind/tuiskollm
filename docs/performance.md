@@ -111,6 +111,19 @@ If clocks pass the loaded probe and drift only later during a long measurement, 
 writes the completed medians with `clock_policy: diagnostic_uncontrolled` and then returns a
 refusal. This preserves tuning evidence without weakening the gate or making it blessable.
 
+Benchmark repetition budgets are selected by the timed boundary rather than inherited from one
+global leaf default:
+
+| Duration class | Samples | Replays per sample | Warmup replays | Typical boundary |
+|---|---:|---:|---:|---|
+| short graph | 40 | 256 | 1,024 | microsecond-scale operator |
+| long graph | 40 | 32 | 128 | LM head or composed owner |
+| resident model | 40 | 1 | 16 | complete 64-layer graph |
+
+One resident replay already takes tens of milliseconds, so repeating it 256 times provides no
+useful timer-resolution benefit and creates an avoidable thermal phase. Reports bind the warmup and
+replay counts into their performance identity; a baseline comparison refuses when either changes.
+
 ## Command reference
 
 | Command | Purpose | Output |
@@ -160,7 +173,11 @@ refusal. This preserves tuning evidence without weakening the gate or making it 
 | `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
 | `cargo run -p xtask -- perf energy` | Full leaf reports plus a sustained power window per route | `target/benchmarks/perf-energy/*.json` |
 | `cargo run -p xtask -- perf gate` | Run every oracle, measure every suite, and compare checked baselines | `target/benchmarks/perf-gate/*.json` |
-| `cargo run -p xtask -- perf bless SUITE` | Run one oracle and explicitly replace that suite's baseline | `qual/baselines/SUITE-sm120.json` |
+| `cargo run -p xtask -- perf candidate SUITE [SNAPSHOT] [options]` | Qualify the changed suite, then directly time its exact downstream owner/model cone | `target/benchmarks/perf-candidate/SUITE/*.json` |
+| `cargo run -p xtask -- perf check SUITE [SNAPSHOT]` | Measure the complete authoritative dependency cone and compare each checked baseline | `target/benchmarks/perf-check/SUITE/*.json` |
+| `cargo run -p xtask -- perf bless SUITE [SNAPSHOT]` | Run one oracle and explicitly replace that leaf or composed suite's baseline | `qual/baselines/SUITE-sm120.json` |
+| `cargo run -p xtask -- profile resident-model SNAPSHOT --batch B --replays N --tool nsys` | Capture the production graph after warmup and attribute every node to semantic owner, stage, and layer | `target/profiles/resident-model-bB/` |
+| `cargo run -p xtask -- profile resident-model SNAPSHOT --batch B --tool ncu --kernel REGEX` | Collect hardware counters for one selected production kernel family | `target/profiles/resident-model-bB/` |
 
 Host text paths use Criterion with the real snapshot loaded once outside measurement:
 
@@ -198,8 +215,14 @@ The leaf executable can also be controlled directly through `xtask`:
 cargo run -p xtask -- bench-residual-norm \
   --samples 40 \
   --launches-per-sample 256 \
+  --warmup-launches 1024 \
   --json target/benchmarks/residual-norm.json
 ```
+
+Use `--batch B` for a fast exact-route diagnostic. The report records
+`case_policy: diagnostic_subset` and `selected_batch_size: B`; it cannot be blessed or compared as
+the complete authority. This is the intended inner loop for a B-specific retile. Remove the option
+before final comparison so every admitted `B=1..8` route is timed.
 
 Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, `bench-fp8-lm-head`,
 `bench-fp8-swiglu`, `bench-fp8-down`, `bench-gdn-prepare`, `bench-gdn-recurrence`, or
@@ -243,6 +266,69 @@ copies of the physical KV pool. Prompt preparation and metadata uploads remain o
 
 Add `--energy-seconds 2` for sustained energy sampling. At least three samples, one launch per
 sample, and a two-second energy window are required.
+
+## Optimization dependency cones
+
+An optimization starts at one exact suite and moves outward through directly affected production
+owners. `perf candidate` and `perf check` use a checked registry for that relationship; they do not
+estimate a composed boundary by adding leaf medians. Examples include:
+
+```text
+nvfp4-down -> nvfp4-mlp -> resident-model -> resident-long-context-model
+fp8-down -> dense-fp8-mlp -> dense-fp8-gdn-layer + full-attention-layer
+         -> resident-model + resident-long-context-model
+long-context-paged-gqa -> resident-long-context-model
+```
+
+The candidate mode is diagnostic: it runs the changed suite's oracle once, builds and resource-
+checks once, and measures the direct dependency cone. The check mode requalifies each distinct
+correctness boundary in the cone, uses complete suite defaults, and compares every cone report with
+its independent baseline. The two resident timing profiles share one resident-model oracle. A
+source-backed composed suite needs the admitted snapshot path even when the selected root is a
+synthetic leaf.
+
+Keep resource and timing authorities distinct. A leaf resource change is reviewed in its text
+baseline; each directly measured composed boundary has its own JSON performance baseline. A leaf
+improvement is not a model win until the directly timed resident report shows it.
+
+## Resident graph profiling
+
+The profiling command uses the same resident owner, allocations, stream, warmed cache state, exact
+batch graph, and 131-token context as the production short-context benchmark. Model loading,
+materialization, graph construction, and warmup finish before the application calls the public CUDA
+profiler-control API. Nsight therefore captures only explicit embedding preparation and complete
+resident graph replays.
+
+For Nsight Systems:
+
+```bash
+cargo run -p xtask -- profile resident-model SNAPSHOT \
+  --batch 1 --replays 3 --tool nsys
+```
+
+The command exports the trace to SQLite and processes it in Rust. It refuses unless the observed
+kernel sequence matches the semantic manifest exactly. The output directory contains:
+
+- the native `.nsys-rep` and exported `.sqlite` reports;
+- CUDA's verbose graph `.dot` inventory;
+- a semantic JSON manifest mapping graph-node ranges to exact layers, owners, and source routes;
+- per-node, per-stage, per-layer, and per-replay CSV timings; and
+- tool, Git status, executable hash, and device provenance metadata.
+
+The replay CSV closes complete graph span against the sum of kernel durations and inter-kernel
+gaps. Treat it as profiler evidence, not a regression median: tracing perturbs timing, and profiler
+clocks may differ from the checked benchmark clock band.
+
+Use Nsight Compute only after the Systems trace identifies an Amdahl-relevant kernel family:
+
+```bash
+cargo run -p xtask -- profile resident-model SNAPSHOT \
+  --batch 1 --replays 1 --tool ncu --kernel 'nvfp4_down_a16_b1'
+```
+
+The NCU report diagnoses physical memory transactions, stalls, occupancy, and instruction-pipeline
+use. Its isolated replay duration is not directly comparable with an uninstrumented resident-model
+baseline, and local speedup estimates must not be added across kernels.
 
 ## What one timing means
 
@@ -439,6 +525,7 @@ the same:
 - cuda-oxide generator/resource stamp;
 - SM and memory clock bands;
 - minimum sample count;
+- warmup replay count and complete-inventory case policy;
 - timing and power scopes.
 
 The generator stamp records readable cuda-oxide, Rust, and CUDA Toolkit identities. Both `ptxas`
@@ -500,6 +587,11 @@ Time composed layers, the whole model, and server requests directly. Do not esti
 by summing leaf medians: graph concurrency, cache reuse, scheduling, and host work can make that sum
 wrong in either direction.
 
+For tuning, first use an exact route subset and profiler artifacts to select the change. Then run
+the changed oracle and resource gate, directly measure its composed dependency cone, and finally
+repeat with the complete inventory before comparison or blessing. Preserve profiler reports under
+`target/`; they are diagnostic build products, not checked source.
+
 Criterion remains the harness for pure host work such as checkpoint admission, tokenization,
 template rendering, prefix lookup, sampling, and streaming detokenization. CUDA-event timing,
 exclusive-device controls, NVML telemetry, and device baselines remain in this runner.
@@ -510,10 +602,11 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
   FP8-QKV and dense-FP8 SwiGLU routes. Q/K preparation, attention, output, MLP, and GDN prefill need
   their own complete routes before the resident program can stop priming through decode.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
-- There is no TTFT, inter-token-latency, concurrency, long-context, or end-to-end MTP benchmark in
-  this repository yet.
+- There is no full-server TTFT, inter-token-latency, concurrency, prefix-reuse, or end-to-end MTP
+  benchmark in this repository yet. Direct long-context operator and resident-model timing exists.
 - Power and energy are reportable for the resident model; full-server energy remains future work.
-- `ncu` and Nsight Systems traces are diagnostic artifacts, not produced by the regression runner.
+- `ncu` and Nsight Systems traces are first-class diagnostic artifacts, but remain outside checked
+  regression comparison and baseline blessing.
 
 These are scope statements, not inferred passes. New cases should be added with their production
 owners and independent oracles.

@@ -31,17 +31,55 @@ pub struct DeviceBenchmarkOptions {
     pub samples: usize,
     /// Operations bracketed by each paired timing interval.
     pub launches_per_sample: u64,
+    /// Production-graph replays used to establish warmed state before timing.
+    pub warmup_launches: u64,
+    /// Optional exact decode batch retained for a diagnostic subset run.
+    pub batch_size: Option<u32>,
     /// Dedicated power-sampling window per route, when requested.
     pub energy_seconds: Option<f64>,
 }
 
-impl Default for DeviceBenchmarkOptions {
-    fn default() -> Self {
+impl DeviceBenchmarkOptions {
+    /// Defaults for microsecond-scale operator graphs.
+    pub const fn short_graph() -> Self {
         Self {
             samples: 40,
             launches_per_sample: 256,
+            warmup_launches: 1_024,
+            batch_size: None,
             energy_seconds: None,
         }
+    }
+
+    /// Defaults for graph boundaries whose single replay already takes hundreds of microseconds.
+    pub const fn long_graph() -> Self {
+        Self {
+            samples: 40,
+            // A 32-replay interval is several milliseconds for the admitted composed owners,
+            // amortizing the timer without turning one sample into a long thermal phase.
+            launches_per_sample: 32,
+            warmup_launches: 128,
+            batch_size: None,
+            energy_seconds: None,
+        }
+    }
+
+    /// Defaults for the complete resident model graph.
+    pub const fn resident_model() -> Self {
+        Self {
+            samples: 40,
+            // One 17+ ms graph already exceeds CUDA-event resolution by four orders of magnitude.
+            launches_per_sample: 1,
+            warmup_launches: 16,
+            batch_size: None,
+            energy_seconds: None,
+        }
+    }
+}
+
+impl Default for DeviceBenchmarkOptions {
+    fn default() -> Self {
+        Self::short_graph()
     }
 }
 
@@ -509,6 +547,12 @@ pub struct DeviceBenchmarkReport {
     pub samples: usize,
     /// Leaf graph replays included in each paired timing interval.
     pub launches_per_sample: u64,
+    /// Production-graph replays used to establish warmed state before timing.
+    pub warmup_launches: u64,
+    /// Whether the report covers the complete suite inventory or a diagnostic subset.
+    pub case_policy: &'static str,
+    /// Exact decode batch selected for a diagnostic subset report.
+    pub selected_batch_size: Option<u32>,
     /// Boundaries represented by the four timing kinds.
     pub timing_scope: &'static str,
     /// Telemetry field and physical scope used for power estimates.
@@ -577,6 +621,7 @@ pub(crate) struct TelemetryEvidence {
     pub(crate) samples: usize,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct RepeatedGraph<'a> {
     graph: &'a CudaGraph,
     operations: u64,
@@ -604,6 +649,7 @@ impl<'a> RepeatedGraph<'a> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ExactDeviceCase<'a> {
     route: &'static str,
     shape: String,
@@ -971,19 +1017,14 @@ pub(crate) fn require_current_process_exclusive() -> Result<(), DeviceBenchmarkE
 pub(crate) fn warmup_launches(
     options: DeviceBenchmarkOptions,
 ) -> Result<u64, DeviceBenchmarkError> {
-    if options.samples < 3 || options.launches_per_sample == 0 {
+    if options.samples < 3 || options.launches_per_sample == 0 || options.warmup_launches == 0 {
         return Err(DeviceBenchmarkError::Precondition(
-            "at least three samples and one launch per sample are required".to_string(),
+            "at least three samples, one launch per sample, and one warmup launch are required"
+                .to_string(),
         ));
     }
 
-    options
-        .launches_per_sample
-        .checked_mul(4)
-        .map(|launches| launches.max(1_024))
-        .ok_or_else(|| {
-            DeviceBenchmarkError::Precondition("warmup launch count overflows".to_string())
-        })
+    Ok(options.warmup_launches)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1000,7 +1041,7 @@ pub(crate) fn finish_report(
     let identity = preflight.identity;
 
     Ok(DeviceBenchmarkReport {
-        schema_version: 6,
+        schema_version: 7,
         suite: spec.suite,
         classification: spec.classification,
         device: identity.name,
@@ -1030,6 +1071,13 @@ pub(crate) fn finish_report(
         telemetry_samples: telemetry.samples,
         samples: options.samples,
         launches_per_sample: options.launches_per_sample,
+        warmup_launches: options.warmup_launches,
+        case_policy: if options.batch_size.is_some() {
+            "diagnostic_subset"
+        } else {
+            "complete_inventory"
+        },
+        selected_batch_size: options.batch_size,
         timing_scope: spec.timing_scope,
         power_scope: "nvidia-smi power.draw.instant, whole board",
         metrics,
@@ -1051,13 +1099,9 @@ pub(crate) fn measure_cases(
     ),
     DeviceBenchmarkError,
 > {
-    if cases.is_empty() {
-        return Err(DeviceBenchmarkError::Precondition(
-            "device benchmark has no registered cases".to_string(),
-        ));
-    }
+    let cases = selected_cases(cases, options.batch_size)?;
 
-    validate_loaded_clock_policy(stream, timer, cases)?;
+    validate_loaded_clock_policy(stream, timer, &cases)?;
 
     let mut tasks = Vec::with_capacity(cases.len() * 2);
     for (index, case) in cases.iter().enumerate() {
@@ -1161,12 +1205,34 @@ pub(crate) fn measure_cases(
     }
 
     let energy_metrics = if let Some(seconds) = options.energy_seconds {
-        measure_energy(stream, timer, cases, &device_graph_medians, seconds)?
+        measure_energy(stream, timer, &cases, &device_graph_medians, seconds)?
     } else {
         Vec::new()
     };
 
     Ok((metrics, energy_metrics, telemetry))
+}
+
+fn selected_cases<'a>(
+    cases: &[ExactDeviceCase<'a>],
+    batch_size: Option<u32>,
+) -> Result<Vec<ExactDeviceCase<'a>>, DeviceBenchmarkError> {
+    let selected = cases
+        .iter()
+        .filter(|case| batch_size.is_none_or(|batch| case.workload.batch_size == Some(batch)))
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        let selection = batch_size.map_or_else(
+            || "the complete inventory".to_string(),
+            |batch| format!("diagnostic B={batch}"),
+        );
+        return Err(DeviceBenchmarkError::Precondition(format!(
+            "device benchmark has no case matching {selection}"
+        )));
+    }
+
+    Ok(selected)
 }
 
 fn validate_loaded_clock_policy(
@@ -1810,14 +1876,33 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchmarkMemoryKind, BenchmarkMemoryMeasurement, ComputeProcess, DeviceMemoryMetric,
-        DeviceMemorySnapshot, MemoryComparison, MemoryRecorder, TelemetryEvidence, TelemetrySample,
-        loaded_clock_probe_replays, measurement_order, parse_compute_processes,
-        parse_process_memory, telemetry_evidence, validate_compute_process_count,
+        BenchmarkMemoryKind, BenchmarkMemoryMeasurement, ComputeProcess, DeviceBenchmarkOptions,
+        DeviceMemoryMetric, DeviceMemorySnapshot, MemoryComparison, MemoryRecorder,
+        TelemetryEvidence, TelemetrySample, loaded_clock_probe_replays, measurement_order,
+        parse_compute_processes, parse_process_memory, telemetry_evidence,
+        validate_compute_process_count, warmup_launches,
     };
     use std::time::Duration;
 
     const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn benchmark_budgets_match_graph_duration_classes() {
+        let short = DeviceBenchmarkOptions::short_graph();
+        let long = DeviceBenchmarkOptions::long_graph();
+        let resident = DeviceBenchmarkOptions::resident_model();
+
+        assert_eq!(
+            (short.launches_per_sample, short.warmup_launches),
+            (256, 1_024)
+        );
+        assert_eq!((long.launches_per_sample, long.warmup_launches), (32, 128));
+        assert_eq!(
+            (resident.launches_per_sample, resident.warmup_launches),
+            (1, 16)
+        );
+        assert_eq!(warmup_launches(resident).unwrap(), 16);
+    }
 
     #[test]
     fn telemetry_statistics_are_deterministic() {

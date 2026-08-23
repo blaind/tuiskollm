@@ -6,8 +6,8 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 
-const BASELINE_SCHEMA: u32 = 4;
-const REPORT_SCHEMA: u32 = 6;
+const BASELINE_SCHEMA: u32 = 5;
+const REPORT_SCHEMA: u32 = 7;
 const CLOCK_PADDING_MHZ: u32 = 15;
 const MEMORY_CLOCK_PADDING_MHZ: u32 = 50;
 const DEVICE_RELATIVE_TOLERANCE_PERCENT: f64 = 5.0;
@@ -31,6 +31,8 @@ struct PerformanceReport {
     memory_clock_min_mhz: u32,
     memory_clock_max_mhz: u32,
     samples: usize,
+    warmup_launches: u64,
+    case_policy: String,
     timing_scope: String,
     power_scope: String,
     metrics: Vec<ReportMetric>,
@@ -91,6 +93,8 @@ struct PerformanceBaseline {
     sm_clock_band_mhz: ClockBand,
     memory_clock_band_mhz: ClockBand,
     minimum_samples: usize,
+    warmup_launches: u64,
+    case_policy: String,
     timing_scope: String,
     power_scope: String,
     metrics: Vec<BaselineMetric>,
@@ -291,6 +295,13 @@ pub(crate) fn bless(report_path: &Path, baseline_path: &Path) -> Result<(), Box<
         )
         .into());
     }
+    if report.case_policy != "complete_inventory" {
+        return Err(format!(
+            "cannot bless a performance report with case policy `{}`",
+            report.case_policy
+        )
+        .into());
+    }
     let _ = report_metrics(&report)?;
     let _ = report_memory_metrics(&report.memory)?;
     let previous = if baseline_path.is_file() {
@@ -403,6 +414,8 @@ pub(crate) fn bless(report_path: &Path, baseline_path: &Path) -> Result<(), Box<
             MEMORY_CLOCK_PADDING_MHZ,
         ),
         minimum_samples: report.samples,
+        warmup_launches: report.warmup_launches,
+        case_policy: report.case_policy,
         timing_scope: report.timing_scope,
         power_scope: report.power_scope,
         metrics,
@@ -459,6 +472,7 @@ fn validate_environment(
             &baseline.compute_capability,
         ),
         ("clock policy", &report.clock_policy, &baseline.clock_policy),
+        ("case policy", &report.case_policy, &baseline.case_policy),
         (
             "generator baseline",
             &report.generator_baseline_sha256,
@@ -476,6 +490,13 @@ fn validate_environment(
         return Err(format!(
             "performance report has {} samples, baseline requires at least {}",
             report.samples, baseline.minimum_samples
+        )
+        .into());
+    }
+    if report.warmup_launches != baseline.warmup_launches {
+        return Err(format!(
+            "performance report uses {} warmup launches, baseline requires {}",
+            report.warmup_launches, baseline.warmup_launches
         )
         .into());
     }
@@ -867,6 +888,8 @@ mod tests {
                 maximum: 14_051,
             },
             minimum_samples: 40,
+            warmup_launches: 1_024,
+            case_policy: "complete_inventory".to_string(),
             timing_scope: "scope".to_string(),
             power_scope: "scope".to_string(),
             metrics: Vec::new(),
