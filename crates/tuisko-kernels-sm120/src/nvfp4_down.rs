@@ -6,7 +6,7 @@ use cuda_device::{
 };
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
-use tuisko_model::{Arch, Qwen38_27B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const HIDDEN: usize = Qwen38_27B::HIDDEN;
@@ -18,7 +18,6 @@ const CODE_BYTES_PER_ROW: usize = INPUT_COLUMNS / 2;
 const PHASE_GROUPS: usize = 32;
 const PHASES: usize = GROUPS_PER_ROW / PHASE_GROUPS;
 const CODE_WORDS_PER_PHASE: usize = 32 * (GROUP_K / 2) / size_of::<u32>();
-const SCALE_TILES_PER_ROW: usize = GROUPS_PER_ROW / 4;
 
 // One warp retains two complete output-row reductions. The 32 lanes cover 32
 // K16 groups per phase, so 34 phases cover all 1,088 groups without changing
@@ -38,6 +37,8 @@ const _: () = assert!(HIDDEN == 5_120);
 const _: () = assert!(INPUT_COLUMNS == 17_408);
 const _: () = assert!(OUTPUT_ROWS == 5_120);
 const _: () = assert!(GROUPS_PER_ROW == 1_088);
+const _: () = assert!(Qwen35_9B::HIDDEN == 4_096);
+const _: () = assert!(Qwen35_9B::INTERMEDIATE == 12_288);
 const _: () = assert!(PHASES * CODE_WORDS_PER_PHASE == CODE_BYTES_PER_ROW / size_of::<u32>());
 const _: () = assert!(SHARED_U32 * size_of::<u32>() == 8_192);
 
@@ -47,20 +48,22 @@ mod kernels {
     use cuda_device::{convert, float, warp};
 
     #[inline(always)]
-    fn weight_scale_offset(parent_row: usize, scale_tile: usize) -> usize {
+    fn weight_scale_offset<A: Arch>(parent_row: usize, scale_tile: usize) -> usize {
         let persistent_tile = parent_row / 128;
         let row_in_tile = parent_row & 127;
         let row_mod32 = row_in_tile & 31;
         let row_quartile = row_in_tile >> 5;
 
-        (persistent_tile * SCALE_TILES_PER_ROW + scale_tile) * 512
+        let scale_tiles_per_row = A::INTERMEDIATE / GROUP_K / 4;
+
+        (persistent_tile * scale_tiles_per_row + scale_tile) * 512
             + row_mod32 * 16
             + row_quartile * 4
     }
 
     #[inline(always)]
-    fn weight_group_scale_offset(parent_row: usize, group: usize) -> usize {
-        weight_scale_offset(parent_row, group >> 2) + (group & 3)
+    fn weight_group_scale_offset<A: Arch>(parent_row: usize, group: usize) -> usize {
+        weight_scale_offset::<A>(parent_row, group >> 2) + (group & 3)
     }
 
     #[inline(always)]
@@ -155,7 +158,7 @@ mod kernels {
     }
 
     #[inline(always)]
-    unsafe fn down_body<const TOKENS: usize, const COALESCED_SCALES: bool>(
+    unsafe fn down_body<A: Arch, const TOKENS: usize, const COALESCED_SCALES: bool>(
         input: *const u32,
         weight_codes: *const u32,
         weight_scales: *const u8,
@@ -174,7 +177,7 @@ mod kernels {
         let mut second_accumulators = [0.0f32; TOKENS];
         let mut phase = 0usize;
 
-        while phase < PHASES {
+        while phase < A::INTERMEDIATE / GROUP_K / PHASE_GROUPS {
             let mut task = tid;
             while task < TOKENS * PHASE_PACKED_PAIRS {
                 let token = task / PHASE_PACKED_PAIRS;
@@ -182,7 +185,7 @@ mod kernels {
                 // SAFETY: every exact route supplies `TOKENS` complete input rows.
                 unsafe {
                     *shared.add(task) =
-                        *input.add(token * (INPUT_COLUMNS / 2) + phase * 256 + pair);
+                        *input.add(token * (A::INTERMEDIATE / 2) + phase * 256 + pair);
                 }
                 task += THREADS as usize;
             }
@@ -194,7 +197,7 @@ mod kernels {
                 let mut first_word = 0u32;
                 let mut second_word = 0u32;
                 if scale_lane == 0 {
-                    let offset = weight_scale_offset(first_row, group >> 2);
+                    let offset = weight_scale_offset::<A>(first_row, group >> 2);
                     // SAFETY: paired physical rows own adjacent aligned four-scale words.
                     (first_word, second_word) =
                         unsafe { load_u32x2_read_only(weight_scales.add(offset).cast::<u32>()) };
@@ -209,12 +212,12 @@ mod kernels {
                 // SAFETY: source validation admitted one swizzled scale per logical group.
                 let first = unsafe {
                     load_u8_read_only(
-                        weight_scales.add(weight_group_scale_offset(first_row, group)),
+                        weight_scales.add(weight_group_scale_offset::<A>(first_row, group)),
                     )
                 };
                 let second = unsafe {
                     load_u8_read_only(
-                        weight_scales.add(weight_group_scale_offset(second_row, group)),
+                        weight_scales.add(weight_group_scale_offset::<A>(second_row, group)),
                     )
                 };
 
@@ -222,7 +225,7 @@ mod kernels {
             };
             let first_coefficient = e4m3_to_f32(first_scale) * weight_scale_reciprocal;
             let second_coefficient = e4m3_to_f32(second_scale) * weight_scale_reciprocal;
-            let row_words = CODE_BYTES_PER_ROW / size_of::<u32>();
+            let row_words = (A::INTERMEDIATE / 2) / size_of::<u32>();
             let word_offset = phase * CODE_WORDS_PER_PHASE + lane * 2;
             let first_source = unsafe { weight_codes.add(first_row * row_words + word_offset) };
             let second_source = unsafe { weight_codes.add(second_row * row_words + word_offset) };
@@ -310,8 +313,8 @@ mod kernels {
                     if lane == 0 {
                         // SAFETY: one lane writes two unique token/output-row values.
                         unsafe {
-                            *output.add($token * OUTPUT_ROWS + first_row) = f32_to_bf16(first);
-                            *output.add($token * OUTPUT_ROWS + second_row) = f32_to_bf16(second);
+                            *output.add($token * A::HIDDEN + first_row) = f32_to_bf16(first);
+                            *output.add($token * A::HIDDEN + second_row) = f32_to_bf16(second);
                         }
                     }
                 }
@@ -347,7 +350,7 @@ mod kernels {
         static mut SHARED: SharedArray<u32, SHARED_U32, 16> = SharedArray::UNINIT;
 
         unsafe {
-            down_body::<1, true>(
+            down_body::<Qwen38_27B, 1, true>(
                 input,
                 weight_codes,
                 weight_scales,
@@ -379,7 +382,38 @@ mod kernels {
         let _ = A::HIDDEN;
 
         unsafe {
-            down_body::<TOKENS, false>(
+            down_body::<A, TOKENS, false>(
+                input,
+                weight_codes,
+                weight_scales,
+                weight_scale_reciprocal,
+                output,
+                core::ptr::addr_of_mut!(SHARED).cast::<u32>(),
+            );
+        }
+    }
+
+    /// Projects exact Qwen3.5 BF16 activations through represented NVFP4.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_down_a16<const TOKENS: usize>(
+        input: *const u32,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        weight_scale_reciprocal: f32,
+        output: *mut u16,
+    ) {
+        static mut SHARED: SharedArray<u32, SHARED_U32, 16> = SharedArray::UNINIT;
+
+        unsafe {
+            down_body::<Qwen35_9B, TOKENS, false>(
                 input,
                 weight_codes,
                 weight_scales,
@@ -395,6 +429,13 @@ fn launch_config() -> LaunchConfig1D {
     // Eight warps emit two rows each, so 320 exact CTAs cover all 5,120
     // outputs without a tail branch while sharing each staged input phase.
     LaunchConfig1D::new((OUTPUT_ROWS / (2 * WARPS)) as u32, THREADS, 0)
+}
+
+fn qwen35_launch_config() -> LaunchConfig1D {
+    // The same eight warps retain two output rows each; 4,096 / 16 gives 256
+    // exact CTAs. Each row has 768 K16 groups, so the unchanged lane order
+    // traverses 24 phases instead of Qwen3.8's 34 without changing arithmetic.
+    LaunchConfig1D::new((Qwen35_9B::HIDDEN / (2 * WARPS)) as u32, THREADS, 0)
 }
 
 struct PreparedBatchOneRoute {
@@ -473,6 +514,44 @@ impl<A: Arch, const TOKENS: usize> PreparedBatchRoute<A, TOKENS> {
     }
 }
 
+struct PreparedQwen35BatchRoute<const TOKENS: usize> {
+    projection: PreparedLaunch<kernels::__qwen35_nvfp4_down_a16_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedQwen35BatchRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let projection = module
+            .prepare_qwen35_nvfp4_down_a16::<TOKENS>(qwen35_launch_config())
+            .map_err(|source| GpuError::launch("preparing Qwen3.5 SM120 NVFP4 A16", source))?;
+
+        Ok(Self { projection })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        weight_scale_reciprocal: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_nvfp4_down_a16::<TOKENS>(
+                stream,
+                &self.projection,
+                input.cast::<u32>(),
+                weight_codes.cast::<u32>(),
+                weight_scales,
+                weight_scale_reciprocal,
+                output,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.5 SM120 NVFP4 A16", source))
+    }
+}
+
 /// PTX symbols retained for every exact SM120 NVFP4 down projection batch.
 pub(crate) fn nvfp4_down_ptx_names() -> [&'static str; MAX_BATCH] {
     [
@@ -484,6 +563,20 @@ pub(crate) fn nvfp4_down_ptx_names() -> [&'static str; MAX_BATCH] {
         kernels::nvfp4_down_a16_ptx_name::<Qwen38_27B, 6>(),
         kernels::nvfp4_down_a16_ptx_name::<Qwen38_27B, 7>(),
         kernels::nvfp4_down_a16_ptx_name::<Qwen38_27B, 8>(),
+    ]
+}
+
+/// PTX symbols retained for every exact Qwen3.5 NVFP4 down batch.
+pub(crate) fn qwen35_nvfp4_down_ptx_names() -> [&'static str; MAX_BATCH] {
+    [
+        kernels::qwen35_nvfp4_down_a16_ptx_name::<1>(),
+        kernels::qwen35_nvfp4_down_a16_ptx_name::<2>(),
+        kernels::qwen35_nvfp4_down_a16_ptx_name::<3>(),
+        kernels::qwen35_nvfp4_down_a16_ptx_name::<4>(),
+        kernels::qwen35_nvfp4_down_a16_ptx_name::<5>(),
+        kernels::qwen35_nvfp4_down_a16_ptx_name::<6>(),
+        kernels::qwen35_nvfp4_down_a16_ptx_name::<7>(),
+        kernels::qwen35_nvfp4_down_a16_ptx_name::<8>(),
     ]
 }
 
@@ -582,13 +675,108 @@ impl<A: Sm120Arch> Nvfp4DownOp<A> {
     }
 }
 
+/// Prepared exact-batch Qwen3.5 NVFP4 down routes on SM120.
+pub struct Qwen35Nvfp4DownOp {
+    module: kernels::LoadedModule,
+    b1: PreparedQwen35BatchRoute<1>,
+    b2: PreparedQwen35BatchRoute<2>,
+    b3: PreparedQwen35BatchRoute<3>,
+    b4: PreparedQwen35BatchRoute<4>,
+    b5: PreparedQwen35BatchRoute<5>,
+    b6: PreparedQwen35BatchRoute<6>,
+    b7: PreparedQwen35BatchRoute<7>,
+    b8: PreparedQwen35BatchRoute<8>,
+}
+
+impl Qwen35Nvfp4DownOp {
+    /// Loads the embedded module and prepares every exact Qwen3.5 batch.
+    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        let _ = qwen35_nvfp4_down_ptx_names();
+        // SAFETY: this crate owns the embedded cuda-oxide module artifact.
+        let module = unsafe { kernels::load(context) }.map_err(|source| {
+            GpuError::module("loading the Qwen3.5 SM120 NVFP4 down module", source)
+        })?;
+
+        Ok(Self {
+            b1: PreparedQwen35BatchRoute::prepare(&module)?,
+            b2: PreparedQwen35BatchRoute::prepare(&module)?,
+            b3: PreparedQwen35BatchRoute::prepare(&module)?,
+            b4: PreparedQwen35BatchRoute::prepare(&module)?,
+            b5: PreparedQwen35BatchRoute::prepare(&module)?,
+            b6: PreparedQwen35BatchRoute::prepare(&module)?,
+            b7: PreparedQwen35BatchRoute::prepare(&module)?,
+            b8: PreparedQwen35BatchRoute::prepare(&module)?,
+            module,
+        })
+    }
+
+    /// Executes represented-weight A16 at exact `B=1..=8`.
+    ///
+    /// # Safety
+    ///
+    /// `input` covers `batch * 12_288` BF16 values; `weight_codes` covers
+    /// packed E2M1 `[4_096, 12_288]`; `weight_scales` covers swizzled E4M3
+    /// `[4_096, 768]`; and `output` covers `batch * 4_096` BF16 values.
+    /// Four-byte-loaded planes are aligned, the divisor is finite and
+    /// positive, and disjoint allocations remain live in `stream`'s context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 NVFP4 weight scale divisor must be finite and positive",
+            ));
+        }
+
+        let reciprocal = 1.0 / weight_scale_divisor;
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        input,
+                        weight_codes,
+                        weight_scales,
+                        reciprocal,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match batch {
+            1 => launch!(b1),
+            2 => launch!(b2),
+            3 => launch!(b3),
+            4 => launch!(b4),
+            5 => launch!(b5),
+            6 => launch!(b6),
+            7 => launch!(b7),
+            8 => launch!(b8),
+            _ => Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 NVFP4 down batch {batch} is outside the exact range 1..={MAX_BATCH}"
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CODE_WORDS_PER_PHASE, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_BATCH, OUTPUT_ROWS, PHASES,
-        SHARED_U32, nvfp4_down_ptx_names,
+        CODE_WORDS_PER_PHASE, GROUP_K, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_BATCH, OUTPUT_ROWS,
+        PHASE_GROUPS, PHASES, SHARED_U32, WARPS, nvfp4_down_ptx_names, qwen35_nvfp4_down_ptx_names,
     };
     use std::collections::BTreeSet;
+    use tuisko_model::{Arch, Qwen35_9B};
 
     #[test]
     fn exact_geometry_matches_the_source_owner() {
@@ -601,11 +789,24 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_geometry_preserves_the_phase_and_row_ownership() {
+        assert_eq!(Qwen35_9B::INTERMEDIATE / GROUP_K, 768);
+        assert_eq!(Qwen35_9B::INTERMEDIATE / GROUP_K / PHASE_GROUPS, 24);
+        assert_eq!(Qwen35_9B::HIDDEN / (2 * WARPS), 256);
+        assert_eq!(SHARED_U32 * size_of::<u32>(), 8_192);
+    }
+
+    #[test]
     fn inventory_has_one_distinct_entry_per_batch() {
         let names = nvfp4_down_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
         assert_eq!(names.len(), MAX_BATCH);
         assert_eq!(unique.len(), names.len());
+
+        let qwen35 = qwen35_nvfp4_down_ptx_names();
+        let all = names.into_iter().chain(qwen35).collect::<BTreeSet<_>>();
+        assert_eq!(qwen35.len(), MAX_BATCH);
+        assert_eq!(all.len(), 2 * MAX_BATCH);
     }
 }
