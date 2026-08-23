@@ -86,6 +86,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut empty_request = stop_request;
     empty_request.max_new_tokens = 0;
     let mut empty_session = GenerationSession::start(&frontend, &empty_request)?;
+    drop(frontend);
     if empty_session.finish_reason() != Some(FinishReason::Length) {
         return Err("zero-token request did not finish at initialization".into());
     }

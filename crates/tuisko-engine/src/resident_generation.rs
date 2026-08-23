@@ -25,7 +25,7 @@ pub struct ResidentTextGenerator {
 
 /// One streaming generation request borrowing the single resident slot.
 pub struct ResidentGenerationSession<'a> {
-    control: GenerationSession<'a>,
+    control: GenerationSession,
     program: &'a mut ResidentModelProgram,
     stream: &'a CudaStream,
     logits: &'a mut [u16],
