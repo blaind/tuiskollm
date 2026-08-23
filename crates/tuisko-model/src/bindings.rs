@@ -1,8 +1,8 @@
 //! Shape- and dtype-checked bindings from checkpoint tensors to model roles.
 
 use crate::{
-    Arch, Bf16View, CheckpointError, CheckpointResult, CheckpointSnapshot, F32View, Fp8E4M3View,
-    TensorView, U8View,
+    Arch, Bf16View, CheckpointContract, CheckpointError, CheckpointResult, CheckpointSnapshot,
+    F32View, Fp8E4M3View, TensorView, U8View,
 };
 
 const EMBEDDING: &str = "model.language_model.embed_tokens.weight";
@@ -823,6 +823,157 @@ impl<'a> VisionBindings<'a> {
     }
 }
 
+/// Exact ModelOpt NVFP4 planes for one linear projection.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelOptNvfp4LinearBindings<'a> {
+    /// Packed E2M1 weights `[rows, columns / 2]`.
+    pub weight: U8View<'a, 2>,
+    /// E4M3 block scales `[rows, columns / 16]`.
+    pub block_scale: Fp8E4M3View<'a, 2>,
+    /// Positive source activation scale stored as one rank-zero F32 value.
+    pub input_scale: F32View<'a, 0>,
+    /// Positive second-stage weight scale stored as one rank-zero F32 value.
+    pub weight_scale_2: F32View<'a, 0>,
+    /// Logical output row count.
+    pub rows: usize,
+    /// Logical input column count before E2M1 packing.
+    pub columns: usize,
+}
+
+impl<'a> ModelOptNvfp4LinearBindings<'a> {
+    fn bind_from(
+        prefix: &str,
+        rows: usize,
+        columns: usize,
+        layer: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        let packed_columns = codec_columns(columns, E2M1_VALUES_PER_BYTE, "packed E2M1")?;
+        let scale_columns = codec_columns(columns, NVFP4_GROUP_SIZE, "E4M3 block-scale")?;
+        let weight = U8View::bind(
+            tensor(&format!("{prefix}.weight"))?,
+            [rows as u64, packed_columns],
+        )?;
+        let block_scale = Fp8E4M3View::bind(
+            tensor(&format!("{prefix}.weight_scale"))?,
+            [rows as u64, scale_columns],
+        )?;
+
+        validate_nvfp4_scales(layer, prefix, block_scale.codes())?;
+
+        Ok(Self {
+            weight,
+            block_scale,
+            input_scale: positive_rank_zero_f32(tensor(&format!("{prefix}.input_scale"))?)?,
+            weight_scale_2: positive_rank_zero_f32(tensor(&format!("{prefix}.weight_scale_2"))?)?,
+            rows,
+            columns,
+        })
+    }
+}
+
+/// Complete ModelOpt NVFP4 source family for one Qwen3.5 MLP boundary.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelOptNvfp4MlpBindings<'a> {
+    /// Gate projection packed weights and exact source scales.
+    pub gate: ModelOptNvfp4LinearBindings<'a>,
+    /// Up projection packed weights and exact source scales.
+    pub up: ModelOptNvfp4LinearBindings<'a>,
+    /// Down projection packed weights and exact source scales.
+    pub down: ModelOptNvfp4LinearBindings<'a>,
+    /// Zero-centered RMSNorm weights before the MLP `[hidden]`.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights for the next decoder boundary `[hidden]`.
+    pub next_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning this MLP boundary.
+    pub layer: usize,
+}
+
+impl<'a> ModelOptNvfp4MlpBindings<'a> {
+    /// Binds one exact Qwen3.5 ModelOpt NVFP4 MLP source family.
+    pub fn bind<A: Arch>(
+        snapshot: &'a CheckpointSnapshot<A>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from::<A>(layer, |name| snapshot.tensor(name))
+    }
+
+    fn bind_from<A: Arch>(
+        layer: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        require_modelopt_nvfp4_mlp_layer::<A>(layer)?;
+
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let mlp_prefix = format!("{layer_prefix}.mlp");
+        let gate = ModelOptNvfp4LinearBindings::bind_from(
+            &format!("{mlp_prefix}.gate_proj"),
+            A::INTERMEDIATE,
+            A::HIDDEN,
+            layer,
+            |name| tensor(name),
+        )?;
+        let up = ModelOptNvfp4LinearBindings::bind_from(
+            &format!("{mlp_prefix}.up_proj"),
+            A::INTERMEDIATE,
+            A::HIDDEN,
+            layer,
+            |name| tensor(name),
+        )?;
+        let down = ModelOptNvfp4LinearBindings::bind_from(
+            &format!("{mlp_prefix}.down_proj"),
+            A::HIDDEN,
+            A::INTERMEDIATE,
+            layer,
+            |name| tensor(name),
+        )?;
+
+        require_same_rank_zero_f32(
+            layer,
+            "gate/up input_scale",
+            &gate.input_scale,
+            &up.input_scale,
+        )?;
+        require_same_rank_zero_f32(
+            layer,
+            "gate/up weight_scale_2",
+            &gate.weight_scale_2,
+            &up.weight_scale_2,
+        )?;
+
+        let input_norm = Bf16View::bind(
+            tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+            [A::HIDDEN as u64],
+        )?;
+        let next_norm = Bf16View::bind(
+            tensor(&modelopt_nvfp4_next_norm_name::<A>(layer)?)?,
+            [A::HIDDEN as u64],
+        )?;
+
+        Ok(Self {
+            gate,
+            up,
+            down,
+            input_norm,
+            next_norm,
+            layer,
+        })
+    }
+}
+
+fn modelopt_nvfp4_next_norm_name<A: Arch>(layer: usize) -> CheckpointResult<String> {
+    require_modelopt_nvfp4_mlp_layer::<A>(layer)?;
+    let next_layer = layer
+        .checked_add(1)
+        .ok_or_else(|| CheckpointError::source_binding("ModelOpt NVFP4 MLP layer overflows"))?;
+
+    Ok(if next_layer == A::LAYERS {
+        FINAL_NORM.to_string()
+    } else {
+        format!("model.language_model.layers.{next_layer}.input_layernorm.weight")
+    })
+}
+
 /// Exact packed gate/up source planes for one NVFP4 MLP layer.
 #[derive(Clone, Copy, Debug)]
 pub struct Nvfp4GateUpBindings<'a> {
@@ -1095,6 +1246,16 @@ pub(crate) fn require_nvfp4_mlp_layer(layer: usize, layer_count: usize) -> Check
     Ok(())
 }
 
+fn require_modelopt_nvfp4_mlp_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
+    if A::CHECKPOINT_CONTRACT != CheckpointContract::ModelOptNvfp4 || layer >= A::LAYERS {
+        return Err(CheckpointError::source_binding(format!(
+            "layer {layer} does not use the admitted ModelOpt NVFP4 MLP source contract"
+        )));
+    }
+
+    Ok(())
+}
+
 fn require_dense_fp8_mlp_layer<A: Arch>(layer: usize) -> CheckpointResult<()> {
     if !(DENSE_FP8_MLP_LAYER_START..A::LAYERS).contains(&layer) {
         return Err(CheckpointError::source_binding(format!(
@@ -1197,6 +1358,35 @@ fn positive_f32(tensor: TensorView<'_>) -> CheckpointResult<f32> {
     Ok(value)
 }
 
+fn positive_rank_zero_f32(tensor: TensorView<'_>) -> CheckpointResult<F32View<'_, 0>> {
+    let view = F32View::bind(tensor, [])?;
+    let value = view.value(0).expect("validated scalar has one value");
+
+    if !value.is_finite() || value <= 0.0 {
+        return Err(CheckpointError::source_binding(format!(
+            "tensor `{}` must contain a finite positive F32 scale, observed {value}",
+            view.name()
+        )));
+    }
+
+    Ok(view)
+}
+
+fn require_same_rank_zero_f32(
+    layer: usize,
+    role: &str,
+    first: &F32View<'_, 0>,
+    second: &F32View<'_, 0>,
+) -> CheckpointResult<()> {
+    if first.bits(0) != second.bits(0) {
+        return Err(CheckpointError::source_binding(format!(
+            "layer-{layer} {role} values differ"
+        )));
+    }
+
+    Ok(())
+}
+
 fn positive_bf16(tensor: TensorView<'_>) -> CheckpointResult<u16> {
     let view = Bf16View::bind(tensor, [1])?;
     validate_positive_bf16_scales(&view)?;
@@ -1235,13 +1425,16 @@ fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> Checkpo
 mod tests {
     use super::{
         DenseFp8DownBindings, DenseFp8GateUpBindings, DenseFp8MlpBindings,
-        FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings, MtpBindings,
-        Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings, TextEndpointBindings,
-        VisionBindings, dense_fp8_next_norm_name, positive_bf16, require_adjacent,
-        require_dense_fp8_mlp_layer, require_full_attention_layer, require_gdn_layer,
-        require_mtp_contract, require_nvfp4_mlp_layer, validate_nvfp4_scales,
+        FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings, ModelOptNvfp4MlpBindings,
+        MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings,
+        TextEndpointBindings, VisionBindings, dense_fp8_next_norm_name, positive_bf16,
+        require_adjacent, require_dense_fp8_mlp_layer, require_full_attention_layer,
+        require_gdn_layer, require_mtp_contract, require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
-    use crate::{Arch, CheckpointErrorCode, CheckpointResult, DType, SafeTensorFile, TensorView};
+    use crate::{
+        Arch, CheckpointContract, CheckpointErrorCode, CheckpointResult, DType, SafeTensorFile,
+        TensorView,
+    };
     use serde_json::{Value, json};
     use std::fs::{self, File};
     use std::io::Write;
@@ -1295,6 +1488,40 @@ mod tests {
         const VOCAB: usize = 3;
         const LAYERS: usize = 64;
         const FULL_ATTENTION_INTERVAL: usize = 4;
+        const NUM_ATTENTION_HEADS: usize = 1;
+        const NUM_KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 1;
+        const LINEAR_KEY_HEADS: usize = 1;
+        const LINEAR_VALUE_HEADS: usize = 1;
+        const LINEAR_HEAD_DIM: usize = 1;
+        const LINEAR_CONV_KERNEL_DIM: usize = 4;
+        const MTP_LAYERS: usize = 1;
+        const MTP_USES_DEDICATED_EMBEDDINGS: bool = false;
+        const VISION_DEPTH: usize = 1;
+        const VISION_HIDDEN: usize = 1;
+        const VISION_INTERMEDIATE: usize = 1;
+        const VISION_NUM_HEADS: usize = 1;
+        const VISION_POSITIONS: usize = 1;
+        const VISION_OUTPUT_HIDDEN: usize = 1;
+        const VISION_INPUT_CHANNELS: usize = 1;
+        const VISION_PATCH_SIZE: usize = 1;
+        const VISION_SPATIAL_MERGE_SIZE: usize = 1;
+        const VISION_TEMPORAL_PATCH_SIZE: usize = 1;
+    }
+
+    #[derive(Clone, Copy)]
+    struct ModelOptArch;
+
+    impl Arch for ModelOptArch {
+        const MODEL_ID: &'static str = "test/modelopt";
+        const REVISION: &'static str = "test-revision";
+        const CHECKPOINT_CONTRACT: CheckpointContract = CheckpointContract::ModelOptNvfp4;
+        const HIDDEN: usize = 32;
+        const RMS_NORM_EPSILON: f32 = 1.0e-6;
+        const INTERMEDIATE: usize = 16;
+        const VOCAB: usize = 3;
+        const LAYERS: usize = 2;
+        const FULL_ATTENTION_INTERVAL: usize = 2;
         const NUM_ATTENTION_HEADS: usize = 1;
         const NUM_KV_HEADS: usize = 1;
         const HEAD_DIM: usize = 1;
@@ -1423,6 +1650,70 @@ mod tests {
                 },
                 format!("{down}.weight_scale"): {
                     "dtype":"F8_E4M3", "shape":[32,1], "data_offsets":[856,888]
+                },
+                format!("{layer_prefix}.post_attention_layernorm.weight"): {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[888,952]
+                },
+                format!("{next_layer_prefix}.input_layernorm.weight"): {
+                    "dtype":"BF16", "shape":[32], "data_offsets":[952,1016]
+                }
+            }),
+            payload,
+        )
+    }
+
+    fn modelopt_nvfp4_mlp_fixture(layer: usize) -> (Value, Vec<u8>) {
+        let prefix = format!("model.language_model.layers.{layer}.mlp");
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let next_layer_prefix = format!("model.language_model.layers.{}", layer + 1);
+        let mut payload = vec![0x38; 1_016];
+
+        payload[0..4].copy_from_slice(&0.25f32.to_le_bytes());
+        payload[4..8].copy_from_slice(&0.125f32.to_le_bytes());
+        payload[8..12].copy_from_slice(&0.25f32.to_le_bytes());
+        payload[12..16].copy_from_slice(&0.125f32.to_le_bytes());
+        payload[16..20].copy_from_slice(&0.5f32.to_le_bytes());
+        payload[20..24].copy_from_slice(&0.0625f32.to_le_bytes());
+        payload[888..952].fill(0x70);
+        payload[952..1_016].fill(0x80);
+
+        (
+            json!({
+                format!("{prefix}.gate_proj.input_scale"): {
+                    "dtype":"F32", "shape":[], "data_offsets":[0,4]
+                },
+                format!("{prefix}.gate_proj.weight_scale_2"): {
+                    "dtype":"F32", "shape":[], "data_offsets":[4,8]
+                },
+                format!("{prefix}.up_proj.input_scale"): {
+                    "dtype":"F32", "shape":[], "data_offsets":[8,12]
+                },
+                format!("{prefix}.up_proj.weight_scale_2"): {
+                    "dtype":"F32", "shape":[], "data_offsets":[12,16]
+                },
+                format!("{prefix}.down_proj.input_scale"): {
+                    "dtype":"F32", "shape":[], "data_offsets":[16,20]
+                },
+                format!("{prefix}.down_proj.weight_scale_2"): {
+                    "dtype":"F32", "shape":[], "data_offsets":[20,24]
+                },
+                format!("{prefix}.gate_proj.weight_scale"): {
+                    "dtype":"F8_E4M3", "shape":[16,2], "data_offsets":[24,56]
+                },
+                format!("{prefix}.up_proj.weight_scale"): {
+                    "dtype":"F8_E4M3", "shape":[16,2], "data_offsets":[56,88]
+                },
+                format!("{prefix}.down_proj.weight_scale"): {
+                    "dtype":"F8_E4M3", "shape":[32,1], "data_offsets":[88,120]
+                },
+                format!("{prefix}.gate_proj.weight"): {
+                    "dtype":"U8", "shape":[16,16], "data_offsets":[120,376]
+                },
+                format!("{prefix}.up_proj.weight"): {
+                    "dtype":"U8", "shape":[16,16], "data_offsets":[376,632]
+                },
+                format!("{prefix}.down_proj.weight"): {
+                    "dtype":"U8", "shape":[32,8], "data_offsets":[632,888]
                 },
                 format!("{layer_prefix}.post_attention_layernorm.weight"): {
                     "dtype":"BF16", "shape":[32], "data_offsets":[888,952]
@@ -1865,6 +2156,90 @@ mod tests {
         assert_eq!(complete.layer, 55);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn binds_exact_modelopt_nvfp4_mlp_source_contract() {
+        let path = fixture_path("modelopt-nvfp4-mlp");
+        let (header, payload) = modelopt_nvfp4_mlp_fixture(0);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let bindings =
+            ModelOptNvfp4MlpBindings::bind_from::<ModelOptArch>(0, |name| file.tensor(name))
+                .unwrap();
+
+        assert_eq!(bindings.gate.weight.shape(), &[16, 16]);
+        assert_eq!(bindings.gate.block_scale.shape(), &[16, 2]);
+        assert_eq!(bindings.gate.input_scale.value(0), Some(0.25));
+        assert_eq!(bindings.gate.weight_scale_2.value(0), Some(0.125));
+        assert_eq!(bindings.up.weight.shape(), &[16, 16]);
+        assert_eq!(bindings.down.weight.shape(), &[32, 8]);
+        assert_eq!(bindings.down.block_scale.shape(), &[32, 1]);
+        assert_eq!(bindings.down.input_scale.value(0), Some(0.5));
+        assert_eq!(bindings.down.weight_scale_2.value(0), Some(0.0625));
+        assert_eq!((bindings.gate.rows, bindings.gate.columns), (16, 32));
+        assert_eq!((bindings.down.rows, bindings.down.columns), (32, 16));
+        assert_eq!(bindings.input_norm.bytes()[0], 0x70);
+        assert_eq!(bindings.next_norm.bytes()[0], 0x80);
+        assert_eq!(bindings.layer, 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_modelopt_nvfp4_scale_and_route_drift() {
+        let (header, payload) = modelopt_nvfp4_mlp_fixture(0);
+
+        for (label, offset, bytes, expected) in [
+            (
+                "modelopt-nonpositive-scale",
+                0,
+                f32::NAN.to_le_bytes(),
+                "finite positive F32 scale",
+            ),
+            (
+                "modelopt-gate-up-scale-mismatch",
+                8,
+                0.5f32.to_le_bytes(),
+                "gate/up input_scale values differ",
+            ),
+        ] {
+            let path = fixture_path(label);
+            let mut changed = payload.clone();
+            changed[offset..offset + 4].copy_from_slice(&bytes);
+            write_safetensors_payload(&path, header.clone(), &changed);
+            let file = SafeTensorFile::open(&path).unwrap();
+
+            let error =
+                ModelOptNvfp4MlpBindings::bind_from::<ModelOptArch>(0, |name| file.tensor(name))
+                    .unwrap_err();
+
+            assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+            assert!(error.to_string().contains(expected), "{error}");
+            fs::remove_file(path).unwrap();
+        }
+
+        let path = fixture_path("modelopt-invalid-block-scale");
+        let mut changed = payload;
+        changed[24] = 0x7f;
+        write_safetensors_payload(&path, header, &changed);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let error =
+            ModelOptNvfp4MlpBindings::bind_from::<ModelOptArch>(0, |name| file.tensor(name))
+                .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("scale plane"));
+        fs::remove_file(path).unwrap();
+
+        let error = ModelOptNvfp4MlpBindings::bind_from::<Nvfp4Arch>(0, |_| {
+            panic!("the route check must reject before tensor lookup")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("ModelOpt NVFP4 MLP"));
     }
 
     #[test]
