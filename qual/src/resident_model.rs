@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
-    EngineError, MAX_BATCH, PagedKvSlotState, ResidentDecodeRoute, ResidentLongContextObservables,
-    ResidentModelObservables, ResidentModelProgram,
+    EngineError, MAX_BATCH, PagedKvSlotState, ResidentDecodeRoute, ResidentLoadMode,
+    ResidentLongContextObservables, ResidentModelObservables, ResidentModelProgram,
 };
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, device_memory_info};
 use tuisko_kernels_sm120::{
@@ -73,6 +73,13 @@ pub struct ResidentModelQualification {
 pub fn qualify_resident_model(
     root: &Path,
 ) -> Result<ResidentModelQualification, ResidentModelQualificationError> {
+    qualify_resident_model_with_mode(root, ResidentLoadMode::Legacy)
+}
+
+fn qualify_resident_model_with_mode(
+    root: &Path,
+    load_mode: ResidentLoadMode,
+) -> Result<ResidentModelQualification, ResidentModelQualificationError> {
     let _preflight = device_benchmark::preflight()?;
     let snapshot = Arc::new(CheckpointSnapshot::<Qwen38_27B>::open(root)?);
     let endpoint = TextEndpointBindings::bind(snapshot.as_ref())?;
@@ -88,7 +95,14 @@ pub fn qualify_resident_model(
         )));
     }
     let stream = context.new_stream().map_err(GpuError::from)?;
-    let mut program = ResidentModelProgram::from_snapshot(&context, snapshot.clone())?;
+    let mut program = match load_mode {
+        ResidentLoadMode::Legacy => {
+            ResidentModelProgram::from_snapshot(&context, snapshot.clone())?
+        }
+        ResidentLoadMode::Selective => {
+            ResidentModelProgram::from_snapshot_selective(&context, snapshot.clone())?
+        }
+    };
     initialize_short_routes(&mut program, &stream)?;
     verify_owner(&program)?;
     let stable_base = program.base_address();
@@ -1381,19 +1395,43 @@ fn verify_no_device_allocation(
 
 #[cfg(test)]
 mod tests {
-    use super::{SELECTED_LOGIT_ROWS, qualify_resident_model};
+    use super::{
+        ResidentModelQualification, SELECTED_LOGIT_ROWS, qualify_resident_model,
+        qualify_resident_model_with_mode,
+    };
     use std::path::PathBuf;
+    use tuisko_engine::ResidentLoadMode;
 
     #[test]
     #[ignore = "requires the pinned snapshot and an exclusive SM120 device"]
     fn source_model_matches_final_oracle_and_exact_graph_replay()
     -> Result<(), super::ResidentModelQualificationError> {
-        let root = std::env::var_os("TUISKO_SNAPSHOT").ok_or_else(|| {
-            super::ResidentModelQualificationError::Mismatch(
-                "set TUISKO_SNAPSHOT to the admitted revision".to_string(),
-            )
-        })?;
-        let report = qualify_resident_model(&PathBuf::from(root))?;
+        let report = qualify_resident_model(&snapshot_root()?)?;
+        assert_complete_report(report);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the pinned snapshot and an exclusive SM120 device"]
+    fn selective_loader_matches_final_oracle_and_exact_graph_replay()
+    -> Result<(), super::ResidentModelQualificationError> {
+        let report =
+            qualify_resident_model_with_mode(&snapshot_root()?, ResidentLoadMode::Selective)?;
+        assert_complete_report(report);
+        Ok(())
+    }
+
+    fn snapshot_root() -> Result<PathBuf, super::ResidentModelQualificationError> {
+        std::env::var_os("TUISKO_SNAPSHOT")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                super::ResidentModelQualificationError::Mismatch(
+                    "set TUISKO_SNAPSHOT to the admitted revision".to_string(),
+                )
+            })
+    }
+
+    fn assert_complete_report(report: ResidentModelQualification) {
         let active = (1..=8).sum::<usize>();
         assert_eq!(report.source_scalars, 256);
         assert_eq!(
@@ -1406,6 +1444,5 @@ mod tests {
         assert_eq!(report.long_route_cases, 49);
         assert!(report.long_oracle_values > 0);
         assert!(report.maximum_absolute_error.is_finite());
-        Ok(())
     }
 }

@@ -230,6 +230,53 @@ impl LoadingDeviceArena {
         Ok(())
     }
 
+    /// Enqueues a host-slice copy into one not-yet-initialized destination range.
+    ///
+    /// # Safety
+    ///
+    /// `source` must remain allocated and immutable until `stream` reaches the copy. The caller
+    /// must synchronize that stream before the source can be released or changed.
+    pub unsafe fn copy_from_host_async<T: DeviceCopy>(
+        &mut self,
+        stream: &CudaStream,
+        destination: Range<usize>,
+        source: &[T],
+    ) -> GpuResult<()> {
+        self.require_stream_context(stream, "copying into a loading arena")?;
+        self.initialized.require_available(&destination)?;
+        let bytes = destination.end - destination.start;
+        if bytes != size_of_val(source) {
+            return Err(GpuError::arena(format!(
+                "host source has {} bytes for loading-arena destination {}..{} ({} bytes)",
+                size_of_val(source),
+                destination.start,
+                destination.end,
+                bytes,
+            )));
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+        let address = self.address(destination.start)?;
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the loading-arena CUDA context", source))?;
+        // SAFETY: the caller owns the source lifetime; coverage validation proved the destination
+        // range is inside the live allocation and both ranges contain exactly `bytes`.
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                address,
+                source.as_ptr(),
+                bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|source| GpuError::driver("copying a host slice into a loading arena", source))?;
+        self.initialized.record(destination);
+        Ok(())
+    }
+
     /// Synchronizes all initialization writes and exposes the complete arena to runtime owners.
     pub fn seal(self, stream: &CudaStream) -> GpuResult<DeviceArena> {
         self.require_stream_context(stream, "sealing a loading arena")?;
