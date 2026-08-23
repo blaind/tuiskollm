@@ -1,3 +1,5 @@
+//! Exact pinned Hugging Face snapshot acquisition and cache admission.
+
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
@@ -73,18 +75,118 @@ impl RequiredFile {
     }
 }
 
+/// Observable work performed while provisioning one pinned snapshot file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProvisioningStage {
+    /// A resumed partial file is being hashed before its HTTP range request.
+    Verifying,
+    /// Bytes are being received from Hugging Face and appended to the cache blob.
+    Downloading,
+    /// The complete blob is being synchronized and installed into the snapshot.
+    Finalizing,
+}
+
+/// Exact per-file and whole-snapshot progress for terminal or API reporting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProvisioningProgress {
+    stage: ProvisioningStage,
+    file: &'static str,
+    file_bytes: u64,
+    file_total: u64,
+    completed_bytes: u64,
+    total_bytes: u64,
+}
+
+impl ProvisioningProgress {
+    /// Current provisioning stage.
+    pub const fn stage(self) -> ProvisioningStage {
+        self.stage
+    }
+
+    /// Exact filename from the pinned inventory.
+    pub const fn file(self) -> &'static str {
+        self.file
+    }
+
+    /// Bytes processed for the current file and stage.
+    pub const fn file_bytes(self) -> u64 {
+        self.file_bytes
+    }
+
+    /// Exact byte length of the current file.
+    pub const fn file_total(self) -> u64 {
+        self.file_total
+    }
+
+    /// Bytes processed through the current file in the missing-file inventory.
+    pub const fn completed_bytes(self) -> u64 {
+        self.completed_bytes
+    }
+
+    /// Exact logical bytes across all initially missing files.
+    pub const fn total_bytes(self) -> u64 {
+        self.total_bytes
+    }
+}
+
+struct FileProgress<'a> {
+    required: &'a RequiredFile,
+    completed_before: u64,
+    total_bytes: u64,
+    report: &'a mut dyn FnMut(ProvisioningProgress) -> Result<(), String>,
+}
+
+impl FileProgress<'_> {
+    fn emit(&mut self, stage: ProvisioningStage, file_bytes: u64) -> Result<(), String> {
+        if file_bytes > self.required.bytes {
+            return Err(format!(
+                "provisioning progress for {} reached {file_bytes} of {} bytes",
+                self.required.name, self.required.bytes,
+            ));
+        }
+        let completed_bytes = self
+            .completed_before
+            .checked_add(file_bytes)
+            .ok_or("Hugging Face provisioning byte count overflows")?;
+        (self.report)(ProvisioningProgress {
+            stage,
+            file: self.required.name,
+            file_bytes,
+            file_total: self.required.bytes,
+            completed_bytes,
+            total_bytes: self.total_bytes,
+        })
+    }
+}
+
+/// Resolved local snapshot and optional work performed to provision it.
 pub struct SnapshotResolution {
+    /// Exact admitted snapshot directory.
     pub path: PathBuf,
+    /// Download summary, or `None` when the snapshot was already local.
     pub provisioning: Option<Provisioning>,
 }
 
+/// Completed snapshot provisioning work.
 pub struct Provisioning {
+    /// Wall time spent downloading and installing the missing files.
     pub elapsed: Duration,
+    /// Number of files missing from the snapshot before provisioning.
     pub files: usize,
+    /// Exact logical bytes covered by those files.
     pub bytes: u64,
 }
 
+/// Resolves an explicit snapshot or provisions the pinned Hugging Face revision.
 pub fn resolve_snapshot(explicit: Option<PathBuf>) -> Result<SnapshotResolution, String> {
+    resolve_snapshot_with_progress(explicit, |_| Ok(()))
+}
+
+/// Resolves or provisions the pinned revision while reporting exact byte progress.
+pub fn resolve_snapshot_with_progress(
+    explicit: Option<PathBuf>,
+    mut report: impl FnMut(ProvisioningProgress) -> Result<(), String>,
+) -> Result<SnapshotResolution, String> {
     if let Some(path) = explicit {
         return Ok(local_resolution(path));
     }
@@ -107,15 +209,23 @@ pub fn resolve_snapshot(explicit: Option<PathBuf>) -> Result<SnapshotResolution,
         ));
     }
 
-    eprintln!(
-        "fetching {} at {} into the Hugging Face cache",
-        Qwen38_27B::MODEL_ID,
-        Qwen38_27B::REVISION,
-    );
     let started = Instant::now();
     let token = hf_token(&environment)?;
+    let total_bytes = missing.iter().map(|file| file.bytes).sum();
+    let mut completed_bytes = 0;
     for required in missing.iter().copied() {
-        download_file(&cache, &snapshot, required, token.as_deref())?;
+        download_file(
+            &cache,
+            &snapshot,
+            required,
+            token.as_deref(),
+            completed_bytes,
+            total_bytes,
+            &mut report,
+        )?;
+        completed_bytes = completed_bytes
+            .checked_add(required.bytes)
+            .ok_or("Hugging Face provisioning byte count overflows")?;
     }
     let SnapshotState::Complete = inspect_snapshot(&snapshot)? else {
         return Err(format!(
@@ -129,7 +239,7 @@ pub fn resolve_snapshot(explicit: Option<PathBuf>) -> Result<SnapshotResolution,
         provisioning: Some(Provisioning {
             elapsed: started.elapsed(),
             files: missing.len(),
-            bytes: missing.iter().map(|file| file.bytes).sum(),
+            bytes: total_bytes,
         }),
     })
 }
@@ -146,6 +256,9 @@ fn download_file(
     snapshot: &Path,
     required: &RequiredFile,
     token: Option<&str>,
+    completed_before: u64,
+    total_bytes: u64,
+    report: &mut impl FnMut(ProvisioningProgress) -> Result<(), String>,
 ) -> Result<(), String> {
     let repository = repository_folder();
     let repository_root = cache.join(&repository);
@@ -173,8 +286,15 @@ fn download_file(
             required.name
         )
     })?;
+    let mut progress = FileProgress {
+        required,
+        completed_before,
+        total_bytes,
+        report,
+    };
 
     if exact_file_length(&blob, required.bytes)? {
+        progress.emit(ProvisioningStage::Finalizing, required.bytes)?;
         install_snapshot_link(snapshot, required)?;
         return Ok(());
     }
@@ -201,11 +321,13 @@ fn download_file(
 
     let mut hasher = Sha256::new();
     if offset != 0 {
-        hash_prefix(&mut file, offset, &mut hasher, &incomplete)?;
+        hash_prefix(&mut file, offset, &mut hasher, &incomplete, &mut progress)?;
     }
     if offset < required.bytes {
-        append_remote(&mut file, offset, required, token, &mut hasher)?;
+        progress.emit(ProvisioningStage::Downloading, offset)?;
+        append_remote(&mut file, offset, token, &mut hasher, &mut progress)?;
     }
+    progress.emit(ProvisioningStage::Finalizing, required.bytes)?;
     file.sync_all()
         .map_err(|error| format!("syncing {}: {error}", incomplete.display()))?;
     let actual_bytes = file
@@ -266,10 +388,11 @@ fn validate_remote_metadata(required: &RequiredFile, token: Option<&str>) -> Res
 fn append_remote(
     file: &mut File,
     offset: u64,
-    required: &RequiredFile,
     token: Option<&str>,
     hasher: &mut Sha256,
+    progress: &mut FileProgress<'_>,
 ) -> Result<(), String> {
+    let required = progress.required;
     let agent = agent(10);
     let url = resolve_url(required.name);
     let mut request = authorize(agent.get(&url), token);
@@ -294,6 +417,7 @@ fn append_remote(
 
     let mut reader = response.into_body().into_reader();
     let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut received = offset;
     loop {
         let read = reader
             .read(&mut buffer)
@@ -304,6 +428,10 @@ fn append_remote(
         file.write_all(&buffer[..read])
             .map_err(|error| format!("writing {}: {error}", required.name))?;
         hasher.update(&buffer[..read]);
+        received = received
+            .checked_add(read as u64)
+            .ok_or("Hugging Face file byte count overflows")?;
+        progress.emit(ProvisioningStage::Downloading, received)?;
     }
     Ok(())
 }
@@ -313,12 +441,14 @@ fn hash_prefix(
     bytes: u64,
     hasher: &mut Sha256,
     path: &Path,
+    progress: &mut FileProgress<'_>,
 ) -> Result<(), String> {
     use std::io::{Seek, SeekFrom};
 
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("seeking {}: {error}", path.display()))?;
     let mut remaining = bytes;
+    let mut hashed = 0;
     let mut buffer = vec![0_u8; 1024 * 1024];
     while remaining != 0 {
         let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
@@ -326,6 +456,8 @@ fn hash_prefix(
             .map_err(|error| format!("reading partial download {}: {error}", path.display()))?;
         hasher.update(&buffer[..limit]);
         remaining -= limit as u64;
+        hashed += limit as u64;
+        progress.emit(ProvisioningStage::Verifying, hashed)?;
     }
     Ok(())
 }
@@ -519,8 +651,8 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        REQUIRED_FILES, SnapshotState, hex_digest, hub_cache, inspect_snapshot, offline,
-        snapshot_path,
+        FileProgress, ProvisioningStage, REQUIRED_FILES, SnapshotState, hex_digest, hub_cache,
+        inspect_snapshot, offline, snapshot_path,
     };
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -606,6 +738,47 @@ mod tests {
     #[test]
     fn digest_format_is_lowercase_hex() {
         assert_eq!(hex_digest(&[0, 1, 254, 255]), "0001feff");
+    }
+
+    #[test]
+    fn progress_is_exact_and_refuses_file_overrun() {
+        let required = &REQUIRED_FILES[2];
+        let mut events = Vec::new();
+        let mut report = |progress| {
+            events.push(progress);
+            Ok(())
+        };
+        {
+            let mut progress = FileProgress {
+                required,
+                completed_before: 2 << 30,
+                total_bytes: 24 << 30,
+                report: &mut report,
+            };
+            progress
+                .emit(ProvisioningStage::Downloading, 1 << 30)
+                .unwrap();
+        }
+        let progress = events[0];
+        assert_eq!(progress.stage(), ProvisioningStage::Downloading);
+        assert_eq!(progress.file(), "model.safetensors");
+        assert_eq!(progress.file_bytes(), 1 << 30);
+        assert_eq!(progress.file_total(), required.bytes);
+        assert_eq!(progress.completed_bytes(), 3 << 30);
+        assert_eq!(progress.total_bytes(), 24 << 30);
+
+        let mut discard = |_| Ok(());
+        let mut progress = FileProgress {
+            required,
+            completed_before: 0,
+            total_bytes: required.bytes,
+            report: &mut discard,
+        };
+        assert!(
+            progress
+                .emit(ProvisioningStage::Downloading, required.bytes + 1)
+                .is_err()
+        );
     }
 
     struct TestDirectory(PathBuf);
