@@ -160,6 +160,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact-B graph, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact-B graphs, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT` | Check complete source layer-63 attention/MLP seams, represented KV cache, exact-B graphs, stable addresses, and owner allocation | terminal |
+| `cargo run -p xtask -- qualify-qwen35-full-attention-layer SNAPSHOT` | Check complete Qwen3.5 source layer-31 attention/MLP seams, BF16 KV cache, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-resident-model SNAPSHOT` | Check all 64 source routes, final source-backed formulas, dynamic page recycling/remapping and isolated reset, persistent state/cache, short plus six-bucket exact-B whole-model graphs, independent long-attention seam formulas, stable device/host addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-resident-generation SNAPSHOT` | Check pinned vLLM next-token fixtures plus frontend, greedy control, streaming decode, stable ownership, and zero post-warmup device allocation | terminal |
 | `cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT` | Compare compact mixed-length scheduling with sequential requests, including every B=1..8 route, noncontiguous survivor replay, cancellation, exact retained-prefix reuse, divergence fallback, slot recycling, stable ownership, and zero post-warmup device allocation | terminal |
@@ -181,6 +182,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-qwen35-attention-qk-prepare` | Measure every exact Qwen3.5 Q/K prepare and cache-append graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT` | Measure every complete source-backed layer-60 graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-full-attention-layer SNAPSHOT` | Measure every complete source-backed layer-63 graph at a 131-token, three-page context | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen35-full-attention-layer SNAPSHOT` | Measure every complete Qwen3.5 source-backed layer-31 graph at a 131-token, three-page BF16 context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-resident-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head graph at a 131-token context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-resident-long-context-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head long graph with one 131,073-token row and compact one-token survivors | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
@@ -305,6 +307,10 @@ allocation remain outside the timed region.
 `bench-full-attention-layer SNAPSHOT` measures the complete layer-63 decode graph directly. Its
 131-token warm cache crosses both 64-token page seams; repeated paths overwrite the same admitted
 cache position so the timed geometry stays invariant.
+
+`bench-qwen35-full-attention-layer SNAPSHOT` applies the same direct boundary to Qwen3.5 layer 31.
+Its accounting distinguishes the B=2 A16 MLP path from the W4A4 paths and records the BF16 cache
+separately from resident weights and workspace.
 
 `bench-resident-model SNAPSHOT` times the complete production graph directly; it never derives a
 model latency from leaf medians. The current 131-token route exercises all 64 layers and the LM
