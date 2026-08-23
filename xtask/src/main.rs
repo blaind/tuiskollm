@@ -5526,6 +5526,18 @@ fn gate_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
             require_registers(&baseline, key, registers)?;
         }
     }
+    for (key, shared) in [
+        ("prefill_control_shared_bytes", &prefill_control_shared),
+        (
+            "prefill_convolution_shared_bytes",
+            &prefill_convolution_shared,
+        ),
+        ("prefill_history_shared_bytes", &prefill_history_shared),
+    ] {
+        if baseline.contains_key(key) {
+            require_uniform_value(&baseline, key, shared)?;
+        }
+    }
 
     println!(
         "GDN prepare gate passed: 8 control + 8 convolution + 4 prefill control + 4 prefill convolution + 4 prefill history entries, REG {:?} / {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?} / {:?} / {:?}, SASS present",
