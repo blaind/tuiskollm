@@ -12,14 +12,25 @@ only for a nonstandard Toolkit location.
 
 ## Build
 
-Build the top-level executable with:
+Build the top-level executable through the pinned CUDA compiler and run every resource gate with:
 
 ```bash
-cargo build --release --bin tuiskollm
+cargo run -p xtask -- bootstrap-cuda-oxide
+cargo run -p xtask -- build-server
 ```
 
-The output is `target/release/tuiskollm`. The executable is currently a scaffold; serving and its
-checkpoint command line have not landed yet.
+The output is `target/cuda-oxide-build/release/tuiskollm`. A plain `cargo build` cannot finalize the
+embedded device artifacts. Start the exact resident server with the pinned snapshot directory and
+an optional numeric listen address:
+
+```bash
+target/cuda-oxide-build/release/tuiskollm serve SNAPSHOT 127.0.0.1:8000
+```
+
+It exposes `GET /health`, `GET /v1/models`, and OpenAI-compatible blocking or SSE
+`POST /v1/chat/completions`. The server loads and admits the complete checkpoint before binding the
+listener, owns one bounded resident scheduling queue, and refuses a different model identity or
+request options that the current product cannot honor.
 
 The optional `tuisko-llm` Python package exposes the admitted tokenizer and chat-template frontend.
 It does not claim an in-process inference API; see [`docs/python.md`](docs/python.md).
@@ -28,13 +39,16 @@ It does not claim an in-process inference API; see [`docs/python.md`](docs/pytho
 history/state pairs, 16 current 192-token-per-slot attention KV caches, endpoint weights, one shared
 workspace, and immutable whole-model CUDA Graphs for every `B=1..8` route. Compact active rows can
 address any distinct physical state/cache slots, and one slot can be reset without touching its
-survivors. Server wiring has not landed. Concrete single-slot and compact eight-request generation
-owners connect the admitted frontend, sampling, streaming decode, and resident graphs for prompts
-within the current 192-token cache. The compact owner preserves the final emitted token as pending,
-packs only requests needing device work, cancels without advancing that pending token, and recycles
-holes without moving survivor state. Inactive slots retain their exact processed token span and may
-skip only a prefix that the next prompt contains in full; divergence falls back to cold priming.
-Prompt priming uses the exact B=1 decode route until optimized prefill routes are admitted.
+survivors. The HTTP worker owns that scheduler and disconnecting a response cancels its resident
+request without moving survivors. Concrete single-slot and compact eight-request generation owners
+connect the admitted frontend, sampling, streaming decode, and resident graphs for prompts within
+the current 192-token cache. The compact owner preserves the final emitted token as pending, packs
+only requests needing device work, cancels without advancing that pending token, and recycles holes
+without moving survivor state. Inactive slots retain their exact processed token span and may skip
+only a prefix that the next prompt contains in full; divergence falls back to cold priming. Prompt
+priming uses the exact B=1 decode route until optimized prefill routes are admitted. Vision inputs,
+MTP generation, and prefill routes are not served yet and are rejected or remain outside the HTTP
+contract rather than silently taking another route.
 
 ## Current device slice
 

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+tuisko-serve.workspace = true
+
 [workspace]
 members = [
     "crates/tuisko-engine",
