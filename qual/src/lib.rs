@@ -14,6 +14,8 @@ mod attention_output;
 #[cfg(feature = "device")]
 mod attention_output_benchmark;
 #[cfg(feature = "device")]
+mod attention_output_prefill;
+#[cfg(feature = "device")]
 mod attention_qk_prepare;
 #[cfg(feature = "device")]
 mod attention_qk_prepare_benchmark;
@@ -152,6 +154,11 @@ pub use attention_output::{
 };
 #[cfg(feature = "device")]
 pub use attention_output_benchmark::benchmark_attention_output;
+#[cfg(feature = "device")]
+pub use attention_output_prefill::{
+    AttentionOutputPrefillQualification, AttentionOutputPrefillQualificationError,
+    qualify_attention_output_prefill,
+};
 #[cfg(feature = "device")]
 pub use attention_qk_prepare::{
     AttentionQkPrepareQualification, AttentionQkPrepareQualificationError,

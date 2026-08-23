@@ -24,7 +24,10 @@ maximum/denominator/numerator states and reduce them into the public output seam
 `T=1024` macro prefill uses the two-CTA K32 flash producer at exact `P=1,2,4,8,16`, with one
 compile-time reducer per partition count; the intended resident route is P4. Long-context paged
 GQA retains the same represented cache contract and partitions contexts through 220,000 positions
-into 256-position partial softmaxes plus one exact reduction at `B=1..8`. The resident text owner
+into 256-position partial softmaxes plus one exact reduction at `B=1..8`. Gated attention output
+publishes its FP32 and dynamic E4M3 seams and applies the source-native projection at exact
+`B=1..8` and `T=32,64,128,1024`; the prefill projection uses exact 32x32 tiles through T=128 and
+64x32 tiles at T=1024. The resident text owner
 composes all 48 GDN layers, 16 attention layers, source-routed MLPs, and the LM head into one
 directly timed graph at every exact `B=1..8`; serving cases remain future work.
 
@@ -164,7 +167,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-paged-gqa` | Check exact page lookup, grouped-head mapping, represented E4M3 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8, shared T=32/64/128 prefill, and partitioned T=128 P8/P16 deep tails | terminal |
 | `cargo run -p xtask -- qualify-qwen35-paged-gqa` | Check Qwen3.5 exact page lookup, grouped-head mapping, represented BF16 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-long-context-paged-gqa` | Check every partition bucket through 220,000 positions, all partial/reduction seams, untouched scratch, and graph replay at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-attention-output` | Check sigmoid gating, the published FP32 seam, dynamic E4M3 quantization, source-native projection, and graph replay at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-attention-output` | Check sigmoid gating, the published FP32 seam, dynamic E4M3 quantization, source-native projection, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact-B graph, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact-B graphs, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT` | Check complete source layer-63 attention/MLP seams, represented KV cache, exact-B graphs, stable addresses, and owner allocation | terminal |

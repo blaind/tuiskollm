@@ -74,8 +74,11 @@ while represented F16 probabilities and V feed PV Tensor Cores. P8 uses 64-posit
 32,768 positions, P16 uses 32-position tiles through 220,000, and both publish complete FP32
 softmax states to the existing reducer. The `T=1024` macro leaf reuses the two-CTA K32 producer
 through exact `P=1,2,4,8,16` routes and has a separately specialized reducer for each; the future
-resident schedule will select P4. Attention-output prefill and full-layer/server routing remain
-separate slices, so these leaves do not yet change server prompt priming.
+resident schedule will select P4. Gated attention output admits exact `T=32,64,128,1024` routes:
+one CTA per token publishes the sigmoid-gated FP32 seam and its dynamic E4M3 representation, then
+32x32 or 64x32 native E4M3 MMA tiles project through the source-native output matrix. Full-layer
+prefill composition and server routing remain separate slices, so these leaves do not yet change
+server prompt priming.
 
 ## Current device slice
 
