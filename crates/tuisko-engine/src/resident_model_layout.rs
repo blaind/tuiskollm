@@ -1,11 +1,15 @@
 //! Exact resident and shared-KV arena plan for the Qwen3.8 text model.
 
 mod program;
+mod upload_plan;
 
 pub use program::{ResidentDecodeRoute, ResidentModelProgram};
 #[cfg(feature = "qualification")]
 pub use program::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
+};
+pub use upload_plan::{
+    ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
 };
 
 use crate::{
