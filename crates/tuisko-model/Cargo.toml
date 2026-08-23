@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 memmap2.workspace = true
+page_size.workspace = true
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true

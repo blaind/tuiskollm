@@ -89,6 +89,8 @@ pub enum ResidentLoadMode {
     Selective,
 }
 
+const PRODUCTION_LOAD_MODE: ResidentLoadMode = ResidentLoadMode::Selective;
+
 impl ResidentLoadMode {
     /// Stable spelling used in startup reports.
     pub const fn as_str(self) -> &'static str {
@@ -110,6 +112,7 @@ pub struct ResidentLoadStats {
     layout_plan_ns: u64,
     arena_allocation_ns: u64,
     operator_setup_ns: u64,
+    source_prefault_ns: u64,
     weight_prepare_ns: u64,
     source_binding_ns: u64,
     qkv_gather_ns: u64,
@@ -119,6 +122,7 @@ pub struct ResidentLoadStats {
     weight_load_ns: u64,
     nonweight_init_ns: u64,
     graph_capture_ns: u64,
+    prefault_bytes: usize,
     borrowed_source_bytes: usize,
     gathered_source_bytes: usize,
     swizzled_source_bytes: usize,
@@ -166,6 +170,11 @@ impl ResidentLoadStats {
         self.operator_setup_ns
     }
 
+    /// Host nanoseconds spent populating source-mapping page tables before CUDA access.
+    pub const fn source_prefault_ns(self) -> u64 {
+        self.source_prefault_ns
+    }
+
     /// Host nanoseconds spent binding and materializing source values outside CUDA copy calls.
     pub const fn weight_prepare_ns(self) -> u64 {
         self.weight_prepare_ns
@@ -209,6 +218,11 @@ impl ResidentLoadStats {
     /// Host nanoseconds spent binding stable pointers and capturing the graph inventory.
     pub const fn graph_capture_ns(self) -> u64 {
         self.graph_capture_ns
+    }
+
+    /// Immutable source-mapping bytes submitted for page-table population.
+    pub const fn prefault_bytes(self) -> usize {
+        self.prefault_bytes
     }
 
     /// Weight bytes borrowed directly from admitted mmap-backed source planes.
@@ -321,20 +335,30 @@ impl ResidentEmbeddingStageGraph<'_> {
 }
 
 impl ResidentModelProgram {
-    /// Loads every exact source plane and captures one complete graph for each `B=1..=8` route.
+    /// Loads every exact source plane through the qualified prefaulted route.
     pub fn from_snapshot(
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
-        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Legacy)
+        Self::from_snapshot_with_mode(context, snapshot, PRODUCTION_LOAD_MODE)
     }
 
-    /// Loads through selective initialization while retaining the legacy path for qualification.
+    /// Loads through selective initialization for focused qualification.
+    #[cfg(feature = "qualification")]
     pub fn from_snapshot_selective(
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
         Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Selective)
+    }
+
+    /// Loads through the retained eager-zeroing A/B authority.
+    #[cfg(feature = "qualification")]
+    pub fn from_snapshot_legacy(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+    ) -> EngineResult<Self> {
+        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Legacy)
     }
 
     fn from_snapshot_with_mode(
@@ -443,6 +467,7 @@ impl ResidentModelProgram {
                     layout_plan_ns,
                     arena_allocation_ns,
                     operator_setup_ns,
+                    source_prefault_ns: 0,
                     weight_prepare_ns,
                     source_binding_ns: preparation.source_binding_ns,
                     qkv_gather_ns: preparation.qkv_gather_ns,
@@ -452,6 +477,7 @@ impl ResidentModelProgram {
                     weight_load_ns,
                     nonweight_init_ns,
                     graph_capture_ns: 0,
+                    prefault_bytes: 0,
                     borrowed_source_bytes,
                     gathered_source_bytes,
                     swizzled_source_bytes,
@@ -464,6 +490,17 @@ impl ResidentModelProgram {
                 mut kv_arena,
             } => {
                 let weight_start = Instant::now();
+                #[cfg(target_os = "linux")]
+                let (prefault_bytes, source_prefault_ns) = {
+                    let prefault_start = Instant::now();
+                    let bytes = snapshot.prefault_model_shard()?;
+                    (
+                        bytes,
+                        elapsed_ns("resident source prefault", prefault_start)?,
+                    )
+                };
+                #[cfg(not(target_os = "linux"))]
+                let (prefault_bytes, source_prefault_ns) = (0, 0);
                 let (scalars, upload_bytes, upload_submissions, weight_copy_ns, preparation) = {
                     let mut sink = SelectiveWeightSink {
                         arena: &mut arena,
@@ -497,11 +534,12 @@ impl ResidentModelProgram {
                     })?;
                 let preparation_other_ns = weight_prepare_ns
                     .checked_sub(preparation.total_ns()?)
+                    .and_then(|nanoseconds| nanoseconds.checked_sub(source_prefault_ns))
                     .ok_or_else(|| {
-                    EngineError::layout(
-                        "classified selective preparation exceeds total preparation",
-                    )
-                })?;
+                        EngineError::layout(
+                            "classified selective preparation exceeds total preparation",
+                        )
+                    })?;
 
                 let nonweight_start = Instant::now();
                 let metadata = initialize_selective_nonweights(
@@ -543,6 +581,7 @@ impl ResidentModelProgram {
                     layout_plan_ns,
                     arena_allocation_ns,
                     operator_setup_ns,
+                    source_prefault_ns,
                     weight_prepare_ns,
                     source_binding_ns: preparation.source_binding_ns,
                     qkv_gather_ns: preparation.qkv_gather_ns,
@@ -552,6 +591,7 @@ impl ResidentModelProgram {
                     weight_load_ns,
                     nonweight_init_ns,
                     graph_capture_ns: 0,
+                    prefault_bytes,
                     borrowed_source_bytes,
                     gathered_source_bytes,
                     swizzled_source_bytes,
@@ -2994,8 +3034,16 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bf16_to_f32, decode_lengths, require_batch, select_decode_route, slot_rows};
+    use super::{
+        PRODUCTION_LOAD_MODE, ResidentLoadMode, bf16_to_f32, decode_lengths, require_batch,
+        select_decode_route, slot_rows,
+    };
     use crate::EngineErrorCode;
+
+    #[test]
+    fn production_loader_is_the_prefaulted_selective_route() {
+        assert_eq!(PRODUCTION_LOAD_MODE, ResidentLoadMode::Selective);
+    }
 
     #[test]
     fn exact_batch_inventory_rejects_every_neighbor() {

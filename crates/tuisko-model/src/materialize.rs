@@ -1069,7 +1069,7 @@ fn swizzle_scale_tile(
     }
 }
 
-fn materialization_pool(role: &str) -> CheckpointResult<&'static rayon::ThreadPool> {
+pub(crate) fn materialization_pool(role: &str) -> CheckpointResult<&'static rayon::ThreadPool> {
     let pool = MATERIALIZATION_POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(materialization_workers())
