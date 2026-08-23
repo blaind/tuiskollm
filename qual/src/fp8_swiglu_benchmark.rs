@@ -11,11 +11,11 @@ use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     GpuTimer,
 };
-use tuisko_kernels_sm120::DenseFp8SwiGluOp;
+use tuisko_kernels_sm120::{DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps};
 use tuisko_model::{Arch, Qwen38_27B};
 
-const MAX_ROWS: usize = 128;
-const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const ALIGNMENT: usize = 256;
 const INPUT_PATTERN: [f32; 8] = [0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625];
 const TOKEN_FACTORS: [f32; 8] = [1.0, 0.5, 0.25, 0.125, -1.0, -0.5, -0.25, -0.125];
@@ -30,6 +30,21 @@ struct Regions {
     weight_codes: ArenaRegion<u8>,
     weight_scales: ArenaRegion<u16>,
     output: ArenaRegion<u16>,
+}
+
+impl Regions {
+    fn payload_bytes(self) -> usize {
+        self.input.byte_len()
+            + self.activation_codes.byte_len()
+            + self.activation_scales.byte_len()
+            + self.weight_codes.byte_len()
+            + self.weight_scales.byte_len()
+            + self.output.byte_len()
+    }
+
+    fn weight_bytes(self) -> usize {
+        self.weight_codes.byte_len() + self.weight_scales.byte_len()
+    }
 }
 
 struct Addresses {
@@ -51,6 +66,7 @@ struct Session {
     routes: Vec<RouteGraphs>,
     timer: GpuTimer,
     _op: DenseFp8SwiGluOp,
+    maps: DenseFp8SwiGluTmaMaps,
     arena: DeviceArena,
     regions: Regions,
     stream: Arc<CudaStream>,
@@ -85,10 +101,19 @@ impl Session {
             weight_scales: arena.address(regions.weight_scales)?,
             output: arena.address(regions.output)?,
         };
+        // SAFETY: this session owns the stable maximum activation and source weight planes.
+        let maps = unsafe {
+            DenseFp8SwiGluTmaMaps::new(
+                &stream,
+                addresses.activation_codes.cast_const(),
+                addresses.weight_codes,
+            )?
+        };
         let mut routes = Vec::with_capacity(EXACT_ROUTES.len());
         for rows in EXACT_ROUTES {
             routes.push(capture_route(
                 &op,
+                &maps,
                 &stream,
                 &addresses,
                 rows,
@@ -101,6 +126,7 @@ impl Session {
             routes,
             timer,
             _op: op,
+            maps,
             arena,
             regions,
             stream,
@@ -146,7 +172,7 @@ impl Session {
     }
 
     fn weight_bytes(&self) -> usize {
-        self.regions.weight_codes.byte_len() + self.regions.weight_scales.byte_len()
+        self.regions.weight_bytes()
     }
 }
 
@@ -207,15 +233,16 @@ fn make_weight_scales() -> Vec<u16> {
 
 fn capture_route(
     op: &DenseFp8SwiGluOp,
+    maps: &DenseFp8SwiGluTmaMaps,
     stream: &CudaStream,
     addresses: &Addresses,
     rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, maps, stream, addresses, rows))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, rows)?;
+            launch(op, maps, stream, addresses, rows)?;
         }
 
         Ok(())
@@ -230,22 +257,36 @@ fn capture_route(
 
 fn launch(
     op: &DenseFp8SwiGluOp,
+    maps: &DenseFp8SwiGluTmaMaps,
     stream: &CudaStream,
     addresses: &Addresses,
     rows: usize,
 ) -> GpuResult<()> {
     // SAFETY: all pointers cover their complete aligned maximum-row arena regions.
     unsafe {
-        op.launch(
-            stream,
-            rows,
-            addresses.input,
-            addresses.activation_codes,
-            addresses.activation_scales,
-            addresses.weight_codes,
-            addresses.weight_scales,
-            addresses.output,
-        )
+        if rows == MAX_ROWS {
+            op.launch_macro_prefill(
+                stream,
+                addresses.input,
+                addresses.activation_codes,
+                addresses.activation_scales,
+                addresses.weight_codes,
+                addresses.weight_scales,
+                addresses.output,
+                maps,
+            )
+        } else {
+            op.launch(
+                stream,
+                rows,
+                addresses.input,
+                addresses.activation_codes,
+                addresses.activation_scales,
+                addresses.weight_codes,
+                addresses.weight_scales,
+                addresses.output,
+            )
+        }
     }
 }
 
@@ -269,6 +310,7 @@ pub fn benchmark_fp8_swiglu(
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(options.launches_per_sample)?;
     let weight_bytes = session.weight_bytes();
+    let padding_bytes = session.arena.byte_len() - session.regions.payload_bytes();
     memory.register_owned(
         "fp8_swiglu/weights",
         BenchmarkMemoryKind::Weights,
@@ -278,8 +320,20 @@ pub fn benchmark_fp8_swiglu(
     memory.register_owned(
         "fp8_swiglu/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
-        session.arena.byte_len() - weight_bytes,
-        "max_rows=128",
+        session.arena.byte_len() - weight_bytes - padding_bytes,
+        "max_rows=1024 quantization and gate/up output seams",
+    )?;
+    memory.register_owned(
+        "fp8_swiglu/tma_descriptors",
+        BenchmarkMemoryKind::Other,
+        session.maps.byte_len(),
+        "two address-bound 128-byte tensor maps",
+    )?;
+    memory.register_owned(
+        "fp8_swiglu/alignment_padding",
+        BenchmarkMemoryKind::Other,
+        padding_bytes,
+        "256-byte arena region alignment",
     )?;
     memory.capture("after_setup")?;
     session.warm(warmup_launches)?;
@@ -315,11 +369,12 @@ fn f32_to_bf16(value: f32) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{EXACT_ROUTES, MAX_ROWS, logical_bytes};
+    use super::{EXACT_ROUTES, MAX_ROWS, layout, logical_bytes};
+    use tuisko_kernels_sm120::DenseFp8SwiGluTmaMaps;
     use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
-    fn byte_accounting_covers_quantize_projection_and_fused_epilogue() {
+    fn fp8_swiglu_suite_benchmark_byte_accounting_covers_every_route() {
         let weights = 2 * Qwen38_27B::INTERMEDIATE * (Qwen38_27B::HIDDEN + size_of::<u16>());
         let per_token = 4 * Qwen38_27B::HIDDEN
             + 2 * size_of::<f32>()
@@ -327,6 +382,15 @@ mod tests {
 
         assert_eq!(logical_bytes(1), weights + per_token);
         assert_eq!(logical_bytes(MAX_ROWS), weights + MAX_ROWS * per_token);
-        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
+    }
+
+    #[test]
+    fn fp8_swiglu_suite_benchmark_arena_accounting_exposes_every_byte() {
+        let (layout, regions) = layout().unwrap();
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 0);
+        assert_eq!(layout.byte_len(), 229_711_872);
+        assert_eq!(regions.payload_bytes(), 229_711_872);
+        assert_eq!(DenseFp8SwiGluTmaMaps::BYTE_LEN, 256);
     }
 }

@@ -78,7 +78,9 @@ softmax states to the existing reducer. The `T=1024` macro leaf reuses the two-C
 through exact `P=1,2,4,8,16` routes and has a separately specialized reducer for each; the future
 resident schedule will select P4. Gated attention output admits exact `T=32,64,128,1024` routes:
 one CTA per token publishes the sigmoid-gated FP32 seam and its dynamic E4M3 representation, then
-32x32 or 64x32 native E4M3 MMA tiles project through the source-native output matrix. Full-layer
+32x32 or 64x32 native E4M3 MMA tiles project through the source-native output matrix. Dense-FP8
+gate/up SwiGLU also admits exact `T=1024`: a 128x64x64 three-stage TMA route retains the represented
+E4M3 activation and source-weight planes and owns two stable tensor-map descriptors. Full-layer
 prefill composition and server routing remain separate slices, so these leaves do not yet change
 server prompt priming.
 
@@ -93,6 +95,7 @@ cargo run -p xtask -- qualify-residual-norm
 cargo run -p xtask -- qualify-fp8-qkv
 cargo run -p xtask -- qualify-fp8-gdn-input
 cargo run -p xtask -- qualify-fp8-lm-head
+cargo run -p xtask -- qualify-fp8-swiglu
 cargo run -p xtask -- qualify-nvfp4-swiglu
 cargo run -p xtask -- qualify-nvfp4-down
 cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT
