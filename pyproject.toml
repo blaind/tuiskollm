@@ -1,0 +1,62 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tuisko-llm"
+dynamic = ["version"]
+description = "Exact tokenizer and chat-template frontend for TuiskoLLM"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT OR Apache-2.0"
+
+[dependency-groups]
+dev = [
+    "maturin>=1.7,<2",
+    "mypy>=1.10",
+    "pytest>=8,<10",
+    "ruff>=0.4",
+]
+
+[tool.maturin]
+manifest-path = "crates/tuisko-python/Cargo.toml"
+module-name = "tuisko.llm._native"
+python-source = "python"
+features = ["extension-module"]
+compatibility = "manylinux_2_34"
+
+[tool.uv]
+required-version = "==0.12.3"
+build-constraint-dependencies = ["maturin==1.14.1"]
+cache-keys = [
+    { file = "Cargo.lock" },
+    { file = "Cargo.toml" },
+    { file = "crates/tuisko-frontend/**/*.rs" },
+    { file = "crates/tuisko-model/**/*.rs" },
+    { file = "crates/tuisko-python/**/*.rs" },
+    { file = "crates/tuisko-python/Cargo.toml" },
+    { file = "pyproject.toml" },
+    { file = "python/**/*.py" },
+    { file = "python/**/*.pyi" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+addopts = "-q -ra"
+markers = [
+    "checkpoint: requires the admitted snapshot path in TUISKO_CHECKPOINT",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "PT"]
+
+[tool.mypy]
+strict = true
+explicit_package_bases = true
+mypy_path = "python"
+python_version = "3.12"
+files = ["python/tuisko/llm", "python/tests"]

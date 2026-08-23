@@ -21,6 +21,9 @@ cargo build --release --bin tuiskollm
 The output is `target/release/tuiskollm`. The executable is currently a scaffold; serving and its
 checkpoint command line have not landed yet.
 
+The optional `tuisko-llm` Python package exposes the admitted tokenizer and chat-template frontend.
+It does not claim an in-process inference API; see [`docs/python.md`](docs/python.md).
+
 ## Current device slice
 
 Bootstrap the pinned cuda-oxide toolchain, then build and qualify the current device slice:
