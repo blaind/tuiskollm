@@ -15,7 +15,7 @@ use tuisko_engine::{ResidentLoadMode, ResidentModelProgram};
 use tuisko_gpu::{CudaContext, GpuError};
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const DEFAULT_SAMPLES: usize = 3;
 const DEFAULT_WARMUPS: usize = 1;
 const DEFAULT_REPORT: &str = "target/benchmarks/startup/loader-comparison-sm120.json";
@@ -73,6 +73,10 @@ struct StartupSample {
     arena_allocation_ms: f64,
     operator_setup_ms: f64,
     weight_prepare_ms: f64,
+    source_binding_ms: f64,
+    qkv_gather_ms: f64,
+    nvfp4_materialize_ms: f64,
+    preparation_other_ms: f64,
     weight_copy_ms: f64,
     weight_load_ms: f64,
     nonweight_init_ms: f64,
@@ -90,6 +94,9 @@ struct StartupSample {
     upload_submissions: usize,
     zeroed_bytes: usize,
     pinned_stager_bytes: usize,
+    borrowed_source_bytes: usize,
+    gathered_source_bytes: usize,
+    swizzled_source_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,8 +244,24 @@ impl StartupLoaderReport {
                 samples.iter().map(|sample| sample.operator_setup_ms),
             ),
             summarize(
-                "weight_prepare_and_bind",
+                "weight_host_preparation",
                 samples.iter().map(|sample| sample.weight_prepare_ms),
+            ),
+            summarize(
+                "source_binding_validation",
+                samples.iter().map(|sample| sample.source_binding_ms),
+            ),
+            summarize(
+                "qkv_gather",
+                samples.iter().map(|sample| sample.qkv_gather_ms),
+            ),
+            summarize(
+                "nvfp4_scale_swizzle",
+                samples.iter().map(|sample| sample.nvfp4_materialize_ms),
+            ),
+            summarize(
+                "preparation_other",
+                samples.iter().map(|sample| sample.preparation_other_ms),
             ),
             summarize(
                 "weight_cuda_copy_calls",
@@ -459,6 +482,10 @@ fn measure_startup(
     let arena_allocation_ms = nanoseconds_to_milliseconds(load_stats.arena_allocation_ns());
     let operator_setup_ms = nanoseconds_to_milliseconds(load_stats.operator_setup_ns());
     let weight_prepare_ms = nanoseconds_to_milliseconds(load_stats.weight_prepare_ns());
+    let source_binding_ms = nanoseconds_to_milliseconds(load_stats.source_binding_ns());
+    let qkv_gather_ms = nanoseconds_to_milliseconds(load_stats.qkv_gather_ns());
+    let nvfp4_materialize_ms = nanoseconds_to_milliseconds(load_stats.nvfp4_materialize_ns());
+    let preparation_other_ms = nanoseconds_to_milliseconds(load_stats.preparation_other_ns());
     let weight_copy_ms = nanoseconds_to_milliseconds(load_stats.weight_copy_ns());
     let weight_load_ms = nanoseconds_to_milliseconds(load_stats.weight_load_ns());
     let nonweight_init_ms = nanoseconds_to_milliseconds(load_stats.nonweight_init_ns());
@@ -489,6 +516,10 @@ fn measure_startup(
         arena_allocation_ms,
         operator_setup_ms,
         weight_prepare_ms,
+        source_binding_ms,
+        qkv_gather_ms,
+        nvfp4_materialize_ms,
+        preparation_other_ms,
         weight_copy_ms,
         weight_load_ms,
         nonweight_init_ms,
@@ -506,6 +537,9 @@ fn measure_startup(
         upload_submissions: program.load_stats().upload_submissions(),
         zeroed_bytes: program.load_stats().zeroed_bytes(),
         pinned_stager_bytes: program.load_stats().pinned_stager_bytes(),
+        borrowed_source_bytes: load_stats.borrowed_source_bytes(),
+        gathered_source_bytes: load_stats.gathered_source_bytes(),
+        swizzled_source_bytes: load_stats.swizzled_source_bytes(),
     })
 }
 
@@ -519,6 +553,10 @@ fn validate_samples(samples: &[StartupSample]) -> Result<(), DeviceBenchmarkErro
             sample.arena_allocation_ms,
             sample.operator_setup_ms,
             sample.weight_prepare_ms,
+            sample.source_binding_ms,
+            sample.qkv_gather_ms,
+            sample.nvfp4_materialize_ms,
+            sample.preparation_other_ms,
             sample.weight_copy_ms,
             sample.weight_load_ms,
             sample.nonweight_init_ms,
@@ -550,10 +588,22 @@ fn validate_samples(samples: &[StartupSample]) -> Result<(), DeviceBenchmarkErro
             || sample.upload_submissions != first.upload_submissions
             || sample.zeroed_bytes != first.zeroed_bytes
             || sample.pinned_stager_bytes != first.pinned_stager_bytes
+            || sample.borrowed_source_bytes != first.borrowed_source_bytes
+            || sample.gathered_source_bytes != first.gathered_source_bytes
+            || sample.swizzled_source_bytes != first.swizzled_source_bytes
         {
             return Err(DeviceBenchmarkError::Precondition(
                 "fresh-process startup samples disagree on their exact product identity or byte accounting"
                     .into(),
+            ));
+        }
+        let classified_weight_bytes = sample
+            .borrowed_source_bytes
+            .checked_add(sample.gathered_source_bytes)
+            .and_then(|bytes| bytes.checked_add(sample.swizzled_source_bytes));
+        if classified_weight_bytes != Some(sample.resident_weight_bytes) {
+            return Err(DeviceBenchmarkError::Precondition(
+                "startup source-preparation bytes do not cover the resident weights exactly".into(),
             ));
         }
     }
@@ -629,6 +679,12 @@ fn print_report(report: &StartupBenchmarkReport) {
             sample.upload_submissions,
             sample.zeroed_bytes as f64 / (1_u64 << 30) as f64,
             sample.pinned_stager_bytes as f64 / (1_u64 << 20) as f64,
+        );
+        eprintln!(
+            "source bytes: {:.2} GiB borrowed · {:.2} GiB gathered · {:.2} GiB swizzled",
+            sample.borrowed_source_bytes as f64 / (1_u64 << 30) as f64,
+            sample.gathered_source_bytes as f64 / (1_u64 << 30) as f64,
+            sample.swizzled_source_bytes as f64 / (1_u64 << 30) as f64,
         );
         let weight_copy_gib_s =
             sample.upload_bytes as f64 / (1_u64 << 30) as f64 / (sample.weight_copy_ms / 1_000.0);
