@@ -8,11 +8,13 @@ use crate::residual_norm::rms_norm_oracle;
 use crate::{DeviceBenchmarkError, device_benchmark};
 use std::path::Path;
 use std::sync::Arc;
-use tuisko_engine::{DenseFp8MlpObservables, DenseFp8MlpProgram, EngineError, MAX_BATCH};
+use tuisko_engine::{DenseFp8MlpObservables, DenseFp8MlpProgram, EngineError};
 use tuisko_gpu::{CudaContext, GpuError, device_memory_info};
 use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, DenseFp8MlpBindings, Qwen38_27B};
 
 const SOURCE_LAYER: usize = 60;
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, MAX_ROWS];
 
 /// Failure of the complete dense-FP8 MLP qualification gate.
 #[derive(Debug, thiserror::Error)]
@@ -37,7 +39,7 @@ pub enum DenseFp8MlpQualificationError {
 /// Observable counts and worst errors from the complete MLP boundary.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DenseFp8MlpQualification {
-    /// Pre-MLP normalized BF16 values checked at every exact batch.
+    /// Pre-MLP normalized BF16 values checked at every exact route.
     pub normalized_values: usize,
     /// Gate/up and down dynamic E4M3 codes checked bit-exactly.
     pub activation_codes: usize,
@@ -47,17 +49,31 @@ pub struct DenseFp8MlpQualification {
     pub source_swiglu_values: usize,
     /// B=1 down values checked against the complete source-weight formula.
     pub source_branch_values: usize,
-    /// Published residual and next-normalized values checked at every batch.
+    /// Published residual and next-normalized values checked at every route.
     pub boundary_values: usize,
     /// Active values reproduced exactly by eager and graph execution.
     pub graph_replay_values: usize,
-    /// Sentinel values preserved outside exact batch extents.
+    /// Sentinel values preserved outside exact route extents.
     pub inactive_values: usize,
+    /// Immutable tensor-map words checked after every route.
+    pub immutable_descriptor_words: usize,
+    /// Exact source-backed device weight bytes.
+    pub resident_weight_bytes: usize,
+    /// Exact address-stable working-plane bytes.
+    pub workspace_bytes: usize,
+    /// Exact resident weights plus working planes, excluding padding.
+    pub owner_bytes: usize,
+    /// Complete arena allocation bytes.
+    pub arena_bytes: usize,
+    /// Alignment bytes not assigned to an owner plane.
+    pub padding_bytes: usize,
+    /// Four address-bound tensor-map descriptor bytes.
+    pub descriptor_bytes: usize,
     /// Largest absolute difference at a represented BF16 seam.
     pub maximum_absolute_error: f32,
 }
 
-/// Qualifies source-backed layer 60 at every exact decode batch.
+/// Qualifies source-backed layer 60 at every exact decode and prefill route.
 pub fn qualify_dense_fp8_mlp(
     root: &Path,
 ) -> Result<DenseFp8MlpQualification, DenseFp8MlpQualificationError> {
@@ -80,6 +96,7 @@ pub fn qualify_dense_fp8_mlp(
     let program = DenseFp8MlpProgram::from_snapshot(&context, snapshot.clone(), SOURCE_LAYER)?;
     let stable_base = program.base_address();
     let stable_addresses = program.qualification_addresses()?;
+    let stable_descriptors = program.qualification_descriptors(&stream)?;
     let mut report = DenseFp8MlpQualification {
         normalized_values: 0,
         activation_codes: 0,
@@ -89,28 +106,35 @@ pub fn qualify_dense_fp8_mlp(
         boundary_values: 0,
         graph_replay_values: 0,
         inactive_values: 0,
+        immutable_descriptor_words: 0,
+        resident_weight_bytes: program.resident_weight_bytes(),
+        workspace_bytes: program.workspace_bytes(),
+        owner_bytes: program.owner_bytes(),
+        arena_bytes: program.arena_bytes(),
+        padding_bytes: program.arena_bytes() - program.owner_bytes(),
+        descriptor_bytes: program.descriptor_bytes(),
         maximum_absolute_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
-        let first_input = make_input(batch, 0);
-        program.load_residual(&stream, batch, &first_input)?;
+    for rows in EXACT_ROUTES {
+        let first_input = make_input(rows, 0);
+        program.load_residual(&stream, rows, &first_input)?;
         program.qualification_reset_outputs(&stream, BYTE_SENTINEL)?;
-        program.launch_eager(&stream, batch)?;
+        program.launch_eager(&stream, rows)?;
         let first = program.qualification_observables(&stream)?;
 
-        let input = make_input(batch, 1);
-        program.load_residual(&stream, batch, &input)?;
+        let input = make_input(rows, 1);
+        program.load_residual(&stream, rows, &input)?;
         program.qualification_reset_outputs(&stream, BYTE_SENTINEL)?;
-        program.replay(&stream, batch)?;
+        program.replay(&stream, rows)?;
         let replay = program.qualification_observables(&stream)?;
 
         program.qualification_reset_outputs(&stream, BYTE_SENTINEL)?;
-        program.launch_eager(&stream, batch)?;
+        program.launch_eager(&stream, rows)?;
         let eager = program.qualification_observables(&stream)?;
 
-        verify_seams(batch, &input, &input_norm, &next_norm, &replay, &mut report)?;
-        if batch == 1 {
+        verify_seams(rows, &input, &input_norm, &next_norm, &replay, &mut report)?;
+        if rows == 1 {
             verify_source_formula(
                 bindings,
                 &gate_up_scales,
@@ -119,18 +143,25 @@ pub fn qualify_dense_fp8_mlp(
                 &mut report,
             )?;
         }
-        verify_replay(batch, &eager, &replay, &mut report)?;
-        verify_replacement_input(batch, &first, &replay)?;
-        verify_inactive(batch, &replay, &mut report)?;
-        verify_inactive(batch, &eager, &mut report)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
+        verify_replacement_input(rows, &first, &replay)?;
+        verify_inactive(rows, &replay, &mut report)?;
+        verify_inactive(rows, &eager, &mut report)?;
 
         if program.base_address() != stable_base
             || program.qualification_addresses()? != stable_addresses
         {
             return Err(DenseFp8MlpQualificationError::Mismatch(format!(
-                "owner addresses changed while qualifying B={batch}"
+                "owner addresses changed while qualifying rows={rows}"
             )));
         }
+        let descriptors = program.qualification_descriptors(&stream)?;
+        if descriptors != stable_descriptors {
+            return Err(DenseFp8MlpQualificationError::Mismatch(format!(
+                "tensor-map descriptors changed while qualifying rows={rows}"
+            )));
+        }
+        report.immutable_descriptor_words += descriptors.iter().map(Vec::len).sum::<usize>();
     }
 
     verify_no_device_allocation(&program, &stream)?;
@@ -139,18 +170,18 @@ pub fn qualify_dense_fp8_mlp(
     Ok(report)
 }
 
-fn make_input(batch: usize, salt: usize) -> Vec<u16> {
+fn make_input(rows: usize, salt: usize) -> Vec<u16> {
     const PATTERN: [f32; 16] = [
         0.875, -0.875, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0625, -0.0625, 0.03125, -0.03125,
         0.0, 0.5, -0.25, 0.125,
     ];
-    (0..batch * Qwen38_27B::HIDDEN)
+    (0..rows * Qwen38_27B::HIDDEN)
         .map(|index| f32_to_bf16(PATTERN[(index + salt * 5 + index / Qwen38_27B::HIDDEN) & 15]))
         .collect()
 }
 
 fn verify_seams(
-    batch: usize,
+    rows: usize,
     input: &[u16],
     input_norm: &[u16],
     next_norm: &[u16],
@@ -160,7 +191,7 @@ fn verify_seams(
     let hidden = Qwen38_27B::HIDDEN;
     let intermediate = Qwen38_27B::INTERMEDIATE;
 
-    for token in 0..batch {
+    for token in 0..rows {
         let hidden_begin = token * hidden;
         let hidden_end = hidden_begin + hidden;
         let intermediate_begin = token * intermediate;
@@ -169,7 +200,7 @@ fn verify_seams(
             rms_norm_oracle::<Qwen38_27B>(&input[hidden_begin..hidden_end], input_norm);
         compare_close_slice(
             "pre-MLP RMSNorm",
-            batch,
+            rows,
             token,
             &observed.normalized[hidden_begin..hidden_end],
             &normalized,
@@ -180,7 +211,7 @@ fn verify_seams(
             .map_err(DenseFp8MlpQualificationError::Mismatch)?;
         compare_codes(
             "gate/up activation",
-            batch,
+            rows,
             token,
             &observed.gate_up_activation_codes[hidden_begin..hidden_end],
             &gate_up_oracle,
@@ -191,7 +222,7 @@ fn verify_seams(
             .map_err(DenseFp8MlpQualificationError::Mismatch)?;
         compare_codes(
             "down activation",
-            batch,
+            rows,
             token,
             &observed.down_activation_codes[intermediate_begin..intermediate_end],
             &down_oracle,
@@ -210,13 +241,13 @@ fn verify_seams(
                 .position(|(actual, expected)| actual != expected)
                 .expect("slices differ");
             return Err(DenseFp8MlpQualificationError::Mismatch(format!(
-                "residual publication at B={batch}, row={token}, column={relative} differs"
+                "residual publication at rows={rows}, row={token}, column={relative} differs"
             )));
         }
         let next = rms_norm_oracle::<Qwen38_27B>(&residual, next_norm);
         compare_close_slice(
             "next RMSNorm",
-            batch,
+            rows,
             token,
             &observed.next_normalized[hidden_begin..hidden_end],
             &next,
@@ -224,10 +255,10 @@ fn verify_seams(
         )?;
     }
 
-    report.normalized_values += batch * hidden;
-    report.activation_codes += batch * (hidden + intermediate);
-    report.activation_scales += batch * 2;
-    report.boundary_values += batch * hidden * 2;
+    report.normalized_values += rows * hidden;
+    report.activation_codes += rows * (hidden + intermediate);
+    report.activation_scales += rows * 2;
+    report.boundary_values += rows * hidden * 2;
 
     Ok(())
 }
@@ -313,7 +344,7 @@ fn fp8_dot(
 
 fn compare_codes(
     role: &str,
-    batch: usize,
+    rows: usize,
     token: usize,
     actual_codes: &[u8],
     oracle: &TokenOracle,
@@ -325,13 +356,13 @@ fn compare_codes(
         .position(|(actual, expected)| actual != expected)
     {
         return Err(DenseFp8MlpQualificationError::Mismatch(format!(
-            "{role} code at B={batch}, row={token}, column={column}: device={:#04x}, oracle={:#04x}",
+            "{role} code at rows={rows}, row={token}, column={column}: device={:#04x}, oracle={:#04x}",
             actual_codes[column], oracle.codes[column]
         )));
     }
     if actual_scale.to_bits() != oracle.scale.to_bits() {
         return Err(DenseFp8MlpQualificationError::Mismatch(format!(
-            "{role} scale at B={batch}, row={token}: device={:#010x}, oracle={:#010x}",
+            "{role} scale at rows={rows}, row={token}: device={:#010x}, oracle={:#010x}",
             actual_scale.to_bits(),
             oracle.scale.to_bits()
         )));
@@ -342,7 +373,7 @@ fn compare_codes(
 
 fn compare_close_slice(
     role: &str,
-    batch: usize,
+    rows: usize,
     token: usize,
     actual: &[u16],
     expected: &[u16],
@@ -352,7 +383,7 @@ fn compare_close_slice(
         let actual = bf16_to_f32(actual);
         let expected = f64::from(bf16_to_f32(expected));
         require_close(
-            &format!("{role} at B={batch}, row={token}"),
+            &format!("{role} at rows={rows}, row={token}"),
             column,
             actual,
             expected,
@@ -383,7 +414,7 @@ fn require_close(
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     eager: &DenseFp8MlpObservables,
     replay: &DenseFp8MlpObservables,
     report: &mut DenseFp8MlpQualification,
@@ -397,7 +428,7 @@ fn verify_replay(
                 .position(|(actual, expected)| actual != expected)
             {
                 return Err(DenseFp8MlpQualificationError::Mismatch(format!(
-                    "B={batch} graph plane `{}` differs at value {index}",
+                    "rows={rows} graph plane `{}` differs at value {index}",
                     stringify!($field)
                 )));
             }
@@ -415,22 +446,22 @@ fn verify_replay(
     same!(next_normalized);
 
     report.graph_replay_values +=
-        batch * (6 * Qwen38_27B::HIDDEN + 2 * Qwen38_27B::INTERMEDIATE + 2);
+        rows * (6 * Qwen38_27B::HIDDEN + 2 * Qwen38_27B::INTERMEDIATE + 2);
 
     Ok(())
 }
 
 fn verify_replacement_input(
-    batch: usize,
+    rows: usize,
     first: &DenseFp8MlpObservables,
     replay: &DenseFp8MlpObservables,
 ) -> Result<(), DenseFp8MlpQualificationError> {
-    let active = batch * Qwen38_27B::HIDDEN;
+    let active = rows * Qwen38_27B::HIDDEN;
     if first.residual_input[..active] == replay.residual_input[..active]
         || first.residual_output[..active] == replay.residual_output[..active]
     {
         return Err(DenseFp8MlpQualificationError::Mismatch(format!(
-            "B={batch} graph replay did not observe replacement residual rows"
+            "rows={rows} graph replay did not observe replacement residual rows"
         )));
     }
 
@@ -438,12 +469,12 @@ fn verify_replacement_input(
 }
 
 fn verify_inactive(
-    batch: usize,
+    rows: usize,
     observed: &DenseFp8MlpObservables,
     report: &mut DenseFp8MlpQualification,
 ) -> Result<(), DenseFp8MlpQualificationError> {
-    let hidden_begin = batch * Qwen38_27B::HIDDEN;
-    let intermediate_begin = batch * Qwen38_27B::INTERMEDIATE;
+    let hidden_begin = rows * Qwen38_27B::HIDDEN;
+    let intermediate_begin = rows * Qwen38_27B::INTERMEDIATE;
     for (role, values) in [
         ("normalized", &observed.normalized[hidden_begin..]),
         ("branch", &observed.branch[hidden_begin..]),
@@ -452,7 +483,7 @@ fn verify_inactive(
     ] {
         if let Some(relative) = values.iter().position(|&value| value != BF16_SENTINEL) {
             return Err(DenseFp8MlpQualificationError::Mismatch(format!(
-                "B={batch} modified inactive {role} value {relative}"
+                "rows={rows} modified inactive {role} value {relative}"
             )));
         }
     }
@@ -461,7 +492,7 @@ fn verify_inactive(
         .position(|&value| value != BF16_SENTINEL)
     {
         return Err(DenseFp8MlpQualificationError::Mismatch(format!(
-            "B={batch} modified inactive SwiGLU value {relative}"
+            "rows={rows} modified inactive SwiGLU value {relative}"
         )));
     }
     for (role, values) in [
@@ -476,29 +507,29 @@ fn verify_inactive(
     ] {
         if let Some(relative) = values.iter().position(|&value| value != BYTE_SENTINEL) {
             return Err(DenseFp8MlpQualificationError::Mismatch(format!(
-                "B={batch} modified inactive {role} code {relative}"
+                "rows={rows} modified inactive {role} code {relative}"
             )));
         }
     }
     for (role, values) in [
         (
             "gate/up activation",
-            &observed.gate_up_activation_scales[batch..],
+            &observed.gate_up_activation_scales[rows..],
         ),
-        ("down activation", &observed.down_activation_scales[batch..]),
+        ("down activation", &observed.down_activation_scales[rows..]),
     ] {
         if let Some(relative) = values
             .iter()
             .position(|value| value.to_bits() != F32_SENTINEL_BITS)
         {
             return Err(DenseFp8MlpQualificationError::Mismatch(format!(
-                "B={batch} modified inactive {role} scale {relative}"
+                "rows={rows} modified inactive {role} scale {relative}"
             )));
         }
     }
 
     report.inactive_values +=
-        (MAX_BATCH - batch) * (5 * Qwen38_27B::HIDDEN + 2 * Qwen38_27B::INTERMEDIATE + 2);
+        (MAX_ROWS - rows) * (5 * Qwen38_27B::HIDDEN + 2 * Qwen38_27B::INTERMEDIATE + 2);
 
     Ok(())
 }
@@ -507,12 +538,12 @@ fn verify_no_device_allocation(
     program: &DenseFp8MlpProgram,
     stream: &tuisko_gpu::CudaStream,
 ) -> Result<(), DenseFp8MlpQualificationError> {
-    program.replay(stream, MAX_BATCH)?;
+    program.replay(stream, MAX_ROWS)?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
     for _ in 0..4 {
-        for batch in [1, 8, 3, 6, 2, 7, 4, 5] {
-            program.replay(stream, batch)?;
+        for rows in [1, 32, 8, 64, 3, 128, 6, MAX_ROWS, 2, 7, 4, 5] {
+            program.replay(stream, rows)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -542,11 +573,17 @@ fn little_endian_words(bytes: &[u8]) -> Result<Vec<u16>, DenseFp8MlpQualificatio
 
 #[cfg(test)]
 mod tests {
-    use super::{DenseFp8MlpQualificationError, qualify_dense_fp8_mlp};
+    use super::{DenseFp8MlpQualificationError, EXACT_ROUTES, MAX_ROWS, qualify_dense_fp8_mlp};
+
+    #[test]
+    fn dense_fp8_mlp_suite_route_inventory_is_exact() {
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
+        assert_eq!(MAX_ROWS, 1_024);
+    }
 
     #[test]
     #[ignore = "requires TUISKO_SNAPSHOT and an idle NVIDIA compute-capability 12.0 device"]
-    fn source_layer60_matches_complete_oracles_and_graph_replay()
+    fn dense_fp8_mlp_suite_source_layer60_matches_complete_oracles_and_graph_replay()
     -> Result<(), DenseFp8MlpQualificationError> {
         let root = std::env::var_os("TUISKO_SNAPSHOT").ok_or_else(|| {
             DenseFp8MlpQualificationError::Mismatch(
@@ -557,13 +594,20 @@ mod tests {
 
         assert_eq!(report.source_swiglu_values, 17_408);
         assert_eq!(report.source_branch_values, 5_120);
-        assert!(report.normalized_values > 0);
-        assert!(report.activation_codes > 0);
-        assert!(report.activation_scales > 0);
-        assert!(report.boundary_values > 0);
-        assert!(report.graph_replay_values > 0);
-        assert!(report.inactive_values > 0);
-        assert!(report.maximum_absolute_error <= 0.125);
+        assert_eq!(report.normalized_values, 6_574_080);
+        assert_eq!(report.activation_codes, 28_925_952);
+        assert_eq!(report.activation_scales, 2_568);
+        assert_eq!(report.boundary_values, 13_148_160);
+        assert_eq!(report.graph_replay_values, 84_150_792);
+        assert_eq!(report.inactive_values, 1_329_679_344);
+        assert_eq!(report.immutable_descriptor_words, 768);
+        assert_eq!(report.resident_weight_bytes, 267_487_232);
+        assert_eq!(report.workspace_bytes, 111_157_248);
+        assert_eq!(report.owner_bytes, 378_644_480);
+        assert_eq!(report.arena_bytes, 378_644_480);
+        assert_eq!(report.padding_bytes, 0);
+        assert_eq!(report.descriptor_bytes, 512);
+        assert!(report.maximum_absolute_error.is_finite());
 
         Ok(())
     }

@@ -1,10 +1,11 @@
 //! Single-allocation layout for one resident dense-FP8 MLP boundary.
 
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::{EngineError, EngineResult};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::Arch;
 
 const ALIGNMENT: usize = 256;
+pub(crate) const MAX_ROWS: usize = 1_024;
 
 /// Checked source-weight and workspace regions for one late-layer MLP.
 #[derive(Clone, Debug)]
@@ -31,12 +32,12 @@ pub struct DenseFp8MlpLayout {
 }
 
 impl DenseFp8MlpLayout {
-    /// Reserves every plane for the architecture's exact B=1..8 routes.
+    /// Reserves every plane for decode and exact prefill routes through T=1024.
     pub fn build<A: Arch>() -> EngineResult<Self> {
-        let batch_hidden = product("dense-FP8 MLP batch-hidden elements", MAX_BATCH, A::HIDDEN)?;
+        let batch_hidden = product("dense-FP8 MLP row-hidden elements", MAX_ROWS, A::HIDDEN)?;
         let batch_intermediate = product(
-            "dense-FP8 MLP batch-intermediate elements",
-            MAX_BATCH,
+            "dense-FP8 MLP row-intermediate elements",
+            MAX_ROWS,
             A::INTERMEDIATE,
         )?;
         let gate_up_weights = product(
@@ -50,12 +51,12 @@ impl DenseFp8MlpLayout {
         let input_norm = builder.reserve(A::HIDDEN, ALIGNMENT)?;
         let normalized = builder.reserve(batch_hidden, ALIGNMENT)?;
         let gate_up_activation_codes = builder.reserve(batch_hidden, ALIGNMENT)?;
-        let gate_up_activation_scales = builder.reserve(MAX_BATCH, ALIGNMENT)?;
+        let gate_up_activation_scales = builder.reserve(MAX_ROWS, ALIGNMENT)?;
         let gate_up_weight_codes = builder.reserve(gate_up_weights, ALIGNMENT)?;
         let gate_up_weight_scales = builder.reserve(2 * A::INTERMEDIATE, ALIGNMENT)?;
         let swiglu = builder.reserve(batch_intermediate, ALIGNMENT)?;
         let down_activation_codes = builder.reserve(batch_intermediate, ALIGNMENT)?;
-        let down_activation_scales = builder.reserve(MAX_BATCH, ALIGNMENT)?;
+        let down_activation_scales = builder.reserve(MAX_ROWS, ALIGNMENT)?;
         let down_weight_codes = builder.reserve(down_weights, ALIGNMENT)?;
         let down_weight_scales = builder.reserve(A::HIDDEN, ALIGNMENT)?;
         let branch = builder.reserve(batch_hidden, ALIGNMENT)?;
@@ -287,10 +288,10 @@ mod tests {
         let layout = DenseFp8MlpLayout::build::<Qwen38_27B>().unwrap();
 
         assert_eq!(layout.resident_weight_bytes(), 267_487_232);
-        assert_eq!(layout.workspace_bytes(), 868_416);
-        assert_eq!(layout.owner_bytes(), 268_355_648);
-        assert_eq!(layout.arena_bytes(), 268_356_096);
-        assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 448);
+        assert_eq!(layout.workspace_bytes(), 111_157_248);
+        assert_eq!(layout.owner_bytes(), 378_644_480);
+        assert_eq!(layout.arena_bytes(), 378_644_480);
+        assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 0);
     }
 
     #[test]

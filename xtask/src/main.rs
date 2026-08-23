@@ -1587,9 +1587,10 @@ fn qualify_dense_fp8_mlp(
             "--release",
             "--lib",
             "--",
-            "dense_fp8_mlp::tests::source_layer60_matches_complete_oracles_and_graph_replay",
+            "dense_fp8_mlp_suite_",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;

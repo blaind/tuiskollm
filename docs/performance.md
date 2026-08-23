@@ -11,7 +11,8 @@ dense-FP8 gate/up SwiGLU at exact
 `B=1..8` and `T=32,64,128,1024`, dense-FP8 down at exact `B=1..8` and `T=32,64,128,1024`, GDN
 control/convolution at exact `B=1..8`, and the GDN recurrence and source-native output projection
 at exact `B=1..8`, plus the source-backed
-dense-FP8 MLP, complete layer-60 GDN, and final-norm plus LM-head owners. NVFP4 gate/up SwiGLU
+dense-FP8 MLP at exact `B=1..8` and `T=32,64,128,1024`, complete layer-60 GDN, and final-norm plus
+LM-head owners. NVFP4 gate/up SwiGLU
 uses the exact retained A16 and W4A4 decode schedules at `B=1..8`; NVFP4 down projection consumes
 the represented E2M1/E4M3 source planes through exact A16 routes at `B=1..8`. Full-attention Q/K
 preparation covers zero-centered normalization, the 64-wide three-axis MRoPE, and represented E4M3
@@ -170,7 +171,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-qwen35-paged-gqa` | Check Qwen3.5 exact page lookup, grouped-head mapping, represented BF16 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-long-context-paged-gqa` | Check every partition bucket through 220,000 positions, all partial/reduction seams, untouched scratch, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-attention-output` | Check sigmoid gating, the published FP32 seam, dynamic E4M3 quantization, source-native projection, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact-B graph, stable addresses, and owner allocation | terminal |
+| `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact B=1..8 and T=32/64/128/1024 graph, all working and residual seams, tensor-map immutability, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact-B graphs, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT` | Check complete source layer-63 attention/MLP seams, represented KV cache, exact-B graphs, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-full-attention-layer SNAPSHOT` | Check complete Qwen3.5 source layer-31 attention/MLP seams, BF16 KV cache, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
@@ -303,9 +304,10 @@ for one operator suite only.
 `bench-text-endpoint SNAPSHOT` accepts the same options. It is intentionally separate from the
 leaf-wide `perf` commands until its first reviewed baseline is blessed.
 
-`bench-dense-fp8-mlp SNAPSHOT` measures the complete source-backed layer-60 MLP graph with the same
-options. It stays outside leaf-wide `perf` until the source-backed route receives a reviewed
-baseline.
+`bench-dense-fp8-mlp SNAPSHOT` directly measures the complete source-backed layer-60 MLP graph at
+every exact `B=1..8` and `T=32,64,128,1024` with the same options. It does not infer composition
+time from leaf medians and stays outside leaf-wide `perf` until the source-backed route receives a
+reviewed baseline.
 
 `bench-nvfp4-mlp SNAPSHOT` directly measures the complete source-backed layer-55 MLP graph. Its
 `B=1,5..8` routes include production E2M1 activation quantization and W4A4 gate/up projection;
