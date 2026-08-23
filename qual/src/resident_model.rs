@@ -52,6 +52,8 @@ pub struct ResidentModelQualification {
     pub graph_replay_values: usize,
     /// Inactive workspace and persistent values verified unchanged.
     pub inactive_values: usize,
+    /// Persistent values checked across physical routing and one-slot reset.
+    pub slot_control_values: usize,
     /// Largest absolute difference from a BF16 or FP64 oracle.
     pub maximum_absolute_error: f32,
 }
@@ -85,15 +87,17 @@ pub fn qualify_resident_model(
         oracle_values: 0,
         graph_replay_values: 0,
         inactive_values: 0,
+        slot_control_values: 0,
         maximum_absolute_error: 0.0,
     };
 
     for batch in 1..=MAX_BATCH {
-        prepare_run(&mut program, &stream, batch)?;
+        let slots = route_slots(batch);
+        prepare_run(&mut program, &stream, batch, slots)?;
         program.launch_eager(&stream, batch)?;
         let eager = program.qualification_observables(&stream)?;
 
-        prepare_run(&mut program, &stream, batch)?;
+        prepare_run(&mut program, &stream, batch, slots)?;
         program.replay(&stream, batch)?;
         let replay = program.qualification_observables(&stream)?;
 
@@ -106,7 +110,7 @@ pub fn qualify_resident_model(
             &replay,
             &mut report,
         )?;
-        verify_inactive(batch, &replay, &mut report)?;
+        verify_inactive(batch, slots, &replay, &mut report)?;
         if program.base_address() != stable_base
             || program.qualification_addresses() != stable_addresses
         {
@@ -115,6 +119,7 @@ pub fn qualify_resident_model(
             )));
         }
     }
+    verify_slot_reset(&mut program, &stream, &mut report)?;
 
     verify_no_device_allocation(&program, &stream)?;
     device_benchmark::require_current_process_exclusive()?;
@@ -132,6 +137,7 @@ fn verify_owner(program: &ResidentModelProgram) -> Result<(), ResidentModelQuali
         || program.host_stager_bytes() != 81_920
         || program.batch_capacity() != 8
         || program.context_capacity() != 192
+        || program.persistent_slot_bytes() != 160_235_520
     {
         return Err(ResidentModelQualificationError::Mismatch(
             "owner byte or route accounting differs from the admitted layout".to_string(),
@@ -204,6 +210,7 @@ fn prepare_run(
     program: &mut ResidentModelProgram,
     stream: &CudaStream,
     batch: usize,
+    slots: &[usize],
 ) -> Result<(), ResidentModelQualificationError> {
     program.reset_state(stream)?;
     program.qualification_reset_workspace(stream, SENTINEL)?;
@@ -211,6 +218,7 @@ fn prepare_run(
         .map(|slot| 100u32 + slot as u32 * 17)
         .collect::<Vec<_>>();
     program.stage_embeddings(stream, &token_ids)?;
+    program.load_slot_routes(stream, slots)?;
     program.load_decode_state(
         stream,
         batch,
@@ -219,6 +227,11 @@ fn prepare_run(
         &[0.0; MAX_BATCH * ROTARY_PAIRS][..batch * ROTARY_PAIRS],
     )?;
     Ok(())
+}
+
+fn route_slots(batch: usize) -> &'static [usize] {
+    const ROUTES: [usize; MAX_BATCH] = [7, 0, 6, 1, 5, 2, 4, 3];
+    &ROUTES[..batch]
 }
 
 fn verify_final_oracle(
@@ -395,6 +408,7 @@ fn observable_values(observed: &ResidentModelObservables) -> usize {
 
 fn verify_inactive(
     batch: usize,
+    slots: &[usize],
     observed: &ResidentModelObservables,
     report: &mut ResidentModelQualification,
 ) -> Result<(), ResidentModelQualificationError> {
@@ -468,13 +482,16 @@ fn verify_inactive(
     inactive += sentinel_u16!(swiglu, Qwen38_27B::INTERMEDIATE);
     inactive += sentinel_u16!(mlp_branch, Qwen38_27B::HIDDEN);
     inactive += sentinel_u16!(logits, Qwen38_27B::VOCAB);
-    inactive += verify_persistent_inactive(batch, observed)?;
+    let persistent = verify_persistent_inactive(batch, slots, observed)?;
+    inactive += persistent;
+    report.slot_control_values += persistent;
     report.inactive_values += inactive;
     Ok(())
 }
 
 fn verify_persistent_inactive(
     batch: usize,
+    active_slots: &[usize],
     observed: &ResidentModelObservables,
 ) -> Result<usize, ResidentModelQualificationError> {
     let history_per_slot = Qwen38_27B::GDN_QKV_ROWS * (Qwen38_27B::LINEAR_CONV_KERNEL_DIM - 1);
@@ -488,42 +505,181 @@ fn verify_persistent_inactive(
         .chunks_exact(MAX_BATCH * history_per_slot)
         .enumerate()
     {
-        let begin = batch * history_per_slot;
-        if values[begin..].iter().any(|&value| value != 0) {
-            return Err(ResidentModelQualificationError::Mismatch(format!(
-                "B={batch} modified inactive GDN history at inventory layer {layer}"
-            )));
+        for slot in 0..MAX_BATCH {
+            if active_slots.contains(&slot) {
+                continue;
+            }
+            let begin = slot * history_per_slot;
+            let end = begin + history_per_slot;
+            if values[begin..end].iter().any(|&value| value != 0) {
+                return Err(ResidentModelQualificationError::Mismatch(format!(
+                    "B={batch} modified inactive GDN history slot {slot} at inventory layer {layer}"
+                )));
+            }
+            inactive += history_per_slot;
         }
-        inactive += values.len() - begin;
     }
     for (layer, values) in observed
         .state
         .chunks_exact(MAX_BATCH * state_per_slot)
         .enumerate()
     {
-        let begin = batch * state_per_slot;
-        if values[begin..].iter().any(|value| value.to_bits() != 0) {
-            return Err(ResidentModelQualificationError::Mismatch(format!(
-                "B={batch} modified inactive GDN state at inventory layer {layer}"
-            )));
+        for slot in 0..MAX_BATCH {
+            if active_slots.contains(&slot) {
+                continue;
+            }
+            let begin = slot * state_per_slot;
+            let end = begin + state_per_slot;
+            if values[begin..end].iter().any(|value| value.to_bits() != 0) {
+                return Err(ResidentModelQualificationError::Mismatch(format!(
+                    "B={batch} modified inactive GDN state slot {slot} at inventory layer {layer}"
+                )));
+            }
+            inactive += state_per_slot;
         }
-        inactive += values.len() - begin;
     }
     for (role, all) in [
         ("key", &observed.key_pages),
         ("value", &observed.value_pages),
     ] {
         for (layer, values) in all.chunks_exact(MAX_BATCH * cache_per_slot).enumerate() {
-            let begin = batch * cache_per_slot;
-            if values[begin..].iter().any(|&value| value != 0) {
-                return Err(ResidentModelQualificationError::Mismatch(format!(
-                    "B={batch} modified inactive {role} cache at inventory layer {layer}"
-                )));
+            for slot in 0..MAX_BATCH {
+                if active_slots.contains(&slot) {
+                    continue;
+                }
+                let begin = slot * cache_per_slot;
+                let end = begin + cache_per_slot;
+                if values[begin..end].iter().any(|&value| value != 0) {
+                    return Err(ResidentModelQualificationError::Mismatch(format!(
+                        "B={batch} modified inactive {role} cache slot {slot} at inventory layer {layer}"
+                    )));
+                }
+                inactive += cache_per_slot;
             }
-            inactive += values.len() - begin;
         }
     }
     Ok(inactive)
+}
+
+fn verify_slot_reset(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+    report: &mut ResidentModelQualification,
+) -> Result<(), ResidentModelQualificationError> {
+    prepare_run(program, stream, MAX_BATCH, route_slots(MAX_BATCH))?;
+    program.replay(stream, MAX_BATCH)?;
+    let before = program.qualification_observables(stream)?;
+    let reset = [1, 6];
+    for slot in reset {
+        program.reset_slot(stream, slot)?;
+    }
+    let after = program.qualification_observables(stream)?;
+
+    let history_per_slot = Qwen38_27B::GDN_QKV_ROWS * (Qwen38_27B::LINEAR_CONV_KERNEL_DIM - 1);
+    let state_per_slot =
+        Qwen38_27B::GDN_CONTROL_ROWS * Qwen38_27B::LINEAR_HEAD_DIM * Qwen38_27B::LINEAR_HEAD_DIM;
+    let cache_per_slot =
+        TABLE_STRIDE * Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM;
+    let mut checked = 0;
+    checked += verify_reset_u16(
+        "GDN history",
+        &before.history,
+        &after.history,
+        history_per_slot,
+        &reset,
+    )?;
+    checked += verify_reset_f32(
+        "GDN state",
+        &before.state,
+        &after.state,
+        state_per_slot,
+        &reset,
+    )?;
+    checked += verify_reset_u8(
+        "key cache",
+        &before.key_pages,
+        &after.key_pages,
+        cache_per_slot,
+        &reset,
+    )?;
+    checked += verify_reset_u8(
+        "value cache",
+        &before.value_pages,
+        &after.value_pages,
+        cache_per_slot,
+        &reset,
+    )?;
+    report.slot_control_values += checked;
+    Ok(())
+}
+
+fn verify_reset_u8(
+    role: &str,
+    before: &[u8],
+    after: &[u8],
+    slot_width: usize,
+    reset: &[usize],
+) -> Result<usize, ResidentModelQualificationError> {
+    verify_reset_chunks(role, before, after, slot_width, reset, |value| *value == 0)
+}
+
+fn verify_reset_u16(
+    role: &str,
+    before: &[u16],
+    after: &[u16],
+    slot_width: usize,
+    reset: &[usize],
+) -> Result<usize, ResidentModelQualificationError> {
+    verify_reset_chunks(role, before, after, slot_width, reset, |value| *value == 0)
+}
+
+fn verify_reset_f32(
+    role: &str,
+    before: &[f32],
+    after: &[f32],
+    slot_width: usize,
+    reset: &[usize],
+) -> Result<usize, ResidentModelQualificationError> {
+    verify_reset_chunks(role, before, after, slot_width, reset, |value| {
+        value.to_bits() == 0
+    })
+}
+
+fn verify_reset_chunks<T: PartialEq>(
+    role: &str,
+    before: &[T],
+    after: &[T],
+    slot_width: usize,
+    reset: &[usize],
+    is_zero: impl Fn(&T) -> bool,
+) -> Result<usize, ResidentModelQualificationError> {
+    if before.len() != after.len() || !(before.len()).is_multiple_of(MAX_BATCH * slot_width) {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "{role} reset inventory has incompatible lengths"
+        )));
+    }
+    for (layer, (before, after)) in before
+        .chunks_exact(MAX_BATCH * slot_width)
+        .zip(after.chunks_exact(MAX_BATCH * slot_width))
+        .enumerate()
+    {
+        for slot in 0..MAX_BATCH {
+            let begin = slot * slot_width;
+            let end = begin + slot_width;
+            if reset.contains(&slot) {
+                if after[begin..end].iter().any(|value| !is_zero(value)) {
+                    return Err(ResidentModelQualificationError::Mismatch(format!(
+                        "{role} reset left nonzero slot {slot} at inventory layer {layer}"
+                    )));
+                }
+            } else if after[begin..end] != before[begin..end] {
+                return Err(ResidentModelQualificationError::Mismatch(format!(
+                    "{role} reset changed surviving slot {slot} at inventory layer {layer}"
+                )));
+            }
+        }
+    }
+    Ok(after.len())
 }
 
 fn compare_exact<T: PartialEq>(
@@ -623,6 +779,7 @@ mod tests {
         );
         assert!(report.graph_replay_values > 0);
         assert!(report.inactive_values > 0);
+        assert!(report.slot_control_values > 0);
         assert!(report.maximum_absolute_error.is_finite());
         Ok(())
     }

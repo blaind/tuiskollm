@@ -26,10 +26,12 @@ It does not claim an in-process inference API; see [`docs/python.md`](docs/pytho
 
 `tuisko-engine` owns the exact 64-layer resident text program: all source-native weights, 48 GDN
 history/state pairs, 16 current 192-token-per-slot attention KV caches, endpoint weights, one shared
-workspace, and immutable whole-model CUDA Graphs for every `B=1..8` route. Server wiring has not
-landed. A concrete single-slot generation owner now connects the admitted frontend, sampling,
-streaming decode, and the resident graph for prompts within the current 192-token cache. Prompt
-priming uses the exact B=1 decode route until optimized prefill routes are admitted.
+workspace, and immutable whole-model CUDA Graphs for every `B=1..8` route. Compact active rows can
+address any distinct physical state/cache slots, and one slot can be reset without touching its
+survivors. Server wiring has not landed. A concrete single-slot generation owner now connects the
+admitted frontend, sampling, streaming decode, and the resident graph for prompts within the current
+192-token cache. Prompt priming uses the exact B=1 decode route until optimized prefill routes are
+admitted.
 
 ## Current device slice
 

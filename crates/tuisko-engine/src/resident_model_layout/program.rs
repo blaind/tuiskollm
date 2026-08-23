@@ -9,7 +9,8 @@ use crate::{EngineError, EngineResult, MAX_BATCH};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tuisko_gpu::{
-    CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, PinnedHostBuffer,
+    ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, DeviceCopy, GpuError, GpuResult,
+    PinnedHostBuffer,
 };
 use tuisko_kernels_sm120::{
     AttentionOutputOp, AttentionQkPrepareOp, DenseFp8DownOp, DenseFp8SwiGluOp, FullAttentionQkvOp,
@@ -239,6 +240,18 @@ impl ResidentModelProgram {
         Ok(())
     }
 
+    /// Selects distinct physical persistent slots for the compact active rows.
+    pub fn load_slot_routes(&self, stream: &CudaStream, slots: &[usize]) -> EngineResult<()> {
+        let rows = slot_rows(slots)?;
+        let workspace = self.layout.workspace;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.state_rows, &rows[..slots.len()])?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.table_rows, &rows[..slots.len()])?;
+
+        Ok(())
+    }
+
     /// Clears all 48 recurrent owners and all 16 represented KV-cache owners.
     pub fn reset_state(&self, stream: &CudaStream) -> EngineResult<()> {
         for layer in &self.layout.layers {
@@ -250,6 +263,25 @@ impl ResidentModelProgram {
                 super::PersistentState::Attention(cache) => {
                     self.arena.fill(stream, cache.key_pages, 0)?;
                     self.arena.fill(stream, cache.value_pages, 0)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clears one physical slot without changing any other persistent owner bytes.
+    pub fn reset_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        require_slot(slot)?;
+        for layer in &self.layout.layers {
+            match layer.persistent {
+                super::PersistentState::Gdn(state) => {
+                    fill_slot(&self.arena, stream, state.history, slot)?;
+                    fill_slot(&self.arena, stream, state.state, slot)?;
+                }
+                super::PersistentState::Attention(cache) => {
+                    fill_slot(&self.arena, stream, cache.key_pages, slot)?;
+                    fill_slot(&self.arena, stream, cache.value_pages, slot)?;
                 }
             }
         }
@@ -332,6 +364,12 @@ impl ResidentModelProgram {
     /// Exact represented KV-cache bytes across the 16 attention layers.
     pub const fn cache_bytes(&self) -> usize {
         self.layout.cache_bytes()
+    }
+
+    /// Causal history, recurrent state, and represented cache bytes in one physical slot.
+    pub const fn persistent_slot_bytes(&self) -> usize {
+        (self.layout.history_bytes() + self.layout.state_bytes() + self.layout.cache_bytes())
+            / MAX_BATCH
     }
 
     /// Exact address-stable workspace bytes shared by every layer and endpoint.
@@ -1640,6 +1678,49 @@ fn decode_lengths(positions: &[u32], capacity: usize) -> EngineResult<[u32; MAX_
     Ok(lengths)
 }
 
+fn slot_rows(slots: &[usize]) -> EngineResult<[u32; MAX_BATCH]> {
+    require_batch(slots.len())?;
+    let mut seen = [false; MAX_BATCH];
+    let mut rows = [0u32; MAX_BATCH];
+    for (row, &slot) in rows.iter_mut().zip(slots) {
+        require_slot(slot)?;
+        if std::mem::replace(&mut seen[slot], true) {
+            return Err(EngineError::route(format!(
+                "resident physical slot {slot} appears more than once"
+            )));
+        }
+        *row = slot as u32;
+    }
+    Ok(rows)
+}
+
+fn require_slot(slot: usize) -> EngineResult<()> {
+    if slot >= MAX_BATCH {
+        return Err(EngineError::route(format!(
+            "resident physical slot {slot} is outside 0..{MAX_BATCH}"
+        )));
+    }
+    Ok(())
+}
+
+fn fill_slot<T: DeviceCopy>(
+    arena: &DeviceArena,
+    stream: &CudaStream,
+    region: ArenaRegion<T>,
+    slot: usize,
+) -> EngineResult<()> {
+    if !region.len().is_multiple_of(MAX_BATCH) {
+        return Err(EngineError::layout(format!(
+            "resident persistent region of {} values is not divisible by {MAX_BATCH} slots",
+            region.len()
+        )));
+    }
+    let width = region.len() / MAX_BATCH;
+    let start = product("resident persistent slot offset", slot, width)?;
+    arena.fill_slice(stream, region, start, width, 0)?;
+    Ok(())
+}
+
 fn copy_embedding_row(source: &[u8], token: usize, destination: &mut [u16]) -> EngineResult<()> {
     if destination.len() != Qwen38_27B::HIDDEN {
         return Err(EngineError::layout(format!(
@@ -1696,7 +1777,7 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bf16_to_f32, decode_lengths, little_endian_words, require_batch};
+    use super::{bf16_to_f32, decode_lengths, little_endian_words, require_batch, slot_rows};
     use crate::EngineErrorCode;
 
     #[test]
@@ -1720,6 +1801,31 @@ mod tests {
             decode_lengths(&[192], 192).unwrap_err().code(),
             Some(EngineErrorCode::Route)
         );
+    }
+
+    #[test]
+    fn slot_routes_cover_every_exact_batch_and_reject_aliasing() {
+        let inventory = [7, 0, 6, 1, 5, 2, 4, 3];
+        for batch in 1..=8 {
+            let rows = slot_rows(&inventory[..batch]).unwrap();
+            assert!(
+                rows[..batch]
+                    .iter()
+                    .zip(&inventory[..batch])
+                    .all(|(&row, &slot)| row as usize == slot)
+            );
+        }
+        for slots in [
+            &[][..],
+            &[0, 0][..],
+            &[8][..],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 0][..],
+        ] {
+            assert_eq!(
+                slot_rows(slots).unwrap_err().code(),
+                Some(EngineErrorCode::Route)
+            );
+        }
     }
 
     #[test]
