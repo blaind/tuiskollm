@@ -115,6 +115,15 @@ const FULL_ATTENTION_LAYER_RESOURCE_BASELINES: &[&str] = &[
     FP8_SWIGLU_RESOURCE_BASELINE,
     FP8_DOWN_RESOURCE_BASELINE,
 ];
+const QWEN35_FULL_ATTENTION_LAYER_RESOURCE_BASELINES: &[&str] = &[
+    QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE,
+    QWEN35_NVFP4_QKV_RESOURCE_BASELINE,
+    QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+    QWEN35_PAGED_GQA_RESOURCE_BASELINE,
+    QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE,
+    QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE,
+    QWEN35_NVFP4_DOWN_RESOURCE_BASELINE,
+];
 const TEXT_ENDPOINT_RESOURCE_BASELINES: &[&str] = &[
     RESIDUAL_NORM_RESOURCE_BASELINE,
     FP8_LM_HEAD_RESOURCE_BASELINE,
@@ -519,6 +528,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-dense-fp8-mlp") => bench_dense_fp8_mlp(root, &remaining),
         Some("bench-dense-fp8-gdn-layer") => bench_dense_fp8_gdn_layer(root, &remaining),
         Some("bench-full-attention-layer") => bench_full_attention_layer(root, &remaining),
+        Some("bench-qwen35-full-attention-layer") => {
+            bench_qwen35_full_attention_layer(root, &remaining)
+        }
         Some("bench-resident-model") => bench_resident_model(root, &remaining),
         Some("bench-resident-long-context-model") => {
             bench_resident_long_context_model(root, &remaining)
@@ -1690,6 +1702,26 @@ fn qualify_qwen35_full_attention_layer(
         ],
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen35_full_attention_layer_benchmark::tests",
+            "--nocapture",
+        ],
+    )?;
     gate_qwen35_residual_norm(root)?;
     gate_qwen35_nvfp4_qkv(root)?;
     gate_qwen35_attention_qk_prepare(root)?;
@@ -2328,6 +2360,40 @@ fn bench_full_attention_layer(
     run_visible(
         Command::new(executable)
             .arg("full-attention-layer")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_qwen35_full_attention_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-qwen35-full-attention-layer SNAPSHOT [options]"
+                .into(),
+        );
+    };
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = Vec::new();
+    for baseline in QWEN35_FULL_ATTENTION_LAYER_RESOURCE_BASELINES {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen35-full-attention-layer")
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
