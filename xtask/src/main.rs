@@ -414,6 +414,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen35-nvfp4-down") if remaining.is_empty() => {
             qualify_qwen35_nvfp4_down(root)
         }
+        Some("qualify-qwen35-nvfp4-mlp") => qualify_qwen35_nvfp4_mlp(root, &remaining),
         Some("qualify-fp8-qkv") if remaining.is_empty() => qualify_fp8_qkv(root),
         Some("qualify-fp8-gdn-input") if remaining.is_empty() => qualify_fp8_gdn_input(root),
         Some("qualify-fp8-lm-head") if remaining.is_empty() => qualify_fp8_lm_head(root),
@@ -1069,6 +1070,40 @@ fn qualify_nvfp4_mlp(root: &Path, arguments: &[std::ffi::OsString]) -> Result<()
     gate_residual_norm(root)?;
     gate_nvfp4_swiglu(root)?;
     gate_nvfp4_down(root)
+}
+
+fn qualify_qwen35_nvfp4_mlp(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-qwen35-nvfp4-mlp SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "nvfp4_mlp::tests::qwen35_source_layer0_matches_complete_oracles_and_graph_replay",
+            "--include-ignored",
+            "--nocapture",
+        ],
+        Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_qwen35_residual_norm(root)?;
+    gate_qwen35_nvfp4_swiglu(root)?;
+    gate_qwen35_nvfp4_down(root)
 }
 
 fn qualify_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
