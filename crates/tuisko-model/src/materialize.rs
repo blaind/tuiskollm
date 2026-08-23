@@ -5,11 +5,13 @@ use crate::bindings::{
     validate_nvfp4_scales,
 };
 use crate::{
-    Bf16View, CheckpointError, CheckpointResult, F32View, FullAttentionQkvBindings,
+    Arch, Bf16View, CheckpointError, CheckpointResult, F32View, FullAttentionQkvBindings,
     ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4LinearBindings,
-    ModelOptNvfp4MlpBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
+    ModelOptNvfp4MlpBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings, Qwen36Moe35B,
+    Qwen36MoeExpertBindings, Qwen36MoeLayerBindings,
 };
 use rayon::prelude::*;
+use std::mem::size_of;
 use std::sync::OnceLock;
 
 const SCALE_TILE_ROWS: usize = 128;
@@ -286,6 +288,91 @@ pub struct MaterializedModelOptNvfp4Mlp<'a> {
     pub next_norm: Bf16View<'a, 1>,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+/// Runtime-native numeric-order Qwen3.6 expert planes.
+#[derive(Debug)]
+pub struct MaterializedQwen36MoeExperts {
+    /// Gate then up packed E2M1 words for each expert.
+    pub gate_up_weight_e2m1: Vec<u8>,
+    /// Swizzled gate/up E4M3 scales in the same expert order.
+    pub gate_up_scale_e4m3_swizzled: Vec<u8>,
+    /// Down-projection packed E2M1 words for each expert.
+    pub down_weight_e2m1: Vec<u8>,
+    /// Swizzled down-projection E4M3 scales in the same expert order.
+    pub down_scale_e4m3_swizzled: Vec<u8>,
+    /// Exact gate/up activation scales by expert.
+    pub gate_up_input_scales: Vec<f32>,
+    /// Exact gate/up second-stage weight scales by expert.
+    pub gate_up_weight_scales_2: Vec<f32>,
+    /// Exact down-projection activation scales by expert.
+    pub down_input_scales: Vec<f32>,
+    /// Exact down-projection second-stage weight scales by expert.
+    pub down_weight_scales_2: Vec<f32>,
+    /// Reciprocal gate/up activation scales consumed by the kernels.
+    pub gate_up_input_scale_divisors: Vec<f32>,
+    /// Reciprocal gate/up weight scales consumed by the kernels.
+    pub gate_up_weight_scale_divisors: Vec<f32>,
+    /// Reciprocal down-projection activation scales consumed by the kernels.
+    pub down_input_scale_divisors: Vec<f32>,
+    /// Reciprocal down-projection weight scales consumed by the kernels.
+    pub down_weight_scale_divisors: Vec<f32>,
+    /// Number of experts in these planes.
+    pub expert_count: usize,
+    /// Intermediate width of each expert.
+    pub intermediate: usize,
+    /// Residual-stream width.
+    pub hidden: usize,
+    /// Decoder layer owning these planes.
+    pub layer: usize,
+}
+
+impl MaterializedQwen36MoeExperts {
+    /// Host bytes owned by this expert layout.
+    pub fn owned_bytes(&self) -> usize {
+        [
+            self.gate_up_weight_e2m1.len(),
+            self.gate_up_scale_e4m3_swizzled.len(),
+            self.down_weight_e2m1.len(),
+            self.down_scale_e4m3_swizzled.len(),
+            self.gate_up_input_scales.len() * size_of::<f32>(),
+            self.gate_up_weight_scales_2.len() * size_of::<f32>(),
+            self.down_input_scales.len() * size_of::<f32>(),
+            self.down_weight_scales_2.len() * size_of::<f32>(),
+            self.gate_up_input_scale_divisors.len() * size_of::<f32>(),
+            self.gate_up_weight_scale_divisors.len() * size_of::<f32>(),
+            self.down_input_scale_divisors.len() * size_of::<f32>(),
+            self.down_weight_scale_divisors.len() * size_of::<f32>(),
+        ]
+        .into_iter()
+        .sum()
+    }
+}
+
+/// Runtime-native Qwen3.6 MoE planes for one decoder layer.
+#[derive(Debug)]
+pub struct MaterializedQwen36MoeLayer<'a> {
+    /// Router weights retained zero-copy from the source mapping.
+    pub router_weight: Bf16View<'a, 2>,
+    /// Shared-expert gate retained zero-copy from the source mapping.
+    pub shared_expert_gate_weight: Bf16View<'a, 2>,
+    /// Routed expert planes in numeric expert order.
+    pub experts: MaterializedQwen36MoeExperts,
+    /// Always-active shared-expert planes.
+    pub shared_expert: MaterializedQwen36MoeExperts,
+    /// Zero-centered RMSNorm weights before the MoE boundary.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights for the next decoder boundary.
+    pub next_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning this layout.
+    pub layer: usize,
+}
+
+impl MaterializedQwen36MoeLayer<'_> {
+    /// Host bytes owned by the two expert layouts.
+    pub fn owned_bytes(&self) -> usize {
+        self.experts.owned_bytes() + self.shared_expert.owned_bytes()
+    }
 }
 
 /// One runtime-native ModelOpt NVFP4 projection.
@@ -802,6 +889,312 @@ impl<'a> ModelOptNvfp4MlpBindings<'a> {
     }
 }
 
+impl<'a> Qwen36MoeLayerBindings<'a> {
+    /// Reorders experts numerically and converts their scale layouts without requantization.
+    pub fn materialize(self) -> CheckpointResult<MaterializedQwen36MoeLayer<'a>> {
+        self.materialize_with_contract(
+            Qwen36Moe35B::LAYERS,
+            Qwen36Moe35B::HIDDEN,
+            Qwen36Moe35B::INTERMEDIATE,
+            Qwen36Moe35B::SHARED_EXPERT_INTERMEDIATE,
+            Qwen36Moe35B::NUM_EXPERTS,
+        )
+    }
+
+    fn materialize_with_contract(
+        self,
+        layer_count: usize,
+        hidden: usize,
+        expert_intermediate: usize,
+        shared_intermediate: usize,
+        expert_count: usize,
+    ) -> CheckpointResult<MaterializedQwen36MoeLayer<'a>> {
+        if self.layer >= layer_count {
+            return Err(CheckpointError::source_binding(format!(
+                "layer {} does not use the admitted Qwen3.6 MoE source contract",
+                self.layer
+            )));
+        }
+        if self.experts.len() != expert_count {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{} Qwen3.6 MoE source has {} routed experts, expected {expert_count}",
+                self.layer,
+                self.experts.len()
+            )));
+        }
+        if self.router_weight.shape() != &[expert_count as u64, hidden as u64]
+            || self.shared_expert_gate_weight.shape() != &[1, hidden as u64]
+            || self.input_norm.shape() != &[hidden as u64]
+            || self.next_norm.shape() != &[hidden as u64]
+        {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{} Qwen3.6 MoE BF16 source geometry differs from its contract",
+                self.layer
+            )));
+        }
+
+        let experts = materialize_qwen36_experts(
+            self.experts,
+            self.layer,
+            hidden,
+            expert_intermediate,
+            "routed experts",
+        )?;
+        let shared_expert = materialize_qwen36_experts(
+            vec![self.shared_expert],
+            self.layer,
+            hidden,
+            shared_intermediate,
+            "shared expert",
+        )?;
+
+        Ok(MaterializedQwen36MoeLayer {
+            router_weight: self.router_weight,
+            shared_expert_gate_weight: self.shared_expert_gate_weight,
+            experts,
+            shared_expert,
+            input_norm: self.input_norm,
+            next_norm: self.next_norm,
+            layer: self.layer,
+        })
+    }
+}
+
+struct PreparedQwen36Expert<'a> {
+    gate: MaterializedModelOptNvfp4Linear<'a>,
+    up: MaterializedModelOptNvfp4Linear<'a>,
+    down: MaterializedModelOptNvfp4Linear<'a>,
+}
+
+fn materialize_qwen36_experts<'a>(
+    bindings: Vec<Qwen36MoeExpertBindings<'a>>,
+    layer: usize,
+    hidden: usize,
+    intermediate: usize,
+    role: &str,
+) -> CheckpointResult<MaterializedQwen36MoeExperts> {
+    if bindings.is_empty() {
+        return Err(CheckpointError::source_binding(format!(
+            "layer-{layer} Qwen3.6 MoE {role} source is empty"
+        )));
+    }
+
+    let expert_count = bindings.len();
+    let prepare = |(expert, binding)| {
+        prepare_qwen36_expert(binding, layer, &format!("{role} expert-{expert}"))
+    };
+    let prepared = if expert_count > 1 && materialization_workers() > 1 {
+        materialization_pool(&format!("layer-{layer} Qwen3.6 MoE {role}"))?.install(|| {
+            bindings
+                .into_par_iter()
+                .enumerate()
+                .map(prepare)
+                .collect::<CheckpointResult<Vec<_>>>()
+        })
+    } else {
+        bindings
+            .into_iter()
+            .enumerate()
+            .map(prepare)
+            .collect::<CheckpointResult<Vec<_>>>()
+    }?;
+
+    flatten_qwen36_experts(prepared, layer, hidden, intermediate, role)
+}
+
+fn prepare_qwen36_expert<'a>(
+    binding: Qwen36MoeExpertBindings<'a>,
+    layer: usize,
+    role: &str,
+) -> CheckpointResult<PreparedQwen36Expert<'a>> {
+    require_same_modelopt_scale(
+        layer,
+        &format!("{role} gate/up input_scale"),
+        &binding.gate.input_scale,
+        &binding.up.input_scale,
+    )?;
+    require_same_modelopt_scale(
+        layer,
+        &format!("{role} gate/up weight_scale_2"),
+        &binding.gate.weight_scale_2,
+        &binding.up.weight_scale_2,
+    )?;
+
+    Ok(PreparedQwen36Expert {
+        gate: materialize_modelopt_linear(binding.gate, layer, &format!("{role} gate"))?,
+        up: materialize_modelopt_linear(binding.up, layer, &format!("{role} up"))?,
+        down: materialize_modelopt_linear(binding.down, layer, &format!("{role} down"))?,
+    })
+}
+
+fn flatten_qwen36_experts(
+    prepared: Vec<PreparedQwen36Expert<'_>>,
+    layer: usize,
+    hidden: usize,
+    intermediate: usize,
+    role: &str,
+) -> CheckpointResult<MaterializedQwen36MoeExperts> {
+    let expert_count = prepared.len();
+
+    for (expert, planes) in prepared.iter().enumerate() {
+        if planes.gate.rows != intermediate
+            || planes.up.rows != intermediate
+            || planes.gate.columns != hidden
+            || planes.up.columns != hidden
+            || planes.down.rows != hidden
+            || planes.down.columns != intermediate
+        {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{layer} Qwen3.6 MoE {role} expert-{expert} geometry differs"
+            )));
+        }
+    }
+
+    let first = prepared
+        .first()
+        .expect("nonempty expert source was checked before materialization");
+    let gate_up_weight_bytes = repeated_length(
+        combined_length(
+            first.gate.weight_e2m1.len(),
+            first.up.weight_e2m1.len(),
+            layer,
+            &format!("{role} gate/up weights"),
+        )?,
+        expert_count,
+        layer,
+        &format!("{role} gate/up weights"),
+    )?;
+    let gate_up_scale_bytes = repeated_length(
+        combined_length(
+            first.gate.scale_e4m3_swizzled.len(),
+            first.up.scale_e4m3_swizzled.len(),
+            layer,
+            &format!("{role} gate/up scales"),
+        )?,
+        expert_count,
+        layer,
+        &format!("{role} gate/up scales"),
+    )?;
+    let down_weight_bytes = repeated_length(
+        first.down.weight_e2m1.len(),
+        expert_count,
+        layer,
+        &format!("{role} down weights"),
+    )?;
+    let down_scale_bytes = repeated_length(
+        first.down.scale_e4m3_swizzled.len(),
+        expert_count,
+        layer,
+        &format!("{role} down scales"),
+    )?;
+    let mut gate_up_weight_e2m1 = reserved_bytes(
+        gate_up_weight_bytes,
+        layer,
+        &format!("{role} gate/up weights"),
+    )?;
+    let mut gate_up_scale_e4m3_swizzled = reserved_bytes(
+        gate_up_scale_bytes,
+        layer,
+        &format!("{role} gate/up scales"),
+    )?;
+    let mut down_weight_e2m1 =
+        reserved_bytes(down_weight_bytes, layer, &format!("{role} down weights"))?;
+    let mut down_scale_e4m3_swizzled =
+        reserved_bytes(down_scale_bytes, layer, &format!("{role} down scales"))?;
+    let mut gate_up_input_scales = reserved_scalars(expert_count, layer, role)?;
+    let mut gate_up_weight_scales_2 = reserved_scalars(expert_count, layer, role)?;
+    let mut down_input_scales = reserved_scalars(expert_count, layer, role)?;
+    let mut down_weight_scales_2 = reserved_scalars(expert_count, layer, role)?;
+    let mut gate_up_input_scale_divisors = reserved_scalars(expert_count, layer, role)?;
+    let mut gate_up_weight_scale_divisors = reserved_scalars(expert_count, layer, role)?;
+    let mut down_input_scale_divisors = reserved_scalars(expert_count, layer, role)?;
+    let mut down_weight_scale_divisors = reserved_scalars(expert_count, layer, role)?;
+
+    for planes in prepared {
+        gate_up_weight_e2m1.extend_from_slice(planes.gate.weight_e2m1);
+        gate_up_weight_e2m1.extend_from_slice(planes.up.weight_e2m1);
+        gate_up_scale_e4m3_swizzled.extend_from_slice(&planes.gate.scale_e4m3_swizzled);
+        gate_up_scale_e4m3_swizzled.extend_from_slice(&planes.up.scale_e4m3_swizzled);
+        down_weight_e2m1.extend_from_slice(planes.down.weight_e2m1);
+        down_scale_e4m3_swizzled.extend_from_slice(&planes.down.scale_e4m3_swizzled);
+        gate_up_input_scales.push(planes.gate.input_scale);
+        gate_up_weight_scales_2.push(planes.gate.weight_scale_2);
+        down_input_scales.push(planes.down.input_scale);
+        down_weight_scales_2.push(planes.down.weight_scale_2);
+        gate_up_input_scale_divisors.push(planes.gate.input_scale_divisor);
+        gate_up_weight_scale_divisors.push(planes.gate.weight_scale_divisor);
+        down_input_scale_divisors.push(planes.down.input_scale_divisor);
+        down_weight_scale_divisors.push(planes.down.weight_scale_divisor);
+    }
+
+    Ok(MaterializedQwen36MoeExperts {
+        gate_up_weight_e2m1,
+        gate_up_scale_e4m3_swizzled,
+        down_weight_e2m1,
+        down_scale_e4m3_swizzled,
+        gate_up_input_scales,
+        gate_up_weight_scales_2,
+        down_input_scales,
+        down_weight_scales_2,
+        gate_up_input_scale_divisors,
+        gate_up_weight_scale_divisors,
+        down_input_scale_divisors,
+        down_weight_scale_divisors,
+        expert_count,
+        intermediate,
+        hidden,
+        layer,
+    })
+}
+
+fn repeated_length(
+    bytes: usize,
+    count: usize,
+    layer: usize,
+    role: &str,
+) -> CheckpointResult<usize> {
+    bytes.checked_mul(count).ok_or_else(|| {
+        CheckpointError::source_binding(format!(
+            "layer-{layer} Qwen3.6 MoE {role} length overflows"
+        ))
+    })
+}
+
+fn combined_length(
+    first: usize,
+    second: usize,
+    layer: usize,
+    role: &str,
+) -> CheckpointResult<usize> {
+    first.checked_add(second).ok_or_else(|| {
+        CheckpointError::source_binding(format!(
+            "layer-{layer} Qwen3.6 MoE {role} length overflows"
+        ))
+    })
+}
+
+fn reserved_bytes(bytes: usize, layer: usize, role: &str) -> CheckpointResult<Vec<u8>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(bytes).map_err(|_| {
+        CheckpointError::source_binding(format!(
+            "layer-{layer} Qwen3.6 MoE {role} cannot reserve {bytes} host bytes"
+        ))
+    })?;
+
+    Ok(values)
+}
+
+fn reserved_scalars(count: usize, layer: usize, role: &str) -> CheckpointResult<Vec<f32>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(|_| {
+        CheckpointError::source_binding(format!(
+            "layer-{layer} Qwen3.6 MoE {role} cannot reserve {count} scale values"
+        ))
+    })?;
+
+    Ok(values)
+}
+
 impl<'a> Nvfp4DownBindings<'a> {
     /// Materializes the down-projection scale layout without requantizing source values.
     pub fn materialize(self) -> CheckpointResult<MaterializedNvfp4Down<'a>> {
@@ -1096,13 +1489,16 @@ mod tests {
         Arch, Bf16View, CheckpointErrorCode, CheckpointSnapshot, DType, F32View, Fp8E4M3View,
         FullAttentionQkvBindings, ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings,
         ModelOptNvfp4LinearBindings, ModelOptNvfp4MlpBindings, Nvfp4DownBindings,
-        Nvfp4GateUpBindings, Qwen35_9B, TensorView, U8View,
+        Nvfp4GateUpBindings, Qwen35_9B, Qwen36Moe35B, Qwen36MoeExpertBindings,
+        Qwen36MoeLayerBindings, TensorView, U8View,
     };
 
     const ROWS: usize = 128;
     const GROUPS: usize = 8;
     const COLUMNS: usize = GROUPS * 16;
     const PACKED_COLUMNS: usize = COLUMNS / 2;
+    const QWEN36_WEIGHT_SHAPE: [u64; 2] = [ROWS as u64, PACKED_COLUMNS as u64];
+    const QWEN36_SCALE_SHAPE: [u64; 2] = [ROWS as u64, GROUPS as u64];
 
     #[test]
     fn parallel_gather_preserves_three_plane_order_exactly() {
@@ -1251,6 +1647,286 @@ mod tests {
         }
 
         expected
+    }
+
+    struct Qwen36ExpertFixture {
+        gate_weight: Vec<u8>,
+        gate_scale: Vec<u8>,
+        gate_input_scale: [u8; 4],
+        gate_weight_scale_2: [u8; 4],
+        up_weight: Vec<u8>,
+        up_scale: Vec<u8>,
+        up_input_scale: [u8; 4],
+        up_weight_scale_2: [u8; 4],
+        down_weight: Vec<u8>,
+        down_scale: Vec<u8>,
+        down_input_scale: [u8; 4],
+        down_weight_scale_2: [u8; 4],
+    }
+
+    impl Qwen36ExpertFixture {
+        fn new(marker: u8) -> Self {
+            Self {
+                gate_weight: vec![marker; ROWS * PACKED_COLUMNS],
+                gate_scale: scale_codes(usize::from(marker)),
+                gate_input_scale: 0.25f32.to_le_bytes(),
+                gate_weight_scale_2: 0.125f32.to_le_bytes(),
+                up_weight: vec![marker.wrapping_add(0x10); ROWS * PACKED_COLUMNS],
+                up_scale: scale_codes(usize::from(marker) + 11),
+                up_input_scale: 0.25f32.to_le_bytes(),
+                up_weight_scale_2: 0.125f32.to_le_bytes(),
+                down_weight: vec![marker.wrapping_add(0x20); ROWS * PACKED_COLUMNS],
+                down_scale: scale_codes(usize::from(marker) + 23),
+                down_input_scale: 0.5f32.to_le_bytes(),
+                down_weight_scale_2: 0.0625f32.to_le_bytes(),
+            }
+        }
+
+        fn bindings(&self) -> Qwen36MoeExpertBindings<'_> {
+            Qwen36MoeExpertBindings {
+                gate: ModelOptNvfp4LinearBindings {
+                    weight: u8_view("gate-weight", &QWEN36_WEIGHT_SHAPE, &self.gate_weight),
+                    block_scale: fp8_view("gate-scale", &QWEN36_SCALE_SHAPE, &self.gate_scale),
+                    input_scale: f32_scalar_view("gate-input-scale", &self.gate_input_scale),
+                    weight_scale_2: f32_scalar_view(
+                        "gate-weight-scale-2",
+                        &self.gate_weight_scale_2,
+                    ),
+                    rows: ROWS,
+                    columns: COLUMNS,
+                },
+                up: ModelOptNvfp4LinearBindings {
+                    weight: u8_view("up-weight", &QWEN36_WEIGHT_SHAPE, &self.up_weight),
+                    block_scale: fp8_view("up-scale", &QWEN36_SCALE_SHAPE, &self.up_scale),
+                    input_scale: f32_scalar_view("up-input-scale", &self.up_input_scale),
+                    weight_scale_2: f32_scalar_view("up-weight-scale-2", &self.up_weight_scale_2),
+                    rows: ROWS,
+                    columns: COLUMNS,
+                },
+                down: ModelOptNvfp4LinearBindings {
+                    weight: u8_view("down-weight", &QWEN36_WEIGHT_SHAPE, &self.down_weight),
+                    block_scale: fp8_view("down-scale", &QWEN36_SCALE_SHAPE, &self.down_scale),
+                    input_scale: f32_scalar_view("down-input-scale", &self.down_input_scale),
+                    weight_scale_2: f32_scalar_view(
+                        "down-weight-scale-2",
+                        &self.down_weight_scale_2,
+                    ),
+                    rows: ROWS,
+                    columns: COLUMNS,
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn qwen36_moe_materialization_preserves_numeric_expert_order() {
+        let experts = [Qwen36ExpertFixture::new(1), Qwen36ExpertFixture::new(2)];
+        let shared = Qwen36ExpertFixture::new(0x40);
+        let router = bf16_bytes(&vec![0x3f80; experts.len() * COLUMNS]);
+        let shared_gate = bf16_bytes(&vec![0x3f00; COLUMNS]);
+        let input_norm = bf16_bytes(&vec![0x4000; COLUMNS]);
+        let next_norm = bf16_bytes(&vec![0x4040; COLUMNS]);
+        let router_shape = [experts.len() as u64, COLUMNS as u64];
+        let bindings = Qwen36MoeLayerBindings {
+            router_weight: bf16_view("router", &router_shape, &router),
+            shared_expert_gate_weight: bf16_view("shared-gate", &[1, COLUMNS as u64], &shared_gate),
+            experts: experts.iter().map(Qwen36ExpertFixture::bindings).collect(),
+            shared_expert: shared.bindings(),
+            input_norm: bf16_vector("input-norm", &[COLUMNS as u64], &input_norm),
+            next_norm: bf16_vector("next-norm", &[COLUMNS as u64], &next_norm),
+            layer: 0,
+        };
+        let materialized = bindings
+            .materialize_with_contract(2, COLUMNS, ROWS, ROWS, experts.len())
+            .unwrap();
+        let mut expected_gate_up_weight = Vec::new();
+        let mut expected_gate_up_scale = Vec::new();
+        let mut expected_down_weight = Vec::new();
+        let mut expected_down_scale = Vec::new();
+
+        for expert in &experts {
+            expected_gate_up_weight.extend_from_slice(&expert.gate_weight);
+            expected_gate_up_weight.extend_from_slice(&expert.up_weight);
+            expected_gate_up_scale.extend(block_scale_oracle(
+                &[expert.gate_scale.as_slice(), expert.up_scale.as_slice()].concat(),
+                2 * ROWS,
+                GROUPS,
+            ));
+            expected_down_weight.extend_from_slice(&expert.down_weight);
+            expected_down_scale.extend(block_scale_oracle(&expert.down_scale, ROWS, GROUPS));
+        }
+
+        assert_eq!(materialized.experts.expert_count, 2);
+        assert_eq!(materialized.experts.intermediate, ROWS);
+        assert_eq!(materialized.experts.hidden, COLUMNS);
+        assert_eq!(
+            materialized.experts.gate_up_weight_e2m1,
+            expected_gate_up_weight
+        );
+        assert_eq!(
+            materialized.experts.gate_up_scale_e4m3_swizzled,
+            expected_gate_up_scale
+        );
+        assert_eq!(materialized.experts.down_weight_e2m1, expected_down_weight);
+        assert_eq!(
+            materialized.experts.down_scale_e4m3_swizzled,
+            expected_down_scale
+        );
+        assert_eq!(materialized.experts.gate_up_input_scales, vec![0.25; 2]);
+        assert_eq!(materialized.experts.gate_up_weight_scales_2, vec![0.125; 2]);
+        assert_eq!(materialized.experts.down_input_scales, vec![0.5; 2]);
+        assert_eq!(materialized.experts.down_weight_scales_2, vec![0.0625; 2]);
+        assert_eq!(
+            materialized.experts.gate_up_input_scale_divisors,
+            vec![4.0; 2]
+        );
+        assert_eq!(materialized.experts.down_input_scale_divisors, vec![2.0; 2]);
+        assert_eq!(materialized.shared_expert.expert_count, 1);
+        assert_eq!(materialized.router_weight.bytes().as_ptr(), router.as_ptr());
+        assert_eq!(materialized.experts.owned_bytes(), 55_360);
+        assert_eq!(materialized.shared_expert.owned_bytes(), 27_680);
+        assert_eq!(materialized.owned_bytes(), 83_040);
+    }
+
+    #[test]
+    fn qwen36_moe_materialization_revalidates_route_count_and_scales() {
+        let mut first = Qwen36ExpertFixture::new(1);
+        let second = Qwen36ExpertFixture::new(2);
+        let shared = Qwen36ExpertFixture::new(0x40);
+        let router = bf16_bytes(&vec![0x3f80; 2 * COLUMNS]);
+        let shared_gate = bf16_bytes(&vec![0x3f00; COLUMNS]);
+        let norm = bf16_bytes(&vec![0x4000; COLUMNS]);
+
+        first.up_input_scale = 0.5f32.to_le_bytes();
+        let bindings = Qwen36MoeLayerBindings {
+            router_weight: bf16_view("router", &[2, COLUMNS as u64], &router),
+            shared_expert_gate_weight: bf16_view("shared-gate", &[1, COLUMNS as u64], &shared_gate),
+            experts: vec![first.bindings(), second.bindings()],
+            shared_expert: shared.bindings(),
+            input_norm: bf16_vector("input-norm", &[COLUMNS as u64], &norm),
+            next_norm: bf16_vector("next-norm", &[COLUMNS as u64], &norm),
+            layer: 0,
+        };
+        let error = bindings
+            .materialize_with_contract(2, COLUMNS, ROWS, ROWS, 2)
+            .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            error
+                .to_string()
+                .contains("gate/up input_scale values differ")
+        );
+
+        let bindings = Qwen36MoeLayerBindings {
+            router_weight: bf16_view("router", &[2, COLUMNS as u64], &router),
+            shared_expert_gate_weight: bf16_view("shared-gate", &[1, COLUMNS as u64], &shared_gate),
+            experts: vec![second.bindings()],
+            shared_expert: shared.bindings(),
+            input_norm: bf16_vector("input-norm", &[COLUMNS as u64], &norm),
+            next_norm: bf16_vector("next-norm", &[COLUMNS as u64], &norm),
+            layer: 0,
+        };
+        let error = bindings
+            .materialize_with_contract(2, COLUMNS, ROWS, ROWS, 2)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("has 1 routed experts, expected 2")
+        );
+    }
+
+    fn assert_qwen36_expert_is_lossless(
+        source: Qwen36MoeExpertBindings<'_>,
+        materialized: &super::MaterializedQwen36MoeExperts,
+        expert: usize,
+    ) {
+        const GATE_UP_WEIGHT_BYTES: usize = 2 * 512 * 1_024;
+        const GATE_UP_SCALE_BYTES: usize = 2 * 512 * 128;
+        const DOWN_WEIGHT_BYTES: usize = 2_048 * 256;
+        const DOWN_SCALE_BYTES: usize = 2_048 * 32;
+
+        let gate_up_weight_begin = expert * GATE_UP_WEIGHT_BYTES;
+        let gate_up_weight_end = gate_up_weight_begin + GATE_UP_WEIGHT_BYTES;
+        let gate_up_scale_begin = expert * GATE_UP_SCALE_BYTES;
+        let gate_up_scale_end = gate_up_scale_begin + GATE_UP_SCALE_BYTES;
+        let down_weight_begin = expert * DOWN_WEIGHT_BYTES;
+        let down_weight_end = down_weight_begin + DOWN_WEIGHT_BYTES;
+        let down_scale_begin = expert * DOWN_SCALE_BYTES;
+        let down_scale_end = down_scale_begin + DOWN_SCALE_BYTES;
+
+        assert_eq!(
+            &materialized.gate_up_weight_e2m1[gate_up_weight_begin..gate_up_weight_end],
+            [source.gate.weight.bytes(), source.up.weight.bytes()].concat()
+        );
+        assert_eq!(
+            &materialized.gate_up_scale_e4m3_swizzled[gate_up_scale_begin..gate_up_scale_end],
+            block_scale_oracle(
+                &[
+                    source.gate.block_scale.codes(),
+                    source.up.block_scale.codes(),
+                ]
+                .concat(),
+                2 * Qwen36Moe35B::INTERMEDIATE,
+                Qwen36Moe35B::HIDDEN / 16,
+            )
+        );
+        assert_eq!(
+            &materialized.down_weight_e2m1[down_weight_begin..down_weight_end],
+            source.down.weight.bytes()
+        );
+        assert_eq!(
+            &materialized.down_scale_e4m3_swizzled[down_scale_begin..down_scale_end],
+            block_scale_oracle(
+                source.down.block_scale.codes(),
+                Qwen36Moe35B::HIDDEN,
+                Qwen36Moe35B::INTERMEDIATE / 16,
+            )
+        );
+        assert_eq!(
+            materialized.gate_up_input_scales[expert].to_bits(),
+            source.gate.input_scale.value(0).unwrap().to_bits()
+        );
+        assert_eq!(
+            materialized.gate_up_weight_scales_2[expert].to_bits(),
+            source.gate.weight_scale_2.value(0).unwrap().to_bits()
+        );
+        assert_eq!(
+            materialized.down_input_scales[expert].to_bits(),
+            source.down.input_scale.value(0).unwrap().to_bits()
+        );
+        assert_eq!(
+            materialized.down_weight_scales_2[expert].to_bits(),
+            source.down.weight_scale_2.value(0).unwrap().to_bits()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN36_SNAPSHOT with the pinned complete Qwen3.6 checkpoint"]
+    fn qwen36_source_moe_layer0_materializes_losslessly() {
+        let root = std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+            .expect("TUISKO_QWEN36_SNAPSHOT is required for the source-backed gate");
+        let snapshot =
+            CheckpointSnapshot::<Qwen36Moe35B>::open(std::path::Path::new(&root)).unwrap();
+        let bindings = Qwen36MoeLayerBindings::bind(&snapshot, 0).unwrap();
+        let source = bindings.clone();
+        let router = bindings.router_weight.bytes();
+        let materialized = bindings.materialize().unwrap();
+
+        assert_eq!(materialized.experts.expert_count, 256);
+        assert_eq!(materialized.experts.hidden, 2_048);
+        assert_eq!(materialized.experts.intermediate, 512);
+        assert_eq!(materialized.experts.owned_bytes(), 452_993_024);
+        assert_eq!(materialized.shared_expert.owned_bytes(), 1_769_504);
+        assert_eq!(materialized.owned_bytes(), 454_762_528);
+        assert_eq!(materialized.router_weight.bytes().as_ptr(), router.as_ptr());
+
+        for expert in 0..source.experts.len() {
+            assert_qwen36_expert_is_lossless(source.experts[expert], &materialized.experts, expert);
+        }
+        assert_qwen36_expert_is_lossless(source.shared_expert, &materialized.shared_expert, 0);
     }
 
     #[test]
