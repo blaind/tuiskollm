@@ -917,6 +917,7 @@ mod tests {
         assert_eq!(report.activation_scales, w4a4_rows * GROUPS_PER_ROW);
         assert_eq!(report.output_values, active_rows * OUTPUT_ROWS);
         assert_eq!(report.a16_comparison_values, OUTPUT_ROWS);
+        assert_eq!(report.candidate_comparison_values, 0);
         assert_eq!(
             report.graph_replay_values,
             (active_rows + 1) * OUTPUT_ROWS + w4a4_rows * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW)

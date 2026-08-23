@@ -12,16 +12,16 @@ use tuisko_gpu::{
 };
 use tuisko_model::{Arch, Qwen35_9B};
 
-const MAX_BATCH: usize = 8;
+pub(crate) const MAX_BATCH: usize = 8;
 const ALIGNMENT: usize = 256;
-const HIDDEN: usize = Qwen35_9B::HIDDEN;
-const OUTPUT_ROWS: usize = Qwen35_9B::INTERMEDIATE;
-const GATE_UP_ROWS: usize = 2 * OUTPUT_ROWS;
+pub(crate) const HIDDEN: usize = Qwen35_9B::HIDDEN;
+pub(crate) const OUTPUT_ROWS: usize = Qwen35_9B::INTERMEDIATE;
+pub(crate) const GATE_UP_ROWS: usize = 2 * OUTPUT_ROWS;
 const GROUP: usize = 16;
-const GROUPS_PER_ROW: usize = HIDDEN / GROUP;
-const CODE_BYTES_PER_ROW: usize = HIDDEN / 2;
-const INPUT_SCALE_DIVISOR: f32 = 3.0;
-const WEIGHT_SCALE_DIVISOR: f32 = 0.125;
+pub(crate) const GROUPS_PER_ROW: usize = HIDDEN / GROUP;
+pub(crate) const CODE_BYTES_PER_ROW: usize = HIDDEN / 2;
+pub(crate) const INPUT_SCALE_DIVISOR: f32 = 3.0;
+pub(crate) const WEIGHT_SCALE_DIVISOR: f32 = 0.125;
 const BYTE_SENTINEL: u8 = 0xa5;
 const BF16_SENTINEL: u16 = 0xa5a5;
 const INPUT_PATTERN: [f32; GROUP] = [
@@ -31,21 +31,21 @@ const INPUT_PATTERN: [f32; GROUP] = [
 const TOKEN_FACTORS: [f32; MAX_BATCH] = [1.0, 0.5, 0.25, 0.125, 1.0, 0.5, 0.25, 0.125];
 
 #[derive(Clone, Copy)]
-struct Regions {
-    input: ArenaRegion<u16>,
-    activation_codes: ArenaRegion<u8>,
-    activation_scales: ArenaRegion<u8>,
-    weight_codes: ArenaRegion<u8>,
-    weight_scales: ArenaRegion<u8>,
-    output: ArenaRegion<u16>,
+pub(crate) struct Regions {
+    pub(crate) input: ArenaRegion<u16>,
+    pub(crate) activation_codes: ArenaRegion<u8>,
+    pub(crate) activation_scales: ArenaRegion<u8>,
+    pub(crate) weight_codes: ArenaRegion<u8>,
+    pub(crate) weight_scales: ArenaRegion<u8>,
+    pub(crate) output: ArenaRegion<u16>,
 }
 
 impl Regions {
-    fn weight_bytes(self) -> usize {
+    pub(crate) fn weight_bytes(self) -> usize {
         self.weight_codes.byte_len() + self.weight_scales.byte_len()
     }
 
-    fn payload_bytes(self) -> usize {
+    pub(crate) fn payload_bytes(self) -> usize {
         self.input.byte_len()
             + self.activation_codes.byte_len()
             + self.activation_scales.byte_len()
@@ -54,13 +54,13 @@ impl Regions {
     }
 }
 
-struct Fixture {
-    input_bf16: Vec<u16>,
+pub(crate) struct Fixture {
+    pub(crate) input_bf16: Vec<u16>,
     input_f32: Vec<f32>,
     activation_codes: Vec<u8>,
     activation_scales: Vec<u8>,
-    weight_codes: Vec<u8>,
-    weight_scales: Vec<u8>,
+    pub(crate) weight_codes: Vec<u8>,
+    pub(crate) weight_scales: Vec<u8>,
 }
 
 struct Observed {
@@ -157,7 +157,7 @@ pub fn qualify_qwen35_nvfp4_swiglu()
     Ok(report)
 }
 
-fn layout() -> GpuResult<(ArenaLayout, Regions)> {
+pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
     let input = layout.reserve(MAX_BATCH * HIDDEN, ALIGNMENT)?;
     let activation_codes = layout.reserve(MAX_BATCH * CODE_BYTES_PER_ROW, ALIGNMENT)?;
@@ -205,7 +205,7 @@ fn require_stable_addresses(
     Ok(())
 }
 
-fn make_fixture() -> Result<Fixture, Nvfp4SwiGluQualificationError> {
+pub(crate) fn make_fixture() -> Result<Fixture, Nvfp4SwiGluQualificationError> {
     let input_bf16 = (0..MAX_BATCH * HIDDEN)
         .map(|index| {
             let token = index / HIDDEN;
