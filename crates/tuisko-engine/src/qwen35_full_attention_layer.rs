@@ -652,6 +652,42 @@ impl Qwen35FullAttentionLayerProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Reads every immutable device plane in source/materialized order.
+    pub fn qualification_immutable(
+        &self,
+        stream: &CudaStream,
+    ) -> EngineResult<Qwen35FullAttentionLayerImmutable> {
+        let regions = self.layout.regions();
+
+        Ok(Qwen35FullAttentionLayerImmutable {
+            input_norm: self.arena.copy_to_host(stream, regions.input_norm)?,
+            qkv_weight_codes: self.arena.copy_to_host(stream, regions.qkv_weight_codes)?,
+            qkv_weight_scales: self.arena.copy_to_host(stream, regions.qkv_weight_scales)?,
+            query_norm: self.arena.copy_to_host(stream, regions.query_norm)?,
+            key_norm: self.arena.copy_to_host(stream, regions.key_norm)?,
+            output_weight_codes: self
+                .arena
+                .copy_to_host(stream, regions.output_weight_codes)?,
+            output_weight_scales: self
+                .arena
+                .copy_to_host(stream, regions.output_weight_scales)?,
+            post_attention_norm: self
+                .arena
+                .copy_to_host(stream, regions.post_attention_norm)?,
+            gate_weight_codes: self.arena.copy_to_host(stream, regions.gate_weight_codes)?,
+            up_weight_codes: self.arena.copy_to_host(stream, regions.up_weight_codes)?,
+            gate_up_weight_scales: self
+                .arena
+                .copy_to_host(stream, regions.gate_up_weight_scales)?,
+            down_weight_codes: self.arena.copy_to_host(stream, regions.down_weight_codes)?,
+            down_weight_scales: self
+                .arena
+                .copy_to_host(stream, regions.down_weight_scales)?,
+            next_norm: self.arena.copy_to_host(stream, regions.next_norm)?,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
     fn ops(&self) -> Ops<'_> {
         Ops {
             norm: &self._norm,
@@ -700,6 +736,39 @@ pub struct Qwen35FullAttentionLayerObservables {
     pub residual_output: Vec<u16>,
     /// Next-boundary normalized rows.
     pub next_normalized: Vec<u16>,
+}
+
+#[cfg(feature = "qualification")]
+/// Immutable source-backed planes exposed to the qualification crate.
+pub struct Qwen35FullAttentionLayerImmutable {
+    /// Input RMSNorm weights.
+    pub input_norm: Vec<u16>,
+    /// Fused packed QKV weight codes.
+    pub qkv_weight_codes: Vec<u8>,
+    /// Fused swizzled QKV block scales.
+    pub qkv_weight_scales: Vec<u8>,
+    /// Query RMSNorm weights.
+    pub query_norm: Vec<u16>,
+    /// Key RMSNorm weights.
+    pub key_norm: Vec<u16>,
+    /// Packed attention-output weight codes.
+    pub output_weight_codes: Vec<u8>,
+    /// Swizzled attention-output block scales.
+    pub output_weight_scales: Vec<u8>,
+    /// Post-attention RMSNorm weights.
+    pub post_attention_norm: Vec<u16>,
+    /// Packed MLP gate weight codes.
+    pub gate_weight_codes: Vec<u8>,
+    /// Packed MLP up weight codes.
+    pub up_weight_codes: Vec<u8>,
+    /// Fused swizzled gate/up block scales.
+    pub gate_up_weight_scales: Vec<u8>,
+    /// Packed MLP down weight codes.
+    pub down_weight_codes: Vec<u8>,
+    /// Swizzled MLP down block scales.
+    pub down_weight_scales: Vec<u8>,
+    /// Next-boundary RMSNorm weights.
+    pub next_norm: Vec<u16>,
 }
 
 #[derive(Clone, Copy)]
