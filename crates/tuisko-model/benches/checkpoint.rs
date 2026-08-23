@@ -8,8 +8,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tuisko_model::{
-    Arch, DType, Fp8E4M3View, Nvfp4DownBindings, Nvfp4GateUpBindings, Qwen38_27B, SafeTensorFile,
-    TensorView, U8View, validate_config,
+    Arch, Bf16View, DType, Fp8E4M3View, FullAttentionQkvBindings, Nvfp4DownBindings,
+    Nvfp4GateUpBindings, Qwen38_27B, SafeTensorFile, TensorView, U8View, validate_config,
 };
 
 const TENSOR_COUNT: usize = 1_953;
@@ -168,6 +168,7 @@ fn checkpoint_benches(criterion: &mut Criterion) {
     group.finish();
 
     nvfp4_materialization_benches(criterion);
+    qkv_materialization_bench(criterion);
 }
 
 fn tensor_view<'a>(
@@ -252,6 +253,73 @@ fn nvfp4_materialization_benches(criterion: &mut Criterion) {
     group.throughput(Throughput::Bytes(down_scale.len() as u64));
     group.bench_function("down", |bencher| {
         bencher.iter(|| black_box(down.materialize().unwrap()));
+    });
+    group.finish();
+}
+
+fn qkv_materialization_bench(criterion: &mut Criterion) {
+    let query_rows = Qwen38_27B::ATTENTION_QUERY_ROWS as u64;
+    let kv_rows = Qwen38_27B::ATTENTION_KV_ROWS as u64;
+    let hidden = Qwen38_27B::HIDDEN as u64;
+    let query_shape = [query_rows, hidden];
+    let kv_shape = [kv_rows, hidden];
+    let query_scale_shape = [query_rows, 1];
+    let kv_scale_shape = [kv_rows, 1];
+    let query_weight = vec![0x20; (query_rows * hidden) as usize];
+    let key_weight = vec![0x30; (kv_rows * hidden) as usize];
+    let value_weight = vec![0x40; (kv_rows * hidden) as usize];
+    let query_scale = [0x80, 0x3f].repeat(query_rows as usize);
+    let key_scale = [0x80, 0x3f].repeat(kv_rows as usize);
+    let value_scale = [0x80, 0x3f].repeat(kv_rows as usize);
+    let bindings = FullAttentionQkvBindings::from_views::<Qwen38_27B>(
+        3,
+        [
+            Fp8E4M3View::bind(
+                tensor_view("query", DType::Fp8E4M3, &query_shape, &query_weight),
+                query_shape,
+            )
+            .unwrap(),
+            Fp8E4M3View::bind(
+                tensor_view("key", DType::Fp8E4M3, &kv_shape, &key_weight),
+                kv_shape,
+            )
+            .unwrap(),
+            Fp8E4M3View::bind(
+                tensor_view("value", DType::Fp8E4M3, &kv_shape, &value_weight),
+                kv_shape,
+            )
+            .unwrap(),
+        ],
+        [
+            Bf16View::bind(
+                tensor_view("query-scale", DType::Bf16, &query_scale_shape, &query_scale),
+                query_scale_shape,
+            )
+            .unwrap(),
+            Bf16View::bind(
+                tensor_view("key-scale", DType::Bf16, &kv_scale_shape, &key_scale),
+                kv_scale_shape,
+            )
+            .unwrap(),
+            Bf16View::bind(
+                tensor_view("value-scale", DType::Bf16, &kv_scale_shape, &value_scale),
+                kv_scale_shape,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let bytes = query_weight.len()
+        + key_weight.len()
+        + value_weight.len()
+        + query_scale.len()
+        + key_scale.len()
+        + value_scale.len();
+    let mut group = criterion.benchmark_group("checkpoint/full-attention-qkv-materialization");
+    group.sample_size(40);
+    group.throughput(Throughput::Bytes(bytes as u64));
+    group.bench_function("weights", |bencher| {
+        bencher.iter(|| black_box(bindings.materialize().unwrap()));
     });
     group.finish();
 }

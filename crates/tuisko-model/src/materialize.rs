@@ -18,16 +18,21 @@ const SCALE_TILE_BYTES: usize = SCALE_TILE_ROWS * SCALE_TILE_GROUPS;
 const NVFP4_GROUP_SIZE: usize = 16;
 const E2M1_VALUES_PER_BYTE: usize = 2;
 const PARALLEL_SWIZZLE_MIN_BYTES: usize = 1 << 20;
-const MAX_SWIZZLE_WORKERS: usize = 16;
+const PARALLEL_GATHER_MIN_BYTES: usize = 1 << 20;
+const MAX_MATERIALIZATION_WORKERS: usize = 16;
 
-static SWIZZLE_POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+static MATERIALIZATION_POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
 
 /// Worker bound used by target-size NVFP4 scale materialization.
 pub fn nvfp4_scale_materialization_workers() -> usize {
+    materialization_workers()
+}
+
+fn materialization_workers() -> usize {
     std::thread::available_parallelism()
         .map(|workers| workers.get())
         .unwrap_or(1)
-        .min(MAX_SWIZZLE_WORKERS)
+        .min(MAX_MATERIALIZATION_WORKERS)
 }
 
 /// Runtime-native fused QKV planes in query/gate, key, value row order.
@@ -91,7 +96,7 @@ impl FullAttentionQkvBindings<'_> {
             })?;
 
         let weight_e4m3 = gather_source_planes(
-            &[
+            [
                 self.query_gate_weight.codes(),
                 self.key_weight.codes(),
                 self.value_weight.codes(),
@@ -99,7 +104,7 @@ impl FullAttentionQkvBindings<'_> {
             &format!("layer-{} full-attention QKV weights", self.layer),
         )?;
         let scale_bf16 = gather_source_planes(
-            &[
+            [
                 self.query_gate_scale.bytes(),
                 self.key_scale.bytes(),
                 self.value_scale.bytes(),
@@ -149,7 +154,7 @@ impl MtpBindings<'_> {
             .ok_or_else(|| CheckpointError::source_binding("MTP QKV row count overflows"))?;
 
         let weight_bf16 = gather_source_planes(
-            &[
+            [
                 self.query_gate_weight.bytes(),
                 self.key_weight.bytes(),
                 self.value_weight.bytes(),
@@ -440,13 +445,16 @@ impl<'a> ModelOptNvfp4GdnBindings<'a> {
             ))
         })?;
         let input_weight_e2m1 = gather_source_planes(
-            &[qkv.weight_e2m1, z.weight_e2m1],
+            [qkv.weight_e2m1, z.weight_e2m1],
             &format!("layer-{} ModelOpt NVFP4 QKV/Z weights", self.layer),
         )?;
         // Both exact row families end on 128-row scale-tile boundaries, so
         // concatenating their complete swizzled tiles preserves fused row order.
         let input_scale_e4m3_swizzled = gather_source_planes(
-            &[&qkv.scale_e4m3_swizzled, &z.scale_e4m3_swizzled],
+            [
+                qkv.scale_e4m3_swizzled.as_slice(),
+                z.scale_e4m3_swizzled.as_slice(),
+            ],
             &format!("layer-{} ModelOpt NVFP4 QKV/Z scales", self.layer),
         )?;
         let controls = materialize_modelopt_controls(self.a_control, self.b_control, self.layer)?;
@@ -551,12 +559,12 @@ fn materialize_modelopt_controls(
     // The source has 64 represented control rows while the Blackwell scale
     // layout owns 128-row tiles. Rows 64..128 are never dispatched.
     let mut weight_e2m1_padded = gather_source_planes(
-        &[a.weight.bytes(), b.weight.bytes()],
+        [a.weight.bytes(), b.weight.bytes()],
         &format!("layer-{layer} ModelOpt NVFP4 A/B control weights"),
     )?;
     weight_e2m1_padded.resize(padded_weight_bytes, 0);
     let mut row_major_scales = gather_source_planes(
-        &[a.block_scale.codes(), b.block_scale.codes()],
+        [a.block_scale.codes(), b.block_scale.codes()],
         &format!("layer-{layer} ModelOpt NVFP4 A/B control scales"),
     )?;
     row_major_scales.resize(padded_scale_bytes, 0);
@@ -623,16 +631,16 @@ impl<'a> ModelOptNvfp4AttentionBindings<'a> {
                 ))
             })?;
         let qkv_weight_e2m1 = gather_source_planes(
-            &[query_gate.weight_e2m1, key.weight_e2m1, value.weight_e2m1],
+            [query_gate.weight_e2m1, key.weight_e2m1, value.weight_e2m1],
             &format!("layer-{} ModelOpt NVFP4 QKV weights", self.layer),
         )?;
         // Each admitted Q/K/V row family is independently tiled by 128 rows,
         // so concatenating complete swizzled tiles preserves fused row order.
         let qkv_scale_e4m3_swizzled = gather_source_planes(
-            &[
-                &query_gate.scale_e4m3_swizzled,
-                &key.scale_e4m3_swizzled,
-                &value.scale_e4m3_swizzled,
+            [
+                query_gate.scale_e4m3_swizzled.as_slice(),
+                key.scale_e4m3_swizzled.as_slice(),
+                value.scale_e4m3_swizzled.as_slice(),
             ],
             &format!("layer-{} ModelOpt NVFP4 QKV scales", self.layer),
         )?;
@@ -873,7 +881,10 @@ fn host_shape(shape: &[u64; 2], role: &str) -> CheckpointResult<[usize; 2]> {
     Ok([rows, columns])
 }
 
-fn gather_source_planes(planes: &[&[u8]], role: &str) -> CheckpointResult<Vec<u8>> {
+fn gather_source_planes<const N: usize>(
+    planes: [&[u8]; N],
+    role: &str,
+) -> CheckpointResult<Vec<u8>> {
     let bytes = planes.iter().try_fold(0usize, |bytes, plane| {
         bytes
             .checked_add(plane.len())
@@ -885,6 +896,33 @@ fn gather_source_planes(planes: &[&[u8]], role: &str) -> CheckpointResult<Vec<u8
     gathered.try_reserve_exact(bytes).map_err(|_| {
         CheckpointError::source_binding(format!("{role} cannot reserve {bytes} host bytes"))
     })?;
+
+    if bytes >= PARALLEL_GATHER_MIN_BYTES && materialization_workers() > 1 {
+        match planes.as_slice() {
+            [first, second] => {
+                materialization_pool(role)?.install(|| {
+                    first
+                        .par_iter()
+                        .copied()
+                        .chain(second.par_iter().copied())
+                        .collect_into_vec(&mut gathered);
+                });
+                return Ok(gathered);
+            }
+            [first, second, third] => {
+                materialization_pool(role)?.install(|| {
+                    first
+                        .par_iter()
+                        .copied()
+                        .chain(second.par_iter().copied())
+                        .chain(third.par_iter().copied())
+                        .collect_into_vec(&mut gathered);
+                });
+                return Ok(gathered);
+            }
+            _ => {}
+        }
+    }
 
     for plane in planes {
         gathered.extend_from_slice(plane);
@@ -987,7 +1025,7 @@ fn swizzle_scale_planes(
     };
 
     if output_len >= PARALLEL_SWIZZLE_MIN_BYTES {
-        swizzle_pool(layer, role)?.install(|| {
+        materialization_pool(&format!("layer-{layer} NVFP4 {role} scales"))?.install(|| {
             swizzled
                 .par_chunks_mut(SCALE_TILE_BYTES)
                 .enumerate()
@@ -1031,24 +1069,27 @@ fn swizzle_scale_tile(
     }
 }
 
-fn swizzle_pool(layer: usize, role: &str) -> CheckpointResult<&'static rayon::ThreadPool> {
-    let pool = SWIZZLE_POOL.get_or_init(|| {
+fn materialization_pool(role: &str) -> CheckpointResult<&'static rayon::ThreadPool> {
+    let pool = MATERIALIZATION_POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(nvfp4_scale_materialization_workers())
-            .thread_name(|index| format!("tuisko-swizzle-{index}"))
+            .num_threads(materialization_workers())
+            .thread_name(|index| format!("tuisko-materialize-{index}"))
             .build()
             .map_err(|error| error.to_string())
     });
     pool.as_ref().map_err(|error| {
         CheckpointError::source_binding(format!(
-            "layer-{layer} NVFP4 {role} cannot start bounded swizzle workers: {error}"
+            "{role} cannot start bounded materialization workers: {error}"
         ))
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SCALE_TILE_GROUPS, SCALE_TILE_ROWS, swizzle_scale_planes, validate_divisor};
+    use super::{
+        SCALE_TILE_GROUPS, SCALE_TILE_ROWS, gather_source_planes, swizzle_scale_planes,
+        validate_divisor,
+    };
     use crate::{
         Arch, Bf16View, CheckpointErrorCode, CheckpointSnapshot, DType, F32View, Fp8E4M3View,
         FullAttentionQkvBindings, ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings,
@@ -1060,6 +1101,37 @@ mod tests {
     const GROUPS: usize = 8;
     const COLUMNS: usize = GROUPS * 16;
     const PACKED_COLUMNS: usize = COLUMNS / 2;
+
+    #[test]
+    fn parallel_gather_preserves_three_plane_order_exactly() {
+        let first = (0..1 << 20).map(|index| index as u8).collect::<Vec<_>>();
+        let second = (0..4_097)
+            .map(|index| (index as u8).wrapping_mul(3))
+            .collect::<Vec<_>>();
+        let third = (0..8_191)
+            .map(|index| (index as u8).wrapping_mul(5))
+            .collect::<Vec<_>>();
+
+        let gathered = gather_source_planes([&first, &second, &third], "test QKV").unwrap();
+        let second_end = first.len() + second.len();
+
+        assert_eq!(&gathered[..first.len()], first.as_slice());
+        assert_eq!(&gathered[first.len()..second_end], second.as_slice());
+        assert_eq!(&gathered[second_end..], third.as_slice());
+    }
+
+    #[test]
+    fn parallel_gather_preserves_two_plane_order_exactly() {
+        let first = (0..1 << 20).map(|index| index as u8).collect::<Vec<_>>();
+        let second = (0..8_191)
+            .map(|index| (index as u8).wrapping_mul(5))
+            .collect::<Vec<_>>();
+
+        let gathered = gather_source_planes([&first, &second], "test fused planes").unwrap();
+
+        assert_eq!(&gathered[..first.len()], first.as_slice());
+        assert_eq!(&gathered[first.len()..], second.as_slice());
+    }
 
     fn u8_view<'a>(name: &'a str, shape: &'a [u64; 2], bytes: &'a [u8]) -> U8View<'a, 2> {
         U8View::bind(
