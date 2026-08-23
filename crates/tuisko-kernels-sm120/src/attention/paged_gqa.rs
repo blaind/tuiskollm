@@ -2,18 +2,19 @@
 
 use crate::Sm120Arch;
 use crate::device::paged_gqa::{
-    FLASH_PREFILL_P8_SHARED_BYTES, FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS,
-    PREFILL_PARTIAL_VALUES, PREFILL_SHARED_BYTES, PREFILL_THREADS, paged_gqa,
-    paged_gqa_prefill_flash_partitioned, paged_gqa_prefill_partitioned_reduce,
-    paged_gqa_prefill_shared, qwen35_paged_gqa_bf16,
+    DECODE_SHARED_VALUES, DECODE_THREADS, FLASH_PREFILL_P8_SHARED_BYTES,
+    FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS, PREFILL_PARTIAL_VALUES,
+    PREFILL_SHARED_BYTES, PREFILL_THREADS, paged_gqa, paged_gqa_prefill_flash_partitioned,
+    paged_gqa_prefill_partitioned_reduce, paged_gqa_prefill_shared, qwen35_paged_gqa_bf16,
 };
-use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
+use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
 use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const THREADS: u32 = 32;
+const DECODE_THREADS_U32: u32 = DECODE_THREADS as u32;
 const PREFILL_SHARED_BYTES_U32: u32 = PREFILL_SHARED_BYTES as u32;
 const FLASH_PREFILL_P8_SHARED_BYTES_U32: u32 = FLASH_PREFILL_P8_SHARED_BYTES as u32;
 const FLASH_PREFILL_P16_SHARED_BYTES_U32: u32 = FLASH_PREFILL_P16_SHARED_BYTES as u32;
@@ -95,12 +96,12 @@ mod kernels {
 
     /// Applies paged FP8 GQA for one exact decode batch.
     #[kernel]
-    #[launch_bounds(32, 16)]
+    #[launch_bounds(256, 2)]
     #[allow(clippy::too_many_arguments)]
     #[launch_contract(
         domain = 1,
         coordinates = u32,
-        block = (32, 1, 1),
+        block = (256, 1, 1),
         dynamic_shared = 0,
         min_compute_capability = (12, 0),
     )]
@@ -116,10 +117,16 @@ mod kernels {
         key_scale: f32,
         value_scale: f32,
     ) {
+        static mut DECODE_PARTIALS: SharedArray<f32, DECODE_SHARED_VALUES, 16> =
+            SharedArray::UNINIT;
+        let partials = core::ptr::addr_of_mut!(DECODE_PARTIALS).cast::<f32>();
+
         // One lane owns eight of the 256 dimensions, so one warp owns one
-        // query head without cross-CTA partials. Keeping one warp per CTA gives
-        // B=1 twenty-four independent CTAs instead of three eight-warp CTAs;
-        // sixteen-CTA launch bounds retain the short-context occupancy target.
+        // query head's slice without cross-CTA partials. The former one-warp
+        // CTA walked the whole context serially and was memory-latency bound
+        // at ~600 ns/position; eight warps splitting the context cut the
+        // serial chain eight-fold and merge their softmax states in shared
+        // memory, keeping B=1 at twenty-four independent CTAs.
         unsafe {
             paged_gqa::<A, TOKENS>(
                 query,
@@ -132,6 +139,7 @@ mod kernels {
                 output,
                 key_scale,
                 value_scale,
+                partials,
             );
         }
     }
@@ -401,7 +409,11 @@ impl<A: Arch, const TOKENS: usize> PreparedRoute<A, TOKENS> {
 
         Ok(Self {
             attention: module
-                .prepare_paged_gqa_exact::<A, TOKENS>(LaunchConfig1D::new(blocks, THREADS, 0))
+                .prepare_paged_gqa_exact::<A, TOKENS>(LaunchConfig1D::new(
+                    blocks,
+                    DECODE_THREADS_U32,
+                    0,
+                ))
                 .map_err(|source| GpuError::launch("preparing paged GQA route", source))?,
         })
     }

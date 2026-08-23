@@ -5453,9 +5453,9 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         5,
     )?;
     for entry in &attention {
-        if !entry.body.contains(".reqntid 32, 1, 1") || !entry.body.contains(".minnctapersm 16") {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
-                "entry `{}` lost its 32-thread/sixteen-CTA launch bounds",
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
                 entry.name
             )
             .into());
@@ -5530,6 +5530,7 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
     let mut prefill_reduce_registers = Vec::new();
     let mut prefill_macro_partial_registers = Vec::new();
     let mut prefill_macro_reduce_registers = Vec::new();
+    let mut decode_shared = Vec::new();
     let mut shared = Vec::new();
     for entry in attention {
         let resource = resources
@@ -5537,7 +5538,7 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
         require_spill_free(entry.name, resource)?;
         registers.push(resource.registers);
-        shared.push(resource.shared);
+        decode_shared.push(resource.shared);
 
         let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
@@ -5685,16 +5686,18 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             &prefill_macro_reduce_registers,
         )?;
     }
+    require_uniform_value(&baseline, "decode_shared_bytes", &decode_shared)?;
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "paged GQA gate passed: 8 decode + 3 shared + 2 flash partition + 2 reduction + 1 macro flash + 5 macro reduction entries, REG {:?} / {:?} / {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, FP8-QMMA/F16-HMMA/E4M3/SHFL/EX2/LDGSTS present",
+        "paged GQA gate passed: 8 decode + 3 shared + 2 flash partition + 2 reduction + 1 macro flash + 5 macro reduction entries, REG {:?} / {:?} / {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, DECODE SHARED {:?}, SHARED {:?}, FP8-QMMA/F16-HMMA/E4M3/SHFL/EX2/LDGSTS present",
         registers,
         prefill_registers,
         prefill_partial_registers,
         prefill_reduce_registers,
         prefill_macro_partial_registers,
         prefill_macro_reduce_registers,
+        decode_shared,
         shared
     );
     Ok(())
