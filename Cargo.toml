@@ -6,8 +6,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
+sha2.workspace = true
 tuisko-model.workspace = true
 tuisko-serve.workspace = true
+ureq.workspace = true
 
 [workspace]
 members = [

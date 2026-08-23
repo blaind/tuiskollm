@@ -3467,8 +3467,10 @@ version = "0.1.0"
 name = "tuiskollm"
 version = "0.1.0"
 dependencies = [
+ "sha2 0.10.9",
  "tuisko-model",
  "tuisko-serve",
+ "ureq",
 ]
 
 [[package]]
