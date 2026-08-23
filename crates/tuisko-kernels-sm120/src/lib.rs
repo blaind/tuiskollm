@@ -24,7 +24,7 @@ pub use fp8::{
 };
 pub use gdn::{GdnPrepareOp, GdnRecurrenceOp};
 pub use inventory::kernel_ptx_names;
-pub use nvfp4_down::Nvfp4DownOp;
+pub use nvfp4_down::{Nvfp4DownOp, Qwen35Nvfp4DownOp};
 pub use nvfp4_swiglu::{Nvfp4SwiGluOp, Qwen35Nvfp4SwiGluOp};
 pub use residual_norm::{Qwen35ResidualNormOp, ResidualNormOp};
 

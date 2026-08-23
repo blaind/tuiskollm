@@ -6,7 +6,8 @@ pub(crate) use tuisko_kernels_sm89::{
 };
 #[cfg(feature = "device")]
 pub(crate) use tuisko_kernels_sm120::{
-    FullAttentionQkvOp, Qwen35Nvfp4SwiGluOp, Qwen35ResidualNormOp, ResidualNormOp,
+    FullAttentionQkvOp, Qwen35Nvfp4DownOp, Qwen35Nvfp4SwiGluOp, Qwen35ResidualNormOp,
+    ResidualNormOp,
 };
 
 #[cfg(feature = "device")]
