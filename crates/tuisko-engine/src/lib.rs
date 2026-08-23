@@ -64,7 +64,9 @@ pub use nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
 #[cfg(feature = "qualification")]
 pub use program::EndpointObservables;
 #[cfg(feature = "qualification")]
-pub use qwen35_full_attention_layer::Qwen35FullAttentionLayerObservables;
+pub use qwen35_full_attention_layer::{
+    Qwen35FullAttentionLayerImmutable, Qwen35FullAttentionLayerObservables,
+};
 #[cfg(feature = "qualification")]
 pub use resident_model_layout::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
