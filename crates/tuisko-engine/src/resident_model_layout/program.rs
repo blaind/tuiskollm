@@ -2,7 +2,7 @@
 
 use super::{
     AttentionWeights, EndpointWeights, GdnPersistent, GdnWeights, MixerWeights, MlpWeights,
-    ResidentModelLayout,
+    ResidentModelLayout, ResidentUploadArena, ResidentUploadPlan, ResidentUploadPreparation,
 };
 #[cfg(feature = "qualification")]
 use crate::PagedKvSlotState;
@@ -17,7 +17,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use tuisko_gpu::{
     ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, DeviceCopy, GpuError, GpuResult,
-    PinnedHostBuffer,
+    LoadingDeviceArena, PinnedHostBuffer,
 };
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_kernels_sm120::{
@@ -79,6 +79,73 @@ enum AttentionRoute {
     Long { index: usize, partitions: usize },
 }
 
+/// Resident checkpoint loading implementation selected before graph construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidentLoadMode {
+    /// Existing pageable, synchronized upload path retained as A/B authority.
+    Legacy,
+    /// Selective initialization with queued direct uploads over a sealed arena.
+    Selective,
+}
+
+impl ResidentLoadMode {
+    /// Stable spelling used in startup reports.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Selective => "selective",
+        }
+    }
+}
+
+/// Exact initialization work performed before resident graph capture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentLoadStats {
+    mode: ResidentLoadMode,
+    upload_bytes: usize,
+    upload_submissions: usize,
+    zeroed_bytes: usize,
+    pinned_stager_bytes: usize,
+}
+
+impl ResidentLoadStats {
+    /// Selected loading implementation.
+    pub const fn mode(self) -> ResidentLoadMode {
+        self.mode
+    }
+
+    /// Source-backed weight and host-derived metadata bytes uploaded.
+    pub const fn upload_bytes(self) -> usize {
+        self.upload_bytes
+    }
+
+    /// Host-to-device copy submissions used for those bytes.
+    pub const fn upload_submissions(self) -> usize {
+        self.upload_submissions
+    }
+
+    /// Device bytes initialized through memset operations.
+    pub const fn zeroed_bytes(self) -> usize {
+        self.zeroed_bytes
+    }
+
+    /// Fixed page-locked host bytes retained during loading, if any.
+    pub const fn pinned_stager_bytes(self) -> usize {
+        self.pinned_stager_bytes
+    }
+}
+
+enum ArenaLoading {
+    Legacy {
+        arena: DeviceArena,
+        kv_arena: DeviceArena,
+    },
+    Selective {
+        arena: LoadingDeviceArena,
+        kv_arena: LoadingDeviceArena,
+    },
+}
+
 struct ResidentGraphs {
     short: [CudaGraph; MAX_BATCH],
     long: [[CudaGraph; MAX_BATCH]; LONG_CONTEXT_ROUTE_COUNT],
@@ -122,6 +189,7 @@ pub struct ResidentModelProgram {
     _pointers: ProgramPointers,
     base_address: u64,
     kv_base_address: u64,
+    load_stats: ResidentLoadStats,
 }
 
 #[cfg(feature = "qualification")]
@@ -145,10 +213,35 @@ impl ResidentModelProgram {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
+        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Legacy)
+    }
+
+    /// Loads through selective initialization while retaining the legacy path for qualification.
+    pub fn from_snapshot_selective(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+    ) -> EngineResult<Self> {
+        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Selective)
+    }
+
+    fn from_snapshot_with_mode(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+        mode: ResidentLoadMode,
+    ) -> EngineResult<Self> {
         let layout = ResidentModelLayout::build()?;
+        let upload_plan = ResidentUploadPlan::build(&layout)?;
         let stream = context.new_stream().map_err(GpuError::from)?;
-        let arena = DeviceArena::zeroed(&stream, &layout.builder)?;
-        let kv_arena = DeviceArena::zeroed(&stream, layout.kv_layout.builder())?;
+        let arenas = match mode {
+            ResidentLoadMode::Legacy => ArenaLoading::Legacy {
+                arena: DeviceArena::zeroed(&stream, &layout.builder)?,
+                kv_arena: DeviceArena::zeroed(&stream, layout.kv_layout.builder())?,
+            },
+            ResidentLoadMode::Selective => ArenaLoading::Selective {
+                arena: LoadingDeviceArena::allocate(&stream, &layout.builder)?,
+                kv_arena: LoadingDeviceArena::allocate(&stream, layout.kv_layout.builder())?,
+            },
+        };
         let kv_slots = PagedKvSlotPool::new(LONG_CONTEXT_PHYSICAL_PAGES)?;
         let norm = ResidualNormOp::new(context)?;
         let gdn_input = GdnInputProjectionOp::new(context)?;
@@ -175,8 +268,76 @@ impl ResidentModelProgram {
         )
         .map_err(GpuError::from)?;
 
-        let scalars = load_source_weights(&arena, &stream, &layout, snapshot.as_ref())?;
-        initialize_metadata(&arena, &kv_arena, &stream, &layout)?;
+        let (arena, kv_arena, scalars, load_stats) = match arenas {
+            ArenaLoading::Legacy { arena, kv_arena } => {
+                let mut sink = LegacyWeightSink { arena: &arena };
+                let scalars = load_source_weights(&mut sink, &stream, &layout, snapshot.as_ref())?;
+                initialize_metadata(&arena, &kv_arena, &stream, &layout)?;
+                let upload_submissions = upload_plan
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.preparation() != ResidentUploadPreparation::Zero)
+                    .count();
+                let load_stats = ResidentLoadStats {
+                    mode,
+                    upload_bytes: upload_plan.weight_bytes() + upload_plan.host_derived_bytes(),
+                    upload_submissions,
+                    zeroed_bytes: layout.arena_bytes(),
+                    pinned_stager_bytes: 0,
+                };
+                (arena, kv_arena, scalars, load_stats)
+            }
+            ArenaLoading::Selective {
+                mut arena,
+                mut kv_arena,
+            } => {
+                let (scalars, upload_bytes, upload_submissions) = {
+                    let mut sink = SelectiveWeightSink {
+                        arena: &mut arena,
+                        plan: &upload_plan,
+                        bytes: 0,
+                        submissions: 0,
+                    };
+                    let scalars =
+                        load_source_weights(&mut sink, &stream, &layout, snapshot.as_ref())?;
+                    (scalars, sink.bytes, sink.submissions)
+                };
+                let metadata = initialize_selective_nonweights(
+                    &mut arena,
+                    &mut kv_arena,
+                    &upload_plan,
+                    &layout,
+                    &stream,
+                )?;
+                let uploaded_bytes = upload_bytes
+                    .checked_add(metadata.bytes)
+                    .ok_or_else(|| EngineError::layout("resident upload byte total overflows"))?;
+                let upload_submissions = upload_submissions
+                    .checked_add(metadata.submissions)
+                    .ok_or_else(|| {
+                        EngineError::layout("resident upload submission total overflows")
+                    })?;
+                let expected_upload_bytes = upload_plan
+                    .weight_bytes()
+                    .checked_add(upload_plan.host_derived_bytes())
+                    .ok_or_else(|| EngineError::layout("resident upload byte total overflows"))?;
+                if uploaded_bytes != expected_upload_bytes {
+                    return Err(EngineError::layout(format!(
+                        "selective loader uploaded {uploaded_bytes} bytes, expected {expected_upload_bytes}",
+                    )));
+                }
+                let load_stats = ResidentLoadStats {
+                    mode,
+                    upload_bytes: uploaded_bytes,
+                    upload_submissions,
+                    zeroed_bytes: upload_plan.zeroed_owner_bytes() + upload_plan.padding_bytes(),
+                    pinned_stager_bytes: 0,
+                };
+                let arena = arena.seal(&stream)?;
+                let kv_arena = kv_arena.seal(&stream)?;
+                (arena, kv_arena, scalars, load_stats)
+            }
+        };
         let pointers = ProgramPointers::bind(&arena, &kv_arena, &layout, &scalars)?;
         let base_address = arena.base_address();
         let kv_base_address = kv_arena.base_address();
@@ -226,6 +387,7 @@ impl ResidentModelProgram {
             _pointers: pointers,
             base_address,
             kv_base_address,
+            load_stats,
         })
     }
 
@@ -522,6 +684,11 @@ impl ResidentModelProgram {
     /// Stable base address of the shared page-table and KV arena.
     pub const fn kv_base_address(&self) -> u64 {
         self.kv_base_address
+    }
+
+    /// Exact allocation and transfer work used to make this program resident.
+    pub const fn load_stats(&self) -> ResidentLoadStats {
+        self.load_stats
     }
 
     /// Exact source-backed device weight bytes.
@@ -1970,8 +2137,92 @@ fn launch_mlp(
     }
 }
 
-fn load_source_weights(
-    arena: &DeviceArena,
+trait ResidentWeightSink {
+    fn copy_from_host<T: DeviceCopy>(
+        &mut self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        source: &[T],
+    ) -> EngineResult<()>;
+}
+
+struct LegacyWeightSink<'a> {
+    arena: &'a DeviceArena,
+}
+
+impl ResidentWeightSink for LegacyWeightSink<'_> {
+    fn copy_from_host<T: DeviceCopy>(
+        &mut self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        source: &[T],
+    ) -> EngineResult<()> {
+        self.arena.copy_from_host(stream, region, source)?;
+        Ok(())
+    }
+}
+
+struct SelectiveWeightSink<'a> {
+    arena: &'a mut LoadingDeviceArena,
+    plan: &'a ResidentUploadPlan,
+    bytes: usize,
+    submissions: usize,
+}
+
+impl ResidentWeightSink for SelectiveWeightSink<'_> {
+    fn copy_from_host<T: DeviceCopy>(
+        &mut self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        source: &[T],
+    ) -> EngineResult<()> {
+        let end = region
+            .offset_bytes()
+            .checked_add(region.byte_len())
+            .ok_or_else(|| EngineError::layout("selective weight destination overflows"))?;
+        match self.plan.preparation_for(
+            ResidentUploadArena::Resident,
+            region.offset_bytes(),
+            region.byte_len(),
+        )? {
+            ResidentUploadPreparation::BorrowedSource => {
+                // SAFETY: borrowed upload-plan entries point into the admitted snapshot mmaps;
+                // `ResidentModelProgram` retains that snapshot beyond the final arena seal.
+                unsafe {
+                    self.arena
+                        .copy_from_host_async(stream, region.offset_bytes()..end, source)?;
+                }
+            }
+            ResidentUploadPreparation::GatheredSource
+            | ResidentUploadPreparation::SwizzledSource => {
+                // SAFETY: synchronization below completes the copy before its temporary source
+                // can be released by the caller.
+                unsafe {
+                    self.arena
+                        .copy_from_host_async(stream, region.offset_bytes()..end, source)?;
+                }
+                stream.synchronize().map_err(GpuError::from)?;
+            }
+            preparation => {
+                return Err(EngineError::layout(format!(
+                    "weight destination unexpectedly requires {preparation:?} preparation"
+                )));
+            }
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(region.byte_len())
+            .ok_or_else(|| EngineError::layout("resident upload bytes overflow"))?;
+        self.submissions = self
+            .submissions
+            .checked_add(1)
+            .ok_or_else(|| EngineError::layout("resident upload submissions overflow"))?;
+        Ok(())
+    }
+}
+
+fn load_source_weights<S: ResidentWeightSink>(
+    arena: &mut S,
     stream: &CudaStream,
     layout: &ResidentModelLayout,
     snapshot: &CheckpointSnapshot<Qwen38_27B>,
@@ -2002,8 +2253,8 @@ fn load_source_weights(
     Ok(scalars)
 }
 
-fn load_mixer(
-    arena: &DeviceArena,
+fn load_mixer<S: ResidentWeightSink>(
+    arena: &mut S,
     stream: &CudaStream,
     layer: usize,
     weights: MixerWeights,
@@ -2110,8 +2361,8 @@ fn load_mixer(
     }
 }
 
-fn load_mlp(
-    arena: &DeviceArena,
+fn load_mlp<S: ResidentWeightSink>(
+    arena: &mut S,
     stream: &CudaStream,
     layer: usize,
     weights: MlpWeights,
@@ -2180,6 +2431,71 @@ fn initialize_metadata(
         workspace.table_rows,
         &(0..MAX_BATCH as u32).collect::<Vec<_>>(),
     )?;
+    Ok(())
+}
+
+fn initialize_selective_nonweights(
+    arena: &mut LoadingDeviceArena,
+    kv_arena: &mut LoadingDeviceArena,
+    plan: &ResidentUploadPlan,
+    layout: &ResidentModelLayout,
+    stream: &CudaStream,
+) -> EngineResult<MetadataUploadStats> {
+    for entry in plan
+        .entries()
+        .iter()
+        .filter(|entry| entry.preparation() == ResidentUploadPreparation::Zero)
+    {
+        let end = entry
+            .offset_bytes()
+            .checked_add(entry.byte_len())
+            .ok_or_else(|| EngineError::layout("resident zero destination overflows"))?;
+        match entry.arena() {
+            ResidentUploadArena::Resident => {
+                arena.fill_async(stream, entry.offset_bytes()..end, 0)?;
+            }
+            ResidentUploadArena::Kv => {
+                kv_arena.fill_async(stream, entry.offset_bytes()..end, 0)?;
+            }
+        }
+    }
+
+    let state_rows = (0..MAX_BATCH as u32).collect::<Vec<_>>();
+    upload_region(stream, arena, layout.workspace.state_rows, &state_rows)?;
+    let table_rows = (0..MAX_BATCH as u32).collect::<Vec<_>>();
+    upload_region(stream, arena, layout.workspace.table_rows, &table_rows)?;
+    let block_tables = vec![u32::MAX; MAX_BATCH * LONG_CONTEXT_PHYSICAL_PAGES];
+    upload_region(
+        stream,
+        kv_arena,
+        layout.kv_layout.block_tables(),
+        &block_tables,
+    )?;
+    stream.synchronize().map_err(GpuError::from)?;
+    Ok(MetadataUploadStats {
+        bytes: plan.host_derived_bytes(),
+        submissions: 3,
+    })
+}
+
+struct MetadataUploadStats {
+    bytes: usize,
+    submissions: usize,
+}
+
+fn upload_region<T: DeviceCopy>(
+    stream: &CudaStream,
+    arena: &mut LoadingDeviceArena,
+    region: ArenaRegion<T>,
+    source: &[T],
+) -> EngineResult<()> {
+    let end = region
+        .offset_bytes()
+        .checked_add(region.byte_len())
+        .ok_or_else(|| EngineError::layout("resident metadata destination overflows"))?;
+    // SAFETY: `initialize_selective_nonweights` synchronizes before its local sources can be
+    // released, and the loading arena checks the exact destination range.
+    unsafe { arena.copy_from_host_async(stream, region.offset_bytes()..end, source)? };
     Ok(())
 }
 

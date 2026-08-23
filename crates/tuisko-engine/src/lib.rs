@@ -49,8 +49,9 @@ pub use resident_generation::{
     ResidentCancellation, ResidentGenerationSession, ResidentRequestId, ResidentTextGenerator,
 };
 pub use resident_model_layout::{
-    ResidentDecodeRoute, ResidentLayerKind, ResidentModelLayout, ResidentModelProgram,
-    ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
+    ResidentDecodeRoute, ResidentLayerKind, ResidentLoadMode, ResidentLoadStats,
+    ResidentModelLayout, ResidentModelProgram, ResidentUploadArena, ResidentUploadEntry,
+    ResidentUploadPlan, ResidentUploadPreparation,
 };
 pub use sampling::{SampleDecision, Sampler, SamplingOptions};
 

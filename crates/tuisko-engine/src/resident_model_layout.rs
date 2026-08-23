@@ -3,7 +3,7 @@
 mod program;
 mod upload_plan;
 
-pub use program::{ResidentDecodeRoute, ResidentModelProgram};
+pub use program::{ResidentDecodeRoute, ResidentLoadMode, ResidentLoadStats, ResidentModelProgram};
 #[cfg(feature = "qualification")]
 pub use program::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,

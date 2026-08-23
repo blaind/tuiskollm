@@ -8,20 +8,51 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use tuisko_engine::ResidentModelProgram;
+use tuisko_engine::{ResidentLoadMode, ResidentModelProgram};
 use tuisko_gpu::{CudaContext, GpuError};
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const DEFAULT_SAMPLES: usize = 3;
 const DEFAULT_WARMUPS: usize = 1;
-const DEFAULT_REPORT: &str = "target/benchmarks/startup/legacy-sm120.json";
+const DEFAULT_REPORT: &str = "target/benchmarks/startup/loader-comparison-sm120.json";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupLoader {
+    Legacy,
+    Selective,
+}
+
+impl StartupLoader {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Selective => "selective",
+        }
+    }
+
+    const fn resident_mode(self) -> ResidentLoadMode {
+        match self {
+            Self::Legacy => ResidentLoadMode::Legacy,
+            Self::Selective => ResidentLoadMode::Selective,
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "selective" => Ok(Self::Selective),
+            _ => Err(format!("unknown startup loader `{value}`").into()),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct StartupOptions {
     snapshot: PathBuf,
     samples: usize,
     warmups: usize,
+    loaders: Vec<StartupLoader>,
     json_path: PathBuf,
 }
 
@@ -43,6 +74,10 @@ struct StartupSample {
     kv_arena_bytes: usize,
     total_device_arena_bytes: usize,
     peak_rss_bytes: u64,
+    upload_bytes: usize,
+    upload_submissions: usize,
+    zeroed_bytes: usize,
+    pinned_stager_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,9 +91,14 @@ struct StartupTimingSummary {
 #[derive(Debug, Serialize)]
 struct StartupBenchmarkReport {
     schema_version: u32,
-    loader: &'static str,
     filesystem_cache: &'static str,
     warmups: usize,
+    loaders: Vec<StartupLoaderReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct StartupLoaderReport {
+    loader: &'static str,
     samples: Vec<StartupSample>,
     timings: Vec<StartupTimingSummary>,
 }
@@ -75,37 +115,78 @@ pub fn run_startup_benchmark_cli() -> Result<(), Box<dyn Error>> {
 
     let options = parse_options(&arguments)?;
     let executable = std::env::current_exe()?;
-    for index in 0..options.warmups {
-        eprintln!(
-            "warming checkpoint pages in fresh process {}/{}",
-            index + 1,
-            options.warmups
-        );
-        let _ = launch_child(&executable, &options.snapshot)?;
+    for loader in &options.loaders {
+        for index in 0..options.warmups {
+            eprintln!(
+                "warming {} startup in fresh process {}/{}",
+                loader.as_str(),
+                index + 1,
+                options.warmups
+            );
+            let _ = launch_child(&executable, &options.snapshot, *loader)?;
+        }
     }
 
-    let mut samples = Vec::with_capacity(options.samples);
+    let mut samples = options
+        .loaders
+        .iter()
+        .map(|loader| (*loader, Vec::with_capacity(options.samples)))
+        .collect::<Vec<_>>();
     for index in 0..options.samples {
-        eprintln!(
-            "measuring legacy startup in fresh process {}/{}",
-            index + 1,
-            options.samples
-        );
-        samples.push(launch_child(&executable, &options.snapshot)?);
+        let order = if index.is_multiple_of(2) {
+            options.loaders.clone()
+        } else {
+            options.loaders.iter().rev().copied().collect()
+        };
+        for loader in order {
+            eprintln!(
+                "measuring {} startup in fresh process {}/{}",
+                loader.as_str(),
+                index + 1,
+                options.samples
+            );
+            let sample = launch_child(&executable, &options.snapshot, loader)?;
+            samples
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == loader)
+                .expect("startup loader sample inventory is complete")
+                .1
+                .push(sample);
+        }
     }
 
-    let report = StartupBenchmarkReport::new(options.warmups, samples)?;
+    let loaders = samples
+        .into_iter()
+        .map(|(loader, samples)| StartupLoaderReport::new(loader, samples))
+        .collect::<Result<Vec<_>, _>>()?;
+    let report = StartupBenchmarkReport {
+        schema_version: SCHEMA_VERSION,
+        filesystem_cache: "warm",
+        warmups: options.warmups,
+        loaders,
+    };
     print_report(&report);
     write_report(&options.json_path, &report)?;
     eprintln!("startup report: {}", options.json_path.display());
     Ok(())
 }
 
-impl StartupBenchmarkReport {
-    fn new(warmups: usize, samples: Vec<StartupSample>) -> Result<Self, DeviceBenchmarkError> {
+impl StartupLoaderReport {
+    fn new(
+        loader: StartupLoader,
+        samples: Vec<StartupSample>,
+    ) -> Result<Self, DeviceBenchmarkError> {
         if samples.is_empty() {
             return Err(DeviceBenchmarkError::Precondition(
                 "startup benchmark requires at least one sample".into(),
+            ));
+        }
+        if samples
+            .iter()
+            .any(|sample| sample.loader != loader.as_str())
+        {
+            return Err(DeviceBenchmarkError::Precondition(
+                "startup sample was assigned to the wrong loader report".into(),
             ));
         }
         validate_samples(&samples)?;
@@ -128,10 +209,7 @@ impl StartupBenchmarkReport {
             ),
         ];
         Ok(Self {
-            schema_version: SCHEMA_VERSION,
-            loader: "legacy",
-            filesystem_cache: "warm",
-            warmups,
+            loader: loader.as_str(),
             samples,
             timings,
         })
@@ -140,7 +218,7 @@ impl StartupBenchmarkReport {
 
 fn parse_options(arguments: &[OsString]) -> Result<StartupOptions, Box<dyn Error>> {
     let Some(snapshot) = arguments.first() else {
-        return Err("usage: bench-startup SNAPSHOT [--samples N] [--warmups N] [--filesystem-cache warm] [--loaders legacy] [--json PATH]".into());
+        return Err("usage: bench-startup SNAPSHOT [--samples N] [--warmups N] [--filesystem-cache warm] [--loaders legacy,selective] [--json PATH]".into());
     };
     if snapshot
         .to_str()
@@ -151,6 +229,7 @@ fn parse_options(arguments: &[OsString]) -> Result<StartupOptions, Box<dyn Error
 
     let mut samples = DEFAULT_SAMPLES;
     let mut warmups = DEFAULT_WARMUPS;
+    let mut loaders = vec![StartupLoader::Legacy, StartupLoader::Selective];
     let mut json_path = PathBuf::from(DEFAULT_REPORT);
     let mut index = 1;
     while index < arguments.len() {
@@ -171,9 +250,19 @@ fn parse_options(arguments: &[OsString]) -> Result<StartupOptions, Box<dyn Error
                         .into(),
                 );
             }
-            "--loaders" if value == "legacy" => {}
             "--loaders" => {
-                return Err("only the unchanged `legacy` loader exists in this slice".into());
+                let value = value.to_str().ok_or("--loaders must be valid UTF-8")?;
+                loaders.clear();
+                for value in value.split(',') {
+                    let loader = StartupLoader::parse(value)?;
+                    if loaders.contains(&loader) {
+                        return Err(format!("startup loader `{value}` is duplicated").into());
+                    }
+                    loaders.push(loader);
+                }
+                if loaders.is_empty() {
+                    return Err("--loaders requires at least one loader".into());
+                }
             }
             _ => return Err(format!("unknown startup benchmark option `{option}`").into()),
         }
@@ -184,6 +273,7 @@ fn parse_options(arguments: &[OsString]) -> Result<StartupOptions, Box<dyn Error
         snapshot: PathBuf::from(snapshot),
         samples,
         warmups,
+        loaders,
         json_path,
     })
 }
@@ -200,18 +290,28 @@ fn parse_count(option: &str, value: &OsStr) -> Result<usize, Box<dyn Error>> {
 }
 
 fn run_child(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
-    let [snapshot] = arguments else {
-        return Err("internal startup child requires exactly one snapshot path".into());
+    let [loader, snapshot] = arguments else {
+        return Err("internal startup child requires one loader and one snapshot path".into());
     };
-    let sample = measure_legacy_startup(Path::new(snapshot))?;
+    let loader = StartupLoader::parse(
+        loader
+            .to_str()
+            .ok_or("internal startup loader must be valid UTF-8")?,
+    )?;
+    let sample = measure_startup(Path::new(snapshot), loader)?;
     serde_json::to_writer(io::stdout().lock(), &sample)?;
     println!();
     Ok(())
 }
 
-fn launch_child(executable: &Path, snapshot: &Path) -> Result<StartupSample, Box<dyn Error>> {
+fn launch_child(
+    executable: &Path,
+    snapshot: &Path,
+    loader: StartupLoader,
+) -> Result<StartupSample, Box<dyn Error>> {
     let output = Command::new(executable)
         .arg("--child")
+        .arg(loader.as_str())
         .arg(snapshot)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -224,7 +324,10 @@ fn launch_child(executable: &Path, snapshot: &Path) -> Result<StartupSample, Box
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn measure_legacy_startup(snapshot_path: &Path) -> Result<StartupSample, DeviceBenchmarkError> {
+fn measure_startup(
+    snapshot_path: &Path,
+    loader: StartupLoader,
+) -> Result<StartupSample, DeviceBenchmarkError> {
     let ready_start = Instant::now();
 
     let checkpoint_start = Instant::now();
@@ -258,15 +361,27 @@ fn measure_legacy_startup(snapshot_path: &Path) -> Result<StartupSample, DeviceB
     let cuda_initialization = cuda_start.elapsed();
 
     let program_start = Instant::now();
-    let program = ResidentModelProgram::from_snapshot(&context, snapshot.into())?;
+    let snapshot = snapshot.into();
+    let mode = loader.resident_mode();
+    let program = match mode {
+        ResidentLoadMode::Legacy => ResidentModelProgram::from_snapshot(&context, snapshot)?,
+        ResidentLoadMode::Selective => {
+            ResidentModelProgram::from_snapshot_selective(&context, snapshot)?
+        }
+    };
     context.synchronize().map_err(GpuError::from)?;
     let resident_program = program_start.elapsed();
     let checkpoint_to_ready = ready_start.elapsed();
     let peak_rss_bytes = process_peak_rss_bytes()?;
+    if program.load_stats().mode() != mode {
+        return Err(DeviceBenchmarkError::Precondition(
+            "resident program reported the wrong startup loader".into(),
+        ));
+    }
 
     Ok(StartupSample {
         schema_version: SCHEMA_VERSION,
-        loader: "legacy".into(),
+        loader: loader.as_str().into(),
         filesystem_cache: "warm".into(),
         checkpoint_revision,
         device_name,
@@ -281,6 +396,10 @@ fn measure_legacy_startup(snapshot_path: &Path) -> Result<StartupSample, DeviceB
         kv_arena_bytes: program.kv_arena_bytes(),
         total_device_arena_bytes: program.arena_bytes(),
         peak_rss_bytes,
+        upload_bytes: program.load_stats().upload_bytes(),
+        upload_submissions: program.load_stats().upload_submissions(),
+        zeroed_bytes: program.load_stats().zeroed_bytes(),
+        pinned_stager_bytes: program.load_stats().pinned_stager_bytes(),
     })
 }
 
@@ -312,6 +431,10 @@ fn validate_samples(samples: &[StartupSample]) -> Result<(), DeviceBenchmarkErro
             || sample.resident_arena_bytes != first.resident_arena_bytes
             || sample.kv_arena_bytes != first.kv_arena_bytes
             || sample.total_device_arena_bytes != first.total_device_arena_bytes
+            || sample.upload_bytes != first.upload_bytes
+            || sample.upload_submissions != first.upload_submissions
+            || sample.zeroed_bytes != first.zeroed_bytes
+            || sample.pinned_stager_bytes != first.pinned_stager_bytes
         {
             return Err(DeviceBenchmarkError::Precondition(
                 "fresh-process startup samples disagree on their exact product identity or byte accounting"
@@ -368,16 +491,26 @@ fn parse_peak_rss_bytes(status: &str) -> io::Result<u64> {
 }
 
 fn print_report(report: &StartupBenchmarkReport) {
-    eprintln!();
-    eprintln!("legacy startup, warm filesystem cache");
-    eprintln!("phase                         minimum ms   median ms   maximum ms");
-    for timing in &report.timings {
+    for loader in &report.loaders {
+        eprintln!();
+        eprintln!("{} startup, warm filesystem cache", loader.loader);
+        eprintln!("phase                         minimum ms   median ms   maximum ms");
+        for timing in &loader.timings {
+            eprintln!(
+                "{:<29} {:>10.3} {:>11.3} {:>12.3}",
+                timing.phase, timing.minimum_ms, timing.median_ms, timing.maximum_ms,
+            );
+        }
+        let sample = &loader.samples[0];
         eprintln!(
-            "{:<29} {:>10.3} {:>11.3} {:>12.3}",
-            timing.phase, timing.minimum_ms, timing.median_ms, timing.maximum_ms,
+            "uploads: {:.2} GiB in {} submissions · zeroed: {:.2} GiB · pinned: {:.0} MiB",
+            sample.upload_bytes as f64 / (1_u64 << 30) as f64,
+            sample.upload_submissions,
+            sample.zeroed_bytes as f64 / (1_u64 << 30) as f64,
+            sample.pinned_stager_bytes as f64 / (1_u64 << 20) as f64,
         );
     }
-    let sample = &report.samples[0];
+    let sample = &report.loaders[0].samples[0];
     eprintln!();
     eprintln!(
         "{} ({}) · {} tensors · {:.2} GiB weights · {:.2} GiB device arenas",
@@ -388,8 +521,9 @@ fn print_report(report: &StartupBenchmarkReport) {
         sample.total_device_arena_bytes as f64 / (1_u64 << 30) as f64,
     );
     let peak_rss = report
-        .samples
+        .loaders
         .iter()
+        .flat_map(|loader| loader.samples.iter())
         .map(|sample| sample.peak_rss_bytes)
         .max()
         .unwrap_or(0);
@@ -410,7 +544,7 @@ fn write_report(path: &Path, report: &StartupBenchmarkReport) -> io::Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_options, parse_peak_rss_bytes};
+    use super::{StartupLoader, parse_options, parse_peak_rss_bytes};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -441,6 +575,16 @@ mod tests {
         assert_eq!(options.snapshot, PathBuf::from("/snapshot"));
         assert_eq!(options.samples, 5);
         assert_eq!(options.warmups, 2);
+        assert_eq!(options.loaders, vec![StartupLoader::Legacy]);
         assert_eq!(options.json_path, PathBuf::from("report.json"));
+    }
+
+    #[test]
+    fn startup_options_compare_both_loaders_by_default() {
+        let options = parse_options(&[OsString::from("/snapshot")]).unwrap();
+        assert_eq!(
+            options.loaders,
+            vec![StartupLoader::Legacy, StartupLoader::Selective]
+        );
     }
 }

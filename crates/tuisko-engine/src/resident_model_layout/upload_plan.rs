@@ -194,6 +194,25 @@ impl ResidentUploadPlan {
     pub const fn initialized_bytes(&self) -> usize {
         self.initialized_bytes
     }
+
+    pub(super) fn preparation_for(
+        &self,
+        arena: ResidentUploadArena,
+        offset: usize,
+        bytes: usize,
+    ) -> EngineResult<ResidentUploadPreparation> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.arena == arena && entry.offset == offset && entry.bytes == bytes)
+            .ok_or_else(|| {
+                EngineError::layout(format!(
+                    "resident upload plan omits destination {arena:?} {offset}..{}",
+                    offset.saturating_add(bytes),
+                ))
+            })?;
+        Ok(entry.preparation)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
