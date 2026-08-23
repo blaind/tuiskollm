@@ -231,7 +231,7 @@ fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::{ALIGNMENT, Nvfp4MlpLayout};
-    use tuisko_model::{Arch, Qwen38_27B};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
     fn spans(layout: &Nvfp4MlpLayout) -> Vec<(usize, usize)> {
         vec![
@@ -265,6 +265,16 @@ mod tests {
         assert_eq!(layout.workspace_bytes(), 711_168);
         assert_eq!(layout.owner_bytes(), 151_136_768);
         assert_eq!(layout.arena_bytes(), 151_136_768);
+    }
+
+    #[test]
+    fn qwen35_nvfp4_mlp_byte_accounting_is_exact() {
+        let layout = Nvfp4MlpLayout::build::<Qwen35_9B>().unwrap();
+
+        assert_eq!(layout.resident_weight_bytes(), 84_951_040);
+        assert_eq!(layout.workspace_bytes(), 542_720);
+        assert_eq!(layout.owner_bytes(), 85_493_760);
+        assert_eq!(layout.arena_bytes(), 85_493_760);
     }
 
     #[test]
