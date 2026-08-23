@@ -1,4 +1,4 @@
-//! Numerical and graph qualification for exact paged GQA decode.
+//! Numerical and graph qualification for exact shared paged-GQA prefill tails.
 
 use crate::fp8_projection_oracle::{BYTE_SENTINEL, F32_SENTINEL_BITS};
 use crate::{DeviceBenchmarkError, device_benchmark};
@@ -9,15 +9,15 @@ use tuisko_gpu::{
 use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, PagedGqaOp};
 use tuisko_model::{Arch, Qwen38_27B};
 
-const MAX_BATCH: usize = 8;
+const MAX_TOKENS: usize = 128;
+const PREFILL_ROUTES: [usize; 3] = [32, 64, 128];
+const PREFIX_TOKENS: usize = 2;
 const ALIGNMENT: usize = 256;
 const PHYSICAL_PAGES: usize = 24;
 const TABLE_ROWS: usize = 8;
 const TABLE_STRIDE: usize = 3;
 const KEY_SCALE: f32 = 0.03125;
 const VALUE_SCALE: f32 = 0.0625;
-const TABLE_ROW_IDS: [u32; MAX_BATCH] = [7, 0, 5, 2, 6, 1, 4, 3];
-const LENGTHS: [u32; MAX_BATCH] = [1, 63, 64, 65, 97, 127, 128, 130];
 const BLOCK_TABLES: [u32; TABLE_ROWS * TABLE_STRIDE] = [
     17, 2, 21, 4, 15, 0, 23, 7, 12, 1, 18, 9, 14, 5, 22, 8, 19, 3, 20, 6, 13, 10, 16, 11,
 ];
@@ -28,9 +28,9 @@ const QUERY_PATTERN: [f32; 16] = [
 const KEY_CODES: [u8; 9] = [0x00, 0x28, 0x30, 0x38, 0xa8, 0xb0, 0xb8, 0x20, 0xa0];
 const VALUE_CODES: [u8; 9] = [0x38, 0xb8, 0x30, 0xb0, 0x28, 0xa8, 0x20, 0xa0, 0x00];
 
-/// Failure of the exact paged GQA qualification gate.
+/// Failure of the exact shared prefill paged-GQA qualification gate.
 #[derive(Debug, thiserror::Error)]
-pub enum PagedGqaQualificationError {
+pub enum PagedGqaPrefillQualificationError {
     /// GPU ownership, launch, or driver failure.
     #[error(transparent)]
     Gpu(#[from] GpuError),
@@ -38,13 +38,13 @@ pub enum PagedGqaQualificationError {
     #[error(transparent)]
     Precondition(#[from] DeviceBenchmarkError),
     /// Device behavior disagreed with the independent mathematical contract.
-    #[error("paged GQA qualification failed: {0}")]
+    #[error("paged GQA prefill qualification failed: {0}")]
     Mismatch(String),
 }
 
-/// Observable counts and worst error across every exact route.
+/// Observable counts and worst error across every exact shared prefill route.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PagedGqaQualification {
+pub struct PagedGqaPrefillQualification {
     /// Active FP32 outputs compared with the independent FP64 softmax.
     pub output_values: usize,
     /// Inactive FP32 output words proved untouched.
@@ -88,15 +88,18 @@ struct Fixture {
     query: Vec<f32>,
     key_pages: Vec<u8>,
     value_pages: Vec<u8>,
+    table_rows: Vec<u32>,
+    lengths: Vec<u32>,
 }
 
-/// Qualifies eager and captured paged GQA routes at exact `B=1..=8`.
-pub fn qualify_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificationError> {
+/// Qualifies eager and captured shared paged-GQA routes at exact `T=32/64/128`.
+pub fn qualify_paged_gqa_prefill()
+-> Result<PagedGqaPrefillQualification, PagedGqaPrefillQualificationError> {
     let _preflight = device_benchmark::preflight()?;
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
     if capability != (12, 0) {
-        return Err(PagedGqaQualificationError::Mismatch(format!(
+        return Err(PagedGqaPrefillQualificationError::Mismatch(format!(
             "device zero has compute capability {}.{}, expected 12.0",
             capability.0, capability.1
         )));
@@ -108,7 +111,7 @@ pub fn qualify_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificatio
     load_fixture(&arena, &stream, regions, &fixture)?;
     let op = PagedGqaOp::new(&context)?;
     let stable_addresses = addresses(&arena, regions)?;
-    let mut report = PagedGqaQualification {
+    let mut report = PagedGqaPrefillQualification {
         output_values: 0,
         untouched_values: 0,
         immutable_input_values: 0,
@@ -118,24 +121,24 @@ pub fn qualify_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificatio
         maximum_absolute_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
+    for tokens in PREFILL_ROUTES {
         reset_output(&arena, &stream, regions)?;
-        launch(&op, &arena, &stream, regions, batch)?;
+        launch(&op, &arena, &stream, regions, tokens)?;
         let eager = arena.copy_to_host(&stream, regions.output)?;
-        verify_oracle(batch, &fixture, &eager, &mut report)?;
+        verify_oracle(tokens, &fixture, &eager, &mut report)?;
         verify_inputs(&arena, &stream, regions, &fixture, &mut report)?;
 
         reset_output(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
+        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, tokens))?;
         graph.launch(&stream)?;
         let replay = arena.copy_to_host(&stream, regions.output)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay(tokens, &eager, &replay, &mut report)?;
         verify_inputs(&arena, &stream, regions, &fixture, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
-            return Err(PagedGqaQualificationError::Mismatch(format!(
-                "device addresses changed while qualifying B={batch}"
+            return Err(PagedGqaPrefillQualificationError::Mismatch(format!(
+                "device addresses changed while qualifying T={tokens}"
             )));
         }
     }
@@ -148,15 +151,15 @@ pub fn qualify_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificatio
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let query = layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let query = layout.reserve(MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
     let plane_bytes =
         PHYSICAL_PAGES * Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM;
     let key_pages = layout.reserve(plane_bytes, ALIGNMENT)?;
     let value_pages = layout.reserve(plane_bytes, ALIGNMENT)?;
     let block_tables = layout.reserve(TABLE_ROWS * TABLE_STRIDE, ALIGNMENT)?;
-    let table_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
-    let lengths = layout.reserve(MAX_BATCH, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let table_rows = layout.reserve(MAX_TOKENS, ALIGNMENT)?;
+    let lengths = layout.reserve(MAX_TOKENS, ALIGNMENT)?;
+    let output = layout.reserve(MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -173,11 +176,11 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
 }
 
 fn fixture() -> Fixture {
-    let query = (0..MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS)
+    let query = (0..MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS)
         .map(|index| {
             let token = index / Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
             let head = index / Qwen38_27B::HEAD_DIM % Qwen38_27B::NUM_ATTENTION_HEADS;
-            QUERY_PATTERN[(index + head * 3 + token * 5) & 15] * (1.0 - token as f32 / 16.0)
+            QUERY_PATTERN[(index + head * 3 + token * 5) & 15] * (1.0 - (token & 15) as f32 / 32.0)
         })
         .collect::<Vec<_>>();
     let plane_bytes =
@@ -197,11 +200,19 @@ fn fixture() -> Fixture {
             }
         }
     }
+    let table_rows = (0..MAX_TOKENS)
+        .map(|token| ((token / 2) % TABLE_ROWS) as u32)
+        .collect();
+    let lengths = (0..MAX_TOKENS)
+        .map(|token| (PREFIX_TOKENS + token + 1) as u32)
+        .collect();
 
     Fixture {
         query,
         key_pages,
         value_pages,
+        table_rows,
+        lengths,
     }
 }
 
@@ -215,8 +226,8 @@ fn load_fixture(
     arena.copy_from_host(stream, regions.key_pages, &fixture.key_pages)?;
     arena.copy_from_host(stream, regions.value_pages, &fixture.value_pages)?;
     arena.copy_from_host(stream, regions.block_tables, &BLOCK_TABLES)?;
-    arena.copy_from_host(stream, regions.table_rows, &TABLE_ROW_IDS)?;
-    arena.copy_from_host(stream, regions.lengths, &LENGTHS)
+    arena.copy_from_host(stream, regions.table_rows, &fixture.table_rows)?;
+    arena.copy_from_host(stream, regions.lengths, &fixture.lengths)
 }
 
 fn reset_output(
@@ -244,14 +255,14 @@ fn launch(
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
-    batch: usize,
+    tokens: usize,
 ) -> GpuResult<()> {
-    // SAFETY: all allocations cover the maximum batch, every length is
-    // nonzero and fits three table entries, and every physical page is owned.
+    // SAFETY: all allocations cover T=128. Adjacent tokens share a table row,
+    // every causal length is nonzero and fits three entries, and all pages are owned.
     unsafe {
-        op.launch(
+        op.launch_prefill_shared(
             stream,
-            batch,
+            tokens,
             arena.address(regions.query)?,
             arena.address(regions.key_pages)?,
             arena.address(regions.value_pages)?,
@@ -267,13 +278,13 @@ fn launch(
 }
 
 fn verify_oracle(
-    batch: usize,
+    tokens: usize,
     fixture: &Fixture,
     observed: &[f32],
-    report: &mut PagedGqaQualification,
-) -> Result<(), PagedGqaQualificationError> {
-    let expected = oracle(batch, fixture)?;
-    let active = batch * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
+    report: &mut PagedGqaPrefillQualification,
+) -> Result<(), PagedGqaPrefillQualificationError> {
+    let expected = oracle(tokens, fixture);
+    let active = tokens * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
     for (index, (&actual, &expected)) in observed[..active]
         .iter()
         .zip(&expected[..active])
@@ -283,15 +294,15 @@ fn verify_oracle(
         report.maximum_absolute_error = report.maximum_absolute_error.max(error);
         let tolerance = 0.002f32.max(expected.abs() * 0.003);
         if !actual.is_finite() || error > tolerance {
-            return Err(PagedGqaQualificationError::Mismatch(format!(
-                "output at B={batch}, index={index}: device={actual}, oracle={expected}, tolerance={tolerance}"
+            return Err(PagedGqaPrefillQualificationError::Mismatch(format!(
+                "output at T={tokens}, index={index}: device={actual}, oracle={expected}, tolerance={tolerance}"
             )));
         }
     }
     for (index, value) in observed[active..].iter().enumerate() {
         if value.to_bits() != F32_SENTINEL_BITS {
-            return Err(PagedGqaQualificationError::Mismatch(format!(
-                "B={batch} modified inactive output word {}",
+            return Err(PagedGqaPrefillQualificationError::Mismatch(format!(
+                "T={tokens} modified inactive output word {}",
                 active + index
             )));
         }
@@ -302,12 +313,12 @@ fn verify_oracle(
     Ok(())
 }
 
-fn oracle(batch: usize, fixture: &Fixture) -> Result<Vec<f32>, PagedGqaQualificationError> {
+fn oracle(tokens: usize, fixture: &Fixture) -> Vec<f32> {
     let mut output =
-        vec![f32::from_bits(F32_SENTINEL_BITS); MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS];
-    for token in 0..batch {
-        let row = TABLE_ROW_IDS[token] as usize;
-        let length = LENGTHS[token] as usize;
+        vec![f32::from_bits(F32_SENTINEL_BITS); MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS];
+    for token in 0..tokens {
+        let row = fixture.table_rows[token] as usize;
+        let length = fixture.lengths[token] as usize;
         for query_head in 0..Qwen38_27B::NUM_ATTENTION_HEADS {
             let kv_head = query_head / (Qwen38_27B::NUM_ATTENTION_HEADS / Qwen38_27B::NUM_KV_HEADS);
             let query_base =
@@ -353,7 +364,7 @@ fn oracle(batch: usize, fixture: &Fixture) -> Result<Vec<f32>, PagedGqaQualifica
         }
     }
 
-    Ok(output)
+    output
 }
 
 fn decode_e4m3(code: u8) -> f64 {
@@ -382,8 +393,8 @@ fn verify_inputs(
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
     fixture: &Fixture,
-    report: &mut PagedGqaQualification,
-) -> Result<(), PagedGqaQualificationError> {
+    report: &mut PagedGqaPrefillQualification,
+) -> Result<(), PagedGqaPrefillQualificationError> {
     macro_rules! check {
         ($region:expr, $expected:expr, $name:literal) => {{
             let actual = arena.copy_to_host(stream, $region)?;
@@ -392,7 +403,7 @@ fn verify_inputs(
                 .zip($expected)
                 .position(|(actual, expected)| actual != expected)
             {
-                return Err(PagedGqaQualificationError::Mismatch(format!(
+                return Err(PagedGqaPrefillQualificationError::Mismatch(format!(
                     "read-only {} changed at index {index}",
                     $name
                 )));
@@ -405,26 +416,26 @@ fn verify_inputs(
     check!(regions.key_pages, &fixture.key_pages, "key cache");
     check!(regions.value_pages, &fixture.value_pages, "value cache");
     check!(regions.block_tables, &BLOCK_TABLES, "block tables");
-    check!(regions.table_rows, &TABLE_ROW_IDS, "table rows");
-    check!(regions.lengths, &LENGTHS, "lengths");
+    check!(regions.table_rows, &fixture.table_rows, "table rows");
+    check!(regions.lengths, &fixture.lengths, "lengths");
 
     Ok(())
 }
 
 fn verify_replay(
-    batch: usize,
+    tokens: usize,
     eager: &[f32],
     replay: &[f32],
-    report: &mut PagedGqaQualification,
-) -> Result<(), PagedGqaQualificationError> {
+    report: &mut PagedGqaPrefillQualification,
+) -> Result<(), PagedGqaPrefillQualificationError> {
     if let Some(index) = replay
         .iter()
         .map(|value| value.to_bits())
         .zip(eager.iter().map(|value| value.to_bits()))
         .position(|(actual, expected)| actual != expected)
     {
-        return Err(PagedGqaQualificationError::Mismatch(format!(
-            "B={batch} graph output word {index} differs from eager"
+        return Err(PagedGqaPrefillQualificationError::Mismatch(format!(
+            "T={tokens} graph output word {index} differs from eager"
         )));
     }
     report.graph_replay_values += replay.len();
@@ -438,24 +449,25 @@ fn verify_no_post_warmup_allocation(
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
-) -> Result<(), PagedGqaQualificationError> {
-    let graphs = (1..=MAX_BATCH)
-        .map(|batch| CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch)))
+) -> Result<(), PagedGqaPrefillQualificationError> {
+    let graphs = PREFILL_ROUTES
+        .iter()
+        .map(|&tokens| CudaGraph::capture(stream, || launch(op, arena, stream, regions, tokens)))
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
         graph.launch(stream)?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
-    for _ in 0..4 {
-        for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
-            graphs[batch - 1].launch(stream)?;
+    for _ in 0..8 {
+        for &route in &[2usize, 0, 1] {
+            graphs[route].launch(stream)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
     let after = device_memory_info(context)?;
     if before != after {
-        return Err(PagedGqaQualificationError::Mismatch(format!(
+        return Err(PagedGqaPrefillQualificationError::Mismatch(format!(
             "device memory changed after warmup: before={before:?}, after={after:?}"
         )));
     }
@@ -465,32 +477,35 @@ fn verify_no_post_warmup_allocation(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_BATCH, PHYSICAL_PAGES, Qwen38_27B, TABLE_ROWS, TABLE_STRIDE, layout, qualify_paged_gqa,
-    };
+    use super::{MAX_TOKENS, PREFILL_ROUTES, Qwen38_27B, layout, qualify_paged_gqa_prefill};
     use tuisko_model::Arch;
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn paged_gqa_suite_exact_batches_match_independent_oracles_and_graph_replay()
-    -> Result<(), super::PagedGqaQualificationError> {
-        let report = qualify_paged_gqa()?;
-        let active_tokens = (1..=MAX_BATCH).sum::<usize>();
+    fn paged_gqa_suite_exact_prefill_routes_match_independent_oracles_and_graph_replay()
+    -> Result<(), super::PagedGqaPrefillQualificationError> {
+        let report = qualify_paged_gqa_prefill()?;
+        let active_tokens = PREFILL_ROUTES.iter().sum::<usize>();
         let output_per_token = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
 
         assert_eq!(report.output_values, active_tokens * output_per_token);
-        assert_eq!(report.untouched_values, 172_032);
+        assert_eq!(
+            report.untouched_values,
+            PREFILL_ROUTES
+                .iter()
+                .map(|tokens| (MAX_TOKENS - tokens) * output_per_token)
+                .sum::<usize>()
+        );
         assert_eq!(
             report.graph_replay_values,
-            MAX_BATCH * MAX_BATCH * output_per_token
+            PREFILL_ROUTES.len() * MAX_TOKENS * output_per_token
         );
-        assert_eq!(TABLE_ROWS * TABLE_STRIDE, PHYSICAL_PAGES);
-        assert_eq!(report.arena_bytes - report.padding_bytes, 3_539_104);
-        assert_eq!(report.immutable_input_values, 51_118_720);
+        assert_eq!(report.arena_bytes - report.padding_bytes, 9_438_304);
+        assert_eq!(report.immutable_input_values, 23_594_640);
         assert!(report.maximum_absolute_error <= 0.003);
         let (arena, regions) = layout()?;
-        assert_eq!(arena.byte_len(), 3_539_712);
-        assert_eq!(arena.byte_len() - regions.payload_bytes(), 608);
+        assert_eq!(arena.byte_len(), 9_438_464);
+        assert_eq!(arena.byte_len() - regions.payload_bytes(), 160);
 
         Ok(())
     }

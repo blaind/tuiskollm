@@ -1087,9 +1087,10 @@ fn qualify_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "paged_gqa::tests",
+            "paged_gqa_suite_",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_paged_gqa(root)
@@ -2781,7 +2782,12 @@ pub(crate) fn prepare_remote_qualify(
     gpu: gpu_target::GpuTarget,
     test_filter: &str,
 ) -> Result<RemoteQualify, Box<dyn Error>> {
-    let test_args = [test_filter, "--include-ignored", "--nocapture"];
+    let test_args = [
+        test_filter,
+        "--include-ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ];
     let arguments = vec![
         "test".to_string(),
         "--arch".to_string(),
@@ -2804,6 +2810,7 @@ pub(crate) fn prepare_remote_qualify(
         test_args[0].to_string(),
         test_args[1].to_string(),
         test_args[2].to_string(),
+        test_args[3].to_string(),
     ];
     let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
     let messages = run_oxide_capture(root, &argument_refs)?;
@@ -4226,7 +4233,16 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("paged_gqa_exact_TID_"))
         .collect::<Vec<_>>();
+    let prefill = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("paged_gqa_prefill_shared_exact_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("paged GQA", attention.len(), 8)?;
+    require_count("shared prefill paged GQA", prefill.len(), 3)?;
     for entry in &attention {
         if !entry.body.contains(".reqntid 32, 1, 1") || !entry.body.contains(".minnctapersm 16") {
             return Err(format!(
@@ -4234,6 +4250,18 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
                 entry.name
             )
             .into());
+        }
+    }
+    for entry in &prefill {
+        if !entry.body.contains(".reqntid 384, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 384-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        if !entry.body.contains("__dynamic_smem__") {
+            return Err(format!("entry `{}` lost dynamic shared memory", entry.name).into());
         }
     }
 
@@ -4261,6 +4289,7 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
     let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
     let sass = String::from_utf8(sass.stdout)?;
     let mut registers = Vec::new();
+    let mut prefill_registers = Vec::new();
     let mut shared = Vec::new();
     for entry in attention {
         let resource = resources
@@ -4280,13 +4309,35 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    for entry in prefill {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        prefill_registers.push(resource.registers);
+        shared.push(resource.shared);
+
+        let body = sass_function_body(&sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        for instruction in ["F2FP.F16.E4M3.UNPACK_B", "SHFL.BFLY", "MUFU.EX2", "LDGSTS"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+    }
     registers.sort_unstable();
+    prefill_registers.sort_unstable();
     require_registers(&baseline, "attention_registers", &registers)?;
+    if baseline.contains_key("prefill_shared_registers") {
+        require_registers(&baseline, "prefill_shared_registers", &prefill_registers)?;
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "paged GQA gate passed: 8 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/SHFL/EX2 present",
-        registers, shared
+        "paged GQA gate passed: 8 decode + 3 shared prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/SHFL/EX2/LDGSTS present",
+        registers, prefill_registers, shared
     );
     Ok(())
 }

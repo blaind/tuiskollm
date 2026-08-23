@@ -1,4 +1,4 @@
-//! Direct timings for exact short-context paged GQA graph routes.
+//! Direct timings for exact decode and shared-prefill paged-GQA graph routes.
 
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
@@ -15,6 +15,9 @@ use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, PagedGqaOp};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const MAX_TOKENS: usize = 128;
+const PREFILL_ROUTES: [usize; 3] = [32, 64, 128];
+const PREFIX_TOKENS: usize = 2;
 const ALIGNMENT: usize = 256;
 const PHYSICAL_PAGES: usize = 24;
 const TABLE_ROWS: usize = 8;
@@ -22,8 +25,8 @@ const TABLE_STRIDE: usize = 3;
 const CONTEXT_TOKENS: usize = 130;
 const KEY_SCALE: f32 = 0.03125;
 const VALUE_SCALE: f32 = 0.0625;
-const TABLE_ROW_IDS: [u32; MAX_BATCH] = [7, 0, 5, 2, 6, 1, 4, 3];
-const LENGTHS: [u32; MAX_BATCH] = [CONTEXT_TOKENS as u32; MAX_BATCH];
+const DECODE_TABLE_ROW_IDS: [u32; MAX_BATCH] = [7, 0, 5, 2, 6, 1, 4, 3];
+const DECODE_LENGTHS: [u32; MAX_BATCH] = [CONTEXT_TOKENS as u32; MAX_BATCH];
 const BLOCK_TABLES: [u32; TABLE_ROWS * TABLE_STRIDE] = [
     17, 2, 21, 4, 15, 0, 23, 7, 12, 1, 18, 9, 14, 5, 22, 8, 19, 3, 20, 6, 13, 10, 16, 11,
 ];
@@ -39,8 +42,10 @@ struct Regions {
     key_pages: ArenaRegion<u8>,
     value_pages: ArenaRegion<u8>,
     block_tables: ArenaRegion<u32>,
-    table_rows: ArenaRegion<u32>,
-    lengths: ArenaRegion<u32>,
+    decode_table_rows: ArenaRegion<u32>,
+    decode_lengths: ArenaRegion<u32>,
+    prefill_table_rows: ArenaRegion<u32>,
+    prefill_lengths: ArenaRegion<u32>,
     output: ArenaRegion<f32>,
 }
 
@@ -50,8 +55,10 @@ impl Regions {
             + self.key_pages.byte_len()
             + self.value_pages.byte_len()
             + self.block_tables.byte_len()
-            + self.table_rows.byte_len()
-            + self.lengths.byte_len()
+            + self.decode_table_rows.byte_len()
+            + self.decode_lengths.byte_len()
+            + self.prefill_table_rows.byte_len()
+            + self.prefill_lengths.byte_len()
             + self.output.byte_len()
     }
 
@@ -65,13 +72,16 @@ struct Addresses {
     key_pages: *const u8,
     value_pages: *const u8,
     block_tables: *const u32,
-    table_rows: *const u32,
-    lengths: *const u32,
+    decode_table_rows: *const u32,
+    decode_lengths: *const u32,
+    prefill_table_rows: *const u32,
+    prefill_lengths: *const u32,
     output: *mut f32,
 }
 
 struct RouteGraphs {
-    batch: usize,
+    tokens: usize,
+    prefill: bool,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
@@ -104,7 +114,18 @@ impl Session {
         let op = PagedGqaOp::new(&context)?;
         let addresses = addresses(&arena, regions)?;
         let routes = (1..=MAX_BATCH)
-            .map(|batch| capture_route(&op, &stream, &addresses, batch, repeated_operations))
+            .map(|tokens| (tokens, false))
+            .chain(PREFILL_ROUTES.into_iter().map(|tokens| (tokens, true)))
+            .map(|(tokens, prefill)| {
+                capture_route(
+                    &op,
+                    &stream,
+                    &addresses,
+                    tokens,
+                    prefill,
+                    repeated_operations,
+                )
+            })
             .collect::<GpuResult<Vec<_>>>()?;
         let timer = GpuTimer::new(&context)?;
 
@@ -132,15 +153,27 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
-                let mut workload = BenchmarkWorkload::warm_operator_decode(route.batch as u32);
-                workload.context_tokens = Some(CONTEXT_TOKENS as u64);
+                let (shape, mut workload, context_tokens) = if route.prefill {
+                    (
+                        format!("T={}", route.tokens),
+                        BenchmarkWorkload::warm_operator_prefill(route.tokens as u64),
+                        PREFIX_TOKENS + route.tokens,
+                    )
+                } else {
+                    (
+                        format!("B={}", route.tokens),
+                        BenchmarkWorkload::warm_operator_decode(route.tokens as u32),
+                        CONTEXT_TOKENS,
+                    )
+                };
+                workload.context_tokens = Some(context_tokens as u64);
                 ExactDeviceCase::new(
                     "paged_gqa/online_softmax_e4m3_kv",
-                    format!("B={}", route.batch),
+                    shape,
                     workload,
                     OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
+                        logical_bytes(route.tokens, route.prefill),
+                        route.tokens as u64,
                         "token",
                     ),
                     &route.leaf,
@@ -153,15 +186,17 @@ impl Session {
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let query = layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let query = layout.reserve(MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
     let plane_bytes =
         PHYSICAL_PAGES * Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM;
     let key_pages = layout.reserve(plane_bytes, ALIGNMENT)?;
     let value_pages = layout.reserve(plane_bytes, ALIGNMENT)?;
     let block_tables = layout.reserve(TABLE_ROWS * TABLE_STRIDE, ALIGNMENT)?;
-    let table_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
-    let lengths = layout.reserve(MAX_BATCH, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let decode_table_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
+    let decode_lengths = layout.reserve(MAX_BATCH, ALIGNMENT)?;
+    let prefill_table_rows = layout.reserve(MAX_TOKENS, ALIGNMENT)?;
+    let prefill_lengths = layout.reserve(MAX_TOKENS, ALIGNMENT)?;
+    let output = layout.reserve(MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -170,15 +205,17 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
             key_pages,
             value_pages,
             block_tables,
-            table_rows,
-            lengths,
+            decode_table_rows,
+            decode_lengths,
+            prefill_table_rows,
+            prefill_lengths,
             output,
         },
     ))
 }
 
 fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuResult<()> {
-    let query = (0..MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS)
+    let query = (0..MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS)
         .map(|index| QUERY_VALUES[(index + index / Qwen38_27B::HEAD_DIM) & 7])
         .collect::<Vec<_>>();
     let plane_bytes =
@@ -194,8 +231,16 @@ fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> G
     arena.copy_from_host(stream, regions.key_pages, &key_pages)?;
     arena.copy_from_host(stream, regions.value_pages, &value_pages)?;
     arena.copy_from_host(stream, regions.block_tables, &BLOCK_TABLES)?;
-    arena.copy_from_host(stream, regions.table_rows, &TABLE_ROW_IDS)?;
-    arena.copy_from_host(stream, regions.lengths, &LENGTHS)
+    let prefill_table_rows = (0..MAX_TOKENS)
+        .map(|token| ((token / 2) % TABLE_ROWS) as u32)
+        .collect::<Vec<_>>();
+    let prefill_lengths = (0..MAX_TOKENS)
+        .map(|token| (PREFIX_TOKENS + token + 1) as u32)
+        .collect::<Vec<_>>();
+    arena.copy_from_host(stream, regions.decode_table_rows, &DECODE_TABLE_ROW_IDS)?;
+    arena.copy_from_host(stream, regions.decode_lengths, &DECODE_LENGTHS)?;
+    arena.copy_from_host(stream, regions.prefill_table_rows, &prefill_table_rows)?;
+    arena.copy_from_host(stream, regions.prefill_lengths, &prefill_lengths)
 }
 
 fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<Addresses> {
@@ -204,8 +249,10 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<Addresses> {
         key_pages: arena.address(regions.key_pages)?,
         value_pages: arena.address(regions.value_pages)?,
         block_tables: arena.address(regions.block_tables)?,
-        table_rows: arena.address(regions.table_rows)?,
-        lengths: arena.address(regions.lengths)?,
+        decode_table_rows: arena.address(regions.decode_table_rows)?,
+        decode_lengths: arena.address(regions.decode_lengths)?,
+        prefill_table_rows: arena.address(regions.prefill_table_rows)?,
+        prefill_lengths: arena.address(regions.prefill_lengths)?,
         output: arena.address(regions.output)?,
     })
 }
@@ -214,19 +261,21 @@ fn capture_route(
     op: &PagedGqaOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    tokens: usize,
+    prefill: bool,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, batch))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, tokens, prefill))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, batch)?;
+            launch(op, stream, addresses, tokens, prefill)?;
         }
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        tokens,
+        prefill,
         leaf,
         repeated,
     })
@@ -236,39 +285,72 @@ fn launch(
     op: &PagedGqaOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    tokens: usize,
+    prefill: bool,
 ) -> GpuResult<()> {
     // SAFETY: the benchmark owns all 24 physical pages and each row's three
-    // table entries cover the fixed 130-token context.
-    unsafe {
-        op.launch(
-            stream,
-            batch,
-            addresses.query,
-            addresses.key_pages,
-            addresses.value_pages,
-            addresses.block_tables,
-            addresses.table_rows,
-            TABLE_STRIDE,
-            addresses.lengths,
-            addresses.output,
-            KEY_SCALE,
-            VALUE_SCALE,
-        )
+    // entries cover the fixed decode or causal shared-prefill context.
+    if prefill {
+        unsafe {
+            op.launch_prefill_shared(
+                stream,
+                tokens,
+                addresses.query,
+                addresses.key_pages,
+                addresses.value_pages,
+                addresses.block_tables,
+                addresses.prefill_table_rows,
+                TABLE_STRIDE,
+                addresses.prefill_lengths,
+                addresses.output,
+                KEY_SCALE,
+                VALUE_SCALE,
+            )
+        }
+    } else {
+        unsafe {
+            op.launch(
+                stream,
+                tokens,
+                addresses.query,
+                addresses.key_pages,
+                addresses.value_pages,
+                addresses.block_tables,
+                addresses.decode_table_rows,
+                TABLE_STRIDE,
+                addresses.decode_lengths,
+                addresses.output,
+                KEY_SCALE,
+                VALUE_SCALE,
+            )
+        }
     }
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(tokens: usize, prefill: bool) -> usize {
     let query = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>();
-    let cache = 2 * Qwen38_27B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * Qwen38_27B::HEAD_DIM;
-    let page_metadata =
-        2 * size_of::<u32>() + Qwen38_27B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * size_of::<u32>();
     let output = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>();
+    if prefill {
+        let shared_positions = (0..tokens)
+            .step_by(2)
+            .map(|first_token| PREFIX_TOKENS + first_token + 2)
+            .sum::<usize>();
+        let cache = 2 * Qwen38_27B::NUM_KV_HEADS * shared_positions * Qwen38_27B::HEAD_DIM;
+        let page_metadata =
+            Qwen38_27B::NUM_KV_HEADS * (tokens + tokens / 2 + shared_positions) * size_of::<u32>();
 
-    batch * (query + cache + page_metadata + output)
+        tokens * (query + output) + cache + page_metadata
+    } else {
+        let scanned_positions = tokens * CONTEXT_TOKENS;
+        let cache = 2 * Qwen38_27B::NUM_ATTENTION_HEADS * scanned_positions * Qwen38_27B::HEAD_DIM;
+        let page_metadata = 2 * tokens * size_of::<u32>()
+            + Qwen38_27B::NUM_ATTENTION_HEADS * scanned_positions * size_of::<u32>();
+
+        tokens * (query + output) + cache + page_metadata
+    }
 }
 
-/// Measures every exact paged GQA batch at a 130-token, three-page context.
+/// Measures exact decode batches and shared `T=32/64/128` paged-GQA prefill tails.
 pub fn benchmark_paged_gqa(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
@@ -290,7 +372,7 @@ pub fn benchmark_paged_gqa(
         "paged_gqa/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         workspace_bytes,
-        "max_batch=8 query/output and three-page metadata",
+        "max_tokens=128 query/output plus separate compact-decode and causal-prefill metadata",
     )?;
     memory.register_owned(
         "paged_gqa/alignment_padding",
@@ -311,7 +393,7 @@ pub fn benchmark_paged_gqa(
         BenchmarkReportSpec {
             suite: "bench-paged-gqa",
             classification: "performance_sensitive_stateful_leaf",
-            timing_scope: "paired Rust submission/completion, production graph, and repeated-operation graph at context=130",
+            timing_scope: "paired Rust submission/completion, production graph, and repeated-operation graph at decode context=130 or causal prefill context",
         },
         preflight,
         baseline_sha256,
@@ -325,25 +407,34 @@ pub fn benchmark_paged_gqa(
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTEXT_TOKENS, MAX_BATCH, layout, logical_bytes};
+    use super::{CONTEXT_TOKENS, MAX_BATCH, MAX_TOKENS, PREFIX_TOKENS, layout, logical_bytes};
     use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
-    fn byte_accounting_covers_every_query_head_cache_scan() {
+    fn paged_gqa_suite_byte_accounting_covers_decode_and_shared_prefill_traffic() {
         let per_token = 2 * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS * 4
             + 2 * Qwen38_27B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * Qwen38_27B::HEAD_DIM
             + 2 * 4
             + Qwen38_27B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * 4;
 
-        assert_eq!(logical_bytes(1), per_token);
-        assert_eq!(logical_bytes(MAX_BATCH), MAX_BATCH * per_token);
+        assert_eq!(logical_bytes(1, false), per_token);
+        assert_eq!(logical_bytes(MAX_BATCH, false), MAX_BATCH * per_token);
+
+        let shared_positions = (0..MAX_TOKENS)
+            .step_by(2)
+            .map(|first_token| PREFIX_TOKENS + first_token + 2)
+            .sum::<usize>();
+        let prefill = 2 * MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS * 4
+            + 2 * Qwen38_27B::NUM_KV_HEADS * shared_positions * Qwen38_27B::HEAD_DIM
+            + Qwen38_27B::NUM_KV_HEADS * (MAX_TOKENS + MAX_TOKENS / 2 + shared_positions) * 4;
+        assert_eq!(logical_bytes(MAX_TOKENS, true), prefill);
     }
 
     #[test]
-    fn arena_accounting_exposes_every_padding_byte() {
+    fn paged_gqa_suite_arena_accounting_exposes_every_padding_byte() {
         let (layout, regions) = layout().unwrap();
-        assert_eq!(layout.byte_len(), 3_539_712);
-        assert_eq!(regions.payload_bytes(), 3_539_104);
+        assert_eq!(layout.byte_len(), 9_438_976);
+        assert_eq!(regions.payload_bytes(), 9_438_368);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 608);
     }
 }
