@@ -6,6 +6,9 @@ use crate::device::fp8_swiglu::{
     fp8_swiglu_decode as fp8_swiglu_decode_body, fp8_swiglu_decode_b1,
     fp8_swiglu_mma as fp8_swiglu_mma_body,
 };
+use crate::fp8::swiglu_tma::{
+    DenseFp8SwiGluTmaMaps, DenseFp8SwiGluTmaRoute, TOKENS as MACRO_TOKENS, ptx_name as tma_ptx_name,
+};
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -302,6 +305,8 @@ pub struct DenseFp8SwiGluOp<A: Sm120Arch = Qwen38_27B> {
     t64: PreparedLaunch<kernels::__fp8_swiglu_mma_t64_CudaKernel>,
     t128_quantize: PreparedLaunch<kernels::__fp8_swiglu_quantize_CudaKernel<A>>,
     t128: PreparedLaunch<kernels::__fp8_swiglu_mma_t128_CudaKernel>,
+    t1024_quantize: PreparedLaunch<kernels::__fp8_swiglu_quantize_CudaKernel<A>>,
+    t1024: DenseFp8SwiGluTmaRoute,
 }
 
 impl<A: Sm120Arch> DenseFp8SwiGluOp<A> {
@@ -348,6 +353,8 @@ impl<A: Sm120Arch> DenseFp8SwiGluOp<A> {
                     PREFILL_K64_SHARED_BYTES,
                 ))
                 .map_err(|source| GpuError::launch("preparing dense-FP8 SwiGLU T=128", source))?,
+            t1024_quantize: prepare_quantize::<A, MACRO_TOKENS>(&module)?,
+            t1024: DenseFp8SwiGluTmaRoute::new(context)?,
             module,
         })
     }
@@ -449,10 +456,52 @@ impl<A: Sm120Arch> DenseFp8SwiGluOp<A> {
             }
         }
     }
+
+    /// Dynamically quantizes and applies the exact T=1024 TMA route.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`] at exactly 1024 rows.
+    /// `maps` was constructed for the same `activation_codes` and
+    /// `weight_codes` addresses, which remain live and stable through replay.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_macro_prefill(
+        &self,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+        maps: &DenseFp8SwiGluTmaMaps,
+    ) -> GpuResult<()> {
+        if maps.activation_codes() != activation_codes.addr()
+            || maps.weight_codes() != weight_codes.addr()
+        {
+            return Err(GpuError::invalid_launch(
+                "dense-FP8 SwiGLU tensor maps do not match the launch addresses",
+            ));
+        }
+        self.module
+            .fp8_swiglu_quantize::<A>(
+                stream,
+                &self.t1024_quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u16>(),
+                activation_scales,
+            )
+            .map_err(|source| GpuError::launch("launching dense-FP8 quantization", source))?;
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.t1024
+                .launch(stream, maps, activation_scales, weight_scales, output)
+        }
+    }
 }
 
 /// PTX symbols retained for quantization and every exact dense-FP8 SwiGLU route.
-pub(crate) fn fp8_swiglu_ptx_names() -> [&'static str; 12] {
+pub(crate) fn fp8_swiglu_ptx_names() -> [&'static str; 13] {
     [
         kernels::fp8_swiglu_quantize_ptx_name::<Qwen38_27B>(),
         kernels::fp8_swiglu_decode_ptx_name::<Qwen38_27B, 1>(),
@@ -466,6 +515,7 @@ pub(crate) fn fp8_swiglu_ptx_names() -> [&'static str; 12] {
         "fp8_swiglu_mma_t32",
         "fp8_swiglu_mma_t64",
         "fp8_swiglu_mma_t128",
+        tma_ptx_name(),
     ]
 }
 
@@ -515,7 +565,7 @@ mod tests {
         let names = fp8_swiglu_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 13);
         assert_eq!(unique.len(), names.len());
     }
 }

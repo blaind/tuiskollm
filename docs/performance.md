@@ -8,7 +8,7 @@ The available device suites cover zero-centered residual/RMSNorm at exact `B=1..
 dynamic-quantize FP8 QKV at exact `B=1..8`, `T=16` MTP, and `T=32,64,128,1024` prefill widths,
 GDN Q/K/V/Z input projection at exact `B=1..8`, the full-vocabulary FP8 LM head at exact `B=1..8`,
 dense-FP8 gate/up SwiGLU at exact
-`B=1..8` and `T=32,64,128`, dense-FP8 down and GDN control/convolution at exact `B=1..8`, and the
+`B=1..8` and `T=32,64,128,1024`, dense-FP8 down and GDN control/convolution at exact `B=1..8`, and the
 GDN recurrence and source-native output projection at exact `B=1..8`, plus the source-backed
 dense-FP8 MLP, complete layer-60 GDN, and final-norm plus LM-head owners. NVFP4 gate/up SwiGLU
 uses the exact retained A16 and W4A4 decode schedules at `B=1..8`; NVFP4 down projection consumes
@@ -472,8 +472,9 @@ includes one query read per active partition, one K/V load per 32-row/query-head
 length/table/page metadata reads, and both the producer writes and reducer reads of every complete
 FP32 partial state. Macro `T=1024/P=4` cases use the same accounting at contexts 32,768 and 98,304;
 their resident maximum workspace still covers every qualified `P=1,2,4,8,16` route.
-Dense-FP8-SwiGLU `T=32,64,128` cases are `operator/prefill` cases with prompt and context lengths
-equal to the active rows. Concurrency, output, and prefix cache do not apply to these leaf suites.
+Dense-FP8-SwiGLU `T=32,64,128,1024` cases are `operator/prefill` cases with prompt and context
+lengths equal to the active rows. The T=1024 route owns two 128-byte address-bound TMA descriptors;
+concurrency, output, and prefix cache do not apply to these leaf suites.
 
 ## Memory and capacity
 

@@ -1146,9 +1146,10 @@ fn qualify_fp8_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "fp8_swiglu",
+            "fp8_swiglu_suite_",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_fp8_swiglu(root)
@@ -4745,9 +4746,14 @@ fn gate_fp8_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
             )
         })
         .collect::<Vec<_>>();
+    let tma = entries
+        .iter()
+        .filter(|entry| entry.name == "fp8_swiglu_tma_t1024")
+        .collect::<Vec<_>>();
     require_count("dense-FP8 SwiGLU quantization", quantize.len(), 1)?;
     require_count("dense-FP8 SwiGLU decode", decode.len(), 8)?;
     require_count("dense-FP8 SwiGLU prefill", prefill.len(), 3)?;
+    require_count("dense-FP8 SwiGLU TMA prefill", tma.len(), 1)?;
 
     for entry in quantize.iter().chain(&decode).chain(&prefill) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
@@ -4757,6 +4763,17 @@ fn gate_fp8_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
+    }
+    if !tma[0].body.contains(".reqntid 288, 1, 1")
+        || !tma[0].body.contains(".minnctapersm 2")
+        || tma[0].body.contains(".reqnctapercluster")
+    {
+        return Err(
+            "dense-FP8 SwiGLU TMA lost its 288-thread/two-CTA single-CTA launch contract".into(),
+        );
+    }
+    if !ptx.contains(".extern .shared .align 128 .b8 __dynamic_smem_fp8_swiglu_tma_t1024[];") {
+        return Err("dense-FP8 SwiGLU TMA lost its 128-byte dynamic-shared alignment".into());
     }
 
     let artifact = sm120_gate_artifact(root)?;
@@ -4773,6 +4790,16 @@ fn gate_fp8_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
+    let tma_sass = sass_function_body(sass, tma[0].name)
+        .ok_or("cuobjdump omitted dense-FP8 SwiGLU TMA SASS")?;
+    for instruction in ["QMMA.16832.F32.E4M3.E4M3", "UTMALDG.2D", "MUFU.RCP"] {
+        if !tma_sass.contains(instruction) {
+            return Err(format!("dense-FP8 SwiGLU TMA lost required `{instruction}` SASS").into());
+        }
+    }
+    if tma_sass.contains("CALL.") {
+        return Err("dense-FP8 SwiGLU TMA regained an out-of-line device call".into());
+    }
 
     let quantize_resource = resources
         .get(quantize[0].name)
@@ -4783,32 +4810,57 @@ fn gate_fp8_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
         "quantize_registers",
         &[quantize_resource.registers],
     )?;
+    require_uniform_value(
+        &baseline,
+        "quantize_shared_bytes",
+        &[quantize_resource.shared],
+    )?;
 
     let mut decode_registers = Vec::new();
+    let mut decode_shared = Vec::new();
     for entry in &decode {
         let resource = resources
             .get(entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
         require_spill_free(entry.name, resource)?;
         decode_registers.push(resource.registers);
+        decode_shared.push(resource.shared);
     }
     decode_registers.sort_unstable();
     require_registers(&baseline, "decode_registers", &decode_registers)?;
+    require_uniform_value(&baseline, "decode_shared_bytes", &decode_shared)?;
 
     let mut prefill_registers = Vec::new();
+    let mut prefill_shared = Vec::new();
     for entry in &prefill {
         let resource = resources
             .get(entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
         require_spill_free(entry.name, resource)?;
         prefill_registers.push(resource.registers);
+        prefill_shared.push(resource.shared);
     }
     prefill_registers.sort_unstable();
     require_registers(&baseline, "prefill_registers", &prefill_registers)?;
+    require_uniform_value(&baseline, "prefill_shared_bytes", &prefill_shared)?;
+
+    let tma_resource = resources
+        .get(tma[0].name)
+        .ok_or("cuobjdump omitted dense-FP8 SwiGLU TMA resources")?;
+    require_spill_free(tma[0].name, tma_resource)?;
+    require_registers(&baseline, "tma_registers", &[tma_resource.registers])?;
+    require_uniform_value(&baseline, "tma_shared_bytes", &[tma_resource.shared])?;
 
     println!(
-        "dense-FP8 SwiGLU gate passed: 1 quantize + 8 decode + 3 prefill entries, REG {} / {:?} / {:?}, STACK:0 LOCAL:0",
-        quantize_resource.registers, decode_registers, prefill_registers
+        "dense-FP8 SwiGLU gate passed: 1 quantize + 8 decode + 3 tiled prefill + 1 TMA prefill entries, REG {} / {:?} / {:?} / {}, STACK:0 LOCAL:0, SHARED {} / {:?} / {:?} / {}, QMMA/TMA/RCP present",
+        quantize_resource.registers,
+        decode_registers,
+        prefill_registers,
+        tma_resource.registers,
+        quantize_resource.shared,
+        decode_shared,
+        prefill_shared,
+        tma_resource.shared,
     );
     Ok(())
 }
