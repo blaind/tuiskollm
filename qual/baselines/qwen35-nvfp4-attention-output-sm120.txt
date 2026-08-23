@@ -1,0 +1,9 @@
+cuda_oxide_commit=1f4d813719012d384f2db12b88efc9314c8bf50c
+rustc_release=1.96.0-nightly
+rustc_commit=55e86c996809902e8bbad512cfb4d2c18be446d9
+cuda_toolkit_release=13.3
+cuda_toolkit_version=13.3.73
+gate_registers=26,26,26,26,26,26,26,26
+projection_registers=40,92,96,96,96,105,106,116
+gate_shared_bytes=1024
+projection_shared_bytes=9216
