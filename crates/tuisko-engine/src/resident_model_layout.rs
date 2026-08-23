@@ -1,5 +1,11 @@
 //! Exact single-arena plan for the resident Qwen3.8 text model.
 
+mod program;
+
+#[cfg(feature = "qualification")]
+pub use program::ResidentModelObservables;
+pub use program::ResidentModelProgram;
+
 use crate::{
     EngineError, EngineResult, MAX_BATCH,
     full_attention_layer_layout::{CONTEXT_CAPACITY, PHYSICAL_PAGES, TABLE_STRIDE},

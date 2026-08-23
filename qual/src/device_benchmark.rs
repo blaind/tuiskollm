@@ -265,6 +265,22 @@ impl BenchmarkWorkload {
             execution: BenchmarkExecution::CudaGraph,
         }
     }
+
+    pub(crate) fn warm_model_decode(batch_size: u32, context_tokens: u64) -> Self {
+        Self {
+            scope: BenchmarkScope::Model,
+            phase: BenchmarkPhase::Decode,
+            batch_size: Some(batch_size),
+            concurrency: None,
+            active_tokens: Some(u64::from(batch_size)),
+            prompt_tokens: None,
+            context_tokens: Some(context_tokens),
+            output_tokens: None,
+            device_cache: DeviceCacheRegime::Warm,
+            prefix_cache: None,
+            execution: BenchmarkExecution::CudaGraph,
+        }
+    }
 }
 
 /// Kind of resident memory attributed by a benchmark owner.
@@ -593,6 +609,7 @@ pub(crate) struct ExactDeviceCase<'a> {
     units_per_operation: u64,
     unit: &'static str,
     leaf_graph: &'a CudaGraph,
+    preparation_graph: Option<&'a CudaGraph>,
     repeated: Option<RepeatedGraph<'a>>,
 }
 
@@ -613,8 +630,14 @@ impl<'a> ExactDeviceCase<'a> {
             units_per_operation: accounting.units_per_operation,
             unit: accounting.unit,
             leaf_graph,
+            preparation_graph: None,
             repeated,
         }
+    }
+
+    pub(crate) fn with_preparation(mut self, graph: &'a CudaGraph) -> Self {
+        self.preparation_graph = Some(graph);
+        self
     }
 }
 
@@ -1041,13 +1064,32 @@ pub(crate) fn measure_cases(
         for task_index in measurement_order(sample, tasks.len()) {
             match tasks[task_index] {
                 MeasurementTask::Leaf(case_index) => {
-                    let timing = timer.measure_with_host(stream, || {
+                    let case = &cases[case_index];
+                    let timing = if let Some(preparation) = case.preparation_graph {
+                        let mut timing = tuisko_gpu::GpuTiming {
+                            device: Duration::ZERO,
+                            host_submit: Duration::ZERO,
+                            host_completion: Duration::ZERO,
+                        };
                         for _ in 0..options.launches_per_sample {
-                            cases[case_index].leaf_graph.launch(stream)?;
+                            preparation.launch(stream)?;
+                            stream.synchronize().map_err(tuisko_gpu::GpuError::from)?;
+                            let operation = timer
+                                .measure_with_host(stream, || case.leaf_graph.launch(stream))?;
+                            timing.device += operation.device;
+                            timing.host_submit += operation.host_submit;
+                            timing.host_completion += operation.host_completion;
                         }
+                        timing
+                    } else {
+                        timer.measure_with_host(stream, || {
+                            for _ in 0..options.launches_per_sample {
+                                case.leaf_graph.launch(stream)?;
+                            }
 
-                        Ok(())
-                    })?;
+                            Ok(())
+                        })?
+                    };
                     let divisor = options.launches_per_sample;
                     samples[case_index]
                         .host_submit
@@ -1144,6 +1186,9 @@ fn measure_energy(
         let sampler = TelemetrySampler::start();
         let timing = timer.measure_with_host(stream, || {
             for _ in 0..operations {
+                if let Some(preparation) = case.preparation_graph {
+                    preparation.launch(stream)?;
+                }
                 case.leaf_graph.launch(stream)?;
             }
 

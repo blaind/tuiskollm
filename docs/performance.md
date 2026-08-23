@@ -14,9 +14,9 @@ the represented E2M1/E4M3 source planes through exact A16 routes at `B=1..8`. Fu
 preparation covers zero-centered normalization, the 64-wide three-axis MRoPE, and represented E4M3
 KV-cache append at exact `B=1..8`. Short-context paged GQA covers exact 24-query/4-KV-head,
 256-wide online-softmax decode across page boundaries at `B=1..8`; long-context partitioned decode
-and prefill remain separate future routes. The report schema is already shaped for future
-whole-model and serving cases, but those measurements do not exist until their production owners
-land.
+and prefill remain separate future routes. The resident text owner composes all 48 GDN layers, 16
+attention layers, source-routed MLPs, and the LM head into one directly timed graph at every exact
+`B=1..8`; serving cases remain future work.
 
 SM89 has separate remote-only diagnostic suites for the exact `[34816,5120]` NVFP4 gate/up,
 `[5120,17408]` down, and dynamic-quantize FP8 `[14336,5120]` QKV owners at `B=1..8`. The NVFP4
@@ -117,6 +117,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact-B graph, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact-B graphs, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT` | Check complete source layer-63 attention/MLP seams, represented KV cache, exact-B graphs, stable addresses, and owner allocation | terminal |
+| `cargo run -p xtask -- qualify-resident-model SNAPSHOT` | Check all 64 source routes, final source-backed formulas, persistent state/cache, exact-B whole-model graphs, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
 | `cargo run -p xtask -- bench-gdn-prepare` | Measure every exact control-plus-convolution graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-recurrence` | Measure every exact stateful recurrence graph | terminal or `--json PATH` |
@@ -129,6 +130,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- bench-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed layer-55 MLP graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT` | Measure every complete source-backed layer-60 graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-full-attention-layer SNAPSHOT` | Measure every complete source-backed layer-63 graph at a 131-token, three-page context | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-resident-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head graph at a 131-token context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
 | `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
@@ -201,12 +203,20 @@ allocation remain outside the timed region.
 131-token warm cache crosses both 64-token page seams; repeated paths overwrite the same admitted
 cache position so the timed geometry stays invariant.
 
+`bench-resident-model SNAPSHOT` times the complete production graph directly; it never derives a
+model latency from leaf medians. The current 131-token route exercises all 64 layers and the LM
+head with resident weights, shared workspace, recurrent state, and represented KV caches. It omits
+the repeated-operation graph because one complete graph is already long enough for CUDA-event
+resolution and duplicating hundreds of model nodes would measure a different owner. The production
+embedding-staging graph restores represented input rows before each sample and remains outside the
+timed whole-model replay.
+
 Add `--energy-seconds 2` for sustained energy sampling. At least three samples, one launch per
 sample, and a two-second energy window are required.
 
 ## What one timing means
 
-Each exact route reports four boundaries:
+Each exact route reports three boundaries and short routes also report a fourth:
 
 | Measurement | Boundary |
 |---|---|
@@ -215,7 +225,7 @@ Each exact route reports four boundaries:
 | `device_graph` | CUDA-event time per production graph replay |
 | `device_path` | CUDA-event time per complete operation inside one graph containing many repetitions |
 
-`device_graph` is the production graph-replay cost. `device_path` reduces CUDA-event timer
+`device_graph` is the production graph-replay cost. Optional `device_path` reduces CUDA-event timer
 quantization for a short operation; it is not a different production route. A residual-norm path is
 one kernel. An FP8 projection path is its production quantization and projection pair. The text
 endpoint path is final RMSNorm followed by dynamic activation quantization and the LM-head
@@ -467,10 +477,9 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 - Decode operator coverage is exact `B=1..8`; prefill remains limited to the explicitly listed
   dense-FP8 SwiGLU routes, and long-context attention needs separate routes.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
-- There is no whole-model, TTFT, inter-token-latency, concurrency, long-context, or end-to-end MTP
-  benchmark in this repository yet.
-- Power and energy are reportable, but energy is most meaningful after sustained model/server cases
-  land.
+- There is no TTFT, inter-token-latency, concurrency, long-context, or end-to-end MTP benchmark in
+  this repository yet.
+- Power and energy are reportable for the resident model; full-server energy remains future work.
 - `ncu` and Nsight Systems traces are diagnostic artifacts, not produced by the regression runner.
 
 These are scope statements, not inferred passes. New cases should be added with their production

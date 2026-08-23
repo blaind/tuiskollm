@@ -30,6 +30,22 @@ const ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/attention-qk-prepare-sm120.txt";
 const PAGED_GQA_RESOURCE_BASELINE: &str = "qual/baselines/paged-gqa-sm120.txt";
 const ATTENTION_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/attention-output-sm120.txt";
+const RESIDENT_MODEL_RESOURCE_BASELINES: &[&str] = &[
+    RESIDUAL_NORM_RESOURCE_BASELINE,
+    FP8_QKV_RESOURCE_BASELINE,
+    FP8_GDN_INPUT_RESOURCE_BASELINE,
+    FP8_LM_HEAD_RESOURCE_BASELINE,
+    FP8_SWIGLU_RESOURCE_BASELINE,
+    FP8_DOWN_RESOURCE_BASELINE,
+    NVFP4_SWIGLU_RESOURCE_BASELINE,
+    NVFP4_DOWN_RESOURCE_BASELINE,
+    GDN_PREPARE_RESOURCE_BASELINE,
+    GDN_RECURRENCE_RESOURCE_BASELINE,
+    GDN_OUTPUT_RESOURCE_BASELINE,
+    ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+    PAGED_GQA_RESOURCE_BASELINE,
+    ATTENTION_OUTPUT_RESOURCE_BASELINE,
+];
 const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
 const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build-sm120";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
@@ -173,7 +189,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-nvfp4-mlp|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-nvfp4-swiglu|gate-nvfp4-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-attention-output|perf|remote>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-nvfp4-mlp|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-resident-model|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-resident-model|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-nvfp4-swiglu|gate-nvfp4-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-attention-output|perf|remote>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -205,6 +221,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-dense-fp8-mlp") => qualify_dense_fp8_mlp(root, &remaining),
         Some("qualify-dense-fp8-gdn-layer") => qualify_dense_fp8_gdn_layer(root, &remaining),
         Some("qualify-full-attention-layer") => qualify_full_attention_layer(root, &remaining),
+        Some("qualify-resident-model") => qualify_resident_model(root, &remaining),
         Some("qualify-text-endpoint") => qualify_text_endpoint(root, &remaining),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
         Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
@@ -224,6 +241,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-dense-fp8-mlp") => bench_dense_fp8_mlp(root, &remaining),
         Some("bench-dense-fp8-gdn-layer") => bench_dense_fp8_gdn_layer(root, &remaining),
         Some("bench-full-attention-layer") => bench_full_attention_layer(root, &remaining),
+        Some("bench-resident-model") => bench_resident_model(root, &remaining),
         Some("bench-text-endpoint") => bench_text_endpoint(root, &remaining),
         Some("gate-residual-norm") if remaining.is_empty() => gate_residual_norm(root),
         Some("gate-fp8-qkv") if remaining.is_empty() => gate_fp8_qkv(root),
@@ -940,6 +958,55 @@ fn qualify_full_attention_layer(
     gate_fp8_down(root)
 }
 
+fn qualify_resident_model(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-resident-model SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "resident_model::tests::source_model_matches_final_oracle_and_exact_graph_replay",
+            "--include-ignored",
+            "--nocapture",
+        ],
+        Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_resident_model_resources(root)
+}
+
+fn gate_resident_model_resources(root: &Path) -> Result<(), Box<dyn Error>> {
+    gate_residual_norm(root)?;
+    gate_fp8_qkv(root)?;
+    gate_fp8_gdn_input(root)?;
+    gate_fp8_lm_head(root)?;
+    gate_fp8_swiglu(root)?;
+    gate_fp8_down(root)?;
+    gate_nvfp4_swiglu(root)?;
+    gate_nvfp4_down(root)?;
+    gate_gdn_prepare(root)?;
+    gate_gdn_recurrence(root)?;
+    gate_gdn_output(root)?;
+    gate_attention_qk_prepare(root)?;
+    gate_paged_gqa(root)?;
+    gate_attention_output(root)
+}
+
 fn qualify_fp8_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
     run_oxide(
         root,
@@ -1226,6 +1293,37 @@ fn bench_full_attention_layer(
     run_visible(
         Command::new(executable)
             .arg("full-attention-layer")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_resident_model(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err("usage: cargo run -p xtask -- bench-resident-model SNAPSHOT [options]".into());
+    };
+    build_sm120(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = Vec::new();
+    for baseline in RESIDENT_MODEL_RESOURCE_BASELINES {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("resident-model")
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
@@ -1576,6 +1674,15 @@ pub(crate) fn prepare_remote_full_attention_layer_benchmark(
             FP8_DOWN_RESOURCE_BASELINE,
         ],
     )
+}
+
+/// Locates the complete resident-model benchmark and binds every launched leaf resource.
+#[cfg(feature = "remote")]
+pub(crate) fn prepare_remote_resident_model_benchmark(
+    root: &Path,
+    gpu: gpu_target::GpuTarget,
+) -> Result<RemoteBenchmark, Box<dyn Error>> {
+    prepare_remote_benchmark_with_baselines(root, gpu, RESIDENT_MODEL_RESOURCE_BASELINES)
 }
 
 fn prepare_remote_benchmark_with_baselines(

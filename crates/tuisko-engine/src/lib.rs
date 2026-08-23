@@ -29,7 +29,7 @@ pub use layout::{EndpointLayout, MAX_BATCH};
 pub use nvfp4_mlp::Nvfp4MlpProgram;
 pub use nvfp4_mlp_layout::Nvfp4MlpLayout;
 pub use program::TextEndpointProgram;
-pub use resident_model_layout::{ResidentLayerKind, ResidentModelLayout};
+pub use resident_model_layout::{ResidentLayerKind, ResidentModelLayout, ResidentModelProgram};
 pub use sampling::{SampleDecision, Sampler, SamplingOptions};
 
 #[cfg(feature = "qualification")]
@@ -42,3 +42,5 @@ pub use full_attention_layer::FullAttentionLayerObservables;
 pub use nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
 #[cfg(feature = "qualification")]
 pub use program::EndpointObservables;
+#[cfg(feature = "qualification")]
+pub use resident_model_layout::ResidentModelObservables;
