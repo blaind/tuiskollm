@@ -3,8 +3,8 @@
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
     DeviceBenchmarkOptions, DeviceBenchmarkReport, ExactDeviceCase, MemoryRecorder,
-    OperationAccounting, RepeatedGraph, finish_report, generator_baseline_sha256, measure_cases,
-    preflight, require_current_process_exclusive, warmup_launches,
+    OperationAccounting, finish_report, generator_baseline_sha256, measure_cases, preflight,
+    require_current_process_exclusive, warmup_launches,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -13,10 +13,12 @@ use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, GpuError, GpuTimer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
 const SOURCE_LAYER: usize = 60;
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, MAX_ROWS];
 
 struct RouteGraph {
-    batch: usize,
-    repeated: CudaGraph,
+    rows: usize,
+    preparation: CudaGraph,
 }
 
 struct Session {
@@ -28,7 +30,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(root: &Path, repeated_operations: u64) -> Result<Self, DeviceBenchmarkError> {
+    fn new(root: &Path) -> Result<Self, DeviceBenchmarkError> {
         let snapshot = Arc::new(CheckpointSnapshot::<Qwen38_27B>::open(root)?);
         let context = CudaContext::new(0).map_err(GpuError::from)?;
         let capability = context.compute_capability().map_err(GpuError::from)?;
@@ -40,17 +42,14 @@ impl Session {
         }
         let stream = context.new_stream().map_err(GpuError::from)?;
         let program = DenseFp8GdnLayerProgram::from_snapshot(&context, snapshot, SOURCE_LAYER)?;
-        program.load_residual(&stream, MAX_BATCH, &benchmark_input())?;
+        program.load_residual(&stream, MAX_ROWS, &benchmark_input())?;
         program.reset_state(&stream)?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| {
+        let routes = EXACT_ROUTES
+            .iter()
+            .map(|&rows| {
                 Ok(RouteGraph {
-                    batch,
-                    repeated: program.qualification_repeated_graph(
-                        &stream,
-                        batch,
-                        repeated_operations,
-                    )?,
+                    rows,
+                    preparation: program.qualification_state_reset_graph(&stream)?,
                 })
             })
             .collect::<Result<Vec<_>, DeviceBenchmarkError>>()?;
@@ -66,9 +65,10 @@ impl Session {
 
     fn warm(&self, launches: u64) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
-            for batch in 1..=MAX_BATCH {
+            for route in &self.routes {
+                route.preparation.launch(&self.stream)?;
                 self.program
-                    .qualification_graph(batch)?
+                    .qualification_graph(route.rows)?
                     .launch(&self.stream)?;
             }
         }
@@ -76,25 +76,30 @@ impl Session {
         Ok(())
     }
 
-    fn cases(
-        &self,
-        repeated_operations: u64,
-    ) -> Result<Vec<ExactDeviceCase<'_>>, DeviceBenchmarkError> {
+    fn cases(&self) -> Result<Vec<ExactDeviceCase<'_>>, DeviceBenchmarkError> {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_layer_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_layer_prefill(route.rows as u64),
+                    )
+                };
                 Ok(ExactDeviceCase::new(
                     "dense_fp8_gdn_layer/layer60",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_layer_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
-                    self.program.qualification_graph(route.batch)?,
-                    Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
-                ))
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
+                    self.program.qualification_graph(route.rows)?,
+                    None,
+                )
+                .with_preparation(&route.preparation))
             })
             .collect()
     }
@@ -102,12 +107,12 @@ impl Session {
 
 fn benchmark_input() -> Vec<u16> {
     const PATTERN: [f32; 8] = [0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625];
-    (0..MAX_BATCH * Qwen38_27B::HIDDEN)
+    (0..MAX_ROWS * Qwen38_27B::HIDDEN)
         .map(|index| f32_to_bf16(PATTERN[(index + index / Qwen38_27B::HIDDEN) & 7]))
         .collect()
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(rows: usize) -> usize {
     let hidden = Qwen38_27B::HIDDEN;
     let intermediate = Qwen38_27B::INTERMEDIATE;
     let input_rows = Qwen38_27B::GDN_INPUT_ROWS;
@@ -128,7 +133,7 @@ fn logical_bytes(batch: usize) -> usize {
         + 16 * value_rows
         + 6 * intermediate
         + 2 * size_of::<f32>() * 4;
-    weights + batch * per_token
+    weights + rows * per_token
 }
 
 /// Measures every exact graph of one source-backed dense-FP8 GDN layer owner.
@@ -140,7 +145,7 @@ pub fn benchmark_dense_fp8_gdn_layer(
     let warmup_launches = warmup_launches(options)?;
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
-    let session = Session::new(root, options.launches_per_sample)?;
+    let session = Session::new(root)?;
     memory.register_owned(
         "dense_fp8_gdn_layer/resident_weights",
         BenchmarkMemoryKind::Weights,
@@ -151,7 +156,7 @@ pub fn benchmark_dense_fp8_gdn_layer(
         "dense_fp8_gdn_layer/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.program.workspace_bytes(),
-        "max_batch=8 including causal history and FP32 state",
+        "max_rows=1024 plus eight causal-history and FP32-state rows",
     )?;
     memory.register_owned(
         "dense_fp8_gdn_layer/alignment_padding",
@@ -161,11 +166,17 @@ pub fn benchmark_dense_fp8_gdn_layer(
             - session.program.workspace_bytes(),
         "single 256-byte-aligned arena",
     )?;
+    memory.register_owned(
+        "dense_fp8_gdn_layer/address_bound_tensor_maps",
+        BenchmarkMemoryKind::Other,
+        session.program.descriptor_bytes(),
+        "four 128-byte gate/up and down tensor maps",
+    )?;
     memory.capture("after_setup")?;
     session.warm(warmup_launches)?;
     memory.capture("after_warmup")?;
     require_current_process_exclusive()?;
-    let cases = session.cases(options.launches_per_sample)?;
+    let cases = session.cases()?;
     let (metrics, energy_metrics, telemetry) =
         measure_cases(&session.stream, &session.timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
@@ -173,7 +184,7 @@ pub fn benchmark_dense_fp8_gdn_layer(
         BenchmarkReportSpec {
             suite: "bench-dense-fp8-gdn-layer",
             classification: "performance_sensitive_layer",
-            timing_scope: "paired Rust submission/completion, repeated production graph, and repeated-operation graph",
+            timing_scope: "paired Rust production-graph submission/completion after an untimed exact-state reset",
         },
         preflight,
         baseline_sha256,
@@ -192,7 +203,7 @@ fn f32_to_bf16(value: f32) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, logical_bytes};
+    use super::{EXACT_ROUTES, MAX_BATCH, MAX_ROWS, logical_bytes};
 
     #[test]
     fn byte_accounting_scales_only_per_token_traffic() {
@@ -201,5 +212,11 @@ mod tests {
         assert_eq!(per_token, 7_869_216);
         assert_eq!(one, 391_818_464);
         assert_eq!(logical_bytes(MAX_BATCH), one + (MAX_BATCH - 1) * per_token);
+        assert_eq!(logical_bytes(MAX_ROWS), one + (MAX_ROWS - 1) * per_token);
+    }
+
+    #[test]
+    fn benchmark_route_inventory_is_exact() {
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
     }
 }

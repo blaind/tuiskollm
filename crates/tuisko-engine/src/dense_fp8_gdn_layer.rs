@@ -1,20 +1,27 @@
 //! Resident source-backed dense-FP8 GDN decoder layer.
 
-use crate::dense_fp8_gdn_layer_layout::GdnLayerRegions;
+use crate::dense_fp8_gdn_layer_layout::{GdnLayerRegions, MAX_ROWS};
 use crate::{DenseFp8GdnLayerLayout, EngineError, EngineResult, MAX_BATCH};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
 use tuisko_kernels_sm120::{
-    DenseFp8DownOp, DenseFp8SwiGluOp, GdnInputProjectionOp, GdnOutputProjectionOp, GdnPrepareOp,
-    GdnRecurrenceOp, ResidualNormOp, Sm120Arch,
+    DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps,
+    GdnInputProjectionOp, GdnOutputProjectionOp, GdnPrepareOp, GdnRecurrenceOp, ResidualNormOp,
+    Sm120Arch,
 };
 use tuisko_model::{CheckpointSnapshot, DenseFp8MlpBindings, GdnBindings, Qwen38_27B};
 
-/// One late dense-FP8 GDN layer with immutable exact-batch graph routes.
+/// One late dense-FP8 GDN layer with immutable exact decode and prefill graphs.
 pub struct DenseFp8GdnLayerProgram<A: Sm120Arch = Qwen38_27B> {
     // Drop graphs before the arena and loaded modules whose handles they retain.
     graphs: [CudaGraph; MAX_BATCH],
+    prefill_graphs: [CudaGraph; 4],
+    // Captured TMA launches retain these address-bound descriptor allocations.
+    #[allow(dead_code)]
+    gate_up_maps: DenseFp8SwiGluTmaMaps,
+    #[allow(dead_code)]
+    down_maps: DenseFp8DownTmaMaps,
     arena: DeviceArena,
     _norm: ResidualNormOp<A>,
     _input: GdnInputProjectionOp<A>,
@@ -269,6 +276,22 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
         )?;
 
         let pointers = Pointers::bind(&arena, regions)?;
+        // SAFETY: the one owner arena keeps all encoded source addresses stable.
+        let gate_up_maps = unsafe {
+            DenseFp8SwiGluTmaMaps::new(
+                &stream,
+                pointers.gate_up_activation_codes.cast_const(),
+                pointers.gate_up_weight_codes,
+            )?
+        };
+        // SAFETY: the one owner arena keeps all encoded source addresses stable.
+        let down_maps = unsafe {
+            DenseFp8DownTmaMaps::new(
+                &stream,
+                pointers.down_activation_codes.cast_const(),
+                pointers.down_weight_codes,
+            )?
+        };
         let base_address = arena.base_address();
         let ops = Ops {
             norm: &norm,
@@ -278,11 +301,17 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
             output: &output,
             swiglu: &swiglu,
             down: &down,
+            gate_up_maps: &gate_up_maps,
+            down_maps: &down_maps,
         };
-        let graphs = capture_routes(&stream, ops, pointers)?;
+        let graphs = capture_decode_routes(&stream, ops, pointers)?;
+        let prefill_graphs = capture_prefill_routes(&stream, ops, pointers)?;
 
         Ok(Self {
             graphs,
+            prefill_graphs,
+            gate_up_maps,
+            down_maps,
             arena,
             _norm: norm,
             _input: input,
@@ -300,18 +329,18 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
         })
     }
 
-    /// Uploads exactly `batch` BF16 residual rows into stable input storage.
+    /// Uploads one exact decode or prefill width into stable input storage.
     pub fn load_residual(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         values: &[u16],
     ) -> EngineResult<()> {
-        require_batch(batch)?;
-        let expected = product("dense-FP8 GDN input elements", batch, A::HIDDEN)?;
+        require_rows(rows)?;
+        let expected = product("dense-FP8 GDN input elements", rows, A::HIDDEN)?;
         if values.len() != expected {
             return Err(EngineError::layout(format!(
-                "dense-FP8 GDN input has {} values, expected {expected} for B={batch}",
+                "dense-FP8 GDN input has {} values, expected {expected} for rows={rows}",
                 values.len()
             )));
         }
@@ -328,17 +357,16 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
         Ok(())
     }
 
-    /// Replays the immutable graph for one exact batch.
-    pub fn replay(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
-        self.graphs[batch - 1].launch(stream)?;
+    /// Replays the immutable graph for one exact decode or prefill width.
+    pub fn replay(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        self.graph(rows)?.launch(stream)?;
         Ok(())
     }
 
     /// Reads active BF16 residual output rows.
-    pub fn read_residual(&self, stream: &CudaStream, batch: usize) -> EngineResult<Vec<u16>> {
-        require_batch(batch)?;
-        let values = product("dense-FP8 GDN output elements", batch, A::HIDDEN)?;
+    pub fn read_residual(&self, stream: &CudaStream, rows: usize) -> EngineResult<Vec<u16>> {
+        require_rows(rows)?;
+        let values = product("dense-FP8 GDN output elements", rows, A::HIDDEN)?;
         Ok(self
             .arena
             .copy_prefix_to_host(stream, self.layout.regions().residual_output, values)?)
@@ -374,9 +402,24 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
         self.layout.arena_bytes()
     }
 
+    /// Resident weights plus workspace, excluding alignment padding.
+    pub const fn owner_bytes(&self) -> usize {
+        self.layout.owner_bytes()
+    }
+
     /// Largest admitted exact batch.
     pub const fn batch_capacity(&self) -> usize {
         MAX_BATCH
+    }
+
+    /// Largest admitted exact prefill width.
+    pub const fn row_capacity(&self) -> usize {
+        MAX_ROWS
+    }
+
+    /// Exact bytes in all four address-bound MLP tensor-map descriptors.
+    pub const fn descriptor_bytes(&self) -> usize {
+        DenseFp8SwiGluTmaMaps::BYTE_LEN + DenseFp8DownTmaMaps::BYTE_LEN
     }
 
     /// Checked owner layout.
@@ -389,13 +432,26 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
         &self.snapshot
     }
 
+    fn graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
+        if (1..=MAX_BATCH).contains(&rows) {
+            return Ok(&self.graphs[rows - 1]);
+        }
+        let index = prefill_index(rows).ok_or_else(|| {
+            EngineError::route(format!(
+                "dense-FP8 GDN layer row count {rows} is outside 1..={MAX_BATCH},32,64,128,1024"
+            ))
+        })?;
+
+        Ok(&self.prefill_graphs[index])
+    }
+
     #[cfg(feature = "qualification")]
     /// Launches the production route eagerly for graph-agreement qualification.
-    pub fn launch_eager(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
+    pub fn launch_eager(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        require_rows(rows)?;
         launch_route(
             stream,
-            batch,
+            rows,
             self.ops(),
             Pointers::bind(&self.arena, self.layout.regions())?,
         )?;
@@ -404,9 +460,18 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
 
     #[cfg(feature = "qualification")]
     /// Returns one captured production graph.
-    pub fn qualification_graph(&self, batch: usize) -> EngineResult<&CudaGraph> {
-        require_batch(batch)?;
-        Ok(&self.graphs[batch - 1])
+    pub fn qualification_graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
+        self.graph(rows)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Captures the production owner's exact history and state reset.
+    pub fn qualification_state_reset_graph(&self, stream: &CudaStream) -> EngineResult<CudaGraph> {
+        let regions = self.layout.regions();
+        Ok(CudaGraph::capture(stream, || {
+            self.arena.fill(stream, regions.history, 0)?;
+            self.arena.fill(stream, regions.state, 0)
+        })?)
     }
 
     #[cfg(feature = "qualification")]
@@ -414,10 +479,10 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
     pub fn qualification_repeated_graph(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         operations: u64,
     ) -> EngineResult<CudaGraph> {
-        require_batch(batch)?;
+        require_rows(rows)?;
         if operations == 0 {
             return Err(EngineError::route(
                 "repeated dense-FP8 GDN graph requires at least one operation",
@@ -427,7 +492,7 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
         let ops = self.ops();
         Ok(CudaGraph::capture(stream, || {
             for _ in 0..operations {
-                launch_route(stream, batch, ops, pointers)?;
+                launch_route(stream, rows, ops, pointers)?;
             }
             Ok(())
         })?)
@@ -436,7 +501,25 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
     #[cfg(feature = "qualification")]
     /// Returns every stable arena address in layout order.
     pub fn qualification_addresses(&self) -> EngineResult<Vec<usize>> {
-        Ok(Pointers::bind(&self.arena, self.layout.regions())?.addresses())
+        let mut addresses = Pointers::bind(&self.arena, self.layout.regions())?.addresses();
+        addresses.extend(self.gate_up_maps.device_addresses());
+        addresses.extend(self.down_maps.device_addresses());
+
+        Ok(addresses)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Copies all four opaque address-bound tensor maps.
+    pub fn qualification_descriptors(&self, stream: &CudaStream) -> EngineResult<[Vec<u64>; 4]> {
+        let gate_up = self.gate_up_maps.copy_to_host(stream)?;
+        let down = self.down_maps.copy_to_host(stream)?;
+
+        Ok([
+            gate_up[0].clone(),
+            gate_up[1].clone(),
+            down[0].clone(),
+            down[1].clone(),
+        ])
     }
 
     #[cfg(feature = "qualification")]
@@ -543,6 +626,8 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
             output: &self._output,
             swiglu: &self._swiglu,
             down: &self._down,
+            gate_up_maps: &self.gate_up_maps,
+            down_maps: &self.down_maps,
         }
     }
 }
@@ -607,9 +692,11 @@ struct Ops<'a, A: Sm120Arch> {
     output: &'a GdnOutputProjectionOp<A>,
     swiglu: &'a DenseFp8SwiGluOp<A>,
     down: &'a DenseFp8DownOp<A>,
+    gate_up_maps: &'a DenseFp8SwiGluTmaMaps,
+    down_maps: &'a DenseFp8DownTmaMaps,
 }
 
-fn capture_routes<A: Sm120Arch>(
+fn capture_decode_routes<A: Sm120Arch>(
     stream: &CudaStream,
     ops: Ops<'_, A>,
     pointers: Pointers,
@@ -625,25 +712,43 @@ fn capture_routes<A: Sm120Arch>(
     })
 }
 
+fn capture_prefill_routes<A: Sm120Arch>(
+    stream: &CudaStream,
+    ops: Ops<'_, A>,
+    pointers: Pointers,
+) -> EngineResult<[CudaGraph; 4]> {
+    let mut graphs = Vec::with_capacity(4);
+    for rows in [32, 64, 128, MAX_ROWS] {
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_route(stream, rows, ops, pointers)
+        })?);
+    }
+
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("dense-FP8 GDN layer prefill graph inventory has wrong cardinality")
+    })
+}
+
 fn launch_route<A: Sm120Arch>(
     stream: &CudaStream,
-    batch: usize,
+    rows: usize,
     ops: Ops<'_, A>,
     pointers: Pointers,
 ) -> GpuResult<()> {
-    // SAFETY: the single arena provides aligned, disjoint maximum-batch
-    // regions, and exact dispatch restricts every launch to `batch` rows.
+    // SAFETY: the single arena provides aligned, disjoint MAX_ROWS regions,
+    // and exact dispatch restricts every launch to `rows` rows. Persistent
+    // history and state keep eight decode rows; prefill uses mapped row zero.
     unsafe {
         ops.norm.launch_plain(
             stream,
-            batch,
+            rows,
             pointers.residual_input,
             pointers.input_norm,
             pointers.mixer_normalized,
         )?;
         ops.input.launch(
             stream,
-            batch,
+            rows,
             pointers.mixer_normalized,
             pointers.input_activation_codes,
             pointers.input_activation_scales,
@@ -653,7 +758,7 @@ fn launch_route<A: Sm120Arch>(
         )?;
         ops.prepare.launch(
             stream,
-            batch,
+            rows,
             pointers.mixer_normalized,
             pointers.control_weights,
             pointers.a_log,
@@ -668,7 +773,7 @@ fn launch_route<A: Sm120Arch>(
         )?;
         ops.recurrence.launch(
             stream,
-            batch,
+            rows,
             pointers.convolved,
             pointers.projected,
             pointers.log_decay,
@@ -680,7 +785,7 @@ fn launch_route<A: Sm120Arch>(
         )?;
         ops.output.launch(
             stream,
-            batch,
+            rows,
             pointers.recurrent_output,
             pointers.output_activation_codes,
             pointers.output_activation_scales,
@@ -690,36 +795,73 @@ fn launch_route<A: Sm120Arch>(
         )?;
         ops.norm.launch_residual(
             stream,
-            batch,
+            rows,
             pointers.residual_input,
             pointers.mixer_branch,
             pointers.post_attention_norm,
             pointers.mixer_residual,
             pointers.mlp_normalized,
         )?;
-        ops.swiglu.launch(
-            stream,
-            batch,
-            pointers.mlp_normalized,
-            pointers.gate_up_activation_codes,
-            pointers.gate_up_activation_scales,
-            pointers.gate_up_weight_codes,
-            pointers.gate_up_weight_scales,
-            pointers.swiglu,
-        )?;
-        ops.down.launch(
-            stream,
-            batch,
-            pointers.swiglu,
-            pointers.down_activation_codes,
-            pointers.down_activation_scales,
-            pointers.down_weight_codes,
-            pointers.down_weight_scales,
-            pointers.mlp_branch,
-        )?;
+        if rows == MAX_ROWS {
+            // T=1024 amortizes address-bound TMA setup across the complete macro tile.
+            ops.swiglu.launch_macro_prefill(
+                stream,
+                pointers.mlp_normalized,
+                pointers.gate_up_activation_codes,
+                pointers.gate_up_activation_scales,
+                pointers.gate_up_weight_codes,
+                pointers.gate_up_weight_scales,
+                pointers.swiglu,
+                ops.gate_up_maps,
+            )?;
+            ops.down.launch_macro_prefill(
+                stream,
+                pointers.swiglu,
+                pointers.down_activation_codes,
+                pointers.down_activation_scales,
+                pointers.down_weight_codes,
+                pointers.down_weight_scales,
+                pointers.mlp_branch,
+                ops.down_maps,
+            )?;
+        } else {
+            ops.swiglu.launch(
+                stream,
+                rows,
+                pointers.mlp_normalized,
+                pointers.gate_up_activation_codes,
+                pointers.gate_up_activation_scales,
+                pointers.gate_up_weight_codes,
+                pointers.gate_up_weight_scales,
+                pointers.swiglu,
+            )?;
+            if rows <= MAX_BATCH {
+                ops.down.launch(
+                    stream,
+                    rows,
+                    pointers.swiglu,
+                    pointers.down_activation_codes,
+                    pointers.down_activation_scales,
+                    pointers.down_weight_codes,
+                    pointers.down_weight_scales,
+                    pointers.mlp_branch,
+                )?;
+            } else {
+                ops.down.launch_tail_prefill(
+                    stream,
+                    rows,
+                    pointers.swiglu,
+                    pointers.down_activation_codes,
+                    pointers.down_activation_scales,
+                    pointers.down_weight_codes,
+                    pointers.down_weight_scales,
+                    pointers.mlp_branch,
+                )?;
+            }
+        }
         ops.norm.launch_residual(
             stream,
-            batch,
+            rows,
             pointers.mixer_residual,
             pointers.mlp_branch,
             pointers.next_norm,
@@ -730,10 +872,20 @@ fn launch_route<A: Sm120Arch>(
     Ok(())
 }
 
-fn require_batch(batch: usize) -> EngineResult<()> {
-    if !(1..=MAX_BATCH).contains(&batch) {
+fn prefill_index(rows: usize) -> Option<usize> {
+    match rows {
+        32 => Some(0),
+        64 => Some(1),
+        128 => Some(2),
+        MAX_ROWS => Some(3),
+        _ => None,
+    }
+}
+
+fn require_rows(rows: usize) -> EngineResult<()> {
+    if !(1..=MAX_BATCH).contains(&rows) && prefill_index(rows).is_none() {
         return Err(EngineError::route(format!(
-            "dense-FP8 GDN layer batch {batch} is outside 1..={MAX_BATCH}"
+            "dense-FP8 GDN layer row count {rows} is outside 1..={MAX_BATCH},32,64,128,1024"
         )));
     }
     Ok(())
@@ -760,12 +912,15 @@ fn little_endian_words(bytes: &[u8]) -> EngineResult<Vec<u16>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, require_batch};
+    use super::{MAX_BATCH, require_rows};
 
     #[test]
-    fn exact_batch_table_rejects_every_uncompiled_route() {
-        for (batch, admitted) in [(0, false), (1, true), (8, true), (9, false), (16, false)] {
-            assert_eq!(require_batch(batch).is_ok(), admitted, "batch={batch}");
+    fn exact_route_table_rejects_every_uncompiled_route() {
+        for rows in [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024] {
+            require_rows(rows).unwrap();
+        }
+        for rows in [0, 9, 31, 33, 63, 65, 127, 129, 1_023, 1_025, usize::MAX] {
+            assert!(require_rows(rows).is_err(), "rows={rows}");
         }
         assert_eq!(MAX_BATCH, 8);
     }

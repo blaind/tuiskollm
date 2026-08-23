@@ -97,8 +97,10 @@ after every parallel convolution reader completes. GDN recurrence admits the sam
 causally advanced mapped FP32 state row; 48 value-head CTAs retain the decode reduction order while
 each CTA advances tokens serially. GDN output retains one token-owned dynamic quantization CTA per
 row and projects `T=32,64,128` with 32x32 native E4M3 MMA tiles or `T=1024` with 64x32 macro tiles.
-GDN layer composition and resident/server routing remain separate slices, so these routes do not
-yet change server priming.
+The source-backed dense-FP8 GDN owner composes every mixer, recurrent-state, residual, MLP, and
+next-normalization seam at the same four prefill widths, with one mapped prefill state/history row
+and stable TMA descriptors for its macro MLP. Resident/server routing remains separate, so these
+routes do not yet change server priming.
 
 ## Current device slice
 

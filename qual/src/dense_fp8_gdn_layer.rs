@@ -15,6 +15,8 @@ use tuisko_model::{
 };
 
 const SOURCE_LAYER: usize = 60;
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, MAX_ROWS];
 const HEAD_DIM: usize = 128;
 const KEY_HEADS: usize = 16;
 const VALUE_HEADS: usize = 48;
@@ -46,7 +48,7 @@ pub enum DenseFp8GdnLayerQualificationError {
 /// Observable counts and worst error from one complete source-backed layer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DenseFp8GdnLayerQualification {
-    /// Residual and normalization values checked at every exact batch.
+    /// Residual and normalization values checked at every exact route.
     pub boundary_values: usize,
     /// Dynamic E4M3 codes checked bit-exactly at all four quantization seams.
     pub activation_codes: usize,
@@ -58,6 +60,20 @@ pub struct DenseFp8GdnLayerQualification {
     pub graph_replay_values: usize,
     /// Inactive values verified unchanged.
     pub inactive_values: usize,
+    /// Immutable tensor-map words checked after every route.
+    pub immutable_descriptor_words: usize,
+    /// Exact source-backed device weight bytes.
+    pub resident_weight_bytes: usize,
+    /// Exact address-stable workspace and state bytes.
+    pub workspace_bytes: usize,
+    /// Exact resident weights plus workspace, excluding padding.
+    pub owner_bytes: usize,
+    /// Complete arena allocation bytes.
+    pub arena_bytes: usize,
+    /// Alignment bytes not assigned to an owner plane.
+    pub padding_bytes: usize,
+    /// Four address-bound tensor-map descriptor bytes.
+    pub descriptor_bytes: usize,
     /// Largest absolute difference from a represented-value or FP64 seam oracle.
     pub maximum_absolute_error: f32,
 }
@@ -77,7 +93,7 @@ struct SourcePlanes {
     next_norm: Vec<u16>,
 }
 
-/// Qualifies source-backed layer 60 at every exact decode batch.
+/// Qualifies source-backed layer 60 at every exact decode and prefill route.
 pub fn qualify_dense_fp8_gdn_layer(
     root: &Path,
 ) -> Result<DenseFp8GdnLayerQualification, DenseFp8GdnLayerQualificationError> {
@@ -98,11 +114,21 @@ pub fn qualify_dense_fp8_gdn_layer(
     let program = DenseFp8GdnLayerProgram::from_snapshot(&context, snapshot.clone(), SOURCE_LAYER)?;
     let stable_base = program.base_address();
     let stable_addresses = program.qualification_addresses()?;
-    if stable_addresses.len() != 41 {
+    let stable_descriptors = program.qualification_descriptors(&stream)?;
+    if stable_addresses.len() != 45 {
         return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
-            "owner exposes {} addresses, expected 41",
+            "owner exposes {} addresses, expected 45",
             stable_addresses.len()
         )));
+    }
+    if program.resident_weight_bytes() != 383_949_248
+        || program.workspace_bytes() != 247_316_512
+        || program.arena_bytes() != 631_266_304
+        || program.descriptor_bytes() != 512
+    {
+        return Err(DenseFp8GdnLayerQualificationError::Mismatch(
+            "owner byte accounting differs from the admitted layout".to_string(),
+        ));
     }
     let mut report = DenseFp8GdnLayerQualification {
         boundary_values: 0,
@@ -111,45 +137,59 @@ pub fn qualify_dense_fp8_gdn_layer(
         source_values: 0,
         graph_replay_values: 0,
         inactive_values: 0,
+        immutable_descriptor_words: 0,
+        resident_weight_bytes: program.resident_weight_bytes(),
+        workspace_bytes: program.workspace_bytes(),
+        owner_bytes: program.owner_bytes(),
+        arena_bytes: program.arena_bytes(),
+        padding_bytes: program.arena_bytes() - program.owner_bytes(),
+        descriptor_bytes: program.descriptor_bytes(),
         maximum_absolute_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
-        let first_input = make_input(batch, 0);
+    for rows in EXACT_ROUTES {
+        let first_input = make_input(rows, 0);
         program.reset_state(&stream)?;
-        program.load_residual(&stream, batch, &first_input)?;
+        program.load_residual(&stream, rows, &first_input)?;
         program.qualification_reset_outputs(&stream, BYTE_SENTINEL)?;
-        program.launch_eager(&stream, batch)?;
+        program.launch_eager(&stream, rows)?;
         let first = program.qualification_observables(&stream)?;
 
-        let input = make_input(batch, 1);
+        let input = make_input(rows, 1);
         program.reset_state(&stream)?;
-        program.load_residual(&stream, batch, &input)?;
+        program.load_residual(&stream, rows, &input)?;
         program.qualification_reset_outputs(&stream, BYTE_SENTINEL)?;
-        program.replay(&stream, batch)?;
+        program.replay(&stream, rows)?;
         let replay = program.qualification_observables(&stream)?;
 
         program.reset_state(&stream)?;
         program.qualification_reset_outputs(&stream, BYTE_SENTINEL)?;
-        program.launch_eager(&stream, batch)?;
+        program.launch_eager(&stream, rows)?;
         let eager = program.qualification_observables(&stream)?;
 
-        verify_boundaries(batch, &input, &sources, &replay, &mut report)?;
-        verify_quantization(batch, &replay, &mut report)?;
-        if batch == 1 {
+        verify_boundaries(rows, &input, &sources, &replay, &mut report)?;
+        verify_quantization(rows, &replay, &mut report)?;
+        if rows == 1 {
             verify_source_formula(gdn, mlp, &sources, &replay, &mut report)?;
         }
-        verify_replay(batch, &eager, &replay, &mut report)?;
-        verify_replacement_input(batch, &first, &replay)?;
-        verify_inactive(batch, &replay, &mut report)?;
-        verify_inactive(batch, &eager, &mut report)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
+        verify_replacement_input(rows, &first, &replay)?;
+        verify_inactive(rows, &replay, &mut report)?;
+        verify_inactive(rows, &eager, &mut report)?;
         if program.base_address() != stable_base
             || program.qualification_addresses()? != stable_addresses
         {
             return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
-                "owner addresses changed while qualifying B={batch}"
+                "owner addresses changed while qualifying rows={rows}"
             )));
         }
+        let descriptors = program.qualification_descriptors(&stream)?;
+        if descriptors != stable_descriptors {
+            return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
+                "tensor-map descriptors changed while qualifying rows={rows}"
+            )));
+        }
+        report.immutable_descriptor_words += descriptors.iter().map(Vec::len).sum::<usize>();
     }
 
     verify_no_device_allocation(&program, &stream)?;
@@ -573,7 +613,7 @@ fn verify_recurrence(
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     eager: &DenseFp8GdnLayerObservables,
     replay: &DenseFp8GdnLayerObservables,
     report: &mut DenseFp8GdnLayerQualification,
@@ -587,7 +627,7 @@ fn verify_replay(
                 .position(|(actual, expected)| actual != expected)
             {
                 return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
-                    "B={batch} graph plane `{}` differs at value {index}",
+                    "rows={rows} graph plane `{}` differs at value {index}",
                     stringify!($field)
                 )));
             }
@@ -616,50 +656,53 @@ fn verify_replay(
     same!(mlp_branch);
     same!(residual_output);
     same!(next_normalized);
-    report.graph_replay_values += active_values(batch);
+    report.graph_replay_values += active_values(rows);
     Ok(())
 }
 
-fn active_values(batch: usize) -> usize {
-    batch
-        * (9 * Qwen38_27B::HIDDEN
-            + Qwen38_27B::GDN_INPUT_ROWS
-            + 4 * Qwen38_27B::GDN_QKV_ROWS
-            + 2 * Qwen38_27B::GDN_VALUE_ROWS
-            + 2 * Qwen38_27B::INTERMEDIATE
-            + 2 * Qwen38_27B::GDN_CONTROL_ROWS
-            + 4)
-        + batch * STATE_PER_ROW
+fn active_state_rows(rows: usize) -> usize {
+    if rows <= MAX_BATCH { rows } else { 1 }
+}
+
+fn active_values(rows: usize) -> usize {
+    rows * (9 * Qwen38_27B::HIDDEN
+        + Qwen38_27B::GDN_INPUT_ROWS
+        + Qwen38_27B::GDN_QKV_ROWS
+        + 2 * Qwen38_27B::GDN_VALUE_ROWS
+        + 2 * Qwen38_27B::INTERMEDIATE
+        + 2 * Qwen38_27B::GDN_CONTROL_ROWS
+        + 4)
+        + active_state_rows(rows) * (3 * Qwen38_27B::GDN_QKV_ROWS + STATE_PER_ROW)
 }
 
 fn verify_replacement_input(
-    batch: usize,
+    rows: usize,
     first: &DenseFp8GdnLayerObservables,
     replay: &DenseFp8GdnLayerObservables,
 ) -> Result<(), DenseFp8GdnLayerQualificationError> {
-    let active = batch * Qwen38_27B::HIDDEN;
+    let active = rows * Qwen38_27B::HIDDEN;
     if first.residual_output[..active] == replay.residual_output[..active] {
         return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
-            "B={batch} graph ignored replacement input"
+            "rows={rows} graph ignored replacement input"
         )));
     }
     Ok(())
 }
 
 fn verify_inactive(
-    batch: usize,
+    rows: usize,
     observed: &DenseFp8GdnLayerObservables,
     report: &mut DenseFp8GdnLayerQualification,
 ) -> Result<(), DenseFp8GdnLayerQualificationError> {
     macro_rules! sentinel_u16 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|&value| value != BF16_SENTINEL)
             {
                 return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
-                    "B={batch} modified inactive `{}` value",
+                    "rows={rows} modified inactive `{}` value",
                     stringify!($field)
                 )));
             }
@@ -668,13 +711,13 @@ fn verify_inactive(
     }
     macro_rules! sentinel_u8 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|&value| value != BYTE_SENTINEL)
             {
                 return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
-                    "B={batch} modified inactive `{}` value",
+                    "rows={rows} modified inactive `{}` value",
                     stringify!($field)
                 )));
             }
@@ -683,13 +726,13 @@ fn verify_inactive(
     }
     macro_rules! sentinel_f32 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|value| value.to_bits() != F32_SENTINEL_BITS)
             {
                 return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
-                    "B={batch} modified inactive `{}` value",
+                    "rows={rows} modified inactive `{}` value",
                     stringify!($field)
                 )));
             }
@@ -718,28 +761,47 @@ fn verify_inactive(
     inactive += sentinel_u16!(mlp_branch, Qwen38_27B::HIDDEN);
     inactive += sentinel_u16!(residual_output, Qwen38_27B::HIDDEN);
     inactive += sentinel_u16!(next_normalized, Qwen38_27B::HIDDEN);
-    let state_begin = batch * STATE_PER_ROW;
+    let state_begin = active_state_rows(rows) * STATE_PER_ROW;
     if observed.state[state_begin..]
         .iter()
         .any(|&value| value != 0.0)
     {
         return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
-            "B={batch} modified inactive recurrent state"
+            "rows={rows} modified inactive recurrent state"
         )));
     }
     let history_width = Qwen38_27B::GDN_QKV_ROWS * 3;
-    let history_begin = batch * history_width;
+    let history_begin = active_state_rows(rows) * history_width;
     if observed.history[history_begin..]
         .iter()
         .any(|&value| value != 0)
     {
         return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
-            "B={batch} modified inactive causal history"
+            "rows={rows} modified inactive causal history"
         )));
     }
     inactive += observed.state.len() - state_begin + observed.history.len() - history_begin;
+    let expected = inactive_values(rows);
+    if inactive != expected {
+        return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
+            "rows={rows} inactive accounting is {inactive}, expected {expected}"
+        )));
+    }
     report.inactive_values += inactive;
     Ok(())
+}
+
+fn inactive_values(rows: usize) -> usize {
+    let working_per_row = 9 * Qwen38_27B::HIDDEN
+        + Qwen38_27B::GDN_INPUT_ROWS
+        + Qwen38_27B::GDN_QKV_ROWS
+        + 2 * Qwen38_27B::GDN_VALUE_ROWS
+        + 2 * Qwen38_27B::INTERMEDIATE
+        + 2 * Qwen38_27B::GDN_CONTROL_ROWS
+        + 4;
+    let state_per_row = 3 * Qwen38_27B::GDN_QKV_ROWS + STATE_PER_ROW;
+
+    (MAX_ROWS - rows) * working_per_row + (MAX_BATCH - active_state_rows(rows)) * state_per_row
 }
 
 fn residual_oracle(input: &[u16], branch: &[u16]) -> Vec<u16> {
@@ -822,12 +884,12 @@ fn verify_no_device_allocation(
     program: &DenseFp8GdnLayerProgram,
     stream: &tuisko_gpu::CudaStream,
 ) -> Result<(), DenseFp8GdnLayerQualificationError> {
-    program.replay(stream, MAX_BATCH)?;
+    program.replay(stream, MAX_ROWS)?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
     for _ in 0..2 {
-        for batch in [1, 8, 3, 6, 2, 7, 4, 5] {
-            program.replay(stream, batch)?;
+        for rows in [1, 32, 8, 64, 3, 128, 6, MAX_ROWS, 2, 7, 4, 5] {
+            program.replay(stream, rows)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -856,8 +918,8 @@ fn little_endian_words(bytes: &[u8]) -> Result<Vec<u16>, DenseFp8GdnLayerQualifi
 #[cfg(test)]
 mod tests {
     use super::{
-        DenseFp8GdnLayerQualificationError, SOURCE_LAYER, STATE_PER_ROW, active_values,
-        qualify_dense_fp8_gdn_layer,
+        DenseFp8GdnLayerQualificationError, EXACT_ROUTES, MAX_ROWS, SOURCE_LAYER, STATE_PER_ROW,
+        active_values, inactive_values, qualify_dense_fp8_gdn_layer,
     };
     use std::path::PathBuf;
     use tuisko_model::{Arch, Qwen38_27B};
@@ -872,19 +934,15 @@ mod tests {
             )
         })?;
         let report = qualify_dense_fp8_gdn_layer(&PathBuf::from(root))?;
-        let active_batches = (1..=8).sum::<usize>();
-        let per_row = active_values(1);
+        let active_rows = EXACT_ROUTES.iter().sum::<usize>();
         assert_eq!(SOURCE_LAYER, 60);
-        assert_eq!(
-            report.boundary_values,
-            active_batches * 5 * Qwen38_27B::HIDDEN
-        );
+        assert_eq!(report.boundary_values, active_rows * 5 * Qwen38_27B::HIDDEN);
         assert_eq!(
             report.activation_codes,
-            active_batches
+            active_rows
                 * (2 * Qwen38_27B::HIDDEN + Qwen38_27B::GDN_VALUE_ROWS + Qwen38_27B::INTERMEDIATE)
         );
-        assert_eq!(report.activation_scales, 4 * active_batches);
+        assert_eq!(report.activation_scales, 4 * active_rows);
         assert_eq!(
             report.source_values,
             Qwen38_27B::GDN_INPUT_ROWS
@@ -895,9 +953,34 @@ mod tests {
                 + 2 * Qwen38_27B::HIDDEN
                 + Qwen38_27B::INTERMEDIATE
         );
-        assert_eq!(report.graph_replay_values, active_batches * per_row);
-        assert_eq!(report.inactive_values, 2 * (0..8).sum::<usize>() * per_row);
+        assert_eq!(
+            report.graph_replay_values,
+            EXACT_ROUTES
+                .iter()
+                .map(|&rows| active_values(rows))
+                .sum::<usize>()
+        );
+        assert_eq!(
+            report.inactive_values,
+            2 * EXACT_ROUTES
+                .iter()
+                .map(|&rows| inactive_values(rows))
+                .sum::<usize>()
+        );
+        assert_eq!(report.immutable_descriptor_words, 768);
+        assert_eq!(report.resident_weight_bytes, 383_949_248);
+        assert_eq!(report.workspace_bytes, 247_316_512);
+        assert_eq!(report.owner_bytes, 631_265_760);
+        assert_eq!(report.arena_bytes, 631_266_304);
+        assert_eq!(report.padding_bytes, 544);
+        assert_eq!(report.descriptor_bytes, 512);
         assert!(report.maximum_absolute_error.is_finite());
         Ok(())
+    }
+
+    #[test]
+    fn dense_fp8_gdn_layer_suite_route_inventory_is_exact() {
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
+        assert_eq!(MAX_ROWS, 1_024);
     }
 }

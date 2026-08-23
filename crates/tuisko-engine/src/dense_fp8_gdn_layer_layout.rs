@@ -5,6 +5,7 @@ use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::Arch;
 
 const ALIGNMENT: usize = 256;
+pub(crate) const MAX_ROWS: usize = 1_024;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GdnLayerRegions {
@@ -61,18 +62,14 @@ pub struct DenseFp8GdnLayerLayout {
 }
 
 impl DenseFp8GdnLayerLayout {
-    /// Reserves every plane for the architecture's exact `B=1..=8` routes.
+    /// Reserves every plane for the exact decode and prefill routes.
     pub fn build<A: Arch>() -> EngineResult<Self> {
-        let batch_hidden = product("GDN batch-hidden elements", MAX_BATCH, A::HIDDEN)?;
-        let batch_input = product("GDN projected elements", MAX_BATCH, A::GDN_INPUT_ROWS)?;
-        let batch_qkv = product("GDN convolved elements", MAX_BATCH, A::GDN_QKV_ROWS)?;
-        let batch_value = product(
-            "GDN recurrent output elements",
-            MAX_BATCH,
-            A::GDN_VALUE_ROWS,
-        )?;
-        let batch_control = product("GDN control elements", MAX_BATCH, A::GDN_CONTROL_ROWS)?;
-        let batch_intermediate = product("GDN MLP elements", MAX_BATCH, A::INTERMEDIATE)?;
+        let row_hidden = product("GDN row-hidden elements", MAX_ROWS, A::HIDDEN)?;
+        let row_input = product("GDN projected elements", MAX_ROWS, A::GDN_INPUT_ROWS)?;
+        let row_qkv = product("GDN convolved elements", MAX_ROWS, A::GDN_QKV_ROWS)?;
+        let row_value = product("GDN recurrent output elements", MAX_ROWS, A::GDN_VALUE_ROWS)?;
+        let row_control = product("GDN control elements", MAX_ROWS, A::GDN_CONTROL_ROWS)?;
+        let row_intermediate = product("GDN MLP elements", MAX_ROWS, A::INTERMEDIATE)?;
         let input_weights = product("GDN input weights", A::GDN_INPUT_ROWS, A::HIDDEN)?;
         let control_weights = product(
             "GDN A/B control weights",
@@ -110,47 +107,47 @@ impl DenseFp8GdnLayerLayout {
 
         let mut builder = ArenaLayout::new();
         let regions = GdnLayerRegions {
-            residual_input: builder.reserve(batch_hidden, ALIGNMENT)?,
+            residual_input: builder.reserve(row_hidden, ALIGNMENT)?,
             input_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            mixer_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
-            input_activation_codes: builder.reserve(batch_hidden, ALIGNMENT)?,
-            input_activation_scales: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+            mixer_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            input_activation_codes: builder.reserve(row_hidden, ALIGNMENT)?,
+            input_activation_scales: builder.reserve(MAX_ROWS, ALIGNMENT)?,
             input_weight_codes: builder.reserve(input_weights, ALIGNMENT)?,
             input_weight_scales: builder.reserve(A::GDN_INPUT_ROWS, ALIGNMENT)?,
-            projected: builder.reserve(batch_input, ALIGNMENT)?,
+            projected: builder.reserve(row_input, ALIGNMENT)?,
             control_weights: builder.reserve(control_weights, ALIGNMENT)?,
             a_log: builder.reserve(A::GDN_CONTROL_ROWS, ALIGNMENT)?,
             dt_bias: builder.reserve(A::GDN_CONTROL_ROWS, ALIGNMENT)?,
             convolution_weights: builder.reserve(convolution_weights, ALIGNMENT)?,
             state_rows: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             history: builder.reserve(history, ALIGNMENT)?,
-            log_decay: builder.reserve(batch_control, ALIGNMENT)?,
-            beta: builder.reserve(batch_control, ALIGNMENT)?,
-            convolved: builder.reserve(batch_qkv, ALIGNMENT)?,
+            log_decay: builder.reserve(row_control, ALIGNMENT)?,
+            beta: builder.reserve(row_control, ALIGNMENT)?,
+            convolved: builder.reserve(row_qkv, ALIGNMENT)?,
             recurrent_norm: builder.reserve(A::LINEAR_HEAD_DIM, ALIGNMENT)?,
             state: builder.reserve(state, ALIGNMENT)?,
-            recurrent_output: builder.reserve(batch_value, ALIGNMENT)?,
-            output_activation_codes: builder.reserve(batch_value, ALIGNMENT)?,
-            output_activation_scales: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+            recurrent_output: builder.reserve(row_value, ALIGNMENT)?,
+            output_activation_codes: builder.reserve(row_value, ALIGNMENT)?,
+            output_activation_scales: builder.reserve(MAX_ROWS, ALIGNMENT)?,
             output_weight_codes: builder.reserve(output_weights, ALIGNMENT)?,
             output_weight_scales: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            mixer_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
+            mixer_branch: builder.reserve(row_hidden, ALIGNMENT)?,
             post_attention_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            mixer_residual: builder.reserve(batch_hidden, ALIGNMENT)?,
-            mlp_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
-            gate_up_activation_codes: builder.reserve(batch_hidden, ALIGNMENT)?,
-            gate_up_activation_scales: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+            mixer_residual: builder.reserve(row_hidden, ALIGNMENT)?,
+            mlp_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            gate_up_activation_codes: builder.reserve(row_hidden, ALIGNMENT)?,
+            gate_up_activation_scales: builder.reserve(MAX_ROWS, ALIGNMENT)?,
             gate_up_weight_codes: builder.reserve(gate_up_weights, ALIGNMENT)?,
             gate_up_weight_scales: builder.reserve(2 * A::INTERMEDIATE, ALIGNMENT)?,
-            swiglu: builder.reserve(batch_intermediate, ALIGNMENT)?,
-            down_activation_codes: builder.reserve(batch_intermediate, ALIGNMENT)?,
-            down_activation_scales: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+            swiglu: builder.reserve(row_intermediate, ALIGNMENT)?,
+            down_activation_codes: builder.reserve(row_intermediate, ALIGNMENT)?,
+            down_activation_scales: builder.reserve(MAX_ROWS, ALIGNMENT)?,
             down_weight_codes: builder.reserve(down_weights, ALIGNMENT)?,
             down_weight_scales: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            mlp_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
+            mlp_branch: builder.reserve(row_hidden, ALIGNMENT)?,
             next_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            residual_output: builder.reserve(batch_hidden, ALIGNMENT)?,
-            next_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
+            residual_output: builder.reserve(row_hidden, ALIGNMENT)?,
+            next_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
         };
         let resident_weight_bytes = sum(
             "dense-FP8 GDN resident weight bytes",
@@ -264,10 +261,10 @@ mod tests {
         let layout = DenseFp8GdnLayerLayout::build::<Qwen38_27B>().unwrap();
 
         assert_eq!(layout.resident_weight_bytes(), 383_949_248);
-        assert_eq!(layout.workspace_bytes(), 27_389_088);
-        assert_eq!(layout.owner_bytes(), 411_338_336);
-        assert_eq!(layout.arena_bytes(), 411_339_776);
-        assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 1_440);
+        assert_eq!(layout.workspace_bytes(), 247_316_512);
+        assert_eq!(layout.owner_bytes(), 631_265_760);
+        assert_eq!(layout.arena_bytes(), 631_266_304);
+        assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 544);
     }
 
     #[test]

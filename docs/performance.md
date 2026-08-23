@@ -175,7 +175,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-long-context-paged-gqa` | Check every partition bucket through 220,000 positions, all partial/reduction seams, untouched scratch, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-attention-output` | Check sigmoid gating, the published FP32 seam, dynamic E4M3 quantization, source-native projection, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact B=1..8 and T=32/64/128/1024 graph, all working and residual seams, tensor-map immutability, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact-B graphs, stable addresses, and owner allocation | terminal |
+| `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact B=1..8 and T=32/64/128/1024 graphs, tensor-map immutability, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT` | Check complete source layer-63 attention/MLP seams, represented KV cache, exact B=1..8 and T=32/64/128/1024 graphs, P4 macro partials, immutable tensor maps, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-full-attention-layer SNAPSHOT` | Check complete Qwen3.5 source layer-31 attention/MLP seams, BF16 KV cache, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-resident-model SNAPSHOT` | Check all 64 source routes, final source-backed formulas, dynamic page recycling/remapping and isolated reset, persistent state/cache, short plus six-bucket exact-B whole-model graphs, independent long-attention seam formulas, stable device/host addresses, and owner allocation | terminal |
@@ -318,9 +318,9 @@ reviewed baseline.
 down projection. It remains outside leaf-wide `perf` until a locked-clock local baseline is
 reviewed.
 
-`bench-dense-fp8-gdn-layer SNAPSHOT` measures the complete stateful layer-60 graph. Repeated samples
-advance its persistent history and FP32 recurrence exactly as serial decode rounds do; setup and
-allocation remain outside the timed region.
+`bench-dense-fp8-gdn-layer SNAPSHOT` measures each complete stateful layer-60 decode and prefill
+graph after an untimed production-owner reset of its history and FP32 recurrence. It reports exact
+`B=1..8` and `T=32,64,128,1024` routes; setup and allocation remain outside the timed region.
 
 `bench-full-attention-layer SNAPSHOT` directly measures the complete layer-63 graphs rather than
 summing leaf medians. Decode uses a 131-token warm cache that crosses both 64-token page seams;
@@ -705,8 +705,8 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 - Decode operator coverage is exact `B=1..8`; prefill remains limited to the explicitly listed
   residual norm, FP8-QKV, Q/K preparation/cache-append, shared early-context, partitioned deep-tail
   and macro paged-GQA, attention-output, dense-FP8 MLP, full-attention-layer, FP8-GDN-input,
-  GDN-prepare, GDN-recurrence, and GDN-output routes. GDN layer composition and resident integration
-  still need complete routes before the server can stop priming through decode.
+  GDN-prepare, GDN-recurrence, GDN-output, and dense-FP8 GDN-layer routes. Resident integration still
+  needs complete routes before the server can stop priming through decode.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
 - There is no full-server TTFT, inter-token-latency, concurrency, prefix-reuse, or end-to-end MTP
   benchmark in this repository yet. Direct long-context operator and resident-model timing exists.
