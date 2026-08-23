@@ -16,13 +16,15 @@ preparation covers zero-centered normalization, the 64-wide three-axis MRoPE, an
 KV-cache append at exact `B=1..8` and `T=32,64,128,1024`. Short-context paged GQA covers exact
 24-query/4-KV-head, 256-wide online-softmax decode across page boundaries at `B=1..8` plus causal
 shared-cache prefill tails at `T=32,64,128`. Each prefill CTA stages one 64-position represented
-E4M3 K/V tile once for two adjacent tokens and their twelve grouped-query warps. Long-context paged
-GQA retains
+E4M3 K/V tile once for two adjacent tokens and their twelve grouped-query warps. Deep `T=128`
+prefill tails select eight partitions for contexts 129 through 32,768 and sixteen partitions
+through 220,000, publish complete FP32 maximum/denominator/numerator states, and reduce them into
+the public output seam. Long-context paged GQA retains
 the same represented cache contract and partitions contexts through 220,000 positions into
-256-position partial softmaxes plus one exact reduction at `B=1..8`; partitioned deep-tail and
-macro-prefill attention remain separate future routes. The resident text owner composes all 48 GDN layers, 16
-attention layers, source-routed MLPs, and the LM head into one directly timed graph at every exact
-`B=1..8`; serving cases remain future work.
+256-position partial softmaxes plus one exact reduction at `B=1..8`; macro-prefill attention
+remains a separate future route. The resident text owner composes all 48 GDN layers, 16 attention
+layers, source-routed MLPs, and the LM head into one directly timed graph at every exact `B=1..8`;
+serving cases remain future work.
 
 SM89 has separate remote-only diagnostic suites for the exact `[34816,5120]` NVFP4 gate/up,
 `[5120,17408]` down, and dynamic-quantize FP8 `[14336,5120]` QKV owners at `B=1..8`. The NVFP4
@@ -147,7 +149,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-gdn-recurrence` | Check mapped FP32 state transitions, gated normalization, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-gdn-output` | Check dynamic E4M3 quantization, source-native output projection, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-attention-qk-prepare` | Check Q/K zero-centered normalization, three-axis MRoPE, represented E4M3 cache append, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-paged-gqa` | Check exact page lookup, grouped-head mapping, represented E4M3 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8 and shared T=32/64/128 prefill | terminal |
+| `cargo run -p xtask -- qualify-paged-gqa` | Check exact page lookup, grouped-head mapping, represented E4M3 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8, shared T=32/64/128 prefill, and partitioned T=128 P8/P16 deep tails | terminal |
 | `cargo run -p xtask -- qualify-long-context-paged-gqa` | Check every partition bucket through 220,000 positions, all partial/reduction seams, untouched scratch, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-attention-output` | Check sigmoid gating, the published FP32 seam, dynamic E4M3 quantization, source-native projection, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact-B graph, stable addresses, and owner allocation | terminal |
@@ -161,7 +163,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-gdn-recurrence` | Measure every exact stateful recurrence graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-output` | Measure every exact output quantize-plus-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-qk-prepare` | Measure every exact Q/K prepare and cache-append graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-paged-gqa` | Measure exact B=1..8 graphs at a 130-token context plus causal shared T=32/64/128 prefill graphs | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-paged-gqa` | Measure exact B=1..8 graphs at a 130-token context, causal shared T=32/64/128 graphs, and partitioned T=128 graphs at contexts 32,768 and 98,304 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-long-context-paged-gqa` | Measure every exact two-stage paged GQA graph with the complete 3,438-page pool divided among active slots | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-output` | Measure every exact sigmoid-gate, quantize, and output-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-nvfp4-swiglu` | Measure every exact retained A16/W4A4 NVFP4 gate/up SwiGLU graph | terminal or `--json PATH` |
@@ -389,7 +391,9 @@ those immutable padding reads.
 Paged GQA `B=1..8` cases are `operator/decode` at context 130. Its shared `T=32,64,128` cases are
 `operator/prefill`; token `i` attends a two-token prefix plus the causal span through `i`. Logical
 bytes charge each K/V tile once per adjacent-token/KV-head group rather than duplicating its six
-query-head consumers.
+query-head consumers. The partitioned `T=128` P8/P16 cases are also `operator/prefill`; accounting
+includes repeated per-partition query reads, one K/V load per adjacent-token/KV-head group, and
+both the producer writes and reducer reads of every complete FP32 partial state.
 Dense-FP8-SwiGLU `T=32,64,128` cases are `operator/prefill` cases with prompt and context lengths
 equal to the active rows. Concurrency, output, and prefix cache do not apply to these leaf suites.
 
@@ -606,9 +610,9 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 ## Current limitations
 
 - Decode operator coverage is exact `B=1..8`; prefill remains limited to the explicitly listed
-  FP8-QKV, Q/K preparation/cache-append, shared early-context paged-GQA, and dense-FP8 SwiGLU
-  routes. Deep-tail/macro attention, output, MLP, and GDN prefill need complete routes before the
-  resident program can stop priming through decode.
+  FP8-QKV, Q/K preparation/cache-append, shared early-context and partitioned deep-tail paged-GQA,
+  and dense-FP8 SwiGLU routes. Macro attention, output, MLP, and GDN prefill need complete routes
+  before the resident program can stop priming through decode.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
 - There is no full-server TTFT, inter-token-latency, concurrency, prefix-reuse, or end-to-end MTP
   benchmark in this repository yet. Direct long-context operator and resident-model timing exists.

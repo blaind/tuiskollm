@@ -56,7 +56,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         #[cfg(feature = "device")]
         "paged-gqa" => {
             let (options, json_path) =
-                parse_options(arguments, DeviceBenchmarkOptions::short_graph())?;
+                parse_options(arguments, DeviceBenchmarkOptions::long_graph())?;
             (benchmark_paged_gqa(options)?, json_path)
         }
         #[cfg(feature = "device")]

@@ -4241,8 +4241,30 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
                 .starts_with("paged_gqa_prefill_shared_exact_TID_")
         })
         .collect::<Vec<_>>();
+    let prefill_partials = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("paged_gqa_prefill_partitioned_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    let prefill_reductions = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("paged_gqa_prefill_partitioned_reduce_exact_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("paged GQA", attention.len(), 8)?;
     require_count("shared prefill paged GQA", prefill.len(), 3)?;
+    require_count("partitioned prefill paged GQA", prefill_partials.len(), 2)?;
+    require_count(
+        "partitioned prefill paged GQA reduction",
+        prefill_reductions.len(),
+        2,
+    )?;
     for entry in &attention {
         if !entry.body.contains(".reqntid 32, 1, 1") || !entry.body.contains(".minnctapersm 16") {
             return Err(format!(
@@ -4262,6 +4284,27 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         }
         if !entry.body.contains("__dynamic_smem__") {
             return Err(format!("entry `{}` lost dynamic shared memory", entry.name).into());
+        }
+    }
+    for entry in &prefill_partials {
+        if !entry.body.contains(".reqntid 384, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 384-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        if !entry.body.contains("__dynamic_smem__") {
+            return Err(format!("entry `{}` lost dynamic shared memory", entry.name).into());
+        }
+    }
+    for entry in &prefill_reductions {
+        if !entry.body.contains(".reqntid 32, 1, 1") || !entry.body.contains(".minnctapersm 16") {
+            return Err(format!(
+                "entry `{}` lost its 32-thread/sixteen-CTA launch bounds",
+                entry.name
+            )
+            .into());
         }
     }
 
@@ -4290,6 +4333,8 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
     let sass = String::from_utf8(sass.stdout)?;
     let mut registers = Vec::new();
     let mut prefill_registers = Vec::new();
+    let mut prefill_partial_registers = Vec::new();
+    let mut prefill_reduce_registers = Vec::new();
     let mut shared = Vec::new();
     for entry in attention {
         let resource = resources
@@ -4327,17 +4372,65 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    for entry in prefill_partials {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        prefill_partial_registers.push(resource.registers);
+        shared.push(resource.shared);
+
+        let body = sass_function_body(&sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        for instruction in ["F2FP.F16.E4M3.UNPACK_B", "SHFL.BFLY", "MUFU.EX2", "LDGSTS"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+    }
+    for entry in prefill_reductions {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        prefill_reduce_registers.push(resource.registers);
+        shared.push(resource.shared);
+
+        let body = sass_function_body(&sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        if !body.contains("MUFU.EX2") {
+            return Err(format!("entry `{}` lost required `MUFU.EX2` SASS", entry.name).into());
+        }
+    }
     registers.sort_unstable();
     prefill_registers.sort_unstable();
+    prefill_partial_registers.sort_unstable();
+    prefill_reduce_registers.sort_unstable();
     require_registers(&baseline, "attention_registers", &registers)?;
     if baseline.contains_key("prefill_shared_registers") {
         require_registers(&baseline, "prefill_shared_registers", &prefill_registers)?;
     }
+    if baseline.contains_key("prefill_partition_registers") {
+        require_registers(
+            &baseline,
+            "prefill_partition_registers",
+            &prefill_partial_registers,
+        )?;
+    }
+    if baseline.contains_key("prefill_reduce_registers") {
+        require_registers(
+            &baseline,
+            "prefill_reduce_registers",
+            &prefill_reduce_registers,
+        )?;
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "paged GQA gate passed: 8 decode + 3 shared prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/SHFL/EX2/LDGSTS present",
-        registers, prefill_registers, shared
+        "paged GQA gate passed: 8 decode + 3 shared + 2 partition + 2 reduction entries, REG {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/SHFL/EX2/LDGSTS present",
+        registers, prefill_registers, prefill_partial_registers, prefill_reduce_registers, shared
     );
     Ok(())
 }
