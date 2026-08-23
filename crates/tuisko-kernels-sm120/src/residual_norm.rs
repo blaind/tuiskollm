@@ -1024,7 +1024,11 @@ mod tests {
     fn qwen35_ptx_inventory_has_two_distinct_entries_per_batch() {
         let qwen38 = residual_norm_ptx_names();
         let qwen35 = qwen35_residual_norm_ptx_names();
-        let unique = qwen38.into_iter().chain(qwen35).collect::<BTreeSet<_>>();
+        let unique = qwen38
+            .iter()
+            .chain(&qwen35)
+            .copied()
+            .collect::<BTreeSet<_>>();
 
         assert_eq!(qwen35.len(), 2 * MAX_BATCH);
         assert_eq!(unique.len(), qwen38.len() + qwen35.len());
