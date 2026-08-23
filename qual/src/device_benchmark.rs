@@ -12,12 +12,14 @@ use std::process::{Command, Output};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tuisko_gpu::{CudaGraph, CudaStream, GpuTimer};
 
 const DEVICE_INDEX: &str = "0";
 const MAX_IDLE_MEMORY_MIB: u32 = 1_024;
 const MIN_TELEMETRY_SAMPLES: usize = 3;
+const LOADED_CLOCK_PROBE_DURATION: Duration = Duration::from_secs(2);
+const MAX_LOADED_CLOCK_PROBE_REPLAYS: u64 = 1_000_000;
 const DIAGNOSTIC_CLOCK_ENV: &str = "TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT";
 const CLOCK_RESET_COMMAND: &str =
     "sudo nvidia-smi -i 0 --reset-gpu-clocks && sudo nvidia-smi -i 0 --reset-memory-clocks";
@@ -1049,6 +1051,8 @@ pub(crate) fn measure_cases(
         ));
     }
 
+    validate_loaded_clock_policy(stream, timer, cases)?;
+
     let mut tasks = Vec::with_capacity(cases.len() * 2);
     for (index, case) in cases.iter().enumerate() {
         tasks.push(MeasurementTask::Leaf(index));
@@ -1157,6 +1161,94 @@ pub(crate) fn measure_cases(
     };
 
     Ok((metrics, energy_metrics, telemetry))
+}
+
+fn validate_loaded_clock_policy(
+    stream: &CudaStream,
+    timer: &GpuTimer,
+    cases: &[ExactDeviceCase<'_>],
+) -> Result<(), DeviceBenchmarkError> {
+    let case = cases
+        .iter()
+        .max_by_key(|case| case.logical_bytes)
+        .expect("nonempty cases checked by caller");
+    let sampler = TelemetrySampler::start();
+    let mut measured = Duration::ZERO;
+    let mut replays = 1;
+    let started = Instant::now();
+    while measured < LOADED_CLOCK_PROBE_DURATION || started.elapsed() < LOADED_CLOCK_PROBE_DURATION
+    {
+        let elapsed = timer.measure(stream, || {
+            for _ in 0..replays {
+                launch_clock_probe_unit(stream, case)?;
+            }
+
+            Ok(())
+        })?;
+        measured += elapsed;
+        if measured < LOADED_CLOCK_PROBE_DURATION {
+            replays = loaded_clock_probe_replays(
+                LOADED_CLOCK_PROBE_DURATION - measured,
+                elapsed,
+                replays,
+            )?;
+        }
+    }
+    let telemetry = sampler.finish().map_err(|error| match error {
+        DeviceBenchmarkError::Precondition(reason) => DeviceBenchmarkError::Precondition(format!(
+            "loaded clock probe refused before full timing: {reason}"
+        )),
+        other => other,
+    })?;
+    require_current_process_exclusive()?;
+    eprintln!(
+        "loaded clock probe passed: {} {}, SM {}..{} MHz (median {}), memory {}..{} MHz, {} samples",
+        case.route,
+        case.shape,
+        telemetry.sm_minimum_mhz,
+        telemetry.sm_maximum_mhz,
+        telemetry.sm_median_mhz,
+        telemetry.memory_minimum_mhz,
+        telemetry.memory_maximum_mhz,
+        telemetry.samples,
+    );
+
+    Ok(())
+}
+
+fn launch_clock_probe_unit(
+    stream: &CudaStream,
+    case: &ExactDeviceCase<'_>,
+) -> Result<(), tuisko_gpu::GpuError> {
+    if let Some(repeated) = &case.repeated {
+        repeated.graph.launch(stream)
+    } else {
+        if let Some(preparation) = case.preparation_graph {
+            preparation.launch(stream)?;
+        }
+        case.leaf_graph.launch(stream)
+    }
+}
+
+fn loaded_clock_probe_replays(
+    remaining: Duration,
+    elapsed: Duration,
+    completed_replays: u64,
+) -> Result<u64, DeviceBenchmarkError> {
+    let elapsed_nanos = elapsed.as_nanos();
+    if elapsed_nanos == 0 || completed_replays == 0 {
+        return Err(DeviceBenchmarkError::Precondition(
+            "loaded clock probe produced zero work or device duration".to_string(),
+        ));
+    }
+    let replays = remaining
+        .as_nanos()
+        .saturating_mul(u128::from(completed_replays))
+        .div_ceil(elapsed_nanos);
+
+    Ok(u64::try_from(replays)
+        .unwrap_or(u64::MAX)
+        .clamp(1, MAX_LOADED_CLOCK_PROBE_REPLAYS))
 }
 
 fn measure_energy(
@@ -1446,7 +1538,7 @@ fn telemetry_evidence(
 fn clock_drift_message(kind: &str, minimum_mhz: u32, maximum_mhz: u32) -> String {
     if let Some(lock) = CLOCK_LOCK_COMMAND {
         format!(
-            "{kind} clock moved from {minimum_mhz} to {maximum_mhz} MHz\nlock target clocks before the run:\n  {lock}\nreset them afterward:\n  {CLOCK_RESET_COMMAND}"
+            "{kind} clock moved from {minimum_mhz} to {maximum_mhz} MHz\nlock target clocks before the run:\n  {lock}\nreset them afterward:\n  {CLOCK_RESET_COMMAND}\nfor an explicitly non-authoritative diagnostic report, set `{DIAGNOSTIC_CLOCK_ENV}=1`; diagnostic reports cannot be blessed"
         )
     } else {
         format!(
@@ -1711,9 +1803,10 @@ mod tests {
     use super::{
         BenchmarkMemoryKind, BenchmarkMemoryMeasurement, ComputeProcess, DeviceMemoryMetric,
         DeviceMemorySnapshot, MemoryComparison, MemoryRecorder, TelemetryEvidence, TelemetrySample,
-        measurement_order, parse_compute_processes, parse_process_memory, telemetry_evidence,
-        validate_compute_process_count,
+        loaded_clock_probe_replays, measurement_order, parse_compute_processes,
+        parse_process_memory, telemetry_evidence, validate_compute_process_count,
     };
+    use std::time::Duration;
 
     const MIB: u64 = 1024 * 1024;
 
@@ -1756,6 +1849,30 @@ mod tests {
         assert_eq!(evidence.power_median_watts, 230.0);
         assert_eq!(evidence.device_memory_maximum_used_bytes, 102 * 1024 * 1024);
         assert_eq!(evidence.device_memory_minimum_free_bytes, 898 * 1024 * 1024);
+    }
+
+    #[test]
+    fn loaded_clock_probe_targets_two_seconds_without_unbounded_submission() {
+        assert_eq!(
+            loaded_clock_probe_replays(Duration::from_secs(2), Duration::from_millis(500), 1,)
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            loaded_clock_probe_replays(Duration::from_secs(1), Duration::from_micros(2), 1)
+                .unwrap(),
+            500_000
+        );
+        assert_eq!(
+            loaded_clock_probe_replays(Duration::from_secs(2), Duration::from_micros(1), 1)
+                .unwrap(),
+            1_000_000
+        );
+        assert!(loaded_clock_probe_replays(Duration::from_secs(1), Duration::ZERO, 1).is_err());
+        assert!(
+            loaded_clock_probe_replays(Duration::from_secs(1), Duration::from_millis(1), 0)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1825,6 +1942,8 @@ mod tests {
         assert!(error.contains("--lock-memory-clocks=14001,14001"));
         assert!(error.contains("--reset-gpu-clocks"));
         assert!(error.contains("--reset-memory-clocks"));
+        assert!(error.contains("TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT=1"));
+        assert!(error.contains("diagnostic reports cannot be blessed"));
 
         let evidence =
             telemetry_evidence(vec![sample(13_601), sample(14_001), sample(14_001)], true)

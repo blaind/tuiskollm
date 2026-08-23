@@ -95,6 +95,17 @@ target/benchmarks/perf-smoke/attention-output.json
 Every performance command also executes the release SM120 build and checks the PTX/SASS entry and
 resource inventory before launching the benchmark.
 
+After owner warmup, the runner sustains the production graph for at least two seconds and applies
+the checked clock-spread policy before collecting the full rotated sample matrix. An unlocked or
+otherwise incomparable device therefore refuses before a long suite spends its timing window.
+The same clock policy remains in force over the complete measurement; the probe is an early guard,
+not a substitute for final telemetry.
+
+To retain exploratory timings on an intentionally uncontrolled clock, set
+`TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT=1`. The resulting JSON records
+`clock_policy: diagnostic_uncontrolled`; `perf bless` refuses it, so diagnostic evidence cannot
+silently become performance authority.
+
 ## Command reference
 
 | Command | Purpose | Output |
