@@ -5,6 +5,7 @@ mod performance;
 mod remote;
 
 use gpu_target::BuildTargetProfile;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
@@ -49,13 +50,45 @@ const RESIDENT_MODEL_RESOURCE_BASELINES: &[&str] = &[
     LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE,
     ATTENTION_OUTPUT_RESOURCE_BASELINE,
 ];
+const NVFP4_MLP_RESOURCE_BASELINES: &[&str] = &[
+    RESIDUAL_NORM_RESOURCE_BASELINE,
+    NVFP4_SWIGLU_RESOURCE_BASELINE,
+    NVFP4_DOWN_RESOURCE_BASELINE,
+];
+const DENSE_FP8_MLP_RESOURCE_BASELINES: &[&str] = &[
+    RESIDUAL_NORM_RESOURCE_BASELINE,
+    FP8_SWIGLU_RESOURCE_BASELINE,
+    FP8_DOWN_RESOURCE_BASELINE,
+];
+const DENSE_FP8_GDN_LAYER_RESOURCE_BASELINES: &[&str] = &[
+    RESIDUAL_NORM_RESOURCE_BASELINE,
+    FP8_GDN_INPUT_RESOURCE_BASELINE,
+    GDN_PREPARE_RESOURCE_BASELINE,
+    GDN_RECURRENCE_RESOURCE_BASELINE,
+    GDN_OUTPUT_RESOURCE_BASELINE,
+    FP8_SWIGLU_RESOURCE_BASELINE,
+    FP8_DOWN_RESOURCE_BASELINE,
+];
+const FULL_ATTENTION_LAYER_RESOURCE_BASELINES: &[&str] = &[
+    RESIDUAL_NORM_RESOURCE_BASELINE,
+    FP8_QKV_RESOURCE_BASELINE,
+    ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+    PAGED_GQA_RESOURCE_BASELINE,
+    ATTENTION_OUTPUT_RESOURCE_BASELINE,
+    FP8_SWIGLU_RESOURCE_BASELINE,
+    FP8_DOWN_RESOURCE_BASELINE,
+];
+const TEXT_ENDPOINT_RESOURCE_BASELINES: &[&str] = &[
+    RESIDUAL_NORM_RESOURCE_BASELINE,
+    FP8_LM_HEAD_RESOURCE_BASELINE,
+];
 const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
 const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build-sm120";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
 const CUDA_OXIDE_REPOSITORY: &str = "https://github.com/NVlabs/cuda-oxide.git";
 const CUDA_OXIDE_REVISION: &str = "1f4d813719012d384f2db12b88efc9314c8bf50c";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PerformanceSuite {
     ResidualNorm,
     Fp8Qkv,
@@ -90,6 +123,28 @@ const PERFORMANCE_SUITES: [PerformanceSuite; 15] = [
     PerformanceSuite::PagedGqa,
     PerformanceSuite::LongContextPagedGqa,
     PerformanceSuite::AttentionOutput,
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OptimizationSuite {
+    Leaf(PerformanceSuite),
+    Nvfp4Mlp,
+    DenseFp8Mlp,
+    DenseFp8GdnLayer,
+    FullAttentionLayer,
+    TextEndpoint,
+    ResidentModel,
+    ResidentLongContextModel,
+}
+
+const COMPOSED_PERFORMANCE_SUITES: [OptimizationSuite; 7] = [
+    OptimizationSuite::Nvfp4Mlp,
+    OptimizationSuite::DenseFp8Mlp,
+    OptimizationSuite::DenseFp8GdnLayer,
+    OptimizationSuite::FullAttentionLayer,
+    OptimizationSuite::TextEndpoint,
+    OptimizationSuite::ResidentModel,
+    OptimizationSuite::ResidentLongContextModel,
 ];
 
 impl PerformanceSuite {
@@ -195,11 +250,144 @@ impl PerformanceSuite {
     }
 }
 
+impl OptimizationSuite {
+    fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
+        if let Ok(suite) = PerformanceSuite::parse(value) {
+            return Ok(Self::Leaf(suite));
+        }
+        COMPOSED_PERFORMANCE_SUITES
+            .iter()
+            .copied()
+            .find(|suite| suite.name() == value)
+            .ok_or_else(|| format!("unknown optimization suite `{value}`").into())
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Leaf(suite) => suite.name(),
+            Self::Nvfp4Mlp => "nvfp4-mlp",
+            Self::DenseFp8Mlp => "dense-fp8-mlp",
+            Self::DenseFp8GdnLayer => "dense-fp8-gdn-layer",
+            Self::FullAttentionLayer => "full-attention-layer",
+            Self::TextEndpoint => "text-endpoint",
+            Self::ResidentModel => "resident-model",
+            Self::ResidentLongContextModel => "resident-long-context-model",
+        }
+    }
+
+    const fn requires_snapshot(self) -> bool {
+        !matches!(self, Self::Leaf(_))
+    }
+
+    fn resource_baselines(self) -> Vec<&'static str> {
+        match self {
+            Self::Leaf(suite) => vec![suite.resource_baseline()],
+            Self::Nvfp4Mlp => NVFP4_MLP_RESOURCE_BASELINES.to_vec(),
+            Self::DenseFp8Mlp => DENSE_FP8_MLP_RESOURCE_BASELINES.to_vec(),
+            Self::DenseFp8GdnLayer => DENSE_FP8_GDN_LAYER_RESOURCE_BASELINES.to_vec(),
+            Self::FullAttentionLayer => FULL_ATTENTION_LAYER_RESOURCE_BASELINES.to_vec(),
+            Self::TextEndpoint => TEXT_ENDPOINT_RESOURCE_BASELINES.to_vec(),
+            Self::ResidentModel | Self::ResidentLongContextModel => {
+                RESIDENT_MODEL_RESOURCE_BASELINES.to_vec()
+            }
+        }
+    }
+
+    const fn performance_baseline(self) -> &'static str {
+        match self {
+            Self::Leaf(suite) => suite.performance_baseline(),
+            Self::Nvfp4Mlp => "qual/baselines/nvfp4-mlp-sm120.json",
+            Self::DenseFp8Mlp => "qual/baselines/dense-fp8-mlp-sm120.json",
+            Self::DenseFp8GdnLayer => "qual/baselines/dense-fp8-gdn-layer-sm120.json",
+            Self::FullAttentionLayer => "qual/baselines/full-attention-layer-sm120.json",
+            Self::TextEndpoint => "qual/baselines/text-endpoint-sm120.json",
+            Self::ResidentModel => "qual/baselines/resident-model-sm120.json",
+            Self::ResidentLongContextModel => {
+                "qual/baselines/resident-long-context-model-sm120.json"
+            }
+        }
+    }
+
+    fn qualify(self, root: &Path, snapshot: Option<&OsStr>) -> Result<(), Box<dyn Error>> {
+        let snapshot_arguments = || -> Result<[std::ffi::OsString; 1], Box<dyn Error>> {
+            Ok([snapshot
+                .ok_or_else(|| format!("{} requires the admitted snapshot path", self.name()))?
+                .to_os_string()])
+        };
+        match self {
+            Self::Leaf(suite) => suite.qualify(root),
+            Self::Nvfp4Mlp => qualify_nvfp4_mlp(root, &snapshot_arguments()?),
+            Self::DenseFp8Mlp => qualify_dense_fp8_mlp(root, &snapshot_arguments()?),
+            Self::DenseFp8GdnLayer => qualify_dense_fp8_gdn_layer(root, &snapshot_arguments()?),
+            Self::FullAttentionLayer => qualify_full_attention_layer(root, &snapshot_arguments()?),
+            Self::TextEndpoint => qualify_text_endpoint(root, &snapshot_arguments()?),
+            Self::ResidentModel | Self::ResidentLongContextModel => {
+                qualify_resident_model(root, &snapshot_arguments()?)
+            }
+        }
+    }
+
+    fn dependency_cone(self) -> Vec<Self> {
+        use OptimizationSuite::{
+            DenseFp8GdnLayer, DenseFp8Mlp, FullAttentionLayer, Nvfp4Mlp, ResidentLongContextModel,
+            ResidentModel, TextEndpoint,
+        };
+        use PerformanceSuite::{
+            AttentionOutput, AttentionQkPrepare, Fp8Down, Fp8GdnInput, Fp8LmHead, Fp8Qkv,
+            Fp8SwiGlu, GdnOutput, GdnPrepare, GdnRecurrence, LongContextPagedGqa, Nvfp4Down,
+            Nvfp4SwiGlu, PagedGqa, ResidualNorm,
+        };
+
+        let downstream = match self {
+            Self::ResidentModel | Self::ResidentLongContextModel => &[][..],
+            Self::Leaf(LongContextPagedGqa) => &[ResidentLongContextModel],
+            Self::Leaf(Nvfp4SwiGlu | Nvfp4Down) | Self::Nvfp4Mlp => {
+                &[Nvfp4Mlp, ResidentModel, ResidentLongContextModel]
+            }
+            Self::Leaf(Fp8LmHead) | Self::TextEndpoint => {
+                &[TextEndpoint, ResidentModel, ResidentLongContextModel]
+            }
+            Self::Leaf(Fp8GdnInput | GdnPrepare | GdnRecurrence | GdnOutput)
+            | Self::DenseFp8GdnLayer => {
+                &[DenseFp8GdnLayer, ResidentModel, ResidentLongContextModel]
+            }
+            Self::Leaf(Fp8Qkv | AttentionQkPrepare | PagedGqa | AttentionOutput)
+            | Self::FullAttentionLayer => {
+                &[FullAttentionLayer, ResidentModel, ResidentLongContextModel]
+            }
+            Self::Leaf(Fp8SwiGlu | Fp8Down) | Self::DenseFp8Mlp => &[
+                DenseFp8Mlp,
+                DenseFp8GdnLayer,
+                FullAttentionLayer,
+                ResidentModel,
+                ResidentLongContextModel,
+            ],
+            Self::Leaf(ResidualNorm) => &[
+                Nvfp4Mlp,
+                DenseFp8Mlp,
+                DenseFp8GdnLayer,
+                FullAttentionLayer,
+                TextEndpoint,
+                ResidentModel,
+                ResidentLongContextModel,
+            ],
+        };
+        let mut cone = vec![self];
+        for suite in downstream {
+            if !cone.contains(suite) {
+                cone.push(*suite);
+            }
+        }
+
+        cone
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|build-server|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-nvfp4-mlp|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-long-context-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-resident-model|qualify-resident-generation|qualify-resident-batch-generation|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-resident-model|bench-resident-long-context-model|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-nvfp4-swiglu|gate-nvfp4-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-long-context-paged-gqa|gate-attention-output|perf|remote>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|build-server|qualify-...|bench-...|gate-...|perf|profile|remote>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -285,6 +473,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("gate-attention-output") if remaining.is_empty() => gate_attention_output(root),
         Some("perf") => perf(root, &remaining),
+        Some("profile") => profile(root, &remaining),
         Some("remote") => remote::run(root, &remaining),
         Some(known)
             if matches!(
@@ -1573,34 +1762,623 @@ fn run_benchmark_suite(
     Ok(())
 }
 
+fn run_optimization_benchmark(
+    root: &Path,
+    suite: OptimizationSuite,
+    snapshot: Option<&OsStr>,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    if let OptimizationSuite::Leaf(leaf) = suite {
+        return run_benchmark_suite(root, leaf, arguments);
+    }
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let snapshot =
+        snapshot.ok_or_else(|| format!("{} requires the admitted snapshot path", suite.name()))?;
+    let mut baselines = Vec::new();
+    for baseline in suite.resource_baselines() {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    let mut command = Command::new(executable);
+    command
+        .arg(suite.name())
+        .arg(snapshot)
+        .args(arguments)
+        .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines));
+    run_visible(&mut command)
+}
+
+fn profile(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    let [scope, snapshot, remaining @ ..] = arguments else {
+        return Err("usage: cargo run -p xtask -- profile resident-model SNAPSHOT [--batch B] [--replays N] [--tool nsys|ncu] [--kernel REGEX] [--output-dir PATH]".into());
+    };
+    if scope != "resident-model" {
+        return Err(format!("unknown profile scope `{}`", scope.to_string_lossy()).into());
+    }
+    let mut batch = 1u32;
+    let mut replays = 3u64;
+    let mut tool = "nsys";
+    let mut kernel = None;
+    let mut output_dir = None;
+    let mut options = remaining.iter();
+    while let Some(argument) = options.next() {
+        let value = options
+            .next()
+            .ok_or_else(|| format!("`{}` requires a value", argument.to_string_lossy()))?;
+        match argument.to_str().ok_or("profile argument is not UTF-8")? {
+            "--batch" => batch = value.to_str().ok_or("batch is not UTF-8")?.parse()?,
+            "--replays" => replays = value.to_str().ok_or("replays is not UTF-8")?.parse()?,
+            "--tool" => tool = value.to_str().ok_or("profile tool is not UTF-8")?,
+            "--kernel" => kernel = Some(value.to_str().ok_or("kernel filter is not UTF-8")?),
+            "--output-dir" => output_dir = Some(PathBuf::from(value)),
+            option => return Err(format!("unknown profile option `{option}`").into()),
+        }
+    }
+    if !(1..=8).contains(&batch) || replays == 0 {
+        return Err("resident profile requires `--batch 1..=8` and nonzero `--replays`".into());
+    }
+    if !matches!(tool, "nsys" | "ncu") {
+        return Err("resident profile tool must be `nsys` or `ncu`".into());
+    }
+    if tool == "ncu" && kernel.is_none() {
+        return Err("resident `ncu` profiling requires `--kernel REGEX`".into());
+    }
+
+    build_sm120(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let output_dir =
+        output_dir.unwrap_or_else(|| root.join(format!("target/profiles/resident-model-b{batch}")));
+    fs::create_dir_all(&output_dir)?;
+    let stem = format!("resident-model-b{batch}");
+    let graph_dot = output_dir.join(format!("{stem}-graph.dot"));
+    let manifest = output_dir.join(format!("{stem}-semantic.json"));
+    let profile_prefix = output_dir.join(format!("{stem}-{tool}"));
+    let warmup_launches = if tool == "ncu" { 1 } else { 16 };
+    let profile_arguments = [
+        "profile-resident-model".into(),
+        snapshot.clone(),
+        "--batch".into(),
+        batch.to_string().into(),
+        "--warmup-launches".into(),
+        warmup_launches.to_string().into(),
+        "--captured-replays".into(),
+        replays.to_string().into(),
+        "--graph-dot".into(),
+        graph_dot.as_os_str().to_os_string(),
+        "--manifest".into(),
+        manifest.as_os_str().to_os_string(),
+    ];
+    let tool_path = cuda_tool(tool);
+    let mut command = Command::new(&tool_path);
+    if tool == "nsys" {
+        command.args([
+            "profile",
+            "--trace=cuda",
+            "--sample=none",
+            "--cpuctxsw=none",
+            "--capture-range=cudaProfilerApi",
+            "--capture-range-end=stop",
+            "--cuda-graph-trace=node",
+            "--force-overwrite=true",
+        ]);
+        command.arg("--output").arg(&profile_prefix);
+    } else {
+        command.args([
+            "--profile-from-start=off",
+            "--target-processes=all",
+            "--set=full",
+            "--launch-count=1",
+            "--force-overwrite",
+        ]);
+        command
+            .arg("--kernel-name")
+            .arg(kernel.expect("ncu kernel filter checked"))
+            .arg("--export")
+            .arg(&profile_prefix);
+    }
+    command.arg(&executable).args(&profile_arguments);
+    run_visible(&mut command)?;
+
+    if tool == "nsys" {
+        let report = profile_prefix.with_extension("nsys-rep");
+        let sqlite = output_dir.join(format!("{stem}-nsys.sqlite"));
+        run_visible(
+            Command::new(&tool_path)
+                .args(["export", "--type=sqlite", "--force-overwrite=true"])
+                .arg("--output")
+                .arg(&sqlite)
+                .arg(&report),
+        )?;
+        postprocess_resident_nsys(&sqlite, &manifest, &output_dir, &stem)?;
+    }
+
+    let tool_identity = run_captured(Command::new(&tool_path).arg("--version"))?;
+    let git_commit = command_text("git", &["-C", path_text(root)?, "rev-parse", "HEAD"])?;
+    let git_status = command_text("git", &["-C", path_text(root)?, "status", "--short"])?;
+    let device = command_text(
+        "nvidia-smi",
+        &[
+            "-i",
+            "0",
+            "--query-gpu=name,uuid,driver_version,clocks.current.sm,clocks.current.memory,temperature.gpu,power.draw.instant",
+            "--format=csv,noheader",
+        ],
+    )?;
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "scope": "resident-model",
+        "batch_size": batch,
+        "captured_replays": replays,
+        "warmup_launches": warmup_launches,
+        "tool": tool,
+        "tool_path": tool_path,
+        "tool_identity": tool_identity.trim(),
+        "binary_sha256": sha256(&fs::read(&executable)?),
+        "git_commit": git_commit.trim(),
+        "git_status": git_status.lines().collect::<Vec<_>>(),
+        "device_after_capture": device.trim(),
+        "graph_dot": graph_dot,
+        "semantic_manifest": manifest,
+    });
+    let metadata_path = output_dir.join(format!("{stem}-{tool}-metadata.json"));
+    let mut json = serde_json::to_vec_pretty(&metadata)?;
+    json.push(b'\n');
+    fs::write(&metadata_path, json)?;
+    println!("profile artifacts: {}", output_dir.display());
+
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ProfileKernelSample {
+    start_ns: u64,
+    end_ns: u64,
+}
+
+struct ProfileNodeSamples {
+    graph_node_id: u64,
+    kernel: String,
+    samples: Vec<ProfileKernelSample>,
+}
+
+struct SemanticProfileNode {
+    layer: Option<usize>,
+    component: String,
+    source_route: String,
+    kernel_family: String,
+}
+
+fn postprocess_resident_nsys(
+    sqlite: &Path,
+    manifest: &Path,
+    output_dir: &Path,
+    stem: &str,
+) -> Result<(), Box<dyn Error>> {
+    let manifest_json: serde_json::Value = serde_json::from_slice(&fs::read(manifest)?)?;
+    let expected_nodes = manifest_json["graph_kernel_nodes"]
+        .as_u64()
+        .ok_or("resident semantic manifest omits graph_kernel_nodes")?
+        as usize;
+    let expected_replays = manifest_json["captured_replays"]
+        .as_u64()
+        .ok_or("resident semantic manifest omits captured_replays")?
+        as usize;
+    let semantic_nodes = semantic_profile_nodes(&manifest_json)?;
+    if semantic_nodes.len() != expected_nodes {
+        return Err(format!(
+            "semantic manifest expands to {} nodes, expected {expected_nodes}",
+            semantic_nodes.len()
+        )
+        .into());
+    }
+    let connection = Connection::open_with_flags(sqlite, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let graph_id = connection
+        .query_row(
+            "SELECT graphId
+             FROM CUPTI_ACTIVITY_KIND_KERNEL
+             WHERE graphId IS NOT NULL
+             GROUP BY graphId
+             HAVING COUNT(DISTINCT graphNodeId) = ?1
+             ORDER BY graphId
+             LIMIT 1",
+            [expected_nodes as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or_else(|| format!("Nsight SQLite has no graph with {expected_nodes} kernel nodes"))?;
+    let mut statement = connection.prepare(
+        "SELECT k.graphNodeId, k.start, k.end, s.value
+         FROM CUPTI_ACTIVITY_KIND_KERNEL k
+         JOIN StringIds s ON s.id = k.shortName
+         WHERE k.graphId = ?1
+         ORDER BY k.graphNodeId, k.start",
+    )?;
+    let rows = statement.query_map([graph_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut by_node = BTreeMap::<u64, ProfileNodeSamples>::new();
+    for row in rows {
+        let (graph_node_id, start_ns, end_ns, kernel) = row?;
+        let graph_node_id = u64::try_from(graph_node_id)?;
+        let start_ns = u64::try_from(start_ns)?;
+        let end_ns = u64::try_from(end_ns)?;
+        let entry = by_node
+            .entry(graph_node_id)
+            .or_insert_with(|| ProfileNodeSamples {
+                graph_node_id,
+                kernel: kernel.clone(),
+                samples: Vec::new(),
+            });
+        if entry.kernel != kernel {
+            return Err(format!(
+                "graph node {graph_node_id} changed kernel from `{}` to `{kernel}`",
+                entry.kernel
+            )
+            .into());
+        }
+        entry.samples.push(ProfileKernelSample { start_ns, end_ns });
+    }
+    let nodes = by_node.into_values().collect::<Vec<_>>();
+    if nodes.len() != expected_nodes {
+        return Err(format!(
+            "Nsight graph {graph_id} contains {} kernel nodes, expected {expected_nodes}",
+            nodes.len()
+        )
+        .into());
+    }
+    for (ordinal, (node, semantic)) in nodes.iter().zip(&semantic_nodes).enumerate() {
+        if node.samples.len() != expected_replays {
+            return Err(format!(
+                "graph node {} has {} captured samples, expected {expected_replays}",
+                node.graph_node_id,
+                node.samples.len()
+            )
+            .into());
+        }
+        if !node.kernel.contains(&semantic.kernel_family) {
+            return Err(format!(
+                "semantic node {} expects kernel family `{}`, Nsight observed `{}`",
+                ordinal + 1,
+                semantic.kernel_family,
+                node.kernel
+            )
+            .into());
+        }
+    }
+
+    let mut graph_spans = vec![0.0; expected_replays];
+    let mut graph_kernel_sums = vec![0.0; expected_replays];
+    for replay in 0..expected_replays {
+        let start = nodes
+            .iter()
+            .map(|node| node.samples[replay].start_ns)
+            .min()
+            .expect("nonempty graph node inventory");
+        let end = nodes
+            .iter()
+            .map(|node| node.samples[replay].end_ns)
+            .max()
+            .expect("nonempty graph node inventory");
+        graph_spans[replay] = (end - start) as f64 / 1_000.0;
+        graph_kernel_sums[replay] = nodes
+            .iter()
+            .map(|node| {
+                let sample = &node.samples[replay];
+                (sample.end_ns - sample.start_ns) as f64 / 1_000.0
+            })
+            .sum();
+    }
+    write_profile_node_csv(output_dir, stem, &nodes, &semantic_nodes)?;
+    write_profile_stage_csv(
+        output_dir,
+        stem,
+        &nodes,
+        &semantic_nodes,
+        expected_replays,
+        mean(&graph_spans),
+    )?;
+    write_profile_layer_csv(
+        output_dir,
+        stem,
+        &nodes,
+        &semantic_nodes,
+        expected_replays,
+        mean(&graph_spans),
+    )?;
+    let mut replay_csv = String::from("replay,graph_span_us,kernel_sum_us,gaps_us,gap_percent\n");
+    for replay in 0..expected_replays {
+        let gaps = graph_spans[replay] - graph_kernel_sums[replay];
+        replay_csv.push_str(&format!(
+            "{},{:.3},{:.3},{:.3},{:.4}\n",
+            replay + 1,
+            graph_spans[replay],
+            graph_kernel_sums[replay],
+            gaps,
+            gaps / graph_spans[replay] * 100.0,
+        ));
+    }
+    fs::write(
+        output_dir.join(format!("{stem}-replay-timings.csv")),
+        replay_csv,
+    )?;
+    println!(
+        "profile closure: {:.3} us graph, {:.3} us kernels, {:.3} us gaps ({:.2}%)",
+        mean(&graph_spans),
+        mean(&graph_kernel_sums),
+        mean(&graph_spans) - mean(&graph_kernel_sums),
+        (mean(&graph_spans) - mean(&graph_kernel_sums)) / mean(&graph_spans) * 100.0,
+    );
+
+    Ok(())
+}
+
+fn semantic_profile_nodes(
+    manifest: &serde_json::Value,
+) -> Result<Vec<SemanticProfileNode>, Box<dyn Error>> {
+    let stages = manifest["stages"]
+        .as_array()
+        .ok_or("resident semantic manifest omits stages")?;
+    let mut nodes = Vec::new();
+    for stage in stages {
+        let layer = stage["layer"].as_u64().map(|layer| layer as usize);
+        let component = stage["component"]
+            .as_str()
+            .ok_or("resident semantic stage omits component")?;
+        let source_route = stage["source_route"]
+            .as_str()
+            .ok_or("resident semantic stage omits source_route")?;
+        let families = stage["kernel_families"]
+            .as_array()
+            .ok_or("resident semantic stage omits kernel_families")?;
+        for family in families {
+            nodes.push(SemanticProfileNode {
+                layer,
+                component: component.to_string(),
+                source_route: source_route.to_string(),
+                kernel_family: family
+                    .as_str()
+                    .ok_or("resident semantic kernel family is not text")?
+                    .to_string(),
+            });
+        }
+    }
+
+    Ok(nodes)
+}
+
+fn write_profile_node_csv(
+    output_dir: &Path,
+    stem: &str,
+    nodes: &[ProfileNodeSamples],
+    semantic: &[SemanticProfileNode],
+) -> Result<(), Box<dyn Error>> {
+    let mut csv = String::from(
+        "ordinal,graph_node_id,layer,component,source_route,kernel,mean_us,median_us,min_us,max_us\n",
+    );
+    for (ordinal, (node, semantic)) in nodes.iter().zip(semantic).enumerate() {
+        let values = node
+            .samples
+            .iter()
+            .map(|sample| (sample.end_ns - sample.start_ns) as f64 / 1_000.0)
+            .collect::<Vec<_>>();
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}\n",
+            ordinal + 1,
+            node.graph_node_id,
+            semantic
+                .layer
+                .map_or_else(|| "-".to_string(), |layer| layer.to_string()),
+            semantic.component,
+            semantic.source_route,
+            csv_field(&node.kernel),
+            mean(&values),
+            median(&values),
+            values.iter().copied().fold(f64::INFINITY, f64::min),
+            values.iter().copied().fold(0.0, f64::max),
+        ));
+    }
+    fs::write(output_dir.join(format!("{stem}-node-timings.csv")), csv)?;
+    Ok(())
+}
+
+fn write_profile_stage_csv(
+    output_dir: &Path,
+    stem: &str,
+    nodes: &[ProfileNodeSamples],
+    semantic: &[SemanticProfileNode],
+    replays: usize,
+    graph_mean_us: f64,
+) -> Result<(), Box<dyn Error>> {
+    let mut groups = Vec::<(Option<usize>, String, String, Vec<f64>, usize)>::new();
+    for (node, semantic) in nodes.iter().zip(semantic) {
+        let new_group = groups.last().is_none_or(|(layer, component, route, _, _)| {
+            *layer != semantic.layer
+                || component != &semantic.component
+                || route != &semantic.source_route
+        });
+        if new_group {
+            groups.push((
+                semantic.layer,
+                semantic.component.clone(),
+                semantic.source_route.clone(),
+                vec![0.0; replays],
+                0,
+            ));
+        }
+        let group = groups.last_mut().expect("stage group was inserted");
+        group.4 += 1;
+        for replay in 0..replays {
+            group.3[replay] +=
+                (node.samples[replay].end_ns - node.samples[replay].start_ns) as f64 / 1_000.0;
+        }
+    }
+    let mut csv = String::from(
+        "ordinal,layer,component,source_route,kernel_nodes,mean_us,median_us,min_us,max_us,graph_share_percent\n",
+    );
+    for (ordinal, (layer, component, route, values, kernel_nodes)) in groups.iter().enumerate() {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.4}\n",
+            ordinal + 1,
+            layer.map_or_else(|| "-".to_string(), |layer| layer.to_string()),
+            component,
+            route,
+            kernel_nodes,
+            mean(values),
+            median(values),
+            values.iter().copied().fold(f64::INFINITY, f64::min),
+            values.iter().copied().fold(0.0, f64::max),
+            mean(values) / graph_mean_us * 100.0,
+        ));
+    }
+    fs::write(output_dir.join(format!("{stem}-stage-timings.csv")), csv)?;
+    Ok(())
+}
+
+fn write_profile_layer_csv(
+    output_dir: &Path,
+    stem: &str,
+    nodes: &[ProfileNodeSamples],
+    semantic: &[SemanticProfileNode],
+    replays: usize,
+    graph_mean_us: f64,
+) -> Result<(), Box<dyn Error>> {
+    let mut layers = BTreeMap::<i32, (String, Vec<f64>)>::new();
+    for (node, semantic) in nodes.iter().zip(semantic) {
+        let layer = semantic.layer.map_or_else(
+            || {
+                if semantic.component == "input_norm" {
+                    -1
+                } else {
+                    64
+                }
+            },
+            |layer| layer as i32,
+        );
+        let entry = layers
+            .entry(layer)
+            .or_insert_with(|| (semantic.source_route.clone(), vec![0.0; replays]));
+        for replay in 0..replays {
+            entry.1[replay] +=
+                (node.samples[replay].end_ns - node.samples[replay].start_ns) as f64 / 1_000.0;
+        }
+    }
+    let mut csv =
+        String::from("layer,source_route,mean_us,median_us,min_us,max_us,graph_share_percent\n");
+    for (layer, (route, values)) in layers {
+        let label = match layer {
+            -1 => "input".to_string(),
+            64 => "endpoint".to_string(),
+            _ => layer.to_string(),
+        };
+        csv.push_str(&format!(
+            "{label},{route},{:.3},{:.3},{:.3},{:.3},{:.4}\n",
+            mean(&values),
+            median(&values),
+            values.iter().copied().fold(f64::INFINITY, f64::min),
+            values.iter().copied().fold(0.0, f64::max),
+            mean(&values) / graph_mean_us * 100.0,
+        ));
+    }
+    fs::write(output_dir.join(format!("{stem}-layer-timings.csv")), csv)?;
+    Ok(())
+}
+
+fn mean(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+fn median(values: &[f64]) -> f64 {
+    let mut values = values.to_vec();
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
     let Some(mode) = arguments.first() else {
         return Err(
-            "usage: cargo run -p xtask -- perf <smoke|leaf|energy|gate|bless SUITE>".into(),
+            "usage: cargo run -p xtask -- perf <smoke|leaf|energy|gate|candidate SUITE [SNAPSHOT] [options]|check SUITE [SNAPSHOT]|bless SUITE [SNAPSHOT]>".into(),
         );
     };
     let mode = mode.to_str().ok_or("perf mode is not UTF-8")?;
     if mode == "bless" {
-        let [_, suite] = arguments else {
-            return Err(
-                "usage: cargo run -p xtask -- perf bless <residual-norm|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|nvfp4-swiglu|nvfp4-down|gdn-prepare|gdn-recurrence|gdn-output|attention-qk-prepare|paged-gqa|long-context-paged-gqa|attention-output>"
-                    .into(),
-            );
+        let suite = arguments
+            .get(1)
+            .ok_or("usage: cargo run -p xtask -- perf bless SUITE [SNAPSHOT]")?;
+        let suite = OptimizationSuite::parse(suite.to_str().ok_or("perf suite is not UTF-8")?)?;
+        let snapshot = if suite.requires_snapshot() {
+            let [_, _, snapshot] = arguments else {
+                return Err(format!("perf bless {} requires SNAPSHOT", suite.name()).into());
+            };
+            Some(snapshot.as_os_str())
+        } else {
+            if arguments.len() != 2 {
+                return Err(format!("perf bless {} takes no SNAPSHOT", suite.name()).into());
+            }
+            None
         };
-        let suite = PerformanceSuite::parse(suite.to_str().ok_or("perf suite is not UTF-8")?)?;
-        return bless_suite(root, suite);
+        return bless_optimization_suite(root, suite, snapshot);
+    }
+    if matches!(mode, "candidate" | "check") {
+        let suite = arguments.get(1).ok_or(
+            "usage: cargo run -p xtask -- perf candidate|check SUITE [SNAPSHOT] [options]",
+        )?;
+        let suite = OptimizationSuite::parse(suite.to_str().ok_or("perf suite is not UTF-8")?)?;
+        let cone = suite.dependency_cone();
+        let needs_snapshot = cone.iter().any(|suite| suite.requires_snapshot());
+        let mut remaining = &arguments[2..];
+        let snapshot = if needs_snapshot {
+            let (snapshot, options) = remaining.split_first().ok_or_else(|| {
+                format!(
+                    "perf {mode} {} requires SNAPSHOT for its composed dependency cone",
+                    suite.name()
+                )
+            })?;
+            remaining = options;
+            Some(snapshot.as_os_str())
+        } else {
+            None
+        };
+        if mode == "check" && !remaining.is_empty() {
+            return Err("`perf check` uses the complete authoritative suite defaults".into());
+        }
+        return run_optimization_cone(root, mode, suite, &cone, snapshot, remaining);
     }
     if arguments.len() != 1 {
         return Err(format!("`perf {mode}` takes no additional arguments").into());
     }
 
     let options = match mode {
-        "smoke" => vec![
-            "--samples".into(),
-            "3".into(),
-            "--launches-per-sample".into(),
-            "1024".into(),
-        ],
+        "smoke" => vec!["--samples".into(), "3".into()],
         "leaf" | "gate" => Vec::new(),
         "energy" => vec!["--energy-seconds".into(), "2".into()],
         _ => return Err(format!("unknown perf mode `{mode}`").into()),
@@ -1633,6 +2411,48 @@ fn run_performance_suites(
     if compare {
         for suite in PERFORMANCE_SUITES {
             let report = performance_report_path(root, mode, suite);
+            performance::compare(&report, &root.join(suite.performance_baseline()))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_optimization_cone(
+    root: &Path,
+    mode: &str,
+    root_suite: OptimizationSuite,
+    cone: &[OptimizationSuite],
+    snapshot: Option<&OsStr>,
+    options: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    if mode == "check" {
+        let mut qualified = Vec::new();
+        for suite in cone.iter().copied() {
+            let authority = if suite == OptimizationSuite::ResidentLongContextModel {
+                OptimizationSuite::ResidentModel
+            } else {
+                suite
+            };
+            if !qualified.contains(&authority) {
+                authority.qualify(root, snapshot)?;
+                qualified.push(authority);
+            }
+        }
+    } else {
+        root_suite.qualify(root, snapshot)?;
+    }
+    build_sm120(root)?;
+    for (index, suite) in cone.iter().copied().enumerate() {
+        if index != 0 {
+            wait_for_device_idle()?;
+        }
+        let report = optimization_report_path(root, mode, root_suite, suite);
+        let mut arguments = options.to_vec();
+        arguments.push("--json".into());
+        arguments.push(path_text(&report)?.into());
+        run_optimization_benchmark(root, suite, snapshot, &arguments)?;
+        if mode == "check" {
             performance::compare(&report, &root.join(suite.performance_baseline()))?;
         }
     }
@@ -1685,17 +2505,39 @@ fn sass_function_body<'a>(sass: &'a str, name: &str) -> Option<&'a str> {
     Some(body.split("\n\t\tFunction :").next().unwrap_or(body))
 }
 
-fn bless_suite(root: &Path, suite: PerformanceSuite) -> Result<(), Box<dyn Error>> {
-    suite.qualify(root)?;
+fn bless_optimization_suite(
+    root: &Path,
+    suite: OptimizationSuite,
+    snapshot: Option<&OsStr>,
+) -> Result<(), Box<dyn Error>> {
+    suite.qualify(root, snapshot)?;
     build_sm120(root)?;
-    let report = performance_report_path(root, "bless", suite);
-    run_benchmark_suite(root, suite, &["--json".into(), path_text(&report)?.into()])?;
+    let report = optimization_report_path(root, "bless", suite, suite);
+    run_optimization_benchmark(
+        root,
+        suite,
+        snapshot,
+        &["--json".into(), path_text(&report)?.into()],
+    )?;
     performance::bless(&report, &root.join(suite.performance_baseline()))
 }
 
 fn performance_report_path(root: &Path, mode: &str, suite: PerformanceSuite) -> PathBuf {
     root.join(format!(
         "target/benchmarks/perf-{mode}/{}.json",
+        suite.name()
+    ))
+}
+
+fn optimization_report_path(
+    root: &Path,
+    mode: &str,
+    root_suite: OptimizationSuite,
+    suite: OptimizationSuite,
+) -> PathBuf {
+    root.join(format!(
+        "target/benchmarks/perf-{mode}/{}/{}.json",
+        root_suite.name(),
         suite.name()
     ))
 }
@@ -4079,9 +4921,9 @@ fn require_uniform_value(
 #[cfg(test)]
 mod tests {
     use super::{
-        PERFORMANCE_SUITES, PerformanceSuite, parse_cuda_toolkit_identity, parse_entries,
-        parse_idle_sample, parse_resources, parse_rustc_identity, require_count,
-        require_uniform_value, sass_function_body,
+        COMPOSED_PERFORMANCE_SUITES, OptimizationSuite, PERFORMANCE_SUITES, PerformanceSuite,
+        parse_cuda_toolkit_identity, parse_entries, parse_idle_sample, parse_resources,
+        parse_rustc_identity, require_count, require_uniform_value, sass_function_body,
     };
     use std::collections::BTreeMap;
 
@@ -4183,6 +5025,71 @@ mod tests {
             );
         }
         assert!(PerformanceSuite::parse("unknown").is_err());
+    }
+
+    #[test]
+    fn composed_performance_inventory_and_dependency_cones_are_exact() {
+        let names = COMPOSED_PERFORMANCE_SUITES
+            .iter()
+            .map(|suite| suite.name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "nvfp4-mlp",
+                "dense-fp8-mlp",
+                "dense-fp8-gdn-layer",
+                "full-attention-layer",
+                "text-endpoint",
+                "resident-model",
+                "resident-long-context-model",
+            ]
+        );
+
+        let cone = OptimizationSuite::parse("nvfp4-down")
+            .unwrap()
+            .dependency_cone()
+            .into_iter()
+            .map(OptimizationSuite::name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cone,
+            [
+                "nvfp4-down",
+                "nvfp4-mlp",
+                "resident-model",
+                "resident-long-context-model",
+            ]
+        );
+
+        let cone = OptimizationSuite::parse("fp8-down")
+            .unwrap()
+            .dependency_cone()
+            .into_iter()
+            .map(OptimizationSuite::name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cone,
+            [
+                "fp8-down",
+                "dense-fp8-mlp",
+                "dense-fp8-gdn-layer",
+                "full-attention-layer",
+                "resident-model",
+                "resident-long-context-model",
+            ]
+        );
+
+        let cone = OptimizationSuite::parse("long-context-paged-gqa")
+            .unwrap()
+            .dependency_cone()
+            .into_iter()
+            .map(OptimizationSuite::name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cone,
+            ["long-context-paged-gqa", "resident-long-context-model"]
+        );
     }
 
     #[test]
