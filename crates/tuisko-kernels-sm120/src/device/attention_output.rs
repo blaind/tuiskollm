@@ -25,6 +25,34 @@ unsafe fn gated_value<A: Arch>(attention: *const f32, qkv: *const u16, index: us
 }
 
 #[inline(always)]
+fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+
+    (rounded >> 16) as u16
+}
+
+#[inline(always)]
+pub(crate) unsafe fn attention_gate_bf16<A: Arch>(
+    attention: *mut f32,
+    qkv: *const u16,
+    activation: *mut u16,
+) {
+    let token = thread::blockIdx_x() as usize;
+    let mut index = thread::threadIdx_x() as usize;
+
+    while index < A::ATTENTION_OUTPUT_COLUMNS {
+        let gated = unsafe { gated_value::<A>(attention, qkv, index) };
+        let offset = token * A::ATTENTION_OUTPUT_COLUMNS + index;
+        unsafe {
+            *attention.add(offset) = gated;
+            *activation.add(offset) = f32_to_bf16(gated);
+        }
+        index += THREADS;
+    }
+}
+
+#[inline(always)]
 pub(crate) unsafe fn attention_gate_quantize<A: Arch>(
     attention: *mut f32,
     qkv: *const u16,

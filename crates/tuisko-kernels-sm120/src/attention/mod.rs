@@ -1,6 +1,7 @@
 //! Exact full-attention operators.
 
 mod long_context_paged_gqa;
+mod nvfp4_output;
 mod output;
 mod paged_gqa;
 mod qk_prepare;
@@ -10,6 +11,8 @@ pub use long_context_paged_gqa::{
     LONG_CONTEXT_GQA_MAX_PARTITIONS, LONG_CONTEXT_GQA_MAX_TOKENS,
     LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE, LongContextPagedGqaOp,
 };
+pub use nvfp4_output::Qwen35Nvfp4AttentionOutputOp;
+pub(crate) use nvfp4_output::qwen35_nvfp4_attention_output_ptx_names;
 pub use output::AttentionOutputOp;
 pub(crate) use output::attention_output_ptx_names;
 pub use paged_gqa::{

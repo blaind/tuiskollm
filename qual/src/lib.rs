@@ -101,6 +101,8 @@ mod paged_gqa_partitioned_prefill;
 #[cfg(feature = "device")]
 mod paged_gqa_prefill;
 #[cfg(feature = "device")]
+mod qwen35_nvfp4_attention_output;
+#[cfg(feature = "device")]
 mod qwen35_nvfp4_down;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_down_benchmark;
@@ -248,6 +250,11 @@ pub use paged_gqa_partitioned_prefill::{
 #[cfg(feature = "device")]
 pub use paged_gqa_prefill::{
     PagedGqaPrefillQualification, PagedGqaPrefillQualificationError, qualify_paged_gqa_prefill,
+};
+#[cfg(feature = "device")]
+pub use qwen35_nvfp4_attention_output::{
+    Qwen35Nvfp4AttentionOutputQualification, Qwen35Nvfp4AttentionOutputQualificationError,
+    qualify_qwen35_nvfp4_attention_output,
 };
 #[cfg(feature = "device")]
 pub use qwen35_nvfp4_down::qualify_qwen35_nvfp4_down;
