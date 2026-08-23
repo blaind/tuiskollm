@@ -3572,6 +3572,7 @@ fn encoded_backend_rustflags(root: &Path, source: &Path) -> Result<String, Box<d
         (source, "/cuda-oxide"),
         (cargo_home.as_path(), "/cargo-home"),
         (Path::new(sysroot.trim()), "/rust-toolchain"),
+        (root, "/tuiskollm"),
     ];
     let flags = prefixes
         .into_iter()
