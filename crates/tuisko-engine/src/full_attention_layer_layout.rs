@@ -2,13 +2,16 @@
 
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
-use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
+use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES};
 use tuisko_model::Arch;
 
 const ALIGNMENT: usize = 256;
 pub(crate) const PHYSICAL_PAGES: usize = 24;
 pub(crate) const TABLE_STRIDE: usize = 3;
 pub(crate) const CONTEXT_CAPACITY: usize = TABLE_STRIDE * ATTENTION_PAGE_SIZE;
+pub(crate) const PREFILL_TABLE_STRIDE: usize = PHYSICAL_PAGES;
+pub(crate) const PREFILL_CONTEXT_CAPACITY: usize = PREFILL_TABLE_STRIDE * ATTENTION_PAGE_SIZE;
+pub(crate) const MAX_ROWS: usize = 1_024;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FullAttentionLayerRegions {
@@ -28,10 +31,16 @@ pub(crate) struct FullAttentionLayerRegions {
     pub(crate) table_rows: ArenaRegion<u32>,
     pub(crate) cache_positions: ArenaRegion<u32>,
     pub(crate) lengths: ArenaRegion<u32>,
+    pub(crate) prefill_rope_cos: ArenaRegion<f32>,
+    pub(crate) prefill_rope_sin: ArenaRegion<f32>,
+    pub(crate) prefill_table_rows: ArenaRegion<u32>,
+    pub(crate) prefill_cache_positions: ArenaRegion<u32>,
+    pub(crate) prefill_lengths: ArenaRegion<u32>,
     pub(crate) query: ArenaRegion<f32>,
     pub(crate) key_pages: ArenaRegion<u8>,
     pub(crate) value_pages: ArenaRegion<u8>,
     pub(crate) attention: ArenaRegion<f32>,
+    pub(crate) macro_partials: ArenaRegion<f32>,
     pub(crate) output_activation_codes: ArenaRegion<u8>,
     pub(crate) output_activation_scales: ArenaRegion<f32>,
     pub(crate) output_weight_codes: ArenaRegion<u8>,
@@ -66,20 +75,20 @@ pub struct FullAttentionLayerLayout {
 }
 
 impl FullAttentionLayerLayout {
-    /// Reserves every source and seam for exact decode `B=1..8` and 192-token slots.
+    /// Reserves exact decode and prefill seams plus the shared 24-page cache pool.
     pub fn build<A: Arch>() -> EngineResult<Self> {
-        let batch_hidden = product("attention batch-hidden elements", MAX_BATCH, A::HIDDEN)?;
+        let batch_hidden = product("attention row-hidden elements", MAX_ROWS, A::HIDDEN)?;
         let batch_qkv = product(
-            "attention fused QKV elements",
-            MAX_BATCH,
+            "attention fused QKV row elements",
+            MAX_ROWS,
             A::ATTENTION_QKV_ROWS,
         )?;
         let batch_attention = product(
-            "attention batch-output elements",
-            MAX_BATCH,
+            "attention row-output elements",
+            MAX_ROWS,
             A::ATTENTION_OUTPUT_COLUMNS,
         )?;
-        let batch_intermediate = product("attention MLP elements", MAX_BATCH, A::INTERMEDIATE)?;
+        let batch_intermediate = product("attention MLP elements", MAX_ROWS, A::INTERMEDIATE)?;
         let qkv_weights = product("attention QKV weights", A::ATTENTION_QKV_ROWS, A::HIDDEN)?;
         let output_weights = product(
             "attention output weights",
@@ -116,7 +125,7 @@ impl FullAttentionLayerLayout {
             input_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
             mixer_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
             qkv_activation_codes: builder.reserve(batch_hidden, ALIGNMENT)?,
-            qkv_activation_scales: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+            qkv_activation_scales: builder.reserve(MAX_ROWS, ALIGNMENT)?,
             qkv_weight_codes: builder.reserve(qkv_weights, ALIGNMENT)?,
             qkv_weight_scales: builder.reserve(A::ATTENTION_QKV_ROWS, ALIGNMENT)?,
             qkv: builder.reserve(batch_qkv, ALIGNMENT)?,
@@ -124,16 +133,25 @@ impl FullAttentionLayerLayout {
             key_norm: builder.reserve(A::HEAD_DIM, ALIGNMENT)?,
             rope_cos: builder.reserve(MAX_BATCH * 32, ALIGNMENT)?,
             rope_sin: builder.reserve(MAX_BATCH * 32, ALIGNMENT)?,
-            block_tables: builder.reserve(MAX_BATCH * TABLE_STRIDE, ALIGNMENT)?,
+            block_tables: builder.reserve(PHYSICAL_PAGES, ALIGNMENT)?,
             table_rows: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             cache_positions: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             lengths: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+            prefill_rope_cos: builder.reserve(MAX_ROWS * 32, ALIGNMENT)?,
+            prefill_rope_sin: builder.reserve(MAX_ROWS * 32, ALIGNMENT)?,
+            prefill_table_rows: builder.reserve(MAX_ROWS, ALIGNMENT)?,
+            prefill_cache_positions: builder.reserve(MAX_ROWS, ALIGNMENT)?,
+            prefill_lengths: builder.reserve(MAX_ROWS, ALIGNMENT)?,
             query: builder.reserve(batch_attention, ALIGNMENT)?,
             key_pages: builder.reserve(cache_plane, ALIGNMENT)?,
             value_pages: builder.reserve(cache_plane, ALIGNMENT)?,
             attention: builder.reserve(batch_attention, ALIGNMENT)?,
+            macro_partials: builder.reserve(
+                PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES / size_of::<f32>(),
+                ALIGNMENT,
+            )?,
             output_activation_codes: builder.reserve(batch_attention, ALIGNMENT)?,
-            output_activation_scales: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+            output_activation_scales: builder.reserve(MAX_ROWS, ALIGNMENT)?,
             output_weight_codes: builder.reserve(output_weights, ALIGNMENT)?,
             output_weight_scales: builder.reserve(A::HIDDEN, ALIGNMENT)?,
             mixer_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
@@ -141,12 +159,12 @@ impl FullAttentionLayerLayout {
             mixer_residual: builder.reserve(batch_hidden, ALIGNMENT)?,
             mlp_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
             gate_up_activation_codes: builder.reserve(batch_hidden, ALIGNMENT)?,
-            gate_up_activation_scales: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+            gate_up_activation_scales: builder.reserve(MAX_ROWS, ALIGNMENT)?,
             gate_up_weight_codes: builder.reserve(gate_up_weights, ALIGNMENT)?,
             gate_up_weight_scales: builder.reserve(2 * A::INTERMEDIATE, ALIGNMENT)?,
             swiglu: builder.reserve(batch_intermediate, ALIGNMENT)?,
             down_activation_codes: builder.reserve(batch_intermediate, ALIGNMENT)?,
-            down_activation_scales: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+            down_activation_scales: builder.reserve(MAX_ROWS, ALIGNMENT)?,
             down_weight_codes: builder.reserve(down_weights, ALIGNMENT)?,
             down_weight_scales: builder.reserve(A::HIDDEN, ALIGNMENT)?,
             mlp_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
@@ -190,8 +208,14 @@ impl FullAttentionLayerLayout {
                 regions.table_rows.byte_len(),
                 regions.cache_positions.byte_len(),
                 regions.lengths.byte_len(),
+                regions.prefill_rope_cos.byte_len(),
+                regions.prefill_rope_sin.byte_len(),
+                regions.prefill_table_rows.byte_len(),
+                regions.prefill_cache_positions.byte_len(),
+                regions.prefill_lengths.byte_len(),
                 regions.query.byte_len(),
                 regions.attention.byte_len(),
+                regions.macro_partials.byte_len(),
                 regions.output_activation_codes.byte_len(),
                 regions.output_activation_scales.byte_len(),
                 regions.mixer_branch.byte_len(),
@@ -254,6 +278,11 @@ impl FullAttentionLayerLayout {
     pub const fn context_capacity(&self) -> usize {
         CONTEXT_CAPACITY
     }
+
+    /// Complete shared-page capacity used by exact from-empty prefill.
+    pub const fn prefill_context_capacity(&self) -> usize {
+        PREFILL_CONTEXT_CAPACITY
+    }
 }
 
 fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
@@ -271,7 +300,9 @@ fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALIGNMENT, CONTEXT_CAPACITY, FullAttentionLayerLayout};
+    use super::{
+        ALIGNMENT, CONTEXT_CAPACITY, FullAttentionLayerLayout, MAX_ROWS, PREFILL_CONTEXT_CAPACITY,
+    };
     use tuisko_model::Qwen38_27B;
 
     #[test]
@@ -280,10 +311,10 @@ mod tests {
 
         assert_eq!(layout.resident_weight_bytes(), 372_395_008);
         assert_eq!(layout.cache_bytes(), 3_145_728);
-        assert_eq!(layout.workspace_bytes(), 1_829_184);
-        assert_eq!(layout.owner_bytes(), 377_369_920);
-        assert_eq!(layout.arena_bytes(), 377_371_648);
-        assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 1_728);
+        assert_eq!(layout.workspace_bytes(), 639_924_416);
+        assert_eq!(layout.owner_bytes(), 1_015_465_152);
+        assert_eq!(layout.arena_bytes(), 1_015_465_984);
+        assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 832);
     }
 
     #[test]
@@ -307,10 +338,16 @@ mod tests {
             span(regions.table_rows),
             span(regions.cache_positions),
             span(regions.lengths),
+            span(regions.prefill_rope_cos),
+            span(regions.prefill_rope_sin),
+            span(regions.prefill_table_rows),
+            span(regions.prefill_cache_positions),
+            span(regions.prefill_lengths),
             span(regions.query),
             span(regions.key_pages),
             span(regions.value_pages),
             span(regions.attention),
+            span(regions.macro_partials),
             span(regions.output_activation_codes),
             span(regions.output_activation_scales),
             span(regions.output_weight_codes),
@@ -348,6 +385,9 @@ mod tests {
         let layout = FullAttentionLayerLayout::build::<Qwen38_27B>().unwrap();
         assert_eq!(layout.context_capacity(), CONTEXT_CAPACITY);
         assert_eq!(layout.context_capacity(), 192);
+        assert_eq!(layout.prefill_context_capacity(), PREFILL_CONTEXT_CAPACITY);
+        assert_eq!(layout.prefill_context_capacity(), 1_536);
+        assert_eq!(MAX_ROWS, 1_024);
         assert_eq!(layout.cache_bytes(), 3_145_728);
     }
 

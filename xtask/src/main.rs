@@ -1660,9 +1660,10 @@ fn qualify_full_attention_layer(
             "--release",
             "--lib",
             "--",
-            "full_attention_layer::tests::source_layer63_matches_complete_seam_oracles_and_graph_replay",
+            "full_attention_layer_suite_",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
