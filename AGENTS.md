@@ -26,6 +26,28 @@ SM89 and SM86 remain partial qualification targets until their complete inventor
 - `qual` owns independent oracles, fixtures, probes, and benchmarks. `xtask` owns device builds,
   artifact inspection, resource gates, and explicit baseline blessing.
 
+## Target expansion
+
+- Admit a new exact target in this order: pinned config, complete tensor inventory, typed source
+  bindings, lossless materialization, qualified kernels, composed layers, resident program, then
+  serving.
+- Admit device support per operator and exact route. Do not widen a model- or GPU-level sealed
+  trait if that makes unfinished operators constructible.
+- Add a second exact implementation beside mature code first. Extract a shared helper only after
+  both real call sites prove identical represented-value semantics, layout, and accumulation order.
+- A shared device-code change reruns every consuming product's numerical, resource, and performance
+  sentinels. A new target must not silently alter an existing product.
+- Generated symbol hashes may change when a CUDA module gains entries. Compare semantic
+  inventories and normalized function bodies; symbol-name stability alone is not artifact
+  stability.
+- Document quantization-convention conversion at the checkpoint-adapter boundary and independently
+  test source words, scale permutations, and scalar bits. Do not bury the conversion in a kernel
+  launcher.
+- Qualify synthetic represented-value cases before real checkpoint ownership, then require a real
+  source-backed layer gate before whole-model composition.
+- Describe partial support precisely. Source admission or one qualified kernel is not model
+  inference support.
+
 ## Device changes
 
 An admitted device route requires all of the following in the same feature:
@@ -64,6 +86,10 @@ See `docs/performance.md` for commands and measurement semantics.
 - Do not commit or push unless the user explicitly requests it.
 - Count skips separately from passes. A deferred fix needs an `#[ignore]`d acceptance test that
   states the missing condition.
+- When implementation reveals a durable repository-wide invariant or recurring failure mode not
+  covered here, propose a concise `AGENTS.md` update in the handoff. Branch-specific status,
+  measurements, and one-off implementation details belong in the relevant design or performance
+  document.
 
 ## Releases
 
