@@ -34,7 +34,6 @@ impl Qualification {
             "qualify-fp8-qkv" => "fp8_qkv",
             "qualify-fp8-gdn-input" => "fp8_gdn_input",
             "qualify-fp8-lm-head" => "fp8_lm_head",
-            "qualify-nvfp4-swiglu" => "nvfp4_swiglu",
             "qualify-attention-qk-prepare" => "attention_qk_prepare::tests",
             "qualify-paged-gqa" => "paged_gqa::tests",
             "qualify-attention-output" => "attention_output::tests",
@@ -49,7 +48,6 @@ impl Qualification {
                 "qualify-fp8-qkv" => "fp8-qkv",
                 "qualify-fp8-gdn-input" => "fp8-gdn-input",
                 "qualify-fp8-lm-head" => "fp8-lm-head",
-                "qualify-nvfp4-swiglu" => "nvfp4-swiglu",
                 "qualify-attention-qk-prepare" => "attention-qk-prepare",
                 "qualify-paged-gqa" => "paged-gqa",
                 "qualify-attention-output" => "attention-output",
@@ -75,7 +73,6 @@ impl Benchmark {
             "bench-fp8-qkv" => crate::PerformanceSuite::Fp8Qkv,
             "bench-fp8-gdn-input" => crate::PerformanceSuite::Fp8GdnInput,
             "bench-fp8-lm-head" => crate::PerformanceSuite::Fp8LmHead,
-            "bench-nvfp4-swiglu" => crate::PerformanceSuite::Nvfp4SwiGlu,
             "bench-attention-qk-prepare" => crate::PerformanceSuite::AttentionQkPrepare,
             "bench-paged-gqa" => crate::PerformanceSuite::PagedGqa,
             "bench-attention-output" => crate::PerformanceSuite::AttentionOutput,
@@ -346,6 +343,9 @@ mod tests {
         let nvfp4 = Qualification::parse("qualify-nvfp4-swiglu").expect("known suite");
         assert_eq!(nvfp4.name, "nvfp4-swiglu");
         assert_eq!(nvfp4.filter, "nvfp4_swiglu");
+        let nvfp4_down = Qualification::parse("qualify-nvfp4-down").expect("known suite");
+        assert_eq!(nvfp4_down.name, "nvfp4-down");
+        assert_eq!(nvfp4_down.filter, "nvfp4_down");
         assert_eq!(
             Benchmark::parse("bench-fp8-qkv")
                 .expect("known benchmark")
@@ -359,6 +359,13 @@ mod tests {
                 .suite
                 .name(),
             "nvfp4-swiglu"
+        );
+        assert_eq!(
+            Benchmark::parse("bench-nvfp4-down")
+                .expect("known benchmark")
+                .suite
+                .name(),
+            "nvfp4-down"
         );
         assert_eq!(
             Benchmark::parse("bench-attention-qk-prepare")
