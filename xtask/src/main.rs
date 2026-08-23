@@ -448,6 +448,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-qwen35-residual-norm") => bench_qwen35_residual_norm(root, &remaining),
         Some("bench-qwen35-nvfp4-swiglu") => bench_qwen35_nvfp4_swiglu(root, &remaining),
         Some("bench-qwen35-nvfp4-down") => bench_qwen35_nvfp4_down(root, &remaining),
+        Some("bench-qwen35-nvfp4-mlp") => bench_qwen35_nvfp4_mlp(root, &remaining),
         Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
         Some("bench-fp8-gdn-input") => bench_fp8_gdn_input(root, &remaining),
         Some("bench-fp8-lm-head") => bench_fp8_lm_head(root, &remaining),
@@ -1675,6 +1676,38 @@ fn bench_qwen35_nvfp4_down(
                 "TUISKO_GENERATOR_BASELINE_SHA256",
                 sha256(&fs::read(root.join(QWEN35_NVFP4_DOWN_RESOURCE_BASELINE))?),
             ),
+    )
+}
+
+fn bench_qwen35_nvfp4_mlp(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-qwen35-nvfp4-mlp SNAPSHOT [options]".into(),
+        );
+    };
+    build_sm120(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = fs::read(root.join(QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE))?;
+    baselines.extend_from_slice(&fs::read(root.join(QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE))?);
+    baselines.extend_from_slice(&fs::read(root.join(QWEN35_NVFP4_DOWN_RESOURCE_BASELINE))?);
+    run_visible(
+        Command::new(executable)
+            .arg("qwen35-nvfp4-mlp")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
     )
 }
 

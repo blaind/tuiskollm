@@ -105,6 +105,8 @@ mod qwen35_nvfp4_down;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_down_benchmark;
 #[cfg(feature = "device")]
+mod qwen35_nvfp4_mlp_benchmark;
+#[cfg(feature = "device")]
 mod qwen35_nvfp4_swiglu;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_swiglu_benchmark;
@@ -241,6 +243,8 @@ pub use paged_gqa_prefill::{
 pub use qwen35_nvfp4_down::qualify_qwen35_nvfp4_down;
 #[cfg(feature = "device")]
 pub use qwen35_nvfp4_down_benchmark::benchmark_qwen35_nvfp4_down;
+#[cfg(feature = "device")]
+pub use qwen35_nvfp4_mlp_benchmark::benchmark_qwen35_nvfp4_mlp;
 #[cfg(feature = "device")]
 pub use qwen35_nvfp4_swiglu::qualify_qwen35_nvfp4_swiglu;
 #[cfg(feature = "device")]
