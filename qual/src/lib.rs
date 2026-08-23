@@ -137,6 +137,8 @@ mod qwen35_full_attention_layer_benchmark;
 #[cfg(feature = "device")]
 mod qwen35_gdn_layer;
 #[cfg(feature = "device")]
+mod qwen35_gdn_layer_benchmark;
+#[cfg(feature = "device")]
 mod qwen35_gdn_prepare;
 #[cfg(feature = "device")]
 mod qwen35_gdn_prepare_benchmark;
@@ -393,6 +395,8 @@ pub use qwen35_full_attention_layer_benchmark::benchmark_qwen35_full_attention_l
 pub use qwen35_gdn_layer::{
     Qwen35GdnLayerQualification, Qwen35GdnLayerQualificationError, qualify_qwen35_gdn_layer,
 };
+#[cfg(feature = "device")]
+pub use qwen35_gdn_layer_benchmark::benchmark_qwen35_gdn_layer;
 #[cfg(feature = "device")]
 pub use qwen35_gdn_prepare::{
     Qwen35GdnPrepareQualification, Qwen35GdnPrepareQualificationError, qualify_qwen35_gdn_prepare,
