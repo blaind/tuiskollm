@@ -305,6 +305,7 @@ async fn chat_completions(
         stream,
         split_reasoning,
         parse_tools,
+        include_usage,
     } = match request.prepare(numeric_id ^ DEFAULT_SEED_SCRAMBLE) {
         Ok(request) => request,
         Err(ChatRequestError::ModelNotFound { requested }) => {
@@ -339,7 +340,14 @@ async fn chat_completions(
         .unwrap_or_default()
         .as_secs();
     if stream {
-        streaming_response(reply_rx, id, created, split_reasoning, parse_tools)
+        streaming_response(
+            reply_rx,
+            id,
+            created,
+            split_reasoning,
+            parse_tools,
+            include_usage,
+        )
     } else {
         blocking_response(reply_rx, id, created, split_reasoning, parse_tools).await
     }

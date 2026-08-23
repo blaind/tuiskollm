@@ -102,16 +102,20 @@ pub fn streaming_response(
     created: u64,
     split_reasoning: bool,
     parse_tools: bool,
+    include_usage: bool,
 ) -> Response {
     let (events_tx, events_rx) = unbounded_channel::<Result<Event, Infallible>>();
     tokio::spawn(async move {
-        let first = json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": SERVED_MODEL,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
-        });
+        let first = stream_chunk(
+            json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": SERVED_MODEL,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+            }),
+            include_usage,
+        );
         if events_tx
             .send(Ok(Event::default().data(first.to_string())))
             .is_err()
@@ -125,7 +129,7 @@ pub fn streaming_response(
             match reply {
                 GenerationReply::Delta(delta) => {
                     let parsed = parser.push(&delta);
-                    if let Some(event) = assistant_delta_event(&id, created, parsed)
+                    if let Some(event) = assistant_delta_event(&id, created, parsed, include_usage)
                         && events_tx.send(Ok(event)).is_err()
                     {
                         return;
@@ -134,12 +138,14 @@ pub fn streaming_response(
                 GenerationReply::Done(output) => {
                     terminal = true;
                     let parsed = parser.finish();
-                    if let Some(event) = assistant_delta_event(&id, created, parsed.delta)
+                    if let Some(event) =
+                        assistant_delta_event(&id, created, parsed.delta, include_usage)
                         && events_tx.send(Ok(event)).is_err()
                     {
                         return;
                     }
-                    if let Some(event) = tool_calls_event(&id, created, &parsed.tool_calls)
+                    if let Some(event) =
+                        tool_calls_event(&id, created, &parsed.tool_calls, include_usage)
                         && events_tx.send(Ok(event)).is_err()
                     {
                         return;
@@ -149,19 +155,37 @@ pub fn streaming_response(
                     } else {
                         "tool_calls"
                     };
-                    let event = json!({
-                        "id": id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": SERVED_MODEL,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-                        "usage": usage(&output)
-                    });
+                    let event = stream_chunk(
+                        json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": SERVED_MODEL,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                        }),
+                        include_usage,
+                    );
                     if events_tx
                         .send(Ok(Event::default().data(event.to_string())))
                         .is_err()
                     {
                         return;
+                    }
+                    if include_usage {
+                        let event = json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": SERVED_MODEL,
+                            "choices": [],
+                            "usage": usage(&output)
+                        });
+                        if events_tx
+                            .send(Ok(Event::default().data(event.to_string())))
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                     break;
                 }
@@ -249,32 +273,45 @@ fn blocking_tool_calls(completion_id: &str, calls: &[ParsedToolCall]) -> Value {
     )
 }
 
-fn tool_calls_event(id: &str, created: u64, calls: &[ParsedToolCall]) -> Option<Event> {
+fn tool_calls_event(
+    id: &str,
+    created: u64,
+    calls: &[ParsedToolCall],
+    include_usage: bool,
+) -> Option<Event> {
     if calls.is_empty() {
         return None;
     }
-    let event = json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": SERVED_MODEL,
-        "choices": [{
-            "index": 0,
-            "delta": {
-                "tool_calls": calls.iter().enumerate().map(|(index, call)| json!({
-                    "index": index,
-                    "id": tool_call_id(id, index),
-                    "type": "function",
-                    "function": {"name": call.name, "arguments": call.arguments}
-                })).collect::<Vec<_>>()
-            },
-            "finish_reason": null
-        }]
-    });
+    let event = stream_chunk(
+        json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": SERVED_MODEL,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": calls.iter().enumerate().map(|(index, call)| json!({
+                        "index": index,
+                        "id": tool_call_id(id, index),
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments}
+                    })).collect::<Vec<_>>()
+                },
+                "finish_reason": null
+            }]
+        }),
+        include_usage,
+    );
     Some(Event::default().data(event.to_string()))
 }
 
-fn assistant_delta_event(id: &str, created: u64, parsed: AssistantDelta) -> Option<Event> {
+fn assistant_delta_event(
+    id: &str,
+    created: u64,
+    parsed: AssistantDelta,
+    include_usage: bool,
+) -> Option<Event> {
     let delta = match (parsed.reasoning.is_empty(), parsed.content.is_empty()) {
         (true, true) => return None,
         (false, true) => json!({"reasoning_content": parsed.reasoning}),
@@ -283,14 +320,24 @@ fn assistant_delta_event(id: &str, created: u64, parsed: AssistantDelta) -> Opti
             json!({"reasoning_content": parsed.reasoning, "content": parsed.content})
         }
     };
-    let event = json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": SERVED_MODEL,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
-    });
+    let event = stream_chunk(
+        json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": SERVED_MODEL,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+        }),
+        include_usage,
+    );
     Some(Event::default().data(event.to_string()))
+}
+
+fn stream_chunk(mut chunk: Value, include_usage: bool) -> Value {
+    if include_usage {
+        chunk["usage"] = Value::Null;
+    }
+    chunk
 }
 
 #[cfg(test)]
@@ -382,6 +429,7 @@ mod tests {
                 19,
                 true,
                 true,
+                true,
             );
 
             assert_eq!(
@@ -409,7 +457,11 @@ mod tests {
                 r#"{"command":"ls"}"#
             );
             assert_eq!(events[3]["choices"][0]["finish_reason"], "tool_calls");
-            assert_eq!(events[3]["usage"]["total_tokens"], 5);
+            assert!(events[..4]
+                .iter()
+                .all(|event| event.get("usage") == Some(&Value::Null)));
+            assert_eq!(events[4]["choices"], json!([]));
+            assert_eq!(events[4]["usage"]["total_tokens"], 5);
         });
     }
 
@@ -448,7 +500,7 @@ mod tests {
             sender
                 .send(GenerationReply::Rejected("context is full".into()))
                 .unwrap();
-            let response = streaming_response(receiver, "id".into(), 1, false, false);
+            let response = streaming_response(receiver, "id".into(), 1, false, false, false);
             let rejection_body = body(response).await;
             let data = rejection_body
                 .lines()
@@ -459,7 +511,7 @@ mod tests {
 
             let (sender, receiver) = unbounded_channel::<GenerationReply>();
             drop(sender);
-            let response = streaming_response(receiver, "id".into(), 1, false, false);
+            let response = streaming_response(receiver, "id".into(), 1, false, false, false);
             let body = body(response).await;
             let data = body
                 .lines()

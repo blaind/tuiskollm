@@ -45,7 +45,18 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     stream: bool,
     #[serde(default)]
+    stream_options: Option<StreamOptions>,
+    #[serde(default)]
     chat_template_kwargs: ChatTemplateKwargs,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
+    #[serde(default)]
+    include_obfuscation: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -69,6 +80,8 @@ pub struct PreparedChatRequest {
     pub split_reasoning: bool,
     /// Whether generated Qwen tool XML is parsed into OpenAI tool calls.
     pub parse_tools: bool,
+    /// Whether SSE output ends with the OpenAI usage-only chunk.
+    pub include_usage: bool,
 }
 
 /// Rejection at the OpenAI transport boundary.
@@ -96,6 +109,19 @@ impl ChatCompletionRequest {
         if self.messages.is_empty() {
             return Err(ChatRequestError::Invalid(
                 "messages must not be empty".into(),
+            ));
+        }
+        if self.stream_options.is_some() && !self.stream {
+            return Err(ChatRequestError::Invalid(
+                "stream_options requires stream=true".into(),
+            ));
+        }
+        if self
+            .stream_options
+            .is_some_and(|options| options.include_obfuscation == Some(true))
+        {
+            return Err(ChatRequestError::Invalid(
+                "stream obfuscation is not admitted by this self-hosted server".into(),
             ));
         }
         if self.n.is_some_and(|choices| choices != 1) {
@@ -158,6 +184,9 @@ impl ChatCompletionRequest {
             stream: self.stream,
             split_reasoning,
             parse_tools,
+            include_usage: self
+                .stream_options
+                .is_some_and(|options| options.include_usage),
         })
     }
 }
@@ -200,6 +229,7 @@ mod tests {
                 "top_k":9,
                 "seed":17,
                 "stream":true,
+                "stream_options":{{"include_usage":true,"include_obfuscation":false}},
                 "chat_template_kwargs":{{
                     "enable_thinking":true,
                     "preserve_thinking":false,
@@ -225,6 +255,7 @@ mod tests {
         assert!(prepared.stream);
         assert!(prepared.split_reasoning);
         assert!(prepared.parse_tools);
+        assert!(prepared.include_usage);
     }
 
     #[test]
@@ -267,6 +298,14 @@ mod tests {
                 r#""messages":[{"role":"user","content":"x"}],"tool_choice":"required""#,
                 "tool_choice",
             ),
+            (
+                r#""messages":[{"role":"user","content":"x"}],"stream_options":{"include_usage":true}"#,
+                "stream_options requires stream=true",
+            ),
+            (
+                r#""messages":[{"role":"user","content":"x"}],"stream":true,"stream_options":{"include_obfuscation":true}"#,
+                "stream obfuscation",
+            ),
         ];
         for (fields, expected) in cases {
             let error = request(&format!(r#"{{"model":"{SERVED_MODEL}",{fields}}}"#))
@@ -289,5 +328,12 @@ mod tests {
         );
         let error = serde_json::from_str::<ChatCompletionRequest>(&image).unwrap_err();
         assert!(error.to_string().contains("vision tower"));
+
+        let unknown_stream_option = format!(
+            r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"x"}}],"stream":true,"stream_options":{{"usage":true}}}}"#
+        );
+        let error = serde_json::from_str::<ChatCompletionRequest>(&unknown_stream_option)
+            .expect_err("unknown stream options must not be ignored");
+        assert!(error.to_string().contains("unknown field `usage`"));
     }
 }
