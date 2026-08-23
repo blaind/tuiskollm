@@ -659,6 +659,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen35-gdn-recurrence") if remaining.is_empty() => {
             qualify_qwen35_gdn_recurrence(root)
         }
+        Some("qualify-qwen35-nvfp4-gdn-output") if remaining.is_empty() => {
+            qualify_qwen35_nvfp4_gdn_output(root)
+        }
         Some("qualify-qwen35-nvfp4-attention-output") if remaining.is_empty() => {
             qualify_qwen35_nvfp4_attention_output(root)
         }
@@ -726,6 +729,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-qwen35-nvfp4-gdn-input") => bench_qwen35_nvfp4_gdn_input(root, &remaining),
         Some("bench-qwen35-gdn-prepare") => bench_qwen35_gdn_prepare(root, &remaining),
         Some("bench-qwen35-gdn-recurrence") => bench_qwen35_gdn_recurrence(root, &remaining),
+        Some("bench-qwen35-nvfp4-gdn-output") => bench_qwen35_nvfp4_gdn_output(root, &remaining),
         Some("bench-qwen35-nvfp4-attention-output") => {
             bench_qwen35_nvfp4_attention_output(root, &remaining)
         }
@@ -841,6 +845,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-qwen35-nvfp4-attention-output"
                     | "qualify-qwen35-gdn-prepare"
                     | "qualify-qwen35-gdn-recurrence"
+                    | "qualify-qwen35-nvfp4-gdn-output"
                     | "qualify-fp8-qkv"
                     | "qualify-fp8-gdn-input"
                     | "qualify-fp8-lm-head"
@@ -1439,6 +1444,31 @@ fn qualify_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     gate_qwen35_gdn_recurrence(root)
+}
+
+fn qualify_qwen35_nvfp4_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen35_nvfp4_gdn_output",
+            "--include-ignored",
+            "--nocapture",
+        ],
+    )?;
+    gate_qwen35_nvfp4_attention_output(root)
 }
 
 fn qualify_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -2962,6 +2992,34 @@ fn bench_qwen35_gdn_recurrence(
                 "TUISKO_GENERATOR_BASELINE_SHA256",
                 sha256(&fs::read(
                     root.join(QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE),
+                )?),
+            ),
+    )
+}
+
+fn bench_qwen35_nvfp4_gdn_output(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen35-nvfp4-gdn-output")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(
+                    root.join(QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE),
                 )?),
             ),
     )

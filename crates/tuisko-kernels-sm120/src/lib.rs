@@ -26,8 +26,8 @@ pub use attention::{
     PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PAGED_GQA_PREFILL_MACRO_MAX_PARTITIONS,
     PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES, PAGED_GQA_PREFILL_MACRO_TOKENS,
     PAGED_GQA_PREFILL_MAX_CONTEXT, PAGED_GQA_PREFILL_PARTIAL_BYTES, PagedGqaOp,
-    Qwen35AttentionQkPrepareOp, Qwen35Nvfp4AttentionOutputOp, Qwen35PagedGqaOp,
-    paged_gqa_prefill_partitions,
+    Qwen35AttentionQkPrepareOp, Qwen35Nvfp4AttentionOutputOp, Qwen35Nvfp4GdnOutputOp,
+    Qwen35PagedGqaOp, paged_gqa_prefill_partitions,
 };
 pub use fp8::{
     DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps,
