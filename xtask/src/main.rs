@@ -16,6 +16,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const RESIDUAL_NORM_RESOURCE_BASELINE: &str = "qual/baselines/residual-norm-sm120.txt";
@@ -3754,27 +3755,29 @@ pub(crate) fn gate_residual_norm_target(
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join(format!("residual-norm-{}-gate.cubin", gpu.key()));
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new(gpu.oxide_arch()),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let resources = if matches!(gpu, gpu_target::GpuTarget::Sm120) {
+        sm120_gate_artifact(root)?.resources.clone()
+    } else {
+        let temporary = root.join("target/tmp");
+        fs::create_dir_all(&temporary)?;
+        let cubin = temporary.join(format!("residual-norm-{}-gate.cubin", gpu.key()));
+        require_success(
+            &cuda_tool("ptxas"),
+            &[
+                OsStr::new("-O3"),
+                OsStr::new("--gpu-name"),
+                OsStr::new(gpu.oxide_arch()),
+                ptx_path.as_os_str(),
+                OsStr::new("--output-file"),
+                cubin.as_os_str(),
+            ],
+        )?;
+        let output = require_success(
+            &cuda_tool("cuobjdump"),
+            &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+        )?;
+        parse_resources(&String::from_utf8(output.stdout)?)?
+    };
     let mut plain_registers = Vec::new();
     let mut residual_registers = Vec::new();
     let mut shared = Vec::new();
@@ -3845,29 +3848,9 @@ fn gate_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("qwen35-residual-norm-sm120-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let mut plain_registers = Vec::with_capacity(plain.len());
     let mut residual_registers = Vec::with_capacity(residual.len());
     let mut shared = Vec::with_capacity(plain.len() + residual.len());
@@ -3884,7 +3867,7 @@ fn gate_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
             registers.push(resource.registers);
             shared.push(resource.shared);
 
-            let body = sass_function_body(&sass, entry.name)
+            let body = sass_function_body(sass, entry.name)
                 .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
             for instruction in ["MUFU.RSQ", "F2FP.BF16.F32.PACK_AB"] {
                 if !body.contains(instruction) {
@@ -4099,31 +4082,11 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("fp8-qkv-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     for entry in qkv_t16.iter().chain(&qkv_prefill).chain(&qkv_t1024) {
-        let body = sass_function_body(&sass, entry.name)
+        let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted FP8 QKV MMA entry `{}`", entry.name))?;
         if !body.contains("QMMA.16832.F32.E4M3.E4M3") {
             return Err(format!(
@@ -4312,27 +4275,7 @@ fn gate_fp8_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("fp8-gdn-input-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let resources = &sm120_gate_artifact(root)?.resources;
     let mut registers = Vec::new();
     let mut shared = Vec::new();
     for entry in gdn_input {
@@ -4383,27 +4326,7 @@ fn gate_fp8_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("fp8-lm-head-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let resources = &sm120_gate_artifact(root)?.resources;
     let mut registers = Vec::new();
     let mut shared = Vec::new();
     for entry in lm_head {
@@ -4469,31 +4392,11 @@ fn gate_fp8_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("fp8-swiglu-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     for entry in &prefill {
-        let body = sass_function_body(&sass, entry.name)
+        let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
         if !body.contains("QMMA.16832.F32.E4M3.E4M3") {
             return Err(format!(
@@ -4576,27 +4479,7 @@ fn gate_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("fp8-down-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let resources = &sm120_gate_artifact(root)?.resources;
     let quantize_resource = resources
         .get(quantize[0].name)
         .ok_or("cuobjdump omitted dense-FP8 down quantization")?;
@@ -4704,29 +4587,9 @@ fn gate_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("nvfp4-swiglu-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
 
     let mut a16_registers = Vec::new();
     let mut a16_shared = Vec::new();
@@ -4767,7 +4630,7 @@ fn gate_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
             .get(entry.name)
             .ok_or_else(|| format!("cuobjdump omitted NVFP4 W4A4 entry `{}`", entry.name))?;
         require_spill_free(entry.name, resource)?;
-        let body = sass_function_body(&sass, entry.name)
+        let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted NVFP4 W4A4 SASS `{}`", entry.name))?;
         if !body.contains("OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X") {
             return Err(format!(
@@ -4870,29 +4733,9 @@ fn gate_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("qwen35-nvfp4-swiglu-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
 
     let mut a16_registers = Vec::new();
     let mut a16_shared = Vec::new();
@@ -4937,7 +4780,7 @@ fn gate_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
             )
         })?;
         require_spill_free(entry.name, resource)?;
-        let body = sass_function_body(&sass, entry.name)
+        let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted Qwen3.5 NVFP4 W4A4 SASS `{}`", entry.name))?;
         if !body.contains("OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X") {
             return Err(format!(
@@ -5005,27 +4848,7 @@ fn gate_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("gdn-prepare-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let resources = &sm120_gate_artifact(root)?.resources;
     let mut control_registers = Vec::new();
     let mut convolution_registers = Vec::new();
     let mut control_shared = Vec::new();
@@ -5081,27 +4904,7 @@ fn gate_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("gdn-recurrence-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let resources = &sm120_gate_artifact(root)?.resources;
     let mut registers = Vec::new();
     let mut shared = Vec::new();
     for entry in recurrence {
@@ -5148,27 +4951,7 @@ fn gate_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("gdn-output-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let resources = &sm120_gate_artifact(root)?.resources;
     let quantize_resource = resources
         .get(quantize[0].name)
         .ok_or("cuobjdump omitted GDN output quantization")?;
@@ -5256,29 +5039,9 @@ fn gate_attention_qk_prepare_target(
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("attention-qk-prepare-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let mut decode_registers = Vec::new();
     let mut prefill_registers = Vec::new();
     let mut shared = Vec::new();
@@ -5294,7 +5057,7 @@ fn gate_attention_qk_prepare_target(
             registers.push(resource.registers);
             shared.push(resource.shared);
 
-            let body = sass_function_body(&sass, entry.name)
+            let body = sass_function_body(sass, entry.name)
                 .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
             for instruction in [
                 "MUFU.RSQ",
@@ -5415,29 +5178,9 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("paged-gqa-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let mut registers = Vec::new();
     let mut prefill_registers = Vec::new();
     let mut prefill_partial_registers = Vec::new();
@@ -5451,7 +5194,7 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         registers.push(resource.registers);
         shared.push(resource.shared);
 
-        let body = sass_function_body(&sass, entry.name)
+        let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
         for instruction in ["F2FP.F16.E4M3.UNPACK_B", "SHFL.BFLY", "MUFU.EX2"] {
             if !body.contains(instruction) {
@@ -5469,7 +5212,7 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         prefill_registers.push(resource.registers);
         shared.push(resource.shared);
 
-        let body = sass_function_body(&sass, entry.name)
+        let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
         for instruction in ["F2FP.F16.E4M3.UNPACK_B", "SHFL.BFLY", "MUFU.EX2", "LDGSTS"] {
             if !body.contains(instruction) {
@@ -5487,7 +5230,7 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         prefill_partial_registers.push(resource.registers);
         shared.push(resource.shared);
 
-        let body = sass_function_body(&sass, entry.name)
+        let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
         for instruction in ["F2FP.F16.E4M3.UNPACK_B", "SHFL.BFLY", "MUFU.EX2", "LDGSTS"] {
             if !body.contains(instruction) {
@@ -5505,7 +5248,7 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         prefill_reduce_registers.push(resource.registers);
         shared.push(resource.shared);
 
-        let body = sass_function_body(&sass, entry.name)
+        let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
         if !body.contains("MUFU.EX2") {
             return Err(format!("entry `{}` lost required `MUFU.EX2` SASS", entry.name).into());
@@ -5587,29 +5330,9 @@ fn gate_long_context_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("long-context-paged-gqa-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let mut partial_registers = Vec::new();
     let mut reduction_registers = Vec::new();
     let mut shared = Vec::new();
@@ -5633,7 +5356,7 @@ fn gate_long_context_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             registers.push(resource.registers);
             shared.push(resource.shared);
 
-            let body = sass_function_body(&sass, entry.name)
+            let body = sass_function_body(sass, entry.name)
                 .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
             for instruction in instructions {
                 if !body.contains(instruction) {
@@ -5687,34 +5410,14 @@ fn gate_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("attention-output-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let quantize_resource = resources
         .get(quantize[0].name)
         .ok_or("cuobjdump omitted attention-output gate quantization")?;
     require_spill_free(quantize[0].name, quantize_resource)?;
-    let quantize_sass = sass_function_body(&sass, quantize[0].name)
+    let quantize_sass = sass_function_body(sass, quantize[0].name)
         .ok_or("cuobjdump omitted attention-output gate quantization SASS")?;
     for instruction in ["MUFU.EX2", "F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C"] {
         if !quantize_sass.contains(instruction) {
@@ -5743,7 +5446,7 @@ fn gate_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
             .get(entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
         require_spill_free(entry.name, resource)?;
-        let body = sass_function_body(&sass, entry.name)
+        let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
         for instruction in ["F2FP.F16.E4M3.UNPACK_B", "SHFL.DOWN"] {
             if !body.contains(instruction) {
@@ -5804,29 +5507,9 @@ fn gate_nvfp4_down(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("nvfp4-down-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let mut registers = Vec::new();
     let mut shared = Vec::new();
     for entry in routes {
@@ -5834,7 +5517,7 @@ fn gate_nvfp4_down(root: &Path) -> Result<(), Box<dyn Error>> {
             .get(entry.name)
             .ok_or_else(|| format!("cuobjdump omitted NVFP4 down entry `{}`", entry.name))?;
         require_spill_free(entry.name, resource)?;
-        if sass_function_body(&sass, entry.name).is_none() {
+        if sass_function_body(sass, entry.name).is_none() {
             return Err(format!("cuobjdump omitted NVFP4 down SASS `{}`", entry.name).into());
         }
         registers.push(resource.registers);
@@ -5883,29 +5566,9 @@ fn gate_qwen35_nvfp4_down(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("qwen35-nvfp4-down-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let mut registers = Vec::new();
     let mut shared = Vec::new();
     for entry in routes {
@@ -5916,7 +5579,7 @@ fn gate_qwen35_nvfp4_down(root: &Path) -> Result<(), Box<dyn Error>> {
             )
         })?;
         require_spill_free(entry.name, resource)?;
-        if sass_function_body(&sass, entry.name).is_none() {
+        if sass_function_body(sass, entry.name).is_none() {
             return Err(
                 format!("cuobjdump omitted Qwen3.5 NVFP4 down SASS `{}`", entry.name).into(),
             );
@@ -5968,29 +5631,9 @@ fn gate_qwen35_nvfp4_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("qwen35-nvfp4-qkv-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let mut registers = Vec::new();
     let mut shared = Vec::new();
     for entry in routes {
@@ -5998,7 +5641,7 @@ fn gate_qwen35_nvfp4_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
             .get(entry.name)
             .ok_or_else(|| format!("cuobjdump omitted Qwen3.5 NVFP4 QKV entry `{}`", entry.name))?;
         require_spill_free(entry.name, resource)?;
-        if sass_function_body(&sass, entry.name).is_none() {
+        if sass_function_body(sass, entry.name).is_none() {
             return Err(
                 format!("cuobjdump omitted Qwen3.5 NVFP4 QKV SASS `{}`", entry.name).into(),
             );
@@ -6308,6 +5951,87 @@ struct Resource {
     stack: u32,
     shared: u32,
     local: u32,
+}
+
+struct Sm120GateArtifact {
+    root: PathBuf,
+    cubin: PathBuf,
+    resources: BTreeMap<String, Resource>,
+    sass: OnceLock<Result<String, String>>,
+}
+
+static SM120_GATE_ARTIFACT: OnceLock<Result<Sm120GateArtifact, String>> = OnceLock::new();
+
+fn sm120_gate_artifact(root: &Path) -> Result<&'static Sm120GateArtifact, Box<dyn Error>> {
+    let artifact = SM120_GATE_ARTIFACT
+        .get_or_init(|| build_sm120_gate_artifact(root).map_err(|error| error.to_string()));
+    let artifact = match artifact {
+        Ok(artifact) => artifact,
+        Err(error) => return Err(error.clone().into()),
+    };
+    if artifact.root != root {
+        return Err(format!(
+            "one xtask process cannot resource-check SM120 artifacts from both `{}` and `{}`",
+            artifact.root.display(),
+            root.display()
+        )
+        .into());
+    }
+
+    Ok(artifact)
+}
+
+fn build_sm120_gate_artifact(root: &Path) -> Result<Sm120GateArtifact, Box<dyn Error>> {
+    let ptx = root.join(PTX);
+    if !ptx.is_file() {
+        return Err(format!(
+            "could not read {}; run the pinned release device build first",
+            ptx.display()
+        )
+        .into());
+    }
+    let temporary = root.join("target/tmp");
+    fs::create_dir_all(&temporary)?;
+    let cubin = temporary.join("sm120-resource-gates.cubin");
+    require_success(
+        &cuda_tool("ptxas"),
+        &[
+            OsStr::new("-O3"),
+            OsStr::new("--gpu-name"),
+            OsStr::new("sm_120a"),
+            ptx.as_os_str(),
+            OsStr::new("--output-file"),
+            cubin.as_os_str(),
+        ],
+    )?;
+    let output = require_success(
+        &cuda_tool("cuobjdump"),
+        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+    )?;
+
+    Ok(Sm120GateArtifact {
+        root: root.to_path_buf(),
+        cubin,
+        resources: parse_resources(&String::from_utf8(output.stdout)?)?,
+        sass: OnceLock::new(),
+    })
+}
+
+impl Sm120GateArtifact {
+    fn sass(&self) -> Result<&str, Box<dyn Error>> {
+        let sass = self.sass.get_or_init(|| {
+            require_success(
+                &cuda_tool("cuobjdump"),
+                &[OsStr::new("--dump-sass"), self.cubin.as_os_str()],
+            )
+            .and_then(|output| String::from_utf8(output.stdout).map_err(Into::into))
+            .map_err(|error| error.to_string())
+        });
+        match sass {
+            Ok(sass) => Ok(sass),
+            Err(error) => Err(error.clone().into()),
+        }
+    }
 }
 
 fn parse_resources(text: &str) -> Result<BTreeMap<String, Resource>, Box<dyn Error>> {
