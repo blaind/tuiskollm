@@ -27,6 +27,9 @@ directory and an optional numeric listen address:
 target/cuda-oxide-build-sm120/release/tuiskollm serve SNAPSHOT 127.0.0.1:8000
 ```
 
+Tagged releases attach a stripped Linux x86-64 server and checksum. The archive requires glibc
+2.35 or newer, the NVIDIA driver, and the exact RTX 5090, but not Rust or the CUDA Toolkit.
+
 It exposes `GET /health`, `GET /v1/models`, and OpenAI-compatible blocking or SSE
 `POST /v1/chat/completions`. The server loads and admits the complete checkpoint before binding the
 listener, owns one bounded resident scheduling queue, and refuses a different model identity or

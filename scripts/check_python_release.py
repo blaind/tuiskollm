@@ -18,7 +18,7 @@ from typing import NoReturn, cast
 
 WORKSPACE = Path(__file__).resolve().parents[1]
 DISTRIBUTION = "tuisko-llm"
-TAG_PREFIX = "tuisko-llm-v"
+TAG_PREFIX = "v"
 WHEEL_STEM = "tuisko_llm"
 WHEEL_TAG = "cp312-abi3-manylinux_2_34_x86_64"
 SDIST_MAX_BYTES = 1024 * 1024
