@@ -2,6 +2,9 @@
 
 use crate::Sm120Arch;
 use crate::device::fp8_down::{fp8_down_projection, quantize_down_activation};
+use crate::fp8::down_tma::{
+    DenseFp8DownTmaMaps, DenseFp8DownTmaRoute, TOKENS as MACRO_TOKENS, ptx_name as tma_ptx_name,
+};
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -159,6 +162,8 @@ pub struct DenseFp8DownOp<A: Sm120Arch = Qwen38_27B> {
     b6: PreparedRoute<A, 6>,
     b7: PreparedRoute<A, 7>,
     b8: PreparedRoute<A, 8>,
+    t1024_quantize: PreparedLaunch<kernels::__fp8_down_quantize_CudaKernel<A>>,
+    t1024: DenseFp8DownTmaRoute,
 }
 
 impl<A: Sm120Arch> DenseFp8DownOp<A> {
@@ -179,6 +184,8 @@ impl<A: Sm120Arch> DenseFp8DownOp<A> {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            t1024_quantize: prepare_quantize::<A, MACRO_TOKENS>(&module)?,
+            t1024: DenseFp8DownTmaRoute::new(context)?,
             module,
         })
     }
@@ -241,10 +248,52 @@ impl<A: Sm120Arch> DenseFp8DownOp<A> {
             _ => unreachable!(),
         }
     }
+
+    /// Dynamically quantizes and applies the exact T=1024 TMA down route.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`] at exactly 1024 rows.
+    /// `maps` was constructed for the same `activation_codes` and
+    /// `weight_codes` addresses, which remain live and stable through replay.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_macro_prefill(
+        &self,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+        maps: &DenseFp8DownTmaMaps,
+    ) -> GpuResult<()> {
+        if maps.activation_codes() != activation_codes.addr()
+            || maps.weight_codes() != weight_codes.addr()
+        {
+            return Err(GpuError::invalid_launch(
+                "dense-FP8 down tensor maps do not match the launch addresses",
+            ));
+        }
+        self.module
+            .fp8_down_quantize::<A>(
+                stream,
+                &self.t1024_quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u16>(),
+                activation_scales,
+            )
+            .map_err(|source| GpuError::launch("launching dense-FP8 down quantization", source))?;
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.t1024
+                .launch(stream, maps, activation_scales, weight_scales, output)
+        }
+    }
 }
 
 /// PTX symbols retained for quantization and every exact dense-FP8 down route.
-pub(crate) fn fp8_down_ptx_names() -> [&'static str; 9] {
+pub(crate) fn fp8_down_ptx_names() -> [&'static str; 10] {
     [
         kernels::fp8_down_quantize_ptx_name::<Qwen38_27B>(),
         kernels::fp8_down_ptx_name::<Qwen38_27B, 1>(),
@@ -255,6 +304,7 @@ pub(crate) fn fp8_down_ptx_names() -> [&'static str; 9] {
         kernels::fp8_down_ptx_name::<Qwen38_27B, 6>(),
         kernels::fp8_down_ptx_name::<Qwen38_27B, 7>(),
         kernels::fp8_down_ptx_name::<Qwen38_27B, 8>(),
+        tma_ptx_name(),
     ]
 }
 
@@ -293,7 +343,7 @@ mod tests {
         let names = fp8_down_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 10);
         assert_eq!(unique.len(), names.len());
     }
 }

@@ -1,4 +1,5 @@
 mod down;
+mod down_tma;
 mod gdn_output;
 mod projection;
 mod swiglu;
@@ -6,6 +7,7 @@ mod swiglu_tma;
 
 pub use down::DenseFp8DownOp;
 pub(crate) use down::fp8_down_ptx_names;
+pub use down_tma::DenseFp8DownTmaMaps;
 pub use gdn_output::GdnOutputProjectionOp;
 pub(crate) use gdn_output::gdn_output_ptx_names;
 pub use projection::{FullAttentionQkvOp, GdnInputProjectionOp, LmHeadOp};
