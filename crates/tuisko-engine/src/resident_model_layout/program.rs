@@ -15,6 +15,7 @@ use crate::{
 #[cfg(feature = "qualification")]
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Instant;
 use tuisko_gpu::{
     ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, DeviceCopy, GpuError, GpuResult,
     LoadingDeviceArena, PinnedHostBuffer,
@@ -106,6 +107,14 @@ pub struct ResidentLoadStats {
     upload_submissions: usize,
     zeroed_bytes: usize,
     pinned_stager_bytes: usize,
+    layout_plan_ns: u64,
+    arena_allocation_ns: u64,
+    operator_setup_ns: u64,
+    weight_prepare_ns: u64,
+    weight_copy_ns: u64,
+    weight_load_ns: u64,
+    nonweight_init_ns: u64,
+    graph_capture_ns: u64,
 }
 
 impl ResidentLoadStats {
@@ -132,6 +141,46 @@ impl ResidentLoadStats {
     /// Fixed page-locked host bytes retained during loading, if any.
     pub const fn pinned_stager_bytes(self) -> usize {
         self.pinned_stager_bytes
+    }
+
+    /// Host nanoseconds spent deriving the layout and exact upload plan.
+    pub const fn layout_plan_ns(self) -> u64 {
+        self.layout_plan_ns
+    }
+
+    /// Host nanoseconds spent creating and completing the device allocations.
+    pub const fn arena_allocation_ns(self) -> u64 {
+        self.arena_allocation_ns
+    }
+
+    /// Host nanoseconds spent loading operators and allocating their fixed host state.
+    pub const fn operator_setup_ns(self) -> u64 {
+        self.operator_setup_ns
+    }
+
+    /// Host nanoseconds spent binding and materializing source values outside CUDA copy calls.
+    pub const fn weight_prepare_ns(self) -> u64 {
+        self.weight_prepare_ns
+    }
+
+    /// Host nanoseconds spent inside CUDA host-to-device copy calls and their required waits.
+    pub const fn weight_copy_ns(self) -> u64 {
+        self.weight_copy_ns
+    }
+
+    /// Host nanoseconds spent materializing and uploading source-backed weights.
+    pub const fn weight_load_ns(self) -> u64 {
+        self.weight_load_ns
+    }
+
+    /// Host nanoseconds spent initializing metadata, runtime state, cache, and padding.
+    pub const fn nonweight_init_ns(self) -> u64 {
+        self.nonweight_init_ns
+    }
+
+    /// Host nanoseconds spent binding stable pointers and capturing the graph inventory.
+    pub const fn graph_capture_ns(self) -> u64 {
+        self.graph_capture_ns
     }
 }
 
@@ -229,8 +278,12 @@ impl ResidentModelProgram {
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
         mode: ResidentLoadMode,
     ) -> EngineResult<Self> {
+        let layout_start = Instant::now();
         let layout = ResidentModelLayout::build()?;
         let upload_plan = ResidentUploadPlan::build(&layout)?;
+        let layout_plan_ns = elapsed_ns("resident layout and upload plan", layout_start)?;
+
+        let allocation_start = Instant::now();
         let stream = context.new_stream().map_err(GpuError::from)?;
         let arenas = match mode {
             ResidentLoadMode::Legacy => ArenaLoading::Legacy {
@@ -242,6 +295,10 @@ impl ResidentModelProgram {
                 kv_arena: LoadingDeviceArena::allocate(&stream, layout.kv_layout.builder())?,
             },
         };
+        stream.synchronize().map_err(GpuError::from)?;
+        let arena_allocation_ns = elapsed_ns("resident arena allocation", allocation_start)?;
+
+        let operator_start = Instant::now();
         let kv_slots = PagedKvSlotPool::new(LONG_CONTEXT_PHYSICAL_PAGES)?;
         let norm = ResidualNormOp::new(context)?;
         let gdn_input = GdnInputProjectionOp::new(context)?;
@@ -267,12 +324,29 @@ impl ResidentModelProgram {
             )?,
         )
         .map_err(GpuError::from)?;
+        let operator_setup_ns = elapsed_ns("resident operator setup", operator_start)?;
 
-        let (arena, kv_arena, scalars, load_stats) = match arenas {
+        let (arena, kv_arena, scalars, mut load_stats) = match arenas {
             ArenaLoading::Legacy { arena, kv_arena } => {
-                let mut sink = LegacyWeightSink { arena: &arena };
+                let weight_start = Instant::now();
+                let mut sink = LegacyWeightSink {
+                    arena: &arena,
+                    copy_ns: 0,
+                };
                 let scalars = load_source_weights(&mut sink, &stream, &layout, snapshot.as_ref())?;
+                let weight_load_ns = elapsed_ns("resident legacy weight load", weight_start)?;
+                let weight_copy_ns = sink.copy_ns;
+                let weight_prepare_ns =
+                    weight_load_ns.checked_sub(weight_copy_ns).ok_or_else(|| {
+                        EngineError::layout(
+                            "legacy weight-copy time exceeds total weight-load time",
+                        )
+                    })?;
+
+                let nonweight_start = Instant::now();
                 initialize_metadata(&arena, &kv_arena, &stream, &layout)?;
+                let nonweight_init_ns =
+                    elapsed_ns("resident legacy non-weight initialization", nonweight_start)?;
                 let upload_submissions = upload_plan
                     .entries()
                     .iter()
@@ -284,6 +358,14 @@ impl ResidentModelProgram {
                     upload_submissions,
                     zeroed_bytes: layout.arena_bytes(),
                     pinned_stager_bytes: 0,
+                    layout_plan_ns,
+                    arena_allocation_ns,
+                    operator_setup_ns,
+                    weight_prepare_ns,
+                    weight_copy_ns,
+                    weight_load_ns,
+                    nonweight_init_ns,
+                    graph_capture_ns: 0,
                 };
                 (arena, kv_arena, scalars, load_stats)
             }
@@ -291,17 +373,28 @@ impl ResidentModelProgram {
                 mut arena,
                 mut kv_arena,
             } => {
-                let (scalars, upload_bytes, upload_submissions) = {
+                let weight_start = Instant::now();
+                let (scalars, upload_bytes, upload_submissions, weight_copy_ns) = {
                     let mut sink = SelectiveWeightSink {
                         arena: &mut arena,
                         plan: &upload_plan,
                         bytes: 0,
                         submissions: 0,
+                        copy_ns: 0,
                     };
                     let scalars =
                         load_source_weights(&mut sink, &stream, &layout, snapshot.as_ref())?;
-                    (scalars, sink.bytes, sink.submissions)
+                    (scalars, sink.bytes, sink.submissions, sink.copy_ns)
                 };
+                let weight_load_ns = elapsed_ns("resident selective weight load", weight_start)?;
+                let weight_prepare_ns =
+                    weight_load_ns.checked_sub(weight_copy_ns).ok_or_else(|| {
+                        EngineError::layout(
+                            "selective weight-copy time exceeds total weight-load time",
+                        )
+                    })?;
+
+                let nonweight_start = Instant::now();
                 let metadata = initialize_selective_nonweights(
                     &mut arena,
                     &mut kv_arena,
@@ -326,18 +419,31 @@ impl ResidentModelProgram {
                         "selective loader uploaded {uploaded_bytes} bytes, expected {expected_upload_bytes}",
                     )));
                 }
+                let arena = arena.seal(&stream)?;
+                let kv_arena = kv_arena.seal(&stream)?;
+                let nonweight_init_ns = elapsed_ns(
+                    "resident selective non-weight initialization",
+                    nonweight_start,
+                )?;
                 let load_stats = ResidentLoadStats {
                     mode,
                     upload_bytes: uploaded_bytes,
                     upload_submissions,
                     zeroed_bytes: upload_plan.zeroed_owner_bytes() + upload_plan.padding_bytes(),
                     pinned_stager_bytes: 0,
+                    layout_plan_ns,
+                    arena_allocation_ns,
+                    operator_setup_ns,
+                    weight_prepare_ns,
+                    weight_copy_ns,
+                    weight_load_ns,
+                    nonweight_init_ns,
+                    graph_capture_ns: 0,
                 };
-                let arena = arena.seal(&stream)?;
-                let kv_arena = kv_arena.seal(&stream)?;
                 (arena, kv_arena, scalars, load_stats)
             }
         };
+        let graph_start = Instant::now();
         let pointers = ProgramPointers::bind(&arena, &kv_arena, &layout, &scalars)?;
         let base_address = arena.base_address();
         let kv_base_address = kv_arena.base_address();
@@ -359,6 +465,7 @@ impl ResidentModelProgram {
             lm_head: &lm_head,
         };
         let graphs = capture_routes(&stream, ops, &pointers)?;
+        load_stats.graph_capture_ns = elapsed_ns("resident graph capture", graph_start)?;
 
         Ok(Self {
             graphs,
@@ -2148,6 +2255,7 @@ trait ResidentWeightSink {
 
 struct LegacyWeightSink<'a> {
     arena: &'a DeviceArena,
+    copy_ns: u64,
 }
 
 impl ResidentWeightSink for LegacyWeightSink<'_> {
@@ -2157,7 +2265,12 @@ impl ResidentWeightSink for LegacyWeightSink<'_> {
         region: ArenaRegion<T>,
         source: &[T],
     ) -> EngineResult<()> {
+        let started = Instant::now();
         self.arena.copy_from_host(stream, region, source)?;
+        self.copy_ns = self
+            .copy_ns
+            .checked_add(elapsed_ns("legacy weight copy", started)?)
+            .ok_or_else(|| EngineError::layout("legacy weight-copy time overflows"))?;
         Ok(())
     }
 }
@@ -2167,6 +2280,7 @@ struct SelectiveWeightSink<'a> {
     plan: &'a ResidentUploadPlan,
     bytes: usize,
     submissions: usize,
+    copy_ns: u64,
 }
 
 impl ResidentWeightSink for SelectiveWeightSink<'_> {
@@ -2176,6 +2290,7 @@ impl ResidentWeightSink for SelectiveWeightSink<'_> {
         region: ArenaRegion<T>,
         source: &[T],
     ) -> EngineResult<()> {
+        let started = Instant::now();
         let end = region
             .offset_bytes()
             .checked_add(region.byte_len())
@@ -2209,6 +2324,10 @@ impl ResidentWeightSink for SelectiveWeightSink<'_> {
                 )));
             }
         }
+        self.copy_ns = self
+            .copy_ns
+            .checked_add(elapsed_ns("selective weight copy", started)?)
+            .ok_or_else(|| EngineError::layout("selective weight-copy time overflows"))?;
         self.bytes = self
             .bytes
             .checked_add(region.byte_len())
@@ -2681,6 +2800,11 @@ fn require_batch(batch: usize) -> EngineResult<()> {
         )));
     }
     Ok(())
+}
+
+fn elapsed_ns(phase: &str, started: Instant) -> EngineResult<u64> {
+    u64::try_from(started.elapsed().as_nanos())
+        .map_err(|_| EngineError::layout(format!("{phase} duration exceeds u64 nanoseconds")))
 }
 
 fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
