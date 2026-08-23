@@ -29,6 +29,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+axum = "0.8"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 cuda-core = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "1f4d813719012d384f2db12b88efc9314c8bf50c" }
 cuda-device = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "1f4d813719012d384f2db12b88efc9314c8bf50c" }
@@ -46,6 +47,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1.53", default-features = false, features = ["io-util", "net", "rt", "sync", "time"] }
+tokio-stream = "0.1"
 tokenizers = { version = "=0.23.1", default-features = false, features = ["onig"] }
 tuisko-engine = { version = "0.1.0", path = "crates/tuisko-engine" }
 tuisko-frontend = { version = "0.1.0", path = "crates/tuisko-frontend" }
