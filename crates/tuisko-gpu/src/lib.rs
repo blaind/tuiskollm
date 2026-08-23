@@ -9,7 +9,7 @@ mod timer;
 pub use arena::{ArenaLayout, ArenaRegion, DeviceArena};
 pub use cuda_core::{
     CudaContext, CudaEvent, CudaStream, DeviceBuffer, DeviceCopy, DriverError, LaunchConfig1D,
-    LaunchContractError, PinnedHostBuffer, PreparedLaunch, SyncPolicy,
+    LaunchConfig2D, LaunchContractError, PinnedHostBuffer, PreparedLaunch, SyncPolicy,
 };
 pub use error::{GpuError, GpuErrorCode, GpuResult};
 pub use graph::CudaGraph;

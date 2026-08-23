@@ -8,7 +8,8 @@ dynamic-quantize FP8 QKV at exact `B=1..8` plus `T=16`, GDN Q/K/V/Z input projec
 `B=1..8`, the full-vocabulary FP8 LM head at exact `B=1..8`, dense-FP8 gate/up SwiGLU at exact
 `B=1..8` and `T=32,64,128`, dense-FP8 down and GDN control/convolution at exact `B=1..8`, and the
 GDN recurrence and source-native output projection at exact `B=1..8`, plus the source-backed
-dense-FP8 MLP, complete layer-60 GDN, and final-norm plus LM-head owners. Full-attention Q/K
+dense-FP8 MLP, complete layer-60 GDN, and final-norm plus LM-head owners. NVFP4 gate/up SwiGLU
+uses the exact retained A16 and W4A4 decode schedules at `B=1..8`. Full-attention Q/K
 preparation covers zero-centered normalization, the 64-wide three-axis MRoPE, and represented E4M3
 KV-cache append at exact `B=1..8`. Short-context paged GQA covers exact 24-query/4-KV-head,
 256-wide online-softmax decode across page boundaries at `B=1..8`; long-context partitioned decode
@@ -77,6 +78,7 @@ target/benchmarks/perf-smoke/fp8-gdn-input.json
 target/benchmarks/perf-smoke/fp8-lm-head.json
 target/benchmarks/perf-smoke/fp8-swiglu.json
 target/benchmarks/perf-smoke/fp8-down.json
+target/benchmarks/perf-smoke/nvfp4-swiglu.json
 target/benchmarks/perf-smoke/gdn-prepare.json
 target/benchmarks/perf-smoke/gdn-recurrence.json
 target/benchmarks/perf-smoke/gdn-output.json
@@ -101,6 +103,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- qualify-fp8-lm-head` | Run the independent represented-value full-vocabulary LM-head oracle and benchmark-accounting test | terminal |
 | `cargo run -p xtask -- qualify-fp8-swiglu` | Run the exhaustive represented-value gate/up SwiGLU oracle and graph-replay gate | terminal |
 | `cargo run -p xtask -- qualify-fp8-down` | Run the exhaustive represented-value dense-FP8 down oracle and graph-replay gate | terminal |
+| `cargo run -p xtask -- qualify-nvfp4-swiglu` | Check represented E2M1/E4M3 seams, A16/W4A4 production routing, immutable weights, graph replay, stable addresses, and post-warmup allocation at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-gdn-prepare` | Check the two control formulas, mapped width-4 convolution/history updates, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-gdn-recurrence` | Check mapped FP32 state transitions, gated normalization, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-gdn-output` | Check dynamic E4M3 quantization, source-native output projection, and graph replay at B=1..8 | terminal |
@@ -117,6 +120,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- bench-attention-qk-prepare` | Measure every exact Q/K prepare and cache-append graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-paged-gqa` | Measure every exact paged GQA graph at a 130-token, three-page context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-output` | Measure every exact sigmoid-gate, quantize, and output-projection graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-nvfp4-swiglu` | Measure every exact retained A16/W4A4 NVFP4 gate/up SwiGLU graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT` | Measure every complete source-backed layer-60 graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-full-attention-layer SNAPSHOT` | Measure every complete source-backed layer-63 graph at a 131-token, three-page context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
@@ -167,8 +171,8 @@ cargo run -p xtask -- bench-residual-norm \
 
 Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, `bench-fp8-lm-head`,
 `bench-fp8-swiglu`, `bench-fp8-down`, `bench-gdn-prepare`, `bench-gdn-recurrence`, or
-`bench-gdn-output`, `bench-attention-qk-prepare`, `bench-paged-gqa`, or `bench-attention-output` with
-the same options for one operator suite only.
+`bench-gdn-output`, `bench-nvfp4-swiglu`, `bench-attention-qk-prepare`, `bench-paged-gqa`, or
+`bench-attention-output` with the same options for one operator suite only.
 
 `bench-text-endpoint SNAPSHOT` accepts the same options. It is intentionally separate from the
 leaf-wide `perf` commands until its first reviewed baseline is blessed.
@@ -235,9 +239,9 @@ Unused dimensions are `null`, not zero. A comparison refuses when any workload d
 inventory differs. This prevents, for example, a warm short-context operator result from being
 compared with a cold long-context model result that shares a route name.
 
-The residual-norm, FP8-QKV `B=1..8`, FP8-GDN-input, FP8-LM-head, dense-FP8-SwiGLU `B=1..8`, and
-dense-FP8-down cases are `operator/decode`, warm-cache, CUDA-Graph workloads. They set batch and
-active tokens to the exact batch. FP8-QKV `T=16` is an `operator/mtp` case.
+The residual-norm, FP8-QKV `B=1..8`, FP8-GDN-input, FP8-LM-head, dense-FP8-SwiGLU `B=1..8`,
+dense-FP8-down, and NVFP4-SwiGLU cases are `operator/decode`, warm-cache, CUDA-Graph workloads.
+They set batch and active tokens to the exact batch. FP8-QKV `T=16` is an `operator/mtp` case.
 Dense-FP8-SwiGLU `T=32,64,128` cases are `operator/prefill` cases with prompt and context lengths
 equal to the active rows. Concurrency, output, and prefix cache do not apply to these leaf suites.
 
@@ -447,11 +451,11 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 
 ## Current limitations
 
-- Only residual/RMSNorm `B=1..8`, FP8-QKV `B=1..8,T=16`, FP8 GDN input `B=1..8`,
-  and FP8 LM head `B=1..8` leaf cases are registered.
+- Decode operator coverage is exact `B=1..8`; prefill remains limited to the explicitly listed
+  dense-FP8 SwiGLU routes, and long-context attention needs separate routes.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
-- There is no whole-layer, whole-model, TTFT, inter-token-latency, concurrency, long-context,
-  or end-to-end MTP benchmark in this repository yet.
+- There is no whole-model, TTFT, inter-token-latency, concurrency, long-context, or end-to-end MTP
+  benchmark in this repository yet.
 - Power and energy are reportable, but energy is most meaningful after sustained model/server cases
   land.
 - `ncu` and Nsight Systems traces are diagnostic artifacts, not produced by the regression runner.

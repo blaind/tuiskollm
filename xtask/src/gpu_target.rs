@@ -69,7 +69,7 @@ impl BuildTargetProfile for GpuTarget {
 
     fn nvfp4_swiglu_resource_baseline(self) -> Option<&'static str> {
         match self {
-            Self::Sm120 => None,
+            Self::Sm120 => Some("qual/baselines/nvfp4-swiglu-sm120.txt"),
             Self::Sm89 => Some("qual/baselines/nvfp4-swiglu-sm89.txt"),
             Self::Sm86 => Some("qual/baselines/nvfp4-swiglu-sm86.txt"),
         }
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(
             GpuTarget::ALL.map(BuildTargetProfile::nvfp4_swiglu_resource_baseline),
             [
-                None,
+                Some("qual/baselines/nvfp4-swiglu-sm120.txt"),
                 Some("qual/baselines/nvfp4-swiglu-sm89.txt"),
                 Some("qual/baselines/nvfp4-swiglu-sm86.txt"),
             ]
