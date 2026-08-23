@@ -31,6 +31,11 @@ impl SamplingOptions {
             seed: 0,
         }
     }
+
+    /// Validates the exact sampler domain without creating request state.
+    pub fn validate(self) -> EngineResult<()> {
+        validate_options(self)
+    }
 }
 
 impl Default for SamplingOptions {
@@ -64,7 +69,7 @@ pub struct Sampler {
 impl Sampler {
     /// Validates one request's options and stop-token pair.
     pub fn new(options: SamplingOptions, stop_ids: [u32; 2]) -> EngineResult<Self> {
-        validate_options(options)?;
+        options.validate()?;
         validate_stop_ids(stop_ids)?;
 
         Ok(Self {

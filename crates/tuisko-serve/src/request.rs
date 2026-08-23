@@ -206,12 +206,21 @@ impl ChatCompletionRequest {
             reasoning_effort: self.chat_template_kwargs.reasoning_effort,
             tools,
         };
-        generation.sampling = SamplingOptions {
+        let sampling = SamplingOptions {
             temperature: self.temperature.unwrap_or(1.0),
             top_p: self.top_p.unwrap_or(0.95),
             top_k: self.top_k.unwrap_or(20),
             seed: self.seed.unwrap_or(default_seed),
         };
+        if sampling.temperature > 2.0 {
+            return Err(ChatRequestError::Invalid(
+                "temperature must be in the OpenAI-compatible range 0..=2".into(),
+            ));
+        }
+        sampling
+            .validate()
+            .map_err(|error| ChatRequestError::Invalid(error.to_string()))?;
+        generation.sampling = sampling;
         generation.max_new_tokens = max_new_tokens;
 
         Ok(PreparedChatRequest {
@@ -619,5 +628,23 @@ mod tests {
         );
         serde_json::from_str::<ChatCompletionRequest>(&unknown)
             .expect_err("unknown function-tool fields must not be ignored");
+    }
+
+    #[test]
+    fn invalid_sampling_controls_fail_before_worker_admission() {
+        let cases = [
+            (r#""temperature":-0.1"#, "temperature"),
+            (r#""temperature":2.1"#, "0..=2"),
+            (r#""top_p":1.1"#, "top_p"),
+            (r#""top_k":0"#, "top_k"),
+        ];
+        for (control, expected) in cases {
+            let error = request(&format!(
+                r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"x"}}],{control}}}"#
+            ))
+            .prepare(1)
+            .expect_err("invalid sampling controls must fail before enqueue");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 }
