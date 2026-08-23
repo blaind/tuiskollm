@@ -29,6 +29,8 @@ const QWEN35_NVFP4_QKV_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-qk
 const QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt";
 const QWEN35_GDN_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-gdn-prepare-sm120.txt";
+const QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen35-gdn-recurrence-sm120.txt";
 const QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-nvfp4-attention-output-sm120.txt";
 const FP8_QKV_RESOURCE_BASELINE: &str = "qual/baselines/fp8-qkv-sm120.txt";
@@ -91,6 +93,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     QWEN35_NVFP4_QKV_RESOURCE_BASELINE,
     QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE,
     QWEN35_GDN_PREPARE_RESOURCE_BASELINE,
+    QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE,
     QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE,
     GDN_PREPARE_RESOURCE_BASELINE,
     GDN_RECURRENCE_RESOURCE_BASELINE,
@@ -722,6 +725,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-qwen35-nvfp4-qkv") => bench_qwen35_nvfp4_qkv(root, &remaining),
         Some("bench-qwen35-nvfp4-gdn-input") => bench_qwen35_nvfp4_gdn_input(root, &remaining),
         Some("bench-qwen35-gdn-prepare") => bench_qwen35_gdn_prepare(root, &remaining),
+        Some("bench-qwen35-gdn-recurrence") => bench_qwen35_gdn_recurrence(root, &remaining),
         Some("bench-qwen35-nvfp4-attention-output") => {
             bench_qwen35_nvfp4_attention_output(root, &remaining)
         }
@@ -2931,6 +2935,34 @@ fn bench_qwen35_gdn_prepare(
             .env(
                 "TUISKO_GENERATOR_BASELINE_SHA256",
                 sha256(&fs::read(root.join(QWEN35_GDN_PREPARE_RESOURCE_BASELINE))?),
+            ),
+    )
+}
+
+fn bench_qwen35_gdn_recurrence(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen35-gdn-recurrence")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(
+                    root.join(QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE),
+                )?),
             ),
     )
 }
@@ -8781,6 +8813,10 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
     let ptx_path = root.join(PTX);
     let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
         format!(
@@ -8860,6 +8896,8 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
     }
     registers.sort_unstable();
     shared.sort_unstable();
+    require_registers(&baseline, "recurrence_registers", &registers)?;
+    require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
         "Qwen3.5 GDN recurrence gate passed: 8 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/EX2 present",
@@ -9682,6 +9720,7 @@ mod tests {
                 "qual/baselines/qwen35-nvfp4-qkv-sm120.txt",
                 "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt",
                 "qual/baselines/qwen35-gdn-prepare-sm120.txt",
+                "qual/baselines/qwen35-gdn-recurrence-sm120.txt",
                 "qual/baselines/qwen35-nvfp4-attention-output-sm120.txt",
                 "qual/baselines/gdn-prepare-sm120.txt",
                 "qual/baselines/gdn-recurrence-sm120.txt",
