@@ -57,7 +57,7 @@ pub struct Nvfp4SwiGluQualification {
     pub graph_replay_values: usize,
     /// Sentinel values verified outside active route extents.
     pub inactive_values: usize,
-    /// Read-only represented weight bytes proved unchanged.
+    /// Read-only represented input and weight values proved unchanged.
     pub immutable_input_values: usize,
     /// Exact bytes in the one-allocation qualification arena.
     pub arena_bytes: usize,
@@ -407,6 +407,17 @@ fn verify_immutable(
     fixture: &Fixture,
     report: &mut Nvfp4SwiGluQualification,
 ) -> Result<(), Nvfp4SwiGluQualificationError> {
+    let input = arena.copy_to_host(stream, regions.input)?;
+    if let Some(index) = input
+        .iter()
+        .zip(&fixture.input_bf16)
+        .position(|(actual, expected)| actual != expected)
+    {
+        return Err(Nvfp4SwiGluQualificationError::Mismatch(format!(
+            "read-only input {index} changed: device={:#06x}, source={:#06x}",
+            input[index], fixture.input_bf16[index]
+        )));
+    }
     let weight_codes = arena.copy_to_host(stream, regions.weight_codes)?;
     if let Some(index) = weight_codes
         .iter()
@@ -429,7 +440,7 @@ fn verify_immutable(
             weight_scales[index], fixture.weight_scales[index]
         )));
     }
-    report.immutable_input_values += weight_codes.len() + weight_scales.len();
+    report.immutable_input_values += input.len() + weight_codes.len() + weight_scales.len();
 
     Ok(())
 }
@@ -910,7 +921,7 @@ mod tests {
         assert!(report.inactive_values > 0);
         assert_eq!(
             report.immutable_input_values,
-            18 * GATE_UP_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW)
+            18 * (MAX_BATCH * super::HIDDEN + GATE_UP_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW))
         );
         assert_eq!(report.arena_bytes, 100_653_568);
         assert_eq!(report.weight_bytes, 100_270_080);
