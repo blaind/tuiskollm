@@ -136,7 +136,7 @@ refusal. This preserves tuning evidence without weakening the gate or making it 
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact-B graph, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact-B graphs, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT` | Check complete source layer-63 attention/MLP seams, represented KV cache, exact-B graphs, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-resident-model SNAPSHOT` | Check all 64 source routes, final source-backed formulas, dynamic page recycling/remapping and isolated reset, persistent state/cache, exact-B whole-model graphs, stable device/host addresses, and owner allocation | terminal |
+| `cargo run -p xtask -- qualify-resident-model SNAPSHOT` | Check all 64 source routes, final source-backed formulas, dynamic page recycling/remapping and isolated reset, persistent state/cache, short plus six-bucket exact-B whole-model graphs, independent long-attention seam formulas, stable device/host addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-resident-generation SNAPSHOT` | Check pinned vLLM next-token fixtures plus frontend, greedy control, streaming decode, stable ownership, and zero post-warmup device allocation | terminal |
 | `cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT` | Compare compact mixed-length scheduling with sequential requests, including every B=1..8 route, noncontiguous survivor replay, cancellation, exact retained-prefix reuse, divergence fallback, slot recycling, stable ownership, and zero post-warmup device allocation | terminal |
 | `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
@@ -153,6 +153,7 @@ refusal. This preserves tuning evidence without weakening the gate or making it 
 | `cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT` | Measure every complete source-backed layer-60 graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-full-attention-layer SNAPSHOT` | Measure every complete source-backed layer-63 graph at a 131-token, three-page context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-resident-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head graph at a 131-token context | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-resident-long-context-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head long graph with one 131,073-token row and compact one-token survivors | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
 | `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
@@ -233,6 +234,11 @@ the repeated-operation graph because one complete graph is already long enough f
 resolution and duplicating hundreds of model nodes would measure a different owner. The production
 embedding-staging graph restores represented input rows before each sample and remains outside the
 timed whole-model replay.
+
+`bench-resident-long-context-model SNAPSHOT` uses the same production owner and direct graph timing.
+Its shared-pool profile assigns 131,073 positions to the first compact row and one position to each
+survivor, selecting the 860-partition graph for every exact `B=1..8` route without inventing eight
+copies of the physical KV pool. Prompt preparation and metadata uploads remain outside timing.
 
 Add `--energy-seconds 2` for sustained energy sampling. At least three samples, one launch per
 sample, and a two-second energy window are required.

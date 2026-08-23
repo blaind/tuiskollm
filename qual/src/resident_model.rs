@@ -7,10 +7,13 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
-    EngineError, MAX_BATCH, PagedKvSlotState, ResidentModelObservables, ResidentModelProgram,
+    EngineError, MAX_BATCH, PagedKvSlotState, ResidentDecodeRoute, ResidentLongContextObservables,
+    ResidentModelObservables, ResidentModelProgram,
 };
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, device_memory_info};
-use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
+use tuisko_kernels_sm120::{
+    ATTENTION_PAGE_SIZE, LONG_CONTEXT_GQA_MAX_PARTITIONS, LONG_CONTEXT_GQA_PARTITION_SIZE,
+};
 use tuisko_model::{
     Arch, CheckpointError, CheckpointSnapshot, FullAttentionPostBindings, Nvfp4DownBindings,
     Nvfp4GateUpBindings, Qwen38_27B, TextEndpointBindings,
@@ -21,6 +24,8 @@ const BF16_SENTINEL: u16 = 0x7d7d;
 const F32_SENTINEL_BITS: u32 = 0x7d7d7d7d;
 const ROTARY_PAIRS: usize = 32;
 const TABLE_STRIDE: usize = 3;
+const LONG_ROUTE_LENGTHS: [usize; 6] = [193, 1_025, 4_097, 16_385, 65_537, 131_073];
+const LONG_ORACLE_DIMENSIONS: [usize; 8] = [0, 31, 32, 127, 128, 223, 224, 255];
 const SELECTED_LOGIT_ROWS: [usize; 5] = [0, 1, 31_337, 131_071, Qwen38_27B::VOCAB - 1];
 
 /// Failure of the complete source-backed resident-model gate.
@@ -56,6 +61,10 @@ pub struct ResidentModelQualification {
     pub inactive_values: usize,
     /// Persistent values checked across physical routing and one-slot reset.
     pub slot_control_values: usize,
+    /// Long-context whole-model eager/graph cases checked.
+    pub long_route_cases: usize,
+    /// Independent long-attention seam values checked.
+    pub long_oracle_values: usize,
     /// Largest absolute difference from a BF16 or FP64 oracle.
     pub maximum_absolute_error: f32,
 }
@@ -93,18 +102,20 @@ pub fn qualify_resident_model(
         graph_replay_values: 0,
         inactive_values: 0,
         slot_control_values: 0,
+        long_route_cases: 0,
+        long_oracle_values: 0,
         maximum_absolute_error: 0.0,
     };
     report.slot_control_values += verify_block_tables(&program, &stream)?;
 
     for batch in 1..=MAX_BATCH {
         let slots = route_slots(batch);
-        prepare_run(&mut program, &stream, batch, slots)?;
-        program.launch_eager(&stream, batch)?;
+        let eager_route = prepare_run(&mut program, &stream, batch, slots)?;
+        program.launch_eager(&stream, eager_route)?;
         let eager = program.qualification_observables(&stream)?;
 
-        prepare_run(&mut program, &stream, batch, slots)?;
-        program.replay(&stream, batch)?;
+        let replay_route = prepare_run(&mut program, &stream, batch, slots)?;
+        program.replay(&stream, replay_route)?;
         let replay = program.qualification_observables(&stream)?;
 
         verify_replay(batch, &eager, &replay, &mut report)?;
@@ -130,6 +141,7 @@ pub fn qualify_resident_model(
     verify_slot_reset(&mut program, &stream, &mut report)?;
     report.slot_control_values += verify_block_tables(&program, &stream)?;
     report.slot_control_values += verify_dynamic_page_routes(&mut program, &stream)?;
+    verify_long_context_routes(&mut program, &stream, &mut report)?;
 
     verify_no_device_allocation(&program, &stream)?;
     if program.qualification_kv_route_addresses() != stable_route_addresses {
@@ -216,16 +228,16 @@ fn verify_dynamic_page_routes(
         ));
     }
 
-    prepare_run(program, stream, 1, &[0])?;
-    program.launch_eager(stream, 1)?;
+    let eager_route = prepare_run(program, stream, 1, &[0])?;
+    program.launch_eager(stream, eager_route)?;
     let eager = program.qualification_cache_page(stream, 24)?;
     if eager.0.iter().all(|&value| value == 0) || eager.1.iter().all(|&value| value == 0) {
         return Err(ResidentModelQualificationError::Mismatch(
             "eager replay did not append K/V values through the remapped slot row".to_string(),
         ));
     }
-    prepare_run(program, stream, 1, &[0])?;
-    program.replay(stream, 1)?;
+    let replay_route = prepare_run(program, stream, 1, &[0])?;
+    program.replay(stream, replay_route)?;
     let replay = program.qualification_cache_page(stream, 24)?;
     if replay != eager {
         return Err(ResidentModelQualificationError::Mismatch(
@@ -240,6 +252,398 @@ fn verify_dynamic_page_routes(
         + eager.1.len()
         + replay.0.len()
         + replay.1.len())
+}
+
+fn verify_long_context_routes(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+    report: &mut ResidentModelQualification,
+) -> Result<(), ResidentModelQualificationError> {
+    vacate_all_slots(program, stream)?;
+    program.activate_kv_slot(7)?;
+    program.reserve_kv_slot_tokens(stream, 7, 220_000)?;
+    verify_long_context_case(program, stream, &[7], &[219_999], report)?;
+
+    vacate_all_slots(program, stream)?;
+    for slot in 0..MAX_BATCH {
+        program.activate_kv_slot(slot)?;
+    }
+    program.reserve_kv_slot_tokens(stream, 7, LONG_ROUTE_LENGTHS[5])?;
+    for slot in 0..MAX_BATCH - 1 {
+        program.reserve_kv_slot_tokens(stream, slot, 1)?;
+    }
+    for maximum_length in LONG_ROUTE_LENGTHS {
+        for batch in 1..=MAX_BATCH {
+            let mut positions = [0u32; MAX_BATCH];
+            positions[0] = u32::try_from(maximum_length - 1).map_err(|_| {
+                ResidentModelQualificationError::Mismatch(
+                    "long-context qualification position exceeds u32".to_string(),
+                )
+            })?;
+            verify_long_context_case(
+                program,
+                stream,
+                route_slots(batch),
+                &positions[..batch],
+                report,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn vacate_all_slots(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+) -> Result<(), ResidentModelQualificationError> {
+    for slot in 0..MAX_BATCH {
+        if program.qualification_kv_slot_state(slot)? != PagedKvSlotState::Vacant {
+            program.recycle_kv_slot(stream, slot)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_long_context_case(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+    slots: &[usize],
+    positions: &[u32],
+    report: &mut ResidentModelQualification,
+) -> Result<(), ResidentModelQualificationError> {
+    let eager_route = prepare_long_context_run(program, stream, slots, positions)?;
+    program.launch_eager(stream, eager_route)?;
+    let eager = program.qualification_long_context_observables(stream, eager_route)?;
+    let eager_pages = read_active_cache_pages(program, stream, slots, positions)?;
+
+    let replay_route = prepare_long_context_run(program, stream, slots, positions)?;
+    if replay_route != eager_route {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "long-context eager route {eager_route:?} differs from replay route {replay_route:?}"
+        )));
+    }
+    program.replay(stream, replay_route)?;
+    let replay = program.qualification_long_context_observables(stream, replay_route)?;
+    let replay_pages = read_active_cache_pages(program, stream, slots, positions)?;
+
+    compare_long_context_replay(replay_route, &eager, &replay)?;
+    if eager_pages != replay_pages {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "B={} long-context cache append differs under graph replay",
+            replay_route.batch()
+        )));
+    }
+    verify_long_context_oracle(
+        replay_route,
+        positions,
+        &replay_pages,
+        program
+            .qualification_cache_scales()
+            .last()
+            .copied()
+            .ok_or_else(|| {
+                ResidentModelQualificationError::Mismatch(
+                    "resident model has no attention cache scale".to_string(),
+                )
+            })?,
+        &replay,
+        report,
+    )?;
+    report.graph_replay_values += long_context_observable_values(&replay)
+        + replay_pages
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>();
+    report.long_route_cases += 1;
+    Ok(())
+}
+
+fn prepare_long_context_run(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+    slots: &[usize],
+    positions: &[u32],
+) -> Result<ResidentDecodeRoute, ResidentModelQualificationError> {
+    if slots.len() != positions.len() {
+        return Err(ResidentModelQualificationError::Mismatch(
+            "long-context slot and position inventories differ".to_string(),
+        ));
+    }
+    let batch = slots.len();
+    program.reset_state(stream)?;
+    program.qualification_reset_workspace(stream, SENTINEL)?;
+    let token_ids = (0..batch)
+        .map(|row| 700u32 + row as u32 * 29)
+        .collect::<Vec<_>>();
+    program.stage_embeddings(stream, &token_ids)?;
+    program.load_slot_routes(stream, slots)?;
+    Ok(program.load_decode_state(
+        stream,
+        batch,
+        positions,
+        &[1.0; MAX_BATCH * ROTARY_PAIRS][..batch * ROTARY_PAIRS],
+        &[0.0; MAX_BATCH * ROTARY_PAIRS][..batch * ROTARY_PAIRS],
+    )?)
+}
+
+type CachePages = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn read_active_cache_pages(
+    program: &ResidentModelProgram,
+    stream: &CudaStream,
+    slots: &[usize],
+    positions: &[u32],
+) -> Result<CachePages, ResidentModelQualificationError> {
+    slots
+        .iter()
+        .zip(positions)
+        .map(|(&slot, &position)| {
+            let physical =
+                usize::try_from(program.qualification_kv_physical_page(slot, position as usize)?)
+                    .map_err(|_| {
+                    ResidentModelQualificationError::Mismatch(
+                        "long-context physical page exceeds host width".to_string(),
+                    )
+                })?;
+            Ok(program.qualification_cache_page(stream, physical)?)
+        })
+        .collect()
+}
+
+fn compare_long_context_replay(
+    route: ResidentDecodeRoute,
+    eager: &ResidentLongContextObservables,
+    replay: &ResidentLongContextObservables,
+) -> Result<(), ResidentModelQualificationError> {
+    compare_exact(
+        &format!("B={} long-context graph `projected`", route.batch()),
+        &replay.projected,
+        &eager.projected,
+    )?;
+    for (role, actual, expected) in [
+        ("query", &replay.query, &eager.query),
+        (
+            "partial_maximum",
+            &replay.partial_maximum,
+            &eager.partial_maximum,
+        ),
+        (
+            "partial_denominator",
+            &replay.partial_denominator,
+            &eager.partial_denominator,
+        ),
+        (
+            "partial_numerator",
+            &replay.partial_numerator,
+            &eager.partial_numerator,
+        ),
+        ("attention", &replay.attention, &eager.attention),
+    ] {
+        if let Some(index) = actual
+            .iter()
+            .zip(expected)
+            .position(|(actual, expected)| actual.to_bits() != expected.to_bits())
+        {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "B={} long-context graph `{role}` differs at value {index}",
+                route.batch()
+            )));
+        }
+    }
+    for (role, actual, expected) in [
+        ("mixer_branch", &replay.mixer_branch, &eager.mixer_branch),
+        ("residual_a", &replay.residual_a, &eager.residual_a),
+        ("logits", &replay.logits, &eager.logits),
+    ] {
+        compare_exact(
+            &format!("B={} long-context graph `{role}`", route.batch()),
+            actual,
+            expected,
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_long_context_oracle(
+    route: ResidentDecodeRoute,
+    positions: &[u32],
+    pages: &CachePages,
+    cache_scales: [f32; 2],
+    observed: &ResidentLongContextObservables,
+    report: &mut ResidentModelQualification,
+) -> Result<(), ResidentModelQualificationError> {
+    let page_values = Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM;
+    let attention_layers = Qwen38_27B::LAYERS / Qwen38_27B::FULL_ATTENTION_INTERVAL;
+    let layer_offset = (attention_layers - 1) * page_values;
+    let dimensions = Qwen38_27B::HEAD_DIM;
+    let heads = Qwen38_27B::NUM_ATTENTION_HEADS;
+    let queries_per_kv = heads / Qwen38_27B::NUM_KV_HEADS;
+    let launched_partitions = route.partition_capacity().ok_or_else(|| {
+        ResidentModelQualificationError::Mismatch(
+            "long-context oracle received a short graph route".to_string(),
+        )
+    })?;
+
+    for token in 0..route.batch() {
+        let length = positions[token] as usize + 1;
+        let active_partitions = length.div_ceil(LONG_CONTEXT_GQA_PARTITION_SIZE);
+        if active_partitions > launched_partitions {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "B={} needs {active_partitions} partials but graph owns {launched_partitions}",
+                route.batch()
+            )));
+        }
+        let page_position = (length - 1) & (ATTENTION_PAGE_SIZE - 1);
+        let key = &pages[token].0[layer_offset..layer_offset + page_values];
+        let value = &pages[token].1[layer_offset..layer_offset + page_values];
+        for query_head in 0..heads {
+            let head_token = token * heads + query_head;
+            let query_base = head_token * dimensions;
+            let kv_head = query_head / queries_per_kv;
+            let cache_base = (kv_head * ATTENTION_PAGE_SIZE + page_position) * dimensions;
+            let mut score = 0.0f64;
+            for dimension in 0..dimensions {
+                score += f64::from(observed.query[query_base + dimension])
+                    * f64::from(
+                        decode_e4m3fn(key[cache_base + dimension])
+                            .map_err(ResidentModelQualificationError::Mismatch)?,
+                    )
+                    * f64::from(cache_scales[0]);
+            }
+            score *= 0.0625;
+
+            let partial_base = head_token * LONG_CONTEXT_GQA_MAX_PARTITIONS;
+            for partition in 0..active_partitions {
+                let first = partition * LONG_CONTEXT_GQA_PARTITION_SIZE;
+                let end = (first + LONG_CONTEXT_GQA_PARTITION_SIZE).min(length);
+                let values = end - first;
+                let contains_current = (first..end).contains(&(length - 1));
+                let (maximum, denominator, current_weight) = if contains_current {
+                    let maximum = score.max(0.0);
+                    let current_weight = (score - maximum).exp();
+                    let denominator = (values - 1) as f64 * (-maximum).exp() + current_weight;
+                    (maximum, denominator, current_weight)
+                } else {
+                    (0.0, values as f64, 0.0)
+                };
+                let partial = partial_base + partition;
+                require_long_close(
+                    "partial maximum",
+                    partial,
+                    observed.partial_maximum[partial],
+                    maximum,
+                    0.004,
+                    0.004,
+                )?;
+                require_long_close(
+                    "partial denominator",
+                    partial,
+                    observed.partial_denominator[partial],
+                    denominator,
+                    0.02,
+                    0.008,
+                )?;
+                report.long_oracle_values += 2;
+                for dimension in LONG_ORACLE_DIMENSIONS {
+                    let expected = if contains_current {
+                        f64::from(
+                            decode_e4m3fn(value[cache_base + dimension])
+                                .map_err(ResidentModelQualificationError::Mismatch)?,
+                        ) * f64::from(cache_scales[1])
+                            * current_weight
+                    } else {
+                        0.0
+                    };
+                    let index = partial * dimensions + dimension;
+                    require_long_close(
+                        "partial numerator",
+                        index,
+                        observed.partial_numerator[index],
+                        expected,
+                        0.02,
+                        0.008,
+                    )?;
+                    report.long_oracle_values += 1;
+                }
+            }
+            for partition in active_partitions..LONG_CONTEXT_GQA_MAX_PARTITIONS {
+                let partial = partial_base + partition;
+                if observed.partial_maximum[partial].to_bits() != F32_SENTINEL_BITS
+                    || observed.partial_denominator[partial].to_bits() != F32_SENTINEL_BITS
+                {
+                    return Err(ResidentModelQualificationError::Mismatch(format!(
+                        "B={} inactive long partial {partial} was modified",
+                        route.batch()
+                    )));
+                }
+                for dimension in LONG_ORACLE_DIMENSIONS {
+                    let index = partial * dimensions + dimension;
+                    if observed.partial_numerator[index].to_bits() != F32_SENTINEL_BITS {
+                        return Err(ResidentModelQualificationError::Mismatch(format!(
+                            "B={} inactive long numerator {index} was modified",
+                            route.batch()
+                        )));
+                    }
+                }
+            }
+            let maximum = score.max(0.0);
+            let current_weight = (score - maximum).exp();
+            let denominator = (length - 1) as f64 * (-maximum).exp() + current_weight;
+            for dimension in LONG_ORACLE_DIMENSIONS {
+                let current_value = f64::from(
+                    decode_e4m3fn(value[cache_base + dimension])
+                        .map_err(ResidentModelQualificationError::Mismatch)?,
+                ) * f64::from(cache_scales[1]);
+                let gate_index = token * Qwen38_27B::ATTENTION_QKV_ROWS
+                    + query_head * 2 * dimensions
+                    + dimensions
+                    + dimension;
+                let gate = f64::from(bf16_to_f32(observed.projected[gate_index]));
+                let reduced = current_value * current_weight / denominator;
+                let expected = reduced / (1.0 + (-gate).exp());
+                require_long_close(
+                    "reduced and gated attention",
+                    query_base + dimension,
+                    observed.attention[query_base + dimension],
+                    expected,
+                    0.004,
+                    0.006,
+                )?;
+                report.long_oracle_values += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_long_close(
+    role: &str,
+    index: usize,
+    actual: f32,
+    expected: f64,
+    absolute_tolerance: f32,
+    relative_tolerance: f32,
+) -> Result<(), ResidentModelQualificationError> {
+    let error = (f64::from(actual) - expected).abs() as f32;
+    let tolerance = absolute_tolerance.max(expected.abs() as f32 * relative_tolerance);
+    if !actual.is_finite() || error > tolerance {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "long-context {role} at value {index}: device={actual}, oracle={expected}, tolerance={tolerance}"
+        )));
+    }
+    Ok(())
+}
+
+fn long_context_observable_values(observed: &ResidentLongContextObservables) -> usize {
+    observed.projected.len()
+        + observed.query.len()
+        + observed.partial_maximum.len()
+        + observed.partial_denominator.len()
+        + observed.partial_numerator.len()
+        + observed.attention.len()
+        + observed.mixer_branch.len()
+        + observed.residual_a.len()
+        + observed.logits.len()
 }
 
 fn initialize_short_routes(
@@ -289,26 +693,26 @@ fn verify_owner(program: &ResidentModelProgram) -> Result<(), ResidentModelQuali
         || program.state_bytes() != 1_207_959_552
         || program.cache_bytes() != 7_210_008_576
         || program.kv_table_bytes() != 110_016
-        || program.workspace_bytes() != 5_910_176
+        || program.workspace_bytes() != 176_314_016
         || program.padding_bytes() != 16_544
-        || program.resident_arena_bytes() != 20_341_161_728
+        || program.resident_arena_bytes() != 20_511_565_568
         || program.kv_arena_bytes() != 7_210_118_656
-        || program.arena_bytes() != 27_551_280_384
+        || program.arena_bytes() != 27_721_684_224
         || program.host_stager_bytes() != 81_920
         || program.kv_route_host_bytes() != 113_454
         || program.batch_capacity() != 8
-        || program.context_capacity() != 192
-        || program.persistent_slot_bytes() != 160_235_520
+        || program.context_capacity() != 220_000
+        || program.persistent_slot_bytes() != 153_944_064
     {
         return Err(ResidentModelQualificationError::Mismatch(
             "owner byte or route accounting differs from the admitted layout".to_string(),
         ));
     }
     let addresses = program.qualification_addresses();
-    if addresses.len() != 1_126 || addresses.iter().copied().collect::<BTreeSet<_>>().len() != 1_126
+    if addresses.len() != 1_129 || addresses.iter().copied().collect::<BTreeSet<_>>().len() != 1_129
     {
         return Err(ResidentModelQualificationError::Mismatch(format!(
-            "owner exposes {} addresses, expected 1,126 unique addresses",
+            "owner exposes {} addresses, expected 1,129 unique addresses",
             addresses.len()
         )));
     }
@@ -378,7 +782,7 @@ fn prepare_run(
     stream: &CudaStream,
     batch: usize,
     slots: &[usize],
-) -> Result<(), ResidentModelQualificationError> {
+) -> Result<ResidentDecodeRoute, ResidentModelQualificationError> {
     program.reset_state(stream)?;
     program.qualification_reset_workspace(stream, SENTINEL)?;
     let token_ids = (0..batch)
@@ -386,14 +790,13 @@ fn prepare_run(
         .collect::<Vec<_>>();
     program.stage_embeddings(stream, &token_ids)?;
     program.load_slot_routes(stream, slots)?;
-    program.load_decode_state(
+    Ok(program.load_decode_state(
         stream,
         batch,
         &[0; MAX_BATCH][..batch],
         &[1.0; MAX_BATCH * ROTARY_PAIRS][..batch * ROTARY_PAIRS],
         &[0.0; MAX_BATCH * ROTARY_PAIRS][..batch * ROTARY_PAIRS],
-    )?;
-    Ok(())
+    )?)
 }
 
 fn route_slots(batch: usize) -> &'static [usize] {
@@ -533,6 +936,9 @@ fn verify_replay(
     same!(convolved);
     same!(recurrent_output);
     same_f32!(query);
+    same_f32!(partial_maximum);
+    same_f32!(partial_denominator);
+    same_f32!(partial_numerator);
     same_f32!(attention);
     same!(mixer_branch);
     same!(swiglu);
@@ -564,6 +970,9 @@ fn observable_values(observed: &ResidentModelObservables) -> usize {
         + observed.convolved.len()
         + observed.recurrent_output.len()
         + observed.query.len()
+        + observed.partial_maximum.len()
+        + observed.partial_denominator.len()
+        + observed.partial_numerator.len()
         + observed.attention.len()
         + observed.mixer_branch.len()
         + observed.swiglu.len()
@@ -648,6 +1057,21 @@ fn verify_inactive(
     inactive += sentinel_u16!(convolved, Qwen38_27B::GDN_QKV_ROWS);
     inactive += sentinel_u16!(recurrent_output, Qwen38_27B::GDN_VALUE_ROWS);
     inactive += sentinel_f32!(query, Qwen38_27B::ATTENTION_OUTPUT_COLUMNS);
+    for (role, values) in [
+        ("partial_maximum", &observed.partial_maximum),
+        ("partial_denominator", &observed.partial_denominator),
+        ("partial_numerator", &observed.partial_numerator),
+    ] {
+        if values
+            .iter()
+            .any(|value| value.to_bits() != F32_SENTINEL_BITS)
+        {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "B={batch} short graph modified `{role}` scratch"
+            )));
+        }
+        inactive += values.len();
+    }
     inactive += sentinel_f32!(attention, Qwen38_27B::ATTENTION_OUTPUT_COLUMNS);
     inactive += sentinel_u16!(mixer_branch, Qwen38_27B::HIDDEN);
     inactive += sentinel_u16!(swiglu, Qwen38_27B::INTERMEDIATE);
@@ -748,8 +1172,8 @@ fn verify_slot_reset(
     stream: &CudaStream,
     report: &mut ResidentModelQualification,
 ) -> Result<(), ResidentModelQualificationError> {
-    prepare_run(program, stream, MAX_BATCH, route_slots(MAX_BATCH))?;
-    program.replay(stream, MAX_BATCH)?;
+    let route = prepare_run(program, stream, MAX_BATCH, route_slots(MAX_BATCH))?;
+    program.replay(stream, route)?;
     let before = program.qualification_observables(stream)?;
     let reset = [1, 6];
     for slot in reset {
@@ -922,11 +1346,28 @@ fn verify_no_device_allocation(
     program: &ResidentModelProgram,
     stream: &CudaStream,
 ) -> Result<(), ResidentModelQualificationError> {
-    program.replay(stream, MAX_BATCH)?;
+    let routes: [ResidentDecodeRoute; MAX_BATCH] = (1..=MAX_BATCH)
+        .map(|batch| {
+            program.load_decode_state(
+                stream,
+                batch,
+                &[0; MAX_BATCH][..batch],
+                &[1.0; MAX_BATCH * ROTARY_PAIRS][..batch * ROTARY_PAIRS],
+                &[0.0; MAX_BATCH * ROTARY_PAIRS][..batch * ROTARY_PAIRS],
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| {
+            ResidentModelQualificationError::Mismatch(
+                "allocation route inventory has wrong cardinality".to_string(),
+            )
+        })?;
+    program.replay(stream, routes[MAX_BATCH - 1])?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
     for batch in [1, 8, 3, 6, 2, 7, 4, 5] {
-        program.replay(stream, batch)?;
+        program.replay(stream, routes[batch - 1])?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let after = device_memory_info(program.context())?;
@@ -962,6 +1403,8 @@ mod tests {
         assert!(report.graph_replay_values > 0);
         assert!(report.inactive_values > 0);
         assert!(report.slot_control_values > 0);
+        assert_eq!(report.long_route_cases, 49);
+        assert!(report.long_oracle_values > 0);
         assert!(report.maximum_absolute_error.is_finite());
         Ok(())
     }

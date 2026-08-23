@@ -633,14 +633,14 @@ impl ResidentBatchGenerator {
             .stage_embeddings(&self.stream, &tokens[..pending])?;
         self.program
             .load_slot_routes(&self.stream, &slots[..pending])?;
-        self.program.load_decode_state(
+        let route = self.program.load_decode_state(
             &self.stream,
             pending,
             &positions[..pending],
             &rope_cos[..pending * ROTARY_PAIRS],
             &rope_sin[..pending * ROTARY_PAIRS],
         )?;
-        self.program.replay(&self.stream, pending)?;
+        self.program.replay(&self.stream, route)?;
         let download = compact_download_logits(pending);
         self.program
             .read_logits_into(&self.stream, pending, &mut self.logits[download])?;
@@ -744,8 +744,8 @@ fn replay_token(
 ) -> EngineResult<()> {
     let (rope_cos, rope_sin) = text_rope(position);
     program.stage_embeddings(stream, &[token])?;
-    program.load_decode_state(stream, 1, &[position], &rope_cos, &rope_sin)?;
-    program.replay(stream, 1)
+    let route = program.load_decode_state(stream, 1, &[position], &rope_cos, &rope_sin)?;
+    program.replay(stream, route)
 }
 
 fn text_rope(position: u32) -> ([f32; ROTARY_PAIRS], [f32; ROTARY_PAIRS]) {
@@ -787,14 +787,14 @@ mod tests {
     use crate::EngineErrorCode;
 
     #[test]
-    fn short_context_capacity_counts_only_processed_generated_tokens() {
-        require_generation_capacity(192, 1, 192).unwrap();
-        require_generation_capacity(1, 192, 192).unwrap();
-        require_generation_capacity(192, 0, 192).unwrap();
+    fn long_context_capacity_counts_only_processed_generated_tokens() {
+        require_generation_capacity(220_000, 1, 220_000).unwrap();
+        require_generation_capacity(1, 220_000, 220_000).unwrap();
+        require_generation_capacity(220_000, 0, 220_000).unwrap();
 
-        for (prompt, generated) in [(0, 1), (192, 2), (2, 192), (usize::MAX, 2)] {
+        for (prompt, generated) in [(0, 1), (220_000, 2), (2, 220_000), (usize::MAX, 2)] {
             assert_eq!(
-                require_generation_capacity(prompt, generated, 192)
+                require_generation_capacity(prompt, generated, 220_000)
                     .unwrap_err()
                     .code(),
                 Some(EngineErrorCode::Generation)

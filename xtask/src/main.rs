@@ -46,6 +46,7 @@ const RESIDENT_MODEL_RESOURCE_BASELINES: &[&str] = &[
     GDN_OUTPUT_RESOURCE_BASELINE,
     ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     PAGED_GQA_RESOURCE_BASELINE,
+    LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE,
     ATTENTION_OUTPUT_RESOURCE_BASELINE,
 ];
 const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
@@ -198,7 +199,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|build-server|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-nvfp4-mlp|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-long-context-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-resident-model|qualify-resident-generation|qualify-resident-batch-generation|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-resident-model|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-nvfp4-swiglu|gate-nvfp4-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-long-context-paged-gqa|gate-attention-output|perf|remote>".into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|build-server|qualify-frontend|qualify-generation|qualify-residual-norm|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|qualify-fp8-swiglu|qualify-fp8-down|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-nvfp4-mlp|qualify-gdn-prepare|qualify-gdn-recurrence|qualify-gdn-output|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-long-context-paged-gqa|qualify-attention-output|qualify-dense-fp8-mlp|qualify-dense-fp8-gdn-layer|qualify-full-attention-layer|qualify-resident-model|qualify-resident-generation|qualify-resident-batch-generation|qualify-text-endpoint|bench-residual-norm|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|bench-fp8-swiglu|bench-fp8-down|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-gdn-prepare|bench-gdn-recurrence|bench-gdn-output|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-dense-fp8-mlp|bench-dense-fp8-gdn-layer|bench-full-attention-layer|bench-resident-model|bench-resident-long-context-model|bench-text-endpoint|gate-residual-norm|gate-fp8-qkv|gate-fp8-gdn-input|gate-fp8-lm-head|gate-fp8-swiglu|gate-fp8-down|gate-nvfp4-swiglu|gate-nvfp4-down|gate-gdn-prepare|gate-gdn-recurrence|gate-gdn-output|gate-attention-qk-prepare|gate-paged-gqa|gate-long-context-paged-gqa|gate-attention-output|perf|remote>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -260,6 +261,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-dense-fp8-gdn-layer") => bench_dense_fp8_gdn_layer(root, &remaining),
         Some("bench-full-attention-layer") => bench_full_attention_layer(root, &remaining),
         Some("bench-resident-model") => bench_resident_model(root, &remaining),
+        Some("bench-resident-long-context-model") => {
+            bench_resident_long_context_model(root, &remaining)
+        }
         Some("bench-text-endpoint") => bench_text_endpoint(root, &remaining),
         Some("gate-residual-norm") if remaining.is_empty() => gate_residual_norm(root),
         Some("gate-fp8-qkv") if remaining.is_empty() => gate_fp8_qkv(root),
@@ -1151,6 +1155,7 @@ fn gate_resident_model_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_gdn_output(root)?;
     gate_attention_qk_prepare(root)?;
     gate_paged_gqa(root)?;
+    gate_long_context_paged_gqa(root)?;
     gate_attention_output(root)
 }
 
@@ -1457,8 +1462,29 @@ fn bench_resident_model(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
+    bench_resident_model_variant(root, arguments, "bench-resident-model", "resident-model")
+}
+
+fn bench_resident_long_context_model(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    bench_resident_model_variant(
+        root,
+        arguments,
+        "bench-resident-long-context-model",
+        "resident-long-context-model",
+    )
+}
+
+fn bench_resident_model_variant(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+    command: &str,
+    suite: &str,
+) -> Result<(), Box<dyn Error>> {
     let Some((snapshot, options)) = arguments.split_first() else {
-        return Err("usage: cargo run -p xtask -- bench-resident-model SNAPSHOT [options]".into());
+        return Err(format!("usage: cargo run -p xtask -- {command} SNAPSHOT [options]").into());
     };
     build_sm120(root)?;
     let executable = root
@@ -1477,7 +1503,7 @@ fn bench_resident_model(
     }
     run_visible(
         Command::new(executable)
-            .arg("resident-model")
+            .arg(suite)
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),

@@ -40,26 +40,29 @@ It does not claim an in-process inference API; see [`python/README.md`](python/R
 
 `tuisko-engine` owns the exact 64-layer resident text program: all source-native weights, 48 GDN
 history/state pairs, one shared 3,438-page E4M3 KV pool across 16 attention layers, endpoint weights,
-one shared workspace, and immutable whole-model CUDA Graphs for every `B=1..8` route. The current
-decode path reserves three pages per active slot, so request admission remains 192 tokens while the
-remaining long-context pages stay unassigned. An allocation-free 113,454-byte host owner maintains
-the eight stable device-table rows, recycles physical pages between slots, and clears a reassigned
-page before publishing its new route. Compact active rows can address any distinct physical
-state/cache slots, and one slot can be reset without touching its survivors. The HTTP worker owns
-that scheduler and disconnecting a response cancels its resident
-request without moving survivors. Concrete single-slot and compact eight-request generation owners
-connect the admitted frontend, sampling, streaming decode, and resident graphs for prompts within
-the current 192-token cache. The compact owner preserves the final emitted token as pending, packs
-only requests needing device work, cancels without advancing that pending token, and recycles holes
-without moving survivor state. Inactive slots retain their exact processed token span and may skip
-only a prefix that the next prompt contains in full; divergence falls back to cold priming. Prompt
-priming uses the exact B=1 decode route until optimized prefill routes are admitted. Vision inputs,
+one shared workspace, and immutable whole-model CUDA Graphs for every `B=1..8` route. Decode keeps
+the short graph through 192 positions and selects one of six partitioned graph buckets above it,
+with an exact 220,000-position per-request ceiling. The shared 3,438-page pool is divided among
+active slots, so aggregate admission may refuse concurrent requests whose rounded page counts
+exceed the pool. An allocation-free 113,454-byte host owner maintains the eight stable device-table
+rows, recycles physical pages between slots, and clears a reassigned page before publishing its new
+route. Compact active rows can address any distinct physical state/cache slots, and one slot can be
+reset without touching its survivors. The HTTP worker owns that scheduler and disconnecting a
+response cancels its resident request without moving survivors. Concrete single-slot and compact
+eight-request generation owners connect the admitted frontend, sampling, streaming decode, and
+resident graphs through the 220,000-position ceiling. The compact owner preserves the final emitted
+token as pending, packs only requests needing device work, cancels without advancing that pending
+token, and recycles holes without moving survivor state. Inactive slots retain their exact processed
+token span and may skip only a prefix that the next prompt contains in full; divergence falls back
+to cold priming. Prompt
+priming uses the exact B=1 decode route until optimized prefill routes are admitted, so long prompts
+are a correctness path rather than a production-TTFT path. Vision inputs,
 MTP generation, and prefill routes are not served yet and are rejected or remain outside the HTTP
 contract rather than silently taking another route.
 
 The standalone SM120 operator inventory also includes partitioned paged GQA through 220,000
-positions at every exact `B=1..8` route. Its resident-program integration is a later slice; its
-presence does not expand the server's current 192-token admission limit.
+positions at every exact `B=1..8` route. The resident program owns its maximum-B partial workspace
+once and captures all six partition buckets without changing addresses after warmup.
 
 ## Current device slice
 
@@ -77,6 +80,7 @@ cargo run -p xtask -- qualify-nvfp4-down
 cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT
 cargo run -p xtask -- qualify-long-context-paged-gqa
 cargo run -p xtask -- qualify-resident-model SNAPSHOT
+cargo run -p xtask -- bench-resident-long-context-model SNAPSHOT
 cargo run -p xtask -- qualify-resident-generation SNAPSHOT
 cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT
 cargo run -p xtask -- perf smoke

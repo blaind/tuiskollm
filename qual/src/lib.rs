@@ -227,7 +227,9 @@ pub use resident_model::{
     ResidentModelQualification, ResidentModelQualificationError, qualify_resident_model,
 };
 #[cfg(feature = "device")]
-pub use resident_model_benchmark::benchmark_resident_model;
+pub use resident_model_benchmark::{
+    benchmark_resident_long_context_model, benchmark_resident_model,
+};
 pub use residual_norm::{
     ResidualNormQualification, ResidualNormQualificationError, qualify_residual_norm,
 };
