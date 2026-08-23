@@ -14,22 +14,25 @@ fn text_frontend(criterion: &mut Criterion) {
     let frontend = TextFrontend::open(&snapshot).unwrap();
     let options = ChatTemplateOptions {
         enable_thinking: Some(false),
+        ..ChatTemplateOptions::default()
     };
 
     let short_messages = [ChatMessage::new("user", "Hello")];
     let long_text = "Hello! café naïve 中文 テスト тест 🚀 ".repeat(64);
     let long_messages = [ChatMessage::new("user", long_text)];
     let short_rendered = frontend
-        .render_chat(&short_messages, true, options)
+        .render_chat(&short_messages, true, &options)
         .unwrap();
-    let long_rendered = frontend.render_chat(&long_messages, true, options).unwrap();
+    let long_rendered = frontend
+        .render_chat(&long_messages, true, &options)
+        .unwrap();
     let long_ids = frontend.encode(&long_rendered).unwrap();
 
     let mut render = criterion.benchmark_group("frontend/render_chat");
     render.bench_function("hello", |bencher| {
         bencher.iter(|| {
             frontend
-                .render_chat(black_box(&short_messages), true, options)
+                .render_chat(black_box(&short_messages), true, &options)
                 .unwrap()
         });
     });
@@ -78,22 +81,22 @@ fn text_frontend(criterion: &mut Criterion) {
         variants.push(messages);
     }
     let expected_tokens = cache_disabled
-        .encode_chat(&variants[0], options)
+        .encode_chat(&variants[0], &options)
         .unwrap()
         .len() as u64;
-    identical_cache.encode_chat(&variants[0], options).unwrap();
+    identical_cache.encode_chat(&variants[0], &options).unwrap();
     let identical_probe = identical_cache
-        .encode_chat_with_report(&variants[0], options)
+        .encode_chat_with_report(&variants[0], &options)
         .unwrap();
     assert_eq!(
         identical_probe.reused_tokens,
         identical_probe.token_ids.len()
     );
     for messages in variants.iter().take(4) {
-        partial_cache.encode_chat(messages, options).unwrap();
+        partial_cache.encode_chat(messages, &options).unwrap();
     }
     let partial_probe = partial_cache
-        .encode_chat_with_report(&variants[4], options)
+        .encode_chat_with_report(&variants[4], &options)
         .unwrap();
     assert!(partial_probe.reused_tokens > 0);
     assert!(partial_probe.fresh_bytes > 0);
@@ -103,14 +106,14 @@ fn text_frontend(criterion: &mut Criterion) {
     encode_chat.bench_function("cache-disabled", |bencher| {
         bencher.iter(|| {
             cache_disabled
-                .encode_chat(black_box(&variants[0]), options)
+                .encode_chat(black_box(&variants[0]), &options)
                 .unwrap()
         });
     });
     encode_chat.bench_function("identical-hit", |bencher| {
         bencher.iter(|| {
             identical_cache
-                .encode_chat_with_report(black_box(&variants[0]), options)
+                .encode_chat_with_report(black_box(&variants[0]), &options)
                 .unwrap()
         });
     });
@@ -120,7 +123,7 @@ fn text_frontend(criterion: &mut Criterion) {
             let messages = &variants[variant % variants.len()];
             variant += 1;
             partial_cache
-                .encode_chat_with_report(black_box(messages), options)
+                .encode_chat_with_report(black_box(messages), &options)
                 .unwrap()
         });
     });

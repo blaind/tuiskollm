@@ -331,6 +331,7 @@ fn greedy_request(content: &str, maximum: usize) -> ChatGenerationRequest {
     let mut request = ChatGenerationRequest::new(vec![ChatMessage::new("user", content)]);
     request.template = ChatTemplateOptions {
         enable_thinking: Some(false),
+        ..ChatTemplateOptions::default()
     };
     request.sampling = SamplingOptions::greedy();
     request.max_new_tokens = maximum;

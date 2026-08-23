@@ -128,12 +128,12 @@ impl Frontend {
         add_generation_prompt: bool,
         enable_thinking: Option<bool>,
     ) -> PyResult<String> {
+        let options = ChatTemplateOptions {
+            enable_thinking,
+            ..ChatTemplateOptions::default()
+        };
         self.inner
-            .render_chat(
-                &chat_messages(messages),
-                add_generation_prompt,
-                ChatTemplateOptions { enable_thinking },
-            )
+            .render_chat(&chat_messages(messages), add_generation_prompt, &options)
             .map_err(|error| FrontendError::new_err(error.to_string()))
     }
 
@@ -143,11 +143,12 @@ impl Frontend {
         messages: Vec<(String, String)>,
         enable_thinking: Option<bool>,
     ) -> PyResult<Vec<u32>> {
+        let options = ChatTemplateOptions {
+            enable_thinking,
+            ..ChatTemplateOptions::default()
+        };
         self.inner
-            .encode_chat(
-                &chat_messages(messages),
-                ChatTemplateOptions { enable_thinking },
-            )
+            .encode_chat(&chat_messages(messages), &options)
             .map_err(|error| FrontendError::new_err(error.to_string()))
     }
 
@@ -157,11 +158,12 @@ impl Frontend {
         messages: Vec<(String, String)>,
         enable_thinking: Option<bool>,
     ) -> PyResult<PromptEncoding> {
+        let options = ChatTemplateOptions {
+            enable_thinking,
+            ..ChatTemplateOptions::default()
+        };
         self.inner
-            .encode_chat_with_report(
-                &chat_messages(messages),
-                ChatTemplateOptions { enable_thinking },
-            )
+            .encode_chat_with_report(&chat_messages(messages), &options)
             .map(PromptEncoding::from)
             .map_err(|error| FrontendError::new_err(error.to_string()))
     }

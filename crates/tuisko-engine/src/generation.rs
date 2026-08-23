@@ -99,7 +99,7 @@ pub struct GenerationSession {
 impl GenerationSession {
     /// Renders and tokenizes the prompt and initializes sampling state.
     pub fn start(frontend: &TextFrontend, request: &ChatGenerationRequest) -> EngineResult<Self> {
-        let prompt = frontend.encode_chat_with_report(&request.messages, request.template)?;
+        let prompt = frontend.encode_chat_with_report(&request.messages, &request.template)?;
         let stop_ids: [u32; 2] = frontend
             .stop_ids()
             .try_into()

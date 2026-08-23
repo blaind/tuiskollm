@@ -22,8 +22,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let messages = vec![ChatMessage::new("user", "Hello")];
     let expected_prompt = frontend.encode_chat(
         &messages,
-        ChatTemplateOptions {
+        &ChatTemplateOptions {
             enable_thinking: Some(false),
+            ..ChatTemplateOptions::default()
         },
     )?;
     let expected_text = "Hello, 世界!";

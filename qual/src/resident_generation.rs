@@ -85,8 +85,9 @@ pub fn qualify_resident_generation(
     let messages = vec![ChatMessage::new("user", "Hello")];
     let template = ChatTemplateOptions {
         enable_thinking: Some(false),
+        ..ChatTemplateOptions::default()
     };
-    let expected_prompt = oracle_frontend.encode_chat(&messages, template)?;
+    let expected_prompt = oracle_frontend.encode_chat(&messages, &template)?;
     let stop_ids = oracle_frontend.stop_ids();
     let mut expected_tokens = Vec::with_capacity(2);
     for _ in 0..2 {
