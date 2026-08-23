@@ -15,7 +15,7 @@ use tuisko_engine::{ResidentLoadMode, ResidentModelProgram};
 use tuisko_gpu::{CudaContext, GpuError};
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 const DEFAULT_SAMPLES: usize = 3;
 const DEFAULT_WARMUPS: usize = 1;
 const DEFAULT_REPORT: &str = "target/benchmarks/startup/loader-comparison-sm120.json";
@@ -97,6 +97,7 @@ struct StartupSample {
     borrowed_source_bytes: usize,
     gathered_source_bytes: usize,
     swizzled_source_bytes: usize,
+    nvfp4_materialize_workers: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -540,6 +541,7 @@ fn measure_startup(
         borrowed_source_bytes: load_stats.borrowed_source_bytes(),
         gathered_source_bytes: load_stats.gathered_source_bytes(),
         swizzled_source_bytes: load_stats.swizzled_source_bytes(),
+        nvfp4_materialize_workers: load_stats.nvfp4_materialize_workers(),
     })
 }
 
@@ -591,6 +593,7 @@ fn validate_samples(samples: &[StartupSample]) -> Result<(), DeviceBenchmarkErro
             || sample.borrowed_source_bytes != first.borrowed_source_bytes
             || sample.gathered_source_bytes != first.gathered_source_bytes
             || sample.swizzled_source_bytes != first.swizzled_source_bytes
+            || sample.nvfp4_materialize_workers != first.nvfp4_materialize_workers
         {
             return Err(DeviceBenchmarkError::Precondition(
                 "fresh-process startup samples disagree on their exact product identity or byte accounting"
@@ -681,10 +684,11 @@ fn print_report(report: &StartupBenchmarkReport) {
             sample.pinned_stager_bytes as f64 / (1_u64 << 20) as f64,
         );
         eprintln!(
-            "source bytes: {:.2} GiB borrowed · {:.2} GiB gathered · {:.2} GiB swizzled",
+            "source bytes: {:.2} GiB borrowed · {:.2} GiB gathered · {:.2} GiB swizzled on {} workers",
             sample.borrowed_source_bytes as f64 / (1_u64 << 30) as f64,
             sample.gathered_source_bytes as f64 / (1_u64 << 30) as f64,
             sample.swizzled_source_bytes as f64 / (1_u64 << 30) as f64,
+            sample.nvfp4_materialize_workers,
         );
         let weight_copy_gib_s =
             sample.upload_bytes as f64 / (1_u64 << 30) as f64 / (sample.weight_copy_ms / 1_000.0);
