@@ -14,6 +14,7 @@ mod nvfp4_mlp;
 mod nvfp4_mlp_layout;
 mod paged_kv_slots;
 mod program;
+mod qwen35_nvfp4_mlp;
 mod resident_generation;
 mod resident_model_layout;
 mod sampling;
@@ -38,6 +39,7 @@ pub use nvfp4_mlp::Nvfp4MlpProgram;
 pub use nvfp4_mlp_layout::Nvfp4MlpLayout;
 pub use paged_kv_slots::{PagedKvRoute, PagedKvSlotPool, PagedKvSlotState, PagedKvTableUpdate};
 pub use program::TextEndpointProgram;
+pub use qwen35_nvfp4_mlp::Qwen35Nvfp4MlpProgram;
 pub use resident_generation::{
     ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentBatchGenerator,
     ResidentCancellation, ResidentGenerationSession, ResidentRequestId, ResidentTextGenerator,
