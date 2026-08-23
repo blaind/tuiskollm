@@ -887,6 +887,7 @@ pub struct ModelOptNvfp4MlpBindings<'a> {
     pub next_norm: Bf16View<'a, 1>,
     /// Decoder layer owning this MLP boundary.
     pub layer: usize,
+    pub(crate) layer_count: usize,
 }
 
 impl<'a> ModelOptNvfp4MlpBindings<'a> {
@@ -957,6 +958,7 @@ impl<'a> ModelOptNvfp4MlpBindings<'a> {
             input_norm,
             next_norm,
             layer,
+            layer_count: A::LAYERS,
         })
     }
 }
