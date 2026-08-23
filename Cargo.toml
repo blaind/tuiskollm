@@ -6,10 +6,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
-sha2.workspace = true
-tuisko-model.workspace = true
+tuisko-provision.workspace = true
 tuisko-serve.workspace = true
-ureq.workspace = true
 
 [workspace]
 members = [
@@ -21,6 +19,7 @@ members = [
     "crates/tuisko-kernels-sm120",
     "crates/tuisko-model",
     "crates/tuisko-python",
+    "crates/tuisko-provision",
     "crates/tuisko-remote",
     "crates/tuisko-targets",
     "crates/tuisko-serve",
@@ -65,6 +64,7 @@ tuisko-kernels-sm86 = { version = "0.1.0", path = "crates/tuisko-kernels-sm86" }
 tuisko-kernels-sm89 = { version = "0.1.0", path = "crates/tuisko-kernels-sm89" }
 tuisko-kernels-sm120 = { version = "0.1.0", path = "crates/tuisko-kernels-sm120" }
 tuisko-model = { version = "0.1.0", path = "crates/tuisko-model" }
+tuisko-provision = { version = "0.1.0", path = "crates/tuisko-provision" }
 tuisko-remote = { version = "0.1.0", path = "crates/tuisko-remote" }
 tuisko-targets = { version = "0.1.0", path = "crates/tuisko-targets" }
 tuisko-serve = { version = "0.1.0", path = "crates/tuisko-serve" }

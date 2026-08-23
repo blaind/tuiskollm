@@ -17,6 +17,7 @@ SM89 and SM86 remain partial qualification targets until their complete inventor
 
 - `tuisko-model` owns checkpoint admission, typed source views, and lossless materialization.
 - `tuisko-frontend` owns tokenizer admission, chat templates, prompt encoding, and streaming text.
+- `tuisko-provision` owns pinned Hugging Face cache resolution, download, and snapshot admission.
 - `tuisko-gpu` owns raw CUDA resources and model-independent checked wrappers.
 - `tuisko-targets` owns exact GPU identity and startup profile selection.
 - Each `tuisko-kernels-sm*` crate owns one architecture's device code, inventories, tuning, and
