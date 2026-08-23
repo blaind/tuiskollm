@@ -557,6 +557,44 @@ impl DeviceArena {
         self.copy_prefix_from_host(stream, region, source)
     }
 
+    /// Copies exact source bytes into one complete typed region.
+    pub fn copy_region_bytes_from_host<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        source: &[u8],
+    ) -> GpuResult<()> {
+        self.require_stream_context(stream, "copying source bytes into a device arena")?;
+        if source.len() != region.byte_len() {
+            return Err(GpuError::arena(format!(
+                "host source has {} bytes for an arena region of {} bytes",
+                source.len(),
+                region.byte_len()
+            )));
+        }
+        if source.is_empty() {
+            return Ok(());
+        }
+        let address = self.address(region)? as u64;
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
+        // SAFETY: the checked typed region and source slice both cover the exact byte count.
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                address,
+                source.as_ptr(),
+                source.len(),
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|source| GpuError::driver("copying source bytes into a device arena", source))?;
+        stream
+            .synchronize()
+            .map_err(|source| GpuError::driver("synchronizing a device arena upload", source))
+    }
+
     /// Copies a typed host slice into the beginning of one region.
     pub fn copy_prefix_from_host<T: DeviceCopy>(
         &self,
@@ -903,6 +941,30 @@ mod tests {
         assert_eq!(
             arena.copy_to_host(&stream, bytes).unwrap(),
             [0xa5, 0xa5, 0xa5, 0xa5, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
+    fn region_byte_upload_preserves_exact_little_endian_words() {
+        let context = CudaContext::new(0).unwrap();
+        assert_eq!(context.compute_capability().unwrap(), (12, 0));
+        let stream = context.new_stream().unwrap();
+        let mut layout = ArenaLayout::new();
+        let words = layout.reserve::<u16>(2, 256).unwrap();
+        let arena = DeviceArena::zeroed(&stream, &layout).unwrap();
+
+        arena
+            .copy_region_bytes_from_host(&stream, words, &[0x80, 0x3f, 0x00, 0xbf])
+            .unwrap();
+        assert_eq!(
+            arena.copy_to_host(&stream, words).unwrap(),
+            [0x3f80, 0xbf00]
+        );
+        assert!(
+            arena
+                .copy_region_bytes_from_host(&stream, words, &[0; 3])
+                .is_err()
         );
     }
 
