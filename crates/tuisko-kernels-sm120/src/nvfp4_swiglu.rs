@@ -13,6 +13,7 @@ use tuisko_gpu::{
 use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const PREFILL_ROWS: [usize; 4] = [32, 64, 128, 1_024];
 const HIDDEN: usize = Qwen38_27B::HIDDEN;
 const OUTPUT_ROWS: usize = Qwen38_27B::INTERMEDIATE;
 const GATE_UP_ROWS: usize = 2 * OUTPUT_ROWS;
@@ -1431,9 +1432,12 @@ impl<const TOKENS: usize> PreparedW4a4Route<TOKENS> {
         let quantize_blocks = u32::try_from(quantize_blocks)
             .map_err(|_| GpuError::invalid_launch("NVFP4 quantization grid exceeds CUDA width"))?;
         // Each projection CTA emits 32 fused gate/up rows, yielding 544 exact
-        // CTAs and no output-row padding.
+        // column CTAs and no output-row padding. Forty-eight token slots retain
+        // two CTAs per SM; exact T=32/64/128/1024 therefore use 1/2/3/22 tiles.
         let projection_blocks = u32::try_from(OUTPUT_ROWS / ROWS_PER_BRANCH)
             .map_err(|_| GpuError::invalid_launch("NVFP4 projection grid exceeds CUDA width"))?;
+        let token_tiles = u32::try_from(TOKENS.div_ceil(SMALL_BLOCK_M))
+            .map_err(|_| GpuError::invalid_launch("NVFP4 token grid exceeds CUDA height"))?;
         let quantize = module
             .prepare_nvfp4_quantize::<TOKENS>(LaunchConfig1D::new(quantize_blocks, 256, 0))
             .map_err(|source| {
@@ -1441,7 +1445,7 @@ impl<const TOKENS: usize> PreparedW4a4Route<TOKENS> {
             })?;
         let projection = module
             .prepare_nvfp4_swiglu_w4a4::<TOKENS>(LaunchConfig2D::new(
-                (projection_blocks, 1),
+                (projection_blocks, token_tiles),
                 (W4A4_THREADS, 1),
                 0,
             ))
@@ -1575,7 +1579,7 @@ impl<const TOKENS: usize> PreparedQwen35W4a4Route<TOKENS> {
 }
 
 /// PTX symbols retained for every admitted NVFP4 SwiGLU schedule.
-pub(crate) fn nvfp4_swiglu_ptx_names() -> [&'static str; 14] {
+pub(crate) fn nvfp4_swiglu_ptx_names() -> [&'static str; 22] {
     [
         "nvfp4_swiglu_a16_t1",
         "nvfp4_swiglu_a16_t2",
@@ -1586,11 +1590,19 @@ pub(crate) fn nvfp4_swiglu_ptx_names() -> [&'static str; 14] {
         kernels::nvfp4_quantize_ptx_name::<6>(),
         kernels::nvfp4_quantize_ptx_name::<7>(),
         kernels::nvfp4_quantize_ptx_name::<8>(),
+        kernels::nvfp4_quantize_ptx_name::<32>(),
+        kernels::nvfp4_quantize_ptx_name::<64>(),
+        kernels::nvfp4_quantize_ptx_name::<128>(),
+        kernels::nvfp4_quantize_ptx_name::<1_024>(),
         kernels::nvfp4_swiglu_w4a4_ptx_name::<1>(),
         kernels::nvfp4_swiglu_w4a4_ptx_name::<5>(),
         kernels::nvfp4_swiglu_w4a4_ptx_name::<6>(),
         kernels::nvfp4_swiglu_w4a4_ptx_name::<7>(),
         kernels::nvfp4_swiglu_w4a4_ptx_name::<8>(),
+        kernels::nvfp4_swiglu_w4a4_ptx_name::<32>(),
+        kernels::nvfp4_swiglu_w4a4_ptx_name::<64>(),
+        kernels::nvfp4_swiglu_w4a4_ptx_name::<128>(),
+        kernels::nvfp4_swiglu_w4a4_ptx_name::<1_024>(),
     ]
 }
 
@@ -1632,10 +1644,14 @@ pub struct Nvfp4SwiGluOp {
     w4a4_b6: PreparedW4a4Route<6>,
     w4a4_b7: PreparedW4a4Route<7>,
     w4a4_b8: PreparedW4a4Route<8>,
+    w4a4_t32: PreparedW4a4Route<32>,
+    w4a4_t64: PreparedW4a4Route<64>,
+    w4a4_t128: PreparedW4a4Route<128>,
+    w4a4_t1024: PreparedW4a4Route<1_024>,
 }
 
 impl Nvfp4SwiGluOp {
-    /// Loads the embedded SM120 module and prepares every admitted decode route.
+    /// Loads the embedded SM120 module and prepares every admitted route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
         let _ = nvfp4_swiglu_ptx_names();
         // SAFETY: this crate owns the embedded cuda-oxide module artifact.
@@ -1660,29 +1676,34 @@ impl Nvfp4SwiGluOp {
             w4a4_b6: PreparedW4a4Route::prepare(&module)?,
             w4a4_b7: PreparedW4a4Route::prepare(&module)?,
             w4a4_b8: PreparedW4a4Route::prepare(&module)?,
+            w4a4_t32: PreparedW4a4Route::prepare(&module)?,
+            w4a4_t64: PreparedW4a4Route::prepare(&module)?,
+            w4a4_t128: PreparedW4a4Route::prepare(&module)?,
+            w4a4_t1024: PreparedW4a4Route::prepare(&module)?,
             module,
         })
     }
 
-    /// Executes the retained production route for an exact `B=1..=8`.
+    /// Executes the retained production route for exact decode or prefill rows.
     ///
     /// B=1 and B=5..8 dynamically quantize the input and use W4A4 MMA; B=2..4
-    /// preserve the represented BF16 activation and use the A16 schedule.
+    /// preserve the represented BF16 activation and use the A16 schedule. Exact
+    /// `T=32,64,128,1024` prefill routes use W4A4 dynamic quantization and MMA.
     ///
     /// # Safety
     ///
-    /// `input` covers `batch * 5_120` BF16 values; activation scratch covers
-    /// `batch * 2_560` code bytes and `batch * 320` scale bytes; `weight_codes`
+    /// `input` covers `rows * 5_120` BF16 values; activation scratch covers
+    /// `rows * 2_560` code bytes and `rows * 320` scale bytes; `weight_codes`
     /// covers the fused packed `[34_816, 5_120]` plane; `weight_scales` covers
     /// its swizzled `[34_816, 320]` plane; and `output` covers
-    /// `batch * 17_408` BF16 values. Four-byte-loaded planes are four-byte
+    /// `rows * 17_408` BF16 values. Four-byte-loaded planes are four-byte
     /// aligned. Divisors are finite and positive. All allocations belong to
     /// `stream`'s context, remain live through completion, and do not overlap.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         input: *const u16,
         activation_codes: *mut u8,
         activation_scales: *mut u8,
@@ -1692,9 +1713,9 @@ impl Nvfp4SwiGluOp {
         weight_scale_divisor: f32,
         output: *mut u16,
     ) -> GpuResult<()> {
-        if !(1..=MAX_BATCH).contains(&batch) {
+        if !(1..=MAX_BATCH).contains(&rows) && !PREFILL_ROWS.contains(&rows) {
             return Err(GpuError::invalid_launch(format!(
-                "NVFP4 SwiGLU batch {batch} is not an exact B=1..=8 route"
+                "NVFP4 SwiGLU row count {rows} is outside the exact B=1..=8, T=32,64,128,1024 routes"
             )));
         }
         if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
@@ -1727,12 +1748,12 @@ impl Nvfp4SwiGluOp {
             };
         }
 
-        match batch {
+        match rows {
             1 => w4a4!(w4a4_b1),
             2..=4 => unsafe {
                 self.launch_a16(
                     stream,
-                    batch,
+                    rows,
                     input,
                     weight_codes,
                     weight_scales,
@@ -1744,7 +1765,11 @@ impl Nvfp4SwiGluOp {
             6 => w4a4!(w4a4_b6),
             7 => w4a4!(w4a4_b7),
             8 => w4a4!(w4a4_b8),
-            _ => unreachable!("batch range was validated above"),
+            32 => w4a4!(w4a4_t32),
+            64 => w4a4!(w4a4_t64),
+            128 => w4a4!(w4a4_t128),
+            1_024 => w4a4!(w4a4_t1024),
+            _ => unreachable!("row count was validated above"),
         }
     }
 
@@ -2078,26 +2103,27 @@ impl Qwen35Nvfp4SwiGluOp {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BATCH, Qwen35SwiGluSchedule, nvfp4_swiglu_ptx_names, qwen35_nvfp4_swiglu_ptx_names,
-        qwen35_swiglu_schedule,
+        MAX_BATCH, PREFILL_ROWS, Qwen35SwiGluSchedule, nvfp4_swiglu_ptx_names,
+        qwen35_nvfp4_swiglu_ptx_names, qwen35_swiglu_schedule,
     };
     use std::collections::BTreeSet;
 
     #[test]
-    fn inventory_covers_retained_decode_routes() {
+    fn inventory_covers_every_exact_route() {
         let names = nvfp4_swiglu_ptx_names();
 
         assert_eq!(MAX_BATCH, 8);
-        assert_eq!(names.len(), 14);
+        assert_eq!(PREFILL_ROWS, [32, 64, 128, 1_024]);
+        assert_eq!(names.len(), 22);
         assert_eq!(names.iter().filter(|name| name.contains("a16")).count(), 4);
         assert_eq!(
             names
                 .iter()
                 .filter(|name| name.contains("quantize"))
                 .count(),
-            5
+            9
         );
-        assert_eq!(names.iter().filter(|name| name.contains("w4a4")).count(), 5);
+        assert_eq!(names.iter().filter(|name| name.contains("w4a4")).count(), 9);
     }
 
     #[test]

@@ -14,7 +14,8 @@ control/convolution and recurrence at exact `B=1..8` and `T=32,64,128,1024`, and
 source-native output projection at exact `B=1..8`, plus the source-backed
 dense-FP8 MLP at exact `B=1..8` and `T=32,64,128,1024`, complete layer-60 GDN, and final-norm plus
 LM-head owners. NVFP4 gate/up SwiGLU
-uses the exact retained A16 and W4A4 decode schedules at `B=1..8`; NVFP4 down projection consumes
+uses the exact retained A16 and W4A4 decode schedules at `B=1..8` plus W4A4 prefill at
+`T=32,64,128,1024`; NVFP4 down projection consumes
 the represented E2M1/E4M3 source planes through exact A16 routes at `B=1..8`. Full-attention Q/K
 preparation covers zero-centered normalization, the 64-wide three-axis MRoPE, and represented E4M3
 KV-cache append at exact `B=1..8` and `T=32,64,128,1024`. Short-context paged GQA covers exact
@@ -159,7 +160,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-fp8-lm-head` | Run the independent represented-value full-vocabulary LM-head oracle and benchmark-accounting test | terminal |
 | `cargo run -p xtask -- qualify-fp8-swiglu` | Run the exhaustive represented-value gate/up SwiGLU oracle and graph-replay gate | terminal |
 | `cargo run -p xtask -- qualify-fp8-down` | Run the exhaustive represented-value dense-FP8 down oracle and graph-replay gate | terminal |
-| `cargo run -p xtask -- qualify-nvfp4-swiglu` | Check represented E2M1/E4M3 seams, A16/W4A4 production routing, immutable weights, graph replay, stable addresses, and post-warmup allocation at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-nvfp4-swiglu` | Check represented E2M1/E4M3 seams, A16/W4A4 production routing, immutable weights, graph replay, stable addresses, and post-warmup allocation at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-nvfp4-down` | Check represented E2M1/E4M3 down projection, immutable input/weights, graph replay, stable addresses, and post-warmup allocation at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT` | Check source layer 55, route-specific A16/W4A4 scratch, every observable seam, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-mlp SNAPSHOT` | Check Qwen3.5 source layer 0, ModelOpt scale conversion, route-specific A16/W4A4 scratch, every observable seam, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
@@ -485,10 +486,10 @@ includes one query read per active partition, one K/V load per 32-row/query-head
 length/table/page metadata reads, and both the producer writes and reducer reads of every complete
 FP32 partial state. Macro `T=1024/P=4` cases use the same accounting at contexts 32,768 and 98,304;
 their resident maximum workspace still covers every qualified `P=1,2,4,8,16` route.
-Dense-FP8-SwiGLU and dense-FP8-down `T=32,64,128,1024` cases are `operator/prefill`
-cases with prompt and context lengths equal to the active rows. Each T=1024 owner has two
-128-byte address-bound TMA descriptors; concurrency, output, and prefix cache do not apply to
-these leaf suites.
+Dense-FP8-SwiGLU, dense-FP8-down, and NVFP4-SwiGLU `T=32,64,128,1024` cases are `operator/prefill`
+cases with prompt and context lengths equal to the active rows. Each dense-FP8 T=1024 owner has
+two 128-byte address-bound TMA descriptors; the NVFP4 route uses its prepared W4A4 launches without
+descriptors. Concurrency, output, and prefix cache do not apply to these leaf suites.
 
 ## Memory and capacity
 
@@ -704,7 +705,7 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 
 - Decode operator coverage is exact `B=1..8`; prefill remains limited to the explicitly listed
   residual norm, FP8-QKV, Q/K preparation/cache-append, shared early-context, partitioned deep-tail
-  and macro paged-GQA, attention-output, dense-FP8 MLP, full-attention-layer, FP8-GDN-input,
+  and macro paged-GQA, attention-output, dense-FP8 MLP, NVFP4 SwiGLU, full-attention-layer, FP8-GDN-input,
   GDN-prepare, GDN-recurrence, GDN-output, and dense-FP8 GDN-layer routes. Resident integration still
   needs complete routes before the server can stop priming through decode.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
