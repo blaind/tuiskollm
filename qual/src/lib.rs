@@ -103,6 +103,8 @@ mod paged_gqa_prefill;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_attention_output;
 #[cfg(feature = "device")]
+mod qwen35_nvfp4_attention_output_benchmark;
+#[cfg(feature = "device")]
 mod qwen35_nvfp4_down;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_down_benchmark;
@@ -256,6 +258,8 @@ pub use qwen35_nvfp4_attention_output::{
     Qwen35Nvfp4AttentionOutputQualification, Qwen35Nvfp4AttentionOutputQualificationError,
     qualify_qwen35_nvfp4_attention_output,
 };
+#[cfg(feature = "device")]
+pub use qwen35_nvfp4_attention_output_benchmark::benchmark_qwen35_nvfp4_attention_output;
 #[cfg(feature = "device")]
 pub use qwen35_nvfp4_down::qualify_qwen35_nvfp4_down;
 #[cfg(feature = "device")]

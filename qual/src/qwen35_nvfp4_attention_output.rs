@@ -9,15 +9,15 @@ use tuisko_gpu::{
 };
 use tuisko_model::{Arch, Qwen35_9B};
 
-const MAX_BATCH: usize = 8;
+pub(crate) const MAX_BATCH: usize = 8;
 const ALIGNMENT: usize = 256;
-const COLUMNS: usize = Qwen35_9B::ATTENTION_OUTPUT_COLUMNS;
-const QKV_ROWS: usize = Qwen35_9B::ATTENTION_QKV_ROWS;
-const OUTPUT_ROWS: usize = Qwen35_9B::HIDDEN;
+pub(crate) const COLUMNS: usize = Qwen35_9B::ATTENTION_OUTPUT_COLUMNS;
+pub(crate) const QKV_ROWS: usize = Qwen35_9B::ATTENTION_QKV_ROWS;
+pub(crate) const OUTPUT_ROWS: usize = Qwen35_9B::HIDDEN;
 const GROUP: usize = 16;
-const GROUPS_PER_ROW: usize = COLUMNS / GROUP;
-const CODE_BYTES_PER_ROW: usize = COLUMNS / 2;
-const WEIGHT_SCALE_DIVISOR: f32 = 16.0;
+pub(crate) const GROUPS_PER_ROW: usize = COLUMNS / GROUP;
+pub(crate) const CODE_BYTES_PER_ROW: usize = COLUMNS / 2;
+pub(crate) const WEIGHT_SCALE_DIVISOR: f32 = 16.0;
 const BYTE_SENTINEL: u8 = 0xa5;
 const BF16_SENTINEL: u16 = 0xa5a5;
 const F32_SENTINEL_BITS: u32 = 0xa5a5_a5a5;
@@ -76,21 +76,21 @@ pub struct Qwen35Nvfp4AttentionOutputQualification {
 }
 
 #[derive(Clone, Copy)]
-struct Regions {
-    attention: ArenaRegion<f32>,
-    qkv: ArenaRegion<u16>,
-    activation: ArenaRegion<u16>,
-    weight_codes: ArenaRegion<u8>,
-    weight_scales: ArenaRegion<u8>,
-    output: ArenaRegion<u16>,
+pub(crate) struct Regions {
+    pub(crate) attention: ArenaRegion<f32>,
+    pub(crate) qkv: ArenaRegion<u16>,
+    pub(crate) activation: ArenaRegion<u16>,
+    pub(crate) weight_codes: ArenaRegion<u8>,
+    pub(crate) weight_scales: ArenaRegion<u8>,
+    pub(crate) output: ArenaRegion<u16>,
 }
 
 impl Regions {
-    fn weight_bytes(self) -> usize {
+    pub(crate) fn weight_bytes(self) -> usize {
         self.weight_codes.byte_len() + self.weight_scales.byte_len()
     }
 
-    fn payload_bytes(self) -> usize {
+    pub(crate) fn payload_bytes(self) -> usize {
         self.attention.byte_len()
             + self.qkv.byte_len()
             + self.activation.byte_len()
@@ -99,14 +99,14 @@ impl Regions {
     }
 }
 
-struct Fixture {
-    attention: Vec<f32>,
-    qkv: Vec<u16>,
+pub(crate) struct Fixture {
+    pub(crate) attention: Vec<f32>,
+    pub(crate) qkv: Vec<u16>,
     gated: Vec<f32>,
     activation_bf16: Vec<u16>,
     activation_f32: Vec<f32>,
-    weight_codes: Vec<u8>,
-    weight_scales: Vec<u8>,
+    pub(crate) weight_codes: Vec<u8>,
+    pub(crate) weight_scales: Vec<u8>,
 }
 
 struct Observed {
@@ -179,7 +179,7 @@ pub fn qualify_qwen35_nvfp4_attention_output()
     Ok(report)
 }
 
-fn layout() -> GpuResult<(ArenaLayout, Regions)> {
+pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
     let attention = layout.reserve(MAX_BATCH * COLUMNS, ALIGNMENT)?;
     let qkv = layout.reserve(MAX_BATCH * QKV_ROWS, ALIGNMENT)?;
@@ -270,7 +270,7 @@ fn observe(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuRes
     })
 }
 
-fn make_fixture() -> Fixture {
+pub(crate) fn make_fixture() -> Fixture {
     let attention = (0..MAX_BATCH * COLUMNS)
         .map(|index| {
             let token = index / COLUMNS;

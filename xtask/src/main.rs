@@ -24,6 +24,8 @@ const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
 const QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt";
 const QWEN35_NVFP4_DOWN_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-down-sm120.txt";
 const QWEN35_NVFP4_QKV_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-qkv-sm120.txt";
+const QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen35-nvfp4-attention-output-sm120.txt";
 const FP8_QKV_RESOURCE_BASELINE: &str = "qual/baselines/fp8-qkv-sm120.txt";
 const FP8_GDN_INPUT_RESOURCE_BASELINE: &str = "qual/baselines/fp8-gdn-input-sm120.txt";
 const FP8_LM_HEAD_RESOURCE_BASELINE: &str = "qual/baselines/fp8-lm-head-sm120.txt";
@@ -73,6 +75,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     NVFP4_DOWN_RESOURCE_BASELINE,
     QWEN35_NVFP4_DOWN_RESOURCE_BASELINE,
     QWEN35_NVFP4_QKV_RESOURCE_BASELINE,
+    QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE,
     GDN_PREPARE_RESOURCE_BASELINE,
     GDN_RECURRENCE_RESOURCE_BASELINE,
     GDN_OUTPUT_RESOURCE_BASELINE,
@@ -486,6 +489,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-qwen35-nvfp4-swiglu") => bench_qwen35_nvfp4_swiglu(root, &remaining),
         Some("bench-qwen35-nvfp4-down") => bench_qwen35_nvfp4_down(root, &remaining),
         Some("bench-qwen35-nvfp4-qkv") => bench_qwen35_nvfp4_qkv(root, &remaining),
+        Some("bench-qwen35-nvfp4-attention-output") => {
+            bench_qwen35_nvfp4_attention_output(root, &remaining)
+        }
         Some("bench-qwen35-nvfp4-mlp") => bench_qwen35_nvfp4_mlp(root, &remaining),
         Some("bench-qwen35-attention-qk-prepare") => {
             bench_qwen35_attention_qk_prepare(root, &remaining)
@@ -1056,6 +1062,26 @@ fn qualify_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Erro
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
+        ],
+    )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen35_nvfp4_attention_output_benchmark::tests::accounting_",
+            "--nocapture",
         ],
     )?;
     gate_qwen35_nvfp4_attention_output(root)
@@ -1936,6 +1962,34 @@ fn bench_qwen35_nvfp4_qkv(
             .env(
                 "TUISKO_GENERATOR_BASELINE_SHA256",
                 sha256(&fs::read(root.join(QWEN35_NVFP4_QKV_RESOURCE_BASELINE))?),
+            ),
+    )
+}
+
+fn bench_qwen35_nvfp4_attention_output(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen35-nvfp4-attention-output")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(
+                    root.join(QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE),
+                )?),
             ),
     )
 }
@@ -6240,6 +6294,10 @@ fn gate_qwen35_nvfp4_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn gate_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
     let ptx_path = root.join(PTX);
     let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
         format!(
@@ -6350,6 +6408,10 @@ fn gate_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>>
     projection_registers.sort_unstable();
     gate_shared.sort_unstable();
     projection_shared.sort_unstable();
+    require_registers(&baseline, "gate_registers", &gate_registers)?;
+    require_registers(&baseline, "projection_registers", &projection_registers)?;
+    require_uniform_value(&baseline, "gate_shared_bytes", &gate_shared)?;
+    require_uniform_value(&baseline, "projection_shared_bytes", &projection_shared)?;
 
     println!(
         "Qwen3.5 NVFP4 attention-output gate passed: 8 gate + 8 projection entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}, EX2/E2M1 present",
@@ -6867,6 +6929,7 @@ mod tests {
                 "qual/baselines/nvfp4-down-sm120.txt",
                 "qual/baselines/qwen35-nvfp4-down-sm120.txt",
                 "qual/baselines/qwen35-nvfp4-qkv-sm120.txt",
+                "qual/baselines/qwen35-nvfp4-attention-output-sm120.txt",
                 "qual/baselines/gdn-prepare-sm120.txt",
                 "qual/baselines/gdn-recurrence-sm120.txt",
                 "qual/baselines/gdn-output-sm120.txt",
