@@ -237,9 +237,10 @@ impl ResidentTextGenerator {
 
     #[cfg(feature = "qualification")]
     /// Stable device-arena and pinned-logit addresses owned by this generator.
-    pub fn qualification_addresses(&self) -> [usize; 2] {
+    pub fn qualification_addresses(&self) -> [usize; 3] {
         [
             self.program.base_address() as usize,
+            self.program.kv_base_address() as usize,
             self.logits.as_ptr().addr(),
         ]
     }
@@ -483,9 +484,10 @@ impl ResidentBatchGenerator {
 
     #[cfg(feature = "qualification")]
     /// Stable device-arena and pinned-logit addresses owned by this scheduler.
-    pub fn qualification_addresses(&self) -> [usize; 2] {
+    pub fn qualification_addresses(&self) -> [usize; 3] {
         [
             self.program.base_address() as usize,
+            self.program.kv_base_address() as usize,
             self.logits.as_ptr().addr(),
         ]
     }

@@ -69,9 +69,9 @@ impl KvCacheCodec {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct KvPlaneRegions {
-    data: ArenaRegion<u8>,
-    scales: Option<ArenaRegion<u8>>,
+pub(crate) struct KvPlaneRegions {
+    pub(crate) data: ArenaRegion<u8>,
+    pub(crate) scales: Option<ArenaRegion<u8>>,
 }
 
 impl KvPlaneRegions {
@@ -84,9 +84,9 @@ impl KvPlaneRegions {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct LayerKvRegions {
-    key: KvPlaneRegions,
-    value: KvPlaneRegions,
+pub(crate) struct LayerKvRegions {
+    pub(crate) key: KvPlaneRegions,
+    pub(crate) value: KvPlaneRegions,
 }
 
 impl LayerKvRegions {
@@ -244,6 +244,18 @@ impl SharedPagedKvLayout {
     /// Alignment bytes not owned by a typed page table or cache plane.
     pub const fn padding_bytes(&self) -> usize {
         self.arena_bytes() - self.owner_bytes()
+    }
+
+    pub(crate) const fn builder(&self) -> &ArenaLayout {
+        &self.builder
+    }
+
+    pub(crate) const fn block_tables(&self) -> ArenaRegion<u32> {
+        self.block_tables
+    }
+
+    pub(crate) fn layers(&self) -> &[LayerKvRegions] {
+        &self.layers
     }
 
     fn validate_regions(&self) -> EngineResult<()> {

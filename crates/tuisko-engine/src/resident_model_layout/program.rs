@@ -1,10 +1,11 @@
 //! Resident exact-target execution owner for the complete text model.
 
 use super::{
-    AttentionPersistent, AttentionWeights, EndpointWeights, GdnPersistent, GdnWeights,
-    MixerWeights, MlpWeights, ResidentModelLayout, SharedWorkspace,
+    AttentionWeights, EndpointWeights, GdnPersistent, GdnWeights, MixerWeights, MlpWeights,
+    ResidentModelLayout,
 };
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::long_context_kv_layout::LayerKvRegions;
+use crate::{EngineError, EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH};
 #[cfg(feature = "qualification")]
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use tuisko_gpu::{
     ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, DeviceCopy, GpuError, GpuResult,
     PinnedHostBuffer,
 };
+use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_kernels_sm120::{
     AttentionOutputOp, AttentionQkPrepareOp, DenseFp8DownOp, DenseFp8SwiGluOp, FullAttentionQkvOp,
     GdnInputProjectionOp, GdnOutputProjectionOp, GdnPrepareOp, GdnRecurrenceOp, LmHeadOp,
@@ -24,12 +26,15 @@ use tuisko_model::{
 };
 
 const ROTARY_PAIRS: usize = 32;
+const SHORT_CONTEXT_PAGES_PER_SLOT: usize = super::CONTEXT_CAPACITY / ATTENTION_PAGE_SIZE;
+const SHORT_CONTEXT_PHYSICAL_PAGES: usize = MAX_BATCH * SHORT_CONTEXT_PAGES_PER_SLOT;
 
-/// One arena, one shared workspace, and immutable `B=1..=8` graphs for all 64 text layers.
+/// Resident and shared-KV arenas plus immutable `B=1..=8` graphs for all 64 text layers.
 pub struct ResidentModelProgram {
-    // Graphs retain arena addresses and module handles, so they drop first.
+    // Graphs retain both arena addresses and module handles, so they drop first.
     graphs: [CudaGraph; MAX_BATCH],
     arena: DeviceArena,
+    kv_arena: DeviceArena,
     _norm: ResidualNormOp<Qwen38_27B>,
     _gdn_input: GdnInputProjectionOp<Qwen38_27B>,
     _gdn_prepare: GdnPrepareOp<Qwen38_27B>,
@@ -50,6 +55,7 @@ pub struct ResidentModelProgram {
     layout: ResidentModelLayout,
     _pointers: ProgramPointers,
     base_address: u64,
+    kv_base_address: u64,
 }
 
 #[cfg(feature = "qualification")]
@@ -76,6 +82,7 @@ impl ResidentModelProgram {
         let layout = ResidentModelLayout::build()?;
         let stream = context.new_stream().map_err(GpuError::from)?;
         let arena = DeviceArena::zeroed(&stream, &layout.builder)?;
+        let kv_arena = DeviceArena::zeroed(&stream, layout.kv_layout.builder())?;
         let norm = ResidualNormOp::new(context)?;
         let gdn_input = GdnInputProjectionOp::new(context)?;
         let gdn_prepare = GdnPrepareOp::new(context)?;
@@ -101,9 +108,10 @@ impl ResidentModelProgram {
         .map_err(GpuError::from)?;
 
         let scalars = load_source_weights(&arena, &stream, &layout, snapshot.as_ref())?;
-        initialize_metadata(&arena, &stream, layout.workspace)?;
-        let pointers = ProgramPointers::bind(&arena, &layout, &scalars)?;
+        initialize_metadata(&arena, &kv_arena, &stream, &layout)?;
+        let pointers = ProgramPointers::bind(&arena, &kv_arena, &layout, &scalars)?;
         let base_address = arena.base_address();
+        let kv_base_address = kv_arena.base_address();
         let ops = Ops {
             norm: &norm,
             gdn_input: &gdn_input,
@@ -125,6 +133,7 @@ impl ResidentModelProgram {
         Ok(Self {
             graphs,
             arena,
+            kv_arena,
             _norm: norm,
             _gdn_input: gdn_input,
             _gdn_prepare: gdn_prepare,
@@ -145,6 +154,7 @@ impl ResidentModelProgram {
             layout,
             _pointers: pointers,
             base_address,
+            kv_base_address,
         })
     }
 
@@ -252,19 +262,37 @@ impl ResidentModelProgram {
         Ok(())
     }
 
-    /// Clears all 48 recurrent owners and all 16 represented KV-cache owners.
+    /// Clears all recurrent owners and the 24 pages assigned to the current decode route.
     pub fn reset_state(&self, stream: &CudaStream) -> EngineResult<()> {
+        let mut attention_layer = 0;
         for layer in &self.layout.layers {
             match layer.persistent {
                 super::PersistentState::Gdn(state) => {
                     self.arena.fill(stream, state.history, 0)?;
                     self.arena.fill(stream, state.state, 0)?;
                 }
-                super::PersistentState::Attention(cache) => {
-                    self.arena.fill(stream, cache.key_pages, 0)?;
-                    self.arena.fill(stream, cache.value_pages, 0)?;
+                super::PersistentState::Attention => {
+                    let cache = self
+                        .layout
+                        .kv_layout
+                        .layers()
+                        .get(attention_layer)
+                        .copied()
+                        .ok_or_else(|| {
+                            EngineError::layout(
+                                "resident reset visited more attention layers than the shared KV inventory",
+                            )
+                        })?;
+                    fill_cache_prefix(&self.kv_arena, stream, cache.key.data)?;
+                    fill_cache_prefix(&self.kv_arena, stream, cache.value.data)?;
+                    attention_layer += 1;
                 }
             }
+        }
+        if attention_layer != self.layout.kv_layout.layers().len() {
+            return Err(EngineError::layout(
+                "resident reset did not visit every shared KV layer",
+            ));
         }
 
         Ok(())
@@ -273,17 +301,35 @@ impl ResidentModelProgram {
     /// Clears one physical slot without changing any other persistent owner bytes.
     pub fn reset_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
         require_slot(slot)?;
+        let mut attention_layer = 0;
         for layer in &self.layout.layers {
             match layer.persistent {
                 super::PersistentState::Gdn(state) => {
                     fill_slot(&self.arena, stream, state.history, slot)?;
                     fill_slot(&self.arena, stream, state.state, slot)?;
                 }
-                super::PersistentState::Attention(cache) => {
-                    fill_slot(&self.arena, stream, cache.key_pages, slot)?;
-                    fill_slot(&self.arena, stream, cache.value_pages, slot)?;
+                super::PersistentState::Attention => {
+                    let cache = self
+                        .layout
+                        .kv_layout
+                        .layers()
+                        .get(attention_layer)
+                        .copied()
+                        .ok_or_else(|| {
+                            EngineError::layout(
+                                "resident slot reset visited more attention layers than the shared KV inventory",
+                            )
+                        })?;
+                    fill_cache_slot(&self.kv_arena, stream, cache.key.data, slot)?;
+                    fill_cache_slot(&self.kv_arena, stream, cache.value.data, slot)?;
+                    attention_layer += 1;
                 }
             }
+        }
+        if attention_layer != self.layout.kv_layout.layers().len() {
+            return Err(EngineError::layout(
+                "resident slot reset did not visit every shared KV layer",
+            ));
         }
 
         Ok(())
@@ -346,6 +392,11 @@ impl ResidentModelProgram {
         self.base_address
     }
 
+    /// Stable base address of the shared page-table and KV arena.
+    pub const fn kv_base_address(&self) -> u64 {
+        self.kv_base_address
+    }
+
     /// Exact source-backed device weight bytes.
     pub const fn resident_weight_bytes(&self) -> usize {
         self.layout.resident_weight_bytes()
@@ -366,9 +417,21 @@ impl ResidentModelProgram {
         self.layout.cache_bytes()
     }
 
-    /// Causal history, recurrent state, and represented cache bytes in one physical slot.
+    /// Stable long-context page-table bytes across all eight slot rows.
+    pub const fn kv_table_bytes(&self) -> usize {
+        self.layout.kv_table_bytes()
+    }
+
+    /// GDN state plus the three cache pages assigned to one current decode slot.
     pub const fn persistent_slot_bytes(&self) -> usize {
-        (self.layout.history_bytes() + self.layout.state_bytes() + self.layout.cache_bytes())
+        (self.layout.history_bytes()
+            + self.layout.state_bytes()
+            + SHORT_CONTEXT_PHYSICAL_PAGES
+                * Qwen38_27B::NUM_KV_HEADS
+                * ATTENTION_PAGE_SIZE
+                * Qwen38_27B::HEAD_DIM
+                * 2
+                * (Qwen38_27B::LAYERS / Qwen38_27B::FULL_ATTENTION_INTERVAL))
             / MAX_BATCH
     }
 
@@ -380,6 +443,16 @@ impl ResidentModelProgram {
     /// Complete device arena bytes, including exact alignment padding.
     pub const fn arena_bytes(&self) -> usize {
         self.layout.arena_bytes()
+    }
+
+    /// Weight, GDN-state, and shared-workspace allocation bytes.
+    pub const fn resident_arena_bytes(&self) -> usize {
+        self.layout.resident_arena_bytes()
+    }
+
+    /// Shared page-table and represented KV allocation bytes.
+    pub const fn kv_arena_bytes(&self) -> usize {
+        self.layout.kv_arena_bytes()
     }
 
     /// Exact alignment padding inside the complete device arena.
@@ -483,6 +556,14 @@ impl ResidentModelProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Reads all eight stable long-context page-table rows.
+    pub fn qualification_block_tables(&self, stream: &CudaStream) -> EngineResult<Vec<u32>> {
+        Ok(self
+            .kv_arena
+            .copy_to_host(stream, self.layout.kv_layout.block_tables())?)
+    }
+
+    #[cfg(feature = "qualification")]
     /// Fills every mutable workspace seam with one byte sentinel.
     pub fn qualification_reset_workspace(&self, stream: &CudaStream, byte: u8) -> EngineResult<()> {
         let workspace = self.layout.workspace;
@@ -568,19 +649,36 @@ impl ResidentModelProgram {
         let mut history =
             Vec::with_capacity(self.layout.history_bytes() / std::mem::size_of::<u16>());
         let mut state = Vec::with_capacity(self.layout.state_bytes() / std::mem::size_of::<f32>());
-        let mut key_pages = Vec::with_capacity(self.layout.cache_bytes() / 2);
-        let mut value_pages = Vec::with_capacity(self.layout.cache_bytes() / 2);
+        let active_cache_values = cache_values(SHORT_CONTEXT_PHYSICAL_PAGES)?;
+        let guard_values = cache_values(1)?;
+        let observed_plane_values = active_cache_values + guard_values;
+        let attention_layers = self.layout.kv_layout.layers().len();
+        let mut key_pages = Vec::with_capacity(active_cache_values * attention_layers);
+        let mut value_pages = Vec::with_capacity(active_cache_values * attention_layers);
+        let mut key_guard_pages = Vec::with_capacity(guard_values * attention_layers);
+        let mut value_guard_pages = Vec::with_capacity(guard_values * attention_layers);
         for layer in &self.layout.layers {
             match layer.persistent {
                 super::PersistentState::Gdn(regions) => {
                     history.extend(self.arena.copy_to_host(stream, regions.history)?);
                     state.extend(self.arena.copy_to_host(stream, regions.state)?);
                 }
-                super::PersistentState::Attention(regions) => {
-                    key_pages.extend(self.arena.copy_to_host(stream, regions.key_pages)?);
-                    value_pages.extend(self.arena.copy_to_host(stream, regions.value_pages)?);
-                }
+                super::PersistentState::Attention => {}
             }
+        }
+        for cache in self.layout.kv_layout.layers() {
+            let key =
+                self.kv_arena
+                    .copy_prefix_to_host(stream, cache.key.data, observed_plane_values)?;
+            let value = self.kv_arena.copy_prefix_to_host(
+                stream,
+                cache.value.data,
+                observed_plane_values,
+            )?;
+            key_pages.extend_from_slice(&key[..active_cache_values]);
+            value_pages.extend_from_slice(&value[..active_cache_values]);
+            key_guard_pages.extend_from_slice(&key[active_cache_values..]);
+            value_guard_pages.extend_from_slice(&value[active_cache_values..]);
         }
         let workspace = self.layout.workspace;
         Ok(ResidentModelObservables {
@@ -620,6 +718,8 @@ impl ResidentModelProgram {
             state,
             key_pages,
             value_pages,
+            key_guard_pages,
+            value_guard_pages,
         })
     }
 
@@ -695,6 +795,10 @@ pub struct ResidentModelObservables {
     pub key_pages: Vec<u8>,
     /// Concatenated represented value caches in ascending attention-layer order.
     pub value_pages: Vec<u8>,
+    /// First unassigned key page from every attention layer.
+    pub key_guard_pages: Vec<u8>,
+    /// First unassigned value page from every attention layer.
+    pub value_guard_pages: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -909,6 +1013,7 @@ struct ProgramPointers {
 impl ProgramPointers {
     fn bind(
         arena: &DeviceArena,
+        kv_arena: &DeviceArena,
         layout: &ResidentModelLayout,
         scalars: &[LayerScalars],
     ) -> EngineResult<Self> {
@@ -917,19 +1022,45 @@ impl ProgramPointers {
                 "resident scalar inventory does not match layer inventory",
             ));
         }
-        let layers = layout
-            .layers
-            .iter()
-            .zip(scalars)
-            .map(|(layer, scalars)| {
-                Ok(LayerPointers {
-                    mixer: bind_mixer(arena, layer.mixer, layer.persistent, scalars.mixer)?,
-                    mlp: bind_mlp(arena, layer.mlp, scalars.mlp)?,
-                })
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
+        let mut layers = Vec::with_capacity(layout.layers.len());
+        let mut attention_layer = 0;
+        for (layer, scalars) in layout.layers.iter().zip(scalars) {
+            let cache = match layer.persistent {
+                super::PersistentState::Gdn(_) => None,
+                super::PersistentState::Attention => {
+                    let cache = layout
+                        .kv_layout
+                        .layers()
+                        .get(attention_layer)
+                        .copied()
+                        .ok_or_else(|| {
+                            EngineError::layout(
+                                "resident attention layer exceeds shared KV plane inventory",
+                            )
+                        })?;
+                    attention_layer += 1;
+                    Some(cache)
+                }
+            };
+            layers.push(LayerPointers {
+                mixer: bind_mixer(
+                    arena,
+                    kv_arena,
+                    layer.mixer,
+                    layer.persistent,
+                    cache,
+                    scalars.mixer,
+                )?,
+                mlp: bind_mlp(arena, layer.mlp, scalars.mlp)?,
+            });
+        }
+        if attention_layer != layout.kv_layout.layers().len() {
+            return Err(EngineError::layout(
+                "resident attention layer inventory does not consume every shared KV plane",
+            ));
+        }
         let endpoint = EndpointPointers::bind(arena, layout.endpoint)?;
-        let workspace = WorkspacePointers::bind(arena, layout.workspace)?;
+        let workspace = WorkspacePointers::bind(arena, kv_arena, layout)?;
 
         Ok(Self {
             layers,
@@ -978,7 +1109,12 @@ impl EndpointPointers {
 }
 
 impl WorkspacePointers {
-    fn bind(arena: &DeviceArena, regions: SharedWorkspace) -> GpuResult<Self> {
+    fn bind(
+        arena: &DeviceArena,
+        kv_arena: &DeviceArena,
+        layout: &ResidentModelLayout,
+    ) -> GpuResult<Self> {
+        let regions = layout.workspace;
         Ok(Self {
             residual_a: arena.address(regions.residual_a)?,
             residual_b: arena.address(regions.residual_b)?,
@@ -997,7 +1133,9 @@ impl WorkspacePointers {
             recurrent_output: arena.address(regions.recurrent_output)?,
             rope_cos: arena.address(regions.rope_cos)?.cast_const(),
             rope_sin: arena.address(regions.rope_sin)?.cast_const(),
-            block_tables: arena.address(regions.block_tables)?.cast_const(),
+            block_tables: kv_arena
+                .address(layout.kv_layout.block_tables())?
+                .cast_const(),
             table_rows: arena.address(regions.table_rows)?.cast_const(),
             cache_positions: arena.address(regions.cache_positions)?.cast_const(),
             lengths: arena.address(regions.lengths)?.cast_const(),
@@ -1046,22 +1184,26 @@ impl WorkspacePointers {
 
 fn bind_mixer(
     arena: &DeviceArena,
+    kv_arena: &DeviceArena,
     weights: MixerWeights,
     persistent: super::PersistentState,
+    cache: Option<LayerKvRegions>,
     scalars: MixerScalars,
 ) -> EngineResult<MixerPointers> {
-    match (weights, persistent, scalars) {
+    match (weights, persistent, cache, scalars) {
         (
             MixerWeights::Gdn(weights),
             super::PersistentState::Gdn(persistent),
+            None,
             MixerScalars::Gdn,
         ) => Ok(MixerPointers::Gdn(bind_gdn(arena, weights, persistent)?)),
         (
             MixerWeights::Attention(weights),
-            super::PersistentState::Attention(persistent),
+            super::PersistentState::Attention,
+            Some(cache),
             MixerScalars::Attention(scalars),
         ) => Ok(MixerPointers::Attention(bind_attention(
-            arena, weights, persistent, scalars,
+            arena, kv_arena, weights, cache, scalars,
         )?)),
         _ => Err(EngineError::layout(
             "resident mixer scalar route does not match its source route",
@@ -1093,8 +1235,9 @@ fn bind_gdn(
 
 fn bind_attention(
     arena: &DeviceArena,
+    kv_arena: &DeviceArena,
     weights: AttentionWeights,
-    persistent: AttentionPersistent,
+    cache: LayerKvRegions,
     scalars: AttentionScalars,
 ) -> GpuResult<AttentionPointers> {
     Ok(AttentionPointers {
@@ -1106,8 +1249,8 @@ fn bind_attention(
         output_weight_codes: arena.address(weights.output_weight_codes)?.cast_const(),
         output_weight_scales: arena.address(weights.output_weight_scales)?.cast_const(),
         post_attention_norm: arena.address(weights.post_attention_norm)?.cast_const(),
-        key_pages: arena.address(persistent.key_pages)?,
-        value_pages: arena.address(persistent.value_pages)?,
+        key_pages: kv_arena.address(cache.key.data)?,
+        value_pages: kv_arena.address(cache.value.data)?,
         scalars,
     })
 }
@@ -1349,7 +1492,7 @@ fn launch_mixer(
                     workspace.rope_sin,
                     workspace.block_tables,
                     workspace.table_rows,
-                    super::TABLE_STRIDE,
+                    LONG_CONTEXT_PHYSICAL_PAGES,
                     workspace.cache_positions,
                     workspace.query,
                     p.key_pages,
@@ -1365,7 +1508,7 @@ fn launch_mixer(
                     p.value_pages,
                     workspace.block_tables,
                     workspace.table_rows,
-                    super::TABLE_STRIDE,
+                    LONG_CONTEXT_PHYSICAL_PAGES,
                     workspace.lengths,
                     workspace.attention,
                     p.scalars.key_cache_scale,
@@ -1642,19 +1785,25 @@ fn load_mlp(
 
 fn initialize_metadata(
     arena: &DeviceArena,
+    kv_arena: &DeviceArena,
     stream: &CudaStream,
-    workspace: SharedWorkspace,
+    layout: &ResidentModelLayout,
 ) -> EngineResult<()> {
+    let workspace = layout.workspace;
     arena.copy_from_host(
         stream,
         workspace.state_rows,
         &(0..MAX_BATCH as u32).collect::<Vec<_>>(),
     )?;
-    arena.copy_from_host(
-        stream,
-        workspace.block_tables,
-        &(0..(MAX_BATCH * super::TABLE_STRIDE) as u32).collect::<Vec<_>>(),
-    )?;
+    let mut block_tables = vec![u32::MAX; MAX_BATCH * LONG_CONTEXT_PHYSICAL_PAGES];
+    for slot in 0..MAX_BATCH {
+        for logical_page in 0..SHORT_CONTEXT_PAGES_PER_SLOT {
+            block_tables[slot * LONG_CONTEXT_PHYSICAL_PAGES + logical_page] =
+                u32::try_from(slot * SHORT_CONTEXT_PAGES_PER_SLOT + logical_page)
+                    .map_err(|_| EngineError::layout("resident physical page exceeds u32"))?;
+        }
+    }
+    kv_arena.copy_from_host(stream, layout.kv_layout.block_tables(), &block_tables)?;
     arena.copy_from_host(
         stream,
         workspace.table_rows,
@@ -1719,6 +1868,58 @@ fn fill_slot<T: DeviceCopy>(
     let start = product("resident persistent slot offset", slot, width)?;
     arena.fill_slice(stream, region, start, width, 0)?;
     Ok(())
+}
+
+fn fill_cache_prefix(
+    arena: &DeviceArena,
+    stream: &CudaStream,
+    region: ArenaRegion<u8>,
+) -> EngineResult<()> {
+    arena.fill_slice(
+        stream,
+        region,
+        0,
+        cache_values(SHORT_CONTEXT_PHYSICAL_PAGES)?,
+        0,
+    )?;
+    Ok(())
+}
+
+fn fill_cache_slot(
+    arena: &DeviceArena,
+    stream: &CudaStream,
+    region: ArenaRegion<u8>,
+    slot: usize,
+) -> EngineResult<()> {
+    let first_page = product(
+        "resident slot first cache page",
+        slot,
+        SHORT_CONTEXT_PAGES_PER_SLOT,
+    )?;
+    arena.fill_slice(
+        stream,
+        region,
+        cache_values(first_page)?,
+        cache_values(SHORT_CONTEXT_PAGES_PER_SLOT)?,
+        0,
+    )?;
+    Ok(())
+}
+
+fn cache_values(pages: usize) -> EngineResult<usize> {
+    product(
+        "resident represented cache values",
+        pages,
+        product(
+            "resident represented cache page values",
+            product(
+                "resident represented cache head tokens",
+                Qwen38_27B::NUM_KV_HEADS,
+                ATTENTION_PAGE_SIZE,
+            )?,
+            Qwen38_27B::HEAD_DIM,
+        )?,
+    )
 }
 
 fn copy_embedding_row(source: &[u8], token: usize, destination: &mut [u16]) -> EngineResult<()> {

@@ -1,4 +1,4 @@
-//! Exact single-arena plan for the resident Qwen3.8 text model.
+//! Exact resident and shared-KV arena plan for the Qwen3.8 text model.
 
 mod program;
 
@@ -7,11 +7,10 @@ pub use program::ResidentModelProgram;
 pub use program::{ResidentEmbeddingStageGraph, ResidentModelObservables};
 
 use crate::{
-    EngineError, EngineResult, MAX_BATCH,
-    full_attention_layer_layout::{CONTEXT_CAPACITY, PHYSICAL_PAGES, TABLE_STRIDE},
+    EngineError, EngineResult, KvCacheCodec, MAX_BATCH, SharedPagedKvLayout,
+    full_attention_layer_layout::CONTEXT_CAPACITY,
 };
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
-use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{Arch, NVFP4_MLP_LAYER_END, Qwen38_27B};
 
 const ALIGNMENT: usize = 256;
@@ -342,50 +341,16 @@ impl GdnPersistent {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct AttentionPersistent {
-    key_pages: ArenaRegion<u8>,
-    value_pages: ArenaRegion<u8>,
-}
-
-impl AttentionPersistent {
-    fn reserve(builder: &mut ArenaLayout) -> EngineResult<Self> {
-        type A = Qwen38_27B;
-        let cache_plane = product(
-            "resident attention cache plane",
-            product(
-                "resident attention cache page heads",
-                PHYSICAL_PAGES,
-                A::NUM_KV_HEADS,
-            )?,
-            product(
-                "resident attention cache page values",
-                ATTENTION_PAGE_SIZE,
-                A::HEAD_DIM,
-            )?,
-        )?;
-
-        Ok(Self {
-            key_pages: builder.reserve(cache_plane, ALIGNMENT)?,
-            value_pages: builder.reserve(cache_plane, ALIGNMENT)?,
-        })
-    }
-
-    fn push_spans(self, spans: &mut Vec<Span>) {
-        push_regions!(spans, self.key_pages, self.value_pages);
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 enum PersistentState {
     Gdn(GdnPersistent),
-    Attention(AttentionPersistent),
+    Attention,
 }
 
 impl PersistentState {
     fn push_spans(self, spans: &mut Vec<Span>) {
         match self {
             Self::Gdn(state) => state.push_spans(spans),
-            Self::Attention(cache) => cache.push_spans(spans),
+            Self::Attention => {}
         }
     }
 }
@@ -414,7 +379,7 @@ impl ResidentLayerLayout {
             MlpWeights::DenseFp8(DenseFp8MlpWeights::reserve(builder)?)
         };
         let persistent = if attention {
-            PersistentState::Attention(AttentionPersistent::reserve(builder)?)
+            PersistentState::Attention
         } else {
             PersistentState::Gdn(GdnPersistent::reserve(builder)?)
         };
@@ -494,7 +459,6 @@ struct SharedWorkspace {
     recurrent_output: ArenaRegion<u16>,
     rope_cos: ArenaRegion<f32>,
     rope_sin: ArenaRegion<f32>,
-    block_tables: ArenaRegion<u32>,
     table_rows: ArenaRegion<u32>,
     cache_positions: ArenaRegion<u32>,
     lengths: ArenaRegion<u32>,
@@ -549,7 +513,6 @@ impl SharedWorkspace {
             recurrent_output: builder.reserve(batch_value, ALIGNMENT)?,
             rope_cos: builder.reserve(MAX_BATCH * 32, ALIGNMENT)?,
             rope_sin: builder.reserve(MAX_BATCH * 32, ALIGNMENT)?,
-            block_tables: builder.reserve(MAX_BATCH * TABLE_STRIDE, ALIGNMENT)?,
             table_rows: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             cache_positions: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             lengths: builder.reserve(MAX_BATCH, ALIGNMENT)?,
@@ -582,7 +545,6 @@ impl SharedWorkspace {
             self.recurrent_output,
             self.rope_cos,
             self.rope_sin,
-            self.block_tables,
             self.table_rows,
             self.cache_positions,
             self.lengths,
@@ -606,6 +568,7 @@ impl SharedWorkspace {
 #[derive(Clone, Debug)]
 pub struct ResidentModelLayout {
     builder: ArenaLayout,
+    kv_layout: SharedPagedKvLayout,
     layers: Vec<ResidentLayerLayout>,
     endpoint: EndpointWeights,
     workspace: SharedWorkspace,
@@ -613,11 +576,12 @@ pub struct ResidentModelLayout {
     history_bytes: usize,
     state_bytes: usize,
     cache_bytes: usize,
+    kv_table_bytes: usize,
     workspace_bytes: usize,
 }
 
 impl ResidentModelLayout {
-    /// Plans the exact admitted 64-layer Qwen3.8 text model in one aligned arena.
+    /// Plans the exact admitted 64-layer model and its shared 220K E4M3 KV pool.
     pub fn build() -> EngineResult<Self> {
         type A = Qwen38_27B;
         require_exact_geometry()?;
@@ -628,6 +592,7 @@ impl ResidentModelLayout {
         }
         let endpoint = EndpointWeights::reserve(&mut builder)?;
         let workspace = SharedWorkspace::reserve(&mut builder)?;
+        let kv_layout = SharedPagedKvLayout::build(KvCacheCodec::E4m3)?;
         let resident_weight_bytes =
             layers
                 .iter()
@@ -644,10 +609,12 @@ impl ResidentModelLayout {
                 })?;
         let history_bytes = gdn_history_bytes()?;
         let state_bytes = gdn_state_bytes()?;
-        let cache_bytes = attention_cache_bytes()?;
+        let cache_bytes = kv_layout.cache_bytes();
+        let kv_table_bytes = kv_layout.block_table_bytes();
         let workspace_bytes = workspace.byte_len()?;
         let layout = Self {
             builder,
+            kv_layout,
             layers,
             endpoint,
             workspace,
@@ -655,6 +622,7 @@ impl ResidentModelLayout {
             history_bytes,
             state_bytes,
             cache_bytes,
+            kv_table_bytes,
             workspace_bytes,
         };
         layout.validate_regions()?;
@@ -672,9 +640,19 @@ impl ResidentModelLayout {
         self.layers.get(layer).map(|layer| layer.kind)
     }
 
-    /// Complete single-allocation byte count, including alignment padding.
+    /// Complete resident plus shared-KV device allocation bytes, including padding.
     pub const fn arena_bytes(&self) -> usize {
+        self.resident_arena_bytes() + self.kv_arena_bytes()
+    }
+
+    /// Weight, GDN-state, and shared-workspace arena bytes including padding.
+    pub const fn resident_arena_bytes(&self) -> usize {
         self.builder.byte_len()
+    }
+
+    /// Shared page tables and E4M3 K/V planes in their address-stable arena.
+    pub const fn kv_arena_bytes(&self) -> usize {
+        self.kv_layout.arena_bytes()
     }
 
     /// Source-backed norm, projection, MLP, final-norm, and LM-head bytes on device.
@@ -697,6 +675,11 @@ impl ResidentModelLayout {
         self.cache_bytes
     }
 
+    /// Stable device block-table bytes for all eight 220K-capable slot rows.
+    pub const fn kv_table_bytes(&self) -> usize {
+        self.kv_table_bytes
+    }
+
     /// One address-stable workspace shared sequentially by all layers and the endpoint.
     pub const fn workspace_bytes(&self) -> usize {
         self.workspace_bytes
@@ -708,6 +691,7 @@ impl ResidentModelLayout {
             + self.history_bytes
             + self.state_bytes
             + self.cache_bytes
+            + self.kv_table_bytes
             + self.workspace_bytes
     }
 
@@ -751,11 +735,11 @@ impl ResidentModelLayout {
                 )));
             }
             let end = checked_sum("resident region end", span.offset, span.bytes)?;
-            if end > self.arena_bytes() {
+            if end > self.resident_arena_bytes() {
                 return Err(EngineError::layout(format!(
                     "resident region {0}..{end} exceeds arena {1}",
                     span.offset,
-                    self.arena_bytes()
+                    self.resident_arena_bytes()
                 )));
             }
         }
@@ -772,10 +756,14 @@ impl ResidentModelLayout {
         let represented_bytes = spans.iter().try_fold(0usize, |total, span| {
             checked_sum("represented resident bytes", total, span.bytes)
         })?;
-        if represented_bytes != self.owner_bytes() {
+        let resident_owner_bytes = self
+            .owner_bytes()
+            .checked_sub(self.kv_layout.owner_bytes())
+            .ok_or_else(|| EngineError::layout("resident KV ownership exceeds total ownership"))?;
+        if represented_bytes != resident_owner_bytes {
             return Err(EngineError::layout(format!(
                 "represented resident regions own {represented_bytes} bytes, accounting owns {}",
-                self.owner_bytes()
+                resident_owner_bytes
             )));
         }
 
@@ -867,24 +855,6 @@ fn gdn_state_bytes() -> EngineResult<usize> {
     )
 }
 
-fn attention_cache_bytes() -> EngineResult<usize> {
-    type A = Qwen38_27B;
-    let attention_layers = A::LAYERS / A::FULL_ATTENTION_INTERVAL;
-    product(
-        "all attention cache bytes",
-        product(
-            "per-layer attention cache bytes",
-            product(
-                "one attention cache plane",
-                product("attention page heads", PHYSICAL_PAGES, A::NUM_KV_HEADS)?,
-                product("attention page values", ATTENTION_PAGE_SIZE, A::HEAD_DIM)?,
-            )?,
-            2,
-        )?,
-        attention_layers,
-    )
-}
-
 fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
     left.checked_mul(right)
         .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
@@ -934,14 +904,15 @@ mod tests {
         assert_eq!(layout.resident_weight_bytes(), 19_103_682_560);
         assert_eq!(layout.history_bytes(), 23_592_960);
         assert_eq!(layout.state_bytes(), 1_207_959_552);
-        assert_eq!(layout.cache_bytes(), 50_331_648);
-        assert_eq!(layout.workspace_bytes(), 5_910_272);
+        assert_eq!(layout.cache_bytes(), 7_210_008_576);
+        assert_eq!(layout.kv_table_bytes(), 110_016);
+        assert_eq!(layout.workspace_bytes(), 5_910_176);
         assert_eq!(
             layout.source_mapped_embedding_bytes().unwrap(),
             2_542_796_800
         );
         assert_eq!(layout.context_capacity(), 192);
-        assert_eq!(layout.owner_bytes(), 20_391_476_992);
+        assert_eq!(layout.owner_bytes(), 27_551_263_840);
     }
 
     #[test]
@@ -956,7 +927,9 @@ mod tests {
             assert!(batch * 6_144 <= layout.workspace.query.len());
             assert!(batch * 248_320 <= layout.workspace.logits.len());
         }
-        assert_eq!(layout.padding_bytes(), 16_640);
-        assert_eq!(layout.arena_bytes(), 20_391_493_632);
+        assert_eq!(layout.resident_arena_bytes(), 20_341_161_728);
+        assert_eq!(layout.kv_arena_bytes(), 7_210_118_656);
+        assert_eq!(layout.padding_bytes(), 16_544);
+        assert_eq!(layout.arena_bytes(), 27_551_280_384);
     }
 }

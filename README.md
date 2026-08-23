@@ -36,10 +36,12 @@ The optional `tuisko-llm` Python package exposes the admitted tokenizer and chat
 It does not claim an in-process inference API; see [`docs/python.md`](docs/python.md).
 
 `tuisko-engine` owns the exact 64-layer resident text program: all source-native weights, 48 GDN
-history/state pairs, 16 current 192-token-per-slot attention KV caches, endpoint weights, one shared
-workspace, and immutable whole-model CUDA Graphs for every `B=1..8` route. Compact active rows can
-address any distinct physical state/cache slots, and one slot can be reset without touching its
-survivors. The HTTP worker owns that scheduler and disconnecting a response cancels its resident
+history/state pairs, one shared 3,438-page E4M3 KV pool across 16 attention layers, endpoint weights,
+one shared workspace, and immutable whole-model CUDA Graphs for every `B=1..8` route. The current
+qualified decode tables assign three pages to each stable slot, so request admission remains 192
+tokens while the remaining long-context pages stay unassigned. Compact active rows can address any
+distinct physical state/cache slots, and one slot can be reset without touching its survivors. The
+HTTP worker owns that scheduler and disconnecting a response cancels its resident
 request without moving survivors. Concrete single-slot and compact eight-request generation owners
 connect the admitted frontend, sampling, streaming decode, and resident graphs for prompts within
 the current 192-token cache. The compact owner preserves the final emitted token as pending, packs
