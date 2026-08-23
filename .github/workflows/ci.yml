@@ -20,6 +20,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, llvm-tools-preview, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: host
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --exclude tuiskollm --exclude tuisko-engine --exclude tuisko-gpu --exclude tuisko-kernels-sm86 --exclude tuisko-kernels-sm89 --exclude tuisko-kernels-sm120 --exclude tuisko-qual --exclude tuisko-serve --all-targets -- -D warnings
       - run: cargo clippy --package tuisko-qual --no-default-features --bin qualify-frontend -- -D warnings
@@ -48,6 +52,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: python
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.12.3"
