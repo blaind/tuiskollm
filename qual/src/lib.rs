@@ -107,6 +107,8 @@ mod qwen35_nvfp4_down_benchmark;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_mlp_benchmark;
 #[cfg(feature = "device")]
+mod qwen35_nvfp4_qkv;
+#[cfg(feature = "device")]
 mod qwen35_nvfp4_swiglu;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_swiglu_benchmark;
@@ -245,6 +247,10 @@ pub use qwen35_nvfp4_down::qualify_qwen35_nvfp4_down;
 pub use qwen35_nvfp4_down_benchmark::benchmark_qwen35_nvfp4_down;
 #[cfg(feature = "device")]
 pub use qwen35_nvfp4_mlp_benchmark::benchmark_qwen35_nvfp4_mlp;
+#[cfg(feature = "device")]
+pub use qwen35_nvfp4_qkv::{
+    Qwen35Nvfp4QkvQualification, Qwen35Nvfp4QkvQualificationError, qualify_qwen35_nvfp4_qkv,
+};
 #[cfg(feature = "device")]
 pub use qwen35_nvfp4_swiglu::qualify_qwen35_nvfp4_swiglu;
 #[cfg(feature = "device")]
