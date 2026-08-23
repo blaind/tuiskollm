@@ -146,6 +146,8 @@ pub use attention_qk_prepare::{
 #[cfg(feature = "device")]
 pub use attention_qk_prepare_benchmark::benchmark_attention_qk_prepare;
 #[cfg(feature = "device")]
+pub use attention_qk_prepare_benchmark::benchmark_qwen35_attention_qk_prepare;
+#[cfg(feature = "device")]
 pub use dense_fp8_gdn_layer::{
     DenseFp8GdnLayerQualification, DenseFp8GdnLayerQualificationError, qualify_dense_fp8_gdn_layer,
 };
