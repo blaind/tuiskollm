@@ -33,15 +33,20 @@ TUISKO_CHECKPOINT=/path/to/16b6615af3548b88e2d8e382457bc705b00479cf \
 ## Surface
 
 ```python
-from tuisko.llm import Frontend
+from tuisko.llm import ChatMessage, Frontend
 
 frontend = Frontend.open("/path/to/16b6615af3548b88e2d8e382457bc705b00479cf")
-messages = [("system", "You are concise."), ("user", "Hello")]
+messages = [ChatMessage("system", "You are concise."), ChatMessage("user", "Hello")]
 prompt = frontend.encode_chat_with_report(messages, enable_thinking=False)
 
 print(prompt.token_ids)
 print(prompt.reused_tokens)
 ```
+
+The structured message types also carry prior reasoning, tool calls, and tool results. Template
+methods expose the checkpoint's thinking controls and tool definitions. `Frontend.streaming_decoder`
+incrementally decodes generated token IDs without splitting UTF-8 text. Existing `(role, content)`
+pairs remain accepted for text-only messages.
 
 `Frontend.open` first admits the complete pinned checkpoint inventory. Errors retain the Rust
 boundary's stable category in their message and are raised as either `CheckpointError` or
