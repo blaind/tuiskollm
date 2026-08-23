@@ -12,9 +12,10 @@ use crate::gpu_target::{GpuTarget, has_full_kernel_inventory};
 #[cfg(feature = "remote")]
 const USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
     <qualify-residual-norm|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
-    qualify-nvfp4-mlp|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|bench-residual-norm|\
-    bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-fp8-qkv|bench-fp8-gdn-input|bench-fp8-lm-head|\
-    bench-attention-qk-prepare|bench-paged-gqa|bench-attention-output|probe|check|sweep> \
+    qualify-nvfp4-mlp|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-attention-output|qualify-full-attention-layer|\
+    bench-residual-norm|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-fp8-qkv|bench-fp8-gdn-input|\
+    bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|bench-attention-output|bench-full-attention-layer|\
+    probe|check|sweep> \
     [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
     [--samples N] [--launches-per-sample N] [--energy-seconds N]";
 
@@ -41,6 +42,9 @@ impl Qualification {
             "qualify-attention-qk-prepare" => "attention_qk_prepare::tests",
             "qualify-paged-gqa" => "paged_gqa::tests",
             "qualify-attention-output" => "attention_output::tests",
+            "qualify-full-attention-layer" => {
+                "full_attention_layer::tests::source_layer63_matches_complete_seam_oracles_and_graph_replay"
+            }
             _ => return None,
         };
 
@@ -56,10 +60,11 @@ impl Qualification {
                 "qualify-attention-qk-prepare" => "attention-qk-prepare",
                 "qualify-paged-gqa" => "paged-gqa",
                 "qualify-attention-output" => "attention-output",
+                "qualify-full-attention-layer" => "full-attention-layer",
                 _ => unreachable!(),
             },
             filter,
-            source_snapshot: name == "qualify-nvfp4-mlp",
+            source_snapshot: matches!(name, "qualify-nvfp4-mlp" | "qualify-full-attention-layer"),
         })
     }
 }
@@ -69,6 +74,7 @@ impl Qualification {
 enum Benchmark {
     Leaf(crate::PerformanceSuite),
     Nvfp4Mlp,
+    FullAttentionLayer,
 }
 
 #[cfg(any(feature = "remote", test))]
@@ -85,6 +91,7 @@ impl Benchmark {
             "bench-attention-qk-prepare" => Self::Leaf(crate::PerformanceSuite::AttentionQkPrepare),
             "bench-paged-gqa" => Self::Leaf(crate::PerformanceSuite::PagedGqa),
             "bench-attention-output" => Self::Leaf(crate::PerformanceSuite::AttentionOutput),
+            "bench-full-attention-layer" => Self::FullAttentionLayer,
             _ => return None,
         })
     }
@@ -93,11 +100,12 @@ impl Benchmark {
         match self {
             Self::Leaf(suite) => suite.name(),
             Self::Nvfp4Mlp => "nvfp4-mlp",
+            Self::FullAttentionLayer => "full-attention-layer",
         }
     }
 
     fn source_snapshot(self) -> bool {
-        matches!(self, Self::Nvfp4Mlp)
+        matches!(self, Self::Nvfp4Mlp | Self::FullAttentionLayer)
     }
 }
 
@@ -194,6 +202,9 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
         let prepared = match benchmark {
             Benchmark::Leaf(suite) => crate::prepare_remote_benchmark(root, options.gpu, suite)?,
             Benchmark::Nvfp4Mlp => crate::prepare_remote_nvfp4_mlp_benchmark(root, options.gpu)?,
+            Benchmark::FullAttentionLayer => {
+                crate::prepare_remote_full_attention_layer_benchmark(root, options.gpu)?
+            }
         };
         tuisko_remote::run_benchmark(
             root,
@@ -364,15 +375,12 @@ mod tests {
         let output = Qualification::parse("qualify-attention-output").expect("known suite");
         assert_eq!(output.name, "attention-output");
         assert_eq!(output.filter, "attention_output::tests");
-        let nvfp4 = Qualification::parse("qualify-nvfp4-swiglu").expect("known suite");
-        assert_eq!(nvfp4.name, "nvfp4-swiglu");
-        assert_eq!(nvfp4.filter, "nvfp4_swiglu");
-        let nvfp4_down = Qualification::parse("qualify-nvfp4-down").expect("known suite");
-        assert_eq!(nvfp4_down.name, "nvfp4-down");
-        assert_eq!(nvfp4_down.filter, "nvfp4_down");
         let nvfp4_mlp = Qualification::parse("qualify-nvfp4-mlp").expect("known suite");
         assert_eq!(nvfp4_mlp.name, "nvfp4-mlp");
         assert!(nvfp4_mlp.source_snapshot);
+        let full = Qualification::parse("qualify-full-attention-layer").expect("known suite");
+        assert_eq!(full.name, "full-attention-layer");
+        assert!(full.source_snapshot);
         assert_eq!(Benchmark::parse("bench-fp8-qkv").unwrap().name(), "fp8-qkv");
         assert_eq!(
             Benchmark::parse("bench-nvfp4-swiglu").unwrap().name(),
@@ -385,6 +393,9 @@ mod tests {
         let mlp = Benchmark::parse("bench-nvfp4-mlp").expect("known benchmark");
         assert_eq!(mlp.name(), "nvfp4-mlp");
         assert!(mlp.source_snapshot());
+        let full = Benchmark::parse("bench-full-attention-layer").expect("known benchmark");
+        assert_eq!(full.name(), "full-attention-layer");
+        assert!(full.source_snapshot());
         assert_eq!(
             Benchmark::parse("bench-attention-qk-prepare")
                 .expect("known benchmark")

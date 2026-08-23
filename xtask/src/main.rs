@@ -1557,6 +1557,27 @@ pub(crate) fn prepare_remote_nvfp4_mlp_benchmark(
     )
 }
 
+/// Locates the composed full-attention benchmark and binds every launched leaf resource.
+#[cfg(feature = "remote")]
+pub(crate) fn prepare_remote_full_attention_layer_benchmark(
+    root: &Path,
+    gpu: gpu_target::GpuTarget,
+) -> Result<RemoteBenchmark, Box<dyn Error>> {
+    prepare_remote_benchmark_with_baselines(
+        root,
+        gpu,
+        &[
+            RESIDUAL_NORM_RESOURCE_BASELINE,
+            FP8_QKV_RESOURCE_BASELINE,
+            ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+            PAGED_GQA_RESOURCE_BASELINE,
+            ATTENTION_OUTPUT_RESOURCE_BASELINE,
+            FP8_SWIGLU_RESOURCE_BASELINE,
+            FP8_DOWN_RESOURCE_BASELINE,
+        ],
+    )
+}
+
 fn prepare_remote_benchmark_with_baselines(
     root: &Path,
     gpu: gpu_target::GpuTarget,
