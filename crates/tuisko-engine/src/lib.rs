@@ -69,8 +69,9 @@ pub use qwen35_resident_model::{
 pub use qwen35_text_endpoint::Qwen35TextEndpointProgram;
 pub use qwen35_text_endpoint_layout::Qwen35TextEndpointLayout;
 pub use resident_generation::{
-    ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentBatchGenerator,
-    ResidentCancellation, ResidentGenerationSession, ResidentRequestId, ResidentTextGenerator,
+    Qwen35ResidentGenerationSession, Qwen35ResidentTextGenerator, ResidentBatchAdmission,
+    ResidentBatchEvent, ResidentBatchEvents, ResidentBatchGenerator, ResidentCancellation,
+    ResidentGenerationSession, ResidentRequestId, ResidentTextGenerator,
 };
 pub use resident_model_layout::{
     ResidentDecodeRoute, ResidentLayerKind, ResidentLoadMode, ResidentLoadPhase,
