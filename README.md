@@ -91,8 +91,10 @@ input norm, QKV, Q/K preparation and cache append, paged GQA, gated output proje
 residual seams at the same exact widths. Its prefill graphs own separate from-empty causal metadata,
 the shared 24-page cache row, P4 macro partials, and stable MLP tensor maps. The source-native
 dense-FP8 GDN Q/K/V/Z input projection separately admits the same four prefill widths through
-64x64 E4M3 MMA tiles. GDN prepare, recurrence, output, layer composition, and resident/server
-routing remain separate slices, so these routes do not yet change server priming.
+64x64 E4M3 MMA tiles. GDN control and width-4 causal-convolution preparation admits the same
+widths, retaining one mapped history row and publishing its final three represented values only
+after every parallel convolution reader completes. GDN recurrence, output, layer composition, and
+resident/server routing remain separate slices, so these routes do not yet change server priming.
 
 ## Current device slice
 

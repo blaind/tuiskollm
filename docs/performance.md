@@ -10,8 +10,8 @@ widths, GDN Q/K/V/Z input projection at exact `B=1..8` and `T=32,64,128,1024`, t
 full-vocabulary FP8 LM head at exact `B=1..8`,
 dense-FP8 gate/up SwiGLU at exact
 `B=1..8` and `T=32,64,128,1024`, dense-FP8 down at exact `B=1..8` and `T=32,64,128,1024`, GDN
-control/convolution at exact `B=1..8`, and the GDN recurrence and source-native output projection
-at exact `B=1..8`, plus the source-backed
+control/convolution at exact `B=1..8` and `T=32,64,128,1024`, and the GDN recurrence and
+source-native output projection at exact `B=1..8`, plus the source-backed
 dense-FP8 MLP at exact `B=1..8` and `T=32,64,128,1024`, complete layer-60 GDN, and final-norm plus
 LM-head owners. NVFP4 gate/up SwiGLU
 uses the exact retained A16 and W4A4 decode schedules at `B=1..8`; NVFP4 down projection consumes
@@ -166,7 +166,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-qkv` | Check Qwen3.5 fused Q/gate, K, and V represented values with three weight-scale divisors at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-attention-output` | Check Qwen3.5 sigmoid gating, BF16 projection seam, represented NVFP4 output, immutable inputs, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-attention-qk-prepare` | Check Qwen3.5 Q/K zero-centered normalization, three-axis MRoPE, represented BF16 cache append, and graph replay at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-gdn-prepare` | Check the two control formulas, mapped width-4 convolution/history updates, and graph replay at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-gdn-prepare` | Check the two control formulas, mapped width-4 convolution/history updates, immutable seams, stable ownership, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-gdn-recurrence` | Check mapped FP32 state transitions, gated normalization, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-gdn-output` | Check dynamic E4M3 quantization, source-native output projection, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-attention-qk-prepare` | Check Q/K zero-centered normalization, three-axis MRoPE, represented E4M3 cache append, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
@@ -182,7 +182,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-resident-generation SNAPSHOT` | Check pinned vLLM next-token fixtures plus frontend, greedy control, streaming decode, stable ownership, and zero post-warmup device allocation | terminal |
 | `cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT` | Compare compact mixed-length scheduling with sequential requests, including every B=1..8 route, noncontiguous survivor replay, cancellation, exact retained-prefix reuse, divergence fallback, slot recycling, stable ownership, and zero post-warmup device allocation | terminal |
 | `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
-| `cargo run -p xtask -- bench-gdn-prepare` | Measure every exact control-plus-convolution graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-gdn-prepare` | Measure every exact control-plus-convolution graph after an untimed exact-history restore | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-recurrence` | Measure every exact stateful recurrence graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-output` | Measure every exact output quantize-plus-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-qk-prepare` | Measure every exact Q/K prepare and cache-append graph | terminal or `--json PATH` |
@@ -467,9 +467,13 @@ compared with a cold long-context model result that shares a route name.
 The residual-norm `B=1..8`, FP8-QKV `B=1..8`, FP8-GDN-input `B=1..8`, FP8-LM-head, dense-FP8-SwiGLU `B=1..8`,
 dense-FP8-down, NVFP4-SwiGLU, and NVFP4-down cases are `operator/decode`, warm-cache, CUDA-Graph
 workloads. They set batch and active tokens to the exact batch. FP8-QKV `T=16` is an
-`operator/mtp` case; residual norm, FP8-QKV, and FP8-GDN-input `T=32,64,128,1024` routes are
+`operator/mtp` case; residual norm, FP8-QKV, FP8-GDN-input, and GDN-prepare
+`T=32,64,128,1024` routes are
 `operator/prefill` cases. Both projection T=32 routes read a padded 64-row activation-code tile,
 and their logical-byte accounting includes those immutable padding reads.
+GDN-prepare samples restore the exact mapped history outside the timed interval; the timed graph
+contains only the production control, parallel causal-convolution, and ordered history-publication
+launches.
 Paged GQA `B=1..8` cases are `operator/decode` at context 130. Its shared `T=32,64,128` cases are
 `operator/prefill`; token `i` attends a two-token prefix plus the causal span through `i`. Logical
 bytes charge each K/V tile once per adjacent-token/KV-head group rather than duplicating its six
@@ -697,8 +701,8 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 
 - Decode operator coverage is exact `B=1..8`; prefill remains limited to the explicitly listed
   residual norm, FP8-QKV, Q/K preparation/cache-append, shared early-context, partitioned deep-tail
-  and macro paged-GQA, attention-output, dense-FP8 MLP, full-attention-layer, and FP8-GDN-input
-  routes. GDN prepare, recurrence, output, layer composition, and resident integration still need
+  and macro paged-GQA, attention-output, dense-FP8 MLP, full-attention-layer, FP8-GDN-input, and
+  GDN-prepare routes. GDN recurrence, output, layer composition, and resident integration still need
   complete routes before the server can stop priming through decode.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
 - There is no full-server TTFT, inter-token-latency, concurrency, prefix-reuse, or end-to-end MTP

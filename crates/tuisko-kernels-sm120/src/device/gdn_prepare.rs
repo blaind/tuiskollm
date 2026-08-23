@@ -140,3 +140,87 @@ pub(crate) unsafe fn gdn_convolution<A: Arch, const TOKENS: usize>(
         *output.add(token * A::GDN_QKV_ROWS + channel) = tcgen05::f32_to_bf16_rne(activated);
     }
 }
+
+#[inline(always)]
+unsafe fn projected_channel<A: Arch>(projected: *const u16, token: usize, channel: usize) -> u16 {
+    unsafe { *projected.add(token * A::GDN_INPUT_ROWS + channel) }
+}
+
+#[inline(always)]
+pub(crate) unsafe fn gdn_convolution_prefill<A: Arch, const TOKENS: usize>(
+    projected: *const u16,
+    weights: *const u16,
+    state_rows: *const u32,
+    history: *const u16,
+    output: *mut u16,
+) {
+    const HISTORY: usize = 3;
+
+    let index = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+    if index >= TOKENS * A::GDN_QKV_ROWS {
+        return;
+    }
+
+    let token = index / A::GDN_QKV_ROWS;
+    let channel = index - token * A::GDN_QKV_ROWS;
+    let state_row = unsafe { *state_rows as usize };
+    let history = unsafe { history.add((state_row * A::GDN_QKV_ROWS + channel) * HISTORY) };
+    let current = unsafe { projected_channel::<A>(projected, token, channel) };
+    let h0 = if token >= 3 {
+        unsafe { projected_channel::<A>(projected, token - 3, channel) }
+    } else {
+        unsafe { *history.add(token) }
+    };
+    let h1 = if token >= 2 {
+        unsafe { projected_channel::<A>(projected, token - 2, channel) }
+    } else {
+        unsafe { *history.add(token + 1) }
+    };
+    let h2 = if token >= 1 {
+        unsafe { projected_channel::<A>(projected, token - 1, channel) }
+    } else {
+        unsafe { *history.add(2) }
+    };
+
+    let weights = unsafe { weights.add(channel * A::LINEAR_CONV_KERNEL_DIM) };
+    let sum = float::fma_rn_f32(
+        unsafe { bf16(weights) },
+        bf16_bits(h0),
+        float::fma_rn_f32(
+            unsafe { bf16(weights.add(1)) },
+            bf16_bits(h1),
+            float::fma_rn_f32(
+                unsafe { bf16(weights.add(2)) },
+                bf16_bits(h2),
+                unsafe { bf16(weights.add(3)) } * bf16_bits(current),
+            ),
+        ),
+    );
+    let activated = sum * sigmoid(sum);
+
+    unsafe {
+        *output.add(token * A::GDN_QKV_ROWS + channel) = tcgen05::f32_to_bf16_rne(activated);
+    }
+}
+
+#[inline(always)]
+pub(crate) unsafe fn gdn_convolution_prefill_history<A: Arch, const TOKENS: usize>(
+    projected: *const u16,
+    state_rows: *const u32,
+    history: *mut u16,
+) {
+    const HISTORY: usize = 3;
+
+    let channel = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+    if channel >= A::GDN_QKV_ROWS {
+        return;
+    }
+
+    let state_row = unsafe { *state_rows as usize };
+    let history = unsafe { history.add((state_row * A::GDN_QKV_ROWS + channel) * HISTORY) };
+    unsafe {
+        *history = projected_channel::<A>(projected, TOKENS - 3, channel);
+        *history.add(1) = projected_channel::<A>(projected, TOKENS - 2, channel);
+        *history.add(2) = projected_channel::<A>(projected, TOKENS - 1, channel);
+    }
+}

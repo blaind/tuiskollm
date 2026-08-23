@@ -3,22 +3,24 @@
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
     DeviceBenchmarkOptions, DeviceBenchmarkReport, ExactDeviceCase, MemoryRecorder,
-    OperationAccounting, RepeatedGraph, finish_report, generator_baseline_sha256, measure_cases,
-    preflight, require_current_process_exclusive, warmup_launches,
+    OperationAccounting, finish_report, generator_baseline_sha256, measure_cases, preflight,
+    require_current_process_exclusive, warmup_launches,
 };
 use crate::fp8_projection_oracle::f32_to_bf16;
 use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
-    GpuTimer,
+    GpuTimer, PinnedHostBuffer,
 };
 use tuisko_kernels_sm120::GdnPrepareOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, MAX_BATCH, 32, 64, 128, MAX_ROWS];
 const ALIGNMENT: usize = 256;
 const HISTORY_TAPS: usize = 3;
-const STATE_ROWS: [u32; MAX_BATCH] = [7, 0, 5, 2, 6, 1, 4, 3];
+const STATE_ROWS: [u32; MAX_BATCH] = [0, 1, 2, 3, 4, 5, 6, 7];
 const VALUES: [f32; 8] = [
     0.25, -0.125, 0.0625, -0.03125, 0.1875, -0.09375, 0.046875, 0.0,
 ];
@@ -53,9 +55,9 @@ struct Addresses {
 }
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
+    preparation: CudaGraph,
     leaf: CudaGraph,
-    repeated: CudaGraph,
 }
 
 struct Session {
@@ -64,12 +66,13 @@ struct Session {
     _op: GdnPrepareOp,
     arena: DeviceArena,
     regions: Regions,
+    _history_seed: PinnedHostBuffer<u16>,
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
 }
 
 impl Session {
-    fn new(repeated_operations: u64) -> Result<Self, DeviceBenchmarkError> {
+    fn new() -> Result<Self, DeviceBenchmarkError> {
         let context = CudaContext::new(0).map_err(GpuError::from)?;
         let capability = context.compute_capability().map_err(GpuError::from)?;
         if capability != (12, 0) {
@@ -81,12 +84,25 @@ impl Session {
         let stream = context.new_stream().map_err(GpuError::from)?;
         let (layout, regions) = layout()?;
         let arena = DeviceArena::zeroed(&stream, &layout)?;
-        load_fixture(&arena, &stream, regions)?;
+        let history = load_fixture(&arena, &stream, regions)?;
+        let history_seed =
+            PinnedHostBuffer::from_slice(&context, &history).map_err(GpuError::from)?;
         stream.synchronize().map_err(GpuError::from)?;
         let op = GdnPrepareOp::new(&context)?;
         let addresses = addresses(&arena, regions)?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| capture_route(&op, &stream, &addresses, batch, repeated_operations))
+        let routes = EXACT_ROUTES
+            .into_iter()
+            .map(|rows| {
+                capture_route(
+                    &op,
+                    &stream,
+                    &arena,
+                    regions,
+                    &history_seed,
+                    &addresses,
+                    rows,
+                )
+            })
             .collect::<GpuResult<Vec<_>>>()?;
         let timer = GpuTimer::new(&context)?;
 
@@ -96,6 +112,7 @@ impl Session {
             _op: op,
             arena,
             regions,
+            _history_seed: history_seed,
             stream,
             _context: context,
         })
@@ -104,28 +121,37 @@ impl Session {
     fn warm(&self, launches: u64) -> GpuResult<()> {
         for _ in 0..launches {
             for route in &self.routes {
+                route.preparation.launch(&self.stream)?;
                 route.leaf.launch(&self.stream)?;
             }
         }
         self.stream.synchronize().map_err(GpuError::from)
     }
 
-    fn cases(&self, repeated_operations: u64) -> Vec<ExactDeviceCase<'_>> {
+    fn cases(&self) -> Vec<ExactDeviceCase<'_>> {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     "gdn_prepare/control_convolution",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
                     &route.leaf,
-                    Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
+                    None,
                 )
+                .with_preparation(&route.preparation)
             })
             .collect()
     }
@@ -136,27 +162,51 @@ impl Session {
             + self.regions.dt_bias.byte_len()
             + self.regions.convolution_weights.byte_len()
     }
+
+    fn workspace_bytes(&self) -> usize {
+        self.regions.payload_bytes() - self.weight_bytes()
+    }
+
+    fn padding_bytes(&self) -> usize {
+        self.arena.byte_len() - self.regions.payload_bytes()
+    }
+}
+
+impl Regions {
+    fn payload_bytes(self) -> usize {
+        self.input.byte_len()
+            + self.control_weights.byte_len()
+            + self.a_log.byte_len()
+            + self.dt_bias.byte_len()
+            + self.projected.byte_len()
+            + self.convolution_weights.byte_len()
+            + self.state_rows.byte_len()
+            + self.history.byte_len()
+            + self.log_decay.byte_len()
+            + self.beta.byte_len()
+            + self.convolved.byte_len()
+    }
 }
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let input = layout.reserve(MAX_BATCH * Qwen38_27B::HIDDEN, ALIGNMENT)?;
+    let input = layout.reserve(MAX_ROWS * Qwen38_27B::HIDDEN, ALIGNMENT)?;
     let control_weights = layout.reserve(
         2 * Qwen38_27B::GDN_CONTROL_ROWS * Qwen38_27B::HIDDEN,
         ALIGNMENT,
     )?;
     let a_log = layout.reserve(Qwen38_27B::GDN_CONTROL_ROWS, ALIGNMENT)?;
     let dt_bias = layout.reserve(Qwen38_27B::GDN_CONTROL_ROWS, ALIGNMENT)?;
-    let projected = layout.reserve(MAX_BATCH * Qwen38_27B::GDN_INPUT_ROWS, ALIGNMENT)?;
+    let projected = layout.reserve(MAX_ROWS * Qwen38_27B::GDN_INPUT_ROWS, ALIGNMENT)?;
     let convolution_weights = layout.reserve(Qwen38_27B::GDN_QKV_ROWS * 4, ALIGNMENT)?;
     let state_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
     let history = layout.reserve(
         MAX_BATCH * Qwen38_27B::GDN_QKV_ROWS * HISTORY_TAPS,
         ALIGNMENT,
     )?;
-    let log_decay = layout.reserve(MAX_BATCH * Qwen38_27B::GDN_CONTROL_ROWS, ALIGNMENT)?;
-    let beta = layout.reserve(MAX_BATCH * Qwen38_27B::GDN_CONTROL_ROWS, ALIGNMENT)?;
-    let convolved = layout.reserve(MAX_BATCH * Qwen38_27B::GDN_QKV_ROWS, ALIGNMENT)?;
+    let log_decay = layout.reserve(MAX_ROWS * Qwen38_27B::GDN_CONTROL_ROWS, ALIGNMENT)?;
+    let beta = layout.reserve(MAX_ROWS * Qwen38_27B::GDN_CONTROL_ROWS, ALIGNMENT)?;
+    let convolved = layout.reserve(MAX_ROWS * Qwen38_27B::GDN_QKV_ROWS, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -176,17 +226,23 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     ))
 }
 
-fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuResult<()> {
-    let input = (0..MAX_BATCH * Qwen38_27B::HIDDEN)
-        .map(|index| f32_to_bf16(VALUES[index & 7]))
+fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuResult<Vec<u16>> {
+    let input = (0..MAX_ROWS * Qwen38_27B::HIDDEN)
+        .map(|index| {
+            let token = index / Qwen38_27B::HIDDEN;
+            f32_to_bf16(VALUES[(index + token) & 7])
+        })
         .collect::<Vec<_>>();
     let control_weights = (0..2 * Qwen38_27B::GDN_CONTROL_ROWS * Qwen38_27B::HIDDEN)
         .map(|index| f32_to_bf16(VALUES[(3 * index) & 7] / 64.0))
         .collect::<Vec<_>>();
     let a_log = vec![f32_to_bf16(-2.0); Qwen38_27B::GDN_CONTROL_ROWS];
     let dt_bias = vec![f32_to_bf16(0.03125); Qwen38_27B::GDN_CONTROL_ROWS];
-    let projected = (0..MAX_BATCH * Qwen38_27B::GDN_INPUT_ROWS)
-        .map(|index| f32_to_bf16(VALUES[(5 * index) & 7]))
+    let projected = (0..MAX_ROWS * Qwen38_27B::GDN_INPUT_ROWS)
+        .map(|index| {
+            let token = index / Qwen38_27B::GDN_INPUT_ROWS;
+            f32_to_bf16(VALUES[(5 * index + token) & 7])
+        })
         .collect::<Vec<_>>();
     let convolution_weights = (0..Qwen38_27B::GDN_QKV_ROWS * 4)
         .map(|index| f32_to_bf16([0.5, -0.25, 0.125, 0.25][index & 3]))
@@ -202,7 +258,9 @@ fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> G
     arena.copy_from_host(stream, regions.projected, &projected)?;
     arena.copy_from_host(stream, regions.convolution_weights, &convolution_weights)?;
     arena.copy_from_host(stream, regions.state_rows, &STATE_ROWS)?;
-    arena.copy_from_host(stream, regions.history, &history)
+    arena.copy_from_host(stream, regions.history, &history)?;
+
+    Ok(history)
 }
 
 fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<Addresses> {
@@ -224,22 +282,32 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<Addresses> {
 fn capture_route(
     op: &GdnPrepareOp,
     stream: &CudaStream,
+    arena: &DeviceArena,
+    regions: Regions,
+    history_seed: &PinnedHostBuffer<u16>,
     addresses: &Addresses,
-    batch: usize,
-    repeated_operations: u64,
+    rows: usize,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, batch))?;
-    let repeated = CudaGraph::capture(stream, || {
-        for _ in 0..repeated_operations {
-            launch(op, stream, addresses, batch)?;
+    let state_rows = if rows <= MAX_BATCH { rows } else { 1 };
+    let history_values = state_rows * Qwen38_27B::GDN_QKV_ROWS * HISTORY_TAPS;
+    let preparation = CudaGraph::capture(stream, || {
+        // SAFETY: the pinned seed remains immutable and owned by Session through
+        // every replay; both source and destination cover `history_values`.
+        unsafe {
+            arena.copy_prefix_from_pinned_host_async(
+                stream,
+                regions.history,
+                history_seed,
+                history_values,
+            )
         }
-        Ok(())
     })?;
+    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows))?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
+        preparation,
         leaf,
-        repeated,
     })
 }
 
@@ -247,14 +315,14 @@ fn launch(
     op: &GdnPrepareOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     // SAFETY: pointers cover aligned maximum-batch regions and all mapped state
     // rows are below the eight-row history capacity.
     unsafe {
         op.launch(
             stream,
-            batch,
+            rows,
             addresses.input,
             addresses.control_weights,
             addresses.a_log,
@@ -270,21 +338,22 @@ fn launch(
     }
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(rows: usize) -> usize {
     let hidden = Qwen38_27B::HIDDEN;
     let controls = Qwen38_27B::GDN_CONTROL_ROWS;
     let qkv = Qwen38_27B::GDN_QKV_ROWS;
     let weights = 2 * controls * hidden * size_of::<u16>()
         + 2 * controls * size_of::<u16>()
         + qkv * 4 * size_of::<u16>();
-    let per_token = hidden * size_of::<u16>()
-        + 2 * controls * size_of::<f32>()
-        + qkv * size_of::<u16>()
-        + size_of::<u32>()
-        + 2 * HISTORY_TAPS * qkv * size_of::<u16>()
-        + qkv * size_of::<u16>();
+    let control_per_token =
+        hidden * size_of::<u16>() + 2 * controls * size_of::<f32>() + size_of::<u32>();
+    let convolution = if rows <= MAX_BATCH {
+        rows * (8 * qkv * size_of::<u16>())
+    } else {
+        rows * (5 * qkv * size_of::<u16>()) + 6 * qkv * size_of::<u16>() + size_of::<u32>()
+    };
 
-    weights + batch * per_token
+    weights + rows * control_per_token + convolution
 }
 
 /// Measures every exact GDN prepare batch with paired host/device timings.
@@ -295,8 +364,10 @@ pub fn benchmark_gdn_prepare(
     let warmup_launches = warmup_launches(options)?;
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
-    let session = Session::new(options.launches_per_sample)?;
+    let session = Session::new()?;
     let weight_bytes = session.weight_bytes();
+    let workspace_bytes = session.workspace_bytes();
+    let padding_bytes = session.padding_bytes();
     memory.register_owned(
         "gdn_prepare/weights",
         BenchmarkMemoryKind::Weights,
@@ -306,14 +377,20 @@ pub fn benchmark_gdn_prepare(
     memory.register_owned(
         "gdn_prepare/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
-        session.arena.byte_len() - weight_bytes,
-        "max_batch=8, eight mapped history rows",
+        workspace_bytes,
+        "max_rows=1024,eight mapped history rows",
+    )?;
+    memory.register_owned(
+        "gdn_prepare/alignment_padding",
+        BenchmarkMemoryKind::Other,
+        padding_bytes,
+        "256-byte region alignment",
     )?;
     memory.capture("after_setup")?;
     session.warm(warmup_launches)?;
     memory.capture("after_warmup")?;
     require_current_process_exclusive()?;
-    let cases = session.cases(options.launches_per_sample);
+    let cases = session.cases();
     let (metrics, energy_metrics, telemetry) =
         measure_cases(&session.stream, &session.timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
@@ -322,7 +399,7 @@ pub fn benchmark_gdn_prepare(
         BenchmarkReportSpec {
             suite: "bench-gdn-prepare",
             classification: "performance_sensitive_leaf_pair",
-            timing_scope: "paired Rust submission/completion, production graph, and repeated-operation graph",
+            timing_scope: "paired Rust submission/completion and production graph after untimed exact-history restore",
         },
         preflight,
         baseline_sha256,
@@ -336,7 +413,7 @@ pub fn benchmark_gdn_prepare(
 
 #[cfg(test)]
 mod tests {
-    use super::{HISTORY_TAPS, MAX_BATCH, logical_bytes};
+    use super::{EXACT_ROUTES, MAX_BATCH, MAX_ROWS, layout, logical_bytes};
     use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
@@ -344,14 +421,41 @@ mod tests {
         let controls = Qwen38_27B::GDN_CONTROL_ROWS;
         let qkv = Qwen38_27B::GDN_QKV_ROWS;
         let weights = 2 * controls * Qwen38_27B::HIDDEN * 2 + 2 * controls * 2 + qkv * 4 * 2;
-        let per_token = Qwen38_27B::HIDDEN * 2
-            + 2 * controls * 4
-            + qkv * 2
-            + 4
-            + 2 * HISTORY_TAPS * qkv * 2
-            + qkv * 2;
+        let control_per_token = Qwen38_27B::HIDDEN * 2 + 2 * controls * 4 + 4;
+        let decode_convolution_per_token = 8 * qkv * 2;
+        let prefill_convolution_per_token = 5 * qkv * 2;
+        let publication = 6 * qkv * 2 + 4;
 
-        assert_eq!(logical_bytes(1), weights + per_token);
-        assert_eq!(logical_bytes(MAX_BATCH), weights + MAX_BATCH * per_token);
+        assert_eq!(
+            logical_bytes(1),
+            weights + control_per_token + decode_convolution_per_token
+        );
+        assert_eq!(
+            logical_bytes(MAX_BATCH),
+            weights + MAX_BATCH * (control_per_token + decode_convolution_per_token)
+        );
+        assert_eq!(
+            logical_bytes(32),
+            weights + 32 * (control_per_token + prefill_convolution_per_token) + publication
+        );
+        assert_eq!(
+            logical_bytes(MAX_ROWS),
+            weights + MAX_ROWS * (control_per_token + prefill_convolution_per_token) + publication
+        );
+    }
+
+    #[test]
+    fn benchmark_route_inventory_and_owner_accounting_are_exact() {
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
+        let (layout, regions) = layout().unwrap();
+        let weights = regions.control_weights.byte_len()
+            + regions.a_log.byte_len()
+            + regions.dt_bias.byte_len()
+            + regions.convolution_weights.byte_len();
+
+        assert_eq!(weights, 1_065_152);
+        assert_eq!(layout.byte_len(), 66_962_176);
+        assert_eq!(regions.payload_bytes(), 66_961_632);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 544);
     }
 }

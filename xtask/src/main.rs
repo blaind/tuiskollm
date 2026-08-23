@@ -5395,10 +5395,29 @@ fn gate_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("gdn_convolution_exact_TID_"))
         .collect::<Vec<_>>();
+    let prefill_control = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("gdn_control_prefill_exact_TID_"))
+        .collect::<Vec<_>>();
+    let prefill_convolution = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("gdn_convolution_prefill_exact_TID_"))
+        .collect::<Vec<_>>();
+    let prefill_history = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("gdn_convolution_prefill_history_exact_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("GDN control", control.len(), 8)?;
     require_count("GDN convolution", convolution.len(), 8)?;
+    require_count("GDN prefill control", prefill_control.len(), 4)?;
+    require_count("GDN prefill convolution", prefill_convolution.len(), 4)?;
+    require_count("GDN prefill history publication", prefill_history.len(), 4)?;
 
-    for entry in &control {
+    for entry in control.iter().chain(&prefill_control) {
         if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 512-thread/two-CTA launch bounds",
@@ -5407,7 +5426,11 @@ fn gate_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    for entry in &convolution {
+    for entry in convolution
+        .iter()
+        .chain(&prefill_convolution)
+        .chain(&prefill_history)
+    {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
@@ -5417,11 +5440,30 @@ fn gate_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let resources = &sm120_gate_artifact(root)?.resources;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    for entry in prefill_control
+        .iter()
+        .chain(&prefill_convolution)
+        .chain(&prefill_history)
+    {
+        if sass_function_body(sass, entry.name).is_none() {
+            return Err(
+                format!("cuobjdump omitted GDN prefill SASS entry `{}`", entry.name).into(),
+            );
+        }
+    }
     let mut control_registers = Vec::new();
     let mut convolution_registers = Vec::new();
+    let mut prefill_control_registers = Vec::new();
+    let mut prefill_convolution_registers = Vec::new();
+    let mut prefill_history_registers = Vec::new();
     let mut control_shared = Vec::new();
     let mut convolution_shared = Vec::new();
+    let mut prefill_control_shared = Vec::new();
+    let mut prefill_convolution_shared = Vec::new();
+    let mut prefill_history_shared = Vec::new();
 
     for entry in control {
         let resource = resources
@@ -5439,14 +5481,64 @@ fn gate_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         convolution_registers.push(resource.registers);
         convolution_shared.push(resource.shared);
     }
+    for (entries, registers, shared) in [
+        (
+            &prefill_control,
+            &mut prefill_control_registers,
+            &mut prefill_control_shared,
+        ),
+        (
+            &prefill_convolution,
+            &mut prefill_convolution_registers,
+            &mut prefill_convolution_shared,
+        ),
+        (
+            &prefill_history,
+            &mut prefill_history_registers,
+            &mut prefill_history_shared,
+        ),
+    ] {
+        for entry in entries {
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+            shared.push(resource.shared);
+        }
+    }
     control_registers.sort_unstable();
     convolution_registers.sort_unstable();
+    prefill_control_registers.sort_unstable();
+    prefill_convolution_registers.sort_unstable();
+    prefill_history_registers.sort_unstable();
     require_registers(&baseline, "control_registers", &control_registers)?;
     require_registers(&baseline, "convolution_registers", &convolution_registers)?;
+    for (key, registers) in [
+        ("prefill_control_registers", &prefill_control_registers),
+        (
+            "prefill_convolution_registers",
+            &prefill_convolution_registers,
+        ),
+        ("prefill_history_registers", &prefill_history_registers),
+    ] {
+        if baseline.contains_key(key) {
+            require_registers(&baseline, key, registers)?;
+        }
+    }
 
     println!(
-        "GDN prepare gate passed: 8 control + 8 convolution entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}",
-        control_registers, convolution_registers, control_shared, convolution_shared
+        "GDN prepare gate passed: 8 control + 8 convolution + 4 prefill control + 4 prefill convolution + 4 prefill history entries, REG {:?} / {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?} / {:?} / {:?}, SASS present",
+        control_registers,
+        convolution_registers,
+        prefill_control_registers,
+        prefill_convolution_registers,
+        prefill_history_registers,
+        control_shared,
+        convolution_shared,
+        prefill_control_shared,
+        prefill_convolution_shared,
+        prefill_history_shared,
     );
     Ok(())
 }

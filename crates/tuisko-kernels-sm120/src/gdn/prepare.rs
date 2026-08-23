@@ -1,7 +1,9 @@
 //! Exact-batch GDN control and causal-convolution preparation.
 
 use crate::Sm120Arch;
-use crate::device::gdn_prepare::{gdn_control, gdn_convolution};
+use crate::device::gdn_prepare::{
+    gdn_control, gdn_convolution, gdn_convolution_prefill, gdn_convolution_prefill_history,
+};
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -12,9 +14,14 @@ const CONTROL_WARPS: usize = 16;
 const CONTROL_THREADS: u32 = (CONTROL_WARPS * 32) as u32;
 const CONTROL_ROWS_PER_CTA: usize = CONTROL_WARPS / 2;
 const CONV_THREADS: u32 = 256;
+const PREFILL_ROWS: [usize; 4] = [32, 64, 128, 1_024];
 
 fn admitted_batch(batch: usize) -> bool {
     (1..=MAX_BATCH).contains(&batch)
+}
+
+fn admitted_rows(rows: usize) -> bool {
+    admitted_batch(rows) || PREFILL_ROWS.contains(&rows)
 }
 
 fn require_geometry<A: Arch>() -> GpuResult<()> {
@@ -23,6 +30,7 @@ fn require_geometry<A: Arch>() -> GpuResult<()> {
         || A::GDN_CONTROL_ROWS == 0
         || !(2 * A::GDN_CONTROL_ROWS).is_multiple_of(CONTROL_ROWS_PER_CTA)
         || A::GDN_QKV_ROWS == 0
+        || !A::GDN_QKV_ROWS.is_multiple_of(CONV_THREADS as usize)
         || A::LINEAR_CONV_KERNEL_DIM != 4
     {
         return Err(GpuError::invalid_launch(
@@ -75,6 +83,42 @@ mod kernels {
         }
     }
 
+    /// Computes the two control vectors for one exact prefill sequence.
+    #[kernel]
+    #[launch_bounds(512, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (512, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn gdn_control_prefill_exact<A: Arch, const TOKENS: usize>(
+        input: *const u32,
+        control_weights: *const u16,
+        a_log: *const u16,
+        dt_bias: *const u16,
+        log_decay: *mut f32,
+        beta: *mut f32,
+    ) {
+        static mut WARP_SUMS: SharedArray<f32, CONTROL_WARPS, 16> = SharedArray::UNINIT;
+        let warp_sums = core::ptr::addr_of_mut!(WARP_SUMS).cast::<f32>();
+
+        // The same two-warps-per-row reduction retains decode's represented
+        // accumulation order. T tokens expose 12*T independent CTAs.
+        unsafe {
+            gdn_control::<A, TOKENS>(
+                input,
+                control_weights,
+                a_log,
+                dt_bias,
+                log_decay,
+                beta,
+                warp_sums,
+            );
+        }
+    }
+
     /// Updates causal history and applies the represented width-4 convolution.
     #[kernel]
     #[launch_bounds(256, 2)]
@@ -97,6 +141,53 @@ mod kernels {
         // history words, preserving the scalar four-tap FMA order.
         unsafe {
             gdn_convolution::<A, TOKENS>(projected, weights, state_rows, history, output);
+        }
+    }
+
+    /// Publishes the final three represented projected values to causal history.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn gdn_convolution_prefill_history_exact<A: Arch, const TOKENS: usize>(
+        projected: *const u16,
+        state_rows: *const u32,
+        history: *mut u16,
+    ) {
+        // One thread owns all three words for one channel. Forty CTAs cover
+        // 10,240 channels after the convolution grid has finished reading history.
+        unsafe {
+            gdn_convolution_prefill_history::<A, TOKENS>(projected, state_rows, history);
+        }
+    }
+
+    /// Applies from-empty causal convolution across one exact prefill sequence.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn gdn_convolution_prefill_exact<A: Arch, const TOKENS: usize>(
+        projected: *const u16,
+        weights: *const u16,
+        state_rows: *const u32,
+        history: *const u16,
+        output: *mut u16,
+    ) {
+        // Width four makes every token an independent represented-value read
+        // from the projected sequence. Forty CTAs per token expose the complete
+        // 10,240-channel plane without racing the later history publication.
+        unsafe {
+            gdn_convolution_prefill::<A, TOKENS>(projected, weights, state_rows, history, output);
         }
     }
 }
@@ -175,7 +266,108 @@ impl<A: Arch, const TOKENS: usize> PreparedRoute<A, TOKENS> {
     }
 }
 
-/// Prepared GDN control and convolution routes for every exact decode batch.
+struct PreparedPrefillRoute<A: Arch, const TOKENS: usize> {
+    control: PreparedLaunch<kernels::__gdn_control_prefill_exact_CudaKernel<A, TOKENS>>,
+    convolution: PreparedLaunch<kernels::__gdn_convolution_prefill_exact_CudaKernel<A, TOKENS>>,
+    history: PreparedLaunch<kernels::__gdn_convolution_prefill_history_exact_CudaKernel<A, TOKENS>>,
+}
+
+impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !PREFILL_ROWS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "GDN prepare prefill route T={TOKENS} is not admitted"
+            )));
+        }
+        let control_blocks = u32::try_from(TOKENS * 2 * A::GDN_CONTROL_ROWS / CONTROL_ROWS_PER_CTA)
+            .map_err(|_| GpuError::invalid_launch("GDN prefill control grid exceeds u32"))?;
+        let convolution_blocks = u32::try_from(
+            (TOKENS * A::GDN_QKV_ROWS).div_ceil(CONV_THREADS as usize),
+        )
+        .map_err(|_| GpuError::invalid_launch("GDN prefill convolution grid exceeds u32"))?;
+        let history_blocks = u32::try_from(A::GDN_QKV_ROWS / CONV_THREADS as usize)
+            .map_err(|_| GpuError::invalid_launch("GDN prefill history grid exceeds u32"))?;
+
+        Ok(Self {
+            control: module
+                .prepare_gdn_control_prefill_exact::<A, TOKENS>(LaunchConfig1D::new(
+                    control_blocks,
+                    CONTROL_THREADS,
+                    0,
+                ))
+                .map_err(|source| GpuError::launch("preparing GDN prefill control", source))?,
+            convolution: module
+                .prepare_gdn_convolution_prefill_exact::<A, TOKENS>(LaunchConfig1D::new(
+                    convolution_blocks,
+                    CONV_THREADS,
+                    0,
+                ))
+                .map_err(|source| GpuError::launch("preparing GDN prefill convolution", source))?,
+            history: module
+                .prepare_gdn_convolution_prefill_history_exact::<A, TOKENS>(LaunchConfig1D::new(
+                    history_blocks,
+                    CONV_THREADS,
+                    0,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing GDN prefill history publication", source)
+                })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        control_weights: *const u16,
+        a_log: *const u16,
+        dt_bias: *const u16,
+        projected: *const u16,
+        convolution_weights: *const u16,
+        state_rows: *const u32,
+        history: *mut u16,
+        log_decay: *mut f32,
+        beta: *mut f32,
+        convolved: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .gdn_control_prefill_exact::<A, TOKENS>(
+                stream,
+                &self.control,
+                input.cast::<u32>(),
+                control_weights,
+                a_log,
+                dt_bias,
+                log_decay,
+                beta,
+            )
+            .map_err(|source| GpuError::launch("launching GDN prefill control", source))?;
+        module
+            .gdn_convolution_prefill_exact::<A, TOKENS>(
+                stream,
+                &self.convolution,
+                projected,
+                convolution_weights,
+                state_rows,
+                history,
+                convolved,
+            )
+            .map_err(|source| GpuError::launch("launching GDN prefill convolution", source))?;
+        module
+            .gdn_convolution_prefill_history_exact::<A, TOKENS>(
+                stream,
+                &self.history,
+                projected,
+                state_rows,
+                history,
+            )
+            .map_err(|source| GpuError::launch("launching GDN prefill history publication", source))
+    }
+}
+
+/// Prepared GDN control and convolution routes for exact decode and prefill rows.
 pub struct GdnPrepareOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
     b1: PreparedRoute<A, 1>,
@@ -186,10 +378,14 @@ pub struct GdnPrepareOp<A: Sm120Arch = Qwen38_27B> {
     b6: PreparedRoute<A, 6>,
     b7: PreparedRoute<A, 7>,
     b8: PreparedRoute<A, 8>,
+    t32: PreparedPrefillRoute<A, 32>,
+    t64: PreparedPrefillRoute<A, 64>,
+    t128: PreparedPrefillRoute<A, 128>,
+    t1024: PreparedPrefillRoute<A, 1_024>,
 }
 
 impl<A: Sm120Arch> GdnPrepareOp<A> {
-    /// Loads the embedded SM120 module and prepares every exact-batch route.
+    /// Loads the embedded SM120 module and prepares every exact route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
         require_geometry::<A>()?;
         let _ = gdn_prepare_ptx_names();
@@ -206,6 +402,10 @@ impl<A: Sm120Arch> GdnPrepareOp<A> {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
+            t1024: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -214,20 +414,21 @@ impl<A: Sm120Arch> GdnPrepareOp<A> {
     ///
     /// # Safety
     ///
-    /// Inputs cover `[batch, A::HIDDEN]` and `[batch, A::GDN_INPUT_ROWS]` BF16
+    /// Inputs cover `[rows, A::HIDDEN]` and `[rows, A::GDN_INPUT_ROWS]` BF16
     /// values. The fused control weights cover `[2 * A::GDN_CONTROL_ROWS,
     /// A::HIDDEN]`; `a_log` and `dt_bias` each cover `A::GDN_CONTROL_ROWS`;
     /// convolution weights cover `[A::GDN_QKV_ROWS, 4]`; and each state-row
-    /// index is below the caller-owned history capacity. Outputs cover
-    /// `[batch, A::GDN_CONTROL_ROWS]` FP32 controls and
-    /// `[batch, A::GDN_QKV_ROWS]` BF16 values. Allocations are aligned,
+    /// index is below the caller-owned history capacity. Prefill routes read one
+    /// state-row index and advance that row across the contiguous sequence. Outputs cover
+    /// `[rows, A::GDN_CONTROL_ROWS]` FP32 controls and
+    /// `[rows, A::GDN_QKV_ROWS]` BF16 values. Allocations are aligned,
     /// non-overlapping, live through completion, and belong to `stream`'s
     /// context.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         input: *const u16,
         control_weights: *const u16,
         a_log: *const u16,
@@ -240,9 +441,9 @@ impl<A: Sm120Arch> GdnPrepareOp<A> {
         beta: *mut f32,
         convolved: *mut u16,
     ) -> GpuResult<()> {
-        if !admitted_batch(batch) {
+        if !admitted_rows(rows) {
             return Err(GpuError::invalid_launch(format!(
-                "GDN prepare batch {batch} is outside the admitted range 1..={MAX_BATCH}"
+                "GDN prepare row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128,1024"
             )));
         }
 
@@ -268,7 +469,7 @@ impl<A: Sm120Arch> GdnPrepareOp<A> {
             };
         }
 
-        match batch {
+        match rows {
             1 => launch!(b1),
             2 => launch!(b2),
             3 => launch!(b3),
@@ -277,6 +478,10 @@ impl<A: Sm120Arch> GdnPrepareOp<A> {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
+            1_024 => launch!(t1024),
             _ => unreachable!(),
         }
     }
@@ -293,6 +498,16 @@ pub(crate) fn gdn_prepare_ptx_names() -> Vec<&'static str> {
         };
     }
 
+    macro_rules! prefill_names {
+        ($tokens:literal) => {
+            [
+                kernels::gdn_control_prefill_exact_ptx_name::<Qwen38_27B, $tokens>(),
+                kernels::gdn_convolution_prefill_exact_ptx_name::<Qwen38_27B, $tokens>(),
+                kernels::gdn_convolution_prefill_history_exact_ptx_name::<Qwen38_27B, $tokens>(),
+            ]
+        };
+    }
+
     names!(1)
         .into_iter()
         .chain(names!(2))
@@ -302,13 +517,18 @@ pub(crate) fn gdn_prepare_ptx_names() -> Vec<&'static str> {
         .chain(names!(6))
         .chain(names!(7))
         .chain(names!(8))
+        .chain(prefill_names!(32))
+        .chain(prefill_names!(64))
+        .chain(prefill_names!(128))
+        .chain(prefill_names!(1_024))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_ROWS_PER_CTA, CONTROL_THREADS, CONV_THREADS, admitted_batch, gdn_prepare_ptx_names,
+        CONTROL_ROWS_PER_CTA, CONTROL_THREADS, CONV_THREADS, admitted_batch, admitted_rows,
+        gdn_prepare_ptx_names,
     };
     use std::collections::BTreeSet;
     use tuisko_model::{Arch, Qwen38_27B};
@@ -328,6 +548,24 @@ mod tests {
     }
 
     #[test]
+    fn row_table_covers_exact_decode_and_prefill_routes() {
+        for (rows, expected) in [
+            (0, false),
+            (1, true),
+            (8, true),
+            (9, false),
+            (31, false),
+            (32, true),
+            (64, true),
+            (128, true),
+            (1_024, true),
+            (1_025, false),
+        ] {
+            assert_eq!(admitted_rows(rows), expected, "rows={rows}");
+        }
+    }
+
+    #[test]
     fn geometry_matches_the_retained_schedules() {
         assert_eq!(CONTROL_THREADS, 512);
         assert_eq!(CONV_THREADS, 256);
@@ -338,11 +576,11 @@ mod tests {
     }
 
     #[test]
-    fn ptx_inventory_has_two_entries_per_batch() {
+    fn ptx_inventory_has_decode_pairs_and_prefill_triples() {
         let names = gdn_prepare_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 28);
         assert_eq!(unique.len(), names.len());
     }
 }
