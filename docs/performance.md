@@ -3,7 +3,8 @@
 TuiskoLLM uses a custom device runner for GPU measurements and Criterion for pure host work. GPU
 results are valid only on the exact RTX 5090 target under an exclusive, recorded environment.
 
-The available device suites cover zero-centered residual/RMSNorm at exact `B=1..8`, and
+The available device suites cover zero-centered residual/RMSNorm at exact `B=1..8` and
+`T=32,64,128,1024`, and
 dynamic-quantize FP8 QKV at exact `B=1..8`, `T=16` MTP, and `T=32,64,128,1024` prefill widths,
 GDN Q/K/V/Z input projection at exact `B=1..8`, the full-vocabulary FP8 LM head at exact `B=1..8`,
 dense-FP8 gate/up SwiGLU at exact
@@ -456,10 +457,11 @@ Unused dimensions are `null`, not zero. A comparison refuses when any workload d
 inventory differs. This prevents, for example, a warm short-context operator result from being
 compared with a cold long-context model result that shares a route name.
 
-The residual-norm, FP8-QKV `B=1..8`, FP8-GDN-input, FP8-LM-head, dense-FP8-SwiGLU `B=1..8`,
+The residual-norm `B=1..8`, FP8-QKV `B=1..8`, FP8-GDN-input, FP8-LM-head, dense-FP8-SwiGLU `B=1..8`,
 dense-FP8-down, NVFP4-SwiGLU, and NVFP4-down cases are `operator/decode`, warm-cache, CUDA-Graph
 workloads. They set batch and active tokens to the exact batch. FP8-QKV `T=16` is an
-`operator/mtp` case; its `T=32,64,128,1024` routes are `operator/prefill` cases. The T=32
+`operator/mtp` case; residual norm and FP8-QKV `T=32,64,128,1024` routes are `operator/prefill`
+cases. The QKV T=32
 projection reads a padded 64-row activation-code tile, and its logical-byte accounting includes
 those immutable padding reads.
 Paged GQA `B=1..8` cases are `operator/decode` at context 130. Its shared `T=32,64,128` cases are
@@ -686,9 +688,9 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 ## Current limitations
 
 - Decode operator coverage is exact `B=1..8`; prefill remains limited to the explicitly listed
-  FP8-QKV, Q/K preparation/cache-append, shared early-context and partitioned deep-tail paged-GQA,
-  and dense-FP8 SwiGLU routes. Macro attention, output, MLP, and GDN prefill need complete routes
-  before the resident program can stop priming through decode.
+  residual norm, FP8-QKV, Q/K preparation/cache-append, shared early-context, partitioned deep-tail
+  and macro paged-GQA, attention-output, and dense-FP8 SwiGLU routes. MLP and GDN prefill still need
+  complete routes before the resident program can stop priming through decode.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
 - There is no full-server TTFT, inter-token-latency, concurrency, prefix-reuse, or end-to-end MTP
   benchmark in this repository yet. Direct long-context operator and resident-model timing exists.

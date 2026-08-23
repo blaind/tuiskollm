@@ -139,6 +139,8 @@ mod resident_model_benchmark;
 mod residual_norm;
 mod residual_norm_benchmark;
 #[cfg(feature = "device")]
+mod residual_norm_prefill;
+#[cfg(feature = "device")]
 mod startup_benchmark;
 #[cfg(feature = "device")]
 mod startup_h2d;
@@ -332,6 +334,11 @@ pub use residual_norm::{
 #[cfg(feature = "device")]
 pub use residual_norm_benchmark::benchmark_qwen35_residual_norm;
 pub use residual_norm_benchmark::benchmark_residual_norm;
+#[cfg(feature = "device")]
+pub use residual_norm_prefill::{
+    ResidualNormPrefillQualification, ResidualNormPrefillQualificationError,
+    qualify_residual_norm_prefill,
+};
 #[cfg(feature = "device")]
 pub use startup_benchmark::run_startup_benchmark_cli;
 #[cfg(feature = "device")]

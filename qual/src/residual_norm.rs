@@ -491,14 +491,14 @@ fn check_close(
     Ok(())
 }
 
-fn f32_to_bf16(value: f32) -> u16 {
+pub(crate) fn f32_to_bf16(value: f32) -> u16 {
     let bits = value.to_bits();
     let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
 
     (rounded >> 16) as u16
 }
 
-fn bf16_to_f32(bits: u16) -> f32 {
+pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
@@ -513,7 +513,7 @@ mod tests {
     use tuisko_model::Arch;
 
     #[test]
-    fn bf16_conversion_uses_round_to_nearest_even() {
+    fn residual_norm_suite_bf16_conversion_uses_round_to_nearest_even() {
         let even_halfway = 1.0 + 0.00390625;
         let odd_halfway = bf16_to_f32(0x3f81) + 0.00390625;
 
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the GPU selected by the qualification feature"]
-    fn exact_batches_match_independent_oracles_and_graph_replay()
+    fn residual_norm_suite_decode_batches_match_independent_oracles_and_graph_replay()
     -> Result<(), ResidualNormQualificationError> {
         let report = qualify_residual_norm()?;
         let active_per_plane = (1..=MAX_BATCH).sum::<usize>() * Qwen38_27B::HIDDEN;
