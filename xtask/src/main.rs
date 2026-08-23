@@ -17,6 +17,8 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const RESIDUAL_NORM_RESOURCE_BASELINE: &str = "qual/baselines/residual-norm-sm120.txt";
+const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen35-residual-norm-sm120.txt";
 const FP8_QKV_RESOURCE_BASELINE: &str = "qual/baselines/fp8-qkv-sm120.txt";
 const FP8_GDN_INPUT_RESOURCE_BASELINE: &str = "qual/baselines/fp8-gdn-input-sm120.txt";
 const FP8_LM_HEAD_RESOURCE_BASELINE: &str = "qual/baselines/fp8-lm-head-sm120.txt";
@@ -434,6 +436,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-text-endpoint") => qualify_text_endpoint(root, &remaining),
         Some("bench-startup") => bench_startup(root, &remaining),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
+        Some("bench-qwen35-residual-norm") => bench_qwen35_residual_norm(root, &remaining),
         Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
         Some("bench-fp8-gdn-input") => bench_fp8_gdn_input(root, &remaining),
         Some("bench-fp8-lm-head") => bench_fp8_lm_head(root, &remaining),
@@ -1494,6 +1497,34 @@ fn bench_residual_norm(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     bench_suite(root, PerformanceSuite::ResidualNorm, arguments)
+}
+
+fn bench_qwen35_residual_norm(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen35-residual-norm")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(
+                    root.join(QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE),
+                )?),
+            ),
+    )
 }
 
 fn bench_fp8_qkv(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
@@ -3038,6 +3069,10 @@ pub(crate) fn gate_residual_norm_target(
 }
 
 fn gate_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
     let ptx_path = root.join(PTX);
     let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
         format!(
@@ -3122,6 +3157,9 @@ fn gate_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
     plain_registers.sort_unstable();
     residual_registers.sort_unstable();
     shared.sort_unstable();
+    require_registers(&baseline, "plain_registers", &plain_registers)?;
+    require_registers(&baseline, "residual_registers", &residual_registers)?;
+    require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
         "Qwen3.5 residual-norm gate passed: 8 plain + 8 residual entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/BF16 pack present",
