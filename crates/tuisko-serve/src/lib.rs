@@ -3,6 +3,7 @@
 mod assistant;
 mod request;
 mod response;
+mod server;
 
 pub use assistant::{
     AssistantDelta, AssistantStreamFinish, AssistantStreamParser, ParsedAssistantOutput,
@@ -10,3 +11,4 @@ pub use assistant::{
 };
 pub use request::{ChatCompletionRequest, ChatRequestError, PreparedChatRequest, SERVED_MODEL};
 pub use response::{GenerationReply, blocking_response, openai_error, streaming_response};
+pub use server::{ServerConfig, ServerError, run};

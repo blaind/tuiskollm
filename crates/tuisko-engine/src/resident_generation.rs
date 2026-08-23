@@ -246,6 +246,21 @@ impl ResidentTextGenerator {
 }
 
 impl ResidentBatchGenerator {
+    /// Opens the exact resident scheduler on device zero and refuses any non-SM120 device.
+    pub fn from_snapshot_device_zero(
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+    ) -> EngineResult<Self> {
+        let context = Arc::new(CudaContext::new(0).map_err(GpuError::from)?);
+        let capability = context.compute_capability().map_err(GpuError::from)?;
+        if capability != (12, 0) {
+            return Err(EngineError::route(format!(
+                "device zero has compute capability {}.{}, expected 12.0",
+                capability.0, capability.1
+            )));
+        }
+        Self::from_snapshot(&context, snapshot)
+    }
+
     /// Admits the pinned frontend and complete resident program for compact B=1..8 decoding.
     pub fn from_snapshot(
         context: &Arc<CudaContext>,
@@ -454,6 +469,11 @@ impl ResidentBatchGenerator {
     /// Page-locked embedding staging plus slot and compact-download logit banks.
     pub fn host_stager_bytes(&self) -> usize {
         self.program.host_stager_bytes() + self.logits.num_bytes()
+    }
+
+    /// Current short-context token capacity per physical slot.
+    pub const fn context_capacity(&self) -> usize {
+        self.program.context_capacity()
     }
 
     /// CUDA context shared by all slots, exact graphs, and pinned buffers.
