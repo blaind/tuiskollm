@@ -115,6 +115,8 @@ mod qwen35_nvfp4_swiglu;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_swiglu_benchmark;
 #[cfg(feature = "device")]
+mod qwen35_paged_gqa_benchmark;
+#[cfg(feature = "device")]
 mod resident_batch_generation;
 #[cfg(feature = "device")]
 mod resident_generation;
@@ -263,6 +265,8 @@ pub use qwen35_nvfp4_qkv_benchmark::benchmark_qwen35_nvfp4_qkv;
 pub use qwen35_nvfp4_swiglu::qualify_qwen35_nvfp4_swiglu;
 #[cfg(feature = "device")]
 pub use qwen35_nvfp4_swiglu_benchmark::benchmark_qwen35_nvfp4_swiglu;
+#[cfg(feature = "device")]
+pub use qwen35_paged_gqa_benchmark::benchmark_qwen35_paged_gqa;
 #[cfg(feature = "device")]
 pub use resident_batch_generation::{
     ResidentBatchGenerationQualification, ResidentBatchGenerationQualificationError,
