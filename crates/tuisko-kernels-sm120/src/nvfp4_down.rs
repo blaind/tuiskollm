@@ -27,6 +27,8 @@ const SCALE_TILES_PER_ROW: usize = GROUPS_PER_ROW / 4;
 // Staging each 512-value phase once removes 15 duplicate activation reads per
 // CTA while preserving both dot-product accumulation orders. Two resident
 // 256-thread CTAs fit the measured register and 9,216-byte shared footprints.
+// B=1 pairs the adjacent four-scale words owned by each row pair, reducing 16
+// scale sectors per warp/phase to eight before subgroup broadcast.
 const WARPS: usize = 8;
 const THREADS: u32 = (WARPS * 32) as u32;
 const PHASE_PACKED_PAIRS: usize = 32 * GROUP_K / 2;
@@ -153,7 +155,7 @@ mod kernels {
     }
 
     #[inline(always)]
-    unsafe fn down_body<const TOKENS: usize>(
+    unsafe fn down_body<const TOKENS: usize, const COALESCED_SCALES: bool>(
         input: *const u32,
         weight_codes: *const u32,
         weight_scales: *const u8,
@@ -187,12 +189,36 @@ mod kernels {
             thread::sync_threads();
 
             let group = phase * PHASE_GROUPS + lane;
-            // SAFETY: source validation admitted one swizzled scale per logical group.
-            let first_scale = unsafe {
-                load_u8_read_only(weight_scales.add(weight_group_scale_offset(first_row, group)))
-            };
-            let second_scale = unsafe {
-                load_u8_read_only(weight_scales.add(weight_group_scale_offset(second_row, group)))
+            let (first_scale, second_scale) = if COALESCED_SCALES {
+                let scale_lane = lane & 3;
+                let mut first_word = 0u32;
+                let mut second_word = 0u32;
+                if scale_lane == 0 {
+                    let offset = weight_scale_offset(first_row, group >> 2);
+                    // SAFETY: paired physical rows own adjacent aligned four-scale words.
+                    (first_word, second_word) =
+                        unsafe { load_u32x2_read_only(weight_scales.add(offset).cast::<u32>()) };
+                }
+                let source_lane = (lane - scale_lane) as u32;
+                first_word = warp::shuffle(first_word, source_lane);
+                second_word = warp::shuffle(second_word, source_lane);
+                let shift = scale_lane * 8;
+
+                ((first_word >> shift) as u8, (second_word >> shift) as u8)
+            } else {
+                // SAFETY: source validation admitted one swizzled scale per logical group.
+                let first = unsafe {
+                    load_u8_read_only(
+                        weight_scales.add(weight_group_scale_offset(first_row, group)),
+                    )
+                };
+                let second = unsafe {
+                    load_u8_read_only(
+                        weight_scales.add(weight_group_scale_offset(second_row, group)),
+                    )
+                };
+
+                (first, second)
             };
             let first_coefficient = e4m3_to_f32(first_scale) * weight_scale_reciprocal;
             let second_coefficient = e4m3_to_f32(second_scale) * weight_scale_reciprocal;
@@ -321,7 +347,7 @@ mod kernels {
         static mut SHARED: SharedArray<u32, SHARED_U32, 16> = SharedArray::UNINIT;
 
         unsafe {
-            down_body::<1>(
+            down_body::<1, true>(
                 input,
                 weight_codes,
                 weight_scales,
@@ -353,7 +379,7 @@ mod kernels {
         let _ = A::HIDDEN;
 
         unsafe {
-            down_body::<TOKENS>(
+            down_body::<TOKENS, false>(
                 input,
                 weight_codes,
                 weight_scales,
