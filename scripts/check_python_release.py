@@ -130,7 +130,7 @@ def check_sdist(sdist: Path, expected: str) -> None:
         f"{root}/Cargo.toml",
         f"{root}/LICENSE-APACHE",
         f"{root}/LICENSE-MIT",
-        f"{root}/docs/python.md",
+        f"{root}/python/README.md",
         f"{root}/pyproject.toml",
         f"{root}/crates/tuisko-frontend/src/lib.rs",
         f"{root}/crates/tuisko-model/src/lib.rs",

@@ -36,7 +36,7 @@ listener, owns one bounded resident scheduling queue, and refuses a different mo
 request options that the current product cannot honor.
 
 The optional `tuisko-llm` Python package exposes the admitted tokenizer and chat-template frontend.
-It does not claim an in-process inference API; see [`docs/python.md`](docs/python.md).
+It does not claim an in-process inference API; see [`python/README.md`](python/README.md).
 
 `tuisko-engine` owns the exact 64-layer resident text program: all source-native weights, 48 GDN
 history/state pairs, one shared 3,438-page E4M3 KV pool across 16 attention layers, endpoint weights,

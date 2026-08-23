@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "tuisko-llm"
 dynamic = ["version"]
 description = "Exact tokenizer and chat-template frontend for TuiskoLLM"
-readme = "docs/python.md"
+readme = "python/README.md"
 requires-python = ">=3.12"
 license = "MIT OR Apache-2.0"
 classifiers = [
