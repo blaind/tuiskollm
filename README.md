@@ -57,6 +57,10 @@ priming uses the exact B=1 decode route until optimized prefill routes are admit
 MTP generation, and prefill routes are not served yet and are rejected or remain outside the HTTP
 contract rather than silently taking another route.
 
+The standalone SM120 operator inventory also includes partitioned paged GQA through 220,000
+positions at every exact `B=1..8` route. Its resident-program integration is a later slice; its
+presence does not expand the server's current 192-token admission limit.
+
 ## Current device slice
 
 Bootstrap the pinned cuda-oxide toolchain, then build and qualify the current device slice:
@@ -71,6 +75,7 @@ cargo run -p xtask -- qualify-fp8-lm-head
 cargo run -p xtask -- qualify-nvfp4-swiglu
 cargo run -p xtask -- qualify-nvfp4-down
 cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT
+cargo run -p xtask -- qualify-long-context-paged-gqa
 cargo run -p xtask -- qualify-resident-model SNAPSHOT
 cargo run -p xtask -- qualify-resident-generation SNAPSHOT
 cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT

@@ -11,7 +11,11 @@ mod nvfp4_swiglu;
 mod residual_norm;
 
 pub use arch::Sm120Arch;
-pub use attention::{ATTENTION_PAGE_SIZE, AttentionOutputOp, AttentionQkPrepareOp, PagedGqaOp};
+pub use attention::{
+    ATTENTION_PAGE_SIZE, AttentionOutputOp, AttentionQkPrepareOp, LONG_CONTEXT_GQA_MAX_PARTITIONS,
+    LONG_CONTEXT_GQA_MAX_TOKENS, LONG_CONTEXT_GQA_PARTITION_BUCKETS,
+    LONG_CONTEXT_GQA_PARTITION_SIZE, LongContextPagedGqaOp, PagedGqaOp,
+};
 pub use fp8::{
     DenseFp8DownOp, DenseFp8SwiGluOp, FullAttentionQkvOp, GdnInputProjectionOp,
     GdnOutputProjectionOp, LmHeadOp,
