@@ -1,8 +1,11 @@
 //! Typed layout and single-allocation ownership for address-stable workspaces.
 
 use crate::{CudaStream, DeviceBuffer, DeviceCopy, GpuError, GpuResult, PinnedHostBuffer};
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::mem::{align_of, size_of, size_of_val};
+use std::ops::Range;
+use std::sync::Arc;
 
 /// A typed byte range reserved within a device arena.
 #[derive(Clone, Copy, Debug)]
@@ -116,6 +119,228 @@ impl ArenaLayout {
 pub struct DeviceArena {
     storage: DeviceBuffer<u8>,
     bytes: usize,
+}
+
+/// Uninitialized device allocation available only to checked startup writes.
+pub struct LoadingDeviceArena {
+    storage: DeviceBuffer<u8>,
+    stream: Arc<CudaStream>,
+    bytes: usize,
+    initialized: InitializationCoverage,
+}
+
+impl LoadingDeviceArena {
+    /// Allocates the storage required by `layout` without enqueueing a full-arena memset.
+    pub fn allocate(stream: &Arc<CudaStream>, layout: &ArenaLayout) -> GpuResult<Self> {
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the loading-arena CUDA context", source))?;
+        // SAFETY: this type exposes only writes until `seal` proves complete initialization and
+        // synchronizes their stream. No safe operation can read the returned storage beforehand.
+        let storage = unsafe { DeviceBuffer::uninitialized_async(stream, layout.byte_len()) }
+            .map_err(|source| {
+                GpuError::driver("allocating an uninitialized device arena", source)
+            })?;
+
+        Ok(Self {
+            storage,
+            stream: stream.clone(),
+            bytes: layout.byte_len(),
+            initialized: InitializationCoverage::new(layout.byte_len()),
+        })
+    }
+
+    /// Enqueues a byte fill over one not-yet-initialized destination range.
+    pub fn fill_async(
+        &mut self,
+        stream: &CudaStream,
+        destination: Range<usize>,
+        value: u8,
+    ) -> GpuResult<()> {
+        self.require_stream_context(stream, "filling a loading arena")?;
+        self.initialized.require_available(&destination)?;
+        let bytes = destination.end - destination.start;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let address = self.address(destination.start)?;
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the loading-arena CUDA context", source))?;
+        // SAFETY: coverage validation proved this byte range is inside the live allocation.
+        unsafe { cuda_core::memory::memset_d8_async(address, value, bytes, stream.cu_stream()) }
+            .map_err(|source| GpuError::driver("filling a loading-arena range", source))?;
+        self.initialized.record(destination);
+        Ok(())
+    }
+
+    /// Enqueues a pinned-host copy into one not-yet-initialized destination range.
+    ///
+    /// `source_offset` and the destination length select the source byte range.
+    ///
+    /// # Safety
+    ///
+    /// The selected pinned source range must remain allocated and immutable until this stream
+    /// reaches the copy. An event wait or stream synchronization must precede buffer reuse.
+    pub unsafe fn copy_from_pinned_host_async(
+        &mut self,
+        stream: &CudaStream,
+        destination: Range<usize>,
+        source: &PinnedHostBuffer<u8>,
+        source_offset: usize,
+    ) -> GpuResult<()> {
+        self.require_stream_context(stream, "copying into a loading arena")?;
+        if source.context().as_ref() != stream.context().as_ref() {
+            return Err(GpuError::context(
+                "pinned host source and loading arena must share one CUDA context",
+            ));
+        }
+        self.initialized.require_available(&destination)?;
+        let bytes = destination.end - destination.start;
+        let source_end = source_offset
+            .checked_add(bytes)
+            .ok_or_else(|| GpuError::arena("loading-arena source range overflows"))?;
+        if source_end > source.len() {
+            return Err(GpuError::arena(format!(
+                "pinned source range {source_offset}..{source_end} exceeds {} bytes",
+                source.len()
+            )));
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+        let address = self.address(destination.start)?;
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the loading-arena CUDA context", source))?;
+        // SAFETY: the caller retains the pinned bytes; both checked ranges cover `bytes`.
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                address,
+                source.as_ptr().add(source_offset),
+                bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|source| GpuError::driver("copying a pinned loading-arena range", source))?;
+        self.initialized.record(destination);
+        Ok(())
+    }
+
+    /// Synchronizes all initialization writes and exposes the complete arena to runtime owners.
+    pub fn seal(self, stream: &CudaStream) -> GpuResult<DeviceArena> {
+        self.require_stream_context(stream, "sealing a loading arena")?;
+        self.initialized.require_complete()?;
+        stream.synchronize().map_err(|source| {
+            GpuError::driver("synchronizing loading-arena initialization", source)
+        })?;
+        Ok(DeviceArena {
+            storage: self.storage,
+            bytes: self.bytes,
+        })
+    }
+
+    /// Complete allocation bytes that must be initialized before sealing.
+    pub const fn byte_len(&self) -> usize {
+        self.bytes
+    }
+
+    fn address(&self, offset: usize) -> GpuResult<u64> {
+        let offset = u64::try_from(offset).map_err(|_| {
+            GpuError::arena("loading-arena offset exceeds the device address width")
+        })?;
+        self.storage
+            .cu_deviceptr()
+            .checked_add(offset)
+            .ok_or_else(|| GpuError::arena("loading-arena device address overflows"))
+    }
+
+    fn require_stream_context(&self, stream: &CudaStream, operation: &str) -> GpuResult<()> {
+        if self.storage.context().as_ref() != stream.context().as_ref() {
+            return Err(GpuError::context(format!(
+                "{operation} requires the allocation and stream to share one CUDA context"
+            )));
+        }
+        if self.stream.cu_stream() != stream.cu_stream() {
+            return Err(GpuError::context(format!(
+                "{operation} requires the loading arena's allocation stream"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct InitializationCoverage {
+    bytes: usize,
+    ranges: BTreeMap<usize, usize>,
+}
+
+impl InitializationCoverage {
+    const fn new(bytes: usize) -> Self {
+        Self {
+            bytes,
+            ranges: BTreeMap::new(),
+        }
+    }
+
+    fn require_available(&self, range: &Range<usize>) -> GpuResult<()> {
+        if range.start > range.end || range.end > self.bytes {
+            return Err(GpuError::arena(format!(
+                "loading-arena initialization range {}..{} exceeds {} bytes",
+                range.start, range.end, self.bytes
+            )));
+        }
+        if range.is_empty() {
+            return Ok(());
+        }
+        if let Some((&start, &end)) = self.ranges.range(..=range.start).next_back()
+            && end > range.start
+        {
+            return Err(overlap_error(range, start, end));
+        }
+        if let Some((&start, &end)) = self.ranges.range(range.start..).next()
+            && start < range.end
+        {
+            return Err(overlap_error(range, start, end));
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, range: Range<usize>) {
+        if !range.is_empty() {
+            self.ranges.insert(range.start, range.end);
+        }
+    }
+
+    fn require_complete(&self) -> GpuResult<()> {
+        let mut cursor = 0;
+        for (&start, &end) in &self.ranges {
+            if start != cursor {
+                return Err(GpuError::arena(format!(
+                    "loading arena is uninitialized at {cursor}..{start}"
+                )));
+            }
+            cursor = end;
+        }
+        if cursor != self.bytes {
+            return Err(GpuError::arena(format!(
+                "loading arena is uninitialized at {cursor}..{}",
+                self.bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn overlap_error(range: &Range<usize>, start: usize, end: usize) -> GpuError {
+    GpuError::arena(format!(
+        "loading-arena initialization {}..{} overlaps {start}..{end}",
+        range.start, range.end
+    ))
 }
 
 impl DeviceArena {
@@ -526,8 +751,8 @@ impl DeviceArena {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArenaLayout, DeviceArena};
-    use crate::{CudaContext, GpuErrorCode};
+    use super::{ArenaLayout, DeviceArena, InitializationCoverage, LoadingDeviceArena};
+    use crate::{CudaContext, GpuErrorCode, PinnedHostBuffer};
 
     #[test]
     fn layout_aligns_non_overlapping_typed_regions() {
@@ -573,6 +798,65 @@ mod tests {
         assert!(zero_sized.to_string().contains("zero-sized element"));
         assert_eq!(overflow.code(), GpuErrorCode::Arena);
         assert!(overflow.to_string().contains("byte count overflows"));
+    }
+
+    #[test]
+    fn loading_coverage_accepts_one_out_of_order_write_per_byte() {
+        let mut coverage = InitializationCoverage::new(16);
+
+        for range in [8..12, 0..4, 12..16, 4..8] {
+            coverage.require_available(&range).unwrap();
+            coverage.record(range);
+        }
+
+        coverage.require_complete().unwrap();
+    }
+
+    #[test]
+    fn loading_coverage_rejects_gaps_overlaps_and_out_of_bounds() {
+        let mut coverage = InitializationCoverage::new(16);
+        coverage.require_available(&(4..12)).unwrap();
+        coverage.record(4..12);
+
+        for range in [0..5, 8..16, 12..17] {
+            let error = coverage.require_available(&range).unwrap_err();
+            assert_eq!(error.code(), GpuErrorCode::Arena);
+        }
+        let reversed = std::ops::Range { start: 14, end: 13 };
+        assert_eq!(
+            coverage.require_available(&reversed).unwrap_err().code(),
+            GpuErrorCode::Arena
+        );
+        let error = coverage.require_complete().unwrap_err();
+        assert_eq!(error.code(), GpuErrorCode::Arena);
+        assert!(error.to_string().contains("uninitialized at 0..4"));
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
+    fn loading_arena_seals_only_after_every_byte_is_initialized() {
+        let context = CudaContext::new(0).unwrap();
+        assert_eq!(context.compute_capability().unwrap(), (12, 0));
+        let stream = context.new_stream().unwrap();
+        let mut layout = ArenaLayout::new();
+        let bytes = layout.reserve::<u8>(8, 256).unwrap();
+        let mut source = PinnedHostBuffer::zeroed(&context, 4).unwrap();
+        source.as_mut_slice().copy_from_slice(&[1, 2, 3, 4]);
+        let mut loading = LoadingDeviceArena::allocate(&stream, &layout).unwrap();
+
+        loading.fill_async(&stream, 0..4, 0xa5).unwrap();
+        // SAFETY: `source` remains immutable and alive through `seal`, which synchronizes the copy.
+        unsafe {
+            loading
+                .copy_from_pinned_host_async(&stream, 4..8, &source, 0)
+                .unwrap();
+        }
+        let arena = loading.seal(&stream).unwrap();
+
+        assert_eq!(
+            arena.copy_to_host(&stream, bytes).unwrap(),
+            [0xa5, 0xa5, 0xa5, 0xa5, 1, 2, 3, 4]
+        );
     }
 
     #[test]

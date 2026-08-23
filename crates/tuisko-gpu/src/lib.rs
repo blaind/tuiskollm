@@ -7,7 +7,7 @@ mod memory;
 mod profiler;
 mod timer;
 
-pub use arena::{ArenaLayout, ArenaRegion, DeviceArena};
+pub use arena::{ArenaLayout, ArenaRegion, DeviceArena, LoadingDeviceArena};
 pub use cuda_core::{
     CudaContext, CudaEvent, CudaStream, DeviceBuffer, DeviceCopy, DriverError, LaunchConfig1D,
     LaunchConfig2D, LaunchContractError, PinnedHostBuffer, PreparedLaunch, SyncPolicy,
