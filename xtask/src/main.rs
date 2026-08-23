@@ -4886,18 +4886,46 @@ fn gate_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("fp8_down_TID_"))
         .collect::<Vec<_>>();
+    let prefill = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.name,
+                "fp8_down_mma_t32" | "fp8_down_mma_t64" | "fp8_down_mma_t128"
+            )
+        })
+        .collect::<Vec<_>>();
     let tma = entries
         .iter()
         .filter(|entry| entry.name == "fp8_down_tma_t1024")
         .collect::<Vec<_>>();
     require_count("dense-FP8 down quantization", quantize.len(), 1)?;
     require_count("dense-FP8 down projection", down.len(), 8)?;
+    require_count("dense-FP8 down tail prefill", prefill.len(), 3)?;
     require_count("dense-FP8 down TMA prefill", tma.len(), 1)?;
 
     for entry in quantize.iter().chain(&down) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in &prefill {
+        let (threads, minimum_ctas) = if entry.name == "fp8_down_mma_t32" {
+            (128, 4)
+        } else {
+            (256, 2)
+        };
+        if !entry.body.contains(&format!(".reqntid {threads}, 1, 1"))
+            || !entry
+                .body
+                .contains(&format!(".minnctapersm {minimum_ctas}"))
+        {
+            return Err(format!(
+                "entry `{}` lost its exact {threads}-thread/{minimum_ctas}-CTA launch bounds",
                 entry.name
             )
             .into());
@@ -4918,6 +4946,19 @@ fn gate_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
     let artifact = sm120_gate_artifact(root)?;
     let resources = &artifact.resources;
     let sass = artifact.sass()?;
+    for entry in &prefill {
+        let body = sass_function_body(sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        for instruction in ["QMMA.16832.F32.E4M3.E4M3", "LDGSTS"] {
+            if !body.contains(instruction) {
+                return Err(format!(
+                    "dense-FP8 down entry `{}` lost required `{instruction}` SASS",
+                    entry.name
+                )
+                .into());
+            }
+        }
+    }
     let tma_sass =
         sass_function_body(sass, tma[0].name).ok_or("cuobjdump omitted dense-FP8 down TMA SASS")?;
     for instruction in ["QMMA.16832.F32.E4M3.E4M3", "UTMALDG.2D"] {
@@ -4957,6 +4998,20 @@ fn gate_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
     require_registers(&baseline, "down_registers", &down_registers)?;
     require_uniform_value(&baseline, "down_shared_bytes", &shared)?;
 
+    let mut prefill_registers = Vec::new();
+    let mut prefill_shared = Vec::new();
+    for entry in &prefill {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        prefill_registers.push(resource.registers);
+        prefill_shared.push(resource.shared);
+    }
+    prefill_registers.sort_unstable();
+    require_registers(&baseline, "prefill_registers", &prefill_registers)?;
+    require_uniform_value(&baseline, "prefill_shared_bytes", &prefill_shared)?;
+
     let tma_resource = resources
         .get(tma[0].name)
         .ok_or("cuobjdump omitted dense-FP8 down TMA resources")?;
@@ -4965,12 +5020,14 @@ fn gate_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
     require_uniform_value(&baseline, "tma_shared_bytes", &[tma_resource.shared])?;
 
     println!(
-        "dense-FP8 down gate passed: 1 quantize + 8 decode + 1 TMA prefill entries, REG {} / {:?} / {}, STACK:0 LOCAL:0, SHARED {} / {:?} / {}, QMMA/TMA present",
+        "dense-FP8 down gate passed: 1 quantize + 8 decode + 3 tiled prefill + 1 TMA prefill entries, REG {} / {:?} / {:?} / {}, STACK:0 LOCAL:0, SHARED {} / {:?} / {:?} / {}, QMMA/LDGSTS/TMA present",
         quantize_resource.registers,
         down_registers,
+        prefill_registers,
         tma_resource.registers,
         quantize_resource.shared,
         shared,
+        prefill_shared,
         tma_resource.shared,
     );
     Ok(())

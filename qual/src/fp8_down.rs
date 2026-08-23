@@ -13,7 +13,7 @@ use tuisko_kernels_sm120::{DenseFp8DownOp, DenseFp8DownTmaMaps};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_ROWS: usize = 1_024;
-const EXACT_ROUTES: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 1_024];
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const ALIGNMENT: usize = 256;
 const INPUT_PATTERN: [f32; 16] = [
     0.875, -0.875, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0625, -0.0625, 0.03125, -0.03125, 0.0,
@@ -308,6 +308,17 @@ fn launch(
                 arena.address(regions.weight_scales)?,
                 arena.address(regions.output)?,
                 maps,
+            )
+        } else if rows > 8 {
+            op.launch_tail_prefill(
+                stream,
+                rows,
+                arena.address(regions.input)?,
+                arena.address(regions.activation_codes)?,
+                arena.address(regions.activation_scales)?,
+                arena.address(regions.weight_codes)?,
+                arena.address(regions.weight_scales)?,
+                arena.address(regions.output)?,
             )
         } else {
             op.launch(
