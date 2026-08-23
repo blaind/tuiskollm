@@ -12,7 +12,7 @@ use tuisko_engine::{ResidentLoadMode, ResidentModelProgram};
 use tuisko_gpu::{CudaContext, GpuError};
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const DEFAULT_SAMPLES: usize = 3;
 const DEFAULT_WARMUPS: usize = 1;
 const DEFAULT_REPORT: &str = "target/benchmarks/startup/loader-comparison-sm120.json";
@@ -66,6 +66,15 @@ struct StartupSample {
     compute_capability: String,
     checkpoint_admission_ms: f64,
     cuda_initialization_ms: f64,
+    layout_plan_ms: f64,
+    arena_allocation_ms: f64,
+    operator_setup_ms: f64,
+    weight_prepare_ms: f64,
+    weight_copy_ms: f64,
+    weight_load_ms: f64,
+    nonweight_init_ms: f64,
+    graph_capture_ms: f64,
+    resident_other_ms: f64,
     resident_program_ms: f64,
     checkpoint_to_ready_ms: f64,
     tensor_count: usize,
@@ -198,6 +207,42 @@ impl StartupLoaderReport {
             summarize(
                 "cuda_initialization",
                 samples.iter().map(|sample| sample.cuda_initialization_ms),
+            ),
+            summarize(
+                "layout_and_upload_plan",
+                samples.iter().map(|sample| sample.layout_plan_ms),
+            ),
+            summarize(
+                "arena_allocation",
+                samples.iter().map(|sample| sample.arena_allocation_ms),
+            ),
+            summarize(
+                "operator_setup",
+                samples.iter().map(|sample| sample.operator_setup_ms),
+            ),
+            summarize(
+                "weight_prepare_and_bind",
+                samples.iter().map(|sample| sample.weight_prepare_ms),
+            ),
+            summarize(
+                "weight_cuda_copy_calls",
+                samples.iter().map(|sample| sample.weight_copy_ms),
+            ),
+            summarize(
+                "weight_materialize_upload",
+                samples.iter().map(|sample| sample.weight_load_ms),
+            ),
+            summarize(
+                "nonweight_initialization",
+                samples.iter().map(|sample| sample.nonweight_init_ms),
+            ),
+            summarize(
+                "pointer_bind_graph_capture",
+                samples.iter().map(|sample| sample.graph_capture_ms),
+            ),
+            summarize(
+                "resident_unattributed",
+                samples.iter().map(|sample| sample.resident_other_ms),
             ),
             summarize(
                 "resident_program",
@@ -378,6 +423,28 @@ fn measure_startup(
             "resident program reported the wrong startup loader".into(),
         ));
     }
+    let load_stats = program.load_stats();
+    let resident_program_ms = milliseconds(resident_program);
+    let layout_plan_ms = nanoseconds_to_milliseconds(load_stats.layout_plan_ns());
+    let arena_allocation_ms = nanoseconds_to_milliseconds(load_stats.arena_allocation_ns());
+    let operator_setup_ms = nanoseconds_to_milliseconds(load_stats.operator_setup_ns());
+    let weight_prepare_ms = nanoseconds_to_milliseconds(load_stats.weight_prepare_ns());
+    let weight_copy_ms = nanoseconds_to_milliseconds(load_stats.weight_copy_ns());
+    let weight_load_ms = nanoseconds_to_milliseconds(load_stats.weight_load_ns());
+    let nonweight_init_ms = nanoseconds_to_milliseconds(load_stats.nonweight_init_ns());
+    let graph_capture_ms = nanoseconds_to_milliseconds(load_stats.graph_capture_ns());
+    let detailed_ms = layout_plan_ms
+        + arena_allocation_ms
+        + operator_setup_ms
+        + weight_load_ms
+        + nonweight_init_ms
+        + graph_capture_ms;
+    let resident_other_ms = resident_program_ms - detailed_ms;
+    if !resident_other_ms.is_finite() || resident_other_ms < 0.0 {
+        return Err(DeviceBenchmarkError::Precondition(format!(
+            "resident startup phases total {detailed_ms:.3} ms but the enclosing constructor measured {resident_program_ms:.3} ms"
+        )));
+    }
 
     Ok(StartupSample {
         schema_version: SCHEMA_VERSION,
@@ -388,7 +455,16 @@ fn measure_startup(
         compute_capability: format!("{}.{}", compute_capability.0, compute_capability.1),
         checkpoint_admission_ms: milliseconds(checkpoint_admission),
         cuda_initialization_ms: milliseconds(cuda_initialization),
-        resident_program_ms: milliseconds(resident_program),
+        layout_plan_ms,
+        arena_allocation_ms,
+        operator_setup_ms,
+        weight_prepare_ms,
+        weight_copy_ms,
+        weight_load_ms,
+        nonweight_init_ms,
+        graph_capture_ms,
+        resident_other_ms,
+        resident_program_ms,
         checkpoint_to_ready_ms: milliseconds(checkpoint_to_ready),
         tensor_count,
         resident_weight_bytes: program.resident_weight_bytes(),
@@ -409,6 +485,15 @@ fn validate_samples(samples: &[StartupSample]) -> Result<(), DeviceBenchmarkErro
         let timings = [
             sample.checkpoint_admission_ms,
             sample.cuda_initialization_ms,
+            sample.layout_plan_ms,
+            sample.arena_allocation_ms,
+            sample.operator_setup_ms,
+            sample.weight_prepare_ms,
+            sample.weight_copy_ms,
+            sample.weight_load_ms,
+            sample.nonweight_init_ms,
+            sample.graph_capture_ms,
+            sample.resident_other_ms,
             sample.resident_program_ms,
             sample.checkpoint_to_ready_ms,
         ];
@@ -463,6 +548,10 @@ fn percentile(sorted: &[f64], percentile: f64) -> f64 {
 
 fn milliseconds(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+fn nanoseconds_to_milliseconds(nanoseconds: u64) -> f64 {
+    nanoseconds as f64 / 1_000_000.0
 }
 
 fn process_peak_rss_bytes() -> io::Result<u64> {
