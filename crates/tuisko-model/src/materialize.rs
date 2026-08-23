@@ -5,8 +5,8 @@ use crate::bindings::{
     validate_nvfp4_scales,
 };
 use crate::{
-    CheckpointError, CheckpointResult, FullAttentionQkvBindings, MtpBindings, Nvfp4DownBindings,
-    Nvfp4GateUpBindings,
+    Bf16View, CheckpointError, CheckpointResult, F32View, FullAttentionQkvBindings,
+    ModelOptNvfp4MlpBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
 };
 
 const SCALE_TILE_ROWS: usize = 128;
@@ -245,6 +245,107 @@ pub struct MaterializedNvfp4Down<'a> {
     pub layer: usize,
 }
 
+/// Runtime-native Qwen3.5 MLP planes derived losslessly from ModelOpt NVFP4 sources.
+#[derive(Debug)]
+pub struct MaterializedModelOptNvfp4Mlp<'a> {
+    /// Fused gate/up runtime layout consumed by the qualified NVFP4 SwiGLU route.
+    pub gate_up: MaterializedNvfp4GateUp<'a>,
+    /// Down-projection runtime layout consumed by the qualified NVFP4 down route.
+    pub down: MaterializedNvfp4Down<'a>,
+    /// Exact source activation scale shared by gate and up.
+    pub gate_up_input_scale: f32,
+    /// Exact source second-stage weight scale shared by gate and up.
+    pub gate_up_weight_scale_2: f32,
+    /// Exact source down-projection activation scale.
+    pub down_input_scale: f32,
+    /// Exact source down-projection second-stage weight scale.
+    pub down_weight_scale_2: f32,
+    /// Zero-centered RMSNorm weights before the MLP.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights for the next decoder boundary.
+    pub next_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning this layout.
+    pub layer: usize,
+}
+
+impl<'a> ModelOptNvfp4MlpBindings<'a> {
+    /// Converts ModelOpt scalar conventions and swizzles block scales for the SM120 kernels.
+    pub fn materialize(self) -> CheckpointResult<MaterializedModelOptNvfp4Mlp<'a>> {
+        if self.layer >= self.layer_count {
+            return Err(CheckpointError::source_binding(format!(
+                "layer {} does not use the admitted ModelOpt NVFP4 MLP source contract",
+                self.layer
+            )));
+        }
+
+        require_same_modelopt_scale(
+            self.layer,
+            "gate/up input_scale",
+            &self.gate.input_scale,
+            &self.up.input_scale,
+        )?;
+        require_same_modelopt_scale(
+            self.layer,
+            "gate/up weight_scale_2",
+            &self.gate.weight_scale_2,
+            &self.up.weight_scale_2,
+        )?;
+
+        let gate_up_input_scale =
+            modelopt_scale(self.layer, "gate/up input_scale", &self.gate.input_scale)?;
+        let gate_up_weight_scale_2 = modelopt_scale(
+            self.layer,
+            "gate/up weight_scale_2",
+            &self.gate.weight_scale_2,
+        )?;
+        let down_input_scale =
+            modelopt_scale(self.layer, "down input_scale", &self.down.input_scale)?;
+        let down_weight_scale_2 =
+            modelopt_scale(self.layer, "down weight_scale_2", &self.down.weight_scale_2)?;
+
+        // ModelOpt exports amax / (E2M1_MAX * E4M3_MAX). The kernels take the
+        // reciprocal global divisor, so this changes convention, not represented values.
+        let gate_up = Nvfp4GateUpBindings {
+            gate_weight: self.gate.weight,
+            up_weight: self.up.weight,
+            gate_scale: self.gate.block_scale,
+            up_scale: self.up.block_scale,
+            input_scale_divisor: reciprocal_scale(
+                self.layer,
+                "gate/up input",
+                gate_up_input_scale,
+            )?,
+            weight_scale_divisor: reciprocal_scale(
+                self.layer,
+                "gate/up weight",
+                gate_up_weight_scale_2,
+            )?,
+            layer: self.layer,
+        }
+        .materialize()?;
+        let down = Nvfp4DownBindings {
+            weight: self.down.weight,
+            scale: self.down.block_scale,
+            input_scale_divisor: reciprocal_scale(self.layer, "down input", down_input_scale)?,
+            weight_scale_divisor: reciprocal_scale(self.layer, "down weight", down_weight_scale_2)?,
+            layer: self.layer,
+        }
+        .materialize()?;
+
+        Ok(MaterializedModelOptNvfp4Mlp {
+            gate_up,
+            down,
+            gate_up_input_scale,
+            gate_up_weight_scale_2,
+            down_input_scale,
+            down_weight_scale_2,
+            input_norm: self.input_norm,
+            next_norm: self.next_norm,
+            layer: self.layer,
+        })
+    }
+}
+
 impl<'a> Nvfp4DownBindings<'a> {
     /// Materializes the down-projection scale layout without requantizing source values.
     pub fn materialize(self) -> CheckpointResult<MaterializedNvfp4Down<'a>> {
@@ -279,6 +380,40 @@ impl<'a> Nvfp4DownBindings<'a> {
             layer: self.layer,
         })
     }
+}
+
+fn modelopt_scale(layer: usize, role: &str, scale: &F32View<'_, 0>) -> CheckpointResult<f32> {
+    let value = scale.value(0).expect("validated scalar has one value");
+
+    if !value.is_finite() || value <= 0.0 {
+        return Err(CheckpointError::source_binding(format!(
+            "layer-{layer} ModelOpt NVFP4 {role} must be finite and positive, observed {value}"
+        )));
+    }
+
+    Ok(value)
+}
+
+fn require_same_modelopt_scale(
+    layer: usize,
+    role: &str,
+    first: &F32View<'_, 0>,
+    second: &F32View<'_, 0>,
+) -> CheckpointResult<()> {
+    if first.bits(0) != second.bits(0) {
+        return Err(CheckpointError::source_binding(format!(
+            "layer-{layer} ModelOpt NVFP4 {role} values differ"
+        )));
+    }
+
+    Ok(())
+}
+
+fn reciprocal_scale(layer: usize, role: &str, scale: f32) -> CheckpointResult<f32> {
+    let divisor = 1.0 / scale;
+    validate_divisor(layer, role, divisor)?;
+
+    Ok(divisor)
 }
 
 fn host_shape(shape: &[u64; 2], role: &str) -> CheckpointResult<[usize; 2]> {
@@ -425,8 +560,9 @@ fn nvfp4_scale_offset(row: usize, group: usize, groups_per_row: usize) -> usize 
 mod tests {
     use super::{SCALE_TILE_GROUPS, SCALE_TILE_ROWS, swizzle_scale_planes, validate_divisor};
     use crate::{
-        Bf16View, CheckpointErrorCode, DType, Fp8E4M3View, FullAttentionQkvBindings,
-        Nvfp4DownBindings, Nvfp4GateUpBindings, TensorView, U8View,
+        Bf16View, CheckpointErrorCode, DType, F32View, Fp8E4M3View, FullAttentionQkvBindings,
+        ModelOptNvfp4LinearBindings, ModelOptNvfp4MlpBindings, Nvfp4DownBindings,
+        Nvfp4GateUpBindings, TensorView, U8View,
     };
 
     const ROWS: usize = 128;
@@ -472,6 +608,34 @@ mod tests {
                 data_range: 0..bytes.len() as u64,
             },
             *shape,
+        )
+        .unwrap()
+    }
+
+    fn bf16_vector<'a>(name: &'a str, shape: &'a [u64; 1], bytes: &'a [u8]) -> Bf16View<'a, 1> {
+        Bf16View::bind(
+            TensorView {
+                name,
+                dtype: DType::Bf16,
+                shape,
+                bytes,
+                data_range: 0..bytes.len() as u64,
+            },
+            *shape,
+        )
+        .unwrap()
+    }
+
+    fn f32_scalar_view<'a>(name: &'a str, bytes: &'a [u8; 4]) -> F32View<'a, 0> {
+        F32View::bind(
+            TensorView {
+                name,
+                dtype: DType::F32,
+                shape: &[],
+                bytes,
+                data_range: 0..4,
+            },
+            [],
         )
         .unwrap()
     }
@@ -684,6 +848,129 @@ mod tests {
         assert_eq!(materialized.weight_e2m1.as_ptr(), weight.as_ptr());
         assert_eq!((materialized.rows, materialized.columns), (128, 128));
         assert_eq!(materialized.layer, 55);
+    }
+
+    #[test]
+    fn modelopt_materialization_preserves_words_and_converts_scale_convention() {
+        let weight_shape = [ROWS as u64, PACKED_COLUMNS as u64];
+        let scale_shape = [ROWS as u64, GROUPS as u64];
+        let norm_shape = [ROWS as u64];
+        let gate_weight = vec![0x10; ROWS * PACKED_COLUMNS];
+        let up_weight = vec![0x32; ROWS * PACKED_COLUMNS];
+        let down_weight = vec![0x54; ROWS * PACKED_COLUMNS];
+        let gate_scale = scale_codes(0);
+        let up_scale = scale_codes(11);
+        let down_scale = scale_codes(23);
+        let gate_up_input = 0.25f32.to_le_bytes();
+        let gate_up_weight = 0.125f32.to_le_bytes();
+        let down_input = 0.5f32.to_le_bytes();
+        let down_weight_scale = 0.0625f32.to_le_bytes();
+        let input_norm = bf16_bytes(&[0x3f80; ROWS]);
+        let next_norm = bf16_bytes(&[0x4000; ROWS]);
+        let gate = ModelOptNvfp4LinearBindings {
+            weight: u8_view("gate", &weight_shape, &gate_weight),
+            block_scale: fp8_view("gate-scale", &scale_shape, &gate_scale),
+            input_scale: f32_scalar_view("gate-input", &gate_up_input),
+            weight_scale_2: f32_scalar_view("gate-weight", &gate_up_weight),
+            rows: ROWS,
+            columns: COLUMNS,
+        };
+        let up = ModelOptNvfp4LinearBindings {
+            weight: u8_view("up", &weight_shape, &up_weight),
+            block_scale: fp8_view("up-scale", &scale_shape, &up_scale),
+            input_scale: f32_scalar_view("up-input", &gate_up_input),
+            weight_scale_2: f32_scalar_view("up-weight", &gate_up_weight),
+            rows: ROWS,
+            columns: COLUMNS,
+        };
+        let down = ModelOptNvfp4LinearBindings {
+            weight: u8_view("down", &weight_shape, &down_weight),
+            block_scale: fp8_view("down-scale", &scale_shape, &down_scale),
+            input_scale: f32_scalar_view("down-input", &down_input),
+            weight_scale_2: f32_scalar_view("down-weight", &down_weight_scale),
+            rows: ROWS,
+            columns: COLUMNS,
+        };
+        let bindings = ModelOptNvfp4MlpBindings {
+            gate,
+            up,
+            down,
+            input_norm: bf16_vector("input-norm", &norm_shape, &input_norm),
+            next_norm: bf16_vector("next-norm", &norm_shape, &next_norm),
+            layer: 3,
+            layer_count: 32,
+        };
+
+        let route_error = ModelOptNvfp4MlpBindings {
+            layer_count: 3,
+            ..bindings
+        }
+        .materialize()
+        .unwrap_err();
+        assert_eq!(route_error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            route_error
+                .to_string()
+                .contains("does not use the admitted")
+        );
+
+        let mismatched_input = 0.75f32.to_le_bytes();
+        let scale_error = ModelOptNvfp4MlpBindings {
+            up: ModelOptNvfp4LinearBindings {
+                input_scale: f32_scalar_view("up-input", &mismatched_input),
+                ..up
+            },
+            ..bindings
+        }
+        .materialize()
+        .unwrap_err();
+        assert_eq!(scale_error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            scale_error
+                .to_string()
+                .contains("input_scale values differ")
+        );
+
+        let materialized = bindings.materialize().unwrap();
+        let gate_up_source = [gate_scale.as_slice(), up_scale.as_slice()].concat();
+
+        assert_eq!(
+            materialized.gate_up.scale_e4m3_swizzled,
+            block_scale_oracle(&gate_up_source, 2 * ROWS, GROUPS)
+        );
+        assert_eq!(
+            materialized.down.scale_e4m3_swizzled,
+            block_scale_oracle(&down_scale, ROWS, GROUPS)
+        );
+        assert_eq!(
+            materialized.gate_up.gate_weight_e2m1.as_ptr(),
+            gate_weight.as_ptr()
+        );
+        assert_eq!(
+            materialized.gate_up.up_weight_e2m1.as_ptr(),
+            up_weight.as_ptr()
+        );
+        assert_eq!(materialized.down.weight_e2m1.as_ptr(), down_weight.as_ptr());
+        assert_eq!(
+            materialized.gate_up_input_scale.to_bits(),
+            0.25f32.to_bits()
+        );
+        assert_eq!(
+            materialized.gate_up_weight_scale_2.to_bits(),
+            0.125f32.to_bits()
+        );
+        assert_eq!(materialized.down_input_scale.to_bits(), 0.5f32.to_bits());
+        assert_eq!(
+            materialized.down_weight_scale_2.to_bits(),
+            0.0625f32.to_bits()
+        );
+        assert_eq!(materialized.gate_up.input_scale_divisor, 4.0);
+        assert_eq!(materialized.gate_up.weight_scale_divisor, 8.0);
+        assert_eq!(materialized.down.input_scale_divisor, 2.0);
+        assert_eq!(materialized.down.weight_scale_divisor, 16.0);
+        assert_eq!(materialized.input_norm.word(0), Some(0x3f80));
+        assert_eq!(materialized.next_norm.word(0), Some(0x4000));
+        assert_eq!(materialized.layer, 3);
     }
 
     #[test]
