@@ -208,6 +208,30 @@ impl Qwen35TextEndpointProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Captures repeated eager routes for intrinsic endpoint timing.
+    pub fn qualification_repeated_graph(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        operations: u64,
+    ) -> EngineResult<CudaGraph> {
+        require_batch(batch)?;
+        if operations == 0 {
+            return Err(EngineError::route(
+                "repeated Qwen3.5 endpoint graph requires at least one operation",
+            ));
+        }
+        let pointers = EndpointPointers::bind(&self.arena, &self.layout)?;
+
+        Ok(CudaGraph::capture(stream, || {
+            for _ in 0..operations {
+                launch_route(stream, batch, &self.norm, &self.lm_head, pointers)?;
+            }
+            Ok(())
+        })?)
+    }
+
+    #[cfg(feature = "qualification")]
     /// Returns every checked arena address in layout order.
     pub fn qualification_addresses(&self) -> EngineResult<[usize; 5]> {
         Ok(EndpointPointers::bind(&self.arena, &self.layout)?.addresses())

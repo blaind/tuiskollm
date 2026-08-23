@@ -179,6 +179,8 @@ mod qwen35_paged_gqa_benchmark;
 #[cfg(feature = "device")]
 mod qwen35_text_endpoint;
 #[cfg(feature = "device")]
+mod qwen35_text_endpoint_benchmark;
+#[cfg(feature = "device")]
 mod resident_batch_generation;
 #[cfg(feature = "device")]
 mod resident_generation;
@@ -462,6 +464,8 @@ pub use qwen35_text_endpoint::{
     Qwen35TextEndpointQualification, Qwen35TextEndpointQualificationError,
     qualify_qwen35_text_endpoint,
 };
+#[cfg(feature = "device")]
+pub use qwen35_text_endpoint_benchmark::benchmark_qwen35_text_endpoint;
 #[cfg(feature = "device")]
 pub use resident_batch_generation::{
     ResidentBatchGenerationQualification, ResidentBatchGenerationQualificationError,
