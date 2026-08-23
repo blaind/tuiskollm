@@ -5,3 +5,7 @@ cuda_toolkit_release=13.3
 cuda_toolkit_version=13.3.73
 quantize_registers=25
 down_registers=33,53,63,66,72,80,87,94
+quantize_shared_bytes=1152
+down_shared_bytes=1024
+tma_registers=84
+tma_shared_bytes=1024
