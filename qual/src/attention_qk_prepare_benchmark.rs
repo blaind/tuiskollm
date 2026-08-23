@@ -16,15 +16,17 @@ use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, AttentionQkPrepareOp};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const MAX_TOKENS: usize = 1_024;
+const ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const ALIGNMENT: usize = 256;
 const PHYSICAL_PAGES: usize = 16;
 const TABLE_ROWS: usize = 8;
-const TABLE_STRIDE: usize = 2;
+const TABLE_STRIDE: usize = 16;
 const ROTARY_PAIRS: usize = 32;
 const KEY_SCALE: f32 = 0.03125;
 const VALUE_SCALE: f32 = 0.0625;
-const TABLE_ROW_IDS: [u32; MAX_BATCH] = [7, 0, 5, 2, 6, 1, 4, 3];
-const CACHE_POSITIONS: [u32; MAX_BATCH] = [63, 64, 1, 126, 2, 65, 127, 0];
+const DECODE_TABLE_ROWS: [u32; MAX_BATCH] = [7, 0, 5, 2, 6, 1, 4, 3];
+const DECODE_CACHE_POSITIONS: [u32; MAX_BATCH] = [63, 64, 1, 126, 2, 65, 127, 0];
 const VALUES: [f32; 8] = [
     0.5, -0.375, 0.25, -0.1875, 0.125, -0.09375, 0.0625, -0.03125,
 ];
@@ -37,8 +39,10 @@ struct Regions {
     rope_cos: ArenaRegion<f32>,
     rope_sin: ArenaRegion<f32>,
     block_tables: ArenaRegion<u32>,
-    table_rows: ArenaRegion<u32>,
-    cache_positions: ArenaRegion<u32>,
+    decode_table_rows: ArenaRegion<u32>,
+    decode_cache_positions: ArenaRegion<u32>,
+    prefill_table_rows: ArenaRegion<u32>,
+    prefill_cache_positions: ArenaRegion<u32>,
     query: ArenaRegion<f32>,
     key_pages: ArenaRegion<u8>,
     value_pages: ArenaRegion<u8>,
@@ -52,8 +56,10 @@ impl Regions {
             + self.rope_cos.byte_len()
             + self.rope_sin.byte_len()
             + self.block_tables.byte_len()
-            + self.table_rows.byte_len()
-            + self.cache_positions.byte_len()
+            + self.decode_table_rows.byte_len()
+            + self.decode_cache_positions.byte_len()
+            + self.prefill_table_rows.byte_len()
+            + self.prefill_cache_positions.byte_len()
             + self.query.byte_len()
             + self.key_pages.byte_len()
             + self.value_pages.byte_len()
@@ -75,15 +81,17 @@ struct Addresses {
     rope_cos: *const f32,
     rope_sin: *const f32,
     block_tables: *const u32,
-    table_rows: *const u32,
-    cache_positions: *const u32,
+    decode_table_rows: *const u32,
+    decode_cache_positions: *const u32,
+    prefill_table_rows: *const u32,
+    prefill_cache_positions: *const u32,
     query: *mut f32,
     key_pages: *mut u8,
     value_pages: *mut u8,
 }
 
 struct RouteGraphs {
-    batch: usize,
+    tokens: usize,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
@@ -115,8 +123,9 @@ impl Session {
         stream.synchronize().map_err(GpuError::from)?;
         let op = AttentionQkPrepareOp::new(&context)?;
         let addresses = addresses(&arena, regions)?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| capture_route(&op, &stream, &addresses, batch, repeated_operations))
+        let routes = ROUTES
+            .iter()
+            .map(|&tokens| capture_route(&op, &stream, &addresses, tokens, repeated_operations))
             .collect::<GpuResult<Vec<_>>>()?;
         let timer = GpuTimer::new(&context)?;
 
@@ -144,13 +153,24 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.tokens <= MAX_BATCH {
+                    (
+                        format!("B={}", route.tokens),
+                        BenchmarkWorkload::warm_operator_decode(route.tokens as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.tokens),
+                        BenchmarkWorkload::warm_operator_prefill(route.tokens as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     "attention_qk_prepare/norm_mrope_cache_append",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
+                    shape,
+                    workload,
                     OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
+                        logical_bytes(route.tokens),
+                        route.tokens as u64,
                         "token",
                     ),
                     &route.leaf,
@@ -163,15 +183,17 @@ impl Session {
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let qkv = layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_QKV_ROWS, ALIGNMENT)?;
+    let qkv = layout.reserve(MAX_TOKENS * Qwen38_27B::ATTENTION_QKV_ROWS, ALIGNMENT)?;
     let query_norm = layout.reserve(Qwen38_27B::HEAD_DIM, ALIGNMENT)?;
     let key_norm = layout.reserve(Qwen38_27B::HEAD_DIM, ALIGNMENT)?;
-    let rope_cos = layout.reserve(MAX_BATCH * ROTARY_PAIRS, ALIGNMENT)?;
-    let rope_sin = layout.reserve(MAX_BATCH * ROTARY_PAIRS, ALIGNMENT)?;
+    let rope_cos = layout.reserve(MAX_TOKENS * ROTARY_PAIRS, ALIGNMENT)?;
+    let rope_sin = layout.reserve(MAX_TOKENS * ROTARY_PAIRS, ALIGNMENT)?;
     let block_tables = layout.reserve(TABLE_ROWS * TABLE_STRIDE, ALIGNMENT)?;
-    let table_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
-    let cache_positions = layout.reserve(MAX_BATCH, ALIGNMENT)?;
-    let query = layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let decode_table_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
+    let decode_cache_positions = layout.reserve(MAX_BATCH, ALIGNMENT)?;
+    let prefill_table_rows = layout.reserve(MAX_TOKENS, ALIGNMENT)?;
+    let prefill_cache_positions = layout.reserve(MAX_TOKENS, ALIGNMENT)?;
+    let query = layout.reserve(MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
     let plane_bytes =
         PHYSICAL_PAGES * Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM;
     let key_pages = layout.reserve(plane_bytes, ALIGNMENT)?;
@@ -186,8 +208,10 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
             rope_cos,
             rope_sin,
             block_tables,
-            table_rows,
-            cache_positions,
+            decode_table_rows,
+            decode_cache_positions,
+            prefill_table_rows,
+            prefill_cache_positions,
             query,
             key_pages,
             value_pages,
@@ -196,7 +220,7 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
 }
 
 fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuResult<()> {
-    let qkv = (0..MAX_BATCH * Qwen38_27B::ATTENTION_QKV_ROWS)
+    let qkv = (0..MAX_TOKENS * Qwen38_27B::ATTENTION_QKV_ROWS)
         .map(|index| f32_to_bf16(VALUES[(index + index / Qwen38_27B::ATTENTION_QKV_ROWS) & 7]))
         .collect::<Vec<_>>();
     let query_norm = (0..Qwen38_27B::HEAD_DIM)
@@ -205,18 +229,22 @@ fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> G
     let key_norm = (0..Qwen38_27B::HEAD_DIM)
         .map(|index| f32_to_bf16(VALUES[(index + 5) & 7] * 0.25))
         .collect::<Vec<_>>();
-    let mut rope_cos = vec![0.0f32; MAX_BATCH * ROTARY_PAIRS];
-    let mut rope_sin = vec![0.0f32; MAX_BATCH * ROTARY_PAIRS];
-    for token in 0..MAX_BATCH {
+    let mut rope_cos = vec![0.0f32; MAX_TOKENS * ROTARY_PAIRS];
+    let mut rope_sin = vec![0.0f32; MAX_TOKENS * ROTARY_PAIRS];
+    for token in 0..MAX_TOKENS {
         for pair in 0..ROTARY_PAIRS {
             let angle = (token * 3 + pair) as f32 / 128.0;
             rope_cos[token * ROTARY_PAIRS + pair] = angle.cos();
             rope_sin[token * ROTARY_PAIRS + pair] = angle.sin();
         }
     }
-    let block_tables = (0..TABLE_ROWS * TABLE_STRIDE)
-        .map(|page| page as u32)
+    let block_tables = (0..TABLE_ROWS)
+        .flat_map(|row| {
+            (0..TABLE_STRIDE).map(move |page| ((2 * row + page) % PHYSICAL_PAGES) as u32)
+        })
         .collect::<Vec<_>>();
+    let prefill_table_rows = vec![0u32; MAX_TOKENS];
+    let prefill_cache_positions = (0..MAX_TOKENS as u32).collect::<Vec<_>>();
 
     arena.copy_from_host(stream, regions.qkv, &qkv)?;
     arena.copy_from_host(stream, regions.query_norm, &query_norm)?;
@@ -224,8 +252,18 @@ fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> G
     arena.copy_from_host(stream, regions.rope_cos, &rope_cos)?;
     arena.copy_from_host(stream, regions.rope_sin, &rope_sin)?;
     arena.copy_from_host(stream, regions.block_tables, &block_tables)?;
-    arena.copy_from_host(stream, regions.table_rows, &TABLE_ROW_IDS)?;
-    arena.copy_from_host(stream, regions.cache_positions, &CACHE_POSITIONS)
+    arena.copy_from_host(stream, regions.decode_table_rows, &DECODE_TABLE_ROWS)?;
+    arena.copy_from_host(
+        stream,
+        regions.decode_cache_positions,
+        &DECODE_CACHE_POSITIONS,
+    )?;
+    arena.copy_from_host(stream, regions.prefill_table_rows, &prefill_table_rows)?;
+    arena.copy_from_host(
+        stream,
+        regions.prefill_cache_positions,
+        &prefill_cache_positions,
+    )
 }
 
 fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<Addresses> {
@@ -236,8 +274,10 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<Addresses> {
         rope_cos: arena.address(regions.rope_cos)?,
         rope_sin: arena.address(regions.rope_sin)?,
         block_tables: arena.address(regions.block_tables)?,
-        table_rows: arena.address(regions.table_rows)?,
-        cache_positions: arena.address(regions.cache_positions)?,
+        decode_table_rows: arena.address(regions.decode_table_rows)?,
+        decode_cache_positions: arena.address(regions.decode_cache_positions)?,
+        prefill_table_rows: arena.address(regions.prefill_table_rows)?,
+        prefill_cache_positions: arena.address(regions.prefill_cache_positions)?,
         query: arena.address(regions.query)?,
         key_pages: arena.address(regions.key_pages)?,
         value_pages: arena.address(regions.value_pages)?,
@@ -248,19 +288,19 @@ fn capture_route(
     op: &AttentionQkPrepareOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    tokens: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, batch))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, tokens))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, batch)?;
+            launch(op, stream, addresses, tokens)?;
         }
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        tokens,
         leaf,
         repeated,
     })
@@ -270,23 +310,34 @@ fn launch(
     op: &AttentionQkPrepareOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    tokens: usize,
 ) -> GpuResult<()> {
-    // SAFETY: all pointers cover maximum-batch regions and metadata selects
-    // valid table rows, logical pages, and sixteen resident physical pages.
+    let (table_rows, cache_positions) = if tokens <= MAX_BATCH {
+        (
+            addresses.decode_table_rows,
+            addresses.decode_cache_positions,
+        )
+    } else {
+        (
+            addresses.prefill_table_rows,
+            addresses.prefill_cache_positions,
+        )
+    };
+    // SAFETY: pointers cover the maximum route and the selected metadata plane
+    // names valid table rows, logical pages, and sixteen resident pages.
     unsafe {
         op.launch(
             stream,
-            batch,
+            tokens,
             addresses.qkv,
             addresses.query_norm,
             addresses.key_norm,
             addresses.rope_cos,
             addresses.rope_sin,
             addresses.block_tables,
-            addresses.table_rows,
+            table_rows,
             TABLE_STRIDE,
-            addresses.cache_positions,
+            cache_positions,
             addresses.query,
             addresses.key_pages,
             addresses.value_pages,
@@ -296,7 +347,7 @@ fn launch(
     }
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(tokens: usize) -> usize {
     let heads = Qwen38_27B::NUM_ATTENTION_HEADS + Qwen38_27B::NUM_KV_HEADS;
     let source_values = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS + 2 * Qwen38_27B::ATTENTION_KV_ROWS;
     let norm_values = heads * Qwen38_27B::HEAD_DIM;
@@ -310,10 +361,10 @@ fn logical_bytes(batch: usize) -> usize {
         + query_output
         + cache_output;
 
-    batch * per_token
+    tokens * per_token
 }
 
-/// Measures every exact attention Q/K preparation batch.
+/// Measures every exact attention Q/K preparation decode and prefill route.
 pub fn benchmark_attention_qk_prepare(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
@@ -342,7 +393,7 @@ pub fn benchmark_attention_qk_prepare(
         "attention_qk_prepare/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         workspace_bytes,
-        "max_batch=8 QKV, rotary, page metadata, and prepared query",
+        "max_tokens=1024 QKV, rotary, separate compact-decode/contiguous-prefill metadata, and prepared query",
     )?;
     memory.register_owned(
         "attention_qk_prepare/alignment_padding",
@@ -377,7 +428,7 @@ pub fn benchmark_attention_qk_prepare(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, layout, logical_bytes};
+    use super::{MAX_TOKENS, ROUTES, layout, logical_bytes};
     use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
@@ -393,14 +444,17 @@ mod tests {
             + 2 * Qwen38_27B::ATTENTION_KV_ROWS;
 
         assert_eq!(logical_bytes(1), per_token);
-        assert_eq!(logical_bytes(MAX_BATCH), MAX_BATCH * per_token);
+        for tokens in ROUTES {
+            assert_eq!(logical_bytes(tokens), tokens * per_token);
+        }
     }
 
     #[test]
     fn arena_accounting_exposes_every_padding_byte() {
         let (layout, regions) = layout().unwrap();
-        assert_eq!(layout.byte_len(), 2_526_976);
-        assert_eq!(regions.payload_bytes(), 2_526_336);
-        assert_eq!(layout.byte_len() - regions.payload_bytes(), 640);
+        assert_eq!(layout.byte_len(), 56_895_488);
+        assert_eq!(regions.payload_bytes(), 56_895_040);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 448);
+        assert_eq!(MAX_TOKENS, 1_024);
     }
 }

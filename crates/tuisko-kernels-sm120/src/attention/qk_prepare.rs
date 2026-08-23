@@ -11,11 +11,16 @@ use tuisko_model::{Arch, Qwen38_27B};
 pub const ATTENTION_PAGE_SIZE: usize = 64;
 
 const MAX_BATCH: usize = 8;
+const PREFILL_TOKENS: [usize; 4] = [32, 64, 128, 1_024];
 const WARPS_PER_CTA: usize = 8;
 const THREADS: u32 = (WARPS_PER_CTA * 32) as u32;
 
 fn admitted_batch(batch: usize) -> bool {
     (1..=MAX_BATCH).contains(&batch)
+}
+
+fn admitted_tokens(tokens: usize) -> bool {
+    admitted_batch(tokens) || PREFILL_TOKENS.contains(&tokens)
 }
 
 fn require_geometry<A: Arch>() -> GpuResult<()> {
@@ -70,6 +75,56 @@ mod kernels {
         // One warp owns one complete 256-wide head. Eight heads per CTA gives
         // 28 CTAs at B=8, enough to occupy the target while keeping each
         // normalization reduction and its 64-wide MRoPE exchange warp-local.
+        unsafe {
+            attention_qk_prepare::<A, TOKENS>(
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+                key_scale,
+                value_scale,
+            );
+        }
+    }
+
+    /// Prepares Q/K and appends K/V for one exact prefill width.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn attention_qk_prepare_prefill_exact<A: Arch, const TOKENS: usize>(
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u8,
+        value_pages: *mut u8,
+        key_scale: f32,
+        value_scale: f32,
+    ) {
+        // Eight complete heads per CTA retains the warp-local 256-value
+        // normalization/MRoPE seam. T=32 already supplies 112 CTAs and T=1024
+        // supplies 3,584, so a wider cooperative tile would only add exchange.
         unsafe {
             attention_qk_prepare::<A, TOKENS>(
                 qkv,
@@ -154,7 +209,73 @@ impl<A: Arch, const TOKENS: usize> PreparedRoute<A, TOKENS> {
     }
 }
 
-/// Prepared Q/K normalization, MRoPE, and KV-cache append routes for `B=1..8`.
+struct PreparedPrefillRoute<A: Arch, const TOKENS: usize> {
+    prepare: PreparedLaunch<kernels::__attention_qk_prepare_prefill_exact_CudaKernel<A, TOKENS>>,
+}
+
+impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let blocks = u32::try_from(
+            (TOKENS * (A::NUM_ATTENTION_HEADS + A::NUM_KV_HEADS)).div_ceil(WARPS_PER_CTA),
+        )
+        .map_err(|_| GpuError::invalid_launch("attention Q/K prefill grid exceeds u32"))?;
+
+        Ok(Self {
+            prepare: module
+                .prepare_attention_qk_prepare_prefill_exact::<A, TOKENS>(LaunchConfig1D::new(
+                    blocks, THREADS, 0,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing attention Q/K prefill route", source)
+                })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u8,
+        value_pages: *mut u8,
+        key_scale: f32,
+        value_scale: f32,
+    ) -> GpuResult<()> {
+        module
+            .attention_qk_prepare_prefill_exact::<A, TOKENS>(
+                stream,
+                &self.prepare,
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+                key_scale,
+                value_scale,
+            )
+            .map_err(|source| GpuError::launch("launching attention Q/K prefill", source))
+    }
+}
+
+/// Prepared Q/K normalization, MRoPE, and KV-cache append routes for exact
+/// `B=1..8` decode and `T=32,64,128,1024` prefill widths.
 pub struct AttentionQkPrepareOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
     b1: PreparedRoute<A, 1>,
@@ -165,6 +286,10 @@ pub struct AttentionQkPrepareOp<A: Sm120Arch = Qwen38_27B> {
     b6: PreparedRoute<A, 6>,
     b7: PreparedRoute<A, 7>,
     b8: PreparedRoute<A, 8>,
+    t32: PreparedPrefillRoute<A, 32>,
+    t64: PreparedPrefillRoute<A, 64>,
+    t128: PreparedPrefillRoute<A, 128>,
+    t1024: PreparedPrefillRoute<A, 1_024>,
 }
 
 impl<A: Sm120Arch> AttentionQkPrepareOp<A> {
@@ -185,6 +310,10 @@ impl<A: Sm120Arch> AttentionQkPrepareOp<A> {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
+            t1024: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -193,11 +322,11 @@ impl<A: Sm120Arch> AttentionQkPrepareOp<A> {
     ///
     /// # Safety
     ///
-    /// `qkv` covers `[batch, A::ATTENTION_QKV_ROWS]` BF16 values in the fused
+    /// `qkv` covers `[tokens, A::ATTENTION_QKV_ROWS]` BF16 values in the fused
     /// query/gate, key, value order. Norms cover `A::HEAD_DIM`; rotary planes
-    /// cover `[batch, 32]`; metadata covers `batch`; and the block-table row
+    /// cover `[tokens, 32]`; metadata covers `tokens`; and the block-table row
     /// selected for each token covers its cache position. Query covers
-    /// `[batch, 24, 256]` FP32 values. Cache planes use page-major
+    /// `[tokens, 24, 256]` FP32 values. Cache planes use page-major
     /// `[physical_page, 4, 64, 256]` bytes and cover every selected page.
     /// Allocations are aligned, non-overlapping, live through completion, and
     /// belong to `stream`'s context.
@@ -205,7 +334,7 @@ impl<A: Sm120Arch> AttentionQkPrepareOp<A> {
     pub unsafe fn launch(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        tokens: usize,
         qkv: *const u16,
         query_norm: *const u16,
         key_norm: *const u16,
@@ -221,9 +350,9 @@ impl<A: Sm120Arch> AttentionQkPrepareOp<A> {
         key_scale: f32,
         value_scale: f32,
     ) -> GpuResult<()> {
-        if !admitted_batch(batch) {
+        if !admitted_tokens(tokens) {
             return Err(GpuError::invalid_launch(format!(
-                "attention Q/K prepare batch {batch} is outside the admitted range 1..={MAX_BATCH}"
+                "attention Q/K prepare tokens {tokens} must be one of 1..={MAX_BATCH},32,64,128,1024"
             )));
         }
         let table_stride = u32::try_from(table_stride).map_err(|_| {
@@ -270,7 +399,7 @@ impl<A: Sm120Arch> AttentionQkPrepareOp<A> {
             };
         }
 
-        match batch {
+        match tokens {
             1 => launch!(b1),
             2 => launch!(b2),
             3 => launch!(b3),
@@ -279,6 +408,10 @@ impl<A: Sm120Arch> AttentionQkPrepareOp<A> {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
+            1_024 => launch!(t1024),
             _ => unreachable!(),
         }
     }
@@ -295,35 +428,44 @@ pub(crate) fn attention_qk_prepare_ptx_names() -> Vec<&'static str> {
         kernels::attention_qk_prepare_exact_ptx_name::<Qwen38_27B, 6>(),
         kernels::attention_qk_prepare_exact_ptx_name::<Qwen38_27B, 7>(),
         kernels::attention_qk_prepare_exact_ptx_name::<Qwen38_27B, 8>(),
+        kernels::attention_qk_prepare_prefill_exact_ptx_name::<Qwen38_27B, 32>(),
+        kernels::attention_qk_prepare_prefill_exact_ptx_name::<Qwen38_27B, 64>(),
+        kernels::attention_qk_prepare_prefill_exact_ptx_name::<Qwen38_27B, 128>(),
+        kernels::attention_qk_prepare_prefill_exact_ptx_name::<Qwen38_27B, 1_024>(),
     ]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{THREADS, admitted_batch, attention_qk_prepare_ptx_names};
+    use super::{THREADS, admitted_tokens, attention_qk_prepare_ptx_names};
     use std::collections::BTreeSet;
 
     #[test]
-    fn batch_table_covers_only_exact_decode_routes() {
-        for (batch, expected) in [
+    fn route_table_covers_only_exact_decode_and_prefill_widths() {
+        for (tokens, expected) in [
             (0, false),
             (1, true),
             (4, true),
             (8, true),
             (9, false),
-            (128, false),
+            (16, false),
+            (32, true),
+            (64, true),
+            (128, true),
+            (1_024, true),
+            (1_025, false),
         ] {
-            assert_eq!(admitted_batch(batch), expected, "batch={batch}");
+            assert_eq!(admitted_tokens(tokens), expected, "tokens={tokens}");
         }
         assert_eq!(THREADS, 256);
     }
 
     #[test]
-    fn ptx_inventory_has_one_entry_per_batch() {
+    fn ptx_inventory_has_one_entry_per_exact_route() {
         let names = attention_qk_prepare_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 12);
         assert_eq!(unique.len(), names.len());
     }
 }

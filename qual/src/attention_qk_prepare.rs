@@ -12,16 +12,18 @@ use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, AttentionQkPrepareOp};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const MAX_TOKENS: usize = 1_024;
+const ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const ALIGNMENT: usize = 256;
 const PHYSICAL_PAGES: usize = 16;
 const TABLE_ROWS: usize = 8;
-const TABLE_STRIDE: usize = 2;
+const TABLE_STRIDE: usize = 16;
 const ROTARY_DIM: usize = 64;
 const ROTARY_PAIRS: usize = ROTARY_DIM / 2;
 const KEY_SCALE: f32 = 0.03125;
 const VALUE_SCALE: f32 = 0.0625;
-const TABLE_ROW_IDS: [u32; MAX_BATCH] = [7, 0, 5, 2, 6, 1, 4, 3];
-const CACHE_POSITIONS: [u32; MAX_BATCH] = [63, 64, 1, 126, 2, 65, 127, 0];
+const DECODE_TABLE_ROWS: [u32; MAX_BATCH] = [7, 0, 5, 2, 6, 1, 4, 3];
+const DECODE_CACHE_POSITIONS: [u32; MAX_BATCH] = [63, 64, 1, 126, 2, 65, 127, 0];
 const INPUT_PATTERN: [f32; 16] = [
     0.5, -0.375, 0.25, -0.1875, 0.125, -0.09375, 0.0625, -0.03125, -0.5, 0.375, -0.25, 0.1875,
     -0.125, 0.09375, -0.0625, 0.03125,
@@ -44,7 +46,7 @@ pub enum AttentionQkPrepareQualificationError {
     Mismatch(String),
 }
 
-/// Observable counts and worst errors across every exact decode route.
+/// Observable counts and worst errors across every exact decode and prefill route.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AttentionQkPrepareQualification {
     /// Active FP32 query values compared with the independent formula.
@@ -73,8 +75,10 @@ struct Regions {
     rope_cos: ArenaRegion<f32>,
     rope_sin: ArenaRegion<f32>,
     block_tables: ArenaRegion<u32>,
-    table_rows: ArenaRegion<u32>,
-    cache_positions: ArenaRegion<u32>,
+    decode_table_rows: ArenaRegion<u32>,
+    decode_cache_positions: ArenaRegion<u32>,
+    prefill_table_rows: ArenaRegion<u32>,
+    prefill_cache_positions: ArenaRegion<u32>,
     query: ArenaRegion<f32>,
     key_pages: ArenaRegion<u8>,
     value_pages: ArenaRegion<u8>,
@@ -88,8 +92,10 @@ impl Regions {
             + self.rope_cos.byte_len()
             + self.rope_sin.byte_len()
             + self.block_tables.byte_len()
-            + self.table_rows.byte_len()
-            + self.cache_positions.byte_len()
+            + self.decode_table_rows.byte_len()
+            + self.decode_cache_positions.byte_len()
+            + self.prefill_table_rows.byte_len()
+            + self.prefill_cache_positions.byte_len()
             + self.query.byte_len()
             + self.key_pages.byte_len()
             + self.value_pages.byte_len()
@@ -103,6 +109,8 @@ struct Fixture {
     rope_cos: Vec<f32>,
     rope_sin: Vec<f32>,
     block_tables: Vec<u32>,
+    prefill_table_rows: Vec<u32>,
+    prefill_cache_positions: Vec<u32>,
 }
 
 struct Observed {
@@ -111,7 +119,8 @@ struct Observed {
     value_pages: Vec<u8>,
 }
 
-/// Qualifies eager and captured Q/K preparation routes at exact `B=1..=8`.
+/// Qualifies eager and captured Q/K preparation routes at exact `B=1..=8`
+/// and `T=32,64,128,1024`.
 pub fn qualify_attention_qk_prepare()
 -> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
     let _preflight = device_benchmark::preflight()?;
@@ -142,24 +151,24 @@ pub fn qualify_attention_qk_prepare()
         maximum_query_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
+    for &tokens in &ROUTES {
         reset_outputs(&arena, &stream, regions)?;
-        launch(&op, &arena, &stream, regions, batch)?;
+        launch(&op, &arena, &stream, regions, tokens)?;
         let eager = observe(&arena, &stream, regions)?;
-        verify_oracle(batch, &fixture, &eager, &mut report)?;
+        verify_oracle(tokens, &fixture, &eager, &mut report)?;
         verify_inputs(&arena, &stream, regions, &fixture, &mut report)?;
 
         reset_outputs(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
+        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, tokens))?;
         graph.launch(&stream)?;
         let replay = observe(&arena, &stream, regions)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay(tokens, &eager, &replay, &mut report)?;
         verify_inputs(&arena, &stream, regions, &fixture, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(AttentionQkPrepareQualificationError::Mismatch(format!(
-                "device addresses changed while qualifying B={batch}"
+                "device addresses changed while qualifying tokens={tokens}"
             )));
         }
     }
@@ -177,8 +186,9 @@ fn verify_no_post_warmup_allocation(
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
 ) -> Result<(), AttentionQkPrepareQualificationError> {
-    let graphs = (1..=MAX_BATCH)
-        .map(|batch| CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch)))
+    let graphs = ROUTES
+        .iter()
+        .map(|&tokens| CudaGraph::capture(stream, || launch(op, arena, stream, regions, tokens)))
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
         graph.launch(stream)?;
@@ -186,8 +196,8 @@ fn verify_no_post_warmup_allocation(
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
-        for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
-            graphs[batch - 1].launch(stream)?;
+        for &route in &[0usize, 11, 7, 8, 3, 10, 1, 9, 6, 2, 5, 4] {
+            graphs[route].launch(stream)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -203,15 +213,17 @@ fn verify_no_post_warmup_allocation(
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let qkv = layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_QKV_ROWS, ALIGNMENT)?;
+    let qkv = layout.reserve(MAX_TOKENS * Qwen38_27B::ATTENTION_QKV_ROWS, ALIGNMENT)?;
     let query_norm = layout.reserve(Qwen38_27B::HEAD_DIM, ALIGNMENT)?;
     let key_norm = layout.reserve(Qwen38_27B::HEAD_DIM, ALIGNMENT)?;
-    let rope_cos = layout.reserve(MAX_BATCH * ROTARY_PAIRS, ALIGNMENT)?;
-    let rope_sin = layout.reserve(MAX_BATCH * ROTARY_PAIRS, ALIGNMENT)?;
+    let rope_cos = layout.reserve(MAX_TOKENS * ROTARY_PAIRS, ALIGNMENT)?;
+    let rope_sin = layout.reserve(MAX_TOKENS * ROTARY_PAIRS, ALIGNMENT)?;
     let block_tables = layout.reserve(TABLE_ROWS * TABLE_STRIDE, ALIGNMENT)?;
-    let table_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
-    let cache_positions = layout.reserve(MAX_BATCH, ALIGNMENT)?;
-    let query = layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let decode_table_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
+    let decode_cache_positions = layout.reserve(MAX_BATCH, ALIGNMENT)?;
+    let prefill_table_rows = layout.reserve(MAX_TOKENS, ALIGNMENT)?;
+    let prefill_cache_positions = layout.reserve(MAX_TOKENS, ALIGNMENT)?;
+    let query = layout.reserve(MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
     let plane_bytes =
         PHYSICAL_PAGES * Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM;
     let key_pages = layout.reserve(plane_bytes, ALIGNMENT)?;
@@ -226,8 +238,10 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
             rope_cos,
             rope_sin,
             block_tables,
-            table_rows,
-            cache_positions,
+            decode_table_rows,
+            decode_cache_positions,
+            prefill_table_rows,
+            prefill_cache_positions,
             query,
             key_pages,
             value_pages,
@@ -236,10 +250,11 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
 }
 
 fn fixture() -> Fixture {
-    let qkv = (0..MAX_BATCH * Qwen38_27B::ATTENTION_QKV_ROWS)
+    let qkv = (0..MAX_TOKENS * Qwen38_27B::ATTENTION_QKV_ROWS)
         .map(|index| {
             let token = index / Qwen38_27B::ATTENTION_QKV_ROWS;
-            f32_to_bf16(INPUT_PATTERN[(index + 3 * token) & 15] * (1.0 - token as f32 / 16.0))
+            let factor = 1.0 - (token & 7) as f32 / 16.0;
+            f32_to_bf16(INPUT_PATTERN[(index + 3 * token) & 15] * factor)
         })
         .collect();
     let query_norm = (0..Qwen38_27B::HEAD_DIM)
@@ -248,11 +263,12 @@ fn fixture() -> Fixture {
     let key_norm = (0..Qwen38_27B::HEAD_DIM)
         .map(|index| f32_to_bf16(NORM_PATTERN[(index + 5) & 7]))
         .collect();
-    let positions = [
-        [0u32, 1, 63, 64, 127, 128, 511, 512],
-        [0u32, 2, 17, 33, 49, 65, 81, 97],
-        [0u32, 3, 19, 35, 51, 67, 83, 99],
-    ];
+    let mut positions = [[0u32; MAX_TOKENS]; 3];
+    for token in 0..MAX_TOKENS {
+        positions[0][token] = token as u32;
+        positions[1][token] = (3 * token + 17) as u32;
+        positions[2][token] = (5 * token + 29) as u32;
+    }
     let (rope_cos, rope_sin) = make_mrope_coefficients(&positions);
 
     Fixture {
@@ -261,16 +277,20 @@ fn fixture() -> Fixture {
         key_norm,
         rope_cos,
         rope_sin,
-        block_tables: (0..TABLE_ROWS * TABLE_STRIDE)
-            .map(|page| page as u32)
+        block_tables: (0..TABLE_ROWS)
+            .flat_map(|row| {
+                (0..TABLE_STRIDE).map(move |page| ((2 * row + page) % PHYSICAL_PAGES) as u32)
+            })
             .collect(),
+        prefill_table_rows: vec![0; MAX_TOKENS],
+        prefill_cache_positions: (0..MAX_TOKENS as u32).collect(),
     }
 }
 
-fn make_mrope_coefficients(positions: &[[u32; MAX_BATCH]; 3]) -> (Vec<f32>, Vec<f32>) {
-    let mut cosine = vec![0.0f32; MAX_BATCH * ROTARY_PAIRS];
-    let mut sine = vec![0.0f32; MAX_BATCH * ROTARY_PAIRS];
-    for token in 0..MAX_BATCH {
+fn make_mrope_coefficients(positions: &[[u32; MAX_TOKENS]; 3]) -> (Vec<f32>, Vec<f32>) {
+    let mut cosine = vec![0.0f32; MAX_TOKENS * ROTARY_PAIRS];
+    let mut sine = vec![0.0f32; MAX_TOKENS * ROTARY_PAIRS];
+    for token in 0..MAX_TOKENS {
         for pair in 0..ROTARY_PAIRS {
             // Consecutive pairs cycle temporal/height/width, yielding the
             // checkpoint's exact 32-pair [11, 11, 10] MRoPE partition.
@@ -296,8 +316,22 @@ fn load_fixture(
     arena.copy_from_host(stream, regions.rope_cos, &fixture.rope_cos)?;
     arena.copy_from_host(stream, regions.rope_sin, &fixture.rope_sin)?;
     arena.copy_from_host(stream, regions.block_tables, &fixture.block_tables)?;
-    arena.copy_from_host(stream, regions.table_rows, &TABLE_ROW_IDS)?;
-    arena.copy_from_host(stream, regions.cache_positions, &CACHE_POSITIONS)
+    arena.copy_from_host(stream, regions.decode_table_rows, &DECODE_TABLE_ROWS)?;
+    arena.copy_from_host(
+        stream,
+        regions.decode_cache_positions,
+        &DECODE_CACHE_POSITIONS,
+    )?;
+    arena.copy_from_host(
+        stream,
+        regions.prefill_table_rows,
+        &fixture.prefill_table_rows,
+    )?;
+    arena.copy_from_host(
+        stream,
+        regions.prefill_cache_positions,
+        &fixture.prefill_cache_positions,
+    )
 }
 
 fn reset_outputs(
@@ -310,7 +344,7 @@ fn reset_outputs(
     arena.fill(stream, regions.value_pages, BYTE_SENTINEL)
 }
 
-fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 11]> {
+fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 13]> {
     Ok([
         arena.address(regions.qkv)?.addr(),
         arena.address(regions.query_norm)?.addr(),
@@ -318,8 +352,10 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 11]> {
         arena.address(regions.rope_cos)?.addr(),
         arena.address(regions.rope_sin)?.addr(),
         arena.address(regions.block_tables)?.addr(),
-        arena.address(regions.table_rows)?.addr(),
-        arena.address(regions.cache_positions)?.addr(),
+        arena.address(regions.decode_table_rows)?.addr(),
+        arena.address(regions.decode_cache_positions)?.addr(),
+        arena.address(regions.prefill_table_rows)?.addr(),
+        arena.address(regions.prefill_cache_positions)?.addr(),
         arena.address(regions.query)?.addr(),
         arena.address(regions.key_pages)?.addr(),
         arena.address(regions.value_pages)?.addr(),
@@ -331,23 +367,34 @@ fn launch(
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
-    batch: usize,
+    tokens: usize,
 ) -> GpuResult<()> {
-    // SAFETY: all regions cover the maximum batch, metadata selects valid
-    // table rows/pages, and both cache planes own all sixteen physical pages.
+    let (table_rows, cache_positions) = if tokens <= MAX_BATCH {
+        (
+            arena.address(regions.decode_table_rows)?,
+            arena.address(regions.decode_cache_positions)?,
+        )
+    } else {
+        (
+            arena.address(regions.prefill_table_rows)?,
+            arena.address(regions.prefill_cache_positions)?,
+        )
+    };
+    // SAFETY: all regions cover the maximum width, route-specific metadata
+    // selects resident pages, and both cache planes own all sixteen pages.
     unsafe {
         op.launch(
             stream,
-            batch,
+            tokens,
             arena.address(regions.qkv)?,
             arena.address(regions.query_norm)?,
             arena.address(regions.key_norm)?,
             arena.address(regions.rope_cos)?,
             arena.address(regions.rope_sin)?,
             arena.address(regions.block_tables)?,
-            arena.address(regions.table_rows)?,
+            table_rows,
             TABLE_STRIDE,
-            arena.address(regions.cache_positions)?,
+            cache_positions,
             arena.address(regions.query)?,
             arena.address(regions.key_pages)?,
             arena.address(regions.value_pages)?,
@@ -370,13 +417,13 @@ fn observe(
 }
 
 fn verify_oracle(
-    batch: usize,
+    tokens: usize,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut AttentionQkPrepareQualification,
 ) -> Result<(), AttentionQkPrepareQualificationError> {
-    let (query, key_pages, value_pages) = oracle(batch, fixture)?;
-    let active_query = batch * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
+    let (query, key_pages, value_pages) = oracle(tokens, fixture)?;
+    let active_query = tokens * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
     for (index, (&actual, &expected)) in observed.query[..active_query]
         .iter()
         .zip(&query[..active_query])
@@ -387,22 +434,22 @@ fn verify_oracle(
         let tolerance = 0.002f32.max(expected.abs() * 0.003);
         if !actual.is_finite() || error > tolerance {
             return Err(AttentionQkPrepareQualificationError::Mismatch(format!(
-                "query at B={batch}, index={index}: device={actual}, oracle={expected}, tolerance={tolerance}"
+                "query at tokens={tokens}, index={index}: device={actual}, oracle={expected}, tolerance={tolerance}"
             )));
         }
     }
     for (index, value) in observed.query[active_query..].iter().enumerate() {
         if value.to_bits() != F32_SENTINEL_BITS {
             return Err(AttentionQkPrepareQualificationError::Mismatch(format!(
-                "B={batch} modified inactive query word {}",
+                "tokens={tokens} modified inactive query word {}",
                 active_query + index
             )));
         }
     }
-    compare_cache(batch, "key", &observed.key_pages, &key_pages)?;
-    compare_cache(batch, "value", &observed.value_pages, &value_pages)?;
+    compare_cache(tokens, "key", &observed.key_pages, &key_pages)?;
+    compare_cache(tokens, "value", &observed.value_pages, &value_pages)?;
 
-    let appended = batch * 2 * Qwen38_27B::ATTENTION_KV_ROWS;
+    let appended = tokens * 2 * Qwen38_27B::ATTENTION_KV_ROWS;
     report.query_values += active_query;
     report.appended_cache_codes += appended;
     report.untouched_values +=
@@ -413,7 +460,7 @@ fn verify_oracle(
 }
 
 fn compare_cache(
-    batch: usize,
+    tokens: usize,
     name: &str,
     actual: &[u8],
     expected: &[u8],
@@ -424,7 +471,7 @@ fn compare_cache(
         .position(|(actual, expected)| actual != expected)
     {
         return Err(AttentionQkPrepareQualificationError::Mismatch(format!(
-            "{name} cache at B={batch}, byte={index}: device={:#04x}, oracle={:#04x}",
+            "{name} cache at tokens={tokens}, byte={index}: device={:#04x}, oracle={:#04x}",
             actual[index], expected[index]
         )));
     }
@@ -432,17 +479,25 @@ fn compare_cache(
 }
 
 fn oracle(
-    batch: usize,
+    tokens: usize,
     fixture: &Fixture,
 ) -> Result<(Vec<f32>, Vec<u8>, Vec<u8>), AttentionQkPrepareQualificationError> {
     let mut query =
-        vec![f32::from_bits(F32_SENTINEL_BITS); MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS];
+        vec![f32::from_bits(F32_SENTINEL_BITS); MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS];
     let plane_bytes =
         PHYSICAL_PAGES * Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM;
     let mut key_pages = vec![BYTE_SENTINEL; plane_bytes];
     let mut value_pages = vec![BYTE_SENTINEL; plane_bytes];
 
-    for token in 0..batch {
+    let (table_rows, cache_positions): (&[u32], &[u32]) = if tokens <= MAX_BATCH {
+        (&DECODE_TABLE_ROWS, &DECODE_CACHE_POSITIONS)
+    } else {
+        (
+            &fixture.prefill_table_rows,
+            &fixture.prefill_cache_positions,
+        )
+    };
+    for token in 0..tokens {
         let token_base = token * Qwen38_27B::ATTENTION_QKV_ROWS;
         let cosine = &fixture.rope_cos[token * ROTARY_PAIRS..(token + 1) * ROTARY_PAIRS];
         let sine = &fixture.rope_sin[token * ROTARY_PAIRS..(token + 1) * ROTARY_PAIRS];
@@ -459,8 +514,8 @@ fn oracle(
             );
         }
 
-        let table_row = TABLE_ROW_IDS[token] as usize;
-        let position = CACHE_POSITIONS[token] as usize;
+        let table_row = table_rows[token] as usize;
+        let position = cache_positions[token] as usize;
         let physical_page = fixture.block_tables
             [table_row * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE]
             as usize;
@@ -568,14 +623,32 @@ fn verify_inputs(
     check!(regions.rope_cos, &fixture.rope_cos, "rotary cosine");
     check!(regions.rope_sin, &fixture.rope_sin, "rotary sine");
     check!(regions.block_tables, &fixture.block_tables, "block table");
-    check!(regions.table_rows, &TABLE_ROW_IDS, "table rows");
-    check!(regions.cache_positions, &CACHE_POSITIONS, "cache positions");
+    check!(
+        regions.decode_table_rows,
+        &DECODE_TABLE_ROWS,
+        "decode table rows"
+    );
+    check!(
+        regions.decode_cache_positions,
+        &DECODE_CACHE_POSITIONS,
+        "decode cache positions"
+    );
+    check!(
+        regions.prefill_table_rows,
+        &fixture.prefill_table_rows,
+        "prefill table rows"
+    );
+    check!(
+        regions.prefill_cache_positions,
+        &fixture.prefill_cache_positions,
+        "prefill cache positions"
+    );
 
     Ok(())
 }
 
 fn verify_replay(
-    batch: usize,
+    tokens: usize,
     eager: &Observed,
     replay: &Observed,
     report: &mut AttentionQkPrepareQualification,
@@ -588,12 +661,12 @@ fn verify_replay(
         .position(|(actual, expected)| actual != expected)
     {
         return Err(AttentionQkPrepareQualificationError::Mismatch(format!(
-            "B={batch} graph query word {index} differs from eager"
+            "tokens={tokens} graph query word {index} differs from eager"
         )));
     }
-    compare_cache(batch, "graph key", &replay.key_pages, &eager.key_pages)?;
+    compare_cache(tokens, "graph key", &replay.key_pages, &eager.key_pages)?;
     compare_cache(
-        batch,
+        tokens,
         "graph value",
         &replay.value_pages,
         &eager.value_pages,
@@ -607,7 +680,7 @@ fn verify_replay(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BATCH, PHYSICAL_PAGES, Qwen38_27B, TABLE_ROWS, TABLE_STRIDE,
+        MAX_TOKENS, PHYSICAL_PAGES, Qwen38_27B, ROUTES, TABLE_ROWS, TABLE_STRIDE, layout,
         qualify_attention_qk_prepare,
     };
     use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -615,23 +688,32 @@ mod tests {
 
     #[test]
     #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
-    fn exact_batches_match_independent_oracles_and_graph_replay()
+    fn exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), super::AttentionQkPrepareQualificationError> {
         let report = qualify_attention_qk_prepare()?;
-        let active_tokens = (1..=MAX_BATCH).sum::<usize>();
+        let active_tokens = ROUTES.iter().sum::<usize>();
         let query_per_token = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
         let cache_per_token = 2 * Qwen38_27B::ATTENTION_KV_ROWS;
         let plane_bytes =
             PHYSICAL_PAGES * Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM;
-        let replay_per_route = MAX_BATCH * query_per_token + 2 * plane_bytes;
+        let replay_per_route = MAX_TOKENS * query_per_token + 2 * plane_bytes;
+        let total_observable = ROUTES.len() * replay_per_route;
 
         assert_eq!(report.query_values, active_tokens * query_per_token);
         assert_eq!(report.appended_cache_codes, active_tokens * cache_per_token);
-        assert_eq!(report.untouched_values, 16_875_520);
-        assert_eq!(report.immutable_input_values, 1_851_904);
-        assert_eq!(report.graph_replay_values, MAX_BATCH * replay_per_route);
-        assert_eq!(TABLE_ROWS * TABLE_STRIDE, PHYSICAL_PAGES);
-        assert_eq!(report.arena_bytes - report.padding_bytes, 2_526_336);
+        assert_eq!(
+            report.untouched_values,
+            total_observable - active_tokens * (query_per_token + cache_per_token)
+        );
+        assert_eq!(report.graph_replay_values, total_observable);
+        assert_eq!(TABLE_ROWS * TABLE_STRIDE, 128);
+        let (layout, regions) = layout()?;
+        assert_eq!(report.arena_bytes, layout.byte_len());
+        assert_eq!(
+            report.arena_bytes - report.padding_bytes,
+            regions.payload_bytes()
+        );
+        assert_eq!(report.immutable_input_values, 2 * ROUTES.len() * 14_748_304);
         assert!(report.maximum_query_error <= 0.003);
 
         Ok(())
