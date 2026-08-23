@@ -106,6 +106,8 @@ mod resident_model;
 mod resident_model_benchmark;
 mod residual_norm;
 mod residual_norm_benchmark;
+#[cfg(feature = "device")]
+mod startup_benchmark;
 mod target;
 #[cfg(feature = "device")]
 mod text_endpoint;
@@ -235,6 +237,8 @@ pub use residual_norm::{
     ResidualNormQualification, ResidualNormQualificationError, qualify_residual_norm,
 };
 pub use residual_norm_benchmark::benchmark_residual_norm;
+#[cfg(feature = "device")]
+pub use startup_benchmark::run_startup_benchmark_cli;
 #[cfg(feature = "device")]
 pub use text_endpoint::{
     TextEndpointQualification, TextEndpointQualificationError, qualify_text_endpoint,

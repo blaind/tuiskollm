@@ -429,6 +429,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             qualify_resident_batch_generation(root, &remaining)
         }
         Some("qualify-text-endpoint") => qualify_text_endpoint(root, &remaining),
+        Some("bench-startup") => bench_startup(root, &remaining),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
         Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
         Some("bench-fp8-gdn-input") => bench_fp8_gdn_input(root, &remaining),
@@ -594,6 +595,28 @@ fn build_sm120(root: &Path) -> Result<(), Box<dyn Error>> {
             "tuisko-qual",
             "--bin",
             "bench-device",
+            "--release",
+        ],
+    )?;
+    gate_sm120_resources(root)
+}
+
+fn build_startup_benchmark(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "build",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_BUILD_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--bin",
+            "bench-startup",
             "--release",
         ],
     )?;
@@ -1652,6 +1675,24 @@ fn bench_resident_model(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     bench_resident_model_variant(root, arguments, "bench-resident-model", "resident-model")
+}
+
+fn bench_startup(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err("usage: cargo run -p xtask -- bench-startup SNAPSHOT [options]".into());
+    };
+    build_startup_benchmark(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-startup");
+    if !executable.is_file() {
+        return Err(format!(
+            "startup benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(Command::new(executable).arg(snapshot).args(options))
 }
 
 fn bench_resident_long_context_model(
