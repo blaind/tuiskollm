@@ -6,6 +6,7 @@ use tuisko_model::Arch;
 
 const ALIGNMENT: usize = 256;
 const NVFP4_GROUP: usize = 16;
+pub(crate) const MAX_ROWS: usize = 1_024;
 
 /// Checked source-weight and workspace regions for one early-layer MLP.
 #[derive(Clone, Debug)]
@@ -20,6 +21,8 @@ pub struct Nvfp4MlpLayout {
     up_weight_codes: ArenaRegion<u8>,
     gate_up_weight_scales: ArenaRegion<u8>,
     swiglu: ArenaRegion<u16>,
+    down_activation_codes: ArenaRegion<u8>,
+    down_activation_scales: ArenaRegion<u8>,
     down_weight_codes: ArenaRegion<u8>,
     down_weight_scales: ArenaRegion<u8>,
     branch: ArenaRegion<u16>,
@@ -31,15 +34,21 @@ pub struct Nvfp4MlpLayout {
 }
 
 impl Nvfp4MlpLayout {
-    /// Reserves every plane for the architecture's exact `B=1..=8` routes.
+    /// Reserves every plane for the exact decode routes.
     pub fn build<A: Arch>() -> EngineResult<Self> {
+        Self::build_rows::<A>(MAX_BATCH, false)
+    }
+
+    /// Reserves every plane for decode and exact prefill routes through T=1024.
+    pub(crate) fn build_prefill<A: Arch>() -> EngineResult<Self> {
+        Self::build_rows::<A>(MAX_ROWS, true)
+    }
+
+    fn build_rows<A: Arch>(rows: usize, down_scratch: bool) -> EngineResult<Self> {
         require_geometry::<A>()?;
-        let batch_hidden = product("NVFP4 MLP batch-hidden elements", MAX_BATCH, A::HIDDEN)?;
-        let batch_intermediate = product(
-            "NVFP4 MLP batch-intermediate elements",
-            MAX_BATCH,
-            A::INTERMEDIATE,
-        )?;
+        let row_hidden = product("NVFP4 MLP row-hidden elements", rows, A::HIDDEN)?;
+        let row_intermediate =
+            product("NVFP4 MLP row-intermediate elements", rows, A::INTERMEDIATE)?;
         let branch_codes = product(
             "NVFP4 gate/up branch code bytes",
             A::INTERMEDIATE,
@@ -57,21 +66,37 @@ impl Nvfp4MlpLayout {
             A::INTERMEDIATE / NVFP4_GROUP,
         )?;
         let mut builder = ArenaLayout::new();
-        let residual_input = builder.reserve(batch_hidden, ALIGNMENT)?;
+        let residual_input = builder.reserve(row_hidden, ALIGNMENT)?;
         let input_norm = builder.reserve(A::HIDDEN, ALIGNMENT)?;
-        let normalized = builder.reserve(batch_hidden, ALIGNMENT)?;
-        let gate_up_activation_codes = builder.reserve(batch_hidden / 2, ALIGNMENT)?;
-        let gate_up_activation_scales = builder.reserve(batch_hidden / NVFP4_GROUP, ALIGNMENT)?;
+        let normalized = builder.reserve(row_hidden, ALIGNMENT)?;
+        let gate_up_activation_codes = builder.reserve(row_hidden / 2, ALIGNMENT)?;
+        let gate_up_activation_scales = builder.reserve(row_hidden / NVFP4_GROUP, ALIGNMENT)?;
         let gate_weight_codes = builder.reserve(branch_codes, ALIGNMENT)?;
         let up_weight_codes = builder.reserve(branch_codes, ALIGNMENT)?;
         let gate_up_weight_scales = builder.reserve(gate_up_scales, ALIGNMENT)?;
-        let swiglu = builder.reserve(batch_intermediate, ALIGNMENT)?;
+        let swiglu = builder.reserve(row_intermediate, ALIGNMENT)?;
+        let down_activation_codes = builder.reserve(
+            if down_scratch {
+                row_intermediate / 2
+            } else {
+                0
+            },
+            ALIGNMENT,
+        )?;
+        let down_activation_scales = builder.reserve(
+            if down_scratch {
+                row_intermediate / NVFP4_GROUP
+            } else {
+                0
+            },
+            ALIGNMENT,
+        )?;
         let down_weight_codes = builder.reserve(down_codes, ALIGNMENT)?;
         let down_weight_scales = builder.reserve(down_scales, ALIGNMENT)?;
-        let branch = builder.reserve(batch_hidden, ALIGNMENT)?;
+        let branch = builder.reserve(row_hidden, ALIGNMENT)?;
         let next_norm = builder.reserve(A::HIDDEN, ALIGNMENT)?;
-        let residual_output = builder.reserve(batch_hidden, ALIGNMENT)?;
-        let next_normalized = builder.reserve(batch_hidden, ALIGNMENT)?;
+        let residual_output = builder.reserve(row_hidden, ALIGNMENT)?;
+        let next_normalized = builder.reserve(row_hidden, ALIGNMENT)?;
         let resident_weight_bytes = sum(
             "NVFP4 MLP resident weight bytes",
             &[
@@ -92,6 +117,8 @@ impl Nvfp4MlpLayout {
                 gate_up_activation_codes.byte_len(),
                 gate_up_activation_scales.byte_len(),
                 swiglu.byte_len(),
+                down_activation_codes.byte_len(),
+                down_activation_scales.byte_len(),
                 branch.byte_len(),
                 residual_output.byte_len(),
                 next_normalized.byte_len(),
@@ -109,6 +136,8 @@ impl Nvfp4MlpLayout {
             up_weight_codes,
             gate_up_weight_scales,
             swiglu,
+            down_activation_codes,
+            down_activation_scales,
             down_weight_codes,
             down_weight_scales,
             branch,
@@ -180,6 +209,14 @@ impl Nvfp4MlpLayout {
         self.swiglu
     }
 
+    pub(crate) const fn down_activation_codes(&self) -> ArenaRegion<u8> {
+        self.down_activation_codes
+    }
+
+    pub(crate) const fn down_activation_scales(&self) -> ArenaRegion<u8> {
+        self.down_activation_scales
+    }
+
     pub(crate) const fn down_weight_codes(&self) -> ArenaRegion<u8> {
         self.down_weight_codes
     }
@@ -244,6 +281,8 @@ mod tests {
             span(layout.up_weight_codes()),
             span(layout.gate_up_weight_scales()),
             span(layout.swiglu()),
+            span(layout.down_activation_codes()),
+            span(layout.down_activation_scales()),
             span(layout.down_weight_codes()),
             span(layout.down_weight_scales()),
             span(layout.branch()),
@@ -259,12 +298,12 @@ mod tests {
 
     #[test]
     fn qwen_nvfp4_mlp_byte_accounting_is_exact() {
-        let layout = Nvfp4MlpLayout::build::<Qwen38_27B>().unwrap();
+        let layout = Nvfp4MlpLayout::build_prefill::<Qwen38_27B>().unwrap();
 
         assert_eq!(layout.resident_weight_bytes(), 150_425_600);
-        assert_eq!(layout.workspace_bytes(), 711_168);
-        assert_eq!(layout.owner_bytes(), 151_136_768);
-        assert_eq!(layout.arena_bytes(), 151_136_768);
+        assert_eq!(layout.workspace_bytes(), 101_056_512);
+        assert_eq!(layout.owner_bytes(), 251_482_112);
+        assert_eq!(layout.arena_bytes(), 251_482_112);
     }
 
     #[test]
@@ -279,7 +318,7 @@ mod tests {
 
     #[test]
     fn regions_are_aligned_disjoint_and_inside_the_arena() {
-        let layout = Nvfp4MlpLayout::build::<Qwen38_27B>().unwrap();
+        let layout = Nvfp4MlpLayout::build_prefill::<Qwen38_27B>().unwrap();
         let mut regions = spans(&layout);
         regions.sort_unstable_by_key(|(offset, _)| *offset);
 
@@ -294,7 +333,7 @@ mod tests {
 
     #[test]
     fn packed_planes_follow_exact_source_geometry() {
-        let layout = Nvfp4MlpLayout::build::<Qwen38_27B>().unwrap();
+        let layout = Nvfp4MlpLayout::build_prefill::<Qwen38_27B>().unwrap();
 
         assert_eq!(
             layout.gate_weight_codes().byte_len(),

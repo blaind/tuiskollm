@@ -18,17 +18,27 @@ use tuisko_model::{
 const SOURCE_LAYER: usize = 55;
 const QWEN35_SOURCE_LAYER: usize = 0;
 const GROUP: usize = 16;
+const QWEN38_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 
 #[derive(Clone, Copy)]
 struct MlpGeometry {
     hidden: usize,
     intermediate: usize,
+    max_rows: usize,
     w4a4_batches: [bool; MAX_BATCH],
 }
 
 impl MlpGeometry {
-    const fn uses_w4a4(self, batch: usize) -> bool {
-        batch > 0 && batch <= MAX_BATCH && self.w4a4_batches[batch - 1]
+    const fn uses_gate_w4a4(self, rows: usize) -> bool {
+        if rows > MAX_BATCH {
+            true
+        } else {
+            rows > 0 && self.w4a4_batches[rows - 1]
+        }
+    }
+
+    const fn uses_down_w4a4(self, rows: usize) -> bool {
+        rows > MAX_BATCH
     }
 
     const fn hidden_groups(self) -> usize {
@@ -38,16 +48,26 @@ impl MlpGeometry {
     const fn hidden_code_bytes(self) -> usize {
         self.hidden / 2
     }
+
+    const fn intermediate_groups(self) -> usize {
+        self.intermediate / GROUP
+    }
+
+    const fn intermediate_code_bytes(self) -> usize {
+        self.intermediate / 2
+    }
 }
 
 const QWEN38_GEOMETRY: MlpGeometry = MlpGeometry {
     hidden: Qwen38_27B::HIDDEN,
     intermediate: Qwen38_27B::INTERMEDIATE,
+    max_rows: 1_024,
     w4a4_batches: [true, false, false, false, true, true, true, true],
 };
 const QWEN35_GEOMETRY: MlpGeometry = MlpGeometry {
     hidden: Qwen35_9B::HIDDEN,
     intermediate: Qwen35_9B::INTERMEDIATE,
+    max_rows: MAX_BATCH,
     w4a4_batches: [true, false, true, true, true, true, true, true],
 };
 
@@ -74,17 +94,17 @@ pub enum Nvfp4MlpQualificationError {
 /// Observable counts, ownership, and worst error from the complete MLP boundary.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Nvfp4MlpQualification {
-    /// Pre-MLP normalized BF16 values checked at every exact batch.
+    /// Pre-MLP normalized BF16 values checked at every exact route.
     pub normalized_values: usize,
     /// Dynamic E2M1 codes checked bit-exactly on every W4A4 route.
     pub activation_codes: usize,
     /// Dynamic E4M3 scales checked bit-exactly on every W4A4 route.
     pub activation_scales: usize,
-    /// B=1 SwiGLU values checked against the complete source-weight formula.
+    /// SwiGLU values checked against complete or sampled source-weight formulas.
     pub source_swiglu_values: usize,
-    /// B=1 down values checked against the complete source-weight formula.
+    /// Down values checked against complete or sampled source-weight formulas.
     pub source_branch_values: usize,
-    /// Published residual and next-normalized values checked at every batch.
+    /// Published residual and next-normalized values checked at every exact route.
     pub boundary_values: usize,
     /// Active values reproduced exactly by eager and graph execution.
     pub graph_replay_values: usize,
@@ -104,7 +124,7 @@ pub struct Nvfp4MlpQualification {
     pub maximum_absolute_error: f32,
 }
 
-/// Qualifies source-backed layer 55 at every exact decode batch.
+/// Qualifies source-backed layer 55 at every exact decode and prefill width.
 pub fn qualify_nvfp4_mlp(root: &Path) -> Result<Nvfp4MlpQualification, Nvfp4MlpQualificationError> {
     let _preflight = device_benchmark::preflight()?;
     let snapshot = Arc::new(CheckpointSnapshot::<Qwen38_27B>::open(root)?);
@@ -134,6 +154,18 @@ pub fn qualify_nvfp4_mlp(root: &Path) -> Result<Nvfp4MlpQualification, Nvfp4MlpQ
         down_weight_scales: &down_materialized.scale_e4m3_swizzled,
         next_norm: &next_norm,
     };
+    let source_formula = SourceFormula {
+        gate_weight: bindings.gate_up.gate_weight.bytes(),
+        up_weight: bindings.gate_up.up_weight.bytes(),
+        gate_scale: bindings.gate_up.gate_scale.codes(),
+        up_scale: bindings.gate_up.up_scale.codes(),
+        down_weight: bindings.down.weight.bytes(),
+        down_scale: bindings.down.scale.codes(),
+        gate_up_input_divisor: bindings.gate_up.input_scale_divisor,
+        gate_up_weight_divisor: bindings.gate_up.weight_scale_divisor,
+        down_input_divisor: bindings.down.input_scale_divisor,
+        down_weight_divisor: bindings.down.weight_scale_divisor,
+    };
     let mut report = Nvfp4MlpQualification {
         normalized_values: 0,
         activation_codes: 0,
@@ -154,30 +186,30 @@ pub fn qualify_nvfp4_mlp(root: &Path) -> Result<Nvfp4MlpQualification, Nvfp4MlpQ
     };
 
     require_divisors(&program, bindings)?;
-    for batch in 1..=MAX_BATCH {
-        let first_input = make_input(QWEN38_GEOMETRY, batch, 0);
-        program.load_residual(&stream, batch, &first_input)?;
+    for rows in QWEN38_ROUTES {
+        let first_input = make_input(QWEN38_GEOMETRY, rows, 0);
+        program.load_residual(&stream, rows, &first_input)?;
         program.qualification_reset_outputs(&stream, BYTE_SENTINEL)?;
-        program.launch_eager(&stream, batch)?;
+        program.launch_eager(&stream, rows)?;
         let first = program.qualification_observables(&stream)?;
 
-        let input = make_input(QWEN38_GEOMETRY, batch, 1);
-        program.load_residual(&stream, batch, &input)?;
+        let input = make_input(QWEN38_GEOMETRY, rows, 1);
+        program.load_residual(&stream, rows, &input)?;
         program.qualification_reset_outputs(&stream, BYTE_SENTINEL)?;
-        program.replay(&stream, batch)?;
+        program.replay(&stream, rows)?;
         let replay = program.qualification_observables(&stream)?;
         verify_immutable(
-            batch,
+            rows,
             &program.qualification_immutable(&stream)?,
             expected_immutable,
             &mut report,
         )?;
 
         program.qualification_reset_outputs(&stream, BYTE_SENTINEL)?;
-        program.launch_eager(&stream, batch)?;
+        program.launch_eager(&stream, rows)?;
         let eager = program.qualification_observables(&stream)?;
         verify_immutable(
-            batch,
+            rows,
             &program.qualification_immutable(&stream)?,
             expected_immutable,
             &mut report,
@@ -185,44 +217,39 @@ pub fn qualify_nvfp4_mlp(root: &Path) -> Result<Nvfp4MlpQualification, Nvfp4MlpQ
 
         verify_seams::<Qwen38_27B>(
             QWEN38_GEOMETRY,
-            batch,
+            rows,
             BoundarySource {
                 input: &input,
                 input_norm: &input_norm,
                 next_norm: &next_norm,
-                input_scale_divisor: bindings.gate_up.input_scale_divisor,
+                gate_up_input_scale_divisor: bindings.gate_up.input_scale_divisor,
+                down_input_scale_divisor: bindings.down.input_scale_divisor,
             },
             &replay,
             &mut report,
         )?;
-        if batch == 1 {
-            verify_source_formula(
+        if rows == 1 {
+            verify_source_formula(QWEN38_GEOMETRY, source_formula, &replay, &mut report)?;
+        } else if rows > MAX_BATCH {
+            verify_prefill_source_samples(
                 QWEN38_GEOMETRY,
-                SourceFormula {
-                    gate_weight: bindings.gate_up.gate_weight.bytes(),
-                    up_weight: bindings.gate_up.up_weight.bytes(),
-                    gate_scale: bindings.gate_up.gate_scale.codes(),
-                    up_scale: bindings.gate_up.up_scale.codes(),
-                    down_weight: bindings.down.weight.bytes(),
-                    down_scale: bindings.down.scale.codes(),
-                    gate_up_input_divisor: bindings.gate_up.input_scale_divisor,
-                    gate_up_weight_divisor: bindings.gate_up.weight_scale_divisor,
-                    down_weight_divisor: bindings.down.weight_scale_divisor,
-                },
+                rows,
+                source_formula,
                 &replay,
                 &mut report,
             )?;
         }
-        verify_replay(QWEN38_GEOMETRY, batch, &eager, &replay, &mut report)?;
-        verify_replacement_input(QWEN38_GEOMETRY, batch, &first, &replay)?;
-        verify_inactive(QWEN38_GEOMETRY, batch, &replay, &mut report)?;
-        verify_inactive(QWEN38_GEOMETRY, batch, &eager, &mut report)?;
+        verify_replay(QWEN38_GEOMETRY, rows, &eager, &replay, &mut report)?;
+        verify_replacement_input(QWEN38_GEOMETRY, rows, &first, &replay)?;
+        verify_inactive(QWEN38_GEOMETRY, rows, &replay, &mut report)?;
+        verify_inactive(QWEN38_GEOMETRY, rows, &eager, &mut report)?;
 
         if program.base_address() != stable_base
             || program.qualification_addresses()? != stable_addresses
         {
             return Err(Nvfp4MlpQualificationError::Mismatch(format!(
-                "owner addresses changed while qualifying B={batch}"
+                "owner addresses changed while qualifying {}",
+                route_name(rows)
             )));
         }
     }
@@ -274,6 +301,7 @@ pub fn qualify_qwen35_nvfp4_mlp(
         down_scale: bindings.down.block_scale.codes(),
         gate_up_input_divisor: materialized.gate_up.input_scale_divisor,
         gate_up_weight_divisor: materialized.gate_up.weight_scale_divisor,
+        down_input_divisor: materialized.down.input_scale_divisor,
         down_weight_divisor: materialized.down.weight_scale_divisor,
     };
     let mut report = Nvfp4MlpQualification {
@@ -332,7 +360,8 @@ pub fn qualify_qwen35_nvfp4_mlp(
                 input: &input,
                 input_norm: &input_norm,
                 next_norm: &next_norm,
-                input_scale_divisor: materialized.gate_up.input_scale_divisor,
+                gate_up_input_scale_divisor: materialized.gate_up.input_scale_divisor,
+                down_input_scale_divisor: materialized.down.input_scale_divisor,
             },
             &replay,
             &mut report,
@@ -442,7 +471,8 @@ struct BoundarySource<'a> {
     input: &'a [u16],
     input_norm: &'a [u16],
     next_norm: &'a [u16],
-    input_scale_divisor: f32,
+    gate_up_input_scale_divisor: f32,
+    down_input_scale_divisor: f32,
 }
 
 fn verify_seams<A: Arch>(
@@ -468,10 +498,10 @@ fn verify_seams<A: Arch>(
             &mut report.maximum_absolute_error,
         )?;
 
-        if geometry.uses_w4a4(batch) {
+        if geometry.uses_gate_w4a4(batch) {
             let (codes, scales) = quantize_oracle(
                 &observed.normalized[hidden_begin..hidden_end],
-                source.input_scale_divisor,
+                source.gate_up_input_scale_divisor,
             )?;
             require_equal_u8(
                 "gate/up activation code",
@@ -499,6 +529,30 @@ fn verify_seams<A: Arch>(
             token,
             &observed.swiglu[intermediate_begin..intermediate_end],
         )?;
+        if geometry.uses_down_w4a4(batch) {
+            let (codes, scales) = quantize_oracle(
+                &observed.swiglu[intermediate_begin..intermediate_end],
+                source.down_input_scale_divisor,
+            )?;
+            require_equal_u8(
+                "down activation code",
+                batch,
+                token,
+                &observed.down_activation_codes[token * geometry.intermediate_code_bytes()
+                    ..(token + 1) * geometry.intermediate_code_bytes()],
+                &codes,
+            )?;
+            require_equal_u8(
+                "down activation scale",
+                batch,
+                token,
+                &observed.down_activation_scales[token * geometry.intermediate_groups()
+                    ..(token + 1) * geometry.intermediate_groups()],
+                &scales,
+            )?;
+            report.activation_codes += geometry.intermediate_code_bytes();
+            report.activation_scales += geometry.intermediate_groups();
+        }
         require_active_written(
             "down branch",
             batch,
@@ -517,7 +571,8 @@ fn verify_seams<A: Arch>(
                 .position(|(actual, expected)| actual != expected)
                 .expect("slices differ");
             return Err(Nvfp4MlpQualificationError::Mismatch(format!(
-                "residual publication at B={batch}, row={token}, column={relative} differs"
+                "residual publication at {}, row={token}, column={relative} differs",
+                route_name(batch)
             )));
         }
         let next = rms_norm_oracle::<A>(&residual, source.next_norm);
@@ -547,6 +602,7 @@ struct SourceFormula<'a> {
     down_scale: &'a [u8],
     gate_up_input_divisor: f32,
     gate_up_weight_divisor: f32,
+    down_input_divisor: f32,
     down_weight_divisor: f32,
 }
 
@@ -616,6 +672,97 @@ fn verify_source_formula(
     report.source_branch_values += geometry.hidden;
 
     Ok(())
+}
+
+fn verify_prefill_source_samples(
+    geometry: MlpGeometry,
+    rows: usize,
+    source: SourceFormula<'_>,
+    observed: &Nvfp4MlpObservables,
+    report: &mut Nvfp4MlpQualification,
+) -> Result<(), Nvfp4MlpQualificationError> {
+    let token = rows - 1;
+    let hidden_code_begin = token * geometry.hidden_code_bytes();
+    let hidden_scale_begin = token * geometry.hidden_groups();
+    let gate_activation = QuantizedActivation {
+        codes: &observed.gate_up_activation_codes
+            [hidden_code_begin..hidden_code_begin + geometry.hidden_code_bytes()],
+        scales: &observed.gate_up_activation_scales
+            [hidden_scale_begin..hidden_scale_begin + geometry.hidden_groups()],
+        scale_divisor: source.gate_up_input_divisor,
+    };
+    for column in sample_columns(geometry.intermediate) {
+        let gate = nvfp4_dot_w4a4(
+            gate_activation,
+            source.gate_weight,
+            source.gate_scale,
+            column,
+            geometry.hidden,
+            source.gate_up_weight_divisor,
+        )?;
+        let up = nvfp4_dot_w4a4(
+            gate_activation,
+            source.up_weight,
+            source.up_scale,
+            column,
+            geometry.hidden,
+            source.gate_up_weight_divisor,
+        )?;
+        let gate = f64::from(bf16_to_f32(f32_to_bf16(gate as f32)));
+        let up = f64::from(bf16_to_f32(f32_to_bf16(up as f32)));
+        let expected = gate / (1.0 + (-gate).exp()) * up;
+        require_close(
+            &format!("source prefill SwiGLU at {}", route_name(rows)),
+            column,
+            bf16_to_f32(observed.swiglu[token * geometry.intermediate + column]),
+            expected,
+            &mut report.maximum_absolute_error,
+        )?;
+        report.source_swiglu_values += 1;
+    }
+
+    let intermediate_code_begin = token * geometry.intermediate_code_bytes();
+    let intermediate_scale_begin = token * geometry.intermediate_groups();
+    let down_activation = QuantizedActivation {
+        codes: &observed.down_activation_codes
+            [intermediate_code_begin..intermediate_code_begin + geometry.intermediate_code_bytes()],
+        scales: &observed.down_activation_scales
+            [intermediate_scale_begin..intermediate_scale_begin + geometry.intermediate_groups()],
+        scale_divisor: source.down_input_divisor,
+    };
+    for column in sample_columns(geometry.hidden) {
+        let expected = nvfp4_dot_w4a4(
+            down_activation,
+            source.down_weight,
+            source.down_scale,
+            column,
+            geometry.intermediate,
+            source.down_weight_divisor,
+        )?;
+        require_close(
+            &format!("source prefill down projection at {}", route_name(rows)),
+            column,
+            bf16_to_f32(observed.branch[token * geometry.hidden + column]),
+            expected,
+            &mut report.maximum_absolute_error,
+        )?;
+        report.source_branch_values += 1;
+    }
+
+    Ok(())
+}
+
+const fn sample_columns(width: usize) -> [usize; 8] {
+    [
+        0,
+        1,
+        width / 8,
+        width / 4,
+        width / 2,
+        3 * width / 4,
+        width - 2,
+        width - 1,
+    ]
 }
 
 #[derive(Clone, Copy)]
@@ -733,7 +880,7 @@ fn quantize_oracle(
 }
 
 fn verify_immutable(
-    batch: usize,
+    rows: usize,
     actual: &Nvfp4MlpImmutable,
     expected: ExpectedImmutable<'_>,
     report: &mut Nvfp4MlpQualification,
@@ -747,7 +894,8 @@ fn verify_immutable(
                 .position(|(actual, expected)| actual != expected)
             {
                 return Err(Nvfp4MlpQualificationError::Mismatch(format!(
-                    "B={batch} immutable plane `{}` differs at value {index}",
+                    "{} immutable plane `{}` differs at value {index}",
+                    route_name(rows),
                     stringify!($field),
                 )));
             }
@@ -767,7 +915,7 @@ fn verify_immutable(
 
 fn verify_replay(
     geometry: MlpGeometry,
-    batch: usize,
+    rows: usize,
     eager: &Nvfp4MlpObservables,
     replay: &Nvfp4MlpObservables,
     report: &mut Nvfp4MlpQualification,
@@ -781,7 +929,8 @@ fn verify_replay(
                 .position(|(actual, expected)| actual != expected)
             {
                 return Err(Nvfp4MlpQualificationError::Mismatch(format!(
-                    "B={batch} graph plane `{}` differs at value {index}",
+                    "{} graph plane `{}` differs at value {index}",
+                    route_name(rows),
                     stringify!($field),
                 )));
             }
@@ -792,14 +941,20 @@ fn verify_replay(
     same!(gate_up_activation_codes);
     same!(gate_up_activation_scales);
     same!(swiglu);
+    same!(down_activation_codes);
+    same!(down_activation_scales);
     same!(branch);
     same!(residual_output);
     same!(next_normalized);
 
-    report.graph_replay_values += batch * (5 * geometry.hidden + geometry.intermediate);
-    if geometry.uses_w4a4(batch) {
+    report.graph_replay_values += rows * (5 * geometry.hidden + geometry.intermediate);
+    if geometry.uses_gate_w4a4(rows) {
         report.graph_replay_values +=
-            batch * (geometry.hidden_code_bytes() + geometry.hidden_groups());
+            rows * (geometry.hidden_code_bytes() + geometry.hidden_groups());
+    }
+    if geometry.uses_down_w4a4(rows) {
+        report.graph_replay_values +=
+            rows * (geometry.intermediate_code_bytes() + geometry.intermediate_groups());
     }
 
     Ok(())
@@ -807,16 +962,17 @@ fn verify_replay(
 
 fn verify_replacement_input(
     geometry: MlpGeometry,
-    batch: usize,
+    rows: usize,
     first: &Nvfp4MlpObservables,
     replay: &Nvfp4MlpObservables,
 ) -> Result<(), Nvfp4MlpQualificationError> {
-    let active = batch * geometry.hidden;
+    let active = rows * geometry.hidden;
     if first.residual_input[..active] == replay.residual_input[..active]
         || first.residual_output[..active] == replay.residual_output[..active]
     {
         return Err(Nvfp4MlpQualificationError::Mismatch(format!(
-            "B={batch} graph replay did not observe replacement residual rows"
+            "{} graph replay did not observe replacement residual rows",
+            route_name(rows)
         )));
     }
 
@@ -825,12 +981,12 @@ fn verify_replacement_input(
 
 fn verify_inactive(
     geometry: MlpGeometry,
-    batch: usize,
+    rows: usize,
     observed: &Nvfp4MlpObservables,
     report: &mut Nvfp4MlpQualification,
 ) -> Result<(), Nvfp4MlpQualificationError> {
-    let hidden_begin = batch * geometry.hidden;
-    let intermediate_begin = batch * geometry.intermediate;
+    let hidden_begin = rows * geometry.hidden;
+    let intermediate_begin = rows * geometry.intermediate;
     for (role, values) in [
         ("normalized", &observed.normalized[hidden_begin..]),
         ("branch", &observed.branch[hidden_begin..]),
@@ -839,7 +995,8 @@ fn verify_inactive(
     ] {
         if let Some(relative) = values.iter().position(|&value| value != BF16_SENTINEL) {
             return Err(Nvfp4MlpQualificationError::Mismatch(format!(
-                "B={batch} modified inactive {role} value {relative}"
+                "{} modified inactive {role} value {relative}",
+                route_name(rows)
             )));
         }
     }
@@ -848,41 +1005,67 @@ fn verify_inactive(
         .position(|&value| value != BF16_SENTINEL)
     {
         return Err(Nvfp4MlpQualificationError::Mismatch(format!(
-            "B={batch} modified inactive SwiGLU value {relative}"
+            "{} modified inactive SwiGLU value {relative}",
+            route_name(rows)
         )));
     }
 
-    let code_begin = if geometry.uses_w4a4(batch) {
-        batch * geometry.hidden_code_bytes()
+    let gate_code_begin = if geometry.uses_gate_w4a4(rows) {
+        rows * geometry.hidden_code_bytes()
     } else {
         0
     };
-    let scale_begin = if geometry.uses_w4a4(batch) {
-        batch * geometry.hidden_groups()
+    let gate_scale_begin = if geometry.uses_gate_w4a4(rows) {
+        rows * geometry.hidden_groups()
+    } else {
+        0
+    };
+    let down_code_begin = if geometry.uses_down_w4a4(rows) {
+        rows * geometry.intermediate_code_bytes()
+    } else {
+        0
+    };
+    let down_scale_begin = if geometry.uses_down_w4a4(rows) {
+        rows * geometry.intermediate_groups()
     } else {
         0
     };
     for (role, values) in [
         (
             "gate/up activation code",
-            &observed.gate_up_activation_codes[code_begin..],
+            &observed.gate_up_activation_codes[gate_code_begin..],
         ),
         (
             "gate/up activation scale",
-            &observed.gate_up_activation_scales[scale_begin..],
+            &observed.gate_up_activation_scales[gate_scale_begin..],
+        ),
+        (
+            "down activation code",
+            &observed.down_activation_codes[down_code_begin..],
+        ),
+        (
+            "down activation scale",
+            &observed.down_activation_scales[down_scale_begin..],
         ),
     ] {
         if let Some(relative) = values.iter().position(|&value| value != BYTE_SENTINEL) {
             return Err(Nvfp4MlpQualificationError::Mismatch(format!(
-                "B={batch} modified inactive {role} value {relative}"
+                "{} modified inactive {role} value {relative}",
+                route_name(rows)
             )));
         }
     }
 
-    let inactive_scratch = (MAX_BATCH * geometry.hidden_code_bytes() - code_begin)
-        + (MAX_BATCH * geometry.hidden_groups() - scale_begin);
-    report.inactive_values +=
-        (MAX_BATCH - batch) * (4 * geometry.hidden + geometry.intermediate) + inactive_scratch;
+    let inactive_scratch = observed.gate_up_activation_codes.len() - gate_code_begin
+        + observed.gate_up_activation_scales.len()
+        - gate_scale_begin
+        + observed.down_activation_codes.len()
+        - down_code_begin
+        + observed.down_activation_scales.len()
+        - down_scale_begin;
+    report.inactive_values += (geometry.max_rows - rows)
+        * (4 * geometry.hidden + geometry.intermediate)
+        + inactive_scratch;
 
     Ok(())
 }
@@ -891,12 +1074,12 @@ fn verify_no_device_allocation(
     program: &Nvfp4MlpProgram,
     stream: &tuisko_gpu::CudaStream,
 ) -> Result<(), Nvfp4MlpQualificationError> {
-    program.replay(stream, MAX_BATCH)?;
+    program.replay(stream, 1_024)?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
     for _ in 0..4 {
-        for batch in [1, 8, 3, 6, 2, 7, 4, 5] {
-            program.replay(stream, batch)?;
+        for rows in QWEN38_ROUTES {
+            program.replay(stream, rows)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -908,6 +1091,14 @@ fn verify_no_device_allocation(
     }
 
     Ok(())
+}
+
+fn route_name(rows: usize) -> String {
+    if rows <= MAX_BATCH {
+        format!("B={rows}")
+    } else {
+        format!("T={rows}")
+    }
 }
 
 fn verify_no_qwen35_device_allocation(
@@ -941,7 +1132,8 @@ fn require_active_written(
 ) -> Result<(), Nvfp4MlpQualificationError> {
     if let Some(column) = values.iter().position(|&value| value == BF16_SENTINEL) {
         return Err(Nvfp4MlpQualificationError::Mismatch(format!(
-            "B={batch} {role} row={token}, column={column} retained its sentinel"
+            "{} {role} row={token}, column={column} retained its sentinel",
+            route_name(batch)
         )));
     }
 
@@ -961,8 +1153,10 @@ fn require_equal_u8(
         .position(|(actual, expected)| actual != expected)
     {
         return Err(Nvfp4MlpQualificationError::Mismatch(format!(
-            "{role} at B={batch}, row={token}, column={column}: device={:#04x}, oracle={:#04x}",
-            actual[column], expected[column],
+            "{role} at {}, row={token}, column={column}: device={:#04x}, oracle={:#04x}",
+            route_name(batch),
+            actual[column],
+            expected[column],
         )));
     }
 
@@ -979,7 +1173,7 @@ fn compare_close_slice(
 ) -> Result<(), Nvfp4MlpQualificationError> {
     for (column, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
         require_close(
-            &format!("{role} at B={batch}, row={token}"),
+            &format!("{role} at {}, row={token}", route_name(batch)),
             column,
             bf16_to_f32(actual),
             f64::from(bf16_to_f32(expected)),
@@ -1093,14 +1287,22 @@ mod tests {
         assert_eq!(decode_e4m3fn(0x40).unwrap(), 2.0);
         assert_eq!(
             (1..=8)
-                .map(|batch| QWEN38_GEOMETRY.uses_w4a4(batch))
+                .map(|batch| QWEN38_GEOMETRY.uses_gate_w4a4(batch))
                 .collect::<Vec<_>>(),
             [true, false, false, false, true, true, true, true],
+        );
+        assert_eq!(
+            [32, 64, 128, 1_024].map(|rows| QWEN38_GEOMETRY.uses_gate_w4a4(rows)),
+            [true; 4],
+        );
+        assert_eq!(
+            [32, 64, 128, 1_024].map(|rows| QWEN38_GEOMETRY.uses_down_w4a4(rows)),
+            [true; 4],
         );
         assert_eq!(SOURCE_LAYER, 55);
         assert_eq!(
             (1..=8)
-                .map(|batch| QWEN35_GEOMETRY.uses_w4a4(batch))
+                .map(|batch| QWEN35_GEOMETRY.uses_gate_w4a4(batch))
                 .collect::<Vec<_>>(),
             [true, false, true, true, true, true, true, true],
         );
@@ -1118,11 +1320,11 @@ mod tests {
         })?;
         let report = qualify_nvfp4_mlp(std::path::Path::new(&root))?;
 
-        assert_eq!(report.source_swiglu_values, 17_408);
-        assert_eq!(report.source_branch_values, 5_120);
+        assert_eq!(report.source_swiglu_values, 17_440);
+        assert_eq!(report.source_branch_values, 5_152);
         assert_eq!(report.weight_bytes, 150_425_600);
-        assert_eq!(report.workspace_bytes, 711_168);
-        assert_eq!(report.arena_bytes, 151_136_768);
+        assert_eq!(report.workspace_bytes, 101_056_512);
+        assert_eq!(report.arena_bytes, 251_482_112);
         assert_eq!(report.padding_bytes, 0);
         assert!(report.normalized_values > 0);
         assert!(report.activation_codes > 0);
