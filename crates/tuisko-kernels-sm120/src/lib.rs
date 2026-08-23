@@ -1,6 +1,7 @@
 //! Exact-target SM120 operator kernels and their prepared host launchers.
 
 mod arch;
+mod attention;
 mod device;
 mod fp8;
 mod gdn;
@@ -8,6 +9,7 @@ mod inventory;
 mod residual_norm;
 
 pub use arch::Sm120Arch;
+pub use attention::{ATTENTION_PAGE_SIZE, AttentionQkPrepareOp};
 pub use fp8::{
     DenseFp8DownOp, DenseFp8SwiGluOp, FullAttentionQkvOp, GdnInputProjectionOp,
     GdnOutputProjectionOp, LmHeadOp,

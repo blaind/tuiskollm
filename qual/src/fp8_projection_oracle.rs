@@ -49,7 +49,7 @@ pub(crate) fn quantize_oracle(input: &[u16]) -> Result<TokenOracle, String> {
     })
 }
 
-fn encode_e4m3fn(value: f32) -> Result<u8, String> {
+pub(crate) fn encode_e4m3fn(value: f32) -> Result<u8, String> {
     if !value.is_finite() {
         return Err("oracle E4M3 input is not finite".to_string());
     }

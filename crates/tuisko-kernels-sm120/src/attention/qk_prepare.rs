@@ -1,0 +1,329 @@
+//! Exact-batch Q/K normalization, MRoPE, and FP8 KV-cache append.
+
+use crate::Sm120Arch;
+use crate::device::attention_qk_prepare::attention_qk_prepare;
+use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
+use std::sync::Arc;
+use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_model::{Arch, Qwen38_27B};
+
+/// Number of token positions held by one physical KV-cache page.
+pub const ATTENTION_PAGE_SIZE: usize = 64;
+
+const MAX_BATCH: usize = 8;
+const WARPS_PER_CTA: usize = 8;
+const THREADS: u32 = (WARPS_PER_CTA * 32) as u32;
+
+fn admitted_batch(batch: usize) -> bool {
+    (1..=MAX_BATCH).contains(&batch)
+}
+
+fn require_geometry<A: Arch>() -> GpuResult<()> {
+    if A::NUM_ATTENTION_HEADS != 24
+        || A::NUM_KV_HEADS != 4
+        || A::HEAD_DIM != 256
+        || A::ATTENTION_QUERY_ROWS != 12_288
+        || A::ATTENTION_KV_ROWS != 1_024
+        || A::ATTENTION_QKV_ROWS != 14_336
+        || A::RMS_NORM_EPSILON != 1.0e-6
+    {
+        return Err(GpuError::invalid_launch(
+            "architecture geometry is incompatible with the admitted attention Q/K prepare schedule",
+        ));
+    }
+
+    Ok(())
+}
+
+#[cuda_module]
+#[allow(clippy::too_many_arguments)]
+mod kernels {
+    use super::*;
+
+    /// Prepares Q/K and appends K/V for one exact decode batch.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn attention_qk_prepare_exact<A: Arch, const TOKENS: usize>(
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u8,
+        value_pages: *mut u8,
+        key_scale: f32,
+        value_scale: f32,
+    ) {
+        // One warp owns one complete 256-wide head. Eight heads per CTA gives
+        // 28 CTAs at B=8, enough to occupy the target while keeping each
+        // normalization reduction and its 64-wide MRoPE exchange warp-local.
+        unsafe {
+            attention_qk_prepare::<A, TOKENS>(
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+                key_scale,
+                value_scale,
+            );
+        }
+    }
+}
+
+struct PreparedRoute<A: Arch, const TOKENS: usize> {
+    prepare: PreparedLaunch<kernels::__attention_qk_prepare_exact_CudaKernel<A, TOKENS>>,
+}
+
+impl<A: Arch, const TOKENS: usize> PreparedRoute<A, TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let blocks = u32::try_from(
+            (TOKENS * (A::NUM_ATTENTION_HEADS + A::NUM_KV_HEADS)).div_ceil(WARPS_PER_CTA),
+        )
+        .map_err(|_| GpuError::invalid_launch("attention Q/K prepare grid exceeds u32"))?;
+
+        Ok(Self {
+            prepare: module
+                .prepare_attention_qk_prepare_exact::<A, TOKENS>(LaunchConfig1D::new(
+                    blocks, THREADS, 0,
+                ))
+                .map_err(|source| GpuError::launch("preparing attention Q/K route", source))?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u8,
+        value_pages: *mut u8,
+        key_scale: f32,
+        value_scale: f32,
+    ) -> GpuResult<()> {
+        module
+            .attention_qk_prepare_exact::<A, TOKENS>(
+                stream,
+                &self.prepare,
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+                key_scale,
+                value_scale,
+            )
+            .map_err(|source| GpuError::launch("launching attention Q/K prepare", source))
+    }
+}
+
+/// Prepared Q/K normalization, MRoPE, and KV-cache append routes for `B=1..8`.
+pub struct AttentionQkPrepareOp<A: Sm120Arch = Qwen38_27B> {
+    module: kernels::LoadedModule,
+    b1: PreparedRoute<A, 1>,
+    b2: PreparedRoute<A, 2>,
+    b3: PreparedRoute<A, 3>,
+    b4: PreparedRoute<A, 4>,
+    b5: PreparedRoute<A, 5>,
+    b6: PreparedRoute<A, 6>,
+    b7: PreparedRoute<A, 7>,
+    b8: PreparedRoute<A, 8>,
+}
+
+impl<A: Sm120Arch> AttentionQkPrepareOp<A> {
+    /// Loads the embedded module and prepares every exact decode route.
+    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        require_geometry::<A>()?;
+        let _ = attention_qk_prepare_ptx_names();
+        // SAFETY: this crate owns the embedded cuda-oxide module artifact.
+        let module = unsafe { kernels::load(context) }
+            .map_err(|source| GpuError::module("loading attention Q/K prepare", source))?;
+
+        Ok(Self {
+            b1: PreparedRoute::prepare(&module)?,
+            b2: PreparedRoute::prepare(&module)?,
+            b3: PreparedRoute::prepare(&module)?,
+            b4: PreparedRoute::prepare(&module)?,
+            b5: PreparedRoute::prepare(&module)?,
+            b6: PreparedRoute::prepare(&module)?,
+            b7: PreparedRoute::prepare(&module)?,
+            b8: PreparedRoute::prepare(&module)?,
+            module,
+        })
+    }
+
+    /// Normalizes and rotates Q/K, then appends represented E4M3 K/V codes.
+    ///
+    /// # Safety
+    ///
+    /// `qkv` covers `[batch, A::ATTENTION_QKV_ROWS]` BF16 values in the fused
+    /// query/gate, key, value order. Norms cover `A::HEAD_DIM`; rotary planes
+    /// cover `[batch, 32]`; metadata covers `batch`; and the block-table row
+    /// selected for each token covers its cache position. Query covers
+    /// `[batch, 24, 256]` FP32 values. Cache planes use page-major
+    /// `[physical_page, 4, 64, 256]` bytes and cover every selected page.
+    /// Allocations are aligned, non-overlapping, live through completion, and
+    /// belong to `stream`'s context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: usize,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u8,
+        value_pages: *mut u8,
+        key_scale: f32,
+        value_scale: f32,
+    ) -> GpuResult<()> {
+        if !admitted_batch(batch) {
+            return Err(GpuError::invalid_launch(format!(
+                "attention Q/K prepare batch {batch} is outside the admitted range 1..={MAX_BATCH}"
+            )));
+        }
+        let table_stride = u32::try_from(table_stride).map_err(|_| {
+            GpuError::invalid_launch("attention Q/K block-table stride exceeds u32")
+        })?;
+        if table_stride == 0 {
+            return Err(GpuError::invalid_launch(
+                "attention Q/K block-table stride must be nonzero",
+            ));
+        }
+        if !key_scale.is_finite() || key_scale <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "attention key-cache scale must be finite and positive",
+            ));
+        }
+        if !value_scale.is_finite() || value_scale <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "attention value-cache scale must be finite and positive",
+            ));
+        }
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        qkv,
+                        query_norm,
+                        key_norm,
+                        rope_cos,
+                        rope_sin,
+                        block_tables,
+                        table_rows,
+                        table_stride,
+                        cache_positions,
+                        query,
+                        key_pages,
+                        value_pages,
+                        key_scale,
+                        value_scale,
+                    )
+                }
+            };
+        }
+
+        match batch {
+            1 => launch!(b1),
+            2 => launch!(b2),
+            3 => launch!(b3),
+            4 => launch!(b4),
+            5 => launch!(b5),
+            6 => launch!(b6),
+            7 => launch!(b7),
+            8 => launch!(b8),
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// PTX symbols retained for every exact attention Q/K prepare route.
+pub(crate) fn attention_qk_prepare_ptx_names() -> Vec<&'static str> {
+    vec![
+        kernels::attention_qk_prepare_exact_ptx_name::<Qwen38_27B, 1>(),
+        kernels::attention_qk_prepare_exact_ptx_name::<Qwen38_27B, 2>(),
+        kernels::attention_qk_prepare_exact_ptx_name::<Qwen38_27B, 3>(),
+        kernels::attention_qk_prepare_exact_ptx_name::<Qwen38_27B, 4>(),
+        kernels::attention_qk_prepare_exact_ptx_name::<Qwen38_27B, 5>(),
+        kernels::attention_qk_prepare_exact_ptx_name::<Qwen38_27B, 6>(),
+        kernels::attention_qk_prepare_exact_ptx_name::<Qwen38_27B, 7>(),
+        kernels::attention_qk_prepare_exact_ptx_name::<Qwen38_27B, 8>(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{THREADS, admitted_batch, attention_qk_prepare_ptx_names};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn batch_table_covers_only_exact_decode_routes() {
+        for (batch, expected) in [
+            (0, false),
+            (1, true),
+            (4, true),
+            (8, true),
+            (9, false),
+            (128, false),
+        ] {
+            assert_eq!(admitted_batch(batch), expected, "batch={batch}");
+        }
+        assert_eq!(THREADS, 256);
+    }
+
+    #[test]
+    fn ptx_inventory_has_one_entry_per_batch() {
+        let names = attention_qk_prepare_ptx_names();
+        let unique = names.iter().copied().collect::<BTreeSet<_>>();
+
+        assert_eq!(names.len(), 8);
+        assert_eq!(unique.len(), names.len());
+    }
+}

@@ -10,6 +10,10 @@
 compile_error!("select exactly one device target feature");
 
 #[cfg(feature = "device")]
+mod attention_qk_prepare;
+#[cfg(feature = "device")]
+mod attention_qk_prepare_benchmark;
+#[cfg(feature = "device")]
 mod dense_fp8_gdn_layer;
 #[cfg(feature = "device")]
 mod dense_fp8_gdn_layer_benchmark;
@@ -68,6 +72,13 @@ mod text_endpoint;
 #[cfg(feature = "device")]
 mod text_endpoint_benchmark;
 
+#[cfg(feature = "device")]
+pub use attention_qk_prepare::{
+    AttentionQkPrepareQualification, AttentionQkPrepareQualificationError,
+    qualify_attention_qk_prepare,
+};
+#[cfg(feature = "device")]
+pub use attention_qk_prepare_benchmark::benchmark_attention_qk_prepare;
 #[cfg(feature = "device")]
 pub use dense_fp8_gdn_layer::{
     DenseFp8GdnLayerQualification, DenseFp8GdnLayerQualificationError, qualify_dense_fp8_gdn_layer,
