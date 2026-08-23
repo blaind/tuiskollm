@@ -1330,6 +1330,26 @@ fn qualify_qwen35_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>
             "--nocapture",
         ],
     )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "attention_qk_prepare_benchmark::tests::qwen35_",
+            "--nocapture",
+        ],
+    )?;
     gate_qwen35_attention_qk_prepare(root)
 }
 
@@ -5207,6 +5227,8 @@ fn gate_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         "attention_qk_prepare_exact_TID_",
         Some("attention_qk_prepare_prefill_exact_TID_"),
         "attention Q/K prepare",
+        "F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C",
+        "E4M3",
     )
 }
 
@@ -5217,6 +5239,8 @@ fn gate_qwen35_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         "qwen35_attention_qk_prepare_exact_TID_",
         None,
         "Qwen3.5 attention Q/K prepare",
+        "F2FP.BF16.F32.PACK_AB",
+        "BF16",
     )
 }
 
@@ -5226,6 +5250,8 @@ fn gate_attention_qk_prepare_target(
     entry_prefix: &str,
     prefill_prefix: Option<&str>,
     label: &str,
+    cache_instruction: &str,
+    cache_label: &str,
 ) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(root.join(baseline_path))?)?;
     verify_generator_stamp(root, &baseline)?;
@@ -5296,11 +5322,7 @@ fn gate_attention_qk_prepare_target(
 
             let body = sass_function_body(&sass, entry.name)
                 .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
-            for instruction in [
-                "MUFU.RSQ",
-                "SHFL.BFLY",
-                "F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C",
-            ] {
+            for instruction in ["MUFU.RSQ", "SHFL.BFLY", cache_instruction] {
                 if !body.contains(instruction) {
                     return Err(format!(
                         "entry `{}` lost required `{instruction}` SASS",
@@ -5320,7 +5342,7 @@ fn gate_attention_qk_prepare_target(
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "{label} gate passed: {} decode + {} prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/SHFL/E4M3 present",
+        "{label} gate passed: {} decode + {} prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/SHFL/{cache_label} present",
         prepare.len(),
         prefill.len(),
         decode_registers,

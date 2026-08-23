@@ -101,6 +101,7 @@ trait BenchQkPrepareOp {
     type Target: Arch;
     const ROUTES: &'static [usize];
     const MAX_TOKENS: usize;
+    const CACHE_ELEMENT_BYTES: usize;
 
     fn new(context: &Arc<CudaContext>) -> GpuResult<Self>
     where
@@ -115,6 +116,7 @@ macro_rules! impl_bench_op {
             type Target = $target;
             const ROUTES: &'static [usize] = $routes;
             const MAX_TOKENS: usize = $max_tokens;
+            const CACHE_ELEMENT_BYTES: usize = size_of::<u8>();
 
             fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
                 <$op>::new(context)
@@ -166,12 +168,40 @@ macro_rules! impl_bench_op {
 }
 
 impl_bench_op!(AttentionQkPrepareOp, Qwen38_27B, &ROUTES, MAX_TOKENS);
-impl_bench_op!(
-    Qwen35AttentionQkPrepareOp,
-    Qwen35_9B,
-    &QWEN35_ROUTES,
-    MAX_BATCH
-);
+
+impl BenchQkPrepareOp for Qwen35AttentionQkPrepareOp {
+    type Target = Qwen35_9B;
+    const ROUTES: &'static [usize] = &QWEN35_ROUTES;
+    const MAX_TOKENS: usize = MAX_BATCH;
+    const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
+
+    fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        Qwen35AttentionQkPrepareOp::new(context)
+    }
+
+    fn launch(&self, stream: &CudaStream, addresses: &Addresses, batch: usize) -> GpuResult<()> {
+        // SAFETY: the arena reserves aligned BF16 cache planes and owns every
+        // pointer through completion of the captured graph.
+        unsafe {
+            self.launch(
+                stream,
+                batch,
+                addresses.qkv,
+                addresses.query_norm,
+                addresses.key_norm,
+                addresses.rope_cos,
+                addresses.rope_sin,
+                addresses.block_tables,
+                addresses.decode_table_rows,
+                TABLE_STRIDE,
+                addresses.decode_cache_positions,
+                addresses.query,
+                addresses.key_pages.cast(),
+                addresses.value_pages.cast(),
+            )
+        }
+    }
+}
 
 struct Session<O> {
     routes: Vec<RouteGraphs>,
@@ -194,7 +224,7 @@ impl<O: BenchQkPrepareOp> Session<O> {
             )));
         }
         let stream = context.new_stream().map_err(GpuError::from)?;
-        let (layout, regions) = layout::<O::Target>(O::MAX_TOKENS)?;
+        let (layout, regions) = layout::<O::Target>(O::MAX_TOKENS, O::CACHE_ELEMENT_BYTES)?;
         let arena = DeviceArena::zeroed(&stream, &layout)?;
         load_fixture::<O::Target>(&arena, &stream, regions, O::MAX_TOKENS)?;
         stream.synchronize().map_err(GpuError::from)?;
@@ -246,7 +276,7 @@ impl<O: BenchQkPrepareOp> Session<O> {
                     shape,
                     workload,
                     OperationAccounting::new(
-                        logical_bytes::<O::Target>(route_graph.tokens),
+                        logical_bytes::<O::Target>(route_graph.tokens, O::CACHE_ELEMENT_BYTES),
                         route_graph.tokens as u64,
                         "token",
                     ),
@@ -261,7 +291,10 @@ impl<O: BenchQkPrepareOp> Session<O> {
     }
 }
 
-fn layout<A: Arch>(max_tokens: usize) -> GpuResult<(ArenaLayout, Regions)> {
+fn layout<A: Arch>(
+    max_tokens: usize,
+    cache_element_bytes: usize,
+) -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
     let qkv = layout.reserve(max_tokens * A::ATTENTION_QKV_ROWS, ALIGNMENT)?;
     let query_norm = layout.reserve(A::HEAD_DIM, ALIGNMENT)?;
@@ -274,7 +307,8 @@ fn layout<A: Arch>(max_tokens: usize) -> GpuResult<(ArenaLayout, Regions)> {
     let prefill_table_rows = layout.reserve(max_tokens, ALIGNMENT)?;
     let prefill_cache_positions = layout.reserve(max_tokens, ALIGNMENT)?;
     let query = layout.reserve(max_tokens * A::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
-    let plane_bytes = PHYSICAL_PAGES * A::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * A::HEAD_DIM;
+    let plane_bytes =
+        PHYSICAL_PAGES * A::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * A::HEAD_DIM * cache_element_bytes;
     let key_pages = layout.reserve(plane_bytes, ALIGNMENT)?;
     let value_pages = layout.reserve(plane_bytes, ALIGNMENT)?;
 
@@ -399,14 +433,14 @@ fn launch(
     op.launch(stream, addresses, tokens)
 }
 
-fn logical_bytes<A: Arch>(tokens: usize) -> usize {
+fn logical_bytes<A: Arch>(tokens: usize, cache_element_bytes: usize) -> usize {
     let heads = A::NUM_ATTENTION_HEADS + A::NUM_KV_HEADS;
     let source_values = A::ATTENTION_OUTPUT_COLUMNS + 2 * A::ATTENTION_KV_ROWS;
     let norm_values = heads * A::HEAD_DIM;
     let rotary_values = heads * ROTARY_PAIRS * 2;
     let metadata_values = 3;
     let query_output = A::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>();
-    let cache_output = 2 * A::ATTENTION_KV_ROWS;
+    let cache_output = 2 * A::ATTENTION_KV_ROWS * cache_element_bytes;
     let per_token = (source_values + norm_values) * size_of::<u16>()
         + rotary_values * size_of::<f32>()
         + metadata_values * size_of::<u32>()
@@ -422,6 +456,7 @@ struct BenchmarkLabels {
     route: &'static str,
     weights: &'static str,
     cache: &'static str,
+    cache_description: &'static str,
     workspace: &'static str,
     padding: &'static str,
 }
@@ -431,6 +466,7 @@ const QWEN38_LABELS: BenchmarkLabels = BenchmarkLabels {
     route: "attention_qk_prepare/norm_mrope_cache_append",
     weights: "attention_qk_prepare/weights",
     cache: "attention_qk_prepare/kv_cache",
+    cache_description: "16 physical pages, four KV heads, 64 positions, E4M3 K/V",
     workspace: "attention_qk_prepare/address_stable_workspace",
     padding: "attention_qk_prepare/alignment_padding",
 };
@@ -440,6 +476,7 @@ const QWEN35_LABELS: BenchmarkLabels = BenchmarkLabels {
     route: "qwen35_attention_qk_prepare/norm_mrope_cache_append",
     weights: "qwen35_attention_qk_prepare/weights",
     cache: "qwen35_attention_qk_prepare/kv_cache",
+    cache_description: "16 physical pages, four KV heads, 64 positions, BF16 K/V",
     workspace: "qwen35_attention_qk_prepare/address_stable_workspace",
     padding: "qwen35_attention_qk_prepare/alignment_padding",
 };
@@ -467,7 +504,7 @@ fn benchmark_target<O: BenchQkPrepareOp>(
         labels.cache,
         BenchmarkMemoryKind::KvCache,
         cache_bytes,
-        "16 physical pages, four KV heads, 64 positions, E4M3 K/V",
+        labels.cache_description,
     )?;
     memory.register_owned(
         labels.workspace,
@@ -537,9 +574,12 @@ mod tests {
             + Qwen38_27B::ATTENTION_OUTPUT_COLUMNS * 4
             + 2 * Qwen38_27B::ATTENTION_KV_ROWS;
 
-        assert_eq!(logical_bytes::<Qwen38_27B>(1), per_token);
+        assert_eq!(logical_bytes::<Qwen38_27B>(1, size_of::<u8>()), per_token);
         for tokens in ROUTES {
-            assert_eq!(logical_bytes::<Qwen38_27B>(tokens), tokens * per_token);
+            assert_eq!(
+                logical_bytes::<Qwen38_27B>(tokens, size_of::<u8>()),
+                tokens * per_token
+            );
         }
 
         let qwen35_heads = Qwen35_9B::NUM_ATTENTION_HEADS + Qwen35_9B::NUM_KV_HEADS;
@@ -550,21 +590,49 @@ mod tests {
             + qwen35_heads * 32 * 2 * 4
             + 3 * 4
             + Qwen35_9B::ATTENTION_OUTPUT_COLUMNS * 4
-            + 2 * Qwen35_9B::ATTENTION_KV_ROWS;
-        assert_eq!(logical_bytes::<Qwen35_9B>(1), qwen35_per_token);
+            + 2 * Qwen35_9B::ATTENTION_KV_ROWS * size_of::<u16>();
+        assert_eq!(
+            logical_bytes::<Qwen35_9B>(1, size_of::<u16>()),
+            qwen35_per_token
+        );
     }
 
     #[test]
     fn arena_accounting_exposes_every_padding_byte() {
-        let (qwen38_layout, regions) = layout::<Qwen38_27B>(MAX_TOKENS).unwrap();
+        let (qwen38_layout, regions) = layout::<Qwen38_27B>(MAX_TOKENS, size_of::<u8>()).unwrap();
         assert_eq!(qwen38_layout.byte_len(), 56_895_488);
         assert_eq!(regions.payload_bytes(), 56_895_040);
         assert_eq!(qwen38_layout.byte_len() - regions.payload_bytes(), 448);
         assert_eq!(MAX_TOKENS, 1_024);
 
-        let (qwen35_layout, regions) = layout::<Qwen35_9B>(MAX_BATCH).unwrap();
-        assert_eq!(qwen35_layout.byte_len(), 2_396_672);
-        assert_eq!(regions.payload_bytes(), 2_395_776);
+        let (qwen35_layout, regions) = layout::<Qwen35_9B>(MAX_BATCH, size_of::<u16>()).unwrap();
+        assert_eq!(qwen35_layout.byte_len(), 4_493_824);
+        assert_eq!(regions.payload_bytes(), 4_492_928);
         assert_eq!(qwen35_layout.byte_len() - regions.payload_bytes(), 896);
+    }
+
+    #[test]
+    fn qwen35_bf16_cache_accounting_matches_the_production_route() {
+        let heads = Qwen35_9B::NUM_ATTENTION_HEADS + Qwen35_9B::NUM_KV_HEADS;
+        let per_token = (Qwen35_9B::ATTENTION_OUTPUT_COLUMNS
+            + 2 * Qwen35_9B::ATTENTION_KV_ROWS
+            + heads * Qwen35_9B::HEAD_DIM)
+            * size_of::<u16>()
+            + heads * 32 * 2 * size_of::<f32>()
+            + 3 * size_of::<u32>()
+            + Qwen35_9B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>()
+            + 2 * Qwen35_9B::ATTENTION_KV_ROWS * size_of::<u16>();
+        for batch in 1..=MAX_BATCH {
+            assert_eq!(
+                logical_bytes::<Qwen35_9B>(batch, size_of::<u16>()),
+                batch * per_token
+            );
+        }
+
+        let (layout, regions) = layout::<Qwen35_9B>(MAX_BATCH, size_of::<u16>()).unwrap();
+        assert_eq!(layout.byte_len(), 4_493_824);
+        assert_eq!(regions.payload_bytes(), 4_492_928);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 896);
+        assert_eq!(regions.cache_bytes(), 4_194_304);
     }
 }
