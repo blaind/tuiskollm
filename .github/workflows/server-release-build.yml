@@ -54,6 +54,7 @@ jobs:
             binutils \
             clang-21 \
             cuda-compiler-13-3=13.3.1-1 \
+            cuda-nvdisasm-13-3=13.3.73-1 \
             libclang-21-dev \
             libnvjitlink-dev-13-3=13.3.33-1 \
             llvm-21
@@ -64,6 +65,8 @@ jobs:
           set -euo pipefail
           ptxas --version | tee "${RUNNER_TEMP}/ptxas-version.txt"
           grep -F "release 13.3, V13.3.73" "${RUNNER_TEMP}/ptxas-version.txt"
+          nvdisasm --version | tee "${RUNNER_TEMP}/nvdisasm-version.txt"
+          grep -F "release 13.3, V13.3.73" "${RUNNER_TEMP}/nvdisasm-version.txt"
           clang-21 --version | head -1
           test -f "${CUDA_HOME}/include/cuda.h"
           test -f "${CUDA_HOME}/lib64/stubs/libcuda.so"
