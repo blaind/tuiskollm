@@ -23,6 +23,8 @@ mod qwen35_full_attention_layer_layout;
 mod qwen35_gdn_layer;
 mod qwen35_gdn_layer_layout;
 mod qwen35_nvfp4_mlp;
+mod qwen35_text_endpoint;
+mod qwen35_text_endpoint_layout;
 mod resident_generation;
 mod resident_model_layout;
 mod resident_mtp;
@@ -60,6 +62,8 @@ pub use qwen35_full_attention_layer_layout::Qwen35FullAttentionLayerLayout;
 pub use qwen35_gdn_layer::Qwen35GdnLayerProgram;
 pub use qwen35_gdn_layer_layout::Qwen35GdnLayerLayout;
 pub use qwen35_nvfp4_mlp::Qwen35Nvfp4MlpProgram;
+pub use qwen35_text_endpoint::Qwen35TextEndpointProgram;
+pub use qwen35_text_endpoint_layout::Qwen35TextEndpointLayout;
 pub use resident_generation::{
     ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentBatchGenerator,
     ResidentCancellation, ResidentGenerationSession, ResidentRequestId, ResidentTextGenerator,
@@ -110,6 +114,8 @@ pub use qwen35_full_attention_layer::{
 };
 #[cfg(feature = "qualification")]
 pub use qwen35_gdn_layer::{Qwen35GdnLayerImmutable, Qwen35GdnLayerObservables};
+#[cfg(feature = "qualification")]
+pub use qwen35_text_endpoint::Qwen35EndpointObservables;
 #[cfg(feature = "qualification")]
 pub use resident_model_layout::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
