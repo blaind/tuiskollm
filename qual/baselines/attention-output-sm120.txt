@@ -7,3 +7,5 @@ quantize_registers=25
 projection_registers=33,53,63,66,72,80,87,94
 quantize_shared_bytes=1056
 projection_shared_bytes=1024
+prefill_projection_registers=52,52,52,52
+prefill_projection_shared_bytes=1024
