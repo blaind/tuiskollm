@@ -646,7 +646,6 @@ impl Qwen35GdnLayerProgram {
         })
     }
 
-    #[cfg(feature = "qualification")]
     fn ops(&self) -> Ops<'_> {
         Ops {
             norm: &self._norm,
