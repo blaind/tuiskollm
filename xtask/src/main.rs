@@ -21,6 +21,7 @@ const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-residual-norm-sm120.txt";
 const QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt";
 const QWEN35_NVFP4_DOWN_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-down-sm120.txt";
+const QWEN35_NVFP4_QKV_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-qkv-sm120.txt";
 const FP8_QKV_RESOURCE_BASELINE: &str = "qual/baselines/fp8-qkv-sm120.txt";
 const FP8_GDN_INPUT_RESOURCE_BASELINE: &str = "qual/baselines/fp8-gdn-input-sm120.txt";
 const FP8_LM_HEAD_RESOURCE_BASELINE: &str = "qual/baselines/fp8-lm-head-sm120.txt";
@@ -449,6 +450,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-qwen35-residual-norm") => bench_qwen35_residual_norm(root, &remaining),
         Some("bench-qwen35-nvfp4-swiglu") => bench_qwen35_nvfp4_swiglu(root, &remaining),
         Some("bench-qwen35-nvfp4-down") => bench_qwen35_nvfp4_down(root, &remaining),
+        Some("bench-qwen35-nvfp4-qkv") => bench_qwen35_nvfp4_qkv(root, &remaining),
         Some("bench-qwen35-nvfp4-mlp") => bench_qwen35_nvfp4_mlp(root, &remaining),
         Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
         Some("bench-fp8-gdn-input") => bench_fp8_gdn_input(root, &remaining),
@@ -1703,6 +1705,32 @@ fn bench_qwen35_nvfp4_down(
             .env(
                 "TUISKO_GENERATOR_BASELINE_SHA256",
                 sha256(&fs::read(root.join(QWEN35_NVFP4_DOWN_RESOURCE_BASELINE))?),
+            ),
+    )
+}
+
+fn bench_qwen35_nvfp4_qkv(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen35-nvfp4-qkv")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(root.join(QWEN35_NVFP4_QKV_RESOURCE_BASELINE))?),
             ),
     )
 }
@@ -5378,6 +5406,10 @@ fn gate_qwen35_nvfp4_down(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn gate_qwen35_nvfp4_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN35_NVFP4_QKV_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
     let ptx_path = root.join(PTX);
     let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
         format!(
@@ -5445,6 +5477,8 @@ fn gate_qwen35_nvfp4_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
     }
     registers.sort_unstable();
     shared.sort_unstable();
+    require_registers(&baseline, "nvfp4_registers", &registers)?;
+    require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
         "Qwen3.5 NVFP4 QKV gate passed: 8 A16 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
