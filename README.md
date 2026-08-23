@@ -93,8 +93,10 @@ the shared 24-page cache row, P4 macro partials, and stable MLP tensor maps. The
 dense-FP8 GDN Q/K/V/Z input projection separately admits the same four prefill widths through
 64x64 E4M3 MMA tiles. GDN control and width-4 causal-convolution preparation admits the same
 widths, retaining one mapped history row and publishing its final three represented values only
-after every parallel convolution reader completes. GDN recurrence, output, layer composition, and
-resident/server routing remain separate slices, so these routes do not yet change server priming.
+after every parallel convolution reader completes. GDN recurrence admits the same widths with one
+causally advanced mapped FP32 state row; 48 value-head CTAs retain the decode reduction order while
+each CTA advances tokens serially. GDN output, layer composition, and resident/server routing
+remain separate slices, so these routes do not yet change server priming.
 
 ## Current device slice
 

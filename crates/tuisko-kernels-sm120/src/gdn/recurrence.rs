@@ -1,7 +1,7 @@
 //! Exact-batch FP32 GDN recurrence and gated normalization.
 
 use crate::Sm120Arch;
-use crate::device::gdn_recurrence::gdn_recurrence;
+use crate::device::gdn_recurrence::{gdn_recurrence, gdn_recurrence_prefill};
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -13,9 +13,14 @@ const VALUE_HEADS: usize = 48;
 const HEAD_DIM: usize = 128;
 const WARPS: usize = 16;
 const THREADS: u32 = (WARPS * 32) as u32;
+const PREFILL_ROWS: [usize; 4] = [32, 64, 128, 1_024];
 
 fn admitted_batch(batch: usize) -> bool {
     (1..=MAX_BATCH).contains(&batch)
+}
+
+fn admitted_rows(rows: usize) -> bool {
+    admitted_batch(rows) || PREFILL_ROWS.contains(&rows)
 }
 
 fn require_geometry<A: Arch>() -> GpuResult<()> {
@@ -85,6 +90,53 @@ mod kernels {
             );
         }
     }
+
+    /// Advances one mapped state row through an exact causal prefill sequence.
+    #[kernel]
+    #[launch_bounds(512, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (512, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn gdn_recurrence_prefill_exact<A: Arch, const TOKENS: usize>(
+        qkv: *const u16,
+        projected: *const u16,
+        log_decay: *const f32,
+        beta: *const f32,
+        norm_weight: *const u16,
+        state_rows: *const u32,
+        state: *mut f32,
+        output: *mut u16,
+    ) {
+        static mut QUERY: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
+        static mut KEY: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
+        static mut RECURRENT_OUTPUT: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
+        static mut REDUCTION: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
+
+        // State dependence permits exactly 48 independent value-head CTAs.
+        // Each CTA advances tokens serially while its 16 warps retain decode's
+        // four-columns-per-lane state update and reduction order.
+        unsafe {
+            gdn_recurrence_prefill::<A, TOKENS>(
+                qkv,
+                projected,
+                log_decay,
+                beta,
+                norm_weight,
+                state_rows,
+                state,
+                output,
+                core::ptr::addr_of_mut!(QUERY).cast::<f32>(),
+                core::ptr::addr_of_mut!(KEY).cast::<f32>(),
+                core::ptr::addr_of_mut!(RECURRENT_OUTPUT).cast::<f32>(),
+                core::ptr::addr_of_mut!(REDUCTION).cast::<f32>(),
+            );
+        }
+    }
 }
 
 struct PreparedRoute<A: Arch, const TOKENS: usize> {
@@ -133,7 +185,60 @@ impl<A: Arch, const TOKENS: usize> PreparedRoute<A, TOKENS> {
     }
 }
 
-/// Prepared FP32 GDN recurrence routes for every exact decode batch.
+struct PreparedPrefillRoute<A: Arch, const TOKENS: usize> {
+    launch: PreparedLaunch<kernels::__gdn_recurrence_prefill_exact_CudaKernel<A, TOKENS>>,
+}
+
+impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !PREFILL_ROWS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "GDN recurrence prefill route T={TOKENS} is not admitted"
+            )));
+        }
+        let launch = module
+            .prepare_gdn_recurrence_prefill_exact::<A, TOKENS>(LaunchConfig1D::new(
+                VALUE_HEADS as u32,
+                THREADS,
+                0,
+            ))
+            .map_err(|source| GpuError::launch("preparing GDN recurrence prefill", source))?;
+
+        Ok(Self { launch })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        qkv: *const u16,
+        projected: *const u16,
+        log_decay: *const f32,
+        beta: *const f32,
+        norm_weight: *const u16,
+        state_rows: *const u32,
+        state: *mut f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .gdn_recurrence_prefill_exact::<A, TOKENS>(
+                stream,
+                &self.launch,
+                qkv,
+                projected,
+                log_decay,
+                beta,
+                norm_weight,
+                state_rows,
+                state,
+                output,
+            )
+            .map_err(|source| GpuError::launch("launching GDN recurrence prefill", source))
+    }
+}
+
+/// Prepared FP32 GDN recurrence routes for exact decode and prefill rows.
 pub struct GdnRecurrenceOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
     b1: PreparedRoute<A, 1>,
@@ -144,6 +249,10 @@ pub struct GdnRecurrenceOp<A: Sm120Arch = Qwen38_27B> {
     b6: PreparedRoute<A, 6>,
     b7: PreparedRoute<A, 7>,
     b8: PreparedRoute<A, 8>,
+    t32: PreparedPrefillRoute<A, 32>,
+    t64: PreparedPrefillRoute<A, 64>,
+    t128: PreparedPrefillRoute<A, 128>,
+    t1024: PreparedPrefillRoute<A, 1_024>,
 }
 
 impl<A: Sm120Arch> GdnRecurrenceOp<A> {
@@ -164,6 +273,10 @@ impl<A: Sm120Arch> GdnRecurrenceOp<A> {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
+            t1024: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -172,19 +285,20 @@ impl<A: Sm120Arch> GdnRecurrenceOp<A> {
     ///
     /// # Safety
     ///
-    /// `qkv` and `projected` cover `[batch, A::GDN_QKV_ROWS]` and
-    /// `[batch, A::GDN_INPUT_ROWS]` BF16 values. Controls cover
-    /// `[batch, A::GDN_CONTROL_ROWS]`; `norm_weight` covers one head;
+    /// `qkv` and `projected` cover `[rows, A::GDN_QKV_ROWS]` and
+    /// `[rows, A::GDN_INPUT_ROWS]` BF16 values. Controls cover
+    /// `[rows, A::GDN_CONTROL_ROWS]`; `norm_weight` covers one head;
     /// every state-row index is below the caller-owned `[rows,
     /// A::GDN_CONTROL_ROWS, A::LINEAR_HEAD_DIM, A::LINEAR_HEAD_DIM]` FP32
-    /// state; and `output` covers `[batch, A::GDN_VALUE_ROWS]` BF16 values.
+    /// state; and `output` covers `[rows, A::GDN_VALUE_ROWS]` BF16 values.
+    /// Prefill routes read one state-row index and advance that row causally.
     /// Allocations are aligned, non-overlapping, live through completion, and
     /// belong to `stream`'s context.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         qkv: *const u16,
         projected: *const u16,
         log_decay: *const f32,
@@ -194,9 +308,9 @@ impl<A: Sm120Arch> GdnRecurrenceOp<A> {
         state: *mut f32,
         output: *mut u16,
     ) -> GpuResult<()> {
-        if !admitted_batch(batch) {
+        if !admitted_rows(rows) {
             return Err(GpuError::invalid_launch(format!(
-                "GDN recurrence batch {batch} is outside the admitted range 1..={MAX_BATCH}"
+                "GDN recurrence row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128,1024"
             )));
         }
 
@@ -219,7 +333,7 @@ impl<A: Sm120Arch> GdnRecurrenceOp<A> {
             };
         }
 
-        match batch {
+        match rows {
             1 => launch!(b1),
             2 => launch!(b2),
             3 => launch!(b3),
@@ -228,14 +342,18 @@ impl<A: Sm120Arch> GdnRecurrenceOp<A> {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
+            1_024 => launch!(t1024),
             _ => unreachable!(),
         }
     }
 }
 
 /// PTX symbols retained for every exact GDN recurrence route.
-pub(crate) fn gdn_recurrence_ptx_names() -> [&'static str; MAX_BATCH] {
-    [
+pub(crate) fn gdn_recurrence_ptx_names() -> Vec<&'static str> {
+    vec![
         kernels::gdn_recurrence_exact_ptx_name::<Qwen38_27B, 1>(),
         kernels::gdn_recurrence_exact_ptx_name::<Qwen38_27B, 2>(),
         kernels::gdn_recurrence_exact_ptx_name::<Qwen38_27B, 3>(),
@@ -244,13 +362,17 @@ pub(crate) fn gdn_recurrence_ptx_names() -> [&'static str; MAX_BATCH] {
         kernels::gdn_recurrence_exact_ptx_name::<Qwen38_27B, 6>(),
         kernels::gdn_recurrence_exact_ptx_name::<Qwen38_27B, 7>(),
         kernels::gdn_recurrence_exact_ptx_name::<Qwen38_27B, 8>(),
+        kernels::gdn_recurrence_prefill_exact_ptx_name::<Qwen38_27B, 32>(),
+        kernels::gdn_recurrence_prefill_exact_ptx_name::<Qwen38_27B, 64>(),
+        kernels::gdn_recurrence_prefill_exact_ptx_name::<Qwen38_27B, 128>(),
+        kernels::gdn_recurrence_prefill_exact_ptx_name::<Qwen38_27B, 1_024>(),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        HEAD_DIM, KEY_HEADS, MAX_BATCH, THREADS, VALUE_HEADS, admitted_batch,
+        HEAD_DIM, KEY_HEADS, MAX_BATCH, THREADS, VALUE_HEADS, admitted_batch, admitted_rows,
         gdn_recurrence_ptx_names,
     };
     use std::collections::BTreeSet;
@@ -271,6 +393,23 @@ mod tests {
     }
 
     #[test]
+    fn row_table_covers_exact_decode_and_prefill_routes() {
+        for (rows, expected) in [
+            (0, false),
+            (1, true),
+            (8, true),
+            (9, false),
+            (32, true),
+            (64, true),
+            (128, true),
+            (1_024, true),
+            (1_025, false),
+        ] {
+            assert_eq!(admitted_rows(rows), expected, "rows={rows}");
+        }
+    }
+
+    #[test]
     fn geometry_matches_the_exact_state_contract() {
         assert_eq!(THREADS, 512);
         assert_eq!(VALUE_HEADS / KEY_HEADS, 3);
@@ -280,11 +419,11 @@ mod tests {
     }
 
     #[test]
-    fn ptx_inventory_has_one_entry_per_batch() {
+    fn ptx_inventory_has_decode_and_prefill_entries() {
         let names = gdn_recurrence_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), MAX_BATCH);
+        assert_eq!(names.len(), MAX_BATCH + 4);
         assert_eq!(unique.len(), names.len());
     }
 }

@@ -1,13 +1,17 @@
 //! Numerical and graph qualification for exact GDN recurrence routes.
 
+use crate::device_benchmark::{preflight, require_current_process_exclusive};
 use crate::fp8_projection_oracle::{BF16_SENTINEL, BYTE_SENTINEL, bf16_to_f32, f32_to_bf16};
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
+    device_memory_info,
 };
 use tuisko_kernels_sm120::GdnRecurrenceOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, MAX_BATCH, 32, 64, 128, MAX_ROWS];
 const ALIGNMENT: usize = 256;
 const HEAD_DIM: usize = 128;
 const KEY_HEADS: usize = 16;
@@ -42,6 +46,14 @@ pub struct GdnRecurrenceQualification {
     pub graph_replay_values: usize,
     /// Unmapped state and inactive outputs verified unchanged.
     pub inactive_values: usize,
+    /// Caller-owned input, controls, mapping, and norm values verified unchanged.
+    pub immutable_values: usize,
+    /// Exact bytes in the one-allocation qualification arena.
+    pub arena_bytes: usize,
+    /// Exact payload bytes, excluding alignment padding.
+    pub payload_bytes: usize,
+    /// Alignment padding bytes in the qualification arena.
+    pub padding_bytes: usize,
     /// Largest absolute state error.
     pub maximum_state_error: f32,
     /// Largest absolute output error.
@@ -60,6 +72,19 @@ struct Regions {
     output: ArenaRegion<u16>,
 }
 
+impl Regions {
+    fn payload_bytes(self) -> usize {
+        self.qkv.byte_len()
+            + self.projected.byte_len()
+            + self.log_decay.byte_len()
+            + self.beta.byte_len()
+            + self.norm_weight.byte_len()
+            + self.state_rows.byte_len()
+            + self.state.byte_len()
+            + self.output.byte_len()
+    }
+}
+
 struct Fixture {
     qkv: Vec<u16>,
     projected: Vec<u16>,
@@ -70,6 +95,12 @@ struct Fixture {
 }
 
 struct Observed {
+    qkv: Vec<u16>,
+    projected: Vec<u16>,
+    log_decay: Vec<f32>,
+    beta: Vec<f32>,
+    norm_weight: Vec<u16>,
+    state_rows: Vec<u32>,
     state: Vec<f32>,
     output: Vec<u16>,
 }
@@ -79,9 +110,10 @@ struct Oracle {
     output: Vec<f64>,
 }
 
-/// Qualifies eager and captured recurrence routes at exact `B=1..=8`.
+/// Qualifies eager and captured recurrence routes at exact decode and prefill rows.
 pub fn qualify_gdn_recurrence()
 -> Result<GdnRecurrenceQualification, GdnRecurrenceQualificationError> {
+    preflight().map_err(|error| GdnRecurrenceQualificationError::Mismatch(error.to_string()))?;
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
     if capability != (12, 0) {
@@ -96,49 +128,62 @@ pub fn qualify_gdn_recurrence()
     let fixture = fixture();
     load_fixture(&arena, &stream, regions, &fixture)?;
     let op = GdnRecurrenceOp::new(&context)?;
+    require_current_process_exclusive()
+        .map_err(|error| GdnRecurrenceQualificationError::Mismatch(error.to_string()))?;
     let stable_addresses = addresses(&arena, regions)?;
     let mut report = GdnRecurrenceQualification {
         state_values: 0,
         output_values: 0,
         graph_replay_values: 0,
         inactive_values: 0,
+        immutable_values: 0,
+        arena_bytes: layout.byte_len(),
+        payload_bytes: regions.payload_bytes(),
+        padding_bytes: layout.byte_len() - regions.payload_bytes(),
         maximum_state_error: 0.0,
         maximum_output_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
+    for rows in EXACT_ROUTES {
         reset(&arena, &stream, regions, &fixture)?;
-        launch(&op, &arena, &stream, regions, batch)?;
+        launch(&op, &arena, &stream, regions, rows)?;
         let eager = observe(&arena, &stream, regions)?;
-        verify_oracle(batch, &fixture, &eager, &mut report)?;
+        verify_oracle(rows, &fixture, &eager, &mut report)?;
 
         reset(&arena, &stream, regions, &fixture)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
+        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, rows))?;
         graph.launch(&stream)?;
         let replay = observe(&arena, &stream, regions)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay(rows, &fixture, &eager, &replay, &mut report)?;
+
+        reset(&arena, &stream, regions, &fixture)?;
+        graph.launch(&stream)?;
+        let second_replay = observe(&arena, &stream, regions)?;
+        verify_replay(rows, &fixture, &eager, &second_replay, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(GdnRecurrenceQualificationError::Mismatch(format!(
-                "device addresses changed while qualifying B={batch}"
+                "device addresses changed while qualifying row count {rows}"
             )));
         }
     }
+
+    verify_no_post_warmup_allocation(&context, &op, &arena, &stream, regions, &fixture)?;
 
     Ok(report)
 }
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let qkv = layout.reserve(MAX_BATCH * Qwen38_27B::GDN_QKV_ROWS, ALIGNMENT)?;
-    let projected = layout.reserve(MAX_BATCH * Qwen38_27B::GDN_INPUT_ROWS, ALIGNMENT)?;
-    let log_decay = layout.reserve(MAX_BATCH * VALUE_HEADS, ALIGNMENT)?;
-    let beta = layout.reserve(MAX_BATCH * VALUE_HEADS, ALIGNMENT)?;
+    let qkv = layout.reserve(MAX_ROWS * Qwen38_27B::GDN_QKV_ROWS, ALIGNMENT)?;
+    let projected = layout.reserve(MAX_ROWS * Qwen38_27B::GDN_INPUT_ROWS, ALIGNMENT)?;
+    let log_decay = layout.reserve(MAX_ROWS * VALUE_HEADS, ALIGNMENT)?;
+    let beta = layout.reserve(MAX_ROWS * VALUE_HEADS, ALIGNMENT)?;
     let norm_weight = layout.reserve(HEAD_DIM, ALIGNMENT)?;
     let state_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
     let state = layout.reserve(MAX_BATCH * STATE_PER_ROW, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * VALUE_WIDTH, ALIGNMENT)?;
+    let output = layout.reserve(MAX_ROWS * VALUE_WIDTH, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -160,9 +205,9 @@ fn fixture() -> Fixture {
     const VALUE: [f32; 8] = [0.5, -0.375, 0.25, -0.125, 0.0625, -0.03125, 0.1875, -0.25];
     const GATE: [f32; 8] = [-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0];
     const NORM: [f32; 8] = [0.75, 0.875, 1.0, 1.125, 0.625, 1.25, 0.5, 1.5];
-    let mut qkv = vec![0; MAX_BATCH * Qwen38_27B::GDN_QKV_ROWS];
-    let mut projected = vec![0; MAX_BATCH * Qwen38_27B::GDN_INPUT_ROWS];
-    for token in 0..MAX_BATCH {
+    let mut qkv = vec![0; MAX_ROWS * Qwen38_27B::GDN_QKV_ROWS];
+    let mut projected = vec![0; MAX_ROWS * Qwen38_27B::GDN_INPUT_ROWS];
+    for token in 0..MAX_ROWS {
         let qkv_base = token * Qwen38_27B::GDN_QKV_ROWS;
         for index in 0..QK_WIDTH {
             qkv[qkv_base + index] = f32_to_bf16(QK[(index + token) & 7]);
@@ -174,10 +219,10 @@ fn fixture() -> Fixture {
                 f32_to_bf16(GATE[(index + index / HEAD_DIM + token) & 7]);
         }
     }
-    let log_decay = (0..MAX_BATCH * VALUE_HEADS)
+    let log_decay = (0..MAX_ROWS * VALUE_HEADS)
         .map(|index| -0.125 - (index & 7) as f32 * 0.03125)
         .collect();
-    let beta = (0..MAX_BATCH * VALUE_HEADS)
+    let beta = (0..MAX_ROWS * VALUE_HEADS)
         .map(|index| 0.25 + (index & 3) as f32 * 0.125)
         .collect();
     let norm_weight = (0..HEAD_DIM)
@@ -239,14 +284,14 @@ fn launch(
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     // SAFETY: all regions cover their maximum extents and every mapped row is
     // below the eight-row state capacity.
     unsafe {
         op.launch(
             stream,
-            batch,
+            rows,
             arena.address(regions.qkv)?,
             arena.address(regions.projected)?,
             arena.address(regions.log_decay)?,
@@ -265,19 +310,30 @@ fn observe(
     regions: Regions,
 ) -> GpuResult<Observed> {
     Ok(Observed {
+        qkv: arena.copy_to_host(stream, regions.qkv)?,
+        projected: arena.copy_to_host(stream, regions.projected)?,
+        log_decay: arena.copy_to_host(stream, regions.log_decay)?,
+        beta: arena.copy_to_host(stream, regions.beta)?,
+        norm_weight: arena.copy_to_host(stream, regions.norm_weight)?,
+        state_rows: arena.copy_to_host(stream, regions.state_rows)?,
         state: arena.copy_to_host(stream, regions.state)?,
         output: arena.copy_to_host(stream, regions.output)?,
     })
 }
 
-fn oracle(batch: usize, fixture: &Fixture) -> Oracle {
+fn oracle(rows: usize, fixture: &Fixture) -> Oracle {
     let mut state = fixture
         .state
         .iter()
         .map(|&value| f64::from(value))
         .collect::<Vec<_>>();
-    let mut output = vec![0.0; batch * VALUE_WIDTH];
-    for (token, &state_row) in STATE_ROWS[..batch].iter().enumerate() {
+    let mut output = vec![0.0; rows * VALUE_WIDTH];
+    for token in 0..rows {
+        let state_row = if rows <= MAX_BATCH {
+            STATE_ROWS[token]
+        } else {
+            STATE_ROWS[0]
+        };
         let qkv_base = token * Qwen38_27B::GDN_QKV_ROWS;
         let mut query = vec![[0.0f64; HEAD_DIM]; KEY_HEADS];
         let mut key = vec![[0.0f64; HEAD_DIM]; KEY_HEADS];
@@ -336,22 +392,29 @@ fn oracle(batch: usize, fixture: &Fixture) -> Oracle {
 }
 
 fn verify_oracle(
-    batch: usize,
+    rows: usize,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut GdnRecurrenceQualification,
 ) -> Result<(), GdnRecurrenceQualificationError> {
-    let expected = oracle(batch, fixture);
-    let active_rows = &STATE_ROWS[..batch];
+    verify_immutable(rows, fixture, observed)?;
+    let expected = oracle(rows, fixture);
+    let active_state_rows = if rows <= MAX_BATCH { rows } else { 1 };
     for (index, (&actual, &expected)) in observed.state.iter().zip(&expected.state).enumerate() {
         let error = (f64::from(actual) - expected).abs() as f32;
         report.maximum_state_error = report.maximum_state_error.max(error);
         if error > 2.0e-4f32.max(expected.abs() as f32 * 0.002) {
             return Err(GdnRecurrenceQualificationError::Mismatch(format!(
-                "state at B={batch}, index={index}: device={actual}, oracle={expected}, error={error}"
+                "state at rows={rows}, index={index}: device={actual}, oracle={expected}, error={error}"
             )));
         }
-        if active_rows.contains(&((index / STATE_PER_ROW) as u32)) {
+        let state_row = (index / STATE_PER_ROW) as u32;
+        let active = if rows <= MAX_BATCH {
+            STATE_ROWS[..rows].contains(&state_row)
+        } else {
+            state_row == STATE_ROWS[0]
+        };
+        if active {
             report.state_values += 1;
         } else {
             report.inactive_values += 1;
@@ -363,31 +426,99 @@ fn verify_oracle(
         report.maximum_output_error = report.maximum_output_error.max(error);
         if error > 0.015625f32.max(expected.abs() as f32 * 0.01) {
             return Err(GdnRecurrenceQualificationError::Mismatch(format!(
-                "output at B={batch}, index={index}: device={actual}, oracle={expected}, error={error}"
+                "output at rows={rows}, index={index}: device={actual}, oracle={expected}, error={error}"
             )));
         }
         report.output_values += 1;
     }
-    if let Some(relative) = observed.output[batch * VALUE_WIDTH..]
+    if let Some(relative) = observed.output[rows * VALUE_WIDTH..]
         .iter()
         .position(|&bits| bits != BF16_SENTINEL)
     {
         return Err(GdnRecurrenceQualificationError::Mismatch(format!(
-            "B={batch} modified inactive output {}",
-            batch * VALUE_WIDTH + relative
+            "rows={rows} modified inactive output {}",
+            rows * VALUE_WIDTH + relative
         )));
     }
-    report.inactive_values += (MAX_BATCH - batch) * VALUE_WIDTH;
+    debug_assert!(active_state_rows <= MAX_BATCH);
+    report.inactive_values += (MAX_ROWS - rows) * VALUE_WIDTH;
+    report.immutable_values += immutable_values(fixture);
 
     Ok(())
 }
 
+fn verify_immutable(
+    rows: usize,
+    fixture: &Fixture,
+    observed: &Observed,
+) -> Result<(), GdnRecurrenceQualificationError> {
+    for (name, actual, expected) in [
+        ("qkv", observed.qkv.as_slice(), fixture.qkv.as_slice()),
+        (
+            "projected",
+            observed.projected.as_slice(),
+            fixture.projected.as_slice(),
+        ),
+        (
+            "norm_weight",
+            observed.norm_weight.as_slice(),
+            fixture.norm_weight.as_slice(),
+        ),
+    ] {
+        if let Some(index) = actual
+            .iter()
+            .zip(expected)
+            .position(|(actual, expected)| actual != expected)
+        {
+            return Err(GdnRecurrenceQualificationError::Mismatch(format!(
+                "rows={rows} modified immutable {name} value {index}"
+            )));
+        }
+    }
+    for (name, actual, expected) in [
+        (
+            "log_decay",
+            observed.log_decay.as_slice(),
+            fixture.log_decay.as_slice(),
+        ),
+        ("beta", observed.beta.as_slice(), fixture.beta.as_slice()),
+    ] {
+        if let Some(index) = actual
+            .iter()
+            .zip(expected)
+            .position(|(actual, expected)| actual.to_bits() != expected.to_bits())
+        {
+            return Err(GdnRecurrenceQualificationError::Mismatch(format!(
+                "rows={rows} modified immutable {name} value {index}"
+            )));
+        }
+    }
+    if observed.state_rows != STATE_ROWS {
+        return Err(GdnRecurrenceQualificationError::Mismatch(format!(
+            "rows={rows} modified immutable state-row mapping"
+        )));
+    }
+
+    Ok(())
+}
+
+fn immutable_values(fixture: &Fixture) -> usize {
+    fixture.qkv.len()
+        + fixture.projected.len()
+        + fixture.log_decay.len()
+        + fixture.beta.len()
+        + fixture.norm_weight.len()
+        + STATE_ROWS.len()
+}
+
 fn verify_replay(
-    batch: usize,
+    rows: usize,
+    fixture: &Fixture,
     eager: &Observed,
     replay: &Observed,
     report: &mut GdnRecurrenceQualification,
 ) -> Result<(), GdnRecurrenceQualificationError> {
+    verify_immutable(rows, fixture, replay)?;
     if let Some(index) = replay
         .state
         .iter()
@@ -395,7 +526,7 @@ fn verify_replay(
         .position(|(actual, expected)| actual.to_bits() != expected.to_bits())
     {
         return Err(GdnRecurrenceQualificationError::Mismatch(format!(
-            "B={batch} graph state value {index} differs from eager"
+            "rows={rows} graph state value {index} differs from eager"
         )));
     }
     if let Some(index) = replay
@@ -405,10 +536,47 @@ fn verify_replay(
         .position(|(actual, expected)| actual != expected)
     {
         return Err(GdnRecurrenceQualificationError::Mismatch(format!(
-            "B={batch} graph output value {index} differs from eager"
+            "rows={rows} graph output value {index} differs from eager"
         )));
     }
-    report.graph_replay_values += replay.state.len() + batch * VALUE_WIDTH;
+    report.graph_replay_values += replay.state.len() + rows * VALUE_WIDTH;
+    report.immutable_values += immutable_values(fixture);
+
+    Ok(())
+}
+
+fn verify_no_post_warmup_allocation(
+    context: &CudaContext,
+    op: &GdnRecurrenceOp,
+    arena: &DeviceArena,
+    stream: &tuisko_gpu::CudaStream,
+    regions: Regions,
+    fixture: &Fixture,
+) -> Result<(), GdnRecurrenceQualificationError> {
+    let mut graphs = Vec::with_capacity(EXACT_ROUTES.len());
+    for rows in EXACT_ROUTES {
+        reset(arena, stream, regions, fixture)?;
+        graphs.push(CudaGraph::capture(stream, || {
+            launch(op, arena, stream, regions, rows)
+        })?);
+    }
+    for graph in &graphs {
+        graph.launch(stream)?;
+    }
+    stream.synchronize().map_err(GpuError::from)?;
+    let before = device_memory_info(context)?;
+    for _ in 0..4 {
+        for graph in graphs.iter().rev() {
+            graph.launch(stream)?;
+        }
+    }
+    stream.synchronize().map_err(GpuError::from)?;
+    let after = device_memory_info(context)?;
+    if before != after {
+        return Err(GdnRecurrenceQualificationError::Mismatch(format!(
+            "device memory changed after warmup: before={before:?}, after={after:?}"
+        )));
+    }
 
     Ok(())
 }
@@ -416,30 +584,51 @@ fn verify_replay(
 #[cfg(test)]
 mod tests {
     use super::{
-        GdnRecurrenceQualificationError, MAX_BATCH, STATE_PER_ROW, VALUE_WIDTH,
-        qualify_gdn_recurrence,
+        EXACT_ROUTES, GdnRecurrenceQualificationError, MAX_BATCH, MAX_ROWS, STATE_PER_ROW,
+        VALUE_WIDTH, fixture, immutable_values, layout, qualify_gdn_recurrence,
     };
 
     #[test]
     #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
-    fn exact_batches_match_independent_oracles_and_graph_replay()
+    fn exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), GdnRecurrenceQualificationError> {
         let report = qualify_gdn_recurrence()?;
-        let active_rows = (1..=MAX_BATCH).sum::<usize>();
+        let active_rows = EXACT_ROUTES.iter().sum::<usize>();
+        let active_state_rows = (1..=MAX_BATCH).sum::<usize>() + 4;
+        let inactive_state_rows = EXACT_ROUTES.len() * MAX_BATCH - active_state_rows;
+        let inactive_output_rows = EXACT_ROUTES
+            .iter()
+            .map(|rows| MAX_ROWS - rows)
+            .sum::<usize>();
 
-        assert_eq!(report.state_values, active_rows * STATE_PER_ROW);
+        assert_eq!(report.state_values, active_state_rows * STATE_PER_ROW);
         assert_eq!(report.output_values, active_rows * VALUE_WIDTH);
         assert_eq!(
             report.graph_replay_values,
-            MAX_BATCH * MAX_BATCH * STATE_PER_ROW + active_rows * VALUE_WIDTH
+            2 * (EXACT_ROUTES.len() * MAX_BATCH * STATE_PER_ROW + active_rows * VALUE_WIDTH)
         );
         assert_eq!(
             report.inactive_values,
-            (0..MAX_BATCH).sum::<usize>() * (STATE_PER_ROW + VALUE_WIDTH)
+            inactive_state_rows * STATE_PER_ROW + inactive_output_rows * VALUE_WIDTH
+        );
+        assert_eq!(
+            report.immutable_values,
+            3 * EXACT_ROUTES.len() * immutable_values(&fixture())
+        );
+        assert_eq!(
+            report.arena_bytes,
+            report.payload_bytes + report.padding_bytes
         );
         assert!(report.maximum_state_error <= 0.002);
         assert!(report.maximum_output_error <= 0.03125);
 
         Ok(())
+    }
+
+    #[test]
+    fn route_inventory_and_arena_accounting_are_exact() {
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
+        let (layout, regions) = layout().unwrap();
+        assert_eq!(layout.byte_len(), regions.payload_bytes() + 224);
     }
 }

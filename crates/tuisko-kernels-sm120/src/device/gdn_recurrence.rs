@@ -40,26 +40,22 @@ fn block_sum(value: f32, shared: *mut f32, lane: usize, warp_index: usize) -> f3
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn gdn_recurrence<A: Arch, const TOKENS: usize>(
+unsafe fn gdn_recurrence_token<A: Arch>(
     qkv: *const u16,
     projected: *const u16,
     log_decay: *const f32,
     beta: *const f32,
     norm_weight: *const u16,
-    state_rows: *const u32,
     state: *mut f32,
     output: *mut u16,
+    token: usize,
+    value_head: usize,
+    state_row: usize,
     query: *mut f32,
     key: *mut f32,
     recurrent_output: *mut f32,
     reduction: *mut f32,
 ) {
-    let block = thread::blockIdx_x() as usize;
-    let token = block / VALUE_HEADS;
-    if token >= TOKENS {
-        return;
-    }
-    let value_head = block - token * VALUE_HEADS;
     let key_head = value_head / (VALUE_HEADS / KEY_HEADS);
     let tid = thread::threadIdx_x() as usize;
     let lane = tid & 31;
@@ -107,7 +103,6 @@ pub(crate) unsafe fn gdn_recurrence<A: Arch, const TOKENS: usize>(
         float::ex2_approx_f32(unsafe { *log_decay.add(control) } * core::f32::consts::LOG2_E);
     let beta = unsafe { *beta.add(control) };
     let value_row = unsafe { token_qkv.add(2 * QK_WIDTH + value_head * HEAD_DIM) };
-    let state_row = unsafe { *state_rows.add(token) as usize };
     let state = unsafe { state.add((state_row * VALUE_HEADS + value_head) * HEAD_DIM * HEAD_DIM) };
     let mut row = warp_index;
 
@@ -182,5 +177,93 @@ pub(crate) unsafe fn gdn_recurrence<A: Arch, const TOKENS: usize>(
             *output.add(token * VALUE_WIDTH + value_head * HEAD_DIM + tid) =
                 tcgen05::f32_to_bf16_rne(normalized * silu);
         }
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn gdn_recurrence<A: Arch, const TOKENS: usize>(
+    qkv: *const u16,
+    projected: *const u16,
+    log_decay: *const f32,
+    beta: *const f32,
+    norm_weight: *const u16,
+    state_rows: *const u32,
+    state: *mut f32,
+    output: *mut u16,
+    query: *mut f32,
+    key: *mut f32,
+    recurrent_output: *mut f32,
+    reduction: *mut f32,
+) {
+    let block = thread::blockIdx_x() as usize;
+    let token = block / VALUE_HEADS;
+    if token >= TOKENS {
+        return;
+    }
+    let value_head = block - token * VALUE_HEADS;
+    let state_row = unsafe { *state_rows.add(token) as usize };
+    unsafe {
+        gdn_recurrence_token::<A>(
+            qkv,
+            projected,
+            log_decay,
+            beta,
+            norm_weight,
+            state,
+            output,
+            token,
+            value_head,
+            state_row,
+            query,
+            key,
+            recurrent_output,
+            reduction,
+        );
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn gdn_recurrence_prefill<A: Arch, const TOKENS: usize>(
+    qkv: *const u16,
+    projected: *const u16,
+    log_decay: *const f32,
+    beta: *const f32,
+    norm_weight: *const u16,
+    state_rows: *const u32,
+    state: *mut f32,
+    output: *mut u16,
+    query: *mut f32,
+    key: *mut f32,
+    recurrent_output: *mut f32,
+    reduction: *mut f32,
+) {
+    let value_head = thread::blockIdx_x() as usize;
+    if value_head >= VALUE_HEADS {
+        return;
+    }
+    let state_row = unsafe { *state_rows as usize };
+    let mut token = 0;
+    while token < TOKENS {
+        unsafe {
+            gdn_recurrence_token::<A>(
+                qkv,
+                projected,
+                log_decay,
+                beta,
+                norm_weight,
+                state,
+                output,
+                token,
+                value_head,
+                state_row,
+                query,
+                key,
+                recurrent_output,
+                reduction,
+            );
+        }
+        token += 1;
     }
 }
