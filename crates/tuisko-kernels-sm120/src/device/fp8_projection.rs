@@ -354,7 +354,7 @@ pub(crate) unsafe fn fp8_projection<
 }
 
 #[inline(always)]
-unsafe fn store_qkv_mma_tile<A: Arch>(
+unsafe fn store_qkv_mma_t16_tile<A: Arch>(
     values: [f32; 4],
     activation_scales: *const f32,
     weight_scales: *const u16,
@@ -362,13 +362,11 @@ unsafe fn store_qkv_mma_tile<A: Arch>(
     first_token: usize,
     first_output: usize,
 ) {
-    // SAFETY: the exact QKV tile maps both scale words within the source plane.
     let first_weight_scale =
         f32::from_bits((unsafe { *weight_scales.add(first_output) } as u32) << 16);
-    // SAFETY: output columns are paired and the second scale is adjacent.
     let second_weight_scale =
         f32::from_bits((unsafe { *weight_scales.add(first_output + 1) } as u32) << 16);
-    // SAFETY: the T=16 tile maps both token rows and output columns uniquely.
+    // SAFETY: the specialized T=16 tile maps both token rows and columns uniquely.
     unsafe {
         let activation_scale = *activation_scales.add(first_token);
         *output.add(first_token * A::ATTENTION_QKV_ROWS + first_output) =
@@ -389,7 +387,7 @@ unsafe fn store_qkv_mma_tile<A: Arch>(
     }
 }
 
-/// Projects exactly 16 quantized rows with the retained two-warp tensor-core tile.
+/// Projects exactly 16 quantized rows with the unchanged two-warp tensor-core tile.
 #[inline(always)]
 pub(crate) unsafe fn qkv_projection_mma_t16<A: Arch>(
     activation_codes: *const u32,
@@ -416,7 +414,6 @@ pub(crate) unsafe fn qkv_projection_mma_t16<A: Arch>(
     let first_output_tile = output_tile * OUTPUT_ROWS_PER_BLOCK;
     let warp_output = first_output_tile + warp_index * 32;
     let activation_tile = DynamicSharedArray::<u32, 16>::get();
-    // SAFETY: two 16-row activation stages precede the weight stages.
     let weight_tile = unsafe { activation_tile.add(STAGES * TOKENS * K_WORDS) };
     let mut accumulator0 = [0.0f32; 4];
     let mut accumulator1 = [0.0f32; 4];
@@ -453,7 +450,7 @@ pub(crate) unsafe fn qkv_projection_mma_t16<A: Arch>(
     let mut stage = 0usize;
     let mut k_tile = 0usize;
     while k_tile < k_tiles as usize {
-        // SAFETY: every next-stage copy remains within the admitted source planes and shared arena.
+        // SAFETY: every next-stage copy remains in the admitted source and shared planes.
         unsafe {
             if k_tile + 1 < k_tiles as usize {
                 let next_stage = stage ^ 1;
@@ -499,7 +496,6 @@ pub(crate) unsafe fn qkv_projection_mma_t16<A: Arch>(
         let mut k_subtile = 0usize;
         while k_subtile < K_SUBTILES {
             let k_offset = k_subtile * 8;
-            // SAFETY: each lane group loads the fragments required by m16n8k32.
             let activation_fragment = unsafe {
                 [
                     *activation_tile
@@ -565,9 +561,9 @@ pub(crate) unsafe fn qkv_projection_mma_t16<A: Arch>(
 
     let first_token = lane_group;
     let first_output = warp_output + thread_in_group * 2;
-    // SAFETY: the two warps partition the complete 16x64 output tile.
+    // SAFETY: the two warps partition the complete T=16, 16x64 output tile.
     unsafe {
-        store_qkv_mma_tile::<A>(
+        store_qkv_mma_t16_tile::<A>(
             accumulator0,
             activation_scales,
             weight_scales,
@@ -575,7 +571,7 @@ pub(crate) unsafe fn qkv_projection_mma_t16<A: Arch>(
             first_token,
             first_output,
         );
-        store_qkv_mma_tile::<A>(
+        store_qkv_mma_t16_tile::<A>(
             accumulator1,
             activation_scales,
             weight_scales,
@@ -583,7 +579,7 @@ pub(crate) unsafe fn qkv_projection_mma_t16<A: Arch>(
             first_token,
             first_output + 8,
         );
-        store_qkv_mma_tile::<A>(
+        store_qkv_mma_t16_tile::<A>(
             accumulator2,
             activation_scales,
             weight_scales,
@@ -591,7 +587,273 @@ pub(crate) unsafe fn qkv_projection_mma_t16<A: Arch>(
             first_token,
             first_output + 16,
         );
-        store_qkv_mma_tile::<A>(
+        store_qkv_mma_t16_tile::<A>(
+            accumulator3,
+            activation_scales,
+            weight_scales,
+            output,
+            first_token,
+            first_output + 24,
+        );
+    }
+}
+
+#[inline(always)]
+unsafe fn store_qkv_prefill_mma_tile<A: Arch, const TOKENS: usize>(
+    values: [f32; 4],
+    activation_scales: *const f32,
+    weight_scales: *const u16,
+    output: *mut u16,
+    first_token: usize,
+    first_output: usize,
+) {
+    // SAFETY: the exact QKV tile maps both scale words within the source plane.
+    let first_weight_scale =
+        f32::from_bits((unsafe { *weight_scales.add(first_output) } as u32) << 16);
+    // SAFETY: output columns are paired and the second scale is adjacent.
+    let second_weight_scale =
+        f32::from_bits((unsafe { *weight_scales.add(first_output + 1) } as u32) << 16);
+    if first_token < TOKENS {
+        // SAFETY: the exact tile maps this token row and output pair uniquely.
+        unsafe {
+            let activation_scale = *activation_scales.add(first_token);
+            *output.add(first_token * A::ATTENTION_QKV_ROWS + first_output) =
+                tcgen05::cvt_f32x2_bf16x2(values[0] * activation_scale * first_weight_scale, 0.0)
+                    as u16;
+            *output.add(first_token * A::ATTENTION_QKV_ROWS + first_output + 1) =
+                tcgen05::cvt_f32x2_bf16x2(values[1] * activation_scale * second_weight_scale, 0.0)
+                    as u16;
+        }
+    }
+
+    let second_token = first_token + 8;
+    if second_token < TOKENS {
+        // SAFETY: the paired MMA row remains inside the exact active-token extent.
+        unsafe {
+            let activation_scale = *activation_scales.add(second_token);
+            *output.add(second_token * A::ATTENTION_QKV_ROWS + first_output) =
+                tcgen05::cvt_f32x2_bf16x2(values[2] * activation_scale * first_weight_scale, 0.0)
+                    as u16;
+            *output.add(second_token * A::ATTENTION_QKV_ROWS + first_output + 1) =
+                tcgen05::cvt_f32x2_bf16x2(values[3] * activation_scale * second_weight_scale, 0.0)
+                    as u16;
+        }
+    }
+}
+
+/// Projects one admitted QKV prefill width with the retained 16x64 tensor-core tile.
+#[inline(always)]
+pub(crate) unsafe fn qkv_projection_mma<
+    A: Arch,
+    const TOKENS: usize,
+    const BM: usize,
+    const BK_WORDS: usize,
+    const K_SUBTILES: usize,
+>(
+    activation_codes: *const u32,
+    activation_scales: *const f32,
+    weight_codes: *const u32,
+    weight_scales: *const u16,
+    output: *mut u16,
+    k_tiles: u32,
+) {
+    const OUTPUT_ROWS_PER_BLOCK: usize = 64;
+    const STAGES: usize = 2;
+
+    let block = thread::blockIdx_x() as usize;
+    let tid = thread::threadIdx_x() as usize;
+    let lane = tid & 31;
+    let warp_index = tid >> 5;
+    let lane_group = lane >> 2;
+    let thread_in_group = lane & 3;
+    let words_per_row = A::HIDDEN / 4;
+    let output_tiles = A::ATTENTION_QKV_ROWS / OUTPUT_ROWS_PER_BLOCK;
+    let token_tile = block / output_tiles;
+    let output_tile = block - token_tile * output_tiles;
+    let first_token_tile = token_tile * BM;
+    let first_output_tile = output_tile * OUTPUT_ROWS_PER_BLOCK;
+    let warp_token = first_token_tile + (warp_index >> 1) * 16;
+    let warp_output = first_output_tile + (warp_index & 1) * 32;
+    let activation_tile = DynamicSharedArray::<u32, 16>::get();
+    // SAFETY: two complete activation stages precede two 64-row weight stages.
+    let weight_tile = unsafe { activation_tile.add(STAGES * BM * BK_WORDS) };
+    let mut accumulator0 = [0.0f32; 4];
+    let mut accumulator1 = [0.0f32; 4];
+    let mut accumulator2 = [0.0f32; 4];
+    let mut accumulator3 = [0.0f32; 4];
+
+    debug_assert_eq!(thread::blockDim_x() as usize, (BM / 16) * 2 * 32);
+    // SAFETY: the launch and dynamic-shared contract cover the first K stage.
+    unsafe {
+        let chunks_per_row = BK_WORDS / 4;
+        let mut task = tid;
+        while task < BM * chunks_per_row {
+            let row = task / chunks_per_row;
+            let word = (task - row * chunks_per_row) * 4;
+            cp_async_ca_16(
+                activation_tile.add(row * BK_WORDS + word),
+                activation_codes.add((first_token_tile + row) * words_per_row + word),
+            );
+            task += thread::blockDim_x() as usize;
+        }
+        task = tid;
+        while task < OUTPUT_ROWS_PER_BLOCK * chunks_per_row {
+            let row = task / chunks_per_row;
+            let word = (task - row * chunks_per_row) * 4;
+            cp_async_cg_16(
+                weight_tile.add(row * BK_WORDS + word),
+                weight_codes.add((first_output_tile + row) * words_per_row + word),
+            );
+            task += thread::blockDim_x() as usize;
+        }
+        cp_async_commit_group();
+    }
+
+    let mut stage = 0usize;
+    let mut k_tile = 0usize;
+    while k_tile < k_tiles as usize {
+        // SAFETY: every next-stage copy remains within the admitted source planes and shared arena.
+        unsafe {
+            if k_tile + 1 < k_tiles as usize {
+                let next_stage = stage ^ 1;
+                let next_word = (k_tile + 1) * BK_WORDS;
+                let chunks_per_row = BK_WORDS / 4;
+                let mut task = tid;
+                while task < BM * chunks_per_row {
+                    let row = task / chunks_per_row;
+                    let word = (task - row * chunks_per_row) * 4;
+                    cp_async_ca_16(
+                        activation_tile.add(next_stage * BM * BK_WORDS + row * BK_WORDS + word),
+                        activation_codes
+                            .add((first_token_tile + row) * words_per_row + next_word + word),
+                    );
+                    task += thread::blockDim_x() as usize;
+                }
+                task = tid;
+                while task < OUTPUT_ROWS_PER_BLOCK * chunks_per_row {
+                    let row = task / chunks_per_row;
+                    let word = (task - row * chunks_per_row) * 4;
+                    cp_async_cg_16(
+                        weight_tile.add(
+                            next_stage * OUTPUT_ROWS_PER_BLOCK * BK_WORDS + row * BK_WORDS + word,
+                        ),
+                        weight_codes
+                            .add((first_output_tile + row) * words_per_row + next_word + word),
+                    );
+                    task += thread::blockDim_x() as usize;
+                }
+                cp_async_commit_group();
+                cp_async_wait_group(1);
+            } else {
+                cp_async_wait_group(0);
+            }
+        }
+        thread::sync_threads();
+
+        let activation_base = stage * BM * BK_WORDS + (warp_index >> 1) * 16 * BK_WORDS;
+        let first_weight_base =
+            stage * OUTPUT_ROWS_PER_BLOCK * BK_WORDS + (warp_index & 1) * 32 * BK_WORDS;
+        let weight0 = first_weight_base;
+        let weight1 = weight0 + 8 * BK_WORDS;
+        let weight2 = weight1 + 8 * BK_WORDS;
+        let weight3 = weight2 + 8 * BK_WORDS;
+        let mut k_subtile = 0usize;
+        while k_subtile < K_SUBTILES {
+            let k_offset = k_subtile * 8;
+            // SAFETY: each lane group loads the fragments required by m16n8k32.
+            let activation_fragment = unsafe {
+                [
+                    *activation_tile
+                        .add(activation_base + lane_group * BK_WORDS + k_offset + thread_in_group),
+                    *activation_tile.add(
+                        activation_base + (lane_group + 8) * BK_WORDS + k_offset + thread_in_group,
+                    ),
+                    *activation_tile.add(
+                        activation_base + lane_group * BK_WORDS + k_offset + thread_in_group + 4,
+                    ),
+                    *activation_tile.add(
+                        activation_base
+                            + (lane_group + 8) * BK_WORDS
+                            + k_offset
+                            + thread_in_group
+                            + 4,
+                    ),
+                ]
+            };
+            macro_rules! weight_fragment {
+                ($base:ident) => {
+                    [
+                        *weight_tile
+                            .add($base + lane_group * BK_WORDS + k_offset + thread_in_group),
+                        *weight_tile
+                            .add($base + lane_group * BK_WORDS + k_offset + thread_in_group + 4),
+                    ]
+                };
+            }
+            accumulator0 = unsafe {
+                cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                    accumulator0,
+                    activation_fragment,
+                    weight_fragment!(weight0),
+                )
+            };
+            accumulator1 = unsafe {
+                cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                    accumulator1,
+                    activation_fragment,
+                    weight_fragment!(weight1),
+                )
+            };
+            accumulator2 = unsafe {
+                cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                    accumulator2,
+                    activation_fragment,
+                    weight_fragment!(weight2),
+                )
+            };
+            accumulator3 = unsafe {
+                cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                    accumulator3,
+                    activation_fragment,
+                    weight_fragment!(weight3),
+                )
+            };
+            k_subtile += 1;
+        }
+        thread::sync_threads();
+        stage ^= 1;
+        k_tile += 1;
+    }
+
+    let first_token = warp_token + lane_group;
+    let first_output = warp_output + thread_in_group * 2;
+    // SAFETY: the route's warps partition every active 16x64 output tile.
+    unsafe {
+        store_qkv_prefill_mma_tile::<A, TOKENS>(
+            accumulator0,
+            activation_scales,
+            weight_scales,
+            output,
+            first_token,
+            first_output,
+        );
+        store_qkv_prefill_mma_tile::<A, TOKENS>(
+            accumulator1,
+            activation_scales,
+            weight_scales,
+            output,
+            first_token,
+            first_output + 8,
+        );
+        store_qkv_prefill_mma_tile::<A, TOKENS>(
+            accumulator2,
+            activation_scales,
+            weight_scales,
+            output,
+            first_token,
+            first_output + 16,
+        );
+        store_qkv_prefill_mma_tile::<A, TOKENS>(
             accumulator3,
             activation_scales,
             weight_scales,

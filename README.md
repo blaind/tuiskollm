@@ -62,7 +62,10 @@ contract rather than silently taking another route.
 
 The standalone SM120 operator inventory also includes partitioned paged GQA through 220,000
 positions at every exact `B=1..8` route. The resident program owns its maximum-B partial workspace
-once and captures all six partition buckets without changing addresses after warmup.
+once and captures all six partition buckets without changing addresses after warmup. Its
+source-native full-attention QKV owner admits exact `T=32,64,128,1024` prefill projections in
+addition to `B=1..8` decode and `T=16` MTP; the downstream attention-prefill owners remain separate
+future slices, so this leaf does not yet change server prompt priming.
 
 ## Current device slice
 

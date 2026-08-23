@@ -16,15 +16,15 @@ use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 #[cfg(feature = "device")]
-const MAX_ROWS: usize = 16;
+const MAX_ROWS: usize = 1_024;
 #[cfg(feature = "sm89")]
 const MAX_ROWS: usize = MAX_BATCH;
 #[cfg(feature = "device")]
-const EXACT_ROUTES: [usize; MAX_BATCH + 1] = [1, 2, 3, 4, 5, 6, 7, 8, 16];
+const EXACT_ROUTES: [usize; MAX_BATCH + 5] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128, 1_024];
 #[cfg(feature = "sm89")]
 const EXACT_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
 #[cfg(feature = "device")]
-const MAX_ROWS_DESCRIPTION: &str = "max_rows=16";
+const MAX_ROWS_DESCRIPTION: &str = "max_rows=1024,padded_t32_activation_rows=64";
 #[cfg(feature = "sm89")]
 const MAX_ROWS_DESCRIPTION: &str = "max_rows=8";
 const ALIGNMENT: usize = 256;
@@ -144,10 +144,15 @@ impl Session {
                         format!("B={}", route.rows),
                         BenchmarkWorkload::warm_operator_decode(route.rows as u32),
                     )
-                } else {
+                } else if route.rows == 16 {
                     (
                         format!("T={}", route.rows),
                         BenchmarkWorkload::warm_operator_mtp(route.rows as u64),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
                     )
                 };
                 ExactDeviceCase::new(
@@ -195,7 +200,7 @@ fn make_input() -> Vec<u16> {
     (0..MAX_ROWS * Qwen38_27B::HIDDEN)
         .map(|index| {
             let token = index / Qwen38_27B::HIDDEN;
-            f32_to_bf16(INPUT_PATTERN[index & 7] * TOKEN_FACTORS[token])
+            f32_to_bf16(INPUT_PATTERN[index & 7] * TOKEN_FACTORS[token & 15])
         })
         .collect()
 }
@@ -269,7 +274,8 @@ fn launch(
 fn logical_bytes(rows: usize) -> usize {
     let hidden = Qwen38_27B::HIDDEN;
     let output_rows = Qwen38_27B::ATTENTION_QKV_ROWS;
-    let activation = rows * (2 * hidden + 2 * hidden + 2 * size_of::<f32>());
+    let projection_rows = if rows == 32 { 64 } else { rows };
+    let activation = rows * (3 * hidden + 2 * size_of::<f32>()) + projection_rows * hidden;
     let weights = output_rows * hidden + output_rows * size_of::<u16>();
     let output = rows * output_rows * size_of::<u16>();
 
@@ -343,6 +349,10 @@ mod tests {
 
         assert_eq!(logical_bytes(1), weights + per_token);
         assert_eq!(logical_bytes(MAX_BATCH), weights + MAX_BATCH * per_token);
+        assert_eq!(
+            logical_bytes(32),
+            weights + 32 * per_token + 32 * Qwen38_27B::HIDDEN
+        );
         assert_eq!(logical_bytes(MAX_ROWS), weights + MAX_ROWS * per_token);
     }
 }

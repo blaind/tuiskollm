@@ -2263,9 +2263,19 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name == "fp8_qkv_mma_t16")
         .collect::<Vec<_>>();
+    let qkv_prefill = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("fp8_qkv_mma_TID_"))
+        .collect::<Vec<_>>();
+    let qkv_t1024 = entries
+        .iter()
+        .filter(|entry| entry.name == "fp8_qkv_mma_t1024")
+        .collect::<Vec<_>>();
     require_count("FP8 activation quantization", quantize.len(), 1)?;
     require_count("FP8 QKV", qkv.len(), 8)?;
     require_count("FP8 QKV T=16", qkv_t16.len(), 1)?;
+    require_count("FP8 QKV T=32/64/128", qkv_prefill.len(), 3)?;
+    require_count("FP8 QKV T=1024", qkv_t1024.len(), 1)?;
 
     for entry in quantize.iter().chain(&qkv) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
@@ -2280,6 +2290,15 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         || !qkv_t16[0].body.contains(".minnctapersm 4")
     {
         return Err("FP8 QKV T=16 lost its 64-thread/four-CTA launch bounds".into());
+    }
+    for entry in qkv_prefill.iter().chain(&qkv_t1024) {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA prefill launch bounds",
+                entry.name
+            )
+            .into());
+        }
     }
 
     let temporary = root.join("target/tmp");
@@ -2305,10 +2324,16 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
     let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
     let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
     let sass = String::from_utf8(sass.stdout)?;
-    let t16_sass =
-        sass_function_body(&sass, qkv_t16[0].name).ok_or("cuobjdump omitted FP8 QKV T=16 SASS")?;
-    if !t16_sass.contains("QMMA.16832.F32.E4M3.E4M3") {
-        return Err("FP8 QKV T=16 lost its native E4M3 tensor-core instruction".into());
+    for entry in qkv_t16.iter().chain(&qkv_prefill).chain(&qkv_t1024) {
+        let body = sass_function_body(&sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted FP8 QKV MMA entry `{}`", entry.name))?;
+        if !body.contains("QMMA.16832.F32.E4M3.E4M3") {
+            return Err(format!(
+                "FP8 QKV MMA entry `{}` lost its native E4M3 tensor-core instruction",
+                entry.name
+            )
+            .into());
+        }
     }
     let quantize_resource = resources
         .get(quantize[0].name)
@@ -2341,15 +2366,31 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         "qkv_t16_registers",
         &[qkv_t16_resource.registers],
     )?;
+    let mut qkv_prefill_registers = Vec::new();
+    let mut qkv_prefill_shared = Vec::new();
+    for entry in qkv_prefill.iter().chain(&qkv_t1024) {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted FP8 QKV prefill entry `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        qkv_prefill_registers.push(resource.registers);
+        qkv_prefill_shared.push(resource.shared);
+    }
+    qkv_prefill_registers.sort_unstable();
+    if baseline.contains_key("qkv_prefill_registers") {
+        require_registers(&baseline, "qkv_prefill_registers", &qkv_prefill_registers)?;
+    }
 
     println!(
-        "FP8 QKV gate passed: 1 quantize + 8 decode + 1 T=16 projection entries, REG {} / {:?} / {}, STACK:0 LOCAL:0, SHARED {} / {:?} / {}",
+        "FP8 QKV gate passed: 1 quantize + 8 decode + 1 T=16 + 4 prefill projection entries, REG {} / {:?} / {} / {:?}, STACK:0 LOCAL:0, SHARED {} / {:?} / {} / {:?}",
         quantize_resource.registers,
         qkv_registers,
         qkv_t16_resource.registers,
+        qkv_prefill_registers,
         quantize_resource.shared,
         qkv_shared,
         qkv_t16_resource.shared,
+        qkv_prefill_shared,
     );
     Ok(())
 }
