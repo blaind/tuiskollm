@@ -16,10 +16,8 @@ pub struct Bf16View<'a, const RANK: usize> {
 }
 
 impl<'a, const RANK: usize> Bf16View<'a, RANK> {
-    pub(crate) fn bind(
-        tensor: TensorView<'a>,
-        expected_shape: [u64; RANK],
-    ) -> CheckpointResult<Self> {
+    /// Validates one public tensor descriptor as an exact BF16 view.
+    pub fn bind(tensor: TensorView<'a>, expected_shape: [u64; RANK]) -> CheckpointResult<Self> {
         Ok(Self {
             view: validate(tensor, DType::Bf16, expected_shape)?,
         })

@@ -273,6 +273,48 @@ impl<'a> FullAttentionQkvBindings<'a> {
             [kv_rows, 1],
         )?;
 
+        Self::from_views::<A>(
+            layer,
+            [query_gate_weight, key_weight, value_weight],
+            [query_gate_scale, key_scale, value_scale],
+        )
+    }
+
+    /// Constructs one exact QKV family from validated source views.
+    pub fn from_views<A: Arch>(
+        layer: usize,
+        weights: [Fp8E4M3View<'a, 2>; 3],
+        scales: [Bf16View<'a, 2>; 3],
+    ) -> CheckpointResult<Self> {
+        require_full_attention_layer(layer, A::LAYERS, A::FULL_ATTENTION_INTERVAL)?;
+
+        let query_rows = A::ATTENTION_QUERY_ROWS as u64;
+        let kv_rows = A::ATTENTION_KV_ROWS as u64;
+        let hidden = A::HIDDEN as u64;
+        let [query_gate_weight, key_weight, value_weight] = weights;
+        let [query_gate_scale, key_scale, value_scale] = scales;
+
+        let expected_weight_shapes = [[query_rows, hidden], [kv_rows, hidden], [kv_rows, hidden]];
+        let observed_weight_shapes = [
+            *query_gate_weight.shape(),
+            *key_weight.shape(),
+            *value_weight.shape(),
+        ];
+        let expected_scale_shapes = [[query_rows, 1], [kv_rows, 1], [kv_rows, 1]];
+        let observed_scale_shapes = [
+            *query_gate_scale.shape(),
+            *key_scale.shape(),
+            *value_scale.shape(),
+        ];
+
+        if observed_weight_shapes != expected_weight_shapes
+            || observed_scale_shapes != expected_scale_shapes
+        {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{layer} full-attention QKV views do not match the target shapes"
+            )));
+        }
+
         validate_positive_bf16_scales(&query_gate_scale)?;
         validate_positive_bf16_scales(&key_scale)?;
         validate_positive_bf16_scales(&value_scale)?;
