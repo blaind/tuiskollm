@@ -5567,8 +5567,13 @@ fn gate_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("gdn_recurrence_exact_TID_"))
         .collect::<Vec<_>>();
+    let prefill = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("gdn_recurrence_prefill_exact_TID_"))
+        .collect::<Vec<_>>();
     require_count("GDN recurrence", recurrence.len(), 8)?;
-    for entry in &recurrence {
+    require_count("GDN recurrence prefill", prefill.len(), 4)?;
+    for entry in recurrence.iter().chain(&prefill) {
         if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 512-thread/two-CTA launch bounds",
@@ -5577,7 +5582,18 @@ fn gate_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    let resources = &sm120_gate_artifact(root)?.resources;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    for entry in &prefill {
+        if sass_function_body(sass, entry.name).is_none() {
+            return Err(format!(
+                "cuobjdump omitted GDN recurrence prefill SASS `{}`",
+                entry.name
+            )
+            .into());
+        }
+    }
     let mut registers = Vec::new();
     let mut shared = Vec::new();
     for entry in recurrence {
@@ -5590,9 +5606,34 @@ fn gate_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
     }
     registers.sort_unstable();
     require_registers(&baseline, "recurrence_registers", &registers)?;
+    let mut prefill_registers = Vec::new();
+    let mut prefill_shared = Vec::new();
+    for entry in prefill {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        prefill_registers.push(resource.registers);
+        prefill_shared.push(resource.shared);
+    }
+    prefill_registers.sort_unstable();
+    if baseline.contains_key("prefill_recurrence_registers") {
+        require_registers(
+            &baseline,
+            "prefill_recurrence_registers",
+            &prefill_registers,
+        )?;
+    }
+    if baseline.contains_key("prefill_recurrence_shared_bytes") {
+        require_uniform_value(
+            &baseline,
+            "prefill_recurrence_shared_bytes",
+            &prefill_shared,
+        )?;
+    }
     println!(
-        "GDN recurrence gate passed: 8 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
-        registers, shared
+        "GDN recurrence gate passed: 8 decode + 4 prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}, SASS present",
+        registers, prefill_registers, shared, prefill_shared
     );
     Ok(())
 }
