@@ -23,8 +23,8 @@ pub use attention::{
     paged_gqa_prefill_partitions,
 };
 pub use fp8::{
-    DenseFp8DownOp, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps, FullAttentionQkvOp,
-    GdnInputProjectionOp, GdnOutputProjectionOp, LmHeadOp,
+    DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps,
+    FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp, LmHeadOp,
 };
 pub use gdn::{GdnPrepareOp, GdnRecurrenceOp};
 pub use inventory::kernel_ptx_names;

@@ -1172,9 +1172,10 @@ fn qualify_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "fp8_down",
+            "fp8_down_suite_",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_fp8_down(root)
@@ -4885,8 +4886,13 @@ fn gate_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("fp8_down_TID_"))
         .collect::<Vec<_>>();
+    let tma = entries
+        .iter()
+        .filter(|entry| entry.name == "fp8_down_tma_t1024")
+        .collect::<Vec<_>>();
     require_count("dense-FP8 down quantization", quantize.len(), 1)?;
     require_count("dense-FP8 down projection", down.len(), 8)?;
+    require_count("dense-FP8 down TMA prefill", tma.len(), 1)?;
 
     for entry in quantize.iter().chain(&down) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
@@ -4897,8 +4903,31 @@ fn gate_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
+    if !tma[0].body.contains(".reqntid 288, 1, 1")
+        || !tma[0].body.contains(".minnctapersm 2")
+        || tma[0].body.contains(".reqnctapercluster")
+    {
+        return Err(
+            "dense-FP8 down TMA lost its 288-thread/two-CTA single-CTA launch contract".into(),
+        );
+    }
+    if !ptx.contains(".extern .shared .align 128 .b8 __dynamic_smem_fp8_down_tma_t1024[];") {
+        return Err("dense-FP8 down TMA lost its 128-byte dynamic-shared alignment".into());
+    }
 
-    let resources = &sm120_gate_artifact(root)?.resources;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    let tma_sass =
+        sass_function_body(sass, tma[0].name).ok_or("cuobjdump omitted dense-FP8 down TMA SASS")?;
+    for instruction in ["QMMA.16832.F32.E4M3.E4M3", "UTMALDG.2D"] {
+        if !tma_sass.contains(instruction) {
+            return Err(format!("dense-FP8 down TMA lost required `{instruction}` SASS").into());
+        }
+    }
+    if tma_sass.contains("CALL.") {
+        return Err("dense-FP8 down TMA regained an out-of-line device call".into());
+    }
     let quantize_resource = resources
         .get(quantize[0].name)
         .ok_or("cuobjdump omitted dense-FP8 down quantization")?;
@@ -4907,6 +4936,11 @@ fn gate_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
         &baseline,
         "quantize_registers",
         &[quantize_resource.registers],
+    )?;
+    require_uniform_value(
+        &baseline,
+        "quantize_shared_bytes",
+        &[quantize_resource.shared],
     )?;
 
     let mut down_registers = Vec::new();
@@ -4921,10 +4955,23 @@ fn gate_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
     }
     down_registers.sort_unstable();
     require_registers(&baseline, "down_registers", &down_registers)?;
+    require_uniform_value(&baseline, "down_shared_bytes", &shared)?;
+
+    let tma_resource = resources
+        .get(tma[0].name)
+        .ok_or("cuobjdump omitted dense-FP8 down TMA resources")?;
+    require_spill_free(tma[0].name, tma_resource)?;
+    require_registers(&baseline, "tma_registers", &[tma_resource.registers])?;
+    require_uniform_value(&baseline, "tma_shared_bytes", &[tma_resource.shared])?;
 
     println!(
-        "dense-FP8 down gate passed: 1 quantize + 8 projection entries, REG {} / {:?}, STACK:0 LOCAL:0, SHARED {} / {:?}",
-        quantize_resource.registers, down_registers, quantize_resource.shared, shared,
+        "dense-FP8 down gate passed: 1 quantize + 8 decode + 1 TMA prefill entries, REG {} / {:?} / {}, STACK:0 LOCAL:0, SHARED {} / {:?} / {}, QMMA/TMA present",
+        quantize_resource.registers,
+        down_registers,
+        tma_resource.registers,
+        quantize_resource.shared,
+        shared,
+        tma_resource.shared,
     );
     Ok(())
 }
