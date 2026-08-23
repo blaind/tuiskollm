@@ -18,8 +18,9 @@ use tuisko_qual::{
     benchmark_fp8_swiglu, benchmark_full_attention_layer, benchmark_gdn_output,
     benchmark_gdn_prepare, benchmark_gdn_recurrence, benchmark_long_context_paged_gqa,
     benchmark_nvfp4_mlp, benchmark_paged_gqa, benchmark_qwen35_nvfp4_down,
-    benchmark_qwen35_nvfp4_mlp, benchmark_qwen35_nvfp4_swiglu, benchmark_qwen35_residual_norm,
-    benchmark_resident_long_context_model, benchmark_resident_model, benchmark_text_endpoint,
+    benchmark_qwen35_nvfp4_mlp, benchmark_qwen35_nvfp4_qkv, benchmark_qwen35_nvfp4_swiglu,
+    benchmark_qwen35_residual_norm, benchmark_resident_long_context_model,
+    benchmark_resident_model, benchmark_text_endpoint,
     profile_resident_model,
 };
 
@@ -43,7 +44,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
     let suite = arguments
         .next()
-        .ok_or("usage: bench-device <attention-qk-prepare|paged-gqa|long-context-paged-gqa|attention-output|residual-norm|qwen35-residual-norm|qwen35-nvfp4-swiglu|qwen35-nvfp4-down|qwen35-nvfp4-mlp|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|nvfp4-swiglu|nvfp4-down|nvfp4-mlp|gdn-prepare|gdn-recurrence|gdn-output|dense-fp8-mlp|dense-fp8-gdn-layer|full-attention-layer|resident-model|resident-long-context-model|text-endpoint|profile-resident-model> [SNAPSHOT] [options]")?;
+        .ok_or("usage: bench-device <attention-qk-prepare|paged-gqa|long-context-paged-gqa|attention-output|residual-norm|qwen35-residual-norm|qwen35-nvfp4-swiglu|qwen35-nvfp4-down|qwen35-nvfp4-qkv|qwen35-nvfp4-mlp|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|nvfp4-swiglu|nvfp4-down|nvfp4-mlp|gdn-prepare|gdn-recurrence|gdn-output|dense-fp8-mlp|dense-fp8-gdn-layer|full-attention-layer|resident-model|resident-long-context-model|text-endpoint|profile-resident-model> [SNAPSHOT] [options]")?;
     #[cfg(feature = "device")]
     if suite == "profile-resident-model" {
         return run_resident_profile(arguments);
@@ -95,6 +96,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             let (options, json_path) =
                 parse_options(arguments, DeviceBenchmarkOptions::short_graph())?;
             (benchmark_qwen35_nvfp4_down(options)?, json_path)
+        }
+        #[cfg(feature = "device")]
+        "qwen35-nvfp4-qkv" => {
+            let (options, json_path) =
+                parse_options(arguments, DeviceBenchmarkOptions::short_graph())?;
+            (benchmark_qwen35_nvfp4_qkv(options)?, json_path)
         }
         #[cfg(feature = "device")]
         "qwen35-nvfp4-mlp" => {

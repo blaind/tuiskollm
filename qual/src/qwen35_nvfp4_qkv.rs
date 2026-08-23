@@ -9,16 +9,16 @@ use tuisko_gpu::{
 };
 use tuisko_model::{Arch, Qwen35_9B};
 
-const MAX_BATCH: usize = 8;
+pub(crate) const MAX_BATCH: usize = 8;
 const ALIGNMENT: usize = 256;
-const INPUT_COLUMNS: usize = Qwen35_9B::HIDDEN;
-const OUTPUT_ROWS: usize = Qwen35_9B::ATTENTION_QKV_ROWS;
+pub(crate) const INPUT_COLUMNS: usize = Qwen35_9B::HIDDEN;
+pub(crate) const OUTPUT_ROWS: usize = Qwen35_9B::ATTENTION_QKV_ROWS;
 const QUERY_ROWS: usize = Qwen35_9B::ATTENTION_QUERY_ROWS;
 const KEY_ROWS: usize = Qwen35_9B::ATTENTION_KV_ROWS;
 const GROUP: usize = 16;
-const GROUPS_PER_ROW: usize = INPUT_COLUMNS / GROUP;
-const CODE_BYTES_PER_ROW: usize = INPUT_COLUMNS / 2;
-const WEIGHT_SCALE_DIVISORS: [f32; 3] = [0.125, 0.25, 0.5];
+pub(crate) const GROUPS_PER_ROW: usize = INPUT_COLUMNS / GROUP;
+pub(crate) const CODE_BYTES_PER_ROW: usize = INPUT_COLUMNS / 2;
+pub(crate) const WEIGHT_SCALE_DIVISORS: [f32; 3] = [0.125, 0.25, 0.5];
 const BF16_SENTINEL: u16 = 0xa5a5;
 const INPUT_PATTERN: [f32; GROUP] = [
     0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0, 0.5,
@@ -66,28 +66,28 @@ pub struct Qwen35Nvfp4QkvQualification {
 }
 
 #[derive(Clone, Copy)]
-struct Regions {
-    input: ArenaRegion<u16>,
-    weight_codes: ArenaRegion<u8>,
-    weight_scales: ArenaRegion<u8>,
-    output: ArenaRegion<u16>,
+pub(crate) struct Regions {
+    pub(crate) input: ArenaRegion<u16>,
+    pub(crate) weight_codes: ArenaRegion<u8>,
+    pub(crate) weight_scales: ArenaRegion<u8>,
+    pub(crate) output: ArenaRegion<u16>,
 }
 
 impl Regions {
-    fn weight_bytes(self) -> usize {
+    pub(crate) fn weight_bytes(self) -> usize {
         self.weight_codes.byte_len() + self.weight_scales.byte_len()
     }
 
-    fn payload_bytes(self) -> usize {
+    pub(crate) fn payload_bytes(self) -> usize {
         self.input.byte_len() + self.weight_bytes() + self.output.byte_len()
     }
 }
 
-struct Fixture {
-    input_bf16: Vec<u16>,
+pub(crate) struct Fixture {
+    pub(crate) input_bf16: Vec<u16>,
     input_f32: Vec<f32>,
-    weight_codes: Vec<u8>,
-    weight_scales: Vec<u8>,
+    pub(crate) weight_codes: Vec<u8>,
+    pub(crate) weight_scales: Vec<u8>,
 }
 
 /// Qualifies eager and captured Qwen3.5 A16 QKV at exact `B=1..=8`.
@@ -151,7 +151,7 @@ pub fn qualify_qwen35_nvfp4_qkv()
     Ok(report)
 }
 
-fn layout() -> GpuResult<(ArenaLayout, Regions)> {
+pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
     let input = layout.reserve(MAX_BATCH * INPUT_COLUMNS, ALIGNMENT)?;
     let weight_codes = layout.reserve(OUTPUT_ROWS * CODE_BYTES_PER_ROW, ALIGNMENT)?;
@@ -203,7 +203,7 @@ fn launch(
     }
 }
 
-fn make_fixture() -> Fixture {
+pub(crate) fn make_fixture() -> Fixture {
     let input_bf16 = (0..MAX_BATCH * INPUT_COLUMNS)
         .map(|index| {
             let token = index / INPUT_COLUMNS;
