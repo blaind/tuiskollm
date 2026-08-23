@@ -213,7 +213,9 @@ pub use nvfp4_down::{Nvfp4DownQualification, Nvfp4DownQualificationError, qualif
 #[cfg(any(feature = "device", feature = "sm89"))]
 pub use nvfp4_down_benchmark::benchmark_nvfp4_down;
 #[cfg(feature = "device")]
-pub use nvfp4_mlp::{Nvfp4MlpQualification, Nvfp4MlpQualificationError, qualify_nvfp4_mlp};
+pub use nvfp4_mlp::{
+    Nvfp4MlpQualification, Nvfp4MlpQualificationError, qualify_nvfp4_mlp, qualify_qwen35_nvfp4_mlp,
+};
 #[cfg(feature = "device")]
 pub use nvfp4_mlp_benchmark::benchmark_nvfp4_mlp;
 #[cfg(any(feature = "device", feature = "sm89", feature = "sm86"))]
