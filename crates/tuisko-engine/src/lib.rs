@@ -42,7 +42,9 @@ pub use resident_generation::{
     ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentBatchGenerator,
     ResidentCancellation, ResidentGenerationSession, ResidentRequestId, ResidentTextGenerator,
 };
-pub use resident_model_layout::{ResidentLayerKind, ResidentModelLayout, ResidentModelProgram};
+pub use resident_model_layout::{
+    ResidentDecodeRoute, ResidentLayerKind, ResidentModelLayout, ResidentModelProgram,
+};
 pub use sampling::{SampleDecision, Sampler, SamplingOptions};
 
 #[cfg(feature = "qualification")]
@@ -56,4 +58,6 @@ pub use nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
 #[cfg(feature = "qualification")]
 pub use program::EndpointObservables;
 #[cfg(feature = "qualification")]
-pub use resident_model_layout::{ResidentEmbeddingStageGraph, ResidentModelObservables};
+pub use resident_model_layout::{
+    ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
+};

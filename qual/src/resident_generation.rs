@@ -165,10 +165,10 @@ pub fn qualify_resident_generation(
 fn verify_owner(
     generator: &ResidentTextGenerator,
 ) -> Result<(), ResidentGenerationQualificationError> {
-    if generator.arena_bytes() != 27_551_280_384
+    if generator.arena_bytes() != 27_721_684_224
         || generator.host_stager_bytes() != 578_560
         || generator.kv_route_host_bytes() != 113_454
-        || generator.context_capacity() != 192
+        || generator.context_capacity() != 220_000
     {
         return Err(ResidentGenerationQualificationError::Mismatch(
             "resident generation owner bytes or capacity changed".to_string(),

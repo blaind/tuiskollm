@@ -8,23 +8,36 @@ use crate::device_benchmark::{
 };
 use std::path::Path;
 use std::sync::Arc;
-use tuisko_engine::{MAX_BATCH, ResidentEmbeddingStageGraph, ResidentModelProgram};
+use tuisko_engine::{
+    MAX_BATCH, ResidentDecodeRoute, ResidentEmbeddingStageGraph, ResidentModelProgram,
+};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuTimer};
+use tuisko_kernels_sm120::{LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
 const CACHE_POSITION: u32 = 130;
 const CONTEXT_TOKENS: usize = CACHE_POSITION as usize + 1;
+const LONG_CONTEXT_TOKENS: usize = 131_073;
 const ROTARY_PAIRS: usize = 32;
+const LONG_ROUTE_SLOTS: [usize; MAX_BATCH] = [7, 0, 6, 1, 5, 2, 4, 3];
+
+#[derive(Clone, Copy)]
+enum BenchmarkProfile {
+    Short,
+    Long,
+}
 
 struct Session {
     timer: GpuTimer,
     program: ResidentModelProgram,
+    routes: [ResidentDecodeRoute; MAX_BATCH],
+    context_lengths: [usize; MAX_BATCH],
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
 }
 
 impl Session {
-    fn new(root: &Path) -> Result<Self, DeviceBenchmarkError> {
+    fn new(root: &Path, profile: BenchmarkProfile) -> Result<Self, DeviceBenchmarkError> {
         let snapshot = Arc::new(CheckpointSnapshot::<Qwen38_27B>::open(root)?);
         let context = CudaContext::new(0).map_err(GpuError::from)?;
         let capability = context.compute_capability().map_err(GpuError::from)?;
@@ -36,24 +49,60 @@ impl Session {
         }
         let stream = context.new_stream().map_err(GpuError::from)?;
         let mut program = ResidentModelProgram::from_snapshot(&context, snapshot)?;
-        for slot in 0..MAX_BATCH {
-            program.activate_kv_slot(slot)?;
-            program.reserve_kv_slot_tokens(&stream, slot, 192)?;
-        }
+        let (slots, positions, context_lengths) = match profile {
+            BenchmarkProfile::Short => {
+                for slot in 0..MAX_BATCH {
+                    program.activate_kv_slot(slot)?;
+                    program.reserve_kv_slot_tokens(&stream, slot, 192)?;
+                }
+                (
+                    core::array::from_fn(|slot| slot),
+                    [CACHE_POSITION; MAX_BATCH],
+                    [CONTEXT_TOKENS; MAX_BATCH],
+                )
+            }
+            BenchmarkProfile::Long => {
+                for slot in 0..MAX_BATCH {
+                    program.activate_kv_slot(slot)?;
+                }
+                program.reserve_kv_slot_tokens(&stream, 7, LONG_CONTEXT_TOKENS)?;
+                for slot in 0..MAX_BATCH - 1 {
+                    program.reserve_kv_slot_tokens(&stream, slot, 1)?;
+                }
+                let mut positions = [0; MAX_BATCH];
+                positions[0] = (LONG_CONTEXT_TOKENS - 1) as u32;
+                let mut context_lengths = [1; MAX_BATCH];
+                context_lengths[0] = LONG_CONTEXT_TOKENS;
+                (LONG_ROUTE_SLOTS, positions, context_lengths)
+            }
+        };
+        program.load_slot_routes(&stream, &slots)?;
         program.stage_embeddings(&stream, &benchmark_token_ids())?;
         program.reset_state(&stream)?;
-        let (rope_cos, rope_sin) = benchmark_rope();
-        program.load_decode_state(
-            &stream,
-            MAX_BATCH,
-            &[CACHE_POSITION; MAX_BATCH],
-            &rope_cos,
-            &rope_sin,
-        )?;
+        let (rope_cos, rope_sin) = benchmark_rope(&positions);
+        let routes = (1..=MAX_BATCH)
+            .map(|batch| {
+                program.load_decode_state(
+                    &stream,
+                    batch,
+                    &positions[..batch],
+                    &rope_cos[..batch * ROTARY_PAIRS],
+                    &rope_sin[..batch * ROTARY_PAIRS],
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| {
+                DeviceBenchmarkError::Precondition(
+                    "resident decode route inventory has wrong cardinality".to_string(),
+                )
+            })?;
         let timer = GpuTimer::new(&context)?;
         Ok(Self {
             timer,
             program,
+            routes,
+            context_lengths,
             stream,
             _context: context,
         })
@@ -85,7 +134,7 @@ impl Session {
             for batch in 1..=MAX_BATCH {
                 embedding_graphs[batch - 1].graph().launch(&self.stream)?;
                 self.program
-                    .qualification_graph(batch)?
+                    .qualification_graph(self.routes[batch - 1])
                     .launch(&self.stream)?;
             }
         }
@@ -96,15 +145,26 @@ impl Session {
     fn cases<'a>(
         &'a self,
         embedding_graphs: &'a [ResidentEmbeddingStageGraph<'a>; MAX_BATCH],
+        operation: &'static str,
     ) -> Result<Vec<ExactDeviceCase<'a>>, DeviceBenchmarkError> {
         (1..=MAX_BATCH)
             .map(|batch| {
                 Ok(ExactDeviceCase::new(
-                    "resident_model/text_decode",
+                    operation,
                     format!("B={batch}"),
-                    BenchmarkWorkload::warm_model_decode(batch as u32, CONTEXT_TOKENS as u64),
-                    OperationAccounting::new(logical_bytes(batch), batch as u64, "token"),
-                    self.program.qualification_graph(batch)?,
+                    BenchmarkWorkload::warm_model_decode(
+                        batch as u32,
+                        *self.context_lengths[..batch]
+                            .iter()
+                            .max()
+                            .expect("exact batch is nonempty") as u64,
+                    ),
+                    OperationAccounting::new(
+                        logical_bytes(batch, &self.context_lengths[..batch]),
+                        batch as u64,
+                        "token",
+                    ),
+                    self.program.qualification_graph(self.routes[batch - 1]),
                     None,
                 )
                 .with_preparation(embedding_graphs[batch - 1].graph()))
@@ -117,13 +177,13 @@ fn benchmark_token_ids() -> [u32; MAX_BATCH] {
     core::array::from_fn(|slot| (100 + slot * 17) as u32)
 }
 
-fn benchmark_rope() -> (Vec<f32>, Vec<f32>) {
+fn benchmark_rope(positions: &[u32; MAX_BATCH]) -> (Vec<f32>, Vec<f32>) {
     let mut cosine = vec![0.0; MAX_BATCH * ROTARY_PAIRS];
     let mut sine = vec![0.0; MAX_BATCH * ROTARY_PAIRS];
     for slot in 0..MAX_BATCH {
         for pair in 0..ROTARY_PAIRS {
             let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
-            let angle = f64::from(CACHE_POSITION) * frequency;
+            let angle = f64::from(positions[slot]) * frequency;
             let (sin, cos) = angle.sin_cos();
             cosine[slot * ROTARY_PAIRS + pair] = cos as f32;
             sine[slot * ROTARY_PAIRS + pair] = sin as f32;
@@ -132,7 +192,7 @@ fn benchmark_rope() -> (Vec<f32>, Vec<f32>) {
     (cosine, sine)
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(batch: usize, context_lengths: &[usize]) -> usize {
     let hidden = Qwen38_27B::HIDDEN;
     let intermediate = Qwen38_27B::INTERMEDIATE;
     let vocab = Qwen38_27B::VOCAB;
@@ -151,7 +211,58 @@ fn logical_bytes(batch: usize) -> usize {
     let per_token = 48 * dense_gdn_layer + 16 * dense_attention_layer + endpoint
         - 56 * (dense_mlp - nvfp4_mlp)
         - 64 * 6 * hidden;
-    resident_weights + batch * per_token
+    let short_total = resident_weights + batch * per_token;
+    if context_lengths
+        .iter()
+        .all(|&length| length == CONTEXT_TOKENS)
+    {
+        return short_total;
+    }
+    short_total - 16 * short_gqa_bytes(batch) + 16 * long_gqa_bytes(context_lengths)
+}
+
+fn short_gqa_bytes(batch: usize) -> usize {
+    let query = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>();
+    let cache = 2 * Qwen38_27B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * Qwen38_27B::HEAD_DIM;
+    let metadata =
+        2 * size_of::<u32>() + Qwen38_27B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * size_of::<u32>();
+    let output = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>();
+    batch * (query + cache + metadata + output)
+}
+
+fn long_gqa_bytes(context_lengths: &[usize]) -> usize {
+    let maximum_length = context_lengths
+        .iter()
+        .copied()
+        .max()
+        .expect("exact batch is nonempty");
+    let required = maximum_length.div_ceil(LONG_CONTEXT_GQA_PARTITION_SIZE);
+    let launched_partitions = LONG_CONTEXT_GQA_PARTITION_BUCKETS
+        .iter()
+        .copied()
+        .find(|&partitions| partitions >= required)
+        .expect("resident context has a graph partition bucket");
+    context_lengths
+        .iter()
+        .copied()
+        .map(|context_tokens| {
+            let partitions = context_tokens.div_ceil(LONG_CONTEXT_GQA_PARTITION_SIZE);
+            let partials = Qwen38_27B::NUM_ATTENTION_HEADS * partitions;
+            let partial_query = partials * Qwen38_27B::HEAD_DIM * size_of::<f32>();
+            let cache = 2 * Qwen38_27B::NUM_ATTENTION_HEADS * context_tokens * Qwen38_27B::HEAD_DIM;
+            let block_table = Qwen38_27B::NUM_ATTENTION_HEADS * context_tokens * size_of::<u32>();
+            let metadata = Qwen38_27B::NUM_ATTENTION_HEADS
+                * (launched_partitions + partitions + 1)
+                * size_of::<u32>();
+            let partial = partials
+                * (2 * size_of::<f32>()
+                    + Qwen38_27B::HEAD_DIM * size_of::<f32>()
+                    + 3 * size_of::<f32>()
+                    + Qwen38_27B::HEAD_DIM * size_of::<f32>());
+            let output = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>();
+            partial_query + cache + block_table + metadata + partial + output
+        })
+        .sum()
 }
 
 /// Measures every exact complete-model graph directly without summing leaf medians.
@@ -159,50 +270,100 @@ pub fn benchmark_resident_model(
     root: &Path,
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
+    benchmark_resident_profile(
+        root,
+        options,
+        BenchmarkProfile::Short,
+        "bench-resident-model",
+        "resident_model/text_decode",
+    )
+}
+
+/// Measures every exact long-context complete-model graph directly.
+pub fn benchmark_resident_long_context_model(
+    root: &Path,
+    options: DeviceBenchmarkOptions,
+) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
+    benchmark_resident_profile(
+        root,
+        options,
+        BenchmarkProfile::Long,
+        "bench-resident-long-context-model",
+        "resident_long_context_model/text_decode",
+    )
+}
+
+fn benchmark_resident_profile(
+    root: &Path,
+    options: DeviceBenchmarkOptions,
+    profile: BenchmarkProfile,
+    suite: &'static str,
+    operation: &'static str,
+) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
+    let names = match profile {
+        BenchmarkProfile::Short => [
+            "resident_model/resident_weights",
+            "resident_model/gdn_history",
+            "resident_model/gdn_state",
+            "resident_model/represented_kv_cache",
+            "resident_model/kv_block_tables",
+            "resident_model/shared_workspace",
+            "resident_model/alignment_padding",
+        ],
+        BenchmarkProfile::Long => [
+            "resident_long_context_model/resident_weights",
+            "resident_long_context_model/gdn_history",
+            "resident_long_context_model/gdn_state",
+            "resident_long_context_model/represented_kv_cache",
+            "resident_long_context_model/kv_block_tables",
+            "resident_long_context_model/shared_workspace",
+            "resident_long_context_model/alignment_padding",
+        ],
+    };
     let baseline_sha256 = generator_baseline_sha256()?;
     let warmup_launches = warmup_launches(options)?;
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
-    let session = Session::new(root)?;
+    let session = Session::new(root, profile)?;
     let embedding_graphs = session.embedding_graphs()?;
     memory.register_owned(
-        "resident_model/resident_weights",
+        names[0],
         BenchmarkMemoryKind::Weights,
         session.program.resident_weight_bytes(),
         "64 exact source-routed layers plus final norm and LM head",
     )?;
     memory.register_owned(
-        "resident_model/gdn_history",
+        names[1],
         BenchmarkMemoryKind::Other,
         session.program.history_bytes(),
         "48 layers * 8 slots * 10,240 rows * 3 BF16 values",
     )?;
     memory.register_owned(
-        "resident_model/gdn_state",
+        names[2],
         BenchmarkMemoryKind::Other,
         session.program.state_bytes(),
         "48 layers * 8 slots * 48 FP32 128x128 matrices",
     )?;
     memory.register_owned(
-        "resident_model/represented_kv_cache",
+        names[3],
         BenchmarkMemoryKind::KvCache,
         session.program.cache_bytes(),
         "16 layers * one shared 3,438-page pool * 4 heads * 64 * 256 E4M3 K/V values",
     )?;
     memory.register_owned(
-        "resident_model/kv_block_tables",
+        names[4],
         BenchmarkMemoryKind::Other,
         session.program.kv_table_bytes(),
         "8 stable slot rows * 3,438 u32 page-table entries",
     )?;
     memory.register_owned(
-        "resident_model/shared_workspace",
+        names[5],
         BenchmarkMemoryKind::Workspace,
         session.program.workspace_bytes(),
         "one max_batch=8 workspace shared sequentially by all layers and endpoint",
     )?;
     memory.register_owned(
-        "resident_model/alignment_padding",
+        names[6],
         BenchmarkMemoryKind::Other,
         session.program.padding_bytes(),
         "256-byte alignment across the resident and shared-KV arenas",
@@ -211,13 +372,13 @@ pub fn benchmark_resident_model(
     session.warm(&embedding_graphs, warmup_launches)?;
     memory.capture("after_warmup")?;
     require_current_process_exclusive()?;
-    let cases = session.cases(&embedding_graphs)?;
+    let cases = session.cases(&embedding_graphs, operation)?;
     let (metrics, energy_metrics, telemetry) =
         measure_cases(&session.stream, &session.timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
     finish_report(
         BenchmarkReportSpec {
-            suite: "bench-resident-model",
+            suite,
             classification: "performance_sensitive_model",
             timing_scope: "paired Rust submission/completion and direct complete production graph replay",
         },
@@ -233,15 +394,28 @@ pub fn benchmark_resident_model(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, logical_bytes};
+    use super::{CONTEXT_TOKENS, LONG_CONTEXT_TOKENS, MAX_BATCH, logical_bytes};
 
     #[test]
     fn byte_accounting_tracks_the_exact_nvfp4_batch_routes() {
-        let one = logical_bytes(1);
-        let two_per_token = (logical_bytes(2) - 19_103_682_560) / 2;
-        let five_per_token = (logical_bytes(5) - 19_103_682_560) / 5;
+        let contexts = [CONTEXT_TOKENS; MAX_BATCH];
+        let one = logical_bytes(1, &contexts[..1]);
+        let two_per_token = (logical_bytes(2, &contexts[..2]) - 19_103_682_560) / 2;
+        let five_per_token = (logical_bytes(5, &contexts[..5]) - 19_103_682_560) / 5;
         assert_eq!(one - 19_103_682_560, five_per_token);
         assert_eq!(five_per_token - two_per_token, 56 * (5_120 + 5_120 / 8));
-        assert!(logical_bytes(MAX_BATCH) > logical_bytes(1));
+        assert!(logical_bytes(MAX_BATCH, &contexts) > logical_bytes(1, &contexts[..1]));
+    }
+
+    #[test]
+    fn long_context_accounting_tracks_one_deep_row_and_compact_survivors() {
+        let mut contexts = [1; MAX_BATCH];
+        contexts[0] = LONG_CONTEXT_TOKENS;
+        for batch in 1..=MAX_BATCH {
+            assert!(
+                logical_bytes(batch, &contexts[..batch])
+                    > logical_bytes(batch, &[CONTEXT_TOKENS; MAX_BATCH][..batch])
+            );
+        }
     }
 }

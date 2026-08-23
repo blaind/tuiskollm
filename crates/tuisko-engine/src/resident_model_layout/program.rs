@@ -9,7 +9,8 @@ use crate::PagedKvSlotState;
 use crate::long_context_kv_layout::LayerKvRegions;
 use crate::{
     EngineError, EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, PagedKvSlotPool,
-    PagedKvTableUpdate,
+    PagedKvTableUpdate, full_attention_layer_layout::CONTEXT_CAPACITY as SHORT_CONTEXT_CAPACITY,
+    long_context_kv_layout::MAX_CONTEXT_TOKENS,
 };
 #[cfg(feature = "qualification")]
 use std::marker::PhantomData;
@@ -21,8 +22,9 @@ use tuisko_gpu::{
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_kernels_sm120::{
     AttentionOutputOp, AttentionQkPrepareOp, DenseFp8DownOp, DenseFp8SwiGluOp, FullAttentionQkvOp,
-    GdnInputProjectionOp, GdnOutputProjectionOp, GdnPrepareOp, GdnRecurrenceOp, LmHeadOp,
-    Nvfp4DownOp, Nvfp4SwiGluOp, PagedGqaOp, ResidualNormOp,
+    GdnInputProjectionOp, GdnOutputProjectionOp, GdnPrepareOp, GdnRecurrenceOp,
+    LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE, LmHeadOp,
+    LongContextPagedGqaOp, Nvfp4DownOp, Nvfp4SwiGluOp, PagedGqaOp, ResidualNormOp,
 };
 use tuisko_model::{
     Arch, CheckpointSnapshot, DenseFp8DownBindings, DenseFp8GateUpBindings,
@@ -31,13 +33,70 @@ use tuisko_model::{
 };
 
 const ROTARY_PAIRS: usize = 32;
-const SHORT_CONTEXT_PAGES_PER_SLOT: usize = super::CONTEXT_CAPACITY / ATTENTION_PAGE_SIZE;
+#[cfg(feature = "qualification")]
+const SHORT_CONTEXT_PAGES_PER_SLOT: usize = SHORT_CONTEXT_CAPACITY / ATTENTION_PAGE_SIZE;
+#[cfg(feature = "qualification")]
 const SHORT_CONTEXT_PHYSICAL_PAGES: usize = MAX_BATCH * SHORT_CONTEXT_PAGES_PER_SLOT;
+const LONG_CONTEXT_ROUTE_COUNT: usize = LONG_CONTEXT_GQA_PARTITION_BUCKETS.len();
+
+/// Exact resident graph selected by one checked decode-state upload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "the decode route must be replayed with the state that selected it"]
+pub struct ResidentDecodeRoute {
+    batch: usize,
+    maximum_length: usize,
+    attention: AttentionRoute,
+}
+
+impl ResidentDecodeRoute {
+    /// Number of compact rows captured by this exact route.
+    pub const fn batch(self) -> usize {
+        self.batch
+    }
+
+    /// Largest uploaded cache length across the active rows.
+    pub const fn maximum_length(self) -> usize {
+        self.maximum_length
+    }
+
+    /// Whether this route uses partitioned long-context attention.
+    pub const fn is_long_context(self) -> bool {
+        matches!(self.attention, AttentionRoute::Long { .. })
+    }
+
+    /// Captured partition capacity, or `None` for the short-context graph.
+    pub const fn partition_capacity(self) -> Option<usize> {
+        match self.attention {
+            AttentionRoute::Short => None,
+            AttentionRoute::Long { partitions, .. } => Some(partitions),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttentionRoute {
+    Short,
+    Long { index: usize, partitions: usize },
+}
+
+struct ResidentGraphs {
+    short: [CudaGraph; MAX_BATCH],
+    long: [[CudaGraph; MAX_BATCH]; LONG_CONTEXT_ROUTE_COUNT],
+}
+
+impl ResidentGraphs {
+    fn select(&self, route: ResidentDecodeRoute) -> &CudaGraph {
+        match route.attention {
+            AttentionRoute::Short => &self.short[route.batch - 1],
+            AttentionRoute::Long { index, .. } => &self.long[index][route.batch - 1],
+        }
+    }
+}
 
 /// Resident and shared-KV arenas plus immutable `B=1..=8` graphs for all 64 text layers.
 pub struct ResidentModelProgram {
     // Graphs retain both arena addresses and module handles, so they drop first.
-    graphs: [CudaGraph; MAX_BATCH],
+    graphs: ResidentGraphs,
     arena: DeviceArena,
     kv_arena: DeviceArena,
     kv_slots: PagedKvSlotPool,
@@ -49,6 +108,7 @@ pub struct ResidentModelProgram {
     _attention_qkv: FullAttentionQkvOp<Qwen38_27B>,
     _attention_qk_prepare: AttentionQkPrepareOp<Qwen38_27B>,
     _paged_gqa: PagedGqaOp<Qwen38_27B>,
+    _long_context_paged_gqa: LongContextPagedGqaOp<Qwen38_27B>,
     _attention_output: AttentionOutputOp<Qwen38_27B>,
     _dense_swiglu: DenseFp8SwiGluOp<Qwen38_27B>,
     _dense_down: DenseFp8DownOp<Qwen38_27B>,
@@ -98,6 +158,7 @@ impl ResidentModelProgram {
         let attention_qkv = FullAttentionQkvOp::new(context)?;
         let attention_qk_prepare = AttentionQkPrepareOp::new(context)?;
         let paged_gqa = PagedGqaOp::new(context)?;
+        let long_context_paged_gqa = LongContextPagedGqaOp::new(context)?;
         let attention_output = AttentionOutputOp::new(context)?;
         let dense_swiglu = DenseFp8SwiGluOp::new(context)?;
         let dense_down = DenseFp8DownOp::new(context)?;
@@ -128,6 +189,7 @@ impl ResidentModelProgram {
             attention_qkv: &attention_qkv,
             attention_qk_prepare: &attention_qk_prepare,
             paged_gqa: &paged_gqa,
+            long_context_paged_gqa: &long_context_paged_gqa,
             attention_output: &attention_output,
             dense_swiglu: &dense_swiglu,
             dense_down: &dense_down,
@@ -150,6 +212,7 @@ impl ResidentModelProgram {
             _attention_qkv: attention_qkv,
             _attention_qk_prepare: attention_qk_prepare,
             _paged_gqa: paged_gqa,
+            _long_context_paged_gqa: long_context_paged_gqa,
             _attention_output: attention_output,
             _dense_swiglu: dense_swiglu,
             _dense_down: dense_down,
@@ -230,7 +293,7 @@ impl ResidentModelProgram {
         positions: &[u32],
         rope_cos: &[f32],
         rope_sin: &[f32],
-    ) -> EngineResult<()> {
+    ) -> EngineResult<ResidentDecodeRoute> {
         require_batch(batch)?;
         if positions.len() != batch {
             return Err(EngineError::layout(format!(
@@ -255,7 +318,7 @@ impl ResidentModelProgram {
         self.arena
             .copy_prefix_from_host(stream, workspace.rope_sin, rope_sin)?;
 
-        Ok(())
+        select_decode_route(batch, &lengths[..batch])
     }
 
     /// Selects distinct physical persistent slots for the compact active rows.
@@ -329,7 +392,7 @@ impl ResidentModelProgram {
         Ok(released)
     }
 
-    /// Clears all recurrent owners and every currently assigned physical cache page.
+    /// Clears all recurrent owners and the complete shared physical cache pool.
     pub fn reset_state(&self, stream: &CudaStream) -> EngineResult<()> {
         for layer in &self.layout.layers {
             if let super::PersistentState::Gdn(state) = layer.persistent {
@@ -337,8 +400,9 @@ impl ResidentModelProgram {
                 self.arena.fill(stream, state.state, 0)?;
             }
         }
-        for slot in 0..MAX_BATCH {
-            self.clear_slot_cache(stream, slot)?;
+        for cache in self.layout.kv_layout.layers() {
+            self.kv_arena.fill(stream, cache.key.data, 0)?;
+            self.kv_arena.fill(stream, cache.value.data, 0)?;
         }
 
         Ok(())
@@ -399,10 +463,9 @@ impl ResidentModelProgram {
         Ok(())
     }
 
-    /// Replays the immutable complete-model graph for one exact batch.
-    pub fn replay(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
-        self.graphs[batch - 1].launch(stream)?;
+    /// Replays the immutable graph selected by the matching decode-state upload.
+    pub fn replay(&self, stream: &CudaStream, route: ResidentDecodeRoute) -> EngineResult<()> {
+        self.graphs.select(route).launch(stream)?;
 
         Ok(())
     }
@@ -491,17 +554,12 @@ impl ResidentModelProgram {
         self.kv_slots.host_allocation_bytes()
     }
 
-    /// GDN state plus the three cache pages assigned to one current decode slot.
+    /// Fixed GDN history and recurrent-state bytes owned by one slot.
+    ///
+    /// KV pages are drawn from the shared pool and therefore have no fixed
+    /// per-slot ownership byte count.
     pub const fn persistent_slot_bytes(&self) -> usize {
-        (self.layout.history_bytes()
-            + self.layout.state_bytes()
-            + SHORT_CONTEXT_PHYSICAL_PAGES
-                * Qwen38_27B::NUM_KV_HEADS
-                * ATTENTION_PAGE_SIZE
-                * Qwen38_27B::HEAD_DIM
-                * 2
-                * (Qwen38_27B::LAYERS / Qwen38_27B::FULL_ATTENTION_INTERVAL))
-            / MAX_BATCH
+        (self.layout.history_bytes() + self.layout.state_bytes()) / MAX_BATCH
     }
 
     /// Exact address-stable workspace bytes shared by every layer and endpoint.
@@ -551,17 +609,19 @@ impl ResidentModelProgram {
 
     #[cfg(feature = "qualification")]
     /// Launches the complete production schedule eagerly for graph-agreement checks.
-    pub fn launch_eager(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
-        launch_route(stream, batch, self.ops(), &self._pointers)?;
+    pub fn launch_eager(
+        &self,
+        stream: &CudaStream,
+        route: ResidentDecodeRoute,
+    ) -> EngineResult<()> {
+        launch_route(stream, route, self.ops(), &self._pointers)?;
         Ok(())
     }
 
     #[cfg(feature = "qualification")]
-    /// Returns one captured complete-model graph.
-    pub fn qualification_graph(&self, batch: usize) -> EngineResult<&CudaGraph> {
-        require_batch(batch)?;
-        Ok(&self.graphs[batch - 1])
+    /// Returns the captured complete-model graph for one checked state route.
+    pub fn qualification_graph(&self, route: ResidentDecodeRoute) -> &CudaGraph {
+        self.graphs.select(route)
     }
 
     #[cfg(feature = "qualification")]
@@ -569,10 +629,9 @@ impl ResidentModelProgram {
     pub fn qualification_repeated_graph(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        route: ResidentDecodeRoute,
         operations: u64,
     ) -> EngineResult<CudaGraph> {
-        require_batch(batch)?;
         if operations == 0 {
             return Err(EngineError::route(
                 "repeated resident-model graph requires at least one operation",
@@ -581,7 +640,7 @@ impl ResidentModelProgram {
         let ops = self.ops();
         Ok(CudaGraph::capture(stream, || {
             for _ in 0..operations {
-                launch_route(stream, batch, ops, &self._pointers)?;
+                launch_route(stream, route, ops, &self._pointers)?;
             }
             Ok(())
         })?)
@@ -730,6 +789,9 @@ impl ResidentModelProgram {
             workspace.log_decay,
             workspace.beta,
             workspace.query,
+            workspace.partial_maximum,
+            workspace.partial_denominator,
+            workspace.partial_numerator,
             workspace.attention,
         ] {
             self.arena.fill(stream, region, byte)?;
@@ -840,6 +902,13 @@ impl ResidentModelProgram {
                 .arena
                 .copy_to_host(stream, workspace.recurrent_output)?,
             query: self.arena.copy_to_host(stream, workspace.query)?,
+            partial_maximum: self.arena.copy_to_host(stream, workspace.partial_maximum)?,
+            partial_denominator: self
+                .arena
+                .copy_to_host(stream, workspace.partial_denominator)?,
+            partial_numerator: self
+                .arena
+                .copy_to_host(stream, workspace.partial_numerator)?,
             attention: self.arena.copy_to_host(stream, workspace.attention)?,
             mixer_branch: self.arena.copy_to_host(stream, workspace.mixer_branch)?,
             swiglu: self.arena.copy_to_host(stream, workspace.swiglu)?,
@@ -855,6 +924,93 @@ impl ResidentModelProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Reads the shared attention scratch and downstream seams changed by a long route.
+    pub fn qualification_long_context_observables(
+        &self,
+        stream: &CudaStream,
+        route: ResidentDecodeRoute,
+    ) -> EngineResult<ResidentLongContextObservables> {
+        let workspace = self.layout.workspace;
+        let attention_values = product(
+            "resident long qualification attention values",
+            route.batch,
+            Qwen38_27B::ATTENTION_OUTPUT_COLUMNS,
+        )?;
+        let projected_values = product(
+            "resident long qualification QKV values",
+            route.batch,
+            Qwen38_27B::ATTENTION_QKV_ROWS,
+        )?;
+        let partial_values = product(
+            "resident long qualification partial values",
+            product(
+                "resident long qualification head rows",
+                route.batch,
+                Qwen38_27B::NUM_ATTENTION_HEADS,
+            )?,
+            tuisko_kernels_sm120::LONG_CONTEXT_GQA_MAX_PARTITIONS,
+        )?;
+        let partial_numerator_values = product(
+            "resident long qualification numerator values",
+            partial_values,
+            Qwen38_27B::HEAD_DIM,
+        )?;
+        let hidden_values = product(
+            "resident long qualification hidden values",
+            route.batch,
+            Qwen38_27B::HIDDEN,
+        )?;
+        let logit_values = product(
+            "resident long qualification logit values",
+            route.batch,
+            Qwen38_27B::VOCAB,
+        )?;
+        Ok(ResidentLongContextObservables {
+            projected: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.projected,
+                projected_values,
+            )?,
+            query: self
+                .arena
+                .copy_prefix_to_host(stream, workspace.query, attention_values)?,
+            partial_maximum: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.partial_maximum,
+                partial_values,
+            )?,
+            partial_denominator: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.partial_denominator,
+                partial_values,
+            )?,
+            partial_numerator: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.partial_numerator,
+                partial_numerator_values,
+            )?,
+            attention: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.attention,
+                attention_values,
+            )?,
+            mixer_branch: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.mixer_branch,
+                hidden_values,
+            )?,
+            residual_a: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.residual_a,
+                hidden_values,
+            )?,
+            logits: self
+                .arena
+                .copy_prefix_to_host(stream, workspace.logits, logit_values)?,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
     fn ops(&self) -> Ops<'_> {
         Ops {
             norm: &self._norm,
@@ -865,6 +1021,7 @@ impl ResidentModelProgram {
             attention_qkv: &self._attention_qkv,
             attention_qk_prepare: &self._attention_qk_prepare,
             paged_gqa: &self._paged_gqa,
+            long_context_paged_gqa: &self._long_context_paged_gqa,
             attention_output: &self._attention_output,
             dense_swiglu: &self._dense_swiglu,
             dense_down: &self._dense_down,
@@ -908,6 +1065,12 @@ pub struct ResidentModelObservables {
     pub recurrent_output: Vec<u16>,
     /// Last prepared attention query rows.
     pub query: Vec<f32>,
+    /// Partition maxima retained by the long-context attention route.
+    pub partial_maximum: Vec<f32>,
+    /// Partition softmax denominators retained by the long-context attention route.
+    pub partial_denominator: Vec<f32>,
+    /// Partition attention numerators retained by the long-context attention route.
+    pub partial_numerator: Vec<f32>,
     /// Last gated attention-output rows.
     pub attention: Vec<f32>,
     /// Final mixer projection branch rows.
@@ -930,6 +1093,29 @@ pub struct ResidentModelObservables {
     pub key_guard_pages: Vec<u8>,
     /// First unassigned value page from every attention layer.
     pub value_guard_pages: Vec<u8>,
+}
+
+#[cfg(feature = "qualification")]
+/// Long-attention scratch plus the downstream complete-model seams it changes.
+pub struct ResidentLongContextObservables {
+    /// Last attention layer's QKV projection, including output-gate rows.
+    pub projected: Vec<u16>,
+    /// Last attention layer's prepared query rows.
+    pub query: Vec<f32>,
+    /// Last attention layer's partition maxima.
+    pub partial_maximum: Vec<f32>,
+    /// Last attention layer's partition denominators.
+    pub partial_denominator: Vec<f32>,
+    /// Last attention layer's partition numerators.
+    pub partial_numerator: Vec<f32>,
+    /// Last attention layer's gated GQA output.
+    pub attention: Vec<f32>,
+    /// Final attention projection branch.
+    pub mixer_branch: Vec<u16>,
+    /// Final residual rows before endpoint normalization.
+    pub residual_a: Vec<u16>,
+    /// Full BF16 vocabulary logits.
+    pub logits: Vec<u16>,
 }
 
 #[derive(Clone, Copy)]
@@ -1127,6 +1313,9 @@ struct WorkspacePointers {
     cache_positions: *const u32,
     lengths: *const u32,
     query: *mut f32,
+    partial_maximum: *mut f32,
+    partial_denominator: *mut f32,
+    partial_numerator: *mut f32,
     attention: *mut f32,
     mixer_branch: *mut u16,
     swiglu: *mut u16,
@@ -1271,6 +1460,9 @@ impl WorkspacePointers {
             cache_positions: arena.address(regions.cache_positions)?.cast_const(),
             lengths: arena.address(regions.lengths)?.cast_const(),
             query: arena.address(regions.query)?,
+            partial_maximum: arena.address(regions.partial_maximum)?,
+            partial_denominator: arena.address(regions.partial_denominator)?,
+            partial_numerator: arena.address(regions.partial_numerator)?,
             attention: arena.address(regions.attention)?,
             mixer_branch: arena.address(regions.mixer_branch)?,
             swiglu: arena.address(regions.swiglu)?,
@@ -1304,6 +1496,9 @@ impl WorkspacePointers {
             self.cache_positions.addr(),
             self.lengths.addr(),
             self.query.addr(),
+            self.partial_maximum.addr(),
+            self.partial_denominator.addr(),
+            self.partial_numerator.addr(),
             self.attention.addr(),
             self.mixer_branch.addr(),
             self.swiglu.addr(),
@@ -1434,6 +1629,7 @@ struct Ops<'a> {
     attention_qkv: &'a FullAttentionQkvOp<Qwen38_27B>,
     attention_qk_prepare: &'a AttentionQkPrepareOp<Qwen38_27B>,
     paged_gqa: &'a PagedGqaOp<Qwen38_27B>,
+    long_context_paged_gqa: &'a LongContextPagedGqaOp<Qwen38_27B>,
     attention_output: &'a AttentionOutputOp<Qwen38_27B>,
     dense_swiglu: &'a DenseFp8SwiGluOp<Qwen38_27B>,
     dense_down: &'a DenseFp8DownOp<Qwen38_27B>,
@@ -1446,24 +1642,54 @@ fn capture_routes(
     stream: &CudaStream,
     ops: Ops<'_>,
     pointers: &ProgramPointers,
-) -> EngineResult<[CudaGraph; MAX_BATCH]> {
-    let mut graphs = Vec::with_capacity(MAX_BATCH);
+) -> EngineResult<ResidentGraphs> {
+    let mut short = Vec::with_capacity(MAX_BATCH);
     for batch in 1..=MAX_BATCH {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, batch, ops, pointers)
+        let route = ResidentDecodeRoute {
+            batch,
+            maximum_length: SHORT_CONTEXT_CAPACITY,
+            attention: AttentionRoute::Short,
+        };
+        short.push(CudaGraph::capture(stream, || {
+            launch_route(stream, route, ops, pointers)
         })?);
     }
-    graphs
+    let short = short
         .try_into()
-        .map_err(|_| EngineError::layout("resident graph inventory has wrong cardinality"))
+        .map_err(|_| EngineError::layout("resident short graph inventory has wrong cardinality"))?;
+
+    let mut long = Vec::with_capacity(LONG_CONTEXT_ROUTE_COUNT);
+    for (index, &partitions) in LONG_CONTEXT_GQA_PARTITION_BUCKETS.iter().enumerate() {
+        let maximum_length = (partitions * LONG_CONTEXT_GQA_PARTITION_SIZE).min(MAX_CONTEXT_TOKENS);
+        let mut graphs = Vec::with_capacity(MAX_BATCH);
+        for batch in 1..=MAX_BATCH {
+            let route = ResidentDecodeRoute {
+                batch,
+                maximum_length,
+                attention: AttentionRoute::Long { index, partitions },
+            };
+            graphs.push(CudaGraph::capture(stream, || {
+                launch_route(stream, route, ops, pointers)
+            })?);
+        }
+        long.push(graphs.try_into().map_err(|_| {
+            EngineError::layout("resident long graph batch inventory has wrong cardinality")
+        })?);
+    }
+    let long = long.try_into().map_err(|_| {
+        EngineError::layout("resident long graph partition inventory has wrong cardinality")
+    })?;
+
+    Ok(ResidentGraphs { short, long })
 }
 
 fn launch_route(
     stream: &CudaStream,
-    batch: usize,
+    route: ResidentDecodeRoute,
     ops: Ops<'_>,
     pointers: &ProgramPointers,
 ) -> GpuResult<()> {
+    let batch = route.batch;
     let workspace = pointers.workspace;
     let first = pointers
         .layers
@@ -1483,7 +1709,7 @@ fn launch_route(
 
     let mut residual_input = workspace.residual_a;
     for (index, layer) in pointers.layers.iter().enumerate() {
-        launch_mixer(stream, batch, ops, workspace, layer.mixer)?;
+        launch_mixer(stream, route, ops, workspace, layer.mixer)?;
         // SAFETY: mixer output and both residual seams are disjoint maximum-B planes.
         unsafe {
             ops.norm.launch_residual(
@@ -1544,11 +1770,12 @@ fn launch_route(
 
 fn launch_mixer(
     stream: &CudaStream,
-    batch: usize,
+    route: ResidentDecodeRoute,
     ops: Ops<'_>,
     workspace: WorkspacePointers,
     mixer: MixerPointers,
 ) -> GpuResult<()> {
+    let batch = route.batch;
     // SAFETY: the shared scratch planes are reused only after the preceding
     // launch has consumed them, and each persistent plane belongs to this layer.
     unsafe {
@@ -1631,20 +1858,40 @@ fn launch_mixer(
                     p.scalars.key_cache_scale,
                     p.scalars.value_cache_scale,
                 )?;
-                ops.paged_gqa.launch(
-                    stream,
-                    batch,
-                    workspace.query,
-                    p.key_pages,
-                    p.value_pages,
-                    workspace.block_tables,
-                    workspace.table_rows,
-                    LONG_CONTEXT_PHYSICAL_PAGES,
-                    workspace.lengths,
-                    workspace.attention,
-                    p.scalars.key_cache_scale,
-                    p.scalars.value_cache_scale,
-                )?;
+                match route.attention {
+                    AttentionRoute::Short => ops.paged_gqa.launch(
+                        stream,
+                        batch,
+                        workspace.query,
+                        p.key_pages,
+                        p.value_pages,
+                        workspace.block_tables,
+                        workspace.table_rows,
+                        LONG_CONTEXT_PHYSICAL_PAGES,
+                        workspace.lengths,
+                        workspace.attention,
+                        p.scalars.key_cache_scale,
+                        p.scalars.value_cache_scale,
+                    )?,
+                    AttentionRoute::Long { .. } => ops.long_context_paged_gqa.launch(
+                        stream,
+                        batch,
+                        route.maximum_length,
+                        workspace.query,
+                        p.key_pages,
+                        p.value_pages,
+                        workspace.block_tables,
+                        workspace.table_rows,
+                        LONG_CONTEXT_PHYSICAL_PAGES,
+                        workspace.lengths,
+                        workspace.partial_maximum,
+                        workspace.partial_denominator,
+                        workspace.partial_numerator,
+                        workspace.attention,
+                        p.scalars.key_cache_scale,
+                        p.scalars.value_cache_scale,
+                    )?,
+                }
                 ops.attention_output.launch(
                     stream,
                     batch,
@@ -1951,6 +2198,47 @@ fn decode_lengths(positions: &[u32], capacity: usize) -> EngineResult<[u32; MAX_
     Ok(lengths)
 }
 
+fn select_decode_route(batch: usize, lengths: &[u32]) -> EngineResult<ResidentDecodeRoute> {
+    require_batch(batch)?;
+    if lengths.len() != batch {
+        return Err(EngineError::route(format!(
+            "resident route has {} lengths, expected {batch}",
+            lengths.len()
+        )));
+    }
+    let maximum_length =
+        lengths.iter().copied().max().ok_or_else(|| {
+            EngineError::route("resident route requires at least one cache length")
+        })? as usize;
+    if maximum_length == 0 || maximum_length > MAX_CONTEXT_TOKENS {
+        return Err(EngineError::route(format!(
+            "resident maximum cache length {maximum_length} is outside 1..={MAX_CONTEXT_TOKENS}"
+        )));
+    }
+    let attention = if maximum_length <= SHORT_CONTEXT_CAPACITY {
+        AttentionRoute::Short
+    } else {
+        let required = maximum_length.div_ceil(LONG_CONTEXT_GQA_PARTITION_SIZE);
+        let (index, partitions) = LONG_CONTEXT_GQA_PARTITION_BUCKETS
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|&(_, partitions)| partitions >= required)
+            .ok_or_else(|| {
+                EngineError::route(format!(
+                    "resident maximum cache length {maximum_length} has no partition graph"
+                ))
+            })?;
+        AttentionRoute::Long { index, partitions }
+    };
+
+    Ok(ResidentDecodeRoute {
+        batch,
+        maximum_length,
+        attention,
+    })
+}
+
 fn slot_rows(slots: &[usize]) -> EngineResult<[u32; MAX_BATCH]> {
     require_batch(slots.len())?;
     let mut seen = [false; MAX_BATCH];
@@ -2086,7 +2374,10 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bf16_to_f32, decode_lengths, little_endian_words, require_batch, slot_rows};
+    use super::{
+        bf16_to_f32, decode_lengths, little_endian_words, require_batch, select_decode_route,
+        slot_rows,
+    };
     use crate::EngineErrorCode;
 
     #[test]
@@ -2103,13 +2394,50 @@ mod tests {
     #[test]
     fn decode_lengths_enforce_the_current_cache_capacity() {
         assert_eq!(
-            &decode_lengths(&[0, 63, 191], 192).unwrap()[..3],
-            [1, 64, 192]
+            &decode_lengths(&[0, 63, 219_999], 220_000).unwrap()[..3],
+            [1, 64, 220_000]
         );
         assert_eq!(
-            decode_lengths(&[192], 192).unwrap_err().code(),
+            decode_lengths(&[220_000], 220_000).unwrap_err().code(),
             Some(EngineErrorCode::Route)
         );
+    }
+
+    #[test]
+    fn decode_graph_inventory_covers_every_batch_and_partition_boundary() {
+        let cases = [
+            (1u32, None),
+            (192, None),
+            (193, Some(4)),
+            (1_024, Some(4)),
+            (1_025, Some(16)),
+            (4_096, Some(16)),
+            (4_097, Some(64)),
+            (16_384, Some(64)),
+            (16_385, Some(256)),
+            (65_536, Some(256)),
+            (65_537, Some(512)),
+            (131_072, Some(512)),
+            (131_073, Some(860)),
+            (220_000, Some(860)),
+        ];
+        for batch in 1..=8 {
+            for (maximum_length, partitions) in cases {
+                let mut lengths = vec![1; batch];
+                lengths[batch - 1] = maximum_length;
+                let route = select_decode_route(batch, &lengths).unwrap();
+                assert_eq!(route.batch(), batch);
+                assert_eq!(route.maximum_length(), maximum_length as usize);
+                assert_eq!(route.partition_capacity(), partitions);
+                assert_eq!(route.is_long_context(), partitions.is_some());
+            }
+        }
+        for (batch, lengths) in [(1, vec![]), (2, vec![1]), (1, vec![220_001])] {
+            assert_eq!(
+                select_decode_route(batch, &lengths).unwrap_err().code(),
+                Some(EngineErrorCode::Route)
+            );
+        }
     }
 
     #[test]

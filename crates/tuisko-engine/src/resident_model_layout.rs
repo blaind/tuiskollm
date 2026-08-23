@@ -2,15 +2,18 @@
 
 mod program;
 
-pub use program::ResidentModelProgram;
+pub use program::{ResidentDecodeRoute, ResidentModelProgram};
 #[cfg(feature = "qualification")]
-pub use program::{ResidentEmbeddingStageGraph, ResidentModelObservables};
+pub use program::{
+    ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
+};
 
 use crate::{
     EngineError, EngineResult, KvCacheCodec, MAX_BATCH, SharedPagedKvLayout,
-    full_attention_layer_layout::CONTEXT_CAPACITY,
+    long_context_kv_layout::MAX_CONTEXT_TOKENS,
 };
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
+use tuisko_kernels_sm120::LONG_CONTEXT_GQA_MAX_PARTITIONS;
 use tuisko_model::{Arch, NVFP4_MLP_LAYER_END, Qwen38_27B};
 
 const ALIGNMENT: usize = 256;
@@ -463,6 +466,9 @@ struct SharedWorkspace {
     cache_positions: ArenaRegion<u32>,
     lengths: ArenaRegion<u32>,
     query: ArenaRegion<f32>,
+    partial_maximum: ArenaRegion<f32>,
+    partial_denominator: ArenaRegion<f32>,
+    partial_numerator: ArenaRegion<f32>,
     attention: ArenaRegion<f32>,
     mixer_branch: ArenaRegion<u16>,
     swiglu: ArenaRegion<u16>,
@@ -493,6 +499,20 @@ impl SharedWorkspace {
             MAX_BATCH,
             A::ATTENTION_OUTPUT_COLUMNS,
         )?;
+        let batch_attention_partials = product(
+            "resident attention partial workspace",
+            product(
+                "resident attention partial rows",
+                MAX_BATCH,
+                A::NUM_ATTENTION_HEADS,
+            )?,
+            LONG_CONTEXT_GQA_MAX_PARTITIONS,
+        )?;
+        let batch_attention_numerator = product(
+            "resident attention partial numerator workspace",
+            batch_attention_partials,
+            A::HEAD_DIM,
+        )?;
         let batch_logits = product("resident logits workspace", MAX_BATCH, A::VOCAB)?;
 
         Ok(Self {
@@ -517,6 +537,9 @@ impl SharedWorkspace {
             cache_positions: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             lengths: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             query: builder.reserve(batch_attention, ALIGNMENT)?,
+            partial_maximum: builder.reserve(batch_attention_partials, ALIGNMENT)?,
+            partial_denominator: builder.reserve(batch_attention_partials, ALIGNMENT)?,
+            partial_numerator: builder.reserve(batch_attention_numerator, ALIGNMENT)?,
             attention: builder.reserve(batch_attention, ALIGNMENT)?,
             mixer_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
             swiglu: builder.reserve(batch_intermediate, ALIGNMENT)?,
@@ -549,6 +572,9 @@ impl SharedWorkspace {
             self.cache_positions,
             self.lengths,
             self.query,
+            self.partial_maximum,
+            self.partial_denominator,
+            self.partial_numerator,
             self.attention,
             self.mixer_branch,
             self.swiglu,
@@ -713,9 +739,9 @@ impl ResidentModelLayout {
         )
     }
 
-    /// Fixed per-slot context capacity of the current exact attention owner.
+    /// Maximum logical context admitted for one slot in the shared page pool.
     pub const fn context_capacity(&self) -> usize {
-        CONTEXT_CAPACITY
+        MAX_CONTEXT_TOKENS
     }
 
     fn validate_regions(&self) -> EngineResult<()> {
@@ -906,13 +932,13 @@ mod tests {
         assert_eq!(layout.state_bytes(), 1_207_959_552);
         assert_eq!(layout.cache_bytes(), 7_210_008_576);
         assert_eq!(layout.kv_table_bytes(), 110_016);
-        assert_eq!(layout.workspace_bytes(), 5_910_176);
+        assert_eq!(layout.workspace_bytes(), 176_314_016);
         assert_eq!(
             layout.source_mapped_embedding_bytes().unwrap(),
             2_542_796_800
         );
-        assert_eq!(layout.context_capacity(), 192);
-        assert_eq!(layout.owner_bytes(), 27_551_263_840);
+        assert_eq!(layout.context_capacity(), 220_000);
+        assert_eq!(layout.owner_bytes(), 27_721_667_680);
     }
 
     #[test]
@@ -925,11 +951,14 @@ mod tests {
             assert!(batch * 16_384 <= layout.workspace.projected.len());
             assert!(batch * 10_240 <= layout.workspace.convolved.len());
             assert!(batch * 6_144 <= layout.workspace.query.len());
+            assert!(batch * 24 * 860 <= layout.workspace.partial_maximum.len());
+            assert!(batch * 24 * 860 <= layout.workspace.partial_denominator.len());
+            assert!(batch * 24 * 860 * 256 <= layout.workspace.partial_numerator.len());
             assert!(batch * 248_320 <= layout.workspace.logits.len());
         }
-        assert_eq!(layout.resident_arena_bytes(), 20_341_161_728);
+        assert_eq!(layout.resident_arena_bytes(), 20_511_565_568);
         assert_eq!(layout.kv_arena_bytes(), 7_210_118_656);
         assert_eq!(layout.padding_bytes(), 16_544);
-        assert_eq!(layout.arena_bytes(), 27_551_280_384);
+        assert_eq!(layout.arena_bytes(), 27_721_684_224);
     }
 }
