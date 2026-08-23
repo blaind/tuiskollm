@@ -1062,7 +1062,7 @@ fn qualify_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "attention_qk_prepare::tests",
+            "attention_qk_prepare",
             "--include-ignored",
             "--nocapture",
         ],
@@ -4126,8 +4126,17 @@ fn gate_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("attention_qk_prepare_exact_TID_"))
         .collect::<Vec<_>>();
+    let prefill = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("attention_qk_prepare_prefill_exact_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("attention Q/K preparation", prepare.len(), 8)?;
-    for entry in &prepare {
+    require_count("attention Q/K prefill preparation", prefill.len(), 4)?;
+    for entry in prepare.iter().chain(&prefill) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
@@ -4160,37 +4169,49 @@ fn gate_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
     let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
     let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
     let sass = String::from_utf8(sass.stdout)?;
-    let mut registers = Vec::new();
+    let mut decode_registers = Vec::new();
+    let mut prefill_registers = Vec::new();
     let mut shared = Vec::new();
-    for entry in prepare {
-        let resource = resources
-            .get(entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
-        require_spill_free(entry.name, resource)?;
-        registers.push(resource.registers);
-        shared.push(resource.shared);
+    for (entries, registers) in [
+        (&prepare, &mut decode_registers),
+        (&prefill, &mut prefill_registers),
+    ] {
+        for entry in entries {
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+            shared.push(resource.shared);
 
-        let body = sass_function_body(&sass, entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
-        for instruction in [
-            "MUFU.RSQ",
-            "SHFL.BFLY",
-            "F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C",
-        ] {
-            if !body.contains(instruction) {
-                return Err(
-                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
-                );
+            let body = sass_function_body(&sass, entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+            for instruction in [
+                "MUFU.RSQ",
+                "SHFL.BFLY",
+                "F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C",
+            ] {
+                if !body.contains(instruction) {
+                    return Err(format!(
+                        "entry `{}` lost required `{instruction}` SASS",
+                        entry.name
+                    )
+                    .into());
+                }
             }
         }
     }
-    registers.sort_unstable();
-    require_registers(&baseline, "prepare_registers", &registers)?;
+    decode_registers.sort_unstable();
+    prefill_registers.sort_unstable();
+    require_registers(&baseline, "prepare_registers", &decode_registers)?;
+    if baseline.contains_key("prefill_prepare_registers") {
+        require_registers(&baseline, "prefill_prepare_registers", &prefill_registers)?;
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "attention Q/K prepare gate passed: 8 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/SHFL/E4M3 present",
-        registers, shared
+        "attention Q/K prepare gate passed: 8 decode + 4 prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/SHFL/E4M3 present",
+        decode_registers, prefill_registers, shared
     );
     Ok(())
 }

@@ -41,7 +41,7 @@ impl Qualification {
             "qualify-nvfp4-mlp" => {
                 "nvfp4_mlp::tests::source_layer55_matches_complete_oracles_and_graph_replay"
             }
-            "qualify-attention-qk-prepare" => "attention_qk_prepare::tests",
+            "qualify-attention-qk-prepare" => "attention_qk_prepare",
             "qualify-paged-gqa" => "paged_gqa::tests",
             "qualify-long-context-paged-gqa" => "long_context_paged_gqa",
             "qualify-attention-output" => "attention_output::tests",
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(qualification.filter, "nvfp4_down::tests");
         let attention = Qualification::parse("qualify-attention-qk-prepare").expect("known suite");
         assert_eq!(attention.name, "attention-qk-prepare");
-        assert_eq!(attention.filter, "attention_qk_prepare::tests");
+        assert_eq!(attention.filter, "attention_qk_prepare");
         let paged = Qualification::parse("qualify-paged-gqa").expect("known suite");
         assert_eq!(paged.name, "paged-gqa");
         assert_eq!(paged.filter, "paged_gqa::tests");
