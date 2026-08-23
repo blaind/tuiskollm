@@ -1,6 +1,8 @@
 //! Repository build and qualification gates.
 
 mod gpu_target;
+mod perf_artifact;
+mod perf_iteration;
 mod performance;
 mod remote;
 
@@ -53,6 +55,28 @@ const RESIDENT_MODEL_RESOURCE_BASELINES: &[&str] = &[
     GDN_RECURRENCE_RESOURCE_BASELINE,
     GDN_OUTPUT_RESOURCE_BASELINE,
     ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+    PAGED_GQA_RESOURCE_BASELINE,
+    LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE,
+    ATTENTION_OUTPUT_RESOURCE_BASELINE,
+];
+const SM120_RESOURCE_BASELINES: &[&str] = &[
+    RESIDUAL_NORM_RESOURCE_BASELINE,
+    QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE,
+    FP8_QKV_RESOURCE_BASELINE,
+    FP8_GDN_INPUT_RESOURCE_BASELINE,
+    FP8_LM_HEAD_RESOURCE_BASELINE,
+    FP8_SWIGLU_RESOURCE_BASELINE,
+    FP8_DOWN_RESOURCE_BASELINE,
+    NVFP4_SWIGLU_RESOURCE_BASELINE,
+    QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE,
+    NVFP4_DOWN_RESOURCE_BASELINE,
+    QWEN35_NVFP4_DOWN_RESOURCE_BASELINE,
+    QWEN35_NVFP4_QKV_RESOURCE_BASELINE,
+    GDN_PREPARE_RESOURCE_BASELINE,
+    GDN_RECURRENCE_RESOURCE_BASELINE,
+    GDN_OUTPUT_RESOURCE_BASELINE,
+    ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+    QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     PAGED_GQA_RESOURCE_BASELINE,
     LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE,
     ATTENTION_OUTPUT_RESOURCE_BASELINE,
@@ -622,6 +646,32 @@ fn bootstrap_cuda_oxide(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn build_sm120(root: &Path) -> Result<(), Box<dyn Error>> {
+    let device_inputs = perf_artifact::device_input_sha256(root)?;
+    let resource_baselines =
+        perf_artifact::resource_baselines_sha256(root, SM120_RESOURCE_BASELINES)?;
+    if perf_artifact::local_build_is_current(
+        root,
+        &device_inputs,
+        &resource_baselines,
+        CUDA_OXIDE_REVISION,
+    )? {
+        println!("reusing verified worktree-local SM120 benchmark artifacts");
+        return gate_sm120_resources(root);
+    }
+    if let Some(source) = perf_artifact::restore_build_from_worktrees(
+        root,
+        &device_inputs,
+        &resource_baselines,
+        CUDA_OXIDE_REVISION,
+    )? {
+        println!(
+            "restored verified SM120 benchmark artifacts from {}",
+            source.display()
+        );
+        gate_sm120_resources(root)?;
+        return Ok(());
+    }
+
     run_oxide(
         root,
         &[
@@ -640,7 +690,14 @@ fn build_sm120(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
         ],
     )?;
-    gate_sm120_resources(root)
+    gate_sm120_resources(root)?;
+    perf_artifact::record_build(root, device_inputs, resource_baselines, CUDA_OXIDE_REVISION)
+}
+
+fn build_sm120_for_performance(root: &Path) -> Result<(), Box<dyn Error>> {
+    require_performance_device_idle()?;
+    build_sm120(root)?;
+    wait_for_device_idle()
 }
 
 fn build_startup_benchmark(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -1672,7 +1729,7 @@ fn bench_qwen35_residual_norm(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -1700,7 +1757,7 @@ fn bench_qwen35_nvfp4_swiglu(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -1726,7 +1783,7 @@ fn bench_qwen35_nvfp4_down(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -1752,7 +1809,7 @@ fn bench_qwen35_nvfp4_qkv(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -1783,7 +1840,7 @@ fn bench_qwen35_nvfp4_mlp(
             "usage: cargo run -p xtask -- bench-qwen35-nvfp4-mlp SNAPSHOT [options]".into(),
         );
     };
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -1810,7 +1867,7 @@ fn bench_qwen35_attention_qk_prepare(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -1869,7 +1926,7 @@ fn bench_nvfp4_mlp(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), 
     let Some((snapshot, options)) = arguments.split_first() else {
         return Err("usage: cargo run -p xtask -- bench-nvfp4-mlp SNAPSHOT [options]".into());
     };
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -1939,7 +1996,7 @@ fn bench_dense_fp8_mlp(
     let Some((snapshot, options)) = arguments.split_first() else {
         return Err("usage: cargo run -p xtask -- bench-dense-fp8-mlp SNAPSHOT [options]".into());
     };
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -1971,7 +2028,7 @@ fn bench_dense_fp8_gdn_layer(
             "usage: cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT [options]".into(),
         );
     };
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -2011,7 +2068,7 @@ fn bench_full_attention_layer(
             "usage: cargo run -p xtask -- bench-full-attention-layer SNAPSHOT [options]".into(),
         );
     };
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -2054,7 +2111,9 @@ fn bench_startup(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Bo
     let Some((snapshot, options)) = arguments.split_first() else {
         return Err("usage: cargo run -p xtask -- bench-startup SNAPSHOT [options]".into());
     };
+    require_performance_device_idle()?;
     build_startup_benchmark(root)?;
+    wait_for_device_idle()?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-startup");
@@ -2089,7 +2148,7 @@ fn bench_resident_model_variant(
     let Some((snapshot, options)) = arguments.split_first() else {
         return Err(format!("usage: cargo run -p xtask -- {command} SNAPSHOT [options]").into());
     };
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -2120,7 +2179,7 @@ fn bench_text_endpoint(
     let Some((snapshot, options)) = arguments.split_first() else {
         return Err("usage: cargo run -p xtask -- bench-text-endpoint SNAPSHOT [options]".into());
     };
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -2147,7 +2206,7 @@ fn bench_suite(
     suite: PerformanceSuite,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     run_benchmark_suite(root, suite, arguments)
 }
 
@@ -2246,7 +2305,7 @@ fn profile(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn 
         return Err("resident `ncu` profiling requires `--kernel REGEX`".into());
     }
 
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -2740,10 +2799,17 @@ fn csv_field(value: &str) -> String {
 fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
     let Some(mode) = arguments.first() else {
         return Err(
-            "usage: cargo run -p xtask -- perf <smoke|leaf|energy|gate|candidate SUITE [SNAPSHOT] [options]|check SUITE [SNAPSHOT]|bless SUITE [SNAPSHOT]>".into(),
+            "usage: cargo run -p xtask -- perf <smoke|leaf|energy|gate|candidate|check|bless|iterate|diagnose-diff> ...".into(),
         );
     };
     let mode = mode.to_str().ok_or("perf mode is not UTF-8")?;
+    if mode == "diagnose-diff" {
+        return diagnose_performance_report(root, &arguments[1..]);
+    }
+    if mode == "iterate" {
+        let options = parse_performance_iteration(&arguments[1..])?;
+        return run_performance_iteration(root, options);
+    }
     if mode == "bless" {
         let suite = arguments
             .get(1)
@@ -2760,6 +2826,7 @@ fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
             }
             None
         };
+        require_performance_device_idle()?;
         return bless_optimization_suite(root, suite, snapshot);
     }
     if matches!(mode, "candidate" | "check") {
@@ -2785,6 +2852,7 @@ fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
         if mode == "check" && !remaining.is_empty() {
             return Err("`perf check` uses the complete authoritative suite defaults".into());
         }
+        require_performance_device_idle()?;
         return run_optimization_cone(root, mode, suite, &cone, snapshot, remaining);
     }
     if arguments.len() != 1 {
@@ -2797,13 +2865,266 @@ fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
         "energy" => vec!["--energy-seconds".into(), "2".into()],
         _ => return Err(format!("unknown perf mode `{mode}`").into()),
     };
+    require_performance_device_idle()?;
     if mode == "gate" {
         for suite in PERFORMANCE_SUITES {
             suite.qualify(root)?;
         }
     }
     build_sm120(root)?;
+    wait_for_device_idle()?;
     run_performance_suites(root, mode, &options, mode == "gate")
+}
+
+struct PerformanceIterationOptions {
+    suite: PerformanceSuite,
+    batch_size: u32,
+    hypothesis: String,
+}
+
+fn parse_performance_iteration(
+    arguments: &[std::ffi::OsString],
+) -> Result<PerformanceIterationOptions, Box<dyn Error>> {
+    let Some((suite, remaining)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- perf iterate SUITE --batch B --hypothesis TEXT".into(),
+        );
+    };
+    let suite = PerformanceSuite::parse(suite.to_str().ok_or("perf suite is not UTF-8")?)?;
+    let mut batch_size = None;
+    let mut hypothesis = None;
+    let mut options = remaining.iter();
+    while let Some(option) = options.next() {
+        let value = options
+            .next()
+            .ok_or_else(|| format!("`{}` requires a value", option.to_string_lossy()))?;
+        match option.to_str().ok_or("perf iterate option is not UTF-8")? {
+            "--batch" if batch_size.is_none() => {
+                batch_size = Some(value.to_str().ok_or("batch is not UTF-8")?.parse()?);
+            }
+            "--hypothesis" if hypothesis.is_none() => {
+                hypothesis = Some(
+                    value
+                        .to_str()
+                        .ok_or("performance hypothesis is not UTF-8")?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            option => {
+                return Err(format!("unknown or duplicate perf iterate option `{option}`").into());
+            }
+        }
+    }
+    let batch_size = batch_size.ok_or("perf iterate requires `--batch B`")?;
+    if !(1..=8).contains(&batch_size) {
+        return Err("perf iterate requires `--batch 1..=8`".into());
+    }
+    let hypothesis = hypothesis.ok_or("perf iterate requires `--hypothesis TEXT`")?;
+    if hypothesis.is_empty() {
+        return Err("perf iterate requires a nonempty hypothesis".into());
+    }
+
+    Ok(PerformanceIterationOptions {
+        suite,
+        batch_size,
+        hypothesis,
+    })
+}
+
+fn run_performance_iteration(
+    root: &Path,
+    options: PerformanceIterationOptions,
+) -> Result<(), Box<dyn Error>> {
+    let suite = options.suite;
+    let baseline = root.join(suite.performance_baseline());
+    let device_inputs = perf_artifact::device_input_sha256(root)?;
+    let mut recorder = perf_iteration::IterationRecorder::start(
+        root,
+        suite.name(),
+        options.batch_size,
+        options.hypothesis,
+        device_inputs.clone(),
+        &baseline,
+    )?;
+
+    let started = Instant::now();
+    let device_identity = match require_performance_device_idle()
+        .and_then(|()| performance_device_identity_sha256())
+    {
+        Ok(identity) => {
+            recorder.record_stage("preflight", "passed", started.elapsed());
+            identity
+        }
+        Err(error) => {
+            recorder.record_stage("preflight", "refused", started.elapsed());
+            return fail_performance_iteration(recorder, error);
+        }
+    };
+
+    let started = Instant::now();
+    match perf_artifact::qualification_is_current(
+        root,
+        suite.name(),
+        &device_inputs,
+        &device_identity,
+    ) {
+        Ok(true) => recorder.record_stage("qualification", "reused", started.elapsed()),
+        Ok(false) => {
+            if let Err(error) = suite.qualify(root).and_then(|()| {
+                perf_artifact::record_qualification(
+                    root,
+                    suite.name(),
+                    device_inputs.clone(),
+                    device_identity.clone(),
+                )
+            }) {
+                recorder.record_stage("qualification", "failed", started.elapsed());
+                return fail_performance_iteration(recorder, error);
+            }
+            recorder.record_stage("qualification", "passed", started.elapsed());
+        }
+        Err(error) => {
+            recorder.record_stage("qualification", "failed", started.elapsed());
+            return fail_performance_iteration(recorder, error);
+        }
+    }
+
+    let started = Instant::now();
+    let resource_baselines =
+        match perf_artifact::resource_baselines_sha256(root, SM120_RESOURCE_BASELINES) {
+            Ok(value) => value,
+            Err(error) => {
+                recorder.record_stage("build", "failed", started.elapsed());
+                return fail_performance_iteration(recorder, error);
+            }
+        };
+    match perf_artifact::local_build_is_current(
+        root,
+        &device_inputs,
+        &resource_baselines,
+        CUDA_OXIDE_REVISION,
+    ) {
+        Ok(true) => recorder.record_stage("build", "reused", started.elapsed()),
+        Ok(false) => {
+            if let Err(error) = build_sm120(root) {
+                recorder.record_stage("build", "failed", started.elapsed());
+                return fail_performance_iteration(recorder, error);
+            }
+            recorder.record_stage("build", "passed", started.elapsed());
+        }
+        Err(error) => {
+            recorder.record_stage("build", "failed", started.elapsed());
+            return fail_performance_iteration(recorder, error);
+        }
+    }
+
+    let started = Instant::now();
+    let benchmark_arguments = [
+        "--batch".into(),
+        options.batch_size.to_string().into(),
+        "--json".into(),
+        recorder.report_path().into_os_string(),
+    ];
+    if let Err(error) =
+        wait_for_device_idle().and_then(|()| run_benchmark_suite(root, suite, &benchmark_arguments))
+    {
+        recorder.record_stage("benchmark", "refused_or_failed", started.elapsed());
+        return fail_performance_iteration(recorder, error);
+    }
+    recorder.record_stage("benchmark", "passed", started.elapsed());
+
+    let started = Instant::now();
+    let diagnostic = match performance::diagnose(&recorder.report_path(), &baseline) {
+        Ok(diagnostic) => diagnostic,
+        Err(error) => {
+            recorder.record_stage("comparison", "refused_or_failed", started.elapsed());
+            return fail_performance_iteration(recorder, error);
+        }
+    };
+    recorder.record_stage("comparison", "diagnostic_only", started.elapsed());
+    let output = recorder.succeed(diagnostic)?;
+    println!(
+        "diagnostic optimization iteration preserved at {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn fail_performance_iteration(
+    recorder: perf_iteration::IterationRecorder,
+    error: Box<dyn Error>,
+) -> Result<(), Box<dyn Error>> {
+    let error_text = error.to_string();
+    match recorder.fail(error.as_ref()) {
+        Ok(output) => eprintln!(
+            "failed or refused optimization iteration preserved at {}",
+            output.display()
+        ),
+        Err(record_error) => {
+            return Err(format!(
+                "{error_text}; additionally failed to preserve the iteration record: {record_error}"
+            )
+            .into());
+        }
+    }
+    Err(error)
+}
+
+fn diagnose_performance_report(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let (suite, report, output) = match arguments {
+        [suite, report] => (suite, report, None),
+        [suite, report, option, output] if option == "--json" => (suite, report, Some(output)),
+        _ => {
+            return Err(
+                "usage: cargo run -p xtask -- perf diagnose-diff SUITE REPORT [--json OUTPUT]"
+                    .into(),
+            );
+        }
+    };
+    let suite = OptimizationSuite::parse(suite.to_str().ok_or("perf suite is not UTF-8")?)?;
+    let report = resolve_repository_path(root, report);
+    let output = match output {
+        Some(path) => resolve_target_output(root, path)?,
+        None => root.join(format!(
+            "target/benchmarks/perf-diagnostic/{}.json",
+            suite.name()
+        )),
+    };
+    let diagnostic = performance::diagnose(&report, &root.join(suite.performance_baseline()))?;
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut json = serde_json::to_vec_pretty(&diagnostic)?;
+    json.push(b'\n');
+    fs::write(&output, json)?;
+    println!("diagnostic comparison JSON: {}", output.display());
+    Ok(())
+}
+
+fn resolve_repository_path(root: &Path, path: &OsStr) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn resolve_target_output(root: &Path, path: &OsStr) -> Result<PathBuf, Box<dyn Error>> {
+    let path = Path::new(path);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || !path.starts_with("target")
+    {
+        return Err("diagnostic output must be a repository-relative path under `target/`".into());
+    }
+    Ok(root.join(path))
 }
 
 fn run_performance_suites(
@@ -2840,6 +3161,8 @@ fn run_optimization_cone(
     snapshot: Option<&OsStr>,
     options: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
+    let device_inputs = perf_artifact::device_input_sha256(root)?;
+    let device_identity = performance_device_identity_sha256()?;
     if mode == "check" {
         let mut qualified = Vec::new();
         for suite in cone.iter().copied() {
@@ -2850,13 +3173,25 @@ fn run_optimization_cone(
             };
             if !qualified.contains(&authority) {
                 authority.qualify(root, snapshot)?;
+                if let OptimizationSuite::Leaf(leaf) = authority {
+                    perf_artifact::record_qualification(
+                        root,
+                        leaf.name(),
+                        device_inputs.clone(),
+                        device_identity.clone(),
+                    )?;
+                }
                 qualified.push(authority);
             }
         }
     } else {
         root_suite.qualify(root, snapshot)?;
+        if let OptimizationSuite::Leaf(leaf) = root_suite {
+            perf_artifact::record_qualification(root, leaf.name(), device_inputs, device_identity)?;
+        }
     }
     build_sm120(root)?;
+    wait_for_device_idle()?;
     for (index, suite) in cone.iter().copied().enumerate() {
         if index != 0 {
             wait_for_device_idle()?;
@@ -2889,7 +3224,7 @@ fn wait_for_device_idle() -> Result<(), Box<dyn Error>> {
         )?;
         let (utilization, memory_mib) = parse_idle_sample(&row)?;
         if utilization == 0 && memory_mib <= 1_024 {
-            return Ok(());
+            return require_performance_device_idle();
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -2901,6 +3236,98 @@ fn wait_for_device_idle() -> Result<(), Box<dyn Error>> {
 
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn require_performance_device_idle() -> Result<(), Box<dyn Error>> {
+    if env::var_os("CUDA_VISIBLE_DEVICES").is_some_and(|value| value != "0") {
+        return Err(
+            "performance commands require CUDA_VISIBLE_DEVICES to be unset or exactly `0`".into(),
+        );
+    }
+    let row = command_text(
+        "nvidia-smi",
+        &[
+            "-i",
+            "0",
+            "--query-gpu=name,utilization.gpu,memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+    )?;
+    let (device, utilization, memory_mib) = parse_performance_device_sample(&row)?;
+    let expected = gpu_target::GpuTarget::Sm120.device_name();
+    if device != expected {
+        return Err(format!(
+            "performance commands require device zero to be `{expected}`, found `{device}`"
+        )
+        .into());
+    }
+    if utilization != 0 || memory_mib > 1_024 {
+        return Err(format!(
+            "device zero is busy before performance setup: utilization={utilization}%, memory={memory_mib} MiB"
+        )
+        .into());
+    }
+    let processes = command_text(
+        "nvidia-smi",
+        &[
+            "-i",
+            "0",
+            "--query-compute-apps=pid",
+            "--format=csv,noheader,nounits",
+        ],
+    )?;
+    let pids = parse_compute_pids(&processes)?;
+    if !pids.is_empty() {
+        return Err(format!(
+            "device zero has foreign compute processes before performance setup: {pids:?}"
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn performance_device_identity_sha256() -> Result<String, Box<dyn Error>> {
+    let identity = command_text(
+        "nvidia-smi",
+        &[
+            "-i",
+            "0",
+            "--query-gpu=name,uuid,driver_version",
+            "--format=csv,noheader,nounits",
+        ],
+    )?;
+    Ok(sha256(identity.trim().as_bytes()))
+}
+
+fn parse_performance_device_sample(row: &str) -> Result<(String, u32, u64), Box<dyn Error>> {
+    let fields = row.trim().split(',').map(str::trim).collect::<Vec<_>>();
+    let [device, utilization, memory_mib] = fields.as_slice() else {
+        return Err(format!(
+            "unexpected nvidia-smi performance preflight row `{}`",
+            row.trim()
+        )
+        .into());
+    };
+
+    Ok((
+        (*device).to_string(),
+        utilization.parse()?,
+        memory_mib.parse()?,
+    ))
+}
+
+fn parse_compute_pids(output: &str) -> Result<Vec<u32>, Box<dyn Error>> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "No running processes found")
+        .map(|line| {
+            line.parse().map_err(|error| {
+                format!("unexpected nvidia-smi compute PID `{line}`: {error}").into()
+            })
+        })
+        .collect()
 }
 
 fn parse_idle_sample(row: &str) -> Result<(u32, u64), Box<dyn Error>> {
@@ -2925,7 +3352,16 @@ fn bless_optimization_suite(
     snapshot: Option<&OsStr>,
 ) -> Result<(), Box<dyn Error>> {
     suite.qualify(root, snapshot)?;
+    if let OptimizationSuite::Leaf(leaf) = suite {
+        perf_artifact::record_qualification(
+            root,
+            leaf.name(),
+            perf_artifact::device_input_sha256(root)?,
+            performance_device_identity_sha256()?,
+        )?;
+    }
     build_sm120(root)?;
+    wait_for_device_idle()?;
     let report = optimization_report_path(root, "bless", suite, suite);
     run_optimization_benchmark(
         root,
@@ -5966,10 +6402,13 @@ fn require_uniform_value(
 mod tests {
     use super::{
         COMPOSED_PERFORMANCE_SUITES, OptimizationSuite, PERFORMANCE_SUITES, PerformanceSuite,
-        parse_cuda_toolkit_identity, parse_entries, parse_idle_sample, parse_resources,
-        parse_rustc_identity, require_count, require_uniform_value, sass_function_body,
+        SM120_RESOURCE_BASELINES, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
+        parse_idle_sample, parse_performance_device_sample, parse_performance_iteration,
+        parse_resources, parse_rustc_identity, require_count, require_uniform_value,
+        resolve_target_output, sass_function_body,
     };
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
 
     #[test]
     fn parses_hashed_and_concrete_entries() {
@@ -6072,6 +6511,35 @@ mod tests {
     }
 
     #[test]
+    fn sm120_build_receipt_covers_every_resource_gate() {
+        assert_eq!(
+            SM120_RESOURCE_BASELINES,
+            [
+                "qual/baselines/residual-norm-sm120.txt",
+                "qual/baselines/qwen35-residual-norm-sm120.txt",
+                "qual/baselines/fp8-qkv-sm120.txt",
+                "qual/baselines/fp8-gdn-input-sm120.txt",
+                "qual/baselines/fp8-lm-head-sm120.txt",
+                "qual/baselines/fp8-swiglu-sm120.txt",
+                "qual/baselines/fp8-down-sm120.txt",
+                "qual/baselines/nvfp4-swiglu-sm120.txt",
+                "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt",
+                "qual/baselines/nvfp4-down-sm120.txt",
+                "qual/baselines/qwen35-nvfp4-down-sm120.txt",
+                "qual/baselines/qwen35-nvfp4-qkv-sm120.txt",
+                "qual/baselines/gdn-prepare-sm120.txt",
+                "qual/baselines/gdn-recurrence-sm120.txt",
+                "qual/baselines/gdn-output-sm120.txt",
+                "qual/baselines/attention-qk-prepare-sm120.txt",
+                "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",
+                "qual/baselines/paged-gqa-sm120.txt",
+                "qual/baselines/long-context-paged-gqa-sm120.txt",
+                "qual/baselines/attention-output-sm120.txt",
+            ]
+        );
+    }
+
+    #[test]
     fn composed_performance_inventory_and_dependency_cones_are_exact() {
         let names = COMPOSED_PERFORMANCE_SUITES
             .iter()
@@ -6141,6 +6609,56 @@ mod tests {
         assert_eq!(parse_idle_sample("0, 234\n").unwrap(), (0, 234));
         assert_eq!(parse_idle_sample("69, 1024").unwrap(), (69, 1_024));
         assert!(parse_idle_sample("0, 234, 1").is_err());
+    }
+
+    #[test]
+    fn parses_exact_performance_preflight_samples_and_processes() {
+        assert_eq!(
+            parse_performance_device_sample("NVIDIA GeForce RTX 5090, 0, 503\n").unwrap(),
+            ("NVIDIA GeForce RTX 5090".to_string(), 0, 503)
+        );
+        assert!(parse_performance_device_sample("RTX 5090, 0").is_err());
+        assert_eq!(parse_compute_pids("\n").unwrap(), Vec::<u32>::new());
+        assert_eq!(parse_compute_pids("123\n456\n").unwrap(), vec![123, 456]);
+        assert!(parse_compute_pids("N/A\n").is_err());
+    }
+
+    #[test]
+    fn perf_iteration_requires_one_exact_batch_and_hypothesis() {
+        let options = parse_performance_iteration(&[
+            OsString::from("nvfp4-down"),
+            OsString::from("--batch"),
+            OsString::from("1"),
+            OsString::from("--hypothesis"),
+            OsString::from("coalesce B=1 loads"),
+        ])
+        .unwrap();
+        assert_eq!(options.suite, PerformanceSuite::Nvfp4Down);
+        assert_eq!(options.batch_size, 1);
+        assert_eq!(options.hypothesis, "coalesce B=1 loads");
+
+        assert!(
+            parse_performance_iteration(&[
+                OsString::from("nvfp4-down"),
+                OsString::from("--batch"),
+                OsString::from("9"),
+                OsString::from("--hypothesis"),
+                OsString::from("invalid batch"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn diagnostic_output_is_confined_to_the_ignored_target_tree() {
+        let root = std::path::Path::new("/repository");
+        assert_eq!(
+            resolve_target_output(root, std::ffi::OsStr::new("target/report.json")).unwrap(),
+            root.join("target/report.json")
+        );
+        assert!(resolve_target_output(root, std::ffi::OsStr::new("AGENTS.md")).is_err());
+        assert!(resolve_target_output(root, std::ffi::OsStr::new("target/../AGENTS.md")).is_err());
+        assert!(resolve_target_output(root, std::ffi::OsStr::new("/tmp/report.json")).is_err());
     }
 
     #[test]

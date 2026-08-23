@@ -16,7 +16,7 @@ const HOST_RELATIVE_TOLERANCE_PERCENT: f64 = 15.0;
 const HOST_ABSOLUTE_TOLERANCE_MICROSECONDS: f64 = 0.10;
 const OBSERVED_MEMORY_TOLERANCE_BYTES: u64 = 16 * 1024 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct PerformanceReport {
     schema_version: u32,
     suite: String,
@@ -33,13 +33,15 @@ struct PerformanceReport {
     samples: usize,
     warmup_launches: u64,
     case_policy: String,
+    #[serde(default)]
+    selected_batch_size: Option<u32>,
     timing_scope: String,
     power_scope: String,
     metrics: Vec<ReportMetric>,
     memory: ReportMemory,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ReportMetric {
     route: String,
     shape: String,
@@ -64,13 +66,13 @@ struct Workload {
     execution: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ReportMemory {
     device_total_bytes: u64,
     metrics: Vec<ReportMemoryMetric>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ReportMemoryMetric {
     name: String,
     measurement: String,
@@ -136,6 +138,45 @@ struct BaselineMemoryMetric {
     reference_bytes: u64,
     absolute_tolerance_bytes: u64,
     enforced: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DiagnosticComparison {
+    pub authoritative: bool,
+    pub suite: String,
+    pub case_policy: String,
+    pub selected_batch_size: Option<u32>,
+    pub generator_provenance_changed: bool,
+    pub candidate_generator_baseline_sha256: String,
+    pub authority_generator_baseline_sha256: String,
+    pub timing_regressions: usize,
+    pub memory_regressions: usize,
+    pub timing_metrics: Vec<DiagnosticTimingMetric>,
+    pub memory_metrics: Vec<DiagnosticMemoryMetric>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DiagnosticTimingMetric {
+    route: String,
+    shape: String,
+    measurement: String,
+    reference_microseconds: f64,
+    candidate_microseconds: f64,
+    delta_percent: f64,
+    maximum_microseconds: f64,
+    enforced: bool,
+    regressed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DiagnosticMemoryMetric {
+    name: String,
+    measurement: String,
+    reference_bytes: u64,
+    candidate_bytes: u64,
+    delta_bytes: i128,
+    enforced: bool,
+    regressed: bool,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -284,6 +325,189 @@ pub(crate) fn compare(report_path: &Path, baseline_path: &Path) -> Result<(), Bo
         memory_candidates.len()
     );
     Ok(())
+}
+
+pub(crate) fn diagnose(
+    report_path: &Path,
+    baseline_path: &Path,
+) -> Result<DiagnosticComparison, Box<dyn Error>> {
+    let report = read_report(report_path)?;
+    let baseline: PerformanceBaseline =
+        serde_json::from_slice(&fs::read(baseline_path).map_err(|error| {
+            format!(
+                "could not read performance baseline {}: {error}",
+                baseline_path.display()
+            )
+        })?)?;
+    validate_diagnostic_environment(&report, &baseline)?;
+
+    let candidates = report_metrics(&report)?;
+    let authorities = baseline_metrics(&baseline)?;
+    match report.case_policy.as_str() {
+        "complete_inventory" => {
+            if candidates.keys().ne(authorities.keys()) {
+                return Err("performance report and baseline metric inventories differ".into());
+            }
+        }
+        "diagnostic_subset" => {
+            let selected = report
+                .selected_batch_size
+                .ok_or("diagnostic subset report omitted its selected batch size")?;
+            if !(1..=8).contains(&selected) {
+                return Err(
+                    format!("diagnostic subset selected invalid batch size {selected}").into(),
+                );
+            }
+            if candidates.is_empty() {
+                return Err("diagnostic subset report contains no timing metrics".into());
+            }
+            for key in candidates.keys() {
+                if key.workload.batch_size != Some(selected) {
+                    return Err(format!(
+                        "diagnostic subset metric {} {} {} is not B={selected}",
+                        key.route, key.shape, key.measurement
+                    )
+                    .into());
+                }
+                if !authorities.contains_key(key) {
+                    return Err(format!(
+                        "diagnostic subset metric {} {} {} has no matching authority",
+                        key.route, key.shape, key.measurement
+                    )
+                    .into());
+                }
+            }
+        }
+        policy => {
+            return Err(format!("unsupported diagnostic case policy `{policy}`").into());
+        }
+    }
+
+    println!(
+        "status route                            shape metric               reference  candidate    delta"
+    );
+    let mut timing_regressions = 0usize;
+    let mut timing_metrics = Vec::with_capacity(candidates.len());
+    for (key, candidate) in &candidates {
+        let authority = authorities
+            .get(key)
+            .expect("diagnostic metric authority was checked");
+        if candidate.operations_per_interval != authority.operations_per_interval {
+            return Err(format!(
+                "{} {} {} uses {} operations per interval, baseline requires {}",
+                key.route,
+                key.shape,
+                key.measurement,
+                candidate.operations_per_interval,
+                authority.operations_per_interval
+            )
+            .into());
+        }
+        let delta_percent =
+            (candidate.median_microseconds / authority.reference_microseconds - 1.0) * 100.0;
+        let maximum = maximum_allowed(authority);
+        let regressed = authority.enforced && candidate.median_microseconds > maximum;
+        if regressed {
+            timing_regressions += 1;
+        }
+        let status = if !authority.enforced {
+            "INFO"
+        } else if regressed {
+            "REGRESS"
+        } else {
+            "WITHIN"
+        };
+        println!(
+            "{status:<7} {:<32} {:<5} {:<19} {:>8.3} us {:>8.3} us {delta_percent:>+7.2}%",
+            key.route,
+            key.shape,
+            key.measurement,
+            authority.reference_microseconds,
+            candidate.median_microseconds,
+        );
+        timing_metrics.push(DiagnosticTimingMetric {
+            route: key.route.clone(),
+            shape: key.shape.clone(),
+            measurement: key.measurement.clone(),
+            reference_microseconds: authority.reference_microseconds,
+            candidate_microseconds: candidate.median_microseconds,
+            delta_percent,
+            maximum_microseconds: maximum,
+            enforced: authority.enforced,
+            regressed,
+        });
+    }
+
+    let memory_candidates = report_memory_metrics(&report.memory)?;
+    let memory_authorities = baseline_memory_metrics(&baseline.memory)?;
+    if memory_candidates.keys().ne(memory_authorities.keys()) {
+        return Err("performance report and baseline memory metric inventories differ".into());
+    }
+    println!();
+    println!("status memory                                      reference    candidate");
+    let mut memory_regressions = 0usize;
+    let mut memory_metrics = Vec::with_capacity(memory_candidates.len());
+    for (key, candidate) in &memory_candidates {
+        let authority = memory_authorities
+            .get(key)
+            .expect("matching memory metric inventories were checked");
+        require_memory_contract(candidate, authority)?;
+        let regressed = authority.enforced && !memory_passes(candidate.bytes, authority)?;
+        if regressed {
+            memory_regressions += 1;
+        }
+        let status = if !authority.enforced {
+            "INFO"
+        } else if regressed {
+            "REGRESS"
+        } else {
+            "WITHIN"
+        };
+        println!(
+            "{status:<7} {:<43} {:>9.2} MiB {:>9.2} MiB",
+            key.name,
+            authority.reference_bytes as f64 / (1024.0 * 1024.0),
+            candidate.bytes as f64 / (1024.0 * 1024.0),
+        );
+        memory_metrics.push(DiagnosticMemoryMetric {
+            name: key.name.clone(),
+            measurement: key.measurement.clone(),
+            reference_bytes: authority.reference_bytes,
+            candidate_bytes: candidate.bytes,
+            delta_bytes: candidate.bytes as i128 - authority.reference_bytes as i128,
+            enforced: authority.enforced,
+            regressed,
+        });
+    }
+
+    let generator_provenance_changed =
+        report.generator_baseline_sha256 != baseline.generator_baseline_sha256;
+    println!();
+    println!(
+        "diagnostic only: {} timing and {} memory metrics, {} enforced regressions, generator provenance {}",
+        timing_metrics.len(),
+        memory_metrics.len(),
+        timing_regressions + memory_regressions,
+        if generator_provenance_changed {
+            "changed"
+        } else {
+            "matched"
+        }
+    );
+
+    Ok(DiagnosticComparison {
+        authoritative: false,
+        suite: report.suite,
+        case_policy: report.case_policy,
+        selected_batch_size: report.selected_batch_size,
+        generator_provenance_changed,
+        candidate_generator_baseline_sha256: report.generator_baseline_sha256,
+        authority_generator_baseline_sha256: baseline.generator_baseline_sha256,
+        timing_regressions,
+        memory_regressions,
+        timing_metrics,
+        memory_metrics,
+    })
 }
 
 pub(crate) fn bless(report_path: &Path, baseline_path: &Path) -> Result<(), Box<dyn Error>> {
@@ -455,6 +679,56 @@ fn validate_environment(
     report: &PerformanceReport,
     baseline: &PerformanceBaseline,
 ) -> Result<(), Box<dyn Error>> {
+    validate_common_environment(report, baseline)?;
+    for (name, candidate, authority) in [
+        ("case policy", &report.case_policy, &baseline.case_policy),
+        (
+            "generator baseline",
+            &report.generator_baseline_sha256,
+            &baseline.generator_baseline_sha256,
+        ),
+    ] {
+        if candidate != authority {
+            return Err(format!(
+                "performance {name} is `{candidate}`, baseline requires `{authority}`"
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_diagnostic_environment(
+    report: &PerformanceReport,
+    baseline: &PerformanceBaseline,
+) -> Result<(), Box<dyn Error>> {
+    validate_common_environment(report, baseline)?;
+    if baseline.case_policy != "complete_inventory" {
+        return Err(format!(
+            "diagnostic comparison requires a complete-inventory authority, found `{}`",
+            baseline.case_policy
+        )
+        .into());
+    }
+    if !matches!(
+        report.case_policy.as_str(),
+        "complete_inventory" | "diagnostic_subset"
+    ) {
+        return Err(format!(
+            "diagnostic comparison does not admit case policy `{}`",
+            report.case_policy
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn validate_common_environment(
+    report: &PerformanceReport,
+    baseline: &PerformanceBaseline,
+) -> Result<(), Box<dyn Error>> {
     if baseline.schema_version != BASELINE_SCHEMA {
         return Err(format!(
             "performance baseline schema is {}, expected {BASELINE_SCHEMA}",
@@ -472,12 +746,6 @@ fn validate_environment(
             &baseline.compute_capability,
         ),
         ("clock policy", &report.clock_policy, &baseline.clock_policy),
-        ("case policy", &report.case_policy, &baseline.case_policy),
-        (
-            "generator baseline",
-            &report.generator_baseline_sha256,
-            &baseline.generator_baseline_sha256,
-        ),
     ] {
         if candidate != authority {
             return Err(format!(
@@ -532,7 +800,9 @@ fn validate_environment(
         report.memory_clock_min_mhz,
         report.memory_clock_max_mhz,
         baseline.memory_clock_band_mhz,
-    )
+    )?;
+
+    Ok(())
 }
 
 fn require_clock_band(
@@ -836,9 +1106,12 @@ fn default_memory_enforced(measurement: &str) -> bool {
 mod tests {
     use super::{
         BaselineMemoryMetric, BaselineMetric, ClockBand, MemoryBaseline, PerformanceBaseline,
-        Workload, default_memory_enforced, default_memory_tolerance, maximum_allowed,
-        memory_passes, padded_band, require_clock_band,
+        PerformanceReport, ReportMemory, ReportMemoryMetric, ReportMetric, Workload,
+        default_memory_enforced, default_memory_tolerance, diagnose, maximum_allowed,
+        memory_passes, padded_band, require_clock_band, validate_environment,
     };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn workload() -> Workload {
         Workload {
@@ -961,5 +1234,134 @@ mod tests {
         metric.comparison = "at_least".to_string();
         assert!(memory_passes(90, &metric).unwrap());
         assert!(!memory_passes(89, &metric).unwrap());
+    }
+
+    #[test]
+    fn diagnostic_subset_allows_provenance_lag_but_is_never_authoritative() {
+        let report = PerformanceReport {
+            schema_version: super::REPORT_SCHEMA,
+            suite: "suite".to_string(),
+            device: "NVIDIA GeForce RTX 5090".to_string(),
+            driver_version: "driver".to_string(),
+            compute_capability: "12.0".to_string(),
+            clock_policy: "controlled".to_string(),
+            binary_sha256: "c".repeat(64),
+            generator_baseline_sha256: "new".to_string(),
+            sm_clock_min_mhz: 2_197,
+            sm_clock_max_mhz: 2_197,
+            memory_clock_min_mhz: 14_001,
+            memory_clock_max_mhz: 14_001,
+            samples: 40,
+            warmup_launches: 1_024,
+            case_policy: "diagnostic_subset".to_string(),
+            selected_batch_size: Some(1),
+            timing_scope: "scope".to_string(),
+            power_scope: "scope".to_string(),
+            metrics: vec![ReportMetric {
+                route: "route-b1".to_string(),
+                shape: "B=1".to_string(),
+                workload: workload(),
+                measurement: "device_graph".to_string(),
+                median_microseconds: 3.9,
+                operations_per_interval: 256,
+            }],
+            memory: ReportMemory {
+                device_total_bytes: 1,
+                metrics: vec![ReportMemoryMetric {
+                    name: "summary/post_warmup_growth".to_string(),
+                    measurement: "timed_growth_after_warmup".to_string(),
+                    kind: None,
+                    scaling: None,
+                    bytes: 0,
+                    comparison: "at_most".to_string(),
+                }],
+            },
+        };
+        let mut batch_two = workload();
+        batch_two.batch_size = Some(2);
+        batch_two.active_tokens = Some(2);
+        let baseline = PerformanceBaseline {
+            schema_version: super::BASELINE_SCHEMA,
+            suite: "suite".to_string(),
+            device: "NVIDIA GeForce RTX 5090".to_string(),
+            driver_version: "driver".to_string(),
+            compute_capability: "12.0".to_string(),
+            clock_policy: "controlled".to_string(),
+            blessed_binary_sha256: "a".repeat(64),
+            generator_baseline_sha256: "old".to_string(),
+            sm_clock_band_mhz: ClockBand {
+                minimum: 2_182,
+                maximum: 2_212,
+            },
+            memory_clock_band_mhz: ClockBand {
+                minimum: 13_951,
+                maximum: 14_051,
+            },
+            minimum_samples: 40,
+            warmup_launches: 1_024,
+            case_policy: "complete_inventory".to_string(),
+            timing_scope: "scope".to_string(),
+            power_scope: "scope".to_string(),
+            metrics: vec![
+                BaselineMetric {
+                    route: "route-b1".to_string(),
+                    shape: "B=1".to_string(),
+                    workload: workload(),
+                    measurement: "device_graph".to_string(),
+                    reference_microseconds: 4.0,
+                    relative_tolerance_percent: 5.0,
+                    absolute_tolerance_microseconds: 0.05,
+                    operations_per_interval: 256,
+                    enforced: true,
+                },
+                BaselineMetric {
+                    route: "route-b2".to_string(),
+                    shape: "B=2".to_string(),
+                    workload: batch_two,
+                    measurement: "device_graph".to_string(),
+                    reference_microseconds: 5.0,
+                    relative_tolerance_percent: 5.0,
+                    absolute_tolerance_microseconds: 0.05,
+                    operations_per_interval: 256,
+                    enforced: true,
+                },
+            ],
+            memory: MemoryBaseline {
+                device_total_bytes: 1,
+                metrics: vec![BaselineMemoryMetric {
+                    name: "summary/post_warmup_growth".to_string(),
+                    measurement: "timed_growth_after_warmup".to_string(),
+                    kind: None,
+                    scaling: None,
+                    comparison: "at_most".to_string(),
+                    reference_bytes: 0,
+                    absolute_tolerance_bytes: 0,
+                    enforced: true,
+                }],
+            },
+        };
+        assert!(validate_environment(&report, &baseline).is_err());
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "tuiskollm-performance-diagnostic-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let report_path = directory.join("report.json");
+        let baseline_path = directory.join("baseline.json");
+        fs::write(&report_path, serde_json::to_vec(&report).unwrap()).unwrap();
+        fs::write(&baseline_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+
+        let diagnostic = diagnose(&report_path, &baseline_path).unwrap();
+
+        assert!(!diagnostic.authoritative);
+        assert!(diagnostic.generator_provenance_changed);
+        assert_eq!(diagnostic.selected_batch_size, Some(1));
+        assert_eq!(diagnostic.timing_metrics.len(), 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

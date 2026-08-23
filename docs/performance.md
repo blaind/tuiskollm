@@ -187,6 +187,8 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- perf candidate SUITE [SNAPSHOT] [options]` | Qualify the changed suite, then directly time its exact downstream owner/model cone | `target/benchmarks/perf-candidate/SUITE/*.json` |
 | `cargo run -p xtask -- perf check SUITE [SNAPSHOT]` | Measure the complete authoritative dependency cone and compare each checked baseline | `target/benchmarks/perf-check/SUITE/*.json` |
 | `cargo run -p xtask -- perf bless SUITE [SNAPSHOT]` | Run one oracle and explicitly replace that leaf or composed suite's baseline | `qual/baselines/SUITE-sm120.json` |
+| `cargo run -p xtask -- perf iterate SUITE --batch B --hypothesis TEXT` | Run one exact leaf route through verified qualification/build receipts, timing, and a diagnostic-only comparison | `target/optimization/SUITE/` |
+| `cargo run -p xtask -- perf diagnose-diff SUITE REPORT [--json OUTPUT]` | Compare a complete or exact-B report diagnostically while admitting only case-policy and generator-provenance differences | `target/benchmarks/perf-diagnostic/` |
 | `cargo run -p xtask -- profile resident-model SNAPSHOT --batch B --replays N --tool nsys` | Capture the production graph after warmup and attribute every node to semantic owner, stage, and layer | `target/profiles/resident-model-bB/` |
 | `cargo run -p xtask -- profile resident-model SNAPSHOT --batch B --tool ncu --kernel REGEX` | Collect hardware counters for one selected production kernel family | `target/profiles/resident-model-bB/` |
 
@@ -234,6 +236,44 @@ Use `--batch B` for a fast exact-route diagnostic. The report records
 `case_policy: diagnostic_subset` and `selected_batch_size: B`; it cannot be blessed or compared as
 the complete authority. This is the intended inner loop for a B-specific retile. Remove the option
 before final comparison so every admitted `B=1..8` route is timed.
+
+For the qualified inner loop, use the leaf-only wrapper and state the single measured hypothesis:
+
+```bash
+export TUISKO_AGENT_ITERATION_STARTED_UNIX_MILLISECONDS="$(date +%s%3N)"
+# Make the one-hypothesis source change.
+cargo run -p xtask -- perf iterate nvfp4-down \
+  --batch 1 \
+  --hypothesis "coalesce B=1 weight sectors"
+```
+
+Before any qualification or build work, the wrapper requires device zero to be the exact RTX 5090,
+idle below the admitted memory threshold, free of compute processes, and selected by an unset or
+exactly `0` `CUDA_VISIBLE_DEVICES`. The benchmark process still performs its complete independent
+preflight and telemetry checks immediately before timing.
+
+`perf iterate` reuses a numerical qualification only when an ignored receipt matches the complete
+device-input fingerprint and the hashed physical-device/driver identity. It reuses a build only
+when the input, cuda-oxide revision, complete resource-baseline digest, executable digest, and PTX
+digest match. It may copy those two verified build artifacts from another registered Git worktree;
+it never shares a mutable Cargo target directory. A normal `build-sm120` still reruns all resource
+gates after local or cross-worktree reuse, while the inner loop may trust a receipt that was written
+only after those gates passed. A stale, malformed, or hash-mismatched ignored receipt is a cache
+miss and forces fresh evidence; it never blocks the rebuild or weakens validation.
+
+Each attempt, including a controlled refusal or failure, gets a JSON manifest and raw benchmark
+report under `target/optimization/SUITE/`. A bundled-SQLite index at
+`target/optimization/iterations.sqlite3` records the hypothesis, Git/input identity, result, and
+wall time for preflight, qualification, build, benchmark, comparison, the whole command, and—when
+the environment variable above is set—the complete agent loop. These files are ignored diagnostic
+evidence, not checked authority.
+
+The diagnostic comparator requires the same suite, target, driver, compute capability, controlled
+clock policy and band, sampling identity, timing/power scope, workload keys, operation counts, and
+memory contract as the checked baseline. It permits only the expected complete-versus-exact-B case
+selection and generator/resource-provenance lag. Its JSON always records `authoritative: false`, it
+does not fail merely because a metric regressed, and no diagnostic path calls baseline blessing.
+An explicit diagnostic `--json` output must be a repository-relative path under `target/`.
 
 Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, `bench-fp8-lm-head`,
 `bench-fp8-swiglu`, `bench-fp8-down`, `bench-gdn-prepare`, `bench-gdn-recurrence`, or

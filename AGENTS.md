@@ -86,6 +86,10 @@ See `docs/performance.md` for commands and measurement semantics.
 - Change one measured hypothesis per iteration. Record both agent-loop wall time and command/device
   wall time, and preserve accepted, rejected, refused, and failed evidence under `target/` with its
   clocks, medians, and resources.
+- Refuse a wrong or occupied local device before qualification or build work. Reuse device evidence
+  or build artifacts only through ignored exact-input receipts bound to the applicable device,
+  toolchain, resource authorities, and artifact hashes; never share a mutable Cargo target between
+  worktrees.
 - An exact route or `B`-only run is an inner-loop diagnostic. Record the selection in the report
   and never compare or bless it as the complete admitted inventory.
 - Scale warmup and timing repetitions to the production boundary's measured duration. A resident
