@@ -2,7 +2,7 @@
 
 use crate::Sm120Arch;
 use crate::device::fp8_projection::{
-    fp8_projection, qkv_projection_mma, qkv_projection_mma_t16, quantize_activation,
+    fp8_projection, prefill_projection_mma, qkv_projection_mma_t16, quantize_activation,
 };
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
@@ -248,13 +248,14 @@ mod kernels {
         // SAFETY: the prepared route instantiates only T=32/64/128 with a complete
         // padded 64-row activation tile and exact 64-row output tiles.
         unsafe {
-            qkv_projection_mma::<Qwen38_27B, TOKENS, 64, 32, 4>(
+            prefill_projection_mma::<Qwen38_27B, TOKENS, 64, 32, 4>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
                 weight_scales,
                 output,
                 k_tiles,
+                Qwen38_27B::ATTENTION_QKV_ROWS,
             );
         }
     }
@@ -279,13 +280,80 @@ mod kernels {
     ) {
         // SAFETY: the fixed launch covers every 64-row token tile and QKV output tile.
         unsafe {
-            qkv_projection_mma::<Qwen38_27B, 1024, 64, 16, 2>(
+            prefill_projection_mma::<Qwen38_27B, 1024, 64, 16, 2>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
                 weight_scales,
                 output,
                 k_tiles,
+                Qwen38_27B::ATTENTION_QKV_ROWS,
+            );
+        }
+    }
+
+    /// Projects one exact 32/64/128-row prefill tile through source-native GDN Q/K/V/Z.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 32768,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn fp8_gdn_input_mma<const TOKENS: usize>(
+        activation_codes: *const u32,
+        activation_scales: *const f32,
+        weight_codes: *const u32,
+        weight_scales: *const u16,
+        output: *mut u16,
+        k_tiles: u32,
+    ) {
+        // SAFETY: the exact 64x64 CTA tile preserves every m16n8k32 accumulation
+        // and exposes 256 output CTAs per token tile for the 16,384-row GDN plane.
+        unsafe {
+            prefill_projection_mma::<Qwen38_27B, TOKENS, 64, 32, 4>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                k_tiles,
+                Qwen38_27B::GDN_INPUT_ROWS,
+            );
+        }
+    }
+
+    /// Projects exactly 1,024 GDN input rows with the low-shared-memory tile.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 16384,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn fp8_gdn_input_mma_t1024(
+        activation_codes: *const u32,
+        activation_scales: *const f32,
+        weight_codes: *const u32,
+        weight_scales: *const u16,
+        output: *mut u16,
+        k_tiles: u32,
+    ) {
+        // SAFETY: 16 K words keep the two-stage tile at 16 KiB while the 4,096
+        // CTAs cover every 64-token by 64-output tile exactly once.
+        unsafe {
+            prefill_projection_mma::<Qwen38_27B, 1024, 64, 16, 2>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                k_tiles,
+                Qwen38_27B::GDN_INPUT_ROWS,
             );
         }
     }
@@ -680,6 +748,151 @@ impl PreparedQkvT1024Route {
     }
 }
 
+struct PreparedGdnInputPrefillRoute<const TOKENS: usize> {
+    quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
+    projection: PreparedLaunch<kernels::__fp8_gdn_input_mma_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedGdnInputPrefillRoute<TOKENS> {
+    fn prepare<A: Arch>(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !QKV_MMA_PREFILL_TOKENS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "FP8 GDN input prefill route T={TOKENS} is not admitted"
+            )));
+        }
+        let token_tiles = TOKENS.div_ceil(QKV_MMA_PREFILL_BLOCK_ROWS);
+        let projection_blocks = A::GDN_INPUT_ROWS / QKV_MMA_OUTPUT_ROWS * token_tiles;
+        let projection_blocks = u32::try_from(projection_blocks).map_err(|_| {
+            GpuError::invalid_launch("FP8 GDN input prefill grid exceeds CUDA width")
+        })?;
+        let projection = module
+            .prepare_fp8_gdn_input_mma::<TOKENS>(LaunchConfig1D::new(
+                projection_blocks,
+                QKV_MMA_PREFILL_THREADS,
+                QKV_MMA_PREFILL_SHARED_BYTES,
+            ))
+            .map_err(|source| {
+                GpuError::launch("preparing the FP8 GDN input prefill projection", source)
+            })?;
+
+        Ok(Self {
+            quantize: prepare_quantize::<TOKENS>(module)?,
+            projection,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch<A: Arch>(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .quantize_activation_e4m3(
+                stream,
+                &self.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u16>(),
+                activation_scales,
+            )
+            .map_err(|source| GpuError::launch("launching FP8 activation quantization", source))?;
+        let k_tiles = A::HIDDEN / 4 / QKV_MMA_K_WORDS;
+        module
+            .fp8_gdn_input_mma::<TOKENS>(
+                stream,
+                &self.projection,
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                weight_codes.cast::<u32>(),
+                weight_scales,
+                output,
+                k_tiles as u32,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching the FP8 GDN input prefill projection", source)
+            })
+    }
+}
+
+struct PreparedGdnInputT1024Route {
+    quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
+    projection: PreparedLaunch<kernels::__fp8_gdn_input_mma_t1024_CudaKernel>,
+}
+
+impl PreparedGdnInputT1024Route {
+    fn prepare<A: Arch>(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let token_tiles = QKV_MMA_MACRO_TOKENS / QKV_MMA_PREFILL_BLOCK_ROWS;
+        let projection_blocks = A::GDN_INPUT_ROWS / QKV_MMA_OUTPUT_ROWS * token_tiles;
+        let projection_blocks = u32::try_from(projection_blocks).map_err(|_| {
+            GpuError::invalid_launch("FP8 GDN input macro-prefill grid exceeds CUDA width")
+        })?;
+        let projection = module
+            .prepare_fp8_gdn_input_mma_t1024(LaunchConfig1D::new(
+                projection_blocks,
+                QKV_MMA_PREFILL_THREADS,
+                QKV_MMA_MACRO_SHARED_BYTES,
+            ))
+            .map_err(|source| {
+                GpuError::launch(
+                    "preparing the FP8 GDN input macro-prefill projection",
+                    source,
+                )
+            })?;
+
+        Ok(Self {
+            quantize: prepare_quantize::<QKV_MMA_MACRO_TOKENS>(module)?,
+            projection,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch<A: Arch>(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .quantize_activation_e4m3(
+                stream,
+                &self.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u16>(),
+                activation_scales,
+            )
+            .map_err(|source| GpuError::launch("launching FP8 activation quantization", source))?;
+        let k_tiles = A::HIDDEN / 4 / QKV_MMA_MACRO_K_WORDS;
+        module
+            .fp8_gdn_input_mma_t1024(
+                stream,
+                &self.projection,
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                weight_codes.cast::<u32>(),
+                weight_scales,
+                output,
+                k_tiles as u32,
+            )
+            .map_err(|source| {
+                GpuError::launch(
+                    "launching the FP8 GDN input macro-prefill projection",
+                    source,
+                )
+            })
+    }
+}
+
 /// PTX symbols retained for activation quantization and every admitted QKV route.
 pub(crate) fn fp8_qkv_ptx_names() -> [&'static str; 14] {
     [
@@ -700,8 +913,8 @@ pub(crate) fn fp8_qkv_ptx_names() -> [&'static str; 14] {
     ]
 }
 
-/// PTX symbols retained for every exact GDN input projection batch.
-pub(crate) fn fp8_gdn_input_ptx_names() -> [&'static str; 8] {
+/// PTX symbols retained for every exact GDN input projection route.
+pub(crate) fn fp8_gdn_input_ptx_names() -> [&'static str; 12] {
     [
         kernels::fp8_gdn_input_ptx_name::<Qwen38_27B, 1>(),
         kernels::fp8_gdn_input_ptx_name::<Qwen38_27B, 2>(),
@@ -711,6 +924,10 @@ pub(crate) fn fp8_gdn_input_ptx_names() -> [&'static str; 8] {
         kernels::fp8_gdn_input_ptx_name::<Qwen38_27B, 6>(),
         kernels::fp8_gdn_input_ptx_name::<Qwen38_27B, 7>(),
         kernels::fp8_gdn_input_ptx_name::<Qwen38_27B, 8>(),
+        kernels::fp8_gdn_input_mma_ptx_name::<32>(),
+        kernels::fp8_gdn_input_mma_ptx_name::<64>(),
+        kernels::fp8_gdn_input_mma_ptx_name::<128>(),
+        "fp8_gdn_input_mma_t1024",
     ]
 }
 
@@ -890,7 +1107,7 @@ impl<A: Sm120Arch> FullAttentionQkvOp<A> {
     }
 }
 
-/// Prepared dynamic-quantize plus source-native GDN Q/K/V/Z routes for exact `B=1..=8`.
+/// Prepared dynamic-quantize plus source-native GDN Q/K/V/Z decode and prefill routes.
 pub struct GdnInputProjectionOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
     b1: PreparedGdnInputRoute<A, 1>,
@@ -901,10 +1118,14 @@ pub struct GdnInputProjectionOp<A: Sm120Arch = Qwen38_27B> {
     b6: PreparedGdnInputRoute<A, 6>,
     b7: PreparedGdnInputRoute<A, 7>,
     b8: PreparedGdnInputRoute<A, 8>,
+    t32: PreparedGdnInputPrefillRoute<32>,
+    t64: PreparedGdnInputPrefillRoute<64>,
+    t128: PreparedGdnInputPrefillRoute<128>,
+    t1024: PreparedGdnInputT1024Route,
 }
 
 impl<A: Sm120Arch> GdnInputProjectionOp<A> {
-    /// Loads the embedded SM120 module and prepares every exact-batch route.
+    /// Loads the embedded SM120 module and prepares every exact route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
         require_fp8_geometry::<A>()?;
         let _ = fp8_gdn_input_ptx_names();
@@ -921,16 +1142,21 @@ impl<A: Sm120Arch> GdnInputProjectionOp<A> {
             b6: PreparedGdnInputRoute::prepare(&module)?,
             b7: PreparedGdnInputRoute::prepare(&module)?,
             b8: PreparedGdnInputRoute::prepare(&module)?,
+            t32: PreparedGdnInputPrefillRoute::prepare::<A>(&module)?,
+            t64: PreparedGdnInputPrefillRoute::prepare::<A>(&module)?,
+            t128: PreparedGdnInputPrefillRoute::prepare::<A>(&module)?,
+            t1024: PreparedGdnInputT1024Route::prepare::<A>(&module)?,
             module,
         })
     }
 
-    /// Dynamically quantizes an exact batch and projects fused GDN Q/K/V/Z output.
+    /// Dynamically quantizes an exact row count and projects fused GDN Q/K/V/Z output.
     ///
     /// # Safety
     ///
-    /// `input` covers `batch * A::HIDDEN` BF16 values; `activation_codes` covers
-    /// the same number of bytes; `activation_scales` covers `batch` FP32 values;
+    /// `input` covers `rows * A::HIDDEN` BF16 values. `activation_codes` covers
+    /// at least 64 rows for T=32 and otherwise `rows`, so the retained padded CTA
+    /// can read its complete immutable tile; `activation_scales` covers `rows` FP32 values;
     /// weights cover `[A::GDN_INPUT_ROWS, A::HIDDEN]` E4M3 codes and one BF16
     /// scale per output row; and `output` covers all projected rows.
     /// Four-byte-loaded planes must be four-byte aligned. All allocations must
@@ -939,7 +1165,7 @@ impl<A: Sm120Arch> GdnInputProjectionOp<A> {
     pub unsafe fn launch(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         input: *const u16,
         activation_codes: *mut u8,
         activation_scales: *mut f32,
@@ -965,7 +1191,7 @@ impl<A: Sm120Arch> GdnInputProjectionOp<A> {
             };
         }
 
-        match batch {
+        match rows {
             1 => launch!(b1),
             2 => launch!(b2),
             3 => launch!(b3),
@@ -974,8 +1200,56 @@ impl<A: Sm120Arch> GdnInputProjectionOp<A> {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => unsafe {
+                self.t32.launch::<A>(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
+            64 => unsafe {
+                self.t64.launch::<A>(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
+            128 => unsafe {
+                self.t128.launch::<A>(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
+            1_024 => unsafe {
+                self.t1024.launch::<A>(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
             _ => Err(GpuError::invalid_launch(format!(
-                "FP8 GDN input batch {batch} is outside the admitted range 1..={MAX_BATCH}"
+                "FP8 GDN input row count {rows} is outside the admitted routes 1..={MAX_BATCH}, 32, 64, 128, and 1024"
             ))),
         }
     }
@@ -1121,6 +1395,7 @@ mod tests {
         assert_eq!(QKV_MMA_PREFILL_SHARED_BYTES, 32_768);
         assert_eq!(QKV_MMA_MACRO_SHARED_BYTES, 16_384);
         assert_eq!(Qwen38_27B::ATTENTION_QKV_ROWS % QKV_MMA_OUTPUT_ROWS, 0);
+        assert_eq!(Qwen38_27B::GDN_INPUT_ROWS % QKV_MMA_OUTPUT_ROWS, 0);
         assert_eq!((Qwen38_27B::HIDDEN / 4) % QKV_MMA_K_WORDS, 0);
         assert_eq!((Qwen38_27B::HIDDEN / 4) % QKV_MMA_MACRO_K_WORDS, 0);
     }
@@ -1153,7 +1428,7 @@ mod tests {
             .collect::<Vec<_>>();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 3 * MAX_BATCH + 6);
+        assert_eq!(names.len(), 3 * MAX_BATCH + 10);
         assert_eq!(unique.len(), names.len());
     }
 }

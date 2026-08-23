@@ -599,15 +599,16 @@ pub(crate) unsafe fn qkv_projection_mma_t16<A: Arch>(
 }
 
 #[inline(always)]
-unsafe fn store_qkv_prefill_mma_tile<A: Arch, const TOKENS: usize>(
+unsafe fn store_prefill_projection_mma_tile<const TOKENS: usize>(
     values: [f32; 4],
     activation_scales: *const f32,
     weight_scales: *const u16,
     output: *mut u16,
     first_token: usize,
     first_output: usize,
+    output_rows: usize,
 ) {
-    // SAFETY: the exact QKV tile maps both scale words within the source plane.
+    // SAFETY: the exact projection tile maps both scale words within the source plane.
     let first_weight_scale =
         f32::from_bits((unsafe { *weight_scales.add(first_output) } as u32) << 16);
     // SAFETY: output columns are paired and the second scale is adjacent.
@@ -617,10 +618,10 @@ unsafe fn store_qkv_prefill_mma_tile<A: Arch, const TOKENS: usize>(
         // SAFETY: the exact tile maps this token row and output pair uniquely.
         unsafe {
             let activation_scale = *activation_scales.add(first_token);
-            *output.add(first_token * A::ATTENTION_QKV_ROWS + first_output) =
+            *output.add(first_token * output_rows + first_output) =
                 tcgen05::cvt_f32x2_bf16x2(values[0] * activation_scale * first_weight_scale, 0.0)
                     as u16;
-            *output.add(first_token * A::ATTENTION_QKV_ROWS + first_output + 1) =
+            *output.add(first_token * output_rows + first_output + 1) =
                 tcgen05::cvt_f32x2_bf16x2(values[1] * activation_scale * second_weight_scale, 0.0)
                     as u16;
         }
@@ -631,19 +632,19 @@ unsafe fn store_qkv_prefill_mma_tile<A: Arch, const TOKENS: usize>(
         // SAFETY: the paired MMA row remains inside the exact active-token extent.
         unsafe {
             let activation_scale = *activation_scales.add(second_token);
-            *output.add(second_token * A::ATTENTION_QKV_ROWS + first_output) =
+            *output.add(second_token * output_rows + first_output) =
                 tcgen05::cvt_f32x2_bf16x2(values[2] * activation_scale * first_weight_scale, 0.0)
                     as u16;
-            *output.add(second_token * A::ATTENTION_QKV_ROWS + first_output + 1) =
+            *output.add(second_token * output_rows + first_output + 1) =
                 tcgen05::cvt_f32x2_bf16x2(values[3] * activation_scale * second_weight_scale, 0.0)
                     as u16;
         }
     }
 }
 
-/// Projects one admitted QKV prefill width with the retained 16x64 tensor-core tile.
+/// Projects one admitted FP8 prefill width with the retained 16x64 tensor-core tile.
 #[inline(always)]
-pub(crate) unsafe fn qkv_projection_mma<
+pub(crate) unsafe fn prefill_projection_mma<
     A: Arch,
     const TOKENS: usize,
     const BM: usize,
@@ -656,6 +657,7 @@ pub(crate) unsafe fn qkv_projection_mma<
     weight_scales: *const u16,
     output: *mut u16,
     k_tiles: u32,
+    output_rows: usize,
 ) {
     const OUTPUT_ROWS_PER_BLOCK: usize = 64;
     const STAGES: usize = 2;
@@ -667,7 +669,7 @@ pub(crate) unsafe fn qkv_projection_mma<
     let lane_group = lane >> 2;
     let thread_in_group = lane & 3;
     let words_per_row = A::HIDDEN / 4;
-    let output_tiles = A::ATTENTION_QKV_ROWS / OUTPUT_ROWS_PER_BLOCK;
+    let output_tiles = output_rows / OUTPUT_ROWS_PER_BLOCK;
     let token_tile = block / output_tiles;
     let output_tile = block - token_tile * output_tiles;
     let first_token_tile = token_tile * BM;
@@ -829,37 +831,41 @@ pub(crate) unsafe fn qkv_projection_mma<
     let first_output = warp_output + thread_in_group * 2;
     // SAFETY: the route's warps partition every active 16x64 output tile.
     unsafe {
-        store_qkv_prefill_mma_tile::<A, TOKENS>(
+        store_prefill_projection_mma_tile::<TOKENS>(
             accumulator0,
             activation_scales,
             weight_scales,
             output,
             first_token,
             first_output,
+            output_rows,
         );
-        store_qkv_prefill_mma_tile::<A, TOKENS>(
+        store_prefill_projection_mma_tile::<TOKENS>(
             accumulator1,
             activation_scales,
             weight_scales,
             output,
             first_token,
             first_output + 8,
+            output_rows,
         );
-        store_qkv_prefill_mma_tile::<A, TOKENS>(
+        store_prefill_projection_mma_tile::<TOKENS>(
             accumulator2,
             activation_scales,
             weight_scales,
             output,
             first_token,
             first_output + 16,
+            output_rows,
         );
-        store_qkv_prefill_mma_tile::<A, TOKENS>(
+        store_prefill_projection_mma_tile::<TOKENS>(
             accumulator3,
             activation_scales,
             weight_scales,
             output,
             first_token,
             first_output + 24,
+            output_rows,
         );
     }
 }

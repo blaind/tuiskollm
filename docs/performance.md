@@ -5,8 +5,9 @@ results are valid only on the exact RTX 5090 target under an exclusive, recorded
 
 The available device suites cover zero-centered residual/RMSNorm at exact `B=1..8` and
 `T=32,64,128,1024`, and
-dynamic-quantize FP8 QKV at exact `B=1..8`, `T=16` MTP, and `T=32,64,128,1024` prefill widths,
-GDN Q/K/V/Z input projection at exact `B=1..8`, the full-vocabulary FP8 LM head at exact `B=1..8`,
+dynamically-quantized FP8 QKV at exact `B=1..8`, `T=16` MTP, and `T=32,64,128,1024` prefill
+widths, GDN Q/K/V/Z input projection at exact `B=1..8` and `T=32,64,128,1024`, the
+full-vocabulary FP8 LM head at exact `B=1..8`,
 dense-FP8 gate/up SwiGLU at exact
 `B=1..8` and `T=32,64,128,1024`, dense-FP8 down at exact `B=1..8` and `T=32,64,128,1024`, GDN
 control/convolution at exact `B=1..8`, and the GDN recurrence and source-native output projection
@@ -154,7 +155,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-generation SNAPSHOT` | Check prompt-to-sampling-to-streaming state over exact BF16 logit rows | terminal |
 | `cargo run -p xtask -- qualify-residual-norm` | Run the independent numerical and graph-replay oracle | terminal |
 | `cargo run -p xtask -- qualify-fp8-qkv` | Check represented activation codes/scales and QKV output for B=1..8, T=16, and T=32/64/128/1024 prefill, including padded T=32 reads and graph replay | terminal |
-| `cargo run -p xtask -- qualify-fp8-gdn-input` | Run the independent represented-value GDN input oracle and benchmark-accounting test | terminal |
+| `cargo run -p xtask -- qualify-fp8-gdn-input` | Check represented activation codes/scales and GDN Q/K/V/Z output for B=1..8 and T=32/64/128/1024 prefill, including padded T=32 reads and graph replay | terminal |
 | `cargo run -p xtask -- qualify-fp8-lm-head` | Run the independent represented-value full-vocabulary LM-head oracle and benchmark-accounting test | terminal |
 | `cargo run -p xtask -- qualify-fp8-swiglu` | Run the exhaustive represented-value gate/up SwiGLU oracle and graph-replay gate | terminal |
 | `cargo run -p xtask -- qualify-fp8-down` | Run the exhaustive represented-value dense-FP8 down oracle and graph-replay gate | terminal |
@@ -463,13 +464,12 @@ Unused dimensions are `null`, not zero. A comparison refuses when any workload d
 inventory differs. This prevents, for example, a warm short-context operator result from being
 compared with a cold long-context model result that shares a route name.
 
-The residual-norm `B=1..8`, FP8-QKV `B=1..8`, FP8-GDN-input, FP8-LM-head, dense-FP8-SwiGLU `B=1..8`,
+The residual-norm `B=1..8`, FP8-QKV `B=1..8`, FP8-GDN-input `B=1..8`, FP8-LM-head, dense-FP8-SwiGLU `B=1..8`,
 dense-FP8-down, NVFP4-SwiGLU, and NVFP4-down cases are `operator/decode`, warm-cache, CUDA-Graph
 workloads. They set batch and active tokens to the exact batch. FP8-QKV `T=16` is an
-`operator/mtp` case; residual norm and FP8-QKV `T=32,64,128,1024` routes are `operator/prefill`
-cases. The QKV T=32
-projection reads a padded 64-row activation-code tile, and its logical-byte accounting includes
-those immutable padding reads.
+`operator/mtp` case; residual norm, FP8-QKV, and FP8-GDN-input `T=32,64,128,1024` routes are
+`operator/prefill` cases. Both projection T=32 routes read a padded 64-row activation-code tile,
+and their logical-byte accounting includes those immutable padding reads.
 Paged GQA `B=1..8` cases are `operator/decode` at context 130. Its shared `T=32,64,128` cases are
 `operator/prefill`; token `i` attends a two-token prefix plus the causal span through `i`. Logical
 bytes charge each K/V tile once per adjacent-token/KV-head group rather than duplicating its six
@@ -697,9 +697,9 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 
 - Decode operator coverage is exact `B=1..8`; prefill remains limited to the explicitly listed
   residual norm, FP8-QKV, Q/K preparation/cache-append, shared early-context, partitioned deep-tail
-  and macro paged-GQA, attention-output, dense-FP8 MLP, and full-attention-layer routes. GDN prefill
-  and resident integration still need complete routes before the server can stop priming through
-  decode.
+  and macro paged-GQA, attention-output, dense-FP8 MLP, full-attention-layer, and FP8-GDN-input
+  routes. GDN prepare, recurrence, output, layer composition, and resident integration still need
+  complete routes before the server can stop priming through decode.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
 - There is no full-server TTFT, inter-token-latency, concurrency, prefix-reuse, or end-to-end MTP
   benchmark in this repository yet. Direct long-context operator and resident-model timing exists.
