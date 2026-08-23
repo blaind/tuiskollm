@@ -230,7 +230,7 @@ impl ResidentModelProgram {
         self.arena
             .copy_prefix_from_host(stream, workspace.cache_positions, positions)?;
         self.arena
-            .copy_prefix_from_host(stream, workspace.lengths, &lengths)?;
+            .copy_prefix_from_host(stream, workspace.lengths, &lengths[..batch])?;
         self.arena
             .copy_prefix_from_host(stream, workspace.rope_cos, rope_cos)?;
         self.arena
@@ -272,6 +272,27 @@ impl ResidentModelProgram {
         Ok(self
             .arena
             .copy_prefix_to_host(stream, self.layout.workspace.logits, values)?)
+    }
+
+    /// Reads active BF16 logits into one reusable host allocation.
+    pub fn read_logits_into(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        require_batch(batch)?;
+        let expected = product("resident logit elements", batch, Qwen38_27B::VOCAB)?;
+        if destination.len() != expected {
+            return Err(EngineError::layout(format!(
+                "resident logit destination has {} values, expected {expected} for B={batch}",
+                destination.len()
+            )));
+        }
+        self.arena
+            .copy_prefix_to_host_slice(stream, self.layout.workspace.logits, destination)?;
+
+        Ok(())
     }
 
     /// Reads the final active BF16 residual rows before final normalization.
@@ -1604,20 +1625,19 @@ fn initialize_metadata(
     Ok(())
 }
 
-fn decode_lengths(positions: &[u32], capacity: usize) -> EngineResult<Vec<u32>> {
-    positions
-        .iter()
-        .map(|&position| {
-            if position as usize >= capacity {
-                return Err(EngineError::route(format!(
-                    "resident cache position {position} exceeds the {capacity}-token slot capacity"
-                )));
-            }
-            position
-                .checked_add(1)
-                .ok_or_else(|| EngineError::route("resident cache length overflows"))
-        })
-        .collect()
+fn decode_lengths(positions: &[u32], capacity: usize) -> EngineResult<[u32; MAX_BATCH]> {
+    let mut lengths = [0u32; MAX_BATCH];
+    for (target, &position) in lengths.iter_mut().zip(positions) {
+        if position as usize >= capacity {
+            return Err(EngineError::route(format!(
+                "resident cache position {position} exceeds the {capacity}-token slot capacity"
+            )));
+        }
+        *target = position
+            .checked_add(1)
+            .ok_or_else(|| EngineError::route("resident cache length overflows"))?;
+    }
+    Ok(lengths)
 }
 
 fn copy_embedding_row(source: &[u8], token: usize, destination: &mut [u16]) -> EngineResult<()> {
@@ -1692,7 +1712,10 @@ mod tests {
 
     #[test]
     fn decode_lengths_enforce_the_current_cache_capacity() {
-        assert_eq!(decode_lengths(&[0, 63, 191], 192).unwrap(), [1, 64, 192]);
+        assert_eq!(
+            &decode_lengths(&[0, 63, 191], 192).unwrap()[..3],
+            [1, 64, 192]
+        );
         assert_eq!(
             decode_lengths(&[192], 192).unwrap_err().code(),
             Some(EngineErrorCode::Route)

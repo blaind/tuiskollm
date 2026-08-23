@@ -548,20 +548,7 @@ fn qualification_command(arguments: &[String], source_snapshot: bool) -> String 
 }
 
 fn prepare_source_snapshot(ssh: &Ssh, timeout_secs: u64) -> RemoteResult<()> {
-    let command = format!(
-        "set -eu; python3 -m pip install --quiet --disable-pip-version-check --no-input \
-           --break-system-packages \
-           'huggingface_hub[hf_xet]==0.34.4'; \
-         mkdir -p {SNAPSHOT_ROOT}; \
-         HF_HOME=/tmp/tuiskollm/hf-home HF_HUB_DISABLE_PROGRESS_BARS=1 \
-         HF_XET_CHUNK_CACHE_SIZE_BYTES=0 hf download unsloth/Qwen3.8-27B-NVFP4 \
-           --revision {SNAPSHOT_REVISION} --local-dir {SNAPSHOT_ROOT} \
-           --include config.json model.safetensors.index.json model.safetensors model_mtp.safetensors; \
-         cd {SNAPSHOT_ROOT}; \
-         test \"$(stat -c %s model.safetensors)\" = 22568192096; \
-         test \"$(stat -c %s model_mtp.safetensors)\" = 849400392; \
-         test \"$(stat -c %s model.safetensors.index.json)\" = 164371"
-    );
+    let command = source_snapshot_command();
     println!("downloading pinned source snapshot {SNAPSHOT_REVISION}");
     let (status, output) = ssh.run(&command, timeout_secs)?;
     if status != 0 {
@@ -569,9 +556,30 @@ fn prepare_source_snapshot(ssh: &Ssh, timeout_secs: u64) -> RemoteResult<()> {
             detail: format!("pinned snapshot download exited {status}:\n{output}"),
         });
     }
-    println!("pinned source snapshot admitted by exact shard lengths");
+    println!("pinned source snapshot admitted by exact artifact lengths");
 
     Ok(())
+}
+
+fn source_snapshot_command() -> String {
+    format!(
+        "set -eu; python3 -m pip install --quiet --disable-pip-version-check --no-input \
+           --break-system-packages \
+           'huggingface_hub[hf_xet]==0.34.4'; \
+         mkdir -p {SNAPSHOT_ROOT}; \
+         HF_HOME=/tmp/tuiskollm/hf-home HF_HUB_DISABLE_PROGRESS_BARS=1 \
+         HF_XET_CHUNK_CACHE_SIZE_BYTES=0 hf download unsloth/Qwen3.8-27B-NVFP4 \
+           --revision {SNAPSHOT_REVISION} --local-dir {SNAPSHOT_ROOT} \
+           --include config.json model.safetensors.index.json model.safetensors model_mtp.safetensors \
+             tokenizer.json chat_template.jinja generation_config.json; \
+         cd {SNAPSHOT_ROOT}; \
+         test \"$(stat -c %s model.safetensors)\" = 22568192096; \
+         test \"$(stat -c %s model_mtp.safetensors)\" = 849400392; \
+         test \"$(stat -c %s model.safetensors.index.json)\" = 164371; \
+         test \"$(stat -c %s tokenizer.json)\" = 19989325; \
+         test \"$(stat -c %s chat_template.jinja)\" = 9993; \
+         test \"$(stat -c %s generation_config.json)\" = 214"
+    )
 }
 
 fn remaining_run_seconds(
@@ -806,7 +814,7 @@ mod tests {
 
     use super::{
         benchmark_command, lease_expired, leased_pod_name, owned_pod_id, qualification_command,
-        sanitize_arguments,
+        sanitize_arguments, source_snapshot_command,
     };
 
     #[test]
@@ -826,6 +834,20 @@ mod tests {
         let command = qualification_command(&["suite::tests".to_owned()], true);
 
         assert!(command.contains("TUISKO_SNAPSHOT=/tmp/tuiskollm/snapshots/16b6615a"));
+    }
+
+    #[test]
+    fn source_snapshot_contains_and_admits_frontend_assets() {
+        let command = source_snapshot_command();
+
+        for (file, bytes) in [
+            ("tokenizer.json", 19_989_325),
+            ("chat_template.jinja", 9_993),
+            ("generation_config.json", 214),
+        ] {
+            assert!(command.contains(file));
+            assert!(command.contains(&format!("= {bytes}")));
+        }
     }
 
     #[test]
