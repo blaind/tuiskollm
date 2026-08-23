@@ -18,7 +18,8 @@ uv run --locked ruff check python
 uv run --locked ruff format --check python
 uv run --locked mypy
 uv run --locked pytest
-uv run --locked maturin build --release --out dist
+uv run --locked maturin build --release --locked --out dist
+uv run --locked maturin sdist --out dist
 ```
 
 Tests using the real tokenizer and template are explicit and skipped when the pinned snapshot is
@@ -45,3 +46,14 @@ print(prompt.reused_tokens)
 `Frontend.open` first admits the complete pinned checkpoint inventory. Errors retain the Rust
 boundary's stable category in their message and are raised as either `CheckpointError` or
 `FrontendError`, both subclasses of `TuiskoError`.
+
+## Release
+
+The `Python release` workflow builds and inspects both distributions on a manual run. A tag named
+`tuisko-llm-vX.Y.Z`, exactly matching the workspace version, additionally publishes them to PyPI
+and creates a GitHub release.
+
+Before the first release, add a pending PyPI trusted publisher for project `tuisko-llm` with owner
+`blaind`, repository `tuiskollm`, workflow `python-release.yml`, and environment `pypi`. The
+matching GitHub environment should be protected before the first tag is pushed. No PyPI token is
+stored in GitHub.

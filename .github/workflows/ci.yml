@@ -40,6 +40,11 @@ jobs:
   python:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      RUSTFLAGS: >-
+        --remap-path-prefix=${{ github.workspace }}=tuiskollm
+        --remap-path-prefix=/home/runner/.cargo=cargo
+        --remap-path-prefix=/home/runner/.rustup=rustup
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -49,9 +54,19 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run --locked ruff check python
-      - run: uv run --locked ruff format --check python
+      - run: uv run --locked ruff check python scripts/check_python_release.py
+      - run: uv run --locked ruff format --check python scripts/check_python_release.py
       - run: uv run --locked mypy
-      - run: uv run --locked maturin build --release --out dist
+      - run: uv run --locked maturin build --release --locked --out dist
+      - run: uv run --locked maturin sdist --out dist
+      - name: Verify Python distributions
+        run: |
+          version=$(uv run --locked python scripts/check_python_release.py version)
+          uv run --locked python scripts/check_python_release.py artifacts \
+            --expected "$version" --max-wheel-mib 12 dist/*
       - run: uv pip install --python .venv/bin/python --reinstall dist/*manylinux*.whl
+      - name: Smoke-test installed wheel
+        run: |
+          version=$(uv run --no-sync python scripts/check_python_release.py version)
+          uv run --no-sync python scripts/check_python_release.py smoke --expected "$version"
       - run: uv run --no-sync pytest

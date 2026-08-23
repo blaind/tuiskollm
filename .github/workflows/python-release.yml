@@ -1,0 +1,137 @@
+name: Python release
+
+on:
+  push:
+    tags:
+      - "tuisko-llm-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  WHEEL_MAX_MIB: 12
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv lock --check
+      - id: version
+        name: Read package version
+        run: >-
+          echo "value=$(uv run --no-project --python 3.12 python
+          scripts/check_python_release.py version)" >> "$GITHUB_OUTPUT"
+      - name: Match tag to package version
+        if: github.ref_type == 'tag'
+        run: >-
+          uv run --no-project --python 3.12 python
+          scripts/check_python_release.py tag "${{ github.ref_name }}"
+
+  build:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
+      RUSTFLAGS: >-
+        --remap-path-prefix=${{ github.workspace }}=tuiskollm
+        --remap-path-prefix=/github/workspace=tuiskollm
+        --remap-path-prefix=/home/runner/.cargo=cargo
+        --remap-path-prefix=/home/runner/.rustup=rustup
+        --remap-path-prefix=/io/crates=tuiskollm/crates
+        --remap-path-prefix=/io/python=tuiskollm/python
+        --remap-path-prefix=/root/.cargo=cargo
+        --remap-path-prefix=/root/.rustup=rustup
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+          enable-cache: true
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: >-
+            --release
+            --locked
+            --strip
+            --manifest-path crates/tuisko-python/Cargo.toml
+            --out dist
+          manylinux: "2_34"
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: >-
+            --manifest-path crates/tuisko-python/Cargo.toml
+            --out dist
+      - name: Create artifact inspection environment
+        run: uv venv --python 3.12 target/python-release-venv
+      - name: Verify Python distributions
+        run: >-
+          target/python-release-venv/bin/python scripts/check_python_release.py artifacts
+          --expected "$EXPECTED_VERSION" --max-wheel-mib "$WHEEL_MAX_MIB" dist/*
+      - name: Install and smoke-test wheel
+        run: |
+          uv pip install --python target/python-release-venv/bin/python dist/*.whl
+          target/python-release-venv/bin/python scripts/check_python_release.py \
+            smoke --expected "$EXPECTED_VERSION"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-distributions
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  publish-pypi:
+    if: startsWith(github.ref, 'refs/tags/tuisko-llm-v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/tuisko-llm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/tuisko-llm-v')
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-distributions
+          path: dist
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tar.gz

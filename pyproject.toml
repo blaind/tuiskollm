@@ -6,9 +6,21 @@ build-backend = "maturin"
 name = "tuisko-llm"
 dynamic = ["version"]
 description = "Exact tokenizer and chat-template frontend for TuiskoLLM"
-readme = "README.md"
+readme = "docs/python.md"
 requires-python = ">=3.12"
 license = "MIT OR Apache-2.0"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/blaind/tuiskollm"
+Issues = "https://github.com/blaind/tuiskollm/issues"
 
 [dependency-groups]
 dev = [
@@ -24,6 +36,11 @@ module-name = "tuisko.llm._native"
 python-source = "python"
 features = ["extension-module"]
 compatibility = "manylinux_2_34"
+strip = true
+include = [
+    { path = "LICENSE-APACHE", format = "sdist" },
+    { path = "LICENSE-MIT", format = "sdist" },
+]
 
 [tool.uv]
 required-version = "==0.12.3"
@@ -38,6 +55,7 @@ cache-keys = [
     { file = "pyproject.toml" },
     { file = "python/**/*.py" },
     { file = "python/**/*.pyi" },
+    { file = "scripts/check_python_release.py" },
 ]
 
 [tool.pytest.ini_options]
@@ -59,4 +77,4 @@ strict = true
 explicit_package_bases = true
 mypy_path = "python"
 python_version = "3.12"
-files = ["python/tuisko/llm", "python/tests"]
+files = ["python/tuisko/llm", "python/tests", "scripts/check_python_release.py"]
