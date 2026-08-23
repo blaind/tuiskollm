@@ -53,6 +53,8 @@ pub struct Nvfp4SwiGluQualification {
     pub output_values: usize,
     /// Retained A16 B=1 comparison outputs checked independently.
     pub a16_comparison_values: usize,
+    /// Other schedule-candidate outputs checked before route selection.
+    pub candidate_comparison_values: usize,
     /// Active codes, scales, and outputs reproduced by graph replay.
     pub graph_replay_values: usize,
     /// Sentinel values verified outside active route extents.
@@ -143,6 +145,7 @@ pub fn qualify_nvfp4_swiglu() -> Result<Nvfp4SwiGluQualification, Nvfp4SwiGluQua
         activation_scales: 0,
         output_values: 0,
         a16_comparison_values: 0,
+        candidate_comparison_values: 0,
         graph_replay_values: 0,
         inactive_values: 0,
         immutable_input_values: 0,
@@ -801,7 +804,7 @@ fn scale_offset(row: usize, group: usize) -> usize {
         + scale_lane
 }
 
-fn encode_e2m1(value: f32) -> u8 {
+pub(crate) fn encode_e2m1(value: f32) -> u8 {
     let mut best = 0u8;
     let mut best_distance = f32::INFINITY;
     let candidates = if value.is_sign_negative() {
@@ -821,14 +824,14 @@ fn encode_e2m1(value: f32) -> u8 {
     best
 }
 
-fn decode_e2m1(code: u8) -> f32 {
+pub(crate) fn decode_e2m1(code: u8) -> f32 {
     const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let magnitude = MAGNITUDES[(code & 7) as usize];
 
     if code & 8 == 0 { magnitude } else { -magnitude }
 }
 
-fn encode_e4m3fn(value: f32) -> Result<u8, Nvfp4SwiGluQualificationError> {
+pub(crate) fn encode_e4m3fn(value: f32) -> Result<u8, Nvfp4SwiGluQualificationError> {
     if !value.is_finite() || value < 0.0 {
         return Err(Nvfp4SwiGluQualificationError::Mismatch(
             "oracle E4M3 scale is not finite and non-negative".to_string(),
@@ -849,7 +852,7 @@ fn encode_e4m3fn(value: f32) -> Result<u8, Nvfp4SwiGluQualificationError> {
     Ok(best)
 }
 
-fn decode_e4m3fn(word: u8) -> Result<f32, Nvfp4SwiGluQualificationError> {
+pub(crate) fn decode_e4m3fn(word: u8) -> Result<f32, Nvfp4SwiGluQualificationError> {
     let sign = if word & 0x80 == 0 { 1.0 } else { -1.0 };
     let exponent = (word >> 3) & 0x0f;
     let fraction = word & 0x07;
@@ -869,7 +872,7 @@ fn decode_e4m3fn(word: u8) -> Result<f32, Nvfp4SwiGluQualificationError> {
     Ok(sign * magnitude)
 }
 
-fn f32_to_bf16(value: f32) -> u16 {
+pub(crate) fn f32_to_bf16(value: f32) -> u16 {
     let mut bits = value.to_bits();
     let tie = (bits >> 16) & 1;
     bits = bits.wrapping_add(0x7fff + tie);
@@ -877,7 +880,7 @@ fn f32_to_bf16(value: f32) -> u16 {
     (bits >> 16) as u16
 }
 
-fn bf16_to_f32(bits: u16) -> f32 {
+pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 

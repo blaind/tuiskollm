@@ -406,6 +406,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen35-residual-norm") if remaining.is_empty() => {
             qualify_qwen35_residual_norm(root)
         }
+        Some("qualify-qwen35-nvfp4-swiglu") if remaining.is_empty() => {
+            qualify_qwen35_nvfp4_swiglu(root)
+        }
         Some("qualify-fp8-qkv") if remaining.is_empty() => qualify_fp8_qkv(root),
         Some("qualify-fp8-gdn-input") if remaining.is_empty() => qualify_fp8_gdn_input(root),
         Some("qualify-fp8-lm-head") if remaining.is_empty() => qualify_fp8_lm_head(root),
@@ -464,6 +467,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("gate-qwen35-residual-norm") if remaining.is_empty() => {
             gate_qwen35_residual_norm(root)
         }
+        Some("gate-qwen35-nvfp4-swiglu") if remaining.is_empty() => gate_qwen35_nvfp4_swiglu(root),
         Some("gate-fp8-qkv") if remaining.is_empty() => gate_fp8_qkv(root),
         Some("gate-fp8-gdn-input") if remaining.is_empty() => gate_fp8_gdn_input(root),
         Some("gate-fp8-lm-head") if remaining.is_empty() => gate_fp8_lm_head(root),
@@ -670,6 +674,7 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_fp8_swiglu(root)?;
     gate_fp8_down(root)?;
     gate_nvfp4_swiglu(root)?;
+    gate_qwen35_nvfp4_swiglu(root)?;
     gate_nvfp4_down(root)?;
     gate_gdn_prepare(root)?;
     gate_gdn_recurrence(root)?;
@@ -849,6 +854,31 @@ fn qualify_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     gate_qwen35_residual_norm(root)
+}
+
+fn qualify_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen35_nvfp4_swiglu::tests::exact_batches_and_candidates_match_independent_oracles_and_graph_replay",
+            "--include-ignored",
+            "--nocapture",
+        ],
+    )?;
+    gate_qwen35_nvfp4_swiglu(root)
 }
 
 fn qualify_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -4042,6 +4072,167 @@ fn gate_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
 
     println!(
         "NVFP4 SwiGLU gate passed: 4 A16 + 5 quantize + 5 W4A4 entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}",
+        a16_registers, quantize_registers, w4a4_registers, a16_shared, quantize_shared, w4a4_shared,
+    );
+    Ok(())
+}
+
+fn gate_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; run the pinned release device build first",
+            ptx_path.display()
+        )
+    })?;
+    let entries = parse_entries(&ptx);
+    let a16 = entries
+        .iter()
+        .filter(|entry| {
+            entry.name == "qwen35_nvfp4_swiglu_a16_t1"
+                || entry.name == "qwen35_nvfp4_swiglu_a16_t2"
+                || entry.name.starts_with("qwen35_nvfp4_swiglu_a16_TID_")
+        })
+        .collect::<Vec<_>>();
+    let quantize = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen35_nvfp4_quantize_TID_"))
+        .collect::<Vec<_>>();
+    let w4a4 = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen35_nvfp4_swiglu_w4a4_TID_"))
+        .collect::<Vec<_>>();
+    require_count("Qwen3.5 NVFP4 SwiGLU A16", a16.len(), 4)?;
+    require_count("Qwen3.5 NVFP4 activation quantization", quantize.len(), 8)?;
+    require_count("Qwen3.5 NVFP4 SwiGLU W4A4", w4a4.len(), 8)?;
+
+    for entry in &a16 {
+        let minimum_ctas = if entry.name == "qwen35_nvfp4_swiglu_a16_t1" {
+            2
+        } else {
+            1
+        };
+        if !entry.body.contains(".reqntid 256, 1, 1")
+            || !entry
+                .body
+                .contains(&format!(".minnctapersm {minimum_ctas}"))
+        {
+            return Err(format!(
+                "entry `{}` lost its retained 256-thread/{minimum_ctas}-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in &quantize {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in &w4a4 {
+        if !entry.body.contains(".reqntid 384, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its retained 384-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        if !entry
+            .body
+            .contains("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X")
+        {
+            return Err(format!(
+                "entry `{}` lost its exact NVFP4 inline PTX instruction",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let temporary = root.join("target/tmp");
+    fs::create_dir_all(&temporary)?;
+    let cubin = temporary.join("qwen35-nvfp4-swiglu-gate.cubin");
+    let ptxas = cuda_tool("ptxas");
+    require_success(
+        &ptxas,
+        &[
+            OsStr::new("-O3"),
+            OsStr::new("--gpu-name"),
+            OsStr::new("sm_120a"),
+            ptx_path.as_os_str(),
+            OsStr::new("--output-file"),
+            cubin.as_os_str(),
+        ],
+    )?;
+    let cuobjdump = cuda_tool("cuobjdump");
+    let resources = require_success(
+        &cuobjdump,
+        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+    )?;
+    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
+    let sass = String::from_utf8(sass.stdout)?;
+
+    let mut a16_registers = Vec::new();
+    let mut a16_shared = Vec::new();
+    for entry in a16 {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted Qwen3.5 NVFP4 A16 entry `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        a16_registers.push(resource.registers);
+        a16_shared.push(resource.shared);
+    }
+    a16_registers.sort_unstable();
+    a16_shared.sort_unstable();
+
+    let mut quantize_registers = Vec::new();
+    let mut quantize_shared = Vec::new();
+    for entry in quantize {
+        let resource = resources.get(entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted Qwen3.5 NVFP4 quantization entry `{}`",
+                entry.name
+            )
+        })?;
+        require_spill_free(entry.name, resource)?;
+        quantize_registers.push(resource.registers);
+        quantize_shared.push(resource.shared);
+    }
+    quantize_registers.sort_unstable();
+    quantize_shared.sort_unstable();
+
+    let mut w4a4_registers = Vec::new();
+    let mut w4a4_shared = Vec::new();
+    for entry in w4a4 {
+        let resource = resources.get(entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted Qwen3.5 NVFP4 W4A4 entry `{}`",
+                entry.name
+            )
+        })?;
+        require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(&sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted Qwen3.5 NVFP4 W4A4 SASS `{}`", entry.name))?;
+        if !body.contains("OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X") {
+            return Err(format!(
+                "entry `{}` lost native Blackwell NVFP4 MMA selection",
+                entry.name
+            )
+            .into());
+        }
+        w4a4_registers.push(resource.registers);
+        w4a4_shared.push(resource.shared);
+    }
+    w4a4_registers.sort_unstable();
+    w4a4_shared.sort_unstable();
+
+    println!(
+        "Qwen3.5 NVFP4 SwiGLU gate passed: 4 A16 + 8 quantize + 8 W4A4 entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}",
         a16_registers, quantize_registers, w4a4_registers, a16_shared, quantize_shared, w4a4_shared,
     );
     Ok(())

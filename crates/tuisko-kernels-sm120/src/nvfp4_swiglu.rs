@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tuisko_gpu::{
     CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, LaunchConfig2D, PreparedLaunch,
 };
-use tuisko_model::{Arch, Qwen38_27B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const HIDDEN: usize = Qwen38_27B::HIDDEN;
@@ -18,8 +18,6 @@ const OUTPUT_ROWS: usize = Qwen38_27B::INTERMEDIATE;
 const GATE_UP_ROWS: usize = 2 * OUTPUT_ROWS;
 const GROUP_K: usize = 16;
 const GROUPS_PER_ROW: usize = HIDDEN / GROUP_K;
-const CODE_BYTES_PER_ROW: usize = HIDDEN / 2;
-const SCALE_TILES_PER_ROW: usize = GROUPS_PER_ROW / 4;
 
 // Eight warps cover eight gate/up row pairs per CTA. The 2,176-block grid
 // preserves the scale-plane M128x4 row order used by materialization.
@@ -42,7 +40,6 @@ const STAGES: usize = 2;
 const K64_PER_STAGE: usize = BLOCK_K / 64;
 const CODE_ROW_BYTES: usize = BLOCK_K / 2;
 const SEGMENTS_PER_ROW: usize = CODE_ROW_BYTES / 16;
-const K_TILES: usize = HIDDEN / BLOCK_K;
 const ROWS_PER_BRANCH: usize = BLOCK_N / 2;
 const OUTPUT_STRIDE: usize = BLOCK_N + 8;
 const W4A4_THREADS: u32 = ((SMALL_BLOCK_M / WARP_M) * WARPS_N * 32) as u32;
@@ -61,6 +58,8 @@ const SHARED_U32: usize = SHARED_BYTES / 4;
 const _: () = assert!(HIDDEN == 5_120);
 const _: () = assert!(OUTPUT_ROWS == 17_408);
 const _: () = assert!(GATE_UP_ROWS == 34_816);
+const _: () = assert!(Qwen35_9B::HIDDEN == 4_096);
+const _: () = assert!(Qwen35_9B::INTERMEDIATE == 12_288);
 const _: () = assert!(SHARED_BYTES == 36_864);
 
 #[cuda_module]
@@ -78,31 +77,32 @@ mod kernels {
     }
 
     #[inline(always)]
-    fn weight_row(row_begin: usize, local_row: usize) -> usize {
+    fn weight_row<A: Arch>(row_begin: usize, local_row: usize) -> usize {
         row_begin
             + (local_row & (ROWS_PER_BRANCH - 1))
             + if local_row >= ROWS_PER_BRANCH {
-                OUTPUT_ROWS
+                A::INTERMEDIATE
             } else {
                 0
             }
     }
 
     #[inline(always)]
-    fn weight_scale_offset(parent_row: usize, scale_tile: usize) -> usize {
+    fn weight_scale_offset<A: Arch>(parent_row: usize, scale_tile: usize) -> usize {
         let persistent_tile = parent_row / 128;
         let row_in_tile = parent_row & 127;
         let row_mod32 = row_in_tile & 31;
         let row_quartile = row_in_tile >> 5;
+        let scale_tiles_per_row = A::HIDDEN / GROUP_K / 4;
 
-        (persistent_tile * SCALE_TILES_PER_ROW + scale_tile) * 512
+        (persistent_tile * scale_tiles_per_row + scale_tile) * 512
             + row_mod32 * 16
             + row_quartile * 4
     }
 
     #[inline(always)]
-    fn weight_group_scale_offset(parent_row: usize, group: usize) -> usize {
-        weight_scale_offset(parent_row, group >> 2) + (group & 3)
+    fn weight_group_scale_offset<A: Arch>(parent_row: usize, group: usize) -> usize {
+        weight_scale_offset::<A>(parent_row, group >> 2) + (group & 3)
     }
 
     #[inline(always)]
@@ -211,7 +211,7 @@ mod kernels {
 
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn decode_phase<const PHASE: usize>(
+    unsafe fn decode_phase<A: Arch, const PHASE: usize>(
         input: *const u32,
         weight_codes: *const u32,
         weight_scales: *const u8,
@@ -224,14 +224,14 @@ mod kernels {
     ) {
         let group = PHASE * 32 + lane;
         let gate_scale = unsafe {
-            load_u8_read_only(weight_scales.add(weight_group_scale_offset(gate_row, group)))
+            load_u8_read_only(weight_scales.add(weight_group_scale_offset::<A>(gate_row, group)))
         };
         let up_scale = unsafe {
-            load_u8_read_only(weight_scales.add(weight_group_scale_offset(up_row, group)))
+            load_u8_read_only(weight_scales.add(weight_group_scale_offset::<A>(up_row, group)))
         };
         let gate_coefficient = e4m3_to_f32(gate_scale) * weight_scale_reciprocal;
         let up_coefficient = e4m3_to_f32(up_scale) * weight_scale_reciprocal;
-        let row_words = CODE_BYTES_PER_ROW / 4;
+        let row_words = (A::HIDDEN / 2) / 4;
         let phase_words = (32 * GROUP_K / 2) / 4;
         let lane_words = GROUP_K / 2 / 4;
         let gate_source = unsafe {
@@ -297,7 +297,7 @@ mod kernels {
 
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn small_t_phase<const TOKENS: usize>(
+    unsafe fn small_t_phase<A: Arch, const TOKENS: usize>(
         phase: usize,
         input: *const u32,
         weight_codes: *const u32,
@@ -317,7 +317,7 @@ mod kernels {
         while task < TOKENS * PACKS_PER_TOKEN_PHASE {
             let token = task / PACKS_PER_TOKEN_PHASE;
             let pack = task - token * PACKS_PER_TOKEN_PHASE;
-            let source = unsafe { input.add(token * (HIDDEN / 2) + phase * 256 + pack * 4) };
+            let source = unsafe { input.add(token * (A::HIDDEN / 2) + phase * 256 + pack * 4) };
             let values = unsafe { load_u32x4_read_only(source) };
             let destination = unsafe { shared.add(token * 256 + pack * 4).cast::<[u32; 4]>() };
 
@@ -328,14 +328,14 @@ mod kernels {
 
         let group = phase * 32 + lane;
         let gate_scale = unsafe {
-            load_u8_read_only(weight_scales.add(weight_group_scale_offset(gate_row, group)))
+            load_u8_read_only(weight_scales.add(weight_group_scale_offset::<A>(gate_row, group)))
         };
         let up_scale = unsafe {
-            load_u8_read_only(weight_scales.add(weight_group_scale_offset(up_row, group)))
+            load_u8_read_only(weight_scales.add(weight_group_scale_offset::<A>(up_row, group)))
         };
         let gate_coefficient = e4m3_to_f32(gate_scale) * weight_scale_reciprocal;
         let up_coefficient = e4m3_to_f32(up_scale) * weight_scale_reciprocal;
-        let row_words = CODE_BYTES_PER_ROW / 4;
+        let row_words = (A::HIDDEN / 2) / 4;
         let phase_words = (32 * GROUP_K / 2) / 4;
         let lane_words = GROUP_K / 2 / 4;
         let gate_source = unsafe {
@@ -414,7 +414,7 @@ mod kernels {
     }
 
     #[inline(always)]
-    unsafe fn small_t_body<const TOKENS: usize>(
+    unsafe fn small_t_body<A: Arch, const TOKENS: usize>(
         input: *const u32,
         weight_codes: *const u32,
         weight_scales: *const u8,
@@ -432,14 +432,14 @@ mod kernels {
         let row_mod32 = flat_pair >> 2;
         let quartile = flat_pair & 3;
         let gate_row = m_tile * 128 + row_mod32 + quartile * 32;
-        let up_row = gate_row + OUTPUT_ROWS;
+        let up_row = gate_row + A::INTERMEDIATE;
         let mut gate_accumulators = [0.0f32; TOKENS];
         let mut up_accumulators = [0.0f32; TOKENS];
         let mut phase = 0usize;
 
-        while phase < 10 {
+        while phase < A::HIDDEN / 512 {
             unsafe {
-                small_t_phase::<TOKENS>(
+                small_t_phase::<A, TOKENS>(
                     phase,
                     input,
                     weight_codes,
@@ -465,7 +465,7 @@ mod kernels {
 
                     if lane == 0 {
                         unsafe {
-                            *output.add($token * OUTPUT_ROWS + gate_row) =
+                            *output.add($token * A::INTERMEDIATE + gate_row) =
                                 tcgen05::cvt_f32x2_bf16x2(silu(gate) * up, 0.0) as u16;
                         }
                     }
@@ -530,7 +530,7 @@ mod kernels {
         macro_rules! phase {
             ($phase:literal) => {
                 unsafe {
-                    decode_phase::<$phase>(
+                    decode_phase::<Qwen38_27B, $phase>(
                         input,
                         weight_codes,
                         weight_scales,
@@ -591,7 +591,7 @@ mod kernels {
         static mut SHARED: SharedArray<u32, A16_T2_SHARED_U32, 16> = SharedArray::UNINIT;
 
         unsafe {
-            small_t_body::<2>(
+            small_t_body::<Qwen38_27B, 2>(
                 input,
                 weight_codes,
                 weight_scales,
@@ -621,7 +621,7 @@ mod kernels {
         static mut SHARED: SharedArray<u32, A16_T4_SHARED_U32, 16> = SharedArray::UNINIT;
 
         unsafe {
-            small_t_body::<3>(
+            small_t_body::<Qwen38_27B, 3>(
                 input,
                 weight_codes,
                 weight_scales,
@@ -651,7 +651,140 @@ mod kernels {
         static mut SHARED: SharedArray<u32, A16_T4_SHARED_U32, 16> = SharedArray::UNINIT;
 
         unsafe {
-            small_t_body::<4>(
+            small_t_body::<Qwen38_27B, 4>(
+                input,
+                weight_codes,
+                weight_scales,
+                weight_scale_reciprocal,
+                output,
+                core::ptr::addr_of_mut!(SHARED).cast::<u32>(),
+            );
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_swiglu_a16_t1(
+        input: *const u32,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        weight_scale_reciprocal: f32,
+        output: *mut u16,
+    ) {
+        let block = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_index = tid >> 5;
+        let m_tile = block >> 4;
+        let cta_in_tile = block & 15;
+        let flat_pair = cta_in_tile * A16_WARPS + warp_index;
+        let row_mod32 = flat_pair >> 2;
+        let quartile = flat_pair & 3;
+        let gate_row = m_tile * 128 + row_mod32 + quartile * 32;
+        let up_row = gate_row + Qwen35_9B::INTERMEDIATE;
+        let mut gate_accumulators = [0.0f32; 4];
+        let mut up_accumulators = [0.0f32; 4];
+
+        macro_rules! phase {
+            ($phase:literal) => {
+                unsafe {
+                    decode_phase::<Qwen35_9B, $phase>(
+                        input,
+                        weight_codes,
+                        weight_scales,
+                        weight_scale_reciprocal,
+                        gate_row,
+                        up_row,
+                        lane,
+                        &mut gate_accumulators,
+                        &mut up_accumulators,
+                    );
+                }
+            };
+        }
+
+        phase!(0);
+        phase!(1);
+        phase!(2);
+        phase!(3);
+        phase!(4);
+        phase!(5);
+        phase!(6);
+        phase!(7);
+
+        let mut gate = gate_accumulators[0]
+            + gate_accumulators[1]
+            + gate_accumulators[2]
+            + gate_accumulators[3];
+        let mut up =
+            up_accumulators[0] + up_accumulators[1] + up_accumulators[2] + up_accumulators[3];
+        gate = reduce_sum_lane0(gate);
+        up = reduce_sum_lane0(up);
+
+        if lane == 0 {
+            unsafe {
+                *output.add(gate_row) = tcgen05::cvt_f32x2_bf16x2(silu(gate) * up, 0.0) as u16;
+            }
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_swiglu_a16_t2(
+        input: *const u32,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        weight_scale_reciprocal: f32,
+        output: *mut u16,
+    ) {
+        static mut SHARED: SharedArray<u32, A16_T2_SHARED_U32, 16> = SharedArray::UNINIT;
+
+        unsafe {
+            small_t_body::<Qwen35_9B, 2>(
+                input,
+                weight_codes,
+                weight_scales,
+                weight_scale_reciprocal,
+                output,
+                core::ptr::addr_of_mut!(SHARED).cast::<u32>(),
+            );
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_swiglu_a16<const TOKENS: usize>(
+        input: *const u32,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        weight_scale_reciprocal: f32,
+        output: *mut u16,
+    ) {
+        static mut SHARED: SharedArray<u32, A16_T4_SHARED_U32, 16> = SharedArray::UNINIT;
+
+        unsafe {
+            small_t_body::<Qwen35_9B, TOKENS>(
                 input,
                 weight_codes,
                 weight_scales,
@@ -741,20 +874,21 @@ mod kernels {
     }
 
     #[inline(always)]
-    unsafe fn quantize_body<const TOKENS: usize>(
+    unsafe fn quantize_body<A: Arch, const TOKENS: usize>(
         task: usize,
         input: *const u32,
         codes: *mut u32,
         scales: *mut u8,
         input_scale_divisor: f32,
     ) {
-        if task >= TOKENS * GROUPS_PER_ROW {
+        let groups_per_row = A::HIDDEN / GROUP_K;
+        if task >= TOKENS * groups_per_row {
             return;
         }
 
-        let token = task / GROUPS_PER_ROW;
-        let group = task - token * GROUPS_PER_ROW;
-        let source = unsafe { input.add(token * (HIDDEN / 2) + group * (GROUP_K / 2)) };
+        let token = task / groups_per_row;
+        let group = task - token * groups_per_row;
+        let source = unsafe { input.add(token * (A::HIDDEN / 2) + group * (GROUP_K / 2)) };
         let (p0, p1, p2, p3) = unsafe { load_u32x4(source) };
         let (p4, p5, p6, p7) = unsafe { load_u32x4(source.add(4)) };
         let (v0, v1) = convert::cvt_f32x2_bf16x2(p0);
@@ -780,7 +914,7 @@ mod kernels {
         let encoded_pair = convert::cvt_rn_satfinite_e4m3x2_f32(scale_unencoded, scale_unencoded);
         let scale = encoded_pair as u8;
         let code_destination =
-            unsafe { codes.add(token * (CODE_BYTES_PER_ROW / 4) + group * (GROUP_K / 8)) };
+            unsafe { codes.add(token * (A::HIDDEN / 8) + group * (GROUP_K / 8)) };
 
         if scale == 0 {
             unsafe {
@@ -834,7 +968,33 @@ mod kernels {
         input_scale_divisor: f32,
     ) {
         unsafe {
-            quantize_body::<TOKENS>(
+            quantize_body::<Qwen38_27B, TOKENS>(
+                thread::index_1d().get(),
+                input,
+                codes,
+                scales,
+                input_scale_divisor,
+            );
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_quantize<const TOKENS: usize>(
+        input: *const u32,
+        codes: *mut u32,
+        scales: *mut u8,
+        input_scale_divisor: f32,
+    ) {
+        unsafe {
+            quantize_body::<Qwen35_9B, TOKENS>(
                 thread::index_1d().get(),
                 input,
                 codes,
@@ -846,7 +1006,7 @@ mod kernels {
 
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn stage_tile<const TOKENS: usize>(
+    unsafe fn stage_tile<A: Arch, const TOKENS: usize>(
         shared: *mut u8,
         activation_codes: *const u32,
         activation_scales: *const u8,
@@ -871,9 +1031,7 @@ mod kernels {
             };
             let source = unsafe {
                 activation_codes.add(
-                    source_token * (CODE_BYTES_PER_ROW / 4)
-                        + k_tile * (CODE_ROW_BYTES / 4)
-                        + segment * 4,
+                    source_token * (A::HIDDEN / 8) + k_tile * (CODE_ROW_BYTES / 4) + segment * 4,
                 )
             };
 
@@ -891,7 +1049,8 @@ mod kernels {
                     .cast::<u32>()
             };
             let source = unsafe {
-                activation_scales.add(source_token * GROUPS_PER_ROW + k_tile * K64_PER_STAGE * 4)
+                activation_scales
+                    .add(source_token * (A::HIDDEN / GROUP_K) + k_tile * K64_PER_STAGE * 4)
             };
 
             unsafe {
@@ -903,7 +1062,7 @@ mod kernels {
         while task < BLOCK_N * SEGMENTS_PER_ROW {
             let row = task / SEGMENTS_PER_ROW;
             let segment = task - row * SEGMENTS_PER_ROW;
-            let parent_row = weight_row(row_begin, row);
+            let parent_row = weight_row::<A>(row_begin, row);
             let physical = swizzled_byte(row, segment * 16);
             let destination = unsafe {
                 shared
@@ -911,11 +1070,8 @@ mod kernels {
                     .cast::<u32>()
             };
             let source = unsafe {
-                weight_codes.add(
-                    parent_row * (CODE_BYTES_PER_ROW / 4)
-                        + k_tile * (CODE_ROW_BYTES / 4)
-                        + segment * 4,
-                )
+                weight_codes
+                    .add(parent_row * (A::HIDDEN / 8) + k_tile * (CODE_ROW_BYTES / 4) + segment * 4)
             };
 
             unsafe { cp_async_cg_16(destination, source) };
@@ -926,14 +1082,15 @@ mod kernels {
         while scale_task < BLOCK_N * K64_PER_STAGE {
             let row = scale_task / K64_PER_STAGE;
             let local_k64 = scale_task - row * K64_PER_STAGE;
-            let parent_row = weight_row(row_begin, row);
+            let parent_row = weight_row::<A>(row_begin, row);
             let global_k64 = k_tile * K64_PER_STAGE + local_k64;
             let destination = unsafe {
                 shared
                     .add(B_SCALE_OFFSET + (stage * BLOCK_N * K64_PER_STAGE + scale_task) * 4)
                     .cast::<u32>()
             };
-            let source = unsafe { weight_scales.add(weight_scale_offset(parent_row, global_k64)) };
+            let source =
+                unsafe { weight_scales.add(weight_scale_offset::<A>(parent_row, global_k64)) };
 
             unsafe { cp_async_ca_4(destination, source.cast::<u32>()) };
             scale_task += W4A4_THREADS as usize;
@@ -979,7 +1136,7 @@ mod kernels {
     }
 
     #[inline(always)]
-    unsafe fn w4a4_body<const TOKENS: usize>(
+    unsafe fn w4a4_body<A: Arch, const TOKENS: usize>(
         activation_codes: *const u32,
         activation_scales: *const u8,
         weight_codes: *const u32,
@@ -1000,7 +1157,7 @@ mod kernels {
 
         while stage < STAGES {
             unsafe {
-                stage_tile::<TOKENS>(
+                stage_tile::<A, TOKENS>(
                     shared,
                     activation_codes,
                     activation_scales,
@@ -1027,7 +1184,7 @@ mod kernels {
         let scale_b_row_offset = lane >> 2;
         let mut k_tile = 0usize;
 
-        while k_tile < K_TILES {
+        while k_tile < A::HIDDEN / BLOCK_K {
             stage = k_tile % STAGES;
             unsafe { cp_async_wait_group(1) };
             thread::sync_threads();
@@ -1098,9 +1255,9 @@ mod kernels {
 
             thread::sync_threads();
             let next_k_tile = k_tile + STAGES;
-            if next_k_tile < K_TILES {
+            if next_k_tile < A::HIDDEN / BLOCK_K {
                 unsafe {
-                    stage_tile::<TOKENS>(
+                    stage_tile::<A, TOKENS>(
                         shared,
                         activation_codes,
                         activation_scales,
@@ -1181,7 +1338,7 @@ mod kernels {
 
                 let destination = unsafe {
                     output
-                        .add(token * OUTPUT_ROWS + row_begin + row_vector * 8)
+                        .add(token * A::INTERMEDIATE + row_begin + row_vector * 8)
                         .cast::<[u32; 4]>()
                 };
 
@@ -1208,7 +1365,36 @@ mod kernels {
         alpha: f32,
     ) {
         unsafe {
-            w4a4_body::<TOKENS>(
+            w4a4_body::<Qwen38_27B, TOKENS>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                alpha,
+            );
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(384, 2)]
+    #[launch_contract(
+        domain = 2,
+        coordinates = u32,
+        block = (384, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_swiglu_w4a4<const TOKENS: usize>(
+        activation_codes: *const u32,
+        activation_scales: *const u8,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        output: *mut u16,
+        alpha: f32,
+    ) {
+        unsafe {
+            w4a4_body::<Qwen35_9B, TOKENS>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
@@ -1224,6 +1410,12 @@ fn a16_config() -> LaunchConfig1D {
     // One eight-warp CTA emits eight gate/up row pairs, so 17,408 outputs
     // require exactly 2,176 CTAs without a tail route.
     LaunchConfig1D::new((OUTPUT_ROWS / A16_WARPS) as u32, A16_THREADS, 0)
+}
+
+fn qwen35_a16_config() -> LaunchConfig1D {
+    // Eight warps still own eight gate/up pairs, so the 12,288 output rows
+    // form 1,536 exact CTAs; only the K loop shrinks from ten to eight phases.
+    LaunchConfig1D::new((Qwen35_9B::INTERMEDIATE / A16_WARPS) as u32, A16_THREADS, 0)
 }
 
 struct PreparedW4a4Route<const TOKENS: usize> {
@@ -1302,6 +1494,86 @@ impl<const TOKENS: usize> PreparedW4a4Route<TOKENS> {
     }
 }
 
+struct PreparedQwen35W4a4Route<const TOKENS: usize> {
+    quantize: PreparedLaunch<kernels::__qwen35_nvfp4_quantize_CudaKernel<TOKENS>>,
+    projection: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_w4a4_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedQwen35W4a4Route<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let groups_per_row = Qwen35_9B::HIDDEN / GROUP_K;
+        // Each 4,096-wide row has exactly 256 scale groups, so one quantizer
+        // CTA owns each token without changing the 16-value group arithmetic.
+        let quantize_blocks = (TOKENS * groups_per_row).div_ceil(256);
+        let quantize_blocks = u32::try_from(quantize_blocks).map_err(|_| {
+            GpuError::invalid_launch("Qwen3.5 NVFP4 quantization grid exceeds CUDA width")
+        })?;
+        // One CTA publishes 32 gate/up pairs; 12,288 output rows therefore
+        // use 384 CTAs, with the qualified 64-column MMA tile unchanged.
+        let projection_blocks =
+            u32::try_from(Qwen35_9B::INTERMEDIATE / ROWS_PER_BRANCH).map_err(|_| {
+                GpuError::invalid_launch("Qwen3.5 NVFP4 projection grid exceeds CUDA width")
+            })?;
+        let quantize = module
+            .prepare_qwen35_nvfp4_quantize::<TOKENS>(LaunchConfig1D::new(quantize_blocks, 256, 0))
+            .map_err(|source| {
+                GpuError::launch("preparing Qwen3.5 NVFP4 activation quantization", source)
+            })?;
+        let projection = module
+            .prepare_qwen35_nvfp4_swiglu_w4a4::<TOKENS>(LaunchConfig2D::new(
+                (projection_blocks, 1),
+                (W4A4_THREADS, 1),
+                0,
+            ))
+            .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 W4A4 SwiGLU", source))?;
+
+        Ok(Self {
+            quantize,
+            projection,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_nvfp4_quantize::<TOKENS>(
+                stream,
+                &self.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                input_scale_divisor,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching Qwen3.5 NVFP4 activation quantization", source)
+            })?;
+        module
+            .qwen35_nvfp4_swiglu_w4a4::<TOKENS>(
+                stream,
+                &self.projection,
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                weight_codes.cast::<u32>(),
+                weight_scales,
+                output,
+                1.0 / (input_scale_divisor * weight_scale_divisor),
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.5 NVFP4 W4A4 SwiGLU", source))
+    }
+}
+
 /// PTX symbols retained for every admitted NVFP4 SwiGLU schedule.
 pub(crate) fn nvfp4_swiglu_ptx_names() -> [&'static str; 14] {
     [
@@ -1319,6 +1591,32 @@ pub(crate) fn nvfp4_swiglu_ptx_names() -> [&'static str; 14] {
         kernels::nvfp4_swiglu_w4a4_ptx_name::<6>(),
         kernels::nvfp4_swiglu_w4a4_ptx_name::<7>(),
         kernels::nvfp4_swiglu_w4a4_ptx_name::<8>(),
+    ]
+}
+
+/// PTX symbols retained for Qwen3.5 production and crossover comparison.
+pub(crate) fn qwen35_nvfp4_swiglu_ptx_names() -> [&'static str; 20] {
+    [
+        "qwen35_nvfp4_swiglu_a16_t1",
+        "qwen35_nvfp4_swiglu_a16_t2",
+        kernels::qwen35_nvfp4_swiglu_a16_ptx_name::<3>(),
+        kernels::qwen35_nvfp4_swiglu_a16_ptx_name::<4>(),
+        kernels::qwen35_nvfp4_quantize_ptx_name::<1>(),
+        kernels::qwen35_nvfp4_quantize_ptx_name::<2>(),
+        kernels::qwen35_nvfp4_quantize_ptx_name::<3>(),
+        kernels::qwen35_nvfp4_quantize_ptx_name::<4>(),
+        kernels::qwen35_nvfp4_quantize_ptx_name::<5>(),
+        kernels::qwen35_nvfp4_quantize_ptx_name::<6>(),
+        kernels::qwen35_nvfp4_quantize_ptx_name::<7>(),
+        kernels::qwen35_nvfp4_quantize_ptx_name::<8>(),
+        kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<1>(),
+        kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<2>(),
+        kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<3>(),
+        kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<4>(),
+        kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<5>(),
+        kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<6>(),
+        kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<7>(),
+        kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<8>(),
     ]
 }
 
@@ -1502,9 +1800,288 @@ impl Nvfp4SwiGluOp {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Qwen35SwiGluSchedule {
+    A16,
+    W4a4,
+}
+
+fn qwen35_swiglu_schedule(batch: usize) -> Option<Qwen35SwiGluSchedule> {
+    // At 2,197/14,001 MHz SM/memory clocks, paired device-path medians for
+    // A16/W4A4 were 28.988/27.032 us (B=1), 25.623/27.023 (B=2),
+    // 30.726/27.148 (B=3), and 37.498/27.172 (B=4). Thus only B=2 keeps
+    // represented BF16 activations; the row formula is unchanged in either
+    // schedule and both candidates pass the same independent FP64 oracle.
+    match batch {
+        2 => Some(Qwen35SwiGluSchedule::A16),
+        1 | 3..=8 => Some(Qwen35SwiGluSchedule::W4a4),
+        _ => None,
+    }
+}
+
+/// Prepared production and comparison routes for exact Qwen3.5 NVFP4 gate/up.
+///
+/// A16 (`B=1..=4`) and W4A4 (`B=1..=8`) remain available so the measured
+/// crossover can be reproduced even though production selects one per batch.
+pub struct Qwen35Nvfp4SwiGluOp {
+    module: kernels::LoadedModule,
+    a16_t1: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_a16_t1_CudaKernel>,
+    a16_t2: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_a16_t2_CudaKernel>,
+    a16_t3: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_a16_CudaKernel<3>>,
+    a16_t4: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_a16_CudaKernel<4>>,
+    w4a4_b1: PreparedQwen35W4a4Route<1>,
+    w4a4_b2: PreparedQwen35W4a4Route<2>,
+    w4a4_b3: PreparedQwen35W4a4Route<3>,
+    w4a4_b4: PreparedQwen35W4a4Route<4>,
+    w4a4_b5: PreparedQwen35W4a4Route<5>,
+    w4a4_b6: PreparedQwen35W4a4Route<6>,
+    w4a4_b7: PreparedQwen35W4a4Route<7>,
+    w4a4_b8: PreparedQwen35W4a4Route<8>,
+}
+
+impl Qwen35Nvfp4SwiGluOp {
+    /// Loads the SM120 module and prepares every Qwen3.5 candidate route.
+    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        let _ = qwen35_nvfp4_swiglu_ptx_names();
+        // SAFETY: this crate owns the embedded cuda-oxide module artifact.
+        let module = unsafe { kernels::load(context) }.map_err(|source| {
+            GpuError::module("loading the Qwen3.5 NVFP4 SwiGLU module", source)
+        })?;
+        let launch = qwen35_a16_config();
+
+        Ok(Self {
+            a16_t1: module
+                .prepare_qwen35_nvfp4_swiglu_a16_t1(launch)
+                .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 A16 B=1", source))?,
+            a16_t2: module
+                .prepare_qwen35_nvfp4_swiglu_a16_t2(launch)
+                .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 A16 B=2", source))?,
+            a16_t3: module
+                .prepare_qwen35_nvfp4_swiglu_a16::<3>(launch)
+                .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 A16 B=3", source))?,
+            a16_t4: module
+                .prepare_qwen35_nvfp4_swiglu_a16::<4>(launch)
+                .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 A16 B=4", source))?,
+            w4a4_b1: PreparedQwen35W4a4Route::prepare(&module)?,
+            w4a4_b2: PreparedQwen35W4a4Route::prepare(&module)?,
+            w4a4_b3: PreparedQwen35W4a4Route::prepare(&module)?,
+            w4a4_b4: PreparedQwen35W4a4Route::prepare(&module)?,
+            w4a4_b5: PreparedQwen35W4a4Route::prepare(&module)?,
+            w4a4_b6: PreparedQwen35W4a4Route::prepare(&module)?,
+            w4a4_b7: PreparedQwen35W4a4Route::prepare(&module)?,
+            w4a4_b8: PreparedQwen35W4a4Route::prepare(&module)?,
+            module,
+        })
+    }
+
+    /// Executes the measured exact-batch route selected for Qwen3.5.
+    ///
+    /// # Safety
+    ///
+    /// `input` covers `batch * 4_096` BF16 values; scratch covers
+    /// `batch * 2_048` code bytes and `batch * 256` scale bytes;
+    /// `weight_codes` covers packed `[24_576, 4_096]`, `weight_scales`
+    /// covers its swizzled `[24_576, 256]` plane, and `output` covers
+    /// `batch * 12_288` BF16 values. Four-byte-loaded planes are aligned.
+    /// Divisors are finite and positive. Allocations belong to `stream`'s
+    /// context, remain live through completion, and do not overlap.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        match qwen35_swiglu_schedule(batch) {
+            Some(Qwen35SwiGluSchedule::A16) => unsafe {
+                self.launch_a16(
+                    stream,
+                    batch,
+                    input,
+                    weight_codes,
+                    weight_scales,
+                    weight_scale_divisor,
+                    output,
+                )
+            },
+            Some(Qwen35SwiGluSchedule::W4a4) => unsafe {
+                self.launch_w4a4(
+                    stream,
+                    batch,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    input_scale_divisor,
+                    weight_scale_divisor,
+                    output,
+                )
+            },
+            None => Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 NVFP4 SwiGLU batch {batch} is not an exact B=1..=8 route"
+            ))),
+        }
+    }
+
+    /// Executes the represented-BF16 comparison route at exact `B=1..=4`.
+    ///
+    /// # Safety
+    ///
+    /// The corresponding input, weight, scale, output, alignment, lifetime,
+    /// context, and overlap requirements are documented by [`Self::launch`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_a16(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 NVFP4 weight scale divisor must be finite and positive",
+            ));
+        }
+
+        let reciprocal = 1.0 / weight_scale_divisor;
+        match batch {
+            1 => self
+                .module
+                .qwen35_nvfp4_swiglu_a16_t1(
+                    stream,
+                    &self.a16_t1,
+                    input.cast::<u32>(),
+                    weight_codes.cast::<u32>(),
+                    weight_scales,
+                    reciprocal,
+                    output,
+                )
+                .map_err(|source| GpuError::launch("launching Qwen3.5 NVFP4 A16 B=1", source)),
+            2 => self
+                .module
+                .qwen35_nvfp4_swiglu_a16_t2(
+                    stream,
+                    &self.a16_t2,
+                    input.cast::<u32>(),
+                    weight_codes.cast::<u32>(),
+                    weight_scales,
+                    reciprocal,
+                    output,
+                )
+                .map_err(|source| GpuError::launch("launching Qwen3.5 NVFP4 A16 B=2", source)),
+            3 => self
+                .module
+                .qwen35_nvfp4_swiglu_a16::<3>(
+                    stream,
+                    &self.a16_t3,
+                    input.cast::<u32>(),
+                    weight_codes.cast::<u32>(),
+                    weight_scales,
+                    reciprocal,
+                    output,
+                )
+                .map_err(|source| GpuError::launch("launching Qwen3.5 NVFP4 A16 B=3", source)),
+            4 => self
+                .module
+                .qwen35_nvfp4_swiglu_a16::<4>(
+                    stream,
+                    &self.a16_t4,
+                    input.cast::<u32>(),
+                    weight_codes.cast::<u32>(),
+                    weight_scales,
+                    reciprocal,
+                    output,
+                )
+                .map_err(|source| GpuError::launch("launching Qwen3.5 NVFP4 A16 B=4", source)),
+            _ => Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 NVFP4 A16 batch {batch} is not an exact B=1..=4 route"
+            ))),
+        }
+    }
+
+    /// Quantizes BF16 activations and executes W4A4 at exact `B=1..=8`.
+    ///
+    /// # Safety
+    ///
+    /// The requirements are identical to [`Self::launch`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_w4a4(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 NVFP4 input scale divisor must be finite and positive",
+            ));
+        }
+        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 NVFP4 weight scale divisor must be finite and positive",
+            ));
+        }
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        input,
+                        activation_codes,
+                        activation_scales,
+                        weight_codes,
+                        weight_scales,
+                        input_scale_divisor,
+                        weight_scale_divisor,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match batch {
+            1 => launch!(w4a4_b1),
+            2 => launch!(w4a4_b2),
+            3 => launch!(w4a4_b3),
+            4 => launch!(w4a4_b4),
+            5 => launch!(w4a4_b5),
+            6 => launch!(w4a4_b6),
+            7 => launch!(w4a4_b7),
+            8 => launch!(w4a4_b8),
+            _ => Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 NVFP4 W4A4 batch {batch} is not an exact B=1..=8 route"
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, nvfp4_swiglu_ptx_names};
+    use super::{
+        MAX_BATCH, Qwen35SwiGluSchedule, nvfp4_swiglu_ptx_names, qwen35_nvfp4_swiglu_ptx_names,
+        qwen35_swiglu_schedule,
+    };
+    use std::collections::BTreeSet;
 
     #[test]
     fn inventory_covers_retained_decode_routes() {
@@ -1521,5 +2098,32 @@ mod tests {
             5
         );
         assert_eq!(names.iter().filter(|name| name.contains("w4a4")).count(), 5);
+    }
+
+    #[test]
+    fn qwen35_inventory_and_routing_are_exact() {
+        let names = qwen35_nvfp4_swiglu_ptx_names();
+        let unique = names.into_iter().collect::<BTreeSet<_>>();
+
+        assert_eq!(names.len(), 20);
+        assert_eq!(unique.len(), names.len());
+        assert_eq!(qwen35_swiglu_schedule(0), None);
+        assert_eq!(
+            (1..=MAX_BATCH)
+                .map(qwen35_swiglu_schedule)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(Qwen35SwiGluSchedule::W4a4),
+                Some(Qwen35SwiGluSchedule::A16),
+                Some(Qwen35SwiGluSchedule::W4a4),
+                Some(Qwen35SwiGluSchedule::W4a4),
+                Some(Qwen35SwiGluSchedule::W4a4),
+                Some(Qwen35SwiGluSchedule::W4a4),
+                Some(Qwen35SwiGluSchedule::W4a4),
+                Some(Qwen35SwiGluSchedule::W4a4),
+            ]
+        );
+        assert_eq!(qwen35_swiglu_schedule(MAX_BATCH + 1), None);
+        assert_eq!(qwen35_swiglu_schedule(usize::MAX), None);
     }
 }

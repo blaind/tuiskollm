@@ -5,7 +5,9 @@ pub(crate) use tuisko_kernels_sm89::{
     FullAttentionQkvOp, Nvfp4DownOp, Nvfp4SwiGluOp, ResidualNormOp,
 };
 #[cfg(feature = "device")]
-pub(crate) use tuisko_kernels_sm120::{FullAttentionQkvOp, Qwen35ResidualNormOp, ResidualNormOp};
+pub(crate) use tuisko_kernels_sm120::{
+    FullAttentionQkvOp, Qwen35Nvfp4SwiGluOp, Qwen35ResidualNormOp, ResidualNormOp,
+};
 
 #[cfg(feature = "device")]
 const TARGET_PROFILE: tuisko_targets::TargetProfile = tuisko_targets::TargetProfile::Sm120;
