@@ -83,6 +83,9 @@ See `docs/performance.md` for commands and measurement semantics.
 
 ## Optimization loop
 
+- Change one measured hypothesis per iteration. Record both agent-loop wall time and command/device
+  wall time, and preserve accepted, rejected, refused, and failed evidence under `target/` with its
+  clocks, medians, and resources.
 - An exact route or `B`-only run is an inner-loop diagnostic. Record the selection in the report
   and never compare or bless it as the complete admitted inventory.
 - Scale warmup and timing repetitions to the production boundary's measured duration. A resident
@@ -94,6 +97,8 @@ See `docs/performance.md` for commands and measurement semantics.
 - Before comparison or blessing, repeat the dependency cone with every admitted exact route and
   its authoritative defaults. Keep each composed boundary's baseline independent from leaf
   resource and performance baselines.
+- Revert a rejected implementation before beginning the next hypothesis. A noisy composed result
+  cannot rescue a clear leaf regression, and changed resource authority remains a separate slice.
 - Profile only the production owner or CUDA Graph after allocation and warmup. Attribute profiler
   nodes through an exact semantic owner/stage manifest, require the observed graph inventory to
   match it, and close graph span against kernel time and gaps before drawing Amdahl conclusions.
