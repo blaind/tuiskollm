@@ -233,7 +233,9 @@ pub use nvfp4_swiglu::{
 #[cfg(any(feature = "device", feature = "sm89", feature = "sm86"))]
 pub use nvfp4_swiglu_benchmark::benchmark_nvfp4_swiglu;
 #[cfg(feature = "device")]
-pub use paged_gqa::{PagedGqaQualification, PagedGqaQualificationError, qualify_paged_gqa};
+pub use paged_gqa::{
+    PagedGqaQualification, PagedGqaQualificationError, qualify_paged_gqa, qualify_qwen35_paged_gqa,
+};
 #[cfg(feature = "device")]
 pub use paged_gqa_benchmark::benchmark_paged_gqa;
 #[cfg(feature = "device")]

@@ -461,6 +461,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             qualify_attention_qk_prepare(root)
         }
         Some("qualify-paged-gqa") if remaining.is_empty() => qualify_paged_gqa(root),
+        Some("qualify-qwen35-paged-gqa") if remaining.is_empty() => qualify_qwen35_paged_gqa(root),
         Some("qualify-long-context-paged-gqa") if remaining.is_empty() => {
             qualify_long_context_paged_gqa(root)
         }
@@ -561,6 +562,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-gdn-output"
                     | "qualify-attention-qk-prepare"
                     | "qualify-paged-gqa"
+                    | "qualify-qwen35-paged-gqa"
                     | "qualify-long-context-paged-gqa"
                     | "qualify-attention-output"
                     | "gate-residual-norm"
@@ -1377,6 +1379,31 @@ fn qualify_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     gate_paged_gqa(root)
+}
+
+fn qualify_qwen35_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "paged_gqa::tests::qwen35_bf16_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )
 }
 
 fn qualify_long_context_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {

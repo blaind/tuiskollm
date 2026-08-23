@@ -17,7 +17,7 @@ pub use attention::{
     LONG_CONTEXT_GQA_MAX_TOKENS, LONG_CONTEXT_GQA_PARTITION_BUCKETS,
     LONG_CONTEXT_GQA_PARTITION_SIZE, LongContextPagedGqaOp,
     PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PAGED_GQA_PREFILL_MAX_CONTEXT,
-    PAGED_GQA_PREFILL_PARTIAL_BYTES, PagedGqaOp, Qwen35AttentionQkPrepareOp,
+    PAGED_GQA_PREFILL_PARTIAL_BYTES, PagedGqaOp, Qwen35AttentionQkPrepareOp, Qwen35PagedGqaOp,
     paged_gqa_prefill_partitions,
 };
 pub use fp8::{
