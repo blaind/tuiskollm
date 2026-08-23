@@ -64,6 +64,10 @@ mod nvfp4_down_benchmark;
 mod nvfp4_swiglu;
 #[cfg(any(feature = "sm89", feature = "sm86"))]
 mod nvfp4_swiglu_benchmark;
+#[cfg(feature = "device")]
+mod paged_gqa;
+#[cfg(feature = "device")]
+mod paged_gqa_benchmark;
 mod residual_norm;
 mod residual_norm_benchmark;
 mod target;
@@ -144,6 +148,10 @@ pub use nvfp4_swiglu::{
 };
 #[cfg(any(feature = "sm89", feature = "sm86"))]
 pub use nvfp4_swiglu_benchmark::benchmark_nvfp4_swiglu;
+#[cfg(feature = "device")]
+pub use paged_gqa::{PagedGqaQualification, PagedGqaQualificationError, qualify_paged_gqa};
+#[cfg(feature = "device")]
+pub use paged_gqa_benchmark::benchmark_paged_gqa;
 pub use residual_norm::{
     ResidualNormQualification, ResidualNormQualificationError, qualify_residual_norm,
 };

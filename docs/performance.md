@@ -10,8 +10,11 @@ dynamic-quantize FP8 QKV at exact `B=1..8` plus `T=16`, GDN Q/K/V/Z input projec
 GDN recurrence and source-native output projection at exact `B=1..8`, plus the source-backed
 dense-FP8 MLP, complete layer-60 GDN, and final-norm plus LM-head owners. Full-attention Q/K
 preparation covers zero-centered normalization, the 64-wide three-axis MRoPE, and represented E4M3
-KV-cache append at exact `B=1..8`. The report schema is already shaped for future whole-model and
-serving cases, but those measurements do not exist until their production owners land.
+KV-cache append at exact `B=1..8`. Short-context paged GQA covers exact 24-query/4-KV-head,
+256-wide online-softmax decode across page boundaries at `B=1..8`; long-context partitioned decode
+and prefill remain separate future routes. The report schema is already shaped for future
+whole-model and serving cases, but those measurements do not exist until their production owners
+land.
 
 SM89 has separate remote-only diagnostic suites for the exact `[34816,5120]` NVFP4 gate/up,
 `[5120,17408]` down, and dynamic-quantize FP8 `[14336,5120]` QKV owners at `B=1..8`. The NVFP4
@@ -78,6 +81,7 @@ target/benchmarks/perf-smoke/gdn-prepare.json
 target/benchmarks/perf-smoke/gdn-recurrence.json
 target/benchmarks/perf-smoke/gdn-output.json
 target/benchmarks/perf-smoke/attention-qk-prepare.json
+target/benchmarks/perf-smoke/paged-gqa.json
 ```
 
 Every performance command also executes the release SM120 build and checks the PTX/SASS entry and
@@ -100,6 +104,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- qualify-gdn-recurrence` | Check mapped FP32 state transitions, gated normalization, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-gdn-output` | Check dynamic E4M3 quantization, source-native output projection, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-attention-qk-prepare` | Check Q/K zero-centered normalization, three-axis MRoPE, represented E4M3 cache append, and graph replay at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-paged-gqa` | Check exact page lookup, grouped-head mapping, represented E4M3 online softmax, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact-B graph, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact-B graphs, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
@@ -107,6 +112,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- bench-gdn-recurrence` | Measure every exact stateful recurrence graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-output` | Measure every exact output quantize-plus-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-qk-prepare` | Measure every exact Q/K prepare and cache-append graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-paged-gqa` | Measure every exact paged GQA graph at a 130-token, three-page context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT` | Measure every complete source-backed layer-60 graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
@@ -156,8 +162,8 @@ cargo run -p xtask -- bench-residual-norm \
 
 Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, `bench-fp8-lm-head`,
 `bench-fp8-swiglu`, `bench-fp8-down`, `bench-gdn-prepare`, `bench-gdn-recurrence`, or
-`bench-gdn-output`, or `bench-attention-qk-prepare` with the same options for one operator suite
-only.
+`bench-gdn-output`, `bench-attention-qk-prepare`, or `bench-paged-gqa` with the same options for one
+operator suite only.
 
 `bench-text-endpoint SNAPSHOT` accepts the same options. It is intentionally separate from the
 leaf-wide `perf` commands until its first reviewed baseline is blessed.

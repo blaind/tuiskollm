@@ -4,3 +4,4 @@ pub(crate) mod fp8_projection;
 pub(crate) mod fp8_swiglu;
 pub(crate) mod gdn_prepare;
 pub(crate) mod gdn_recurrence;
+pub(crate) mod paged_gqa;

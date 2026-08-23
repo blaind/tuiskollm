@@ -15,7 +15,8 @@ use tuisko_qual::{DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_resid
 use tuisko_qual::{
     benchmark_attention_qk_prepare, benchmark_dense_fp8_gdn_layer, benchmark_dense_fp8_mlp,
     benchmark_fp8_down, benchmark_fp8_gdn_input, benchmark_fp8_lm_head, benchmark_fp8_swiglu,
-    benchmark_gdn_output, benchmark_gdn_prepare, benchmark_gdn_recurrence, benchmark_text_endpoint,
+    benchmark_gdn_output, benchmark_gdn_prepare, benchmark_gdn_recurrence, benchmark_paged_gqa,
+    benchmark_text_endpoint,
 };
 
 fn main() -> ExitCode {
@@ -38,12 +39,17 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
     let suite = arguments
         .next()
-        .ok_or("usage: bench-device <attention-qk-prepare|residual-norm|nvfp4-swiglu|nvfp4-down|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|gdn-prepare|gdn-recurrence|gdn-output|dense-fp8-mlp|dense-fp8-gdn-layer|text-endpoint> [SNAPSHOT] [options]")?;
+        .ok_or("usage: bench-device <attention-qk-prepare|paged-gqa|residual-norm|nvfp4-swiglu|nvfp4-down|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|gdn-prepare|gdn-recurrence|gdn-output|dense-fp8-mlp|dense-fp8-gdn-layer|text-endpoint> [SNAPSHOT] [options]")?;
     let report = match suite.as_str() {
         #[cfg(feature = "device")]
         "attention-qk-prepare" => {
             let (options, json_path) = parse_options(arguments)?;
             (benchmark_attention_qk_prepare(options)?, json_path)
+        }
+        #[cfg(feature = "device")]
+        "paged-gqa" => {
+            let (options, json_path) = parse_options(arguments)?;
+            (benchmark_paged_gqa(options)?, json_path)
         }
         "residual-norm" => {
             let (options, json_path) = parse_options(arguments)?;
