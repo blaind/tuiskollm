@@ -43,4 +43,4 @@ pub use nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
 #[cfg(feature = "qualification")]
 pub use program::EndpointObservables;
 #[cfg(feature = "qualification")]
-pub use resident_model_layout::ResidentModelObservables;
+pub use resident_model_layout::{ResidentEmbeddingStageGraph, ResidentModelObservables};
