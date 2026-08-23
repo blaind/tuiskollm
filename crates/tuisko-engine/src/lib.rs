@@ -12,6 +12,7 @@ mod layout;
 mod long_context_kv_layout;
 mod nvfp4_mlp;
 mod nvfp4_mlp_layout;
+mod paged_kv_slots;
 mod program;
 mod resident_generation;
 mod resident_model_layout;
@@ -30,11 +31,12 @@ pub use generation::{
 };
 pub use layout::{EndpointLayout, MAX_BATCH};
 pub use long_context_kv_layout::{
-    KvCacheCodec, KvCacheCodecDescriptor, ResidentKvCapacityPlan, SharedPagedKvLayout,
-    plan_resident_kv_capacity,
+    KvCacheCodec, KvCacheCodecDescriptor, LONG_CONTEXT_PHYSICAL_PAGES, MAX_CONTEXT_TOKENS,
+    ResidentKvCapacityPlan, SharedPagedKvLayout, plan_resident_kv_capacity,
 };
 pub use nvfp4_mlp::Nvfp4MlpProgram;
 pub use nvfp4_mlp_layout::Nvfp4MlpLayout;
+pub use paged_kv_slots::{PagedKvRoute, PagedKvSlotPool, PagedKvSlotState, PagedKvTableUpdate};
 pub use program::TextEndpointProgram;
 pub use resident_generation::{
     ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentBatchGenerator,
