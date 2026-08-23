@@ -14,11 +14,13 @@ uses the exact retained A16 and W4A4 decode schedules at `B=1..8`; NVFP4 down pr
 the represented E2M1/E4M3 source planes through exact A16 routes at `B=1..8`. Full-attention Q/K
 preparation covers zero-centered normalization, the 64-wide three-axis MRoPE, and represented E4M3
 KV-cache append at exact `B=1..8` and `T=32,64,128,1024`. Short-context paged GQA covers exact
-24-query/4-KV-head, 256-wide online-softmax decode across page boundaries at `B=1..8`. Long-context
-paged GQA retains
+24-query/4-KV-head, 256-wide online-softmax decode across page boundaries at `B=1..8` plus causal
+shared-cache prefill tails at `T=32,64,128`. Each prefill CTA stages one 64-position represented
+E4M3 K/V tile once for two adjacent tokens and their twelve grouped-query warps. Long-context paged
+GQA retains
 the same represented cache contract and partitions contexts through 220,000 positions into
-256-position partial softmaxes plus one exact reduction at `B=1..8`; prefill remains a separate
-future route. The resident text owner composes all 48 GDN layers, 16
+256-position partial softmaxes plus one exact reduction at `B=1..8`; partitioned deep-tail and
+macro-prefill attention remain separate future routes. The resident text owner composes all 48 GDN layers, 16
 attention layers, source-routed MLPs, and the LM head into one directly timed graph at every exact
 `B=1..8`; serving cases remain future work.
 
@@ -145,7 +147,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-gdn-recurrence` | Check mapped FP32 state transitions, gated normalization, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-gdn-output` | Check dynamic E4M3 quantization, source-native output projection, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-attention-qk-prepare` | Check Q/K zero-centered normalization, three-axis MRoPE, represented E4M3 cache append, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-paged-gqa` | Check exact page lookup, grouped-head mapping, represented E4M3 online softmax, and graph replay at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-paged-gqa` | Check exact page lookup, grouped-head mapping, represented E4M3 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8 and shared T=32/64/128 prefill | terminal |
 | `cargo run -p xtask -- qualify-long-context-paged-gqa` | Check every partition bucket through 220,000 positions, all partial/reduction seams, untouched scratch, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-attention-output` | Check sigmoid gating, the published FP32 seam, dynamic E4M3 quantization, source-native projection, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact-B graph, stable addresses, and owner allocation | terminal |
@@ -159,7 +161,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-gdn-recurrence` | Measure every exact stateful recurrence graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-output` | Measure every exact output quantize-plus-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-qk-prepare` | Measure every exact Q/K prepare and cache-append graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-paged-gqa` | Measure every exact paged GQA graph at a 130-token, three-page context | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-paged-gqa` | Measure exact B=1..8 graphs at a 130-token context plus causal shared T=32/64/128 prefill graphs | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-long-context-paged-gqa` | Measure every exact two-stage paged GQA graph with the complete 3,438-page pool divided among active slots | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-output` | Measure every exact sigmoid-gate, quantize, and output-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-nvfp4-swiglu` | Measure every exact retained A16/W4A4 NVFP4 gate/up SwiGLU graph | terminal or `--json PATH` |
@@ -384,6 +386,10 @@ workloads. They set batch and active tokens to the exact batch. FP8-QKV `T=16` i
 `operator/mtp` case; its `T=32,64,128,1024` routes are `operator/prefill` cases. The T=32
 projection reads a padded 64-row activation-code tile, and its logical-byte accounting includes
 those immutable padding reads.
+Paged GQA `B=1..8` cases are `operator/decode` at context 130. Its shared `T=32,64,128` cases are
+`operator/prefill`; token `i` attends a two-token prefix plus the causal span through `i`. Logical
+bytes charge each K/V tile once per adjacent-token/KV-head group rather than duplicating its six
+query-head consumers.
 Dense-FP8-SwiGLU `T=32,64,128` cases are `operator/prefill` cases with prompt and context lengths
 equal to the active rows. Concurrency, output, and prefix cache do not apply to these leaf suites.
 
@@ -600,8 +606,9 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 ## Current limitations
 
 - Decode operator coverage is exact `B=1..8`; prefill remains limited to the explicitly listed
-  FP8-QKV, Q/K preparation/cache-append, and dense-FP8 SwiGLU routes. Attention, output, MLP, and GDN
-  prefill need their own complete routes before the resident program can stop priming through decode.
+  FP8-QKV, Q/K preparation/cache-append, shared early-context paged-GQA, and dense-FP8 SwiGLU
+  routes. Deep-tail/macro attention, output, MLP, and GDN prefill need complete routes before the
+  resident program can stop priming through decode.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
 - There is no full-server TTFT, inter-token-latency, concurrency, prefix-reuse, or end-to-end MTP
   benchmark in this repository yet. Direct long-context operator and resident-model timing exists.

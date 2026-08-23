@@ -66,8 +66,10 @@ once and captures all six partition buckets without changing addresses after war
 source-native full-attention QKV owner admits exact `T=32,64,128,1024` prefill projections in
 addition to `B=1..8` decode and `T=16` MTP. Q/K zero-centered normalization, MRoPE, and represented
 E4M3 cache append admit the same four prefill widths alongside `B=1..8` decode. Paged GQA and
-attention-output prefill remain separate future slices, so these leaves do not yet change server
-prompt priming.
+attention now also admits shared-cache causal `T=32,64,128` early-context tails: one 384-thread CTA
+shares each 64-position E4M3 K/V tile across two tokens and their twelve grouped-query warps. Deep
+partitioned `T=128`, macro `T=1024`, and attention-output prefill remain separate future slices, so
+these leaves do not yet change server prompt priming.
 
 ## Current device slice
 
@@ -83,6 +85,8 @@ cargo run -p xtask -- qualify-fp8-lm-head
 cargo run -p xtask -- qualify-nvfp4-swiglu
 cargo run -p xtask -- qualify-nvfp4-down
 cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT
+cargo run -p xtask -- qualify-attention-qk-prepare
+cargo run -p xtask -- qualify-paged-gqa
 cargo run -p xtask -- qualify-long-context-paged-gqa
 cargo run -p xtask -- qualify-resident-model SNAPSHOT
 cargo run -p xtask -- bench-resident-long-context-model SNAPSHOT
