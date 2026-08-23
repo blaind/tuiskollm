@@ -75,6 +75,24 @@ probe, preserve the completed medians as diagnostic evidence before refusing the
 uncontrolled-clock reports are diagnostic only and can never become performance authority.
 See `docs/performance.md` for commands and measurement semantics.
 
+## Optimization loop
+
+- An exact route or `B`-only run is an inner-loop diagnostic. Record the selection in the report
+  and never compare or bless it as the complete admitted inventory.
+- Scale warmup and timing repetitions to the production boundary's measured duration. A resident
+  model graph must not inherit a microsecond leaf's repetition count; reports and baselines bind
+  the selected counts as part of measurement identity.
+- After the changed numerical and resource gate passes, directly time every affected boundary in
+  the checked leaf-to-owner-to-resident/server dependency cone. A leaf win is not a model win, and
+  no composed result may be inferred by summing constituent medians.
+- Before comparison or blessing, repeat the dependency cone with every admitted exact route and
+  its authoritative defaults. Keep each composed boundary's baseline independent from leaf
+  resource and performance baselines.
+- Profile only the production owner or CUDA Graph after allocation and warmup. Attribute profiler
+  nodes through an exact semantic owner/stage manifest, require the observed graph inventory to
+  match it, and close graph span against kernel time and gaps before drawing Amdahl conclusions.
+  Profiles remain diagnostic artifacts under `target/`, never checked performance authority.
+
 ## Change discipline
 
 - Use focused branches such as `feat/...`, `fix/...`, `perf/...`, `docs/...`, or `chore/...` and keep
