@@ -185,7 +185,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         _ => return Err(format!("unknown benchmark suite `{suite}`").into()),
     };
     print_report(&report.0);
-    write_report(&report.0, report.1)
+    write_report(&report.0, report.1)?;
+    if report.0.clock_policy == "diagnostic_uncontrolled"
+        && std::env::var("TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT").as_deref() != Ok("1")
+    {
+        return Err(format!(
+            "timings were preserved as diagnostic_uncontrolled because clocks drifted during the full measurement: SM {}..{} MHz, memory {}..{} MHz; the report cannot be blessed",
+            report.0.sm_clock_min_mhz,
+            report.0.sm_clock_max_mhz,
+            report.0.memory_clock_min_mhz,
+            report.0.memory_clock_max_mhz,
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 fn print_report(report: &DeviceBenchmarkReport) {

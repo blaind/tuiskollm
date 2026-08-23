@@ -559,6 +559,7 @@ pub(crate) struct DeviceIdentity {
 }
 
 pub(crate) struct TelemetryEvidence {
+    pub(crate) clock_comparable: bool,
     pub(crate) sm_minimum_mhz: u32,
     pub(crate) sm_median_mhz: u32,
     pub(crate) sm_maximum_mhz: u32,
@@ -695,10 +696,9 @@ impl TelemetrySampler {
         }
     }
 
-    pub(crate) fn finish(mut self) -> Result<TelemetryEvidence, DeviceBenchmarkError> {
+    fn samples(mut self) -> Result<Vec<TelemetrySample>, DeviceBenchmarkError> {
         self.stop.store(true, Ordering::Release);
-        let samples = self
-            .thread
+        self.thread
             .take()
             .ok_or_else(|| {
                 DeviceBenchmarkError::Precondition(
@@ -709,9 +709,15 @@ impl TelemetrySampler {
             .map_err(|_| {
                 DeviceBenchmarkError::Precondition("telemetry sampler thread panicked".to_string())
             })?
-            .map_err(DeviceBenchmarkError::Precondition)?;
+            .map_err(DeviceBenchmarkError::Precondition)
+    }
 
-        telemetry_evidence(samples, diagnostic_clock_drift_allowed())
+    pub(crate) fn finish(self) -> Result<TelemetryEvidence, DeviceBenchmarkError> {
+        telemetry_evidence(self.samples()?, diagnostic_clock_drift_allowed())
+    }
+
+    fn finish_preserving_clock_drift(self) -> Result<TelemetryEvidence, DeviceBenchmarkError> {
+        telemetry_evidence(self.samples()?, true)
     }
 }
 
@@ -1002,7 +1008,7 @@ pub(crate) fn finish_report(
         driver_version: identity.driver_version,
         device_index: 0,
         compute_capability: EXPECTED_COMPUTE_CAPABILITY_TEXT.to_string(),
-        clock_policy: if diagnostic_clock_drift_allowed() {
+        clock_policy: if diagnostic_clock_drift_allowed() || !telemetry.clock_comparable {
             "diagnostic_uncontrolled"
         } else {
             "controlled"
@@ -1118,7 +1124,7 @@ pub(crate) fn measure_cases(
             }
         }
     }
-    let telemetry = telemetry_sampler.finish()?;
+    let telemetry = telemetry_sampler.finish_preserving_clock_drift()?;
     require_current_process_exclusive()?;
 
     let mut metrics = Vec::with_capacity(tasks.len() * 2);
@@ -1500,7 +1506,8 @@ fn telemetry_evidence(
     device_free.sort_unstable();
 
     let sm_spread = sm[sm.len() - 1] - sm[0];
-    if sm_spread > MAX_SM_CLOCK_SPREAD_MHZ && !allow_clock_drift {
+    let sm_comparable = sm_spread <= MAX_SM_CLOCK_SPREAD_MHZ;
+    if !sm_comparable && !allow_clock_drift {
         return Err(DeviceBenchmarkError::Precondition(clock_drift_message(
             "SM",
             sm[0],
@@ -1508,7 +1515,8 @@ fn telemetry_evidence(
         )));
     }
     let memory_spread = memory[memory.len() - 1] - memory[0];
-    if memory_spread > MAX_MEMORY_CLOCK_SPREAD_MHZ && !allow_clock_drift {
+    let memory_comparable = memory_spread <= MAX_MEMORY_CLOCK_SPREAD_MHZ;
+    if !memory_comparable && !allow_clock_drift {
         return Err(DeviceBenchmarkError::Precondition(clock_drift_message(
             "memory",
             memory[0],
@@ -1517,6 +1525,7 @@ fn telemetry_evidence(
     }
 
     Ok(TelemetryEvidence {
+        clock_comparable: sm_comparable && memory_comparable,
         sm_minimum_mhz: sm[0],
         sm_median_mhz: sm[sm.len() / 2],
         sm_maximum_mhz: sm[sm.len() - 1],
@@ -1896,6 +1905,7 @@ mod tests {
         )
         .expect("the target's measured clock P-state steps are comparable");
 
+        assert!(evidence.clock_comparable);
         assert_eq!(evidence.sm_minimum_mhz, 2_160);
         assert_eq!(evidence.sm_maximum_mhz, 2_197);
         assert_eq!(evidence.memory_minimum_mhz, 13_801);
@@ -1948,6 +1958,7 @@ mod tests {
         let evidence =
             telemetry_evidence(vec![sample(13_601), sample(14_001), sample(14_001)], true)
                 .expect("diagnostic runs retain drifting clock evidence");
+        assert!(!evidence.clock_comparable);
         assert_eq!(evidence.memory_minimum_mhz, 13_601);
         assert_eq!(evidence.memory_maximum_mhz, 14_001);
     }
@@ -2042,6 +2053,7 @@ mod tests {
             }],
         };
         let telemetry = TelemetryEvidence {
+            clock_comparable: true,
             sm_minimum_mhz: 2_200,
             sm_median_mhz: 2_200,
             sm_maximum_mhz: 2_200,
