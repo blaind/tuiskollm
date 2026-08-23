@@ -180,16 +180,18 @@ enum OptimizationSuite {
     FullAttentionLayer,
     TextEndpoint,
     ResidentModel,
+    ResidentPrefill,
     ResidentLongContextModel,
 }
 
-const COMPOSED_PERFORMANCE_SUITES: [OptimizationSuite; 7] = [
+const COMPOSED_PERFORMANCE_SUITES: [OptimizationSuite; 8] = [
     OptimizationSuite::Nvfp4Mlp,
     OptimizationSuite::DenseFp8Mlp,
     OptimizationSuite::DenseFp8GdnLayer,
     OptimizationSuite::FullAttentionLayer,
     OptimizationSuite::TextEndpoint,
     OptimizationSuite::ResidentModel,
+    OptimizationSuite::ResidentPrefill,
     OptimizationSuite::ResidentLongContextModel,
 ];
 
@@ -317,6 +319,7 @@ impl OptimizationSuite {
             Self::FullAttentionLayer => "full-attention-layer",
             Self::TextEndpoint => "text-endpoint",
             Self::ResidentModel => "resident-model",
+            Self::ResidentPrefill => "resident-prefill",
             Self::ResidentLongContextModel => "resident-long-context-model",
         }
     }
@@ -333,7 +336,7 @@ impl OptimizationSuite {
             Self::DenseFp8GdnLayer => DENSE_FP8_GDN_LAYER_RESOURCE_BASELINES.to_vec(),
             Self::FullAttentionLayer => FULL_ATTENTION_LAYER_RESOURCE_BASELINES.to_vec(),
             Self::TextEndpoint => TEXT_ENDPOINT_RESOURCE_BASELINES.to_vec(),
-            Self::ResidentModel | Self::ResidentLongContextModel => {
+            Self::ResidentModel | Self::ResidentPrefill | Self::ResidentLongContextModel => {
                 RESIDENT_MODEL_RESOURCE_BASELINES.to_vec()
             }
         }
@@ -348,6 +351,7 @@ impl OptimizationSuite {
             Self::FullAttentionLayer => "qual/baselines/full-attention-layer-sm120.json",
             Self::TextEndpoint => "qual/baselines/text-endpoint-sm120.json",
             Self::ResidentModel => "qual/baselines/resident-model-sm120.json",
+            Self::ResidentPrefill => "qual/baselines/resident-prefill-sm120.json",
             Self::ResidentLongContextModel => {
                 "qual/baselines/resident-long-context-model-sm120.json"
             }
@@ -367,7 +371,7 @@ impl OptimizationSuite {
             Self::DenseFp8GdnLayer => qualify_dense_fp8_gdn_layer(root, &snapshot_arguments()?),
             Self::FullAttentionLayer => qualify_full_attention_layer(root, &snapshot_arguments()?),
             Self::TextEndpoint => qualify_text_endpoint(root, &snapshot_arguments()?),
-            Self::ResidentModel | Self::ResidentLongContextModel => {
+            Self::ResidentModel | Self::ResidentPrefill | Self::ResidentLongContextModel => {
                 qualify_resident_model(root, &snapshot_arguments()?)
             }
         }
@@ -376,7 +380,7 @@ impl OptimizationSuite {
     fn dependency_cone(self) -> Vec<Self> {
         use OptimizationSuite::{
             DenseFp8GdnLayer, DenseFp8Mlp, FullAttentionLayer, Nvfp4Mlp, ResidentLongContextModel,
-            ResidentModel, TextEndpoint,
+            ResidentModel, ResidentPrefill, TextEndpoint,
         };
         use PerformanceSuite::{
             AttentionOutput, AttentionQkPrepare, Fp8Down, Fp8GdnInput, Fp8LmHead, Fp8Qkv,
@@ -385,27 +389,40 @@ impl OptimizationSuite {
         };
 
         let downstream = match self {
-            Self::ResidentModel | Self::ResidentLongContextModel => &[][..],
+            Self::ResidentModel | Self::ResidentPrefill | Self::ResidentLongContextModel => &[][..],
             Self::Leaf(LongContextPagedGqa) => &[ResidentLongContextModel],
-            Self::Leaf(Nvfp4SwiGlu | Nvfp4Down) | Self::Nvfp4Mlp => {
-                &[Nvfp4Mlp, ResidentModel, ResidentLongContextModel]
-            }
-            Self::Leaf(Fp8LmHead) | Self::TextEndpoint => {
-                &[TextEndpoint, ResidentModel, ResidentLongContextModel]
-            }
+            Self::Leaf(Nvfp4SwiGlu | Nvfp4Down) | Self::Nvfp4Mlp => &[
+                Nvfp4Mlp,
+                ResidentModel,
+                ResidentPrefill,
+                ResidentLongContextModel,
+            ],
+            Self::Leaf(Fp8LmHead) | Self::TextEndpoint => &[
+                TextEndpoint,
+                ResidentModel,
+                ResidentPrefill,
+                ResidentLongContextModel,
+            ],
             Self::Leaf(Fp8GdnInput | GdnPrepare | GdnRecurrence | GdnOutput)
-            | Self::DenseFp8GdnLayer => {
-                &[DenseFp8GdnLayer, ResidentModel, ResidentLongContextModel]
-            }
+            | Self::DenseFp8GdnLayer => &[
+                DenseFp8GdnLayer,
+                ResidentModel,
+                ResidentPrefill,
+                ResidentLongContextModel,
+            ],
             Self::Leaf(Fp8Qkv | AttentionQkPrepare | PagedGqa | AttentionOutput)
-            | Self::FullAttentionLayer => {
-                &[FullAttentionLayer, ResidentModel, ResidentLongContextModel]
-            }
+            | Self::FullAttentionLayer => &[
+                FullAttentionLayer,
+                ResidentModel,
+                ResidentPrefill,
+                ResidentLongContextModel,
+            ],
             Self::Leaf(Fp8SwiGlu | Fp8Down) | Self::DenseFp8Mlp => &[
                 DenseFp8Mlp,
                 DenseFp8GdnLayer,
                 FullAttentionLayer,
                 ResidentModel,
+                ResidentPrefill,
                 ResidentLongContextModel,
             ],
             Self::Leaf(ResidualNorm) => &[
@@ -415,6 +432,7 @@ impl OptimizationSuite {
                 FullAttentionLayer,
                 TextEndpoint,
                 ResidentModel,
+                ResidentPrefill,
                 ResidentLongContextModel,
             ],
         };
@@ -532,6 +550,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             bench_qwen35_full_attention_layer(root, &remaining)
         }
         Some("bench-resident-model") => bench_resident_model(root, &remaining),
+        Some("bench-resident-prefill") => bench_resident_prefill(root, &remaining),
         Some("bench-resident-long-context-model") => {
             bench_resident_long_context_model(root, &remaining)
         }
@@ -2400,6 +2419,18 @@ fn bench_resident_model(
     bench_resident_model_variant(root, arguments, "bench-resident-model", "resident-model")
 }
 
+fn bench_resident_prefill(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    bench_resident_model_variant(
+        root,
+        arguments,
+        "bench-resident-prefill",
+        "resident-prefill",
+    )
+}
+
 fn bench_startup(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
     let Some((snapshot, options)) = arguments.split_first() else {
         return Err("usage: cargo run -p xtask -- bench-startup SNAPSHOT [options]".into());
@@ -3459,7 +3490,10 @@ fn run_optimization_cone(
     if mode == "check" {
         let mut qualified = Vec::new();
         for suite in cone.iter().copied() {
-            let authority = if suite == OptimizationSuite::ResidentLongContextModel {
+            let authority = if matches!(
+                suite,
+                OptimizationSuite::ResidentPrefill | OptimizationSuite::ResidentLongContextModel
+            ) {
                 OptimizationSuite::ResidentModel
             } else {
                 suite
@@ -7575,6 +7609,7 @@ mod tests {
                 "full-attention-layer",
                 "text-endpoint",
                 "resident-model",
+                "resident-prefill",
                 "resident-long-context-model",
             ]
         );
@@ -7591,6 +7626,7 @@ mod tests {
                 "nvfp4-down",
                 "nvfp4-mlp",
                 "resident-model",
+                "resident-prefill",
                 "resident-long-context-model",
             ]
         );
@@ -7609,6 +7645,7 @@ mod tests {
                 "dense-fp8-gdn-layer",
                 "full-attention-layer",
                 "resident-model",
+                "resident-prefill",
                 "resident-long-context-model",
             ]
         );

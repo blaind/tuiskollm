@@ -165,8 +165,8 @@ pub fn qualify_resident_generation(
 fn verify_owner(
     generator: &ResidentTextGenerator,
 ) -> Result<(), ResidentGenerationQualificationError> {
-    if generator.arena_bytes() != 27_721_684_224
-        || generator.host_stager_bytes() != 578_560
+    if generator.arena_bytes() != 28_380_566_016
+        || generator.host_stager_bytes() != 10_982_400
         || generator.kv_route_host_bytes() != 113_454
         || generator.context_capacity() != 220_000
     {
@@ -204,8 +204,8 @@ mod tests {
         let report = qualify_resident_generation(&PathBuf::from(root))?;
         assert_eq!(report.reference_cases, 2);
         assert!((1..=2).contains(&report.chat_steps));
-        assert_eq!(report.arena_bytes, 27_551_280_384);
-        assert_eq!(report.host_stager_bytes, 578_560);
+        assert_eq!(report.arena_bytes, 28_380_566_016);
+        assert_eq!(report.host_stager_bytes, 10_982_400);
         Ok(())
     }
 }

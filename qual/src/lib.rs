@@ -324,7 +324,7 @@ pub use resident_model::{
 #[cfg(feature = "device")]
 pub use resident_model_benchmark::{
     ResidentModelProfileManifest, ResidentProfileStage, benchmark_resident_long_context_model,
-    benchmark_resident_model, profile_resident_model,
+    benchmark_resident_model, benchmark_resident_prefill, profile_resident_model,
 };
 #[cfg(feature = "device")]
 pub use residual_norm::qualify_qwen35_residual_norm;

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
     MAX_BATCH, ResidentDecodeRoute, ResidentEmbeddingStageGraph, ResidentLayerKind,
-    ResidentModelLayout, ResidentModelProgram,
+    ResidentModelLayout, ResidentModelProgram, ResidentPrefillRoute,
 };
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuTimer, profiler_start, profiler_stop};
 use tuisko_kernels_sm120::{LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE};
@@ -22,6 +22,7 @@ const CONTEXT_TOKENS: usize = CACHE_POSITION as usize + 1;
 const LONG_CONTEXT_TOKENS: usize = 131_073;
 const ROTARY_PAIRS: usize = 32;
 const LONG_ROUTE_SLOTS: [usize; MAX_BATCH] = [7, 0, 6, 1, 5, 2, 4, 3];
+const PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1_024];
 
 #[derive(Clone, Copy)]
 enum BenchmarkProfile {
@@ -78,6 +79,124 @@ struct Session {
     context_lengths: [usize; MAX_BATCH],
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
+}
+
+struct PrefillSession {
+    timer: GpuTimer,
+    program: ResidentModelProgram,
+    routes: [ResidentPrefillRoute; 4],
+    stream: Arc<CudaStream>,
+    _context: Arc<CudaContext>,
+}
+
+impl PrefillSession {
+    fn new(root: &Path) -> Result<Self, DeviceBenchmarkError> {
+        let snapshot = Arc::new(CheckpointSnapshot::<Qwen38_27B>::open(root)?);
+        let context = CudaContext::new(0).map_err(GpuError::from)?;
+        let capability = context.compute_capability().map_err(GpuError::from)?;
+        if capability != (12, 0) {
+            return Err(DeviceBenchmarkError::Precondition(format!(
+                "device zero has compute capability {}.{}, expected 12.0",
+                capability.0, capability.1
+            )));
+        }
+        let stream = context.new_stream().map_err(GpuError::from)?;
+        let mut program = ResidentModelProgram::from_snapshot(&context, snapshot)?;
+        program.activate_kv_slot(0)?;
+        let update = program.reserve_kv_slot_tokens(&stream, 0, 1_024)?;
+        if update.first_entry() != 0 || update.entry_count() != 16 {
+            return Err(DeviceBenchmarkError::Precondition(format!(
+                "resident prefill benchmark reserved {update:?}, expected pages 0..16"
+            )));
+        }
+        program.stage_embeddings(&stream, &prefill_token_ids())?;
+        program.reset_state(&stream)?;
+        let (rope_cos, rope_sin) = prefill_rope(1_024);
+        let routes = PREFILL_ROUTES
+            .into_iter()
+            .map(|tokens| {
+                program.load_prefill_state(
+                    &stream,
+                    tokens,
+                    0,
+                    &rope_cos[..tokens * ROTARY_PAIRS],
+                    &rope_sin[..tokens * ROTARY_PAIRS],
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| {
+                DeviceBenchmarkError::Precondition(
+                    "resident prefill route inventory has wrong cardinality".to_string(),
+                )
+            })?;
+        let timer = GpuTimer::new(&context)?;
+        Ok(Self {
+            timer,
+            program,
+            routes,
+            stream,
+            _context: context,
+        })
+    }
+
+    fn embedding_graphs(
+        &self,
+    ) -> Result<[ResidentEmbeddingStageGraph<'_>; 4], DeviceBenchmarkError> {
+        PREFILL_ROUTES
+            .into_iter()
+            .map(|tokens| {
+                self.program
+                    .qualification_embedding_stage_graph(&self.stream, tokens)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| {
+                DeviceBenchmarkError::Precondition(
+                    "resident prefill embedding graph inventory has wrong cardinality".to_string(),
+                )
+            })
+    }
+
+    fn warm(
+        &self,
+        embedding_graphs: &[ResidentEmbeddingStageGraph<'_>; 4],
+        launches: u64,
+    ) -> Result<(), DeviceBenchmarkError> {
+        for _ in 0..launches {
+            for (index, route) in self.routes.iter().copied().enumerate() {
+                embedding_graphs[index].graph().launch(&self.stream)?;
+                self.program
+                    .qualification_prefill_graph(route)?
+                    .launch(&self.stream)?;
+            }
+        }
+        self.stream.synchronize().map_err(GpuError::from)?;
+        Ok(())
+    }
+
+    fn cases<'a>(
+        &'a self,
+        embedding_graphs: &'a [ResidentEmbeddingStageGraph<'a>; 4],
+    ) -> Result<Vec<ExactDeviceCase<'a>>, DeviceBenchmarkError> {
+        self.routes
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, route)| {
+                let tokens = route.tokens();
+                Ok(ExactDeviceCase::new(
+                    "resident_model/text_prefill",
+                    format!("T={tokens}"),
+                    BenchmarkWorkload::warm_model_prefill(tokens as u64),
+                    OperationAccounting::new(prefill_logical_bytes(tokens), tokens as u64, "token"),
+                    self.program.qualification_prefill_graph(route)?,
+                    None,
+                )
+                .with_preparation(embedding_graphs[index].graph()))
+            })
+            .collect()
+    }
 }
 
 impl Session {
@@ -225,6 +344,12 @@ fn benchmark_token_ids() -> [u32; MAX_BATCH] {
     core::array::from_fn(|slot| (100 + slot * 17) as u32)
 }
 
+fn prefill_token_ids() -> Vec<u32> {
+    (0..1_024)
+        .map(|token| 100u32 + (token % 251) as u32)
+        .collect()
+}
+
 fn benchmark_rope(positions: &[u32; MAX_BATCH]) -> (Vec<f32>, Vec<f32>) {
     let mut cosine = vec![0.0; MAX_BATCH * ROTARY_PAIRS];
     let mut sine = vec![0.0; MAX_BATCH * ROTARY_PAIRS];
@@ -235,6 +360,21 @@ fn benchmark_rope(positions: &[u32; MAX_BATCH]) -> (Vec<f32>, Vec<f32>) {
             let (sin, cos) = angle.sin_cos();
             cosine[slot * ROTARY_PAIRS + pair] = cos as f32;
             sine[slot * ROTARY_PAIRS + pair] = sin as f32;
+        }
+    }
+    (cosine, sine)
+}
+
+fn prefill_rope(tokens: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut cosine = vec![0.0; tokens * ROTARY_PAIRS];
+    let mut sine = vec![0.0; tokens * ROTARY_PAIRS];
+    for token in 0..tokens {
+        for pair in 0..ROTARY_PAIRS {
+            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
+            let angle = token as f64 * frequency;
+            let (sin, cos) = angle.sin_cos();
+            cosine[token * ROTARY_PAIRS + pair] = cos as f32;
+            sine[token * ROTARY_PAIRS + pair] = sin as f32;
         }
     }
     (cosine, sine)
@@ -276,6 +416,45 @@ fn short_gqa_bytes(batch: usize) -> usize {
         2 * size_of::<u32>() + Qwen38_27B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * size_of::<u32>();
     let output = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>();
     batch * (query + cache + metadata + output)
+}
+
+fn prefill_logical_bytes(tokens: usize) -> usize {
+    let hidden = Qwen38_27B::HIDDEN;
+    let intermediate = Qwen38_27B::INTERMEDIATE;
+    let vocab = Qwen38_27B::VOCAB;
+    let resident_weights = 19_103_682_560usize;
+    let dense_gdn_layer = 7_869_216usize;
+    let dense_attention_decode_layer = 1_988_624usize;
+    let dense_mlp = 22 * hidden + 6 * intermediate + 4 * size_of::<f32>();
+    let nvfp4_mlp =
+        20 * hidden + 4 * intermediate + hidden + hidden / 8 + intermediate + intermediate / 8;
+    let endpoint = 8 * hidden + 2 * size_of::<f32>() + 2 * vocab;
+    let short_gqa_per_row = short_gqa_bytes(1);
+    // This removes the B=1/context=131 GQA route embedded in the admitted
+    // layer traffic, substitutes exact causal T-wide GQA traffic, and keeps
+    // the final-token-only endpoint outside the per-prompt-row term.
+    let common_per_row = 48 * dense_gdn_layer + 16 * dense_attention_decode_layer
+        - 56 * (dense_mlp - nvfp4_mlp)
+        - 64 * 6 * hidden
+        - 16 * short_gqa_per_row;
+    resident_weights + tokens * common_per_row + 16 * prefill_gqa_bytes(tokens) + endpoint
+}
+
+fn prefill_gqa_bytes(tokens: usize) -> usize {
+    let attention = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
+    let heads = Qwen38_27B::NUM_ATTENTION_HEADS;
+    let causal_pairs = tokens * (tokens + 1) / 2;
+    let query = tokens * attention * size_of::<f32>();
+    let cache = 2 * attention * causal_pairs;
+    let metadata = 2 * tokens * size_of::<u32>() + heads * causal_pairs * size_of::<u32>();
+    let output = tokens * attention * size_of::<f32>();
+    let macro_partials = if tokens == 1_024 {
+        let values = tokens * heads * 4 * (Qwen38_27B::HEAD_DIM + 2);
+        2 * values * size_of::<f32>()
+    } else {
+        0
+    };
+    query + cache + metadata + output + macro_partials
 }
 
 fn long_gqa_bytes(context_lengths: &[usize]) -> usize {
@@ -517,6 +696,93 @@ pub fn benchmark_resident_model(
     )
 }
 
+/// Measures every exact from-empty resident prompt graph directly.
+pub fn benchmark_resident_prefill(
+    root: &Path,
+    options: DeviceBenchmarkOptions,
+) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
+    let baseline_sha256 = generator_baseline_sha256()?;
+    let warmup_launches = warmup_launches(options)?;
+    let preflight = preflight()?;
+    let mut memory = MemoryRecorder::new(&preflight)?;
+    let session = PrefillSession::new(root)?;
+    let embedding_graphs = session.embedding_graphs()?;
+    for (name, kind, bytes, description) in [
+        (
+            "resident_prefill/resident_weights",
+            BenchmarkMemoryKind::Weights,
+            session.program.resident_weight_bytes(),
+            "64 exact source-routed layers plus final norm and LM head",
+        ),
+        (
+            "resident_prefill/gdn_history",
+            BenchmarkMemoryKind::Other,
+            session.program.history_bytes(),
+            "48 layers * 8 persistent causal-history slots",
+        ),
+        (
+            "resident_prefill/gdn_state",
+            BenchmarkMemoryKind::Other,
+            session.program.state_bytes(),
+            "48 layers * 8 persistent FP32 recurrent-state slots",
+        ),
+        (
+            "resident_prefill/represented_kv_cache",
+            BenchmarkMemoryKind::KvCache,
+            session.program.cache_bytes(),
+            "16 layers sharing the exact 220,000-token physical page pool",
+        ),
+        (
+            "resident_prefill/kv_block_tables",
+            BenchmarkMemoryKind::Other,
+            session.program.kv_table_bytes(),
+            "8 stable slot rows * 3,438 u32 page-table entries",
+        ),
+        (
+            "resident_prefill/shared_workspace",
+            BenchmarkMemoryKind::Workspace,
+            session.program.workspace_bytes(),
+            "one max_rows=1024 workspace including the admitted P4 macro partials",
+        ),
+        (
+            "resident_prefill/address_bound_tensor_maps",
+            BenchmarkMemoryKind::Other,
+            session.program.descriptor_bytes(),
+            "eight dense layers * four address-bound 128-byte tensor maps",
+        ),
+        (
+            "resident_prefill/alignment_padding",
+            BenchmarkMemoryKind::Other,
+            session.program.padding_bytes(),
+            "256-byte alignment across the resident and shared-KV arenas",
+        ),
+    ] {
+        memory.register_owned(name, kind, bytes, description)?;
+    }
+    memory.capture("after_setup")?;
+    session.warm(&embedding_graphs, warmup_launches)?;
+    memory.capture("after_warmup")?;
+    require_current_process_exclusive()?;
+    let cases = session.cases(&embedding_graphs)?;
+    let (metrics, energy_metrics, telemetry) =
+        measure_cases(&session.stream, &session.timer, &cases, options)?;
+    let memory = memory.finish(&telemetry)?;
+    finish_report(
+        BenchmarkReportSpec {
+            suite: "bench-resident-prefill",
+            classification: "performance_sensitive_model",
+            timing_scope: "paired Rust submission/completion and direct complete production prefill graph replay",
+        },
+        preflight,
+        baseline_sha256,
+        options,
+        metrics,
+        energy_metrics,
+        telemetry,
+        memory,
+    )
+}
+
 /// Measures every exact long-context complete-model graph directly.
 pub fn benchmark_resident_long_context_model(
     root: &Path,
@@ -546,6 +812,7 @@ fn benchmark_resident_profile(
             "resident_model/represented_kv_cache",
             "resident_model/kv_block_tables",
             "resident_model/shared_workspace",
+            "resident_model/address_bound_tensor_maps",
             "resident_model/alignment_padding",
         ],
         BenchmarkProfile::Long => [
@@ -555,6 +822,7 @@ fn benchmark_resident_profile(
             "resident_long_context_model/represented_kv_cache",
             "resident_long_context_model/kv_block_tables",
             "resident_long_context_model/shared_workspace",
+            "resident_long_context_model/address_bound_tensor_maps",
             "resident_long_context_model/alignment_padding",
         ],
     };
@@ -598,10 +866,16 @@ fn benchmark_resident_profile(
         names[5],
         BenchmarkMemoryKind::Workspace,
         session.program.workspace_bytes(),
-        "one max_batch=8 workspace shared sequentially by all layers and endpoint",
+        "one max_rows=1024 workspace shared sequentially by all layers and endpoint",
     )?;
     memory.register_owned(
         names[6],
+        BenchmarkMemoryKind::Other,
+        session.program.descriptor_bytes(),
+        "eight dense layers * four address-bound 128-byte tensor maps",
+    )?;
+    memory.register_owned(
+        names[7],
         BenchmarkMemoryKind::Other,
         session.program.padding_bytes(),
         "256-byte alignment across the resident and shared-KV arenas",
@@ -633,7 +907,8 @@ fn benchmark_resident_profile(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_TOKENS, LONG_CONTEXT_TOKENS, MAX_BATCH, logical_bytes, resident_profile_manifest,
+        CONTEXT_TOKENS, LONG_CONTEXT_TOKENS, MAX_BATCH, logical_bytes, prefill_logical_bytes,
+        resident_profile_manifest,
     };
     use std::path::Path;
     use tuisko_engine::ResidentModelLayout;
@@ -659,6 +934,14 @@ mod tests {
                     > logical_bytes(batch, &[CONTEXT_TOKENS; MAX_BATCH][..batch])
             );
         }
+    }
+
+    #[test]
+    fn prefill_accounting_tracks_every_exact_causal_route() {
+        let routes = [32, 64, 128, 1_024].map(prefill_logical_bytes);
+        assert!(routes.windows(2).all(|pair| pair[1] > pair[0]));
+        let weights = 19_103_682_560usize;
+        assert!(routes[3] - weights > 8 * (routes[2] - weights));
     }
 
     #[test]
