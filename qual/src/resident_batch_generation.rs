@@ -440,13 +440,17 @@ fn require_round(
 fn verify_owner(
     generator: &ResidentBatchGenerator,
 ) -> Result<(), ResidentBatchGenerationQualificationError> {
-    if generator.arena_bytes() != 20_391_493_632 || generator.host_stager_bytes() != 8_028_160 {
+    if generator.arena_bytes() != 27_551_280_384 || generator.host_stager_bytes() != 8_028_160 {
         return Err(ResidentBatchGenerationQualificationError::Mismatch(
             "compact scheduler owner byte accounting changed".to_string(),
         ));
     }
     let addresses = generator.qualification_addresses();
-    if addresses[0] == 0 || addresses[1] == 0 || addresses[0] == addresses[1] {
+    if addresses.contains(&0)
+        || addresses[0] == addresses[1]
+        || addresses[0] == addresses[2]
+        || addresses[1] == addresses[2]
+    {
         return Err(ResidentBatchGenerationQualificationError::Mismatch(
             "compact scheduler owner addresses are invalid".to_string(),
         ));
@@ -476,7 +480,7 @@ mod tests {
         assert_eq!(report.cancellations, 2);
         assert_eq!(report.exact_prefix_reuses, 1);
         assert_eq!(report.safe_cold_fallbacks, 1);
-        assert_eq!(report.arena_bytes, 20_391_493_632);
+        assert_eq!(report.arena_bytes, 27_551_280_384);
         assert_eq!(report.host_stager_bytes, 8_028_160);
         Ok(())
     }

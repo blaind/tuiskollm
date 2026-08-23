@@ -183,7 +183,13 @@ pub fn benchmark_resident_model(
         "resident_model/represented_kv_cache",
         BenchmarkMemoryKind::KvCache,
         session.program.cache_bytes(),
-        "16 layers * 8 slots * 3 pages * 4 heads * 64 * 256 E4M3 K/V values",
+        "16 layers * one shared 3,438-page pool * 4 heads * 64 * 256 E4M3 K/V values",
+    )?;
+    memory.register_owned(
+        "resident_model/kv_block_tables",
+        BenchmarkMemoryKind::Other,
+        session.program.kv_table_bytes(),
+        "8 stable slot rows * 3,438 u32 page-table entries",
     )?;
     memory.register_owned(
         "resident_model/shared_workspace",
@@ -195,7 +201,7 @@ pub fn benchmark_resident_model(
         "resident_model/alignment_padding",
         BenchmarkMemoryKind::Other,
         session.program.padding_bytes(),
-        "single 256-byte-aligned resident arena",
+        "256-byte alignment across the resident and shared-KV arenas",
     )?;
     memory.capture("after_setup")?;
     session.warm(&embedding_graphs, warmup_launches)?;

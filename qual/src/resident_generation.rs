@@ -162,7 +162,7 @@ pub fn qualify_resident_generation(
 fn verify_owner(
     generator: &ResidentTextGenerator,
 ) -> Result<(), ResidentGenerationQualificationError> {
-    if generator.arena_bytes() != 20_391_493_632
+    if generator.arena_bytes() != 27_551_280_384
         || generator.host_stager_bytes() != 578_560
         || generator.context_capacity() != 192
     {
@@ -171,7 +171,11 @@ fn verify_owner(
         ));
     }
     let addresses = generator.qualification_addresses();
-    if addresses[0] == 0 || addresses[1] == 0 || addresses[0] == addresses[1] {
+    if addresses.contains(&0)
+        || addresses[0] == addresses[1]
+        || addresses[0] == addresses[2]
+        || addresses[1] == addresses[2]
+    {
         return Err(ResidentGenerationQualificationError::Mismatch(
             "resident generation owner addresses are invalid".to_string(),
         ));
@@ -196,7 +200,7 @@ mod tests {
         let report = qualify_resident_generation(&PathBuf::from(root))?;
         assert_eq!(report.reference_cases, 2);
         assert!((1..=2).contains(&report.chat_steps));
-        assert_eq!(report.arena_bytes, 20_391_493_632);
+        assert_eq!(report.arena_bytes, 27_551_280_384);
         assert_eq!(report.host_stager_bytes, 578_560);
         Ok(())
     }

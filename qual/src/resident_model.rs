@@ -80,6 +80,7 @@ pub fn qualify_resident_model(
     let mut program = ResidentModelProgram::from_snapshot(&context, snapshot.clone())?;
     verify_owner(&program)?;
     let stable_base = program.base_address();
+    let stable_kv_base = program.kv_base_address();
     let stable_addresses = program.qualification_addresses();
     verify_scalars(&program, snapshot.as_ref())?;
     let mut report = ResidentModelQualification {
@@ -90,6 +91,7 @@ pub fn qualify_resident_model(
         slot_control_values: 0,
         maximum_absolute_error: 0.0,
     };
+    report.slot_control_values += verify_block_tables(&program, &stream)?;
 
     for batch in 1..=MAX_BATCH {
         let slots = route_slots(batch);
@@ -112,6 +114,7 @@ pub fn qualify_resident_model(
         )?;
         verify_inactive(batch, slots, &replay, &mut report)?;
         if program.base_address() != stable_base
+            || program.kv_base_address() != stable_kv_base
             || program.qualification_addresses() != stable_addresses
         {
             return Err(ResidentModelQualificationError::Mismatch(format!(
@@ -120,20 +123,54 @@ pub fn qualify_resident_model(
         }
     }
     verify_slot_reset(&mut program, &stream, &mut report)?;
+    report.slot_control_values += verify_block_tables(&program, &stream)?;
 
     verify_no_device_allocation(&program, &stream)?;
     device_benchmark::require_current_process_exclusive()?;
     Ok(report)
 }
 
+fn verify_block_tables(
+    program: &ResidentModelProgram,
+    stream: &CudaStream,
+) -> Result<usize, ResidentModelQualificationError> {
+    let tables = program.qualification_block_tables(stream)?;
+    let expected = MAX_BATCH * 3_438;
+    if tables.len() != expected {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "resident block tables contain {} entries, expected {expected}",
+            tables.len()
+        )));
+    }
+    for slot in 0..MAX_BATCH {
+        let row = &tables[slot * 3_438..(slot + 1) * 3_438];
+        for (logical_page, &physical_page) in row.iter().enumerate() {
+            let expected = if logical_page < TABLE_STRIDE {
+                (slot * TABLE_STRIDE + logical_page) as u32
+            } else {
+                u32::MAX
+            };
+            if physical_page != expected {
+                return Err(ResidentModelQualificationError::Mismatch(format!(
+                    "resident slot {slot} table entry {logical_page} is {physical_page}, expected {expected}"
+                )));
+            }
+        }
+    }
+    Ok(tables.len())
+}
+
 fn verify_owner(program: &ResidentModelProgram) -> Result<(), ResidentModelQualificationError> {
     if program.resident_weight_bytes() != 19_103_682_560
         || program.history_bytes() != 23_592_960
         || program.state_bytes() != 1_207_959_552
-        || program.cache_bytes() != 50_331_648
-        || program.workspace_bytes() != 5_910_272
-        || program.padding_bytes() != 16_640
-        || program.arena_bytes() != 20_391_493_632
+        || program.cache_bytes() != 7_210_008_576
+        || program.kv_table_bytes() != 110_016
+        || program.workspace_bytes() != 5_910_176
+        || program.padding_bytes() != 16_544
+        || program.resident_arena_bytes() != 20_341_161_728
+        || program.kv_arena_bytes() != 7_210_118_656
+        || program.arena_bytes() != 27_551_280_384
         || program.host_stager_bytes() != 81_920
         || program.batch_capacity() != 8
         || program.context_capacity() != 192
@@ -375,6 +412,8 @@ fn verify_replay(
     same_f32!(state);
     same!(key_pages);
     same!(value_pages);
+    same!(key_guard_pages);
+    same!(value_guard_pages);
     report.graph_replay_values += observable_values(replay);
     Ok(())
 }
@@ -404,6 +443,8 @@ fn observable_values(observed: &ResidentModelObservables) -> usize {
         + observed.state.len()
         + observed.key_pages.len()
         + observed.value_pages.len()
+        + observed.key_guard_pages.len()
+        + observed.value_guard_pages.len()
 }
 
 fn verify_inactive(
@@ -557,6 +598,17 @@ fn verify_persistent_inactive(
                 inactive += cache_per_slot;
             }
         }
+    }
+    for (role, guards) in [
+        ("key", &observed.key_guard_pages),
+        ("value", &observed.value_guard_pages),
+    ] {
+        if guards.iter().any(|&value| value != 0) {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "B={batch} modified the first unassigned {role} cache page"
+            )));
+        }
+        inactive += guards.len();
     }
     Ok(inactive)
 }
