@@ -579,6 +579,6 @@ mod tests {
         assert_eq!((MACRO_THREADS, MACRO_SHARED_BYTES), (128, 24_576));
         let names = attention_output_ptx_names();
         assert_eq!(names.len(), 13);
-        assert_eq!(names.iter().copied().collect::<BTreeSet<_>>().len(), 9);
+        assert_eq!(names.iter().copied().collect::<BTreeSet<_>>().len(), 13);
     }
 }
