@@ -16,9 +16,14 @@ use tuisko_kernels_sm120::GdnOutputProjectionOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, MAX_BATCH, 32, 64, 128, MAX_ROWS];
 const ALIGNMENT: usize = 256;
 const INPUT_PATTERN: [f32; 8] = [0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625];
-const TOKEN_FACTORS: [f32; MAX_BATCH] = [1.0, 0.5, 0.25, 0.125, -1.0, -0.5, -0.25, -0.125];
+const TOKEN_FACTORS: [f32; 16] = [
+    1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, -1.0, -0.875, -0.75, -0.625, -0.5, -0.375,
+    -0.25, -0.125,
+];
 
 #[derive(Clone, Copy)]
 struct Regions {
@@ -31,7 +36,7 @@ struct Regions {
 }
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
@@ -83,13 +88,13 @@ impl Session {
             weight_scales: arena.address(regions.weight_scales)?,
             output: arena.address(regions.output)?,
         };
-        let mut routes = Vec::with_capacity(MAX_BATCH);
-        for batch in 1..=MAX_BATCH {
+        let mut routes = Vec::with_capacity(EXACT_ROUTES.len());
+        for rows in EXACT_ROUTES {
             routes.push(capture_route(
                 &op,
                 &stream,
                 &addresses,
-                batch,
+                rows,
                 repeated_operations,
             )?);
         }
@@ -120,15 +125,22 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     "gdn_output/quantize_projection",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
                     &route.leaf,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 )
@@ -139,18 +151,37 @@ impl Session {
     fn weight_bytes(&self) -> usize {
         self.regions.weight_codes.byte_len() + self.regions.weight_scales.byte_len()
     }
+
+    fn workspace_bytes(&self) -> usize {
+        self.regions.payload_bytes() - self.weight_bytes()
+    }
+
+    fn padding_bytes(&self) -> usize {
+        self.arena.byte_len() - self.regions.payload_bytes()
+    }
+}
+
+impl Regions {
+    fn payload_bytes(self) -> usize {
+        self.input.byte_len()
+            + self.activation_codes.byte_len()
+            + self.activation_scales.byte_len()
+            + self.weight_codes.byte_len()
+            + self.weight_scales.byte_len()
+            + self.output.byte_len()
+    }
 }
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let columns = Qwen38_27B::GDN_VALUE_ROWS;
     let rows = Qwen38_27B::HIDDEN;
     let mut layout = ArenaLayout::new();
-    let input = layout.reserve(MAX_BATCH * columns, ALIGNMENT)?;
-    let activation_codes = layout.reserve(MAX_BATCH * columns, ALIGNMENT)?;
-    let activation_scales = layout.reserve(MAX_BATCH, ALIGNMENT)?;
+    let input = layout.reserve(MAX_ROWS * columns, ALIGNMENT)?;
+    let activation_codes = layout.reserve(MAX_ROWS * columns, ALIGNMENT)?;
+    let activation_scales = layout.reserve(MAX_ROWS, ALIGNMENT)?;
     let weight_codes = layout.reserve(rows * columns, ALIGNMENT)?;
     let weight_scales = layout.reserve(rows, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * rows, ALIGNMENT)?;
+    let output = layout.reserve(MAX_ROWS * rows, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -166,10 +197,10 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
 }
 
 fn make_input() -> Vec<u16> {
-    (0..MAX_BATCH * Qwen38_27B::GDN_VALUE_ROWS)
+    (0..MAX_ROWS * Qwen38_27B::GDN_VALUE_ROWS)
         .map(|index| {
             let token = index / Qwen38_27B::GDN_VALUE_ROWS;
-            f32_to_bf16(INPUT_PATTERN[index & 7] * TOKEN_FACTORS[token])
+            f32_to_bf16(INPUT_PATTERN[index & 7] * TOKEN_FACTORS[token & 15])
         })
         .collect()
 }
@@ -200,20 +231,20 @@ fn capture_route(
     op: &GdnOutputProjectionOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, batch))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, batch)?;
+            launch(op, stream, addresses, rows)?;
         }
 
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
         leaf,
         repeated,
     })
@@ -223,13 +254,13 @@ fn launch(
     op: &GdnOutputProjectionOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     // SAFETY: every pointer names its complete, aligned maximum-batch arena region.
     unsafe {
         op.launch(
             stream,
-            batch,
+            rows,
             addresses.input,
             addresses.activation_codes,
             addresses.activation_scales,
@@ -240,12 +271,12 @@ fn launch(
     }
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(rows_count: usize) -> usize {
     let columns = Qwen38_27B::GDN_VALUE_ROWS;
     let rows = Qwen38_27B::HIDDEN;
-    let activation = batch * (2 * columns + 2 * columns + 2 * size_of::<f32>());
+    let activation = rows_count * (2 * columns + 2 * columns + 2 * size_of::<f32>());
     let weights = rows * columns + rows * size_of::<u16>();
-    let output = batch * rows * size_of::<u16>();
+    let output = rows_count * rows * size_of::<u16>();
 
     activation + weights + output
 }
@@ -260,6 +291,8 @@ pub fn benchmark_gdn_output(
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(options.launches_per_sample)?;
     let weight_bytes = session.weight_bytes();
+    let workspace_bytes = session.workspace_bytes();
+    let padding_bytes = session.padding_bytes();
     memory.register_owned(
         "gdn_output/weights",
         BenchmarkMemoryKind::Weights,
@@ -269,8 +302,14 @@ pub fn benchmark_gdn_output(
     memory.register_owned(
         "gdn_output/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
-        session.arena.byte_len() - weight_bytes,
-        "max_batch=8",
+        workspace_bytes,
+        "max_rows=1024 inputs, activation scratch, and output",
+    )?;
+    memory.register_owned(
+        "gdn_output/alignment_padding",
+        BenchmarkMemoryKind::Other,
+        padding_bytes,
+        "256-byte region alignment",
     )?;
     memory.capture("after_setup")?;
     session.warm(warmup_launches)?;
@@ -299,7 +338,7 @@ pub fn benchmark_gdn_output(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, logical_bytes};
+    use super::{EXACT_ROUTES, MAX_BATCH, MAX_ROWS, layout, logical_bytes};
     use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
@@ -310,5 +349,20 @@ mod tests {
 
         assert_eq!(logical_bytes(1), weights + per_token);
         assert_eq!(logical_bytes(MAX_BATCH), weights + MAX_BATCH * per_token);
+        assert_eq!(logical_bytes(MAX_ROWS), weights + MAX_ROWS * per_token);
+    }
+
+    #[test]
+    fn benchmark_route_inventory_and_owner_accounting_are_exact() {
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
+        let (layout, regions) = layout().unwrap();
+
+        assert_eq!(
+            regions.weight_codes.byte_len() + regions.weight_scales.byte_len(),
+            31_467_520
+        );
+        assert_eq!(regions.payload_bytes(), 60_831_744);
+        assert_eq!(layout.byte_len(), 60_831_744);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 0);
     }
 }

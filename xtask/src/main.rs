@@ -5654,8 +5654,22 @@ fn gate_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("gdn_output_projection_TID_"))
         .collect::<Vec<_>>();
+    let prefill = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("gdn_output_projection_mma_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    let macro_prefill = entries
+        .iter()
+        .filter(|entry| entry.name == "gdn_output_projection_mma_t1024")
+        .collect::<Vec<_>>();
     require_count("GDN output quantization", quantize.len(), 1)?;
     require_count("GDN output projection", projection.len(), 8)?;
+    require_count("GDN output T=32/64/128 projection", prefill.len(), 3)?;
+    require_count("GDN output T=1024 projection", macro_prefill.len(), 1)?;
     for entry in quantize.iter().chain(&projection) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
@@ -5665,11 +5679,38 @@ fn gate_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    let resources = &sm120_gate_artifact(root)?.resources;
+    for entry in &prefill {
+        if !entry.body.contains(".reqntid 64, 1, 1") || !entry.body.contains(".minnctapersm 4") {
+            return Err(format!(
+                "entry `{}` lost its 64-thread/four-CTA prefill launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    if !macro_prefill[0].body.contains(".reqntid 128, 1, 1")
+        || !macro_prefill[0].body.contains(".minnctapersm 4")
+    {
+        return Err("GDN output T=1024 lost its 128-thread/four-CTA launch bounds".into());
+    }
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let quantize_resource = resources
         .get(quantize[0].name)
         .ok_or("cuobjdump omitted GDN output quantization")?;
     require_spill_free(quantize[0].name, quantize_resource)?;
+    let quantize_sass = sass_function_body(sass, quantize[0].name)
+        .ok_or("cuobjdump omitted GDN output quantization SASS")?;
+    for instruction in ["SHFL.BFLY", "F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C"] {
+        if !quantize_sass.contains(instruction) {
+            return Err(format!(
+                "entry `{}` lost required `{instruction}` SASS",
+                quantize[0].name
+            )
+            .into());
+        }
+    }
     require_registers(
         &baseline,
         "quantize_registers",
@@ -5682,17 +5723,63 @@ fn gate_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
             .get(entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
         require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        for instruction in ["F2FP.F16.E4M3.UNPACK_B", "SHFL.DOWN"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
         projection_registers.push(resource.registers);
         projection_shared.push(resource.shared);
     }
     projection_registers.sort_unstable();
     require_registers(&baseline, "projection_registers", &projection_registers)?;
+
+    let mut prefill_registers = Vec::new();
+    let mut prefill_shared = Vec::new();
+    for entry in prefill.iter().chain(&macro_prefill) {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        for instruction in ["QMMA.16832.F32.E4M3.E4M3", "LDGSTS"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+        prefill_registers.push(resource.registers);
+        prefill_shared.push(resource.shared);
+    }
+    prefill_registers.sort_unstable();
+    if baseline.contains_key("prefill_projection_registers") {
+        require_registers(
+            &baseline,
+            "prefill_projection_registers",
+            &prefill_registers,
+        )?;
+    }
+    if baseline.contains_key("prefill_projection_shared_bytes") {
+        require_uniform_value(
+            &baseline,
+            "prefill_projection_shared_bytes",
+            &prefill_shared,
+        )?;
+    }
     println!(
-        "GDN output gate passed: 1 quantize + 8 projection entries, REG {} / {:?}, STACK:0 LOCAL:0, SHARED {} / {:?}",
+        "GDN output gate passed: 1 quantize + 8 decode + 4 prefill projection entries, REG {} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {} / {:?} / {:?}, E4M3/SHFL/QMMA/LDGSTS present",
         quantize_resource.registers,
         projection_registers,
+        prefill_registers,
         quantize_resource.shared,
         projection_shared,
+        prefill_shared,
     );
     Ok(())
 }

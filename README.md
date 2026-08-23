@@ -95,8 +95,10 @@ dense-FP8 GDN Q/K/V/Z input projection separately admits the same four prefill w
 widths, retaining one mapped history row and publishing its final three represented values only
 after every parallel convolution reader completes. GDN recurrence admits the same widths with one
 causally advanced mapped FP32 state row; 48 value-head CTAs retain the decode reduction order while
-each CTA advances tokens serially. GDN output, layer composition, and resident/server routing
-remain separate slices, so these routes do not yet change server priming.
+each CTA advances tokens serially. GDN output retains one token-owned dynamic quantization CTA per
+row and projects `T=32,64,128` with 32x32 native E4M3 MMA tiles or `T=1024` with 64x32 macro tiles.
+GDN layer composition and resident/server routing remain separate slices, so these routes do not
+yet change server priming.
 
 ## Current device slice
 
