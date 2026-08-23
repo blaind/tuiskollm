@@ -162,14 +162,17 @@ impl ResidentTextGenerator {
             logits,
         } = self;
         let control = GenerationSession::start(frontend, request)?;
-        require_generation_capacity(
+        let required_positions = require_generation_capacity(
             control.prompt_token_ids().len(),
             request.max_new_tokens,
             program.context_capacity(),
         )?;
 
         if control.finish_reason().is_none() {
-            program.reset_state(stream)?;
+            program.recycle_kv_slot(stream, 0)?;
+            program.reset_slot(stream, 0)?;
+            program.activate_kv_slot(0)?;
+            program.reserve_kv_slot_tokens(stream, 0, required_positions)?;
             program.load_slot_routes(stream, &[0])?;
             for (position, &token) in control.prompt_token_ids().iter().enumerate() {
                 replay_token(
@@ -206,6 +209,11 @@ impl ResidentTextGenerator {
         self.program.host_stager_bytes() + self.logits.num_bytes()
     }
 
+    /// Fixed host bytes owning shared page tables and physical-page tags.
+    pub const fn kv_route_host_bytes(&self) -> usize {
+        self.program.kv_route_host_bytes()
+    }
+
     /// Current short-context token capacity per single slot.
     pub const fn context_capacity(&self) -> usize {
         self.program.context_capacity()
@@ -219,8 +227,13 @@ impl ResidentTextGenerator {
     #[cfg(feature = "qualification")]
     /// Runs an independently captured raw-token reference case through the production path.
     pub fn qualification_greedy_after_tokens(&mut self, token_ids: &[u32]) -> EngineResult<u32> {
-        require_generation_capacity(token_ids.len(), 1, self.program.context_capacity())?;
-        self.program.reset_state(&self.stream)?;
+        let required_positions =
+            require_generation_capacity(token_ids.len(), 1, self.program.context_capacity())?;
+        self.program.recycle_kv_slot(&self.stream, 0)?;
+        self.program.reset_slot(&self.stream, 0)?;
+        self.program.activate_kv_slot(0)?;
+        self.program
+            .reserve_kv_slot_tokens(&self.stream, 0, required_positions)?;
         self.program.load_slot_routes(&self.stream, &[0])?;
         for (position, &token) in token_ids.iter().enumerate() {
             replay_token(&mut self.program, &self.stream, token, position as u32)?;
@@ -295,7 +308,7 @@ impl ResidentBatchGenerator {
         request: &ChatGenerationRequest,
     ) -> EngineResult<ResidentBatchAdmission> {
         let control = GenerationSession::start(&self.frontend, request)?;
-        require_generation_capacity(
+        let required_positions = require_generation_capacity(
             control.prompt_token_ids().len(),
             request.max_new_tokens,
             self.program.context_capacity(),
@@ -316,8 +329,14 @@ impl ResidentBatchGenerator {
         }
         let (slot, device_reused_tokens, reset) = self.select_slot(control.prompt_token_ids())?;
         if reset {
+            self.program.recycle_kv_slot(&self.stream, slot)?;
             self.program.reset_slot(&self.stream, slot)?;
+            self.program.activate_kv_slot(slot)?;
+        } else {
+            self.program.activate_kv_slot(slot)?;
         }
+        self.program
+            .reserve_kv_slot_tokens(&self.stream, slot, required_positions)?;
         self.program.load_slot_routes(&self.stream, &[slot])?;
         for (offset, &token) in control.prompt_token_ids()[device_reused_tokens..]
             .iter()
@@ -472,6 +491,11 @@ impl ResidentBatchGenerator {
         self.program.host_stager_bytes() + self.logits.num_bytes()
     }
 
+    /// Fixed host bytes owning shared page tables and physical-page tags.
+    pub const fn kv_route_host_bytes(&self) -> usize {
+        self.program.kv_route_host_bytes()
+    }
+
     /// Current short-context token capacity per physical slot.
     pub const fn context_capacity(&self) -> usize {
         self.program.context_capacity()
@@ -513,8 +537,13 @@ impl ResidentBatchGenerator {
 
     #[cfg(feature = "qualification")]
     /// Drops host retention metadata so an independent scheduler fixture starts cold.
-    pub fn qualification_clear_retained(&mut self) {
-        self.retained.fill_with(|| None);
+    pub fn qualification_clear_retained(&mut self) -> EngineResult<()> {
+        for slot in 0..MAX_BATCH {
+            if self.retained[slot].take().is_some() {
+                self.program.recycle_kv_slot(&self.stream, slot)?;
+            }
+        }
+        Ok(())
     }
 
     fn select_slot(&mut self, prompt: &[u32]) -> EngineResult<(usize, usize, bool)> {
@@ -556,10 +585,14 @@ impl ResidentBatchGenerator {
     }
 
     fn store_retained(&mut self, slot: usize, tokens: Vec<u32>) -> EngineResult<()> {
-        self.retention_clock = self
+        let next_clock = self
             .retention_clock
             .checked_add(1)
             .ok_or_else(|| EngineError::generation("resident retention clock overflows"))?;
+        self.program
+            .truncate_kv_slot_tokens(&self.stream, slot, tokens.len())?;
+        self.program.retain_kv_slot(slot)?;
+        self.retention_clock = next_clock;
         self.retained[slot] = Some(RetainedSlot {
             tokens,
             last_used: self.retention_clock,
@@ -731,7 +764,7 @@ fn require_generation_capacity(
     prompt_tokens: usize,
     maximum_new_tokens: usize,
     context_capacity: usize,
-) -> EngineResult<()> {
+) -> EngineResult<usize> {
     if prompt_tokens == 0 {
         return Err(EngineError::generation(
             "resident generation requires a nonempty prompt",
@@ -745,7 +778,7 @@ fn require_generation_capacity(
             "prompt plus processed generation requires {evaluated} positions, current resident capacity is {context_capacity}"
         )));
     }
-    Ok(())
+    Ok(evaluated)
 }
 
 #[cfg(test)]

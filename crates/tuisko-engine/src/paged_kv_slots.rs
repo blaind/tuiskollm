@@ -124,6 +124,15 @@ impl PagedKvSlotPool {
         self.page_tables.len() * size_of::<u32>() + self.page_owners.len() * size_of::<u8>()
     }
 
+    #[cfg(feature = "qualification")]
+    /// Stable host backing addresses for post-warmup allocation checks.
+    pub fn qualification_addresses(&self) -> [usize; 2] {
+        [
+            self.page_tables.as_ptr().addr(),
+            self.page_owners.as_ptr().addr(),
+        ]
+    }
+
     /// Current lifecycle state for one stable slot row.
     pub fn state(&self, slot: usize) -> EngineResult<PagedKvSlotState> {
         require_slot(slot)?;

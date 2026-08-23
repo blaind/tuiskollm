@@ -49,6 +49,8 @@ pub struct ResidentGenerationQualification {
     pub arena_bytes: usize,
     /// Exact page-locked embedding and logit staging bytes.
     pub host_stager_bytes: usize,
+    /// Exact allocation-free host page-routing bytes.
+    pub kv_route_host_bytes: usize,
 }
 
 /// Qualifies the exact single-slot frontend-to-device generation path.
@@ -156,6 +158,7 @@ pub fn qualify_resident_generation(
         chat_steps: step_tokens.len(),
         arena_bytes: generator.arena_bytes(),
         host_stager_bytes: generator.host_stager_bytes(),
+        kv_route_host_bytes: generator.kv_route_host_bytes(),
     })
 }
 
@@ -164,6 +167,7 @@ fn verify_owner(
 ) -> Result<(), ResidentGenerationQualificationError> {
     if generator.arena_bytes() != 27_551_280_384
         || generator.host_stager_bytes() != 578_560
+        || generator.kv_route_host_bytes() != 113_454
         || generator.context_capacity() != 192
     {
         return Err(ResidentGenerationQualificationError::Mismatch(

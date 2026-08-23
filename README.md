@@ -41,10 +41,12 @@ It does not claim an in-process inference API; see [`docs/python.md`](docs/pytho
 `tuisko-engine` owns the exact 64-layer resident text program: all source-native weights, 48 GDN
 history/state pairs, one shared 3,438-page E4M3 KV pool across 16 attention layers, endpoint weights,
 one shared workspace, and immutable whole-model CUDA Graphs for every `B=1..8` route. The current
-qualified decode tables assign three pages to each stable slot, so request admission remains 192
-tokens while the remaining long-context pages stay unassigned. Compact active rows can address any
-distinct physical state/cache slots, and one slot can be reset without touching its survivors. The
-HTTP worker owns that scheduler and disconnecting a response cancels its resident
+decode path reserves three pages per active slot, so request admission remains 192 tokens while the
+remaining long-context pages stay unassigned. An allocation-free 113,454-byte host owner maintains
+the eight stable device-table rows, recycles physical pages between slots, and clears a reassigned
+page before publishing its new route. Compact active rows can address any distinct physical
+state/cache slots, and one slot can be reset without touching its survivors. The HTTP worker owns
+that scheduler and disconnecting a response cancels its resident
 request without moving survivors. Concrete single-slot and compact eight-request generation owners
 connect the admitted frontend, sampling, streaming decode, and resident graphs for prompts within
 the current 192-token cache. The compact owner preserves the final emitted token as pending, packs
