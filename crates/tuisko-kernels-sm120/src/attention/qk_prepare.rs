@@ -1,7 +1,7 @@
-//! Exact-batch Q/K normalization, MRoPE, and FP8 KV-cache append.
+//! Exact-batch Q/K normalization, MRoPE, and KV-cache append.
 
 use crate::Sm120Arch;
-use crate::device::attention_qk_prepare::attention_qk_prepare;
+use crate::device::attention_qk_prepare::{attention_qk_prepare, qwen35_attention_qk_prepare};
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -185,17 +185,15 @@ mod kernels {
         table_stride: u32,
         cache_positions: *const u32,
         query: *mut f32,
-        key_pages: *mut u8,
-        value_pages: *mut u8,
-        key_scale: f32,
-        value_scale: f32,
+        key_pages: *mut u16,
+        value_pages: *mut u16,
     ) {
         // Qwen3.5 has 20 head-warps per B=1..8 batch: eight warps per
         // CTA make 20 CTAs at B=8. This first qualified route preserves the
         // existing one-warp/head reduction and MRoPE order exactly; its paired
         // performance slice decides whether a different topology is owed.
         unsafe {
-            attention_qk_prepare::<Qwen35_9B, TOKENS>(
+            qwen35_attention_qk_prepare::<Qwen35_9B, TOKENS>(
                 qkv,
                 query_norm,
                 key_norm,
@@ -208,8 +206,6 @@ mod kernels {
                 query,
                 key_pages,
                 value_pages,
-                key_scale,
-                value_scale,
             );
         }
     }
@@ -381,10 +377,8 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
         table_stride: u32,
         cache_positions: *const u32,
         query: *mut f32,
-        key_pages: *mut u8,
-        value_pages: *mut u8,
-        key_scale: f32,
-        value_scale: f32,
+        key_pages: *mut u16,
+        value_pages: *mut u16,
     ) -> GpuResult<()> {
         module
             .qwen35_attention_qk_prepare_exact::<TOKENS>(
@@ -402,8 +396,6 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
                 query,
                 key_pages,
                 value_pages,
-                key_scale,
-                value_scale,
             )
             .map_err(|source| GpuError::launch("launching Qwen3.5 attention Q/K prepare", source))
     }
@@ -588,7 +580,7 @@ impl Qwen35AttentionQkPrepareOp {
         })
     }
 
-    /// Normalizes and rotates Q/K, then appends represented E4M3 K/V codes.
+    /// Normalizes and rotates Q/K, then appends represented BF16 K/V values.
     ///
     /// # Safety
     ///
@@ -596,9 +588,9 @@ impl Qwen35AttentionQkPrepareOp {
     /// order. Norms cover 256 values; rotary planes cover `[batch, 32]`;
     /// metadata covers `batch`; and each selected block-table row covers its
     /// cache position. Query covers `[batch, 16, 256]` FP32 values. Cache
-    /// planes use page-major `[physical_page, 4, 64, 256]` bytes. Allocations
-    /// are aligned, non-overlapping, live through completion, and belong to
-    /// `stream`'s context.
+    /// planes use page-major `[physical_page, 4, 64, 256]` BF16 values.
+    /// Allocations are aligned, non-overlapping, live through completion, and
+    /// belong to `stream`'s context.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
@@ -614,10 +606,8 @@ impl Qwen35AttentionQkPrepareOp {
         table_stride: usize,
         cache_positions: *const u32,
         query: *mut f32,
-        key_pages: *mut u8,
-        value_pages: *mut u8,
-        key_scale: f32,
-        value_scale: f32,
+        key_pages: *mut u16,
+        value_pages: *mut u16,
     ) -> GpuResult<()> {
         if !admitted_batch(batch) {
             return Err(GpuError::invalid_launch(format!(
@@ -632,17 +622,6 @@ impl Qwen35AttentionQkPrepareOp {
                 "Qwen3.5 attention Q/K block-table stride must be nonzero",
             ));
         }
-        if !key_scale.is_finite() || key_scale <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 attention key-cache scale must be finite and positive",
-            ));
-        }
-        if !value_scale.is_finite() || value_scale <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 attention value-cache scale must be finite and positive",
-            ));
-        }
-
         macro_rules! launch {
             ($route:ident) => {
                 unsafe {
@@ -661,8 +640,6 @@ impl Qwen35AttentionQkPrepareOp {
                         query,
                         key_pages,
                         value_pages,
-                        key_scale,
-                        value_scale,
                     )
                 }
             };
