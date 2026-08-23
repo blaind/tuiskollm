@@ -1,16 +1,16 @@
-name: Python release
+name: Release
 
 on:
   push:
     tags:
-      - "tuisko-llm-v*"
+      - "v*"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: python-release-${{ github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -98,8 +98,17 @@ jobs:
             dist/*.tar.gz
           if-no-files-found: error
 
+  server:
+    needs: preflight
+    uses: ./.github/workflows/server-release-build.yml
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+
   publish-pypi:
-    if: startsWith(github.ref, 'refs/tags/tuisko-llm-v')
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -119,8 +128,8 @@ jobs:
           packages-dir: dist
 
   github-release:
-    if: startsWith(github.ref, 'refs/tags/tuisko-llm-v')
-    needs: publish-pypi
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [publish-pypi, server]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -130,8 +139,13 @@ jobs:
         with:
           name: python-distributions
           path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: server-distribution
+          path: dist
       - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.whl
             dist/*.tar.gz
+            dist/*.sha256

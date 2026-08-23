@@ -49,9 +49,9 @@ boundary's stable category in their message and are raised as either `Checkpoint
 
 ## Release
 
-The `Python release` workflow builds and inspects both distributions on a manual run. A tag named
-`tuisko-llm-vX.Y.Z`, exactly matching the workspace version, additionally publishes them to PyPI
-and creates a GitHub release.
+The `Release` workflow builds and inspects the Python distributions and SM120 server archive on a
+manual run. A tag named `vX.Y.Z`, exactly matching the workspace version, additionally publishes
+the wheel and source distribution to PyPI and attaches every artifact to one GitHub release.
 
 Before the first release, add a pending PyPI trusted publisher for project `tuisko-llm` with owner
 `blaind`, repository `tuiskollm`, workflow `python-release.yml`, and environment `pypi`. The
