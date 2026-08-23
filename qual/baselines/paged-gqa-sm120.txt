@@ -5,4 +5,6 @@ cuda_toolkit_release=13.3
 cuda_toolkit_version=13.3.73
 attention_registers=47,47,47,47,47,47,47,47
 prefill_shared_registers=56,56,56
+prefill_partition_registers=64,64
+prefill_reduce_registers=34,34
 shared_bytes=1024
