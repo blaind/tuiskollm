@@ -997,6 +997,8 @@ pub struct ModelOptNvfp4AttentionBindings<'a> {
     pub post_attention_norm: Bf16View<'a, 1>,
     /// Decoder layer owning these sources.
     pub layer: usize,
+    pub(crate) layer_count: usize,
+    pub(crate) full_attention_interval: usize,
 }
 
 impl<'a> ModelOptNvfp4AttentionBindings<'a> {
@@ -1081,6 +1083,8 @@ impl<'a> ModelOptNvfp4AttentionBindings<'a> {
                 [A::HIDDEN as u64],
             )?,
             layer,
+            layer_count: A::LAYERS,
+            full_attention_interval: A::FULL_ATTENTION_INTERVAL,
         })
     }
 }

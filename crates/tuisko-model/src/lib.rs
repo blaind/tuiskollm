@@ -22,7 +22,8 @@ pub use dtype::DType;
 pub use error::{CheckpointError, CheckpointErrorCode, CheckpointResult};
 pub use inventory::CheckpointSnapshot;
 pub use materialize::{
-    MaterializedFullAttentionQkv, MaterializedModelOptNvfp4Mlp, MaterializedMtpQkv,
+    MaterializedFullAttentionQkv, MaterializedModelOptNvfp4Attention,
+    MaterializedModelOptNvfp4Linear, MaterializedModelOptNvfp4Mlp, MaterializedMtpQkv,
     MaterializedNvfp4Down, MaterializedNvfp4GateUp,
 };
 pub use safetensors::{SafeTensorFile, TensorView};
