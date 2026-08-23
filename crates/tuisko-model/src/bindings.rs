@@ -5,7 +5,7 @@ use crate::{
     F32View, Fp8E4M3View, TensorView, U8View,
 };
 
-const EMBEDDING: &str = "model.language_model.embed_tokens.weight";
+pub(crate) const EMBEDDING: &str = "model.language_model.embed_tokens.weight";
 const FINAL_NORM: &str = "model.language_model.norm.weight";
 const LM_HEAD: &str = "lm_head.weight";
 const LM_HEAD_SCALE: &str = "lm_head.weight_scale";

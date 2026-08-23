@@ -1,7 +1,11 @@
 //! Validated mmap access to safetensors headers and tensor byte ranges.
 
 use crate::{CheckpointError, CheckpointResult, DType};
+#[cfg(target_os = "linux")]
+use memmap2::Advice;
 use memmap2::{Mmap, MmapOptions};
+#[cfg(target_os = "linux")]
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -134,6 +138,54 @@ impl SafeTensorFile {
         self.tensors.len()
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prefault_except(&self, tensor_name: &str) -> CheckpointResult<usize> {
+        const CHUNK_BYTES: usize = 256 * 1024 * 1024;
+
+        let descriptor = self.tensors.get(tensor_name).ok_or_else(|| {
+            CheckpointError::tensor(format!(
+                "{} is missing prefault exclusion tensor `{tensor_name}`",
+                self.path.display()
+            ))
+        })?;
+        let excluded_start = self
+            .data_start
+            .checked_add(usize::try_from(descriptor.data_offsets[0]).map_err(|_| {
+                CheckpointError::safetensors("prefault exclusion offset exceeds the host")
+            })?)
+            .ok_or_else(|| {
+                CheckpointError::safetensors("prefault exclusion start overflows the host")
+            })?;
+        let excluded_end = self
+            .data_start
+            .checked_add(usize::try_from(descriptor.data_offsets[1]).map_err(|_| {
+                CheckpointError::safetensors("prefault exclusion offset exceeds the host")
+            })?)
+            .ok_or_else(|| {
+                CheckpointError::safetensors("prefault exclusion end overflows the host")
+            })?;
+        let page_bytes = page_size::get();
+        let chunks = prefault_ranges(
+            self.mmap.len(),
+            excluded_start..excluded_end,
+            page_bytes,
+            CHUNK_BYTES,
+        )?;
+        let bytes = chunks.iter().try_fold(0usize, |bytes, range| {
+            bytes.checked_add(range.len()).ok_or_else(|| {
+                CheckpointError::safetensors("prefault byte accounting overflows the host")
+            })
+        })?;
+        crate::materialize::materialization_pool("checkpoint prefault")?.install(|| {
+            chunks.into_par_iter().try_for_each(|range| {
+                self.mmap
+                    .advise_range(Advice::PopulateRead, range.start, range.len())
+                    .map_err(|error| CheckpointError::io("prefaulting", &self.path, error))
+            })
+        })?;
+        Ok(bytes)
+    }
+
     pub(crate) fn header_bytes(&self) -> usize {
         self.data_start - 8
     }
@@ -200,6 +252,44 @@ impl SafeTensorFile {
             ))
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn prefault_ranges(
+    mapping_bytes: usize,
+    excluded: Range<usize>,
+    page_bytes: usize,
+    chunk_bytes: usize,
+) -> CheckpointResult<Vec<Range<usize>>> {
+    if page_bytes == 0 || chunk_bytes == 0 || !chunk_bytes.is_multiple_of(page_bytes) {
+        return Err(CheckpointError::safetensors(
+            "prefault page and chunk sizes are inconsistent",
+        ));
+    }
+    if excluded.start > excluded.end || excluded.end > mapping_bytes {
+        return Err(CheckpointError::safetensors(
+            "prefault exclusion is outside the mapping",
+        ));
+    }
+    let before_end = excluded.start / page_bytes * page_bytes;
+    let after_start = excluded
+        .end
+        .div_ceil(page_bytes)
+        .checked_mul(page_bytes)
+        .ok_or_else(|| {
+            CheckpointError::safetensors("prefault exclusion page range overflows the host")
+        })?
+        .min(mapping_bytes);
+    let mut chunks = Vec::new();
+    for range in [0..before_end, after_start..mapping_bytes] {
+        let mut offset = range.start;
+        while offset < range.end {
+            let end = offset.saturating_add(chunk_bytes).min(range.end);
+            chunks.push(offset..end);
+            offset = end;
+        }
+    }
+    Ok(chunks)
 }
 
 /// Borrowed source tensor whose descriptor and byte range have been validated.
@@ -269,6 +359,8 @@ fn validate_descriptor(
 #[cfg(test)]
 mod tests {
     use super::SafeTensorFile;
+    #[cfg(target_os = "linux")]
+    use super::prefault_ranges;
     use crate::{CheckpointErrorCode, DType};
     use serde_json::{Value, json};
     use std::fs::{self, File};
@@ -277,6 +369,23 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prefault_ranges_exclude_every_page_touched_by_the_tensor() {
+        let page = 4_096;
+        let ranges =
+            prefault_ranges(10 * page, 2 * page + 17..5 * page + 29, page, 2 * page).unwrap();
+
+        assert_eq!(
+            ranges,
+            vec![0..2 * page, 6 * page..8 * page, 8 * page..10 * page]
+        );
+        assert_eq!(
+            ranges.iter().map(std::ops::Range::len).sum::<usize>(),
+            6 * page
+        );
+    }
 
     fn fixture_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

@@ -88,6 +88,12 @@ impl<A: Arch> CheckpointSnapshot<A> {
         self.tensors.len()
     }
 
+    /// Populates page tables for the immutable base-model shard without copying its bytes.
+    #[cfg(target_os = "linux")]
+    pub fn prefault_model_shard(&self) -> CheckpointResult<usize> {
+        self.model.prefault_except(crate::bindings::EMBEDDING)
+    }
+
     /// Returns a validated source view for an indexed tensor.
     pub fn tensor(&self, name: &str) -> CheckpointResult<TensorView<'_>> {
         match self.shard(name)? {

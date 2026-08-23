@@ -73,7 +73,7 @@ pub struct ResidentModelQualification {
 pub fn qualify_resident_model(
     root: &Path,
 ) -> Result<ResidentModelQualification, ResidentModelQualificationError> {
-    qualify_resident_model_with_mode(root, ResidentLoadMode::Legacy)
+    qualify_resident_model_with_mode(root, ResidentLoadMode::Selective)
 }
 
 fn qualify_resident_model_with_mode(
@@ -97,7 +97,7 @@ fn qualify_resident_model_with_mode(
     let stream = context.new_stream().map_err(GpuError::from)?;
     let mut program = match load_mode {
         ResidentLoadMode::Legacy => {
-            ResidentModelProgram::from_snapshot(&context, snapshot.clone())?
+            ResidentModelProgram::from_snapshot_legacy(&context, snapshot.clone())?
         }
         ResidentLoadMode::Selective => {
             ResidentModelProgram::from_snapshot_selective(&context, snapshot.clone())?
@@ -1413,10 +1413,9 @@ mod tests {
 
     #[test]
     #[ignore = "requires the pinned snapshot and an exclusive SM120 device"]
-    fn selective_loader_matches_final_oracle_and_exact_graph_replay()
+    fn legacy_loader_matches_final_oracle_and_exact_graph_replay()
     -> Result<(), super::ResidentModelQualificationError> {
-        let report =
-            qualify_resident_model_with_mode(&snapshot_root()?, ResidentLoadMode::Selective)?;
+        let report = qualify_resident_model_with_mode(&snapshot_root()?, ResidentLoadMode::Legacy)?;
         assert_complete_report(report);
         Ok(())
     }

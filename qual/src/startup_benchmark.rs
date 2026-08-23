@@ -15,7 +15,7 @@ use tuisko_engine::{ResidentLoadMode, ResidentModelProgram};
 use tuisko_gpu::{CudaContext, GpuError};
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 const DEFAULT_SAMPLES: usize = 3;
 const DEFAULT_WARMUPS: usize = 1;
 const DEFAULT_REPORT: &str = "target/benchmarks/startup/loader-comparison-sm120.json";
@@ -72,6 +72,7 @@ struct StartupSample {
     layout_plan_ms: f64,
     arena_allocation_ms: f64,
     operator_setup_ms: f64,
+    source_prefault_ms: f64,
     weight_prepare_ms: f64,
     source_binding_ms: f64,
     qkv_gather_ms: f64,
@@ -94,6 +95,7 @@ struct StartupSample {
     upload_submissions: usize,
     zeroed_bytes: usize,
     pinned_stager_bytes: usize,
+    prefault_bytes: usize,
     borrowed_source_bytes: usize,
     gathered_source_bytes: usize,
     swizzled_source_bytes: usize,
@@ -243,6 +245,10 @@ impl StartupLoaderReport {
             summarize(
                 "operator_setup",
                 samples.iter().map(|sample| sample.operator_setup_ms),
+            ),
+            summarize(
+                "source_page_prefault",
+                samples.iter().map(|sample| sample.source_prefault_ms),
             ),
             summarize(
                 "weight_host_preparation",
@@ -463,7 +469,7 @@ fn measure_startup(
     let snapshot = snapshot.into();
     let mode = loader.resident_mode();
     let program = match mode {
-        ResidentLoadMode::Legacy => ResidentModelProgram::from_snapshot(&context, snapshot)?,
+        ResidentLoadMode::Legacy => ResidentModelProgram::from_snapshot_legacy(&context, snapshot)?,
         ResidentLoadMode::Selective => {
             ResidentModelProgram::from_snapshot_selective(&context, snapshot)?
         }
@@ -482,6 +488,7 @@ fn measure_startup(
     let layout_plan_ms = nanoseconds_to_milliseconds(load_stats.layout_plan_ns());
     let arena_allocation_ms = nanoseconds_to_milliseconds(load_stats.arena_allocation_ns());
     let operator_setup_ms = nanoseconds_to_milliseconds(load_stats.operator_setup_ns());
+    let source_prefault_ms = nanoseconds_to_milliseconds(load_stats.source_prefault_ns());
     let weight_prepare_ms = nanoseconds_to_milliseconds(load_stats.weight_prepare_ns());
     let source_binding_ms = nanoseconds_to_milliseconds(load_stats.source_binding_ns());
     let qkv_gather_ms = nanoseconds_to_milliseconds(load_stats.qkv_gather_ns());
@@ -516,6 +523,7 @@ fn measure_startup(
         layout_plan_ms,
         arena_allocation_ms,
         operator_setup_ms,
+        source_prefault_ms,
         weight_prepare_ms,
         source_binding_ms,
         qkv_gather_ms,
@@ -538,6 +546,7 @@ fn measure_startup(
         upload_submissions: program.load_stats().upload_submissions(),
         zeroed_bytes: program.load_stats().zeroed_bytes(),
         pinned_stager_bytes: program.load_stats().pinned_stager_bytes(),
+        prefault_bytes: load_stats.prefault_bytes(),
         borrowed_source_bytes: load_stats.borrowed_source_bytes(),
         gathered_source_bytes: load_stats.gathered_source_bytes(),
         swizzled_source_bytes: load_stats.swizzled_source_bytes(),
@@ -575,6 +584,11 @@ fn validate_samples(samples: &[StartupSample]) -> Result<(), DeviceBenchmarkErro
                 "startup timings must all be finite and greater than zero".into(),
             ));
         }
+        if !sample.source_prefault_ms.is_finite() || sample.source_prefault_ms < 0.0 {
+            return Err(DeviceBenchmarkError::Precondition(
+                "source-prefault timing must be finite and non-negative".into(),
+            ));
+        }
         if sample.schema_version != SCHEMA_VERSION
             || sample.loader != first.loader
             || sample.filesystem_cache != first.filesystem_cache
@@ -590,6 +604,7 @@ fn validate_samples(samples: &[StartupSample]) -> Result<(), DeviceBenchmarkErro
             || sample.upload_submissions != first.upload_submissions
             || sample.zeroed_bytes != first.zeroed_bytes
             || sample.pinned_stager_bytes != first.pinned_stager_bytes
+            || sample.prefault_bytes != first.prefault_bytes
             || sample.borrowed_source_bytes != first.borrowed_source_bytes
             || sample.gathered_source_bytes != first.gathered_source_bytes
             || sample.swizzled_source_bytes != first.swizzled_source_bytes
@@ -599,6 +614,19 @@ fn validate_samples(samples: &[StartupSample]) -> Result<(), DeviceBenchmarkErro
                 "fresh-process startup samples disagree on their exact product identity or byte accounting"
                     .into(),
             ));
+        }
+        match sample.loader.as_str() {
+            "legacy" if sample.prefault_bytes != 0 || sample.source_prefault_ms != 0.0 => {
+                return Err(DeviceBenchmarkError::Precondition(
+                    "legacy startup unexpectedly reported source prefaulting".into(),
+                ));
+            }
+            "selective" if sample.prefault_bytes == 0 || sample.source_prefault_ms == 0.0 => {
+                return Err(DeviceBenchmarkError::Precondition(
+                    "selective startup omitted source-prefault accounting".into(),
+                ));
+            }
+            _ => {}
         }
         let classified_weight_bytes = sample
             .borrowed_source_bytes
@@ -689,6 +717,10 @@ fn print_report(report: &StartupBenchmarkReport) {
             sample.gathered_source_bytes as f64 / (1_u64 << 30) as f64,
             sample.swizzled_source_bytes as f64 / (1_u64 << 30) as f64,
             sample.nvfp4_materialize_workers,
+        );
+        eprintln!(
+            "prefaulted: {:.2} GiB of immutable source mapping",
+            sample.prefault_bytes as f64 / (1_u64 << 30) as f64,
         );
         let weight_copy_gib_s =
             sample.upload_bytes as f64 / (1_u64 << 30) as f64 / (sample.weight_copy_ms / 1_000.0);
