@@ -114,7 +114,38 @@ pub fn qualify_fp8_lm_head() -> Result<Fp8LmHeadQualification, Fp8LmHeadQualific
         }
     }
 
+    require_complete_report(&report)?;
+
     Ok(report)
+}
+
+fn require_complete_report(
+    report: &Fp8LmHeadQualification,
+) -> Result<(), Fp8LmHeadQualificationError> {
+    let active_rows = (1..=MAX_BATCH).sum::<usize>();
+    let active_per_run = Qwen38_27B::HIDDEN + 1 + Qwen38_27B::VOCAB;
+    let inactive_per_pass = (0..MAX_BATCH).sum::<usize>() * active_per_run;
+    let expected = Fp8LmHeadQualification {
+        activation_codes: active_rows * Qwen38_27B::HIDDEN,
+        activation_scales: active_rows,
+        output_values: active_rows * Qwen38_27B::VOCAB,
+        graph_replay_values: active_rows * active_per_run,
+        inactive_values: inactive_per_pass * 2,
+        maximum_absolute_error: report.maximum_absolute_error,
+    };
+    if report != &expected {
+        return Err(Fp8LmHeadQualificationError::Mismatch(format!(
+            "incomplete route accounting: observed {report:?}, expected {expected:?}"
+        )));
+    }
+    if report.maximum_absolute_error > 0.0625 {
+        return Err(Fp8LmHeadQualificationError::Mismatch(format!(
+            "maximum absolute error {} exceeds 0.0625",
+            report.maximum_absolute_error
+        )));
+    }
+
+    Ok(())
 }
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {

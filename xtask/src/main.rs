@@ -1873,26 +1873,13 @@ fn qualify_fp8_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn qualify_fp8_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
-        root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "fp8_lm_head",
-            "--include-ignored",
-            "--nocapture",
-        ],
+    build_sm120(root)?;
+    run_visible(
+        Command::new(
+            root.join(CUDA_OXIDE_BUILD_TARGET)
+                .join("release/bench-device"),
+        )
+        .arg("qualify-fp8-lm-head"),
     )?;
     gate_fp8_lm_head(root)
 }
