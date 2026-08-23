@@ -101,6 +101,12 @@ target/benchmarks/perf-smoke/attention-output.json
 Every performance command also executes the release SM120 build and checks the PTX/SASS entry and
 resource inventory before launching the benchmark.
 
+A complete in-process resource sweep compiles the generated SM120 PTX into one shared cubin, parses
+its resource inventory once, and lazily dumps its SASS once. Every suite still independently checks
+its exact entries, launch bounds, registers, stack, local memory, shared memory, and required
+instructions. Reusing the identical compiler artifact removes repeated `ptxas` and `cuobjdump`
+work; it does not turn the suite checks into one aggregate pass.
+
 After owner warmup, the runner sustains the production graph for at least two seconds and applies
 the checked clock-spread policy before collecting the full rotated sample matrix. An unlocked or
 otherwise incomparable device therefore refuses before a long suite spends its timing window.
@@ -380,6 +386,13 @@ cargo run -p xtask -- profile resident-model SNAPSHOT \
 The NCU report diagnoses physical memory transactions, stalls, occupancy, and instruction-pipeline
 use. Its isolated replay duration is not directly comparable with an uninstrumented resident-model
 baseline, and local speedup estimates must not be added across kernels.
+
+Treat occupancy, wave-tail, and excessive-transaction warnings as experiment selectors rather than
+optimization goals. Before a retile, account for the invariant useful rows or warps and every fixed
+per-CTA cost, including staging, barriers, inactive lanes, and tail guards. Making a grid divide the
+SM count evenly can duplicate that work or weaken a branch-free mapping even when reported
+occupancy rises. Direct production timing decides whether to retain the change; before-and-after
+counters support a causal explanation but do not replace that timing.
 
 ## What one timing means
 
