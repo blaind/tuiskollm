@@ -4,11 +4,12 @@ use crate::Sm120Arch;
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract, thread};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
-use tuisko_model::{Arch, Qwen38_27B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 // Compact batching owns one compiled route for every B=1..8.
 const MAX_BATCH: usize = 8;
-// Qualified 512-thread reduction: 16 warps, five packed BF16 pairs per thread.
+// Qualified 512-thread reduction: 16 warps, with five Qwen3.8 or four Qwen3.5
+// packed BF16 pairs per thread and no tail in either exact hidden width.
 const WARPS: usize = 16;
 const THREADS: u32 = (WARPS * 32) as u32;
 
@@ -114,6 +115,69 @@ mod kernels {
         }
     }
 
+    #[inline(always)]
+    fn residual_rms_norm_body<A: Arch, const TOKENS: usize>(
+        residual_input: *const u32,
+        branch: *const u32,
+        weight: *const u32,
+        residual_output: *mut u32,
+        normalized_output: *mut u32,
+        shared: *mut f32,
+    ) {
+        let token = thread::blockIdx_x() as usize;
+        if token >= TOKENS {
+            return;
+        }
+
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_index = tid >> 5;
+        let pairs = A::HIDDEN / 2;
+        // SAFETY: the launch contract requires one complete row per active block.
+        let residual_input = unsafe { residual_input.add(token * pairs) };
+        // SAFETY: the branch plane has the same row coverage.
+        let branch = unsafe { branch.add(token * pairs) };
+        // SAFETY: the two output planes have the same row coverage.
+        let residual_output = unsafe { residual_output.add(token * pairs) };
+        // SAFETY: the two output planes have the same row coverage.
+        let normalized_output = unsafe { normalized_output.add(token * pairs) };
+        let mut sum = 0.0f32;
+        let mut pair = tid;
+
+        while pair < pairs {
+            // SAFETY: both reads are within this block's row.
+            let (xlow, xhigh) = convert::cvt_f32x2_bf16x2(unsafe { *residual_input.add(pair) });
+            // SAFETY: both reads are within this block's row.
+            let (blow, bhigh) = convert::cvt_f32x2_bf16x2(unsafe { *branch.add(pair) });
+            let represented = tcgen05::cvt_f32x2_bf16x2(xlow + blow, xhigh + bhigh);
+            // SAFETY: each thread publishes one disjoint packed BF16 pair.
+            unsafe { *residual_output.add(pair) = represented };
+            let (low, high) = convert::cvt_f32x2_bf16x2(represented);
+            sum = float::fma_rn_f32(low, low, sum);
+            sum = float::fma_rn_f32(high, high, sum);
+            pair += THREADS as usize;
+        }
+
+        sum = block_sum(sum, shared, lane, warp_index);
+        let inverse_rms = float::rsqrt_approx_f32(sum / A::HIDDEN as f32 + A::RMS_NORM_EPSILON);
+        pair = tid;
+
+        while pair < pairs {
+            // SAFETY: the published residual and weights cover a complete row.
+            let (low, high) = convert::cvt_f32x2_bf16x2(unsafe { *residual_output.add(pair) });
+            // SAFETY: the weight plane contains one complete hidden row.
+            let (wlow, whigh) = convert::cvt_f32x2_bf16x2(unsafe { *weight.add(pair) });
+            // SAFETY: each thread writes disjoint packed BF16 pairs.
+            unsafe {
+                *normalized_output.add(pair) = tcgen05::cvt_f32x2_bf16x2(
+                    low * inverse_rms * (1.0 + wlow),
+                    high * inverse_rms * (1.0 + whigh),
+                );
+            }
+            pair += THREADS as usize;
+        }
+    }
+
     /// Normalizes the singleton BF16 row and pins this module's artifact.
     #[kernel]
     #[launch_bounds(512, 2)]
@@ -171,58 +235,66 @@ mod kernels {
     ) {
         static mut WARP_SUM: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
         let shared = core::ptr::addr_of_mut!(WARP_SUM).cast::<f32>();
-        let token = thread::blockIdx_x() as usize;
-        if token >= TOKENS {
-            return;
-        }
 
-        let tid = thread::threadIdx_x() as usize;
-        let lane = tid & 31;
-        let warp_index = tid >> 5;
-        let pairs = A::HIDDEN / 2;
-        // SAFETY: the launch contract requires one complete row per active block.
-        let residual_input = unsafe { residual_input.add(token * pairs) };
-        // SAFETY: the branch plane has the same row coverage.
-        let branch = unsafe { branch.add(token * pairs) };
-        // SAFETY: the two output planes have the same row coverage.
-        let residual_output = unsafe { residual_output.add(token * pairs) };
-        // SAFETY: the two output planes have the same row coverage.
-        let normalized_output = unsafe { normalized_output.add(token * pairs) };
-        let mut sum = 0.0f32;
-        let mut pair = tid;
+        residual_rms_norm_body::<A, TOKENS>(
+            residual_input,
+            branch,
+            weight,
+            residual_output,
+            normalized_output,
+            shared,
+        );
+    }
 
-        while pair < pairs {
-            // SAFETY: both reads are within this block's row.
-            let (xlow, xhigh) = convert::cvt_f32x2_bf16x2(unsafe { *residual_input.add(pair) });
-            // SAFETY: both reads are within this block's row.
-            let (blow, bhigh) = convert::cvt_f32x2_bf16x2(unsafe { *branch.add(pair) });
-            let represented = tcgen05::cvt_f32x2_bf16x2(xlow + blow, xhigh + bhigh);
-            // SAFETY: each thread publishes one disjoint packed BF16 pair.
-            unsafe { *residual_output.add(pair) = represented };
-            let (low, high) = convert::cvt_f32x2_bf16x2(represented);
-            sum = float::fma_rn_f32(low, low, sum);
-            sum = float::fma_rn_f32(high, high, sum);
-            pair += THREADS as usize;
-        }
+    /// Normalizes exact Qwen3.5 BF16 rows with zero-centered weights.
+    #[kernel]
+    #[launch_bounds(512, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (512, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_rms_norm<const TOKENS: usize>(
+        input: *const u32,
+        weight: *const u32,
+        output: *mut u32,
+    ) {
+        static mut WARP_SUM: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
+        let shared = core::ptr::addr_of_mut!(WARP_SUM).cast::<f32>();
 
-        sum = block_sum(sum, shared, lane, warp_index);
-        let inverse_rms = float::rsqrt_approx_f32(sum / A::HIDDEN as f32 + A::RMS_NORM_EPSILON);
-        pair = tid;
+        rms_norm_body::<Qwen35_9B, TOKENS>(input, weight, output, shared);
+    }
 
-        while pair < pairs {
-            // SAFETY: the published residual and weights cover a complete row.
-            let (low, high) = convert::cvt_f32x2_bf16x2(unsafe { *residual_output.add(pair) });
-            // SAFETY: the weight plane contains one complete hidden row.
-            let (wlow, whigh) = convert::cvt_f32x2_bf16x2(unsafe { *weight.add(pair) });
-            // SAFETY: each thread writes disjoint packed BF16 pairs.
-            unsafe {
-                *normalized_output.add(pair) = tcgen05::cvt_f32x2_bf16x2(
-                    low * inverse_rms * (1.0 + wlow),
-                    high * inverse_rms * (1.0 + whigh),
-                );
-            }
-            pair += THREADS as usize;
-        }
+    /// Publishes and normalizes exact Qwen3.5 BF16 residual rows.
+    #[kernel]
+    #[launch_bounds(512, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (512, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_residual_rms_norm<const TOKENS: usize>(
+        residual_input: *const u32,
+        branch: *const u32,
+        weight: *const u32,
+        residual_output: *mut u32,
+        normalized_output: *mut u32,
+    ) {
+        static mut WARP_SUM: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
+        let shared = core::ptr::addr_of_mut!(WARP_SUM).cast::<f32>();
+
+        residual_rms_norm_body::<Qwen35_9B, TOKENS>(
+            residual_input,
+            branch,
+            weight,
+            residual_output,
+            normalized_output,
+            shared,
+        );
     }
 }
 
@@ -356,6 +428,75 @@ impl<A: Arch, const TOKENS: usize> PreparedBatchRoute<A, TOKENS> {
     }
 }
 
+struct PreparedQwen35BatchRoute<const TOKENS: usize> {
+    plain: PreparedLaunch<kernels::__qwen35_rms_norm_CudaKernel<TOKENS>>,
+    residual: PreparedLaunch<kernels::__qwen35_residual_rms_norm_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedQwen35BatchRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let blocks = u32::try_from(TOKENS).map_err(|_| {
+            GpuError::invalid_launch("Qwen3.5 RMSNorm batch exceeds CUDA grid width")
+        })?;
+        let launch = LaunchConfig1D::new(blocks, THREADS, 0);
+        let plain = module
+            .prepare_qwen35_rms_norm::<TOKENS>(launch)
+            .map_err(|source| GpuError::launch("preparing the Qwen3.5 RMSNorm kernel", source))?;
+        let residual = module
+            .prepare_qwen35_residual_rms_norm::<TOKENS>(launch)
+            .map_err(|source| {
+                GpuError::launch("preparing the Qwen3.5 residual RMSNorm kernel", source)
+            })?;
+
+        Ok(Self { plain, residual })
+    }
+
+    unsafe fn launch_plain(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_rms_norm::<TOKENS>(
+                stream,
+                &self.plain,
+                input.cast::<u32>(),
+                weight.cast::<u32>(),
+                output.cast::<u32>(),
+            )
+            .map_err(|source| GpuError::launch("launching the Qwen3.5 RMSNorm kernel", source))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_residual(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        residual_input: *const u16,
+        branch: *const u16,
+        weight: *const u16,
+        residual_output: *mut u16,
+        normalized_output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_residual_rms_norm::<TOKENS>(
+                stream,
+                &self.residual,
+                residual_input.cast::<u32>(),
+                branch.cast::<u32>(),
+                weight.cast::<u32>(),
+                residual_output.cast::<u32>(),
+                normalized_output.cast::<u32>(),
+            )
+            .map_err(|source| {
+                GpuError::launch("launching the Qwen3.5 residual RMSNorm kernel", source)
+            })
+    }
+}
+
 /// PTX symbols retained for both residual-norm families at every exact batch.
 pub(crate) fn residual_norm_ptx_names() -> [&'static str; 16] {
     [
@@ -375,6 +516,28 @@ pub(crate) fn residual_norm_ptx_names() -> [&'static str; 16] {
         kernels::residual_rms_norm_ptx_name::<Qwen38_27B, 6>(),
         kernels::residual_rms_norm_ptx_name::<Qwen38_27B, 7>(),
         kernels::residual_rms_norm_ptx_name::<Qwen38_27B, 8>(),
+    ]
+}
+
+/// PTX symbols retained for Qwen3.5 plain and fused-residual routes.
+pub(crate) fn qwen35_residual_norm_ptx_names() -> [&'static str; 16] {
+    [
+        kernels::qwen35_rms_norm_ptx_name::<1>(),
+        kernels::qwen35_rms_norm_ptx_name::<2>(),
+        kernels::qwen35_rms_norm_ptx_name::<3>(),
+        kernels::qwen35_rms_norm_ptx_name::<4>(),
+        kernels::qwen35_rms_norm_ptx_name::<5>(),
+        kernels::qwen35_rms_norm_ptx_name::<6>(),
+        kernels::qwen35_rms_norm_ptx_name::<7>(),
+        kernels::qwen35_rms_norm_ptx_name::<8>(),
+        kernels::qwen35_residual_rms_norm_ptx_name::<1>(),
+        kernels::qwen35_residual_rms_norm_ptx_name::<2>(),
+        kernels::qwen35_residual_rms_norm_ptx_name::<3>(),
+        kernels::qwen35_residual_rms_norm_ptx_name::<4>(),
+        kernels::qwen35_residual_rms_norm_ptx_name::<5>(),
+        kernels::qwen35_residual_rms_norm_ptx_name::<6>(),
+        kernels::qwen35_residual_rms_norm_ptx_name::<7>(),
+        kernels::qwen35_residual_rms_norm_ptx_name::<8>(),
     ]
 }
 
@@ -507,12 +670,175 @@ impl<A: Sm120Arch> ResidualNormOp<A> {
     }
 }
 
+/// Prepared Qwen3.5 plain and fused-residual RMSNorm routes for exact `B=1..8`.
+pub struct Qwen35ResidualNormOp {
+    module: kernels::LoadedModule,
+    b1: PreparedQwen35BatchRoute<1>,
+    b2: PreparedQwen35BatchRoute<2>,
+    b3: PreparedQwen35BatchRoute<3>,
+    b4: PreparedQwen35BatchRoute<4>,
+    b5: PreparedQwen35BatchRoute<5>,
+    b6: PreparedQwen35BatchRoute<6>,
+    b7: PreparedQwen35BatchRoute<7>,
+    b8: PreparedQwen35BatchRoute<8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Qwen35BatchRoute {
+    B1,
+    B2,
+    B3,
+    B4,
+    B5,
+    B6,
+    B7,
+    B8,
+}
+
+fn qwen35_batch_route(batch: usize) -> Option<Qwen35BatchRoute> {
+    match batch {
+        1 => Some(Qwen35BatchRoute::B1),
+        2 => Some(Qwen35BatchRoute::B2),
+        3 => Some(Qwen35BatchRoute::B3),
+        4 => Some(Qwen35BatchRoute::B4),
+        5 => Some(Qwen35BatchRoute::B5),
+        6 => Some(Qwen35BatchRoute::B6),
+        7 => Some(Qwen35BatchRoute::B7),
+        8 => Some(Qwen35BatchRoute::B8),
+        _ => None,
+    }
+}
+
+impl Qwen35ResidualNormOp {
+    /// Loads the embedded SM120 module and prepares every exact Qwen3.5 route.
+    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        let geometry = residual_norm_geometry::<Qwen35_9B>().ok_or_else(|| {
+            GpuError::invalid_launch("Qwen3.5 RMSNorm requires a positive even hidden width")
+        })?;
+        if geometry.pairs_per_thread * THREADS as usize != geometry.pairs_per_row {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 RMSNorm requires an exact packed-pair/thread mapping",
+            ));
+        }
+        let _ = qwen35_residual_norm_ptx_names();
+        // SAFETY: this crate owns one cuda-oxide module and its embedded artifact.
+        let module = unsafe { kernels::load(context) }
+            .map_err(|source| GpuError::module("loading the residual-norm module", source))?;
+
+        Ok(Self {
+            b1: PreparedQwen35BatchRoute::prepare(&module)?,
+            b2: PreparedQwen35BatchRoute::prepare(&module)?,
+            b3: PreparedQwen35BatchRoute::prepare(&module)?,
+            b4: PreparedQwen35BatchRoute::prepare(&module)?,
+            b5: PreparedQwen35BatchRoute::prepare(&module)?,
+            b6: PreparedQwen35BatchRoute::prepare(&module)?,
+            b7: PreparedQwen35BatchRoute::prepare(&module)?,
+            b8: PreparedQwen35BatchRoute::prepare(&module)?,
+            module,
+        })
+    }
+
+    /// Launches plain zero-centered RMSNorm for exactly `batch` rows.
+    ///
+    /// # Safety
+    ///
+    /// Pointers must be four-byte aligned and cover complete 4,096-value rows.
+    /// Allocations must belong to `stream`'s context, remain live through stream
+    /// completion, and input and output must not overlap.
+    pub unsafe fn launch_plain(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($route:ident) => {
+                // SAFETY: the public method's pointer contract is unchanged by dispatch.
+                unsafe {
+                    self.$route
+                        .launch_plain(&self.module, stream, input, weight, output)
+                }
+            };
+        }
+
+        match qwen35_batch_route(batch) {
+            Some(Qwen35BatchRoute::B1) => launch!(b1),
+            Some(Qwen35BatchRoute::B2) => launch!(b2),
+            Some(Qwen35BatchRoute::B3) => launch!(b3),
+            Some(Qwen35BatchRoute::B4) => launch!(b4),
+            Some(Qwen35BatchRoute::B5) => launch!(b5),
+            Some(Qwen35BatchRoute::B6) => launch!(b6),
+            Some(Qwen35BatchRoute::B7) => launch!(b7),
+            Some(Qwen35BatchRoute::B8) => launch!(b8),
+            None => Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 RMSNorm batch {batch} is outside the exact range 1..={MAX_BATCH}"
+            ))),
+        }
+    }
+
+    /// Publishes BF16 residual sums and normalizes the represented rows.
+    ///
+    /// # Safety
+    ///
+    /// Pointers must be four-byte aligned. Row planes must cover
+    /// `batch * 4,096` BF16 values and `weight` must cover 4,096 values.
+    /// Allocations must belong to `stream`'s context, remain live through
+    /// completion, and not overlap except that the two input planes may alias.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_residual(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        residual_input: *const u16,
+        branch: *const u16,
+        weight: *const u16,
+        residual_output: *mut u16,
+        normalized_output: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($route:ident) => {
+                // SAFETY: the public method's pointer contract is unchanged by dispatch.
+                unsafe {
+                    self.$route.launch_residual(
+                        &self.module,
+                        stream,
+                        residual_input,
+                        branch,
+                        weight,
+                        residual_output,
+                        normalized_output,
+                    )
+                }
+            };
+        }
+
+        match qwen35_batch_route(batch) {
+            Some(Qwen35BatchRoute::B1) => launch!(b1),
+            Some(Qwen35BatchRoute::B2) => launch!(b2),
+            Some(Qwen35BatchRoute::B3) => launch!(b3),
+            Some(Qwen35BatchRoute::B4) => launch!(b4),
+            Some(Qwen35BatchRoute::B5) => launch!(b5),
+            Some(Qwen35BatchRoute::B6) => launch!(b6),
+            Some(Qwen35BatchRoute::B7) => launch!(b7),
+            Some(Qwen35BatchRoute::B8) => launch!(b8),
+            None => Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 residual RMSNorm batch {batch} is outside the exact range 1..={MAX_BATCH}"
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, THREADS, WARPS, residual_norm_geometry, residual_norm_ptx_names};
+    use super::{
+        MAX_BATCH, Qwen35BatchRoute, THREADS, WARPS, qwen35_batch_route,
+        qwen35_residual_norm_ptx_names, residual_norm_geometry, residual_norm_ptx_names,
+    };
     use crate::test_arch::TestArch;
     use std::collections::BTreeSet;
-    use tuisko_model::{Arch, Qwen38_27B};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
     #[test]
     fn exact_geometry_is_pair_and_cta_aligned() {
@@ -527,10 +853,13 @@ mod tests {
     #[test]
     fn geometry_flows_from_the_architecture() {
         let qwen = residual_norm_geometry::<Qwen38_27B>().unwrap();
+        let qwen35 = residual_norm_geometry::<Qwen35_9B>().unwrap();
         let test = residual_norm_geometry::<TestArch>().unwrap();
 
         assert_eq!(qwen.pairs_per_row, 2_560);
         assert_eq!(qwen.pairs_per_thread, 5);
+        assert_eq!(qwen35.pairs_per_row, 2_048);
+        assert_eq!(qwen35.pairs_per_thread, 4);
         assert_eq!(test.pairs_per_row, 512);
         assert_eq!(test.pairs_per_thread, 1);
     }
@@ -542,5 +871,35 @@ mod tests {
 
         assert_eq!(names.len(), 2 * MAX_BATCH);
         assert_eq!(unique.len(), names.len());
+    }
+
+    #[test]
+    fn qwen35_ptx_inventory_has_two_distinct_entries_per_batch() {
+        let qwen38 = residual_norm_ptx_names();
+        let qwen35 = qwen35_residual_norm_ptx_names();
+        let unique = qwen38.into_iter().chain(qwen35).collect::<BTreeSet<_>>();
+
+        assert_eq!(qwen35.len(), 2 * MAX_BATCH);
+        assert_eq!(unique.len(), qwen38.len() + qwen35.len());
+    }
+
+    #[test]
+    fn qwen35_batch_routing_is_exact() {
+        assert_eq!(qwen35_batch_route(0), None);
+        assert_eq!(
+            (1..=MAX_BATCH).map(qwen35_batch_route).collect::<Vec<_>>(),
+            vec![
+                Some(Qwen35BatchRoute::B1),
+                Some(Qwen35BatchRoute::B2),
+                Some(Qwen35BatchRoute::B3),
+                Some(Qwen35BatchRoute::B4),
+                Some(Qwen35BatchRoute::B5),
+                Some(Qwen35BatchRoute::B6),
+                Some(Qwen35BatchRoute::B7),
+                Some(Qwen35BatchRoute::B8),
+            ]
+        );
+        assert_eq!(qwen35_batch_route(MAX_BATCH + 1), None);
+        assert_eq!(qwen35_batch_route(usize::MAX), None);
     }
 }

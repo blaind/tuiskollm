@@ -246,9 +246,13 @@ pub use resident_model_benchmark::{
     ResidentModelProfileManifest, ResidentProfileStage, benchmark_resident_long_context_model,
     benchmark_resident_model, profile_resident_model,
 };
+#[cfg(feature = "device")]
+pub use residual_norm::qualify_qwen35_residual_norm;
 pub use residual_norm::{
     ResidualNormQualification, ResidualNormQualificationError, qualify_residual_norm,
 };
+#[cfg(feature = "device")]
+pub use residual_norm_benchmark::benchmark_qwen35_residual_norm;
 pub use residual_norm_benchmark::benchmark_residual_norm;
 #[cfg(feature = "device")]
 pub use startup_benchmark::run_startup_benchmark_cli;

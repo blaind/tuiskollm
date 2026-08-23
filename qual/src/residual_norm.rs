@@ -1,10 +1,13 @@
 //! Numerical and graph qualification for the exact residual-norm routes.
 
+#[cfg(feature = "device")]
+use crate::target::Qwen35ResidualNormOp;
 use crate::target::{EXPECTED_COMPUTE_CAPABILITY, ResidualNormOp};
+use std::sync::Arc;
 use tuisko_gpu::{
-    ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
+    ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
 };
-use tuisko_model::{Arch, Qwen38_27B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const ALIGNMENT: usize = 256;
@@ -57,9 +60,126 @@ struct Regions {
     normalized: ArenaRegion<u16>,
 }
 
+pub(crate) trait ResidualNormLauncher {
+    unsafe fn launch_plain(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_residual(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        residual_input: *const u16,
+        branch: *const u16,
+        weight: *const u16,
+        residual_output: *mut u16,
+        normalized_output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+impl ResidualNormLauncher for ResidualNormOp {
+    unsafe fn launch_plain(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        // SAFETY: this adapter preserves the operator's pointer contract.
+        unsafe { ResidualNormOp::launch_plain(self, stream, batch, input, weight, output) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_residual(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        residual_input: *const u16,
+        branch: *const u16,
+        weight: *const u16,
+        residual_output: *mut u16,
+        normalized_output: *mut u16,
+    ) -> GpuResult<()> {
+        // SAFETY: this adapter preserves the operator's pointer contract.
+        unsafe {
+            ResidualNormOp::launch_residual(
+                self,
+                stream,
+                batch,
+                residual_input,
+                branch,
+                weight,
+                residual_output,
+                normalized_output,
+            )
+        }
+    }
+}
+
+#[cfg(feature = "device")]
+impl ResidualNormLauncher for Qwen35ResidualNormOp {
+    unsafe fn launch_plain(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        // SAFETY: this adapter preserves the operator's pointer contract.
+        unsafe { Qwen35ResidualNormOp::launch_plain(self, stream, batch, input, weight, output) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_residual(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        residual_input: *const u16,
+        branch: *const u16,
+        weight: *const u16,
+        residual_output: *mut u16,
+        normalized_output: *mut u16,
+    ) -> GpuResult<()> {
+        // SAFETY: this adapter preserves the operator's pointer contract.
+        unsafe {
+            Qwen35ResidualNormOp::launch_residual(
+                self,
+                stream,
+                batch,
+                residual_input,
+                branch,
+                weight,
+                residual_output,
+                normalized_output,
+            )
+        }
+    }
+}
+
 /// Qualifies eager and captured exact `B=1..8` execution on device zero.
 pub fn qualify_residual_norm() -> Result<ResidualNormQualification, ResidualNormQualificationError>
 {
+    qualify_target::<Qwen38_27B, ResidualNormOp>(ResidualNormOp::new)
+}
+
+/// Qualifies the exact Qwen3.5 4,096-wide routes on SM120 device zero.
+#[cfg(feature = "device")]
+pub fn qualify_qwen35_residual_norm()
+-> Result<ResidualNormQualification, ResidualNormQualificationError> {
+    qualify_target::<Qwen35_9B, Qwen35ResidualNormOp>(Qwen35ResidualNormOp::new)
+}
+
+fn qualify_target<A: Arch, O: ResidualNormLauncher>(
+    prepare: fn(&Arc<CudaContext>) -> GpuResult<O>,
+) -> Result<ResidualNormQualification, ResidualNormQualificationError> {
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
     if capability != EXPECTED_COMPUTE_CAPABILITY {
@@ -73,22 +193,22 @@ pub fn qualify_residual_norm() -> Result<ResidualNormQualification, ResidualNorm
     }
 
     let stream = context.new_stream().map_err(GpuError::from)?;
-    let (layout, regions) = layout()?;
+    let (layout, regions) = layout::<A>()?;
     let arena = DeviceArena::zeroed(&stream, &layout)?;
-    let op = ResidualNormOp::new(&context)?;
-    let elements = MAX_BATCH * Qwen38_27B::HIDDEN;
+    let op = prepare(&context)?;
+    let elements = MAX_BATCH * A::HIDDEN;
     let input = (0..elements)
         .map(|index| {
             f32_to_bf16(
-                INPUT_PATTERN[(index + index / Qwen38_27B::HIDDEN) & 15]
-                    * (1.0 - (index / Qwen38_27B::HIDDEN) as f32 * 0.03125),
+                INPUT_PATTERN[(index + index / A::HIDDEN) & 15]
+                    * (1.0 - (index / A::HIDDEN) as f32 * 0.03125),
             )
         })
         .collect::<Vec<_>>();
     let branch = (0..elements)
-        .map(|index| f32_to_bf16(BRANCH_PATTERN[(index * 3 + index / Qwen38_27B::HIDDEN) & 7]))
+        .map(|index| f32_to_bf16(BRANCH_PATTERN[(index * 3 + index / A::HIDDEN) & 7]))
         .collect::<Vec<_>>();
-    let weight = (0..Qwen38_27B::HIDDEN)
+    let weight = (0..A::HIDDEN)
         .map(|index| f32_to_bf16(WEIGHT_PATTERN[index & 7]))
         .collect::<Vec<_>>();
 
@@ -109,7 +229,7 @@ pub fn qualify_residual_norm() -> Result<ResidualNormQualification, ResidualNorm
         reset_outputs(&arena, &stream, regions)?;
         launch_all(&op, &arena, &stream, regions, batch)?;
         let eager = read_outputs(&arena, &stream, regions)?;
-        verify_eager(batch, &input, &branch, &weight, &eager, &mut report)?;
+        verify_eager::<A>(batch, &input, &branch, &weight, &eager, &mut report)?;
 
         reset_outputs(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
@@ -118,7 +238,7 @@ pub fn qualify_residual_norm() -> Result<ResidualNormQualification, ResidualNorm
         graph.launch(&stream)?;
         graph.launch(&stream)?;
         let replay = read_outputs(&arena, &stream, regions)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay::<A>(batch, &eager, &replay, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(ResidualNormQualificationError::Mismatch(format!(
@@ -130,12 +250,12 @@ pub fn qualify_residual_norm() -> Result<ResidualNormQualification, ResidualNorm
     Ok(report)
 }
 
-fn layout() -> GpuResult<(ArenaLayout, Regions)> {
+fn layout<A: Arch>() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let rows = MAX_BATCH * Qwen38_27B::HIDDEN;
+    let rows = MAX_BATCH * A::HIDDEN;
     let input = layout.reserve(rows, ALIGNMENT)?;
     let branch = layout.reserve(rows, ALIGNMENT)?;
-    let weight = layout.reserve(Qwen38_27B::HIDDEN, ALIGNMENT)?;
+    let weight = layout.reserve(A::HIDDEN, ALIGNMENT)?;
     let plain = layout.reserve(rows, ALIGNMENT)?;
     let residual = layout.reserve(rows, ALIGNMENT)?;
     let normalized = layout.reserve(rows, ALIGNMENT)?;
@@ -174,8 +294,8 @@ fn reset_outputs(
     arena.fill(stream, regions.normalized, 0xa5)
 }
 
-fn launch_all(
-    op: &ResidualNormOp,
+fn launch_all<O: ResidualNormLauncher>(
+    op: &O,
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
@@ -210,7 +330,7 @@ fn read_outputs(
     ))
 }
 
-fn verify_eager(
+fn verify_eager<A: Arch>(
     batch: usize,
     input: &[u16],
     branch: &[u16],
@@ -218,19 +338,19 @@ fn verify_eager(
     observed: &OutputPlanes,
     report: &mut ResidualNormQualification,
 ) -> Result<(), ResidualNormQualificationError> {
-    let hidden = Qwen38_27B::HIDDEN;
+    let hidden = A::HIDDEN;
     let active = batch * hidden;
 
     for token in 0..batch {
         let begin = token * hidden;
         let end = begin + hidden;
-        let plain_oracle = rms_norm_oracle::<Qwen38_27B>(&input[begin..end], weight);
+        let plain_oracle = rms_norm_oracle::<A>(&input[begin..end], weight);
         let residual_oracle = input[begin..end]
             .iter()
             .zip(&branch[begin..end])
             .map(|(&value, &branch)| f32_to_bf16(bf16_to_f32(value) + bf16_to_f32(branch)))
             .collect::<Vec<_>>();
-        let normalized_oracle = rms_norm_oracle::<Qwen38_27B>(&residual_oracle, weight);
+        let normalized_oracle = rms_norm_oracle::<A>(&residual_oracle, weight);
 
         for column in 0..hidden {
             let index = begin + column;
@@ -261,7 +381,7 @@ fn verify_eager(
         }
     }
 
-    verify_inactive(batch, observed)?;
+    verify_inactive::<A>(batch, observed)?;
     report.plain_values += active;
     report.residual_values += active;
     report.normalized_values += active;
@@ -270,7 +390,7 @@ fn verify_eager(
     Ok(())
 }
 
-fn verify_replay(
+fn verify_replay<A: Arch>(
     batch: usize,
     eager: &OutputPlanes,
     replay: &OutputPlanes,
@@ -293,18 +413,18 @@ fn verify_replay(
         }
     }
 
-    verify_inactive(batch, replay)?;
-    report.graph_replay_values += batch * Qwen38_27B::HIDDEN * 3;
-    report.inactive_values += (MAX_BATCH - batch) * Qwen38_27B::HIDDEN * 3;
+    verify_inactive::<A>(batch, replay)?;
+    report.graph_replay_values += batch * A::HIDDEN * 3;
+    report.inactive_values += (MAX_BATCH - batch) * A::HIDDEN * 3;
 
     Ok(())
 }
 
-fn verify_inactive(
+fn verify_inactive<A: Arch>(
     batch: usize,
     observed: &OutputPlanes,
 ) -> Result<(), ResidualNormQualificationError> {
-    let active = batch * Qwen38_27B::HIDDEN;
+    let active = batch * A::HIDDEN;
     for (name, plane) in [
         ("plain", &observed.0),
         ("residual", &observed.1),
@@ -384,8 +504,10 @@ fn bf16_to_f32(bits: u16) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "device")]
+    use super::qualify_qwen35_residual_norm;
     use super::{
-        MAX_BATCH, Qwen38_27B, ResidualNormQualificationError, bf16_to_f32, f32_to_bf16,
+        MAX_BATCH, Qwen35_9B, Qwen38_27B, ResidualNormQualificationError, bf16_to_f32, f32_to_bf16,
         qualify_residual_norm,
     };
     use tuisko_model::Arch;
@@ -406,6 +528,25 @@ mod tests {
         let report = qualify_residual_norm()?;
         let active_per_plane = (1..=MAX_BATCH).sum::<usize>() * Qwen38_27B::HIDDEN;
         let inactive_per_run = (0..MAX_BATCH).sum::<usize>() * Qwen38_27B::HIDDEN * 3;
+
+        assert_eq!(report.plain_values, active_per_plane);
+        assert_eq!(report.residual_values, active_per_plane);
+        assert_eq!(report.normalized_values, active_per_plane);
+        assert_eq!(report.graph_replay_values, active_per_plane * 3);
+        assert_eq!(report.inactive_values, inactive_per_run * 2);
+        assert!(report.maximum_absolute_error <= 0.015625);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "device")]
+    #[test]
+    #[ignore = "requires an exclusive RTX 5090"]
+    fn qwen35_exact_batches_match_independent_oracles_and_graph_replay()
+    -> Result<(), ResidualNormQualificationError> {
+        let report = qualify_qwen35_residual_norm()?;
+        let active_per_plane = (1..=MAX_BATCH).sum::<usize>() * Qwen35_9B::HIDDEN;
+        let inactive_per_run = (0..MAX_BATCH).sum::<usize>() * Qwen35_9B::HIDDEN * 3;
 
         assert_eq!(report.plain_values, active_per_plane);
         assert_eq!(report.residual_values, active_per_plane);
