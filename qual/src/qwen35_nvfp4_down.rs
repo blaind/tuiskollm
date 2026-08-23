@@ -75,6 +75,8 @@ pub fn qualify_qwen35_nvfp4_down() -> Result<Nvfp4DownQualification, Nvfp4DownQu
     arena.copy_from_host(&stream, regions.weight_scales, &fixture.weight_scales)?;
     let stable_addresses = addresses(&arena, regions)?;
     let mut report = Nvfp4DownQualification {
+        activation_codes: 0,
+        activation_scales: 0,
         output_values: 0,
         graph_replay_values: 0,
         inactive_values: 0,

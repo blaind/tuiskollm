@@ -1,4 +1,4 @@
-//! Paired timings for every exact SM120 NVFP4 A16 down projection route.
+//! Paired timings for every exact SM120 NVFP4 down projection route.
 
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
@@ -15,22 +15,27 @@ use tuisko_kernels_sm120::Nvfp4DownOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const ALIGNMENT: usize = 256;
 const INPUT_COLUMNS: usize = Qwen38_27B::INTERMEDIATE;
 const OUTPUT_ROWS: usize = Qwen38_27B::HIDDEN;
 const GROUP: usize = 16;
 const GROUPS_PER_ROW: usize = INPUT_COLUMNS / GROUP;
 const CODE_BYTES_PER_ROW: usize = INPUT_COLUMNS / 2;
+const INPUT_SCALE_DIVISOR: f32 = 3.0;
 const WEIGHT_SCALE_DIVISOR: f32 = 0.125;
 const INPUT_PATTERN: [f32; GROUP] = [
     0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0, 0.5,
     -0.5,
 ];
-const TOKEN_FACTORS: [f32; MAX_BATCH] = [1.0, 0.5, 0.25, 0.125, 1.0, 0.5, 0.25, 0.125];
+const TOKEN_FACTORS: [f32; MAX_BATCH] = [1.0, 0.5, 0.25, 0.125, -1.0, -0.5, -0.25, -0.125];
 
 #[derive(Clone, Copy)]
 struct Regions {
     input: ArenaRegion<u16>,
+    activation_codes: ArenaRegion<u8>,
+    activation_scales: ArenaRegion<u8>,
     weight_codes: ArenaRegion<u8>,
     weight_scales: ArenaRegion<u8>,
     output: ArenaRegion<u16>,
@@ -42,18 +47,24 @@ impl Regions {
     }
 
     fn payload_bytes(self) -> usize {
-        self.input.byte_len() + self.weight_bytes() + self.output.byte_len()
+        self.input.byte_len()
+            + self.activation_codes.byte_len()
+            + self.activation_scales.byte_len()
+            + self.weight_bytes()
+            + self.output.byte_len()
     }
 }
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
 
 struct Addresses {
     input: *const u16,
+    activation_codes: *mut u8,
+    activation_scales: *mut u8,
     weight_codes: *const u8,
     weight_scales: *const u8,
     output: *mut u16,
@@ -91,17 +102,19 @@ impl Session {
         let op = Nvfp4DownOp::new(&context)?;
         let addresses = Addresses {
             input: arena.address(regions.input)?,
+            activation_codes: arena.address(regions.activation_codes)?,
+            activation_scales: arena.address(regions.activation_scales)?,
             weight_codes: arena.address(regions.weight_codes)?,
             weight_scales: arena.address(regions.weight_scales)?,
             output: arena.address(regions.output)?,
         };
-        let mut routes = Vec::with_capacity(MAX_BATCH);
-        for batch in 1..=MAX_BATCH {
+        let mut routes = Vec::with_capacity(EXACT_ROUTES.len());
+        for rows in EXACT_ROUTES {
             routes.push(capture_route(
                 &op,
                 &stream,
                 &addresses,
-                batch,
+                rows,
                 repeated_operations,
             )?);
         }
@@ -131,15 +144,22 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
-                    "nvfp4_down/a16",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
+                    "nvfp4_down/production",
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
                     &route.leaf,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 )
@@ -154,15 +174,19 @@ impl Session {
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let input = layout.reserve(MAX_BATCH * INPUT_COLUMNS, ALIGNMENT)?;
+    let input = layout.reserve(MAX_ROWS * INPUT_COLUMNS, ALIGNMENT)?;
+    let activation_codes = layout.reserve(MAX_ROWS * CODE_BYTES_PER_ROW, ALIGNMENT)?;
+    let activation_scales = layout.reserve(MAX_ROWS * GROUPS_PER_ROW, ALIGNMENT)?;
     let weight_codes = layout.reserve(OUTPUT_ROWS * CODE_BYTES_PER_ROW, ALIGNMENT)?;
     let weight_scales = layout.reserve(OUTPUT_ROWS * GROUPS_PER_ROW, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * OUTPUT_ROWS, ALIGNMENT)?;
+    let output = layout.reserve(MAX_ROWS * OUTPUT_ROWS, ALIGNMENT)?;
 
     Ok((
         layout,
         Regions {
             input,
+            activation_codes,
+            activation_scales,
             weight_codes,
             weight_scales,
             output,
@@ -171,10 +195,10 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
 }
 
 fn make_input() -> Vec<u16> {
-    (0..MAX_BATCH * INPUT_COLUMNS)
+    (0..MAX_ROWS * INPUT_COLUMNS)
         .map(|index| {
             let token = index / INPUT_COLUMNS;
-            f32_to_bf16(INPUT_PATTERN[index & (GROUP - 1)] * TOKEN_FACTORS[token])
+            f32_to_bf16(INPUT_PATTERN[index & (GROUP - 1)] * TOKEN_FACTORS[token & 7])
         })
         .collect()
 }
@@ -244,20 +268,20 @@ fn capture_route(
     op: &Nvfp4DownOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, batch))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, batch)?;
+            launch(op, stream, addresses, rows)?;
         }
 
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
         leaf,
         repeated,
     })
@@ -267,28 +291,48 @@ fn launch(
     op: &Nvfp4DownOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     // SAFETY: every pointer names its complete, aligned maximum-batch region.
     unsafe {
-        op.launch(
-            stream,
-            batch,
-            addresses.input,
-            addresses.weight_codes,
-            addresses.weight_scales,
-            WEIGHT_SCALE_DIVISOR,
-            addresses.output,
-        )
+        if rows <= MAX_BATCH {
+            op.launch(
+                stream,
+                rows,
+                addresses.input,
+                addresses.weight_codes,
+                addresses.weight_scales,
+                WEIGHT_SCALE_DIVISOR,
+                addresses.output,
+            )
+        } else {
+            op.launch_prefill(
+                stream,
+                rows,
+                addresses.input,
+                addresses.activation_codes,
+                addresses.activation_scales,
+                addresses.weight_codes,
+                addresses.weight_scales,
+                INPUT_SCALE_DIVISOR,
+                WEIGHT_SCALE_DIVISOR,
+                addresses.output,
+            )
+        }
     }
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(rows: usize) -> usize {
     let weights = OUTPUT_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
-    let input = batch * INPUT_COLUMNS * size_of::<u16>();
-    let output = batch * OUTPUT_ROWS * size_of::<u16>();
+    let input = rows * INPUT_COLUMNS * size_of::<u16>();
+    let output = rows * OUTPUT_ROWS * size_of::<u16>();
+    let scratch = if rows > MAX_BATCH {
+        2 * rows * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW)
+    } else {
+        0
+    };
 
-    weights + input + output
+    weights + input + output + scratch
 }
 
 fn f32_to_bf16(value: f32) -> u16 {
@@ -319,7 +363,7 @@ pub fn benchmark_nvfp4_down(
         "nvfp4_down/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes - padding_bytes,
-        "max_batch=8",
+        "max_rows=1024 activation quantization and output seams",
     )?;
     memory.register_owned(
         "nvfp4_down/alignment_padding",
@@ -340,7 +384,7 @@ pub fn benchmark_nvfp4_down(
         BenchmarkReportSpec {
             suite: "bench-nvfp4-down",
             classification: "performance_sensitive_leaf",
-            timing_scope: "paired Rust submission/completion, repeated leaf graph, and repeated-operation graph",
+            timing_scope: "paired Rust submission/completion, repeated production graph, and repeated-operation graph",
         },
         preflight,
         baseline_sha256,
@@ -355,26 +399,33 @@ pub fn benchmark_nvfp4_down(
 #[cfg(test)]
 mod tests {
     use super::{
-        CODE_BYTES_PER_ROW, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_BATCH, OUTPUT_ROWS, layout,
-        logical_bytes,
+        CODE_BYTES_PER_ROW, EXACT_ROUTES, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_ROWS, OUTPUT_ROWS,
+        layout, logical_bytes,
     };
 
     #[test]
-    fn byte_accounting_covers_the_complete_a16_path() {
+    fn byte_accounting_tracks_the_selected_production_schedule() {
         let weights = OUTPUT_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
-        let b8 = weights
-            + MAX_BATCH * (INPUT_COLUMNS * size_of::<u16>() + OUTPUT_ROWS * size_of::<u16>());
+        let a16_b2 =
+            weights + 2 * (INPUT_COLUMNS * size_of::<u16>() + OUTPUT_ROWS * size_of::<u16>());
+        let w4a4_t1024 = weights
+            + MAX_ROWS
+                * (INPUT_COLUMNS * size_of::<u16>()
+                    + OUTPUT_ROWS * size_of::<u16>()
+                    + 2 * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW));
 
-        assert_eq!(logical_bytes(MAX_BATCH), b8);
+        assert_eq!(logical_bytes(2), a16_b2);
+        assert_eq!(logical_bytes(MAX_ROWS), w4a4_t1024);
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
     }
 
     #[test]
     fn arena_accounting_exposes_every_owned_byte() {
         let (layout, regions) = layout().unwrap();
 
-        assert_eq!(layout.byte_len(), 50_495_488);
+        assert_eq!(layout.byte_len(), 106_299_392);
         assert_eq!(regions.weight_bytes(), 50_135_040);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 360_448);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 56_164_352);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 0);
     }
 }
