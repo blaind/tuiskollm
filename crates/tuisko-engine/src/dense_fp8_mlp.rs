@@ -1,16 +1,26 @@
 //! Resident source-backed dense-FP8 MLP program.
 
+use crate::dense_fp8_mlp_layout::MAX_ROWS;
 use crate::{DenseFp8MlpLayout, EngineError, EngineResult, MAX_BATCH};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
-use tuisko_kernels_sm120::{DenseFp8DownOp, DenseFp8SwiGluOp, ResidualNormOp, Sm120Arch};
+use tuisko_kernels_sm120::{
+    DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps, ResidualNormOp,
+    Sm120Arch,
+};
 use tuisko_model::{CheckpointSnapshot, DenseFp8MlpBindings, Qwen38_27B};
 
-/// One late-layer dense-FP8 MLP with immutable exact-batch graph routes.
+/// One late-layer dense-FP8 MLP with immutable exact decode and prefill graphs.
 pub struct DenseFp8MlpProgram<A: Sm120Arch = Qwen38_27B> {
     // Drop graphs before the arena and loaded modules whose handles they retain.
     graphs: [CudaGraph; MAX_BATCH],
+    prefill_graphs: [CudaGraph; 4],
+    // Captured TMA launches retain these address-bound descriptor allocations.
+    #[allow(dead_code)]
+    gate_up_maps: DenseFp8SwiGluTmaMaps,
+    #[allow(dead_code)]
+    down_maps: DenseFp8DownTmaMaps,
     arena: DeviceArena,
     _norm: ResidualNormOp<A>,
     _swiglu: DenseFp8SwiGluOp<A>,
@@ -89,7 +99,7 @@ impl Pointers {
 }
 
 impl<A: Sm120Arch> DenseFp8MlpProgram<A> {
-    /// Loads one admitted layer, allocates one arena, and captures B=1..8.
+    /// Loads one admitted layer, allocates one arena, and captures all exact routes.
     pub fn from_snapshot(
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<A>>,
@@ -135,11 +145,47 @@ impl<A: Sm120Arch> DenseFp8MlpProgram<A> {
         )?;
 
         let pointers = Pointers::bind(&arena, &layout)?;
+        // SAFETY: the owner arena keeps all encoded source addresses stable.
+        let gate_up_maps = unsafe {
+            DenseFp8SwiGluTmaMaps::new(
+                &stream,
+                pointers.gate_up_activation_codes.cast_const(),
+                pointers.gate_up_weight_codes,
+            )?
+        };
+        // SAFETY: the owner arena keeps all encoded source addresses stable.
+        let down_maps = unsafe {
+            DenseFp8DownTmaMaps::new(
+                &stream,
+                pointers.down_activation_codes.cast_const(),
+                pointers.down_weight_codes,
+            )?
+        };
         let base_address = arena.base_address();
-        let graphs = capture_routes(&stream, &norm, &swiglu, &down, pointers)?;
+        let graphs = capture_decode_routes(
+            &stream,
+            &norm,
+            &swiglu,
+            &down,
+            &gate_up_maps,
+            &down_maps,
+            pointers,
+        )?;
+        let prefill_graphs = capture_prefill_routes(
+            &stream,
+            &norm,
+            &swiglu,
+            &down,
+            &gate_up_maps,
+            &down_maps,
+            pointers,
+        )?;
 
         Ok(Self {
             graphs,
+            prefill_graphs,
+            gate_up_maps,
+            down_maps,
             arena,
             _norm: norm,
             _swiglu: swiglu,
@@ -153,18 +199,18 @@ impl<A: Sm120Arch> DenseFp8MlpProgram<A> {
         })
     }
 
-    /// Uploads exactly `batch` BF16 residual rows into stable input storage.
+    /// Uploads one exact decode or prefill width into stable input storage.
     pub fn load_residual(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         values: &[u16],
     ) -> EngineResult<()> {
-        require_batch(batch)?;
-        let expected = checked_product("dense-FP8 MLP input elements", batch, A::HIDDEN)?;
+        require_rows(rows)?;
+        let expected = checked_product("dense-FP8 MLP input elements", rows, A::HIDDEN)?;
         if values.len() != expected {
             return Err(EngineError::layout(format!(
-                "dense-FP8 MLP input has {} values, expected {expected} for B={batch}",
+                "dense-FP8 MLP input has {} values, expected {expected} for rows={rows}",
                 values.len()
             )));
         }
@@ -174,18 +220,17 @@ impl<A: Sm120Arch> DenseFp8MlpProgram<A> {
         Ok(())
     }
 
-    /// Replays the immutable graph for one exact batch.
-    pub fn replay(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
-        self.graphs[batch - 1].launch(stream)?;
+    /// Replays the immutable graph for one exact decode or prefill width.
+    pub fn replay(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        self.graph(rows)?.launch(stream)?;
 
         Ok(())
     }
 
     /// Reads active BF16 residual output rows.
-    pub fn read_residual(&self, stream: &CudaStream, batch: usize) -> EngineResult<Vec<u16>> {
-        require_batch(batch)?;
-        let values = checked_product("dense-FP8 MLP output elements", batch, A::HIDDEN)?;
+    pub fn read_residual(&self, stream: &CudaStream, rows: usize) -> EngineResult<Vec<u16>> {
+        require_rows(rows)?;
+        let values = checked_product("dense-FP8 MLP output elements", rows, A::HIDDEN)?;
 
         Ok(self
             .arena
@@ -222,9 +267,24 @@ impl<A: Sm120Arch> DenseFp8MlpProgram<A> {
         self.layout.arena_bytes()
     }
 
+    /// Resident weights plus working planes, excluding alignment padding.
+    pub const fn owner_bytes(&self) -> usize {
+        self.layout.owner_bytes()
+    }
+
     /// Largest admitted exact batch.
     pub const fn batch_capacity(&self) -> usize {
         MAX_BATCH
+    }
+
+    /// Largest admitted exact prefill width.
+    pub const fn row_capacity(&self) -> usize {
+        MAX_ROWS
+    }
+
+    /// Exact bytes in all four address-bound tensor-map descriptors.
+    pub const fn descriptor_bytes(&self) -> usize {
+        DenseFp8SwiGluTmaMaps::BYTE_LEN + DenseFp8DownTmaMaps::BYTE_LEN
     }
 
     /// Checked owner layout.
@@ -237,17 +297,32 @@ impl<A: Sm120Arch> DenseFp8MlpProgram<A> {
         &self.snapshot
     }
 
+    fn graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
+        if (1..=MAX_BATCH).contains(&rows) {
+            return Ok(&self.graphs[rows - 1]);
+        }
+        let index = prefill_index(rows).ok_or_else(|| {
+            EngineError::route(format!(
+                "dense-FP8 MLP row count {rows} is outside 1..={MAX_BATCH},32,64,128,1024"
+            ))
+        })?;
+
+        Ok(&self.prefill_graphs[index])
+    }
+
     #[cfg(feature = "qualification")]
     /// Launches the production route eagerly for graph-agreement qualification.
-    pub fn launch_eager(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
+    pub fn launch_eager(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        require_rows(rows)?;
         let pointers = Pointers::bind(&self.arena, &self.layout)?;
         launch_route(
             stream,
-            batch,
+            rows,
             &self._norm,
             &self._swiglu,
             &self._down,
+            &self.gate_up_maps,
+            &self.down_maps,
             pointers,
         )?;
 
@@ -256,10 +331,8 @@ impl<A: Sm120Arch> DenseFp8MlpProgram<A> {
 
     #[cfg(feature = "qualification")]
     /// Returns one captured production graph.
-    pub fn qualification_graph(&self, batch: usize) -> EngineResult<&CudaGraph> {
-        require_batch(batch)?;
-
-        Ok(&self.graphs[batch - 1])
+    pub fn qualification_graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
+        self.graph(rows)
     }
 
     #[cfg(feature = "qualification")]
@@ -267,10 +340,10 @@ impl<A: Sm120Arch> DenseFp8MlpProgram<A> {
     pub fn qualification_repeated_graph(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         operations: u64,
     ) -> EngineResult<CudaGraph> {
-        require_batch(batch)?;
+        require_rows(rows)?;
         if operations == 0 {
             return Err(EngineError::route(
                 "repeated dense-FP8 MLP graph requires at least one operation",
@@ -282,10 +355,12 @@ impl<A: Sm120Arch> DenseFp8MlpProgram<A> {
             for _ in 0..operations {
                 launch_route(
                     stream,
-                    batch,
+                    rows,
                     &self._norm,
                     &self._swiglu,
                     &self._down,
+                    &self.gate_up_maps,
+                    &self.down_maps,
                     pointers,
                 )?;
             }
@@ -296,8 +371,30 @@ impl<A: Sm120Arch> DenseFp8MlpProgram<A> {
 
     #[cfg(feature = "qualification")]
     /// Returns every stable arena address in layout order.
-    pub fn qualification_addresses(&self) -> EngineResult<[usize; 16]> {
-        Ok(Pointers::bind(&self.arena, &self.layout)?.addresses())
+    pub fn qualification_addresses(&self) -> EngineResult<[usize; 20]> {
+        let arena = Pointers::bind(&self.arena, &self.layout)?.addresses();
+        let gate_up = self.gate_up_maps.device_addresses();
+        let down = self.down_maps.device_addresses();
+
+        Ok([
+            arena[0], arena[1], arena[2], arena[3], arena[4], arena[5], arena[6], arena[7],
+            arena[8], arena[9], arena[10], arena[11], arena[12], arena[13], arena[14], arena[15],
+            gate_up[0], gate_up[1], down[0], down[1],
+        ])
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Copies all four opaque tensor maps for immutable-owner qualification.
+    pub fn qualification_descriptors(&self, stream: &CudaStream) -> EngineResult<[Vec<u64>; 4]> {
+        let gate_up = self.gate_up_maps.copy_to_host(stream)?;
+        let down = self.down_maps.copy_to_host(stream)?;
+
+        Ok([
+            gate_up[0].clone(),
+            gate_up[1].clone(),
+            down[0].clone(),
+            down[1].clone(),
+        ])
     }
 
     #[cfg(feature = "qualification")]
@@ -382,17 +479,28 @@ pub struct DenseFp8MlpObservables {
     pub next_normalized: Vec<u16>,
 }
 
-fn capture_routes<A: Sm120Arch>(
+fn capture_decode_routes<A: Sm120Arch>(
     stream: &CudaStream,
     norm: &ResidualNormOp<A>,
     swiglu: &DenseFp8SwiGluOp<A>,
     down: &DenseFp8DownOp<A>,
+    gate_up_maps: &DenseFp8SwiGluTmaMaps,
+    down_maps: &DenseFp8DownTmaMaps,
     pointers: Pointers,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
     let mut graphs = Vec::with_capacity(MAX_BATCH);
     for batch in 1..=MAX_BATCH {
         graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, batch, norm, swiglu, down, pointers)
+            launch_route(
+                stream,
+                batch,
+                norm,
+                swiglu,
+                down,
+                gate_up_maps,
+                down_maps,
+                pointers,
+            )
         })?);
     }
 
@@ -401,47 +509,117 @@ fn capture_routes<A: Sm120Arch>(
         .map_err(|_| EngineError::layout("dense-FP8 MLP graph inventory has wrong cardinality"))
 }
 
-fn launch_route<A: Sm120Arch>(
+fn capture_prefill_routes<A: Sm120Arch>(
     stream: &CudaStream,
-    batch: usize,
     norm: &ResidualNormOp<A>,
     swiglu: &DenseFp8SwiGluOp<A>,
     down: &DenseFp8DownOp<A>,
+    gate_up_maps: &DenseFp8SwiGluTmaMaps,
+    down_maps: &DenseFp8DownTmaMaps,
+    pointers: Pointers,
+) -> EngineResult<[CudaGraph; 4]> {
+    let mut graphs = Vec::with_capacity(4);
+    for rows in [32, 64, 128, MAX_ROWS] {
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_route(
+                stream,
+                rows,
+                norm,
+                swiglu,
+                down,
+                gate_up_maps,
+                down_maps,
+                pointers,
+            )
+        })?);
+    }
+
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("dense-FP8 MLP prefill graph inventory has wrong cardinality")
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_route<A: Sm120Arch>(
+    stream: &CudaStream,
+    rows: usize,
+    norm: &ResidualNormOp<A>,
+    swiglu: &DenseFp8SwiGluOp<A>,
+    down: &DenseFp8DownOp<A>,
+    gate_up_maps: &DenseFp8SwiGluTmaMaps,
+    down_maps: &DenseFp8DownTmaMaps,
     pointers: Pointers,
 ) -> GpuResult<()> {
     // SAFETY: all pointers name aligned non-overlapping regions sized for
-    // MAX_BATCH, and exact dispatch restricts each launch to `batch` rows.
+    // MAX_ROWS, and exact dispatch restricts each launch to `rows` rows.
     unsafe {
         norm.launch_plain(
             stream,
-            batch,
+            rows,
             pointers.residual_input,
             pointers.input_norm,
             pointers.normalized,
         )?;
-        swiglu.launch(
-            stream,
-            batch,
-            pointers.normalized,
-            pointers.gate_up_activation_codes,
-            pointers.gate_up_activation_scales,
-            pointers.gate_up_weight_codes,
-            pointers.gate_up_weight_scales,
-            pointers.swiglu,
-        )?;
-        down.launch(
-            stream,
-            batch,
-            pointers.swiglu,
-            pointers.down_activation_codes,
-            pointers.down_activation_scales,
-            pointers.down_weight_codes,
-            pointers.down_weight_scales,
-            pointers.branch,
-        )?;
+        if rows == MAX_ROWS {
+            // T=1024 amortizes address-bound TMA setup across the complete macro tile.
+            swiglu.launch_macro_prefill(
+                stream,
+                pointers.normalized,
+                pointers.gate_up_activation_codes,
+                pointers.gate_up_activation_scales,
+                pointers.gate_up_weight_codes,
+                pointers.gate_up_weight_scales,
+                pointers.swiglu,
+                gate_up_maps,
+            )?;
+            down.launch_macro_prefill(
+                stream,
+                pointers.swiglu,
+                pointers.down_activation_codes,
+                pointers.down_activation_scales,
+                pointers.down_weight_codes,
+                pointers.down_weight_scales,
+                pointers.branch,
+                down_maps,
+            )?;
+        } else {
+            swiglu.launch(
+                stream,
+                rows,
+                pointers.normalized,
+                pointers.gate_up_activation_codes,
+                pointers.gate_up_activation_scales,
+                pointers.gate_up_weight_codes,
+                pointers.gate_up_weight_scales,
+                pointers.swiglu,
+            )?;
+            if rows <= MAX_BATCH {
+                down.launch(
+                    stream,
+                    rows,
+                    pointers.swiglu,
+                    pointers.down_activation_codes,
+                    pointers.down_activation_scales,
+                    pointers.down_weight_codes,
+                    pointers.down_weight_scales,
+                    pointers.branch,
+                )?;
+            } else {
+                down.launch_tail_prefill(
+                    stream,
+                    rows,
+                    pointers.swiglu,
+                    pointers.down_activation_codes,
+                    pointers.down_activation_scales,
+                    pointers.down_weight_codes,
+                    pointers.down_weight_scales,
+                    pointers.branch,
+                )?;
+            }
+        }
         norm.launch_residual(
             stream,
-            batch,
+            rows,
             pointers.residual_input,
             pointers.branch,
             pointers.next_norm,
@@ -465,10 +643,20 @@ fn little_endian_words(bytes: &[u8]) -> EngineResult<Vec<u16>> {
         .collect())
 }
 
-fn require_batch(batch: usize) -> EngineResult<()> {
-    if !(1..=MAX_BATCH).contains(&batch) {
+fn prefill_index(rows: usize) -> Option<usize> {
+    match rows {
+        32 => Some(0),
+        64 => Some(1),
+        128 => Some(2),
+        MAX_ROWS => Some(3),
+        _ => None,
+    }
+}
+
+fn require_rows(rows: usize) -> EngineResult<()> {
+    if !(1..=MAX_BATCH).contains(&rows) && prefill_index(rows).is_none() {
         return Err(EngineError::route(format!(
-            "dense-FP8 MLP batch {batch} is outside the exact range 1..={MAX_BATCH}"
+            "dense-FP8 MLP row count {rows} is outside 1..={MAX_BATCH},32,64,128,1024"
         )));
     }
 
@@ -482,16 +670,16 @@ fn checked_product(name: &str, left: usize, right: usize) -> EngineResult<usize>
 
 #[cfg(test)]
 mod tests {
-    use super::{little_endian_words, require_batch};
+    use super::{little_endian_words, require_rows};
     use crate::EngineErrorCode;
 
     #[test]
-    fn exact_batch_table_rejects_every_boundary_neighbor() {
-        for batch in 1..=8 {
-            require_batch(batch).unwrap();
+    fn exact_route_table_rejects_every_boundary_neighbor() {
+        for rows in [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024] {
+            require_rows(rows).unwrap();
         }
-        for batch in [0, 9, 16, usize::MAX] {
-            let error = require_batch(batch).unwrap_err();
+        for rows in [0, 9, 31, 33, 63, 65, 127, 129, 1_023, 1_025, usize::MAX] {
+            let error = require_rows(rows).unwrap_err();
             assert_eq!(error.code(), Some(EngineErrorCode::Route));
         }
     }

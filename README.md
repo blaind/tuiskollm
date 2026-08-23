@@ -83,8 +83,10 @@ gate/up SwiGLU also admits exact `T=1024`: a 128x64x64 three-stage TMA route ret
 E4M3 activation and source-weight planes and owns two stable tensor-map descriptors. Dense-FP8
 down projection admits exact `T=32,64,128` K=128 MMA tails plus a separate `T=1024` 128x64x64
 three-stage TMA route over its source-native `[5120,17408]` weight plane with the same explicit
-descriptor ownership. Full-layer prefill composition and server routing remain separate slices,
-so these leaves do not yet change server prompt priming.
+descriptor ownership. The source-backed dense-FP8 MLP owner composes residual norms, gate/up,
+SwiGLU, down projection, and residual publication into directly qualified graphs at every
+`B=1..8` and `T=32,64,128,1024`. Full attention/GDN-layer prefill composition and server routing
+remain separate slices, so these routes do not yet change server prompt priming.
 
 ## Current device slice
 
