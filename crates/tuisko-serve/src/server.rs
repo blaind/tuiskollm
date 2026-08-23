@@ -23,7 +23,9 @@ use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedSender, channel, error::TryRecvError, error::TrySendError,
     unbounded_channel,
 };
-use tuisko_engine::{MAX_BATCH, ResidentBatchGenerator, ResidentRequestId};
+use tuisko_engine::{
+    MAX_BATCH, ResidentBatchGenerator, ResidentLoadPhase, ResidentLoadProgress, ResidentRequestId,
+};
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
 const REQUEST_BODY_LIMIT: usize = 2 * 1024 * 1024;
@@ -87,19 +89,21 @@ struct Ready {
 /// Loads the exact resident model, then serves health, model, blocking, and SSE routes.
 pub fn run(config: ServerConfig) -> Result<(), ServerError> {
     let startup_start = Instant::now();
-    let (state, ready) = start_worker(&config.snapshot)?;
+    let stdout = std::io::stdout();
+    let interactive = stdout.is_terminal();
+    let color = interactive && std::env::var_os("NO_COLOR").is_none();
+    let (state, ready) = {
+        let mut stdout = stdout.lock();
+        stdout.write_all(render_loading(color, interactive).as_bytes())?;
+        stdout.flush()?;
+        start_worker(&config.snapshot, &mut stdout, interactive, color)?
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(config.address).await?;
-        let stdout = std::io::stdout();
-        let output = render_startup(
-            &ready,
-            startup_start.elapsed(),
-            config.address,
-            stdout.is_terminal() && std::env::var_os("NO_COLOR").is_none(),
-        );
+        let output = render_startup(&ready, startup_start.elapsed(), config.address, color);
         let mut stdout = stdout.lock();
         stdout.write_all(output.as_bytes())?;
         stdout.flush()?;
@@ -108,19 +112,61 @@ pub fn run(config: ServerConfig) -> Result<(), ServerError> {
     })
 }
 
-fn start_worker(snapshot: &Path) -> Result<(AppState, Ready), ServerError> {
+fn start_worker(
+    snapshot: &Path,
+    output: &mut impl IoWrite,
+    interactive: bool,
+    color: bool,
+) -> Result<(AppState, Ready), ServerError> {
     let (jobs_tx, jobs_rx) = channel(MAX_BATCH);
     let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
     let worker_ready = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(ResidentLoadProgress::new());
     let snapshot = snapshot.to_owned();
     let worker_ready_clone = Arc::clone(&worker_ready);
+    let worker_progress = Arc::clone(&progress);
     std::thread::Builder::new()
         .name("tuiskollm-engine".into())
-        .spawn(move || engine_worker(snapshot, jobs_rx, ready_tx, worker_ready_clone))?;
-    let ready = ready_rx
-        .recv()
-        .map_err(|_| ServerError::StartupDisconnected)?
-        .map_err(ServerError::Startup)?;
+        .spawn(move || {
+            engine_worker(
+                snapshot,
+                jobs_rx,
+                ready_tx,
+                worker_ready_clone,
+                worker_progress,
+            )
+        })?;
+    let mut displayed = None;
+    let mut spinner_tick = 1;
+    let ready = loop {
+        match ready_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(ready) => break ready,
+            Err(std_mpsc::RecvTimeoutError::Timeout) if interactive => {
+                let snapshot = progress.snapshot();
+                if (snapshot.0 == ResidentLoadPhase::Preparing || Some(snapshot) != displayed)
+                    && let Some(line) = render_load_progress(
+                        snapshot.0,
+                        snapshot.1,
+                        snapshot.2,
+                        spinner_tick,
+                        color,
+                    )
+                {
+                    output.write_all(line.as_bytes())?;
+                    output.flush()?;
+                    displayed = Some(snapshot);
+                    spinner_tick = spinner_tick.wrapping_add(1);
+                }
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                clear_progress_line(output, interactive)?;
+                return Err(ServerError::StartupDisconnected);
+            }
+        }
+    };
+    clear_progress_line(output, interactive)?;
+    let ready = ready.map_err(ServerError::Startup)?;
     Ok((
         AppState {
             jobs: jobs_tx,
@@ -136,6 +182,7 @@ fn engine_worker(
     mut jobs: Receiver<Job>,
     ready: std_mpsc::SyncSender<Result<Ready, String>>,
     worker_ready: Arc<AtomicBool>,
+    progress: Arc<ResidentLoadProgress>,
 ) {
     struct ReadinessGuard(Arc<AtomicBool>);
     impl Drop for ReadinessGuard {
@@ -151,8 +198,11 @@ fn engine_worker(
             .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
         let checkpoint_admission = checkpoint_start.elapsed();
         let tensor_count = snapshot.tensor_count();
-        let generator = ResidentBatchGenerator::from_snapshot_device_zero(snapshot)
-            .map_err(|error| format!("loading the resident text program: {error}"))?;
+        let generator = ResidentBatchGenerator::from_snapshot_device_zero_with_progress(
+            snapshot,
+            progress.as_ref(),
+        )
+        .map_err(|error| format!("loading the resident text program: {error}"))?;
         let device_name = generator
             .context()
             .device_name()
@@ -238,16 +288,94 @@ fn engine_worker(
     }
 }
 
+fn render_loading(color: bool, interactive: bool) -> String {
+    let (header, loading, reset) = if color {
+        ("\x1b[1;36m", "\x1b[1;33m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    let newline = if interactive { "" } else { "\n" };
+    format!(
+        "{header}TuiskoLLM{reset} · {SERVED_MODEL}\n{loading}LOADING{reset} ⠋       preparing resident model…{newline}"
+    )
+}
+
+fn render_load_progress(
+    phase: ResidentLoadPhase,
+    submitted_bytes: usize,
+    total_bytes: usize,
+    spinner_tick: usize,
+    color: bool,
+) -> Option<String> {
+    let finalizing = match phase {
+        ResidentLoadPhase::Preparing => {
+            const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+            let frame = FRAMES[spinner_tick % FRAMES.len()];
+            let (loading, reset) = if color {
+                ("\x1b[1;33m", "\x1b[0m")
+            } else {
+                ("", "")
+            };
+            return Some(format!(
+                "\r\x1b[2K{loading}LOADING{reset} {frame}       preparing resident model…"
+            ));
+        }
+        ResidentLoadPhase::Ready => return None,
+        ResidentLoadPhase::Uploading => false,
+        ResidentLoadPhase::Finalizing => true,
+    };
+    Some(render_weight_progress(
+        submitted_bytes,
+        total_bytes,
+        finalizing,
+        color,
+    ))
+}
+
+fn render_weight_progress(
+    submitted_bytes: usize,
+    total_bytes: usize,
+    finalizing: bool,
+    color: bool,
+) -> String {
+    const BAR_WIDTH: usize = 20;
+    let submitted_bytes = submitted_bytes.min(total_bytes);
+    let filled = submitted_bytes
+        .saturating_mul(BAR_WIDTH)
+        .checked_div(total_bytes)
+        .unwrap_or(0);
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(BAR_WIDTH - filled));
+    let (loading, reset) = if color {
+        ("\x1b[1;33m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    let suffix = if finalizing { " · finalizing…" } else { "" };
+    format!(
+        "\r\x1b[2K{loading}LOADING{reset} weights  {bar}  {:.2} / {:.2} GiB{suffix}",
+        gibibytes(submitted_bytes),
+        gibibytes(total_bytes),
+    )
+}
+
+fn clear_progress_line(output: &mut impl IoWrite, interactive: bool) -> std::io::Result<()> {
+    if interactive {
+        output.write_all(b"\r\x1b[2K")?;
+        output.flush()?;
+    }
+    Ok(())
+}
+
 fn render_startup(ready: &Ready, total: Duration, address: SocketAddr, color: bool) -> String {
     let mut output = String::new();
-    let (header, ok, ready_label, reset) = if color {
-        ("\x1b[1;36m", "\x1b[32m", "\x1b[1;32m", "\x1b[0m")
+    let (ok, ready_label, reset) = if color {
+        ("\x1b[32m", "\x1b[1;32m", "\x1b[0m")
     } else {
-        ("", "", "", "")
+        ("", "", "")
     };
     writeln!(
         output,
-        "{header}TuiskoLLM{reset} · {SERVED_MODEL} · {}",
+        "{ok}OK{reset} device                 · {}",
         ready.device_name
     )
     .expect("writing to a String cannot fail");
@@ -474,7 +602,7 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
 mod tests {
     use super::{
         AppState, EnqueueError, Job, Ready, chat_completions, enqueue_job, health, models,
-        render_startup,
+        render_loading, render_startup, render_weight_progress,
     };
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
     use axum::Json;
@@ -530,13 +658,20 @@ mod tests {
             context_capacity: 220_000,
         };
         let address = "127.0.0.1:8000".parse::<SocketAddr>().unwrap();
+        let loading = render_loading(false, false);
+        assert_eq!(
+            loading,
+            "TuiskoLLM · unsloth/Qwen3.8-27B-NVFP4\nLOADING ⠋       preparing resident model…\n"
+        );
+        assert!(!render_loading(false, true).ends_with('\n'));
+
         let plain = render_startup(&ready, Duration::from_micros(1_925_200), address, false);
         let lines = plain.lines().collect::<Vec<_>>();
 
         assert_eq!(lines.len(), 6);
         assert_eq!(
             lines[0],
-            "TuiskoLLM · unsloth/Qwen3.8-27B-NVFP4 · NVIDIA GeForce RTX 5090"
+            "OK device                 · NVIDIA GeForce RTX 5090"
         );
         assert!(lines[1].contains("2.5 ms · 1968 tensors"));
         assert!(lines[2].contains("53.0 ms · 18.00 GiB"));
@@ -548,8 +683,20 @@ mod tests {
         );
         assert!(!plain.contains('\x1b'));
 
+        let colored_loading = render_loading(true, true);
+        assert!(colored_loading.starts_with("\x1b[1;36mTuiskoLLM\x1b[0m"));
+        assert!(colored_loading.contains("\x1b[1;33mLOADING\x1b[0m"));
+
+        let progress = render_weight_progress(3 << 30, 4 << 30, false, false);
+        assert!(progress.contains("███████████████░░░░░"));
+        assert!(progress.contains("3.00 / 4.00 GiB"));
+        let finalizing = render_weight_progress(4 << 30, 4 << 30, true, true);
+        assert!(finalizing.contains("\x1b[1;33mLOADING\x1b[0m"));
+        assert!(finalizing.contains("████████████████████"));
+        assert!(finalizing.ends_with("4.00 / 4.00 GiB · finalizing…"));
+
         let colored = render_startup(&ready, Duration::from_micros(1_925_200), address, true);
-        assert!(colored.starts_with("\x1b[1;36mTuiskoLLM\x1b[0m"));
+        assert!(colored.starts_with("\x1b[32mOK\x1b[0m device"));
         assert!(colored.contains("\x1b[1;32mREADY\x1b[0m"));
     }
 

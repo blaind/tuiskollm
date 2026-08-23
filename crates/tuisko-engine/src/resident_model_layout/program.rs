@@ -2,7 +2,8 @@
 
 use super::{
     AttentionWeights, EndpointWeights, GdnPersistent, GdnWeights, MixerWeights, MlpWeights,
-    ResidentModelLayout, ResidentUploadArena, ResidentUploadPlan, ResidentUploadPreparation,
+    ResidentLoadProgress, ResidentModelLayout, ResidentUploadArena, ResidentUploadPlan,
+    ResidentUploadPreparation,
 };
 #[cfg(feature = "qualification")]
 use crate::PagedKvSlotState;
@@ -340,7 +341,15 @@ impl ResidentModelProgram {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
-        Self::from_snapshot_with_mode(context, snapshot, PRODUCTION_LOAD_MODE)
+        Self::from_snapshot_with_mode(context, snapshot, PRODUCTION_LOAD_MODE, None)
+    }
+
+    pub(crate) fn from_snapshot_with_progress(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+        progress: &ResidentLoadProgress,
+    ) -> EngineResult<Self> {
+        Self::from_snapshot_with_mode(context, snapshot, PRODUCTION_LOAD_MODE, Some(progress))
     }
 
     /// Loads through selective initialization for focused qualification.
@@ -349,7 +358,7 @@ impl ResidentModelProgram {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
-        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Selective)
+        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Selective, None)
     }
 
     /// Loads through the retained eager-zeroing A/B authority.
@@ -358,13 +367,14 @@ impl ResidentModelProgram {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
-        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Legacy)
+        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Legacy, None)
     }
 
     fn from_snapshot_with_mode(
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
         mode: ResidentLoadMode,
+        progress: Option<&ResidentLoadProgress>,
     ) -> EngineResult<Self> {
         let layout_start = Instant::now();
         let layout = ResidentModelLayout::build()?;
@@ -490,6 +500,13 @@ impl ResidentModelProgram {
                 mut kv_arena,
             } => {
                 let weight_start = Instant::now();
+                let expected_upload_bytes = upload_plan
+                    .weight_bytes()
+                    .checked_add(upload_plan.host_derived_bytes())
+                    .ok_or_else(|| EngineError::layout("resident upload byte total overflows"))?;
+                if let Some(progress) = progress {
+                    progress.begin_upload(expected_upload_bytes);
+                }
                 #[cfg(target_os = "linux")]
                 let (prefault_bytes, source_prefault_ns) = {
                     let prefault_start = Instant::now();
@@ -508,6 +525,7 @@ impl ResidentModelProgram {
                         bytes: 0,
                         submissions: 0,
                         copy_ns: 0,
+                        progress,
                     };
                     let mut preparation = ResidentPreparationStats::default();
                     let scalars = load_source_weights(
@@ -549,6 +567,9 @@ impl ResidentModelProgram {
                     &layout,
                     &stream,
                 )?;
+                if let Some(progress) = progress {
+                    progress.submit(metadata.bytes)?;
+                }
                 let uploaded_bytes = upload_bytes
                     .checked_add(metadata.bytes)
                     .ok_or_else(|| EngineError::layout("resident upload byte total overflows"))?;
@@ -557,14 +578,13 @@ impl ResidentModelProgram {
                     .ok_or_else(|| {
                         EngineError::layout("resident upload submission total overflows")
                     })?;
-                let expected_upload_bytes = upload_plan
-                    .weight_bytes()
-                    .checked_add(upload_plan.host_derived_bytes())
-                    .ok_or_else(|| EngineError::layout("resident upload byte total overflows"))?;
                 if uploaded_bytes != expected_upload_bytes {
                     return Err(EngineError::layout(format!(
                         "selective loader uploaded {uploaded_bytes} bytes, expected {expected_upload_bytes}",
                     )));
+                }
+                if let Some(progress) = progress {
+                    progress.finish_upload()?;
                 }
                 let arena = arena.seal(&stream)?;
                 let kv_arena = kv_arena.seal(&stream)?;
@@ -623,6 +643,9 @@ impl ResidentModelProgram {
         };
         let graphs = capture_routes(&stream, ops, &pointers)?;
         load_stats.graph_capture_ns = elapsed_ns("resident graph capture", graph_start)?;
+        if let Some(progress) = progress {
+            progress.finish();
+        }
 
         Ok(Self {
             graphs,
@@ -2461,6 +2484,7 @@ struct SelectiveWeightSink<'a> {
     bytes: usize,
     submissions: usize,
     copy_ns: u64,
+    progress: Option<&'a ResidentLoadProgress>,
 }
 
 impl SelectiveWeightSink<'_> {
@@ -2515,6 +2539,9 @@ impl SelectiveWeightSink<'_> {
             .submissions
             .checked_add(1)
             .ok_or_else(|| EngineError::layout("resident upload submissions overflow"))?;
+        if let Some(progress) = self.progress {
+            progress.submit(bytes)?;
+        }
         Ok(())
     }
 }
