@@ -1,6 +1,7 @@
 //! Exact resident and shared-KV arena plan for the Qwen3.8 text model.
 
 mod program;
+mod progress;
 mod upload_plan;
 
 pub use program::{ResidentDecodeRoute, ResidentLoadMode, ResidentLoadStats, ResidentModelProgram};
@@ -8,6 +9,7 @@ pub use program::{ResidentDecodeRoute, ResidentLoadMode, ResidentLoadStats, Resi
 pub use program::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
 };
+pub use progress::{ResidentLoadPhase, ResidentLoadProgress};
 pub use upload_plan::{
     ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
 };

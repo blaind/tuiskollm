@@ -2,7 +2,7 @@
 
 use crate::{
     CancelledText, ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
-    GenerationSession, GenerationStep, MAX_BATCH, ResidentModelProgram,
+    GenerationSession, GenerationStep, MAX_BATCH, ResidentLoadProgress, ResidentModelProgram,
 };
 #[cfg(feature = "qualification")]
 use crate::{Sampler, SamplingOptions};
@@ -264,15 +264,17 @@ impl ResidentBatchGenerator {
     pub fn from_snapshot_device_zero(
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
-        let context = Arc::new(CudaContext::new(0).map_err(GpuError::from)?);
-        let capability = context.compute_capability().map_err(GpuError::from)?;
-        if capability != (12, 0) {
-            return Err(EngineError::route(format!(
-                "device zero has compute capability {}.{}, expected 12.0",
-                capability.0, capability.1
-            )));
-        }
+        let context = device_zero_context()?;
         Self::from_snapshot(&context, snapshot)
+    }
+
+    /// Opens device zero while publishing resident startup counters.
+    pub fn from_snapshot_device_zero_with_progress(
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+        progress: &ResidentLoadProgress,
+    ) -> EngineResult<Self> {
+        let context = device_zero_context()?;
+        Self::from_snapshot_inner(&context, snapshot, Some(progress))
     }
 
     /// Admits the pinned frontend and complete resident program for compact B=1..8 decoding.
@@ -280,8 +282,21 @@ impl ResidentBatchGenerator {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
+        Self::from_snapshot_inner(context, snapshot, None)
+    }
+
+    fn from_snapshot_inner(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+        progress: Option<&ResidentLoadProgress>,
+    ) -> EngineResult<Self> {
         let frontend = TextFrontend::open(snapshot.as_ref())?;
-        let program = ResidentModelProgram::from_snapshot(context, snapshot)?;
+        let program = match progress {
+            Some(progress) => {
+                ResidentModelProgram::from_snapshot_with_progress(context, snapshot, progress)?
+            }
+            None => ResidentModelProgram::from_snapshot(context, snapshot)?,
+        };
         let stream = context.new_stream().map_err(GpuError::from)?;
         let logit_values = Qwen38_27B::VOCAB
             .checked_mul(LOGIT_BANK_ROWS)
@@ -664,6 +679,18 @@ impl ResidentBatchGenerator {
         }
         Ok(())
     }
+}
+
+fn device_zero_context() -> EngineResult<Arc<CudaContext>> {
+    let context = CudaContext::new(0).map_err(GpuError::from)?;
+    let capability = context.compute_capability().map_err(GpuError::from)?;
+    if capability != (12, 0) {
+        return Err(EngineError::route(format!(
+            "device zero has compute capability {}.{}, expected 12.0",
+            capability.0, capability.1
+        )));
+    }
+    Ok(context)
 }
 
 impl ResidentGenerationSession<'_> {
