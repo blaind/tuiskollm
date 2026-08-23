@@ -75,6 +75,10 @@ impl<A: Arch> CheckpointSnapshot<A> {
                 Self::open_split_with_spec(root, QWEN38_INVENTORY)
             }
             CheckpointContract::ModelOptNvfp4 => Self::open_modelopt(root),
+            CheckpointContract::ModelOptNvfp4Moe => Err(CheckpointError::inventory(format!(
+                "{} Qwen3.6 multi-shard inventory is not admitted yet",
+                root.display()
+            ))),
         }
     }
 
