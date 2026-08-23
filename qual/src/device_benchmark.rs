@@ -249,6 +249,22 @@ impl BenchmarkWorkload {
             execution: BenchmarkExecution::CudaGraph,
         }
     }
+
+    pub(crate) fn warm_attention_layer_decode(batch_size: u32, context_tokens: u64) -> Self {
+        Self {
+            scope: BenchmarkScope::Layer,
+            phase: BenchmarkPhase::Decode,
+            batch_size: Some(batch_size),
+            concurrency: None,
+            active_tokens: Some(u64::from(batch_size)),
+            prompt_tokens: None,
+            context_tokens: Some(context_tokens),
+            output_tokens: None,
+            device_cache: DeviceCacheRegime::Warm,
+            prefix_cache: None,
+            execution: BenchmarkExecution::CudaGraph,
+        }
+    }
 }
 
 /// Kind of resident memory attributed by a benchmark owner.

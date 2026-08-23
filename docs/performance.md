@@ -109,6 +109,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- qualify-attention-output` | Check sigmoid gating, the published FP32 seam, dynamic E4M3 quantization, source-native projection, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact-B graph, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact-B graphs, stable addresses, and owner allocation | terminal |
+| `cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT` | Check complete source layer-63 attention/MLP seams, represented KV cache, exact-B graphs, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
 | `cargo run -p xtask -- bench-gdn-prepare` | Measure every exact control-plus-convolution graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-recurrence` | Measure every exact stateful recurrence graph | terminal or `--json PATH` |
@@ -117,6 +118,7 @@ resource inventory before launching the benchmark.
 | `cargo run -p xtask -- bench-paged-gqa` | Measure every exact paged GQA graph at a 130-token, three-page context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-output` | Measure every exact sigmoid-gate, quantize, and output-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT` | Measure every complete source-backed layer-60 graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-full-attention-layer SNAPSHOT` | Measure every complete source-backed layer-63 graph at a 131-token, three-page context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
 | `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
@@ -178,6 +180,10 @@ baseline.
 `bench-dense-fp8-gdn-layer SNAPSHOT` measures the complete stateful layer-60 graph. Repeated samples
 advance its persistent history and FP32 recurrence exactly as serial decode rounds do; setup and
 allocation remain outside the timed region.
+
+`bench-full-attention-layer SNAPSHOT` measures the complete layer-63 decode graph directly. Its
+131-token warm cache crosses both 64-token page seams; repeated paths overwrite the same admitted
+cache position so the timed geometry stays invariant.
 
 Add `--energy-seconds 2` for sustained energy sampling. At least three samples, one launch per
 sample, and a two-second energy window are required.
