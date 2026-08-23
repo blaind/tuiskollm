@@ -1,4 +1,7 @@
 use crate::DeviceBenchmarkError;
+use crate::startup_h2d::{
+    H2dCalibrationReport, measure_h2d_calibration, pinned_h2d_gib_s, print_h2d_calibration,
+};
 use crate::target::{EXPECTED_COMPUTE_CAPABILITY, EXPECTED_DEVICE_NAME};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -12,7 +15,7 @@ use tuisko_engine::{ResidentLoadMode, ResidentModelProgram};
 use tuisko_gpu::{CudaContext, GpuError};
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const DEFAULT_SAMPLES: usize = 3;
 const DEFAULT_WARMUPS: usize = 1;
 const DEFAULT_REPORT: &str = "target/benchmarks/startup/loader-comparison-sm120.json";
@@ -102,6 +105,7 @@ struct StartupBenchmarkReport {
     schema_version: u32,
     filesystem_cache: &'static str,
     warmups: usize,
+    h2d_calibration: H2dCalibrationReport,
     loaders: Vec<StartupLoaderReport>,
 }
 
@@ -121,9 +125,20 @@ pub fn run_startup_benchmark_cli() -> Result<(), Box<dyn Error>> {
     ) {
         return run_child(&arguments[1..]);
     }
+    if matches!(
+        arguments.first().and_then(|value| value.to_str()),
+        Some("--h2d-child")
+    ) {
+        let report = measure_h2d_calibration()?;
+        serde_json::to_writer(io::stdout().lock(), &report)?;
+        println!();
+        return Ok(());
+    }
 
     let options = parse_options(&arguments)?;
     let executable = std::env::current_exe()?;
+    eprintln!("calibrating contiguous pageable and pinned host-to-device transfers");
+    let h2d_calibration = launch_h2d_child(&executable)?;
     for loader in &options.loaders {
         for index in 0..options.warmups {
             eprintln!(
@@ -172,6 +187,7 @@ pub fn run_startup_benchmark_cli() -> Result<(), Box<dyn Error>> {
         schema_version: SCHEMA_VERSION,
         filesystem_cache: "warm",
         warmups: options.warmups,
+        h2d_calibration,
         loaders,
     };
     print_report(&report);
@@ -365,6 +381,20 @@ fn launch_child(
     if !output.status.success() {
         io::stderr().write_all(&output.stderr)?;
         return Err(format!("startup child failed with {}", output.status).into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn launch_h2d_child(executable: &Path) -> Result<H2dCalibrationReport, Box<dyn Error>> {
+    let output = Command::new(executable)
+        .arg("--h2d-child")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !output.status.success() {
+        io::stderr().write_all(&output.stderr)?;
+        return Err(format!("H2D calibration child failed with {}", output.status).into());
     }
     Ok(serde_json::from_slice(&output.stdout)?)
 }
@@ -580,6 +610,8 @@ fn parse_peak_rss_bytes(status: &str) -> io::Result<u64> {
 }
 
 fn print_report(report: &StartupBenchmarkReport) {
+    print_h2d_calibration(&report.h2d_calibration);
+    let pinned_h2d_gib_s = pinned_h2d_gib_s(&report.h2d_calibration);
     for loader in &report.loaders {
         eprintln!();
         eprintln!("{} startup, warm filesystem cache", loader.loader);
@@ -597,6 +629,13 @@ fn print_report(report: &StartupBenchmarkReport) {
             sample.upload_submissions,
             sample.zeroed_bytes as f64 / (1_u64 << 30) as f64,
             sample.pinned_stager_bytes as f64 / (1_u64 << 20) as f64,
+        );
+        let weight_copy_gib_s =
+            sample.upload_bytes as f64 / (1_u64 << 30) as f64 / (sample.weight_copy_ms / 1_000.0);
+        eprintln!(
+            "copy-call aggregate: {:.2} GiB/s · {:.1}% of contiguous pinned H2D",
+            weight_copy_gib_s,
+            weight_copy_gib_s / pinned_h2d_gib_s * 100.0,
         );
     }
     let sample = &report.loaders[0].samples[0];

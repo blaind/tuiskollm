@@ -136,6 +136,8 @@ mod residual_norm;
 mod residual_norm_benchmark;
 #[cfg(feature = "device")]
 mod startup_benchmark;
+#[cfg(feature = "device")]
+mod startup_h2d;
 mod target;
 #[cfg(feature = "device")]
 mod text_endpoint;
