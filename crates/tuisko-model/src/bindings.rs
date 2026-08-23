@@ -1427,6 +1427,39 @@ impl<'a> Nvfp4DownBindings<'a> {
     }
 }
 
+/// BF16 text endpoint sources used by the exact Qwen3.5 checkpoint.
+#[derive(Clone, Copy, Debug)]
+pub struct Bf16TextEndpointBindings<'a> {
+    /// BF16 token embedding matrix `[vocab, hidden]`.
+    pub embedding: Bf16View<'a, 2>,
+    /// BF16 final RMSNorm weights `[hidden]`.
+    pub final_norm: Bf16View<'a, 1>,
+    /// Untied BF16 language-model head `[vocab, hidden]`.
+    pub lm_head: Bf16View<'a, 2>,
+}
+
+impl<'a> Bf16TextEndpointBindings<'a> {
+    /// Binds the exact Qwen3.5 embedding, final norm, and BF16 LM head.
+    pub fn bind<A: Arch>(snapshot: &'a CheckpointSnapshot<A>) -> CheckpointResult<Self> {
+        Self::bind_from::<A>(|name| snapshot.tensor(name))
+    }
+
+    fn bind_from<A: Arch>(
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        require_modelopt_contract::<A>("text endpoints")?;
+
+        let vocab = A::VOCAB as u64;
+        let hidden = A::HIDDEN as u64;
+
+        Ok(Self {
+            embedding: Bf16View::bind(tensor(EMBEDDING)?, [vocab, hidden])?,
+            final_norm: Bf16View::bind(tensor(FINAL_NORM)?, [hidden])?,
+            lm_head: Bf16View::bind(tensor(LM_HEAD)?, [vocab, hidden])?,
+        })
+    }
+}
+
 /// Shape- and dtype-checked source views for the text input and output endpoints.
 #[derive(Clone, Copy, Debug)]
 pub struct TextEndpointBindings<'a> {
@@ -1678,13 +1711,14 @@ fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> Checkpo
 #[cfg(test)]
 mod tests {
     use super::{
-        DenseFp8DownBindings, DenseFp8GateUpBindings, DenseFp8MlpBindings, E2M1_VALUES_PER_BYTE,
-        FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings,
-        ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings,
-        MtpBindings, NVFP4_GROUP_SIZE, Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings,
-        TextEndpointBindings, VisionBindings, dense_fp8_next_norm_name, positive_bf16,
-        require_adjacent, require_dense_fp8_mlp_layer, require_full_attention_layer,
-        require_gdn_layer, require_mtp_contract, require_nvfp4_mlp_layer, validate_nvfp4_scales,
+        Bf16TextEndpointBindings, DenseFp8DownBindings, DenseFp8GateUpBindings,
+        DenseFp8MlpBindings, E2M1_VALUES_PER_BYTE, FullAttentionPostBindings,
+        FullAttentionQkvBindings, GdnBindings, ModelOptNvfp4AttentionBindings,
+        ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings, MtpBindings, NVFP4_GROUP_SIZE,
+        Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings, TextEndpointBindings,
+        VisionBindings, dense_fp8_next_norm_name, positive_bf16, require_adjacent,
+        require_dense_fp8_mlp_layer, require_full_attention_layer, require_gdn_layer,
+        require_mtp_contract, require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
     use crate::{
         Arch, CheckpointContract, CheckpointErrorCode, CheckpointResult, DType, SafeTensorFile,
@@ -1829,6 +1863,30 @@ mod tests {
                 "data_offsets": [44, 50]
             }
         })
+    }
+
+    fn modelopt_endpoint_fixture() -> (Value, Vec<u8>) {
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+
+        for (name, shape) in [
+            (
+                "model.language_model.embed_tokens.weight",
+                vec![ModelOptArch::VOCAB, ModelOptArch::HIDDEN],
+            ),
+            (
+                "model.language_model.norm.weight",
+                vec![ModelOptArch::HIDDEN],
+            ),
+            (
+                "lm_head.weight",
+                vec![ModelOptArch::VOCAB, ModelOptArch::HIDDEN],
+            ),
+        ] {
+            append_bf16_tensor(&mut header, &mut payload, name, shape);
+        }
+
+        (Value::Object(header), payload)
     }
 
     fn write_safetensors(path: &Path, header: Value) {
@@ -2516,6 +2574,31 @@ mod tests {
         assert_eq!(bindings.lm_head.shape(), &[3, 4]);
         assert_eq!(bindings.lm_head.codes(), &(32u8..44).collect::<Vec<_>>());
         assert_eq!(bindings.lm_head_scale.shape(), &[3, 1]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn binds_exact_bf16_text_endpoint_contract() {
+        let path = fixture_path("modelopt-endpoints");
+        let (header, payload) = modelopt_endpoint_fixture();
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let bindings =
+            Bf16TextEndpointBindings::bind_from::<ModelOptArch>(|name| file.tensor(name)).unwrap();
+
+        assert_eq!(bindings.embedding.shape(), &[3, 32]);
+        assert_eq!(bindings.final_norm.shape(), &[32]);
+        assert_eq!(bindings.lm_head.shape(), &[3, 32]);
+        assert_ne!(bindings.embedding.word(0), bindings.lm_head.word(0));
+
+        let error = Bf16TextEndpointBindings::bind_from::<Nvfp4Arch>(|_| {
+            panic!("the contract check must reject before tensor lookup")
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("text endpoints"));
 
         fs::remove_file(path).unwrap();
     }
