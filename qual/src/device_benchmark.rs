@@ -17,6 +17,8 @@ use tuisko_gpu::{CudaGraph, CudaStream, GpuTimer};
 
 const DEVICE_INDEX: &str = "0";
 const MAX_IDLE_MEMORY_MIB: u32 = 1_024;
+const IDLE_UTILIZATION_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_UTILIZATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MIN_TELEMETRY_SAMPLES: usize = 3;
 const LOADED_CLOCK_PROBE_DURATION: Duration = Duration::from_secs(2);
 const MAX_LOADED_CLOCK_PROBE_REPLAYS: u64 = 1_000_000;
@@ -982,20 +984,36 @@ impl MemoryRecorder {
 
 pub(crate) fn preflight() -> Result<DevicePreflight, DeviceBenchmarkError> {
     require_unmapped_ordinal_zero()?;
-    let snapshot = device_snapshot()?;
-    if snapshot.identity.name != EXPECTED_DEVICE_NAME {
-        return Err(DeviceBenchmarkError::Precondition(format!(
-            "device zero is `{}`, expected `{EXPECTED_DEVICE_NAME}`",
-            snapshot.identity.name
-        )));
-    }
-    if snapshot.utilization_percent != 0 || snapshot.memory_used_mib > MAX_IDLE_MEMORY_MIB {
-        return Err(DeviceBenchmarkError::Precondition(format!(
-            "device zero is not idle: utilization={}%, memory={} MiB",
-            snapshot.utilization_percent, snapshot.memory_used_mib
-        )));
-    }
-    require_compute_process_count(0)?;
+    let deadline = Instant::now() + IDLE_UTILIZATION_SETTLE_TIMEOUT;
+    let snapshot = loop {
+        let snapshot = device_snapshot()?;
+        if snapshot.identity.name != EXPECTED_DEVICE_NAME {
+            return Err(DeviceBenchmarkError::Precondition(format!(
+                "device zero is `{}`, expected `{EXPECTED_DEVICE_NAME}`",
+                snapshot.identity.name
+            )));
+        }
+        if snapshot.memory_used_mib > MAX_IDLE_MEMORY_MIB {
+            return Err(DeviceBenchmarkError::Precondition(format!(
+                "device zero is not idle: utilization={}%, memory={} MiB",
+                snapshot.utilization_percent, snapshot.memory_used_mib
+            )));
+        }
+        require_compute_process_count(0)?;
+        if snapshot.utilization_percent == 0 {
+            break snapshot;
+        }
+        if Instant::now() >= deadline {
+            return Err(DeviceBenchmarkError::Precondition(format!(
+                "device zero utilization did not settle within {} seconds: utilization={}%, memory={} MiB",
+                IDLE_UTILIZATION_SETTLE_TIMEOUT.as_secs(),
+                snapshot.utilization_percent,
+                snapshot.memory_used_mib
+            )));
+        }
+
+        thread::sleep(IDLE_UTILIZATION_POLL_INTERVAL);
+    };
 
     Ok(DevicePreflight {
         identity: DeviceIdentity {
