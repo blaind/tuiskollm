@@ -2368,6 +2368,13 @@ trait ResidentWeightSink {
         region: ArenaRegion<T>,
         source: &[T],
     ) -> EngineResult<()>;
+
+    fn copy_bytes_from_host<T: DeviceCopy>(
+        &mut self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        source: &[u8],
+    ) -> EngineResult<()>;
 }
 
 struct LegacyWeightSink<'a> {
@@ -2390,6 +2397,22 @@ impl ResidentWeightSink for LegacyWeightSink<'_> {
             .ok_or_else(|| EngineError::layout("legacy weight-copy time overflows"))?;
         Ok(())
     }
+
+    fn copy_bytes_from_host<T: DeviceCopy>(
+        &mut self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        source: &[u8],
+    ) -> EngineResult<()> {
+        let started = Instant::now();
+        self.arena
+            .copy_region_bytes_from_host(stream, region, source)?;
+        self.copy_ns = self
+            .copy_ns
+            .checked_add(elapsed_ns("legacy weight copy", started)?)
+            .ok_or_else(|| EngineError::layout("legacy weight-copy time overflows"))?;
+        Ok(())
+    }
 }
 
 struct SelectiveWeightSink<'a> {
@@ -2400,29 +2423,28 @@ struct SelectiveWeightSink<'a> {
     copy_ns: u64,
 }
 
-impl ResidentWeightSink for SelectiveWeightSink<'_> {
-    fn copy_from_host<T: DeviceCopy>(
+impl SelectiveWeightSink<'_> {
+    fn copy_source<T: DeviceCopy>(
         &mut self,
         stream: &CudaStream,
-        region: ArenaRegion<T>,
+        offset: usize,
+        bytes: usize,
         source: &[T],
     ) -> EngineResult<()> {
         let started = Instant::now();
-        let end = region
-            .offset_bytes()
-            .checked_add(region.byte_len())
+        let end = offset
+            .checked_add(bytes)
             .ok_or_else(|| EngineError::layout("selective weight destination overflows"))?;
-        match self.plan.preparation_for(
-            ResidentUploadArena::Resident,
-            region.offset_bytes(),
-            region.byte_len(),
-        )? {
+        match self
+            .plan
+            .preparation_for(ResidentUploadArena::Resident, offset, bytes)?
+        {
             ResidentUploadPreparation::BorrowedSource => {
                 // SAFETY: borrowed upload-plan entries point into the admitted snapshot mmaps;
                 // `ResidentModelProgram` retains that snapshot beyond the final arena seal.
                 unsafe {
                     self.arena
-                        .copy_from_host_async(stream, region.offset_bytes()..end, source)?;
+                        .copy_from_host_async(stream, offset..end, source)?;
                 }
             }
             ResidentUploadPreparation::GatheredSource
@@ -2431,7 +2453,7 @@ impl ResidentWeightSink for SelectiveWeightSink<'_> {
                 // can be released by the caller.
                 unsafe {
                     self.arena
-                        .copy_from_host_async(stream, region.offset_bytes()..end, source)?;
+                        .copy_from_host_async(stream, offset..end, source)?;
                 }
                 stream.synchronize().map_err(GpuError::from)?;
             }
@@ -2447,13 +2469,33 @@ impl ResidentWeightSink for SelectiveWeightSink<'_> {
             .ok_or_else(|| EngineError::layout("selective weight-copy time overflows"))?;
         self.bytes = self
             .bytes
-            .checked_add(region.byte_len())
+            .checked_add(bytes)
             .ok_or_else(|| EngineError::layout("resident upload bytes overflow"))?;
         self.submissions = self
             .submissions
             .checked_add(1)
             .ok_or_else(|| EngineError::layout("resident upload submissions overflow"))?;
         Ok(())
+    }
+}
+
+impl ResidentWeightSink for SelectiveWeightSink<'_> {
+    fn copy_from_host<T: DeviceCopy>(
+        &mut self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        source: &[T],
+    ) -> EngineResult<()> {
+        self.copy_source(stream, region.offset_bytes(), region.byte_len(), source)
+    }
+
+    fn copy_bytes_from_host<T: DeviceCopy>(
+        &mut self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        source: &[u8],
+    ) -> EngineResult<()> {
+        self.copy_source(stream, region.offset_bytes(), region.byte_len(), source)
     }
 }
 
@@ -2482,20 +2524,20 @@ fn load_source_weights<S: ResidentWeightSink>(
         "resident endpoint source binding",
         || Ok(TextEndpointBindings::bind(snapshot)?),
     )?;
-    arena.copy_from_host(
+    arena.copy_bytes_from_host(
         stream,
         layout.endpoint.final_norm,
-        &endpoint.final_norm.words().collect::<Vec<_>>(),
+        endpoint.final_norm.bytes(),
     )?;
     arena.copy_from_host(
         stream,
         layout.endpoint.lm_head_codes,
         endpoint.lm_head.codes(),
     )?;
-    arena.copy_from_host(
+    arena.copy_bytes_from_host(
         stream,
         layout.endpoint.lm_head_scales,
-        &endpoint.lm_head_scale.words().collect::<Vec<_>>(),
+        endpoint.lm_head_scale.bytes(),
     )?;
 
     Ok(scalars)
@@ -2516,54 +2558,38 @@ fn load_mixer<S: ResidentWeightSink>(
                 "resident GDN source binding",
                 || Ok(GdnBindings::bind(snapshot, layer)?),
             )?;
-            arena.copy_from_host(
-                stream,
-                weights.input_norm,
-                &source.input_norm.words().collect::<Vec<_>>(),
-            )?;
+            arena.copy_bytes_from_host(stream, weights.input_norm, source.input_norm.bytes())?;
             arena.copy_from_host(stream, weights.input_weight_codes, source.input_weight_e4m3)?;
-            arena.copy_from_host(
+            arena.copy_bytes_from_host(
                 stream,
                 weights.input_weight_scales,
-                &little_endian_words(source.input_scale_bf16)?,
+                source.input_scale_bf16,
             )?;
             let mut control = source.a_control_weight.words().collect::<Vec<_>>();
             control.extend(source.b_control_weight.words());
             arena.copy_from_host(stream, weights.control_weights, &control)?;
-            arena.copy_from_host(
-                stream,
-                weights.a_log,
-                &source.a_log.words().collect::<Vec<_>>(),
-            )?;
-            arena.copy_from_host(
-                stream,
-                weights.dt_bias,
-                &source.dt_bias.words().collect::<Vec<_>>(),
-            )?;
-            arena.copy_from_host(
+            arena.copy_bytes_from_host(stream, weights.a_log, source.a_log.bytes())?;
+            arena.copy_bytes_from_host(stream, weights.dt_bias, source.dt_bias.bytes())?;
+            arena.copy_bytes_from_host(
                 stream,
                 weights.convolution_weights,
-                &source.convolution_weight.words().collect::<Vec<_>>(),
+                source.convolution_weight.bytes(),
             )?;
-            arena.copy_from_host(
-                stream,
-                weights.recurrent_norm,
-                &source.norm.words().collect::<Vec<_>>(),
-            )?;
+            arena.copy_bytes_from_host(stream, weights.recurrent_norm, source.norm.bytes())?;
             arena.copy_from_host(
                 stream,
                 weights.output_weight_codes,
                 source.output_weight.codes(),
             )?;
-            arena.copy_from_host(
+            arena.copy_bytes_from_host(
                 stream,
                 weights.output_weight_scales,
-                &source.output_scale.words().collect::<Vec<_>>(),
+                source.output_scale.bytes(),
             )?;
-            arena.copy_from_host(
+            arena.copy_bytes_from_host(
                 stream,
                 weights.post_attention_norm,
-                &source.post_attention_norm.words().collect::<Vec<_>>(),
+                source.post_attention_norm.bytes(),
             )?;
             Ok(MixerScalars::Gdn)
         }
@@ -2583,41 +2609,25 @@ fn load_mixer<S: ResidentWeightSink>(
                 "resident attention post source binding",
                 || Ok(FullAttentionPostBindings::bind(snapshot, layer)?),
             )?;
-            arena.copy_from_host(
-                stream,
-                weights.input_norm,
-                &source.input_norm.words().collect::<Vec<_>>(),
-            )?;
+            arena.copy_bytes_from_host(stream, weights.input_norm, source.input_norm.bytes())?;
             arena.copy_from_host(stream, weights.qkv_weight_codes, &qkv.weight_e4m3)?;
-            arena.copy_from_host(
-                stream,
-                weights.qkv_weight_scales,
-                &little_endian_words(&qkv.scale_bf16)?,
-            )?;
-            arena.copy_from_host(
-                stream,
-                weights.query_norm,
-                &source.query_norm.words().collect::<Vec<_>>(),
-            )?;
-            arena.copy_from_host(
-                stream,
-                weights.key_norm,
-                &source.key_norm.words().collect::<Vec<_>>(),
-            )?;
+            arena.copy_bytes_from_host(stream, weights.qkv_weight_scales, &qkv.scale_bf16)?;
+            arena.copy_bytes_from_host(stream, weights.query_norm, source.query_norm.bytes())?;
+            arena.copy_bytes_from_host(stream, weights.key_norm, source.key_norm.bytes())?;
             arena.copy_from_host(
                 stream,
                 weights.output_weight_codes,
                 source.output_weight.codes(),
             )?;
-            arena.copy_from_host(
+            arena.copy_bytes_from_host(
                 stream,
                 weights.output_weight_scales,
-                &source.output_scale.words().collect::<Vec<_>>(),
+                source.output_scale.bytes(),
             )?;
-            arena.copy_from_host(
+            arena.copy_bytes_from_host(
                 stream,
                 weights.post_attention_norm,
-                &source.post_attention_norm.words().collect::<Vec<_>>(),
+                source.post_attention_norm.bytes(),
             )?;
             Ok(MixerScalars::Attention(AttentionScalars {
                 key_cache_scale: bf16_to_f32(source.key_cache_scale_bf16),
@@ -2689,17 +2699,13 @@ fn load_mlp<S: ResidentWeightSink>(
                 || Ok(DenseFp8DownBindings::bind(snapshot, layer)?),
             )?;
             arena.copy_from_host(stream, weights.gate_up_weight_codes, gate_up.weight_e4m3)?;
-            arena.copy_from_host(
+            arena.copy_bytes_from_host(
                 stream,
                 weights.gate_up_weight_scales,
-                &little_endian_words(gate_up.scale_bf16)?,
+                gate_up.scale_bf16,
             )?;
             arena.copy_from_host(stream, weights.down_weight_codes, down.weight.codes())?;
-            arena.copy_from_host(
-                stream,
-                weights.down_weight_scales,
-                &down.scale.words().collect::<Vec<_>>(),
-            )?;
+            arena.copy_bytes_from_host(stream, weights.down_weight_scales, down.scale.bytes())?;
             Ok(MlpScalars::DenseFp8)
         }
     }
@@ -2950,19 +2956,6 @@ fn copy_embedding_row(source: &[u8], token: usize, destination: &mut [u16]) -> E
     Ok(())
 }
 
-fn little_endian_words(bytes: &[u8]) -> EngineResult<Vec<u16>> {
-    let (words, remainder) = bytes.as_chunks::<2>();
-    if !remainder.is_empty() {
-        return Err(EngineError::layout(
-            "resident BF16 source plane has an odd byte length",
-        ));
-    }
-    Ok(words
-        .iter()
-        .map(|bytes| u16::from_le_bytes(*bytes))
-        .collect())
-}
-
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
@@ -3001,10 +2994,7 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        bf16_to_f32, decode_lengths, little_endian_words, require_batch, select_decode_route,
-        slot_rows,
-    };
+    use super::{bf16_to_f32, decode_lengths, require_batch, select_decode_route, slot_rows};
     use crate::EngineErrorCode;
 
     #[test]
@@ -3093,12 +3083,7 @@ mod tests {
     }
 
     #[test]
-    fn represented_source_words_are_not_numerically_reencoded() {
-        assert_eq!(
-            little_endian_words(&[0x80, 0x3f, 0x00, 0xbf]).unwrap(),
-            [0x3f80, 0xbf00]
-        );
+    fn bf16_word_widens_exactly() {
         assert_eq!(bf16_to_f32(0x3f80).to_bits(), 1.0f32.to_bits());
-        assert!(little_endian_words(&[0]).is_err());
     }
 }
