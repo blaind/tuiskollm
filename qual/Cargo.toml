@@ -46,6 +46,11 @@ path = "src/bin/bench_device.rs"
 required-features = ["residual-benchmark"]
 
 [[bin]]
+name = "bench-startup"
+path = "src/bin/bench_startup.rs"
+required-features = ["device"]
+
+[[bin]]
 name = "qualify-frontend"
 path = "src/bin/qualify_frontend.rs"
 
