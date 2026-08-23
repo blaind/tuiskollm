@@ -59,12 +59,14 @@ Run the host checks relevant to every change:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --exclude tuisko-gpu --exclude tuisko-kernels-sm86 \
+cargo clippy --workspace --exclude tuiskollm --exclude tuisko-engine \
+  --exclude tuisko-gpu --exclude tuisko-kernels-sm86 \
   --exclude tuisko-kernels-sm89 --exclude tuisko-kernels-sm120 \
-  --exclude tuisko-qual --all-targets -- -D warnings
-cargo test --workspace --exclude tuisko-gpu --exclude tuisko-kernels-sm86 \
+  --exclude tuisko-qual --exclude tuisko-serve --all-targets -- -D warnings
+cargo test --workspace --exclude tuiskollm --exclude tuisko-engine \
+  --exclude tuisko-gpu --exclude tuisko-kernels-sm86 \
   --exclude tuisko-kernels-sm89 --exclude tuisko-kernels-sm120 \
-  --exclude tuisko-qual
+  --exclude tuisko-qual --exclude tuisko-serve
 cargo deny --workspace --all-features check
 ```
 
