@@ -401,6 +401,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-frontend") => qualify_frontend(root, &remaining),
         Some("qualify-generation") => qualify_generation(root, &remaining),
         Some("qualify-residual-norm") if remaining.is_empty() => qualify_residual_norm(root),
+        Some("qualify-qwen35-residual-norm") if remaining.is_empty() => {
+            qualify_qwen35_residual_norm(root)
+        }
         Some("qualify-fp8-qkv") if remaining.is_empty() => qualify_fp8_qkv(root),
         Some("qualify-fp8-gdn-input") if remaining.is_empty() => qualify_fp8_gdn_input(root),
         Some("qualify-fp8-lm-head") if remaining.is_empty() => qualify_fp8_lm_head(root),
@@ -455,6 +458,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("bench-text-endpoint") => bench_text_endpoint(root, &remaining),
         Some("gate-residual-norm") if remaining.is_empty() => gate_residual_norm(root),
+        Some("gate-qwen35-residual-norm") if remaining.is_empty() => {
+            gate_qwen35_residual_norm(root)
+        }
         Some("gate-fp8-qkv") if remaining.is_empty() => gate_fp8_qkv(root),
         Some("gate-fp8-gdn-input") if remaining.is_empty() => gate_fp8_gdn_input(root),
         Some("gate-fp8-lm-head") if remaining.is_empty() => gate_fp8_lm_head(root),
@@ -485,6 +491,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "build-residual-bench"
                     | "build-server"
                     | "qualify-residual-norm"
+                    | "qualify-qwen35-residual-norm"
                     | "qualify-fp8-qkv"
                     | "qualify-fp8-gdn-input"
                     | "qualify-fp8-lm-head"
@@ -500,6 +507,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-long-context-paged-gqa"
                     | "qualify-attention-output"
                     | "gate-residual-norm"
+                    | "gate-qwen35-residual-norm"
                     | "gate-fp8-qkv"
                     | "gate-fp8-gdn-input"
                     | "gate-fp8-lm-head"
@@ -652,6 +660,7 @@ fn build_server(root: &Path) -> Result<(), Box<dyn Error>> {
 
 fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_residual_norm(root)?;
+    gate_qwen35_residual_norm(root)?;
     gate_fp8_qkv(root)?;
     gate_fp8_gdn_input(root)?;
     gate_fp8_lm_head(root)?;
@@ -812,6 +821,31 @@ fn qualify_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     gate_residual_norm(root)
+}
+
+fn qualify_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "residual_norm::tests::qwen35_exact_batches_match_independent_oracles_and_graph_replay",
+            "--include-ignored",
+            "--nocapture",
+        ],
+    )?;
+    gate_qwen35_residual_norm(root)
 }
 
 fn qualify_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -2999,6 +3033,99 @@ pub(crate) fn gate_residual_norm_target(
         plain_registers,
         residual_registers,
         shared
+    );
+    Ok(())
+}
+
+fn gate_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; run the pinned release device build first",
+            ptx_path.display()
+        )
+    })?;
+    let entries = parse_entries(&ptx);
+    let plain = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen35_rms_norm_TID_"))
+        .collect::<Vec<_>>();
+    let residual = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen35_residual_rms_norm_TID_"))
+        .collect::<Vec<_>>();
+    require_count("Qwen3.5 plain RMSNorm", plain.len(), 8)?;
+    require_count("Qwen3.5 residual RMSNorm", residual.len(), 8)?;
+
+    for entry in plain.iter().chain(&residual) {
+        if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 512-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let temporary = root.join("target/tmp");
+    fs::create_dir_all(&temporary)?;
+    let cubin = temporary.join("qwen35-residual-norm-sm120-gate.cubin");
+    let ptxas = cuda_tool("ptxas");
+    require_success(
+        &ptxas,
+        &[
+            OsStr::new("-O3"),
+            OsStr::new("--gpu-name"),
+            OsStr::new("sm_120a"),
+            ptx_path.as_os_str(),
+            OsStr::new("--output-file"),
+            cubin.as_os_str(),
+        ],
+    )?;
+    let cuobjdump = cuda_tool("cuobjdump");
+    let resources = require_success(
+        &cuobjdump,
+        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+    )?;
+    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
+    let sass = String::from_utf8(sass.stdout)?;
+    let mut plain_registers = Vec::with_capacity(plain.len());
+    let mut residual_registers = Vec::with_capacity(residual.len());
+    let mut shared = Vec::with_capacity(plain.len() + residual.len());
+
+    for (family, entries, registers) in [
+        ("plain", &plain, &mut plain_registers),
+        ("residual", &residual, &mut residual_registers),
+    ] {
+        for entry in entries {
+            let resource = resources.get(entry.name).ok_or_else(|| {
+                format!("cuobjdump omitted Qwen3.5 {family} entry `{}`", entry.name)
+            })?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+            shared.push(resource.shared);
+
+            let body = sass_function_body(&sass, entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+            for instruction in ["MUFU.RSQ", "F2FP.BF16.F32.PACK_AB"] {
+                if !body.contains(instruction) {
+                    return Err(format!(
+                        "entry `{}` lost required `{instruction}` SASS",
+                        entry.name
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    plain_registers.sort_unstable();
+    residual_registers.sort_unstable();
+    shared.sort_unstable();
+
+    println!(
+        "Qwen3.5 residual-norm gate passed: 8 plain + 8 residual entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/BF16 pack present",
+        plain_registers, residual_registers, shared
     );
     Ok(())
 }

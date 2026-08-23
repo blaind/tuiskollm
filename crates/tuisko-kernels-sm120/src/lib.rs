@@ -26,7 +26,7 @@ pub use gdn::{GdnPrepareOp, GdnRecurrenceOp};
 pub use inventory::kernel_ptx_names;
 pub use nvfp4_down::Nvfp4DownOp;
 pub use nvfp4_swiglu::Nvfp4SwiGluOp;
-pub use residual_norm::ResidualNormOp;
+pub use residual_norm::{Qwen35ResidualNormOp, ResidualNormOp};
 
 #[cfg(test)]
 pub(crate) mod test_arch {
