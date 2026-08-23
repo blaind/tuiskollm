@@ -47,11 +47,16 @@ pub(crate) enum PerformanceSuite {
     Nvfp4Down,
 }
 
-const PERFORMANCE_SUITES: [PerformanceSuite; 4] = [
+const PERFORMANCE_SUITES: [PerformanceSuite; 9] = [
     PerformanceSuite::ResidualNorm,
     PerformanceSuite::Fp8Qkv,
     PerformanceSuite::Fp8GdnInput,
     PerformanceSuite::Fp8LmHead,
+    PerformanceSuite::Fp8SwiGlu,
+    PerformanceSuite::Fp8Down,
+    PerformanceSuite::GdnPrepare,
+    PerformanceSuite::GdnRecurrence,
+    PerformanceSuite::GdnOutput,
 ];
 
 impl PerformanceSuite {
@@ -953,7 +958,7 @@ fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
     if mode == "bless" {
         let [_, suite] = arguments else {
             return Err(
-                "usage: cargo run -p xtask -- perf bless <residual-norm|fp8-qkv|fp8-gdn-input|fp8-lm-head>"
+                "usage: cargo run -p xtask -- perf bless <residual-norm|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|gdn-prepare|gdn-recurrence|gdn-output>"
                     .into(),
             );
         };
@@ -2799,7 +2804,17 @@ mod tests {
 
         assert_eq!(
             names,
-            ["residual-norm", "fp8-qkv", "fp8-gdn-input", "fp8-lm-head"]
+            [
+                "residual-norm",
+                "fp8-qkv",
+                "fp8-gdn-input",
+                "fp8-lm-head",
+                "fp8-swiglu",
+                "fp8-down",
+                "gdn-prepare",
+                "gdn-recurrence",
+                "gdn-output",
+            ]
         );
         for suite in PERFORMANCE_SUITES {
             assert_eq!(
