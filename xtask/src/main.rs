@@ -1552,9 +1552,10 @@ fn qualify_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "attention_output::tests",
+            "attention_output_suite_",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_attention_output(root)
@@ -5897,8 +5898,22 @@ fn gate_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("attention_output_projection_TID_"))
         .collect::<Vec<_>>();
+    let prefill = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("attention_output_projection_mma_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    let macro_prefill = entries
+        .iter()
+        .filter(|entry| entry.name == "attention_output_projection_mma_t1024")
+        .collect::<Vec<_>>();
     require_count("attention-output gate quantization", quantize.len(), 1)?;
     require_count("attention-output projection", projection.len(), 8)?;
+    require_count("attention-output T=32/64/128 projection", prefill.len(), 3)?;
+    require_count("attention-output T=1024 projection", macro_prefill.len(), 1)?;
     for entry in quantize.iter().chain(&projection) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
@@ -5907,6 +5922,20 @@ fn gate_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
+    }
+    for entry in &prefill {
+        if !entry.body.contains(".reqntid 64, 1, 1") || !entry.body.contains(".minnctapersm 4") {
+            return Err(format!(
+                "entry `{}` lost its 64-thread/four-CTA prefill launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    if !macro_prefill[0].body.contains(".reqntid 128, 1, 1")
+        || !macro_prefill[0].body.contains(".minnctapersm 4")
+    {
+        return Err("attention-output T=1024 lost its 128-thread/four-CTA launch bounds".into());
     }
 
     let artifact = sm120_gate_artifact(root)?;
@@ -5961,12 +5990,49 @@ fn gate_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
     require_registers(&baseline, "projection_registers", &projection_registers)?;
     require_uniform_value(&baseline, "projection_shared_bytes", &projection_shared)?;
 
+    let mut prefill_registers = Vec::new();
+    let mut prefill_shared = Vec::new();
+    for entry in prefill.iter().chain(&macro_prefill) {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        for instruction in ["QMMA.16832.F32.E4M3.E4M3", "LDGSTS"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+        prefill_registers.push(resource.registers);
+        prefill_shared.push(resource.shared);
+    }
+    prefill_registers.sort_unstable();
+    if baseline.contains_key("prefill_projection_registers") {
+        require_registers(
+            &baseline,
+            "prefill_projection_registers",
+            &prefill_registers,
+        )?;
+    }
+    if baseline.contains_key("prefill_projection_shared_bytes") {
+        require_uniform_value(
+            &baseline,
+            "prefill_projection_shared_bytes",
+            &prefill_shared,
+        )?;
+    }
+
     println!(
-        "attention output gate passed: 1 quantize + 8 projection entries, REG {} / {:?}, STACK:0 LOCAL:0, SHARED {} / {:?}, EX2/E4M3/SHFL present",
+        "attention output gate passed: 1 quantize + 8 decode + 4 prefill projection entries, REG {} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {} / {:?} / {:?}, EX2/E4M3/SHFL/QMMA/LDGSTS present",
         quantize_resource.registers,
         projection_registers,
+        prefill_registers,
         quantize_resource.shared,
         projection_shared,
+        prefill_shared,
     );
     Ok(())
 }

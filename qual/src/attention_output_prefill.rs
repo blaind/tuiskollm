@@ -1,4 +1,4 @@
-//! Numerical, seam, and graph qualification for gated FP8 attention output.
+//! Numerical, seam, and graph qualification for exact attention-output prefill routes.
 
 use crate::fp8_projection_oracle::{
     BF16_SENTINEL, BYTE_SENTINEL, F32_SENTINEL_BITS, SCALE_VALUES, WEIGHT_CODES, bf16_to_f32,
@@ -6,21 +6,22 @@ use crate::fp8_projection_oracle::{
 };
 use crate::{DeviceBenchmarkError, device_benchmark};
 use tuisko_gpu::{
-    ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
+    ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     device_memory_info,
 };
 use tuisko_kernels_sm120::AttentionOutputOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
-const MAX_BATCH: usize = 8;
+const ROUTES: [usize; 4] = [32, 64, 128, 1_024];
+const MAX_ROWS: usize = 1_024;
 const ALIGNMENT: usize = 256;
 const FP8_MAX: f32 = 448.0;
 const GATE_PATTERN: [f32; 8] = [0.0, -1.0, -0.5, -0.25, 0.25, 0.5, 0.75, 1.0];
-const TOKEN_FACTORS: [f32; MAX_BATCH] = [1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125];
+const TOKEN_FACTORS: [f32; 8] = [1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125];
 
-/// Failure of the exact attention-output qualification gate.
 #[derive(Debug, thiserror::Error)]
-pub enum AttentionOutputQualificationError {
+/// Failure of exact attention-output prefill qualification.
+pub enum AttentionOutputPrefillQualificationError {
     /// GPU ownership, launch, or driver failure.
     #[error(transparent)]
     Gpu(#[from] GpuError),
@@ -28,36 +29,36 @@ pub enum AttentionOutputQualificationError {
     #[error(transparent)]
     Precondition(#[from] DeviceBenchmarkError),
     /// Device behavior disagreed with the independent mathematical contract.
-    #[error("attention-output qualification failed: {0}")]
+    #[error("attention-output prefill qualification failed: {0}")]
     Mismatch(String),
 }
 
-/// Observable counts, storage ownership, and worst error across exact `B=1..8`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AttentionOutputQualification {
-    /// Gated FP32 values compared with mathematical sigmoid.
+/// Complete observable accounting across T=32/64/128/1024.
+pub struct AttentionOutputPrefillQualification {
+    /// Gated FP32 values checked against mathematical sigmoid.
     pub gated_values: usize,
-    /// Dynamic E4M3 activation codes compared bit-exactly.
+    /// Dynamic E4M3 activation codes checked bit-exactly.
     pub activation_codes: usize,
-    /// Dynamic FP32 activation scales compared bit-exactly.
+    /// Dynamic FP32 scales checked bit-exactly.
     pub activation_scales: usize,
-    /// BF16 projection values compared with the represented-value oracle.
+    /// BF16 projection values checked against represented-value accumulation.
     pub output_values: usize,
-    /// Complete mutable arena seams reproduced by CUDA Graph replay.
+    /// Mutable arena values reproduced by CUDA Graph replay.
     pub graph_replay_values: usize,
-    /// Sentinel values proved untouched outside each exact batch.
+    /// Inactive sentinel values proved untouched.
     pub inactive_values: usize,
-    /// Read-only fused QKV and projection-weight values proved unchanged.
+    /// Read-only QKV and weight values proved unchanged.
     pub immutable_input_values: usize,
-    /// Exact bytes in the one-allocation qualification arena.
+    /// Exact bytes in the single qualification arena.
     pub arena_bytes: usize,
-    /// Alignment padding bytes in that arena.
+    /// Exact alignment padding bytes in that arena.
     pub padding_bytes: usize,
-    /// Largest absolute gated-FP32 error.
+    /// Largest gated-FP32 absolute error.
     pub maximum_gated_error: f32,
-    /// Largest absolute BF16 projection error.
+    /// Largest projection absolute error.
     pub maximum_projection_error: f32,
-    /// Largest relative BF16 projection error, with a nonzero denominator floor.
+    /// Largest projection relative error.
     pub maximum_projection_relative_error: f32,
 }
 
@@ -105,14 +106,14 @@ struct Observed {
     output: Vec<u16>,
 }
 
-/// Qualifies eager and captured attention-output routes at exact `B=1..=8`.
-pub fn qualify_attention_output()
--> Result<AttentionOutputQualification, AttentionOutputQualificationError> {
+/// Qualifies every exact attention-output prefill route and public seam.
+pub fn qualify_attention_output_prefill()
+-> Result<AttentionOutputPrefillQualification, AttentionOutputPrefillQualificationError> {
     let _preflight = device_benchmark::preflight()?;
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
     if capability != (12, 0) {
-        return Err(AttentionOutputQualificationError::Mismatch(format!(
+        return Err(AttentionOutputPrefillQualificationError::Mismatch(format!(
             "device zero has compute capability {}.{}, expected 12.0",
             capability.0, capability.1
         )));
@@ -125,7 +126,7 @@ pub fn qualify_attention_output()
     load_immutable(&arena, &stream, regions, &fixture)?;
     let op = AttentionOutputOp::new(&context)?;
     let stable_addresses = addresses(&arena, regions)?;
-    let mut report = AttentionOutputQualification {
+    let mut report = AttentionOutputPrefillQualification {
         gated_values: 0,
         activation_codes: 0,
         activation_scales: 0,
@@ -140,24 +141,24 @@ pub fn qualify_attention_output()
         maximum_projection_relative_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
-        reset(&arena, &stream, regions, &fixture, batch)?;
-        launch(&op, &arena, &stream, regions, batch)?;
+    for rows in ROUTES {
+        reset(&arena, &stream, regions, &fixture, rows)?;
+        launch(&op, &arena, &stream, regions, rows)?;
         let eager = observe(&arena, &stream, regions)?;
-        verify_eager(batch, &oracles, &eager, &mut report)?;
+        verify_eager(rows, &oracles, &eager, &mut report)?;
         verify_immutable(&arena, &stream, regions, &fixture, &mut report)?;
 
-        reset(&arena, &stream, regions, &fixture, batch)?;
+        reset(&arena, &stream, regions, &fixture, rows)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
+        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, rows))?;
         graph.launch(&stream)?;
         let replay = observe(&arena, &stream, regions)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
         verify_immutable(&arena, &stream, regions, &fixture, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
-            return Err(AttentionOutputQualificationError::Mismatch(format!(
-                "device addresses changed while qualifying B={batch}"
+            return Err(AttentionOutputPrefillQualificationError::Mismatch(format!(
+                "device addresses changed while qualifying T={rows}"
             )));
         }
     }
@@ -170,17 +171,17 @@ pub fn qualify_attention_output()
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let attention = layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
-    let qkv = layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_QKV_ROWS, ALIGNMENT)?;
+    let attention = layout.reserve(MAX_ROWS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let qkv = layout.reserve(MAX_ROWS * Qwen38_27B::ATTENTION_QKV_ROWS, ALIGNMENT)?;
     let activation_codes =
-        layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
-    let activation_scales = layout.reserve(MAX_BATCH, ALIGNMENT)?;
+        layout.reserve(MAX_ROWS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let activation_scales = layout.reserve(MAX_ROWS, ALIGNMENT)?;
     let weight_codes = layout.reserve(
         Qwen38_27B::HIDDEN * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS,
         ALIGNMENT,
     )?;
     let weight_scales = layout.reserve(Qwen38_27B::HIDDEN, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * Qwen38_27B::HIDDEN, ALIGNMENT)?;
+    let output = layout.reserve(MAX_ROWS * Qwen38_27B::HIDDEN, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -197,7 +198,7 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
 }
 
 fn fixture() -> Fixture {
-    let attention = (0..MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS)
+    let attention = (0..MAX_ROWS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS)
         .map(|index| {
             let token = index / Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
             let column = index - token * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
@@ -210,11 +211,11 @@ fn fixture() -> Fixture {
             } else {
                 -1.0
             };
-            sign * magnitude * TOKEN_FACTORS[token]
+            sign * magnitude * TOKEN_FACTORS[token & 7]
         })
         .collect::<Vec<_>>();
-    let mut qkv = vec![BF16_SENTINEL; MAX_BATCH * Qwen38_27B::ATTENTION_QKV_ROWS];
-    for token in 0..MAX_BATCH {
+    let mut qkv = vec![BF16_SENTINEL; MAX_ROWS * Qwen38_27B::ATTENTION_QKV_ROWS];
+    for token in 0..MAX_ROWS {
         for head in 0..Qwen38_27B::NUM_ATTENTION_HEADS {
             for dimension in 0..Qwen38_27B::HEAD_DIM {
                 let gate = token * Qwen38_27B::ATTENTION_QKV_ROWS
@@ -244,8 +245,10 @@ fn fixture() -> Fixture {
     }
 }
 
-fn make_oracles(fixture: &Fixture) -> Result<Vec<TokenOracle>, AttentionOutputQualificationError> {
-    (0..MAX_BATCH)
+fn make_oracles(
+    fixture: &Fixture,
+) -> Result<Vec<TokenOracle>, AttentionOutputPrefillQualificationError> {
+    (0..8)
         .map(|token| {
             let gated = (0..Qwen38_27B::ATTENTION_OUTPUT_COLUMNS)
                 .map(|column| {
@@ -272,15 +275,16 @@ fn make_oracles(fixture: &Fixture) -> Result<Vec<TokenOracle>, AttentionOutputQu
                 .iter()
                 .map(|&value| encode_e4m3fn(value / scale))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(AttentionOutputQualificationError::Mismatch)?;
+                .map_err(AttentionOutputPrefillQualificationError::Mismatch)?;
             let mut correlations = [0.0f64; 4];
             for (column, &code) in codes.iter().enumerate() {
                 let activation = f64::from(
-                    decode_e4m3fn(code).map_err(AttentionOutputQualificationError::Mismatch)?,
+                    decode_e4m3fn(code)
+                        .map_err(AttentionOutputPrefillQualificationError::Mismatch)?,
                 );
                 for phase in 0..4 {
                     let weight = decode_e4m3fn(WEIGHT_CODES[(phase + column) & 3])
-                        .map_err(AttentionOutputQualificationError::Mismatch)?;
+                        .map_err(AttentionOutputPrefillQualificationError::Mismatch)?;
                     correlations[phase] += activation * f64::from(weight);
                 }
             }
@@ -297,7 +301,7 @@ fn make_oracles(fixture: &Fixture) -> Result<Vec<TokenOracle>, AttentionOutputQu
 
 fn load_immutable(
     arena: &DeviceArena,
-    stream: &tuisko_gpu::CudaStream,
+    stream: &CudaStream,
     regions: Regions,
     fixture: &Fixture,
 ) -> GpuResult<()> {
@@ -308,16 +312,16 @@ fn load_immutable(
 
 fn reset(
     arena: &DeviceArena,
-    stream: &tuisko_gpu::CudaStream,
+    stream: &CudaStream,
     regions: Regions,
     fixture: &Fixture,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     arena.fill(stream, regions.attention, BYTE_SENTINEL)?;
     arena.copy_prefix_from_host(
         stream,
         regions.attention,
-        &fixture.attention[..batch * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS],
+        &fixture.attention[..rows * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS],
     )?;
     arena.fill(stream, regions.activation_codes, BYTE_SENTINEL)?;
     arena.fill(stream, regions.activation_scales, BYTE_SENTINEL)?;
@@ -339,15 +343,15 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 7]> {
 fn launch(
     op: &AttentionOutputOp,
     arena: &DeviceArena,
-    stream: &tuisko_gpu::CudaStream,
+    stream: &CudaStream,
     regions: Regions,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
-    // SAFETY: every region is aligned, disjoint, context-local, and covers B=8.
+    // SAFETY: every region is aligned, disjoint, context-local, and covers T=1024.
     unsafe {
         op.launch(
             stream,
-            batch,
+            rows,
             arena.address(regions.attention)?,
             arena.address(regions.qkv)?,
             arena.address(regions.activation_codes)?,
@@ -359,11 +363,7 @@ fn launch(
     }
 }
 
-fn observe(
-    arena: &DeviceArena,
-    stream: &tuisko_gpu::CudaStream,
-    regions: Regions,
-) -> GpuResult<Observed> {
+fn observe(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuResult<Observed> {
     Ok(Observed {
         attention: arena.copy_to_host(stream, regions.attention)?,
         activation_codes: arena.copy_to_host(stream, regions.activation_codes)?,
@@ -373,13 +373,14 @@ fn observe(
 }
 
 fn verify_eager(
-    batch: usize,
+    rows: usize,
     oracles: &[TokenOracle],
     observed: &Observed,
-    report: &mut AttentionOutputQualification,
-) -> Result<(), AttentionOutputQualificationError> {
+    report: &mut AttentionOutputPrefillQualification,
+) -> Result<(), AttentionOutputPrefillQualificationError> {
     let columns = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
-    for (token, oracle) in oracles[..batch].iter().enumerate() {
+    for token in 0..rows {
+        let oracle = &oracles[token & 7];
         let begin = token * columns;
         for (column, (&actual, &expected)) in observed.attention[begin..begin + columns]
             .iter()
@@ -390,8 +391,8 @@ fn verify_eager(
             report.maximum_gated_error = report.maximum_gated_error.max(error);
             let tolerance = 0.000_05f32.max(expected.abs() * 0.000_25);
             if !actual.is_finite() || error > tolerance {
-                return Err(AttentionOutputQualificationError::Mismatch(format!(
-                    "gated value at B={batch}, token={token}, column={column}: device={actual}, oracle={expected}, tolerance={tolerance}"
+                return Err(AttentionOutputPrefillQualificationError::Mismatch(format!(
+                    "gated value at T={rows}, token={token}, column={column}: device={actual}, oracle={expected}, tolerance={tolerance}"
                 )));
             }
         }
@@ -400,13 +401,13 @@ fn verify_eager(
             .zip(&oracle.codes)
             .position(|(actual, expected)| actual != expected)
         {
-            return Err(AttentionOutputQualificationError::Mismatch(format!(
-                "activation code at B={batch}, token={token}, column={column} differs"
+            return Err(AttentionOutputPrefillQualificationError::Mismatch(format!(
+                "activation code at T={rows}, token={token}, column={column} differs"
             )));
         }
         if observed.activation_scales[token].to_bits() != oracle.scale.to_bits() {
-            return Err(AttentionOutputQualificationError::Mismatch(format!(
-                "activation scale at B={batch}, token={token}: device={}, oracle={} differs",
+            return Err(AttentionOutputPrefillQualificationError::Mismatch(format!(
+                "activation scale at T={rows}, token={token}: device={}, oracle={} differs",
                 observed.activation_scales[token], oracle.scale
             )));
         }
@@ -422,60 +423,60 @@ fn verify_eager(
                 report.maximum_projection_relative_error.max(relative_error);
             let tolerance = 0.125f32.max(expected.abs() as f32 * 0.015);
             if !actual.is_finite() || error > tolerance {
-                return Err(AttentionOutputQualificationError::Mismatch(format!(
-                    "projection at B={batch}, token={token}, row={row}: device={actual}, oracle={expected}, tolerance={tolerance}"
+                return Err(AttentionOutputPrefillQualificationError::Mismatch(format!(
+                    "projection at T={rows}, token={token}, row={row}: device={actual}, oracle={expected}, tolerance={tolerance}"
                 )));
             }
         }
     }
-    verify_inactive(batch, observed)?;
-    report.gated_values += batch * columns;
-    report.activation_codes += batch * columns;
-    report.activation_scales += batch;
-    report.output_values += batch * Qwen38_27B::HIDDEN;
-    report.inactive_values += inactive_values(batch);
+    verify_inactive(rows, observed)?;
+    report.gated_values += rows * columns;
+    report.activation_codes += rows * columns;
+    report.activation_scales += rows;
+    report.output_values += rows * Qwen38_27B::HIDDEN;
+    report.inactive_values += inactive_values(rows);
 
     Ok(())
 }
 
 fn verify_inactive(
-    batch: usize,
+    rows: usize,
     observed: &Observed,
-) -> Result<(), AttentionOutputQualificationError> {
-    let attention_begin = batch * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
-    let output_begin = batch * Qwen38_27B::HIDDEN;
+) -> Result<(), AttentionOutputPrefillQualificationError> {
+    let attention_begin = rows * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
+    let output_begin = rows * Qwen38_27B::HIDDEN;
     if observed.attention[attention_begin..]
         .iter()
         .any(|value| value.to_bits() != F32_SENTINEL_BITS)
         || observed.activation_codes[attention_begin..]
             .iter()
             .any(|&value| value != BYTE_SENTINEL)
-        || observed.activation_scales[batch..]
+        || observed.activation_scales[rows..]
             .iter()
             .any(|value| value.to_bits() != F32_SENTINEL_BITS)
         || observed.output[output_begin..]
             .iter()
             .any(|&value| value != BF16_SENTINEL)
     {
-        return Err(AttentionOutputQualificationError::Mismatch(format!(
-            "B={batch} modified an inactive value"
+        return Err(AttentionOutputPrefillQualificationError::Mismatch(format!(
+            "T={rows} modified an inactive value"
         )));
     }
 
     Ok(())
 }
 
-fn inactive_values(batch: usize) -> usize {
-    (MAX_BATCH - batch) * (2 * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS + 1 + Qwen38_27B::HIDDEN)
+fn inactive_values(rows: usize) -> usize {
+    (MAX_ROWS - rows) * (2 * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS + 1 + Qwen38_27B::HIDDEN)
 }
 
 fn verify_immutable(
     arena: &DeviceArena,
-    stream: &tuisko_gpu::CudaStream,
+    stream: &CudaStream,
     regions: Regions,
     fixture: &Fixture,
-    report: &mut AttentionOutputQualification,
-) -> Result<(), AttentionOutputQualificationError> {
+    report: &mut AttentionOutputPrefillQualification,
+) -> Result<(), AttentionOutputPrefillQualificationError> {
     macro_rules! check {
         ($region:expr, $expected:expr, $name:literal) => {{
             let actual = arena.copy_to_host(stream, $region)?;
@@ -484,7 +485,7 @@ fn verify_immutable(
                 .zip($expected)
                 .position(|(actual, expected)| actual != expected)
             {
-                return Err(AttentionOutputQualificationError::Mismatch(format!(
+                return Err(AttentionOutputPrefillQualificationError::Mismatch(format!(
                     "read-only {} changed at index {index}",
                     $name
                 )));
@@ -505,11 +506,11 @@ fn verify_immutable(
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     eager: &Observed,
     replay: &Observed,
-    report: &mut AttentionOutputQualification,
-) -> Result<(), AttentionOutputQualificationError> {
+    report: &mut AttentionOutputPrefillQualification,
+) -> Result<(), AttentionOutputPrefillQualificationError> {
     let same = replay
         .attention
         .iter()
@@ -523,16 +524,16 @@ fn verify_replay(
             .eq(eager.activation_scales.iter().map(|value| value.to_bits()))
         && replay.output == eager.output;
     if !same {
-        return Err(AttentionOutputQualificationError::Mismatch(format!(
-            "B={batch} graph replay differs from eager"
+        return Err(AttentionOutputPrefillQualificationError::Mismatch(format!(
+            "T={rows} graph replay differs from eager"
         )));
     }
-    verify_inactive(batch, replay)?;
+    verify_inactive(rows, replay)?;
     report.graph_replay_values += replay.attention.len()
         + replay.activation_codes.len()
         + replay.activation_scales.len()
         + replay.output.len();
-    report.inactive_values += inactive_values(batch);
+    report.inactive_values += inactive_values(rows);
 
     Ok(())
 }
@@ -541,28 +542,31 @@ fn verify_no_post_warmup_allocation(
     context: &CudaContext,
     op: &AttentionOutputOp,
     arena: &DeviceArena,
-    stream: &tuisko_gpu::CudaStream,
+    stream: &CudaStream,
     regions: Regions,
     fixture: &Fixture,
-) -> Result<(), AttentionOutputQualificationError> {
-    reset(arena, stream, regions, fixture, MAX_BATCH)?;
-    let graphs = (1..=MAX_BATCH)
-        .map(|batch| CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch)))
-        .collect::<GpuResult<Vec<_>>>()?;
+) -> Result<(), AttentionOutputPrefillQualificationError> {
+    let mut graphs = Vec::with_capacity(ROUTES.len());
+    for rows in ROUTES {
+        reset(arena, stream, regions, fixture, rows)?;
+        graphs.push(CudaGraph::capture(stream, || {
+            launch(op, arena, stream, regions, rows)
+        })?);
+    }
     for graph in &graphs {
         graph.launch(stream)?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
-        for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
-            graphs[batch - 1].launch(stream)?;
+        for graph in graphs.iter().rev() {
+            graph.launch(stream)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
     let after = device_memory_info(context)?;
     if before != after {
-        return Err(AttentionOutputQualificationError::Mismatch(format!(
+        return Err(AttentionOutputPrefillQualificationError::Mismatch(format!(
             "device memory changed after warmup: before={before:?}, after={after:?}"
         )));
     }
@@ -572,19 +576,19 @@ fn verify_no_post_warmup_allocation(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, Qwen38_27B, layout, qualify_attention_output};
-    use tuisko_model::Arch;
+    use super::{MAX_ROWS, ROUTES, layout, qualify_attention_output_prefill};
+    use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn attention_output_suite_decode_routes_match_independent_oracles_and_graph_replay()
-    -> Result<(), super::AttentionOutputQualificationError> {
-        let report = qualify_attention_output()?;
-        let active = (1..=MAX_BATCH).sum::<usize>();
-        let mutable = 2 * MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS
-            + MAX_BATCH
-            + MAX_BATCH * Qwen38_27B::HIDDEN;
-        let immutable = MAX_BATCH * Qwen38_27B::ATTENTION_QKV_ROWS
+    fn attention_output_suite_prefill_routes_match_every_oracle_seam_and_graph_replay()
+    -> Result<(), super::AttentionOutputPrefillQualificationError> {
+        let report = qualify_attention_output_prefill()?;
+        let active = ROUTES.into_iter().sum::<usize>();
+        let mutable = 2 * MAX_ROWS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS
+            + MAX_ROWS
+            + MAX_ROWS * Qwen38_27B::HIDDEN;
+        let immutable = MAX_ROWS * Qwen38_27B::ATTENTION_QKV_ROWS
             + Qwen38_27B::HIDDEN * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS
             + Qwen38_27B::HIDDEN;
 
@@ -595,21 +599,25 @@ mod tests {
         assert_eq!(report.activation_codes, report.gated_values);
         assert_eq!(report.activation_scales, active);
         assert_eq!(report.output_values, active * Qwen38_27B::HIDDEN);
-        assert_eq!(report.graph_replay_values, MAX_BATCH * mutable);
+        assert_eq!(report.graph_replay_values, ROUTES.len() * mutable);
         assert_eq!(
             report.inactive_values,
-            2 * (0..MAX_BATCH).sum::<usize>()
-                * (2 * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS + 1 + Qwen38_27B::HIDDEN)
+            2 * ROUTES
+                .into_iter()
+                .map(|rows| {
+                    (MAX_ROWS - rows)
+                        * (2 * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS + 1 + Qwen38_27B::HIDDEN)
+                })
+                .sum::<usize>()
         );
-        assert_eq!(report.immutable_input_values, 2 * MAX_BATCH * immutable);
+        assert_eq!(report.immutable_input_values, 2 * ROUTES.len() * immutable);
         assert!(report.maximum_gated_error <= 0.000_05);
         assert!(report.maximum_projection_relative_error <= 0.015);
         let (arena, regions) = layout()?;
-        assert_eq!(regions.payload_bytes(), 32_024_608);
-        assert_eq!(arena.byte_len() - regions.payload_bytes(), 224);
-        assert_eq!(arena.byte_len(), 32_024_832);
-        assert_eq!(report.padding_bytes, 224);
-        assert_eq!(report.arena_bytes, 32_024_832);
+        assert_eq!(report.padding_bytes, 0);
+        assert_eq!(report.arena_bytes, 102_774_784);
+        assert_eq!(report.arena_bytes, arena.byte_len());
+        assert_eq!(regions.payload_bytes(), arena.byte_len());
 
         Ok(())
     }

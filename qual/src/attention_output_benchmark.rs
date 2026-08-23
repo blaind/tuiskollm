@@ -16,8 +16,11 @@ use tuisko_kernels_sm120::AttentionOutputOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const ALIGNMENT: usize = 256;
 const ATTENTION_VALUES: [f32; 8] = [1.0, -0.875, 0.75, -0.625, 0.5, -0.375, 0.25, -0.125];
+const REPLAY_STABLE_GATE: f32 = 128.0;
 
 #[derive(Clone, Copy)]
 struct Regions {
@@ -57,7 +60,7 @@ struct Addresses {
 }
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
@@ -89,8 +92,9 @@ impl Session {
         stream.synchronize().map_err(GpuError::from)?;
         let op = AttentionOutputOp::new(&context)?;
         let addresses = addresses(&arena, regions)?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| capture_route(&op, &stream, &addresses, batch, repeated_operations))
+        let routes = EXACT_ROUTES
+            .into_iter()
+            .map(|rows| capture_route(&op, &stream, &addresses, rows, repeated_operations))
             .collect::<GpuResult<Vec<_>>>()?;
         let timer = GpuTimer::new(&context)?;
 
@@ -118,15 +122,22 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     "attention_output/sigmoid_quantize_projection",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
                     &route.leaf,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 )
@@ -137,17 +148,17 @@ impl Session {
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let attention = layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
-    let qkv = layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_QKV_ROWS, ALIGNMENT)?;
+    let attention = layout.reserve(MAX_ROWS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let qkv = layout.reserve(MAX_ROWS * Qwen38_27B::ATTENTION_QKV_ROWS, ALIGNMENT)?;
     let activation_codes =
-        layout.reserve(MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
-    let activation_scales = layout.reserve(MAX_BATCH, ALIGNMENT)?;
+        layout.reserve(MAX_ROWS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let activation_scales = layout.reserve(MAX_ROWS, ALIGNMENT)?;
     let weight_codes = layout.reserve(
         Qwen38_27B::HIDDEN * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS,
         ALIGNMENT,
     )?;
     let weight_scales = layout.reserve(Qwen38_27B::HIDDEN, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * Qwen38_27B::HIDDEN, ALIGNMENT)?;
+    let output = layout.reserve(MAX_ROWS * Qwen38_27B::HIDDEN, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -164,10 +175,24 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
 }
 
 fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuResult<()> {
-    let attention = (0..MAX_BATCH * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS)
+    let attention = (0..MAX_ROWS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS)
         .map(|index| ATTENTION_VALUES[(index + index / Qwen38_27B::ATTENTION_OUTPUT_COLUMNS) & 7])
         .collect::<Vec<_>>();
-    let qkv = vec![0u16; MAX_BATCH * Qwen38_27B::ATTENTION_QKV_ROWS];
+    let mut qkv = vec![0u16; MAX_ROWS * Qwen38_27B::ATTENTION_QKV_ROWS];
+    // A large positive BF16 gate makes `1 + exp(-gate)` round to exactly one.
+    // Repeated graphs therefore time identical production inputs even though the
+    // public gated-FP32 seam is written in place by every operation.
+    for token in 0..MAX_ROWS {
+        for head in 0..Qwen38_27B::NUM_ATTENTION_HEADS {
+            for dimension in 0..Qwen38_27B::HEAD_DIM {
+                let gate = token * Qwen38_27B::ATTENTION_QKV_ROWS
+                    + head * 2 * Qwen38_27B::HEAD_DIM
+                    + Qwen38_27B::HEAD_DIM
+                    + dimension;
+                qkv[gate] = f32_to_bf16(REPLAY_STABLE_GATE);
+            }
+        }
+    }
     let weight_codes = (0..Qwen38_27B::HIDDEN * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS)
         .map(|index| {
             let row = index / Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
@@ -200,19 +225,19 @@ fn capture_route(
     op: &AttentionOutputOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, batch))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, batch)?;
+            launch(op, stream, addresses, rows)?;
         }
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
         leaf,
         repeated,
     })
@@ -222,13 +247,13 @@ fn launch(
     op: &AttentionOutputOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     // SAFETY: every pointer names its complete, aligned maximum-batch arena region.
     unsafe {
         op.launch(
             stream,
-            batch,
+            rows,
             addresses.attention,
             addresses.qkv,
             addresses.activation_codes,
@@ -240,16 +265,16 @@ fn launch(
     }
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(rows: usize) -> usize {
     let columns = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
-    let rows = Qwen38_27B::HIDDEN;
-    let weights = rows * (columns + size_of::<u16>());
-    let per_token = 16 * columns + 3 * size_of::<f32>() + rows * size_of::<u16>();
+    let output_rows = Qwen38_27B::HIDDEN;
+    let weights = output_rows * (columns + size_of::<u16>());
+    let per_token = 16 * columns + 3 * size_of::<f32>() + output_rows * size_of::<u16>();
 
-    weights + batch * per_token
+    weights + rows * per_token
 }
 
-/// Measures every exact attention-output batch using its production graph path.
+/// Measures every exact attention-output decode and prefill route.
 pub fn benchmark_attention_output(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
@@ -270,7 +295,7 @@ pub fn benchmark_attention_output(
         "attention_output/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes - padding_bytes,
-        "max_batch=8 gated attention, fused QKV, quantization, and output seams",
+        "max_rows=1024 gated attention, fused QKV, quantization, and output seams",
     )?;
     memory.register_owned(
         "attention_output/alignment_padding",
@@ -305,11 +330,11 @@ pub fn benchmark_attention_output(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, layout, logical_bytes};
+    use super::{MAX_BATCH, MAX_ROWS, layout, logical_bytes};
     use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
-    fn byte_accounting_covers_gate_quantize_and_projection() {
+    fn attention_output_suite_benchmark_byte_accounting_covers_decode_and_prefill() {
         let weights =
             Qwen38_27B::HIDDEN * (Qwen38_27B::ATTENTION_OUTPUT_COLUMNS + size_of::<u16>());
         let per_token = 16 * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS
@@ -318,13 +343,14 @@ mod tests {
 
         assert_eq!(logical_bytes(1), weights + per_token);
         assert_eq!(logical_bytes(MAX_BATCH), weights + MAX_BATCH * per_token);
+        assert_eq!(logical_bytes(MAX_ROWS), weights + MAX_ROWS * per_token);
     }
 
     #[test]
-    fn arena_accounting_exposes_every_padding_byte() {
+    fn attention_output_suite_benchmark_arena_accounting_exposes_every_byte() {
         let (layout, regions) = layout().unwrap();
-        assert_eq!(layout.byte_len() - regions.payload_bytes(), 224);
-        assert_eq!(layout.byte_len(), 32_024_832);
-        assert_eq!(regions.payload_bytes(), 32_024_608);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 0);
+        assert_eq!(layout.byte_len(), 102_774_784);
+        assert_eq!(regions.payload_bytes(), 102_774_784);
     }
 }
