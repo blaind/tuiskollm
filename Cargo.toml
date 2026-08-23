@@ -46,6 +46,7 @@ memmap2 = "0.9"
 minijinja = { version = "2", features = ["json"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 pyo3 = { version = "0.29", features = ["abi3-py312"] }
+rayon = "1.12"
 russh = { version = "0.63", default-features = false, features = ["ring"] }
 russh-sftp = "2.4"
 rusqlite = { version = "0.32.1", features = ["bundled"] }

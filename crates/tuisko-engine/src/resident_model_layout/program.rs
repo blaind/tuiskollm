@@ -30,7 +30,7 @@ use tuisko_kernels_sm120::{
 use tuisko_model::{
     Arch, CheckpointSnapshot, DenseFp8DownBindings, DenseFp8GateUpBindings,
     FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings, Nvfp4DownBindings,
-    Nvfp4GateUpBindings, Qwen38_27B, TextEndpointBindings,
+    Nvfp4GateUpBindings, Qwen38_27B, TextEndpointBindings, nvfp4_scale_materialization_workers,
 };
 
 const ROTARY_PAIRS: usize = 32;
@@ -122,6 +122,7 @@ pub struct ResidentLoadStats {
     borrowed_source_bytes: usize,
     gathered_source_bytes: usize,
     swizzled_source_bytes: usize,
+    nvfp4_materialize_workers: usize,
 }
 
 impl ResidentLoadStats {
@@ -223,6 +224,11 @@ impl ResidentLoadStats {
     /// Weight bytes losslessly swizzled into kernel scale order.
     pub const fn swizzled_source_bytes(self) -> usize {
         self.swizzled_source_bytes
+    }
+
+    /// Maximum worker count used to materialize target-size NVFP4 scale planes.
+    pub const fn nvfp4_materialize_workers(self) -> usize {
+        self.nvfp4_materialize_workers
     }
 }
 
@@ -449,6 +455,7 @@ impl ResidentModelProgram {
                     borrowed_source_bytes,
                     gathered_source_bytes,
                     swizzled_source_bytes,
+                    nvfp4_materialize_workers: nvfp4_scale_materialization_workers(),
                 };
                 (arena, kv_arena, scalars, load_stats)
             }
@@ -548,6 +555,7 @@ impl ResidentModelProgram {
                     borrowed_source_bytes,
                     gathered_source_bytes,
                     swizzled_source_bytes,
+                    nvfp4_materialize_workers: nvfp4_scale_materialization_workers(),
                 };
                 (arena, kv_arena, scalars, load_stats)
             }

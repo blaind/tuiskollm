@@ -9,12 +9,26 @@ use crate::{
     ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4LinearBindings,
     ModelOptNvfp4MlpBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
 };
+use rayon::prelude::*;
+use std::sync::OnceLock;
 
 const SCALE_TILE_ROWS: usize = 128;
 const SCALE_TILE_GROUPS: usize = 4;
 const SCALE_TILE_BYTES: usize = SCALE_TILE_ROWS * SCALE_TILE_GROUPS;
 const NVFP4_GROUP_SIZE: usize = 16;
 const E2M1_VALUES_PER_BYTE: usize = 2;
+const PARALLEL_SWIZZLE_MIN_BYTES: usize = 1 << 20;
+const MAX_SWIZZLE_WORKERS: usize = 16;
+
+static SWIZZLE_POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+
+/// Worker bound used by target-size NVFP4 scale materialization.
+pub fn nvfp4_scale_materialization_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|workers| workers.get())
+        .unwrap_or(1)
+        .min(MAX_SWIZZLE_WORKERS)
+}
 
 /// Runtime-native fused QKV planes in query/gate, key, value row order.
 #[derive(Debug)]
@@ -960,32 +974,76 @@ fn swizzle_scale_planes(
     }
 
     let mut swizzled = vec![0; output_len];
+    let scale_tiles_per_row = groups_per_row / SCALE_TILE_GROUPS;
+    let swizzle_tile = |(tile_index, destination): (usize, &mut [u8])| {
+        swizzle_scale_tile(
+            destination,
+            tile_index,
+            scale_tiles_per_row,
+            planes,
+            rows_per_plane,
+            groups_per_row,
+        );
+    };
 
-    for row in 0..rows {
-        let source_plane = row / rows_per_plane;
-        let source_row = row % rows_per_plane;
-
-        for group in 0..groups_per_row {
-            let source = planes[source_plane][source_row * groups_per_row + group];
-            swizzled[nvfp4_scale_offset(row, group, groups_per_row)] = source;
-        }
+    if output_len >= PARALLEL_SWIZZLE_MIN_BYTES {
+        swizzle_pool(layer, role)?.install(|| {
+            swizzled
+                .par_chunks_mut(SCALE_TILE_BYTES)
+                .enumerate()
+                .for_each(swizzle_tile);
+        });
+    } else {
+        swizzled
+            .chunks_mut(SCALE_TILE_BYTES)
+            .enumerate()
+            .for_each(swizzle_tile);
     }
 
     Ok(swizzled)
 }
 
-fn nvfp4_scale_offset(row: usize, group: usize, groups_per_row: usize) -> usize {
-    let persistent_tile = row / SCALE_TILE_ROWS;
-    let row_in_tile = row % SCALE_TILE_ROWS;
-    let row_mod32 = row_in_tile % 32;
-    let row_quartile = row_in_tile / 32;
-    let scale_tile = group / SCALE_TILE_GROUPS;
-    let scale_lane = group % SCALE_TILE_GROUPS;
+fn swizzle_scale_tile(
+    destination: &mut [u8],
+    tile_index: usize,
+    scale_tiles_per_row: usize,
+    planes: &[&[u8]],
+    rows_per_plane: usize,
+    groups_per_row: usize,
+) {
+    let persistent_tile = tile_index / scale_tiles_per_row;
+    let scale_tile = tile_index % scale_tiles_per_row;
+    let source_group = scale_tile * SCALE_TILE_GROUPS;
 
-    (persistent_tile * (groups_per_row / SCALE_TILE_GROUPS) + scale_tile) * SCALE_TILE_BYTES
-        + row_mod32 * 16
-        + row_quartile * 4
-        + scale_lane
+    // Each 512-byte destination tile is independent. Writing by its 32 contiguous
+    // 16-byte rows avoids the old per-byte division and scattered store while preserving
+    // the exact BlockScaleK16M128x4 address mapping.
+    for row_mod32 in 0..32 {
+        let destination_row = &mut destination[row_mod32 * 16..(row_mod32 + 1) * 16];
+        for row_quartile in 0..4 {
+            let row = persistent_tile * SCALE_TILE_ROWS + row_quartile * 32 + row_mod32;
+            let source_plane = row / rows_per_plane;
+            let source_row = row % rows_per_plane;
+            let source = source_row * groups_per_row + source_group;
+            destination_row[row_quartile * 4..(row_quartile + 1) * 4]
+                .copy_from_slice(&planes[source_plane][source..source + 4]);
+        }
+    }
+}
+
+fn swizzle_pool(layer: usize, role: &str) -> CheckpointResult<&'static rayon::ThreadPool> {
+    let pool = SWIZZLE_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(nvfp4_scale_materialization_workers())
+            .thread_name(|index| format!("tuisko-swizzle-{index}"))
+            .build()
+            .map_err(|error| error.to_string())
+    });
+    pool.as_ref().map_err(|error| {
+        CheckpointError::source_binding(format!(
+            "layer-{layer} NVFP4 {role} cannot start bounded swizzle workers: {error}"
+        ))
+    })
 }
 
 #[cfg(test)]
