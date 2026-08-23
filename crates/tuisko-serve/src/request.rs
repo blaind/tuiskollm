@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use tuisko_engine::{ChatGenerationRequest, SamplingOptions, SamplingPenalties};
-use tuisko_frontend::{ChatMessage, ChatTemplateOptions, SPECIAL_TOKEN_LITERALS};
+use tuisko_frontend::{
+    ChatMessage, ChatTemplateOptions, GenerationDefaults, SPECIAL_TOKEN_LITERALS,
+};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 128;
@@ -126,7 +128,24 @@ pub enum ChatRequestError {
 impl ChatCompletionRequest {
     /// Validates and maps this wire request, using `default_seed` only when no seed was supplied.
     pub fn prepare(self, default_seed: u64) -> Result<PreparedChatRequest, ChatRequestError> {
-        if self.model != SERVED_MODEL {
+        self.prepare_for(
+            default_seed,
+            SERVED_MODEL,
+            GenerationDefaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+            },
+        )
+    }
+
+    pub(crate) fn prepare_for(
+        self,
+        default_seed: u64,
+        served_model: &str,
+        defaults: GenerationDefaults,
+    ) -> Result<PreparedChatRequest, ChatRequestError> {
+        if self.model != served_model {
             return Err(ChatRequestError::ModelNotFound {
                 requested: self.model,
             });
@@ -211,9 +230,9 @@ impl ChatCompletionRequest {
             tools,
         };
         let sampling = SamplingOptions {
-            temperature: self.temperature.unwrap_or(1.0),
-            top_p: self.top_p.unwrap_or(0.95),
-            top_k: self.top_k.unwrap_or(20),
+            temperature: self.temperature.unwrap_or(defaults.temperature),
+            top_p: self.top_p.unwrap_or(defaults.top_p),
+            top_k: self.top_k.unwrap_or(defaults.top_k),
             seed: self.seed.unwrap_or(default_seed),
             penalties: SamplingPenalties {
                 presence: self.presence_penalty.unwrap_or(0.0),
@@ -418,6 +437,8 @@ fn require_no_special_tokens(what: &str, text: &str) -> Result<(), ChatRequestEr
 #[cfg(test)]
 mod tests {
     use super::{ChatCompletionRequest, ChatRequestError, SERVED_MODEL, SamplingPenalties};
+    use tuisko_frontend::GenerationDefaults;
+    use tuisko_model::{Arch, Qwen35_9B};
 
     fn request(body: &str) -> ChatCompletionRequest {
         serde_json::from_str(body).unwrap()
@@ -499,6 +520,32 @@ mod tests {
         assert!(prepared.generation.template.tools.is_empty());
         assert!(!prepared.parse_tools);
         assert!(prepared.split_reasoning);
+    }
+
+    #[test]
+    fn selected_qwen35_process_uses_its_greedy_defaults() {
+        let prepared = request(&format!(
+            r#"{{
+                "model":"{}",
+                "messages":[{{"role":"user","content":"hello"}}]
+            }}"#,
+            Qwen35_9B::MODEL_ID
+        ))
+        .prepare_for(
+            37,
+            Qwen35_9B::MODEL_ID,
+            GenerationDefaults {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prepared.generation.sampling.temperature, 0.0);
+        assert_eq!(prepared.generation.sampling.top_p, 1.0);
+        assert_eq!(prepared.generation.sampling.top_k, 1);
+        assert_eq!(prepared.generation.sampling.seed, 37);
     }
 
     #[test]

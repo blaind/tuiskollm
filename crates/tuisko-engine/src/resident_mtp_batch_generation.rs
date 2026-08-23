@@ -12,7 +12,7 @@ use crate::{
     SamplingDistribution,
 };
 use std::sync::Arc;
-use tuisko_frontend::TextFrontend;
+use tuisko_frontend::{GenerationDefaults, TextFrontend};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
@@ -478,6 +478,11 @@ impl ResidentMtpBatchGenerator {
     /// Shared target/MTP long-context capacity per slot.
     pub const fn context_capacity(&self) -> usize {
         self.program.target().context_capacity()
+    }
+
+    /// Sampling defaults admitted from the pinned target snapshot.
+    pub const fn generation_defaults(&self) -> GenerationDefaults {
+        self.frontend.generation_defaults()
     }
 
     /// Fixed host bytes owning the shared page routes.

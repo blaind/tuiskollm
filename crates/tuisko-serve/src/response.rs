@@ -1,6 +1,6 @@
 //! Blocking and server-sent-event OpenAI response bodies.
 
-use crate::{AssistantDelta, AssistantStreamParser, ParsedToolCall, SERVED_MODEL};
+use crate::{AssistantDelta, AssistantStreamParser, ParsedToolCall};
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -40,6 +40,7 @@ pub async fn blocking_response(
     mut replies: Receiver<GenerationReply>,
     id: String,
     created: u64,
+    model_id: &'static str,
     split_reasoning: bool,
     parse_tools: bool,
 ) -> Response {
@@ -74,7 +75,7 @@ pub async fn blocking_response(
                     "id": id,
                     "object": "chat.completion",
                     "created": created,
-                    "model": SERVED_MODEL,
+                    "model": model_id,
                     "choices": [{
                         "index": 0,
                         "message": message,
@@ -108,6 +109,7 @@ pub fn streaming_response(
     mut replies: Receiver<GenerationReply>,
     id: String,
     created: u64,
+    model_id: &'static str,
     split_reasoning: bool,
     parse_tools: bool,
     include_usage: bool,
@@ -119,7 +121,7 @@ pub fn streaming_response(
                 "id": id,
                 "object": "chat.completion.chunk",
                 "created": created,
-                "model": SERVED_MODEL,
+                "model": model_id,
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
             }),
             include_usage,
@@ -146,7 +148,8 @@ pub fn streaming_response(
             match reply {
                 GenerationReply::Delta(delta) => {
                     let parsed = parser.push(&delta);
-                    if let Some(event) = assistant_delta_event(&id, created, parsed, include_usage)
+                    if let Some(event) =
+                        assistant_delta_event(&id, created, model_id, parsed, include_usage)
                         && events_tx.send(Ok(event)).await.is_err()
                     {
                         return;
@@ -156,13 +159,13 @@ pub fn streaming_response(
                     terminal = true;
                     let parsed = parser.finish();
                     if let Some(event) =
-                        assistant_delta_event(&id, created, parsed.delta, include_usage)
+                        assistant_delta_event(&id, created, model_id, parsed.delta, include_usage)
                         && events_tx.send(Ok(event)).await.is_err()
                     {
                         return;
                     }
                     if let Some(event) =
-                        tool_calls_event(&id, created, &parsed.tool_calls, include_usage)
+                        tool_calls_event(&id, created, model_id, &parsed.tool_calls, include_usage)
                         && events_tx.send(Ok(event)).await.is_err()
                     {
                         return;
@@ -177,7 +180,7 @@ pub fn streaming_response(
                             "id": id,
                             "object": "chat.completion.chunk",
                             "created": created,
-                            "model": SERVED_MODEL,
+                            "model": model_id,
                             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
                         }),
                         include_usage,
@@ -194,7 +197,7 @@ pub fn streaming_response(
                             "id": id,
                             "object": "chat.completion.chunk",
                             "created": created,
-                            "model": SERVED_MODEL,
+                            "model": model_id,
                             "choices": [],
                             "usage": usage(&output)
                         });
@@ -297,6 +300,7 @@ fn blocking_tool_calls(completion_id: &str, calls: &[ParsedToolCall]) -> Value {
 fn tool_calls_event(
     id: &str,
     created: u64,
+    model_id: &'static str,
     calls: &[ParsedToolCall],
     include_usage: bool,
 ) -> Option<Event> {
@@ -308,7 +312,7 @@ fn tool_calls_event(
             "id": id,
             "object": "chat.completion.chunk",
             "created": created,
-            "model": SERVED_MODEL,
+            "model": model_id,
             "choices": [{
                 "index": 0,
                 "delta": {
@@ -330,6 +334,7 @@ fn tool_calls_event(
 fn assistant_delta_event(
     id: &str,
     created: u64,
+    model_id: &'static str,
     parsed: AssistantDelta,
     include_usage: bool,
 ) -> Option<Event> {
@@ -346,7 +351,7 @@ fn assistant_delta_event(
             "id": id,
             "object": "chat.completion.chunk",
             "created": created,
-            "model": SERVED_MODEL,
+            "model": model_id,
             "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
         }),
         include_usage,
@@ -371,6 +376,8 @@ mod tests {
     use tokio::sync::mpsc::{channel, error::TrySendError};
     use tuisko_engine::{FinishReason, GeneratedText};
     use tuisko_frontend::PromptEncoding;
+
+    const TEST_MODEL: &str = "test/exact-model";
 
     fn output(text: &str, reason: FinishReason) -> GeneratedText {
         GeneratedText {
@@ -408,14 +415,22 @@ mod tests {
                     FinishReason::Length,
                 )))
                 .unwrap();
-            let response =
-                blocking_response(receiver, "chatcmpl-tuisko-0001".into(), 17, true, false).await;
+            let response = blocking_response(
+                receiver,
+                "chatcmpl-tuisko-0001".into(),
+                17,
+                TEST_MODEL,
+                true,
+                false,
+            )
+            .await;
 
             assert_eq!(response.status(), StatusCode::OK);
             let value: Value = serde_json::from_str(&body(response).await).unwrap();
             assert_eq!(value["choices"][0]["message"]["content"], "answer");
             assert_eq!(value["choices"][0]["message"]["reasoning_content"], "think");
             assert_eq!(value["choices"][0]["finish_reason"], "length");
+            assert_eq!(value["model"], TEST_MODEL);
             assert_eq!(
                 value["usage"],
                 json!({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
@@ -444,6 +459,7 @@ mod tests {
                 receiver,
                 "chatcmpl-tuisko-0002".into(),
                 19,
+                TEST_MODEL,
                 true,
                 true,
                 true,
@@ -479,6 +495,7 @@ mod tests {
                 .all(|event| event.get("usage") == Some(&Value::Null)));
             assert_eq!(events[4]["choices"], json!([]));
             assert_eq!(events[4]["usage"]["total_tokens"], 5);
+            assert!(events.iter().all(|event| event["model"] == TEST_MODEL));
         });
     }
 
@@ -489,7 +506,8 @@ mod tests {
             sender
                 .try_send(GenerationReply::Rejected("bad sampling".into()))
                 .unwrap();
-            let response = blocking_response(receiver, "id".into(), 1, false, false).await;
+            let response =
+                blocking_response(receiver, "id".into(), 1, TEST_MODEL, false, false).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let error: Value = serde_json::from_str(&body(response).await).unwrap();
             assert_eq!(error["error"]["message"], "bad sampling");
@@ -498,14 +516,16 @@ mod tests {
             sender
                 .try_send(GenerationReply::Failed("device launch failed".into()))
                 .unwrap();
-            let response = blocking_response(receiver, "id".into(), 1, false, false).await;
+            let response =
+                blocking_response(receiver, "id".into(), 1, TEST_MODEL, false, false).await;
             assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
             let error: Value = serde_json::from_str(&body(response).await).unwrap();
             assert_eq!(error["error"]["type"], "server_error");
 
             let (sender, receiver) = channel::<GenerationReply>(8);
             drop(sender);
-            let response = blocking_response(receiver, "id".into(), 1, false, false).await;
+            let response =
+                blocking_response(receiver, "id".into(), 1, TEST_MODEL, false, false).await;
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         });
     }
@@ -519,6 +539,7 @@ mod tests {
                 receiver,
                 "id".into(),
                 1,
+                TEST_MODEL,
                 false,
                 false,
                 false,
@@ -551,6 +572,7 @@ mod tests {
                 receiver,
                 "id".into(),
                 1,
+                TEST_MODEL,
                 false,
                 false,
                 false,
@@ -572,6 +594,7 @@ mod tests {
                 receiver,
                 "id".into(),
                 1,
+                TEST_MODEL,
                 false,
                 false,
                 false,

@@ -1,7 +1,7 @@
 //! Concrete HTTP server and resident scheduler worker.
 
 use crate::{
-    ChatCompletionRequest, ChatRequestError, GenerationReply, PreparedChatRequest, SERVED_MODEL,
+    ChatCompletionRequest, ChatRequestError, GenerationReply, PreparedChatRequest,
     blocking_response, openai_error, streaming_response,
 };
 use axum::extract::rejection::JsonRejection;
@@ -22,10 +22,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
 use tokio::sync::oneshot;
 use tuisko_engine::{
-    GenerationStep, MAX_BATCH, ResidentLoadPhase, ResidentLoadProgress, ResidentMtpBatchGenerator,
-    ResidentRequestId,
+    GenerationStep, MAX_BATCH, Qwen35ResidentTextGenerator, ResidentLoadPhase,
+    ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentRequestId,
 };
-use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
+use tuisko_frontend::GenerationDefaults;
+use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B, Qwen38_27B};
 
 const REQUEST_BODY_LIMIT: usize = 2 * 1024 * 1024;
 const DEFAULT_SEED_SCRAMBLE: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -65,6 +66,8 @@ struct AppState {
     jobs: Sender<Job>,
     request_ids: Arc<AtomicU64>,
     worker_ready: Arc<AtomicBool>,
+    model_id: &'static str,
+    generation_defaults: GenerationDefaults,
 }
 
 struct Job {
@@ -79,6 +82,8 @@ enum EnqueueError {
 }
 
 struct Ready {
+    model_id: &'static str,
+    generation_defaults: GenerationDefaults,
     device_name: String,
     checkpoint_admission: Duration,
     weight_load: Duration,
@@ -89,20 +94,50 @@ struct Ready {
     prefault_bytes: usize,
     arena_bytes: usize,
     host_stager_bytes: usize,
+    slot_capacity: usize,
     context_capacity: usize,
+    detailed_load_timing: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResidentTarget {
+    Qwen38,
+    Qwen35,
+}
+
+impl ResidentTarget {
+    fn from_snapshot(root: &Path) -> Result<Self, String> {
+        match root.file_name().and_then(|name| name.to_str()) {
+            Some(Qwen38_27B::REVISION) => Ok(Self::Qwen38),
+            Some(Qwen35_9B::REVISION) => Ok(Self::Qwen35),
+            actual => Err(format!(
+                "snapshot revision {actual:?} is not {} or {}",
+                Qwen38_27B::REVISION,
+                Qwen35_9B::REVISION
+            )),
+        }
+    }
+
+    const fn model_id(self) -> &'static str {
+        match self {
+            Self::Qwen38 => Qwen38_27B::MODEL_ID,
+            Self::Qwen35 => Qwen35_9B::MODEL_ID,
+        }
+    }
 }
 
 /// Loads the exact resident model, then serves health, model, blocking, and SSE routes.
 pub fn run(config: ServerConfig) -> Result<(), ServerError> {
     let startup_start = Instant::now();
+    let target = ResidentTarget::from_snapshot(&config.snapshot).map_err(ServerError::Startup)?;
     let stdout = std::io::stdout();
     let interactive = stdout.is_terminal();
     let color = interactive && std::env::var_os("NO_COLOR").is_none();
     let (state, ready, worker_failure) = {
         let mut stdout = stdout.lock();
-        stdout.write_all(render_loading(color, interactive).as_bytes())?;
+        stdout.write_all(render_loading(target.model_id(), color, interactive).as_bytes())?;
         stdout.flush()?;
-        start_worker(&config.snapshot, &mut stdout, interactive, color)?
+        start_worker(&config.snapshot, target, &mut stdout, interactive, color)?
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -132,6 +167,7 @@ async fn serve_until_worker_failure(
 
 fn start_worker(
     snapshot: &Path,
+    target: ResidentTarget,
     output: &mut impl IoWrite,
     interactive: bool,
     color: bool,
@@ -149,6 +185,7 @@ fn start_worker(
         .spawn(move || {
             engine_worker(
                 snapshot,
+                target,
                 jobs_rx,
                 ready_tx,
                 failure_tx,
@@ -192,6 +229,8 @@ fn start_worker(
             jobs: jobs_tx,
             request_ids: Arc::new(AtomicU64::new(1)),
             worker_ready,
+            model_id: ready.model_id,
+            generation_defaults: ready.generation_defaults,
         },
         ready,
         failure_rx,
@@ -200,6 +239,7 @@ fn start_worker(
 
 fn engine_worker(
     snapshot: PathBuf,
+    target: ResidentTarget,
     mut jobs: Receiver<Job>,
     ready: std_mpsc::SyncSender<Result<Ready, String>>,
     failure: oneshot::Sender<String>,
@@ -213,6 +253,10 @@ fn engine_worker(
         }
     }
     let _readiness_guard = ReadinessGuard(Arc::clone(&worker_ready));
+    if target == ResidentTarget::Qwen35 {
+        qwen35_engine_worker(snapshot, jobs, ready, worker_ready);
+        return;
+    }
     let generator = (|| {
         let checkpoint_start = Instant::now();
         let snapshot = CheckpointSnapshot::<Qwen38_27B>::open(&snapshot)
@@ -240,6 +284,8 @@ fn engine_worker(
     };
     let load_stats = generator.load_stats();
     let startup = Ready {
+        model_id: Qwen38_27B::MODEL_ID,
+        generation_defaults: generator.generation_defaults(),
         device_name,
         checkpoint_admission,
         weight_load: Duration::from_nanos(load_stats.weight_load_ns()),
@@ -250,7 +296,9 @@ fn engine_worker(
         prefault_bytes: load_stats.prefault_bytes(),
         arena_bytes: generator.arena_bytes(),
         host_stager_bytes: generator.host_stager_bytes(),
+        slot_capacity: MAX_BATCH,
         context_capacity: generator.context_capacity(),
+        detailed_load_timing: true,
     };
     worker_ready.store(true, Ordering::Release);
     if ready.send(Ok(startup)).is_err() {
@@ -315,7 +363,107 @@ fn engine_worker(
     }
 }
 
-fn render_loading(color: bool, interactive: bool) -> String {
+fn qwen35_engine_worker(
+    snapshot: PathBuf,
+    mut jobs: Receiver<Job>,
+    ready: std_mpsc::SyncSender<Result<Ready, String>>,
+    worker_ready: Arc<AtomicBool>,
+) {
+    let loaded = (|| {
+        let checkpoint_start = Instant::now();
+        let snapshot = CheckpointSnapshot::<Qwen35_9B>::open(&snapshot)
+            .map(Arc::new)
+            .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
+        let checkpoint_admission = checkpoint_start.elapsed();
+        let tensor_count = snapshot.tensor_count();
+        let load_start = Instant::now();
+        let generator = Qwen35ResidentTextGenerator::from_snapshot_device_zero(snapshot)
+            .map_err(|error| format!("loading the resident Qwen3.5 text program: {error}"))?;
+        let resident_load = load_start.elapsed();
+        let device_name = generator
+            .context()
+            .device_name()
+            .map_err(|error| format!("reading the CUDA device name: {error}"))?;
+        Ok::<_, String>((
+            generator,
+            checkpoint_admission,
+            resident_load,
+            tensor_count,
+            device_name,
+        ))
+    })();
+    let (mut generator, checkpoint_admission, resident_load, tensor_count, device_name) =
+        match loaded {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return;
+            }
+        };
+    let startup = Ready {
+        model_id: Qwen35_9B::MODEL_ID,
+        generation_defaults: generator.generation_defaults(),
+        device_name,
+        checkpoint_admission,
+        weight_load: resident_load,
+        source_prefault: Duration::ZERO,
+        graph_capture: Duration::ZERO,
+        tensor_count,
+        upload_bytes: generator.resident_weight_bytes(),
+        prefault_bytes: 0,
+        arena_bytes: generator.arena_bytes(),
+        host_stager_bytes: generator.host_stager_bytes(),
+        slot_capacity: 1,
+        context_capacity: generator.context_capacity(),
+        detailed_load_timing: false,
+    };
+    worker_ready.store(true, Ordering::Release);
+    if ready.send(Ok(startup)).is_err() {
+        return;
+    }
+
+    while let Some(job) = jobs.blocking_recv() {
+        run_qwen35_job(&mut generator, job);
+    }
+}
+
+fn run_qwen35_job(generator: &mut Qwen35ResidentTextGenerator, job: Job) {
+    if job.reply.is_closed() {
+        return;
+    }
+    let mut session = match generator.start(&job.request) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = job.reply.send(GenerationReply::Rejected(error.to_string()));
+            return;
+        }
+    };
+    while session.finish_reason().is_none() {
+        if job.reply.is_closed() {
+            return;
+        }
+        let step = match session.step() {
+            Ok(step) => step,
+            Err(error) => {
+                let _ = job.reply.send(GenerationReply::Failed(error.to_string()));
+                return;
+            }
+        };
+        if let Some(delta) = step.delta {
+            let _ = job.reply.send(GenerationReply::Delta(delta));
+        }
+    }
+    match session.into_output() {
+        Ok(output) => {
+            let _ = job.reply.send(GenerationReply::Done(output));
+        }
+        Err(error) => {
+            let _ = job.reply.send(GenerationReply::Failed(error.to_string()));
+        }
+    }
+}
+
+fn render_loading(model_id: &str, color: bool, interactive: bool) -> String {
     let (header, loading, reset) = if color {
         ("\x1b[1;36m", "\x1b[1;33m", "\x1b[0m")
     } else {
@@ -323,7 +471,7 @@ fn render_loading(color: bool, interactive: bool) -> String {
     };
     let newline = if interactive { "" } else { "\n" };
     format!(
-        "{header}TuiskoLLM{reset} · {SERVED_MODEL}\n{loading}LOADING{reset} ⠋       preparing resident model…{newline}"
+        "{header}TuiskoLLM{reset} · {model_id}\n{loading}LOADING{reset} ⠋       preparing resident model…{newline}"
     )
 }
 
@@ -400,6 +548,11 @@ fn render_startup(ready: &Ready, total: Duration, address: SocketAddr, color: bo
     } else {
         ("", "", "")
     };
+    let generation_route = if ready.model_id == Qwen38_27B::MODEL_ID {
+        GENERATION_ROUTE
+    } else {
+        "single-token"
+    };
     writeln!(
         output,
         "{ok}OK{reset} device                 · {}",
@@ -413,30 +566,41 @@ fn render_startup(ready: &Ready, total: Duration, address: SocketAddr, color: bo
         ready.tensor_count,
     )
     .expect("writing to a String cannot fail");
+    if ready.detailed_load_timing {
+        writeln!(
+            output,
+            "{ok}OK{reset} source pages {:>7.1} ms · {:.2} GiB",
+            milliseconds(ready.source_prefault),
+            gibibytes(ready.prefault_bytes),
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            output,
+            "{ok}OK{reset} weights      {:>7.1} ms · {:.2} GiB",
+            milliseconds(ready.weight_load),
+            gibibytes(ready.upload_bytes),
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            output,
+            "{ok}OK{reset} graphs       {:>7.1} ms",
+            milliseconds(ready.graph_capture),
+        )
+        .expect("writing to a String cannot fail");
+    } else {
+        writeln!(
+            output,
+            "{ok}OK{reset} resident    {:>7.1} ms · {:.2} GiB weights and graphs",
+            milliseconds(ready.weight_load),
+            gibibytes(ready.upload_bytes),
+        )
+        .expect("writing to a String cannot fail");
+    }
     writeln!(
         output,
-        "{ok}OK{reset} source pages {:>7.1} ms · {:.2} GiB",
-        milliseconds(ready.source_prefault),
-        gibibytes(ready.prefault_bytes),
-    )
-    .expect("writing to a String cannot fail");
-    writeln!(
-        output,
-        "{ok}OK{reset} weights      {:>7.1} ms · {:.2} GiB",
-        milliseconds(ready.weight_load),
-        gibibytes(ready.upload_bytes),
-    )
-    .expect("writing to a String cannot fail");
-    writeln!(
-        output,
-        "{ok}OK{reset} graphs       {:>7.1} ms",
-        milliseconds(ready.graph_capture),
-    )
-    .expect("writing to a String cannot fail");
-    writeln!(
-        output,
-        "{ready_label}READY{reset}          {:>7.1} ms · http://{address} · {GENERATION_ROUTE} · {MAX_BATCH} slots · context {} · {:.2} GiB device · {:.2} MiB pinned",
+        "{ready_label}READY{reset}          {:>7.1} ms · http://{address} · {generation_route} · {} slots · context {} · {:.2} GiB device · {:.2} MiB pinned",
         milliseconds(total),
+        ready.slot_capacity,
         ready.context_capacity,
         gibibytes(ready.arena_bytes),
         mebibytes(ready.host_stager_bytes),
@@ -542,10 +706,10 @@ async fn health(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn models() -> Json<Value> {
+async fn models(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "object": "list",
-        "data": [{"id": SERVED_MODEL, "object": "model", "owned_by": "tuiskollm"}]
+        "data": [{"id": state.model_id, "object": "model", "owned_by": "tuiskollm"}]
     }))
 }
 
@@ -570,7 +734,11 @@ async fn chat_completions(
         split_reasoning,
         parse_tools,
         include_usage,
-    } = match request.prepare(numeric_id ^ DEFAULT_SEED_SCRAMBLE) {
+    } = match request.prepare_for(
+        numeric_id ^ DEFAULT_SEED_SCRAMBLE,
+        state.model_id,
+        state.generation_defaults,
+    ) {
         Ok(request) => request,
         Err(ChatRequestError::ModelNotFound { requested }) => {
             return openai_error(
@@ -613,6 +781,7 @@ async fn chat_completions(
                 reply_rx,
                 id,
                 created,
+                state.model_id,
                 split_reasoning,
                 parse_tools,
                 include_usage,
@@ -624,7 +793,15 @@ async fn chat_completions(
             ),
         }
     } else {
-        blocking_response(reply_rx, id, created, split_reasoning, parse_tools).await
+        blocking_response(
+            reply_rx,
+            id,
+            created,
+            state.model_id,
+            split_reasoning,
+            parse_tools,
+        )
+        .await
     }
 }
 
@@ -654,9 +831,9 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, EnqueueError, Job, Ready, ServerError, chat_completions, enqueue_job, health,
-        models, render_loading, render_startup, render_weight_progress, router,
-        serve_until_worker_failure, try_send_generation_steps,
+        AppState, EnqueueError, Job, Ready, ResidentTarget, ServerError, chat_completions,
+        enqueue_job, health, models, render_loading, render_startup, render_weight_progress,
+        router, serve_until_worker_failure, try_send_generation_steps,
     };
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
     use axum::Json;
@@ -670,8 +847,9 @@ mod tests {
     use std::time::Duration;
     use tokio::runtime::Builder;
     use tokio::sync::mpsc::channel;
-    use tuisko_engine::{ChatGenerationRequest, FinishReason, GenerationStep};
-    use tuisko_frontend::ChatMessage;
+    use tuisko_engine::{ChatGenerationRequest, FinishReason, GenerationStep, MAX_BATCH};
+    use tuisko_frontend::{ChatMessage, GenerationDefaults};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
     fn runtime() -> tokio::runtime::Runtime {
         Builder::new_current_thread().enable_all().build().unwrap()
@@ -693,12 +871,24 @@ mod tests {
             jobs,
             request_ids: Arc::new(AtomicU64::new(1)),
             worker_ready: Arc::new(AtomicBool::new(ready)),
+            model_id: SERVED_MODEL,
+            generation_defaults: GenerationDefaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+            },
         }
     }
 
     #[test]
     fn startup_output_is_exact_plain_text_or_terminal_color() {
         let ready = Ready {
+            model_id: SERVED_MODEL,
+            generation_defaults: GenerationDefaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+            },
             device_name: "NVIDIA GeForce RTX 5090".into(),
             checkpoint_admission: Duration::from_micros(2_500),
             weight_load: Duration::from_micros(1_604_600),
@@ -709,15 +899,17 @@ mod tests {
             prefault_bytes: 18 * (1 << 30),
             arena_bytes: 25 * (1 << 30),
             host_stager_bytes: 16 * (1 << 20),
+            slot_capacity: MAX_BATCH,
             context_capacity: 220_000,
+            detailed_load_timing: true,
         };
         let address = "127.0.0.1:8000".parse::<SocketAddr>().unwrap();
-        let loading = render_loading(false, false);
+        let loading = render_loading(SERVED_MODEL, false, false);
         assert_eq!(
             loading,
             "TuiskoLLM · unsloth/Qwen3.8-27B-NVFP4\nLOADING ⠋       preparing resident model…\n"
         );
-        assert!(!render_loading(false, true).ends_with('\n'));
+        assert!(!render_loading(SERVED_MODEL, false, true).ends_with('\n'));
 
         let plain = render_startup(&ready, Duration::from_micros(1_925_200), address, false);
         let lines = plain.lines().collect::<Vec<_>>();
@@ -737,7 +929,7 @@ mod tests {
         );
         assert!(!plain.contains('\x1b'));
 
-        let colored_loading = render_loading(true, true);
+        let colored_loading = render_loading(SERVED_MODEL, true, true);
         assert!(colored_loading.starts_with("\x1b[1;36mTuiskoLLM\x1b[0m"));
         assert!(colored_loading.contains("\x1b[1;33mLOADING\x1b[0m"));
 
@@ -752,6 +944,44 @@ mod tests {
         let colored = render_startup(&ready, Duration::from_micros(1_925_200), address, true);
         assert!(colored.starts_with("\x1b[32mOK\x1b[0m device"));
         assert!(colored.contains("\x1b[1;32mREADY\x1b[0m"));
+    }
+
+    #[test]
+    fn qwen35_startup_reports_aggregate_loading_and_one_slot() {
+        let ready = Ready {
+            model_id: Qwen35_9B::MODEL_ID,
+            generation_defaults: GenerationDefaults {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 1,
+            },
+            device_name: "NVIDIA GeForce RTX 5090".into(),
+            checkpoint_admission: Duration::from_millis(11),
+            weight_load: Duration::from_millis(725),
+            source_prefault: Duration::ZERO,
+            graph_capture: Duration::ZERO,
+            tensor_count: 1_234,
+            upload_bytes: 6 * (1 << 30),
+            prefault_bytes: 0,
+            arena_bytes: 7 * (1 << 30),
+            host_stager_bytes: 1 << 20,
+            slot_capacity: 1,
+            context_capacity: 192,
+            detailed_load_timing: false,
+        };
+
+        let output = render_startup(
+            &ready,
+            Duration::from_millis(900),
+            "127.0.0.1:8000".parse().unwrap(),
+            false,
+        );
+        let lines = output.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 4);
+        assert!(lines[2].contains("725.0 ms · 6.00 GiB weights and graphs"));
+        assert!(lines[3].contains("1 slots · context 192"));
+        assert!(!output.contains("source pages"));
     }
 
     #[test]
@@ -852,7 +1082,8 @@ mod tests {
             let (jobs, _receiver) = channel(1);
             let unavailable = health(State(state(jobs, false))).await;
             assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
-            let models = models().await.0;
+            let (jobs, _receiver) = channel(1);
+            let models = models(State(state(jobs, true))).await.0;
             assert_eq!(models["data"][0]["id"], SERVED_MODEL);
             assert_eq!(models["data"][0]["owned_by"], "tuiskollm");
         });
@@ -866,6 +1097,27 @@ mod tests {
             "max_completion_tokens": 7
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn snapshot_revision_selects_one_concrete_resident_target() {
+        for (revision, expected, model) in [
+            (
+                Qwen38_27B::REVISION,
+                ResidentTarget::Qwen38,
+                Qwen38_27B::MODEL_ID,
+            ),
+            (
+                Qwen35_9B::REVISION,
+                ResidentTarget::Qwen35,
+                Qwen35_9B::MODEL_ID,
+            ),
+        ] {
+            let target = ResidentTarget::from_snapshot(std::path::Path::new(revision)).unwrap();
+            assert_eq!(target, expected);
+            assert_eq!(target.model_id(), model);
+        }
+        assert!(ResidentTarget::from_snapshot(std::path::Path::new("moving-main")).is_err());
     }
 
     #[test]

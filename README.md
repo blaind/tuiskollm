@@ -1,8 +1,9 @@
 # TuiskoLLM
 
-TuiskoLLM is an exact-target Rust/SM120 inference server for
-`unsloth/Qwen3.8-27B-NVFP4` at revision
-`16b6615af3548b88e2d8e382457bc705b00479cf` on one NVIDIA GeForce RTX 5090.
+TuiskoLLM is an exact-target Rust/SM120 inference server for pinned NVFP4 checkpoints on one NVIDIA
+GeForce RTX 5090. The complete product target is `unsloth/Qwen3.8-27B-NVFP4` at revision
+`16b6615af3548b88e2d8e382457bc705b00479cf`; the initial `AxionML/Qwen3.5-9B-NVFP4` route admits
+revision `97aef92393f126bf649f310cd40861be8dad3279` as a serialized, 192-token text server.
 
 ## Development
 
@@ -34,6 +35,10 @@ It exposes `GET /health`, `GET /v1/models`, and OpenAI-compatible blocking or SS
 `POST /v1/chat/completions`. The server loads and admits the complete checkpoint before binding the
 listener, owns one bounded resident scheduling queue, and refuses a different model identity or
 request options that the current product cannot honor.
+
+Passing the pinned Qwen3.5 snapshot selects its concrete 32-layer resident program and greedy
+checkpoint defaults once at startup. It currently serves one request at a time through its B=1
+short-context graph; compact batching and optimized prefill remain separate qualification work.
 
 The optional `tuisko-llm` Python package exposes the admitted tokenizer and chat-template frontend.
 It does not claim an in-process inference API; see [`python/README.md`](python/README.md).
