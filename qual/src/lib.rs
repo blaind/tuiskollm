@@ -139,6 +139,10 @@ mod qwen35_gdn_prepare;
 #[cfg(feature = "device")]
 mod qwen35_gdn_prepare_benchmark;
 #[cfg(feature = "device")]
+mod qwen35_gdn_recurrence;
+#[cfg(feature = "device")]
+mod qwen35_gdn_recurrence_benchmark;
+#[cfg(feature = "device")]
 mod qwen35_nvfp4_attention_output;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_attention_output_benchmark;
@@ -385,6 +389,13 @@ pub use qwen35_gdn_prepare::{
 };
 #[cfg(feature = "device")]
 pub use qwen35_gdn_prepare_benchmark::benchmark_qwen35_gdn_prepare;
+#[cfg(feature = "device")]
+pub use qwen35_gdn_recurrence::{
+    Qwen35GdnRecurrenceQualification, Qwen35GdnRecurrenceQualificationError,
+    qualify_qwen35_gdn_recurrence,
+};
+#[cfg(feature = "device")]
+pub use qwen35_gdn_recurrence_benchmark::benchmark_qwen35_gdn_recurrence;
 #[cfg(feature = "device")]
 pub use qwen35_nvfp4_attention_output::{
     Qwen35Nvfp4AttentionOutputQualification, Qwen35Nvfp4AttentionOutputQualificationError,
