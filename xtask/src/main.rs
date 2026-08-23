@@ -34,6 +34,8 @@ const GDN_RECURRENCE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-recurrence-sm
 const GDN_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/gdn-output-sm120.txt";
 const ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/attention-qk-prepare-sm120.txt";
+const QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen35-attention-qk-prepare-sm120.txt";
 const PAGED_GQA_RESOURCE_BASELINE: &str = "qual/baselines/paged-gqa-sm120.txt";
 const LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE: &str =
     "qual/baselines/long-context-paged-gqa-sm120.txt";
@@ -455,6 +457,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-qwen35-nvfp4-down") => bench_qwen35_nvfp4_down(root, &remaining),
         Some("bench-qwen35-nvfp4-qkv") => bench_qwen35_nvfp4_qkv(root, &remaining),
         Some("bench-qwen35-nvfp4-mlp") => bench_qwen35_nvfp4_mlp(root, &remaining),
+        Some("bench-qwen35-attention-qk-prepare") => {
+            bench_qwen35_attention_qk_prepare(root, &remaining)
+        }
         Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
         Some("bench-fp8-gdn-input") => bench_fp8_gdn_input(root, &remaining),
         Some("bench-fp8-lm-head") => bench_fp8_lm_head(root, &remaining),
@@ -485,6 +490,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("gate-qwen35-nvfp4-swiglu") if remaining.is_empty() => gate_qwen35_nvfp4_swiglu(root),
         Some("gate-qwen35-nvfp4-down") if remaining.is_empty() => gate_qwen35_nvfp4_down(root),
         Some("gate-qwen35-nvfp4-qkv") if remaining.is_empty() => gate_qwen35_nvfp4_qkv(root),
+        Some("gate-qwen35-attention-qk-prepare") if remaining.is_empty() => {
+            gate_qwen35_attention_qk_prepare(root)
+        }
         Some("gate-fp8-qkv") if remaining.is_empty() => gate_fp8_qkv(root),
         Some("gate-fp8-gdn-input") if remaining.is_empty() => gate_fp8_gdn_input(root),
         Some("gate-fp8-lm-head") if remaining.is_empty() => gate_fp8_lm_head(root),
@@ -533,6 +541,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-attention-output"
                     | "gate-residual-norm"
                     | "gate-qwen35-residual-norm"
+                    | "gate-qwen35-attention-qk-prepare"
                     | "gate-fp8-qkv"
                     | "gate-fp8-gdn-input"
                     | "gate-fp8-lm-head"
@@ -700,6 +709,7 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_gdn_recurrence(root)?;
     gate_gdn_output(root)?;
     gate_attention_qk_prepare(root)?;
+    gate_qwen35_attention_qk_prepare(root)?;
     gate_paged_gqa(root)?;
     gate_long_context_paged_gqa(root)?;
     gate_attention_output(root)
@@ -1262,7 +1272,8 @@ fn qualify_qwen35_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>
             "--include-ignored",
             "--nocapture",
         ],
-    )
+    )?;
+    gate_qwen35_attention_qk_prepare(root)
 }
 
 fn qualify_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -1792,6 +1803,34 @@ fn bench_qwen35_nvfp4_mlp(
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_qwen35_attention_qk_prepare(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen35-attention-qk-prepare")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(
+                    root.join(QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE),
+                )?),
+            ),
     )
 }
 
@@ -4726,27 +4765,51 @@ fn gate_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn gate_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
-    let baseline = parse_baseline(&fs::read_to_string(
-        root.join(ATTENTION_QK_PREPARE_RESOURCE_BASELINE),
-    )?)?;
+    gate_attention_qk_prepare_target(
+        root,
+        ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+        "attention_qk_prepare_exact_TID_",
+        Some("attention_qk_prepare_prefill_exact_TID_"),
+        "attention Q/K prepare",
+    )
+}
+
+fn gate_qwen35_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
+    gate_attention_qk_prepare_target(
+        root,
+        QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+        "qwen35_attention_qk_prepare_exact_TID_",
+        None,
+        "Qwen3.5 attention Q/K prepare",
+    )
+}
+
+fn gate_attention_qk_prepare_target(
+    root: &Path,
+    baseline_path: &str,
+    entry_prefix: &str,
+    prefill_prefix: Option<&str>,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(root.join(baseline_path))?)?;
     verify_generator_stamp(root, &baseline)?;
     let ptx_path = root.join(PTX);
     let ptx = fs::read_to_string(&ptx_path)?;
     let entries = parse_entries(&ptx);
     let prepare = entries
         .iter()
-        .filter(|entry| entry.name.starts_with("attention_qk_prepare_exact_TID_"))
+        .filter(|entry| entry.name.starts_with(entry_prefix))
         .collect::<Vec<_>>();
-    let prefill = entries
-        .iter()
-        .filter(|entry| {
-            entry
-                .name
-                .starts_with("attention_qk_prepare_prefill_exact_TID_")
-        })
-        .collect::<Vec<_>>();
-    require_count("attention Q/K preparation", prepare.len(), 8)?;
-    require_count("attention Q/K prefill preparation", prefill.len(), 4)?;
+    let prefill = prefill_prefix.map_or_else(Vec::new, |prefix| {
+        entries
+            .iter()
+            .filter(|entry| entry.name.starts_with(prefix))
+            .collect::<Vec<_>>()
+    });
+    require_count(label, prepare.len(), 8)?;
+    if prefill_prefix.is_some() {
+        require_count("attention Q/K prefill preparation", prefill.len(), 4)?;
+    }
     for entry in prepare.iter().chain(&prefill) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
@@ -4821,8 +4884,12 @@ fn gate_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "attention Q/K prepare gate passed: 8 decode + 4 prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/SHFL/E4M3 present",
-        decode_registers, prefill_registers, shared
+        "{label} gate passed: {} decode + {} prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/SHFL/E4M3 present",
+        prepare.len(),
+        prefill.len(),
+        decode_registers,
+        prefill_registers,
+        shared
     );
     Ok(())
 }

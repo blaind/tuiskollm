@@ -174,6 +174,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed layer-55 MLP graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed Qwen3.5 layer-0 MLP graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-qkv` | Measure every exact Qwen3.5 fused NVFP4 QKV graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen35-attention-qk-prepare` | Measure every exact Qwen3.5 Q/K prepare and cache-append graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT` | Measure every complete source-backed layer-60 graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-full-attention-layer SNAPSHOT` | Measure every complete source-backed layer-63 graph at a 131-token, three-page context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-resident-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head graph at a 131-token context | terminal or `--json PATH` |
