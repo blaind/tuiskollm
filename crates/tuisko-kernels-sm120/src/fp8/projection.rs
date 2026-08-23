@@ -1,7 +1,9 @@
 //! Source-native FP8 projections with dynamic E4M3 activation quantization.
 
 use crate::Sm120Arch;
-use crate::device::fp8_projection::{fp8_projection, qkv_projection_mma_t16, quantize_activation};
+use crate::device::fp8_projection::{
+    fp8_projection, qkv_projection_mma, qkv_projection_mma_t16, quantize_activation,
+};
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -15,14 +17,31 @@ const QUANTIZE_THREADS: u32 = (QUANTIZE_WARPS * 32) as u32;
 // 90.65% measured DRAM throughput without changing the per-row accumulation order.
 const DECODE_PROJECTION_WARPS: usize = 8;
 const DECODE_PROJECTION_THREADS: u32 = (DECODE_PROJECTION_WARPS * 32) as u32;
-// The MTP boundary is exactly 16 rows. Two warps cover one 16x64 output tile,
-// with 128 K bytes per stage split into four m16n8k32 subtiles.
-const QKV_MMA_TOKENS: usize = 16;
+// T=16 uses two warps for one 16x64 tile. T=32/64/128 use a 64-row CTA so eight
+// warps share each 64-row weight tile; the retained schedule measured better than
+// narrower token CTAs while preserving each m16n8k32 accumulation sequence.
+const QKV_MMA_T16_TOKENS: usize = 16;
+const QKV_MMA_PREFILL_TOKENS: [usize; 3] = [32, 64, 128];
+const QKV_MMA_MACRO_TOKENS: usize = 1_024;
 const QKV_MMA_OUTPUT_ROWS: usize = 64;
+const QKV_MMA_T16_BLOCK_ROWS: usize = 16;
+const QKV_MMA_PREFILL_BLOCK_ROWS: usize = 64;
 const QKV_MMA_K_WORDS: usize = 32;
-const QKV_MMA_THREADS: u32 = 64;
-const QKV_MMA_SHARED_BYTES: u32 =
-    (2 * (QKV_MMA_TOKENS + QKV_MMA_OUTPUT_ROWS) * QKV_MMA_K_WORDS * size_of::<u32>()) as u32;
+// The 1,024-row route halves the staged K words. It keeps the same ordered sequence
+// of m16n8k32 operations while reducing dynamic shared memory from 32 KiB to 16 KiB.
+const QKV_MMA_MACRO_K_WORDS: usize = 16;
+const QKV_MMA_T16_THREADS: u32 = 64;
+const QKV_MMA_PREFILL_THREADS: u32 = 256;
+const QKV_MMA_T16_SHARED_BYTES: u32 =
+    (2 * (QKV_MMA_T16_BLOCK_ROWS + QKV_MMA_OUTPUT_ROWS) * QKV_MMA_K_WORDS * size_of::<u32>())
+        as u32;
+const QKV_MMA_PREFILL_SHARED_BYTES: u32 =
+    (2 * (QKV_MMA_PREFILL_BLOCK_ROWS + QKV_MMA_OUTPUT_ROWS) * QKV_MMA_K_WORDS * size_of::<u32>())
+        as u32;
+const QKV_MMA_MACRO_SHARED_BYTES: u32 = (2
+    * (QKV_MMA_PREFILL_BLOCK_ROWS + QKV_MMA_OUTPUT_ROWS)
+    * QKV_MMA_MACRO_K_WORDS
+    * size_of::<u32>()) as u32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Fp8Geometry {
@@ -30,7 +49,7 @@ struct Fp8Geometry {
     qkv_decode_blocks: usize,
     gdn_decode_blocks: usize,
     lm_head_decode_blocks: usize,
-    qkv_mma_blocks: usize,
+    qkv_mma_output_tiles: usize,
     qkv_mma_k_tiles: usize,
 }
 
@@ -52,7 +71,7 @@ fn fp8_geometry<A: Arch>() -> Option<Fp8Geometry> {
         qkv_decode_blocks: A::ATTENTION_QKV_ROWS / decode_rows,
         gdn_decode_blocks: A::GDN_INPUT_ROWS / decode_rows,
         lm_head_decode_blocks: A::VOCAB / decode_rows,
-        qkv_mma_blocks: A::ATTENTION_QKV_ROWS / QKV_MMA_OUTPUT_ROWS,
+        qkv_mma_output_tiles: A::ATTENTION_QKV_ROWS / QKV_MMA_OUTPUT_ROWS,
         qkv_mma_k_tiles: A::HIDDEN / 4 / QKV_MMA_K_WORDS,
     })
 }
@@ -198,6 +217,69 @@ mod kernels {
         // SAFETY: the fixed launch covers the exact 16-row QKV plane.
         unsafe {
             qkv_projection_mma_t16::<Qwen38_27B>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                k_tiles,
+            );
+        }
+    }
+
+    /// Projects one exact 32/64/128-row prefill tile through source-native QKV.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 32768,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn fp8_qkv_mma<const TOKENS: usize>(
+        activation_codes: *const u32,
+        activation_scales: *const f32,
+        weight_codes: *const u32,
+        weight_scales: *const u16,
+        output: *mut u16,
+        k_tiles: u32,
+    ) {
+        // SAFETY: the prepared route instantiates only T=32/64/128 with a complete
+        // padded 64-row activation tile and exact 64-row output tiles.
+        unsafe {
+            qkv_projection_mma::<Qwen38_27B, TOKENS, 64, 32, 4>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                k_tiles,
+            );
+        }
+    }
+
+    /// Projects exactly 1,024 rows through the retained low-shared-memory QKV tile.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 16384,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn fp8_qkv_mma_t1024(
+        activation_codes: *const u32,
+        activation_scales: *const f32,
+        weight_codes: *const u32,
+        weight_scales: *const u16,
+        output: *mut u16,
+        k_tiles: u32,
+    ) {
+        // SAFETY: the fixed launch covers every 64-row token tile and QKV output tile.
+        unsafe {
+            qkv_projection_mma::<Qwen38_27B, 1024, 64, 16, 2>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
@@ -414,13 +496,13 @@ impl PreparedQkvT16Route {
         let projection = module
             .prepare_fp8_qkv_mma_t16(LaunchConfig1D::new(
                 projection_blocks,
-                QKV_MMA_THREADS,
-                QKV_MMA_SHARED_BYTES,
+                QKV_MMA_T16_THREADS,
+                QKV_MMA_T16_SHARED_BYTES,
             ))
             .map_err(|source| GpuError::launch("preparing the FP8 QKV T=16 projection", source))?;
 
         Ok(Self {
-            quantize: prepare_quantize::<QKV_MMA_TOKENS>(module)?,
+            quantize: prepare_quantize::<QKV_MMA_T16_TOKENS>(module)?,
             projection,
         })
     }
@@ -462,8 +544,144 @@ impl PreparedQkvT16Route {
     }
 }
 
+struct PreparedQkvPrefillRoute<const TOKENS: usize> {
+    quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
+    projection: PreparedLaunch<kernels::__fp8_qkv_mma_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedQkvPrefillRoute<TOKENS> {
+    fn prepare<A: Arch>(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !QKV_MMA_PREFILL_TOKENS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "FP8 QKV prefill route T={TOKENS} is not admitted"
+            )));
+        }
+        let token_tiles = TOKENS.div_ceil(QKV_MMA_PREFILL_BLOCK_ROWS);
+        let projection_blocks = A::ATTENTION_QKV_ROWS / QKV_MMA_OUTPUT_ROWS * token_tiles;
+        let projection_blocks = u32::try_from(projection_blocks)
+            .map_err(|_| GpuError::invalid_launch("FP8 QKV prefill grid exceeds CUDA width"))?;
+        let projection = module
+            .prepare_fp8_qkv_mma::<TOKENS>(LaunchConfig1D::new(
+                projection_blocks,
+                QKV_MMA_PREFILL_THREADS,
+                QKV_MMA_PREFILL_SHARED_BYTES,
+            ))
+            .map_err(|source| {
+                GpuError::launch("preparing the FP8 QKV prefill projection", source)
+            })?;
+
+        Ok(Self {
+            quantize: prepare_quantize::<TOKENS>(module)?,
+            projection,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch<A: Arch>(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .quantize_activation_e4m3(
+                stream,
+                &self.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u16>(),
+                activation_scales,
+            )
+            .map_err(|source| GpuError::launch("launching FP8 activation quantization", source))?;
+        let k_tiles = A::HIDDEN / 4 / QKV_MMA_K_WORDS;
+        module
+            .fp8_qkv_mma::<TOKENS>(
+                stream,
+                &self.projection,
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                weight_codes.cast::<u32>(),
+                weight_scales,
+                output,
+                k_tiles as u32,
+            )
+            .map_err(|source| GpuError::launch("launching the FP8 QKV prefill projection", source))
+    }
+}
+
+struct PreparedQkvT1024Route {
+    quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
+    projection: PreparedLaunch<kernels::__fp8_qkv_mma_t1024_CudaKernel>,
+}
+
+impl PreparedQkvT1024Route {
+    fn prepare<A: Arch>(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let token_tiles = QKV_MMA_MACRO_TOKENS / QKV_MMA_PREFILL_BLOCK_ROWS;
+        let projection_blocks = A::ATTENTION_QKV_ROWS / QKV_MMA_OUTPUT_ROWS * token_tiles;
+        let projection_blocks = u32::try_from(projection_blocks).map_err(|_| {
+            GpuError::invalid_launch("FP8 QKV macro-prefill grid exceeds CUDA width")
+        })?;
+        let projection = module
+            .prepare_fp8_qkv_mma_t1024(LaunchConfig1D::new(
+                projection_blocks,
+                QKV_MMA_PREFILL_THREADS,
+                QKV_MMA_MACRO_SHARED_BYTES,
+            ))
+            .map_err(|source| {
+                GpuError::launch("preparing the FP8 QKV macro-prefill projection", source)
+            })?;
+
+        Ok(Self {
+            quantize: prepare_quantize::<QKV_MMA_MACRO_TOKENS>(module)?,
+            projection,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch<A: Arch>(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .quantize_activation_e4m3(
+                stream,
+                &self.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u16>(),
+                activation_scales,
+            )
+            .map_err(|source| GpuError::launch("launching FP8 activation quantization", source))?;
+        let k_tiles = A::HIDDEN / 4 / QKV_MMA_MACRO_K_WORDS;
+        module
+            .fp8_qkv_mma_t1024(
+                stream,
+                &self.projection,
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                weight_codes.cast::<u32>(),
+                weight_scales,
+                output,
+                k_tiles as u32,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching the FP8 QKV macro-prefill projection", source)
+            })
+    }
+}
+
 /// PTX symbols retained for activation quantization and every admitted QKV route.
-pub(crate) fn fp8_qkv_ptx_names() -> [&'static str; 10] {
+pub(crate) fn fp8_qkv_ptx_names() -> [&'static str; 14] {
     [
         "quantize_activation_e4m3",
         kernels::fp8_qkv_ptx_name::<Qwen38_27B, 1>(),
@@ -475,6 +693,10 @@ pub(crate) fn fp8_qkv_ptx_names() -> [&'static str; 10] {
         kernels::fp8_qkv_ptx_name::<Qwen38_27B, 7>(),
         kernels::fp8_qkv_ptx_name::<Qwen38_27B, 8>(),
         "fp8_qkv_mma_t16",
+        kernels::fp8_qkv_mma_ptx_name::<32>(),
+        kernels::fp8_qkv_mma_ptx_name::<64>(),
+        kernels::fp8_qkv_mma_ptx_name::<128>(),
+        "fp8_qkv_mma_t1024",
     ]
 }
 
@@ -506,7 +728,7 @@ pub(crate) fn fp8_lm_head_ptx_names() -> [&'static str; 8] {
     ]
 }
 
-/// Prepared dynamic-quantize plus source-native QKV routes for exact `B=1..=8` and `T=16`.
+/// Prepared dynamic-quantize plus source-native QKV routes for decode, MTP, and prefill.
 pub struct FullAttentionQkvOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
     b1: PreparedQkvRoute<A, 1>,
@@ -518,6 +740,10 @@ pub struct FullAttentionQkvOp<A: Sm120Arch = Qwen38_27B> {
     b7: PreparedQkvRoute<A, 7>,
     b8: PreparedQkvRoute<A, 8>,
     t16: PreparedQkvT16Route,
+    t32: PreparedQkvPrefillRoute<32>,
+    t64: PreparedQkvPrefillRoute<64>,
+    t128: PreparedQkvPrefillRoute<128>,
+    t1024: PreparedQkvT1024Route,
 }
 
 impl<A: Sm120Arch> FullAttentionQkvOp<A> {
@@ -539,6 +765,10 @@ impl<A: Sm120Arch> FullAttentionQkvOp<A> {
             b7: PreparedQkvRoute::prepare(&module)?,
             b8: PreparedQkvRoute::prepare(&module)?,
             t16: PreparedQkvT16Route::prepare::<A>(&module)?,
+            t32: PreparedQkvPrefillRoute::prepare::<A>(&module)?,
+            t64: PreparedQkvPrefillRoute::prepare::<A>(&module)?,
+            t128: PreparedQkvPrefillRoute::prepare::<A>(&module)?,
+            t1024: PreparedQkvT1024Route::prepare::<A>(&module)?,
             module,
         })
     }
@@ -547,8 +777,9 @@ impl<A: Sm120Arch> FullAttentionQkvOp<A> {
     ///
     /// # Safety
     ///
-    /// `input` covers `rows * A::HIDDEN` BF16 values; `activation_codes` covers
-    /// the same number of bytes; `activation_scales` covers `rows` FP32 values;
+    /// `input` covers `rows * A::HIDDEN` BF16 values. `activation_codes` covers
+    /// at least 64 rows for T=32 and otherwise `rows`, so the retained padded CTA
+    /// can read its complete immutable tile; `activation_scales` covers `rows` FP32 values;
     /// weights cover `[A::ATTENTION_QKV_ROWS, A::HIDDEN]` E4M3 codes and one
     /// BF16 scale per output row; and `output` covers all projected rows.
     /// Four-byte-loaded planes must be four-byte aligned. All allocations must
@@ -604,8 +835,56 @@ impl<A: Sm120Arch> FullAttentionQkvOp<A> {
                     output,
                 )
             },
+            32 => unsafe {
+                self.t32.launch::<A>(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
+            64 => unsafe {
+                self.t64.launch::<A>(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
+            128 => unsafe {
+                self.t128.launch::<A>(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
+            1_024 => unsafe {
+                self.t1024.launch::<A>(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
             _ => Err(GpuError::invalid_launch(format!(
-                "FP8 QKV row count {rows} is outside the admitted routes 1..={MAX_BATCH} and 16"
+                "FP8 QKV row count {rows} is outside the admitted routes 1..={MAX_BATCH}, 16, 32, 64, 128, and 1024"
             ))),
         }
     }
@@ -797,9 +1076,11 @@ impl<A: Sm120Arch> LmHeadOp<A> {
 mod tests {
     use super::{
         DECODE_PROJECTION_THREADS, DECODE_PROJECTION_WARPS, MAX_BATCH, QKV_MMA_K_WORDS,
-        QKV_MMA_OUTPUT_ROWS, QKV_MMA_SHARED_BYTES, QKV_MMA_THREADS, QKV_MMA_TOKENS,
-        QUANTIZE_THREADS, fp8_gdn_input_ptx_names, fp8_geometry, fp8_lm_head_ptx_names,
-        fp8_qkv_ptx_names,
+        QKV_MMA_MACRO_K_WORDS, QKV_MMA_MACRO_SHARED_BYTES, QKV_MMA_MACRO_TOKENS,
+        QKV_MMA_OUTPUT_ROWS, QKV_MMA_PREFILL_BLOCK_ROWS, QKV_MMA_PREFILL_SHARED_BYTES,
+        QKV_MMA_PREFILL_THREADS, QKV_MMA_PREFILL_TOKENS, QKV_MMA_T16_BLOCK_ROWS,
+        QKV_MMA_T16_SHARED_BYTES, QKV_MMA_T16_THREADS, QKV_MMA_T16_TOKENS, QUANTIZE_THREADS,
+        fp8_gdn_input_ptx_names, fp8_geometry, fp8_lm_head_ptx_names, fp8_qkv_ptx_names,
     };
     use crate::test_arch::TestArch;
     use std::collections::BTreeSet;
@@ -825,14 +1106,23 @@ mod tests {
     }
 
     #[test]
-    fn t16_geometry_matches_the_retained_mma_schedule() {
-        assert_eq!(QKV_MMA_TOKENS, 16);
+    fn prefill_geometry_matches_the_retained_mma_schedules() {
+        assert_eq!(QKV_MMA_T16_TOKENS, 16);
+        assert_eq!(QKV_MMA_PREFILL_TOKENS, [32, 64, 128]);
+        assert_eq!(QKV_MMA_MACRO_TOKENS, 1_024);
         assert_eq!(QKV_MMA_OUTPUT_ROWS, 64);
+        assert_eq!(QKV_MMA_T16_BLOCK_ROWS, 16);
+        assert_eq!(QKV_MMA_PREFILL_BLOCK_ROWS, 64);
         assert_eq!(QKV_MMA_K_WORDS, 32);
-        assert_eq!(QKV_MMA_THREADS, 64);
-        assert_eq!(QKV_MMA_SHARED_BYTES, 20_480);
+        assert_eq!(QKV_MMA_MACRO_K_WORDS, 16);
+        assert_eq!(QKV_MMA_T16_THREADS, 64);
+        assert_eq!(QKV_MMA_PREFILL_THREADS, 256);
+        assert_eq!(QKV_MMA_T16_SHARED_BYTES, 20_480);
+        assert_eq!(QKV_MMA_PREFILL_SHARED_BYTES, 32_768);
+        assert_eq!(QKV_MMA_MACRO_SHARED_BYTES, 16_384);
         assert_eq!(Qwen38_27B::ATTENTION_QKV_ROWS % QKV_MMA_OUTPUT_ROWS, 0);
         assert_eq!((Qwen38_27B::HIDDEN / 4) % QKV_MMA_K_WORDS, 0);
+        assert_eq!((Qwen38_27B::HIDDEN / 4) % QKV_MMA_MACRO_K_WORDS, 0);
     }
 
     #[test]
@@ -844,13 +1134,13 @@ mod tests {
         assert_eq!(qwen.qkv_decode_blocks, 896);
         assert_eq!(qwen.gdn_decode_blocks, 1_024);
         assert_eq!(qwen.lm_head_decode_blocks, 15_520);
-        assert_eq!(qwen.qkv_mma_blocks, 224);
+        assert_eq!(qwen.qkv_mma_output_tiles, 224);
         assert_eq!(qwen.qkv_mma_k_tiles, 40);
         assert_eq!(test.quantize_pairs_per_thread, 2);
         assert_eq!(test.qkv_decode_blocks, 40);
         assert_eq!(test.gdn_decode_blocks, 24);
         assert_eq!(test.lm_head_decode_blocks, 32);
-        assert_eq!(test.qkv_mma_blocks, 10);
+        assert_eq!(test.qkv_mma_output_tiles, 10);
         assert_eq!(test.qkv_mma_k_tiles, 8);
     }
 
@@ -863,7 +1153,7 @@ mod tests {
             .collect::<Vec<_>>();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 3 * MAX_BATCH + 2);
+        assert_eq!(names.len(), 3 * MAX_BATCH + 6);
         assert_eq!(unique.len(), names.len());
     }
 }

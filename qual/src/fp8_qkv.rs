@@ -12,11 +12,11 @@ use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 #[cfg(feature = "device")]
-const MAX_ROWS: usize = 16;
+const MAX_ROWS: usize = 1_024;
 #[cfg(feature = "sm89")]
 const MAX_ROWS: usize = MAX_BATCH;
 #[cfg(feature = "device")]
-const EXACT_ROUTES: [usize; MAX_BATCH + 1] = [1, 2, 3, 4, 5, 6, 7, 8, 16];
+const EXACT_ROUTES: [usize; MAX_BATCH + 5] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128, 1_024];
 #[cfg(feature = "sm89")]
 const EXACT_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
 const ALIGNMENT: usize = 256;
@@ -68,7 +68,7 @@ struct Regions {
     output: ArenaRegion<u16>,
 }
 
-/// Qualifies eager and captured full-attention QKV at exact `B=1..=8` and `T=16`.
+/// Qualifies eager and captured full-attention QKV decode, MTP, and prefill routes.
 pub fn qualify_fp8_qkv() -> Result<Fp8QkvQualification, Fp8QkvQualificationError> {
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
@@ -170,7 +170,7 @@ fn make_input() -> Vec<u16> {
     (0..MAX_ROWS * Qwen38_27B::HIDDEN)
         .map(|index| {
             let token = index / Qwen38_27B::HIDDEN;
-            f32_to_bf16(INPUT_PATTERN[index & 15] * TOKEN_FACTORS[token])
+            f32_to_bf16(INPUT_PATTERN[index & 15] * TOKEN_FACTORS[token & 15])
         })
         .collect()
 }
