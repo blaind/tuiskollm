@@ -63,6 +63,8 @@ contract rather than silently taking another route.
 The standalone SM120 operator inventory also includes partitioned paged GQA through 220,000
 positions at every exact `B=1..8` route. The resident program owns its maximum-B partial workspace
 once and captures all six partition buckets without changing addresses after warmup. Its
+zero-centered RMSNorm leaves retain separate exact `T=32,64,128,1024` symbols for plain input and
+the fused BF16 residual-publication seam. The
 source-native full-attention QKV owner admits exact `T=32,64,128,1024` prefill projections in
 addition to `B=1..8` decode and `T=16` MTP. Q/K zero-centered normalization, MRoPE, and represented
 E4M3 cache append admit the same four prefill widths alongside `B=1..8` decode. Paged GQA and

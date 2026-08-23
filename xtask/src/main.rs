@@ -816,7 +816,7 @@ fn build_residual_norm(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     let gpu = parse_build_gpu(arguments, "build-residual-norm")?;
-    let prepared = prepare_remote_qualify(root, gpu, "residual_norm::tests")?;
+    let prepared = prepare_remote_qualify(root, gpu, "residual_norm_suite_")?;
     gate_residual_norm_target(root, gpu)?;
     println!(
         "{} ({}, compute capability {}) residual-norm qualification artifact: {}",
@@ -949,9 +949,10 @@ fn qualify_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "residual_norm::tests",
+            "residual_norm_suite_",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_residual_norm(root)
@@ -4029,10 +4030,34 @@ pub(crate) fn gate_residual_norm_target(
         .iter()
         .filter(|entry| entry.name.starts_with("residual_rms_norm_TID_"))
         .collect::<Vec<_>>();
+    let prefill_plain = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("rms_norm_prefill_TID_"))
+        .collect::<Vec<_>>();
+    let prefill_residual = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("residual_rms_norm_prefill_TID_"))
+        .collect::<Vec<_>>();
     require_count("plain RMSNorm", plain.len(), 8)?;
     require_count("residual RMSNorm", residual.len(), 8)?;
+    let expected_prefill = usize::from(matches!(gpu, gpu_target::GpuTarget::Sm120)) * 4;
+    require_count(
+        "plain RMSNorm prefill",
+        prefill_plain.len(),
+        expected_prefill,
+    )?;
+    require_count(
+        "residual RMSNorm prefill",
+        prefill_residual.len(),
+        expected_prefill,
+    )?;
 
-    for entry in plain.iter().chain(&residual) {
+    for entry in plain
+        .iter()
+        .chain(&residual)
+        .chain(&prefill_plain)
+        .chain(&prefill_residual)
+    {
         if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 512-thread/two-CTA launch bounds",
@@ -4043,7 +4068,23 @@ pub(crate) fn gate_residual_norm_target(
     }
 
     let resources = if matches!(gpu, gpu_target::GpuTarget::Sm120) {
-        sm120_gate_artifact(root)?.resources.clone()
+        let artifact = sm120_gate_artifact(root)?;
+        let sass = artifact.sass()?;
+        for entry in prefill_plain.iter().chain(&prefill_residual) {
+            let body = sass_function_body(sass, entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+            for instruction in ["SHFL.BFLY", "MUFU.RSQ", "F2FP.BF16.F32.PACK_AB"] {
+                if !body.contains(instruction) {
+                    return Err(format!(
+                        "entry `{}` lost required `{instruction}` SASS",
+                        entry.name
+                    )
+                    .into());
+                }
+            }
+        }
+
+        artifact.resources.clone()
     } else {
         let temporary = root.join("target/tmp");
         fs::create_dir_all(&temporary)?;
@@ -4067,7 +4108,10 @@ pub(crate) fn gate_residual_norm_target(
     };
     let mut plain_registers = Vec::new();
     let mut residual_registers = Vec::new();
+    let mut prefill_plain_registers = Vec::new();
+    let mut prefill_residual_registers = Vec::new();
     let mut shared = Vec::new();
+    let mut prefill_shared = Vec::new();
 
     for entry in plain {
         let resource = resources
@@ -4085,18 +4129,54 @@ pub(crate) fn gate_residual_norm_target(
         residual_registers.push(resource.registers);
         shared.push(resource.shared);
     }
+    for entry in prefill_plain {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted plain prefill entry `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        prefill_plain_registers.push(resource.registers);
+        prefill_shared.push(resource.shared);
+    }
+    for entry in prefill_residual {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted residual prefill entry `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        prefill_residual_registers.push(resource.registers);
+        prefill_shared.push(resource.shared);
+    }
     plain_registers.sort_unstable();
     residual_registers.sort_unstable();
+    prefill_plain_registers.sort_unstable();
+    prefill_residual_registers.sort_unstable();
     require_registers(&baseline, "plain_registers", &plain_registers)?;
     require_registers(&baseline, "residual_registers", &residual_registers)?;
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
+    if matches!(gpu, gpu_target::GpuTarget::Sm120) {
+        require_registers(
+            &baseline,
+            "prefill_plain_registers",
+            &prefill_plain_registers,
+        )?;
+        require_registers(
+            &baseline,
+            "prefill_residual_registers",
+            &prefill_residual_registers,
+        )?;
+        require_uniform_value(&baseline, "prefill_shared_bytes", &prefill_shared)?;
+    }
 
     println!(
-        "{} residual-norm gate passed: 8 plain + 8 residual entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}",
+        "{} residual-norm gate passed: 8 plain + 8 residual decode and {} + {} prefill entries, REG {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}, SHFL/RSQ/BF16 present",
         gpu.key(),
+        expected_prefill,
+        expected_prefill,
         plain_registers,
         residual_registers,
-        shared
+        prefill_plain_registers,
+        prefill_residual_registers,
+        shared,
+        prefill_shared,
     );
     Ok(())
 }

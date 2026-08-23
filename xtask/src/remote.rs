@@ -32,7 +32,7 @@ struct Qualification {
 impl Qualification {
     fn parse(name: &str) -> Option<Self> {
         let filter = match name {
-            "qualify-residual-norm" => "residual_norm::tests",
+            "qualify-residual-norm" => "residual_norm_suite_",
             "qualify-nvfp4-swiglu" => "nvfp4_swiglu::tests",
             "qualify-nvfp4-down" => "nvfp4_down::tests",
             "qualify-fp8-qkv" => "fp8_qkv",
@@ -403,7 +403,7 @@ mod tests {
     fn remote_suite_inventory_is_exact() {
         let qualification = Qualification::parse("qualify-residual-norm").expect("known suite");
         assert_eq!(qualification.name, "residual-norm");
-        assert_eq!(qualification.filter, "residual_norm::tests");
+        assert_eq!(qualification.filter, "residual_norm_suite_");
         let qualification = Qualification::parse("qualify-nvfp4-swiglu").expect("known suite");
         assert_eq!(qualification.name, "nvfp4-swiglu");
         assert_eq!(qualification.filter, "nvfp4_swiglu::tests");

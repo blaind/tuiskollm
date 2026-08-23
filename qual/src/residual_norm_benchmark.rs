@@ -18,6 +18,15 @@ use tuisko_gpu::{
 use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const DECODE_ROUTES: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+#[cfg(feature = "device")]
+const QWEN38_MAX_ROWS: usize = 1_024;
+#[cfg(not(feature = "device"))]
+const QWEN38_MAX_ROWS: usize = MAX_BATCH;
+#[cfg(feature = "device")]
+const QWEN38_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
+#[cfg(not(feature = "device"))]
+const QWEN38_ROUTES: [usize; 8] = DECODE_ROUTES;
 const INPUT_PATTERN: [f32; 8] = [0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625];
 const BRANCH_PATTERN: [f32; 8] = [
     0.25, -0.125, 0.0625, -0.03125, -0.25, 0.125, -0.0625, 0.03125,
@@ -44,11 +53,37 @@ struct Addresses {
     normalized: *mut u16,
 }
 
+#[derive(Clone, Copy)]
+struct Regions {
+    input: tuisko_gpu::ArenaRegion<u16>,
+    branch: tuisko_gpu::ArenaRegion<u16>,
+    weight: tuisko_gpu::ArenaRegion<u16>,
+    plain: tuisko_gpu::ArenaRegion<u16>,
+    residual: tuisko_gpu::ArenaRegion<u16>,
+    normalized: tuisko_gpu::ArenaRegion<u16>,
+}
+
+impl Regions {
+    fn payload_bytes(self) -> usize {
+        self.input.byte_len()
+            + self.branch.byte_len()
+            + self.weight.byte_len()
+            + self.plain.byte_len()
+            + self.residual.byte_len()
+            + self.normalized.byte_len()
+    }
+
+    fn weight_bytes(self) -> usize {
+        self.weight.byte_len()
+    }
+}
+
 struct Session<A: Arch, O: ResidualNormLauncher> {
     routes: Vec<RouteGraphs>,
     timer: GpuTimer,
     _op: O,
-    _arena: DeviceArena,
+    arena: DeviceArena,
+    regions: Regions,
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
     _arch: PhantomData<A>,
@@ -58,6 +93,8 @@ impl<A: Arch, O: ResidualNormLauncher> Session<A, O> {
     fn new(
         repeated_operations: u64,
         prepare: fn(&Arc<CudaContext>) -> GpuResult<O>,
+        exact_routes: &[usize],
+        max_rows: usize,
     ) -> Result<Self, DeviceBenchmarkError> {
         let context = CudaContext::new(0).map_err(GpuError::from)?;
         let capability = context.compute_capability().map_err(GpuError::from)?;
@@ -72,14 +109,8 @@ impl<A: Arch, O: ResidualNormLauncher> Session<A, O> {
         }
 
         let stream = context.new_stream().map_err(GpuError::from)?;
-        let mut layout = ArenaLayout::new();
-        let rows = MAX_BATCH * A::HIDDEN;
-        let input = layout.reserve::<u16>(rows, 256)?;
-        let branch = layout.reserve::<u16>(rows, 256)?;
-        let weight = layout.reserve::<u16>(A::HIDDEN, 256)?;
-        let plain = layout.reserve::<u16>(rows, 256)?;
-        let residual = layout.reserve::<u16>(rows, 256)?;
-        let normalized = layout.reserve::<u16>(rows, 256)?;
+        let (layout, regions) = layout::<A>(max_rows)?;
+        let rows = max_rows * A::HIDDEN;
         let arena = DeviceArena::zeroed(&stream, &layout)?;
         let input_host = (0..rows)
             .map(|index| f32_to_bf16(INPUT_PATTERN[(index + index / A::HIDDEN) & 7]))
@@ -90,22 +121,22 @@ impl<A: Arch, O: ResidualNormLauncher> Session<A, O> {
         let weight_host = (0..A::HIDDEN)
             .map(|index| f32_to_bf16(WEIGHT_PATTERN[index & 7]))
             .collect::<Vec<_>>();
-        arena.copy_from_host(&stream, input, &input_host)?;
-        arena.copy_from_host(&stream, branch, &branch_host)?;
-        arena.copy_from_host(&stream, weight, &weight_host)?;
+        arena.copy_from_host(&stream, regions.input, &input_host)?;
+        arena.copy_from_host(&stream, regions.branch, &branch_host)?;
+        arena.copy_from_host(&stream, regions.weight, &weight_host)?;
         stream.synchronize().map_err(GpuError::from)?;
 
         let op = prepare(&context)?;
         let addresses = Addresses {
-            input: arena.address(input)?,
-            branch: arena.address(branch)?,
-            weight: arena.address(weight)?,
-            plain: arena.address(plain)?,
-            residual: arena.address(residual)?,
-            normalized: arena.address(normalized)?,
+            input: arena.address(regions.input)?,
+            branch: arena.address(regions.branch)?,
+            weight: arena.address(regions.weight)?,
+            plain: arena.address(regions.plain)?,
+            residual: arena.address(regions.residual)?,
+            normalized: arena.address(regions.normalized)?,
         };
-        let mut routes = Vec::with_capacity(MAX_BATCH);
-        for batch in 1..=MAX_BATCH {
+        let mut routes = Vec::with_capacity(exact_routes.len());
+        for &batch in exact_routes {
             routes.push(RouteGraphs {
                 batch,
                 plain: capture_plain(&op, &stream, &addresses, batch, repeated_operations)?,
@@ -118,7 +149,8 @@ impl<A: Arch, O: ResidualNormLauncher> Session<A, O> {
             routes,
             timer,
             _op: op,
-            _arena: arena,
+            arena,
+            regions,
             stream,
             _context: context,
             _arch: PhantomData,
@@ -143,11 +175,21 @@ impl<A: Arch, O: ResidualNormLauncher> Session<A, O> {
     ) -> Vec<ExactDeviceCase<'_>> {
         let mut cases = Vec::with_capacity(self.routes.len() * 2);
         for route in &self.routes {
-            let shape = format!("B={}", route.batch);
+            let (shape, workload) = if route.batch <= MAX_BATCH {
+                (
+                    format!("B={}", route.batch),
+                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
+                )
+            } else {
+                (
+                    format!("T={}", route.batch),
+                    BenchmarkWorkload::warm_operator_prefill(route.batch as u64),
+                )
+            };
             cases.push(ExactDeviceCase::new(
                 plain_route,
                 shape.clone(),
-                BenchmarkWorkload::warm_operator_decode(route.batch as u32),
+                workload.clone(),
                 OperationAccounting::new(
                     logical_bytes::<A>(route.batch, false),
                     route.batch as u64,
@@ -162,7 +204,7 @@ impl<A: Arch, O: ResidualNormLauncher> Session<A, O> {
             cases.push(ExactDeviceCase::new(
                 residual_route,
                 shape,
-                BenchmarkWorkload::warm_operator_decode(route.batch as u32),
+                workload,
                 OperationAccounting::new(
                     logical_bytes::<A>(route.batch, true),
                     route.batch as u64,
@@ -178,6 +220,29 @@ impl<A: Arch, O: ResidualNormLauncher> Session<A, O> {
 
         cases
     }
+}
+
+fn layout<A: Arch>(max_rows: usize) -> GpuResult<(ArenaLayout, Regions)> {
+    let mut layout = ArenaLayout::new();
+    let rows = max_rows * A::HIDDEN;
+    let input = layout.reserve(rows, 256)?;
+    let branch = layout.reserve(rows, 256)?;
+    let weight = layout.reserve(A::HIDDEN, 256)?;
+    let plain = layout.reserve(rows, 256)?;
+    let residual = layout.reserve(rows, 256)?;
+    let normalized = layout.reserve(rows, 256)?;
+
+    Ok((
+        layout,
+        Regions {
+            input,
+            branch,
+            weight,
+            plain,
+            residual,
+            normalized,
+        },
+    ))
 }
 
 fn capture_plain<O: ResidualNormLauncher>(
@@ -262,7 +327,7 @@ fn capture_residual<O: ResidualNormLauncher>(
     Ok(GraphPair { leaf, repeated })
 }
 
-/// Measures all exact batches with paired host/device and repeated-path timings.
+/// Measures every admitted decode and target-specific prefill route directly.
 pub fn benchmark_residual_norm(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
@@ -272,8 +337,12 @@ pub fn benchmark_residual_norm(
         "bench-residual-norm",
         "residual_norm/plain",
         "residual_norm/fused_residual",
-        "residual_norm/address_stable_arena",
-        "max_batch=8,hidden=5120",
+        "residual_norm/address_stable_workspace",
+        "max_rows=1024,hidden=5120",
+        "residual_norm/weights",
+        "residual_norm/alignment_padding",
+        &QWEN38_ROUTES,
+        QWEN38_MAX_ROWS,
     )
 }
 
@@ -288,8 +357,12 @@ pub fn benchmark_qwen35_residual_norm(
         "bench-qwen35-residual-norm",
         "qwen35_9b/residual_norm/plain",
         "qwen35_9b/residual_norm/fused_residual",
-        "qwen35_9b/residual_norm/address_stable_arena",
+        "qwen35_9b/residual_norm/address_stable_workspace",
         "max_batch=8,hidden=4096",
+        "qwen35_9b/residual_norm/weights",
+        "qwen35_9b/residual_norm/alignment_padding",
+        &DECODE_ROUTES,
+        MAX_BATCH,
     )
 }
 
@@ -300,19 +373,38 @@ fn benchmark_target<A: Arch, O: ResidualNormLauncher>(
     suite: &'static str,
     plain_route: &'static str,
     residual_route: &'static str,
-    arena_name: &'static str,
+    workspace_name: &'static str,
     arena_scaling: &'static str,
+    weight_name: &'static str,
+    padding_name: &'static str,
+    exact_routes: &[usize],
+    max_rows: usize,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
     let baseline_sha256 = generator_baseline_sha256()?;
     let warmup_launches = warmup_launches(options)?;
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
-    let session = Session::<A, O>::new(options.launches_per_sample, prepare)?;
+    let session =
+        Session::<A, O>::new(options.launches_per_sample, prepare, exact_routes, max_rows)?;
+    let weight_bytes = session.regions.weight_bytes();
+    let padding_bytes = session.arena.byte_len() - session.regions.payload_bytes();
     memory.register_owned(
-        arena_name,
+        weight_name,
+        BenchmarkMemoryKind::Weights,
+        weight_bytes,
+        "one zero-centered BF16 hidden-width row",
+    )?;
+    memory.register_owned(
+        workspace_name,
         BenchmarkMemoryKind::Workspace,
-        session._arena.byte_len(),
+        session.arena.byte_len() - weight_bytes - padding_bytes,
         arena_scaling,
+    )?;
+    memory.register_owned(
+        padding_name,
+        BenchmarkMemoryKind::Other,
+        padding_bytes,
+        "256-byte arena region alignment",
     )?;
     memory.capture("after_setup")?;
     session.warm(warmup_launches)?;
@@ -353,7 +445,7 @@ fn logical_bytes<A: Arch>(batch: usize, fused_residual: bool) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Qwen35_9B, Qwen38_27B, logical_bytes};
+    use super::{MAX_BATCH, QWEN38_MAX_ROWS, Qwen35_9B, Qwen38_27B, layout, logical_bytes};
 
     #[test]
     fn byte_accounting_covers_every_read_and_write_plane() {
@@ -361,5 +453,20 @@ mod tests {
         assert_eq!(logical_bytes::<Qwen38_27B>(8, true), 10 * 8 * 5_120);
         assert_eq!(logical_bytes::<Qwen35_9B>(8, false), 6 * 8 * 4_096);
         assert_eq!(logical_bytes::<Qwen35_9B>(8, true), 10 * 8 * 4_096);
+    }
+
+    #[test]
+    fn residual_norm_suite_benchmark_arena_accounting_exposes_every_byte() {
+        let (layout, regions) = layout::<Qwen38_27B>(QWEN38_MAX_ROWS).unwrap();
+        assert_eq!(layout.byte_len(), regions.payload_bytes());
+        assert_eq!(regions.weight_bytes(), 10_240);
+        assert_eq!(
+            layout.byte_len(),
+            5 * QWEN38_MAX_ROWS * Qwen38_27B::HIDDEN * size_of::<u16>() + regions.weight_bytes()
+        );
+
+        let (qwen35_layout, qwen35_regions) = layout::<Qwen35_9B>(MAX_BATCH).unwrap();
+        assert_eq!(qwen35_layout.byte_len(), qwen35_regions.payload_bytes());
+        assert_eq!(qwen35_regions.weight_bytes(), 8_192);
     }
 }

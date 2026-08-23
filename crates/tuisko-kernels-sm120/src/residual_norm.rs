@@ -217,36 +217,6 @@ mod kernels {
         rms_norm_body::<A, TOKENS>(input, weight, output, shared);
     }
 
-    /// Publishes a BF16 residual sum and normalizes that represented value.
-    #[kernel]
-    #[launch_bounds(512, 2)]
-    #[launch_contract(
-        domain = 1,
-        coordinates = u32,
-        block = (512, 1, 1),
-        dynamic_shared = 0,
-        min_compute_capability = (12, 0),
-    )]
-    pub fn residual_rms_norm<A: Arch, const TOKENS: usize>(
-        residual_input: *const u32,
-        branch: *const u32,
-        weight: *const u32,
-        residual_output: *mut u32,
-        normalized_output: *mut u32,
-    ) {
-        static mut WARP_SUM: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
-        let shared = core::ptr::addr_of_mut!(WARP_SUM).cast::<f32>();
-
-        residual_rms_norm_body::<A, TOKENS>(
-            residual_input,
-            branch,
-            weight,
-            residual_output,
-            normalized_output,
-            shared,
-        );
-    }
-
     /// Normalizes exact Qwen3.5 BF16 rows with zero-centered weights.
     #[kernel]
     #[launch_bounds(512, 2)]
@@ -289,6 +259,89 @@ mod kernels {
         let shared = core::ptr::addr_of_mut!(WARP_SUM).cast::<f32>();
 
         residual_rms_norm_body::<Qwen35_9B, TOKENS>(
+            residual_input,
+            branch,
+            weight,
+            residual_output,
+            normalized_output,
+            shared,
+        );
+    }
+
+    /// Publishes a BF16 residual sum and normalizes one exact decode batch.
+    #[kernel]
+    #[launch_bounds(512, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (512, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn residual_rms_norm<A: Arch, const TOKENS: usize>(
+        residual_input: *const u32,
+        branch: *const u32,
+        weight: *const u32,
+        residual_output: *mut u32,
+        normalized_output: *mut u32,
+    ) {
+        static mut WARP_SUM: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
+        let shared = core::ptr::addr_of_mut!(WARP_SUM).cast::<f32>();
+
+        residual_rms_norm_body::<A, TOKENS>(
+            residual_input,
+            branch,
+            weight,
+            residual_output,
+            normalized_output,
+            shared,
+        );
+    }
+
+    /// Normalizes one exact Qwen3.8 prefill width.
+    #[kernel]
+    #[launch_bounds(512, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (512, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn rms_norm_prefill<A: Arch, const TOKENS: usize>(
+        input: *const u32,
+        weight: *const u32,
+        output: *mut u32,
+    ) {
+        static mut WARP_SUM: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
+        let shared = core::ptr::addr_of_mut!(WARP_SUM).cast::<f32>();
+
+        // One 512-thread CTA retains five packed BF16 pairs per thread. Scaling
+        // the grid by exact rows changes only independent row ownership.
+        rms_norm_body::<A, TOKENS>(input, weight, output, shared);
+    }
+
+    /// Publishes and normalizes one exact Qwen3.8 prefill width.
+    #[kernel]
+    #[launch_bounds(512, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (512, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn residual_rms_norm_prefill<A: Arch, const TOKENS: usize>(
+        residual_input: *const u32,
+        branch: *const u32,
+        weight: *const u32,
+        residual_output: *mut u32,
+        normalized_output: *mut u32,
+    ) {
+        static mut WARP_SUM: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
+        let shared = core::ptr::addr_of_mut!(WARP_SUM).cast::<f32>();
+
+        residual_rms_norm_body::<A, TOKENS>(
             residual_input,
             branch,
             weight,
@@ -498,9 +551,78 @@ impl<const TOKENS: usize> PreparedQwen35BatchRoute<TOKENS> {
     }
 }
 
+// Prefill retains separate symbols so its resource authority cannot drift with decode.
+struct PreparedPrefillRoute<A: Arch, const TOKENS: usize> {
+    plain: PreparedLaunch<kernels::__rms_norm_prefill_CudaKernel<A, TOKENS>>,
+    residual: PreparedLaunch<kernels::__residual_rms_norm_prefill_CudaKernel<A, TOKENS>>,
+}
+
+impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let blocks = u32::try_from(TOKENS)
+            .map_err(|_| GpuError::invalid_launch("RMSNorm prefill exceeds CUDA grid width"))?;
+        let launch = LaunchConfig1D::new(blocks, THREADS, 0);
+        let plain = module
+            .prepare_rms_norm_prefill::<A, TOKENS>(launch)
+            .map_err(|source| GpuError::launch("preparing the RMSNorm prefill kernel", source))?;
+        let residual = module
+            .prepare_residual_rms_norm_prefill::<A, TOKENS>(launch)
+            .map_err(|source| {
+                GpuError::launch("preparing the residual RMSNorm prefill kernel", source)
+            })?;
+
+        Ok(Self { plain, residual })
+    }
+
+    unsafe fn launch_plain(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .rms_norm_prefill::<A, TOKENS>(
+                stream,
+                &self.plain,
+                input.cast::<u32>(),
+                weight.cast::<u32>(),
+                output.cast::<u32>(),
+            )
+            .map_err(|source| GpuError::launch("launching the RMSNorm prefill kernel", source))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_residual(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        residual_input: *const u16,
+        branch: *const u16,
+        weight: *const u16,
+        residual_output: *mut u16,
+        normalized_output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .residual_rms_norm_prefill::<A, TOKENS>(
+                stream,
+                &self.residual,
+                residual_input.cast::<u32>(),
+                branch.cast::<u32>(),
+                weight.cast::<u32>(),
+                residual_output.cast::<u32>(),
+                normalized_output.cast::<u32>(),
+            )
+            .map_err(|source| {
+                GpuError::launch("launching the residual RMSNorm prefill kernel", source)
+            })
+    }
+}
+
 /// PTX symbols retained for both residual-norm families at every exact batch.
-pub(crate) fn residual_norm_ptx_names() -> [&'static str; 16] {
-    [
+pub(crate) fn residual_norm_ptx_names() -> Vec<&'static str> {
+    vec![
         "rms_norm_b1",
         kernels::rms_norm_ptx_name::<Qwen38_27B, 2>(),
         kernels::rms_norm_ptx_name::<Qwen38_27B, 3>(),
@@ -517,6 +639,14 @@ pub(crate) fn residual_norm_ptx_names() -> [&'static str; 16] {
         kernels::residual_rms_norm_ptx_name::<Qwen38_27B, 6>(),
         kernels::residual_rms_norm_ptx_name::<Qwen38_27B, 7>(),
         kernels::residual_rms_norm_ptx_name::<Qwen38_27B, 8>(),
+        kernels::rms_norm_prefill_ptx_name::<Qwen38_27B, 32>(),
+        kernels::rms_norm_prefill_ptx_name::<Qwen38_27B, 64>(),
+        kernels::rms_norm_prefill_ptx_name::<Qwen38_27B, 128>(),
+        kernels::rms_norm_prefill_ptx_name::<Qwen38_27B, 1024>(),
+        kernels::residual_rms_norm_prefill_ptx_name::<Qwen38_27B, 32>(),
+        kernels::residual_rms_norm_prefill_ptx_name::<Qwen38_27B, 64>(),
+        kernels::residual_rms_norm_prefill_ptx_name::<Qwen38_27B, 128>(),
+        kernels::residual_rms_norm_prefill_ptx_name::<Qwen38_27B, 1024>(),
     ]
 }
 
@@ -542,7 +672,7 @@ pub(crate) fn qwen35_residual_norm_ptx_names() -> [&'static str; 16] {
     ]
 }
 
-/// Prepared plain and fused-residual RMSNorm routes for every exact batch `1..=8`.
+/// Prepared RMSNorm routes for decode `B=1..=8` and prefill `T=32,64,128,1024`.
 pub struct ResidualNormOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
     b1: PreparedBatchOneRoute,
@@ -553,6 +683,10 @@ pub struct ResidualNormOp<A: Sm120Arch = Qwen38_27B> {
     b6: PreparedBatchRoute<A, 6>,
     b7: PreparedBatchRoute<A, 7>,
     b8: PreparedBatchRoute<A, 8>,
+    t32: PreparedPrefillRoute<A, 32>,
+    t64: PreparedPrefillRoute<A, 64>,
+    t128: PreparedPrefillRoute<A, 128>,
+    t1024: PreparedPrefillRoute<A, 1024>,
 }
 
 impl<A: Sm120Arch> ResidualNormOp<A> {
@@ -575,11 +709,15 @@ impl<A: Sm120Arch> ResidualNormOp<A> {
             b6: PreparedBatchRoute::prepare(&module)?,
             b7: PreparedBatchRoute::prepare(&module)?,
             b8: PreparedBatchRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
+            t1024: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
 
-    /// Launches the plain RMSNorm route for exactly `batch` complete rows.
+    /// Launches the plain RMSNorm route for one exact decode or prefill row count.
     ///
     /// # Safety
     ///
@@ -613,8 +751,12 @@ impl<A: Sm120Arch> ResidualNormOp<A> {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
+            1024 => launch!(t1024),
             _ => Err(GpuError::invalid_launch(format!(
-                "RMSNorm batch {batch} is outside the exact range 1..={MAX_BATCH}"
+                "RMSNorm row count {batch} is outside exact decode 1..={MAX_BATCH} and prefill T=32,64,128,1024"
             ))),
         }
     }
@@ -664,8 +806,12 @@ impl<A: Sm120Arch> ResidualNormOp<A> {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
+            1024 => launch!(t1024),
             _ => Err(GpuError::invalid_launch(format!(
-                "residual RMSNorm batch {batch} is outside the exact range 1..={MAX_BATCH}"
+                "residual RMSNorm row count {batch} is outside exact decode 1..={MAX_BATCH} and prefill T=32,64,128,1024"
             ))),
         }
     }
@@ -866,11 +1012,11 @@ mod tests {
     }
 
     #[test]
-    fn ptx_inventory_has_two_distinct_entries_per_batch() {
+    fn ptx_inventory_has_decode_and_prefill_entries() {
         let names = residual_norm_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 2 * MAX_BATCH);
+        assert_eq!(names.len(), 2 * MAX_BATCH + 8);
         assert_eq!(unique.len(), names.len());
     }
 
