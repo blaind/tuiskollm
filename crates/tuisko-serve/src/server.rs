@@ -12,11 +12,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
+use std::io::{IsTerminal, Write as IoWrite};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedSender, channel, error::TryRecvError, error::TrySendError,
     unbounded_channel,
@@ -69,6 +71,14 @@ enum EnqueueError {
 }
 
 struct Ready {
+    device_name: String,
+    checkpoint_admission: Duration,
+    weight_load: Duration,
+    source_prefault: Duration,
+    graph_capture: Duration,
+    tensor_count: usize,
+    upload_bytes: usize,
+    prefault_bytes: usize,
     arena_bytes: usize,
     host_stager_bytes: usize,
     context_capacity: usize,
@@ -76,20 +86,23 @@ struct Ready {
 
 /// Loads the exact resident model, then serves health, model, blocking, and SSE routes.
 pub fn run(config: ServerConfig) -> Result<(), ServerError> {
+    let startup_start = Instant::now();
     let (state, ready) = start_worker(&config.snapshot)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(config.address).await?;
-        println!(
-            "TuiskoLLM serving {SERVED_MODEL} at http://{} ({} slots, context {}, {:.2} MiB device arena, {:.2} MiB pinned staging)",
+        let stdout = std::io::stdout();
+        let output = render_startup(
+            &ready,
+            startup_start.elapsed(),
             config.address,
-            MAX_BATCH,
-            ready.context_capacity,
-            ready.arena_bytes as f64 / (1 << 20) as f64,
-            ready.host_stager_bytes as f64 / (1 << 20) as f64,
+            stdout.is_terminal() && std::env::var_os("NO_COLOR").is_none(),
         );
+        let mut stdout = stdout.lock();
+        stdout.write_all(output.as_bytes())?;
+        stdout.flush()?;
         axum::serve(listener, router(state)).await?;
         Ok(())
     })
@@ -132,20 +145,37 @@ fn engine_worker(
     }
     let _readiness_guard = ReadinessGuard(Arc::clone(&worker_ready));
     let generator = (|| {
+        let checkpoint_start = Instant::now();
         let snapshot = CheckpointSnapshot::<Qwen38_27B>::open(&snapshot)
             .map(Arc::new)
             .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
-        ResidentBatchGenerator::from_snapshot_device_zero(snapshot)
-            .map_err(|error| format!("loading the resident text program: {error}"))
+        let checkpoint_admission = checkpoint_start.elapsed();
+        let tensor_count = snapshot.tensor_count();
+        let generator = ResidentBatchGenerator::from_snapshot_device_zero(snapshot)
+            .map_err(|error| format!("loading the resident text program: {error}"))?;
+        let device_name = generator
+            .context()
+            .device_name()
+            .map_err(|error| format!("reading the CUDA device name: {error}"))?;
+        Ok::<_, String>((generator, checkpoint_admission, tensor_count, device_name))
     })();
-    let mut generator = match generator {
-        Ok(generator) => generator,
+    let (mut generator, checkpoint_admission, tensor_count, device_name) = match generator {
+        Ok(result) => result,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
     };
+    let load_stats = generator.load_stats();
     let startup = Ready {
+        device_name,
+        checkpoint_admission,
+        weight_load: Duration::from_nanos(load_stats.weight_load_ns()),
+        source_prefault: Duration::from_nanos(load_stats.source_prefault_ns()),
+        graph_capture: Duration::from_nanos(load_stats.graph_capture_ns()),
+        tensor_count,
+        upload_bytes: load_stats.upload_bytes(),
+        prefault_bytes: load_stats.prefault_bytes(),
         arena_bytes: generator.arena_bytes(),
         host_stager_bytes: generator.host_stager_bytes(),
         context_capacity: generator.context_capacity(),
@@ -206,6 +236,70 @@ fn engine_worker(
             }
         }
     }
+}
+
+fn render_startup(ready: &Ready, total: Duration, address: SocketAddr, color: bool) -> String {
+    let mut output = String::new();
+    let (header, ok, ready_label, reset) = if color {
+        ("\x1b[1;36m", "\x1b[32m", "\x1b[1;32m", "\x1b[0m")
+    } else {
+        ("", "", "", "")
+    };
+    writeln!(
+        output,
+        "{header}TuiskoLLM{reset} · {SERVED_MODEL} · {}",
+        ready.device_name
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        output,
+        "{ok}OK{reset} checkpoint  {:>8.1} ms · {} tensors",
+        milliseconds(ready.checkpoint_admission),
+        ready.tensor_count,
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        output,
+        "{ok}OK{reset} source pages {:>7.1} ms · {:.2} GiB",
+        milliseconds(ready.source_prefault),
+        gibibytes(ready.prefault_bytes),
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        output,
+        "{ok}OK{reset} weights      {:>7.1} ms · {:.2} GiB",
+        milliseconds(ready.weight_load),
+        gibibytes(ready.upload_bytes),
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        output,
+        "{ok}OK{reset} graphs       {:>7.1} ms",
+        milliseconds(ready.graph_capture),
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        output,
+        "{ready_label}READY{reset}          {:>7.1} ms · http://{address} · {MAX_BATCH} slots · context {} · {:.2} GiB device · {:.2} MiB pinned",
+        milliseconds(total),
+        ready.context_capacity,
+        gibibytes(ready.arena_bytes),
+        mebibytes(ready.host_stager_bytes),
+    )
+    .expect("writing to a String cannot fail");
+    output
+}
+
+fn milliseconds(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn gibibytes(bytes: usize) -> f64 {
+    bytes as f64 / (1_u64 << 30) as f64
+}
+
+fn mebibytes(bytes: usize) -> f64 {
+    bytes as f64 / (1_u64 << 20) as f64
 }
 
 fn admit_job(
@@ -378,15 +472,20 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, EnqueueError, Job, chat_completions, enqueue_job, health, models};
+    use super::{
+        AppState, EnqueueError, Job, Ready, chat_completions, enqueue_job, health, models,
+        render_startup,
+    };
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
     use axum::Json;
     use axum::body::to_bytes;
     use axum::extract::State;
     use axum::http::StatusCode;
     use serde_json::Value;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::time::Duration;
     use tokio::runtime::Builder;
     use tokio::sync::mpsc::{channel, unbounded_channel};
     use tuisko_engine::ChatGenerationRequest;
@@ -413,6 +512,45 @@ mod tests {
             request_ids: Arc::new(AtomicU64::new(1)),
             worker_ready: Arc::new(AtomicBool::new(ready)),
         }
+    }
+
+    #[test]
+    fn startup_output_is_exact_plain_text_or_terminal_color() {
+        let ready = Ready {
+            device_name: "NVIDIA GeForce RTX 5090".into(),
+            checkpoint_admission: Duration::from_micros(2_500),
+            weight_load: Duration::from_micros(1_604_600),
+            source_prefault: Duration::from_micros(53_000),
+            graph_capture: Duration::from_micros(83_100),
+            tensor_count: 1_968,
+            upload_bytes: 19 * (1 << 30),
+            prefault_bytes: 18 * (1 << 30),
+            arena_bytes: 25 * (1 << 30),
+            host_stager_bytes: 16 * (1 << 20),
+            context_capacity: 220_000,
+        };
+        let address = "127.0.0.1:8000".parse::<SocketAddr>().unwrap();
+        let plain = render_startup(&ready, Duration::from_micros(1_925_200), address, false);
+        let lines = plain.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 6);
+        assert_eq!(
+            lines[0],
+            "TuiskoLLM · unsloth/Qwen3.8-27B-NVFP4 · NVIDIA GeForce RTX 5090"
+        );
+        assert!(lines[1].contains("2.5 ms · 1968 tensors"));
+        assert!(lines[2].contains("53.0 ms · 18.00 GiB"));
+        assert!(lines[3].contains("1604.6 ms · 19.00 GiB"));
+        assert!(lines[4].contains("83.1 ms"));
+        assert!(lines[5].contains("1925.2 ms · http://127.0.0.1:8000"));
+        assert!(
+            lines[5].contains("8 slots · context 220000 · 25.00 GiB device · 16.00 MiB pinned")
+        );
+        assert!(!plain.contains('\x1b'));
+
+        let colored = render_startup(&ready, Duration::from_micros(1_925_200), address, true);
+        assert!(colored.starts_with("\x1b[1;36mTuiskoLLM\x1b[0m"));
+        assert!(colored.contains("\x1b[1;32mREADY\x1b[0m"));
     }
 
     #[test]
