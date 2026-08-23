@@ -3,6 +3,7 @@
 mod hf;
 
 use std::ffi::OsString;
+use std::io::{IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -49,12 +50,37 @@ fn main() -> ExitCode {
 }
 
 fn run_serve(args: ServeArgs) -> Result<(), String> {
-    let snapshot = hf::resolve_snapshot(args.snapshot)?;
+    let resolution = hf::resolve_snapshot(args.snapshot)?;
+    if let Some(provisioning) = resolution.provisioning {
+        let stdout = std::io::stdout();
+        let color = stdout.is_terminal() && std::env::var_os("NO_COLOR").is_none();
+        let mut stdout = stdout.lock();
+        stdout
+            .write_all(render_provisioning(&provisioning, color).as_bytes())
+            .map_err(|error| format!("writing startup output: {error}"))?;
+        stdout
+            .flush()
+            .map_err(|error| format!("flushing startup output: {error}"))?;
+    }
     tuisko_serve::run(ServerConfig {
-        snapshot,
+        snapshot: resolution.path,
         address: args.address,
     })
     .map_err(|error| error.to_string())
+}
+
+fn render_provisioning(provisioning: &hf::Provisioning, color: bool) -> String {
+    let (ok, reset) = if color {
+        ("\x1b[32m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    format!(
+        "{ok}OK{reset} snapshot     {:>7.1} ms · {} files · {:.2} GiB\n",
+        provisioning.elapsed.as_secs_f64() * 1_000.0,
+        provisioning.files,
+        provisioning.bytes as f64 / (1_u64 << 30) as f64,
+    )
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
@@ -101,10 +127,11 @@ fn require_end(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, DEFAULT_ADDRESS, ServeArgs, parse_args};
+    use super::{Command, DEFAULT_ADDRESS, ServeArgs, parse_args, render_provisioning};
     use std::ffi::OsString;
     use std::net::SocketAddr;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn parse(args: &[&str]) -> Result<Command, String> {
         parse_args(args.iter().map(OsString::from))
@@ -159,5 +186,19 @@ mod tests {
         assert_eq!(parse(&["--help"]).unwrap(), Command::Help);
         assert_eq!(parse(&["-V"]).unwrap(), Command::Version);
         assert!(parse(&["--help", "extra"]).is_err());
+    }
+
+    #[test]
+    fn provisioning_output_derives_every_reported_value() {
+        let provisioning = super::hf::Provisioning {
+            elapsed: Duration::from_micros(338_500),
+            files: 7,
+            bytes: 23_437_778_955,
+        };
+        assert_eq!(
+            render_provisioning(&provisioning, false),
+            "OK snapshot       338.5 ms · 7 files · 21.83 GiB\n"
+        );
+        assert!(render_provisioning(&provisioning, true).starts_with("\x1b[32mOK\x1b[0m"));
     }
 }
