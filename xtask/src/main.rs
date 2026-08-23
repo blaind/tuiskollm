@@ -417,6 +417,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("qualify-qwen35-nvfp4-qkv") if remaining.is_empty() => qualify_qwen35_nvfp4_qkv(root),
         Some("qualify-qwen35-nvfp4-mlp") => qualify_qwen35_nvfp4_mlp(root, &remaining),
+        Some("qualify-qwen35-attention-qk-prepare") if remaining.is_empty() => {
+            qualify_qwen35_attention_qk_prepare(root)
+        }
         Some("qualify-fp8-qkv") if remaining.is_empty() => qualify_fp8_qkv(root),
         Some("qualify-fp8-gdn-input") if remaining.is_empty() => qualify_fp8_gdn_input(root),
         Some("qualify-fp8-lm-head") if remaining.is_empty() => qualify_fp8_lm_head(root),
@@ -513,6 +516,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "build-server"
                     | "qualify-residual-norm"
                     | "qualify-qwen35-residual-norm"
+                    | "qualify-qwen35-attention-qk-prepare"
                     | "qualify-fp8-qkv"
                     | "qualify-fp8-gdn-input"
                     | "qualify-fp8-lm-head"
@@ -1235,6 +1239,30 @@ fn qualify_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     gate_attention_qk_prepare(root)
+}
+
+fn qualify_qwen35_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "attention_qk_prepare::tests::qwen35_",
+            "--include-ignored",
+            "--nocapture",
+        ],
+    )
 }
 
 fn qualify_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {

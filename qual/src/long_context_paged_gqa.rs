@@ -511,8 +511,8 @@ fn verify_scalar_plane(
     untouched_count: &mut usize,
     maximum_error: &mut f32,
 ) -> Result<(), LongContextPagedGqaQualificationError> {
-    for token in 0..MAX_BATCH {
-        let partitions = (LENGTHS[token] as usize).div_ceil(LONG_CONTEXT_GQA_PARTITION_SIZE);
+    for (token, &length) in LENGTHS.iter().enumerate() {
+        let partitions = (length as usize).div_ceil(LONG_CONTEXT_GQA_PARTITION_SIZE);
         for query_head in 0..Qwen38_27B::NUM_ATTENTION_HEADS {
             let base = (token * Qwen38_27B::NUM_ATTENTION_HEADS + query_head)
                 * LONG_CONTEXT_GQA_MAX_PARTITIONS;
@@ -547,8 +547,8 @@ fn verify_numerator_plane(
     oracle: &Oracle,
     report: &mut LongContextPagedGqaQualification,
 ) -> Result<(), LongContextPagedGqaQualificationError> {
-    for token in 0..MAX_BATCH {
-        let partitions = (LENGTHS[token] as usize).div_ceil(LONG_CONTEXT_GQA_PARTITION_SIZE);
+    for (token, &length) in LENGTHS.iter().enumerate() {
+        let partitions = (length as usize).div_ceil(LONG_CONTEXT_GQA_PARTITION_SIZE);
         for query_head in 0..Qwen38_27B::NUM_ATTENTION_HEADS {
             let partial_base = (token * Qwen38_27B::NUM_ATTENTION_HEADS + query_head)
                 * LONG_CONTEXT_GQA_MAX_PARTITIONS;
