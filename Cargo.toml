@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+tuisko-model.workspace = true
 tuisko-serve.workspace = true
 
 [workspace]

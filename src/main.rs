@@ -1,5 +1,7 @@
 //! Rust-owned inference server.
 
+mod hf;
+
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -7,18 +9,24 @@ use std::process::ExitCode;
 use tuisko_serve::ServerConfig;
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8000";
-const USAGE: &str = "TuiskoLLM exact-target inference server\n\nUsage:\n  tuiskollm serve SNAPSHOT [ADDRESS]\n  tuiskollm --help\n  tuiskollm --version\n\nADDRESS defaults to 127.0.0.1:8000.";
+const USAGE: &str = "TuiskoLLM exact-target inference server\n\nUsage:\n  tuiskollm serve [SNAPSHOT] [ADDRESS]\n  tuiskollm --help\n  tuiskollm --version\n\nWithout SNAPSHOT, the pinned Hugging Face cache entry is used. ADDRESS defaults to 127.0.0.1:8000.";
+
+#[derive(Debug, Eq, PartialEq)]
+struct ServeArgs {
+    snapshot: Option<PathBuf>,
+    address: SocketAddr,
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
-    Serve(ServerConfig),
+    Serve(ServeArgs),
     Help,
     Version,
 }
 
 fn main() -> ExitCode {
     match parse_args(std::env::args_os().skip(1)) {
-        Ok(Command::Serve(config)) => match tuisko_serve::run(config) {
+        Ok(Command::Serve(args)) => match run_serve(args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("tuiskollm: {error}");
@@ -40,6 +48,15 @@ fn main() -> ExitCode {
     }
 }
 
+fn run_serve(args: ServeArgs) -> Result<(), String> {
+    let snapshot = hf::resolve_snapshot(args.snapshot)?;
+    tuisko_serve::run(ServerConfig {
+        snapshot,
+        address: args.address,
+    })
+    .map_err(|error| error.to_string())
+}
+
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut args = args.into_iter();
     let Some(command) = args.next() else {
@@ -57,10 +74,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
         return Err(format!("unknown command `{}`", command.to_string_lossy()));
     }
 
-    let snapshot = args
-        .next()
-        .map(PathBuf::from)
-        .ok_or_else(|| "serve requires SNAPSHOT".to_owned())?;
+    let snapshot = args.next().map(PathBuf::from);
     let address = match args.next() {
         Some(address) => address
             .to_str()
@@ -72,7 +86,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
             .expect("the checked default address is valid"),
     };
     require_end(args)?;
-    Ok(Command::Serve(ServerConfig { snapshot, address }))
+    Ok(Command::Serve(ServeArgs { snapshot, address }))
 }
 
 fn require_end(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
@@ -87,7 +101,7 @@ fn require_end(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, DEFAULT_ADDRESS, parse_args};
+    use super::{Command, DEFAULT_ADDRESS, ServeArgs, parse_args};
     use std::ffi::OsString;
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -101,8 +115,8 @@ mod tests {
         let command = parse(&["serve", "/models/pinned"]).unwrap();
         assert_eq!(
             command,
-            Command::Serve(tuisko_serve::ServerConfig {
-                snapshot: PathBuf::from("/models/pinned"),
+            Command::Serve(ServeArgs {
+                snapshot: Some(PathBuf::from("/models/pinned")),
                 address: DEFAULT_ADDRESS.parse::<SocketAddr>().unwrap(),
             })
         );
@@ -121,7 +135,13 @@ mod tests {
     fn malformed_or_ambiguous_commands_are_refused() {
         assert!(parse(&[]).unwrap_err().contains("missing command"));
         assert!(parse(&["server"]).unwrap_err().contains("unknown command"));
-        assert!(parse(&["serve"]).unwrap_err().contains("requires SNAPSHOT"));
+        assert_eq!(
+            parse(&["serve"]).unwrap(),
+            Command::Serve(ServeArgs {
+                snapshot: None,
+                address: DEFAULT_ADDRESS.parse().unwrap(),
+            })
+        );
         assert!(
             parse(&["serve", "snapshot", "localhost:8000"])
                 .unwrap_err()
