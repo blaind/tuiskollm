@@ -6,7 +6,9 @@ use crate::{DeviceBenchmarkError, device_benchmark};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
-use tuisko_engine::{EngineError, MAX_BATCH, ResidentModelObservables, ResidentModelProgram};
+use tuisko_engine::{
+    EngineError, MAX_BATCH, PagedKvSlotState, ResidentModelObservables, ResidentModelProgram,
+};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, device_memory_info};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{
@@ -78,10 +80,12 @@ pub fn qualify_resident_model(
     }
     let stream = context.new_stream().map_err(GpuError::from)?;
     let mut program = ResidentModelProgram::from_snapshot(&context, snapshot.clone())?;
+    initialize_short_routes(&mut program, &stream)?;
     verify_owner(&program)?;
     let stable_base = program.base_address();
     let stable_kv_base = program.kv_base_address();
     let stable_addresses = program.qualification_addresses();
+    let stable_route_addresses = program.qualification_kv_route_addresses();
     verify_scalars(&program, snapshot.as_ref())?;
     let mut report = ResidentModelQualification {
         source_scalars: 16 * 2 + 56 * 4,
@@ -116,6 +120,7 @@ pub fn qualify_resident_model(
         if program.base_address() != stable_base
             || program.kv_base_address() != stable_kv_base
             || program.qualification_addresses() != stable_addresses
+            || program.qualification_kv_route_addresses() != stable_route_addresses
         {
             return Err(ResidentModelQualificationError::Mismatch(format!(
                 "owner addresses changed while qualifying B={batch}"
@@ -124,10 +129,128 @@ pub fn qualify_resident_model(
     }
     verify_slot_reset(&mut program, &stream, &mut report)?;
     report.slot_control_values += verify_block_tables(&program, &stream)?;
+    report.slot_control_values += verify_dynamic_page_routes(&mut program, &stream)?;
 
     verify_no_device_allocation(&program, &stream)?;
+    if program.qualification_kv_route_addresses() != stable_route_addresses {
+        return Err(ResidentModelQualificationError::Mismatch(
+            "page-router host addresses changed after route mutation".to_string(),
+        ));
+    }
     device_benchmark::require_current_process_exclusive()?;
     Ok(report)
+}
+
+fn verify_dynamic_page_routes(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+) -> Result<usize, ResidentModelQualificationError> {
+    if program.recycle_kv_slot(stream, 0)? != TABLE_STRIDE
+        || program.qualification_kv_slot_state(0)? != PagedKvSlotState::Vacant
+    {
+        return Err(ResidentModelQualificationError::Mismatch(
+            "slot 0 recycling did not release its exact initial page inventory".to_string(),
+        ));
+    }
+
+    let extension = program.reserve_kv_slot_tokens(stream, 1, 2 * 192)?;
+    if (
+        extension.slot(),
+        extension.first_entry(),
+        extension.entry_count(),
+    ) != (1, TABLE_STRIDE, TABLE_STRIDE)
+    {
+        return Err(ResidentModelQualificationError::Mismatch(
+            "slot 1 did not reuse the three released physical pages as its logical tail"
+                .to_string(),
+        ));
+    }
+    for (position, expected) in [(192usize, 0u32), (256, 1), (320, 2)] {
+        if program.qualification_kv_physical_page(1, position)? != expected {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "slot 1 position {position} did not route to reassigned page {expected}"
+            )));
+        }
+    }
+    let (reassigned_key, reassigned_value) = program.qualification_cache_page(stream, 0)?;
+    if reassigned_key.iter().any(|&value| value != 0)
+        || reassigned_value.iter().any(|&value| value != 0)
+    {
+        return Err(ResidentModelQualificationError::Mismatch(
+            "a reassigned physical page retained values from its prior slot owner".to_string(),
+        ));
+    }
+
+    program.activate_kv_slot(0)?;
+    let replacement = program.reserve_kv_slot_tokens(stream, 0, 192)?;
+    if (
+        replacement.slot(),
+        replacement.first_entry(),
+        replacement.entry_count(),
+    ) != (0, 0, TABLE_STRIDE)
+    {
+        return Err(ResidentModelQualificationError::Mismatch(
+            "slot 0 replacement route has the wrong logical inventory".to_string(),
+        ));
+    }
+    for (position, expected) in [(0usize, 24u32), (64, 25), (128, 26)] {
+        if program.qualification_kv_physical_page(0, position)? != expected {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "slot 0 position {position} did not route to replacement page {expected}"
+            )));
+        }
+    }
+
+    let tables = program.qualification_block_tables(stream)?;
+    let row0 = &tables[..3_438];
+    let row1 = &tables[3_438..2 * 3_438];
+    if row0[..TABLE_STRIDE] != [24, 25, 26]
+        || row0[TABLE_STRIDE..].iter().any(|&page| page != u32::MAX)
+        || row1[..2 * TABLE_STRIDE] != [3, 4, 5, 0, 1, 2]
+        || row1[2 * TABLE_STRIDE..]
+            .iter()
+            .any(|&page| page != u32::MAX)
+    {
+        return Err(ResidentModelQualificationError::Mismatch(
+            "device block-table rows disagree with the independent remapping oracle".to_string(),
+        ));
+    }
+
+    prepare_run(program, stream, 1, &[0])?;
+    program.launch_eager(stream, 1)?;
+    let eager = program.qualification_cache_page(stream, 24)?;
+    if eager.0.iter().all(|&value| value == 0) || eager.1.iter().all(|&value| value == 0) {
+        return Err(ResidentModelQualificationError::Mismatch(
+            "eager replay did not append K/V values through the remapped slot row".to_string(),
+        ));
+    }
+    prepare_run(program, stream, 1, &[0])?;
+    program.replay(stream, 1)?;
+    let replay = program.qualification_cache_page(stream, 24)?;
+    if replay != eager {
+        return Err(ResidentModelQualificationError::Mismatch(
+            "graph replay differs from eager cache append through a remapped slot row".to_string(),
+        ));
+    }
+
+    Ok(tables.len()
+        + reassigned_key.len()
+        + reassigned_value.len()
+        + eager.0.len()
+        + eager.1.len()
+        + replay.0.len()
+        + replay.1.len())
+}
+
+fn initialize_short_routes(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+) -> Result<(), ResidentModelQualificationError> {
+    for slot in 0..MAX_BATCH {
+        program.activate_kv_slot(slot)?;
+        program.reserve_kv_slot_tokens(stream, slot, 192)?;
+    }
+    Ok(())
 }
 
 fn verify_block_tables(
@@ -172,6 +295,7 @@ fn verify_owner(program: &ResidentModelProgram) -> Result<(), ResidentModelQuali
         || program.kv_arena_bytes() != 7_210_118_656
         || program.arena_bytes() != 27_551_280_384
         || program.host_stager_bytes() != 81_920
+        || program.kv_route_host_bytes() != 113_454
         || program.batch_capacity() != 8
         || program.context_capacity() != 192
         || program.persistent_slot_bytes() != 160_235_520
@@ -187,6 +311,12 @@ fn verify_owner(program: &ResidentModelProgram) -> Result<(), ResidentModelQuali
             "owner exposes {} addresses, expected 1,126 unique addresses",
             addresses.len()
         )));
+    }
+    let host_addresses = program.qualification_kv_route_addresses();
+    if host_addresses[0] == 0 || host_addresses[1] == 0 || host_addresses[0] == host_addresses[1] {
+        return Err(ResidentModelQualificationError::Mismatch(
+            "page-router host addresses are null or aliased".to_string(),
+        ));
     }
     Ok(())
 }

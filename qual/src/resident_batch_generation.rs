@@ -55,6 +55,8 @@ pub struct ResidentBatchGenerationQualification {
     pub arena_bytes: usize,
     /// Exact page-locked embedding and double-logit-bank bytes.
     pub host_stager_bytes: usize,
+    /// Exact allocation-free host page-routing bytes.
+    pub kv_route_host_bytes: usize,
 }
 
 /// Qualifies mixed-length compact scheduling against independent sequential execution.
@@ -88,7 +90,7 @@ pub fn qualify_resident_batch_generation(
         expected.push(run_alone(&mut generator, request)?);
     }
     verify_exact_batch_inventory(&mut generator, &requests[0], &expected[0])?;
-    generator.qualification_clear_retained();
+    generator.qualification_clear_retained()?;
     let before = device_memory_info(generator.context())?;
 
     let a = generator.admit(&requests[0])?.request_id;
@@ -142,7 +144,7 @@ pub fn qualify_resident_batch_generation(
             "completed compact schedule retained an active request".to_string(),
         ));
     }
-    generator.qualification_clear_retained();
+    generator.qualification_clear_retained()?;
     verify_prefix_reuse_and_cancellation(
         &mut generator,
         &oracle_frontend,
@@ -177,6 +179,7 @@ pub fn qualify_resident_batch_generation(
         safe_cold_fallbacks: 1,
         arena_bytes: generator.arena_bytes(),
         host_stager_bytes: generator.host_stager_bytes(),
+        kv_route_host_bytes: generator.kv_route_host_bytes(),
     })
 }
 
@@ -440,7 +443,10 @@ fn require_round(
 fn verify_owner(
     generator: &ResidentBatchGenerator,
 ) -> Result<(), ResidentBatchGenerationQualificationError> {
-    if generator.arena_bytes() != 27_551_280_384 || generator.host_stager_bytes() != 8_028_160 {
+    if generator.arena_bytes() != 27_551_280_384
+        || generator.host_stager_bytes() != 8_028_160
+        || generator.kv_route_host_bytes() != 113_454
+    {
         return Err(ResidentBatchGenerationQualificationError::Mismatch(
             "compact scheduler owner byte accounting changed".to_string(),
         ));

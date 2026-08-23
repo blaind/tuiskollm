@@ -4,8 +4,13 @@ use super::{
     AttentionWeights, EndpointWeights, GdnPersistent, GdnWeights, MixerWeights, MlpWeights,
     ResidentModelLayout,
 };
+#[cfg(feature = "qualification")]
+use crate::PagedKvSlotState;
 use crate::long_context_kv_layout::LayerKvRegions;
-use crate::{EngineError, EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH};
+use crate::{
+    EngineError, EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, PagedKvSlotPool,
+    PagedKvTableUpdate,
+};
 #[cfg(feature = "qualification")]
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -35,6 +40,7 @@ pub struct ResidentModelProgram {
     graphs: [CudaGraph; MAX_BATCH],
     arena: DeviceArena,
     kv_arena: DeviceArena,
+    kv_slots: PagedKvSlotPool,
     _norm: ResidualNormOp<Qwen38_27B>,
     _gdn_input: GdnInputProjectionOp<Qwen38_27B>,
     _gdn_prepare: GdnPrepareOp<Qwen38_27B>,
@@ -83,6 +89,7 @@ impl ResidentModelProgram {
         let stream = context.new_stream().map_err(GpuError::from)?;
         let arena = DeviceArena::zeroed(&stream, &layout.builder)?;
         let kv_arena = DeviceArena::zeroed(&stream, layout.kv_layout.builder())?;
+        let kv_slots = PagedKvSlotPool::new(LONG_CONTEXT_PHYSICAL_PAGES)?;
         let norm = ResidualNormOp::new(context)?;
         let gdn_input = GdnInputProjectionOp::new(context)?;
         let gdn_prepare = GdnPrepareOp::new(context)?;
@@ -134,6 +141,7 @@ impl ResidentModelProgram {
             graphs,
             arena,
             kv_arena,
+            kv_slots,
             _norm: norm,
             _gdn_input: gdn_input,
             _gdn_prepare: gdn_prepare,
@@ -262,37 +270,75 @@ impl ResidentModelProgram {
         Ok(())
     }
 
-    /// Clears all recurrent owners and the 24 pages assigned to the current decode route.
+    /// Activates one vacant or retained stable page-table row.
+    pub fn activate_kv_slot(&mut self, slot: usize) -> EngineResult<()> {
+        self.kv_slots.activate(slot)
+    }
+
+    /// Extends one active row and synchronizes only its stable device table row.
+    pub fn reserve_kv_slot_tokens(
+        &mut self,
+        stream: &CudaStream,
+        slot: usize,
+        token_count: usize,
+    ) -> EngineResult<PagedKvTableUpdate> {
+        let update = self.kv_slots.reserve_tokens(slot, token_count)?;
+        for logical_page in update.first_entry()..update.first_entry() + update.entry_count() {
+            let position = product(
+                "resident newly assigned cache position",
+                logical_page,
+                ATTENTION_PAGE_SIZE,
+            )?;
+            let physical_page = usize::try_from(
+                self.kv_slots.route(slot, position)?.physical_page(),
+            )
+            .map_err(|_| EngineError::layout("resident physical page exceeds host width"))?;
+            clear_physical_cache_page(&self.kv_arena, stream, &self.layout, physical_page)?;
+        }
+        if !update.is_empty() {
+            self.sync_kv_table_row(stream, slot)?;
+        }
+        Ok(update)
+    }
+
+    /// Releases trailing pages while retaining an exact processed-token boundary.
+    pub fn truncate_kv_slot_tokens(
+        &mut self,
+        stream: &CudaStream,
+        slot: usize,
+        token_count: usize,
+    ) -> EngineResult<usize> {
+        let released = self.kv_slots.truncate_tokens(slot, token_count)?;
+        if released != 0 {
+            self.sync_kv_table_row(stream, slot)?;
+        }
+        Ok(released)
+    }
+
+    /// Marks one active page-table row as an exact reusable prefix.
+    pub fn retain_kv_slot(&mut self, slot: usize) -> EngineResult<()> {
+        self.kv_slots.retain(slot)
+    }
+
+    /// Releases every page owned by one active or retained row.
+    pub fn recycle_kv_slot(&mut self, stream: &CudaStream, slot: usize) -> EngineResult<usize> {
+        let released = self.kv_slots.recycle(slot)?;
+        if released != 0 {
+            self.sync_kv_table_row(stream, slot)?;
+        }
+        Ok(released)
+    }
+
+    /// Clears all recurrent owners and every currently assigned physical cache page.
     pub fn reset_state(&self, stream: &CudaStream) -> EngineResult<()> {
-        let mut attention_layer = 0;
         for layer in &self.layout.layers {
-            match layer.persistent {
-                super::PersistentState::Gdn(state) => {
-                    self.arena.fill(stream, state.history, 0)?;
-                    self.arena.fill(stream, state.state, 0)?;
-                }
-                super::PersistentState::Attention => {
-                    let cache = self
-                        .layout
-                        .kv_layout
-                        .layers()
-                        .get(attention_layer)
-                        .copied()
-                        .ok_or_else(|| {
-                            EngineError::layout(
-                                "resident reset visited more attention layers than the shared KV inventory",
-                            )
-                        })?;
-                    fill_cache_prefix(&self.kv_arena, stream, cache.key.data)?;
-                    fill_cache_prefix(&self.kv_arena, stream, cache.value.data)?;
-                    attention_layer += 1;
-                }
+            if let super::PersistentState::Gdn(state) = layer.persistent {
+                self.arena.fill(stream, state.history, 0)?;
+                self.arena.fill(stream, state.state, 0)?;
             }
         }
-        if attention_layer != self.layout.kv_layout.layers().len() {
-            return Err(EngineError::layout(
-                "resident reset did not visit every shared KV layer",
-            ));
+        for slot in 0..MAX_BATCH {
+            self.clear_slot_cache(stream, slot)?;
         }
 
         Ok(())
@@ -308,22 +354,7 @@ impl ResidentModelProgram {
                     fill_slot(&self.arena, stream, state.history, slot)?;
                     fill_slot(&self.arena, stream, state.state, slot)?;
                 }
-                super::PersistentState::Attention => {
-                    let cache = self
-                        .layout
-                        .kv_layout
-                        .layers()
-                        .get(attention_layer)
-                        .copied()
-                        .ok_or_else(|| {
-                            EngineError::layout(
-                                "resident slot reset visited more attention layers than the shared KV inventory",
-                            )
-                        })?;
-                    fill_cache_slot(&self.kv_arena, stream, cache.key.data, slot)?;
-                    fill_cache_slot(&self.kv_arena, stream, cache.value.data, slot)?;
-                    attention_layer += 1;
-                }
+                super::PersistentState::Attention => attention_layer += 1,
             }
         }
         if attention_layer != self.layout.kv_layout.layers().len() {
@@ -331,7 +362,40 @@ impl ResidentModelProgram {
                 "resident slot reset did not visit every shared KV layer",
             ));
         }
+        self.clear_slot_cache(stream, slot)?;
 
+        Ok(())
+    }
+
+    fn clear_slot_cache(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        let pages = self.kv_slots.page_count(slot)?;
+        for logical_page in 0..pages {
+            let position = product(
+                "resident assigned cache position",
+                logical_page,
+                ATTENTION_PAGE_SIZE,
+            )?;
+            let physical_page = usize::try_from(
+                self.kv_slots.route(slot, position)?.physical_page(),
+            )
+            .map_err(|_| EngineError::layout("resident physical page exceeds host width"))?;
+            clear_physical_cache_page(&self.kv_arena, stream, &self.layout, physical_page)?;
+        }
+        Ok(())
+    }
+
+    fn sync_kv_table_row(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        let start = product(
+            "resident block-table row offset",
+            slot,
+            LONG_CONTEXT_PHYSICAL_PAGES,
+        )?;
+        self.kv_arena.copy_slice_from_host(
+            stream,
+            self.layout.kv_layout.block_tables(),
+            start,
+            self.kv_slots.page_table(slot)?,
+        )?;
         Ok(())
     }
 
@@ -420,6 +484,11 @@ impl ResidentModelProgram {
     /// Stable long-context page-table bytes across all eight slot rows.
     pub const fn kv_table_bytes(&self) -> usize {
         self.layout.kv_table_bytes()
+    }
+
+    /// Fixed host bytes owning all stable table rows and physical-page tags.
+    pub const fn kv_route_host_bytes(&self) -> usize {
+        self.kv_slots.host_allocation_bytes()
     }
 
     /// GDN state plus the three cache pages assigned to one current decode slot.
@@ -561,6 +630,68 @@ impl ResidentModelProgram {
         Ok(self
             .kv_arena
             .copy_to_host(stream, self.layout.kv_layout.block_tables())?)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Stable host addresses owned by the allocation-free page router.
+    pub fn qualification_kv_route_addresses(&self) -> [usize; 2] {
+        self.kv_slots.qualification_addresses()
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Current lifecycle state for one stable page-table row.
+    pub fn qualification_kv_slot_state(&self, slot: usize) -> EngineResult<PagedKvSlotState> {
+        self.kv_slots.state(slot)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Current logical-page count for one stable page-table row.
+    pub fn qualification_kv_page_count(&self, slot: usize) -> EngineResult<usize> {
+        self.kv_slots.page_count(slot)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Physical page selected for one already-owned slot position.
+    pub fn qualification_kv_physical_page(
+        &self,
+        slot: usize,
+        position: usize,
+    ) -> EngineResult<u32> {
+        Ok(self.kv_slots.route(slot, position)?.physical_page())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads one physical K/V page from every full-attention layer.
+    pub fn qualification_cache_page(
+        &self,
+        stream: &CudaStream,
+        physical_page: usize,
+    ) -> EngineResult<(Vec<u8>, Vec<u8>)> {
+        if physical_page >= LONG_CONTEXT_PHYSICAL_PAGES {
+            return Err(EngineError::route(format!(
+                "qualification cache page {physical_page} exceeds 0..{LONG_CONTEXT_PHYSICAL_PAGES}"
+            )));
+        }
+        let page_values = cache_values(1)?;
+        let start = cache_values(physical_page)?;
+        let layers = self.layout.kv_layout.layers().len();
+        let mut key = Vec::with_capacity(page_values * layers);
+        let mut value = Vec::with_capacity(page_values * layers);
+        for cache in self.layout.kv_layout.layers() {
+            key.extend(self.kv_arena.copy_slice_to_host(
+                stream,
+                cache.key.data,
+                start,
+                page_values,
+            )?);
+            value.extend(self.kv_arena.copy_slice_to_host(
+                stream,
+                cache.value.data,
+                start,
+                page_values,
+            )?);
+        }
+        Ok((key, value))
     }
 
     #[cfg(feature = "qualification")]
@@ -1795,14 +1926,7 @@ fn initialize_metadata(
         workspace.state_rows,
         &(0..MAX_BATCH as u32).collect::<Vec<_>>(),
     )?;
-    let mut block_tables = vec![u32::MAX; MAX_BATCH * LONG_CONTEXT_PHYSICAL_PAGES];
-    for slot in 0..MAX_BATCH {
-        for logical_page in 0..SHORT_CONTEXT_PAGES_PER_SLOT {
-            block_tables[slot * LONG_CONTEXT_PHYSICAL_PAGES + logical_page] =
-                u32::try_from(slot * SHORT_CONTEXT_PAGES_PER_SLOT + logical_page)
-                    .map_err(|_| EngineError::layout("resident physical page exceeds u32"))?;
-        }
-    }
+    let block_tables = vec![u32::MAX; MAX_BATCH * LONG_CONTEXT_PHYSICAL_PAGES];
     kv_arena.copy_from_host(stream, layout.kv_layout.block_tables(), &block_tables)?;
     arena.copy_from_host(
         stream,
@@ -1870,39 +1994,23 @@ fn fill_slot<T: DeviceCopy>(
     Ok(())
 }
 
-fn fill_cache_prefix(
+fn clear_physical_cache_page(
     arena: &DeviceArena,
     stream: &CudaStream,
-    region: ArenaRegion<u8>,
+    layout: &ResidentModelLayout,
+    physical_page: usize,
 ) -> EngineResult<()> {
-    arena.fill_slice(
-        stream,
-        region,
-        0,
-        cache_values(SHORT_CONTEXT_PHYSICAL_PAGES)?,
-        0,
-    )?;
-    Ok(())
-}
-
-fn fill_cache_slot(
-    arena: &DeviceArena,
-    stream: &CudaStream,
-    region: ArenaRegion<u8>,
-    slot: usize,
-) -> EngineResult<()> {
-    let first_page = product(
-        "resident slot first cache page",
-        slot,
-        SHORT_CONTEXT_PAGES_PER_SLOT,
-    )?;
-    arena.fill_slice(
-        stream,
-        region,
-        cache_values(first_page)?,
-        cache_values(SHORT_CONTEXT_PAGES_PER_SLOT)?,
-        0,
-    )?;
+    if physical_page >= LONG_CONTEXT_PHYSICAL_PAGES {
+        return Err(EngineError::layout(format!(
+            "resident physical cache page {physical_page} exceeds 0..{LONG_CONTEXT_PHYSICAL_PAGES}"
+        )));
+    }
+    let start = cache_values(physical_page)?;
+    let len = cache_values(1)?;
+    for cache in layout.kv_layout.layers() {
+        arena.fill_slice(stream, cache.key.data, start, len, 0)?;
+        arena.fill_slice(stream, cache.value.data, start, len, 0)?;
+    }
     Ok(())
 }
 

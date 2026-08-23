@@ -292,15 +292,36 @@ impl DeviceArena {
         region: ArenaRegion<T>,
         source: &[T],
     ) -> GpuResult<()> {
+        self.copy_slice_from_host(stream, region, 0, source)
+    }
+
+    /// Copies a typed host slice into one checked subrange of a region.
+    pub fn copy_slice_from_host<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        start: usize,
+        source: &[T],
+    ) -> GpuResult<()> {
         self.require_stream_context(stream, "copying a host slice into a device arena")?;
-        if source.len() > region.len {
+        let end = start
+            .checked_add(source.len())
+            .ok_or_else(|| GpuError::arena("arena upload subrange overflows"))?;
+        if end > region.len {
             return Err(GpuError::arena(format!(
-                "host source has {} elements for an arena region of {} elements",
+                "host source has {} elements; arena upload subrange {start}..{end} exceeds a region of {} elements",
                 source.len(),
                 region.len
             )));
         }
-        let address = self.address(region)? as u64;
+        let byte_start = start
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena("arena upload byte offset overflows"))?;
+        let address = (self.address(region)? as u64)
+            .checked_add(u64::try_from(byte_start).map_err(|_| {
+                GpuError::arena("arena upload byte offset exceeds the device address width")
+            })?)
+            .ok_or_else(|| GpuError::arena("arena upload device address overflows"))?;
         let bytes = size_of_val(source);
         if bytes == 0 {
             return Ok(());
@@ -310,7 +331,7 @@ impl DeviceArena {
             .context()
             .bind_to_thread()
             .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
-        // SAFETY: the checked region and source slice both cover exactly `region.bytes`.
+        // SAFETY: the checked typed subrange and source slice both cover `bytes`.
         unsafe {
             cuda_core::memory::memcpy_htod_async(
                 address,
@@ -392,14 +413,35 @@ impl DeviceArena {
         region: ArenaRegion<T>,
         len: usize,
     ) -> GpuResult<Vec<T>> {
+        self.copy_slice_to_host(stream, region, 0, len)
+    }
+
+    /// Copies one checked typed subrange into an owned host vector.
+    pub fn copy_slice_to_host<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        start: usize,
+        len: usize,
+    ) -> GpuResult<Vec<T>> {
         self.require_stream_context(stream, "copying a device arena region to the host")?;
-        if len > region.len {
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| GpuError::arena("arena download subrange overflows"))?;
+        if end > region.len {
             return Err(GpuError::arena(format!(
-                "requested {len} elements from an arena region of {} elements",
+                "arena download subrange {start}..{end} exceeds a region of {} elements",
                 region.len
             )));
         }
-        let address = self.address(region)? as u64;
+        let byte_start = start
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena("arena download byte offset overflows"))?;
+        let address = (self.address(region)? as u64)
+            .checked_add(u64::try_from(byte_start).map_err(|_| {
+                GpuError::arena("arena download byte offset exceeds the device address width")
+            })?)
+            .ok_or_else(|| GpuError::arena("arena download device address overflows"))?;
         let bytes = len
             .checked_mul(size_of::<T>())
             .ok_or_else(|| GpuError::arena("arena copy byte count overflows"))?;
@@ -484,8 +526,8 @@ impl DeviceArena {
 
 #[cfg(test)]
 mod tests {
-    use super::ArenaLayout;
-    use crate::GpuErrorCode;
+    use super::{ArenaLayout, DeviceArena};
+    use crate::{CudaContext, GpuErrorCode};
 
     #[test]
     fn layout_aligns_non_overlapping_typed_regions() {
@@ -531,5 +573,56 @@ mod tests {
         assert!(zero_sized.to_string().contains("zero-sized element"));
         assert_eq!(overflow.code(), GpuErrorCode::Arena);
         assert!(overflow.to_string().contains("byte count overflows"));
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
+    fn typed_subrange_copies_preserve_neighboring_values() {
+        let context = CudaContext::new(0).unwrap();
+        assert_eq!(context.compute_capability().unwrap(), (12, 0));
+        let stream = context.new_stream().unwrap();
+        let mut layout = ArenaLayout::new();
+        let values = layout.reserve::<u32>(8, 256).unwrap();
+        let arena = DeviceArena::zeroed(&stream, &layout).unwrap();
+        let stable_address = arena.address(values).unwrap();
+
+        arena.fill(&stream, values, 0xa5).unwrap();
+        arena
+            .copy_slice_from_host(&stream, values, 3, &[11, 22])
+            .unwrap();
+
+        assert_eq!(
+            arena.copy_slice_to_host(&stream, values, 3, 2).unwrap(),
+            [11, 22]
+        );
+        assert_eq!(
+            arena.copy_to_host(&stream, values).unwrap(),
+            [
+                0xa5a5_a5a5,
+                0xa5a5_a5a5,
+                0xa5a5_a5a5,
+                11,
+                22,
+                0xa5a5_a5a5,
+                0xa5a5_a5a5,
+                0xa5a5_a5a5
+            ]
+        );
+        assert_eq!(arena.address(values).unwrap(), stable_address);
+
+        for error in [
+            arena
+                .copy_slice_from_host(&stream, values, 7, &[1, 2])
+                .unwrap_err(),
+            arena
+                .copy_slice_from_host(&stream, values, usize::MAX, &[1])
+                .unwrap_err(),
+            arena.copy_slice_to_host(&stream, values, 7, 2).unwrap_err(),
+            arena
+                .copy_slice_to_host(&stream, values, usize::MAX, 1)
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.code(), GpuErrorCode::Arena);
+        }
     }
 }

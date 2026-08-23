@@ -36,6 +36,10 @@ impl Session {
         }
         let stream = context.new_stream().map_err(GpuError::from)?;
         let mut program = ResidentModelProgram::from_snapshot(&context, snapshot)?;
+        for slot in 0..MAX_BATCH {
+            program.activate_kv_slot(slot)?;
+            program.reserve_kv_slot_tokens(&stream, slot, 192)?;
+        }
         program.stage_embeddings(&stream, &benchmark_token_ids())?;
         program.reset_state(&stream)?;
         let (rope_cos, rope_sin) = benchmark_rope();
