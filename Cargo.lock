@@ -3467,6 +3467,7 @@ version = "0.1.0"
 name = "tuiskollm"
 version = "0.1.0"
 dependencies = [
+ "tuisko-model",
  "tuisko-serve",
 ]
 
