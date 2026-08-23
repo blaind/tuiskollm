@@ -1,6 +1,6 @@
 use crate::device::fp8_projection::e4m3x2_to_f32;
 use cuda_device::async_copy::{cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group};
-use cuda_device::{DynamicSharedArray, float, thread, warp};
+use cuda_device::{DynamicSharedArray, convert, f16x2, float, thread, warp, wmma};
 use tuisko_model::Arch;
 
 const VALUES_PER_LANE: usize = 8;
@@ -13,6 +13,36 @@ const PREFILL_KEY_TILE: usize = 64;
 const PREFILL_PLANE_WORDS: usize = PREFILL_KEY_TILE * 256 / size_of::<u32>();
 pub(crate) const PREFILL_SHARED_BYTES: usize = 2 * PREFILL_PLANE_WORDS * size_of::<u32>();
 pub(crate) const PREFILL_PARTIAL_VALUES: usize = 258;
+const FLASH_PREFILL_MMA_ROWS: usize = 16;
+const FLASH_PREFILL_QUERY_GROUPS: usize = 2;
+const FLASH_PREFILL_QUERY_ROWS: usize = FLASH_PREFILL_QUERY_GROUPS * FLASH_PREFILL_MMA_ROWS;
+const FLASH_PREFILL_WARPS_PER_GROUP: usize = 4;
+pub(crate) const FLASH_PREFILL_THREADS: usize =
+    FLASH_PREFILL_QUERY_GROUPS * FLASH_PREFILL_WARPS_PER_GROUP * WARP_THREADS;
+const FLASH_PREFILL_P16_KEY_TILE: usize = 32;
+const FLASH_PREFILL_Q_BYTES: usize = FLASH_PREFILL_QUERY_ROWS * 256;
+const FLASH_PREFILL_Q_SCALE_BYTES: usize = FLASH_PREFILL_QUERY_ROWS * core::mem::size_of::<f32>();
+const FLASH_PREFILL_STATS_VALUES: usize = 3 * FLASH_PREFILL_QUERY_ROWS;
+
+const fn flash_prefill_shared_bytes(key_tile: usize) -> usize {
+    // Single buffering keeps P16 at two CTAs/SM. A second K=32 buffer
+    // consumes 76,288 bytes and measured 1.63x slower at 98K; doubled K=64
+    // exceeds the SM120 per-block shared-memory limit.
+    FLASH_PREFILL_Q_BYTES
+        + key_tile * 256
+        + key_tile * 256
+        + key_tile * 256 * 2
+        + FLASH_PREFILL_QUERY_ROWS * key_tile * 2
+        + FLASH_PREFILL_Q_SCALE_BYTES
+        + FLASH_PREFILL_STATS_VALUES * core::mem::size_of::<f32>()
+}
+
+pub(crate) const FLASH_PREFILL_P8_SHARED_BYTES: usize =
+    flash_prefill_shared_bytes(PREFILL_KEY_TILE);
+pub(crate) const FLASH_PREFILL_P16_SHARED_BYTES: usize =
+    flash_prefill_shared_bytes(FLASH_PREFILL_P16_KEY_TILE);
+const _: () = assert!(FLASH_PREFILL_P8_SHARED_BYTES == 78_336);
+const _: () = assert!(FLASH_PREFILL_P16_SHARED_BYTES == 43_520);
 pub(crate) const LONG_CONTEXT_PARTITION_SIZE: usize = 256;
 pub(crate) const LONG_CONTEXT_MAX_TOKENS: usize = 220_000;
 pub(crate) const LONG_CONTEXT_MAX_PARTITIONS: usize =
@@ -57,6 +87,1035 @@ unsafe fn load_bf16x8(source: *const u16) -> [f32; VALUES_PER_LANE] {
 #[inline(always)]
 fn fast_exp(value: f32) -> f32 {
     float::ex2_approx_f32(value * core::f32::consts::LOG2_E)
+}
+
+#[inline(always)]
+fn warp_max(mut value: f32) -> f32 {
+    value = value.max(warp::shuffle_xor_f32_sync(0xffff_ffff, value, 16));
+    value = value.max(warp::shuffle_xor_f32_sync(0xffff_ffff, value, 8));
+    value = value.max(warp::shuffle_xor_f32_sync(0xffff_ffff, value, 4));
+    value = value.max(warp::shuffle_xor_f32_sync(0xffff_ffff, value, 2));
+    value.max(warp::shuffle_xor_f32_sync(0xffff_ffff, value, 1))
+}
+
+#[inline(always)]
+fn quad_sum(mut value: f32) -> f32 {
+    value += warp::shuffle_xor_f32_sync(0xffff_ffff, value, 2);
+    value + warp::shuffle_xor_f32_sync(0xffff_ffff, value, 1)
+}
+
+#[inline(always)]
+fn quad_max(mut value: f32) -> f32 {
+    value = value.max(warp::shuffle_xor_f32_sync(0xffff_ffff, value, 2));
+    value.max(warp::shuffle_xor_f32_sync(0xffff_ffff, value, 1))
+}
+
+#[inline(always)]
+fn flash_swizzle(row: usize, column: usize) -> usize {
+    (((column >> 3) ^ (row & 7)) << 3) | (column & 7)
+}
+
+#[inline(always)]
+fn flash_p_swizzle<const KEY_TILE: usize>(row: usize, column: usize) -> usize {
+    if KEY_TILE == FLASH_PREFILL_P16_KEY_TILE {
+        (((column >> 3) ^ (row & 3)) << 3) | (column & 7)
+    } else {
+        flash_swizzle(row, column)
+    }
+}
+
+#[inline(always)]
+fn flash_qk_word(row: usize, logical_word: usize) -> usize {
+    (((logical_word >> 2) ^ (row & 7)) << 2) | (logical_word & 3)
+}
+
+#[inline(always)]
+fn scale_flash_fragment(fragment: [f32; 4], alpha0: f32, alpha1: f32) -> [f32; 4] {
+    [
+        fragment[0] * alpha0,
+        fragment[1] * alpha0,
+        fragment[2] * alpha1,
+        fragment[3] * alpha1,
+    ]
+}
+
+#[inline(always)]
+unsafe fn store_flash_fragment(
+    partials: *mut f32,
+    base0: usize,
+    base1: usize,
+    dimension: usize,
+    fragment: [f32; 4],
+) {
+    unsafe {
+        *partials.add(base0 + 2 + dimension) = fragment[0];
+        *partials.add(base0 + 2 + dimension + 1) = fragment[1];
+        *partials.add(base1 + 2 + dimension) = fragment[2];
+        *partials.add(base1 + 2 + dimension + 1) = fragment[3];
+    }
+}
+
+#[inline(always)]
+unsafe fn load_flash_v_fragment<A: Arch>(
+    v_shared: *const u16,
+    row: usize,
+    output_tile: usize,
+) -> [u32; 2] {
+    let column = output_tile * 8;
+    let address =
+        unsafe { v_shared.add(row * A::HEAD_DIM + flash_swizzle(row, column)) }.cast::<u32>();
+    unsafe { wmma::ldmatrix_x2_trans(address) }
+}
+
+#[inline(always)]
+unsafe fn load_flash_k_fragment<A: Arch>(
+    k_words: *const u32,
+    key_base: usize,
+    k_offset: usize,
+    lane_group: usize,
+    lane_in_group: usize,
+) -> [u32; 2] {
+    let row = key_base + lane_group;
+    unsafe {
+        [
+            *k_words.add(
+                row * (A::HEAD_DIM / size_of::<u32>())
+                    + flash_qk_word(row, k_offset + lane_in_group),
+            ),
+            *k_words.add(
+                row * (A::HEAD_DIM / size_of::<u32>())
+                    + flash_qk_word(row, k_offset + lane_in_group + 4),
+            ),
+        ]
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn scale_flash_scores(
+    score: [f32; 4],
+    key_base: usize,
+    tile_position: usize,
+    lane_in_group: usize,
+    length0: usize,
+    length1: usize,
+    partition_end: usize,
+    scale0: f32,
+    scale1: f32,
+) -> [f32; 4] {
+    let key0 = tile_position + key_base + lane_in_group * 2;
+    let key1 = key0 + 1;
+    [
+        if key0 < length0 && key0 < partition_end {
+            score[0] * scale0
+        } else {
+            -1.0e30
+        },
+        if key1 < length0 && key1 < partition_end {
+            score[1] * scale0
+        } else {
+            -1.0e30
+        },
+        if key0 < length1 && key0 < partition_end {
+            score[2] * scale1
+        } else {
+            -1.0e30
+        },
+        if key1 < length1 && key1 < partition_end {
+            score[3] * scale1
+        } else {
+            -1.0e30
+        },
+    ]
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn write_flash_probabilities<const KEY_TILE: usize>(
+    p_shared: *mut u16,
+    score: [f32; 4],
+    key_base: usize,
+    tile_position: usize,
+    lane_in_group: usize,
+    row0: usize,
+    row1: usize,
+    length0: usize,
+    length1: usize,
+    partition_end: usize,
+    maximum0: f32,
+    maximum1: f32,
+) -> (f32, f32) {
+    let key0 = tile_position + key_base + lane_in_group * 2;
+    let key1 = key0 + 1;
+    let p00 = if key0 < length0 && key0 < partition_end {
+        fast_exp(score[0] - maximum0)
+    } else {
+        0.0
+    };
+    let p01 = if key1 < length0 && key1 < partition_end {
+        fast_exp(score[1] - maximum0)
+    } else {
+        0.0
+    };
+    let p10 = if key0 < length1 && key0 < partition_end {
+        fast_exp(score[2] - maximum1)
+    } else {
+        0.0
+    };
+    let p11 = if key1 < length1 && key1 < partition_end {
+        fast_exp(score[3] - maximum1)
+    } else {
+        0.0
+    };
+    let column = key_base + lane_in_group * 2;
+    unsafe {
+        *p_shared
+            .add(row0 * KEY_TILE + flash_p_swizzle::<KEY_TILE>(row0, column))
+            .cast::<u32>() = convert::cvt_f16x2_f32(p00, p01);
+        *p_shared
+            .add(row1 * KEY_TILE + flash_p_swizzle::<KEY_TILE>(row1, column))
+            .cast::<u32>() = convert::cvt_f16x2_f32(p10, p11);
+    }
+    (p00 + p01, p10 + p11)
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn flash_tile_cp_async<A: Arch, const KEY_TILE: usize>(
+    k_words: *mut u32,
+    v_codes: *mut u8,
+    key_pages: *const u8,
+    value_pages: *const u8,
+    block_table: *const u32,
+    kv_head: usize,
+    tile_position: usize,
+    tile_positions: usize,
+    tid: usize,
+) {
+    let physical_page = unsafe { *block_table.add(tile_position / PAGE_SIZE) as usize };
+    let mut task = tid;
+    while task < KEY_TILE * (A::HEAD_DIM / 16) {
+        let key_in_tile = task / (A::HEAD_DIM / 16);
+        let dimension_segment = task - key_in_tile * (A::HEAD_DIM / 16);
+        let valid = key_in_tile < tile_positions;
+        let position = tile_position + key_in_tile;
+        let source_offset = A::HEAD_DIM
+            * ((position & (PAGE_SIZE - 1))
+                + PAGE_SIZE * (kv_head + A::NUM_KV_HEADS * physical_page))
+            + dimension_segment * 16;
+        let physical_segment = dimension_segment ^ (key_in_tile & 7);
+        unsafe {
+            cp_async_cg_zfill_16(
+                k_words.add(key_in_tile * (A::HEAD_DIM / 4) + physical_segment * 4),
+                key_pages.add(source_offset),
+                if valid { 16 } else { 0 },
+            );
+            cp_async_cg_zfill_16(
+                v_codes
+                    .add(key_in_tile * A::HEAD_DIM + dimension_segment * 16)
+                    .cast::<u32>(),
+                value_pages.add(source_offset),
+                if valid { 16 } else { 0 },
+            );
+        }
+        task += FLASH_PREFILL_THREADS;
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn paged_gqa_prefill_flash_partitioned<A: Arch, const KEY_TILE: usize>(
+    query: *const f32,
+    key_pages: *const u8,
+    value_pages: *const u8,
+    block_tables: *const u32,
+    table_rows: *const u32,
+    table_stride: u32,
+    lengths: *const u32,
+    partitions: u32,
+    partials: *mut f32,
+    key_scale: f32,
+    value_scale: f32,
+) {
+    let block = thread::blockIdx_x() as usize;
+    let partitions = partitions as usize;
+    let partition = block % partitions;
+    let group = block / partitions;
+    let query_head = group % A::NUM_ATTENTION_HEADS;
+    let query_block = group / A::NUM_ATTENTION_HEADS;
+    let first_token = query_block * FLASH_PREFILL_QUERY_ROWS;
+    let tid = thread::threadIdx_x() as usize;
+    let warp_index = tid / WARP_THREADS;
+    let query_group = warp_index / FLASH_PREFILL_WARPS_PER_GROUP;
+    let output_warp = warp_index - query_group * FLASH_PREFILL_WARPS_PER_GROUP;
+    let lane = tid & (WARP_THREADS - 1);
+    let lane_group = lane >> 2;
+    let lane_in_group = lane & 3;
+    let kv_head = query_head / PREFILL_QUERY_WARPS;
+    let group_length = unsafe { *lengths.add(first_token + FLASH_PREFILL_QUERY_ROWS - 1) as usize };
+    let key_tiles = group_length.div_ceil(KEY_TILE);
+    let tiles_per_partition = key_tiles.div_ceil(partitions);
+    let partition_tile_begin = partition * tiles_per_partition;
+    let partition_tile_end = (partition_tile_begin + tiles_per_partition).min(key_tiles);
+    let partition_begin = partition_tile_begin * KEY_TILE;
+    let partition_end = (partition_tile_end * KEY_TILE).min(group_length);
+
+    if partition_begin >= partition_end {
+        let mut task = tid;
+        while task < FLASH_PREFILL_QUERY_ROWS * PREFILL_PARTIAL_VALUES {
+            let row = task / PREFILL_PARTIAL_VALUES;
+            let field = task - row * PREFILL_PARTIAL_VALUES;
+            let token = first_token + row;
+            let base = ((token * A::NUM_ATTENTION_HEADS + query_head) * partitions + partition)
+                * PREFILL_PARTIAL_VALUES;
+            unsafe {
+                *partials.add(base + field) = if field == 0 { -1.0e30 } else { 0.0 };
+            }
+            task += FLASH_PREFILL_THREADS;
+        }
+        return;
+    }
+
+    let shared = DynamicSharedArray::<u32, 16>::get().cast::<u8>();
+    let q_shared = shared;
+    let k_base = unsafe { q_shared.add(FLASH_PREFILL_Q_BYTES) };
+    let v_codes_base = unsafe { k_base.add(KEY_TILE * A::HEAD_DIM) };
+    let v_shared_base = unsafe { v_codes_base.add(KEY_TILE * A::HEAD_DIM) }.cast::<u16>();
+    let p_shared = unsafe {
+        v_shared_base
+            .cast::<u8>()
+            .add(KEY_TILE * A::HEAD_DIM * size_of::<u16>())
+    }
+    .cast::<u16>();
+    let q_scales = unsafe {
+        p_shared
+            .cast::<u8>()
+            .add(FLASH_PREFILL_QUERY_ROWS * KEY_TILE * size_of::<u16>())
+    }
+    .cast::<f32>();
+    let stats = unsafe {
+        q_scales
+            .cast::<u8>()
+            .add(FLASH_PREFILL_Q_SCALE_BYTES)
+            .cast::<f32>()
+    };
+
+    // Eight warps quantize 32 rows once per CTA. Each lane owns eight
+    // contiguous dimensions; the row scale is reused by all eight QK steps.
+    let mut row = warp_index;
+    while row < FLASH_PREFILL_QUERY_ROWS {
+        let token = first_token + row;
+        let dimension = lane * VALUES_PER_LANE;
+        let source = unsafe {
+            query.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
+        };
+        let q0 = unsafe { *source };
+        let q1 = unsafe { *source.add(1) };
+        let q2 = unsafe { *source.add(2) };
+        let q3 = unsafe { *source.add(3) };
+        let q4 = unsafe { *source.add(4) };
+        let q5 = unsafe { *source.add(5) };
+        let q6 = unsafe { *source.add(6) };
+        let q7 = unsafe { *source.add(7) };
+        let mut absolute_maximum = q0
+            .abs()
+            .max(q1.abs())
+            .max(q2.abs())
+            .max(q3.abs())
+            .max(q4.abs())
+            .max(q5.abs())
+            .max(q6.abs())
+            .max(q7.abs());
+        absolute_maximum = warp_max(absolute_maximum);
+        let scale = if absolute_maximum > 0.0 {
+            absolute_maximum / 448.0
+        } else {
+            1.0
+        };
+        if lane == 0 {
+            unsafe { *q_scales.add(row) = scale };
+        }
+        let inverse = 1.0 / scale;
+        let logical_word = lane * 2;
+        let destination = unsafe {
+            q_shared.add(
+                row * A::HEAD_DIM + flash_qk_word(row, logical_word) * core::mem::size_of::<u32>(),
+            )
+        }
+        .cast::<u32>();
+        let packed0 = convert::cvt_rn_satfinite_e4m3x2_f32(q0 * inverse, q1 * inverse);
+        let packed1 = convert::cvt_rn_satfinite_e4m3x2_f32(q2 * inverse, q3 * inverse);
+        let packed2 = convert::cvt_rn_satfinite_e4m3x2_f32(q4 * inverse, q5 * inverse);
+        let packed3 = convert::cvt_rn_satfinite_e4m3x2_f32(q6 * inverse, q7 * inverse);
+        unsafe {
+            *destination = u32::from(packed0) | (u32::from(packed1) << 16);
+            *destination.add(1) = u32::from(packed2) | (u32::from(packed3) << 16);
+        }
+        row += FLASH_PREFILL_THREADS / WARP_THREADS;
+    }
+    thread::sync_threads();
+
+    let table_row = unsafe { *table_rows.add(first_token) as usize };
+    let block_table = unsafe { block_tables.add(table_row * table_stride as usize) };
+    let q_words = q_shared.cast::<u32>();
+    let value_scale_pair = convert::cvt_f16x2_f32(value_scale, value_scale);
+    let mut pv0 = [0.0f32; 4];
+    let mut pv1 = [0.0f32; 4];
+    let mut pv2 = [0.0f32; 4];
+    let mut pv3 = [0.0f32; 4];
+    let mut pv4 = [0.0f32; 4];
+    let mut pv5 = [0.0f32; 4];
+    let mut pv6 = [0.0f32; 4];
+    let mut pv7 = [0.0f32; 4];
+    let mut running_maximum0 = -1.0e30f32;
+    let mut running_maximum1 = -1.0e30f32;
+    let mut running_denominator0 = 0.0f32;
+    let mut running_denominator1 = 0.0f32;
+
+    let a_matrix = lane >> 3;
+    let a_row_offset = (lane & 7) + ((a_matrix & 1) << 3);
+    let a_column_offset = (a_matrix >> 1) << 3;
+    let b_row_offset = lane & 7;
+    let b_k_offset = ((lane >> 3) & 1) << 3;
+
+    let mut tile_position = partition_begin;
+    while tile_position < partition_end {
+        unsafe {
+            flash_tile_cp_async::<A, KEY_TILE>(
+                k_base.cast::<u32>(),
+                v_codes_base,
+                key_pages,
+                value_pages,
+                block_table,
+                kv_head,
+                tile_position,
+                (partition_end - tile_position).min(KEY_TILE),
+                tid,
+            );
+            cp_async_commit_group();
+            cp_async_wait_group(0);
+        }
+        thread::sync_threads();
+        let k_words = k_base.cast::<u32>();
+        let v_codes = v_codes_base;
+        let v_shared = v_shared_base;
+
+        if output_warp == 0 {
+            let row0 = query_group * FLASH_PREFILL_MMA_ROWS + lane_group;
+            let row1 = row0 + 8;
+            let length0 = unsafe { *lengths.add(first_token + row0) as usize };
+            let length1 = unsafe { *lengths.add(first_token + row1) as usize };
+            let score_scale0 = unsafe { *q_scales.add(row0) } * key_scale * 0.0625;
+            let score_scale1 = unsafe { *q_scales.add(row1) } * key_scale * 0.0625;
+            let mut score0 = [0.0f32; 4];
+            let mut score1 = [0.0f32; 4];
+            let mut score2 = [0.0f32; 4];
+            let mut score3 = [0.0f32; 4];
+            let mut score4 = [0.0f32; 4];
+            let mut score5 = [0.0f32; 4];
+            let mut score6 = [0.0f32; 4];
+            let mut score7 = [0.0f32; 4];
+            let mut k_subtile = 0usize;
+            while k_subtile < A::HEAD_DIM / 32 {
+                let k_offset = k_subtile * 8;
+                let activation_fragment = unsafe {
+                    [
+                        *q_words.add(
+                            row0 * (A::HEAD_DIM / 4)
+                                + flash_qk_word(row0, k_offset + lane_in_group),
+                        ),
+                        *q_words.add(
+                            row1 * (A::HEAD_DIM / 4)
+                                + flash_qk_word(row1, k_offset + lane_in_group),
+                        ),
+                        *q_words.add(
+                            row0 * (A::HEAD_DIM / 4)
+                                + flash_qk_word(row0, k_offset + lane_in_group + 4),
+                        ),
+                        *q_words.add(
+                            row1 * (A::HEAD_DIM / 4)
+                                + flash_qk_word(row1, k_offset + lane_in_group + 4),
+                        ),
+                    ]
+                };
+                unsafe {
+                    score0 = cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                        score0,
+                        activation_fragment,
+                        load_flash_k_fragment::<A>(k_words, 0, k_offset, lane_group, lane_in_group),
+                    );
+                    score1 = cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                        score1,
+                        activation_fragment,
+                        load_flash_k_fragment::<A>(k_words, 8, k_offset, lane_group, lane_in_group),
+                    );
+                    score2 = cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                        score2,
+                        activation_fragment,
+                        load_flash_k_fragment::<A>(
+                            k_words,
+                            16,
+                            k_offset,
+                            lane_group,
+                            lane_in_group,
+                        ),
+                    );
+                    score3 = cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                        score3,
+                        activation_fragment,
+                        load_flash_k_fragment::<A>(
+                            k_words,
+                            24,
+                            k_offset,
+                            lane_group,
+                            lane_in_group,
+                        ),
+                    );
+                    if KEY_TILE == PREFILL_KEY_TILE {
+                        score4 = cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                            score4,
+                            activation_fragment,
+                            load_flash_k_fragment::<A>(
+                                k_words,
+                                32,
+                                k_offset,
+                                lane_group,
+                                lane_in_group,
+                            ),
+                        );
+                        score5 = cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                            score5,
+                            activation_fragment,
+                            load_flash_k_fragment::<A>(
+                                k_words,
+                                40,
+                                k_offset,
+                                lane_group,
+                                lane_in_group,
+                            ),
+                        );
+                        score6 = cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                            score6,
+                            activation_fragment,
+                            load_flash_k_fragment::<A>(
+                                k_words,
+                                48,
+                                k_offset,
+                                lane_group,
+                                lane_in_group,
+                            ),
+                        );
+                        score7 = cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                            score7,
+                            activation_fragment,
+                            load_flash_k_fragment::<A>(
+                                k_words,
+                                56,
+                                k_offset,
+                                lane_group,
+                                lane_in_group,
+                            ),
+                        );
+                    }
+                }
+                k_subtile += 1;
+            }
+
+            score0 = scale_flash_scores(
+                score0,
+                0,
+                tile_position,
+                lane_in_group,
+                length0,
+                length1,
+                partition_end,
+                score_scale0,
+                score_scale1,
+            );
+            score1 = scale_flash_scores(
+                score1,
+                8,
+                tile_position,
+                lane_in_group,
+                length0,
+                length1,
+                partition_end,
+                score_scale0,
+                score_scale1,
+            );
+            score2 = scale_flash_scores(
+                score2,
+                16,
+                tile_position,
+                lane_in_group,
+                length0,
+                length1,
+                partition_end,
+                score_scale0,
+                score_scale1,
+            );
+            score3 = scale_flash_scores(
+                score3,
+                24,
+                tile_position,
+                lane_in_group,
+                length0,
+                length1,
+                partition_end,
+                score_scale0,
+                score_scale1,
+            );
+            if KEY_TILE == PREFILL_KEY_TILE {
+                score4 = scale_flash_scores(
+                    score4,
+                    32,
+                    tile_position,
+                    lane_in_group,
+                    length0,
+                    length1,
+                    partition_end,
+                    score_scale0,
+                    score_scale1,
+                );
+                score5 = scale_flash_scores(
+                    score5,
+                    40,
+                    tile_position,
+                    lane_in_group,
+                    length0,
+                    length1,
+                    partition_end,
+                    score_scale0,
+                    score_scale1,
+                );
+                score6 = scale_flash_scores(
+                    score6,
+                    48,
+                    tile_position,
+                    lane_in_group,
+                    length0,
+                    length1,
+                    partition_end,
+                    score_scale0,
+                    score_scale1,
+                );
+                score7 = scale_flash_scores(
+                    score7,
+                    56,
+                    tile_position,
+                    lane_in_group,
+                    length0,
+                    length1,
+                    partition_end,
+                    score_scale0,
+                    score_scale1,
+                );
+            }
+
+            let mut block_maximum0 = score0[0]
+                .max(score0[1])
+                .max(score1[0])
+                .max(score1[1])
+                .max(score2[0])
+                .max(score2[1])
+                .max(score3[0])
+                .max(score3[1]);
+            let mut block_maximum1 = score0[2]
+                .max(score0[3])
+                .max(score1[2])
+                .max(score1[3])
+                .max(score2[2])
+                .max(score2[3])
+                .max(score3[2])
+                .max(score3[3]);
+            if KEY_TILE == PREFILL_KEY_TILE {
+                block_maximum0 = block_maximum0
+                    .max(score4[0])
+                    .max(score4[1])
+                    .max(score5[0])
+                    .max(score5[1])
+                    .max(score6[0])
+                    .max(score6[1])
+                    .max(score7[0])
+                    .max(score7[1]);
+                block_maximum1 = block_maximum1
+                    .max(score4[2])
+                    .max(score4[3])
+                    .max(score5[2])
+                    .max(score5[3])
+                    .max(score6[2])
+                    .max(score6[3])
+                    .max(score7[2])
+                    .max(score7[3]);
+            }
+            block_maximum0 = quad_max(block_maximum0);
+            block_maximum1 = quad_max(block_maximum1);
+            let next_maximum0 = running_maximum0.max(block_maximum0);
+            let next_maximum1 = running_maximum1.max(block_maximum1);
+            let alpha0 = if running_denominator0 > 0.0 {
+                fast_exp(running_maximum0 - next_maximum0)
+            } else {
+                0.0
+            };
+            let alpha1 = if running_denominator1 > 0.0 {
+                fast_exp(running_maximum1 - next_maximum1)
+            } else {
+                0.0
+            };
+
+            let p0 = unsafe {
+                write_flash_probabilities::<KEY_TILE>(
+                    p_shared,
+                    score0,
+                    0,
+                    tile_position,
+                    lane_in_group,
+                    row0,
+                    row1,
+                    length0,
+                    length1,
+                    partition_end,
+                    next_maximum0,
+                    next_maximum1,
+                )
+            };
+            let p1 = unsafe {
+                write_flash_probabilities::<KEY_TILE>(
+                    p_shared,
+                    score1,
+                    8,
+                    tile_position,
+                    lane_in_group,
+                    row0,
+                    row1,
+                    length0,
+                    length1,
+                    partition_end,
+                    next_maximum0,
+                    next_maximum1,
+                )
+            };
+            let p2 = unsafe {
+                write_flash_probabilities::<KEY_TILE>(
+                    p_shared,
+                    score2,
+                    16,
+                    tile_position,
+                    lane_in_group,
+                    row0,
+                    row1,
+                    length0,
+                    length1,
+                    partition_end,
+                    next_maximum0,
+                    next_maximum1,
+                )
+            };
+            let p3 = unsafe {
+                write_flash_probabilities::<KEY_TILE>(
+                    p_shared,
+                    score3,
+                    24,
+                    tile_position,
+                    lane_in_group,
+                    row0,
+                    row1,
+                    length0,
+                    length1,
+                    partition_end,
+                    next_maximum0,
+                    next_maximum1,
+                )
+            };
+            let mut block_denominator0 = p0.0 + p1.0 + p2.0 + p3.0;
+            let mut block_denominator1 = p0.1 + p1.1 + p2.1 + p3.1;
+            if KEY_TILE == PREFILL_KEY_TILE {
+                let p4 = unsafe {
+                    write_flash_probabilities::<KEY_TILE>(
+                        p_shared,
+                        score4,
+                        32,
+                        tile_position,
+                        lane_in_group,
+                        row0,
+                        row1,
+                        length0,
+                        length1,
+                        partition_end,
+                        next_maximum0,
+                        next_maximum1,
+                    )
+                };
+                let p5 = unsafe {
+                    write_flash_probabilities::<KEY_TILE>(
+                        p_shared,
+                        score5,
+                        40,
+                        tile_position,
+                        lane_in_group,
+                        row0,
+                        row1,
+                        length0,
+                        length1,
+                        partition_end,
+                        next_maximum0,
+                        next_maximum1,
+                    )
+                };
+                let p6 = unsafe {
+                    write_flash_probabilities::<KEY_TILE>(
+                        p_shared,
+                        score6,
+                        48,
+                        tile_position,
+                        lane_in_group,
+                        row0,
+                        row1,
+                        length0,
+                        length1,
+                        partition_end,
+                        next_maximum0,
+                        next_maximum1,
+                    )
+                };
+                let p7 = unsafe {
+                    write_flash_probabilities::<KEY_TILE>(
+                        p_shared,
+                        score7,
+                        56,
+                        tile_position,
+                        lane_in_group,
+                        row0,
+                        row1,
+                        length0,
+                        length1,
+                        partition_end,
+                        next_maximum0,
+                        next_maximum1,
+                    )
+                };
+                block_denominator0 += p4.0 + p5.0 + p6.0 + p7.0;
+                block_denominator1 += p4.1 + p5.1 + p6.1 + p7.1;
+            }
+            block_denominator0 = quad_sum(block_denominator0);
+            block_denominator1 = quad_sum(block_denominator1);
+            running_denominator0 = running_denominator0 * alpha0 + block_denominator0;
+            running_denominator1 = running_denominator1 * alpha1 + block_denominator1;
+            running_maximum0 = next_maximum0;
+            running_maximum1 = next_maximum1;
+            if lane_in_group == 0 {
+                unsafe {
+                    *stats.add(row0) = running_maximum0;
+                    *stats.add(row1) = running_maximum1;
+                    *stats.add(FLASH_PREFILL_QUERY_ROWS + row0) = running_denominator0;
+                    *stats.add(FLASH_PREFILL_QUERY_ROWS + row1) = running_denominator1;
+                    *stats.add(2 * FLASH_PREFILL_QUERY_ROWS + row0) = alpha0;
+                    *stats.add(2 * FLASH_PREFILL_QUERY_ROWS + row1) = alpha1;
+                }
+            }
+        } else {
+            // One warp per query group produces QK; the other six warps
+            // convert disjoint V rows while the score producer runs.
+            let worker_warp = query_group * (FLASH_PREFILL_WARPS_PER_GROUP - 1) + output_warp - 1;
+            let mut worker_task = worker_warp * WARP_THREADS + lane;
+            let worker_threads =
+                FLASH_PREFILL_QUERY_GROUPS * (FLASH_PREFILL_WARPS_PER_GROUP - 1) * WARP_THREADS;
+            while worker_task < KEY_TILE * (A::HEAD_DIM / 8) {
+                let key_in_tile = worker_task / (A::HEAD_DIM / 8);
+                let dimension_chunk = worker_task - key_in_tile * (A::HEAD_DIM / 8);
+                let dimension = dimension_chunk * 8;
+                let packed = unsafe {
+                    *v_codes
+                        .add(key_in_tile * A::HEAD_DIM + dimension)
+                        .cast::<u64>()
+                };
+                let destination = unsafe {
+                    v_shared.add(key_in_tile * A::HEAD_DIM + flash_swizzle(key_in_tile, dimension))
+                }
+                .cast::<u32>();
+                unsafe {
+                    *destination = f16x2::mul_f16x2(
+                        convert::cvt_rn_f16x2_e4m3x2(packed as u16),
+                        value_scale_pair,
+                    );
+                    *destination.add(1) = f16x2::mul_f16x2(
+                        convert::cvt_rn_f16x2_e4m3x2((packed >> 16) as u16),
+                        value_scale_pair,
+                    );
+                    *destination.add(2) = f16x2::mul_f16x2(
+                        convert::cvt_rn_f16x2_e4m3x2((packed >> 32) as u16),
+                        value_scale_pair,
+                    );
+                    *destination.add(3) = f16x2::mul_f16x2(
+                        convert::cvt_rn_f16x2_e4m3x2((packed >> 48) as u16),
+                        value_scale_pair,
+                    );
+                }
+                worker_task += worker_threads;
+            }
+        }
+        thread::sync_threads();
+
+        let row0 = query_group * FLASH_PREFILL_MMA_ROWS + lane_group;
+        let row1 = row0 + 8;
+        let alpha0 = unsafe { *stats.add(2 * FLASH_PREFILL_QUERY_ROWS + row0) };
+        let alpha1 = unsafe { *stats.add(2 * FLASH_PREFILL_QUERY_ROWS + row1) };
+        pv0 = scale_flash_fragment(pv0, alpha0, alpha1);
+        pv1 = scale_flash_fragment(pv1, alpha0, alpha1);
+        pv2 = scale_flash_fragment(pv2, alpha0, alpha1);
+        pv3 = scale_flash_fragment(pv3, alpha0, alpha1);
+        pv4 = scale_flash_fragment(pv4, alpha0, alpha1);
+        pv5 = scale_flash_fragment(pv5, alpha0, alpha1);
+        pv6 = scale_flash_fragment(pv6, alpha0, alpha1);
+        pv7 = scale_flash_fragment(pv7, alpha0, alpha1);
+
+        let mut key_subtile = 0usize;
+        while key_subtile < KEY_TILE / 16 {
+            let p_column = key_subtile * 16 + a_column_offset;
+            let p_row = query_group * FLASH_PREFILL_MMA_ROWS + a_row_offset;
+            let p_address = unsafe {
+                p_shared.add(p_row * KEY_TILE + flash_p_swizzle::<KEY_TILE>(p_row, p_column))
+            }
+            .cast::<u32>();
+            let p_fragment = unsafe { wmma::ldmatrix_x4(p_address) };
+            let v_row = key_subtile * 16 + b_k_offset + b_row_offset;
+            let output_base = output_warp * 8;
+            pv0 = unsafe {
+                wmma::mma_m16n8k16_f32_f16(
+                    pv0,
+                    p_fragment,
+                    load_flash_v_fragment::<A>(v_shared, v_row, output_base),
+                )
+            };
+            pv1 = unsafe {
+                wmma::mma_m16n8k16_f32_f16(
+                    pv1,
+                    p_fragment,
+                    load_flash_v_fragment::<A>(v_shared, v_row, output_base + 1),
+                )
+            };
+            pv2 = unsafe {
+                wmma::mma_m16n8k16_f32_f16(
+                    pv2,
+                    p_fragment,
+                    load_flash_v_fragment::<A>(v_shared, v_row, output_base + 2),
+                )
+            };
+            pv3 = unsafe {
+                wmma::mma_m16n8k16_f32_f16(
+                    pv3,
+                    p_fragment,
+                    load_flash_v_fragment::<A>(v_shared, v_row, output_base + 3),
+                )
+            };
+            pv4 = unsafe {
+                wmma::mma_m16n8k16_f32_f16(
+                    pv4,
+                    p_fragment,
+                    load_flash_v_fragment::<A>(v_shared, v_row, output_base + 4),
+                )
+            };
+            pv5 = unsafe {
+                wmma::mma_m16n8k16_f32_f16(
+                    pv5,
+                    p_fragment,
+                    load_flash_v_fragment::<A>(v_shared, v_row, output_base + 5),
+                )
+            };
+            pv6 = unsafe {
+                wmma::mma_m16n8k16_f32_f16(
+                    pv6,
+                    p_fragment,
+                    load_flash_v_fragment::<A>(v_shared, v_row, output_base + 6),
+                )
+            };
+            pv7 = unsafe {
+                wmma::mma_m16n8k16_f32_f16(
+                    pv7,
+                    p_fragment,
+                    load_flash_v_fragment::<A>(v_shared, v_row, output_base + 7),
+                )
+            };
+            key_subtile += 1;
+        }
+        tile_position += KEY_TILE;
+    }
+
+    let row0 = query_group * FLASH_PREFILL_MMA_ROWS + lane_group;
+    let row1 = row0 + 8;
+    let token0 = first_token + row0;
+    let token1 = first_token + row1;
+    let base0 = ((token0 * A::NUM_ATTENTION_HEADS + query_head) * partitions + partition)
+        * PREFILL_PARTIAL_VALUES;
+    let base1 = ((token1 * A::NUM_ATTENTION_HEADS + query_head) * partitions + partition)
+        * PREFILL_PARTIAL_VALUES;
+    if output_warp == 0 && lane_in_group == 0 {
+        unsafe {
+            *partials.add(base0) = *stats.add(row0);
+            *partials.add(base0 + 1) = *stats.add(FLASH_PREFILL_QUERY_ROWS + row0);
+            *partials.add(base1) = *stats.add(row1);
+            *partials.add(base1 + 1) = *stats.add(FLASH_PREFILL_QUERY_ROWS + row1);
+        }
+    }
+    let output_base = output_warp * 8;
+    unsafe {
+        store_flash_fragment(
+            partials,
+            base0,
+            base1,
+            output_base * 8 + lane_in_group * 2,
+            pv0,
+        );
+        store_flash_fragment(
+            partials,
+            base0,
+            base1,
+            (output_base + 1) * 8 + lane_in_group * 2,
+            pv1,
+        );
+        store_flash_fragment(
+            partials,
+            base0,
+            base1,
+            (output_base + 2) * 8 + lane_in_group * 2,
+            pv2,
+        );
+        store_flash_fragment(
+            partials,
+            base0,
+            base1,
+            (output_base + 3) * 8 + lane_in_group * 2,
+            pv3,
+        );
+        store_flash_fragment(
+            partials,
+            base0,
+            base1,
+            (output_base + 4) * 8 + lane_in_group * 2,
+            pv4,
+        );
+        store_flash_fragment(
+            partials,
+            base0,
+            base1,
+            (output_base + 5) * 8 + lane_in_group * 2,
+            pv5,
+        );
+        store_flash_fragment(
+            partials,
+            base0,
+            base1,
+            (output_base + 6) * 8 + lane_in_group * 2,
+            pv6,
+        );
+        store_flash_fragment(
+            partials,
+            base0,
+            base1,
+            (output_base + 7) * 8 + lane_in_group * 2,
+            pv7,
+        );
+    }
 }
 
 #[inline(always)]
@@ -205,183 +1264,6 @@ pub(crate) unsafe fn paged_gqa_prefill_shared<A: Arch, const TOKENS: usize>(
     let mut element = 0usize;
     while element < VALUES_PER_LANE {
         unsafe { *output.add(element) = accumulator[element] / denominator };
-        element += 1;
-    }
-}
-
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn paged_gqa_prefill_partitioned<
-    A: Arch,
-    const TOKENS: usize,
-    const PARTITIONS: usize,
->(
-    query: *const f32,
-    key_pages: *const u8,
-    value_pages: *const u8,
-    block_tables: *const u32,
-    table_rows: *const u32,
-    table_stride: u32,
-    lengths: *const u32,
-    partials: *mut f32,
-    key_scale: f32,
-    value_scale: f32,
-) {
-    let block = thread::blockIdx_x() as usize;
-    let partition = block % PARTITIONS;
-    let group = block / PARTITIONS;
-    let kv_head = group % A::NUM_KV_HEADS;
-    let token_pair = group / A::NUM_KV_HEADS;
-    let first_token = token_pair * PREFILL_TOKEN_GROUP;
-    let tid = thread::threadIdx_x() as usize;
-    let warp_index = tid / WARP_THREADS;
-    let lane = tid & (WARP_THREADS - 1);
-    let token_in_group = warp_index / PREFILL_QUERY_WARPS;
-    let query_in_group = warp_index - token_in_group * PREFILL_QUERY_WARPS;
-    let token = first_token + token_in_group;
-    let query_head = kv_head * PREFILL_QUERY_WARPS + query_in_group;
-    let dimension = lane * VALUES_PER_LANE;
-    let length0 = unsafe { *lengths.add(first_token) as usize };
-    let length1 = unsafe { *lengths.add(first_token + 1) as usize };
-    let group_length = length0.max(length1);
-    let positions_per_partition = group_length.div_ceil(PARTITIONS);
-    let partition_begin = partition * positions_per_partition;
-    let partition_end = core::cmp::min(partition_begin + positions_per_partition, group_length);
-    let token_length = if token_in_group == 0 {
-        length0
-    } else {
-        length1
-    };
-    let token_partition_end = core::cmp::min(partition_end, token_length);
-    let partial_base = ((token * A::NUM_ATTENTION_HEADS + query_head) * PARTITIONS + partition)
-        * PREFILL_PARTIAL_VALUES;
-
-    if partition_begin >= partition_end {
-        if lane == 0 {
-            unsafe {
-                *partials.add(partial_base) = -1.0e30;
-                *partials.add(partial_base + 1) = 0.0;
-            }
-        }
-        let mut offset = lane;
-        while offset < A::HEAD_DIM {
-            unsafe { *partials.add(partial_base + 2 + offset) = 0.0 };
-            offset += WARP_THREADS;
-        }
-        return;
-    }
-
-    let query = unsafe {
-        query.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
-    };
-    let table_row = unsafe { *table_rows.add(first_token) as usize };
-    let block_table = unsafe { block_tables.add(table_row * table_stride as usize) };
-    let q = unsafe {
-        [
-            *query,
-            *query.add(1),
-            *query.add(2),
-            *query.add(3),
-            *query.add(4),
-            *query.add(5),
-            *query.add(6),
-            *query.add(7),
-        ]
-    };
-    let shared = DynamicSharedArray::<u32, 16>::get();
-    let shared_bytes = shared.cast::<u8>();
-    let mut accumulator = [0.0f32; VALUES_PER_LANE];
-    let mut maximum = -1.0e30f32;
-    let mut denominator = 0.0f32;
-    let mut tile_position = partition_begin;
-
-    while tile_position < partition_end {
-        let tile_positions = core::cmp::min(partition_end - tile_position, PREFILL_KEY_TILE);
-        let mut task = tid;
-        while task < 2 * tile_positions * (A::HEAD_DIM / 16) {
-            let plane = task / (tile_positions * (A::HEAD_DIM / 16));
-            let within_plane = task - plane * tile_positions * (A::HEAD_DIM / 16);
-            let position_in_tile = within_plane / (A::HEAD_DIM / 16);
-            let dimension_segment = within_plane - position_in_tile * (A::HEAD_DIM / 16);
-            let position = tile_position + position_in_tile;
-            let physical_page = unsafe { *block_table.add(position / PAGE_SIZE) as usize };
-            let cache_element = A::HEAD_DIM
-                * ((position & (PAGE_SIZE - 1))
-                    + PAGE_SIZE * (kv_head + A::NUM_KV_HEADS * physical_page))
-                + dimension_segment * 16;
-            let source = if plane == 0 { key_pages } else { value_pages };
-            let destination_word = plane * PREFILL_PLANE_WORDS
-                + position_in_tile * (A::HEAD_DIM / size_of::<u32>())
-                + dimension_segment * (16 / size_of::<u32>());
-            unsafe {
-                cp_async_cg_zfill_16(shared.add(destination_word), source.add(cache_element), 16);
-            }
-            task += PREFILL_THREADS;
-        }
-        unsafe {
-            cp_async_commit_group();
-            cp_async_wait_group(0);
-        }
-        thread::sync_threads();
-
-        let mut position = tile_position;
-        while position < tile_position + tile_positions {
-            if position < token_partition_end {
-                let tile_element = (position - tile_position) * A::HEAD_DIM + dimension;
-                let key = unsafe { load_e4m3x8(shared_bytes.add(tile_element), key_scale) };
-                let value = unsafe {
-                    load_e4m3x8(
-                        shared_bytes.add(PREFILL_PLANE_WORDS * size_of::<u32>() + tile_element),
-                        value_scale,
-                    )
-                };
-                let mut score = 0.0f32;
-                let mut element = 0usize;
-                while element < VALUES_PER_LANE {
-                    score = float::fma_rn_f32(q[element], key[element], score);
-                    element += 1;
-                }
-                score = warp::reduce_sum_f32(score) * 0.0625;
-
-                if score > maximum {
-                    let old_scale = fast_exp(maximum - score);
-                    denominator = denominator * old_scale + 1.0;
-                    maximum = score;
-                    element = 0;
-                    while element < VALUES_PER_LANE {
-                        accumulator[element] = float::fma_rn_f32(
-                            1.0,
-                            value[element],
-                            accumulator[element] * old_scale,
-                        );
-                        element += 1;
-                    }
-                } else {
-                    let weight = fast_exp(score - maximum);
-                    denominator += weight;
-                    element = 0;
-                    while element < VALUES_PER_LANE {
-                        accumulator[element] =
-                            float::fma_rn_f32(weight, value[element], accumulator[element]);
-                        element += 1;
-                    }
-                }
-            }
-            position += 1;
-        }
-        thread::sync_threads();
-        tile_position += tile_positions;
-    }
-
-    if lane == 0 {
-        unsafe {
-            *partials.add(partial_base) = maximum;
-            *partials.add(partial_base + 1) = denominator;
-        }
-    }
-    let mut element = 0usize;
-    while element < VALUES_PER_LANE {
-        unsafe { *partials.add(partial_base + 2 + dimension + element) = accumulator[element] };
         element += 1;
     }
 }

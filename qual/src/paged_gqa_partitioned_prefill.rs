@@ -1,6 +1,8 @@
 //! Deep-context qualification for partitioned T=128 paged GQA.
 
-use crate::fp8_projection_oracle::{BYTE_SENTINEL, F32_SENTINEL_BITS};
+use crate::fp8_projection_oracle::{
+    BYTE_SENTINEL, F32_SENTINEL_BITS, decode_e4m3fn, encode_e4m3fn, f16_to_f32, f32_to_f16,
+};
 use crate::{DeviceBenchmarkError, device_benchmark};
 use std::collections::BTreeSet;
 use tuisko_gpu::{
@@ -129,6 +131,24 @@ impl PrefixHistograms {
         }
         counts
     }
+}
+
+fn flash_partition_interval(
+    token: usize,
+    lengths: &[u32],
+    partitions: usize,
+    partition: usize,
+) -> (usize, usize) {
+    let key_tile = if partitions == 8 { 64 } else { 32 };
+    let first_token = token / 32 * 32;
+    let group_length = lengths[first_token + 31] as usize;
+    let key_tiles = group_length.div_ceil(key_tile);
+    let tiles_per_partition = key_tiles.div_ceil(partitions);
+    let begin = partition * tiles_per_partition * key_tile;
+    let end = ((partition + 1) * tiles_per_partition * key_tile)
+        .min(group_length)
+        .min(lengths[token] as usize);
+    (begin, end)
 }
 
 /// Qualifies P=8 and P=16 eager/graph routes, including their full FP32 seams.
@@ -369,13 +389,10 @@ fn oracle(
     let mut partials = vec![f32::from_bits(F32_SENTINEL_BITS); PARTIAL_FLOATS];
     let mut output = vec![0.0f32; TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS];
     let histograms = prefix_histograms(context_tokens, lengths, partitions, fixture)?;
-    let scores = score_classes(fixture);
+    let scores = score_classes(fixture)?;
     let values = value_classes();
 
     for token in 0..TOKENS {
-        let first_token = token & !1;
-        let group_length = lengths[first_token + 1] as usize;
-        let per_partition = group_length.div_ceil(partitions);
         let length = lengths[token] as usize;
         for query_head in 0..Qwen38_27B::NUM_ATTENTION_HEADS {
             let kv_head = query_head / (Qwen38_27B::NUM_ATTENTION_HEADS / Qwen38_27B::NUM_KV_HEADS);
@@ -388,8 +405,7 @@ fn oracle(
             }
 
             for partition in 0..partitions {
-                let begin = partition * per_partition;
-                let end = (begin + per_partition).min(group_length).min(length);
+                let (begin, end) = flash_partition_interval(token, lengths, partitions, partition);
                 let counts = histograms.interval(kv_head, begin, end);
                 let state = represented_state(&counts, &scores[query_head], &values);
                 let base = ((token * Qwen38_27B::NUM_ATTENTION_HEADS + query_head) * partitions
@@ -419,14 +435,10 @@ fn prefix_histograms(
 ) -> Result<PrefixHistograms, PagedGqaPartitionedPrefillQualificationError> {
     let mut boundaries = BTreeSet::from([0usize, context_tokens]);
     for token in 0..TOKENS {
-        let first_token = token & !1;
-        let group_length = lengths[first_token + 1] as usize;
-        let per_partition = group_length.div_ceil(partitions);
         let length = lengths[token] as usize;
         boundaries.insert(length);
         for partition in 0..partitions {
-            let begin = partition * per_partition;
-            let end = (begin + per_partition).min(group_length).min(length);
+            let (begin, end) = flash_partition_interval(token, lengths, partitions, partition);
             if begin < end {
                 boundaries.insert(begin);
                 boundaries.insert(end);
@@ -478,31 +490,49 @@ fn code_class(
         })
 }
 
-fn score_classes(fixture: &Fixture) -> [[f64; 8]; Qwen38_27B::NUM_ATTENTION_HEADS] {
+fn score_classes(
+    fixture: &Fixture,
+) -> Result<[[f64; 8]; Qwen38_27B::NUM_ATTENTION_HEADS], PagedGqaPartitionedPrefillQualificationError>
+{
     let mut scores = [[0.0f64; 8]; Qwen38_27B::NUM_ATTENTION_HEADS];
     for (query_head, head_scores) in scores.iter_mut().enumerate() {
         let query_base = query_head * Qwen38_27B::HEAD_DIM;
+        let query = &fixture.query[query_base..query_base + Qwen38_27B::HEAD_DIM];
+        let maximum = query
+            .iter()
+            .fold(0.0f32, |current, value| current.max(value.abs()));
+        let scale = if maximum > 0.0 { maximum / 448.0 } else { 1.0 };
+        let represented_query = query
+            .iter()
+            .map(|&value| {
+                let code = encode_e4m3fn(value / scale)
+                    .map_err(PagedGqaPartitionedPrefillQualificationError::Mismatch)?;
+                decode_e4m3fn(code)
+                    .map(|represented| f64::from(represented * scale))
+                    .map_err(PagedGqaPartitionedPrefillQualificationError::Mismatch)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         for (class, score) in head_scores.iter_mut().enumerate() {
-            *score = fixture.query[query_base..query_base + Qwen38_27B::HEAD_DIM]
+            *score = represented_query
                 .iter()
                 .enumerate()
                 .map(|(dimension, &query)| {
-                    f64::from(query)
-                        * decode_e4m3(KEY_CODES[(class + dimension) & 7])
-                        * f64::from(KEY_SCALE)
+                    query * decode_e4m3(KEY_CODES[(class + dimension) & 7]) * f64::from(KEY_SCALE)
                 })
                 .sum::<f64>()
                 * 0.0625;
         }
     }
-    scores
+    Ok(scores)
 }
 
 fn value_classes() -> [[f64; Qwen38_27B::HEAD_DIM]; 8] {
     let mut values = [[0.0f64; Qwen38_27B::HEAD_DIM]; 8];
     for (class, class_values) in values.iter_mut().enumerate() {
         for (dimension, value) in class_values.iter_mut().enumerate() {
-            *value = decode_e4m3(VALUE_CODES[(class + dimension) & 7]) * f64::from(VALUE_SCALE);
+            let unrounded =
+                decode_e4m3(VALUE_CODES[(class + dimension) & 7]) * f64::from(VALUE_SCALE);
+            *value = f64::from(f16_to_f32(f32_to_f16(unrounded as f32)));
         }
     }
     values
@@ -527,10 +557,11 @@ fn represented_state(
     let mut value_weights = [0.0f64; 8];
     for key in 0..8 {
         let weight = (scores[key] - maximum).exp();
+        let represented_weight = f64::from(f16_to_f32(f32_to_f16(weight as f32)));
         for value in 0..8 {
             let count = f64::from(counts[key * 8 + value]);
             denominator += count * weight;
-            value_weights[value] += count * weight;
+            value_weights[value] += count * represented_weight;
         }
     }
     let mut numerator = [0.0f64; Qwen38_27B::HEAD_DIM];
@@ -715,9 +746,57 @@ fn verify_no_post_warmup_allocation(
 mod tests {
     use super::{
         LONG_CONTEXT, MAX_PARTITIONS, PARTIAL_FLOATS, PARTIAL_VALUES, SHORT_CONTEXT, TOKENS,
+        decode_e4m3fn, encode_e4m3fn, f16_to_f32, f32_to_f16, fixture, flash_partition_interval,
         layout, qualify_paged_gqa_partitioned_prefill,
     };
     use tuisko_kernels_sm120::{PAGED_GQA_PREFILL_PARTIAL_BYTES, paged_gqa_prefill_partitions};
+
+    #[test]
+    fn paged_gqa_suite_flash_partition_boundaries_follow_exact_query_groups_and_key_tiles() {
+        let fixture = fixture();
+
+        assert_eq!(
+            flash_partition_interval(0, &fixture.short_lengths, 8, 0),
+            (0, 64)
+        );
+        assert_eq!(
+            flash_partition_interval(0, &fixture.short_lengths, 8, 2),
+            (128, 130)
+        );
+        assert_eq!(
+            flash_partition_interval(31, &fixture.short_lengths, 8, 2),
+            (128, 161)
+        );
+        assert_eq!(
+            flash_partition_interval(31, &fixture.short_lengths, 8, 3),
+            (192, 161)
+        );
+
+        assert_eq!(
+            flash_partition_interval(0, &fixture.long_lengths, 16, 0),
+            (0, 2_048)
+        );
+        assert_eq!(
+            flash_partition_interval(0, &fixture.long_lengths, 16, 15),
+            (30_720, 32_642)
+        );
+        assert_eq!(
+            flash_partition_interval(31, &fixture.long_lengths, 16, 15),
+            (30_720, 32_673)
+        );
+    }
+
+    #[test]
+    fn paged_gqa_suite_flash_representation_codecs_pin_rounding() {
+        let scale = 0.5 / 448.0;
+
+        assert_eq!(encode_e4m3fn(-0.375 / scale).unwrap(), 0xfa);
+        assert_eq!(decode_e4m3fn(0xfa).unwrap() * scale, -0.357_142_87);
+        assert_eq!(f32_to_f16(1.0 + 2.0f32.powi(-11)), 0x3c00);
+        assert_eq!(f16_to_f32(0x3c01), 1.0 + 2.0f32.powi(-10));
+        assert_eq!(f32_to_f16(2.0f32.powi(-24)), 0x0001);
+        assert_eq!(f16_to_f32(0x0001), 2.0f32.powi(-24));
+    }
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]

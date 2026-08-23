@@ -5404,7 +5404,10 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         .filter(|entry| {
             entry
                 .name
-                .starts_with("paged_gqa_prefill_partitioned_exact_TID_")
+                .starts_with("paged_gqa_prefill_flash_p8_exact_TID_")
+                || entry
+                    .name
+                    .starts_with("paged_gqa_prefill_flash_p16_exact_TID_")
         })
         .collect::<Vec<_>>();
     let prefill_reductions = entries
@@ -5445,10 +5448,15 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
     for entry in &prefill_partials {
-        if !entry.body.contains(".reqntid 384, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+        let expected_ctas = if entry.name.contains("_p8_") { 1 } else { 2 };
+        if !entry.body.contains(".reqntid 256, 1, 1")
+            || !entry
+                .body
+                .contains(&format!(".minnctapersm {expected_ctas}"))
+        {
             return Err(format!(
-                "entry `{}` lost its 384-thread/two-CTA launch bounds",
-                entry.name
+                "entry `{}` lost its 256-thread/{expected_ctas}-CTA launch bounds",
+                entry.name,
             )
             .into());
         }
@@ -5520,7 +5528,15 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
 
         let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
-        for instruction in ["F2FP.F16.E4M3.UNPACK_B", "SHFL.BFLY", "MUFU.EX2", "LDGSTS"] {
+        for instruction in [
+            "F2FP.F16.E4M3.UNPACK_B",
+            "F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C",
+            "QMMA.16832.F32.E4M3.E4M3",
+            "HMMA.16816.F32",
+            "SHFL.BFLY",
+            "MUFU.EX2",
+            "LDGSTS",
+        ] {
             if !body.contains(instruction) {
                 return Err(
                     format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
@@ -5550,10 +5566,10 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
     if baseline.contains_key("prefill_shared_registers") {
         require_registers(&baseline, "prefill_shared_registers", &prefill_registers)?;
     }
-    if baseline.contains_key("prefill_partition_registers") {
+    if baseline.contains_key("prefill_flash_partition_registers") {
         require_registers(
             &baseline,
-            "prefill_partition_registers",
+            "prefill_flash_partition_registers",
             &prefill_partial_registers,
         )?;
     }
@@ -5567,7 +5583,7 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "paged GQA gate passed: 8 decode + 3 shared + 2 partition + 2 reduction entries, REG {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/SHFL/EX2/LDGSTS present",
+        "paged GQA gate passed: 8 decode + 3 shared + 2 flash partition + 2 reduction entries, REG {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, FP8-QMMA/F16-HMMA/E4M3/SHFL/EX2/LDGSTS present",
         registers, prefill_registers, prefill_partial_registers, prefill_reduce_registers, shared
     );
     Ok(())

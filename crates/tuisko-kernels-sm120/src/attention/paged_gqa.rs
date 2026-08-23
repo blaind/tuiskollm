@@ -2,9 +2,10 @@
 
 use crate::Sm120Arch;
 use crate::device::paged_gqa::{
+    FLASH_PREFILL_P8_SHARED_BYTES, FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS,
     PREFILL_PARTIAL_VALUES, PREFILL_SHARED_BYTES, PREFILL_THREADS, paged_gqa,
-    paged_gqa_prefill_partitioned, paged_gqa_prefill_partitioned_reduce, paged_gqa_prefill_shared,
-    qwen35_paged_gqa_bf16,
+    paged_gqa_prefill_flash_partitioned, paged_gqa_prefill_partitioned_reduce,
+    paged_gqa_prefill_shared, qwen35_paged_gqa_bf16,
 };
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
@@ -14,6 +15,8 @@ use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 const MAX_BATCH: usize = 8;
 const THREADS: u32 = 32;
 const PREFILL_SHARED_BYTES_U32: u32 = PREFILL_SHARED_BYTES as u32;
+const FLASH_PREFILL_P8_SHARED_BYTES_U32: u32 = FLASH_PREFILL_P8_SHARED_BYTES as u32;
+const FLASH_PREFILL_P16_SHARED_BYTES_U32: u32 = FLASH_PREFILL_P16_SHARED_BYTES as u32;
 /// First context length routed to the sixteen-partition T=128 schedule.
 pub const PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT: usize = 32_769;
 /// Largest admitted T=128 prefill context.
@@ -200,18 +203,19 @@ mod kernels {
         }
     }
 
-    /// Produces FP32 online-softmax states for one exact T=128 partition route.
+    /// Produces FP32 online-softmax states for the P8/K64 T=128 flash route.
     #[kernel]
-    #[launch_bounds(384, 2)]
+    #[launch_bounds(256, 1)]
     #[allow(clippy::too_many_arguments)]
     #[launch_contract(
         domain = 1,
         coordinates = u32,
-        block = (384, 1, 1),
-        dynamic_shared = 32768,
+        block = (256, 1, 1),
+        dynamic_shared = 78336,
+        dynamic_shared_alignment = 16,
         min_compute_capability = (12, 0),
     )]
-    pub fn paged_gqa_prefill_partitioned_exact<A: Arch, const PARTITIONS: usize>(
+    pub fn paged_gqa_prefill_flash_p8_exact<A: Arch>(
         query: *const f32,
         key_pages: *const u8,
         value_pages: *const u8,
@@ -219,15 +223,15 @@ mod kernels {
         table_rows: *const u32,
         table_stride: u32,
         lengths: *const u32,
+        partitions: u32,
         partials: *mut f32,
         key_scale: f32,
         value_scale: f32,
     ) {
-        // Eight partitions expose 2,048 CTAs below 32,769 positions; sixteen
-        // expose 4,096 above it. Each CTA retains the two-token/six-head GQA
-        // reuse topology and a 32-KiB K/V tile while bounding serial prefix work.
+        // K=64 halves the tile loop below 32,769 positions. Its 78,336-byte
+        // single buffer permits one CTA/SM; P8 exposes 768 independent CTAs.
         unsafe {
-            paged_gqa_prefill_partitioned::<A, 128, PARTITIONS>(
+            paged_gqa_prefill_flash_partitioned::<A, 64>(
                 query,
                 key_pages,
                 value_pages,
@@ -235,6 +239,51 @@ mod kernels {
                 table_rows,
                 table_stride,
                 lengths,
+                partitions,
+                partials,
+                key_scale,
+                value_scale,
+            );
+        }
+    }
+
+    /// Produces FP32 online-softmax states for the P16/K32 T=128 flash route.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 43520,
+        dynamic_shared_alignment = 16,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn paged_gqa_prefill_flash_p16_exact<A: Arch>(
+        query: *const f32,
+        key_pages: *const u8,
+        value_pages: *const u8,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        lengths: *const u32,
+        partitions: u32,
+        partials: *mut f32,
+        key_scale: f32,
+        value_scale: f32,
+    ) {
+        // K=32 keeps two CTAs resident at deep contexts. P16 exposes 1,536
+        // independent CTAs without the occupancy loss of a second buffer.
+        unsafe {
+            paged_gqa_prefill_flash_partitioned::<A, 32>(
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                partitions,
                 partials,
                 key_scale,
                 value_scale,
@@ -417,38 +466,35 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
     }
 }
 
-struct PreparedPartitionedPrefillRoute<A: Arch, const PARTITIONS: usize> {
-    partial:
-        PreparedLaunch<kernels::__paged_gqa_prefill_partitioned_exact_CudaKernel<A, PARTITIONS>>,
-    reduce: PreparedLaunch<
-        kernels::__paged_gqa_prefill_partitioned_reduce_exact_CudaKernel<A, PARTITIONS>,
-    >,
+struct PreparedPartitionedPrefillP8<A: Arch> {
+    partial: PreparedLaunch<kernels::__paged_gqa_prefill_flash_p8_exact_CudaKernel<A>>,
+    reduce: PreparedLaunch<kernels::__paged_gqa_prefill_partitioned_reduce_exact_CudaKernel<A, 8>>,
 }
 
-impl<A: Arch, const PARTITIONS: usize> PreparedPartitionedPrefillRoute<A, PARTITIONS> {
+impl<A: Arch> PreparedPartitionedPrefillP8<A> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let partial_blocks = u32::try_from(128 / 2 * A::NUM_KV_HEADS * PARTITIONS)
-            .map_err(|_| GpuError::invalid_launch("partitioned paged GQA grid exceeds u32"))?;
+        let partial_blocks = u32::try_from(128 / 32 * A::NUM_ATTENTION_HEADS * 8)
+            .map_err(|_| GpuError::invalid_launch("P8 flash paged GQA grid exceeds u32"))?;
         let reduce_blocks = u32::try_from(128 * A::NUM_ATTENTION_HEADS)
             .map_err(|_| GpuError::invalid_launch("paged GQA reduction grid exceeds u32"))?;
 
         Ok(Self {
             partial: module
-                .prepare_paged_gqa_prefill_partitioned_exact::<A, PARTITIONS>(LaunchConfig1D::new(
+                .prepare_paged_gqa_prefill_flash_p8_exact::<A>(LaunchConfig1D::new(
                     partial_blocks,
-                    PREFILL_THREADS as u32,
-                    PREFILL_SHARED_BYTES_U32,
+                    FLASH_PREFILL_THREADS as u32,
+                    FLASH_PREFILL_P8_SHARED_BYTES_U32,
                 ))
                 .map_err(|source| {
-                    GpuError::launch("preparing partitioned paged GQA prefill", source)
+                    GpuError::launch("preparing P8 flash paged GQA prefill", source)
                 })?,
             reduce: module
-                .prepare_paged_gqa_prefill_partitioned_reduce_exact::<A, PARTITIONS>(
-                    LaunchConfig1D::new(reduce_blocks, THREADS, 0),
-                )
-                .map_err(|source| {
-                    GpuError::launch("preparing partitioned paged GQA reduction", source)
-                })?,
+                .prepare_paged_gqa_prefill_partitioned_reduce_exact::<A, 8>(LaunchConfig1D::new(
+                    reduce_blocks,
+                    THREADS,
+                    0,
+                ))
+                .map_err(|source| GpuError::launch("preparing P8 paged GQA reduction", source))?,
         })
     }
 
@@ -470,7 +516,7 @@ impl<A: Arch, const PARTITIONS: usize> PreparedPartitionedPrefillRoute<A, PARTIT
         value_scale: f32,
     ) -> GpuResult<()> {
         module
-            .paged_gqa_prefill_partitioned_exact::<A, PARTITIONS>(
+            .paged_gqa_prefill_flash_p8_exact::<A>(
                 stream,
                 &self.partial,
                 query,
@@ -480,21 +526,97 @@ impl<A: Arch, const PARTITIONS: usize> PreparedPartitionedPrefillRoute<A, PARTIT
                 table_rows,
                 table_stride,
                 lengths,
+                8,
                 partials,
                 key_scale,
                 value_scale,
             )
-            .map_err(|source| {
-                GpuError::launch("launching partitioned paged GQA prefill", source)
-            })?;
+            .map_err(|source| GpuError::launch("launching P8 flash paged GQA prefill", source))?;
         module
-            .paged_gqa_prefill_partitioned_reduce_exact::<A, PARTITIONS>(
+            .paged_gqa_prefill_partitioned_reduce_exact::<A, 8>(
                 stream,
                 &self.reduce,
                 partials,
                 output,
             )
-            .map_err(|source| GpuError::launch("launching partitioned paged GQA reduction", source))
+            .map_err(|source| GpuError::launch("launching P8 paged GQA reduction", source))
+    }
+}
+
+struct PreparedPartitionedPrefillP16<A: Arch> {
+    partial: PreparedLaunch<kernels::__paged_gqa_prefill_flash_p16_exact_CudaKernel<A>>,
+    reduce: PreparedLaunch<kernels::__paged_gqa_prefill_partitioned_reduce_exact_CudaKernel<A, 16>>,
+}
+
+impl<A: Arch> PreparedPartitionedPrefillP16<A> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let partial_blocks = u32::try_from(128 / 32 * A::NUM_ATTENTION_HEADS * 16)
+            .map_err(|_| GpuError::invalid_launch("P16 flash paged GQA grid exceeds u32"))?;
+        let reduce_blocks = u32::try_from(128 * A::NUM_ATTENTION_HEADS)
+            .map_err(|_| GpuError::invalid_launch("paged GQA reduction grid exceeds u32"))?;
+
+        Ok(Self {
+            partial: module
+                .prepare_paged_gqa_prefill_flash_p16_exact::<A>(LaunchConfig1D::new(
+                    partial_blocks,
+                    FLASH_PREFILL_THREADS as u32,
+                    FLASH_PREFILL_P16_SHARED_BYTES_U32,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing P16 flash paged GQA prefill", source)
+                })?,
+            reduce: module
+                .prepare_paged_gqa_prefill_partitioned_reduce_exact::<A, 16>(LaunchConfig1D::new(
+                    reduce_blocks,
+                    THREADS,
+                    0,
+                ))
+                .map_err(|source| GpuError::launch("preparing P16 paged GQA reduction", source))?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        query: *const f32,
+        key_pages: *const u8,
+        value_pages: *const u8,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        lengths: *const u32,
+        partials: *mut f32,
+        output: *mut f32,
+        key_scale: f32,
+        value_scale: f32,
+    ) -> GpuResult<()> {
+        module
+            .paged_gqa_prefill_flash_p16_exact::<A>(
+                stream,
+                &self.partial,
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                16,
+                partials,
+                key_scale,
+                value_scale,
+            )
+            .map_err(|source| GpuError::launch("launching P16 flash paged GQA prefill", source))?;
+        module
+            .paged_gqa_prefill_partitioned_reduce_exact::<A, 16>(
+                stream,
+                &self.reduce,
+                partials,
+                output,
+            )
+            .map_err(|source| GpuError::launch("launching P16 paged GQA reduction", source))
     }
 }
 
@@ -512,8 +634,8 @@ pub struct PagedGqaOp<A: Sm120Arch = Qwen38_27B> {
     t32: PreparedPrefillRoute<A, 32>,
     t64: PreparedPrefillRoute<A, 64>,
     t128: PreparedPrefillRoute<A, 128>,
-    p8: PreparedPartitionedPrefillRoute<A, 8>,
-    p16: PreparedPartitionedPrefillRoute<A, 16>,
+    p8: PreparedPartitionedPrefillP8<A>,
+    p16: PreparedPartitionedPrefillP16<A>,
 }
 
 impl<A: Sm120Arch> PagedGqaOp<A> {
@@ -537,8 +659,8 @@ impl<A: Sm120Arch> PagedGqaOp<A> {
             t32: PreparedPrefillRoute::prepare(&module)?,
             t64: PreparedPrefillRoute::prepare(&module)?,
             t128: PreparedPrefillRoute::prepare(&module)?,
-            p8: PreparedPartitionedPrefillRoute::prepare(&module)?,
-            p16: PreparedPartitionedPrefillRoute::prepare(&module)?,
+            p8: PreparedPartitionedPrefillP8::prepare(&module)?,
+            p16: PreparedPartitionedPrefillP16::prepare(&module)?,
             module,
         })
     }
@@ -885,9 +1007,9 @@ pub(crate) fn paged_gqa_ptx_names() -> Vec<&'static str> {
         kernels::paged_gqa_prefill_shared_exact_ptx_name::<Qwen38_27B, 32>(),
         kernels::paged_gqa_prefill_shared_exact_ptx_name::<Qwen38_27B, 64>(),
         kernels::paged_gqa_prefill_shared_exact_ptx_name::<Qwen38_27B, 128>(),
-        kernels::paged_gqa_prefill_partitioned_exact_ptx_name::<Qwen38_27B, 8>(),
+        kernels::paged_gqa_prefill_flash_p8_exact_ptx_name::<Qwen38_27B>(),
         kernels::paged_gqa_prefill_partitioned_reduce_exact_ptx_name::<Qwen38_27B, 8>(),
-        kernels::paged_gqa_prefill_partitioned_exact_ptx_name::<Qwen38_27B, 16>(),
+        kernels::paged_gqa_prefill_flash_p16_exact_ptx_name::<Qwen38_27B>(),
         kernels::paged_gqa_prefill_partitioned_reduce_exact_ptx_name::<Qwen38_27B, 16>(),
     ]
 }
@@ -909,6 +1031,7 @@ pub(crate) fn qwen35_paged_gqa_ptx_names() -> [&'static str; MAX_BATCH] {
 #[cfg(test)]
 mod tests {
     use super::{
+        FLASH_PREFILL_P8_SHARED_BYTES, FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS,
         PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PAGED_GQA_PREFILL_PARTIAL_BYTES,
         PREFILL_SHARED_BYTES, PREFILL_THREADS, THREADS, admitted_batch,
         paged_gqa_prefill_partitions, paged_gqa_ptx_names, qwen35_paged_gqa_ptx_names,
@@ -932,6 +1055,9 @@ mod tests {
         assert_eq!(unique.len(), names.len());
         assert_eq!(PREFILL_THREADS, 384);
         assert_eq!(PREFILL_SHARED_BYTES, 32_768);
+        assert_eq!(FLASH_PREFILL_THREADS, 256);
+        assert_eq!(FLASH_PREFILL_P8_SHARED_BYTES, 78_336);
+        assert_eq!(FLASH_PREFILL_P16_SHARED_BYTES, 43_520);
         assert_eq!(PAGED_GQA_PREFILL_PARTIAL_BYTES, 50_724_864);
 
         let qwen35 = qwen35_paged_gqa_ptx_names();
