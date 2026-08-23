@@ -8,8 +8,9 @@ use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 // Compact batching owns one compiled route for every B=1..8.
 const MAX_BATCH: usize = 8;
-// Qualified 512-thread reduction: 16 warps, with five Qwen3.8 or four Qwen3.5
-// packed BF16 pairs per thread and no tail in either exact hidden width.
+// At 2,197 MHz the 512-thread Qwen3.5 B=1 path measures 2.283/2.572 us
+// plain/fused. Its 2,048 packed pairs map to four per thread versus five for
+// Qwen3.8; retaining the 16-warp reduction preserves the qualified topology.
 const WARPS: usize = 16;
 const THREADS: u32 = (WARPS * 32) as u32;
 
