@@ -131,6 +131,8 @@ mod paged_gqa_partitioned_prefill;
 #[cfg(feature = "device")]
 mod paged_gqa_prefill;
 #[cfg(feature = "device")]
+mod qwen35_bf16_lm_head;
+#[cfg(feature = "device")]
 mod qwen35_full_attention_layer;
 #[cfg(feature = "device")]
 mod qwen35_full_attention_layer_benchmark;
@@ -383,6 +385,10 @@ pub use paged_gqa_partitioned_prefill::{
 #[cfg(feature = "device")]
 pub use paged_gqa_prefill::{
     PagedGqaPrefillQualification, PagedGqaPrefillQualificationError, qualify_paged_gqa_prefill,
+};
+#[cfg(feature = "device")]
+pub use qwen35_bf16_lm_head::{
+    Qwen35Bf16LmHeadQualification, Qwen35Bf16LmHeadQualificationError, qualify_qwen35_bf16_lm_head,
 };
 #[cfg(feature = "device")]
 pub use qwen35_full_attention_layer::{

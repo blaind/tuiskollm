@@ -2,6 +2,7 @@
 
 mod arch;
 mod attention;
+mod bf16_lm_head;
 mod device;
 mod fp8;
 mod gdn;
@@ -29,6 +30,7 @@ pub use attention::{
     Qwen35AttentionQkPrepareOp, Qwen35Nvfp4AttentionOutputOp, Qwen35Nvfp4GdnOutputOp,
     Qwen35PagedGqaOp, paged_gqa_prefill_partitions,
 };
+pub use bf16_lm_head::Qwen35Bf16LmHeadOp;
 pub use fp8::{
     DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps,
     FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp, LmHeadOp,
