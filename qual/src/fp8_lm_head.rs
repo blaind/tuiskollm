@@ -102,8 +102,12 @@ pub fn qualify_fp8_lm_head() -> Result<Fp8LmHeadQualification, Fp8LmHeadQualific
         reset_outputs(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
         let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
-        graph.launch(&stream)?;
-        graph.launch(&stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
         let replay = read_observed(&arena, &stream, regions)?;
         verify_replay(batch, &eager, &replay, &mut report)?;
 

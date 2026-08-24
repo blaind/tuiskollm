@@ -103,8 +103,12 @@ impl Session {
     fn warm(&self, launches: u64) -> GpuResult<()> {
         for _ in 0..launches {
             for route in &self.routes {
-                route.preparation.launch(&self.stream)?;
-                route.leaf.launch(&self.stream)?;
+                // SAFETY: this Session owns both these route graphs and everything they
+                // captured (arena, maps, op modules), dropping the graphs first.
+                unsafe { route.preparation.launch(&self.stream) }?;
+                // SAFETY: this Session owns both these route graphs and everything they
+                // captured (arena, maps, op modules), dropping the graphs first.
+                unsafe { route.leaf.launch(&self.stream) }?;
             }
         }
         self.stream.synchronize().map_err(GpuError::from)

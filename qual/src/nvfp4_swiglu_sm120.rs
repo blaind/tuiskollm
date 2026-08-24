@@ -171,8 +171,12 @@ pub fn qualify_nvfp4_swiglu() -> Result<Nvfp4SwiGluQualification, Nvfp4SwiGluQua
         let graph = CudaGraph::capture(&stream, || {
             launch_production(&op, &arena, &stream, regions, rows)
         })?;
-        graph.launch(&stream)?;
-        graph.launch(&stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
         let replay = read_observed(&arena, &stream, regions)?;
         verify_replay(rows, schedule, &eager, &replay, &mut report)?;
         verify_immutable(&arena, &stream, regions, &fixture, &mut report)?;
@@ -688,8 +692,12 @@ fn qualify_a16_b1(
     reset_observed(arena, stream, regions)?;
     stream.synchronize().map_err(GpuError::from)?;
     let graph = CudaGraph::capture(stream, || launch_a16_b1(op, arena, stream, regions))?;
-    graph.launch(stream)?;
-    graph.launch(stream)?;
+    // SAFETY: every allocation this graph captured is owned by this scope or
+    // its caller and outlives the replays and the synchronize that follows.
+    unsafe { graph.launch(stream) }?;
+    // SAFETY: every allocation this graph captured is owned by this scope or
+    // its caller and outlives the replays and the synchronize that follows.
+    unsafe { graph.launch(stream) }?;
     let replay = read_observed(arena, stream, regions)?;
     verify_replay(1, Schedule::A16, &eager, &replay, report)?;
     verify_immutable(arena, stream, regions, fixture, report)?;
@@ -713,16 +721,24 @@ fn verify_no_post_warmup_allocation(
         .collect::<GpuResult<Vec<_>>>()?;
     let a16 = CudaGraph::capture(stream, || launch_a16_b1(op, arena, stream, regions))?;
     for graph in &graphs {
-        graph.launch(stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(stream) }?;
     }
-    a16.launch(stream)?;
+    // SAFETY: every allocation this graph captured is owned by this scope or
+    // its caller and outlives the replays and the synchronize that follows.
+    unsafe { a16.launch(stream) }?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
         for graph in graphs.iter().rev() {
-            graph.launch(stream)?;
+            // SAFETY: every allocation this graph captured is owned by this scope or
+            // its caller and outlives the replays and the synchronize that follows.
+            unsafe { graph.launch(stream) }?;
         }
-        a16.launch(stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { a16.launch(stream) }?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let after = device_memory_info(context)?;

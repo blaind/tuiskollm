@@ -142,12 +142,22 @@ impl Session {
     ) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
             for (route, stage) in self.routes.iter().zip(stage_graphs) {
-                stage.graph().launch(&self.stream)?;
-                self.program
-                    .qualification_target_mtp_segmented_verify_graph(route.route)?
-                    .launch(&self.stream)?;
-                stage.graph().launch(&self.stream)?;
-                route.verify_commit.launch(&self.stream)?;
+                // SAFETY: the stage graph borrows this Session's program, which
+                // owns every captured device allocation, and itself retains its
+                // pinned sources; all outlive the replays and the synchronize.
+                unsafe { stage.graph().launch(&self.stream) }?;
+                let verify = self
+                    .program
+                    .qualification_target_mtp_segmented_verify_graph(route.route)?;
+                // SAFETY: this Session's program owns the graph and every
+                // allocation it captured, outliving the replays and synchronize.
+                unsafe { verify.launch(&self.stream) }?;
+                // SAFETY: as for the stage replay above.
+                unsafe { stage.graph().launch(&self.stream) }?;
+                // SAFETY: this Session owns both the route graphs and the
+                // program whose allocations they captured, all alive across
+                // these replays and the synchronize below.
+                unsafe { route.verify_commit.launch(&self.stream) }?;
             }
         }
         self.stream.synchronize().map_err(GpuError::from)?;

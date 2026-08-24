@@ -125,8 +125,12 @@ pub fn qualify_qwen35_nvfp4_swiglu()
         let graph = CudaGraph::capture(&stream, || {
             launch(&op, &arena, &stream, regions, batch, schedule)
         })?;
-        graph.launch(&stream)?;
-        graph.launch(&stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
         let replay = read_observed(&arena, &stream, regions)?;
         verify_replay(batch, schedule, &eager, &replay, &mut report)?;
         require_stable_addresses(&arena, regions, stable_addresses, &format!("B={batch}"))?;
@@ -540,13 +544,17 @@ fn verify_no_post_warmup_allocation(
         })
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
-        graph.launch(stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(stream) }?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
         for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
-            graphs[batch - 1].launch(stream)?;
+            // SAFETY: every allocation this graph captured is owned by this scope or
+            // its caller and outlives the replays and the synchronize that follows.
+            unsafe { graphs[batch - 1].launch(stream) }?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;

@@ -104,17 +104,23 @@ pub fn qualify_gdn_state_snapshot()
     reset(&arena, &stream, regions)?;
     stream.synchronize().map_err(GpuError::from)?;
     let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions))?;
-    graph.launch(&stream)?;
+    // SAFETY: every allocation this graph captured is owned by this scope or
+    // its caller and outlives the replays and the synchronize that follows.
+    unsafe { graph.launch(&stream) }?;
     let replay_history = arena.copy_to_host(&stream, regions.scratch_history)?;
     let replay_state = arena.copy_to_host(&stream, regions.scratch_state)?;
     compare_words("graph history", &replay_history, &eager_history)?;
     compare_f32_bits("graph state", &replay_state, &eager_state)?;
 
-    graph.launch(&stream)?;
+    // SAFETY: every allocation this graph captured is owned by this scope or
+    // its caller and outlives the replays and the synchronize that follows.
+    unsafe { graph.launch(&stream) }?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(&context)?;
     for _ in 0..16 {
-        graph.launch(&stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let after = device_memory_info(&context)?;

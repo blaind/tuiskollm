@@ -168,8 +168,12 @@ pub fn qualify_fp8_swiglu() -> Result<Fp8SwiGluQualification, Fp8SwiGluQualifica
         let graph = CudaGraph::capture(&stream, || {
             launch(&op, &maps, &arena, &stream, regions, rows)
         })?;
-        graph.launch(&stream)?;
-        graph.launch(&stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
         let replay = read_observed(&arena, &stream, regions)?;
         verify_replay(rows, &eager, &replay, &mut report)?;
         verify_immutable(
@@ -553,13 +557,17 @@ fn verify_no_post_warmup_allocation(
         })?);
     }
     for graph in &graphs {
-        graph.launch(stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(stream) }?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
         for graph in graphs.iter().rev() {
-            graph.launch(stream)?;
+            // SAFETY: every allocation this graph captured is owned by this scope or
+            // its caller and outlives the replays and the synchronize that follows.
+            unsafe { graph.launch(stream) }?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;

@@ -530,21 +530,27 @@ impl MtpLayerProgram {
     /// Replays one complete draft route for exact `B=1..=8`.
     pub fn replay_draft(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
         require_batch(batch)?;
-        self.draft_graphs[batch - 1].launch(stream)?;
+        // SAFETY: this MtpLayerProgram owns every captured allocation (arena,
+        // op modules) for its whole life and drops the graphs first.
+        unsafe { self.draft_graphs[batch - 1].launch(stream) }?;
         Ok(())
     }
 
     /// Replays one prime-only cache append for exact `K=1..=4`.
     pub fn replay_prime(&self, stream: &CudaStream, tokens: usize) -> EngineResult<()> {
         require_realign(tokens)?;
-        self.prime_graphs[tokens - 1].launch(stream)?;
+        // SAFETY: this MtpLayerProgram owns every captured allocation (arena,
+        // op modules) for its whole life and drops the graphs first.
+        unsafe { self.prime_graphs[tokens - 1].launch(stream) }?;
         Ok(())
     }
 
     /// Replays a causal realignment with prime-only prefix and final full row.
     pub fn replay_realign(&self, stream: &CudaStream, tokens: usize) -> EngineResult<()> {
         require_realign(tokens)?;
-        self.realign_graphs[tokens - 1].launch(stream)?;
+        // SAFETY: this MtpLayerProgram owns every captured allocation (arena,
+        // op modules) for its whole life and drops the graphs first.
+        unsafe { self.realign_graphs[tokens - 1].launch(stream) }?;
         Ok(())
     }
 

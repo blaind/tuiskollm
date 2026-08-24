@@ -736,13 +736,16 @@ impl ResidentMtpProgram {
         stream: &CudaStream,
         route: ResidentMtpPromptRoute,
     ) -> EngineResult<()> {
-        self.graphs.prompt[prompt_index(route.rows).ok_or_else(|| {
+        let graph = &self.graphs.prompt[prompt_index(route.rows).ok_or_else(|| {
             EngineError::route(format!(
                 "resident MTP prompt route {} is not admitted",
                 route.rows
             ))
-        })?]
-        .launch(stream)?;
+        })?];
+        // SAFETY: this ResidentMtpProgram owns every captured allocation (local
+        // and target arenas, pinned stagers, op modules) for its whole life and
+        // drops the graphs first.
+        unsafe { graph.launch(stream) }?;
         Ok(())
     }
 
@@ -753,7 +756,10 @@ impl ResidentMtpProgram {
         route: ResidentMtpDraftRoute,
     ) -> EngineResult<()> {
         require_batch(route.batch)?;
-        self.graphs.draft[route.batch - 1].launch(stream)?;
+        // SAFETY: this ResidentMtpProgram owns every captured allocation (local
+        // and target arenas, pinned stagers, op modules) for its whole life and
+        // drops the graphs first.
+        unsafe { self.graphs.draft[route.batch - 1].launch(stream) }?;
         Ok(())
     }
 
@@ -764,7 +770,10 @@ impl ResidentMtpProgram {
         route: ResidentMtpDraftRoute,
     ) -> EngineResult<()> {
         require_batch(route.batch)?;
-        self.graphs.continue_draft[route.batch - 1].launch(stream)?;
+        // SAFETY: this ResidentMtpProgram owns every captured allocation (local
+        // and target arenas, pinned stagers, op modules) for its whole life and
+        // drops the graphs first.
+        unsafe { self.graphs.continue_draft[route.batch - 1].launch(stream) }?;
         Ok(())
     }
 
@@ -775,7 +784,10 @@ impl ResidentMtpProgram {
         route: ResidentMtpDraftRoute,
     ) -> EngineResult<()> {
         require_batch(route.batch)?;
-        self.graphs.staged_continue_draft[route.batch - 1].launch(stream)?;
+        // SAFETY: this ResidentMtpProgram owns every captured allocation (local
+        // and target arenas, pinned stagers, op modules) for its whole life and
+        // drops the graphs first.
+        unsafe { self.graphs.staged_continue_draft[route.batch - 1].launch(stream) }?;
         Ok(())
     }
 
@@ -786,7 +798,10 @@ impl ResidentMtpProgram {
         route: ResidentMtpRealignRoute,
     ) -> EngineResult<()> {
         require_realign(route.tokens)?;
-        self.graphs.prime[route.tokens - 1].launch(stream)?;
+        // SAFETY: this ResidentMtpProgram owns every captured allocation (local
+        // and target arenas, pinned stagers, op modules) for its whole life and
+        // drops the graphs first.
+        unsafe { self.graphs.prime[route.tokens - 1].launch(stream) }?;
         Ok(())
     }
 
@@ -797,7 +812,10 @@ impl ResidentMtpProgram {
         route: ResidentMtpRealignRoute,
     ) -> EngineResult<()> {
         require_realign(route.tokens)?;
-        self.graphs.realign[route.tokens - 1].launch(stream)?;
+        // SAFETY: this ResidentMtpProgram owns every captured allocation (local
+        // and target arenas, pinned stagers, op modules) for its whole life and
+        // drops the graphs first.
+        unsafe { self.graphs.realign[route.tokens - 1].launch(stream) }?;
         Ok(())
     }
 

@@ -187,10 +187,14 @@ impl PrefillSession {
     ) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
             for (index, route) in self.routes.iter().copied().enumerate() {
-                stage_graphs[index].graph().launch(&self.stream)?;
-                self.program
-                    .qualification_prefill_graph(route)?
-                    .launch(&self.stream)?;
+                // SAFETY: the stage graph borrows this Session's program, which
+                // owns every captured device allocation, and itself retains its
+                // pinned sources; both outlive the replays and the synchronize.
+                unsafe { stage_graphs[index].graph().launch(&self.stream) }?;
+                let graph = self.program.qualification_prefill_graph(route)?;
+                // SAFETY: this Session's program owns the graph and every
+                // allocation it captured, outliving the replay and synchronize.
+                unsafe { graph.launch(&self.stream) }?;
             }
         }
         self.stream.synchronize().map_err(GpuError::from)?;
@@ -337,10 +341,14 @@ impl Session {
                 if selected_batch_size.is_some_and(|selected| selected as usize != batch) {
                     continue;
                 }
-                embedding_graphs[batch - 1].graph().launch(&self.stream)?;
-                self.program
-                    .qualification_graph(self.routes[batch - 1])
-                    .launch(&self.stream)?;
+                // SAFETY: the stage graph borrows this Session's program, which
+                // owns every captured device allocation, and itself borrows its
+                // pinned source; both outlive the replays and the synchronize.
+                unsafe { embedding_graphs[batch - 1].graph().launch(&self.stream) }?;
+                let graph = self.program.qualification_graph(self.routes[batch - 1]);
+                // SAFETY: this Session's program owns the graph and every
+                // allocation it captured, outliving the replay and synchronize.
+                unsafe { graph.launch(&self.stream) }?;
             }
         }
         self.stream.synchronize().map_err(GpuError::from)?;
@@ -558,14 +566,17 @@ pub fn profile_resident_model(
         .debug_dot(graph_dot)?;
     profiler_start(&session._context)?;
     for _ in 0..captured_replays {
-        embedding_graphs[batch - 1]
-            .graph()
-            .launch(&session.stream)?;
+        // SAFETY: the stage graph borrows the session's program, which owns
+        // every captured device allocation, and itself borrows its pinned
+        // source; both outlive the replay and the synchronize that follows.
+        unsafe { embedding_graphs[batch - 1].graph().launch(&session.stream) }?;
         session.stream.synchronize().map_err(GpuError::from)?;
-        session
+        let graph = session
             .program
-            .qualification_graph(session.routes[batch - 1])
-            .launch(&session.stream)?;
+            .qualification_graph(session.routes[batch - 1]);
+        // SAFETY: the session's program owns the graph and every allocation it
+        // captured, outliving the replay and the synchronize that follows.
+        unsafe { graph.launch(&session.stream) }?;
         session.stream.synchronize().map_err(GpuError::from)?;
     }
     profiler_stop(&session._context)?;

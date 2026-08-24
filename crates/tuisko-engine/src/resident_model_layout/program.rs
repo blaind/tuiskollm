@@ -463,18 +463,31 @@ impl ResidentGraphs {
         }
     }
 
-    fn launch_target_segmented_verify(
+    /// Enqueues the direct graph or updated shared variant for one segmented route.
+    ///
+    /// # Safety
+    ///
+    /// This inventory does not own the allocations its recordings captured. The
+    /// caller must keep every one of them alive and unmoved until `stream`
+    /// completes the replay — the `ResidentModelProgram` holding this inventory
+    /// alongside those allocations is what provides that guarantee.
+    unsafe fn launch_target_segmented_verify(
         &self,
         stream: &CudaStream,
         route: ResidentMtpSegmentedVerifyRoute,
     ) -> GpuResult<()> {
         if let Some(graph) = self.select_direct_target_segmented_verify(route) {
-            return graph.launch(stream);
+            // SAFETY: the caller keeps every allocation this graph captured alive
+            // until the replay completes.
+            return unsafe { graph.launch(stream) };
         }
         match route.attention {
-            AttentionRoute::Long { index, .. } => self.target_segmented_verify_long
-                [route.tokens - 1][route.batch - 2]
-                .launch(stream, index),
+            // SAFETY: the caller keeps every allocation this variant's definitions
+            // captured alive until the replay completes.
+            AttentionRoute::Long { index, .. } => unsafe {
+                self.target_segmented_verify_long[route.tokens - 1][route.batch - 2]
+                    .launch(stream, index)
+            },
             AttentionRoute::Short => unreachable!("short segmented routes are direct graphs"),
         }
     }
@@ -1530,7 +1543,10 @@ impl ResidentModelProgram {
 
     /// Replays the immutable graph selected by the matching decode-state upload.
     pub fn replay(&self, stream: &CudaStream, route: ResidentDecodeRoute) -> EngineResult<()> {
-        self.graphs.select(route).launch(stream)?;
+        // SAFETY: this ResidentModelProgram owns every captured allocation
+        // (resident and KV arenas, TMA maps, op modules) for its whole life and
+        // drops the graphs first.
+        unsafe { self.graphs.select(route).launch(stream) }?;
 
         Ok(())
     }
@@ -1541,7 +1557,10 @@ impl ResidentModelProgram {
         stream: &CudaStream,
         route: ResidentPrefillRoute,
     ) -> EngineResult<()> {
-        self.graphs.select_prefill(route)?.launch(stream)?;
+        // SAFETY: this ResidentModelProgram owns every captured allocation
+        // (resident and KV arenas, TMA maps, op modules) for its whole life and
+        // drops the graphs first.
+        unsafe { self.graphs.select_prefill(route)?.launch(stream) }?;
         Ok(())
     }
 
@@ -1551,7 +1570,10 @@ impl ResidentModelProgram {
         stream: &CudaStream,
         route: ResidentMtpVerifyRoute,
     ) -> EngineResult<()> {
-        self.graphs.select_target_verify(route).launch(stream)?;
+        // SAFETY: this ResidentModelProgram owns every captured allocation
+        // (resident and KV arenas, TMA maps, op modules) for its whole life and
+        // drops the graphs first.
+        unsafe { self.graphs.select_target_verify(route).launch(stream) }?;
         Ok(())
     }
 
@@ -1561,7 +1583,10 @@ impl ResidentModelProgram {
         stream: &CudaStream,
         route: ResidentMtpSegmentedVerifyRoute,
     ) -> EngineResult<()> {
-        self.graphs.launch_target_segmented_verify(stream, route)?;
+        // SAFETY: this ResidentModelProgram owns every captured allocation
+        // (resident and KV arenas, TMA maps, op modules) for its whole life and
+        // drops the graph inventory first.
+        unsafe { self.graphs.launch_target_segmented_verify(stream, route) }?;
         Ok(())
     }
 
@@ -1578,9 +1603,11 @@ impl ResidentModelProgram {
                 route.tokens
             )));
         }
-        self.graphs
-            .select_target_commit(accepted_tokens)?
-            .launch(stream)?;
+        let graph = self.graphs.select_target_commit(accepted_tokens)?;
+        // SAFETY: this ResidentModelProgram owns every captured allocation
+        // (resident and KV arenas, TMA maps, op modules) for its whole life and
+        // drops the graphs first.
+        unsafe { graph.launch(stream) }?;
         Ok(())
     }
 

@@ -336,7 +336,9 @@ fn qualify_segmented_routes(
                 Some(&accepted),
                 1,
             )?;
-            graph.launch(stream).map_err(GpuError::from)?;
+            // SAFETY: the borrowed program, which owns every allocation this
+            // local graph captured, outlives the graph and this replay.
+            unsafe { graph.launch(stream) }.map_err(GpuError::from)?;
             let graph_commit = program
                 .qualification_target_mtp_segmented_observables(stream, graph_commit_route)?;
             compare_observables(

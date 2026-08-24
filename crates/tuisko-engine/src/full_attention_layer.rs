@@ -501,7 +501,9 @@ impl<A: Sm120Arch> FullAttentionLayerProgram<A> {
 
     /// Replays the immutable graph for one exact decode or prefill width.
     pub fn replay(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
-        self.graph(rows)?.launch(stream)?;
+        // SAFETY: this FullAttentionLayerProgram owns every captured allocation
+        // (arena, TMA maps, op modules) for its whole life and drops the graphs first.
+        unsafe { self.graph(rows)?.launch(stream) }?;
         Ok(())
     }
 

@@ -434,7 +434,9 @@ where
         reset_outputs(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
         let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, tokens))?;
-        graph.launch(&stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
         let replay = observe(&arena, &stream, regions)?;
         verify_replay(tokens, &eager, &replay, &mut report)?;
         verify_inputs(&arena, &stream, regions, &fixture, &mut report)?;
@@ -464,13 +466,17 @@ fn verify_no_post_warmup_allocation<O: QualifiedQkPrepareOp>(
         .map(|&tokens| CudaGraph::capture(stream, || launch(op, arena, stream, regions, tokens)))
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
-        graph.launch(stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(stream) }?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
         for graph in graphs.iter().rev() {
-            graph.launch(stream)?;
+            // SAFETY: every allocation this graph captured is owned by this scope or
+            // its caller and outlives the replays and the synchronize that follows.
+            unsafe { graph.launch(stream) }?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;

@@ -66,10 +66,13 @@ impl Session {
     fn warm(&self, launches: u64) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
             for route in &self.routes {
-                route.preparation.launch(&self.stream)?;
-                self.program
-                    .qualification_graph(route.rows)?
-                    .launch(&self.stream)?;
+                // SAFETY: this Session owns both the preparation graphs and the
+                // program whose arena they captured, dropping the graphs first.
+                unsafe { route.preparation.launch(&self.stream) }?;
+                let graph = self.program.qualification_graph(route.rows)?;
+                // SAFETY: this Session's program owns the graph and every
+                // allocation it captured, outliving the replay and synchronize.
+                unsafe { graph.launch(&self.stream) }?;
             }
         }
         self.stream.synchronize().map_err(GpuError::from)?;
