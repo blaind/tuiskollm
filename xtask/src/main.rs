@@ -128,6 +128,16 @@ const FULL_ATTENTION_LAYER_RESOURCE_BASELINES: &[&str] = &[
     FP8_SWIGLU_RESOURCE_BASELINE,
     FP8_DOWN_RESOURCE_BASELINE,
 ];
+const MTP_LAYER_RESOURCE_BASELINES: &[&str] = &[
+    RESIDUAL_NORM_RESOURCE_BASELINE,
+    MTP_BF16_FUSION_RESOURCE_BASELINE,
+    MTP_BF16_QKV_RESOURCE_BASELINE,
+    MTP_BF16_QK_PREPARE_RESOURCE_BASELINE,
+    MTP_BF16_PAGED_GQA_RESOURCE_BASELINE,
+    MTP_BF16_ATTENTION_OUTPUT_RESOURCE_BASELINE,
+    MTP_BF16_MLP_RESOURCE_BASELINE,
+    FP8_LM_HEAD_RESOURCE_BASELINE,
+];
 const QWEN35_FULL_ATTENTION_LAYER_RESOURCE_BASELINES: &[&str] = &[
     QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE,
     QWEN35_NVFP4_QKV_RESOURCE_BASELINE,
@@ -203,17 +213,19 @@ enum OptimizationSuite {
     DenseFp8Mlp,
     DenseFp8GdnLayer,
     FullAttentionLayer,
+    MtpLayer,
     TextEndpoint,
     ResidentModel,
     ResidentPrefill,
     ResidentLongContextModel,
 }
 
-const COMPOSED_PERFORMANCE_SUITES: [OptimizationSuite; 8] = [
+const COMPOSED_PERFORMANCE_SUITES: [OptimizationSuite; 9] = [
     OptimizationSuite::Nvfp4Mlp,
     OptimizationSuite::DenseFp8Mlp,
     OptimizationSuite::DenseFp8GdnLayer,
     OptimizationSuite::FullAttentionLayer,
+    OptimizationSuite::MtpLayer,
     OptimizationSuite::TextEndpoint,
     OptimizationSuite::ResidentModel,
     OptimizationSuite::ResidentPrefill,
@@ -410,6 +422,7 @@ impl OptimizationSuite {
             Self::DenseFp8Mlp => "dense-fp8-mlp",
             Self::DenseFp8GdnLayer => "dense-fp8-gdn-layer",
             Self::FullAttentionLayer => "full-attention-layer",
+            Self::MtpLayer => "mtp-layer",
             Self::TextEndpoint => "text-endpoint",
             Self::ResidentModel => "resident-model",
             Self::ResidentPrefill => "resident-prefill",
@@ -431,6 +444,7 @@ impl OptimizationSuite {
             Self::DenseFp8Mlp => DENSE_FP8_MLP_RESOURCE_BASELINES.to_vec(),
             Self::DenseFp8GdnLayer => DENSE_FP8_GDN_LAYER_RESOURCE_BASELINES.to_vec(),
             Self::FullAttentionLayer => FULL_ATTENTION_LAYER_RESOURCE_BASELINES.to_vec(),
+            Self::MtpLayer => MTP_LAYER_RESOURCE_BASELINES.to_vec(),
             Self::TextEndpoint => TEXT_ENDPOINT_RESOURCE_BASELINES.to_vec(),
             Self::ResidentModel | Self::ResidentPrefill | Self::ResidentLongContextModel => {
                 RESIDENT_MODEL_RESOURCE_BASELINES.to_vec()
@@ -445,6 +459,7 @@ impl OptimizationSuite {
             Self::DenseFp8Mlp => "qual/baselines/dense-fp8-mlp-sm120.json",
             Self::DenseFp8GdnLayer => "qual/baselines/dense-fp8-gdn-layer-sm120.json",
             Self::FullAttentionLayer => "qual/baselines/full-attention-layer-sm120.json",
+            Self::MtpLayer => "qual/baselines/mtp-layer-sm120.json",
             Self::TextEndpoint => "qual/baselines/text-endpoint-sm120.json",
             Self::ResidentModel => "qual/baselines/resident-model-sm120.json",
             Self::ResidentPrefill => "qual/baselines/resident-prefill-sm120.json",
@@ -466,6 +481,7 @@ impl OptimizationSuite {
             Self::DenseFp8Mlp => qualify_dense_fp8_mlp(root, &snapshot_arguments()?),
             Self::DenseFp8GdnLayer => qualify_dense_fp8_gdn_layer(root, &snapshot_arguments()?),
             Self::FullAttentionLayer => qualify_full_attention_layer(root, &snapshot_arguments()?),
+            Self::MtpLayer => qualify_mtp_layer(root, &snapshot_arguments()?),
             Self::TextEndpoint => qualify_text_endpoint(root, &snapshot_arguments()?),
             Self::ResidentModel | Self::ResidentPrefill | Self::ResidentLongContextModel => {
                 qualify_resident_model(root, &snapshot_arguments()?)
@@ -475,8 +491,8 @@ impl OptimizationSuite {
 
     fn dependency_cone(self) -> Vec<Self> {
         use OptimizationSuite::{
-            DenseFp8GdnLayer, DenseFp8Mlp, FullAttentionLayer, Nvfp4Mlp, ResidentLongContextModel,
-            ResidentModel, ResidentPrefill, TextEndpoint,
+            DenseFp8GdnLayer, DenseFp8Mlp, FullAttentionLayer, MtpLayer, Nvfp4Mlp,
+            ResidentLongContextModel, ResidentModel, ResidentPrefill, TextEndpoint,
         };
         use PerformanceSuite::{
             AttentionOutput, AttentionQkPrepare, Fp8Down, Fp8GdnInput, Fp8LmHead, Fp8Qkv,
@@ -486,7 +502,10 @@ impl OptimizationSuite {
         };
 
         let downstream = match self {
-            Self::ResidentModel | Self::ResidentPrefill | Self::ResidentLongContextModel => &[][..],
+            Self::MtpLayer
+            | Self::ResidentModel
+            | Self::ResidentPrefill
+            | Self::ResidentLongContextModel => &[][..],
             Self::Leaf(LongContextPagedGqa) => &[ResidentLongContextModel],
             Self::Leaf(
                 MtpBf16Fusion
@@ -495,14 +514,21 @@ impl OptimizationSuite {
                 | MtpBf16PagedGqa
                 | MtpBf16AttentionOutput
                 | MtpBf16Mlp,
-            ) => &[],
+            ) => &[MtpLayer],
             Self::Leaf(Nvfp4SwiGlu | Nvfp4Down) | Self::Nvfp4Mlp => &[
                 Nvfp4Mlp,
                 ResidentModel,
                 ResidentPrefill,
                 ResidentLongContextModel,
             ],
-            Self::Leaf(Fp8LmHead) | Self::TextEndpoint => &[
+            Self::Leaf(Fp8LmHead) => &[
+                MtpLayer,
+                TextEndpoint,
+                ResidentModel,
+                ResidentPrefill,
+                ResidentLongContextModel,
+            ],
+            Self::TextEndpoint => &[
                 TextEndpoint,
                 ResidentModel,
                 ResidentPrefill,
@@ -535,6 +561,7 @@ impl OptimizationSuite {
                 DenseFp8Mlp,
                 DenseFp8GdnLayer,
                 FullAttentionLayer,
+                MtpLayer,
                 TextEndpoint,
                 ResidentModel,
                 ResidentPrefill,
@@ -620,6 +647,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-dense-fp8-mlp") => qualify_dense_fp8_mlp(root, &remaining),
         Some("qualify-dense-fp8-gdn-layer") => qualify_dense_fp8_gdn_layer(root, &remaining),
         Some("qualify-full-attention-layer") => qualify_full_attention_layer(root, &remaining),
+        Some("qualify-mtp-layer") => qualify_mtp_layer(root, &remaining),
         Some("qualify-qwen35-full-attention-layer") => {
             qualify_qwen35_full_attention_layer(root, &remaining)
         }
@@ -669,6 +697,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-dense-fp8-mlp") => bench_dense_fp8_mlp(root, &remaining),
         Some("bench-dense-fp8-gdn-layer") => bench_dense_fp8_gdn_layer(root, &remaining),
         Some("bench-full-attention-layer") => bench_full_attention_layer(root, &remaining),
+        Some("bench-mtp-layer") => bench_mtp_layer(root, &remaining),
         Some("bench-qwen35-full-attention-layer") => {
             bench_qwen35_full_attention_layer(root, &remaining)
         }
@@ -2058,6 +2087,47 @@ fn qualify_full_attention_layer(
     gate_fp8_down(root)
 }
 
+fn qualify_mtp_layer(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-mtp-layer SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "mtp_layer_suite_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_mtp_layer(root)
+}
+
+pub(crate) fn gate_mtp_layer(root: &Path) -> Result<(), Box<dyn Error>> {
+    gate_residual_norm(root)?;
+    gate_mtp_bf16_fusion(root)?;
+    gate_mtp_bf16_qkv(root)?;
+    gate_mtp_bf16_qk_prepare(root)?;
+    gate_mtp_bf16_paged_gqa(root)?;
+    gate_mtp_bf16_attention_output(root)?;
+    gate_mtp_bf16_mlp(root)?;
+    gate_fp8_lm_head(root)
+}
+
 fn qualify_qwen35_full_attention_layer(
     root: &Path,
     arguments: &[std::ffi::OsString],
@@ -2771,6 +2841,34 @@ fn bench_full_attention_layer(
     run_visible(
         Command::new(executable)
             .arg("full-attention-layer")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_mtp_layer(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err("usage: cargo run -p xtask -- bench-mtp-layer SNAPSHOT [options]".into());
+    };
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = Vec::new();
+    for baseline in MTP_LAYER_RESOURCE_BASELINES {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("mtp-layer")
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
@@ -4294,6 +4392,15 @@ pub(crate) fn prepare_remote_full_attention_layer_benchmark(
             FP8_DOWN_RESOURCE_BASELINE,
         ],
     )
+}
+
+/// Locates the composed MTP-layer benchmark and binds every launched leaf resource.
+#[cfg(feature = "remote")]
+pub(crate) fn prepare_remote_mtp_layer_benchmark(
+    root: &Path,
+    gpu: gpu_target::GpuTarget,
+) -> Result<RemoteBenchmark, Box<dyn Error>> {
+    prepare_remote_benchmark_with_baselines(root, gpu, MTP_LAYER_RESOURCE_BASELINES)
 }
 
 /// Locates the complete resident-model benchmark and binds every launched leaf resource.
@@ -8303,11 +8410,12 @@ fn require_uniform_value(
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPOSED_PERFORMANCE_SUITES, OptimizationSuite, PERFORMANCE_SUITES, PerformanceSuite,
-        SM120_RESOURCE_BASELINES, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
-        parse_idle_sample, parse_performance_device_sample, parse_performance_iteration,
-        parse_resources, parse_rustc_identity, require_count, require_uniform_value,
-        resolve_target_output, sass_function_body,
+        COMPOSED_PERFORMANCE_SUITES, MTP_LAYER_RESOURCE_BASELINES, OptimizationSuite,
+        PERFORMANCE_SUITES, PerformanceSuite, SM120_RESOURCE_BASELINES, parse_compute_pids,
+        parse_cuda_toolkit_identity, parse_entries, parse_idle_sample,
+        parse_performance_device_sample, parse_performance_iteration, parse_resources,
+        parse_rustc_identity, require_count, require_uniform_value, resolve_target_output,
+        sass_function_body,
     };
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -8468,6 +8576,7 @@ mod tests {
                 "dense-fp8-mlp",
                 "dense-fp8-gdn-layer",
                 "full-attention-layer",
+                "mtp-layer",
                 "text-endpoint",
                 "resident-model",
                 "resident-prefill",
@@ -8521,6 +8630,18 @@ mod tests {
             cone,
             ["long-context-paged-gqa", "resident-long-context-model"]
         );
+
+        let cone = OptimizationSuite::parse("mtp-bf16-qkv")
+            .unwrap()
+            .dependency_cone()
+            .into_iter()
+            .map(OptimizationSuite::name)
+            .collect::<Vec<_>>();
+        assert_eq!(cone, ["mtp-bf16-qkv", "mtp-layer"]);
+
+        let mtp_layer = OptimizationSuite::parse("mtp-layer").unwrap();
+        assert_eq!(mtp_layer.resource_baselines(), MTP_LAYER_RESOURCE_BASELINES);
+        assert!(mtp_layer.requires_snapshot());
     }
 
     #[test]
