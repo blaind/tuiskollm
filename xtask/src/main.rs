@@ -36,6 +36,7 @@ const NVFP4_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/nvfp4-swiglu-sm120.
 const NVFP4_DOWN_RESOURCE_BASELINE: &str = "qual/baselines/nvfp4-down-sm120.txt";
 const GDN_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-prepare-sm120.txt";
 const GDN_RECURRENCE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-recurrence-sm120.txt";
+const GDN_STATE_SNAPSHOT_RESOURCE_BASELINE: &str = "qual/baselines/gdn-state-snapshot-sm120.txt";
 const GDN_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/gdn-output-sm120.txt";
 const ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/attention-qk-prepare-sm120.txt";
@@ -64,6 +65,7 @@ const RESIDENT_MODEL_RESOURCE_BASELINES: &[&str] = &[
     NVFP4_DOWN_RESOURCE_BASELINE,
     GDN_PREPARE_RESOURCE_BASELINE,
     GDN_RECURRENCE_RESOURCE_BASELINE,
+    GDN_STATE_SNAPSHOT_RESOURCE_BASELINE,
     GDN_OUTPUT_RESOURCE_BASELINE,
     ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     PAGED_GQA_RESOURCE_BASELINE,
@@ -86,6 +88,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE,
     GDN_PREPARE_RESOURCE_BASELINE,
     GDN_RECURRENCE_RESOURCE_BASELINE,
+    GDN_STATE_SNAPSHOT_RESOURCE_BASELINE,
     GDN_OUTPUT_RESOURCE_BASELINE,
     ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
@@ -648,6 +651,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-dense-fp8-gdn-layer") => qualify_dense_fp8_gdn_layer(root, &remaining),
         Some("qualify-full-attention-layer") => qualify_full_attention_layer(root, &remaining),
         Some("qualify-mtp-layer") => qualify_mtp_layer(root, &remaining),
+        Some("qualify-target-mtp-verify") => qualify_target_mtp_verify(root, &remaining),
         Some("qualify-qwen35-full-attention-layer") => {
             qualify_qwen35_full_attention_layer(root, &remaining)
         }
@@ -698,6 +702,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-dense-fp8-gdn-layer") => bench_dense_fp8_gdn_layer(root, &remaining),
         Some("bench-full-attention-layer") => bench_full_attention_layer(root, &remaining),
         Some("bench-mtp-layer") => bench_mtp_layer(root, &remaining),
+        Some("bench-target-mtp-verify") => bench_target_mtp_verify(root, &remaining),
         Some("bench-qwen35-full-attention-layer") => {
             bench_qwen35_full_attention_layer(root, &remaining)
         }
@@ -783,6 +788,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-mtp-bf16-qkv"
                     | "qualify-mtp-bf16-qk-prepare"
                     | "qualify-mtp-bf16-paged-gqa"
+                    | "qualify-target-mtp-verify"
                     | "gate-residual-norm"
                     | "gate-qwen35-residual-norm"
                     | "gate-qwen35-attention-qk-prepare"
@@ -993,6 +999,7 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_qwen35_nvfp4_attention_output(root)?;
     gate_gdn_prepare(root)?;
     gate_gdn_recurrence(root)?;
+    gate_gdn_state_snapshot(root)?;
     gate_gdn_output(root)?;
     gate_attention_qk_prepare(root)?;
     gate_qwen35_attention_qk_prepare(root)?;
@@ -2117,6 +2124,39 @@ fn qualify_mtp_layer(root: &Path, arguments: &[std::ffi::OsString]) -> Result<()
     gate_mtp_layer(root)
 }
 
+fn qualify_target_mtp_verify(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-target-mtp-verify SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "target_mtp_verify::tests::exact_target_verify_and_commit_match_source_oracles",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_resident_model_resources(root)
+}
+
 pub(crate) fn gate_mtp_layer(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_residual_norm(root)?;
     gate_mtp_bf16_fusion(root)?;
@@ -2298,6 +2338,7 @@ fn gate_resident_model_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_nvfp4_down(root)?;
     gate_gdn_prepare(root)?;
     gate_gdn_recurrence(root)?;
+    gate_gdn_state_snapshot(root)?;
     gate_gdn_output(root)?;
     gate_attention_qk_prepare(root)?;
     gate_paged_gqa(root)?;
@@ -2869,6 +2910,39 @@ fn bench_mtp_layer(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), 
     run_visible(
         Command::new(executable)
             .arg("mtp-layer")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_target_mtp_verify(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-target-mtp-verify SNAPSHOT [options]".into(),
+        );
+    };
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = Vec::new();
+    for baseline in RESIDENT_MODEL_RESOURCE_BASELINES {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("target-mtp-verify")
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
@@ -5979,9 +6053,17 @@ fn gate_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         .collect::<Vec<_>>();
     require_count("GDN control", control.len(), 8)?;
     require_count("GDN convolution", convolution.len(), 8)?;
-    require_count("GDN prefill control", prefill_control.len(), 4)?;
-    require_count("GDN prefill convolution", prefill_convolution.len(), 4)?;
-    require_count("GDN prefill history publication", prefill_history.len(), 4)?;
+    require_count("GDN causal/prefill control", prefill_control.len(), 8)?;
+    require_count(
+        "GDN causal/prefill convolution",
+        prefill_convolution.len(),
+        8,
+    )?;
+    require_count(
+        "GDN causal/prefill history publication",
+        prefill_history.len(),
+        8,
+    )?;
 
     for entry in control.iter().chain(&prefill_control) {
         if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
@@ -6106,7 +6188,7 @@ fn gate_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
     }
 
     println!(
-        "GDN prepare gate passed: 8 control + 8 convolution + 4 prefill control + 4 prefill convolution + 4 prefill history entries, REG {:?} / {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?} / {:?} / {:?}, SASS present",
+        "GDN prepare gate passed: 8 decode control + 8 decode convolution + 4 causal/4 prefill control + 4 causal/4 prefill convolution + 4 causal/4 prefill history entries, REG {:?} / {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?} / {:?} / {:?}, SASS present",
         control_registers,
         convolution_registers,
         prefill_control_registers,
@@ -6138,7 +6220,7 @@ fn gate_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
         .filter(|entry| entry.name.starts_with("gdn_recurrence_prefill_exact_TID_"))
         .collect::<Vec<_>>();
     require_count("GDN recurrence", recurrence.len(), 8)?;
-    require_count("GDN recurrence prefill", prefill.len(), 4)?;
+    require_count("GDN recurrence causal/prefill", prefill.len(), 8)?;
     for entry in recurrence.iter().chain(&prefill) {
         if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
@@ -6198,8 +6280,54 @@ fn gate_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
         )?;
     }
     println!(
-        "GDN recurrence gate passed: 8 decode + 4 prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}, SASS present",
+        "GDN recurrence gate passed: 8 decode + 4 causal + 4 prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}, SASS present",
         registers, prefill_registers, shared, prefill_shared
+    );
+    Ok(())
+}
+
+fn gate_gdn_state_snapshot(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(GDN_STATE_SNAPSHOT_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+    let ptx = fs::read_to_string(root.join(PTX))?;
+    let entries = parse_entries(&ptx);
+    let snapshots = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("gdn_state_snapshot_exact_TID_"))
+        .collect::<Vec<_>>();
+    require_count("GDN state snapshot", snapshots.len(), 1)?;
+    let entry = snapshots[0];
+    if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+        return Err(format!(
+            "entry `{}` lost its 256-thread/two-CTA launch bounds",
+            entry.name
+        )
+        .into());
+    }
+    if !entry.body.contains("ld.global.v2.b64") || !entry.body.contains("st.global.v2.b64") {
+        return Err(format!(
+            "entry `{}` lost its represented 16-byte load/store path",
+            entry.name
+        )
+        .into());
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resource = artifact
+        .resources
+        .get(entry.name)
+        .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+    require_spill_free(entry.name, resource)?;
+    require_registers(&baseline, "snapshot_registers", &[resource.registers])?;
+    require_uniform_value(&baseline, "snapshot_shared_bytes", &[resource.shared])?;
+    if sass_function_body(artifact.sass()?, entry.name).is_none() {
+        return Err(format!("cuobjdump omitted GDN snapshot SASS `{}`", entry.name).into());
+    }
+    println!(
+        "GDN state snapshot gate passed: 1 exact entry, REG [{}], STACK:0 LOCAL:0, SHARED [{}], vectorized PTX and SASS present",
+        resource.registers, resource.shared
     );
     Ok(())
 }
@@ -8546,6 +8674,7 @@ mod tests {
                 "qual/baselines/qwen35-nvfp4-attention-output-sm120.txt",
                 "qual/baselines/gdn-prepare-sm120.txt",
                 "qual/baselines/gdn-recurrence-sm120.txt",
+                "qual/baselines/gdn-state-snapshot-sm120.txt",
                 "qual/baselines/gdn-output-sm120.txt",
                 "qual/baselines/attention-qk-prepare-sm120.txt",
                 "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",

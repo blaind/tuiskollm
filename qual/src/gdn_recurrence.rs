@@ -12,6 +12,7 @@ use tuisko_model::{Arch, Qwen38_27B};
 const MAX_BATCH: usize = 8;
 const MAX_ROWS: usize = 1_024;
 const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, MAX_BATCH, 32, 64, 128, MAX_ROWS];
+const CAUSAL_ROUTES: [usize; 4] = [1, 2, 3, 4];
 const ALIGNMENT: usize = 256;
 const HEAD_DIM: usize = 128;
 const KEY_HEADS: usize = 16;
@@ -148,7 +149,7 @@ pub fn qualify_gdn_recurrence()
         reset(&arena, &stream, regions, &fixture)?;
         launch(&op, &arena, &stream, regions, rows)?;
         let eager = observe(&arena, &stream, regions)?;
-        verify_oracle(rows, &fixture, &eager, &mut report)?;
+        verify_oracle(rows, false, &fixture, &eager, &mut report)?;
 
         reset(&arena, &stream, regions, &fixture)?;
         stream.synchronize().map_err(GpuError::from)?;
@@ -169,9 +170,69 @@ pub fn qualify_gdn_recurrence()
         }
     }
 
+    for tokens in CAUSAL_ROUTES {
+        reset(&arena, &stream, regions, &fixture)?;
+        launch_causal(&op, &arena, &stream, regions, tokens)?;
+        let eager = observe(&arena, &stream, regions)?;
+        verify_oracle(tokens, true, &fixture, &eager, &mut report)?;
+        if tokens == 1 {
+            reset(&arena, &stream, regions, &fixture)?;
+            launch(&op, &arena, &stream, regions, 1)?;
+            let decode = observe(&arena, &stream, regions)?;
+            verify_causal_k1_decode_agreement(&eager, &decode)?;
+        }
+
+        reset(&arena, &stream, regions, &fixture)?;
+        stream.synchronize().map_err(GpuError::from)?;
+        let graph = CudaGraph::capture(&stream, || {
+            launch_causal(&op, &arena, &stream, regions, tokens)
+        })?;
+        graph.launch(&stream)?;
+        let replay = observe(&arena, &stream, regions)?;
+        verify_replay(tokens, &fixture, &eager, &replay, &mut report)?;
+
+        reset(&arena, &stream, regions, &fixture)?;
+        graph.launch(&stream)?;
+        let second_replay = observe(&arena, &stream, regions)?;
+        verify_replay(tokens, &fixture, &eager, &second_replay, &mut report)?;
+
+        if addresses(&arena, regions)? != stable_addresses {
+            return Err(GdnRecurrenceQualificationError::Mismatch(format!(
+                "device addresses changed while qualifying causal K={tokens}"
+            )));
+        }
+    }
+
     verify_no_post_warmup_allocation(&context, &op, &arena, &stream, regions, &fixture)?;
 
     Ok(report)
+}
+
+fn verify_causal_k1_decode_agreement(
+    causal: &Observed,
+    decode: &Observed,
+) -> Result<(), GdnRecurrenceQualificationError> {
+    if let Some(index) = causal
+        .state
+        .iter()
+        .zip(&decode.state)
+        .position(|(actual, expected)| actual.to_bits() != expected.to_bits())
+    {
+        return Err(GdnRecurrenceQualificationError::Mismatch(format!(
+            "causal K=1 state differs bit-exactly from decode B=1 at {index}"
+        )));
+    }
+    if let Some(index) = causal
+        .output
+        .iter()
+        .zip(&decode.output)
+        .position(|(actual, expected)| actual != expected)
+    {
+        return Err(GdnRecurrenceQualificationError::Mismatch(format!(
+            "causal K=1 output differs bit-exactly from decode B=1 at {index}"
+        )));
+    }
+    Ok(())
 }
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
@@ -304,6 +365,31 @@ fn launch(
     }
 }
 
+fn launch_causal(
+    op: &GdnRecurrenceOp,
+    arena: &DeviceArena,
+    stream: &tuisko_gpu::CudaStream,
+    regions: Regions,
+    tokens: usize,
+) -> GpuResult<()> {
+    // SAFETY: all exact causal rows share STATE_ROWS[0]; every plane covers
+    // K=4 and the selected state row is below eight.
+    unsafe {
+        op.launch_causal(
+            stream,
+            tokens,
+            arena.address(regions.qkv)?,
+            arena.address(regions.projected)?,
+            arena.address(regions.log_decay)?,
+            arena.address(regions.beta)?,
+            arena.address(regions.norm_weight)?,
+            arena.address(regions.state_rows)?,
+            arena.address(regions.state)?,
+            arena.address(regions.output)?,
+        )
+    }
+}
+
 fn observe(
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
@@ -321,7 +407,7 @@ fn observe(
     })
 }
 
-fn oracle(rows: usize, fixture: &Fixture) -> Oracle {
+fn oracle(rows: usize, causal: bool, fixture: &Fixture) -> Oracle {
     let mut state = fixture
         .state
         .iter()
@@ -329,7 +415,7 @@ fn oracle(rows: usize, fixture: &Fixture) -> Oracle {
         .collect::<Vec<_>>();
     let mut output = vec![0.0; rows * VALUE_WIDTH];
     for token in 0..rows {
-        let state_row = if rows <= MAX_BATCH {
+        let state_row = if !causal && rows <= MAX_BATCH {
             STATE_ROWS[token]
         } else {
             STATE_ROWS[0]
@@ -393,13 +479,18 @@ fn oracle(rows: usize, fixture: &Fixture) -> Oracle {
 
 fn verify_oracle(
     rows: usize,
+    causal: bool,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut GdnRecurrenceQualification,
 ) -> Result<(), GdnRecurrenceQualificationError> {
     verify_immutable(rows, fixture, observed)?;
-    let expected = oracle(rows, fixture);
-    let active_state_rows = if rows <= MAX_BATCH { rows } else { 1 };
+    let expected = oracle(rows, causal, fixture);
+    let active_state_rows = if !causal && rows <= MAX_BATCH {
+        rows
+    } else {
+        1
+    };
     for (index, (&actual, &expected)) in observed.state.iter().zip(&expected.state).enumerate() {
         let error = (f64::from(actual) - expected).abs() as f32;
         report.maximum_state_error = report.maximum_state_error.max(error);
@@ -409,7 +500,7 @@ fn verify_oracle(
             )));
         }
         let state_row = (index / STATE_PER_ROW) as u32;
-        let active = if rows <= MAX_BATCH {
+        let active = if !causal && rows <= MAX_BATCH {
             STATE_ROWS[..rows].contains(&state_row)
         } else {
             state_row == STATE_ROWS[0]
@@ -553,11 +644,17 @@ fn verify_no_post_warmup_allocation(
     regions: Regions,
     fixture: &Fixture,
 ) -> Result<(), GdnRecurrenceQualificationError> {
-    let mut graphs = Vec::with_capacity(EXACT_ROUTES.len());
+    let mut graphs = Vec::with_capacity(EXACT_ROUTES.len() + CAUSAL_ROUTES.len());
     for rows in EXACT_ROUTES {
         reset(arena, stream, regions, fixture)?;
         graphs.push(CudaGraph::capture(stream, || {
             launch(op, arena, stream, regions, rows)
+        })?);
+    }
+    for tokens in CAUSAL_ROUTES {
+        reset(arena, stream, regions, fixture)?;
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_causal(op, arena, stream, regions, tokens)
         })?);
     }
     for graph in &graphs {
@@ -584,8 +681,8 @@ fn verify_no_post_warmup_allocation(
 #[cfg(test)]
 mod tests {
     use super::{
-        EXACT_ROUTES, GdnRecurrenceQualificationError, MAX_BATCH, MAX_ROWS, STATE_PER_ROW,
-        VALUE_WIDTH, fixture, immutable_values, layout, qualify_gdn_recurrence,
+        CAUSAL_ROUTES, EXACT_ROUTES, GdnRecurrenceQualificationError, MAX_BATCH, MAX_ROWS,
+        STATE_PER_ROW, VALUE_WIDTH, fixture, immutable_values, layout, qualify_gdn_recurrence,
     };
 
     #[test]
@@ -593,11 +690,13 @@ mod tests {
     fn exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), GdnRecurrenceQualificationError> {
         let report = qualify_gdn_recurrence()?;
-        let active_rows = EXACT_ROUTES.iter().sum::<usize>();
-        let active_state_rows = (1..=MAX_BATCH).sum::<usize>() + 4;
-        let inactive_state_rows = EXACT_ROUTES.len() * MAX_BATCH - active_state_rows;
+        let active_rows = EXACT_ROUTES.iter().chain(&CAUSAL_ROUTES).sum::<usize>();
+        let route_count = EXACT_ROUTES.len() + CAUSAL_ROUTES.len();
+        let active_state_rows = (1..=MAX_BATCH).sum::<usize>() + 4 + CAUSAL_ROUTES.len();
+        let inactive_state_rows = route_count * MAX_BATCH - active_state_rows;
         let inactive_output_rows = EXACT_ROUTES
             .iter()
+            .chain(&CAUSAL_ROUTES)
             .map(|rows| MAX_ROWS - rows)
             .sum::<usize>();
 
@@ -605,7 +704,7 @@ mod tests {
         assert_eq!(report.output_values, active_rows * VALUE_WIDTH);
         assert_eq!(
             report.graph_replay_values,
-            2 * (EXACT_ROUTES.len() * MAX_BATCH * STATE_PER_ROW + active_rows * VALUE_WIDTH)
+            2 * (route_count * MAX_BATCH * STATE_PER_ROW + active_rows * VALUE_WIDTH)
         );
         assert_eq!(
             report.inactive_values,
@@ -613,7 +712,7 @@ mod tests {
         );
         assert_eq!(
             report.immutable_values,
-            3 * EXACT_ROUTES.len() * immutable_values(&fixture())
+            3 * route_count * immutable_values(&fixture())
         );
         assert_eq!(
             report.arena_bytes,
@@ -628,6 +727,7 @@ mod tests {
     #[test]
     fn route_inventory_and_arena_accounting_are_exact() {
         assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
+        assert_eq!(CAUSAL_ROUTES, [1, 2, 3, 4]);
         let (layout, regions) = layout().unwrap();
         assert_eq!(layout.byte_len(), regions.payload_bytes() + 224);
     }
