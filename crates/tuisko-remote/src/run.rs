@@ -238,6 +238,7 @@ pub fn run_qualification(
         });
     }
     ssh.put_file(&options.executable, &format!("{REMOTE_WORKDIR}/qual"))?;
+    guard.failed = true;
 
     if options.source_snapshot {
         prepare_source_snapshot(&ssh, run_seconds)?;
@@ -330,6 +331,7 @@ pub fn run_benchmark(workspace_root: &Path, options: &BenchmarkOptions) -> Remot
         &options.executable,
         &format!("{REMOTE_WORKDIR}/bench-device"),
     )?;
+    guard.failed = true;
 
     if options.source_snapshot {
         prepare_source_snapshot(&ssh, run_seconds)?;
