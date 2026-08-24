@@ -182,8 +182,8 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT` | Check complete source layer-63 attention/MLP seams, represented KV cache, exact B=1..8 and T=32/64/128/1024 graphs, P4 macro partials, immutable tensor maps, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-full-attention-layer SNAPSHOT` | Check complete Qwen3.5 source layer-31 attention/MLP seams, BF16 KV cache, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-resident-model SNAPSHOT` | Check all 64 source routes, final source-backed formulas, dynamic page recycling/remapping and isolated reset, persistent state/cache, short plus six-bucket exact-B whole-model graphs, six exact prefill graph specializations across from-empty and nonzero-prefix metadata, independent long-attention seam formulas, stable device/host addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-resident-generation SNAPSHOT` | Check pinned vLLM next-token fixtures, every exact T=32/64/128/1024 native-prefill dispatch, frontend, greedy control, streaming decode, stable ownership, and zero post-warmup device allocation | terminal |
-| `cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT` | Compare compact mixed-length scheduling with sequential requests, including every B=1..8 decode route, all four native-prefill admissions, noncontiguous survivor replay, cancellation, exact retained-prefix reuse, divergence fallback, slot recycling, stable ownership, and zero post-warmup device allocation | terminal |
+| `cargo run -p xtask -- qualify-resident-generation SNAPSHOT` | Check pinned vLLM next-token fixtures, exact and composed T1024/T128/T64/T32 prefill plans through the P16 context band, scalar tail boundaries, frontend, greedy control, streaming decode, stable ownership, and zero post-warmup device allocation | terminal |
+| `cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT` | Compare compact mixed-length scheduling with sequential requests, including every B=1..8 decode route, exact and composed prefill plans, scalar tail boundaries, noncontiguous survivor replay, cancellation, exact retained-prefix reuse, divergence fallback, slot recycling, stable ownership, and zero post-warmup device allocation | terminal |
 | `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
 | `cargo run -p xtask -- bench-gdn-prepare` | Measure every exact control-plus-convolution graph after an untimed exact-history restore | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-recurrence` | Measure every exact stateful recurrence graph after an untimed exact-state restore | terminal or `--json PATH` |
@@ -719,8 +719,9 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
   residual norm, FP8-QKV, Q/K preparation/cache-append, shared early-context, partitioned deep-tail
   and macro paged-GQA, attention-output, dense-FP8 MLP, NVFP4 SwiGLU, NVFP4 down,
   full-attention-layer, FP8-GDN-input, GDN-prepare, GDN-recurrence, GDN-output, and dense-FP8
-  GDN-layer routes. Server admission uses native whole-model prefill only for fresh prompts at exact
-  `T=32,64,128,1024`; reused prefixes, tails, and other prompt lengths still prime through decode.
+  GDN-layer routes. Server admission composes only exact T1024/T128/T64/T32 whole-model graphs for
+  cold prompts and reused-prefix suffixes; an unmatched final span below 32 tokens primes through
+  exact B1 decode.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
 - There is no full-server TTFT, inter-token-latency, concurrency, prefix-reuse, or end-to-end MTP
   benchmark in this repository yet. Direct long-context operator and resident-model timing exists.

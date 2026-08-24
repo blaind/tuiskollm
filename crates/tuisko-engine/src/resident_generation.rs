@@ -15,7 +15,6 @@ const ROTARY_DIM: usize = 64;
 const ROTARY_PAIRS: usize = ROTARY_DIM / 2;
 const ROPE_THETA: f64 = 10_000_000.0;
 const LOGIT_BANK_ROWS: usize = 2 * MAX_BATCH;
-const NATIVE_PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1024];
 const MAX_NATIVE_PREFILL_TOKENS: usize = 1024;
 
 /// Concrete frontend, device program, stream, and host-logit owner for one active request.
@@ -52,7 +51,7 @@ pub struct ResidentBatchAdmission {
     pub prompt_tokens: usize,
     /// Prompt tokens restored from an exact retained device-state prefix.
     pub device_reused_tokens: usize,
-    /// Prompt tokens processed by one exact from-empty whole-model prefill graph.
+    /// Prompt tokens processed by exact whole-model prefill graphs.
     pub native_prefill_tokens: usize,
     /// Immediate output for a request with `max_new_tokens == 0`.
     pub completed: Option<GeneratedText>,
@@ -707,7 +706,7 @@ impl ResidentGenerationSession<'_> {
         self.control.generated_token_ids()
     }
 
-    /// Prompt tokens processed by one exact from-empty whole-model prefill graph.
+    /// Prompt tokens processed by exact whole-model prefill graphs.
     pub const fn native_prefill_tokens(&self) -> usize {
         self.native_prefill_tokens
     }
@@ -800,36 +799,21 @@ fn prime_prompt(
             "resident processed prefix exceeds its prompt",
         ));
     }
-    if native_prefill_tokens(token_ids.len(), processed_prefix).is_some() {
-        let rotary_values = token_ids
-            .len()
-            .checked_mul(ROTARY_PAIRS)
-            .ok_or_else(|| EngineError::generation("prompt rotary values overflow"))?;
-        let mut rope_cos = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
-        let mut rope_sin = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
-        for position in 0..token_ids.len() {
-            let position = u32::try_from(position).map_err(|_| {
-                EngineError::generation("prompt position exceeds the exact route width")
-            })?;
-            let (cosine, sine) = text_rope(position);
-            let begin = position as usize * ROTARY_PAIRS;
-            rope_cos[begin..begin + ROTARY_PAIRS].copy_from_slice(&cosine);
-            rope_sin[begin..begin + ROTARY_PAIRS].copy_from_slice(&sine);
-        }
-        program.stage_embeddings(stream, token_ids)?;
-        let route = program.load_prefill_state(
+
+    let mut cursor = processed_prefix;
+    while let Some(tokens) = next_native_prefill_tile(token_ids.len() - cursor) {
+        replay_prefill_tile(
+            program,
             stream,
-            token_ids.len(),
+            &token_ids[cursor..cursor + tokens],
             slot,
-            &rope_cos[..rotary_values],
-            &rope_sin[..rotary_values],
+            cursor,
         )?;
-        program.replay_prefill(stream, route)?;
-        return Ok(token_ids.len());
+        cursor += tokens;
     }
 
-    for (offset, &token) in token_ids[processed_prefix..].iter().enumerate() {
-        let position = processed_prefix + offset;
+    for (offset, &token) in token_ids[cursor..].iter().enumerate() {
+        let position = cursor + offset;
         replay_token(
             program,
             stream,
@@ -839,21 +823,60 @@ fn prime_prompt(
             })?,
         )?;
     }
-    Ok(0)
+    Ok(cursor - processed_prefix)
 }
 
-const fn native_prefill_tokens(prompt_tokens: usize, processed_prefix: usize) -> Option<usize> {
-    if processed_prefix != 0 {
-        return None;
+fn replay_prefill_tile(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+    token_ids: &[u32],
+    slot: usize,
+    first_position: usize,
+) -> EngineResult<()> {
+    let rotary_values = token_ids
+        .len()
+        .checked_mul(ROTARY_PAIRS)
+        .ok_or_else(|| EngineError::generation("prompt rotary values overflow"))?;
+    let mut rope_cos = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+    let mut rope_sin = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+    for token in 0..token_ids.len() {
+        let position = first_position
+            .checked_add(token)
+            .and_then(|position| u32::try_from(position).ok())
+            .ok_or_else(|| {
+                EngineError::generation("prompt position exceeds the exact route width")
+            })?;
+        let (cosine, sine) = text_rope(position);
+        let begin = token * ROTARY_PAIRS;
+        rope_cos[begin..begin + ROTARY_PAIRS].copy_from_slice(&cosine);
+        rope_sin[begin..begin + ROTARY_PAIRS].copy_from_slice(&sine);
     }
-    let mut index = 0;
-    while index < NATIVE_PREFILL_ROUTES.len() {
-        if NATIVE_PREFILL_ROUTES[index] == prompt_tokens {
-            return Some(prompt_tokens);
-        }
-        index += 1;
+    program.stage_embeddings(stream, token_ids)?;
+    let route = program.load_prefill_tile_state(
+        stream,
+        token_ids.len(),
+        slot,
+        first_position,
+        &rope_cos[..rotary_values],
+        &rope_sin[..rotary_values],
+    )?;
+    program.replay_prefill(stream, route)
+}
+
+const fn next_native_prefill_tile(remaining: usize) -> Option<usize> {
+    // Largest-first scheduling minimizes complete 64-layer graph replays while
+    // retaining only launch widths that have their own admitted device route.
+    if remaining >= 1024 {
+        Some(1024)
+    } else if remaining >= 128 {
+        Some(128)
+    } else if remaining >= 64 {
+        Some(64)
+    } else if remaining >= 32 {
+        Some(32)
+    } else {
+        None
     }
-    None
 }
 
 fn text_rope(position: u32) -> ([f32; ROTARY_PAIRS], [f32; ROTARY_PAIRS]) {
@@ -891,10 +914,7 @@ fn require_generation_capacity(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        NATIVE_PREFILL_ROUTES, ROTARY_PAIRS, native_prefill_tokens, require_generation_capacity,
-        text_rope,
-    };
+    use super::{ROTARY_PAIRS, next_native_prefill_tile, require_generation_capacity, text_rope};
     use crate::EngineErrorCode;
 
     #[test]
@@ -929,16 +949,32 @@ mod tests {
     }
 
     #[test]
-    fn native_prefill_inventory_is_exact_and_from_empty_only() {
-        for tokens in NATIVE_PREFILL_ROUTES {
-            assert_eq!(native_prefill_tokens(tokens, 0), Some(tokens));
-            assert_eq!(native_prefill_tokens(tokens, 1), None);
-            assert_eq!(native_prefill_tokens(tokens, tokens), None);
-            assert_eq!(native_prefill_tokens(tokens - 1, 0), None);
-            assert_eq!(native_prefill_tokens(tokens + 1, 0), None);
-        }
-        for tokens in [0, 1, 31, 33, 63, 65, 127, 129, 1023, 1025, 220_000] {
-            assert_eq!(native_prefill_tokens(tokens, 0), None);
+    fn native_prefill_plan_uses_only_the_exact_largest_first_inventory() {
+        for (tokens, expected) in [
+            (0, vec![]),
+            (31, vec![]),
+            (32, vec![32]),
+            (63, vec![32]),
+            (64, vec![64]),
+            (96, vec![64, 32]),
+            (127, vec![64, 32]),
+            (128, vec![128]),
+            (160, vec![128, 32]),
+            (1_023, vec![128, 128, 128, 128, 128, 128, 128, 64, 32]),
+            (1_024, vec![1_024]),
+            (1_055, vec![1_024]),
+            (1_056, vec![1_024, 32]),
+            (1_152, vec![1_024, 128]),
+            (2_208, vec![1_024, 1_024, 128, 32]),
+        ] {
+            let mut remaining = tokens;
+            let mut actual = Vec::new();
+            while let Some(tile) = next_native_prefill_tile(remaining) {
+                actual.push(tile);
+                remaining -= tile;
+            }
+            assert_eq!(actual, expected, "T={tokens}");
+            assert!(remaining < 32);
         }
     }
 }
