@@ -307,17 +307,7 @@ fn download_file(
         .append(true)
         .open(&incomplete)
         .map_err(|error| format!("opening partial download {}: {error}", incomplete.display()))?;
-    let offset = file
-        .metadata()
-        .map_err(|error| format!("reading partial download {}: {error}", incomplete.display()))?
-        .len();
-    if offset > required.bytes {
-        return Err(format!(
-            "partial download {} has {offset} bytes, expected at most {}",
-            incomplete.display(),
-            required.bytes,
-        ));
-    }
+    let offset = resume_offset(&file, required.bytes, &incomplete)?;
 
     let mut hasher = Sha256::new();
     if offset != 0 {
@@ -416,6 +406,17 @@ fn append_remote(
     }
 
     let mut reader = response.into_body().into_reader();
+    append_body(&mut reader, file, offset, hasher, progress)
+}
+
+fn append_body(
+    reader: &mut impl Read,
+    file: &mut File,
+    offset: u64,
+    hasher: &mut Sha256,
+    progress: &mut FileProgress<'_>,
+) -> Result<(), String> {
+    let required = progress.required;
     let mut buffer = vec![0_u8; 1024 * 1024];
     let mut received = offset;
     loop {
@@ -424,6 +425,12 @@ fn append_remote(
             .map_err(|error| format!("receiving {}: {error}", required.name))?;
         if read == 0 {
             break;
+        }
+        if read as u64 > required.bytes - received {
+            return Err(format!(
+                "downloading {} received more than the expected {} bytes",
+                required.name, required.bytes,
+            ));
         }
         file.write_all(&buffer[..read])
             .map_err(|error| format!("writing {}: {error}", required.name))?;
@@ -434,6 +441,19 @@ fn append_remote(
         progress.emit(ProvisioningStage::Downloading, received)?;
     }
     Ok(())
+}
+
+fn resume_offset(file: &File, limit: u64, path: &Path) -> Result<u64, String> {
+    let offset = file
+        .metadata()
+        .map_err(|error| format!("reading partial download {}: {error}", path.display()))?
+        .len();
+    if offset <= limit {
+        return Ok(offset);
+    }
+    file.set_len(0)
+        .map_err(|error| format!("resetting oversized download {}: {error}", path.display()))?;
+    Ok(0)
 }
 
 fn hash_prefix(
@@ -507,9 +527,10 @@ fn exact_file_length(path: &Path, expected: u64) -> Result<bool, String> {
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() && metadata.len() == expected => Ok(true),
         Ok(metadata) if metadata.is_file() => Err(format!(
-            "Hugging Face blob {} has {} bytes, expected {expected}",
+            "Hugging Face blob {} has {} bytes, expected {expected}; delete {} to re-download",
             path.display(),
             metadata.len(),
+            path.display(),
         )),
         Ok(_) => Err(format!("{} is not a regular file", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -651,12 +672,15 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileProgress, ProvisioningStage, REQUIRED_FILES, SnapshotState, hex_digest, hub_cache,
-        inspect_snapshot, offline, snapshot_path,
+        FileProgress, ProvisioningStage, REQUIRED_FILES, RequiredFile, Sha256, SnapshotState,
+        append_body, exact_file_length, hex_digest, hub_cache, inspect_snapshot, offline,
+        resume_offset, snapshot_path,
     };
+    use sha2::Digest;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
-    use std::fs::{self, File};
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Cursor, Write};
     use std::path::{Path, PathBuf};
 
     fn environment(values: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
@@ -779,6 +803,77 @@ mod tests {
                 .emit(ProvisioningStage::Downloading, required.bytes + 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn oversized_partial_download_is_truncated_for_retry() {
+        let root = TestDirectory::new("oversized");
+        let path = root.path().join("blob.incomplete");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&[7_u8; 10]).unwrap();
+        assert_eq!(resume_offset(&file, 4, &path).unwrap(), 0);
+        assert_eq!(file.metadata().unwrap().len(), 0);
+
+        file.write_all(&[7_u8; 3]).unwrap();
+        assert_eq!(resume_offset(&file, 4, &path).unwrap(), 3);
+        assert_eq!(file.metadata().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn overlong_body_errors_without_wedging_the_partial_file() {
+        let required = RequiredFile::new("small.bin", 4, "blob", "sha");
+        let root = TestDirectory::new("overlong");
+        let path = root.path().join("small.bin.incomplete");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut discard = |_| Ok(());
+        let mut progress = FileProgress {
+            required: &required,
+            completed_before: 0,
+            total_bytes: required.bytes,
+            report: &mut discard,
+        };
+        let mut hasher = Sha256::new();
+        let error = append_body(
+            &mut Cursor::new([7_u8; 10]),
+            &mut file,
+            0,
+            &mut hasher,
+            &mut progress,
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("small.bin received more than the expected 4 bytes"));
+        assert_eq!(file.metadata().unwrap().len(), 0);
+
+        let mut hasher = Sha256::new();
+        append_body(
+            &mut Cursor::new([7_u8; 4]),
+            &mut file,
+            0,
+            &mut hasher,
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn wrong_sized_blob_error_names_the_path_to_delete() {
+        let root = TestDirectory::new("blob-size");
+        let path = root.path().join("blob");
+        File::create(&path).unwrap().set_len(1).unwrap();
+        let error = exact_file_length(&path, 4).err().unwrap();
+        assert!(error.contains(&format!("delete {} to re-download", path.display())));
     }
 
     struct TestDirectory(PathBuf);
