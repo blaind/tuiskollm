@@ -427,8 +427,8 @@ mod tests {
         assert_eq!(report.arena_addresses, 41);
         assert_eq!(report.weight_bytes, 19_808_036_096);
         assert_eq!(report.cache_bytes, 31_457_280);
-        assert_eq!(report.workspace_bytes, 737_446_176);
-        assert_eq!(report.arena_bytes, 20_576_980_992);
+        assert_eq!(report.workspace_bytes, 1_223_712_576);
+        assert_eq!(report.arena_bytes, 21_063_232_512);
         assert!(report.maximum_normalization_error.is_finite());
         assert!(report.maximum_logit_error.is_finite());
 

@@ -7,6 +7,7 @@ use tuisko_model::{Arch, Qwen36Moe35B};
 const ALIGNMENT: usize = 256;
 const NVFP4_GROUP: usize = 16;
 const SLOTS_PER_TOKEN: usize = Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN + 1;
+pub(crate) const QWEN36_GDN_MAX_ROWS: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Qwen36GdnMoeLayerRegions {
@@ -69,20 +70,32 @@ pub struct Qwen36GdnMoeLayerLayout {
 }
 
 impl Qwen36GdnMoeLayerLayout {
-    /// Reserves every source plane and exact decode seam for `B=1..=8`.
+    /// Reserves every source plane and exact decode/prefill seam through T=128.
     pub fn build() -> EngineResult<Self> {
         type A = Qwen36Moe35B;
         require_geometry()?;
 
-        let batch_hidden = product("Qwen3.6 layer batch-hidden", MAX_BATCH, A::HIDDEN)?;
-        let batch_projected = product("Qwen3.6 layer projected", MAX_BATCH, A::GDN_INPUT_ROWS)?;
-        let batch_qkv = product("Qwen3.6 layer convolved", MAX_BATCH, A::GDN_QKV_ROWS)?;
-        let batch_value = product(
+        let row_hidden = product("Qwen3.6 layer row-hidden", QWEN36_GDN_MAX_ROWS, A::HIDDEN)?;
+        let row_projected = product(
+            "Qwen3.6 layer projected",
+            QWEN36_GDN_MAX_ROWS,
+            A::GDN_INPUT_ROWS,
+        )?;
+        let row_qkv = product(
+            "Qwen3.6 layer convolved",
+            QWEN36_GDN_MAX_ROWS,
+            A::GDN_QKV_ROWS,
+        )?;
+        let row_value = product(
             "Qwen3.6 layer recurrent output",
-            MAX_BATCH,
+            QWEN36_GDN_MAX_ROWS,
             A::GDN_VALUE_ROWS,
         )?;
-        let batch_control = product("Qwen3.6 layer controls", MAX_BATCH, A::GDN_CONTROL_ROWS)?;
+        let row_control = product(
+            "Qwen3.6 layer controls",
+            QWEN36_GDN_MAX_ROWS,
+            A::GDN_CONTROL_ROWS,
+        )?;
         let history = product(
             "Qwen3.6 layer history",
             product("Qwen3.6 layer history rows", MAX_BATCH, A::GDN_QKV_ROWS)?,
@@ -151,47 +164,53 @@ impl Qwen36GdnMoeLayerLayout {
         )?;
         let expert_intermediate = product(
             "Qwen3.6 expert intermediate",
-            product("Qwen3.6 expert slots", MAX_BATCH, SLOTS_PER_TOKEN)?,
+            product("Qwen3.6 expert slots", QWEN36_GDN_MAX_ROWS, SLOTS_PER_TOKEN)?,
             A::INTERMEDIATE,
         )?;
         let expert_output = product(
             "Qwen3.6 expert output",
-            product("Qwen3.6 expert output slots", MAX_BATCH, SLOTS_PER_TOKEN)?,
+            product(
+                "Qwen3.6 expert output slots",
+                QWEN36_GDN_MAX_ROWS,
+                SLOTS_PER_TOKEN,
+            )?,
             A::HIDDEN,
         )?;
 
         let mut builder = ArenaLayout::new();
         let regions = Qwen36GdnMoeLayerRegions {
-            residual_input: builder.reserve(batch_hidden, ALIGNMENT)?,
+            residual_input: builder.reserve(row_hidden, ALIGNMENT)?,
             input_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            mixer_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
-            input_activation_codes: builder.reserve(batch_hidden, ALIGNMENT)?,
+            mixer_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            input_activation_codes: builder.reserve(row_hidden, ALIGNMENT)?,
             input_weight_codes: builder.reserve(A::GDN_INPUT_ROWS * A::HIDDEN, ALIGNMENT)?,
             control_weight_bf16: builder.reserve(2 * A::GDN_CONTROL_ROWS * A::HIDDEN, ALIGNMENT)?,
-            projected: builder.reserve(batch_projected, ALIGNMENT)?,
-            projected_controls: builder.reserve(2 * batch_control, ALIGNMENT)?,
+            projected: builder.reserve(row_projected, ALIGNMENT)?,
+            projected_controls: builder.reserve(2 * row_control, ALIGNMENT)?,
             a_log: builder.reserve(A::GDN_CONTROL_ROWS, ALIGNMENT)?,
             dt_bias: builder.reserve(A::GDN_CONTROL_ROWS, ALIGNMENT)?,
             convolution_weights: builder
                 .reserve(A::GDN_QKV_ROWS * A::LINEAR_CONV_KERNEL_DIM, ALIGNMENT)?,
             state_rows: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             history: builder.reserve(history, ALIGNMENT)?,
-            log_decay: builder.reserve(batch_control, ALIGNMENT)?,
-            beta: builder.reserve(batch_control, ALIGNMENT)?,
-            convolved: builder.reserve(batch_qkv, ALIGNMENT)?,
+            log_decay: builder.reserve(row_control, ALIGNMENT)?,
+            beta: builder.reserve(row_control, ALIGNMENT)?,
+            convolved: builder.reserve(row_qkv, ALIGNMENT)?,
             recurrent_norm: builder.reserve(A::LINEAR_HEAD_DIM, ALIGNMENT)?,
             state: builder.reserve(state, ALIGNMENT)?,
-            recurrent_output: builder.reserve(batch_value, ALIGNMENT)?,
-            output_activation_codes: builder.reserve(batch_value, ALIGNMENT)?,
+            recurrent_output: builder.reserve(row_value, ALIGNMENT)?,
+            output_activation_codes: builder.reserve(row_value, ALIGNMENT)?,
             output_weight_codes: builder.reserve(A::HIDDEN * A::GDN_VALUE_ROWS, ALIGNMENT)?,
-            mixer_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
+            mixer_branch: builder.reserve(row_hidden, ALIGNMENT)?,
             post_attention_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            mixer_residual: builder.reserve(batch_hidden, ALIGNMENT)?,
-            moe_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
+            mixer_residual: builder.reserve(row_hidden, ALIGNMENT)?,
+            moe_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
             router_weight: builder.reserve(A::NUM_EXPERTS * A::HIDDEN, ALIGNMENT)?,
-            router_logits: builder.reserve(MAX_BATCH * A::NUM_EXPERTS, ALIGNMENT)?,
-            expert_indices: builder.reserve(MAX_BATCH * A::NUM_EXPERTS_PER_TOKEN, ALIGNMENT)?,
-            routing_weights: builder.reserve(MAX_BATCH * A::NUM_EXPERTS_PER_TOKEN, ALIGNMENT)?,
+            router_logits: builder.reserve(QWEN36_GDN_MAX_ROWS * A::NUM_EXPERTS, ALIGNMENT)?,
+            expert_indices: builder
+                .reserve(QWEN36_GDN_MAX_ROWS * A::NUM_EXPERTS_PER_TOKEN, ALIGNMENT)?,
+            routing_weights: builder
+                .reserve(QWEN36_GDN_MAX_ROWS * A::NUM_EXPERTS_PER_TOKEN, ALIGNMENT)?,
             routed_gate_up_codes: builder.reserve(routed_gate_up_codes, ALIGNMENT)?,
             routed_gate_up_scales: builder.reserve(routed_gate_up_scales, ALIGNMENT)?,
             routed_gate_up_weight_scales_2: builder.reserve(A::NUM_EXPERTS, ALIGNMENT)?,
@@ -205,11 +224,11 @@ impl Qwen36GdnMoeLayerLayout {
             shared_gate_weight: builder.reserve(A::HIDDEN, ALIGNMENT)?,
             expert_intermediate: builder.reserve(expert_intermediate, ALIGNMENT)?,
             expert_output: builder.reserve(expert_output, ALIGNMENT)?,
-            shared_gate: builder.reserve(MAX_BATCH, ALIGNMENT)?,
-            moe_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
+            shared_gate: builder.reserve(QWEN36_GDN_MAX_ROWS, ALIGNMENT)?,
+            moe_branch: builder.reserve(row_hidden, ALIGNMENT)?,
             next_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            residual_output: builder.reserve(batch_hidden, ALIGNMENT)?,
-            next_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
+            residual_output: builder.reserve(row_hidden, ALIGNMENT)?,
+            next_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
         };
         let resident_weight_bytes = sum(
             "Qwen3.6 layer resident weights",
@@ -304,6 +323,11 @@ impl Qwen36GdnMoeLayerLayout {
     pub const fn owner_bytes(&self) -> usize {
         self.resident_weight_bytes + self.workspace_bytes
     }
+
+    /// Largest exact row route owned by the layer.
+    pub const fn row_capacity(&self) -> usize {
+        QWEN36_GDN_MAX_ROWS
+    }
 }
 
 fn require_geometry() -> EngineResult<()> {
@@ -349,10 +373,11 @@ mod tests {
         assert_eq!(Qwen36Moe35B::GDN_INPUT_ROWS, 12_288);
         assert_eq!(Qwen36Moe35B::NUM_EXPERTS, 256);
         assert_eq!(layout.resident_weight_bytes(), 489_703_808);
-        assert_eq!(layout.workspace_bytes(), 18_251_056);
-        assert_eq!(layout.owner_bytes(), 507_954_864);
-        assert_eq!(layout.arena_bytes(), 507_955_968);
-        assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 1_104);
+        assert_eq!(layout.workspace_bytes(), 34_459_936);
+        assert_eq!(layout.owner_bytes(), 524_163_744);
+        assert_eq!(layout.arena_bytes(), 524_164_352);
+        assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 608);
+        assert_eq!(layout.row_capacity(), 128);
     }
 
     #[test]

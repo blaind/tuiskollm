@@ -18,9 +18,11 @@ const STATE_PER_ROW: usize =
     Qwen36Moe35B::GDN_CONTROL_ROWS * Qwen36Moe35B::LINEAR_HEAD_DIM * Qwen36Moe35B::LINEAR_HEAD_DIM;
 const EXPERT_SLOTS: usize = Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN + 1;
 const NVFP4_GROUP: usize = 16;
+const MAX_ROWS: usize = 128;
+const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, MAX_ROWS];
 
 struct RouteGraph {
-    batch: usize,
+    rows: usize,
     repeated: CudaGraph,
 }
 
@@ -45,15 +47,16 @@ impl Session {
         }
         let stream = context.new_stream().map_err(GpuError::from)?;
         let program = Qwen36GdnMoeLayerProgram::from_snapshot(&context, snapshot, SOURCE_LAYER)?;
-        program.load_residual(&stream, MAX_BATCH, &benchmark_input())?;
+        program.load_residual(&stream, MAX_ROWS, &benchmark_input())?;
         program.reset_state(&stream)?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| {
+        let routes = EXACT_ROUTES
+            .into_iter()
+            .map(|rows| {
                 Ok(RouteGraph {
-                    batch,
+                    rows,
                     repeated: program.qualification_repeated_graph(
                         &stream,
-                        batch,
+                        rows,
                         repeated_operations,
                     )?,
                 })
@@ -72,13 +75,9 @@ impl Session {
 
     fn warm(&self, launches: u64) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
-            for batch in 1..=MAX_BATCH {
+            for rows in EXACT_ROUTES {
                 // SAFETY: the program retains every captured layer allocation through this replay.
-                unsafe {
-                    self.program
-                        .qualification_graph(batch)?
-                        .launch(&self.stream)
-                }?;
+                unsafe { self.program.qualification_graph(rows)?.launch(&self.stream) }?;
             }
         }
         self.stream.synchronize().map_err(GpuError::from)?;
@@ -93,16 +92,23 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_layer_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_layer_prefill(route.rows as u64),
+                    )
+                };
                 Ok(ExactDeviceCase::new(
                     "qwen36_35b_a3b/gdn_moe/layer0",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_layer_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
-                    self.program.qualification_graph(route.batch)?,
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
+                    self.program.qualification_graph(route.rows)?,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 ))
             })
@@ -112,12 +118,12 @@ impl Session {
 
 fn benchmark_input() -> Vec<u16> {
     const PATTERN: [f32; 8] = [0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625];
-    (0..MAX_BATCH * Qwen36Moe35B::HIDDEN)
+    (0..MAX_ROWS * Qwen36Moe35B::HIDDEN)
         .map(|index| f32_to_bf16(PATTERN[(index + index / Qwen36Moe35B::HIDDEN) & 7]))
         .collect()
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(rows: usize) -> usize {
     let hidden = Qwen36Moe35B::HIDDEN;
     let input_rows = Qwen36Moe35B::GDN_INPUT_ROWS;
     let qkv_rows = Qwen36Moe35B::GDN_QKV_ROWS;
@@ -127,33 +133,34 @@ fn logical_bytes(batch: usize) -> usize {
     let experts = Qwen36Moe35B::NUM_EXPERTS;
     let top_k = Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN;
 
-    let plain_norm = 3 * batch * hidden * size_of::<u16>();
+    let state_row_count = if rows <= MAX_BATCH { rows } else { 1 };
+    let plain_norm = 3 * rows * hidden * size_of::<u16>();
     let input_projection_weights = input_rows * hidden + 2 * controls * hidden * size_of::<u16>();
     let input_projection = input_projection_weights
-        + batch
+        + rows
             * (hidden * (size_of::<u16>() + size_of::<u8>())
                 + (input_rows + 2 * controls) * size_of::<u16>());
-    let prepare = batch
+    let prepare = rows
         * (4 * controls * size_of::<u16>()
             + 2 * controls * size_of::<f32>()
             + qkv_rows * size_of::<u16>()
             + qkv_rows * (HISTORY_TAPS + 1) * size_of::<u16>()
-            + size_of::<u32>()
             + 2 * qkv_rows * HISTORY_TAPS * size_of::<u16>()
-            + qkv_rows * size_of::<u16>());
+            + qkv_rows * size_of::<u16>())
+        + state_row_count * size_of::<u32>();
     let recurrence = Qwen36Moe35B::LINEAR_HEAD_DIM * size_of::<u16>()
-        + batch
+        + rows
             * (qkv_rows * size_of::<u16>()
                 + value_rows * size_of::<u16>()
                 + 2 * controls * size_of::<f32>()
-                + size_of::<u32>()
                 + 2 * STATE_PER_ROW * size_of::<f32>()
-                + value_rows * size_of::<u16>());
+                + value_rows * size_of::<u16>())
+        + state_row_count * size_of::<u32>();
     let output_projection = hidden * value_rows
-        + batch * (value_rows * (size_of::<u16>() + size_of::<u8>()) + hidden * size_of::<u16>());
-    let residual_boundaries = 2 * 5 * batch * hidden * size_of::<u16>();
+        + rows * (value_rows * (size_of::<u16>() + size_of::<u8>()) + hidden * size_of::<u16>());
+    let residual_boundaries = 2 * 5 * rows * hidden * size_of::<u16>();
     let router = experts * hidden * size_of::<u16>()
-        + batch
+        + rows
             * (hidden * size_of::<u16>()
                 + experts * size_of::<u16>()
                 + 2 * top_k * size_of::<u16>());
@@ -162,9 +169,9 @@ fn logical_bytes(batch: usize) -> usize {
     let down_codes = hidden * intermediate / 2;
     let down_scales = hidden * intermediate / NVFP4_GROUP;
     let selected_expert_weights =
-        batch * EXPERT_SLOTS * (gate_up_codes + gate_up_scales + down_codes + down_scales);
+        rows * EXPERT_SLOTS * (gate_up_codes + gate_up_scales + down_codes + down_scales);
     let experts_path = selected_expert_weights
-        + batch
+        + rows
             * (hidden * size_of::<u16>()
                 + 2 * top_k * size_of::<u16>()
                 + hidden * size_of::<u16>()
@@ -202,7 +209,7 @@ pub fn benchmark_qwen36_gdn_moe_layer(
         "qwen36_35b_a3b/gdn_moe/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.program.workspace_bytes(),
-        "max_batch=8 including causal history, FP32 state, routing, and nine expert slots",
+        "max_rows=128 working planes plus eight persistent causal history/state slots",
     )?;
     memory.register_owned(
         "qwen36_35b_a3b/gdn_moe/alignment_padding",
@@ -250,5 +257,7 @@ mod tests {
     fn accounting_covers_every_composed_leaf_and_selected_expert() {
         assert_eq!(logical_bytes(1), 55_424_712);
         assert_eq!(logical_bytes(MAX_BATCH), 199_339_840);
+        assert!(logical_bytes(MAX_ROWS) > logical_bytes(64));
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
     }
 }
