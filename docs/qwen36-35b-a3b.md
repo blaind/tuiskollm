@@ -86,8 +86,16 @@ top eight, renormalization over those eight probabilities, routed expert output,
 must be explicitly pinned rather than inherited from an unstable library primitive.
 
 The current partial slice admits the complete source inventory and lossless expert materialization,
-then qualifies BF16 router logits and normalized top-eight selection at every exact `B=1..8`.
-Routed/shared expert execution, composed layers, and model inference remain unimplemented.
+then qualifies BF16 router logits, normalized top-eight selection, all selected routed experts, the
+always-active shared expert, and their fixed-order combination at every exact `B=1..8`. The expert
+owner retains all 256 numeric-order expert planes in 454,760,448 weight bytes and uses 434,448
+address-stable workspace bytes. Its 24 gate/up, down, and combine entries use zero stack/local
+memory and pass complete eager/oracle plus CUDA Graph agreement.
+
+At a measured 2,182 MHz median SM clock, the warm expert-only repeated path is 12.726 us at B=1
+and 76.390 us at B=8. The rise after B=6 coincides with the selected expert working set exceeding
+the target's cache, so these are leaf diagnostics rather than a cold whole-layer or model claim.
+Composed layers, exact prefill expert routes, and model inference remain unimplemented.
 
 ## Implementation order
 

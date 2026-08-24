@@ -217,6 +217,7 @@ impl<const TOKENS: usize> PreparedBatchRoute<TOKENS> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
