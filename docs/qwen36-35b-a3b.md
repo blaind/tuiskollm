@@ -184,8 +184,11 @@ bytes for a 20,402,726,912-byte allocation. Eight whole-model decode graphs chai
 BF16 publication directly into the next owner. The real checkpoint passes all eight eager/graph
 routes, 76,032 represented endpoint-oracle values, 8,939,520 finite logits, inactive-row and
 replacement-input checks, all 41 stable addresses, zero post-warmup growth, and the complete
-downstream spill/resource cone. Native prompt graphs will be reconciled with the resident-prefill
-stack after that stack lands.
+downstream spill/resource cone. An unblessed direct diagnostic at an observed 2,100--2,137 MHz SM
+and 13,801 MHz memory clock measures 5.051/9.364 ms at B=1/8, or about 198/854 aggregate rows per
+second. Production-graph and repeated complete-path medians agree within 0.01%, and the timed
+region has zero device-memory growth. Native prompt graphs will be reconciled with the
+resident-prefill stack after that stack lands.
 
 ## Implementation order
 
