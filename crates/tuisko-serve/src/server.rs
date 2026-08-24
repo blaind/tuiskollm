@@ -75,6 +75,11 @@ struct Job {
     reply: Sender<GenerationReply>,
 }
 
+struct ActiveReply {
+    sender: Sender<GenerationReply>,
+    cached_prompt_tokens: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EnqueueError {
     Full,
@@ -357,7 +362,7 @@ fn engine_worker(
         for event in events.iter() {
             let failed = replies
                 .get(&event.request_id)
-                .is_some_and(|reply| !try_send_generation_steps(reply, event.steps()));
+                .is_some_and(|reply| !try_send_generation_steps(&reply.sender, event.steps()));
             if failed {
                 // Full or closed: drop the lane so the next cancel pass reaps the request.
                 replies.remove(&event.request_id);
@@ -365,7 +370,10 @@ fn engine_worker(
             if let Some(output) = &event.completed
                 && let Some(reply) = replies.remove(&event.request_id)
             {
-                let _ = reply.try_send(GenerationReply::Done(output.clone()));
+                let _ = reply.sender.try_send(GenerationReply::Done {
+                    output: output.clone(),
+                    cached_prompt_tokens: reply.cached_prompt_tokens,
+                });
             }
         }
     }
@@ -463,7 +471,10 @@ fn run_qwen35_job(generator: &mut Qwen35ResidentTextGenerator, job: Job) {
     }
     match session.into_output() {
         Ok(output) => {
-            let _ = job.reply.send(GenerationReply::Done(output));
+            let _ = job.reply.send(GenerationReply::Done {
+                output,
+                cached_prompt_tokens: 0,
+            });
         }
         Err(error) => {
             let _ = job.reply.send(GenerationReply::Failed(error.to_string()));
@@ -563,7 +574,10 @@ fn run_qwen36_job(generator: &mut Qwen36ResidentTextGenerator, job: Job) {
     }
     match session.into_output() {
         Ok(output) => {
-            let _ = job.reply.send(GenerationReply::Done(output));
+            let _ = job.reply.send(GenerationReply::Done {
+                output,
+                cached_prompt_tokens: 0,
+            });
         }
         Err(error) => {
             let _ = job.reply.send(GenerationReply::Failed(error.to_string()));
@@ -731,7 +745,7 @@ fn mebibytes(bytes: usize) -> f64 {
 
 fn admit_job(
     generator: &mut ResidentMtpBatchGenerator,
-    replies: &mut HashMap<ResidentRequestId, Sender<GenerationReply>>,
+    replies: &mut HashMap<ResidentRequestId, ActiveReply>,
     job: Job,
 ) {
     if job.reply.is_closed() {
@@ -740,9 +754,18 @@ fn admit_job(
     match generator.admit(&job.request) {
         Ok(admission) => {
             if let Some(output) = admission.completed {
-                let _ = job.reply.try_send(GenerationReply::Done(output));
+                let _ = job.reply.try_send(GenerationReply::Done {
+                    output,
+                    cached_prompt_tokens: admission.device_reused_tokens,
+                });
             } else {
-                let previous = replies.insert(admission.request_id, job.reply);
+                let previous = replies.insert(
+                    admission.request_id,
+                    ActiveReply {
+                        sender: job.reply,
+                        cached_prompt_tokens: admission.device_reused_tokens,
+                    },
+                );
                 debug_assert!(previous.is_none(), "resident request identities are unique");
             }
         }
@@ -756,11 +779,15 @@ fn admit_job(
 
 fn cancel_disconnected(
     generator: &mut ResidentMtpBatchGenerator,
-    replies: &mut HashMap<ResidentRequestId, Sender<GenerationReply>>,
+    replies: &mut HashMap<ResidentRequestId, ActiveReply>,
 ) -> Result<(), String> {
     let cancelled = generator
         .active_request_ids()
-        .filter(|request| replies.get(request).is_none_or(Sender::is_closed))
+        .filter(|request| {
+            replies
+                .get(request)
+                .is_none_or(|reply| reply.sender.is_closed())
+        })
         .collect::<Vec<_>>();
     for request in cancelled {
         replies.remove(&request);
@@ -787,9 +814,11 @@ fn try_send_generation_steps<'a>(
     true
 }
 
-fn fail_all(replies: &mut HashMap<ResidentRequestId, Sender<GenerationReply>>, message: String) {
+fn fail_all(replies: &mut HashMap<ResidentRequestId, ActiveReply>, message: String) {
     for (_, reply) in replies.drain() {
-        let _ = reply.try_send(GenerationReply::Failed(message.clone()));
+        let _ = reply
+            .sender
+            .try_send(GenerationReply::Failed(message.clone()));
     }
 }
 

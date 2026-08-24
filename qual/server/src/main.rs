@@ -507,11 +507,21 @@ fn expect_common(value: &Value, object_kind: &str) -> Result<()> {
 
 fn parse_usage(value: &Value) -> Result<Usage> {
     let prompt_tokens = usize_value(field(value, "prompt_tokens")?, "prompt tokens")?;
+    let prompt_details = field(value, "prompt_tokens_details")?;
+    let cached_tokens = usize_value(
+        field(prompt_details, "cached_tokens")?,
+        "cached prompt tokens",
+    )?;
     let completion_tokens = usize_value(field(value, "completion_tokens")?, "completion tokens")?;
     let total_tokens = usize_value(field(value, "total_tokens")?, "total tokens")?;
     if prompt_tokens == 0 || !(1..=COMPLETION_TOKENS).contains(&completion_tokens) {
         return Err(QualError::Contract(format!(
             "usage has invalid prompt/completion counts {prompt_tokens}/{completion_tokens}"
+        )));
+    }
+    if cached_tokens > prompt_tokens {
+        return Err(QualError::Contract(format!(
+            "usage has {cached_tokens} cached tokens but only {prompt_tokens} prompt tokens"
         )));
     }
     if total_tokens != prompt_tokens + completion_tokens {
@@ -631,7 +641,12 @@ mod tests {
 
     #[test]
     fn blocking_and_sse_fixtures_have_identical_semantics() {
-        let usage = json!({"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 13});
+        let usage = json!({
+            "prompt_tokens": 11,
+            "prompt_tokens_details": {"cached_tokens": 7},
+            "completion_tokens": 2,
+            "total_tokens": 13
+        });
         let blocking = json!({
             "id": "chatcmpl-tuisko-0001",
             "object": "chat.completion",
@@ -650,7 +665,7 @@ mod tests {
             "data: {\"id\":\"chatcmpl-tuisko-0002\",\"object\":\"chat.completion.chunk\",\"created\":2,\"model\":\"unsloth/Qwen3.8-27B-NVFP4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"bl\"},\"finish_reason\":null}],\"usage\":null}\n\n",
             "data: {\"id\":\"chatcmpl-tuisko-0002\",\"object\":\"chat.completion.chunk\",\"created\":2,\"model\":\"unsloth/Qwen3.8-27B-NVFP4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ue\"},\"finish_reason\":null}],\"usage\":null}\n\n",
             "data: {\"id\":\"chatcmpl-tuisko-0002\",\"object\":\"chat.completion.chunk\",\"created\":2,\"model\":\"unsloth/Qwen3.8-27B-NVFP4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
-            "data: {\"id\":\"chatcmpl-tuisko-0002\",\"object\":\"chat.completion.chunk\",\"created\":2,\"model\":\"unsloth/Qwen3.8-27B-NVFP4\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2,\"total_tokens\":13}}\n\n",
+            "data: {\"id\":\"chatcmpl-tuisko-0002\",\"object\":\"chat.completion.chunk\",\"created\":2,\"model\":\"unsloth/Qwen3.8-27B-NVFP4\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"prompt_tokens_details\":{\"cached_tokens\":7},\"completion_tokens\":2,\"total_tokens\":13}}\n\n",
             "data: [DONE]\n\n"
         );
         let expected = Completion {
