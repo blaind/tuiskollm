@@ -568,7 +568,7 @@ async fn chat_completions(
             );
         }
     };
-    let (reply_tx, reply_rx) = unbounded_channel();
+    let (reply_tx, mut reply_rx) = unbounded_channel();
     if let Err(error) = enqueue_job(
         &state.jobs,
         Job {
@@ -585,14 +585,25 @@ async fn chat_completions(
         .unwrap_or_default()
         .as_secs();
     if stream {
-        streaming_response(
-            reply_rx,
-            id,
-            created,
-            split_reasoning,
-            parse_tools,
-            include_usage,
-        )
+        match reply_rx.recv().await {
+            Some(GenerationReply::Rejected(message)) => {
+                openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error")
+            }
+            Some(first) => streaming_response(
+                first,
+                reply_rx,
+                id,
+                created,
+                split_reasoning,
+                parse_tools,
+                include_usage,
+            ),
+            None => openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "resident engine worker disconnected".into(),
+                "server_error",
+            ),
+        }
     } else {
         blocking_response(reply_rx, id, created, split_reasoning, parse_tools).await
     }
@@ -791,27 +802,34 @@ mod tests {
         });
     }
 
+    fn streaming_request() -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": SERVED_MODEL,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+            "max_completion_tokens": 7
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn streaming_handler_enqueues_the_real_request_and_surfaces_worker_errors() {
         runtime().block_on(async {
             let (jobs, mut receiver) = channel(1);
             let state = state(jobs, true);
-            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-                "model": SERVED_MODEL,
-                "messages": [{"role": "user", "content": "hello"}],
-                "stream": true,
-                "max_completion_tokens": 7
-            }))
-            .unwrap();
-            let response = chat_completions(State(state), Ok(Json(request))).await;
-            assert_eq!(response.status(), StatusCode::OK);
+            let handler = tokio::spawn(chat_completions(
+                State(state),
+                Ok(Json(streaming_request())),
+            ));
 
-            let queued = receiver.try_recv().unwrap();
+            let queued = receiver.recv().await.unwrap();
             assert_eq!(queued.request.max_new_tokens, 7);
             queued
                 .reply
                 .send(GenerationReply::Failed("fixture failure".into()))
                 .unwrap();
+            let response = handler.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
             let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
             let body = String::from_utf8(bytes.to_vec()).unwrap();
             let error = body
@@ -822,6 +840,52 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing streamed error in {body:?}"));
             assert_eq!(error["message"], "fixture failure");
             assert_eq!(error["type"], "server_error");
+        });
+    }
+
+    #[test]
+    fn streaming_admission_rejection_is_a_bad_request_not_a_stream() {
+        runtime().block_on(async {
+            let (jobs, mut receiver) = channel(1);
+            let state = state(jobs, true);
+            let handler = tokio::spawn(chat_completions(
+                State(state),
+                Ok(Json(streaming_request())),
+            ));
+
+            let queued = receiver.recv().await.unwrap();
+            queued
+                .reply
+                .send(GenerationReply::Rejected(
+                    "prompt exceeds the resident context".into(),
+                ))
+                .unwrap();
+            let response = handler.await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let error: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                error["error"]["message"],
+                "prompt exceeds the resident context"
+            );
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+        });
+    }
+
+    #[test]
+    fn streaming_worker_disconnect_before_admission_is_unavailable() {
+        runtime().block_on(async {
+            let (jobs, mut receiver) = channel(1);
+            let state = state(jobs, true);
+            let handler = tokio::spawn(chat_completions(
+                State(state),
+                Ok(Json(streaming_request())),
+            ));
+
+            let queued = receiver.recv().await.unwrap();
+            drop(queued);
+            let response = handler.await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         });
     }
 }
