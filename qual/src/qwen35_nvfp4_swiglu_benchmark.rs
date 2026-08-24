@@ -1,4 +1,4 @@
-//! Paired timings for Qwen3.5 NVFP4 SwiGLU crossover routes.
+//! Paired timings for exact Qwen3.5 NVFP4 SwiGLU routes.
 
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
@@ -8,7 +8,7 @@ use crate::device_benchmark::{
 };
 use crate::qwen35_nvfp4_swiglu::{
     CODE_BYTES_PER_ROW, GATE_UP_ROWS, GROUPS_PER_ROW, HIDDEN, INPUT_SCALE_DIVISOR, MAX_BATCH,
-    OUTPUT_ROWS, Regions, WEIGHT_SCALE_DIVISOR, layout, make_fixture,
+    OUTPUT_ROWS, PREFILL_ROWS, Regions, WEIGHT_SCALE_DIVISOR, layout, make_fixture,
 };
 use crate::target::Qwen35Nvfp4SwiGluOp;
 use std::sync::Arc;
@@ -30,7 +30,7 @@ impl Schedule {
 }
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
     schedule: Schedule,
     leaf: CudaGraph,
     repeated: CudaGraph,
@@ -87,7 +87,7 @@ impl Session {
             weight_scales: arena.address(regions.weight_scales)?,
             output: arena.address(regions.output)?,
         };
-        let mut routes = Vec::with_capacity(12);
+        let mut routes = Vec::with_capacity(16);
         for batch in 1..=4 {
             routes.push(capture_route(
                 &op,
@@ -104,6 +104,16 @@ impl Session {
                 &stream,
                 &addresses,
                 batch,
+                Schedule::W4a4,
+                repeated_operations,
+            )?);
+        }
+        for rows in PREFILL_ROWS {
+            routes.push(capture_route(
+                &op,
+                &stream,
+                &addresses,
+                rows,
                 Schedule::W4a4,
                 repeated_operations,
             )?);
@@ -135,13 +145,24 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     route.schedule.route(),
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
+                    shape,
+                    workload,
                     OperationAccounting::new(
-                        logical_bytes(route.batch, route.schedule),
-                        route.batch as u64,
+                        logical_bytes(route.rows, route.schedule),
+                        route.rows as u64,
                         "token",
                     ),
                     &route.leaf,
@@ -156,20 +177,20 @@ fn capture_route(
     op: &Qwen35Nvfp4SwiGluOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
     schedule: Schedule,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, batch, schedule))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows, schedule))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, batch, schedule)?;
+            launch(op, stream, addresses, rows, schedule)?;
         }
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
         schedule,
         leaf,
         repeated,
@@ -180,24 +201,36 @@ fn launch(
     op: &Qwen35Nvfp4SwiGluOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
     schedule: Schedule,
 ) -> GpuResult<()> {
     // SAFETY: each address names its aligned maximum-batch arena region.
     unsafe {
-        match schedule {
-            Schedule::A16 => op.launch_a16(
+        match (schedule, rows <= MAX_BATCH) {
+            (Schedule::A16, _) => op.launch_a16(
                 stream,
-                batch,
+                rows,
                 addresses.input,
                 addresses.weight_codes,
                 addresses.weight_scales,
                 WEIGHT_SCALE_DIVISOR,
                 addresses.output,
             ),
-            Schedule::W4a4 => op.launch_w4a4(
+            (Schedule::W4a4, true) => op.launch_w4a4(
                 stream,
-                batch,
+                rows,
+                addresses.input,
+                addresses.activation_codes,
+                addresses.activation_scales,
+                addresses.weight_codes,
+                addresses.weight_scales,
+                INPUT_SCALE_DIVISOR,
+                WEIGHT_SCALE_DIVISOR,
+                addresses.output,
+            ),
+            (Schedule::W4a4, false) => op.launch_prefill(
+                stream,
+                rows,
                 addresses.input,
                 addresses.activation_codes,
                 addresses.activation_scales,
@@ -211,19 +244,19 @@ fn launch(
     }
 }
 
-fn logical_bytes(batch: usize, schedule: Schedule) -> usize {
+fn logical_bytes(rows: usize, schedule: Schedule) -> usize {
     let weights = GATE_UP_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
-    let input = batch * HIDDEN * size_of::<u16>();
-    let output = batch * OUTPUT_ROWS * size_of::<u16>();
+    let input = rows * HIDDEN * size_of::<u16>();
+    let output = rows * OUTPUT_ROWS * size_of::<u16>();
     let scratch = match schedule {
         Schedule::A16 => 0,
-        Schedule::W4a4 => 2 * batch * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW),
+        Schedule::W4a4 => 2 * rows * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW),
     };
 
     weights + input + output + scratch
 }
 
-/// Measures all qualified Qwen3.5 A16/W4A4 crossover routes.
+/// Measures all qualified Qwen3.5 A16/W4A4 routes.
 pub fn benchmark_qwen35_nvfp4_swiglu(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
@@ -244,7 +277,7 @@ pub fn benchmark_qwen35_nvfp4_swiglu(
         "qwen35_9b/nvfp4_swiglu/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes - padding_bytes,
-        "max_batch=8",
+        "max_rows=1024",
     )?;
     memory.register_owned(
         "qwen35_9b/nvfp4_swiglu/alignment_padding",
@@ -286,7 +319,7 @@ mod tests {
         let (layout, regions) = layout().unwrap();
         let weights = GATE_UP_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
 
-        assert_eq!(layout.byte_len(), 56_903_680);
+        assert_eq!(layout.byte_len(), 92_536_832);
         assert_eq!(regions.weight_bytes(), weights);
         assert_eq!(
             logical_bytes(4, Schedule::A16),
@@ -295,6 +328,12 @@ mod tests {
         assert_eq!(
             logical_bytes(8, Schedule::W4a4),
             weights + 8 * (HIDDEN + OUTPUT_ROWS) * 2 + 16 * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW)
+        );
+        assert_eq!(
+            logical_bytes(1_024, Schedule::W4a4),
+            weights
+                + 1_024 * (HIDDEN + OUTPUT_ROWS) * 2
+                + 2_048 * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW)
         );
     }
 }
