@@ -223,6 +223,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-attention-qk-prepare` | Measure every exact Q/K prepare and cache-append graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-paged-gqa` | Measure exact B=1..8 graphs at a 130-token context, causal shared T=32/64/128 graphs, partitioned T=128 tails, and production-P4 T=1024 macro graphs at contexts 32,768 and 98,304 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-paged-gqa` | Measure every exact Qwen3.5 B=1..8 BF16 paged-GQA graph at a 130-token context | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-paged-gqa` | Measure every exact Qwen3.6 B=1..8 BF16 paged-GQA graph at a 130-token context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-long-context-paged-gqa` | Measure every exact two-stage paged GQA graph with the complete 3,438-page pool divided among active slots | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-output` | Measure every exact sigmoid-gate, quantize, and output-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-mtp-bf16-fusion` | Measure every exact B=1..8 production graph for both BF16 norms plus the source-BF16 MTP fusion projection | terminal or `--json PATH` |

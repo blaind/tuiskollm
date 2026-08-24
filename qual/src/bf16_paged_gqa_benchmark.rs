@@ -248,6 +248,11 @@ impl<O: BenchPagedGqaOp> Session<O> {
     }
 
     fn warm(&self, launches: u64) -> GpuResult<()> {
+        for route in &self.routes {
+            // SAFETY: this Session owns the repeated route graph and every captured
+            // allocation until after this synchronized replay.
+            unsafe { route.repeated.launch(&self.stream) }?;
+        }
         for _ in 0..launches {
             for route in &self.routes {
                 // SAFETY: this Session owns both these route graphs and everything they
