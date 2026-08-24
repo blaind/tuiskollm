@@ -14,6 +14,8 @@ use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const DECODE_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
+const QWEN35_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
+const QWEN35_MAX_TOKENS: usize = 128;
 const QWEN36_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 const QWEN36_MAX_TOKENS: usize = 128;
 const ALIGNMENT: usize = 256;
@@ -195,8 +197,8 @@ impl QualifiedPagedGqaOp for PagedGqaOp {
 
 impl QualifiedPagedGqaOp for Qwen35PagedGqaOp {
     type Target = Qwen35_9B;
-    const ROUTES: &'static [usize] = &DECODE_ROUTES;
-    const MAX_TOKENS: usize = MAX_BATCH;
+    const ROUTES: &'static [usize] = &QWEN35_ROUTES;
+    const MAX_TOKENS: usize = QWEN35_MAX_TOKENS;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16;
 
@@ -336,7 +338,8 @@ pub fn qualify_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificatio
     qualify_target::<PagedGqaOp>()
 }
 
-/// Qualifies Qwen3.5 eager and captured BF16 paged GQA at exact `B=1..=8`.
+/// Qualifies Qwen3.5 eager and captured BF16 paged GQA at exact `B=1..=8`
+/// and `T=32,64,128`.
 pub fn qualify_qwen35_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificationError> {
     qualify_target::<Qwen35PagedGqaOp>()
 }
@@ -793,9 +796,10 @@ fn verify_no_post_warmup_allocation<O: QualifiedPagedGqaOp>(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BATCH, PHYSICAL_PAGES, QWEN36_MAX_TOKENS, QWEN36_ROUTES, Qwen35_9B, Qwen36Moe35B,
-        Qwen38_27B, TABLE_ROWS, TABLE_STRIDE, layout, qualify_mtp_bf16_paged_gqa,
-        qualify_paged_gqa, qualify_qwen35_paged_gqa, qualify_qwen36_paged_gqa,
+        MAX_BATCH, PHYSICAL_PAGES, QWEN35_MAX_TOKENS, QWEN35_ROUTES, QWEN36_MAX_TOKENS,
+        QWEN36_ROUTES, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, TABLE_ROWS, TABLE_STRIDE, layout,
+        qualify_mtp_bf16_paged_gqa, qualify_paged_gqa, qualify_qwen35_paged_gqa,
+        qualify_qwen36_paged_gqa,
     };
     use std::mem::size_of;
     use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -830,35 +834,35 @@ mod tests {
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn qwen35_bf16_exact_batches_match_independent_oracles_and_graph_replay()
+    fn qwen35_bf16_exact_decode_and_prompt_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), super::PagedGqaQualificationError> {
         let report = qualify_qwen35_paged_gqa()?;
-        let active_tokens = (1..=MAX_BATCH).sum::<usize>();
+        let active_tokens = QWEN35_ROUTES.iter().sum::<usize>();
         let output_per_token = Qwen35_9B::ATTENTION_OUTPUT_COLUMNS;
         let plane_bytes = PHYSICAL_PAGES
             * Qwen35_9B::NUM_KV_HEADS
             * ATTENTION_PAGE_SIZE
             * Qwen35_9B::HEAD_DIM
             * size_of::<u16>();
-        let immutable_per_check = MAX_BATCH * output_per_token
+        let immutable_per_check = QWEN35_MAX_TOKENS * output_per_token
             + 2 * plane_bytes
             + TABLE_ROWS * TABLE_STRIDE
-            + 2 * MAX_BATCH;
+            + 2 * QWEN35_MAX_TOKENS;
 
         assert_eq!(report.output_values, active_tokens * output_per_token);
-        assert_eq!(report.untouched_values, 114_688);
-        assert_eq!(report.graph_replay_values, 262_144);
+        assert_eq!(report.untouched_values, 4_702_208);
+        assert_eq!(report.graph_replay_values, 5_767_168);
         assert_eq!(
             report.immutable_input_values,
-            2 * MAX_BATCH * immutable_per_check
+            2 * QWEN35_ROUTES.len() * immutable_per_check
         );
-        assert_eq!(report.arena_bytes - report.padding_bytes, 6_553_760);
+        assert_eq!(report.arena_bytes - report.padding_bytes, 10_486_880);
         assert_eq!(report.cache_bytes, 6_291_456);
-        assert_eq!(report.workspace_bytes, 262_304);
+        assert_eq!(report.workspace_bytes, 4_195_424);
         assert!(report.maximum_absolute_error <= 0.003);
-        let (arena, regions) = layout::<Qwen35_9B>(MAX_BATCH, size_of::<u16>())?;
-        assert_eq!(arena.byte_len(), 6_554_368);
-        assert_eq!(arena.byte_len() - regions.payload_bytes(), 608);
+        let (arena, regions) = layout::<Qwen35_9B>(QWEN35_MAX_TOKENS, size_of::<u16>())?;
+        assert_eq!(arena.byte_len(), 10_487_040);
+        assert_eq!(arena.byte_len() - regions.payload_bytes(), 160);
 
         Ok(())
     }

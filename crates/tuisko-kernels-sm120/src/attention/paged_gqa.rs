@@ -4,9 +4,9 @@ use crate::Sm120Arch;
 use crate::device::paged_gqa::{
     BF16_PREFILL_SHARED_BYTES, BF16_PREFILL_THREADS, FLASH_PREFILL_P8_SHARED_BYTES,
     FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS, PREFILL_PARTIAL_VALUES,
-    PREFILL_SHARED_BYTES, PREFILL_THREADS, bf16_paged_gqa, bf16_paged_gqa_prefill_shared,
-    paged_gqa, paged_gqa_prefill_flash_partitioned, paged_gqa_prefill_partitioned_reduce,
-    paged_gqa_prefill_shared,
+    PREFILL_SHARED_BYTES, PREFILL_THREADS, QWEN35_BF16_PREFILL_THREADS, bf16_paged_gqa,
+    bf16_paged_gqa_prefill_shared, paged_gqa, paged_gqa_prefill_flash_partitioned,
+    paged_gqa_prefill_partitioned_reduce, paged_gqa_prefill_shared,
 };
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
@@ -19,6 +19,7 @@ const PREFILL_SHARED_BYTES_U32: u32 = PREFILL_SHARED_BYTES as u32;
 const BF16_PREFILL_SHARED_BYTES_U32: u32 = BF16_PREFILL_SHARED_BYTES as u32;
 const FLASH_PREFILL_P8_SHARED_BYTES_U32: u32 = FLASH_PREFILL_P8_SHARED_BYTES as u32;
 const FLASH_PREFILL_P16_SHARED_BYTES_U32: u32 = FLASH_PREFILL_P16_SHARED_BYTES as u32;
+const QWEN35_PREFILL_TOKENS: [usize; 3] = [32, 64, 128];
 const QWEN36_PREFILL_TOKENS: [usize; 3] = [32, 64, 128];
 /// First context length routed to the sixteen-partition T=128 schedule.
 pub const PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT: usize = 32_769;
@@ -222,6 +223,47 @@ mod kernels {
         // online-softmax order; grouping heads would be a new arithmetic route.
         unsafe {
             bf16_paged_gqa::<Qwen35_9B, TOKENS>(
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                output,
+            );
+        }
+    }
+
+    /// Applies shared-cache Qwen3.5 BF16 GQA for one exact prompt width.
+    #[kernel]
+    #[launch_bounds(128, 1)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (128, 1, 1),
+        dynamic_shared = 65536,
+        dynamic_shared_alignment = 16,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_paged_gqa_prefill_shared_exact<const TOKENS: usize>(
+        query: *const f32,
+        key_pages: *const u16,
+        value_pages: *const u16,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        lengths: *const u32,
+        output: *mut f32,
+    ) {
+        // At T=128 the decode topology launches 2,048 one-warp CTAs and
+        // rereads each 64-position BF16 K/V tile four times. This route uses
+        // 512 one-token/KV-head CTAs: the four query-head warps share one
+        // 65,536-byte tile. Each warp retains its head, key order, FP32
+        // reduction, and online-softmax recurrence, so arithmetic is unchanged.
+        unsafe {
+            bf16_paged_gqa_prefill_shared::<Qwen35_9B, TOKENS>(
                 query,
                 key_pages,
                 value_pages,
@@ -596,6 +638,64 @@ impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
 
 struct PreparedQwen35Route<const TOKENS: usize> {
     attention: PreparedLaunch<kernels::__qwen35_paged_gqa_exact_CudaKernel<TOKENS>>,
+}
+
+struct PreparedQwen35PrefillRoute<const TOKENS: usize> {
+    attention: PreparedLaunch<kernels::__qwen35_paged_gqa_prefill_shared_exact_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedQwen35PrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !QWEN35_PREFILL_TOKENS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 paged GQA prefill route T={TOKENS} is not admitted"
+            )));
+        }
+        let blocks = u32::try_from(TOKENS * Qwen35_9B::NUM_KV_HEADS)
+            .map_err(|_| GpuError::invalid_launch("Qwen3.5 paged GQA prefill grid exceeds u32"))?;
+
+        Ok(Self {
+            attention: module
+                .prepare_qwen35_paged_gqa_prefill_shared_exact::<TOKENS>(LaunchConfig1D::new(
+                    blocks,
+                    QWEN35_BF16_PREFILL_THREADS as u32,
+                    BF16_PREFILL_SHARED_BYTES_U32,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.5 shared paged GQA prefill", source)
+                })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        query: *const f32,
+        key_pages: *const u16,
+        value_pages: *const u16,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        lengths: *const u32,
+        output: *mut f32,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_paged_gqa_prefill_shared_exact::<TOKENS>(
+                stream,
+                &self.attention,
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                output,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.5 paged GQA prefill", source))
+    }
 }
 
 impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
@@ -1330,7 +1430,7 @@ fn validate_launch(table_stride: usize, key_scale: f32, value_scale: f32) -> Gpu
     Ok(table_stride)
 }
 
-/// Prepared Qwen3.5 short-context BF16 paged GQA routes for exact `B=1..8`.
+/// Prepared Qwen3.5 BF16 paged GQA routes for exact `B=1..8` and `T=32,64,128`.
 pub struct Qwen35PagedGqaOp {
     module: kernels::LoadedModule,
     b1: PreparedQwen35Route<1>,
@@ -1341,6 +1441,9 @@ pub struct Qwen35PagedGqaOp {
     b6: PreparedQwen35Route<6>,
     b7: PreparedQwen35Route<7>,
     b8: PreparedQwen35Route<8>,
+    t32: PreparedQwen35PrefillRoute<32>,
+    t64: PreparedQwen35PrefillRoute<64>,
+    t128: PreparedQwen35PrefillRoute<128>,
 }
 
 impl Qwen35PagedGqaOp {
@@ -1361,6 +1464,9 @@ impl Qwen35PagedGqaOp {
             b6: PreparedQwen35Route::prepare(&module)?,
             b7: PreparedQwen35Route::prepare(&module)?,
             b8: PreparedQwen35Route::prepare(&module)?,
+            t32: PreparedQwen35PrefillRoute::prepare(&module)?,
+            t64: PreparedQwen35PrefillRoute::prepare(&module)?,
+            t128: PreparedQwen35PrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -1369,8 +1475,8 @@ impl Qwen35PagedGqaOp {
     ///
     /// # Safety
     ///
-    /// Query and output cover `[batch, 16, 256]` FP32 values. Cache planes
-    /// use `[physical_page, 4, 64, 256]` BF16 values. Metadata covers `batch`;
+    /// Query and output cover `[tokens, 16, 256]` FP32 values. Cache planes
+    /// use `[physical_page, 4, 64, 256]` BF16 values. Metadata covers `tokens`;
     /// each length is nonzero, its table row covers that length rounded up to
     /// 64, and every physical page is resident. Allocations are aligned,
     /// disjoint, live through completion, and belong to `stream`'s context.
@@ -1378,7 +1484,7 @@ impl Qwen35PagedGqaOp {
     pub unsafe fn launch(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        tokens: usize,
         query: *const f32,
         key_pages: *const u16,
         value_pages: *const u16,
@@ -1388,9 +1494,9 @@ impl Qwen35PagedGqaOp {
         lengths: *const u32,
         output: *mut f32,
     ) -> GpuResult<()> {
-        if !admitted_batch(batch) {
+        if !admitted_batch(tokens) && !QWEN35_PREFILL_TOKENS.contains(&tokens) {
             return Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 paged GQA batch {batch} is outside the admitted range 1..={MAX_BATCH}"
+                "Qwen3.5 paged GQA tokens {tokens} must be one of 1..={MAX_BATCH},32,64,128"
             )));
         }
         let table_stride = u32::try_from(table_stride)
@@ -1420,7 +1526,7 @@ impl Qwen35PagedGqaOp {
             };
         }
 
-        match batch {
+        match tokens {
             1 => launch!(b1),
             2 => launch!(b2),
             3 => launch!(b3),
@@ -1429,6 +1535,9 @@ impl Qwen35PagedGqaOp {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
             _ => unreachable!(),
         }
     }
@@ -1575,8 +1684,8 @@ pub(crate) fn paged_gqa_ptx_names() -> Vec<&'static str> {
 }
 
 /// PTX symbols retained for every exact Qwen3.5 BF16 paged GQA route.
-pub(crate) fn qwen35_paged_gqa_ptx_names() -> [&'static str; MAX_BATCH] {
-    [
+pub(crate) fn qwen35_paged_gqa_ptx_names() -> Vec<&'static str> {
+    vec![
         kernels::qwen35_paged_gqa_exact_ptx_name::<1>(),
         kernels::qwen35_paged_gqa_exact_ptx_name::<2>(),
         kernels::qwen35_paged_gqa_exact_ptx_name::<3>(),
@@ -1585,6 +1694,9 @@ pub(crate) fn qwen35_paged_gqa_ptx_names() -> [&'static str; MAX_BATCH] {
         kernels::qwen35_paged_gqa_exact_ptx_name::<6>(),
         kernels::qwen35_paged_gqa_exact_ptx_name::<7>(),
         kernels::qwen35_paged_gqa_exact_ptx_name::<8>(),
+        kernels::qwen35_paged_gqa_prefill_shared_exact_ptx_name::<32>(),
+        kernels::qwen35_paged_gqa_prefill_shared_exact_ptx_name::<64>(),
+        kernels::qwen35_paged_gqa_prefill_shared_exact_ptx_name::<128>(),
     ]
 }
 
@@ -1612,9 +1724,9 @@ mod tests {
         FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS,
         PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES,
         PAGED_GQA_PREFILL_MACRO_TOKENS, PAGED_GQA_PREFILL_PARTIAL_BYTES, PREFILL_SHARED_BYTES,
-        PREFILL_THREADS, QWEN36_PREFILL_TOKENS, THREADS, admitted_batch, admitted_macro_partitions,
-        paged_gqa_prefill_partitions, paged_gqa_ptx_names, qwen35_paged_gqa_ptx_names,
-        qwen36_paged_gqa_ptx_names,
+        PREFILL_THREADS, QWEN35_BF16_PREFILL_THREADS, QWEN35_PREFILL_TOKENS, QWEN36_PREFILL_TOKENS,
+        THREADS, admitted_batch, admitted_macro_partitions, paged_gqa_prefill_partitions,
+        paged_gqa_ptx_names, qwen35_paged_gqa_ptx_names, qwen36_paged_gqa_ptx_names,
     };
     use std::collections::BTreeSet;
 
@@ -1644,7 +1756,7 @@ mod tests {
 
         let qwen35 = qwen35_paged_gqa_ptx_names();
         let qwen35_unique = qwen35.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(qwen35.len(), 8);
+        assert_eq!(qwen35.len(), 11);
         assert_eq!(qwen35_unique.len(), qwen35.len());
         assert!(names.iter().all(|name| !qwen35_unique.contains(name)));
 
@@ -1654,6 +1766,8 @@ mod tests {
         assert_eq!(qwen36_unique.len(), qwen36.len());
         assert!(names.iter().all(|name| !qwen36_unique.contains(name)));
         assert!(qwen35_unique.is_disjoint(&qwen36_unique));
+        assert_eq!(QWEN35_PREFILL_TOKENS, [32, 64, 128]);
+        assert_eq!(QWEN35_BF16_PREFILL_THREADS, 128);
         assert_eq!(QWEN36_PREFILL_TOKENS, [32, 64, 128]);
         assert_eq!(BF16_PREFILL_THREADS, 256);
         assert_eq!(BF16_PREFILL_SHARED_BYTES, 65_536);
