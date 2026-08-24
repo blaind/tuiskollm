@@ -127,13 +127,25 @@ impl Client {
     }
 
     fn blocking(&self) -> Result<Completion> {
+        self.blocking_request(request(false, COMPLETION_TOKENS), "blocking completion")
+    }
+
+    fn blocking_request(&self, request: Value, label: &str) -> Result<Completion> {
         let mut response = self
             .agent
             .post(self.url("/v1/chat/completions"))
-            .send_json(request(false, COMPLETION_TOKENS))?;
-        expect_status(&response, 200, "blocking completion")?;
+            .send_json(request)?;
+        expect_status(&response, 200, label)?;
         let body: Value = response.body_mut().read_json()?;
         validate_blocking(&body)
+    }
+
+    fn expect_rejection(&self, request: Value, label: &str) -> Result<()> {
+        let response = self
+            .agent
+            .post(self.url("/v1/chat/completions"))
+            .send_json(request)?;
+        expect_status(&response, 400, label)
     }
 
     fn streaming(&self) -> Result<Completion> {
@@ -216,6 +228,33 @@ impl Qualification {
 
         let blocking = self.client.blocking()?;
         self.check(!blocking.content.is_empty(), "blocking content is empty")?;
+
+        for (label, stop) in [
+            ("empty stop string", json!("")),
+            ("empty stop list", json!([])),
+        ] {
+            let mut request = request(false, COMPLETION_TOKENS);
+            request["stop"] = stop;
+            let completion = self.client.blocking_request(request, label)?;
+            self.check(
+                completion == blocking,
+                format!(
+                    "{label} changed completion semantics: expected={blocking:?}, actual={completion:?}"
+                ),
+            )?;
+        }
+
+        for field in ["max_tokens", "max_completion_tokens"] {
+            let mut request = request(false, COMPLETION_TOKENS);
+            let request_object = request
+                .as_object_mut()
+                .expect("the qualification request is an object");
+            request_object.remove("max_completion_tokens");
+            request_object.insert(field.into(), json!(0));
+            self.client
+                .expect_rejection(request, &format!("zero {field}"))?;
+            self.check(true, format!("zero {field} was not rejected"))?;
+        }
 
         let streaming = self.client.streaming()?;
         self.check(

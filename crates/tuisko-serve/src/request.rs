@@ -1,6 +1,6 @@
 //! OpenAI chat-completion request admission.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 use std::collections::HashSet;
 use tuisko_engine::{ChatGenerationRequest, SamplingOptions, SamplingPenalties};
@@ -26,9 +26,9 @@ pub struct ChatCompletionRequest {
     tools: Vec<FunctionTool>,
     #[serde(default)]
     tool_choice: Option<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_positive_token_limit")]
     max_tokens: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_positive_token_limit")]
     max_completion_tokens: Option<usize>,
     #[serde(default)]
     temperature: Option<f32>,
@@ -179,7 +179,7 @@ impl ChatCompletionRequest {
                 "only one completion choice is admitted".into(),
             ));
         }
-        if self.stop.as_ref().is_some_and(|stop| !stop.is_null()) {
+        if self.stop.as_ref().is_some_and(has_custom_stop) {
             return Err(ChatRequestError::Invalid(
                 "custom stop sequences are not admitted; the checkpoint EOS set is fixed".into(),
             ));
@@ -260,6 +260,26 @@ impl ChatCompletionRequest {
                 .stream_options
                 .is_some_and(|options| options.include_usage),
         })
+    }
+}
+
+fn deserialize_positive_token_limit<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<usize>::deserialize(deserializer)?;
+    if value == Some(0) {
+        return Err(D::Error::custom("token limit must be at least 1"));
+    }
+    Ok(value)
+}
+
+fn has_custom_stop(stop: &Value) -> bool {
+    match stop {
+        Value::Null => false,
+        Value::String(value) => !value.is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        _ => true,
     }
 }
 
@@ -582,6 +602,32 @@ mod tests {
                 .prepare(1)
                 .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn empty_stop_controls_are_noops_and_zero_token_limits_are_rejected() {
+        for stop in ["null", r#""""#, "[]"] {
+            request(&format!(
+                r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"x"}}],"stop":{stop}}}"#
+            ))
+            .prepare(1)
+            .unwrap();
+        }
+        for stop in [r#""x""#, r#"["x"]"#] {
+            let error = request(&format!(
+                r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"x"}}],"stop":{stop}}}"#
+            ))
+            .prepare(1)
+            .unwrap_err();
+            assert!(error.to_string().contains("custom stop"), "{error}");
+        }
+        for field in ["max_tokens", "max_completion_tokens"] {
+            let body = format!(
+                r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"x"}}],"{field}":0}}"#
+            );
+            let error = serde_json::from_str::<ChatCompletionRequest>(&body).unwrap_err();
+            assert!(error.to_string().contains("at least 1"), "{error}");
         }
     }
 
