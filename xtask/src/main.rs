@@ -34,6 +34,8 @@ const QWEN36_MOE_EXPERTS_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-moe-ex
 const QWEN36_FP8_QKV_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-fp8-qkv-sm120.txt";
 const QWEN36_GDN_INPUT_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-gdn-input-sm120.txt";
 const QWEN36_GDN_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-gdn-output-sm120.txt";
+const QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen36-attention-output-sm120.txt";
 const QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt";
 const QWEN35_GDN_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-gdn-prepare-sm120.txt";
@@ -109,6 +111,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     QWEN36_FP8_QKV_RESOURCE_BASELINE,
     QWEN36_GDN_INPUT_RESOURCE_BASELINE,
     QWEN36_GDN_OUTPUT_RESOURCE_BASELINE,
+    QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINE,
     QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE,
     QWEN35_GDN_PREPARE_RESOURCE_BASELINE,
     QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE,
@@ -226,6 +229,10 @@ const QWEN36_GDN_MOE_LAYER_RESOURCE_BASELINES: &[&str] = &[
     QWEN36_GDN_OUTPUT_RESOURCE_BASELINE,
     QWEN36_MOE_ROUTER_RESOURCE_BASELINE,
     QWEN36_MOE_EXPERTS_RESOURCE_BASELINE,
+];
+const QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINES: &[&str] = &[
+    QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINE,
+    QWEN36_GDN_OUTPUT_RESOURCE_BASELINE,
 ];
 const QWEN35_RESIDENT_MODEL_RESOURCE_BASELINES: &[&str] = &[
     QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE,
@@ -816,6 +823,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-qwen36-fp8-qkv") => bench_qwen36_fp8_qkv(root, &remaining),
         Some("bench-qwen36-gdn-input") => bench_qwen36_gdn_input(root, &remaining),
         Some("bench-qwen36-gdn-output") => bench_qwen36_gdn_output(root, &remaining),
+        Some("bench-qwen36-attention-output") => bench_qwen36_attention_output(root, &remaining),
         Some("bench-qwen36-gdn-prepare") => bench_qwen36_gdn_prepare(root, &remaining),
         Some("bench-qwen36-gdn-recurrence") => bench_qwen36_gdn_recurrence(root, &remaining),
         Some("bench-qwen35-nvfp4-gdn-input") => bench_qwen35_nvfp4_gdn_input(root, &remaining),
@@ -928,6 +936,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("gate-paged-gqa") if remaining.is_empty() => gate_paged_gqa(root),
         Some("gate-qwen35-paged-gqa") if remaining.is_empty() => gate_qwen35_paged_gqa(root),
         Some("gate-qwen36-paged-gqa") if remaining.is_empty() => gate_qwen36_paged_gqa(root),
+        Some("gate-qwen36-attention-output") if remaining.is_empty() => {
+            gate_qwen36_attention_output(root)
+        }
         Some("gate-long-context-paged-gqa") if remaining.is_empty() => {
             gate_long_context_paged_gqa(root)
         }
@@ -996,6 +1007,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "gate-qwen36-fp8-qkv"
                     | "gate-qwen36-gdn-input"
                     | "gate-qwen36-gdn-output"
+                    | "gate-qwen36-attention-output"
                     | "gate-qwen35-attention-qk-prepare"
                     | "gate-qwen36-attention-qk-prepare"
                     | "gate-qwen35-nvfp4-attention-output"
@@ -1215,6 +1227,7 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_qwen36_fp8_qkv(root)?;
     gate_qwen36_gdn_input(root)?;
     gate_qwen36_gdn_output(root)?;
+    gate_qwen36_attention_output(root)?;
     gate_qwen35_nvfp4_gdn_input(root)?;
     gate_qwen35_gdn_prepare(root)?;
     gate_qwen35_gdn_recurrence(root)?;
@@ -1686,7 +1699,9 @@ fn qualify_qwen36_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
             "--nocapture",
             "--test-threads=1",
         ],
-    )
+    )?;
+    gate_qwen36_gdn_output(root)?;
+    gate_qwen36_attention_output(root)
 }
 
 fn qualify_qwen36_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -3803,6 +3818,33 @@ fn bench_qwen36_gdn_output(
                 "TUISKO_GENERATOR_BASELINE_SHA256",
                 sha256(&fs::read(root.join(QWEN36_GDN_OUTPUT_RESOURCE_BASELINE))?),
             ),
+    )
+}
+
+fn bench_qwen36_attention_output(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = Vec::new();
+    for baseline in QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINES {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen36-attention-output")
+            .args(arguments)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
     )
 }
 
@@ -10703,6 +10745,82 @@ fn gate_qwen36_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn gate_qwen36_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; run the pinned release device build first",
+            ptx_path.display()
+        )
+    })?;
+    let entries = parse_entries(&ptx);
+    let gates = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen36_attention_output_gate_bf16_TID_")
+        })
+        .collect::<Vec<_>>();
+    require_count("Qwen3.6 attention-output gate", gates.len(), 8)?;
+
+    for entry in &gates {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        for instruction in ["ex2.approx.f32", "st.global.b16"] {
+            if !entry.body.contains(instruction) {
+                return Err(format!(
+                    "Qwen3.6 attention-output gate `{}` lost `{instruction}` PTX",
+                    entry.name
+                )
+                .into());
+            }
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    let mut registers = Vec::with_capacity(gates.len());
+    let mut shared = Vec::with_capacity(gates.len());
+    for entry in gates {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted Qwen3.6 gate `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted Qwen3.6 gate SASS `{}`", entry.name))?;
+        for instruction in ["MUFU.EX2", "STG.E.U16"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+        registers.push(resource.registers);
+        shared.push(resource.shared);
+    }
+    registers.sort_unstable();
+    shared.sort_unstable();
+    require_registers(&baseline, "gate_registers", &registers)?;
+    require_uniform_value(&baseline, "shared_bytes", &shared)?;
+
+    println!(
+        "Qwen3.6 attention-output gate passed: 8 gate entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, EX2/BF16-store present",
+        registers, shared
+    );
+    Ok(())
+}
+
 fn gate_qwen35_nvfp4_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(
         root.join(QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE),
@@ -11791,6 +11909,7 @@ mod tests {
                 "qual/baselines/qwen36-fp8-qkv-sm120.txt",
                 "qual/baselines/qwen36-gdn-input-sm120.txt",
                 "qual/baselines/qwen36-gdn-output-sm120.txt",
+                "qual/baselines/qwen36-attention-output-sm120.txt",
                 "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt",
                 "qual/baselines/qwen35-gdn-prepare-sm120.txt",
                 "qual/baselines/qwen35-gdn-recurrence-sm120.txt",

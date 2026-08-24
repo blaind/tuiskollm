@@ -250,6 +250,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-qwen36-fp8-qkv` | Measure every exact Qwen3.6 static-FP8 full-attention Q/K/V graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-input` | Measure every exact Qwen3.6 static-FP8 Q/K/V/Z plus BF16 A/B control graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-output` | Measure every exact Qwen3.6 static-FP8 GDN output graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-attention-output` | Measure every complete Qwen3.6 sigmoid-gate, BF16-stage, and static-FP8 output graph with input restoration outside timing | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-prepare` | Measure every exact Qwen3.6 control/convolution graph through the shared exact-geometry binary route | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-recurrence` | Measure every exact Qwen3.6 recurrent state graph through the shared exact-geometry binary route | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-gdn-input` | Measure every exact Qwen3.5 fused NVFP4 Q/K/V/Z and A/B graph | terminal or `--json PATH` |

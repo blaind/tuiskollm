@@ -146,8 +146,13 @@ zero stack/local memory, and 1,024 bytes shared. Timing remains unreported becau
 diagnostic run failed the exclusive-device precondition. The gated attention-output leaf then
 applies the query-paired sigmoid gate, publishes the BF16 projection seam, statically quantizes it
 with the admitted scalar scale, and consumes the source-native E4M3 `[2048,4096]` output plane at
-every exact `B=1..8`. Its feature gate covers the complete eager and captured path; resource
-evidence and timing remain a separate follow-up slice. The full layer owner remains separate.
+every exact `B=1..8`. Its independent oracle passes 147,456 gated FP32 values, 147,456 exact BF16
+staging values, 147,456 exact E4M3 codes, 73,728 FP64-formula outputs, 516,096 graph-replay values,
+and 802,816 inactive sentinels with immutable sources, stable addresses, and zero post-warmup
+growth in an 8,798,208-byte arena. The eight gate entries use 26 registers, zero stack/local
+memory, and 1,024 bytes shared; the reused static-FP8 projection retains its separately checked
+resource contract. Timing remains unreported because the available run failed the exclusive-device
+precondition after qualification. The full layer owner remains separate.
 
 ## Implementation order
 
