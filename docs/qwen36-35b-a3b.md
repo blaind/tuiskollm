@@ -191,11 +191,13 @@ eight decode and three prompt gate entries use 26 registers, zero stack/local me
 bytes shared; the reused static-FP8 projection retains its separately checked resource contract.
 At a fixed 2,197 MHz SM and 13,801 MHz memory clock, the unblessed complete graph measures
 71.294/71.714/73.003 us at T=32/64/128; B=1/8 measure 18.440/32.642 us. One source-backed layer-3
-owner now composes these attention
-leaves, both residual seams, and the routed/shared MoE boundary into eight exact-B graphs over one
-487,394,048-byte arena. Its B=1 source oracle and all-batch lifecycle gate pass with 483,085,312
-resident weight bytes, 3,145,728 BF16 cache bytes, and 1,161,680 workspace bytes. Its unblessed
-direct diagnostic measures 122.901/255.794 us at B=1/8 while clocks span 2,070--2,197 MHz.
+owner composes these leaves, both residual seams, and the routed/shared MoE boundary into exact
+`B=1..8` and `T=32/64/128` graphs over one 504,819,456-byte arena. The complete source and
+lifecycle gate covers all eleven routes, immutable runtime inputs, inactive cache and workspace
+extents, stable addresses, and zero post-warmup growth. It owns 483,085,312 resident weight bytes,
+3,145,728 BF16 cache bytes, and 18,587,584 workspace bytes. An uncontrolled-clock diagnostic
+measures 122.720/254.824 us at B=1/8 and 400.194/636.714/1,149.554 us at T=32/64/128 while SM
+clocks span 2,122--2,175 MHz; these values are not baseline authority.
 
 The NVFP4 endpoint prerequisite now owns eight exact A16 LM-head routes over the source-represented
 `[248320,2048]` plane. It retains BF16 activations rather than requantizing them, reads packed E2M1
@@ -218,8 +220,8 @@ direct graph measures 199.142/448.010 us at B=1/8; the repeated intrinsic path m
 
 The initial resident text layout then composes 30 GDN/MoE layers, ten full-attention/MoE layers,
 and the endpoint into 41 address-stable arenas. It accounts 19,808,036,096 device weight bytes,
-31,457,280 short-context BF16 cache bytes, 563,187,136 workspace/state bytes, and 46,400 alignment
-bytes for a 20,402,726,912-byte allocation. Eight whole-model decode graphs chain each layer's
+31,457,280 short-context BF16 cache bytes, 737,446,176 workspace/state bytes, and 41,440 alignment
+bytes for a 20,576,980,992-byte allocation. Eight whole-model decode graphs chain each layer's
 BF16 publication directly into the next owner. The real checkpoint passes all eight eager/graph
 routes, 76,032 represented endpoint-oracle values, 8,939,520 finite logits, inactive-row and
 replacement-input checks, all 41 stable addresses, zero post-warmup growth, and the complete

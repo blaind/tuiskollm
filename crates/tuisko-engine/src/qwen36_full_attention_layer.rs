@@ -1,7 +1,8 @@
 //! Resident source-backed Qwen3.6 full-attention plus MoE decoder layer.
 
 use crate::qwen36_full_attention_layer_layout::{
-    QWEN36_CONTEXT_CAPACITY, QWEN36_TABLE_STRIDE, Qwen36FullAttentionLayerRegions,
+    QWEN36_CONTEXT_CAPACITY, QWEN36_MAX_ROWS, QWEN36_PREFILL_CONTEXT_CAPACITY,
+    QWEN36_PREFILL_TABLE_STRIDE, QWEN36_TABLE_STRIDE, Qwen36FullAttentionLayerRegions,
 };
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen36FullAttentionLayerLayout};
 use std::sync::Arc;
@@ -16,10 +17,11 @@ use tuisko_model::{
 
 const ROTARY_PAIRS: usize = 32;
 
-/// One Qwen3.6 full-attention layer with immutable exact-batch graph routes.
+/// One Qwen3.6 full-attention layer with immutable exact decode and prefill graphs.
 pub struct Qwen36FullAttentionLayerProgram {
     // Drop graphs before the arena and loaded modules whose handles they retain.
     graphs: [CudaGraph; MAX_BATCH],
+    prefill_graphs: [CudaGraph; 3],
     arena: DeviceArena,
     _norm: Qwen36ResidualNormOp,
     _qkv: Qwen36Fp8QkvOp,
@@ -62,6 +64,11 @@ struct Pointers {
     table_rows: *const u32,
     cache_positions: *const u32,
     lengths: *const u32,
+    prefill_rope_cos: *const f32,
+    prefill_rope_sin: *const f32,
+    prefill_table_rows: *const u32,
+    prefill_cache_positions: *const u32,
+    prefill_lengths: *const u32,
     query: *mut f32,
     key_pages: *mut u16,
     value_pages: *mut u16,
@@ -114,6 +121,11 @@ impl Pointers {
             table_rows: arena.address(regions.table_rows)?.cast_const(),
             cache_positions: arena.address(regions.cache_positions)?.cast_const(),
             lengths: arena.address(regions.lengths)?.cast_const(),
+            prefill_rope_cos: arena.address(regions.prefill_rope_cos)?.cast_const(),
+            prefill_rope_sin: arena.address(regions.prefill_rope_sin)?.cast_const(),
+            prefill_table_rows: arena.address(regions.prefill_table_rows)?.cast_const(),
+            prefill_cache_positions: arena.address(regions.prefill_cache_positions)?.cast_const(),
+            prefill_lengths: arena.address(regions.prefill_lengths)?.cast_const(),
             query: arena.address(regions.query)?,
             key_pages: arena.address(regions.key_pages)?,
             value_pages: arena.address(regions.value_pages)?,
@@ -171,6 +183,11 @@ impl Pointers {
             self.table_rows.addr(),
             self.cache_positions.addr(),
             self.lengths.addr(),
+            self.prefill_rope_cos.addr(),
+            self.prefill_rope_sin.addr(),
+            self.prefill_table_rows.addr(),
+            self.prefill_cache_positions.addr(),
+            self.prefill_lengths.addr(),
             self.query.addr(),
             self.key_pages.addr(),
             self.value_pages.addr(),
@@ -220,7 +237,7 @@ struct Ops<'a> {
 }
 
 impl Qwen36FullAttentionLayerProgram {
-    /// Loads one admitted source layer and captures exact `B=1..=8` decode routes.
+    /// Loads one source layer and captures exact `B=1..8` and `T=32,64,128` routes.
     pub fn from_snapshot(
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
@@ -369,10 +386,12 @@ impl Qwen36FullAttentionLayerProgram {
             router: &router,
             experts: &experts,
         };
-        let graphs = capture_routes(&stream, ops, pointers, scales)?;
+        let graphs = capture_decode_routes(&stream, ops, pointers, scales)?;
+        let prefill_graphs = capture_prefill_routes(&stream, ops, pointers, scales)?;
 
         Ok(Self {
             graphs,
+            prefill_graphs,
             arena,
             _norm: norm,
             _qkv: qkv,
@@ -390,23 +409,70 @@ impl Qwen36FullAttentionLayerProgram {
         })
     }
 
-    /// Uploads exactly `batch` BF16 residual rows into stable input storage.
+    /// Uploads one exact decode or prefill width into stable input storage.
     pub fn load_residual(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         values: &[u16],
     ) -> EngineResult<()> {
-        require_batch(batch)?;
-        let expected = product("Qwen3.6 attention input", batch, Qwen36Moe35B::HIDDEN)?;
+        require_rows(rows)?;
+        let expected = product("Qwen3.6 attention input", rows, Qwen36Moe35B::HIDDEN)?;
         if values.len() != expected {
             return Err(EngineError::layout(format!(
-                "Qwen3.6 attention input has {} values, expected {expected} for B={batch}",
+                "Qwen3.6 attention input has {} values, expected {expected} for rows={rows}",
                 values.len()
             )));
         }
         self.arena
             .copy_prefix_from_host(stream, self.layout.regions().residual_input, values)?;
+
+        Ok(())
+    }
+
+    /// Loads a contiguous from-empty causal prefill tile and its 32 MRoPE pairs.
+    pub fn load_prefill_state(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        if prefill_index(tokens).is_none() {
+            return Err(EngineError::route(format!(
+                "Qwen3.6 full-attention prefill tokens {tokens} are outside 32,64,128"
+            )));
+        }
+        let rotary_values = product(
+            "Qwen3.6 attention prefill rotary values",
+            tokens,
+            ROTARY_PAIRS,
+        )?;
+        if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
+            return Err(EngineError::layout(format!(
+                "Qwen3.6 attention prefill rotary planes must each have {rotary_values} values for T={tokens}"
+            )));
+        }
+        if tokens > QWEN36_PREFILL_CONTEXT_CAPACITY {
+            return Err(EngineError::route(format!(
+                "Qwen3.6 attention prefill T={tokens} exceeds the {QWEN36_PREFILL_CONTEXT_CAPACITY}-token shared cache"
+            )));
+        }
+
+        let positions = (0..tokens as u32).collect::<Vec<_>>();
+        let lengths = (1..=tokens as u32).collect::<Vec<_>>();
+        let table_rows = vec![0u32; tokens];
+        let regions = self.layout.regions();
+        self.arena
+            .copy_prefix_from_host(stream, regions.prefill_table_rows, &table_rows)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.prefill_cache_positions, &positions)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.prefill_lengths, &lengths)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.prefill_rope_cos, rope_cos)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.prefill_rope_sin, rope_sin)?;
 
         Ok(())
     }
@@ -492,20 +558,20 @@ impl Qwen36FullAttentionLayerProgram {
         Ok(())
     }
 
-    /// Replays the immutable graph for one exact batch.
-    pub fn replay(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
+    /// Replays the immutable graph for one admitted row count.
+    pub fn replay(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        let graph = self.graph(rows)?;
         // SAFETY: this Qwen36FullAttentionLayerProgram owns every captured
         // allocation (arena, op modules) for its whole life and drops the graphs first.
-        unsafe { self.graphs[batch - 1].launch(stream) }?;
+        unsafe { graph.launch(stream) }?;
 
         Ok(())
     }
 
     /// Reads active BF16 residual output rows.
-    pub fn read_residual(&self, stream: &CudaStream, batch: usize) -> EngineResult<Vec<u16>> {
-        require_batch(batch)?;
-        let values = product("Qwen3.6 attention output", batch, Qwen36Moe35B::HIDDEN)?;
+    pub fn read_residual(&self, stream: &CudaStream, rows: usize) -> EngineResult<Vec<u16>> {
+        require_rows(rows)?;
+        let values = product("Qwen3.6 attention output", rows, Qwen36Moe35B::HIDDEN)?;
 
         Ok(self
             .arena
@@ -552,9 +618,19 @@ impl Qwen36FullAttentionLayerProgram {
         self.layout.context_capacity()
     }
 
+    /// From-empty prompt capacity of the shared physical-page row.
+    pub const fn prefill_context_capacity(&self) -> usize {
+        self.layout.prefill_context_capacity()
+    }
+
     /// Largest admitted exact batch.
     pub const fn batch_capacity(&self) -> usize {
         MAX_BATCH
+    }
+
+    /// Largest admitted exact row count.
+    pub const fn row_capacity(&self) -> usize {
+        QWEN36_MAX_ROWS
     }
 
     /// Checked owner layout.
@@ -567,31 +643,45 @@ impl Qwen36FullAttentionLayerProgram {
         &self.snapshot
     }
 
+    fn graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
+        if (1..=MAX_BATCH).contains(&rows) {
+            return Ok(&self.graphs[rows - 1]);
+        }
+        let index = prefill_index(rows).ok_or_else(|| {
+            EngineError::route(format!(
+                "Qwen3.6 full-attention row count {rows} is outside 1..={MAX_BATCH},32,64,128"
+            ))
+        })?;
+
+        Ok(&self.prefill_graphs[index])
+    }
+
     /// Launches this layer from another resident owner's BF16 residual plane.
     ///
     /// # Safety
-    /// `input` covers `batch * 2,048` BF16 values in this CUDA context.
+    /// `input` covers `rows * 2,048` BF16 values in this CUDA context.
     #[allow(dead_code)]
     pub(crate) unsafe fn launch_from(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         input: *const u16,
     ) -> GpuResult<*const u16> {
         let mut pointers = Pointers::bind(&self.arena, self.layout.regions())?;
         pointers.residual_input = input;
-        launch_route(stream, batch, self.ops(), pointers, self.scales)?;
+        require_rows(rows).map_err(|error| GpuError::invalid_launch(error.to_string()))?;
+        launch_route(stream, rows, self.ops(), pointers, self.scales)?;
 
         Ok(pointers.residual_output.cast_const())
     }
 
     #[cfg(feature = "qualification")]
     /// Launches the production route eagerly for graph-agreement qualification.
-    pub fn launch_eager(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
+    pub fn launch_eager(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        require_rows(rows)?;
         launch_route(
             stream,
-            batch,
+            rows,
             self.ops(),
             Pointers::bind(&self.arena, self.layout.regions())?,
             self.scales,
@@ -602,9 +692,8 @@ impl Qwen36FullAttentionLayerProgram {
 
     #[cfg(feature = "qualification")]
     /// Returns one captured production graph.
-    pub fn qualification_graph(&self, batch: usize) -> EngineResult<&CudaGraph> {
-        require_batch(batch)?;
-        Ok(&self.graphs[batch - 1])
+    pub fn qualification_graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
+        self.graph(rows)
     }
 
     #[cfg(feature = "qualification")]
@@ -612,10 +701,10 @@ impl Qwen36FullAttentionLayerProgram {
     pub fn qualification_repeated_graph(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         operations: u64,
     ) -> EngineResult<CudaGraph> {
-        require_batch(batch)?;
+        require_rows(rows)?;
         if operations == 0 {
             return Err(EngineError::route(
                 "repeated Qwen3.6 full-attention graph requires at least one operation",
@@ -627,7 +716,7 @@ impl Qwen36FullAttentionLayerProgram {
 
         Ok(CudaGraph::capture(stream, || {
             for _ in 0..operations {
-                launch_route(stream, batch, ops, pointers, scales)?;
+                launch_route(stream, rows, ops, pointers, scales)?;
             }
             Ok(())
         })?)
@@ -731,6 +820,34 @@ impl Qwen36FullAttentionLayerProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Reads every graph input whose contents may vary between launches.
+    pub fn qualification_runtime_inputs(
+        &self,
+        stream: &CudaStream,
+    ) -> EngineResult<Qwen36FullAttentionLayerInputs> {
+        let regions = self.layout.regions();
+
+        Ok(Qwen36FullAttentionLayerInputs {
+            residual_input: self.arena.copy_to_host(stream, regions.residual_input)?,
+            block_tables: self.arena.copy_to_host(stream, regions.block_tables)?,
+            rope_cos: self.arena.copy_to_host(stream, regions.rope_cos)?,
+            rope_sin: self.arena.copy_to_host(stream, regions.rope_sin)?,
+            table_rows: self.arena.copy_to_host(stream, regions.table_rows)?,
+            cache_positions: self.arena.copy_to_host(stream, regions.cache_positions)?,
+            lengths: self.arena.copy_to_host(stream, regions.lengths)?,
+            prefill_rope_cos: self.arena.copy_to_host(stream, regions.prefill_rope_cos)?,
+            prefill_rope_sin: self.arena.copy_to_host(stream, regions.prefill_rope_sin)?,
+            prefill_table_rows: self
+                .arena
+                .copy_to_host(stream, regions.prefill_table_rows)?,
+            prefill_cache_positions: self
+                .arena
+                .copy_to_host(stream, regions.prefill_cache_positions)?,
+            prefill_lengths: self.arena.copy_to_host(stream, regions.prefill_lengths)?,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
     /// Reads every immutable device plane in source/materialized order.
     pub fn qualification_immutable(
         &self,
@@ -794,6 +911,35 @@ impl Qwen36FullAttentionLayerProgram {
             experts: &self._experts,
         }
     }
+}
+
+#[cfg(feature = "qualification")]
+/// Runtime-owned planes that must remain immutable during a layer launch.
+pub struct Qwen36FullAttentionLayerInputs {
+    /// BF16 residual rows consumed by the layer.
+    pub residual_input: Vec<u16>,
+    /// Complete physical-page inventory shared by both attention routes.
+    pub block_tables: Vec<u32>,
+    /// Decode MRoPE cosine values.
+    pub rope_cos: Vec<f32>,
+    /// Decode MRoPE sine values.
+    pub rope_sin: Vec<f32>,
+    /// Decode block-table rows.
+    pub table_rows: Vec<u32>,
+    /// Decode cache positions.
+    pub cache_positions: Vec<u32>,
+    /// Decode causal lengths.
+    pub lengths: Vec<u32>,
+    /// Prefill MRoPE cosine values.
+    pub prefill_rope_cos: Vec<f32>,
+    /// Prefill MRoPE sine values.
+    pub prefill_rope_sin: Vec<f32>,
+    /// Prefill block-table rows.
+    pub prefill_table_rows: Vec<u32>,
+    /// Prefill cache positions.
+    pub prefill_cache_positions: Vec<u32>,
+    /// Prefill causal lengths.
+    pub prefill_lengths: Vec<u32>,
 }
 
 #[cfg(feature = "qualification")]
@@ -886,7 +1032,7 @@ pub struct Qwen36FullAttentionLayerImmutable {
     pub next_norm: Vec<u16>,
 }
 
-fn capture_routes(
+fn capture_decode_routes(
     stream: &CudaStream,
     ops: Ops<'_>,
     pointers: Pointers,
@@ -900,31 +1046,72 @@ fn capture_routes(
     }
 
     graphs.try_into().map_err(|_| {
-        EngineError::layout("Qwen3.6 full-attention graph inventory has wrong cardinality")
+        EngineError::layout("Qwen3.6 full-attention decode graph inventory has wrong cardinality")
+    })
+}
+
+fn capture_prefill_routes(
+    stream: &CudaStream,
+    ops: Ops<'_>,
+    pointers: Pointers,
+    scales: SourceScales,
+) -> EngineResult<[CudaGraph; 3]> {
+    // T=128 would otherwise require sixteen B=8 layer graphs and 15 extra
+    // graph boundaries. This composes the same seven qualified T=128 leaves,
+    // so every leaf retains its accumulation and rounding order.
+    let mut graphs = Vec::with_capacity(3);
+    for rows in [32, 64, 128] {
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_route(stream, rows, ops, pointers, scales)
+        })?);
+    }
+
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("Qwen3.6 full-attention prefill graph inventory has wrong cardinality")
     })
 }
 
 fn launch_route(
     stream: &CudaStream,
-    batch: usize,
+    rows: usize,
     ops: Ops<'_>,
     pointers: Pointers,
     scales: SourceScales,
 ) -> GpuResult<()> {
-    // SAFETY: one arena owns aligned, disjoint maximum-batch planes. Fixed
-    // three-page slot tables cover every admitted decode position, and every
-    // launcher selects the separately compiled exact-B route.
+    let (rope_cos, rope_sin, table_rows, cache_positions, lengths, table_stride) =
+        if rows <= MAX_BATCH {
+            (
+                pointers.rope_cos,
+                pointers.rope_sin,
+                pointers.table_rows,
+                pointers.cache_positions,
+                pointers.lengths,
+                QWEN36_TABLE_STRIDE,
+            )
+        } else {
+            (
+                pointers.prefill_rope_cos,
+                pointers.prefill_rope_sin,
+                pointers.prefill_table_rows,
+                pointers.prefill_cache_positions,
+                pointers.prefill_lengths,
+                QWEN36_PREFILL_TABLE_STRIDE,
+            )
+        };
+    // SAFETY: one arena owns aligned, disjoint 128-row planes. Decode uses
+    // three-page slot rows; prefill uses one shared 24-page row. Each leaf
+    // selects the same exact row count, preserving its qualified arithmetic.
     unsafe {
         ops.norm.launch_plain(
             stream,
-            batch,
+            rows,
             pointers.residual_input,
             pointers.input_norm,
             pointers.mixer_normalized,
         )?;
         ops.qkv.launch(
             stream,
-            batch,
+            rows,
             pointers.mixer_normalized,
             pointers.qkv_activation_codes,
             scales.qkv_input,
@@ -936,35 +1123,35 @@ fn launch_route(
         )?;
         ops.qk_prepare.launch(
             stream,
-            batch,
+            rows,
             pointers.qkv,
             pointers.query_norm,
             pointers.key_norm,
-            pointers.rope_cos,
-            pointers.rope_sin,
+            rope_cos,
+            rope_sin,
             pointers.block_tables,
-            pointers.table_rows,
-            QWEN36_TABLE_STRIDE,
-            pointers.cache_positions,
+            table_rows,
+            table_stride,
+            cache_positions,
             pointers.query,
             pointers.key_pages,
             pointers.value_pages,
         )?;
         ops.paged_gqa.launch(
             stream,
-            batch,
+            rows,
             pointers.query,
             pointers.key_pages,
             pointers.value_pages,
             pointers.block_tables,
-            pointers.table_rows,
-            QWEN36_TABLE_STRIDE,
-            pointers.lengths,
+            table_rows,
+            table_stride,
+            lengths,
             pointers.attention,
         )?;
         ops.attention_output.launch(
             stream,
-            batch,
+            rows,
             pointers.attention,
             pointers.qkv,
             pointers.output_activation,
@@ -976,7 +1163,7 @@ fn launch_route(
         )?;
         ops.norm.launch_residual(
             stream,
-            batch,
+            rows,
             pointers.residual_input,
             pointers.mixer_branch,
             pointers.post_attention_norm,
@@ -985,7 +1172,7 @@ fn launch_route(
         )?;
         ops.router.launch(
             stream,
-            batch,
+            rows,
             pointers.moe_normalized,
             pointers.router_weight,
             pointers.router_logits,
@@ -994,7 +1181,7 @@ fn launch_route(
         )?;
         ops.experts.launch(
             stream,
-            batch,
+            rows,
             pointers.moe_normalized,
             pointers.expert_indices,
             pointers.routing_weights,
@@ -1018,7 +1205,7 @@ fn launch_route(
         )?;
         ops.norm.launch_residual(
             stream,
-            batch,
+            rows,
             pointers.mixer_residual,
             pointers.moe_branch,
             pointers.next_norm,
@@ -1040,6 +1227,25 @@ fn require_batch(batch: usize) -> EngineResult<()> {
     Ok(())
 }
 
+fn prefill_index(rows: usize) -> Option<usize> {
+    match rows {
+        32 => Some(0),
+        64 => Some(1),
+        128 => Some(2),
+        _ => None,
+    }
+}
+
+fn require_rows(rows: usize) -> EngineResult<()> {
+    if (1..=MAX_BATCH).contains(&rows) || prefill_index(rows).is_some() {
+        return Ok(());
+    }
+
+    Err(EngineError::route(format!(
+        "Qwen3.6 full-attention row count {rows} is outside 1..={MAX_BATCH},32,64,128"
+    )))
+}
+
 fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
     left.checked_mul(right)
         .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
@@ -1047,7 +1253,7 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, ROTARY_PAIRS, require_batch};
+    use super::{MAX_BATCH, ROTARY_PAIRS, prefill_index, require_batch, require_rows};
     use crate::EngineErrorCode;
 
     #[test]
@@ -1060,5 +1266,22 @@ mod tests {
             assert_eq!(error.code(), Some(EngineErrorCode::Route));
         }
         assert_eq!(ROTARY_PAIRS, 32);
+    }
+
+    #[test]
+    fn exact_row_table_covers_decode_and_prefill_only() {
+        for rows in [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128] {
+            require_rows(rows).unwrap();
+        }
+        assert_eq!(prefill_index(32), Some(0));
+        assert_eq!(prefill_index(64), Some(1));
+        assert_eq!(prefill_index(128), Some(2));
+        for rows in [0, 9, 31, 33, 63, 65, 127, 129, usize::MAX] {
+            assert_eq!(prefill_index(rows), None);
+            assert_eq!(
+                require_rows(rows).unwrap_err().code(),
+                Some(EngineErrorCode::Route)
+            );
+        }
     }
 }
