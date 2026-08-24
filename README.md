@@ -74,9 +74,10 @@ request uses draft-three speculative generation, exact target verification at `K
 streaming tokens per request; blocking and SSE responses retain that committed order.
 
 The compact owner preserves the final emitted token as pending, packs only requests needing device
-work, cancels without advancing that pending token, and recycles holes without moving survivor
-state. Inactive slots retain their exact processed target/MTP token span and may skip only a prefix
-that the next prompt contains in full; divergence falls back to cold priming. Admission greedily
+work, and recycles holes without moving survivor state. Cancellation restores the last complete
+message's hidden and GDN state from fixed page-locked snapshots and truncates both target/MTP caches
+to that boundary. Inactive slots may skip only an exact retained prefix that the next prompt contains
+in full; divergence falls back to cold priming. Admission greedily
 processes cold prompts and reused-prefix suffixes with exact T1024, T128, T64, and T32 whole-model
 graphs. Only the final 0--31 tokens retain the qualified B=1 path; the scheduler neither pads
 recurrent rows nor invents an unqualified chunk width. Vision inputs are not served yet and remain

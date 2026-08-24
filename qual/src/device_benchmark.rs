@@ -462,6 +462,26 @@ impl BenchmarkWorkload {
             execution: BenchmarkExecution::HostSynchronized,
         }
     }
+
+    pub(crate) fn warm_model_cancellation_resume(
+        prompt_tokens: u64,
+        message_boundary_tokens: u64,
+        followup_tokens: u64,
+    ) -> Self {
+        Self {
+            scope: BenchmarkScope::Model,
+            phase: BenchmarkPhase::Request,
+            batch_size: Some(1),
+            concurrency: Some(1),
+            active_tokens: Some(followup_tokens - message_boundary_tokens),
+            prompt_tokens: Some(followup_tokens),
+            context_tokens: Some(prompt_tokens.max(followup_tokens)),
+            output_tokens: None,
+            device_cache: DeviceCacheRegime::Warm,
+            prefix_cache: Some(PrefixCacheRegime::PartialHit),
+            execution: BenchmarkExecution::HostSynchronized,
+        }
+    }
 }
 
 /// Kind of resident memory attributed by a benchmark owner.

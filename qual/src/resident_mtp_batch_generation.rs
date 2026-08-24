@@ -56,6 +56,8 @@ pub struct ResidentMtpBatchGenerationQualification {
     pub device_owner_bytes: usize,
     /// Complete page-locked program and scheduler ownership.
     pub host_stager_bytes: usize,
+    /// Page-locked cancellation snapshots across all eight slots.
+    pub message_boundary_snapshot_bytes: usize,
     /// Exact shared page-route host ownership.
     pub kv_route_host_bytes: usize,
 }
@@ -127,6 +129,7 @@ pub fn qualify_resident_mtp_batch_generation(
         sampled_lanes,
         device_owner_bytes: generator.device_owner_bytes(),
         host_stager_bytes: generator.host_stager_bytes(),
+        message_boundary_snapshot_bytes: generator.message_boundary_snapshot_bytes(),
         kv_route_host_bytes: generator.kv_route_host_bytes(),
     })
 }
@@ -217,18 +220,21 @@ fn qualify_reuse_cancellation_and_recycling(
     let anchors = generator.step()?;
     let b_anchor = one_token(&anchors, b.request_id)?;
     let cancelled = generator.cancel(b.request_id)?;
-    if cancelled.device_retained_tokens != b.prompt_tokens
-        || generator.qualification_retained_tokens(1) != Some(b.prompt_tokens)
+    let boundary_tokens = cancelled.output.prompt.message_boundary_tokens;
+    if boundary_tokens >= b.prompt_tokens
+        || cancelled.device_retained_tokens != boundary_tokens
+        || generator.qualification_retained_tokens(1) != Some(boundary_tokens)
+        || !generator.qualification_message_boundary_matches(1)?
     {
         return Err(ResidentMtpBatchGenerationQualificationError::Mismatch(
-            "middle-slot cancellation retained the wrong processed boundary".to_string(),
+            "middle-slot cancellation did not restore every message-boundary seam".to_string(),
         ));
     }
 
     let reused = generator.admit(&request)?;
-    if reused.device_reused_tokens != b.prompt_tokens {
+    if reused.device_reused_tokens != boundary_tokens {
         return Err(ResidentMtpBatchGenerationQualificationError::Mismatch(
-            "identical prompt did not restore the cancelled target/MTP prefix".to_string(),
+            "identical prompt did not restore the cancelled message boundary".to_string(),
         ));
     }
     require_slot(generator, reused.request_id, 1)?;
@@ -246,19 +252,25 @@ fn qualify_reuse_cancellation_and_recycling(
         ));
     }
 
-    for request in [a.request_id, c.request_id, reused.request_id] {
-        let _ = generator.cancel(request)?;
-    }
-    // A and C have advanced through a speculative transaction, so their retained
-    // spans are longer than the original prompt and must not match it partially.
-    let divergent = generator.admit(&request)?;
-    if divergent.device_reused_tokens != b.prompt_tokens {
-        // B's exact prompt-only cancellation remains one valid retained row. Consume it first.
+    let reused_cancelled = generator.cancel(reused.request_id)?;
+    if reused_cancelled.device_retained_tokens != boundary_tokens {
         return Err(ResidentMtpBatchGenerationQualificationError::Mismatch(
-            "the most recent exact prompt-only retained row was not selected".to_string(),
+            "reused prompt did not retain the same message boundary".to_string(),
         ));
     }
-    let _ = generator.cancel(divergent.request_id)?;
+    let followup = followup_request(8);
+    let followup_admission = generator.admit(&followup)?;
+    if followup_admission.device_reused_tokens != boundary_tokens {
+        return Err(ResidentMtpBatchGenerationQualificationError::Mismatch(
+            "a divergent next turn did not reuse the cancelled message boundary".to_string(),
+        ));
+    }
+    require_slot(generator, followup_admission.request_id, 1)?;
+    let _ = generator.cancel(followup_admission.request_id)?;
+
+    for request in [a.request_id, c.request_id] {
+        let _ = generator.cancel(request)?;
+    }
     generator.qualification_clear_retained()?;
 
     let longer = greedy_request("Give a brief greeting and name one color.", 8);
@@ -435,19 +447,29 @@ fn sampled_request(content: &str, maximum: usize, seed: u64) -> ChatGenerationRe
     request
 }
 
+fn followup_request(maximum: usize) -> ChatGenerationRequest {
+    let mut request = greedy_request("Give a brief greeting.", maximum);
+    request
+        .messages
+        .push(ChatMessage::new("user", "Now name one primary color."));
+    request
+}
+
 fn verify_owner(
     generator: &ResidentMtpBatchGenerator,
 ) -> Result<(), ResidentMtpBatchGenerationQualificationError> {
     if generator.device_owner_bytes() != 30_342_618_624
-        || generator.host_stager_bytes() != 49_385_472
+        || generator.host_stager_bytes() != 1_281_019_904
+        || generator.message_boundary_snapshot_bytes() != 1_231_634_432
         || generator.kv_route_host_bytes() != 113_454
         || generator.context_capacity() != 220_000
     {
         return Err(ResidentMtpBatchGenerationQualificationError::Mismatch(
             format!(
-                "compact MTP owner accounting changed: device={}, host={}, routes={}, capacity={}",
+                "compact MTP owner accounting changed: device={}, host={}, boundary={}, routes={}, capacity={}",
                 generator.device_owner_bytes(),
                 generator.host_stager_bytes(),
+                generator.message_boundary_snapshot_bytes(),
                 generator.kv_route_host_bytes(),
                 generator.context_capacity()
             ),
@@ -494,6 +516,7 @@ mod tests {
         assert_eq!(report.safe_cold_fallbacks, 1);
         assert_eq!(report.sampled_lanes, 3);
         assert_eq!(report.device_owner_bytes, 30_342_618_624);
-        assert_eq!(report.host_stager_bytes, 49_385_472);
+        assert_eq!(report.host_stager_bytes, 1_281_019_904);
+        assert_eq!(report.message_boundary_snapshot_bytes, 1_231_634_432);
     }
 }

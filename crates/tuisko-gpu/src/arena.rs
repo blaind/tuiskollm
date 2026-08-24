@@ -678,20 +678,52 @@ impl DeviceArena {
         source: &PinnedHostBuffer<T>,
         len: usize,
     ) -> GpuResult<()> {
+        unsafe { self.copy_slice_from_pinned_host_async(stream, region, 0, source, 0, len) }
+    }
+
+    /// Enqueues a checked pinned-host subrange upload without synchronizing the stream.
+    ///
+    /// # Safety
+    ///
+    /// `source` must remain allocated and immutable until the copy completes. Captured copies
+    /// require the source and destination addresses to remain stable through final replay.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn copy_slice_from_pinned_host_async<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        destination_start: usize,
+        source: &PinnedHostBuffer<T>,
+        source_start: usize,
+        len: usize,
+    ) -> GpuResult<()> {
         self.require_stream_context(stream, "copying a pinned host prefix into a device arena")?;
         if source.context().as_ref() != stream.context().as_ref() {
             return Err(GpuError::context(
                 "pinned host source and arena stream must share one CUDA context",
             ));
         }
-        if len > source.len() || len > region.len {
+        let destination_end = destination_start
+            .checked_add(len)
+            .ok_or_else(|| GpuError::arena("pinned upload destination range overflows"))?;
+        let source_end = source_start
+            .checked_add(len)
+            .ok_or_else(|| GpuError::arena("pinned upload source range overflows"))?;
+        if destination_end > region.len || source_end > source.len() {
             return Err(GpuError::arena(format!(
-                "pinned upload length {len} exceeds source {} or region {} elements",
+                "pinned upload ranges {source_start}..{source_end} and {destination_start}..{destination_end} exceed source {} or region {} elements",
                 source.len(),
                 region.len
             )));
         }
-        let address = self.address(region)? as u64;
+        let byte_start = destination_start
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena("pinned upload byte offset overflows"))?;
+        let address = (self.address(region)? as u64)
+            .checked_add(u64::try_from(byte_start).map_err(|_| {
+                GpuError::arena("pinned upload byte offset exceeds the device address width")
+            })?)
+            .ok_or_else(|| GpuError::arena("pinned upload device address overflows"))?;
         let bytes = len
             .checked_mul(size_of::<T>())
             .ok_or_else(|| GpuError::arena("pinned upload byte count overflows"))?;
@@ -708,12 +740,79 @@ impl DeviceArena {
         unsafe {
             cuda_core::memory::memcpy_htod_async(
                 address,
-                source.as_ptr(),
+                source.as_ptr().add(source_start),
                 bytes,
                 stream.cu_stream(),
             )
         }
         .map_err(|source| GpuError::driver("copying a pinned host prefix into an arena", source))
+    }
+
+    /// Enqueues a checked device subrange download into pinned host memory.
+    ///
+    /// # Safety
+    ///
+    /// `destination` must remain allocated and must not be read or mutated until the stream
+    /// reaches the copy. Captured copies require stable source and destination addresses.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn copy_slice_to_pinned_host_async<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        source_start: usize,
+        destination: &mut PinnedHostBuffer<T>,
+        destination_start: usize,
+        len: usize,
+    ) -> GpuResult<()> {
+        self.require_stream_context(stream, "copying a device arena into pinned host memory")?;
+        if destination.context().as_ref() != stream.context().as_ref() {
+            return Err(GpuError::context(
+                "pinned host destination and arena stream must share one CUDA context",
+            ));
+        }
+        let source_end = source_start
+            .checked_add(len)
+            .ok_or_else(|| GpuError::arena("pinned download source range overflows"))?;
+        let destination_end = destination_start
+            .checked_add(len)
+            .ok_or_else(|| GpuError::arena("pinned download destination range overflows"))?;
+        if source_end > region.len || destination_end > destination.len() {
+            return Err(GpuError::arena(format!(
+                "pinned download ranges {source_start}..{source_end} and {destination_start}..{destination_end} exceed region {} or destination {} elements",
+                region.len,
+                destination.len()
+            )));
+        }
+        let byte_start = source_start
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena("pinned download byte offset overflows"))?;
+        let address = (self.address(region)? as u64)
+            .checked_add(u64::try_from(byte_start).map_err(|_| {
+                GpuError::arena("pinned download byte offset exceeds the device address width")
+            })?)
+            .ok_or_else(|| GpuError::arena("pinned download device address overflows"))?;
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena("pinned download byte count overflows"))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        stream.context().bind_to_thread().map_err(|source| {
+            GpuError::driver(
+                "binding the arena CUDA context for a pinned download",
+                source,
+            )
+        })?;
+        unsafe {
+            cuda_core::memory::memcpy_dtoh_async(
+                destination.as_mut_ptr().add(destination_start),
+                address,
+                bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|source| GpuError::driver("copying an arena into pinned host memory", source))
     }
 
     /// Enqueues a typed prefix copy between two checked arena regions.
@@ -1151,6 +1250,23 @@ mod tests {
             ]
         );
         assert_eq!(arena.address(values).unwrap(), stable_address);
+
+        let mut pinned_source = PinnedHostBuffer::zeroed(&context, 4).unwrap();
+        pinned_source
+            .as_mut_slice()
+            .copy_from_slice(&[31, 41, 59, 26]);
+        let mut pinned_destination = PinnedHostBuffer::zeroed(&context, 4).unwrap();
+        // SAFETY: both pinned buffers remain live and untouched through the synchronization.
+        unsafe {
+            arena
+                .copy_slice_from_pinned_host_async(&stream, values, 5, &pinned_source, 1, 2)
+                .unwrap();
+            arena
+                .copy_slice_to_pinned_host_async(&stream, values, 5, &mut pinned_destination, 1, 2)
+                .unwrap();
+        }
+        stream.synchronize().unwrap();
+        assert_eq!(pinned_destination.as_slice(), &[0, 41, 59, 0]);
 
         for error in [
             arena

@@ -1519,6 +1519,115 @@ impl ResidentModelProgram {
         Ok(())
     }
 
+    /// Captures one slot's exact GDN history and recurrent state into its stable host row.
+    pub fn capture_gdn_slot(
+        &self,
+        stream: &CudaStream,
+        slot: usize,
+        history: &mut PinnedHostBuffer<u16>,
+        state: &mut PinnedHostBuffer<f32>,
+    ) -> EngineResult<()> {
+        require_slot(slot)?;
+        require_gdn_snapshot_buffers(self, history, state)?;
+        let mut history_offset = product(
+            "resident GDN snapshot history slot offset",
+            slot,
+            self.gdn_slot_history_values(),
+        )?;
+        let mut state_offset = product(
+            "resident GDN snapshot state slot offset",
+            slot,
+            self.gdn_slot_state_values(),
+        )?;
+        for layer in &self.layout.layers {
+            let super::PersistentState::Gdn(persistent) = layer.persistent else {
+                continue;
+            };
+            let history_values = persistent.history.len() / MAX_BATCH;
+            let state_values = persistent.state.len() / MAX_BATCH;
+            // SAFETY: the exact slot slices and pinned destination rows remain stable until the
+            // single synchronization after all 48 layer copies.
+            unsafe {
+                self.arena.copy_slice_to_pinned_host_async(
+                    stream,
+                    persistent.history,
+                    slot * history_values,
+                    history,
+                    history_offset,
+                    history_values,
+                )?;
+                self.arena.copy_slice_to_pinned_host_async(
+                    stream,
+                    persistent.state,
+                    slot * state_values,
+                    state,
+                    state_offset,
+                    state_values,
+                )?;
+            }
+            history_offset += history_values;
+            state_offset += state_values;
+        }
+        debug_assert_eq!(history_offset, (slot + 1) * self.gdn_slot_history_values());
+        debug_assert_eq!(state_offset, (slot + 1) * self.gdn_slot_state_values());
+        stream.synchronize().map_err(GpuError::from)?;
+        Ok(())
+    }
+
+    /// Restores one slot's exact GDN history and recurrent state from its stable host row.
+    pub fn restore_gdn_slot(
+        &self,
+        stream: &CudaStream,
+        slot: usize,
+        history: &PinnedHostBuffer<u16>,
+        state: &PinnedHostBuffer<f32>,
+    ) -> EngineResult<()> {
+        require_slot(slot)?;
+        require_gdn_snapshot_buffers(self, history, state)?;
+        let mut history_offset = product(
+            "resident GDN restore history slot offset",
+            slot,
+            self.gdn_slot_history_values(),
+        )?;
+        let mut state_offset = product(
+            "resident GDN restore state slot offset",
+            slot,
+            self.gdn_slot_state_values(),
+        )?;
+        for layer in &self.layout.layers {
+            let super::PersistentState::Gdn(persistent) = layer.persistent else {
+                continue;
+            };
+            let history_values = persistent.history.len() / MAX_BATCH;
+            let state_values = persistent.state.len() / MAX_BATCH;
+            // SAFETY: the pinned source rows remain immutable and address-stable. Subsequent
+            // work consumes the restored state on the same ordered stream.
+            unsafe {
+                self.arena.copy_slice_from_pinned_host_async(
+                    stream,
+                    persistent.history,
+                    slot * history_values,
+                    history,
+                    history_offset,
+                    history_values,
+                )?;
+                self.arena.copy_slice_from_pinned_host_async(
+                    stream,
+                    persistent.state,
+                    slot * state_values,
+                    state,
+                    state_offset,
+                    state_values,
+                )?;
+            }
+            history_offset += history_values;
+            state_offset += state_values;
+        }
+        debug_assert_eq!(history_offset, (slot + 1) * self.gdn_slot_history_values());
+        debug_assert_eq!(state_offset, (slot + 1) * self.gdn_slot_state_values());
+        Ok(())
+    }
+
     fn clear_slot_cache(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
         let pages = self.kv_slots.page_count(slot)?;
         for logical_page in 0..pages {
@@ -2053,6 +2162,16 @@ impl ResidentModelProgram {
     /// per-slot ownership byte count.
     pub const fn persistent_slot_bytes(&self) -> usize {
         (self.layout.history_bytes() + self.layout.state_bytes()) / MAX_BATCH
+    }
+
+    /// BF16 history values in one exact GDN slot snapshot.
+    pub const fn gdn_slot_history_values(&self) -> usize {
+        self.layout.history_bytes() / MAX_BATCH / std::mem::size_of::<u16>()
+    }
+
+    /// FP32 recurrent values in one exact GDN slot snapshot.
+    pub const fn gdn_slot_state_values(&self) -> usize {
+        self.layout.state_bytes() / MAX_BATCH / std::mem::size_of::<f32>()
     }
 
     /// Exact address-stable workspace bytes shared by every layer and endpoint.
@@ -2784,6 +2903,48 @@ impl ResidentModelProgram {
         debug_assert_eq!(history_offset, expected_history);
         debug_assert_eq!(state_offset, expected_state);
         Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Compares one live GDN slot with its exact stable host snapshot.
+    pub fn qualification_gdn_slot_matches_snapshot(
+        &self,
+        stream: &CudaStream,
+        slot: usize,
+        history: &PinnedHostBuffer<u16>,
+        state: &PinnedHostBuffer<f32>,
+    ) -> EngineResult<bool> {
+        require_slot(slot)?;
+        require_gdn_snapshot_buffers(self, history, state)?;
+        let mut history_offset = slot * self.gdn_slot_history_values();
+        let mut state_offset = slot * self.gdn_slot_state_values();
+        for layer in &self.layout.layers {
+            let super::PersistentState::Gdn(persistent) = layer.persistent else {
+                continue;
+            };
+            let history_values = persistent.history.len() / MAX_BATCH;
+            let state_values = persistent.state.len() / MAX_BATCH;
+            let live_history = self.arena.copy_slice_to_host(
+                stream,
+                persistent.history,
+                slot * history_values,
+                history_values,
+            )?;
+            let live_state = self.arena.copy_slice_to_host(
+                stream,
+                persistent.state,
+                slot * state_values,
+                state_values,
+            )?;
+            if live_history != history[history_offset..history_offset + history_values]
+                || live_state != state[state_offset..state_offset + state_values]
+            {
+                return Ok(false);
+            }
+            history_offset += history_values;
+            state_offset += state_values;
+        }
+        Ok(true)
     }
 
     #[cfg(feature = "qualification")]
@@ -6331,6 +6492,31 @@ fn require_slot(slot: usize) -> EngineResult<()> {
     if slot >= MAX_BATCH {
         return Err(EngineError::route(format!(
             "resident physical slot {slot} is outside 0..{MAX_BATCH}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_gdn_snapshot_buffers(
+    program: &ResidentModelProgram,
+    history: &PinnedHostBuffer<u16>,
+    state: &PinnedHostBuffer<f32>,
+) -> EngineResult<()> {
+    let expected_history = product(
+        "resident GDN snapshot history values",
+        MAX_BATCH,
+        program.gdn_slot_history_values(),
+    )?;
+    let expected_state = product(
+        "resident GDN snapshot state values",
+        MAX_BATCH,
+        program.gdn_slot_state_values(),
+    )?;
+    if history.len() != expected_history || state.len() != expected_state {
+        return Err(EngineError::layout(format!(
+            "resident GDN snapshot buffers have {}/{} history/state values, expected {expected_history}/{expected_state}",
+            history.len(),
+            state.len()
         )));
     }
     Ok(())
