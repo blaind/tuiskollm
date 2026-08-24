@@ -28,6 +28,7 @@ const QWEN35_NVFP4_DOWN_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-d
 const QWEN35_NVFP4_QKV_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-qkv-sm120.txt";
 const QWEN35_BF16_LM_HEAD_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-bf16-lm-head-sm120.txt";
 const QWEN36_MOE_ROUTER_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-moe-router-sm120.txt";
+const QWEN36_MOE_EXPERTS_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-moe-experts-sm120.txt";
 const QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt";
 const QWEN35_GDN_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-gdn-prepare-sm120.txt";
@@ -95,6 +96,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     QWEN35_NVFP4_QKV_RESOURCE_BASELINE,
     QWEN35_BF16_LM_HEAD_RESOURCE_BASELINE,
     QWEN36_MOE_ROUTER_RESOURCE_BASELINE,
+    QWEN36_MOE_EXPERTS_RESOURCE_BASELINE,
     QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE,
     QWEN35_GDN_PREPARE_RESOURCE_BASELINE,
     QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE,
@@ -679,6 +681,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen36-moe-router") if remaining.is_empty() => {
             qualify_qwen36_moe_router(root)
         }
+        Some("qualify-qwen36-moe-experts") if remaining.is_empty() => {
+            qualify_qwen36_moe_experts(root)
+        }
         Some("qualify-qwen35-bf16-lm-head") => qualify_qwen35_bf16_lm_head(root, &remaining),
         Some("qualify-qwen35-text-endpoint") => qualify_qwen35_text_endpoint(root, &remaining),
         Some("qualify-qwen35-resident-model") => qualify_qwen35_resident_model(root, &remaining),
@@ -761,6 +766,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-qwen35-nvfp4-down") => bench_qwen35_nvfp4_down(root, &remaining),
         Some("bench-qwen35-nvfp4-qkv") => bench_qwen35_nvfp4_qkv(root, &remaining),
         Some("bench-qwen36-moe-router") => bench_qwen36_moe_router(root, &remaining),
+        Some("bench-qwen36-moe-experts") => bench_qwen36_moe_experts(root, &remaining),
         Some("bench-qwen35-nvfp4-gdn-input") => bench_qwen35_nvfp4_gdn_input(root, &remaining),
         Some("bench-qwen35-gdn-prepare") => bench_qwen35_gdn_prepare(root, &remaining),
         Some("bench-qwen35-gdn-recurrence") => bench_qwen35_gdn_recurrence(root, &remaining),
@@ -827,6 +833,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("gate-qwen35-nvfp4-qkv") if remaining.is_empty() => gate_qwen35_nvfp4_qkv(root),
         Some("gate-qwen35-bf16-lm-head") if remaining.is_empty() => gate_qwen35_bf16_lm_head(root),
         Some("gate-qwen36-moe-router") if remaining.is_empty() => gate_qwen36_moe_router(root),
+        Some("gate-qwen36-moe-experts") if remaining.is_empty() => gate_qwen36_moe_experts(root),
         Some("gate-qwen35-nvfp4-gdn-input") if remaining.is_empty() => {
             gate_qwen35_nvfp4_gdn_input(root)
         }
@@ -1122,6 +1129,7 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_qwen35_nvfp4_qkv(root)?;
     gate_qwen35_bf16_lm_head(root)?;
     gate_qwen36_moe_router(root)?;
+    gate_qwen36_moe_experts(root)?;
     gate_qwen35_nvfp4_gdn_input(root)?;
     gate_qwen35_gdn_prepare(root)?;
     gate_qwen35_gdn_recurrence(root)?;
@@ -1438,6 +1446,32 @@ fn qualify_qwen36_moe_router(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     gate_qwen36_moe_router(root)
+}
+
+fn qualify_qwen36_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen36_moe_experts",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )?;
+    gate_qwen36_moe_experts(root)
 }
 
 fn qualify_qwen35_bf16_lm_head(
@@ -3218,6 +3252,32 @@ fn bench_qwen36_moe_router(
             .env(
                 "TUISKO_GENERATOR_BASELINE_SHA256",
                 sha256(&fs::read(root.join(QWEN36_MOE_ROUTER_RESOURCE_BASELINE))?),
+            ),
+    )
+}
+
+fn bench_qwen36_moe_experts(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen36-moe-experts")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(root.join(QWEN36_MOE_EXPERTS_RESOURCE_BASELINE))?),
             ),
     )
 }
@@ -9286,6 +9346,162 @@ fn gate_qwen36_moe_router(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn gate_qwen36_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN36_MOE_EXPERTS_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; run the pinned release device build first",
+            ptx_path.display()
+        )
+    })?;
+    let entries = parse_entries(&ptx);
+    let gate_up = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen36_moe_expert_gate_up_TID_"))
+        .collect::<Vec<_>>();
+    let down = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen36_moe_expert_down_TID_"))
+        .collect::<Vec<_>>();
+    let combine = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen36_moe_expert_combine_TID_"))
+        .collect::<Vec<_>>();
+    require_count("Qwen3.6 MoE expert gate/up", gate_up.len(), 8)?;
+    require_count("Qwen3.6 MoE expert down", down.len(), 8)?;
+    require_count("Qwen3.6 MoE expert combine", combine.len(), 8)?;
+
+    for (role, routes, instructions) in [
+        (
+            "gate/up",
+            gate_up.as_slice(),
+            &[
+                "cvt.rn.f16x2.e2m1x2",
+                "shfl.sync.down.b32",
+                "ex2.approx.f32",
+            ][..],
+        ),
+        (
+            "down",
+            down.as_slice(),
+            &["cvt.rn.f16x2.e2m1x2", "shfl.sync.down.b32"][..],
+        ),
+        (
+            "combine",
+            combine.as_slice(),
+            &["fma.rn.f32", "ex2.approx.f32"][..],
+        ),
+    ] {
+        for entry in routes {
+            if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2")
+            {
+                return Err(format!(
+                    "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                    entry.name
+                )
+                .into());
+            }
+            for instruction in instructions {
+                if !entry.body.contains(instruction) {
+                    return Err(format!(
+                        "Qwen3.6 MoE expert {role} entry `{}` lost `{instruction}` PTX",
+                        entry.name
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    let mut gate_up_registers = Vec::with_capacity(gate_up.len());
+    let mut down_registers = Vec::with_capacity(down.len());
+    let mut combine_registers = Vec::with_capacity(combine.len());
+    let mut gate_up_shared = Vec::with_capacity(gate_up.len());
+    let mut down_shared = Vec::with_capacity(down.len());
+    let mut combine_shared = Vec::with_capacity(combine.len());
+
+    for (role, routes, instructions, registers, shared) in [
+        (
+            "gate/up",
+            gate_up,
+            &["F2FP.F16.E2M1", "SHFL.DOWN", "MUFU.EX2", "STG.E.U16"][..],
+            &mut gate_up_registers,
+            &mut gate_up_shared,
+        ),
+        (
+            "down",
+            down,
+            &["F2FP.F16.E2M1", "SHFL.DOWN", "STG.E.U16"][..],
+            &mut down_registers,
+            &mut down_shared,
+        ),
+        (
+            "combine",
+            combine,
+            &["MUFU.EX2", "FFMA", "STG.E.U16"][..],
+            &mut combine_registers,
+            &mut combine_shared,
+        ),
+    ] {
+        for entry in routes {
+            let resource = resources.get(entry.name).ok_or_else(|| {
+                format!(
+                    "cuobjdump omitted Qwen3.6 MoE expert {role} `{}`",
+                    entry.name
+                )
+            })?;
+            require_spill_free(entry.name, resource)?;
+            let body = sass_function_body(sass, entry.name).ok_or_else(|| {
+                format!(
+                    "cuobjdump omitted Qwen3.6 MoE expert {role} SASS `{}`",
+                    entry.name
+                )
+            })?;
+            for instruction in instructions {
+                if !body.contains(instruction) {
+                    return Err(format!(
+                        "entry `{}` lost required `{instruction}` SASS",
+                        entry.name
+                    )
+                    .into());
+                }
+            }
+            registers.push(resource.registers);
+            shared.push(resource.shared);
+        }
+    }
+    gate_up_registers.sort_unstable();
+    down_registers.sort_unstable();
+    combine_registers.sort_unstable();
+    gate_up_shared.sort_unstable();
+    down_shared.sort_unstable();
+    combine_shared.sort_unstable();
+    require_registers(&baseline, "gate_up_registers", &gate_up_registers)?;
+    require_registers(&baseline, "down_registers", &down_registers)?;
+    require_registers(&baseline, "combine_registers", &combine_registers)?;
+    require_uniform_value(&baseline, "gate_up_shared_bytes", &gate_up_shared)?;
+    require_uniform_value(&baseline, "down_shared_bytes", &down_shared)?;
+    require_uniform_value(&baseline, "combine_shared_bytes", &combine_shared)?;
+
+    println!(
+        "Qwen3.6 MoE expert gate passed: 8 gate/up + 8 down + 8 combine entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}, E2M1/SHFL/EX2/BF16-store present",
+        gate_up_registers,
+        down_registers,
+        combine_registers,
+        gate_up_shared,
+        down_shared,
+        combine_shared
+    );
+    Ok(())
+}
+
 fn gate_qwen35_nvfp4_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(
         root.join(QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE),
@@ -10369,6 +10585,7 @@ mod tests {
                 "qual/baselines/qwen35-nvfp4-qkv-sm120.txt",
                 "qual/baselines/qwen35-bf16-lm-head-sm120.txt",
                 "qual/baselines/qwen36-moe-router-sm120.txt",
+                "qual/baselines/qwen36-moe-experts-sm120.txt",
                 "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt",
                 "qual/baselines/qwen35-gdn-prepare-sm120.txt",
                 "qual/baselines/qwen35-gdn-recurrence-sm120.txt",
