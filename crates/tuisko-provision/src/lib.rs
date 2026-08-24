@@ -383,7 +383,35 @@ fn validate_remote_metadata(required: &RequiredFile, token: Option<&str>) -> Res
         Qwen38_27B::REVISION,
         required.name,
     )?;
-    require_header(&response, "x-linked-etag", required.blob, required.name)
+    require_pinned_etag(
+        header_value(&response, "x-linked-etag"),
+        header_value(&response, "etag"),
+        required,
+    )
+}
+
+fn header_value<'r>(response: &'r ureq::http::Response<ureq::Body>, name: &str) -> Option<&'r str> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+}
+
+fn require_pinned_etag(
+    linked: Option<&str>,
+    etag: Option<&str>,
+    required: &RequiredFile,
+) -> Result<(), String> {
+    let actual = linked.or(etag);
+    let normalized = actual.map(|value| value.strip_prefix("W/").unwrap_or(value).trim_matches('"'));
+    if normalized == Some(required.blob) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Hugging Face metadata for {} has etag {actual:?}, expected {}",
+            required.name, required.blob,
+        ))
+    }
 }
 
 fn append_remote(
@@ -685,7 +713,7 @@ mod tests {
     use super::{
         FileProgress, ProvisioningStage, REQUIRED_FILES, RequiredFile, Sha256, SnapshotState,
         append_body, exact_file_length, hex_digest, hub_cache, inspect_snapshot, offline,
-        resume_offset, snapshot_path,
+        require_pinned_etag, resume_offset, snapshot_path,
     };
     use crate::resolve_snapshot;
     use sha2::Digest;
@@ -904,6 +932,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(file.metadata().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn plain_etag_backs_up_missing_linked_etag() {
+        let required = &REQUIRED_FILES[0];
+        let quoted = format!("\"{}\"", required.blob);
+        let weak = format!("W/\"{}\"", required.blob);
+        require_pinned_etag(Some(&quoted), None, required).unwrap();
+        require_pinned_etag(None, Some(&quoted), required).unwrap();
+        require_pinned_etag(None, Some(&weak), required).unwrap();
+        require_pinned_etag(Some(&quoted), Some("\"junk\""), required).unwrap();
+
+        let error = require_pinned_etag(None, None, required).err().unwrap();
+        assert!(error.contains(&format!(
+            "metadata for config.json has etag None, expected {}",
+            required.blob,
+        )));
+        assert!(
+            require_pinned_etag(Some("\"junk\""), Some(&quoted), required)
+                .err()
+                .unwrap()
+                .contains("junk")
+        );
     }
 
     #[test]
