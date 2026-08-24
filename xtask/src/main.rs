@@ -6,6 +6,7 @@ mod perf_iteration;
 mod performance;
 mod remote;
 mod server_qualification;
+mod server_qual;
 
 use gpu_target::BuildTargetProfile;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -726,6 +727,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("build-server") if remaining.is_empty() => build_server(root),
         Some("qualify-frontend") => qualify_frontend(root, &remaining),
         Some("qualify-generation") => qualify_generation(root, &remaining),
+        Some("qualify-server") => server_qual::run(root, &remaining),
         Some("qualify-host") if remaining.is_empty() => qualify_host(root),
         Some("qualify-residual-norm") if remaining.is_empty() => qualify_residual_norm(root),
         Some("qualify-qwen35-residual-norm") if remaining.is_empty() => {
@@ -6427,9 +6429,13 @@ fn wait_for_device_idle() -> Result<(), Box<dyn Error>> {
 }
 
 fn require_performance_device_idle() -> Result<(), Box<dyn Error>> {
+    require_device_idle("performance setup")
+}
+
+fn require_device_idle(activity: &str) -> Result<(), Box<dyn Error>> {
     if env::var_os("CUDA_VISIBLE_DEVICES").is_some_and(|value| value != "0") {
         return Err(
-            "performance commands require CUDA_VISIBLE_DEVICES to be unset or exactly `0`".into(),
+            format!("{activity} requires CUDA_VISIBLE_DEVICES to be unset or exactly `0`").into(),
         );
     }
     let row = command_text(
@@ -6445,13 +6451,13 @@ fn require_performance_device_idle() -> Result<(), Box<dyn Error>> {
     let expected = gpu_target::GpuTarget::Sm120.device_name();
     if device != expected {
         return Err(format!(
-            "performance commands require device zero to be `{expected}`, found `{device}`"
+            "{activity} requires device zero to be `{expected}`, found `{device}`"
         )
         .into());
     }
     if utilization != 0 || memory_mib > 1_024 {
         return Err(format!(
-            "device zero is busy before performance setup: utilization={utilization}%, memory={memory_mib} MiB"
+            "device zero is busy before {activity}: utilization={utilization}%, memory={memory_mib} MiB"
         )
         .into());
     }
@@ -6467,7 +6473,7 @@ fn require_performance_device_idle() -> Result<(), Box<dyn Error>> {
     let pids = parse_compute_pids(&processes)?;
     if !pids.is_empty() {
         return Err(format!(
-            "device zero has foreign compute processes before performance setup: {pids:?}"
+            "device zero has foreign compute processes before {activity}: {pids:?}"
         )
         .into());
     }
