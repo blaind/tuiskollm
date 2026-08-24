@@ -98,7 +98,7 @@ mod tests {
         let names = kernel_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 589);
+        assert_eq!(names.len(), 595);
         assert_eq!(unique.len(), names.len());
     }
 }

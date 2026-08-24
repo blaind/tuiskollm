@@ -19,6 +19,8 @@ use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const DECODE_ROUTES: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+const QWEN36_MAX_ROWS: usize = 128;
+const QWEN36_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 #[cfg(feature = "device")]
 const QWEN38_MAX_ROWS: usize = 1_024;
 #[cfg(not(feature = "device"))]
@@ -370,7 +372,7 @@ pub fn benchmark_qwen35_residual_norm(
     )
 }
 
-/// Measures the exact Qwen3.6 residual-norm routes on SM120.
+/// Measures Qwen3.6 residual norm at decode `B=1..8` and prefill `T=32,64,128`.
 #[cfg(feature = "device")]
 pub fn benchmark_qwen36_residual_norm(
     options: DeviceBenchmarkOptions,
@@ -382,11 +384,11 @@ pub fn benchmark_qwen36_residual_norm(
         "qwen36_35b_a3b/residual_norm/plain",
         "qwen36_35b_a3b/residual_norm/fused_residual",
         "qwen36_35b_a3b/residual_norm/address_stable_workspace",
-        "max_batch=8,hidden=2048",
+        "max_rows=128,hidden=2048",
         "qwen36_35b_a3b/residual_norm/weights",
         "qwen36_35b_a3b/residual_norm/alignment_padding",
-        &DECODE_ROUTES,
-        MAX_BATCH,
+        &QWEN36_ROUTES,
+        QWEN36_MAX_ROWS,
     )
 }
 
@@ -469,7 +471,10 @@ fn logical_bytes<A: Arch>(batch: usize, fused_residual: bool) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, QWEN38_MAX_ROWS, Qwen35_9B, Qwen38_27B, layout, logical_bytes};
+    use super::{
+        MAX_BATCH, QWEN36_MAX_ROWS, QWEN36_ROUTES, QWEN38_MAX_ROWS, Qwen35_9B, Qwen36Moe35B,
+        Qwen38_27B, layout, logical_bytes,
+    };
     use tuisko_model::Arch;
 
     #[test]
@@ -478,6 +483,8 @@ mod tests {
         assert_eq!(logical_bytes::<Qwen38_27B>(8, true), 10 * 8 * 5_120);
         assert_eq!(logical_bytes::<Qwen35_9B>(8, false), 6 * 8 * 4_096);
         assert_eq!(logical_bytes::<Qwen35_9B>(8, true), 10 * 8 * 4_096);
+        assert_eq!(logical_bytes::<Qwen36Moe35B>(128, false), 6 * 128 * 2_048);
+        assert_eq!(logical_bytes::<Qwen36Moe35B>(128, true), 10 * 128 * 2_048);
     }
 
     #[test]
@@ -493,5 +500,19 @@ mod tests {
         let (qwen35_layout, qwen35_regions) = layout::<Qwen35_9B>(MAX_BATCH).unwrap();
         assert_eq!(qwen35_layout.byte_len(), qwen35_regions.payload_bytes());
         assert_eq!(qwen35_regions.weight_bytes(), 8_192);
+    }
+
+    #[test]
+    fn qwen36_residual_norm_benchmark_arena_accounting_exposes_every_byte() {
+        assert_eq!(QWEN36_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
+        let (layout, regions) = layout::<Qwen36Moe35B>(QWEN36_MAX_ROWS).unwrap();
+
+        assert_eq!(layout.byte_len(), regions.payload_bytes());
+        assert_eq!(regions.weight_bytes(), 4_096);
+        assert_eq!(
+            layout.byte_len(),
+            5 * QWEN36_MAX_ROWS * Qwen36Moe35B::HIDDEN * size_of::<u16>() + regions.weight_bytes()
+        );
+        assert_eq!(layout.byte_len(), 2_625_536);
     }
 }

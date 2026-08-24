@@ -1513,9 +1513,10 @@ fn qualify_qwen36_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "residual_norm::tests::qwen36_exact_batches_match_independent_oracles_and_graph_replay",
+            "qwen36_residual_norm",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_qwen36_residual_norm(root)
@@ -6964,11 +6965,16 @@ pub(crate) fn gate_residual_norm_target(
         .collect::<Vec<_>>();
     let prefill_plain = entries
         .iter()
-        .filter(|entry| entry.name.starts_with("rms_norm_prefill_TID_"))
+        .filter(|entry| {
+            entry.name.starts_with("rms_norm_prefill_TID_") && entry.body.contains("0f45A00000")
+        })
         .collect::<Vec<_>>();
     let prefill_residual = entries
         .iter()
-        .filter(|entry| entry.name.starts_with("residual_rms_norm_prefill_TID_"))
+        .filter(|entry| {
+            entry.name.starts_with("residual_rms_norm_prefill_TID_")
+                && entry.body.contains("0f45A00000")
+        })
         .collect::<Vec<_>>();
     require_count("plain RMSNorm", plain.len(), 8)?;
     require_count("residual RMSNorm", residual.len(), 8)?;
@@ -7220,10 +7226,34 @@ fn gate_qwen36_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
             entry.name.starts_with("residual_rms_norm_TID_") && entry.body.contains("0f3A000000")
         })
         .collect::<Vec<_>>();
+    let prefill_plain = entries
+        .iter()
+        .filter(|entry| {
+            entry.name.starts_with("rms_norm_prefill_TID_") && entry.body.contains("0f3A000000")
+        })
+        .collect::<Vec<_>>();
+    let prefill_residual = entries
+        .iter()
+        .filter(|entry| {
+            entry.name.starts_with("residual_rms_norm_prefill_TID_")
+                && entry.body.contains("0f3A000000")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.6 plain RMSNorm", plain.len(), 8)?;
     require_count("Qwen3.6 residual RMSNorm", residual.len(), 8)?;
+    require_count("Qwen3.6 plain RMSNorm prefill", prefill_plain.len(), 3)?;
+    require_count(
+        "Qwen3.6 residual RMSNorm prefill",
+        prefill_residual.len(),
+        3,
+    )?;
 
-    for entry in plain.iter().chain(&residual) {
+    for entry in plain
+        .iter()
+        .chain(&residual)
+        .chain(&prefill_plain)
+        .chain(&prefill_residual)
+    {
         if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 512-thread/two-CTA launch bounds",
@@ -7238,11 +7268,25 @@ fn gate_qwen36_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
     let sass = artifact.sass()?;
     let mut plain_registers = Vec::with_capacity(plain.len());
     let mut residual_registers = Vec::with_capacity(residual.len());
-    let mut shared = Vec::with_capacity(plain.len() + residual.len());
+    let mut prefill_plain_registers = Vec::with_capacity(prefill_plain.len());
+    let mut prefill_residual_registers = Vec::with_capacity(prefill_residual.len());
+    let mut shared = Vec::with_capacity(
+        plain.len() + residual.len() + prefill_plain.len() + prefill_residual.len(),
+    );
 
     for (family, entries, registers) in [
         ("plain", &plain, &mut plain_registers),
         ("residual", &residual, &mut residual_registers),
+        (
+            "plain prefill",
+            &prefill_plain,
+            &mut prefill_plain_registers,
+        ),
+        (
+            "residual prefill",
+            &prefill_residual,
+            &mut prefill_residual_registers,
+        ),
     ] {
         for entry in entries {
             let resource = resources.get(entry.name).ok_or_else(|| {
@@ -7267,14 +7311,34 @@ fn gate_qwen36_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
     }
     plain_registers.sort_unstable();
     residual_registers.sort_unstable();
+    prefill_plain_registers.sort_unstable();
+    prefill_residual_registers.sort_unstable();
     shared.sort_unstable();
     require_registers(&baseline, "plain_registers", &plain_registers)?;
     require_registers(&baseline, "residual_registers", &residual_registers)?;
+    if baseline.contains_key("prefill_plain_registers") {
+        require_registers(
+            &baseline,
+            "prefill_plain_registers",
+            &prefill_plain_registers,
+        )?;
+    }
+    if baseline.contains_key("prefill_residual_registers") {
+        require_registers(
+            &baseline,
+            "prefill_residual_registers",
+            &prefill_residual_registers,
+        )?;
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "Qwen3.6 residual-norm gate passed: 8 plain + 8 residual entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/BF16 pack present",
-        plain_registers, residual_registers, shared
+        "Qwen3.6 residual-norm gate passed: 8 decode + 3 prefill plain and residual entries, REG {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/BF16 pack present",
+        plain_registers,
+        residual_registers,
+        prefill_plain_registers,
+        prefill_residual_registers,
+        shared
     );
     Ok(())
 }
