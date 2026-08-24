@@ -839,15 +839,35 @@ impl DeviceArena {
         region: ArenaRegion<T>,
         destination: &mut [T],
     ) -> GpuResult<()> {
+        self.copy_slice_to_host_slice(stream, region, 0, destination)
+    }
+
+    /// Copies one checked typed subrange into an existing host slice.
+    pub fn copy_slice_to_host_slice<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        region: ArenaRegion<T>,
+        start: usize,
+        destination: &mut [T],
+    ) -> GpuResult<()> {
         self.require_stream_context(stream, "copying a device arena region to the host")?;
-        if destination.len() > region.len {
+        let end = start
+            .checked_add(destination.len())
+            .ok_or_else(|| GpuError::arena("arena download subrange overflows"))?;
+        if end > region.len {
             return Err(GpuError::arena(format!(
-                "host destination has {} elements for an arena region of {} elements",
-                destination.len(),
+                "arena download subrange {start}..{end} exceeds a region of {} elements",
                 region.len
             )));
         }
-        let address = self.address(region)? as u64;
+        let byte_start = start
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena("arena download byte offset overflows"))?;
+        let address = (self.address(region)? as u64)
+            .checked_add(u64::try_from(byte_start).map_err(|_| {
+                GpuError::arena("arena download byte offset exceeds the device address width")
+            })?)
+            .ok_or_else(|| GpuError::arena("arena download device address overflows"))?;
         let bytes = size_of_val(destination);
         if bytes == 0 {
             return Ok(());
@@ -1033,6 +1053,11 @@ mod tests {
             .copy_slice_from_host(&stream, values, 3, &[11, 22])
             .unwrap();
 
+        let mut copied = [0; 2];
+        arena
+            .copy_slice_to_host_slice(&stream, values, 3, &mut copied)
+            .unwrap();
+        assert_eq!(copied, [11, 22]);
         assert_eq!(
             arena.copy_slice_to_host(&stream, values, 3, 2).unwrap(),
             [11, 22]
@@ -1062,6 +1087,9 @@ mod tests {
             arena.copy_slice_to_host(&stream, values, 7, 2).unwrap_err(),
             arena
                 .copy_slice_to_host(&stream, values, usize::MAX, 1)
+                .unwrap_err(),
+            arena
+                .copy_slice_to_host_slice(&stream, values, 7, &mut [0; 2])
                 .unwrap_err(),
         ] {
             assert_eq!(error.code(), GpuErrorCode::Arena);

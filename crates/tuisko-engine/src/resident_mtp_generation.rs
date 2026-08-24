@@ -563,7 +563,8 @@ impl ResidentMtpGenerationSession<'_> {
         } else {
             self.program.replay_realign(self.stream, route)?;
             let draft = draft_logits_mut(self.logits);
-            self.program.read_logits_into(self.stream, 1, draft)?;
+            self.program
+                .read_logit_row_into(self.stream, outputs.len() - 1, draft)?;
         }
         Ok(())
     }

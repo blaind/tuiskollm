@@ -733,6 +733,35 @@ impl ResidentMtpProgram {
         Ok(())
     }
 
+    /// Reads one exact BF16 draft-logit row into reusable host storage.
+    pub fn read_logit_row_into(
+        &self,
+        stream: &CudaStream,
+        row: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        if row >= MAX_BATCH {
+            return Err(EngineError::route(format!(
+                "resident MTP logit row {row} is outside 0..{MAX_BATCH}"
+            )));
+        }
+        if destination.len() != Qwen38_27B::VOCAB {
+            return Err(EngineError::layout(format!(
+                "resident MTP logit-row destination has {} values, expected {}",
+                destination.len(),
+                Qwen38_27B::VOCAB
+            )));
+        }
+        let start = product("resident MTP logit-row offset", row, Qwen38_27B::VOCAB)?;
+        self.arena.copy_slice_to_host_slice(
+            stream,
+            self.layout.regions().logits,
+            start,
+            destination,
+        )?;
+        Ok(())
+    }
+
     /// Activates the one shared target/MTP page-table row.
     pub fn activate_kv_slot(&mut self, slot: usize) -> EngineResult<()> {
         self.target.activate_kv_slot(slot)
