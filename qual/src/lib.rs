@@ -143,6 +143,10 @@ mod qwen35_nvfp4_down;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_down_benchmark;
 #[cfg(feature = "device")]
+mod qwen35_nvfp4_gdn_input;
+#[cfg(feature = "device")]
+mod qwen35_nvfp4_gdn_input_benchmark;
+#[cfg(feature = "device")]
 mod qwen35_nvfp4_mlp_benchmark;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_qkv;
@@ -382,6 +386,13 @@ pub use qwen35_nvfp4_attention_output_benchmark::benchmark_qwen35_nvfp4_attentio
 pub use qwen35_nvfp4_down::qualify_qwen35_nvfp4_down;
 #[cfg(feature = "device")]
 pub use qwen35_nvfp4_down_benchmark::benchmark_qwen35_nvfp4_down;
+#[cfg(feature = "device")]
+pub use qwen35_nvfp4_gdn_input::{
+    Qwen35Nvfp4GdnInputQualification, Qwen35Nvfp4GdnInputQualificationError,
+    qualify_qwen35_nvfp4_gdn_input,
+};
+#[cfg(feature = "device")]
+pub use qwen35_nvfp4_gdn_input_benchmark::benchmark_qwen35_nvfp4_gdn_input;
 #[cfg(feature = "device")]
 pub use qwen35_nvfp4_mlp_benchmark::benchmark_qwen35_nvfp4_mlp;
 #[cfg(feature = "device")]
