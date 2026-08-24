@@ -3,13 +3,13 @@
 use std::future::Future;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use russh::client;
-use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect};
 use russh_sftp::client::SftpSession;
 use tokio::io::AsyncWriteExt;
@@ -19,17 +19,32 @@ use crate::{RemoteError, RemoteResult};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Default)]
+/// Host key learned at the first connect of a run and pinned for its lifetime.
+pub(crate) type HostKeyPin = Arc<Mutex<Option<PublicKey>>>;
+
 struct Client {
-    host_key: Option<String>,
+    host_key: HostKeyPin,
 }
 
 impl Client {
-    fn accept_host_key(&mut self, fingerprint: String) -> bool {
-        match &self.host_key {
-            Some(expected) => expected == &fingerprint,
+    fn accept_host_key(&self, offered: &PublicKey) -> bool {
+        let mut pinned = self
+            .host_key
+            .lock()
+            .expect("host key pin is never poisoned");
+        match pinned.as_ref() {
+            Some(expected) if expected.key_data() == offered.key_data() => true,
+            Some(expected) => {
+                eprintln!(
+                    "pod host key changed from {} to {}; rejecting the connection",
+                    expected.fingerprint(HashAlg::Sha256),
+                    offered.fingerprint(HashAlg::Sha256)
+                );
+                false
+            }
             None => {
-                self.host_key = Some(fingerprint);
+                println!("pod host key: {}", offered.fingerprint(HashAlg::Sha256));
+                *pinned = Some(offered.clone());
                 true
             }
         }
@@ -43,11 +58,7 @@ impl client::Handler for Client {
         &mut self,
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        let fingerprint = server_public_key
-            .public_key()
-            .fingerprint(HashAlg::Sha256)
-            .to_string();
-        Ok(self.accept_host_key(fingerprint))
+        Ok(self.accept_host_key(&server_public_key.public_key()))
     }
 }
 
@@ -64,7 +75,16 @@ impl Ssh {
     }
 
     /// Connects to one direct pod endpoint using an OpenSSH private key.
-    pub fn connect(key_file: &Path, host: &str, port: u16, user: &str) -> RemoteResult<Self> {
+    ///
+    /// The server key is required to match `host_key`, which pins the
+    /// first-seen key across the reconnects of one run.
+    pub fn connect(
+        key_file: &Path,
+        host: &str,
+        port: u16,
+        user: &str,
+        host_key: &HostKeyPin,
+    ) -> RemoteResult<Self> {
         let key = load_key(key_file)?;
         let runtime = Builder::new_current_thread()
             .enable_io()
@@ -83,7 +103,13 @@ impl Ssh {
         let connection = runtime.block_on(async {
             tokio::time::timeout(
                 CONNECT_TIMEOUT,
-                client::connect(config, (host, port), Client::default()),
+                client::connect(
+                    config,
+                    (host, port),
+                    Client {
+                        host_key: host_key.clone(),
+                    },
+                ),
             )
             .await
         });
@@ -337,15 +363,27 @@ mod tests {
     use std::io::Read;
 
     use flate2::read::GzDecoder;
+    use russh::keys::PublicKey;
+    use russh::keys::ssh_key::public::{Ed25519PublicKey, KeyData};
 
-    use super::{Client, gzip, shell_quote};
+    use super::{Client, HostKeyPin, gzip, shell_quote};
 
     #[test]
-    fn host_key_is_pinned_for_the_session() {
-        let mut client = Client::default();
-        assert!(client.accept_host_key("SHA256:first".to_owned()));
-        assert!(client.accept_host_key("SHA256:first".to_owned()));
-        assert!(!client.accept_host_key("SHA256:changed".to_owned()));
+    fn host_key_is_pinned_across_reconnects_of_one_run() {
+        let pin = HostKeyPin::default();
+        let first = PublicKey::new(KeyData::Ed25519(Ed25519PublicKey([1u8; 32])), "");
+        let changed = PublicKey::new(KeyData::Ed25519(Ed25519PublicKey([2u8; 32])), "");
+
+        let client = Client {
+            host_key: pin.clone(),
+        };
+        assert!(client.accept_host_key(&first));
+        assert!(client.accept_host_key(&first));
+        assert!(!client.accept_host_key(&changed));
+
+        let reconnected = Client { host_key: pin };
+        assert!(reconnected.accept_host_key(&first));
+        assert!(!reconnected.accept_host_key(&changed));
     }
 
     #[test]

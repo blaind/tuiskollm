@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::key::{resolve_api_key, resolve_env};
 use crate::sentry::{delete_pod, mark_keep, spawn_sentry};
-use crate::ssh::Ssh;
+use crate::ssh::{HostKeyPin, Ssh};
 use crate::v2::{POD_NAME_PREFIX, REMOTE_WORKDIR, V2, is_missing, wait_until_ssh};
 use crate::{GpuTarget, RemoteError, RemoteResult};
 
@@ -497,8 +497,9 @@ fn open_pod(
         .filter(|user| !user.is_empty())
         .unwrap_or_else(|| "root".to_owned());
     println!("direct ssh/sftp: {user}@{host}:{port}");
+    let host_key = HostKeyPin::default();
     let ssh = loop {
-        match Ssh::connect(&key_file, &host, port, &user) {
+        match Ssh::connect(&key_file, &host, port, &user, &host_key) {
             Ok(ssh) => break ssh,
             Err(error) if Instant::now() < deadline => {
                 eprintln!("SSH not ready ({error}); retrying in 5s");
