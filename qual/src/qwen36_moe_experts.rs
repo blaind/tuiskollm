@@ -652,7 +652,7 @@ fn build_oracle(fixture: &mut Fixture) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn nvfp4_dot(
+pub(crate) fn nvfp4_dot(
     input: &[u16],
     codes: &[u8],
     scales: &[u8],
