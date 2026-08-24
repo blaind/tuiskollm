@@ -11,6 +11,8 @@ use tuisko_gpu::{
 use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen38_27B};
 
 pub(crate) const MAX_BATCH: usize = 8;
+const MAX_TOKENS: usize = 1_024;
+const ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const ALIGNMENT: usize = 256;
 pub(crate) const INPUT_COLUMNS: usize = Qwen38_27B::HIDDEN;
 pub(crate) const OUTPUT_ROWS: usize = Qwen38_27B::ATTENTION_QKV_ROWS;
@@ -89,7 +91,7 @@ pub(crate) struct Fixture {
     pub(crate) weight: Vec<u16>,
 }
 
-/// Qualifies gathered source-BF16 MTP Q/gate/K/V projection at exact `B=1..=8`.
+/// Qualifies gathered source-BF16 MTP Q/gate/K/V projection at decode and prompt widths.
 pub fn qualify_mtp_bf16_qkv(
     root: &Path,
 ) -> Result<MtpBf16QkvQualification, MtpBf16QkvQualificationError> {
@@ -144,7 +146,7 @@ pub fn qualify_mtp_bf16_qkv(
         maximum_absolute_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
+    for batch in ROUTES {
         arena.copy_from_host(&stream, regions.input, &fixture.first_input)?;
         arena.fill(&stream, regions.output, BF16_SENTINEL as u8)?;
         launch(&op, &arena, &stream, regions, batch)?;
@@ -189,9 +191,9 @@ pub fn qualify_mtp_bf16_qkv(
 
 pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let input = layout.reserve(MAX_BATCH * INPUT_COLUMNS, ALIGNMENT)?;
+    let input = layout.reserve(MAX_TOKENS * INPUT_COLUMNS, ALIGNMENT)?;
     let weight = layout.reserve(OUTPUT_ROWS * INPUT_COLUMNS, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * OUTPUT_ROWS, ALIGNMENT)?;
+    let output = layout.reserve(MAX_TOKENS * OUTPUT_ROWS, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -204,7 +206,7 @@ pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
 }
 
 fn make_input(salt: usize) -> Vec<u16> {
-    (0..MAX_BATCH * INPUT_COLUMNS)
+    (0..MAX_TOKENS * INPUT_COLUMNS)
         .map(|index| {
             let token = index / INPUT_COLUMNS;
             f32_to_bf16(
@@ -249,7 +251,7 @@ fn launch_b1_row(
     regions: Regions,
     row: usize,
 ) -> GpuResult<()> {
-    // SAFETY: `row < MAX_BATCH`; each offset selects one complete aligned row.
+    // SAFETY: `row < MAX_TOKENS`; each offset selects one complete aligned row.
     unsafe {
         op.launch(
             stream,
@@ -268,7 +270,7 @@ fn b1_route_references(
     regions: Regions,
 ) -> GpuResult<Vec<u16>> {
     arena.fill(stream, regions.output, BF16_SENTINEL as u8)?;
-    for row in 0..MAX_BATCH {
+    for row in 0..MAX_TOKENS {
         launch_b1_row(op, arena, stream, regions, row)?;
     }
     arena.copy_to_host(stream, regions.output)
@@ -376,7 +378,7 @@ fn verify_inactive(
             "B={batch} modified inactive output value {index}"
         )));
     }
-    report.inactive_values += (MAX_BATCH - batch) * OUTPUT_ROWS;
+    report.inactive_values += (MAX_TOKENS - batch) * OUTPUT_ROWS;
     Ok(())
 }
 
@@ -416,11 +418,11 @@ fn verify_no_post_warmup_allocation(
     stream: &CudaStream,
     regions: Regions,
 ) -> Result<(), MtpBf16QkvQualificationError> {
-    launch(op, arena, stream, regions, MAX_BATCH)?;
+    launch(op, arena, stream, regions, MAX_TOKENS)?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
-        for batch in [1, 8, 3, 6, 2, 7, 4, 5] {
+        for batch in ROUTES {
             launch(op, arena, stream, regions, batch)?;
         }
     }
@@ -436,7 +438,7 @@ fn verify_no_post_warmup_allocation(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, OUTPUT_ROWS, layout, qualify_mtp_bf16_qkv};
+    use super::{MAX_BATCH, MAX_TOKENS, OUTPUT_ROWS, ROUTES, layout, qualify_mtp_bf16_qkv};
     use std::path::PathBuf;
 
     #[test]
@@ -448,9 +450,11 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6, 7, 8]
         );
         assert_eq!(OUTPUT_ROWS, 14_336);
+        assert_eq!(ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
+        assert_eq!(MAX_TOKENS, 1_024);
         assert_eq!(regions.weight_bytes(), 146_800_640);
-        assert_eq!(regions.workspace_bytes(), 311_296);
-        assert_eq!(regions.payload_bytes(), 147_111_936);
+        assert_eq!(regions.workspace_bytes(), 39_845_888);
+        assert_eq!(regions.payload_bytes(), 186_646_528);
         assert_eq!(layout.byte_len(), regions.payload_bytes());
     }
 
@@ -462,13 +466,13 @@ mod tests {
         );
         let report = qualify_mtp_bf16_qkv(&root).expect("MTP BF16 QKV qualification");
 
-        assert_eq!(report.output_values, 36 * OUTPUT_ROWS);
+        assert_eq!(report.output_values, 1_320 * OUTPUT_ROWS);
         assert_eq!(report.source_output_values, OUTPUT_ROWS);
-        assert_eq!(report.graph_replay_values, 36 * OUTPUT_ROWS);
-        assert_eq!(report.inactive_values, 2 * 28 * OUTPUT_ROWS);
+        assert_eq!(report.graph_replay_values, 1_320 * OUTPUT_ROWS);
+        assert_eq!(report.inactive_values, 2 * 10_968 * OUTPUT_ROWS);
         assert_eq!(report.weight_bytes, 146_800_640);
-        assert_eq!(report.workspace_bytes, 311_296);
-        assert_eq!(report.arena_bytes, 147_111_936);
+        assert_eq!(report.workspace_bytes, 39_845_888);
+        assert_eq!(report.arena_bytes, 186_646_528);
         assert_eq!(report.padding_bytes, 0);
     }
 }

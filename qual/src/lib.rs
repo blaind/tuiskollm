@@ -92,6 +92,10 @@ mod mtp_bf16_qkv_benchmark;
 mod mtp_layer;
 #[cfg(feature = "device")]
 mod mtp_layer_benchmark;
+#[cfg(feature = "device")]
+mod mtp_prompt_prime;
+#[cfg(feature = "device")]
+mod mtp_prompt_prime_benchmark;
 #[cfg(feature = "sm89")]
 mod nvfp4_down;
 #[cfg(feature = "device")]
@@ -299,6 +303,12 @@ pub use mtp_bf16_qkv_benchmark::benchmark_mtp_bf16_qkv;
 pub use mtp_layer::{MtpLayerQualification, MtpLayerQualificationError, qualify_mtp_layer};
 #[cfg(feature = "device")]
 pub use mtp_layer_benchmark::benchmark_mtp_layer;
+#[cfg(feature = "device")]
+pub use mtp_prompt_prime::{
+    MtpPromptPrimeQualification, MtpPromptPrimeQualificationError, qualify_mtp_prompt_prime,
+};
+#[cfg(feature = "device")]
+pub use mtp_prompt_prime_benchmark::benchmark_mtp_prompt_prime;
 #[cfg(any(feature = "device", feature = "sm89"))]
 pub use nvfp4_down::{Nvfp4DownQualification, Nvfp4DownQualificationError, qualify_nvfp4_down};
 #[cfg(any(feature = "device", feature = "sm89"))]

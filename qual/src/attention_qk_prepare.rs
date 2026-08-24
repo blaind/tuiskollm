@@ -58,7 +58,7 @@ pub enum AttentionQkPrepareQualificationError {
 pub struct AttentionQkPrepareQualification {
     /// Active FP32 query values compared with the independent formula.
     pub query_values: usize,
-    /// Appended represented key and value elements compared bit-exactly.
+    /// Appended represented key and value elements compared with independent formulas.
     pub appended_cache_values: usize,
     /// Cache bytes and inactive query words proved untouched.
     pub untouched_values: usize,
@@ -76,7 +76,7 @@ pub struct AttentionQkPrepareQualification {
     pub arena_bytes: usize,
     /// Alignment padding bytes in that arena.
     pub padding_bytes: usize,
-    /// Largest absolute prepared-query error.
+    /// Largest absolute prepared-query or BF16-key error.
     pub maximum_query_error: f32,
 }
 
@@ -152,7 +152,8 @@ struct Observed {
 #[derive(Clone, Copy)]
 enum CacheFormat {
     E4m3,
-    Bf16,
+    Bf16Exact,
+    Bf16Math,
 }
 
 trait QualifiedQkPrepareOp {
@@ -256,7 +257,7 @@ impl QualifiedQkPrepareOp for Qwen35AttentionQkPrepareOp {
     const ROUTES: &'static [usize] = &QWEN35_ROUTES;
     const MAX_TOKENS: usize = MAX_BATCH;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
-    const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16;
+    const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16Exact;
 
     fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
         Qwen35AttentionQkPrepareOp::new(context)
@@ -307,10 +308,10 @@ impl QualifiedQkPrepareOp for Qwen35AttentionQkPrepareOp {
 
 impl QualifiedQkPrepareOp for MtpBf16QkPrepareOp {
     type Target = Qwen38_27B;
-    const ROUTES: &'static [usize] = &QWEN35_ROUTES;
-    const MAX_TOKENS: usize = MAX_BATCH;
+    const ROUTES: &'static [usize] = &ROUTES;
+    const MAX_TOKENS: usize = MAX_TOKENS;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
-    const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16;
+    const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16Math;
 
     fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
         MtpBf16QkPrepareOp::new(context)
@@ -372,7 +373,7 @@ pub fn qualify_qwen35_attention_qk_prepare()
     qualify_target::<Qwen35AttentionQkPrepareOp>(None)
 }
 
-/// Qualifies source-backed MTP Q/K preparation at exact `B=1..=8`.
+/// Qualifies source-backed MTP Q/K preparation at exact `B=1..=8` and prompt tiles.
 pub fn qualify_mtp_bf16_qk_prepare(
     root: &Path,
 ) -> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
@@ -733,7 +734,17 @@ fn verify_oracle<A: Arch>(
             )));
         }
     }
-    compare_cache(tokens, "key", &observed.key_pages, &expected.key_pages)?;
+    match cache_format {
+        CacheFormat::E4m3 | CacheFormat::Bf16Exact => {
+            compare_cache(tokens, "key", &observed.key_pages, &expected.key_pages)?;
+        }
+        CacheFormat::Bf16Math => compare_bf16_key_cache(
+            tokens,
+            &observed.key_pages,
+            &expected.key_pages,
+            &mut report.maximum_query_error,
+        )?,
+    }
     compare_cache(
         tokens,
         "value",
@@ -751,6 +762,44 @@ fn verify_oracle<A: Arch>(
     Ok(())
 }
 
+fn compare_bf16_key_cache(
+    tokens: usize,
+    actual: &[u8],
+    expected: &[u8],
+    maximum_error: &mut f32,
+) -> Result<(), AttentionQkPrepareQualificationError> {
+    for (index, (actual, expected)) in actual
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<2>().0)
+        .enumerate()
+    {
+        let actual = u16::from_le_bytes(*actual);
+        let expected = u16::from_le_bytes(*expected);
+        if expected == u16::from_le_bytes([BYTE_SENTINEL; 2]) {
+            if actual != expected {
+                return Err(AttentionQkPrepareQualificationError::Mismatch(format!(
+                    "key cache at tokens={tokens} modified inactive BF16 word {index}"
+                )));
+            }
+            continue;
+        }
+
+        let actual_value = bf16_to_f32(actual);
+        let expected_value = bf16_to_f32(expected);
+        let error = (actual_value - expected_value).abs();
+        *maximum_error = maximum_error.max(error);
+        let tolerance = 0.002f32.max(expected_value.abs() * 0.003);
+        if !actual_value.is_finite() || error > tolerance {
+            return Err(AttentionQkPrepareQualificationError::Mismatch(format!(
+                "key cache at tokens={tokens}, BF16 word={index}: device={actual_value} ({actual:#06x}), oracle={expected_value} ({expected:#06x}), tolerance={tolerance}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn compare_cache(
     tokens: usize,
     name: &str,
@@ -762,9 +811,19 @@ fn compare_cache(
         .zip(expected)
         .position(|(actual, expected)| actual != expected)
     {
+        let word = index & !1;
+        let words = actual
+            .get(word..word + 2)
+            .zip(expected.get(word..word + 2))
+            .map(|(actual, expected)| {
+                (
+                    u16::from_le_bytes([actual[0], actual[1]]),
+                    u16::from_le_bytes([expected[0], expected[1]]),
+                )
+            });
         return Err(AttentionQkPrepareQualificationError::Mismatch(format!(
-            "{name} cache at tokens={tokens}, byte={index}: device={:#04x}, oracle={:#04x}",
-            actual[index], expected[index]
+            "{name} cache at tokens={tokens}, byte={index}: device={:#04x}, oracle={:#04x}, BF16 words={words:?}",
+            actual[index], expected[index],
         )));
     }
     Ok(())
@@ -839,7 +898,7 @@ fn oracle<A: Arch>(
                         )
                         .map_err(AttentionQkPrepareQualificationError::Mismatch)?;
                     }
-                    CacheFormat::Bf16 => {
+                    CacheFormat::Bf16Exact | CacheFormat::Bf16Math => {
                         let byte = destination * size_of::<u16>();
                         key_pages[byte..byte + 2]
                             .copy_from_slice(&f32_to_bf16(key_value).to_le_bytes());
@@ -863,7 +922,7 @@ fn oracle<A: Arch>(
 const fn cache_element_bytes(format: CacheFormat) -> usize {
     match format {
         CacheFormat::E4m3 => size_of::<u8>(),
-        CacheFormat::Bf16 => size_of::<u16>(),
+        CacheFormat::Bf16Exact | CacheFormat::Bf16Math => size_of::<u16>(),
     }
 }
 
@@ -1093,18 +1152,15 @@ mod tests {
 
     #[test]
     fn mtp_bf16_qk_prepare_suite_route_and_byte_inventory_is_exact() {
-        let (layout, regions) = layout::<Qwen38_27B>(MAX_BATCH, size_of::<u16>()).unwrap();
+        let (layout, regions) = layout::<Qwen38_27B>(MAX_TOKENS, size_of::<u16>()).unwrap();
 
-        assert_eq!(
-            (1..=MAX_BATCH).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8]
-        );
+        assert_eq!(ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
         assert_eq!(regions.weight_bytes(), 1_024);
         assert_eq!(regions.cache_bytes(), 4_194_304);
-        assert_eq!(regions.workspace_bytes(), 428_672);
-        assert_eq!(regions.payload_bytes(), 4_624_000);
-        assert_eq!(layout.byte_len(), 4_624_896);
-        assert_eq!(layout.byte_len() - regions.payload_bytes(), 896);
+        assert_eq!(regions.workspace_bytes(), 54_796_864);
+        assert_eq!(regions.payload_bytes(), 58_992_192);
+        assert_eq!(layout.byte_len(), 58_992_640);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 448);
     }
 
     #[test]
@@ -1115,16 +1171,16 @@ mod tests {
         );
         let report = qualify_mtp_bf16_qk_prepare(&root).expect("MTP BF16 Q/K qualification");
 
-        assert_eq!(report.query_values, 221_184);
-        assert_eq!(report.appended_cache_values, 73_728);
-        assert_eq!(report.untouched_values, 33_579_008);
-        assert_eq!(report.immutable_input_values, 1_853_952);
-        assert_eq!(report.graph_replay_values, 33_947_648);
+        assert_eq!(report.query_values, 7_888_896);
+        assert_eq!(report.appended_cache_values, 2_629_632);
+        assert_eq!(report.untouched_values, 112_680_960);
+        assert_eq!(report.immutable_input_values, 353_959_296);
+        assert_eq!(report.graph_replay_values, 125_829_120);
         assert_eq!(report.weight_bytes, 1_024);
         assert_eq!(report.cache_bytes, 4_194_304);
-        assert_eq!(report.workspace_bytes, 428_672);
-        assert_eq!(report.arena_bytes, 4_624_896);
-        assert_eq!(report.padding_bytes, 896);
+        assert_eq!(report.workspace_bytes, 54_796_864);
+        assert_eq!(report.arena_bytes, 58_992_640);
+        assert_eq!(report.padding_bytes, 448);
         assert!(report.maximum_query_error <= 0.003);
     }
 }
