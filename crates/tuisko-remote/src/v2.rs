@@ -130,7 +130,15 @@ pub(crate) struct SshEndpoint {
 pub(crate) fn wait_until_ssh(v2: &V2, pod_id: &str, deadline: Instant) -> RemoteResult<SshRoutes> {
     let started = Instant::now();
     loop {
-        let pod = v2.get_pod(pod_id)?;
+        let pod = match v2.get_pod(pod_id) {
+            Ok(pod) => pod,
+            Err(error) if is_retryable(&error) && Instant::now() < deadline => {
+                eprintln!("pod status poll failed ({error}); retrying in 5s");
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if pod.status.as_deref() == Some("RUNNING")
             && let Some(ssh) = pod.ssh.as_ref().filter(|ssh| ssh.direct.is_some())
         {
@@ -164,6 +172,17 @@ pub(crate) fn wait_until_ssh(v2: &V2, pod_id: &str, deadline: Instant) -> Remote
 
 pub(crate) fn is_missing(error: &RemoteError) -> bool {
     matches!(error, RemoteError::Api { status: 404, .. })
+}
+
+fn is_retryable(error: &RemoteError) -> bool {
+    matches!(
+        error,
+        RemoteError::Network { .. }
+            | RemoteError::Api {
+                status: 500..=599,
+                ..
+            }
+    )
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(
@@ -207,7 +226,8 @@ fn parse_pod_list(body: &serde_json::Value) -> RemoteResult<Vec<Pod>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SshRoutes, parse_pod_list};
+    use super::{SshRoutes, is_retryable, parse_pod_list};
+    use crate::RemoteError;
 
     #[test]
     fn direct_route_parses() {
@@ -219,6 +239,22 @@ mod tests {
         assert_eq!(direct.host.as_deref(), Some("1.2.3.4"));
         assert_eq!(direct.port, Some(32122));
         assert_eq!(direct.username.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn only_server_side_api_failures_are_retryable() {
+        let api = |status| RemoteError::Api {
+            operation: "get pod",
+            status,
+            body: String::new(),
+        };
+
+        assert!(is_retryable(&api(500)));
+        assert!(is_retryable(&api(503)));
+        assert!(!is_retryable(&api(404)));
+        assert!(!is_retryable(&api(401)));
+        assert!(!is_retryable(&api(0)));
+        assert!(!is_retryable(&RemoteError::MissingKey));
     }
 
     #[test]
