@@ -96,7 +96,11 @@ pub async fn blocking_response(
 }
 
 /// Streams one generation channel as OpenAI server-sent events followed by `[DONE]`.
+///
+/// `first` is the already-received admission reply; the caller has verified it is
+/// not a rejection before committing to the stream shape.
 pub fn streaming_response(
+    first: GenerationReply,
     mut replies: UnboundedReceiver<GenerationReply>,
     id: String,
     created: u64,
@@ -106,7 +110,7 @@ pub fn streaming_response(
 ) -> Response {
     let (events_tx, events_rx) = unbounded_channel::<Result<Event, Infallible>>();
     tokio::spawn(async move {
-        let first = stream_chunk(
+        let role = stream_chunk(
             json!({
                 "id": id,
                 "object": "chat.completion.chunk",
@@ -117,7 +121,7 @@ pub fn streaming_response(
             include_usage,
         );
         if events_tx
-            .send(Ok(Event::default().data(first.to_string())))
+            .send(Ok(Event::default().data(role.to_string())))
             .is_err()
         {
             return;
@@ -125,7 +129,15 @@ pub fn streaming_response(
 
         let mut parser = AssistantStreamParser::new(split_reasoning, parse_tools);
         let mut terminal = false;
-        while let Some(reply) = replies.recv().await {
+        let mut next = Some(first);
+        loop {
+            let reply = match next.take() {
+                Some(reply) => reply,
+                None => match replies.recv().await {
+                    Some(reply) => reply,
+                    None => break,
+                },
+            };
             match reply {
                 GenerationReply::Delta(delta) => {
                     let parsed = parser.push(&delta);
@@ -408,11 +420,6 @@ mod tests {
             let (sender, receiver) = unbounded_channel();
             sender
                 .send(GenerationReply::Delta(
-                    "inspect</think>\n\n<tool_".into(),
-                ))
-                .unwrap();
-            sender
-                .send(GenerationReply::Delta(
                     "call><function=bash><parameter=command>ls</parameter></function></tool_call>"
                         .into(),
                 ))
@@ -424,6 +431,7 @@ mod tests {
                 )))
                 .unwrap();
             let response = streaming_response(
+                GenerationReply::Delta("inspect</think>\n\n<tool_".into()),
                 receiver,
                 "chatcmpl-tuisko-0002".into(),
                 19,
@@ -494,24 +502,39 @@ mod tests {
     }
 
     #[test]
-    fn streaming_rejection_and_disconnect_are_distinct() {
+    fn streaming_failure_and_disconnect_stay_in_stream() {
         runtime().block_on(async {
-            let (sender, receiver) = unbounded_channel();
-            sender
-                .send(GenerationReply::Rejected("context is full".into()))
-                .unwrap();
-            let response = streaming_response(receiver, "id".into(), 1, false, false, false);
-            let rejection_body = body(response).await;
-            let data = rejection_body
+            let (_sender, receiver) = unbounded_channel();
+            let response = streaming_response(
+                GenerationReply::Failed("device launch failed".into()),
+                receiver,
+                "id".into(),
+                1,
+                false,
+                false,
+                false,
+            );
+            let failure_body = body(response).await;
+            let data = failure_body
                 .lines()
                 .filter_map(|line| line.strip_prefix("data: "))
                 .collect::<Vec<_>>();
+            assert_eq!(data.last(), Some(&"[DONE]"));
             let error: Value = serde_json::from_str(data[data.len() - 2]).unwrap();
-            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert_eq!(error["error"]["message"], "device launch failed");
+            assert_eq!(error["error"]["type"], "server_error");
 
             let (sender, receiver) = unbounded_channel::<GenerationReply>();
             drop(sender);
-            let response = streaming_response(receiver, "id".into(), 1, false, false, false);
+            let response = streaming_response(
+                GenerationReply::Delta("partial".into()),
+                receiver,
+                "id".into(),
+                1,
+                false,
+                false,
+                false,
+            );
             let body = body(response).await;
             let data = body
                 .lines()
@@ -519,6 +542,8 @@ mod tests {
                 .collect::<Vec<_>>();
 
             assert_eq!(data.last(), Some(&"[DONE]"));
+            let delta: Value = serde_json::from_str(data[1]).unwrap();
+            assert_eq!(delta["choices"][0]["delta"]["content"], "partial");
             let error: Value = serde_json::from_str(data[data.len() - 2]).unwrap();
             assert_eq!(error["error"]["type"], "server_error");
         });
