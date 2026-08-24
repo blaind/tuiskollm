@@ -7,7 +7,8 @@ use crate::device_benchmark::{
     require_current_process_exclusive, warmup_launches,
 };
 use crate::qwen36_attention_output::{
-    COLUMNS, INPUT_SCALE, MAX_BATCH, OUTPUT_ROWS, Regions, WEIGHT_SCALE, layout, make_fixture,
+    COLUMNS, INPUT_SCALE, MAX_BATCH, MAX_TOKENS, OUTPUT_ROWS, ROUTES, Regions, WEIGHT_SCALE,
+    layout, make_fixture,
 };
 use crate::target::Qwen36AttentionOutputOp;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use tuisko_gpu::{
 };
 
 struct RouteGraphs {
-    batch: usize,
+    tokens: usize,
     preparation: CudaGraph,
     operation: CudaGraph,
 }
@@ -54,9 +55,9 @@ impl Session {
         }
 
         let stream = context.new_stream().map_err(GpuError::from)?;
-        let (layout, regions) = layout()?;
+        let (layout, regions) = layout(MAX_TOKENS)?;
         let arena = DeviceArena::zeroed(&stream, &layout)?;
-        let fixture = make_fixture().map_err(|error| {
+        let fixture = make_fixture(MAX_TOKENS).map_err(|error| {
             DeviceBenchmarkError::Precondition(format!("building Qwen3.6 fixture: {error}"))
         })?;
         arena.copy_from_host(&stream, regions.attention, &fixture.attention)?;
@@ -75,8 +76,9 @@ impl Session {
             weight_codes: arena.address(regions.weight_codes)?,
             output: arena.address(regions.output)?,
         };
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| {
+        let routes = ROUTES
+            .iter()
+            .map(|&tokens| {
                 capture_route(
                     &op,
                     &arena,
@@ -84,7 +86,7 @@ impl Session {
                     &stream,
                     &attention_source,
                     &addresses,
-                    batch,
+                    tokens,
                 )
             })
             .collect::<GpuResult<Vec<_>>>()?;
@@ -117,13 +119,24 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.tokens <= MAX_BATCH {
+                    (
+                        format!("B={}", route.tokens),
+                        BenchmarkWorkload::warm_operator_decode(route.tokens as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.tokens),
+                        BenchmarkWorkload::warm_operator_prefill(route.tokens as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     "qwen36_35b_a3b/attention_output/gate_static_fp8",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
+                    shape,
+                    workload,
                     OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
+                        logical_bytes(route.tokens),
+                        route.tokens as u64,
                         "token",
                     ),
                     &route.operation,
@@ -142,20 +155,20 @@ fn capture_route(
     stream: &CudaStream,
     attention_source: &PinnedHostBuffer<f32>,
     addresses: &Addresses,
-    batch: usize,
+    tokens: usize,
 ) -> GpuResult<RouteGraphs> {
     let preparation = CudaGraph::capture(stream, || unsafe {
         arena.copy_prefix_from_pinned_host_async(
             stream,
             regions.attention,
             attention_source,
-            batch * COLUMNS,
+            tokens * COLUMNS,
         )
     })?;
-    let operation = CudaGraph::capture(stream, || launch(op, stream, addresses, batch))?;
+    let operation = CudaGraph::capture(stream, || launch(op, stream, addresses, tokens))?;
 
     Ok(RouteGraphs {
-        batch,
+        tokens,
         preparation,
         operation,
     })
@@ -165,12 +178,12 @@ fn launch(
     op: &Qwen36AttentionOutputOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    tokens: usize,
 ) -> GpuResult<()> {
     unsafe {
         op.launch(
             stream,
-            batch,
+            tokens,
             addresses.attention,
             addresses.qkv,
             addresses.activation,
@@ -183,11 +196,11 @@ fn launch(
     }
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(tokens: usize) -> usize {
     let weights = OUTPUT_ROWS * COLUMNS;
     let per_token = 15 * COLUMNS + 2 * OUTPUT_ROWS;
 
-    weights + batch * per_token
+    weights + tokens * per_token
 }
 
 /// Measures every complete Qwen3.6 gated static-FP8 attention-output graph.
@@ -211,7 +224,7 @@ pub fn benchmark_qwen36_attention_output(
         "qwen36_35b_a3b/attention_output/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes - padding_bytes,
-        "max_batch=8 attention, QKV, BF16 staging, static codes, and output",
+        "max_tokens=128 attention, QKV, BF16 staging, static codes, and output",
     )?;
     memory.register_owned(
         "qwen36_35b_a3b/attention_output/alignment_padding",
@@ -250,13 +263,14 @@ mod tests {
 
     #[test]
     fn accounting_covers_the_complete_output_path() {
-        let (layout, regions) = layout().unwrap();
-        let b8 = regions.weight_bytes() + MAX_BATCH * (15 * COLUMNS + 2 * OUTPUT_ROWS);
+        let (layout, regions) = layout(MAX_TOKENS).unwrap();
+        let t128 = regions.weight_bytes() + MAX_TOKENS * (15 * COLUMNS + 2 * OUTPUT_ROWS);
 
-        assert_eq!(logical_bytes(MAX_BATCH), b8);
+        assert_eq!(logical_bytes(MAX_TOKENS), t128);
+        assert_eq!(ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
         assert_eq!(crate::qwen36_attention_output::QKV_ROWS, 9_216);
-        assert_eq!(layout.byte_len(), 8_798_208);
+        assert_eq!(layout.byte_len(), 14_942_208);
         assert_eq!(regions.weight_bytes(), 8_388_608);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 409_600);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 6_553_600);
     }
 }

@@ -11702,9 +11702,22 @@ fn gate_qwen36_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
                 .starts_with("qwen36_attention_output_gate_bf16_TID_")
         })
         .collect::<Vec<_>>();
+    let prefill_gates = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen36_attention_output_gate_bf16_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.6 attention-output gate", gates.len(), 8)?;
+    require_count(
+        "Qwen3.6 attention-output prefill gate",
+        prefill_gates.len(),
+        3,
+    )?;
 
-    for entry in &gates {
+    for entry in gates.iter().chain(prefill_gates.iter()) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
@@ -11727,32 +11740,51 @@ fn gate_qwen36_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
     let resources = &artifact.resources;
     let sass = artifact.sass()?;
     let mut registers = Vec::with_capacity(gates.len());
-    let mut shared = Vec::with_capacity(gates.len());
-    for entry in gates {
-        let resource = resources
-            .get(entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted Qwen3.6 gate `{}`", entry.name))?;
-        require_spill_free(entry.name, resource)?;
-        let body = sass_function_body(sass, entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted Qwen3.6 gate SASS `{}`", entry.name))?;
-        for instruction in ["MUFU.EX2", "STG.E.U16"] {
-            if !body.contains(instruction) {
-                return Err(
-                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
-                );
+    let mut prefill_registers = Vec::with_capacity(prefill_gates.len());
+    let mut shared = Vec::with_capacity(gates.len() + prefill_gates.len());
+    for (role, routes, role_registers) in [
+        ("decode", gates, &mut registers),
+        ("prefill", prefill_gates, &mut prefill_registers),
+    ] {
+        for entry in routes {
+            let resource = resources.get(entry.name).ok_or_else(|| {
+                format!(
+                    "cuobjdump omitted Qwen3.6 attention-output {role} gate `{}`",
+                    entry.name
+                )
+            })?;
+            require_spill_free(entry.name, resource)?;
+            let body = sass_function_body(sass, entry.name).ok_or_else(|| {
+                format!(
+                    "cuobjdump omitted Qwen3.6 attention-output {role} gate SASS `{}`",
+                    entry.name
+                )
+            })?;
+            for instruction in ["MUFU.EX2", "STG.E.U16"] {
+                if !body.contains(instruction) {
+                    return Err(format!(
+                        "entry `{}` lost required `{instruction}` SASS",
+                        entry.name
+                    )
+                    .into());
+                }
             }
+            role_registers.push(resource.registers);
+            shared.push(resource.shared);
         }
-        registers.push(resource.registers);
-        shared.push(resource.shared);
     }
     registers.sort_unstable();
+    prefill_registers.sort_unstable();
     shared.sort_unstable();
     require_registers(&baseline, "gate_registers", &registers)?;
+    if baseline.contains_key("prefill_gate_registers") {
+        require_registers(&baseline, "prefill_gate_registers", &prefill_registers)?;
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "Qwen3.6 attention-output gate passed: 8 gate entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, EX2/BF16-store present",
-        registers, shared
+        "Qwen3.6 attention-output gate passed: 8 decode + 3 prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, EX2/BF16-store present",
+        registers, prefill_registers, shared
     );
     Ok(())
 }
