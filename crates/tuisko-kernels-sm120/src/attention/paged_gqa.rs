@@ -3,14 +3,14 @@
 use crate::Sm120Arch;
 use crate::device::paged_gqa::{
     FLASH_PREFILL_P8_SHARED_BYTES, FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS,
-    PREFILL_PARTIAL_VALUES, PREFILL_SHARED_BYTES, PREFILL_THREADS, paged_gqa,
+    PREFILL_PARTIAL_VALUES, PREFILL_SHARED_BYTES, PREFILL_THREADS, bf16_paged_gqa, paged_gqa,
     paged_gqa_prefill_flash_partitioned, paged_gqa_prefill_partitioned_reduce,
-    paged_gqa_prefill_shared, qwen35_paged_gqa_bf16,
+    paged_gqa_prefill_shared,
 };
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
-use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const THREADS: u32 = 32;
@@ -82,6 +82,20 @@ fn require_qwen35_geometry() -> GpuResult<()> {
     {
         return Err(GpuError::invalid_launch(
             "Qwen3.5 geometry is incompatible with its admitted paged GQA schedule",
+        ));
+    }
+
+    Ok(())
+}
+
+fn require_qwen36_geometry() -> GpuResult<()> {
+    if Qwen36Moe35B::NUM_ATTENTION_HEADS != 16
+        || Qwen36Moe35B::NUM_KV_HEADS != 2
+        || Qwen36Moe35B::HEAD_DIM != 256
+        || Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS != 4_096
+    {
+        return Err(GpuError::invalid_launch(
+            "Qwen3.6 geometry is incompatible with its admitted paged GQA schedule",
         ));
     }
 
@@ -204,7 +218,45 @@ mod kernels {
         // context. The 16/128 B=1/B=8 CTAs preserve the established per-head
         // online-softmax order; grouping heads would be a new arithmetic route.
         unsafe {
-            qwen35_paged_gqa_bf16::<Qwen35_9B, TOKENS>(
+            bf16_paged_gqa::<Qwen35_9B, TOKENS>(
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                output,
+            );
+        }
+    }
+
+    /// Applies Qwen3.6 paged BF16 GQA for one exact decode batch.
+    #[kernel]
+    #[launch_bounds(32, 16)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (32, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_paged_gqa_exact<const TOKENS: usize>(
+        query: *const f32,
+        key_pages: *const u16,
+        value_pages: *const u16,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        lengths: *const u32,
+        output: *mut f32,
+    ) {
+        // One warp preserves the qualified 256-column online-softmax order.
+        // Qwen3.6's 16 query heads still expose 16/128 B=1/B=8 CTAs, while
+        // its 8:1 query/KV grouping changes only the selected cache head.
+        unsafe {
+            bf16_paged_gqa::<Qwen36Moe35B, TOKENS>(
                 query,
                 key_pages,
                 value_pages,
@@ -542,6 +594,53 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
                 output,
             )
             .map_err(|source| GpuError::launch("launching Qwen3.5 paged GQA", source))
+    }
+}
+
+struct PreparedQwen36Route<const TOKENS: usize> {
+    attention: PreparedLaunch<kernels::__qwen36_paged_gqa_exact_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedQwen36Route<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let blocks = u32::try_from(TOKENS * Qwen36Moe35B::NUM_ATTENTION_HEADS)
+            .map_err(|_| GpuError::invalid_launch("Qwen3.6 paged GQA grid exceeds u32"))?;
+
+        Ok(Self {
+            attention: module
+                .prepare_qwen36_paged_gqa_exact::<TOKENS>(LaunchConfig1D::new(blocks, THREADS, 0))
+                .map_err(|source| GpuError::launch("preparing Qwen3.6 paged GQA", source))?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        query: *const f32,
+        key_pages: *const u16,
+        value_pages: *const u16,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        lengths: *const u32,
+        output: *mut f32,
+    ) -> GpuResult<()> {
+        module
+            .qwen36_paged_gqa_exact::<TOKENS>(
+                stream,
+                &self.attention,
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                output,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.6 paged GQA", source))
     }
 }
 
@@ -1233,6 +1332,110 @@ impl Qwen35PagedGqaOp {
     }
 }
 
+/// Prepared Qwen3.6 short-context BF16 paged GQA routes for exact `B=1..8`.
+pub struct Qwen36PagedGqaOp {
+    module: kernels::LoadedModule,
+    b1: PreparedQwen36Route<1>,
+    b2: PreparedQwen36Route<2>,
+    b3: PreparedQwen36Route<3>,
+    b4: PreparedQwen36Route<4>,
+    b5: PreparedQwen36Route<5>,
+    b6: PreparedQwen36Route<6>,
+    b7: PreparedQwen36Route<7>,
+    b8: PreparedQwen36Route<8>,
+}
+
+impl Qwen36PagedGqaOp {
+    /// Loads the embedded module and prepares every exact Qwen3.6 route.
+    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        require_qwen36_geometry()?;
+        let _ = qwen36_paged_gqa_ptx_names();
+        // SAFETY: this crate owns the embedded cuda-oxide module artifact.
+        let module = unsafe { kernels::load(context) }
+            .map_err(|source| GpuError::module("loading Qwen3.6 paged GQA", source))?;
+
+        Ok(Self {
+            b1: PreparedQwen36Route::prepare(&module)?,
+            b2: PreparedQwen36Route::prepare(&module)?,
+            b3: PreparedQwen36Route::prepare(&module)?,
+            b4: PreparedQwen36Route::prepare(&module)?,
+            b5: PreparedQwen36Route::prepare(&module)?,
+            b6: PreparedQwen36Route::prepare(&module)?,
+            b7: PreparedQwen36Route::prepare(&module)?,
+            b8: PreparedQwen36Route::prepare(&module)?,
+            module,
+        })
+    }
+
+    /// Applies online-softmax GQA over page-major represented BF16 K/V.
+    ///
+    /// # Safety
+    ///
+    /// Query and output cover `[batch,16,256]` FP32 values. Cache planes use
+    /// `[physical_page,2,64,256]` BF16 values. Metadata covers `batch`; each
+    /// length is nonzero, its table row covers that length rounded up to 64,
+    /// and every physical page is resident. Allocations are aligned,
+    /// disjoint, live through completion, and context-local.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        query: *const f32,
+        key_pages: *const u16,
+        value_pages: *const u16,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: usize,
+        lengths: *const u32,
+        output: *mut f32,
+    ) -> GpuResult<()> {
+        if !admitted_batch(batch) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 paged GQA batch {batch} is outside the admitted range 1..={MAX_BATCH}"
+            )));
+        }
+        let table_stride = u32::try_from(table_stride)
+            .map_err(|_| GpuError::invalid_launch("Qwen3.6 paged GQA table stride exceeds u32"))?;
+        if table_stride == 0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.6 paged GQA table stride must be nonzero",
+            ));
+        }
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        query,
+                        key_pages,
+                        value_pages,
+                        block_tables,
+                        table_rows,
+                        table_stride,
+                        lengths,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match batch {
+            1 => launch!(b1),
+            2 => launch!(b2),
+            3 => launch!(b3),
+            4 => launch!(b4),
+            5 => launch!(b5),
+            6 => launch!(b6),
+            7 => launch!(b7),
+            8 => launch!(b8),
+            _ => unreachable!(),
+        }
+    }
+}
+
 /// PTX symbols retained for every exact paged GQA route.
 pub(crate) fn paged_gqa_ptx_names() -> Vec<&'static str> {
     vec![
@@ -1274,6 +1477,20 @@ pub(crate) fn qwen35_paged_gqa_ptx_names() -> [&'static str; MAX_BATCH] {
     ]
 }
 
+/// PTX symbols retained for every exact Qwen3.6 BF16 paged GQA route.
+pub(crate) fn qwen36_paged_gqa_ptx_names() -> [&'static str; MAX_BATCH] {
+    [
+        kernels::qwen36_paged_gqa_exact_ptx_name::<1>(),
+        kernels::qwen36_paged_gqa_exact_ptx_name::<2>(),
+        kernels::qwen36_paged_gqa_exact_ptx_name::<3>(),
+        kernels::qwen36_paged_gqa_exact_ptx_name::<4>(),
+        kernels::qwen36_paged_gqa_exact_ptx_name::<5>(),
+        kernels::qwen36_paged_gqa_exact_ptx_name::<6>(),
+        kernels::qwen36_paged_gqa_exact_ptx_name::<7>(),
+        kernels::qwen36_paged_gqa_exact_ptx_name::<8>(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1282,6 +1499,7 @@ mod tests {
         PAGED_GQA_PREFILL_MACRO_TOKENS, PAGED_GQA_PREFILL_PARTIAL_BYTES, PREFILL_SHARED_BYTES,
         PREFILL_THREADS, THREADS, admitted_batch, admitted_macro_partitions,
         paged_gqa_prefill_partitions, paged_gqa_ptx_names, qwen35_paged_gqa_ptx_names,
+        qwen36_paged_gqa_ptx_names,
     };
     use std::collections::BTreeSet;
 
@@ -1314,6 +1532,13 @@ mod tests {
         assert_eq!(qwen35.len(), 8);
         assert_eq!(qwen35_unique.len(), qwen35.len());
         assert!(names.iter().all(|name| !qwen35_unique.contains(name)));
+
+        let qwen36 = qwen36_paged_gqa_ptx_names();
+        let qwen36_unique = qwen36.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(qwen36.len(), 8);
+        assert_eq!(qwen36_unique.len(), qwen36.len());
+        assert!(names.iter().all(|name| !qwen36_unique.contains(name)));
+        assert!(qwen35_unique.is_disjoint(&qwen36_unique));
     }
 
     #[test]

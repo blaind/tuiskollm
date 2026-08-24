@@ -20,6 +20,8 @@ mod attention_qk_prepare;
 #[cfg(feature = "device")]
 mod attention_qk_prepare_benchmark;
 #[cfg(feature = "device")]
+mod bf16_paged_gqa_benchmark;
+#[cfg(feature = "device")]
 mod dense_fp8_gdn_layer;
 #[cfg(feature = "device")]
 mod dense_fp8_gdn_layer_benchmark;
@@ -177,8 +179,6 @@ mod qwen35_nvfp4_swiglu;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_swiglu_benchmark;
 #[cfg(feature = "device")]
-mod qwen35_paged_gqa_benchmark;
-#[cfg(feature = "device")]
 mod qwen35_resident_model;
 #[cfg(feature = "device")]
 mod qwen35_resident_model_benchmark;
@@ -275,6 +275,10 @@ pub use attention_qk_prepare::{
 pub use attention_qk_prepare_benchmark::{
     benchmark_attention_qk_prepare, benchmark_mtp_bf16_qk_prepare,
     benchmark_qwen35_attention_qk_prepare, benchmark_qwen36_attention_qk_prepare,
+};
+#[cfg(feature = "device")]
+pub use bf16_paged_gqa_benchmark::{
+    benchmark_mtp_bf16_paged_gqa, benchmark_qwen35_paged_gqa, benchmark_qwen36_paged_gqa,
 };
 #[cfg(feature = "device")]
 pub use dense_fp8_gdn_layer::{
@@ -403,7 +407,7 @@ pub use nvfp4_swiglu_benchmark::benchmark_nvfp4_swiglu;
 #[cfg(feature = "device")]
 pub use paged_gqa::{
     PagedGqaQualification, PagedGqaQualificationError, qualify_mtp_bf16_paged_gqa,
-    qualify_paged_gqa, qualify_qwen35_paged_gqa,
+    qualify_paged_gqa, qualify_qwen35_paged_gqa, qualify_qwen36_paged_gqa,
 };
 #[cfg(feature = "device")]
 pub use paged_gqa_benchmark::benchmark_paged_gqa;
@@ -499,8 +503,6 @@ pub use qwen35_nvfp4_qkv_benchmark::benchmark_qwen35_nvfp4_qkv;
 pub use qwen35_nvfp4_swiglu::qualify_qwen35_nvfp4_swiglu;
 #[cfg(feature = "device")]
 pub use qwen35_nvfp4_swiglu_benchmark::benchmark_qwen35_nvfp4_swiglu;
-#[cfg(feature = "device")]
-pub use qwen35_paged_gqa_benchmark::{benchmark_mtp_bf16_paged_gqa, benchmark_qwen35_paged_gqa};
 #[cfg(feature = "device")]
 pub use qwen35_resident_model::{
     Qwen35ResidentModelQualification, Qwen35ResidentModelQualificationError,

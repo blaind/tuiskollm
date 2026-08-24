@@ -761,6 +761,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("qualify-paged-gqa") if remaining.is_empty() => qualify_paged_gqa(root),
         Some("qualify-qwen35-paged-gqa") if remaining.is_empty() => qualify_qwen35_paged_gqa(root),
+        Some("qualify-qwen36-paged-gqa") if remaining.is_empty() => qualify_qwen36_paged_gqa(root),
         Some("qualify-long-context-paged-gqa") if remaining.is_empty() => {
             qualify_long_context_paged_gqa(root)
         }
@@ -971,6 +972,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-attention-qk-prepare"
                     | "qualify-paged-gqa"
                     | "qualify-qwen35-paged-gqa"
+                    | "qualify-qwen36-paged-gqa"
                     | "qualify-long-context-paged-gqa"
                     | "qualify-attention-output"
                     | "qualify-mtp-bf16-fusion"
@@ -2451,11 +2453,56 @@ fn qualify_qwen35_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "qwen35_paged_gqa_benchmark::tests::qwen35_bf16_",
+            "bf16_paged_gqa_benchmark::tests::qwen35_bf16_",
             "--nocapture",
         ],
     )?;
     gate_qwen35_paged_gqa(root)
+}
+
+fn qualify_qwen36_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "paged_gqa::tests::qwen36_bf16_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "bf16_paged_gqa_benchmark::tests::qwen36_bf16_",
+            "--nocapture",
+        ],
+    )
 }
 
 fn qualify_long_context_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {

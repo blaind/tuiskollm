@@ -1414,7 +1414,7 @@ pub(crate) unsafe fn paged_gqa<A: Arch, const TOKENS: usize>(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn qwen35_paged_gqa_bf16<A: Arch, const TOKENS: usize>(
+pub(crate) unsafe fn bf16_paged_gqa<A: Arch, const TOKENS: usize>(
     query: *const f32,
     key_pages: *const u16,
     value_pages: *const u16,
