@@ -23,6 +23,8 @@ mod qwen35_full_attention_layer_layout;
 mod qwen35_nvfp4_mlp;
 mod resident_generation;
 mod resident_model_layout;
+mod resident_mtp;
+mod resident_mtp_layout;
 mod sampling;
 
 pub use dense_fp8_gdn_layer::DenseFp8GdnLayerProgram;
@@ -62,6 +64,10 @@ pub use resident_model_layout::{
     ResidentMtpVerifyRoute, ResidentPrefillRoute, ResidentUploadArena, ResidentUploadEntry,
     ResidentUploadPlan, ResidentUploadPreparation,
 };
+pub use resident_mtp::{
+    ResidentMtpDraftRoute, ResidentMtpProgram, ResidentMtpPromptRoute, ResidentMtpRealignRoute,
+};
+pub use resident_mtp_layout::ResidentMtpLayout;
 pub use sampling::{SampleDecision, Sampler, SamplingOptions};
 
 #[cfg(feature = "qualification")]
@@ -88,3 +94,5 @@ pub use resident_model_layout::{
     ResidentMtpGdnObservables, ResidentMtpLayerObservables, ResidentMtpVerifyObservables,
     ResidentPrefillStageGraph,
 };
+#[cfg(feature = "qualification")]
+pub use resident_mtp::ResidentMtpObservables;

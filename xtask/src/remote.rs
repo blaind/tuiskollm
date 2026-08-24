@@ -12,10 +12,10 @@ use crate::gpu_target::{GpuTarget, has_full_kernel_inventory};
 #[cfg(feature = "remote")]
 const USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
     <qualify-residual-norm|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
-    qualify-nvfp4-mlp|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-long-context-paged-gqa|qualify-attention-output|qualify-mtp-bf16-fusion|qualify-mtp-bf16-qkv|qualify-mtp-bf16-qk-prepare|qualify-mtp-bf16-paged-gqa|qualify-mtp-bf16-attention-output|qualify-mtp-bf16-mlp|qualify-full-attention-layer|qualify-mtp-layer|qualify-target-mtp-verify|qualify-mtp-prompt-prime|\
+    qualify-nvfp4-mlp|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-long-context-paged-gqa|qualify-attention-output|qualify-mtp-bf16-fusion|qualify-mtp-bf16-qkv|qualify-mtp-bf16-qk-prepare|qualify-mtp-bf16-paged-gqa|qualify-mtp-bf16-attention-output|qualify-mtp-bf16-mlp|qualify-full-attention-layer|qualify-mtp-layer|qualify-target-mtp-verify|qualify-mtp-prompt-prime|qualify-resident-mtp|\
     qualify-resident-model|qualify-resident-generation|qualify-resident-batch-generation|\
     bench-residual-norm|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-fp8-qkv|bench-fp8-gdn-input|\
-    bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-mtp-bf16-fusion|bench-mtp-bf16-qkv|bench-mtp-bf16-qk-prepare|bench-mtp-bf16-paged-gqa|bench-mtp-bf16-attention-output|bench-mtp-bf16-mlp|bench-full-attention-layer|bench-mtp-layer|bench-target-mtp-verify|bench-mtp-prompt-prime|\
+    bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-mtp-bf16-fusion|bench-mtp-bf16-qkv|bench-mtp-bf16-qk-prepare|bench-mtp-bf16-paged-gqa|bench-mtp-bf16-attention-output|bench-mtp-bf16-mlp|bench-full-attention-layer|bench-mtp-layer|bench-target-mtp-verify|bench-mtp-prompt-prime|bench-resident-mtp|\
     bench-resident-model|bench-resident-prefill|bench-resident-long-context-model|\
     probe|check|sweep> \
     [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
@@ -59,6 +59,7 @@ impl Qualification {
                 "target_mtp_verify::tests::exact_target_verify_and_commit_match_source_oracles"
             }
             "qualify-mtp-prompt-prime" => "mtp_prompt_prime_suite_",
+            "qualify-resident-mtp" => "resident_mtp_suite_",
             "qualify-resident-model" => {
                 "resident_model::tests::source_model_matches_final_oracle_and_exact_graph_replay"
             }
@@ -94,6 +95,7 @@ impl Qualification {
                 "qualify-mtp-layer" => "mtp-layer",
                 "qualify-target-mtp-verify" => "target-mtp-verify",
                 "qualify-mtp-prompt-prime" => "mtp-prompt-prime",
+                "qualify-resident-mtp" => "resident-mtp",
                 "qualify-resident-model" => "resident-model",
                 "qualify-resident-generation" => "resident-generation",
                 "qualify-resident-batch-generation" => "resident-batch-generation",
@@ -112,6 +114,7 @@ impl Qualification {
                     | "qualify-mtp-layer"
                     | "qualify-target-mtp-verify"
                     | "qualify-mtp-prompt-prime"
+                    | "qualify-resident-mtp"
                     | "qualify-resident-model"
                     | "qualify-resident-generation"
                     | "qualify-resident-batch-generation"
@@ -129,6 +132,7 @@ enum Benchmark {
     MtpLayer,
     TargetMtpVerify,
     MtpPromptPrime,
+    ResidentMtp,
     ResidentModel,
     ResidentPrefill,
     ResidentLongContextModel,
@@ -163,6 +167,7 @@ impl Benchmark {
             "bench-mtp-layer" => Self::MtpLayer,
             "bench-target-mtp-verify" => Self::TargetMtpVerify,
             "bench-mtp-prompt-prime" => Self::MtpPromptPrime,
+            "bench-resident-mtp" => Self::ResidentMtp,
             "bench-resident-model" => Self::ResidentModel,
             "bench-resident-prefill" => Self::ResidentPrefill,
             "bench-resident-long-context-model" => Self::ResidentLongContextModel,
@@ -178,6 +183,7 @@ impl Benchmark {
             Self::MtpLayer => "mtp-layer",
             Self::TargetMtpVerify => "target-mtp-verify",
             Self::MtpPromptPrime => "mtp-prompt-prime",
+            Self::ResidentMtp => "resident-mtp",
             Self::ResidentModel => "resident-model",
             Self::ResidentPrefill => "resident-prefill",
             Self::ResidentLongContextModel => "resident-long-context-model",
@@ -192,6 +198,7 @@ impl Benchmark {
                 | Self::MtpLayer
                 | Self::TargetMtpVerify
                 | Self::MtpPromptPrime
+                | Self::ResidentMtp
                 | Self::ResidentModel
                 | Self::ResidentPrefill
                 | Self::ResidentLongContextModel
@@ -302,6 +309,9 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
             Benchmark::MtpPromptPrime => {
                 crate::prepare_remote_mtp_prompt_prime_benchmark(root, options.gpu)?
             }
+            Benchmark::ResidentMtp => {
+                crate::prepare_remote_resident_mtp_benchmark(root, options.gpu)?
+            }
             Benchmark::ResidentModel => {
                 crate::prepare_remote_resident_model_benchmark(root, options.gpu)?
             }
@@ -353,6 +363,8 @@ fn gate_static_resources(root: &Path, gpu: GpuTarget, command: &str) -> Result<(
         crate::gate_nvfp4_down_target(root, gpu)
     } else if command.contains("fp8-qkv") && gpu == GpuTarget::Sm89 {
         crate::gate_fp8_qkv_sm89(root)
+    } else if command.contains("resident-mtp") {
+        crate::gate_resident_mtp(root)
     } else if command.contains("mtp-prompt-prime") {
         crate::gate_mtp_prompt_prime(root)
     } else if command.contains("target-mtp-verify") {
@@ -546,6 +558,10 @@ mod tests {
         assert_eq!(prompt.name, "mtp-prompt-prime");
         assert_eq!(prompt.filter, "mtp_prompt_prime_suite_");
         assert!(prompt.source_snapshot);
+        let resident_mtp = Qualification::parse("qualify-resident-mtp").expect("known suite");
+        assert_eq!(resident_mtp.name, "resident-mtp");
+        assert_eq!(resident_mtp.filter, "resident_mtp_suite_");
+        assert!(resident_mtp.source_snapshot);
         let generation = Qualification::parse("qualify-resident-generation").expect("known suite");
         assert_eq!(generation.name, "resident-generation");
         assert!(generation.source_snapshot);
@@ -576,6 +592,9 @@ mod tests {
         let prompt = Benchmark::parse("bench-mtp-prompt-prime").expect("known benchmark");
         assert_eq!(prompt.name(), "mtp-prompt-prime");
         assert!(prompt.source_snapshot());
+        let resident_mtp = Benchmark::parse("bench-resident-mtp").expect("known benchmark");
+        assert_eq!(resident_mtp.name(), "resident-mtp");
+        assert!(resident_mtp.source_snapshot());
         assert_eq!(
             Benchmark::parse("bench-attention-qk-prepare")
                 .expect("known benchmark")

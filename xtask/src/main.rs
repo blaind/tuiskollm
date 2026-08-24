@@ -147,6 +147,30 @@ const MTP_PROMPT_PRIME_RESOURCE_BASELINES: &[&str] = &[
     MTP_BF16_QKV_RESOURCE_BASELINE,
     MTP_BF16_QK_PREPARE_RESOURCE_BASELINE,
 ];
+const RESIDENT_MTP_RESOURCE_BASELINES: &[&str] = &[
+    RESIDUAL_NORM_RESOURCE_BASELINE,
+    FP8_QKV_RESOURCE_BASELINE,
+    FP8_GDN_INPUT_RESOURCE_BASELINE,
+    FP8_LM_HEAD_RESOURCE_BASELINE,
+    FP8_SWIGLU_RESOURCE_BASELINE,
+    FP8_DOWN_RESOURCE_BASELINE,
+    NVFP4_SWIGLU_RESOURCE_BASELINE,
+    NVFP4_DOWN_RESOURCE_BASELINE,
+    GDN_PREPARE_RESOURCE_BASELINE,
+    GDN_RECURRENCE_RESOURCE_BASELINE,
+    GDN_STATE_SNAPSHOT_RESOURCE_BASELINE,
+    GDN_OUTPUT_RESOURCE_BASELINE,
+    ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+    PAGED_GQA_RESOURCE_BASELINE,
+    LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE,
+    ATTENTION_OUTPUT_RESOURCE_BASELINE,
+    MTP_BF16_FUSION_RESOURCE_BASELINE,
+    MTP_BF16_QKV_RESOURCE_BASELINE,
+    MTP_BF16_QK_PREPARE_RESOURCE_BASELINE,
+    MTP_BF16_PAGED_GQA_RESOURCE_BASELINE,
+    MTP_BF16_ATTENTION_OUTPUT_RESOURCE_BASELINE,
+    MTP_BF16_MLP_RESOURCE_BASELINE,
+];
 const QWEN35_FULL_ATTENTION_LAYER_RESOURCE_BASELINES: &[&str] = &[
     QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE,
     QWEN35_NVFP4_QKV_RESOURCE_BASELINE,
@@ -659,6 +683,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-mtp-layer") => qualify_mtp_layer(root, &remaining),
         Some("qualify-target-mtp-verify") => qualify_target_mtp_verify(root, &remaining),
         Some("qualify-mtp-prompt-prime") => qualify_mtp_prompt_prime(root, &remaining),
+        Some("qualify-resident-mtp") => qualify_resident_mtp(root, &remaining),
         Some("qualify-qwen35-full-attention-layer") => {
             qualify_qwen35_full_attention_layer(root, &remaining)
         }
@@ -711,6 +736,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-mtp-layer") => bench_mtp_layer(root, &remaining),
         Some("bench-target-mtp-verify") => bench_target_mtp_verify(root, &remaining),
         Some("bench-mtp-prompt-prime") => bench_mtp_prompt_prime(root, &remaining),
+        Some("bench-resident-mtp") => bench_resident_mtp(root, &remaining),
         Some("bench-qwen35-full-attention-layer") => {
             bench_qwen35_full_attention_layer(root, &remaining)
         }
@@ -2198,11 +2224,49 @@ fn qualify_mtp_prompt_prime(
     gate_mtp_prompt_prime(root)
 }
 
+fn qualify_resident_mtp(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-resident-mtp SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "resident_mtp_suite_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_resident_mtp(root)
+}
+
 pub(crate) fn gate_mtp_prompt_prime(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_residual_norm(root)?;
     gate_mtp_bf16_fusion(root)?;
     gate_mtp_bf16_qkv(root)?;
     gate_mtp_bf16_qk_prepare(root)
+}
+
+pub(crate) fn gate_resident_mtp(root: &Path) -> Result<(), Box<dyn Error>> {
+    gate_resident_model_resources(root)?;
+    gate_mtp_layer(root)
 }
 
 pub(crate) fn gate_mtp_layer(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -3024,6 +3088,34 @@ fn bench_mtp_prompt_prime(
     run_visible(
         Command::new(executable)
             .arg("mtp-prompt-prime")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_resident_mtp(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err("usage: cargo run -p xtask -- bench-resident-mtp SNAPSHOT [options]".into());
+    };
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = Vec::new();
+    for baseline in RESIDENT_MTP_RESOURCE_BASELINES {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("resident-mtp")
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
@@ -4565,6 +4657,15 @@ pub(crate) fn prepare_remote_mtp_prompt_prime_benchmark(
     gpu: gpu_target::GpuTarget,
 ) -> Result<RemoteBenchmark, Box<dyn Error>> {
     prepare_remote_benchmark_with_baselines(root, gpu, MTP_PROMPT_PRIME_RESOURCE_BASELINES)
+}
+
+/// Locates the resident MTP benchmark and binds every target and MTP leaf resource.
+#[cfg(feature = "remote")]
+pub(crate) fn prepare_remote_resident_mtp_benchmark(
+    root: &Path,
+    gpu: gpu_target::GpuTarget,
+) -> Result<RemoteBenchmark, Box<dyn Error>> {
+    prepare_remote_benchmark_with_baselines(root, gpu, RESIDENT_MTP_RESOURCE_BASELINES)
 }
 
 /// Locates the complete resident-model benchmark and binds every launched leaf resource.
