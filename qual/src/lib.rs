@@ -166,6 +166,10 @@ mod resident_model_benchmark;
 mod resident_mtp;
 #[cfg(feature = "device")]
 mod resident_mtp_benchmark;
+#[cfg(feature = "device")]
+mod resident_mtp_generation;
+#[cfg(feature = "device")]
+mod resident_mtp_generation_benchmark;
 mod residual_norm;
 mod residual_norm_benchmark;
 #[cfg(feature = "device")]
@@ -407,6 +411,13 @@ pub use resident_mtp::{
 };
 #[cfg(feature = "device")]
 pub use resident_mtp_benchmark::benchmark_resident_mtp;
+#[cfg(feature = "device")]
+pub use resident_mtp_generation::{
+    ResidentMtpGenerationQualification, ResidentMtpGenerationQualificationError,
+    qualify_resident_mtp_generation,
+};
+#[cfg(feature = "device")]
+pub use resident_mtp_generation_benchmark::benchmark_resident_mtp_generation;
 #[cfg(feature = "device")]
 pub use residual_norm::qualify_qwen35_residual_norm;
 pub use residual_norm::{

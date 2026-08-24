@@ -36,6 +36,11 @@ impl SamplingOptions {
     pub fn validate(self) -> EngineResult<()> {
         validate_options(self)
     }
+
+    /// Whether these controls select the exact greedy route.
+    pub const fn is_greedy(self) -> bool {
+        self.temperature == 0.0 || self.top_k == 1
+    }
 }
 
 impl Default for SamplingOptions {
@@ -108,7 +113,7 @@ enum SamplingRoute {
 }
 
 fn sampling_route(options: SamplingOptions) -> SamplingRoute {
-    if options.temperature == 0.0 || options.top_k == 1 {
+    if options.is_greedy() {
         SamplingRoute::Greedy
     } else {
         SamplingRoute::TopKTopP

@@ -47,6 +47,8 @@ pub struct ResidentMtpQualification {
     pub prompt_routes: usize,
     /// Exact compact draft routes checked eagerly and by graph replay.
     pub draft_routes: usize,
+    /// Exact single-slot residual-continuation route checked eagerly and by graph replay.
+    pub continuation_routes: usize,
     /// Exact prime-only realignment routes checked eagerly and by graph replay.
     pub prime_routes: usize,
     /// Exact full realignment routes checked eagerly and by graph replay.
@@ -71,7 +73,7 @@ pub struct ResidentMtpQualification {
     pub padding_bytes: usize,
     /// Page-locked graph source bytes.
     pub host_stager_bytes: usize,
-    /// Exact prompt, draft, prime, and realignment graphs.
+    /// Exact prompt, seeded draft, continuation, prime, and realignment graphs.
     pub graph_count: usize,
 }
 
@@ -124,6 +126,7 @@ pub fn qualify_resident_mtp(
         source_oracle_suites: 2,
         prompt_routes: 0,
         draft_routes: 0,
+        continuation_routes: 0,
         prime_routes: 0,
         realign_routes: 0,
         tail_routes: 0,
@@ -148,6 +151,14 @@ pub fn qualify_resident_mtp(
         &mut report,
     )?;
     verify_draft_routes(
+        &mut program,
+        &stream,
+        embedding,
+        stable_bases,
+        &stable_addresses,
+        &mut report,
+    )?;
+    verify_continuation_route(
         &mut program,
         &stream,
         embedding,
@@ -191,7 +202,7 @@ fn verify_owner(program: &ResidentMtpProgram) -> Result<(), ResidentMtpQualifica
         || program.owner_bytes() != 1_873_554_176
         || program.padding_bytes() != 288
         || program.host_stager_bytes() != 10_760_192
-        || program.graph_count() != 21
+        || program.graph_count() != 22
     {
         return Err(ResidentMtpQualificationError::Mismatch(
             "resident MTP byte or graph accounting differs from the admitted layout".to_string(),
@@ -280,6 +291,91 @@ fn verify_draft_routes(
         verify_stable(program, stable_bases, stable_addresses, "draft", batch)?;
         report.draft_routes += 1;
     }
+    Ok(())
+}
+
+fn verify_continuation_route(
+    program: &mut ResidentMtpProgram,
+    stream: &CudaStream,
+    embedding: &[u8],
+    stable_bases: (u64, u64),
+    stable_addresses: &[usize],
+    report: &mut ResidentMtpQualification,
+) -> Result<(), ResidentMtpQualificationError> {
+    let seed_position = 130u32;
+    let continuation_position = seed_position + 1;
+    let seed_token = token_id(8_100);
+    let continuation_token = token_id(8_101);
+    let seed_hidden = hidden_fixture(1, 8_100);
+    let (seed_cosine, seed_sine) = rope(&[seed_position]);
+    let (continuation_cosine, continuation_sine) = rope(&[continuation_position]);
+
+    let run_seed = |program: &mut ResidentMtpProgram| {
+        program.reset_slot(stream, 0)?;
+        program.target().load_residual(stream, 1, &seed_hidden)?;
+        let route = program.stage_draft(
+            stream,
+            &[0],
+            &[seed_position],
+            &[seed_token],
+            &seed_cosine,
+            &seed_sine,
+        )?;
+        program.replay_draft(stream, route)?;
+        program.qualification_observables(stream, 1, true)
+    };
+
+    let seed = run_seed(program)?;
+    let prior_residual = seed.residual_output.ok_or_else(|| {
+        ResidentMtpQualificationError::Mismatch(
+            "resident MTP seed route did not publish its residual".to_string(),
+        )
+    })?;
+    let route = program.stage_draft(
+        stream,
+        &[0],
+        &[continuation_position],
+        &[continuation_token],
+        &continuation_cosine,
+        &continuation_sine,
+    )?;
+    program.qualification_launch_eager_continue_draft(stream, route)?;
+    let eager = program.qualification_observables(stream, 1, true)?;
+    let eager_cache = read_cache(program, stream, 0, seed_position as usize, 2)?;
+    verify_inputs(
+        program,
+        stream,
+        embedding,
+        &[continuation_token],
+        &prior_residual,
+        &[0],
+        &[continuation_position],
+        &continuation_cosine,
+        &continuation_sine,
+        &eager,
+    )?;
+
+    let replay_seed = run_seed(program)?;
+    if replay_seed.residual_output.as_deref() != Some(prior_residual.as_slice()) {
+        return Err(ResidentMtpQualificationError::Mismatch(
+            "resident MTP seed residual changed before graph continuation".to_string(),
+        ));
+    }
+    let route = program.stage_draft(
+        stream,
+        &[0],
+        &[continuation_position],
+        &[continuation_token],
+        &continuation_cosine,
+        &continuation_sine,
+    )?;
+    program.replay_continue_draft(stream, route)?;
+    let replay = program.qualification_observables(stream, 1, true)?;
+    let replay_cache = read_cache(program, stream, 0, seed_position as usize, 2)?;
+    compare_observables("continuation", 1, &eager, &replay, report)?;
+    compare_cache("continuation", 1, &eager_cache, &replay_cache)?;
+    verify_stable(program, stable_bases, stable_addresses, "continuation", 1)?;
+    report.continuation_routes += 1;
     Ok(())
 }
 
@@ -906,6 +1002,7 @@ mod tests {
         assert_eq!(report.source_oracle_suites, 2);
         assert_eq!(report.prompt_routes, 5);
         assert_eq!(report.draft_routes, 8);
+        assert_eq!(report.continuation_routes, 1);
         assert_eq!(report.prime_routes, 4);
         assert_eq!(report.realign_routes, 4);
         assert_eq!(report.tail_routes, 31);
