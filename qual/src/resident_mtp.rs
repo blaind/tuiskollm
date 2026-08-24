@@ -215,6 +215,21 @@ fn run_source_oracles() -> Result<(), ResidentMtpQualificationError> {
         ))
     })?;
     for (role, test) in TESTS {
+        let listing = std::process::Command::new(&executable)
+            .args([test, "--exact", "--list"])
+            .output()
+            .map_err(|error| {
+                ResidentMtpQualificationError::Mismatch(format!(
+                    "listing the {role} target test failed: {error}"
+                ))
+            })?;
+        if !listing.status.success()
+            || !String::from_utf8_lossy(&listing.stdout).contains(&format!("{test}: test"))
+        {
+            return Err(ResidentMtpQualificationError::Mismatch(format!(
+                "the {role} target test `{test}` is missing from this executable"
+            )));
+        }
         let status = std::process::Command::new(&executable)
             .args([
                 test,
