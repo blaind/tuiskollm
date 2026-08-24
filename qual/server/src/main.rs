@@ -256,6 +256,20 @@ impl Qualification {
             self.check(true, format!("zero {field} was not rejected"))?;
         }
 
+        for (label, content) in [
+            ("missing user content", None),
+            ("null user content", Some(Value::Null)),
+        ] {
+            let mut request = request(false, COMPLETION_TOKENS);
+            let mut message = json!({"role": "user"});
+            if let Some(content) = content {
+                message["content"] = content;
+            }
+            request["messages"] = json!([message]);
+            self.client.expect_rejection(request, label)?;
+            self.check(true, format!("{label} was not rejected"))?;
+        }
+
         let streaming = self.client.streaming()?;
         self.check(
             streaming == blocking,
