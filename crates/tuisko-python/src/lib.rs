@@ -303,34 +303,45 @@ impl Frontend {
     #[classmethod]
     #[pyo3(signature = (checkpoint, prompt_cache_capacity = 4))]
     fn open(
-        _class: &Bound<'_, PyType>,
+        class: &Bound<'_, PyType>,
         checkpoint: &str,
         prompt_cache_capacity: usize,
     ) -> PyResult<Self> {
-        let snapshot = CheckpointSnapshot::<Qwen38_27B>::open(Path::new(checkpoint))
-            .map_err(|error| CheckpointError::new_err(error.to_string()))?;
-        let inner = TextFrontend::open_with_options(
-            &snapshot,
-            TextFrontendOptions {
-                prompt_cache_capacity,
-            },
-        )
-        .map_err(|error| FrontendError::new_err(error.to_string()))?;
+        class.py().detach(|| {
+            let snapshot = CheckpointSnapshot::<Qwen38_27B>::open(Path::new(checkpoint))
+                .map_err(|error| CheckpointError::new_err(error.to_string()))?;
+            let inner = TextFrontend::open_with_options(
+                &snapshot,
+                TextFrontendOptions {
+                    prompt_cache_capacity,
+                },
+            )
+            .map_err(|error| FrontendError::new_err(error.to_string()))?;
 
-        Ok(Self { inner })
+            Ok(Self { inner })
+        })
     }
 
-    fn encode(&self, text: &str) -> PyResult<Vec<u32>> {
-        self.inner
-            .encode(text)
-            .map_err(|error| FrontendError::new_err(error.to_string()))
+    fn encode(&self, py: Python<'_>, text: &str) -> PyResult<Vec<u32>> {
+        py.detach(|| {
+            self.inner
+                .encode(text)
+                .map_err(|error| FrontendError::new_err(error.to_string()))
+        })
     }
 
     #[pyo3(signature = (token_ids, skip_special_tokens = true))]
-    fn decode(&self, token_ids: Vec<u32>, skip_special_tokens: bool) -> PyResult<String> {
-        self.inner
-            .decode(&token_ids, skip_special_tokens)
-            .map_err(|error| FrontendError::new_err(error.to_string()))
+    fn decode(
+        &self,
+        py: Python<'_>,
+        token_ids: Vec<u32>,
+        skip_special_tokens: bool,
+    ) -> PyResult<String> {
+        py.detach(|| {
+            self.inner
+                .decode(&token_ids, skip_special_tokens)
+                .map_err(|error| FrontendError::new_err(error.to_string()))
+        })
     }
 
     #[pyo3(signature = (
@@ -350,12 +361,15 @@ impl Frontend {
         reasoning_effort: Option<String>,
         tools: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<String> {
+        let py = messages.py();
         let messages = chat_messages(messages)?;
         let options =
             chat_template_options(enable_thinking, preserve_thinking, reasoning_effort, tools)?;
-        self.inner
-            .render_chat(&messages, add_generation_prompt, &options)
-            .map_err(|error| FrontendError::new_err(error.to_string()))
+        py.detach(|| {
+            self.inner
+                .render_chat(&messages, add_generation_prompt, &options)
+                .map_err(|error| FrontendError::new_err(error.to_string()))
+        })
     }
 
     #[pyo3(signature = (
@@ -373,12 +387,15 @@ impl Frontend {
         reasoning_effort: Option<String>,
         tools: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<u32>> {
+        let py = messages.py();
         let messages = chat_messages(messages)?;
         let options =
             chat_template_options(enable_thinking, preserve_thinking, reasoning_effort, tools)?;
-        self.inner
-            .encode_chat(&messages, &options)
-            .map_err(|error| FrontendError::new_err(error.to_string()))
+        py.detach(|| {
+            self.inner
+                .encode_chat(&messages, &options)
+                .map_err(|error| FrontendError::new_err(error.to_string()))
+        })
     }
 
     #[pyo3(signature = (
@@ -396,13 +413,16 @@ impl Frontend {
         reasoning_effort: Option<String>,
         tools: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PromptEncoding> {
+        let py = messages.py();
         let messages = chat_messages(messages)?;
         let options =
             chat_template_options(enable_thinking, preserve_thinking, reasoning_effort, tools)?;
-        self.inner
-            .encode_chat_with_report(&messages, &options)
-            .map(PromptEncoding::from)
-            .map_err(|error| FrontendError::new_err(error.to_string()))
+        py.detach(|| {
+            self.inner
+                .encode_chat_with_report(&messages, &options)
+                .map(PromptEncoding::from)
+                .map_err(|error| FrontendError::new_err(error.to_string()))
+        })
     }
 
     fn streaming_decoder(&self) -> StreamingDecoder {
