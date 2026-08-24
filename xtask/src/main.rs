@@ -6406,22 +6406,13 @@ fn wait_for_device_idle() -> Result<(), Box<dyn Error>> {
     let timeout = Duration::from_secs(10);
     let deadline = Instant::now() + timeout;
     loop {
-        let row = command_text(
-            "nvidia-smi",
-            &[
-                "-i",
-                "0",
-                "--query-gpu=utilization.gpu,memory.used",
-                "--format=csv,noheader,nounits",
-            ],
-        )?;
-        let (utilization, memory_mib) = parse_idle_sample(&row)?;
-        if utilization == 0 && memory_mib <= 1_024 {
-            return require_performance_device_idle();
+        let (utilization, memory_mib, pids) = device_idle_evidence("device idle wait")?;
+        if device_is_idle(utilization, memory_mib, &pids) {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "device zero remained busy for {} seconds between performance suites: utilization={utilization}%, memory={memory_mib} MiB",
+                "device zero remained busy for {} seconds: utilization={utilization}%, memory={memory_mib} MiB, compute processes={pids:?}",
                 timeout.as_secs()
             )
             .into());
@@ -6436,6 +6427,24 @@ fn require_performance_device_idle() -> Result<(), Box<dyn Error>> {
 }
 
 fn require_device_idle(activity: &str) -> Result<(), Box<dyn Error>> {
+    let (utilization, memory_mib, pids) = device_idle_evidence(activity)?;
+    if utilization != 0 || memory_mib > 1_024 {
+        return Err(format!(
+            "device zero is busy before {activity}: utilization={utilization}%, memory={memory_mib} MiB"
+        )
+        .into());
+    }
+    if !pids.is_empty() {
+        return Err(format!(
+            "device zero has foreign compute processes before {activity}: {pids:?}"
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn device_idle_evidence(activity: &str) -> Result<(u32, u64, Vec<u32>), Box<dyn Error>> {
     if env::var_os("CUDA_VISIBLE_DEVICES").is_some_and(|value| value != "0") {
         return Err(
             format!("{activity} requires CUDA_VISIBLE_DEVICES to be unset or exactly `0`").into(),
@@ -6458,12 +6467,6 @@ fn require_device_idle(activity: &str) -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    if utilization != 0 || memory_mib > 1_024 {
-        return Err(format!(
-            "device zero is busy before {activity}: utilization={utilization}%, memory={memory_mib} MiB"
-        )
-        .into());
-    }
     let processes = command_text(
         "nvidia-smi",
         &[
@@ -6474,14 +6477,11 @@ fn require_device_idle(activity: &str) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     let pids = parse_compute_pids(&processes)?;
-    if !pids.is_empty() {
-        return Err(format!(
-            "device zero has foreign compute processes before {activity}: {pids:?}"
-        )
-        .into());
-    }
+    Ok((utilization, memory_mib, pids))
+}
 
-    Ok(())
+fn device_is_idle(utilization: u32, memory_mib: u64, pids: &[u32]) -> bool {
+    utilization == 0 && memory_mib <= 1_024 && pids.is_empty()
 }
 
 fn performance_device_identity_sha256() -> Result<String, Box<dyn Error>> {
@@ -6525,15 +6525,6 @@ fn parse_compute_pids(output: &str) -> Result<Vec<u32>, Box<dyn Error>> {
             })
         })
         .collect()
-}
-
-fn parse_idle_sample(row: &str) -> Result<(u32, u64), Box<dyn Error>> {
-    let fields = row.trim().split(',').map(str::trim).collect::<Vec<_>>();
-    let [utilization, memory_mib] = fields.as_slice() else {
-        return Err(format!("unexpected nvidia-smi idle row `{}`", row.trim()).into());
-    };
-
-    Ok((utilization.parse()?, memory_mib.parse()?))
 }
 
 fn sass_function_body<'a>(sass: &'a str, name: &str) -> Option<&'a str> {
@@ -13010,8 +13001,8 @@ mod tests {
     use super::{
         COMPOSED_PERFORMANCE_SUITES, MTP_LAYER_RESOURCE_BASELINES, OptimizationSuite,
         PERFORMANCE_SUITES, PerformanceSuite, QWEN35_RESIDUAL_NORM_TEST_FILTER,
-        QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, parse_baseline,
-        parse_compute_pids, parse_cuda_toolkit_identity, parse_entries, parse_idle_sample,
+        QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, device_is_idle,
+        parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
         parse_performance_device_sample, parse_performance_iteration, parse_resources,
         parse_rustc_identity, preflight_performance_baselines, require_consumed_baseline_keys,
         require_count, require_registers, require_uniform_value, resolve_target_output,
@@ -13317,10 +13308,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_idle_device_samples() {
-        assert_eq!(parse_idle_sample("0, 234\n").unwrap(), (0, 234));
-        assert_eq!(parse_idle_sample("69, 1024").unwrap(), (69, 1_024));
-        assert!(parse_idle_sample("0, 234, 1").is_err());
+    fn idle_evidence_requires_all_three_signals() {
+        assert!(device_is_idle(0, 234, &[]));
+        assert!(!device_is_idle(1, 234, &[]));
+        assert!(!device_is_idle(0, 1_025, &[]));
+        assert!(!device_is_idle(0, 234, &[123]));
     }
 
     #[test]
