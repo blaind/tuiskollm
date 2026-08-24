@@ -403,7 +403,8 @@ fn require_pinned_etag(
     required: &RequiredFile,
 ) -> Result<(), String> {
     let actual = linked.or(etag);
-    let normalized = actual.map(|value| value.strip_prefix("W/").unwrap_or(value).trim_matches('"'));
+    let normalized =
+        actual.map(|value| value.strip_prefix("W/").unwrap_or(value).trim_matches('"'));
     if normalized == Some(required.blob) {
         Ok(())
     } else {

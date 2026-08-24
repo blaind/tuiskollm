@@ -283,7 +283,10 @@ fn validate_tools(tools: &[FunctionTool]) -> Result<(), ChatRequestError> {
             require_no_special_tokens(&format!("tool {index} description"), description)?;
         }
         if let Some(parameters) = tool.function.parameters.as_ref() {
-            require_no_special_tokens(&format!("tool {index} parameters"), &parameters.to_string())?;
+            require_no_special_tokens(
+                &format!("tool {index} parameters"),
+                &parameters.to_string(),
+            )?;
         }
         if tool.function.strict == Some(true) {
             return Err(ChatRequestError::Invalid(format!(

@@ -360,9 +360,9 @@ impl ResidentBatchGenerator {
             self.program.reset_slot(&self.stream, slot)?;
         }
         self.program.activate_kv_slot(slot)?;
-        if let Err(error) = self
-            .program
-            .reserve_kv_slot_tokens(&self.stream, slot, required_positions)
+        if let Err(error) =
+            self.program
+                .reserve_kv_slot_tokens(&self.stream, slot, required_positions)
         {
             // No replay has happened yet, so the retained prefix is still exact.
             if reset {
