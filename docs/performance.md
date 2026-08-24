@@ -179,6 +179,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-attention-output` | Check sigmoid gating, the published FP32 seam, dynamic E4M3 quantization, source-native projection, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-mtp-bf16-fusion SNAPSHOT` | Check both source zero-centered normalization seams, the complete source-BF16 `[5120,10240]` projection, exact B=1..8 routes, immutable inputs/weights, graph replay, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-mtp-bf16-qkv SNAPSHOT` | Check lossless Q/gate/K/V gathering, the complete source-BF16 `[14336,5120]` projection, exact B=1..8 routes, immutable inputs/weights, graph replay, stable addresses, and owner allocation | terminal |
+| `cargo run -p xtask -- qualify-mtp-bf16-qk-prepare SNAPSHOT` | Check source Q/K norms, independent zero-centered normalization and three-axis MRoPE formulas, represented BF16 K/V append, exact B=1..8 routes, immutable inputs/weights/metadata, graph replay, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact B=1..8 and T=32/64/128/1024 graph, all working and residual seams, tensor-map immutability, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact B=1..8 and T=32/64/128/1024 graphs, tensor-map immutability, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT` | Check complete source layer-63 attention/MLP seams, represented KV cache, exact B=1..8 and T=32/64/128/1024 graphs, P4 macro partials, immutable tensor maps, stable addresses, and owner allocation | terminal |
@@ -197,6 +198,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-attention-output` | Measure every exact sigmoid-gate, quantize, and output-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-mtp-bf16-fusion` | Measure every exact B=1..8 production graph for both BF16 norms plus the source-BF16 MTP fusion projection | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-mtp-bf16-qkv` | Measure every exact B=1..8 gathered source-BF16 MTP Q/gate/K/V projection graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-mtp-bf16-qk-prepare` | Measure every exact B=1..8 MTP source-norm Q/K preparation and BF16 cache-append graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-nvfp4-swiglu` | Measure every exact retained A16/W4A4 NVFP4 gate/up SwiGLU graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-nvfp4-down` | Measure every exact A16 decode and W4A4 prefill NVFP4 down-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed layer-55 decode and prefill MLP graph | terminal or `--json PATH` |
@@ -310,7 +312,7 @@ Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, `bench-fp8-lm-
 `bench-fp8-swiglu`, `bench-fp8-down`, `bench-gdn-prepare`, `bench-gdn-recurrence`, or
 `bench-gdn-output`, `bench-nvfp4-swiglu`, `bench-nvfp4-down`, `bench-attention-qk-prepare`,
 `bench-paged-gqa`, `bench-long-context-paged-gqa`, `bench-attention-output`, or
-`bench-mtp-bf16-fusion`, or `bench-mtp-bf16-qkv` with the same options
+`bench-mtp-bf16-fusion`, `bench-mtp-bf16-qkv`, or `bench-mtp-bf16-qk-prepare` with the same options
 for one operator suite only.
 
 `bench-text-endpoint SNAPSHOT` accepts the same options. It is intentionally separate from the

@@ -3,14 +3,15 @@
 use crate::fp8_projection_oracle::{
     BYTE_SENTINEL, F32_SENTINEL_BITS, bf16_to_f32, encode_e4m3fn, f32_to_bf16,
 };
+use crate::target::MtpBf16QkPrepareOp;
 use crate::{DeviceBenchmarkError, device_benchmark};
-use std::{mem::size_of, sync::Arc};
+use std::{mem::size_of, path::Path, sync::Arc};
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
     device_memory_info,
 };
 use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, Qwen35AttentionQkPrepareOp};
-use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
+use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const MAX_TOKENS: usize = 1_024;
@@ -35,6 +36,10 @@ const NORM_PATTERN: [f32; 8] = [-0.125, -0.0625, 0.0, 0.0625, 0.125, 0.1875, 0.2
 /// Failure of the exact attention Q/K preparation gate.
 #[derive(Debug, thiserror::Error)]
 pub enum AttentionQkPrepareQualificationError {
+    /// Snapshot admission or MTP source binding failed.
+    #[error(transparent)]
+    Checkpoint(#[from] CheckpointError),
+
     /// GPU ownership, launch, or driver failure.
     #[error(transparent)]
     Gpu(#[from] GpuError),
@@ -61,6 +66,12 @@ pub struct AttentionQkPrepareQualification {
     pub immutable_input_values: usize,
     /// Complete output/cache state reproduced by CUDA Graph replay.
     pub graph_replay_values: usize,
+    /// Exact represented query/key norm bytes.
+    pub weight_bytes: usize,
+    /// Exact BF16 or E4M3 cache bytes owned by the fixture.
+    pub cache_bytes: usize,
+    /// Exact address-stable non-weight, non-cache bytes.
+    pub workspace_bytes: usize,
     /// Exact bytes in the one-allocation qualification arena.
     pub arena_bytes: usize,
     /// Alignment padding bytes in that arena.
@@ -102,6 +113,18 @@ impl Regions {
             + self.key_pages.byte_len()
             + self.value_pages.byte_len()
     }
+
+    fn weight_bytes(self) -> usize {
+        self.query_norm.byte_len() + self.key_norm.byte_len()
+    }
+
+    fn cache_bytes(self) -> usize {
+        self.key_pages.byte_len() + self.value_pages.byte_len()
+    }
+
+    fn workspace_bytes(self) -> usize {
+        self.payload_bytes() - self.weight_bytes() - self.cache_bytes()
+    }
 }
 
 struct Fixture {
@@ -113,6 +136,11 @@ struct Fixture {
     block_tables: Vec<u32>,
     prefill_table_rows: Vec<u32>,
     prefill_cache_positions: Vec<u32>,
+}
+
+struct SourceNorms {
+    query: Vec<u16>,
+    key: Vec<u16>,
 }
 
 struct Observed {
@@ -277,21 +305,90 @@ impl QualifiedQkPrepareOp for Qwen35AttentionQkPrepareOp {
     }
 }
 
+impl QualifiedQkPrepareOp for MtpBf16QkPrepareOp {
+    type Target = Qwen38_27B;
+    const ROUTES: &'static [usize] = &QWEN35_ROUTES;
+    const MAX_TOKENS: usize = MAX_BATCH;
+    const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
+    const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16;
+
+    fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        MtpBf16QkPrepareOp::new(context)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &self,
+        stream: &tuisko_gpu::CudaStream,
+        batch: usize,
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: usize,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u8,
+        value_pages: *mut u8,
+        _key_scale: f32,
+        _value_scale: f32,
+    ) -> GpuResult<()> {
+        // SAFETY: the qualification layout reserves aligned BF16 cache planes
+        // and establishes the complete exact-batch pointer contract.
+        unsafe {
+            self.launch(
+                stream,
+                batch,
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages.cast(),
+                value_pages.cast(),
+            )
+        }
+    }
+}
+
 /// Qualifies eager and captured Q/K preparation routes at exact `B=1..=8`
 /// and `T=32,64,128,1024`.
 pub fn qualify_attention_qk_prepare()
 -> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
-    qualify_target::<AttentionQkPrepareOp>()
+    qualify_target::<AttentionQkPrepareOp>(None)
 }
 
 /// Qualifies Qwen3.5 eager and captured Q/K preparation at exact `B=1..=8`.
 pub fn qualify_qwen35_attention_qk_prepare()
 -> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
-    qualify_target::<Qwen35AttentionQkPrepareOp>()
+    qualify_target::<Qwen35AttentionQkPrepareOp>(None)
 }
 
-fn qualify_target<O>()
--> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError>
+/// Qualifies source-backed MTP Q/K preparation at exact `B=1..=8`.
+pub fn qualify_mtp_bf16_qk_prepare(
+    root: &Path,
+) -> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
+    let snapshot = CheckpointSnapshot::<Qwen38_27B>::open(root)?;
+    let bindings = MtpBindings::bind(&snapshot)?;
+    let source = SourceNorms {
+        query: bindings.query_norm.words().collect(),
+        key: bindings.key_norm.words().collect(),
+    };
+
+    qualify_target::<MtpBf16QkPrepareOp>(Some(&source))
+}
+
+fn qualify_target<O>(
+    source_norms: Option<&SourceNorms>,
+) -> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError>
 where
     O: QualifiedQkPrepareOp,
 {
@@ -308,7 +405,7 @@ where
     let stream = context.new_stream().map_err(GpuError::from)?;
     let (layout, regions) = layout::<O::Target>(O::MAX_TOKENS, O::CACHE_ELEMENT_BYTES)?;
     let arena = DeviceArena::zeroed(&stream, &layout)?;
-    let fixture = fixture::<O::Target>(O::MAX_TOKENS);
+    let fixture = fixture::<O::Target>(O::MAX_TOKENS, source_norms);
     load_fixture(&arena, &stream, regions, &fixture)?;
     let op = O::new(&context)?;
     let stable_addresses = addresses(&arena, regions)?;
@@ -318,6 +415,9 @@ where
         untouched_values: 0,
         immutable_input_values: 0,
         graph_replay_values: 0,
+        weight_bytes: regions.weight_bytes(),
+        cache_bytes: regions.cache_bytes(),
+        workspace_bytes: regions.workspace_bytes(),
         arena_bytes: layout.byte_len(),
         padding_bytes: layout.byte_len() - regions.payload_bytes(),
         maximum_query_error: 0.0,
@@ -424,7 +524,7 @@ fn layout<A: Arch>(
     ))
 }
 
-fn fixture<A: Arch>(max_tokens: usize) -> Fixture {
+fn fixture<A: Arch>(max_tokens: usize, source_norms: Option<&SourceNorms>) -> Fixture {
     let qkv = (0..max_tokens * A::ATTENTION_QKV_ROWS)
         .map(|index| {
             let token = index / A::ATTENTION_QKV_ROWS;
@@ -432,12 +532,22 @@ fn fixture<A: Arch>(max_tokens: usize) -> Fixture {
             f32_to_bf16(INPUT_PATTERN[(index + 3 * token) & 15] * factor)
         })
         .collect();
-    let query_norm = (0..A::HEAD_DIM)
-        .map(|index| f32_to_bf16(NORM_PATTERN[(index + 3) & 7]))
-        .collect();
-    let key_norm = (0..A::HEAD_DIM)
-        .map(|index| f32_to_bf16(NORM_PATTERN[(index + 5) & 7]))
-        .collect();
+    let query_norm = source_norms.map_or_else(
+        || {
+            (0..A::HEAD_DIM)
+                .map(|index| f32_to_bf16(NORM_PATTERN[(index + 3) & 7]))
+                .collect()
+        },
+        |source| source.query.clone(),
+    );
+    let key_norm = source_norms.map_or_else(
+        || {
+            (0..A::HEAD_DIM)
+                .map(|index| f32_to_bf16(NORM_PATTERN[(index + 5) & 7]))
+                .collect()
+        },
+        |source| source.key.clone(),
+    );
     let mut positions = [
         vec![0u32; max_tokens],
         vec![0u32; max_tokens],
@@ -894,9 +1004,10 @@ fn verify_replay(
 mod tests {
     use super::{
         MAX_BATCH, MAX_TOKENS, PHYSICAL_PAGES, Qwen35_9B, Qwen38_27B, ROUTES, TABLE_ROWS,
-        TABLE_STRIDE, layout, qualify_attention_qk_prepare, qualify_qwen35_attention_qk_prepare,
+        TABLE_STRIDE, layout, qualify_attention_qk_prepare, qualify_mtp_bf16_qk_prepare,
+        qualify_qwen35_attention_qk_prepare,
     };
-    use std::mem::size_of;
+    use std::{mem::size_of, path::PathBuf};
     use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
     use tuisko_model::Arch;
 
@@ -930,6 +1041,9 @@ mod tests {
             report.arena_bytes - report.padding_bytes,
             regions.payload_bytes()
         );
+        assert_eq!(report.weight_bytes, regions.weight_bytes());
+        assert_eq!(report.cache_bytes, regions.cache_bytes());
+        assert_eq!(report.workspace_bytes, regions.workspace_bytes());
         assert_eq!(report.immutable_input_values, 2 * ROUTES.len() * 14_748_304);
         assert!(report.maximum_query_error <= 0.003);
         Ok(())
@@ -970,7 +1084,47 @@ mod tests {
         assert_eq!(report.arena_bytes, layout.byte_len());
         assert_eq!(report.arena_bytes - report.padding_bytes, 4_492_928);
         assert_eq!(regions.payload_bytes(), 4_492_928);
+        assert_eq!(report.weight_bytes, regions.weight_bytes());
+        assert_eq!(report.cache_bytes, regions.cache_bytes());
+        assert_eq!(report.workspace_bytes, regions.workspace_bytes());
         assert!(report.maximum_query_error <= 0.003);
         Ok(())
+    }
+
+    #[test]
+    fn mtp_bf16_qk_prepare_suite_route_and_byte_inventory_is_exact() {
+        let (layout, regions) = layout::<Qwen38_27B>(MAX_BATCH, size_of::<u16>()).unwrap();
+
+        assert_eq!(
+            (1..=MAX_BATCH).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(regions.weight_bytes(), 1_024);
+        assert_eq!(regions.cache_bytes(), 4_194_304);
+        assert_eq!(regions.workspace_bytes(), 428_672);
+        assert_eq!(regions.payload_bytes(), 4_624_000);
+        assert_eq!(layout.byte_len(), 4_624_896);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 896);
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive SM120 device and the pinned Qwen3.8 snapshot"]
+    fn mtp_bf16_qk_prepare_suite_source_norms_match_every_route_and_graph_replay() {
+        let root = PathBuf::from(
+            std::env::var_os("TUISKO_SNAPSHOT").expect("TUISKO_SNAPSHOT must name the snapshot"),
+        );
+        let report = qualify_mtp_bf16_qk_prepare(&root).expect("MTP BF16 Q/K qualification");
+
+        assert_eq!(report.query_values, 221_184);
+        assert_eq!(report.appended_cache_values, 73_728);
+        assert_eq!(report.untouched_values, 33_579_008);
+        assert_eq!(report.immutable_input_values, 1_853_952);
+        assert_eq!(report.graph_replay_values, 33_947_648);
+        assert_eq!(report.weight_bytes, 1_024);
+        assert_eq!(report.cache_bytes, 4_194_304);
+        assert_eq!(report.workspace_bytes, 428_672);
+        assert_eq!(report.arena_bytes, 4_624_896);
+        assert_eq!(report.padding_bytes, 896);
+        assert!(report.maximum_query_error <= 0.003);
     }
 }

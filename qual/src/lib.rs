@@ -172,12 +172,13 @@ pub use attention_output_prefill::{
 #[cfg(feature = "device")]
 pub use attention_qk_prepare::{
     AttentionQkPrepareQualification, AttentionQkPrepareQualificationError,
-    qualify_attention_qk_prepare, qualify_qwen35_attention_qk_prepare,
+    qualify_attention_qk_prepare, qualify_mtp_bf16_qk_prepare, qualify_qwen35_attention_qk_prepare,
 };
 #[cfg(feature = "device")]
-pub use attention_qk_prepare_benchmark::benchmark_attention_qk_prepare;
-#[cfg(feature = "device")]
-pub use attention_qk_prepare_benchmark::benchmark_qwen35_attention_qk_prepare;
+pub use attention_qk_prepare_benchmark::{
+    benchmark_attention_qk_prepare, benchmark_mtp_bf16_qk_prepare,
+    benchmark_qwen35_attention_qk_prepare,
+};
 #[cfg(feature = "device")]
 pub use dense_fp8_gdn_layer::{
     DenseFp8GdnLayerQualification, DenseFp8GdnLayerQualificationError, qualify_dense_fp8_gdn_layer,
