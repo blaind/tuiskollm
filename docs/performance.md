@@ -243,6 +243,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-qwen36-moe-router` | Measure every exact Qwen3.6 BF16 router projection plus normalized top-eight graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-moe-experts` | Measure every exact Qwen3.6 routed/shared NVFP4 expert plus combine graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-residual-norm` | Measure every exact Qwen3.6 plain and fused-residual RMSNorm graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-fp8-qkv` | Measure every exact Qwen3.6 static-FP8 full-attention Q/K/V graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-input` | Measure every exact Qwen3.6 static-FP8 Q/K/V/Z plus BF16 A/B control graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-output` | Measure every exact Qwen3.6 static-FP8 GDN output graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-prepare` | Measure every exact Qwen3.6 control/convolution graph through the shared exact-geometry binary route | terminal or `--json PATH` |
