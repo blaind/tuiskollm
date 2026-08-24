@@ -9000,7 +9000,7 @@ fn gate_qwen35_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         root,
         QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
         "qwen35_attention_qk_prepare_exact_TID_",
-        None,
+        Some(("qwen35_attention_qk_prepare_prefill_exact_TID_", 4)),
         "Qwen3.5 attention Q/K prepare",
         "F2FP.BF16.F32.PACK_AB",
         "BF16",

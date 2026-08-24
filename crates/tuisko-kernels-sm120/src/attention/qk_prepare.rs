@@ -232,6 +232,52 @@ mod kernels {
         }
     }
 
+    /// Prepares Qwen3.5 Q/K and appends K/V for one exact prompt width.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_attention_qk_prepare_prefill_exact<const TOKENS: usize>(
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u16,
+        value_pages: *mut u16,
+    ) {
+        // T=32 and T=1,024 contain 640 and 20,480 independent head-warps,
+        // giving 80 and 2,560 CTAs. Each warp retains the decode route's
+        // 256-value reduction, MRoPE exchange, and BF16 store order.
+        unsafe {
+            bf16_attention_qk_prepare::<Qwen35_9B, TOKENS>(
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+            );
+        }
+    }
+
     /// Prepares Qwen3.6 Q/K and appends K/V for one exact decode batch.
     #[kernel]
     #[launch_bounds(256, 2)]
@@ -515,6 +561,74 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
     }
 }
 
+struct PreparedQwen35PrefillRoute<const TOKENS: usize> {
+    prepare:
+        PreparedLaunch<kernels::__qwen35_attention_qk_prepare_prefill_exact_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedQwen35PrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !PREFILL_TOKENS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 attention Q/K prefill route T={TOKENS} is not admitted"
+            )));
+        }
+        let blocks = u32::try_from(
+            (TOKENS * (Qwen35_9B::NUM_ATTENTION_HEADS + Qwen35_9B::NUM_KV_HEADS))
+                .div_ceil(WARPS_PER_CTA),
+        )
+        .map_err(|_| GpuError::invalid_launch("Qwen3.5 attention Q/K prefill grid exceeds u32"))?;
+
+        Ok(Self {
+            prepare: module
+                .prepare_qwen35_attention_qk_prepare_prefill_exact::<TOKENS>(LaunchConfig1D::new(
+                    blocks, THREADS, 0,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.5 attention Q/K prefill route", source)
+                })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u16,
+        value_pages: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_attention_qk_prepare_prefill_exact::<TOKENS>(
+                stream,
+                &self.prepare,
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.5 attention Q/K prefill", source))
+    }
+}
+
 struct PreparedQwen36Route<const TOKENS: usize> {
     prepare: PreparedLaunch<kernels::__qwen36_attention_qk_prepare_exact_CudaKernel<TOKENS>>,
 }
@@ -789,7 +903,7 @@ impl<A: Sm120Arch> AttentionQkPrepareOp<A> {
     }
 }
 
-/// Prepared Qwen3.5 Q/K normalization, MRoPE, and KV-cache routes for `B=1..8`.
+/// Prepared Qwen3.5 Q/K normalization, MRoPE, and KV-cache routes.
 pub struct Qwen35AttentionQkPrepareOp {
     module: kernels::LoadedModule,
     b1: PreparedQwen35Route<1>,
@@ -800,10 +914,14 @@ pub struct Qwen35AttentionQkPrepareOp {
     b6: PreparedQwen35Route<6>,
     b7: PreparedQwen35Route<7>,
     b8: PreparedQwen35Route<8>,
+    t32: PreparedQwen35PrefillRoute<32>,
+    t64: PreparedQwen35PrefillRoute<64>,
+    t128: PreparedQwen35PrefillRoute<128>,
+    t1024: PreparedQwen35PrefillRoute<1_024>,
 }
 
 impl Qwen35AttentionQkPrepareOp {
-    /// Loads the embedded module and prepares every exact Qwen3.5 decode route.
+    /// Loads the embedded module and prepares every exact Qwen3.5 route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
         require_qwen35_geometry()?;
         let _ = qwen35_attention_qk_prepare_ptx_names();
@@ -820,6 +938,10 @@ impl Qwen35AttentionQkPrepareOp {
             b6: PreparedQwen35Route::prepare(&module)?,
             b7: PreparedQwen35Route::prepare(&module)?,
             b8: PreparedQwen35Route::prepare(&module)?,
+            t32: PreparedQwen35PrefillRoute::prepare(&module)?,
+            t64: PreparedQwen35PrefillRoute::prepare(&module)?,
+            t128: PreparedQwen35PrefillRoute::prepare(&module)?,
+            t1024: PreparedQwen35PrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -839,7 +961,7 @@ impl Qwen35AttentionQkPrepareOp {
     pub unsafe fn launch(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        tokens: usize,
         qkv: *const u16,
         query_norm: *const u16,
         key_norm: *const u16,
@@ -853,9 +975,9 @@ impl Qwen35AttentionQkPrepareOp {
         key_pages: *mut u16,
         value_pages: *mut u16,
     ) -> GpuResult<()> {
-        if !admitted_batch(batch) {
+        if !admitted_tokens(tokens) {
             return Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 attention Q/K prepare batch {batch} is outside the admitted range 1..={MAX_BATCH}"
+                "Qwen3.5 attention Q/K prepare tokens {tokens} must be one of 1..={MAX_BATCH},32,64,128,1024"
             )));
         }
         let table_stride = u32::try_from(table_stride).map_err(|_| {
@@ -889,7 +1011,7 @@ impl Qwen35AttentionQkPrepareOp {
             };
         }
 
-        match batch {
+        match tokens {
             1 => launch!(b1),
             2 => launch!(b2),
             3 => launch!(b3),
@@ -898,6 +1020,10 @@ impl Qwen35AttentionQkPrepareOp {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
+            1_024 => launch!(t1024),
             _ => unreachable!(),
         }
     }
@@ -1044,8 +1170,8 @@ pub(crate) fn attention_qk_prepare_ptx_names() -> Vec<&'static str> {
 }
 
 /// PTX symbols retained for every exact Qwen3.5 attention Q/K prepare route.
-pub(crate) fn qwen35_attention_qk_prepare_ptx_names() -> [&'static str; MAX_BATCH] {
-    [
+pub(crate) fn qwen35_attention_qk_prepare_ptx_names() -> Vec<&'static str> {
+    vec![
         kernels::qwen35_attention_qk_prepare_exact_ptx_name::<1>(),
         kernels::qwen35_attention_qk_prepare_exact_ptx_name::<2>(),
         kernels::qwen35_attention_qk_prepare_exact_ptx_name::<3>(),
@@ -1054,6 +1180,10 @@ pub(crate) fn qwen35_attention_qk_prepare_ptx_names() -> [&'static str; MAX_BATC
         kernels::qwen35_attention_qk_prepare_exact_ptx_name::<6>(),
         kernels::qwen35_attention_qk_prepare_exact_ptx_name::<7>(),
         kernels::qwen35_attention_qk_prepare_exact_ptx_name::<8>(),
+        kernels::qwen35_attention_qk_prepare_prefill_exact_ptx_name::<32>(),
+        kernels::qwen35_attention_qk_prepare_prefill_exact_ptx_name::<64>(),
+        kernels::qwen35_attention_qk_prepare_prefill_exact_ptx_name::<128>(),
+        kernels::qwen35_attention_qk_prepare_prefill_exact_ptx_name::<1_024>(),
     ]
 }
 
@@ -1127,7 +1257,7 @@ mod tests {
 
         let qwen35 = qwen35_attention_qk_prepare_ptx_names();
         let qwen35_unique = qwen35.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(qwen35.len(), 8);
+        assert_eq!(qwen35.len(), 12);
         assert_eq!(qwen35_unique.len(), qwen35.len());
         assert!(names.iter().all(|name| !qwen35_unique.contains(name)));
 

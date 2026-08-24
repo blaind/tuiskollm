@@ -21,7 +21,6 @@ use tuisko_model::{
 const MAX_BATCH: usize = 8;
 const MAX_TOKENS: usize = 1_024;
 const ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
-const BF16_DECODE_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
 const QWEN36_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 const QWEN36_MAX_TOKENS: usize = 128;
 const ALIGNMENT: usize = 256;
@@ -261,10 +260,10 @@ impl_qualified_op!(AttentionQkPrepareOp, Qwen38_27B, &ROUTES, MAX_TOKENS);
 
 impl QualifiedQkPrepareOp for Qwen35AttentionQkPrepareOp {
     type Target = Qwen35_9B;
-    const ROUTES: &'static [usize] = &BF16_DECODE_ROUTES;
-    const MAX_TOKENS: usize = MAX_BATCH;
+    const ROUTES: &'static [usize] = &ROUTES;
+    const MAX_TOKENS: usize = 1_024;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
-    const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16Exact;
+    const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16Math;
 
     fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
         Qwen35AttentionQkPrepareOp::new(context)
@@ -428,7 +427,7 @@ pub fn qualify_attention_qk_prepare()
     qualify_target::<AttentionQkPrepareOp>(None)
 }
 
-/// Qualifies Qwen3.5 eager and captured Q/K preparation at exact `B=1..=8`.
+/// Qualifies Qwen3.5 Q/K preparation at exact decode and prompt widths.
 pub fn qualify_qwen35_attention_qk_prepare()
 -> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
     qualify_target::<Qwen35AttentionQkPrepareOp>(None)
@@ -623,16 +622,15 @@ fn fixture<A: Arch>(max_tokens: usize, source_norms: Option<&SourceNorms>) -> Fi
         },
         |source| source.key.clone(),
     );
-    let mut positions = [
-        vec![0u32; max_tokens],
-        vec![0u32; max_tokens],
-        vec![0u32; max_tokens],
+    let positions = [
+        (0..max_tokens).map(|token| token as u32).collect(),
+        (0..max_tokens)
+            .map(|token| (3 * token + 17) as u32)
+            .collect(),
+        (0..max_tokens)
+            .map(|token| (5 * token + 29) as u32)
+            .collect(),
     ];
-    for token in 0..max_tokens {
-        positions[0][token] = token as u32;
-        positions[1][token] = (3 * token + 17) as u32;
-        positions[2][token] = (5 * token + 29) as u32;
-    }
     let (rope_cos, rope_sin) = make_mrope_coefficients(&positions);
 
     Fixture {
@@ -1185,10 +1183,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
-    fn qwen35_exact_batches_match_independent_oracles_and_graph_replay()
+    fn qwen35_exact_decode_and_prompt_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), super::AttentionQkPrepareQualificationError> {
         let report = qualify_qwen35_attention_qk_prepare()?;
-        let active_tokens = (1..=MAX_BATCH).sum::<usize>();
+        let active_tokens = ROUTES.iter().sum::<usize>();
         let query_per_token = Qwen35_9B::ATTENTION_OUTPUT_COLUMNS;
         let cache_per_token = 2 * Qwen35_9B::ATTENTION_KV_ROWS;
         let plane_bytes = PHYSICAL_PAGES
@@ -1196,28 +1194,34 @@ mod tests {
             * ATTENTION_PAGE_SIZE
             * Qwen35_9B::HEAD_DIM
             * size_of::<u16>();
-        let replay_per_route = MAX_BATCH * query_per_token + 2 * plane_bytes;
-        let immutable_per_check = MAX_BATCH * Qwen35_9B::ATTENTION_QKV_ROWS
+        let replay_per_route = MAX_TOKENS * query_per_token + 2 * plane_bytes;
+        let total_observable = ROUTES.len() * replay_per_route;
+        let immutable_per_check = MAX_TOKENS * Qwen35_9B::ATTENTION_QKV_ROWS
             + 2 * Qwen35_9B::HEAD_DIM
-            + 2 * MAX_BATCH * super::ROTARY_PAIRS
+            + 2 * MAX_TOKENS * super::ROTARY_PAIRS
             + TABLE_ROWS * TABLE_STRIDE
-            + 4 * MAX_BATCH;
+            + 2 * MAX_BATCH
+            + 2 * MAX_TOKENS;
 
         assert_eq!(report.query_values, active_tokens * query_per_token);
         assert_eq!(
             report.appended_cache_values,
             active_tokens * cache_per_token
         );
-        assert_eq!(report.untouched_values, 33_521_664);
+        assert_eq!(
+            report.untouched_values,
+            total_observable
+                - active_tokens * (query_per_token + cache_per_token * size_of::<u16>())
+        );
         assert_eq!(
             report.immutable_input_values,
-            2 * MAX_BATCH * immutable_per_check
+            2 * ROUTES.len() * immutable_per_check
         );
-        assert_eq!(report.graph_replay_values, MAX_BATCH * replay_per_route);
-        let (layout, regions) = layout::<Qwen35_9B>(MAX_BATCH, size_of::<u16>())?;
+        assert_eq!(report.graph_replay_values, total_observable);
+        let (layout, regions) = layout::<Qwen35_9B>(MAX_TOKENS, size_of::<u16>())?;
         assert_eq!(report.arena_bytes, layout.byte_len());
-        assert_eq!(report.arena_bytes - report.padding_bytes, 4_492_928);
-        assert_eq!(regions.payload_bytes(), 4_492_928);
+        assert_eq!(report.arena_bytes - report.padding_bytes, 42_214_976);
+        assert_eq!(regions.payload_bytes(), 42_214_976);
         assert_eq!(report.weight_bytes, regions.weight_bytes());
         assert_eq!(report.cache_bytes, regions.cache_bytes());
         assert_eq!(report.workspace_bytes, regions.workspace_bytes());
