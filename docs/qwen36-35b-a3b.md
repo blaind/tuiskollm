@@ -194,6 +194,13 @@ The text frontend separately admits the snapshot's 248,070-entry tokenizer, Qwen
 ordered stop IDs `[248046, 248044]`, and sampled defaults `temperature=1`, `top_p=0.95`, and
 `top_k=20`. Thinking and no-thinking `Hello` prompts match the retained Transformers 5.2.0 token
 fixtures exactly; this contract is not aliased to Qwen3.5 even though their tokenizer files match.
+A concrete single-slot generation owner now joins that frontend to the complete resident model.
+For the exact thinking-mode `Hello` prompt, production streaming and separately driven raw-token
+transitions select the same two greedy tokens `[8160, 579]`; reset replay is deterministic, all 42
+device/host addresses remain stable, and device memory does not grow after warmup. This is
+frontend-to-device state-transition evidence, not an external same-model logit-parity claim. The
+initial route serially evaluates prompts through B=1 decode and loudly enforces its 192-position
+capacity until the native resident-prefill stack is reconciled.
 
 ## Implementation order
 
