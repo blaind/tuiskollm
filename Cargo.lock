@@ -3943,6 +3943,7 @@ dependencies = [
  "sha2 0.10.9",
  "tuisko-remote",
  "tuisko-targets",
+ "ureq",
 ]
 
 [[package]]

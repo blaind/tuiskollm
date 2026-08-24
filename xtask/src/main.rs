@@ -5,6 +5,7 @@ mod perf_artifact;
 mod perf_iteration;
 mod performance;
 mod remote;
+mod server_qualification;
 
 use gpu_target::BuildTargetProfile;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -766,6 +767,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen36-text-endpoint") => qualify_qwen36_text_endpoint(root, &remaining),
         Some("qualify-qwen36-resident-model") => qualify_qwen36_resident_model(root, &remaining),
         Some("qualify-qwen36-generation") => qualify_qwen36_generation(root, &remaining),
+        Some("qualify-qwen36-server") => qualify_qwen36_server(root, &remaining),
         Some("qualify-qwen35-resident-model") => qualify_qwen35_resident_model(root, &remaining),
         Some("qualify-qwen35-generation") => qualify_qwen35_generation(root, &remaining),
         Some("qualify-qwen35-nvfp4-gdn-input") if remaining.is_empty() => {
@@ -2016,6 +2018,20 @@ fn qualify_qwen36_generation(
     gate_qwen36_paged_gqa(root)?;
     gate_qwen36_attention_output(root)?;
     gate_qwen36_nvfp4_lm_head(root)
+}
+
+fn qualify_qwen36_server(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-qwen36-server SNAPSHOT".into());
+    };
+    require_performance_device_idle()?;
+    build_server(root)?;
+    require_performance_device_idle()?;
+    let executable = root.join(CUDA_OXIDE_BUILD_TARGET).join("release/tuiskollm");
+    server_qualification::qualify_qwen36(&executable, Path::new(snapshot))
 }
 
 fn qualify_qwen35_resident_model(
