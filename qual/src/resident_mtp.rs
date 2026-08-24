@@ -450,6 +450,19 @@ fn verify_realign_routes(
         program.replay_realign(stream, route)?;
         let replay = program.qualification_observables(stream, tokens_count, true)?;
         let replay_cache = read_cache(program, stream, 0, first, tokens_count)?;
+        let mut selected_logits = vec![0u16; Qwen38_27B::VOCAB];
+        program.read_logit_row_into(stream, tokens_count - 1, &mut selected_logits)?;
+        let logits = replay.logits.as_ref().ok_or_else(|| {
+            ResidentMtpQualificationError::Mismatch(format!(
+                "resident MTP K={tokens_count} realignment published no logits"
+            ))
+        })?;
+        let begin = (tokens_count - 1) * Qwen38_27B::VOCAB;
+        if selected_logits != logits[begin..begin + Qwen38_27B::VOCAB] {
+            return Err(ResidentMtpQualificationError::Mismatch(format!(
+                "resident MTP K={tokens_count} selected the wrong realignment logit row"
+            )));
+        }
         compare_observables("realign", tokens_count, &eager, &replay, report)?;
         compare_cache("realign", tokens_count, &eager_cache, &replay_cache)?;
         verify_stable(
