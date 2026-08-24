@@ -13,6 +13,8 @@ use tuisko_gpu::{
 use tuisko_model::{Arch, Qwen36Moe35B};
 
 pub(crate) const MAX_BATCH: usize = 8;
+pub(crate) const MAX_TOKENS: usize = 128;
+pub(crate) const ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 const ALIGNMENT: usize = 256;
 pub(crate) const COLUMNS: usize = Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS;
 pub(crate) const QKV_ROWS: usize = Qwen36Moe35B::ATTENTION_QKV_ROWS;
@@ -118,7 +120,8 @@ struct Observed {
     output: Vec<u16>,
 }
 
-/// Qualifies eager and captured Qwen3.6 attention output at exact `B=1..=8`.
+/// Qualifies eager and captured Qwen3.6 attention output at exact `B=1..=8`
+/// and `T=32,64,128`.
 pub fn qualify_qwen36_attention_output()
 -> Result<Qwen36AttentionOutputQualification, Qwen36AttentionOutputQualificationError> {
     let _preflight = device_benchmark::preflight()?;
@@ -132,10 +135,10 @@ pub fn qualify_qwen36_attention_output()
     }
 
     let stream = context.new_stream().map_err(GpuError::from)?;
-    let (layout, regions) = layout()?;
+    let (layout, regions) = layout(MAX_TOKENS)?;
     let arena = DeviceArena::zeroed(&stream, &layout)?;
     let op = Qwen36AttentionOutputOp::new(&context)?;
-    let fixture = make_fixture()?;
+    let fixture = make_fixture(MAX_TOKENS)?;
     load_immutable(&arena, &stream, regions, &fixture)?;
     let stable_addresses = addresses(&arena, regions)?;
     let mut report = Qwen36AttentionOutputQualification {
@@ -154,23 +157,23 @@ pub fn qualify_qwen36_attention_output()
         maximum_projection_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
-        reset(&arena, &stream, regions, &fixture, batch)?;
-        launch(&op, &arena, &stream, regions, batch)?;
+    for tokens in ROUTES {
+        reset(&arena, &stream, regions, &fixture, tokens)?;
+        launch(&op, &arena, &stream, regions, tokens)?;
         let eager = observe(&arena, &stream, regions)?;
-        verify_eager(batch, &fixture, &eager, &mut report)?;
+        verify_eager(tokens, &fixture, &eager, &mut report)?;
 
-        reset(&arena, &stream, regions, &fixture, batch)?;
+        reset(&arena, &stream, regions, &fixture, tokens)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
+        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, tokens))?;
         // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
         unsafe { graph.launch(&stream) }?;
         let replay = observe(&arena, &stream, regions)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay(tokens, &eager, &replay, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(Qwen36AttentionOutputQualificationError::Mismatch(format!(
-                "device addresses changed while qualifying B={batch}"
+                "device addresses changed while qualifying tokens={tokens}"
             )));
         }
     }
@@ -182,14 +185,14 @@ pub fn qualify_qwen36_attention_output()
     Ok(report)
 }
 
-pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
+pub(crate) fn layout(max_tokens: usize) -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let attention = layout.reserve(MAX_BATCH * COLUMNS, ALIGNMENT)?;
-    let qkv = layout.reserve(MAX_BATCH * QKV_ROWS, ALIGNMENT)?;
-    let activation = layout.reserve(MAX_BATCH * COLUMNS, ALIGNMENT)?;
-    let activation_codes = layout.reserve(MAX_BATCH * COLUMNS, ALIGNMENT)?;
+    let attention = layout.reserve(max_tokens * COLUMNS, ALIGNMENT)?;
+    let qkv = layout.reserve(max_tokens * QKV_ROWS, ALIGNMENT)?;
+    let activation = layout.reserve(max_tokens * COLUMNS, ALIGNMENT)?;
+    let activation_codes = layout.reserve(max_tokens * COLUMNS, ALIGNMENT)?;
     let weight_codes = layout.reserve(OUTPUT_ROWS * COLUMNS, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * OUTPUT_ROWS, ALIGNMENT)?;
+    let output = layout.reserve(max_tokens * OUTPUT_ROWS, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -230,13 +233,13 @@ fn reset(
     stream: &CudaStream,
     regions: Regions,
     fixture: &Fixture,
-    batch: usize,
+    tokens: usize,
 ) -> GpuResult<()> {
     arena.fill(stream, regions.attention, BYTE_SENTINEL)?;
     arena.copy_prefix_from_host(
         stream,
         regions.attention,
-        &fixture.attention[..batch * COLUMNS],
+        &fixture.attention[..tokens * COLUMNS],
     )?;
     arena.fill(stream, regions.activation, BYTE_SENTINEL)?;
     arena.fill(stream, regions.activation_codes, BYTE_SENTINEL)?;
@@ -249,12 +252,12 @@ fn launch(
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
-    batch: usize,
+    tokens: usize,
 ) -> GpuResult<()> {
     unsafe {
         op.launch(
             stream,
-            batch,
+            tokens,
             arena.address(regions.attention)?,
             arena.address(regions.qkv)?,
             arena.address(regions.activation)?,
@@ -276,15 +279,17 @@ fn observe(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuRes
     })
 }
 
-pub(crate) fn make_fixture() -> Result<Fixture, Qwen36AttentionOutputQualificationError> {
-    let attention = (0..MAX_BATCH * COLUMNS)
+pub(crate) fn make_fixture(
+    max_tokens: usize,
+) -> Result<Fixture, Qwen36AttentionOutputQualificationError> {
+    let attention = (0..max_tokens * COLUMNS)
         .map(|index| {
             let token = index / COLUMNS;
-            ATTENTION_PATTERN[index & (GROUP - 1)] * TOKEN_FACTORS[token]
+            ATTENTION_PATTERN[index & (GROUP - 1)] * TOKEN_FACTORS[token % TOKEN_FACTORS.len()]
         })
         .collect::<Vec<_>>();
-    let mut qkv = vec![BF16_SENTINEL; MAX_BATCH * QKV_ROWS];
-    for token in 0..MAX_BATCH {
+    let mut qkv = vec![BF16_SENTINEL; max_tokens * QKV_ROWS];
+    for token in 0..max_tokens {
         for head in 0..Qwen36Moe35B::NUM_ATTENTION_HEADS {
             for dimension in 0..Qwen36Moe35B::HEAD_DIM {
                 let gate = token * QKV_ROWS
@@ -295,7 +300,7 @@ pub(crate) fn make_fixture() -> Result<Fixture, Qwen36AttentionOutputQualificati
             }
         }
     }
-    let gated = (0..MAX_BATCH * COLUMNS)
+    let gated = (0..max_tokens * COLUMNS)
         .map(|index| {
             let gate = f64::from(GATE_PATTERN[index & (GROUP - 1)]);
             (f64::from(attention[index]) / (1.0 + (-gate).exp())) as f32
@@ -312,7 +317,7 @@ pub(crate) fn make_fixture() -> Result<Fixture, Qwen36AttentionOutputQualificati
     let weight_codes = (0..OUTPUT_ROWS * COLUMNS)
         .map(|index| WEIGHT_CODES[(index / COLUMNS) & 3])
         .collect::<Vec<_>>();
-    let row_sums = (0..MAX_BATCH)
+    let row_sums = (0..max_tokens)
         .map(|token| {
             activation_codes[token * COLUMNS..(token + 1) * COLUMNS]
                 .iter()
@@ -337,12 +342,12 @@ pub(crate) fn make_fixture() -> Result<Fixture, Qwen36AttentionOutputQualificati
 }
 
 fn verify_eager(
-    batch: usize,
+    tokens: usize,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut Qwen36AttentionOutputQualification,
 ) -> Result<(), Qwen36AttentionOutputQualificationError> {
-    let active_columns = batch * COLUMNS;
+    let active_columns = tokens * COLUMNS;
     for index in 0..active_columns {
         let actual = observed.attention[index];
         let expected = fixture.gated[index];
@@ -351,7 +356,7 @@ fn verify_eager(
         report.maximum_gated_error = report.maximum_gated_error.max(error);
         if !actual.is_finite() || error > tolerance {
             return Err(Qwen36AttentionOutputQualificationError::Mismatch(format!(
-                "B={batch} gated index={index}: device={actual}, oracle={expected}, tolerance={tolerance}"
+                "tokens={tokens} gated index={index}: device={actual}, oracle={expected}, tolerance={tolerance}"
             )));
         }
     }
@@ -364,7 +369,7 @@ fn verify_eager(
             .position(|(actual, expected)| actual != expected)
             .expect("unequal slices contain one differing value");
         return Err(Qwen36AttentionOutputQualificationError::Mismatch(format!(
-            "B={batch} BF16 activation {index} differs"
+            "tokens={tokens} BF16 activation {index} differs"
         )));
     }
     report.activation_values += active_columns;
@@ -376,13 +381,13 @@ fn verify_eager(
             .position(|(actual, expected)| actual != expected)
             .expect("unequal slices contain one differing code");
         return Err(Qwen36AttentionOutputQualificationError::Mismatch(format!(
-            "B={batch} activation code {index} is {:#04x}, expected {:#04x}",
+            "tokens={tokens} activation code {index} is {:#04x}, expected {:#04x}",
             observed.activation_codes[index], fixture.activation_codes[index]
         )));
     }
     report.activation_codes += active_columns;
 
-    for token in 0..batch {
+    for token in 0..tokens {
         for row in 0..OUTPUT_ROWS {
             let expected = fixture.row_sums[token]
                 * f64::from(WEIGHT_VALUES[row & 3])
@@ -393,21 +398,21 @@ fn verify_eager(
             report.maximum_projection_error = report.maximum_projection_error.max(error as f32);
             if !actual.is_finite() || error > tolerance {
                 return Err(Qwen36AttentionOutputQualificationError::Mismatch(format!(
-                    "B={batch} output token={token}, row={row}: device={actual}, oracle={expected}, tolerance={tolerance}"
+                    "tokens={tokens} output token={token}, row={row}: device={actual}, oracle={expected}, tolerance={tolerance}"
                 )));
             }
         }
     }
-    report.output_values += batch * OUTPUT_ROWS;
+    report.output_values += tokens * OUTPUT_ROWS;
 
-    verify_inactive(batch, observed)?;
-    report.inactive_values += inactive_values(batch);
+    verify_inactive(tokens, observed)?;
+    report.inactive_values += inactive_values(tokens);
 
     Ok(())
 }
 
 fn verify_replay(
-    batch: usize,
+    tokens: usize,
     eager: &Observed,
     replay: &Observed,
     report: &mut Qwen36AttentionOutputQualification,
@@ -422,22 +427,22 @@ fn verify_replay(
         && replay.output == eager.output;
     if !same {
         return Err(Qwen36AttentionOutputQualificationError::Mismatch(format!(
-            "B={batch} graph replay differs from eager execution"
+            "tokens={tokens} graph replay differs from eager execution"
         )));
     }
-    verify_inactive(batch, replay)?;
-    report.graph_replay_values += batch * (3 * COLUMNS + OUTPUT_ROWS);
-    report.inactive_values += inactive_values(batch);
+    verify_inactive(tokens, replay)?;
+    report.graph_replay_values += tokens * (3 * COLUMNS + OUTPUT_ROWS);
+    report.inactive_values += inactive_values(tokens);
 
     Ok(())
 }
 
 fn verify_inactive(
-    batch: usize,
+    tokens: usize,
     observed: &Observed,
 ) -> Result<(), Qwen36AttentionOutputQualificationError> {
-    let columns_begin = batch * COLUMNS;
-    let output_begin = batch * OUTPUT_ROWS;
+    let columns_begin = tokens * COLUMNS;
+    let output_begin = tokens * OUTPUT_ROWS;
     if observed.attention[columns_begin..]
         .iter()
         .any(|value| value.to_bits() != F32_SENTINEL_BITS)
@@ -452,15 +457,15 @@ fn verify_inactive(
             .any(|&value| value != BF16_SENTINEL)
     {
         return Err(Qwen36AttentionOutputQualificationError::Mismatch(format!(
-            "B={batch} modified an inactive value"
+            "tokens={tokens} modified an inactive value"
         )));
     }
 
     Ok(())
 }
 
-fn inactive_values(batch: usize) -> usize {
-    (MAX_BATCH - batch) * (3 * COLUMNS + OUTPUT_ROWS)
+fn inactive_values(tokens: usize) -> usize {
+    (MAX_TOKENS - tokens) * (3 * COLUMNS + OUTPUT_ROWS)
 }
 
 fn verify_immutable(
@@ -490,11 +495,12 @@ fn verify_no_post_warmup_allocation(
     regions: Regions,
     fixture: &Fixture,
 ) -> Result<(), Qwen36AttentionOutputQualificationError> {
-    let graphs = (1..=MAX_BATCH)
-        .map(|batch| {
-            reset(arena, stream, regions, fixture, batch)?;
+    let graphs = ROUTES
+        .iter()
+        .map(|&tokens| {
+            reset(arena, stream, regions, fixture, tokens)?;
             stream.synchronize().map_err(GpuError::from)?;
-            CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch))
+            CudaGraph::capture(stream, || launch(op, arena, stream, regions, tokens))
         })
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
@@ -504,9 +510,9 @@ fn verify_no_post_warmup_allocation(
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
-        for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
+        for graph in graphs.iter().rev() {
             // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
-            unsafe { graphs[batch - 1].launch(stream) }?;
+            unsafe { graph.launch(stream) }?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -526,22 +532,23 @@ mod tests {
 
     #[test]
     fn arena_accounting_matches_exact_geometry() {
-        let (layout, regions) = layout().unwrap();
+        let (layout, regions) = layout(MAX_TOKENS).unwrap();
 
         assert_eq!(regions.weight_bytes(), 8_388_608);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 409_600);
-        assert_eq!(layout.byte_len(), 8_798_208);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 6_553_600);
+        assert_eq!(layout.byte_len(), 14_942_208);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 0);
     }
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn exact_batches_match_independent_oracles_and_graph_replay()
+    fn exact_decode_and_prompt_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), Qwen36AttentionOutputQualificationError> {
         let report = qualify_qwen36_attention_output()?;
-        let active = (1..=MAX_BATCH).sum::<usize>();
-        let inactive = (1..=MAX_BATCH)
-            .map(|batch| MAX_BATCH - batch)
+        let active = ROUTES.iter().sum::<usize>();
+        let inactive = ROUTES
+            .iter()
+            .map(|tokens| MAX_TOKENS - tokens)
             .sum::<usize>();
 
         assert_eq!(report.gated_values, active * COLUMNS);
@@ -556,10 +563,10 @@ mod tests {
             report.inactive_values,
             2 * inactive * (3 * COLUMNS + OUTPUT_ROWS)
         );
-        assert_eq!(report.immutable_input_values, 8_462_336);
-        assert_eq!(report.arena_bytes, 8_798_208);
+        assert_eq!(report.immutable_input_values, 9_568_256);
+        assert_eq!(report.arena_bytes, 14_942_208);
         assert_eq!(report.weight_bytes, 8_388_608);
-        assert_eq!(report.workspace_bytes, 409_600);
+        assert_eq!(report.workspace_bytes, 6_553_600);
         assert_eq!(report.padding_bytes, 0);
         assert!(report.maximum_gated_error.is_finite());
         assert!(report.maximum_projection_error.is_finite());

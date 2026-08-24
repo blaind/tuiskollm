@@ -176,16 +176,18 @@ sentinels, 5,767,168 graph-replay values, and 80,746,512 immutable-input checks 
 arena with stable addresses and zero post-warmup growth. The eight decode entries use 48 registers;
 the three prompt entries use 54. All 11 have zero stack/local memory and 1,024 bytes static shared,
 while prompt launches request the exact 65,536-byte dynamic tile. Timing remains unreported because
-the available diagnostic run failed the exclusive-device precondition. The gated attention-output leaf then
-applies the query-paired sigmoid gate, publishes the BF16 projection seam, statically quantizes it
-with the admitted scalar scale, and consumes the source-native E4M3 `[2048,4096]` output plane at
-every exact `B=1..8`. Its independent oracle passes 147,456 gated FP32 values, 147,456 exact BF16
-staging values, 147,456 exact E4M3 codes, 73,728 FP64-formula outputs, 516,096 graph-replay values,
-and 802,816 inactive sentinels with immutable sources, stable addresses, and zero post-warmup
-growth in an 8,798,208-byte arena. The eight gate entries use 26 registers, zero stack/local
-memory, and 1,024 bytes shared; the reused static-FP8 projection retains its separately checked
-resource contract. Timing remains unreported because the available run failed the exclusive-device
-precondition after qualification. One source-backed layer-3 owner now composes these attention
+the available diagnostic run failed the exclusive-device precondition. The gated attention-output
+leaf then applies the query-paired sigmoid gate, publishes the BF16 projection seam, statically
+quantizes it with the admitted scalar scale, and consumes the source-native E4M3 `[2048,4096]`
+output plane at every exact `B=1..8` and `T=32,64,128`. Its independent oracle passes 1,064,960
+gated FP32 values, 1,064,960 exact BF16 staging values, 1,064,960 exact E4M3 codes, 532,480
+FP64-formula outputs, 3,727,360 graph-replay values, and 32,915,456 inactive sentinels with
+immutable sources, stable addresses, and zero post-warmup growth in a 14,942,208-byte arena. All
+eight decode and three prompt gate entries use 26 registers, zero stack/local memory, and 1,024
+bytes shared; the reused static-FP8 projection retains its separately checked resource contract.
+At a fixed 2,197 MHz SM and 13,801 MHz memory clock, the unblessed complete graph measures
+71.294/71.714/73.003 us at T=32/64/128; B=1/8 measure 18.440/32.642 us. One source-backed layer-3
+owner now composes these attention
 leaves, both residual seams, and the routed/shared MoE boundary into eight exact-B graphs over one
 487,394,048-byte arena. Its B=1 source oracle and all-batch lifecycle gate pass with 483,085,312
 resident weight bytes, 3,145,728 BF16 cache bytes, and 1,161,680 workspace bytes. Its unblessed
