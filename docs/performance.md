@@ -243,6 +243,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-resident-prefill SNAPSHOT` | Directly measure complete T=32/64/128/1024 resident prompt graphs across from-empty, shared-tail, P8/P16 T128, and P4 macro-tail contexts with final-token-only LM head | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-resident-long-context-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head long graph with one 131,073-token row and compact one-token survivors | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen35-text-endpoint SNAPSHOT` | Measure every source-backed Qwen3.5 final-norm plus BF16 LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
 | `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
 | `cargo run -p xtask -- perf energy` | Full leaf reports plus a sustained power window per route | `target/benchmarks/perf-energy/*.json` |
@@ -347,6 +348,10 @@ Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, `bench-fp8-lm-
 
 `bench-text-endpoint SNAPSHOT` accepts the same options. It is intentionally separate from the
 leaf-wide `perf` commands until its first reviewed baseline is blessed.
+
+`bench-qwen35-text-endpoint SNAPSHOT` directly measures the source-backed final RMSNorm plus BF16
+LM-head graph at every exact `B=1..8`. It remains outside leaf-wide `perf` until a locked-clock
+baseline is reviewed.
 
 `bench-dense-fp8-mlp SNAPSHOT` directly measures the complete source-backed layer-60 MLP graph at
 every exact `B=1..8` and `T=32,64,128,1024` with the same options. It does not infer composition
