@@ -108,8 +108,13 @@ the next control/convolution and FP32 recurrence stages reuse the already qualif
 entries because both profiles have the exact same 32 control rows, 8,192 Q/K/V rows, 4,096 value
 rows, 16 Q/K heads, 32 value heads, width-128 state, and width-four history. Compile-time geometry
 assertions and separate Qwen3.6 oracle entry points make that reuse executable rather than
-conventional. Composed layers, exact prefill expert routes, and model inference remain
-unimplemented.
+conventional. The final GDN projection preserves its source E4M3 `[2048,4096]` plane and static
+FP8 scales. Its exact `B=1..8` routes pass 147,456 activation-code, 73,728 FP64-formula output,
+221,184 graph-replay, and 344,064 inactive-sentinel comparisons while retaining immutable sources,
+stable addresses, and zero post-warmup growth. All 16 entries have zero stack/local memory. At a
+2,190 MHz median SM clock, the unblessed warm repeated path measures 9.543/22.031 us at B=1/8;
+the complete two-node graph measures 10.852/24.567 us. Composed layers, exact prefill expert
+routes, and model inference remain unimplemented.
 
 ## Implementation order
 

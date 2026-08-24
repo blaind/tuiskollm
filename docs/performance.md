@@ -171,6 +171,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-qwen36-moe-router` | Check Qwen3.6 BF16 router logits, deterministic top-eight experts, normalized BF16 weights, immutable sources, exact-B graph replay, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-moe-experts` | Check Qwen3.6 selected routed experts, shared expert/gate, fixed-order top-eight combination, immutable 256-expert planes, exact-B graph replay, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-gdn-input` | Check Qwen3.6 static E4M3 Q/K/V/Z, BF16 A/B controls, immutable sources, exact-B graph replay, inactive extents, and allocation behavior at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-qwen36-gdn-output` | Check Qwen3.6 static E4M3 GDN output, immutable sources, exact-B graph replay, inactive extents, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-gdn-prepare` | Check Qwen3.6 decay/beta controls, width-four causal history, exact-B graph replay, and allocation behavior through the shared exact Qwen3.5 binary route | terminal |
 | `cargo run -p xtask -- qualify-qwen36-gdn-recurrence` | Check Qwen3.6 FP32 state transitions, gated normalization, exact-B graph replay, and allocation behavior through the shared exact Qwen3.5 binary route | terminal |
 | `cargo run -p xtask -- qualify-qwen35-bf16-lm-head SNAPSHOT` | Check the source BF16 LM head against sampled FP64 dots, eager/graph agreement, immutable inputs, stable addresses, and allocation behavior at B=1..8 | terminal |
@@ -241,6 +242,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-qwen36-moe-experts` | Measure every exact Qwen3.6 routed/shared NVFP4 expert plus combine graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-residual-norm` | Measure every exact Qwen3.6 plain and fused-residual RMSNorm graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-input` | Measure every exact Qwen3.6 static-FP8 Q/K/V/Z plus BF16 A/B control graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-gdn-output` | Measure every exact Qwen3.6 static-FP8 GDN output graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-prepare` | Measure every exact Qwen3.6 control/convolution graph through the shared exact-geometry binary route | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-recurrence` | Measure every exact Qwen3.6 recurrent state graph through the shared exact-geometry binary route | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-gdn-input` | Measure every exact Qwen3.5 fused NVFP4 Q/K/V/Z and A/B graph | terminal or `--json PATH` |
