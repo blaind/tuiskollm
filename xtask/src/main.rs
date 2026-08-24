@@ -1743,7 +1743,7 @@ fn qualify_qwen36_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "qwen36_gdn_output",
+            "qwen36_gdn_output::tests::exact_routes_match_independent_oracles_and_graph_replay",
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -11221,10 +11221,36 @@ fn gate_qwen36_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_gdn_output_projection_TID_"))
         .collect::<Vec<_>>();
+    let prefill_quantize = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen36_gdn_output_static_quantize_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
+    let prefill_projection = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen36_gdn_output_projection_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.6 GDN output static quantization", quantize.len(), 8)?;
     require_count("Qwen3.6 GDN output projection", projection.len(), 8)?;
+    require_count(
+        "Qwen3.6 GDN output prefill static quantization",
+        prefill_quantize.len(),
+        3,
+    )?;
+    require_count(
+        "Qwen3.6 GDN output prefill projection",
+        prefill_projection.len(),
+        3,
+    )?;
 
-    for entry in &quantize {
+    for entry in quantize.iter().chain(prefill_quantize.iter()) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
@@ -11265,13 +11291,26 @@ fn gate_qwen36_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    for entry in &prefill_projection {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
 
     let artifact = sm120_gate_artifact(root)?;
     let resources = &artifact.resources;
     let sass = artifact.sass()?;
     let mut quantize_registers = Vec::with_capacity(quantize.len());
+    let mut prefill_quantize_registers = Vec::with_capacity(prefill_quantize.len());
     let mut projection_registers = Vec::with_capacity(projection.len());
-    let mut shared = Vec::with_capacity(quantize.len() + projection.len());
+    let mut prefill_projection_registers = Vec::with_capacity(prefill_projection.len());
+    let mut shared = Vec::with_capacity(
+        quantize.len() + prefill_quantize.len() + projection.len() + prefill_projection.len(),
+    );
     for (role, routes, instructions, registers) in [
         (
             "static quantization",
@@ -11284,6 +11323,18 @@ fn gate_qwen36_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
             projection,
             &["F2FP.F16.E4M3", "FFMA", "SHFL.DOWN", "STG.E.U16"][..],
             &mut projection_registers,
+        ),
+        (
+            "prefill static quantization",
+            prefill_quantize,
+            &["F2FP.SATFINITE.E4M3", "STG.E.U16"][..],
+            &mut prefill_quantize_registers,
+        ),
+        (
+            "prefill projection",
+            prefill_projection,
+            &["QMMA.16832.F32.E4M3.E4M3", "LDGSTS", "STG.E.U16"][..],
+            &mut prefill_projection_registers,
         ),
     ] {
         for entry in routes {
@@ -11314,15 +11365,35 @@ fn gate_qwen36_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
     quantize_registers.sort_unstable();
+    prefill_quantize_registers.sort_unstable();
     projection_registers.sort_unstable();
+    prefill_projection_registers.sort_unstable();
     shared.sort_unstable();
     require_registers(&baseline, "quantize_registers", &quantize_registers)?;
     require_registers(&baseline, "projection_registers", &projection_registers)?;
+    for (key, registers) in [
+        (
+            "prefill_quantize_registers",
+            prefill_quantize_registers.as_slice(),
+        ),
+        (
+            "prefill_projection_registers",
+            prefill_projection_registers.as_slice(),
+        ),
+    ] {
+        if baseline.contains_key(key) {
+            require_registers(&baseline, key, registers)?;
+        }
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "Qwen3.6 GDN output gate passed: 8 static quantize + 8 FP8 projection entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/FFMA/SHFL/BF16-store present",
-        quantize_registers, projection_registers, shared
+        "Qwen3.6 GDN output gate passed: 8 decode + 3 prefill routes, REG quantize {:?} / {:?}, projection {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/QMMA/FFMA/SHFL/BF16-store present",
+        quantize_registers,
+        prefill_quantize_registers,
+        projection_registers,
+        prefill_projection_registers,
+        shared
     );
     Ok(())
 }
