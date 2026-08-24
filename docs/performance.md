@@ -157,6 +157,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-frontend SNAPSHOT` | Check exact template, tokenizer, streaming, and prefix-cache behavior | terminal |
 | `cargo run -p xtask -- qualify-generation SNAPSHOT` | Check prompt-to-sampling-to-streaming state over exact BF16 logit rows | terminal |
 | `cargo run -p xtask -- qualify-residual-norm` | Run the independent numerical and graph-replay oracle | terminal |
+| `cargo run -p xtask -- qualify-qwen36-residual-norm` | Check Qwen3.6 zero-centered RMSNorm and fused residual publication at every exact B=1..8 route | terminal |
 | `cargo run -p xtask -- qualify-fp8-qkv` | Check represented activation codes/scales and QKV output for B=1..8, T=16, and T=32/64/128/1024 prefill, including padded T=32 reads and graph replay | terminal |
 | `cargo run -p xtask -- qualify-fp8-gdn-input` | Check represented activation codes/scales and GDN Q/K/V/Z output for B=1..8 and T=32/64/128/1024 prefill, including padded T=32 reads and graph replay | terminal |
 | `cargo run -p xtask -- qualify-fp8-lm-head` | Run the independent represented-value full-vocabulary LM-head oracle and benchmark-accounting test | terminal |
@@ -235,6 +236,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-qwen35-nvfp4-qkv` | Measure every exact Qwen3.5 fused NVFP4 QKV graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-moe-router` | Measure every exact Qwen3.6 BF16 router projection plus normalized top-eight graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-moe-experts` | Measure every exact Qwen3.6 routed/shared NVFP4 expert plus combine graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-residual-norm` | Measure every exact Qwen3.6 plain and fused-residual RMSNorm graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-gdn-input` | Measure every exact Qwen3.5 fused NVFP4 Q/K/V/Z and A/B graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-gdn-prepare` | Measure every exact Qwen3.5 fused control-plus-convolution graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-gdn-recurrence` | Measure every exact Qwen3.5 stateful recurrence graph | terminal or `--json PATH` |
