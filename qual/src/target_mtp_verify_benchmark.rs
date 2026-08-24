@@ -144,7 +144,7 @@ impl Session {
             for (route, stage) in self.routes.iter().zip(stage_graphs) {
                 stage.graph().launch(&self.stream)?;
                 self.program
-                    .qualification_target_mtp_segmented_verify_graph(route.route)
+                    .qualification_target_mtp_segmented_verify_graph(route.route)?
                     .launch(&self.stream)?;
                 stage.graph().launch(&self.stream)?;
                 route.verify_commit.launch(&self.stream)?;
@@ -157,7 +157,7 @@ impl Session {
     fn cases<'a>(
         &'a self,
         stage_graphs: &'a [ResidentMtpSegmentedStageGraph<'a>],
-    ) -> Vec<ExactDeviceCase<'a>> {
+    ) -> Result<Vec<ExactDeviceCase<'a>>, DeviceBenchmarkError> {
         let mut cases = Vec::with_capacity(2 * MAX_BATCH * VERIFY_ROUTES);
         for (route, stage) in self.routes.iter().zip(stage_graphs) {
             let tokens = route.route.tokens();
@@ -174,7 +174,7 @@ impl Session {
                         "target_token",
                     ),
                     self.program
-                        .qualification_target_mtp_segmented_verify_graph(route.route),
+                        .qualification_target_mtp_segmented_verify_graph(route.route)?,
                     None,
                 )
                 .with_preparation(stage.graph()),
@@ -195,7 +195,7 @@ impl Session {
                 .with_preparation(stage.graph()),
             );
         }
-        cases
+        Ok(cases)
     }
 }
 
@@ -349,7 +349,7 @@ pub fn benchmark_target_mtp_verify(
     session.warm(&stage_graphs, warmup_launches)?;
     memory.capture("after_warmup")?;
     require_current_process_exclusive()?;
-    let cases = session.cases(&stage_graphs);
+    let cases = session.cases(&stage_graphs)?;
     let (metrics, energy_metrics, telemetry) =
         measure_cases(&session.stream, &session.timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;

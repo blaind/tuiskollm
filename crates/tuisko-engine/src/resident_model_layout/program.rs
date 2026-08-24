@@ -18,8 +18,8 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Instant;
 use tuisko_gpu::{
-    ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, DeviceCopy, GpuError, GpuResult,
-    LoadingDeviceArena, PinnedHostBuffer,
+    ArenaRegion, CudaContext, CudaGraph, CudaGraphDefinition, CudaGraphVariants, CudaStream,
+    DeviceArena, DeviceCopy, GpuError, GpuResult, LoadingDeviceArena, PinnedHostBuffer,
 };
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_kernels_sm120::{
@@ -416,8 +416,9 @@ struct ResidentGraphs {
     target_verify_long: [[CudaGraph; TARGET_VERIFY_ROUTE_COUNT]; LONG_CONTEXT_ROUTE_COUNT],
     target_segmented_verify_short:
         [[CudaGraph; TARGET_SEGMENTED_BATCH_ROUTES]; TARGET_VERIFY_ROUTE_COUNT],
-    target_segmented_verify_long: [[[CudaGraph; TARGET_SEGMENTED_BATCH_ROUTES];
-        TARGET_VERIFY_ROUTE_COUNT]; LONG_CONTEXT_ROUTE_COUNT],
+    target_segmented_verify_long: [[CudaGraphVariants<LONG_CONTEXT_ROUTE_COUNT>;
+        TARGET_SEGMENTED_BATCH_ROUTES];
+        TARGET_VERIFY_ROUTE_COUNT],
     target_commit: [CudaGraph; TARGET_VERIFY_ROUTE_COUNT],
 }
 
@@ -441,23 +442,62 @@ impl ResidentGraphs {
         }
     }
 
-    fn select_target_segmented_verify(&self, route: ResidentMtpSegmentedVerifyRoute) -> &CudaGraph {
+    fn select_direct_target_segmented_verify(
+        &self,
+        route: ResidentMtpSegmentedVerifyRoute,
+    ) -> Option<&CudaGraph> {
         if route.batch == 1 {
-            return match route.attention {
+            return Some(match route.attention {
                 AttentionRoute::Short => &self.target_verify_short[route.tokens - 1],
                 AttentionRoute::Long { index, .. } => {
                     &self.target_verify_long[index][route.tokens - 1]
                 }
-            };
+            });
         }
         match route.attention {
             AttentionRoute::Short => {
-                &self.target_segmented_verify_short[route.tokens - 1][route.batch - 2]
+                Some(&self.target_segmented_verify_short[route.tokens - 1][route.batch - 2])
             }
-            AttentionRoute::Long { index, .. } => {
-                &self.target_segmented_verify_long[index][route.tokens - 1][route.batch - 2]
-            }
+            AttentionRoute::Long { .. } => None,
         }
+    }
+
+    fn launch_target_segmented_verify(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpSegmentedVerifyRoute,
+    ) -> GpuResult<()> {
+        if let Some(graph) = self.select_direct_target_segmented_verify(route) {
+            return graph.launch(stream);
+        }
+        match route.attention {
+            AttentionRoute::Long { index, .. } => self.target_segmented_verify_long
+                [route.tokens - 1][route.batch - 2]
+                .launch(stream, index),
+            AttentionRoute::Short => unreachable!("short segmented routes are direct graphs"),
+        }
+    }
+
+    const fn target_mtp_executable_count(&self) -> usize {
+        TARGET_VERIFY_ROUTE_COUNT
+            * (LONG_CONTEXT_ROUTE_COUNT + 2 + 2 * TARGET_SEGMENTED_BATCH_ROUTES)
+    }
+
+    const fn executable_count(&self) -> usize {
+        MAX_BATCH
+            + PREFILL_GRAPH_ROUTE_COUNT
+            + self.target_mtp_executable_count()
+            + LONG_CONTEXT_ROUTE_COUNT * MAX_BATCH
+    }
+
+    const fn route_count(&self) -> usize {
+        MAX_BATCH
+            + PREFILL_GRAPH_ROUTE_COUNT
+            + TARGET_VERIFY_ROUTE_COUNT
+                * (LONG_CONTEXT_ROUTE_COUNT
+                    + 2
+                    + TARGET_SEGMENTED_BATCH_ROUTES * (LONG_CONTEXT_ROUTE_COUNT + 1))
+            + LONG_CONTEXT_ROUTE_COUNT * MAX_BATCH
     }
 
     fn select_target_commit(&self, tokens: usize) -> EngineResult<&CudaGraph> {
@@ -1488,9 +1528,7 @@ impl ResidentModelProgram {
         stream: &CudaStream,
         route: ResidentMtpSegmentedVerifyRoute,
     ) -> EngineResult<()> {
-        self.graphs
-            .select_target_segmented_verify(route)
-            .launch(stream)?;
+        self.graphs.launch_target_segmented_verify(stream, route)?;
         Ok(())
     }
 
@@ -1834,6 +1872,21 @@ impl ResidentModelProgram {
                 + TARGET_SEGMENTED_BATCH_ROUTES * (LONG_CONTEXT_ROUTE_COUNT + 1))
     }
 
+    /// Executable instances retained for the complete target MTP route inventory.
+    pub const fn target_mtp_graph_executable_count(&self) -> usize {
+        self.graphs.target_mtp_executable_count()
+    }
+
+    /// Complete resident route-definition inventory.
+    pub const fn graph_route_count(&self) -> usize {
+        self.graphs.route_count()
+    }
+
+    /// Complete resident executable-graph ownership after compatible variant sharing.
+    pub const fn graph_executable_count(&self) -> usize {
+        self.graphs.executable_count()
+    }
+
     /// Fixed per-slot capacity of the current exact attention caches.
     pub const fn context_capacity(&self) -> usize {
         self.layout.context_capacity()
@@ -1959,8 +2012,14 @@ impl ResidentModelProgram {
     pub fn qualification_target_mtp_segmented_verify_graph(
         &self,
         route: ResidentMtpSegmentedVerifyRoute,
-    ) -> &CudaGraph {
-        self.graphs.select_target_segmented_verify(route)
+    ) -> EngineResult<&CudaGraph> {
+        self.graphs
+            .select_direct_target_segmented_verify(route)
+            .ok_or_else(|| {
+                EngineError::route(
+                    "long-context segmented target verification uses an updated graph variant",
+                )
+            })
     }
 
     #[cfg(feature = "qualification")]
@@ -4245,34 +4304,35 @@ fn capture_routes(
         .try_into()
         .map_err(|_| EngineError::layout("segmented target MTP short token inventory differs"))?;
 
-    let mut target_segmented_verify_long = Vec::with_capacity(LONG_CONTEXT_ROUTE_COUNT);
-    for (index, &partitions) in LONG_CONTEXT_GQA_PARTITION_BUCKETS.iter().enumerate() {
-        let maximum_length = (partitions * LONG_CONTEXT_GQA_PARTITION_SIZE).min(MAX_CONTEXT_TOKENS);
-        let mut token_graphs = Vec::with_capacity(TARGET_VERIFY_ROUTE_COUNT);
-        for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
-            let mut graphs = Vec::with_capacity(TARGET_SEGMENTED_BATCH_ROUTES);
-            for batch in 2..=MAX_BATCH {
+    let mut target_segmented_verify_long = Vec::with_capacity(TARGET_VERIFY_ROUTE_COUNT);
+    for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
+        let mut batch_graphs = Vec::with_capacity(TARGET_SEGMENTED_BATCH_ROUTES);
+        for batch in 2..=MAX_BATCH {
+            let mut definitions = Vec::with_capacity(LONG_CONTEXT_ROUTE_COUNT);
+            for (index, &partitions) in LONG_CONTEXT_GQA_PARTITION_BUCKETS.iter().enumerate() {
+                let maximum_length =
+                    (partitions * LONG_CONTEXT_GQA_PARTITION_SIZE).min(MAX_CONTEXT_TOKENS);
                 let route = ResidentMtpSegmentedVerifyRoute {
                     tokens,
                     batch,
                     maximum_length,
                     attention: AttentionRoute::Long { index, partitions },
                 };
-                graphs.push(CudaGraph::capture(stream, || {
+                definitions.push(CudaGraphDefinition::capture(stream, || {
                     launch_target_mtp_segmented_verify(stream, route, ops, pointers, dense_mlp_maps)
                 })?);
             }
-            token_graphs.push(graphs.try_into().map_err(|_| {
-                EngineError::layout("segmented target MTP long batch inventory differs")
-            })?);
+            batch_graphs.push(CudaGraphVariants::new(definitions.try_into().map_err(
+                |_| EngineError::layout("segmented target MTP long partition inventory differs"),
+            )?)?);
         }
-        target_segmented_verify_long.push(token_graphs.try_into().map_err(|_| {
-            EngineError::layout("segmented target MTP long token inventory differs")
+        target_segmented_verify_long.push(batch_graphs.try_into().map_err(|_| {
+            EngineError::layout("segmented target MTP long batch inventory differs")
         })?);
     }
-    let target_segmented_verify_long = target_segmented_verify_long.try_into().map_err(|_| {
-        EngineError::layout("segmented target MTP long partition inventory differs")
-    })?;
+    let target_segmented_verify_long = target_segmented_verify_long
+        .try_into()
+        .map_err(|_| EngineError::layout("segmented target MTP long token inventory differs"))?;
 
     let mut target_commit = Vec::with_capacity(TARGET_VERIFY_ROUTE_COUNT);
     for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
@@ -6190,6 +6250,7 @@ mod tests {
                     + super::TARGET_SEGMENTED_BATCH_ROUTES * (LONG_CONTEXT_ROUTE_COUNT + 1)),
             228
         );
+        assert_eq!(4 * (LONG_CONTEXT_ROUTE_COUNT + 2 + 2 * 7), 88);
         for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
             require_target_verify_tokens(tokens).unwrap();
             for maximum_length in [
