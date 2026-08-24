@@ -157,7 +157,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-frontend SNAPSHOT` | Check exact template, tokenizer, streaming, and prefix-cache behavior | terminal |
 | `cargo run -p xtask -- qualify-generation SNAPSHOT` | Check prompt-to-sampling-to-streaming state over exact BF16 logit rows | terminal |
 | `cargo run -p xtask -- qualify-residual-norm` | Run the independent numerical and graph-replay oracle | terminal |
-| `cargo run -p xtask -- qualify-qwen36-residual-norm` | Check Qwen3.6 zero-centered RMSNorm and fused residual publication at every exact B=1..8 route | terminal |
+| `cargo run -p xtask -- qualify-qwen36-residual-norm` | Check Qwen3.6 zero-centered RMSNorm and fused residual publication at B=1..8 and T=32/64/128 | terminal |
 | `cargo run -p xtask -- qualify-fp8-qkv` | Check represented activation codes/scales and QKV output for B=1..8, T=16, and T=32/64/128/1024 prefill, including padded T=32 reads and graph replay | terminal |
 | `cargo run -p xtask -- qualify-fp8-gdn-input` | Check represented activation codes/scales and GDN Q/K/V/Z output for B=1..8 and T=32/64/128/1024 prefill, including padded T=32 reads and graph replay | terminal |
 | `cargo run -p xtask -- qualify-fp8-lm-head` | Run the independent represented-value full-vocabulary LM-head oracle and benchmark-accounting test | terminal |
@@ -253,7 +253,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-qwen36-moe-router` | Measure every exact Qwen3.6 BF16 router projection plus normalized top-eight graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-moe-experts` | Measure every exact Qwen3.6 routed/shared NVFP4 expert plus combine graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-nvfp4-lm-head` | Measure every exact Qwen3.6 represented-weight NVFP4 full-vocabulary graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-residual-norm` | Measure every exact Qwen3.6 plain and fused-residual RMSNorm graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-residual-norm` | Measure every exact Qwen3.6 plain and fused-residual RMSNorm graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-fp8-qkv` | Measure every exact Qwen3.6 static-FP8 full-attention Q/K/V graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-input` | Measure every exact Qwen3.6 static-FP8 Q/K/V/Z plus BF16 A/B control graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-output` | Measure every exact Qwen3.6 static-FP8 GDN output graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
@@ -572,9 +572,10 @@ compared with a cold long-context model result that shares a route name.
 The residual-norm `B=1..8`, FP8-QKV `B=1..8`, FP8-GDN-input `B=1..8`, FP8-LM-head, dense-FP8-SwiGLU `B=1..8`,
 dense-FP8-down, NVFP4-SwiGLU, and NVFP4-down cases are `operator/decode`, warm-cache, CUDA-Graph
 workloads. They set batch and active tokens to the exact batch. FP8-QKV `T=16` is an
-`operator/mtp` case; residual norm, FP8-QKV, FP8-GDN-input, GDN-prepare, and GDN-recurrence
-`T=32,64,128,1024` routes are
-`operator/prefill` cases. Both projection T=32 routes read a padded 64-row activation-code tile,
+`operator/mtp` case; residual norm, FP8-QKV, FP8-GDN-input, GDN-prepare, and GDN-recurrence prompt
+routes are `operator/prefill` cases. The Qwen3.8 residual-norm inventory reaches T=1024, while the
+Qwen3.6 residual-norm inventory admits T=32/64/128. Both projection T=32 routes read a padded
+64-row activation-code tile,
 and their logical-byte accounting includes those immutable padding reads.
 GDN-prepare samples restore the exact mapped history outside the timed interval; the timed graph
 contains only the production control, parallel causal-convolution, and ordered history-publication

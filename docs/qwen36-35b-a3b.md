@@ -101,9 +101,13 @@ bytes. All 33 gate/up, down, and combine entries use zero stack/local memory. At
 2,197/13,801 MHz SM/memory clocks, the unblessed complete prompt graphs measure
 252.088/479.809/936.724 us at T=32/64/128; B=1/8 measure 14.348/81.375 us. These remain leaf
 diagnostics rather than a cold whole-layer or model claim.
-The 2,048-wide zero-centered RMSNorm and fused residual-publication routes also cover every exact
-`B=1..8`, pass 786,432 oracle/graph/sentinel observations, and measure 1.761/1.858 us plain plus
-1.887/1.948 us fused at B=1/8 with a locked 2,197 MHz SM clock. The first GDN projection family
+The 2,048-wide zero-centered RMSNorm and fused residual-publication routes cover every exact
+`B=1..8` and `T=32/64/128`. They check 532,480 values in each of the plain, residual-publication,
+and normalized planes, 1,597,440 graph-replay values, 14,106,624 inactive sentinels, and 526,336
+immutable source values with no post-warmup device growth. All 22 entries use zero stack/local
+memory. Locked B=1/8 intrinsic medians remain 1.761/1.858 us plain and 1.887/1.948 us fused. At a
+2,160 MHz median loaded clock, the unblessed prompt intrinsic medians are 1.886/2.007/2.259 us
+plain and 1.964/2.093/2.375 us fused at T=32/64/128. The first GDN projection family
 preserves the checkpoint's static FP8 contract: BF16 inputs are quantized with the admitted scalar
 scale, source E4M3 Q/K/V/Z weights retain their two scalar scales, and the 64 BF16 A/B control rows
 remain a separate exact projection. Exact `T=32/64/128` prompt routes reuse the same represented
