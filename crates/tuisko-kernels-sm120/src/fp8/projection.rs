@@ -55,8 +55,9 @@ struct Fp8Geometry {
 
 fn fp8_geometry<A: Arch>() -> Option<Fp8Geometry> {
     let decode_rows = 2 * DECODE_PROJECTION_WARPS;
-    if A::HIDDEN == 0
-        || !A::HIDDEN.is_multiple_of(512)
+    // The decode kernels instantiate `fp8_projection::<5_120, ..>`; only the
+    // exact width is admissible regardless of divisibility.
+    if A::HIDDEN != 5_120
         || !A::ATTENTION_QKV_ROWS.is_multiple_of(decode_rows)
         || !A::GDN_INPUT_ROWS.is_multiple_of(decode_rows)
         || !A::VOCAB.is_multiple_of(decode_rows)
@@ -1401,9 +1402,8 @@ mod tests {
     }
 
     #[test]
-    fn geometry_flows_from_the_architecture() {
+    fn geometry_admits_only_the_hardcoded_decode_width() {
         let qwen = fp8_geometry::<Qwen38_27B>().unwrap();
-        let test = fp8_geometry::<TestArch>().unwrap();
 
         assert_eq!(qwen.quantize_pairs_per_thread, 10);
         assert_eq!(qwen.qkv_decode_blocks, 896);
@@ -1411,12 +1411,9 @@ mod tests {
         assert_eq!(qwen.lm_head_decode_blocks, 15_520);
         assert_eq!(qwen.qkv_mma_output_tiles, 224);
         assert_eq!(qwen.qkv_mma_k_tiles, 40);
-        assert_eq!(test.quantize_pairs_per_thread, 2);
-        assert_eq!(test.qkv_decode_blocks, 40);
-        assert_eq!(test.gdn_decode_blocks, 24);
-        assert_eq!(test.lm_head_decode_blocks, 32);
-        assert_eq!(test.qkv_mma_output_tiles, 10);
-        assert_eq!(test.qkv_mma_k_tiles, 8);
+        // HIDDEN=1024 satisfies every divisibility requirement but not the
+        // 5,120 width baked into the decode kernel instantiations.
+        assert!(fp8_geometry::<TestArch>().is_none());
     }
 
     #[test]
