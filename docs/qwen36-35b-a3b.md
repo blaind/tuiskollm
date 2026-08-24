@@ -168,7 +168,9 @@ The eight A16 entries use 40--111 registers, 9,216 bytes shared, and zero stack/
 pinned PTX/SASS retains represented E2M1 conversion, warp reduction, and BF16 publication. Direct
 timing remains unreported because the available card was occupied. Exact endpoint bindings retain
 the mmap-backed BF16 embeddings/final norm and losslessly swizzle the LM-head E4M3 plane while
-borrowing its packed E2M1 words. The resident endpoint owner remains unimplemented.
+borrowing its packed E2M1 words. A single-allocation resident owner now stages embedding rows
+without rescanning the LM-head source and captures final-norm plus NVFP4 LM-head graphs at every
+exact `B=1..8`; source-backed device qualification is the next separate slice.
 
 ## Implementation order
 

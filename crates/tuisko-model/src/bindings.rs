@@ -1988,6 +1988,16 @@ impl<'a> Qwen36TextEndpointBindings<'a> {
         })
     }
 
+    /// Binds only the mmap-backed embedding used during token staging.
+    pub fn bind_embedding(
+        snapshot: &'a CheckpointSnapshot<Qwen36Moe35B>,
+    ) -> CheckpointResult<Bf16View<'a, 2>> {
+        Bf16View::bind(
+            snapshot.tensor(EMBEDDING)?,
+            [Qwen36Moe35B::VOCAB as u64, Qwen36Moe35B::HIDDEN as u64],
+        )
+    }
+
     fn bind_from(
         vocab: usize,
         hidden: usize,
