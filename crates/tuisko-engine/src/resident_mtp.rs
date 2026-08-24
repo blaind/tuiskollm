@@ -888,6 +888,29 @@ impl ResidentMtpProgram {
         Ok(())
     }
 
+    /// Reads compact final-residual rows into reusable host storage.
+    pub fn read_residuals_into(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        require_batch(rows)?;
+        let expected = product("resident MTP residual elements", rows, Qwen38_27B::HIDDEN)?;
+        if destination.len() != expected {
+            return Err(EngineError::layout(format!(
+                "resident MTP residual destination has {} values, expected {expected} for B={rows}",
+                destination.len()
+            )));
+        }
+        self.arena.copy_prefix_to_host_slice(
+            stream,
+            self.layout.regions().residual_output,
+            destination,
+        )?;
+        Ok(())
+    }
+
     /// Activates the one shared target/MTP page-table row.
     pub fn activate_kv_slot(&mut self, slot: usize) -> EngineResult<()> {
         self.target.activate_kv_slot(slot)

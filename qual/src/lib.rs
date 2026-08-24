@@ -165,6 +165,10 @@ mod resident_model_benchmark;
 #[cfg(feature = "device")]
 mod resident_mtp;
 #[cfg(feature = "device")]
+mod resident_mtp_batch_generation;
+#[cfg(feature = "device")]
+mod resident_mtp_batch_generation_benchmark;
+#[cfg(feature = "device")]
 mod resident_mtp_benchmark;
 #[cfg(feature = "device")]
 mod resident_mtp_generation;
@@ -415,6 +419,13 @@ pub use resident_model_benchmark::{
 pub use resident_mtp::{
     ResidentMtpQualification, ResidentMtpQualificationError, qualify_resident_mtp,
 };
+#[cfg(feature = "device")]
+pub use resident_mtp_batch_generation::{
+    ResidentMtpBatchGenerationQualification, ResidentMtpBatchGenerationQualificationError,
+    qualify_resident_mtp_batch_generation,
+};
+#[cfg(feature = "device")]
+pub use resident_mtp_batch_generation_benchmark::benchmark_resident_mtp_batch_generation;
 #[cfg(feature = "device")]
 pub use resident_mtp_benchmark::benchmark_resident_mtp;
 #[cfg(feature = "device")]

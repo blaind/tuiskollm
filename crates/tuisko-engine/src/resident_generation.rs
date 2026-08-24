@@ -107,6 +107,10 @@ pub struct ResidentGenerationSession<'a> {
 }
 
 impl ResidentRequestId {
+    pub(crate) const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
     /// Numeric identity suitable for transport correlation and logs.
     pub const fn get(self) -> u64 {
         self.0
