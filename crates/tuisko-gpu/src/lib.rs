@@ -13,7 +13,7 @@ pub use cuda_core::{
     LaunchConfig2D, LaunchContractError, PinnedHostBuffer, PreparedLaunch, SyncPolicy,
 };
 pub use error::{GpuError, GpuErrorCode, GpuResult};
-pub use graph::CudaGraph;
+pub use graph::{CudaGraph, CudaGraphDefinition, CudaGraphVariants};
 pub use memory::{DeviceMemoryInfo, device_memory_info};
 pub use profiler::{profiler_start, profiler_stop};
 pub use timer::{GpuTimer, GpuTiming};

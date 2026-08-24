@@ -3,10 +3,25 @@
 use crate::{CudaContext, CudaStream, GpuError, GpuResult};
 use cuda_core::{IntoResult, sys};
 use std::ffi::CString;
+use std::mem::ManuallyDrop;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// One captured CUDA Graph definition without an executable instance.
+pub struct CudaGraphDefinition {
+    context: Arc<CudaContext>,
+    graph: sys::CUgraph,
+}
+
+/// Exact topology-compatible graph definitions sharing one executable instance.
+pub struct CudaGraphVariants<const N: usize> {
+    context: Arc<CudaContext>,
+    definitions: [CudaGraphDefinition; N],
+    executable: sys::CUgraphExec,
+    selected: Mutex<usize>,
+}
 
 /// One immutable CUDA Graph and its executable instance.
 ///
@@ -24,49 +39,9 @@ impl CudaGraph {
     where
         F: FnOnce() -> GpuResult<()>,
     {
-        let context = stream.context().clone();
-        context
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the graph CUDA context", source))?;
-        // SAFETY: the stream is live and its context is current on this thread.
-        unsafe {
-            sys::cuStreamBeginCapture_v2(
-                stream.cu_stream(),
-                sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )
-            .result()
-        }
-        .map_err(|source| GpuError::driver("beginning CUDA Graph capture", source))?;
-        let capture = ActiveCapture {
-            context: context.clone(),
-            stream,
-            active: true,
-        };
-
-        record()?;
-
-        let graph = capture.finish()?;
-        if graph.is_null() {
-            return Err(GpuError::graph("CUDA stream capture returned a null graph"));
-        }
-
-        let mut executable = ptr::null_mut();
-        // SAFETY: `graph` is the live graph returned by the completed capture.
-        let instantiate = unsafe { sys::cuGraphInstantiateWithFlags(&mut executable, graph, 0) }
-            .result()
-            .map_err(|source| GpuError::driver("instantiating a CUDA Graph", source));
-        if let Err(error) = instantiate {
-            // SAFETY: instantiation failed without transferring ownership of `graph`.
-            context.record_err(unsafe { sys::cuGraphDestroy(graph).result() });
-            return Err(error);
-        }
-        if executable.is_null() {
-            // SAFETY: a null executable leaves `graph` owned by this function.
-            context.record_err(unsafe { sys::cuGraphDestroy(graph).result() });
-            return Err(GpuError::graph(
-                "CUDA Graph instantiation returned a null executable",
-            ));
-        }
+        let definition = CudaGraphDefinition::capture(stream, record)?;
+        let executable = instantiate(&definition)?;
+        let (context, graph) = definition.into_parts();
 
         Ok(Self {
             context,
@@ -109,6 +84,179 @@ impl CudaGraph {
     }
 }
 
+impl CudaGraphDefinition {
+    /// Captures operations without allocating an executable graph instance.
+    pub fn capture<F>(stream: &CudaStream, record: F) -> GpuResult<Self>
+    where
+        F: FnOnce() -> GpuResult<()>,
+    {
+        let context = stream.context().clone();
+        context
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the graph CUDA context", source))?;
+        // SAFETY: the stream is live and its context is current on this thread.
+        unsafe {
+            sys::cuStreamBeginCapture_v2(
+                stream.cu_stream(),
+                sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .result()
+        }
+        .map_err(|source| GpuError::driver("beginning CUDA Graph capture", source))?;
+        let capture = ActiveCapture {
+            context: context.clone(),
+            stream,
+            active: true,
+        };
+
+        record()?;
+
+        let graph = capture.finish()?;
+        if graph.is_null() {
+            return Err(GpuError::graph("CUDA stream capture returned a null graph"));
+        }
+        Ok(Self { context, graph })
+    }
+
+    /// Writes this definition's structural inventory for out-of-band inspection.
+    pub fn debug_dot(&self, path: &Path) -> GpuResult<()> {
+        debug_dot(&self.context, self.graph, path)
+    }
+
+    fn into_parts(self) -> (Arc<CudaContext>, sys::CUgraph) {
+        let this = ManuallyDrop::new(self);
+        // SAFETY: `this` will not run Drop; ownership of both fields moves to the caller.
+        let context = unsafe { ptr::read(&this.context) };
+        (context, this.graph)
+    }
+}
+
+impl<const N: usize> CudaGraphVariants<N> {
+    /// Instantiates the first of an exact non-empty definition inventory.
+    pub fn new(definitions: [CudaGraphDefinition; N]) -> GpuResult<Self> {
+        let first = definitions
+            .first()
+            .ok_or_else(|| GpuError::graph("CUDA Graph variant inventory cannot be empty"))?;
+        if definitions
+            .iter()
+            .any(|definition| definition.context.as_ref() != first.context.as_ref())
+        {
+            return Err(GpuError::context(
+                "CUDA Graph variants must belong to one context",
+            ));
+        }
+        let context = first.context.clone();
+        let executable = instantiate(first)?;
+        Ok(Self {
+            context,
+            definitions,
+            executable,
+            selected: Mutex::new(0),
+        })
+    }
+
+    /// Synchronizes only when needed, updates the shared executable, and enqueues one variant.
+    pub fn launch(&self, stream: &CudaStream, index: usize) -> GpuResult<()> {
+        if self.context.as_ref() != stream.context().as_ref() {
+            return Err(GpuError::context(
+                "CUDA Graph variants and launch stream belong to different contexts",
+            ));
+        }
+        let definition = self.definitions.get(index).ok_or_else(|| {
+            GpuError::graph(format!(
+                "CUDA Graph variant {index} is outside an exact {N}-entry inventory"
+            ))
+        })?;
+        let mut selected = self
+            .selected
+            .lock()
+            .map_err(|_| GpuError::graph("CUDA Graph variant selection lock is poisoned"))?;
+        if *selected != index {
+            stream.synchronize().map_err(|source| {
+                GpuError::driver("synchronizing before CUDA Graph update", source)
+            })?;
+            self.context
+                .bind_to_thread()
+                .map_err(|source| GpuError::driver("binding the graph CUDA context", source))?;
+            let mut result = sys::CUgraphExecUpdateResultInfo {
+                result: sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_ERROR,
+                errorNode: ptr::null_mut(),
+                errorFromNode: ptr::null_mut(),
+            };
+            // SAFETY: the executable and definition are live, context-matched handles. The
+            // stream synchronization completed every earlier launch of this serialized owner.
+            unsafe { sys::cuGraphExecUpdate_v2(self.executable, definition.graph, &mut result) }
+                .result()
+                .map_err(|source| GpuError::driver("updating a CUDA Graph executable", source))?;
+            if result.result != sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS {
+                return Err(GpuError::graph(format!(
+                    "CUDA Graph executable update returned result {}",
+                    result.result
+                )));
+            }
+            *selected = index;
+        }
+
+        self.context
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the graph CUDA context", source))?;
+        // SAFETY: the selected executable is live and belongs to the launch stream's context.
+        unsafe { sys::cuGraphLaunch(self.executable, stream.cu_stream()).result() }
+            .map_err(|source| GpuError::driver("launching a CUDA Graph variant", source))
+    }
+
+    /// Writes one exact definition's structural inventory for out-of-band inspection.
+    pub fn debug_dot(&self, index: usize, path: &Path) -> GpuResult<()> {
+        self.definitions
+            .get(index)
+            .ok_or_else(|| {
+                GpuError::graph(format!(
+                    "CUDA Graph variant {index} is outside an exact {N}-entry inventory"
+                ))
+            })?
+            .debug_dot(path)
+    }
+
+    /// Exact route-definition count.
+    pub const fn route_count(&self) -> usize {
+        N
+    }
+
+    /// One shared executable instance.
+    pub const fn executable_count(&self) -> usize {
+        1
+    }
+}
+
+fn instantiate(definition: &CudaGraphDefinition) -> GpuResult<sys::CUgraphExec> {
+    let mut executable = ptr::null_mut();
+    // SAFETY: `definition.graph` is live in the current context.
+    unsafe { sys::cuGraphInstantiateWithFlags(&mut executable, definition.graph, 0) }
+        .result()
+        .map_err(|source| GpuError::driver("instantiating a CUDA Graph", source))?;
+    if executable.is_null() {
+        return Err(GpuError::graph(
+            "CUDA Graph instantiation returned a null executable",
+        ));
+    }
+    Ok(executable)
+}
+
+fn debug_dot(context: &CudaContext, graph: sys::CUgraph, path: &Path) -> GpuResult<()> {
+    context
+        .bind_to_thread()
+        .map_err(|source| GpuError::driver("binding the graph CUDA context", source))?;
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| GpuError::graph("CUDA Graph DOT path contains an interior NUL"))?;
+    let flags = sys::CUgraphDebugDot_flags_enum_CU_GRAPH_DEBUG_DOT_FLAGS_VERBOSE
+        | sys::CUgraphDebugDot_flags_enum_CU_GRAPH_DEBUG_DOT_FLAGS_KERNEL_NODE_PARAMS
+        | sys::CUgraphDebugDot_flags_enum_CU_GRAPH_DEBUG_DOT_FLAGS_EXTRA_TOPO_INFO;
+    // SAFETY: the graph is live, and CUDA consumes the NUL-terminated path before returning.
+    unsafe { sys::cuGraphDebugDotPrint(graph, path.as_ptr(), flags) }
+        .result()
+        .map_err(|source| GpuError::driver("writing CUDA Graph DOT inventory", source))
+}
+
 impl Drop for CudaGraph {
     fn drop(&mut self) {
         self.context.record_err(self.context.bind_to_thread());
@@ -117,6 +265,24 @@ impl Drop for CudaGraph {
             .record_err(unsafe { sys::cuGraphExecDestroy(self.executable).result() });
         self.context
             .record_err(unsafe { sys::cuGraphDestroy(self.graph).result() });
+    }
+}
+
+impl Drop for CudaGraphDefinition {
+    fn drop(&mut self) {
+        self.context.record_err(self.context.bind_to_thread());
+        // SAFETY: this owner destroys its captured definition exactly once.
+        self.context
+            .record_err(unsafe { sys::cuGraphDestroy(self.graph).result() });
+    }
+}
+
+impl<const N: usize> Drop for CudaGraphVariants<N> {
+    fn drop(&mut self) {
+        self.context.record_err(self.context.bind_to_thread());
+        // SAFETY: this owner destroys its one executable before definitions drop.
+        self.context
+            .record_err(unsafe { sys::cuGraphExecDestroy(self.executable).result() });
     }
 }
 
@@ -170,8 +336,8 @@ impl Drop for ActiveCapture<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::CudaGraph;
-    use crate::{ArenaLayout, CudaContext, DeviceArena, GpuError};
+    use super::{CudaGraph, CudaGraphDefinition, CudaGraphVariants};
+    use crate::{ArenaLayout, CudaContext, DeviceArena, GpuError, device_memory_info};
 
     #[test]
     #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
@@ -236,5 +402,40 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0xa5)
         );
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
+    fn topology_compatible_variants_share_one_allocation_stable_executable() {
+        let context = CudaContext::new(0).unwrap();
+        assert_eq!(context.compute_capability().unwrap(), (12, 0));
+        let stream = context.new_stream().unwrap();
+        let mut layout = ArenaLayout::new();
+        let values = layout.reserve::<u32>(4, 256).unwrap();
+        let arena = DeviceArena::zeroed(&stream, &layout).unwrap();
+        let first =
+            CudaGraphDefinition::capture(&stream, || arena.fill(&stream, values, 0x11)).unwrap();
+        let second =
+            CudaGraphDefinition::capture(&stream, || arena.fill(&stream, values, 0x22)).unwrap();
+        let variants = CudaGraphVariants::new([first, second]).unwrap();
+        assert_eq!(variants.route_count(), 2);
+        assert_eq!(variants.executable_count(), 1);
+
+        variants.launch(&stream, 0).unwrap();
+        variants.launch(&stream, 1).unwrap();
+        variants.launch(&stream, 0).unwrap();
+        stream.synchronize().unwrap();
+        let before = device_memory_info(&context).unwrap();
+        for index in [1, 0, 1, 1, 0] {
+            variants.launch(&stream, index).unwrap();
+        }
+        stream.synchronize().unwrap();
+        let after = device_memory_info(&context).unwrap();
+
+        assert_eq!(
+            arena.copy_to_host(&stream, values).unwrap(),
+            [0x1111_1111; 4]
+        );
+        assert_eq!(before.free_bytes, after.free_bytes);
     }
 }
