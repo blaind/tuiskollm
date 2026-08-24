@@ -167,6 +167,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT` | Check source layer 55, route-specific A16/W4A4 scratch, every observable seam, exact B=1..8 and T=32/64/128/1024 graphs, immutable weights, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-mlp SNAPSHOT` | Check Qwen3.5 source layer 0, ModelOpt scale conversion, route-specific A16/W4A4 scratch, every observable seam, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-qkv` | Check Qwen3.5 fused Q/gate, K, and V represented values with three weight-scale divisors at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-qwen36-moe-router` | Check Qwen3.6 BF16 router logits, deterministic top-eight experts, normalized BF16 weights, immutable sources, exact-B graph replay, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-bf16-lm-head SNAPSHOT` | Check the source BF16 LM head against sampled FP64 dots, eager/graph agreement, immutable inputs, stable addresses, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-text-endpoint SNAPSHOT` | Check exact source embeddings, final RMSNorm, sampled full-formula BF16 logits, graph replay, stable addresses, and post-warmup allocation at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-resident-model SNAPSHOT` | Check every complete Qwen3.5 text layer plus endpoint graph against eager replay, endpoint source formulas, finite logits, stable addresses, and owner allocation at B=1..8 | terminal |
@@ -231,6 +232,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed layer-55 decode and prefill MLP graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed Qwen3.5 layer-0 MLP graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-qkv` | Measure every exact Qwen3.5 fused NVFP4 QKV graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-moe-router` | Measure every exact Qwen3.6 BF16 router projection plus normalized top-eight graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-gdn-input` | Measure every exact Qwen3.5 fused NVFP4 Q/K/V/Z and A/B graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-gdn-prepare` | Measure every exact Qwen3.5 fused control-plus-convolution graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-gdn-recurrence` | Measure every exact Qwen3.5 stateful recurrence graph | terminal or `--json PATH` |
