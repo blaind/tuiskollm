@@ -549,14 +549,14 @@ pub use resident_mtp_sampling::{
 };
 #[cfg(feature = "device")]
 pub use resident_mtp_sampling_benchmark::benchmark_resident_mtp_sampling;
-#[cfg(feature = "device")]
-pub use residual_norm::qualify_qwen35_residual_norm;
 pub use residual_norm::{
     ResidualNormQualification, ResidualNormQualificationError, qualify_residual_norm,
 };
 #[cfg(feature = "device")]
-pub use residual_norm_benchmark::benchmark_qwen35_residual_norm;
+pub use residual_norm::{qualify_qwen35_residual_norm, qualify_qwen36_residual_norm};
 pub use residual_norm_benchmark::benchmark_residual_norm;
+#[cfg(feature = "device")]
+pub use residual_norm_benchmark::{benchmark_qwen35_residual_norm, benchmark_qwen36_residual_norm};
 #[cfg(feature = "device")]
 pub use residual_norm_prefill::{
     ResidualNormPrefillQualification, ResidualNormPrefillQualificationError,

@@ -28,6 +28,7 @@ use tuisko_qual::{
     benchmark_qwen35_nvfp4_mlp, benchmark_qwen35_nvfp4_qkv, benchmark_qwen35_nvfp4_swiglu,
     benchmark_qwen35_paged_gqa, benchmark_qwen35_resident_model, benchmark_qwen35_residual_norm,
     benchmark_qwen35_text_endpoint, benchmark_qwen36_moe_experts, benchmark_qwen36_moe_router,
+    benchmark_qwen36_residual_norm,
     benchmark_resident_long_context_model, benchmark_resident_model, benchmark_resident_mtp,
     benchmark_resident_mtp_batch_generation, benchmark_resident_mtp_generation,
     benchmark_resident_mtp_sampling, benchmark_resident_prefill, benchmark_target_mtp_verify,
@@ -241,6 +242,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             let (options, json_path) =
                 parse_options(arguments, DeviceBenchmarkOptions::short_graph())?;
             (benchmark_qwen35_residual_norm(options)?, json_path)
+        }
+        #[cfg(feature = "device")]
+        "qwen36-residual-norm" => {
+            let (options, json_path) =
+                parse_options(arguments, DeviceBenchmarkOptions::short_graph())?;
+            (benchmark_qwen36_residual_norm(options)?, json_path)
         }
         #[cfg(feature = "device")]
         "qwen35-nvfp4-swiglu" => {

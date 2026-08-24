@@ -7,15 +7,15 @@ use crate::device_benchmark::{
     preflight, require_current_process_exclusive, warmup_launches,
 };
 use crate::residual_norm::ResidualNormLauncher;
-#[cfg(feature = "device")]
-use crate::target::Qwen35ResidualNormOp;
 use crate::target::{EXPECTED_COMPUTE_CAPABILITY, ResidualNormOp};
+#[cfg(feature = "device")]
+use crate::target::{Qwen35ResidualNormOp, Qwen36ResidualNormOp};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer,
 };
-use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const DECODE_ROUTES: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -365,6 +365,26 @@ pub fn benchmark_qwen35_residual_norm(
         "max_batch=8,hidden=4096",
         "qwen35_9b/residual_norm/weights",
         "qwen35_9b/residual_norm/alignment_padding",
+        &DECODE_ROUTES,
+        MAX_BATCH,
+    )
+}
+
+/// Measures the exact Qwen3.6 residual-norm routes on SM120.
+#[cfg(feature = "device")]
+pub fn benchmark_qwen36_residual_norm(
+    options: DeviceBenchmarkOptions,
+) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
+    benchmark_target::<Qwen36Moe35B, Qwen36ResidualNormOp>(
+        options,
+        Qwen36ResidualNormOp::new,
+        "bench-qwen36-residual-norm",
+        "qwen36_35b_a3b/residual_norm/plain",
+        "qwen36_35b_a3b/residual_norm/fused_residual",
+        "qwen36_35b_a3b/residual_norm/address_stable_workspace",
+        "max_batch=8,hidden=2048",
+        "qwen36_35b_a3b/residual_norm/weights",
+        "qwen36_35b_a3b/residual_norm/alignment_padding",
         &DECODE_ROUTES,
         MAX_BATCH,
     )

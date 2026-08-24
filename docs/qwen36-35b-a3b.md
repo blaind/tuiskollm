@@ -95,7 +95,10 @@ memory and pass complete eager/oracle plus CUDA Graph agreement.
 At a measured 2,182 MHz median SM clock, the warm expert-only repeated path is 12.726 us at B=1
 and 76.390 us at B=8. The rise after B=6 coincides with the selected expert working set exceeding
 the target's cache, so these are leaf diagnostics rather than a cold whole-layer or model claim.
-Composed layers, exact prefill expert routes, and model inference remain unimplemented.
+The 2,048-wide zero-centered RMSNorm and fused residual-publication routes also cover every exact
+`B=1..8`, pass 786,432 oracle/graph/sentinel observations, and measure 1.761/1.858 us plain plus
+1.887/1.948 us fused at B=1/8 with a locked 2,197 MHz SM clock. Composed layers, exact prefill
+expert routes, and model inference remain unimplemented.
 
 ## Implementation order
 
