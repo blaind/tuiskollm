@@ -67,7 +67,6 @@ pub(crate) struct Qwen36FullAttentionLayerRegions {
 #[derive(Clone, Debug)]
 pub struct Qwen36FullAttentionLayerLayout {
     builder: ArenaLayout,
-    #[allow(dead_code)]
     regions: Qwen36FullAttentionLayerRegions,
     resident_weight_bytes: usize,
     cache_bytes: usize,
@@ -287,7 +286,10 @@ impl Qwen36FullAttentionLayerLayout {
         })
     }
 
-    #[allow(dead_code)]
+    pub(crate) const fn builder(&self) -> &ArenaLayout {
+        &self.builder
+    }
+
     pub(crate) const fn regions(&self) -> Qwen36FullAttentionLayerRegions {
         self.regions
     }
