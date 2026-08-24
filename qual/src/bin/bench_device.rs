@@ -203,7 +203,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .next()
                 .ok_or("target-mtp-verify requires the admitted snapshot path")?;
             let (options, json_path) =
-                parse_options(arguments, DeviceBenchmarkOptions::long_graph())?;
+                parse_options(arguments, DeviceBenchmarkOptions::resident_model())?;
             (
                 benchmark_target_mtp_verify(&PathBuf::from(snapshot), options)?,
                 json_path,

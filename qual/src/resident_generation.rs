@@ -203,7 +203,7 @@ pub fn qualify_resident_generation(
 fn verify_owner(
     generator: &ResidentTextGenerator,
 ) -> Result<(), ResidentGenerationQualificationError> {
-    if generator.arena_bytes() != 28_390_138_624
+    if generator.arena_bytes() != 28_469_064_448
         || generator.host_stager_bytes() != 10_982_400
         || generator.kv_route_host_bytes() != 113_454
         || generator.context_capacity() != 220_000
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(report.reference_cases, 2);
         assert!((1..=2).contains(&report.chat_steps));
         assert_eq!(report.native_prefill_plans, 13);
-        assert_eq!(report.arena_bytes, 28_390_138_624);
+        assert_eq!(report.arena_bytes, 28_469_064_448);
         assert_eq!(report.host_stager_bytes, 10_982_400);
         Ok(())
     }

@@ -804,7 +804,7 @@ mod tests {
 
         assert_eq!(plan.weight_bytes(), 19_103_682_560);
         assert_eq!(plan.host_derived_bytes(), 118_208);
-        assert_eq!(plan.zeroed_owner_bytes(), 9_286_322_180);
+        assert_eq!(plan.zeroed_owner_bytes(), 9_365_248_004);
         assert_eq!(plan.padding_bytes(), 15_676);
         assert_eq!(plan.initialized_bytes(), layout.arena_bytes());
     }
