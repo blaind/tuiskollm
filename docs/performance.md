@@ -156,6 +156,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- build-sm120` | Build the release device artifact and check entries, registers, stack, local, and shared bytes | terminal |
 | `cargo run -p xtask -- qualify-frontend SNAPSHOT` | Check exact template, tokenizer, streaming, and prefix-cache behavior | terminal |
 | `cargo run -p xtask -- qualify-generation SNAPSHOT` | Check prompt-to-sampling-to-streaming state over exact BF16 logit rows | terminal |
+| `cargo run -p tuisko-server-qual -- http://127.0.0.1:8000` | Check the live exact server's blocking and SSE contracts, greedy concurrency stability at request counts 1 through 8, cancellation, and eight-slot recycling | terminal |
 | `cargo run -p xtask -- qualify-residual-norm` | Run the independent numerical and graph-replay oracle | terminal |
 | `cargo run -p xtask -- qualify-qwen35-residual-norm` | Check Qwen3.5 zero-centered RMSNorm and fused residual publication at B=1..8 and T=32/64/128 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-residual-norm` | Check Qwen3.6 zero-centered RMSNorm and fused residual publication at B=1..8 and T=32/64/128 | terminal |
@@ -822,8 +823,11 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
   cold prompts and reused-prefix suffixes; an unmatched final span below 32 tokens primes through
   exact B1 decode.
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
-- There is no full-server TTFT, inter-token-latency, concurrency, prefix-reuse, or end-to-end MTP
-  benchmark in this repository yet. Direct long-context operator and resident-model timing exists.
+- External HTTP qualification covers blocking/SSE agreement, greedy stability across concurrent
+  request counts 1 through 8, cancellation, and slot recycling. It does not prove internal batch
+  occupancy and is not a timing benchmark. There is no full-server TTFT, inter-token-latency,
+  prefix-reuse, or end-to-end MTP benchmark in this repository yet. Direct long-context operator
+  and resident-model timing exists.
 - Power and energy are reportable for the resident model; full-server energy remains future work.
 - `ncu` and Nsight Systems traces are first-class diagnostic artifacts, but remain outside checked
   regression comparison and baseline blessing.

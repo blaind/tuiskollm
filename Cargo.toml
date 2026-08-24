@@ -24,6 +24,7 @@ members = [
     "crates/tuisko-targets",
     "crates/tuisko-serve",
     "qual",
+    "qual/server",
     "xtask",
 ]
 resolver = "3"

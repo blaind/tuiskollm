@@ -3471,6 +3471,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuisko-server-qual"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "tuisko-model",
+ "ureq",
+]
+
+[[package]]
 name = "tuisko-targets"
 version = "0.1.0"
 
