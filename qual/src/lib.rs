@@ -177,6 +177,8 @@ mod qwen35_nvfp4_swiglu_benchmark;
 #[cfg(feature = "device")]
 mod qwen35_paged_gqa_benchmark;
 #[cfg(feature = "device")]
+mod qwen35_resident_model;
+#[cfg(feature = "device")]
 mod qwen35_text_endpoint;
 #[cfg(feature = "device")]
 mod qwen35_text_endpoint_benchmark;
@@ -459,6 +461,11 @@ pub use qwen35_nvfp4_swiglu::qualify_qwen35_nvfp4_swiglu;
 pub use qwen35_nvfp4_swiglu_benchmark::benchmark_qwen35_nvfp4_swiglu;
 #[cfg(feature = "device")]
 pub use qwen35_paged_gqa_benchmark::{benchmark_mtp_bf16_paged_gqa, benchmark_qwen35_paged_gqa};
+#[cfg(feature = "device")]
+pub use qwen35_resident_model::{
+    Qwen35ResidentModelQualification, Qwen35ResidentModelQualificationError,
+    qualify_qwen35_resident_model,
+};
 #[cfg(feature = "device")]
 pub use qwen35_text_endpoint::{
     Qwen35TextEndpointQualification, Qwen35TextEndpointQualificationError,

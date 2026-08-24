@@ -119,6 +119,8 @@ pub use qwen35_full_attention_layer::{
 #[cfg(feature = "qualification")]
 pub use qwen35_gdn_layer::{Qwen35GdnLayerImmutable, Qwen35GdnLayerObservables};
 #[cfg(feature = "qualification")]
+pub use qwen35_resident_model::Qwen35ResidentModelObservables;
+#[cfg(feature = "qualification")]
 pub use qwen35_text_endpoint::Qwen35EndpointObservables;
 #[cfg(feature = "qualification")]
 pub use resident_model_layout::{
