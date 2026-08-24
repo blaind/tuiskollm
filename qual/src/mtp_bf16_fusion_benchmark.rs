@@ -214,7 +214,7 @@ pub fn benchmark_mtp_bf16_fusion(
         "qwen3_8/mtp/bf16_fusion/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.regions.workspace_bytes(),
-        "max_batch=8 embedding, hidden, both normalized seams, and projected output",
+        "max_tokens=1024 embedding, hidden, both normalized seams, and projected output",
     )?;
     memory.register_owned(
         "qwen3_8/mtp/bf16_fusion/alignment_padding",
@@ -256,8 +256,8 @@ mod tests {
         let (layout, regions) = layout().unwrap();
 
         assert_eq!(regions.weight_bytes(), 104_878_080);
-        assert_eq!(regions.workspace_bytes(), 409_600);
-        assert_eq!(regions.payload_bytes(), 105_287_680);
+        assert_eq!(regions.workspace_bytes(), 52_428_800);
+        assert_eq!(regions.payload_bytes(), 157_306_880);
         assert_eq!(layout.byte_len(), regions.payload_bytes());
         assert_eq!(logical_bytes(1), 104_949_760);
         assert_eq!(logical_bytes(MAX_BATCH), 105_451_520);
