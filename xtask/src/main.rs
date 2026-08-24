@@ -2717,7 +2717,7 @@ fn bench_qwen35_nvfp4_attention_output(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
@@ -2889,7 +2889,7 @@ fn bench_qwen35_paged_gqa(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120(root)?;
+    build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
         .join("release/bench-device");
