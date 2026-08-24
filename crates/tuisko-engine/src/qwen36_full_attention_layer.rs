@@ -153,6 +153,59 @@ impl Pointers {
             next_normalized: arena.address(regions.next_normalized)?,
         })
     }
+
+    #[cfg(feature = "qualification")]
+    fn addresses(self) -> Vec<usize> {
+        vec![
+            self.residual_input.addr(),
+            self.input_norm.addr(),
+            self.mixer_normalized.addr(),
+            self.qkv_activation_codes.addr(),
+            self.qkv_weight_codes.addr(),
+            self.qkv.addr(),
+            self.query_norm.addr(),
+            self.key_norm.addr(),
+            self.rope_cos.addr(),
+            self.rope_sin.addr(),
+            self.block_tables.addr(),
+            self.table_rows.addr(),
+            self.cache_positions.addr(),
+            self.lengths.addr(),
+            self.query.addr(),
+            self.key_pages.addr(),
+            self.value_pages.addr(),
+            self.attention.addr(),
+            self.output_activation.addr(),
+            self.output_activation_codes.addr(),
+            self.output_weight_codes.addr(),
+            self.mixer_branch.addr(),
+            self.post_attention_norm.addr(),
+            self.mixer_residual.addr(),
+            self.moe_normalized.addr(),
+            self.router_weight.addr(),
+            self.router_logits.addr(),
+            self.expert_indices.addr(),
+            self.routing_weights.addr(),
+            self.routed_gate_up_codes.addr(),
+            self.routed_gate_up_scales.addr(),
+            self.routed_gate_up_weight_scales_2.addr(),
+            self.routed_down_codes.addr(),
+            self.routed_down_scales.addr(),
+            self.routed_down_weight_scales_2.addr(),
+            self.shared_gate_up_codes.addr(),
+            self.shared_gate_up_scales.addr(),
+            self.shared_down_codes.addr(),
+            self.shared_down_scales.addr(),
+            self.shared_gate_weight.addr(),
+            self.expert_intermediate.addr(),
+            self.expert_output.addr(),
+            self.shared_gate.addr(),
+            self.moe_branch.addr(),
+            self.next_norm.addr(),
+            self.residual_output.addr(),
+            self.next_normalized.addr(),
+        ]
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -532,6 +585,204 @@ impl Qwen36FullAttentionLayerProgram {
         Ok(pointers.residual_output.cast_const())
     }
 
+    #[cfg(feature = "qualification")]
+    /// Launches the production route eagerly for graph-agreement qualification.
+    pub fn launch_eager(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
+        require_batch(batch)?;
+        launch_route(
+            stream,
+            batch,
+            self.ops(),
+            Pointers::bind(&self.arena, self.layout.regions())?,
+            self.scales,
+        )?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns one captured production graph.
+    pub fn qualification_graph(&self, batch: usize) -> EngineResult<&CudaGraph> {
+        require_batch(batch)?;
+        Ok(&self.graphs[batch - 1])
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Captures repeated production paths for high-resolution device timing.
+    pub fn qualification_repeated_graph(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        operations: u64,
+    ) -> EngineResult<CudaGraph> {
+        require_batch(batch)?;
+        if operations == 0 {
+            return Err(EngineError::route(
+                "repeated Qwen3.6 full-attention graph requires at least one operation",
+            ));
+        }
+        let pointers = Pointers::bind(&self.arena, self.layout.regions())?;
+        let ops = self.ops();
+        let scales = self.scales;
+
+        Ok(CudaGraph::capture(stream, || {
+            for _ in 0..operations {
+                launch_route(stream, batch, ops, pointers, scales)?;
+            }
+            Ok(())
+        })?)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns every stable arena address in layout order.
+    pub fn qualification_addresses(&self) -> EngineResult<Vec<usize>> {
+        Ok(Pointers::bind(&self.arena, self.layout.regions())?.addresses())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns exact scalar FP8 and shared-expert scales in launch order.
+    pub const fn qualification_source_scales(&self) -> [f32; 9] {
+        [
+            self.scales.qkv_input,
+            self.scales.qkv_weight[0],
+            self.scales.qkv_weight[1],
+            self.scales.qkv_weight[2],
+            self.scales.output_input,
+            self.scales.output_weight,
+            self.scales.shared_gate_up_weight,
+            self.scales.shared_down_weight,
+            Qwen36Moe35B::RMS_NORM_EPSILON,
+        ]
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Fills every non-cache mutable seam with one byte sentinel.
+    pub fn qualification_reset_outputs(&self, stream: &CudaStream, byte: u8) -> EngineResult<()> {
+        let regions = self.layout.regions();
+        for region in [
+            regions.mixer_normalized,
+            regions.qkv,
+            regions.output_activation,
+            regions.mixer_branch,
+            regions.mixer_residual,
+            regions.moe_normalized,
+            regions.router_logits,
+            regions.expert_indices,
+            regions.routing_weights,
+            regions.expert_intermediate,
+            regions.expert_output,
+            regions.shared_gate,
+            regions.moe_branch,
+            regions.residual_output,
+            regions.next_normalized,
+        ] {
+            self.arena.fill(stream, region, byte)?;
+        }
+        for region in [
+            regions.qkv_activation_codes,
+            regions.output_activation_codes,
+        ] {
+            self.arena.fill(stream, region, byte)?;
+        }
+        for region in [regions.query, regions.attention] {
+            self.arena.fill(stream, region, byte)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads every mutable seam, including complete persistent cache planes.
+    pub fn qualification_observables(
+        &self,
+        stream: &CudaStream,
+    ) -> EngineResult<Qwen36FullAttentionLayerObservables> {
+        let regions = self.layout.regions();
+
+        Ok(Qwen36FullAttentionLayerObservables {
+            mixer_normalized: self.arena.copy_to_host(stream, regions.mixer_normalized)?,
+            qkv_activation_codes: self
+                .arena
+                .copy_to_host(stream, regions.qkv_activation_codes)?,
+            qkv: self.arena.copy_to_host(stream, regions.qkv)?,
+            query: self.arena.copy_to_host(stream, regions.query)?,
+            key_pages: self.arena.copy_to_host(stream, regions.key_pages)?,
+            value_pages: self.arena.copy_to_host(stream, regions.value_pages)?,
+            attention: self.arena.copy_to_host(stream, regions.attention)?,
+            output_activation: self.arena.copy_to_host(stream, regions.output_activation)?,
+            output_activation_codes: self
+                .arena
+                .copy_to_host(stream, regions.output_activation_codes)?,
+            mixer_branch: self.arena.copy_to_host(stream, regions.mixer_branch)?,
+            mixer_residual: self.arena.copy_to_host(stream, regions.mixer_residual)?,
+            moe_normalized: self.arena.copy_to_host(stream, regions.moe_normalized)?,
+            router_logits: self.arena.copy_to_host(stream, regions.router_logits)?,
+            expert_indices: self.arena.copy_to_host(stream, regions.expert_indices)?,
+            routing_weights: self.arena.copy_to_host(stream, regions.routing_weights)?,
+            expert_intermediate: self
+                .arena
+                .copy_to_host(stream, regions.expert_intermediate)?,
+            expert_output: self.arena.copy_to_host(stream, regions.expert_output)?,
+            shared_gate: self.arena.copy_to_host(stream, regions.shared_gate)?,
+            moe_branch: self.arena.copy_to_host(stream, regions.moe_branch)?,
+            residual_output: self.arena.copy_to_host(stream, regions.residual_output)?,
+            next_normalized: self.arena.copy_to_host(stream, regions.next_normalized)?,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads every immutable device plane in source/materialized order.
+    pub fn qualification_immutable(
+        &self,
+        stream: &CudaStream,
+    ) -> EngineResult<Qwen36FullAttentionLayerImmutable> {
+        let regions = self.layout.regions();
+
+        Ok(Qwen36FullAttentionLayerImmutable {
+            input_norm: self.arena.copy_to_host(stream, regions.input_norm)?,
+            qkv_weight_codes: self.arena.copy_to_host(stream, regions.qkv_weight_codes)?,
+            query_norm: self.arena.copy_to_host(stream, regions.query_norm)?,
+            key_norm: self.arena.copy_to_host(stream, regions.key_norm)?,
+            output_weight_codes: self
+                .arena
+                .copy_to_host(stream, regions.output_weight_codes)?,
+            post_attention_norm: self
+                .arena
+                .copy_to_host(stream, regions.post_attention_norm)?,
+            router_weight: self.arena.copy_to_host(stream, regions.router_weight)?,
+            routed_gate_up_codes: self
+                .arena
+                .copy_to_host(stream, regions.routed_gate_up_codes)?,
+            routed_gate_up_scales: self
+                .arena
+                .copy_to_host(stream, regions.routed_gate_up_scales)?,
+            routed_gate_up_weight_scales_2: self
+                .arena
+                .copy_to_host(stream, regions.routed_gate_up_weight_scales_2)?,
+            routed_down_codes: self.arena.copy_to_host(stream, regions.routed_down_codes)?,
+            routed_down_scales: self
+                .arena
+                .copy_to_host(stream, regions.routed_down_scales)?,
+            routed_down_weight_scales_2: self
+                .arena
+                .copy_to_host(stream, regions.routed_down_weight_scales_2)?,
+            shared_gate_up_codes: self
+                .arena
+                .copy_to_host(stream, regions.shared_gate_up_codes)?,
+            shared_gate_up_scales: self
+                .arena
+                .copy_to_host(stream, regions.shared_gate_up_scales)?,
+            shared_down_codes: self.arena.copy_to_host(stream, regions.shared_down_codes)?,
+            shared_down_scales: self
+                .arena
+                .copy_to_host(stream, regions.shared_down_scales)?,
+            shared_gate_weight: self
+                .arena
+                .copy_to_host(stream, regions.shared_gate_weight)?,
+            next_norm: self.arena.copy_to_host(stream, regions.next_norm)?,
+        })
+    }
+
     fn ops(&self) -> Ops<'_> {
         Ops {
             norm: &self._norm,
@@ -543,6 +794,96 @@ impl Qwen36FullAttentionLayerProgram {
             experts: &self._experts,
         }
     }
+}
+
+#[cfg(feature = "qualification")]
+/// Complete mutable planes exposed to the qualification crate.
+pub struct Qwen36FullAttentionLayerObservables {
+    /// Pre-attention normalized rows.
+    pub mixer_normalized: Vec<u16>,
+    /// Static E4M3 QKV activation codes.
+    pub qkv_activation_codes: Vec<u8>,
+    /// Fused query/gate, key, and value rows.
+    pub qkv: Vec<u16>,
+    /// Prepared FP32 query heads.
+    pub query: Vec<f32>,
+    /// Complete represented BF16 key cache.
+    pub key_pages: Vec<u16>,
+    /// Complete represented BF16 value cache.
+    pub value_pages: Vec<u16>,
+    /// FP32 GQA output, gated in place by attention output.
+    pub attention: Vec<f32>,
+    /// Gated BF16 attention values.
+    pub output_activation: Vec<u16>,
+    /// Static E4M3 attention-output activation codes.
+    pub output_activation_codes: Vec<u8>,
+    /// Attention output-projection branch.
+    pub mixer_branch: Vec<u16>,
+    /// Residual after attention.
+    pub mixer_residual: Vec<u16>,
+    /// Pre-MoE normalized rows.
+    pub moe_normalized: Vec<u16>,
+    /// Router logits for all experts.
+    pub router_logits: Vec<u16>,
+    /// Selected top-eight expert indices.
+    pub expert_indices: Vec<u16>,
+    /// Renormalized top-eight routing weights.
+    pub routing_weights: Vec<u16>,
+    /// Routed and shared expert SwiGLU values.
+    pub expert_intermediate: Vec<u16>,
+    /// Routed and shared expert down-projection values.
+    pub expert_output: Vec<u16>,
+    /// Shared-expert gate logits.
+    pub shared_gate: Vec<u16>,
+    /// Combined routed plus shared MoE branch.
+    pub moe_branch: Vec<u16>,
+    /// Published layer residual rows.
+    pub residual_output: Vec<u16>,
+    /// Next-boundary normalized rows.
+    pub next_normalized: Vec<u16>,
+}
+
+#[cfg(feature = "qualification")]
+/// Immutable source-backed planes exposed to the qualification crate.
+pub struct Qwen36FullAttentionLayerImmutable {
+    /// Input RMSNorm weights.
+    pub input_norm: Vec<u16>,
+    /// Fused source E4M3 QKV weights.
+    pub qkv_weight_codes: Vec<u8>,
+    /// Per-head query RMSNorm weights.
+    pub query_norm: Vec<u16>,
+    /// Per-head key RMSNorm weights.
+    pub key_norm: Vec<u16>,
+    /// Source E4M3 attention-output weights.
+    pub output_weight_codes: Vec<u8>,
+    /// Post-attention RMSNorm weights.
+    pub post_attention_norm: Vec<u16>,
+    /// BF16 router weights.
+    pub router_weight: Vec<u16>,
+    /// Numeric-order routed gate/up E2M1 codes.
+    pub routed_gate_up_codes: Vec<u8>,
+    /// Swizzled routed gate/up E4M3 scales.
+    pub routed_gate_up_scales: Vec<u8>,
+    /// Routed gate/up second-stage scales.
+    pub routed_gate_up_weight_scales_2: Vec<f32>,
+    /// Numeric-order routed down E2M1 codes.
+    pub routed_down_codes: Vec<u8>,
+    /// Swizzled routed down E4M3 scales.
+    pub routed_down_scales: Vec<u8>,
+    /// Routed down second-stage scales.
+    pub routed_down_weight_scales_2: Vec<f32>,
+    /// Shared-expert gate/up E2M1 codes.
+    pub shared_gate_up_codes: Vec<u8>,
+    /// Shared-expert gate/up E4M3 scales.
+    pub shared_gate_up_scales: Vec<u8>,
+    /// Shared-expert down E2M1 codes.
+    pub shared_down_codes: Vec<u8>,
+    /// Shared-expert down E4M3 scales.
+    pub shared_down_scales: Vec<u8>,
+    /// BF16 shared-expert gate weights.
+    pub shared_gate_weight: Vec<u16>,
+    /// Next-boundary RMSNorm weights.
+    pub next_norm: Vec<u16>,
 }
 
 fn capture_routes(

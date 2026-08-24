@@ -132,6 +132,10 @@ pub use qwen35_resident_model::Qwen35ResidentModelObservables;
 #[cfg(feature = "qualification")]
 pub use qwen35_text_endpoint::Qwen35EndpointObservables;
 #[cfg(feature = "qualification")]
+pub use qwen36_full_attention_layer::{
+    Qwen36FullAttentionLayerImmutable, Qwen36FullAttentionLayerObservables,
+};
+#[cfg(feature = "qualification")]
 pub use qwen36_gdn_moe_layer::{Qwen36GdnMoeLayerImmutable, Qwen36GdnMoeLayerObservables};
 #[cfg(feature = "qualification")]
 pub use resident_model_layout::{

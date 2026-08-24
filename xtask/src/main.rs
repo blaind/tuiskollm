@@ -803,6 +803,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen35-full-attention-layer") => {
             qualify_qwen35_full_attention_layer(root, &remaining)
         }
+        Some("qualify-qwen36-full-attention-layer") => {
+            qualify_qwen36_full_attention_layer(root, &remaining)
+        }
         Some("qualify-qwen35-gdn-layer") => qualify_qwen35_gdn_layer(root, &remaining),
         Some("qualify-qwen36-gdn-moe-layer") => qualify_qwen36_gdn_moe_layer(root, &remaining),
         Some("qualify-resident-model") => qualify_resident_model(root, &remaining),
@@ -3359,6 +3362,47 @@ fn qualify_qwen36_gdn_moe_layer(
     gate_qwen35_gdn_prepare(root)?;
     gate_qwen35_gdn_recurrence(root)?;
     gate_qwen36_gdn_output(root)?;
+    gate_qwen36_moe_router(root)?;
+    gate_qwen36_moe_experts(root)
+}
+
+fn qualify_qwen36_full_attention_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err(
+            "usage: cargo run -p xtask -- qualify-qwen36-full-attention-layer SNAPSHOT".into(),
+        );
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen36_full_attention_layer::tests",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_qwen36_residual_norm(root)?;
+    gate_qwen36_fp8_qkv(root)?;
+    gate_qwen36_attention_qk_prepare(root)?;
+    gate_qwen36_paged_gqa(root)?;
+    gate_qwen36_attention_output(root)?;
     gate_qwen36_moe_router(root)?;
     gate_qwen36_moe_experts(root)
 }
