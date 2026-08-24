@@ -205,8 +205,9 @@ The server now selects this concrete target from the pinned revision directory a
 `nvidia/Qwen3.6-35B-A3B-NVFP4` through the OpenAI health, models, blocking chat, and SSE routes. A
 real localhost thinking-mode `Hello` request emits the two-token reasoning text `Here's`; blocking
 and SSE responses both report 11 prompt tokens, two completion tokens, `finish_reason=length`, and
-the exact model identity. Startup exposes one slot and the same 192-position limit rather than
-implying compact batching or native prefill support.
+the exact model identity. `xtask qualify-qwen36-server` makes those public-boundary checks
+repeatable and stops only the server child it starts. Startup exposes one slot and the same
+192-position limit rather than implying compact batching or native prefill support.
 
 ## Implementation order
 
