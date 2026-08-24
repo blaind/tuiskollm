@@ -74,6 +74,10 @@ mod long_context_paged_gqa_benchmark;
 mod mtp_bf16_fusion;
 #[cfg(feature = "device")]
 mod mtp_bf16_fusion_benchmark;
+#[cfg(feature = "device")]
+mod mtp_bf16_qkv;
+#[cfg(feature = "device")]
+mod mtp_bf16_qkv_benchmark;
 #[cfg(feature = "sm89")]
 mod nvfp4_down;
 #[cfg(feature = "device")]
@@ -249,6 +253,12 @@ pub use mtp_bf16_fusion::{
 };
 #[cfg(feature = "device")]
 pub use mtp_bf16_fusion_benchmark::benchmark_mtp_bf16_fusion;
+#[cfg(feature = "device")]
+pub use mtp_bf16_qkv::{
+    MtpBf16QkvQualification, MtpBf16QkvQualificationError, qualify_mtp_bf16_qkv,
+};
+#[cfg(feature = "device")]
+pub use mtp_bf16_qkv_benchmark::benchmark_mtp_bf16_qkv;
 #[cfg(any(feature = "device", feature = "sm89"))]
 pub use nvfp4_down::{Nvfp4DownQualification, Nvfp4DownQualificationError, qualify_nvfp4_down};
 #[cfg(any(feature = "device", feature = "sm89"))]
