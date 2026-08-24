@@ -41,7 +41,9 @@ It does not claim an in-process inference API; see [`python/README.md`](python/R
 `tuisko-engine` owns the exact 64-layer resident text program: all source-native weights, 48 GDN
 history/state pairs, one shared 3,438-page E4M3 KV pool across 16 attention layers, endpoint weights,
 one shared workspace, immutable whole-model CUDA Graphs for every `B=1..8` route, and exact
-from-empty prompt graphs at `T=32,64,128,1024`. Decode keeps
+prompt graphs at `T=32,64,128,1024`. Contiguous nonzero-prefix tiles retain shared T32/T64,
+select shared/P8/P16 attention for T128 by absolute context, and use the directly measured P4
+macro attention schedule for T1024. Decode keeps
 the short graph through 192 positions and selects one of six partitioned graph buckets above it,
 with an exact 220,000-position per-request ceiling. The shared 3,438-page pool is divided among
 active slots, so aggregate admission may refuse concurrent requests whose rounded page counts
@@ -58,7 +60,7 @@ token span and may skip only a prefix that the next prompt contains in full; div
 to cold priming. Fresh prompts of exactly `T=32,64,128,1024` use the corresponding whole-model
 prefill graph through both single-request and compact scheduler admission. Reused prefixes and
 other prompt lengths retain the qualified B=1 decode priming path; arbitrary prompt tiling is not
-silently inferred from the from-empty graphs. Vision inputs and MTP generation are not served yet
+yet wired into scheduler admission. Vision inputs and MTP generation are not served yet
 and are rejected or remain outside the HTTP contract rather than silently taking another route.
 
 The standalone SM120 operator inventory also includes partitioned paged GQA through 220,000
