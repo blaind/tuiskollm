@@ -50,18 +50,23 @@ active slots, so aggregate admission may refuse concurrent requests whose rounde
 exceed the pool. An allocation-free 113,454-byte host owner maintains the eight stable device-table
 rows, recycles physical pages between slots, and clears a reassigned page before publishing its new
 route. Compact active rows can address any distinct physical state/cache slots, and one slot can be
-reset without touching its survivors. The HTTP worker owns that scheduler and disconnecting a
-response cancels its resident request without moving survivors. Concrete single-slot and compact
-eight-request generation owners connect the admitted frontend, sampling, streaming decode, and
-resident graphs through the 220,000-position ceiling. The compact owner preserves the final emitted
-token as pending, packs only requests needing device work, cancels without advancing that pending
-token, and recycles holes without moving survivor state. Inactive slots retain their exact processed
-token span and may skip only a prefix that the next prompt contains in full; divergence falls back
-to cold priming. Single-request and compact scheduler admission greedily process cold prompts and
-reused-prefix suffixes with exact T1024, T128, T64, and T32 whole-model graphs. Only the final
-0--31 tokens retain the qualified B=1 path; the scheduler neither pads recurrent rows nor invents
-an unqualified chunk width. Vision inputs and MTP generation are not served yet
-and are rejected or remain outside the HTTP contract rather than silently taking another route.
+reset without touching its survivors. The HTTP worker owns the
+[qualified compact MTP scheduler](docs/mtp-design.md) and
+disconnecting a response cancels its resident request without moving survivors or demoting its MTP
+prefix. The MTP owner preserves the checkpoint's 849,398,784 represented BF16 weight bytes, mirrors
+the target page lifecycle in an 859.500 MiB BF16 cache, and uses the shared target LM head. Every
+request uses draft-three speculative generation, exact target verification at `K=1..4`, and compact
+`B=1..8` continuation and segmented-verify routes. One transaction can publish one through four
+streaming tokens per request; blocking and SSE responses retain that committed order.
+
+The compact owner preserves the final emitted token as pending, packs only requests needing device
+work, cancels without advancing that pending token, and recycles holes without moving survivor
+state. Inactive slots retain their exact processed target/MTP token span and may skip only a prefix
+that the next prompt contains in full; divergence falls back to cold priming. Admission greedily
+processes cold prompts and reused-prefix suffixes with exact T1024, T128, T64, and T32 whole-model
+graphs. Only the final 0--31 tokens retain the qualified B=1 path; the scheduler neither pads
+recurrent rows nor invents an unqualified chunk width. Vision inputs are not served yet and remain
+outside the HTTP contract rather than silently taking another route.
 
 The standalone SM120 operator inventory also includes partitioned paged GQA through 220,000
 positions at every exact `B=1..8` route. The resident program owns its maximum-B partial workspace

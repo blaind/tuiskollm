@@ -67,7 +67,8 @@ pub use resident_model_layout::{
     ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
 };
 pub use resident_mtp::{
-    ResidentMtpDraftRoute, ResidentMtpProgram, ResidentMtpPromptRoute, ResidentMtpRealignRoute,
+    ResidentMtpDraftRoute, ResidentMtpLoadStats, ResidentMtpProgram, ResidentMtpPromptRoute,
+    ResidentMtpRealignRoute,
 };
 pub use resident_mtp_batch_generation::{
     ResidentMtpBatchEvent, ResidentMtpBatchEvents, ResidentMtpBatchGenerator,

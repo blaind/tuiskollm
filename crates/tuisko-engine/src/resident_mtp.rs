@@ -3,9 +3,10 @@
 use crate::resident_mtp_layout::{MTP_PROMPT_ROWS, ResidentMtpCacheRegions, ResidentMtpRegions};
 use crate::{
     EngineError, EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, PagedKvTableUpdate,
-    ResidentModelProgram, ResidentMtpLayout,
+    ResidentLoadProgress, ResidentLoadStats, ResidentModelProgram, ResidentMtpLayout,
 };
 use std::sync::Arc;
+use std::time::Instant;
 use tuisko_gpu::{
     CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, PinnedHostBuffer,
 };
@@ -18,6 +19,67 @@ use tuisko_model::{Arch, CheckpointSnapshot, MtpBindings, Qwen38_27B, TextEndpoi
 const ROTARY_PAIRS: usize = 32;
 const PROMPT_ROUTES: [usize; 5] = [1, 32, 64, 128, MTP_PROMPT_ROWS];
 const REALIGN_ROUTES: usize = 4;
+
+/// Combined target-plus-MTP startup work exposed by the production server owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentMtpLoadStats {
+    upload_bytes: usize,
+    weight_load_ns: u64,
+    source_prefault_ns: u64,
+    graph_capture_ns: u64,
+    prefault_bytes: usize,
+}
+
+impl ResidentMtpLoadStats {
+    fn combine(
+        target: ResidentLoadStats,
+        mtp_upload_bytes: usize,
+        mtp_weight_load_ns: u64,
+        mtp_graph_capture_ns: u64,
+    ) -> EngineResult<Self> {
+        Ok(Self {
+            upload_bytes: target
+                .upload_bytes()
+                .checked_add(mtp_upload_bytes)
+                .ok_or_else(|| EngineError::layout("combined MTP upload bytes overflow"))?,
+            weight_load_ns: target
+                .weight_load_ns()
+                .checked_add(mtp_weight_load_ns)
+                .ok_or_else(|| EngineError::layout("combined MTP weight-load time overflows"))?,
+            source_prefault_ns: target.source_prefault_ns(),
+            graph_capture_ns: target
+                .graph_capture_ns()
+                .checked_add(mtp_graph_capture_ns)
+                .ok_or_else(|| EngineError::layout("combined MTP graph-capture time overflows"))?,
+            prefault_bytes: target.prefault_bytes(),
+        })
+    }
+
+    /// Exact source-backed and host-derived bytes uploaded into both resident owners.
+    pub const fn upload_bytes(self) -> usize {
+        self.upload_bytes
+    }
+
+    /// Combined target and MTP materialization and upload time.
+    pub const fn weight_load_ns(self) -> u64 {
+        self.weight_load_ns
+    }
+
+    /// Target source-mapping prefault time shared by both owners.
+    pub const fn source_prefault_ns(self) -> u64 {
+        self.source_prefault_ns
+    }
+
+    /// Combined target and MTP stable-graph capture time.
+    pub const fn graph_capture_ns(self) -> u64 {
+        self.graph_capture_ns
+    }
+
+    /// Immutable source-mapping bytes populated before either owner opens its source planes.
+    pub const fn prefault_bytes(self) -> usize {
+        self.prefault_bytes
+    }
+}
 
 /// Exact resident prompt-prime graph selected by a checked staging call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +188,7 @@ pub struct ResidentMtpProgram {
     layout: ResidentMtpLayout,
     base_address: u64,
     cache_base_address: u64,
+    load_stats: ResidentMtpLoadStats,
 }
 
 #[derive(Clone, Copy)]
@@ -379,7 +442,23 @@ impl ResidentMtpProgram {
     ) -> EngineResult<Self> {
         let (target, reservation) =
             ResidentModelProgram::from_snapshot_reserving_mtp(context, snapshot)?;
-        Self::from_target_reservation(target, reservation)
+        Self::from_target_reservation(target, reservation, None)
+    }
+
+    pub(crate) fn from_snapshot_with_progress(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+        progress: &ResidentLoadProgress,
+    ) -> EngineResult<Self> {
+        let mtp_upload_bytes = ResidentMtpLayout::build()?.resident_weight_bytes();
+        let (target, reservation) =
+            ResidentModelProgram::from_snapshot_reserving_mtp_with_progress(
+                context,
+                snapshot,
+                progress,
+                mtp_upload_bytes,
+            )?;
+        Self::from_target_reservation(target, reservation, Some(progress))
     }
 
     /// Adds one exact resident MTP owner around an already-loaded target program.
@@ -388,13 +467,15 @@ impl ResidentMtpProgram {
         let stream = context.new_stream().map_err(GpuError::from)?;
         let reservation = ResidentMtpArenaReservation::allocate(&stream)?;
         stream.synchronize().map_err(GpuError::from)?;
-        Self::from_target_reservation(target, reservation)
+        Self::from_target_reservation(target, reservation, None)
     }
 
     fn from_target_reservation(
         target: ResidentModelProgram,
         reservation: ResidentMtpArenaReservation,
+        progress: Option<&ResidentLoadProgress>,
     ) -> EngineResult<Self> {
+        let weight_start = Instant::now();
         let context = target.context().clone();
         let mtp = MtpBindings::bind(target.snapshot().as_ref())?;
         let qkv = mtp.materialize_qkv()?;
@@ -439,6 +520,12 @@ impl ResidentMtpProgram {
         )?;
         arena.copy_region_bytes_from_host(&stream, regions.down_weight, mtp.down_weight.bytes())?;
         arena.copy_region_bytes_from_host(&stream, regions.final_norm, mtp.final_norm.bytes())?;
+        if let Some(progress) = progress {
+            progress.submit(layout.resident_weight_bytes())?;
+            progress.finish_upload()?;
+        }
+        stream.synchronize().map_err(GpuError::from)?;
+        let mtp_weight_load_ns = elapsed_ns("resident MTP weight load", weight_start)?;
 
         let fusion = MtpBf16FusionOp::new(&context)?;
         let norm = ResidualNormOp::new(&context)?;
@@ -496,10 +583,21 @@ impl ResidentMtpProgram {
             rope_sin: &rope_sin_stager,
             continuation_hidden: &continuation_hidden_stager,
         };
+        let graph_start = Instant::now();
         let graphs = capture_graphs(&stream, &target, &arena, regions, pointers, ops, stagers)?;
         stream.synchronize().map_err(GpuError::from)?;
+        let mtp_graph_capture_ns = elapsed_ns("resident MTP graph capture", graph_start)?;
+        if let Some(progress) = progress {
+            progress.finish();
+        }
         let base_address = arena.base_address();
         let cache_base_address = cache_arena.base_address();
+        let load_stats = ResidentMtpLoadStats::combine(
+            target.load_stats(),
+            layout.resident_weight_bytes(),
+            mtp_weight_load_ns,
+            mtp_graph_capture_ns,
+        )?;
 
         Ok(Self {
             graphs,
@@ -524,6 +622,7 @@ impl ResidentMtpProgram {
             layout,
             base_address,
             cache_base_address,
+            load_stats,
         })
     }
 
@@ -1082,6 +1181,11 @@ impl ResidentMtpProgram {
             + self.rope_cos_stager.num_bytes()
             + self.rope_sin_stager.num_bytes()
             + self.continuation_hidden_stager.num_bytes()
+    }
+
+    /// Combined target-plus-MTP startup work used by the production server report.
+    pub const fn load_stats(&self) -> ResidentMtpLoadStats {
+        self.load_stats
     }
 
     /// Exact prompt, seeded draft, two continuation, prime, and realignment inventories.
@@ -2127,6 +2231,11 @@ fn copy_embedding_row(source: &[u8], token: usize, destination: &mut [u16]) -> E
 fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
     left.checked_mul(right)
         .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
+}
+
+fn elapsed_ns(phase: &str, started: Instant) -> EngineResult<u64> {
+    u64::try_from(started.elapsed().as_nanos())
+        .map_err(|_| EngineError::layout(format!("{phase} exceeds u64 nanoseconds")))
 }
 
 #[cfg(test)]

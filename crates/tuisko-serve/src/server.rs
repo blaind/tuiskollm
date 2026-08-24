@@ -22,7 +22,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
 use tokio::sync::oneshot;
 use tuisko_engine::{
-    MAX_BATCH, ResidentBatchGenerator, ResidentLoadPhase, ResidentLoadProgress, ResidentRequestId,
+    GenerationStep, MAX_BATCH, ResidentLoadPhase, ResidentLoadProgress, ResidentMtpBatchGenerator,
+    ResidentRequestId,
 };
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
@@ -31,6 +32,7 @@ const DEFAULT_SEED_SCRAMBLE: u64 = 0x9e37_79b9_7f4a_7c15;
 // Bounded so the single-threaded worker never blocks on a stalled client; a full
 // lane is treated exactly like a disconnected one.
 const GENERATION_REPLY_BUFFER: usize = 32;
+const GENERATION_ROUTE: &str = "mtp-draft-3";
 
 /// Startup configuration for the one exact resident server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,7 +220,7 @@ fn engine_worker(
             .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
         let checkpoint_admission = checkpoint_start.elapsed();
         let tensor_count = snapshot.tensor_count();
-        let generator = ResidentBatchGenerator::from_snapshot_device_zero_with_progress(
+        let generator = ResidentMtpBatchGenerator::from_snapshot_device_zero_with_progress(
             snapshot,
             progress.as_ref(),
         )
@@ -297,12 +299,10 @@ fn engine_worker(
             }
         };
         for event in events.iter() {
-            if let Some(reply) = replies.get(&event.request_id)
-                && let Some(delta) = &event.step.delta
-                && reply
-                    .try_send(GenerationReply::Delta(delta.clone()))
-                    .is_err()
-            {
+            let failed = replies
+                .get(&event.request_id)
+                .is_some_and(|reply| !try_send_generation_steps(reply, event.steps()));
+            if failed {
                 // Full or closed: drop the lane so the next cancel pass reaps the request.
                 replies.remove(&event.request_id);
             }
@@ -435,7 +435,7 @@ fn render_startup(ready: &Ready, total: Duration, address: SocketAddr, color: bo
     .expect("writing to a String cannot fail");
     writeln!(
         output,
-        "{ready_label}READY{reset}          {:>7.1} ms · http://{address} · {MAX_BATCH} slots · context {} · {:.2} GiB device · {:.2} MiB pinned",
+        "{ready_label}READY{reset}          {:>7.1} ms · http://{address} · {GENERATION_ROUTE} · {MAX_BATCH} slots · context {} · {:.2} GiB device · {:.2} MiB pinned",
         milliseconds(total),
         ready.context_capacity,
         gibibytes(ready.arena_bytes),
@@ -458,7 +458,7 @@ fn mebibytes(bytes: usize) -> f64 {
 }
 
 fn admit_job(
-    generator: &mut ResidentBatchGenerator,
+    generator: &mut ResidentMtpBatchGenerator,
     replies: &mut HashMap<ResidentRequestId, Sender<GenerationReply>>,
     job: Job,
 ) {
@@ -483,7 +483,7 @@ fn admit_job(
 }
 
 fn cancel_disconnected(
-    generator: &mut ResidentBatchGenerator,
+    generator: &mut ResidentMtpBatchGenerator,
     replies: &mut HashMap<ResidentRequestId, Sender<GenerationReply>>,
 ) -> Result<(), String> {
     let cancelled = generator
@@ -497,6 +497,22 @@ fn cancel_disconnected(
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn try_send_generation_steps<'a>(
+    reply: &Sender<GenerationReply>,
+    steps: impl IntoIterator<Item = &'a GenerationStep>,
+) -> bool {
+    for step in steps {
+        if let Some(delta) = &step.delta
+            && reply
+                .try_send(GenerationReply::Delta(delta.clone()))
+                .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn fail_all(replies: &mut HashMap<ResidentRequestId, Sender<GenerationReply>>, message: String) {
@@ -516,7 +532,7 @@ fn router(state: AppState) -> Router {
 
 async fn health(State(state): State<AppState>) -> Response {
     if state.worker_ready.load(Ordering::Acquire) {
-        Json(json!({"status": "ok"})).into_response()
+        Json(json!({"status": "ok", "generation_route": GENERATION_ROUTE})).into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -640,7 +656,7 @@ mod tests {
     use super::{
         AppState, EnqueueError, Job, Ready, ServerError, chat_completions, enqueue_job, health,
         models, render_loading, render_startup, render_weight_progress, router,
-        serve_until_worker_failure,
+        serve_until_worker_failure, try_send_generation_steps,
     };
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
     use axum::Json;
@@ -654,7 +670,7 @@ mod tests {
     use std::time::Duration;
     use tokio::runtime::Builder;
     use tokio::sync::mpsc::channel;
-    use tuisko_engine::ChatGenerationRequest;
+    use tuisko_engine::{ChatGenerationRequest, FinishReason, GenerationStep};
     use tuisko_frontend::ChatMessage;
 
     fn runtime() -> tokio::runtime::Runtime {
@@ -715,7 +731,7 @@ mod tests {
         assert!(lines[2].contains("53.0 ms · 18.00 GiB"));
         assert!(lines[3].contains("1604.6 ms · 19.00 GiB"));
         assert!(lines[4].contains("83.1 ms"));
-        assert!(lines[5].contains("1925.2 ms · http://127.0.0.1:8000"));
+        assert!(lines[5].contains("1925.2 ms · http://127.0.0.1:8000 · mtp-draft-3"));
         assert!(
             lines[5].contains("8 slots · context 220000 · 25.00 GiB device · 16.00 MiB pinned")
         );
@@ -787,6 +803,42 @@ mod tests {
     }
 
     #[test]
+    fn mtp_transaction_forwards_every_decoded_delta_in_order() {
+        let (reply, mut receiver) = channel(4);
+        let steps = [
+            GenerationStep {
+                token_id: 1,
+                delta: Some("one".into()),
+                finish_reason: None,
+            },
+            GenerationStep {
+                token_id: 2,
+                delta: None,
+                finish_reason: None,
+            },
+            GenerationStep {
+                token_id: 3,
+                delta: Some(" two".into()),
+                finish_reason: None,
+            },
+            GenerationStep {
+                token_id: 4,
+                delta: Some(" three".into()),
+                finish_reason: Some(FinishReason::Length),
+            },
+        ];
+
+        assert!(try_send_generation_steps(&reply, &steps));
+        let deltas = std::iter::from_fn(|| receiver.try_recv().ok())
+            .map(|reply| match reply {
+                GenerationReply::Delta(delta) => delta,
+                _ => panic!("MTP step adapter emitted a non-delta reply"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, ["one", " two", " three"]);
+    }
+
+    #[test]
     fn health_and_model_routes_name_the_exact_product() {
         runtime().block_on(async {
             let (jobs, _receiver) = channel(1);
@@ -795,6 +847,7 @@ mod tests {
             let body = to_bytes(ready.into_body(), 1 << 20).await.unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["status"], "ok");
+            assert_eq!(body["generation_route"], "mtp-draft-3");
 
             let (jobs, _receiver) = channel(1);
             let unavailable = health(State(state(jobs, false))).await;
