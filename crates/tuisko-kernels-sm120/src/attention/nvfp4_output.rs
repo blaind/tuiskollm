@@ -1,4 +1,4 @@
-//! Exact Qwen3.5 gated NVFP4 attention-output projection.
+//! Exact Qwen3.5 gated attention output and shared square NVFP4 projection.
 
 use crate::device::attention_output::attention_gate_bf16;
 use cuda_device::{
@@ -32,6 +32,10 @@ const _: () = assert!(OUTPUT_ROWS == 4_096);
 const _: () = assert!(GROUPS_PER_ROW == 256);
 const _: () = assert!(PHASES == 8);
 const _: () = assert!(SHARED_U32 * size_of::<u32>() == 8_192);
+
+fn admitted_batch(batch: usize) -> bool {
+    (1..=MAX_BATCH).contains(&batch)
+}
 
 #[cuda_module]
 mod kernels {
@@ -350,9 +354,49 @@ fn projection_launch_config() -> LaunchConfig1D {
     LaunchConfig1D::new((OUTPUT_ROWS / (2 * WARPS)) as u32, THREADS, 0)
 }
 
+struct PreparedProjectionRoute<const TOKENS: usize> {
+    projection: PreparedLaunch<kernels::__qwen35_nvfp4_attention_output_a16_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedProjectionRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let projection = module
+            .prepare_qwen35_nvfp4_attention_output_a16::<TOKENS>(projection_launch_config())
+            .map_err(|source| {
+                GpuError::launch("preparing Qwen3.5 square NVFP4 projection", source)
+            })?;
+
+        Ok(Self { projection })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        weight_reciprocal: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_nvfp4_attention_output_a16::<TOKENS>(
+                stream,
+                &self.projection,
+                input.cast::<u32>(),
+                weight_codes.cast::<u32>(),
+                weight_scales,
+                weight_reciprocal,
+                output,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.5 square NVFP4 projection", source))
+    }
+}
+
 struct PreparedRoute<const TOKENS: usize> {
     gate: PreparedLaunch<kernels::__qwen35_nvfp4_attention_output_gate_bf16_CudaKernel<TOKENS>>,
-    projection: PreparedLaunch<kernels::__qwen35_nvfp4_attention_output_a16_CudaKernel<TOKENS>>,
+    projection: PreparedProjectionRoute<TOKENS>,
 }
 
 impl<const TOKENS: usize> PreparedRoute<TOKENS> {
@@ -364,13 +408,11 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
                 0,
             ))
             .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 attention gate", source))?;
-        let projection = module
-            .prepare_qwen35_nvfp4_attention_output_a16::<TOKENS>(projection_launch_config())
-            .map_err(|source| {
-                GpuError::launch("preparing Qwen3.5 NVFP4 attention output", source)
-            })?;
 
-        Ok(Self { gate, projection })
+        Ok(Self {
+            gate,
+            projection: PreparedProjectionRoute::prepare(module)?,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -391,17 +433,112 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
                 stream, &self.gate, attention, qkv, activation,
             )
             .map_err(|source| GpuError::launch("launching Qwen3.5 NVFP4 attention gate", source))?;
-        module
-            .qwen35_nvfp4_attention_output_a16::<TOKENS>(
+        unsafe {
+            self.projection.launch(
+                module,
                 stream,
-                &self.projection,
-                activation.cast::<u32>(),
-                weight_codes.cast::<u32>(),
+                activation,
+                weight_codes,
                 weight_scales,
                 weight_reciprocal,
                 output,
             )
-            .map_err(|source| GpuError::launch("launching Qwen3.5 NVFP4 attention output", source))
+        }
+    }
+}
+
+/// Prepared square NVFP4 projections shared by Qwen3.5 attention and GDN output.
+pub struct Qwen35Nvfp4GdnOutputOp {
+    module: kernels::LoadedModule,
+    b1: PreparedProjectionRoute<1>,
+    b2: PreparedProjectionRoute<2>,
+    b3: PreparedProjectionRoute<3>,
+    b4: PreparedProjectionRoute<4>,
+    b5: PreparedProjectionRoute<5>,
+    b6: PreparedProjectionRoute<6>,
+    b7: PreparedProjectionRoute<7>,
+    b8: PreparedProjectionRoute<8>,
+}
+
+impl Qwen35Nvfp4GdnOutputOp {
+    /// Loads the shared projection module and prepares every exact batch.
+    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        let _ = qwen35_nvfp4_attention_output_ptx_names();
+        let module = unsafe { kernels::load(context) }.map_err(|source| {
+            GpuError::module("loading the Qwen3.5 SM120 NVFP4 output module", source)
+        })?;
+
+        Ok(Self {
+            b1: PreparedProjectionRoute::prepare(&module)?,
+            b2: PreparedProjectionRoute::prepare(&module)?,
+            b3: PreparedProjectionRoute::prepare(&module)?,
+            b4: PreparedProjectionRoute::prepare(&module)?,
+            b5: PreparedProjectionRoute::prepare(&module)?,
+            b6: PreparedProjectionRoute::prepare(&module)?,
+            b7: PreparedProjectionRoute::prepare(&module)?,
+            b8: PreparedProjectionRoute::prepare(&module)?,
+            module,
+        })
+    }
+
+    /// Projects gated GDN output through represented square NVFP4 weights.
+    ///
+    /// # Safety
+    ///
+    /// `input` and `output` cover `batch * 4_096` BF16 values. Weights cover
+    /// packed E2M1 `[4_096,4_096]` plus swizzled E4M3 `[4_096,256]`.
+    /// Four-byte-loaded planes are aligned, disjoint, context-local, and live
+    /// through stream completion.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 NVFP4 GDN-output weight scale divisor must be finite and positive",
+            ));
+        }
+        let reciprocal = 1.0 / weight_scale_divisor;
+        if !admitted_batch(batch) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 NVFP4 GDN-output batch {batch} is outside the exact range 1..={MAX_BATCH}"
+            )));
+        }
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        input,
+                        weight_codes,
+                        weight_scales,
+                        reciprocal,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match batch {
+            1 => launch!(b1),
+            2 => launch!(b2),
+            3 => launch!(b3),
+            4 => launch!(b4),
+            5 => launch!(b5),
+            6 => launch!(b6),
+            7 => launch!(b7),
+            8 => launch!(b8),
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -471,6 +608,11 @@ impl Qwen35Nvfp4AttentionOutputOp {
             ));
         }
         let reciprocal = 1.0 / weight_scale_divisor;
+        if !admitted_batch(batch) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 NVFP4 attention-output batch {batch} is outside the exact range 1..={MAX_BATCH}"
+            )));
+        }
 
         macro_rules! launch {
             ($route:ident) => {
@@ -499,9 +641,7 @@ impl Qwen35Nvfp4AttentionOutputOp {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
-            _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 NVFP4 attention-output batch {batch} is outside the exact range 1..={MAX_BATCH}"
-            ))),
+            _ => unreachable!(),
         }
     }
 }
@@ -531,7 +671,7 @@ pub(crate) fn qwen35_nvfp4_attention_output_ptx_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GROUPS_PER_ROW, MAX_BATCH, OUTPUT_ROWS, PHASES, SHARED_U32, WARPS,
+        GROUPS_PER_ROW, MAX_BATCH, OUTPUT_ROWS, PHASES, SHARED_U32, WARPS, admitted_batch,
         qwen35_nvfp4_attention_output_ptx_names,
     };
     use std::collections::BTreeSet;
@@ -543,6 +683,9 @@ mod tests {
         assert_eq!(PHASES, 8);
         assert_eq!(OUTPUT_ROWS / (2 * WARPS), 256);
         assert_eq!(SHARED_U32 * size_of::<u32>(), 8_192);
+        for (batch, expected) in [(0, false), (1, true), (8, true), (9, false)] {
+            assert_eq!(admitted_batch(batch), expected, "batch={batch}");
+        }
 
         let names = qwen35_nvfp4_attention_output_ptx_names();
         assert_eq!(names.len(), 2 * MAX_BATCH);
