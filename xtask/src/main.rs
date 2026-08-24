@@ -9,7 +9,8 @@ mod remote;
 use gpu_target::BuildTargetProfile;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -863,7 +864,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             Err(format!("`{known}` takes no arguments").into())
         }
         _ => Err(format!("unknown xtask command `{}`", command.to_string_lossy()).into()),
-    }
+    }?;
+
+    require_consumed_baseline_keys()
 }
 
 fn workspace_root() -> Result<&'static Path, Box<dyn Error>> {
@@ -8535,10 +8538,7 @@ fn gate_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-fn verify_generator_stamp(
-    root: &Path,
-    baseline: &BTreeMap<String, String>,
-) -> Result<(), Box<dyn Error>> {
+fn verify_generator_stamp(root: &Path, baseline: &Baseline) -> Result<(), Box<dyn Error>> {
     let backend = backend_path(root)?;
     let source = cuda_oxide_source(root, &backend)?;
     let commit = command_text("git", &["-C", path_text(&source)?, "rev-parse", "HEAD"])?;
@@ -8761,7 +8761,57 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn parse_baseline(text: &str) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+thread_local! {
+    static UNCONSUMED_BASELINE_KEYS: RefCell<BTreeSet<String>> =
+        const { RefCell::new(BTreeSet::new()) };
+}
+
+struct Baseline {
+    fields: BTreeMap<String, String>,
+    consumed: RefCell<BTreeSet<String>>,
+}
+
+impl Baseline {
+    fn contains_key(&self, key: &str) -> bool {
+        self.fields.contains_key(key)
+    }
+
+    fn get(&self, key: &str) -> Option<&String> {
+        self.consumed.borrow_mut().insert(key.to_string());
+        self.fields.get(key)
+    }
+}
+
+impl Drop for Baseline {
+    fn drop(&mut self) {
+        let consumed = self.consumed.borrow();
+        UNCONSUMED_BASELINE_KEYS.with(|unconsumed| {
+            unconsumed.borrow_mut().extend(
+                self.fields
+                    .keys()
+                    .filter(|key| !consumed.contains(*key))
+                    .cloned(),
+            );
+        });
+    }
+}
+
+fn require_consumed_baseline_keys() -> Result<(), Box<dyn Error>> {
+    let unconsumed =
+        UNCONSUMED_BASELINE_KEYS.with(|keys| std::mem::take(&mut *keys.borrow_mut()));
+    if unconsumed.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "resource baseline keys were never consumed by their gate (misspelled key?): {}",
+        unconsumed.into_iter().collect::<Vec<_>>().join(", ")
+    )
+    .into())
+}
+
+fn parse_baseline(text: &str) -> Result<Baseline, Box<dyn Error>> {
+    require_consumed_baseline_keys()?;
     let mut fields = BTreeMap::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let (key, value) = line
@@ -8770,14 +8820,13 @@ fn parse_baseline(text: &str) -> Result<BTreeMap<String, String>, Box<dyn Error>
         fields.insert(key.to_string(), value.to_string());
     }
 
-    Ok(fields)
+    Ok(Baseline {
+        fields,
+        consumed: RefCell::new(BTreeSet::new()),
+    })
 }
 
-fn require_stamp(
-    baseline: &BTreeMap<String, String>,
-    key: &str,
-    actual: &str,
-) -> Result<(), Box<dyn Error>> {
+fn require_stamp(baseline: &Baseline, key: &str, actual: &str) -> Result<(), Box<dyn Error>> {
     let expected = baseline
         .get(key)
         .ok_or_else(|| format!("baseline is missing `{key}`"))?;
@@ -8978,7 +9027,7 @@ fn require_spill_free(name: &str, resource: &Resource) -> Result<(), Box<dyn Err
 }
 
 fn require_registers(
-    baseline: &BTreeMap<String, String>,
+    baseline: &Baseline,
     key: &str,
     actual: &[u32],
 ) -> Result<(), Box<dyn Error>> {
@@ -8991,7 +9040,7 @@ fn require_registers(
 }
 
 fn require_uniform_value(
-    baseline: &BTreeMap<String, String>,
+    baseline: &Baseline,
     key: &str,
     actual: &[u32],
 ) -> Result<(), Box<dyn Error>> {
@@ -9009,13 +9058,12 @@ fn require_uniform_value(
 mod tests {
     use super::{
         COMPOSED_PERFORMANCE_SUITES, MTP_LAYER_RESOURCE_BASELINES, OptimizationSuite,
-        PERFORMANCE_SUITES, PerformanceSuite, SM120_RESOURCE_BASELINES, parse_compute_pids,
-        parse_cuda_toolkit_identity, parse_entries, parse_idle_sample,
+        PERFORMANCE_SUITES, PerformanceSuite, SM120_RESOURCE_BASELINES, parse_baseline,
+        parse_compute_pids, parse_cuda_toolkit_identity, parse_entries, parse_idle_sample,
         parse_performance_device_sample, parse_performance_iteration, parse_resources,
-        parse_rustc_identity, require_count, require_uniform_value, resolve_target_output,
-        sass_function_body,
+        parse_rustc_identity, require_consumed_baseline_keys, require_count, require_registers,
+        require_uniform_value, resolve_target_output, sass_function_body,
     };
-    use std::collections::BTreeMap;
     use std::ffi::OsString;
 
     #[test]
@@ -9076,10 +9124,28 @@ mod tests {
 
     #[test]
     fn shared_memory_contract_requires_one_value() {
-        let baseline = BTreeMap::from([("shared_bytes".to_string(), "1088".to_string())]);
+        let baseline = parse_baseline("shared_bytes=1088\n").unwrap();
 
         require_uniform_value(&baseline, "shared_bytes", &[1_088; 16]).unwrap();
         assert!(require_uniform_value(&baseline, "shared_bytes", &[1_088, 1_024]).is_err());
+    }
+
+    #[test]
+    fn unconsumed_baseline_keys_are_rejected() {
+        let baseline = parse_baseline("alpha_registers=80\nbeta_registers=96\n").unwrap();
+        assert!(!baseline.contains_key("beta_regs"));
+        require_registers(&baseline, "alpha_registers", &[80]).unwrap();
+        drop(baseline);
+
+        let error = require_consumed_baseline_keys().err().unwrap();
+        assert!(error.to_string().contains("beta_registers"));
+        assert!(!error.to_string().contains("alpha_registers"));
+        require_consumed_baseline_keys().unwrap();
+
+        let baseline = parse_baseline("alpha_registers=80\n").unwrap();
+        require_registers(&baseline, "alpha_registers", &[80]).unwrap();
+        drop(baseline);
+        require_consumed_baseline_keys().unwrap();
     }
 
     #[test]
