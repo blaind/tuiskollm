@@ -4572,7 +4572,11 @@ fn parse_idle_sample(row: &str) -> Result<(u32, u64), Box<dyn Error>> {
 
 fn sass_function_body<'a>(sass: &'a str, name: &str) -> Option<&'a str> {
     let marker = format!("Function : {name}");
-    let body = &sass[sass.find(&marker)? + marker.len()..];
+    let start = sass
+        .match_indices(&marker)
+        .map(|(index, _)| index + marker.len())
+        .find(|&end| sass[end..].lines().next().unwrap_or("").trim().is_empty())?;
+    let body = &sass[start..];
 
     Some(body.split("\n\t\tFunction :").next().unwrap_or(body))
 }
@@ -9217,5 +9221,17 @@ mod tests {
         );
         assert!(!sass_function_body(sass, "second").unwrap().contains("QMMA"));
         assert!(sass_function_body(sass, "missing").is_none());
+    }
+
+    #[test]
+    fn prefix_extension_names_never_alias() {
+        let sass = "\t\tFunction : foo_bar\nNOP;\n\
+                    \t\tFunction : foo\nQMMA.16832.F32.E4M3.E4M3 R0, R1, R2, R3;\n";
+
+        let body = sass_function_body(sass, "foo").unwrap();
+        assert!(body.contains("QMMA"));
+        assert!(!body.contains("NOP"));
+        assert!(sass_function_body(sass, "foo_bar").unwrap().contains("NOP"));
+        assert!(sass_function_body(sass, "foo_").is_none());
     }
 }
