@@ -120,7 +120,17 @@ weight bytes and 18,251,056 workspace/state bytes in one 507,955,968-byte arena.
 eager/graph agreement, inactive seam checks, immutable source checks, and zero post-warmup growth;
 B=1 additionally passes the complete represented source formula. At a diagnostic 2,107 MHz median
 SM clock, its direct graph measures 67.869/201.387 us at B=1/8. Full-attention layers, the endpoint,
-exact prefill experts, and model inference remain unimplemented.
+exact prefill experts, and model inference remain unimplemented. The full-attention source seam is
+now admitted separately: Q, K, and V preserve their E4M3 bytes and three scalar FP32 weight scales
+while losslessly gathering into one `[9216,2048]` Q/K/V plane; the source-native
+`[2048,4096]` output plane remains zero-copy. The first full-attention compute leaf statically
+quantizes BF16 inputs with the checkpoint's shared scalar input scale and projects every exact
+`B=1..8` route. It passes 73,728 activation-code, 331,776 FP64-formula output, 405,504 graph-replay,
+and 630,784 inactive-sentinel comparisons with immutable sources, stable addresses, and zero
+post-warmup growth. At a diagnostic 2,167 MHz median SM clock, its unblessed warm repeated path
+measures 8.064/21.350 us at B=1/8; the production graph boundary measures 10.240/22.544 us. Q/K
+normalization and RoPE, BF16 cache ownership, attention, gated output, and the full layer owner
+remain separate qualification slices.
 
 ## Implementation order
 

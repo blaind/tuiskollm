@@ -187,6 +187,10 @@ mod qwen35_text_endpoint;
 #[cfg(feature = "device")]
 mod qwen35_text_endpoint_benchmark;
 #[cfg(feature = "device")]
+mod qwen36_fp8_qkv;
+#[cfg(feature = "device")]
+mod qwen36_fp8_qkv_benchmark;
+#[cfg(feature = "device")]
 mod qwen36_gdn_input;
 #[cfg(feature = "device")]
 mod qwen36_gdn_input_benchmark;
@@ -510,6 +514,12 @@ pub use qwen35_text_endpoint::{
 };
 #[cfg(feature = "device")]
 pub use qwen35_text_endpoint_benchmark::benchmark_qwen35_text_endpoint;
+#[cfg(feature = "device")]
+pub use qwen36_fp8_qkv::{
+    Qwen36Fp8QkvQualification, Qwen36Fp8QkvQualificationError, qualify_qwen36_fp8_qkv,
+};
+#[cfg(feature = "device")]
+pub use qwen36_fp8_qkv_benchmark::benchmark_qwen36_fp8_qkv;
 #[cfg(feature = "device")]
 pub use qwen36_gdn_input::{
     Qwen36GdnInputQualification, Qwen36GdnInputQualificationError, qualify_qwen36_gdn_input,
