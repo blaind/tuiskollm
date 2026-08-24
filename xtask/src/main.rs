@@ -12486,14 +12486,54 @@ fn gate_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>>
                 .starts_with("qwen35_nvfp4_attention_output_a16_TID_")
         })
         .collect::<Vec<_>>();
+    let prefill_gates = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_nvfp4_attention_output_gate_bf16_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
+    let quantize = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_nvfp4_attention_output_quantize_TID_")
+        })
+        .collect::<Vec<_>>();
+    let w4a4 = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_nvfp4_attention_output_w4a4_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.5 NVFP4 attention-output gate", gates.len(), 8)?;
     require_count(
         "Qwen3.5 NVFP4 attention-output projection",
         projections.len(),
         8,
     )?;
+    require_count(
+        "Qwen3.5 NVFP4 attention-output prefill gate",
+        prefill_gates.len(),
+        3,
+    )?;
+    require_count(
+        "Qwen3.5 NVFP4 attention-output quantization",
+        quantize.len(),
+        3,
+    )?;
+    require_count("Qwen3.5 NVFP4 attention-output W4A4", w4a4.len(), 3)?;
 
-    for entry in gates.iter().chain(&projections) {
+    for entry in gates
+        .iter()
+        .chain(&projections)
+        .chain(&prefill_gates)
+        .chain(&quantize)
+    {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
@@ -12502,7 +12542,7 @@ fn gate_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>>
             .into());
         }
     }
-    for entry in &gates {
+    for entry in gates.iter().chain(&prefill_gates) {
         if !entry.body.contains("ex2.approx.f32") {
             return Err(format!("entry `{}` lost sigmoid EX2", entry.name).into());
         }
@@ -12510,6 +12550,25 @@ fn gate_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>>
     for entry in &projections {
         if !entry.body.contains("cvt.rn.f16x2.e2m1x2") {
             return Err(format!("entry `{}` lost represented E2M1 conversion", entry.name).into());
+        }
+    }
+    for entry in &w4a4 {
+        if !entry.body.contains(".reqntid 384, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 384-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        if !entry
+            .body
+            .contains("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X")
+        {
+            return Err(format!(
+                "entry `{}` lost its exact NVFP4 inline PTX instruction",
+                entry.name
+            )
+            .into());
         }
     }
 
@@ -12577,9 +12636,91 @@ fn gate_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>>
     require_uniform_value(&baseline, "gate_shared_bytes", &gate_shared)?;
     require_uniform_value(&baseline, "projection_shared_bytes", &projection_shared)?;
 
+    let mut prefill_gate_registers = Vec::new();
+    let mut prefill_quantize_registers = Vec::new();
+    let mut prefill_w4a4_registers = Vec::new();
+    let mut prefill_gate_shared = Vec::new();
+    let mut prefill_quantize_shared = Vec::new();
+    let mut prefill_w4a4_shared = Vec::new();
+    for (routes, registers, shared, label, required_sass) in [
+        (
+            &prefill_gates,
+            &mut prefill_gate_registers,
+            &mut prefill_gate_shared,
+            "prefill gate",
+            None,
+        ),
+        (
+            &quantize,
+            &mut prefill_quantize_registers,
+            &mut prefill_quantize_shared,
+            "prefill quantization",
+            None,
+        ),
+        (
+            &w4a4,
+            &mut prefill_w4a4_registers,
+            &mut prefill_w4a4_shared,
+            "W4A4 prefill projection",
+            Some("OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X"),
+        ),
+    ] {
+        for entry in routes {
+            let resource = resources.get(entry.name).ok_or_else(|| {
+                format!(
+                    "cuobjdump omitted Qwen3.5 NVFP4 attention-output {label} `{}`",
+                    entry.name
+                )
+            })?;
+            require_spill_free(entry.name, resource)?;
+            let body = sass_function_body(&sass, entry.name).ok_or_else(|| {
+                format!(
+                    "cuobjdump omitted Qwen3.5 NVFP4 attention-output {label} SASS `{}`",
+                    entry.name
+                )
+            })?;
+            if let Some(instruction) = required_sass
+                && !body.contains(instruction)
+            {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+            registers.push(resource.registers);
+            shared.push(resource.shared);
+        }
+        registers.sort_unstable();
+        shared.sort_unstable();
+    }
+    if baseline.contains_key("prefill_gate_registers") {
+        require_registers(&baseline, "prefill_gate_registers", &prefill_gate_registers)?;
+        require_uniform_value(&baseline, "prefill_gate_shared_bytes", &prefill_gate_shared)?;
+        require_registers(
+            &baseline,
+            "prefill_quantize_registers",
+            &prefill_quantize_registers,
+        )?;
+        require_uniform_value(
+            &baseline,
+            "prefill_quantize_shared_bytes",
+            &prefill_quantize_shared,
+        )?;
+        require_registers(&baseline, "prefill_w4a4_registers", &prefill_w4a4_registers)?;
+        require_uniform_value(&baseline, "prefill_w4a4_shared_bytes", &prefill_w4a4_shared)?;
+    }
+
     println!(
-        "Qwen3.5 NVFP4 attention-output gate passed: 8 gate + 8 projection entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}, EX2/E2M1 present",
-        gate_registers, projection_registers, gate_shared, projection_shared
+        "Qwen3.5 NVFP4 attention-output gate passed: 8 gate + 8 A16 + 3 prefill gate + 3 quantize + 3 W4A4 entries, REG {:?} / {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?} / {:?} / {:?}, EX2/E2M1/OMMA present",
+        gate_registers,
+        projection_registers,
+        prefill_gate_registers,
+        prefill_quantize_registers,
+        prefill_w4a4_registers,
+        gate_shared,
+        projection_shared,
+        prefill_gate_shared,
+        prefill_quantize_shared,
+        prefill_w4a4_shared,
     );
     Ok(())
 }

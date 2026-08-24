@@ -10,6 +10,8 @@ use tuisko_gpu::{
 use tuisko_model::{Arch, Qwen35_9B};
 
 pub(crate) const MAX_BATCH: usize = 8;
+pub(crate) const MAX_ROWS: usize = 128;
+pub(crate) const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 const ALIGNMENT: usize = 256;
 pub(crate) const COLUMNS: usize = Qwen35_9B::ATTENTION_OUTPUT_COLUMNS;
 pub(crate) const QKV_ROWS: usize = Qwen35_9B::ATTENTION_QKV_ROWS;
@@ -17,6 +19,7 @@ pub(crate) const OUTPUT_ROWS: usize = Qwen35_9B::HIDDEN;
 const GROUP: usize = 16;
 pub(crate) const GROUPS_PER_ROW: usize = COLUMNS / GROUP;
 pub(crate) const CODE_BYTES_PER_ROW: usize = COLUMNS / 2;
+pub(crate) const INPUT_SCALE_DIVISOR: f32 = 3.0;
 pub(crate) const WEIGHT_SCALE_DIVISOR: f32 = 16.0;
 const BYTE_SENTINEL: u8 = 0xa5;
 const BF16_SENTINEL: u16 = 0xa5a5;
@@ -53,6 +56,10 @@ pub struct Qwen35Nvfp4AttentionOutputQualification {
     pub gated_values: usize,
     /// BF16 projection inputs compared bit-exactly.
     pub activation_values: usize,
+    /// Exact represented activation codes produced by prompt quantization.
+    pub activation_codes: usize,
+    /// Exact E4M3 activation scales produced by prompt quantization.
+    pub activation_scales: usize,
     /// BF16 outputs compared with the represented-value oracle.
     pub output_values: usize,
     /// Complete mutable seams reproduced by CUDA Graph replay.
@@ -80,6 +87,8 @@ pub(crate) struct Regions {
     pub(crate) attention: ArenaRegion<f32>,
     pub(crate) qkv: ArenaRegion<u16>,
     pub(crate) activation: ArenaRegion<u16>,
+    pub(crate) activation_codes: ArenaRegion<u8>,
+    pub(crate) activation_scales: ArenaRegion<u8>,
     pub(crate) weight_codes: ArenaRegion<u8>,
     pub(crate) weight_scales: ArenaRegion<u8>,
     pub(crate) output: ArenaRegion<u16>,
@@ -94,6 +103,8 @@ impl Regions {
         self.attention.byte_len()
             + self.qkv.byte_len()
             + self.activation.byte_len()
+            + self.activation_codes.byte_len()
+            + self.activation_scales.byte_len()
             + self.weight_bytes()
             + self.output.byte_len()
     }
@@ -105,6 +116,8 @@ pub(crate) struct Fixture {
     gated: Vec<f32>,
     pub(crate) activation_bf16: Vec<u16>,
     pub(crate) activation_f32: Vec<f32>,
+    activation_codes: Vec<u8>,
+    activation_scales: Vec<u8>,
     pub(crate) weight_codes: Vec<u8>,
     pub(crate) weight_scales: Vec<u8>,
 }
@@ -112,10 +125,18 @@ pub(crate) struct Fixture {
 struct Observed {
     attention: Vec<f32>,
     activation: Vec<u16>,
+    activation_codes: Vec<u8>,
+    activation_scales: Vec<u8>,
     output: Vec<u16>,
 }
 
-/// Qualifies eager and captured Qwen3.5 attention output at exact `B=1..=8`.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Schedule {
+    A16,
+    W4a4,
+}
+
+/// Qualifies eager and captured Qwen3.5 attention output at every exact route.
 pub fn qualify_qwen35_nvfp4_attention_output()
 -> Result<Qwen35Nvfp4AttentionOutputQualification, Qwen35Nvfp4AttentionOutputQualificationError> {
     let _preflight = device_benchmark::preflight()?;
@@ -134,12 +155,14 @@ pub fn qualify_qwen35_nvfp4_attention_output()
     let (layout, regions) = layout()?;
     let arena = DeviceArena::zeroed(&stream, &layout)?;
     let op = Qwen35Nvfp4AttentionOutputOp::new(&context)?;
-    let fixture = make_fixture();
+    let fixture = make_fixture()?;
     load_immutable(&arena, &stream, regions, &fixture)?;
     let stable_addresses = addresses(&arena, regions)?;
     let mut report = Qwen35Nvfp4AttentionOutputQualification {
         gated_values: 0,
         activation_values: 0,
+        activation_codes: 0,
+        activation_scales: 0,
         output_values: 0,
         graph_replay_values: 0,
         inactive_values: 0,
@@ -152,24 +175,28 @@ pub fn qualify_qwen35_nvfp4_attention_output()
         maximum_projection_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
-        reset(&arena, &stream, regions, &fixture, batch)?;
-        launch(&op, &arena, &stream, regions, batch)?;
+    for rows in EXACT_ROUTES {
+        let schedule = schedule(rows);
+        reset(&arena, &stream, regions, &fixture, rows)?;
+        launch(&op, &arena, &stream, regions, rows)?;
         let eager = observe(&arena, &stream, regions)?;
-        verify_eager(batch, &fixture, &eager, &mut report)?;
+        verify_eager(rows, schedule, &fixture, &eager, &mut report)?;
 
-        reset(&arena, &stream, regions, &fixture, batch)?;
+        reset(&arena, &stream, regions, &fixture, rows)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
+        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, rows))?;
         // SAFETY: every allocation this graph captured is owned by this scope or
         // its caller and outlives the replays and the synchronize that follows.
         unsafe { graph.launch(&stream) }?;
         let replay = observe(&arena, &stream, regions)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay(rows, schedule, &eager, &replay, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(
-                format!("device addresses changed while qualifying B={batch}"),
+                format!(
+                    "device addresses changed while qualifying {}",
+                    route_name(rows)
+                ),
             ));
         }
     }
@@ -183,12 +210,14 @@ pub fn qualify_qwen35_nvfp4_attention_output()
 
 pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let attention = layout.reserve(MAX_BATCH * COLUMNS, ALIGNMENT)?;
-    let qkv = layout.reserve(MAX_BATCH * QKV_ROWS, ALIGNMENT)?;
-    let activation = layout.reserve(MAX_BATCH * COLUMNS, ALIGNMENT)?;
+    let attention = layout.reserve(MAX_ROWS * COLUMNS, ALIGNMENT)?;
+    let qkv = layout.reserve(MAX_ROWS * QKV_ROWS, ALIGNMENT)?;
+    let activation = layout.reserve(MAX_ROWS * COLUMNS, ALIGNMENT)?;
+    let activation_codes = layout.reserve(MAX_ROWS * CODE_BYTES_PER_ROW, ALIGNMENT)?;
+    let activation_scales = layout.reserve(MAX_ROWS * GROUPS_PER_ROW, ALIGNMENT)?;
     let weight_codes = layout.reserve(OUTPUT_ROWS * CODE_BYTES_PER_ROW, ALIGNMENT)?;
     let weight_scales = layout.reserve(OUTPUT_ROWS * GROUPS_PER_ROW, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * OUTPUT_ROWS, ALIGNMENT)?;
+    let output = layout.reserve(MAX_ROWS * OUTPUT_ROWS, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -196,6 +225,8 @@ pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
             attention,
             qkv,
             activation,
+            activation_codes,
+            activation_scales,
             weight_codes,
             weight_scales,
             output,
@@ -203,11 +234,13 @@ pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     ))
 }
 
-fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 6]> {
+fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 8]> {
     Ok([
         arena.address(regions.attention)?.addr(),
         arena.address(regions.qkv)?.addr(),
         arena.address(regions.activation)?.addr(),
+        arena.address(regions.activation_codes)?.addr(),
+        arena.address(regions.activation_scales)?.addr(),
         arena.address(regions.weight_codes)?.addr(),
         arena.address(regions.weight_scales)?.addr(),
         arena.address(regions.output)?.addr(),
@@ -239,6 +272,8 @@ fn reset(
         &fixture.attention[..batch * COLUMNS],
     )?;
     arena.fill(stream, regions.activation, BYTE_SENTINEL)?;
+    arena.fill(stream, regions.activation_codes, BYTE_SENTINEL)?;
+    arena.fill(stream, regions.activation_scales, BYTE_SENTINEL)?;
     arena.fill(stream, regions.output, BYTE_SENTINEL)
 }
 
@@ -247,20 +282,37 @@ fn launch(
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     unsafe {
-        op.launch(
-            stream,
-            batch,
-            arena.address(regions.attention)?,
-            arena.address(regions.qkv)?,
-            arena.address(regions.activation)?,
-            arena.address(regions.weight_codes)?,
-            arena.address(regions.weight_scales)?,
-            WEIGHT_SCALE_DIVISOR,
-            arena.address(regions.output)?,
-        )
+        if rows <= MAX_BATCH {
+            op.launch(
+                stream,
+                rows,
+                arena.address(regions.attention)?,
+                arena.address(regions.qkv)?,
+                arena.address(regions.activation)?,
+                arena.address(regions.weight_codes)?,
+                arena.address(regions.weight_scales)?,
+                WEIGHT_SCALE_DIVISOR,
+                arena.address(regions.output)?,
+            )
+        } else {
+            op.launch_prefill(
+                stream,
+                rows,
+                arena.address(regions.attention)?,
+                arena.address(regions.qkv)?,
+                arena.address(regions.activation)?,
+                arena.address(regions.activation_codes)?,
+                arena.address(regions.activation_scales)?,
+                arena.address(regions.weight_codes)?,
+                arena.address(regions.weight_scales)?,
+                INPUT_SCALE_DIVISOR,
+                WEIGHT_SCALE_DIVISOR,
+                arena.address(regions.output)?,
+            )
+        }
     }
 }
 
@@ -268,19 +320,21 @@ fn observe(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuRes
     Ok(Observed {
         attention: arena.copy_to_host(stream, regions.attention)?,
         activation: arena.copy_to_host(stream, regions.activation)?,
+        activation_codes: arena.copy_to_host(stream, regions.activation_codes)?,
+        activation_scales: arena.copy_to_host(stream, regions.activation_scales)?,
         output: arena.copy_to_host(stream, regions.output)?,
     })
 }
 
-pub(crate) fn make_fixture() -> Fixture {
-    let attention = (0..MAX_BATCH * COLUMNS)
+pub(crate) fn make_fixture() -> Result<Fixture, Qwen35Nvfp4AttentionOutputQualificationError> {
+    let attention = (0..MAX_ROWS * COLUMNS)
         .map(|index| {
             let token = index / COLUMNS;
-            ATTENTION_PATTERN[index & (GROUP - 1)] * TOKEN_FACTORS[token]
+            ATTENTION_PATTERN[index & (GROUP - 1)] * TOKEN_FACTORS[token & 7]
         })
         .collect::<Vec<_>>();
-    let mut qkv = vec![BF16_SENTINEL; MAX_BATCH * QKV_ROWS];
-    for token in 0..MAX_BATCH {
+    let mut qkv = vec![BF16_SENTINEL; MAX_ROWS * QKV_ROWS];
+    for token in 0..MAX_ROWS {
         for head in 0..Qwen35_9B::NUM_ATTENTION_HEADS {
             for dimension in 0..Qwen35_9B::HEAD_DIM {
                 let gate = token * QKV_ROWS
@@ -305,17 +359,55 @@ pub(crate) fn make_fixture() -> Fixture {
         .copied()
         .map(bf16_to_f32)
         .collect::<Vec<_>>();
+    let (activation_codes, activation_scales) = quantize_oracle(&activation_f32)?;
     let (weight_codes, weight_scales) = make_weights();
 
-    Fixture {
+    Ok(Fixture {
         attention,
         qkv,
         gated,
         activation_bf16,
         activation_f32,
+        activation_codes,
+        activation_scales,
         weight_codes,
         weight_scales,
+    })
+}
+
+fn quantize_oracle(
+    input: &[f32],
+) -> Result<(Vec<u8>, Vec<u8>), Qwen35Nvfp4AttentionOutputQualificationError> {
+    let tokens = input.len() / COLUMNS;
+    let mut codes = vec![0u8; tokens * CODE_BYTES_PER_ROW];
+    let mut scales = vec![0u8; tokens * GROUPS_PER_ROW];
+
+    for token in 0..tokens {
+        for group in 0..GROUPS_PER_ROW {
+            let input_begin = token * COLUMNS + group * GROUP;
+            let values = &input[input_begin..input_begin + GROUP];
+            let maximum = values
+                .iter()
+                .fold(0.0f32, |current, value| current.max(value.abs()));
+            let scale = encode_e4m3fn(INPUT_SCALE_DIVISOR * maximum / 6.0)?;
+            scales[token * GROUPS_PER_ROW + group] = scale;
+            if scale == 0 {
+                continue;
+            }
+
+            let decoded_scale = decode_e4m3fn(scale).map_err(|error| {
+                Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(error.to_string())
+            })?;
+            for pair in 0..GROUP / 2 {
+                let low = encode_e2m1(values[2 * pair] * INPUT_SCALE_DIVISOR / decoded_scale);
+                let high = encode_e2m1(values[2 * pair + 1] * INPUT_SCALE_DIVISOR / decoded_scale);
+                let destination = token * CODE_BYTES_PER_ROW + group * (GROUP / 2) + pair;
+                codes[destination] = low | (high << 4);
+            }
+        }
     }
+
+    Ok((codes, scales))
 }
 
 fn make_weights() -> (Vec<u8>, Vec<u8>) {
@@ -352,12 +444,14 @@ fn make_weights() -> (Vec<u8>, Vec<u8>) {
 }
 
 fn verify_eager(
-    batch: usize,
+    rows: usize,
+    schedule: Schedule,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut Qwen35Nvfp4AttentionOutputQualification,
 ) -> Result<(), Qwen35Nvfp4AttentionOutputQualificationError> {
-    for token in 0..batch {
+    verify_scratch(rows, schedule, fixture, observed)?;
+    for token in 0..rows {
         let begin = token * COLUMNS;
         for column in 0..COLUMNS {
             let actual = observed.attention[begin + column];
@@ -368,7 +462,8 @@ fn verify_eager(
             if !actual.is_finite() || error > tolerance {
                 return Err(Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(
                     format!(
-                        "B={batch} gated token={token}, column={column}: device={actual}, oracle={expected}, tolerance={tolerance}"
+                        "{} gated token={token}, column={column}: device={actual}, oracle={expected}, tolerance={tolerance}",
+                        route_name(rows)
                     ),
                 ));
             }
@@ -379,11 +474,14 @@ fn verify_eager(
             .position(|(actual, expected)| actual != expected)
         {
             return Err(Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(
-                format!("B={batch} BF16 activation token={token}, column={column} differs"),
+                format!(
+                    "{} BF16 activation token={token}, column={column} differs",
+                    route_name(rows)
+                ),
             ));
         }
         for row in 0..OUTPUT_ROWS {
-            let expected = dot_oracle(token, row, fixture)?;
+            let expected = dot_oracle_for_schedule(token, row, schedule, fixture)?;
             let actual = f64::from(bf16_to_f32(observed.output[token * OUTPUT_ROWS + row]));
             let error = (actual - expected).abs();
             let tolerance = 0.25f64.max(expected.abs() * 0.025);
@@ -391,24 +489,30 @@ fn verify_eager(
             if !actual.is_finite() || error > tolerance {
                 return Err(Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(
                     format!(
-                        "B={batch} output token={token}, row={row}: device={actual}, oracle={expected}, tolerance={tolerance}"
+                        "{} output token={token}, row={row}: device={actual}, oracle={expected}, tolerance={tolerance}",
+                        route_name(rows)
                     ),
                 ));
             }
         }
     }
 
-    verify_inactive(batch, observed)?;
-    report.gated_values += batch * COLUMNS;
-    report.activation_values += batch * COLUMNS;
-    report.output_values += batch * OUTPUT_ROWS;
-    report.inactive_values += inactive_values(batch);
+    verify_inactive(rows, schedule, observed)?;
+    report.gated_values += rows * COLUMNS;
+    report.activation_values += rows * COLUMNS;
+    if schedule == Schedule::W4a4 {
+        report.activation_codes += rows * CODE_BYTES_PER_ROW;
+        report.activation_scales += rows * GROUPS_PER_ROW;
+    }
+    report.output_values += rows * OUTPUT_ROWS;
+    report.inactive_values += inactive_values(rows, schedule);
 
     Ok(())
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
+    schedule: Schedule,
     eager: &Observed,
     replay: &Observed,
     report: &mut Qwen35Nvfp4AttentionOutputQualification,
@@ -419,45 +523,140 @@ fn verify_replay(
         .map(|value| value.to_bits())
         .eq(eager.attention.iter().map(|value| value.to_bits()))
         && replay.activation == eager.activation
+        && replay.activation_codes == eager.activation_codes
+        && replay.activation_scales == eager.activation_scales
         && replay.output == eager.output;
     if !same {
         return Err(Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(
-            format!("B={batch} graph replay differs from eager execution"),
+            format!(
+                "{} graph replay differs from eager execution",
+                route_name(rows)
+            ),
         ));
     }
-    verify_inactive(batch, replay)?;
-    report.graph_replay_values += batch * (2 * COLUMNS + OUTPUT_ROWS);
-    report.inactive_values += inactive_values(batch);
+    verify_inactive(rows, schedule, replay)?;
+    report.graph_replay_values += rows * (2 * COLUMNS + OUTPUT_ROWS);
+    if schedule == Schedule::W4a4 {
+        report.graph_replay_values += rows * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
+    }
+    report.inactive_values += inactive_values(rows, schedule);
+
+    Ok(())
+}
+
+fn verify_scratch(
+    rows: usize,
+    schedule: Schedule,
+    fixture: &Fixture,
+    observed: &Observed,
+) -> Result<(), Qwen35Nvfp4AttentionOutputQualificationError> {
+    let active_codes = if schedule == Schedule::W4a4 {
+        rows * CODE_BYTES_PER_ROW
+    } else {
+        0
+    };
+    let active_scales = if schedule == Schedule::W4a4 {
+        rows * GROUPS_PER_ROW
+    } else {
+        0
+    };
+    if let Some(index) = observed.activation_codes[..active_codes]
+        .iter()
+        .zip(&fixture.activation_codes[..active_codes])
+        .position(|(actual, expected)| actual != expected)
+    {
+        return Err(Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(
+            format!(
+                "{} activation code {index}: device={:#04x}, oracle={:#04x}",
+                route_name(rows),
+                observed.activation_codes[index],
+                fixture.activation_codes[index]
+            ),
+        ));
+    }
+    if let Some(index) = observed.activation_scales[..active_scales]
+        .iter()
+        .zip(&fixture.activation_scales[..active_scales])
+        .position(|(actual, expected)| actual != expected)
+    {
+        return Err(Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(
+            format!(
+                "{} activation scale {index}: device={:#04x}, oracle={:#04x}",
+                route_name(rows),
+                observed.activation_scales[index],
+                fixture.activation_scales[index]
+            ),
+        ));
+    }
 
     Ok(())
 }
 
 fn verify_inactive(
-    batch: usize,
+    rows: usize,
+    schedule: Schedule,
     observed: &Observed,
 ) -> Result<(), Qwen35Nvfp4AttentionOutputQualificationError> {
-    let columns_begin = batch * COLUMNS;
-    let output_begin = batch * OUTPUT_ROWS;
+    let columns_begin = rows * COLUMNS;
+    let code_begin = if schedule == Schedule::W4a4 {
+        rows * CODE_BYTES_PER_ROW
+    } else {
+        0
+    };
+    let scale_begin = if schedule == Schedule::W4a4 {
+        rows * GROUPS_PER_ROW
+    } else {
+        0
+    };
+    let output_begin = rows * OUTPUT_ROWS;
     if observed.attention[columns_begin..]
         .iter()
         .any(|value| value.to_bits() != F32_SENTINEL_BITS)
         || observed.activation[columns_begin..]
             .iter()
             .any(|&value| value != BF16_SENTINEL)
+        || observed.activation_codes[code_begin..]
+            .iter()
+            .any(|&value| value != BYTE_SENTINEL)
+        || observed.activation_scales[scale_begin..]
+            .iter()
+            .any(|&value| value != BYTE_SENTINEL)
         || observed.output[output_begin..]
             .iter()
             .any(|&value| value != BF16_SENTINEL)
     {
         return Err(Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(
-            format!("B={batch} modified an inactive value"),
+            format!("{} modified an inactive value", route_name(rows)),
         ));
     }
 
     Ok(())
 }
 
-fn inactive_values(batch: usize) -> usize {
-    (MAX_BATCH - batch) * (2 * COLUMNS + OUTPUT_ROWS)
+fn inactive_values(rows: usize, schedule: Schedule) -> usize {
+    let scratch = if schedule == Schedule::W4a4 {
+        (MAX_ROWS - rows) * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW)
+    } else {
+        MAX_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW)
+    };
+
+    (MAX_ROWS - rows) * (2 * COLUMNS + OUTPUT_ROWS) + scratch
+}
+
+fn schedule(rows: usize) -> Schedule {
+    if rows <= MAX_BATCH {
+        Schedule::A16
+    } else {
+        Schedule::W4a4
+    }
+}
+
+fn route_name(rows: usize) -> String {
+    if rows <= MAX_BATCH {
+        format!("B={rows}")
+    } else {
+        format!("T={rows}")
+    }
 }
 
 fn verify_immutable(
@@ -491,11 +690,12 @@ fn verify_no_post_warmup_allocation(
     regions: Regions,
     fixture: &Fixture,
 ) -> Result<(), Qwen35Nvfp4AttentionOutputQualificationError> {
-    let graphs = (1..=MAX_BATCH)
-        .map(|batch| {
-            reset(arena, stream, regions, fixture, batch)?;
+    let graphs = EXACT_ROUTES
+        .into_iter()
+        .map(|rows| {
+            reset(arena, stream, regions, fixture, rows)?;
             stream.synchronize().map_err(GpuError::from)?;
-            CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch))
+            CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows))
         })
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
@@ -506,10 +706,10 @@ fn verify_no_post_warmup_allocation(
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
-        for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
+        for graph in graphs.iter().rev() {
             // SAFETY: every allocation this graph captured is owned by this scope or
             // its caller and outlives the replays and the synchronize that follows.
-            unsafe { graphs[batch - 1].launch(stream) }?;
+            unsafe { graph.launch(stream) }?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -528,10 +728,19 @@ pub(crate) fn dot_oracle(
     row: usize,
     fixture: &Fixture,
 ) -> Result<f64, Qwen35Nvfp4AttentionOutputQualificationError> {
+    dot_oracle_for_schedule(token, row, Schedule::A16, fixture)
+}
+
+fn dot_oracle_for_schedule(
+    token: usize,
+    row: usize,
+    schedule: Schedule,
+    fixture: &Fixture,
+) -> Result<f64, Qwen35Nvfp4AttentionOutputQualificationError> {
     let exceptional = exceptional_group(row);
     let ordinary = (exceptional + 1) % GROUPS_PER_ROW;
-    let ordinary_dot = group_dot(token, row, ordinary, fixture);
-    let exceptional_dot = group_dot(token, row, exceptional, fixture);
+    let ordinary_dot = group_dot(token, row, ordinary, schedule, fixture)?;
+    let exceptional_dot = group_dot(token, row, exceptional, schedule, fixture)?;
     let ordinary_scale = decode_e4m3fn(fixture.weight_scales[scale_offset(row, ordinary)])
         .map_err(|error| {
             Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(error.to_string())
@@ -548,9 +757,23 @@ pub(crate) fn dot_oracle(
     )
 }
 
-fn group_dot(token: usize, row: usize, group: usize, fixture: &Fixture) -> f64 {
+fn group_dot(
+    token: usize,
+    row: usize,
+    group: usize,
+    schedule: Schedule,
+    fixture: &Fixture,
+) -> Result<f64, Qwen35Nvfp4AttentionOutputQualificationError> {
     let weight_begin = row * CODE_BYTES_PER_ROW + group * (GROUP / 2);
     let input_begin = token * COLUMNS + group * GROUP;
+    let activation_begin = token * CODE_BYTES_PER_ROW + group * (GROUP / 2);
+    let activation_scale = if schedule == Schedule::W4a4 {
+        decode_e4m3fn(fixture.activation_scales[token * GROUPS_PER_ROW + group]).map_err(
+            |error| Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(error.to_string()),
+        )?
+    } else {
+        1.0
+    };
     let mut sum = 0.0f64;
     for column in 0..GROUP {
         let packed = fixture.weight_codes[weight_begin + column / 2];
@@ -559,11 +782,22 @@ fn group_dot(token: usize, row: usize, group: usize, fixture: &Fixture) -> f64 {
         } else {
             packed >> 4
         };
-        sum +=
-            f64::from(fixture.activation_f32[input_begin + column]) * f64::from(decode_e2m1(code));
+        let activation = match schedule {
+            Schedule::A16 => f64::from(fixture.activation_f32[input_begin + column]),
+            Schedule::W4a4 => {
+                let packed = fixture.activation_codes[activation_begin + column / 2];
+                let code = if column & 1 == 0 {
+                    packed & 15
+                } else {
+                    packed >> 4
+                };
+                f64::from(decode_e2m1(code) * activation_scale / INPUT_SCALE_DIVISOR)
+            }
+        };
+        sum += activation * f64::from(decode_e2m1(code));
     }
 
-    sum
+    Ok(sum)
 }
 
 fn exceptional_group(row: usize) -> usize {
@@ -584,6 +818,47 @@ fn scale_offset(row: usize, group: usize) -> usize {
         + scale_lane
 }
 
+fn encode_e2m1(value: f32) -> u8 {
+    let mut best = 0u8;
+    let mut best_distance = f32::INFINITY;
+    let candidates = if value.is_sign_negative() {
+        8u8..16
+    } else {
+        0u8..8
+    };
+    for code in candidates {
+        let distance = (value - decode_e2m1(code)).abs();
+        if distance < best_distance || (distance == best_distance && code & 1 == 0) {
+            best = code;
+            best_distance = distance;
+        }
+    }
+
+    best
+}
+
+fn encode_e4m3fn(value: f32) -> Result<u8, Qwen35Nvfp4AttentionOutputQualificationError> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(
+            "Qwen3.5 oracle E4M3 scale is not finite and non-negative".to_string(),
+        ));
+    }
+    let mut best = 0u8;
+    let mut best_distance = f32::INFINITY;
+    for code in 0u8..=0x7e {
+        let represented = decode_e4m3fn(code).map_err(|error| {
+            Qwen35Nvfp4AttentionOutputQualificationError::Mismatch(error.to_string())
+        })?;
+        let distance = (value - represented).abs();
+        if distance < best_distance || (distance == best_distance && code & 1 == 0) {
+            best = code;
+            best_distance = distance;
+        }
+    }
+
+    Ok(best)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,15 +866,21 @@ mod tests {
     #[test]
     fn arena_swizzle_and_fixture_match_exact_geometry() {
         let (layout, regions) = layout().unwrap();
-        let fixture = make_fixture();
+        let fixture = make_fixture().unwrap();
 
         assert_eq!(scale_offset(0, 0), 0);
         assert_eq!(scale_offset(127, 255), 32_767);
         assert_eq!(scale_offset(128, 0), 32_768);
-        assert_eq!(fixture.activation_bf16.len(), MAX_BATCH * COLUMNS);
+        assert_eq!(fixture.activation_bf16.len(), MAX_ROWS * COLUMNS);
+        assert_eq!(
+            fixture.activation_codes.len(),
+            MAX_ROWS * CODE_BYTES_PER_ROW
+        );
+        assert_eq!(fixture.activation_scales.len(), MAX_ROWS * GROUPS_PER_ROW);
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
         assert_eq!(regions.weight_bytes(), 9_437_184);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 425_984);
-        assert_eq!(layout.byte_len(), 9_863_168);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 7_110_656);
+        assert_eq!(layout.byte_len(), 16_547_840);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 0);
     }
 
@@ -608,26 +889,27 @@ mod tests {
     fn exact_batches_match_independent_oracles_and_graph_replay()
     -> Result<(), Qwen35Nvfp4AttentionOutputQualificationError> {
         let report = qualify_qwen35_nvfp4_attention_output()?;
-        let active_rows = (1..=MAX_BATCH).sum::<usize>();
-        let inactive_rows = (1..=MAX_BATCH)
-            .map(|batch| MAX_BATCH - batch)
+        let active_rows = EXACT_ROUTES.into_iter().sum::<usize>();
+        let prefill_rows = EXACT_ROUTES
+            .into_iter()
+            .filter(|&rows| schedule(rows) == Schedule::W4a4)
+            .sum::<usize>();
+        let inactive = EXACT_ROUTES
+            .into_iter()
+            .map(|rows| inactive_values(rows, schedule(rows)))
             .sum::<usize>();
 
         assert_eq!(report.gated_values, active_rows * COLUMNS);
         assert_eq!(report.activation_values, active_rows * COLUMNS);
+        assert_eq!(report.activation_codes, prefill_rows * CODE_BYTES_PER_ROW);
+        assert_eq!(report.activation_scales, prefill_rows * GROUPS_PER_ROW);
         assert_eq!(report.output_values, active_rows * OUTPUT_ROWS);
-        assert_eq!(
-            report.graph_replay_values,
-            active_rows * (2 * COLUMNS + OUTPUT_ROWS)
-        );
-        assert_eq!(
-            report.inactive_values,
-            2 * inactive_rows * (2 * COLUMNS + OUTPUT_ROWS)
-        );
-        assert_eq!(report.immutable_input_values, 9_519_104);
-        assert_eq!(report.arena_bytes, 9_863_168);
+        assert_eq!(report.graph_replay_values, 3_710_976);
+        assert_eq!(report.inactive_values, 2 * inactive);
+        assert_eq!(report.immutable_input_values, 10_747_904);
+        assert_eq!(report.arena_bytes, 16_547_840);
         assert_eq!(report.weight_bytes, 9_437_184);
-        assert_eq!(report.workspace_bytes, 425_984);
+        assert_eq!(report.workspace_bytes, 7_110_656);
         assert_eq!(report.padding_bytes, 0);
         assert!(report.maximum_gated_error.is_finite());
         assert!(report.maximum_projection_error.is_finite());

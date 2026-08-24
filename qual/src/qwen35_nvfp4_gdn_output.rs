@@ -89,7 +89,11 @@ pub fn qualify_qwen35_nvfp4_gdn_output()
     let (layout, regions) = layout()?;
     let arena = DeviceArena::zeroed(&stream, &layout)?;
     let op = Qwen35Nvfp4GdnOutputOp::new(&context)?;
-    let fixture = make_fixture();
+    let fixture = make_fixture().map_err(|error| {
+        Qwen35Nvfp4GdnOutputQualificationError::Mismatch(format!(
+            "Qwen3.5 GDN-output fixture construction failed: {error}"
+        ))
+    })?;
     upload_fixture(&arena, &stream, regions, &fixture)?;
     let stable_addresses = addresses(&arena, regions)?;
     let mut report = Qwen35Nvfp4GdnOutputQualification {
@@ -165,7 +169,11 @@ pub(crate) fn upload_fixture(
     regions: Regions,
     fixture: &Fixture,
 ) -> GpuResult<()> {
-    arena.copy_from_host(stream, regions.input, &fixture.activation_bf16)?;
+    arena.copy_from_host(
+        stream,
+        regions.input,
+        &fixture.activation_bf16[..MAX_BATCH * COLUMNS],
+    )?;
     arena.copy_from_host(stream, regions.weight_codes, &fixture.weight_codes)?;
     arena.copy_from_host(stream, regions.weight_scales, &fixture.weight_scales)
 }
@@ -268,7 +276,7 @@ fn verify_immutable(
     let input = arena.copy_to_host(stream, regions.input)?;
     let weight_codes = arena.copy_to_host(stream, regions.weight_codes)?;
     let weight_scales = arena.copy_to_host(stream, regions.weight_scales)?;
-    if input != fixture.activation_bf16
+    if input != fixture.activation_bf16[..MAX_BATCH * COLUMNS]
         || weight_codes != fixture.weight_codes
         || weight_scales != fixture.weight_scales
     {
@@ -321,9 +329,9 @@ mod tests {
     #[test]
     fn arena_and_fixture_match_exact_geometry() {
         let (layout, regions) = layout().unwrap();
-        let fixture = make_fixture();
+        let fixture = make_fixture().unwrap();
 
-        assert_eq!(fixture.activation_bf16.len(), MAX_BATCH * COLUMNS);
+        assert!(fixture.activation_bf16.len() >= MAX_BATCH * COLUMNS);
         assert_eq!(regions.weight_bytes(), 9_437_184);
         assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 131_072);
         assert_eq!(layout.byte_len(), 9_568_256);

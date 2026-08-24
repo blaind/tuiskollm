@@ -44,7 +44,11 @@ impl Session {
         let stream = context.new_stream().map_err(GpuError::from)?;
         let (layout, regions) = layout()?;
         let arena = DeviceArena::zeroed(&stream, &layout)?;
-        let fixture = make_fixture();
+        let fixture = make_fixture().map_err(|error| {
+            DeviceBenchmarkError::Precondition(format!(
+                "Qwen3.5 GDN-output fixture construction failed: {error}"
+            ))
+        })?;
         upload_fixture(&arena, &stream, regions, &fixture)?;
         stream.synchronize().map_err(GpuError::from)?;
         let op = Qwen35Nvfp4GdnOutputOp::new(&context)?;
