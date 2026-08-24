@@ -13,6 +13,7 @@ const VOCABULARY: usize = Qwen38_27B::VOCAB;
 
 const DEFAULT_TOP_K: usize = 20;
 const DEFAULT_TOP_P: f32 = 0.95;
+const LINEAR_PROBE_LIMIT: usize = 64;
 const RNG_SCRAMBLE: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// Per-request sampling controls.
@@ -116,17 +117,28 @@ impl Default for SamplingPenalties {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SamplingDistribution {
     masses: Vec<(u32, f64)>,
+    by_token: Vec<(u32, f64)>,
     total: f64,
 }
 
 impl SamplingDistribution {
     /// Probability assigned to one vocabulary token, including zero outside the support.
     pub fn probability(&self, token: u32) -> f64 {
-        self.masses
-            .iter()
-            .find(|&&(candidate, _)| candidate == token)
-            .map(|&(_, mass)| mass / self.total)
-            .unwrap_or(0.0)
+        if self.by_token.is_empty() {
+            return self
+                .masses
+                .iter()
+                .find(|&&(candidate, _)| candidate == token)
+                .map(|&(_, mass)| mass / self.total)
+                .unwrap_or(0.0);
+        }
+        match self
+            .by_token
+            .binary_search_by_key(&token, |&(candidate, _)| candidate)
+        {
+            Ok(index) => self.by_token[index].1 / self.total,
+            Err(_) => 0.0,
+        }
     }
 
     /// Normalized support in the exact inverse-CDF order used by production.
@@ -170,7 +182,16 @@ impl SamplingDistribution {
                 "sampling distribution has no finite positive mass",
             ));
         }
-        Ok(Self { masses, total })
+        let mut by_token = Vec::new();
+        if masses.len() > LINEAR_PROBE_LIMIT {
+            by_token = masses.clone();
+            by_token.sort_unstable_by_key(|&(token, _)| token);
+        }
+        Ok(Self {
+            masses,
+            by_token,
+            total,
+        })
     }
 
     #[cfg(feature = "qualification")]
@@ -818,6 +839,61 @@ mod tests {
         let corrected = speculative_decision(3, &target, &draft, 0.0, 0.75).unwrap();
         assert!(!corrected.accepted);
         assert_eq!(corrected.token_id, 2);
+    }
+
+    #[test]
+    fn indexed_probability_and_residual_match_the_linear_scan_law() {
+        let target_masses = (0..100u32)
+            .map(|index| (index * 2, 1.0 + f64::from(index % 7)))
+            .collect::<Vec<_>>();
+        let draft_masses = (0..100u32)
+            .map(|index| (index * 3, 0.5 + f64::from(index % 5)))
+            .collect::<Vec<_>>();
+        let linear = |masses: &[(u32, f64)], token: u32| {
+            let total = masses.iter().map(|&(_, mass)| mass).sum::<f64>();
+            masses
+                .iter()
+                .find(|&&(candidate, _)| candidate == token)
+                .map(|&(_, mass)| mass / total)
+                .unwrap_or(0.0)
+        };
+        let target = SamplingDistribution::from_masses(target_masses.clone()).unwrap();
+        let draft = SamplingDistribution::from_masses(draft_masses.clone()).unwrap();
+        assert!(target_masses.len() > super::LINEAR_PROBE_LIMIT);
+        for token in 0..=300 {
+            assert_eq!(target.probability(token), linear(&target_masses, token));
+            assert_eq!(draft.probability(token), linear(&draft_masses, token));
+            let draft_probability = linear(&draft_masses, token);
+            let expected = if draft_probability <= 0.0 {
+                0.0
+            } else {
+                (linear(&target_masses, token) / draft_probability).min(1.0)
+            };
+            assert_eq!(
+                speculative_accept_probability(token, &target, &draft),
+                expected
+            );
+        }
+        let expected_excess = target_masses
+            .iter()
+            .filter_map(|&(token, _)| {
+                let excess = linear(&target_masses, token) - linear(&draft_masses, token);
+                (excess > 0.0).then_some((token, excess))
+            })
+            .collect::<Vec<_>>();
+        let expected_total = expected_excess
+            .iter()
+            .map(|&(_, excess)| excess)
+            .sum::<f64>();
+        let residual = speculative_residual(&target, &draft).unwrap();
+        assert!(expected_excess.len() > super::LINEAR_PROBE_LIMIT);
+        assert_eq!(
+            residual.probabilities().collect::<Vec<_>>(),
+            expected_excess
+                .iter()
+                .map(|&(token, excess)| (token, excess / expected_total))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
