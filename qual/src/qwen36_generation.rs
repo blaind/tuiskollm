@@ -189,7 +189,7 @@ fn verify_owner(
 ) -> Result<(), Qwen36GenerationQualificationError> {
     if generator.arena_bytes() != 21_063_232_512
         || generator.resident_weight_bytes() != 19_808_036_096
-        || generator.host_stager_bytes() != 529_408
+        || generator.host_stager_bytes() != 1_053_696
         || generator.context_capacity() != 192
     {
         return Err(Qwen36GenerationQualificationError::Mismatch(
@@ -233,7 +233,7 @@ mod tests {
         assert!((1..=2).contains(&report.chat_steps));
         assert_eq!(report.arena_bytes, 21_063_232_512);
         assert_eq!(report.resident_weight_bytes, 19_808_036_096);
-        assert_eq!(report.host_stager_bytes, 529_408);
+        assert_eq!(report.host_stager_bytes, 1_053_696);
         assert_eq!(report.stable_addresses, 42);
         eprintln!("Qwen3.6 generation qualification passed: {report:?}");
         Ok(())

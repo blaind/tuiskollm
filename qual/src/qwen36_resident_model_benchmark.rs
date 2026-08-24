@@ -8,7 +8,7 @@ use crate::device_benchmark::{
 };
 use std::path::Path;
 use std::sync::Arc;
-use tuisko_engine::{MAX_BATCH, Qwen36ResidentModelProgram};
+use tuisko_engine::{MAX_BATCH, Qwen36ResidentModelProgram, Qwen36ResidentPrefillRoute};
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, GpuError, GpuTimer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen36Moe35B};
 
@@ -20,9 +20,16 @@ const STATE_PER_ROW: usize =
     Qwen36Moe35B::GDN_CONTROL_ROWS * Qwen36Moe35B::LINEAR_HEAD_DIM * Qwen36Moe35B::LINEAR_HEAD_DIM;
 const EXPERT_SLOTS: usize = Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN + 1;
 const NVFP4_GROUP: usize = 16;
+const PREFILL_ROUTES: [usize; 3] = [32, 64, 128];
+
+#[derive(Clone, Copy)]
+enum ExactRoute {
+    Decode(usize),
+    Prefill(Qwen36ResidentPrefillRoute),
+}
 
 struct RouteGraph {
-    batch: usize,
+    route: ExactRoute,
     repeated: CudaGraph,
 }
 
@@ -57,18 +64,40 @@ impl Session {
             &rope_cos,
             &rope_sin,
         )?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| {
-                Ok(RouteGraph {
-                    batch,
-                    repeated: program.qualification_repeated_graph(
-                        &stream,
-                        batch,
-                        repeated_operations,
-                    )?,
-                })
+        program.stage_prefill_embeddings(&stream, &prefill_token_ids(128))?;
+        let (prefill_cos, prefill_sin) = prefill_rope(128);
+        let prefill_routes = PREFILL_ROUTES
+            .into_iter()
+            .map(|tokens| {
+                program.load_prefill_state(
+                    &stream,
+                    tokens,
+                    &prefill_cos[..tokens * ROTARY_PAIRS],
+                    &prefill_sin[..tokens * ROTARY_PAIRS],
+                )
             })
-            .collect::<Result<Vec<_>, DeviceBenchmarkError>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut routes = Vec::with_capacity(MAX_BATCH + PREFILL_ROUTES.len());
+        for batch in 1..=MAX_BATCH {
+            routes.push(RouteGraph {
+                route: ExactRoute::Decode(batch),
+                repeated: program.qualification_repeated_graph(
+                    &stream,
+                    batch,
+                    repeated_operations,
+                )?,
+            });
+        }
+        for route in prefill_routes {
+            routes.push(RouteGraph {
+                route: ExactRoute::Prefill(route),
+                repeated: program.qualification_repeated_prefill_graph(
+                    &stream,
+                    route,
+                    repeated_operations,
+                )?,
+            });
+        }
         let timer = GpuTimer::new(&context)?;
 
         Ok(Self {
@@ -82,13 +111,15 @@ impl Session {
 
     fn warm(&self, launches: u64) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
-            for batch in 1..=MAX_BATCH {
+            for route in &self.routes {
+                let graph = match route.route {
+                    ExactRoute::Decode(batch) => self.program.qualification_graph(batch)?,
+                    ExactRoute::Prefill(route) => {
+                        self.program.qualification_prefill_graph(route)?
+                    }
+                };
                 // SAFETY: the program retains every captured model allocation through this replay.
-                unsafe {
-                    self.program
-                        .qualification_graph(batch)?
-                        .launch(&self.stream)
-                }?;
+                unsafe { graph.launch(&self.stream) }?;
             }
         }
         self.stream.synchronize().map_err(GpuError::from)?;
@@ -103,16 +134,35 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
-                Ok(ExactDeviceCase::new(
-                    "qwen36_35b_a3b/resident_model/decode",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_model_decode(route.batch as u32, CONTEXT_TOKENS as u64),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
+                let (operation, shape, workload, accounting, graph) = match route.route {
+                    ExactRoute::Decode(batch) => (
+                        "qwen36_35b_a3b/resident_model/decode",
+                        format!("B={batch}"),
+                        BenchmarkWorkload::warm_model_decode(batch as u32, CONTEXT_TOKENS as u64),
+                        OperationAccounting::new(logical_bytes(batch), batch as u64, "token"),
+                        self.program.qualification_graph(batch)?,
                     ),
-                    self.program.qualification_graph(route.batch)?,
+                    ExactRoute::Prefill(prefill) => {
+                        let tokens = prefill.tokens();
+                        (
+                            "qwen36_35b_a3b/resident_model/prefill",
+                            format!("T={tokens}"),
+                            BenchmarkWorkload::warm_model_prefill(tokens as u64),
+                            OperationAccounting::new(
+                                prefill_logical_bytes(tokens),
+                                tokens as u64,
+                                "token",
+                            ),
+                            self.program.qualification_prefill_graph(prefill)?,
+                        )
+                    }
+                };
+                Ok(ExactDeviceCase::new(
+                    operation,
+                    shape,
+                    workload,
+                    accounting,
+                    graph,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 ))
             })
@@ -140,6 +190,27 @@ fn benchmark_rope() -> (Vec<f32>, Vec<f32>) {
     (cosine, sine)
 }
 
+fn prefill_token_ids(tokens: usize) -> Vec<u32> {
+    (0..tokens)
+        .map(|token| 100u32 + (token % 251) as u32)
+        .collect()
+}
+
+fn prefill_rope(tokens: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut cosine = vec![0.0; tokens * ROTARY_PAIRS];
+    let mut sine = vec![0.0; tokens * ROTARY_PAIRS];
+    for token in 0..tokens {
+        for pair in 0..ROTARY_PAIRS {
+            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
+            let angle = token as f64 * frequency;
+            let (sin, cos) = angle.sin_cos();
+            cosine[token * ROTARY_PAIRS + pair] = cos as f32;
+            sine[token * ROTARY_PAIRS + pair] = sin as f32;
+        }
+    }
+    (cosine, sine)
+}
+
 fn logical_bytes(batch: usize) -> usize {
     const GDN_LAYERS: usize = 30;
     const ATTENTION_LAYERS: usize = 10;
@@ -159,6 +230,7 @@ fn gdn_logical_bytes(batch: usize) -> usize {
     let experts = Qwen36Moe35B::NUM_EXPERTS;
     let top_k = Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN;
 
+    let state_row_count = if batch <= MAX_BATCH { batch } else { 1 };
     let plain_norm = 3 * batch * hidden * size_of::<u16>();
     let input_projection_weights = input_rows * hidden + 2 * controls * hidden * size_of::<u16>();
     let input_projection = input_projection_weights
@@ -170,17 +242,17 @@ fn gdn_logical_bytes(batch: usize) -> usize {
             + 2 * controls * size_of::<f32>()
             + qkv_rows * size_of::<u16>()
             + qkv_rows * (HISTORY_TAPS + 1) * size_of::<u16>()
-            + size_of::<u32>()
             + 2 * qkv_rows * HISTORY_TAPS * size_of::<u16>()
-            + qkv_rows * size_of::<u16>());
+            + qkv_rows * size_of::<u16>())
+        + state_row_count * size_of::<u32>();
     let recurrence = Qwen36Moe35B::LINEAR_HEAD_DIM * size_of::<u16>()
         + batch
             * (qkv_rows * size_of::<u16>()
                 + value_rows * size_of::<u16>()
                 + 2 * controls * size_of::<f32>()
-                + size_of::<u32>()
                 + 2 * STATE_PER_ROW * size_of::<f32>()
-                + value_rows * size_of::<u16>());
+                + value_rows * size_of::<u16>())
+        + state_row_count * size_of::<u32>();
     let output_projection = hidden * value_rows
         + batch * (value_rows * (size_of::<u16>() + size_of::<u8>()) + hidden * size_of::<u16>());
     let residual_boundaries = 2 * 5 * batch * hidden * size_of::<u16>();
@@ -230,14 +302,19 @@ fn attention_logical_bytes(batch: usize) -> usize {
         + 3 * size_of::<u32>()
         + attention * size_of::<f32>()
         + 2 * kv * size_of::<u16>();
+    let context_values = if batch <= MAX_BATCH {
+        batch * CONTEXT_TOKENS
+    } else {
+        batch * (batch + 1) / 2
+    };
     let cache = 2
         * Qwen36Moe35B::NUM_ATTENTION_HEADS
-        * CONTEXT_TOKENS
+        * context_values
         * Qwen36Moe35B::HEAD_DIM
         * size_of::<u16>();
-    let metadata = 2 * size_of::<u32>()
-        + Qwen36Moe35B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * size_of::<u32>();
-    let paged_gqa = 2 * attention * size_of::<f32>() + cache + metadata;
+    let metadata = batch * 2 * size_of::<u32>()
+        + Qwen36Moe35B::NUM_ATTENTION_HEADS * context_values * size_of::<u32>();
+    let paged_gqa = batch * 2 * attention * size_of::<f32>() + cache + metadata;
     let attention_output = 18 * attention + 2 * hidden;
     let residual_boundaries = 2 * 5 * hidden * size_of::<u16>();
     let router_weights = experts * hidden * size_of::<u16>();
@@ -250,16 +327,15 @@ fn attention_logical_bytes(batch: usize) -> usize {
         + 2 * EXPERT_SLOTS * intermediate * size_of::<u16>()
         + 2 * EXPERT_SLOTS * hidden * size_of::<u16>()
         + hidden * size_of::<u16>();
-    let per_token = plain_norm
+    let per_token_without_gqa = plain_norm
         + qkv_projection
         + qk_prepare
-        + paged_gqa
         + attention_output
         + residual_boundaries
         + router
         + experts_path;
 
-    projection_weights + router_weights + batch * per_token
+    projection_weights + router_weights + batch * per_token_without_gqa + paged_gqa
 }
 
 fn selected_expert_weight_bytes() -> usize {
@@ -282,7 +358,16 @@ fn endpoint_logical_bytes(batch: usize) -> usize {
     weights + batch * per_token
 }
 
-/// Measures every exact complete Qwen3.6 text-model graph.
+fn prefill_logical_bytes(tokens: usize) -> usize {
+    const GDN_LAYERS: usize = 30;
+    const ATTENTION_LAYERS: usize = 10;
+
+    GDN_LAYERS * gdn_logical_bytes(tokens)
+        + ATTENTION_LAYERS * attention_logical_bytes(tokens)
+        + endpoint_logical_bytes(1)
+}
+
+/// Measures every exact complete Qwen3.6 decode and native-prompt graph.
 pub fn benchmark_qwen36_resident_model(
     root: &Path,
     options: DeviceBenchmarkOptions,
@@ -357,5 +442,8 @@ mod tests {
         assert_eq!(endpoint_logical_bytes(MAX_BATCH), 290_172_992);
         assert_eq!(logical_bytes(1), 2_416_679_488);
         assert_eq!(logical_bytes(MAX_BATCH), 8_027_410_432);
+        let prefill = PREFILL_ROUTES.map(prefill_logical_bytes);
+        assert!(prefill.windows(2).all(|pair| pair[1] > pair[0]));
+        assert!(prefill[2] > 2 * prefill[1]);
     }
 }

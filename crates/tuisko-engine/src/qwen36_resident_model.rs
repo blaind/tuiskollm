@@ -6,8 +6,26 @@ use crate::{
     Qwen36TextEndpointLayout, Qwen36TextEndpointProgram,
 };
 use std::sync::Arc;
-use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, GpuError, GpuResult};
+use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, GpuError, GpuResult, PinnedHostBuffer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen36Moe35B};
+
+const ROTARY_PAIRS: usize = 32;
+const PREFILL_ROUTES: [usize; 3] = [32, 64, 128];
+const MAX_PREFILL_ROWS: usize = 128;
+
+/// Exact from-empty prompt graph selected by matching state uploads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "the Qwen3.6 prefill route must be replayed with the state that selected it"]
+pub struct Qwen36ResidentPrefillRoute {
+    tokens: usize,
+}
+
+impl Qwen36ResidentPrefillRoute {
+    /// Number of contiguous prompt tokens represented by this route.
+    pub const fn tokens(self) -> usize {
+        self.tokens
+    }
+}
 
 /// Exact source route owned by one Qwen3.6 decoder layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -188,6 +206,35 @@ impl ResidentLayer {
         }
     }
 
+    fn load_prefill_state(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        match self {
+            Self::GdnMoe(_) => Ok(()),
+            Self::FullAttentionMoe(program) => {
+                program.load_prefill_state(stream, tokens, rope_cos, rope_sin)
+            }
+        }
+    }
+
+    fn load_residual(&self, stream: &CudaStream, rows: usize, values: &[u16]) -> EngineResult<()> {
+        match self {
+            Self::GdnMoe(program) => program.load_residual(stream, rows, values),
+            Self::FullAttentionMoe(program) => program.load_residual(stream, rows, values),
+        }
+    }
+
+    fn input_address(&self) -> GpuResult<*const u16> {
+        match self {
+            Self::GdnMoe(program) => program.input_address(),
+            Self::FullAttentionMoe(program) => program.input_address(),
+        }
+    }
+
     /// # Safety
     /// `input` names the active BF16 residual rows in the shared CUDA context.
     unsafe fn launch_from(
@@ -228,14 +275,16 @@ impl ResidentLayer {
 pub struct Qwen36ResidentModelProgram {
     // Drop whole-model graphs before the layer arenas and loaded modules they retain.
     graphs: [CudaGraph; MAX_BATCH],
+    prefill_graphs: [CudaGraph; 3],
     layers: Vec<ResidentLayer>,
     endpoint: Qwen36TextEndpointProgram,
+    prefill_embedding_stager: PinnedHostBuffer<u16>,
     context: Arc<CudaContext>,
     layout: Qwen36ResidentModelLayout,
 }
 
 impl Qwen36ResidentModelProgram {
-    /// Loads all source weights and captures one immutable graph per exact batch.
+    /// Loads all source weights and captures exact decode and native prefill graphs.
     pub fn from_snapshot(
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
@@ -251,14 +300,20 @@ impl Qwen36ResidentModelProgram {
             )?);
         }
         let endpoint = Qwen36TextEndpointProgram::from_snapshot(context, snapshot)?;
+        let prefill_embedding_stager =
+            PinnedHostBuffer::zeroed(context, MAX_PREFILL_ROWS * Qwen36Moe35B::HIDDEN)
+                .map_err(GpuError::from)?;
         for layer in &layers {
             layer.reset(&stream)?;
         }
-        let graphs = capture_routes(&stream, &layers, &endpoint)?;
+        let graphs = capture_decode_routes(&stream, &layers, &endpoint)?;
+        let prefill_graphs = capture_prefill_routes(&stream, &layers, &endpoint)?;
         let program = Self {
             graphs,
+            prefill_graphs,
             layers,
             endpoint,
+            prefill_embedding_stager,
             context: Arc::clone(context),
             layout,
         };
@@ -270,6 +325,30 @@ impl Qwen36ResidentModelProgram {
     /// Copies exact mmap-backed embedding rows into the stable endpoint input plane.
     pub fn stage_embeddings(&mut self, stream: &CudaStream, token_ids: &[u32]) -> EngineResult<()> {
         self.endpoint.stage_embeddings(stream, token_ids)
+    }
+
+    /// Gathers one exact prompt tile into layer zero's stable input plane.
+    pub fn stage_prefill_embeddings(
+        &mut self,
+        stream: &CudaStream,
+        token_ids: &[u32],
+    ) -> EngineResult<()> {
+        require_prefill(token_ids.len())?;
+        let active = product(
+            "Qwen3.6 resident prefill embedding values",
+            token_ids.len(),
+            Qwen36Moe35B::HIDDEN,
+        )?;
+        self.endpoint
+            .gather_embedding_rows(token_ids, &mut self.prefill_embedding_stager[..active])?;
+        self.layers
+            .first()
+            .ok_or_else(|| EngineError::layout("Qwen3.6 resident layer inventory is empty"))?
+            .load_residual(
+                stream,
+                token_ids.len(),
+                &self.prefill_embedding_stager[..active],
+            )
     }
 
     /// Updates decode positions and MRoPE values in every full-attention layer.
@@ -287,6 +366,32 @@ impl Qwen36ResidentModelProgram {
         }
 
         Ok(())
+    }
+
+    /// Updates every attention layer for one contiguous from-empty prompt tile.
+    pub fn load_prefill_state(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<Qwen36ResidentPrefillRoute> {
+        require_prefill(tokens)?;
+        let rotary_values = product(
+            "Qwen3.6 resident prefill rotary values",
+            tokens,
+            ROTARY_PAIRS,
+        )?;
+        if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
+            return Err(EngineError::layout(format!(
+                "Qwen3.6 resident prefill rotary planes must each have {rotary_values} values for T={tokens}"
+            )));
+        }
+        for layer in &self.layers {
+            layer.load_prefill_state(stream, tokens, rope_cos, rope_sin)?;
+        }
+
+        Ok(Qwen36ResidentPrefillRoute { tokens })
     }
 
     /// Clears every GDN history/state and full-attention BF16 cache plane.
@@ -308,9 +413,26 @@ impl Qwen36ResidentModelProgram {
         Ok(())
     }
 
+    /// Replays one immutable from-empty prompt graph.
+    pub fn replay_prefill(
+        &self,
+        stream: &CudaStream,
+        route: Qwen36ResidentPrefillRoute,
+    ) -> EngineResult<()> {
+        // SAFETY: this owner retains every allocation captured by the prompt graph.
+        unsafe { self.prefill_graph(route)?.launch(stream) }?;
+
+        Ok(())
+    }
+
     /// Reads active BF16 full-vocabulary logits.
     pub fn read_logits(&self, stream: &CudaStream, batch: usize) -> EngineResult<Vec<u16>> {
         self.endpoint.read_logits(stream, batch)
+    }
+
+    /// Reads the final-token BF16 vocabulary logits from one prompt graph.
+    pub fn read_prefill_logits(&self, stream: &CudaStream) -> EngineResult<Vec<u16>> {
+        self.endpoint.read_logits(stream, 1)
     }
 
     /// Reads active BF16 logits into one reusable host allocation.
@@ -330,6 +452,19 @@ impl Qwen36ResidentModelProgram {
             .last()
             .ok_or_else(|| EngineError::layout("Qwen3.6 resident layer inventory is empty"))?
             .read_residual(stream, batch)
+    }
+
+    /// Reads every final-layer residual row emitted by one exact prompt tile.
+    pub fn read_prefill_final_residual(
+        &self,
+        stream: &CudaStream,
+        route: Qwen36ResidentPrefillRoute,
+    ) -> EngineResult<Vec<u16>> {
+        self.prefill_graph(route)?;
+        self.layers
+            .last()
+            .ok_or_else(|| EngineError::layout("Qwen3.6 resident layer inventory is empty"))?
+            .read_residual(stream, route.tokens)
     }
 
     /// CUDA context shared by every resident owner.
@@ -363,7 +498,18 @@ impl Qwen36ResidentModelProgram {
 
     /// Page-locked bytes used to gather mmap-backed embedding rows.
     pub fn host_stager_bytes(&self) -> usize {
-        self.endpoint.host_stager_bytes()
+        self.endpoint.host_stager_bytes() + self.prefill_embedding_stager.num_bytes()
+    }
+
+    fn prefill_graph(&self, route: Qwen36ResidentPrefillRoute) -> EngineResult<&CudaGraph> {
+        let index = prefill_index(route.tokens).ok_or_else(|| {
+            EngineError::route(format!(
+                "Qwen3.6 resident prefill token count {} is outside 32,64,128",
+                route.tokens
+            ))
+        })?;
+
+        Ok(&self.prefill_graphs[index])
     }
 
     #[cfg(feature = "qualification")]
@@ -381,6 +527,28 @@ impl Qwen36ResidentModelProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Launches one complete native prompt route eagerly.
+    pub fn launch_prefill_eager(
+        &self,
+        stream: &CudaStream,
+        route: Qwen36ResidentPrefillRoute,
+    ) -> EngineResult<()> {
+        self.prefill_graph(route)?;
+        launch_prefill_route(stream, route, &self.layers, &self.endpoint)?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns one captured complete-model prompt graph.
+    pub fn qualification_prefill_graph(
+        &self,
+        route: Qwen36ResidentPrefillRoute,
+    ) -> EngineResult<&CudaGraph> {
+        self.prefill_graph(route)
+    }
+
+    #[cfg(feature = "qualification")]
     /// Fills the endpoint output planes before a whole-model route.
     pub fn qualification_reset_outputs(&self, stream: &CudaStream, byte: u8) -> EngineResult<()> {
         self.endpoint.qualification_reset_outputs(stream, byte)
@@ -392,18 +560,18 @@ impl Qwen36ResidentModelProgram {
         &self,
         stream: &CudaStream,
     ) -> EngineResult<Qwen36ResidentModelObservables> {
-        let endpoint = self.endpoint.qualification_observables(stream)?;
-        let final_residual = self
-            .layers
-            .last()
-            .ok_or_else(|| EngineError::layout("Qwen3.6 resident layer inventory is empty"))?
-            .read_residual(stream, MAX_BATCH)?;
+        self.qualification_observables_for(stream, MAX_BATCH)
+    }
 
-        Ok(Qwen36ResidentModelObservables {
-            final_residual,
-            normalized: endpoint.normalized,
-            logits: endpoint.logits,
-        })
+    #[cfg(feature = "qualification")]
+    /// Reads all final residual rows plus the final-token endpoint planes.
+    pub fn qualification_prefill_observables(
+        &self,
+        stream: &CudaStream,
+        route: Qwen36ResidentPrefillRoute,
+    ) -> EngineResult<Qwen36ResidentModelObservables> {
+        self.prefill_graph(route)?;
+        self.qualification_observables_for(stream, route.tokens)
     }
 
     #[cfg(feature = "qualification")]
@@ -426,6 +594,48 @@ impl Qwen36ResidentModelProgram {
             }
             Ok(())
         })?)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Captures repeated complete-model prompt paths for direct timing.
+    pub fn qualification_repeated_prefill_graph(
+        &self,
+        stream: &CudaStream,
+        route: Qwen36ResidentPrefillRoute,
+        operations: u64,
+    ) -> EngineResult<CudaGraph> {
+        self.prefill_graph(route)?;
+        if operations == 0 {
+            return Err(EngineError::route(
+                "repeated Qwen3.6 model prefill graph requires at least one operation",
+            ));
+        }
+        Ok(CudaGraph::capture(stream, || {
+            for _ in 0..operations {
+                launch_prefill_route(stream, route, &self.layers, &self.endpoint)?;
+            }
+            Ok(())
+        })?)
+    }
+
+    #[cfg(feature = "qualification")]
+    fn qualification_observables_for(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+    ) -> EngineResult<Qwen36ResidentModelObservables> {
+        let endpoint = self.endpoint.qualification_observables(stream)?;
+        let final_residual = self
+            .layers
+            .last()
+            .ok_or_else(|| EngineError::layout("Qwen3.6 resident layer inventory is empty"))?
+            .read_residual(stream, rows)?;
+
+        Ok(Qwen36ResidentModelObservables {
+            final_residual,
+            normalized: endpoint.normalized,
+            logits: endpoint.logits,
+        })
     }
 
     fn require_accounting(&self) -> EngineResult<()> {
@@ -462,7 +672,7 @@ pub struct Qwen36ResidentModelObservables {
     pub logits: Vec<u16>,
 }
 
-fn capture_routes(
+fn capture_decode_routes(
     stream: &CudaStream,
     layers: &[ResidentLayer],
     endpoint: &Qwen36TextEndpointProgram,
@@ -476,6 +686,27 @@ fn capture_routes(
     graphs
         .try_into()
         .map_err(|_| EngineError::layout("Qwen3.6 whole-model graph inventory is incomplete"))
+}
+
+fn capture_prefill_routes(
+    stream: &CudaStream,
+    layers: &[ResidentLayer],
+    endpoint: &Qwen36TextEndpointProgram,
+) -> EngineResult<[CudaGraph; 3]> {
+    // T=128 otherwise crosses 40 layer graphs plus the endpoint and exposes
+    // 40 host-visible boundaries. This graph composes the same qualified
+    // per-layer T=128 routes without changing any leaf accumulation order.
+    let mut graphs = Vec::with_capacity(PREFILL_ROUTES.len());
+    for tokens in PREFILL_ROUTES {
+        let route = Qwen36ResidentPrefillRoute { tokens };
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_prefill_route(stream, route, layers, endpoint)
+        })?);
+    }
+
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("Qwen3.6 whole-model prefill graph inventory is incomplete")
+    })
 }
 
 fn launch_route(
@@ -492,6 +723,27 @@ fn launch_route(
     }
     // The final layer's publication remains live for the endpoint and graph lifetime.
     unsafe { endpoint.launch_from(stream, batch, residual) }
+}
+
+fn launch_prefill_route(
+    stream: &CudaStream,
+    route: Qwen36ResidentPrefillRoute,
+    layers: &[ResidentLayer],
+    endpoint: &Qwen36TextEndpointProgram,
+) -> GpuResult<()> {
+    let first = layers
+        .first()
+        .ok_or_else(|| GpuError::invalid_launch("Qwen3.6 resident layer inventory is empty"))?;
+    let mut residual = first.input_address()?;
+    for layer in layers {
+        // All layer owners retain 128-row publication planes in one context;
+        // the next layer consumes them directly without a staging boundary.
+        residual = unsafe { layer.launch_from(stream, route.tokens, residual)? };
+    }
+    // Only the final prompt row feeds sampling. At T=128, retaining all
+    // 248,320-wide logits would require 63,569,920 extra BF16 values.
+    let final_row = unsafe { residual.add((route.tokens - 1) * Qwen36Moe35B::HIDDEN) };
+    unsafe { endpoint.launch_from(stream, 1, final_row) }
 }
 
 const fn layer_kind(layer: usize) -> Qwen36ResidentLayerKind {
@@ -520,6 +772,25 @@ fn require_batch(batch: usize) -> EngineResult<()> {
     Ok(())
 }
 
+const fn prefill_index(tokens: usize) -> Option<usize> {
+    match tokens {
+        32 => Some(0),
+        64 => Some(1),
+        128 => Some(2),
+        _ => None,
+    }
+}
+
+fn require_prefill(tokens: usize) -> EngineResult<()> {
+    if prefill_index(tokens).is_some() {
+        return Ok(());
+    }
+
+    Err(EngineError::route(format!(
+        "Qwen3.6 resident prefill token count {tokens} is outside 32,64,128"
+    )))
+}
+
 fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
     left.checked_mul(right)
         .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
@@ -538,7 +809,10 @@ fn sum_products(name: &str, terms: &[(usize, usize)]) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Qwen36ResidentLayerKind, Qwen36ResidentModelLayout};
+    use super::{
+        Qwen36ResidentLayerKind, Qwen36ResidentModelLayout, prefill_index, require_prefill,
+    };
+    use crate::EngineErrorCode;
 
     #[test]
     fn exact_layer_route_inventory_is_complete() {
@@ -575,5 +849,20 @@ mod tests {
             1_017_118_720
         );
         assert_eq!(layout.context_capacity(), 192);
+    }
+
+    #[test]
+    fn exact_prefill_inventory_rejects_every_neighbor() {
+        for (index, tokens) in [32, 64, 128].into_iter().enumerate() {
+            assert_eq!(prefill_index(tokens), Some(index));
+            require_prefill(tokens).unwrap();
+        }
+        for tokens in [0, 1, 8, 16, 31, 33, 63, 65, 127, 129, usize::MAX] {
+            assert_eq!(prefill_index(tokens), None);
+            assert_eq!(
+                require_prefill(tokens).unwrap_err().code(),
+                Some(EngineErrorCode::Route)
+            );
+        }
     }
 }
