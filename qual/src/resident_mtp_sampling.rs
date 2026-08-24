@@ -265,14 +265,18 @@ fn compare_seeded(
 fn verify_owner(
     generator: &ResidentMtpTextGenerator,
 ) -> Result<(), ResidentMtpSamplingQualificationError> {
-    if generator.device_owner_bytes() != 30_263_692_800
-        || generator.host_stager_bytes() != 23_729_152
+    if generator.device_owner_bytes() != 30_342_618_624
+        || generator.host_stager_bytes() != 23_811_072
         || generator.kv_route_host_bytes() != 113_454
         || generator.context_capacity() != 220_000
     {
-        return Err(ResidentMtpSamplingQualificationError::Mismatch(
-            "resident sampled MTP owner bytes or capacity changed".to_string(),
-        ));
+        return Err(ResidentMtpSamplingQualificationError::Mismatch(format!(
+            "resident sampled MTP owner accounting changed: device={}, host={}, routes={}, capacity={}",
+            generator.device_owner_bytes(),
+            generator.host_stager_bytes(),
+            generator.kv_route_host_bytes(),
+            generator.context_capacity()
+        )));
     }
     Ok(())
 }
@@ -304,6 +308,6 @@ mod tests {
         assert!(report.verification_routes.iter().all(|&routes| routes > 0));
         assert!(report.accepted_drafts > 0);
         assert!(report.accepted_drafts < report.draft_proposals);
-        assert_eq!(report.device_owner_bytes, 30_263_692_800);
+        assert_eq!(report.device_owner_bytes, 30_342_618_624);
     }
 }

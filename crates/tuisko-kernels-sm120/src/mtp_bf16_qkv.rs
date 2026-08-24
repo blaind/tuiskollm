@@ -53,26 +53,53 @@ mod kernels {
         let mut accumulator = [0.0f32; 4];
         let mut column = 0usize;
 
-        while column < INPUT_COLUMNS {
-            // m16n8k16 is the smallest native BF16 Tensor Core tile. B<=8 uses
-            // only the lower token rows, and no padded row is ever published.
-            let activation = unsafe {
-                [
-                    input_pair::<TOKENS>(input, group, column + 2 * thread_in_group),
-                    input_pair::<TOKENS>(input, group + 8, column + 2 * thread_in_group),
-                    input_pair::<TOKENS>(input, group, column + 8 + 2 * thread_in_group),
-                    input_pair::<TOKENS>(input, group + 8, column + 8 + 2 * thread_in_group),
-                ]
-            };
-            let weights = unsafe {
-                [
-                    weight_pair(weight, weight_row, column + 2 * thread_in_group),
-                    weight_pair(weight, weight_row, column + 8 + 2 * thread_in_group),
-                ]
-            };
-            // SAFETY: all lanes execute the same row-major A / column-major B MMA.
-            accumulator = unsafe { wmma::mma_m16n8k16_f32_bf16(accumulator, activation, weights) };
-            column += 16;
+        macro_rules! k_step {
+            ($column:expr) => {{
+                let column = $column;
+                // m16n8k16 is the smallest native BF16 Tensor Core tile. B<=8
+                // uses only the lower token rows; no padded row is published.
+                let activation = unsafe {
+                    [
+                        input_pair::<TOKENS>(input, group, column + 2 * thread_in_group),
+                        input_pair::<TOKENS>(input, group + 8, column + 2 * thread_in_group),
+                        input_pair::<TOKENS>(input, group, column + 8 + 2 * thread_in_group),
+                        input_pair::<TOKENS>(input, group + 8, column + 8 + 2 * thread_in_group),
+                    ]
+                };
+                let weights = unsafe {
+                    [
+                        weight_pair(weight, weight_row, column + 2 * thread_in_group),
+                        weight_pair(weight, weight_row, column + 8 + 2 * thread_in_group),
+                    ]
+                };
+                // SAFETY: all lanes execute the same row-major A / column-major B MMA.
+                accumulator =
+                    unsafe { wmma::mma_m16n8k16_f32_bf16(accumulator, activation, weights) };
+            }};
+        }
+        // The narrow exact routes fold most activation rows to constants and
+        // lose load depth; four K-blocks per iteration restore the weight
+        // pipeline, and the wide routes take eight (INPUT_COLUMNS = 5,120).
+        if TOKENS <= 2 {
+            while column < INPUT_COLUMNS {
+                k_step!(column);
+                k_step!(column + 16);
+                k_step!(column + 32);
+                k_step!(column + 48);
+                column += 64;
+            }
+        } else {
+            while column < INPUT_COLUMNS {
+                k_step!(column);
+                k_step!(column + 16);
+                k_step!(column + 32);
+                k_step!(column + 48);
+                k_step!(column + 64);
+                k_step!(column + 80);
+                k_step!(column + 96);
+                k_step!(column + 112);
+                column += 128;
+            }
         }
 
         if group < TOKENS {
