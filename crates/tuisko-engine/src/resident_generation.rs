@@ -15,6 +15,8 @@ const ROTARY_DIM: usize = 64;
 const ROTARY_PAIRS: usize = ROTARY_DIM / 2;
 const ROPE_THETA: f64 = 10_000_000.0;
 const LOGIT_BANK_ROWS: usize = 2 * MAX_BATCH;
+const NATIVE_PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1024];
+const MAX_NATIVE_PREFILL_TOKENS: usize = 1024;
 
 /// Concrete frontend, device program, stream, and host-logit owner for one active request.
 pub struct ResidentTextGenerator {
@@ -50,6 +52,8 @@ pub struct ResidentBatchAdmission {
     pub prompt_tokens: usize,
     /// Prompt tokens restored from an exact retained device-state prefix.
     pub device_reused_tokens: usize,
+    /// Prompt tokens processed by one exact from-empty whole-model prefill graph.
+    pub native_prefill_tokens: usize,
     /// Immediate output for a request with `max_new_tokens == 0`.
     pub completed: Option<GeneratedText>,
 }
@@ -100,6 +104,7 @@ pub struct ResidentGenerationSession<'a> {
     logits: &'a mut [u16],
     pending_token: Option<u32>,
     next_position: u32,
+    native_prefill_tokens: usize,
 }
 
 impl ResidentRequestId {
@@ -148,9 +153,7 @@ impl ResidentTextGenerator {
         })
     }
 
-    /// Renders one request and primes its prompt through the admitted B=1 decode graph.
-    ///
-    /// This is the current short-context correctness route, not an optimized prefill route.
+    /// Renders one request and primes its prompt through an exact resident graph.
     pub fn start<'a>(
         &'a mut self,
         request: &ChatGenerationRequest,
@@ -167,6 +170,7 @@ impl ResidentTextGenerator {
             request.max_new_tokens,
             program.context_capacity(),
         )?;
+        let mut native_prefill_tokens = 0;
 
         if control.finish_reason().is_none() {
             program.recycle_kv_slot(stream, 0)?;
@@ -174,16 +178,8 @@ impl ResidentTextGenerator {
             program.activate_kv_slot(0)?;
             program.reserve_kv_slot_tokens(stream, 0, required_positions)?;
             program.load_slot_routes(stream, &[0])?;
-            for (position, &token) in control.prompt_token_ids().iter().enumerate() {
-                replay_token(
-                    program,
-                    stream,
-                    token,
-                    u32::try_from(position).map_err(|_| {
-                        EngineError::generation("prompt position exceeds the exact route width")
-                    })?,
-                )?;
-            }
+            native_prefill_tokens =
+                prime_prompt(program, stream, control.prompt_token_ids(), 0, 0)?;
             program.read_logits_into(stream, 1, logits)?;
         }
         let next_position = u32::try_from(control.prompt_token_ids().len())
@@ -196,6 +192,7 @@ impl ResidentTextGenerator {
             logits,
             pending_token: None,
             next_position,
+            native_prefill_tokens,
         })
     }
 
@@ -227,6 +224,16 @@ impl ResidentTextGenerator {
     #[cfg(feature = "qualification")]
     /// Runs an independently captured raw-token reference case through the production path.
     pub fn qualification_greedy_after_tokens(&mut self, token_ids: &[u32]) -> EngineResult<u32> {
+        self.qualification_greedy_after_tokens_with_route(token_ids)
+            .map(|(token, _)| token)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Runs raw tokens and reports whether the production path selected native prefill.
+    pub fn qualification_greedy_after_tokens_with_route(
+        &mut self,
+        token_ids: &[u32],
+    ) -> EngineResult<(u32, usize)> {
         let required_positions =
             require_generation_capacity(token_ids.len(), 1, self.program.context_capacity())?;
         self.program.recycle_kv_slot(&self.stream, 0)?;
@@ -235,9 +242,7 @@ impl ResidentTextGenerator {
         self.program
             .reserve_kv_slot_tokens(&self.stream, 0, required_positions)?;
         self.program.load_slot_routes(&self.stream, &[0])?;
-        for (position, &token) in token_ids.iter().enumerate() {
-            replay_token(&mut self.program, &self.stream, token, position as u32)?;
-        }
+        let native_prefill_tokens = prime_prompt(&mut self.program, &self.stream, token_ids, 0, 0)?;
         self.program
             .read_logits_into(&self.stream, 1, &mut self.logits)?;
         let stop_ids: [u32; 2] =
@@ -245,7 +250,10 @@ impl ResidentTextGenerator {
                 EngineError::generation("frontend returned the wrong stop-ID count")
             })?;
         let mut sampler = Sampler::new(SamplingOptions::greedy(), stop_ids)?;
-        Ok(sampler.sample(&self.logits)?.token_id)
+        Ok((
+            sampler.sample(&self.logits)?.token_id,
+            native_prefill_tokens,
+        ))
     }
 
     #[cfg(feature = "qualification")]
@@ -339,6 +347,7 @@ impl ResidentBatchGenerator {
                 request_id,
                 prompt_tokens,
                 device_reused_tokens: 0,
+                native_prefill_tokens: 0,
                 completed: Some(control.into_output()?),
             });
         }
@@ -353,20 +362,13 @@ impl ResidentBatchGenerator {
         self.program
             .reserve_kv_slot_tokens(&self.stream, slot, required_positions)?;
         self.program.load_slot_routes(&self.stream, &[slot])?;
-        for (offset, &token) in control.prompt_token_ids()[device_reused_tokens..]
-            .iter()
-            .enumerate()
-        {
-            let position = device_reused_tokens + offset;
-            replay_token(
-                &mut self.program,
-                &self.stream,
-                token,
-                u32::try_from(position).map_err(|_| {
-                    EngineError::generation("prompt position exceeds the exact route width")
-                })?,
-            )?;
-        }
+        let native_prefill_tokens = prime_prompt(
+            &mut self.program,
+            &self.stream,
+            control.prompt_token_ids(),
+            slot,
+            device_reused_tokens,
+        )?;
         if device_reused_tokens < prompt_tokens {
             let logits = slot_logits(slot);
             self.program
@@ -387,6 +389,7 @@ impl ResidentBatchGenerator {
             request_id,
             prompt_tokens,
             device_reused_tokens,
+            native_prefill_tokens,
             completed: None,
         })
     }
@@ -704,6 +707,11 @@ impl ResidentGenerationSession<'_> {
         self.control.generated_token_ids()
     }
 
+    /// Prompt tokens processed by one exact from-empty whole-model prefill graph.
+    pub const fn native_prefill_tokens(&self) -> usize {
+        self.native_prefill_tokens
+    }
+
     /// Current terminal state.
     pub const fn finish_reason(&self) -> Option<FinishReason> {
         self.control.finish_reason()
@@ -780,6 +788,74 @@ fn replay_token(
     program.replay(stream, route)
 }
 
+fn prime_prompt(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+    token_ids: &[u32],
+    slot: usize,
+    processed_prefix: usize,
+) -> EngineResult<usize> {
+    if processed_prefix > token_ids.len() {
+        return Err(EngineError::generation(
+            "resident processed prefix exceeds its prompt",
+        ));
+    }
+    if native_prefill_tokens(token_ids.len(), processed_prefix).is_some() {
+        let rotary_values = token_ids
+            .len()
+            .checked_mul(ROTARY_PAIRS)
+            .ok_or_else(|| EngineError::generation("prompt rotary values overflow"))?;
+        let mut rope_cos = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+        let mut rope_sin = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+        for position in 0..token_ids.len() {
+            let position = u32::try_from(position).map_err(|_| {
+                EngineError::generation("prompt position exceeds the exact route width")
+            })?;
+            let (cosine, sine) = text_rope(position);
+            let begin = position as usize * ROTARY_PAIRS;
+            rope_cos[begin..begin + ROTARY_PAIRS].copy_from_slice(&cosine);
+            rope_sin[begin..begin + ROTARY_PAIRS].copy_from_slice(&sine);
+        }
+        program.stage_embeddings(stream, token_ids)?;
+        let route = program.load_prefill_state(
+            stream,
+            token_ids.len(),
+            slot,
+            &rope_cos[..rotary_values],
+            &rope_sin[..rotary_values],
+        )?;
+        program.replay_prefill(stream, route)?;
+        return Ok(token_ids.len());
+    }
+
+    for (offset, &token) in token_ids[processed_prefix..].iter().enumerate() {
+        let position = processed_prefix + offset;
+        replay_token(
+            program,
+            stream,
+            token,
+            u32::try_from(position).map_err(|_| {
+                EngineError::generation("prompt position exceeds the exact route width")
+            })?,
+        )?;
+    }
+    Ok(0)
+}
+
+const fn native_prefill_tokens(prompt_tokens: usize, processed_prefix: usize) -> Option<usize> {
+    if processed_prefix != 0 {
+        return None;
+    }
+    let mut index = 0;
+    while index < NATIVE_PREFILL_ROUTES.len() {
+        if NATIVE_PREFILL_ROUTES[index] == prompt_tokens {
+            return Some(prompt_tokens);
+        }
+        index += 1;
+    }
+    None
+}
+
 fn text_rope(position: u32) -> ([f32; ROTARY_PAIRS], [f32; ROTARY_PAIRS]) {
     let mut cosine = [0.0f32; ROTARY_PAIRS];
     let mut sine = [0.0f32; ROTARY_PAIRS];
@@ -815,7 +891,10 @@ fn require_generation_capacity(
 
 #[cfg(test)]
 mod tests {
-    use super::{ROTARY_PAIRS, require_generation_capacity, text_rope};
+    use super::{
+        NATIVE_PREFILL_ROUTES, ROTARY_PAIRS, native_prefill_tokens, require_generation_capacity,
+        text_rope,
+    };
     use crate::EngineErrorCode;
 
     #[test]
@@ -847,5 +926,19 @@ mod tests {
         assert_eq!(sine[0].to_bits(), (130.0f64.sin() as f32).to_bits());
         assert_eq!(cosine[31].to_bits(), (angle.cos() as f32).to_bits());
         assert_eq!(sine[31].to_bits(), (angle.sin() as f32).to_bits());
+    }
+
+    #[test]
+    fn native_prefill_inventory_is_exact_and_from_empty_only() {
+        for tokens in NATIVE_PREFILL_ROUTES {
+            assert_eq!(native_prefill_tokens(tokens, 0), Some(tokens));
+            assert_eq!(native_prefill_tokens(tokens, 1), None);
+            assert_eq!(native_prefill_tokens(tokens, tokens), None);
+            assert_eq!(native_prefill_tokens(tokens - 1, 0), None);
+            assert_eq!(native_prefill_tokens(tokens + 1, 0), None);
+        }
+        for tokens in [0, 1, 31, 33, 63, 65, 127, 129, 1023, 1025, 220_000] {
+            assert_eq!(native_prefill_tokens(tokens, 0), None);
+        }
     }
 }

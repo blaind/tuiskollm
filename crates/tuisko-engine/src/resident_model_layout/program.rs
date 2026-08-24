@@ -839,18 +839,26 @@ impl ResidentModelProgram {
 
         let slot = u32::try_from(slot)
             .map_err(|_| EngineError::layout("resident prefill slot exceeds u32"))?;
-        let positions = (0..tokens as u32).collect::<Vec<_>>();
-        let lengths = (1..=tokens as u32).collect::<Vec<_>>();
-        let rows = vec![slot; tokens];
+        let mut positions = [0u32; super::MAX_ROWS];
+        let mut lengths = [0u32; super::MAX_ROWS];
+        let mut rows = [0u32; super::MAX_ROWS];
+        for token in 0..tokens {
+            positions[token] = token as u32;
+            lengths[token] = token as u32 + 1;
+            rows[token] = slot;
+        }
         let workspace = self.layout.workspace;
         self.arena
-            .copy_prefix_from_host(stream, workspace.state_rows, &rows)?;
+            .copy_prefix_from_host(stream, workspace.state_rows, &rows[..tokens])?;
         self.arena
-            .copy_prefix_from_host(stream, workspace.table_rows, &rows)?;
+            .copy_prefix_from_host(stream, workspace.table_rows, &rows[..tokens])?;
+        self.arena.copy_prefix_from_host(
+            stream,
+            workspace.cache_positions,
+            &positions[..tokens],
+        )?;
         self.arena
-            .copy_prefix_from_host(stream, workspace.cache_positions, &positions)?;
-        self.arena
-            .copy_prefix_from_host(stream, workspace.lengths, &lengths)?;
+            .copy_prefix_from_host(stream, workspace.lengths, &lengths[..tokens])?;
         self.arena
             .copy_prefix_from_host(stream, workspace.rope_cos, rope_cos)?;
         self.arena
