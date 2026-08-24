@@ -134,7 +134,7 @@ fn checked_ssh_key() -> RemoteResult<PathBuf> {
 }
 
 /// Provisions and validates a GPU without uploading a device artifact.
-pub fn run_probe(options: &ProbeOptions) -> RemoteResult<()> {
+pub fn run_probe(workspace_root: &Path, options: &ProbeOptions) -> RemoteResult<()> {
     if options.max_minutes < 2 {
         return Err(RemoteError::DeadlineExceeded {
             minutes: options.max_minutes,
@@ -146,6 +146,7 @@ pub fn run_probe(options: &ProbeOptions) -> RemoteResult<()> {
     let budget = Duration::from_secs(u64::from(options.max_minutes) * 60);
     let provisioning_deadline = started + PROVISIONING_DEADLINE.min(budget);
     let (guard, ssh, pod_id, cost_per_hour) = open_pod(
+        workspace_root,
         &api,
         options.gpu,
         &options.image,
@@ -188,6 +189,7 @@ pub fn run_qualification(
     let budget = Duration::from_secs(u64::from(options.max_minutes) * 60);
     let provisioning_deadline = started + PROVISIONING_DEADLINE.min(budget);
     let (mut guard, ssh, pod_id, cost_per_hour) = open_pod(
+        workspace_root,
         &api,
         options.gpu,
         &options.image,
@@ -277,6 +279,7 @@ pub fn run_benchmark(workspace_root: &Path, options: &BenchmarkOptions) -> Remot
     let budget = Duration::from_secs(u64::from(options.max_minutes) * 60);
     let provisioning_deadline = started + PROVISIONING_DEADLINE.min(budget);
     let (mut guard, ssh, pod_id, cost_per_hour) = open_pod(
+        workspace_root,
         &api,
         options.gpu,
         &options.image,
@@ -344,9 +347,9 @@ pub fn run_benchmark(workspace_root: &Path, options: &BenchmarkOptions) -> Remot
 }
 
 /// Verifies API authentication and reports pods owned by this worktree.
-pub fn check() -> RemoteResult<()> {
+pub fn check(workspace_root: &Path) -> RemoteResult<()> {
     let pods = V2::new(resolve_api_key()?).list_pods()?;
-    let owned_ids = owned_pod_ids()?;
+    let owned_ids = owned_pod_ids(workspace_root)?;
     let now = unix_seconds();
     let owned = pods
         .iter()
@@ -389,10 +392,10 @@ pub fn check() -> RemoteResult<()> {
 }
 
 /// Deletes pods recorded as owned by this worktree.
-pub fn sweep_stale() -> RemoteResult<u32> {
+pub fn sweep_stale(workspace_root: &Path) -> RemoteResult<u32> {
     let api = V2::new(resolve_api_key()?);
     let now = unix_seconds();
-    let mut targets = owned_pod_ids()?
+    let mut targets = owned_pod_ids(workspace_root)?
         .into_iter()
         .map(|pod_id| (pod_id, "current-worktree ownership"))
         .collect::<BTreeMap<_, _>>();
@@ -417,7 +420,7 @@ pub fn sweep_stale() -> RemoteResult<u32> {
     let mut swept = 0u32;
     for (pod_id, reason) in targets {
         delete_pod(&pod_id)?;
-        forget_owned_pod(&owned_pod_path(&pod_id)?);
+        forget_owned_pod(&owned_pod_path(workspace_root, &pod_id));
         std::fs::remove_file(crate::sentry::keep_file_path(&pod_id)).ok();
         println!("deleted remote pod {pod_id} ({reason})");
         swept += 1;
@@ -427,7 +430,9 @@ pub fn sweep_stale() -> RemoteResult<u32> {
     Ok(swept)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_pod(
+    workspace_root: &Path,
     api: &V2,
     gpu: GpuTarget,
     image: &str,
@@ -436,7 +441,7 @@ fn open_pod(
     budget: Duration,
     deadline: Instant,
 ) -> RemoteResult<(PodGuard, Ssh, String, Option<f64>)> {
-    let ownership_directory = ownership_directory()?;
+    let ownership_directory = ownership_directory(workspace_root);
     let name = leased_pod_name(unix_seconds(), budget, keep_on_fail);
     println!("creating {name} (1x secure {})", gpu.device_name());
     let pod = api.create_gate_pod(&name, image, gpu)?;
@@ -715,16 +720,12 @@ fn sha256_hex(path: &Path) -> RemoteResult<String> {
         .collect())
 }
 
-fn ownership_directory() -> RemoteResult<PathBuf> {
-    let current = std::env::current_dir().map_err(|source| RemoteError::Read {
-        what: "current worktree directory".to_owned(),
-        source,
-    })?;
-    Ok(current.join("target/remote-state/pods"))
+fn ownership_directory(workspace_root: &Path) -> PathBuf {
+    workspace_root.join("target/remote-state/pods")
 }
 
-fn owned_pod_path(pod_id: &str) -> RemoteResult<PathBuf> {
-    Ok(ownership_directory()?.join(format!("{pod_id}{OWNED_POD_SUFFIX}")))
+fn owned_pod_path(workspace_root: &Path, pod_id: &str) -> PathBuf {
+    ownership_directory(workspace_root).join(format!("{pod_id}{OWNED_POD_SUFFIX}"))
 }
 
 fn record_owned_pod(path: &Path) -> RemoteResult<()> {
@@ -752,8 +753,8 @@ fn forget_owned_pod(path: &Path) {
     }
 }
 
-fn owned_pod_ids() -> RemoteResult<BTreeSet<String>> {
-    let directory = ownership_directory()?;
+fn owned_pod_ids(workspace_root: &Path) -> RemoteResult<BTreeSet<String>> {
+    let directory = ownership_directory(workspace_root);
     let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),

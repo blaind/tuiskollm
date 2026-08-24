@@ -245,11 +245,11 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     };
     match command {
         "check" if arguments.len() == 1 => {
-            tuisko_remote::check().map_err(|error| format!("{error}"))?;
+            tuisko_remote::check(root).map_err(|error| format!("{error}"))?;
             return Ok(());
         }
         "sweep" if arguments.len() == 1 => {
-            tuisko_remote::sweep_stale().map_err(|error| format!("{error}"))?;
+            tuisko_remote::sweep_stale(root).map_err(|error| format!("{error}"))?;
             return Ok(());
         }
         "sentry" => return run_sentry(arguments),
@@ -259,12 +259,15 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if command == "probe" {
         let options = parse_options(&arguments[1..], false)?;
         tuisko_remote::check_credentials().map_err(|error| format!("{error}"))?;
-        tuisko_remote::run_probe(&tuisko_remote::ProbeOptions {
-            gpu: options.gpu.remote_gpu(),
-            image: options.image,
-            max_minutes: options.max_minutes,
-            keep_on_fail: options.keep_on_fail,
-        })
+        tuisko_remote::run_probe(
+            root,
+            &tuisko_remote::ProbeOptions {
+                gpu: options.gpu.remote_gpu(),
+                image: options.image,
+                max_minutes: options.max_minutes,
+                keep_on_fail: options.keep_on_fail,
+            },
+        )
         .map_err(|error| format!("{error}"))?;
         return Ok(());
     }
