@@ -1,13 +1,13 @@
 //! Source-BF16 paged grouped-query attention for admitted MTP layers.
 
-use crate::device::paged_gqa::{DECODE_RING_SHARED_BYTES, bf16_paged_gqa};
-use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
+use crate::device::paged_gqa::{DECODE_SHARED_VALUES, DECODE_THREADS, bf16_paged_gqa};
+use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
 use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
-const THREADS: u32 = 32;
+const THREADS: u32 = DECODE_THREADS as u32;
 
 fn admitted_batch(batch: usize) -> bool {
     (1..=MAX_BATCH).contains(&batch)
@@ -20,14 +20,13 @@ mod kernels {
 
     /// Applies represented-BF16 paged GQA for one exact MTP decode batch.
     #[kernel]
-    #[launch_bounds(32, 16)]
+    #[launch_bounds(256, 2)]
     #[allow(clippy::too_many_arguments)]
     #[launch_contract(
         domain = 1,
         coordinates = u32,
-        block = (32, 1, 1),
-        dynamic_shared = 8192,
-        dynamic_shared_alignment = 16,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
         min_compute_capability = (12, 0),
     )]
     pub fn mtp_bf16_paged_gqa<const TOKENS: usize>(
@@ -40,9 +39,12 @@ mod kernels {
         lengths: *const u32,
         output: *mut f32,
     ) {
-        // One warp owns one 256-wide query head and preserves the established
-        // online-softmax order. B=8 exposes 192 CTAs, enough for one target-SM
-        // wave; combining heads would change the represented arithmetic route.
+        static mut DECODE_PARTIALS: SharedArray<f32, DECODE_SHARED_VALUES, 16> =
+            SharedArray::UNINIT;
+        let partials = core::ptr::addr_of_mut!(DECODE_PARTIALS).cast::<f32>();
+
+        // Eight warps use the same represented-BF16 slice schedule as the
+        // target decode route.
         unsafe {
             bf16_paged_gqa::<Qwen38_27B, TOKENS>(
                 query,
@@ -53,6 +55,7 @@ mod kernels {
                 table_stride,
                 lengths,
                 output,
+                partials,
             );
         }
     }
@@ -157,11 +160,7 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
 
         Ok(Self {
             attention: module
-                .prepare_mtp_bf16_paged_gqa::<TOKENS>(LaunchConfig1D::new(
-                    blocks,
-                    THREADS,
-                    DECODE_RING_SHARED_BYTES as u32,
-                ))
+                .prepare_mtp_bf16_paged_gqa::<TOKENS>(LaunchConfig1D::new(blocks, THREADS, 0))
                 .map_err(|source| GpuError::launch("preparing MTP BF16 paged GQA", source))?,
         })
     }
@@ -464,7 +463,7 @@ mod tests {
 
         assert_eq!(names.len(), 8);
         assert_eq!(unique.len(), names.len());
-        assert_eq!(THREADS, 32);
+        assert_eq!(THREADS, 256);
         for batch in 0..=9 {
             assert_eq!(admitted_batch(batch), (1..=8).contains(&batch));
         }
