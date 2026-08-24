@@ -7,6 +7,7 @@ use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, P
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1_024];
 const HIDDEN: usize = Qwen38_27B::HIDDEN;
 const FUSION_COLUMNS: usize = 2 * HIDDEN;
 const OUTPUT_TILES: usize = HIDDEN / 8;
@@ -121,6 +122,78 @@ mod kernels {
         }
     }
 
+    #[inline(always)]
+    unsafe fn projection_prefill_body<const TOKENS: usize>(
+        normalized_embedding: *const u32,
+        normalized_hidden: *const u32,
+        weight: *const u32,
+        output: *mut u32,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_index = tid >> 5;
+        let group = lane >> 2;
+        let thread_in_group = lane & 3;
+        let block = thread::blockIdx_x() as usize;
+        let output_block = block % BLOCKS as usize;
+        let token_tile = block / BLOCKS as usize;
+        let output_tile = output_block * WARPS + warp_index;
+        let weight_row = output_tile * 8 + group;
+        let token_row = token_tile * 16 + group;
+        let mut accumulator = [0.0f32; 4];
+        let mut column = 0usize;
+
+        while column < FUSION_COLUMNS {
+            let activation = unsafe {
+                [
+                    input_pair::<TOKENS>(
+                        normalized_embedding,
+                        normalized_hidden,
+                        token_row,
+                        column + 2 * thread_in_group,
+                    ),
+                    input_pair::<TOKENS>(
+                        normalized_embedding,
+                        normalized_hidden,
+                        token_row + 8,
+                        column + 2 * thread_in_group,
+                    ),
+                    input_pair::<TOKENS>(
+                        normalized_embedding,
+                        normalized_hidden,
+                        token_row,
+                        column + 8 + 2 * thread_in_group,
+                    ),
+                    input_pair::<TOKENS>(
+                        normalized_embedding,
+                        normalized_hidden,
+                        token_row + 8,
+                        column + 8 + 2 * thread_in_group,
+                    ),
+                ]
+            };
+            let weights = unsafe {
+                [
+                    weight_pair(weight, weight_row, column + 2 * thread_in_group),
+                    weight_pair(weight, weight_row, column + 8 + 2 * thread_in_group),
+                ]
+            };
+            accumulator = unsafe { wmma::mma_m16n8k16_f32_bf16(accumulator, activation, weights) };
+            column += 16;
+        }
+
+        let output_words = HIDDEN / 2;
+        let output_column_word = output_tile * 4 + thread_in_group;
+        // Sixteen prompt rows fill both native fragment halves. One CTA still
+        // owns 64 adjacent outputs, retaining the measured decode weight walk.
+        unsafe {
+            *output.add(token_row * output_words + output_column_word) =
+                tcgen05::cvt_f32x2_bf16x2(accumulator[0], accumulator[1]);
+            *output.add((token_row + 8) * output_words + output_column_word) =
+                tcgen05::cvt_f32x2_bf16x2(accumulator[2], accumulator[3]);
+        }
+    }
+
     /// Projects exact MTP decode rows through the source-BF16 fusion matrix.
     #[kernel]
     #[launch_bounds(256, 2)]
@@ -142,10 +215,78 @@ mod kernels {
             projection_body::<TOKENS>(normalized_embedding, normalized_hidden, weight, output);
         }
     }
+
+    /// Projects an exact MTP prompt tile through the source-BF16 fusion matrix.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn mtp_bf16_fusion_prefill<const TOKENS: usize>(
+        normalized_embedding: *const u32,
+        normalized_hidden: *const u32,
+        weight: *const u32,
+        output: *mut u32,
+    ) {
+        unsafe {
+            projection_prefill_body::<TOKENS>(
+                normalized_embedding,
+                normalized_hidden,
+                weight,
+                output,
+            );
+        }
+    }
 }
 
 struct PreparedRoute<const TOKENS: usize> {
     projection: PreparedLaunch<kernels::__mtp_bf16_fusion_CudaKernel<TOKENS>>,
+}
+
+struct PreparedPrefillRoute<const TOKENS: usize> {
+    projection: PreparedLaunch<kernels::__mtp_bf16_fusion_prefill_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let token_tiles = TOKENS / 16;
+        let blocks = u32::try_from(BLOCKS as usize * token_tiles)
+            .map_err(|_| GpuError::invalid_launch("MTP BF16 fusion prefill grid exceeds u32"))?;
+        Ok(Self {
+            projection: module
+                .prepare_mtp_bf16_fusion_prefill::<TOKENS>(LaunchConfig1D::new(blocks, THREADS, 0))
+                .map_err(|source| {
+                    GpuError::launch("preparing the MTP BF16 fusion prefill projection", source)
+                })?,
+        })
+    }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        normalized_embedding: *const u16,
+        normalized_hidden: *const u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .mtp_bf16_fusion_prefill::<TOKENS>(
+                stream,
+                &self.projection,
+                normalized_embedding.cast::<u32>(),
+                normalized_hidden.cast::<u32>(),
+                weight.cast::<u32>(),
+                output.cast::<u32>(),
+            )
+            .map_err(|source| {
+                GpuError::launch("launching the MTP BF16 fusion prefill projection", source)
+            })
+    }
 }
 
 impl<const TOKENS: usize> PreparedRoute<TOKENS> {
@@ -195,6 +336,16 @@ pub(crate) fn mtp_bf16_fusion_ptx_names() -> [&'static str; MAX_BATCH] {
     ]
 }
 
+/// Stable PTX symbol inventory for every exact MTP fusion prompt tile.
+pub(crate) fn mtp_bf16_fusion_prefill_ptx_names() -> [&'static str; 4] {
+    [
+        kernels::mtp_bf16_fusion_prefill_ptx_name::<32>(),
+        kernels::mtp_bf16_fusion_prefill_ptx_name::<64>(),
+        kernels::mtp_bf16_fusion_prefill_ptx_name::<128>(),
+        kernels::mtp_bf16_fusion_prefill_ptx_name::<1_024>(),
+    ]
+}
+
 /// Prepared source-BF16 input-fusion routes for exact MTP decode `B=1..=8`.
 pub struct MtpBf16FusionOp {
     norm: ResidualNormOp,
@@ -207,6 +358,10 @@ pub struct MtpBf16FusionOp {
     b6: PreparedRoute<6>,
     b7: PreparedRoute<7>,
     b8: PreparedRoute<8>,
+    t32: PreparedPrefillRoute<32>,
+    t64: PreparedPrefillRoute<64>,
+    t128: PreparedPrefillRoute<128>,
+    t1024: PreparedPrefillRoute<1_024>,
 }
 
 impl MtpBf16FusionOp {
@@ -220,7 +375,10 @@ impl MtpBf16FusionOp {
                 "Qwen3.8 MTP fusion geometry does not tile exact BF16 MMA shapes",
             ));
         }
-        let _ = mtp_bf16_fusion_ptx_names();
+        let _ = (
+            mtp_bf16_fusion_ptx_names(),
+            mtp_bf16_fusion_prefill_ptx_names(),
+        );
         // SAFETY: this crate owns the embedded MTP fusion artifact.
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module("loading the MTP BF16 fusion module", source))?;
@@ -235,6 +393,10 @@ impl MtpBf16FusionOp {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
+            t1024: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -292,6 +454,21 @@ impl MtpBf16FusionOp {
             };
         }
 
+        macro_rules! launch_prefill {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        normalized_embedding,
+                        normalized_hidden,
+                        projection_weight,
+                        output,
+                    )
+                }
+            };
+        }
+
         match batch {
             1 => launch!(b1),
             2 => launch!(b2),
@@ -301,8 +478,12 @@ impl MtpBf16FusionOp {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch_prefill!(t32),
+            64 => launch_prefill!(t64),
+            128 => launch_prefill!(t128),
+            1_024 => launch_prefill!(t1024),
             _ => Err(GpuError::invalid_launch(format!(
-                "MTP BF16 fusion batch {batch} is outside exact B=1..={MAX_BATCH}"
+                "MTP BF16 fusion rows {batch} are outside exact B=1..={MAX_BATCH} or T={PREFILL_ROUTES:?}"
             ))),
         }
     }
@@ -310,7 +491,10 @@ impl MtpBf16FusionOp {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCKS, FUSION_COLUMNS, HIDDEN, OUTPUT_TILES, WARPS, mtp_bf16_fusion_ptx_names};
+    use super::{
+        BLOCKS, FUSION_COLUMNS, HIDDEN, OUTPUT_TILES, PREFILL_ROUTES, WARPS,
+        mtp_bf16_fusion_prefill_ptx_names, mtp_bf16_fusion_ptx_names,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -329,5 +513,9 @@ mod tests {
 
         assert_eq!(names.len(), 8);
         assert_eq!(unique.len(), names.len());
+        let prefill = mtp_bf16_fusion_prefill_ptx_names();
+        assert_eq!(PREFILL_ROUTES, [32, 64, 128, 1_024]);
+        assert_eq!(prefill.len(), PREFILL_ROUTES.len());
+        assert_eq!(prefill.iter().copied().collect::<BTreeSet<_>>().len(), 4);
     }
 }

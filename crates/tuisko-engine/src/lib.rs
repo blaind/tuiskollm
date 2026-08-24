@@ -12,6 +12,8 @@ mod layout;
 mod long_context_kv_layout;
 mod mtp_layer;
 mod mtp_layer_layout;
+mod mtp_prompt_prime;
+mod mtp_prompt_prime_layout;
 mod nvfp4_mlp;
 mod nvfp4_mlp_layout;
 mod paged_kv_slots;
@@ -41,6 +43,8 @@ pub use long_context_kv_layout::{
 };
 pub use mtp_layer::MtpLayerProgram;
 pub use mtp_layer_layout::MtpLayerLayout;
+pub use mtp_prompt_prime::{MtpPromptPrimeProgram, MtpPromptPrimeRoute};
+pub use mtp_prompt_prime_layout::MtpPromptPrimeLayout;
 pub use nvfp4_mlp::Nvfp4MlpProgram;
 pub use nvfp4_mlp_layout::Nvfp4MlpLayout;
 pub use paged_kv_slots::{PagedKvRoute, PagedKvSlotPool, PagedKvSlotState, PagedKvTableUpdate};
@@ -68,6 +72,8 @@ pub use dense_fp8_mlp::DenseFp8MlpObservables;
 pub use full_attention_layer::FullAttentionLayerObservables;
 #[cfg(feature = "qualification")]
 pub use mtp_layer::MtpLayerObservables;
+#[cfg(feature = "qualification")]
+pub use mtp_prompt_prime::MtpPromptPrimeObservables;
 #[cfg(feature = "qualification")]
 pub use nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
 #[cfg(feature = "qualification")]

@@ -707,6 +707,55 @@ impl DeviceArena {
         .map_err(|source| GpuError::driver("copying a pinned host prefix into an arena", source))
     }
 
+    /// Enqueues a typed prefix copy between two checked arena regions.
+    ///
+    /// # Safety
+    ///
+    /// Both arenas must remain live until the stream reaches the copy. If the copy is captured in
+    /// a CUDA Graph, both arena allocations and their addresses must remain stable through the
+    /// final graph replay. Source and destination prefixes must not overlap unless identical.
+    pub unsafe fn copy_prefix_from_arena_async<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        destination: ArenaRegion<T>,
+        source_arena: &DeviceArena,
+        source: ArenaRegion<T>,
+        len: usize,
+    ) -> GpuResult<()> {
+        self.require_stream_context(stream, "copying between device arenas")?;
+        source_arena.require_stream_context(stream, "copying between device arenas")?;
+        if len > destination.len || len > source.len {
+            return Err(GpuError::arena(format!(
+                "device copy length {len} exceeds destination {} or source {} elements",
+                destination.len, source.len
+            )));
+        }
+        let destination_address = self.address(destination)? as u64;
+        let source_address = source_arena.address(source)? as u64;
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena("device copy byte count overflows"))?;
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|source| GpuError::driver("binding the device-copy CUDA context", source))?;
+        // SAFETY: both checked typed prefixes cover `bytes`; the caller owns the asynchronous
+        // lifetimes and non-overlap contract documented by this method.
+        unsafe {
+            cuda_core::memory::memcpy_dtod_async(
+                destination_address,
+                source_address,
+                bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|source| GpuError::driver("copying between device arenas", source))
+    }
+
     /// Copies one complete typed region into an owned host vector.
     pub fn copy_to_host<T: DeviceCopy>(
         &self,

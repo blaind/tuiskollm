@@ -1208,6 +1208,36 @@ impl ResidentModelProgram {
         Ok(())
     }
 
+    pub(crate) fn validate_mtp_prompt_cache(
+        &self,
+        slot: usize,
+        first_position: usize,
+        rows: usize,
+    ) -> EngineResult<()> {
+        require_slot(slot)?;
+        let context_tokens = first_position
+            .checked_add(rows)
+            .ok_or_else(|| EngineError::route("MTP prompt cache position overflows"))?;
+        if context_tokens > self.context_capacity() {
+            return Err(EngineError::route(format!(
+                "MTP prompt cache requires {context_tokens} positions, current resident capacity is {}",
+                self.context_capacity()
+            )));
+        }
+        let reserved_tokens = self
+            .kv_slots
+            .page_count(slot)?
+            .checked_mul(ATTENTION_PAGE_SIZE)
+            .ok_or_else(|| EngineError::layout("MTP prompt reserved capacity overflows"))?;
+        if reserved_tokens < context_tokens {
+            return Err(EngineError::route(format!(
+                "MTP prompt slot {slot} owns {reserved_tokens} cache positions, expected at least {context_tokens}"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Replays the immutable graph selected by the matching decode-state upload.
     pub fn replay(&self, stream: &CudaStream, route: ResidentDecodeRoute) -> EngineResult<()> {
         self.graphs.select(route).launch(stream)?;
@@ -1272,6 +1302,23 @@ impl ResidentModelProgram {
         )?)
     }
 
+    #[cfg(feature = "qualification")]
+    /// Reads every raw target residual row produced by one exact prefill route.
+    pub fn qualification_prefill_residual(
+        &self,
+        stream: &CudaStream,
+        route: ResidentPrefillRoute,
+    ) -> EngineResult<Vec<u16>> {
+        let values = product(
+            "resident prefill residual elements",
+            route.tokens,
+            Qwen38_27B::HIDDEN,
+        )?;
+        Ok(self
+            .arena
+            .copy_prefix_to_host(stream, self.layout.workspace.residual_a, values)?)
+    }
+
     /// Reads active BF16 logits into one reusable host allocation.
     pub fn read_logits_into(
         &self,
@@ -1302,9 +1349,69 @@ impl ResidentModelProgram {
             .copy_prefix_to_host(stream, self.layout.workspace.residual_a, values)?)
     }
 
+    /// Enqueues the raw target residual and current page table into an MTP prompt owner.
+    ///
+    /// # Safety
+    ///
+    /// The destination arena must remain live until the stream reaches both copies. If these
+    /// copies are captured in a graph, this resident owner and the destination arena must keep
+    /// their addresses stable through the final replay.
+    pub(crate) unsafe fn enqueue_mtp_prompt_handoff(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        destination: &DeviceArena,
+        target_hidden: ArenaRegion<u16>,
+        block_tables: ArenaRegion<u32>,
+    ) -> GpuResult<()> {
+        if !(1..=super::MAX_ROWS).contains(&rows) {
+            return Err(GpuError::invalid_launch(format!(
+                "MTP prompt handoff rows {rows} are outside 1..={}",
+                super::MAX_ROWS
+            )));
+        }
+        let hidden_values = rows.checked_mul(Qwen38_27B::HIDDEN).ok_or_else(|| {
+            GpuError::invalid_launch("MTP prompt target-hidden element count overflows")
+        })?;
+        // SAFETY: the checked resident and destination regions remain owned by the two programs;
+        // the caller supplies the graph/stream lifetime promised by this method.
+        unsafe {
+            destination.copy_prefix_from_arena_async(
+                stream,
+                target_hidden,
+                &self.arena,
+                self.layout.workspace.residual_a,
+                hidden_values,
+            )?;
+            destination.copy_prefix_from_arena_async(
+                stream,
+                block_tables,
+                &self.kv_arena,
+                self.layout.kv_layout.block_tables(),
+                self.layout.kv_layout.block_tables().len(),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    pub(crate) fn qualification_mtp_prompt_source_addresses(&self) -> GpuResult<[usize; 2]> {
+        Ok([
+            self.arena.address(self.layout.workspace.residual_a)?.addr(),
+            self.kv_arena
+                .address(self.layout.kv_layout.block_tables())?
+                .addr(),
+        ])
+    }
+
     /// CUDA context shared by the arena, graphs, and prepared operators.
     pub const fn context(&self) -> &Arc<CudaContext> {
         &self.context
+    }
+
+    pub(crate) const fn snapshot(&self) -> &Arc<CheckpointSnapshot<Qwen38_27B>> {
+        &self.snapshot
     }
 
     /// Stable base address captured by all exact-batch graphs.

@@ -7,6 +7,7 @@ use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, P
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1_024];
 const WARPS_PER_CTA: usize = 8;
 const THREADS: u32 = (WARPS_PER_CTA * 32) as u32;
 
@@ -63,10 +64,116 @@ mod kernels {
             );
         }
     }
+
+    /// Prepares Q/K and appends represented BF16 K/V for one exact MTP prompt tile.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn mtp_bf16_qk_prepare_prefill<const TOKENS: usize>(
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u16,
+        value_pages: *mut u16,
+    ) {
+        // One warp still owns one 256-wide head. The smallest prompt route
+        // exposes 112 CTAs and T=1024 exposes 3,584, without changing the
+        // warp-local reduction or MRoPE arithmetic qualified for decode.
+        unsafe {
+            qwen35_attention_qk_prepare::<Qwen38_27B, TOKENS>(
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+            );
+        }
+    }
 }
 
 struct PreparedRoute<const TOKENS: usize> {
     prepare: PreparedLaunch<kernels::__mtp_bf16_qk_prepare_CudaKernel<TOKENS>>,
+}
+
+struct PreparedPrefillRoute<const TOKENS: usize> {
+    prepare: PreparedLaunch<kernels::__mtp_bf16_qk_prepare_prefill_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let head_warps = TOKENS * (Qwen38_27B::NUM_ATTENTION_HEADS + Qwen38_27B::NUM_KV_HEADS);
+        let blocks = u32::try_from(head_warps.div_ceil(WARPS_PER_CTA))
+            .map_err(|_| GpuError::invalid_launch("MTP BF16 Q/K prefill grid exceeds u32"))?;
+
+        Ok(Self {
+            prepare: module
+                .prepare_mtp_bf16_qk_prepare_prefill::<TOKENS>(LaunchConfig1D::new(
+                    blocks, THREADS, 0,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing the MTP BF16 Q/K prefill route", source)
+                })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u16,
+        value_pages: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .mtp_bf16_qk_prepare_prefill::<TOKENS>(
+                stream,
+                &self.prepare,
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+            )
+            .map_err(|source| GpuError::launch("launching the MTP BF16 Q/K prefill route", source))
+    }
 }
 
 impl<const TOKENS: usize> PreparedRoute<TOKENS> {
@@ -135,6 +242,16 @@ pub(crate) fn mtp_bf16_qk_prepare_ptx_names() -> [&'static str; MAX_BATCH] {
     ]
 }
 
+/// Stable PTX symbol inventory for every exact MTP Q/K prompt tile.
+pub(crate) fn mtp_bf16_qk_prepare_prefill_ptx_names() -> [&'static str; 4] {
+    [
+        kernels::mtp_bf16_qk_prepare_prefill_ptx_name::<32>(),
+        kernels::mtp_bf16_qk_prepare_prefill_ptx_name::<64>(),
+        kernels::mtp_bf16_qk_prepare_prefill_ptx_name::<128>(),
+        kernels::mtp_bf16_qk_prepare_prefill_ptx_name::<1_024>(),
+    ]
+}
+
 /// Prepared Qwen3.8 MTP Q/K normalization, MRoPE, and BF16 cache routes.
 pub struct MtpBf16QkPrepareOp {
     module: kernels::LoadedModule,
@@ -146,6 +263,10 @@ pub struct MtpBf16QkPrepareOp {
     b6: PreparedRoute<6>,
     b7: PreparedRoute<7>,
     b8: PreparedRoute<8>,
+    t32: PreparedPrefillRoute<32>,
+    t64: PreparedPrefillRoute<64>,
+    t128: PreparedPrefillRoute<128>,
+    t1024: PreparedPrefillRoute<1_024>,
 }
 
 impl MtpBf16QkPrepareOp {
@@ -163,7 +284,10 @@ impl MtpBf16QkPrepareOp {
                 "Qwen3.8 geometry is incompatible with the MTP BF16 Q/K schedule",
             ));
         }
-        let _ = mtp_bf16_qk_prepare_ptx_names();
+        let _ = (
+            mtp_bf16_qk_prepare_ptx_names(),
+            mtp_bf16_qk_prepare_prefill_ptx_names(),
+        );
         // SAFETY: this crate owns the embedded exact MTP artifact.
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module("loading the MTP BF16 Q/K module", source))?;
@@ -177,6 +301,10 @@ impl MtpBf16QkPrepareOp {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
+            t1024: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -210,9 +338,9 @@ impl MtpBf16QkPrepareOp {
         key_pages: *mut u16,
         value_pages: *mut u16,
     ) -> GpuResult<()> {
-        if !admitted_batch(batch) {
+        if !admitted_batch(batch) && !PREFILL_ROUTES.contains(&batch) {
             return Err(GpuError::invalid_launch(format!(
-                "MTP BF16 Q/K batch {batch} is outside the admitted range 1..={MAX_BATCH}"
+                "MTP BF16 Q/K rows {batch} are outside exact B=1..={MAX_BATCH} or T={PREFILL_ROUTES:?}"
             )));
         }
         let table_stride = u32::try_from(table_stride)
@@ -247,6 +375,30 @@ impl MtpBf16QkPrepareOp {
             };
         }
 
+        macro_rules! launch_prefill {
+            ($route:ident) => {
+                // SAFETY: exact-T dispatch preserves the public pointer contract.
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        qkv,
+                        query_norm,
+                        key_norm,
+                        rope_cos,
+                        rope_sin,
+                        block_tables,
+                        table_rows,
+                        table_stride,
+                        cache_positions,
+                        query,
+                        key_pages,
+                        value_pages,
+                    )
+                }
+            };
+        }
+
         match batch {
             1 => launch!(b1),
             2 => launch!(b2),
@@ -256,6 +408,10 @@ impl MtpBf16QkPrepareOp {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch_prefill!(t32),
+            64 => launch_prefill!(t64),
+            128 => launch_prefill!(t128),
+            1_024 => launch_prefill!(t1024),
             _ => unreachable!(),
         }
     }
@@ -263,7 +419,10 @@ impl MtpBf16QkPrepareOp {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, THREADS, admitted_batch, mtp_bf16_qk_prepare_ptx_names};
+    use super::{
+        MAX_BATCH, PREFILL_ROUTES, THREADS, admitted_batch, mtp_bf16_qk_prepare_prefill_ptx_names,
+        mtp_bf16_qk_prepare_ptx_names,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -276,6 +435,10 @@ mod tests {
 
         assert_eq!(names.len(), MAX_BATCH);
         assert_eq!(unique.len(), names.len());
+        let prefill = mtp_bf16_qk_prepare_prefill_ptx_names();
+        assert_eq!(PREFILL_ROUTES, [32, 64, 128, 1_024]);
+        assert_eq!(prefill.len(), PREFILL_ROUTES.len());
+        assert_eq!(prefill.iter().copied().collect::<BTreeSet<_>>().len(), 4);
         assert_eq!(THREADS, 256);
     }
 }

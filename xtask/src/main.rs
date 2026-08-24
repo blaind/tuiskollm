@@ -141,6 +141,12 @@ const MTP_LAYER_RESOURCE_BASELINES: &[&str] = &[
     MTP_BF16_MLP_RESOURCE_BASELINE,
     FP8_LM_HEAD_RESOURCE_BASELINE,
 ];
+const MTP_PROMPT_PRIME_RESOURCE_BASELINES: &[&str] = &[
+    RESIDUAL_NORM_RESOURCE_BASELINE,
+    MTP_BF16_FUSION_RESOURCE_BASELINE,
+    MTP_BF16_QKV_RESOURCE_BASELINE,
+    MTP_BF16_QK_PREPARE_RESOURCE_BASELINE,
+];
 const QWEN35_FULL_ATTENTION_LAYER_RESOURCE_BASELINES: &[&str] = &[
     QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE,
     QWEN35_NVFP4_QKV_RESOURCE_BASELINE,
@@ -652,6 +658,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-full-attention-layer") => qualify_full_attention_layer(root, &remaining),
         Some("qualify-mtp-layer") => qualify_mtp_layer(root, &remaining),
         Some("qualify-target-mtp-verify") => qualify_target_mtp_verify(root, &remaining),
+        Some("qualify-mtp-prompt-prime") => qualify_mtp_prompt_prime(root, &remaining),
         Some("qualify-qwen35-full-attention-layer") => {
             qualify_qwen35_full_attention_layer(root, &remaining)
         }
@@ -703,6 +710,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-full-attention-layer") => bench_full_attention_layer(root, &remaining),
         Some("bench-mtp-layer") => bench_mtp_layer(root, &remaining),
         Some("bench-target-mtp-verify") => bench_target_mtp_verify(root, &remaining),
+        Some("bench-mtp-prompt-prime") => bench_mtp_prompt_prime(root, &remaining),
         Some("bench-qwen35-full-attention-layer") => {
             bench_qwen35_full_attention_layer(root, &remaining)
         }
@@ -2157,6 +2165,46 @@ fn qualify_target_mtp_verify(
     gate_resident_model_resources(root)
 }
 
+fn qualify_mtp_prompt_prime(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-mtp-prompt-prime SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "mtp_prompt_prime_suite_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_mtp_prompt_prime(root)
+}
+
+pub(crate) fn gate_mtp_prompt_prime(root: &Path) -> Result<(), Box<dyn Error>> {
+    gate_residual_norm(root)?;
+    gate_mtp_bf16_fusion(root)?;
+    gate_mtp_bf16_qkv(root)?;
+    gate_mtp_bf16_qk_prepare(root)
+}
+
 pub(crate) fn gate_mtp_layer(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_residual_norm(root)?;
     gate_mtp_bf16_fusion(root)?;
@@ -2943,6 +2991,39 @@ fn bench_target_mtp_verify(
     run_visible(
         Command::new(executable)
             .arg("target-mtp-verify")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_mtp_prompt_prime(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-mtp-prompt-prime SNAPSHOT [options]".into(),
+        );
+    };
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = Vec::new();
+    for baseline in MTP_PROMPT_PRIME_RESOURCE_BASELINES {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("mtp-prompt-prime")
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
@@ -4475,6 +4556,15 @@ pub(crate) fn prepare_remote_mtp_layer_benchmark(
     gpu: gpu_target::GpuTarget,
 ) -> Result<RemoteBenchmark, Box<dyn Error>> {
     prepare_remote_benchmark_with_baselines(root, gpu, MTP_LAYER_RESOURCE_BASELINES)
+}
+
+/// Locates the prompt-prime benchmark and binds every launched leaf resource.
+#[cfg(feature = "remote")]
+pub(crate) fn prepare_remote_mtp_prompt_prime_benchmark(
+    root: &Path,
+    gpu: gpu_target::GpuTarget,
+) -> Result<RemoteBenchmark, Box<dyn Error>> {
+    prepare_remote_benchmark_with_baselines(root, gpu, MTP_PROMPT_PRIME_RESOURCE_BASELINES)
 }
 
 /// Locates the complete resident-model benchmark and binds every launched leaf resource.
@@ -6507,7 +6597,7 @@ fn gate_mtp_bf16_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         root,
         MTP_BF16_QK_PREPARE_RESOURCE_BASELINE,
         "mtp_bf16_qk_prepare_TID_",
-        None,
+        Some("mtp_bf16_qk_prepare_prefill_TID_"),
         "MTP BF16 Q/K prepare",
         "F2FP.BF16.F32.PACK_AB",
         "BF16",
@@ -7332,8 +7422,13 @@ fn gate_mtp_bf16_fusion(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("mtp_bf16_fusion_TID_"))
         .collect::<Vec<_>>();
+    let prefill = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("mtp_bf16_fusion_prefill_TID_"))
+        .collect::<Vec<_>>();
     require_count("MTP BF16 fusion", routes.len(), 8)?;
-    for entry in &routes {
+    require_count("MTP BF16 fusion prefill", prefill.len(), 4)?;
+    for entry in routes.iter().chain(&prefill) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
@@ -7357,31 +7452,43 @@ fn gate_mtp_bf16_fusion(root: &Path) -> Result<(), Box<dyn Error>> {
     let resources = &artifact.resources;
     let sass = artifact.sass()?;
     let mut registers = Vec::new();
+    let mut prefill_registers = Vec::new();
     let mut shared = Vec::new();
-    for entry in routes {
-        let resource = resources
-            .get(entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
-        require_spill_free(entry.name, resource)?;
-        let body = sass_function_body(sass, entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
-        for instruction in ["HMMA.16816.F32.BF16", "F2FP.BF16.F32.PACK_AB"] {
-            if !body.contains(instruction) {
-                return Err(
-                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
-                );
+    for (entries, entry_registers) in [
+        (&routes, &mut registers),
+        (&prefill, &mut prefill_registers),
+    ] {
+        for entry in entries {
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            let body = sass_function_body(sass, entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+            for instruction in ["HMMA.16816.F32.BF16", "F2FP.BF16.F32.PACK_AB"] {
+                if !body.contains(instruction) {
+                    return Err(format!(
+                        "entry `{}` lost required `{instruction}` SASS",
+                        entry.name
+                    )
+                    .into());
+                }
             }
+            entry_registers.push(resource.registers);
+            shared.push(resource.shared);
         }
-        registers.push(resource.registers);
-        shared.push(resource.shared);
     }
     registers.sort_unstable();
+    prefill_registers.sort_unstable();
     require_registers(&baseline, "fusion_registers", &registers)?;
+    if baseline.contains_key("prefill_fusion_registers") {
+        require_registers(&baseline, "prefill_fusion_registers", &prefill_registers)?;
+    }
     require_uniform_value(&baseline, "fusion_shared_bytes", &shared)?;
 
     println!(
-        "MTP BF16 fusion gate passed: 8 exact decode entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, BF16 HMMA/pack present",
-        registers, shared
+        "MTP BF16 fusion gate passed: 8 decode + 4 prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, BF16 HMMA/pack present",
+        registers, prefill_registers, shared
     );
     Ok(())
 }
@@ -7619,8 +7726,13 @@ fn gate_mtp_bf16_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("mtp_bf16_qkv_TID_"))
         .collect::<Vec<_>>();
+    let prefill = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("mtp_bf16_qkv_prefill_TID_"))
+        .collect::<Vec<_>>();
     require_count("MTP BF16 QKV", routes.len(), 8)?;
-    for entry in &routes {
+    require_count("MTP BF16 QKV prefill", prefill.len(), 4)?;
+    for entry in routes.iter().chain(&prefill) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
@@ -7644,31 +7756,43 @@ fn gate_mtp_bf16_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
     let resources = &artifact.resources;
     let sass = artifact.sass()?;
     let mut registers = Vec::new();
+    let mut prefill_registers = Vec::new();
     let mut shared = Vec::new();
-    for entry in routes {
-        let resource = resources
-            .get(entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
-        require_spill_free(entry.name, resource)?;
-        let body = sass_function_body(sass, entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
-        for instruction in ["HMMA.16816.F32.BF16", "F2FP.BF16.F32.PACK_AB"] {
-            if !body.contains(instruction) {
-                return Err(
-                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
-                );
+    for (entries, entry_registers) in [
+        (&routes, &mut registers),
+        (&prefill, &mut prefill_registers),
+    ] {
+        for entry in entries {
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            let body = sass_function_body(sass, entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+            for instruction in ["HMMA.16816.F32.BF16", "F2FP.BF16.F32.PACK_AB"] {
+                if !body.contains(instruction) {
+                    return Err(format!(
+                        "entry `{}` lost required `{instruction}` SASS",
+                        entry.name
+                    )
+                    .into());
+                }
             }
+            entry_registers.push(resource.registers);
+            shared.push(resource.shared);
         }
-        registers.push(resource.registers);
-        shared.push(resource.shared);
     }
     registers.sort_unstable();
+    prefill_registers.sort_unstable();
     require_registers(&baseline, "qkv_registers", &registers)?;
+    if baseline.contains_key("prefill_qkv_registers") {
+        require_registers(&baseline, "prefill_qkv_registers", &prefill_registers)?;
+    }
     require_uniform_value(&baseline, "qkv_shared_bytes", &shared)?;
 
     println!(
-        "MTP BF16 QKV gate passed: 8 exact decode entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, BF16 HMMA/pack present",
-        registers, shared
+        "MTP BF16 QKV gate passed: 8 decode + 4 prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, BF16 HMMA/pack present",
+        registers, prefill_registers, shared
     );
     Ok(())
 }
