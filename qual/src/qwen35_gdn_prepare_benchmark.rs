@@ -1,4 +1,4 @@
-//! Paired timings for every exact Qwen3.5 GDN prepare route.
+//! Paired timings for every exact Qwen3.5/Qwen3.6 GDN prepare route.
 
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
@@ -7,15 +7,15 @@ use crate::device_benchmark::{
     preflight, require_current_process_exclusive, warmup_launches,
 };
 use crate::qwen35_gdn_prepare::{
-    CONTROL_ROWS, HISTORY_TAPS, MAX_BATCH, QKV_ROWS, Regions, launch, layout, make_fixture,
-    upload_fixture,
+    CONTROL_ROWS, EXACT_ROUTES, HISTORY_TAPS, MAX_BATCH, QKV_ROWS, Regions, launch, layout,
+    make_fixture, upload_fixture,
 };
 use crate::target::Qwen35GdnPrepareOp;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer};
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
@@ -91,8 +91,9 @@ impl Session {
         upload_fixture(&arena, &stream, regions, &fixture)?;
         stream.synchronize().map_err(GpuError::from)?;
         let op = Qwen35GdnPrepareOp::new(&context)?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| capture_route(&op, &arena, &stream, regions, batch, repeated_operations))
+        let routes = EXACT_ROUTES
+            .iter()
+            .map(|&rows| capture_route(&op, &arena, &stream, regions, rows, repeated_operations))
             .collect::<GpuResult<Vec<_>>>()?;
 
         Ok(Self {
@@ -120,15 +121,22 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     target.route(),
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
                     &route.leaf,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 )
@@ -142,35 +150,39 @@ fn capture_route(
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
-    batch: usize,
+    rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, arena, stream, regions, batch)?;
+            launch(op, arena, stream, regions, rows)?;
         }
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
         leaf,
         repeated,
     })
 }
 
-fn logical_bytes(batch: usize) -> usize {
-    let per_token = 2 * CONTROL_ROWS * size_of::<u16>()
-        + 2 * CONTROL_ROWS * size_of::<u16>()
+fn logical_bytes(rows: usize) -> usize {
+    let weights =
+        2 * CONTROL_ROWS * size_of::<u16>() + QKV_ROWS * (HISTORY_TAPS + 1) * size_of::<u16>();
+    let control_per_token = 2 * CONTROL_ROWS * size_of::<u16>()
         + 2 * CONTROL_ROWS * size_of::<f32>()
-        + QKV_ROWS * size_of::<u16>()
-        + QKV_ROWS * (HISTORY_TAPS + 1) * size_of::<u16>()
-        + size_of::<u32>()
-        + 2 * QKV_ROWS * HISTORY_TAPS * size_of::<u16>()
-        + QKV_ROWS * size_of::<u16>();
+        + size_of::<u32>();
+    let convolution = if rows <= MAX_BATCH {
+        rows * (8 * QKV_ROWS * size_of::<u16>())
+    } else {
+        rows * (5 * QKV_ROWS * size_of::<u16>())
+            + 2 * HISTORY_TAPS * QKV_ROWS * size_of::<u16>()
+            + size_of::<u32>()
+    };
 
-    batch * per_token
+    weights + rows * control_per_token + convolution
 }
 
 /// Measures every exact Qwen3.5 control/convolution route with paired timings.
@@ -208,7 +220,7 @@ fn benchmark(
         target.workspace(),
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes - padding_bytes,
-        "max_batch=8, eight mapped history rows",
+        "max_rows=128 and eight mapped history rows",
     )?;
     memory.register_owned(
         target.padding(),
@@ -248,11 +260,30 @@ mod tests {
 
     #[test]
     fn accounting_covers_controls_convolution_and_history() {
-        let per_token = 197_124;
+        let weights = 65_664;
+        let control_per_token = 388;
+        let decode_convolution_per_token = 131_072;
+        let prefill_convolution_per_token = 81_920;
+        let history_publication = 98_308;
 
         assert_eq!(CONTROL_STRIDE, 128);
         assert_eq!(PROJECTED_ROWS, 12_288);
-        assert_eq!(logical_bytes(1), per_token);
-        assert_eq!(logical_bytes(MAX_BATCH), MAX_BATCH * per_token);
+        assert_eq!(logical_bytes(1), 197_124);
+        assert_eq!(
+            logical_bytes(MAX_BATCH),
+            weights + MAX_BATCH * (control_per_token + decode_convolution_per_token)
+        );
+        assert_eq!(
+            logical_bytes(32),
+            weights
+                + 32 * (control_per_token + prefill_convolution_per_token)
+                + history_publication
+        );
+        assert_eq!(
+            logical_bytes(128),
+            weights
+                + 128 * (control_per_token + prefill_convolution_per_token)
+                + history_publication
+        );
     }
 }

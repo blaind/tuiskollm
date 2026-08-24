@@ -1796,7 +1796,7 @@ fn qualify_qwen36_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "qwen35_gdn_prepare::tests::qwen36_exact_batches_match_shared_independent_oracle",
+            "qwen35_gdn_prepare::tests::qwen36_exact_routes_match_shared_independent_oracle",
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -11507,9 +11507,31 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("qwen35_gdn_prepare_exact_TID_"))
         .collect::<Vec<_>>();
+    let prefill = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_gdn_prepare_prefill_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    let prefill_history = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_gdn_prepare_prefill_history_exact_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.5 GDN prepare", routes.len(), 8)?;
+    require_count("Qwen3.5/Qwen3.6 GDN prepare prefill", prefill.len(), 3)?;
+    require_count(
+        "Qwen3.5/Qwen3.6 GDN prepare prefill history",
+        prefill_history.len(),
+        3,
+    )?;
 
-    for entry in &routes {
+    for entry in routes.iter().chain(&prefill).chain(&prefill_history) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
@@ -11517,7 +11539,9 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
-        if !entry.body.contains("ex2.approx.f32") || !entry.body.contains("lg2.approx.f32") {
+        if !entry.name.contains("prefill_history")
+            && (!entry.body.contains("ex2.approx.f32") || !entry.body.contains("lg2.approx.f32"))
+        {
             return Err(format!(
                 "entry `{}` lost the Qwen3.5 GDN control transforms",
                 entry.name
@@ -11550,30 +11574,60 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
     let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
     let sass = String::from_utf8(sass.stdout)?;
     let mut registers = Vec::new();
+    let mut prefill_registers = Vec::new();
+    let mut prefill_history_registers = Vec::new();
     let mut shared = Vec::new();
-    for entry in routes {
-        let resource = resources
-            .get(entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted Qwen3.5 GDN prepare `{}`", entry.name))?;
-        require_spill_free(entry.name, resource)?;
-        if sass_function_body(&sass, entry.name).is_none() {
-            return Err(format!(
-                "cuobjdump omitted Qwen3.5 GDN prepare SASS `{}`",
-                entry.name
-            )
-            .into());
+    for (role, entries, role_registers) in [
+        ("decode", routes, &mut registers),
+        ("prefill", prefill, &mut prefill_registers),
+        (
+            "prefill history",
+            prefill_history,
+            &mut prefill_history_registers,
+        ),
+    ] {
+        for entry in entries {
+            let resource = resources.get(entry.name).ok_or_else(|| {
+                format!(
+                    "cuobjdump omitted Qwen3.5 GDN prepare {role} `{}`",
+                    entry.name
+                )
+            })?;
+            require_spill_free(entry.name, resource)?;
+            let body = sass_function_body(&sass, entry.name).ok_or_else(|| {
+                format!(
+                    "cuobjdump omitted Qwen3.5 GDN prepare {role} SASS `{}`",
+                    entry.name
+                )
+            })?;
+            if !body.contains("STG.E") {
+                return Err(format!("entry `{}` lost its represented stores", entry.name).into());
+            }
+            role_registers.push(resource.registers);
+            shared.push(resource.shared);
         }
-        registers.push(resource.registers);
-        shared.push(resource.shared);
     }
     registers.sort_unstable();
+    prefill_registers.sort_unstable();
+    prefill_history_registers.sort_unstable();
     shared.sort_unstable();
     require_registers(&baseline, "prepare_registers", &registers)?;
+    for (key, registers) in [
+        ("prefill_registers", prefill_registers.as_slice()),
+        (
+            "prefill_history_registers",
+            prefill_history_registers.as_slice(),
+        ),
+    ] {
+        if baseline.contains_key(key) {
+            require_registers(&baseline, key, registers)?;
+        }
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "Qwen3.5 GDN prepare gate passed: 8 fused control/convolution entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
-        registers, shared
+        "Qwen3.5/Qwen3.6 GDN prepare gate passed: 8 decode + 3 prefill + 3 history entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}",
+        registers, prefill_registers, prefill_history_registers, shared
     );
     Ok(())
 }
