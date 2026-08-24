@@ -10,6 +10,8 @@ use tuisko_gpu::{
 use tuisko_model::{Arch, Qwen35_9B};
 
 pub(crate) const MAX_BATCH: usize = 8;
+pub(crate) const MAX_ROWS: usize = 128;
+pub(crate) const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, MAX_BATCH, 32, 64, MAX_ROWS];
 const ALIGNMENT: usize = 256;
 pub(crate) const CONTROL_ROWS: usize = Qwen35_9B::GDN_CONTROL_ROWS;
 pub(crate) const CONTROL_STRIDE: usize = 128;
@@ -39,7 +41,7 @@ pub enum Qwen35GdnPrepareQualificationError {
     Mismatch(String),
 }
 
-/// Observable counts and worst errors across every exact batch route.
+/// Observable counts and worst errors across every exact decode and prompt route.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Qwen35GdnPrepareQualification {
     /// FP32 decay and beta values compared with the independent formula.
@@ -123,7 +125,7 @@ struct Observed {
     history: Vec<u16>,
 }
 
-/// Qualifies eager and captured Qwen3.5 control/convolution at `B=1..=8`.
+/// Qualifies eager and captured Qwen3.5 control/convolution at every exact route.
 pub fn qualify_qwen35_gdn_prepare()
 -> Result<Qwen35GdnPrepareQualification, Qwen35GdnPrepareQualificationError> {
     let _preflight = device_benchmark::preflight()?;
@@ -158,23 +160,23 @@ pub fn qualify_qwen35_gdn_prepare()
         maximum_convolution_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
+    for rows in EXACT_ROUTES {
         reset_state(&arena, &stream, regions, &fixture)?;
-        launch(&op, &arena, &stream, regions, batch)?;
+        launch(&op, &arena, &stream, regions, rows)?;
         let eager = observe(&arena, &stream, regions)?;
-        verify_oracle(batch, &fixture, &eager, &mut report)?;
+        verify_oracle(rows, &fixture, &eager, &mut report)?;
 
         reset_state(&arena, &stream, regions, &fixture)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
+        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, rows))?;
         // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
         unsafe { graph.launch(&stream) }?;
         let replay = observe(&arena, &stream, regions)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(Qwen35GdnPrepareQualificationError::Mismatch(format!(
-                "device addresses changed while qualifying B={batch}"
+                "device addresses changed while qualifying row count {rows}"
             )));
         }
     }
@@ -197,16 +199,16 @@ pub fn qualify_qwen36_gdn_prepare()
 
 pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let projected_controls = layout.reserve(MAX_BATCH * CONTROL_STRIDE, ALIGNMENT)?;
+    let projected_controls = layout.reserve(MAX_ROWS * CONTROL_STRIDE, ALIGNMENT)?;
     let a_log = layout.reserve(CONTROL_ROWS, ALIGNMENT)?;
     let dt_bias = layout.reserve(CONTROL_ROWS, ALIGNMENT)?;
-    let projected = layout.reserve(MAX_BATCH * PROJECTED_ROWS, ALIGNMENT)?;
+    let projected = layout.reserve(MAX_ROWS * PROJECTED_ROWS, ALIGNMENT)?;
     let convolution_weights = layout.reserve(QKV_ROWS * (HISTORY_TAPS + 1), ALIGNMENT)?;
     let state_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
     let history = layout.reserve(MAX_BATCH * QKV_ROWS * HISTORY_TAPS, ALIGNMENT)?;
-    let log_decay = layout.reserve(MAX_BATCH * CONTROL_ROWS, ALIGNMENT)?;
-    let beta = layout.reserve(MAX_BATCH * CONTROL_ROWS, ALIGNMENT)?;
-    let convolved = layout.reserve(MAX_BATCH * QKV_ROWS, ALIGNMENT)?;
+    let log_decay = layout.reserve(MAX_ROWS * CONTROL_ROWS, ALIGNMENT)?;
+    let beta = layout.reserve(MAX_ROWS * CONTROL_ROWS, ALIGNMENT)?;
+    let convolved = layout.reserve(MAX_ROWS * QKV_ROWS, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -241,11 +243,12 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 10]> {
 }
 
 pub(crate) fn make_fixture() -> Fixture {
-    let mut projected_controls = vec![0u16; MAX_BATCH * CONTROL_STRIDE];
-    for token in 0..MAX_BATCH {
+    let mut projected_controls = vec![0u16; MAX_ROWS * CONTROL_STRIDE];
+    for token in 0..MAX_ROWS {
+        let token_factor = 1.0 + (token & 7) as f32 / 16.0;
         for row in 0..2 * CONTROL_ROWS {
             projected_controls[token * CONTROL_STRIDE + row] =
-                f32_to_bf16(CONTROL_PATTERN[(row + 3 * token) & 7] * (1.0 + token as f32 / 16.0));
+                f32_to_bf16(CONTROL_PATTERN[(row + 3 * token) & 7] * token_factor);
         }
     }
     let a_log = (0..CONTROL_ROWS)
@@ -254,10 +257,11 @@ pub(crate) fn make_fixture() -> Fixture {
     let dt_bias = (0..CONTROL_ROWS)
         .map(|row| f32_to_bf16((row as f32 - 15.5) / 128.0))
         .collect();
-    let projected = (0..MAX_BATCH * PROJECTED_ROWS)
+    let projected = (0..MAX_ROWS * PROJECTED_ROWS)
         .map(|index| {
             let token = index / PROJECTED_ROWS;
-            f32_to_bf16(PROJECTED_PATTERN[(3 * index + token) & 7] * (1.0 + token as f32 / 16.0))
+            let token_factor = 1.0 + (token & 7) as f32 / 16.0;
+            f32_to_bf16(PROJECTED_PATTERN[(3 * index + token) & 7] * token_factor)
         })
         .collect();
     let convolution_weights = (0..QKV_ROWS * (HISTORY_TAPS + 1))
@@ -317,12 +321,12 @@ pub(crate) fn launch(
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     unsafe {
         op.launch(
             stream,
-            batch,
+            rows,
             arena.address(regions.projected_controls)?,
             arena.address(regions.a_log)?,
             arena.address(regions.dt_bias)?,
@@ -347,30 +351,30 @@ fn observe(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuRes
 }
 
 fn verify_oracle(
-    batch: usize,
+    rows: usize,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut Qwen35GdnPrepareQualification,
 ) -> Result<(), Qwen35GdnPrepareQualificationError> {
-    verify_controls(batch, fixture, observed, report)?;
-    verify_convolution(batch, fixture, observed, report)?;
-    verify_inactive(batch, observed)?;
+    verify_controls(rows, fixture, observed, report)?;
+    verify_convolution(rows, fixture, observed, report)?;
+    verify_inactive(rows, observed)?;
 
-    report.control_values += batch * 2 * CONTROL_ROWS;
-    report.convolution_values += batch * QKV_ROWS;
+    report.control_values += rows * 2 * CONTROL_ROWS;
+    report.convolution_values += rows * QKV_ROWS;
     report.history_values += observed.history.len();
-    report.inactive_values += inactive_values(batch);
+    report.inactive_values += inactive_values(rows);
 
     Ok(())
 }
 
 fn verify_controls(
-    batch: usize,
+    rows: usize,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut Qwen35GdnPrepareQualification,
 ) -> Result<(), Qwen35GdnPrepareQualificationError> {
-    for token in 0..batch {
+    for token in 0..rows {
         for row in 0..2 * CONTROL_ROWS {
             let raw = f64::from(bf16_to_f32(
                 fixture.projected_controls[token * CONTROL_STRIDE + row],
@@ -390,7 +394,7 @@ fn verify_controls(
             report.maximum_control_error = report.maximum_control_error.max(error);
             if error > 0.002 {
                 return Err(Qwen35GdnPrepareQualificationError::Mismatch(format!(
-                    "control at B={batch}, token={token}, row={row}: device={actual}, oracle={expected}, error={error}"
+                    "control at rows={rows}, token={token}, row={row}: device={actual}, oracle={expected}, error={error}"
                 )));
             }
         }
@@ -400,13 +404,18 @@ fn verify_controls(
 }
 
 fn verify_convolution(
-    batch: usize,
+    rows: usize,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut Qwen35GdnPrepareQualification,
 ) -> Result<(), Qwen35GdnPrepareQualificationError> {
     let mut expected_history = fixture.history.clone();
-    for (token, &state_row) in STATE_ROWS[..batch].iter().enumerate() {
+    for token in 0..rows {
+        let state_row = if rows <= MAX_BATCH {
+            STATE_ROWS[token]
+        } else {
+            STATE_ROWS[0]
+        };
         for channel in 0..QKV_ROWS {
             let history_base = (state_row as usize * QKV_ROWS + channel) * HISTORY_TAPS;
             let current = fixture.projected[token * PROJECTED_ROWS + channel];
@@ -428,7 +437,7 @@ fn verify_convolution(
             report.maximum_convolution_error = report.maximum_convolution_error.max(error);
             if error > 0.002 {
                 return Err(Qwen35GdnPrepareQualificationError::Mismatch(format!(
-                    "convolution at B={batch}, token={token}, channel={channel}: device={actual}, oracle={expected}, error={error}"
+                    "convolution at rows={rows}, token={token}, channel={channel}: device={actual}, oracle={expected}, error={error}"
                 )));
             }
 
@@ -444,7 +453,7 @@ fn verify_convolution(
         .position(|(actual, expected)| actual != expected)
     {
         return Err(Qwen35GdnPrepareQualificationError::Mismatch(format!(
-            "history at B={batch}, index={index}: device={:#06x}, oracle={:#06x}",
+            "history at rows={rows}, index={index}: device={:#06x}, oracle={:#06x}",
             observed.history[index], expected_history[index]
         )));
     }
@@ -453,28 +462,28 @@ fn verify_convolution(
 }
 
 fn verify_inactive(
-    batch: usize,
+    rows: usize,
     observed: &Observed,
 ) -> Result<(), Qwen35GdnPrepareQualificationError> {
     for (name, values) in [("log_decay", &observed.log_decay), ("beta", &observed.beta)] {
-        let begin = batch * CONTROL_ROWS;
+        let begin = rows * CONTROL_ROWS;
         if let Some(relative) = values[begin..]
             .iter()
             .position(|value| value.to_bits() != 0xa5a5_a5a5)
         {
             return Err(Qwen35GdnPrepareQualificationError::Mismatch(format!(
-                "B={batch} modified inactive {name} value {}",
+                "rows={rows} modified inactive {name} value {}",
                 begin + relative
             )));
         }
     }
-    let begin = batch * QKV_ROWS;
+    let begin = rows * QKV_ROWS;
     if let Some(relative) = observed.convolved[begin..]
         .iter()
         .position(|&value| value != BF16_SENTINEL)
     {
         return Err(Qwen35GdnPrepareQualificationError::Mismatch(format!(
-            "B={batch} modified inactive convolution value {}",
+            "rows={rows} modified inactive convolution value {}",
             begin + relative
         )));
     }
@@ -482,12 +491,12 @@ fn verify_inactive(
     Ok(())
 }
 
-fn inactive_values(batch: usize) -> usize {
-    (MAX_BATCH - batch) * (2 * CONTROL_ROWS + QKV_ROWS)
+fn inactive_values(rows: usize) -> usize {
+    (MAX_ROWS - rows) * (2 * CONTROL_ROWS + QKV_ROWS)
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     eager: &Observed,
     replay: &Observed,
     report: &mut Qwen35GdnPrepareQualification,
@@ -507,12 +516,12 @@ fn verify_replay(
         || replay.history != eager.history
     {
         return Err(Qwen35GdnPrepareQualificationError::Mismatch(format!(
-            "B={batch} graph replay differs from eager execution"
+            "rows={rows} graph replay differs from eager execution"
         )));
     }
-    verify_inactive(batch, replay)?;
-    report.graph_replay_values += batch * (2 * CONTROL_ROWS + QKV_ROWS) + replay.history.len();
-    report.inactive_values += inactive_values(batch);
+    verify_inactive(rows, replay)?;
+    report.graph_replay_values += rows * (2 * CONTROL_ROWS + QKV_ROWS) + replay.history.len();
+    report.inactive_values += inactive_values(rows);
 
     Ok(())
 }
@@ -558,8 +567,9 @@ fn verify_no_post_warmup_allocation(
     stream: &CudaStream,
     regions: Regions,
 ) -> Result<(), Qwen35GdnPrepareQualificationError> {
-    let graphs = (1..=MAX_BATCH)
-        .map(|batch| CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch)))
+    let graphs = EXACT_ROUTES
+        .iter()
+        .map(|&rows| CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows)))
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
         // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
@@ -568,9 +578,9 @@ fn verify_no_post_warmup_allocation(
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
-        for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
+        for graph in graphs.iter().rev() {
             // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
-            unsafe { graphs[batch - 1].launch(stream) }?;
+            unsafe { graph.launch(stream) }?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -593,38 +603,39 @@ mod tests {
         let (layout, regions) = layout().unwrap();
 
         assert_eq!(regions.weight_bytes(), 65_664);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 725_024);
-        assert_eq!(regions.payload_bytes(), 790_688);
-        assert_eq!(layout.byte_len(), 791_296);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 5_701_664);
+        assert_eq!(regions.payload_bytes(), 5_767_328);
+        assert_eq!(layout.byte_len(), 5_767_936);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 608);
     }
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn exact_batches_match_independent_oracles_and_graph_replay()
+    fn exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), Qwen35GdnPrepareQualificationError> {
         let report = qualify_qwen35_gdn_prepare()?;
-        let active_rows = (1..=MAX_BATCH).sum::<usize>();
-        let inactive_rows = (1..=MAX_BATCH)
-            .map(|batch| MAX_BATCH - batch)
+        let active_rows = EXACT_ROUTES.iter().sum::<usize>();
+        let inactive_rows = EXACT_ROUTES
+            .iter()
+            .map(|rows| MAX_ROWS - rows)
             .sum::<usize>();
         let complete_history = MAX_BATCH * QKV_ROWS * HISTORY_TAPS;
 
         assert_eq!(report.control_values, active_rows * 2 * CONTROL_ROWS);
         assert_eq!(report.convolution_values, active_rows * QKV_ROWS);
-        assert_eq!(report.history_values, MAX_BATCH * complete_history);
+        assert_eq!(report.history_values, EXACT_ROUTES.len() * complete_history);
         assert_eq!(
             report.graph_replay_values,
-            active_rows * (2 * CONTROL_ROWS + QKV_ROWS) + MAX_BATCH * complete_history
+            active_rows * (2 * CONTROL_ROWS + QKV_ROWS) + EXACT_ROUTES.len() * complete_history
         );
         assert_eq!(
             report.inactive_values,
             2 * inactive_rows * (2 * CONTROL_ROWS + QKV_ROWS)
         );
-        assert_eq!(report.immutable_input_values, 132_168);
-        assert_eq!(report.arena_bytes, 791_296);
+        assert_eq!(report.immutable_input_values, 1_622_088);
+        assert_eq!(report.arena_bytes, 5_767_936);
         assert_eq!(report.weight_bytes, 65_664);
-        assert_eq!(report.workspace_bytes, 725_024);
+        assert_eq!(report.workspace_bytes, 5_701_664);
         assert_eq!(report.padding_bytes, 608);
         assert!(report.maximum_control_error <= 0.002);
         assert!(report.maximum_convolution_error <= 0.002);
@@ -634,13 +645,13 @@ mod tests {
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn qwen36_exact_batches_match_shared_independent_oracle()
+    fn qwen36_exact_routes_match_shared_independent_oracle()
     -> Result<(), Qwen36GdnPrepareQualificationError> {
         let report = qualify_qwen36_gdn_prepare()?;
 
-        assert_eq!(report.control_values, 2_304);
-        assert_eq!(report.convolution_values, 294_912);
-        assert_eq!(report.arena_bytes, 791_296);
+        assert_eq!(report.control_values, 16_640);
+        assert_eq!(report.convolution_values, 2_129_920);
+        assert_eq!(report.arena_bytes, 5_767_936);
         assert_eq!(report.weight_bytes, 65_664);
         assert!(report.maximum_control_error <= 0.002);
         assert!(report.maximum_convolution_error <= 0.002);

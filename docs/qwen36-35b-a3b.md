@@ -107,12 +107,19 @@ output, 3,744,000 graph-replay, and 33,062,400 inactive-sentinel comparisons wit
 and no post-warmup device growth. Its complete three-node path measures 12.443/33.309 us at B=1/8
 and a locked 2,197 MHz SM clock; the unblessed prompt diagnostics measure
 102.416/104.407/132.575 us at T=32/64/128 with a 2,182 MHz median SM clock. The decode and prompt
-timings are unblessed leaf diagnostics; the next control/convolution and FP32 recurrence stages
-reuse the already qualified Qwen3.5 binary
-entries because both profiles have the exact same 32 control rows, 8,192 Q/K/V rows, 4,096 value
-rows, 16 Q/K heads, 32 value heads, width-128 state, and width-four history. Compile-time geometry
-assertions and separate Qwen3.6 oracle entry points make that reuse executable rather than
-conventional. The final GDN projection preserves its source E4M3 `[2048,4096]` plane and static
+timings are unblessed leaf diagnostics. The following control/convolution stage reuses the Qwen3.5
+binary entries because both profiles have the exact same 32 control rows, 8,192 Q/K/V rows, 4,096
+value rows, 16 Q/K heads, 32 value heads, width-128 state, and width-four history. Its exact
+`T=32/64/128` route computes each four-tap causal output from one mapped prior history without racing
+cross-token updates, then publishes the final three represented BF16 values in a separate kernel.
+Every decode and prompt route passes the independent control/convolution oracle, graph replay,
+inactive sentinels, immutable inputs, stable-address, and zero-growth checks. All 14 entries use
+zero stack/local memory. At a diagnostic 2,115 MHz median SM clock, its unblessed intrinsic prompt
+path measures 3.739/4.689/6.259 us and its complete graph measures 6.140/6.148/8.192 us at
+T=32/64/128. The next FP32 recurrence stage can share the same geometry only after its causal
+prompt oracle closes that arithmetic separately. Compile-time geometry assertions and separate
+Qwen3.6 oracle entry points make shared binaries executable rather than conventional. The final
+GDN projection preserves its source E4M3 `[2048,4096]` plane and static
 FP8 scales. Its exact `B=1..8` routes pass 147,456 activation-code, 73,728 FP64-formula output,
 221,184 graph-replay, and 344,064 inactive-sentinel comparisons while retaining immutable sources,
 stable addresses, and zero post-warmup growth. All 16 entries have zero stack/local memory. At a
