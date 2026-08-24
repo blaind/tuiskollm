@@ -12,6 +12,7 @@ pub const ATTENTION_PAGE_SIZE: usize = 64;
 
 const MAX_BATCH: usize = 8;
 const PREFILL_TOKENS: [usize; 4] = [32, 64, 128, 1_024];
+const QWEN36_PREFILL_TOKENS: [usize; 3] = [32, 64, 128];
 const WARPS_PER_CTA: usize = 8;
 const THREADS: u32 = (WARPS_PER_CTA * 32) as u32;
 
@@ -21,6 +22,10 @@ fn admitted_batch(batch: usize) -> bool {
 
 fn admitted_tokens(tokens: usize) -> bool {
     admitted_batch(tokens) || PREFILL_TOKENS.contains(&tokens)
+}
+
+fn admitted_qwen36_tokens(tokens: usize) -> bool {
+    admitted_batch(tokens) || QWEN36_PREFILL_TOKENS.contains(&tokens)
 }
 
 fn require_qwen38_geometry<A: Arch>() -> GpuResult<()> {
@@ -255,6 +260,52 @@ mod kernels {
         // Qwen3.6 has 18 head-warps per token. Eight warps per CTA produce
         // 18 CTAs at B=8 while preserving the same one-warp/head reduction,
         // 64-wide MRoPE exchange, and BF16 store order as Qwen3.5.
+        unsafe {
+            bf16_attention_qk_prepare::<Qwen36Moe35B, TOKENS>(
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+            );
+        }
+    }
+
+    /// Prepares Qwen3.6 Q/K and appends K/V for one exact prompt width.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_attention_qk_prepare_prefill_exact<const TOKENS: usize>(
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u16,
+        value_pages: *mut u16,
+    ) {
+        // T=128 contains 2,304 independent head-warps. One 288-CTA launch
+        // replaces 16 B=8 launches without regrouping any head: every warp
+        // retains the same 256-value reduction, MRoPE exchange, and BF16 stores.
         unsafe {
             bf16_attention_qk_prepare::<Qwen36Moe35B, TOKENS>(
                 qkv,
@@ -526,6 +577,74 @@ impl<const TOKENS: usize> PreparedQwen36Route<TOKENS> {
     }
 }
 
+struct PreparedQwen36PrefillRoute<const TOKENS: usize> {
+    prepare:
+        PreparedLaunch<kernels::__qwen36_attention_qk_prepare_prefill_exact_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedQwen36PrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !QWEN36_PREFILL_TOKENS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 attention Q/K prefill route T={TOKENS} is not admitted"
+            )));
+        }
+        let blocks = u32::try_from(
+            (TOKENS * (Qwen36Moe35B::NUM_ATTENTION_HEADS + Qwen36Moe35B::NUM_KV_HEADS))
+                .div_ceil(WARPS_PER_CTA),
+        )
+        .map_err(|_| GpuError::invalid_launch("Qwen3.6 attention Q/K prefill grid exceeds u32"))?;
+
+        Ok(Self {
+            prepare: module
+                .prepare_qwen36_attention_qk_prepare_prefill_exact::<TOKENS>(LaunchConfig1D::new(
+                    blocks, THREADS, 0,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.6 attention Q/K prefill route", source)
+                })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u16,
+        value_pages: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen36_attention_qk_prepare_prefill_exact::<TOKENS>(
+                stream,
+                &self.prepare,
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.6 attention Q/K prefill", source))
+    }
+}
+
 /// Prepared Q/K normalization, MRoPE, and KV-cache append routes for exact
 /// `B=1..8` decode and `T=32,64,128,1024` prefill widths.
 pub struct AttentionQkPrepareOp<A: Sm120Arch = Qwen38_27B> {
@@ -784,7 +903,7 @@ impl Qwen35AttentionQkPrepareOp {
     }
 }
 
-/// Prepared Qwen3.6 Q/K normalization, MRoPE, and BF16 KV-cache routes for `B=1..8`.
+/// Prepared Qwen3.6 Q/K normalization, MRoPE, and BF16 KV-cache decode and prompt routes.
 pub struct Qwen36AttentionQkPrepareOp {
     module: kernels::LoadedModule,
     b1: PreparedQwen36Route<1>,
@@ -795,6 +914,9 @@ pub struct Qwen36AttentionQkPrepareOp {
     b6: PreparedQwen36Route<6>,
     b7: PreparedQwen36Route<7>,
     b8: PreparedQwen36Route<8>,
+    t32: PreparedQwen36PrefillRoute<32>,
+    t64: PreparedQwen36PrefillRoute<64>,
+    t128: PreparedQwen36PrefillRoute<128>,
 }
 
 impl Qwen36AttentionQkPrepareOp {
@@ -815,6 +937,9 @@ impl Qwen36AttentionQkPrepareOp {
             b6: PreparedQwen36Route::prepare(&module)?,
             b7: PreparedQwen36Route::prepare(&module)?,
             b8: PreparedQwen36Route::prepare(&module)?,
+            t32: PreparedQwen36PrefillRoute::prepare(&module)?,
+            t64: PreparedQwen36PrefillRoute::prepare(&module)?,
+            t128: PreparedQwen36PrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -823,17 +948,17 @@ impl Qwen36AttentionQkPrepareOp {
     ///
     /// # Safety
     ///
-    /// `qkv` covers `[batch,9216]` BF16 values in query/gate, key, value order.
-    /// Norms cover 256 values; rotary planes cover `[batch,32]`; metadata
-    /// covers `batch`; and each selected block-table row covers its cache
-    /// position. Query covers `[batch,16,256]` FP32 values. Cache planes use
+    /// `qkv` covers `[tokens,9216]` BF16 values in query/gate, key, value order.
+    /// Norms cover 256 values; rotary planes cover `[tokens,32]`; metadata
+    /// covers `tokens`; and each selected block-table row covers its cache
+    /// position. Query covers `[tokens,16,256]` FP32 values. Cache planes use
     /// page-major `[physical_page,2,64,256]` BF16 values. Allocations are
     /// aligned, non-overlapping, live through completion, and context-local.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        tokens: usize,
         qkv: *const u16,
         query_norm: *const u16,
         key_norm: *const u16,
@@ -847,9 +972,9 @@ impl Qwen36AttentionQkPrepareOp {
         key_pages: *mut u16,
         value_pages: *mut u16,
     ) -> GpuResult<()> {
-        if !admitted_batch(batch) {
+        if !admitted_qwen36_tokens(tokens) {
             return Err(GpuError::invalid_launch(format!(
-                "Qwen3.6 attention Q/K prepare batch {batch} is outside the admitted range 1..={MAX_BATCH}"
+                "Qwen3.6 attention Q/K prepare tokens {tokens} must be one of 1..={MAX_BATCH},32,64,128"
             )));
         }
         let table_stride = u32::try_from(table_stride).map_err(|_| {
@@ -883,7 +1008,7 @@ impl Qwen36AttentionQkPrepareOp {
             };
         }
 
-        match batch {
+        match tokens {
             1 => launch!(b1),
             2 => launch!(b2),
             3 => launch!(b3),
@@ -892,6 +1017,9 @@ impl Qwen36AttentionQkPrepareOp {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
             _ => unreachable!(),
         }
     }
@@ -930,8 +1058,8 @@ pub(crate) fn qwen35_attention_qk_prepare_ptx_names() -> [&'static str; MAX_BATC
 }
 
 /// PTX symbols retained for every exact Qwen3.6 attention Q/K prepare route.
-pub(crate) fn qwen36_attention_qk_prepare_ptx_names() -> [&'static str; MAX_BATCH] {
-    [
+pub(crate) fn qwen36_attention_qk_prepare_ptx_names() -> Vec<&'static str> {
+    vec![
         kernels::qwen36_attention_qk_prepare_exact_ptx_name::<1>(),
         kernels::qwen36_attention_qk_prepare_exact_ptx_name::<2>(),
         kernels::qwen36_attention_qk_prepare_exact_ptx_name::<3>(),
@@ -940,14 +1068,18 @@ pub(crate) fn qwen36_attention_qk_prepare_ptx_names() -> [&'static str; MAX_BATC
         kernels::qwen36_attention_qk_prepare_exact_ptx_name::<6>(),
         kernels::qwen36_attention_qk_prepare_exact_ptx_name::<7>(),
         kernels::qwen36_attention_qk_prepare_exact_ptx_name::<8>(),
+        kernels::qwen36_attention_qk_prepare_prefill_exact_ptx_name::<32>(),
+        kernels::qwen36_attention_qk_prepare_prefill_exact_ptx_name::<64>(),
+        kernels::qwen36_attention_qk_prepare_prefill_exact_ptx_name::<128>(),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        THREADS, admitted_tokens, attention_qk_prepare_ptx_names,
-        qwen35_attention_qk_prepare_ptx_names, qwen36_attention_qk_prepare_ptx_names,
+        QWEN36_PREFILL_TOKENS, THREADS, admitted_qwen36_tokens, admitted_tokens,
+        attention_qk_prepare_ptx_names, qwen35_attention_qk_prepare_ptx_names,
+        qwen36_attention_qk_prepare_ptx_names,
     };
     use std::collections::BTreeSet;
 
@@ -969,6 +1101,20 @@ mod tests {
             assert_eq!(admitted_tokens(tokens), expected, "tokens={tokens}");
         }
         assert_eq!(THREADS, 256);
+
+        for (tokens, expected) in [
+            (0, false),
+            (1, true),
+            (8, true),
+            (9, false),
+            (32, true),
+            (64, true),
+            (128, true),
+            (1_024, false),
+        ] {
+            assert_eq!(admitted_qwen36_tokens(tokens), expected, "tokens={tokens}");
+        }
+        assert_eq!(QWEN36_PREFILL_TOKENS, [32, 64, 128]);
     }
 
     #[test]
@@ -987,7 +1133,7 @@ mod tests {
 
         let qwen36 = qwen36_attention_qk_prepare_ptx_names();
         let qwen36_unique = qwen36.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(qwen36.len(), 8);
+        assert_eq!(qwen36.len(), 11);
         assert_eq!(qwen36_unique.len(), qwen36.len());
         assert!(names.iter().all(|name| !qwen36_unique.contains(name)));
         assert!(qwen35_unique.is_disjoint(&qwen36_unique));
