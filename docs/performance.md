@@ -278,6 +278,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-qwen35-text-endpoint SNAPSHOT` | Measure every source-backed Qwen3.5 final-norm plus BF16 LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-text-endpoint SNAPSHOT` | Measure every source-backed Qwen3.6 final-norm plus represented NVFP4 LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-resident-model SNAPSHOT` | Directly measure every complete 32-layer plus BF16-endpoint graph at a 131-token context | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-resident-model SNAPSHOT` | Directly measure every complete 40-layer plus NVFP4-endpoint graph at a 131-token context | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
 | `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
 | `cargo run -p xtask -- perf energy` | Full leaf reports plus a sustained power window per route | `target/benchmarks/perf-energy/*.json` |
@@ -396,6 +397,10 @@ at every exact `B=1..8`; it never infers whole-model latency from leaf medians. 
 leaf-wide `perf` until a locked-clock baseline is reviewed. A controlled 2,182 MHz SM / 13,801 MHz
 memory diagnostic measured 6.261 ms at `B=1` and 8.485 ms at `B=8`, with about 1.2 us host submit
 time and zero timed device-memory growth.
+
+`bench-qwen36-resident-model SNAPSHOT` directly measures the complete 40-layer plus represented
+NVFP4 endpoint graph at every exact `B=1..8`; it never infers whole-model latency from leaf
+medians. It remains outside leaf-wide `perf` until a locked-clock baseline is reviewed.
 
 `bench-dense-fp8-mlp SNAPSHOT` directly measures the complete source-backed layer-60 MLP graph at
 every exact `B=1..8` and `T=32,64,128,1024` with the same options. It does not infer composition
