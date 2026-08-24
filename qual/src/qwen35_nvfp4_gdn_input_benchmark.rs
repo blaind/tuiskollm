@@ -7,22 +7,24 @@ use crate::device_benchmark::{
     preflight, require_current_process_exclusive, warmup_launches,
 };
 use crate::qwen35_nvfp4_gdn_input::{
-    CODE_BYTES_PER_ROW, CONTROL_WEIGHT_SCALE_DIVISOR, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_BATCH,
-    PADDED_CONTROL_ROWS, PROJECTED_ROWS, PROJECTED_WEIGHT_SCALE_DIVISOR, Regions, layout,
-    make_fixture,
+    CODE_BYTES_PER_ROW, CONTROL_WEIGHT_SCALE_DIVISOR, EXACT_ROUTES, GROUPS_PER_ROW, INPUT_COLUMNS,
+    INPUT_SCALE_DIVISOR, MAX_BATCH, PADDED_CONTROL_ROWS, PROJECTED_ROWS,
+    PROJECTED_WEIGHT_SCALE_DIVISOR, Regions, layout, make_fixture,
 };
 use crate::target::Qwen35Nvfp4GdnInputOp;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer};
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
 
 struct Addresses {
     input: *const u16,
+    activation_codes: *mut u8,
+    activation_scales: *mut u8,
     projected_weight_codes: *const u8,
     projected_weight_scales: *const u8,
     control_weight_codes: *const u8,
@@ -55,7 +57,11 @@ impl Session {
         let stream = context.new_stream().map_err(GpuError::from)?;
         let (layout, regions) = layout()?;
         let arena = DeviceArena::zeroed(&stream, &layout)?;
-        let fixture = make_fixture();
+        let fixture = make_fixture().map_err(|error| {
+            DeviceBenchmarkError::Precondition(format!(
+                "Qwen3.5 GDN input fixture construction failed: {error}"
+            ))
+        })?;
         arena.copy_from_host(&stream, regions.input, &fixture.input_bf16)?;
         arena.copy_from_host(
             &stream,
@@ -82,6 +88,8 @@ impl Session {
         let op = Qwen35Nvfp4GdnInputOp::new(&context)?;
         let addresses = Addresses {
             input: arena.address(regions.input)?,
+            activation_codes: arena.address(regions.activation_codes)?,
+            activation_scales: arena.address(regions.activation_scales)?,
             projected_weight_codes: arena.address(regions.projected_weight_codes)?,
             projected_weight_scales: arena.address(regions.projected_weight_scales)?,
             control_weight_codes: arena.address(regions.control_weight_codes)?,
@@ -89,8 +97,9 @@ impl Session {
             projected_output: arena.address(regions.projected_output)?,
             control_output: arena.address(regions.control_output)?,
         };
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| capture_route(&op, &stream, &addresses, batch, repeated_operations))
+        let routes = EXACT_ROUTES
+            .into_iter()
+            .map(|rows| capture_route(&op, &stream, &addresses, rows, repeated_operations))
             .collect::<GpuResult<Vec<_>>>()?;
 
         Ok(Self {
@@ -118,15 +127,22 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
-                    "qwen35_9b/nvfp4_gdn_input/a16",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
+                    "qwen35_9b/nvfp4_gdn_input/production",
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
                     &route.leaf,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 )
@@ -139,19 +155,19 @@ fn capture_route(
     op: &Qwen35Nvfp4GdnInputOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, batch))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, batch)?;
+            launch(op, stream, addresses, rows)?;
         }
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
         leaf,
         repeated,
     })
@@ -161,31 +177,55 @@ fn launch(
     op: &Qwen35Nvfp4GdnInputOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     unsafe {
-        op.launch(
-            stream,
-            batch,
-            addresses.input,
-            addresses.projected_weight_codes,
-            addresses.projected_weight_scales,
-            PROJECTED_WEIGHT_SCALE_DIVISOR,
-            addresses.control_weight_codes,
-            addresses.control_weight_scales,
-            CONTROL_WEIGHT_SCALE_DIVISOR,
-            addresses.projected_output,
-            addresses.control_output,
-        )
+        if rows <= MAX_BATCH {
+            op.launch(
+                stream,
+                rows,
+                addresses.input,
+                addresses.projected_weight_codes,
+                addresses.projected_weight_scales,
+                PROJECTED_WEIGHT_SCALE_DIVISOR,
+                addresses.control_weight_codes,
+                addresses.control_weight_scales,
+                CONTROL_WEIGHT_SCALE_DIVISOR,
+                addresses.projected_output,
+                addresses.control_output,
+            )
+        } else {
+            op.launch_prefill(
+                stream,
+                rows,
+                addresses.input,
+                addresses.activation_codes,
+                addresses.activation_scales,
+                addresses.projected_weight_codes,
+                addresses.projected_weight_scales,
+                PROJECTED_WEIGHT_SCALE_DIVISOR,
+                addresses.control_weight_codes,
+                addresses.control_weight_scales,
+                CONTROL_WEIGHT_SCALE_DIVISOR,
+                INPUT_SCALE_DIVISOR,
+                addresses.projected_output,
+                addresses.control_output,
+            )
+        }
     }
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(rows: usize) -> usize {
     let weights = (PROJECTED_ROWS + PADDED_CONTROL_ROWS) * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
-    let input = batch * INPUT_COLUMNS * size_of::<u16>();
-    let output = batch * (PROJECTED_ROWS + PADDED_CONTROL_ROWS) * size_of::<u16>();
+    let input = rows * INPUT_COLUMNS * size_of::<u16>();
+    let output = rows * (PROJECTED_ROWS + PADDED_CONTROL_ROWS) * size_of::<u16>();
+    let scratch = if rows > MAX_BATCH {
+        2 * rows * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW)
+    } else {
+        0
+    };
 
-    weights + input + output
+    weights + input + output + scratch
 }
 
 /// Measures every exact Qwen3.5 NVFP4 GDN input route with paired timings.
@@ -209,7 +249,7 @@ pub fn benchmark_qwen35_nvfp4_gdn_input(
         "qwen35_9b/nvfp4_gdn_input/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes - padding_bytes,
-        "max_batch=8",
+        "max_rows=128 activation quantization and both output seams",
     )?;
     memory.register_owned(
         "qwen35_9b/nvfp4_gdn_input/alignment_padding",
@@ -247,16 +287,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accounting_covers_the_complete_qwen35_gdn_input_path() {
+    fn accounting_covers_every_qwen35_gdn_input_decode_and_prefill_byte() {
         let (layout, regions) = layout().unwrap();
         let weights =
             (PROJECTED_ROWS + PADDED_CONTROL_ROWS) * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
-        let b8 = weights
-            + MAX_BATCH * (INPUT_COLUMNS + PROJECTED_ROWS + PADDED_CONTROL_ROWS) * size_of::<u16>();
+        let t128 = weights
+            + crate::qwen35_nvfp4_gdn_input::MAX_ROWS
+                * (INPUT_COLUMNS * size_of::<u16>()
+                    + (PROJECTED_ROWS + PADDED_CONTROL_ROWS) * size_of::<u16>()
+                    + 2 * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW));
 
-        assert_eq!(logical_bytes(MAX_BATCH), b8);
-        assert_eq!(layout.byte_len(), 28_870_656);
+        assert_eq!(logical_bytes(crate::qwen35_nvfp4_gdn_input::MAX_ROWS), t128);
+        assert_eq!(layout.byte_len(), 33_128_448);
         assert_eq!(regions.weight_bytes(), 28_606_464);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 264_192);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 4_521_984);
     }
 }
