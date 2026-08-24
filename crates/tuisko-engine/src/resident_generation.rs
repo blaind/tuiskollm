@@ -2,15 +2,15 @@
 
 use crate::{
     CancelledText, ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
-    GenerationSession, GenerationStep, MAX_BATCH, Qwen35ResidentModelProgram, ResidentLoadProgress,
-    ResidentModelProgram,
+    GenerationSession, GenerationStep, MAX_BATCH, Qwen35ResidentModelProgram,
+    Qwen36ResidentModelProgram, ResidentLoadProgress, ResidentModelProgram,
 };
 #[cfg(feature = "qualification")]
 use crate::{Sampler, SamplingOptions};
 use std::sync::Arc;
 use tuisko_frontend::{GenerationDefaults, TextFrontend};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
-use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B, Qwen38_27B};
+use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 const ROTARY_DIM: usize = 64;
 const ROTARY_PAIRS: usize = ROTARY_DIM / 2;
@@ -30,6 +30,14 @@ pub struct ResidentTextGenerator {
 pub struct Qwen35ResidentTextGenerator {
     frontend: TextFrontend,
     program: Qwen35ResidentModelProgram,
+    stream: Arc<CudaStream>,
+    logits: PinnedHostBuffer<u16>,
+}
+
+/// Concrete Qwen3.6 frontend, resident program, stream, and reusable host-logit owner.
+pub struct Qwen36ResidentTextGenerator {
+    frontend: TextFrontend,
+    program: Qwen36ResidentModelProgram,
     stream: Arc<CudaStream>,
     logits: PinnedHostBuffer<u16>,
 }
@@ -119,6 +127,16 @@ pub struct ResidentGenerationSession<'a> {
 pub struct Qwen35ResidentGenerationSession<'a> {
     control: GenerationSession,
     program: &'a mut Qwen35ResidentModelProgram,
+    stream: &'a CudaStream,
+    logits: &'a mut [u16],
+    pending_token: Option<u32>,
+    next_position: u32,
+}
+
+/// One Qwen3.6 streaming request borrowing the single resident slot.
+pub struct Qwen36ResidentGenerationSession<'a> {
+    control: GenerationSession,
+    program: &'a mut Qwen36ResidentModelProgram,
     stream: &'a CudaStream,
     logits: &'a mut [u16],
     pending_token: Option<u32>,
@@ -410,6 +428,138 @@ impl Qwen35ResidentTextGenerator {
 
     #[cfg(feature = "qualification")]
     /// Stable arena and pinned-logit addresses owned by this generator.
+    pub fn qualification_addresses(&self) -> Vec<usize> {
+        self.program
+            .base_addresses()
+            .into_iter()
+            .map(|address| address as usize)
+            .chain(core::iter::once(self.logits.as_ptr().addr()))
+            .collect()
+    }
+}
+
+impl Qwen36ResidentTextGenerator {
+    /// Opens the exact Qwen3.6 text generator on device zero.
+    pub fn from_snapshot_device_zero(
+        snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
+    ) -> EngineResult<Self> {
+        let context = device_zero_context()?;
+        Self::from_snapshot(&context, snapshot)
+    }
+
+    /// Admits the Qwen3.6 frontend and loads its complete resident text program.
+    pub fn from_snapshot(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
+    ) -> EngineResult<Self> {
+        let frontend = TextFrontend::open_qwen36(snapshot.as_ref())?;
+        let program = Qwen36ResidentModelProgram::from_snapshot(context, snapshot)?;
+        let stream = context.new_stream().map_err(GpuError::from)?;
+        let logits =
+            PinnedHostBuffer::zeroed(context, Qwen36Moe35B::VOCAB).map_err(GpuError::from)?;
+
+        Ok(Self {
+            frontend,
+            program,
+            stream,
+            logits,
+        })
+    }
+
+    /// Renders one request and serially evaluates its prompt through the B=1 graph.
+    ///
+    /// Native prompt graphs remain owned by the separate resident-prefill stack. Until that stack
+    /// is reconciled, prompts exceeding the exact 192-position decode capacity are refused.
+    pub fn start<'a>(
+        &'a mut self,
+        request: &ChatGenerationRequest,
+    ) -> EngineResult<Qwen36ResidentGenerationSession<'a>> {
+        let Self {
+            frontend,
+            program,
+            stream,
+            logits,
+        } = self;
+        let control = GenerationSession::start(frontend, request)?;
+        require_generation_capacity(
+            control.prompt_token_ids().len(),
+            request.max_new_tokens,
+            program.context_capacity(),
+        )?;
+
+        if control.finish_reason().is_none() {
+            program.reset_state(stream)?;
+            for (position, &token) in control.prompt_token_ids().iter().enumerate() {
+                replay_qwen36_token(
+                    program,
+                    stream,
+                    token,
+                    u32::try_from(position).map_err(|_| {
+                        EngineError::generation("prompt position exceeds the exact route width")
+                    })?,
+                )?;
+            }
+            program.read_logits_into(stream, 1, logits)?;
+        }
+        let next_position = u32::try_from(control.prompt_token_ids().len())
+            .map_err(|_| EngineError::generation("prompt length exceeds the position width"))?;
+
+        Ok(Qwen36ResidentGenerationSession {
+            control,
+            program,
+            stream,
+            logits,
+            pending_token: None,
+            next_position,
+        })
+    }
+
+    /// Exact device bytes across the 41 retained Qwen3.6 arenas.
+    pub const fn arena_bytes(&self) -> usize {
+        self.program.layout().arena_bytes()
+    }
+
+    /// Source-backed decoder and endpoint weights resident on the device.
+    pub const fn resident_weight_bytes(&self) -> usize {
+        self.program.layout().resident_weight_bytes()
+    }
+
+    /// Page-locked embedding and logit staging bytes.
+    pub fn host_stager_bytes(&self) -> usize {
+        self.program.host_stager_bytes() + self.logits.num_bytes()
+    }
+
+    /// Current short-context token capacity of the single slot.
+    pub const fn context_capacity(&self) -> usize {
+        self.program.context_capacity()
+    }
+
+    /// CUDA context shared by the model, stream, graphs, and pinned buffers.
+    pub const fn context(&self) -> &Arc<CudaContext> {
+        self.program.context()
+    }
+
+    /// Checkpoint-admitted sampling defaults.
+    pub const fn generation_defaults(&self) -> GenerationDefaults {
+        self.frontend.generation_defaults()
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Runs raw token IDs through the production path and returns the next greedy token.
+    pub fn qualification_greedy_after_tokens(&mut self, token_ids: &[u32]) -> EngineResult<u32> {
+        require_generation_capacity(token_ids.len(), 1, self.program.context_capacity())?;
+        self.program.reset_state(&self.stream)?;
+        for (position, &token) in token_ids.iter().enumerate() {
+            replay_qwen36_token(&mut self.program, &self.stream, token, position as u32)?;
+        }
+        self.program
+            .read_logits_into(&self.stream, 1, &mut self.logits)?;
+        let mut sampler = Sampler::new(SamplingOptions::greedy(), self.frontend.stop_ids())?;
+        Ok(sampler.sample(&self.logits)?.token_id)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Stable retained device-arena and pinned-logit addresses.
     pub fn qualification_addresses(&self) -> Vec<usize> {
         self.program
             .base_addresses()
@@ -949,6 +1099,46 @@ impl Qwen35ResidentGenerationSession<'_> {
     }
 }
 
+impl Qwen36ResidentGenerationSession<'_> {
+    /// Exact prompt token IDs selected by the admitted Qwen3.6 frontend.
+    pub fn prompt_token_ids(&self) -> &[u32] {
+        self.control.prompt_token_ids()
+    }
+
+    /// Tokens selected so far, including an unprocessed final token.
+    pub fn generated_token_ids(&self) -> &[u32] {
+        self.control.generated_token_ids()
+    }
+
+    /// Current terminal state.
+    pub const fn finish_reason(&self) -> Option<FinishReason> {
+        self.control.finish_reason()
+    }
+
+    /// Samples one token and returns its streaming delta before the next model replay.
+    pub fn step(&mut self) -> EngineResult<GenerationStep> {
+        if let Some(token) = self.pending_token.take() {
+            replay_qwen36_token(self.program, self.stream, token, self.next_position)?;
+            self.program.read_logits_into(self.stream, 1, self.logits)?;
+            self.next_position = self
+                .next_position
+                .checked_add(1)
+                .ok_or_else(|| EngineError::generation("generation position overflows"))?;
+        }
+
+        let step = self.control.accept_logits(self.logits)?;
+        if step.finish_reason.is_none() {
+            self.pending_token = Some(step.token_id);
+        }
+        Ok(step)
+    }
+
+    /// Converts a terminal Qwen3.6 session into its complete decoded result.
+    pub fn into_output(self) -> EngineResult<GeneratedText> {
+        self.control.into_output()
+    }
+}
+
 fn slot_logits(slot: usize) -> std::ops::Range<usize> {
     let begin = slot * Qwen38_27B::VOCAB;
     begin..begin + Qwen38_27B::VOCAB
@@ -1090,6 +1280,18 @@ const fn next_native_prefill_tile(remaining: usize) -> Option<usize> {
 
 fn replay_qwen35_token(
     program: &mut Qwen35ResidentModelProgram,
+    stream: &CudaStream,
+    token: u32,
+    position: u32,
+) -> EngineResult<()> {
+    let (rope_cos, rope_sin) = text_rope(position);
+    program.stage_embeddings(stream, &[token])?;
+    program.load_decode_state(stream, 1, &[position], &rope_cos, &rope_sin)?;
+    program.replay(stream, 1)
+}
+
+fn replay_qwen36_token(
+    program: &mut Qwen36ResidentModelProgram,
     stream: &CudaStream,
     token: u32,
     position: u32,
