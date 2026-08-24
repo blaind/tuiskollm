@@ -1,0 +1,457 @@
+//! Exact Qwen3.6 source-NVFP4 language-model head.
+
+use cuda_device::{
+    SharedArray, cuda_module, kernel, launch_bounds, launch_contract, ptx_asm, thread,
+};
+use std::sync::Arc;
+use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_model::{Arch, Qwen36Moe35B};
+
+const MAX_BATCH: usize = 8;
+const INPUT_COLUMNS: usize = Qwen36Moe35B::HIDDEN;
+const OUTPUT_ROWS: usize = Qwen36Moe35B::VOCAB;
+const GROUP_K: usize = 16;
+const GROUPS_PER_ROW: usize = INPUT_COLUMNS / GROUP_K;
+const CODE_BYTES_PER_ROW: usize = INPUT_COLUMNS / 2;
+const PHASE_GROUPS: usize = 32;
+const PHASES: usize = GROUPS_PER_ROW / PHASE_GROUPS;
+const CODE_WORDS_PER_PHASE: usize = PHASE_GROUPS * (GROUP_K / 2) / size_of::<u32>();
+
+// A one-warp CTA would launch 124,160 CTAs and reload every BF16 activation
+// row for each adjacent output pair. Eight warps share each 1,024-byte phase,
+// cutting those activation reads eightfold while retaining 15,520 CTAs =
+// 91.3 CTAs/SM on the 170-SM target. Every warp still owns two output rows,
+// visits K16 groups in lane/phase order, and uses the same shuffle reduction.
+const WARPS: usize = 8;
+const THREADS: u32 = (WARPS * 32) as u32;
+const PHASE_PACKED_PAIRS: usize = PHASE_GROUPS * GROUP_K / 2;
+const SHARED_U32: usize = MAX_BATCH * PHASE_PACKED_PAIRS;
+
+const _: () = assert!(INPUT_COLUMNS == 2_048);
+const _: () = assert!(OUTPUT_ROWS == 248_320);
+const _: () = assert!(GROUPS_PER_ROW == 128);
+const _: () = assert!(PHASES == 4);
+const _: () = assert!(OUTPUT_ROWS.is_multiple_of(128));
+const _: () = assert!(OUTPUT_ROWS.is_multiple_of(2 * WARPS));
+const _: () = assert!(SHARED_U32 * size_of::<u32>() == 8_192);
+
+#[cuda_module]
+mod kernels {
+    use super::*;
+    use cuda_device::{convert, float, tcgen05, warp};
+
+    #[inline(always)]
+    fn scale_offset(row: usize, group: usize) -> usize {
+        let persistent_tile = row >> 7;
+        let row_in_tile = row & 127;
+        let scale_tile = group >> 2;
+
+        (persistent_tile * (GROUPS_PER_ROW >> 2) + scale_tile) * 512
+            + (row_in_tile & 31) * 16
+            + (row_in_tile >> 5) * 4
+            + (group & 3)
+    }
+
+    #[inline(always)]
+    fn physical_row(index: usize) -> usize {
+        let tile = index >> 7;
+        let in_tile = index & 127;
+
+        tile * 128 + (in_tile >> 2) + (in_tile & 3) * 32
+    }
+
+    #[inline(always)]
+    fn e4m3_to_f32(code: u8) -> f32 {
+        let duplicated = code as u16 | ((code as u16) << 8);
+        let packed_f16 = convert::cvt_rn_f16x2_e4m3x2(duplicated);
+
+        convert::cvt_f32_f16x2_lo(packed_f16)
+    }
+
+    #[inline(always)]
+    fn e2m1x2_to_f32(packed: u8) -> (f32, f32) {
+        let packed_f16: u32;
+        let storage = packed as u16;
+
+        unsafe {
+            ptx_asm!(
+                "{ .reg .b8 lo, zero; mov.b16 {lo, zero}, %1; \
+                 cvt.rn.f16x2.e2m1x2 %0, lo; }",
+                out("=r") packed_f16,
+                in("h") storage,
+                options(register_only),
+            );
+        }
+
+        convert::cvt_f32x2_f16x2(packed_f16)
+    }
+
+    #[inline(always)]
+    unsafe fn load_u32x2_read_only(source: *const u32) -> (u32, u32) {
+        let first: u32;
+        let second: u32;
+
+        unsafe {
+            ptx_asm!(
+                "ld.global.nc.v2.u32 {%0, %1}, [%2];",
+                out("=r") first,
+                out("=r") second,
+                in("l") source,
+                clobber("memory"),
+            );
+        }
+
+        (first, second)
+    }
+
+    #[inline(always)]
+    unsafe fn load_u8_read_only(source: *const u8) -> u8 {
+        let value: u32;
+
+        unsafe {
+            ptx_asm!(
+                "ld.global.nc.u8 %0, [%1];",
+                out("=r") value,
+                in("l") source,
+                clobber("memory"),
+            );
+        }
+
+        value as u8
+    }
+
+    #[inline(always)]
+    fn reduce_sum_lane_zero(mut value: f32) -> f32 {
+        value += warp::shuffle_down_f32(value, 16);
+        value += warp::shuffle_down_f32(value, 8);
+        value += warp::shuffle_down_f32(value, 4);
+        value += warp::shuffle_down_f32(value, 2);
+        value += warp::shuffle_down_f32(value, 1);
+
+        value
+    }
+
+    /// Projects exact BF16 rows through the source-represented NVFP4 LM head.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_nvfp4_lm_head_a16<const TOKENS: usize>(
+        input: *const u32,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        weight_scale_2: f32,
+        output: *mut u16,
+    ) {
+        static mut SHARED: SharedArray<u32, SHARED_U32, 16> = SharedArray::UNINIT;
+
+        let block = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_index = tid >> 5;
+        let pair_index = block * (2 * WARPS) + 2 * warp_index;
+        let first_row = physical_row(pair_index);
+        let second_row = physical_row(pair_index + 1);
+        let mut first_accumulators = [0.0f32; TOKENS];
+        let mut second_accumulators = [0.0f32; TOKENS];
+        let shared = core::ptr::addr_of_mut!(SHARED).cast::<u32>();
+        let mut phase = 0usize;
+
+        while phase < PHASES {
+            let mut task = tid;
+            while task < TOKENS * PHASE_PACKED_PAIRS {
+                let token = task / PHASE_PACKED_PAIRS;
+                let pair = task - token * PHASE_PACKED_PAIRS;
+                unsafe {
+                    *shared.add(task) =
+                        *input.add(token * (INPUT_COLUMNS / 2) + phase * PHASE_PACKED_PAIRS + pair);
+                }
+                task += THREADS as usize;
+            }
+            thread::sync_threads();
+
+            let group = phase * PHASE_GROUPS + lane;
+            let first_scale =
+                unsafe { load_u8_read_only(weight_scales.add(scale_offset(first_row, group))) };
+            let second_scale =
+                unsafe { load_u8_read_only(weight_scales.add(scale_offset(second_row, group))) };
+            let first_coefficient = e4m3_to_f32(first_scale) * weight_scale_2;
+            let second_coefficient = e4m3_to_f32(second_scale) * weight_scale_2;
+            let row_words = CODE_BYTES_PER_ROW / size_of::<u32>();
+            let word_offset = phase * CODE_WORDS_PER_PHASE + lane * 2;
+            let first_source = unsafe { weight_codes.add(first_row * row_words + word_offset) };
+            let second_source = unsafe { weight_codes.add(second_row * row_words + word_offset) };
+            let first_words = unsafe { load_u32x2_read_only(first_source) };
+            let second_words = unsafe { load_u32x2_read_only(second_source) };
+
+            macro_rules! accumulate_pair {
+                ($pair:literal) => {{
+                    let shift = ($pair & 3) * 8;
+                    let first_packed = if $pair < 4 {
+                        (first_words.0 >> shift) as u8
+                    } else {
+                        (first_words.1 >> shift) as u8
+                    };
+                    let second_packed = if $pair < 4 {
+                        (second_words.0 >> shift) as u8
+                    } else {
+                        (second_words.1 >> shift) as u8
+                    };
+                    let (first_weight0, first_weight1) = e2m1x2_to_f32(first_packed);
+                    let (second_weight0, second_weight1) = e2m1x2_to_f32(second_packed);
+
+                    macro_rules! accumulate_token {
+                        ($token:literal) => {
+                            if $token < TOKENS {
+                                let bits = unsafe {
+                                    *shared.add($token * PHASE_PACKED_PAIRS + lane * 8 + $pair)
+                                };
+                                let (activation0, activation1) = convert::cvt_f32x2_bf16x2(bits);
+                                first_accumulators[$token] = float::fma_rn_f32(
+                                    first_weight0 * first_coefficient,
+                                    activation0,
+                                    first_accumulators[$token],
+                                );
+                                first_accumulators[$token] = float::fma_rn_f32(
+                                    first_weight1 * first_coefficient,
+                                    activation1,
+                                    first_accumulators[$token],
+                                );
+                                second_accumulators[$token] = float::fma_rn_f32(
+                                    second_weight0 * second_coefficient,
+                                    activation0,
+                                    second_accumulators[$token],
+                                );
+                                second_accumulators[$token] = float::fma_rn_f32(
+                                    second_weight1 * second_coefficient,
+                                    activation1,
+                                    second_accumulators[$token],
+                                );
+                            }
+                        };
+                    }
+
+                    accumulate_token!(0);
+                    accumulate_token!(1);
+                    accumulate_token!(2);
+                    accumulate_token!(3);
+                    accumulate_token!(4);
+                    accumulate_token!(5);
+                    accumulate_token!(6);
+                    accumulate_token!(7);
+                }};
+            }
+
+            accumulate_pair!(0);
+            accumulate_pair!(1);
+            accumulate_pair!(2);
+            accumulate_pair!(3);
+            accumulate_pair!(4);
+            accumulate_pair!(5);
+            accumulate_pair!(6);
+            accumulate_pair!(7);
+            thread::sync_threads();
+            phase += 1;
+        }
+
+        macro_rules! finish_token {
+            ($token:literal) => {
+                if $token < TOKENS {
+                    let first = reduce_sum_lane_zero(first_accumulators[$token]);
+                    let second = reduce_sum_lane_zero(second_accumulators[$token]);
+                    if lane == 0 {
+                        unsafe {
+                            *output.add($token * OUTPUT_ROWS + first_row) =
+                                tcgen05::f32_to_bf16_rne(first);
+                            *output.add($token * OUTPUT_ROWS + second_row) =
+                                tcgen05::f32_to_bf16_rne(second);
+                        }
+                    }
+                }
+            };
+        }
+
+        finish_token!(0);
+        finish_token!(1);
+        finish_token!(2);
+        finish_token!(3);
+        finish_token!(4);
+        finish_token!(5);
+        finish_token!(6);
+        finish_token!(7);
+    }
+}
+
+fn launch_config() -> LaunchConfig1D {
+    LaunchConfig1D::new((OUTPUT_ROWS / (2 * WARPS)) as u32, THREADS, 0)
+}
+
+struct PreparedBatchRoute<const TOKENS: usize> {
+    projection: PreparedLaunch<kernels::__qwen36_nvfp4_lm_head_a16_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedBatchRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let projection = module
+            .prepare_qwen36_nvfp4_lm_head_a16::<TOKENS>(launch_config())
+            .map_err(|source| GpuError::launch("preparing Qwen3.6 NVFP4 LM head", source))?;
+
+        Ok(Self { projection })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        weight_scale_2: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen36_nvfp4_lm_head_a16::<TOKENS>(
+                stream,
+                &self.projection,
+                input.cast::<u32>(),
+                weight_codes.cast::<u32>(),
+                weight_scales,
+                weight_scale_2,
+                output,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.6 NVFP4 LM head", source))
+    }
+}
+
+/// PTX symbols retained for every exact Qwen3.6 LM-head batch.
+pub(crate) fn qwen36_nvfp4_lm_head_ptx_names() -> [&'static str; MAX_BATCH] {
+    [
+        kernels::qwen36_nvfp4_lm_head_a16_ptx_name::<1>(),
+        kernels::qwen36_nvfp4_lm_head_a16_ptx_name::<2>(),
+        kernels::qwen36_nvfp4_lm_head_a16_ptx_name::<3>(),
+        kernels::qwen36_nvfp4_lm_head_a16_ptx_name::<4>(),
+        kernels::qwen36_nvfp4_lm_head_a16_ptx_name::<5>(),
+        kernels::qwen36_nvfp4_lm_head_a16_ptx_name::<6>(),
+        kernels::qwen36_nvfp4_lm_head_a16_ptx_name::<7>(),
+        kernels::qwen36_nvfp4_lm_head_a16_ptx_name::<8>(),
+    ]
+}
+
+/// Prepared exact-batch Qwen3.6 NVFP4 LM-head routes on SM120.
+pub struct Qwen36Nvfp4LmHeadOp {
+    module: kernels::LoadedModule,
+    b1: PreparedBatchRoute<1>,
+    b2: PreparedBatchRoute<2>,
+    b3: PreparedBatchRoute<3>,
+    b4: PreparedBatchRoute<4>,
+    b5: PreparedBatchRoute<5>,
+    b6: PreparedBatchRoute<6>,
+    b7: PreparedBatchRoute<7>,
+    b8: PreparedBatchRoute<8>,
+}
+
+impl Qwen36Nvfp4LmHeadOp {
+    /// Loads the embedded module and prepares every exact batch.
+    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        let _ = qwen36_nvfp4_lm_head_ptx_names();
+        let module = unsafe { kernels::load(context) }
+            .map_err(|source| GpuError::module("loading Qwen3.6 NVFP4 LM-head kernels", source))?;
+
+        Ok(Self {
+            b1: PreparedBatchRoute::prepare(&module)?,
+            b2: PreparedBatchRoute::prepare(&module)?,
+            b3: PreparedBatchRoute::prepare(&module)?,
+            b4: PreparedBatchRoute::prepare(&module)?,
+            b5: PreparedBatchRoute::prepare(&module)?,
+            b6: PreparedBatchRoute::prepare(&module)?,
+            b7: PreparedBatchRoute::prepare(&module)?,
+            b8: PreparedBatchRoute::prepare(&module)?,
+            module,
+        })
+    }
+
+    /// Projects source-represented NVFP4 weights at exact `B=1..=8`.
+    ///
+    /// # Safety
+    ///
+    /// `input` covers BF16 `[batch,2048]`; `weight_codes` covers packed E2M1
+    /// `[248320,1024]`; `weight_scales` covers swizzled E4M3 `[248320,128]`;
+    /// and `output` covers BF16 `[batch,248320]`. All planes are aligned,
+    /// disjoint, context-local, and live until `stream` completes.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        weight_scale_2: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        if !weight_scale_2.is_finite() || weight_scale_2 <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.6 NVFP4 LM-head weight scale must be finite and positive",
+            ));
+        }
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        input,
+                        weight_codes,
+                        weight_scales,
+                        weight_scale_2,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match batch {
+            1 => launch!(b1),
+            2 => launch!(b2),
+            3 => launch!(b3),
+            4 => launch!(b4),
+            5 => launch!(b5),
+            6 => launch!(b6),
+            7 => launch!(b7),
+            8 => launch!(b8),
+            _ => Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 NVFP4 LM-head batch {batch} is outside the exact range 1..={MAX_BATCH}"
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn geometry_and_inventory_are_exact() {
+        assert_eq!(OUTPUT_ROWS, 248_320);
+        assert_eq!(GROUPS_PER_ROW, 128);
+        assert_eq!(PHASES, 4);
+        assert_eq!(CODE_WORDS_PER_PHASE, 64);
+        assert_eq!(OUTPUT_ROWS / (2 * WARPS), 15_520);
+        assert_eq!(SHARED_U32 * size_of::<u32>(), 8_192);
+
+        let names = qwen36_nvfp4_lm_head_ptx_names();
+        assert_eq!(names.len(), MAX_BATCH);
+        assert_eq!(
+            names.iter().copied().collect::<BTreeSet<_>>().len(),
+            names.len()
+        );
+    }
+}

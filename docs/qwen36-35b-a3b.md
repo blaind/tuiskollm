@@ -152,7 +152,20 @@ and 802,816 inactive sentinels with immutable sources, stable addresses, and zer
 growth in an 8,798,208-byte arena. The eight gate entries use 26 registers, zero stack/local
 memory, and 1,024 bytes shared; the reused static-FP8 projection retains its separately checked
 resource contract. Timing remains unreported because the available run failed the exclusive-device
-precondition after qualification. The full layer owner remains separate.
+precondition after qualification. One source-backed layer-3 owner now composes these attention
+leaves, both residual seams, and the routed/shared MoE boundary into eight exact-B graphs over one
+487,394,048-byte arena. Its B=1 source oracle and all-batch lifecycle gate pass with 483,085,312
+resident weight bytes, 3,145,728 BF16 cache bytes, and 1,161,680 workspace bytes. Its unblessed
+direct diagnostic measures 122.901/255.794 us at B=1/8 while clocks span 2,070--2,197 MHz.
+
+The NVFP4 endpoint prerequisite now owns eight exact A16 LM-head routes over the source-represented
+`[248320,2048]` plane. It retains BF16 activations rather than requantizing them, reads packed E2M1
+codes plus losslessly swizzled E4M3 scales, and applies the exact second-stage source weight scale.
+Every `B=1..8` route publishes and graph-replays 8,939,520 finite logits, checks 4,608 independent
+represented-value dots including scale-layout seams, preserves 13,905,920 inactive sentinels, and
+proves its 286,064,640 weight bytes immutable with stable addresses and no post-warmup growth.
+Static resource evidence and direct timing are the next separate slice; the source-backed endpoint
+owner remains unimplemented.
 
 ## Implementation order
 
