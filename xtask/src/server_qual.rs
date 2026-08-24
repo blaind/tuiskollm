@@ -20,19 +20,33 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const ROUTE: &str = "mtp-draft-3";
 
 pub(super) fn run(root: &Path, arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
-    let snapshot = parse_snapshot(arguments, "qualify-server")?;
+    run_mode(root, arguments, false)
+}
+
+pub(super) fn run_long_context(root: &Path, arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
+    run_mode(root, arguments, true)
+}
+
+fn run_mode(root: &Path, arguments: &[OsString], long_context: bool) -> Result<(), Box<dyn Error>> {
+    let command = if long_context {
+        "qualify-server-long-context"
+    } else {
+        "qualify-server"
+    };
+    let snapshot = parse_snapshot(arguments, command)?;
     let (tools, mut server) = start(root, snapshot, "server qualification setup")?;
-    let qualification = run_visible(
-        Command::new(tools.qualifier())
-            .arg(server.base_url())
-            .current_dir(root),
-    );
+    let mut qualification = Command::new(tools.qualifier());
+    qualification.arg(server.base_url()).current_dir(root);
+    if long_context {
+        qualification.arg("--long-context");
+    }
+    let qualification = run_visible(&mut qualification);
     let stop = server.stop_and_wait();
     qualification?;
     stop?;
 
     println!(
-        "production server qualification passed; lifecycle log: {}",
+        "production {command} passed; lifecycle log: {}",
         server.log_path().display()
     );
     Ok(())
