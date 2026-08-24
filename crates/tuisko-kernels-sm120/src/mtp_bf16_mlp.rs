@@ -67,31 +67,67 @@ mod kernels {
         let mut up = [0.0f32; 4];
         let mut column = 0usize;
 
-        while column < HIDDEN {
-            let input = unsafe {
-                [
-                    input_pair::<TOKENS>(input, group, column + 2 * thread_in_group),
-                    input_pair::<TOKENS>(input, group + 8, column + 2 * thread_in_group),
-                    input_pair::<TOKENS>(input, group, column + 8 + 2 * thread_in_group),
-                    input_pair::<TOKENS>(input, group + 8, column + 8 + 2 * thread_in_group),
-                ]
-            };
-            let gate_weight = unsafe {
-                [
-                    gate_up_weight_pair(gate_up_weight, gate_row, column + 2 * thread_in_group),
-                    gate_up_weight_pair(gate_up_weight, gate_row, column + 8 + 2 * thread_in_group),
-                ]
-            };
-            let up_weight = unsafe {
-                [
-                    gate_up_weight_pair(gate_up_weight, up_row, column + 2 * thread_in_group),
-                    gate_up_weight_pair(gate_up_weight, up_row, column + 8 + 2 * thread_in_group),
-                ]
-            };
-            // SAFETY: all lanes execute identical native BF16 MMA instructions.
-            gate = unsafe { wmma::mma_m16n8k16_f32_bf16(gate, input, gate_weight) };
-            up = unsafe { wmma::mma_m16n8k16_f32_bf16(up, input, up_weight) };
-            column += 16;
+        macro_rules! k_step {
+            ($column:expr) => {{
+                let column = $column;
+                let input = unsafe {
+                    [
+                        input_pair::<TOKENS>(input, group, column + 2 * thread_in_group),
+                        input_pair::<TOKENS>(input, group + 8, column + 2 * thread_in_group),
+                        input_pair::<TOKENS>(input, group, column + 8 + 2 * thread_in_group),
+                        input_pair::<TOKENS>(input, group + 8, column + 8 + 2 * thread_in_group),
+                    ]
+                };
+                let gate_weight = unsafe {
+                    [
+                        gate_up_weight_pair(gate_up_weight, gate_row, column + 2 * thread_in_group),
+                        gate_up_weight_pair(
+                            gate_up_weight,
+                            gate_row,
+                            column + 8 + 2 * thread_in_group,
+                        ),
+                    ]
+                };
+                let up_weight = unsafe {
+                    [
+                        gate_up_weight_pair(gate_up_weight, up_row, column + 2 * thread_in_group),
+                        gate_up_weight_pair(
+                            gate_up_weight,
+                            up_row,
+                            column + 8 + 2 * thread_in_group,
+                        ),
+                    ]
+                };
+                // SAFETY: all lanes execute identical native BF16 MMA instructions.
+                gate = unsafe { wmma::mma_m16n8k16_f32_bf16(gate, input, gate_weight) };
+                up = unsafe { wmma::mma_m16n8k16_f32_bf16(up, input, up_weight) };
+            }};
+        }
+        // The narrow exact routes fold most input rows to constants and lose
+        // load depth (B=1 compiled to 32 registers and ran 2.1x slower than
+        // B=8 on the same weight stream); four K-blocks per iteration restore
+        // the pipeline there while the wide routes take eight before register
+        // pressure bites (HIDDEN = 5,120 = 320 sixteen-column blocks).
+        if TOKENS <= 2 {
+            while column < HIDDEN {
+                k_step!(column);
+                k_step!(column + 16);
+                k_step!(column + 32);
+                k_step!(column + 48);
+                column += 64;
+            }
+        } else {
+            while column < HIDDEN {
+                k_step!(column);
+                k_step!(column + 16);
+                k_step!(column + 32);
+                k_step!(column + 48);
+                k_step!(column + 64);
+                k_step!(column + 80);
+                k_step!(column + 96);
+                k_step!(column + 112);
+                column += 128;
+            }
         }
 
         if group < TOKENS {
