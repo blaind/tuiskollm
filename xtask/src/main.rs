@@ -4061,6 +4061,12 @@ fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
         if mode == "check" && !remaining.is_empty() {
             return Err("`perf check` uses the complete authoritative suite defaults".into());
         }
+        if mode == "check" {
+            preflight_performance_baselines(
+                root,
+                cone.iter().map(|suite| suite.performance_baseline()),
+            )?;
+        }
         require_performance_device_idle()?;
         return run_optimization_cone(root, mode, suite, &cone, snapshot, remaining);
     }
@@ -4079,6 +4085,14 @@ fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
         "energy" => vec!["--energy-seconds".into(), "2".into()],
         _ => return Err(format!("unknown perf mode `{mode}`").into()),
     };
+    if mode == "gate" {
+        preflight_performance_baselines(
+            root,
+            PERFORMANCE_SUITES
+                .into_iter()
+                .map(PerformanceSuite::performance_baseline),
+        )?;
+    }
     require_performance_device_idle()?;
     if mode == "gate" {
         for suite in PERFORMANCE_SUITES {
@@ -4356,6 +4370,27 @@ fn resolve_target_output(root: &Path, path: &OsStr) -> Result<PathBuf, Box<dyn E
         return Err("diagnostic output must be a repository-relative path under `target/`".into());
     }
     Ok(root.join(path))
+}
+
+fn preflight_performance_baselines(
+    root: &Path,
+    baselines: impl IntoIterator<Item = &'static str>,
+) -> Result<(), Box<dyn Error>> {
+    let mut failures = Vec::new();
+    for baseline in baselines {
+        if let Err(error) = performance::preflight_baseline(&root.join(baseline)) {
+            failures.push(format!("{baseline}: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "performance baselines are missing or invalid; bless each suite before comparing:\n{}",
+        failures.join("\n")
+    )
+    .into())
 }
 
 fn run_performance_suites(
@@ -8703,8 +8738,7 @@ impl Drop for Baseline {
 }
 
 fn require_consumed_baseline_keys() -> Result<(), Box<dyn Error>> {
-    let unconsumed =
-        UNCONSUMED_BASELINE_KEYS.with(|keys| std::mem::take(&mut *keys.borrow_mut()));
+    let unconsumed = UNCONSUMED_BASELINE_KEYS.with(|keys| std::mem::take(&mut *keys.borrow_mut()));
     if unconsumed.is_empty() {
         return Ok(());
     }
@@ -8923,11 +8957,7 @@ fn require_spill_free(name: &str, resource: &Resource) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-fn require_registers(
-    baseline: &Baseline,
-    key: &str,
-    actual: &[u32],
-) -> Result<(), Box<dyn Error>> {
+fn require_registers(baseline: &Baseline, key: &str, actual: &[u32]) -> Result<(), Box<dyn Error>> {
     let actual = actual
         .iter()
         .map(u32::to_string)
@@ -8958,8 +8988,9 @@ mod tests {
         PERFORMANCE_SUITES, PerformanceSuite, SM120_RESOURCE_BASELINES, parse_baseline,
         parse_compute_pids, parse_cuda_toolkit_identity, parse_entries, parse_idle_sample,
         parse_performance_device_sample, parse_performance_iteration, parse_resources,
-        parse_rustc_identity, require_consumed_baseline_keys, require_count, require_registers,
-        require_uniform_value, resolve_target_output, sass_function_body,
+        parse_rustc_identity, preflight_performance_baselines, require_consumed_baseline_keys,
+        require_count, require_registers, require_uniform_value, resolve_target_output,
+        sass_function_body, workspace_root,
     };
     use std::ffi::OsString;
 
@@ -9025,6 +9056,26 @@ mod tests {
 
         require_uniform_value(&baseline, "shared_bytes", &[1_088; 16]).unwrap();
         assert!(require_uniform_value(&baseline, "shared_bytes", &[1_088, 1_024]).is_err());
+    }
+
+    #[test]
+    fn baseline_preflight_lists_every_missing_file() {
+        let root = workspace_root().unwrap();
+        preflight_performance_baselines(root, ["qual/baselines/nvfp4-down-sm120.json"]).unwrap();
+
+        let error = preflight_performance_baselines(
+            root,
+            [
+                "qual/baselines/never-blessed-a.json",
+                "qual/baselines/nvfp4-down-sm120.json",
+                "qual/baselines/never-blessed-b.json",
+            ],
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("never-blessed-a.json"));
+        assert!(error.to_string().contains("never-blessed-b.json"));
+        assert!(!error.to_string().contains("nvfp4-down-sm120.json"));
     }
 
     #[test]

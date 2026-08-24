@@ -662,6 +662,11 @@ pub(crate) fn bless(report_path: &Path, baseline_path: &Path) -> Result<(), Box<
     Ok(())
 }
 
+pub(crate) fn preflight_baseline(baseline_path: &Path) -> Result<(), Box<dyn Error>> {
+    serde_json::from_slice::<PerformanceBaseline>(&fs::read(baseline_path)?)?;
+    Ok(())
+}
+
 fn read_report(path: &Path) -> Result<PerformanceReport, Box<dyn Error>> {
     let report: PerformanceReport = serde_json::from_slice(&fs::read(path)?)?;
     if report.schema_version != REPORT_SCHEMA {
