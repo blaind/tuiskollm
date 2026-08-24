@@ -392,6 +392,9 @@ fn overlap_error(range: &Range<usize>, start: usize, end: usize) -> GpuError {
 
 impl DeviceArena {
     /// Allocates and zeroes the storage required by `layout`.
+    ///
+    /// Synchronizes `stream` before returning, so later operations observe the
+    /// zeroed bytes from any stream in the same context.
     pub fn zeroed(stream: &CudaStream, layout: &ArenaLayout) -> GpuResult<Self> {
         stream
             .context()
@@ -399,6 +402,12 @@ impl DeviceArena {
             .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
         let storage = DeviceBuffer::zeroed(stream, layout.byte_len())
             .map_err(|source| GpuError::driver("allocating a zeroed device arena", source))?;
+        // The zeroing memset is only enqueued on `stream`, while later arena
+        // operations accept any same-context stream; draining `stream` here
+        // keeps a cross-stream reader from observing uninitialized memory.
+        stream
+            .synchronize()
+            .map_err(|source| GpuError::driver("synchronizing device arena zeroing", source))?;
 
         Ok(Self {
             storage,
