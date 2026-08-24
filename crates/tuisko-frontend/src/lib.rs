@@ -60,13 +60,11 @@ impl FrontendContract {
 }
 
 /// One text message supplied to the checkpoint chat template.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ChatMessage {
     /// Template role such as `system`, `user`, or `assistant`.
     pub role: String,
     /// Text content, accepting OpenAI text parts at the transport boundary.
-    #[serde(default, deserialize_with = "deserialize_chat_content")]
     pub content: String,
     /// Earlier reasoning supplied when the template is configured to preserve it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -77,6 +75,53 @@ pub struct ChatMessage {
     /// Tool-call identity associated with a `tool` response message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireChatMessage {
+    role: String,
+    #[serde(default, deserialize_with = "deserialize_wire_chat_content")]
+    content: WireMessageContent,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ChatToolCall>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Default)]
+enum WireMessageContent {
+    #[default]
+    Missing,
+    Null,
+    Text(String),
+}
+
+impl<'de> Deserialize<'de> for ChatMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let message = WireChatMessage::deserialize(deserializer)?;
+        if message.role == "user" && !matches!(message.content, WireMessageContent::Text(_)) {
+            return Err(D::Error::custom(
+                "user message must include non-null `content`",
+            ));
+        }
+        let content = match message.content {
+            WireMessageContent::Missing | WireMessageContent::Null => String::new(),
+            WireMessageContent::Text(content) => content,
+        };
+        Ok(Self {
+            role: message.role,
+            content,
+            reasoning_content: message.reasoning_content,
+            tool_calls: message.tool_calls,
+            tool_call_id: message.tool_call_id,
+        })
+    }
 }
 
 /// One OpenAI-compatible function call in conversation history.
@@ -168,13 +213,13 @@ struct WireChatContentPart {
     extra: Map<String, Value>,
 }
 
-fn deserialize_chat_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+fn deserialize_wire_chat_content<'de, D>(deserializer: D) -> Result<WireMessageContent, D::Error>
 where
     D: Deserializer<'de>,
 {
     match Option::<WireChatContent>::deserialize(deserializer)? {
-        None => Ok(String::new()),
-        Some(WireChatContent::Text(text)) => Ok(text),
+        None => Ok(WireMessageContent::Null),
+        Some(WireChatContent::Text(text)) => Ok(WireMessageContent::Text(text)),
         Some(WireChatContent::Parts(parts)) => {
             let mut text = String::new();
             for part in parts {
@@ -200,7 +245,7 @@ where
                         .ok_or_else(|| D::Error::custom("text content part is missing `text`"))?,
                 );
             }
-            Ok(text)
+            Ok(WireMessageContent::Text(text))
         }
     }
 }
@@ -966,6 +1011,14 @@ mod tests {
         assert_eq!(parts.content, "hello");
         assert_eq!(null.content, "");
         assert_eq!(missing.content, "");
+    }
+
+    #[test]
+    fn user_message_requires_explicit_non_null_content() {
+        for message in [r#"{"role":"user"}"#, r#"{"role":"user","content":null}"#] {
+            let error = serde_json::from_str::<ChatMessage>(message).unwrap_err();
+            assert!(error.to_string().contains("non-null `content`"), "{error}");
+        }
     }
 
     #[test]

@@ -724,6 +724,15 @@ mod tests {
     }
 
     #[test]
+    fn user_messages_require_explicit_non_null_content() {
+        for message in [r#"{"role":"user"}"#, r#"{"role":"user","content":null}"#] {
+            let body = format!(r#"{{"model":"{SERVED_MODEL}","messages":[{message}]}}"#);
+            let error = serde_json::from_str::<ChatCompletionRequest>(&body).unwrap_err();
+            assert!(error.to_string().contains("non-null `content`"), "{error}");
+        }
+    }
+
+    #[test]
     fn rejects_special_token_literals_in_chat_input() {
         for literal in tuisko_frontend::SPECIAL_TOKEN_LITERALS {
             let error = request(&format!(
