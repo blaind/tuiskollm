@@ -79,6 +79,10 @@ mod mtp_bf16_fusion;
 #[cfg(feature = "device")]
 mod mtp_bf16_fusion_benchmark;
 #[cfg(feature = "device")]
+mod mtp_bf16_mlp;
+#[cfg(feature = "device")]
+mod mtp_bf16_mlp_benchmark;
+#[cfg(feature = "device")]
 mod mtp_bf16_qkv;
 #[cfg(feature = "device")]
 mod mtp_bf16_qkv_benchmark;
@@ -265,6 +269,12 @@ pub use mtp_bf16_fusion::{
 };
 #[cfg(feature = "device")]
 pub use mtp_bf16_fusion_benchmark::benchmark_mtp_bf16_fusion;
+#[cfg(feature = "device")]
+pub use mtp_bf16_mlp::{
+    MtpBf16MlpQualification, MtpBf16MlpQualificationError, qualify_mtp_bf16_mlp,
+};
+#[cfg(feature = "device")]
+pub use mtp_bf16_mlp_benchmark::benchmark_mtp_bf16_mlp;
 #[cfg(feature = "device")]
 pub use mtp_bf16_qkv::{
     MtpBf16QkvQualification, MtpBf16QkvQualificationError, qualify_mtp_bf16_qkv,
