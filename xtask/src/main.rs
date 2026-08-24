@@ -1613,7 +1613,7 @@ fn qualify_qwen36_moe_router(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "qwen36_moe_router",
+            "qwen36_moe_router::tests::exact_routes_match_independent_oracles_and_graph_replay",
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -10493,10 +10493,36 @@ fn gate_qwen36_moe_router(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_moe_router_select_TID_"))
         .collect::<Vec<_>>();
+    let prefill_projection = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen36_moe_router_logits_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
+    let prefill_selection = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen36_moe_router_select_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.6 MoE router projection", projection.len(), 8)?;
     require_count("Qwen3.6 MoE router selection", selection.len(), 8)?;
+    require_count(
+        "Qwen3.6 MoE prompt router projection",
+        prefill_projection.len(),
+        3,
+    )?;
+    require_count(
+        "Qwen3.6 MoE prompt router selection",
+        prefill_selection.len(),
+        3,
+    )?;
 
-    for entry in &projection {
+    for entry in projection.iter().chain(&prefill_projection) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
@@ -10512,7 +10538,7 @@ fn gate_qwen36_moe_router(root: &Path) -> Result<(), Box<dyn Error>> {
             }
         }
     }
-    for entry in &selection {
+    for entry in selection.iter().chain(&prefill_selection) {
         if !entry.body.contains(".reqntid 32, 1, 1") || !entry.body.contains(".minnctapersm 1") {
             return Err(format!("entry `{}` lost its one-warp launch bounds", entry.name).into());
         }
@@ -10525,8 +10551,12 @@ fn gate_qwen36_moe_router(root: &Path) -> Result<(), Box<dyn Error>> {
     let resources = &artifact.resources;
     let sass = artifact.sass()?;
     let mut projection_registers = Vec::with_capacity(projection.len());
+    let mut prefill_projection_registers = Vec::with_capacity(prefill_projection.len());
     let mut selection_registers = Vec::with_capacity(selection.len());
-    let mut shared = Vec::with_capacity(projection.len() + selection.len());
+    let mut prefill_selection_registers = Vec::with_capacity(prefill_selection.len());
+    let mut shared = Vec::with_capacity(
+        projection.len() + prefill_projection.len() + selection.len() + prefill_selection.len(),
+    );
     for (role, routes, instructions, registers) in [
         (
             "projection",
@@ -10539,6 +10569,18 @@ fn gate_qwen36_moe_router(root: &Path) -> Result<(), Box<dyn Error>> {
             selection,
             &["MUFU.EX2", "LDG.E.U16", "STG.E.U16"][..],
             &mut selection_registers,
+        ),
+        (
+            "prefill projection",
+            prefill_projection,
+            &["FFMA", "SHFL.DOWN", "STG.E.U16"][..],
+            &mut prefill_projection_registers,
+        ),
+        (
+            "prefill selection",
+            prefill_selection,
+            &["MUFU.EX2", "LDG.E.U16", "STG.E.U16"][..],
+            &mut prefill_selection_registers,
         ),
     ] {
         for entry in routes {
@@ -10569,15 +10611,35 @@ fn gate_qwen36_moe_router(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
     projection_registers.sort_unstable();
+    prefill_projection_registers.sort_unstable();
     selection_registers.sort_unstable();
+    prefill_selection_registers.sort_unstable();
     shared.sort_unstable();
     require_registers(&baseline, "projection_registers", &projection_registers)?;
     require_registers(&baseline, "selection_registers", &selection_registers)?;
+    for (key, registers) in [
+        (
+            "prefill_projection_registers",
+            prefill_projection_registers.as_slice(),
+        ),
+        (
+            "prefill_selection_registers",
+            prefill_selection_registers.as_slice(),
+        ),
+    ] {
+        if baseline.contains_key(key) {
+            require_registers(&baseline, key, registers)?;
+        }
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "Qwen3.6 MoE router gate passed: 8 projection + 8 top-eight entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, FFMA/SHFL/EX2/BF16-store present",
-        projection_registers, selection_registers, shared
+        "Qwen3.6 MoE router gate passed: 8 decode + 3 prefill routes, REG projection {:?} / {:?}, selection {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, FFMA/SHFL/EX2/BF16-store present",
+        projection_registers,
+        prefill_projection_registers,
+        selection_registers,
+        prefill_selection_registers,
+        shared
     );
     Ok(())
 }

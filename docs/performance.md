@@ -168,7 +168,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT` | Check source layer 55, route-specific A16/W4A4 scratch, every observable seam, exact B=1..8 and T=32/64/128/1024 graphs, immutable weights, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-mlp SNAPSHOT` | Check Qwen3.5 source layer 0, ModelOpt scale conversion, route-specific A16/W4A4 scratch, every observable seam, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-qkv` | Check Qwen3.5 fused Q/gate, K, and V represented values with three weight-scale divisors at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-moe-router` | Check Qwen3.6 BF16 router logits, deterministic top-eight experts, normalized BF16 weights, immutable sources, exact-B graph replay, and allocation behavior at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-qwen36-moe-router` | Check Qwen3.6 BF16 router logits, deterministic top-eight experts, normalized BF16 weights, immutable sources, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-moe-experts` | Check Qwen3.6 selected routed experts, shared expert/gate, fixed-order top-eight combination, immutable 256-expert planes, exact-B graph replay, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-nvfp4-lm-head` | Check represented Qwen3.6 NVFP4 LM-head logits, complete publication, immutable source planes, exact-B graph replay, inactive extents, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-text-endpoint SNAPSHOT` | Check exact Qwen3.6 source embeddings, final RMSNorm, sampled represented NVFP4 logits, immutable source planes, graph replay, stable addresses, and post-warmup allocation at B=1..8 | terminal |
@@ -250,7 +250,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed layer-55 decode and prefill MLP graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed Qwen3.5 layer-0 MLP graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-qkv` | Measure every exact Qwen3.5 fused NVFP4 QKV graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-moe-router` | Measure every exact Qwen3.6 BF16 router projection plus normalized top-eight graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-moe-router` | Measure every exact Qwen3.6 BF16 router projection plus normalized top-eight graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-moe-experts` | Measure every exact Qwen3.6 routed/shared NVFP4 expert plus combine graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-nvfp4-lm-head` | Measure every exact Qwen3.6 represented-weight NVFP4 full-vocabulary graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-residual-norm` | Measure every exact Qwen3.6 plain and fused-residual RMSNorm graph | terminal or `--json PATH` |
