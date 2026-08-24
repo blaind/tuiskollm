@@ -127,7 +127,9 @@ while losslessly gathering into one `[9216,2048]` Q/K/V plane; the source-native
 quantizes BF16 inputs with the checkpoint's shared scalar input scale and projects every exact
 `B=1..8` route. It passes 73,728 activation-code, 331,776 FP64-formula output, 405,504 graph-replay,
 and 630,784 inactive-sentinel comparisons with immutable sources, stable addresses, and zero
-post-warmup growth. At a diagnostic 2,167 MHz median SM clock, its unblessed warm repeated path
+post-warmup growth. Its eight quantizers retain 25 registers, the eight projections retain sorted
+register counts `[31,32,35,38,38,40,44,45]`, and every entry uses zero stack/local memory. At a
+diagnostic 2,167 MHz median SM clock, its unblessed warm repeated path
 measures 8.064/21.350 us at B=1/8; the production graph boundary measures 10.240/22.544 us. Q/K
 normalization and RoPE, BF16 cache ownership, attention, gated output, and the full layer owner
 remain separate qualification slices.
