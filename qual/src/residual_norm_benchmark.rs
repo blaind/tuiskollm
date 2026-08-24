@@ -446,6 +446,7 @@ fn logical_bytes<A: Arch>(batch: usize, fused_residual: bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{MAX_BATCH, QWEN38_MAX_ROWS, Qwen35_9B, Qwen38_27B, layout, logical_bytes};
+    use tuisko_model::Arch;
 
     #[test]
     fn byte_accounting_covers_every_read_and_write_plane() {
@@ -457,11 +458,11 @@ mod tests {
 
     #[test]
     fn residual_norm_suite_benchmark_arena_accounting_exposes_every_byte() {
-        let (layout, regions) = layout::<Qwen38_27B>(QWEN38_MAX_ROWS).unwrap();
-        assert_eq!(layout.byte_len(), regions.payload_bytes());
+        let (qwen38_layout, regions) = layout::<Qwen38_27B>(QWEN38_MAX_ROWS).unwrap();
+        assert_eq!(qwen38_layout.byte_len(), regions.payload_bytes());
         assert_eq!(regions.weight_bytes(), 10_240);
         assert_eq!(
-            layout.byte_len(),
+            qwen38_layout.byte_len(),
             5 * QWEN38_MAX_ROWS * Qwen38_27B::HIDDEN * size_of::<u16>() + regions.weight_bytes()
         );
 

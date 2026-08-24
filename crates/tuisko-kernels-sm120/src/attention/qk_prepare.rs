@@ -694,7 +694,7 @@ pub(crate) fn qwen35_attention_qk_prepare_ptx_names() -> [&'static str; MAX_BATC
 #[cfg(test)]
 mod tests {
     use super::{
-        THREADS, admitted_batch, admitted_tokens, attention_qk_prepare_ptx_names,
+        THREADS, admitted_tokens, attention_qk_prepare_ptx_names,
         qwen35_attention_qk_prepare_ptx_names,
     };
     use std::collections::BTreeSet;
