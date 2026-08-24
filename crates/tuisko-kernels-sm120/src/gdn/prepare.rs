@@ -14,6 +14,7 @@ const CONTROL_WARPS: usize = 16;
 const CONTROL_THREADS: u32 = (CONTROL_WARPS * 32) as u32;
 const CONTROL_ROWS_PER_CTA: usize = CONTROL_WARPS / 2;
 const CONV_THREADS: u32 = 256;
+const CAUSAL_ROWS: [usize; 4] = [1, 2, 3, 4];
 const PREFILL_ROWS: [usize; 4] = [32, 64, 128, 1_024];
 
 fn admitted_batch(batch: usize) -> bool {
@@ -274,9 +275,9 @@ struct PreparedPrefillRoute<A: Arch, const TOKENS: usize> {
 
 impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        if !PREFILL_ROWS.contains(&TOKENS) {
+        if !CAUSAL_ROWS.contains(&TOKENS) && !PREFILL_ROWS.contains(&TOKENS) {
             return Err(GpuError::invalid_launch(format!(
-                "GDN prepare prefill route T={TOKENS} is not admitted"
+                "GDN prepare causal route T={TOKENS} is not admitted"
             )));
         }
         let control_blocks = u32::try_from(TOKENS * 2 * A::GDN_CONTROL_ROWS / CONTROL_ROWS_PER_CTA)
@@ -365,6 +366,41 @@ impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
             )
             .map_err(|source| GpuError::launch("launching GDN prefill history publication", source))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_replay(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        projected: *const u16,
+        convolution_weights: *const u16,
+        state_rows: *const u32,
+        history: *mut u16,
+        convolved: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .gdn_convolution_prefill_exact::<A, TOKENS>(
+                stream,
+                &self.convolution,
+                projected,
+                convolution_weights,
+                state_rows,
+                history,
+                convolved,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching GDN causal replay convolution", source)
+            })?;
+        module
+            .gdn_convolution_prefill_history_exact::<A, TOKENS>(
+                stream,
+                &self.history,
+                projected,
+                state_rows,
+                history,
+            )
+            .map_err(|source| GpuError::launch("launching GDN causal replay history", source))
+    }
 }
 
 /// Prepared GDN control and convolution routes for exact decode and prefill rows.
@@ -378,6 +414,10 @@ pub struct GdnPrepareOp<A: Sm120Arch = Qwen38_27B> {
     b6: PreparedRoute<A, 6>,
     b7: PreparedRoute<A, 7>,
     b8: PreparedRoute<A, 8>,
+    k1: PreparedPrefillRoute<A, 1>,
+    k2: PreparedPrefillRoute<A, 2>,
+    k3: PreparedPrefillRoute<A, 3>,
+    k4: PreparedPrefillRoute<A, 4>,
     t32: PreparedPrefillRoute<A, 32>,
     t64: PreparedPrefillRoute<A, 64>,
     t128: PreparedPrefillRoute<A, 128>,
@@ -402,6 +442,10 @@ impl<A: Sm120Arch> GdnPrepareOp<A> {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            k1: PreparedPrefillRoute::prepare(&module)?,
+            k2: PreparedPrefillRoute::prepare(&module)?,
+            k3: PreparedPrefillRoute::prepare(&module)?,
+            k4: PreparedPrefillRoute::prepare(&module)?,
             t32: PreparedPrefillRoute::prepare(&module)?,
             t64: PreparedPrefillRoute::prepare(&module)?,
             t128: PreparedPrefillRoute::prepare(&module)?,
@@ -485,6 +529,116 @@ impl<A: Sm120Arch> GdnPrepareOp<A> {
             _ => unreachable!(),
         }
     }
+
+    /// Advances one state row through an exact `K=1..4` causal sequence.
+    ///
+    /// Unlike the decode routes, every row names the same state row and the
+    /// history publication happens once after all convolution reads complete.
+    ///
+    /// # Safety
+    ///
+    /// Inputs and outputs cover the same planes documented by [`Self::launch`]
+    /// for `tokens` rows. `state_rows` covers one valid row index. The caller
+    /// owns that row exclusively through completion; allocations are aligned,
+    /// non-overlapping, live through completion, and belong to `stream`'s
+    /// context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_causal(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        input: *const u16,
+        control_weights: *const u16,
+        a_log: *const u16,
+        dt_bias: *const u16,
+        projected: *const u16,
+        convolution_weights: *const u16,
+        state_rows: *const u32,
+        history: *mut u16,
+        log_decay: *mut f32,
+        beta: *mut f32,
+        convolved: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        input,
+                        control_weights,
+                        a_log,
+                        dt_bias,
+                        projected,
+                        convolution_weights,
+                        state_rows,
+                        history,
+                        log_decay,
+                        beta,
+                        convolved,
+                    )
+                }
+            };
+        }
+
+        match tokens {
+            1 => launch!(k1),
+            2 => launch!(k2),
+            3 => launch!(k3),
+            4 => launch!(k4),
+            _ => Err(GpuError::invalid_launch(format!(
+                "GDN causal prepare token count {tokens} is outside the admitted routes 1..=4"
+            ))),
+        }
+    }
+
+    /// Replays recorded projected values into one live causal-history row.
+    ///
+    /// # Safety
+    ///
+    /// `projected` and `convolved` cover `[tokens, A::GDN_QKV_ROWS]` BF16
+    /// values, convolution weights cover `[A::GDN_QKV_ROWS, 4]`, and
+    /// `state_rows` covers one valid row index. The caller owns that history
+    /// row exclusively through completion; allocations are aligned,
+    /// non-overlapping, live through completion, and belong to `stream`'s
+    /// context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_causal_replay(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        projected: *const u16,
+        convolution_weights: *const u16,
+        state_rows: *const u32,
+        history: *mut u16,
+        convolved: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch_replay(
+                        &self.module,
+                        stream,
+                        projected,
+                        convolution_weights,
+                        state_rows,
+                        history,
+                        convolved,
+                    )
+                }
+            };
+        }
+
+        match tokens {
+            1 => launch!(k1),
+            2 => launch!(k2),
+            3 => launch!(k3),
+            4 => launch!(k4),
+            _ => Err(GpuError::invalid_launch(format!(
+                "GDN causal replay token count {tokens} is outside the admitted routes 1..=4"
+            ))),
+        }
+    }
 }
 
 /// PTX symbols retained for both leaves of every exact GDN prepare route.
@@ -517,6 +671,10 @@ pub(crate) fn gdn_prepare_ptx_names() -> Vec<&'static str> {
         .chain(names!(6))
         .chain(names!(7))
         .chain(names!(8))
+        .chain(prefill_names!(1))
+        .chain(prefill_names!(2))
+        .chain(prefill_names!(3))
+        .chain(prefill_names!(4))
         .chain(prefill_names!(32))
         .chain(prefill_names!(64))
         .chain(prefill_names!(128))
@@ -580,7 +738,7 @@ mod tests {
         let names = gdn_prepare_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 28);
+        assert_eq!(names.len(), 40);
         assert_eq!(unique.len(), names.len());
     }
 }

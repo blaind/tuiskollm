@@ -25,7 +25,7 @@ use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_kernels_sm120::{
     AttentionOutputOp, AttentionQkPrepareOp, DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp,
     DenseFp8SwiGluTmaMaps, FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp,
-    GdnPrepareOp, GdnRecurrenceOp, LONG_CONTEXT_GQA_PARTITION_BUCKETS,
+    GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp, LONG_CONTEXT_GQA_PARTITION_BUCKETS,
     LONG_CONTEXT_GQA_PARTITION_SIZE, LmHeadOp, LongContextPagedGqaOp, Nvfp4DownOp, Nvfp4SwiGluOp,
     PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PagedGqaOp, ResidualNormOp,
 };
@@ -42,6 +42,8 @@ const SHORT_CONTEXT_PAGES_PER_SLOT: usize = SHORT_CONTEXT_CAPACITY / ATTENTION_P
 const SHORT_CONTEXT_PHYSICAL_PAGES: usize = MAX_BATCH * SHORT_CONTEXT_PAGES_PER_SLOT;
 const LONG_CONTEXT_ROUTE_COUNT: usize = LONG_CONTEXT_GQA_PARTITION_BUCKETS.len();
 const PREFILL_GRAPH_ROUTE_COUNT: usize = 6;
+const TARGET_VERIFY_ROUTE_COUNT: usize = 4;
+const GDN_LAYER_COUNT: usize = 48;
 
 /// Exact resident graph selected by one checked decode-state upload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,6 +62,46 @@ pub struct ResidentPrefillRoute {
     first_position: usize,
     context_tokens: usize,
     attention: PrefillAttentionRoute,
+}
+
+/// Exact provisional target-verification graph selected by one checked upload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "the target-verification route must be replayed with the state that selected it"]
+pub struct ResidentMtpVerifyRoute {
+    tokens: usize,
+    slot: usize,
+    maximum_length: usize,
+    attention: AttentionRoute,
+}
+
+impl ResidentMtpVerifyRoute {
+    /// Number of causal target input rows in this exact route.
+    pub const fn tokens(self) -> usize {
+        self.tokens
+    }
+
+    /// Stable resident slot whose state is snapshotted provisionally.
+    pub const fn slot(self) -> usize {
+        self.slot
+    }
+
+    /// Causal context length after all provisional rows are evaluated.
+    pub const fn maximum_length(self) -> usize {
+        self.maximum_length
+    }
+
+    /// Whether this route uses partitioned long-context attention.
+    pub const fn is_long_context(self) -> bool {
+        matches!(self.attention, AttentionRoute::Long { .. })
+    }
+
+    /// Captured partition capacity, or `None` for the short-context graph.
+    pub const fn partition_capacity(self) -> Option<usize> {
+        match self.attention {
+            AttentionRoute::Short => None,
+            AttentionRoute::Long { partitions, .. } => Some(partitions),
+        }
+    }
 }
 
 impl ResidentPrefillRoute {
@@ -323,6 +365,9 @@ struct ResidentGraphs {
     short: [CudaGraph; MAX_BATCH],
     long: [[CudaGraph; MAX_BATCH]; LONG_CONTEXT_ROUTE_COUNT],
     prefill: [CudaGraph; PREFILL_GRAPH_ROUTE_COUNT],
+    target_verify_short: [CudaGraph; TARGET_VERIFY_ROUTE_COUNT],
+    target_verify_long: [[CudaGraph; TARGET_VERIFY_ROUTE_COUNT]; LONG_CONTEXT_ROUTE_COUNT],
+    target_commit: [CudaGraph; TARGET_VERIFY_ROUTE_COUNT],
 }
 
 impl ResidentGraphs {
@@ -336,6 +381,21 @@ impl ResidentGraphs {
     fn select_prefill(&self, route: ResidentPrefillRoute) -> EngineResult<&CudaGraph> {
         let index = prefill_graph_index(route)?;
         Ok(&self.prefill[index])
+    }
+
+    fn select_target_verify(&self, route: ResidentMtpVerifyRoute) -> &CudaGraph {
+        match route.attention {
+            AttentionRoute::Short => &self.target_verify_short[route.tokens - 1],
+            AttentionRoute::Long { index, .. } => &self.target_verify_long[index][route.tokens - 1],
+        }
+    }
+
+    fn select_target_commit(&self, tokens: usize) -> EngineResult<&CudaGraph> {
+        self.target_commit
+            .get(tokens.wrapping_sub(1))
+            .ok_or_else(|| {
+                EngineError::route("target MTP commit must contain exactly 1..=4 input rows")
+            })
     }
 }
 
@@ -356,6 +416,7 @@ pub struct ResidentModelProgram {
     _gdn_input: GdnInputProjectionOp<Qwen38_27B>,
     _gdn_prepare: GdnPrepareOp<Qwen38_27B>,
     _gdn_recurrence: GdnRecurrenceOp<Qwen38_27B>,
+    _gdn_state_snapshot: GdnStateSnapshotOp<Qwen38_27B>,
     _gdn_output: GdnOutputProjectionOp<Qwen38_27B>,
     _attention_qkv: FullAttentionQkvOp<Qwen38_27B>,
     _attention_qk_prepare: AttentionQkPrepareOp<Qwen38_27B>,
@@ -485,6 +546,7 @@ impl ResidentModelProgram {
         let gdn_input = GdnInputProjectionOp::new(context)?;
         let gdn_prepare = GdnPrepareOp::new(context)?;
         let gdn_recurrence = GdnRecurrenceOp::new(context)?;
+        let gdn_state_snapshot = GdnStateSnapshotOp::new(context)?;
         let gdn_output = GdnOutputProjectionOp::new(context)?;
         let attention_qkv = FullAttentionQkvOp::new(context)?;
         let attention_qk_prepare = AttentionQkPrepareOp::new(context)?;
@@ -707,6 +769,7 @@ impl ResidentModelProgram {
             gdn_input: &gdn_input,
             gdn_prepare: &gdn_prepare,
             gdn_recurrence: &gdn_recurrence,
+            gdn_state_snapshot: &gdn_state_snapshot,
             gdn_output: &gdn_output,
             attention_qkv: &attention_qkv,
             attention_qk_prepare: &attention_qk_prepare,
@@ -735,6 +798,7 @@ impl ResidentModelProgram {
             _gdn_input: gdn_input,
             _gdn_prepare: gdn_prepare,
             _gdn_recurrence: gdn_recurrence,
+            _gdn_state_snapshot: gdn_state_snapshot,
             _gdn_output: gdn_output,
             _attention_qkv: attention_qkv,
             _attention_qk_prepare: attention_qk_prepare,
@@ -847,6 +911,83 @@ impl ResidentModelProgram {
             .copy_prefix_from_host(stream, workspace.rope_sin, rope_sin)?;
 
         select_decode_route(batch, &lengths[..batch])
+    }
+
+    /// Loads one exact provisional target-verification window for a stable slot.
+    pub fn load_target_mtp_verify_state(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        slot: usize,
+        first_position: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<ResidentMtpVerifyRoute> {
+        require_target_verify_tokens(tokens)?;
+        require_slot(slot)?;
+        let context_tokens = first_position
+            .checked_add(tokens)
+            .ok_or_else(|| EngineError::route("target MTP verification context overflows"))?;
+        if context_tokens > self.context_capacity() {
+            return Err(EngineError::route(format!(
+                "target MTP verification requires {context_tokens} positions, current resident capacity is {}",
+                self.context_capacity()
+            )));
+        }
+        let reserved_tokens = self
+            .kv_slots
+            .page_count(slot)?
+            .checked_mul(ATTENTION_PAGE_SIZE)
+            .ok_or_else(|| EngineError::layout("target MTP reserved capacity overflows"))?;
+        if reserved_tokens < context_tokens {
+            return Err(EngineError::route(format!(
+                "target MTP slot {slot} owns {reserved_tokens} cache positions, expected at least {context_tokens}"
+            )));
+        }
+        let rotary_values = product("target MTP rotary values", tokens, ROTARY_PAIRS)?;
+        if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
+            return Err(EngineError::layout(format!(
+                "target MTP rotary planes must each have {rotary_values} values for K={tokens}"
+            )));
+        }
+
+        let slot_row =
+            u32::try_from(slot).map_err(|_| EngineError::layout("target MTP slot exceeds u32"))?;
+        let mut positions = [0u32; TARGET_VERIFY_ROUTE_COUNT];
+        let mut lengths = [0u32; TARGET_VERIFY_ROUTE_COUNT];
+        let rows = [slot_row; TARGET_VERIFY_ROUTE_COUNT];
+        for token in 0..tokens {
+            let position = first_position
+                .checked_add(token)
+                .and_then(|position| u32::try_from(position).ok())
+                .ok_or_else(|| EngineError::route("target MTP position exceeds u32"))?;
+            positions[token] = position;
+            lengths[token] = position + 1;
+        }
+        let decode = select_decode_route(tokens, &lengths[..tokens])?;
+        let workspace = self.layout.workspace;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.state_rows, &rows[..tokens])?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.table_rows, &rows[..tokens])?;
+        self.arena.copy_prefix_from_host(
+            stream,
+            workspace.cache_positions,
+            &positions[..tokens],
+        )?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.lengths, &lengths[..tokens])?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.rope_cos, rope_cos)?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.rope_sin, rope_sin)?;
+
+        Ok(ResidentMtpVerifyRoute {
+            tokens,
+            slot,
+            maximum_length: decode.maximum_length,
+            attention: decode.attention,
+        })
     }
 
     /// Loads one exact from-empty prompt tile into one active slot.
@@ -1084,6 +1225,35 @@ impl ResidentModelProgram {
         Ok(())
     }
 
+    /// Replays one immutable provisional target-verification graph.
+    pub fn replay_target_mtp_verify(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpVerifyRoute,
+    ) -> EngineResult<()> {
+        self.graphs.select_target_verify(route).launch(stream)?;
+        Ok(())
+    }
+
+    /// Commits an accepted prefix from the matching provisional verification.
+    pub fn replay_target_mtp_commit(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpVerifyRoute,
+        accepted_tokens: usize,
+    ) -> EngineResult<()> {
+        if accepted_tokens > route.tokens {
+            return Err(EngineError::route(format!(
+                "target MTP commit accepts {accepted_tokens} rows from a K={} verification",
+                route.tokens
+            )));
+        }
+        self.graphs
+            .select_target_commit(accepted_tokens)?
+            .launch(stream)?;
+        Ok(())
+    }
+
     /// Reads active BF16 vocabulary logits.
     pub fn read_logits(&self, stream: &CudaStream, batch: usize) -> EngineResult<Vec<u16>> {
         require_batch(batch)?;
@@ -1235,6 +1405,11 @@ impl ResidentModelProgram {
         super::MAX_ROWS
     }
 
+    /// Immutable provisional-verify and accepted-prefix graph entries.
+    pub const fn target_mtp_graph_count(&self) -> usize {
+        TARGET_VERIFY_ROUTE_COUNT * (LONG_CONTEXT_ROUTE_COUNT + 2)
+    }
+
     /// Fixed per-slot capacity of the current exact attention caches.
     pub const fn context_capacity(&self) -> usize {
         self.layout.context_capacity()
@@ -1280,6 +1455,41 @@ impl ResidentModelProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Launches one provisional target-verification schedule eagerly.
+    pub fn launch_target_mtp_verify_eager(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpVerifyRoute,
+    ) -> EngineResult<()> {
+        launch_target_mtp_verify(
+            stream,
+            route,
+            self.ops(),
+            &self._pointers,
+            &self.dense_mlp_maps,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Launches one accepted-prefix state commit eagerly.
+    pub fn launch_target_mtp_commit_eager(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpVerifyRoute,
+        accepted_tokens: usize,
+    ) -> EngineResult<()> {
+        if !(1..=route.tokens).contains(&accepted_tokens) {
+            return Err(EngineError::route(format!(
+                "target MTP eager commit accepts {accepted_tokens} rows from a K={} verification",
+                route.tokens
+            )));
+        }
+        launch_target_mtp_commit(stream, accepted_tokens, self.ops(), &self._pointers)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
     /// Returns the captured complete-model graph for one checked state route.
     pub fn qualification_graph(&self, route: ResidentDecodeRoute) -> &CudaGraph {
         self.graphs.select(route)
@@ -1292,6 +1502,24 @@ impl ResidentModelProgram {
         route: ResidentPrefillRoute,
     ) -> EngineResult<&CudaGraph> {
         self.graphs.select_prefill(route)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns one captured provisional target-verification graph.
+    pub fn qualification_target_mtp_verify_graph(
+        &self,
+        route: ResidentMtpVerifyRoute,
+    ) -> &CudaGraph {
+        self.graphs.select_target_verify(route)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns one captured accepted-prefix commit graph.
+    pub fn qualification_target_mtp_commit_graph(
+        &self,
+        accepted_tokens: usize,
+    ) -> EngineResult<&CudaGraph> {
+        self.graphs.select_target_commit(accepted_tokens)
     }
 
     #[cfg(feature = "qualification")]
@@ -1333,6 +1561,43 @@ impl ResidentModelProgram {
         Ok(CudaGraph::capture(stream, || {
             for _ in 0..operations {
                 launch_prefill_route(stream, route, ops, &self._pointers, &self.dense_mlp_maps)?;
+            }
+            Ok(())
+        })?)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Captures repeated production target verify and optional commit schedules.
+    pub fn qualification_repeated_target_mtp_graph(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpVerifyRoute,
+        committed_tokens: Option<usize>,
+        operations: u64,
+    ) -> EngineResult<CudaGraph> {
+        if operations == 0 {
+            return Err(EngineError::route(
+                "repeated target MTP graph requires at least one operation",
+            ));
+        }
+        if committed_tokens.is_some_and(|tokens| !(1..=route.tokens).contains(&tokens)) {
+            return Err(EngineError::route(
+                "repeated target MTP commit exceeds its verification window",
+            ));
+        }
+        let ops = self.ops();
+        Ok(CudaGraph::capture(stream, || {
+            for _ in 0..operations {
+                launch_target_mtp_verify(
+                    stream,
+                    route,
+                    ops,
+                    &self._pointers,
+                    &self.dense_mlp_maps,
+                )?;
+                if let Some(tokens) = committed_tokens {
+                    launch_target_mtp_commit(stream, tokens, ops, &self._pointers)?;
+                }
             }
             Ok(())
         })?)
@@ -1557,6 +1822,53 @@ impl ResidentModelProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Loads one selected slot's complete patterned GDN history and state rows.
+    pub fn qualification_load_target_mtp_gdn_slot(
+        &self,
+        stream: &CudaStream,
+        slot: usize,
+        history: &[u16],
+        state: &[f32],
+    ) -> EngineResult<()> {
+        require_slot(slot)?;
+        let expected_history = self.layout.history_bytes() / MAX_BATCH / size_of::<u16>();
+        let expected_state = self.layout.state_bytes() / MAX_BATCH / size_of::<f32>();
+        if history.len() != expected_history || state.len() != expected_state {
+            return Err(EngineError::layout(format!(
+                "target MTP slot fixture has {}/{} history/state values, expected {expected_history}/{expected_state}",
+                history.len(),
+                state.len()
+            )));
+        }
+        let mut history_offset = 0;
+        let mut state_offset = 0;
+        for layer in &self.layout.layers {
+            let super::PersistentState::Gdn(persistent) = layer.persistent else {
+                continue;
+            };
+            let history_values = persistent.history.len() / MAX_BATCH;
+            let state_values = persistent.state.len() / MAX_BATCH;
+            self.arena.copy_slice_from_host(
+                stream,
+                persistent.history,
+                slot * history_values,
+                &history[history_offset..history_offset + history_values],
+            )?;
+            self.arena.copy_slice_from_host(
+                stream,
+                persistent.state,
+                slot * state_values,
+                &state[state_offset..state_offset + state_values],
+            )?;
+            history_offset += history_values;
+            state_offset += state_values;
+        }
+        debug_assert_eq!(history_offset, expected_history);
+        debug_assert_eq!(state_offset, expected_state);
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
     /// Fills every mutable workspace seam with one byte sentinel.
     pub fn qualification_reset_workspace(&self, stream: &CudaStream, byte: u8) -> EngineResult<()> {
         let workspace = self.layout.workspace;
@@ -1584,6 +1896,8 @@ impl ResidentModelProgram {
             workspace.recurrent_output,
             workspace.swiglu,
             workspace.logits,
+            workspace.provisional_history,
+            workspace.recorded_projected,
         ] {
             self.arena.fill(stream, region, byte)?;
         }
@@ -1597,10 +1911,381 @@ impl ResidentModelProgram {
             workspace.partial_numerator,
             workspace.prefill_partials,
             workspace.attention,
+            workspace.provisional_state,
+            workspace.recorded_log_decay,
+            workspace.recorded_beta,
         ] {
             self.arena.fill(stream, region, byte)?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads every target-verification seam plus the selected live GDN rows.
+    pub fn qualification_target_mtp_observables(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpVerifyRoute,
+    ) -> EngineResult<ResidentMtpVerifyObservables> {
+        let workspace = self.layout.workspace;
+        let hidden_values = product(
+            "target MTP observable hidden values",
+            route.tokens,
+            Qwen38_27B::HIDDEN,
+        )?;
+        let logit_values = product(
+            "target MTP observable logits",
+            route.tokens,
+            Qwen38_27B::VOCAB,
+        )?;
+        let mut live_history =
+            Vec::with_capacity(self.layout.history_bytes() / MAX_BATCH / size_of::<u16>());
+        let mut live_state =
+            Vec::with_capacity(self.layout.state_bytes() / MAX_BATCH / size_of::<f32>());
+        for layer in &self.layout.layers {
+            let super::PersistentState::Gdn(persistent) = layer.persistent else {
+                continue;
+            };
+            let history_values = persistent.history.len() / MAX_BATCH;
+            let state_values = persistent.state.len() / MAX_BATCH;
+            live_history.extend(self.arena.copy_slice_to_host(
+                stream,
+                persistent.history,
+                route.slot * history_values,
+                history_values,
+            )?);
+            live_state.extend(self.arena.copy_slice_to_host(
+                stream,
+                persistent.state,
+                route.slot * state_values,
+                state_values,
+            )?);
+        }
+
+        Ok(ResidentMtpVerifyObservables {
+            residual_a: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.residual_a,
+                hidden_values,
+            )?,
+            final_normalized: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.mixer_normalized,
+                hidden_values,
+            )?,
+            logits: self
+                .arena
+                .copy_prefix_to_host(stream, workspace.logits, logit_values)?,
+            provisional_history: self
+                .arena
+                .copy_to_host(stream, workspace.provisional_history)?,
+            provisional_state: self
+                .arena
+                .copy_to_host(stream, workspace.provisional_state)?,
+            recorded_projected: self
+                .arena
+                .copy_to_host(stream, workspace.recorded_projected)?,
+            recorded_log_decay: self
+                .arena
+                .copy_to_host(stream, workspace.recorded_log_decay)?,
+            recorded_beta: self.arena.copy_to_host(stream, workspace.recorded_beta)?,
+            live_history,
+            live_state,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Launches and observes the first GDN mixer through target or decode ownership.
+    pub fn qualification_first_gdn_mtp_seams(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpVerifyRoute,
+        target: bool,
+    ) -> EngineResult<ResidentMtpGdnObservables> {
+        if route.tokens != 1 {
+            return Err(EngineError::route(
+                "first-GDN target/decode seam comparison requires K=1",
+            ));
+        }
+        let first = self
+            ._pointers
+            .layers
+            .first()
+            .ok_or_else(|| EngineError::layout("resident layer inventory is empty"))?;
+        let MixerPointers::Gdn(_) = first.mixer else {
+            return Err(EngineError::layout("resident first layer is not GDN"));
+        };
+        let workspace = self._pointers.workspace;
+        // SAFETY: the checked K=1 route and resident owner cover every seam.
+        unsafe {
+            self._norm.launch_plain(
+                stream,
+                1,
+                workspace.residual_a,
+                first.mixer.input_norm(),
+                workspace.mixer_normalized,
+            )?;
+        }
+        if target {
+            let mut gdn_layer = 0;
+            launch_target_mtp_mixer(
+                stream,
+                route,
+                self.ops(),
+                workspace,
+                first.mixer,
+                &mut gdn_layer,
+            )?;
+            debug_assert_eq!(gdn_layer, 1);
+        } else {
+            launch_mixer(
+                stream,
+                ResidentDecodeRoute {
+                    batch: 1,
+                    maximum_length: route.maximum_length,
+                    attention: AttentionRoute::Short,
+                },
+                self.ops(),
+                workspace,
+                first.mixer,
+            )?;
+        }
+        let workspace_regions = self.layout.workspace;
+        let layout_layer = self
+            .layout
+            .layers
+            .first()
+            .ok_or_else(|| EngineError::layout("resident layout layer inventory is empty"))?;
+        let super::PersistentState::Gdn(persistent_regions) = layout_layer.persistent else {
+            return Err(EngineError::layout(
+                "resident first layout layer is not GDN",
+            ));
+        };
+        let projected = if target {
+            workspace_regions.recorded_projected
+        } else {
+            workspace_regions.projected
+        };
+        let log_decay = if target {
+            workspace_regions.recorded_log_decay
+        } else {
+            workspace_regions.log_decay
+        };
+        let beta = if target {
+            workspace_regions.recorded_beta
+        } else {
+            workspace_regions.beta
+        };
+        let (history, state) = if target {
+            (
+                workspace_regions.provisional_history,
+                workspace_regions.provisional_state,
+            )
+        } else {
+            (persistent_regions.history, persistent_regions.state)
+        };
+        let history_values = persistent_regions.history.len() / MAX_BATCH;
+        let state_values = persistent_regions.state.len() / MAX_BATCH;
+        let history_offset = if target {
+            0
+        } else {
+            route.slot * history_values
+        };
+        let state_offset = if target { 0 } else { route.slot * state_values };
+        Ok(ResidentMtpGdnObservables {
+            normalized: self.arena.copy_prefix_to_host(
+                stream,
+                workspace_regions.mixer_normalized,
+                Qwen38_27B::HIDDEN,
+            )?,
+            projected: self.arena.copy_slice_to_host(
+                stream,
+                projected,
+                0,
+                Qwen38_27B::GDN_INPUT_ROWS,
+            )?,
+            log_decay: self.arena.copy_slice_to_host(
+                stream,
+                log_decay,
+                0,
+                Qwen38_27B::GDN_CONTROL_ROWS,
+            )?,
+            beta: self
+                .arena
+                .copy_slice_to_host(stream, beta, 0, Qwen38_27B::GDN_CONTROL_ROWS)?,
+            convolved: self.arena.copy_prefix_to_host(
+                stream,
+                workspace_regions.convolved,
+                Qwen38_27B::GDN_QKV_ROWS,
+            )?,
+            recurrent: self.arena.copy_prefix_to_host(
+                stream,
+                workspace_regions.recurrent_output,
+                Qwen38_27B::GDN_VALUE_ROWS,
+            )?,
+            branch: self.arena.copy_prefix_to_host(
+                stream,
+                workspace_regions.mixer_branch,
+                Qwen38_27B::HIDDEN,
+            )?,
+            history: self.arena.copy_slice_to_host(
+                stream,
+                history,
+                history_offset,
+                history_values,
+            )?,
+            state: self
+                .arena
+                .copy_slice_to_host(stream, state, state_offset, state_values)?,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Launches K=1 through every layer and observes each residual seam.
+    pub fn qualification_mtp_k1_layer_seams(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpVerifyRoute,
+        target: bool,
+    ) -> EngineResult<Vec<ResidentMtpLayerObservables>> {
+        if route.tokens != 1 {
+            return Err(EngineError::route(
+                "target/decode layer seam comparison requires K=1",
+            ));
+        }
+        let first = self
+            ._pointers
+            .layers
+            .first()
+            .ok_or_else(|| EngineError::layout("resident layer inventory is empty"))?;
+        let workspace = self._pointers.workspace;
+        let workspace_regions = self.layout.workspace;
+        // SAFETY: the checked K=1 route and resident owner cover every seam.
+        unsafe {
+            self._norm.launch_plain(
+                stream,
+                1,
+                workspace.residual_a,
+                first.mixer.input_norm(),
+                workspace.mixer_normalized,
+            )?;
+        }
+
+        let decode = ResidentDecodeRoute {
+            batch: 1,
+            maximum_length: route.maximum_length,
+            attention: route.attention,
+        };
+        let mut residual_input = workspace.residual_a;
+        let mut gdn_layer = 0;
+        let mut observed = Vec::with_capacity(self._pointers.layers.len());
+        for (index, layer) in self._pointers.layers.iter().enumerate() {
+            if target {
+                launch_target_mtp_mixer(
+                    stream,
+                    route,
+                    self.ops(),
+                    workspace,
+                    layer.mixer,
+                    &mut gdn_layer,
+                )?;
+            } else {
+                launch_mixer(stream, decode, self.ops(), workspace, layer.mixer)?;
+            }
+            let mixer_branch = self.arena.copy_prefix_to_host(
+                stream,
+                workspace_regions.mixer_branch,
+                Qwen38_27B::HIDDEN,
+            )?;
+            // SAFETY: branch and residual planes are disjoint maximum-row regions.
+            unsafe {
+                self._norm.launch_residual(
+                    stream,
+                    1,
+                    residual_input,
+                    workspace.mixer_branch,
+                    layer.mixer.post_attention_norm(),
+                    workspace.mixer_residual,
+                    workspace.mlp_normalized,
+                )?;
+            }
+            let mixer_residual = self.arena.copy_prefix_to_host(
+                stream,
+                workspace_regions.mixer_residual,
+                Qwen38_27B::HIDDEN,
+            )?;
+            let mlp_normalized = self.arena.copy_prefix_to_host(
+                stream,
+                workspace_regions.mlp_normalized,
+                Qwen38_27B::HIDDEN,
+            )?;
+            launch_mlp(
+                stream,
+                1,
+                self.ops(),
+                workspace,
+                layer.mlp,
+                &self.dense_mlp_maps,
+            )?;
+            let mlp_branch = self.arena.copy_prefix_to_host(
+                stream,
+                workspace_regions.mlp_branch,
+                Qwen38_27B::HIDDEN,
+            )?;
+
+            let residual_output = if index.is_multiple_of(2) {
+                workspace.residual_b
+            } else {
+                workspace.residual_a
+            };
+            let residual_region = if index.is_multiple_of(2) {
+                workspace_regions.residual_b
+            } else {
+                workspace_regions.residual_a
+            };
+            let next_norm = self
+                ._pointers
+                .layers
+                .get(index + 1)
+                .map_or(self._pointers.endpoint.final_norm, |next| {
+                    next.mixer.input_norm()
+                });
+            // SAFETY: residual ping-pong and both branch planes do not alias.
+            unsafe {
+                self._norm.launch_residual(
+                    stream,
+                    1,
+                    workspace.mixer_residual,
+                    workspace.mlp_branch,
+                    next_norm,
+                    residual_output,
+                    workspace.mixer_normalized,
+                )?;
+            }
+            observed.push(ResidentMtpLayerObservables {
+                mixer_branch,
+                mixer_residual,
+                mlp_normalized,
+                mlp_branch,
+                residual: self.arena.copy_prefix_to_host(
+                    stream,
+                    residual_region,
+                    Qwen38_27B::HIDDEN,
+                )?,
+                next_normalized: self.arena.copy_prefix_to_host(
+                    stream,
+                    workspace_regions.mixer_normalized,
+                    Qwen38_27B::HIDDEN,
+                )?,
+            });
+            residual_input = residual_output;
+        }
+        if target && gdn_layer != GDN_LAYER_COUNT {
+            return Err(EngineError::layout(format!(
+                "target layer seam comparison visited {gdn_layer} GDN layers, expected {GDN_LAYER_COUNT}"
+            )));
+        }
+        Ok(observed)
     }
 
     #[cfg(feature = "qualification")]
@@ -1824,6 +2509,7 @@ impl ResidentModelProgram {
             gdn_input: &self._gdn_input,
             gdn_prepare: &self._gdn_prepare,
             gdn_recurrence: &self._gdn_recurrence,
+            gdn_state_snapshot: &self._gdn_state_snapshot,
             gdn_output: &self._gdn_output,
             attention_qkv: &self._attention_qkv,
             attention_qk_prepare: &self._attention_qk_prepare,
@@ -1902,6 +2588,71 @@ pub struct ResidentModelObservables {
     pub key_guard_pages: Vec<u8>,
     /// First unassigned value page from every attention layer.
     pub value_guard_pages: Vec<u8>,
+}
+
+#[cfg(feature = "qualification")]
+/// First-layer GDN seams observed through target-causal or ordinary decode ownership.
+pub struct ResidentMtpGdnObservables {
+    /// Input-normalized hidden row.
+    pub normalized: Vec<u16>,
+    /// Complete GDN input projection.
+    pub projected: Vec<u16>,
+    /// Decay controls.
+    pub log_decay: Vec<f32>,
+    /// Beta controls.
+    pub beta: Vec<f32>,
+    /// Activated causal convolution rows.
+    pub convolved: Vec<u16>,
+    /// Gated recurrent output before projection.
+    pub recurrent: Vec<u16>,
+    /// Projected mixer branch.
+    pub branch: Vec<u16>,
+    /// Updated selected history row.
+    pub history: Vec<u16>,
+    /// Updated selected recurrent-state row.
+    pub state: Vec<f32>,
+}
+
+#[cfg(feature = "qualification")]
+/// Complete K=1 residual seams for one target or ordinary decode layer.
+pub struct ResidentMtpLayerObservables {
+    /// Mixer projection branch before the first residual seam.
+    pub mixer_branch: Vec<u16>,
+    /// Residual after adding the mixer branch.
+    pub mixer_residual: Vec<u16>,
+    /// Normalized input to the MLP.
+    pub mlp_normalized: Vec<u16>,
+    /// MLP projection branch before the second residual seam.
+    pub mlp_branch: Vec<u16>,
+    /// Layer output residual.
+    pub residual: Vec<u16>,
+    /// Normalized input to the following layer or endpoint.
+    pub next_normalized: Vec<u16>,
+}
+
+#[cfg(feature = "qualification")]
+/// Provisional target outputs, replay records, and selected live GDN rows.
+pub struct ResidentMtpVerifyObservables {
+    /// Final target residual rows before endpoint normalization.
+    pub residual_a: Vec<u16>,
+    /// Final-normalized target rows that feed the shared LM head.
+    pub final_normalized: Vec<u16>,
+    /// K-wide BF16 target vocabulary logits.
+    pub logits: Vec<u16>,
+    /// Final provisional causal-history row from the last GDN layer.
+    pub provisional_history: Vec<u16>,
+    /// Final provisional recurrent-state row from the last GDN layer.
+    pub provisional_state: Vec<f32>,
+    /// Per-GDN-layer projected values retained for accepted-prefix replay.
+    pub recorded_projected: Vec<u16>,
+    /// Per-GDN-layer log-decay controls retained for replay.
+    pub recorded_log_decay: Vec<f32>,
+    /// Per-GDN-layer beta controls retained for replay.
+    pub recorded_beta: Vec<f32>,
+    /// Selected live history row concatenated in ascending GDN-layer order.
+    pub live_history: Vec<u16>,
+    /// Selected live recurrent row concatenated in ascending GDN-layer order.
+    pub live_state: Vec<f32>,
 }
 
 #[cfg(feature = "qualification")]
@@ -2132,6 +2883,29 @@ struct WorkspacePointers {
     swiglu: *mut u16,
     mlp_branch: *mut u16,
     logits: *mut u16,
+    provisional_history: *mut u16,
+    provisional_state: *mut f32,
+    provisional_state_row: *const u32,
+    recorded_projected: *mut u16,
+    recorded_log_decay: *mut f32,
+    recorded_beta: *mut f32,
+}
+
+impl WorkspacePointers {
+    fn recorded_projected_for(self, gdn_layer: usize) -> *mut u16 {
+        self.recorded_projected
+            .wrapping_add(gdn_layer * TARGET_VERIFY_ROUTE_COUNT * Qwen38_27B::GDN_INPUT_ROWS)
+    }
+
+    fn recorded_log_decay_for(self, gdn_layer: usize) -> *mut f32 {
+        self.recorded_log_decay
+            .wrapping_add(gdn_layer * TARGET_VERIFY_ROUTE_COUNT * Qwen38_27B::GDN_CONTROL_ROWS)
+    }
+
+    fn recorded_beta_for(self, gdn_layer: usize) -> *mut f32 {
+        self.recorded_beta
+            .wrapping_add(gdn_layer * TARGET_VERIFY_ROUTE_COUNT * Qwen38_27B::GDN_CONTROL_ROWS)
+    }
 }
 
 #[derive(Clone)]
@@ -2332,6 +3106,12 @@ impl WorkspacePointers {
             swiglu: arena.address(regions.swiglu)?,
             mlp_branch: arena.address(regions.mlp_branch)?,
             logits: arena.address(regions.logits)?,
+            provisional_history: arena.address(regions.provisional_history)?,
+            provisional_state: arena.address(regions.provisional_state)?,
+            provisional_state_row: arena.address(regions.provisional_state_row)?.cast_const(),
+            recorded_projected: arena.address(regions.recorded_projected)?,
+            recorded_log_decay: arena.address(regions.recorded_log_decay)?,
+            recorded_beta: arena.address(regions.recorded_beta)?,
         })
     }
 
@@ -2369,6 +3149,12 @@ impl WorkspacePointers {
             self.swiglu.addr(),
             self.mlp_branch.addr(),
             self.logits.addr(),
+            self.provisional_history.addr(),
+            self.provisional_state.addr(),
+            self.provisional_state_row.addr(),
+            self.recorded_projected.addr(),
+            self.recorded_log_decay.addr(),
+            self.recorded_beta.addr(),
         ]);
     }
 }
@@ -2496,6 +3282,7 @@ struct Ops<'a> {
     gdn_input: &'a GdnInputProjectionOp<Qwen38_27B>,
     gdn_prepare: &'a GdnPrepareOp<Qwen38_27B>,
     gdn_recurrence: &'a GdnRecurrenceOp<Qwen38_27B>,
+    gdn_state_snapshot: &'a GdnStateSnapshotOp<Qwen38_27B>,
     gdn_output: &'a GdnOutputProjectionOp<Qwen38_27B>,
     attention_qkv: &'a FullAttentionQkvOp<Qwen38_27B>,
     attention_qk_prepare: &'a AttentionQkPrepareOp<Qwen38_27B>,
@@ -2562,10 +3349,62 @@ fn capture_routes(
         EngineError::layout("resident prefill graph inventory has wrong cardinality")
     })?;
 
+    let mut target_verify_short = Vec::with_capacity(TARGET_VERIFY_ROUTE_COUNT);
+    for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
+        let route = ResidentMtpVerifyRoute {
+            tokens,
+            slot: 0,
+            maximum_length: SHORT_CONTEXT_CAPACITY,
+            attention: AttentionRoute::Short,
+        };
+        target_verify_short.push(CudaGraph::capture(stream, || {
+            launch_target_mtp_verify(stream, route, ops, pointers, dense_mlp_maps)
+        })?);
+    }
+    let target_verify_short = target_verify_short.try_into().map_err(|_| {
+        EngineError::layout("target MTP short graph inventory has wrong cardinality")
+    })?;
+
+    let mut target_verify_long = Vec::with_capacity(LONG_CONTEXT_ROUTE_COUNT);
+    for (index, &partitions) in LONG_CONTEXT_GQA_PARTITION_BUCKETS.iter().enumerate() {
+        let maximum_length = (partitions * LONG_CONTEXT_GQA_PARTITION_SIZE).min(MAX_CONTEXT_TOKENS);
+        let mut graphs = Vec::with_capacity(TARGET_VERIFY_ROUTE_COUNT);
+        for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
+            let route = ResidentMtpVerifyRoute {
+                tokens,
+                slot: 0,
+                maximum_length,
+                attention: AttentionRoute::Long { index, partitions },
+            };
+            graphs.push(CudaGraph::capture(stream, || {
+                launch_target_mtp_verify(stream, route, ops, pointers, dense_mlp_maps)
+            })?);
+        }
+        target_verify_long.push(graphs.try_into().map_err(|_| {
+            EngineError::layout("target MTP long graph token inventory has wrong cardinality")
+        })?);
+    }
+    let target_verify_long = target_verify_long.try_into().map_err(|_| {
+        EngineError::layout("target MTP long graph partition inventory has wrong cardinality")
+    })?;
+
+    let mut target_commit = Vec::with_capacity(TARGET_VERIFY_ROUTE_COUNT);
+    for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
+        target_commit.push(CudaGraph::capture(stream, || {
+            launch_target_mtp_commit(stream, tokens, ops, pointers)
+        })?);
+    }
+    let target_commit = target_commit.try_into().map_err(|_| {
+        EngineError::layout("target MTP commit graph inventory has wrong cardinality")
+    })?;
+
     Ok(ResidentGraphs {
         short,
         long,
         prefill,
+        target_verify_short,
+        target_verify_long,
+        target_commit,
     })
 }
 
@@ -2653,6 +3492,316 @@ fn launch_route(
             workspace.logits,
         )
     }
+}
+
+fn launch_target_mtp_verify(
+    stream: &CudaStream,
+    route: ResidentMtpVerifyRoute,
+    ops: Ops<'_>,
+    pointers: &ProgramPointers,
+    dense_mlp_maps: &[DenseMlpMaps],
+) -> GpuResult<()> {
+    let tokens = route.tokens;
+    let workspace = pointers.workspace;
+    let first = pointers
+        .layers
+        .first()
+        .ok_or_else(|| GpuError::invalid_launch("resident layer inventory is empty"))?;
+    // SAFETY: K=1..4 bounds every shared plane. Metadata maps all causal rows
+    // to one stable slot while the GDN snapshot redirects mutations to scratch.
+    unsafe {
+        ops.norm.launch_plain(
+            stream,
+            tokens,
+            workspace.residual_a,
+            first.mixer.input_norm(),
+            workspace.mixer_normalized,
+        )?;
+    }
+
+    let mut residual_input = workspace.residual_a;
+    let mut gdn_layer = 0;
+    for (index, layer) in pointers.layers.iter().enumerate() {
+        launch_target_mtp_mixer(stream, route, ops, workspace, layer.mixer, &mut gdn_layer)?;
+        // SAFETY: branch and residual planes are disjoint maximum-row regions.
+        unsafe {
+            ops.norm.launch_residual(
+                stream,
+                tokens,
+                residual_input,
+                workspace.mixer_branch,
+                layer.mixer.post_attention_norm(),
+                workspace.mixer_residual,
+                workspace.mlp_normalized,
+            )?;
+        }
+        launch_mlp(stream, tokens, ops, workspace, layer.mlp, dense_mlp_maps)?;
+
+        let residual_output = if index.is_multiple_of(2) {
+            workspace.residual_b
+        } else {
+            workspace.residual_a
+        };
+        let next_norm = pointers
+            .layers
+            .get(index + 1)
+            .map_or(pointers.endpoint.final_norm, |next| next.mixer.input_norm());
+        // SAFETY: residual ping-pong and both branch planes do not alias.
+        unsafe {
+            ops.norm.launch_residual(
+                stream,
+                tokens,
+                workspace.mixer_residual,
+                workspace.mlp_branch,
+                next_norm,
+                residual_output,
+                workspace.mixer_normalized,
+            )?;
+        }
+        residual_input = residual_output;
+    }
+
+    if gdn_layer != GDN_LAYER_COUNT {
+        return Err(GpuError::invalid_launch(format!(
+            "target MTP verification visited {gdn_layer} GDN layers, expected {GDN_LAYER_COUNT}"
+        )));
+    }
+    if residual_input != workspace.residual_a {
+        return Err(GpuError::invalid_launch(
+            "target MTP even-layer schedule did not return to residual A",
+        ));
+    }
+    // Every row judges the following draft token; K=4 row three is the bonus
+    // distribution, so verification owns a complete K-wide logits plane.
+    unsafe {
+        ops.lm_head.launch(
+            stream,
+            tokens,
+            workspace.mixer_normalized,
+            workspace.activation_codes,
+            workspace.activation_scales,
+            pointers.endpoint.lm_head_codes,
+            pointers.endpoint.lm_head_scales,
+            workspace.logits,
+        )
+    }
+}
+
+fn launch_target_mtp_mixer(
+    stream: &CudaStream,
+    route: ResidentMtpVerifyRoute,
+    ops: Ops<'_>,
+    workspace: WorkspacePointers,
+    mixer: MixerPointers,
+    gdn_layer: &mut usize,
+) -> GpuResult<()> {
+    let tokens = route.tokens;
+    // SAFETY: K=1..4 scratch and replay planes are address-stable and consumed
+    // before reuse. Attention rows append distinct positions to one table row.
+    unsafe {
+        match mixer {
+            MixerPointers::Gdn(p) => {
+                let layer = *gdn_layer;
+                *gdn_layer = gdn_layer
+                    .checked_add(1)
+                    .ok_or_else(|| GpuError::invalid_launch("target GDN index overflows"))?;
+                if layer >= GDN_LAYER_COUNT {
+                    return Err(GpuError::invalid_launch(
+                        "target GDN layer exceeds replay inventory",
+                    ));
+                }
+                let projected = workspace.recorded_projected_for(layer);
+                let log_decay = workspace.recorded_log_decay_for(layer);
+                let beta = workspace.recorded_beta_for(layer);
+                ops.gdn_state_snapshot.launch(
+                    stream,
+                    workspace.state_rows,
+                    p.history,
+                    p.state,
+                    workspace.provisional_history,
+                    workspace.provisional_state,
+                )?;
+                ops.gdn_input.launch(
+                    stream,
+                    tokens,
+                    workspace.mixer_normalized,
+                    workspace.activation_codes,
+                    workspace.activation_scales,
+                    p.input_weight_codes,
+                    p.input_weight_scales,
+                    projected,
+                )?;
+                ops.gdn_prepare.launch_causal(
+                    stream,
+                    tokens,
+                    workspace.mixer_normalized,
+                    p.control_weights,
+                    p.a_log,
+                    p.dt_bias,
+                    projected,
+                    p.convolution_weights,
+                    workspace.provisional_state_row,
+                    workspace.provisional_history,
+                    log_decay,
+                    beta,
+                    workspace.convolved,
+                )?;
+                ops.gdn_recurrence.launch_causal(
+                    stream,
+                    tokens,
+                    workspace.convolved,
+                    projected,
+                    log_decay,
+                    beta,
+                    p.recurrent_norm,
+                    workspace.provisional_state_row,
+                    workspace.provisional_state,
+                    workspace.recurrent_output,
+                )?;
+                ops.gdn_output.launch(
+                    stream,
+                    tokens,
+                    workspace.recurrent_output,
+                    workspace.activation_codes,
+                    workspace.activation_scales,
+                    p.output_weight_codes,
+                    p.output_weight_scales,
+                    workspace.mixer_branch,
+                )
+            }
+            MixerPointers::Attention(p) => {
+                ops.attention_qkv.launch(
+                    stream,
+                    tokens,
+                    workspace.mixer_normalized,
+                    workspace.activation_codes,
+                    workspace.activation_scales,
+                    p.qkv_weight_codes,
+                    p.qkv_weight_scales,
+                    workspace.projected,
+                )?;
+                ops.attention_qk_prepare.launch(
+                    stream,
+                    tokens,
+                    workspace.projected,
+                    p.query_norm,
+                    p.key_norm,
+                    workspace.rope_cos,
+                    workspace.rope_sin,
+                    workspace.block_tables,
+                    workspace.table_rows,
+                    LONG_CONTEXT_PHYSICAL_PAGES,
+                    workspace.cache_positions,
+                    workspace.query,
+                    p.key_pages,
+                    p.value_pages,
+                    p.scalars.key_cache_scale,
+                    p.scalars.value_cache_scale,
+                )?;
+                match route.attention {
+                    AttentionRoute::Short => ops.paged_gqa.launch(
+                        stream,
+                        tokens,
+                        workspace.query,
+                        p.key_pages,
+                        p.value_pages,
+                        workspace.block_tables,
+                        workspace.table_rows,
+                        LONG_CONTEXT_PHYSICAL_PAGES,
+                        workspace.lengths,
+                        workspace.attention,
+                        p.scalars.key_cache_scale,
+                        p.scalars.value_cache_scale,
+                    )?,
+                    AttentionRoute::Long { .. } => ops.long_context_paged_gqa.launch(
+                        stream,
+                        tokens,
+                        route.maximum_length,
+                        workspace.query,
+                        p.key_pages,
+                        p.value_pages,
+                        workspace.block_tables,
+                        workspace.table_rows,
+                        LONG_CONTEXT_PHYSICAL_PAGES,
+                        workspace.lengths,
+                        workspace.partial_maximum,
+                        workspace.partial_denominator,
+                        workspace.partial_numerator,
+                        workspace.attention,
+                        p.scalars.key_cache_scale,
+                        p.scalars.value_cache_scale,
+                    )?,
+                }
+                ops.attention_output.launch(
+                    stream,
+                    tokens,
+                    workspace.attention,
+                    workspace.projected,
+                    workspace.activation_codes,
+                    workspace.activation_scales,
+                    p.output_weight_codes,
+                    p.output_weight_scales,
+                    workspace.mixer_branch,
+                )
+            }
+        }
+    }
+}
+
+fn launch_target_mtp_commit(
+    stream: &CudaStream,
+    tokens: usize,
+    ops: Ops<'_>,
+    pointers: &ProgramPointers,
+) -> GpuResult<()> {
+    let workspace = pointers.workspace;
+    let mut gdn_layer = 0;
+    for layer in &pointers.layers {
+        let MixerPointers::Gdn(p) = layer.mixer else {
+            continue;
+        };
+        if gdn_layer >= GDN_LAYER_COUNT {
+            return Err(GpuError::invalid_launch(
+                "target commit GDN layer exceeds replay inventory",
+            ));
+        }
+        let projected = workspace.recorded_projected_for(gdn_layer);
+        let log_decay = workspace.recorded_log_decay_for(gdn_layer);
+        let beta = workspace.recorded_beta_for(gdn_layer);
+        // The represented projected/control planes came from the provisional
+        // target run; only causal convolution and recurrence mutate live state.
+        unsafe {
+            ops.gdn_prepare.launch_causal_replay(
+                stream,
+                tokens,
+                projected,
+                p.convolution_weights,
+                workspace.state_rows,
+                p.history,
+                workspace.convolved,
+            )?;
+            ops.gdn_recurrence.launch_causal(
+                stream,
+                tokens,
+                workspace.convolved,
+                projected,
+                log_decay,
+                beta,
+                p.recurrent_norm,
+                workspace.state_rows,
+                p.state,
+                workspace.recurrent_output,
+            )?;
+        }
+        gdn_layer += 1;
+    }
+    if gdn_layer != GDN_LAYER_COUNT {
+        return Err(GpuError::invalid_launch(format!(
+            "target MTP commit visited {gdn_layer} GDN layers, expected {GDN_LAYER_COUNT}"
+        )));
+    }
+
+    Ok(())
 }
 
 fn launch_prefill_route(
@@ -3785,6 +4934,15 @@ fn require_rows(rows: usize) -> EngineResult<()> {
     Ok(())
 }
 
+fn require_target_verify_tokens(tokens: usize) -> EngineResult<()> {
+    if !(1..=TARGET_VERIFY_ROUTE_COUNT).contains(&tokens) {
+        return Err(EngineError::route(format!(
+            "target MTP verification token count {tokens} is outside 1..={TARGET_VERIFY_ROUTE_COUNT}"
+        )));
+    }
+    Ok(())
+}
+
 fn slot_rows(slots: &[usize]) -> EngineResult<[u32; MAX_BATCH]> {
     require_batch(slots.len())?;
     let mut seen = [false; MAX_BATCH];
@@ -3926,10 +5084,11 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PREFILL_GRAPH_ROUTE_COUNT,
-        PRODUCTION_LOAD_MODE, ResidentLoadMode, bf16_to_f32, decode_lengths, prefill_graph_index,
-        prefill_graph_routes, prefill_index, require_batch, require_rows, select_decode_route,
-        select_prefill_route, slot_rows,
+        LONG_CONTEXT_ROUTE_COUNT, PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT,
+        PREFILL_GRAPH_ROUTE_COUNT, PRODUCTION_LOAD_MODE, ResidentLoadMode,
+        TARGET_VERIFY_ROUTE_COUNT, bf16_to_f32, decode_lengths, prefill_graph_index,
+        prefill_graph_routes, prefill_index, require_batch, require_rows,
+        require_target_verify_tokens, select_decode_route, select_prefill_route, slot_rows,
     };
     use crate::EngineErrorCode;
 
@@ -3946,6 +5105,33 @@ mod tests {
         for batch in [0, 9, 16, usize::MAX] {
             let error = require_batch(batch).unwrap_err();
             assert_eq!(error.code(), Some(EngineErrorCode::Route));
+        }
+    }
+
+    #[test]
+    fn target_mtp_inventory_covers_every_k_and_attention_band() {
+        assert_eq!(
+            TARGET_VERIFY_ROUTE_COUNT * (LONG_CONTEXT_ROUTE_COUNT + 2),
+            32
+        );
+        for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
+            require_target_verify_tokens(tokens).unwrap();
+            for maximum_length in [
+                1u32, 192, 193, 1_024, 1_025, 4_096, 4_097, 16_384, 16_385, 65_536, 65_537,
+                131_072, 131_073, 220_000,
+            ] {
+                let mut lengths = vec![1; tokens];
+                lengths[tokens - 1] = maximum_length;
+                let route = select_decode_route(tokens, &lengths).unwrap();
+                assert_eq!(route.batch(), tokens);
+                assert_eq!(route.maximum_length(), maximum_length as usize);
+            }
+        }
+        for tokens in [0, TARGET_VERIFY_ROUTE_COUNT + 1, usize::MAX] {
+            assert_eq!(
+                require_target_verify_tokens(tokens).unwrap_err().code(),
+                Some(EngineErrorCode::Route)
+            );
         }
     }
 

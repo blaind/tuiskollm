@@ -8,7 +8,7 @@ use crate::fp8::{
     fp8_down_ptx_names, fp8_gdn_input_ptx_names, fp8_lm_head_ptx_names, fp8_qkv_ptx_names,
     fp8_swiglu_ptx_names,
 };
-use crate::gdn::{gdn_prepare_ptx_names, gdn_recurrence_ptx_names};
+use crate::gdn::{gdn_prepare_ptx_names, gdn_recurrence_ptx_names, gdn_state_snapshot_ptx_name};
 use crate::mtp_bf16_attention_output::mtp_bf16_attention_output_ptx_names;
 use crate::mtp_bf16_fusion::mtp_bf16_fusion_ptx_names;
 use crate::mtp_bf16_mlp::mtp_bf16_mlp_ptx_names;
@@ -40,6 +40,7 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .chain(gdn_output_ptx_names())
         .chain(gdn_prepare_ptx_names())
         .chain(gdn_recurrence_ptx_names())
+        .chain([gdn_state_snapshot_ptx_name()])
         .chain(mtp_bf16_fusion_ptx_names())
         .chain(mtp_bf16_mlp_ptx_names())
         .chain(mtp_bf16_attention_output_ptx_names())
@@ -64,7 +65,7 @@ mod tests {
         let names = kernel_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 385);
+        assert_eq!(names.len(), 402);
         assert_eq!(unique.len(), names.len());
     }
 }

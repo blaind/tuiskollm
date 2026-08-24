@@ -12,6 +12,7 @@ use tuisko_model::{Arch, Qwen38_27B};
 const MAX_BATCH: usize = 8;
 const MAX_ROWS: usize = 1_024;
 const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, MAX_BATCH, 32, 64, 128, MAX_ROWS];
+const CAUSAL_ROUTES: [usize; 4] = [1, 2, 3, 4];
 const ALIGNMENT: usize = 256;
 const HISTORY_TAPS: usize = 3;
 const STATE_ROWS: [u32; MAX_BATCH] = [7, 0, 5, 2, 6, 1, 4, 3];
@@ -184,9 +185,91 @@ pub fn qualify_gdn_prepare() -> Result<GdnPrepareQualification, GdnPrepareQualif
         }
     }
 
+    for tokens in CAUSAL_ROUTES {
+        reset_state(&arena, &stream, regions, &fixture)?;
+        launch_causal(&op, &arena, &stream, regions, tokens)?;
+        let eager = observe(&arena, &stream, regions)?;
+        verify_causal_oracle(tokens, &fixture, &eager, &mut report)?;
+        if tokens == 1 {
+            reset_state(&arena, &stream, regions, &fixture)?;
+            launch(&op, &arena, &stream, regions, 1)?;
+            let decode = observe(&arena, &stream, regions)?;
+            verify_causal_k1_decode_agreement(&eager, &decode)?;
+        }
+
+        reset_state(&arena, &stream, regions, &fixture)?;
+        stream.synchronize().map_err(GpuError::from)?;
+        let graph = CudaGraph::capture(&stream, || {
+            launch_causal(&op, &arena, &stream, regions, tokens)
+        })?;
+        graph.launch(&stream)?;
+        let replay = observe(&arena, &stream, regions)?;
+        verify_replay(tokens, &fixture, &eager, &replay, &mut report)?;
+
+        reset_state(&arena, &stream, regions, &fixture)?;
+        graph.launch(&stream)?;
+        let second_replay = observe(&arena, &stream, regions)?;
+        verify_replay(tokens, &fixture, &eager, &second_replay, &mut report)?;
+
+        if addresses(&arena, regions)? != stable_addresses {
+            return Err(GdnPrepareQualificationError::Mismatch(format!(
+                "device addresses changed while qualifying causal K={tokens}"
+            )));
+        }
+    }
+
     verify_no_post_warmup_allocation(&context, &op, &arena, &stream, regions, &fixture)?;
 
     Ok(report)
+}
+
+fn verify_causal_k1_decode_agreement(
+    causal: &Observed,
+    decode: &Observed,
+) -> Result<(), GdnPrepareQualificationError> {
+    let controls = Qwen38_27B::GDN_CONTROL_ROWS;
+    let qkv = Qwen38_27B::GDN_QKV_ROWS;
+    for (name, actual, expected) in [
+        (
+            "log_decay",
+            &causal.log_decay[..controls],
+            &decode.log_decay[..controls],
+        ),
+        ("beta", &causal.beta[..controls], &decode.beta[..controls]),
+    ] {
+        if let Some(index) = actual
+            .iter()
+            .zip(expected)
+            .position(|(actual, expected)| actual.to_bits() != expected.to_bits())
+        {
+            return Err(GdnPrepareQualificationError::Mismatch(format!(
+                "causal K=1 {name} differs bit-exactly from decode B=1 at {index}"
+            )));
+        }
+    }
+    for (name, actual, expected) in [
+        (
+            "convolution",
+            &causal.convolved[..qkv],
+            &decode.convolved[..qkv],
+        ),
+        (
+            "history",
+            causal.history.as_slice(),
+            decode.history.as_slice(),
+        ),
+    ] {
+        if let Some(index) = actual
+            .iter()
+            .zip(expected)
+            .position(|(actual, expected)| actual != expected)
+        {
+            return Err(GdnPrepareQualificationError::Mismatch(format!(
+                "causal K=1 {name} differs bit-exactly from decode B=1 at {index}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
@@ -349,6 +432,34 @@ fn launch(
     }
 }
 
+fn launch_causal(
+    op: &GdnPrepareOp,
+    arena: &DeviceArena,
+    stream: &tuisko_gpu::CudaStream,
+    regions: Regions,
+    tokens: usize,
+) -> GpuResult<()> {
+    // SAFETY: every exact causal row shares STATE_ROWS[0]; all other planes
+    // cover K=4 and the mapped history row is below eight.
+    unsafe {
+        op.launch_causal(
+            stream,
+            tokens,
+            arena.address(regions.input)?,
+            arena.address(regions.control_weights)?,
+            arena.address(regions.a_log)?,
+            arena.address(regions.dt_bias)?,
+            arena.address(regions.projected)?,
+            arena.address(regions.convolution_weights)?,
+            arena.address(regions.state_rows)?,
+            arena.address(regions.history)?,
+            arena.address(regions.log_decay)?,
+            arena.address(regions.beta)?,
+            arena.address(regions.convolved)?,
+        )
+    }
+}
+
 fn observe(
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
@@ -386,6 +497,25 @@ fn verify_oracle(
     report.inactive_values += inactive_values(rows);
     report.immutable_values += immutable_values(fixture);
 
+    Ok(())
+}
+
+fn verify_causal_oracle(
+    tokens: usize,
+    fixture: &Fixture,
+    observed: &Observed,
+    report: &mut GdnPrepareQualification,
+) -> Result<(), GdnPrepareQualificationError> {
+    verify_immutable(tokens, fixture, observed)?;
+    verify_controls(tokens, fixture, observed, report)?;
+    verify_causal_convolution(tokens, fixture, observed, report)?;
+    verify_inactive(tokens, observed)?;
+
+    report.control_values += tokens * 2 * Qwen38_27B::GDN_CONTROL_ROWS;
+    report.convolution_values += tokens * Qwen38_27B::GDN_QKV_ROWS;
+    report.history_values += observed.history.len();
+    report.inactive_values += inactive_values(tokens);
+    report.immutable_values += immutable_values(fixture);
     Ok(())
 }
 
@@ -549,6 +679,61 @@ fn verify_convolution(
     Ok(())
 }
 
+fn verify_causal_convolution(
+    tokens: usize,
+    fixture: &Fixture,
+    observed: &Observed,
+    report: &mut GdnPrepareQualification,
+) -> Result<(), GdnPrepareQualificationError> {
+    let qkv = Qwen38_27B::GDN_QKV_ROWS;
+    let input_rows = Qwen38_27B::GDN_INPUT_ROWS;
+    let state_row = STATE_ROWS[0] as usize;
+    let mut expected_history = fixture.history.clone();
+
+    for token in 0..tokens {
+        for channel in 0..qkv {
+            let history_base = (state_row * qkv + channel) * HISTORY_TAPS;
+            let current = fixture.projected[token * input_rows + channel];
+            let values = [
+                expected_history[history_base],
+                expected_history[history_base + 1],
+                expected_history[history_base + 2],
+                current,
+            ];
+            let sum = (0..4)
+                .map(|tap| {
+                    f64::from(bf16_to_f32(fixture.convolution_weights[channel * 4 + tap]))
+                        * f64::from(bf16_to_f32(values[tap]))
+                })
+                .sum::<f64>();
+            let expected = sum / (1.0 + (-sum).exp());
+            let actual = bf16_to_f32(observed.convolved[token * qkv + channel]);
+            let error = (f64::from(actual) - expected).abs() as f32;
+            report.maximum_convolution_error = report.maximum_convolution_error.max(error);
+            if error > 0.002 {
+                return Err(GdnPrepareQualificationError::Mismatch(format!(
+                    "causal convolution at K={tokens}, token={token}, channel={channel}: device={actual}, oracle={expected}, error={error}"
+                )));
+            }
+            expected_history[history_base..history_base + HISTORY_TAPS]
+                .copy_from_slice(&[values[1], values[2], current]);
+        }
+    }
+
+    if let Some(index) = observed
+        .history
+        .iter()
+        .zip(&expected_history)
+        .position(|(actual, expected)| actual != expected)
+    {
+        return Err(GdnPrepareQualificationError::Mismatch(format!(
+            "causal history at K={tokens}, index={index}: device={:#06x}, oracle={:#06x}",
+            observed.history[index], expected_history[index]
+        )));
+    }
+    Ok(())
+}
+
 fn verify_inactive(rows: usize, observed: &Observed) -> Result<(), GdnPrepareQualificationError> {
     let controls = Qwen38_27B::GDN_CONTROL_ROWS;
     let qkv = Qwen38_27B::GDN_QKV_ROWS;
@@ -646,11 +831,17 @@ fn verify_no_post_warmup_allocation(
     regions: Regions,
     fixture: &Fixture,
 ) -> Result<(), GdnPrepareQualificationError> {
-    let mut graphs = Vec::with_capacity(EXACT_ROUTES.len());
+    let mut graphs = Vec::with_capacity(EXACT_ROUTES.len() + CAUSAL_ROUTES.len());
     for rows in EXACT_ROUTES {
         reset_state(arena, stream, regions, fixture)?;
         graphs.push(CudaGraph::capture(stream, || {
             launch(op, arena, stream, regions, rows)
+        })?);
+    }
+    for tokens in CAUSAL_ROUTES {
+        reset_state(arena, stream, regions, fixture)?;
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_causal(op, arena, stream, regions, tokens)
         })?);
     }
     for graph in &graphs {
@@ -677,8 +868,8 @@ fn verify_no_post_warmup_allocation(
 #[cfg(test)]
 mod tests {
     use super::{
-        EXACT_ROUTES, GdnPrepareQualificationError, HISTORY_TAPS, MAX_BATCH, MAX_ROWS, Qwen38_27B,
-        fixture, immutable_values, layout, qualify_gdn_prepare,
+        CAUSAL_ROUTES, EXACT_ROUTES, GdnPrepareQualificationError, HISTORY_TAPS, MAX_BATCH,
+        MAX_ROWS, Qwen38_27B, fixture, immutable_values, layout, qualify_gdn_prepare,
     };
     use tuisko_model::Arch;
 
@@ -687,12 +878,14 @@ mod tests {
     fn exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), GdnPrepareQualificationError> {
         let report = qualify_gdn_prepare()?;
-        let active_rows = EXACT_ROUTES.iter().sum::<usize>();
+        let active_rows = EXACT_ROUTES.iter().chain(&CAUSAL_ROUTES).sum::<usize>();
+        let route_count = EXACT_ROUTES.len() + CAUSAL_ROUTES.len();
         let complete_history = MAX_BATCH * Qwen38_27B::GDN_QKV_ROWS * HISTORY_TAPS;
         let active_outputs =
             active_rows * (2 * Qwen38_27B::GDN_CONTROL_ROWS + Qwen38_27B::GDN_QKV_ROWS);
         let inactive_outputs = EXACT_ROUTES
             .iter()
+            .chain(&CAUSAL_ROUTES)
             .map(|rows| MAX_ROWS - rows)
             .sum::<usize>()
             * (2 * Qwen38_27B::GDN_CONTROL_ROWS + Qwen38_27B::GDN_QKV_ROWS);
@@ -705,15 +898,15 @@ mod tests {
             report.convolution_values,
             active_rows * Qwen38_27B::GDN_QKV_ROWS
         );
-        assert_eq!(report.history_values, EXACT_ROUTES.len() * complete_history);
+        assert_eq!(report.history_values, route_count * complete_history);
         assert_eq!(
             report.graph_replay_values,
-            2 * (active_outputs + EXACT_ROUTES.len() * complete_history)
+            2 * (active_outputs + route_count * complete_history)
         );
         assert_eq!(report.inactive_values, 3 * inactive_outputs);
         assert_eq!(
             report.immutable_values,
-            3 * EXACT_ROUTES.len() * immutable_values(&fixture())
+            3 * route_count * immutable_values(&fixture())
         );
         assert_eq!(
             report.arena_bytes,
@@ -728,6 +921,7 @@ mod tests {
     #[test]
     fn route_inventory_and_arena_accounting_are_exact() {
         assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
+        assert_eq!(CAUSAL_ROUTES, [1, 2, 3, 4]);
         let (layout, regions) = layout().unwrap();
         assert_eq!(layout.byte_len(), regions.payload_bytes() + 544);
     }

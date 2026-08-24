@@ -218,9 +218,25 @@ pub(crate) unsafe fn gdn_convolution_prefill_history<A: Arch, const TOKENS: usiz
 
     let state_row = unsafe { *state_rows as usize };
     let history = unsafe { history.add((state_row * A::GDN_QKV_ROWS + channel) * HISTORY) };
+    let old1 = unsafe { *history.add(1) };
+    let old2 = unsafe { *history.add(2) };
     unsafe {
-        *history = projected_channel::<A>(projected, TOKENS - 3, channel);
-        *history.add(1) = projected_channel::<A>(projected, TOKENS - 2, channel);
-        *history.add(2) = projected_channel::<A>(projected, TOKENS - 1, channel);
+        match TOKENS {
+            1 => {
+                *history = old1;
+                *history.add(1) = old2;
+                *history.add(2) = projected_channel::<A>(projected, 0, channel);
+            }
+            2 => {
+                *history = old2;
+                *history.add(1) = projected_channel::<A>(projected, 0, channel);
+                *history.add(2) = projected_channel::<A>(projected, 1, channel);
+            }
+            _ => {
+                *history = projected_channel::<A>(projected, TOKENS - 3, channel);
+                *history.add(1) = projected_channel::<A>(projected, TOKENS - 2, channel);
+                *history.add(2) = projected_channel::<A>(projected, TOKENS - 1, channel);
+            }
+        }
     }
 }

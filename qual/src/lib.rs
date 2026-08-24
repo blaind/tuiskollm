@@ -67,6 +67,8 @@ mod gdn_recurrence;
 #[cfg(feature = "device")]
 mod gdn_recurrence_benchmark;
 #[cfg(feature = "device")]
+mod gdn_state_snapshot;
+#[cfg(feature = "device")]
 mod long_context_paged_gqa;
 #[cfg(feature = "device")]
 mod long_context_paged_gqa_benchmark;
@@ -166,6 +168,10 @@ mod startup_benchmark;
 mod startup_h2d;
 mod target;
 #[cfg(feature = "device")]
+mod target_mtp_verify;
+#[cfg(feature = "device")]
+mod target_mtp_verify_benchmark;
+#[cfg(feature = "device")]
 mod text_endpoint;
 #[cfg(feature = "device")]
 mod text_endpoint_benchmark;
@@ -253,6 +259,10 @@ pub use gdn_recurrence::{
 };
 #[cfg(feature = "device")]
 pub use gdn_recurrence_benchmark::benchmark_gdn_recurrence;
+#[cfg(feature = "device")]
+pub use gdn_state_snapshot::{
+    GdnStateSnapshotQualification, GdnStateSnapshotQualificationError, qualify_gdn_state_snapshot,
+};
 #[cfg(feature = "device")]
 pub use long_context_paged_gqa::{
     LongContextPagedGqaQualification, LongContextPagedGqaQualificationError,
@@ -392,6 +402,12 @@ pub use residual_norm_prefill::{
 };
 #[cfg(feature = "device")]
 pub use startup_benchmark::run_startup_benchmark_cli;
+#[cfg(feature = "device")]
+pub use target_mtp_verify::{
+    TargetMtpVerifyQualification, TargetMtpVerifyQualificationError, qualify_target_mtp_verify,
+};
+#[cfg(feature = "device")]
+pub use target_mtp_verify_benchmark::benchmark_target_mtp_verify;
 #[cfg(feature = "device")]
 pub use text_endpoint::{
     TextEndpointQualification, TextEndpointQualificationError, qualify_text_endpoint,

@@ -55,8 +55,8 @@ pub use resident_generation::{
 pub use resident_model_layout::{
     ResidentDecodeRoute, ResidentLayerKind, ResidentLoadMode, ResidentLoadPhase,
     ResidentLoadProgress, ResidentLoadStats, ResidentModelLayout, ResidentModelProgram,
-    ResidentPrefillRoute, ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan,
-    ResidentUploadPreparation,
+    ResidentMtpVerifyRoute, ResidentPrefillRoute, ResidentUploadArena, ResidentUploadEntry,
+    ResidentUploadPlan, ResidentUploadPreparation,
 };
 pub use sampling::{SampleDecision, Sampler, SamplingOptions};
 
@@ -79,5 +79,6 @@ pub use qwen35_full_attention_layer::{
 #[cfg(feature = "qualification")]
 pub use resident_model_layout::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
+    ResidentMtpGdnObservables, ResidentMtpLayerObservables, ResidentMtpVerifyObservables,
     ResidentPrefillStageGraph,
 };

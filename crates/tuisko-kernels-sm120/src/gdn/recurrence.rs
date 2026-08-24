@@ -13,6 +13,7 @@ const VALUE_HEADS: usize = 48;
 const HEAD_DIM: usize = 128;
 const WARPS: usize = 16;
 const THREADS: u32 = (WARPS * 32) as u32;
+const CAUSAL_ROWS: [usize; 4] = [1, 2, 3, 4];
 const PREFILL_ROWS: [usize; 4] = [32, 64, 128, 1_024];
 
 fn admitted_batch(batch: usize) -> bool {
@@ -191,9 +192,9 @@ struct PreparedPrefillRoute<A: Arch, const TOKENS: usize> {
 
 impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        if !PREFILL_ROWS.contains(&TOKENS) {
+        if !CAUSAL_ROWS.contains(&TOKENS) && !PREFILL_ROWS.contains(&TOKENS) {
             return Err(GpuError::invalid_launch(format!(
-                "GDN recurrence prefill route T={TOKENS} is not admitted"
+                "GDN recurrence causal route T={TOKENS} is not admitted"
             )));
         }
         let launch = module
@@ -249,6 +250,10 @@ pub struct GdnRecurrenceOp<A: Sm120Arch = Qwen38_27B> {
     b6: PreparedRoute<A, 6>,
     b7: PreparedRoute<A, 7>,
     b8: PreparedRoute<A, 8>,
+    k1: PreparedPrefillRoute<A, 1>,
+    k2: PreparedPrefillRoute<A, 2>,
+    k3: PreparedPrefillRoute<A, 3>,
+    k4: PreparedPrefillRoute<A, 4>,
     t32: PreparedPrefillRoute<A, 32>,
     t64: PreparedPrefillRoute<A, 64>,
     t128: PreparedPrefillRoute<A, 128>,
@@ -273,6 +278,10 @@ impl<A: Sm120Arch> GdnRecurrenceOp<A> {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            k1: PreparedPrefillRoute::prepare(&module)?,
+            k2: PreparedPrefillRoute::prepare(&module)?,
+            k3: PreparedPrefillRoute::prepare(&module)?,
+            k4: PreparedPrefillRoute::prepare(&module)?,
             t32: PreparedPrefillRoute::prepare(&module)?,
             t64: PreparedPrefillRoute::prepare(&module)?,
             t128: PreparedPrefillRoute::prepare(&module)?,
@@ -349,6 +358,62 @@ impl<A: Sm120Arch> GdnRecurrenceOp<A> {
             _ => unreachable!(),
         }
     }
+
+    /// Advances one state row through an exact `K=1..4` causal sequence.
+    ///
+    /// Forty-eight value-head CTAs each advance their owned state serially;
+    /// this exposes head parallelism without changing token dependence.
+    ///
+    /// # Safety
+    ///
+    /// Inputs and outputs cover the same planes documented by [`Self::launch`]
+    /// for `tokens` rows. `state_rows` covers one valid row index. The caller
+    /// owns that state row exclusively through completion; allocations are
+    /// aligned, non-overlapping, live through completion, and belong to
+    /// `stream`'s context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_causal(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        qkv: *const u16,
+        projected: *const u16,
+        log_decay: *const f32,
+        beta: *const f32,
+        norm_weight: *const u16,
+        state_rows: *const u32,
+        state: *mut f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        qkv,
+                        projected,
+                        log_decay,
+                        beta,
+                        norm_weight,
+                        state_rows,
+                        state,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match tokens {
+            1 => launch!(k1),
+            2 => launch!(k2),
+            3 => launch!(k3),
+            4 => launch!(k4),
+            _ => Err(GpuError::invalid_launch(format!(
+                "GDN causal recurrence token count {tokens} is outside the admitted routes 1..=4"
+            ))),
+        }
+    }
 }
 
 /// PTX symbols retained for every exact GDN recurrence route.
@@ -362,6 +427,10 @@ pub(crate) fn gdn_recurrence_ptx_names() -> Vec<&'static str> {
         kernels::gdn_recurrence_exact_ptx_name::<Qwen38_27B, 6>(),
         kernels::gdn_recurrence_exact_ptx_name::<Qwen38_27B, 7>(),
         kernels::gdn_recurrence_exact_ptx_name::<Qwen38_27B, 8>(),
+        kernels::gdn_recurrence_prefill_exact_ptx_name::<Qwen38_27B, 1>(),
+        kernels::gdn_recurrence_prefill_exact_ptx_name::<Qwen38_27B, 2>(),
+        kernels::gdn_recurrence_prefill_exact_ptx_name::<Qwen38_27B, 3>(),
+        kernels::gdn_recurrence_prefill_exact_ptx_name::<Qwen38_27B, 4>(),
         kernels::gdn_recurrence_prefill_exact_ptx_name::<Qwen38_27B, 32>(),
         kernels::gdn_recurrence_prefill_exact_ptx_name::<Qwen38_27B, 64>(),
         kernels::gdn_recurrence_prefill_exact_ptx_name::<Qwen38_27B, 128>(),
@@ -423,7 +492,7 @@ mod tests {
         let names = gdn_recurrence_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), MAX_BATCH + 4);
+        assert_eq!(names.len(), MAX_BATCH + 8);
         assert_eq!(unique.len(), names.len());
     }
 }
