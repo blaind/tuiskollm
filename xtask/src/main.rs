@@ -39,6 +39,7 @@ const QWEN36_GDN_INPUT_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-gdn-inpu
 const QWEN36_GDN_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-gdn-output-sm120.txt";
 const QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen36-attention-output-sm120.txt";
+const QWEN36_RESIDENT_MODEL_TEST_FILTER: &str = "qwen36_resident_model";
 const QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt";
 const QWEN35_GDN_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-gdn-prepare-sm120.txt";
@@ -1955,7 +1956,7 @@ fn qualify_qwen36_resident_model(
             "--release",
             "--lib",
             "--",
-            "qwen36_resident_model::tests",
+            QWEN36_RESIDENT_MODEL_TEST_FILTER,
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -12745,12 +12746,13 @@ fn require_uniform_value(
 mod tests {
     use super::{
         COMPOSED_PERFORMANCE_SUITES, MTP_LAYER_RESOURCE_BASELINES, OptimizationSuite,
-        PERFORMANCE_SUITES, PerformanceSuite, SM120_RESOURCE_BASELINES, parse_baseline,
-        parse_compute_pids, parse_cuda_toolkit_identity, parse_entries, parse_idle_sample,
-        parse_performance_device_sample, parse_performance_iteration, parse_resources,
-        parse_rustc_identity, preflight_performance_baselines, require_consumed_baseline_keys,
-        require_count, require_registers, require_uniform_value, resolve_target_output,
-        sass_function_body, workspace_root,
+        PERFORMANCE_SUITES, PerformanceSuite, QWEN36_RESIDENT_MODEL_TEST_FILTER,
+        SM120_RESOURCE_BASELINES, parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity,
+        parse_entries, parse_idle_sample, parse_performance_device_sample,
+        parse_performance_iteration, parse_resources, parse_rustc_identity,
+        preflight_performance_baselines, require_consumed_baseline_keys, require_count,
+        require_registers, require_uniform_value, resolve_target_output, sass_function_body,
+        workspace_root,
     };
     use std::ffi::OsString;
 
@@ -12763,6 +12765,16 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "rms_norm_b1");
         assert_eq!(entries[1].name, "residual_rms_norm_TID_abc");
+    }
+
+    #[test]
+    fn qwen36_resident_filter_selects_oracle_and_accounting() {
+        for test in [
+            "qwen36_resident_model::tests::whole_model_matches_endpoint_oracles_and_graph_replay",
+            "qwen36_resident_model_benchmark::tests::accounting_covers_every_layer_endpoint_and_selected_expert",
+        ] {
+            assert!(test.contains(QWEN36_RESIDENT_MODEL_TEST_FILTER));
+        }
     }
 
     #[test]
