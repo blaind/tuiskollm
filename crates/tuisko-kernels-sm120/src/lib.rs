@@ -6,6 +6,7 @@ mod device;
 mod fp8;
 mod gdn;
 mod inventory;
+mod mtp_bf16_attention_output;
 mod mtp_bf16_fusion;
 mod mtp_bf16_paged_gqa;
 mod mtp_bf16_qk_prepare;
@@ -32,6 +33,7 @@ pub use fp8::{
 };
 pub use gdn::{GdnPrepareOp, GdnRecurrenceOp};
 pub use inventory::kernel_ptx_names;
+pub use mtp_bf16_attention_output::MtpBf16AttentionOutputOp;
 pub use mtp_bf16_fusion::MtpBf16FusionOp;
 pub use mtp_bf16_paged_gqa::MtpBf16PagedGqaOp;
 pub use mtp_bf16_qk_prepare::MtpBf16QkPrepareOp;

@@ -71,6 +71,10 @@ mod long_context_paged_gqa;
 #[cfg(feature = "device")]
 mod long_context_paged_gqa_benchmark;
 #[cfg(feature = "device")]
+mod mtp_bf16_attention_output;
+#[cfg(feature = "device")]
+mod mtp_bf16_attention_output_benchmark;
+#[cfg(feature = "device")]
 mod mtp_bf16_fusion;
 #[cfg(feature = "device")]
 mod mtp_bf16_fusion_benchmark;
@@ -248,6 +252,13 @@ pub use long_context_paged_gqa::{
 };
 #[cfg(feature = "device")]
 pub use long_context_paged_gqa_benchmark::benchmark_long_context_paged_gqa;
+#[cfg(feature = "device")]
+pub use mtp_bf16_attention_output::{
+    MtpBf16AttentionOutputQualification, MtpBf16AttentionOutputQualificationError,
+    qualify_mtp_bf16_attention_output,
+};
+#[cfg(feature = "device")]
+pub use mtp_bf16_attention_output_benchmark::benchmark_mtp_bf16_attention_output;
 #[cfg(feature = "device")]
 pub use mtp_bf16_fusion::{
     MtpBf16FusionQualification, MtpBf16FusionQualificationError, qualify_mtp_bf16_fusion,

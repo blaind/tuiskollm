@@ -47,6 +47,8 @@ const LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE: &str =
     "qual/baselines/long-context-paged-gqa-sm120.txt";
 const ATTENTION_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/attention-output-sm120.txt";
 const MTP_BF16_FUSION_RESOURCE_BASELINE: &str = "qual/baselines/mtp-bf16-fusion-sm120.txt";
+const MTP_BF16_ATTENTION_OUTPUT_RESOURCE_BASELINE: &str =
+    "qual/baselines/mtp-bf16-attention-output-sm120.txt";
 const MTP_BF16_QKV_RESOURCE_BASELINE: &str = "qual/baselines/mtp-bf16-qkv-sm120.txt";
 const MTP_BF16_QK_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/mtp-bf16-qk-prepare-sm120.txt";
 const MTP_BF16_PAGED_GQA_RESOURCE_BASELINE: &str = "qual/baselines/mtp-bf16-paged-gqa-sm120.txt";
@@ -91,6 +93,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE,
     ATTENTION_OUTPUT_RESOURCE_BASELINE,
     MTP_BF16_FUSION_RESOURCE_BASELINE,
+    MTP_BF16_ATTENTION_OUTPUT_RESOURCE_BASELINE,
     MTP_BF16_QKV_RESOURCE_BASELINE,
     MTP_BF16_QK_PREPARE_RESOURCE_BASELINE,
     MTP_BF16_PAGED_GQA_RESOURCE_BASELINE,
@@ -160,12 +163,13 @@ pub(crate) enum PerformanceSuite {
     LongContextPagedGqa,
     AttentionOutput,
     MtpBf16Fusion,
+    MtpBf16AttentionOutput,
     MtpBf16Qkv,
     MtpBf16QkPrepare,
     MtpBf16PagedGqa,
 }
 
-const PERFORMANCE_SUITES: [PerformanceSuite; 19] = [
+const PERFORMANCE_SUITES: [PerformanceSuite; 20] = [
     PerformanceSuite::ResidualNorm,
     PerformanceSuite::Fp8Qkv,
     PerformanceSuite::Fp8GdnInput,
@@ -185,6 +189,7 @@ const PERFORMANCE_SUITES: [PerformanceSuite; 19] = [
     PerformanceSuite::MtpBf16Qkv,
     PerformanceSuite::MtpBf16QkPrepare,
     PerformanceSuite::MtpBf16PagedGqa,
+    PerformanceSuite::MtpBf16AttentionOutput,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,6 +235,7 @@ impl PerformanceSuite {
             Self::LongContextPagedGqa => "long-context-paged-gqa",
             Self::AttentionOutput => "attention-output",
             Self::MtpBf16Fusion => "mtp-bf16-fusion",
+            Self::MtpBf16AttentionOutput => "mtp-bf16-attention-output",
             Self::MtpBf16Qkv => "mtp-bf16-qkv",
             Self::MtpBf16QkPrepare => "mtp-bf16-qk-prepare",
             Self::MtpBf16PagedGqa => "mtp-bf16-paged-gqa",
@@ -254,6 +260,7 @@ impl PerformanceSuite {
             Self::LongContextPagedGqa => LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE,
             Self::AttentionOutput => ATTENTION_OUTPUT_RESOURCE_BASELINE,
             Self::MtpBf16Fusion => MTP_BF16_FUSION_RESOURCE_BASELINE,
+            Self::MtpBf16AttentionOutput => MTP_BF16_ATTENTION_OUTPUT_RESOURCE_BASELINE,
             Self::MtpBf16Qkv => MTP_BF16_QKV_RESOURCE_BASELINE,
             Self::MtpBf16QkPrepare => MTP_BF16_QK_PREPARE_RESOURCE_BASELINE,
             Self::MtpBf16PagedGqa => MTP_BF16_PAGED_GQA_RESOURCE_BASELINE,
@@ -278,6 +285,7 @@ impl PerformanceSuite {
             Self::LongContextPagedGqa => "qual/baselines/long-context-paged-gqa-sm120.json",
             Self::AttentionOutput => "qual/baselines/attention-output-sm120.json",
             Self::MtpBf16Fusion => "qual/baselines/mtp-bf16-fusion-sm120.json",
+            Self::MtpBf16AttentionOutput => "qual/baselines/mtp-bf16-attention-output-sm120.json",
             Self::MtpBf16Qkv => "qual/baselines/mtp-bf16-qkv-sm120.json",
             Self::MtpBf16QkPrepare => "qual/baselines/mtp-bf16-qk-prepare-sm120.json",
             Self::MtpBf16PagedGqa => "qual/baselines/mtp-bf16-paged-gqa-sm120.json",
@@ -302,6 +310,7 @@ impl PerformanceSuite {
             "long-context-paged-gqa" => Ok(Self::LongContextPagedGqa),
             "attention-output" => Ok(Self::AttentionOutput),
             "mtp-bf16-fusion" => Ok(Self::MtpBf16Fusion),
+            "mtp-bf16-attention-output" => Ok(Self::MtpBf16AttentionOutput),
             "mtp-bf16-qkv" => Ok(Self::MtpBf16Qkv),
             "mtp-bf16-qk-prepare" => Ok(Self::MtpBf16QkPrepare),
             "mtp-bf16-paged-gqa" => Ok(Self::MtpBf16PagedGqa),
@@ -312,7 +321,10 @@ impl PerformanceSuite {
     const fn requires_snapshot(self) -> bool {
         matches!(
             self,
-            Self::MtpBf16Fusion | Self::MtpBf16Qkv | Self::MtpBf16QkPrepare
+            Self::MtpBf16Fusion
+                | Self::MtpBf16AttentionOutput
+                | Self::MtpBf16Qkv
+                | Self::MtpBf16QkPrepare
         )
     }
 
@@ -337,6 +349,14 @@ impl PerformanceSuite {
                 root,
                 &[snapshot
                     .ok_or("mtp-bf16-fusion qualification requires the admitted snapshot path")?
+                    .to_os_string()],
+            ),
+            Self::MtpBf16AttentionOutput => qualify_mtp_bf16_attention_output(
+                root,
+                &[snapshot
+                    .ok_or(
+                        "mtp-bf16-attention-output qualification requires the admitted snapshot path",
+                    )?
                     .to_os_string()],
             ),
             Self::MtpBf16Qkv => qualify_mtp_bf16_qkv(
@@ -445,15 +465,21 @@ impl OptimizationSuite {
         };
         use PerformanceSuite::{
             AttentionOutput, AttentionQkPrepare, Fp8Down, Fp8GdnInput, Fp8LmHead, Fp8Qkv,
-            Fp8SwiGlu, GdnOutput, GdnPrepare, GdnRecurrence, LongContextPagedGqa, MtpBf16Fusion,
-            MtpBf16PagedGqa, MtpBf16QkPrepare, MtpBf16Qkv, Nvfp4Down, Nvfp4SwiGlu, PagedGqa,
-            ResidualNorm,
+            Fp8SwiGlu, GdnOutput, GdnPrepare, GdnRecurrence, LongContextPagedGqa,
+            MtpBf16AttentionOutput, MtpBf16Fusion, MtpBf16PagedGqa, MtpBf16QkPrepare, MtpBf16Qkv,
+            Nvfp4Down, Nvfp4SwiGlu, PagedGqa, ResidualNorm,
         };
 
         let downstream = match self {
             Self::ResidentModel | Self::ResidentPrefill | Self::ResidentLongContextModel => &[][..],
             Self::Leaf(LongContextPagedGqa) => &[ResidentLongContextModel],
-            Self::Leaf(MtpBf16Fusion | MtpBf16Qkv | MtpBf16QkPrepare | MtpBf16PagedGqa) => &[],
+            Self::Leaf(
+                MtpBf16Fusion
+                | MtpBf16Qkv
+                | MtpBf16QkPrepare
+                | MtpBf16PagedGqa
+                | MtpBf16AttentionOutput,
+            ) => &[],
             Self::Leaf(Nvfp4SwiGlu | Nvfp4Down) | Self::Nvfp4Mlp => &[
                 Nvfp4Mlp,
                 ResidentModel,
@@ -566,6 +592,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("qualify-attention-output") if remaining.is_empty() => qualify_attention_output(root),
         Some("qualify-mtp-bf16-fusion") => qualify_mtp_bf16_fusion(root, &remaining),
+        Some("qualify-mtp-bf16-attention-output") => {
+            qualify_mtp_bf16_attention_output(root, &remaining)
+        }
         Some("qualify-mtp-bf16-qkv") => qualify_mtp_bf16_qkv(root, &remaining),
         Some("qualify-mtp-bf16-qk-prepare") => qualify_mtp_bf16_qk_prepare(root, &remaining),
         Some("qualify-mtp-bf16-paged-gqa") if remaining.is_empty() => {
@@ -613,6 +642,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-long-context-paged-gqa") => bench_long_context_paged_gqa(root, &remaining),
         Some("bench-attention-output") => bench_attention_output(root, &remaining),
         Some("bench-mtp-bf16-fusion") => bench_mtp_bf16_fusion(root, &remaining),
+        Some("bench-mtp-bf16-attention-output") => {
+            bench_mtp_bf16_attention_output(root, &remaining)
+        }
         Some("bench-mtp-bf16-qkv") => bench_mtp_bf16_qkv(root, &remaining),
         Some("bench-mtp-bf16-qk-prepare") => bench_mtp_bf16_qk_prepare(root, &remaining),
         Some("bench-mtp-bf16-paged-gqa") => bench_mtp_bf16_paged_gqa(root, &remaining),
@@ -661,6 +693,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("gate-attention-output") if remaining.is_empty() => gate_attention_output(root),
         Some("gate-mtp-bf16-fusion") if remaining.is_empty() => gate_mtp_bf16_fusion(root),
+        Some("gate-mtp-bf16-attention-output") if remaining.is_empty() => {
+            gate_mtp_bf16_attention_output(root)
+        }
         Some("gate-mtp-bf16-qkv") if remaining.is_empty() => gate_mtp_bf16_qkv(root),
         Some("gate-mtp-bf16-qk-prepare") if remaining.is_empty() => gate_mtp_bf16_qk_prepare(root),
         Some("gate-mtp-bf16-paged-gqa") if remaining.is_empty() => gate_mtp_bf16_paged_gqa(root),
@@ -695,6 +730,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-long-context-paged-gqa"
                     | "qualify-attention-output"
                     | "qualify-mtp-bf16-fusion"
+                    | "qualify-mtp-bf16-attention-output"
                     | "qualify-mtp-bf16-qkv"
                     | "qualify-mtp-bf16-qk-prepare"
                     | "qualify-mtp-bf16-paged-gqa"
@@ -717,6 +753,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "gate-qwen35-paged-gqa"
                     | "gate-long-context-paged-gqa"
                     | "gate-mtp-bf16-fusion"
+                    | "gate-mtp-bf16-attention-output"
                     | "gate-mtp-bf16-qkv"
                     | "gate-mtp-bf16-qk-prepare"
                     | "gate-mtp-bf16-paged-gqa"
@@ -914,6 +951,7 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_long_context_paged_gqa(root)?;
     gate_attention_output(root)?;
     gate_mtp_bf16_fusion(root)?;
+    gate_mtp_bf16_attention_output(root)?;
     gate_mtp_bf16_qkv(root)?;
     gate_mtp_bf16_qk_prepare(root)?;
     gate_mtp_bf16_paged_gqa(root)
@@ -1704,6 +1742,41 @@ fn qualify_mtp_bf16_fusion(
     )?;
     gate_residual_norm(root)?;
     gate_mtp_bf16_fusion(root)
+}
+
+fn qualify_mtp_bf16_attention_output(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err(
+            "usage: cargo run -p xtask -- qualify-mtp-bf16-attention-output SNAPSHOT".into(),
+        );
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "mtp_bf16_attention_output_suite_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_mtp_bf16_attention_output(root)
 }
 
 fn qualify_mtp_bf16_qkv(
@@ -2507,6 +2580,13 @@ fn bench_mtp_bf16_fusion(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     bench_suite(root, PerformanceSuite::MtpBf16Fusion, arguments)
+}
+
+fn bench_mtp_bf16_attention_output(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    bench_suite(root, PerformanceSuite::MtpBf16AttentionOutput, arguments)
 }
 
 fn bench_mtp_bf16_qkv(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
@@ -7012,6 +7092,115 @@ fn gate_mtp_bf16_fusion(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn gate_mtp_bf16_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(MTP_BF16_ATTENTION_OUTPUT_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+    let ptx = fs::read_to_string(root.join(PTX))?;
+    let entries = parse_entries(&ptx);
+    let gates = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("mtp_bf16_attention_gate_TID_"))
+        .collect::<Vec<_>>();
+    let projections = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("mtp_bf16_attention_output_TID_"))
+        .collect::<Vec<_>>();
+    require_count("MTP BF16 attention gate", gates.len(), 8)?;
+    require_count("MTP BF16 attention-output projection", projections.len(), 8)?;
+    for entry in &gates {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        for instruction in ["ex2.approx.f32", "rcp.rn.f32", "st.global.b16"] {
+            if !entry.body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` PTX", entry.name).into(),
+                );
+            }
+        }
+    }
+    for entry in &projections {
+        if !entry.body.contains(".reqntid 128, 1, 1") || !entry.body.contains(".minnctapersm 4") {
+            return Err(format!(
+                "entry `{}` lost its 128-thread/four-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        for instruction in [
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32",
+            "cvt.rn.bf16x2.f32",
+        ] {
+            if !entry.body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` PTX", entry.name).into(),
+                );
+            }
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    let mut gate_registers = Vec::new();
+    let mut gate_shared = Vec::new();
+    for entry in gates {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        for instruction in ["MUFU.EX2", "MUFU.RCP", "STG.E.U16"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+        gate_registers.push(resource.registers);
+        gate_shared.push(resource.shared);
+    }
+    gate_registers.sort_unstable();
+    require_registers(&baseline, "gate_registers", &gate_registers)?;
+    require_uniform_value(&baseline, "gate_shared_bytes", &gate_shared)?;
+
+    let mut projection_registers = Vec::new();
+    let mut projection_shared = Vec::new();
+    for entry in projections {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        for instruction in ["HMMA.16816.F32.BF16", "F2FP.BF16.F32.PACK_AB"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+        projection_registers.push(resource.registers);
+        projection_shared.push(resource.shared);
+    }
+    projection_registers.sort_unstable();
+    require_registers(&baseline, "projection_registers", &projection_registers)?;
+    require_uniform_value(&baseline, "projection_shared_bytes", &projection_shared)?;
+
+    println!(
+        "MTP BF16 attention-output gate passed: 8 gate + 8 projection entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}, EX2/BF16 HMMA/pack present",
+        gate_registers, projection_registers, gate_shared, projection_shared
+    );
+    Ok(())
+}
+
 fn gate_mtp_bf16_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(
         root.join(MTP_BF16_QKV_RESOURCE_BASELINE),
@@ -8044,6 +8233,7 @@ mod tests {
                 "mtp-bf16-qkv",
                 "mtp-bf16-qk-prepare",
                 "mtp-bf16-paged-gqa",
+                "mtp-bf16-attention-output",
             ]
         );
         for suite in PERFORMANCE_SUITES {
@@ -8083,6 +8273,7 @@ mod tests {
                 "qual/baselines/long-context-paged-gqa-sm120.txt",
                 "qual/baselines/attention-output-sm120.txt",
                 "qual/baselines/mtp-bf16-fusion-sm120.txt",
+                "qual/baselines/mtp-bf16-attention-output-sm120.txt",
                 "qual/baselines/mtp-bf16-qkv-sm120.txt",
                 "qual/baselines/mtp-bf16-qk-prepare-sm120.txt",
                 "qual/baselines/mtp-bf16-paged-gqa-sm120.txt",
