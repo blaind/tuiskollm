@@ -130,9 +130,15 @@ and 630,784 inactive-sentinel comparisons with immutable sources, stable address
 post-warmup growth. Its eight quantizers retain 25 registers, the eight projections retain sorted
 register counts `[31,32,35,38,38,40,44,45]`, and every entry uses zero stack/local memory. At a
 diagnostic 2,167 MHz median SM clock, its unblessed warm repeated path
-measures 8.064/21.350 us at B=1/8; the production graph boundary measures 10.240/22.544 us. Q/K
-normalization and RoPE, BF16 cache ownership, attention, gated output, and the full layer owner
-remain separate qualification slices.
+measures 8.064/21.350 us at B=1/8; the production graph boundary measures 10.240/22.544 us. The
+following BF16 Q/K seam reuses the exact width-256 normalization and 64-wide `[11,11,10]`
+interleaved MRoPE arithmetic already qualified for Qwen3.5, but owns separate Qwen3.6 symbols and
+the narrower two-KV-head page layout. Its eight routes pass 147,456 prepared-query values, 36,864
+exact BF16 cache values, complete eager/graph agreement, untouched pages, immutable inputs, stable
+addresses, and zero post-warmup growth in a 2,380,288-byte arena. At a diagnostic locked 2,197 MHz
+SM clock, its warm repeated path measures 2.825/3.141 us at B=1/8; the 4.104-us graph boundary is
+dispatch-limited throughout this small leaf. Paged attention, gated output, and the full layer
+owner remain separate qualification slices.
 
 ## Implementation order
 

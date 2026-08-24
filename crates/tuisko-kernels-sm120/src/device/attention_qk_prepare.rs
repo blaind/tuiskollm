@@ -205,7 +205,7 @@ pub(crate) unsafe fn attention_qk_prepare<A: Arch, const TOKENS: usize>(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn qwen35_attention_qk_prepare<A: Arch, const TOKENS: usize>(
+pub(crate) unsafe fn bf16_attention_qk_prepare<A: Arch, const TOKENS: usize>(
     qkv: *const u16,
     query_norm: *const u16,
     key_norm: *const u16,

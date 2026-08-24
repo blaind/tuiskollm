@@ -2,6 +2,7 @@ use crate::attention::{
     attention_output_ptx_names, attention_qk_prepare_ptx_names, long_context_paged_gqa_ptx_names,
     paged_gqa_ptx_names, qwen35_attention_qk_prepare_ptx_names,
     qwen35_nvfp4_attention_output_ptx_names, qwen35_paged_gqa_ptx_names,
+    qwen36_attention_qk_prepare_ptx_names,
 };
 use crate::bf16_lm_head::qwen35_bf16_lm_head_ptx_names;
 use crate::fp8::gdn_output_ptx_names;
@@ -13,6 +14,7 @@ use crate::gdn::{
     gdn_prepare_ptx_names, gdn_recurrence_ptx_names, gdn_state_snapshot_ptx_name,
     qwen35_gdn_prepare_ptx_names, qwen35_gdn_recurrence_ptx_names,
 };
+use crate::moe::{qwen36_moe_experts_ptx_names, qwen36_moe_router_ptx_names};
 use crate::mtp_bf16_attention_output::mtp_bf16_attention_output_ptx_names;
 use crate::mtp_bf16_fusion::{mtp_bf16_fusion_prefill_ptx_names, mtp_bf16_fusion_ptx_names};
 use crate::mtp_bf16_mlp::mtp_bf16_mlp_ptx_names;
@@ -21,7 +23,6 @@ use crate::mtp_bf16_qk_prepare::{
     mtp_bf16_qk_prepare_prefill_ptx_names, mtp_bf16_qk_prepare_ptx_names,
 };
 use crate::mtp_bf16_qkv::{mtp_bf16_qkv_prefill_ptx_names, mtp_bf16_qkv_ptx_names};
-use crate::moe::{qwen36_moe_experts_ptx_names, qwen36_moe_router_ptx_names};
 use crate::nvfp4_down::{nvfp4_down_ptx_names, qwen35_nvfp4_down_ptx_names};
 use crate::nvfp4_gdn_input::qwen35_nvfp4_gdn_input_ptx_names;
 use crate::nvfp4_qkv::qwen35_nvfp4_qkv_ptx_names;
@@ -41,6 +42,7 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .chain(qwen36_residual_norm_ptx_names())
         .chain(attention_qk_prepare_ptx_names())
         .chain(qwen35_attention_qk_prepare_ptx_names())
+        .chain(qwen36_attention_qk_prepare_ptx_names())
         .chain(paged_gqa_ptx_names())
         .chain(qwen35_paged_gqa_ptx_names())
         .chain(qwen35_nvfp4_attention_output_ptx_names())
@@ -91,7 +93,7 @@ mod tests {
         let names = kernel_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 518);
+        assert_eq!(names.len(), 526);
         assert_eq!(unique.len(), names.len());
     }
 }

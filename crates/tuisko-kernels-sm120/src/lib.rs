@@ -7,13 +7,13 @@ mod device;
 mod fp8;
 mod gdn;
 mod inventory;
+mod moe;
 mod mtp_bf16_attention_output;
 mod mtp_bf16_fusion;
 mod mtp_bf16_mlp;
 mod mtp_bf16_paged_gqa;
 mod mtp_bf16_qk_prepare;
 mod mtp_bf16_qkv;
-mod moe;
 mod nvfp4_down;
 mod nvfp4_gdn_input;
 mod nvfp4_qkv;
@@ -32,7 +32,7 @@ pub use attention::{
     PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES, PAGED_GQA_PREFILL_MACRO_TOKENS,
     PAGED_GQA_PREFILL_MAX_CONTEXT, PAGED_GQA_PREFILL_PARTIAL_BYTES, PagedGqaOp,
     Qwen35AttentionQkPrepareOp, Qwen35Nvfp4AttentionOutputOp, Qwen35Nvfp4GdnOutputOp,
-    Qwen35PagedGqaOp, paged_gqa_prefill_partitions,
+    Qwen35PagedGqaOp, Qwen36AttentionQkPrepareOp, paged_gqa_prefill_partitions,
 };
 pub use bf16_lm_head::Qwen35Bf16LmHeadOp;
 pub use fp8::{
@@ -40,17 +40,17 @@ pub use fp8::{
     FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp, LmHeadOp,
 };
 pub use gdn::{
-    GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp, Qwen35GdnPrepareOp,
-    Qwen35GdnRecurrenceOp, Qwen36GdnPrepareOp, Qwen36GdnRecurrenceOp,
+    GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp, Qwen35GdnPrepareOp, Qwen35GdnRecurrenceOp,
+    Qwen36GdnPrepareOp, Qwen36GdnRecurrenceOp,
 };
 pub use inventory::kernel_ptx_names;
+pub use moe::{Qwen36MoeExpertsOp, Qwen36MoeRouterOp};
 pub use mtp_bf16_attention_output::MtpBf16AttentionOutputOp;
 pub use mtp_bf16_fusion::MtpBf16FusionOp;
 pub use mtp_bf16_mlp::MtpBf16MlpOp;
 pub use mtp_bf16_paged_gqa::MtpBf16PagedGqaOp;
 pub use mtp_bf16_qk_prepare::MtpBf16QkPrepareOp;
 pub use mtp_bf16_qkv::MtpBf16QkvOp;
-pub use moe::{Qwen36MoeExpertsOp, Qwen36MoeRouterOp};
 pub use nvfp4_down::{Nvfp4DownOp, Qwen35Nvfp4DownOp};
 pub use nvfp4_gdn_input::Qwen35Nvfp4GdnInputOp;
 pub use nvfp4_qkv::Qwen35Nvfp4QkvOp;
