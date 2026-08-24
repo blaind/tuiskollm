@@ -19,10 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::{
-    Receiver, Sender, UnboundedSender, channel, error::TryRecvError, error::TrySendError,
-    unbounded_channel,
-};
+use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
 use tokio::sync::oneshot;
 use tuisko_engine::{
     MAX_BATCH, ResidentBatchGenerator, ResidentLoadPhase, ResidentLoadProgress, ResidentRequestId,
@@ -31,6 +28,9 @@ use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
 const REQUEST_BODY_LIMIT: usize = 2 * 1024 * 1024;
 const DEFAULT_SEED_SCRAMBLE: u64 = 0x9e37_79b9_7f4a_7c15;
+// Bounded so the single-threaded worker never blocks on a stalled client; a full
+// lane is treated exactly like a disconnected one.
+const GENERATION_REPLY_BUFFER: usize = 32;
 
 /// Startup configuration for the one exact resident server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,7 +67,7 @@ struct AppState {
 
 struct Job {
     request: tuisko_engine::ChatGenerationRequest,
-    reply: UnboundedSender<GenerationReply>,
+    reply: Sender<GenerationReply>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -299,13 +299,17 @@ fn engine_worker(
         for event in events.iter() {
             if let Some(reply) = replies.get(&event.request_id)
                 && let Some(delta) = &event.step.delta
+                && reply
+                    .try_send(GenerationReply::Delta(delta.clone()))
+                    .is_err()
             {
-                let _ = reply.send(GenerationReply::Delta(delta.clone()));
+                // Full or closed: drop the lane so the next cancel pass reaps the request.
+                replies.remove(&event.request_id);
             }
             if let Some(output) = &event.completed
                 && let Some(reply) = replies.remove(&event.request_id)
             {
-                let _ = reply.send(GenerationReply::Done(output.clone()));
+                let _ = reply.try_send(GenerationReply::Done(output.clone()));
             }
         }
     }
@@ -455,7 +459,7 @@ fn mebibytes(bytes: usize) -> f64 {
 
 fn admit_job(
     generator: &mut ResidentBatchGenerator,
-    replies: &mut HashMap<ResidentRequestId, UnboundedSender<GenerationReply>>,
+    replies: &mut HashMap<ResidentRequestId, Sender<GenerationReply>>,
     job: Job,
 ) {
     if job.reply.is_closed() {
@@ -464,25 +468,27 @@ fn admit_job(
     match generator.admit(&job.request) {
         Ok(admission) => {
             if let Some(output) = admission.completed {
-                let _ = job.reply.send(GenerationReply::Done(output));
+                let _ = job.reply.try_send(GenerationReply::Done(output));
             } else {
                 let previous = replies.insert(admission.request_id, job.reply);
                 debug_assert!(previous.is_none(), "resident request identities are unique");
             }
         }
         Err(error) => {
-            let _ = job.reply.send(GenerationReply::Rejected(error.to_string()));
+            let _ = job
+                .reply
+                .try_send(GenerationReply::Rejected(error.to_string()));
         }
     }
 }
 
 fn cancel_disconnected(
     generator: &mut ResidentBatchGenerator,
-    replies: &mut HashMap<ResidentRequestId, UnboundedSender<GenerationReply>>,
+    replies: &mut HashMap<ResidentRequestId, Sender<GenerationReply>>,
 ) -> Result<(), String> {
     let cancelled = generator
         .active_request_ids()
-        .filter(|request| replies.get(request).is_none_or(UnboundedSender::is_closed))
+        .filter(|request| replies.get(request).is_none_or(Sender::is_closed))
         .collect::<Vec<_>>();
     for request in cancelled {
         replies.remove(&request);
@@ -493,12 +499,9 @@ fn cancel_disconnected(
     Ok(())
 }
 
-fn fail_all(
-    replies: &mut HashMap<ResidentRequestId, UnboundedSender<GenerationReply>>,
-    message: String,
-) {
+fn fail_all(replies: &mut HashMap<ResidentRequestId, Sender<GenerationReply>>, message: String) {
     for (_, reply) in replies.drain() {
-        let _ = reply.send(GenerationReply::Failed(message.clone()));
+        let _ = reply.try_send(GenerationReply::Failed(message.clone()));
     }
 }
 
@@ -568,7 +571,7 @@ async fn chat_completions(
             );
         }
     };
-    let (reply_tx, mut reply_rx) = unbounded_channel();
+    let (reply_tx, mut reply_rx) = channel(GENERATION_REPLY_BUFFER);
     if let Err(error) = enqueue_job(
         &state.jobs,
         Job {
@@ -650,7 +653,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::time::Duration;
     use tokio::runtime::Builder;
-    use tokio::sync::mpsc::{channel, unbounded_channel};
+    use tokio::sync::mpsc::channel;
     use tuisko_engine::ChatGenerationRequest;
     use tuisko_frontend::ChatMessage;
 
@@ -658,8 +661,8 @@ mod tests {
         Builder::new_current_thread().enable_all().build().unwrap()
     }
 
-    fn job() -> (Job, tokio::sync::mpsc::UnboundedReceiver<GenerationReply>) {
-        let (reply, receiver) = unbounded_channel();
+    fn job() -> (Job, tokio::sync::mpsc::Receiver<GenerationReply>) {
+        let (reply, receiver) = channel(8);
         (
             Job {
                 request: ChatGenerationRequest::new(vec![ChatMessage::new("user", "hello")]),
@@ -826,7 +829,7 @@ mod tests {
             assert_eq!(queued.request.max_new_tokens, 7);
             queued
                 .reply
-                .send(GenerationReply::Failed("fixture failure".into()))
+                .try_send(GenerationReply::Failed("fixture failure".into()))
                 .unwrap();
             let response = handler.await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -856,7 +859,7 @@ mod tests {
             let queued = receiver.recv().await.unwrap();
             queued
                 .reply
-                .send(GenerationReply::Rejected(
+                .try_send(GenerationReply::Rejected(
                     "prompt exceeds the resident context".into(),
                 ))
                 .unwrap();
