@@ -85,6 +85,10 @@ top eight, renormalization over those eight probabilities, routed expert output,
 `sigmoid(shared_expert_gate) * shared_expert_output`. Ties and the eight-expert accumulation order
 must be explicitly pinned rather than inherited from an unstable library primitive.
 
+The current partial slice admits the complete source inventory and lossless expert materialization,
+then qualifies BF16 router logits and normalized top-eight selection at every exact `B=1..8`.
+Routed/shared expert execution, composed layers, and model inference remain unimplemented.
+
 ## Implementation order
 
 1. Add the pinned architecture profile and validate both `config.json` and
