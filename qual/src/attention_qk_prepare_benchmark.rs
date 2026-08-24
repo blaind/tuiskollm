@@ -22,7 +22,9 @@ use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 const MAX_BATCH: usize = 8;
 const MAX_TOKENS: usize = 1_024;
 const ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
-const BF16_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
+const BF16_DECODE_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
+const QWEN36_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
+const QWEN36_MAX_TOKENS: usize = 128;
 const ALIGNMENT: usize = 256;
 const PHYSICAL_PAGES: usize = 16;
 const TABLE_ROWS: usize = 8;
@@ -177,7 +179,7 @@ impl_bench_op!(AttentionQkPrepareOp, Qwen38_27B, &ROUTES, MAX_TOKENS);
 
 impl BenchQkPrepareOp for Qwen35AttentionQkPrepareOp {
     type Target = Qwen35_9B;
-    const ROUTES: &'static [usize] = &BF16_ROUTES;
+    const ROUTES: &'static [usize] = &BF16_DECODE_ROUTES;
     const MAX_TOKENS: usize = MAX_BATCH;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const WORKLOAD_MTP: bool = false;
@@ -212,8 +214,8 @@ impl BenchQkPrepareOp for Qwen35AttentionQkPrepareOp {
 
 impl BenchQkPrepareOp for Qwen36AttentionQkPrepareOp {
     type Target = Qwen36Moe35B;
-    const ROUTES: &'static [usize] = &BF16_ROUTES;
-    const MAX_TOKENS: usize = MAX_BATCH;
+    const ROUTES: &'static [usize] = &QWEN36_ROUTES;
+    const MAX_TOKENS: usize = QWEN36_MAX_TOKENS;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const WORKLOAD_MTP: bool = false;
 
@@ -222,6 +224,17 @@ impl BenchQkPrepareOp for Qwen36AttentionQkPrepareOp {
     }
 
     fn launch(&self, stream: &CudaStream, addresses: &Addresses, batch: usize) -> GpuResult<()> {
+        let (table_rows, cache_positions) = if batch <= MAX_BATCH {
+            (
+                addresses.decode_table_rows,
+                addresses.decode_cache_positions,
+            )
+        } else {
+            (
+                addresses.prefill_table_rows,
+                addresses.prefill_cache_positions,
+            )
+        };
         // SAFETY: the arena reserves aligned BF16 cache planes and owns every
         // pointer through completion of the captured graph.
         unsafe {
@@ -234,9 +247,9 @@ impl BenchQkPrepareOp for Qwen36AttentionQkPrepareOp {
                 addresses.rope_cos,
                 addresses.rope_sin,
                 addresses.block_tables,
-                addresses.decode_table_rows,
+                table_rows,
                 TABLE_STRIDE,
-                addresses.decode_cache_positions,
+                cache_positions,
                 addresses.query,
                 addresses.key_pages.cast(),
                 addresses.value_pages.cast(),
@@ -247,7 +260,7 @@ impl BenchQkPrepareOp for Qwen36AttentionQkPrepareOp {
 
 impl BenchQkPrepareOp for MtpBf16QkPrepareOp {
     type Target = Qwen38_27B;
-    const ROUTES: &'static [usize] = &BF16_ROUTES;
+    const ROUTES: &'static [usize] = &BF16_DECODE_ROUTES;
     const MAX_TOKENS: usize = MAX_BATCH;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const WORKLOAD_MTP: bool = true;
@@ -542,6 +555,7 @@ struct BenchmarkLabels {
     cache: &'static str,
     cache_description: &'static str,
     workspace: &'static str,
+    workspace_description: &'static str,
     padding: &'static str,
 }
 
@@ -552,6 +566,7 @@ const QWEN38_LABELS: BenchmarkLabels = BenchmarkLabels {
     cache: "attention_qk_prepare/kv_cache",
     cache_description: "16 physical pages, four KV heads, 64 positions, E4M3 K/V",
     workspace: "attention_qk_prepare/address_stable_workspace",
+    workspace_description: "max_tokens=1024 QKV, rotary, separate compact-decode/contiguous-prefill metadata, and prepared query",
     padding: "attention_qk_prepare/alignment_padding",
 };
 
@@ -562,6 +577,7 @@ const QWEN35_LABELS: BenchmarkLabels = BenchmarkLabels {
     cache: "qwen35_attention_qk_prepare/kv_cache",
     cache_description: "16 physical pages, four KV heads, 64 positions, BF16 K/V",
     workspace: "qwen35_attention_qk_prepare/address_stable_workspace",
+    workspace_description: "max_tokens=8 QKV, rotary, compact-decode metadata, and prepared query",
     padding: "qwen35_attention_qk_prepare/alignment_padding",
 };
 
@@ -572,6 +588,7 @@ const QWEN36_LABELS: BenchmarkLabels = BenchmarkLabels {
     cache: "qwen36_attention_qk_prepare/kv_cache",
     cache_description: "16 physical pages, two KV heads, 64 positions, BF16 K/V",
     workspace: "qwen36_attention_qk_prepare/address_stable_workspace",
+    workspace_description: "max_tokens=128 QKV, rotary, separate compact-decode/contiguous-prefill metadata, and prepared query",
     padding: "qwen36_attention_qk_prepare/alignment_padding",
 };
 
@@ -582,6 +599,7 @@ const MTP_LABELS: BenchmarkLabels = BenchmarkLabels {
     cache: "qwen3_8/mtp/bf16_qk_prepare/kv_cache",
     cache_description: "16 physical pages, four KV heads, 64 positions, source-native BF16 K/V",
     workspace: "qwen3_8/mtp/bf16_qk_prepare/address_stable_workspace",
+    workspace_description: "max_tokens=8 MTP QKV, rotary, compact-decode metadata, and prepared query",
     padding: "qwen3_8/mtp/bf16_qk_prepare/alignment_padding",
 };
 
@@ -614,7 +632,7 @@ fn benchmark_target<O: BenchQkPrepareOp>(
         labels.workspace,
         BenchmarkMemoryKind::Workspace,
         workspace_bytes,
-        "max_tokens=1024 QKV, rotary, separate compact-decode/contiguous-prefill metadata, and prepared query",
+        labels.workspace_description,
     )?;
     memory.register_owned(
         labels.padding,
@@ -661,7 +679,7 @@ pub fn benchmark_qwen35_attention_qk_prepare(
     benchmark_target::<Qwen35AttentionQkPrepareOp>(options, QWEN35_LABELS)
 }
 
-/// Measures every exact Qwen3.6 attention Q/K preparation batch.
+/// Measures every exact Qwen3.6 attention Q/K decode and prompt route.
 pub fn benchmark_qwen36_attention_qk_prepare(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
@@ -677,7 +695,9 @@ pub fn benchmark_mtp_bf16_qk_prepare(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, MAX_TOKENS, ROUTES, layout, logical_bytes};
+    use super::{
+        MAX_BATCH, MAX_TOKENS, QWEN36_MAX_TOKENS, QWEN36_ROUTES, ROUTES, layout, logical_bytes,
+    };
     use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
     #[test]
@@ -765,17 +785,18 @@ mod tests {
             + 3 * size_of::<u32>()
             + Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>()
             + 2 * Qwen36Moe35B::ATTENTION_KV_ROWS * size_of::<u16>();
-        for batch in 1..=MAX_BATCH {
+        for tokens in QWEN36_ROUTES {
             assert_eq!(
-                logical_bytes::<Qwen36Moe35B>(batch, size_of::<u16>()),
-                batch * per_token
+                logical_bytes::<Qwen36Moe35B>(tokens, size_of::<u16>()),
+                tokens * per_token
             );
         }
 
-        let (layout, regions) = layout::<Qwen36Moe35B>(MAX_BATCH, size_of::<u16>()).unwrap();
-        assert_eq!(layout.byte_len(), 2_380_288);
-        assert_eq!(regions.payload_bytes(), 2_379_392);
-        assert_eq!(layout.byte_len() - regions.payload_bytes(), 896);
+        let (layout, regions) =
+            layout::<Qwen36Moe35B>(QWEN36_MAX_TOKENS, size_of::<u16>()).unwrap();
+        assert_eq!(layout.byte_len(), 6_589_440);
+        assert_eq!(regions.payload_bytes(), 6_588_992);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 448);
         assert_eq!(regions.cache_bytes(), 2_097_152);
     }
 

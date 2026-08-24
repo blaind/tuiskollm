@@ -8861,7 +8861,7 @@ fn gate_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         root,
         ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
         "attention_qk_prepare_exact_TID_",
-        Some("attention_qk_prepare_prefill_exact_TID_"),
+        Some(("attention_qk_prepare_prefill_exact_TID_", 4)),
         "attention Q/K prepare",
         "F2FP.SATFINITE.E4M3.F32.PACK_AB_MERGE_C",
         "E4M3",
@@ -8885,7 +8885,7 @@ fn gate_mtp_bf16_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         root,
         MTP_BF16_QK_PREPARE_RESOURCE_BASELINE,
         "mtp_bf16_qk_prepare_TID_",
-        Some("mtp_bf16_qk_prepare_prefill_TID_"),
+        Some(("mtp_bf16_qk_prepare_prefill_TID_", 4)),
         "MTP BF16 Q/K prepare",
         "F2FP.BF16.F32.PACK_AB",
         "BF16",
@@ -8897,7 +8897,7 @@ fn gate_qwen36_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         root,
         QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
         "qwen36_attention_qk_prepare_exact_TID_",
-        None,
+        Some(("qwen36_attention_qk_prepare_prefill_exact_TID_", 3)),
         "Qwen3.6 attention Q/K prepare",
         "F2FP.BF16.F32.PACK_AB",
         "BF16",
@@ -8908,7 +8908,7 @@ fn gate_attention_qk_prepare_target(
     root: &Path,
     baseline_path: &str,
     entry_prefix: &str,
-    prefill_prefix: Option<&str>,
+    prefill_inventory: Option<(&str, usize)>,
     label: &str,
     cache_instruction: &str,
     cache_label: &str,
@@ -8922,15 +8922,15 @@ fn gate_attention_qk_prepare_target(
         .iter()
         .filter(|entry| entry.name.starts_with(entry_prefix))
         .collect::<Vec<_>>();
-    let prefill = prefill_prefix.map_or_else(Vec::new, |prefix| {
+    let prefill = prefill_inventory.map_or_else(Vec::new, |(prefix, _)| {
         entries
             .iter()
             .filter(|entry| entry.name.starts_with(prefix))
             .collect::<Vec<_>>()
     });
     require_count(label, prepare.len(), 8)?;
-    if prefill_prefix.is_some() {
-        require_count("attention Q/K prefill preparation", prefill.len(), 4)?;
+    if let Some((_, expected)) = prefill_inventory {
+        require_count("attention Q/K prefill preparation", prefill.len(), expected)?;
     }
     for entry in prepare.iter().chain(&prefill) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {

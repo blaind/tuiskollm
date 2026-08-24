@@ -21,7 +21,9 @@ use tuisko_model::{
 const MAX_BATCH: usize = 8;
 const MAX_TOKENS: usize = 1_024;
 const ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
-const BF16_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
+const BF16_DECODE_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
+const QWEN36_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
+const QWEN36_MAX_TOKENS: usize = 128;
 const ALIGNMENT: usize = 256;
 const PHYSICAL_PAGES: usize = 16;
 const TABLE_ROWS: usize = 8;
@@ -259,7 +261,7 @@ impl_qualified_op!(AttentionQkPrepareOp, Qwen38_27B, &ROUTES, MAX_TOKENS);
 
 impl QualifiedQkPrepareOp for Qwen35AttentionQkPrepareOp {
     type Target = Qwen35_9B;
-    const ROUTES: &'static [usize] = &BF16_ROUTES;
+    const ROUTES: &'static [usize] = &BF16_DECODE_ROUTES;
     const MAX_TOKENS: usize = MAX_BATCH;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16Exact;
@@ -313,8 +315,8 @@ impl QualifiedQkPrepareOp for Qwen35AttentionQkPrepareOp {
 
 impl QualifiedQkPrepareOp for Qwen36AttentionQkPrepareOp {
     type Target = Qwen36Moe35B;
-    const ROUTES: &'static [usize] = &BF16_ROUTES;
-    const MAX_TOKENS: usize = MAX_BATCH;
+    const ROUTES: &'static [usize] = &QWEN36_ROUTES;
+    const MAX_TOKENS: usize = QWEN36_MAX_TOKENS;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16Exact;
 
@@ -432,7 +434,8 @@ pub fn qualify_qwen35_attention_qk_prepare()
     qualify_target::<Qwen35AttentionQkPrepareOp>(None)
 }
 
-/// Qualifies Qwen3.6 eager and captured Q/K preparation at exact `B=1..=8`.
+/// Qualifies Qwen3.6 eager and captured Q/K preparation at exact `B=1..=8`
+/// and `T=32,64,128`.
 pub fn qualify_qwen36_attention_qk_prepare()
 -> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
     qualify_target::<Qwen36AttentionQkPrepareOp>(None)
@@ -1133,10 +1136,10 @@ fn verify_replay(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BATCH, MAX_TOKENS, PHYSICAL_PAGES, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, ROUTES,
-        TABLE_ROWS, TABLE_STRIDE, layout, qualify_attention_qk_prepare,
-        qualify_mtp_bf16_qk_prepare, qualify_qwen35_attention_qk_prepare,
-        qualify_qwen36_attention_qk_prepare,
+        MAX_BATCH, MAX_TOKENS, PHYSICAL_PAGES, QWEN36_MAX_TOKENS, QWEN36_ROUTES, Qwen35_9B,
+        Qwen36Moe35B, Qwen38_27B, ROUTES, TABLE_ROWS, TABLE_STRIDE, layout,
+        qualify_attention_qk_prepare, qualify_mtp_bf16_qk_prepare,
+        qualify_qwen35_attention_qk_prepare, qualify_qwen36_attention_qk_prepare,
     };
     use std::{mem::size_of, path::PathBuf};
     use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -1224,10 +1227,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
-    fn qwen36_exact_batches_match_independent_oracles_and_graph_replay()
+    fn qwen36_exact_decode_and_prompt_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), super::AttentionQkPrepareQualificationError> {
         let report = qualify_qwen36_attention_qk_prepare()?;
-        let active_tokens = (1..=MAX_BATCH).sum::<usize>();
+        let active_tokens = QWEN36_ROUTES.iter().sum::<usize>();
         let query_per_token = Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS;
         let cache_elements_per_token = 2 * Qwen36Moe35B::ATTENTION_KV_ROWS;
         let cache_bytes_per_token = cache_elements_per_token * size_of::<u16>();
@@ -1236,8 +1239,14 @@ mod tests {
             * ATTENTION_PAGE_SIZE
             * Qwen36Moe35B::HEAD_DIM
             * size_of::<u16>();
-        let replay_per_route = MAX_BATCH * query_per_token + 2 * plane_bytes;
-        let total_observable = MAX_BATCH * replay_per_route;
+        let replay_per_route = QWEN36_MAX_TOKENS * query_per_token + 2 * plane_bytes;
+        let total_observable = QWEN36_ROUTES.len() * replay_per_route;
+        let immutable_per_check = QWEN36_MAX_TOKENS * Qwen36Moe35B::ATTENTION_QKV_ROWS
+            + 2 * Qwen36Moe35B::HEAD_DIM
+            + 2 * QWEN36_MAX_TOKENS * super::ROTARY_PAIRS
+            + TABLE_ROWS * TABLE_STRIDE
+            + 2 * MAX_BATCH
+            + 2 * QWEN36_MAX_TOKENS;
 
         assert_eq!(report.query_values, active_tokens * query_per_token);
         assert_eq!(
@@ -1248,11 +1257,15 @@ mod tests {
             report.untouched_values,
             total_observable - active_tokens * (query_per_token + cache_bytes_per_token)
         );
+        assert_eq!(
+            report.immutable_input_values,
+            2 * QWEN36_ROUTES.len() * immutable_per_check
+        );
         assert_eq!(report.graph_replay_values, total_observable);
-        let (layout, regions) = layout::<Qwen36Moe35B>(MAX_BATCH, size_of::<u16>())?;
+        let (layout, regions) = layout::<Qwen36Moe35B>(QWEN36_MAX_TOKENS, size_of::<u16>())?;
         assert_eq!(report.arena_bytes, layout.byte_len());
-        assert_eq!(report.arena_bytes - report.padding_bytes, 2_379_392);
-        assert_eq!(regions.payload_bytes(), 2_379_392);
+        assert_eq!(report.arena_bytes - report.padding_bytes, 6_588_992);
+        assert_eq!(regions.payload_bytes(), 6_588_992);
         assert!(report.maximum_query_error <= 0.003);
         Ok(())
     }
