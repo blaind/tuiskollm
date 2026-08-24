@@ -97,8 +97,14 @@ and 76.390 us at B=8. The rise after B=6 coincides with the selected expert work
 the target's cache, so these are leaf diagnostics rather than a cold whole-layer or model claim.
 The 2,048-wide zero-centered RMSNorm and fused residual-publication routes also cover every exact
 `B=1..8`, pass 786,432 oracle/graph/sentinel observations, and measure 1.761/1.858 us plain plus
-1.887/1.948 us fused at B=1/8 with a locked 2,197 MHz SM clock. Composed layers, exact prefill
-expert routes, and model inference remain unimplemented.
+1.887/1.948 us fused at B=1/8 with a locked 2,197 MHz SM clock. The first GDN projection family
+preserves the checkpoint's static FP8 contract: BF16 inputs are quantized with the admitted scalar
+scale, source E4M3 Q/K/V/Z weights retain their two scalar scales, and the 64 BF16 A/B control rows
+remain a separate exact projection. Every `B=1..8` route passes 73,728 exact activation-code,
+444,672 FP64-formula output, 518,400 graph-replay, and 806,400 inactive-sentinel comparisons with
+immutable sources and no post-warmup device growth. Its complete three-node path measures
+12.443/33.309 us at B=1/8 and a locked 2,197 MHz SM clock. These are unblessed leaf diagnostics;
+composed layers, exact prefill expert routes, and model inference remain unimplemented.
 
 ## Implementation order
 

@@ -18,6 +18,7 @@ mod nvfp4_down;
 mod nvfp4_gdn_input;
 mod nvfp4_qkv;
 mod nvfp4_swiglu;
+mod qwen36_gdn_input;
 mod residual_norm;
 
 pub use arch::Sm120Arch;
@@ -52,6 +53,7 @@ pub use nvfp4_down::{Nvfp4DownOp, Qwen35Nvfp4DownOp};
 pub use nvfp4_gdn_input::Qwen35Nvfp4GdnInputOp;
 pub use nvfp4_qkv::Qwen35Nvfp4QkvOp;
 pub use nvfp4_swiglu::{Nvfp4SwiGluOp, Qwen35Nvfp4SwiGluOp};
+pub use qwen36_gdn_input::Qwen36GdnInputOp;
 pub use residual_norm::{Qwen35ResidualNormOp, Qwen36ResidualNormOp, ResidualNormOp};
 
 #[cfg(test)]
