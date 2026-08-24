@@ -8,7 +8,7 @@ use crate::{
 #[cfg(feature = "qualification")]
 use crate::{Sampler, SamplingOptions};
 use std::sync::Arc;
-use tuisko_frontend::TextFrontend;
+use tuisko_frontend::{GenerationDefaults, TextFrontend};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B, Qwen38_27B};
 
@@ -243,6 +243,11 @@ impl ResidentTextGenerator {
         self.program.context()
     }
 
+    /// Checkpoint-admitted sampling defaults.
+    pub const fn generation_defaults(&self) -> GenerationDefaults {
+        self.frontend.generation_defaults()
+    }
+
     #[cfg(feature = "qualification")]
     /// Runs an independently captured raw-token reference case through the production path.
     pub fn qualification_greedy_after_tokens(&mut self, token_ids: &[u32]) -> EngineResult<u32> {
@@ -364,6 +369,11 @@ impl Qwen35ResidentTextGenerator {
         self.program.layout().arena_bytes()
     }
 
+    /// Source-backed decoder and endpoint weights resident on the device.
+    pub const fn resident_weight_bytes(&self) -> usize {
+        self.program.layout().resident_weight_bytes()
+    }
+
     /// Page-locked embedding and logit staging bytes.
     pub fn host_stager_bytes(&self) -> usize {
         self.program.host_stager_bytes() + self.logits.num_bytes()
@@ -377,6 +387,11 @@ impl Qwen35ResidentTextGenerator {
     /// CUDA context shared by the model, stream, graphs, and pinned buffers.
     pub const fn context(&self) -> &Arc<CudaContext> {
         self.program.context()
+    }
+
+    /// Checkpoint-admitted sampling defaults.
+    pub const fn generation_defaults(&self) -> GenerationDefaults {
+        self.frontend.generation_defaults()
     }
 
     #[cfg(feature = "qualification")]
@@ -671,6 +686,11 @@ impl ResidentBatchGenerator {
     /// CUDA context shared by all slots, exact graphs, and pinned buffers.
     pub const fn context(&self) -> &Arc<CudaContext> {
         self.program.context()
+    }
+
+    /// Checkpoint-admitted sampling defaults.
+    pub const fn generation_defaults(&self) -> GenerationDefaults {
+        self.frontend.generation_defaults()
     }
 
     /// Exact loading work used to construct the shared resident program.
@@ -1066,6 +1086,7 @@ const fn next_native_prefill_tile(remaining: usize) -> Option<usize> {
     } else {
         None
     }
+}
 
 fn replay_qwen35_token(
     program: &mut Qwen35ResidentModelProgram,
