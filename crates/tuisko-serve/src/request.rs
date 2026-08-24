@@ -218,6 +218,7 @@ impl ChatCompletionRequest {
             top_p: self.top_p.unwrap_or(0.95),
             top_k: self.top_k.unwrap_or(20),
             seed: self.seed.unwrap_or(default_seed),
+            penalties: Default::default(),
         };
         if sampling.temperature > 2.0 {
             return Err(ChatRequestError::Invalid(

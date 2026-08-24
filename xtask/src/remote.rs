@@ -13,9 +13,9 @@ use crate::gpu_target::{GpuTarget, has_full_kernel_inventory};
 const USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
     <qualify-residual-norm|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
     qualify-nvfp4-mlp|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-long-context-paged-gqa|qualify-attention-output|qualify-mtp-bf16-fusion|qualify-mtp-bf16-qkv|qualify-mtp-bf16-qk-prepare|qualify-mtp-bf16-paged-gqa|qualify-mtp-bf16-attention-output|qualify-mtp-bf16-mlp|qualify-full-attention-layer|qualify-mtp-layer|qualify-target-mtp-verify|qualify-mtp-prompt-prime|qualify-resident-mtp|\
-    qualify-resident-model|qualify-resident-generation|qualify-generation-mtp-greedy|qualify-resident-batch-generation|\
+    qualify-resident-model|qualify-resident-generation|qualify-generation-mtp-greedy|qualify-generation-mtp-sampling|qualify-resident-batch-generation|\
     bench-residual-norm|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-fp8-qkv|bench-fp8-gdn-input|\
-    bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-mtp-bf16-fusion|bench-mtp-bf16-qkv|bench-mtp-bf16-qk-prepare|bench-mtp-bf16-paged-gqa|bench-mtp-bf16-attention-output|bench-mtp-bf16-mlp|bench-full-attention-layer|bench-mtp-layer|bench-target-mtp-verify|bench-mtp-prompt-prime|bench-resident-mtp|bench-generation-mtp-greedy|\
+    bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-mtp-bf16-fusion|bench-mtp-bf16-qkv|bench-mtp-bf16-qk-prepare|bench-mtp-bf16-paged-gqa|bench-mtp-bf16-attention-output|bench-mtp-bf16-mlp|bench-full-attention-layer|bench-mtp-layer|bench-target-mtp-verify|bench-mtp-prompt-prime|bench-resident-mtp|bench-generation-mtp-greedy|bench-generation-mtp-sampling|\
     bench-resident-model|bench-resident-prefill|bench-resident-long-context-model|\
     probe|check|sweep> \
     [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
@@ -61,6 +61,7 @@ impl Qualification {
             "qualify-mtp-prompt-prime" => "mtp_prompt_prime_suite_",
             "qualify-resident-mtp" => "resident_mtp_suite_",
             "qualify-generation-mtp-greedy" => "resident_mtp_generation_suite_",
+            "qualify-generation-mtp-sampling" => "resident_mtp_sampling_suite_",
             "qualify-resident-model" => {
                 "resident_model::tests::source_model_matches_final_oracle_and_exact_graph_replay"
             }
@@ -98,6 +99,7 @@ impl Qualification {
                 "qualify-mtp-prompt-prime" => "mtp-prompt-prime",
                 "qualify-resident-mtp" => "resident-mtp",
                 "qualify-generation-mtp-greedy" => "generation-mtp-greedy",
+                "qualify-generation-mtp-sampling" => "generation-mtp-sampling",
                 "qualify-resident-model" => "resident-model",
                 "qualify-resident-generation" => "resident-generation",
                 "qualify-resident-batch-generation" => "resident-batch-generation",
@@ -118,6 +120,7 @@ impl Qualification {
                     | "qualify-mtp-prompt-prime"
                     | "qualify-resident-mtp"
                     | "qualify-generation-mtp-greedy"
+                    | "qualify-generation-mtp-sampling"
                     | "qualify-resident-model"
                     | "qualify-resident-generation"
                     | "qualify-resident-batch-generation"
@@ -137,6 +140,7 @@ enum Benchmark {
     MtpPromptPrime,
     ResidentMtp,
     GenerationMtpGreedy,
+    GenerationMtpSampling,
     ResidentModel,
     ResidentPrefill,
     ResidentLongContextModel,
@@ -173,6 +177,7 @@ impl Benchmark {
             "bench-mtp-prompt-prime" => Self::MtpPromptPrime,
             "bench-resident-mtp" => Self::ResidentMtp,
             "bench-generation-mtp-greedy" => Self::GenerationMtpGreedy,
+            "bench-generation-mtp-sampling" => Self::GenerationMtpSampling,
             "bench-resident-model" => Self::ResidentModel,
             "bench-resident-prefill" => Self::ResidentPrefill,
             "bench-resident-long-context-model" => Self::ResidentLongContextModel,
@@ -190,6 +195,7 @@ impl Benchmark {
             Self::MtpPromptPrime => "mtp-prompt-prime",
             Self::ResidentMtp => "resident-mtp",
             Self::GenerationMtpGreedy => "generation-mtp-greedy",
+            Self::GenerationMtpSampling => "generation-mtp-sampling",
             Self::ResidentModel => "resident-model",
             Self::ResidentPrefill => "resident-prefill",
             Self::ResidentLongContextModel => "resident-long-context-model",
@@ -206,6 +212,7 @@ impl Benchmark {
                 | Self::MtpPromptPrime
                 | Self::ResidentMtp
                 | Self::GenerationMtpGreedy
+                | Self::GenerationMtpSampling
                 | Self::ResidentModel
                 | Self::ResidentPrefill
                 | Self::ResidentLongContextModel
@@ -320,6 +327,9 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 crate::prepare_remote_resident_mtp_benchmark(root, options.gpu)?
             }
             Benchmark::GenerationMtpGreedy => {
+                crate::prepare_remote_resident_mtp_benchmark(root, options.gpu)?
+            }
+            Benchmark::GenerationMtpSampling => {
                 crate::prepare_remote_resident_mtp_benchmark(root, options.gpu)?
             }
             Benchmark::ResidentModel => {
@@ -577,6 +587,11 @@ mod tests {
         assert_eq!(mtp_generation.name, "generation-mtp-greedy");
         assert_eq!(mtp_generation.filter, "resident_mtp_generation_suite_");
         assert!(mtp_generation.source_snapshot);
+        let mtp_sampling =
+            Qualification::parse("qualify-generation-mtp-sampling").expect("known suite");
+        assert_eq!(mtp_sampling.name, "generation-mtp-sampling");
+        assert_eq!(mtp_sampling.filter, "resident_mtp_sampling_suite_");
+        assert!(mtp_sampling.source_snapshot);
         let generation = Qualification::parse("qualify-resident-generation").expect("known suite");
         assert_eq!(generation.name, "resident-generation");
         assert!(generation.source_snapshot);
@@ -614,6 +629,10 @@ mod tests {
             Benchmark::parse("bench-generation-mtp-greedy").expect("known benchmark");
         assert_eq!(generation_mtp.name(), "generation-mtp-greedy");
         assert!(generation_mtp.source_snapshot());
+        let sampling_mtp =
+            Benchmark::parse("bench-generation-mtp-sampling").expect("known benchmark");
+        assert_eq!(sampling_mtp.name(), "generation-mtp-sampling");
+        assert!(sampling_mtp.source_snapshot());
         assert_eq!(
             Benchmark::parse("bench-attention-qk-prepare")
                 .expect("known benchmark")

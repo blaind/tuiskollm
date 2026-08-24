@@ -219,7 +219,7 @@ fn require_k4(stats: ResidentMtpGreedyStats) -> Result<(), DeviceBenchmarkError>
     Ok(())
 }
 
-fn register_memory(
+pub(crate) fn register_memory(
     memory: &mut MemoryRecorder,
     generator: &ResidentMtpTextGenerator,
 ) -> Result<(), DeviceBenchmarkError> {
