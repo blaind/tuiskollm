@@ -66,9 +66,10 @@ impl Session {
     fn warm(&self, launches: u64) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
             for batch in 1..=MAX_BATCH {
-                self.program
-                    .qualification_graph(batch)?
-                    .launch(&self.stream)?;
+                let graph = self.program.qualification_graph(batch)?;
+                // SAFETY: this Session's program owns the graph and every
+                // allocation it captured, outliving the replay and synchronize.
+                unsafe { graph.launch(&self.stream) }?;
             }
         }
 

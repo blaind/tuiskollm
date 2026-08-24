@@ -753,17 +753,20 @@ fn verify_no_post_warmup_allocation(
     stream: &CudaStream,
 ) -> Result<(), MtpPromptPrimeQualificationError> {
     for rows in ROUTES {
-        program
-            .qualification_graph(MtpPromptPrimeRoute::qualified(rows, SLOT, 0)?)?
-            .launch(stream)?;
+        let graph = program.qualification_graph(MtpPromptPrimeRoute::qualified(rows, SLOT, 0)?)?;
+        // SAFETY: the borrowed program owns the graph and every allocation it
+        // captured, outliving these replays and the synchronize below.
+        unsafe { graph.launch(stream) }?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
         for rows in ROUTES.into_iter().rev() {
-            program
-                .qualification_graph(MtpPromptPrimeRoute::qualified(rows, SLOT, 0)?)?
-                .launch(stream)?;
+            let graph =
+                program.qualification_graph(MtpPromptPrimeRoute::qualified(rows, SLOT, 0)?)?;
+            // SAFETY: the borrowed program owns the graph and every allocation it
+            // captured, outliving these replays and the synchronize below.
+            unsafe { graph.launch(stream) }?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;

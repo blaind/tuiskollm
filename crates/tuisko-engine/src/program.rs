@@ -148,7 +148,10 @@ impl<A: Sm120Arch> TextEndpointProgram<A> {
     /// Replays the immutable graph for one exact batch.
     pub fn replay(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
         require_batch(batch)?;
-        self.graphs[batch - 1].launch(stream)?;
+        // SAFETY: this TextEndpointProgram owns every captured allocation (arena,
+        // pinned embedding stager, op modules) for its whole life and drops the
+        // graphs first.
+        unsafe { self.graphs[batch - 1].launch(stream) }?;
 
         Ok(())
     }

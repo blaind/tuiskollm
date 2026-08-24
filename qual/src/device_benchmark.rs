@@ -774,6 +774,11 @@ impl<'a> RepeatedGraph<'a> {
     }
 }
 
+/// One exact benchmark case borrowing graphs from a session that owns both
+/// the graphs and every allocation they captured (arena, maps, op modules,
+/// program) and declares the graphs first so they drop before the
+/// allocations. A live case borrow therefore proves every captured
+/// allocation outlives any replay enqueued while the borrow is held.
 #[derive(Clone)]
 pub(crate) struct ExactDeviceCase<'a> {
     route: &'static str,
@@ -1325,10 +1330,14 @@ pub(crate) fn measure_cases(
                             host_completion: Duration::ZERO,
                         };
                         for _ in 0..options.launches_per_sample {
-                            preparation.launch(stream)?;
+                            // SAFETY: the live case borrow proves every captured
+                            // allocation outlives these replays (see ExactDeviceCase).
+                            unsafe { preparation.launch(stream) }?;
                             stream.synchronize().map_err(tuisko_gpu::GpuError::from)?;
-                            let operation = timer
-                                .measure_with_host(stream, || case.leaf_graph.launch(stream))?;
+                            // SAFETY: as above via the same live case borrow.
+                            let operation = timer.measure_with_host(stream, || unsafe {
+                                case.leaf_graph.launch(stream)
+                            })?;
                             timing.device += operation.device;
                             timing.host_submit += operation.host_submit;
                             timing.host_completion += operation.host_completion;
@@ -1337,7 +1346,9 @@ pub(crate) fn measure_cases(
                     } else {
                         timer.measure_with_host(stream, || {
                             for _ in 0..options.launches_per_sample {
-                                case.leaf_graph.launch(stream)?;
+                                // SAFETY: the live case borrow proves every captured
+                                // allocation outlives these replays (see ExactDeviceCase).
+                                unsafe { case.leaf_graph.launch(stream) }?;
                             }
 
                             Ok(())
@@ -1359,7 +1370,10 @@ pub(crate) fn measure_cases(
                         .repeated
                         .as_ref()
                         .expect("repeated task requires a repeated graph");
-                    let elapsed = timer.measure(stream, || repeated.graph.launch(stream))?;
+                    // SAFETY: the live case borrow proves every captured
+                    // allocation outlives this replay (see ExactDeviceCase).
+                    let elapsed =
+                        timer.measure(stream, || unsafe { repeated.graph.launch(stream) })?;
                     samples[case_index]
                         .device_path
                         .push(microseconds_per(elapsed, repeated.operations));
@@ -1492,12 +1506,16 @@ fn launch_clock_probe_unit(
     case: &ExactDeviceCase<'_>,
 ) -> Result<(), tuisko_gpu::GpuError> {
     if let Some(repeated) = &case.repeated {
-        repeated.graph.launch(stream)
+        // SAFETY: the live case borrow proves every captured allocation
+        // outlives this replay (see ExactDeviceCase).
+        unsafe { repeated.graph.launch(stream) }
     } else {
         if let Some(preparation) = case.preparation_graph {
-            preparation.launch(stream)?;
+            // SAFETY: as above via the same live case borrow.
+            unsafe { preparation.launch(stream) }?;
         }
-        case.leaf_graph.launch(stream)
+        // SAFETY: as above via the same live case borrow.
+        unsafe { case.leaf_graph.launch(stream) }
     }
 }
 
@@ -1550,9 +1568,12 @@ fn measure_energy(
         let timing = timer.measure_with_host(stream, || {
             for _ in 0..operations {
                 if let Some(preparation) = case.preparation_graph {
-                    preparation.launch(stream)?;
+                    // SAFETY: the live case borrow proves every captured
+                    // allocation outlives these replays (see ExactDeviceCase).
+                    unsafe { preparation.launch(stream) }?;
                 }
-                case.leaf_graph.launch(stream)?;
+                // SAFETY: as above via the same live case borrow.
+                unsafe { case.leaf_graph.launch(stream) }?;
             }
 
             Ok(())

@@ -344,7 +344,10 @@ impl<'a> MtpPromptPrimeProgram<'a> {
 
     /// Replays the immutable handoff-and-prime graph matching the staged route.
     pub fn replay(&self, stream: &CudaStream, route: MtpPromptPrimeRoute) -> EngineResult<()> {
-        self.graph(route.rows)?.launch(stream)?;
+        // SAFETY: this MtpPromptPrimeProgram owns every local captured allocation
+        // (arena, pinned stagers, op modules), borrows the target arenas for
+        // lifetime 'a, and drops the graphs first.
+        unsafe { self.graph(route.rows)?.launch(stream) }?;
         Ok(())
     }
 

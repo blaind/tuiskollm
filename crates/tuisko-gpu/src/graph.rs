@@ -20,6 +20,10 @@ pub struct CudaGraphDefinition {
 /// The first launch pins its stream: every later launch must pass the same
 /// stream, so the shared executable is only ever updated or re-enqueued behind
 /// the launches already ordered on that one stream.
+///
+/// The definitions retain captured device addresses without keeping the
+/// allocations behind them alive; [`CudaGraphVariants::launch`] is `unsafe`
+/// over that obligation.
 pub struct CudaGraphVariants<const N: usize> {
     context: Arc<CudaContext>,
     definitions: [CudaGraphDefinition; N],
@@ -39,7 +43,9 @@ struct SelectedLaunch {
 /// One immutable CUDA Graph and its executable instance.
 ///
 /// Captured operations retain device addresses, so every allocation named by
-/// the recording must outlive this graph and all of its launches.
+/// the recording must outlive this graph and all of its launches. The graph
+/// holds no handle to those allocations; [`CudaGraph::launch`] is `unsafe`
+/// over exactly that obligation.
 pub struct CudaGraph {
     context: Arc<CudaContext>,
     graph: sys::CUgraph,
@@ -64,7 +70,17 @@ impl CudaGraph {
     }
 
     /// Enqueues this immutable graph on a stream from the same CUDA context.
-    pub fn launch(&self, stream: &CudaStream) -> GpuResult<()> {
+    ///
+    /// # Safety
+    ///
+    /// Replay re-issues the captured operations against the raw addresses they
+    /// recorded, and this graph does not keep those allocations alive. The
+    /// caller must guarantee that every allocation the recording captured —
+    /// device arenas, TMA descriptor maps, pinned host staging buffers, and
+    /// loaded module code — is still alive at its captured address when this
+    /// call enqueues the graph, and stays alive and unmoved until `stream`
+    /// completes the replayed work.
+    pub unsafe fn launch(&self, stream: &CudaStream) -> GpuResult<()> {
         if self.context.as_ref() != stream.context().as_ref() {
             return Err(GpuError::context(
                 "CUDA Graph and launch stream belong to different contexts",
@@ -177,7 +193,18 @@ impl<const N: usize> CudaGraphVariants<N> {
     /// rejected otherwise. Pinning keeps all launches of the shared executable ordered on one
     /// stream, so a variant switch only needs to drain that stream before the update, and the
     /// same-stream re-launch path needs no synchronization at all.
-    pub fn launch(&self, stream: &CudaStream, index: usize) -> GpuResult<()> {
+    ///
+    /// # Safety
+    ///
+    /// Replay re-issues the selected definition's captured operations against
+    /// the raw addresses they recorded, and neither the definitions nor the
+    /// shared executable keep those allocations alive. The caller must
+    /// guarantee that every allocation captured by the definition at `index` —
+    /// device arenas, TMA descriptor maps, pinned host staging buffers, and
+    /// loaded module code — is still alive at its captured address when this
+    /// call updates and enqueues the shared executable, and stays alive and
+    /// unmoved until `stream` completes the replayed work.
+    pub unsafe fn launch(&self, stream: &CudaStream, index: usize) -> GpuResult<()> {
         if self.context.as_ref() != stream.context().as_ref() {
             return Err(GpuError::context(
                 "CUDA Graph variants and launch stream belong to different contexts",
@@ -388,8 +415,12 @@ mod tests {
         let values_address = arena.address(values).unwrap();
         let graph = CudaGraph::capture(&stream, || arena.fill(&stream, values, 0x5a)).unwrap();
 
-        graph.launch(&stream).unwrap();
-        graph.launch(&stream).unwrap();
+        // SAFETY: `arena`, the only allocation the recording captured, lives
+        // past the synchronize below.
+        unsafe {
+            graph.launch(&stream).unwrap();
+            graph.launch(&stream).unwrap();
+        }
         stream.synchronize().unwrap();
 
         assert_eq!(arena.base_address(), base_address);
@@ -455,13 +486,19 @@ mod tests {
         assert_eq!(variants.route_count(), 2);
         assert_eq!(variants.executable_count(), 1);
 
-        variants.launch(&stream, 0).unwrap();
-        variants.launch(&stream, 1).unwrap();
-        variants.launch(&stream, 0).unwrap();
+        // SAFETY: `arena`, the only allocation either definition captured,
+        // lives past the final synchronize below.
+        unsafe {
+            variants.launch(&stream, 0).unwrap();
+            variants.launch(&stream, 1).unwrap();
+            variants.launch(&stream, 0).unwrap();
+        }
         stream.synchronize().unwrap();
         let before = device_memory_info(&context).unwrap();
         for index in [1, 0, 1, 1, 0] {
-            variants.launch(&stream, index).unwrap();
+            // SAFETY: `arena`, the only captured allocation, lives past the
+            // synchronize after this loop.
+            unsafe { variants.launch(&stream, index) }.unwrap();
         }
         stream.synchronize().unwrap();
         let after = device_memory_info(&context).unwrap();

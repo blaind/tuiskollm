@@ -235,8 +235,12 @@ fn qualify_target<A: Arch, O: ResidualNormLauncher>(
         stream.synchronize().map_err(GpuError::from)?;
         let graph =
             CudaGraph::capture(&stream, || launch_all(&op, &arena, &stream, regions, batch))?;
-        graph.launch(&stream)?;
-        graph.launch(&stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
         let replay = read_outputs(&arena, &stream, regions)?;
         verify_replay::<A>(batch, &eager, &replay, &mut report)?;
 

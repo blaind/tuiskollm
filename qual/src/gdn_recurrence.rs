@@ -154,12 +154,16 @@ pub fn qualify_gdn_recurrence()
         reset(&arena, &stream, regions, &fixture)?;
         stream.synchronize().map_err(GpuError::from)?;
         let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, rows))?;
-        graph.launch(&stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
         let replay = observe(&arena, &stream, regions)?;
         verify_replay(rows, &fixture, &eager, &replay, &mut report)?;
 
         reset(&arena, &stream, regions, &fixture)?;
-        graph.launch(&stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
         let second_replay = observe(&arena, &stream, regions)?;
         verify_replay(rows, &fixture, &eager, &second_replay, &mut report)?;
 
@@ -187,12 +191,16 @@ pub fn qualify_gdn_recurrence()
         let graph = CudaGraph::capture(&stream, || {
             launch_causal(&op, &arena, &stream, regions, tokens)
         })?;
-        graph.launch(&stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
         let replay = observe(&arena, &stream, regions)?;
         verify_replay(tokens, &fixture, &eager, &replay, &mut report)?;
 
         reset(&arena, &stream, regions, &fixture)?;
-        graph.launch(&stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
         let second_replay = observe(&arena, &stream, regions)?;
         verify_replay(tokens, &fixture, &eager, &second_replay, &mut report)?;
 
@@ -658,13 +666,17 @@ fn verify_no_post_warmup_allocation(
         })?);
     }
     for graph in &graphs {
-        graph.launch(stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(stream) }?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
         for graph in graphs.iter().rev() {
-            graph.launch(stream)?;
+            // SAFETY: every allocation this graph captured is owned by this scope or
+            // its caller and outlives the replays and the synchronize that follows.
+            unsafe { graph.launch(stream) }?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;

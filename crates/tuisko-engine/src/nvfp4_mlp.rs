@@ -212,7 +212,9 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
 
     /// Replays the immutable graph for one exact decode or prefill width.
     pub fn replay(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
-        self.graph(rows)?.launch(stream)?;
+        // SAFETY: this Nvfp4MlpProgram owns every captured allocation (arena,
+        // op modules) for its whole life and drops the graphs first.
+        unsafe { self.graph(rows)?.launch(stream) }?;
 
         Ok(())
     }

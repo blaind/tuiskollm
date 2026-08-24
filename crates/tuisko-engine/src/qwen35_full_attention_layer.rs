@@ -447,7 +447,10 @@ impl Qwen35FullAttentionLayerProgram {
     /// Replays the immutable graph for one exact batch.
     pub fn replay(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
         require_batch(batch)?;
-        self.graphs[batch - 1].launch(stream)?;
+        // SAFETY: this Qwen35FullAttentionLayerProgram owns every captured
+        // allocation (arena, op modules) for its whole life and drops the
+        // graphs first.
+        unsafe { self.graphs[batch - 1].launch(stream) }?;
 
         Ok(())
     }
