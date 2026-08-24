@@ -157,6 +157,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-frontend SNAPSHOT` | Check exact template, tokenizer, streaming, and prefix-cache behavior | terminal |
 | `cargo run -p xtask -- qualify-generation SNAPSHOT` | Check prompt-to-sampling-to-streaming state over exact BF16 logit rows | terminal |
 | `cargo run -p tuisko-server-qual -- http://127.0.0.1:8000` | Check the live exact server's blocking and SSE contracts, greedy concurrency stability at request counts 1 through 8, cancellation, and eight-slot recycling | terminal |
+| `cargo run -p xtask -- qualify-server SNAPSHOT` | Refuse a nonexclusive device, build and launch the production server on private loopback, run the external HTTP suite, stop the child, and require the GPU to return idle | terminal; lifecycle log under `target/server-qualification/` |
 | `cargo run -p xtask -- qualify-residual-norm` | Run the independent numerical and graph-replay oracle | terminal |
 | `cargo run -p xtask -- qualify-qwen35-residual-norm` | Check Qwen3.5 zero-centered RMSNorm and fused residual publication at B=1..8 and T=32/64/128 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-residual-norm` | Check Qwen3.6 zero-centered RMSNorm and fused residual publication at B=1..8 and T=32/64/128 | terminal |
