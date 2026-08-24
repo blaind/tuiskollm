@@ -749,6 +749,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("qualify-qwen35-bf16-lm-head") => qualify_qwen35_bf16_lm_head(root, &remaining),
         Some("qualify-qwen35-text-endpoint") => qualify_qwen35_text_endpoint(root, &remaining),
+        Some("qualify-qwen36-text-endpoint") => qualify_qwen36_text_endpoint(root, &remaining),
         Some("qualify-qwen35-resident-model") => qualify_qwen35_resident_model(root, &remaining),
         Some("qualify-qwen35-generation") => qualify_qwen35_generation(root, &remaining),
         Some("qualify-qwen35-nvfp4-gdn-input") if remaining.is_empty() => {
@@ -1875,6 +1876,40 @@ fn qualify_qwen35_text_endpoint(
     )?;
     gate_qwen35_residual_norm(root)?;
     gate_qwen35_bf16_lm_head(root)
+}
+
+fn qualify_qwen36_text_endpoint(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-qwen36-text-endpoint SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen36_text_endpoint::tests",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_qwen36_residual_norm(root)?;
+    gate_qwen36_nvfp4_lm_head(root)
 }
 
 fn qualify_qwen35_resident_model(
