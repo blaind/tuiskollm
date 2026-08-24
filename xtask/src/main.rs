@@ -230,6 +230,16 @@ const QWEN36_GDN_MOE_LAYER_RESOURCE_BASELINES: &[&str] = &[
     QWEN36_MOE_ROUTER_RESOURCE_BASELINE,
     QWEN36_MOE_EXPERTS_RESOURCE_BASELINE,
 ];
+const QWEN36_FULL_ATTENTION_LAYER_RESOURCE_BASELINES: &[&str] = &[
+    QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE,
+    QWEN36_FP8_QKV_RESOURCE_BASELINE,
+    QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+    QWEN36_PAGED_GQA_RESOURCE_BASELINE,
+    QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINE,
+    QWEN36_GDN_OUTPUT_RESOURCE_BASELINE,
+    QWEN36_MOE_ROUTER_RESOURCE_BASELINE,
+    QWEN36_MOE_EXPERTS_RESOURCE_BASELINE,
+];
 const QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINES: &[&str] = &[
     QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINE,
     QWEN36_GDN_OUTPUT_RESOURCE_BASELINE,
@@ -883,6 +893,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("bench-qwen35-gdn-layer") => bench_qwen35_gdn_layer(root, &remaining),
         Some("bench-qwen36-gdn-moe-layer") => bench_qwen36_gdn_moe_layer(root, &remaining),
+        Some("bench-qwen36-full-attention-layer") => {
+            bench_qwen36_full_attention_layer(root, &remaining)
+        }
         Some("bench-qwen35-text-endpoint") => bench_qwen35_text_endpoint(root, &remaining),
         Some("bench-qwen35-resident-model") => bench_qwen35_resident_model(root, &remaining),
         Some("bench-resident-model") => bench_resident_model(root, &remaining),
@@ -3398,6 +3411,26 @@ fn qualify_qwen36_full_attention_layer(
         ],
         Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
     )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen36_full_attention_layer_benchmark::tests",
+            "--nocapture",
+        ],
+    )?;
     gate_qwen36_residual_norm(root)?;
     gate_qwen36_fp8_qkv(root)?;
     gate_qwen36_attention_qk_prepare(root)?;
@@ -4784,6 +4817,40 @@ fn bench_qwen36_gdn_moe_layer(
     run_visible(
         Command::new(executable)
             .arg("qwen36-gdn-moe-layer")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_qwen36_full_attention_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-qwen36-full-attention-layer SNAPSHOT [options]"
+                .into(),
+        );
+    };
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = Vec::new();
+    for baseline in QWEN36_FULL_ATTENTION_LAYER_RESOURCE_BASELINES {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen36-full-attention-layer")
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
