@@ -2,8 +2,9 @@
 
 TuiskoLLM is an exact-target Rust/SM120 inference server for pinned NVFP4 checkpoints on one NVIDIA
 GeForce RTX 5090. The complete product target is `unsloth/Qwen3.8-27B-NVFP4` at revision
-`16b6615af3548b88e2d8e382457bc705b00479cf`; the initial `AxionML/Qwen3.5-9B-NVFP4` route admits
-revision `97aef92393f126bf649f310cd40861be8dad3279` as a serialized, 192-token text server.
+`16b6615af3548b88e2d8e382457bc705b00479cf`. Initial serialized 192-token text routes also admit
+`AxionML/Qwen3.5-9B-NVFP4` at revision `97aef92393f126bf649f310cd40861be8dad3279` and
+`nvidia/Qwen3.6-35B-A3B-NVFP4` at revision `491c2f1ea524c639598bf8fa787a93fed5a6fbce`.
 
 ## Development
 
@@ -39,6 +40,11 @@ request options that the current product cannot honor.
 Passing the pinned Qwen3.5 snapshot selects its concrete 32-layer resident program and greedy
 checkpoint defaults once at startup. It currently serves one request at a time through its B=1
 short-context graph; compact batching and optimized prefill remain separate qualification work.
+
+Passing the pinned Qwen3.6 snapshot selects its concrete 40-layer GDN/MoE and attention/MoE text
+program. Prompt priming uses the largest exact T=32/64/128 whole-model prefix and B=1 for its tail.
+The initial route remains single-request and 192-token; compact batching, MTP, and Vision are not
+part of this text-support claim.
 
 The optional `tuisko-llm` Python package exposes the admitted tokenizer and chat-template frontend.
 It does not claim an in-process inference API; see [`python/README.md`](python/README.md).
