@@ -1402,6 +1402,25 @@ impl ResidentModelProgram {
                 self.layout.workspace.residual_a,
                 hidden_values,
             )?;
+            self.enqueue_mtp_block_table_handoff(stream, destination, block_tables)?;
+        }
+
+        Ok(())
+    }
+
+    /// Enqueues the current page table without changing an MTP hidden-input plane.
+    ///
+    /// # Safety
+    ///
+    /// The destination arena must remain live until the stream reaches the copy. Captured callers
+    /// must retain both owners at stable addresses through the final replay.
+    pub(crate) unsafe fn enqueue_mtp_block_table_handoff(
+        &self,
+        stream: &CudaStream,
+        destination: &DeviceArena,
+        block_tables: ArenaRegion<u32>,
+    ) -> GpuResult<()> {
+        unsafe {
             destination.copy_prefix_from_arena_async(
                 stream,
                 block_tables,
@@ -1410,7 +1429,6 @@ impl ResidentModelProgram {
                 self.layout.kv_layout.block_tables().len(),
             )?;
         }
-
         Ok(())
     }
 

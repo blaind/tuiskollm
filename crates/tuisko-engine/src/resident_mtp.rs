@@ -95,6 +95,7 @@ impl ResidentMtpRealignRoute {
 struct Graphs {
     prompt: [CudaGraph; PROMPT_ROUTES.len()],
     draft: [CudaGraph; MAX_BATCH],
+    continue_draft: CudaGraph,
     prime: [CudaGraph; REALIGN_ROUTES],
     realign: [CudaGraph; REALIGN_ROUTES],
 }
@@ -670,6 +671,22 @@ impl ResidentMtpProgram {
         Ok(())
     }
 
+    /// Replays the exact single-slot continuation whose hidden input is the prior MTP residual.
+    pub fn replay_continue_draft(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpDraftRoute,
+    ) -> EngineResult<()> {
+        if route.batch != 1 {
+            return Err(EngineError::route(format!(
+                "resident MTP continuation requires B=1, got B={}",
+                route.batch
+            )));
+        }
+        self.graphs.continue_draft.launch(stream)?;
+        Ok(())
+    }
+
     /// Replays one prime-only realignment graph for exact `K=1..4`.
     pub fn replay_prime(
         &self,
@@ -699,6 +716,26 @@ impl ResidentMtpProgram {
         Ok(self
             .arena
             .copy_prefix_to_host(stream, self.layout.regions().logits, values)?)
+    }
+
+    /// Reads active BF16 draft logits into one reusable host allocation.
+    pub fn read_logits_into(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        require_batch(rows)?;
+        let expected = product("resident MTP logit values", rows, Qwen38_27B::VOCAB)?;
+        if destination.len() != expected {
+            return Err(EngineError::layout(format!(
+                "resident MTP logit destination has {} values, expected {expected} for B={rows}",
+                destination.len()
+            )));
+        }
+        self.arena
+            .copy_prefix_to_host_slice(stream, self.layout.regions().logits, destination)?;
+        Ok(())
     }
 
     /// Activates the one shared target/MTP page-table row.
@@ -819,6 +856,10 @@ impl ResidentMtpProgram {
         &self.target
     }
 
+    pub(crate) const fn target_mut(&mut self) -> &mut ResidentModelProgram {
+        &mut self.target
+    }
+
     /// CUDA context shared by target, MTP arenas, operators, and graphs.
     pub const fn context(&self) -> &Arc<CudaContext> {
         &self.context
@@ -869,9 +910,9 @@ impl ResidentMtpProgram {
             + self.rope_sin_stager.num_bytes()
     }
 
-    /// Exact prompt, draft, prime-only, and full-realignment graph inventory.
+    /// Exact prompt, seeded draft, single-lane continuation, prime, and realignment inventory.
     pub const fn graph_count(&self) -> usize {
-        PROMPT_ROUTES.len() + MAX_BATCH + 2 * REALIGN_ROUTES
+        PROMPT_ROUTES.len() + MAX_BATCH + 1 + 2 * REALIGN_ROUTES
     }
 
     /// Checked resident MTP layout.
@@ -916,6 +957,30 @@ impl ResidentMtpProgram {
             self.stagers(),
         )?;
         launch_full(stream, route.batch, self.ops(), self.pointers()?)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Launches the exact single-slot continuation eagerly.
+    pub fn qualification_launch_eager_continue_draft(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpDraftRoute,
+    ) -> EngineResult<()> {
+        if route.batch != 1 {
+            return Err(EngineError::route(format!(
+                "resident MTP continuation requires B=1, got B={}",
+                route.batch
+            )));
+        }
+        launch_continue_upload(
+            stream,
+            &self.target,
+            &self.arena,
+            self.layout.regions(),
+            self.stagers(),
+        )?;
+        launch_full(stream, 1, self.ops(), self.pointers()?)?;
         Ok(())
     }
 
@@ -1359,6 +1424,10 @@ fn capture_graphs(
             launch_full(stream, rows, ops, pointers)
         })?);
     }
+    let continue_draft = CudaGraph::capture(stream, || {
+        launch_continue_upload(stream, target, arena, regions, stagers)?;
+        launch_full(stream, 1, ops, pointers)
+    })?;
     let mut prime = Vec::with_capacity(REALIGN_ROUTES);
     for rows in 1..=REALIGN_ROUTES {
         prime.push(CudaGraph::capture(stream, || {
@@ -1380,6 +1449,7 @@ fn capture_graphs(
         draft: draft
             .try_into()
             .map_err(|_| EngineError::layout("resident MTP draft graph inventory differs"))?,
+        continue_draft,
         prime: prime
             .try_into()
             .map_err(|_| EngineError::layout("resident MTP prime graph inventory differs"))?,
@@ -1443,6 +1513,59 @@ fn launch_upload(
             regions.target_hidden,
             regions.block_tables,
         )?;
+    }
+    Ok(())
+}
+
+fn launch_continue_upload(
+    stream: &CudaStream,
+    target: &ResidentModelProgram,
+    arena: &DeviceArena,
+    regions: ResidentMtpRegions,
+    stagers: Stagers<'_>,
+) -> GpuResult<()> {
+    // One single-slot continuation consumes the prior MTP residual before the full route
+    // overwrites it. Metadata and the current shared target page table remain graph inputs.
+    unsafe {
+        arena.copy_prefix_from_pinned_host_async(
+            stream,
+            regions.embedding,
+            stagers.embedding,
+            Qwen38_27B::HIDDEN,
+        )?;
+        arena.copy_prefix_from_pinned_host_async(
+            stream,
+            regions.table_rows,
+            stagers.table_rows,
+            1,
+        )?;
+        arena.copy_prefix_from_pinned_host_async(
+            stream,
+            regions.cache_positions,
+            stagers.positions,
+            1,
+        )?;
+        arena.copy_prefix_from_pinned_host_async(stream, regions.lengths, stagers.lengths, 1)?;
+        arena.copy_prefix_from_pinned_host_async(
+            stream,
+            regions.rope_cos,
+            stagers.rope_cos,
+            ROTARY_PAIRS,
+        )?;
+        arena.copy_prefix_from_pinned_host_async(
+            stream,
+            regions.rope_sin,
+            stagers.rope_sin,
+            ROTARY_PAIRS,
+        )?;
+        arena.copy_prefix_from_arena_async(
+            stream,
+            regions.target_hidden,
+            arena,
+            regions.residual_output,
+            Qwen38_27B::HIDDEN,
+        )?;
+        target.enqueue_mtp_block_table_handoff(stream, arena, regions.block_tables)?;
     }
     Ok(())
 }

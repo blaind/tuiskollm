@@ -179,6 +179,8 @@ pub enum BenchmarkExecution {
     Eager,
     /// Replay of a captured CUDA Graph.
     CudaGraph,
+    /// Host control over production CUDA graphs through device completion.
+    HostSynchronized,
     /// The complete server boundary.
     Server,
 }
@@ -385,6 +387,42 @@ impl BenchmarkWorkload {
             device_cache: DeviceCacheRegime::Warm,
             prefix_cache: None,
             execution: BenchmarkExecution::CudaGraph,
+        }
+    }
+
+    pub(crate) fn warm_model_mtp_request(
+        prompt_tokens: u64,
+        output_tokens: u64,
+        context_tokens: u64,
+    ) -> Self {
+        Self {
+            scope: BenchmarkScope::Model,
+            phase: BenchmarkPhase::Request,
+            batch_size: Some(1),
+            concurrency: Some(1),
+            active_tokens: Some(output_tokens),
+            prompt_tokens: Some(prompt_tokens),
+            context_tokens: Some(context_tokens),
+            output_tokens: Some(output_tokens),
+            device_cache: DeviceCacheRegime::Warm,
+            prefix_cache: None,
+            execution: BenchmarkExecution::HostSynchronized,
+        }
+    }
+
+    pub(crate) fn warm_model_mtp_round(active_tokens: u64, context_tokens: u64) -> Self {
+        Self {
+            scope: BenchmarkScope::Model,
+            phase: BenchmarkPhase::Mtp,
+            batch_size: Some(1),
+            concurrency: Some(1),
+            active_tokens: Some(active_tokens),
+            prompt_tokens: None,
+            context_tokens: Some(context_tokens),
+            output_tokens: Some(active_tokens),
+            device_cache: DeviceCacheRegime::Warm,
+            prefix_cache: None,
+            execution: BenchmarkExecution::HostSynchronized,
         }
     }
 }
@@ -1596,6 +1634,42 @@ fn metric(
         operations_per_interval,
         logical_bytes_per_operation,
         logical_gib_per_second,
+    })
+}
+
+pub(crate) fn host_completion_metric(
+    route: &'static str,
+    shape: String,
+    workload: BenchmarkWorkload,
+    operations_per_interval: u64,
+    logical_bytes_per_operation: u64,
+    mut samples: Vec<f64>,
+) -> Result<DeviceBenchmarkMetric, DeviceBenchmarkError> {
+    if samples.is_empty()
+        || samples
+            .iter()
+            .any(|sample| !sample.is_finite() || *sample <= 0.0)
+    {
+        return Err(DeviceBenchmarkError::Precondition(format!(
+            "{route} {shape} host_completion produced a non-finite or non-positive timing"
+        )));
+    }
+    samples.sort_by(f64::total_cmp);
+    let percentile = |numerator: usize| {
+        let index = (samples.len() - 1) * numerator / 10;
+        samples[index]
+    };
+    Ok(DeviceBenchmarkMetric {
+        route,
+        shape,
+        workload,
+        measurement: BenchmarkMeasurement::HostCompletion,
+        median_microseconds: percentile(5),
+        p10_microseconds: percentile(1),
+        p90_microseconds: percentile(9),
+        operations_per_interval,
+        logical_bytes_per_operation,
+        logical_gib_per_second: None,
     })
 }
 
