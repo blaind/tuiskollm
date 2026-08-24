@@ -105,11 +105,7 @@ impl GenerationSession {
     /// Renders and tokenizes the prompt and initializes sampling state.
     pub fn start(frontend: &TextFrontend, request: &ChatGenerationRequest) -> EngineResult<Self> {
         let prompt = frontend.encode_chat_with_report(&request.messages, &request.template)?;
-        let stop_ids: [u32; 2] = frontend
-            .stop_ids()
-            .try_into()
-            .map_err(|_| EngineError::generation("frontend returned the wrong stop-ID count"))?;
-        let sampler = Sampler::new(request.sampling, stop_ids)?;
+        let sampler = Sampler::new(request.sampling, frontend.stop_ids())?;
 
         Ok(Self {
             prompt,

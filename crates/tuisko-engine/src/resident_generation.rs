@@ -248,11 +248,7 @@ impl ResidentTextGenerator {
         let native_prefill_tokens = prime_prompt(&mut self.program, &self.stream, token_ids, 0, 0)?;
         self.program
             .read_logits_into(&self.stream, 1, &mut self.logits)?;
-        let stop_ids: [u32; 2] =
-            self.frontend.stop_ids().try_into().map_err(|_| {
-                EngineError::generation("frontend returned the wrong stop-ID count")
-            })?;
-        let mut sampler = Sampler::new(SamplingOptions::greedy(), stop_ids)?;
+        let mut sampler = Sampler::new(SamplingOptions::greedy(), self.frontend.stop_ids())?;
         Ok((
             sampler.sample(&self.logits)?.token_id,
             native_prefill_tokens,

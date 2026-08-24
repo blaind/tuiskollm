@@ -26,12 +26,12 @@ fn sampling(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("engine/sampling");
     group.throughput(Throughput::Elements(Qwen38_27B::VOCAB as u64));
 
-    let mut greedy = Sampler::new(SamplingOptions::greedy(), STOP_IDS).unwrap();
+    let mut greedy = Sampler::new(SamplingOptions::greedy(), &STOP_IDS).unwrap();
     group.bench_function("greedy", |bencher| {
         bencher.iter(|| greedy.sample(black_box(&logits)).unwrap())
     });
 
-    let mut default = Sampler::new(SamplingOptions::default(), STOP_IDS).unwrap();
+    let mut default = Sampler::new(SamplingOptions::default(), &STOP_IDS).unwrap();
     group.bench_function("top-k20-top-p095", |bencher| {
         bencher.iter(|| default.sample(black_box(&logits)).unwrap())
     });

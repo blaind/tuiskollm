@@ -235,18 +235,22 @@ pub struct SampleDecision {
 pub struct Sampler {
     options: SamplingOptions,
     stop_ids: [u32; 2],
+    stop_id_count: usize,
     random: XorShift64,
 }
 
 impl Sampler {
-    /// Validates one request's options and stop-token pair.
-    pub fn new(options: SamplingOptions, stop_ids: [u32; 2]) -> EngineResult<Self> {
+    /// Validates one request's options and one- or two-token stop set.
+    pub fn new(options: SamplingOptions, stop_ids: &[u32]) -> EngineResult<Self> {
         options.validate()?;
         validate_stop_ids(stop_ids)?;
+        let mut copied_stop_ids = [0; 2];
+        copied_stop_ids[..stop_ids.len()].copy_from_slice(stop_ids);
 
         Ok(Self {
             options,
-            stop_ids,
+            stop_ids: copied_stop_ids,
+            stop_id_count: stop_ids.len(),
             random: XorShift64::new(options.seed),
         })
     }
@@ -327,7 +331,7 @@ impl Sampler {
         }
         Ok(SampleDecision {
             token_id,
-            stopped: self.stop_ids.contains(&token_id),
+            stopped: self.stop_ids[..self.stop_id_count].contains(&token_id),
         })
     }
 }
@@ -383,13 +387,18 @@ fn validate_options(options: SamplingOptions) -> EngineResult<()> {
     Ok(())
 }
 
-fn validate_stop_ids(stop_ids: [u32; 2]) -> EngineResult<()> {
-    if stop_ids[0] == stop_ids[1] {
+fn validate_stop_ids(stop_ids: &[u32]) -> EngineResult<()> {
+    if !(1..=2).contains(&stop_ids.len()) {
+        return Err(EngineError::sampling(
+            "generation requires one or two stop-token identifiers",
+        ));
+    }
+    if stop_ids.len() == 2 && stop_ids[0] == stop_ids[1] {
         return Err(EngineError::sampling(
             "generation stop-token identifiers must be distinct",
         ));
     }
-    for token in stop_ids {
+    for &token in stop_ids {
         if usize::try_from(token).map_or(true, |token| token >= VOCABULARY) {
             return Err(EngineError::sampling(format!(
                 "generation stop token {token} is outside vocabulary 0..{VOCABULARY}"
@@ -694,7 +703,7 @@ mod tests {
         let mut row = logits();
         row[17] = bf16(3.0);
         row[STOP_IDS[0] as usize] = bf16(3.0);
-        let mut sampler = Sampler::new(SamplingOptions::greedy(), STOP_IDS).unwrap();
+        let mut sampler = Sampler::new(SamplingOptions::greedy(), &STOP_IDS).unwrap();
 
         assert_eq!(
             sampler.sample(&row).unwrap(),
@@ -704,7 +713,19 @@ mod tests {
             }
         );
 
+        let mut one_stop = Sampler::new(SamplingOptions::greedy(), &STOP_IDS[1..]).unwrap();
+        row[STOP_IDS[0] as usize] = bf16(3.0);
+        row[STOP_IDS[1] as usize] = bf16(4.0);
+        assert_eq!(
+            one_stop.sample(&row).unwrap(),
+            SampleDecision {
+                token_id: STOP_IDS[1],
+                stopped: true,
+            }
+        );
+
         row[STOP_IDS[0] as usize] = bf16(4.0);
+        row[STOP_IDS[1] as usize] = bf16(3.0);
         assert_eq!(
             sampler.sample(&row).unwrap(),
             SampleDecision {
@@ -754,7 +775,7 @@ mod tests {
                     seed,
                     ..SamplingOptions::default()
                 },
-                STOP_IDS,
+                &STOP_IDS,
             )
             .unwrap();
             assert!(matches!(sampler.sample(&row).unwrap().token_id, 3 | 5));
@@ -772,7 +793,7 @@ mod tests {
             seed: 7,
             ..SamplingOptions::default()
         };
-        let mut sampler = Sampler::new(options, STOP_IDS).unwrap();
+        let mut sampler = Sampler::new(options, &STOP_IDS).unwrap();
 
         assert_eq!(sampler.sample(&row).unwrap().token_id, 5);
     }
@@ -792,7 +813,7 @@ mod tests {
                 penalties,
                 ..SamplingOptions::greedy()
             },
-            STOP_IDS,
+            &STOP_IDS,
         )
         .unwrap();
         assert_eq!(
@@ -810,7 +831,7 @@ mod tests {
                 penalties,
                 ..SamplingOptions::default()
             },
-            STOP_IDS,
+            &STOP_IDS,
         )
         .unwrap();
         let law = sampled
@@ -947,11 +968,19 @@ mod tests {
         ];
         for options in bad_options {
             assert_eq!(
-                Sampler::new(options, STOP_IDS).unwrap_err().code(),
+                Sampler::new(options, &STOP_IDS).unwrap_err().code(),
                 Some(EngineErrorCode::Sampling)
             );
         }
         for stop_ids in [[1, 1], [0, Qwen38_27B::VOCAB as u32]] {
+            assert_eq!(
+                Sampler::new(SamplingOptions::default(), &stop_ids)
+                    .unwrap_err()
+                    .code(),
+                Some(EngineErrorCode::Sampling)
+            );
+        }
+        for stop_ids in [&[][..], &[1, 2, 3][..]] {
             assert_eq!(
                 Sampler::new(SamplingOptions::default(), stop_ids)
                     .unwrap_err()
@@ -960,7 +989,7 @@ mod tests {
             );
         }
 
-        let mut sampler = Sampler::new(SamplingOptions::greedy(), STOP_IDS).unwrap();
+        let mut sampler = Sampler::new(SamplingOptions::greedy(), &STOP_IDS).unwrap();
         let short = vec![0; Qwen38_27B::VOCAB - 1];
         assert_eq!(
             sampler.sample(&short).unwrap_err().code(),

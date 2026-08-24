@@ -10,18 +10,20 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
-use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
+use tuisko_model::{CheckpointSnapshot, Qwen35_9B, Qwen38_27B};
 
 pub use error::{FrontendError, FrontendErrorCode, FrontendResult};
 
 const TOKENIZER_FILE: &str = "tokenizer.json";
 const TEMPLATE_FILE: &str = "chat_template.jinja";
 const GENERATION_CONFIG_FILE: &str = "generation_config.json";
-const TOKENIZER_ENTRIES: usize = 248_077;
+const QWEN38_TOKENIZER_ENTRIES: usize = 248_077;
+const QWEN35_TOKENIZER_ENTRIES: usize = 248_070;
 const IM_START_ID: u32 = 248_045;
 const IM_END_ID: u32 = 248_046;
 const END_OF_TEXT_ID: u32 = 248_044;
-const DEFAULT_EOS_IDS: [u32; 2] = [IM_END_ID, END_OF_TEXT_ID];
+const QWEN38_EOS_IDS: [u32; 2] = [IM_END_ID, END_OF_TEXT_ID];
+const QWEN35_EOS_IDS: [u32; 1] = [END_OF_TEXT_ID];
 const DEFAULT_TEMPERATURE: f32 = 1.0;
 const DEFAULT_TOP_P: f32 = 0.95;
 const DEFAULT_TOP_K: usize = 20;
@@ -29,6 +31,28 @@ const PROMPT_BLOCK_START: &str = SPECIAL_TOKEN_LITERALS[0];
 
 /// Literal strings the pinned tokenizer always extracts as control tokens from raw text.
 pub const SPECIAL_TOKEN_LITERALS: [&str; 3] = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"];
+
+#[derive(Clone, Copy)]
+enum FrontendContract {
+    Qwen38,
+    Qwen35,
+}
+
+impl FrontendContract {
+    const fn tokenizer_entries(self) -> usize {
+        match self {
+            Self::Qwen38 => QWEN38_TOKENIZER_ENTRIES,
+            Self::Qwen35 => QWEN35_TOKENIZER_ENTRIES,
+        }
+    }
+
+    const fn eos_ids(self) -> &'static [u32] {
+        match self {
+            Self::Qwen38 => &QWEN38_EOS_IDS,
+            Self::Qwen35 => &QWEN35_EOS_IDS,
+        }
+    }
+}
 
 /// One text message supplied to the checkpoint chat template.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -244,7 +268,7 @@ struct CachedPrefix {
 pub struct TextFrontend {
     decode: Arc<DecodeState>,
     template: String,
-    stop_ids: [u32; 2],
+    stop_ids: Vec<u32>,
     generation_defaults: GenerationDefaults,
     prompt_cache_capacity: usize,
     prompt_cache: Mutex<VecDeque<PromptPrefixEntry>>,
@@ -275,10 +299,27 @@ impl TextFrontend {
         snapshot: &CheckpointSnapshot<Qwen38_27B>,
         options: TextFrontendOptions,
     ) -> FrontendResult<Self> {
-        Self::open_root(snapshot.root(), options)
+        Self::open_root(snapshot.root(), options, FrontendContract::Qwen38)
     }
 
-    fn open_root(root: &Path, options: TextFrontendOptions) -> FrontendResult<Self> {
+    /// Loads and validates the pinned Qwen3.5 tokenizer, template, and generation metadata.
+    pub fn open_qwen35(snapshot: &CheckpointSnapshot<Qwen35_9B>) -> FrontendResult<Self> {
+        Self::open_qwen35_with_options(snapshot, TextFrontendOptions::default())
+    }
+
+    /// Loads the Qwen3.5 frontend with explicit startup options.
+    pub fn open_qwen35_with_options(
+        snapshot: &CheckpointSnapshot<Qwen35_9B>,
+        options: TextFrontendOptions,
+    ) -> FrontendResult<Self> {
+        Self::open_root(snapshot.root(), options, FrontendContract::Qwen35)
+    }
+
+    fn open_root(
+        root: &Path,
+        options: TextFrontendOptions,
+        contract: FrontendContract,
+    ) -> FrontendResult<Self> {
         let tokenizer_path = root.join(TOKENIZER_FILE);
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|source| {
             FrontendError::Tokenizer(format!(
@@ -289,15 +330,15 @@ impl TextFrontend {
         tokenizer
             .with_truncation(None)
             .map_err(|source| FrontendError::Tokenizer(source.to_string()))?;
-        validate_tokenizer(&tokenizer)?;
+        validate_tokenizer(&tokenizer, contract)?;
 
         let template_path = root.join(TEMPLATE_FILE);
         let template = read_string(&template_path)?;
 
         let generation_path = root.join(GENERATION_CONFIG_FILE);
         let generation = read_json(&generation_path)?;
-        let stop_ids = parse_stop_ids(&generation)?;
-        let generation_defaults = parse_generation_defaults(&generation)?;
+        let stop_ids = parse_stop_ids(&generation, contract)?;
+        let generation_defaults = parse_generation_defaults(&generation, contract)?;
         let special_decode_ids = tokenizer
             .get_added_tokens_decoder()
             .iter()
@@ -710,11 +751,12 @@ fn common_prefix_bytes(left: &str, right: &str) -> usize {
     length
 }
 
-fn validate_tokenizer(tokenizer: &Tokenizer) -> FrontendResult<()> {
+fn validate_tokenizer(tokenizer: &Tokenizer, contract: FrontendContract) -> FrontendResult<()> {
     let entries = tokenizer.get_vocab_size(true);
-    if entries != TOKENIZER_ENTRIES {
+    let expected_entries = contract.tokenizer_entries();
+    if entries != expected_entries {
         return Err(FrontendError::Contract(format!(
-            "tokenizer has {entries} entries, expected {TOKENIZER_ENTRIES}"
+            "tokenizer has {entries} entries, expected {expected_entries}"
         )));
     }
 
@@ -753,13 +795,14 @@ fn read_json(path: &Path) -> FrontendResult<Value> {
     })
 }
 
-fn parse_stop_ids(generation: &Value) -> FrontendResult<[u32; 2]> {
-    let values = generation
-        .get("eos_token_id")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            FrontendError::Contract("generation_config.json `eos_token_id` must be an array".into())
-        })?;
+fn parse_stop_ids(generation: &Value, contract: FrontendContract) -> FrontendResult<Vec<u32>> {
+    let value = generation.get("eos_token_id").ok_or_else(|| {
+        FrontendError::Contract("generation_config.json is missing `eos_token_id`".into())
+    })?;
+    let values = match value {
+        Value::Array(values) => values.clone(),
+        value => vec![value.clone()],
+    };
     let stop_ids = values
         .iter()
         .map(|value| value.as_u64().and_then(|id| u32::try_from(id).ok()))
@@ -767,21 +810,32 @@ fn parse_stop_ids(generation: &Value) -> FrontendResult<[u32; 2]> {
         .ok_or_else(|| {
             FrontendError::Contract("generation_config.json contains a non-u32 stop ID".into())
         })?;
-    let stop_ids: [u32; 2] = stop_ids.try_into().map_err(|actual: Vec<u32>| {
-        FrontendError::Contract(format!(
-            "generation stop IDs {actual:?} do not match {DEFAULT_EOS_IDS:?}"
-        ))
-    })?;
-    if stop_ids != DEFAULT_EOS_IDS {
+    let expected = contract.eos_ids();
+    if stop_ids != expected {
         return Err(FrontendError::Contract(format!(
-            "generation stop IDs {stop_ids:?} do not match {DEFAULT_EOS_IDS:?}"
+            "generation stop IDs {stop_ids:?} do not match {expected:?}"
         )));
     }
 
     Ok(stop_ids)
 }
 
-fn parse_generation_defaults(generation: &Value) -> FrontendResult<GenerationDefaults> {
+fn parse_generation_defaults(
+    generation: &Value,
+    contract: FrontendContract,
+) -> FrontendResult<GenerationDefaults> {
+    match contract {
+        FrontendContract::Qwen38 => parse_qwen38_generation_defaults(generation),
+        FrontendContract::Qwen35 => parse_qwen35_generation_defaults(generation),
+    }
+}
+
+fn parse_qwen38_generation_defaults(generation: &Value) -> FrontendResult<GenerationDefaults> {
+    if generation.get("do_sample").and_then(Value::as_bool) != Some(true) {
+        return Err(FrontendError::Contract(
+            "generation_config.json `do_sample` must be true".into(),
+        ));
+    }
     let temperature = generation
         .get("temperature")
         .and_then(Value::as_f64)
@@ -820,12 +874,37 @@ fn parse_generation_defaults(generation: &Value) -> FrontendResult<GenerationDef
     Ok(defaults)
 }
 
+fn parse_qwen35_generation_defaults(generation: &Value) -> FrontendResult<GenerationDefaults> {
+    if generation
+        .get("do_sample")
+        .is_some_and(|value| value.as_bool() != Some(false))
+    {
+        return Err(FrontendError::Contract(
+            "generation_config.json `do_sample` must be false or absent".into(),
+        ));
+    }
+    for field in ["temperature", "top_p", "top_k"] {
+        if generation.get(field).is_some() {
+            return Err(FrontendError::Contract(format!(
+                "generation_config.json `{field}` must be absent when sampling is disabled"
+            )));
+        }
+    }
+
+    Ok(GenerationDefaults {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 1,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedPrefix, ChatMessage, ChatTemplateOptions, FrontendErrorCode, PROMPT_BLOCK_START,
-        PromptPrefixEntry, TextFrontend, best_cached_prefix, byte_level_table, common_prefix_bytes,
-        finish_pending, parse_generation_defaults, parse_stop_ids, push_stream_byte,
+        CachedPrefix, ChatMessage, ChatTemplateOptions, FrontendContract, FrontendErrorCode,
+        PROMPT_BLOCK_START, PromptPrefixEntry, TextFrontend, best_cached_prefix, byte_level_table,
+        common_prefix_bytes, finish_pending, parse_generation_defaults, parse_stop_ids,
+        push_stream_byte,
     };
     use serde_json::json;
     use std::collections::{HashSet, VecDeque};
@@ -916,8 +995,16 @@ mod tests {
 
     #[test]
     fn stop_ids_are_exact() {
-        let generation = json!({"eos_token_id": [248046, 248044]});
-        assert_eq!(parse_stop_ids(&generation).unwrap(), [248046, 248044]);
+        let qwen38 = json!({"eos_token_id": [248046, 248044]});
+        let qwen35 = json!({"eos_token_id": 248044});
+        assert_eq!(
+            parse_stop_ids(&qwen38, FrontendContract::Qwen38).unwrap(),
+            [248046, 248044]
+        );
+        assert_eq!(
+            parse_stop_ids(&qwen35, FrontendContract::Qwen35).unwrap(),
+            [248044]
+        );
     }
 
     #[test]
@@ -929,7 +1016,15 @@ mod tests {
             json!({"eos_token_id": [248046, 248043]}),
             json!({"eos_token_id": [248046, -1]}),
         ] {
-            let error = parse_stop_ids(&generation).unwrap_err();
+            let error = parse_stop_ids(&generation, FrontendContract::Qwen38).unwrap_err();
+            assert_eq!(error.code(), FrontendErrorCode::Contract);
+        }
+        for generation in [
+            json!({}),
+            json!({"eos_token_id": [248044, 248046]}),
+            json!({"eos_token_id": -1}),
+        ] {
+            let error = parse_stop_ids(&generation, FrontendContract::Qwen35).unwrap_err();
             assert_eq!(error.code(), FrontendErrorCode::Contract);
         }
     }
@@ -1000,7 +1095,7 @@ mod tests {
                 special_decode_ids: HashSet::from([3]),
             }),
             template: String::new(),
-            stop_ids: [3, 3],
+            stop_ids: vec![3],
             generation_defaults: super::GenerationDefaults {
                 temperature: 1.0,
                 top_p: 0.95,
@@ -1034,19 +1129,40 @@ mod tests {
 
     #[test]
     fn generation_defaults_are_exact() {
-        let exact = json!({"temperature": 1.0, "top_p": 0.95, "top_k": 20});
-        let defaults = parse_generation_defaults(&exact).unwrap();
+        let exact = json!({
+            "do_sample": true,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20
+        });
+        let defaults = parse_generation_defaults(&exact, FrontendContract::Qwen38).unwrap();
 
         assert_eq!(defaults.temperature, 1.0);
         assert_eq!(defaults.top_p, 0.95);
         assert_eq!(defaults.top_k, 20);
 
         for changed in [
-            json!({"temperature": 0.8, "top_p": 0.95, "top_k": 20}),
-            json!({"temperature": 1.0, "top_p": 0.9, "top_k": 20}),
-            json!({"temperature": 1.0, "top_p": 0.95, "top_k": 40}),
+            json!({"do_sample": false, "temperature": 1.0, "top_p": 0.95, "top_k": 20}),
+            json!({"do_sample": true, "temperature": 0.8, "top_p": 0.95, "top_k": 20}),
+            json!({"do_sample": true, "temperature": 1.0, "top_p": 0.9, "top_k": 20}),
+            json!({"do_sample": true, "temperature": 1.0, "top_p": 0.95, "top_k": 40}),
         ] {
-            assert!(parse_generation_defaults(&changed).is_err());
+            assert!(parse_generation_defaults(&changed, FrontendContract::Qwen38).is_err());
+        }
+
+        let defaults =
+            parse_generation_defaults(&json!({"eos_token_id": 248044}), FrontendContract::Qwen35)
+                .unwrap();
+        assert_eq!(defaults.temperature, 0.0);
+        assert_eq!(defaults.top_p, 1.0);
+        assert_eq!(defaults.top_k, 1);
+        for changed in [
+            json!({"do_sample": true}),
+            json!({"temperature": 1.0}),
+            json!({"top_p": 0.95}),
+            json!({"top_k": 20}),
+        ] {
+            assert!(parse_generation_defaults(&changed, FrontendContract::Qwen35).is_err());
         }
     }
 
