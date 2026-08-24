@@ -298,7 +298,7 @@ mod kernels {
         );
     }
 
-    /// Normalizes one exact Qwen3.8 prefill width.
+    /// Normalizes one exact prefill width.
     #[kernel]
     #[launch_bounds(512, 2)]
     #[launch_contract(
@@ -316,12 +316,12 @@ mod kernels {
         static mut WARP_SUM: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
         let shared = core::ptr::addr_of_mut!(WARP_SUM).cast::<f32>();
 
-        // One 512-thread CTA retains five packed BF16 pairs per thread. Scaling
-        // the grid by exact rows changes only independent row ownership.
+        // One 512-thread CTA owns each row: Qwen3.5/3.6/3.8 consume exactly
+        // four/two/five packed pairs per thread. Exact T changes only CTA count.
         rms_norm_body::<A, TOKENS>(input, weight, output, shared);
     }
 
-    /// Publishes and normalizes one exact Qwen3.8 prefill width.
+    /// Publishes and normalizes one exact prefill width.
     #[kernel]
     #[launch_bounds(512, 2)]
     #[launch_contract(
@@ -651,7 +651,7 @@ pub(crate) fn residual_norm_ptx_names() -> Vec<&'static str> {
 }
 
 /// PTX symbols retained for Qwen3.5 plain and fused-residual routes.
-pub(crate) fn qwen35_residual_norm_ptx_names() -> [&'static str; 16] {
+pub(crate) fn qwen35_residual_norm_ptx_names() -> [&'static str; 22] {
     [
         kernels::qwen35_rms_norm_ptx_name::<1>(),
         kernels::qwen35_rms_norm_ptx_name::<2>(),
@@ -669,6 +669,12 @@ pub(crate) fn qwen35_residual_norm_ptx_names() -> [&'static str; 16] {
         kernels::qwen35_residual_rms_norm_ptx_name::<6>(),
         kernels::qwen35_residual_rms_norm_ptx_name::<7>(),
         kernels::qwen35_residual_rms_norm_ptx_name::<8>(),
+        kernels::rms_norm_prefill_ptx_name::<Qwen35_9B, 32>(),
+        kernels::rms_norm_prefill_ptx_name::<Qwen35_9B, 64>(),
+        kernels::rms_norm_prefill_ptx_name::<Qwen35_9B, 128>(),
+        kernels::residual_rms_norm_prefill_ptx_name::<Qwen35_9B, 32>(),
+        kernels::residual_rms_norm_prefill_ptx_name::<Qwen35_9B, 64>(),
+        kernels::residual_rms_norm_prefill_ptx_name::<Qwen35_9B, 128>(),
     ]
 }
 
@@ -845,7 +851,7 @@ impl<A: Sm120Arch> ResidualNormOp<A> {
     }
 }
 
-/// Prepared Qwen3.5 plain and fused-residual RMSNorm routes for exact `B=1..8`.
+/// Prepared Qwen3.5 RMSNorm routes for decode `B=1..8` and prefill `T=32,64,128`.
 pub struct Qwen35ResidualNormOp {
     module: kernels::LoadedModule,
     b1: PreparedQwen35BatchRoute<1>,
@@ -856,10 +862,13 @@ pub struct Qwen35ResidualNormOp {
     b6: PreparedQwen35BatchRoute<6>,
     b7: PreparedQwen35BatchRoute<7>,
     b8: PreparedQwen35BatchRoute<8>,
+    t32: PreparedPrefillRoute<Qwen35_9B, 32>,
+    t64: PreparedPrefillRoute<Qwen35_9B, 64>,
+    t128: PreparedPrefillRoute<Qwen35_9B, 128>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Qwen35BatchRoute {
+enum Qwen35RowRoute {
     B1,
     B2,
     B3,
@@ -868,18 +877,24 @@ enum Qwen35BatchRoute {
     B6,
     B7,
     B8,
+    T32,
+    T64,
+    T128,
 }
 
-fn qwen35_batch_route(batch: usize) -> Option<Qwen35BatchRoute> {
-    match batch {
-        1 => Some(Qwen35BatchRoute::B1),
-        2 => Some(Qwen35BatchRoute::B2),
-        3 => Some(Qwen35BatchRoute::B3),
-        4 => Some(Qwen35BatchRoute::B4),
-        5 => Some(Qwen35BatchRoute::B5),
-        6 => Some(Qwen35BatchRoute::B6),
-        7 => Some(Qwen35BatchRoute::B7),
-        8 => Some(Qwen35BatchRoute::B8),
+fn qwen35_row_route(rows: usize) -> Option<Qwen35RowRoute> {
+    match rows {
+        1 => Some(Qwen35RowRoute::B1),
+        2 => Some(Qwen35RowRoute::B2),
+        3 => Some(Qwen35RowRoute::B3),
+        4 => Some(Qwen35RowRoute::B4),
+        5 => Some(Qwen35RowRoute::B5),
+        6 => Some(Qwen35RowRoute::B6),
+        7 => Some(Qwen35RowRoute::B7),
+        8 => Some(Qwen35RowRoute::B8),
+        32 => Some(Qwen35RowRoute::T32),
+        64 => Some(Qwen35RowRoute::T64),
+        128 => Some(Qwen35RowRoute::T128),
         _ => None,
     }
 }
@@ -900,6 +915,9 @@ impl Qwen35ResidualNormOp {
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module("loading the residual-norm module", source))?;
 
+        // T=128 is 128 independent 4,096-wide rows. One 128-CTA launch
+        // removes 15 boundaries versus sixteen B=8 launches while each CTA
+        // retains the same 512-thread traversal and reduction order.
         Ok(Self {
             b1: PreparedQwen35BatchRoute::prepare(&module)?,
             b2: PreparedQwen35BatchRoute::prepare(&module)?,
@@ -909,11 +927,14 @@ impl Qwen35ResidualNormOp {
             b6: PreparedQwen35BatchRoute::prepare(&module)?,
             b7: PreparedQwen35BatchRoute::prepare(&module)?,
             b8: PreparedQwen35BatchRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
 
-    /// Launches plain zero-centered RMSNorm for exactly `batch` rows.
+    /// Launches plain zero-centered RMSNorm for one admitted row count.
     ///
     /// # Safety
     ///
@@ -923,7 +944,7 @@ impl Qwen35ResidualNormOp {
     pub unsafe fn launch_plain(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         input: *const u16,
         weight: *const u16,
         output: *mut u16,
@@ -938,17 +959,20 @@ impl Qwen35ResidualNormOp {
             };
         }
 
-        match qwen35_batch_route(batch) {
-            Some(Qwen35BatchRoute::B1) => launch!(b1),
-            Some(Qwen35BatchRoute::B2) => launch!(b2),
-            Some(Qwen35BatchRoute::B3) => launch!(b3),
-            Some(Qwen35BatchRoute::B4) => launch!(b4),
-            Some(Qwen35BatchRoute::B5) => launch!(b5),
-            Some(Qwen35BatchRoute::B6) => launch!(b6),
-            Some(Qwen35BatchRoute::B7) => launch!(b7),
-            Some(Qwen35BatchRoute::B8) => launch!(b8),
+        match qwen35_row_route(rows) {
+            Some(Qwen35RowRoute::B1) => launch!(b1),
+            Some(Qwen35RowRoute::B2) => launch!(b2),
+            Some(Qwen35RowRoute::B3) => launch!(b3),
+            Some(Qwen35RowRoute::B4) => launch!(b4),
+            Some(Qwen35RowRoute::B5) => launch!(b5),
+            Some(Qwen35RowRoute::B6) => launch!(b6),
+            Some(Qwen35RowRoute::B7) => launch!(b7),
+            Some(Qwen35RowRoute::B8) => launch!(b8),
+            Some(Qwen35RowRoute::T32) => launch!(t32),
+            Some(Qwen35RowRoute::T64) => launch!(t64),
+            Some(Qwen35RowRoute::T128) => launch!(t128),
             None => Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 RMSNorm batch {batch} is outside the exact range 1..={MAX_BATCH}"
+                "Qwen3.5 RMSNorm row count {rows} is outside exact decode 1..={MAX_BATCH} and prefill T=32,64,128"
             ))),
         }
     }
@@ -958,14 +982,14 @@ impl Qwen35ResidualNormOp {
     /// # Safety
     ///
     /// Pointers must be four-byte aligned. Row planes must cover
-    /// `batch * 4,096` BF16 values and `weight` must cover 4,096 values.
+    /// `rows * 4,096` BF16 values and `weight` must cover 4,096 values.
     /// Allocations must belong to `stream`'s context, remain live through
     /// completion, and not overlap except that the two input planes may alias.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch_residual(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         residual_input: *const u16,
         branch: *const u16,
         weight: *const u16,
@@ -989,17 +1013,20 @@ impl Qwen35ResidualNormOp {
             };
         }
 
-        match qwen35_batch_route(batch) {
-            Some(Qwen35BatchRoute::B1) => launch!(b1),
-            Some(Qwen35BatchRoute::B2) => launch!(b2),
-            Some(Qwen35BatchRoute::B3) => launch!(b3),
-            Some(Qwen35BatchRoute::B4) => launch!(b4),
-            Some(Qwen35BatchRoute::B5) => launch!(b5),
-            Some(Qwen35BatchRoute::B6) => launch!(b6),
-            Some(Qwen35BatchRoute::B7) => launch!(b7),
-            Some(Qwen35BatchRoute::B8) => launch!(b8),
+        match qwen35_row_route(rows) {
+            Some(Qwen35RowRoute::B1) => launch!(b1),
+            Some(Qwen35RowRoute::B2) => launch!(b2),
+            Some(Qwen35RowRoute::B3) => launch!(b3),
+            Some(Qwen35RowRoute::B4) => launch!(b4),
+            Some(Qwen35RowRoute::B5) => launch!(b5),
+            Some(Qwen35RowRoute::B6) => launch!(b6),
+            Some(Qwen35RowRoute::B7) => launch!(b7),
+            Some(Qwen35RowRoute::B8) => launch!(b8),
+            Some(Qwen35RowRoute::T32) => launch!(t32),
+            Some(Qwen35RowRoute::T64) => launch!(t64),
+            Some(Qwen35RowRoute::T128) => launch!(t128),
             None => Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 residual RMSNorm batch {batch} is outside the exact range 1..={MAX_BATCH}"
+                "Qwen3.5 residual RMSNorm row count {rows} is outside exact decode 1..={MAX_BATCH} and prefill T=32,64,128"
             ))),
         }
     }
@@ -1193,9 +1220,9 @@ impl Qwen36ResidualNormOp {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BATCH, Qwen35BatchRoute, Qwen36RowRoute, THREADS, WARPS, qwen35_batch_route,
-        qwen35_residual_norm_ptx_names, qwen36_residual_norm_ptx_names, qwen36_row_route,
-        residual_norm_geometry, residual_norm_ptx_names,
+        MAX_BATCH, Qwen35RowRoute, Qwen36RowRoute, THREADS, WARPS, qwen35_residual_norm_ptx_names,
+        qwen35_row_route, qwen36_residual_norm_ptx_names, qwen36_row_route, residual_norm_geometry,
+        residual_norm_ptx_names,
     };
     use crate::test_arch::TestArch;
     use std::collections::BTreeSet;
@@ -1238,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_ptx_inventory_has_two_distinct_entries_per_batch() {
+    fn qwen35_ptx_inventory_has_two_distinct_entries_per_route() {
         let qwen38 = residual_norm_ptx_names();
         let qwen35 = qwen35_residual_norm_ptx_names();
         let unique = qwen38
@@ -1247,7 +1274,7 @@ mod tests {
             .copied()
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(qwen35.len(), 2 * MAX_BATCH);
+        assert_eq!(qwen35.len(), 2 * (MAX_BATCH + 3));
         assert_eq!(unique.len(), qwen38.len() + qwen35.len());
     }
 
@@ -1292,22 +1319,26 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_batch_routing_is_exact() {
-        assert_eq!(qwen35_batch_route(0), None);
+    fn qwen35_row_routing_is_exact() {
+        assert_eq!(qwen35_row_route(0), None);
         assert_eq!(
-            (1..=MAX_BATCH).map(qwen35_batch_route).collect::<Vec<_>>(),
-            vec![
-                Some(Qwen35BatchRoute::B1),
-                Some(Qwen35BatchRoute::B2),
-                Some(Qwen35BatchRoute::B3),
-                Some(Qwen35BatchRoute::B4),
-                Some(Qwen35BatchRoute::B5),
-                Some(Qwen35BatchRoute::B6),
-                Some(Qwen35BatchRoute::B7),
-                Some(Qwen35BatchRoute::B8),
+            [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128].map(qwen35_row_route),
+            [
+                Some(Qwen35RowRoute::B1),
+                Some(Qwen35RowRoute::B2),
+                Some(Qwen35RowRoute::B3),
+                Some(Qwen35RowRoute::B4),
+                Some(Qwen35RowRoute::B5),
+                Some(Qwen35RowRoute::B6),
+                Some(Qwen35RowRoute::B7),
+                Some(Qwen35RowRoute::B8),
+                Some(Qwen35RowRoute::T32),
+                Some(Qwen35RowRoute::T64),
+                Some(Qwen35RowRoute::T128),
             ]
         );
-        assert_eq!(qwen35_batch_route(MAX_BATCH + 1), None);
-        assert_eq!(qwen35_batch_route(usize::MAX), None);
+        for rows in [9, 31, 33, 63, 65, 127, 129, usize::MAX] {
+            assert_eq!(qwen35_row_route(rows), None);
+        }
     }
 }

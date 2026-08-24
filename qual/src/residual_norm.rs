@@ -13,6 +13,10 @@ use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 const MAX_BATCH: usize = 8;
 const DECODE_ROUTES: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 #[cfg(feature = "device")]
+const QWEN35_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
+#[cfg(feature = "device")]
+const QWEN35_MAX_ROWS: usize = 128;
+#[cfg(feature = "device")]
 const QWEN36_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 #[cfg(feature = "device")]
 const QWEN36_MAX_ROWS: usize = 128;
@@ -219,14 +223,14 @@ pub fn qualify_residual_norm() -> Result<ResidualNormQualification, ResidualNorm
     qualify_target::<Qwen38_27B, ResidualNormOp>(ResidualNormOp::new, &DECODE_ROUTES, MAX_BATCH)
 }
 
-/// Qualifies the exact Qwen3.5 4,096-wide routes on SM120 device zero.
+/// Qualifies Qwen3.5 decode `B=1..8` and prefill `T=32,64,128` on device zero.
 #[cfg(feature = "device")]
 pub fn qualify_qwen35_residual_norm()
 -> Result<ResidualNormQualification, ResidualNormQualificationError> {
     qualify_target::<Qwen35_9B, Qwen35ResidualNormOp>(
         Qwen35ResidualNormOp::new,
-        &DECODE_ROUTES,
-        MAX_BATCH,
+        &QWEN35_ROUTES,
+        QWEN35_MAX_ROWS,
     )
 }
 
@@ -661,7 +665,8 @@ mod tests {
     };
     #[cfg(feature = "device")]
     use super::{
-        QWEN36_MAX_ROWS, QWEN36_ROUTES, qualify_qwen35_residual_norm, qualify_qwen36_residual_norm,
+        QWEN35_MAX_ROWS, QWEN35_ROUTES, QWEN36_MAX_ROWS, QWEN36_ROUTES,
+        qualify_qwen35_residual_norm, qualify_qwen36_residual_norm,
     };
     use tuisko_model::Arch;
 
@@ -704,13 +709,13 @@ mod tests {
     #[cfg(feature = "device")]
     #[test]
     #[ignore = "requires an exclusive RTX 5090"]
-    fn qwen35_exact_batches_match_independent_oracles_and_graph_replay()
+    fn qwen35_residual_norm_exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), ResidualNormQualificationError> {
         let report = qualify_qwen35_residual_norm()?;
-        let active_per_plane = DECODE_ROUTES.iter().sum::<usize>() * Qwen35_9B::HIDDEN;
-        let inactive_per_run = DECODE_ROUTES
+        let active_per_plane = QWEN35_ROUTES.iter().sum::<usize>() * Qwen35_9B::HIDDEN;
+        let inactive_per_run = QWEN35_ROUTES
             .iter()
-            .map(|rows| MAX_BATCH - rows)
+            .map(|rows| QWEN35_MAX_ROWS - rows)
             .sum::<usize>()
             * Qwen35_9B::HIDDEN
             * 3;
@@ -722,7 +727,7 @@ mod tests {
         assert_eq!(report.inactive_values, inactive_per_run * 2);
         assert_eq!(
             report.immutable_values,
-            (2 * MAX_BATCH + 1) * Qwen35_9B::HIDDEN
+            (2 * QWEN35_MAX_ROWS + 1) * Qwen35_9B::HIDDEN
         );
         assert!(report.maximum_absolute_error <= 0.015625);
 

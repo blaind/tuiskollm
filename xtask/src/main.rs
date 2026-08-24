@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 const RESIDUAL_NORM_RESOURCE_BASELINE: &str = "qual/baselines/residual-norm-sm120.txt";
 const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-residual-norm-sm120.txt";
+const QWEN35_RESIDUAL_NORM_TEST_FILTER: &str = "qwen35_residual_norm";
 const QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen36-residual-norm-sm120.txt";
 const QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt";
@@ -1489,9 +1490,10 @@ fn qualify_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "residual_norm::tests::qwen35_exact_batches_match_independent_oracles_and_graph_replay",
+            QWEN35_RESIDUAL_NORM_TEST_FILTER,
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_qwen35_residual_norm(root)
@@ -7141,10 +7143,35 @@ fn gate_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("qwen35_residual_rms_norm_TID_"))
         .collect::<Vec<_>>();
+    // The pinned compiler folds Qwen3.5's exact 1/4,096 factor to 0x39800000.
+    let prefill_plain = entries
+        .iter()
+        .filter(|entry| {
+            entry.name.starts_with("rms_norm_prefill_TID_") && entry.body.contains("0f39800000")
+        })
+        .collect::<Vec<_>>();
+    let prefill_residual = entries
+        .iter()
+        .filter(|entry| {
+            entry.name.starts_with("residual_rms_norm_prefill_TID_")
+                && entry.body.contains("0f39800000")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.5 plain RMSNorm", plain.len(), 8)?;
     require_count("Qwen3.5 residual RMSNorm", residual.len(), 8)?;
+    require_count("Qwen3.5 plain RMSNorm prefill", prefill_plain.len(), 3)?;
+    require_count(
+        "Qwen3.5 residual RMSNorm prefill",
+        prefill_residual.len(),
+        3,
+    )?;
 
-    for entry in plain.iter().chain(&residual) {
+    for entry in plain
+        .iter()
+        .chain(&residual)
+        .chain(&prefill_plain)
+        .chain(&prefill_residual)
+    {
         if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 512-thread/two-CTA launch bounds",
@@ -7159,11 +7186,25 @@ fn gate_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
     let sass = artifact.sass()?;
     let mut plain_registers = Vec::with_capacity(plain.len());
     let mut residual_registers = Vec::with_capacity(residual.len());
-    let mut shared = Vec::with_capacity(plain.len() + residual.len());
+    let mut prefill_plain_registers = Vec::with_capacity(prefill_plain.len());
+    let mut prefill_residual_registers = Vec::with_capacity(prefill_residual.len());
+    let mut shared = Vec::with_capacity(
+        plain.len() + residual.len() + prefill_plain.len() + prefill_residual.len(),
+    );
 
     for (family, entries, registers) in [
         ("plain", &plain, &mut plain_registers),
         ("residual", &residual, &mut residual_registers),
+        (
+            "plain prefill",
+            &prefill_plain,
+            &mut prefill_plain_registers,
+        ),
+        (
+            "residual prefill",
+            &prefill_residual,
+            &mut prefill_residual_registers,
+        ),
     ] {
         for entry in entries {
             let resource = resources.get(entry.name).ok_or_else(|| {
@@ -7188,14 +7229,34 @@ fn gate_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
     }
     plain_registers.sort_unstable();
     residual_registers.sort_unstable();
+    prefill_plain_registers.sort_unstable();
+    prefill_residual_registers.sort_unstable();
     shared.sort_unstable();
     require_registers(&baseline, "plain_registers", &plain_registers)?;
     require_registers(&baseline, "residual_registers", &residual_registers)?;
+    if baseline.contains_key("prefill_plain_registers") {
+        require_registers(
+            &baseline,
+            "prefill_plain_registers",
+            &prefill_plain_registers,
+        )?;
+    }
+    if baseline.contains_key("prefill_residual_registers") {
+        require_registers(
+            &baseline,
+            "prefill_residual_registers",
+            &prefill_residual_registers,
+        )?;
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "Qwen3.5 residual-norm gate passed: 8 plain + 8 residual entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/BF16 pack present",
-        plain_registers, residual_registers, shared
+        "Qwen3.5 residual-norm gate passed: 8 decode + 3 prefill plain and residual entries, REG {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/BF16 pack present",
+        plain_registers,
+        residual_registers,
+        prefill_plain_registers,
+        prefill_residual_registers,
+        shared
     );
     Ok(())
 }
@@ -12842,13 +12903,13 @@ fn require_uniform_value(
 mod tests {
     use super::{
         COMPOSED_PERFORMANCE_SUITES, MTP_LAYER_RESOURCE_BASELINES, OptimizationSuite,
-        PERFORMANCE_SUITES, PerformanceSuite, QWEN36_RESIDENT_MODEL_TEST_FILTER,
-        SM120_RESOURCE_BASELINES, parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity,
-        parse_entries, parse_idle_sample, parse_performance_device_sample,
-        parse_performance_iteration, parse_resources, parse_rustc_identity,
-        preflight_performance_baselines, require_consumed_baseline_keys, require_count,
-        require_registers, require_uniform_value, resolve_target_output, sass_function_body,
-        workspace_root,
+        PERFORMANCE_SUITES, PerformanceSuite, QWEN35_RESIDUAL_NORM_TEST_FILTER,
+        QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, parse_baseline,
+        parse_compute_pids, parse_cuda_toolkit_identity, parse_entries, parse_idle_sample,
+        parse_performance_device_sample, parse_performance_iteration, parse_resources,
+        parse_rustc_identity, preflight_performance_baselines, require_consumed_baseline_keys,
+        require_count, require_registers, require_uniform_value, resolve_target_output,
+        sass_function_body, workspace_root,
     };
     use std::ffi::OsString;
 
@@ -12870,6 +12931,16 @@ mod tests {
             "qwen36_resident_model_benchmark::tests::accounting_covers_every_layer_endpoint_and_selected_expert",
         ] {
             assert!(test.contains(QWEN36_RESIDENT_MODEL_TEST_FILTER));
+        }
+    }
+
+    #[test]
+    fn qwen35_residual_norm_filter_selects_oracle_and_accounting() {
+        for test in [
+            "residual_norm::tests::qwen35_residual_norm_exact_routes_match_independent_oracles_and_graph_replay",
+            "residual_norm_benchmark::tests::qwen35_residual_norm_benchmark_arena_accounting_exposes_every_byte",
+        ] {
+            assert!(test.contains(QWEN35_RESIDUAL_NORM_TEST_FILTER));
         }
     }
 
