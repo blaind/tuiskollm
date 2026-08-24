@@ -13,6 +13,8 @@ use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, GpuError, GpuTimer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen36Moe35B};
 
 const SOURCE_LAYER: usize = 3;
+const MAX_ROWS: usize = 128;
+const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, MAX_ROWS];
 const CACHE_POSITION: u32 = 130;
 const CONTEXT_TOKENS: usize = CACHE_POSITION as usize + 1;
 const ROTARY_PAIRS: usize = 32;
@@ -20,7 +22,7 @@ const EXPERT_SLOTS: usize = Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN + 1;
 const NVFP4_GROUP: usize = 16;
 
 struct RouteGraph {
-    batch: usize,
+    rows: usize,
     repeated: CudaGraph,
 }
 
@@ -46,7 +48,7 @@ impl Session {
         let stream = context.new_stream().map_err(GpuError::from)?;
         let program =
             Qwen36FullAttentionLayerProgram::from_snapshot(&context, snapshot, SOURCE_LAYER)?;
-        program.load_residual(&stream, MAX_BATCH, &benchmark_input())?;
+        program.load_residual(&stream, MAX_ROWS, &benchmark_input())?;
         program.reset_cache(&stream)?;
         let (rope_cos, rope_sin) = benchmark_rope();
         program.load_decode_state(
@@ -56,13 +58,16 @@ impl Session {
             &rope_cos,
             &rope_sin,
         )?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| {
+        let (prefill_cos, prefill_sin) = prefill_rope(MAX_ROWS);
+        program.load_prefill_state(&stream, MAX_ROWS, &prefill_cos, &prefill_sin)?;
+        let routes = EXACT_ROUTES
+            .into_iter()
+            .map(|rows| {
                 Ok(RouteGraph {
-                    batch,
+                    rows,
                     repeated: program.qualification_repeated_graph(
                         &stream,
-                        batch,
+                        rows,
                         repeated_operations,
                     )?,
                 })
@@ -81,13 +86,9 @@ impl Session {
 
     fn warm(&self, launches: u64) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
-            for batch in 1..=MAX_BATCH {
+            for rows in EXACT_ROUTES {
                 // SAFETY: the program retains every captured layer allocation through this replay.
-                unsafe {
-                    self.program
-                        .qualification_graph(batch)?
-                        .launch(&self.stream)
-                }?;
+                unsafe { self.program.qualification_graph(rows)?.launch(&self.stream) }?;
             }
         }
         self.stream.synchronize().map_err(GpuError::from)?;
@@ -101,19 +102,26 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_attention_layer_decode(
+                            route.rows as u32,
+                            CONTEXT_TOKENS as u64,
+                        ),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_attention_layer_prefill(route.rows as u64),
+                    )
+                };
                 Ok(ExactDeviceCase::new(
                     "qwen36_35b_a3b/full_attention/layer3",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_attention_layer_decode(
-                        route.batch as u32,
-                        CONTEXT_TOKENS as u64,
-                    ),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
-                    self.program.qualification_graph(route.batch)?,
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
+                    self.program.qualification_graph(route.rows)?,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 ))
             })
@@ -123,7 +131,7 @@ impl Session {
 
 fn benchmark_input() -> Vec<u16> {
     const PATTERN: [f32; 8] = [0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625];
-    (0..MAX_BATCH * Qwen36Moe35B::HIDDEN)
+    (0..MAX_ROWS * Qwen36Moe35B::HIDDEN)
         .map(|index| f32_to_bf16(PATTERN[(index + index / Qwen36Moe35B::HIDDEN) & 7]))
         .collect()
 }
@@ -141,7 +149,22 @@ fn benchmark_rope() -> (Vec<f32>, Vec<f32>) {
     (cosine, sine)
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn prefill_rope(tokens: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut cosine = vec![0.0; tokens * ROTARY_PAIRS];
+    let mut sine = vec![0.0; tokens * ROTARY_PAIRS];
+    for token in 0..tokens {
+        for pair in 0..ROTARY_PAIRS {
+            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
+            let angle = token as f64 * frequency;
+            let (sin, cos) = angle.sin_cos();
+            cosine[token * ROTARY_PAIRS + pair] = cos as f32;
+            sine[token * ROTARY_PAIRS + pair] = sin as f32;
+        }
+    }
+    (cosine, sine)
+}
+
+fn logical_bytes(rows: usize) -> usize {
     let hidden = Qwen36Moe35B::HIDDEN;
     let qkv = Qwen36Moe35B::ATTENTION_QKV_ROWS;
     let attention = Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS;
@@ -164,15 +187,20 @@ fn logical_bytes(batch: usize) -> usize {
             + attention * size_of::<f32>()
             + 2 * kv * size_of::<u16>()
     };
+    let context_values = if rows <= MAX_BATCH {
+        rows * CONTEXT_TOKENS
+    } else {
+        rows * (rows + 1) / 2
+    };
     let paged_gqa = {
         let cache = 2
             * Qwen36Moe35B::NUM_ATTENTION_HEADS
-            * CONTEXT_TOKENS
+            * context_values
             * Qwen36Moe35B::HEAD_DIM
             * size_of::<u16>();
-        let metadata = 2 * size_of::<u32>()
-            + Qwen36Moe35B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * size_of::<u32>();
-        2 * attention * size_of::<f32>() + cache + metadata
+        let metadata = rows * 2 * size_of::<u32>()
+            + Qwen36Moe35B::NUM_ATTENTION_HEADS * context_values * size_of::<u32>();
+        rows * 2 * attention * size_of::<f32>() + cache + metadata
     };
     let attention_output = 18 * attention + 2 * hidden;
     let residual_boundaries = 2 * 5 * hidden * size_of::<u16>();
@@ -192,16 +220,15 @@ fn logical_bytes(batch: usize) -> usize {
         + 2 * EXPERT_SLOTS * intermediate * size_of::<u16>()
         + 2 * EXPERT_SLOTS * hidden * size_of::<u16>()
         + hidden * size_of::<u16>();
-    let per_token = plain_norm
+    let per_token_without_gqa = plain_norm
         + qkv_projection
         + qk_prepare
-        + paged_gqa
         + attention_output
         + residual_boundaries
         + router
         + experts_path;
 
-    projection_weights + router_weights + batch * per_token
+    projection_weights + router_weights + rows * per_token_without_gqa + paged_gqa
 }
 
 /// Measures every exact graph of one source-backed Qwen3.6 attention/MoE layer.
@@ -230,7 +257,7 @@ pub fn benchmark_qwen36_full_attention_layer(
         "qwen36_35b_a3b/full_attention/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.program.workspace_bytes(),
-        "max_batch=8 including metadata, routing, expert slots, and all published seams",
+        "max_rows=128 including decode/prefill metadata, routing, expert slots, and published seams",
     )?;
     memory.register_owned(
         "qwen36_35b_a3b/full_attention/alignment_padding",
@@ -280,5 +307,7 @@ mod tests {
         assert_eq!(CONTEXT_TOKENS, 131);
         assert_eq!(logical_bytes(1), 46_735_636);
         assert_eq!(logical_bytes(MAX_BATCH), 175_704_224);
+        assert!(logical_bytes(MAX_ROWS) > logical_bytes(64));
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
     }
 }

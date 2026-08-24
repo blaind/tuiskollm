@@ -10,8 +10,8 @@ use crate::{DeviceBenchmarkError, device_benchmark};
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
-    EngineError, MAX_BATCH, Qwen36FullAttentionLayerImmutable, Qwen36FullAttentionLayerObservables,
-    Qwen36FullAttentionLayerProgram,
+    EngineError, MAX_BATCH, Qwen36FullAttentionLayerImmutable, Qwen36FullAttentionLayerInputs,
+    Qwen36FullAttentionLayerObservables, Qwen36FullAttentionLayerProgram,
 };
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, device_memory_info};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -33,6 +33,8 @@ const EXPERTS: usize = Qwen36Moe35B::NUM_EXPERTS;
 const TOP_K: usize = Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN;
 const SLOTS: usize = TOP_K + 1;
 const INTERMEDIATE: usize = Qwen36Moe35B::INTERMEDIATE;
+const MAX_ROWS: usize = 128;
+const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, MAX_ROWS];
 
 /// Failure of the complete source-backed Qwen3.6 attention/MoE gate.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +73,8 @@ pub struct Qwen36FullAttentionLayerQualification {
     pub inactive_values: usize,
     /// Immutable source/materialized device values proved unchanged.
     pub immutable_values: usize,
+    /// Runtime-owned graph-input values proved unchanged.
+    pub runtime_input_values: usize,
     /// Complete one-allocation owner bytes.
     pub arena_bytes: usize,
     /// Exact source-backed device weight bytes.
@@ -90,7 +94,7 @@ struct SourceMaterialized<'a> {
     moe: MaterializedQwen36MoeLayer<'a>,
 }
 
-/// Qualifies source-backed Qwen3.6 layer 3 at every exact decode batch.
+/// Qualifies source-backed Qwen3.6 layer 3 at every exact decode and prefill route.
 pub fn qualify_qwen36_full_attention_layer(
     root: &Path,
 ) -> Result<Qwen36FullAttentionLayerQualification, Qwen36FullAttentionLayerQualificationError> {
@@ -117,10 +121,10 @@ pub fn qualify_qwen36_full_attention_layer(
         Qwen36FullAttentionLayerProgram::from_snapshot(&context, snapshot.clone(), SOURCE_LAYER)?;
     let stable_base = program.base_address();
     let stable_addresses = program.qualification_addresses()?;
-    if stable_addresses.len() != 47 {
+    if stable_addresses.len() != 52 {
         return Err(Qwen36FullAttentionLayerQualificationError::Mismatch(
             format!(
-                "Qwen3.6 attention owner exposes {} addresses, expected 47",
+                "Qwen3.6 attention owner exposes {} addresses, expected 52",
                 stable_addresses.len()
             ),
         ));
@@ -131,6 +135,7 @@ pub fn qualify_qwen36_full_attention_layer(
         graph_replay_values: 0,
         inactive_values: 0,
         immutable_values: 0,
+        runtime_input_values: 0,
         arena_bytes: program.arena_bytes(),
         weight_bytes: program.resident_weight_bytes(),
         cache_bytes: program.cache_bytes(),
@@ -143,35 +148,49 @@ pub fn qualify_qwen36_full_attention_layer(
     };
     verify_scales(&program, &source)?;
 
-    for batch in 1..=MAX_BATCH {
-        let first_input = make_input(batch, 0);
-        prepare_run(&program, &stream, batch, &first_input)?;
-        program.launch_eager(&stream, batch)?;
+    for rows in EXACT_ROUTES {
+        let first_input = make_input(rows, 0);
+        prepare_run(&program, &stream, rows, &first_input)?;
+        program.launch_eager(&stream, rows)?;
         let first = program.qualification_observables(&stream)?;
 
-        let input = make_input(batch, 1);
-        prepare_run(&program, &stream, batch, &input)?;
-        program.replay(&stream, batch)?;
+        let input = make_input(rows, 1);
+        prepare_run(&program, &stream, rows, &input)?;
+        let replay_inputs = program.qualification_runtime_inputs(&stream)?;
+        verify_runtime_input_contract(rows, &input, &replay_inputs)?;
+        program.replay(&stream, rows)?;
         let replay = program.qualification_observables(&stream)?;
+        let replay_inputs_after = program.qualification_runtime_inputs(&stream)?;
+        report.runtime_input_values +=
+            verify_runtime_inputs_unchanged(rows, &replay_inputs, &replay_inputs_after)?;
 
-        prepare_run(&program, &stream, batch, &input)?;
-        program.launch_eager(&stream, batch)?;
+        prepare_run(&program, &stream, rows, &input)?;
+        let eager_inputs = program.qualification_runtime_inputs(&stream)?;
+        program.launch_eager(&stream, rows)?;
         let eager = program.qualification_observables(&stream)?;
+        let eager_inputs_after = program.qualification_runtime_inputs(&stream)?;
+        report.runtime_input_values +=
+            verify_runtime_inputs_unchanged(rows, &eager_inputs, &eager_inputs_after)?;
 
-        verify_boundaries(batch, &input, &source, &replay, &mut report)?;
-        if batch == 1 {
+        verify_boundaries(rows, &input, &source, &replay, &mut report)?;
+        if rows == 1 {
             verify_source_formula(&source, &replay, &mut report)?;
         }
-        verify_replay(batch, &eager, &replay, &mut report)?;
-        verify_replacement_input(batch, &first, &replay)?;
-        report.inactive_values += verify_inactive(batch, &replay)?;
-        report.inactive_values += verify_inactive(batch, &eager)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
+        verify_replacement_input(rows, &first, &replay)?;
+        report.inactive_values += verify_inactive(rows, &replay)?;
+        report.inactive_values += verify_inactive(rows, &eager)?;
+        report.inactive_values += verify_inactive_cache(rows, &replay)?;
+        report.inactive_values += verify_inactive_cache(rows, &eager)?;
 
         if program.base_address() != stable_base
             || program.qualification_addresses()? != stable_addresses
         {
             return Err(Qwen36FullAttentionLayerQualificationError::Mismatch(
-                format!("Qwen3.6 attention owner addresses changed at B={batch}"),
+                format!(
+                    "Qwen3.6 attention owner addresses changed at {}",
+                    route_label(rows)
+                ),
             ));
         }
     }
@@ -187,12 +206,12 @@ pub fn qualify_qwen36_full_attention_layer(
     Ok(report)
 }
 
-fn make_input(batch: usize, salt: usize) -> Vec<u16> {
+fn make_input(rows: usize, salt: usize) -> Vec<u16> {
     const PATTERN: [f32; 16] = [
         0.875, -0.875, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0625, -0.0625, 0.03125, -0.03125,
         0.0, 0.5, -0.25, 0.125,
     ];
-    (0..batch * HIDDEN)
+    (0..rows * HIDDEN)
         .map(|index| f32_to_bf16(PATTERN[(index + salt * 5 + index / HIDDEN) & 15]))
         .collect()
 }
@@ -200,21 +219,159 @@ fn make_input(batch: usize, salt: usize) -> Vec<u16> {
 fn prepare_run(
     program: &Qwen36FullAttentionLayerProgram,
     stream: &CudaStream,
-    batch: usize,
+    rows: usize,
     input: &[u16],
 ) -> Result<(), Qwen36FullAttentionLayerQualificationError> {
     program.reset_cache(stream)?;
-    program.load_residual(stream, batch, input)?;
-    program.load_decode_state(
-        stream,
-        batch,
-        &vec![0; batch],
-        &vec![1.0; batch * 32],
-        &vec![0.0; batch * 32],
-    )?;
+    program.load_residual(stream, rows, input)?;
+    if rows <= MAX_BATCH {
+        program.load_decode_state(
+            stream,
+            rows,
+            &vec![0; rows],
+            &vec![1.0; rows * 32],
+            &vec![0.0; rows * 32],
+        )?;
+    } else {
+        program.load_prefill_state(stream, rows, &vec![1.0; rows * 32], &vec![0.0; rows * 32])?;
+    }
     program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
 
     Ok(())
+}
+
+fn verify_runtime_input_contract(
+    rows: usize,
+    input: &[u16],
+    actual: &Qwen36FullAttentionLayerInputs,
+) -> Result<(), Qwen36FullAttentionLayerQualificationError> {
+    compare_exact(
+        "runtime residual input",
+        &actual.residual_input[..rows * HIDDEN],
+        input,
+    )?;
+    compare_exact(
+        "runtime physical page inventory",
+        &actual.block_tables,
+        &(0..24u32).collect::<Vec<_>>(),
+    )?;
+    if rows <= MAX_BATCH {
+        compare_exact(
+            "decode table rows",
+            &actual.table_rows[..rows],
+            &(0..rows as u32).collect::<Vec<_>>(),
+        )?;
+        compare_exact(
+            "decode cache positions",
+            &actual.cache_positions[..rows],
+            &vec![0; rows],
+        )?;
+        compare_exact(
+            "decode causal lengths",
+            &actual.lengths[..rows],
+            &vec![1; rows],
+        )?;
+        compare_f32_bits(
+            "decode rotary cosine",
+            &actual.rope_cos[..rows * 32],
+            &vec![1.0; rows * 32],
+        )?;
+        compare_f32_bits(
+            "decode rotary sine",
+            &actual.rope_sin[..rows * 32],
+            &vec![0.0; rows * 32],
+        )?;
+    } else {
+        compare_exact(
+            "prefill table rows",
+            &actual.prefill_table_rows[..rows],
+            &vec![0; rows],
+        )?;
+        compare_exact(
+            "prefill cache positions",
+            &actual.prefill_cache_positions[..rows],
+            &(0..rows as u32).collect::<Vec<_>>(),
+        )?;
+        compare_exact(
+            "prefill causal lengths",
+            &actual.prefill_lengths[..rows],
+            &(1..=rows as u32).collect::<Vec<_>>(),
+        )?;
+        compare_f32_bits(
+            "prefill rotary cosine",
+            &actual.prefill_rope_cos[..rows * 32],
+            &vec![1.0; rows * 32],
+        )?;
+        compare_f32_bits(
+            "prefill rotary sine",
+            &actual.prefill_rope_sin[..rows * 32],
+            &vec![0.0; rows * 32],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn verify_runtime_inputs_unchanged(
+    rows: usize,
+    before: &Qwen36FullAttentionLayerInputs,
+    after: &Qwen36FullAttentionLayerInputs,
+) -> Result<usize, Qwen36FullAttentionLayerQualificationError> {
+    macro_rules! same {
+        ($field:ident) => {
+            compare_exact(
+                &format!(
+                    "{} immutable runtime `{}`",
+                    route_label(rows),
+                    stringify!($field)
+                ),
+                &after.$field,
+                &before.$field,
+            )?;
+        };
+    }
+    macro_rules! same_f32 {
+        ($field:ident) => {
+            compare_f32_bits(
+                &format!(
+                    "{} immutable runtime `{}`",
+                    route_label(rows),
+                    stringify!($field)
+                ),
+                &after.$field,
+                &before.$field,
+            )?;
+        };
+    }
+    same!(residual_input);
+    same!(block_tables);
+    same_f32!(rope_cos);
+    same_f32!(rope_sin);
+    same!(table_rows);
+    same!(cache_positions);
+    same!(lengths);
+    same_f32!(prefill_rope_cos);
+    same_f32!(prefill_rope_sin);
+    same!(prefill_table_rows);
+    same!(prefill_cache_positions);
+    same!(prefill_lengths);
+
+    Ok(runtime_input_values(after))
+}
+
+fn runtime_input_values(values: &Qwen36FullAttentionLayerInputs) -> usize {
+    values.residual_input.len()
+        + values.block_tables.len()
+        + values.rope_cos.len()
+        + values.rope_sin.len()
+        + values.table_rows.len()
+        + values.cache_positions.len()
+        + values.lengths.len()
+        + values.prefill_rope_cos.len()
+        + values.prefill_rope_sin.len()
+        + values.prefill_table_rows.len()
+        + values.prefill_cache_positions.len()
+        + values.prefill_lengths.len()
 }
 
 fn verify_scales(
@@ -242,7 +399,7 @@ fn verify_scales(
 }
 
 fn verify_boundaries(
-    batch: usize,
+    rows: usize,
     input: &[u16],
     source: &SourceMaterialized<'_>,
     observed: &Qwen36FullAttentionLayerObservables,
@@ -255,7 +412,7 @@ fn verify_boundaries(
         .words()
         .collect::<Vec<_>>();
     let next_norm = source.moe.next_norm.words().collect::<Vec<_>>();
-    for token in 0..batch {
+    for token in 0..rows {
         let begin = token * HIDDEN;
         let end = begin + HIDDEN;
         compare_bf16(
@@ -293,7 +450,7 @@ fn verify_boundaries(
             report,
         )?;
     }
-    report.boundary_values += batch * HIDDEN * 5;
+    report.boundary_values += rows * HIDDEN * 5;
     Ok(())
 }
 
@@ -683,7 +840,7 @@ fn bf16_dot(left: &[u16], right: &[u16]) -> f64 {
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     eager: &Qwen36FullAttentionLayerObservables,
     replay: &Qwen36FullAttentionLayerObservables,
     report: &mut Qwen36FullAttentionLayerQualification,
@@ -691,7 +848,7 @@ fn verify_replay(
     macro_rules! same {
         ($field:ident) => {
             compare_exact(
-                &format!("B={batch} graph plane `{}`", stringify!($field)),
+                &format!("{} graph plane `{}`", route_label(rows), stringify!($field)),
                 &replay.$field,
                 &eager.$field,
             )?;
@@ -700,7 +857,7 @@ fn verify_replay(
     macro_rules! same_f32 {
         ($field:ident) => {
             compare_exact(
-                &format!("B={batch} graph plane `{}`", stringify!($field)),
+                &format!("{} graph plane `{}`", route_label(rows), stringify!($field)),
                 &replay
                     .$field
                     .iter()
@@ -764,31 +921,38 @@ fn observable_values(values: &Qwen36FullAttentionLayerObservables) -> usize {
 }
 
 fn verify_replacement_input(
-    batch: usize,
+    rows: usize,
     first: &Qwen36FullAttentionLayerObservables,
     replay: &Qwen36FullAttentionLayerObservables,
 ) -> Result<(), Qwen36FullAttentionLayerQualificationError> {
-    if first.residual_output[..batch * HIDDEN] == replay.residual_output[..batch * HIDDEN] {
+    if first.residual_output[..rows * HIDDEN] == replay.residual_output[..rows * HIDDEN] {
         return Err(Qwen36FullAttentionLayerQualificationError::Mismatch(
-            format!("B={batch} graph ignored replacement residual rows"),
+            format!(
+                "{} graph ignored replacement residual rows",
+                route_label(rows)
+            ),
         ));
     }
     Ok(())
 }
 
 fn verify_inactive(
-    batch: usize,
+    rows: usize,
     observed: &Qwen36FullAttentionLayerObservables,
 ) -> Result<usize, Qwen36FullAttentionLayerQualificationError> {
     macro_rules! u16_tail {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|&value| value != BF16_SENTINEL)
             {
                 return Err(Qwen36FullAttentionLayerQualificationError::Mismatch(
-                    format!("B={batch} modified inactive `{}`", stringify!($field)),
+                    format!(
+                        "{} modified inactive `{}`",
+                        route_label(rows),
+                        stringify!($field)
+                    ),
                 ));
             }
             observed.$field.len() - begin
@@ -796,13 +960,17 @@ fn verify_inactive(
     }
     macro_rules! u8_tail {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|&value| value != BYTE_SENTINEL)
             {
                 return Err(Qwen36FullAttentionLayerQualificationError::Mismatch(
-                    format!("B={batch} modified inactive `{}`", stringify!($field)),
+                    format!(
+                        "{} modified inactive `{}`",
+                        route_label(rows),
+                        stringify!($field)
+                    ),
                 ));
             }
             observed.$field.len() - begin
@@ -810,13 +978,17 @@ fn verify_inactive(
     }
     macro_rules! f32_tail {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|value| value.to_bits() != F32_SENTINEL_BITS)
             {
                 return Err(Qwen36FullAttentionLayerQualificationError::Mismatch(
-                    format!("B={batch} modified inactive `{}`", stringify!($field)),
+                    format!(
+                        "{} modified inactive `{}`",
+                        route_label(rows),
+                        stringify!($field)
+                    ),
                 ));
             }
             observed.$field.len() - begin
@@ -843,6 +1015,52 @@ fn verify_inactive(
     count += u16_tail!(residual_output, HIDDEN);
     count += u16_tail!(next_normalized, HIDDEN);
     Ok(count)
+}
+
+fn verify_inactive_cache(
+    rows: usize,
+    observed: &Qwen36FullAttentionLayerObservables,
+) -> Result<usize, Qwen36FullAttentionLayerQualificationError> {
+    let mut active = vec![false; observed.key_pages.len()];
+    for token in 0..rows {
+        let (physical_page, page_position) = if rows <= MAX_BATCH {
+            (token * 3, 0)
+        } else {
+            (token / ATTENTION_PAGE_SIZE, token % ATTENTION_PAGE_SIZE)
+        };
+        for head in 0..KV_HEADS {
+            for dimension in 0..HEAD_DIM {
+                active[cache_offset(physical_page, head, page_position, dimension)] = true;
+            }
+        }
+    }
+    for (index, ((&key, &value), &is_active)) in observed
+        .key_pages
+        .iter()
+        .zip(&observed.value_pages)
+        .zip(&active)
+        .enumerate()
+    {
+        if !is_active && (key != 0 || value != 0) {
+            return Err(Qwen36FullAttentionLayerQualificationError::Mismatch(
+                format!(
+                    "{} modified inactive cache value {index}",
+                    route_label(rows)
+                ),
+            ));
+        }
+    }
+
+    Ok(2 * active.iter().filter(|&&is_active| !is_active).count())
+}
+
+fn cache_offset(
+    physical_page: usize,
+    head: usize,
+    page_position: usize,
+    dimension: usize,
+) -> usize {
+    dimension + HEAD_DIM * (page_position + ATTENTION_PAGE_SIZE * (head + KV_HEADS * physical_page))
 }
 
 fn verify_immutable(
@@ -936,12 +1154,12 @@ fn verify_no_device_allocation(
     program: &Qwen36FullAttentionLayerProgram,
     stream: &CudaStream,
 ) -> Result<(), Qwen36FullAttentionLayerQualificationError> {
-    program.replay(stream, MAX_BATCH)?;
+    program.replay(stream, MAX_ROWS)?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
     for _ in 0..2 {
-        for batch in [1, 8, 3, 6, 2, 7, 4, 5] {
-            program.replay(stream, batch)?;
+        for rows in [128, 1, 64, 8, 32, 3, 6, 2, 7, 4, 5] {
+            program.replay(stream, rows)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -986,6 +1204,32 @@ fn compare_exact<T: PartialEq>(
         ));
     }
     Ok(())
+}
+
+fn compare_f32_bits(
+    role: &str,
+    actual: &[f32],
+    expected: &[f32],
+) -> Result<(), Qwen36FullAttentionLayerQualificationError> {
+    compare_exact(
+        role,
+        &actual
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        &expected
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn route_label(rows: usize) -> String {
+    if rows <= MAX_BATCH {
+        format!("B={rows}")
+    } else {
+        format!("T={rows}")
+    }
 }
 
 fn compare_bf16(
@@ -1083,6 +1327,7 @@ mod tests {
     fn source_layer_and_owner_geometry_are_exact() {
         assert_eq!(SOURCE_LAYER, 3);
         assert_eq!(ATTENTION_PAGE_SIZE, 64);
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
         assert_eq!(
             2 * 24 * KV_HEADS * ATTENTION_PAGE_SIZE * HEAD_DIM * 2,
             3_145_728
@@ -1100,16 +1345,17 @@ mod tests {
         })?;
         let report = qualify_qwen36_full_attention_layer(Path::new(&root))?;
 
-        assert_eq!(report.boundary_values, 368_640);
+        assert_eq!(report.boundary_values, 2_662_400);
         assert_eq!(report.weight_bytes, 483_085_312);
         assert_eq!(report.cache_bytes, 3_145_728);
-        assert_eq!(report.workspace_bytes, 1_161_680);
-        assert_eq!(report.arena_bytes, 487_394_048);
-        assert_eq!(report.padding_bytes, 1_328);
+        assert_eq!(report.workspace_bytes, 18_587_584);
+        assert_eq!(report.arena_bytes, 504_819_456);
+        assert_eq!(report.padding_bytes, 832);
         assert!(report.source_values > 0);
         assert!(report.graph_replay_values > 0);
         assert!(report.inactive_values > 0);
         assert!(report.immutable_values > 0);
+        assert!(report.runtime_input_values > 0);
         assert!(report.maximum_absolute_error.is_finite());
         Ok(())
     }
