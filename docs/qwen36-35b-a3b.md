@@ -170,7 +170,10 @@ timing remains unreported because the available card was occupied. Exact endpoin
 the mmap-backed BF16 embeddings/final norm and losslessly swizzle the LM-head E4M3 plane while
 borrowing its packed E2M1 words. A single-allocation resident owner now stages embedding rows
 without rescanning the LM-head source and captures final-norm plus NVFP4 LM-head graphs at every
-exact `B=1..8`; source-backed device qualification is the next separate slice.
+exact `B=1..8`. Its source-backed gate passes 73,728 exact embedding values, 73,728 final-norm
+values, 2,304 sampled full-formula represented NVFP4 logits, complete eager/graph agreement,
+inactive-row sentinels, immutable source planes, stable addresses, and zero post-warmup device
+growth in one 290,107,392-byte arena. Direct endpoint timing remains a separate unblessed slice.
 
 ## Implementation order
 
