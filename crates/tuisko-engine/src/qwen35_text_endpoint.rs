@@ -145,6 +145,29 @@ impl Qwen35TextEndpointProgram {
         )?)
     }
 
+    /// Reads active BF16 logits into one reusable host allocation.
+    pub fn read_logits_into(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        require_batch(batch)?;
+        let expected = batch
+            .checked_mul(Qwen35_9B::VOCAB)
+            .ok_or_else(|| EngineError::layout("Qwen3.5 endpoint logit count overflows"))?;
+        if destination.len() != expected {
+            return Err(EngineError::layout(format!(
+                "Qwen3.5 endpoint logit destination has {} values, expected {expected} for B={batch}",
+                destination.len()
+            )));
+        }
+        self.arena
+            .copy_prefix_to_host_slice(stream, self.layout.logits(), destination)?;
+
+        Ok(())
+    }
+
     /// CUDA context shared by the program and all resources.
     pub const fn context(&self) -> &Arc<CudaContext> {
         &self.context

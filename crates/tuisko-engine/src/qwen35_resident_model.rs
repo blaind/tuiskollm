@@ -306,6 +306,16 @@ impl Qwen35ResidentModelProgram {
         self.endpoint.read_logits(stream, batch)
     }
 
+    /// Reads active BF16 logits into one reusable host allocation.
+    pub fn read_logits_into(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        self.endpoint.read_logits_into(stream, batch, destination)
+    }
+
     /// Reads the final decoder residual before endpoint normalization.
     pub fn read_final_residual(&self, stream: &CudaStream, batch: usize) -> EngineResult<Vec<u16>> {
         require_batch(batch)?;
@@ -342,6 +352,11 @@ impl Qwen35ResidentModelProgram {
     /// Fixed short-context capacity of each full-attention slot.
     pub const fn context_capacity(&self) -> usize {
         self.layout.context_capacity()
+    }
+
+    /// Page-locked bytes used to gather mmap-backed embedding rows.
+    pub fn host_stager_bytes(&self) -> usize {
+        self.endpoint.host_stager_bytes()
     }
 
     #[cfg(feature = "qualification")]
