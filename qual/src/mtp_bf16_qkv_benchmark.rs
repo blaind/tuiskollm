@@ -7,7 +7,7 @@ use crate::device_benchmark::{
     preflight, require_current_process_exclusive, warmup_launches,
 };
 use crate::fp8_projection_oracle::f32_to_bf16;
-use crate::mtp_bf16_qkv::{MAX_BATCH, OUTPUT_ROWS, Regions, layout};
+use crate::mtp_bf16_qkv::{MAX_BATCH, MAX_TOKENS, OUTPUT_ROWS, Regions, layout};
 use crate::target::MtpBf16QkvOp;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer};
@@ -74,6 +74,11 @@ impl Session {
     }
 
     fn warm(&self, launches: u64) -> GpuResult<()> {
+        for route in &self.routes {
+            // SAFETY: this Session owns the repeated route graph and every captured
+            // allocation until after this synchronized replay.
+            unsafe { route.repeated.launch(&self.stream) }?;
+        }
         for _ in 0..launches {
             for route in &self.routes {
                 // SAFETY: this Session owns both these route graphs and everything they
@@ -106,14 +111,18 @@ impl Session {
 }
 
 fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuResult<()> {
-    let input = (0..MAX_BATCH * Qwen38_27B::HIDDEN)
-        .map(|index| f32_to_bf16(INPUT_PATTERN[(index * 3 + index / Qwen38_27B::HIDDEN) & 7]))
-        .collect::<Vec<_>>();
+    let input = make_input();
     // A nonzero BF16 plane forces every gathered source-shaped word through the timed path.
     let weight = vec![f32_to_bf16(0.015625); OUTPUT_ROWS * Qwen38_27B::HIDDEN];
 
     arena.copy_from_host(stream, regions.input, &input)?;
     arena.copy_from_host(stream, regions.weight, &weight)
+}
+
+fn make_input() -> Vec<u16> {
+    (0..MAX_TOKENS * Qwen38_27B::HIDDEN)
+        .map(|index| f32_to_bf16(INPUT_PATTERN[(index * 3 + index / Qwen38_27B::HIDDEN) & 7]))
+        .collect()
 }
 
 fn capture_route(
@@ -218,7 +227,7 @@ pub fn benchmark_mtp_bf16_qkv(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, layout, logical_bytes};
+    use super::{MAX_BATCH, layout, logical_bytes, make_input};
 
     #[test]
     fn mtp_bf16_qkv_suite_benchmark_accounting_exposes_every_byte() {
@@ -228,6 +237,10 @@ mod tests {
         assert_eq!(regions.workspace_bytes(), 39_845_888);
         assert_eq!(regions.payload_bytes(), 186_646_528);
         assert_eq!(layout.byte_len(), regions.payload_bytes());
+        assert_eq!(
+            make_input().len() * size_of::<u16>(),
+            regions.input.byte_len()
+        );
         assert_eq!(logical_bytes(1), 146_839_552);
         assert_eq!(logical_bytes(MAX_BATCH), 147_111_936);
     }

@@ -11,7 +11,7 @@ use tuisko_gpu::{
 use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen38_27B};
 
 pub(crate) const MAX_BATCH: usize = 8;
-const MAX_TOKENS: usize = 1_024;
+pub(crate) const MAX_TOKENS: usize = 1_024;
 const ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const ALIGNMENT: usize = 256;
 pub(crate) const INPUT_COLUMNS: usize = Qwen38_27B::HIDDEN;
@@ -448,6 +448,11 @@ mod tests {
     #[test]
     fn mtp_bf16_qkv_suite_route_and_byte_inventory_is_exact() {
         let (layout, regions) = layout().unwrap();
+        let active_tokens = ROUTES.iter().sum::<usize>();
+        let inactive_tokens = ROUTES
+            .iter()
+            .map(|&batch| MAX_TOKENS - batch)
+            .sum::<usize>();
 
         assert_eq!(
             (1..=MAX_BATCH).collect::<Vec<_>>(),
@@ -455,6 +460,8 @@ mod tests {
         );
         assert_eq!(OUTPUT_ROWS, 14_336);
         assert_eq!(ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
+        assert_eq!(active_tokens, 1_284);
+        assert_eq!(inactive_tokens, 11_004);
         assert_eq!(MAX_TOKENS, 1_024);
         assert_eq!(regions.weight_bytes(), 146_800_640);
         assert_eq!(regions.workspace_bytes(), 39_845_888);
@@ -469,11 +476,16 @@ mod tests {
             std::env::var_os("TUISKO_SNAPSHOT").expect("TUISKO_SNAPSHOT must name the snapshot"),
         );
         let report = qualify_mtp_bf16_qkv(&root).expect("MTP BF16 QKV qualification");
+        let active_tokens = ROUTES.iter().sum::<usize>();
+        let inactive_tokens = ROUTES
+            .iter()
+            .map(|&batch| MAX_TOKENS - batch)
+            .sum::<usize>();
 
-        assert_eq!(report.output_values, 1_320 * OUTPUT_ROWS);
+        assert_eq!(report.output_values, active_tokens * OUTPUT_ROWS);
         assert_eq!(report.source_output_values, OUTPUT_ROWS);
-        assert_eq!(report.graph_replay_values, 1_320 * OUTPUT_ROWS);
-        assert_eq!(report.inactive_values, 2 * 10_968 * OUTPUT_ROWS);
+        assert_eq!(report.graph_replay_values, active_tokens * OUTPUT_ROWS);
+        assert_eq!(report.inactive_values, 2 * inactive_tokens * OUTPUT_ROWS);
         assert_eq!(report.weight_bytes, 146_800_640);
         assert_eq!(report.workspace_bytes, 39_845_888);
         assert_eq!(report.arena_bytes, 186_646_528);
