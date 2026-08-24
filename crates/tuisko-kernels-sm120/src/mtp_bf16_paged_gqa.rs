@@ -1,6 +1,6 @@
 //! Source-BF16 paged grouped-query attention for the Qwen3.8 MTP layer.
 
-use crate::device::paged_gqa::qwen35_paged_gqa_bf16;
+use crate::device::paged_gqa::bf16_paged_gqa;
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -43,7 +43,7 @@ mod kernels {
         // online-softmax order. B=8 exposes 192 CTAs, enough for one target-SM
         // wave; combining heads would change the represented arithmetic route.
         unsafe {
-            qwen35_paged_gqa_bf16::<Qwen38_27B, TOKENS>(
+            bf16_paged_gqa::<Qwen38_27B, TOKENS>(
                 query,
                 key_pages,
                 value_pages,

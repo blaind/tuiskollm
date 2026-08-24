@@ -1,6 +1,6 @@
 //! Source-BF16 Q/K preparation and cache append for the Qwen3.8 MTP layer.
 
-use crate::device::attention_qk_prepare::qwen35_attention_qk_prepare;
+use crate::device::attention_qk_prepare::bf16_attention_qk_prepare;
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -48,7 +48,7 @@ mod kernels {
         // One warp owns one 256-wide head. Eight warps retain warp-local RMSNorm
         // and MRoPE while B=8 exposes 28 CTAs on the 170-SM target.
         unsafe {
-            qwen35_attention_qk_prepare::<Qwen38_27B, TOKENS>(
+            bf16_attention_qk_prepare::<Qwen38_27B, TOKENS>(
                 qkv,
                 query_norm,
                 key_norm,
@@ -94,7 +94,7 @@ mod kernels {
         // exposes 112 CTAs and T=1024 exposes 3,584, without changing the
         // warp-local reduction or MRoPE arithmetic qualified for decode.
         unsafe {
-            qwen35_attention_qk_prepare::<Qwen38_27B, TOKENS>(
+            bf16_attention_qk_prepare::<Qwen38_27B, TOKENS>(
                 qkv,
                 query_norm,
                 key_norm,

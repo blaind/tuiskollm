@@ -198,7 +198,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-attention-qk-prepare` | Check Q/K zero-centered normalization, three-axis MRoPE, represented E4M3 cache append, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-paged-gqa` | Check exact page lookup, grouped-head mapping, represented E4M3 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8, shared T=32/64/128 prefill, and partitioned T=128 P8/P16 deep tails | terminal |
 | `cargo run -p xtask -- qualify-qwen35-paged-gqa` | Check Qwen3.5 exact page lookup, grouped-head mapping, represented BF16 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-paged-gqa` | Check Qwen3.6 exact page lookup, 8:1 grouped-head mapping, represented BF16 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-qwen36-paged-gqa` | Check Qwen3.6 exact page lookup, 8:1 grouped-head mapping, represented BF16 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
 | `cargo run -p xtask -- qualify-long-context-paged-gqa` | Check every partition bucket through 220,000 positions, all partial/reduction seams, untouched scratch, and graph replay at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-attention-output` | Check sigmoid gating, the published FP32 seam, dynamic E4M3 quantization, source-native projection, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-mtp-bf16-fusion SNAPSHOT` | Check both source zero-centered normalization seams, the complete source-BF16 `[5120,10240]` projection, exact B=1..8 routes, immutable inputs/weights, graph replay, stable addresses, and owner allocation | terminal |
@@ -230,7 +230,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-attention-qk-prepare` | Measure every exact Q/K prepare and cache-append graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-paged-gqa` | Measure exact B=1..8 graphs at a 130-token context, causal shared T=32/64/128 graphs, partitioned T=128 tails, and production-P4 T=1024 macro graphs at contexts 32,768 and 98,304 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-paged-gqa` | Measure every exact Qwen3.5 B=1..8 BF16 paged-GQA graph at a 130-token context | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-paged-gqa` | Measure every exact Qwen3.6 B=1..8 BF16 paged-GQA graph at a 130-token context | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-paged-gqa` | Measure every exact Qwen3.6 B=1..8 and T=32/64/128 BF16 paged-GQA graph at a 130-token context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-long-context-paged-gqa` | Measure every exact two-stage paged GQA graph with the complete 3,438-page pool divided among active slots | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-output` | Measure every exact sigmoid-gate, quantize, and output-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-mtp-bf16-fusion` | Measure every exact B=1..8 production graph for both BF16 norms plus the source-BF16 MTP fusion projection | terminal or `--json PATH` |
