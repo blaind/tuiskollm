@@ -10,6 +10,8 @@ use tuisko_gpu::{
 use tuisko_model::{Arch, Qwen35_9B};
 
 pub(crate) const MAX_BATCH: usize = 8;
+pub(crate) const MAX_ROWS: usize = 128;
+pub(crate) const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, MAX_BATCH, 32, 64, MAX_ROWS];
 const ALIGNMENT: usize = 256;
 pub(crate) const HEAD_DIM: usize = Qwen35_9B::LINEAR_HEAD_DIM;
 pub(crate) const KEY_HEADS: usize = Qwen35_9B::LINEAR_KEY_HEADS;
@@ -118,7 +120,7 @@ struct Oracle {
     output: Vec<f64>,
 }
 
-/// Qualifies eager and captured Qwen3.5 recurrence at `B=1..=8`.
+/// Qualifies eager and captured Qwen3.5 recurrence at every exact route.
 pub fn qualify_qwen35_gdn_recurrence()
 -> Result<Qwen35GdnRecurrenceQualification, Qwen35GdnRecurrenceQualificationError> {
     let _preflight = device_benchmark::preflight()?;
@@ -152,23 +154,23 @@ pub fn qualify_qwen35_gdn_recurrence()
         maximum_output_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
+    for rows in EXACT_ROUTES {
         reset_state(&arena, &stream, regions, &fixture)?;
-        launch(&op, &arena, &stream, regions, batch)?;
+        launch(&op, &arena, &stream, regions, rows)?;
         let eager = observe(&arena, &stream, regions)?;
-        verify_oracle(batch, &fixture, &eager, &mut report)?;
+        verify_oracle(rows, &fixture, &eager, &mut report)?;
 
         reset_state(&arena, &stream, regions, &fixture)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
+        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, rows))?;
         // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
         unsafe { graph.launch(&stream) }?;
         let replay = observe(&arena, &stream, regions)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(Qwen35GdnRecurrenceQualificationError::Mismatch(format!(
-                "device addresses changed while qualifying B={batch}"
+                "device addresses changed while qualifying row count {rows}"
             )));
         }
     }
@@ -191,14 +193,14 @@ pub fn qualify_qwen36_gdn_recurrence()
 
 pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let qkv = layout.reserve(MAX_BATCH * Qwen35_9B::GDN_QKV_ROWS, ALIGNMENT)?;
-    let projected = layout.reserve(MAX_BATCH * Qwen35_9B::GDN_INPUT_ROWS, ALIGNMENT)?;
-    let log_decay = layout.reserve(MAX_BATCH * VALUE_HEADS, ALIGNMENT)?;
-    let beta = layout.reserve(MAX_BATCH * VALUE_HEADS, ALIGNMENT)?;
+    let qkv = layout.reserve(MAX_ROWS * Qwen35_9B::GDN_QKV_ROWS, ALIGNMENT)?;
+    let projected = layout.reserve(MAX_ROWS * Qwen35_9B::GDN_INPUT_ROWS, ALIGNMENT)?;
+    let log_decay = layout.reserve(MAX_ROWS * VALUE_HEADS, ALIGNMENT)?;
+    let beta = layout.reserve(MAX_ROWS * VALUE_HEADS, ALIGNMENT)?;
     let norm_weight = layout.reserve(HEAD_DIM, ALIGNMENT)?;
     let state_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
     let state = layout.reserve(MAX_BATCH * STATE_PER_ROW, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * VALUE_WIDTH, ALIGNMENT)?;
+    let output = layout.reserve(MAX_ROWS * VALUE_WIDTH, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -220,9 +222,9 @@ pub(crate) fn make_fixture() -> Fixture {
     const VALUE: [f32; 8] = [0.5, -0.375, 0.25, -0.125, 0.0625, -0.03125, 0.1875, -0.25];
     const GATE: [f32; 8] = [-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0];
     const NORM: [f32; 8] = [0.75, 0.875, 1.0, 1.125, 0.625, 1.25, 0.5, 1.5];
-    let mut qkv = vec![0; MAX_BATCH * Qwen35_9B::GDN_QKV_ROWS];
-    let mut projected = vec![0; MAX_BATCH * Qwen35_9B::GDN_INPUT_ROWS];
-    for token in 0..MAX_BATCH {
+    let mut qkv = vec![0; MAX_ROWS * Qwen35_9B::GDN_QKV_ROWS];
+    let mut projected = vec![0; MAX_ROWS * Qwen35_9B::GDN_INPUT_ROWS];
+    for token in 0..MAX_ROWS {
         let qkv_base = token * Qwen35_9B::GDN_QKV_ROWS;
         for index in 0..QK_WIDTH {
             qkv[qkv_base + index] = f32_to_bf16(QK[(index + token) & 7]);
@@ -234,10 +236,10 @@ pub(crate) fn make_fixture() -> Fixture {
                 f32_to_bf16(GATE[(index + index / HEAD_DIM + token) & 7]);
         }
     }
-    let log_decay = (0..MAX_BATCH * VALUE_HEADS)
+    let log_decay = (0..MAX_ROWS * VALUE_HEADS)
         .map(|index| -0.125 - (index & 7) as f32 * 0.03125)
         .collect();
-    let beta = (0..MAX_BATCH * VALUE_HEADS)
+    let beta = (0..MAX_ROWS * VALUE_HEADS)
         .map(|index| 0.25 + (index & 3) as f32 * 0.125)
         .collect();
     let norm_weight = (0..HEAD_DIM)
@@ -300,12 +302,12 @@ pub(crate) fn launch(
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     unsafe {
         op.launch(
             stream,
-            batch,
+            rows,
             arena.address(regions.qkv)?,
             arena.address(regions.projected)?,
             arena.address(regions.log_decay)?,
@@ -325,14 +327,19 @@ fn observe(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuRes
     })
 }
 
-fn oracle(batch: usize, fixture: &Fixture) -> Oracle {
+fn oracle(rows: usize, fixture: &Fixture) -> Oracle {
     let mut state = fixture
         .state
         .iter()
         .map(|&value| f64::from(value))
         .collect::<Vec<_>>();
-    let mut output = vec![0.0; batch * VALUE_WIDTH];
-    for (token, &state_row) in STATE_ROWS[..batch].iter().enumerate() {
+    let mut output = vec![0.0; rows * VALUE_WIDTH];
+    for token in 0..rows {
+        let state_row = if rows <= MAX_BATCH {
+            STATE_ROWS[token]
+        } else {
+            STATE_ROWS[0]
+        };
         let qkv_base = token * Qwen35_9B::GDN_QKV_ROWS;
         let mut query = vec![[0.0f64; HEAD_DIM]; KEY_HEADS];
         let mut key = vec![[0.0f64; HEAD_DIM]; KEY_HEADS];
@@ -390,22 +397,27 @@ fn oracle(batch: usize, fixture: &Fixture) -> Oracle {
 }
 
 fn verify_oracle(
-    batch: usize,
+    rows: usize,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut Qwen35GdnRecurrenceQualification,
 ) -> Result<(), Qwen35GdnRecurrenceQualificationError> {
-    let expected = oracle(batch, fixture);
-    let active_rows = &STATE_ROWS[..batch];
+    let expected = oracle(rows, fixture);
     for (index, (&actual, &expected)) in observed.state.iter().zip(&expected.state).enumerate() {
         let error = (f64::from(actual) - expected).abs() as f32;
         report.maximum_state_error = report.maximum_state_error.max(error);
         if error > 2.0e-4f32.max(expected.abs() as f32 * 0.002) {
             return Err(Qwen35GdnRecurrenceQualificationError::Mismatch(format!(
-                "state at B={batch}, index={index}: device={actual}, oracle={expected}, error={error}"
+                "state at rows={rows}, index={index}: device={actual}, oracle={expected}, error={error}"
             )));
         }
-        if active_rows.contains(&((index / STATE_PER_ROW) as u32)) {
+        let state_row = (index / STATE_PER_ROW) as u32;
+        let active = if rows <= MAX_BATCH {
+            STATE_ROWS[..rows].contains(&state_row)
+        } else {
+            state_row == STATE_ROWS[0]
+        };
+        if active {
             report.state_values += 1;
         } else {
             report.inactive_values += 1;
@@ -417,27 +429,27 @@ fn verify_oracle(
         report.maximum_output_error = report.maximum_output_error.max(error);
         if error > 0.015625f32.max(expected.abs() as f32 * 0.01) {
             return Err(Qwen35GdnRecurrenceQualificationError::Mismatch(format!(
-                "output at B={batch}, index={index}: device={actual}, oracle={expected}, error={error}"
+                "output at rows={rows}, index={index}: device={actual}, oracle={expected}, error={error}"
             )));
         }
         report.output_values += 1;
     }
-    if let Some(relative) = observed.output[batch * VALUE_WIDTH..]
+    if let Some(relative) = observed.output[rows * VALUE_WIDTH..]
         .iter()
         .position(|&bits| bits != BF16_SENTINEL)
     {
         return Err(Qwen35GdnRecurrenceQualificationError::Mismatch(format!(
-            "B={batch} modified inactive output {}",
-            batch * VALUE_WIDTH + relative
+            "rows={rows} modified inactive output {}",
+            rows * VALUE_WIDTH + relative
         )));
     }
-    report.inactive_values += (MAX_BATCH - batch) * VALUE_WIDTH;
+    report.inactive_values += (MAX_ROWS - rows) * VALUE_WIDTH;
 
     Ok(())
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     eager: &Observed,
     replay: &Observed,
     report: &mut Qwen35GdnRecurrenceQualification,
@@ -449,7 +461,7 @@ fn verify_replay(
         .position(|(actual, expected)| actual.to_bits() != expected.to_bits())
     {
         return Err(Qwen35GdnRecurrenceQualificationError::Mismatch(format!(
-            "B={batch} graph state value {index} differs from eager"
+            "rows={rows} graph state value {index} differs from eager"
         )));
     }
     if let Some(index) = replay
@@ -459,10 +471,10 @@ fn verify_replay(
         .position(|(actual, expected)| actual != expected)
     {
         return Err(Qwen35GdnRecurrenceQualificationError::Mismatch(format!(
-            "B={batch} graph output value {index} differs from eager"
+            "rows={rows} graph output value {index} differs from eager"
         )));
     }
-    report.graph_replay_values += replay.state.len() + batch * VALUE_WIDTH;
+    report.graph_replay_values += replay.state.len() + rows * VALUE_WIDTH;
 
     Ok(())
 }
@@ -508,8 +520,9 @@ fn verify_no_post_warmup_allocation(
     stream: &CudaStream,
     regions: Regions,
 ) -> Result<(), Qwen35GdnRecurrenceQualificationError> {
-    let graphs = (1..=MAX_BATCH)
-        .map(|batch| CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch)))
+    let graphs = EXACT_ROUTES
+        .iter()
+        .map(|&rows| CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows)))
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
         // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
@@ -518,9 +531,9 @@ fn verify_no_post_warmup_allocation(
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
-        for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
+        for graph in graphs.iter().rev() {
             // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
-            unsafe { graphs[batch - 1].launch(stream) }?;
+            unsafe { graph.launch(stream) }?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -543,34 +556,39 @@ mod tests {
         let (layout, regions) = layout().unwrap();
 
         assert_eq!(regions.weight_bytes(), 256);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 17_172_512);
-        assert_eq!(regions.payload_bytes(), 17_172_768);
-        assert_eq!(layout.byte_len(), 17_172_992);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 23_101_472);
+        assert_eq!(regions.payload_bytes(), 23_101_728);
+        assert_eq!(layout.byte_len(), 23_101_952);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 224);
     }
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn exact_batches_match_independent_oracles_and_graph_replay()
+    fn exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), Qwen35GdnRecurrenceQualificationError> {
         let report = qualify_qwen35_gdn_recurrence()?;
-        let active_rows = (1..=MAX_BATCH).sum::<usize>();
-        let inactive_rows = (0..MAX_BATCH).sum::<usize>();
+        let active_output_rows = EXACT_ROUTES.iter().sum::<usize>();
+        let active_state_rows = (1..=MAX_BATCH).sum::<usize>() + 3;
+        let inactive_state_rows = (0..MAX_BATCH).sum::<usize>() + 3 * (MAX_BATCH - 1);
+        let inactive_output_rows = EXACT_ROUTES
+            .iter()
+            .map(|rows| MAX_ROWS - rows)
+            .sum::<usize>();
 
-        assert_eq!(report.state_values, active_rows * STATE_PER_ROW);
-        assert_eq!(report.output_values, active_rows * VALUE_WIDTH);
+        assert_eq!(report.state_values, active_state_rows * STATE_PER_ROW);
+        assert_eq!(report.output_values, active_output_rows * VALUE_WIDTH);
         assert_eq!(
             report.graph_replay_values,
-            MAX_BATCH * MAX_BATCH * STATE_PER_ROW + active_rows * VALUE_WIDTH
+            EXACT_ROUTES.len() * MAX_BATCH * STATE_PER_ROW + active_output_rows * VALUE_WIDTH
         );
         assert_eq!(
             report.inactive_values,
-            inactive_rows * (STATE_PER_ROW + VALUE_WIDTH)
+            inactive_state_rows * STATE_PER_ROW + inactive_output_rows * VALUE_WIDTH
         );
-        assert_eq!(report.immutable_input_values, 164_488);
-        assert_eq!(report.arena_bytes, 17_172_992);
+        assert_eq!(report.immutable_input_values, 2_629_768);
+        assert_eq!(report.arena_bytes, 23_101_952);
         assert_eq!(report.weight_bytes, 256);
-        assert_eq!(report.workspace_bytes, 17_172_512);
+        assert_eq!(report.workspace_bytes, 23_101_472);
         assert_eq!(report.padding_bytes, 224);
         assert!(report.maximum_state_error <= 0.002);
         assert!(report.maximum_output_error <= 0.03125);
@@ -580,13 +598,13 @@ mod tests {
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn qwen36_exact_batches_match_shared_independent_oracle()
+    fn qwen36_exact_routes_match_shared_independent_oracle()
     -> Result<(), Qwen36GdnRecurrenceQualificationError> {
         let report = qualify_qwen36_gdn_recurrence()?;
 
-        assert_eq!(report.state_values, 18_874_368);
-        assert_eq!(report.output_values, 147_456);
-        assert_eq!(report.arena_bytes, 17_172_992);
+        assert_eq!(report.state_values, 20_447_232);
+        assert_eq!(report.output_values, 1_064_960);
+        assert_eq!(report.arena_bytes, 23_101_952);
         assert_eq!(report.weight_bytes, 256);
         assert!(report.maximum_state_error <= 0.002);
         assert!(report.maximum_output_error <= 0.03125);

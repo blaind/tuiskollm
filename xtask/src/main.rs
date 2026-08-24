@@ -1822,7 +1822,7 @@ fn qualify_qwen36_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "qwen35_gdn_recurrence::tests::qwen36_exact_batches_match_shared_independent_oracle",
+            "qwen35_gdn_recurrence::tests::qwen36_exact_routes_match_shared_independent_oracle",
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -11649,9 +11649,18 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("qwen35_gdn_recurrence_exact_TID_"))
         .collect::<Vec<_>>();
+    let prefill = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_gdn_recurrence_prefill_exact_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.5 GDN recurrence", routes.len(), 8)?;
+    require_count("Qwen3.5/Qwen3.6 GDN recurrence prefill", prefill.len(), 3)?;
 
-    for entry in &routes {
+    for entry in routes.iter().chain(&prefill) {
         if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 512-thread/two-CTA launch bounds",
@@ -11692,36 +11701,51 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
     let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
     let sass = String::from_utf8(sass.stdout)?;
     let mut registers = Vec::new();
+    let mut prefill_registers = Vec::new();
     let mut shared = Vec::new();
-    for entry in routes {
-        let resource = resources
-            .get(entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted Qwen3.5 GDN recurrence `{}`", entry.name))?;
-        require_spill_free(entry.name, resource)?;
-        let body = sass_function_body(&sass, entry.name).ok_or_else(|| {
-            format!(
-                "cuobjdump omitted Qwen3.5 GDN recurrence SASS `{}`",
-                entry.name
-            )
-        })?;
-        for instruction in ["MUFU.RSQ", "MUFU.EX2"] {
-            if !body.contains(instruction) {
-                return Err(
-                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
-                );
+    for (role, entries, role_registers) in [
+        ("decode", routes, &mut registers),
+        ("prefill", prefill, &mut prefill_registers),
+    ] {
+        for entry in entries {
+            let resource = resources.get(entry.name).ok_or_else(|| {
+                format!(
+                    "cuobjdump omitted Qwen3.5 GDN recurrence {role} `{}`",
+                    entry.name
+                )
+            })?;
+            require_spill_free(entry.name, resource)?;
+            let body = sass_function_body(&sass, entry.name).ok_or_else(|| {
+                format!(
+                    "cuobjdump omitted Qwen3.5 GDN recurrence {role} SASS `{}`",
+                    entry.name
+                )
+            })?;
+            for instruction in ["MUFU.RSQ", "MUFU.EX2"] {
+                if !body.contains(instruction) {
+                    return Err(format!(
+                        "entry `{}` lost required `{instruction}` SASS",
+                        entry.name
+                    )
+                    .into());
+                }
             }
+            role_registers.push(resource.registers);
+            shared.push(resource.shared);
         }
-        registers.push(resource.registers);
-        shared.push(resource.shared);
     }
     registers.sort_unstable();
+    prefill_registers.sort_unstable();
     shared.sort_unstable();
     require_registers(&baseline, "recurrence_registers", &registers)?;
+    if baseline.contains_key("prefill_registers") {
+        require_registers(&baseline, "prefill_registers", &prefill_registers)?;
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "Qwen3.5 GDN recurrence gate passed: 8 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/EX2 present",
-        registers, shared
+        "Qwen3.5/Qwen3.6 GDN recurrence gate passed: 8 decode + 3 prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/EX2 present",
+        registers, prefill_registers, shared
     );
     Ok(())
 }
