@@ -52,7 +52,7 @@ pub use nvfp4_down::{Nvfp4DownOp, Qwen35Nvfp4DownOp};
 pub use nvfp4_gdn_input::Qwen35Nvfp4GdnInputOp;
 pub use nvfp4_qkv::Qwen35Nvfp4QkvOp;
 pub use nvfp4_swiglu::{Nvfp4SwiGluOp, Qwen35Nvfp4SwiGluOp};
-pub use residual_norm::{Qwen35ResidualNormOp, ResidualNormOp};
+pub use residual_norm::{Qwen35ResidualNormOp, Qwen36ResidualNormOp, ResidualNormOp};
 
 #[cfg(test)]
 pub(crate) mod test_arch {

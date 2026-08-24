@@ -1,13 +1,13 @@
 //! Numerical and graph qualification for the exact residual-norm routes.
 
-#[cfg(feature = "device")]
-use crate::target::Qwen35ResidualNormOp;
 use crate::target::{EXPECTED_COMPUTE_CAPABILITY, ResidualNormOp};
+#[cfg(feature = "device")]
+use crate::target::{Qwen35ResidualNormOp, Qwen36ResidualNormOp};
 use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
 };
-use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const ALIGNMENT: usize = 256;
@@ -164,6 +164,47 @@ impl ResidualNormLauncher for Qwen35ResidualNormOp {
     }
 }
 
+#[cfg(feature = "device")]
+impl ResidualNormLauncher for Qwen36ResidualNormOp {
+    unsafe fn launch_plain(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        // SAFETY: this adapter preserves the operator's pointer contract.
+        unsafe { Qwen36ResidualNormOp::launch_plain(self, stream, batch, input, weight, output) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_residual(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        residual_input: *const u16,
+        branch: *const u16,
+        weight: *const u16,
+        residual_output: *mut u16,
+        normalized_output: *mut u16,
+    ) -> GpuResult<()> {
+        // SAFETY: this adapter preserves the operator's pointer contract.
+        unsafe {
+            Qwen36ResidualNormOp::launch_residual(
+                self,
+                stream,
+                batch,
+                residual_input,
+                branch,
+                weight,
+                residual_output,
+                normalized_output,
+            )
+        }
+    }
+}
+
 /// Qualifies eager and captured exact `B=1..8` execution on device zero.
 pub fn qualify_residual_norm() -> Result<ResidualNormQualification, ResidualNormQualificationError>
 {
@@ -175,6 +216,13 @@ pub fn qualify_residual_norm() -> Result<ResidualNormQualification, ResidualNorm
 pub fn qualify_qwen35_residual_norm()
 -> Result<ResidualNormQualification, ResidualNormQualificationError> {
     qualify_target::<Qwen35_9B, Qwen35ResidualNormOp>(Qwen35ResidualNormOp::new)
+}
+
+/// Qualifies the exact Qwen3.6 2,048-wide routes on SM120 device zero.
+#[cfg(feature = "device")]
+pub fn qualify_qwen36_residual_norm()
+-> Result<ResidualNormQualification, ResidualNormQualificationError> {
+    qualify_target::<Qwen36Moe35B, Qwen36ResidualNormOp>(Qwen36ResidualNormOp::new)
 }
 
 fn qualify_target<A: Arch, O: ResidualNormLauncher>(
@@ -508,12 +556,12 @@ pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "device")]
-    use super::qualify_qwen35_residual_norm;
     use super::{
-        MAX_BATCH, Qwen35_9B, Qwen38_27B, ResidualNormQualificationError, bf16_to_f32, f32_to_bf16,
-        qualify_residual_norm,
+        MAX_BATCH, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, ResidualNormQualificationError,
+        bf16_to_f32, f32_to_bf16, qualify_residual_norm,
     };
+    #[cfg(feature = "device")]
+    use super::{qualify_qwen35_residual_norm, qualify_qwen36_residual_norm};
     use tuisko_model::Arch;
 
     #[test]
@@ -551,6 +599,25 @@ mod tests {
         let report = qualify_qwen35_residual_norm()?;
         let active_per_plane = (1..=MAX_BATCH).sum::<usize>() * Qwen35_9B::HIDDEN;
         let inactive_per_run = (0..MAX_BATCH).sum::<usize>() * Qwen35_9B::HIDDEN * 3;
+
+        assert_eq!(report.plain_values, active_per_plane);
+        assert_eq!(report.residual_values, active_per_plane);
+        assert_eq!(report.normalized_values, active_per_plane);
+        assert_eq!(report.graph_replay_values, active_per_plane * 3);
+        assert_eq!(report.inactive_values, inactive_per_run * 2);
+        assert!(report.maximum_absolute_error <= 0.015625);
+
+        Ok(())
+    }
+
+    #[cfg(feature = "device")]
+    #[test]
+    #[ignore = "requires an exclusive RTX 5090"]
+    fn qwen36_exact_batches_match_independent_oracles_and_graph_replay()
+    -> Result<(), ResidualNormQualificationError> {
+        let report = qualify_qwen36_residual_norm()?;
+        let active_per_plane = (1..=MAX_BATCH).sum::<usize>() * Qwen36Moe35B::HIDDEN;
+        let inactive_per_run = (0..MAX_BATCH).sum::<usize>() * Qwen36Moe35B::HIDDEN * 3;
 
         assert_eq!(report.plain_values, active_per_plane);
         assert_eq!(report.residual_values, active_per_plane);
