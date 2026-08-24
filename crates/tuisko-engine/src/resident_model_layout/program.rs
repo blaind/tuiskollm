@@ -1090,6 +1090,17 @@ impl ResidentModelProgram {
         slot: usize,
         token_count: usize,
     ) -> EngineResult<PagedKvTableUpdate> {
+        let update = self.reserve_kv_slot_tokens_unpublished(stream, slot, token_count)?;
+        self.publish_kv_slot_update(stream, update)?;
+        Ok(update)
+    }
+
+    pub(crate) fn reserve_kv_slot_tokens_unpublished(
+        &mut self,
+        stream: &CudaStream,
+        slot: usize,
+        token_count: usize,
+    ) -> EngineResult<PagedKvTableUpdate> {
         let update = self.kv_slots.reserve_tokens(slot, token_count)?;
         for logical_page in update.first_entry()..update.first_entry() + update.entry_count() {
             let position = product(
@@ -1103,10 +1114,18 @@ impl ResidentModelProgram {
             .map_err(|_| EngineError::layout("resident physical page exceeds host width"))?;
             clear_physical_cache_page(&self.kv_arena, stream, &self.layout, physical_page)?;
         }
-        if !update.is_empty() {
-            self.sync_kv_table_row(stream, slot)?;
-        }
         Ok(update)
+    }
+
+    pub(crate) fn publish_kv_slot_update(
+        &self,
+        stream: &CudaStream,
+        update: PagedKvTableUpdate,
+    ) -> EngineResult<()> {
+        if !update.is_empty() {
+            self.sync_kv_table_row(stream, update.slot())?;
+        }
+        Ok(())
     }
 
     /// Releases trailing pages while retaining an exact processed-token boundary.
@@ -1412,6 +1431,39 @@ impl ResidentModelProgram {
 
     pub(crate) const fn snapshot(&self) -> &Arc<CheckpointSnapshot<Qwen38_27B>> {
         &self.snapshot
+    }
+
+    pub(crate) const fn mtp_lm_head_op(&self) -> &LmHeadOp<Qwen38_27B> {
+        &self._lm_head
+    }
+
+    pub(crate) const fn mtp_lm_head_weights(&self) -> (*const u8, *const u16) {
+        (
+            self._pointers.endpoint.lm_head_codes,
+            self._pointers.endpoint.lm_head_scales,
+        )
+    }
+
+    pub(crate) fn mtp_kv_page_count(&self, slot: usize) -> EngineResult<usize> {
+        self.kv_slots.page_count(slot)
+    }
+
+    pub(crate) fn mtp_kv_token_count(&self, slot: usize) -> EngineResult<usize> {
+        self.kv_slots.token_count(slot)
+    }
+
+    pub(crate) fn mtp_kv_physical_page(
+        &self,
+        slot: usize,
+        logical_page: usize,
+    ) -> EngineResult<usize> {
+        let position = product(
+            "resident MTP logical-page position",
+            logical_page,
+            ATTENTION_PAGE_SIZE,
+        )?;
+        usize::try_from(self.kv_slots.route(slot, position)?.physical_page())
+            .map_err(|_| EngineError::layout("resident MTP physical page exceeds host width"))
     }
 
     /// Stable base address captured by all exact-batch graphs.
