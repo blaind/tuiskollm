@@ -326,8 +326,16 @@ pub struct TextFrontend {
 
 struct DecodeState {
     tokenizer: Tokenizer,
+    literal_tokenizer: Tokenizer,
     byte_table: HashMap<char, u8>,
     special_decode_ids: HashSet<u32>,
+    special_encode_tokens: Vec<(String, u32)>,
+}
+
+struct MarkedUserContent {
+    start: String,
+    end: String,
+    content: String,
 }
 
 /// Incremental decoder for one generated text sequence.
@@ -402,17 +410,29 @@ impl TextFrontend {
         let generation = read_json(&generation_path)?;
         let stop_ids = parse_stop_ids(&generation, contract)?;
         let generation_defaults = parse_generation_defaults(&generation, contract)?;
-        let special_decode_ids = tokenizer
+        let mut special_encode_tokens = tokenizer
             .get_added_tokens_decoder()
             .iter()
-            .filter_map(|(&id, token)| token.special.then_some(id))
-            .collect();
+            .filter_map(|(&id, token)| token.special.then_some((token.content.clone(), id)))
+            .collect::<Vec<_>>();
+        special_encode_tokens.sort_unstable_by(|left, right| {
+            right
+                .0
+                .len()
+                .cmp(&left.0.len())
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let special_decode_ids = special_encode_tokens.iter().map(|(_, id)| *id).collect();
+        let mut literal_tokenizer = tokenizer.clone();
+        literal_tokenizer.set_encode_special_tokens(true);
 
         Ok(Self {
             decode: Arc::new(DecodeState {
                 tokenizer,
+                literal_tokenizer,
                 byte_table: byte_level_table(),
                 special_decode_ids,
+                special_encode_tokens,
             }),
             template,
             stop_ids,
@@ -478,10 +498,10 @@ impl TextFrontend {
             .map_err(FrontendError::from)
     }
 
-    /// Encodes text without adding tokenizer-defined special tokens.
+    /// Encodes raw text without extracting tokenizer-defined special tokens.
     pub fn encode(&self, text: &str) -> FrontendResult<Vec<u32>> {
         self.decode
-            .tokenizer
+            .literal_tokenizer
             .encode(text, false)
             .map(|encoding| encoding.get_ids().to_vec())
             .map_err(|source| FrontendError::Tokenizer(format!("could not encode text: {source}")))
@@ -503,6 +523,17 @@ impl TextFrontend {
         messages: &[ChatMessage],
         options: &ChatTemplateOptions,
     ) -> FrontendResult<PromptEncoding> {
+        if self.has_literal_user_specials(messages) {
+            let (rendered, literal_ranges) =
+                self.render_chat_with_literal_user_ranges(messages, options)?;
+            let token_ids = self.encode_rendered_segments(&rendered, &literal_ranges)?;
+            return Ok(PromptEncoding {
+                token_ids,
+                reused_tokens: 0,
+                rendered_bytes: rendered.len(),
+                fresh_bytes: rendered.len(),
+            });
+        }
         let rendered = self.render_chat(messages, true, options)?;
         self.encode_rendered_with_prefix(&rendered)
     }
@@ -589,6 +620,152 @@ impl TextFrontend {
             rendered_bytes: rendered.len(),
             fresh_bytes: rendered.len(),
         })
+    }
+
+    fn has_literal_user_specials(&self, messages: &[ChatMessage]) -> bool {
+        messages.iter().any(|message| {
+            message.role == "user"
+                && self
+                    .decode
+                    .special_encode_tokens
+                    .iter()
+                    .any(|(token, _)| message.content.contains(token))
+        })
+    }
+
+    fn render_chat_with_literal_user_ranges(
+        &self,
+        messages: &[ChatMessage],
+        options: &ChatTemplateOptions,
+    ) -> FrontendResult<(String, Vec<(usize, usize)>)> {
+        let mut occupied = self.template.clone();
+        occupied.push_str(
+            &serde_json::to_string(messages).expect("chat messages serialize for marker admission"),
+        );
+        occupied.push_str(&Value::Array(options.tools.clone()).to_string());
+        if let Some(reasoning_effort) = &options.reasoning_effort {
+            occupied.push_str(reasoning_effort);
+        }
+        let marker_prefix = (0usize..)
+            .map(|nonce| format!("\u{e000}tuisko-user-{nonce}-"))
+            .find(|prefix| !occupied.contains(prefix))
+            .expect("an unused finite marker prefix exists");
+
+        let mut marked_messages = messages.to_vec();
+        let mut marked = Vec::new();
+        for (index, message) in marked_messages.iter_mut().enumerate() {
+            if message.role != "user"
+                || !self
+                    .decode
+                    .special_encode_tokens
+                    .iter()
+                    .any(|(token, _)| message.content.contains(token))
+            {
+                continue;
+            }
+            let start = format!("{marker_prefix}{index}-start\u{e001}");
+            let end = format!("{marker_prefix}{index}-end\u{e001}");
+            let content = std::mem::take(&mut message.content);
+            message.content = format!("{start}{content}{end}");
+            marked.push(MarkedUserContent {
+                start,
+                end,
+                content,
+            });
+        }
+
+        let marked_rendered = self.render_chat(&marked_messages, true, options)?;
+        let mut rendered = String::with_capacity(marked_rendered.len());
+        let mut literal_ranges = Vec::with_capacity(marked.len());
+        let mut cursor = 0;
+        for marker in marked {
+            let start = marked_rendered[cursor..]
+                .find(&marker.start)
+                .map(|offset| cursor + offset)
+                .ok_or_else(|| {
+                    FrontendError::Contract("chat template omitted a user-content marker".into())
+                })?;
+            rendered.push_str(&marked_rendered[cursor..start]);
+            let content_start = start + marker.start.len();
+            let content_end = marked_rendered[content_start..]
+                .find(&marker.end)
+                .map(|offset| content_start + offset)
+                .ok_or_else(|| {
+                    FrontendError::Contract("chat template omitted a user-content boundary".into())
+                })?;
+            if marked_rendered[content_start..content_end] != marker.content {
+                return Err(FrontendError::Contract(
+                    "chat template transformed marked user content".into(),
+                ));
+            }
+            let literal_start = rendered.len();
+            rendered.push_str(&marker.content);
+            literal_ranges.push((literal_start, rendered.len()));
+            cursor = content_end + marker.end.len();
+        }
+        rendered.push_str(&marked_rendered[cursor..]);
+        Ok((rendered, literal_ranges))
+    }
+
+    fn encode_rendered_segments(
+        &self,
+        rendered: &str,
+        literal_ranges: &[(usize, usize)],
+    ) -> FrontendResult<Vec<u32>> {
+        let mut token_ids = Vec::new();
+        let mut text_start = 0;
+        let mut search_start = 0;
+        while let Some((start, token, id)) = self.next_special_token(rendered, search_start) {
+            let end = start + token.len();
+            if literal_ranges
+                .iter()
+                .any(|&(literal_start, literal_end)| start < literal_end && end > literal_start)
+            {
+                search_start = end;
+                continue;
+            }
+            self.append_literal_ids(&rendered[text_start..start], &mut token_ids)?;
+            token_ids.push(id);
+            text_start = end;
+            search_start = end;
+        }
+        self.append_literal_ids(&rendered[text_start..], &mut token_ids)?;
+        Ok(token_ids)
+    }
+
+    fn next_special_token<'a>(
+        &'a self,
+        rendered: &'a str,
+        search_start: usize,
+    ) -> Option<(usize, &'a str, u32)> {
+        self.decode
+            .special_encode_tokens
+            .iter()
+            .filter_map(|(token, id)| {
+                rendered[search_start..]
+                    .find(token)
+                    .map(|offset| (search_start + offset, token.as_str(), *id))
+            })
+            .min_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| right.1.len().cmp(&left.1.len()))
+            })
+    }
+
+    fn append_literal_ids(&self, text: &str, token_ids: &mut Vec<u32>) -> FrontendResult<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let encoding = self
+            .decode
+            .literal_tokenizer
+            .encode(text, false)
+            .map_err(|source| {
+                FrontendError::Tokenizer(format!("could not encode literal prompt text: {source}"))
+            })?;
+        token_ids.extend_from_slice(encoding.get_ids());
+        Ok(())
     }
 
     fn push_prompt_entry(&self, rendered: &str, token_ids: Vec<u32>, token_ends: Vec<usize>) {
@@ -1183,11 +1360,16 @@ mod tests {
             .unk_token("<unk>".into())
             .build()
             .unwrap();
+        let tokenizer = Tokenizer::new(model);
+        let mut literal_tokenizer = tokenizer.clone();
+        literal_tokenizer.set_encode_special_tokens(true);
         let frontend = TextFrontend {
             decode: std::sync::Arc::new(super::DecodeState {
-                tokenizer: Tokenizer::new(model),
+                tokenizer,
+                literal_tokenizer,
                 byte_table,
                 special_decode_ids: HashSet::from([3]),
+                special_encode_tokens: vec![("<special>".into(), 3)],
             }),
             template: String::new(),
             stop_ids: vec![3],

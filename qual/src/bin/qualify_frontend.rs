@@ -19,6 +19,9 @@ const DEFAULT_HELLO: &[u32] = &[
 const NO_THINKING_HELLO: &[u32] = &[
     248045, 846, 198, 9419, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
 ];
+const LITERAL_USER_SPECIALS: &str = "<|im_start|><|im_end|><|endoftext|><|vision_start|>";
+const LITERAL_SPECIAL_IDS: &[u32] = &[248044, 248045, 248046, 248053];
+const NO_THINKING_SUFFIX: &[u32] = &[248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271];
 const TOOL_HELLO: &[u32] = &[
     248045, 8678, 198, 2, 13455, 271, 2523, 599, 2528, 310, 279, 2614, 5568, 25, 271, 27, 15449,
     29, 198, 4754, 1628, 21624, 591, 3147, 44675, 56658, 1267, 3147, 1628, 8934, 198, 510, 15449,
@@ -76,6 +79,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     require_equal("tool-aware chat template", &tool_ids, TOOL_HELLO)?;
     let extended_template_bytes = qualify_extended_template_options(&frontend)?;
+    let literal_special_ids = qualify_literal_user_specials(&frontend)?;
 
     let plain = "TuiskoLLM tokenizer round trip";
     let plain_ids = frontend.encode(plain)?;
@@ -101,14 +105,51 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cache_ids = qualify_prompt_cache(&snapshot)?;
 
     println!(
-        "frontend qualification passed: {} exact reference token IDs, {} extended-template bytes, {} streaming IDs, {} cache-case IDs, stop IDs {:?}",
+        "frontend qualification passed: {} exact reference token IDs, {} literal-special IDs, {} extended-template bytes, {} streaming IDs, {} cache-case IDs, stop IDs {:?}",
         default.len() + no_thinking.len() + tool_ids.len(),
+        literal_special_ids,
         extended_template_bytes,
         streaming_ids.len() + with_specials.len(),
         cache_ids,
         frontend.stop_ids()
     );
     Ok(())
+}
+
+fn qualify_literal_user_specials(frontend: &TextFrontend) -> Result<usize, Box<dyn Error>> {
+    let options = ChatTemplateOptions {
+        enable_thinking: Some(false),
+        ..ChatTemplateOptions::default()
+    };
+    let messages = [ChatMessage::new("user", LITERAL_USER_SPECIALS)];
+    let actual = frontend.encode_chat_with_report(&messages, &options)?;
+
+    let mut expected = vec![248045];
+    expected.extend(frontend.encode(&format!("user\n{LITERAL_USER_SPECIALS}"))?);
+    expected.extend_from_slice(NO_THINKING_SUFFIX);
+    require_equal("literal user special tokens", &actual.token_ids, &expected)?;
+
+    let raw_user_ids = frontend.encode(LITERAL_USER_SPECIALS)?;
+    if raw_user_ids
+        .iter()
+        .any(|token| LITERAL_SPECIAL_IDS.contains(token))
+    {
+        return Err("literal user text was extracted into a tokenizer special ID".into());
+    }
+    for &(token, expected_count) in &[(248045, 2), (248046, 1), (248044, 0), (248053, 0)] {
+        let actual_count = actual.token_ids.iter().filter(|&&id| id == token).count();
+        if actual_count != expected_count {
+            return Err(format!(
+                "encoded chat contains {actual_count} instances of special ID {token}, expected {expected_count}"
+            )
+            .into());
+        }
+    }
+    if actual.reused_tokens != 0 || actual.fresh_bytes != actual.rendered_bytes {
+        return Err("literal-special prompt reported unsupported host prefix reuse".into());
+    }
+
+    Ok(actual.token_ids.len())
 }
 
 fn qualify_extended_template_options(frontend: &TextFrontend) -> Result<usize, Box<dyn Error>> {
