@@ -8,7 +8,7 @@ pub(crate) use tuisko_kernels_sm89::{
 pub(crate) use tuisko_kernels_sm120::{
     FullAttentionQkvOp, MtpBf16AttentionOutputOp, MtpBf16FusionOp, MtpBf16MlpOp,
     MtpBf16QkPrepareOp, MtpBf16QkvOp, Qwen35Nvfp4AttentionOutputOp, Qwen35Nvfp4DownOp,
-    Qwen35GdnPrepareOp, Qwen35Nvfp4GdnInputOp,
+    Qwen35GdnPrepareOp, Qwen35GdnRecurrenceOp, Qwen35Nvfp4GdnInputOp,
     Qwen35Nvfp4QkvOp, Qwen35Nvfp4SwiGluOp, Qwen35ResidualNormOp, ResidualNormOp,
 };
 

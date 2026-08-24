@@ -653,6 +653,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen35-gdn-prepare") if remaining.is_empty() => {
             qualify_qwen35_gdn_prepare(root)
         }
+        Some("qualify-qwen35-gdn-recurrence") if remaining.is_empty() => {
+            qualify_qwen35_gdn_recurrence(root)
+        }
         Some("qualify-qwen35-nvfp4-attention-output") if remaining.is_empty() => {
             qualify_qwen35_nvfp4_attention_output(root)
         }
@@ -780,6 +783,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             gate_qwen35_nvfp4_gdn_input(root)
         }
         Some("gate-qwen35-gdn-prepare") if remaining.is_empty() => gate_qwen35_gdn_prepare(root),
+        Some("gate-qwen35-gdn-recurrence") if remaining.is_empty() => {
+            gate_qwen35_gdn_recurrence(root)
+        }
         Some("gate-qwen35-nvfp4-attention-output") if remaining.is_empty() => {
             gate_qwen35_nvfp4_attention_output(root)
         }
@@ -830,6 +836,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-qwen35-attention-qk-prepare"
                     | "qualify-qwen35-nvfp4-attention-output"
                     | "qualify-qwen35-gdn-prepare"
+                    | "qualify-qwen35-gdn-recurrence"
                     | "qualify-fp8-qkv"
                     | "qualify-fp8-gdn-input"
                     | "qualify-fp8-lm-head"
@@ -857,6 +864,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "gate-qwen35-attention-qk-prepare"
                     | "gate-qwen35-nvfp4-attention-output"
                     | "gate-qwen35-gdn-prepare"
+                    | "gate-qwen35-gdn-recurrence"
                     | "gate-fp8-qkv"
                     | "gate-fp8-gdn-input"
                     | "gate-fp8-lm-head"
@@ -1064,6 +1072,7 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_qwen35_nvfp4_qkv(root)?;
     gate_qwen35_nvfp4_gdn_input(root)?;
     gate_qwen35_gdn_prepare(root)?;
+    gate_qwen35_gdn_recurrence(root)?;
     gate_qwen35_nvfp4_attention_output(root)?;
     gate_gdn_prepare(root)?;
     gate_gdn_recurrence(root)?;
@@ -1401,6 +1410,31 @@ fn qualify_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     gate_qwen35_gdn_prepare(root)
+}
+
+fn qualify_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen35_gdn_recurrence",
+            "--include-ignored",
+            "--nocapture",
+        ],
+    )?;
+    gate_qwen35_gdn_recurrence(root)
 }
 
 fn qualify_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -8741,6 +8775,94 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
 
     println!(
         "Qwen3.5 GDN prepare gate passed: 8 fused control/convolution entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
+        registers, shared
+    );
+    Ok(())
+}
+
+fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; run the pinned release device build first",
+            ptx_path.display()
+        )
+    })?;
+    let entries = parse_entries(&ptx);
+    let routes = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen35_gdn_recurrence_exact_TID_"))
+        .collect::<Vec<_>>();
+    require_count("Qwen3.5 GDN recurrence", routes.len(), 8)?;
+
+    for entry in &routes {
+        if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 512-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        if !entry.body.contains("rsqrt.approx.f32") || !entry.body.contains("ex2.approx.f32") {
+            return Err(format!(
+                "entry `{}` lost normalization or recurrent decay",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let temporary = root.join("target/tmp");
+    fs::create_dir_all(&temporary)?;
+    let cubin = temporary.join("qwen35-gdn-recurrence-gate.cubin");
+    let ptxas = cuda_tool("ptxas");
+    require_success(
+        &ptxas,
+        &[
+            OsStr::new("-O3"),
+            OsStr::new("--gpu-name"),
+            OsStr::new("sm_120a"),
+            ptx_path.as_os_str(),
+            OsStr::new("--output-file"),
+            cubin.as_os_str(),
+        ],
+    )?;
+    let cuobjdump = cuda_tool("cuobjdump");
+    let resources = require_success(
+        &cuobjdump,
+        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+    )?;
+    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
+    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
+    let sass = String::from_utf8(sass.stdout)?;
+    let mut registers = Vec::new();
+    let mut shared = Vec::new();
+    for entry in routes {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted Qwen3.5 GDN recurrence `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(&sass, entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted Qwen3.5 GDN recurrence SASS `{}`",
+                entry.name
+            )
+        })?;
+        for instruction in ["MUFU.RSQ", "MUFU.EX2"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+        registers.push(resource.registers);
+        shared.push(resource.shared);
+    }
+    registers.sort_unstable();
+    shared.sort_unstable();
+
+    println!(
+        "Qwen3.5 GDN recurrence gate passed: 8 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/EX2 present",
         registers, shared
     );
     Ok(())

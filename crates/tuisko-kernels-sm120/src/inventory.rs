@@ -10,7 +10,7 @@ use crate::fp8::{
 };
 use crate::gdn::{
     gdn_prepare_ptx_names, gdn_recurrence_ptx_names, gdn_state_snapshot_ptx_name,
-    qwen35_gdn_prepare_ptx_names,
+    qwen35_gdn_prepare_ptx_names, qwen35_gdn_recurrence_ptx_names,
 };
 use crate::mtp_bf16_attention_output::mtp_bf16_attention_output_ptx_names;
 use crate::mtp_bf16_fusion::{mtp_bf16_fusion_prefill_ptx_names, mtp_bf16_fusion_ptx_names};
@@ -63,6 +63,7 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .chain(qwen35_nvfp4_qkv_ptx_names())
         .chain(qwen35_nvfp4_gdn_input_ptx_names())
         .chain(qwen35_gdn_prepare_ptx_names())
+        .chain(qwen35_gdn_recurrence_ptx_names())
         .collect()
 }
 
@@ -76,7 +77,7 @@ mod tests {
         let names = kernel_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 430);
+        assert_eq!(names.len(), 438);
         assert_eq!(unique.len(), names.len());
     }
 }
