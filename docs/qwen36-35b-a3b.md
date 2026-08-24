@@ -201,6 +201,12 @@ device/host addresses remain stable, and device memory does not grow after warmu
 frontend-to-device state-transition evidence, not an external same-model logit-parity claim. The
 initial route serially evaluates prompts through B=1 decode and loudly enforces its 192-position
 capacity until the native resident-prefill stack is reconciled.
+The server now selects this concrete target from the pinned revision directory and publishes
+`nvidia/Qwen3.6-35B-A3B-NVFP4` through the OpenAI health, models, blocking chat, and SSE routes. A
+real localhost thinking-mode `Hello` request emits the two-token reasoning text `Here's`; blocking
+and SSE responses both report 11 prompt tokens, two completion tokens, `finish_reason=length`, and
+the exact model identity. Startup exposes one slot and the same 192-position limit rather than
+implying compact batching or native prefill support.
 
 ## Implementation order
 

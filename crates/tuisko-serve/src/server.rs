@@ -22,11 +22,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
 use tokio::sync::oneshot;
 use tuisko_engine::{
-    GenerationStep, MAX_BATCH, Qwen35ResidentTextGenerator, ResidentLoadPhase,
-    ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentRequestId,
+    GenerationStep, MAX_BATCH, Qwen35ResidentTextGenerator, Qwen36ResidentTextGenerator,
+    ResidentLoadPhase, ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentRequestId,
 };
 use tuisko_frontend::GenerationDefaults;
-use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B, Qwen38_27B};
+use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 const REQUEST_BODY_LIMIT: usize = 2 * 1024 * 1024;
 const DEFAULT_SEED_SCRAMBLE: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -103,6 +103,7 @@ struct Ready {
 enum ResidentTarget {
     Qwen38,
     Qwen35,
+    Qwen36,
 }
 
 impl ResidentTarget {
@@ -110,10 +111,12 @@ impl ResidentTarget {
         match root.file_name().and_then(|name| name.to_str()) {
             Some(Qwen38_27B::REVISION) => Ok(Self::Qwen38),
             Some(Qwen35_9B::REVISION) => Ok(Self::Qwen35),
+            Some(Qwen36Moe35B::REVISION) => Ok(Self::Qwen36),
             actual => Err(format!(
-                "snapshot revision {actual:?} is not {} or {}",
+                "snapshot revision {actual:?} is not {}, {}, or {}",
                 Qwen38_27B::REVISION,
-                Qwen35_9B::REVISION
+                Qwen35_9B::REVISION,
+                Qwen36Moe35B::REVISION
             )),
         }
     }
@@ -122,6 +125,7 @@ impl ResidentTarget {
         match self {
             Self::Qwen38 => Qwen38_27B::MODEL_ID,
             Self::Qwen35 => Qwen35_9B::MODEL_ID,
+            Self::Qwen36 => Qwen36Moe35B::MODEL_ID,
         }
     }
 }
@@ -255,6 +259,10 @@ fn engine_worker(
     let _readiness_guard = ReadinessGuard(Arc::clone(&worker_ready));
     if target == ResidentTarget::Qwen35 {
         qwen35_engine_worker(snapshot, jobs, ready, worker_ready);
+        return;
+    }
+    if target == ResidentTarget::Qwen36 {
+        qwen36_engine_worker(snapshot, jobs, ready, worker_ready);
         return;
     }
     let generator = (|| {
@@ -428,6 +436,106 @@ fn qwen35_engine_worker(
 }
 
 fn run_qwen35_job(generator: &mut Qwen35ResidentTextGenerator, job: Job) {
+    if job.reply.is_closed() {
+        return;
+    }
+    let mut session = match generator.start(&job.request) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = job.reply.send(GenerationReply::Rejected(error.to_string()));
+            return;
+        }
+    };
+    while session.finish_reason().is_none() {
+        if job.reply.is_closed() {
+            return;
+        }
+        let step = match session.step() {
+            Ok(step) => step,
+            Err(error) => {
+                let _ = job.reply.send(GenerationReply::Failed(error.to_string()));
+                return;
+            }
+        };
+        if let Some(delta) = step.delta {
+            let _ = job.reply.send(GenerationReply::Delta(delta));
+        }
+    }
+    match session.into_output() {
+        Ok(output) => {
+            let _ = job.reply.send(GenerationReply::Done(output));
+        }
+        Err(error) => {
+            let _ = job.reply.send(GenerationReply::Failed(error.to_string()));
+        }
+    }
+}
+
+fn qwen36_engine_worker(
+    snapshot: PathBuf,
+    mut jobs: Receiver<Job>,
+    ready: std_mpsc::SyncSender<Result<Ready, String>>,
+    worker_ready: Arc<AtomicBool>,
+) {
+    let loaded = (|| {
+        let checkpoint_start = Instant::now();
+        let snapshot = CheckpointSnapshot::<Qwen36Moe35B>::open(&snapshot)
+            .map(Arc::new)
+            .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
+        let checkpoint_admission = checkpoint_start.elapsed();
+        let tensor_count = snapshot.tensor_count();
+        let load_start = Instant::now();
+        let generator = Qwen36ResidentTextGenerator::from_snapshot_device_zero(snapshot)
+            .map_err(|error| format!("loading the resident Qwen3.6 text program: {error}"))?;
+        let resident_load = load_start.elapsed();
+        let device_name = generator
+            .context()
+            .device_name()
+            .map_err(|error| format!("reading the CUDA device name: {error}"))?;
+        Ok::<_, String>((
+            generator,
+            checkpoint_admission,
+            resident_load,
+            tensor_count,
+            device_name,
+        ))
+    })();
+    let (mut generator, checkpoint_admission, resident_load, tensor_count, device_name) =
+        match loaded {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return;
+            }
+        };
+    let startup = Ready {
+        model_id: Qwen36Moe35B::MODEL_ID,
+        generation_defaults: generator.generation_defaults(),
+        device_name,
+        checkpoint_admission,
+        weight_load: resident_load,
+        source_prefault: Duration::ZERO,
+        graph_capture: Duration::ZERO,
+        tensor_count,
+        upload_bytes: generator.resident_weight_bytes(),
+        prefault_bytes: 0,
+        arena_bytes: generator.arena_bytes(),
+        host_stager_bytes: generator.host_stager_bytes(),
+        slot_capacity: 1,
+        context_capacity: generator.context_capacity(),
+        detailed_load_timing: false,
+    };
+    worker_ready.store(true, Ordering::Release);
+    if ready.send(Ok(startup)).is_err() {
+        return;
+    }
+
+    while let Some(job) = jobs.blocking_recv() {
+        run_qwen36_job(&mut generator, job);
+    }
+}
+
+fn run_qwen36_job(generator: &mut Qwen36ResidentTextGenerator, job: Job) {
     if job.reply.is_closed() {
         return;
     }
@@ -849,7 +957,7 @@ mod tests {
     use tokio::sync::mpsc::channel;
     use tuisko_engine::{ChatGenerationRequest, FinishReason, GenerationStep, MAX_BATCH};
     use tuisko_frontend::{ChatMessage, GenerationDefaults};
-    use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
     fn runtime() -> tokio::runtime::Runtime {
         Builder::new_current_thread().enable_all().build().unwrap()
@@ -1111,6 +1219,11 @@ mod tests {
                 Qwen35_9B::REVISION,
                 ResidentTarget::Qwen35,
                 Qwen35_9B::MODEL_ID,
+            ),
+            (
+                Qwen36Moe35B::REVISION,
+                ResidentTarget::Qwen36,
+                Qwen36Moe35B::MODEL_ID,
             ),
         ] {
             let target = ResidentTarget::from_snapshot(std::path::Path::new(revision)).unwrap();
