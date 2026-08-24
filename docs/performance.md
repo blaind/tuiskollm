@@ -254,7 +254,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-qwen36-moe-experts` | Measure every exact Qwen3.6 routed/shared NVFP4 expert plus combine graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-nvfp4-lm-head` | Measure every exact Qwen3.6 represented-weight NVFP4 full-vocabulary graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-residual-norm` | Measure every exact Qwen3.6 plain and fused-residual RMSNorm graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-fp8-qkv` | Measure every exact Qwen3.6 static-FP8 full-attention Q/K/V graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-fp8-qkv` | Measure every exact Qwen3.6 static-FP8 full-attention Q/K/V graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-input` | Measure every exact Qwen3.6 static-FP8 Q/K/V/Z plus BF16 A/B control graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-output` | Measure every exact Qwen3.6 static-FP8 GDN output graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-attention-output` | Measure every complete Qwen3.6 sigmoid-gate, BF16-stage, and static-FP8 output graph with input restoration outside timing | terminal or `--json PATH` |

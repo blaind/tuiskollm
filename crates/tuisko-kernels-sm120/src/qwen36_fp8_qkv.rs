@@ -1,5 +1,6 @@
 //! Exact Qwen3.6 static-FP8 full-attention QKV projection.
 
+use crate::device::fp8_projection::prefill_projection_mma_static_three_scales;
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -12,6 +13,14 @@ const KV_ROWS: usize = Qwen36Moe35B::ATTENTION_KV_ROWS;
 const PROJECTED_ROWS: usize = Qwen36Moe35B::ATTENTION_QKV_ROWS;
 const WARPS: usize = 8;
 const THREADS: u32 = (WARPS * 32) as u32;
+const PREFILL_ROUTES: [usize; 3] = [32, 64, 128];
+const PREFILL_BLOCK_ROWS: usize = 64;
+const PREFILL_OUTPUT_ROWS: usize = 64;
+const PREFILL_K_WORDS: usize = 32;
+const PREFILL_K_SUBTILES: usize = 4;
+const PREFILL_THREADS: u32 = 256;
+const PREFILL_SHARED_BYTES: u32 =
+    (2 * (PREFILL_BLOCK_ROWS + PREFILL_OUTPUT_ROWS) * PREFILL_K_WORDS * size_of::<u32>()) as u32;
 
 const _: () = assert!(INPUT_COLUMNS == 2_048);
 const _: () = assert!(QUERY_ROWS == 8_192);
@@ -21,6 +30,7 @@ const _: () = assert!(QUERY_ROWS.is_multiple_of(2 * WARPS));
 const _: () = assert!(KV_ROWS.is_multiple_of(2 * WARPS));
 const _: () = assert!(PROJECTED_ROWS.is_multiple_of(2 * WARPS));
 
+#[allow(clippy::too_many_arguments)]
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -44,17 +54,8 @@ mod kernels {
         value
     }
 
-    /// Quantizes exact BF16 rows with the checkpoint's shared static FP8 scale.
-    #[kernel]
-    #[launch_bounds(256, 2)]
-    #[launch_contract(
-        domain = 1,
-        coordinates = u32,
-        block = (256, 1, 1),
-        dynamic_shared = 0,
-        min_compute_capability = (12, 0),
-    )]
-    pub fn qwen36_attention_fp8_quantize<const TOKENS: usize>(
+    #[inline(always)]
+    unsafe fn static_fp8_quantize<const TOKENS: usize>(
         input: *const u32,
         input_scale: f32,
         codes: *mut u16,
@@ -79,6 +80,42 @@ mod kernels {
             }
             pair += THREADS as usize;
         }
+    }
+
+    /// Quantizes exact BF16 rows with the checkpoint's shared static FP8 scale.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_attention_fp8_quantize<const TOKENS: usize>(
+        input: *const u32,
+        input_scale: f32,
+        codes: *mut u16,
+    ) {
+        unsafe { static_fp8_quantize::<TOKENS>(input, input_scale, codes) }
+    }
+
+    /// Quantizes exact BF16 prompt rows with the checkpoint's shared static FP8 scale.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_attention_fp8_quantize_prefill<const TOKENS: usize>(
+        input: *const u32,
+        input_scale: f32,
+        codes: *mut u16,
+    ) {
+        unsafe { static_fp8_quantize::<TOKENS>(input, input_scale, codes) }
     }
 
     /// Projects static E4M3 activations through fused Q/gate, K, and V weights.
@@ -177,6 +214,50 @@ mod kernels {
         store!(6);
         store!(7);
     }
+
+    /// Projects one exact prompt tile through source-static E4M3 Q/gate, K, and V weights.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 32768,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_fp8_qkv_prefill<const TOKENS: usize>(
+        activation_codes: *const u32,
+        input_scale: f32,
+        weight_codes: *const u32,
+        query_weight_scale: f32,
+        key_weight_scale: f32,
+        value_weight_scale: f32,
+        output: *mut u16,
+        k_tiles: u32,
+    ) {
+        // SAFETY: the exact 64x64 CTA inventory covers all active prompt/output tiles.
+        unsafe {
+            prefill_projection_mma_static_three_scales::<
+                INPUT_COLUMNS,
+                TOKENS,
+                PREFILL_BLOCK_ROWS,
+                PREFILL_K_WORDS,
+                PREFILL_K_SUBTILES,
+            >(
+                activation_codes,
+                input_scale,
+                weight_codes,
+                QUERY_ROWS,
+                QUERY_ROWS + KV_ROWS,
+                query_weight_scale,
+                key_weight_scale,
+                value_weight_scale,
+                output,
+                k_tiles,
+                PROJECTED_ROWS,
+            );
+        }
+    }
 }
 
 struct PreparedBatchRoute<const TOKENS: usize> {
@@ -256,6 +337,94 @@ impl<const TOKENS: usize> PreparedBatchRoute<TOKENS> {
     }
 }
 
+struct PreparedPrefillRoute<const TOKENS: usize> {
+    quantize: PreparedLaunch<kernels::__qwen36_attention_fp8_quantize_prefill_CudaKernel<TOKENS>>,
+    projection: PreparedLaunch<kernels::__qwen36_fp8_qkv_prefill_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !PREFILL_ROUTES.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 attention QKV prefill route T={TOKENS} is not admitted"
+            )));
+        }
+        let quantize = module
+            .prepare_qwen36_attention_fp8_quantize_prefill::<TOKENS>(LaunchConfig1D::new(
+                TOKENS as u32,
+                THREADS,
+                0,
+            ))
+            .map_err(|source| {
+                GpuError::launch(
+                    "preparing Qwen3.6 prefill attention FP8 quantization",
+                    source,
+                )
+            })?;
+        let token_tiles = TOKENS.div_ceil(PREFILL_BLOCK_ROWS);
+        let projection_blocks = PROJECTED_ROWS / PREFILL_OUTPUT_ROWS * token_tiles;
+        // At T=128 the decode topology would scan the 18.87 MiB Q/K/V plane 16
+        // times. Two 64-token MMA tiles scan it twice; each output retains the
+        // same ordered m16n8k32 K sequence and exact Q/K/V scalar scale.
+        let projection = module
+            .prepare_qwen36_fp8_qkv_prefill::<TOKENS>(LaunchConfig1D::new(
+                projection_blocks as u32,
+                PREFILL_THREADS,
+                PREFILL_SHARED_BYTES,
+            ))
+            .map_err(|source| GpuError::launch("preparing Qwen3.6 FP8 QKV prefill", source))?;
+
+        Ok(Self {
+            quantize,
+            projection,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        input_scale: f32,
+        weight_codes: *const u8,
+        query_weight_scale: f32,
+        key_weight_scale: f32,
+        value_weight_scale: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen36_attention_fp8_quantize_prefill::<TOKENS>(
+                stream,
+                &self.quantize,
+                input.cast::<u32>(),
+                input_scale,
+                activation_codes.cast::<u16>(),
+            )
+            .map_err(|source| {
+                GpuError::launch(
+                    "launching Qwen3.6 prefill attention FP8 quantization",
+                    source,
+                )
+            })?;
+        module
+            .qwen36_fp8_qkv_prefill::<TOKENS>(
+                stream,
+                &self.projection,
+                activation_codes.cast::<u32>(),
+                input_scale,
+                weight_codes.cast::<u32>(),
+                query_weight_scale,
+                key_weight_scale,
+                value_weight_scale,
+                output,
+                (INPUT_COLUMNS / 4 / PREFILL_K_WORDS) as u32,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.6 FP8 QKV prefill", source))
+    }
+}
+
 /// PTX symbols retained for every exact Qwen3.6 full-attention QKV route.
 pub(crate) fn qwen36_fp8_qkv_ptx_names() -> Vec<&'static str> {
     vec![
@@ -275,10 +444,16 @@ pub(crate) fn qwen36_fp8_qkv_ptx_names() -> Vec<&'static str> {
         kernels::qwen36_fp8_qkv_ptx_name::<6>(),
         kernels::qwen36_fp8_qkv_ptx_name::<7>(),
         kernels::qwen36_fp8_qkv_ptx_name::<8>(),
+        kernels::qwen36_attention_fp8_quantize_prefill_ptx_name::<32>(),
+        kernels::qwen36_attention_fp8_quantize_prefill_ptx_name::<64>(),
+        kernels::qwen36_attention_fp8_quantize_prefill_ptx_name::<128>(),
+        kernels::qwen36_fp8_qkv_prefill_ptx_name::<32>(),
+        kernels::qwen36_fp8_qkv_prefill_ptx_name::<64>(),
+        kernels::qwen36_fp8_qkv_prefill_ptx_name::<128>(),
     ]
 }
 
-/// Prepared exact-batch Qwen3.6 full-attention QKV routes on SM120.
+/// Prepared exact decode and prompt Qwen3.6 full-attention QKV routes on SM120.
 pub struct Qwen36Fp8QkvOp {
     module: kernels::LoadedModule,
     b1: PreparedBatchRoute<1>,
@@ -289,6 +464,9 @@ pub struct Qwen36Fp8QkvOp {
     b6: PreparedBatchRoute<6>,
     b7: PreparedBatchRoute<7>,
     b8: PreparedBatchRoute<8>,
+    t32: PreparedPrefillRoute<32>,
+    t64: PreparedPrefillRoute<64>,
+    t128: PreparedPrefillRoute<128>,
 }
 
 impl Qwen36Fp8QkvOp {
@@ -307,23 +485,27 @@ impl Qwen36Fp8QkvOp {
             b6: PreparedBatchRoute::prepare(&module)?,
             b7: PreparedBatchRoute::prepare(&module)?,
             b8: PreparedBatchRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
 
-    /// Runs the shared-static-FP8 Q/gate, K, and V projection at exact `B=1..=8`.
+    /// Runs shared-static-FP8 Q/gate, K, and V projection at exact decode or prompt widths.
     ///
     /// # Safety
     ///
-    /// The input covers BF16 `[batch,2048]`; activation workspace covers E4M3
-    /// `[batch,2048]`; weights cover E4M3 `[9216,2048]`; and output covers BF16
-    /// `[batch,9216]`. All planes are aligned, disjoint, context-local, and live
+    /// The input covers BF16 `[rows,2048]`; activation workspace covers at least
+    /// 64 E4M3 rows for `T=32` and otherwise `[rows,2048]`; weights cover E4M3
+    /// `[9216,2048]`; and output covers BF16 `[rows,9216]`. All planes are aligned,
+    /// disjoint, context-local, and live
     /// until `stream` completes.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         input: *const u16,
         activation_codes: *mut u8,
         input_scale: f32,
@@ -366,7 +548,7 @@ impl Qwen36Fp8QkvOp {
             };
         }
 
-        match batch {
+        match rows {
             1 => launch!(b1),
             2 => launch!(b2),
             3 => launch!(b3),
@@ -375,8 +557,11 @@ impl Qwen36Fp8QkvOp {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
             _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.6 attention QKV batch {batch} is outside the exact range 1..={MAX_BATCH}"
+                "Qwen3.6 attention QKV row count {rows} is outside 1..={MAX_BATCH}, 32, 64, and 128"
             ))),
         }
     }
@@ -396,7 +581,10 @@ mod tests {
 
         let names = qwen36_fp8_qkv_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(names.len(), 16);
+        assert_eq!(PREFILL_ROUTES, [32, 64, 128]);
+        assert_eq!(PREFILL_SHARED_BYTES, 32_768);
+        assert_eq!(INPUT_COLUMNS / 4 / PREFILL_K_WORDS, 16);
+        assert_eq!(names.len(), 22);
         assert_eq!(unique.len(), names.len());
     }
 }

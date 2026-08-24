@@ -13,6 +13,8 @@ use tuisko_gpu::{
 use tuisko_model::{Arch, Qwen36Moe35B};
 
 pub(crate) const MAX_BATCH: usize = 8;
+pub(crate) const MAX_ROWS: usize = 128;
+pub(crate) const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, MAX_BATCH, 32, 64, MAX_ROWS];
 const ALIGNMENT: usize = 256;
 pub(crate) const INPUT_COLUMNS: usize = Qwen36Moe35B::HIDDEN;
 pub(crate) const QUERY_ROWS: usize = Qwen36Moe35B::ATTENTION_QUERY_ROWS;
@@ -44,7 +46,7 @@ pub enum Qwen36Fp8QkvQualificationError {
     Mismatch(String),
 }
 
-/// Observable counts and worst error from every exact batch route.
+/// Observable counts and worst error from every exact decode and prompt route.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Qwen36Fp8QkvQualification {
     /// Static E4M3 activation codes compared bit-exactly.
@@ -97,7 +99,7 @@ pub(crate) struct Fixture {
     projected_oracles: Vec<f64>,
 }
 
-/// Qualifies eager and captured Qwen3.6 QKV at exact `B=1..=8`.
+/// Qualifies eager and captured Qwen3.6 QKV at exact decode and prompt widths.
 pub fn qualify_qwen36_fp8_qkv() -> Result<Qwen36Fp8QkvQualification, Qwen36Fp8QkvQualificationError>
 {
     let _preflight = device_benchmark::preflight()?;
@@ -130,25 +132,25 @@ pub fn qualify_qwen36_fp8_qkv() -> Result<Qwen36Fp8QkvQualification, Qwen36Fp8Qk
         maximum_absolute_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
+    for rows in EXACT_ROUTES {
         fill_outputs(&arena, &stream, regions)?;
-        launch(&op, &arena, &stream, regions, batch)?;
+        launch(&op, &arena, &stream, regions, rows)?;
         let eager = read_outputs(&arena, &stream, regions)?;
-        verify_eager(batch, &fixture, &eager, &mut report)?;
+        verify_eager(rows, &fixture, &eager, &mut report)?;
 
         fill_outputs(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
+        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, rows))?;
         // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
         unsafe { graph.launch(&stream) }?;
         // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
         unsafe { graph.launch(&stream) }?;
         let replay = read_outputs(&arena, &stream, regions)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(Qwen36Fp8QkvQualificationError::Mismatch(format!(
-                "device addresses changed while qualifying B={batch}"
+                "device addresses changed while qualifying row count {rows}"
             )));
         }
     }
@@ -162,10 +164,10 @@ pub fn qualify_qwen36_fp8_qkv() -> Result<Qwen36Fp8QkvQualification, Qwen36Fp8Qk
 
 pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let input = layout.reserve(MAX_BATCH * INPUT_COLUMNS, ALIGNMENT)?;
-    let activation_codes = layout.reserve(MAX_BATCH * INPUT_COLUMNS, ALIGNMENT)?;
+    let input = layout.reserve(MAX_ROWS * INPUT_COLUMNS, ALIGNMENT)?;
+    let activation_codes = layout.reserve(MAX_ROWS * INPUT_COLUMNS, ALIGNMENT)?;
     let weight_codes = layout.reserve(PROJECTED_ROWS * INPUT_COLUMNS, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * PROJECTED_ROWS, ALIGNMENT)?;
+    let output = layout.reserve(MAX_ROWS * PROJECTED_ROWS, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -219,12 +221,12 @@ fn launch(
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     unsafe {
         op.launch(
             stream,
-            batch,
+            rows,
             arena.address(regions.input)?,
             arena.address(regions.activation_codes)?,
             INPUT_SCALE,
@@ -238,10 +240,10 @@ fn launch(
 }
 
 pub(crate) fn make_fixture() -> Result<Fixture, Qwen36Fp8QkvQualificationError> {
-    let input_bf16 = (0..MAX_BATCH * INPUT_COLUMNS)
+    let input_bf16 = (0..MAX_ROWS * INPUT_COLUMNS)
         .map(|index| {
             let token = index / INPUT_COLUMNS;
-            f32_to_bf16(INPUT_PATTERN[index & 15] * TOKEN_FACTORS[token])
+            f32_to_bf16(INPUT_PATTERN[index & 15] * TOKEN_FACTORS[token & 7])
         })
         .collect::<Vec<_>>();
     let activation_codes = input_bf16
@@ -254,7 +256,7 @@ pub(crate) fn make_fixture() -> Result<Fixture, Qwen36Fp8QkvQualificationError> 
     let weight_codes = (0..PROJECTED_ROWS * INPUT_COLUMNS)
         .map(|index| WEIGHT_CODES[(index / INPUT_COLUMNS) & 3])
         .collect::<Vec<_>>();
-    let projected_oracles = (0..MAX_BATCH)
+    let projected_oracles = (0..MAX_ROWS)
         .map(|token| {
             activation_codes[token * INPUT_COLUMNS..(token + 1) * INPUT_COLUMNS]
                 .iter()
@@ -276,12 +278,12 @@ pub(crate) fn make_fixture() -> Result<Fixture, Qwen36Fp8QkvQualificationError> 
 }
 
 fn verify_eager(
-    batch: usize,
+    rows: usize,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut Qwen36Fp8QkvQualification,
 ) -> Result<(), Qwen36Fp8QkvQualificationError> {
-    let active_codes = batch * INPUT_COLUMNS;
+    let active_codes = rows * INPUT_COLUMNS;
     if observed.activation_codes[..active_codes] != fixture.activation_codes[..active_codes] {
         let index = observed.activation_codes[..active_codes]
             .iter()
@@ -289,13 +291,13 @@ fn verify_eager(
             .position(|(actual, expected)| actual != expected)
             .expect("unequal slices contain one differing code");
         return Err(Qwen36Fp8QkvQualificationError::Mismatch(format!(
-            "B={batch} activation code {index} is {:#04x}, expected {:#04x}",
+            "rows={rows} activation code {index} is {:#04x}, expected {:#04x}",
             observed.activation_codes[index], fixture.activation_codes[index]
         )));
     }
     report.activation_codes += active_codes;
 
-    for token in 0..batch {
+    for token in 0..rows {
         for row in 0..PROJECTED_ROWS {
             let weight = f64::from(WEIGHT_VALUES[row & 3]);
             let weight_scale = if row < QUERY_ROWS {
@@ -308,7 +310,7 @@ fn verify_eager(
             let expected =
                 fixture.projected_oracles[token] * weight * f64::from(INPUT_SCALE * weight_scale);
             compare_output(
-                batch,
+                rows,
                 token,
                 row,
                 observed.output[token * PROJECTED_ROWS + row],
@@ -317,15 +319,15 @@ fn verify_eager(
             )?;
         }
     }
-    report.output_values += batch * PROJECTED_ROWS;
-    verify_inactive(batch, observed)?;
-    report.inactive_values += (MAX_BATCH - batch) * (INPUT_COLUMNS + PROJECTED_ROWS);
+    report.output_values += rows * PROJECTED_ROWS;
+    verify_inactive(rows, observed)?;
+    report.inactive_values += (MAX_ROWS - rows) * (INPUT_COLUMNS + PROJECTED_ROWS);
 
     Ok(())
 }
 
 fn compare_output(
-    batch: usize,
+    rows: usize,
     token: usize,
     row: usize,
     actual_bits: u16,
@@ -338,7 +340,7 @@ fn compare_output(
     report.maximum_absolute_error = report.maximum_absolute_error.max(absolute_error as f32);
     if absolute_error > tolerance {
         return Err(Qwen36Fp8QkvQualificationError::Mismatch(format!(
-            "B={batch} QKV token={token}, row={row}: device={actual}, oracle={expected}, tolerance={tolerance}"
+            "rows={rows} QKV token={token}, row={row}: device={actual}, oracle={expected}, tolerance={tolerance}"
         )));
     }
 
@@ -346,44 +348,41 @@ fn compare_output(
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     eager: &Observed,
     replay: &Observed,
     report: &mut Qwen36Fp8QkvQualification,
 ) -> Result<(), Qwen36Fp8QkvQualificationError> {
     if eager.activation_codes != replay.activation_codes || eager.output != replay.output {
         return Err(Qwen36Fp8QkvQualificationError::Mismatch(format!(
-            "B={batch} graph replay differs from eager execution"
+            "rows={rows} graph replay differs from eager execution"
         )));
     }
-    verify_inactive(batch, replay)?;
-    report.graph_replay_values += batch * (INPUT_COLUMNS + PROJECTED_ROWS);
-    report.inactive_values += (MAX_BATCH - batch) * (INPUT_COLUMNS + PROJECTED_ROWS);
+    verify_inactive(rows, replay)?;
+    report.graph_replay_values += rows * (INPUT_COLUMNS + PROJECTED_ROWS);
+    report.inactive_values += (MAX_ROWS - rows) * (INPUT_COLUMNS + PROJECTED_ROWS);
 
     Ok(())
 }
 
-fn verify_inactive(
-    batch: usize,
-    observed: &Observed,
-) -> Result<(), Qwen36Fp8QkvQualificationError> {
-    let code_begin = batch * INPUT_COLUMNS;
+fn verify_inactive(rows: usize, observed: &Observed) -> Result<(), Qwen36Fp8QkvQualificationError> {
+    let code_begin = rows * INPUT_COLUMNS;
     if let Some(relative) = observed.activation_codes[code_begin..]
         .iter()
         .position(|&value| value != BYTE_SENTINEL)
     {
         return Err(Qwen36Fp8QkvQualificationError::Mismatch(format!(
-            "B={batch} modified inactive activation code {}",
+            "rows={rows} modified inactive activation code {}",
             code_begin + relative
         )));
     }
-    let output_begin = batch * PROJECTED_ROWS;
+    let output_begin = rows * PROJECTED_ROWS;
     if let Some(relative) = observed.output[output_begin..]
         .iter()
         .position(|&value| value != BF16_SENTINEL)
     {
         return Err(Qwen36Fp8QkvQualificationError::Mismatch(format!(
-            "B={batch} modified inactive QKV output {}",
+            "rows={rows} modified inactive QKV output {}",
             output_begin + relative
         )));
     }
@@ -417,8 +416,9 @@ fn verify_no_post_warmup_allocation(
     stream: &CudaStream,
     regions: Regions,
 ) -> Result<(), Qwen36Fp8QkvQualificationError> {
-    let graphs = (1..=MAX_BATCH)
-        .map(|batch| CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch)))
+    let graphs = EXACT_ROUTES
+        .iter()
+        .map(|&rows| CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows)))
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
         // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
@@ -427,9 +427,9 @@ fn verify_no_post_warmup_allocation(
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
-        for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
+        for graph in graphs.iter().rev() {
             // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
-            unsafe { graphs[batch - 1].launch(stream) }?;
+            unsafe { graph.launch(stream) }?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -452,19 +452,20 @@ mod tests {
         let (layout, regions) = layout().unwrap();
 
         assert_eq!(regions.weight_bytes(), 18_874_368);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 196_608);
-        assert_eq!(layout.byte_len(), 19_070_976);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 3_145_728);
+        assert_eq!(layout.byte_len(), 22_020_096);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 0);
     }
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn exact_batches_match_independent_oracles_and_graph_replay()
+    fn exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), Qwen36Fp8QkvQualificationError> {
         let report = qualify_qwen36_fp8_qkv()?;
-        let active = (1..=MAX_BATCH).sum::<usize>();
-        let inactive = (1..=MAX_BATCH)
-            .map(|batch| MAX_BATCH - batch)
+        let active = EXACT_ROUTES.iter().sum::<usize>();
+        let inactive = EXACT_ROUTES
+            .iter()
+            .map(|rows| MAX_ROWS - rows)
             .sum::<usize>();
 
         assert_eq!(report.activation_codes, active * INPUT_COLUMNS);
@@ -477,10 +478,10 @@ mod tests {
             report.inactive_values,
             2 * inactive * (INPUT_COLUMNS + PROJECTED_ROWS)
         );
-        assert_eq!(report.immutable_input_values, 18_890_752);
-        assert_eq!(report.arena_bytes, 19_070_976);
+        assert_eq!(report.immutable_input_values, 19_136_512);
+        assert_eq!(report.arena_bytes, 22_020_096);
         assert_eq!(report.weight_bytes, 18_874_368);
-        assert_eq!(report.workspace_bytes, 196_608);
+        assert_eq!(report.workspace_bytes, 3_145_728);
         assert_eq!(report.padding_bytes, 0);
         assert!(report.maximum_absolute_error.is_finite());
 
