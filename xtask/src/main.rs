@@ -10959,17 +10959,52 @@ fn gate_qwen36_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_static_fp8_quantize_TID_"))
         .collect::<Vec<_>>();
+    let prefill_quantize = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen36_static_fp8_quantize_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
     let projection = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_fp8_gdn_input_TID_"))
+        .collect::<Vec<_>>();
+    let prefill_projection = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen36_fp8_gdn_input_prefill_TID_"))
         .collect::<Vec<_>>();
     let controls = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_bf16_gdn_control_TID_"))
         .collect::<Vec<_>>();
+    let prefill_controls = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen36_bf16_gdn_control_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.6 static FP8 quantization", quantize.len(), 8)?;
+    require_count(
+        "Qwen3.6 prefill static FP8 quantization",
+        prefill_quantize.len(),
+        3,
+    )?;
     require_count("Qwen3.6 FP8 GDN input projection", projection.len(), 8)?;
+    require_count(
+        "Qwen3.6 FP8 GDN input prefill projection",
+        prefill_projection.len(),
+        3,
+    )?;
     require_count("Qwen3.6 BF16 GDN controls", controls.len(), 8)?;
+    require_count(
+        "Qwen3.6 BF16 GDN prefill controls",
+        prefill_controls.len(),
+        3,
+    )?;
 
     for (role, routes, instructions) in [
         (
@@ -10990,6 +11025,21 @@ fn gate_qwen36_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
         (
             "BF16 controls",
             controls.as_slice(),
+            &["fma.rn.f32", "shfl.sync.down.b32", "cvt.rn.bf16x2.f32"][..],
+        ),
+        (
+            "prefill static quantization",
+            prefill_quantize.as_slice(),
+            &["div.rn.f32", "cvt.rn.satfinite.e4m3x2.f32"][..],
+        ),
+        (
+            "FP8 prefill projection",
+            prefill_projection.as_slice(),
+            &[][..],
+        ),
+        (
+            "BF16 prefill controls",
+            prefill_controls.as_slice(),
             &["fma.rn.f32", "shfl.sync.down.b32", "cvt.rn.bf16x2.f32"][..],
         ),
     ] {
@@ -11018,9 +11068,19 @@ fn gate_qwen36_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
     let resources = &artifact.resources;
     let sass = artifact.sass()?;
     let mut quantize_registers = Vec::with_capacity(quantize.len());
+    let mut prefill_quantize_registers = Vec::with_capacity(prefill_quantize.len());
     let mut projection_registers = Vec::with_capacity(projection.len());
+    let mut prefill_projection_registers = Vec::with_capacity(prefill_projection.len());
     let mut control_registers = Vec::with_capacity(controls.len());
-    let mut shared = Vec::with_capacity(quantize.len() + projection.len() + controls.len());
+    let mut prefill_control_registers = Vec::with_capacity(prefill_controls.len());
+    let mut shared = Vec::with_capacity(
+        quantize.len()
+            + prefill_quantize.len()
+            + projection.len()
+            + prefill_projection.len()
+            + controls.len()
+            + prefill_controls.len(),
+    );
     for (role, routes, instructions, registers) in [
         (
             "static quantization",
@@ -11039,6 +11099,24 @@ fn gate_qwen36_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
             controls,
             &["FFMA", "SHFL.DOWN", "STG.E.U16"][..],
             &mut control_registers,
+        ),
+        (
+            "prefill static quantization",
+            prefill_quantize,
+            &["F2FP.SATFINITE.E4M3", "STG.E.U16"][..],
+            &mut prefill_quantize_registers,
+        ),
+        (
+            "FP8 prefill projection",
+            prefill_projection,
+            &["QMMA.16832.F32.E4M3.E4M3", "LDGSTS", "STG.E.U16"][..],
+            &mut prefill_projection_registers,
+        ),
+        (
+            "BF16 prefill controls",
+            prefill_controls,
+            &["FFMA", "SHFL.DOWN", "STG.E.U16"][..],
+            &mut prefill_control_registers,
         ),
     ] {
         for entry in routes {
@@ -11064,7 +11142,7 @@ fn gate_qwen36_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
                     .into());
                 }
             }
-            if role == "BF16 controls" && body.contains("E4M3") {
+            if role.starts_with("BF16") && body.contains("E4M3") {
                 return Err(format!(
                     "Qwen3.6 BF16 control entry `{}` unexpectedly contains E4M3 conversion",
                     entry.name
@@ -11076,17 +11154,44 @@ fn gate_qwen36_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
     quantize_registers.sort_unstable();
+    prefill_quantize_registers.sort_unstable();
     projection_registers.sort_unstable();
+    prefill_projection_registers.sort_unstable();
     control_registers.sort_unstable();
+    prefill_control_registers.sort_unstable();
     shared.sort_unstable();
     require_registers(&baseline, "quantize_registers", &quantize_registers)?;
     require_registers(&baseline, "projection_registers", &projection_registers)?;
     require_registers(&baseline, "control_registers", &control_registers)?;
+    for (key, registers) in [
+        (
+            "prefill_quantize_registers",
+            prefill_quantize_registers.as_slice(),
+        ),
+        (
+            "prefill_projection_registers",
+            prefill_projection_registers.as_slice(),
+        ),
+        (
+            "prefill_control_registers",
+            prefill_control_registers.as_slice(),
+        ),
+    ] {
+        if baseline.contains_key(key) {
+            require_registers(&baseline, key, registers)?;
+        }
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "Qwen3.6 GDN input gate passed: 8 static quantize + 8 FP8 projection + 8 BF16 control entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/FFMA/SHFL/BF16-store present",
-        quantize_registers, projection_registers, control_registers, shared
+        "Qwen3.6 GDN input gate passed: 8 decode + 3 prefill routes, REG quantize {:?} / {:?}, projection {:?} / {:?}, control {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/QMMA/FFMA/SHFL/BF16-store present",
+        quantize_registers,
+        prefill_quantize_registers,
+        projection_registers,
+        prefill_projection_registers,
+        control_registers,
+        prefill_control_registers,
+        shared
     );
     Ok(())
 }
