@@ -355,6 +355,22 @@ impl BenchmarkWorkload {
             execution: BenchmarkExecution::CudaGraph,
         }
     }
+
+    pub(crate) fn warm_model_prefill(active_tokens: u64) -> Self {
+        Self {
+            scope: BenchmarkScope::Model,
+            phase: BenchmarkPhase::Prefill,
+            batch_size: None,
+            concurrency: None,
+            active_tokens: Some(active_tokens),
+            prompt_tokens: Some(active_tokens),
+            context_tokens: Some(active_tokens),
+            output_tokens: None,
+            device_cache: DeviceCacheRegime::Warm,
+            prefix_cache: None,
+            execution: BenchmarkExecution::CudaGraph,
+        }
+    }
 }
 
 /// Kind of resident memory attributed by a benchmark owner.

@@ -4,7 +4,10 @@ mod program;
 mod progress;
 mod upload_plan;
 
-pub use program::{ResidentDecodeRoute, ResidentLoadMode, ResidentLoadStats, ResidentModelProgram};
+pub use program::{
+    ResidentDecodeRoute, ResidentLoadMode, ResidentLoadStats, ResidentModelProgram,
+    ResidentPrefillRoute,
+};
 #[cfg(feature = "qualification")]
 pub use program::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
@@ -19,11 +22,14 @@ use crate::{
     long_context_kv_layout::MAX_CONTEXT_TOKENS,
 };
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
-use tuisko_kernels_sm120::LONG_CONTEXT_GQA_MAX_PARTITIONS;
+use tuisko_kernels_sm120::{
+    LONG_CONTEXT_GQA_MAX_PARTITIONS, PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES,
+};
 use tuisko_model::{Arch, NVFP4_MLP_LAYER_END, Qwen38_27B};
 
 const ALIGNMENT: usize = 256;
 const NVFP4_GROUP: usize = 16;
+pub(crate) const MAX_ROWS: usize = 1_024;
 
 /// Exact mixer and MLP source route owned by one decoder layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -475,6 +481,7 @@ struct SharedWorkspace {
     partial_maximum: ArenaRegion<f32>,
     partial_denominator: ArenaRegion<f32>,
     partial_numerator: ArenaRegion<f32>,
+    prefill_partials: ArenaRegion<f32>,
     attention: ArenaRegion<f32>,
     mixer_branch: ArenaRegion<u16>,
     swiglu: ArenaRegion<u16>,
@@ -485,27 +492,26 @@ struct SharedWorkspace {
 impl SharedWorkspace {
     fn reserve(builder: &mut ArenaLayout) -> EngineResult<Self> {
         type A = Qwen38_27B;
-        let batch_hidden = product("resident batch-hidden workspace", MAX_BATCH, A::HIDDEN)?;
-        let batch_intermediate = product(
-            "resident batch-intermediate workspace",
-            MAX_BATCH,
+        let row_hidden = product("resident row-hidden workspace", MAX_ROWS, A::HIDDEN)?;
+        let row_intermediate = product(
+            "resident row-intermediate workspace",
+            MAX_ROWS,
             A::INTERMEDIATE,
         )?;
-        let batch_projected =
-            product("resident projected workspace", MAX_BATCH, A::GDN_INPUT_ROWS)?;
-        let batch_control = product("resident control workspace", MAX_BATCH, A::GDN_CONTROL_ROWS)?;
-        let batch_qkv = product("resident convolved workspace", MAX_BATCH, A::GDN_QKV_ROWS)?;
-        let batch_value = product(
+        let row_projected = product("resident projected workspace", MAX_ROWS, A::GDN_INPUT_ROWS)?;
+        let row_control = product("resident control workspace", MAX_ROWS, A::GDN_CONTROL_ROWS)?;
+        let row_qkv = product("resident convolved workspace", MAX_ROWS, A::GDN_QKV_ROWS)?;
+        let row_value = product(
             "resident recurrent-output workspace",
-            MAX_BATCH,
+            MAX_ROWS,
             A::GDN_VALUE_ROWS,
         )?;
-        let batch_attention = product(
+        let row_attention = product(
             "resident attention workspace",
-            MAX_BATCH,
+            MAX_ROWS,
             A::ATTENTION_OUTPUT_COLUMNS,
         )?;
-        let batch_attention_partials = product(
+        let decode_attention_partials = product(
             "resident attention partial workspace",
             product(
                 "resident attention partial rows",
@@ -514,42 +520,48 @@ impl SharedWorkspace {
             )?,
             LONG_CONTEXT_GQA_MAX_PARTITIONS,
         )?;
-        let batch_attention_numerator = product(
+        let attention_numerator = product(
             "resident attention partial numerator workspace",
-            batch_attention_partials,
+            decode_attention_partials,
             A::HEAD_DIM,
         )?;
         let batch_logits = product("resident logits workspace", MAX_BATCH, A::VOCAB)?;
 
         Ok(Self {
-            residual_a: builder.reserve(batch_hidden, ALIGNMENT)?,
-            residual_b: builder.reserve(batch_hidden, ALIGNMENT)?,
-            mixer_residual: builder.reserve(batch_hidden, ALIGNMENT)?,
-            mixer_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
-            mlp_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
-            activation_codes: builder.reserve(batch_intermediate, ALIGNMENT)?,
-            activation_scales: builder.reserve(MAX_BATCH, ALIGNMENT)?,
-            nvfp4_activation_codes: builder.reserve(batch_hidden / 2, ALIGNMENT)?,
-            nvfp4_activation_scales: builder.reserve(batch_hidden / NVFP4_GROUP, ALIGNMENT)?,
-            projected: builder.reserve(batch_projected, ALIGNMENT)?,
-            state_rows: builder.reserve(MAX_BATCH, ALIGNMENT)?,
-            log_decay: builder.reserve(batch_control, ALIGNMENT)?,
-            beta: builder.reserve(batch_control, ALIGNMENT)?,
-            convolved: builder.reserve(batch_qkv, ALIGNMENT)?,
-            recurrent_output: builder.reserve(batch_value, ALIGNMENT)?,
-            rope_cos: builder.reserve(MAX_BATCH * 32, ALIGNMENT)?,
-            rope_sin: builder.reserve(MAX_BATCH * 32, ALIGNMENT)?,
-            table_rows: builder.reserve(MAX_BATCH, ALIGNMENT)?,
-            cache_positions: builder.reserve(MAX_BATCH, ALIGNMENT)?,
-            lengths: builder.reserve(MAX_BATCH, ALIGNMENT)?,
-            query: builder.reserve(batch_attention, ALIGNMENT)?,
-            partial_maximum: builder.reserve(batch_attention_partials, ALIGNMENT)?,
-            partial_denominator: builder.reserve(batch_attention_partials, ALIGNMENT)?,
-            partial_numerator: builder.reserve(batch_attention_numerator, ALIGNMENT)?,
-            attention: builder.reserve(batch_attention, ALIGNMENT)?,
-            mixer_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
-            swiglu: builder.reserve(batch_intermediate, ALIGNMENT)?,
-            mlp_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
+            residual_a: builder.reserve(row_hidden, ALIGNMENT)?,
+            residual_b: builder.reserve(row_hidden, ALIGNMENT)?,
+            mixer_residual: builder.reserve(row_hidden, ALIGNMENT)?,
+            mixer_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            mlp_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            activation_codes: builder.reserve(row_intermediate, ALIGNMENT)?,
+            activation_scales: builder.reserve(MAX_ROWS, ALIGNMENT)?,
+            nvfp4_activation_codes: builder.reserve(row_intermediate / 2, ALIGNMENT)?,
+            nvfp4_activation_scales: builder.reserve(row_intermediate / NVFP4_GROUP, ALIGNMENT)?,
+            projected: builder.reserve(row_projected, ALIGNMENT)?,
+            state_rows: builder.reserve(MAX_ROWS, ALIGNMENT)?,
+            log_decay: builder.reserve(row_control, ALIGNMENT)?,
+            beta: builder.reserve(row_control, ALIGNMENT)?,
+            convolved: builder.reserve(row_qkv, ALIGNMENT)?,
+            recurrent_output: builder.reserve(row_value, ALIGNMENT)?,
+            rope_cos: builder.reserve(MAX_ROWS * 32, ALIGNMENT)?,
+            rope_sin: builder.reserve(MAX_ROWS * 32, ALIGNMENT)?,
+            table_rows: builder.reserve(MAX_ROWS, ALIGNMENT)?,
+            cache_positions: builder.reserve(MAX_ROWS, ALIGNMENT)?,
+            lengths: builder.reserve(MAX_ROWS, ALIGNMENT)?,
+            query: builder.reserve(row_attention, ALIGNMENT)?,
+            partial_maximum: builder.reserve(decode_attention_partials, ALIGNMENT)?,
+            partial_denominator: builder.reserve(decode_attention_partials, ALIGNMENT)?,
+            partial_numerator: builder.reserve(attention_numerator, ALIGNMENT)?,
+            // The admitted T=1024/P=4 macro route retains 24 heads × 1024 rows ×
+            // four 256-wide partition payloads, which is the largest exact prefill tile.
+            prefill_partials: builder.reserve(
+                PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES / size_of::<f32>(),
+                ALIGNMENT,
+            )?,
+            attention: builder.reserve(row_attention, ALIGNMENT)?,
+            mixer_branch: builder.reserve(row_hidden, ALIGNMENT)?,
+            swiglu: builder.reserve(row_intermediate, ALIGNMENT)?,
+            mlp_branch: builder.reserve(row_hidden, ALIGNMENT)?,
             logits: builder.reserve(batch_logits, ALIGNMENT)?,
         })
     }
@@ -581,6 +593,7 @@ impl SharedWorkspace {
             self.partial_maximum,
             self.partial_denominator,
             self.partial_numerator,
+            self.prefill_partials,
             self.attention,
             self.mixer_branch,
             self.swiglu,
@@ -899,7 +912,7 @@ fn checked_sum(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResidentLayerKind, ResidentModelLayout};
+    use super::{PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES, ResidentLayerKind, ResidentModelLayout};
 
     #[test]
     fn exact_layer_route_inventory_is_complete() {
@@ -938,33 +951,40 @@ mod tests {
         assert_eq!(layout.state_bytes(), 1_207_959_552);
         assert_eq!(layout.cache_bytes(), 7_210_008_576);
         assert_eq!(layout.kv_table_bytes(), 110_016);
-        assert_eq!(layout.workspace_bytes(), 176_314_016);
+        assert_eq!(layout.workspace_bytes(), 835_196_928);
         assert_eq!(
             layout.source_mapped_embedding_bytes().unwrap(),
             2_542_796_800
         );
         assert_eq!(layout.context_capacity(), 220_000);
-        assert_eq!(layout.owner_bytes(), 27_721_667_680);
+        assert_eq!(layout.owner_bytes(), 28_380_550_592);
     }
 
     #[test]
-    fn one_shared_workspace_covers_every_exact_batch() {
+    fn one_shared_workspace_covers_every_exact_decode_and_prefill_route() {
         let layout = ResidentModelLayout::build().unwrap();
 
-        for batch in 1..=8 {
-            assert!(batch * 5_120 <= layout.workspace.residual_a.len());
-            assert!(batch * 17_408 <= layout.workspace.activation_codes.len());
-            assert!(batch * 16_384 <= layout.workspace.projected.len());
-            assert!(batch * 10_240 <= layout.workspace.convolved.len());
-            assert!(batch * 6_144 <= layout.workspace.query.len());
-            assert!(batch * 24 * 860 <= layout.workspace.partial_maximum.len());
-            assert!(batch * 24 * 860 <= layout.workspace.partial_denominator.len());
-            assert!(batch * 24 * 860 * 256 <= layout.workspace.partial_numerator.len());
-            assert!(batch * 248_320 <= layout.workspace.logits.len());
+        for rows in [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024] {
+            assert!(rows * 5_120 <= layout.workspace.residual_a.len());
+            assert!(rows * 17_408 <= layout.workspace.activation_codes.len());
+            assert!(rows * 17_408 / 2 <= layout.workspace.nvfp4_activation_codes.len());
+            assert!(rows * 17_408 / 16 <= layout.workspace.nvfp4_activation_scales.len());
+            assert!(rows * 16_384 <= layout.workspace.projected.len());
+            assert!(rows * 10_240 <= layout.workspace.convolved.len());
+            assert!(rows * 6_144 <= layout.workspace.query.len());
+            assert!(rows * 6_144 <= layout.workspace.attention.len());
+            assert!(rows * 17_408 <= layout.workspace.swiglu.len());
         }
-        assert_eq!(layout.resident_arena_bytes(), 20_511_565_568);
+        assert!(8 * 24 * 860 <= layout.workspace.partial_maximum.len());
+        assert!(8 * 24 * 860 * 256 <= layout.workspace.partial_numerator.len());
+        assert_eq!(
+            layout.workspace.prefill_partials.byte_len(),
+            PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES,
+        );
+        assert_eq!(layout.workspace.logits.len(), 8 * 248_320);
+        assert_eq!(layout.resident_arena_bytes(), 21_170_447_360);
         assert_eq!(layout.kv_arena_bytes(), 7_210_118_656);
-        assert_eq!(layout.padding_bytes(), 16_544);
-        assert_eq!(layout.arena_bytes(), 27_721_684_224);
+        assert_eq!(layout.padding_bytes(), 15_424);
+        assert_eq!(layout.arena_bytes(), 28_380_566_016);
     }
 }

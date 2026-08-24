@@ -51,7 +51,8 @@ pub use resident_generation::{
 pub use resident_model_layout::{
     ResidentDecodeRoute, ResidentLayerKind, ResidentLoadMode, ResidentLoadPhase,
     ResidentLoadProgress, ResidentLoadStats, ResidentModelLayout, ResidentModelProgram,
-    ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
+    ResidentPrefillRoute, ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan,
+    ResidentUploadPreparation,
 };
 pub use sampling::{SampleDecision, Sampler, SamplingOptions};
 

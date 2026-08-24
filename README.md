@@ -40,7 +40,8 @@ It does not claim an in-process inference API; see [`python/README.md`](python/R
 
 `tuisko-engine` owns the exact 64-layer resident text program: all source-native weights, 48 GDN
 history/state pairs, one shared 3,438-page E4M3 KV pool across 16 attention layers, endpoint weights,
-one shared workspace, and immutable whole-model CUDA Graphs for every `B=1..8` route. Decode keeps
+one shared workspace, immutable whole-model CUDA Graphs for every `B=1..8` route, and exact
+from-empty prompt graphs at `T=32,64,128,1024`. Decode keeps
 the short graph through 192 positions and selects one of six partitioned graph buckets above it,
 with an exact 220,000-position per-request ceiling. The shared 3,438-page pool is divided among
 active slots, so aggregate admission may refuse concurrent requests whose rounded page counts
@@ -54,11 +55,10 @@ resident graphs through the 220,000-position ceiling. The compact owner preserve
 token as pending, packs only requests needing device work, cancels without advancing that pending
 token, and recycles holes without moving survivor state. Inactive slots retain their exact processed
 token span and may skip only a prefix that the next prompt contains in full; divergence falls back
-to cold priming. Prompt
-priming uses the exact B=1 decode route until optimized prefill routes are admitted, so long prompts
-are a correctness path rather than a production-TTFT path. Vision inputs,
-MTP generation, and prefill routes are not served yet and are rejected or remain outside the HTTP
-contract rather than silently taking another route.
+to cold priming. Server prompt priming still uses the exact B=1 decode route until the resident
+prefill owner is wired into scheduling, so long prompts remain a correctness path rather than a
+production-TTFT path. Vision inputs and MTP generation are not served yet and are rejected or remain
+outside the HTTP contract rather than silently taking another route.
 
 The standalone SM120 operator inventory also includes partitioned paged GQA through 220,000
 positions at every exact `B=1..8` route. The resident program owns its maximum-B partial workspace
@@ -129,6 +129,7 @@ cargo run -p xtask -- qualify-attention-qk-prepare
 cargo run -p xtask -- qualify-paged-gqa
 cargo run -p xtask -- qualify-long-context-paged-gqa
 cargo run -p xtask -- qualify-resident-model SNAPSHOT
+cargo run -p xtask -- bench-resident-prefill SNAPSHOT
 cargo run -p xtask -- bench-resident-long-context-model SNAPSHOT
 cargo run -p xtask -- qualify-resident-generation SNAPSHOT
 cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT

@@ -511,6 +511,7 @@ fn push_workspace(entries: &mut Vec<ResidentUploadEntry>, workspace: SharedWorks
         partial_maximum,
         partial_denominator,
         partial_numerator,
+        prefill_partials,
         attention,
         mixer_branch,
         swiglu,
@@ -796,9 +797,9 @@ mod tests {
         let plan = ResidentUploadPlan::build(&layout).unwrap();
 
         assert_eq!(plan.weight_bytes(), 19_103_682_560);
-        assert_eq!(plan.host_derived_bytes(), 110_080);
-        assert_eq!(plan.zeroed_owner_bytes(), 8_617_875_040);
-        assert_eq!(plan.padding_bytes(), 16_544);
+        assert_eq!(plan.host_derived_bytes(), 118_208);
+        assert_eq!(plan.zeroed_owner_bytes(), 9_276_749_824);
+        assert_eq!(plan.padding_bytes(), 15_424);
         assert_eq!(plan.initialized_bytes(), layout.arena_bytes());
     }
 
@@ -817,7 +818,7 @@ mod tests {
         assert_eq!(count(ResidentUploadPreparation::GatheredSource), 80);
         assert_eq!(count(ResidentUploadPreparation::SwizzledSource), 112);
         assert_eq!(count(ResidentUploadPreparation::HostDerived), 3);
-        assert_eq!(count(ResidentUploadPreparation::Zero), 48 * 2 + 27 + 16 * 2);
+        assert_eq!(count(ResidentUploadPreparation::Zero), 48 * 2 + 28 + 16 * 2);
         assert_eq!(
             plan.weight_bytes_for(ResidentUploadPreparation::BorrowedSource),
             16_945_778_688

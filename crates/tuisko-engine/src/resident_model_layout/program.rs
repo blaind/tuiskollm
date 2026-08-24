@@ -23,10 +23,11 @@ use tuisko_gpu::{
 };
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_kernels_sm120::{
-    AttentionOutputOp, AttentionQkPrepareOp, DenseFp8DownOp, DenseFp8SwiGluOp, FullAttentionQkvOp,
-    GdnInputProjectionOp, GdnOutputProjectionOp, GdnPrepareOp, GdnRecurrenceOp,
-    LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE, LmHeadOp,
-    LongContextPagedGqaOp, Nvfp4DownOp, Nvfp4SwiGluOp, PagedGqaOp, ResidualNormOp,
+    AttentionOutputOp, AttentionQkPrepareOp, DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp,
+    DenseFp8SwiGluTmaMaps, FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp,
+    GdnPrepareOp, GdnRecurrenceOp, LONG_CONTEXT_GQA_PARTITION_BUCKETS,
+    LONG_CONTEXT_GQA_PARTITION_SIZE, LmHeadOp, LongContextPagedGqaOp, Nvfp4DownOp, Nvfp4SwiGluOp,
+    PagedGqaOp, ResidualNormOp,
 };
 use tuisko_model::{
     Arch, CheckpointSnapshot, DenseFp8DownBindings, DenseFp8GateUpBindings,
@@ -40,6 +41,7 @@ const SHORT_CONTEXT_PAGES_PER_SLOT: usize = SHORT_CONTEXT_CAPACITY / ATTENTION_P
 #[cfg(feature = "qualification")]
 const SHORT_CONTEXT_PHYSICAL_PAGES: usize = MAX_BATCH * SHORT_CONTEXT_PAGES_PER_SLOT;
 const LONG_CONTEXT_ROUTE_COUNT: usize = LONG_CONTEXT_GQA_PARTITION_BUCKETS.len();
+const PREFILL_ROUTES: [usize; 4] = [32, 64, 128, super::MAX_ROWS];
 
 /// Exact resident graph selected by one checked decode-state upload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +50,20 @@ pub struct ResidentDecodeRoute {
     batch: usize,
     maximum_length: usize,
     attention: AttentionRoute,
+}
+
+/// Exact from-empty prompt route selected by one checked state upload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "the prefill route must be replayed with the state that selected it"]
+pub struct ResidentPrefillRoute {
+    tokens: usize,
+}
+
+impl ResidentPrefillRoute {
+    /// Number of contiguous prompt tokens captured by this exact route.
+    pub const fn tokens(self) -> usize {
+        self.tokens
+    }
 }
 
 impl ResidentDecodeRoute {
@@ -277,6 +293,7 @@ enum ArenaLoading {
 struct ResidentGraphs {
     short: [CudaGraph; MAX_BATCH],
     long: [[CudaGraph; MAX_BATCH]; LONG_CONTEXT_ROUTE_COUNT],
+    prefill: [CudaGraph; 4],
 }
 
 impl ResidentGraphs {
@@ -286,12 +303,28 @@ impl ResidentGraphs {
             AttentionRoute::Long { index, .. } => &self.long[index][route.batch - 1],
         }
     }
+
+    fn select_prefill(&self, route: ResidentPrefillRoute) -> EngineResult<&CudaGraph> {
+        let index = prefill_index(route.tokens).ok_or_else(|| {
+            EngineError::route(format!(
+                "resident prefill token count {} is outside 32,64,128,1024",
+                route.tokens
+            ))
+        })?;
+        Ok(&self.prefill[index])
+    }
+}
+
+struct DenseMlpMaps {
+    gate_up: DenseFp8SwiGluTmaMaps,
+    down: DenseFp8DownTmaMaps,
 }
 
 /// Resident and shared-KV arenas plus immutable `B=1..=8` graphs for all 64 text layers.
 pub struct ResidentModelProgram {
     // Graphs retain both arena addresses and module handles, so they drop first.
     graphs: ResidentGraphs,
+    dense_mlp_maps: Vec<DenseMlpMaps>,
     arena: DeviceArena,
     kv_arena: DeviceArena,
     kv_slots: PagedKvSlotPool,
@@ -423,7 +456,7 @@ impl ResidentModelProgram {
             context,
             product(
                 "resident embedding stager elements",
-                MAX_BATCH,
+                super::MAX_ROWS,
                 Qwen38_27B::HIDDEN,
             )?,
         )
@@ -622,6 +655,7 @@ impl ResidentModelProgram {
         };
         let graph_start = Instant::now();
         let pointers = ProgramPointers::bind(&arena, &kv_arena, &layout, &scalars)?;
+        let dense_mlp_maps = DenseMlpMaps::bind_all(&stream, &pointers)?;
         let base_address = arena.base_address();
         let kv_base_address = kv_arena.base_address();
         let ops = Ops {
@@ -641,7 +675,7 @@ impl ResidentModelProgram {
             nvfp4_down: &nvfp4_down,
             lm_head: &lm_head,
         };
-        let graphs = capture_routes(&stream, ops, &pointers)?;
+        let graphs = capture_routes(&stream, ops, &pointers, &dense_mlp_maps)?;
         load_stats.graph_capture_ns = elapsed_ns("resident graph capture", graph_start)?;
         if let Some(progress) = progress {
             progress.finish();
@@ -649,6 +683,7 @@ impl ResidentModelProgram {
 
         Ok(Self {
             graphs,
+            dense_mlp_maps,
             arena,
             kv_arena,
             kv_slots,
@@ -680,7 +715,7 @@ impl ResidentModelProgram {
 
     /// Copies exact mmap-backed BF16 embedding rows into the first residual plane.
     pub fn stage_embeddings(&mut self, stream: &CudaStream, token_ids: &[u32]) -> EngineResult<()> {
-        require_batch(token_ids.len())?;
+        require_rows(token_ids.len())?;
         let embedding = TextEndpointBindings::bind_embedding(self.snapshot.as_ref())?;
         let active = product(
             "resident active embedding elements",
@@ -717,14 +752,14 @@ impl ResidentModelProgram {
     pub fn load_residual(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         values: &[u16],
     ) -> EngineResult<()> {
-        require_batch(batch)?;
-        let expected = product("resident residual elements", batch, Qwen38_27B::HIDDEN)?;
+        require_rows(rows)?;
+        let expected = product("resident residual elements", rows, Qwen38_27B::HIDDEN)?;
         if values.len() != expected {
             return Err(EngineError::layout(format!(
-                "resident residual input has {} values, expected {expected} for B={batch}",
+                "resident residual input has {} values, expected {expected} for rows={rows}",
                 values.len()
             )));
         }
@@ -768,6 +803,60 @@ impl ResidentModelProgram {
             .copy_prefix_from_host(stream, workspace.rope_sin, rope_sin)?;
 
         select_decode_route(batch, &lengths[..batch])
+    }
+
+    /// Loads one exact from-empty prompt tile into one active slot.
+    pub fn load_prefill_state(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        slot: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<ResidentPrefillRoute> {
+        if prefill_index(tokens).is_none() {
+            return Err(EngineError::route(format!(
+                "resident prefill tokens {tokens} are outside 32,64,128,1024"
+            )));
+        }
+        require_slot(slot)?;
+        let reserved_tokens = self
+            .kv_slots
+            .page_count(slot)?
+            .checked_mul(ATTENTION_PAGE_SIZE)
+            .ok_or_else(|| EngineError::layout("resident prefill page capacity overflows"))?;
+        if reserved_tokens < tokens {
+            return Err(EngineError::route(format!(
+                "resident prefill slot {slot} owns {reserved_tokens} cache positions, expected at least {tokens}"
+            )));
+        }
+        let rotary_values = product("resident prefill rotary values", tokens, ROTARY_PAIRS)?;
+        if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
+            return Err(EngineError::layout(format!(
+                "resident prefill rotary planes must each have {rotary_values} values for T={tokens}"
+            )));
+        }
+
+        let slot = u32::try_from(slot)
+            .map_err(|_| EngineError::layout("resident prefill slot exceeds u32"))?;
+        let positions = (0..tokens as u32).collect::<Vec<_>>();
+        let lengths = (1..=tokens as u32).collect::<Vec<_>>();
+        let rows = vec![slot; tokens];
+        let workspace = self.layout.workspace;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.state_rows, &rows)?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.table_rows, &rows)?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.cache_positions, &positions)?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.lengths, &lengths)?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.rope_cos, rope_cos)?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.rope_sin, rope_sin)?;
+
+        Ok(ResidentPrefillRoute { tokens })
     }
 
     /// Selects distinct physical persistent slots for the compact active rows.
@@ -919,6 +1008,16 @@ impl ResidentModelProgram {
         Ok(())
     }
 
+    /// Replays one immutable from-empty prompt graph.
+    pub fn replay_prefill(
+        &self,
+        stream: &CudaStream,
+        route: ResidentPrefillRoute,
+    ) -> EngineResult<()> {
+        self.graphs.select_prefill(route)?.launch(stream)?;
+        Ok(())
+    }
+
     /// Reads active BF16 vocabulary logits.
     pub fn read_logits(&self, stream: &CudaStream, batch: usize) -> EngineResult<Vec<u16>> {
         require_batch(batch)?;
@@ -926,6 +1025,15 @@ impl ResidentModelProgram {
         Ok(self
             .arena
             .copy_prefix_to_host(stream, self.layout.workspace.logits, values)?)
+    }
+
+    /// Reads the final-token BF16 vocabulary logits from one prefill graph.
+    pub fn read_prefill_logits(&self, stream: &CudaStream) -> EngineResult<Vec<u16>> {
+        Ok(self.arena.copy_prefix_to_host(
+            stream,
+            self.layout.workspace.logits,
+            Qwen38_27B::VOCAB,
+        )?)
     }
 
     /// Reads active BF16 logits into one reusable host allocation.
@@ -1021,6 +1129,11 @@ impl ResidentModelProgram {
         self.layout.workspace_bytes()
     }
 
+    /// Exact address-bound tensor-map bytes across the eight dense MLP layers.
+    pub fn descriptor_bytes(&self) -> usize {
+        self.dense_mlp_maps.iter().map(DenseMlpMaps::byte_len).sum()
+    }
+
     /// Complete device arena bytes, including exact alignment padding.
     pub const fn arena_bytes(&self) -> usize {
         self.layout.arena_bytes()
@@ -1051,6 +1164,11 @@ impl ResidentModelProgram {
         MAX_BATCH
     }
 
+    /// Largest admitted exact prompt tile.
+    pub const fn row_capacity(&self) -> usize {
+        super::MAX_ROWS
+    }
+
     /// Fixed per-slot capacity of the current exact attention caches.
     pub const fn context_capacity(&self) -> usize {
         self.layout.context_capacity()
@@ -1068,7 +1186,30 @@ impl ResidentModelProgram {
         stream: &CudaStream,
         route: ResidentDecodeRoute,
     ) -> EngineResult<()> {
-        launch_route(stream, route, self.ops(), &self._pointers)?;
+        launch_route(
+            stream,
+            route,
+            self.ops(),
+            &self._pointers,
+            &self.dense_mlp_maps,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Launches one complete prefill schedule eagerly for graph agreement.
+    pub fn launch_prefill_eager(
+        &self,
+        stream: &CudaStream,
+        route: ResidentPrefillRoute,
+    ) -> EngineResult<()> {
+        launch_prefill_route(
+            stream,
+            route,
+            self.ops(),
+            &self._pointers,
+            &self.dense_mlp_maps,
+        )?;
         Ok(())
     }
 
@@ -1076,6 +1217,15 @@ impl ResidentModelProgram {
     /// Returns the captured complete-model graph for one checked state route.
     pub fn qualification_graph(&self, route: ResidentDecodeRoute) -> &CudaGraph {
         self.graphs.select(route)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns one captured complete-model prefill graph.
+    pub fn qualification_prefill_graph(
+        &self,
+        route: ResidentPrefillRoute,
+    ) -> EngineResult<&CudaGraph> {
+        self.graphs.select_prefill(route)
     }
 
     #[cfg(feature = "qualification")]
@@ -1094,7 +1244,29 @@ impl ResidentModelProgram {
         let ops = self.ops();
         Ok(CudaGraph::capture(stream, || {
             for _ in 0..operations {
-                launch_route(stream, route, ops, &self._pointers)?;
+                launch_route(stream, route, ops, &self._pointers, &self.dense_mlp_maps)?;
+            }
+            Ok(())
+        })?)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Captures repeated complete-model prefill schedules for direct timing.
+    pub fn qualification_repeated_prefill_graph(
+        &self,
+        stream: &CudaStream,
+        route: ResidentPrefillRoute,
+        operations: u64,
+    ) -> EngineResult<CudaGraph> {
+        if operations == 0 {
+            return Err(EngineError::route(
+                "repeated resident-model prefill graph requires at least one operation",
+            ));
+        }
+        let ops = self.ops();
+        Ok(CudaGraph::capture(stream, || {
+            for _ in 0..operations {
+                launch_prefill_route(stream, route, ops, &self._pointers, &self.dense_mlp_maps)?;
             }
             Ok(())
         })?)
@@ -1105,12 +1277,12 @@ impl ResidentModelProgram {
     pub fn qualification_embedding_stage_graph(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
     ) -> EngineResult<ResidentEmbeddingStageGraph<'_>> {
-        require_batch(batch)?;
+        require_rows(rows)?;
         let active = product(
             "resident staged embedding elements",
-            batch,
+            rows,
             Qwen38_27B::HIDDEN,
         )?;
         let graph = CudaGraph::capture(stream, || {
@@ -1134,7 +1306,11 @@ impl ResidentModelProgram {
     #[cfg(feature = "qualification")]
     /// Returns every immutable and mutable address captured by the owner.
     pub fn qualification_addresses(&self) -> Vec<usize> {
-        self._pointers.addresses()
+        let mut addresses = self._pointers.addresses();
+        for maps in &self.dense_mlp_maps {
+            maps.push_addresses(&mut addresses);
+        }
+        addresses
     }
 
     #[cfg(feature = "qualification")]
@@ -1246,6 +1422,7 @@ impl ResidentModelProgram {
             workspace.partial_maximum,
             workspace.partial_denominator,
             workspace.partial_numerator,
+            workspace.prefill_partials,
             workspace.attention,
         ] {
             self.arena.fill(stream, region, byte)?;
@@ -1363,6 +1540,9 @@ impl ResidentModelProgram {
             partial_numerator: self
                 .arena
                 .copy_to_host(stream, workspace.partial_numerator)?,
+            prefill_partials: self
+                .arena
+                .copy_to_host(stream, workspace.prefill_partials)?,
             attention: self.arena.copy_to_host(stream, workspace.attention)?,
             mixer_branch: self.arena.copy_to_host(stream, workspace.mixer_branch)?,
             swiglu: self.arena.copy_to_host(stream, workspace.swiglu)?,
@@ -1525,6 +1705,8 @@ pub struct ResidentModelObservables {
     pub partial_denominator: Vec<f32>,
     /// Partition attention numerators retained by the long-context attention route.
     pub partial_numerator: Vec<f32>,
+    /// Macro-prefill producer and reduction scratch.
+    pub prefill_partials: Vec<f32>,
     /// Last gated attention-output rows.
     pub attention: Vec<f32>,
     /// Final mixer projection branch rows.
@@ -1708,6 +1890,7 @@ struct DenseFp8Pointers {
     gate_up_weight_scales: *const u16,
     down_weight_codes: *const u8,
     down_weight_scales: *const u16,
+    map_index: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1770,6 +1953,7 @@ struct WorkspacePointers {
     partial_maximum: *mut f32,
     partial_denominator: *mut f32,
     partial_numerator: *mut f32,
+    prefill_partials: *mut f32,
     attention: *mut f32,
     mixer_branch: *mut u16,
     swiglu: *mut u16,
@@ -1798,6 +1982,7 @@ impl ProgramPointers {
         }
         let mut layers = Vec::with_capacity(layout.layers.len());
         let mut attention_layer = 0;
+        let mut dense_mlp = 0;
         for (layer, scalars) in layout.layers.iter().zip(scalars) {
             let cache = match layer.persistent {
                 super::PersistentState::Gdn(_) => None,
@@ -1825,7 +2010,7 @@ impl ProgramPointers {
                     cache,
                     scalars.mixer,
                 )?,
-                mlp: bind_mlp(arena, layer.mlp, scalars.mlp)?,
+                mlp: bind_mlp(arena, layer.mlp, scalars.mlp, &mut dense_mlp)?,
             });
         }
         if attention_layer != layout.kv_layout.layers().len() {
@@ -1853,6 +2038,57 @@ impl ProgramPointers {
         self.endpoint.push_addresses(&mut addresses);
         self.workspace.push_addresses(&mut addresses);
         addresses
+    }
+}
+
+impl DenseMlpMaps {
+    fn bind_all(stream: &CudaStream, pointers: &ProgramPointers) -> EngineResult<Vec<Self>> {
+        let mut maps = Vec::new();
+        for layer in &pointers.layers {
+            let MlpPointers::DenseFp8(weights) = layer.mlp else {
+                continue;
+            };
+            if weights.map_index != maps.len() {
+                return Err(EngineError::layout(
+                    "resident dense MLP tensor-map inventory is not contiguous",
+                ));
+            }
+            // SAFETY: resident arenas keep the shared scratch and this layer's
+            // source-native weight addresses stable for every captured graph.
+            let gate_up = unsafe {
+                DenseFp8SwiGluTmaMaps::new(
+                    stream,
+                    pointers.workspace.activation_codes.cast_const(),
+                    weights.gate_up_weight_codes,
+                )?
+            };
+            // SAFETY: the same stable scratch covers the larger down-input row.
+            let down = unsafe {
+                DenseFp8DownTmaMaps::new(
+                    stream,
+                    pointers.workspace.activation_codes.cast_const(),
+                    weights.down_weight_codes,
+                )?
+            };
+            maps.push(Self { gate_up, down });
+        }
+        if maps.len() != 8 {
+            return Err(EngineError::layout(format!(
+                "resident dense MLP tensor-map inventory has {} layers, expected 8",
+                maps.len()
+            )));
+        }
+        Ok(maps)
+    }
+
+    fn byte_len(&self) -> usize {
+        self.gate_up.byte_len() + self.down.byte_len()
+    }
+
+    #[cfg(feature = "qualification")]
+    fn push_addresses(&self, addresses: &mut Vec<usize>) {
+        addresses.extend(self.gate_up.device_addresses());
+        addresses.extend(self.down.device_addresses());
     }
 }
 
@@ -1917,6 +2153,7 @@ impl WorkspacePointers {
             partial_maximum: arena.address(regions.partial_maximum)?,
             partial_denominator: arena.address(regions.partial_denominator)?,
             partial_numerator: arena.address(regions.partial_numerator)?,
+            prefill_partials: arena.address(regions.prefill_partials)?,
             attention: arena.address(regions.attention)?,
             mixer_branch: arena.address(regions.mixer_branch)?,
             swiglu: arena.address(regions.swiglu)?,
@@ -1953,6 +2190,7 @@ impl WorkspacePointers {
             self.partial_maximum.addr(),
             self.partial_denominator.addr(),
             self.partial_numerator.addr(),
+            self.prefill_partials.addr(),
             self.attention.addr(),
             self.mixer_branch.addr(),
             self.swiglu.addr(),
@@ -2039,6 +2277,7 @@ fn bind_mlp(
     arena: &DeviceArena,
     weights: MlpWeights,
     scalars: MlpScalars,
+    dense_mlp: &mut usize,
 ) -> EngineResult<MlpPointers> {
     match (weights, scalars) {
         (MlpWeights::Nvfp4(weights), MlpScalars::Nvfp4(scalars)) => {
@@ -2060,11 +2299,16 @@ fn bind_mlp(
             }))
         }
         (MlpWeights::DenseFp8(weights), MlpScalars::DenseFp8) => {
+            let map_index = *dense_mlp;
+            *dense_mlp = dense_mlp
+                .checked_add(1)
+                .ok_or_else(|| EngineError::layout("resident dense MLP inventory overflows"))?;
             Ok(MlpPointers::DenseFp8(DenseFp8Pointers {
                 gate_up_weight_codes: arena.address(weights.gate_up_weight_codes)?.cast_const(),
                 gate_up_weight_scales: arena.address(weights.gate_up_weight_scales)?.cast_const(),
                 down_weight_codes: arena.address(weights.down_weight_codes)?.cast_const(),
                 down_weight_scales: arena.address(weights.down_weight_scales)?.cast_const(),
+                map_index,
             }))
         }
         _ => Err(EngineError::layout(
@@ -2096,6 +2340,7 @@ fn capture_routes(
     stream: &CudaStream,
     ops: Ops<'_>,
     pointers: &ProgramPointers,
+    dense_mlp_maps: &[DenseMlpMaps],
 ) -> EngineResult<ResidentGraphs> {
     let mut short = Vec::with_capacity(MAX_BATCH);
     for batch in 1..=MAX_BATCH {
@@ -2105,7 +2350,7 @@ fn capture_routes(
             attention: AttentionRoute::Short,
         };
         short.push(CudaGraph::capture(stream, || {
-            launch_route(stream, route, ops, pointers)
+            launch_route(stream, route, ops, pointers, dense_mlp_maps)
         })?);
     }
     let short = short
@@ -2123,7 +2368,7 @@ fn capture_routes(
                 attention: AttentionRoute::Long { index, partitions },
             };
             graphs.push(CudaGraph::capture(stream, || {
-                launch_route(stream, route, ops, pointers)
+                launch_route(stream, route, ops, pointers, dense_mlp_maps)
             })?);
         }
         long.push(graphs.try_into().map_err(|_| {
@@ -2134,7 +2379,22 @@ fn capture_routes(
         EngineError::layout("resident long graph partition inventory has wrong cardinality")
     })?;
 
-    Ok(ResidentGraphs { short, long })
+    let mut prefill = Vec::with_capacity(PREFILL_ROUTES.len());
+    for tokens in PREFILL_ROUTES {
+        let route = ResidentPrefillRoute { tokens };
+        prefill.push(CudaGraph::capture(stream, || {
+            launch_prefill_route(stream, route, ops, pointers, dense_mlp_maps)
+        })?);
+    }
+    let prefill = prefill.try_into().map_err(|_| {
+        EngineError::layout("resident prefill graph inventory has wrong cardinality")
+    })?;
+
+    Ok(ResidentGraphs {
+        short,
+        long,
+        prefill,
+    })
 }
 
 fn launch_route(
@@ -2142,6 +2402,7 @@ fn launch_route(
     route: ResidentDecodeRoute,
     ops: Ops<'_>,
     pointers: &ProgramPointers,
+    dense_mlp_maps: &[DenseMlpMaps],
 ) -> GpuResult<()> {
     let batch = route.batch;
     let workspace = pointers.workspace;
@@ -2176,7 +2437,7 @@ fn launch_route(
                 workspace.mlp_normalized,
             )?;
         }
-        launch_mlp(stream, batch, ops, workspace, layer.mlp)?;
+        launch_mlp(stream, batch, ops, workspace, layer.mlp, dense_mlp_maps)?;
 
         let residual_output = if index.is_multiple_of(2) {
             workspace.residual_b
@@ -2219,6 +2480,235 @@ fn launch_route(
             pointers.endpoint.lm_head_scales,
             workspace.logits,
         )
+    }
+}
+
+fn launch_prefill_route(
+    stream: &CudaStream,
+    route: ResidentPrefillRoute,
+    ops: Ops<'_>,
+    pointers: &ProgramPointers,
+    dense_mlp_maps: &[DenseMlpMaps],
+) -> GpuResult<()> {
+    let rows = route.tokens;
+    let workspace = pointers.workspace;
+    let first = pointers
+        .layers
+        .first()
+        .ok_or_else(|| GpuError::invalid_launch("resident layer inventory is empty"))?;
+    // SAFETY: exact T routes bound all shared MAX_ROWS planes, and mapped
+    // metadata selects one persistent slot and one live page-table row.
+    unsafe {
+        ops.norm.launch_plain(
+            stream,
+            rows,
+            workspace.residual_a,
+            first.mixer.input_norm(),
+            workspace.mixer_normalized,
+        )?;
+    }
+
+    let mut residual_input = workspace.residual_a;
+    for (index, layer) in pointers.layers.iter().enumerate() {
+        launch_prefill_mixer(stream, rows, ops, workspace, layer.mixer)?;
+        // SAFETY: branch and residual planes are disjoint MAX_ROWS regions.
+        unsafe {
+            ops.norm.launch_residual(
+                stream,
+                rows,
+                residual_input,
+                workspace.mixer_branch,
+                layer.mixer.post_attention_norm(),
+                workspace.mixer_residual,
+                workspace.mlp_normalized,
+            )?;
+        }
+        launch_mlp(stream, rows, ops, workspace, layer.mlp, dense_mlp_maps)?;
+
+        let residual_output = if index.is_multiple_of(2) {
+            workspace.residual_b
+        } else {
+            workspace.residual_a
+        };
+        let next_norm = pointers
+            .layers
+            .get(index + 1)
+            .map_or(pointers.endpoint.final_norm, |next| next.mixer.input_norm());
+        // SAFETY: residual ping-pong and both branch planes do not alias.
+        unsafe {
+            ops.norm.launch_residual(
+                stream,
+                rows,
+                workspace.mixer_residual,
+                workspace.mlp_branch,
+                next_norm,
+                residual_output,
+                workspace.mixer_normalized,
+            )?;
+        }
+        residual_input = residual_output;
+    }
+
+    if residual_input != workspace.residual_a {
+        return Err(GpuError::invalid_launch(
+            "resident even-layer prefill schedule did not return to residual A",
+        ));
+    }
+    // Only the final prompt row feeds sampling; this avoids a 508,559,360-byte
+    // T-wide logits plane at T=1024 without changing the model boundary.
+    unsafe {
+        let final_row = workspace
+            .mixer_normalized
+            .add((rows - 1) * Qwen38_27B::HIDDEN);
+        ops.lm_head.launch(
+            stream,
+            1,
+            final_row,
+            workspace.activation_codes,
+            workspace.activation_scales,
+            pointers.endpoint.lm_head_codes,
+            pointers.endpoint.lm_head_scales,
+            workspace.logits,
+        )
+    }
+}
+
+fn launch_prefill_mixer(
+    stream: &CudaStream,
+    rows: usize,
+    ops: Ops<'_>,
+    workspace: WorkspacePointers,
+    mixer: MixerPointers,
+) -> GpuResult<()> {
+    // SAFETY: shared scratch is consumed before reuse. All prefill rows map to
+    // one persistent slot; GDN kernels advance it causally in token order.
+    unsafe {
+        match mixer {
+            MixerPointers::Gdn(p) => {
+                ops.gdn_input.launch(
+                    stream,
+                    rows,
+                    workspace.mixer_normalized,
+                    workspace.activation_codes,
+                    workspace.activation_scales,
+                    p.input_weight_codes,
+                    p.input_weight_scales,
+                    workspace.projected,
+                )?;
+                ops.gdn_prepare.launch(
+                    stream,
+                    rows,
+                    workspace.mixer_normalized,
+                    p.control_weights,
+                    p.a_log,
+                    p.dt_bias,
+                    workspace.projected,
+                    p.convolution_weights,
+                    workspace.state_rows,
+                    p.history,
+                    workspace.log_decay,
+                    workspace.beta,
+                    workspace.convolved,
+                )?;
+                ops.gdn_recurrence.launch(
+                    stream,
+                    rows,
+                    workspace.convolved,
+                    workspace.projected,
+                    workspace.log_decay,
+                    workspace.beta,
+                    p.recurrent_norm,
+                    workspace.state_rows,
+                    p.state,
+                    workspace.recurrent_output,
+                )?;
+                ops.gdn_output.launch(
+                    stream,
+                    rows,
+                    workspace.recurrent_output,
+                    workspace.activation_codes,
+                    workspace.activation_scales,
+                    p.output_weight_codes,
+                    p.output_weight_scales,
+                    workspace.mixer_branch,
+                )
+            }
+            MixerPointers::Attention(p) => {
+                ops.attention_qkv.launch(
+                    stream,
+                    rows,
+                    workspace.mixer_normalized,
+                    workspace.activation_codes,
+                    workspace.activation_scales,
+                    p.qkv_weight_codes,
+                    p.qkv_weight_scales,
+                    workspace.projected,
+                )?;
+                ops.attention_qk_prepare.launch(
+                    stream,
+                    rows,
+                    workspace.projected,
+                    p.query_norm,
+                    p.key_norm,
+                    workspace.rope_cos,
+                    workspace.rope_sin,
+                    workspace.block_tables,
+                    workspace.table_rows,
+                    LONG_CONTEXT_PHYSICAL_PAGES,
+                    workspace.cache_positions,
+                    workspace.query,
+                    p.key_pages,
+                    p.value_pages,
+                    p.scalars.key_cache_scale,
+                    p.scalars.value_cache_scale,
+                )?;
+                if rows < super::MAX_ROWS {
+                    ops.paged_gqa.launch_prefill_shared(
+                        stream,
+                        rows,
+                        workspace.query,
+                        p.key_pages,
+                        p.value_pages,
+                        workspace.block_tables,
+                        workspace.table_rows,
+                        LONG_CONTEXT_PHYSICAL_PAGES,
+                        workspace.lengths,
+                        workspace.attention,
+                        p.scalars.key_cache_scale,
+                        p.scalars.value_cache_scale,
+                    )?;
+                } else {
+                    // P4 caps each from-empty T=1024 partition at 256 keys and
+                    // exposes 3,072 producer CTAs before the exact reduction.
+                    ops.paged_gqa.launch_prefill_macro(
+                        stream,
+                        4,
+                        workspace.query,
+                        p.key_pages,
+                        p.value_pages,
+                        workspace.block_tables,
+                        workspace.table_rows,
+                        LONG_CONTEXT_PHYSICAL_PAGES,
+                        workspace.lengths,
+                        workspace.prefill_partials,
+                        workspace.attention,
+                        p.scalars.key_cache_scale,
+                        p.scalars.value_cache_scale,
+                    )?;
+                }
+                ops.attention_output.launch(
+                    stream,
+                    rows,
+                    workspace.attention,
+                    workspace.projected,
+                    workspace.activation_codes,
+                    workspace.activation_scales,
+                    p.output_weight_codes,
+                    p.output_weight_scales,
+                    workspace.mixer_branch,
+                )
+            }
+        }
     }
 }
 
@@ -2364,18 +2854,19 @@ fn launch_mixer(
 
 fn launch_mlp(
     stream: &CudaStream,
-    batch: usize,
+    rows: usize,
     ops: Ops<'_>,
     workspace: WorkspacePointers,
     mlp: MlpPointers,
+    dense_mlp_maps: &[DenseMlpMaps],
 ) -> GpuResult<()> {
-    // SAFETY: all weights are source-route matched and shared scratch covers MAX_BATCH.
+    // SAFETY: all weights are source-route matched and shared scratch covers MAX_ROWS.
     unsafe {
         match mlp {
             MlpPointers::Nvfp4(p) => {
                 ops.nvfp4_swiglu.launch(
                     stream,
-                    batch,
+                    rows,
                     workspace.mlp_normalized,
                     workspace.nvfp4_activation_codes,
                     workspace.nvfp4_activation_scales,
@@ -2385,40 +2876,95 @@ fn launch_mlp(
                     p.scalars.gate_up_weight,
                     workspace.swiglu,
                 )?;
-                // The admitted A16 down route consumes BF16 directly; its
-                // source input divisor remains observable but is not applied.
-                let _ = p.scalars.down_input;
-                ops.nvfp4_down.launch(
-                    stream,
-                    batch,
-                    workspace.swiglu,
-                    p.down_weight_codes,
-                    p.down_weight_scales,
-                    p.scalars.down_weight,
-                    workspace.mlp_branch,
-                )
+                if rows <= MAX_BATCH {
+                    // Decode preserves the BF16 down input.
+                    ops.nvfp4_down.launch(
+                        stream,
+                        rows,
+                        workspace.swiglu,
+                        p.down_weight_codes,
+                        p.down_weight_scales,
+                        p.scalars.down_weight,
+                        workspace.mlp_branch,
+                    )
+                } else {
+                    ops.nvfp4_down.launch_prefill(
+                        stream,
+                        rows,
+                        workspace.swiglu,
+                        workspace.nvfp4_activation_codes,
+                        workspace.nvfp4_activation_scales,
+                        p.down_weight_codes,
+                        p.down_weight_scales,
+                        p.scalars.down_input,
+                        p.scalars.down_weight,
+                        workspace.mlp_branch,
+                    )
+                }
             }
             MlpPointers::DenseFp8(p) => {
-                ops.dense_swiglu.launch(
-                    stream,
-                    batch,
-                    workspace.mlp_normalized,
-                    workspace.activation_codes,
-                    workspace.activation_scales,
-                    p.gate_up_weight_codes,
-                    p.gate_up_weight_scales,
-                    workspace.swiglu,
-                )?;
-                ops.dense_down.launch(
-                    stream,
-                    batch,
-                    workspace.swiglu,
-                    workspace.activation_codes,
-                    workspace.activation_scales,
-                    p.down_weight_codes,
-                    p.down_weight_scales,
-                    workspace.mlp_branch,
-                )
+                if rows == super::MAX_ROWS {
+                    let maps = dense_mlp_maps.get(p.map_index).ok_or_else(|| {
+                        GpuError::invalid_launch(
+                            "resident dense MLP tensor-map index is outside its owner inventory",
+                        )
+                    })?;
+                    // T=1024 amortizes address-bound TMA setup across the macro tiles.
+                    ops.dense_swiglu.launch_macro_prefill(
+                        stream,
+                        workspace.mlp_normalized,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.gate_up_weight_codes,
+                        p.gate_up_weight_scales,
+                        workspace.swiglu,
+                        &maps.gate_up,
+                    )?;
+                    ops.dense_down.launch_macro_prefill(
+                        stream,
+                        workspace.swiglu,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.down_weight_codes,
+                        p.down_weight_scales,
+                        workspace.mlp_branch,
+                        &maps.down,
+                    )
+                } else {
+                    ops.dense_swiglu.launch(
+                        stream,
+                        rows,
+                        workspace.mlp_normalized,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.gate_up_weight_codes,
+                        p.gate_up_weight_scales,
+                        workspace.swiglu,
+                    )?;
+                    if rows <= MAX_BATCH {
+                        ops.dense_down.launch(
+                            stream,
+                            rows,
+                            workspace.swiglu,
+                            workspace.activation_codes,
+                            workspace.activation_scales,
+                            p.down_weight_codes,
+                            p.down_weight_scales,
+                            workspace.mlp_branch,
+                        )
+                    } else {
+                        ops.dense_down.launch_tail_prefill(
+                            stream,
+                            rows,
+                            workspace.swiglu,
+                            workspace.activation_codes,
+                            workspace.activation_scales,
+                            p.down_weight_codes,
+                            p.down_weight_scales,
+                            workspace.mlp_branch,
+                        )
+                    }
+                }
             }
         }
     }
@@ -2785,18 +3331,18 @@ fn initialize_metadata(
     layout: &ResidentModelLayout,
 ) -> EngineResult<()> {
     let workspace = layout.workspace;
-    arena.copy_from_host(
-        stream,
-        workspace.state_rows,
-        &(0..MAX_BATCH as u32).collect::<Vec<_>>(),
-    )?;
+    let mut state_rows = vec![0u32; super::MAX_ROWS];
+    for (row, state_row) in state_rows.iter_mut().take(MAX_BATCH).enumerate() {
+        *state_row = row as u32;
+    }
+    arena.copy_from_host(stream, workspace.state_rows, &state_rows)?;
     let block_tables = vec![u32::MAX; MAX_BATCH * LONG_CONTEXT_PHYSICAL_PAGES];
     kv_arena.copy_from_host(stream, layout.kv_layout.block_tables(), &block_tables)?;
-    arena.copy_from_host(
-        stream,
-        workspace.table_rows,
-        &(0..MAX_BATCH as u32).collect::<Vec<_>>(),
-    )?;
+    let mut table_rows = vec![0u32; super::MAX_ROWS];
+    for (row, table_row) in table_rows.iter_mut().take(MAX_BATCH).enumerate() {
+        *table_row = row as u32;
+    }
+    arena.copy_from_host(stream, workspace.table_rows, &table_rows)?;
     Ok(())
 }
 
@@ -2826,9 +3372,15 @@ fn initialize_selective_nonweights(
         }
     }
 
-    let state_rows = (0..MAX_BATCH as u32).collect::<Vec<_>>();
+    let mut state_rows = vec![0u32; super::MAX_ROWS];
+    for (row, state_row) in state_rows.iter_mut().take(MAX_BATCH).enumerate() {
+        *state_row = row as u32;
+    }
     upload_region(stream, arena, layout.workspace.state_rows, &state_rows)?;
-    let table_rows = (0..MAX_BATCH as u32).collect::<Vec<_>>();
+    let mut table_rows = vec![0u32; super::MAX_ROWS];
+    for (row, table_row) in table_rows.iter_mut().take(MAX_BATCH).enumerate() {
+        *table_row = row as u32;
+    }
     upload_region(stream, arena, layout.workspace.table_rows, &table_rows)?;
     let block_tables = vec![u32::MAX; MAX_BATCH * LONG_CONTEXT_PHYSICAL_PAGES];
     upload_region(
@@ -2919,6 +3471,25 @@ fn select_decode_route(batch: usize, lengths: &[u32]) -> EngineResult<ResidentDe
         maximum_length,
         attention,
     })
+}
+
+const fn prefill_index(rows: usize) -> Option<usize> {
+    match rows {
+        32 => Some(0),
+        64 => Some(1),
+        128 => Some(2),
+        super::MAX_ROWS => Some(3),
+        _ => None,
+    }
+}
+
+fn require_rows(rows: usize) -> EngineResult<()> {
+    if rows == 0 || (rows > MAX_BATCH && prefill_index(rows).is_none()) {
+        return Err(EngineError::route(format!(
+            "resident row count {rows} is not an admitted B=1..{MAX_BATCH} or T=32/64/128/1024 route"
+        )));
+    }
+    Ok(())
 }
 
 fn slot_rows(slots: &[usize]) -> EngineResult<[u32; MAX_BATCH]> {
@@ -3062,8 +3633,8 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PRODUCTION_LOAD_MODE, ResidentLoadMode, bf16_to_f32, decode_lengths, require_batch,
-        select_decode_route, slot_rows,
+        PRODUCTION_LOAD_MODE, ResidentLoadMode, bf16_to_f32, decode_lengths, prefill_index,
+        require_batch, require_rows, select_decode_route, slot_rows,
     };
     use crate::EngineErrorCode;
 
@@ -3080,6 +3651,24 @@ mod tests {
         for batch in [0, 9, 16, usize::MAX] {
             let error = require_batch(batch).unwrap_err();
             assert_eq!(error.code(), Some(EngineErrorCode::Route));
+        }
+    }
+
+    #[test]
+    fn exact_row_inventory_adds_only_the_four_prefill_tiles() {
+        for rows in 1..=8 {
+            require_rows(rows).unwrap();
+        }
+        for (index, rows) in [32, 64, 128, 1_024].into_iter().enumerate() {
+            require_rows(rows).unwrap();
+            assert_eq!(prefill_index(rows), Some(index));
+        }
+        for rows in [0, 9, 31, 33, 63, 65, 127, 129, 1_023, 1_025, usize::MAX] {
+            assert_eq!(
+                require_rows(rows).unwrap_err().code(),
+                Some(EngineErrorCode::Route)
+            );
+            assert_eq!(prefill_index(rows), None);
         }
     }
 

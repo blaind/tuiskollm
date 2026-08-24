@@ -35,7 +35,8 @@ publishes its FP32 and dynamic E4M3 seams and applies the source-native projecti
 `B=1..8` and `T=32,64,128,1024`; the prefill projection uses exact 32x32 tiles through T=128 and
 64x32 tiles at T=1024. The resident text owner
 composes all 48 GDN layers, 16 attention layers, source-routed MLPs, and the LM head into one
-directly timed graph at every exact `B=1..8`; serving cases remain future work.
+directly timed graph at every exact `B=1..8` and one from-empty graph at each exact
+`T=32,64,128,1024`; server routing remains separate.
 The source-backed layer-63 full-attention owner separately composes exact `B=1..8` decode and
 from-empty causal `T=32,64,128,1024` prefill graphs; T=1024 selects the admitted P4 macro GQA route.
 
@@ -180,7 +181,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact B=1..8 and T=32/64/128/1024 graphs, tensor-map immutability, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT` | Check complete source layer-63 attention/MLP seams, represented KV cache, exact B=1..8 and T=32/64/128/1024 graphs, P4 macro partials, immutable tensor maps, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-full-attention-layer SNAPSHOT` | Check complete Qwen3.5 source layer-31 attention/MLP seams, BF16 KV cache, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-resident-model SNAPSHOT` | Check all 64 source routes, final source-backed formulas, dynamic page recycling/remapping and isolated reset, persistent state/cache, short plus six-bucket exact-B whole-model graphs, independent long-attention seam formulas, stable device/host addresses, and owner allocation | terminal |
+| `cargo run -p xtask -- qualify-resident-model SNAPSHOT` | Check all 64 source routes, final source-backed formulas, dynamic page recycling/remapping and isolated reset, persistent state/cache, short plus six-bucket exact-B whole-model graphs, exact T=32/64/128/1024 from-empty prompt graphs, independent long-attention seam formulas, stable device/host addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-resident-generation SNAPSHOT` | Check pinned vLLM next-token fixtures plus frontend, greedy control, streaming decode, stable ownership, and zero post-warmup device allocation | terminal |
 | `cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT` | Compare compact mixed-length scheduling with sequential requests, including every B=1..8 route, noncontiguous survivor replay, cancellation, exact retained-prefix reuse, divergence fallback, slot recycling, stable ownership, and zero post-warmup device allocation | terminal |
 | `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
@@ -203,6 +204,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-full-attention-layer SNAPSHOT` | Measure every complete source-backed layer-63 B=1..8 graph at a 131-token context and every from-empty T=32/64/128/1024 prefill graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-full-attention-layer SNAPSHOT` | Measure every complete Qwen3.5 source-backed layer-31 graph at a 131-token, three-page BF16 context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-resident-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head graph at a 131-token context | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-resident-prefill SNAPSHOT` | Directly measure every complete from-empty T=32/64/128/1024 resident prompt graph with final-token-only LM head | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-resident-long-context-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head long graph with one 131,073-token row and compact one-token survivors | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
@@ -342,6 +344,12 @@ resolution and duplicating hundreds of model nodes would measure a different own
 embedding-staging graph restores represented input rows before each sample and remains outside the
 timed whole-model replay.
 
+`bench-resident-prefill SNAPSHOT` directly times the same resident owner at exact
+`T=32,64,128,1024`. All 64 layers advance one mapped GDN state/history row and one paged-attention
+table row causally from an empty prompt; T=1024 uses the admitted P4 macro GQA route. Only the final
+normalized prompt row enters the LM head, while embedding staging and metadata uploads remain
+outside the timed graph.
+
 `bench-resident-long-context-model SNAPSHOT` uses the same production owner and direct graph timing.
 Its shared-pool profile assigns 131,073 positions to the first compact row and one position to each
 survivor, selecting the 860-partition graph for every exact `B=1..8` route without inventing eight
@@ -357,16 +365,16 @@ owners. `perf candidate` and `perf check` use a checked registry for that relati
 estimate a composed boundary by adding leaf medians. Examples include:
 
 ```text
-nvfp4-down -> nvfp4-mlp -> resident-model -> resident-long-context-model
+nvfp4-down -> nvfp4-mlp -> resident-model + resident-prefill + resident-long-context-model
 fp8-down -> dense-fp8-mlp -> dense-fp8-gdn-layer + full-attention-layer
-         -> resident-model + resident-long-context-model
+         -> resident-model + resident-prefill + resident-long-context-model
 long-context-paged-gqa -> resident-long-context-model
 ```
 
 The candidate mode is diagnostic: it runs the changed suite's oracle once, builds and resource-
 checks once, and measures the direct dependency cone. The check mode requalifies each distinct
 correctness boundary in the cone, uses complete suite defaults, and compares every cone report with
-its independent baseline. The two resident timing profiles share one resident-model oracle. A
+its independent baseline. The three resident timing profiles share one resident-model oracle. A
 source-backed composed suite needs the admitted snapshot path even when the selected root is a
 synthetic leaf.
 

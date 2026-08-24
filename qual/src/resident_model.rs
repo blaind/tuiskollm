@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tuisko_engine::{
     EngineError, MAX_BATCH, PagedKvSlotState, ResidentDecodeRoute, ResidentLoadMode,
     ResidentLongContextObservables, ResidentModelObservables, ResidentModelProgram,
+    ResidentPrefillRoute,
 };
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, device_memory_info};
 use tuisko_kernels_sm120::{
@@ -26,6 +27,7 @@ const ROTARY_PAIRS: usize = 32;
 const TABLE_STRIDE: usize = 3;
 const LONG_ROUTE_LENGTHS: [usize; 6] = [193, 1_025, 4_097, 16_385, 65_537, 131_073];
 const LONG_ORACLE_DIMENSIONS: [usize; 8] = [0, 31, 32, 127, 128, 223, 224, 255];
+const PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1_024];
 const SELECTED_LOGIT_ROWS: [usize; 5] = [0, 1, 31_337, 131_071, Qwen38_27B::VOCAB - 1];
 
 /// Failure of the complete source-backed resident-model gate.
@@ -65,6 +67,8 @@ pub struct ResidentModelQualification {
     pub long_route_cases: usize,
     /// Independent long-attention seam values checked.
     pub long_oracle_values: usize,
+    /// Exact from-empty prompt routes checked eagerly and through CUDA Graph replay.
+    pub prefill_route_cases: usize,
     /// Largest absolute difference from a BF16 or FP64 oracle.
     pub maximum_absolute_error: f32,
 }
@@ -118,6 +122,7 @@ fn qualify_resident_model_with_mode(
         slot_control_values: 0,
         long_route_cases: 0,
         long_oracle_values: 0,
+        prefill_route_cases: 0,
         maximum_absolute_error: 0.0,
     };
     report.slot_control_values += verify_block_tables(&program, &stream)?;
@@ -152,12 +157,24 @@ fn qualify_resident_model_with_mode(
             )));
         }
     }
+    verify_prefill_routes(
+        &mut program,
+        &stream,
+        &final_norm,
+        lm_head_codes,
+        &lm_head_scales,
+        stable_base,
+        stable_kv_base,
+        &stable_addresses,
+        &stable_route_addresses,
+        &mut report,
+    )?;
     verify_slot_reset(&mut program, &stream, &mut report)?;
     report.slot_control_values += verify_block_tables(&program, &stream)?;
     report.slot_control_values += verify_dynamic_page_routes(&mut program, &stream)?;
     verify_long_context_routes(&mut program, &stream, &mut report)?;
 
-    verify_no_device_allocation(&program, &stream)?;
+    verify_no_device_allocation(&mut program, &stream)?;
     if program.qualification_kv_route_addresses() != stable_route_addresses {
         return Err(ResidentModelQualificationError::Mismatch(
             "page-router host addresses changed after route mutation".to_string(),
@@ -165,6 +182,167 @@ fn qualify_resident_model_with_mode(
     }
     device_benchmark::require_current_process_exclusive()?;
     Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_prefill_routes(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+    final_norm: &[u16],
+    lm_head_codes: &[u8],
+    lm_head_scales: &[u16],
+    stable_base: u64,
+    stable_kv_base: u64,
+    stable_addresses: &[usize],
+    stable_route_addresses: &[usize; 2],
+    report: &mut ResidentModelQualification,
+) -> Result<(), ResidentModelQualificationError> {
+    let update = program.reserve_kv_slot_tokens(stream, 0, 1_024)?;
+    if update.first_entry() != 3
+        || update.entry_count() != 13
+        || program.qualification_kv_page_count(0)? != 16
+    {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "resident prefill slot owns {} pages after update {update:?}, expected 16 after adding entries 3..16",
+            program.qualification_kv_page_count(0)?
+        )));
+    }
+
+    for tokens in PREFILL_ROUTES {
+        let eager_route = prepare_prefill_run(program, stream, tokens, 0)?;
+        program.launch_prefill_eager(stream, eager_route)?;
+        let eager = program.qualification_observables(stream)?;
+        let eager_pages = read_prefill_cache_pages(program, stream, 0, tokens)?;
+
+        let replay_route = prepare_prefill_run(program, stream, tokens, 0)?;
+        if replay_route != eager_route {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "T={tokens} eager and replay route tokens differ"
+            )));
+        }
+        program.replay_prefill(stream, replay_route)?;
+        let replay = program.qualification_observables(stream)?;
+        let replay_pages = read_prefill_cache_pages(program, stream, 0, tokens)?;
+
+        verify_replay(tokens, &eager, &replay, report)?;
+        if replay_pages != eager_pages {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "T={tokens} represented cache pages differ under graph replay"
+            )));
+        }
+        if replay_pages.last().is_none_or(|(key, value)| {
+            key.iter().all(|&code| code == 0) || value.iter().all(|&code| code == 0)
+        }) {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "T={tokens} did not publish represented K/V values through its final cache page"
+            )));
+        }
+        verify_prefill_final_oracle(
+            tokens,
+            final_norm,
+            lm_head_codes,
+            lm_head_scales,
+            &replay,
+            report,
+        )?;
+        verify_prefill_inactive(tokens, &replay, report)?;
+        report.graph_replay_values += replay_pages
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>();
+        report.prefill_route_cases += 1;
+
+        if program.base_address() != stable_base
+            || program.kv_base_address() != stable_kv_base
+            || program.qualification_addresses() != stable_addresses
+            || program.qualification_kv_route_addresses() != *stable_route_addresses
+        {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "owner addresses changed while qualifying T={tokens}"
+            )));
+        }
+    }
+
+    let tables = program.qualification_block_tables(stream)?;
+    let used = tables
+        .iter()
+        .copied()
+        .filter(|&page| page != u32::MAX)
+        .collect::<BTreeSet<_>>();
+    let guard_page = (0..3_438u32)
+        .find(|page| !used.contains(page))
+        .ok_or_else(|| {
+            ResidentModelQualificationError::Mismatch(
+                "resident prefill qualification has no unassigned cache guard page".to_string(),
+            )
+        })? as usize;
+    let (key_guard, value_guard) = program.qualification_cache_page(stream, guard_page)?;
+    if key_guard.iter().any(|&value| value != 0) || value_guard.iter().any(|&value| value != 0) {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "resident prefill modified unassigned physical cache page {guard_page}"
+        )));
+    }
+    report.inactive_values += key_guard.len() + value_guard.len();
+
+    let released = program.truncate_kv_slot_tokens(stream, 0, 192)?;
+    if released != 13 || program.qualification_kv_page_count(0)? != 3 {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "resident prefill slot retained {} pages after releasing {released}, expected 3 after releasing 13",
+            program.qualification_kv_page_count(0)?
+        )));
+    }
+    Ok(())
+}
+
+fn prepare_prefill_run(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+    tokens: usize,
+    slot: usize,
+) -> Result<ResidentPrefillRoute, ResidentModelQualificationError> {
+    program.reset_state(stream)?;
+    program.qualification_reset_workspace(stream, SENTINEL)?;
+    let token_ids = (0..tokens)
+        .map(|token| 100u32 + (token % 251) as u32)
+        .collect::<Vec<_>>();
+    program.stage_embeddings(stream, &token_ids)?;
+    let (rope_cos, rope_sin) = prefill_rope(tokens);
+    Ok(program.load_prefill_state(stream, tokens, slot, &rope_cos, &rope_sin)?)
+}
+
+fn prefill_rope(tokens: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut cosine = vec![0.0; tokens * ROTARY_PAIRS];
+    let mut sine = vec![0.0; tokens * ROTARY_PAIRS];
+    for token in 0..tokens {
+        for pair in 0..ROTARY_PAIRS {
+            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
+            let angle = token as f64 * frequency;
+            let (sin, cos) = angle.sin_cos();
+            cosine[token * ROTARY_PAIRS + pair] = cos as f32;
+            sine[token * ROTARY_PAIRS + pair] = sin as f32;
+        }
+    }
+    (cosine, sine)
+}
+
+fn read_prefill_cache_pages(
+    program: &ResidentModelProgram,
+    stream: &CudaStream,
+    slot: usize,
+    tokens: usize,
+) -> Result<CachePages, ResidentModelQualificationError> {
+    (0..tokens.div_ceil(ATTENTION_PAGE_SIZE))
+        .map(|logical_page| {
+            let position = logical_page * ATTENTION_PAGE_SIZE;
+            let physical = usize::try_from(program.qualification_kv_physical_page(slot, position)?)
+                .map_err(|_| {
+                    ResidentModelQualificationError::Mismatch(
+                        "resident prefill physical page exceeds host width".to_string(),
+                    )
+                })?;
+            Ok(program.qualification_cache_page(stream, physical)?)
+        })
+        .collect()
 }
 
 fn verify_dynamic_page_routes(
@@ -707,14 +885,16 @@ fn verify_owner(program: &ResidentModelProgram) -> Result<(), ResidentModelQuali
         || program.state_bytes() != 1_207_959_552
         || program.cache_bytes() != 7_210_008_576
         || program.kv_table_bytes() != 110_016
-        || program.workspace_bytes() != 176_314_016
-        || program.padding_bytes() != 16_544
-        || program.resident_arena_bytes() != 20_511_565_568
+        || program.workspace_bytes() != 835_196_928
+        || program.descriptor_bytes() != 4_096
+        || program.padding_bytes() != 15_424
+        || program.resident_arena_bytes() != 21_170_447_360
         || program.kv_arena_bytes() != 7_210_118_656
-        || program.arena_bytes() != 27_721_684_224
-        || program.host_stager_bytes() != 81_920
+        || program.arena_bytes() != 28_380_566_016
+        || program.host_stager_bytes() != 10_485_760
         || program.kv_route_host_bytes() != 113_454
         || program.batch_capacity() != 8
+        || program.row_capacity() != 1_024
         || program.context_capacity() != 220_000
         || program.persistent_slot_bytes() != 153_944_064
     {
@@ -723,10 +903,10 @@ fn verify_owner(program: &ResidentModelProgram) -> Result<(), ResidentModelQuali
         ));
     }
     let addresses = program.qualification_addresses();
-    if addresses.len() != 1_129 || addresses.iter().copied().collect::<BTreeSet<_>>().len() != 1_129
+    if addresses.len() != 1_162 || addresses.iter().copied().collect::<BTreeSet<_>>().len() != 1_162
     {
         return Err(ResidentModelQualificationError::Mismatch(format!(
-            "owner exposes {} addresses, expected 1,129 unique addresses",
+            "owner exposes {} addresses, expected 1,162 unique addresses",
             addresses.len()
         )));
     }
@@ -881,6 +1061,67 @@ fn verify_final_oracle(
     Ok(())
 }
 
+fn verify_prefill_final_oracle(
+    tokens: usize,
+    final_norm: &[u16],
+    lm_head_codes: &[u8],
+    lm_head_scales: &[u16],
+    observed: &ResidentModelObservables,
+    report: &mut ResidentModelQualification,
+) -> Result<(), ResidentModelQualificationError> {
+    let hidden = Qwen38_27B::HIDDEN;
+    let begin = (tokens - 1) * hidden;
+    let end = begin + hidden;
+    let residual = observed.mixer_residual[begin..end]
+        .iter()
+        .zip(&observed.mlp_branch[begin..end])
+        .map(|(&residual, &branch)| f32_to_bf16(bf16_to_f32(residual) + bf16_to_f32(branch)))
+        .collect::<Vec<_>>();
+    compare_exact(
+        &format!("T={tokens} final residual"),
+        &observed.residual_a[begin..end],
+        &residual,
+    )?;
+    let normalized = rms_norm_oracle::<Qwen38_27B>(&residual, final_norm);
+    compare_bf16(
+        &format!("T={tokens} final RMSNorm"),
+        &observed.mixer_normalized[begin..end],
+        &normalized,
+        &mut report.maximum_absolute_error,
+    )?;
+    let quantized =
+        quantize_oracle(&normalized).map_err(ResidentModelQualificationError::Mismatch)?;
+    compare_exact(
+        &format!("T={tokens} endpoint activation codes"),
+        &observed.activation_codes[..hidden],
+        &quantized.codes,
+    )?;
+    if observed.activation_scales[0].to_bits() != quantized.scale.to_bits() {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "T={tokens} endpoint activation scale differs"
+        )));
+    }
+    for &row in &SELECTED_LOGIT_ROWS {
+        let weight_begin = row * hidden;
+        let expected = fp8_dot(
+            &quantized.codes,
+            quantized.scale,
+            &lm_head_codes[weight_begin..weight_begin + hidden],
+            lm_head_scales[row],
+        )?;
+        let actual = bf16_to_f32(observed.logits[row]);
+        require_close(
+            &format!("T={tokens} selected LM-head row"),
+            row,
+            actual,
+            expected,
+            &mut report.maximum_absolute_error,
+        )?;
+    }
+    report.oracle_values += 3 * hidden + 1 + SELECTED_LOGIT_ROWS.len();
+    Ok(())
+}
+
 fn fp8_dot(
     activations: &[u8],
     activation_scale: f32,
@@ -953,6 +1194,7 @@ fn verify_replay(
     same_f32!(partial_maximum);
     same_f32!(partial_denominator);
     same_f32!(partial_numerator);
+    same_f32!(prefill_partials);
     same_f32!(attention);
     same!(mixer_branch);
     same!(swiglu);
@@ -987,6 +1229,7 @@ fn observable_values(observed: &ResidentModelObservables) -> usize {
         + observed.partial_maximum.len()
         + observed.partial_denominator.len()
         + observed.partial_numerator.len()
+        + observed.prefill_partials.len()
         + observed.attention.len()
         + observed.mixer_branch.len()
         + observed.swiglu.len()
@@ -1075,6 +1318,7 @@ fn verify_inactive(
         ("partial_maximum", &observed.partial_maximum),
         ("partial_denominator", &observed.partial_denominator),
         ("partial_numerator", &observed.partial_numerator),
+        ("prefill_partials", &observed.prefill_partials),
     ] {
         if values
             .iter()
@@ -1091,17 +1335,195 @@ fn verify_inactive(
     inactive += sentinel_u16!(swiglu, Qwen38_27B::INTERMEDIATE);
     inactive += sentinel_u16!(mlp_branch, Qwen38_27B::HIDDEN);
     inactive += sentinel_u16!(logits, Qwen38_27B::VOCAB);
-    let persistent = verify_persistent_inactive(batch, slots, observed)?;
+    let persistent = verify_persistent_inactive(batch, slots, observed, true)?;
     inactive += persistent;
     report.slot_control_values += persistent;
     report.inactive_values += inactive;
     Ok(())
 }
 
+fn verify_prefill_inactive(
+    tokens: usize,
+    observed: &ResidentModelObservables,
+    report: &mut ResidentModelQualification,
+) -> Result<(), ResidentModelQualificationError> {
+    let mut inactive = 0usize;
+    for (role, values, width) in [
+        ("residual_a", &observed.residual_a, Qwen38_27B::HIDDEN),
+        ("residual_b", &observed.residual_b, Qwen38_27B::HIDDEN),
+        (
+            "mixer_residual",
+            &observed.mixer_residual,
+            Qwen38_27B::HIDDEN,
+        ),
+        (
+            "mixer_normalized",
+            &observed.mixer_normalized,
+            Qwen38_27B::HIDDEN,
+        ),
+        (
+            "mlp_normalized",
+            &observed.mlp_normalized,
+            Qwen38_27B::HIDDEN,
+        ),
+        ("projected", &observed.projected, Qwen38_27B::GDN_INPUT_ROWS),
+        ("convolved", &observed.convolved, Qwen38_27B::GDN_QKV_ROWS),
+        (
+            "recurrent_output",
+            &observed.recurrent_output,
+            Qwen38_27B::GDN_VALUE_ROWS,
+        ),
+        ("mixer_branch", &observed.mixer_branch, Qwen38_27B::HIDDEN),
+        ("swiglu", &observed.swiglu, Qwen38_27B::INTERMEDIATE),
+        ("mlp_branch", &observed.mlp_branch, Qwen38_27B::HIDDEN),
+    ] {
+        inactive += require_bf16_sentinel_tail(
+            &format!("T={tokens} inactive {role}"),
+            values,
+            tokens * width,
+        )?;
+    }
+    for (role, values, width) in [
+        (
+            "activation_codes",
+            &observed.activation_codes,
+            Qwen38_27B::INTERMEDIATE,
+        ),
+        (
+            "nvfp4_activation_codes",
+            &observed.nvfp4_activation_codes,
+            Qwen38_27B::INTERMEDIATE / 2,
+        ),
+        (
+            "nvfp4_activation_scales",
+            &observed.nvfp4_activation_scales,
+            Qwen38_27B::INTERMEDIATE / 16,
+        ),
+    ] {
+        inactive += require_u8_sentinel_tail(
+            &format!("T={tokens} inactive {role}"),
+            values,
+            tokens * width,
+        )?;
+    }
+    for (role, values, width) in [
+        ("activation_scales", &observed.activation_scales, 1),
+        (
+            "log_decay",
+            &observed.log_decay,
+            Qwen38_27B::GDN_CONTROL_ROWS,
+        ),
+        ("beta", &observed.beta, Qwen38_27B::GDN_CONTROL_ROWS),
+        (
+            "query",
+            &observed.query,
+            Qwen38_27B::ATTENTION_OUTPUT_COLUMNS,
+        ),
+        (
+            "attention",
+            &observed.attention,
+            Qwen38_27B::ATTENTION_OUTPUT_COLUMNS,
+        ),
+    ] {
+        inactive += require_f32_sentinel_tail(
+            &format!("T={tokens} inactive {role}"),
+            values,
+            tokens * width,
+        )?;
+    }
+    for (role, values) in [
+        ("partial_maximum", &observed.partial_maximum),
+        ("partial_denominator", &observed.partial_denominator),
+        ("partial_numerator", &observed.partial_numerator),
+    ] {
+        inactive += require_f32_sentinel_tail(&format!("T={tokens} untouched {role}"), values, 0)?;
+    }
+    if tokens < 1_024 {
+        inactive += require_f32_sentinel_tail(
+            &format!("T={tokens} untouched prefill_partials"),
+            &observed.prefill_partials,
+            0,
+        )?;
+    }
+    inactive += require_bf16_sentinel_tail(
+        &format!("T={tokens} inactive logits"),
+        &observed.logits,
+        Qwen38_27B::VOCAB,
+    )?;
+    let persistent = verify_persistent_inactive(tokens, &[0], observed, false)?;
+    report.slot_control_values += persistent;
+    report.inactive_values += inactive + persistent;
+    Ok(())
+}
+
+fn require_u8_sentinel_tail(
+    role: &str,
+    values: &[u8],
+    begin: usize,
+) -> Result<usize, ResidentModelQualificationError> {
+    let tail = values.get(begin..).ok_or_else(|| {
+        ResidentModelQualificationError::Mismatch(format!(
+            "{role} begins at {begin}, beyond {} values",
+            values.len()
+        ))
+    })?;
+    if let Some(index) = tail.iter().position(|&value| value != SENTINEL) {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "{role} changed at value {}",
+            begin + index
+        )));
+    }
+    Ok(tail.len())
+}
+
+fn require_bf16_sentinel_tail(
+    role: &str,
+    values: &[u16],
+    begin: usize,
+) -> Result<usize, ResidentModelQualificationError> {
+    let tail = values.get(begin..).ok_or_else(|| {
+        ResidentModelQualificationError::Mismatch(format!(
+            "{role} begins at {begin}, beyond {} values",
+            values.len()
+        ))
+    })?;
+    if let Some(index) = tail.iter().position(|&value| value != BF16_SENTINEL) {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "{role} changed at value {}",
+            begin + index
+        )));
+    }
+    Ok(tail.len())
+}
+
+fn require_f32_sentinel_tail(
+    role: &str,
+    values: &[f32],
+    begin: usize,
+) -> Result<usize, ResidentModelQualificationError> {
+    let tail = values.get(begin..).ok_or_else(|| {
+        ResidentModelQualificationError::Mismatch(format!(
+            "{role} begins at {begin}, beyond {} values",
+            values.len()
+        ))
+    })?;
+    if let Some(index) = tail
+        .iter()
+        .position(|value| value.to_bits() != F32_SENTINEL_BITS)
+    {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "{role} changed at value {}",
+            begin + index
+        )));
+    }
+    Ok(tail.len())
+}
+
 fn verify_persistent_inactive(
     batch: usize,
     active_slots: &[usize],
     observed: &ResidentModelObservables,
+    check_guard_pages: bool,
 ) -> Result<usize, ResidentModelQualificationError> {
     let history_per_slot = Qwen38_27B::GDN_QKV_ROWS * (Qwen38_27B::LINEAR_CONV_KERNEL_DIM - 1);
     let state_per_slot =
@@ -1167,16 +1589,18 @@ fn verify_persistent_inactive(
             }
         }
     }
-    for (role, guards) in [
-        ("key", &observed.key_guard_pages),
-        ("value", &observed.value_guard_pages),
-    ] {
-        if guards.iter().any(|&value| value != 0) {
-            return Err(ResidentModelQualificationError::Mismatch(format!(
-                "B={batch} modified the first unassigned {role} cache page"
-            )));
+    if check_guard_pages {
+        for (role, guards) in [
+            ("key", &observed.key_guard_pages),
+            ("value", &observed.value_guard_pages),
+        ] {
+            if guards.iter().any(|&value| value != 0) {
+                return Err(ResidentModelQualificationError::Mismatch(format!(
+                    "B={batch} modified the first unassigned {role} cache page"
+                )));
+            }
+            inactive += guards.len();
         }
-        inactive += guards.len();
     }
     Ok(inactive)
 }
@@ -1357,7 +1781,7 @@ fn f32_to_bf16(value: f32) -> u16 {
 }
 
 fn verify_no_device_allocation(
-    program: &ResidentModelProgram,
+    program: &mut ResidentModelProgram,
     stream: &CudaStream,
 ) -> Result<(), ResidentModelQualificationError> {
     let routes: [ResidentDecodeRoute; MAX_BATCH] = (1..=MAX_BATCH)
@@ -1388,6 +1812,43 @@ fn verify_no_device_allocation(
     if before != after {
         return Err(ResidentModelQualificationError::Mismatch(format!(
             "device memory changed after warmup: before={before:?}, after={after:?}"
+        )));
+    }
+
+    let token_ids = (0..1_024)
+        .map(|token| 100u32 + (token % 251) as u32)
+        .collect::<Vec<_>>();
+    program.stage_embeddings(stream, &token_ids)?;
+    let (rope_cos, rope_sin) = prefill_rope(1_024);
+    let prefill_routes: [ResidentPrefillRoute; 4] = PREFILL_ROUTES
+        .into_iter()
+        .map(|tokens| {
+            program.load_prefill_state(
+                stream,
+                tokens,
+                7,
+                &rope_cos[..tokens * ROTARY_PAIRS],
+                &rope_sin[..tokens * ROTARY_PAIRS],
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| {
+            ResidentModelQualificationError::Mismatch(
+                "prefill allocation route inventory has wrong cardinality".to_string(),
+            )
+        })?;
+    program.replay_prefill(stream, prefill_routes[3])?;
+    stream.synchronize().map_err(GpuError::from)?;
+    let before = device_memory_info(program.context())?;
+    for index in [0, 3, 1, 2] {
+        program.replay_prefill(stream, prefill_routes[index])?;
+    }
+    stream.synchronize().map_err(GpuError::from)?;
+    let after = device_memory_info(program.context())?;
+    if before != after {
+        return Err(ResidentModelQualificationError::Mismatch(format!(
+            "device memory changed after prefill warmup: before={before:?}, after={after:?}"
         )));
     }
     Ok(())
@@ -1435,12 +1896,13 @@ mod tests {
         assert_eq!(report.source_scalars, 256);
         assert_eq!(
             report.oracle_values,
-            active * (3 * 5_120 + 1 + SELECTED_LOGIT_ROWS.len())
+            (active + 4) * (3 * 5_120 + 1 + SELECTED_LOGIT_ROWS.len())
         );
         assert!(report.graph_replay_values > 0);
         assert!(report.inactive_values > 0);
         assert!(report.slot_control_values > 0);
         assert_eq!(report.long_route_cases, 49);
+        assert_eq!(report.prefill_route_cases, 4);
         assert!(report.long_oracle_values > 0);
         assert!(report.maximum_absolute_error.is_finite());
     }

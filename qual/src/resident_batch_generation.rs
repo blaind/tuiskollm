@@ -443,8 +443,8 @@ fn require_round(
 fn verify_owner(
     generator: &ResidentBatchGenerator,
 ) -> Result<(), ResidentBatchGenerationQualificationError> {
-    if generator.arena_bytes() != 27_551_280_384
-        || generator.host_stager_bytes() != 8_028_160
+    if generator.arena_bytes() != 28_380_566_016
+        || generator.host_stager_bytes() != 18_432_000
         || generator.kv_route_host_bytes() != 113_454
     {
         return Err(ResidentBatchGenerationQualificationError::Mismatch(
@@ -486,8 +486,8 @@ mod tests {
         assert_eq!(report.cancellations, 2);
         assert_eq!(report.exact_prefix_reuses, 1);
         assert_eq!(report.safe_cold_fallbacks, 1);
-        assert_eq!(report.arena_bytes, 27_551_280_384);
-        assert_eq!(report.host_stager_bytes, 8_028_160);
+        assert_eq!(report.arena_bytes, 28_380_566_016);
+        assert_eq!(report.host_stager_bytes, 18_432_000);
         Ok(())
     }
 }

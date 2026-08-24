@@ -16,7 +16,7 @@ const USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
     qualify-resident-model|qualify-resident-generation|qualify-resident-batch-generation|\
     bench-residual-norm|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-fp8-qkv|bench-fp8-gdn-input|\
     bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-full-attention-layer|\
-    bench-resident-model|bench-resident-long-context-model|\
+    bench-resident-model|bench-resident-prefill|bench-resident-long-context-model|\
     probe|check|sweep> \
     [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
     [--samples N] [--launches-per-sample N] [--energy-seconds N]";
@@ -99,6 +99,7 @@ enum Benchmark {
     Nvfp4Mlp,
     FullAttentionLayer,
     ResidentModel,
+    ResidentPrefill,
     ResidentLongContextModel,
 }
 
@@ -121,6 +122,7 @@ impl Benchmark {
             "bench-attention-output" => Self::Leaf(crate::PerformanceSuite::AttentionOutput),
             "bench-full-attention-layer" => Self::FullAttentionLayer,
             "bench-resident-model" => Self::ResidentModel,
+            "bench-resident-prefill" => Self::ResidentPrefill,
             "bench-resident-long-context-model" => Self::ResidentLongContextModel,
             _ => return None,
         })
@@ -132,6 +134,7 @@ impl Benchmark {
             Self::Nvfp4Mlp => "nvfp4-mlp",
             Self::FullAttentionLayer => "full-attention-layer",
             Self::ResidentModel => "resident-model",
+            Self::ResidentPrefill => "resident-prefill",
             Self::ResidentLongContextModel => "resident-long-context-model",
         }
     }
@@ -142,6 +145,7 @@ impl Benchmark {
             Self::Nvfp4Mlp
                 | Self::FullAttentionLayer
                 | Self::ResidentModel
+                | Self::ResidentPrefill
                 | Self::ResidentLongContextModel
         )
     }
@@ -244,6 +248,9 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 crate::prepare_remote_full_attention_layer_benchmark(root, options.gpu)?
             }
             Benchmark::ResidentModel => {
+                crate::prepare_remote_resident_model_benchmark(root, options.gpu)?
+            }
+            Benchmark::ResidentPrefill => {
                 crate::prepare_remote_resident_model_benchmark(root, options.gpu)?
             }
             Benchmark::ResidentLongContextModel => {
