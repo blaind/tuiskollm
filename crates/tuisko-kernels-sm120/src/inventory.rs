@@ -10,6 +10,7 @@ use crate::fp8::{
 };
 use crate::gdn::{gdn_prepare_ptx_names, gdn_recurrence_ptx_names};
 use crate::mtp_bf16_fusion::mtp_bf16_fusion_ptx_names;
+use crate::mtp_bf16_paged_gqa::mtp_bf16_paged_gqa_ptx_names;
 use crate::mtp_bf16_qk_prepare::mtp_bf16_qk_prepare_ptx_names;
 use crate::mtp_bf16_qkv::mtp_bf16_qkv_ptx_names;
 use crate::nvfp4_down::{nvfp4_down_ptx_names, qwen35_nvfp4_down_ptx_names};
@@ -40,6 +41,7 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .chain(mtp_bf16_fusion_ptx_names())
         .chain(mtp_bf16_qkv_ptx_names())
         .chain(mtp_bf16_qk_prepare_ptx_names())
+        .chain(mtp_bf16_paged_gqa_ptx_names())
         .chain(nvfp4_swiglu_ptx_names())
         .chain(qwen35_nvfp4_swiglu_ptx_names())
         .chain(nvfp4_down_ptx_names())
@@ -58,7 +60,7 @@ mod tests {
         let names = kernel_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 345);
+        assert_eq!(names.len(), 353);
         assert_eq!(unique.len(), names.len());
     }
 }

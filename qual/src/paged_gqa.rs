@@ -7,7 +7,7 @@ use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
     device_memory_info,
 };
-use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, PagedGqaOp, Qwen35PagedGqaOp};
+use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, MtpBf16PagedGqaOp, PagedGqaOp, Qwen35PagedGqaOp};
 use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -54,6 +54,10 @@ pub struct PagedGqaQualification {
     pub immutable_input_values: usize,
     /// Complete output state reproduced by CUDA Graph replay.
     pub graph_replay_values: usize,
+    /// Exact represented cache bytes in the qualification arena.
+    pub cache_bytes: usize,
+    /// Exact query, output, and metadata bytes in the qualification arena.
+    pub workspace_bytes: usize,
     /// Exact bytes in the one-allocation qualification arena.
     pub arena_bytes: usize,
     /// Alignment padding bytes in that arena.
@@ -82,6 +86,14 @@ impl Regions {
             + self.table_rows.byte_len()
             + self.lengths.byte_len()
             + self.output.byte_len()
+    }
+
+    fn cache_bytes(self) -> usize {
+        self.key_pages.byte_len() + self.value_pages.byte_len()
+    }
+
+    fn workspace_bytes(self) -> usize {
+        self.payload_bytes() - self.cache_bytes()
     }
 }
 
@@ -214,6 +226,50 @@ impl QualifiedPagedGqaOp for Qwen35PagedGqaOp {
     }
 }
 
+impl QualifiedPagedGqaOp for MtpBf16PagedGqaOp {
+    type Target = Qwen38_27B;
+    const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
+    const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16;
+
+    fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        MtpBf16PagedGqaOp::new(context)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &self,
+        stream: &tuisko_gpu::CudaStream,
+        batch: usize,
+        query: *const f32,
+        key_pages: *const u8,
+        value_pages: *const u8,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: usize,
+        lengths: *const u32,
+        output: *mut f32,
+        _key_scale: f32,
+        _value_scale: f32,
+    ) -> GpuResult<()> {
+        // SAFETY: the qualification layout reserves aligned BF16 cache
+        // planes; byte typing is confined to this shared qualification seam.
+        unsafe {
+            self.launch(
+                stream,
+                batch,
+                query,
+                key_pages.cast(),
+                value_pages.cast(),
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                output,
+            )
+        }
+    }
+}
+
 /// Qualifies eager and captured paged GQA routes at exact `B=1..=8`.
 pub fn qualify_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificationError> {
     qualify_target::<PagedGqaOp>()
@@ -222,6 +278,11 @@ pub fn qualify_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificatio
 /// Qualifies Qwen3.5 eager and captured BF16 paged GQA at exact `B=1..=8`.
 pub fn qualify_qwen35_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificationError> {
     qualify_target::<Qwen35PagedGqaOp>()
+}
+
+/// Qualifies Qwen3.8 MTP eager and captured BF16 paged GQA at exact `B=1..=8`.
+pub fn qualify_mtp_bf16_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificationError> {
+    qualify_target::<MtpBf16PagedGqaOp>()
 }
 
 fn qualify_target<O: QualifiedPagedGqaOp>()
@@ -247,6 +308,8 @@ fn qualify_target<O: QualifiedPagedGqaOp>()
         untouched_values: 0,
         immutable_input_values: 0,
         graph_replay_values: 0,
+        cache_bytes: regions.cache_bytes(),
+        workspace_bytes: regions.workspace_bytes(),
         arena_bytes: layout.byte_len(),
         padding_bytes: layout.byte_len() - regions.payload_bytes(),
         maximum_absolute_error: 0.0,
@@ -644,7 +707,7 @@ fn verify_no_post_warmup_allocation(
 mod tests {
     use super::{
         MAX_BATCH, PHYSICAL_PAGES, Qwen35_9B, Qwen38_27B, TABLE_ROWS, TABLE_STRIDE, layout,
-        qualify_paged_gqa, qualify_qwen35_paged_gqa,
+        qualify_mtp_bf16_paged_gqa, qualify_paged_gqa, qualify_qwen35_paged_gqa,
     };
     use std::mem::size_of;
     use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -666,6 +729,8 @@ mod tests {
         );
         assert_eq!(TABLE_ROWS * TABLE_STRIDE, PHYSICAL_PAGES);
         assert_eq!(report.arena_bytes - report.padding_bytes, 3_539_104);
+        assert_eq!(report.cache_bytes, 3_145_728);
+        assert_eq!(report.workspace_bytes, 393_376);
         assert_eq!(report.immutable_input_values, 51_118_720);
         assert!(report.maximum_absolute_error <= 0.003);
         let (arena, regions) = layout::<Qwen38_27B>(size_of::<u8>())?;
@@ -700,10 +765,57 @@ mod tests {
             2 * MAX_BATCH * immutable_per_check
         );
         assert_eq!(report.arena_bytes - report.padding_bytes, 6_553_760);
+        assert_eq!(report.cache_bytes, 6_291_456);
+        assert_eq!(report.workspace_bytes, 262_304);
         assert!(report.maximum_absolute_error <= 0.003);
         let (arena, regions) = layout::<Qwen35_9B>(size_of::<u16>())?;
         assert_eq!(arena.byte_len(), 6_554_368);
         assert_eq!(arena.byte_len() - regions.payload_bytes(), 608);
+
+        Ok(())
+    }
+
+    #[test]
+    fn mtp_bf16_paged_gqa_suite_arena_accounting_exposes_every_byte() {
+        let (arena, regions) = layout::<Qwen38_27B>(size_of::<u16>()).unwrap();
+
+        assert_eq!(regions.cache_bytes(), 6_291_456);
+        assert_eq!(regions.workspace_bytes(), 393_376);
+        assert_eq!(regions.payload_bytes(), 6_684_832);
+        assert_eq!(arena.byte_len(), 6_685_440);
+        assert_eq!(arena.byte_len() - regions.payload_bytes(), 608);
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
+    fn mtp_bf16_paged_gqa_suite_exact_batches_match_independent_oracles_and_graph_replay()
+    -> Result<(), super::PagedGqaQualificationError> {
+        let report = qualify_mtp_bf16_paged_gqa()?;
+        let active_tokens = (1..=MAX_BATCH).sum::<usize>();
+        let output_per_token = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
+        let plane_bytes = PHYSICAL_PAGES
+            * Qwen38_27B::NUM_KV_HEADS
+            * ATTENTION_PAGE_SIZE
+            * Qwen38_27B::HEAD_DIM
+            * size_of::<u16>();
+        let immutable_per_check = MAX_BATCH * output_per_token
+            + 2 * plane_bytes
+            + TABLE_ROWS * TABLE_STRIDE
+            + 2 * MAX_BATCH;
+
+        assert_eq!(report.output_values, active_tokens * output_per_token);
+        assert_eq!(report.untouched_values, 172_032);
+        assert_eq!(report.graph_replay_values, 393_216);
+        assert_eq!(
+            report.immutable_input_values,
+            2 * MAX_BATCH * immutable_per_check
+        );
+        assert_eq!(report.cache_bytes, 6_291_456);
+        assert_eq!(report.workspace_bytes, 393_376);
+        assert_eq!(report.arena_bytes - report.padding_bytes, 6_684_832);
+        assert_eq!(report.arena_bytes, 6_685_440);
+        assert_eq!(report.padding_bytes, 608);
+        assert!(report.maximum_absolute_error <= 0.003);
 
         Ok(())
     }
