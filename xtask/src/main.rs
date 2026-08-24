@@ -629,6 +629,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("build-server") if remaining.is_empty() => build_server(root),
         Some("qualify-frontend") => qualify_frontend(root, &remaining),
         Some("qualify-generation") => qualify_generation(root, &remaining),
+        Some("qualify-host") if remaining.is_empty() => qualify_host(root),
         Some("qualify-residual-norm") if remaining.is_empty() => qualify_residual_norm(root),
         Some("qualify-qwen35-residual-norm") if remaining.is_empty() => {
             qualify_qwen35_residual_norm(root)
@@ -803,6 +804,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "build-residual-norm"
                     | "build-residual-bench"
                     | "build-server"
+                    | "qualify-host"
                     | "qualify-residual-norm"
                     | "qualify-qwen35-residual-norm"
                     | "qualify-qwen35-attention-qk-prepare"
@@ -1173,6 +1175,29 @@ fn qualify_generation(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(
                 "--",
             ])
             .arg(snapshot),
+    )
+}
+
+/// Runs every non-`#[ignore]` (host-side) tuisko-qual unit test with the GPU
+/// hidden, so stale host asserts fail before any device work.
+fn qualify_host(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+        ],
+        Some(("CUDA_VISIBLE_DEVICES", OsStr::new(""))),
     )
 }
 
@@ -4078,6 +4103,7 @@ fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
     };
     require_performance_device_idle()?;
     if mode == "gate" {
+        qualify_host(root)?;
         for suite in PERFORMANCE_SUITES {
             suite.qualify(root, gate_snapshot)?;
         }
