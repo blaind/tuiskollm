@@ -5106,8 +5106,8 @@ fn gate_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
         .filter(|entry| entry.name.starts_with("nvfp4_swiglu_w4a4_TID_"))
         .collect::<Vec<_>>();
     require_count("NVFP4 SwiGLU A16", a16.len(), 4)?;
-    require_count("NVFP4 activation quantization", quantize.len(), 5)?;
-    require_count("NVFP4 SwiGLU W4A4", w4a4.len(), 5)?;
+    require_count("NVFP4 activation quantization", quantize.len(), 9)?;
+    require_count("NVFP4 SwiGLU W4A4", w4a4.len(), 9)?;
 
     for entry in &a16 {
         let minimum_ctas = if entry.name == "nvfp4_swiglu_a16_t1" {
@@ -5216,7 +5216,7 @@ fn gate_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
     require_uniform_value(&baseline, "w4a4_shared_bytes", &w4a4_shared)?;
 
     println!(
-        "NVFP4 SwiGLU gate passed: 4 A16 + 5 quantize + 5 W4A4 entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}",
+        "NVFP4 SwiGLU gate passed: 4 A16 + 9 quantize (5 decode/4 prefill) + 9 W4A4 (5 decode/4 prefill) entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}",
         a16_registers, quantize_registers, w4a4_registers, a16_shared, quantize_shared, w4a4_shared,
     );
     Ok(())

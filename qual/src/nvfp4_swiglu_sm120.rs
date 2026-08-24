@@ -9,6 +9,8 @@ use tuisko_kernels_sm120::Nvfp4SwiGluOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const ALIGNMENT: usize = 256;
 const HIDDEN: usize = Qwen38_27B::HIDDEN;
 const OUTPUT_ROWS: usize = Qwen38_27B::INTERMEDIATE;
@@ -24,7 +26,7 @@ const INPUT_PATTERN: [f32; GROUP] = [
     0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0, 0.5,
     -0.5,
 ];
-const TOKEN_FACTORS: [f32; MAX_BATCH] = [1.0, 0.5, 0.25, 0.125, 1.0, 0.5, 0.25, 0.125];
+const TOKEN_FACTORS: [f32; 8] = [1.0, 0.5, 0.25, 0.125, -1.0, -0.5, -0.25, -0.125];
 
 /// Failure of the exact NVFP4 SwiGLU qualification gate.
 #[derive(Debug, thiserror::Error)]
@@ -42,7 +44,7 @@ pub enum Nvfp4SwiGluQualificationError {
     Mismatch(String),
 }
 
-/// Observable counts and worst error from every exact decode route.
+/// Observable counts and worst error from every exact decode and prefill route.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Nvfp4SwiGluQualification {
     /// Dynamically generated E2M1 activation codes compared bit-exactly.
@@ -118,7 +120,7 @@ enum Schedule {
     W4a4,
 }
 
-/// Qualifies eager and captured NVFP4 SwiGLU at every exact `B=1..=8`.
+/// Qualifies eager and captured NVFP4 SwiGLU at every admitted row count.
 pub fn qualify_nvfp4_swiglu() -> Result<Nvfp4SwiGluQualification, Nvfp4SwiGluQualificationError> {
     let _preflight = device_benchmark::preflight()?;
     let context = CudaContext::new(0).map_err(GpuError::from)?;
@@ -156,26 +158,26 @@ pub fn qualify_nvfp4_swiglu() -> Result<Nvfp4SwiGluQualification, Nvfp4SwiGluQua
         maximum_absolute_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
-        let schedule = production_schedule(batch);
+    for rows in EXACT_ROUTES {
+        let schedule = production_schedule(rows);
         reset_observed(&arena, &stream, regions)?;
-        launch_production(&op, &arena, &stream, regions, batch)?;
+        launch_production(&op, &arena, &stream, regions, rows)?;
         let eager = read_observed(&arena, &stream, regions)?;
-        verify_eager(batch, schedule, &fixture, &eager, &mut report, false)?;
+        verify_eager(rows, schedule, &fixture, &eager, &mut report, false)?;
         verify_immutable(&arena, &stream, regions, &fixture, &mut report)?;
 
         reset_observed(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
         let graph = CudaGraph::capture(&stream, || {
-            launch_production(&op, &arena, &stream, regions, batch)
+            launch_production(&op, &arena, &stream, regions, rows)
         })?;
         graph.launch(&stream)?;
         graph.launch(&stream)?;
         let replay = read_observed(&arena, &stream, regions)?;
-        verify_replay(batch, schedule, &eager, &replay, &mut report)?;
+        verify_replay(rows, schedule, &eager, &replay, &mut report)?;
         verify_immutable(&arena, &stream, regions, &fixture, &mut report)?;
 
-        require_stable_addresses(&arena, regions, stable_addresses, &format!("B={batch}"))?;
+        require_stable_addresses(&arena, regions, stable_addresses, &route_name(rows))?;
     }
 
     qualify_a16_b1(
@@ -195,12 +197,12 @@ pub fn qualify_nvfp4_swiglu() -> Result<Nvfp4SwiGluQualification, Nvfp4SwiGluQua
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let input = layout.reserve(MAX_BATCH * HIDDEN, ALIGNMENT)?;
-    let activation_codes = layout.reserve(MAX_BATCH * CODE_BYTES_PER_ROW, ALIGNMENT)?;
-    let activation_scales = layout.reserve(MAX_BATCH * GROUPS_PER_ROW, ALIGNMENT)?;
+    let input = layout.reserve(MAX_ROWS * HIDDEN, ALIGNMENT)?;
+    let activation_codes = layout.reserve(MAX_ROWS * CODE_BYTES_PER_ROW, ALIGNMENT)?;
+    let activation_scales = layout.reserve(MAX_ROWS * GROUPS_PER_ROW, ALIGNMENT)?;
     let weight_codes = layout.reserve(GATE_UP_ROWS * CODE_BYTES_PER_ROW, ALIGNMENT)?;
     let weight_scales = layout.reserve(GATE_UP_ROWS * GROUPS_PER_ROW, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * OUTPUT_ROWS, ALIGNMENT)?;
+    let output = layout.reserve(MAX_ROWS * OUTPUT_ROWS, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -242,10 +244,10 @@ fn require_stable_addresses(
 }
 
 fn make_fixture() -> Result<Fixture, Nvfp4SwiGluQualificationError> {
-    let input_bf16 = (0..MAX_BATCH * HIDDEN)
+    let input_bf16 = (0..MAX_ROWS * HIDDEN)
         .map(|index| {
             let token = index / HIDDEN;
-            f32_to_bf16(INPUT_PATTERN[index & (GROUP - 1)] * TOKEN_FACTORS[token])
+            f32_to_bf16(INPUT_PATTERN[index & (GROUP - 1)] * TOKEN_FACTORS[token & 7])
         })
         .collect::<Vec<_>>();
     let input_f32 = input_bf16
@@ -294,10 +296,11 @@ fn make_weights() -> (Vec<u8>, Vec<u8>) {
 }
 
 fn quantize_oracle(input: &[f32]) -> Result<(Vec<u8>, Vec<u8>), Nvfp4SwiGluQualificationError> {
-    let mut codes = vec![0u8; MAX_BATCH * CODE_BYTES_PER_ROW];
-    let mut scales = vec![0u8; MAX_BATCH * GROUPS_PER_ROW];
+    let tokens = input.len() / HIDDEN;
+    let mut codes = vec![0u8; tokens * CODE_BYTES_PER_ROW];
+    let mut scales = vec![0u8; tokens * GROUPS_PER_ROW];
 
-    for token in 0..MAX_BATCH {
+    for token in 0..tokens {
         for group in 0..GROUPS_PER_ROW {
             let input_begin = token * HIDDEN + group * GROUP;
             let values = &input[input_begin..input_begin + GROUP];
@@ -338,7 +341,7 @@ fn launch_production(
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     let input = arena.address(regions.input)?;
     let activation_codes = arena.address(regions.activation_codes)?;
@@ -348,11 +351,11 @@ fn launch_production(
     let output = arena.address(regions.output)?;
 
     // SAFETY: the arena regions are aligned, disjoint, context-local, and own
-    // every maximum-batch extent documented by the production operation.
+    // every maximum-row extent documented by the production operation.
     unsafe {
         op.launch(
             stream,
-            batch,
+            rows,
             input,
             activation_codes,
             activation_scales,
@@ -448,8 +451,8 @@ fn verify_immutable(
     Ok(())
 }
 
-fn production_schedule(batch: usize) -> Schedule {
-    if batch == 1 || batch >= 5 {
+fn production_schedule(rows: usize) -> Schedule {
+    if rows == 1 || rows >= 5 {
         Schedule::W4a4
     } else {
         Schedule::A16
@@ -457,16 +460,16 @@ fn production_schedule(batch: usize) -> Schedule {
 }
 
 fn verify_eager(
-    batch: usize,
+    rows: usize,
     schedule: Schedule,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut Nvfp4SwiGluQualification,
     comparison: bool,
 ) -> Result<(), Nvfp4SwiGluQualificationError> {
-    verify_scratch(batch, schedule, fixture, observed)?;
+    verify_scratch(rows, schedule, fixture, observed)?;
 
-    for token in 0..batch {
+    for token in 0..rows {
         for row in 0..OUTPUT_ROWS {
             let expected = swiglu_oracle(token, row, schedule, fixture)?;
             let index = token * OUTPUT_ROWS + row;
@@ -483,41 +486,42 @@ fn verify_eager(
                     "production"
                 };
                 return Err(Nvfp4SwiGluQualificationError::Mismatch(format!(
-                    "{name} B={batch} output at token={token}, row={row}: device={actual}, oracle={expected}, tolerance={tolerance}"
+                    "{name} {} output at token={token}, row={row}: device={actual}, oracle={expected}, tolerance={tolerance}",
+                    route_name(rows)
                 )));
             }
         }
     }
 
-    verify_inactive(batch, schedule, observed)?;
-    let outputs = batch * OUTPUT_ROWS;
+    verify_inactive(rows, schedule, observed)?;
+    let outputs = rows * OUTPUT_ROWS;
     if comparison {
         report.a16_comparison_values += outputs;
     } else {
         report.output_values += outputs;
         if schedule == Schedule::W4a4 {
-            report.activation_codes += batch * CODE_BYTES_PER_ROW;
-            report.activation_scales += batch * GROUPS_PER_ROW;
+            report.activation_codes += rows * CODE_BYTES_PER_ROW;
+            report.activation_scales += rows * GROUPS_PER_ROW;
         }
     }
-    report.inactive_values += inactive_values(batch, schedule);
+    report.inactive_values += inactive_values(rows, schedule);
 
     Ok(())
 }
 
 fn verify_scratch(
-    batch: usize,
+    rows: usize,
     schedule: Schedule,
     fixture: &Fixture,
     observed: &Observed,
 ) -> Result<(), Nvfp4SwiGluQualificationError> {
     let active_codes = if schedule == Schedule::W4a4 {
-        batch * CODE_BYTES_PER_ROW
+        rows * CODE_BYTES_PER_ROW
     } else {
         0
     };
     let active_scales = if schedule == Schedule::W4a4 {
-        batch * GROUPS_PER_ROW
+        rows * GROUPS_PER_ROW
     } else {
         0
     };
@@ -528,8 +532,10 @@ fn verify_scratch(
         .position(|(actual, expected)| actual != expected)
     {
         return Err(Nvfp4SwiGluQualificationError::Mismatch(format!(
-            "B={batch} activation code {relative}: device={:#04x}, oracle={:#04x}",
-            observed.activation_codes[relative], fixture.activation_codes[relative]
+            "{} activation code {relative}: device={:#04x}, oracle={:#04x}",
+            route_name(rows),
+            observed.activation_codes[relative],
+            fixture.activation_codes[relative]
         )));
     }
     if let Some(relative) = observed.activation_scales[..active_scales]
@@ -538,8 +544,10 @@ fn verify_scratch(
         .position(|(actual, expected)| actual != expected)
     {
         return Err(Nvfp4SwiGluQualificationError::Mismatch(format!(
-            "B={batch} activation scale {relative}: device={:#04x}, oracle={:#04x}",
-            observed.activation_scales[relative], fixture.activation_scales[relative]
+            "{} activation scale {relative}: device={:#04x}, oracle={:#04x}",
+            route_name(rows),
+            observed.activation_scales[relative],
+            fixture.activation_scales[relative]
         )));
     }
 
@@ -547,21 +555,21 @@ fn verify_scratch(
 }
 
 fn verify_inactive(
-    batch: usize,
+    rows: usize,
     schedule: Schedule,
     observed: &Observed,
 ) -> Result<(), Nvfp4SwiGluQualificationError> {
     let code_begin = if schedule == Schedule::W4a4 {
-        batch * CODE_BYTES_PER_ROW
+        rows * CODE_BYTES_PER_ROW
     } else {
         0
     };
     let scale_begin = if schedule == Schedule::W4a4 {
-        batch * GROUPS_PER_ROW
+        rows * GROUPS_PER_ROW
     } else {
         0
     };
-    let output_begin = batch * OUTPUT_ROWS;
+    let output_begin = rows * OUTPUT_ROWS;
 
     for (name, relative) in [
         (
@@ -584,7 +592,8 @@ fn verify_inactive(
                 scale_begin
             };
             return Err(Nvfp4SwiGluQualificationError::Mismatch(format!(
-                "B={batch} modified inactive {name} {}",
+                "{} modified inactive {name} {}",
+                route_name(rows),
                 begin + relative
             )));
         }
@@ -595,7 +604,8 @@ fn verify_inactive(
         .position(|&value| value != BF16_SENTINEL)
     {
         return Err(Nvfp4SwiGluQualificationError::Mismatch(format!(
-            "B={batch} modified inactive output {}",
+            "{} modified inactive output {}",
+            route_name(rows),
             output_begin + relative
         )));
     }
@@ -604,7 +614,7 @@ fn verify_inactive(
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     schedule: Schedule,
     eager: &Observed,
     replay: &Observed,
@@ -628,8 +638,10 @@ fn verify_replay(
             .position(|(actual, expected)| actual != expected)
         {
             return Err(Nvfp4SwiGluQualificationError::Mismatch(format!(
-                "B={batch} graph {name} {index} differs: replay={:#04x}, eager={:#04x}",
-                actual[index], expected[index]
+                "{} graph {name} {index} differs: replay={:#04x}, eager={:#04x}",
+                route_name(rows),
+                actual[index],
+                expected[index]
             )));
         }
     }
@@ -640,17 +652,19 @@ fn verify_replay(
         .position(|(actual, expected)| actual != expected)
     {
         return Err(Nvfp4SwiGluQualificationError::Mismatch(format!(
-            "B={batch} graph output {index} differs: replay={:#06x}, eager={:#06x}",
-            replay.output[index], eager.output[index]
+            "{} graph output {index} differs: replay={:#06x}, eager={:#06x}",
+            route_name(rows),
+            replay.output[index],
+            eager.output[index]
         )));
     }
 
-    verify_inactive(batch, schedule, replay)?;
-    report.graph_replay_values += batch * OUTPUT_ROWS;
+    verify_inactive(rows, schedule, replay)?;
+    report.graph_replay_values += rows * OUTPUT_ROWS;
     if schedule == Schedule::W4a4 {
-        report.graph_replay_values += batch * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
+        report.graph_replay_values += rows * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
     }
-    report.inactive_values += inactive_values(batch, schedule);
+    report.inactive_values += inactive_values(rows, schedule);
 
     Ok(())
 }
@@ -689,10 +703,11 @@ fn verify_no_post_warmup_allocation(
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
 ) -> Result<(), Nvfp4SwiGluQualificationError> {
-    let graphs = (1..=MAX_BATCH)
-        .map(|batch| {
+    let graphs = EXACT_ROUTES
+        .into_iter()
+        .map(|rows| {
             CudaGraph::capture(stream, || {
-                launch_production(op, arena, stream, regions, batch)
+                launch_production(op, arena, stream, regions, rows)
             })
         })
         .collect::<GpuResult<Vec<_>>>()?;
@@ -704,8 +719,8 @@ fn verify_no_post_warmup_allocation(
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
-        for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
-            graphs[batch - 1].launch(stream)?;
+        for graph in graphs.iter().rev() {
+            graph.launch(stream)?;
         }
         a16.launch(stream)?;
     }
@@ -720,19 +735,27 @@ fn verify_no_post_warmup_allocation(
     Ok(())
 }
 
-fn inactive_values(batch: usize, schedule: Schedule) -> usize {
+fn inactive_values(rows: usize, schedule: Schedule) -> usize {
     let inactive_codes = if schedule == Schedule::W4a4 {
-        (MAX_BATCH - batch) * CODE_BYTES_PER_ROW
+        (MAX_ROWS - rows) * CODE_BYTES_PER_ROW
     } else {
-        MAX_BATCH * CODE_BYTES_PER_ROW
+        MAX_ROWS * CODE_BYTES_PER_ROW
     };
     let inactive_scales = if schedule == Schedule::W4a4 {
-        (MAX_BATCH - batch) * GROUPS_PER_ROW
+        (MAX_ROWS - rows) * GROUPS_PER_ROW
     } else {
-        MAX_BATCH * GROUPS_PER_ROW
+        MAX_ROWS * GROUPS_PER_ROW
     };
 
-    inactive_codes + inactive_scales + (MAX_BATCH - batch) * OUTPUT_ROWS
+    inactive_codes + inactive_scales + (MAX_ROWS - rows) * OUTPUT_ROWS
+}
+
+fn route_name(rows: usize) -> String {
+    if rows <= MAX_BATCH {
+        format!("B={rows}")
+    } else {
+        format!("T={rows}")
+    }
 }
 
 fn swiglu_oracle(
@@ -887,9 +910,9 @@ pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CODE_BYTES_PER_ROW, GATE_UP_ROWS, GROUPS_PER_ROW, MAX_BATCH, Nvfp4SwiGluQualificationError,
-        OUTPUT_ROWS, decode_e2m1, decode_e4m3fn, encode_e2m1, encode_e4m3fn, layout,
-        qualify_nvfp4_swiglu, scale_offset,
+        CODE_BYTES_PER_ROW, EXACT_ROUTES, GATE_UP_ROWS, GROUPS_PER_ROW, MAX_ROWS,
+        Nvfp4SwiGluQualificationError, OUTPUT_ROWS, decode_e2m1, decode_e4m3fn, encode_e2m1,
+        encode_e4m3fn, layout, qualify_nvfp4_swiglu, scale_offset,
     };
 
     #[test]
@@ -907,11 +930,11 @@ mod tests {
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn exact_batches_match_independent_oracles_and_graph_replay()
+    fn exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), Nvfp4SwiGluQualificationError> {
         let report = qualify_nvfp4_swiglu()?;
-        let active_rows = (1..=MAX_BATCH).sum::<usize>();
-        let w4a4_rows = 1 + 5 + 6 + 7 + 8;
+        let active_rows = EXACT_ROUTES.iter().sum::<usize>();
+        let w4a4_rows = active_rows - (2 + 3 + 4);
 
         assert_eq!(report.activation_codes, w4a4_rows * CODE_BYTES_PER_ROW);
         assert_eq!(report.activation_scales, w4a4_rows * GROUPS_PER_ROW);
@@ -925,11 +948,12 @@ mod tests {
         assert!(report.inactive_values > 0);
         assert_eq!(
             report.immutable_input_values,
-            18 * (MAX_BATCH * super::HIDDEN + GATE_UP_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW))
+            2 * (EXACT_ROUTES.len() + 1)
+                * (MAX_ROWS * super::HIDDEN + GATE_UP_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW))
         );
-        assert_eq!(report.arena_bytes, 100_653_568);
+        assert_eq!(report.arena_bytes, 149_356_544);
         assert_eq!(report.weight_bytes, 100_270_080);
-        assert_eq!(report.workspace_bytes, 383_488);
+        assert_eq!(report.workspace_bytes, 49_086_464);
         assert_eq!(report.padding_bytes, 0);
         assert!(report.maximum_absolute_error.is_finite());
 
@@ -940,9 +964,9 @@ mod tests {
     fn arena_accounting_exposes_every_owned_byte() {
         let (layout, regions) = layout().unwrap();
 
-        assert_eq!(layout.byte_len(), 100_653_568);
+        assert_eq!(layout.byte_len(), 149_356_544);
         assert_eq!(regions.weight_bytes(), 100_270_080);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 383_488);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 49_086_464);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 0);
     }
 }

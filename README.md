@@ -84,7 +84,9 @@ gate/up SwiGLU also admits exact `T=1024`: a 128x64x64 three-stage TMA route ret
 E4M3 activation and source-weight planes and owns two stable tensor-map descriptors. Dense-FP8
 down projection admits exact `T=32,64,128` K=128 MMA tails plus a separate `T=1024` 128x64x64
 three-stage TMA route over its source-native `[5120,17408]` weight plane with the same explicit
-descriptor ownership. The source-backed dense-FP8 MLP owner composes residual norms, gate/up,
+descriptor ownership. NVFP4 gate/up SwiGLU admits exact `T=32,64,128,1024` W4A4 routes with
+represented E2M1 activation codes, E4M3 block scales, and tail-safe 48-row token tiles. The
+source-backed dense-FP8 MLP owner composes residual norms, gate/up,
 SwiGLU, down projection, and residual publication into directly qualified graphs at every
 `B=1..8` and `T=32,64,128,1024`. The source-backed full-attention owner composes that MLP with
 input norm, QKV, Q/K preparation and cache append, paged GQA, gated output projection, and both
