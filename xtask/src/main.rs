@@ -26,6 +26,7 @@ const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
 const QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt";
 const QWEN35_NVFP4_DOWN_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-down-sm120.txt";
 const QWEN35_NVFP4_QKV_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-qkv-sm120.txt";
+const QWEN35_BF16_LM_HEAD_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-bf16-lm-head-sm120.txt";
 const QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt";
 const QWEN35_GDN_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-gdn-prepare-sm120.txt";
@@ -91,6 +92,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     NVFP4_DOWN_RESOURCE_BASELINE,
     QWEN35_NVFP4_DOWN_RESOURCE_BASELINE,
     QWEN35_NVFP4_QKV_RESOURCE_BASELINE,
+    QWEN35_BF16_LM_HEAD_RESOURCE_BASELINE,
     QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE,
     QWEN35_GDN_PREPARE_RESOURCE_BASELINE,
     QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE,
@@ -799,6 +801,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("gate-qwen35-nvfp4-swiglu") if remaining.is_empty() => gate_qwen35_nvfp4_swiglu(root),
         Some("gate-qwen35-nvfp4-down") if remaining.is_empty() => gate_qwen35_nvfp4_down(root),
         Some("gate-qwen35-nvfp4-qkv") if remaining.is_empty() => gate_qwen35_nvfp4_qkv(root),
+        Some("gate-qwen35-bf16-lm-head") if remaining.is_empty() => gate_qwen35_bf16_lm_head(root),
         Some("gate-qwen35-nvfp4-gdn-input") if remaining.is_empty() => {
             gate_qwen35_nvfp4_gdn_input(root)
         }
@@ -886,6 +889,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "gate-qwen35-nvfp4-attention-output"
                     | "gate-qwen35-gdn-prepare"
                     | "gate-qwen35-gdn-recurrence"
+                    | "gate-qwen35-bf16-lm-head"
                     | "gate-fp8-qkv"
                     | "gate-fp8-gdn-input"
                     | "gate-fp8-lm-head"
@@ -1091,6 +1095,7 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_nvfp4_down(root)?;
     gate_qwen35_nvfp4_down(root)?;
     gate_qwen35_nvfp4_qkv(root)?;
+    gate_qwen35_bf16_lm_head(root)?;
     gate_qwen35_nvfp4_gdn_input(root)?;
     gate_qwen35_gdn_prepare(root)?;
     gate_qwen35_gdn_recurrence(root)?;
@@ -1412,7 +1417,8 @@ fn qualify_qwen35_bf16_lm_head(
             "--test-threads=1",
         ],
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
-    )
+    )?;
+    gate_qwen35_bf16_lm_head(root)
 }
 
 fn qualify_qwen35_nvfp4_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -8831,6 +8837,83 @@ fn gate_qwen35_nvfp4_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn gate_qwen35_bf16_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN35_BF16_LM_HEAD_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; run the pinned release device build first",
+            ptx_path.display()
+        )
+    })?;
+    let entries = parse_entries(&ptx);
+    let routes = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen35_bf16_lm_head_TID_"))
+        .collect::<Vec<_>>();
+    require_count("Qwen3.5 BF16 LM head", routes.len(), 8)?;
+
+    for entry in &routes {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        for instruction in ["fma.rn.f32", "shfl.sync.down.b32"] {
+            if !entry.body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` PTX", entry.name).into(),
+                );
+            }
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    let mut registers = Vec::with_capacity(routes.len());
+    let mut shared = Vec::with_capacity(routes.len());
+    for entry in routes {
+        let resource = resources.get(entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted Qwen3.5 BF16 LM-head entry `{}`",
+                entry.name
+            )
+        })?;
+        require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(sass, entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted Qwen3.5 BF16 LM-head SASS `{}`",
+                entry.name
+            )
+        })?;
+        for instruction in ["FFMA", "SHFL.DOWN", "STG.E.U16"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+        registers.push(resource.registers);
+        shared.push(resource.shared);
+    }
+    registers.sort_unstable();
+    shared.sort_unstable();
+    require_registers(&baseline, "lm_head_registers", &registers)?;
+    require_uniform_value(&baseline, "shared_bytes", &shared)?;
+
+    println!(
+        "Qwen3.5 BF16 LM-head gate passed: 8 projection entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, FFMA/SHFL/BF16-store present",
+        registers, shared
+    );
+    Ok(())
+}
+
 fn gate_qwen35_nvfp4_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(
         root.join(QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE),
@@ -9912,6 +9995,7 @@ mod tests {
                 "qual/baselines/nvfp4-down-sm120.txt",
                 "qual/baselines/qwen35-nvfp4-down-sm120.txt",
                 "qual/baselines/qwen35-nvfp4-qkv-sm120.txt",
+                "qual/baselines/qwen35-bf16-lm-head-sm120.txt",
                 "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt",
                 "qual/baselines/qwen35-gdn-prepare-sm120.txt",
                 "qual/baselines/qwen35-gdn-recurrence-sm120.txt",
