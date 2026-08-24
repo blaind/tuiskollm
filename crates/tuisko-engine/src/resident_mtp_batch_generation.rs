@@ -6,9 +6,10 @@ use crate::resident_mtp_generation::{
 };
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, GeneratedText, GenerationSession,
-    GenerationStep, MAX_BATCH, ResidentBatchAdmission, ResidentCancellation,
-    ResidentMtpGenerationStats, ResidentMtpProgram, ResidentMtpSegmentedVerifyRoute,
-    ResidentMtpVerifyRoute, ResidentRequestId, SamplingDistribution,
+    GenerationStep, MAX_BATCH, ResidentBatchAdmission, ResidentCancellation, ResidentLoadProgress,
+    ResidentMtpGenerationStats, ResidentMtpLoadStats, ResidentMtpProgram,
+    ResidentMtpSegmentedVerifyRoute, ResidentMtpVerifyRoute, ResidentRequestId,
+    SamplingDistribution,
 };
 use std::sync::Arc;
 use tuisko_frontend::TextFrontend;
@@ -172,17 +173,39 @@ impl ResidentMtpBatchGenerator {
         Self::from_snapshot(&context, snapshot)
     }
 
+    /// Opens device zero while publishing combined target-plus-MTP startup counters.
+    pub fn from_snapshot_device_zero_with_progress(
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+        progress: &ResidentLoadProgress,
+    ) -> EngineResult<Self> {
+        let context = device_zero_context()?;
+        Self::from_snapshot_inner(&context, snapshot, Some(progress))
+    }
+
     /// Admits the pinned frontend and complete target-plus-MTP owner.
     pub fn from_snapshot(
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+    ) -> EngineResult<Self> {
+        Self::from_snapshot_inner(context, snapshot, None)
+    }
+
+    fn from_snapshot_inner(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+        progress: Option<&ResidentLoadProgress>,
     ) -> EngineResult<Self> {
         let frontend = TextFrontend::open(snapshot.as_ref())?;
         let stop_ids = frontend
             .stop_ids()
             .try_into()
             .map_err(|_| EngineError::generation("frontend returned the wrong stop-ID count"))?;
-        let program = ResidentMtpProgram::from_snapshot(context, snapshot)?;
+        let program = match progress {
+            Some(progress) => {
+                ResidentMtpProgram::from_snapshot_with_progress(context, snapshot, progress)?
+            }
+            None => ResidentMtpProgram::from_snapshot(context, snapshot)?,
+        };
         let stream = context.new_stream().map_err(GpuError::from)?;
         let target_logits = PinnedHostBuffer::zeroed(
             context,
@@ -437,6 +460,11 @@ impl ResidentMtpBatchGenerator {
         self.program.target().arena_bytes() + self.program.owner_bytes()
     }
 
+    /// Complete target-plus-MTP device ownership reported at server startup.
+    pub const fn arena_bytes(&self) -> usize {
+        self.device_owner_bytes()
+    }
+
     /// Page-locked program and scheduler staging ownership.
     pub fn host_stager_bytes(&self) -> usize {
         self.program.target().host_stager_bytes()
@@ -460,6 +488,11 @@ impl ResidentMtpBatchGenerator {
     /// CUDA context shared by every owner and graph.
     pub const fn context(&self) -> &Arc<CudaContext> {
         self.program.context()
+    }
+
+    /// Combined target-plus-MTP startup work used by the server report.
+    pub const fn load_stats(&self) -> ResidentMtpLoadStats {
+        self.program.load_stats()
     }
 
     #[cfg(feature = "qualification")]

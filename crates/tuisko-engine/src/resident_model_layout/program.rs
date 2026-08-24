@@ -610,7 +610,7 @@ impl ResidentModelProgram {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
-        Self::from_snapshot_with_mode(context, snapshot, PRODUCTION_LOAD_MODE, None, false)
+        Self::from_snapshot_with_mode(context, snapshot, PRODUCTION_LOAD_MODE, None, 0, false)
             .map(|(program, _)| program)
     }
 
@@ -619,7 +619,29 @@ impl ResidentModelProgram {
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<(Self, ResidentMtpArenaReservation)> {
         let (program, reservation) =
-            Self::from_snapshot_with_mode(context, snapshot, PRODUCTION_LOAD_MODE, None, true)?;
+            Self::from_snapshot_with_mode(context, snapshot, PRODUCTION_LOAD_MODE, None, 0, true)?;
+        Ok((
+            program,
+            reservation.ok_or_else(|| {
+                EngineError::layout("resident target did not return its requested MTP reservation")
+            })?,
+        ))
+    }
+
+    pub(crate) fn from_snapshot_reserving_mtp_with_progress(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+        progress: &ResidentLoadProgress,
+        mtp_upload_bytes: usize,
+    ) -> EngineResult<(Self, ResidentMtpArenaReservation)> {
+        let (program, reservation) = Self::from_snapshot_with_mode(
+            context,
+            snapshot,
+            PRODUCTION_LOAD_MODE,
+            Some(progress),
+            mtp_upload_bytes,
+            true,
+        )?;
         Ok((
             program,
             reservation.ok_or_else(|| {
@@ -638,6 +660,7 @@ impl ResidentModelProgram {
             snapshot,
             PRODUCTION_LOAD_MODE,
             Some(progress),
+            0,
             false,
         )
         .map(|(program, _)| program)
@@ -649,8 +672,15 @@ impl ResidentModelProgram {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
-        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Selective, None, false)
-            .map(|(program, _)| program)
+        Self::from_snapshot_with_mode(
+            context,
+            snapshot,
+            ResidentLoadMode::Selective,
+            None,
+            0,
+            false,
+        )
+        .map(|(program, _)| program)
     }
 
     /// Loads through the retained eager-zeroing A/B authority.
@@ -659,7 +689,7 @@ impl ResidentModelProgram {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
-        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Legacy, None, false)
+        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Legacy, None, 0, false)
             .map(|(program, _)| program)
     }
 
@@ -668,6 +698,7 @@ impl ResidentModelProgram {
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
         mode: ResidentLoadMode,
         progress: Option<&ResidentLoadProgress>,
+        progress_tail_upload_bytes: usize,
         reserve_mtp: bool,
     ) -> EngineResult<(Self, Option<ResidentMtpArenaReservation>)> {
         let layout_start = Instant::now();
@@ -804,7 +835,12 @@ impl ResidentModelProgram {
                     .checked_add(upload_plan.host_derived_bytes())
                     .ok_or_else(|| EngineError::layout("resident upload byte total overflows"))?;
                 if let Some(progress) = progress {
-                    progress.begin_upload(expected_upload_bytes);
+                    let total = expected_upload_bytes
+                        .checked_add(progress_tail_upload_bytes)
+                        .ok_or_else(|| {
+                            EngineError::layout("resident progress byte total overflows")
+                        })?;
+                    progress.begin_upload(total);
                 }
                 #[cfg(target_os = "linux")]
                 let (prefault_bytes, source_prefault_ns) = {
@@ -882,7 +918,9 @@ impl ResidentModelProgram {
                         "selective loader uploaded {uploaded_bytes} bytes, expected {expected_upload_bytes}",
                     )));
                 }
-                if let Some(progress) = progress {
+                if let Some(progress) = progress
+                    && progress_tail_upload_bytes == 0
+                {
                     progress.finish_upload()?;
                 }
                 let arena = arena.seal(&stream)?;
@@ -944,7 +982,9 @@ impl ResidentModelProgram {
         };
         let graphs = capture_routes(&stream, ops, &pointers, &dense_mlp_maps)?;
         load_stats.graph_capture_ns = elapsed_ns("resident graph capture", graph_start)?;
-        if let Some(progress) = progress {
+        if let Some(progress) = progress
+            && progress_tail_upload_bytes == 0
+        {
             progress.finish();
         }
 

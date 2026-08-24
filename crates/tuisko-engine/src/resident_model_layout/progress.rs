@@ -51,14 +51,14 @@ impl ResidentLoadProgress {
         )
     }
 
-    pub(super) fn begin_upload(&self, total_bytes: usize) {
+    pub(crate) fn begin_upload(&self, total_bytes: usize) {
         self.submitted_bytes.store(0, Ordering::Relaxed);
         self.total_bytes.store(total_bytes, Ordering::Relaxed);
         self.phase
             .store(ResidentLoadPhase::Uploading as u8, Ordering::Release);
     }
 
-    pub(super) fn submit(&self, bytes: usize) -> EngineResult<()> {
+    pub(crate) fn submit(&self, bytes: usize) -> EngineResult<()> {
         let total = self.total_bytes.load(Ordering::Relaxed);
         self.submitted_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |submitted| {
@@ -74,7 +74,7 @@ impl ResidentLoadProgress {
             })
     }
 
-    pub(super) fn finish_upload(&self) -> EngineResult<()> {
+    pub(crate) fn finish_upload(&self) -> EngineResult<()> {
         let submitted = self.submitted_bytes.load(Ordering::Relaxed);
         let total = self.total_bytes.load(Ordering::Relaxed);
         if submitted != total {
@@ -87,7 +87,7 @@ impl ResidentLoadProgress {
         Ok(())
     }
 
-    pub(super) fn finish(&self) {
+    pub(crate) fn finish(&self) {
         self.phase
             .store(ResidentLoadPhase::Ready as u8, Ordering::Release);
     }
