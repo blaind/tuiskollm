@@ -23,6 +23,13 @@ struct RoundOutcome {
     token_ids: Vec<Vec<u32>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CancellationOutcome {
+    prompt_tokens: usize,
+    message_boundary_tokens: usize,
+    followup_tokens: usize,
+}
+
 /// Measures every exact compact B=1..8 draft-three/K=4 scheduler transaction directly.
 pub fn benchmark_resident_mtp_batch_generation(
     root: &Path,
@@ -76,6 +83,22 @@ pub fn benchmark_resident_mtp_batch_generation(
         })?);
         prompt_tokens.push(prompt.expect("warmup established prompt length"));
     }
+    let followup = followup_request();
+    let mut cancellation_reference = None;
+    for _ in 0..warmup {
+        let (_, outcome) = run_cancellation_resume(&mut generator, &request, &followup)?;
+        if cancellation_reference.is_some_and(|expected| expected != outcome) {
+            return Err(DeviceBenchmarkError::Precondition(
+                "cancellation-resume boundary changed during warmup".to_string(),
+            ));
+        }
+        cancellation_reference = Some(outcome);
+    }
+    let cancellation_reference = cancellation_reference.ok_or_else(|| {
+        DeviceBenchmarkError::Precondition(
+            "cancellation-resume benchmark requires at least one warmup".to_string(),
+        )
+    })?;
     memory.capture("after_warmup")?;
     require_current_process_exclusive()?;
 
@@ -88,7 +111,14 @@ pub fn benchmark_resident_mtp_batch_generation(
         .clone();
     validate_loaded_host_clock_policy("qwen3_8/generation/mtp_batch_round", || {
         let (_, outcome, _) = run_round(&mut generator, &request, loaded_batch)?;
-        require_reference(loaded_batch, Some(&loaded_reference), &outcome)
+        require_reference(loaded_batch, Some(&loaded_reference), &outcome)?;
+        let (_, cancellation) = run_cancellation_resume(&mut generator, &request, &followup)?;
+        if cancellation != cancellation_reference {
+            return Err(DeviceBenchmarkError::Precondition(
+                "loaded cancellation-resume probe changed its exact boundary".to_string(),
+            ));
+        }
+        Ok(())
     })?;
 
     let sampler = TelemetrySampler::start();
@@ -96,6 +126,7 @@ pub fn benchmark_resident_mtp_batch_generation(
         .iter()
         .map(|_| Vec::with_capacity(options.samples))
         .collect::<Vec<_>>();
+    let mut cancellation_samples = Vec::with_capacity(options.samples);
     for sample in 0..options.samples {
         for case in measurement_order(sample, batches.len()) {
             let batch = batches[case];
@@ -114,11 +145,24 @@ pub fn benchmark_resident_mtp_batch_generation(
             samples[case]
                 .push(elapsed.as_secs_f64() * 1_000_000.0 / options.launches_per_sample as f64);
         }
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..options.launches_per_sample {
+            let (iteration, outcome) =
+                run_cancellation_resume(&mut generator, &request, &followup)?;
+            elapsed += iteration;
+            if outcome != cancellation_reference {
+                return Err(DeviceBenchmarkError::Precondition(
+                    "cancellation-resume boundary changed between samples".to_string(),
+                ));
+            }
+        }
+        cancellation_samples
+            .push(elapsed.as_secs_f64() * 1_000_000.0 / options.launches_per_sample as f64);
     }
     let telemetry = sampler.finish()?;
     require_current_process_exclusive()?;
 
-    let mut metrics = Vec::with_capacity(batches.len());
+    let mut metrics = Vec::with_capacity(batches.len() + 1);
     for (case, &batch) in batches.iter().enumerate() {
         let committed = references[case].committed as u64;
         let prompt = prompt_tokens[case] as u64;
@@ -140,12 +184,29 @@ pub fn benchmark_resident_mtp_batch_generation(
             std::mem::take(&mut samples[case]),
         )?);
     }
+    metrics.push(host_completion_metric(
+        "qwen3_8/generation/cancellation_resume",
+        format!(
+            "B=1,prompt={},boundary={},followup={}",
+            cancellation_reference.prompt_tokens,
+            cancellation_reference.message_boundary_tokens,
+            cancellation_reference.followup_tokens
+        ),
+        BenchmarkWorkload::warm_model_cancellation_resume(
+            cancellation_reference.prompt_tokens as u64,
+            cancellation_reference.message_boundary_tokens as u64,
+            cancellation_reference.followup_tokens as u64,
+        ),
+        options.launches_per_sample,
+        0,
+        cancellation_samples,
+    )?);
     let memory = memory.finish(&telemetry)?;
     finish_report(
         BenchmarkReportSpec {
             suite: "bench-generation-mtp-batch",
             classification: "performance_sensitive_model",
-            timing_scope: "direct Rust host completion for compact proposal continuation, lane-major target verification and commit, per-lane MTP realignment, sampling control, and device synchronization through the production scheduler",
+            timing_scope: "direct Rust host completion for compact proposal continuation and for message-boundary snapshot, cancellation restore, and divergent follow-up admission through the production scheduler",
         },
         preflight,
         baseline_sha256,
@@ -155,6 +216,45 @@ pub fn benchmark_resident_mtp_batch_generation(
         telemetry,
         memory,
     )
+}
+
+fn run_cancellation_resume(
+    generator: &mut ResidentMtpBatchGenerator,
+    request: &ChatGenerationRequest,
+    followup: &ChatGenerationRequest,
+) -> Result<(Duration, CancellationOutcome), DeviceBenchmarkError> {
+    generator.qualification_clear_retained()?;
+    let started = Instant::now();
+    let admission = generator.admit(request)?;
+    if admission.device_reused_tokens != 0 {
+        return Err(DeviceBenchmarkError::Precondition(
+            "cancellation benchmark initial request unexpectedly reused a prefix".to_string(),
+        ));
+    }
+    let cancelled = generator.cancel(admission.request_id)?;
+    let message_boundary_tokens = cancelled.device_retained_tokens;
+    if message_boundary_tokens != cancelled.output.prompt.message_boundary_tokens
+        || message_boundary_tokens >= admission.prompt_tokens
+    {
+        return Err(DeviceBenchmarkError::Precondition(
+            "cancellation benchmark retained the wrong message boundary".to_string(),
+        ));
+    }
+    let resumed = generator.admit(followup)?;
+    if resumed.device_reused_tokens != message_boundary_tokens {
+        return Err(DeviceBenchmarkError::Precondition(
+            "cancellation benchmark did not restore the divergent follow-up prefix".to_string(),
+        ));
+    }
+    let elapsed = started.elapsed();
+    let outcome = CancellationOutcome {
+        prompt_tokens: admission.prompt_tokens,
+        message_boundary_tokens,
+        followup_tokens: resumed.prompt_tokens,
+    };
+    let _ = generator.cancel(resumed.request_id)?;
+    generator.qualification_clear_retained()?;
+    Ok((elapsed, outcome))
 }
 
 fn run_round(
@@ -269,6 +369,15 @@ fn request() -> ChatGenerationRequest {
     };
     request.sampling = SamplingOptions::greedy();
     request.max_new_tokens = OUTPUT_TOKENS;
+    request
+}
+
+fn followup_request() -> ChatGenerationRequest {
+    let mut request = request();
+    request.messages.push(ChatMessage::new(
+        "user",
+        "Continue with a different primary color.",
+    ));
     request
 }
 

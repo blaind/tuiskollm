@@ -29,6 +29,10 @@ pub struct ResidentMtpBatchGenerator {
     target_logits: PinnedHostBuffer<u16>,
     draft_logits: PinnedHostBuffer<u16>,
     target_boundary_hidden: PinnedHostBuffer<u16>,
+    message_boundary_hidden: PinnedHostBuffer<u16>,
+    message_boundary_history: PinnedHostBuffer<u16>,
+    message_boundary_state: PinnedHostBuffer<f32>,
+    message_boundary_valid: [bool; MAX_BATCH],
     draft_hidden: PinnedHostBuffer<u16>,
     sessions: [Option<ResidentMtpBatchSession>; MAX_BATCH],
     retained: [Option<RetainedMtpSlot>; MAX_BATCH],
@@ -60,6 +64,7 @@ pub struct ResidentMtpBatchEvents {
 struct ResidentMtpBatchSession {
     request_id: ResidentRequestId,
     control: GenerationSession,
+    message_boundary_tokens: usize,
     next_position: usize,
     maximum_new_tokens: usize,
     started: bool,
@@ -234,6 +239,33 @@ impl ResidentMtpBatchGenerator {
             )?,
         )
         .map_err(GpuError::from)?;
+        let message_boundary_hidden = PinnedHostBuffer::zeroed(
+            context,
+            checked_rows(
+                "resident MTP message-boundary hidden",
+                MAX_BATCH,
+                Qwen38_27B::HIDDEN,
+            )?,
+        )
+        .map_err(GpuError::from)?;
+        let message_boundary_history = PinnedHostBuffer::zeroed(
+            context,
+            checked_rows(
+                "resident MTP message-boundary history",
+                MAX_BATCH,
+                program.target().gdn_slot_history_values(),
+            )?,
+        )
+        .map_err(GpuError::from)?;
+        let message_boundary_state = PinnedHostBuffer::zeroed(
+            context,
+            checked_rows(
+                "resident MTP message-boundary state",
+                MAX_BATCH,
+                program.target().gdn_slot_state_values(),
+            )?,
+        )
+        .map_err(GpuError::from)?;
         let draft_hidden = PinnedHostBuffer::zeroed(
             context,
             checked_rows(
@@ -251,6 +283,10 @@ impl ResidentMtpBatchGenerator {
             target_logits,
             draft_logits,
             target_boundary_hidden,
+            message_boundary_hidden,
+            message_boundary_history,
+            message_boundary_state,
+            message_boundary_valid: [false; MAX_BATCH],
             draft_hidden,
             sessions: std::array::from_fn(|_| None),
             retained: std::array::from_fn(|_| None),
@@ -269,6 +305,7 @@ impl ResidentMtpBatchGenerator {
     ) -> EngineResult<ResidentBatchAdmission> {
         let control = GenerationSession::start(&self.frontend, request)?;
         let prompt_tokens = control.prompt_token_ids().len();
+        let message_boundary_tokens = control.message_boundary_token_ids().len();
         let required_positions = require_generation_capacity(
             prompt_tokens,
             request.max_new_tokens,
@@ -290,9 +327,15 @@ impl ResidentMtpBatchGenerator {
         }
 
         let (slot, reused, reset) = self.select_slot(control.prompt_token_ids())?;
+        if reused > message_boundary_tokens {
+            return Err(EngineError::generation(format!(
+                "resident MTP reused prefix {reused} exceeds message boundary {message_boundary_tokens}"
+            )));
+        }
         if reset {
             self.program.recycle_kv_slot(&self.stream, slot)?;
             self.program.reset_slot(&self.stream, slot)?;
+            self.message_boundary_valid[slot] = false;
         }
         self.program.activate_kv_slot(slot)?;
         self.program
@@ -301,15 +344,50 @@ impl ResidentMtpBatchGenerator {
             .target()
             .load_slot_routes(&self.stream, &[slot])?;
 
-        let boundary = (reused != 0).then(|| &self.target_boundary_hidden[hidden_slot(slot)]);
-        let native_prefill_tokens = prime_prompt(
-            &mut self.program,
-            &self.stream,
-            control.prompt_token_ids(),
-            slot,
-            reused,
-            boundary,
-        )?;
+        let mut native_prefill_tokens = 0usize;
+        if reused < message_boundary_tokens {
+            let retained_hidden =
+                (reused != 0).then(|| &self.target_boundary_hidden[hidden_slot(slot)]);
+            native_prefill_tokens = prime_prompt(
+                &mut self.program,
+                &self.stream,
+                control.message_boundary_token_ids(),
+                slot,
+                reused,
+                retained_hidden,
+            )?;
+            self.program.target().read_residual_row_into(
+                &self.stream,
+                0,
+                &mut self.message_boundary_hidden[hidden_slot(slot)],
+            )?;
+            self.program.target().capture_gdn_slot(
+                &self.stream,
+                slot,
+                &mut self.message_boundary_history,
+                &mut self.message_boundary_state,
+            )?;
+            self.message_boundary_valid[slot] = true;
+        } else if !self.message_boundary_valid[slot] {
+            return Err(EngineError::generation(
+                "resident MTP reused message boundary has no state snapshot",
+            ));
+        }
+        if message_boundary_tokens < prompt_tokens {
+            let suffix_native = prime_prompt(
+                &mut self.program,
+                &self.stream,
+                control.prompt_token_ids(),
+                slot,
+                message_boundary_tokens,
+                Some(&self.message_boundary_hidden[hidden_slot(slot)]),
+            )?;
+            native_prefill_tokens = native_prefill_tokens
+                .checked_add(suffix_native)
+                .ok_or_else(|| {
+                    EngineError::generation("resident native prefill count overflows")
+                })?;
+        }
         if reused < prompt_tokens {
             self.program.target().read_logits_into(
                 &self.stream,
@@ -325,6 +403,7 @@ impl ResidentMtpBatchGenerator {
         self.sessions[slot] = Some(ResidentMtpBatchSession {
             request_id,
             control,
+            message_boundary_tokens,
             next_position: prompt_tokens,
             maximum_new_tokens: request.max_new_tokens,
             started: false,
@@ -410,7 +489,7 @@ impl ResidentMtpBatchGenerator {
         self.finish_events(&active_slots[..active], builders)
     }
 
-    /// Cancels one active request at its fully committed target boundary.
+    /// Cancels one active request at its last complete-message boundary.
     pub fn cancel(&mut self, request_id: ResidentRequestId) -> EngineResult<ResidentCancellation> {
         let index = self.active_slots[..self.active]
             .iter()
@@ -421,10 +500,31 @@ impl ResidentMtpBatchGenerator {
             })
             .ok_or_else(|| EngineError::generation("resident MTP cancellation is not active"))?;
         let slot = self.active_slots[index];
+        if !self.message_boundary_valid[slot] {
+            return Err(EngineError::generation(
+                "resident MTP cancellation has no message-boundary snapshot",
+            ));
+        }
+        let session = self.sessions[slot]
+            .as_ref()
+            .expect("cancelled resident MTP session exists");
+        if session.control.message_boundary_token_ids().len() != session.message_boundary_tokens {
+            return Err(EngineError::generation(
+                "resident MTP cancellation message boundary changed after admission",
+            ));
+        }
         let session = self.sessions[slot]
             .take()
-            .expect("cancelled resident MTP session exists");
-        let retained = processed_tokens(&session)?;
+            .expect("validated resident MTP session exists");
+        let retained = session.control.message_boundary_token_ids().to_vec();
+        self.program.target().restore_gdn_slot(
+            &self.stream,
+            slot,
+            &self.message_boundary_history,
+            &self.message_boundary_state,
+        )?;
+        self.target_boundary_hidden[hidden_slot(slot)]
+            .copy_from_slice(&self.message_boundary_hidden[hidden_slot(slot)]);
         let device_retained_tokens = retained.len();
         self.store_retained(slot, retained)?;
         for position in index..self.active - 1 {
@@ -472,7 +572,17 @@ impl ResidentMtpBatchGenerator {
             + self.target_logits.num_bytes()
             + self.draft_logits.num_bytes()
             + self.target_boundary_hidden.num_bytes()
+            + self.message_boundary_hidden.num_bytes()
+            + self.message_boundary_history.num_bytes()
+            + self.message_boundary_state.num_bytes()
             + self.draft_hidden.num_bytes()
+    }
+
+    /// Page-locked bytes retaining all eight exact cancellation boundaries.
+    pub fn message_boundary_snapshot_bytes(&self) -> usize {
+        self.message_boundary_hidden.num_bytes()
+            + self.message_boundary_history.num_bytes()
+            + self.message_boundary_state.num_bytes()
     }
 
     /// Shared target/MTP long-context capacity per slot.
@@ -508,6 +618,9 @@ impl ResidentMtpBatchGenerator {
             self.target_logits.as_ptr().addr(),
             self.draft_logits.as_ptr().addr(),
             self.target_boundary_hidden.as_ptr().addr(),
+            self.message_boundary_hidden.as_ptr().addr(),
+            self.message_boundary_history.as_ptr().addr(),
+            self.message_boundary_state.as_ptr().addr(),
             self.draft_hidden.as_ptr().addr(),
         ]);
         Ok(addresses)
@@ -530,6 +643,29 @@ impl ResidentMtpBatchGenerator {
             .get(slot)
             .and_then(Option::as_ref)
             .map(|retained| retained.tokens.len())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Whether one restored cancellation boundary matches every owned host snapshot seam.
+    pub fn qualification_message_boundary_matches(&self, slot: usize) -> EngineResult<bool> {
+        if !self
+            .message_boundary_valid
+            .get(slot)
+            .copied()
+            .unwrap_or(false)
+            || self.target_boundary_hidden[hidden_slot(slot)]
+                != self.message_boundary_hidden[hidden_slot(slot)]
+        {
+            return Ok(false);
+        }
+        self.program
+            .target()
+            .qualification_gdn_slot_matches_snapshot(
+                &self.stream,
+                slot,
+                &self.message_boundary_history,
+                &self.message_boundary_state,
+            )
     }
 
     #[cfg(feature = "qualification")]
