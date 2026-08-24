@@ -10,8 +10,8 @@ pub(crate) use tuisko_kernels_sm120::{
     MtpBf16QkPrepareOp, MtpBf16QkvOp, Qwen35Nvfp4AttentionOutputOp, Qwen35Nvfp4DownOp,
     Qwen35Bf16LmHeadOp, Qwen35GdnPrepareOp, Qwen35GdnRecurrenceOp, Qwen35Nvfp4GdnInputOp,
     Qwen35Nvfp4GdnOutputOp,
-    Qwen35Nvfp4QkvOp, Qwen35Nvfp4SwiGluOp, Qwen35ResidualNormOp, Qwen36MoeExpertsOp,
-    Qwen36MoeRouterOp, Qwen36ResidualNormOp, ResidualNormOp,
+    Qwen35Nvfp4QkvOp, Qwen35Nvfp4SwiGluOp, Qwen35ResidualNormOp, Qwen36GdnInputOp,
+    Qwen36MoeExpertsOp, Qwen36MoeRouterOp, Qwen36ResidualNormOp, ResidualNormOp,
 };
 
 #[cfg(feature = "device")]
