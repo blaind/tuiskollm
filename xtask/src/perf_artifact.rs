@@ -162,6 +162,14 @@ pub(crate) fn restore_build_from_worktrees(
             &root.join(BENCHMARK_EXECUTABLE),
         )?;
         copy_artifact(&worktree.join(PTX), &root.join(PTX))?;
+        // the sibling can rebuild between hash and copy; only locally verified bytes count
+        if let Err(error) = verify_artifacts(root, &receipt) {
+            eprintln!(
+                "discarding SM120 build restored from {}: {error}",
+                worktree.display()
+            );
+            continue;
+        }
         write_json(&root.join(BUILD_RECEIPT), &receipt)?;
         return Ok(Some(worktree));
     }
@@ -410,10 +418,11 @@ fn path_text(path: &Path) -> Result<&str, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BENCHMARK_EXECUTABLE, PTX, is_device_input, local_build_is_current, record_build,
-        restore_build_from_worktrees,
+        BENCHMARK_EXECUTABLE, BUILD_RECEIPT, PTX, is_device_input, local_build_is_current,
+        record_build, restore_build_from_worktrees,
     };
     use std::fs;
+    use std::path::PathBuf;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -428,14 +437,13 @@ mod tests {
         assert!(!is_device_input("target/cuda/kernel.ptx"));
     }
 
-    #[test]
-    fn cross_worktree_reuse_verifies_artifact_hashes() {
+    fn scaffold_worktrees(label: &str) -> (PathBuf, PathBuf, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let parent = std::env::temp_dir().join(format!(
-            "tuiskollm-performance-artifact-{}-{nonce}",
+            "tuiskollm-performance-artifact-{label}-{}-{nonce}",
             std::process::id()
         ));
         let root = parent.join("root");
@@ -492,13 +500,35 @@ mod tests {
             "oxide",
         )
         .unwrap();
+        (parent, root, source)
+    }
+
+    #[test]
+    fn cross_worktree_reuse_verifies_artifact_hashes() {
+        let (parent, root, source) = scaffold_worktrees("reuse");
 
         let restored = restore_build_from_worktrees(&root, "inputs", "resources", "oxide").unwrap();
 
-        assert_eq!(restored, Some(source.clone()));
+        assert_eq!(restored, Some(source));
         assert!(local_build_is_current(&root, "inputs", "resources", "oxide").unwrap());
         fs::write(root.join(BENCHMARK_EXECUTABLE), b"tampered").unwrap();
         assert!(!local_build_is_current(&root, "inputs", "resources", "oxide").unwrap());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_discards_copies_that_no_longer_match_the_receipt() {
+        let (parent, root, _source) = scaffold_worktrees("rehash");
+        let ptx = root.join(PTX);
+        fs::create_dir_all(ptx.parent().unwrap()).unwrap();
+        // writes through this link vanish, standing in for a sibling rebuild mid-copy
+        std::os::unix::fs::symlink("/dev/null", &ptx).unwrap();
+
+        let restored = restore_build_from_worktrees(&root, "inputs", "resources", "oxide").unwrap();
+
+        assert_eq!(restored, None);
+        assert!(!root.join(BUILD_RECEIPT).is_file());
         fs::remove_dir_all(parent).unwrap();
     }
 }
