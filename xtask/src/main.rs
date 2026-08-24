@@ -2789,6 +2789,7 @@ fn qualify_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
             "fp8_qkv",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_fp8_qkv(root)
@@ -3038,6 +3039,7 @@ fn qualify_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
             "gdn_output::tests",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_gdn_output(root)
@@ -3390,8 +3392,51 @@ fn qualify_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "attention_output_suite_",
+            "attention_output::tests::attention_output_suite_",
             "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "attention_output_prefill::tests::attention_output_suite_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "attention_output_benchmark::tests::attention_output_suite_",
             "--nocapture",
             "--test-threads=1",
         ],
