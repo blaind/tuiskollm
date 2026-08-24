@@ -170,6 +170,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-qkv` | Check Qwen3.5 fused Q/gate, K, and V represented values with three weight-scale divisors at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-moe-router` | Check Qwen3.6 BF16 router logits, deterministic top-eight experts, normalized BF16 weights, immutable sources, exact-B graph replay, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-moe-experts` | Check Qwen3.6 selected routed experts, shared expert/gate, fixed-order top-eight combination, immutable 256-expert planes, exact-B graph replay, and allocation behavior at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-qwen36-gdn-input` | Check Qwen3.6 static E4M3 Q/K/V/Z, BF16 A/B controls, immutable sources, exact-B graph replay, inactive extents, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-bf16-lm-head SNAPSHOT` | Check the source BF16 LM head against sampled FP64 dots, eager/graph agreement, immutable inputs, stable addresses, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-text-endpoint SNAPSHOT` | Check exact source embeddings, final RMSNorm, sampled full-formula BF16 logits, graph replay, stable addresses, and post-warmup allocation at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-resident-model SNAPSHOT` | Check every complete Qwen3.5 text layer plus endpoint graph against eager replay, endpoint source formulas, finite logits, stable addresses, and owner allocation at B=1..8 | terminal |
@@ -237,6 +238,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-qwen36-moe-router` | Measure every exact Qwen3.6 BF16 router projection plus normalized top-eight graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-moe-experts` | Measure every exact Qwen3.6 routed/shared NVFP4 expert plus combine graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-residual-norm` | Measure every exact Qwen3.6 plain and fused-residual RMSNorm graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-gdn-input` | Measure every exact Qwen3.6 static-FP8 Q/K/V/Z plus BF16 A/B control graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-gdn-input` | Measure every exact Qwen3.5 fused NVFP4 Q/K/V/Z and A/B graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-gdn-prepare` | Measure every exact Qwen3.5 fused control-plus-convolution graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-gdn-recurrence` | Measure every exact Qwen3.5 stateful recurrence graph | terminal or `--json PATH` |
