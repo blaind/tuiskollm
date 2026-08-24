@@ -111,24 +111,12 @@ impl Qwen36TextEndpointProgram {
     /// Copies exact mmap-backed embedding rows through the pinned stager.
     pub fn stage_embeddings(&mut self, stream: &CudaStream, token_ids: &[u32]) -> EngineResult<()> {
         require_batch(token_ids.len())?;
-        let embedding = Qwen36TextEndpointBindings::bind_embedding(self.snapshot.as_ref())?;
-        for (row, &token) in token_ids.iter().enumerate() {
-            let token = usize::try_from(token)
-                .map_err(|_| EngineError::route("token identifier exceeds host width"))?;
-            if token >= Qwen36Moe35B::VOCAB {
-                return Err(EngineError::route(format!(
-                    "token identifier {token} is outside vocabulary 0..{}",
-                    Qwen36Moe35B::VOCAB
-                )));
-            }
-            copy_embedding_row(
-                embedding,
-                token,
-                &mut self.embedding_stager
-                    [row * Qwen36Moe35B::HIDDEN..(row + 1) * Qwen36Moe35B::HIDDEN],
-            )?;
-        }
         let active = token_ids.len() * Qwen36Moe35B::HIDDEN;
+        gather_embedding_rows(
+            self.snapshot.as_ref(),
+            token_ids,
+            &mut self.embedding_stager[..active],
+        )?;
         self.arena.copy_prefix_from_host(
             stream,
             self.layout.input(),
@@ -136,6 +124,14 @@ impl Qwen36TextEndpointProgram {
         )?;
 
         Ok(())
+    }
+
+    pub(crate) fn gather_embedding_rows(
+        &self,
+        token_ids: &[u32],
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        gather_embedding_rows(self.snapshot.as_ref(), token_ids, destination)
     }
 
     /// Replays the immutable graph for one exact batch.
@@ -436,6 +432,41 @@ fn copy_embedding_row(
     for (target, bytes) in destination.iter_mut().zip(source.as_chunks::<2>().0) {
         *target = u16::from_le_bytes(*bytes);
     }
+    Ok(())
+}
+
+fn gather_embedding_rows(
+    snapshot: &CheckpointSnapshot<Qwen36Moe35B>,
+    token_ids: &[u32],
+    destination: &mut [u16],
+) -> EngineResult<()> {
+    let expected = token_ids
+        .len()
+        .checked_mul(Qwen36Moe35B::HIDDEN)
+        .ok_or_else(|| EngineError::layout("Qwen3.6 embedding row count overflows"))?;
+    if destination.len() != expected {
+        return Err(EngineError::layout(format!(
+            "Qwen3.6 embedding destination has {} values, expected {expected}",
+            destination.len()
+        )));
+    }
+    let embedding = Qwen36TextEndpointBindings::bind_embedding(snapshot)?;
+    for (row, &token) in token_ids.iter().enumerate() {
+        let token = usize::try_from(token)
+            .map_err(|_| EngineError::route("token identifier exceeds host width"))?;
+        if token >= Qwen36Moe35B::VOCAB {
+            return Err(EngineError::route(format!(
+                "token identifier {token} is outside vocabulary 0..{}",
+                Qwen36Moe35B::VOCAB
+            )));
+        }
+        copy_embedding_row(
+            embedding,
+            token,
+            &mut destination[row * Qwen36Moe35B::HIDDEN..(row + 1) * Qwen36Moe35B::HIDDEN],
+        )?;
+    }
+
     Ok(())
 }
 

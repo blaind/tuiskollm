@@ -220,15 +220,18 @@ direct graph measures 199.142/448.010 us at B=1/8; the repeated intrinsic path m
 The initial resident text layout then composes 30 GDN/MoE layers, ten full-attention/MoE layers,
 and the endpoint into 41 address-stable arenas. It accounts 19,808,036,096 device weight bytes,
 31,457,280 short-context BF16 cache bytes, 1,223,712,576 workspace/state bytes, and 26,560 alignment
-bytes for a 21,063,232,512-byte allocation. Eight whole-model decode graphs chain each layer's
-BF16 publication directly into the next owner. The real checkpoint passes all eight eager/graph
+bytes for a 21,063,232,512-byte allocation. Eight whole-model decode graphs and three from-empty
+`T=32/64/128` prompt graphs chain each layer's BF16 publication directly into the next owner. The
+prompt input uses a 524,288-byte pinned embedding stager and layer zero's retained 128-row plane;
+only the final prompt row enters the existing endpoint, avoiding a prompt-wide vocabulary-logit
+allocation. The real checkpoint passes all eight decode eager/graph
 routes, 76,032 represented endpoint-oracle values, 8,939,520 finite logits, inactive-row and
 replacement-input checks, all 41 stable addresses, zero post-warmup growth, and the complete
 downstream spill/resource cone. An unblessed direct diagnostic at an observed 2,100--2,137 MHz SM
 and 13,801 MHz memory clock measures 5.051/9.364 ms at B=1/8, or about 198/854 aggregate rows per
 second. Production-graph and repeated complete-path medians agree within 0.01%, and the timed
-region has zero device-memory growth. Native prompt graphs will be reconciled with the
-resident-prefill stack after that stack lands.
+region has zero device-memory growth. The prompt routes have separate complete-model eager/graph,
+represented endpoint, inactive-extent, stable-address, and post-warmup allocation gates.
 
 The text frontend separately admits the snapshot's 248,070-entry tokenizer, Qwen3.6 chat template,
 ordered stop IDs `[248046, 248044]`, and sampled defaults `temperature=1`, `top_p=0.95`, and

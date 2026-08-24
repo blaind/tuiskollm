@@ -172,7 +172,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-qwen36-moe-experts` | Check Qwen3.6 selected routed experts, shared expert/gate, fixed-order top-eight combination, immutable 256-expert planes, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-nvfp4-lm-head` | Check represented Qwen3.6 NVFP4 LM-head logits, complete publication, immutable source planes, exact-B graph replay, inactive extents, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-text-endpoint SNAPSHOT` | Check exact Qwen3.6 source embeddings, final RMSNorm, sampled represented NVFP4 logits, immutable source planes, graph replay, stable addresses, and post-warmup allocation at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-resident-model SNAPSHOT` | Check all 40 Qwen3.6 layers plus endpoint against eager replay, represented endpoint formulas, finite logits, stable addresses, and post-warmup allocation at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-qwen36-resident-model SNAPSHOT` | Check all 40 Qwen3.6 layers plus endpoint against eager replay, represented endpoint formulas, finite logits, stable addresses, and post-warmup allocation at B=1..8 and from-empty T=32/64/128 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-generation SNAPSHOT` | Check exact Transformers prompt IDs, greedy raw-token/streaming agreement, stable ownership, and zero post-warmup device allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen36-server SNAPSHOT` | Start the release server, check the exact health/model inventory plus deterministic blocking and SSE responses, and stop the owned child process | terminal |
 | `cargo run -p xtask -- qualify-qwen36-fp8-qkv` | Check Qwen3.6 static E4M3 full-attention Q/K/V, scalar FP32 scales, immutable sources, exact-B graph replay, inactive extents, and allocation behavior at B=1..8 | terminal |
@@ -280,7 +280,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-qwen35-text-endpoint SNAPSHOT` | Measure every source-backed Qwen3.5 final-norm plus BF16 LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-text-endpoint SNAPSHOT` | Measure every source-backed Qwen3.6 final-norm plus represented NVFP4 LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-resident-model SNAPSHOT` | Directly measure every complete 32-layer plus BF16-endpoint graph at a 131-token context | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-resident-model SNAPSHOT` | Directly measure every complete 40-layer plus NVFP4-endpoint graph at a 131-token context | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-resident-model SNAPSHOT` | Directly measure every complete 40-layer plus NVFP4-endpoint decode graph at a 131-token context and every from-empty T=32/64/128 prompt graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
 | `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
 | `cargo run -p xtask -- perf energy` | Full leaf reports plus a sustained power window per route | `target/benchmarks/perf-energy/*.json` |
@@ -401,8 +401,10 @@ memory diagnostic measured 6.261 ms at `B=1` and 8.485 ms at `B=8`, with about 1
 time and zero timed device-memory growth.
 
 `bench-qwen36-resident-model SNAPSHOT` directly measures the complete 40-layer plus represented
-NVFP4 endpoint graph at every exact `B=1..8`; it never infers whole-model latency from leaf
-medians. It remains outside leaf-wide `perf` until a locked-clock baseline is reviewed.
+NVFP4 endpoint graph at every exact `B=1..8` and from-empty `T=32,64,128`; it never infers
+whole-model latency from leaf medians. Prompt routes retain all final-layer residual rows but send
+only the final row through normalization and the 248,320-wide LM head. It remains outside
+leaf-wide `perf` until a locked-clock baseline is reviewed.
 
 `bench-dense-fp8-mlp SNAPSHOT` directly measures the complete source-backed layer-60 MLP graph at
 every exact `B=1..8` and `T=32,64,128,1024` with the same options. It does not infer composition

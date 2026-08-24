@@ -81,6 +81,7 @@ pub use qwen36_gdn_moe_layer::Qwen36GdnMoeLayerProgram;
 pub use qwen36_gdn_moe_layer_layout::Qwen36GdnMoeLayerLayout;
 pub use qwen36_resident_model::{
     Qwen36ResidentLayerKind, Qwen36ResidentModelLayout, Qwen36ResidentModelProgram,
+    Qwen36ResidentPrefillRoute,
 };
 pub use qwen36_text_endpoint::Qwen36TextEndpointProgram;
 pub use qwen36_text_endpoint_layout::Qwen36TextEndpointLayout;

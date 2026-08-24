@@ -492,6 +492,10 @@ impl Qwen36GdnMoeLayerProgram {
         &self.snapshot
     }
 
+    pub(crate) fn input_address(&self) -> GpuResult<*const u16> {
+        Ok(Pointers::bind(&self.arena, self.layout.regions())?.residual_input)
+    }
+
     fn graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
         if (1..=MAX_BATCH).contains(&rows) {
             return Ok(&self.graphs[rows - 1]);
