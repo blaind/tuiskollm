@@ -33,7 +33,7 @@ pub use fp8::{
     DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps,
     FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp, LmHeadOp,
 };
-pub use gdn::{GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp};
+pub use gdn::{GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp, Qwen35GdnPrepareOp};
 pub use inventory::kernel_ptx_names;
 pub use mtp_bf16_attention_output::MtpBf16AttentionOutputOp;
 pub use mtp_bf16_fusion::MtpBf16FusionOp;
