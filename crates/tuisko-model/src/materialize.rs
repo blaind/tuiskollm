@@ -7,8 +7,9 @@ use crate::bindings::{
 use crate::{
     Arch, Bf16View, CheckpointError, CheckpointResult, F32View, FullAttentionQkvBindings,
     ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4LinearBindings,
-    ModelOptNvfp4MlpBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings, Qwen36Moe35B,
-    Qwen36MoeExpertBindings, Qwen36MoeLayerBindings,
+    ModelOptNvfp4MlpBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
+    Qwen36Fp8LinearBindings, Qwen36GdnBindings, Qwen36Moe35B, Qwen36MoeExpertBindings,
+    Qwen36MoeLayerBindings,
 };
 use rayon::prelude::*;
 use std::mem::size_of;
@@ -373,6 +374,207 @@ impl MaterializedQwen36MoeLayer<'_> {
     pub fn owned_bytes(&self) -> usize {
         self.experts.owned_bytes() + self.shared_expert.owned_bytes()
     }
+}
+
+/// One runtime-native scalar-scaled Qwen3.6 FP8 projection.
+#[derive(Debug)]
+pub struct MaterializedQwen36Fp8Linear<'a> {
+    /// Source E4M3 weight codes retained without conversion.
+    pub weight_e4m3: &'a [u8],
+    /// Exact positive source activation scale.
+    pub input_scale: f32,
+    /// Exact positive source weight scale.
+    pub weight_scale: f32,
+    /// Output row count.
+    pub rows: usize,
+    /// Logical input width.
+    pub columns: usize,
+    /// Decoder layer owning this projection.
+    pub layer: usize,
+}
+
+/// Runtime-native mixed-FP8/BF16 planes for one Qwen3.6 GDN layer.
+#[derive(Debug)]
+pub struct MaterializedQwen36Gdn<'a> {
+    /// Fused Q/K/V then Z E4M3 codes in projection-row order.
+    pub input_weight_e4m3: Vec<u8>,
+    /// Exact source activation scale shared by Q/K/V and Z.
+    pub input_scale: f32,
+    /// Exact source weight scales in Q/K/V then Z order.
+    pub input_weight_scales: [f32; 2],
+    /// Q/K/V rows preceding the Z rows.
+    pub qkv_rows: usize,
+    /// Fused Q/K/V/Z output row count.
+    pub input_rows: usize,
+    /// Logical residual-stream input width.
+    pub input_columns: usize,
+    /// BF16 A then B control weights in projection-row order.
+    pub control_weight_bf16: Vec<u8>,
+    /// Rows in one A or B control projection.
+    pub control_rows_per_projection: usize,
+    /// Logical residual-stream control input width.
+    pub control_columns: usize,
+    /// Recurrent-state output projection.
+    pub output: MaterializedQwen36Fp8Linear<'a>,
+    /// Width-four causal-convolution weights.
+    pub convolution_weight: Bf16View<'a, 3>,
+    /// Log-space recurrence decay parameters.
+    pub a_log: Bf16View<'a, 1>,
+    /// Recurrence time-step bias.
+    pub dt_bias: Bf16View<'a, 1>,
+    /// Per-head gated RMSNorm weights.
+    pub norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the mixer.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the MoE boundary.
+    pub post_attention_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning this layout.
+    pub layer: usize,
+}
+
+impl MaterializedQwen36Gdn<'_> {
+    /// Host bytes owned by the two fused source planes.
+    pub fn owned_bytes(&self) -> usize {
+        self.input_weight_e4m3.len() + self.control_weight_bf16.len()
+    }
+}
+
+impl<'a> Qwen36GdnBindings<'a> {
+    /// Fuses source rows without changing any represented FP8, BF16, or F32 value.
+    pub fn materialize(self) -> CheckpointResult<MaterializedQwen36Gdn<'a>> {
+        self.materialize_with_contract(
+            Qwen36Moe35B::LAYERS,
+            Qwen36Moe35B::FULL_ATTENTION_INTERVAL,
+            Qwen36Moe35B::HIDDEN,
+            Qwen36Moe35B::GDN_QKV_ROWS,
+            Qwen36Moe35B::GDN_VALUE_ROWS,
+            Qwen36Moe35B::GDN_CONTROL_ROWS,
+            Qwen36Moe35B::LINEAR_CONV_KERNEL_DIM,
+            Qwen36Moe35B::LINEAR_HEAD_DIM,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_with_contract(
+        self,
+        layer_count: usize,
+        full_attention_interval: usize,
+        hidden: usize,
+        qkv_rows: usize,
+        value_rows: usize,
+        control_rows: usize,
+        convolution_width: usize,
+        head_dim: usize,
+    ) -> CheckpointResult<MaterializedQwen36Gdn<'a>> {
+        require_gdn_layer_route(self.layer, layer_count, full_attention_interval)?;
+
+        let qkv = materialize_qwen36_fp8_linear(self.qkv, self.layer, "QKV")?;
+        let z = materialize_qwen36_fp8_linear(self.z, self.layer, "Z")?;
+        let output = materialize_qwen36_fp8_linear(self.output, self.layer, "output")?;
+        let a_shape = host_shape(self.a_control.shape(), "Qwen3.6 A-control weights")?;
+        let b_shape = host_shape(self.b_control.shape(), "Qwen3.6 B-control weights")?;
+
+        if qkv.rows != qkv_rows
+            || qkv.columns != hidden
+            || z.rows != value_rows
+            || z.columns != hidden
+            || a_shape != [control_rows, hidden]
+            || b_shape != [control_rows, hidden]
+            || output.rows != hidden
+            || output.columns != value_rows
+            || self.convolution_weight.shape() != &[qkv_rows as u64, 1, convolution_width as u64]
+            || self.a_log.shape() != &[control_rows as u64]
+            || self.dt_bias.shape() != &[control_rows as u64]
+            || self.norm.shape() != &[head_dim as u64]
+            || self.input_norm.shape() != &[hidden as u64]
+            || self.post_attention_norm.shape() != &[hidden as u64]
+        {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{} Qwen3.6 GDN source geometry differs from its contract",
+                self.layer
+            )));
+        }
+        if self.qkv.input_scale.bits(0) != self.z.input_scale.bits(0) {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{} Qwen3.6 QKV/Z input_scale values differ",
+                self.layer
+            )));
+        }
+
+        let input_rows = qkv_rows.checked_add(value_rows).ok_or_else(|| {
+            CheckpointError::source_binding(format!(
+                "layer-{} Qwen3.6 GDN input row count overflows",
+                self.layer
+            ))
+        })?;
+        let input_weight_e4m3 = gather_source_planes(
+            [qkv.weight_e4m3, z.weight_e4m3],
+            &format!("layer-{} Qwen3.6 QKV/Z weights", self.layer),
+        )?;
+        let control_weight_bf16 = gather_source_planes(
+            [self.a_control.bytes(), self.b_control.bytes()],
+            &format!("layer-{} Qwen3.6 A/B control weights", self.layer),
+        )?;
+
+        Ok(MaterializedQwen36Gdn {
+            input_weight_e4m3,
+            input_scale: qkv.input_scale,
+            input_weight_scales: [qkv.weight_scale, z.weight_scale],
+            qkv_rows,
+            input_rows,
+            input_columns: hidden,
+            control_weight_bf16,
+            control_rows_per_projection: control_rows,
+            control_columns: hidden,
+            output,
+            convolution_weight: self.convolution_weight,
+            a_log: self.a_log,
+            dt_bias: self.dt_bias,
+            norm: self.norm,
+            input_norm: self.input_norm,
+            post_attention_norm: self.post_attention_norm,
+            layer: self.layer,
+        })
+    }
+}
+
+fn materialize_qwen36_fp8_linear<'a>(
+    binding: Qwen36Fp8LinearBindings<'a>,
+    layer: usize,
+    role: &str,
+) -> CheckpointResult<MaterializedQwen36Fp8Linear<'a>> {
+    let [rows, columns] = host_shape(binding.weight.shape(), role)?;
+    if rows != binding.rows || columns != binding.columns {
+        return Err(CheckpointError::source_binding(format!(
+            "layer-{layer} Qwen3.6 {role} source geometry differs"
+        )));
+    }
+
+    Ok(MaterializedQwen36Fp8Linear {
+        weight_e4m3: binding.weight.codes(),
+        input_scale: qwen36_fp8_scale(layer, role, "input", &binding.input_scale)?,
+        weight_scale: qwen36_fp8_scale(layer, role, "weight", &binding.weight_scale)?,
+        rows,
+        columns,
+        layer,
+    })
+}
+
+fn qwen36_fp8_scale(
+    layer: usize,
+    role: &str,
+    scale_role: &str,
+    scale: &F32View<'_, 0>,
+) -> CheckpointResult<f32> {
+    let value = scale.value(0).expect("validated scalar has one value");
+
+    if !value.is_finite() || value <= 0.0 {
+        return Err(CheckpointError::source_binding(format!(
+            "layer-{layer} Qwen3.6 {role} {scale_role} scale must be finite and positive, observed {value}"
+        )));
+    }
+
+    Ok(value)
 }
 
 /// One runtime-native ModelOpt NVFP4 projection.
@@ -1489,8 +1691,8 @@ mod tests {
         Arch, Bf16View, CheckpointErrorCode, CheckpointSnapshot, DType, F32View, Fp8E4M3View,
         FullAttentionQkvBindings, ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings,
         ModelOptNvfp4LinearBindings, ModelOptNvfp4MlpBindings, Nvfp4DownBindings,
-        Nvfp4GateUpBindings, Qwen35_9B, Qwen36Moe35B, Qwen36MoeExpertBindings,
-        Qwen36MoeLayerBindings, TensorView, U8View,
+        Nvfp4GateUpBindings, Qwen35_9B, Qwen36Fp8LinearBindings, Qwen36GdnBindings, Qwen36Moe35B,
+        Qwen36MoeExpertBindings, Qwen36MoeLayerBindings, TensorView, U8View,
     };
 
     const ROWS: usize = 128;
@@ -2639,6 +2841,166 @@ mod tests {
             materialized.output.weight_e2m1.as_ptr(),
             output_weight.as_ptr()
         );
+        assert_eq!(materialized.layer, 0);
+    }
+
+    #[test]
+    fn qwen36_gdn_materialization_preserves_mixed_source_planes() {
+        let qkv_weight = vec![0x10; ROWS * COLUMNS];
+        let z_weight = vec![0x20; ROWS * COLUMNS];
+        let a_weight = bf16_bytes(&vec![0x3f80; 32 * COLUMNS]);
+        let b_weight = bf16_bytes(&vec![0x4000; 32 * COLUMNS]);
+        let output_weight = vec![0x30; ROWS * COLUMNS];
+        let convolution = bf16_bytes(&vec![0x4040; ROWS * 4]);
+        let a_log = bf16_bytes(&[0x4080; 32]);
+        let dt_bias = bf16_bytes(&[0x40a0; 32]);
+        let norm = bf16_bytes(&vec![0x40c0; COLUMNS]);
+        let input_norm = bf16_bytes(&vec![0x40e0; COLUMNS]);
+        let post_attention_norm = bf16_bytes(&vec![0x4100; COLUMNS]);
+        let input_scale = 0.25f32.to_le_bytes();
+        let qkv_weight_scale = 0.125f32.to_le_bytes();
+        let z_weight_scale = 0.0625f32.to_le_bytes();
+        let output_input_scale = 0.5f32.to_le_bytes();
+        let output_weight_scale = 0.03125f32.to_le_bytes();
+        let projection_shape = [ROWS as u64, COLUMNS as u64];
+        let control_shape = [32, COLUMNS as u64];
+        let bindings = Qwen36GdnBindings {
+            qkv: Qwen36Fp8LinearBindings {
+                weight: fp8_view("qkv-weight", &projection_shape, &qkv_weight),
+                input_scale: f32_scalar_view("qkv-input-scale", &input_scale),
+                weight_scale: f32_scalar_view("qkv-weight-scale", &qkv_weight_scale),
+                rows: ROWS,
+                columns: COLUMNS,
+            },
+            z: Qwen36Fp8LinearBindings {
+                weight: fp8_view("z-weight", &projection_shape, &z_weight),
+                input_scale: f32_scalar_view("z-input-scale", &input_scale),
+                weight_scale: f32_scalar_view("z-weight-scale", &z_weight_scale),
+                rows: ROWS,
+                columns: COLUMNS,
+            },
+            a_control: bf16_view("a-control", &control_shape, &a_weight),
+            b_control: bf16_view("b-control", &control_shape, &b_weight),
+            output: Qwen36Fp8LinearBindings {
+                weight: fp8_view("output-weight", &projection_shape, &output_weight),
+                input_scale: f32_scalar_view("output-input-scale", &output_input_scale),
+                weight_scale: f32_scalar_view("output-weight-scale", &output_weight_scale),
+                rows: ROWS,
+                columns: COLUMNS,
+            },
+            convolution_weight: bf16_volume("convolution", &[ROWS as u64, 1, 4], &convolution),
+            a_log: bf16_vector("a-log", &[32], &a_log),
+            dt_bias: bf16_vector("dt-bias", &[32], &dt_bias),
+            norm: bf16_vector("norm", &[COLUMNS as u64], &norm),
+            input_norm: bf16_vector("input-norm", &[COLUMNS as u64], &input_norm),
+            post_attention_norm: bf16_vector(
+                "post-attention-norm",
+                &[COLUMNS as u64],
+                &post_attention_norm,
+            ),
+            layer: 0,
+        };
+        let different_input_scale = 0.5f32.to_le_bytes();
+        let scale_error = Qwen36GdnBindings {
+            z: Qwen36Fp8LinearBindings {
+                input_scale: f32_scalar_view("z-input-scale", &different_input_scale),
+                ..bindings.z
+            },
+            ..bindings
+        }
+        .materialize_with_contract(2, 2, COLUMNS, ROWS, ROWS, 32, 4, COLUMNS)
+        .unwrap_err();
+
+        assert_eq!(scale_error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            scale_error
+                .to_string()
+                .contains("QKV/Z input_scale values differ")
+        );
+
+        let materialized = bindings
+            .materialize_with_contract(2, 2, COLUMNS, ROWS, ROWS, 32, 4, COLUMNS)
+            .unwrap();
+
+        assert_eq!(
+            materialized.input_weight_e4m3,
+            [qkv_weight.as_slice(), z_weight.as_slice()].concat()
+        );
+        assert_eq!(
+            materialized.control_weight_bf16,
+            [a_weight.as_slice(), b_weight.as_slice()].concat()
+        );
+        assert_eq!(materialized.input_scale.to_bits(), 0.25f32.to_bits());
+        assert_eq!(
+            materialized
+                .input_weight_scales
+                .map(|scale| scale.to_bits()),
+            [0.125f32.to_bits(), 0.0625f32.to_bits()]
+        );
+        assert_eq!(materialized.qkv_rows, ROWS);
+        assert_eq!(materialized.input_rows, 2 * ROWS);
+        assert_eq!(materialized.input_columns, COLUMNS);
+        assert_eq!(materialized.control_rows_per_projection, 32);
+        assert_eq!(materialized.control_columns, COLUMNS);
+        assert_eq!(
+            materialized.output.weight_e4m3.as_ptr(),
+            output_weight.as_ptr()
+        );
+        assert_eq!(materialized.output.input_scale, 0.5);
+        assert_eq!(materialized.output.weight_scale, 0.03125);
+        assert_eq!(materialized.convolution_weight.word(0), Some(0x4040));
+        assert_eq!(materialized.a_log.word(0), Some(0x4080));
+        assert_eq!(materialized.dt_bias.word(0), Some(0x40a0));
+        assert_eq!(materialized.norm.word(0), Some(0x40c0));
+        assert_eq!(materialized.input_norm.word(0), Some(0x40e0));
+        assert_eq!(materialized.post_attention_norm.word(0), Some(0x4100));
+        assert_eq!(
+            materialized.owned_bytes(),
+            2 * ROWS * COLUMNS + 4 * 32 * COLUMNS
+        );
+        assert_eq!(materialized.layer, 0);
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN36_SNAPSHOT with the pinned complete Qwen3.6 checkpoint"]
+    fn qwen36_source_gdn_layer0_materializes_losslessly() {
+        let root = std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+            .expect("TUISKO_QWEN36_SNAPSHOT is required for the source-backed gate");
+        let snapshot =
+            CheckpointSnapshot::<Qwen36Moe35B>::open(std::path::Path::new(&root)).unwrap();
+        let bindings = Qwen36GdnBindings::bind(&snapshot, 0).unwrap();
+        let input_source = [bindings.qkv.weight.codes(), bindings.z.weight.codes()].concat();
+        let control_source = [bindings.a_control.bytes(), bindings.b_control.bytes()].concat();
+        let output_weight = bindings.output.weight.codes();
+        let input_scale_bits = bindings.qkv.input_scale.bits(0).unwrap();
+        let input_weight_scale_bits = [
+            bindings.qkv.weight_scale.bits(0).unwrap(),
+            bindings.z.weight_scale.bits(0).unwrap(),
+        ];
+        let materialized = bindings.materialize().unwrap();
+
+        assert_eq!(materialized.input_weight_e4m3, input_source);
+        assert_eq!(materialized.control_weight_bf16, control_source);
+        assert_eq!(materialized.input_scale.to_bits(), input_scale_bits);
+        assert_eq!(
+            materialized
+                .input_weight_scales
+                .map(|scale| scale.to_bits()),
+            input_weight_scale_bits
+        );
+        assert_eq!(materialized.qkv_rows, Qwen36Moe35B::GDN_QKV_ROWS);
+        assert_eq!(materialized.input_rows, Qwen36Moe35B::GDN_INPUT_ROWS);
+        assert_eq!(materialized.input_columns, Qwen36Moe35B::HIDDEN);
+        assert_eq!(
+            materialized.control_rows_per_projection,
+            Qwen36Moe35B::GDN_CONTROL_ROWS
+        );
+        assert_eq!(materialized.control_columns, Qwen36Moe35B::HIDDEN);
+        assert_eq!(
+            materialized.output.weight_e4m3.as_ptr(),
+            output_weight.as_ptr()
+        );
+        assert_eq!(materialized.owned_bytes(), 25_427_968);
         assert_eq!(materialized.layer, 0);
     }
 

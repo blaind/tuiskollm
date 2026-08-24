@@ -25,8 +25,9 @@ pub use inventory::CheckpointSnapshot;
 pub use materialize::{
     MaterializedFullAttentionQkv, MaterializedModelOptNvfp4Attention, MaterializedModelOptNvfp4Gdn,
     MaterializedModelOptNvfp4Linear, MaterializedModelOptNvfp4Mlp, MaterializedMtpQkv,
-    MaterializedNvfp4Down, MaterializedNvfp4GateUp, MaterializedQwen36MoeExperts,
-    MaterializedQwen36MoeLayer, nvfp4_scale_materialization_workers,
+    MaterializedNvfp4Down, MaterializedNvfp4GateUp, MaterializedQwen36Fp8Linear,
+    MaterializedQwen36Gdn, MaterializedQwen36MoeExperts, MaterializedQwen36MoeLayer,
+    nvfp4_scale_materialization_workers,
 };
 pub use safetensors::{SafeTensorFile, TensorView};
 pub use views::{Bf16View, F32View, Fp8E4M3View, U8View};
