@@ -9316,6 +9316,7 @@ fn gate_qwen35_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         root,
         QWEN35_PAGED_GQA_RESOURCE_BASELINE,
         "qwen35_paged_gqa_exact_TID_",
+        None,
         "Qwen3.5",
         "qwen35-bf16-paged-gqa-gate.cubin",
     )
@@ -9326,6 +9327,7 @@ fn gate_qwen36_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         root,
         QWEN36_PAGED_GQA_RESOURCE_BASELINE,
         "qwen36_paged_gqa_exact_TID_",
+        Some(("qwen36_paged_gqa_prefill_shared_exact_TID_", 3)),
         "Qwen3.6",
         "qwen36-bf16-paged-gqa-gate.cubin",
     )
@@ -9335,6 +9337,7 @@ fn gate_bf16_paged_gqa_target(
     root: &Path,
     baseline_path: &str,
     entry_prefix: &str,
+    prefill_inventory: Option<(&str, usize)>,
     target: &str,
     cubin_name: &str,
 ) -> Result<(), Box<dyn Error>> {
@@ -9347,11 +9350,33 @@ fn gate_bf16_paged_gqa_target(
         .iter()
         .filter(|entry| entry.name.starts_with(entry_prefix))
         .collect::<Vec<_>>();
+    let prefill = prefill_inventory.map_or_else(Vec::new, |(prefix, _)| {
+        entries
+            .iter()
+            .filter(|entry| entry.name.starts_with(prefix))
+            .collect::<Vec<_>>()
+    });
     require_count(&format!("{target} BF16 paged GQA"), attention.len(), 8)?;
+    if let Some((_, expected)) = prefill_inventory {
+        require_count(
+            &format!("{target} BF16 paged GQA prefill"),
+            prefill.len(),
+            expected,
+        )?;
+    }
     for entry in &attention {
         if !entry.body.contains(".reqntid 32, 1, 1") || !entry.body.contains(".minnctapersm 16") {
             return Err(format!(
                 "entry `{}` lost its 32-thread/sixteen-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in &prefill {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 1") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/one-CTA launch bounds",
                 entry.name
             )
             .into());
@@ -9383,38 +9408,68 @@ fn gate_bf16_paged_gqa_target(
     let sass = String::from_utf8(sass.stdout)?;
     let mut registers = Vec::new();
     let mut shared = Vec::new();
-    for entry in attention {
-        let resource = resources
-            .get(entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
-        require_spill_free(entry.name, resource)?;
-        registers.push(resource.registers);
-        shared.push(resource.shared);
+    let mut prefill_registers = Vec::new();
+    let mut prefill_shared = Vec::new();
+    for (entries, registers, shared, instructions) in [
+        (
+            &attention,
+            &mut registers,
+            &mut shared,
+            &["LDG.E.U16", "SHFL.BFLY", "MUFU.EX2"][..],
+        ),
+        (
+            &prefill,
+            &mut prefill_registers,
+            &mut prefill_shared,
+            &["LDGSTS", "SHFL.BFLY", "MUFU.EX2"][..],
+        ),
+    ] {
+        for entry in entries {
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+            shared.push(resource.shared);
 
-        let body = sass_function_body(&sass, entry.name)
-            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
-        for instruction in ["LDG.E.U16", "SHFL.BFLY", "MUFU.EX2"] {
-            if !body.contains(instruction) {
-                return Err(
-                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
-                );
+            let body = sass_function_body(&sass, entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+            for instruction in instructions {
+                if !body.contains(instruction) {
+                    return Err(format!(
+                        "entry `{}` lost required `{instruction}` SASS",
+                        entry.name
+                    )
+                    .into());
+                }
             }
-        }
-        if body.contains("F2FP.F16.E4M3.UNPACK_B") {
-            return Err(format!(
-                "entry `{}` unexpectedly decodes {target} cache as E4M3",
-                entry.name,
-            )
-            .into());
+            if body.contains("F2FP.F16.E4M3.UNPACK_B") {
+                return Err(format!(
+                    "entry `{}` unexpectedly decodes {target} cache as E4M3",
+                    entry.name,
+                )
+                .into());
+            }
         }
     }
     registers.sort_unstable();
+    prefill_registers.sort_unstable();
     require_registers(&baseline, "attention_registers", &registers)?;
+    if baseline.contains_key("prefill_attention_registers") {
+        require_registers(&baseline, "prefill_attention_registers", &prefill_registers)?;
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
+    if baseline.contains_key("prefill_shared_bytes") {
+        require_uniform_value(&baseline, "prefill_shared_bytes", &prefill_shared)?;
+    }
 
     println!(
-        "{target} BF16 paged GQA gate passed: 8 decode entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, U16/SHFL/EX2 present and E4M3 absent",
-        registers, shared,
+        "{target} BF16 paged GQA gate passed: 8 decode + {} prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}, U16/LDGSTS/SHFL/EX2 present and E4M3 absent",
+        prefill.len(),
+        registers,
+        prefill_registers,
+        shared,
+        prefill_shared,
     );
     Ok(())
 }

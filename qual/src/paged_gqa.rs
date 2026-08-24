@@ -1,4 +1,4 @@
-//! Numerical and graph qualification for exact paged GQA decode.
+//! Numerical and graph qualification for exact paged GQA routes.
 
 use crate::fp8_projection_oracle::{BYTE_SENTINEL, F32_SENTINEL_BITS, bf16_to_f32, f32_to_bf16};
 use crate::{DeviceBenchmarkError, device_benchmark};
@@ -13,6 +13,9 @@ use tuisko_kernels_sm120::{
 use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const DECODE_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
+const QWEN36_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
+const QWEN36_MAX_TOKENS: usize = 128;
 const ALIGNMENT: usize = 256;
 const PHYSICAL_PAGES: usize = 24;
 const TABLE_ROWS: usize = 8;
@@ -103,6 +106,8 @@ struct Fixture {
     query: Vec<f32>,
     key_pages: Vec<u8>,
     value_pages: Vec<u8>,
+    table_rows: Vec<u32>,
+    lengths: Vec<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +118,8 @@ enum CacheFormat {
 
 trait QualifiedPagedGqaOp {
     type Target: Arch;
+    const ROUTES: &'static [usize];
+    const MAX_TOKENS: usize;
     const CACHE_ELEMENT_BYTES: usize;
     const CACHE_FORMAT: CacheFormat;
 
@@ -140,6 +147,8 @@ trait QualifiedPagedGqaOp {
 
 impl QualifiedPagedGqaOp for PagedGqaOp {
     type Target = Qwen38_27B;
+    const ROUTES: &'static [usize] = &DECODE_ROUTES;
+    const MAX_TOKENS: usize = MAX_BATCH;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u8>();
     const CACHE_FORMAT: CacheFormat = CacheFormat::E4m3;
 
@@ -186,6 +195,8 @@ impl QualifiedPagedGqaOp for PagedGqaOp {
 
 impl QualifiedPagedGqaOp for Qwen35PagedGqaOp {
     type Target = Qwen35_9B;
+    const ROUTES: &'static [usize] = &DECODE_ROUTES;
+    const MAX_TOKENS: usize = MAX_BATCH;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16;
 
@@ -230,6 +241,8 @@ impl QualifiedPagedGqaOp for Qwen35PagedGqaOp {
 
 impl QualifiedPagedGqaOp for Qwen36PagedGqaOp {
     type Target = Qwen36Moe35B;
+    const ROUTES: &'static [usize] = &QWEN36_ROUTES;
+    const MAX_TOKENS: usize = QWEN36_MAX_TOKENS;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16;
 
@@ -274,6 +287,8 @@ impl QualifiedPagedGqaOp for Qwen36PagedGqaOp {
 
 impl QualifiedPagedGqaOp for MtpBf16PagedGqaOp {
     type Target = Qwen38_27B;
+    const ROUTES: &'static [usize] = &DECODE_ROUTES;
+    const MAX_TOKENS: usize = MAX_BATCH;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16;
 
@@ -326,7 +341,8 @@ pub fn qualify_qwen35_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQuali
     qualify_target::<Qwen35PagedGqaOp>()
 }
 
-/// Qualifies Qwen3.6 eager and captured BF16 paged GQA at exact `B=1..=8`.
+/// Qualifies Qwen3.6 eager and captured BF16 paged GQA at exact `B=1..=8`
+/// and `T=32,64,128`.
 pub fn qualify_qwen36_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificationError> {
     qualify_target::<Qwen36PagedGqaOp>()
 }
@@ -348,9 +364,9 @@ fn qualify_target<O: QualifiedPagedGqaOp>()
         )));
     }
     let stream = context.new_stream().map_err(GpuError::from)?;
-    let (layout, regions) = layout::<O::Target>(O::CACHE_ELEMENT_BYTES)?;
+    let (layout, regions) = layout::<O::Target>(O::MAX_TOKENS, O::CACHE_ELEMENT_BYTES)?;
     let arena = DeviceArena::zeroed(&stream, &layout)?;
-    let fixture = fixture::<O::Target>(O::CACHE_FORMAT);
+    let fixture = fixture::<O::Target>(O::MAX_TOKENS, O::CACHE_FORMAT);
     load_fixture(&arena, &stream, regions, &fixture)?;
     let op = O::new(&context)?;
     let stable_addresses = addresses(&arena, regions)?;
@@ -366,26 +382,26 @@ fn qualify_target<O: QualifiedPagedGqaOp>()
         maximum_absolute_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
+    for &tokens in O::ROUTES {
         reset_output(&arena, &stream, regions)?;
-        launch(&op, &arena, &stream, regions, batch)?;
+        launch(&op, &arena, &stream, regions, tokens)?;
         let eager = arena.copy_to_host(&stream, regions.output)?;
-        verify_oracle::<O::Target>(batch, O::CACHE_FORMAT, &fixture, &eager, &mut report)?;
+        verify_oracle::<O::Target>(tokens, O::CACHE_FORMAT, &fixture, &eager, &mut report)?;
         verify_inputs(&arena, &stream, regions, &fixture, &mut report)?;
 
         reset_output(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
+        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, tokens))?;
         // SAFETY: every allocation this graph captured is owned by this scope or
-        // its caller and outlives the replays and the synchronize that follows.
+        // its caller and outlives the replay and the synchronize that follows.
         unsafe { graph.launch(&stream) }?;
         let replay = arena.copy_to_host(&stream, regions.output)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay(tokens, &eager, &replay, &mut report)?;
         verify_inputs(&arena, &stream, regions, &fixture, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(PagedGqaQualificationError::Mismatch(format!(
-                "device addresses changed while qualifying B={batch}"
+                "device addresses changed while qualifying tokens={tokens}"
             )));
         }
     }
@@ -396,17 +412,20 @@ fn qualify_target<O: QualifiedPagedGqaOp>()
     Ok(report)
 }
 
-fn layout<A: Arch>(cache_element_bytes: usize) -> GpuResult<(ArenaLayout, Regions)> {
+fn layout<A: Arch>(
+    max_tokens: usize,
+    cache_element_bytes: usize,
+) -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let query = layout.reserve(MAX_BATCH * A::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let query = layout.reserve(max_tokens * A::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
     let plane_bytes =
         PHYSICAL_PAGES * A::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * A::HEAD_DIM * cache_element_bytes;
     let key_pages = layout.reserve(plane_bytes, ALIGNMENT)?;
     let value_pages = layout.reserve(plane_bytes, ALIGNMENT)?;
     let block_tables = layout.reserve(TABLE_ROWS * TABLE_STRIDE, ALIGNMENT)?;
-    let table_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
-    let lengths = layout.reserve(MAX_BATCH, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * A::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let table_rows = layout.reserve(max_tokens, ALIGNMENT)?;
+    let lengths = layout.reserve(max_tokens, ALIGNMENT)?;
+    let output = layout.reserve(max_tokens * A::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -422,8 +441,8 @@ fn layout<A: Arch>(cache_element_bytes: usize) -> GpuResult<(ArenaLayout, Region
     ))
 }
 
-fn fixture<A: Arch>(cache_format: CacheFormat) -> Fixture {
-    let query = (0..MAX_BATCH * A::ATTENTION_OUTPUT_COLUMNS)
+fn fixture<A: Arch>(max_tokens: usize, cache_format: CacheFormat) -> Fixture {
+    let query = (0..max_tokens * A::ATTENTION_OUTPUT_COLUMNS)
         .map(|index| {
             let token = index / A::ATTENTION_OUTPUT_COLUMNS;
             let head = index / A::HEAD_DIM % A::NUM_ATTENTION_HEADS;
@@ -459,6 +478,17 @@ fn fixture<A: Arch>(cache_format: CacheFormat) -> Fixture {
         query,
         key_pages,
         value_pages,
+        table_rows: (0..max_tokens)
+            .map(|token| {
+                TABLE_ROW_IDS
+                    .get(token)
+                    .copied()
+                    .unwrap_or((token % TABLE_ROWS) as u32)
+            })
+            .collect(),
+        lengths: (0..max_tokens)
+            .map(|token| LENGTHS.get(token).copied().unwrap_or((token + 1) as u32))
+            .collect(),
     }
 }
 
@@ -489,8 +519,8 @@ fn load_fixture(
     arena.copy_from_host(stream, regions.key_pages, &fixture.key_pages)?;
     arena.copy_from_host(stream, regions.value_pages, &fixture.value_pages)?;
     arena.copy_from_host(stream, regions.block_tables, &BLOCK_TABLES)?;
-    arena.copy_from_host(stream, regions.table_rows, &TABLE_ROW_IDS)?;
-    arena.copy_from_host(stream, regions.lengths, &LENGTHS)
+    arena.copy_from_host(stream, regions.table_rows, &fixture.table_rows)?;
+    arena.copy_from_host(stream, regions.lengths, &fixture.lengths)
 }
 
 fn reset_output(
@@ -537,14 +567,14 @@ fn launch(
 }
 
 fn verify_oracle<A: Arch>(
-    batch: usize,
+    tokens: usize,
     cache_format: CacheFormat,
     fixture: &Fixture,
     observed: &[f32],
     report: &mut PagedGqaQualification,
 ) -> Result<(), PagedGqaQualificationError> {
-    let expected = oracle::<A>(batch, cache_format, fixture)?;
-    let active = batch * A::ATTENTION_OUTPUT_COLUMNS;
+    let expected = oracle::<A>(tokens, cache_format, fixture)?;
+    let active = tokens * A::ATTENTION_OUTPUT_COLUMNS;
     for (index, (&actual, &expected)) in observed[..active]
         .iter()
         .zip(&expected[..active])
@@ -555,14 +585,14 @@ fn verify_oracle<A: Arch>(
         let tolerance = 0.002f32.max(expected.abs() * 0.003);
         if !actual.is_finite() || error > tolerance {
             return Err(PagedGqaQualificationError::Mismatch(format!(
-                "output at B={batch}, index={index}: device={actual}, oracle={expected}, tolerance={tolerance}"
+                "output at tokens={tokens}, index={index}: device={actual}, oracle={expected}, tolerance={tolerance}"
             )));
         }
     }
     for (index, value) in observed[active..].iter().enumerate() {
         if value.to_bits() != F32_SENTINEL_BITS {
             return Err(PagedGqaQualificationError::Mismatch(format!(
-                "B={batch} modified inactive output word {}",
+                "tokens={tokens} modified inactive output word {}",
                 active + index
             )));
         }
@@ -574,15 +604,14 @@ fn verify_oracle<A: Arch>(
 }
 
 fn oracle<A: Arch>(
-    batch: usize,
+    tokens: usize,
     cache_format: CacheFormat,
     fixture: &Fixture,
 ) -> Result<Vec<f32>, PagedGqaQualificationError> {
-    let mut output =
-        vec![f32::from_bits(F32_SENTINEL_BITS); MAX_BATCH * A::ATTENTION_OUTPUT_COLUMNS];
-    for token in 0..batch {
-        let row = TABLE_ROW_IDS[token] as usize;
-        let length = LENGTHS[token] as usize;
+    let mut output = vec![f32::from_bits(F32_SENTINEL_BITS); fixture.query.len()];
+    for token in 0..tokens {
+        let row = fixture.table_rows[token] as usize;
+        let length = fixture.lengths[token] as usize;
         for query_head in 0..A::NUM_ATTENTION_HEADS {
             let kv_head = query_head / (A::NUM_ATTENTION_HEADS / A::NUM_KV_HEADS);
             let query_base = (token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM;
@@ -698,14 +727,14 @@ fn verify_inputs(
     check!(regions.key_pages, &fixture.key_pages, "key cache");
     check!(regions.value_pages, &fixture.value_pages, "value cache");
     check!(regions.block_tables, &BLOCK_TABLES, "block tables");
-    check!(regions.table_rows, &TABLE_ROW_IDS, "table rows");
-    check!(regions.lengths, &LENGTHS, "lengths");
+    check!(regions.table_rows, &fixture.table_rows, "table rows");
+    check!(regions.lengths, &fixture.lengths, "lengths");
 
     Ok(())
 }
 
 fn verify_replay(
-    batch: usize,
+    tokens: usize,
     eager: &[f32],
     replay: &[f32],
     report: &mut PagedGqaQualification,
@@ -717,7 +746,7 @@ fn verify_replay(
         .position(|(actual, expected)| actual != expected)
     {
         return Err(PagedGqaQualificationError::Mismatch(format!(
-            "B={batch} graph output word {index} differs from eager"
+            "tokens={tokens} graph output word {index} differs from eager"
         )));
     }
     report.graph_replay_values += replay.len();
@@ -725,15 +754,16 @@ fn verify_replay(
     Ok(())
 }
 
-fn verify_no_post_warmup_allocation(
+fn verify_no_post_warmup_allocation<O: QualifiedPagedGqaOp>(
     context: &CudaContext,
-    op: &impl QualifiedPagedGqaOp,
+    op: &O,
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
 ) -> Result<(), PagedGqaQualificationError> {
-    let graphs = (1..=MAX_BATCH)
-        .map(|batch| CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch)))
+    let graphs = O::ROUTES
+        .iter()
+        .map(|&tokens| CudaGraph::capture(stream, || launch(op, arena, stream, regions, tokens)))
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
         // SAFETY: every allocation this graph captured is owned by this scope or
@@ -743,10 +773,10 @@ fn verify_no_post_warmup_allocation(
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
-        for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
+        for graph in graphs.iter().rev() {
             // SAFETY: every allocation this graph captured is owned by this scope or
             // its caller and outlives the replays and the synchronize that follows.
-            unsafe { graphs[batch - 1].launch(stream) }?;
+            unsafe { graph.launch(stream) }?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -763,9 +793,9 @@ fn verify_no_post_warmup_allocation(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BATCH, PHYSICAL_PAGES, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, TABLE_ROWS, TABLE_STRIDE,
-        layout, qualify_mtp_bf16_paged_gqa, qualify_paged_gqa, qualify_qwen35_paged_gqa,
-        qualify_qwen36_paged_gqa,
+        MAX_BATCH, PHYSICAL_PAGES, QWEN36_MAX_TOKENS, QWEN36_ROUTES, Qwen35_9B, Qwen36Moe35B,
+        Qwen38_27B, TABLE_ROWS, TABLE_STRIDE, layout, qualify_mtp_bf16_paged_gqa,
+        qualify_paged_gqa, qualify_qwen35_paged_gqa, qualify_qwen36_paged_gqa,
     };
     use std::mem::size_of;
     use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -791,7 +821,7 @@ mod tests {
         assert_eq!(report.workspace_bytes, 393_376);
         assert_eq!(report.immutable_input_values, 51_118_720);
         assert!(report.maximum_absolute_error <= 0.003);
-        let (arena, regions) = layout::<Qwen38_27B>(size_of::<u8>())?;
+        let (arena, regions) = layout::<Qwen38_27B>(MAX_BATCH, size_of::<u8>())?;
         assert_eq!(arena.byte_len(), 3_539_712);
         assert_eq!(arena.byte_len() - regions.payload_bytes(), 608);
 
@@ -826,7 +856,7 @@ mod tests {
         assert_eq!(report.cache_bytes, 6_291_456);
         assert_eq!(report.workspace_bytes, 262_304);
         assert!(report.maximum_absolute_error <= 0.003);
-        let (arena, regions) = layout::<Qwen35_9B>(size_of::<u16>())?;
+        let (arena, regions) = layout::<Qwen35_9B>(MAX_BATCH, size_of::<u16>())?;
         assert_eq!(arena.byte_len(), 6_554_368);
         assert_eq!(arena.byte_len() - regions.payload_bytes(), 608);
 
@@ -835,40 +865,40 @@ mod tests {
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn qwen36_bf16_exact_batches_match_independent_oracles_and_graph_replay()
+    fn qwen36_bf16_exact_decode_and_prompt_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), super::PagedGqaQualificationError> {
         let report = qualify_qwen36_paged_gqa()?;
-        let active_tokens = (1..=MAX_BATCH).sum::<usize>();
+        let active_tokens = QWEN36_ROUTES.iter().sum::<usize>();
         let output_per_token = Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS;
         let plane_bytes = PHYSICAL_PAGES
             * Qwen36Moe35B::NUM_KV_HEADS
             * ATTENTION_PAGE_SIZE
             * Qwen36Moe35B::HEAD_DIM
             * size_of::<u16>();
-        let immutable_per_check = MAX_BATCH * output_per_token
+        let immutable_per_check = QWEN36_MAX_TOKENS * output_per_token
             + 2 * plane_bytes
             + TABLE_ROWS * TABLE_STRIDE
-            + 2 * MAX_BATCH;
+            + 2 * QWEN36_MAX_TOKENS;
 
         assert_eq!(report.output_values, active_tokens * output_per_token);
-        assert_eq!(report.untouched_values, 114_688);
-        assert_eq!(report.graph_replay_values, 262_144);
+        assert_eq!(report.untouched_values, 4_702_208);
+        assert_eq!(report.graph_replay_values, 5_767_168);
         assert_eq!(
             report.immutable_input_values,
-            2 * MAX_BATCH * immutable_per_check
+            2 * QWEN36_ROUTES.len() * immutable_per_check
         );
-        assert_eq!(report.arena_bytes - report.padding_bytes, 3_408_032);
+        assert_eq!(report.arena_bytes - report.padding_bytes, 7_341_152);
         assert!(report.maximum_absolute_error <= 0.003);
-        let (arena, regions) = layout::<Qwen36Moe35B>(size_of::<u16>())?;
-        assert_eq!(arena.byte_len(), 3_408_640);
-        assert_eq!(arena.byte_len() - regions.payload_bytes(), 608);
+        let (arena, regions) = layout::<Qwen36Moe35B>(QWEN36_MAX_TOKENS, size_of::<u16>())?;
+        assert_eq!(arena.byte_len(), 7_341_312);
+        assert_eq!(arena.byte_len() - regions.payload_bytes(), 160);
 
         Ok(())
     }
 
     #[test]
     fn mtp_bf16_paged_gqa_suite_arena_accounting_exposes_every_byte() {
-        let (arena, regions) = layout::<Qwen38_27B>(size_of::<u16>()).unwrap();
+        let (arena, regions) = layout::<Qwen38_27B>(MAX_BATCH, size_of::<u16>()).unwrap();
 
         assert_eq!(regions.cache_bytes(), 6_291_456);
         assert_eq!(regions.workspace_bytes(), 393_376);

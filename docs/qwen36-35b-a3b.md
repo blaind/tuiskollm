@@ -168,12 +168,15 @@ post-warmup growth in a 6,589,440-byte arena. All 11 entries retain 54 registers
 memory, and 1,024 bytes of shared memory. At a loaded 2,167 MHz median SM clock, its unblessed
 prompt path measures 3.228/3.750/4.936 us and the complete graph measures 4.100/6.109/6.148 us at
 T=32/64/128. B=1/8 measure 2.820/3.124 us for the path; the 4.100-us graph boundary remains
-dispatch-limited at decode width. The following BF16 paged-GQA leaf owns a
-separate 8:1 query/KV-head route at every `B=1..8`. Its independent FP64 page/online-softmax oracle
-passes 147,456 active outputs, 114,688 inactive sentinels, 262,144 graph-replay values, and complete
-read-only input checks in a 3,408,640-byte arena. All eight generated entries use 48 registers,
-zero stack/local memory, and 1,024 bytes shared. Timing remains unreported because the available
-diagnostic run failed the exclusive-device precondition. The gated attention-output leaf then
+dispatch-limited at decode width. The following BF16 paged-GQA leaf owns separate 8:1
+query/KV-head routes at every `B=1..8` and `T=32/64/128`. Prompt CTAs let eight query-head warps
+share each 65,536-byte BF16 K/V tile without changing the per-head online-softmax order. Its
+independent FP64 page/online-softmax oracle passes 1,064,960 active outputs, 4,702,208 inactive
+sentinels, 5,767,168 graph-replay values, and 80,746,512 immutable-input checks in a 7,341,312-byte
+arena with stable addresses and zero post-warmup growth. The eight decode entries use 48 registers;
+the three prompt entries use 54. All 11 have zero stack/local memory and 1,024 bytes static shared,
+while prompt launches request the exact 65,536-byte dynamic tile. Timing remains unreported because
+the available diagnostic run failed the exclusive-device precondition. The gated attention-output leaf then
 applies the query-paired sigmoid gate, publishes the BF16 projection seam, statically quantizes it
 with the admitted scalar scale, and consumes the source-native E4M3 `[2048,4096]` output plane at
 every exact `B=1..8`. Its independent oracle passes 147,456 gated FP32 values, 147,456 exact BF16
