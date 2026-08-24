@@ -14,7 +14,21 @@ use tuisko_model::{CheckpointError, CheckpointSnapshot, Qwen38_27B};
 // 8f20cb4fdf7ab2e5ff9def3598b433f4cafcd9c02aa62d9cfa19eee400bf225a and
 // 4ff0853747ac857814a12455869dc4f111eb7d40e2af544a1389a8c73e107041.
 const VLLM_CASES: [(&[u32], u32); 2] = [(&[151_643], 198), (&[151_643, 151_644], 30_350)];
-const NATIVE_PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1024];
+const PREFILL_PLAN_CASES: [(usize, usize); 13] = [
+    (31, 0),
+    (32, 32),
+    (63, 32),
+    (64, 64),
+    (96, 96),
+    (127, 96),
+    (128, 128),
+    (256, 256),
+    (1_024, 1_024),
+    (1_055, 1_024),
+    (1_056, 1_056),
+    (1_152, 1_152),
+    (32_896, 32_896),
+];
 
 /// Failure of the concrete resident-generation integration gate.
 #[derive(Debug, thiserror::Error)]
@@ -46,8 +60,8 @@ pub struct ResidentGenerationQualification {
     pub reference_cases: usize,
     /// Production chat steps streamed and reassembled.
     pub chat_steps: usize,
-    /// Exact from-empty prefill graphs selected through the production dispatch.
-    pub native_prefill_routes: usize,
+    /// Exact and composed prefill plans selected through production dispatch.
+    pub native_prefill_plans: usize,
     /// Exact device arena bytes owned by the generator.
     pub arena_bytes: usize,
     /// Exact page-locked embedding and logit staging bytes.
@@ -77,13 +91,13 @@ pub fn qualify_resident_generation(
 
     // Warm every host/device transfer path before observing allocation stability.
     let _ = generator.qualification_greedy_after_tokens(VLLM_CASES[0].0)?;
-    let mut native_tokens = [0u32; NATIVE_PREFILL_ROUTES.len()];
-    for (index, tokens) in NATIVE_PREFILL_ROUTES.into_iter().enumerate() {
+    let mut native_tokens = [0u32; PREFILL_PLAN_CASES.len()];
+    for (index, (tokens, expected_native)) in PREFILL_PLAN_CASES.into_iter().enumerate() {
         let fixture = vec![151_643; tokens];
         let (token, selected) = generator.qualification_greedy_after_tokens_with_route(&fixture)?;
-        if selected != tokens {
+        if selected != expected_native {
             return Err(ResidentGenerationQualificationError::Mismatch(format!(
-                "T={tokens} production dispatch selected {selected} native prefill tokens"
+                "T={tokens} production dispatch selected {selected} native prefill tokens, expected {expected_native}"
             )));
         }
         native_tokens[index] = token;
@@ -97,12 +111,12 @@ pub fn qualify_resident_generation(
             )));
         }
     }
-    for (index, tokens) in NATIVE_PREFILL_ROUTES.into_iter().enumerate() {
+    for (index, (tokens, expected_native)) in PREFILL_PLAN_CASES.into_iter().enumerate() {
         let fixture = vec![151_643; tokens];
         let (token, selected) = generator.qualification_greedy_after_tokens_with_route(&fixture)?;
-        if selected != tokens || token != native_tokens[index] {
+        if selected != expected_native || token != native_tokens[index] {
             return Err(ResidentGenerationQualificationError::Mismatch(format!(
-                "T={tokens} native prefill replay changed dispatch or greedy output"
+                "T={tokens} composed prefill replay changed dispatch or greedy output"
             )));
         }
     }
@@ -179,7 +193,7 @@ pub fn qualify_resident_generation(
     Ok(ResidentGenerationQualification {
         reference_cases: VLLM_CASES.len(),
         chat_steps: step_tokens.len(),
-        native_prefill_routes: NATIVE_PREFILL_ROUTES.len(),
+        native_prefill_plans: PREFILL_PLAN_CASES.len(),
         arena_bytes: generator.arena_bytes(),
         host_stager_bytes: generator.host_stager_bytes(),
         kv_route_host_bytes: generator.kv_route_host_bytes(),
@@ -228,7 +242,7 @@ mod tests {
         let report = qualify_resident_generation(&PathBuf::from(root))?;
         assert_eq!(report.reference_cases, 2);
         assert!((1..=2).contains(&report.chat_steps));
-        assert_eq!(report.native_prefill_routes, 4);
+        assert_eq!(report.native_prefill_plans, 13);
         assert_eq!(report.arena_bytes, 28_380_566_016);
         assert_eq!(report.host_stager_bytes, 10_982_400);
         Ok(())

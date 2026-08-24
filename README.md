@@ -57,10 +57,10 @@ resident graphs through the 220,000-position ceiling. The compact owner preserve
 token as pending, packs only requests needing device work, cancels without advancing that pending
 token, and recycles holes without moving survivor state. Inactive slots retain their exact processed
 token span and may skip only a prefix that the next prompt contains in full; divergence falls back
-to cold priming. Fresh prompts of exactly `T=32,64,128,1024` use the corresponding whole-model
-prefill graph through both single-request and compact scheduler admission. Reused prefixes and
-other prompt lengths retain the qualified B=1 decode priming path; arbitrary prompt tiling is not
-yet wired into scheduler admission. Vision inputs and MTP generation are not served yet
+to cold priming. Single-request and compact scheduler admission greedily process cold prompts and
+reused-prefix suffixes with exact T1024, T128, T64, and T32 whole-model graphs. Only the final
+0--31 tokens retain the qualified B=1 path; the scheduler neither pads recurrent rows nor invents
+an unqualified chunk width. Vision inputs and MTP generation are not served yet
 and are rejected or remain outside the HTTP contract rather than silently taking another route.
 
 The standalone SM120 operator inventory also includes partitioned paged GQA through 220,000

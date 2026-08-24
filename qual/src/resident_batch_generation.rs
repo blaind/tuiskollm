@@ -11,7 +11,20 @@ use tuisko_frontend::{ChatMessage, ChatTemplateOptions, FrontendError, TextFront
 use tuisko_gpu::{CudaContext, GpuError, device_memory_info};
 use tuisko_model::{CheckpointError, CheckpointSnapshot, Qwen38_27B};
 
-const NATIVE_PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1024];
+const PREFILL_PLAN_CASES: [(usize, usize); 12] = [
+    (31, 0),
+    (32, 32),
+    (63, 32),
+    (64, 64),
+    (96, 96),
+    (127, 96),
+    (128, 128),
+    (256, 256),
+    (1_024, 1_024),
+    (1_055, 1_024),
+    (1_056, 1_056),
+    (1_152, 1_152),
+];
 
 /// Failure of the compact resident-generation integration gate.
 #[derive(Debug, thiserror::Error)]
@@ -45,8 +58,8 @@ pub struct ResidentBatchGenerationQualification {
     pub rounds: usize,
     /// Exact pending replay batches exercised across B=1..8.
     pub route_batches: usize,
-    /// Exact from-empty prefill routes exercised through batch admission.
-    pub native_prefill_routes: usize,
+    /// Exact and composed prefill plans exercised through batch admission.
+    pub native_prefill_plans: usize,
     /// Physical hole recycled while surviving requests remained active.
     pub recycled_slot: usize,
     /// Active cancellation boundaries exercised.
@@ -70,9 +83,9 @@ pub fn qualify_resident_batch_generation(
     let _preflight = device_benchmark::preflight()?;
     let snapshot = Arc::new(CheckpointSnapshot::<Qwen38_27B>::open(root)?);
     let oracle_frontend = TextFrontend::open(snapshot.as_ref())?;
-    let native_requests = NATIVE_PREFILL_ROUTES
+    let native_requests = PREFILL_PLAN_CASES
         .into_iter()
-        .map(|tokens| exact_prompt_request(&oracle_frontend, tokens))
+        .map(|(tokens, _)| exact_prompt_request(&oracle_frontend, tokens))
         .collect::<Result<Vec<_>, _>>()?;
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
@@ -183,7 +196,7 @@ pub fn qualify_resident_batch_generation(
         requests: requests.len(),
         rounds: 3,
         route_batches: 8,
-        native_prefill_routes: NATIVE_PREFILL_ROUTES.len(),
+        native_prefill_plans: PREFILL_PLAN_CASES.len(),
         recycled_slot: 1,
         cancellations: 2,
         exact_prefix_reuses: 1,
@@ -230,11 +243,11 @@ fn verify_native_prefill_inventory(
     generator: &mut ResidentBatchGenerator,
     requests: &[ChatGenerationRequest],
 ) -> Result<(), ResidentBatchGenerationQualificationError> {
-    for (&tokens, request) in NATIVE_PREFILL_ROUTES.iter().zip(requests) {
+    for (&(tokens, expected_native), request) in PREFILL_PLAN_CASES.iter().zip(requests) {
         let admission = generator.admit(request)?;
         if admission.prompt_tokens != tokens
             || admission.device_reused_tokens != 0
-            || admission.native_prefill_tokens != tokens
+            || admission.native_prefill_tokens != expected_native
         {
             return Err(ResidentBatchGenerationQualificationError::Mismatch(
                 format!(
@@ -600,7 +613,7 @@ mod tests {
         assert_eq!(report.requests, 4);
         assert_eq!(report.rounds, 3);
         assert_eq!(report.route_batches, 8);
-        assert_eq!(report.native_prefill_routes, 4);
+        assert_eq!(report.native_prefill_plans, 12);
         assert_eq!(report.recycled_slot, 1);
         assert_eq!(report.cancellations, 2);
         assert_eq!(report.exact_prefix_reuses, 1);
