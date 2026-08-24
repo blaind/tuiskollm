@@ -70,6 +70,8 @@ pub struct TargetMtpVerifyQualification {
     pub committed_values: usize,
     /// Represented cache bytes compared across eager, graph, and sequential routes.
     pub cache_values: usize,
+    /// Lane-selected target residual values preserved across serial realignment handoffs.
+    pub residual_handoff_values: usize,
     /// Complete immutable target verify/commit graph inventory.
     pub graph_count: usize,
     /// Executable instances retained after long-context variant sharing.
@@ -142,6 +144,7 @@ pub fn qualify_target_mtp_verify(
         rollback_values: 0,
         committed_values: 0,
         cache_values: 0,
+        residual_handoff_values: 0,
         graph_count: program.target_mtp_graph_count(),
         graph_executable_count: program.target_mtp_graph_executable_count(),
         long_segmented_variant_routes: 0,
@@ -275,6 +278,7 @@ fn qualify_segmented_routes(
                 lm_head_scales,
                 report,
             )?;
+            let eager_handoff = selected_segmented_residuals(program, stream, route, &eager)?;
 
             let (graph_route, _) = prepare_segmented(program, stream, batch, tokens, fixture)?;
             program.replay_target_mtp_segmented_verify(stream, graph_route)?;
@@ -296,6 +300,14 @@ fn qualify_segmented_routes(
                 report.cache_values += actual.0.len() + actual.1.len();
             }
             report.graph_replay_values += observable_values(&eager);
+            let replay_handoff =
+                selected_segmented_residuals(program, stream, graph_route, &replay)?;
+            if replay_handoff != eager_handoff {
+                return Err(TargetMtpVerifyQualificationError::Mismatch(format!(
+                    "segmented B={batch} K={tokens} eager and graph residual handoffs differ"
+                )));
+            }
+            report.residual_handoff_values += replay_handoff.iter().map(Vec::len).sum::<usize>();
 
             let accepted = (0..batch).map(|lane| lane % tokens + 1).collect::<Vec<_>>();
             let (commit_route, commit_fixtures) =
@@ -339,6 +351,41 @@ fn qualify_segmented_routes(
         }
     }
     Ok(())
+}
+
+fn selected_segmented_residuals(
+    program: &ResidentModelProgram,
+    stream: &CudaStream,
+    route: ResidentMtpSegmentedVerifyRoute,
+    observed: &ResidentMtpVerifyObservables,
+) -> Result<Vec<Vec<u16>>, TargetMtpVerifyQualificationError> {
+    let expected_values = route.rows() * Qwen38_27B::HIDDEN;
+    if observed.residual_a.len() != expected_values {
+        return Err(TargetMtpVerifyQualificationError::Mismatch(format!(
+            "segmented B={} K={} residual plane has {} values, expected {expected_values}",
+            route.batch(),
+            route.tokens(),
+            observed.residual_a.len()
+        )));
+    }
+    program.backup_target_mtp_segmented_residuals(stream, route)?;
+    let mut selected = Vec::with_capacity(route.batch());
+    for lane in 0..route.batch() {
+        let rows = lane % route.tokens() + 1;
+        program.select_target_mtp_segmented_residual_lane(stream, route, lane, rows)?;
+        let actual = program.read_residual(stream, rows)?;
+        let begin = lane * route.tokens() * Qwen38_27B::HIDDEN;
+        let end = begin + rows * Qwen38_27B::HIDDEN;
+        if actual != observed.residual_a[begin..end] {
+            return Err(TargetMtpVerifyQualificationError::Mismatch(format!(
+                "segmented B={} K={} lane {lane} selected the wrong {rows}-row residual prefix",
+                route.batch(),
+                route.tokens()
+            )));
+        }
+        selected.push(actual);
+    }
+    Ok(selected)
 }
 
 fn prepare_segmented(
@@ -1335,6 +1382,7 @@ mod tests {
         assert_eq!(report.commit_routes, 10);
         assert_eq!(report.segmented_verify_routes, 32);
         assert_eq!(report.segmented_commit_routes, 32);
+        assert_eq!(report.residual_handoff_values, 1_198_080);
         assert_eq!(report.endpoint_oracle_values, 1_896_250);
         assert_eq!(report.graph_count, 228);
         assert_eq!(report.graph_executable_count, 88);

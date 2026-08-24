@@ -1,14 +1,13 @@
 //! Source-backed qualification for the resident long-context Qwen3.8 MTP owner.
 
+use crate::DeviceBenchmarkError;
 use crate::device_benchmark;
 use crate::fp8_projection_oracle::f32_to_bf16;
-use crate::{DeviceBenchmarkError, qualify_mtp_layer, qualify_mtp_prompt_prime};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
-    EngineError, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, ResidentModelProgram,
-    ResidentMtpObservables, ResidentMtpProgram,
+    EngineError, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, ResidentMtpObservables, ResidentMtpProgram,
 };
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, device_memory_info};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -49,6 +48,8 @@ pub struct ResidentMtpQualification {
     pub draft_routes: usize,
     /// Exact compact residual-continuation routes checked eagerly and by graph replay.
     pub continuation_routes: usize,
+    /// Exact compact staged-hidden continuation routes checked eagerly and by graph replay.
+    pub staged_continuation_routes: usize,
     /// Exact prime-only realignment routes checked eagerly and by graph replay.
     pub prime_routes: usize,
     /// Exact full realignment routes checked eagerly and by graph replay.
@@ -73,7 +74,7 @@ pub struct ResidentMtpQualification {
     pub padding_bytes: usize,
     /// Page-locked graph source bytes.
     pub host_stager_bytes: usize,
-    /// Exact prompt, seeded draft, compact continuation, prime, and realignment graphs.
+    /// Exact prompt, seeded draft, same-round/staged continuation, prime, and realignment graphs.
     pub graph_count: usize,
 }
 
@@ -87,8 +88,8 @@ struct CachePage {
 pub fn qualify_resident_mtp(
     root: &Path,
 ) -> Result<ResidentMtpQualification, ResidentMtpQualificationError> {
+    run_source_oracles()?;
     let _preflight = device_benchmark::preflight()?;
-    run_source_oracles(root)?;
 
     let snapshot = Arc::new(CheckpointSnapshot::<Qwen38_27B>::open(root)?);
     let context = CudaContext::new(0).map_err(GpuError::from)?;
@@ -98,15 +99,15 @@ pub fn qualify_resident_mtp(
         ));
     }
     let stream = context.new_stream().map_err(GpuError::from)?;
-    let mut target = ResidentModelProgram::from_snapshot(&context, snapshot.clone())?;
+    let mut program = ResidentMtpProgram::from_snapshot(&context, snapshot.clone())?;
     for slot in 0..MAX_BATCH {
-        target.activate_kv_slot(slot)?;
-        target.reserve_kv_slot_tokens(&stream, slot, 1_024)?;
+        program.activate_kv_slot(slot)?;
+        program.reserve_kv_slot_tokens(&stream, slot, 1_024)?;
     }
-    let mut program = ResidentMtpProgram::from_target(target)?;
     verify_owner(&program)?;
     let stable_bases = (program.base_address(), program.cache_base_address());
     let stable_addresses = program.qualification_addresses()?;
+    let stable_host_stagers = program.qualification_host_stager_addresses();
     if stable_addresses.len() != 44
         || stable_addresses
             .iter()
@@ -120,6 +121,17 @@ pub fn qualify_resident_mtp(
             stable_addresses.len()
         )));
     }
+    if stable_host_stagers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .len()
+        != stable_host_stagers.len()
+    {
+        return Err(ResidentMtpQualificationError::Mismatch(
+            "resident MTP pinned graph sources do not have seven unique addresses".to_string(),
+        ));
+    }
 
     let embedding = TextEndpointBindings::bind_embedding(snapshot.as_ref())?.bytes();
     let mut report = ResidentMtpQualification {
@@ -127,6 +139,7 @@ pub fn qualify_resident_mtp(
         prompt_routes: 0,
         draft_routes: 0,
         continuation_routes: 0,
+        staged_continuation_routes: 0,
         prime_routes: 0,
         realign_routes: 0,
         tail_routes: 0,
@@ -148,6 +161,7 @@ pub fn qualify_resident_mtp(
         embedding,
         stable_bases,
         &stable_addresses,
+        &stable_host_stagers,
         &mut report,
     )?;
     verify_draft_routes(
@@ -156,6 +170,7 @@ pub fn qualify_resident_mtp(
         embedding,
         stable_bases,
         &stable_addresses,
+        &stable_host_stagers,
         &mut report,
     )?;
     verify_continuation_route(
@@ -164,6 +179,7 @@ pub fn qualify_resident_mtp(
         embedding,
         stable_bases,
         &stable_addresses,
+        &stable_host_stagers,
         &mut report,
     )?;
     verify_realign_routes(
@@ -172,6 +188,7 @@ pub fn qualify_resident_mtp(
         embedding,
         stable_bases,
         &stable_addresses,
+        &stable_host_stagers,
         &mut report,
     )?;
     verify_scalar_tails(&mut program, &stream, &mut report)?;
@@ -181,17 +198,44 @@ pub fn qualify_resident_mtp(
     Ok(report)
 }
 
-fn run_source_oracles(root: &Path) -> Result<(), ResidentMtpQualificationError> {
-    qualify_mtp_layer(root).map_err(|error| {
+fn run_source_oracles() -> Result<(), ResidentMtpQualificationError> {
+    const TESTS: [(&str, &str); 2] = [
+        (
+            "complete independent MTP layer oracle",
+            "mtp_layer::tests::mtp_layer_suite_source_owner_matches_all_draft_prime_and_realign_routes",
+        ),
+        (
+            "independent MTP prompt-prime oracle",
+            "mtp_prompt_prime::tests::mtp_prompt_prime_suite_source_values_match_every_route_and_tail",
+        ),
+    ];
+    let executable = std::env::current_exe().map_err(|error| {
         ResidentMtpQualificationError::Mismatch(format!(
-            "complete independent MTP layer oracle failed: {error}"
+            "locating the qualification executable failed: {error}"
         ))
     })?;
-    qualify_mtp_prompt_prime(root).map_err(|error| {
-        ResidentMtpQualificationError::Mismatch(format!(
-            "independent MTP prompt-prime oracle failed: {error}"
-        ))
-    })?;
+    for (role, test) in TESTS {
+        let status = std::process::Command::new(&executable)
+            .args([
+                test,
+                "--exact",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .status()
+            .map_err(|error| {
+                ResidentMtpQualificationError::Mismatch(format!(
+                    "launching the {role} in an isolated process failed: {error}"
+                ))
+            })?;
+        if !status.success() {
+            return Err(ResidentMtpQualificationError::Mismatch(format!(
+                "{role} failed in its isolated process with {status}"
+            )));
+        }
+        device_benchmark::wait_for_owned_child_cleanup()?;
+    }
     Ok(())
 }
 
@@ -201,8 +245,8 @@ fn verify_owner(program: &ResidentMtpProgram) -> Result<(), ResidentMtpQualifica
         || program.workspace_bytes() != 122_904_032
         || program.owner_bytes() != 1_873_554_176
         || program.padding_bytes() != 288
-        || program.host_stager_bytes() != 10_760_192
-        || program.graph_count() != 29
+        || program.host_stager_bytes() != 10_842_112
+        || program.graph_count() != 37
     {
         return Err(ResidentMtpQualificationError::Mismatch(
             "resident MTP byte or graph accounting differs from the admitted layout".to_string(),
@@ -217,6 +261,7 @@ fn verify_prompt_routes(
     embedding: &[u8],
     stable_bases: (u64, u64),
     stable_addresses: &[usize],
+    stable_host_stagers: &[usize; 7],
     report: &mut ResidentMtpQualification,
 ) -> Result<(), ResidentMtpQualificationError> {
     for rows in PROMPT_ROUTES {
@@ -244,7 +289,14 @@ fn verify_prompt_routes(
         let replay_cache = read_cache(program, stream, 0, 0, rows)?;
         compare_observables("prompt", rows, &eager, &replay, report)?;
         compare_cache("prompt", rows, &eager_cache, &replay_cache)?;
-        verify_stable(program, stable_bases, stable_addresses, "prompt", rows)?;
+        verify_stable(
+            program,
+            stable_bases,
+            stable_addresses,
+            stable_host_stagers,
+            "prompt",
+            rows,
+        )?;
         report.prompt_routes += 1;
     }
     Ok(())
@@ -256,6 +308,7 @@ fn verify_draft_routes(
     embedding: &[u8],
     stable_bases: (u64, u64),
     stable_addresses: &[usize],
+    stable_host_stagers: &[usize; 7],
     report: &mut ResidentMtpQualification,
 ) -> Result<(), ResidentMtpQualificationError> {
     for batch in 1..=MAX_BATCH {
@@ -288,7 +341,14 @@ fn verify_draft_routes(
         let replay_cache = read_draft_cache(program, stream, &slots, &positions)?;
         compare_observables("draft", batch, &eager, &replay, report)?;
         compare_cache("draft", batch, &eager_cache, &replay_cache)?;
-        verify_stable(program, stable_bases, stable_addresses, "draft", batch)?;
+        verify_stable(
+            program,
+            stable_bases,
+            stable_addresses,
+            stable_host_stagers,
+            "draft",
+            batch,
+        )?;
         report.draft_routes += 1;
     }
     Ok(())
@@ -300,6 +360,7 @@ fn verify_continuation_route(
     embedding: &[u8],
     stable_bases: (u64, u64),
     stable_addresses: &[usize],
+    stable_host_stagers: &[usize; 7],
     report: &mut ResidentMtpQualification,
 ) -> Result<(), ResidentMtpQualificationError> {
     const SEED_POSITION: u32 = 130;
@@ -382,14 +443,92 @@ fn verify_continuation_route(
         let replay_cache = read_draft_cache(program, stream, &slots, &continuation_positions)?;
         compare_observables("continuation", batch, &eager, &replay, report)?;
         compare_cache("continuation", batch, &eager_cache, &replay_cache)?;
+
+        let staged_seed = run_seed(program)?;
+        if staged_seed.residual_output.as_deref() != Some(prior_residual.as_slice()) {
+            return Err(ResidentMtpQualificationError::Mismatch(format!(
+                "resident MTP B={batch} seed residual changed before staged eager continuation"
+            )));
+        }
+        let staged_route = program.stage_continuation_draft(
+            stream,
+            &slots,
+            &continuation_positions,
+            &continuation_tokens,
+            &prior_residual,
+            &continuation_cosine,
+            &continuation_sine,
+        )?;
+        program.qualification_launch_eager_staged_continue_draft(stream, staged_route)?;
+        let staged_eager = program.qualification_observables(stream, batch, true)?;
+        let staged_eager_cache =
+            read_draft_cache(program, stream, &slots, &continuation_positions)?;
+        if staged_eager != eager {
+            return Err(ResidentMtpQualificationError::Mismatch(format!(
+                "resident MTP B={batch} staged and prior-residual eager continuations differ"
+            )));
+        }
+        compare_cache(
+            "staged continuation eager",
+            batch,
+            &eager_cache,
+            &staged_eager_cache,
+        )?;
+        verify_inputs(
+            program,
+            stream,
+            embedding,
+            &continuation_tokens,
+            &prior_residual,
+            &slots,
+            &continuation_positions,
+            &continuation_cosine,
+            &continuation_sine,
+            &staged_eager,
+        )?;
+
+        let staged_replay_seed = run_seed(program)?;
+        if staged_replay_seed.residual_output.as_deref() != Some(prior_residual.as_slice()) {
+            return Err(ResidentMtpQualificationError::Mismatch(format!(
+                "resident MTP B={batch} seed residual changed before staged graph continuation"
+            )));
+        }
+        let staged_route = program.stage_continuation_draft(
+            stream,
+            &slots,
+            &continuation_positions,
+            &continuation_tokens,
+            &prior_residual,
+            &continuation_cosine,
+            &continuation_sine,
+        )?;
+        program.replay_staged_continue_draft(stream, staged_route)?;
+        let staged_replay = program.qualification_observables(stream, batch, true)?;
+        let staged_replay_cache =
+            read_draft_cache(program, stream, &slots, &continuation_positions)?;
+        compare_observables(
+            "staged continuation graph",
+            batch,
+            &staged_eager,
+            &staged_replay,
+            report,
+        )?;
+        compare_cache(
+            "staged continuation graph",
+            batch,
+            &staged_eager_cache,
+            &staged_replay_cache,
+        )?;
         verify_stable(
             program,
             stable_bases,
             stable_addresses,
+            stable_host_stagers,
             "continuation",
             batch,
         )?;
         report.continuation_routes += 1;
+        report.staged_continuation_routes += 1;
     }
     Ok(())
 }
@@ -400,6 +539,7 @@ fn verify_realign_routes(
     embedding: &[u8],
     stable_bases: (u64, u64),
     stable_addresses: &[usize],
+    stable_host_stagers: &[usize; 7],
     report: &mut ResidentMtpQualification,
 ) -> Result<(), ResidentMtpQualificationError> {
     for tokens_count in 1..=REALIGN_ROUTES {
@@ -452,6 +592,8 @@ fn verify_realign_routes(
         let replay_cache = read_cache(program, stream, 0, first, tokens_count)?;
         let mut selected_logits = vec![0u16; Qwen38_27B::VOCAB];
         program.read_logit_row_into(stream, tokens_count - 1, &mut selected_logits)?;
+        let mut selected_residual = vec![0u16; Qwen38_27B::HIDDEN];
+        program.read_residual_row_into(stream, tokens_count - 1, &mut selected_residual)?;
         let logits = replay.logits.as_ref().ok_or_else(|| {
             ResidentMtpQualificationError::Mismatch(format!(
                 "resident MTP K={tokens_count} realignment published no logits"
@@ -463,12 +605,24 @@ fn verify_realign_routes(
                 "resident MTP K={tokens_count} selected the wrong realignment logit row"
             )));
         }
+        let residuals = replay.residual_output.as_ref().ok_or_else(|| {
+            ResidentMtpQualificationError::Mismatch(format!(
+                "resident MTP K={tokens_count} realignment published no final residual"
+            ))
+        })?;
+        let residual_begin = (tokens_count - 1) * Qwen38_27B::HIDDEN;
+        if selected_residual != residuals[residual_begin..residual_begin + Qwen38_27B::HIDDEN] {
+            return Err(ResidentMtpQualificationError::Mismatch(format!(
+                "resident MTP K={tokens_count} selected the wrong realignment residual row"
+            )));
+        }
         compare_observables("realign", tokens_count, &eager, &replay, report)?;
         compare_cache("realign", tokens_count, &eager_cache, &replay_cache)?;
         verify_stable(
             program,
             stable_bases,
             stable_addresses,
+            stable_host_stagers,
             "realign",
             tokens_count,
         )?;
@@ -817,11 +971,13 @@ fn verify_stable(
     program: &ResidentMtpProgram,
     bases: (u64, u64),
     addresses: &[usize],
+    host_stagers: &[usize; 7],
     role: &str,
     rows: usize,
 ) -> Result<(), ResidentMtpQualificationError> {
     if (program.base_address(), program.cache_base_address()) != bases
         || program.qualification_addresses()? != addresses
+        || program.qualification_host_stager_addresses() != *host_stagers
     {
         return Err(ResidentMtpQualificationError::Mismatch(format!(
             "resident MTP addresses changed after {role} rows={rows}"
@@ -842,15 +998,19 @@ fn verify_no_post_warmup_allocation(
     let (cosine, sine) = rope(&positions);
     program.target().load_residual(stream, MAX_BATCH, &hidden)?;
     let draft = program.stage_draft(stream, &slots, &positions, &tokens, &cosine, &sine)?;
+    let staged = program
+        .stage_continuation_draft(stream, &slots, &positions, &tokens, &hidden, &cosine, &sine)?;
     for _ in 0..2 {
         program.replay_draft(stream, draft)?;
         program.replay_continue_draft(stream, draft)?;
+        program.replay_staged_continue_draft(stream, staged)?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
         program.replay_draft(stream, draft)?;
         program.replay_continue_draft(stream, draft)?;
+        program.replay_staged_continue_draft(stream, staged)?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let after = device_memory_info(context)?;
@@ -1033,6 +1193,7 @@ mod tests {
         assert_eq!(report.prompt_routes, 5);
         assert_eq!(report.draft_routes, 8);
         assert_eq!(report.continuation_routes, 8);
+        assert_eq!(report.staged_continuation_routes, 8);
         assert_eq!(report.prime_routes, 4);
         assert_eq!(report.realign_routes, 4);
         assert_eq!(report.tail_routes, 31);
