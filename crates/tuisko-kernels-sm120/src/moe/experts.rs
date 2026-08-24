@@ -8,6 +8,7 @@ use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, P
 use tuisko_model::{Arch, Qwen36Moe35B};
 
 const MAX_BATCH: usize = 8;
+const PREFILL_ROWS: [usize; 3] = [32, 64, 128];
 const HIDDEN: usize = Qwen36Moe35B::HIDDEN;
 const INTERMEDIATE: usize = Qwen36Moe35B::INTERMEDIATE;
 const EXPERTS: usize = Qwen36Moe35B::NUM_EXPERTS;
@@ -54,6 +55,10 @@ const _: () = assert!(INTERMEDIATE.is_multiple_of(GROUP_K));
 const _: () = assert!(INTERMEDIATE.is_multiple_of(GATE_UP_WARPS));
 const _: () = assert!(HIDDEN.is_multiple_of(DOWN_ROWS_PER_CTA));
 const _: () = assert!(HIDDEN.is_multiple_of(COMBINE_THREADS as usize));
+
+fn admitted_rows(rows: usize) -> bool {
+    (1..=MAX_BATCH).contains(&rows) || PREFILL_ROWS.contains(&rows)
+}
 
 #[allow(clippy::too_many_arguments)]
 #[cuda_module]
@@ -163,17 +168,8 @@ mod kernels {
         }
     }
 
-    #[kernel]
-    #[launch_bounds(256, 2)]
-    #[allow(clippy::too_many_arguments)]
-    #[launch_contract(
-        domain = 1,
-        coordinates = u32,
-        block = (256, 1, 1),
-        dynamic_shared = 0,
-        min_compute_capability = (12, 0),
-    )]
-    pub fn qwen36_moe_expert_gate_up<const TOKENS: usize>(
+    #[inline(always)]
+    unsafe fn expert_gate_up<const TOKENS: usize>(
         input: *const u32,
         expert_indices: *const u16,
         routed_codes: *const u8,
@@ -325,6 +321,7 @@ mod kernels {
         }
     }
 
+    /// Executes routed and shared gate/up for an exact decode batch.
     #[kernel]
     #[launch_bounds(256, 2)]
     #[allow(clippy::too_many_arguments)]
@@ -335,7 +332,79 @@ mod kernels {
         dynamic_shared = 0,
         min_compute_capability = (12, 0),
     )]
-    pub fn qwen36_moe_expert_down<const TOKENS: usize>(
+    pub fn qwen36_moe_expert_gate_up<const TOKENS: usize>(
+        input: *const u32,
+        expert_indices: *const u16,
+        routed_codes: *const u8,
+        routed_scales: *const u8,
+        routed_weight_scales_2: *const f32,
+        shared_codes: *const u8,
+        shared_scales: *const u8,
+        shared_weight_scale_2: f32,
+        shared_gate_weight: *const u32,
+        intermediate_output: *mut u16,
+        shared_gate_output: *mut u16,
+    ) {
+        unsafe {
+            expert_gate_up::<TOKENS>(
+                input,
+                expert_indices,
+                routed_codes,
+                routed_scales,
+                routed_weight_scales_2,
+                shared_codes,
+                shared_scales,
+                shared_weight_scale_2,
+                shared_gate_weight,
+                intermediate_output,
+                shared_gate_output,
+            )
+        }
+    }
+
+    /// Executes routed and shared gate/up for an exact prompt tile.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_moe_expert_gate_up_prefill<const TOKENS: usize>(
+        input: *const u32,
+        expert_indices: *const u16,
+        routed_codes: *const u8,
+        routed_scales: *const u8,
+        routed_weight_scales_2: *const f32,
+        shared_codes: *const u8,
+        shared_scales: *const u8,
+        shared_weight_scale_2: f32,
+        shared_gate_weight: *const u32,
+        intermediate_output: *mut u16,
+        shared_gate_output: *mut u16,
+    ) {
+        unsafe {
+            expert_gate_up::<TOKENS>(
+                input,
+                expert_indices,
+                routed_codes,
+                routed_scales,
+                routed_weight_scales_2,
+                shared_codes,
+                shared_scales,
+                shared_weight_scale_2,
+                shared_gate_weight,
+                intermediate_output,
+                shared_gate_output,
+            )
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn expert_down<const TOKENS: usize>(
         intermediate_input: *const u32,
         expert_indices: *const u16,
         routed_codes: *const u8,
@@ -457,8 +526,10 @@ mod kernels {
         }
     }
 
+    /// Executes routed and shared down projections for an exact decode batch.
     #[kernel]
     #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
     #[launch_contract(
         domain = 1,
         coordinates = u32,
@@ -466,7 +537,71 @@ mod kernels {
         dynamic_shared = 0,
         min_compute_capability = (12, 0),
     )]
-    pub fn qwen36_moe_expert_combine<const TOKENS: usize>(
+    pub fn qwen36_moe_expert_down<const TOKENS: usize>(
+        intermediate_input: *const u32,
+        expert_indices: *const u16,
+        routed_codes: *const u8,
+        routed_scales: *const u8,
+        routed_weight_scales_2: *const f32,
+        shared_codes: *const u8,
+        shared_scales: *const u8,
+        shared_weight_scale_2: f32,
+        expert_output: *mut u16,
+    ) {
+        unsafe {
+            expert_down::<TOKENS>(
+                intermediate_input,
+                expert_indices,
+                routed_codes,
+                routed_scales,
+                routed_weight_scales_2,
+                shared_codes,
+                shared_scales,
+                shared_weight_scale_2,
+                expert_output,
+            )
+        }
+    }
+
+    /// Executes routed and shared down projections for an exact prompt tile.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_moe_expert_down_prefill<const TOKENS: usize>(
+        intermediate_input: *const u32,
+        expert_indices: *const u16,
+        routed_codes: *const u8,
+        routed_scales: *const u8,
+        routed_weight_scales_2: *const f32,
+        shared_codes: *const u8,
+        shared_scales: *const u8,
+        shared_weight_scale_2: f32,
+        expert_output: *mut u16,
+    ) {
+        unsafe {
+            expert_down::<TOKENS>(
+                intermediate_input,
+                expert_indices,
+                routed_codes,
+                routed_scales,
+                routed_weight_scales_2,
+                shared_codes,
+                shared_scales,
+                shared_weight_scale_2,
+                expert_output,
+            )
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn expert_combine<const TOKENS: usize>(
         expert_output: *const u16,
         routing_weights: *const u16,
         shared_gate: *const u16,
@@ -496,6 +631,44 @@ mod kernels {
         let shared_logit = f32::from_bits(u32::from(unsafe { *shared_gate.add(token) }) << 16);
         sum = float::fma_rn_f32(shared_value, sigmoid(shared_logit), sum);
         unsafe { *output.add(token * HIDDEN + column) = tcgen05::f32_to_bf16_rne(sum) };
+    }
+
+    /// Combines routed and shared outputs for an exact decode batch.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_moe_expert_combine<const TOKENS: usize>(
+        expert_output: *const u16,
+        routing_weights: *const u16,
+        shared_gate: *const u16,
+        output: *mut u16,
+    ) {
+        unsafe { expert_combine::<TOKENS>(expert_output, routing_weights, shared_gate, output) }
+    }
+
+    /// Combines routed and shared outputs for an exact prompt tile.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_moe_expert_combine_prefill<const TOKENS: usize>(
+        expert_output: *const u16,
+        routing_weights: *const u16,
+        shared_gate: *const u16,
+        output: *mut u16,
+    ) {
+        unsafe { expert_combine::<TOKENS>(expert_output, routing_weights, shared_gate, output) }
     }
 }
 
@@ -531,6 +704,11 @@ struct PreparedBatchRoute<const TOKENS: usize> {
 
 impl<const TOKENS: usize> PreparedBatchRoute<TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !(1..=MAX_BATCH).contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 MoE expert decode row count {TOKENS} is not admitted"
+            )));
+        }
         Ok(Self {
             gate_up: module
                 .prepare_qwen36_moe_expert_gate_up::<TOKENS>(gate_up_config::<TOKENS>())
@@ -615,15 +793,130 @@ impl<const TOKENS: usize> PreparedBatchRoute<TOKENS> {
     }
 }
 
+struct PreparedPrefillRoute<const TOKENS: usize> {
+    gate_up: PreparedLaunch<kernels::__qwen36_moe_expert_gate_up_prefill_CudaKernel<TOKENS>>,
+    down: PreparedLaunch<kernels::__qwen36_moe_expert_down_prefill_CudaKernel<TOKENS>>,
+    combine: PreparedLaunch<kernels::__qwen36_moe_expert_combine_prefill_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !PREFILL_ROWS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 MoE expert prefill row count {TOKENS} is not admitted"
+            )));
+        }
+        // T=32/64/128 measure 252/480/937 us and 1,895/1,991/2,040 GiB/s of
+        // logical selected-weight traffic at locked clocks. T=128 already
+        // exposes 73,728 gate/up, 147,456 down, and 1,024 combine CTAs across
+        // 170 SMs, so this first prompt route retains the decode topology.
+        // Specialization changes only the independent token count: one warp
+        // still owns each gate/up row or down-row pair and combine retains its
+        // routed-slot 0..7 then shared order, so arithmetic is unchanged.
+        Ok(Self {
+            gate_up: module
+                .prepare_qwen36_moe_expert_gate_up_prefill::<TOKENS>(gate_up_config::<TOKENS>())
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.6 MoE prompt gate/up", source)
+                })?,
+            down: module
+                .prepare_qwen36_moe_expert_down_prefill::<TOKENS>(down_config::<TOKENS>())
+                .map_err(|source| GpuError::launch("preparing Qwen3.6 MoE prompt down", source))?,
+            combine: module
+                .prepare_qwen36_moe_expert_combine_prefill::<TOKENS>(combine_config::<TOKENS>())
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.6 MoE prompt combine", source)
+                })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        expert_indices: *const u16,
+        routing_weights: *const u16,
+        routed_gate_up_codes: *const u8,
+        routed_gate_up_scales: *const u8,
+        routed_gate_up_weight_scales_2: *const f32,
+        routed_down_codes: *const u8,
+        routed_down_scales: *const u8,
+        routed_down_weight_scales_2: *const f32,
+        shared_gate_up_codes: *const u8,
+        shared_gate_up_scales: *const u8,
+        shared_gate_up_weight_scale_2: f32,
+        shared_down_codes: *const u8,
+        shared_down_scales: *const u8,
+        shared_down_weight_scale_2: f32,
+        shared_gate_weight: *const u16,
+        intermediate: *mut u16,
+        expert_output: *mut u16,
+        shared_gate: *mut u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen36_moe_expert_gate_up_prefill::<TOKENS>(
+                stream,
+                &self.gate_up,
+                input.cast::<u32>(),
+                expert_indices,
+                routed_gate_up_codes,
+                routed_gate_up_scales,
+                routed_gate_up_weight_scales_2,
+                shared_gate_up_codes,
+                shared_gate_up_scales,
+                shared_gate_up_weight_scale_2,
+                shared_gate_weight.cast::<u32>(),
+                intermediate,
+                shared_gate,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.6 MoE prompt gate/up", source))?;
+        module
+            .qwen36_moe_expert_down_prefill::<TOKENS>(
+                stream,
+                &self.down,
+                intermediate.cast::<u32>(),
+                expert_indices,
+                routed_down_codes,
+                routed_down_scales,
+                routed_down_weight_scales_2,
+                shared_down_codes,
+                shared_down_scales,
+                shared_down_weight_scale_2,
+                expert_output,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.6 MoE prompt down", source))?;
+        module
+            .qwen36_moe_expert_combine_prefill::<TOKENS>(
+                stream,
+                &self.combine,
+                expert_output,
+                routing_weights,
+                shared_gate,
+                output,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.6 MoE prompt combine", source))
+    }
+}
+
 /// PTX symbols retained for every exact Qwen3.6 expert batch.
 pub(crate) fn qwen36_moe_experts_ptx_names() -> Vec<&'static str> {
-    let mut names = Vec::with_capacity(3 * MAX_BATCH);
+    let mut names = Vec::with_capacity(3 * (MAX_BATCH + PREFILL_ROWS.len()));
 
     macro_rules! push_route {
         ($tokens:literal) => {
             names.push(kernels::qwen36_moe_expert_gate_up_ptx_name::<$tokens>());
             names.push(kernels::qwen36_moe_expert_down_ptx_name::<$tokens>());
             names.push(kernels::qwen36_moe_expert_combine_ptx_name::<$tokens>());
+        };
+    }
+    macro_rules! push_prefill {
+        ($tokens:literal) => {
+            names.push(kernels::qwen36_moe_expert_gate_up_prefill_ptx_name::<$tokens>());
+            names.push(kernels::qwen36_moe_expert_down_prefill_ptx_name::<$tokens>());
+            names.push(kernels::qwen36_moe_expert_combine_prefill_ptx_name::<$tokens>());
         };
     }
 
@@ -635,6 +928,9 @@ pub(crate) fn qwen36_moe_experts_ptx_names() -> Vec<&'static str> {
     push_route!(6);
     push_route!(7);
     push_route!(8);
+    push_prefill!(32);
+    push_prefill!(64);
+    push_prefill!(128);
     names
 }
 
@@ -649,6 +945,9 @@ pub struct Qwen36MoeExpertsOp {
     b6: PreparedBatchRoute<6>,
     b7: PreparedBatchRoute<7>,
     b8: PreparedBatchRoute<8>,
+    t32: PreparedPrefillRoute<32>,
+    t64: PreparedPrefillRoute<64>,
+    t128: PreparedPrefillRoute<128>,
 }
 
 impl Qwen36MoeExpertsOp {
@@ -667,6 +966,9 @@ impl Qwen36MoeExpertsOp {
             b6: PreparedBatchRoute::prepare(&module)?,
             b7: PreparedBatchRoute::prepare(&module)?,
             b8: PreparedBatchRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -677,14 +979,14 @@ impl Qwen36MoeExpertsOp {
     ///
     /// Every pointer covers the exact Qwen3.6 planes documented by its name.
     /// Routed planes contain 256 numeric-order experts and every selected index is
-    /// below 256. Workspaces cover `batch * 9 * 512`, `batch * 9 * 2_048`,
-    /// `batch`, and `batch * 2_048` values respectively. Four-byte-loaded planes
+    /// below 256. Workspaces cover `rows * 9 * 512`, `rows * 9 * 2_048`,
+    /// `rows`, and `rows * 2_048` values respectively. Four-byte-loaded planes
     /// are aligned, disjoint, and live in `stream`'s context through completion.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         input: *const u16,
         expert_indices: *const u16,
         routing_weights: *const u16,
@@ -737,7 +1039,13 @@ impl Qwen36MoeExpertsOp {
             };
         }
 
-        match batch {
+        if !admitted_rows(rows) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 MoE expert row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128"
+            )));
+        }
+
+        match rows {
             1 => launch!(b1),
             2 => launch!(b2),
             3 => launch!(b3),
@@ -746,8 +1054,11 @@ impl Qwen36MoeExpertsOp {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
             _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.6 MoE expert batch {batch} is outside the exact range 1..={MAX_BATCH}"
+                "Qwen3.6 MoE expert row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128"
             ))),
         }
     }
@@ -757,8 +1068,8 @@ impl Qwen36MoeExpertsOp {
 mod tests {
     use super::{
         DOWN_CODE_BYTES_PER_EXPERT, DOWN_SCALE_BYTES_PER_EXPERT, EXPERTS,
-        GATE_UP_CODE_BYTES_PER_EXPERT, GATE_UP_SCALE_BYTES_PER_EXPERT, MAX_BATCH, SLOTS_PER_TOKEN,
-        qwen36_moe_experts_ptx_names,
+        GATE_UP_CODE_BYTES_PER_EXPERT, GATE_UP_SCALE_BYTES_PER_EXPERT, MAX_BATCH, PREFILL_ROWS,
+        SLOTS_PER_TOKEN, admitted_rows, qwen36_moe_experts_ptx_names,
     };
     use std::collections::BTreeSet;
 
@@ -772,10 +1083,29 @@ mod tests {
         assert_eq!(EXPERTS, 256);
 
         let names = qwen36_moe_experts_ptx_names();
-        assert_eq!(names.len(), 3 * MAX_BATCH);
+        assert_eq!(names.len(), 3 * (MAX_BATCH + PREFILL_ROWS.len()));
         assert_eq!(
             names.iter().copied().collect::<BTreeSet<_>>().len(),
             names.len()
         );
+    }
+
+    #[test]
+    fn row_table_covers_only_exact_decode_and_prefill_routes() {
+        for (rows, expected) in [
+            (0, false),
+            (1, true),
+            (8, true),
+            (9, false),
+            (16, false),
+            (32, true),
+            (33, false),
+            (64, true),
+            (65, false),
+            (128, true),
+            (129, false),
+        ] {
+            assert_eq!(admitted_rows(rows), expected, "rows={rows}");
+        }
     }
 }
