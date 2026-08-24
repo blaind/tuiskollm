@@ -10,7 +10,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
-use tuisko_model::{CheckpointSnapshot, Qwen35_9B, Qwen38_27B};
+use tuisko_model::{CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 pub use error::{FrontendError, FrontendErrorCode, FrontendResult};
 
@@ -19,11 +19,13 @@ const TEMPLATE_FILE: &str = "chat_template.jinja";
 const GENERATION_CONFIG_FILE: &str = "generation_config.json";
 const QWEN38_TOKENIZER_ENTRIES: usize = 248_077;
 const QWEN35_TOKENIZER_ENTRIES: usize = 248_070;
+const QWEN36_TOKENIZER_ENTRIES: usize = 248_070;
 const IM_START_ID: u32 = 248_045;
 const IM_END_ID: u32 = 248_046;
 const END_OF_TEXT_ID: u32 = 248_044;
 const QWEN38_EOS_IDS: [u32; 2] = [IM_END_ID, END_OF_TEXT_ID];
 const QWEN35_EOS_IDS: [u32; 1] = [END_OF_TEXT_ID];
+const QWEN36_EOS_IDS: [u32; 2] = [IM_END_ID, END_OF_TEXT_ID];
 const DEFAULT_TEMPERATURE: f32 = 1.0;
 const DEFAULT_TOP_P: f32 = 0.95;
 const DEFAULT_TOP_K: usize = 20;
@@ -36,6 +38,7 @@ pub const SPECIAL_TOKEN_LITERALS: [&str; 3] = ["<|im_start|>", "<|im_end|>", "<|
 enum FrontendContract {
     Qwen38,
     Qwen35,
+    Qwen36,
 }
 
 impl FrontendContract {
@@ -43,6 +46,7 @@ impl FrontendContract {
         match self {
             Self::Qwen38 => QWEN38_TOKENIZER_ENTRIES,
             Self::Qwen35 => QWEN35_TOKENIZER_ENTRIES,
+            Self::Qwen36 => QWEN36_TOKENIZER_ENTRIES,
         }
     }
 
@@ -50,6 +54,7 @@ impl FrontendContract {
         match self {
             Self::Qwen38 => &QWEN38_EOS_IDS,
             Self::Qwen35 => &QWEN35_EOS_IDS,
+            Self::Qwen36 => &QWEN36_EOS_IDS,
         }
     }
 }
@@ -313,6 +318,19 @@ impl TextFrontend {
         options: TextFrontendOptions,
     ) -> FrontendResult<Self> {
         Self::open_root(snapshot.root(), options, FrontendContract::Qwen35)
+    }
+
+    /// Loads and validates the pinned Qwen3.6 tokenizer, template, and generation metadata.
+    pub fn open_qwen36(snapshot: &CheckpointSnapshot<Qwen36Moe35B>) -> FrontendResult<Self> {
+        Self::open_qwen36_with_options(snapshot, TextFrontendOptions::default())
+    }
+
+    /// Loads the Qwen3.6 frontend with explicit startup options.
+    pub fn open_qwen36_with_options(
+        snapshot: &CheckpointSnapshot<Qwen36Moe35B>,
+        options: TextFrontendOptions,
+    ) -> FrontendResult<Self> {
+        Self::open_root(snapshot.root(), options, FrontendContract::Qwen36)
     }
 
     fn open_root(
@@ -825,12 +843,14 @@ fn parse_generation_defaults(
     contract: FrontendContract,
 ) -> FrontendResult<GenerationDefaults> {
     match contract {
-        FrontendContract::Qwen38 => parse_qwen38_generation_defaults(generation),
+        FrontendContract::Qwen38 | FrontendContract::Qwen36 => {
+            parse_sampled_generation_defaults(generation)
+        }
         FrontendContract::Qwen35 => parse_qwen35_generation_defaults(generation),
     }
 }
 
-fn parse_qwen38_generation_defaults(generation: &Value) -> FrontendResult<GenerationDefaults> {
+fn parse_sampled_generation_defaults(generation: &Value) -> FrontendResult<GenerationDefaults> {
     if generation.get("do_sample").and_then(Value::as_bool) != Some(true) {
         return Err(FrontendError::Contract(
             "generation_config.json `do_sample` must be true".into(),
@@ -910,6 +930,15 @@ mod tests {
     use std::collections::{HashSet, VecDeque};
     use tokenizers::Tokenizer;
     use tokenizers::models::wordlevel::WordLevel;
+    use tuisko_model::{CheckpointSnapshot, Qwen36Moe35B};
+
+    // Transformers 5.2.0 `apply_chat_template` and tokenizer output from the pinned snapshot.
+    const QWEN36_HELLO_THINKING: [u32; 11] = [
+        248_045, 846, 198, 9_419, 248_046, 198, 248_045, 74_455, 198, 248_068, 198,
+    ];
+    const QWEN36_HELLO_NO_THINKING: [u32; 13] = [
+        248_045, 846, 198, 9_419, 248_046, 198, 248_045, 74_455, 198, 248_068, 271, 248_069, 271,
+    ];
 
     #[test]
     fn chat_message_serializes_for_the_template() {
@@ -997,6 +1026,7 @@ mod tests {
     fn stop_ids_are_exact() {
         let qwen38 = json!({"eos_token_id": [248046, 248044]});
         let qwen35 = json!({"eos_token_id": 248044});
+        let qwen36 = json!({"eos_token_id": [248046, 248044]});
         assert_eq!(
             parse_stop_ids(&qwen38, FrontendContract::Qwen38).unwrap(),
             [248046, 248044]
@@ -1004,6 +1034,10 @@ mod tests {
         assert_eq!(
             parse_stop_ids(&qwen35, FrontendContract::Qwen35).unwrap(),
             [248044]
+        );
+        assert_eq!(
+            parse_stop_ids(&qwen36, FrontendContract::Qwen36).unwrap(),
+            [248046, 248044]
         );
     }
 
@@ -1025,6 +1059,14 @@ mod tests {
             json!({"eos_token_id": -1}),
         ] {
             let error = parse_stop_ids(&generation, FrontendContract::Qwen35).unwrap_err();
+            assert_eq!(error.code(), FrontendErrorCode::Contract);
+        }
+        for generation in [
+            json!({}),
+            json!({"eos_token_id": 248046}),
+            json!({"eos_token_id": [248044, 248046]}),
+        ] {
+            let error = parse_stop_ids(&generation, FrontendContract::Qwen36).unwrap_err();
             assert_eq!(error.code(), FrontendErrorCode::Contract);
         }
     }
@@ -1140,6 +1182,10 @@ mod tests {
         assert_eq!(defaults.temperature, 1.0);
         assert_eq!(defaults.top_p, 0.95);
         assert_eq!(defaults.top_k, 20);
+        assert_eq!(
+            parse_generation_defaults(&exact, FrontendContract::Qwen36).unwrap(),
+            defaults
+        );
 
         for changed in [
             json!({"do_sample": false, "temperature": 1.0, "top_p": 0.95, "top_k": 20}),
@@ -1164,6 +1210,45 @@ mod tests {
         ] {
             assert!(parse_generation_defaults(&changed, FrontendContract::Qwen35).is_err());
         }
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Qwen3.6 snapshot"]
+    fn qwen36_snapshot_matches_transformers_prompt_fixtures() {
+        let root = std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+            .expect("set TUISKO_QWEN36_SNAPSHOT to the admitted revision");
+        let snapshot =
+            CheckpointSnapshot::<Qwen36Moe35B>::open(std::path::Path::new(&root)).unwrap();
+        let frontend = TextFrontend::open_qwen36(&snapshot).unwrap();
+        let messages = [ChatMessage::new("user", "Hello")];
+
+        assert_eq!(
+            frontend
+                .encode_chat(&messages, &ChatTemplateOptions::default())
+                .unwrap(),
+            QWEN36_HELLO_THINKING
+        );
+        assert_eq!(
+            frontend
+                .encode_chat(
+                    &messages,
+                    &ChatTemplateOptions {
+                        enable_thinking: Some(false),
+                        ..ChatTemplateOptions::default()
+                    },
+                )
+                .unwrap(),
+            QWEN36_HELLO_NO_THINKING
+        );
+        assert_eq!(frontend.stop_ids(), [248_046, 248_044]);
+        assert_eq!(
+            frontend.generation_defaults(),
+            super::GenerationDefaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+            }
+        );
     }
 
     #[test]
