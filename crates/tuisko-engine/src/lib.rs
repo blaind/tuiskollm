@@ -23,6 +23,7 @@ mod qwen35_full_attention_layer_layout;
 mod qwen35_gdn_layer;
 mod qwen35_gdn_layer_layout;
 mod qwen35_nvfp4_mlp;
+mod qwen35_resident_model;
 mod qwen35_text_endpoint;
 mod qwen35_text_endpoint_layout;
 mod resident_generation;
@@ -62,6 +63,9 @@ pub use qwen35_full_attention_layer_layout::Qwen35FullAttentionLayerLayout;
 pub use qwen35_gdn_layer::Qwen35GdnLayerProgram;
 pub use qwen35_gdn_layer_layout::Qwen35GdnLayerLayout;
 pub use qwen35_nvfp4_mlp::Qwen35Nvfp4MlpProgram;
+pub use qwen35_resident_model::{
+    Qwen35ResidentLayerKind, Qwen35ResidentModelLayout, Qwen35ResidentModelProgram,
+};
 pub use qwen35_text_endpoint::Qwen35TextEndpointProgram;
 pub use qwen35_text_endpoint_layout::Qwen35TextEndpointLayout;
 pub use resident_generation::{
