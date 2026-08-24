@@ -181,7 +181,7 @@ pub fn benchmark_mtp_bf16_qkv(
         "qwen3_8/mtp/bf16_qkv/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.regions.workspace_bytes(),
-        "max_batch=8 normalized input and fused BF16 output",
+        "max_tokens=1024 normalized input and fused BF16 output",
     )?;
     memory.register_owned(
         "qwen3_8/mtp/bf16_qkv/alignment_padding",
@@ -223,8 +223,8 @@ mod tests {
         let (layout, regions) = layout().unwrap();
 
         assert_eq!(regions.weight_bytes(), 146_800_640);
-        assert_eq!(regions.workspace_bytes(), 311_296);
-        assert_eq!(regions.payload_bytes(), 147_111_936);
+        assert_eq!(regions.workspace_bytes(), 39_845_888);
+        assert_eq!(regions.payload_bytes(), 186_646_528);
         assert_eq!(layout.byte_len(), regions.payload_bytes());
         assert_eq!(logical_bytes(1), 146_839_552);
         assert_eq!(logical_bytes(MAX_BATCH), 147_111_936);
