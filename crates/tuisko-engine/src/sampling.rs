@@ -5,7 +5,11 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 #[cfg(feature = "qualification")]
 use std::collections::HashSet;
-use tuisko_model::{Arch, Qwen38_27B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
+
+const _: () = assert!(Qwen35_9B::VOCAB == Qwen38_27B::VOCAB);
+/// Vocabulary shared by every admitted generation arch.
+const VOCABULARY: usize = Qwen38_27B::VOCAB;
 
 const DEFAULT_TOP_K: usize = 20;
 const DEFAULT_TOP_P: f32 = 0.95;
@@ -157,7 +161,7 @@ impl SamplingDistribution {
         let total = masses.iter().map(|&(_, mass)| mass).sum::<f64>();
         if masses.is_empty()
             || masses.iter().any(|&(token, mass)| {
-                token as usize >= Qwen38_27B::VOCAB || !mass.is_finite() || mass <= 0.0
+                token as usize >= VOCABULARY || !mass.is_finite() || mass <= 0.0
             })
             || !total.is_finite()
             || total <= 0.0
@@ -295,10 +299,9 @@ impl Sampler {
     }
 
     pub(crate) fn decision_for_token(&self, token_id: u32) -> EngineResult<SampleDecision> {
-        if token_id as usize >= Qwen38_27B::VOCAB {
+        if token_id as usize >= VOCABULARY {
             return Err(EngineError::sampling(format!(
-                "selected token {token_id} is outside vocabulary 0..{}",
-                Qwen38_27B::VOCAB
+                "selected token {token_id} is outside vocabulary 0..{VOCABULARY}"
             )));
         }
         Ok(SampleDecision {
@@ -331,10 +334,9 @@ fn validate_options(options: SamplingOptions) -> EngineResult<()> {
     if !options.top_p.is_finite() || !(0.0..=1.0).contains(&options.top_p) {
         return Err(EngineError::sampling("top_p must be finite and in 0..=1"));
     }
-    if !(1..=Qwen38_27B::VOCAB).contains(&options.top_k) {
+    if !(1..=VOCABULARY).contains(&options.top_k) {
         return Err(EngineError::sampling(format!(
-            "top_k must be in 1..={}",
-            Qwen38_27B::VOCAB
+            "top_k must be in 1..={VOCABULARY}"
         )));
     }
     if !options.penalties.presence.is_finite()
@@ -367,10 +369,9 @@ fn validate_stop_ids(stop_ids: [u32; 2]) -> EngineResult<()> {
         ));
     }
     for token in stop_ids {
-        if usize::try_from(token).map_or(true, |token| token >= Qwen38_27B::VOCAB) {
+        if usize::try_from(token).map_or(true, |token| token >= VOCABULARY) {
             return Err(EngineError::sampling(format!(
-                "generation stop token {token} is outside vocabulary 0..{}",
-                Qwen38_27B::VOCAB
+                "generation stop token {token} is outside vocabulary 0..{VOCABULARY}"
             )));
         }
     }
@@ -379,10 +380,9 @@ fn validate_stop_ids(stop_ids: [u32; 2]) -> EngineResult<()> {
 }
 
 fn require_vocabulary_row(logits: &[u16]) -> EngineResult<()> {
-    if logits.len() != Qwen38_27B::VOCAB {
+    if logits.len() != VOCABULARY {
         return Err(EngineError::sampling(format!(
-            "sampling requires {} BF16 logits, got {}",
-            Qwen38_27B::VOCAB,
+            "sampling requires {VOCABULARY} BF16 logits, got {}",
             logits.len()
         )));
     }
@@ -479,10 +479,9 @@ fn conditioned_top_k(
     provisional: &[u32],
 ) -> EngineResult<Vec<(usize, f32)>> {
     for &token in provisional {
-        if token as usize >= Qwen38_27B::VOCAB {
+        if token as usize >= VOCABULARY {
             return Err(EngineError::sampling(format!(
-                "sampling history token {token} is outside vocabulary 0..{}",
-                Qwen38_27B::VOCAB
+                "sampling history token {token} is outside vocabulary 0..{VOCABULARY}"
             )));
         }
     }
