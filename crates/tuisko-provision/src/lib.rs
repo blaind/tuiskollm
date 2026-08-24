@@ -188,11 +188,11 @@ pub fn resolve_snapshot_with_progress(
     mut report: impl FnMut(ProvisioningProgress) -> Result<(), String>,
 ) -> Result<SnapshotResolution, String> {
     if let Some(path) = explicit {
-        return Ok(local_resolution(path));
+        return verified_local_resolution(path);
     }
     let environment = |name: &str| std::env::var_os(name);
     if let Some(path) = nonempty_environment(&environment, "TUISKO_SNAPSHOT") {
-        return Ok(local_resolution(path.into()));
+        return verified_local_resolution(path.into());
     }
 
     let cache = hub_cache(&environment)?;
@@ -248,6 +248,17 @@ fn local_resolution(path: PathBuf) -> SnapshotResolution {
     SnapshotResolution {
         path,
         provisioning: None,
+    }
+}
+
+fn verified_local_resolution(path: PathBuf) -> Result<SnapshotResolution, String> {
+    match inspect_snapshot(&path)? {
+        SnapshotState::Complete => Ok(local_resolution(path)),
+        SnapshotState::Missing(missing) => Err(format!(
+            "the explicit snapshot at {} is missing {} required file(s)",
+            path.display(),
+            missing.len(),
+        )),
     }
 }
 
@@ -676,6 +687,7 @@ mod tests {
         append_body, exact_file_length, hex_digest, hub_cache, inspect_snapshot, offline,
         resume_offset, snapshot_path,
     };
+    use crate::resolve_snapshot;
     use sha2::Digest;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -803,6 +815,33 @@ mod tests {
                 .emit(ProvisioningStage::Downloading, required.bytes + 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn explicit_snapshot_paths_are_verified() {
+        let root = TestDirectory::new("explicit");
+        for required in REQUIRED_FILES {
+            let file = File::create(root.path().join(required.name)).unwrap();
+            file.set_len(required.bytes).unwrap();
+        }
+        let resolution = resolve_snapshot(Some(root.path().to_path_buf())).unwrap();
+        assert_eq!(resolution.path, root.path());
+        assert!(resolution.provisioning.is_none());
+
+        File::create(root.path().join("config.json"))
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+        let error = resolve_snapshot(Some(root.path().to_path_buf()))
+            .err()
+            .unwrap();
+        assert!(error.contains("config.json has 1 bytes, expected 22564"));
+
+        fs::remove_file(root.path().join("config.json")).unwrap();
+        let error = resolve_snapshot(Some(root.path().to_path_buf()))
+            .err()
+            .unwrap();
+        assert!(error.contains("missing 1 required file(s)"));
     }
 
     #[test]
