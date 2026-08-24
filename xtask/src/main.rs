@@ -6,8 +6,9 @@ mod perf_iteration;
 mod performance;
 mod remote;
 mod server_bench;
-mod server_qualification;
+mod server_performance;
 mod server_qual;
+mod server_qualification;
 
 use gpu_target::BuildTargetProfile;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};

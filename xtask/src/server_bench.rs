@@ -1,8 +1,9 @@
 //! Clock-authoritative production server timing and energy envelope.
 
-use super::{parse_compute_pids, run_visible, server_qual};
+use super::{parse_compute_pids, run_visible, server_performance, server_qual};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
@@ -22,12 +23,28 @@ const DEFAULT_SAMPLES: usize = 5;
 
 pub(super) fn run(root: &Path, arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
     let options = Options::parse(arguments)?;
+    let baseline = root.join(server_performance::baseline_path(options.long_context));
+    if options.baseline_action == Some(BaselineAction::Check) {
+        server_performance::preflight(&baseline)?;
+    }
     let (tools, mut server) =
         server_qual::start(root, &options.snapshot, "server performance setup")?;
     let result = run_authority(root, &options, &tools, &server);
     let stop = server.stop_and_wait();
     result?;
-    stop
+    stop?;
+    let report = root.join(&options.output);
+    match options.baseline_action {
+        Some(BaselineAction::Check) => server_performance::compare(&report, &baseline),
+        Some(BaselineAction::Bless) => server_performance::bless(&report, &baseline),
+        None => Ok(()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BaselineAction {
+    Check,
+    Bless,
 }
 
 struct Options {
@@ -35,12 +52,13 @@ struct Options {
     output: PathBuf,
     samples: usize,
     long_context: bool,
+    baseline_action: Option<BaselineAction>,
 }
 
 impl Options {
     fn parse(arguments: &[OsString]) -> Result<Self, Box<dyn Error>> {
         let Some((snapshot, remaining)) = arguments.split_first() else {
-            return Err("usage: cargo run -p xtask -- bench-server SNAPSHOT [--samples N] [--long-context] [--json target/PATH]".into());
+            return Err("usage: cargo run -p xtask -- bench-server SNAPSHOT [--samples N] [--long-context] [--json target/PATH] [--check|--bless]".into());
         };
         let snapshot = PathBuf::from(snapshot);
         if !snapshot.is_dir() {
@@ -49,6 +67,7 @@ impl Options {
         let mut output = PathBuf::from("target/benchmarks/server-authority/server.json");
         let mut samples = DEFAULT_SAMPLES;
         let mut long_context = false;
+        let mut baseline_action = None;
         let mut index = 0;
         while index < remaining.len() {
             match remaining[index].to_str() {
@@ -66,6 +85,14 @@ impl Options {
                     long_context = true;
                     index += 1;
                 }
+                Some("--check") if baseline_action.is_none() => {
+                    baseline_action = Some(BaselineAction::Check);
+                    index += 1;
+                }
+                Some("--bless") if baseline_action.is_none() => {
+                    baseline_action = Some(BaselineAction::Bless);
+                    index += 1;
+                }
                 Some("--json") => {
                     output =
                         PathBuf::from(remaining.get(index + 1).ok_or("--json requires a path")?);
@@ -80,12 +107,22 @@ impl Options {
         if !(3..=40).contains(&samples) {
             return Err("--samples must be in 3..=40".into());
         }
+        if baseline_action == Some(BaselineAction::Bless)
+            && samples < server_performance::MINIMUM_BASELINE_SAMPLES
+        {
+            return Err(format!(
+                "--bless requires at least {} samples per case",
+                server_performance::MINIMUM_BASELINE_SAMPLES
+            )
+            .into());
+        }
         validate_target_path(&output)?;
         Ok(Self {
             snapshot,
             output,
             samples,
             long_context,
+            baseline_action,
         })
     }
 }
@@ -98,6 +135,7 @@ struct AuthorityReport {
     snapshot: String,
     server_log: String,
     raw_benchmark_report: String,
+    server_binary_sha256: String,
     device: DeviceIdentity,
     server_pid: u32,
     clock_policy: ClockPolicy,
@@ -118,6 +156,8 @@ struct DeviceIdentity {
     name: String,
     uuid: String,
     driver: String,
+    compute_capability: String,
+    total_memory_mib: u64,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -183,6 +223,7 @@ fn run_authority(
     server: &server_qual::ProductionServer,
 ) -> Result<(), Box<dyn Error>> {
     let server_pid = server.pid()?;
+    let server_binary_sha256 = file_sha256(server.executable())?;
     require_only_server_process(server_pid)?;
     run_visible(
         Command::new(tools.qualifier())
@@ -216,6 +257,7 @@ fn run_authority(
             snapshot: options.snapshot.display().to_string(),
             server_log: server.log_path().display().to_string(),
             raw_benchmark_report: raw_path.display().to_string(),
+            server_binary_sha256,
             device,
             server_pid,
             clock_policy: clock_policy(),
@@ -268,6 +310,7 @@ fn run_authority(
         snapshot: options.snapshot.display().to_string(),
         server_log: server.log_path().display().to_string(),
         raw_benchmark_report: raw_path.display().to_string(),
+        server_binary_sha256,
         device,
         server_pid,
         clock_policy: clock_policy(),
@@ -583,7 +626,7 @@ fn device_identity() -> Result<DeviceIdentity, Box<dyn Error>> {
         .args([
             "-i",
             "0",
-            "--query-gpu=name,uuid,driver_version",
+            "--query-gpu=name,uuid,driver_version,compute_cap,memory.total",
             "--format=csv,noheader,nounits",
         ])
         .output()?;
@@ -592,14 +635,20 @@ fn device_identity() -> Result<DeviceIdentity, Box<dyn Error>> {
     }
     let text = String::from_utf8(output.stdout)?;
     let fields = text.trim().split(',').map(str::trim).collect::<Vec<_>>();
-    let [name, uuid, driver] = fields.as_slice() else {
+    let [name, uuid, driver, compute_capability, total_memory] = fields.as_slice() else {
         return Err(format!("unexpected device identity row `{}`", text.trim()).into());
     };
     Ok(DeviceIdentity {
         name: (*name).into(),
         uuid: (*uuid).into(),
         driver: (*driver).into(),
+        compute_capability: (*compute_capability).into(),
+        total_memory_mib: parse_u64(total_memory, "total memory")?,
     })
+}
+
+fn file_sha256(path: &Path) -> Result<String, Box<dyn Error>> {
+    Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
 }
 
 fn raw_report_path(authority: &Path) -> Result<PathBuf, Box<dyn Error>> {
@@ -665,10 +714,11 @@ fn parse_u64(value: &str, label: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MEMORY_CLOCK_SPREAD_MHZ, MAX_SM_CLOCK_SPREAD_MHZ, completion_tokens,
-        parse_telemetry_row, require_comparable_clocks, summarize_telemetry,
+        BaselineAction, MAX_MEMORY_CLOCK_SPREAD_MHZ, MAX_SM_CLOCK_SPREAD_MHZ, Options,
+        completion_tokens, parse_telemetry_row, require_comparable_clocks, summarize_telemetry,
     };
     use serde_json::json;
+    use std::ffi::OsString;
 
     #[test]
     fn telemetry_parser_and_summary_preserve_clock_power_and_memory_evidence() {
@@ -720,5 +770,27 @@ mod tests {
             ]
         });
         assert_eq!(completion_tokens(&report), Some(84));
+    }
+
+    #[test]
+    fn baseline_modes_are_mutually_exclusive_and_blessing_requires_five_samples() {
+        let arguments = [OsString::from("."), OsString::from("--check")];
+        assert_eq!(
+            Options::parse(&arguments).unwrap().baseline_action,
+            Some(BaselineAction::Check)
+        );
+        let arguments = [
+            OsString::from("."),
+            OsString::from("--bless"),
+            OsString::from("--samples"),
+            OsString::from("3"),
+        ];
+        assert!(Options::parse(&arguments).is_err());
+        let arguments = [
+            OsString::from("."),
+            OsString::from("--check"),
+            OsString::from("--bless"),
+        ];
+        assert!(Options::parse(&arguments).is_err());
     }
 }
