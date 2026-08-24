@@ -693,6 +693,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             qualify_qwen36_moe_experts(root)
         }
         Some("qualify-qwen36-gdn-input") if remaining.is_empty() => qualify_qwen36_gdn_input(root),
+        Some("qualify-qwen36-gdn-prepare") if remaining.is_empty() => {
+            qualify_qwen36_gdn_prepare(root)
+        }
+        Some("qualify-qwen36-gdn-recurrence") if remaining.is_empty() => {
+            qualify_qwen36_gdn_recurrence(root)
+        }
         Some("qualify-qwen35-bf16-lm-head") => qualify_qwen35_bf16_lm_head(root, &remaining),
         Some("qualify-qwen35-text-endpoint") => qualify_qwen35_text_endpoint(root, &remaining),
         Some("qualify-qwen35-resident-model") => qualify_qwen35_resident_model(root, &remaining),
@@ -778,6 +784,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-qwen36-moe-router") => bench_qwen36_moe_router(root, &remaining),
         Some("bench-qwen36-moe-experts") => bench_qwen36_moe_experts(root, &remaining),
         Some("bench-qwen36-gdn-input") => bench_qwen36_gdn_input(root, &remaining),
+        Some("bench-qwen36-gdn-prepare") => bench_qwen36_gdn_prepare(root, &remaining),
+        Some("bench-qwen36-gdn-recurrence") => bench_qwen36_gdn_recurrence(root, &remaining),
         Some("bench-qwen35-nvfp4-gdn-input") => bench_qwen35_nvfp4_gdn_input(root, &remaining),
         Some("bench-qwen35-gdn-prepare") => bench_qwen35_gdn_prepare(root, &remaining),
         Some("bench-qwen35-gdn-recurrence") => bench_qwen35_gdn_recurrence(root, &remaining),
@@ -905,6 +913,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-qwen35-residual-norm"
                     | "qualify-qwen36-residual-norm"
                     | "qualify-qwen36-gdn-input"
+                    | "qualify-qwen36-gdn-prepare"
+                    | "qualify-qwen36-gdn-recurrence"
                     | "qualify-qwen35-attention-qk-prepare"
                     | "qualify-qwen35-nvfp4-attention-output"
                     | "qualify-qwen35-gdn-prepare"
@@ -1544,6 +1554,58 @@ fn qualify_qwen36_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     gate_qwen36_gdn_input(root)
+}
+
+fn qualify_qwen36_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen35_gdn_prepare::tests::qwen36_exact_batches_match_shared_independent_oracle",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )?;
+    gate_qwen35_gdn_prepare(root)
+}
+
+fn qualify_qwen36_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen35_gdn_recurrence::tests::qwen36_exact_batches_match_shared_independent_oracle",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )?;
+    gate_qwen35_gdn_recurrence(root)
 }
 
 fn qualify_qwen35_bf16_lm_head(
@@ -3404,6 +3466,60 @@ fn bench_qwen36_gdn_input(
             .env(
                 "TUISKO_GENERATOR_BASELINE_SHA256",
                 sha256(&fs::read(root.join(QWEN36_GDN_INPUT_RESOURCE_BASELINE))?),
+            ),
+    )
+}
+
+fn bench_qwen36_gdn_prepare(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen36-gdn-prepare")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(root.join(QWEN35_GDN_PREPARE_RESOURCE_BASELINE))?),
+            ),
+    )
+}
+
+fn bench_qwen36_gdn_recurrence(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen36-gdn-recurrence")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(
+                    root.join(QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE),
+                )?),
             ),
     )
 }

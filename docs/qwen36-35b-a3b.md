@@ -104,7 +104,12 @@ remain a separate exact projection. Every `B=1..8` route passes 73,728 exact act
 444,672 FP64-formula output, 518,400 graph-replay, and 806,400 inactive-sentinel comparisons with
 immutable sources and no post-warmup device growth. Its complete three-node path measures
 12.443/33.309 us at B=1/8 and a locked 2,197 MHz SM clock. These are unblessed leaf diagnostics;
-composed layers, exact prefill expert routes, and model inference remain unimplemented.
+the next control/convolution and FP32 recurrence stages reuse the already qualified Qwen3.5 binary
+entries because both profiles have the exact same 32 control rows, 8,192 Q/K/V rows, 4,096 value
+rows, 16 Q/K heads, 32 value heads, width-128 state, and width-four history. Compile-time geometry
+assertions and separate Qwen3.6 oracle entry points make that reuse executable rather than
+conventional. Composed layers, exact prefill expert routes, and model inference remain
+unimplemented.
 
 ## Implementation order
 

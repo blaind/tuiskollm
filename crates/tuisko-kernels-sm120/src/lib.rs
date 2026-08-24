@@ -39,7 +39,7 @@ pub use fp8::{
 };
 pub use gdn::{
     GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp, Qwen35GdnPrepareOp,
-    Qwen35GdnRecurrenceOp,
+    Qwen35GdnRecurrenceOp, Qwen36GdnPrepareOp, Qwen36GdnRecurrenceOp,
 };
 pub use inventory::kernel_ptx_names;
 pub use mtp_bf16_attention_output::MtpBf16AttentionOutputOp;

@@ -3,7 +3,7 @@
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
-use tuisko_model::{Arch, Qwen35_9B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B};
 
 const MAX_BATCH: usize = 8;
 const KEY_HEADS: usize = Qwen35_9B::LINEAR_KEY_HEADS;
@@ -20,6 +20,11 @@ const _: () = assert!(KEY_HEADS == 16);
 const _: () = assert!(VALUE_HEADS == 32);
 const _: () = assert!(HEAD_DIM == 128);
 const _: () = assert!(VALUE_HEADS.is_multiple_of(KEY_HEADS));
+const _: () = assert!(Qwen36Moe35B::LINEAR_KEY_HEADS == KEY_HEADS);
+const _: () = assert!(Qwen36Moe35B::LINEAR_VALUE_HEADS == VALUE_HEADS);
+const _: () = assert!(Qwen36Moe35B::LINEAR_HEAD_DIM == HEAD_DIM);
+const _: () = assert!(Qwen36Moe35B::GDN_QK_ROWS == QK_WIDTH);
+const _: () = assert!(Qwen36Moe35B::GDN_VALUE_ROWS == VALUE_WIDTH);
 
 fn admitted_batch(batch: usize) -> bool {
     (1..=MAX_BATCH).contains(&batch)
@@ -246,7 +251,7 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
                 THREADS,
                 0,
             ))
-            .map_err(|source| GpuError::launch("preparing Qwen3.5 GDN recurrence", source))?;
+            .map_err(|source| GpuError::launch("preparing 2,048-wide GDN recurrence", source))?;
 
         Ok(Self { launch })
     }
@@ -278,7 +283,7 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
                 state,
                 output,
             )
-            .map_err(|source| GpuError::launch("launching Qwen3.5 GDN recurrence", source))
+            .map_err(|source| GpuError::launch("launching 2,048-wide GDN recurrence", source))
     }
 }
 
@@ -300,7 +305,7 @@ impl Qwen35GdnRecurrenceOp {
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
         let _ = qwen35_gdn_recurrence_ptx_names();
         let module = unsafe { kernels::load(context) }.map_err(|source| {
-            GpuError::module("loading the Qwen3.5 GDN recurrence module", source)
+            GpuError::module("loading the 2,048-wide GDN recurrence module", source)
         })?;
 
         Ok(Self {
@@ -341,7 +346,7 @@ impl Qwen35GdnRecurrenceOp {
     ) -> GpuResult<()> {
         if !admitted_batch(batch) {
             return Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 GDN recurrence batch {batch} is outside the exact range 1..={MAX_BATCH}"
+                "2,048-wide GDN recurrence batch {batch} is outside the exact range 1..={MAX_BATCH}"
             )));
         }
 
@@ -378,6 +383,13 @@ impl Qwen35GdnRecurrenceOp {
     }
 }
 
+/// Qwen3.6 uses the exact Qwen3.5 recurrent-state binary route.
+///
+/// Both profiles have 16 Q/K heads, 32 value heads, width-128 state heads,
+/// and the same Q/K/value/gate row mapping. Compile-time assertions above
+/// keep this alias tied to that complete arithmetic contract.
+pub type Qwen36GdnRecurrenceOp = Qwen35GdnRecurrenceOp;
+
 /// PTX symbols retained for every exact Qwen3.5 recurrence route.
 pub(crate) fn qwen35_gdn_recurrence_ptx_names() -> [&'static str; MAX_BATCH] {
     [
@@ -395,16 +407,22 @@ pub(crate) fn qwen35_gdn_recurrence_ptx_names() -> [&'static str; MAX_BATCH] {
 #[cfg(test)]
 mod tests {
     use super::{
-        HEAD_DIM, KEY_HEADS, MAX_BATCH, THREADS, VALUE_HEADS, admitted_batch,
-        qwen35_gdn_recurrence_ptx_names,
+        HEAD_DIM, KEY_HEADS, MAX_BATCH, QK_WIDTH, THREADS, VALUE_HEADS, VALUE_WIDTH,
+        admitted_batch, qwen35_gdn_recurrence_ptx_names,
     };
     use std::collections::BTreeSet;
+    use tuisko_model::{Arch, Qwen36Moe35B};
 
     #[test]
     fn geometry_routing_and_inventory_are_exact() {
         assert_eq!(THREADS, 512);
         assert_eq!(VALUE_HEADS / KEY_HEADS, 2);
         assert_eq!(VALUE_HEADS * HEAD_DIM * HEAD_DIM, 524_288);
+        assert_eq!(Qwen36Moe35B::LINEAR_KEY_HEADS, KEY_HEADS);
+        assert_eq!(Qwen36Moe35B::LINEAR_VALUE_HEADS, VALUE_HEADS);
+        assert_eq!(Qwen36Moe35B::LINEAR_HEAD_DIM, HEAD_DIM);
+        assert_eq!(Qwen36Moe35B::GDN_QK_ROWS, QK_WIDTH);
+        assert_eq!(Qwen36Moe35B::GDN_VALUE_ROWS, VALUE_WIDTH);
         for (batch, expected) in [(0, false), (1, true), (8, true), (9, false)] {
             assert_eq!(admitted_batch(batch), expected, "batch={batch}");
         }

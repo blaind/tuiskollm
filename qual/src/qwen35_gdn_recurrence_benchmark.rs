@@ -21,6 +21,49 @@ struct RouteGraphs {
     repeated: CudaGraph,
 }
 
+#[derive(Clone, Copy)]
+enum Target {
+    Qwen35,
+    Qwen36,
+}
+
+impl Target {
+    fn route(self) -> &'static str {
+        match self {
+            Self::Qwen35 => "qwen35_9b/gdn_recurrence/state_gate_norm",
+            Self::Qwen36 => "qwen36_35b_a3b/gdn_recurrence/state_gate_norm",
+        }
+    }
+
+    fn suite(self) -> &'static str {
+        match self {
+            Self::Qwen35 => "bench-qwen35-gdn-recurrence",
+            Self::Qwen36 => "bench-qwen36-gdn-recurrence",
+        }
+    }
+
+    fn weight(self) -> &'static str {
+        match self {
+            Self::Qwen35 => "qwen35_9b/gdn_recurrence/norm_weight",
+            Self::Qwen36 => "qwen36_35b_a3b/gdn_recurrence/norm_weight",
+        }
+    }
+
+    fn workspace(self) -> &'static str {
+        match self {
+            Self::Qwen35 => "qwen35_9b/gdn_recurrence/address_stable_state_workspace",
+            Self::Qwen36 => "qwen36_35b_a3b/gdn_recurrence/address_stable_state_workspace",
+        }
+    }
+
+    fn padding(self) -> &'static str {
+        match self {
+            Self::Qwen35 => "qwen35_9b/gdn_recurrence/alignment_padding",
+            Self::Qwen36 => "qwen36_35b_a3b/gdn_recurrence/alignment_padding",
+        }
+    }
+}
+
 struct Session {
     routes: Vec<RouteGraphs>,
     timer: GpuTimer,
@@ -74,12 +117,12 @@ impl Session {
         self.stream.synchronize().map_err(GpuError::from)
     }
 
-    fn cases(&self, repeated_operations: u64) -> Vec<ExactDeviceCase<'_>> {
+    fn cases(&self, target: Target, repeated_operations: u64) -> Vec<ExactDeviceCase<'_>> {
         self.routes
             .iter()
             .map(|route| {
                 ExactDeviceCase::new(
-                    "qwen35_9b/gdn_recurrence/state_gate_norm",
+                    target.route(),
                     format!("B={}", route.batch),
                     BenchmarkWorkload::warm_operator_decode(route.batch as u32),
                     OperationAccounting::new(
@@ -133,6 +176,20 @@ fn logical_bytes(batch: usize) -> usize {
 pub fn benchmark_qwen35_gdn_recurrence(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
+    benchmark(Target::Qwen35, options)
+}
+
+/// Measures Qwen3.6 through the shared exact-geometry recurrence routes.
+pub fn benchmark_qwen36_gdn_recurrence(
+    options: DeviceBenchmarkOptions,
+) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
+    benchmark(Target::Qwen36, options)
+}
+
+fn benchmark(
+    target: Target,
+    options: DeviceBenchmarkOptions,
+) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
     let baseline_sha256 = generator_baseline_sha256()?;
     let warmup_launches = warmup_launches(options)?;
     let preflight = preflight()?;
@@ -141,19 +198,19 @@ pub fn benchmark_qwen35_gdn_recurrence(
     let weight_bytes = session.regions.weight_bytes();
     let padding_bytes = session.arena.byte_len() - session.regions.payload_bytes();
     memory.register_owned(
-        "qwen35_9b/gdn_recurrence/norm_weight",
+        target.weight(),
         BenchmarkMemoryKind::Weights,
         weight_bytes,
         "one BF16 head-width norm vector",
     )?;
     memory.register_owned(
-        "qwen35_9b/gdn_recurrence/address_stable_state_workspace",
+        target.workspace(),
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes - padding_bytes,
         "eight FP32 state rows and exact-B workspace",
     )?;
     memory.register_owned(
-        "qwen35_9b/gdn_recurrence/alignment_padding",
+        target.padding(),
         BenchmarkMemoryKind::Other,
         padding_bytes,
         "256-byte arena region alignment",
@@ -162,14 +219,14 @@ pub fn benchmark_qwen35_gdn_recurrence(
     session.warm(warmup_launches)?;
     memory.capture("after_warmup")?;
     require_current_process_exclusive()?;
-    let cases = session.cases(options.launches_per_sample);
+    let cases = session.cases(target, options.launches_per_sample);
     let (metrics, energy_metrics, telemetry) =
         measure_cases(&session.stream, &session.timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
 
     finish_report(
         BenchmarkReportSpec {
-            suite: "bench-qwen35-gdn-recurrence",
+            suite: target.suite(),
             classification: "performance_sensitive_stateful_leaf",
             timing_scope: "paired Rust submission/completion, production graph, and repeated-operation graph",
         },

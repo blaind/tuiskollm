@@ -68,6 +68,12 @@ pub struct Qwen35GdnPrepareQualification {
     pub maximum_convolution_error: f32,
 }
 
+/// Qwen3.6 qualification report for the shared exact-geometry route.
+pub type Qwen36GdnPrepareQualification = Qwen35GdnPrepareQualification;
+
+/// Qwen3.6 qualification failure for the shared exact-geometry route.
+pub type Qwen36GdnPrepareQualificationError = Qwen35GdnPrepareQualificationError;
+
 #[derive(Clone, Copy)]
 pub(crate) struct Regions {
     pub(crate) projected_controls: ArenaRegion<u16>,
@@ -178,6 +184,15 @@ pub fn qualify_qwen35_gdn_prepare()
     device_benchmark::require_current_process_exclusive()?;
 
     Ok(report)
+}
+
+/// Qualifies Qwen3.6 with the same binary and independent state-transition oracle.
+///
+/// Kernel compile-time assertions bind both architecture profiles to the exact
+/// 32-control, 8,192-QKV, width-four-history contract.
+pub fn qualify_qwen36_gdn_prepare()
+-> Result<Qwen36GdnPrepareQualification, Qwen36GdnPrepareQualificationError> {
+    qualify_qwen35_gdn_prepare()
 }
 
 pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
@@ -611,6 +626,22 @@ mod tests {
         assert_eq!(report.weight_bytes, 65_664);
         assert_eq!(report.workspace_bytes, 725_024);
         assert_eq!(report.padding_bytes, 608);
+        assert!(report.maximum_control_error <= 0.002);
+        assert!(report.maximum_convolution_error <= 0.002);
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
+    fn qwen36_exact_batches_match_shared_independent_oracle()
+    -> Result<(), Qwen36GdnPrepareQualificationError> {
+        let report = qualify_qwen36_gdn_prepare()?;
+
+        assert_eq!(report.control_values, 2_304);
+        assert_eq!(report.convolution_values, 294_912);
+        assert_eq!(report.arena_bytes, 791_296);
+        assert_eq!(report.weight_bytes, 65_664);
         assert!(report.maximum_control_error <= 0.002);
         assert!(report.maximum_convolution_error <= 0.002);
 
