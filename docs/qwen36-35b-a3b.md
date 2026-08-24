@@ -190,6 +190,11 @@ second. Production-graph and repeated complete-path medians agree within 0.01%, 
 region has zero device-memory growth. Native prompt graphs will be reconciled with the
 resident-prefill stack after that stack lands.
 
+The text frontend separately admits the snapshot's 248,070-entry tokenizer, Qwen3.6 chat template,
+ordered stop IDs `[248046, 248044]`, and sampled defaults `temperature=1`, `top_p=0.95`, and
+`top_k=20`. Thinking and no-thinking `Hello` prompts match the retained Transformers 5.2.0 token
+fixtures exactly; this contract is not aliased to Qwen3.5 even though their tokenizer files match.
+
 ## Implementation order
 
 1. Add the pinned architecture profile and validate both `config.json` and
