@@ -1337,6 +1337,127 @@ impl<'a> Qwen36GdnBindings<'a> {
     }
 }
 
+/// Complete scalar-scaled FP8/BF16 source family for one Qwen3.6 full-attention layer.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen36FullAttentionBindings<'a> {
+    /// Query-plus-gate FP8 projection `[attention_query_rows, hidden]`.
+    pub query_gate: Qwen36Fp8LinearBindings<'a>,
+    /// Key FP8 projection `[attention_kv_rows, hidden]`.
+    pub key: Qwen36Fp8LinearBindings<'a>,
+    /// Value FP8 projection `[attention_kv_rows, hidden]`.
+    pub value: Qwen36Fp8LinearBindings<'a>,
+    /// Gated attention-output FP8 projection `[hidden, attention_output_columns]`.
+    pub output: Qwen36Fp8LinearBindings<'a>,
+    /// Per-head query RMSNorm weights `[head_dim]`.
+    pub query_norm: Bf16View<'a, 1>,
+    /// Per-head key RMSNorm weights `[head_dim]`.
+    pub key_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before attention `[hidden]`.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the MoE boundary `[hidden]`.
+    pub post_attention_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning these sources.
+    pub layer: usize,
+}
+
+impl<'a> Qwen36FullAttentionBindings<'a> {
+    /// Binds one exact Qwen3.6 scalar-scaled FP8 full-attention source family.
+    pub fn bind(
+        snapshot: &'a CheckpointSnapshot<Qwen36Moe35B>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from(
+            layer,
+            Qwen36Moe35B::LAYERS,
+            Qwen36Moe35B::FULL_ATTENTION_INTERVAL,
+            Qwen36Moe35B::HIDDEN,
+            Qwen36Moe35B::ATTENTION_QUERY_ROWS,
+            Qwen36Moe35B::ATTENTION_KV_ROWS,
+            Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS,
+            Qwen36Moe35B::HEAD_DIM,
+            |name| snapshot.tensor(name),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_from(
+        layer: usize,
+        layer_count: usize,
+        full_attention_interval: usize,
+        hidden: usize,
+        query_rows: usize,
+        kv_rows: usize,
+        output_columns: usize,
+        head_dim: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        require_full_attention_layer(layer, layer_count, full_attention_interval)?;
+
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let prefix = format!("{layer_prefix}.self_attn");
+        let query_gate = Qwen36Fp8LinearBindings::bind_from(
+            &format!("{prefix}.q_proj"),
+            query_rows,
+            hidden,
+            |name| tensor(name),
+        )?;
+        let key = Qwen36Fp8LinearBindings::bind_from(
+            &format!("{prefix}.k_proj"),
+            kv_rows,
+            hidden,
+            |name| tensor(name),
+        )?;
+        let value = Qwen36Fp8LinearBindings::bind_from(
+            &format!("{prefix}.v_proj"),
+            kv_rows,
+            hidden,
+            |name| tensor(name),
+        )?;
+
+        require_same_rank_zero_f32(
+            layer,
+            "Q/K input_scale",
+            &query_gate.input_scale,
+            &key.input_scale,
+        )?;
+        require_same_rank_zero_f32(
+            layer,
+            "Q/V input_scale",
+            &query_gate.input_scale,
+            &value.input_scale,
+        )?;
+
+        Ok(Self {
+            query_gate,
+            key,
+            value,
+            output: Qwen36Fp8LinearBindings::bind_from(
+                &format!("{prefix}.o_proj"),
+                hidden,
+                output_columns,
+                |name| tensor(name),
+            )?,
+            query_norm: Bf16View::bind(
+                tensor(&format!("{prefix}.q_norm.weight"))?,
+                [head_dim as u64],
+            )?,
+            key_norm: Bf16View::bind(
+                tensor(&format!("{prefix}.k_norm.weight"))?,
+                [head_dim as u64],
+            )?,
+            input_norm: Bf16View::bind(
+                tensor(&format!("{layer_prefix}.input_layernorm.weight"))?,
+                [hidden as u64],
+            )?,
+            post_attention_norm: Bf16View::bind(
+                tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+                [hidden as u64],
+            )?,
+            layer,
+        })
+    }
+}
+
 fn modelopt_nvfp4_next_norm_name<A: Arch>(layer: usize) -> CheckpointResult<String> {
     require_modelopt_nvfp4_mlp_layer::<A>(layer)?;
     let next_layer = layer
@@ -2109,11 +2230,11 @@ mod tests {
         DenseFp8MlpBindings, E2M1_VALUES_PER_BYTE, FullAttentionPostBindings,
         FullAttentionQkvBindings, GdnBindings, ModelOptNvfp4AttentionBindings,
         ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings, MtpBindings, NVFP4_GROUP_SIZE,
-        Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings, Qwen36GdnBindings,
-        Qwen36MoeLayerBindings, TextEndpointBindings, VisionBindings, dense_fp8_next_norm_name,
-        positive_bf16, qwen36_next_norm_name, require_adjacent, require_dense_fp8_mlp_layer,
-        require_full_attention_layer, require_gdn_layer, require_mtp_contract,
-        require_nvfp4_mlp_layer, validate_nvfp4_scales,
+        Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings, Qwen36FullAttentionBindings,
+        Qwen36GdnBindings, Qwen36MoeLayerBindings, TextEndpointBindings, VisionBindings,
+        dense_fp8_next_norm_name, positive_bf16, qwen36_next_norm_name, require_adjacent,
+        require_dense_fp8_mlp_layer, require_full_attention_layer, require_gdn_layer,
+        require_mtp_contract, require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
     use crate::{
         Arch, CheckpointContract, CheckpointErrorCode, CheckpointResult, CheckpointSnapshot, DType,
@@ -2558,6 +2679,62 @@ mod tests {
             (format!("{prefix}.A_log"), vec![CONTROL_ROWS]),
             (format!("{prefix}.dt_bias"), vec![CONTROL_ROWS]),
             (format!("{prefix}.norm.weight"), vec![HEAD_DIM]),
+            (
+                format!("{layer_prefix}.input_layernorm.weight"),
+                vec![HIDDEN],
+            ),
+            (
+                format!("{layer_prefix}.post_attention_layernorm.weight"),
+                vec![HIDDEN],
+            ),
+        ] {
+            append_bf16_tensor(&mut header, &mut payload, name, shape);
+        }
+
+        (Value::Object(header), payload)
+    }
+
+    fn qwen36_attention_fixture(layer: usize) -> (Value, Vec<u8>) {
+        const HIDDEN: usize = 32;
+        const QUERY_ROWS: usize = 16;
+        const KV_ROWS: usize = 4;
+        const OUTPUT_COLUMNS: usize = 8;
+        const HEAD_DIM: usize = 4;
+
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let prefix = format!("{layer_prefix}.self_attn");
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+
+        for (projection, rows, columns, weight_scale, marker) in [
+            ("q_proj", QUERY_ROWS, HIDDEN, 0.125, 0x10),
+            ("k_proj", KV_ROWS, HIDDEN, 0.0625, 0x20),
+            ("v_proj", KV_ROWS, HIDDEN, 0.03125, 0x30),
+        ] {
+            append_qwen36_fp8_linear(
+                &mut header,
+                &mut payload,
+                &format!("{prefix}.{projection}"),
+                rows,
+                columns,
+                0.25,
+                weight_scale,
+                marker,
+            );
+        }
+        append_qwen36_fp8_linear(
+            &mut header,
+            &mut payload,
+            &format!("{prefix}.o_proj"),
+            HIDDEN,
+            OUTPUT_COLUMNS,
+            0.5,
+            0.015625,
+            0x40,
+        );
+        for (name, shape) in [
+            (format!("{prefix}.q_norm.weight"), vec![HEAD_DIM]),
+            (format!("{prefix}.k_norm.weight"), vec![HEAD_DIM]),
             (
                 format!("{layer_prefix}.input_layernorm.weight"),
                 vec![HIDDEN],
@@ -3565,6 +3742,107 @@ mod tests {
         }
 
         assert_eq!(bound, 30);
+    }
+
+    #[test]
+    fn binds_exact_qwen36_full_attention_source_family() {
+        let path = fixture_path("qwen36-attention");
+        let (header, payload) = qwen36_attention_fixture(1);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let bindings = Qwen36FullAttentionBindings::bind_from(1, 2, 2, 32, 16, 4, 8, 4, |name| {
+            file.tensor(name)
+        })
+        .unwrap();
+
+        assert_eq!(bindings.query_gate.weight.shape(), &[16, 32]);
+        assert_eq!(bindings.query_gate.weight.codes()[0], 0x10);
+        assert_eq!(bindings.query_gate.input_scale.value(0), Some(0.25));
+        assert_eq!(bindings.query_gate.weight_scale.value(0), Some(0.125));
+        assert_eq!(bindings.key.weight.shape(), &[4, 32]);
+        assert_eq!(bindings.key.weight.codes()[0], 0x20);
+        assert_eq!(bindings.value.weight.shape(), &[4, 32]);
+        assert_eq!(bindings.value.weight.codes()[0], 0x30);
+        assert_eq!(bindings.output.weight.shape(), &[32, 8]);
+        assert_eq!(bindings.output.weight.codes()[0], 0x40);
+        assert_eq!(bindings.output.input_scale.value(0), Some(0.5));
+        assert_eq!(bindings.query_norm.shape(), &[4]);
+        assert_eq!(bindings.key_norm.shape(), &[4]);
+        assert_eq!(bindings.input_norm.shape(), &[32]);
+        assert_eq!(bindings.post_attention_norm.shape(), &[32]);
+        assert_eq!(bindings.layer, 1);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_qwen36_full_attention_route_shape_and_scale_drift() {
+        let error = Qwen36FullAttentionBindings::bind_from(0, 2, 2, 32, 16, 4, 8, 4, |_| {
+            panic!("the route check must reject before tensor lookup")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("full-attention source contract"));
+
+        let path = fixture_path("qwen36-attention-shape");
+        let (mut header, payload) = qwen36_attention_fixture(1);
+        header["model.language_model.layers.1.self_attn.q_norm.weight"]["shape"] = json!([2, 2]);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let error = Qwen36FullAttentionBindings::bind_from(1, 2, 2, 32, 16, 4, 8, 4, |name| {
+            file.tensor(name)
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("q_norm.weight"));
+        fs::remove_file(path).unwrap();
+
+        let path = fixture_path("qwen36-attention-scale");
+        let (header, mut payload) = qwen36_attention_fixture(1);
+        let name = "model.language_model.layers.1.self_attn.k_proj.input_scale";
+        let offset = tensor_offset(&header, name);
+        payload[offset..offset + 4].copy_from_slice(&0.5f32.to_le_bytes());
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let error = Qwen36FullAttentionBindings::bind_from(1, 2, 2, 32, 16, 4, 8, 4, |name| {
+            file.tensor(name)
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("Q/K input_scale values differ"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN36_SNAPSHOT with the exact pinned snapshot"]
+    fn binds_all_real_qwen36_full_attention_layers() {
+        let root = std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+            .expect("TUISKO_QWEN36_SNAPSHOT must name the exact pinned snapshot");
+        let snapshot = CheckpointSnapshot::<Qwen36Moe35B>::open(Path::new(&root)).unwrap();
+        let mut bound = 0;
+
+        for layer in 0..Qwen36Moe35B::LAYERS {
+            if !(layer + 1).is_multiple_of(Qwen36Moe35B::FULL_ATTENTION_INTERVAL) {
+                continue;
+            }
+
+            let bindings = Qwen36FullAttentionBindings::bind(&snapshot, layer).unwrap();
+
+            assert_eq!(bindings.query_gate.weight.shape(), &[8_192, 2_048]);
+            assert_eq!(bindings.key.weight.shape(), &[512, 2_048]);
+            assert_eq!(bindings.value.weight.shape(), &[512, 2_048]);
+            assert_eq!(bindings.output.weight.shape(), &[2_048, 4_096]);
+            assert_eq!(bindings.query_norm.shape(), &[256]);
+            assert_eq!(bindings.key_norm.shape(), &[256]);
+            assert_eq!(bindings.input_norm.shape(), &[2_048]);
+            assert_eq!(bindings.post_attention_norm.shape(), &[2_048]);
+            assert_eq!(bindings.layer, layer);
+            bound += 1;
+        }
+
+        assert_eq!(bound, 10);
     }
 
     #[test]
