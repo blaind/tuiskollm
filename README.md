@@ -136,6 +136,7 @@ cargo run -p xtask -- qualify-mtp-bf16-qkv SNAPSHOT
 cargo run -p xtask -- qualify-mtp-bf16-qk-prepare SNAPSHOT
 cargo run -p xtask -- qualify-mtp-bf16-paged-gqa
 cargo run -p xtask -- qualify-mtp-bf16-attention-output SNAPSHOT
+cargo run -p xtask -- qualify-mtp-bf16-mlp SNAPSHOT
 cargo run -p xtask -- qualify-resident-model SNAPSHOT
 cargo run -p xtask -- bench-resident-prefill SNAPSHOT
 cargo run -p xtask -- bench-resident-long-context-model SNAPSHOT
