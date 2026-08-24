@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
     MAX_BATCH, ResidentDecodeRoute, ResidentEmbeddingStageGraph, ResidentLayerKind,
-    ResidentModelLayout, ResidentModelProgram, ResidentPrefillRoute,
+    ResidentModelLayout, ResidentModelProgram, ResidentPrefillRoute, ResidentPrefillStageGraph,
 };
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuTimer, profiler_start, profiler_stop};
 use tuisko_kernels_sm120::{LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE};
@@ -22,7 +22,17 @@ const CONTEXT_TOKENS: usize = CACHE_POSITION as usize + 1;
 const LONG_CONTEXT_TOKENS: usize = 131_073;
 const ROTARY_PAIRS: usize = 32;
 const LONG_ROUTE_SLOTS: [usize; MAX_BATCH] = [7, 0, 6, 1, 5, 2, 4, 3];
-const PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1_024];
+const PREFILL_CASES: [(usize, usize); 9] = [
+    (32, 0),
+    (64, 0),
+    (128, 0),
+    (1_024, 0),
+    (32, 160),
+    (64, 192),
+    (128, 1),
+    (128, 32_768),
+    (1_024, 1_024),
+];
 
 #[derive(Clone, Copy)]
 enum BenchmarkProfile {
@@ -84,7 +94,7 @@ struct Session {
 struct PrefillSession {
     timer: GpuTimer,
     program: ResidentModelProgram,
-    routes: [ResidentPrefillRoute; 4],
+    routes: [ResidentPrefillRoute; PREFILL_CASES.len()],
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
 }
@@ -103,24 +113,30 @@ impl PrefillSession {
         let stream = context.new_stream().map_err(GpuError::from)?;
         let mut program = ResidentModelProgram::from_snapshot(&context, snapshot)?;
         program.activate_kv_slot(0)?;
-        let update = program.reserve_kv_slot_tokens(&stream, 0, 1_024)?;
-        if update.first_entry() != 0 || update.entry_count() != 16 {
+        let maximum_context = PREFILL_CASES
+            .iter()
+            .map(|&(tokens, first_position)| tokens + first_position)
+            .max()
+            .expect("prefill benchmark inventory is nonempty");
+        let update = program.reserve_kv_slot_tokens(&stream, 0, maximum_context)?;
+        if update.first_entry() != 0 || update.entry_count() != 514 {
             return Err(DeviceBenchmarkError::Precondition(format!(
-                "resident prefill benchmark reserved {update:?}, expected pages 0..16"
+                "resident prefill benchmark reserved {update:?}, expected pages 0..514"
             )));
         }
         program.stage_embeddings(&stream, &prefill_token_ids())?;
         program.reset_state(&stream)?;
-        let (rope_cos, rope_sin) = prefill_rope(1_024);
-        let routes = PREFILL_ROUTES
+        let routes = PREFILL_CASES
             .into_iter()
-            .map(|tokens| {
-                program.load_prefill_state(
+            .map(|(tokens, first_position)| {
+                let (rope_cos, rope_sin) = prefill_rope_at(first_position, tokens);
+                program.load_prefill_tile_state(
                     &stream,
                     tokens,
                     0,
-                    &rope_cos[..tokens * ROTARY_PAIRS],
-                    &rope_sin[..tokens * ROTARY_PAIRS],
+                    first_position,
+                    &rope_cos,
+                    &rope_sin,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -140,32 +156,38 @@ impl PrefillSession {
         })
     }
 
-    fn embedding_graphs(
+    fn stage_graphs(
         &self,
-    ) -> Result<[ResidentEmbeddingStageGraph<'_>; 4], DeviceBenchmarkError> {
-        PREFILL_ROUTES
+    ) -> Result<[ResidentPrefillStageGraph<'_>; PREFILL_CASES.len()], DeviceBenchmarkError> {
+        self.routes
             .into_iter()
-            .map(|tokens| {
-                self.program
-                    .qualification_embedding_stage_graph(&self.stream, tokens)
+            .map(|route| {
+                let (rope_cos, rope_sin) = prefill_rope_at(route.first_position(), route.tokens());
+                self.program.qualification_prefill_stage_graph(
+                    &self.stream,
+                    route,
+                    0,
+                    &rope_cos,
+                    &rope_sin,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .map_err(|_| {
                 DeviceBenchmarkError::Precondition(
-                    "resident prefill embedding graph inventory has wrong cardinality".to_string(),
+                    "resident prefill stage graph inventory has wrong cardinality".to_string(),
                 )
             })
     }
 
     fn warm(
         &self,
-        embedding_graphs: &[ResidentEmbeddingStageGraph<'_>; 4],
+        stage_graphs: &[ResidentPrefillStageGraph<'_>; PREFILL_CASES.len()],
         launches: u64,
     ) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
             for (index, route) in self.routes.iter().copied().enumerate() {
-                embedding_graphs[index].graph().launch(&self.stream)?;
+                stage_graphs[index].graph().launch(&self.stream)?;
                 self.program
                     .qualification_prefill_graph(route)?
                     .launch(&self.stream)?;
@@ -177,7 +199,7 @@ impl PrefillSession {
 
     fn cases<'a>(
         &'a self,
-        embedding_graphs: &'a [ResidentEmbeddingStageGraph<'a>; 4],
+        stage_graphs: &'a [ResidentPrefillStageGraph<'a>; PREFILL_CASES.len()],
     ) -> Result<Vec<ExactDeviceCase<'a>>, DeviceBenchmarkError> {
         self.routes
             .iter()
@@ -185,15 +207,31 @@ impl PrefillSession {
             .enumerate()
             .map(|(index, route)| {
                 let tokens = route.tokens();
+                let first_position = route.first_position();
+                let context_tokens = route.context_tokens();
+                let attention = match route.partition_capacity() {
+                    None => "shared".to_string(),
+                    Some(partitions) if tokens == 1_024 => format!("macro-p{partitions}"),
+                    Some(partitions) => format!("partitioned-p{partitions}"),
+                };
                 Ok(ExactDeviceCase::new(
                     "resident_model/text_prefill",
-                    format!("T={tokens}"),
-                    BenchmarkWorkload::warm_model_prefill(tokens as u64),
-                    OperationAccounting::new(prefill_logical_bytes(tokens), tokens as u64, "token"),
+                    format!(
+                        "T={tokens},first={first_position},context={context_tokens},{attention}"
+                    ),
+                    BenchmarkWorkload::warm_model_prefill_tail(
+                        tokens as u64,
+                        context_tokens as u64,
+                    ),
+                    OperationAccounting::new(
+                        prefill_logical_bytes(tokens, first_position, route.partition_capacity()),
+                        tokens as u64,
+                        "token",
+                    ),
                     self.program.qualification_prefill_graph(route)?,
                     None,
                 )
-                .with_preparation(embedding_graphs[index].graph()))
+                .with_preparation(stage_graphs[index].graph()))
             })
             .collect()
     }
@@ -365,13 +403,13 @@ fn benchmark_rope(positions: &[u32; MAX_BATCH]) -> (Vec<f32>, Vec<f32>) {
     (cosine, sine)
 }
 
-fn prefill_rope(tokens: usize) -> (Vec<f32>, Vec<f32>) {
+fn prefill_rope_at(first_position: usize, tokens: usize) -> (Vec<f32>, Vec<f32>) {
     let mut cosine = vec![0.0; tokens * ROTARY_PAIRS];
     let mut sine = vec![0.0; tokens * ROTARY_PAIRS];
     for token in 0..tokens {
         for pair in 0..ROTARY_PAIRS {
             let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
-            let angle = token as f64 * frequency;
+            let angle = (first_position + token) as f64 * frequency;
             let (sin, cos) = angle.sin_cos();
             cosine[token * ROTARY_PAIRS + pair] = cos as f32;
             sine[token * ROTARY_PAIRS + pair] = sin as f32;
@@ -418,7 +456,7 @@ fn short_gqa_bytes(batch: usize) -> usize {
     batch * (query + cache + metadata + output)
 }
 
-fn prefill_logical_bytes(tokens: usize) -> usize {
+fn prefill_logical_bytes(tokens: usize, first_position: usize, partitions: Option<usize>) -> usize {
     let hidden = Qwen38_27B::HIDDEN;
     let intermediate = Qwen38_27B::INTERMEDIATE;
     let vocab = Qwen38_27B::VOCAB;
@@ -437,24 +475,27 @@ fn prefill_logical_bytes(tokens: usize) -> usize {
         - 56 * (dense_mlp - nvfp4_mlp)
         - 64 * 6 * hidden
         - 16 * short_gqa_per_row;
-    resident_weights + tokens * common_per_row + 16 * prefill_gqa_bytes(tokens) + endpoint
+    resident_weights
+        + tokens * common_per_row
+        + 16 * prefill_gqa_bytes(tokens, first_position, partitions)
+        + endpoint
 }
 
-fn prefill_gqa_bytes(tokens: usize) -> usize {
+fn prefill_gqa_bytes(tokens: usize, first_position: usize, partitions: Option<usize>) -> usize {
     let attention = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
     let heads = Qwen38_27B::NUM_ATTENTION_HEADS;
-    let causal_pairs = tokens * (tokens + 1) / 2;
+    let causal_pairs = tokens * (2 * first_position + tokens + 1) / 2;
     let query = tokens * attention * size_of::<f32>();
     let cache = 2 * attention * causal_pairs;
     let metadata = 2 * tokens * size_of::<u32>() + heads * causal_pairs * size_of::<u32>();
     let output = tokens * attention * size_of::<f32>();
-    let macro_partials = if tokens == 1_024 {
-        let values = tokens * heads * 4 * (Qwen38_27B::HEAD_DIM + 2);
+    let partials = if let Some(partitions) = partitions {
+        let values = tokens * heads * partitions * (Qwen38_27B::HEAD_DIM + 2);
         2 * values * size_of::<f32>()
     } else {
         0
     };
-    query + cache + metadata + output + macro_partials
+    query + cache + metadata + output + partials
 }
 
 fn long_gqa_bytes(context_lengths: &[usize]) -> usize {
@@ -696,7 +737,7 @@ pub fn benchmark_resident_model(
     )
 }
 
-/// Measures every exact from-empty resident prompt graph directly.
+/// Measures every exact resident prompt graph and admitted context band directly.
 pub fn benchmark_resident_prefill(
     root: &Path,
     options: DeviceBenchmarkOptions,
@@ -706,7 +747,7 @@ pub fn benchmark_resident_prefill(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = PrefillSession::new(root)?;
-    let embedding_graphs = session.embedding_graphs()?;
+    let stage_graphs = session.stage_graphs()?;
     for (name, kind, bytes, description) in [
         (
             "resident_prefill/resident_weights",
@@ -760,10 +801,10 @@ pub fn benchmark_resident_prefill(
         memory.register_owned(name, kind, bytes, description)?;
     }
     memory.capture("after_setup")?;
-    session.warm(&embedding_graphs, warmup_launches)?;
+    session.warm(&stage_graphs, warmup_launches)?;
     memory.capture("after_warmup")?;
     require_current_process_exclusive()?;
-    let cases = session.cases(&embedding_graphs)?;
+    let cases = session.cases(&stage_graphs)?;
     let (metrics, energy_metrics, telemetry) =
         measure_cases(&session.stream, &session.timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
@@ -938,10 +979,18 @@ mod tests {
 
     #[test]
     fn prefill_accounting_tracks_every_exact_causal_route() {
-        let routes = [32, 64, 128, 1_024].map(prefill_logical_bytes);
+        let routes = [
+            prefill_logical_bytes(32, 0, None),
+            prefill_logical_bytes(64, 0, None),
+            prefill_logical_bytes(128, 0, None),
+            prefill_logical_bytes(1_024, 0, Some(4)),
+        ];
         assert!(routes.windows(2).all(|pair| pair[1] > pair[0]));
         let weights = 19_103_682_560usize;
         assert!(routes[3] - weights > 8 * (routes[2] - weights));
+        assert!(
+            prefill_logical_bytes(128, 32_768, Some(16)) > prefill_logical_bytes(128, 1, Some(8))
+        );
     }
 
     #[test]

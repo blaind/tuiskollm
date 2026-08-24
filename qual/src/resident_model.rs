@@ -28,6 +28,13 @@ const TABLE_STRIDE: usize = 3;
 const LONG_ROUTE_LENGTHS: [usize; 6] = [193, 1_025, 4_097, 16_385, 65_537, 131_073];
 const LONG_ORACLE_DIMENSIONS: [usize; 8] = [0, 31, 32, 127, 128, 223, 224, 255];
 const PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1_024];
+const PREFILL_TAIL_ROUTES: [(usize, usize, Option<usize>); 5] = [
+    (32, 160, None),
+    (64, 192, None),
+    (128, 1, Some(8)),
+    (128, 32_768, Some(16)),
+    (1_024, 1_024, Some(4)),
+];
 const SELECTED_LOGIT_ROWS: [usize; 5] = [0, 1, 31_337, 131_071, Qwen38_27B::VOCAB - 1];
 
 /// Failure of the complete source-backed resident-model gate.
@@ -67,7 +74,7 @@ pub struct ResidentModelQualification {
     pub long_route_cases: usize,
     /// Independent long-attention seam values checked.
     pub long_oracle_values: usize,
-    /// Exact from-empty prompt routes checked eagerly and through CUDA Graph replay.
+    /// Exact from-empty and nonzero-prefix prompt routes checked eagerly and by graph replay.
     pub prefill_route_cases: usize,
     /// Largest absolute difference from a BF16 or FP64 oracle.
     pub maximum_absolute_error: f32,
@@ -169,6 +176,18 @@ fn qualify_resident_model_with_mode(
         &stable_route_addresses,
         &mut report,
     )?;
+    verify_prefill_tail_routes(
+        &mut program,
+        &stream,
+        &final_norm,
+        lm_head_codes,
+        &lm_head_scales,
+        stable_base,
+        stable_kv_base,
+        &stable_addresses,
+        &stable_route_addresses,
+        &mut report,
+    )?;
     verify_slot_reset(&mut program, &stream, &mut report)?;
     report.slot_control_values += verify_block_tables(&program, &stream)?;
     report.slot_control_values += verify_dynamic_page_routes(&mut program, &stream)?;
@@ -245,7 +264,7 @@ fn verify_prefill_routes(
             &replay,
             report,
         )?;
-        verify_prefill_inactive(tokens, &replay, report)?;
+        verify_prefill_inactive(replay_route, &replay, report)?;
         report.graph_replay_values += replay_pages
             .iter()
             .map(|(key, value)| key.len() + value.len())
@@ -294,6 +313,96 @@ fn verify_prefill_routes(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn verify_prefill_tail_routes(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+    final_norm: &[u16],
+    lm_head_codes: &[u8],
+    lm_head_scales: &[u16],
+    stable_base: u64,
+    stable_kv_base: u64,
+    stable_addresses: &[usize],
+    stable_route_addresses: &[usize; 2],
+    report: &mut ResidentModelQualification,
+) -> Result<(), ResidentModelQualificationError> {
+    let maximum_context = PREFILL_TAIL_ROUTES
+        .iter()
+        .map(|&(tokens, first_position, _)| first_position + tokens)
+        .max()
+        .expect("tail route inventory is nonempty");
+    program.reserve_kv_slot_tokens(stream, 0, maximum_context)?;
+
+    for (tokens, first_position, expected_partitions) in PREFILL_TAIL_ROUTES {
+        let eager_route = prepare_prefill_tail_run(program, stream, tokens, first_position, 0)?;
+        if eager_route.tokens() != tokens
+            || eager_route.first_position() != first_position
+            || eager_route.context_tokens() != first_position + tokens
+            || eager_route.partition_capacity() != expected_partitions
+        {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "T={tokens} first={first_position} selected an incorrect tail route"
+            )));
+        }
+        program.launch_prefill_eager(stream, eager_route)?;
+        let eager = program.qualification_observables(stream)?;
+        let eager_pages =
+            read_prefill_tail_cache_pages(program, stream, 0, first_position, tokens)?;
+
+        let replay_route = prepare_prefill_tail_run(program, stream, tokens, first_position, 0)?;
+        if replay_route != eager_route {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "T={tokens} first={first_position} eager and replay tail routes differ"
+            )));
+        }
+        program.replay_prefill(stream, replay_route)?;
+        let replay = program.qualification_observables(stream)?;
+        let replay_pages =
+            read_prefill_tail_cache_pages(program, stream, 0, first_position, tokens)?;
+
+        verify_replay(tokens, &eager, &replay, report)?;
+        if replay_pages != eager_pages {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "T={tokens} first={first_position} represented cache tail differs under graph replay"
+            )));
+        }
+        if replay_pages.last().is_none_or(|(key, value)| {
+            key.iter().all(|&code| code == 0) || value.iter().all(|&code| code == 0)
+        }) {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "T={tokens} first={first_position} did not publish its represented cache tail"
+            )));
+        }
+        verify_prefill_final_oracle(
+            tokens,
+            final_norm,
+            lm_head_codes,
+            lm_head_scales,
+            &replay,
+            report,
+        )?;
+        verify_prefill_inactive(replay_route, &replay, report)?;
+        report.graph_replay_values += replay_pages
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>();
+        report.prefill_route_cases += 1;
+
+        if program.base_address() != stable_base
+            || program.kv_base_address() != stable_kv_base
+            || program.qualification_addresses() != stable_addresses
+            || program.qualification_kv_route_addresses() != *stable_route_addresses
+        {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "owner addresses changed while qualifying T={tokens} first={first_position}"
+            )));
+        }
+    }
+
+    program.truncate_kv_slot_tokens(stream, 0, 192)?;
+    Ok(())
+}
+
 fn prepare_prefill_run(
     program: &mut ResidentModelProgram,
     stream: &CudaStream,
@@ -310,13 +419,41 @@ fn prepare_prefill_run(
     Ok(program.load_prefill_state(stream, tokens, slot, &rope_cos, &rope_sin)?)
 }
 
+fn prepare_prefill_tail_run(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+    tokens: usize,
+    first_position: usize,
+    slot: usize,
+) -> Result<ResidentPrefillRoute, ResidentModelQualificationError> {
+    program.reset_state(stream)?;
+    program.qualification_reset_workspace(stream, SENTINEL)?;
+    let token_ids = (0..tokens)
+        .map(|token| 100u32 + ((first_position + token) % 251) as u32)
+        .collect::<Vec<_>>();
+    program.stage_embeddings(stream, &token_ids)?;
+    let (rope_cos, rope_sin) = prefill_rope_at(first_position, tokens);
+    Ok(program.load_prefill_tile_state(
+        stream,
+        tokens,
+        slot,
+        first_position,
+        &rope_cos,
+        &rope_sin,
+    )?)
+}
+
 fn prefill_rope(tokens: usize) -> (Vec<f32>, Vec<f32>) {
+    prefill_rope_at(0, tokens)
+}
+
+fn prefill_rope_at(first_position: usize, tokens: usize) -> (Vec<f32>, Vec<f32>) {
     let mut cosine = vec![0.0; tokens * ROTARY_PAIRS];
     let mut sine = vec![0.0; tokens * ROTARY_PAIRS];
     for token in 0..tokens {
         for pair in 0..ROTARY_PAIRS {
             let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
-            let angle = token as f64 * frequency;
+            let angle = (first_position + token) as f64 * frequency;
             let (sin, cos) = angle.sin_cos();
             cosine[token * ROTARY_PAIRS + pair] = cos as f32;
             sine[token * ROTARY_PAIRS + pair] = sin as f32;
@@ -340,6 +477,30 @@ fn read_prefill_cache_pages(
                         "resident prefill physical page exceeds host width".to_string(),
                     )
                 })?;
+            Ok(program.qualification_cache_page(stream, physical)?)
+        })
+        .collect()
+}
+
+fn read_prefill_tail_cache_pages(
+    program: &ResidentModelProgram,
+    stream: &CudaStream,
+    slot: usize,
+    first_position: usize,
+    tokens: usize,
+) -> Result<CachePages, ResidentModelQualificationError> {
+    let first_page = first_position / ATTENTION_PAGE_SIZE;
+    let final_page = (first_position + tokens).div_ceil(ATTENTION_PAGE_SIZE);
+    (first_page..final_page)
+        .map(|logical_page| {
+            let physical = usize::try_from(
+                program.qualification_kv_physical_page(slot, logical_page * ATTENTION_PAGE_SIZE)?,
+            )
+            .map_err(|_| {
+                ResidentModelQualificationError::Mismatch(
+                    "resident prefill tail physical page exceeds host width".to_string(),
+                )
+            })?;
             Ok(program.qualification_cache_page(stream, physical)?)
         })
         .collect()
@@ -1343,10 +1504,11 @@ fn verify_inactive(
 }
 
 fn verify_prefill_inactive(
-    tokens: usize,
+    route: ResidentPrefillRoute,
     observed: &ResidentModelObservables,
     report: &mut ResidentModelQualification,
 ) -> Result<(), ResidentModelQualificationError> {
+    let tokens = route.tokens();
     let mut inactive = 0usize;
     for (role, values, width) in [
         ("residual_a", &observed.residual_a, Qwen38_27B::HIDDEN),
@@ -1438,13 +1600,14 @@ fn verify_prefill_inactive(
     ] {
         inactive += require_f32_sentinel_tail(&format!("T={tokens} untouched {role}"), values, 0)?;
     }
-    if tokens < 1_024 {
-        inactive += require_f32_sentinel_tail(
-            &format!("T={tokens} untouched prefill_partials"),
-            &observed.prefill_partials,
-            0,
-        )?;
-    }
+    let active_prefill_partials = route.partition_capacity().map_or(0, |partitions| {
+        tokens * Qwen38_27B::NUM_ATTENTION_HEADS * partitions * (Qwen38_27B::HEAD_DIM + 2)
+    });
+    inactive += require_f32_sentinel_tail(
+        &format!("T={tokens} inactive prefill_partials"),
+        &observed.prefill_partials,
+        active_prefill_partials,
+    )?;
     inactive += require_bf16_sentinel_tail(
         &format!("T={tokens} inactive logits"),
         &observed.logits,
@@ -1819,30 +1982,50 @@ fn verify_no_device_allocation(
         .map(|token| 100u32 + (token % 251) as u32)
         .collect::<Vec<_>>();
     program.stage_embeddings(stream, &token_ids)?;
-    let (rope_cos, rope_sin) = prefill_rope(1_024);
-    let prefill_routes: [ResidentPrefillRoute; 4] = PREFILL_ROUTES
-        .into_iter()
-        .map(|tokens| {
-            program.load_prefill_state(
-                stream,
-                tokens,
-                7,
-                &rope_cos[..tokens * ROTARY_PAIRS],
-                &rope_sin[..tokens * ROTARY_PAIRS],
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .try_into()
-        .map_err(|_| {
+    let graph_routes = [
+        (32, 0),
+        (64, 0),
+        (128, 0),
+        (128, 1),
+        (128, 32_768),
+        (1_024, 1_024),
+    ];
+    let reserved = program
+        .qualification_kv_page_count(7)?
+        .checked_mul(ATTENTION_PAGE_SIZE)
+        .ok_or_else(|| {
             ResidentModelQualificationError::Mismatch(
-                "prefill allocation route inventory has wrong cardinality".to_string(),
+                "prefill allocation warmup reservation overflows".to_string(),
             )
         })?;
-    program.replay_prefill(stream, prefill_routes[3])?;
+    if reserved < 32_896 {
+        program.reserve_kv_slot_tokens(stream, 7, 32_896)?;
+    }
+    for (tokens, first_position) in graph_routes {
+        let (rope_cos, rope_sin) = prefill_rope_at(first_position, tokens);
+        let route = program.load_prefill_tile_state(
+            stream,
+            tokens,
+            7,
+            first_position,
+            &rope_cos,
+            &rope_sin,
+        )?;
+        program.replay_prefill(stream, route)?;
+    }
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
-    for index in [0, 3, 1, 2] {
-        program.replay_prefill(stream, prefill_routes[index])?;
+    for (tokens, first_position) in graph_routes {
+        let (rope_cos, rope_sin) = prefill_rope_at(first_position, tokens);
+        let route = program.load_prefill_tile_state(
+            stream,
+            tokens,
+            7,
+            first_position,
+            &rope_cos,
+            &rope_sin,
+        )?;
+        program.replay_prefill(stream, route)?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let after = device_memory_info(program.context())?;
@@ -1896,13 +2079,13 @@ mod tests {
         assert_eq!(report.source_scalars, 256);
         assert_eq!(
             report.oracle_values,
-            (active + 4) * (3 * 5_120 + 1 + SELECTED_LOGIT_ROWS.len())
+            (active + 9) * (3 * 5_120 + 1 + SELECTED_LOGIT_ROWS.len())
         );
         assert!(report.graph_replay_values > 0);
         assert!(report.inactive_values > 0);
         assert!(report.slot_control_values > 0);
         assert_eq!(report.long_route_cases, 49);
-        assert_eq!(report.prefill_route_cases, 4);
+        assert_eq!(report.prefill_route_cases, 9);
         assert!(report.long_oracle_values > 0);
         assert!(report.maximum_absolute_error.is_finite());
     }

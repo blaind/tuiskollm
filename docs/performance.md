@@ -181,7 +181,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact B=1..8 and T=32/64/128/1024 graphs, tensor-map immutability, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT` | Check complete source layer-63 attention/MLP seams, represented KV cache, exact B=1..8 and T=32/64/128/1024 graphs, P4 macro partials, immutable tensor maps, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-full-attention-layer SNAPSHOT` | Check complete Qwen3.5 source layer-31 attention/MLP seams, BF16 KV cache, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-resident-model SNAPSHOT` | Check all 64 source routes, final source-backed formulas, dynamic page recycling/remapping and isolated reset, persistent state/cache, short plus six-bucket exact-B whole-model graphs, exact T=32/64/128/1024 from-empty prompt graphs, independent long-attention seam formulas, stable device/host addresses, and owner allocation | terminal |
+| `cargo run -p xtask -- qualify-resident-model SNAPSHOT` | Check all 64 source routes, final source-backed formulas, dynamic page recycling/remapping and isolated reset, persistent state/cache, short plus six-bucket exact-B whole-model graphs, six exact prefill graph specializations across from-empty and nonzero-prefix metadata, independent long-attention seam formulas, stable device/host addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-resident-generation SNAPSHOT` | Check pinned vLLM next-token fixtures, every exact T=32/64/128/1024 native-prefill dispatch, frontend, greedy control, streaming decode, stable ownership, and zero post-warmup device allocation | terminal |
 | `cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT` | Compare compact mixed-length scheduling with sequential requests, including every B=1..8 decode route, all four native-prefill admissions, noncontiguous survivor replay, cancellation, exact retained-prefix reuse, divergence fallback, slot recycling, stable ownership, and zero post-warmup device allocation | terminal |
 | `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
@@ -204,7 +204,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-full-attention-layer SNAPSHOT` | Measure every complete source-backed layer-63 B=1..8 graph at a 131-token context and every from-empty T=32/64/128/1024 prefill graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-full-attention-layer SNAPSHOT` | Measure every complete Qwen3.5 source-backed layer-31 graph at a 131-token, three-page BF16 context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-resident-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head graph at a 131-token context | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-resident-prefill SNAPSHOT` | Directly measure every complete from-empty T=32/64/128/1024 resident prompt graph with final-token-only LM head | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-resident-prefill SNAPSHOT` | Directly measure complete T=32/64/128/1024 resident prompt graphs across from-empty, shared-tail, P8/P16 T128, and P4 macro-tail contexts with final-token-only LM head | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-resident-long-context-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head long graph with one 131,073-token row and compact one-token survivors | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
@@ -345,10 +345,11 @@ embedding-staging graph restores represented input rows before each sample and r
 timed whole-model replay.
 
 `bench-resident-prefill SNAPSHOT` directly times the same resident owner at exact
-`T=32,64,128,1024`. All 64 layers advance one mapped GDN state/history row and one paged-attention
-table row causally from an empty prompt; T=1024 uses the admitted P4 macro GQA route. Only the final
-normalized prompt row enters the LM head, while embedding staging and metadata uploads remain
-outside the timed graph.
+`T=32,64,128,1024`. Its complete inventory includes the four from-empty prompts plus shared
+T32/T64 tails, both absolute-context T128 partition bands, and a nonzero-prefix P4 T1024 macro
+tile. All 64 layers advance one mapped GDN state/history row and one paged-attention table row
+causally. Only the final normalized tile row enters the LM head; represented embedding and exact
+metadata restoration remain outside the timed graph.
 
 `bench-resident-long-context-model SNAPSHOT` uses the same production owner and direct graph timing.
 Its shared-pool profile assigns 131,073 positions to the first compact row and one position to each

@@ -73,4 +73,5 @@ pub use qwen35_full_attention_layer::{
 #[cfg(feature = "qualification")]
 pub use resident_model_layout::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
+    ResidentPrefillStageGraph,
 };

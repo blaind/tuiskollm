@@ -11,6 +11,7 @@ pub use program::{
 #[cfg(feature = "qualification")]
 pub use program::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
+    ResidentPrefillStageGraph,
 };
 pub use progress::{ResidentLoadPhase, ResidentLoadProgress};
 pub use upload_plan::{

@@ -27,7 +27,7 @@ use tuisko_kernels_sm120::{
     DenseFp8SwiGluTmaMaps, FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp,
     GdnPrepareOp, GdnRecurrenceOp, LONG_CONTEXT_GQA_PARTITION_BUCKETS,
     LONG_CONTEXT_GQA_PARTITION_SIZE, LmHeadOp, LongContextPagedGqaOp, Nvfp4DownOp, Nvfp4SwiGluOp,
-    PagedGqaOp, ResidualNormOp,
+    PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PagedGqaOp, ResidualNormOp,
 };
 use tuisko_model::{
     Arch, CheckpointSnapshot, DenseFp8DownBindings, DenseFp8GateUpBindings,
@@ -41,7 +41,7 @@ const SHORT_CONTEXT_PAGES_PER_SLOT: usize = SHORT_CONTEXT_CAPACITY / ATTENTION_P
 #[cfg(feature = "qualification")]
 const SHORT_CONTEXT_PHYSICAL_PAGES: usize = MAX_BATCH * SHORT_CONTEXT_PAGES_PER_SLOT;
 const LONG_CONTEXT_ROUTE_COUNT: usize = LONG_CONTEXT_GQA_PARTITION_BUCKETS.len();
-const PREFILL_ROUTES: [usize; 4] = [32, 64, 128, super::MAX_ROWS];
+const PREFILL_GRAPH_ROUTE_COUNT: usize = 6;
 
 /// Exact resident graph selected by one checked decode-state upload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,6 +57,9 @@ pub struct ResidentDecodeRoute {
 #[must_use = "the prefill route must be replayed with the state that selected it"]
 pub struct ResidentPrefillRoute {
     tokens: usize,
+    first_position: usize,
+    context_tokens: usize,
+    attention: PrefillAttentionRoute,
 }
 
 impl ResidentPrefillRoute {
@@ -64,6 +67,32 @@ impl ResidentPrefillRoute {
     pub const fn tokens(self) -> usize {
         self.tokens
     }
+
+    /// First absolute cache position written by this tile.
+    pub const fn first_position(self) -> usize {
+        self.first_position
+    }
+
+    /// Causal context length after the complete tile is processed.
+    pub const fn context_tokens(self) -> usize {
+        self.context_tokens
+    }
+
+    /// Exact partition count used by a partitioned or macro attention route.
+    pub const fn partition_capacity(self) -> Option<usize> {
+        match self.attention {
+            PrefillAttentionRoute::Shared => None,
+            PrefillAttentionRoute::Partitioned { partitions }
+            | PrefillAttentionRoute::Macro { partitions } => Some(partitions),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrefillAttentionRoute {
+    Shared,
+    Partitioned { partitions: usize },
+    Macro { partitions: usize },
 }
 
 impl ResidentDecodeRoute {
@@ -293,7 +322,7 @@ enum ArenaLoading {
 struct ResidentGraphs {
     short: [CudaGraph; MAX_BATCH],
     long: [[CudaGraph; MAX_BATCH]; LONG_CONTEXT_ROUTE_COUNT],
-    prefill: [CudaGraph; 4],
+    prefill: [CudaGraph; PREFILL_GRAPH_ROUTE_COUNT],
 }
 
 impl ResidentGraphs {
@@ -305,12 +334,7 @@ impl ResidentGraphs {
     }
 
     fn select_prefill(&self, route: ResidentPrefillRoute) -> EngineResult<&CudaGraph> {
-        let index = prefill_index(route.tokens).ok_or_else(|| {
-            EngineError::route(format!(
-                "resident prefill token count {} is outside 32,64,128,1024",
-                route.tokens
-            ))
-        })?;
+        let index = prefill_graph_index(route)?;
         Ok(&self.prefill[index])
     }
 }
@@ -363,6 +387,26 @@ pub struct ResidentEmbeddingStageGraph<'a> {
 #[cfg(feature = "qualification")]
 impl ResidentEmbeddingStageGraph<'_> {
     /// Immutable graph whose replay restores represented embedding rows.
+    pub const fn graph(&self) -> &CudaGraph {
+        &self.graph
+    }
+}
+
+#[cfg(feature = "qualification")]
+/// Captured production embedding and prompt-metadata uploads for one prefill route.
+pub struct ResidentPrefillStageGraph<'a> {
+    graph: CudaGraph,
+    _positions: PinnedHostBuffer<u32>,
+    _lengths: PinnedHostBuffer<u32>,
+    _rows: PinnedHostBuffer<u32>,
+    _rope_cos: PinnedHostBuffer<f32>,
+    _rope_sin: PinnedHostBuffer<f32>,
+    source: PhantomData<&'a PinnedHostBuffer<u16>>,
+}
+
+#[cfg(feature = "qualification")]
+impl ResidentPrefillStageGraph<'_> {
+    /// Immutable graph restoring represented embeddings and exact prompt metadata.
     pub const fn graph(&self) -> &CudaGraph {
         &self.graph
     }
@@ -814,20 +858,30 @@ impl ResidentModelProgram {
         rope_cos: &[f32],
         rope_sin: &[f32],
     ) -> EngineResult<ResidentPrefillRoute> {
-        if prefill_index(tokens).is_none() {
-            return Err(EngineError::route(format!(
-                "resident prefill tokens {tokens} are outside 32,64,128,1024"
-            )));
-        }
+        self.load_prefill_tile_state(stream, tokens, slot, 0, rope_cos, rope_sin)
+    }
+
+    /// Loads one exact contiguous prompt tile after an already processed prefix.
+    pub fn load_prefill_tile_state(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        slot: usize,
+        first_position: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<ResidentPrefillRoute> {
+        let route = select_prefill_route(tokens, first_position, self.context_capacity())?;
         require_slot(slot)?;
         let reserved_tokens = self
             .kv_slots
             .page_count(slot)?
             .checked_mul(ATTENTION_PAGE_SIZE)
             .ok_or_else(|| EngineError::layout("resident prefill page capacity overflows"))?;
-        if reserved_tokens < tokens {
+        if reserved_tokens < route.context_tokens {
             return Err(EngineError::route(format!(
-                "resident prefill slot {slot} owns {reserved_tokens} cache positions, expected at least {tokens}"
+                "resident prefill slot {slot} owns {reserved_tokens} cache positions, expected at least {}",
+                route.context_tokens
             )));
         }
         let rotary_values = product("resident prefill rotary values", tokens, ROTARY_PAIRS)?;
@@ -843,8 +897,12 @@ impl ResidentModelProgram {
         let mut lengths = [0u32; super::MAX_ROWS];
         let mut rows = [0u32; super::MAX_ROWS];
         for token in 0..tokens {
-            positions[token] = token as u32;
-            lengths[token] = token as u32 + 1;
+            let position = first_position
+                .checked_add(token)
+                .and_then(|position| u32::try_from(position).ok())
+                .ok_or_else(|| EngineError::route("resident prefill position exceeds u32"))?;
+            positions[token] = position;
+            lengths[token] = position + 1;
             rows[token] = slot;
         }
         let workspace = self.layout.workspace;
@@ -864,7 +922,7 @@ impl ResidentModelProgram {
         self.arena
             .copy_prefix_from_host(stream, workspace.rope_sin, rope_sin)?;
 
-        Ok(ResidentPrefillRoute { tokens })
+        Ok(route)
     }
 
     /// Selects distinct physical persistent slots for the compact active rows.
@@ -1307,6 +1365,113 @@ impl ResidentModelProgram {
         })?;
         Ok(ResidentEmbeddingStageGraph {
             graph,
+            source: PhantomData,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Captures the production uploads that prepare one exact prefill graph replay.
+    pub fn qualification_prefill_stage_graph(
+        &self,
+        stream: &CudaStream,
+        route: ResidentPrefillRoute,
+        slot: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<ResidentPrefillStageGraph<'_>> {
+        require_slot(slot)?;
+        prefill_graph_index(route)?;
+        let rotary_values = product(
+            "resident prefill stage rotary values",
+            route.tokens,
+            ROTARY_PAIRS,
+        )?;
+        if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
+            return Err(EngineError::layout(format!(
+                "resident prefill stage rotary planes must each have {rotary_values} values"
+            )));
+        }
+
+        let mut positions =
+            PinnedHostBuffer::zeroed(&self.context, route.tokens).map_err(GpuError::from)?;
+        let mut lengths =
+            PinnedHostBuffer::zeroed(&self.context, route.tokens).map_err(GpuError::from)?;
+        let mut rows =
+            PinnedHostBuffer::zeroed(&self.context, route.tokens).map_err(GpuError::from)?;
+        for token in 0..route.tokens {
+            let position = u32::try_from(route.first_position + token)
+                .map_err(|_| EngineError::route("resident prefill stage position exceeds u32"))?;
+            positions.as_mut_slice()[token] = position;
+            lengths.as_mut_slice()[token] = position + 1;
+            rows.as_mut_slice()[token] = slot as u32;
+        }
+        let mut pinned_cos =
+            PinnedHostBuffer::zeroed(&self.context, rotary_values).map_err(GpuError::from)?;
+        pinned_cos.as_mut_slice().copy_from_slice(rope_cos);
+        let mut pinned_sin =
+            PinnedHostBuffer::zeroed(&self.context, rotary_values).map_err(GpuError::from)?;
+        pinned_sin.as_mut_slice().copy_from_slice(rope_sin);
+
+        let active_embeddings = product(
+            "resident prefill stage embedding elements",
+            route.tokens,
+            Qwen38_27B::HIDDEN,
+        )?;
+        let workspace = self.layout.workspace;
+        let graph = CudaGraph::capture(stream, || {
+            // SAFETY: the returned owner retains every page-locked source through all replays.
+            unsafe {
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.residual_a,
+                    &self.embedding_stager,
+                    active_embeddings,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.state_rows,
+                    &rows,
+                    route.tokens,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.table_rows,
+                    &rows,
+                    route.tokens,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.cache_positions,
+                    &positions,
+                    route.tokens,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.lengths,
+                    &lengths,
+                    route.tokens,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.rope_cos,
+                    &pinned_cos,
+                    rotary_values,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.rope_sin,
+                    &pinned_sin,
+                    rotary_values,
+                )
+            }
+        })?;
+        Ok(ResidentPrefillStageGraph {
+            graph,
+            _positions: positions,
+            _lengths: lengths,
+            _rows: rows,
+            _rope_cos: pinned_cos,
+            _rope_sin: pinned_sin,
             source: PhantomData,
         })
     }
@@ -2387,9 +2552,8 @@ fn capture_routes(
         EngineError::layout("resident long graph partition inventory has wrong cardinality")
     })?;
 
-    let mut prefill = Vec::with_capacity(PREFILL_ROUTES.len());
-    for tokens in PREFILL_ROUTES {
-        let route = ResidentPrefillRoute { tokens };
+    let mut prefill = Vec::with_capacity(PREFILL_GRAPH_ROUTE_COUNT);
+    for route in prefill_graph_routes() {
         prefill.push(CudaGraph::capture(stream, || {
             launch_prefill_route(stream, route, ops, pointers, dense_mlp_maps)
         })?);
@@ -2518,7 +2682,7 @@ fn launch_prefill_route(
 
     let mut residual_input = workspace.residual_a;
     for (index, layer) in pointers.layers.iter().enumerate() {
-        launch_prefill_mixer(stream, rows, ops, workspace, layer.mixer)?;
+        launch_prefill_mixer(stream, route, ops, workspace, layer.mixer)?;
         // SAFETY: branch and residual planes are disjoint MAX_ROWS regions.
         unsafe {
             ops.norm.launch_residual(
@@ -2583,11 +2747,12 @@ fn launch_prefill_route(
 
 fn launch_prefill_mixer(
     stream: &CudaStream,
-    rows: usize,
+    route: ResidentPrefillRoute,
     ops: Ops<'_>,
     workspace: WorkspacePointers,
     mixer: MixerPointers,
 ) -> GpuResult<()> {
+    let rows = route.tokens;
     // SAFETY: shared scratch is consumed before reuse. All prefill rows map to
     // one persistent slot; GDN kernels advance it causally in token order.
     unsafe {
@@ -2670,8 +2835,8 @@ fn launch_prefill_mixer(
                     p.scalars.key_cache_scale,
                     p.scalars.value_cache_scale,
                 )?;
-                if rows < super::MAX_ROWS {
-                    ops.paged_gqa.launch_prefill_shared(
+                match route.attention {
+                    PrefillAttentionRoute::Shared => ops.paged_gqa.launch_prefill_shared(
                         stream,
                         rows,
                         workspace.query,
@@ -2684,25 +2849,42 @@ fn launch_prefill_mixer(
                         workspace.attention,
                         p.scalars.key_cache_scale,
                         p.scalars.value_cache_scale,
-                    )?;
-                } else {
-                    // P4 caps each from-empty T=1024 partition at 256 keys and
-                    // exposes 3,072 producer CTAs before the exact reduction.
-                    ops.paged_gqa.launch_prefill_macro(
-                        stream,
-                        4,
-                        workspace.query,
-                        p.key_pages,
-                        p.value_pages,
-                        workspace.block_tables,
-                        workspace.table_rows,
-                        LONG_CONTEXT_PHYSICAL_PAGES,
-                        workspace.lengths,
-                        workspace.prefill_partials,
-                        workspace.attention,
-                        p.scalars.key_cache_scale,
-                        p.scalars.value_cache_scale,
-                    )?;
+                    )?,
+                    PrefillAttentionRoute::Partitioned { partitions } => {
+                        debug_assert_eq!(partitions, route.partition_capacity().unwrap());
+                        ops.paged_gqa.launch_prefill_partitioned(
+                            stream,
+                            route.context_tokens,
+                            workspace.query,
+                            p.key_pages,
+                            p.value_pages,
+                            workspace.block_tables,
+                            workspace.table_rows,
+                            LONG_CONTEXT_PHYSICAL_PAGES,
+                            workspace.lengths,
+                            workspace.prefill_partials,
+                            workspace.attention,
+                            p.scalars.key_cache_scale,
+                            p.scalars.value_cache_scale,
+                        )?;
+                    }
+                    PrefillAttentionRoute::Macro { partitions } => {
+                        ops.paged_gqa.launch_prefill_macro(
+                            stream,
+                            partitions,
+                            workspace.query,
+                            p.key_pages,
+                            p.value_pages,
+                            workspace.block_tables,
+                            workspace.table_rows,
+                            LONG_CONTEXT_PHYSICAL_PAGES,
+                            workspace.lengths,
+                            workspace.prefill_partials,
+                            workspace.attention,
+                            p.scalars.key_cache_scale,
+                            p.scalars.value_cache_scale,
+                        )?
+                    }
                 }
                 ops.attention_output.launch(
                     stream,
@@ -3481,6 +3663,109 @@ fn select_decode_route(batch: usize, lengths: &[u32]) -> EngineResult<ResidentDe
     })
 }
 
+const fn prefill_graph_routes() -> [ResidentPrefillRoute; PREFILL_GRAPH_ROUTE_COUNT] {
+    [
+        ResidentPrefillRoute {
+            tokens: 32,
+            first_position: 0,
+            context_tokens: 32,
+            attention: PrefillAttentionRoute::Shared,
+        },
+        ResidentPrefillRoute {
+            tokens: 64,
+            first_position: 0,
+            context_tokens: 64,
+            attention: PrefillAttentionRoute::Shared,
+        },
+        ResidentPrefillRoute {
+            tokens: 128,
+            first_position: 0,
+            context_tokens: 128,
+            attention: PrefillAttentionRoute::Shared,
+        },
+        ResidentPrefillRoute {
+            tokens: 128,
+            first_position: 1,
+            context_tokens: 129,
+            attention: PrefillAttentionRoute::Partitioned { partitions: 8 },
+        },
+        ResidentPrefillRoute {
+            tokens: 128,
+            first_position: PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT - 128,
+            context_tokens: PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT,
+            attention: PrefillAttentionRoute::Partitioned { partitions: 16 },
+        },
+        ResidentPrefillRoute {
+            tokens: super::MAX_ROWS,
+            first_position: 0,
+            context_tokens: super::MAX_ROWS,
+            attention: PrefillAttentionRoute::Macro { partitions: 4 },
+        },
+    ]
+}
+
+fn select_prefill_route(
+    tokens: usize,
+    first_position: usize,
+    capacity: usize,
+) -> EngineResult<ResidentPrefillRoute> {
+    if prefill_index(tokens).is_none() {
+        return Err(EngineError::route(format!(
+            "resident prefill tokens {tokens} are outside 32,64,128,1024"
+        )));
+    }
+    let context_tokens = first_position
+        .checked_add(tokens)
+        .ok_or_else(|| EngineError::route("resident prefill context overflows"))?;
+    if context_tokens > capacity {
+        return Err(EngineError::route(format!(
+            "resident prefill context {context_tokens} exceeds the {capacity}-token slot capacity"
+        )));
+    }
+
+    let attention = match tokens {
+        32 | 64 => PrefillAttentionRoute::Shared,
+        128 if context_tokens == 128 => PrefillAttentionRoute::Shared,
+        128 if context_tokens < PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT => {
+            // Eight K64 partitions expose 768 producer CTAs without the P16
+            // route's doubled grid below the measured 32,769-token crossover.
+            PrefillAttentionRoute::Partitioned { partitions: 8 }
+        }
+        128 => {
+            // Sixteen K32 partitions keep two CTAs resident from the admitted
+            // 32,769-token crossover through the 220,000-token ceiling.
+            PrefillAttentionRoute::Partitioned { partitions: 16 }
+        }
+        super::MAX_ROWS => {
+            // P4 exposes 3,072 producer CTAs and is the directly benchmarked
+            // macro route at both 32,768 and 98,304 context positions.
+            PrefillAttentionRoute::Macro { partitions: 4 }
+        }
+        _ => unreachable!(),
+    };
+    Ok(ResidentPrefillRoute {
+        tokens,
+        first_position,
+        context_tokens,
+        attention,
+    })
+}
+
+fn prefill_graph_index(route: ResidentPrefillRoute) -> EngineResult<usize> {
+    match (route.tokens, route.attention) {
+        (32, PrefillAttentionRoute::Shared) => Ok(0),
+        (64, PrefillAttentionRoute::Shared) => Ok(1),
+        (128, PrefillAttentionRoute::Shared) => Ok(2),
+        (128, PrefillAttentionRoute::Partitioned { partitions: 8 }) => Ok(3),
+        (128, PrefillAttentionRoute::Partitioned { partitions: 16 }) => Ok(4),
+        (super::MAX_ROWS, PrefillAttentionRoute::Macro { partitions: 4 }) => Ok(5),
+        _ => Err(EngineError::route(format!(
+            "resident prefill T={} context {} has no exact attention graph",
+            route.tokens, route.context_tokens
+        ))),
+    }
+}
+
 const fn prefill_index(rows: usize) -> Option<usize> {
     match rows {
         32 => Some(0),
@@ -3641,8 +3926,10 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PRODUCTION_LOAD_MODE, ResidentLoadMode, bf16_to_f32, decode_lengths, prefill_index,
-        require_batch, require_rows, select_decode_route, slot_rows,
+        PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PREFILL_GRAPH_ROUTE_COUNT,
+        PRODUCTION_LOAD_MODE, ResidentLoadMode, bf16_to_f32, decode_lengths, prefill_graph_index,
+        prefill_graph_routes, prefill_index, require_batch, require_rows, select_decode_route,
+        select_prefill_route, slot_rows,
     };
     use crate::EngineErrorCode;
 
@@ -3677,6 +3964,63 @@ mod tests {
                 Some(EngineErrorCode::Route)
             );
             assert_eq!(prefill_index(rows), None);
+        }
+    }
+
+    #[test]
+    fn prefill_graph_inventory_covers_every_admitted_context_band() {
+        let captured = prefill_graph_routes();
+        for (index, route) in captured.into_iter().enumerate() {
+            assert_eq!(prefill_graph_index(route).unwrap(), index);
+        }
+        assert_eq!(captured.len(), PREFILL_GRAPH_ROUTE_COUNT);
+
+        for (tokens, first_position, partitions) in [
+            (32, 0, None),
+            (32, 219_968, None),
+            (64, 0, None),
+            (64, 219_936, None),
+            (128, 0, None),
+            (128, 1, Some(8)),
+            (
+                128,
+                PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT - 129,
+                Some(8),
+            ),
+            (
+                128,
+                PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT - 128,
+                Some(16),
+            ),
+            (128, 219_872, Some(16)),
+            (1_024, 0, Some(4)),
+            (1_024, 218_976, Some(4)),
+        ] {
+            let route = select_prefill_route(tokens, first_position, 220_000).unwrap();
+            assert_eq!(route.tokens(), tokens);
+            assert_eq!(route.first_position(), first_position);
+            assert_eq!(route.context_tokens(), first_position + tokens);
+            assert_eq!(route.partition_capacity(), partitions);
+            prefill_graph_index(route).unwrap();
+        }
+
+        for (tokens, first_position) in [
+            (31, 0),
+            (33, 0),
+            (127, 0),
+            (129, 0),
+            (1_023, 0),
+            (1_025, 0),
+            (32, 219_969),
+            (1_024, 218_977),
+            (32, usize::MAX),
+        ] {
+            assert_eq!(
+                select_prefill_route(tokens, first_position, 220_000)
+                    .unwrap_err()
+                    .code(),
+                Some(EngineErrorCode::Route)
+            );
         }
     }
 
