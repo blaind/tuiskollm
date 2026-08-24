@@ -1283,6 +1283,8 @@ pub struct Nvfp4GateUpBindings<'a> {
     pub weight_scale_divisor: f32,
     /// Decoder layer owning these planes.
     pub layer: usize,
+    /// Total decoder layer count of the bound architecture.
+    pub layer_count: usize,
 }
 
 impl<'a> Nvfp4GateUpBindings<'a> {
@@ -1351,6 +1353,7 @@ impl<'a> Nvfp4GateUpBindings<'a> {
             input_scale_divisor: gate_input_divisor,
             weight_scale_divisor: gate_weight_divisor,
             layer,
+            layer_count: A::LAYERS,
         })
     }
 }
@@ -1368,6 +1371,8 @@ pub struct Nvfp4DownBindings<'a> {
     pub weight_scale_divisor: f32,
     /// Decoder layer owning these planes.
     pub layer: usize,
+    /// Total decoder layer count of the bound architecture.
+    pub layer_count: usize,
 }
 
 /// Complete source planes for one early-layer NVFP4 MLP boundary.
@@ -1473,6 +1478,7 @@ impl<'a> Nvfp4DownBindings<'a> {
             input_scale_divisor,
             weight_scale_divisor,
             layer,
+            layer_count: A::LAYERS,
         })
     }
 }

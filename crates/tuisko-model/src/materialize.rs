@@ -1,8 +1,8 @@
 //! Lossless conversion from source bindings to runtime-native host layouts.
 
 use crate::bindings::{
-    NVFP4_MLP_LAYER_END, require_full_attention_layer, require_gdn_layer_route,
-    require_nvfp4_mlp_layer, validate_nvfp4_scales,
+    require_full_attention_layer, require_gdn_layer_route, require_nvfp4_mlp_layer,
+    validate_nvfp4_scales,
 };
 use crate::{
     Bf16View, CheckpointError, CheckpointResult, F32View, FullAttentionQkvBindings,
@@ -194,7 +194,7 @@ pub struct MaterializedNvfp4GateUp<'a> {
 impl<'a> Nvfp4GateUpBindings<'a> {
     /// Materializes the fused gate/up scale layout without requantizing source values.
     pub fn materialize(self) -> CheckpointResult<MaterializedNvfp4GateUp<'a>> {
-        require_nvfp4_mlp_layer(self.layer, NVFP4_MLP_LAYER_END)?;
+        require_nvfp4_mlp_layer(self.layer, self.layer_count)?;
 
         let [gate_rows, packed_columns] =
             host_shape(self.gate_weight.shape(), "NVFP4 gate weights")?;
@@ -775,6 +775,7 @@ impl<'a> ModelOptNvfp4MlpBindings<'a> {
                 gate_up_weight_scale_2,
             )?,
             layer: self.layer,
+            layer_count: self.layer_count,
         }
         .materialize()?;
         let down = Nvfp4DownBindings {
@@ -783,6 +784,7 @@ impl<'a> ModelOptNvfp4MlpBindings<'a> {
             input_scale_divisor: reciprocal_scale(self.layer, "down input", down_input_scale)?,
             weight_scale_divisor: reciprocal_scale(self.layer, "down weight", down_weight_scale_2)?,
             layer: self.layer,
+            layer_count: self.layer_count,
         }
         .materialize()?;
 
@@ -803,7 +805,7 @@ impl<'a> ModelOptNvfp4MlpBindings<'a> {
 impl<'a> Nvfp4DownBindings<'a> {
     /// Materializes the down-projection scale layout without requantizing source values.
     pub fn materialize(self) -> CheckpointResult<MaterializedNvfp4Down<'a>> {
-        require_nvfp4_mlp_layer(self.layer, NVFP4_MLP_LAYER_END)?;
+        require_nvfp4_mlp_layer(self.layer, self.layer_count)?;
 
         let [rows, packed_columns] = host_shape(self.weight.shape(), "NVFP4 down weights")?;
         let [scale_rows, groups] = host_shape(self.scale.shape(), "NVFP4 down scales")?;
@@ -1357,6 +1359,7 @@ mod tests {
             input_scale_divisor: 3.0,
             weight_scale_divisor: 0.125,
             layer: 55,
+            layer_count: 64,
         };
 
         let error = Nvfp4GateUpBindings {
@@ -1373,6 +1376,17 @@ mod tests {
                 .to_string()
                 .contains("does not use the admitted NVFP4")
         );
+
+        let count_error = Nvfp4GateUpBindings {
+            layer: 40,
+            layer_count: 40,
+            ..bindings
+        }
+        .materialize()
+        .err()
+        .unwrap();
+
+        assert_eq!(count_error.code(), CheckpointErrorCode::SourceBinding);
 
         let materialized = bindings.materialize().unwrap();
         let source = [gate_scale.as_slice(), up_scale.as_slice()].concat();
@@ -1404,6 +1418,7 @@ mod tests {
             input_scale_divisor: 19.0,
             weight_scale_divisor: 3_376.0,
             layer: 55,
+            layer_count: 64,
         };
 
         let error = Nvfp4DownBindings {
@@ -1420,6 +1435,17 @@ mod tests {
                 .to_string()
                 .contains("does not use the admitted NVFP4")
         );
+
+        let count_error = Nvfp4DownBindings {
+            layer: 40,
+            layer_count: 40,
+            ..bindings
+        }
+        .materialize()
+        .err()
+        .unwrap();
+
+        assert_eq!(count_error.code(), CheckpointErrorCode::SourceBinding);
 
         let materialized = bindings.materialize().unwrap();
         let expected = block_scale_oracle(&scale, ROWS, GROUPS);

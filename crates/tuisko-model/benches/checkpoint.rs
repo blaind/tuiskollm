@@ -226,6 +226,7 @@ fn nvfp4_materialization_benches(criterion: &mut Criterion) {
         input_scale_divisor: 1.0,
         weight_scale_divisor: 1.0,
         layer: 0,
+        layer_count: Qwen38_27B::LAYERS,
     };
 
     let down = Nvfp4DownBindings {
@@ -242,6 +243,7 @@ fn nvfp4_materialization_benches(criterion: &mut Criterion) {
         input_scale_divisor: 1.0,
         weight_scale_divisor: 1.0,
         layer: 0,
+        layer_count: Qwen38_27B::LAYERS,
     };
 
     let mut group = criterion.benchmark_group("checkpoint/nvfp4-scale-materialization");
