@@ -16,11 +16,24 @@ pub struct CudaGraphDefinition {
 }
 
 /// Exact topology-compatible graph definitions sharing one executable instance.
+///
+/// The first launch pins its stream: every later launch must pass the same
+/// stream, so the shared executable is only ever updated or re-enqueued behind
+/// the launches already ordered on that one stream.
 pub struct CudaGraphVariants<const N: usize> {
     context: Arc<CudaContext>,
     definitions: [CudaGraphDefinition; N],
     executable: sys::CUgraphExec,
-    selected: Mutex<usize>,
+    selected: Mutex<SelectedLaunch>,
+}
+
+/// Serialized launch state: the resident variant and the pinned launch stream.
+struct SelectedLaunch {
+    index: usize,
+    /// Raw handle of the stream every launch has used, or `None` before the
+    /// first launch. Compared by handle only and never dereferenced; the owner
+    /// keeps that stream alive across launches.
+    stream: Option<sys::CUstream>,
 }
 
 /// One immutable CUDA Graph and its executable instance.
@@ -151,11 +164,19 @@ impl<const N: usize> CudaGraphVariants<N> {
             context,
             definitions,
             executable,
-            selected: Mutex::new(0),
+            selected: Mutex::new(SelectedLaunch {
+                index: 0,
+                stream: None,
+            }),
         })
     }
 
-    /// Synchronizes only when needed, updates the shared executable, and enqueues one variant.
+    /// Updates the shared executable when the variant changes and enqueues one variant.
+    ///
+    /// The first launch pins its stream; every later launch must pass that same stream and is
+    /// rejected otherwise. Pinning keeps all launches of the shared executable ordered on one
+    /// stream, so a variant switch only needs to drain that stream before the update, and the
+    /// same-stream re-launch path needs no synchronization at all.
     pub fn launch(&self, stream: &CudaStream, index: usize) -> GpuResult<()> {
         if self.context.as_ref() != stream.context().as_ref() {
             return Err(GpuError::context(
@@ -171,7 +192,16 @@ impl<const N: usize> CudaGraphVariants<N> {
             .selected
             .lock()
             .map_err(|_| GpuError::graph("CUDA Graph variant selection lock is poisoned"))?;
-        if *selected != index {
+        if let Some(pinned) = selected.stream
+            && pinned != stream.cu_stream()
+        {
+            return Err(GpuError::context(
+                "CUDA Graph variants are pinned to their first launch stream",
+            ));
+        }
+        if selected.index != index {
+            // Every prior launch was enqueued on this pinned stream, so draining it proves no
+            // launch of the shared executable is still executing during the update below.
             stream.synchronize().map_err(|source| {
                 GpuError::driver("synchronizing before CUDA Graph update", source)
             })?;
@@ -183,8 +213,9 @@ impl<const N: usize> CudaGraphVariants<N> {
                 errorNode: ptr::null_mut(),
                 errorFromNode: ptr::null_mut(),
             };
-            // SAFETY: the executable and definition are live, context-matched handles. The
-            // stream synchronization completed every earlier launch of this serialized owner.
+            // SAFETY: the executable and definition are live, context-matched handles. Every
+            // earlier launch of this serialized owner was enqueued on the pinned stream just
+            // synchronized, so the executable is idle for the update.
             unsafe { sys::cuGraphExecUpdate_v2(self.executable, definition.graph, &mut result) }
                 .result()
                 .map_err(|source| GpuError::driver("updating a CUDA Graph executable", source))?;
@@ -194,15 +225,18 @@ impl<const N: usize> CudaGraphVariants<N> {
                     result.result
                 )));
             }
-            *selected = index;
+            selected.index = index;
         }
 
         self.context
             .bind_to_thread()
             .map_err(|source| GpuError::driver("binding the graph CUDA context", source))?;
-        // SAFETY: the selected executable is live and belongs to the launch stream's context.
+        // SAFETY: the selected executable is live and belongs to the launch stream's context;
+        // the pin check above serialized this launch behind every prior one on this stream.
         unsafe { sys::cuGraphLaunch(self.executable, stream.cu_stream()).result() }
-            .map_err(|source| GpuError::driver("launching a CUDA Graph variant", source))
+            .map_err(|source| GpuError::driver("launching a CUDA Graph variant", source))?;
+        selected.stream = Some(stream.cu_stream());
+        Ok(())
     }
 
     /// Writes one exact definition's structural inventory for out-of-band inspection.
