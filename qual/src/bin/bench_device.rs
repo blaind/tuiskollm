@@ -303,7 +303,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         #[cfg(feature = "device")]
         "qwen36-nvfp4-lm-head" => {
             let (options, json_path) =
-                parse_options(arguments, DeviceBenchmarkOptions::short_graph())?;
+                parse_options(arguments, DeviceBenchmarkOptions::long_graph())?;
             (benchmark_qwen36_nvfp4_lm_head(options)?, json_path)
         }
         #[cfg(feature = "device")]
