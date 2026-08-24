@@ -100,11 +100,15 @@ The 2,048-wide zero-centered RMSNorm and fused residual-publication routes also 
 1.887/1.948 us fused at B=1/8 with a locked 2,197 MHz SM clock. The first GDN projection family
 preserves the checkpoint's static FP8 contract: BF16 inputs are quantized with the admitted scalar
 scale, source E4M3 Q/K/V/Z weights retain their two scalar scales, and the 64 BF16 A/B control rows
-remain a separate exact projection. Every `B=1..8` route passes 73,728 exact activation-code,
-444,672 FP64-formula output, 518,400 graph-replay, and 806,400 inactive-sentinel comparisons with
-immutable sources and no post-warmup device growth. Its complete three-node path measures
-12.443/33.309 us at B=1/8 and a locked 2,197 MHz SM clock. These are unblessed leaf diagnostics;
-the next control/convolution and FP32 recurrence stages reuse the already qualified Qwen3.5 binary
+remain a separate exact projection. Exact `T=32/64/128` prompt routes reuse the same represented
+scales and switch only the E4M3 projection to the native `m16n8k32` tensor-core tile. Across every
+decode and prompt route, the gate passes 532,480 exact activation-code, 3,211,520 FP64-formula
+output, 3,744,000 graph-replay, and 33,062,400 inactive-sentinel comparisons with immutable sources
+and no post-warmup device growth. Its complete three-node path measures 12.443/33.309 us at B=1/8
+and a locked 2,197 MHz SM clock; the unblessed prompt diagnostics measure
+102.416/104.407/132.575 us at T=32/64/128 with a 2,182 MHz median SM clock. The decode and prompt
+timings are unblessed leaf diagnostics; the next control/convolution and FP32 recurrence stages
+reuse the already qualified Qwen3.5 binary
 entries because both profiles have the exact same 32 control rows, 8,192 Q/K/V rows, 4,096 value
 rows, 16 Q/K heads, 32 value heads, width-128 state, and width-four history. Compile-time geometry
 assertions and separate Qwen3.6 oracle entry points make that reuse executable rather than

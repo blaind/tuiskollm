@@ -599,25 +599,48 @@ pub(crate) unsafe fn qkv_projection_mma_t16<A: Arch>(
 }
 
 #[inline(always)]
-unsafe fn store_prefill_projection_mma_tile<const TOKENS: usize>(
+#[allow(clippy::too_many_arguments)]
+unsafe fn store_prefill_projection_mma_tile<const TOKENS: usize, const STATIC_SCALES: bool>(
     values: [f32; 4],
     activation_scales: *const f32,
     weight_scales: *const u16,
+    static_activation_scale: f32,
+    static_scale_split: usize,
+    static_first_weight_scale: f32,
+    static_second_weight_scale: f32,
     output: *mut u16,
     first_token: usize,
     first_output: usize,
     output_rows: usize,
 ) {
-    // SAFETY: the exact projection tile maps both scale words within the source plane.
-    let first_weight_scale =
-        f32::from_bits((unsafe { *weight_scales.add(first_output) } as u32) << 16);
-    // SAFETY: output columns are paired and the second scale is adjacent.
-    let second_weight_scale =
-        f32::from_bits((unsafe { *weight_scales.add(first_output + 1) } as u32) << 16);
+    let first_weight_scale = if STATIC_SCALES {
+        if first_output < static_scale_split {
+            static_first_weight_scale
+        } else {
+            static_second_weight_scale
+        }
+    } else {
+        // SAFETY: the exact projection tile maps the source scale word.
+        f32::from_bits((unsafe { *weight_scales.add(first_output) } as u32) << 16)
+    };
+    let second_weight_scale = if STATIC_SCALES {
+        if first_output + 1 < static_scale_split {
+            static_first_weight_scale
+        } else {
+            static_second_weight_scale
+        }
+    } else {
+        // SAFETY: output columns are paired and the second scale is adjacent.
+        f32::from_bits((unsafe { *weight_scales.add(first_output + 1) } as u32) << 16)
+    };
     if first_token < TOKENS {
         // SAFETY: the exact tile maps this token row and output pair uniquely.
         unsafe {
-            let activation_scale = *activation_scales.add(first_token);
+            let activation_scale = if STATIC_SCALES {
+                static_activation_scale
+            } else {
+                *activation_scales.add(first_token)
+            };
             *output.add(first_token * output_rows + first_output) =
                 tcgen05::cvt_f32x2_bf16x2(values[0] * activation_scale * first_weight_scale, 0.0)
                     as u16;
@@ -631,7 +654,11 @@ unsafe fn store_prefill_projection_mma_tile<const TOKENS: usize>(
     if second_token < TOKENS {
         // SAFETY: the paired MMA row remains inside the exact active-token extent.
         unsafe {
-            let activation_scale = *activation_scales.add(second_token);
+            let activation_scale = if STATIC_SCALES {
+                static_activation_scale
+            } else {
+                *activation_scales.add(second_token)
+            };
             *output.add(second_token * output_rows + first_output) =
                 tcgen05::cvt_f32x2_bf16x2(values[2] * activation_scale * first_weight_scale, 0.0)
                     as u16;
@@ -655,6 +682,84 @@ pub(crate) unsafe fn prefill_projection_mma<
     activation_scales: *const f32,
     weight_codes: *const u32,
     weight_scales: *const u16,
+    output: *mut u16,
+    k_tiles: u32,
+    output_rows: usize,
+) {
+    // SAFETY: the public pointer contract supplies dynamic per-row scales.
+    unsafe {
+        prefill_projection_mma_impl::<A, TOKENS, BM, BK_WORDS, K_SUBTILES, false>(
+            activation_codes,
+            activation_scales,
+            weight_codes,
+            weight_scales,
+            0.0,
+            0,
+            0.0,
+            0.0,
+            output,
+            k_tiles,
+            output_rows,
+        );
+    }
+}
+
+/// Projects one admitted FP8 prefill width with exact scalar activation and weight scales.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn prefill_projection_mma_static_scales<
+    A: Arch,
+    const TOKENS: usize,
+    const BM: usize,
+    const BK_WORDS: usize,
+    const K_SUBTILES: usize,
+>(
+    activation_codes: *const u32,
+    static_activation_scale: f32,
+    weight_codes: *const u32,
+    static_scale_split: usize,
+    static_first_weight_scale: f32,
+    static_second_weight_scale: f32,
+    output: *mut u16,
+    k_tiles: u32,
+    output_rows: usize,
+) {
+    // SAFETY: the static route has no scale planes; the const specialization removes those loads.
+    unsafe {
+        prefill_projection_mma_impl::<A, TOKENS, BM, BK_WORDS, K_SUBTILES, true>(
+            activation_codes,
+            core::ptr::null(),
+            weight_codes,
+            core::ptr::null(),
+            static_activation_scale,
+            static_scale_split,
+            static_first_weight_scale,
+            static_second_weight_scale,
+            output,
+            k_tiles,
+            output_rows,
+        );
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn prefill_projection_mma_impl<
+    A: Arch,
+    const TOKENS: usize,
+    const BM: usize,
+    const BK_WORDS: usize,
+    const K_SUBTILES: usize,
+    const STATIC_SCALES: bool,
+>(
+    activation_codes: *const u32,
+    activation_scales: *const f32,
+    weight_codes: *const u32,
+    weight_scales: *const u16,
+    static_activation_scale: f32,
+    static_scale_split: usize,
+    static_first_weight_scale: f32,
+    static_second_weight_scale: f32,
     output: *mut u16,
     k_tiles: u32,
     output_rows: usize,
@@ -831,37 +936,53 @@ pub(crate) unsafe fn prefill_projection_mma<
     let first_output = warp_output + thread_in_group * 2;
     // SAFETY: the route's warps partition every active 16x64 output tile.
     unsafe {
-        store_prefill_projection_mma_tile::<TOKENS>(
+        store_prefill_projection_mma_tile::<TOKENS, STATIC_SCALES>(
             accumulator0,
             activation_scales,
             weight_scales,
+            static_activation_scale,
+            static_scale_split,
+            static_first_weight_scale,
+            static_second_weight_scale,
             output,
             first_token,
             first_output,
             output_rows,
         );
-        store_prefill_projection_mma_tile::<TOKENS>(
+        store_prefill_projection_mma_tile::<TOKENS, STATIC_SCALES>(
             accumulator1,
             activation_scales,
             weight_scales,
+            static_activation_scale,
+            static_scale_split,
+            static_first_weight_scale,
+            static_second_weight_scale,
             output,
             first_token,
             first_output + 8,
             output_rows,
         );
-        store_prefill_projection_mma_tile::<TOKENS>(
+        store_prefill_projection_mma_tile::<TOKENS, STATIC_SCALES>(
             accumulator2,
             activation_scales,
             weight_scales,
+            static_activation_scale,
+            static_scale_split,
+            static_first_weight_scale,
+            static_second_weight_scale,
             output,
             first_token,
             first_output + 16,
             output_rows,
         );
-        store_prefill_projection_mma_tile::<TOKENS>(
+        store_prefill_projection_mma_tile::<TOKENS, STATIC_SCALES>(
             accumulator3,
             activation_scales,
             weight_scales,
+            static_activation_scale,
+            static_scale_split,
+            static_first_weight_scale,
+            static_second_weight_scale,
             output,
             first_token,
             first_output + 24,
