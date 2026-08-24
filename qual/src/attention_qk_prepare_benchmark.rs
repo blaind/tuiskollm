@@ -179,8 +179,8 @@ impl_bench_op!(AttentionQkPrepareOp, Qwen38_27B, &ROUTES, MAX_TOKENS);
 
 impl BenchQkPrepareOp for Qwen35AttentionQkPrepareOp {
     type Target = Qwen35_9B;
-    const ROUTES: &'static [usize] = &BF16_DECODE_ROUTES;
-    const MAX_TOKENS: usize = MAX_BATCH;
+    const ROUTES: &'static [usize] = &ROUTES;
+    const MAX_TOKENS: usize = 1_024;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const WORKLOAD_MTP: bool = false;
 
@@ -188,22 +188,33 @@ impl BenchQkPrepareOp for Qwen35AttentionQkPrepareOp {
         Qwen35AttentionQkPrepareOp::new(context)
     }
 
-    fn launch(&self, stream: &CudaStream, addresses: &Addresses, batch: usize) -> GpuResult<()> {
+    fn launch(&self, stream: &CudaStream, addresses: &Addresses, tokens: usize) -> GpuResult<()> {
+        let (table_rows, cache_positions) = if tokens <= MAX_BATCH {
+            (
+                addresses.decode_table_rows,
+                addresses.decode_cache_positions,
+            )
+        } else {
+            (
+                addresses.prefill_table_rows,
+                addresses.prefill_cache_positions,
+            )
+        };
         // SAFETY: the arena reserves aligned BF16 cache planes and owns every
         // pointer through completion of the captured graph.
         unsafe {
             self.launch(
                 stream,
-                batch,
+                tokens,
                 addresses.qkv,
                 addresses.query_norm,
                 addresses.key_norm,
                 addresses.rope_cos,
                 addresses.rope_sin,
                 addresses.block_tables,
-                addresses.decode_table_rows,
+                table_rows,
                 TABLE_STRIDE,
-                addresses.decode_cache_positions,
+                cache_positions,
                 addresses.query,
                 addresses.key_pages.cast(),
                 addresses.value_pages.cast(),
@@ -577,7 +588,7 @@ const QWEN35_LABELS: BenchmarkLabels = BenchmarkLabels {
     cache: "qwen35_attention_qk_prepare/kv_cache",
     cache_description: "16 physical pages, four KV heads, 64 positions, BF16 K/V",
     workspace: "qwen35_attention_qk_prepare/address_stable_workspace",
-    workspace_description: "max_tokens=8 QKV, rotary, compact-decode metadata, and prepared query",
+    workspace_description: "max_tokens=1024 QKV, rotary, compact-decode/contiguous-prefill metadata, and prepared query",
     padding: "qwen35_attention_qk_prepare/alignment_padding",
 };
 
@@ -672,7 +683,7 @@ pub fn benchmark_attention_qk_prepare(
     benchmark_target::<AttentionQkPrepareOp>(options, QWEN38_LABELS)
 }
 
-/// Measures every exact Qwen3.5 attention Q/K preparation batch.
+/// Measures every exact Qwen3.5 attention Q/K decode and prompt route.
 pub fn benchmark_qwen35_attention_qk_prepare(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
@@ -743,10 +754,10 @@ mod tests {
         assert_eq!(qwen38_layout.byte_len() - regions.payload_bytes(), 448);
         assert_eq!(MAX_TOKENS, 1_024);
 
-        let (qwen35_layout, regions) = layout::<Qwen35_9B>(MAX_BATCH, size_of::<u16>()).unwrap();
-        assert_eq!(qwen35_layout.byte_len(), 4_493_824);
-        assert_eq!(regions.payload_bytes(), 4_492_928);
-        assert_eq!(qwen35_layout.byte_len() - regions.payload_bytes(), 896);
+        let (qwen35_layout, regions) = layout::<Qwen35_9B>(MAX_TOKENS, size_of::<u16>()).unwrap();
+        assert_eq!(qwen35_layout.byte_len(), 42_215_424);
+        assert_eq!(regions.payload_bytes(), 42_214_976);
+        assert_eq!(qwen35_layout.byte_len() - regions.payload_bytes(), 448);
     }
 
     #[test]
@@ -760,17 +771,17 @@ mod tests {
             + 3 * size_of::<u32>()
             + Qwen35_9B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>()
             + 2 * Qwen35_9B::ATTENTION_KV_ROWS * size_of::<u16>();
-        for batch in 1..=MAX_BATCH {
+        for tokens in ROUTES {
             assert_eq!(
-                logical_bytes::<Qwen35_9B>(batch, size_of::<u16>()),
-                batch * per_token
+                logical_bytes::<Qwen35_9B>(tokens, size_of::<u16>()),
+                tokens * per_token
             );
         }
 
-        let (layout, regions) = layout::<Qwen35_9B>(MAX_BATCH, size_of::<u16>()).unwrap();
-        assert_eq!(layout.byte_len(), 4_493_824);
-        assert_eq!(regions.payload_bytes(), 4_492_928);
-        assert_eq!(layout.byte_len() - regions.payload_bytes(), 896);
+        let (layout, regions) = layout::<Qwen35_9B>(MAX_TOKENS, size_of::<u16>()).unwrap();
+        assert_eq!(layout.byte_len(), 42_215_424);
+        assert_eq!(regions.payload_bytes(), 42_214_976);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 448);
         assert_eq!(regions.cache_bytes(), 4_194_304);
     }
 
