@@ -8,8 +8,8 @@ use crate::{
     Arch, Bf16View, CheckpointError, CheckpointResult, F32View, FullAttentionQkvBindings,
     ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4LinearBindings,
     ModelOptNvfp4MlpBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
-    Qwen36Fp8LinearBindings, Qwen36GdnBindings, Qwen36Moe35B, Qwen36MoeExpertBindings,
-    Qwen36MoeLayerBindings,
+    Qwen36Fp8LinearBindings, Qwen36FullAttentionBindings, Qwen36GdnBindings, Qwen36Moe35B,
+    Qwen36MoeExpertBindings, Qwen36MoeLayerBindings,
 };
 use rayon::prelude::*;
 use std::mem::size_of;
@@ -531,6 +531,139 @@ impl<'a> Qwen36GdnBindings<'a> {
             a_log: self.a_log,
             dt_bias: self.dt_bias,
             norm: self.norm,
+            input_norm: self.input_norm,
+            post_attention_norm: self.post_attention_norm,
+            layer: self.layer,
+        })
+    }
+}
+
+/// Runtime-native scalar-scaled FP8/BF16 planes for one Qwen3.6 full-attention layer.
+#[derive(Debug)]
+pub struct MaterializedQwen36FullAttention<'a> {
+    /// Fused Q/gate, K, and V E4M3 codes in projection-row order.
+    pub qkv_weight_e4m3: Vec<u8>,
+    /// Exact source activation scale shared by Q, K, and V.
+    pub qkv_input_scale: f32,
+    /// Exact source weight scales in Q, K, and V order.
+    pub qkv_weight_scales: [f32; 3],
+    /// Query-plus-gate rows preceding the K and V rows.
+    pub query_rows: usize,
+    /// Rows in each K or V projection.
+    pub kv_rows: usize,
+    /// Fused Q/gate, K, and V output row count.
+    pub qkv_rows: usize,
+    /// Logical Q/K/V input width.
+    pub qkv_columns: usize,
+    /// Gated attention-output projection.
+    pub output: MaterializedQwen36Fp8Linear<'a>,
+    /// Per-head query RMSNorm weights.
+    pub query_norm: Bf16View<'a, 1>,
+    /// Per-head key RMSNorm weights.
+    pub key_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before attention.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the MoE boundary.
+    pub post_attention_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning this layout.
+    pub layer: usize,
+}
+
+impl MaterializedQwen36FullAttention<'_> {
+    /// Host bytes owned by the fused Q/K/V plane.
+    pub fn owned_bytes(&self) -> usize {
+        self.qkv_weight_e4m3.len()
+    }
+}
+
+impl<'a> Qwen36FullAttentionBindings<'a> {
+    /// Gathers Q/K/V rows without changing any represented FP8, BF16, or F32 value.
+    pub fn materialize(self) -> CheckpointResult<MaterializedQwen36FullAttention<'a>> {
+        self.materialize_with_contract(
+            Qwen36Moe35B::LAYERS,
+            Qwen36Moe35B::FULL_ATTENTION_INTERVAL,
+            Qwen36Moe35B::HIDDEN,
+            Qwen36Moe35B::ATTENTION_QUERY_ROWS,
+            Qwen36Moe35B::ATTENTION_KV_ROWS,
+            Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS,
+            Qwen36Moe35B::HEAD_DIM,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_with_contract(
+        self,
+        layer_count: usize,
+        full_attention_interval: usize,
+        hidden: usize,
+        query_rows: usize,
+        kv_rows: usize,
+        output_columns: usize,
+        head_dim: usize,
+    ) -> CheckpointResult<MaterializedQwen36FullAttention<'a>> {
+        require_full_attention_layer(self.layer, layer_count, full_attention_interval)?;
+
+        let query_gate = materialize_qwen36_fp8_linear(self.query_gate, self.layer, "query/gate")?;
+        let key = materialize_qwen36_fp8_linear(self.key, self.layer, "key")?;
+        let value = materialize_qwen36_fp8_linear(self.value, self.layer, "value")?;
+        let output = materialize_qwen36_fp8_linear(self.output, self.layer, "output")?;
+
+        if query_gate.rows != query_rows
+            || query_gate.columns != hidden
+            || key.rows != kv_rows
+            || key.columns != hidden
+            || value.rows != kv_rows
+            || value.columns != hidden
+            || output.rows != hidden
+            || output.columns != output_columns
+            || self.query_norm.shape() != &[head_dim as u64]
+            || self.key_norm.shape() != &[head_dim as u64]
+            || self.input_norm.shape() != &[hidden as u64]
+            || self.post_attention_norm.shape() != &[hidden as u64]
+        {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{} Qwen3.6 full-attention source geometry differs from its contract",
+                self.layer
+            )));
+        }
+        if self.query_gate.input_scale.bits(0) != self.key.input_scale.bits(0)
+            || self.query_gate.input_scale.bits(0) != self.value.input_scale.bits(0)
+        {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{} Qwen3.6 Q/K/V input_scale values differ",
+                self.layer
+            )));
+        }
+
+        let qkv_rows = query_rows
+            .checked_add(kv_rows)
+            .and_then(|rows| rows.checked_add(kv_rows))
+            .ok_or_else(|| {
+                CheckpointError::source_binding(format!(
+                    "layer-{} Qwen3.6 Q/K/V row count overflows",
+                    self.layer
+                ))
+            })?;
+        let qkv_weight_e4m3 = gather_source_planes(
+            [query_gate.weight_e4m3, key.weight_e4m3, value.weight_e4m3],
+            &format!("layer-{} Qwen3.6 Q/K/V weights", self.layer),
+        )?;
+
+        Ok(MaterializedQwen36FullAttention {
+            qkv_weight_e4m3,
+            qkv_input_scale: query_gate.input_scale,
+            qkv_weight_scales: [
+                query_gate.weight_scale,
+                key.weight_scale,
+                value.weight_scale,
+            ],
+            query_rows,
+            kv_rows,
+            qkv_rows,
+            qkv_columns: hidden,
+            output,
+            query_norm: self.query_norm,
+            key_norm: self.key_norm,
             input_norm: self.input_norm,
             post_attention_norm: self.post_attention_norm,
             layer: self.layer,
@@ -1691,8 +1824,9 @@ mod tests {
         Arch, Bf16View, CheckpointErrorCode, CheckpointSnapshot, DType, F32View, Fp8E4M3View,
         FullAttentionQkvBindings, ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings,
         ModelOptNvfp4LinearBindings, ModelOptNvfp4MlpBindings, Nvfp4DownBindings,
-        Nvfp4GateUpBindings, Qwen35_9B, Qwen36Fp8LinearBindings, Qwen36GdnBindings, Qwen36Moe35B,
-        Qwen36MoeExpertBindings, Qwen36MoeLayerBindings, TensorView, U8View,
+        Nvfp4GateUpBindings, Qwen35_9B, Qwen36Fp8LinearBindings, Qwen36FullAttentionBindings,
+        Qwen36GdnBindings, Qwen36Moe35B, Qwen36MoeExpertBindings, Qwen36MoeLayerBindings,
+        TensorView, U8View,
     };
 
     const ROWS: usize = 128;
@@ -2959,6 +3093,177 @@ mod tests {
             2 * ROWS * COLUMNS + 4 * 32 * COLUMNS
         );
         assert_eq!(materialized.layer, 0);
+    }
+
+    #[test]
+    fn qwen36_attention_materialization_preserves_source_planes() {
+        const QUERY_ROWS: usize = 128;
+        const KV_ROWS: usize = 32;
+        const OUTPUT_COLUMNS: usize = 64;
+        const HEAD_DIM: usize = 16;
+
+        let query_weight = vec![0x10; QUERY_ROWS * COLUMNS];
+        let key_weight = vec![0x20; KV_ROWS * COLUMNS];
+        let value_weight = vec![0x30; KV_ROWS * COLUMNS];
+        let output_weight = vec![0x40; COLUMNS * OUTPUT_COLUMNS];
+        let query_norm = bf16_bytes(&[0x3f80; HEAD_DIM]);
+        let key_norm = bf16_bytes(&[0x4000; HEAD_DIM]);
+        let input_norm = bf16_bytes(&[0x4040; COLUMNS]);
+        let post_attention_norm = bf16_bytes(&[0x4080; COLUMNS]);
+        let input_scale = 0.25f32.to_le_bytes();
+        let query_weight_scale = 0.125f32.to_le_bytes();
+        let key_weight_scale = 0.0625f32.to_le_bytes();
+        let value_weight_scale = 0.03125f32.to_le_bytes();
+        let output_input_scale = 0.5f32.to_le_bytes();
+        let output_weight_scale = 0.015625f32.to_le_bytes();
+        let query_shape = [QUERY_ROWS as u64, COLUMNS as u64];
+        let kv_shape = [KV_ROWS as u64, COLUMNS as u64];
+        let output_shape = [COLUMNS as u64, OUTPUT_COLUMNS as u64];
+        let bindings = Qwen36FullAttentionBindings {
+            query_gate: Qwen36Fp8LinearBindings {
+                weight: fp8_view("query-weight", &query_shape, &query_weight),
+                input_scale: f32_scalar_view("query-input-scale", &input_scale),
+                weight_scale: f32_scalar_view("query-weight-scale", &query_weight_scale),
+                rows: QUERY_ROWS,
+                columns: COLUMNS,
+            },
+            key: Qwen36Fp8LinearBindings {
+                weight: fp8_view("key-weight", &kv_shape, &key_weight),
+                input_scale: f32_scalar_view("key-input-scale", &input_scale),
+                weight_scale: f32_scalar_view("key-weight-scale", &key_weight_scale),
+                rows: KV_ROWS,
+                columns: COLUMNS,
+            },
+            value: Qwen36Fp8LinearBindings {
+                weight: fp8_view("value-weight", &kv_shape, &value_weight),
+                input_scale: f32_scalar_view("value-input-scale", &input_scale),
+                weight_scale: f32_scalar_view("value-weight-scale", &value_weight_scale),
+                rows: KV_ROWS,
+                columns: COLUMNS,
+            },
+            output: Qwen36Fp8LinearBindings {
+                weight: fp8_view("output-weight", &output_shape, &output_weight),
+                input_scale: f32_scalar_view("output-input-scale", &output_input_scale),
+                weight_scale: f32_scalar_view("output-weight-scale", &output_weight_scale),
+                rows: COLUMNS,
+                columns: OUTPUT_COLUMNS,
+            },
+            query_norm: bf16_vector("query-norm", &[HEAD_DIM as u64], &query_norm),
+            key_norm: bf16_vector("key-norm", &[HEAD_DIM as u64], &key_norm),
+            input_norm: bf16_vector("input-norm", &[COLUMNS as u64], &input_norm),
+            post_attention_norm: bf16_vector(
+                "post-attention-norm",
+                &[COLUMNS as u64],
+                &post_attention_norm,
+            ),
+            layer: 1,
+        };
+        let different_input_scale = 0.5f32.to_le_bytes();
+        let scale_error = Qwen36FullAttentionBindings {
+            key: Qwen36Fp8LinearBindings {
+                input_scale: f32_scalar_view("key-input-scale", &different_input_scale),
+                ..bindings.key
+            },
+            ..bindings
+        }
+        .materialize_with_contract(2, 2, COLUMNS, QUERY_ROWS, KV_ROWS, OUTPUT_COLUMNS, HEAD_DIM)
+        .unwrap_err();
+
+        assert_eq!(scale_error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            scale_error
+                .to_string()
+                .contains("Q/K/V input_scale values differ")
+        );
+
+        let materialized = bindings
+            .materialize_with_contract(2, 2, COLUMNS, QUERY_ROWS, KV_ROWS, OUTPUT_COLUMNS, HEAD_DIM)
+            .unwrap();
+
+        assert_eq!(
+            materialized.qkv_weight_e4m3,
+            [
+                query_weight.as_slice(),
+                key_weight.as_slice(),
+                value_weight.as_slice(),
+            ]
+            .concat()
+        );
+        assert_eq!(materialized.qkv_input_scale.to_bits(), 0.25f32.to_bits());
+        assert_eq!(
+            materialized.qkv_weight_scales.map(|scale| scale.to_bits()),
+            [
+                0.125f32.to_bits(),
+                0.0625f32.to_bits(),
+                0.03125f32.to_bits(),
+            ]
+        );
+        assert_eq!(materialized.query_rows, QUERY_ROWS);
+        assert_eq!(materialized.kv_rows, KV_ROWS);
+        assert_eq!(materialized.qkv_rows, QUERY_ROWS + 2 * KV_ROWS);
+        assert_eq!(materialized.qkv_columns, COLUMNS);
+        assert_eq!(
+            materialized.output.weight_e4m3.as_ptr(),
+            output_weight.as_ptr()
+        );
+        assert_eq!(materialized.output.input_scale, 0.5);
+        assert_eq!(materialized.output.weight_scale, 0.015625);
+        assert_eq!(materialized.query_norm.word(0), Some(0x3f80));
+        assert_eq!(materialized.key_norm.word(0), Some(0x4000));
+        assert_eq!(materialized.input_norm.word(0), Some(0x4040));
+        assert_eq!(materialized.post_attention_norm.word(0), Some(0x4080));
+        assert_eq!(
+            materialized.owned_bytes(),
+            (QUERY_ROWS + 2 * KV_ROWS) * COLUMNS
+        );
+        assert_eq!(materialized.layer, 1);
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN36_SNAPSHOT with the pinned complete Qwen3.6 checkpoint"]
+    fn qwen36_source_attention_layer3_materializes_losslessly() {
+        let root = std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+            .expect("TUISKO_QWEN36_SNAPSHOT is required for the source-backed gate");
+        let snapshot =
+            CheckpointSnapshot::<Qwen36Moe35B>::open(std::path::Path::new(&root)).unwrap();
+        let bindings = Qwen36FullAttentionBindings::bind(&snapshot, 3).unwrap();
+        let qkv_source = [
+            bindings.query_gate.weight.codes(),
+            bindings.key.weight.codes(),
+            bindings.value.weight.codes(),
+        ]
+        .concat();
+        let output_weight = bindings.output.weight.codes();
+        let input_scale_bits = bindings.query_gate.input_scale.bits(0).unwrap();
+        let weight_scale_bits = [
+            bindings.query_gate.weight_scale.bits(0).unwrap(),
+            bindings.key.weight_scale.bits(0).unwrap(),
+            bindings.value.weight_scale.bits(0).unwrap(),
+        ];
+        let materialized = bindings.materialize().unwrap();
+
+        assert_eq!(materialized.qkv_weight_e4m3, qkv_source);
+        assert_eq!(materialized.qkv_input_scale.to_bits(), input_scale_bits);
+        assert_eq!(
+            materialized.qkv_weight_scales.map(|scale| scale.to_bits()),
+            weight_scale_bits
+        );
+        assert_eq!(materialized.query_rows, Qwen36Moe35B::ATTENTION_QUERY_ROWS);
+        assert_eq!(materialized.kv_rows, Qwen36Moe35B::ATTENTION_KV_ROWS);
+        assert_eq!(materialized.qkv_rows, Qwen36Moe35B::ATTENTION_QKV_ROWS);
+        assert_eq!(materialized.qkv_columns, Qwen36Moe35B::HIDDEN);
+        assert_eq!(materialized.qkv_weight_e4m3.len(), 18_874_368);
+        assert_eq!(
+            materialized.output.weight_e4m3.as_ptr(),
+            output_weight.as_ptr()
+        );
+        assert_eq!(materialized.output.weight_e4m3.len(), 8_388_608);
+        assert_eq!(materialized.query_norm.shape(), &[256]);
+        assert_eq!(materialized.key_norm.shape(), &[256]);
+        assert_eq!(materialized.input_norm.shape(), &[2_048]);
+        assert_eq!(materialized.post_attention_norm.shape(), &[2_048]);
+        assert_eq!(materialized.owned_bytes(), 18_874_368);
+        assert_eq!(materialized.layer, 3);
     }
 
     #[test]
