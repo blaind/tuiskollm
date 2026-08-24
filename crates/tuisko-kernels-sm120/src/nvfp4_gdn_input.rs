@@ -1,13 +1,20 @@
 //! Exact Qwen3.5 NVFP4 GDN input projections.
 
+use crate::device::nvfp4_prefill::{
+    BLOCK_N as W4_BLOCK_N, GROUP_K as W4_GROUP_K, THREADS as W4_THREADS, TILE_M as W4_TILE_M,
+    project_w4a4, quantize_bf16_rows,
+};
 use cuda_device::{
     SharedArray, cuda_module, kernel, launch_bounds, launch_contract, ptx_asm, thread,
 };
 use std::sync::Arc;
-use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_gpu::{
+    CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, LaunchConfig2D, PreparedLaunch,
+};
 use tuisko_model::{Arch, Qwen35_9B};
 
 const MAX_BATCH: usize = 8;
+const PREFILL_TOKENS: [usize; 3] = [32, 64, 128];
 const INPUT_COLUMNS: usize = Qwen35_9B::HIDDEN;
 const PROJECTED_ROWS: usize = Qwen35_9B::GDN_INPUT_ROWS;
 const CONTROL_ROWS: usize = 2 * Qwen35_9B::GDN_CONTROL_ROWS;
@@ -402,6 +409,102 @@ mod kernels {
             );
         }
     }
+
+    /// Quantizes exact Qwen3.5 prompt rows once for both GDN projections.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_gdn_input_quantize<const TOKENS: usize>(
+        input: *const u32,
+        codes: *mut u32,
+        scales: *mut u8,
+        input_scale_divisor: f32,
+    ) {
+        unsafe {
+            quantize_bf16_rows::<INPUT_COLUMNS, TOKENS>(
+                thread::index_1d().get(),
+                input,
+                codes,
+                scales,
+                input_scale_divisor,
+            );
+        }
+    }
+
+    /// Projects represented prompt rows into fused Q/K/V/Z.
+    #[kernel]
+    #[launch_bounds(384, 2)]
+    #[launch_contract(
+        domain = 2,
+        coordinates = u32,
+        block = (384, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_gdn_input_projected_w4a4<const TOKENS: usize>(
+        activation_codes: *const u32,
+        activation_scales: *const u8,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        output: *mut u16,
+        alpha: f32,
+    ) {
+        // T=32/64/128 expose 192/384/576 independent 48x64 tiles. Every
+        // m16n8k64 keeps the same K64 words and order; only independent
+        // token/output tiles move out of the 776 decode CTAs.
+        unsafe {
+            project_w4a4::<INPUT_COLUMNS, PROJECTED_ROWS, PROJECTED_ROWS, 0, TOKENS>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                alpha,
+                alpha,
+                alpha,
+            );
+        }
+    }
+
+    /// Projects the same represented prompt rows into padded A/B controls.
+    #[kernel]
+    #[launch_bounds(384, 2)]
+    #[launch_contract(
+        domain = 2,
+        coordinates = u32,
+        block = (384, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_gdn_input_control_w4a4<const TOKENS: usize>(
+        activation_codes: *const u32,
+        activation_scales: *const u8,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        output: *mut u16,
+        alpha: f32,
+    ) {
+        // Two 64-row tiles retain the padded 128-row source owner; rows 64..127
+        // consume its exact zero words and therefore publish exact BF16 zero.
+        unsafe {
+            project_w4a4::<INPUT_COLUMNS, PADDED_CONTROL_ROWS, PADDED_CONTROL_ROWS, 0, TOKENS>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                alpha,
+                alpha,
+                alpha,
+            );
+        }
+    }
 }
 
 fn launch_config() -> LaunchConfig1D {
@@ -456,9 +559,118 @@ impl<const TOKENS: usize> PreparedBatchRoute<TOKENS> {
     }
 }
 
+struct PreparedPrefillRoute<const TOKENS: usize> {
+    quantize: PreparedLaunch<kernels::__qwen35_nvfp4_gdn_input_quantize_CudaKernel<TOKENS>>,
+    projected: PreparedLaunch<kernels::__qwen35_nvfp4_gdn_input_projected_w4a4_CudaKernel<TOKENS>>,
+    control: PreparedLaunch<kernels::__qwen35_nvfp4_gdn_input_control_w4a4_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !PREFILL_TOKENS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 GDN-input prefill route T={TOKENS} is not admitted"
+            )));
+        }
+        let groups_per_row = INPUT_COLUMNS / W4_GROUP_K;
+        let quantize_blocks = u32::try_from((TOKENS * groups_per_row).div_ceil(256))
+            .map_err(|_| GpuError::invalid_launch("Qwen3.5 GDN quantization grid is too wide"))?;
+        let token_tiles = u32::try_from(TOKENS.div_ceil(W4_TILE_M))
+            .map_err(|_| GpuError::invalid_launch("Qwen3.5 GDN input grid is too tall"))?;
+        let projected_blocks = u32::try_from(PROJECTED_ROWS / W4_BLOCK_N)
+            .map_err(|_| GpuError::invalid_launch("Qwen3.5 GDN projected grid is too wide"))?;
+        let control_blocks = u32::try_from(PADDED_CONTROL_ROWS / W4_BLOCK_N)
+            .map_err(|_| GpuError::invalid_launch("Qwen3.5 GDN control grid is too wide"))?;
+
+        Ok(Self {
+            quantize: module
+                .prepare_qwen35_nvfp4_gdn_input_quantize::<TOKENS>(LaunchConfig1D::new(
+                    quantize_blocks,
+                    256,
+                    0,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.5 GDN activation quantization", source)
+                })?,
+            projected: module
+                .prepare_qwen35_nvfp4_gdn_input_projected_w4a4::<TOKENS>(LaunchConfig2D::new(
+                    (projected_blocks, token_tiles),
+                    (W4_THREADS, 1),
+                    0,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.5 projected GDN W4A4", source)
+                })?,
+            control: module
+                .prepare_qwen35_nvfp4_gdn_input_control_w4a4::<TOKENS>(LaunchConfig2D::new(
+                    (control_blocks, token_tiles),
+                    (W4_THREADS, 1),
+                    0,
+                ))
+                .map_err(|source| GpuError::launch("preparing Qwen3.5 control GDN W4A4", source))?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        projected_weight_codes: *const u8,
+        projected_weight_scales: *const u8,
+        projected_weight_scale_divisor: f32,
+        control_weight_codes: *const u8,
+        control_weight_scales: *const u8,
+        control_weight_scale_divisor: f32,
+        input_scale_divisor: f32,
+        projected_output: *mut u16,
+        control_output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_nvfp4_gdn_input_quantize::<TOKENS>(
+                stream,
+                &self.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                input_scale_divisor,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching Qwen3.5 GDN activation quantization", source)
+            })?;
+        module
+            .qwen35_nvfp4_gdn_input_projected_w4a4::<TOKENS>(
+                stream,
+                &self.projected,
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                projected_weight_codes.cast::<u32>(),
+                projected_weight_scales,
+                projected_output,
+                1.0 / (input_scale_divisor * projected_weight_scale_divisor),
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.5 projected GDN W4A4", source))?;
+        module
+            .qwen35_nvfp4_gdn_input_control_w4a4::<TOKENS>(
+                stream,
+                &self.control,
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                control_weight_codes.cast::<u32>(),
+                control_weight_scales,
+                control_output,
+                1.0 / (input_scale_divisor * control_weight_scale_divisor),
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.5 control GDN W4A4", source))
+    }
+}
+
 /// PTX symbols retained for every exact Qwen3.5 GDN input batch.
-pub(crate) fn qwen35_nvfp4_gdn_input_ptx_names() -> [&'static str; MAX_BATCH] {
-    [
+pub(crate) fn qwen35_nvfp4_gdn_input_ptx_names() -> Vec<&'static str> {
+    vec![
         kernels::qwen35_nvfp4_gdn_input_a16_ptx_name::<1>(),
         kernels::qwen35_nvfp4_gdn_input_a16_ptx_name::<2>(),
         kernels::qwen35_nvfp4_gdn_input_a16_ptx_name::<3>(),
@@ -467,6 +679,15 @@ pub(crate) fn qwen35_nvfp4_gdn_input_ptx_names() -> [&'static str; MAX_BATCH] {
         kernels::qwen35_nvfp4_gdn_input_a16_ptx_name::<6>(),
         kernels::qwen35_nvfp4_gdn_input_a16_ptx_name::<7>(),
         kernels::qwen35_nvfp4_gdn_input_a16_ptx_name::<8>(),
+        kernels::qwen35_nvfp4_gdn_input_quantize_ptx_name::<32>(),
+        kernels::qwen35_nvfp4_gdn_input_quantize_ptx_name::<64>(),
+        kernels::qwen35_nvfp4_gdn_input_quantize_ptx_name::<128>(),
+        kernels::qwen35_nvfp4_gdn_input_projected_w4a4_ptx_name::<32>(),
+        kernels::qwen35_nvfp4_gdn_input_projected_w4a4_ptx_name::<64>(),
+        kernels::qwen35_nvfp4_gdn_input_projected_w4a4_ptx_name::<128>(),
+        kernels::qwen35_nvfp4_gdn_input_control_w4a4_ptx_name::<32>(),
+        kernels::qwen35_nvfp4_gdn_input_control_w4a4_ptx_name::<64>(),
+        kernels::qwen35_nvfp4_gdn_input_control_w4a4_ptx_name::<128>(),
     ]
 }
 
@@ -481,6 +702,9 @@ pub struct Qwen35Nvfp4GdnInputOp {
     b6: PreparedBatchRoute<6>,
     b7: PreparedBatchRoute<7>,
     b8: PreparedBatchRoute<8>,
+    t32: PreparedPrefillRoute<32>,
+    t64: PreparedPrefillRoute<64>,
+    t128: PreparedPrefillRoute<128>,
 }
 
 impl Qwen35Nvfp4GdnInputOp {
@@ -500,6 +724,9 @@ impl Qwen35Nvfp4GdnInputOp {
             b6: PreparedBatchRoute::prepare(&module)?,
             b7: PreparedBatchRoute::prepare(&module)?,
             b8: PreparedBatchRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -574,13 +801,89 @@ impl Qwen35Nvfp4GdnInputOp {
             ))),
         }
     }
+
+    /// Quantizes exact prompt rows once and projects both GDN input families.
+    ///
+    /// # Safety
+    ///
+    /// `input` covers `tokens * 4_096` BF16 values. Activation scratch covers
+    /// packed E2M1 `[tokens, 4_096]` and E4M3 `[tokens, 256]`. Weight planes
+    /// cover projected `[12_288, 4_096]` and padded control `[128, 4_096]`
+    /// represented NVFP4. Outputs cover BF16 `[tokens, 12_288]` and
+    /// `[tokens, 128]`. Four-byte-loaded planes are aligned; all three divisors
+    /// are finite and positive; allocations are disjoint, live, and belong to
+    /// `stream`'s context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_prefill(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        projected_weight_codes: *const u8,
+        projected_weight_scales: *const u8,
+        projected_weight_scale_divisor: f32,
+        control_weight_codes: *const u8,
+        control_weight_scales: *const u8,
+        control_weight_scale_divisor: f32,
+        input_scale_divisor: f32,
+        projected_output: *mut u16,
+        control_output: *mut u16,
+    ) -> GpuResult<()> {
+        if [
+            input_scale_divisor,
+            projected_weight_scale_divisor,
+            control_weight_scale_divisor,
+        ]
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 NVFP4 GDN input prefill divisors must be finite and positive",
+            ));
+        }
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        input,
+                        activation_codes,
+                        activation_scales,
+                        projected_weight_codes,
+                        projected_weight_scales,
+                        projected_weight_scale_divisor,
+                        control_weight_codes,
+                        control_weight_scales,
+                        control_weight_scale_divisor,
+                        input_scale_divisor,
+                        projected_output,
+                        control_output,
+                    )
+                }
+            };
+        }
+
+        match tokens {
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
+            _ => Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 NVFP4 GDN input prefill row count {tokens} is outside the exact T=32,64,128 routes"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         CODE_WORDS_PER_PHASE, CONTROL_ROWS, GROUPS_PER_ROW, MAX_BATCH, PADDED_CONTROL_ROWS, PHASES,
-        PROJECTED_ROWS, SHARED_U32, TOTAL_ROWS, WARPS, qwen35_nvfp4_gdn_input_ptx_names,
+        PREFILL_TOKENS, PROJECTED_ROWS, SHARED_U32, TOTAL_ROWS, WARPS,
+        qwen35_nvfp4_gdn_input_ptx_names,
     };
     use std::collections::BTreeSet;
 
@@ -597,7 +900,8 @@ mod tests {
         assert_eq!(SHARED_U32 * size_of::<u32>(), 8_192);
 
         let names = qwen35_nvfp4_gdn_input_ptx_names();
-        assert_eq!(names.len(), MAX_BATCH);
+        assert_eq!(PREFILL_TOKENS, [32, 64, 128]);
+        assert_eq!(names.len(), MAX_BATCH + 3 * PREFILL_TOKENS.len());
         assert_eq!(
             names.iter().copied().collect::<BTreeSet<_>>().len(),
             names.len()
