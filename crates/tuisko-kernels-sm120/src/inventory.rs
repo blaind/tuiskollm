@@ -27,6 +27,7 @@ use crate::nvfp4_gdn_input::qwen35_nvfp4_gdn_input_ptx_names;
 use crate::nvfp4_qkv::qwen35_nvfp4_qkv_ptx_names;
 use crate::nvfp4_swiglu::{nvfp4_swiglu_ptx_names, qwen35_nvfp4_swiglu_ptx_names};
 use crate::qwen36_gdn_input::qwen36_gdn_input_ptx_names;
+use crate::qwen36_gdn_output::qwen36_gdn_output_ptx_names;
 use crate::residual_norm::{
     qwen35_residual_norm_ptx_names, qwen36_residual_norm_ptx_names, residual_norm_ptx_names,
 };
@@ -74,6 +75,7 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .chain(qwen36_moe_router_ptx_names())
         .chain(qwen36_moe_experts_ptx_names())
         .chain(qwen36_gdn_input_ptx_names())
+        .chain(qwen36_gdn_output_ptx_names())
         .collect()
 }
 
@@ -87,7 +89,7 @@ mod tests {
         let names = kernel_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 494);
+        assert_eq!(names.len(), 502);
         assert_eq!(unique.len(), names.len());
     }
 }
