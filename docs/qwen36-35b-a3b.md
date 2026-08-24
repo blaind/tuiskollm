@@ -93,14 +93,14 @@ oracle, with no post-warmup device growth. All 22 projection/selection entries u
 memory. At a 2,182 MHz median SM clock, the unblessed complete prompt graphs measure
 26.612/31.980/43.252 us at T=32/64/128; B=1/8 measure 18.444/20.491 us. The expert path separately
 qualifies all selected routed experts, the always-active shared expert, and their fixed-order
-combination at every exact `B=1..8`. Its owner retains all 256 numeric-order expert planes in
-454,760,448 weight bytes and uses 434,448 address-stable workspace bytes. Its 24 gate/up, down, and
-combine entries use zero stack/local memory and pass complete eager/oracle plus CUDA Graph
-agreement.
-
-At a measured 2,182 MHz median SM clock, the warm expert-only repeated path is 12.726 us at B=1
-and 76.390 us at B=8. The rise after B=6 coincides with the selected expert working set exceeding
-the target's cache, so these are leaf diagnostics rather than a cold whole-layer or model claim.
+combination at every exact `B=1..8` and `T=32/64/128`. Across those routes it checks 1,198,080
+gate/up, 4,792,320 down, 260 shared-gate, 532,480 combined, 6,523,140 graph-replay, and 57,604,344
+inactive values against the independent represented-value oracle. Its owner retains all 256
+numeric-order expert planes in 454,760,448 weight bytes and uses 6,951,168 address-stable workspace
+bytes. All 33 gate/up, down, and combine entries use zero stack/local memory. At locked
+2,197/13,801 MHz SM/memory clocks, the unblessed complete prompt graphs measure
+252.088/479.809/936.724 us at T=32/64/128; B=1/8 measure 14.348/81.375 us. These remain leaf
+diagnostics rather than a cold whole-layer or model claim.
 The 2,048-wide zero-centered RMSNorm and fused residual-publication routes also cover every exact
 `B=1..8`, pass 786,432 oracle/graph/sentinel observations, and measure 1.761/1.858 us plain plus
 1.887/1.948 us fused at B=1/8 with a locked 2,197 MHz SM clock. The first GDN projection family
@@ -146,7 +146,7 @@ weight bytes and 18,251,056 workspace/state bytes in one 507,955,968-byte arena.
 eager/graph agreement, inactive seam checks, immutable source checks, and zero post-warmup growth;
 B=1 additionally passes the complete represented source formula. At a diagnostic 2,107 MHz median
 SM clock, its direct graph measures 67.869/201.387 us at B=1/8. Full-attention layers, the endpoint,
-exact prefill experts, and model inference remain unimplemented. The full-attention source seam is
+and model inference remain unimplemented. The full-attention source seam is
 now admitted separately: Q, K, and V preserve their E4M3 bytes and three scalar FP32 weight scales
 while losslessly gathering into one `[9216,2048]` Q/K/V plane; the source-native
 `[2048,4096]` output plane remains zero-copy. The first full-attention compute leaf statically

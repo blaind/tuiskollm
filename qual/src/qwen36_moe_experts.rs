@@ -10,6 +10,8 @@ use tuisko_gpu::{
 use tuisko_model::{Arch, Qwen36Moe35B};
 
 pub(crate) const MAX_BATCH: usize = 8;
+pub(crate) const MAX_ROWS: usize = 128;
+pub(crate) const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 const ALIGNMENT: usize = 256;
 pub(crate) const HIDDEN: usize = Qwen36Moe35B::HIDDEN;
 pub(crate) const INTERMEDIATE: usize = Qwen36Moe35B::INTERMEDIATE;
@@ -152,7 +154,7 @@ struct Outputs {
     output: Vec<u16>,
 }
 
-/// Qualifies eager and captured routed/shared expert execution at `B=1..=8`.
+/// Qualifies eager and captured routed/shared expert execution at every exact route.
 pub fn qualify_qwen36_moe_experts()
 -> Result<Qwen36MoeExpertsQualification, Qwen36MoeExpertsQualificationError> {
     let _preflight = device_benchmark::preflight()?;
@@ -187,26 +189,26 @@ pub fn qualify_qwen36_moe_experts()
         maximum_absolute_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
+    for rows in EXACT_ROUTES {
         fill_outputs(&arena, &stream, regions)?;
-        launch(&op, &arena, &stream, regions, batch, &fixture)?;
+        launch(&op, &arena, &stream, regions, rows, &fixture)?;
         let eager = read_outputs(&arena, &stream, regions)?;
-        verify_eager(batch, &fixture, &eager, &mut report)?;
+        verify_eager(rows, &fixture, &eager, &mut report)?;
 
         fill_outputs(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
         let graph = CudaGraph::capture(&stream, || {
-            launch(&op, &arena, &stream, regions, batch, &fixture)
+            launch(&op, &arena, &stream, regions, rows, &fixture)
         })?;
         // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
         unsafe { graph.launch(&stream) }?;
         // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
         unsafe { graph.launch(&stream) }?;
         let replay = read_outputs(&arena, &stream, regions)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
         if addresses(&arena, regions)? != stable_addresses {
             return Err(Qwen36MoeExpertsQualificationError::Mismatch(format!(
-                "device addresses changed while qualifying B={batch}"
+                "device addresses changed while qualifying rows={rows}"
             )));
         }
     }
@@ -220,9 +222,9 @@ pub fn qualify_qwen36_moe_experts()
 
 pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let input = layout.reserve(MAX_BATCH * HIDDEN, ALIGNMENT)?;
-    let expert_indices = layout.reserve(MAX_BATCH * TOP_K, ALIGNMENT)?;
-    let routing_weights = layout.reserve(MAX_BATCH * TOP_K, ALIGNMENT)?;
+    let input = layout.reserve(MAX_ROWS * HIDDEN, ALIGNMENT)?;
+    let expert_indices = layout.reserve(MAX_ROWS * TOP_K, ALIGNMENT)?;
+    let routing_weights = layout.reserve(MAX_ROWS * TOP_K, ALIGNMENT)?;
     let routed_gate_up_codes = layout.reserve(EXPERTS * GATE_UP_CODE_BYTES, ALIGNMENT)?;
     let routed_gate_up_scales = layout.reserve(EXPERTS * GATE_UP_SCALE_BYTES, ALIGNMENT)?;
     let routed_gate_up_weight_scales_2 = layout.reserve(EXPERTS, ALIGNMENT)?;
@@ -234,10 +236,10 @@ pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let shared_down_codes = layout.reserve(DOWN_CODE_BYTES, ALIGNMENT)?;
     let shared_down_scales = layout.reserve(DOWN_SCALE_BYTES, ALIGNMENT)?;
     let shared_gate_weight = layout.reserve(HIDDEN, ALIGNMENT)?;
-    let intermediate = layout.reserve(MAX_BATCH * SLOTS * INTERMEDIATE, ALIGNMENT)?;
-    let expert_output = layout.reserve(MAX_BATCH * SLOTS * HIDDEN, ALIGNMENT)?;
-    let shared_gate = layout.reserve(MAX_BATCH, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * HIDDEN, ALIGNMENT)?;
+    let intermediate = layout.reserve(MAX_ROWS * SLOTS * INTERMEDIATE, ALIGNMENT)?;
+    let expert_output = layout.reserve(MAX_ROWS * SLOTS * HIDDEN, ALIGNMENT)?;
+    let shared_gate = layout.reserve(MAX_ROWS, ALIGNMENT)?;
+    let output = layout.reserve(MAX_ROWS * HIDDEN, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -388,17 +390,16 @@ fn read_outputs(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> G
 }
 
 pub(crate) fn make_fixture() -> Fixture {
-    let input = (0..MAX_BATCH * HIDDEN)
+    let input = (0..MAX_ROWS * HIDDEN)
         .map(|index| {
             let token = index / HIDDEN;
             let column = index % HIDDEN;
-            f32_to_bf16((token as f32 + 1.0) * (column as i32 % 17 - 8) as f32 / 256.0)
+            let pattern = token & (MAX_BATCH - 1);
+            f32_to_bf16((pattern as f32 + 1.0) * (column as i32 % 17 - 8) as f32 / 256.0)
         })
         .collect::<Vec<_>>();
-    let expert_indices = (0..MAX_BATCH)
-        .flat_map(selected_experts)
-        .collect::<Vec<_>>();
-    let routing_weights = (0..MAX_BATCH)
+    let expert_indices = (0..MAX_ROWS).flat_map(selected_experts).collect::<Vec<_>>();
+    let routing_weights = (0..MAX_ROWS)
         .flat_map(|_| ROUTING_WEIGHTS.map(f32_to_bf16))
         .collect::<Vec<_>>();
     let selected = selected_mask(&expert_indices);
@@ -478,10 +479,10 @@ pub(crate) fn make_fixture() -> Fixture {
         shared_down_scales,
         shared_down_weight_scale_2,
         shared_gate_weight,
-        expected_intermediate: vec![0; MAX_BATCH * SLOTS * INTERMEDIATE],
-        expected_expert_output: vec![0; MAX_BATCH * SLOTS * HIDDEN],
-        expected_shared_gate: vec![0; MAX_BATCH],
-        expected_output: vec![0; MAX_BATCH * HIDDEN],
+        expected_intermediate: vec![0; MAX_ROWS * SLOTS * INTERMEDIATE],
+        expected_expert_output: vec![0; MAX_ROWS * SLOTS * HIDDEN],
+        expected_shared_gate: vec![0; MAX_ROWS],
+        expected_output: vec![0; MAX_ROWS * HIDDEN],
     };
     build_oracle(&mut fixture);
 
@@ -489,15 +490,16 @@ pub(crate) fn make_fixture() -> Fixture {
 }
 
 fn selected_experts(token: usize) -> [u16; TOP_K] {
+    let token = (token & (MAX_BATCH - 1)) as u16;
     [
-        255 - token as u16,
-        token as u16,
-        17 + token as u16,
-        49 + token as u16,
-        81 + token as u16,
-        113 + token as u16,
-        145 + token as u16,
-        177 + token as u16,
+        255 - token,
+        token,
+        17 + token,
+        49 + token,
+        81 + token,
+        113 + token,
+        145 + token,
+        177 + token,
     ]
 }
 
@@ -544,7 +546,26 @@ fn scale_offset(row: usize, group: usize, groups: usize) -> usize {
 }
 
 fn build_oracle(fixture: &mut Fixture) {
-    for token in 0..MAX_BATCH {
+    for token in 0..MAX_ROWS {
+        if token >= MAX_BATCH {
+            let pattern = token & (MAX_BATCH - 1);
+            fixture.expected_intermediate.copy_within(
+                pattern * SLOTS * INTERMEDIATE..(pattern + 1) * SLOTS * INTERMEDIATE,
+                token * SLOTS * INTERMEDIATE,
+            );
+            fixture.expected_expert_output.copy_within(
+                pattern * SLOTS * HIDDEN..(pattern + 1) * SLOTS * HIDDEN,
+                token * SLOTS * HIDDEN,
+            );
+            fixture
+                .expected_shared_gate
+                .copy_within(pattern..pattern + 1, token);
+            fixture
+                .expected_output
+                .copy_within(pattern * HIDDEN..(pattern + 1) * HIDDEN, token * HIDDEN);
+            continue;
+        }
+
         let input = &fixture.input[token * HIDDEN..(token + 1) * HIDDEN];
         for position in 0..SLOTS {
             let slot = token * SLOTS + position;
@@ -708,17 +729,17 @@ fn decode_e4m3(code: u8) -> f32 {
 }
 
 fn verify_eager(
-    batch: usize,
+    rows: usize,
     fixture: &Fixture,
     observed: &Outputs,
     report: &mut Qwen36MoeExpertsQualification,
 ) -> Result<(), Qwen36MoeExpertsQualificationError> {
-    let intermediate = batch * SLOTS * INTERMEDIATE;
-    let expert_output = batch * SLOTS * HIDDEN;
-    let shared_gate = batch;
-    let output = batch * HIDDEN;
+    let intermediate = rows * SLOTS * INTERMEDIATE;
+    let expert_output = rows * SLOTS * HIDDEN;
+    let shared_gate = rows;
+    let output = rows * HIDDEN;
     compare_bf16(
-        batch,
+        rows,
         "intermediate",
         &observed.intermediate[..intermediate],
         &fixture.expected_intermediate[..intermediate],
@@ -726,7 +747,7 @@ fn verify_eager(
         report,
     )?;
     compare_bf16(
-        batch,
+        rows,
         "expert output",
         &observed.expert_output[..expert_output],
         &fixture.expected_expert_output[..expert_output],
@@ -734,7 +755,7 @@ fn verify_eager(
         report,
     )?;
     compare_bf16(
-        batch,
+        rows,
         "shared gate",
         &observed.shared_gate[..shared_gate],
         &fixture.expected_shared_gate[..shared_gate],
@@ -742,25 +763,25 @@ fn verify_eager(
         report,
     )?;
     compare_bf16(
-        batch,
+        rows,
         "combined output",
         &observed.output[..output],
         &fixture.expected_output[..output],
         0.08,
         report,
     )?;
-    verify_inactive(batch, observed)?;
+    verify_inactive(rows, observed)?;
     report.intermediate_values += intermediate;
     report.expert_output_values += expert_output;
     report.shared_gate_values += shared_gate;
     report.combined_values += output;
-    report.inactive_values += inactive_values(batch);
+    report.inactive_values += inactive_values(rows);
 
     Ok(())
 }
 
 fn compare_bf16(
-    batch: usize,
+    rows: usize,
     role: &str,
     actual: &[u16],
     expected: &[u16],
@@ -774,7 +795,7 @@ fn compare_bf16(
         report.maximum_absolute_error = report.maximum_absolute_error.max(error);
         if !actual.is_finite() || error > tolerance {
             return Err(Qwen36MoeExpertsQualificationError::Mismatch(format!(
-                "B={batch} {role} {index}: device={actual}, oracle={expected}, error={error}"
+                "rows={rows} {role} {index}: device={actual}, oracle={expected}, error={error}"
             )));
         }
     }
@@ -783,7 +804,7 @@ fn compare_bf16(
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     eager: &Outputs,
     replay: &Outputs,
     report: &mut Qwen36MoeExpertsQualification,
@@ -794,48 +815,44 @@ fn verify_replay(
         || eager.output != replay.output
     {
         return Err(Qwen36MoeExpertsQualificationError::Mismatch(format!(
-            "B={batch} graph replay differs from eager execution"
+            "rows={rows} graph replay differs from eager execution"
         )));
     }
-    verify_inactive(batch, replay)?;
-    report.graph_replay_values += batch * (SLOTS * INTERMEDIATE + SLOTS * HIDDEN + 1 + HIDDEN);
-    report.inactive_values += inactive_values(batch);
+    verify_inactive(rows, replay)?;
+    report.graph_replay_values += rows * (SLOTS * INTERMEDIATE + SLOTS * HIDDEN + 1 + HIDDEN);
+    report.inactive_values += inactive_values(rows);
 
     Ok(())
 }
 
-fn inactive_values(batch: usize) -> usize {
-    (MAX_BATCH - batch) * (SLOTS * INTERMEDIATE + SLOTS * HIDDEN + 1 + HIDDEN)
+fn inactive_values(rows: usize) -> usize {
+    (MAX_ROWS - rows) * (SLOTS * INTERMEDIATE + SLOTS * HIDDEN + 1 + HIDDEN)
 }
 
 fn verify_inactive(
-    batch: usize,
+    rows: usize,
     observed: &Outputs,
 ) -> Result<(), Qwen36MoeExpertsQualificationError> {
     for (role, values, begin) in [
         (
             "intermediate",
             observed.intermediate.as_slice(),
-            batch * SLOTS * INTERMEDIATE,
+            rows * SLOTS * INTERMEDIATE,
         ),
         (
             "expert output",
             observed.expert_output.as_slice(),
-            batch * SLOTS * HIDDEN,
+            rows * SLOTS * HIDDEN,
         ),
-        ("shared gate", observed.shared_gate.as_slice(), batch),
-        (
-            "combined output",
-            observed.output.as_slice(),
-            batch * HIDDEN,
-        ),
+        ("shared gate", observed.shared_gate.as_slice(), rows),
+        ("combined output", observed.output.as_slice(), rows * HIDDEN),
     ] {
         if let Some(relative) = values[begin..]
             .iter()
             .position(|&value| value != BF16_SENTINEL)
         {
             return Err(Qwen36MoeExpertsQualificationError::Mismatch(format!(
-                "B={batch} modified inactive {role} value {}",
+                "rows={rows} modified inactive {role} value {}",
                 begin + relative
             )));
         }
@@ -942,11 +959,10 @@ fn verify_no_post_warmup_allocation(
     regions: Regions,
     fixture: &Fixture,
 ) -> Result<(), Qwen36MoeExpertsQualificationError> {
-    let graphs = (1..=MAX_BATCH)
-        .map(|batch| {
-            CudaGraph::capture(stream, || {
-                launch(op, arena, stream, regions, batch, fixture)
-            })
+    let graphs = EXACT_ROUTES
+        .iter()
+        .map(|&rows| {
+            CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows, fixture))
         })
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
@@ -956,9 +972,9 @@ fn verify_no_post_warmup_allocation(
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..2 {
-        for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
+        for graph in graphs.iter().rev() {
             // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
-            unsafe { graphs[batch - 1].launch(stream) }?;
+            unsafe { graph.launch(stream) }?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -981,9 +997,9 @@ mod tests {
         let (layout, regions) = layout().unwrap();
 
         assert_eq!(regions.weight_bytes(), 454_760_448);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 434_448);
-        assert_eq!(layout.byte_len(), 455_195_392);
-        assert_eq!(layout.byte_len() - regions.payload_bytes(), 496);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 6_951_168);
+        assert_eq!(layout.byte_len(), 461_711_616);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 0);
         for token in 0..MAX_BATCH {
             let selected = selected_experts(token);
             assert_eq!(
@@ -999,11 +1015,14 @@ mod tests {
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn exact_batches_match_independent_oracles_and_graph_replay()
+    fn exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), Qwen36MoeExpertsQualificationError> {
         let report = qualify_qwen36_moe_experts()?;
-        let active = (1..=MAX_BATCH).sum::<usize>();
-        let inactive = (1..=MAX_BATCH).map(inactive_values).sum::<usize>();
+        let active = EXACT_ROUTES.iter().sum::<usize>();
+        let inactive = EXACT_ROUTES
+            .iter()
+            .map(|&rows| inactive_values(rows))
+            .sum::<usize>();
 
         assert_eq!(report.intermediate_values, active * SLOTS * INTERMEDIATE);
         assert_eq!(report.expert_output_values, active * SLOTS * HIDDEN);
@@ -1014,11 +1033,11 @@ mod tests {
             active * (SLOTS * INTERMEDIATE + SLOTS * HIDDEN + 1 + HIDDEN)
         );
         assert_eq!(report.inactive_values, 2 * inactive);
-        assert_eq!(report.immutable_bytes, 454_793_472);
-        assert_eq!(report.arena_bytes, 455_195_392);
+        assert_eq!(report.immutable_bytes, 455_288_832);
+        assert_eq!(report.arena_bytes, 461_711_616);
         assert_eq!(report.weight_bytes, 454_760_448);
-        assert_eq!(report.workspace_bytes, 434_448);
-        assert_eq!(report.padding_bytes, 496);
+        assert_eq!(report.workspace_bytes, 6_951_168);
+        assert_eq!(report.padding_bytes, 0);
         assert!(report.maximum_absolute_error.is_finite());
 
         Ok(())

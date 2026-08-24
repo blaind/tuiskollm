@@ -1639,7 +1639,7 @@ fn qualify_qwen36_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "qwen36_moe_experts",
+            "qwen36_moe_experts::tests::exact_routes_match_independent_oracles_and_graph_replay",
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -10669,14 +10669,53 @@ fn gate_qwen36_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_moe_expert_combine_TID_"))
         .collect::<Vec<_>>();
+    let prefill_gate_up = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen36_moe_expert_gate_up_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
+    let prefill_down = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen36_moe_expert_down_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
+    let prefill_combine = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen36_moe_expert_combine_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.6 MoE expert gate/up", gate_up.len(), 8)?;
     require_count("Qwen3.6 MoE expert down", down.len(), 8)?;
     require_count("Qwen3.6 MoE expert combine", combine.len(), 8)?;
+    require_count(
+        "Qwen3.6 MoE prompt expert gate/up",
+        prefill_gate_up.len(),
+        3,
+    )?;
+    require_count("Qwen3.6 MoE prompt expert down", prefill_down.len(), 3)?;
+    require_count(
+        "Qwen3.6 MoE prompt expert combine",
+        prefill_combine.len(),
+        3,
+    )?;
 
     for (role, routes, instructions) in [
         (
             "gate/up",
-            gate_up.as_slice(),
+            gate_up
+                .iter()
+                .chain(&prefill_gate_up)
+                .copied()
+                .collect::<Vec<_>>(),
             &[
                 "cvt.rn.f16x2.e2m1x2",
                 "shfl.sync.down.b32",
@@ -10685,16 +10724,23 @@ fn gate_qwen36_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
         ),
         (
             "down",
-            down.as_slice(),
+            down.iter()
+                .chain(&prefill_down)
+                .copied()
+                .collect::<Vec<_>>(),
             &["cvt.rn.f16x2.e2m1x2", "shfl.sync.down.b32"][..],
         ),
         (
             "combine",
-            combine.as_slice(),
+            combine
+                .iter()
+                .chain(&prefill_combine)
+                .copied()
+                .collect::<Vec<_>>(),
             &["fma.rn.f32", "ex2.approx.f32"][..],
         ),
     ] {
-        for entry in routes {
+        for entry in &routes {
             if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2")
             {
                 return Err(format!(
@@ -10719,11 +10765,17 @@ fn gate_qwen36_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
     let resources = &artifact.resources;
     let sass = artifact.sass()?;
     let mut gate_up_registers = Vec::with_capacity(gate_up.len());
+    let mut prefill_gate_up_registers = Vec::with_capacity(prefill_gate_up.len());
     let mut down_registers = Vec::with_capacity(down.len());
+    let mut prefill_down_registers = Vec::with_capacity(prefill_down.len());
     let mut combine_registers = Vec::with_capacity(combine.len());
-    let mut gate_up_shared = Vec::with_capacity(gate_up.len());
-    let mut down_shared = Vec::with_capacity(down.len());
-    let mut combine_shared = Vec::with_capacity(combine.len());
+    let mut prefill_combine_registers = Vec::with_capacity(prefill_combine.len());
+    let mut gate_up_shared = Vec::with_capacity(gate_up.len() + prefill_gate_up.len());
+    let mut prefill_gate_up_shared = Vec::with_capacity(prefill_gate_up.len());
+    let mut down_shared = Vec::with_capacity(down.len() + prefill_down.len());
+    let mut prefill_down_shared = Vec::with_capacity(prefill_down.len());
+    let mut combine_shared = Vec::with_capacity(combine.len() + prefill_combine.len());
+    let mut prefill_combine_shared = Vec::with_capacity(prefill_combine.len());
 
     for (role, routes, instructions, registers, shared) in [
         (
@@ -10734,6 +10786,13 @@ fn gate_qwen36_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
             &mut gate_up_shared,
         ),
         (
+            "prompt gate/up",
+            prefill_gate_up,
+            &["F2FP.F16.E2M1", "SHFL.DOWN", "MUFU.EX2", "STG.E.U16"][..],
+            &mut prefill_gate_up_registers,
+            &mut prefill_gate_up_shared,
+        ),
+        (
             "down",
             down,
             &["F2FP.F16.E2M1", "SHFL.DOWN", "STG.E.U16"][..],
@@ -10741,11 +10800,25 @@ fn gate_qwen36_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
             &mut down_shared,
         ),
         (
+            "prompt down",
+            prefill_down,
+            &["F2FP.F16.E2M1", "SHFL.DOWN", "STG.E.U16"][..],
+            &mut prefill_down_registers,
+            &mut prefill_down_shared,
+        ),
+        (
             "combine",
             combine,
             &["MUFU.EX2", "FFMA", "STG.E.U16"][..],
             &mut combine_registers,
             &mut combine_shared,
+        ),
+        (
+            "prompt combine",
+            prefill_combine,
+            &["MUFU.EX2", "FFMA", "STG.E.U16"][..],
+            &mut prefill_combine_registers,
+            &mut prefill_combine_shared,
         ),
     ] {
         for entry in routes {
@@ -10776,23 +10849,47 @@ fn gate_qwen36_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
     gate_up_registers.sort_unstable();
+    prefill_gate_up_registers.sort_unstable();
     down_registers.sort_unstable();
+    prefill_down_registers.sort_unstable();
     combine_registers.sort_unstable();
+    prefill_combine_registers.sort_unstable();
+    gate_up_shared.extend(prefill_gate_up_shared);
+    down_shared.extend(prefill_down_shared);
+    combine_shared.extend(prefill_combine_shared);
     gate_up_shared.sort_unstable();
     down_shared.sort_unstable();
     combine_shared.sort_unstable();
     require_registers(&baseline, "gate_up_registers", &gate_up_registers)?;
     require_registers(&baseline, "down_registers", &down_registers)?;
     require_registers(&baseline, "combine_registers", &combine_registers)?;
+    for (key, registers) in [
+        (
+            "prefill_gate_up_registers",
+            prefill_gate_up_registers.as_slice(),
+        ),
+        ("prefill_down_registers", prefill_down_registers.as_slice()),
+        (
+            "prefill_combine_registers",
+            prefill_combine_registers.as_slice(),
+        ),
+    ] {
+        if baseline.contains_key(key) {
+            require_registers(&baseline, key, registers)?;
+        }
+    }
     require_uniform_value(&baseline, "gate_up_shared_bytes", &gate_up_shared)?;
     require_uniform_value(&baseline, "down_shared_bytes", &down_shared)?;
     require_uniform_value(&baseline, "combine_shared_bytes", &combine_shared)?;
 
     println!(
-        "Qwen3.6 MoE expert gate passed: 8 gate/up + 8 down + 8 combine entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}, E2M1/SHFL/EX2/BF16-store present",
+        "Qwen3.6 MoE expert gate passed: 8 decode + 3 prefill routes, REG gate/up {:?} / {:?}, down {:?} / {:?}, combine {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}, E2M1/SHFL/EX2/BF16-store present",
         gate_up_registers,
+        prefill_gate_up_registers,
         down_registers,
+        prefill_down_registers,
         combine_registers,
+        prefill_combine_registers,
         gate_up_shared,
         down_shared,
         combine_shared

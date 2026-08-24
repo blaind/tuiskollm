@@ -7,8 +7,8 @@ use crate::device_benchmark::{
     preflight, require_current_process_exclusive, warmup_launches,
 };
 use crate::qwen36_moe_experts::{
-    HIDDEN, INTERMEDIATE, MAX_BATCH, Regions, SLOTS, TOP_K, copy_fixture, launch, layout,
-    make_fixture,
+    EXACT_ROUTES, HIDDEN, INTERMEDIATE, MAX_BATCH, Regions, SLOTS, TOP_K, copy_fixture, launch,
+    layout, make_fixture,
 };
 use crate::target::Qwen36MoeExpertsOp;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ const DOWN_CODE_BYTES: usize = HIDDEN * INTERMEDIATE / 2;
 const DOWN_SCALE_BYTES: usize = HIDDEN * (INTERMEDIATE / 16);
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
@@ -53,14 +53,15 @@ impl Session {
         copy_fixture(&arena, &stream, regions, &fixture)?;
         stream.synchronize().map_err(GpuError::from)?;
         let op = Qwen36MoeExpertsOp::new(&context)?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| {
+        let routes = EXACT_ROUTES
+            .iter()
+            .map(|&rows| {
                 capture_route(
                     &op,
                     &arena,
                     &stream,
                     regions,
-                    batch,
+                    rows,
                     repeated_operations,
                     &fixture,
                 )
@@ -92,15 +93,22 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     "qwen36_35b_a3b/moe_experts/nvfp4_top8_shared",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
                     &route.leaf,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 )
@@ -115,37 +123,35 @@ fn capture_route(
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
-    batch: usize,
+    rows: usize,
     repeated_operations: u64,
     fixture: &crate::qwen36_moe_experts::Fixture,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || {
-        launch(op, arena, stream, regions, batch, fixture)
-    })?;
+    let leaf = CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows, fixture))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, arena, stream, regions, batch, fixture)?;
+            launch(op, arena, stream, regions, rows, fixture)?;
         }
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
         leaf,
         repeated,
     })
 }
 
-fn logical_bytes(batch: usize) -> usize {
-    let selected_weight_bytes = batch
+fn logical_bytes(rows: usize) -> usize {
+    let selected_weight_bytes = rows
         * SLOTS
         * (GATE_UP_CODE_BYTES + GATE_UP_SCALE_BYTES + DOWN_CODE_BYTES + DOWN_SCALE_BYTES);
-    let input = batch * HIDDEN * size_of::<u16>();
-    let routing = batch * TOP_K * 2 * size_of::<u16>();
-    let shared_gate_weight = batch * HIDDEN * size_of::<u16>();
-    let intermediate = batch * SLOTS * INTERMEDIATE * 2 * size_of::<u16>();
-    let expert_output = batch * SLOTS * HIDDEN * 2 * size_of::<u16>();
-    let output = batch * HIDDEN * size_of::<u16>();
+    let input = rows * HIDDEN * size_of::<u16>();
+    let routing = rows * TOP_K * 2 * size_of::<u16>();
+    let shared_gate_weight = rows * HIDDEN * size_of::<u16>();
+    let intermediate = rows * SLOTS * INTERMEDIATE * 2 * size_of::<u16>();
+    let expert_output = rows * SLOTS * HIDDEN * 2 * size_of::<u16>();
+    let output = rows * HIDDEN * size_of::<u16>();
 
     selected_weight_bytes
         + input
@@ -177,7 +183,7 @@ pub fn benchmark_qwen36_moe_experts(
         "qwen36_35b_a3b/moe_experts/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes - padding_bytes,
-        "max_batch=8 input, top-eight routing, nine expert slots, and combined output",
+        "max_rows=128 input, top-eight routing, nine expert slots, and combined output",
     )?;
     memory.register_owned(
         "qwen36_35b_a3b/moe_experts/alignment_padding",
@@ -218,9 +224,11 @@ mod tests {
     fn accounting_covers_selected_experts_and_every_workspace_seam() {
         assert_eq!(logical_bytes(1), 16_029_728);
         assert_eq!(logical_bytes(MAX_BATCH), 128_237_824);
+        assert_eq!(logical_bytes(128), 2_051_805_184);
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
 
         let (layout, regions) = layout().unwrap();
         assert_eq!(regions.weight_bytes(), 454_760_448);
-        assert_eq!(layout.byte_len(), 455_195_392);
+        assert_eq!(layout.byte_len(), 461_711_616);
     }
 }
