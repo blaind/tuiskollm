@@ -177,6 +177,14 @@ growth in one 290,107,392-byte arena. At locked 2,197/13,801 MHz SM/memory clock
 direct graph measures 199.142/448.010 us at B=1/8; the repeated intrinsic path measures
 197.736/446.026 us and the B=1 route reads the 286 MB endpoint at 1,349.78 GiB/s.
 
+The initial resident text layout then composes 30 GDN/MoE layers, ten full-attention/MoE layers,
+and the endpoint into 41 address-stable arenas. It accounts 19,808,036,096 device weight bytes,
+31,457,280 short-context BF16 cache bytes, 563,187,136 workspace/state bytes, and 46,400 alignment
+bytes for a 20,402,726,912-byte allocation. Eight whole-model decode graphs chain each layer's
+BF16 publication directly into the next owner. Source-backed whole-model qualification remains the
+next separate slice; native prompt graphs will be reconciled with the resident-prefill stack after
+that stack lands.
+
 ## Implementation order
 
 1. Add the pinned architecture profile and validate both `config.json` and
