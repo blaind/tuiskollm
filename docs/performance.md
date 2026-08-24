@@ -843,8 +843,8 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
   case identity, median TTFT,
   inter-token cadence, request latency, completion throughput, whole-board and above-idle energy,
   resident memory, driver, clock bands, binary provenance, and short versus long-context inventory.
-  No checked full-server baseline has been blessed yet. Direct long-context operator and
-  resident-model timing exists.
+  The short-context full-server baseline is checked; the optional long-context HTTP inventory has
+  no checked baseline yet. Direct long-context operator and resident-model timing exists.
 - Power and energy are reportable for the resident model and complete HTTP suite. Full-server
   energy has no checked regression baseline yet.
 - `ncu` and Nsight Systems traces are first-class diagnostic artifacts, but remain outside checked
