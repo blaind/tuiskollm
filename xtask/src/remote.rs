@@ -12,10 +12,10 @@ use crate::gpu_target::{GpuTarget, has_full_kernel_inventory};
 #[cfg(feature = "remote")]
 const USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
     <qualify-residual-norm|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
-    qualify-nvfp4-mlp|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-long-context-paged-gqa|qualify-attention-output|qualify-full-attention-layer|\
+    qualify-nvfp4-mlp|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-long-context-paged-gqa|qualify-attention-output|qualify-mtp-bf16-fusion|qualify-full-attention-layer|\
     qualify-resident-model|qualify-resident-generation|qualify-resident-batch-generation|\
     bench-residual-norm|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-fp8-qkv|bench-fp8-gdn-input|\
-    bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-full-attention-layer|\
+    bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-mtp-bf16-fusion|bench-full-attention-layer|\
     bench-resident-model|bench-resident-prefill|bench-resident-long-context-model|\
     probe|check|sweep> \
     [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
@@ -45,6 +45,7 @@ impl Qualification {
             "qualify-paged-gqa" => "paged_gqa_suite_",
             "qualify-long-context-paged-gqa" => "long_context_paged_gqa",
             "qualify-attention-output" => "attention_output::tests",
+            "qualify-mtp-bf16-fusion" => "mtp_bf16_fusion_suite_",
             "qualify-full-attention-layer" => {
                 "full_attention_layer::tests::source_layer63_matches_complete_seam_oracles_and_graph_replay"
             }
@@ -73,6 +74,7 @@ impl Qualification {
                 "qualify-paged-gqa" => "paged-gqa",
                 "qualify-long-context-paged-gqa" => "long-context-paged-gqa",
                 "qualify-attention-output" => "attention-output",
+                "qualify-mtp-bf16-fusion" => "mtp-bf16-fusion",
                 "qualify-full-attention-layer" => "full-attention-layer",
                 "qualify-resident-model" => "resident-model",
                 "qualify-resident-generation" => "resident-generation",
@@ -83,6 +85,7 @@ impl Qualification {
             source_snapshot: matches!(
                 name,
                 "qualify-nvfp4-mlp"
+                    | "qualify-mtp-bf16-fusion"
                     | "qualify-full-attention-layer"
                     | "qualify-resident-model"
                     | "qualify-resident-generation"
@@ -120,6 +123,7 @@ impl Benchmark {
                 Self::Leaf(crate::PerformanceSuite::LongContextPagedGqa)
             }
             "bench-attention-output" => Self::Leaf(crate::PerformanceSuite::AttentionOutput),
+            "bench-mtp-bf16-fusion" => Self::Leaf(crate::PerformanceSuite::MtpBf16Fusion),
             "bench-full-attention-layer" => Self::FullAttentionLayer,
             "bench-resident-model" => Self::ResidentModel,
             "bench-resident-prefill" => Self::ResidentPrefill,
@@ -298,6 +302,8 @@ fn gate_static_resources(root: &Path, gpu: GpuTarget, command: &str) -> Result<(
         crate::gate_nvfp4_down_target(root, gpu)
     } else if command.contains("fp8-qkv") && gpu == GpuTarget::Sm89 {
         crate::gate_fp8_qkv_sm89(root)
+    } else if command.contains("mtp-bf16-fusion") {
+        crate::gate_mtp_bf16_fusion(root)
     } else {
         crate::gate_residual_norm_target(root, gpu)
     }
@@ -429,6 +435,10 @@ mod tests {
         let output = Qualification::parse("qualify-attention-output").expect("known suite");
         assert_eq!(output.name, "attention-output");
         assert_eq!(output.filter, "attention_output::tests");
+        let mtp = Qualification::parse("qualify-mtp-bf16-fusion").expect("known suite");
+        assert_eq!(mtp.name, "mtp-bf16-fusion");
+        assert_eq!(mtp.filter, "mtp_bf16_fusion_suite_");
+        assert!(mtp.source_snapshot);
         let nvfp4_mlp = Qualification::parse("qualify-nvfp4-mlp").expect("known suite");
         assert_eq!(nvfp4_mlp.name, "nvfp4-mlp");
         assert!(nvfp4_mlp.source_snapshot);
@@ -480,6 +490,9 @@ mod tests {
                 .name(),
             "attention-output"
         );
+        let mtp = Benchmark::parse("bench-mtp-bf16-fusion").expect("known benchmark");
+        assert_eq!(mtp.name(), "mtp-bf16-fusion");
+        assert!(!mtp.source_snapshot());
         assert!(Qualification::parse("bench-residual-norm").is_none());
         assert!(Benchmark::parse("perf").is_none());
     }

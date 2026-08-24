@@ -6,6 +6,7 @@ mod device;
 mod fp8;
 mod gdn;
 mod inventory;
+mod mtp_bf16_fusion;
 mod nvfp4_down;
 mod nvfp4_qkv;
 mod nvfp4_swiglu;
@@ -28,6 +29,7 @@ pub use fp8::{
 };
 pub use gdn::{GdnPrepareOp, GdnRecurrenceOp};
 pub use inventory::kernel_ptx_names;
+pub use mtp_bf16_fusion::MtpBf16FusionOp;
 pub use nvfp4_down::{Nvfp4DownOp, Qwen35Nvfp4DownOp};
 pub use nvfp4_qkv::Qwen35Nvfp4QkvOp;
 pub use nvfp4_swiglu::{Nvfp4SwiGluOp, Qwen35Nvfp4SwiGluOp};

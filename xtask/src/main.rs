@@ -46,6 +46,7 @@ const QWEN35_PAGED_GQA_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-paged-gq
 const LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE: &str =
     "qual/baselines/long-context-paged-gqa-sm120.txt";
 const ATTENTION_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/attention-output-sm120.txt";
+const MTP_BF16_FUSION_RESOURCE_BASELINE: &str = "qual/baselines/mtp-bf16-fusion-sm120.txt";
 const RESIDENT_MODEL_RESOURCE_BASELINES: &[&str] = &[
     RESIDUAL_NORM_RESOURCE_BASELINE,
     FP8_QKV_RESOURCE_BASELINE,
@@ -86,6 +87,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     QWEN35_PAGED_GQA_RESOURCE_BASELINE,
     LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE,
     ATTENTION_OUTPUT_RESOURCE_BASELINE,
+    MTP_BF16_FUSION_RESOURCE_BASELINE,
 ];
 const NVFP4_MLP_RESOURCE_BASELINES: &[&str] = &[
     RESIDUAL_NORM_RESOURCE_BASELINE,
@@ -151,9 +153,10 @@ pub(crate) enum PerformanceSuite {
     PagedGqa,
     LongContextPagedGqa,
     AttentionOutput,
+    MtpBf16Fusion,
 }
 
-const PERFORMANCE_SUITES: [PerformanceSuite; 15] = [
+const PERFORMANCE_SUITES: [PerformanceSuite; 16] = [
     PerformanceSuite::ResidualNorm,
     PerformanceSuite::Fp8Qkv,
     PerformanceSuite::Fp8GdnInput,
@@ -169,6 +172,7 @@ const PERFORMANCE_SUITES: [PerformanceSuite; 15] = [
     PerformanceSuite::PagedGqa,
     PerformanceSuite::LongContextPagedGqa,
     PerformanceSuite::AttentionOutput,
+    PerformanceSuite::MtpBf16Fusion,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,6 +217,7 @@ impl PerformanceSuite {
             Self::PagedGqa => "paged-gqa",
             Self::LongContextPagedGqa => "long-context-paged-gqa",
             Self::AttentionOutput => "attention-output",
+            Self::MtpBf16Fusion => "mtp-bf16-fusion",
         }
     }
 
@@ -233,6 +238,7 @@ impl PerformanceSuite {
             Self::PagedGqa => PAGED_GQA_RESOURCE_BASELINE,
             Self::LongContextPagedGqa => LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE,
             Self::AttentionOutput => ATTENTION_OUTPUT_RESOURCE_BASELINE,
+            Self::MtpBf16Fusion => MTP_BF16_FUSION_RESOURCE_BASELINE,
         }
     }
 
@@ -253,6 +259,7 @@ impl PerformanceSuite {
             Self::PagedGqa => "qual/baselines/paged-gqa-sm120.json",
             Self::LongContextPagedGqa => "qual/baselines/long-context-paged-gqa-sm120.json",
             Self::AttentionOutput => "qual/baselines/attention-output-sm120.json",
+            Self::MtpBf16Fusion => "qual/baselines/mtp-bf16-fusion-sm120.json",
         }
     }
 
@@ -273,11 +280,16 @@ impl PerformanceSuite {
             "paged-gqa" => Ok(Self::PagedGqa),
             "long-context-paged-gqa" => Ok(Self::LongContextPagedGqa),
             "attention-output" => Ok(Self::AttentionOutput),
+            "mtp-bf16-fusion" => Ok(Self::MtpBf16Fusion),
             _ => Err(format!("unknown performance suite `{value}`").into()),
         }
     }
 
-    fn qualify(self, root: &Path) -> Result<(), Box<dyn Error>> {
+    const fn requires_snapshot(self) -> bool {
+        matches!(self, Self::MtpBf16Fusion)
+    }
+
+    fn qualify(self, root: &Path, snapshot: Option<&OsStr>) -> Result<(), Box<dyn Error>> {
         match self {
             Self::ResidualNorm => qualify_residual_norm(root),
             Self::Fp8Qkv => qualify_fp8_qkv(root),
@@ -294,6 +306,12 @@ impl PerformanceSuite {
             Self::PagedGqa => qualify_paged_gqa(root),
             Self::LongContextPagedGqa => qualify_long_context_paged_gqa(root),
             Self::AttentionOutput => qualify_attention_output(root),
+            Self::MtpBf16Fusion => qualify_mtp_bf16_fusion(
+                root,
+                &[snapshot
+                    .ok_or("mtp-bf16-fusion qualification requires the admitted snapshot path")?
+                    .to_os_string()],
+            ),
         }
     }
 }
@@ -325,7 +343,10 @@ impl OptimizationSuite {
     }
 
     const fn requires_snapshot(self) -> bool {
-        !matches!(self, Self::Leaf(_))
+        match self {
+            Self::Leaf(suite) => suite.requires_snapshot(),
+            _ => true,
+        }
     }
 
     fn resource_baselines(self) -> Vec<&'static str> {
@@ -365,7 +386,7 @@ impl OptimizationSuite {
                 .to_os_string()])
         };
         match self {
-            Self::Leaf(suite) => suite.qualify(root),
+            Self::Leaf(suite) => suite.qualify(root, snapshot),
             Self::Nvfp4Mlp => qualify_nvfp4_mlp(root, &snapshot_arguments()?),
             Self::DenseFp8Mlp => qualify_dense_fp8_mlp(root, &snapshot_arguments()?),
             Self::DenseFp8GdnLayer => qualify_dense_fp8_gdn_layer(root, &snapshot_arguments()?),
@@ -384,13 +405,14 @@ impl OptimizationSuite {
         };
         use PerformanceSuite::{
             AttentionOutput, AttentionQkPrepare, Fp8Down, Fp8GdnInput, Fp8LmHead, Fp8Qkv,
-            Fp8SwiGlu, GdnOutput, GdnPrepare, GdnRecurrence, LongContextPagedGqa, Nvfp4Down,
-            Nvfp4SwiGlu, PagedGqa, ResidualNorm,
+            Fp8SwiGlu, GdnOutput, GdnPrepare, GdnRecurrence, LongContextPagedGqa, MtpBf16Fusion,
+            Nvfp4Down, Nvfp4SwiGlu, PagedGqa, ResidualNorm,
         };
 
         let downstream = match self {
             Self::ResidentModel | Self::ResidentPrefill | Self::ResidentLongContextModel => &[][..],
             Self::Leaf(LongContextPagedGqa) => &[ResidentLongContextModel],
+            Self::Leaf(MtpBf16Fusion) => &[],
             Self::Leaf(Nvfp4SwiGlu | Nvfp4Down) | Self::Nvfp4Mlp => &[
                 Nvfp4Mlp,
                 ResidentModel,
@@ -502,6 +524,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             qualify_long_context_paged_gqa(root)
         }
         Some("qualify-attention-output") if remaining.is_empty() => qualify_attention_output(root),
+        Some("qualify-mtp-bf16-fusion") => qualify_mtp_bf16_fusion(root, &remaining),
         Some("qualify-dense-fp8-mlp") => qualify_dense_fp8_mlp(root, &remaining),
         Some("qualify-dense-fp8-gdn-layer") => qualify_dense_fp8_gdn_layer(root, &remaining),
         Some("qualify-full-attention-layer") => qualify_full_attention_layer(root, &remaining),
@@ -543,6 +566,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-qwen35-paged-gqa") => bench_qwen35_paged_gqa(root, &remaining),
         Some("bench-long-context-paged-gqa") => bench_long_context_paged_gqa(root, &remaining),
         Some("bench-attention-output") => bench_attention_output(root, &remaining),
+        Some("bench-mtp-bf16-fusion") => bench_mtp_bf16_fusion(root, &remaining),
         Some("bench-dense-fp8-mlp") => bench_dense_fp8_mlp(root, &remaining),
         Some("bench-dense-fp8-gdn-layer") => bench_dense_fp8_gdn_layer(root, &remaining),
         Some("bench-full-attention-layer") => bench_full_attention_layer(root, &remaining),
@@ -587,6 +611,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             gate_long_context_paged_gqa(root)
         }
         Some("gate-attention-output") if remaining.is_empty() => gate_attention_output(root),
+        Some("gate-mtp-bf16-fusion") if remaining.is_empty() => gate_mtp_bf16_fusion(root),
         Some("perf") => perf(root, &remaining),
         Some("profile") => profile(root, &remaining),
         Some("remote") => remote::run(root, &remaining),
@@ -617,6 +642,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-qwen35-paged-gqa"
                     | "qualify-long-context-paged-gqa"
                     | "qualify-attention-output"
+                    | "qualify-mtp-bf16-fusion"
                     | "gate-residual-norm"
                     | "gate-qwen35-residual-norm"
                     | "gate-qwen35-attention-qk-prepare"
@@ -635,6 +661,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "gate-paged-gqa"
                     | "gate-qwen35-paged-gqa"
                     | "gate-long-context-paged-gqa"
+                    | "gate-mtp-bf16-fusion"
                     | "gate-attention-output"
             ) =>
         {
@@ -827,7 +854,8 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_paged_gqa(root)?;
     gate_qwen35_paged_gqa(root)?;
     gate_long_context_paged_gqa(root)?;
-    gate_attention_output(root)
+    gate_attention_output(root)?;
+    gate_mtp_bf16_fusion(root)
 }
 
 fn build_residual_norm(
@@ -1583,6 +1611,40 @@ fn qualify_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_attention_output(root)
 }
 
+fn qualify_mtp_bf16_fusion(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-mtp-bf16-fusion SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "mtp_bf16_fusion_suite_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_residual_norm(root)?;
+    gate_mtp_bf16_fusion(root)
+}
+
 fn qualify_dense_fp8_mlp(
     root: &Path,
     arguments: &[std::ffi::OsString],
@@ -2265,6 +2327,13 @@ fn bench_attention_output(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     bench_suite(root, PerformanceSuite::AttentionOutput, arguments)
+}
+
+fn bench_mtp_bf16_fusion(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    bench_suite(root, PerformanceSuite::MtpBf16Fusion, arguments)
 }
 
 fn bench_dense_fp8_mlp(
@@ -3179,9 +3248,14 @@ fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
         require_performance_device_idle()?;
         return run_optimization_cone(root, mode, suite, &cone, snapshot, remaining);
     }
-    if arguments.len() != 1 {
-        return Err(format!("`perf {mode}` takes no additional arguments").into());
-    }
+    let gate_snapshot = match (mode, arguments) {
+        ("gate", [_, snapshot]) => Some(snapshot.as_os_str()),
+        ("gate", [_]) => {
+            return Err("`perf gate` requires SNAPSHOT for source-backed MTP qualification".into());
+        }
+        (_, [_]) => None,
+        _ => return Err(format!("`perf {mode}` takes no additional arguments").into()),
+    };
 
     let options = match mode {
         "smoke" => vec!["--samples".into(), "3".into()],
@@ -3192,7 +3266,7 @@ fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
     require_performance_device_idle()?;
     if mode == "gate" {
         for suite in PERFORMANCE_SUITES {
-            suite.qualify(root)?;
+            suite.qualify(root, gate_snapshot)?;
         }
     }
     build_sm120(root)?;
@@ -3202,6 +3276,7 @@ fn perf(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Err
 
 struct PerformanceIterationOptions {
     suite: PerformanceSuite,
+    snapshot: Option<std::ffi::OsString>,
     batch_size: u32,
     hypothesis: String,
 }
@@ -3211,10 +3286,22 @@ fn parse_performance_iteration(
 ) -> Result<PerformanceIterationOptions, Box<dyn Error>> {
     let Some((suite, remaining)) = arguments.split_first() else {
         return Err(
-            "usage: cargo run -p xtask -- perf iterate SUITE --batch B --hypothesis TEXT".into(),
+            "usage: cargo run -p xtask -- perf iterate SUITE [SNAPSHOT] --batch B --hypothesis TEXT"
+                .into(),
         );
     };
     let suite = PerformanceSuite::parse(suite.to_str().ok_or("perf suite is not UTF-8")?)?;
+    let (snapshot, remaining) = if suite.requires_snapshot() {
+        let (snapshot, remaining) = remaining
+            .split_first()
+            .ok_or_else(|| format!("perf iterate {} requires SNAPSHOT", suite.name()))?;
+        if snapshot.to_string_lossy().starts_with("--") {
+            return Err(format!("perf iterate {} requires SNAPSHOT", suite.name()).into());
+        }
+        (Some(snapshot.clone()), remaining)
+    } else {
+        (None, remaining)
+    };
     let mut batch_size = None;
     let mut hypothesis = None;
     let mut options = remaining.iter();
@@ -3251,6 +3338,7 @@ fn parse_performance_iteration(
 
     Ok(PerformanceIterationOptions {
         suite,
+        snapshot,
         batch_size,
         hypothesis,
     })
@@ -3267,7 +3355,7 @@ fn run_performance_iteration(
         root,
         suite.name(),
         options.batch_size,
-        options.hypothesis,
+        options.hypothesis.clone(),
         device_inputs.clone(),
         &baseline,
     )?;
@@ -3295,14 +3383,17 @@ fn run_performance_iteration(
     ) {
         Ok(true) => recorder.record_stage("qualification", "reused", started.elapsed()),
         Ok(false) => {
-            if let Err(error) = suite.qualify(root).and_then(|()| {
-                perf_artifact::record_qualification(
-                    root,
-                    suite.name(),
-                    device_inputs.clone(),
-                    device_identity.clone(),
-                )
-            }) {
+            if let Err(error) = suite
+                .qualify(root, options.snapshot.as_deref())
+                .and_then(|()| {
+                    perf_artifact::record_qualification(
+                        root,
+                        suite.name(),
+                        device_inputs.clone(),
+                        device_identity.clone(),
+                    )
+                })
+            {
                 recorder.record_stage("qualification", "failed", started.elapsed());
                 return fail_performance_iteration(recorder, error);
             }
@@ -6589,6 +6680,72 @@ fn gate_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn gate_mtp_bf16_fusion(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(MTP_BF16_FUSION_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path)?;
+    let entries = parse_entries(&ptx);
+    let routes = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("mtp_bf16_fusion_TID_"))
+        .collect::<Vec<_>>();
+    require_count("MTP BF16 fusion", routes.len(), 8)?;
+    for entry in &routes {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        for instruction in [
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32",
+            "cvt.rn.bf16x2.f32",
+        ] {
+            if !entry.body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` PTX", entry.name).into(),
+                );
+            }
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    let mut registers = Vec::new();
+    let mut shared = Vec::new();
+    for entry in routes {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        for instruction in ["HMMA.16816.F32.BF16", "F2FP.BF16.F32.PACK_AB"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+        registers.push(resource.registers);
+        shared.push(resource.shared);
+    }
+    registers.sort_unstable();
+    require_registers(&baseline, "fusion_registers", &registers)?;
+    require_uniform_value(&baseline, "fusion_shared_bytes", &shared)?;
+
+    println!(
+        "MTP BF16 fusion gate passed: 8 exact decode entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, BF16 HMMA/pack present",
+        registers, shared
+    );
+    Ok(())
+}
+
 fn gate_nvfp4_down(root: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(
         root.join(NVFP4_DOWN_RESOURCE_BASELINE),
@@ -7552,6 +7709,7 @@ mod tests {
                 "paged-gqa",
                 "long-context-paged-gqa",
                 "attention-output",
+                "mtp-bf16-fusion",
             ]
         );
         for suite in PERFORMANCE_SUITES {
@@ -7590,6 +7748,7 @@ mod tests {
                 "qual/baselines/qwen35-paged-gqa-sm120.txt",
                 "qual/baselines/long-context-paged-gqa-sm120.txt",
                 "qual/baselines/attention-output-sm120.txt",
+                "qual/baselines/mtp-bf16-fusion-sm120.txt",
             ]
         );
     }
@@ -7692,8 +7851,20 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(options.suite, PerformanceSuite::Nvfp4Down);
+        assert_eq!(options.snapshot, None);
         assert_eq!(options.batch_size, 1);
         assert_eq!(options.hypothesis, "coalesce B=1 loads");
+
+        let options = parse_performance_iteration(&[
+            OsString::from("mtp-bf16-fusion"),
+            OsString::from("/snapshot"),
+            OsString::from("--batch"),
+            OsString::from("8"),
+            OsString::from("--hypothesis"),
+            OsString::from("reuse normalized planes"),
+        ])
+        .unwrap();
+        assert_eq!(options.snapshot, Some(OsString::from("/snapshot")));
 
         assert!(
             parse_performance_iteration(&[
