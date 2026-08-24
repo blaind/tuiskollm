@@ -7,6 +7,7 @@ mod fp8;
 mod gdn;
 mod inventory;
 mod mtp_bf16_fusion;
+mod mtp_bf16_qk_prepare;
 mod mtp_bf16_qkv;
 mod nvfp4_down;
 mod nvfp4_qkv;
@@ -31,6 +32,7 @@ pub use fp8::{
 pub use gdn::{GdnPrepareOp, GdnRecurrenceOp};
 pub use inventory::kernel_ptx_names;
 pub use mtp_bf16_fusion::MtpBf16FusionOp;
+pub use mtp_bf16_qk_prepare::MtpBf16QkPrepareOp;
 pub use mtp_bf16_qkv::MtpBf16QkvOp;
 pub use nvfp4_down::{Nvfp4DownOp, Qwen35Nvfp4DownOp};
 pub use nvfp4_qkv::Qwen35Nvfp4QkvOp;
