@@ -24,6 +24,7 @@ mod qwen35_nvfp4_mlp;
 mod resident_generation;
 mod resident_model_layout;
 mod resident_mtp;
+mod resident_mtp_batch_generation;
 mod resident_mtp_generation;
 mod resident_mtp_layout;
 mod sampling;
@@ -67,6 +68,9 @@ pub use resident_model_layout::{
 };
 pub use resident_mtp::{
     ResidentMtpDraftRoute, ResidentMtpProgram, ResidentMtpPromptRoute, ResidentMtpRealignRoute,
+};
+pub use resident_mtp_batch_generation::{
+    ResidentMtpBatchEvent, ResidentMtpBatchEvents, ResidentMtpBatchGenerator,
 };
 #[cfg(feature = "qualification")]
 pub use resident_mtp_generation::qualification_decide_sampled_tokens;

@@ -10,8 +10,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tuisko_engine::{
-    ChatGenerationRequest, GeneratedText, ResidentMtpGreedyStats, ResidentMtpTextGenerator,
-    SamplingOptions,
+    ChatGenerationRequest, GeneratedText, ResidentMtpGreedyStats, ResidentMtpProgram,
+    ResidentMtpTextGenerator, SamplingOptions,
 };
 use tuisko_frontend::{ChatMessage, ChatTemplateOptions};
 use tuisko_gpu::{CudaContext, GpuError};
@@ -223,7 +223,13 @@ pub(crate) fn register_memory(
     memory: &mut MemoryRecorder,
     generator: &ResidentMtpTextGenerator,
 ) -> Result<(), DeviceBenchmarkError> {
-    let program = generator.qualification_program();
+    register_program_memory(memory, generator.qualification_program())
+}
+
+pub(crate) fn register_program_memory(
+    memory: &mut MemoryRecorder,
+    program: &ResidentMtpProgram,
+) -> Result<(), DeviceBenchmarkError> {
     let target = program.target();
     for (name, kind, bytes, description) in [
         (

@@ -143,6 +143,8 @@ cargo run -p xtask -- bench-resident-prefill SNAPSHOT
 cargo run -p xtask -- bench-resident-long-context-model SNAPSHOT
 cargo run -p xtask -- qualify-resident-generation SNAPSHOT
 cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT
+cargo run -p xtask -- qualify-generation-mtp-batch SNAPSHOT
+cargo run -p xtask -- bench-generation-mtp-batch SNAPSHOT
 cargo run -p xtask -- perf smoke
 ```
 

@@ -426,6 +426,26 @@ impl BenchmarkWorkload {
             execution: BenchmarkExecution::HostSynchronized,
         }
     }
+
+    pub(crate) fn warm_model_mtp_batch_round(
+        batch_size: u32,
+        active_tokens: u64,
+        context_tokens: u64,
+    ) -> Self {
+        Self {
+            scope: BenchmarkScope::Model,
+            phase: BenchmarkPhase::Mtp,
+            batch_size: Some(batch_size),
+            concurrency: Some(batch_size),
+            active_tokens: Some(active_tokens),
+            prompt_tokens: None,
+            context_tokens: Some(context_tokens),
+            output_tokens: Some(active_tokens),
+            device_cache: DeviceCacheRegime::Warm,
+            prefix_cache: None,
+            execution: BenchmarkExecution::HostSynchronized,
+        }
+    }
 }
 
 /// Kind of resident memory attributed by a benchmark owner.
@@ -1172,6 +1192,38 @@ pub(crate) fn warmup_launches(
     }
 
     Ok(options.warmup_launches)
+}
+
+pub(crate) fn validate_loaded_host_clock_policy(
+    route: &str,
+    mut replay: impl FnMut() -> Result<(), DeviceBenchmarkError>,
+) -> Result<(), DeviceBenchmarkError> {
+    let sampler = TelemetrySampler::start();
+    let started = Instant::now();
+    let mut replays = 0usize;
+    while started.elapsed() < LOADED_CLOCK_PROBE_DURATION {
+        replay()?;
+        replays = replays.checked_add(1).ok_or_else(|| {
+            DeviceBenchmarkError::Precondition("loaded host replay count overflowed".to_string())
+        })?;
+    }
+    let telemetry = sampler.finish().map_err(|error| match error {
+        DeviceBenchmarkError::Precondition(reason) => DeviceBenchmarkError::Precondition(format!(
+            "loaded clock probe refused before full timing: {reason}"
+        )),
+        other => other,
+    })?;
+    require_current_process_exclusive()?;
+    eprintln!(
+        "loaded clock probe passed: {route}, {replays} host-synchronized replays, SM {}..{} MHz (median {}), memory {}..{} MHz, {} samples",
+        telemetry.sm_minimum_mhz,
+        telemetry.sm_maximum_mhz,
+        telemetry.sm_median_mhz,
+        telemetry.memory_minimum_mhz,
+        telemetry.memory_maximum_mhz,
+        telemetry.samples,
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

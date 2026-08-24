@@ -1627,6 +1627,31 @@ impl ResidentModelProgram {
             .copy_prefix_to_host(stream, self.layout.workspace.logits, values)?)
     }
 
+    /// Reads every lane-major target logit row into reusable host storage.
+    pub fn read_target_mtp_segmented_logits_into(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpSegmentedVerifyRoute,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        let expected = product(
+            "segmented target MTP logit elements",
+            route.rows(),
+            Qwen38_27B::VOCAB,
+        )?;
+        if destination.len() != expected {
+            return Err(EngineError::layout(format!(
+                "segmented target MTP logit destination has {} values, expected {expected} for B={} K={}",
+                destination.len(),
+                route.batch(),
+                route.tokens()
+            )));
+        }
+        self.arena
+            .copy_prefix_to_host_slice(stream, self.layout.workspace.logits, destination)?;
+        Ok(())
+    }
+
     /// Preserves every lane-major final target residual before per-lane MTP realignment.
     pub fn backup_target_mtp_segmented_residuals(
         &self,
@@ -1759,6 +1784,39 @@ impl ResidentModelProgram {
         Ok(self
             .arena
             .copy_prefix_to_host(stream, self.layout.workspace.residual_a, values)?)
+    }
+
+    /// Reads one exact final target residual row into reusable host storage.
+    pub fn read_residual_row_into(
+        &self,
+        stream: &CudaStream,
+        row: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        if row >= TARGET_VERIFY_ROWS {
+            return Err(EngineError::route(format!(
+                "resident target residual row {row} is outside 0..{TARGET_VERIFY_ROWS}"
+            )));
+        }
+        if destination.len() != Qwen38_27B::HIDDEN {
+            return Err(EngineError::layout(format!(
+                "resident target residual-row destination has {} values, expected {}",
+                destination.len(),
+                Qwen38_27B::HIDDEN
+            )));
+        }
+        let start = product(
+            "resident target residual-row offset",
+            row,
+            Qwen38_27B::HIDDEN,
+        )?;
+        self.arena.copy_slice_to_host_slice(
+            stream,
+            self.layout.workspace.residual_a,
+            start,
+            destination,
+        )?;
+        Ok(())
     }
 
     /// Enqueues the raw target residual and current page table into an MTP prompt owner.

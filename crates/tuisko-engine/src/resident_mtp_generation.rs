@@ -11,10 +11,10 @@ use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
 const ROTARY_DIM: usize = 64;
-const ROTARY_PAIRS: usize = ROTARY_DIM / 2;
+pub(crate) const ROTARY_PAIRS: usize = ROTARY_DIM / 2;
 const ROPE_THETA: f64 = 10_000_000.0;
-const DRAFT_WINDOW: usize = 3;
-const VERIFY_ROWS: usize = DRAFT_WINDOW + 1;
+pub(crate) const DRAFT_WINDOW: usize = 3;
+pub(crate) const VERIFY_ROWS: usize = DRAFT_WINDOW + 1;
 const MAX_NATIVE_PREFILL_TOKENS: usize = 1_024;
 const LOGIT_ROWS: usize = VERIFY_ROWS + 1;
 
@@ -135,7 +135,8 @@ impl ResidentMtpTextGenerator {
             program.activate_kv_slot(0)?;
             program.reserve_kv_slot_tokens(stream, 0, required_positions)?;
             program.target().load_slot_routes(stream, &[0])?;
-            native_prefill_tokens = prime_prompt(program, stream, control.prompt_token_ids(), 0)?;
+            native_prefill_tokens =
+                prime_prompt(program, stream, control.prompt_token_ids(), 0, 0, None)?;
             let target = target_logits_mut(logits, 1);
             program.target().read_logits_into(stream, 1, target)?;
         }
@@ -583,7 +584,7 @@ impl ResidentMtpGenerationSession<'_> {
     }
 }
 
-fn decide_sampled_tokens(
+pub(crate) fn decide_sampled_tokens(
     drafts: &[u32],
     target_laws: &[&SamplingDistribution],
     draft_laws: &[&SamplingDistribution],
@@ -657,19 +658,48 @@ pub fn qualification_decide_sampled_tokens(
     )
 }
 
-fn prime_prompt(
+pub(crate) fn prime_prompt(
     program: &mut ResidentMtpProgram,
     stream: &CudaStream,
     token_ids: &[u32],
     slot: usize,
+    processed_prefix: usize,
+    boundary_hidden: Option<&[u16]>,
 ) -> EngineResult<usize> {
     if token_ids.is_empty() {
         return Err(EngineError::generation(
             "resident MTP generation requires a nonempty prompt",
         ));
     }
+    if processed_prefix > token_ids.len() {
+        return Err(EngineError::generation(
+            "resident MTP processed prefix exceeds its prompt",
+        ));
+    }
+    if processed_prefix == token_ids.len() {
+        return Ok(0);
+    }
+    if processed_prefix != 0 {
+        let hidden = boundary_hidden.ok_or_else(|| {
+            EngineError::generation("resident MTP prefix reuse has no boundary hidden row")
+        })?;
+        let position = u32::try_from(processed_prefix - 1)
+            .map_err(|_| EngineError::generation("resident MTP prefix boundary exceeds u32"))?;
+        let (cosine, sine) = text_rope(position);
+        let route = program.stage_continuation_draft(
+            stream,
+            &[slot],
+            &[position],
+            &[token_ids[processed_prefix]],
+            hidden,
+            &cosine,
+            &sine,
+        )?;
+        program.replay_staged_continue_draft(stream, route)?;
+    }
+
     let primed = token_ids.len() - 1;
-    let mut cursor = 0;
+    let mut cursor = processed_prefix;
     let mut native = 0;
     let mut cosine = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
     let mut sine = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
@@ -755,7 +785,7 @@ fn replay_prefill_tile(
     program.target().replay_prefill(stream, route)
 }
 
-fn fill_contiguous_rope(
+pub(crate) fn fill_contiguous_rope(
     first_position: usize,
     rows: usize,
     cosine: &mut [f32],
@@ -789,7 +819,7 @@ fn fill_contiguous_rope(
     Ok(values)
 }
 
-fn text_rope(position: u32) -> ([f32; ROTARY_PAIRS], [f32; ROTARY_PAIRS]) {
+pub(crate) fn text_rope(position: u32) -> ([f32; ROTARY_PAIRS], [f32; ROTARY_PAIRS]) {
     let mut cosine = [0.0f32; ROTARY_PAIRS];
     let mut sine = [0.0f32; ROTARY_PAIRS];
     for pair in 0..ROTARY_PAIRS {
@@ -834,7 +864,7 @@ const fn next_native_prefill_tile(remaining: usize) -> Option<usize> {
     }
 }
 
-fn require_generation_capacity(
+pub(crate) fn require_generation_capacity(
     prompt_tokens: usize,
     maximum_new_tokens: usize,
     context_capacity: usize,
