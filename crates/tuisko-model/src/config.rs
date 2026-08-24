@@ -257,6 +257,12 @@ fn validate_compressed<A: Arch>(path: &Path, config: &ModelConfig) -> Checkpoint
     )?;
 
     validate_text::<A>(path, &config.text_config)?;
+    require(
+        path,
+        "text_config.tie_word_embeddings",
+        config.text_config.tie_word_embeddings,
+        Some(false),
+    )?;
     validate_vision::<A>(path, &config.vision_config, VISION_MODEL_TYPE)?;
     validate_compressed_quantization::<A>(path, &config.quantization_config)
 }
@@ -858,6 +864,7 @@ mod tests {
                 "num_hidden_layers": 64,
                 "num_key_value_heads": 4,
                 "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": false,
                 "vocab_size": 248320
             },
             "video_token_id": 248057,
@@ -1109,6 +1116,25 @@ mod tests {
         let mut config = valid_config();
         config["text_config"]["model_type"] = json!("other");
         cases.push(("text-model-type", config, "text_config.model_type"));
+
+        let mut config = valid_config();
+        config["text_config"]["tie_word_embeddings"] = json!(true);
+        cases.push((
+            "text-tied-embeddings",
+            config,
+            "text_config.tie_word_embeddings",
+        ));
+
+        let mut config = valid_config();
+        config["text_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tie_word_embeddings");
+        cases.push((
+            "text-tied-embeddings-missing",
+            config,
+            "text_config.tie_word_embeddings",
+        ));
 
         let mut config = valid_config();
         config["vision_config"]["dtype"] = json!("float16");
