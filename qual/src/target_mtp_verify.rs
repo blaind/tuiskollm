@@ -10,8 +10,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
-    EngineError, MAX_BATCH, ResidentModelProgram, ResidentMtpVerifyObservables,
-    ResidentMtpVerifyRoute,
+    EngineError, MAX_BATCH, ResidentModelProgram, ResidentMtpSegmentedVerifyRoute,
+    ResidentMtpVerifyObservables, ResidentMtpVerifyRoute,
 };
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, device_memory_info};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -56,6 +56,10 @@ pub struct TargetMtpVerifyQualification {
     pub verify_routes: usize,
     /// Exact K=1..4 accepted-prefix commit routes exercised.
     pub commit_routes: usize,
+    /// Every exact lane-major `(B=1..8, K=1..4)` route exercised.
+    pub segmented_verify_routes: usize,
+    /// Per-route commits with distinct accepted counts across active lanes.
+    pub segmented_commit_routes: usize,
     /// Final-normalized and selected-logit values checked by source mathematics.
     pub endpoint_oracle_values: usize,
     /// Provisional, recorded, live, and output values reproduced by graph replay.
@@ -78,6 +82,7 @@ pub struct TargetMtpVerifyQualification {
     pub maximum_absolute_error: f32,
 }
 
+#[derive(Clone)]
 struct Fixture {
     history: Vec<u16>,
     state: Vec<f32>,
@@ -107,8 +112,10 @@ pub fn qualify_target_mtp_verify(
     }
     let stream = context.new_stream().map_err(GpuError::from)?;
     let mut program = ResidentModelProgram::from_snapshot(&context, snapshot.clone())?;
-    program.activate_kv_slot(SLOT)?;
-    program.reserve_kv_slot_tokens(&stream, SLOT, ATTENTION_PAGE_SIZE)?;
+    for slot in 0..MAX_BATCH {
+        program.activate_kv_slot(slot)?;
+        program.reserve_kv_slot_tokens(&stream, slot, ATTENTION_PAGE_SIZE)?;
+    }
     let fixture = fixture(&program);
     verify_owner(&program)?;
     let base = (program.base_address(), program.kv_base_address());
@@ -124,6 +131,8 @@ pub fn qualify_target_mtp_verify(
         leaf_oracle_suites: 3,
         verify_routes: 0,
         commit_routes: 0,
+        segmented_verify_routes: 0,
+        segmented_commit_routes: 0,
         endpoint_oracle_values: 0,
         graph_replay_values: 0,
         rollback_values: 0,
@@ -211,9 +220,308 @@ pub fn qualify_target_mtp_verify(
         verify_stable(&program, base, &addresses, tokens)?;
     }
 
+    qualify_segmented_routes(
+        &mut program,
+        &stream,
+        &fixture,
+        &final_norm,
+        lm_head_codes,
+        &lm_head_scales,
+        base,
+        &addresses,
+        &mut report,
+    )?;
+
     verify_no_post_warmup_allocation(&mut program, &stream, &fixture)?;
     device_benchmark::require_current_process_exclusive()?;
     Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qualify_segmented_routes(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+    fixture: &Fixture,
+    final_norm: &[u16],
+    lm_head_codes: &[u8],
+    lm_head_scales: &[u16],
+    base: (u64, u64),
+    addresses: &[usize],
+    report: &mut TargetMtpVerifyQualification,
+) -> Result<(), TargetMtpVerifyQualificationError> {
+    for batch in 1..=MAX_BATCH {
+        for tokens in 1..=VERIFY_ROUTES {
+            let (route, fixtures) = prepare_segmented(program, stream, batch, tokens, fixture)?;
+            program.launch_target_mtp_segmented_verify_eager(stream, route)?;
+            let eager = program.qualification_target_mtp_segmented_observables(stream, route)?;
+            let eager_cache = segmented_cache_pages(program, stream, batch)?;
+            verify_segmented_rollback(batch, &fixtures, &eager, report)?;
+            verify_segmented_record_boundaries(batch, tokens, &eager)?;
+            for cache in &eager_cache {
+                verify_cache_boundaries(tokens, cache)?;
+            }
+            verify_endpoint_oracle(
+                route.rows(),
+                &eager,
+                final_norm,
+                lm_head_codes,
+                lm_head_scales,
+                report,
+            )?;
+
+            let (graph_route, _) = prepare_segmented(program, stream, batch, tokens, fixture)?;
+            program.replay_target_mtp_segmented_verify(stream, graph_route)?;
+            let replay =
+                program.qualification_target_mtp_segmented_observables(stream, graph_route)?;
+            let replay_cache = segmented_cache_pages(program, stream, batch)?;
+            compare_observables("segmented verify graph", &replay, &eager)?;
+            for (lane, (actual, expected)) in replay_cache.iter().zip(&eager_cache).enumerate() {
+                compare_exact(
+                    &format!("segmented B={batch} K={tokens} lane {lane} key cache"),
+                    &actual.0,
+                    &expected.0,
+                )?;
+                compare_exact(
+                    &format!("segmented B={batch} K={tokens} lane {lane} value cache"),
+                    &actual.1,
+                    &expected.1,
+                )?;
+                report.cache_values += actual.0.len() + actual.1.len();
+            }
+            report.graph_replay_values += observable_values(&eager);
+
+            let accepted = (0..batch).map(|lane| lane % tokens + 1).collect::<Vec<_>>();
+            let (commit_route, commit_fixtures) =
+                prepare_segmented(program, stream, batch, tokens, fixture)?;
+            program.launch_target_mtp_segmented_verify_eager(stream, commit_route)?;
+            let verify =
+                program.qualification_target_mtp_segmented_observables(stream, commit_route)?;
+            program.commit_target_mtp_segmented(stream, commit_route, &accepted)?;
+            let eager_commit =
+                program.qualification_target_mtp_segmented_observables(stream, commit_route)?;
+            verify_segmented_committed_history(
+                batch,
+                tokens,
+                &accepted,
+                &commit_fixtures,
+                &verify,
+                &eager_commit,
+                report,
+            )?;
+
+            let (graph_commit_route, _) =
+                prepare_segmented(program, stream, batch, tokens, fixture)?;
+            let graph = program.qualification_repeated_target_mtp_segmented_graph(
+                stream,
+                graph_commit_route,
+                Some(&accepted),
+                1,
+            )?;
+            graph.launch(stream).map_err(GpuError::from)?;
+            let graph_commit = program
+                .qualification_target_mtp_segmented_observables(stream, graph_commit_route)?;
+            compare_observables(
+                "segmented verify/commit graph",
+                &graph_commit,
+                &eager_commit,
+            )?;
+            report.graph_replay_values += observable_values(&eager_commit);
+            report.segmented_verify_routes += 1;
+            report.segmented_commit_routes += 1;
+            verify_stable(program, base, addresses, tokens)?;
+        }
+    }
+    Ok(())
+}
+
+fn prepare_segmented(
+    program: &mut ResidentModelProgram,
+    stream: &CudaStream,
+    batch: usize,
+    tokens: usize,
+    fixture: &Fixture,
+) -> Result<(ResidentMtpSegmentedVerifyRoute, Vec<Fixture>), TargetMtpVerifyQualificationError> {
+    let fixtures = (0..batch)
+        .map(|slot| segmented_fixture(fixture, slot))
+        .collect::<Vec<_>>();
+    for (slot, lane_fixture) in fixtures.iter().enumerate() {
+        program.reset_slot(stream, slot)?;
+        program.qualification_load_target_mtp_gdn_slot(
+            stream,
+            slot,
+            &lane_fixture.history,
+            &lane_fixture.state,
+        )?;
+    }
+    program.qualification_reset_workspace(stream, BYTE_SENTINEL)?;
+    let token_ids = (0..batch)
+        .flat_map(|lane| {
+            TOKEN_IDS
+                .iter()
+                .take(tokens)
+                .map(move |&token| (token + lane as u32 * 8_191) % Qwen38_27B::VOCAB as u32)
+        })
+        .collect::<Vec<_>>();
+    program.stage_target_mtp_segmented_embeddings(stream, &token_ids)?;
+    let positions = (0..batch)
+        .flat_map(|_| 0..tokens as u32)
+        .collect::<Vec<_>>();
+    let (cosine, sine) = rope(&positions);
+    let slots = (0..batch).collect::<Vec<_>>();
+    let first_positions = vec![0; batch];
+    let route = program.load_target_mtp_segmented_verify_state(
+        stream,
+        tokens,
+        &slots,
+        &first_positions,
+        &cosine,
+        &sine,
+    )?;
+    Ok((route, fixtures))
+}
+
+fn segmented_fixture(fixture: &Fixture, slot: usize) -> Fixture {
+    let history = fixture
+        .history
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| {
+            value ^ ((slot as u16 + 1).wrapping_mul(0x1111)).rotate_left((index & 3) as u32)
+        })
+        .collect();
+    let state = fixture
+        .state
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| value + (slot as f32 + 1.0) * ((index % 7) as f32 - 3.0) / 65_536.0)
+        .collect();
+    Fixture { history, state }
+}
+
+fn segmented_cache_pages(
+    program: &ResidentModelProgram,
+    stream: &CudaStream,
+    batch: usize,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TargetMtpVerifyQualificationError> {
+    (0..batch)
+        .map(|slot| {
+            let physical = usize::try_from(program.qualification_kv_physical_page(slot, 0)?)
+                .map_err(|_| {
+                    TargetMtpVerifyQualificationError::Mismatch(
+                        "segmented cache page exceeds usize".into(),
+                    )
+                })?;
+            Ok(program.qualification_cache_page(stream, physical)?)
+        })
+        .collect()
+}
+
+fn verify_segmented_rollback(
+    batch: usize,
+    fixtures: &[Fixture],
+    observed: &ResidentMtpVerifyObservables,
+    report: &mut TargetMtpVerifyQualification,
+) -> Result<(), TargetMtpVerifyQualificationError> {
+    let history = fixtures
+        .iter()
+        .flat_map(|fixture| fixture.history.iter().copied())
+        .collect::<Vec<_>>();
+    let state = fixtures
+        .iter()
+        .flat_map(|fixture| fixture.state.iter().copied())
+        .collect::<Vec<_>>();
+    compare_exact(
+        &format!("segmented B={batch} provisional live history"),
+        &observed.live_history,
+        &history,
+    )?;
+    compare_f32_bits(
+        &format!("segmented B={batch} provisional live state"),
+        &observed.live_state,
+        &state,
+    )?;
+    report.rollback_values += history.len() + state.len();
+    Ok(())
+}
+
+fn verify_segmented_record_boundaries(
+    batch: usize,
+    tokens: usize,
+    observed: &ResidentMtpVerifyObservables,
+) -> Result<(), TargetMtpVerifyQualificationError> {
+    let projected_stride = batch * VERIFY_ROUTES * Qwen38_27B::GDN_INPUT_ROWS;
+    let control_stride = batch * VERIFY_ROUTES * Qwen38_27B::GDN_CONTROL_ROWS;
+    for layer in 0..GDN_LAYERS {
+        for lane in 0..batch {
+            let projected = layer * projected_stride
+                + (lane * VERIFY_ROUTES + tokens) * Qwen38_27B::GDN_INPUT_ROWS;
+            let projected_end =
+                layer * projected_stride + (lane + 1) * VERIFY_ROUTES * Qwen38_27B::GDN_INPUT_ROWS;
+            if observed.recorded_projected[projected..projected_end]
+                .iter()
+                .any(|&value| value != BF16_SENTINEL)
+            {
+                return Err(TargetMtpVerifyQualificationError::Mismatch(format!(
+                    "segmented B={batch} K={tokens} modified lane {lane} inactive projected records in GDN layer {layer}"
+                )));
+            }
+            let control = layer * control_stride
+                + (lane * VERIFY_ROUTES + tokens) * Qwen38_27B::GDN_CONTROL_ROWS;
+            let control_end =
+                layer * control_stride + (lane + 1) * VERIFY_ROUTES * Qwen38_27B::GDN_CONTROL_ROWS;
+            if observed.recorded_log_decay[control..control_end]
+                .iter()
+                .chain(&observed.recorded_beta[control..control_end])
+                .any(|value| value.to_bits() != F32_SENTINEL_BITS)
+            {
+                return Err(TargetMtpVerifyQualificationError::Mismatch(format!(
+                    "segmented B={batch} K={tokens} modified lane {lane} inactive control records in GDN layer {layer}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_segmented_committed_history(
+    batch: usize,
+    route_tokens: usize,
+    accepted: &[usize],
+    fixtures: &[Fixture],
+    verify: &ResidentMtpVerifyObservables,
+    committed: &ResidentMtpVerifyObservables,
+    report: &mut TargetMtpVerifyQualification,
+) -> Result<(), TargetMtpVerifyQualificationError> {
+    let history_per_layer = Qwen38_27B::GDN_QKV_ROWS * HISTORY_TAPS;
+    let projected_layer_stride = batch * VERIFY_ROUTES * Qwen38_27B::GDN_INPUT_ROWS;
+    let mut expected = Vec::with_capacity(committed.live_history.len());
+    for lane in 0..batch {
+        let mut lane_history = fixtures[lane].history.clone();
+        for layer in 0..GDN_LAYERS {
+            let history_layer = layer * history_per_layer;
+            let projected_layer =
+                layer * projected_layer_stride + lane * VERIFY_ROUTES * Qwen38_27B::GDN_INPUT_ROWS;
+            for token in 0..accepted[lane] {
+                let projected_token = projected_layer + token * Qwen38_27B::GDN_INPUT_ROWS;
+                for channel in 0..Qwen38_27B::GDN_QKV_ROWS {
+                    let history = history_layer + channel * HISTORY_TAPS;
+                    lane_history[history] = lane_history[history + 1];
+                    lane_history[history + 1] = lane_history[history + 2];
+                    lane_history[history + 2] =
+                        verify.recorded_projected[projected_token + channel];
+                }
+            }
+        }
+        expected.extend(lane_history);
+    }
+    compare_exact(
+        &format!("segmented B={batch} K={route_tokens} committed history"),
+        &committed.live_history,
+        &expected,
+    )?;
+    report.committed_values += expected.len();
+    Ok(())
 }
 
 fn verify_first_gdn_k1_seams(
@@ -431,12 +739,12 @@ fn run_leaf_oracles() -> Result<(), TargetMtpVerifyQualificationError> {
 }
 
 fn verify_owner(program: &ResidentModelProgram) -> Result<(), TargetMtpVerifyQualificationError> {
-    if program.workspace_bytes() != 844_769_284
-        || program.resident_arena_bytes() != 21_180_019_968
+    if program.workspace_bytes() != 923_695_108
+        || program.resident_arena_bytes() != 21_258_945_792
         || program.kv_arena_bytes() != 7_210_118_656
-        || program.arena_bytes() != 28_390_138_624
+        || program.arena_bytes() != 28_469_064_448
         || program.padding_bytes() != 15_676
-        || program.target_mtp_graph_count() != 32
+        || program.target_mtp_graph_count() != 228
     {
         return Err(TargetMtpVerifyQualificationError::Mismatch(
             "target verify owner accounting differs from the admitted layout".to_string(),
@@ -866,12 +1174,28 @@ fn verify_no_post_warmup_allocation(
         program.replay_target_mtp_commit(stream, route, tokens)?;
         routes.push(route);
     }
+    for batch in 1..=MAX_BATCH {
+        for tokens in 1..=VERIFY_ROUTES {
+            let (route, _) = prepare_segmented(program, stream, batch, tokens, fixture)?;
+            let accepted = (0..batch).map(|lane| lane % tokens + 1).collect::<Vec<_>>();
+            program.replay_target_mtp_segmented_verify(stream, route)?;
+            program.commit_target_mtp_segmented(stream, route, &accepted)?;
+        }
+    }
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
     for _ in 0..2 {
         for route in routes.iter().rev() {
             program.replay_target_mtp_verify(stream, *route)?;
             program.replay_target_mtp_commit(stream, *route, route.tokens())?;
+        }
+        for batch in (1..=MAX_BATCH).rev() {
+            for tokens in (1..=VERIFY_ROUTES).rev() {
+                let (route, _) = prepare_segmented(program, stream, batch, tokens, fixture)?;
+                let accepted = (0..batch).map(|lane| lane % tokens + 1).collect::<Vec<_>>();
+                program.replay_target_mtp_segmented_verify(stream, route)?;
+                program.commit_target_mtp_segmented(stream, route, &accepted)?;
+            }
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -904,10 +1228,12 @@ mod tests {
         assert_eq!(report.leaf_oracle_suites, 3);
         assert_eq!(report.verify_routes, 4);
         assert_eq!(report.commit_routes, 10);
-        assert_eq!(report.endpoint_oracle_values, 51_250);
-        assert_eq!(report.graph_count, 32);
-        assert_eq!(report.workspace_bytes, 844_769_284);
-        assert_eq!(report.arena_bytes, 28_390_138_624);
+        assert_eq!(report.segmented_verify_routes, 32);
+        assert_eq!(report.segmented_commit_routes, 32);
+        assert_eq!(report.endpoint_oracle_values, 1_896_250);
+        assert_eq!(report.graph_count, 228);
+        assert_eq!(report.workspace_bytes, 923_695_108);
+        assert_eq!(report.arena_bytes, 28_469_064_448);
         assert_eq!(report.padding_bytes, 15_676);
         Ok(())
     }

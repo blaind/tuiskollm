@@ -43,6 +43,8 @@ const SHORT_CONTEXT_PHYSICAL_PAGES: usize = MAX_BATCH * SHORT_CONTEXT_PAGES_PER_
 const LONG_CONTEXT_ROUTE_COUNT: usize = LONG_CONTEXT_GQA_PARTITION_BUCKETS.len();
 const PREFILL_GRAPH_ROUTE_COUNT: usize = 6;
 const TARGET_VERIFY_ROUTE_COUNT: usize = 4;
+const TARGET_SEGMENTED_BATCH_ROUTES: usize = MAX_BATCH - 1;
+const TARGET_VERIFY_ROWS: usize = MAX_BATCH * TARGET_VERIFY_ROUTE_COUNT;
 const GDN_LAYER_COUNT: usize = 48;
 
 /// Exact resident graph selected by one checked decode-state upload.
@@ -72,6 +74,51 @@ pub struct ResidentMtpVerifyRoute {
     slot: usize,
     maximum_length: usize,
     attention: AttentionRoute,
+}
+
+/// Exact lane-major provisional target-verification graph selected by one checked upload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "the segmented target-verification route must be replayed with its uploaded state"]
+pub struct ResidentMtpSegmentedVerifyRoute {
+    tokens: usize,
+    batch: usize,
+    maximum_length: usize,
+    attention: AttentionRoute,
+}
+
+impl ResidentMtpSegmentedVerifyRoute {
+    /// Number of causal target input rows owned by each lane.
+    pub const fn tokens(self) -> usize {
+        self.tokens
+    }
+
+    /// Number of distinct resident slots in the compact transaction.
+    pub const fn batch(self) -> usize {
+        self.batch
+    }
+
+    /// Total lane-major target rows produced by this route.
+    pub const fn rows(self) -> usize {
+        self.tokens * self.batch
+    }
+
+    /// Largest causal context length after the provisional rows are evaluated.
+    pub const fn maximum_length(self) -> usize {
+        self.maximum_length
+    }
+
+    /// Whether this route uses partitioned long-context attention.
+    pub const fn is_long_context(self) -> bool {
+        matches!(self.attention, AttentionRoute::Long { .. })
+    }
+
+    /// Captured partition capacity, or `None` for the short-context graph.
+    pub const fn partition_capacity(self) -> Option<usize> {
+        match self.attention {
+            AttentionRoute::Short => None,
+            AttentionRoute::Long { partitions, .. } => Some(partitions),
+        }
+    }
 }
 
 impl ResidentMtpVerifyRoute {
@@ -367,6 +414,10 @@ struct ResidentGraphs {
     prefill: [CudaGraph; PREFILL_GRAPH_ROUTE_COUNT],
     target_verify_short: [CudaGraph; TARGET_VERIFY_ROUTE_COUNT],
     target_verify_long: [[CudaGraph; TARGET_VERIFY_ROUTE_COUNT]; LONG_CONTEXT_ROUTE_COUNT],
+    target_segmented_verify_short:
+        [[CudaGraph; TARGET_SEGMENTED_BATCH_ROUTES]; TARGET_VERIFY_ROUTE_COUNT],
+    target_segmented_verify_long: [[[CudaGraph; TARGET_SEGMENTED_BATCH_ROUTES];
+        TARGET_VERIFY_ROUTE_COUNT]; LONG_CONTEXT_ROUTE_COUNT],
     target_commit: [CudaGraph; TARGET_VERIFY_ROUTE_COUNT],
 }
 
@@ -387,6 +438,25 @@ impl ResidentGraphs {
         match route.attention {
             AttentionRoute::Short => &self.target_verify_short[route.tokens - 1],
             AttentionRoute::Long { index, .. } => &self.target_verify_long[index][route.tokens - 1],
+        }
+    }
+
+    fn select_target_segmented_verify(&self, route: ResidentMtpSegmentedVerifyRoute) -> &CudaGraph {
+        if route.batch == 1 {
+            return match route.attention {
+                AttentionRoute::Short => &self.target_verify_short[route.tokens - 1],
+                AttentionRoute::Long { index, .. } => {
+                    &self.target_verify_long[index][route.tokens - 1]
+                }
+            };
+        }
+        match route.attention {
+            AttentionRoute::Short => {
+                &self.target_segmented_verify_short[route.tokens - 1][route.batch - 2]
+            }
+            AttentionRoute::Long { index, .. } => {
+                &self.target_segmented_verify_long[index][route.tokens - 1][route.batch - 2]
+            }
         }
     }
 
@@ -468,6 +538,26 @@ pub struct ResidentPrefillStageGraph<'a> {
 #[cfg(feature = "qualification")]
 impl ResidentPrefillStageGraph<'_> {
     /// Immutable graph restoring represented embeddings and exact prompt metadata.
+    pub const fn graph(&self) -> &CudaGraph {
+        &self.graph
+    }
+}
+
+#[cfg(feature = "qualification")]
+/// Captured segmented target embedding and metadata uploads with retained pinned sources.
+pub struct ResidentMtpSegmentedStageGraph<'a> {
+    graph: CudaGraph,
+    _positions: PinnedHostBuffer<u32>,
+    _lengths: PinnedHostBuffer<u32>,
+    _rows: PinnedHostBuffer<u32>,
+    _rope_cos: PinnedHostBuffer<f32>,
+    _rope_sin: PinnedHostBuffer<f32>,
+    source: PhantomData<&'a PinnedHostBuffer<u16>>,
+}
+
+#[cfg(feature = "qualification")]
+impl ResidentMtpSegmentedStageGraph<'_> {
+    /// Immutable graph restoring exact lane-major target embeddings and metadata.
     pub const fn graph(&self) -> &CudaGraph {
         &self.graph
     }
@@ -824,6 +914,25 @@ impl ResidentModelProgram {
     /// Copies exact mmap-backed BF16 embedding rows into the first residual plane.
     pub fn stage_embeddings(&mut self, stream: &CudaStream, token_ids: &[u32]) -> EngineResult<()> {
         require_rows(token_ids.len())?;
+        self.stage_embedding_rows(stream, token_ids)
+    }
+
+    /// Copies exact BF16 embedding rows for one lane-major target transaction.
+    pub fn stage_target_mtp_segmented_embeddings(
+        &mut self,
+        stream: &CudaStream,
+        token_ids: &[u32],
+    ) -> EngineResult<()> {
+        if !(1..=TARGET_VERIFY_ROWS).contains(&token_ids.len()) {
+            return Err(EngineError::route(format!(
+                "segmented target MTP embedding rows {} are outside 1..={TARGET_VERIFY_ROWS}",
+                token_ids.len()
+            )));
+        }
+        self.stage_embedding_rows(stream, token_ids)
+    }
+
+    fn stage_embedding_rows(&mut self, stream: &CudaStream, token_ids: &[u32]) -> EngineResult<()> {
         let embedding = TextEndpointBindings::bind_embedding(self.snapshot.as_ref())?;
         let active = product(
             "resident active embedding elements",
@@ -988,6 +1097,95 @@ impl ResidentModelProgram {
             maximum_length: decode.maximum_length,
             attention: decode.attention,
         })
+    }
+
+    /// Loads one exact lane-major provisional target-verification transaction.
+    pub fn load_target_mtp_segmented_verify_state(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        slots: &[usize],
+        first_positions: &[usize],
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<ResidentMtpSegmentedVerifyRoute> {
+        require_target_verify_tokens(tokens)?;
+        let slot_ids = slot_rows(slots)?;
+        if first_positions.len() != slots.len() {
+            return Err(EngineError::layout(format!(
+                "segmented target MTP has {} first positions, expected B={}",
+                first_positions.len(),
+                slots.len()
+            )));
+        }
+        let rows = product("segmented target MTP rows", slots.len(), tokens)?;
+        let rotary_values = product("segmented target MTP rotary values", rows, ROTARY_PAIRS)?;
+        if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
+            return Err(EngineError::layout(format!(
+                "segmented target MTP rotary planes must each have {rotary_values} values for B={} K={tokens}",
+                slots.len()
+            )));
+        }
+
+        let mut state_rows = [0u32; TARGET_VERIFY_ROWS];
+        let mut table_rows = [0u32; TARGET_VERIFY_ROWS];
+        let mut positions = [0u32; TARGET_VERIFY_ROWS];
+        let mut lengths = [0u32; TARGET_VERIFY_ROWS];
+        let mut lane_lengths = [0u32; MAX_BATCH];
+        for lane in 0..slots.len() {
+            let context_tokens = first_positions[lane].checked_add(tokens).ok_or_else(|| {
+                EngineError::route("segmented target MTP verification context overflows")
+            })?;
+            if context_tokens > self.context_capacity() {
+                return Err(EngineError::route(format!(
+                    "segmented target MTP lane {lane} requires {context_tokens} positions, current resident capacity is {}",
+                    self.context_capacity()
+                )));
+            }
+            let reserved_tokens = self
+                .kv_slots
+                .page_count(slots[lane])?
+                .checked_mul(ATTENTION_PAGE_SIZE)
+                .ok_or_else(|| EngineError::layout("segmented target MTP capacity overflows"))?;
+            if reserved_tokens < context_tokens {
+                return Err(EngineError::route(format!(
+                    "segmented target MTP slot {} owns {reserved_tokens} cache positions, expected at least {context_tokens}",
+                    slots[lane]
+                )));
+            }
+            lane_lengths[lane] = u32::try_from(context_tokens)
+                .map_err(|_| EngineError::route("segmented target MTP length exceeds u32"))?;
+            for token in 0..tokens {
+                let row = lane * tokens + token;
+                let position = first_positions[lane]
+                    .checked_add(token)
+                    .and_then(|position| u32::try_from(position).ok())
+                    .ok_or_else(|| {
+                        EngineError::route("segmented target MTP position exceeds u32")
+                    })?;
+                state_rows[row] = slot_ids[lane];
+                table_rows[row] = slot_ids[lane];
+                positions[row] = position;
+                lengths[row] = position + 1;
+            }
+        }
+        let route =
+            select_segmented_target_route(tokens, slots.len(), &lane_lengths[..slots.len()])?;
+        let workspace = self.layout.workspace;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.state_rows, &state_rows[..rows])?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.table_rows, &table_rows[..rows])?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.cache_positions, &positions[..rows])?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.lengths, &lengths[..rows])?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.rope_cos, rope_cos)?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.rope_sin, rope_sin)?;
+
+        Ok(route)
     }
 
     /// Loads one exact from-empty prompt tile into one active slot.
@@ -1284,6 +1482,18 @@ impl ResidentModelProgram {
         Ok(())
     }
 
+    /// Replays one immutable exact lane-major target-verification graph.
+    pub fn replay_target_mtp_segmented_verify(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpSegmentedVerifyRoute,
+    ) -> EngineResult<()> {
+        self.graphs
+            .select_target_segmented_verify(route)
+            .launch(stream)?;
+        Ok(())
+    }
+
     /// Commits an accepted prefix from the matching provisional verification.
     pub fn replay_target_mtp_commit(
         &self,
@@ -1303,10 +1513,44 @@ impl ResidentModelProgram {
         Ok(())
     }
 
+    /// Commits one accepted target-input prefix per lane from a segmented verification.
+    pub fn commit_target_mtp_segmented(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpSegmentedVerifyRoute,
+        accepted_tokens: &[usize],
+    ) -> EngineResult<()> {
+        require_segmented_commit(route, accepted_tokens)?;
+        launch_target_mtp_segmented_commit(
+            stream,
+            route,
+            accepted_tokens,
+            self.ops(),
+            &self._pointers,
+        )?;
+        Ok(())
+    }
+
     /// Reads active BF16 vocabulary logits.
     pub fn read_logits(&self, stream: &CudaStream, batch: usize) -> EngineResult<Vec<u16>> {
         require_batch(batch)?;
         let values = product("resident logit elements", batch, Qwen38_27B::VOCAB)?;
+        Ok(self
+            .arena
+            .copy_prefix_to_host(stream, self.layout.workspace.logits, values)?)
+    }
+
+    /// Reads every lane-major target logit row from one segmented verification.
+    pub fn read_target_mtp_segmented_logits(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpSegmentedVerifyRoute,
+    ) -> EngineResult<Vec<u16>> {
+        let values = product(
+            "segmented target MTP logit elements",
+            route.rows(),
+            Qwen38_27B::VOCAB,
+        )?;
         Ok(self
             .arena
             .copy_prefix_to_host(stream, self.layout.workspace.logits, values)?)
@@ -1582,9 +1826,12 @@ impl ResidentModelProgram {
         super::MAX_ROWS
     }
 
-    /// Immutable provisional-verify and accepted-prefix graph entries.
+    /// Immutable singleton/segmented provisional-verify and accepted-prefix graph entries.
     pub const fn target_mtp_graph_count(&self) -> usize {
-        TARGET_VERIFY_ROUTE_COUNT * (LONG_CONTEXT_ROUTE_COUNT + 2)
+        TARGET_VERIFY_ROUTE_COUNT
+            * (LONG_CONTEXT_ROUTE_COUNT
+                + 2
+                + TARGET_SEGMENTED_BATCH_ROUTES * (LONG_CONTEXT_ROUTE_COUNT + 1))
     }
 
     /// Fixed per-slot capacity of the current exact attention caches.
@@ -1649,6 +1896,23 @@ impl ResidentModelProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Launches one exact lane-major target-verification schedule eagerly.
+    pub fn launch_target_mtp_segmented_verify_eager(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpSegmentedVerifyRoute,
+    ) -> EngineResult<()> {
+        launch_target_mtp_segmented_verify(
+            stream,
+            route,
+            self.ops(),
+            &self._pointers,
+            &self.dense_mlp_maps,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
     /// Launches one accepted-prefix state commit eagerly.
     pub fn launch_target_mtp_commit_eager(
         &self,
@@ -1688,6 +1952,15 @@ impl ResidentModelProgram {
         route: ResidentMtpVerifyRoute,
     ) -> &CudaGraph {
         self.graphs.select_target_verify(route)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns one captured exact lane-major target-verification graph.
+    pub fn qualification_target_mtp_segmented_verify_graph(
+        &self,
+        route: ResidentMtpSegmentedVerifyRoute,
+    ) -> &CudaGraph {
+        self.graphs.select_target_segmented_verify(route)
     }
 
     #[cfg(feature = "qualification")]
@@ -1774,6 +2047,47 @@ impl ResidentModelProgram {
                 )?;
                 if let Some(tokens) = committed_tokens {
                     launch_target_mtp_commit(stream, tokens, ops, &self._pointers)?;
+                }
+            }
+            Ok(())
+        })?)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Captures repeated segmented verification and optional per-lane commit work.
+    pub fn qualification_repeated_target_mtp_segmented_graph(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpSegmentedVerifyRoute,
+        accepted_tokens: Option<&[usize]>,
+        operations: u64,
+    ) -> EngineResult<CudaGraph> {
+        if operations == 0 {
+            return Err(EngineError::route(
+                "repeated segmented target MTP graph requires at least one operation",
+            ));
+        }
+        if let Some(accepted) = accepted_tokens {
+            require_segmented_commit(route, accepted)?;
+        }
+        let ops = self.ops();
+        Ok(CudaGraph::capture(stream, || {
+            for _ in 0..operations {
+                launch_target_mtp_segmented_verify(
+                    stream,
+                    route,
+                    ops,
+                    &self._pointers,
+                    &self.dense_mlp_maps,
+                )?;
+                if let Some(accepted) = accepted_tokens {
+                    launch_target_mtp_segmented_commit(
+                        stream,
+                        route,
+                        accepted,
+                        ops,
+                        &self._pointers,
+                    )?;
                 }
             }
             Ok(())
@@ -1908,6 +2222,138 @@ impl ResidentModelProgram {
             }
         })?;
         Ok(ResidentPrefillStageGraph {
+            graph,
+            _positions: positions,
+            _lengths: lengths,
+            _rows: rows,
+            _rope_cos: pinned_cos,
+            _rope_sin: pinned_sin,
+            source: PhantomData,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Captures the production uploads for one exact segmented target graph replay.
+    pub fn qualification_target_mtp_segmented_stage_graph(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpSegmentedVerifyRoute,
+        slots: &[usize],
+        first_positions: &[usize],
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<ResidentMtpSegmentedStageGraph<'_>> {
+        let slot_ids = slot_rows(slots)?;
+        if slots.len() != route.batch || first_positions.len() != route.batch {
+            return Err(EngineError::layout(
+                "segmented target stage slot/position inventory differs from its route",
+            ));
+        }
+        let active_rows = route.rows();
+        let rotary_values = product(
+            "segmented target stage rotary values",
+            active_rows,
+            ROTARY_PAIRS,
+        )?;
+        if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
+            return Err(EngineError::layout(format!(
+                "segmented target stage rotary planes must each have {rotary_values} values"
+            )));
+        }
+
+        let mut positions =
+            PinnedHostBuffer::zeroed(&self.context, active_rows).map_err(GpuError::from)?;
+        let mut lengths =
+            PinnedHostBuffer::zeroed(&self.context, active_rows).map_err(GpuError::from)?;
+        let mut rows =
+            PinnedHostBuffer::zeroed(&self.context, active_rows).map_err(GpuError::from)?;
+        let mut lane_lengths = [0u32; MAX_BATCH];
+        for lane in 0..route.batch {
+            for token in 0..route.tokens {
+                let row = lane * route.tokens + token;
+                let position = first_positions[lane]
+                    .checked_add(token)
+                    .and_then(|position| u32::try_from(position).ok())
+                    .ok_or_else(|| {
+                        EngineError::route("segmented target stage position exceeds u32")
+                    })?;
+                positions.as_mut_slice()[row] = position;
+                lengths.as_mut_slice()[row] = position + 1;
+                rows.as_mut_slice()[row] = slot_ids[lane];
+            }
+            lane_lengths[lane] = first_positions[lane]
+                .checked_add(route.tokens)
+                .and_then(|length| u32::try_from(length).ok())
+                .ok_or_else(|| EngineError::route("segmented target stage length exceeds u32"))?;
+        }
+        if select_segmented_target_route(route.tokens, route.batch, &lane_lengths[..route.batch])?
+            != route
+        {
+            return Err(EngineError::route(
+                "segmented target stage metadata selects a different graph route",
+            ));
+        }
+        let mut pinned_cos =
+            PinnedHostBuffer::zeroed(&self.context, rotary_values).map_err(GpuError::from)?;
+        pinned_cos.as_mut_slice().copy_from_slice(rope_cos);
+        let mut pinned_sin =
+            PinnedHostBuffer::zeroed(&self.context, rotary_values).map_err(GpuError::from)?;
+        pinned_sin.as_mut_slice().copy_from_slice(rope_sin);
+        let active_embeddings = product(
+            "segmented target stage embedding elements",
+            active_rows,
+            Qwen38_27B::HIDDEN,
+        )?;
+        let workspace = self.layout.workspace;
+        let graph = CudaGraph::capture(stream, || {
+            // SAFETY: this returned owner retains every pinned source and borrows
+            // the resident embedding stager through the final graph replay.
+            unsafe {
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.residual_a,
+                    &self.embedding_stager,
+                    active_embeddings,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.state_rows,
+                    &rows,
+                    active_rows,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.table_rows,
+                    &rows,
+                    active_rows,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.cache_positions,
+                    &positions,
+                    active_rows,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.lengths,
+                    &lengths,
+                    active_rows,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.rope_cos,
+                    &pinned_cos,
+                    rotary_values,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    workspace.rope_sin,
+                    &pinned_sin,
+                    rotary_values,
+                )
+            }
+        })?;
+        Ok(ResidentMtpSegmentedStageGraph {
             graph,
             _positions: positions,
             _lengths: lengths,
@@ -2138,6 +2584,36 @@ impl ResidentModelProgram {
                 state_values,
             )?);
         }
+        let provisional_history_values =
+            Qwen38_27B::GDN_QKV_ROWS * (Qwen38_27B::LINEAR_CONV_KERNEL_DIM - 1);
+        let provisional_state_values = Qwen38_27B::GDN_CONTROL_ROWS
+            * Qwen38_27B::LINEAR_HEAD_DIM
+            * Qwen38_27B::LINEAR_HEAD_DIM;
+        let mut recorded_projected = Vec::new();
+        let mut recorded_log_decay = Vec::new();
+        let mut recorded_beta = Vec::new();
+        for layer in 0..GDN_LAYER_COUNT {
+            recorded_projected.extend(self.arena.copy_slice_to_host(
+                stream,
+                workspace.recorded_projected,
+                layer * TARGET_VERIFY_ROWS * Qwen38_27B::GDN_INPUT_ROWS,
+                TARGET_VERIFY_ROUTE_COUNT * Qwen38_27B::GDN_INPUT_ROWS,
+            )?);
+            let control_offset = layer * TARGET_VERIFY_ROWS * Qwen38_27B::GDN_CONTROL_ROWS;
+            let control_values = TARGET_VERIFY_ROUTE_COUNT * Qwen38_27B::GDN_CONTROL_ROWS;
+            recorded_log_decay.extend(self.arena.copy_slice_to_host(
+                stream,
+                workspace.recorded_log_decay,
+                control_offset,
+                control_values,
+            )?);
+            recorded_beta.extend(self.arena.copy_slice_to_host(
+                stream,
+                workspace.recorded_beta,
+                control_offset,
+                control_values,
+            )?);
+        }
 
         Ok(ResidentMtpVerifyObservables {
             residual_a: self.arena.copy_prefix_to_host(
@@ -2153,19 +2629,132 @@ impl ResidentModelProgram {
             logits: self
                 .arena
                 .copy_prefix_to_host(stream, workspace.logits, logit_values)?,
-            provisional_history: self
+            provisional_history: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.provisional_history,
+                provisional_history_values,
+            )?,
+            provisional_state: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.provisional_state,
+                provisional_state_values,
+            )?,
+            recorded_projected,
+            recorded_log_decay,
+            recorded_beta,
+            live_history,
+            live_state,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads all lane-major segmented target seams and selected live GDN rows.
+    pub fn qualification_target_mtp_segmented_observables(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpSegmentedVerifyRoute,
+    ) -> EngineResult<ResidentMtpVerifyObservables> {
+        let workspace = self.layout.workspace;
+        let hidden_values = product(
+            "segmented target MTP observable hidden values",
+            route.rows(),
+            Qwen38_27B::HIDDEN,
+        )?;
+        let logit_values = product(
+            "segmented target MTP observable logits",
+            route.rows(),
+            Qwen38_27B::VOCAB,
+        )?;
+        let state_rows =
+            self.arena
+                .copy_prefix_to_host(stream, workspace.state_rows, route.rows())?;
+        let history_values =
+            self.layout.history_bytes() / MAX_BATCH / GDN_LAYER_COUNT / size_of::<u16>();
+        let state_values =
+            self.layout.state_bytes() / MAX_BATCH / GDN_LAYER_COUNT / size_of::<f32>();
+        let mut live_history = Vec::with_capacity(route.batch * GDN_LAYER_COUNT * history_values);
+        let mut live_state = Vec::with_capacity(route.batch * GDN_LAYER_COUNT * state_values);
+        for lane in 0..route.batch {
+            let slot = usize::try_from(state_rows[lane * route.tokens])
+                .map_err(|_| EngineError::layout("segmented target MTP slot exceeds usize"))?;
+            for layer in &self.layout.layers {
+                let super::PersistentState::Gdn(persistent) = layer.persistent else {
+                    continue;
+                };
+                live_history.extend(self.arena.copy_slice_to_host(
+                    stream,
+                    persistent.history,
+                    slot * history_values,
+                    history_values,
+                )?);
+                live_state.extend(self.arena.copy_slice_to_host(
+                    stream,
+                    persistent.state,
+                    slot * state_values,
+                    state_values,
+                )?);
+            }
+        }
+
+        let provisional_history_values =
+            Qwen38_27B::GDN_QKV_ROWS * (Qwen38_27B::LINEAR_CONV_KERNEL_DIM - 1);
+        let provisional_state_values = Qwen38_27B::GDN_CONTROL_ROWS
+            * Qwen38_27B::LINEAR_HEAD_DIM
+            * Qwen38_27B::LINEAR_HEAD_DIM;
+        let record_rows = route.batch * TARGET_VERIFY_ROUTE_COUNT;
+        let mut recorded_projected = Vec::new();
+        let mut recorded_log_decay = Vec::new();
+        let mut recorded_beta = Vec::new();
+        for layer in 0..GDN_LAYER_COUNT {
+            recorded_projected.extend(self.arena.copy_slice_to_host(
+                stream,
+                workspace.recorded_projected,
+                layer * TARGET_VERIFY_ROWS * Qwen38_27B::GDN_INPUT_ROWS,
+                record_rows * Qwen38_27B::GDN_INPUT_ROWS,
+            )?);
+            let control_offset = layer * TARGET_VERIFY_ROWS * Qwen38_27B::GDN_CONTROL_ROWS;
+            let control_values = record_rows * Qwen38_27B::GDN_CONTROL_ROWS;
+            recorded_log_decay.extend(self.arena.copy_slice_to_host(
+                stream,
+                workspace.recorded_log_decay,
+                control_offset,
+                control_values,
+            )?);
+            recorded_beta.extend(self.arena.copy_slice_to_host(
+                stream,
+                workspace.recorded_beta,
+                control_offset,
+                control_values,
+            )?);
+        }
+
+        Ok(ResidentMtpVerifyObservables {
+            residual_a: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.residual_a,
+                hidden_values,
+            )?,
+            final_normalized: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.mixer_normalized,
+                hidden_values,
+            )?,
+            logits: self
                 .arena
-                .copy_to_host(stream, workspace.provisional_history)?,
-            provisional_state: self
-                .arena
-                .copy_to_host(stream, workspace.provisional_state)?,
-            recorded_projected: self
-                .arena
-                .copy_to_host(stream, workspace.recorded_projected)?,
-            recorded_log_decay: self
-                .arena
-                .copy_to_host(stream, workspace.recorded_log_decay)?,
-            recorded_beta: self.arena.copy_to_host(stream, workspace.recorded_beta)?,
+                .copy_prefix_to_host(stream, workspace.logits, logit_values)?,
+            provisional_history: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.provisional_history,
+                route.batch * provisional_history_values,
+            )?,
+            provisional_state: self.arena.copy_prefix_to_host(
+                stream,
+                workspace.provisional_state,
+                route.batch * provisional_state_values,
+            )?,
+            recorded_projected,
+            recorded_log_decay,
+            recorded_beta,
             live_history,
             live_state,
         })
@@ -2207,7 +2796,10 @@ impl ResidentModelProgram {
             let mut gdn_layer = 0;
             launch_target_mtp_mixer(
                 stream,
-                route,
+                route.tokens,
+                0,
+                route.maximum_length,
+                route.attention,
                 self.ops(),
                 workspace,
                 first.mixer,
@@ -2360,7 +2952,10 @@ impl ResidentModelProgram {
             if target {
                 launch_target_mtp_mixer(
                     stream,
-                    route,
+                    route.tokens,
+                    0,
+                    route.maximum_length,
+                    route.attention,
                     self.ops(),
                     workspace,
                     layer.mixer,
@@ -2679,7 +3274,6 @@ impl ResidentModelProgram {
         })
     }
 
-    #[cfg(feature = "qualification")]
     fn ops(&self) -> Ops<'_> {
         Ops {
             norm: &self._norm,
@@ -2810,15 +3404,15 @@ pub struct ResidentMtpLayerObservables {
 #[cfg(feature = "qualification")]
 /// Provisional target outputs, replay records, and selected live GDN rows.
 pub struct ResidentMtpVerifyObservables {
-    /// Final target residual rows before endpoint normalization.
+    /// Active target residual rows before endpoint normalization.
     pub residual_a: Vec<u16>,
     /// Final-normalized target rows that feed the shared LM head.
     pub final_normalized: Vec<u16>,
-    /// K-wide BF16 target vocabulary logits.
+    /// Active lane-major BF16 target vocabulary logits.
     pub logits: Vec<u16>,
-    /// Final provisional causal-history row from the last GDN layer.
+    /// Final provisional causal-history rows from the last GDN layer.
     pub provisional_history: Vec<u16>,
-    /// Final provisional recurrent-state row from the last GDN layer.
+    /// Final provisional recurrent-state rows from the last GDN layer.
     pub provisional_state: Vec<f32>,
     /// Per-GDN-layer projected values retained for accepted-prefix replay.
     pub recorded_projected: Vec<u16>,
@@ -2826,9 +3420,9 @@ pub struct ResidentMtpVerifyObservables {
     pub recorded_log_decay: Vec<f32>,
     /// Per-GDN-layer beta controls retained for replay.
     pub recorded_beta: Vec<f32>,
-    /// Selected live history row concatenated in ascending GDN-layer order.
+    /// Selected live history rows concatenated lane-major, then by GDN layer.
     pub live_history: Vec<u16>,
-    /// Selected live recurrent row concatenated in ascending GDN-layer order.
+    /// Selected live recurrent rows concatenated lane-major, then by GDN layer.
     pub live_state: Vec<f32>,
 }
 
@@ -3071,17 +3665,81 @@ struct WorkspacePointers {
 impl WorkspacePointers {
     fn recorded_projected_for(self, gdn_layer: usize) -> *mut u16 {
         self.recorded_projected
-            .wrapping_add(gdn_layer * TARGET_VERIFY_ROUTE_COUNT * Qwen38_27B::GDN_INPUT_ROWS)
+            .wrapping_add(gdn_layer * TARGET_VERIFY_ROWS * Qwen38_27B::GDN_INPUT_ROWS)
     }
 
     fn recorded_log_decay_for(self, gdn_layer: usize) -> *mut f32 {
         self.recorded_log_decay
-            .wrapping_add(gdn_layer * TARGET_VERIFY_ROUTE_COUNT * Qwen38_27B::GDN_CONTROL_ROWS)
+            .wrapping_add(gdn_layer * TARGET_VERIFY_ROWS * Qwen38_27B::GDN_CONTROL_ROWS)
     }
 
     fn recorded_beta_for(self, gdn_layer: usize) -> *mut f32 {
         self.recorded_beta
-            .wrapping_add(gdn_layer * TARGET_VERIFY_ROUTE_COUNT * Qwen38_27B::GDN_CONTROL_ROWS)
+            .wrapping_add(gdn_layer * TARGET_VERIFY_ROWS * Qwen38_27B::GDN_CONTROL_ROWS)
+    }
+
+    fn target_record_offset(lane: usize) -> usize {
+        lane * TARGET_VERIFY_ROUTE_COUNT
+    }
+
+    fn row_offset(self, rows: usize) -> Self {
+        Self {
+            residual_a: self.residual_a.wrapping_add(rows * Qwen38_27B::HIDDEN),
+            residual_b: self.residual_b.wrapping_add(rows * Qwen38_27B::HIDDEN),
+            mixer_residual: self.mixer_residual.wrapping_add(rows * Qwen38_27B::HIDDEN),
+            mixer_normalized: self
+                .mixer_normalized
+                .wrapping_add(rows * Qwen38_27B::HIDDEN),
+            mlp_normalized: self.mlp_normalized.wrapping_add(rows * Qwen38_27B::HIDDEN),
+            activation_codes: self
+                .activation_codes
+                .wrapping_add(rows * Qwen38_27B::INTERMEDIATE),
+            activation_scales: self.activation_scales.wrapping_add(rows),
+            nvfp4_activation_codes: self
+                .nvfp4_activation_codes
+                .wrapping_add(rows * Qwen38_27B::INTERMEDIATE / 2),
+            nvfp4_activation_scales: self
+                .nvfp4_activation_scales
+                .wrapping_add(rows * Qwen38_27B::INTERMEDIATE / 16),
+            projected: self
+                .projected
+                .wrapping_add(rows * Qwen38_27B::GDN_INPUT_ROWS),
+            state_rows: self.state_rows.wrapping_add(rows),
+            log_decay: self
+                .log_decay
+                .wrapping_add(rows * Qwen38_27B::GDN_CONTROL_ROWS),
+            beta: self.beta.wrapping_add(rows * Qwen38_27B::GDN_CONTROL_ROWS),
+            convolved: self.convolved.wrapping_add(rows * Qwen38_27B::GDN_QKV_ROWS),
+            recurrent_output: self
+                .recurrent_output
+                .wrapping_add(rows * Qwen38_27B::GDN_VALUE_ROWS),
+            rope_cos: self.rope_cos.wrapping_add(rows * ROTARY_PAIRS),
+            rope_sin: self.rope_sin.wrapping_add(rows * ROTARY_PAIRS),
+            block_tables: self.block_tables,
+            table_rows: self.table_rows.wrapping_add(rows),
+            cache_positions: self.cache_positions.wrapping_add(rows),
+            lengths: self.lengths.wrapping_add(rows),
+            query: self
+                .query
+                .wrapping_add(rows * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS),
+            partial_maximum: self.partial_maximum,
+            partial_denominator: self.partial_denominator,
+            partial_numerator: self.partial_numerator,
+            prefill_partials: self.prefill_partials,
+            attention: self
+                .attention
+                .wrapping_add(rows * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS),
+            mixer_branch: self.mixer_branch.wrapping_add(rows * Qwen38_27B::HIDDEN),
+            swiglu: self.swiglu.wrapping_add(rows * Qwen38_27B::INTERMEDIATE),
+            mlp_branch: self.mlp_branch.wrapping_add(rows * Qwen38_27B::HIDDEN),
+            logits: self.logits.wrapping_add(rows * Qwen38_27B::VOCAB),
+            provisional_history: self.provisional_history,
+            provisional_state: self.provisional_state,
+            provisional_state_row: self.provisional_state_row,
+            recorded_projected: self.recorded_projected,
+            recorded_log_decay: self.recorded_log_decay,
+            recorded_beta: self.recorded_beta,
+        }
     }
 }
 
@@ -3565,6 +4223,57 @@ fn capture_routes(
         EngineError::layout("target MTP long graph partition inventory has wrong cardinality")
     })?;
 
+    let mut target_segmented_verify_short = Vec::with_capacity(TARGET_VERIFY_ROUTE_COUNT);
+    for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
+        let mut graphs = Vec::with_capacity(TARGET_SEGMENTED_BATCH_ROUTES);
+        for batch in 2..=MAX_BATCH {
+            let route = ResidentMtpSegmentedVerifyRoute {
+                tokens,
+                batch,
+                maximum_length: SHORT_CONTEXT_CAPACITY,
+                attention: AttentionRoute::Short,
+            };
+            graphs.push(CudaGraph::capture(stream, || {
+                launch_target_mtp_segmented_verify(stream, route, ops, pointers, dense_mlp_maps)
+            })?);
+        }
+        target_segmented_verify_short.push(graphs.try_into().map_err(|_| {
+            EngineError::layout("segmented target MTP short batch inventory differs")
+        })?);
+    }
+    let target_segmented_verify_short = target_segmented_verify_short
+        .try_into()
+        .map_err(|_| EngineError::layout("segmented target MTP short token inventory differs"))?;
+
+    let mut target_segmented_verify_long = Vec::with_capacity(LONG_CONTEXT_ROUTE_COUNT);
+    for (index, &partitions) in LONG_CONTEXT_GQA_PARTITION_BUCKETS.iter().enumerate() {
+        let maximum_length = (partitions * LONG_CONTEXT_GQA_PARTITION_SIZE).min(MAX_CONTEXT_TOKENS);
+        let mut token_graphs = Vec::with_capacity(TARGET_VERIFY_ROUTE_COUNT);
+        for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
+            let mut graphs = Vec::with_capacity(TARGET_SEGMENTED_BATCH_ROUTES);
+            for batch in 2..=MAX_BATCH {
+                let route = ResidentMtpSegmentedVerifyRoute {
+                    tokens,
+                    batch,
+                    maximum_length,
+                    attention: AttentionRoute::Long { index, partitions },
+                };
+                graphs.push(CudaGraph::capture(stream, || {
+                    launch_target_mtp_segmented_verify(stream, route, ops, pointers, dense_mlp_maps)
+                })?);
+            }
+            token_graphs.push(graphs.try_into().map_err(|_| {
+                EngineError::layout("segmented target MTP long batch inventory differs")
+            })?);
+        }
+        target_segmented_verify_long.push(token_graphs.try_into().map_err(|_| {
+            EngineError::layout("segmented target MTP long token inventory differs")
+        })?);
+    }
+    let target_segmented_verify_long = target_segmented_verify_long.try_into().map_err(|_| {
+        EngineError::layout("segmented target MTP long partition inventory differs")
+    })?;
+
     let mut target_commit = Vec::with_capacity(TARGET_VERIFY_ROUTE_COUNT);
     for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
         target_commit.push(CudaGraph::capture(stream, || {
@@ -3581,6 +4290,8 @@ fn capture_routes(
         prefill,
         target_verify_short,
         target_verify_long,
+        target_segmented_verify_short,
+        target_segmented_verify_long,
         target_commit,
     })
 }
@@ -3678,14 +4389,59 @@ fn launch_target_mtp_verify(
     pointers: &ProgramPointers,
     dense_mlp_maps: &[DenseMlpMaps],
 ) -> GpuResult<()> {
-    let tokens = route.tokens;
-    let workspace = pointers.workspace;
+    launch_target_mtp_verify_lane(
+        stream,
+        route.tokens,
+        0,
+        route.maximum_length,
+        route.attention,
+        ops,
+        pointers,
+        dense_mlp_maps,
+    )
+}
+
+fn launch_target_mtp_segmented_verify(
+    stream: &CudaStream,
+    route: ResidentMtpSegmentedVerifyRoute,
+    ops: Ops<'_>,
+    pointers: &ProgramPointers,
+    dense_mlp_maps: &[DenseMlpMaps],
+) -> GpuResult<()> {
+    for lane in 0..route.batch {
+        launch_target_mtp_verify_lane(
+            stream,
+            route.tokens,
+            lane,
+            route.maximum_length,
+            route.attention,
+            ops,
+            pointers,
+            dense_mlp_maps,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_target_mtp_verify_lane(
+    stream: &CudaStream,
+    tokens: usize,
+    lane: usize,
+    maximum_length: usize,
+    attention: AttentionRoute,
+    ops: Ops<'_>,
+    pointers: &ProgramPointers,
+    dense_mlp_maps: &[DenseMlpMaps],
+) -> GpuResult<()> {
+    let row_offset = lane * tokens;
+    let workspace = pointers.workspace.row_offset(row_offset);
     let first = pointers
         .layers
         .first()
         .ok_or_else(|| GpuError::invalid_launch("resident layer inventory is empty"))?;
-    // SAFETY: K=1..4 bounds every shared plane. Metadata maps all causal rows
-    // to one stable slot while the GDN snapshot redirects mutations to scratch.
+    // Each lane retains the exact K=1..4 leaf topology. Independent row offsets,
+    // provisional state, replay records, and page-table metadata prevent aliasing.
     unsafe {
         ops.norm.launch_plain(
             stream,
@@ -3699,7 +4455,17 @@ fn launch_target_mtp_verify(
     let mut residual_input = workspace.residual_a;
     let mut gdn_layer = 0;
     for (index, layer) in pointers.layers.iter().enumerate() {
-        launch_target_mtp_mixer(stream, route, ops, workspace, layer.mixer, &mut gdn_layer)?;
+        launch_target_mtp_mixer(
+            stream,
+            tokens,
+            lane,
+            maximum_length,
+            attention,
+            ops,
+            workspace,
+            layer.mixer,
+            &mut gdn_layer,
+        )?;
         // SAFETY: branch and residual planes are disjoint maximum-row regions.
         unsafe {
             ops.norm.launch_residual(
@@ -3764,15 +4530,18 @@ fn launch_target_mtp_verify(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_target_mtp_mixer(
     stream: &CudaStream,
-    route: ResidentMtpVerifyRoute,
+    tokens: usize,
+    lane: usize,
+    maximum_length: usize,
+    attention: AttentionRoute,
     ops: Ops<'_>,
     workspace: WorkspacePointers,
     mixer: MixerPointers,
     gdn_layer: &mut usize,
 ) -> GpuResult<()> {
-    let tokens = route.tokens;
     // SAFETY: K=1..4 scratch and replay planes are address-stable and consumed
     // before reuse. Attention rows append distinct positions to one table row.
     unsafe {
@@ -3787,16 +4556,34 @@ fn launch_target_mtp_mixer(
                         "target GDN layer exceeds replay inventory",
                     ));
                 }
-                let projected = workspace.recorded_projected_for(layer);
-                let log_decay = workspace.recorded_log_decay_for(layer);
-                let beta = workspace.recorded_beta_for(layer);
+                let record = WorkspacePointers::target_record_offset(lane);
+                let projected = workspace
+                    .recorded_projected_for(layer)
+                    .wrapping_add(record * Qwen38_27B::GDN_INPUT_ROWS);
+                let log_decay = workspace
+                    .recorded_log_decay_for(layer)
+                    .wrapping_add(record * Qwen38_27B::GDN_CONTROL_ROWS);
+                let beta = workspace
+                    .recorded_beta_for(layer)
+                    .wrapping_add(record * Qwen38_27B::GDN_CONTROL_ROWS);
+                let history_values =
+                    Qwen38_27B::GDN_QKV_ROWS * (Qwen38_27B::LINEAR_CONV_KERNEL_DIM - 1);
+                let state_values = Qwen38_27B::GDN_CONTROL_ROWS
+                    * Qwen38_27B::LINEAR_HEAD_DIM
+                    * Qwen38_27B::LINEAR_HEAD_DIM;
+                let provisional_history = workspace
+                    .provisional_history
+                    .wrapping_add(lane * history_values);
+                let provisional_state = workspace
+                    .provisional_state
+                    .wrapping_add(lane * state_values);
                 ops.gdn_state_snapshot.launch(
                     stream,
                     workspace.state_rows,
                     p.history,
                     p.state,
-                    workspace.provisional_history,
-                    workspace.provisional_state,
+                    provisional_history,
+                    provisional_state,
                 )?;
                 ops.gdn_input.launch(
                     stream,
@@ -3818,7 +4605,7 @@ fn launch_target_mtp_mixer(
                     projected,
                     p.convolution_weights,
                     workspace.provisional_state_row,
-                    workspace.provisional_history,
+                    provisional_history,
                     log_decay,
                     beta,
                     workspace.convolved,
@@ -3832,7 +4619,7 @@ fn launch_target_mtp_mixer(
                     beta,
                     p.recurrent_norm,
                     workspace.provisional_state_row,
-                    workspace.provisional_state,
+                    provisional_state,
                     workspace.recurrent_output,
                 )?;
                 ops.gdn_output.launch(
@@ -3875,7 +4662,7 @@ fn launch_target_mtp_mixer(
                     p.scalars.key_cache_scale,
                     p.scalars.value_cache_scale,
                 )?;
-                match route.attention {
+                match attention {
                     AttentionRoute::Short => ops.paged_gqa.launch(
                         stream,
                         tokens,
@@ -3893,7 +4680,7 @@ fn launch_target_mtp_mixer(
                     AttentionRoute::Long { .. } => ops.long_context_paged_gqa.launch(
                         stream,
                         tokens,
-                        route.maximum_length,
+                        maximum_length,
                         workspace.query,
                         p.key_pages,
                         p.value_pages,
@@ -3978,6 +4765,75 @@ fn launch_target_mtp_commit(
         )));
     }
 
+    Ok(())
+}
+
+fn launch_target_mtp_segmented_commit(
+    stream: &CudaStream,
+    route: ResidentMtpSegmentedVerifyRoute,
+    accepted_tokens: &[usize],
+    ops: Ops<'_>,
+    pointers: &ProgramPointers,
+) -> GpuResult<()> {
+    let mut gdn_layer = 0;
+    for layer in &pointers.layers {
+        let MixerPointers::Gdn(p) = layer.mixer else {
+            continue;
+        };
+        if gdn_layer >= GDN_LAYER_COUNT {
+            return Err(GpuError::invalid_launch(
+                "segmented target commit GDN layer exceeds replay inventory",
+            ));
+        }
+        for (lane, &tokens) in accepted_tokens.iter().enumerate() {
+            let row = lane * route.tokens;
+            let workspace = pointers.workspace.row_offset(row);
+            let record = WorkspacePointers::target_record_offset(lane);
+            let projected = pointers
+                .workspace
+                .recorded_projected_for(gdn_layer)
+                .wrapping_add(record * Qwen38_27B::GDN_INPUT_ROWS);
+            let log_decay = pointers
+                .workspace
+                .recorded_log_decay_for(gdn_layer)
+                .wrapping_add(record * Qwen38_27B::GDN_CONTROL_ROWS);
+            let beta = pointers
+                .workspace
+                .recorded_beta_for(gdn_layer)
+                .wrapping_add(record * Qwen38_27B::GDN_CONTROL_ROWS);
+            // Per-lane replay retains the exact K=1..4 convolution and recurrence
+            // arithmetic while records and live state rows remain disjoint.
+            unsafe {
+                ops.gdn_prepare.launch_causal_replay(
+                    stream,
+                    tokens,
+                    projected,
+                    p.convolution_weights,
+                    workspace.state_rows,
+                    p.history,
+                    workspace.convolved,
+                )?;
+                ops.gdn_recurrence.launch_causal(
+                    stream,
+                    tokens,
+                    workspace.convolved,
+                    projected,
+                    log_decay,
+                    beta,
+                    p.recurrent_norm,
+                    workspace.state_rows,
+                    p.state,
+                    workspace.recurrent_output,
+                )?;
+            }
+        }
+        gdn_layer += 1;
+    }
+    if gdn_layer != GDN_LAYER_COUNT {
+        return Err(GpuError::invalid_launch(format!(
+            "segmented target MTP commit visited {gdn_layer} GDN layers, expected {GDN_LAYER_COUNT}"
+        )));
+    }
     Ok(())
 }
 
@@ -5120,6 +5976,45 @@ fn require_target_verify_tokens(tokens: usize) -> EngineResult<()> {
     Ok(())
 }
 
+fn require_segmented_commit(
+    route: ResidentMtpSegmentedVerifyRoute,
+    accepted_tokens: &[usize],
+) -> EngineResult<()> {
+    if accepted_tokens.len() != route.batch {
+        return Err(EngineError::route(format!(
+            "segmented target MTP commit has {} lane counts, expected B={}",
+            accepted_tokens.len(),
+            route.batch
+        )));
+    }
+    if let Some((lane, &tokens)) = accepted_tokens
+        .iter()
+        .enumerate()
+        .find(|(_, tokens)| !(1..=route.tokens).contains(tokens))
+    {
+        return Err(EngineError::route(format!(
+            "segmented target MTP lane {lane} commits {tokens} rows from a K={} verification",
+            route.tokens
+        )));
+    }
+    Ok(())
+}
+
+fn select_segmented_target_route(
+    tokens: usize,
+    batch: usize,
+    maximum_lengths: &[u32],
+) -> EngineResult<ResidentMtpSegmentedVerifyRoute> {
+    require_target_verify_tokens(tokens)?;
+    let decode = select_decode_route(batch, maximum_lengths)?;
+    Ok(ResidentMtpSegmentedVerifyRoute {
+        tokens,
+        batch,
+        maximum_length: decode.maximum_length,
+        attention: decode.attention,
+    })
+}
+
 fn slot_rows(slots: &[usize]) -> EngineResult<[u32; MAX_BATCH]> {
     require_batch(slots.len())?;
     let mut seen = [false; MAX_BATCH];
@@ -5264,8 +6159,9 @@ mod tests {
         LONG_CONTEXT_ROUTE_COUNT, PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT,
         PREFILL_GRAPH_ROUTE_COUNT, PRODUCTION_LOAD_MODE, ResidentLoadMode,
         TARGET_VERIFY_ROUTE_COUNT, bf16_to_f32, decode_lengths, prefill_graph_index,
-        prefill_graph_routes, prefill_index, require_batch, require_rows,
-        require_target_verify_tokens, select_decode_route, select_prefill_route, slot_rows,
+        prefill_graph_routes, prefill_index, require_batch, require_rows, require_segmented_commit,
+        require_target_verify_tokens, select_decode_route, select_prefill_route,
+        select_segmented_target_route, slot_rows,
     };
     use crate::EngineErrorCode;
 
@@ -5288,8 +6184,11 @@ mod tests {
     #[test]
     fn target_mtp_inventory_covers_every_k_and_attention_band() {
         assert_eq!(
-            TARGET_VERIFY_ROUTE_COUNT * (LONG_CONTEXT_ROUTE_COUNT + 2),
-            32
+            TARGET_VERIFY_ROUTE_COUNT
+                * (LONG_CONTEXT_ROUTE_COUNT
+                    + 2
+                    + super::TARGET_SEGMENTED_BATCH_ROUTES * (LONG_CONTEXT_ROUTE_COUNT + 1)),
+            228
         );
         for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
             require_target_verify_tokens(tokens).unwrap();
@@ -5309,6 +6208,32 @@ mod tests {
                 require_target_verify_tokens(tokens).unwrap_err().code(),
                 Some(EngineErrorCode::Route)
             );
+        }
+    }
+
+    #[test]
+    fn segmented_target_inventory_covers_every_batch_k_and_commit_prefix() {
+        for batch in 1..=8 {
+            for tokens in 1..=TARGET_VERIFY_ROUTE_COUNT {
+                let mut lengths = vec![1; batch];
+                lengths[batch - 1] = 220_000;
+                let route = select_segmented_target_route(tokens, batch, &lengths).unwrap();
+                assert_eq!(route.batch(), batch);
+                assert_eq!(route.tokens(), tokens);
+                assert_eq!(route.rows(), batch * tokens);
+                assert_eq!(route.maximum_length(), 220_000);
+                for accepted in 1..=tokens {
+                    require_segmented_commit(route, &vec![accepted; batch]).unwrap();
+                }
+                assert!(require_segmented_commit(route, &vec![1; batch - 1]).is_err());
+                assert!(require_segmented_commit(route, &vec![tokens + 1; batch]).is_err());
+            }
+        }
+        for batch in [0, 9] {
+            assert!(select_segmented_target_route(4, batch, &vec![1; batch]).is_err());
+        }
+        for tokens in [0, 5] {
+            assert!(select_segmented_target_route(tokens, 1, &[1]).is_err());
         }
     }
 

@@ -6,13 +6,13 @@ mod upload_plan;
 
 pub use program::{
     ResidentDecodeRoute, ResidentLoadMode, ResidentLoadStats, ResidentModelProgram,
-    ResidentMtpVerifyRoute, ResidentPrefillRoute,
+    ResidentMtpSegmentedVerifyRoute, ResidentMtpVerifyRoute, ResidentPrefillRoute,
 };
 #[cfg(feature = "qualification")]
 pub use program::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
-    ResidentMtpGdnObservables, ResidentMtpLayerObservables, ResidentMtpVerifyObservables,
-    ResidentPrefillStageGraph,
+    ResidentMtpGdnObservables, ResidentMtpLayerObservables, ResidentMtpSegmentedStageGraph,
+    ResidentMtpVerifyObservables, ResidentPrefillStageGraph,
 };
 pub use progress::{ResidentLoadPhase, ResidentLoadProgress};
 pub use upload_plan::{
@@ -32,6 +32,7 @@ use tuisko_model::{Arch, NVFP4_MLP_LAYER_END, Qwen38_27B};
 const ALIGNMENT: usize = 256;
 const NVFP4_GROUP: usize = 16;
 const TARGET_VERIFY_TOKENS: usize = 4;
+const TARGET_VERIFY_ROWS: usize = MAX_BATCH * TARGET_VERIFY_TOKENS;
 const GDN_LAYER_COUNT: usize = 48;
 pub(crate) const MAX_ROWS: usize = 1_024;
 
@@ -535,15 +536,23 @@ impl SharedWorkspace {
             decode_attention_partials,
             A::HEAD_DIM,
         )?;
-        let batch_logits = product("resident logits workspace", MAX_BATCH, A::VOCAB)?;
+        let batch_logits = product("resident logits workspace", TARGET_VERIFY_ROWS, A::VOCAB)?;
         let provisional_history = product(
             "resident provisional GDN history",
-            A::GDN_QKV_ROWS,
-            A::LINEAR_CONV_KERNEL_DIM - 1,
+            MAX_BATCH,
+            product(
+                "resident provisional GDN history row",
+                A::GDN_QKV_ROWS,
+                A::LINEAR_CONV_KERNEL_DIM - 1,
+            )?,
         )?;
         let provisional_state = product(
             "resident provisional GDN state",
-            A::GDN_CONTROL_ROWS,
+            product(
+                "resident provisional GDN state rows",
+                MAX_BATCH,
+                A::GDN_CONTROL_ROWS,
+            )?,
             product(
                 "resident provisional GDN head matrix",
                 A::LINEAR_HEAD_DIM,
@@ -555,7 +564,7 @@ impl SharedWorkspace {
             GDN_LAYER_COUNT,
             product(
                 "resident target projected replay rows",
-                TARGET_VERIFY_TOKENS,
+                TARGET_VERIFY_ROWS,
                 A::GDN_INPUT_ROWS,
             )?,
         )?;
@@ -564,7 +573,7 @@ impl SharedWorkspace {
             GDN_LAYER_COUNT,
             product(
                 "resident target control replay rows",
-                TARGET_VERIFY_TOKENS,
+                TARGET_VERIFY_ROWS,
                 A::GDN_CONTROL_ROWS,
             )?,
         )?;
@@ -1005,13 +1014,13 @@ mod tests {
         assert_eq!(layout.state_bytes(), 1_207_959_552);
         assert_eq!(layout.cache_bytes(), 7_210_008_576);
         assert_eq!(layout.kv_table_bytes(), 110_016);
-        assert_eq!(layout.workspace_bytes(), 844_769_284);
+        assert_eq!(layout.workspace_bytes(), 923_695_108);
         assert_eq!(
             layout.source_mapped_embedding_bytes().unwrap(),
             2_542_796_800
         );
         assert_eq!(layout.context_capacity(), 220_000);
-        assert_eq!(layout.owner_bytes(), 28_390_122_948);
+        assert_eq!(layout.owner_bytes(), 28_469_048_772);
     }
 
     #[test]
@@ -1035,16 +1044,19 @@ mod tests {
             layout.workspace.prefill_partials.byte_len(),
             PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES,
         );
-        assert_eq!(layout.workspace.logits.len(), 8 * 248_320);
-        assert_eq!(layout.workspace.provisional_history.len(), 10_240 * 3);
-        assert_eq!(layout.workspace.provisional_state.len(), 48 * 128 * 128);
+        assert_eq!(layout.workspace.logits.len(), 8 * 4 * 248_320);
+        assert_eq!(layout.workspace.provisional_history.len(), 8 * 10_240 * 3);
+        assert_eq!(layout.workspace.provisional_state.len(), 8 * 48 * 128 * 128);
         assert_eq!(layout.workspace.provisional_state_row.len(), 1);
-        assert_eq!(layout.workspace.recorded_projected.len(), 48 * 4 * 16_384,);
-        assert_eq!(layout.workspace.recorded_log_decay.len(), 48 * 4 * 48);
-        assert_eq!(layout.workspace.recorded_beta.len(), 48 * 4 * 48);
-        assert_eq!(layout.resident_arena_bytes(), 21_180_019_968);
+        assert_eq!(
+            layout.workspace.recorded_projected.len(),
+            48 * 8 * 4 * 16_384,
+        );
+        assert_eq!(layout.workspace.recorded_log_decay.len(), 48 * 8 * 4 * 48);
+        assert_eq!(layout.workspace.recorded_beta.len(), 48 * 8 * 4 * 48);
+        assert_eq!(layout.resident_arena_bytes(), 21_258_945_792);
         assert_eq!(layout.kv_arena_bytes(), 7_210_118_656);
         assert_eq!(layout.padding_bytes(), 15_676);
-        assert_eq!(layout.arena_bytes(), 28_390_138_624);
+        assert_eq!(layout.arena_bytes(), 28_469_064_448);
     }
 }

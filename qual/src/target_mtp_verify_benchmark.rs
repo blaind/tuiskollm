@@ -3,26 +3,27 @@
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
     DeviceBenchmarkOptions, DeviceBenchmarkReport, ExactDeviceCase, MemoryRecorder,
-    OperationAccounting, RepeatedGraph, finish_report, generator_baseline_sha256, measure_cases,
-    preflight, require_current_process_exclusive, warmup_launches,
+    OperationAccounting, finish_report, generator_baseline_sha256, measure_cases, preflight,
+    require_current_process_exclusive, warmup_launches,
 };
 use std::path::Path;
 use std::sync::Arc;
-use tuisko_engine::{ResidentModelProgram, ResidentMtpVerifyRoute};
+use tuisko_engine::{
+    MAX_BATCH, ResidentModelProgram, ResidentMtpSegmentedStageGraph,
+    ResidentMtpSegmentedVerifyRoute,
+};
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, GpuError, GpuTimer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
 const VERIFY_ROUTES: usize = 4;
 const FIRST_POSITION: usize = 128;
 const ROTARY_PAIRS: usize = 32;
-const SLOT: usize = 0;
 const TOKEN_IDS: [u32; VERIFY_ROUTES] = [101, 7_919, 48_127, 199_933];
 
 struct RouteGraphs {
-    route: ResidentMtpVerifyRoute,
-    verify_repeated: CudaGraph,
+    route: ResidentMtpSegmentedVerifyRoute,
+    _accepted: Vec<usize>,
     verify_commit: CudaGraph,
-    verify_commit_repeated: CudaGraph,
 }
 
 struct Session {
@@ -34,7 +35,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(root: &Path, repeated_operations: u64) -> Result<Self, DeviceBenchmarkError> {
+    fn new(root: &Path) -> Result<Self, DeviceBenchmarkError> {
         let snapshot = Arc::new(CheckpointSnapshot::<Qwen38_27B>::open(root)?);
         let context = CudaContext::new(0).map_err(GpuError::from)?;
         let capability = context.compute_capability().map_err(GpuError::from)?;
@@ -46,53 +47,53 @@ impl Session {
         }
         let stream = context.new_stream().map_err(GpuError::from)?;
         let mut program = ResidentModelProgram::from_snapshot(&context, snapshot)?;
-        program.activate_kv_slot(SLOT)?;
-        program.reserve_kv_slot_tokens(&stream, SLOT, 192)?;
-        program.stage_embeddings(&stream, &TOKEN_IDS)?;
+        for slot in 0..MAX_BATCH {
+            program.activate_kv_slot(slot)?;
+            program.reserve_kv_slot_tokens(&stream, slot, 192)?;
+        }
+        let staged_tokens = (0..MAX_BATCH)
+            .flat_map(|lane| {
+                TOKEN_IDS
+                    .iter()
+                    .map(move |&token| (token + lane as u32 * 8_191) % Qwen38_27B::VOCAB as u32)
+            })
+            .collect::<Vec<_>>();
+        program.stage_target_mtp_segmented_embeddings(&stream, &staged_tokens)?;
         program.reset_state(&stream)?;
 
-        let mut exact_routes = Vec::with_capacity(VERIFY_ROUTES);
-        for tokens in 1..=VERIFY_ROUTES {
-            let positions = (FIRST_POSITION..FIRST_POSITION + tokens)
-                .map(|position| position as u32)
-                .collect::<Vec<_>>();
-            let (cosine, sine) = rope(&positions);
-            exact_routes.push(program.load_target_mtp_verify_state(
-                &stream,
-                tokens,
-                SLOT,
-                FIRST_POSITION,
-                &cosine,
-                &sine,
-            )?);
+        let mut exact_routes = Vec::with_capacity(MAX_BATCH * VERIFY_ROUTES);
+        for batch in 1..=MAX_BATCH {
+            for tokens in 1..=VERIFY_ROUTES {
+                let positions = (0..batch)
+                    .flat_map(|_| FIRST_POSITION..FIRST_POSITION + tokens)
+                    .map(|position| position as u32)
+                    .collect::<Vec<_>>();
+                let slots = (0..batch).collect::<Vec<_>>();
+                let first_positions = vec![FIRST_POSITION; batch];
+                let (cosine, sine) = rope(&positions);
+                exact_routes.push(program.load_target_mtp_segmented_verify_state(
+                    &stream,
+                    tokens,
+                    &slots,
+                    &first_positions,
+                    &cosine,
+                    &sine,
+                )?);
+            }
         }
-        // The final K=4 metadata is a strict prefix-compatible superset for
-        // K=1..3, so every timed graph observes its production positions and
-        // lengths without per-sample host preparation.
         let routes = exact_routes
             .into_iter()
             .map(|route| {
-                let tokens = route.tokens();
+                let accepted = vec![route.tokens(); route.batch()];
                 Ok(RouteGraphs {
                     route,
-                    verify_repeated: program.qualification_repeated_target_mtp_graph(
+                    verify_commit: program.qualification_repeated_target_mtp_segmented_graph(
                         &stream,
                         route,
-                        None,
-                        repeated_operations,
-                    )?,
-                    verify_commit: program.qualification_repeated_target_mtp_graph(
-                        &stream,
-                        route,
-                        Some(tokens),
+                        Some(&accepted),
                         1,
                     )?,
-                    verify_commit_repeated: program.qualification_repeated_target_mtp_graph(
-                        &stream,
-                        route,
-                        Some(tokens),
-                        repeated_operations,
-                    )?,
+                    _accepted: accepted,
                 })
             })
             .collect::<Result<Vec<_>, DeviceBenchmarkError>>()?;
@@ -106,12 +107,46 @@ impl Session {
         })
     }
 
-    fn warm(&self, launches: u64) -> Result<(), DeviceBenchmarkError> {
+    fn stage_graphs(
+        &self,
+    ) -> Result<Vec<ResidentMtpSegmentedStageGraph<'_>>, DeviceBenchmarkError> {
+        self.routes
+            .iter()
+            .map(|entry| {
+                let route = entry.route;
+                let positions = (0..route.batch())
+                    .flat_map(|_| FIRST_POSITION..FIRST_POSITION + route.tokens())
+                    .map(|position| position as u32)
+                    .collect::<Vec<_>>();
+                let (cosine, sine) = rope(&positions);
+                let slots = (0..route.batch()).collect::<Vec<_>>();
+                let first_positions = vec![FIRST_POSITION; route.batch()];
+                Ok(self
+                    .program
+                    .qualification_target_mtp_segmented_stage_graph(
+                        &self.stream,
+                        route,
+                        &slots,
+                        &first_positions,
+                        &cosine,
+                        &sine,
+                    )?)
+            })
+            .collect()
+    }
+
+    fn warm(
+        &self,
+        stage_graphs: &[ResidentMtpSegmentedStageGraph<'_>],
+        launches: u64,
+    ) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
-            for route in &self.routes {
+            for (route, stage) in self.routes.iter().zip(stage_graphs) {
+                stage.graph().launch(&self.stream)?;
                 self.program
-                    .qualification_target_mtp_verify_graph(route.route)
+                    .qualification_target_mtp_segmented_verify_graph(route.route)
                     .launch(&self.stream)?;
+                stage.graph().launch(&self.stream)?;
                 route.verify_commit.launch(&self.stream)?;
             }
         }
@@ -119,38 +154,46 @@ impl Session {
         Ok(())
     }
 
-    fn cases(&self, repeated_operations: u64) -> Vec<ExactDeviceCase<'_>> {
-        let mut cases = Vec::with_capacity(2 * VERIFY_ROUTES);
-        for route in &self.routes {
+    fn cases<'a>(
+        &'a self,
+        stage_graphs: &'a [ResidentMtpSegmentedStageGraph<'a>],
+    ) -> Vec<ExactDeviceCase<'a>> {
+        let mut cases = Vec::with_capacity(2 * MAX_BATCH * VERIFY_ROUTES);
+        for (route, stage) in self.routes.iter().zip(stage_graphs) {
             let tokens = route.route.tokens();
+            let batch = route.route.batch();
             let context = route.route.maximum_length();
-            cases.push(ExactDeviceCase::new(
-                "resident_model/target_mtp_verify",
-                format!("K={tokens},context={context},verify"),
-                BenchmarkWorkload::warm_model_mtp(tokens as u64, context as u64),
-                OperationAccounting::new(verify_logical_bytes(tokens), tokens as u64, "token"),
-                self.program
-                    .qualification_target_mtp_verify_graph(route.route),
-                Some(RepeatedGraph::new(
-                    &route.verify_repeated,
-                    repeated_operations,
-                )),
-            ));
-            cases.push(ExactDeviceCase::new(
-                "resident_model/target_mtp_verify_commit",
-                format!("K={tokens},context={context},verify+commit={tokens}"),
-                BenchmarkWorkload::warm_model_mtp(tokens as u64, context as u64),
-                OperationAccounting::new(
-                    verify_logical_bytes(tokens) + commit_logical_bytes(tokens),
-                    tokens as u64,
-                    "accepted_token",
-                ),
-                &route.verify_commit,
-                Some(RepeatedGraph::new(
-                    &route.verify_commit_repeated,
-                    repeated_operations,
-                )),
-            ));
+            cases.push(
+                ExactDeviceCase::new(
+                    "resident_model/target_mtp_segmented_verify",
+                    format!("B={batch},K={tokens},context={context},verify"),
+                    BenchmarkWorkload::warm_model_mtp((batch * tokens) as u64, context as u64),
+                    OperationAccounting::new(
+                        batch * verify_logical_bytes(tokens),
+                        (batch * tokens) as u64,
+                        "target_token",
+                    ),
+                    self.program
+                        .qualification_target_mtp_segmented_verify_graph(route.route),
+                    None,
+                )
+                .with_preparation(stage.graph()),
+            );
+            cases.push(
+                ExactDeviceCase::new(
+                    "resident_model/target_mtp_segmented_verify_commit",
+                    format!("B={batch},K={tokens},context={context},verify+commit={tokens}"),
+                    BenchmarkWorkload::warm_model_mtp((batch * tokens) as u64, context as u64),
+                    OperationAccounting::new(
+                        batch * (verify_logical_bytes(tokens) + commit_logical_bytes(tokens)),
+                        (batch * tokens) as u64,
+                        "accepted_token",
+                    ),
+                    &route.verify_commit,
+                    None,
+                )
+                .with_preparation(stage.graph()),
+            );
         }
         cases
     }
@@ -248,7 +291,8 @@ pub fn benchmark_target_mtp_verify(
     let warmup_launches = warmup_launches(options)?;
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
-    let session = Session::new(root, options.launches_per_sample)?;
+    let session = Session::new(root)?;
+    let stage_graphs = session.stage_graphs()?;
     for (name, kind, bytes, description) in [
         (
             "target_mtp_verify/resident_weights",
@@ -302,10 +346,10 @@ pub fn benchmark_target_mtp_verify(
         memory.register_owned(name, kind, bytes, description)?;
     }
     memory.capture("after_setup")?;
-    session.warm(warmup_launches)?;
+    session.warm(&stage_graphs, warmup_launches)?;
     memory.capture("after_warmup")?;
     require_current_process_exclusive()?;
-    let cases = session.cases(options.launches_per_sample);
+    let cases = session.cases(&stage_graphs);
     let (metrics, energy_metrics, telemetry) =
         measure_cases(&session.stream, &session.timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
@@ -313,7 +357,7 @@ pub fn benchmark_target_mtp_verify(
         BenchmarkReportSpec {
             suite: "bench-target-mtp-verify",
             classification: "performance_sensitive_model",
-            timing_scope: "paired Rust production-graph submission/completion and repeated complete target verify or verify-plus-commit route",
+            timing_scope: "paired Rust production-graph submission/completion for each complete target verify or verify-plus-commit route; matching metadata restoration is outside timing",
         },
         preflight,
         baseline_sha256,
