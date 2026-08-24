@@ -905,6 +905,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             bench_qwen36_full_attention_layer(root, &remaining)
         }
         Some("bench-qwen35-text-endpoint") => bench_qwen35_text_endpoint(root, &remaining),
+        Some("bench-qwen36-text-endpoint") => bench_qwen36_text_endpoint(root, &remaining),
         Some("bench-qwen35-resident-model") => bench_qwen35_resident_model(root, &remaining),
         Some("bench-resident-model") => bench_resident_model(root, &remaining),
         Some("bench-resident-prefill") => bench_resident_prefill(root, &remaining),
@@ -5096,6 +5097,39 @@ fn bench_qwen35_text_endpoint(
     run_visible(
         Command::new(executable)
             .arg("qwen35-text-endpoint")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_qwen36_text_endpoint(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-qwen36-text-endpoint SNAPSHOT [options]".into(),
+        );
+    };
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = fs::read(root.join(QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE))?;
+    baselines.extend_from_slice(&fs::read(
+        root.join(QWEN36_NVFP4_LM_HEAD_RESOURCE_BASELINE),
+    )?);
+    run_visible(
+        Command::new(executable)
+            .arg("qwen36-text-endpoint")
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
