@@ -1,13 +1,20 @@
 //! Exact Qwen3.5 NVFP4 full-attention QKV projection.
 
+use crate::device::nvfp4_prefill::{
+    BLOCK_N as W4_BLOCK_N, GROUP_K as W4_GROUP_K, SHARED_BYTES as W4_SHARED_BYTES,
+    THREADS as W4_THREADS, TILE_M as W4_TILE_M, project_w4a4, quantize_bf16_rows,
+};
 use cuda_device::{
     SharedArray, cuda_module, kernel, launch_bounds, launch_contract, ptx_asm, thread,
 };
 use std::sync::Arc;
-use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_gpu::{
+    CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, LaunchConfig2D, PreparedLaunch,
+};
 use tuisko_model::{Arch, Qwen35_9B};
 
 const MAX_BATCH: usize = 8;
+const PREFILL_ROWS: [usize; 4] = [32, 64, 128, 1_024];
 const INPUT_COLUMNS: usize = Qwen35_9B::HIDDEN;
 const OUTPUT_ROWS: usize = Qwen35_9B::ATTENTION_QKV_ROWS;
 const QUERY_ROWS: usize = Qwen35_9B::ATTENTION_QUERY_ROWS;
@@ -36,8 +43,15 @@ const _: () = assert!(KEY_ROWS == 1_024);
 const _: () = assert!(GROUPS_PER_ROW == 256);
 const _: () = assert!(PHASES == 8);
 const _: () = assert!(SHARED_U32 * size_of::<u32>() == 8_192);
+const _: () = assert!(INPUT_COLUMNS.is_multiple_of(256));
+const _: () = assert!(OUTPUT_ROWS.is_multiple_of(W4_BLOCK_N));
+const _: () = assert!(QUERY_ROWS.is_multiple_of(W4_BLOCK_N));
+const _: () = assert!(KEY_ROWS.is_multiple_of(W4_BLOCK_N));
+const _: () = assert!(W4_GROUP_K == GROUP_K);
+const _: () = assert!(W4_SHARED_BYTES == 36_864);
 
 #[cuda_module]
+#[allow(clippy::too_many_arguments)]
 mod kernels {
     use super::*;
     use cuda_device::{convert, float, warp};
@@ -361,6 +375,73 @@ mod kernels {
             );
         }
     }
+
+    /// Quantizes exact Qwen3.5 prompt rows into represented NVFP4.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_qkv_quantize<const TOKENS: usize>(
+        input: *const u32,
+        codes: *mut u32,
+        scales: *mut u8,
+        input_scale_divisor: f32,
+    ) {
+        unsafe {
+            quantize_bf16_rows::<INPUT_COLUMNS, TOKENS>(
+                thread::index_1d().get(),
+                input,
+                codes,
+                scales,
+                input_scale_divisor,
+            );
+        }
+    }
+
+    /// Projects exact Qwen3.5 prompt rows through fused represented Q/K/V weights.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(384, 2)]
+    #[launch_contract(
+        domain = 2,
+        coordinates = u32,
+        block = (384, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_qkv_w4a4<const TOKENS: usize>(
+        activation_codes: *const u32,
+        activation_scales: *const u8,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        output: *mut u16,
+        query_alpha: f32,
+        key_alpha: f32,
+        value_alpha: f32,
+    ) {
+        // T=32/64/128/1024 use 1/2/3/22 token tiles and 160 output
+        // tiles, exposing 160/320/480/3,520 CTAs instead of retaining
+        // 32+ token accumulators in 640 decode CTAs. Every m16n8k64 owns the
+        // same K64 interval and source words; only independent token/output
+        // tiles are regrouped, so represented dot-product order is unchanged.
+        unsafe {
+            project_w4a4::<INPUT_COLUMNS, OUTPUT_ROWS, QUERY_ROWS, KEY_ROWS, TOKENS>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                query_alpha,
+                key_alpha,
+                value_alpha,
+            );
+        }
+    }
 }
 
 fn launch_config() -> LaunchConfig1D {
@@ -407,9 +488,93 @@ impl<const TOKENS: usize> PreparedBatchRoute<TOKENS> {
     }
 }
 
+struct PreparedPrefillRoute<const TOKENS: usize> {
+    quantize: PreparedLaunch<kernels::__qwen35_nvfp4_qkv_quantize_CudaKernel<TOKENS>>,
+    projection: PreparedLaunch<kernels::__qwen35_nvfp4_qkv_w4a4_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let groups_per_row = INPUT_COLUMNS / GROUP_K;
+        // One thread owns one K16 codec group: T=32/64/128/1024 therefore
+        // launch 32/64/128/1,024 CTAs, with no partial represented group.
+        let quantize_blocks = u32::try_from((TOKENS * groups_per_row).div_ceil(256))
+            .map_err(|_| GpuError::invalid_launch("Qwen3.5 QKV quantization grid is too wide"))?;
+        // A 48x64 native tile covers all 10,240 output rows exactly. The
+        // Q/K/V boundaries are 64-row aligned, so each CTA has one divisor.
+        let projection_blocks = u32::try_from(OUTPUT_ROWS / W4_BLOCK_N)
+            .map_err(|_| GpuError::invalid_launch("Qwen3.5 QKV grid is too wide"))?;
+        let token_tiles = u32::try_from(TOKENS.div_ceil(W4_TILE_M))
+            .map_err(|_| GpuError::invalid_launch("Qwen3.5 QKV grid is too tall"))?;
+        let quantize = module
+            .prepare_qwen35_nvfp4_qkv_quantize::<TOKENS>(LaunchConfig1D::new(
+                quantize_blocks,
+                256,
+                0,
+            ))
+            .map_err(|source| {
+                GpuError::launch("preparing Qwen3.5 QKV activation quantization", source)
+            })?;
+        let projection = module
+            .prepare_qwen35_nvfp4_qkv_w4a4::<TOKENS>(LaunchConfig2D::new(
+                (projection_blocks, token_tiles),
+                (W4_THREADS, 1),
+                0,
+            ))
+            .map_err(|source| GpuError::launch("preparing Qwen3.5 W4A4 QKV", source))?;
+
+        Ok(Self {
+            quantize,
+            projection,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisors: [f32; 3],
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_nvfp4_qkv_quantize::<TOKENS>(
+                stream,
+                &self.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                input_scale_divisor,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching Qwen3.5 QKV activation quantization", source)
+            })?;
+        module
+            .qwen35_nvfp4_qkv_w4a4::<TOKENS>(
+                stream,
+                &self.projection,
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                weight_codes.cast::<u32>(),
+                weight_scales,
+                output,
+                1.0 / (input_scale_divisor * weight_scale_divisors[0]),
+                1.0 / (input_scale_divisor * weight_scale_divisors[1]),
+                1.0 / (input_scale_divisor * weight_scale_divisors[2]),
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.5 W4A4 QKV", source))
+    }
+}
+
 /// PTX symbols retained for every exact Qwen3.5 QKV batch.
-pub(crate) fn qwen35_nvfp4_qkv_ptx_names() -> [&'static str; MAX_BATCH] {
-    [
+pub(crate) fn qwen35_nvfp4_qkv_ptx_names() -> Vec<&'static str> {
+    vec![
         kernels::qwen35_nvfp4_qkv_a16_ptx_name::<1>(),
         kernels::qwen35_nvfp4_qkv_a16_ptx_name::<2>(),
         kernels::qwen35_nvfp4_qkv_a16_ptx_name::<3>(),
@@ -418,6 +583,14 @@ pub(crate) fn qwen35_nvfp4_qkv_ptx_names() -> [&'static str; MAX_BATCH] {
         kernels::qwen35_nvfp4_qkv_a16_ptx_name::<6>(),
         kernels::qwen35_nvfp4_qkv_a16_ptx_name::<7>(),
         kernels::qwen35_nvfp4_qkv_a16_ptx_name::<8>(),
+        kernels::qwen35_nvfp4_qkv_quantize_ptx_name::<32>(),
+        kernels::qwen35_nvfp4_qkv_quantize_ptx_name::<64>(),
+        kernels::qwen35_nvfp4_qkv_quantize_ptx_name::<128>(),
+        kernels::qwen35_nvfp4_qkv_quantize_ptx_name::<1_024>(),
+        kernels::qwen35_nvfp4_qkv_w4a4_ptx_name::<32>(),
+        kernels::qwen35_nvfp4_qkv_w4a4_ptx_name::<64>(),
+        kernels::qwen35_nvfp4_qkv_w4a4_ptx_name::<128>(),
+        kernels::qwen35_nvfp4_qkv_w4a4_ptx_name::<1_024>(),
     ]
 }
 
@@ -432,6 +605,10 @@ pub struct Qwen35Nvfp4QkvOp {
     b6: PreparedBatchRoute<6>,
     b7: PreparedBatchRoute<7>,
     b8: PreparedBatchRoute<8>,
+    t32: PreparedPrefillRoute<32>,
+    t64: PreparedPrefillRoute<64>,
+    t128: PreparedPrefillRoute<128>,
+    t1024: PreparedPrefillRoute<1_024>,
 }
 
 impl Qwen35Nvfp4QkvOp {
@@ -451,6 +628,10 @@ impl Qwen35Nvfp4QkvOp {
             b6: PreparedBatchRoute::prepare(&module)?,
             b7: PreparedBatchRoute::prepare(&module)?,
             b8: PreparedBatchRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
+            t1024: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -515,13 +696,85 @@ impl Qwen35Nvfp4QkvOp {
             ))),
         }
     }
+
+    /// Dynamically quantizes and projects exact `T=32,64,128,1024` rows.
+    ///
+    /// # Safety
+    ///
+    /// `input` covers `rows * 4_096` BF16 values; activation scratch covers
+    /// `rows * 2_048` code bytes and `rows * 256` scale bytes;
+    /// `weight_codes` covers packed E2M1 `[10_240,4_096]`;
+    /// `weight_scales` covers swizzled E4M3 `[10_240,256]`; and `output`
+    /// covers `rows * 10_240` BF16 values. Four-byte-loaded planes are
+    /// aligned. Divisors are finite and positive. Allocations are disjoint,
+    /// context-local, and live through stream completion.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_prefill(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisors: [f32; 3],
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        if !PREFILL_ROWS.contains(&rows) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 NVFP4 QKV prefill rows {rows} must be one of 32,64,128,1024"
+            )));
+        }
+        if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 NVFP4 QKV input scale divisor must be finite and positive",
+            ));
+        }
+        if weight_scale_divisors
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 NVFP4 QKV weight scale divisors must be finite and positive",
+            ));
+        }
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        input,
+                        activation_codes,
+                        activation_scales,
+                        weight_codes,
+                        weight_scales,
+                        input_scale_divisor,
+                        weight_scale_divisors,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match rows {
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
+            1_024 => launch!(t1024),
+            _ => unreachable!("row count was validated above"),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CODE_WORDS_PER_PHASE, GROUPS_PER_ROW, KEY_ROWS, MAX_BATCH, OUTPUT_ROWS, PHASES, QUERY_ROWS,
-        SHARED_U32, WARPS, qwen35_nvfp4_qkv_ptx_names,
+        CODE_WORDS_PER_PHASE, GROUPS_PER_ROW, KEY_ROWS, MAX_BATCH, OUTPUT_ROWS, PHASES,
+        PREFILL_ROWS, QUERY_ROWS, SHARED_U32, WARPS, qwen35_nvfp4_qkv_ptx_names,
     };
     use std::collections::BTreeSet;
 
@@ -537,7 +790,7 @@ mod tests {
         assert_eq!(SHARED_U32 * size_of::<u32>(), 8_192);
 
         let names = qwen35_nvfp4_qkv_ptx_names();
-        assert_eq!(names.len(), MAX_BATCH);
+        assert_eq!(names.len(), MAX_BATCH + 2 * PREFILL_ROWS.len());
         assert_eq!(
             names.iter().copied().collect::<BTreeSet<_>>().len(),
             names.len()

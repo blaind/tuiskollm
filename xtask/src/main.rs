@@ -10631,7 +10631,17 @@ fn gate_qwen35_nvfp4_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("qwen35_nvfp4_qkv_a16_TID_"))
         .collect::<Vec<_>>();
+    let quantize = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen35_nvfp4_qkv_quantize_TID_"))
+        .collect::<Vec<_>>();
+    let w4a4 = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen35_nvfp4_qkv_w4a4_TID_"))
+        .collect::<Vec<_>>();
     require_count("Qwen3.5 NVFP4 QKV", routes.len(), 8)?;
+    require_count("Qwen3.5 NVFP4 QKV prefill quantization", quantize.len(), 4)?;
+    require_count("Qwen3.5 NVFP4 QKV W4A4 prefill", w4a4.len(), 4)?;
 
     for entry in &routes {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
@@ -10643,6 +10653,34 @@ fn gate_qwen35_nvfp4_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         }
         if !entry.body.contains("cvt.rn.f16x2.e2m1x2") {
             return Err(format!("entry `{}` lost represented E2M1 conversion", entry.name).into());
+        }
+    }
+    for entry in &quantize {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in &w4a4 {
+        if !entry.body.contains(".reqntid 384, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 384-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        if !entry
+            .body
+            .contains("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X")
+        {
+            return Err(format!(
+                "entry `{}` lost its exact NVFP4 inline PTX instruction",
+                entry.name
+            )
+            .into());
         }
     }
 
@@ -10669,9 +10707,67 @@ fn gate_qwen35_nvfp4_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
     require_registers(&baseline, "nvfp4_registers", &registers)?;
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
+    let mut quantize_registers = Vec::new();
+    let mut quantize_shared = Vec::new();
+    for entry in quantize {
+        let resource = resources.get(entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted Qwen3.5 NVFP4 QKV quantization entry `{}`",
+                entry.name
+            )
+        })?;
+        require_spill_free(entry.name, resource)?;
+        if sass_function_body(sass, entry.name).is_none() {
+            return Err(format!(
+                "cuobjdump omitted Qwen3.5 NVFP4 QKV quantization SASS `{}`",
+                entry.name
+            )
+            .into());
+        }
+        quantize_registers.push(resource.registers);
+        quantize_shared.push(resource.shared);
+    }
+    quantize_registers.sort_unstable();
+    if baseline.contains_key("prefill_quantize_registers") {
+        require_registers(&baseline, "prefill_quantize_registers", &quantize_registers)?;
+        require_uniform_value(&baseline, "prefill_quantize_shared_bytes", &quantize_shared)?;
+    }
+
+    let mut w4a4_registers = Vec::new();
+    let mut w4a4_shared = Vec::new();
+    for entry in w4a4 {
+        let resource = resources.get(entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted Qwen3.5 NVFP4 QKV W4A4 entry `{}`",
+                entry.name
+            )
+        })?;
+        require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(sass, entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted Qwen3.5 NVFP4 QKV W4A4 SASS `{}`",
+                entry.name
+            )
+        })?;
+        if !body.contains("OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X") {
+            return Err(format!(
+                "entry `{}` lost native Blackwell NVFP4 MMA selection",
+                entry.name
+            )
+            .into());
+        }
+        w4a4_registers.push(resource.registers);
+        w4a4_shared.push(resource.shared);
+    }
+    w4a4_registers.sort_unstable();
+    if baseline.contains_key("prefill_w4a4_registers") {
+        require_registers(&baseline, "prefill_w4a4_registers", &w4a4_registers)?;
+        require_uniform_value(&baseline, "prefill_w4a4_shared_bytes", &w4a4_shared)?;
+    }
+
     println!(
-        "Qwen3.5 NVFP4 QKV gate passed: 8 A16 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
-        registers, shared
+        "Qwen3.5 NVFP4 QKV gate passed: 8 A16 + 4 prefill quantize + 4 W4A4 entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}",
+        registers, quantize_registers, w4a4_registers, shared, quantize_shared, w4a4_shared
     );
     Ok(())
 }
