@@ -144,7 +144,8 @@ mod kernels {
         // K=128 reduced the retained B=32 cold route from 200.704 to
         // 173.056 us by halving barriers. The 64x64 tile preserves the same
         // m16n8k32 K order and scaled SwiGLU epilogue for every output.
-        // SAFETY: the prepared grid and 48 KiB shared arena cover every tile.
+        // SAFETY: the prepared grid and 48 KiB shared arena cover every tile;
+        // the launch contract pads `activation_codes` to the 64-row tile.
         unsafe {
             fp8_swiglu_mma_body::<Qwen38_27B, 32, 64, 32, 4>(
                 activation_codes,
@@ -363,12 +364,14 @@ impl<A: Sm120Arch> DenseFp8SwiGluOp<A> {
     ///
     /// # Safety
     ///
-    /// `input` and `activation_codes` cover `rows * A::HIDDEN` values;
-    /// `activation_scales` covers `rows`; weights cover
-    /// `[2 * A::INTERMEDIATE, A::HIDDEN]` E4M3 codes plus one BF16 scale per
-    /// source row; and `output` covers `[rows, A::INTERMEDIATE]` BF16 values.
-    /// Four-byte-loaded planes are four-byte aligned. All allocations belong
-    /// to `stream`'s context, remain live through completion, and do not overlap.
+    /// `input` covers `rows * A::HIDDEN` values. `activation_codes` covers
+    /// at least 64 rows for T=32 and otherwise `rows`, so the retained padded
+    /// CTA can read its complete immutable tile; `activation_scales` covers
+    /// `rows`; weights cover `[2 * A::INTERMEDIATE, A::HIDDEN]` E4M3 codes
+    /// plus one BF16 scale per source row; and `output` covers
+    /// `[rows, A::INTERMEDIATE]` BF16 values. Four-byte-loaded planes are
+    /// four-byte aligned. All allocations belong to `stream`'s context,
+    /// remain live through completion, and do not overlap.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
