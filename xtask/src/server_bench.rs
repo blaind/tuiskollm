@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(10);
 const IDLE_SECONDS: f64 = 2.0;
 const LOADED_PROBE_SECONDS: f64 = 3.0;
-const MAX_SM_CLOCK_SPREAD_MHZ: u32 = 50;
+// Ten 7.5 MHz boost steps are 3.4% at 2,197 MHz and recur within one exact HTTP suite.
+const MAX_SM_CLOCK_SPREAD_MHZ: u32 = 75;
 const MAX_MEMORY_CLOCK_SPREAD_MHZ: u32 = 250;
 const DEFAULT_SAMPLES: usize = 5;
 const DIAGNOSTIC_CLOCK_ENV: &str = "TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT";
@@ -776,8 +777,17 @@ mod tests {
     fn clock_policy_refuses_only_outside_the_checked_spreads() {
         let samples = [
             parse_telemetry_row(0.0, "2100, 13801, 51, 300.0, 1, 1").unwrap(),
-            parse_telemetry_row(10.0, "2151, 13801, 51, 300.0, 1, 1").unwrap(),
-            parse_telemetry_row(20.0, "2151, 13801, 51, 300.0, 1, 1").unwrap(),
+            parse_telemetry_row(10.0, "2175, 13801, 51, 300.0, 1, 1").unwrap(),
+            parse_telemetry_row(20.0, "2175, 13801, 51, 300.0, 1, 1").unwrap(),
+        ];
+        let summary = summarize_telemetry(&samples).unwrap();
+        assert_eq!(summary.sm_clock_spread_mhz, MAX_SM_CLOCK_SPREAD_MHZ);
+        require_comparable_clocks(&summary).unwrap();
+
+        let samples = [
+            parse_telemetry_row(0.0, "2100, 13801, 51, 300.0, 1, 1").unwrap(),
+            parse_telemetry_row(10.0, "2176, 13801, 51, 300.0, 1, 1").unwrap(),
+            parse_telemetry_row(20.0, "2176, 13801, 51, 300.0, 1, 1").unwrap(),
         ];
         let summary = summarize_telemetry(&samples).unwrap();
         assert_eq!(summary.sm_clock_spread_mhz, MAX_SM_CLOCK_SPREAD_MHZ + 1);

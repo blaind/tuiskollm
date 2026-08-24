@@ -837,7 +837,10 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
   a sustained loaded-clock preflight, and 10 ms clock/power/memory evidence. The preflight normally
   refuses before direct timing; `TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT=1` instead preserves the full
   timing and telemetry as explicitly refused, non-blessable evidence. Late clock drift is likewise
-  preserved as refused evidence. The strict comparator covers exact case identity, median TTFT,
+  preserved as refused evidence. This full-server boundary admits at most 75 MHz of SM spread: the
+  observed 2,122--2,197 MHz boost band is ten discrete steps and 3.4% of its upper clock. Leaf and
+  resident-model suites retain their separate 50 MHz policy. The strict comparator covers exact
+  case identity, median TTFT,
   inter-token cadence, request latency, completion throughput, whole-board and above-idle energy,
   resident memory, driver, clock bands, binary provenance, and short versus long-context inventory.
   No checked full-server baseline has been blessed yet. Direct long-context operator and
