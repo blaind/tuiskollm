@@ -1,5 +1,6 @@
 //! Resident source-backed NVFP4 MLP program.
 
+use crate::nvfp4_mlp_layout::MAX_ROWS;
 use crate::{EngineError, EngineResult, MAX_BATCH, Nvfp4MlpLayout};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -7,10 +8,11 @@ use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuR
 use tuisko_kernels_sm120::{Nvfp4DownOp, Nvfp4SwiGluOp, ResidualNormOp, Sm120Arch};
 use tuisko_model::{CheckpointSnapshot, Nvfp4MlpBindings, Qwen38_27B};
 
-/// One early-layer NVFP4 MLP with immutable exact-batch graph routes.
+/// One early-layer NVFP4 MLP with immutable exact decode and prefill graphs.
 pub struct Nvfp4MlpProgram<A: Sm120Arch = Qwen38_27B> {
     // Drop graphs before the arena and loaded modules whose handles they retain.
     graphs: [CudaGraph; MAX_BATCH],
+    prefill_graphs: [CudaGraph; 4],
     arena: DeviceArena,
     _norm: ResidualNormOp<A>,
     _swiglu: Nvfp4SwiGluOp,
@@ -42,6 +44,8 @@ struct Pointers {
     up_weight_codes: *const u8,
     gate_up_weight_scales: *const u8,
     swiglu: *mut u16,
+    down_activation_codes: *mut u8,
+    down_activation_scales: *mut u8,
     down_weight_codes: *const u8,
     down_weight_scales: *const u8,
     branch: *mut u16,
@@ -62,6 +66,8 @@ impl Pointers {
             up_weight_codes: arena.address(layout.up_weight_codes())?.cast_const(),
             gate_up_weight_scales: arena.address(layout.gate_up_weight_scales())?.cast_const(),
             swiglu: arena.address(layout.swiglu())?,
+            down_activation_codes: arena.address(layout.down_activation_codes())?,
+            down_activation_scales: arena.address(layout.down_activation_scales())?,
             down_weight_codes: arena.address(layout.down_weight_codes())?.cast_const(),
             down_weight_scales: arena.address(layout.down_weight_scales())?.cast_const(),
             branch: arena.address(layout.branch())?,
@@ -81,7 +87,7 @@ impl Pointers {
     }
 
     #[cfg(feature = "qualification")]
-    fn addresses(self) -> [usize; 15] {
+    fn addresses(self) -> [usize; 17] {
         [
             self.residual_input.addr(),
             self.input_norm.addr(),
@@ -92,6 +98,8 @@ impl Pointers {
             self.up_weight_codes.addr(),
             self.gate_up_weight_scales.addr(),
             self.swiglu.addr(),
+            self.down_activation_codes.addr(),
+            self.down_activation_scales.addr(),
             self.down_weight_codes.addr(),
             self.down_weight_scales.addr(),
             self.branch.addr(),
@@ -106,11 +114,12 @@ impl Pointers {
 struct Divisors {
     gate_up_input: f32,
     gate_up_weight: f32,
+    down_input: f32,
     down_weight: f32,
 }
 
 impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
-    /// Loads one admitted layer, allocates one arena, and captures `B=1..=8`.
+    /// Loads one admitted layer, allocates one arena, and captures all exact routes.
     pub fn from_snapshot(
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<A>>,
@@ -121,7 +130,7 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
         let next_norm = bindings.next_norm.words().collect::<Vec<_>>();
         let gate_up = bindings.gate_up.materialize()?;
         let down = bindings.down.materialize()?;
-        let layout = Nvfp4MlpLayout::build::<A>()?;
+        let layout = Nvfp4MlpLayout::build_prefill::<A>()?;
         let stream = context.new_stream().map_err(GpuError::from)?;
         let arena = DeviceArena::zeroed(&stream, layout.builder())?;
         let norm = ResidualNormOp::new(context)?;
@@ -153,12 +162,16 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
         let divisors = Divisors {
             gate_up_input: gate_up.input_scale_divisor,
             gate_up_weight: gate_up.weight_scale_divisor,
+            down_input: down.input_scale_divisor,
             down_weight: down.weight_scale_divisor,
         };
-        let graphs = capture_routes(&stream, &norm, &swiglu, &down_op, pointers, divisors)?;
+        let graphs = capture_decode_routes(&stream, &norm, &swiglu, &down_op, pointers, divisors)?;
+        let prefill_graphs =
+            capture_prefill_routes(&stream, &norm, &swiglu, &down_op, pointers, divisors)?;
 
         Ok(Self {
             graphs,
+            prefill_graphs,
             arena,
             _norm: norm,
             _swiglu: swiglu,
@@ -176,18 +189,18 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
         })
     }
 
-    /// Uploads exactly `batch` BF16 residual rows into stable input storage.
+    /// Uploads one exact decode or prefill width into stable input storage.
     pub fn load_residual(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         values: &[u16],
     ) -> EngineResult<()> {
-        require_batch(batch)?;
-        let expected = checked_product("NVFP4 MLP input elements", batch, A::HIDDEN)?;
+        require_rows(rows)?;
+        let expected = checked_product("NVFP4 MLP input elements", rows, A::HIDDEN)?;
         if values.len() != expected {
             return Err(EngineError::layout(format!(
-                "NVFP4 MLP input has {} values, expected {expected} for B={batch}",
+                "NVFP4 MLP input has {} values, expected {expected} for rows={rows}",
                 values.len()
             )));
         }
@@ -197,18 +210,17 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
         Ok(())
     }
 
-    /// Replays the immutable graph for one exact batch.
-    pub fn replay(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
-        self.graphs[batch - 1].launch(stream)?;
+    /// Replays the immutable graph for one exact decode or prefill width.
+    pub fn replay(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        self.graph(rows)?.launch(stream)?;
 
         Ok(())
     }
 
     /// Reads active BF16 residual output rows.
-    pub fn read_residual(&self, stream: &CudaStream, batch: usize) -> EngineResult<Vec<u16>> {
-        require_batch(batch)?;
-        let values = checked_product("NVFP4 MLP output elements", batch, A::HIDDEN)?;
+    pub fn read_residual(&self, stream: &CudaStream, rows: usize) -> EngineResult<Vec<u16>> {
+        require_rows(rows)?;
+        let values = checked_product("NVFP4 MLP output elements", rows, A::HIDDEN)?;
 
         Ok(self
             .arena
@@ -250,6 +262,11 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
         MAX_BATCH
     }
 
+    /// Largest admitted exact prefill width.
+    pub const fn row_capacity(&self) -> usize {
+        MAX_ROWS
+    }
+
     /// Checked owner layout.
     pub const fn layout(&self) -> &Nvfp4MlpLayout {
         &self.layout
@@ -260,14 +277,27 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
         &self.snapshot
     }
 
+    fn graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
+        if (1..=MAX_BATCH).contains(&rows) {
+            return Ok(&self.graphs[rows - 1]);
+        }
+        let index = prefill_index(rows).ok_or_else(|| {
+            EngineError::route(format!(
+                "NVFP4 MLP row count {rows} is outside 1..={MAX_BATCH},32,64,128,1024"
+            ))
+        })?;
+
+        Ok(&self.prefill_graphs[index])
+    }
+
     #[cfg(feature = "qualification")]
     /// Launches the production route eagerly for graph-agreement qualification.
-    pub fn launch_eager(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
+    pub fn launch_eager(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        require_rows(rows)?;
         let pointers = Pointers::bind(&self.arena, &self.layout)?;
         launch_route(
             stream,
-            batch,
+            rows,
             &self._norm,
             &self._swiglu,
             &self._down,
@@ -280,10 +310,8 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
 
     #[cfg(feature = "qualification")]
     /// Returns one captured production graph.
-    pub fn qualification_graph(&self, batch: usize) -> EngineResult<&CudaGraph> {
-        require_batch(batch)?;
-
-        Ok(&self.graphs[batch - 1])
+    pub fn qualification_graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
+        self.graph(rows)
     }
 
     #[cfg(feature = "qualification")]
@@ -291,10 +319,10 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
     pub fn qualification_repeated_graph(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         operations: u64,
     ) -> EngineResult<CudaGraph> {
-        require_batch(batch)?;
+        require_rows(rows)?;
         if operations == 0 {
             return Err(EngineError::route(
                 "repeated NVFP4 MLP graph requires at least one operation",
@@ -306,7 +334,7 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
             for _ in 0..operations {
                 launch_route(
                     stream,
-                    batch,
+                    rows,
                     &self._norm,
                     &self._swiglu,
                     &self._down,
@@ -321,7 +349,7 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
 
     #[cfg(feature = "qualification")]
     /// Returns every stable arena address in layout order.
-    pub fn qualification_addresses(&self) -> EngineResult<[usize; 15]> {
+    pub fn qualification_addresses(&self) -> EngineResult<[usize; 17]> {
         Ok(Pointers::bind(&self.arena, &self.layout)?.addresses())
     }
 
@@ -334,6 +362,10 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
         self.arena
             .fill(stream, self.layout.gate_up_activation_scales(), byte)?;
         self.arena.fill(stream, self.layout.swiglu(), byte)?;
+        self.arena
+            .fill(stream, self.layout.down_activation_codes(), byte)?;
+        self.arena
+            .fill(stream, self.layout.down_activation_scales(), byte)?;
         self.arena.fill(stream, self.layout.branch(), byte)?;
         self.arena
             .fill(stream, self.layout.residual_output(), byte)?;
@@ -361,6 +393,12 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
                 .arena
                 .copy_to_host(stream, self.layout.gate_up_activation_scales())?,
             swiglu: self.arena.copy_to_host(stream, self.layout.swiglu())?,
+            down_activation_codes: self
+                .arena
+                .copy_to_host(stream, self.layout.down_activation_codes())?,
+            down_activation_scales: self
+                .arena
+                .copy_to_host(stream, self.layout.down_activation_scales())?,
             branch: self.arena.copy_to_host(stream, self.layout.branch())?,
             residual_output: self
                 .arena
@@ -411,6 +449,7 @@ impl<A: Sm120Arch> Nvfp4MlpProgram<A> {
         Divisors {
             gate_up_input: self.gate_up_input_scale_divisor,
             gate_up_weight: self.gate_up_weight_scale_divisor,
+            down_input: self.down_input_scale_divisor,
             down_weight: self.down_weight_scale_divisor,
         }
     }
@@ -429,6 +468,10 @@ pub struct Nvfp4MlpObservables {
     pub gate_up_activation_scales: Vec<u8>,
     /// Fused BF16 SwiGLU rows.
     pub swiglu: Vec<u16>,
+    /// Dynamic packed E2M1 down-input codes for prefill routes.
+    pub down_activation_codes: Vec<u8>,
+    /// Dynamic E4M3 down-input block scales for prefill routes.
+    pub down_activation_scales: Vec<u8>,
     /// BF16 down-projection branch rows.
     pub branch: Vec<u16>,
     /// Published BF16 residual rows.
@@ -456,7 +499,7 @@ pub struct Nvfp4MlpImmutable {
     pub next_norm: Vec<u16>,
 }
 
-fn capture_routes<A: Sm120Arch>(
+fn capture_decode_routes<A: Sm120Arch>(
     stream: &CudaStream,
     norm: &ResidualNormOp<A>,
     swiglu: &Nvfp4SwiGluOp,
@@ -476,9 +519,29 @@ fn capture_routes<A: Sm120Arch>(
         .map_err(|_| EngineError::layout("NVFP4 MLP graph inventory has wrong cardinality"))
 }
 
+fn capture_prefill_routes<A: Sm120Arch>(
+    stream: &CudaStream,
+    norm: &ResidualNormOp<A>,
+    swiglu: &Nvfp4SwiGluOp,
+    down: &Nvfp4DownOp<A>,
+    pointers: Pointers,
+    divisors: Divisors,
+) -> EngineResult<[CudaGraph; 4]> {
+    let mut graphs = Vec::with_capacity(4);
+    for rows in [32, 64, 128, MAX_ROWS] {
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_route(stream, rows, norm, swiglu, down, pointers, divisors)
+        })?);
+    }
+
+    graphs
+        .try_into()
+        .map_err(|_| EngineError::layout("NVFP4 MLP prefill graph inventory has wrong cardinality"))
+}
+
 fn launch_route<A: Sm120Arch>(
     stream: &CudaStream,
-    batch: usize,
+    rows: usize,
     norm: &ResidualNormOp<A>,
     swiglu: &Nvfp4SwiGluOp,
     down: &Nvfp4DownOp<A>,
@@ -486,18 +549,18 @@ fn launch_route<A: Sm120Arch>(
     divisors: Divisors,
 ) -> GpuResult<()> {
     // SAFETY: all pointers name aligned non-overlapping regions sized for
-    // MAX_BATCH, and exact dispatch restricts each launch to `batch` rows.
+    // MAX_ROWS, and exact dispatch restricts each launch to `rows` rows.
     unsafe {
         norm.launch_plain(
             stream,
-            batch,
+            rows,
             pointers.residual_input,
             pointers.input_norm,
             pointers.normalized,
         )?;
         swiglu.launch(
             stream,
-            batch,
+            rows,
             pointers.normalized,
             pointers.gate_up_activation_codes,
             pointers.gate_up_activation_scales,
@@ -507,20 +570,35 @@ fn launch_route<A: Sm120Arch>(
             divisors.gate_up_weight,
             pointers.swiglu,
         )?;
-        // The admitted down route preserves its BF16 input, so only the
-        // represented weight divisor participates in this A16 schedule.
-        down.launch(
-            stream,
-            batch,
-            pointers.swiglu,
-            pointers.down_weight_codes,
-            pointers.down_weight_scales,
-            divisors.down_weight,
-            pointers.branch,
-        )?;
+        if rows <= MAX_BATCH {
+            // Decode preserves its BF16 input, so only the represented weight
+            // divisor participates in the retained A16 schedule.
+            down.launch(
+                stream,
+                rows,
+                pointers.swiglu,
+                pointers.down_weight_codes,
+                pointers.down_weight_scales,
+                divisors.down_weight,
+                pointers.branch,
+            )?;
+        } else {
+            down.launch_prefill(
+                stream,
+                rows,
+                pointers.swiglu,
+                pointers.down_activation_codes,
+                pointers.down_activation_scales,
+                pointers.down_weight_codes,
+                pointers.down_weight_scales,
+                divisors.down_input,
+                divisors.down_weight,
+                pointers.branch,
+            )?;
+        }
         norm.launch_residual(
             stream,
-            batch,
+            rows,
             pointers.residual_input,
             pointers.branch,
             pointers.next_norm,
@@ -530,14 +608,24 @@ fn launch_route<A: Sm120Arch>(
     }
 }
 
-fn require_batch(batch: usize) -> EngineResult<()> {
-    if !(1..=MAX_BATCH).contains(&batch) {
-        return Err(EngineError::route(format!(
-            "NVFP4 MLP batch {batch} is outside the exact range 1..={MAX_BATCH}"
-        )));
+fn require_rows(rows: usize) -> EngineResult<()> {
+    if (1..=MAX_BATCH).contains(&rows) || prefill_index(rows).is_some() {
+        return Ok(());
     }
 
-    Ok(())
+    Err(EngineError::route(format!(
+        "NVFP4 MLP row count {rows} is outside 1..={MAX_BATCH},32,64,128,1024"
+    )))
+}
+
+const fn prefill_index(rows: usize) -> Option<usize> {
+    match rows {
+        32 => Some(0),
+        64 => Some(1),
+        128 => Some(2),
+        MAX_ROWS => Some(3),
+        _ => None,
+    }
 }
 
 fn checked_product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
@@ -547,16 +635,16 @@ fn checked_product(name: &str, left: usize, right: usize) -> EngineResult<usize>
 
 #[cfg(test)]
 mod tests {
-    use super::require_batch;
+    use super::require_rows;
     use crate::EngineErrorCode;
 
     #[test]
-    fn exact_batch_table_rejects_every_boundary_neighbor() {
-        for batch in 1..=8 {
-            require_batch(batch).unwrap();
+    fn exact_route_table_rejects_every_boundary_neighbor() {
+        for rows in [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024] {
+            require_rows(rows).unwrap();
         }
-        for batch in [0, 9, 16, usize::MAX] {
-            let error = require_batch(batch).unwrap_err();
+        for rows in [0, 9, 16, 31, 33, 63, 65, 127, 129, 1_023, 1_025, usize::MAX] {
+            let error = require_rows(rows).unwrap_err();
             assert_eq!(error.code(), Some(EngineErrorCode::Route));
         }
     }

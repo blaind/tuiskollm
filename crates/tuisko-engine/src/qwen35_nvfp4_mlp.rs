@@ -379,6 +379,8 @@ impl Qwen35Nvfp4MlpProgram {
                 .arena
                 .copy_to_host(stream, self.layout.gate_up_activation_scales())?,
             swiglu: self.arena.copy_to_host(stream, self.layout.swiglu())?,
+            down_activation_codes: Vec::new(),
+            down_activation_scales: Vec::new(),
             branch: self.arena.copy_to_host(stream, self.layout.branch())?,
             residual_output: self
                 .arena

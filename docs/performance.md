@@ -163,7 +163,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-fp8-down` | Run the exhaustive represented-value dense-FP8 down oracle and graph-replay gate | terminal |
 | `cargo run -p xtask -- qualify-nvfp4-swiglu` | Check represented E2M1/E4M3 seams, A16/W4A4 production routing, immutable weights, graph replay, stable addresses, and post-warmup allocation at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-nvfp4-down` | Check represented E2M1/E4M3 activation and down-projection seams, immutable input/weights, graph replay, stable addresses, and post-warmup allocation at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT` | Check source layer 55, route-specific A16/W4A4 scratch, every observable seam, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
+| `cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT` | Check source layer 55, route-specific A16/W4A4 scratch, every observable seam, exact B=1..8 and T=32/64/128/1024 graphs, immutable weights, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-mlp SNAPSHOT` | Check Qwen3.5 source layer 0, ModelOpt scale conversion, route-specific A16/W4A4 scratch, every observable seam, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-qkv` | Check Qwen3.5 fused Q/gate, K, and V represented values with three weight-scale divisors at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-attention-output` | Check Qwen3.5 sigmoid gating, BF16 projection seam, represented NVFP4 output, immutable inputs, and graph replay at B=1..8 | terminal |
@@ -194,7 +194,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-attention-output` | Measure every exact sigmoid-gate, quantize, and output-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-nvfp4-swiglu` | Measure every exact retained A16/W4A4 NVFP4 gate/up SwiGLU graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-nvfp4-down` | Measure every exact A16 decode and W4A4 prefill NVFP4 down-projection graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed layer-55 MLP graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed layer-55 decode and prefill MLP graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed Qwen3.5 layer-0 MLP graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-qkv` | Measure every exact Qwen3.5 fused NVFP4 QKV graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-nvfp4-attention-output` | Measure every complete Qwen3.5 sigmoid-gate, BF16-stage, and NVFP4 output graph with input restoration outside timing | terminal or `--json PATH` |
@@ -314,11 +314,12 @@ every exact `B=1..8` and `T=32,64,128,1024` with the same options. It does not i
 time from leaf medians and stays outside leaf-wide `perf` until the source-backed route receives a
 reviewed baseline.
 
-`bench-nvfp4-mlp SNAPSHOT` directly measures the complete source-backed layer-55 MLP graph. Its
-`B=1,5..8` routes include production E2M1 activation quantization and W4A4 gate/up projection;
-`B=2..4` preserve the BF16 gate/up activation, while every route uses the represented-weight A16
-down projection. It remains outside leaf-wide `perf` until a locked-clock local baseline is
-reviewed.
+`bench-nvfp4-mlp SNAPSHOT` directly measures the complete source-backed layer-55 MLP graph at every
+exact `B=1..8` and `T=32,64,128,1024`. Its `B=1,5..8` routes include production E2M1 activation
+quantization and W4A4 gate/up projection; `B=2..4` preserve the BF16 gate/up activation, and all
+decode routes use the represented-weight A16 down projection. Prefill uses W4A4 for both
+projections and retains distinct represented gate/up and down activation seams. It remains outside
+leaf-wide `perf` until a locked-clock local baseline is reviewed.
 
 `bench-dense-fp8-gdn-layer SNAPSHOT` measures each complete stateful layer-60 decode and prefill
 graph after an untimed production-owner reset of its history and FP32 recurrence. It reports exact

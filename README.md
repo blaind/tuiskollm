@@ -88,6 +88,9 @@ descriptor ownership. NVFP4 gate/up SwiGLU admits exact `T=32,64,128,1024` W4A4 
 represented E2M1 activation codes, E4M3 block scales, and tail-safe 48-row token tiles. The
 NVFP4 down projection admits the same exact widths through native 48x64 W4A4 tiles over its
 complete 17,408-wide source plane, retaining separate activation-code and block-scale seams. The
+source-backed NVFP4 MLP owner composes residual norms, gate/up SwiGLU, down projection, and
+residual publication at every `B=1..8` and `T=32,64,128,1024`; prefill retains both represented
+activation-quantization seams in one address-stable arena. The
 source-backed dense-FP8 MLP owner composes residual norms, gate/up,
 SwiGLU, down projection, and residual publication into directly qualified graphs at every
 `B=1..8` and `T=32,64,128,1024`. The source-backed full-attention owner composes that MLP with
