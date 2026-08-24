@@ -6,7 +6,7 @@ use crate::{
 };
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header::RETRY_AFTER};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -952,11 +952,17 @@ fn enqueue_job(jobs: &Sender<Job>, job: Job) -> Result<(), EnqueueError> {
 
 fn enqueue_error_response(error: EnqueueError) -> Response {
     match error {
-        EnqueueError::Full => openai_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "resident inference queue is full".into(),
-            "server_overloaded",
-        ),
+        EnqueueError::Full => {
+            let mut response = openai_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "resident inference queue is full".into(),
+                "server_overloaded",
+            );
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+            response
+        }
         EnqueueError::Closed => openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "resident engine worker is unavailable".into(),
@@ -976,7 +982,7 @@ mod tests {
     use axum::Json;
     use axum::body::to_bytes;
     use axum::extract::State;
-    use axum::http::StatusCode;
+    use axum::http::{StatusCode, header::RETRY_AFTER};
     use serde_json::Value;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -1131,6 +1137,22 @@ mod tests {
         drop(receiver);
         let closed = enqueue_job(&jobs, job().0).unwrap_err();
         assert_eq!(closed, EnqueueError::Closed);
+    }
+
+    #[test]
+    fn overloaded_handler_paces_retries() {
+        runtime().block_on(async {
+            let (jobs, _receiver) = channel(1);
+            enqueue_job(&jobs, job().0).unwrap();
+            let response =
+                chat_completions(State(state(jobs, true)), Ok(Json(streaming_request()))).await;
+
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1");
+            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let error: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error["error"]["type"], "server_overloaded");
+        });
     }
 
     #[test]
