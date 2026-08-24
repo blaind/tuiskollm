@@ -158,6 +158,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-generation SNAPSHOT` | Check prompt-to-sampling-to-streaming state over exact BF16 logit rows | terminal |
 | `cargo run -p tuisko-server-qual -- http://127.0.0.1:8000` | Check the live exact server's blocking and SSE contracts, greedy concurrency stability at request counts 1 through 8, cancellation, and eight-slot recycling | terminal |
 | `cargo run -p xtask -- qualify-server SNAPSHOT` | Refuse a nonexclusive device, build and launch the production server on private loopback, run the external HTTP suite, stop the child, and require the GPU to return idle | terminal; lifecycle log under `target/server-qualification/` |
+| `cargo run -p tuisko-server-qual --bin bench-server -- http://127.0.0.1:8000 --json target/benchmarks/server-http.json [--samples N] [--long-context]` | Directly time reported full-reuse and low-reuse SSE, external concurrency 1 through 8, and optional 4K/16K/65K/178K prompt boundaries; preserve each completed case incrementally | diagnostic JSON under `target/`; never blessable without lifecycle clock authority |
 | `cargo run -p xtask -- qualify-residual-norm` | Run the independent numerical and graph-replay oracle | terminal |
 | `cargo run -p xtask -- qualify-qwen35-residual-norm` | Check Qwen3.5 zero-centered RMSNorm and fused residual publication at B=1..8 and T=32/64/128 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-residual-norm` | Check Qwen3.6 zero-centered RMSNorm and fused residual publication at B=1..8 and T=32/64/128 | terminal |
@@ -826,9 +827,11 @@ exclusive-device controls, NVML telemetry, and device baselines remain in this r
 - The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
 - External HTTP qualification covers blocking/SSE agreement, greedy stability across concurrent
   request counts 1 through 8, cancellation, and slot recycling. It does not prove internal batch
-  occupancy and is not a timing benchmark. There is no full-server TTFT, inter-token-latency,
-  prefix-reuse, or end-to-end MTP benchmark in this repository yet. Direct long-context operator
-  and resident-model timing exists.
+  occupancy. A direct diagnostic HTTP benchmark reports raw and summarized TTFT, mean inter-token
+  cadence, request time, reported prefix reuse, completion throughput, external concurrency, and
+  optional long-context observations. It incrementally preserves completed samples, but has no
+  lifecycle clock authority or checked baseline yet. Direct long-context operator and
+  resident-model timing exists.
 - Power and energy are reportable for the resident model; full-server energy remains future work.
 - `ncu` and Nsight Systems traces are first-class diagnostic artifacts, but remain outside checked
   regression comparison and baseline blessing.
