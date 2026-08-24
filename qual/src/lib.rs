@@ -223,6 +223,8 @@ mod qwen36_nvfp4_lm_head;
 #[cfg(feature = "device")]
 mod qwen36_nvfp4_lm_head_benchmark;
 #[cfg(feature = "device")]
+mod qwen36_resident_model;
+#[cfg(feature = "device")]
 mod qwen36_text_endpoint;
 #[cfg(feature = "device")]
 mod qwen36_text_endpoint_benchmark;
@@ -591,6 +593,11 @@ pub use qwen36_nvfp4_lm_head::{
 };
 #[cfg(feature = "device")]
 pub use qwen36_nvfp4_lm_head_benchmark::benchmark_qwen36_nvfp4_lm_head;
+#[cfg(feature = "device")]
+pub use qwen36_resident_model::{
+    Qwen36ResidentModelQualification, Qwen36ResidentModelQualificationError,
+    qualify_qwen36_resident_model,
+};
 #[cfg(feature = "device")]
 pub use qwen36_text_endpoint::{
     Qwen36TextEndpointQualification, Qwen36TextEndpointQualificationError,

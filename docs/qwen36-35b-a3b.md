@@ -181,9 +181,11 @@ The initial resident text layout then composes 30 GDN/MoE layers, ten full-atten
 and the endpoint into 41 address-stable arenas. It accounts 19,808,036,096 device weight bytes,
 31,457,280 short-context BF16 cache bytes, 563,187,136 workspace/state bytes, and 46,400 alignment
 bytes for a 20,402,726,912-byte allocation. Eight whole-model decode graphs chain each layer's
-BF16 publication directly into the next owner. Source-backed whole-model qualification remains the
-next separate slice; native prompt graphs will be reconciled with the resident-prefill stack after
-that stack lands.
+BF16 publication directly into the next owner. The real checkpoint passes all eight eager/graph
+routes, 76,032 represented endpoint-oracle values, 8,939,520 finite logits, inactive-row and
+replacement-input checks, all 41 stable addresses, zero post-warmup growth, and the complete
+downstream spill/resource cone. Native prompt graphs will be reconciled with the resident-prefill
+stack after that stack lands.
 
 ## Implementation order
 
