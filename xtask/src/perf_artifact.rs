@@ -398,7 +398,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-fn file_sha256(path: &Path) -> Result<String, Box<dyn Error>> {
+pub(crate) fn file_sha256(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(hex_digest(Sha256::digest(fs::read(path)?).as_slice()))
 }
 

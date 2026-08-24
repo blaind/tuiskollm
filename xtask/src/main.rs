@@ -16,7 +16,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const RESIDUAL_NORM_RESOURCE_BASELINE: &str = "qual/baselines/residual-norm-sm120.txt";
@@ -8731,29 +8731,36 @@ struct Resource {
 
 struct Sm120GateArtifact {
     root: PathBuf,
+    ptx_sha256: String,
     cubin: PathBuf,
     resources: BTreeMap<String, Resource>,
     sass: OnceLock<Result<String, String>>,
 }
 
-static SM120_GATE_ARTIFACT: OnceLock<Result<Sm120GateArtifact, String>> = OnceLock::new();
+static SM120_GATE_ARTIFACT: Mutex<Option<&'static Sm120GateArtifact>> = Mutex::new(None);
 
 fn sm120_gate_artifact(root: &Path) -> Result<&'static Sm120GateArtifact, Box<dyn Error>> {
-    let artifact = SM120_GATE_ARTIFACT
-        .get_or_init(|| build_sm120_gate_artifact(root).map_err(|error| error.to_string()));
-    let artifact = match artifact {
-        Ok(artifact) => artifact,
-        Err(error) => return Err(error.clone().into()),
-    };
-    if artifact.root != root {
-        return Err(format!(
-            "one xtask process cannot resource-check SM120 artifacts from both `{}` and `{}`",
-            artifact.root.display(),
-            root.display()
-        )
-        .into());
+    let mut cached = SM120_GATE_ARTIFACT
+        .lock()
+        .map_err(|_| "SM120 gate artifact cache is poisoned")?;
+    if let Some(artifact) = *cached {
+        if artifact.root != root {
+            return Err(format!(
+                "one xtask process cannot resource-check SM120 artifacts from both `{}` and `{}`",
+                artifact.root.display(),
+                root.display()
+            )
+            .into());
+        }
+        // perf gate regenerates the PTX after qualification seeds this cache
+        let ptx = root.join(PTX);
+        if ptx.is_file() && artifact.ptx_sha256 == perf_artifact::file_sha256(&ptx)? {
+            return Ok(artifact);
+        }
     }
-
+    // leaked so gate call sites keep borrowing a 'static artifact; rebuilds are rare
+    let artifact = &*Box::leak(Box::new(build_sm120_gate_artifact(root)?));
+    *cached = Some(artifact);
     Ok(artifact)
 }
 
@@ -8766,6 +8773,7 @@ fn build_sm120_gate_artifact(root: &Path) -> Result<Sm120GateArtifact, Box<dyn E
         )
         .into());
     }
+    let ptx_sha256 = perf_artifact::file_sha256(&ptx)?;
     let temporary = root.join("target/tmp");
     fs::create_dir_all(&temporary)?;
     let cubin = temporary.join("sm120-resource-gates.cubin");
@@ -8787,6 +8795,7 @@ fn build_sm120_gate_artifact(root: &Path) -> Result<Sm120GateArtifact, Box<dyn E
 
     Ok(Sm120GateArtifact {
         root: root.to_path_buf(),
+        ptx_sha256,
         cubin,
         resources: parse_resources(&String::from_utf8(output.stdout)?)?,
         sass: OnceLock::new(),
