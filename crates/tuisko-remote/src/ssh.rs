@@ -10,7 +10,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use russh::client;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
-use russh::{ChannelMsg, Disconnect};
+use russh::{ChannelMsg, Disconnect, Sig};
 use russh_sftp::client::SftpSession;
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::{Builder, Runtime};
@@ -264,6 +264,7 @@ async fn run_command(
         })?;
 
     let mut status = None;
+    let mut signal = None;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     while let Some(message) = channel.wait().await {
@@ -271,6 +272,7 @@ async fn run_command(
             ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
             ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
             ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+            ChannelMsg::ExitSignal { signal_name, .. } => signal = Some(signal_name),
             _ => {}
         }
     }
@@ -282,7 +284,29 @@ async fn run_command(
         output.push_str(&String::from_utf8_lossy(&stderr));
     }
 
-    Ok((status.unwrap_or(1), output))
+    command_outcome(status, signal, output)
+}
+
+fn command_outcome(
+    status: Option<u32>,
+    signal: Option<Sig>,
+    output: String,
+) -> RemoteResult<(u32, String)> {
+    let reason = match (status, signal) {
+        (Some(status), None) => return Ok((status, output)),
+        (_, Some(signal)) => format!("remote command was killed by signal {signal:?}"),
+        (None, None) => "channel closed without an exit status".to_owned(),
+    };
+    let detail = if output.is_empty() {
+        reason
+    } else {
+        format!("{reason}; output so far:\n{output}")
+    };
+
+    Err(RemoteError::SshIo {
+        operation: "command",
+        source: std::io::Error::other(detail),
+    })
 }
 
 async fn open_sftp(
@@ -338,7 +362,32 @@ mod tests {
 
     use flate2::read::GzDecoder;
 
-    use super::{Client, gzip, shell_quote};
+    use super::{Client, command_outcome, gzip, shell_quote};
+    use crate::RemoteError;
+
+    #[test]
+    fn exit_status_and_output_pass_through() {
+        let (status, output) =
+            command_outcome(Some(3), None, "log".to_owned()).expect("reported status");
+        assert_eq!(status, 3);
+        assert_eq!(output, "log");
+    }
+
+    #[test]
+    fn missing_exit_status_is_a_transport_error() {
+        let error = command_outcome(None, None, String::new()).expect_err("transport death");
+        assert!(matches!(error, RemoteError::SshIo { .. }));
+        assert!(error.to_string().contains("without an exit status"));
+    }
+
+    #[test]
+    fn signal_kill_reports_the_signal_and_output() {
+        let error = command_outcome(None, Some(russh::Sig::KILL), "partial".to_owned())
+            .expect_err("signal kill");
+        let message = error.to_string();
+        assert!(message.contains("KILL"));
+        assert!(message.contains("partial"));
+    }
 
     #[test]
     fn host_key_is_pinned_for_the_session() {
