@@ -4,5 +4,7 @@ rustc_commit=55e86c996809902e8bbad512cfb4d2c18be446d9
 cuda_toolkit_release=13.3
 cuda_toolkit_version=13.3.73
 quantize_registers=25,25,25,25,25,25,25,25
+prefill_quantize_registers=25,25,25
 projection_registers=31,32,36,38,38,40,43,45
+prefill_projection_registers=50,50,50
 shared_bytes=1024
