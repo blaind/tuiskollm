@@ -242,15 +242,15 @@ For the exact thinking-mode `Hello` prompt, production streaming and separately 
 transitions select the same two greedy tokens `[8160, 579]`; reset replay is deterministic, all 42
 device/host addresses remain stable, and device memory does not grow after warmup. This is
 frontend-to-device state-transition evidence, not an external same-model logit-parity claim. The
-initial route serially evaluates prompts through B=1 decode and loudly enforces its 192-position
-capacity until the native resident-prefill stack is reconciled.
+generation route selects the largest qualified from-empty `T=32/64/128` prefix and evaluates the
+remaining prompt tail through exact B=1 decode, while retaining the 192-position capacity.
 The server now selects this concrete target from the pinned revision directory and publishes
 `nvidia/Qwen3.6-35B-A3B-NVFP4` through the OpenAI health, models, blocking chat, and SSE routes. A
 real localhost thinking-mode `Hello` request emits the two-token reasoning text `Here's`; blocking
 and SSE responses both report 11 prompt tokens, two completion tokens, `finish_reason=length`, and
 the exact model identity. `xtask qualify-qwen36-server` makes those public-boundary checks
 repeatable and stops only the server child it starts. Startup exposes one slot and the same
-192-position limit rather than implying compact batching or native prefill support.
+192-position limit rather than implying compact batching.
 
 ## Implementation order
 

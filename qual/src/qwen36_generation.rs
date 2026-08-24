@@ -8,7 +8,7 @@ use tuisko_engine::{
 };
 use tuisko_frontend::{ChatMessage, ChatTemplateOptions, FrontendError, TextFrontend};
 use tuisko_gpu::{CudaContext, GpuError, device_memory_info};
-use tuisko_model::{CheckpointError, CheckpointSnapshot, Qwen36Moe35B};
+use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, Qwen36Moe35B};
 
 // Transformers 5.2.0 `apply_chat_template` and tokenizer output from the pinned snapshot.
 const HELLO_THINKING: [u32; 11] = [
@@ -16,6 +16,15 @@ const HELLO_THINKING: [u32; 11] = [
 ];
 const HELLO_NO_THINKING: [u32; 13] = [
     248_045, 846, 198, 9_419, 248_046, 198, 248_045, 74_455, 198, 248_068, 271, 248_069, 271,
+];
+const PREFILL_ROUTE_CASES: [(usize, usize); 7] = [
+    (31, 0),
+    (32, 32),
+    (33, 32),
+    (64, 64),
+    (65, 64),
+    (128, 128),
+    (129, 128),
 ];
 
 /// Failure of the concrete Qwen3.6 generation integration gate.
@@ -50,6 +59,8 @@ pub struct Qwen36GenerationQualification {
     pub chat_steps: usize,
     /// Exact selected tokens from the production request.
     pub generated_tokens: Vec<u32>,
+    /// Native prompt-prefix widths selected by the synthetic routing matrix.
+    pub native_prefill_tokens: Vec<usize>,
     /// Exact bytes across all retained device arenas.
     pub arena_bytes: usize,
     /// Exact source-backed weights resident on the device.
@@ -80,8 +91,25 @@ pub fn qualify_qwen36_generation(
     verify_owner(&generator)?;
     let stable_addresses = generator.qualification_addresses();
 
-    let _ = generator.qualification_greedy_after_tokens(&HELLO_THINKING)?;
+    let warm_tokens = route_tokens(128, 0);
+    let (_, warm_native) = generator.qualification_greedy_after_tokens_with_route(&warm_tokens)?;
+    if warm_native != 128 {
+        return Err(Qwen36GenerationQualificationError::Mismatch(format!(
+            "T=128 warmup selected a {warm_native}-token native prefix"
+        )));
+    }
     let before = device_memory_info(generator.context())?;
+    let mut native_prefill_tokens = Vec::with_capacity(PREFILL_ROUTE_CASES.len());
+    for (case, (tokens, expected)) in PREFILL_ROUTE_CASES.into_iter().enumerate() {
+        let (_, actual) = generator
+            .qualification_greedy_after_tokens_with_route(&route_tokens(tokens, case + 1))?;
+        if actual != expected {
+            return Err(Qwen36GenerationQualificationError::Mismatch(format!(
+                "{tokens}-token prompt selected native prefix {actual}, expected {expected}"
+            )));
+        }
+        native_prefill_tokens.push(actual);
+    }
     let first = generator.qualification_greedy_after_tokens(&HELLO_THINKING)?;
     let repeated = generator.qualification_greedy_after_tokens(&HELLO_THINKING)?;
     if first != repeated {
@@ -111,6 +139,12 @@ pub fn qualify_qwen36_generation(
         return Err(Qwen36GenerationQualificationError::Mismatch(
             "generation bridge changed the Transformers prompt fixture".into(),
         ));
+    }
+    if session.native_prefill_tokens() != 0 {
+        return Err(Qwen36GenerationQualificationError::Mismatch(format!(
+            "11-token chat prompt selected a {}-token native prefix",
+            session.native_prefill_tokens()
+        )));
     }
     let mut streamed = String::new();
     let mut step_tokens = Vec::new();
@@ -157,11 +191,18 @@ pub fn qualify_qwen36_generation(
         prompt_cases: 2,
         chat_steps: step_tokens.len(),
         generated_tokens: step_tokens,
+        native_prefill_tokens,
         arena_bytes: generator.arena_bytes(),
         resident_weight_bytes: generator.resident_weight_bytes(),
         host_stager_bytes: generator.host_stager_bytes(),
         stable_addresses: stable_addresses.len(),
     })
+}
+
+fn route_tokens(tokens: usize, salt: usize) -> Vec<u32> {
+    (0..tokens)
+        .map(|position| ((101 + salt * 31_337 + position * 65_537) % Qwen36Moe35B::VOCAB) as u32)
+        .collect()
 }
 
 fn verify_prompt_fixtures(
@@ -231,6 +272,7 @@ mod tests {
         let report = qualify_qwen36_generation(&PathBuf::from(root))?;
         assert_eq!(report.prompt_cases, 2);
         assert!((1..=2).contains(&report.chat_steps));
+        assert_eq!(report.native_prefill_tokens, [0, 32, 32, 64, 64, 128, 128]);
         assert_eq!(report.arena_bytes, 21_063_232_512);
         assert_eq!(report.resident_weight_bytes, 19_808_036_096);
         assert_eq!(report.host_stager_bytes, 1_053_696);
