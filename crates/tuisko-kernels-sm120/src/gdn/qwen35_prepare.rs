@@ -3,7 +3,7 @@
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
-use tuisko_model::{Arch, Qwen35_9B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B};
 
 const MAX_BATCH: usize = 8;
 const CONTROL_ROWS: usize = Qwen35_9B::GDN_CONTROL_ROWS;
@@ -24,6 +24,10 @@ const _: () = assert!(PROJECTED_STRIDE == 12_288);
 const _: () = assert!(QKV_ROWS == 8_192);
 const _: () = assert!(HISTORY_TAPS == 3);
 const _: () = assert!(CTAS_PER_TOKEN == 32);
+const _: () = assert!(Qwen36Moe35B::GDN_CONTROL_ROWS == CONTROL_ROWS);
+const _: () = assert!(Qwen36Moe35B::GDN_INPUT_ROWS == PROJECTED_STRIDE);
+const _: () = assert!(Qwen36Moe35B::GDN_QKV_ROWS == QKV_ROWS);
+const _: () = assert!(Qwen36Moe35B::LINEAR_CONV_KERNEL_DIM - 1 == HISTORY_TAPS);
 
 fn admitted_batch(batch: usize) -> bool {
     (1..=MAX_BATCH).contains(&batch)
@@ -161,7 +165,7 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
                     THREADS,
                     0,
                 ))
-                .map_err(|source| GpuError::launch("preparing Qwen3.5 GDN controls", source))?,
+                .map_err(|source| GpuError::launch("preparing 2,048-wide GDN controls", source))?,
         })
     }
 
@@ -196,7 +200,7 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
                 beta,
                 convolved,
             )
-            .map_err(|source| GpuError::launch("launching Qwen3.5 GDN controls", source))
+            .map_err(|source| GpuError::launch("launching 2,048-wide GDN controls", source))
     }
 }
 
@@ -231,8 +235,9 @@ impl Qwen35GdnPrepareOp {
     /// Loads the embedded module and prepares every exact batch.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
         let _ = qwen35_gdn_prepare_ptx_names();
-        let module = unsafe { kernels::load(context) }
-            .map_err(|source| GpuError::module("loading the Qwen3.5 GDN prepare module", source))?;
+        let module = unsafe { kernels::load(context) }.map_err(|source| {
+            GpuError::module("loading the 2,048-wide GDN prepare module", source)
+        })?;
 
         Ok(Self {
             b1: PreparedRoute::prepare(&module)?,
@@ -276,7 +281,7 @@ impl Qwen35GdnPrepareOp {
     ) -> GpuResult<()> {
         if !admitted_batch(batch) {
             return Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 GDN prepare batch {batch} is outside the exact range 1..={MAX_BATCH}"
+                "2,048-wide GDN prepare batch {batch} is outside the exact range 1..={MAX_BATCH}"
             )));
         }
 
@@ -315,6 +320,13 @@ impl Qwen35GdnPrepareOp {
     }
 }
 
+/// Qwen3.6 uses the exact Qwen3.5 control/convolution binary route.
+///
+/// Both profiles have 32 control rows, 12,288 projected rows, 8,192 Q/K/V
+/// rows, and a width-four causal history. Compile-time assertions above keep
+/// this alias from silently widening to a merely similar geometry.
+pub type Qwen36GdnPrepareOp = Qwen35GdnPrepareOp;
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -322,6 +334,7 @@ mod tests {
         admitted_batch, qwen35_gdn_prepare_ptx_names,
     };
     use std::collections::BTreeSet;
+    use tuisko_model::{Arch, Qwen36Moe35B};
 
     #[test]
     fn geometry_routing_and_inventory_are_exact() {
@@ -330,6 +343,9 @@ mod tests {
         assert_eq!(PROJECTED_STRIDE, 12_288);
         assert_eq!(QKV_ROWS, 8_192);
         assert_eq!(CTAS_PER_TOKEN, 32);
+        assert_eq!(Qwen36Moe35B::GDN_CONTROL_ROWS, CONTROL_ROWS);
+        assert_eq!(Qwen36Moe35B::GDN_INPUT_ROWS, PROJECTED_STRIDE);
+        assert_eq!(Qwen36Moe35B::GDN_QKV_ROWS, QKV_ROWS);
         for (batch, expected) in [(0, false), (1, true), (8, true), (9, false)] {
             assert_eq!(admitted_batch(batch), expected, "batch={batch}");
         }

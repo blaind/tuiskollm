@@ -64,6 +64,12 @@ pub struct Qwen35GdnRecurrenceQualification {
     pub maximum_output_error: f32,
 }
 
+/// Qwen3.6 qualification report for the shared exact-geometry recurrence.
+pub type Qwen36GdnRecurrenceQualification = Qwen35GdnRecurrenceQualification;
+
+/// Qwen3.6 qualification failure for the shared exact-geometry recurrence.
+pub type Qwen36GdnRecurrenceQualificationError = Qwen35GdnRecurrenceQualificationError;
+
 #[derive(Clone, Copy)]
 pub(crate) struct Regions {
     pub(crate) qkv: ArenaRegion<u16>,
@@ -172,6 +178,15 @@ pub fn qualify_qwen35_gdn_recurrence()
     device_benchmark::require_current_process_exclusive()?;
 
     Ok(report)
+}
+
+/// Qualifies Qwen3.6 with the same binary and independent FP64 state oracle.
+///
+/// Kernel compile-time assertions bind both profiles to the exact 16-QK-head,
+/// 32-value-head, width-128 state and gate mapping.
+pub fn qualify_qwen36_gdn_recurrence()
+-> Result<Qwen36GdnRecurrenceQualification, Qwen36GdnRecurrenceQualificationError> {
+    qualify_qwen35_gdn_recurrence()
 }
 
 pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
@@ -557,6 +572,22 @@ mod tests {
         assert_eq!(report.weight_bytes, 256);
         assert_eq!(report.workspace_bytes, 17_172_512);
         assert_eq!(report.padding_bytes, 224);
+        assert!(report.maximum_state_error <= 0.002);
+        assert!(report.maximum_output_error <= 0.03125);
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
+    fn qwen36_exact_batches_match_shared_independent_oracle()
+    -> Result<(), Qwen36GdnRecurrenceQualificationError> {
+        let report = qualify_qwen36_gdn_recurrence()?;
+
+        assert_eq!(report.state_values, 18_874_368);
+        assert_eq!(report.output_values, 147_456);
+        assert_eq!(report.arena_bytes, 17_172_992);
+        assert_eq!(report.weight_bytes, 256);
         assert!(report.maximum_state_error <= 0.002);
         assert!(report.maximum_output_error <= 0.03125);
 

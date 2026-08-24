@@ -427,17 +427,24 @@ pub use qwen35_gdn_layer::{
 pub use qwen35_gdn_layer_benchmark::benchmark_qwen35_gdn_layer;
 #[cfg(feature = "device")]
 pub use qwen35_gdn_prepare::{
-    Qwen35GdnPrepareQualification, Qwen35GdnPrepareQualificationError, qualify_qwen35_gdn_prepare,
+    Qwen35GdnPrepareQualification, Qwen35GdnPrepareQualificationError,
+    Qwen36GdnPrepareQualification, Qwen36GdnPrepareQualificationError, qualify_qwen35_gdn_prepare,
+    qualify_qwen36_gdn_prepare,
 };
 #[cfg(feature = "device")]
-pub use qwen35_gdn_prepare_benchmark::benchmark_qwen35_gdn_prepare;
+pub use qwen35_gdn_prepare_benchmark::{
+    benchmark_qwen35_gdn_prepare, benchmark_qwen36_gdn_prepare,
+};
 #[cfg(feature = "device")]
 pub use qwen35_gdn_recurrence::{
     Qwen35GdnRecurrenceQualification, Qwen35GdnRecurrenceQualificationError,
-    qualify_qwen35_gdn_recurrence,
+    Qwen36GdnRecurrenceQualification, Qwen36GdnRecurrenceQualificationError,
+    qualify_qwen35_gdn_recurrence, qualify_qwen36_gdn_recurrence,
 };
 #[cfg(feature = "device")]
-pub use qwen35_gdn_recurrence_benchmark::benchmark_qwen35_gdn_recurrence;
+pub use qwen35_gdn_recurrence_benchmark::{
+    benchmark_qwen35_gdn_recurrence, benchmark_qwen36_gdn_recurrence,
+};
 #[cfg(feature = "device")]
 pub use qwen35_generation::{
     Qwen35GenerationQualification, Qwen35GenerationQualificationError, qualify_qwen35_generation,
