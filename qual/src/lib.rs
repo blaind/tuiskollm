@@ -187,6 +187,10 @@ mod qwen35_text_endpoint;
 #[cfg(feature = "device")]
 mod qwen35_text_endpoint_benchmark;
 #[cfg(feature = "device")]
+mod qwen36_moe_router;
+#[cfg(feature = "device")]
+mod qwen36_moe_router_benchmark;
+#[cfg(feature = "device")]
 mod resident_batch_generation;
 #[cfg(feature = "device")]
 mod resident_generation;
@@ -483,6 +487,12 @@ pub use qwen35_text_endpoint::{
 };
 #[cfg(feature = "device")]
 pub use qwen35_text_endpoint_benchmark::benchmark_qwen35_text_endpoint;
+#[cfg(feature = "device")]
+pub use qwen36_moe_router::{
+    Qwen36MoeRouterQualification, Qwen36MoeRouterQualificationError, qualify_qwen36_moe_router,
+};
+#[cfg(feature = "device")]
+pub use qwen36_moe_router_benchmark::benchmark_qwen36_moe_router;
 #[cfg(feature = "device")]
 pub use resident_batch_generation::{
     ResidentBatchGenerationQualification, ResidentBatchGenerationQualificationError,
