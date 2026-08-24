@@ -1,14 +1,21 @@
 //! Exact Qwen3.5 gated attention output and shared square NVFP4 projection.
 
 use crate::device::attention_output::attention_gate_bf16;
+use crate::device::nvfp4_prefill::{
+    BLOCK_N as W4_BLOCK_N, GROUP_K as W4_GROUP_K, THREADS as W4_THREADS, TILE_M as W4_TILE_M,
+    project_w4a4, quantize_bf16_rows,
+};
 use cuda_device::{
     SharedArray, cuda_module, kernel, launch_bounds, launch_contract, ptx_asm, thread,
 };
 use std::sync::Arc;
-use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_gpu::{
+    CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, LaunchConfig2D, PreparedLaunch,
+};
 use tuisko_model::{Arch, Qwen35_9B};
 
 const MAX_BATCH: usize = 8;
+const PREFILL_TOKENS: [usize; 3] = [32, 64, 128];
 const INPUT_COLUMNS: usize = Qwen35_9B::ATTENTION_OUTPUT_COLUMNS;
 const OUTPUT_ROWS: usize = Qwen35_9B::HIDDEN;
 const GROUP_K: usize = 16;
@@ -38,6 +45,7 @@ fn admitted_batch(batch: usize) -> bool {
 }
 
 #[cuda_module]
+#[allow(clippy::too_many_arguments)]
 mod kernels {
     use super::*;
     use cuda_device::{convert, float, warp};
@@ -318,6 +326,29 @@ mod kernels {
         }
     }
 
+    /// Applies the Qwen3.5 attention gate for one exact prompt width.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_attention_output_gate_bf16_prefill<const TOKENS: usize>(
+        attention: *mut f32,
+        qkv: *const u16,
+        activation: *mut u16,
+    ) {
+        // T=128 contains 524,288 independent gated columns. One CTA retains
+        // the established 4,096-column token ownership, replacing sixteen
+        // B=8 launch boundaries without changing any source pair or rounding.
+        unsafe {
+            attention_gate_bf16::<Qwen35_9B>(attention, qkv, activation);
+        }
+    }
+
     /// Projects gated BF16 attention rows through represented NVFP4 weights.
     #[kernel]
     #[launch_bounds(256, 2)]
@@ -345,6 +376,68 @@ mod kernels {
                 weight_reciprocal,
                 output,
                 core::ptr::addr_of_mut!(SHARED).cast::<u32>(),
+            );
+        }
+    }
+
+    /// Quantizes exact Qwen3.5 gated prompt rows into represented NVFP4.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_attention_output_quantize<const TOKENS: usize>(
+        input: *const u32,
+        codes: *mut u32,
+        scales: *mut u8,
+        input_scale_divisor: f32,
+    ) {
+        unsafe {
+            quantize_bf16_rows::<INPUT_COLUMNS, TOKENS>(
+                thread::index_1d().get(),
+                input,
+                codes,
+                scales,
+                input_scale_divisor,
+            );
+        }
+    }
+
+    /// Projects exact gated prompt rows through represented square weights.
+    #[kernel]
+    #[launch_bounds(384, 2)]
+    #[launch_contract(
+        domain = 2,
+        coordinates = u32,
+        block = (384, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_nvfp4_attention_output_w4a4<const TOKENS: usize>(
+        activation_codes: *const u32,
+        activation_scales: *const u8,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        output: *mut u16,
+        alpha: f32,
+    ) {
+        // T=32/64/128 expose 64/128/192 independent 48x64 tiles instead of
+        // keeping prompt accumulators inside 256 decode CTAs. Each m16n8k64
+        // retains the same K64 words and order; only independent M/N tiles move.
+        unsafe {
+            project_w4a4::<INPUT_COLUMNS, OUTPUT_ROWS, OUTPUT_ROWS, 0, TOKENS>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                alpha,
+                alpha,
+                alpha,
             );
         }
     }
@@ -391,6 +484,91 @@ impl<const TOKENS: usize> PreparedProjectionRoute<TOKENS> {
                 output,
             )
             .map_err(|source| GpuError::launch("launching Qwen3.5 square NVFP4 projection", source))
+    }
+}
+
+struct PreparedPrefillProjection<const TOKENS: usize> {
+    quantize: PreparedLaunch<kernels::__qwen35_nvfp4_attention_output_quantize_CudaKernel<TOKENS>>,
+    projection: PreparedLaunch<kernels::__qwen35_nvfp4_attention_output_w4a4_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedPrefillProjection<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !PREFILL_TOKENS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 NVFP4 output prefill route T={TOKENS} is not admitted"
+            )));
+        }
+        let groups_per_row = INPUT_COLUMNS / W4_GROUP_K;
+        let quantize_blocks =
+            u32::try_from((TOKENS * groups_per_row).div_ceil(256)).map_err(|_| {
+                GpuError::invalid_launch("Qwen3.5 output quantization grid is too wide")
+            })?;
+        let projection_blocks = u32::try_from(OUTPUT_ROWS / W4_BLOCK_N)
+            .map_err(|_| GpuError::invalid_launch("Qwen3.5 output grid is too wide"))?;
+        let token_tiles = u32::try_from(TOKENS.div_ceil(W4_TILE_M))
+            .map_err(|_| GpuError::invalid_launch("Qwen3.5 output grid is too tall"))?;
+        let quantize = module
+            .prepare_qwen35_nvfp4_attention_output_quantize::<TOKENS>(LaunchConfig1D::new(
+                quantize_blocks,
+                256,
+                0,
+            ))
+            .map_err(|source| {
+                GpuError::launch("preparing Qwen3.5 output activation quantization", source)
+            })?;
+        let projection = module
+            .prepare_qwen35_nvfp4_attention_output_w4a4::<TOKENS>(LaunchConfig2D::new(
+                (projection_blocks, token_tiles),
+                (W4_THREADS, 1),
+                0,
+            ))
+            .map_err(|source| GpuError::launch("preparing Qwen3.5 W4A4 output", source))?;
+
+        Ok(Self {
+            quantize,
+            projection,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_nvfp4_attention_output_quantize::<TOKENS>(
+                stream,
+                &self.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                input_scale_divisor,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching Qwen3.5 output activation quantization", source)
+            })?;
+        module
+            .qwen35_nvfp4_attention_output_w4a4::<TOKENS>(
+                stream,
+                &self.projection,
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                weight_codes.cast::<u32>(),
+                weight_scales,
+                output,
+                1.0 / (input_scale_divisor * weight_scale_divisor),
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.5 W4A4 output", source))
     }
 }
 
@@ -441,6 +619,70 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
                 weight_codes,
                 weight_scales,
                 weight_reciprocal,
+                output,
+            )
+        }
+    }
+}
+
+struct PreparedPrefillRoute<const TOKENS: usize> {
+    gate: PreparedLaunch<
+        kernels::__qwen35_nvfp4_attention_output_gate_bf16_prefill_CudaKernel<TOKENS>,
+    >,
+    projection: PreparedPrefillProjection<TOKENS>,
+}
+
+impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let gate =
+            module
+                .prepare_qwen35_nvfp4_attention_output_gate_bf16_prefill::<TOKENS>(
+                    LaunchConfig1D::new(TOKENS as u32, THREADS, 0),
+                )
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.5 NVFP4 attention prefill gate", source)
+                })?;
+
+        Ok(Self {
+            gate,
+            projection: PreparedPrefillProjection::prepare(module)?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        attention: *mut f32,
+        qkv: *const u16,
+        activation: *mut u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_nvfp4_attention_output_gate_bf16_prefill::<TOKENS>(
+                stream, &self.gate, attention, qkv, activation,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching Qwen3.5 NVFP4 attention prefill gate", source)
+            })?;
+        unsafe {
+            self.projection.launch(
+                module,
+                stream,
+                activation,
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                input_scale_divisor,
+                weight_scale_divisor,
                 output,
             )
         }
@@ -542,7 +784,7 @@ impl Qwen35Nvfp4GdnOutputOp {
     }
 }
 
-/// Prepared gated NVFP4 attention-output routes for exact `B=1..=8`.
+/// Prepared gated NVFP4 attention-output routes for exact decode and prompt widths.
 pub struct Qwen35Nvfp4AttentionOutputOp {
     module: kernels::LoadedModule,
     b1: PreparedRoute<1>,
@@ -553,6 +795,9 @@ pub struct Qwen35Nvfp4AttentionOutputOp {
     b6: PreparedRoute<6>,
     b7: PreparedRoute<7>,
     b8: PreparedRoute<8>,
+    t32: PreparedPrefillRoute<32>,
+    t64: PreparedPrefillRoute<64>,
+    t128: PreparedPrefillRoute<128>,
 }
 
 impl Qwen35Nvfp4AttentionOutputOp {
@@ -575,6 +820,9 @@ impl Qwen35Nvfp4AttentionOutputOp {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -644,6 +892,72 @@ impl Qwen35Nvfp4AttentionOutputOp {
             _ => unreachable!(),
         }
     }
+
+    /// Gates and projects one exact prompt width through represented NVFP4.
+    ///
+    /// # Safety
+    ///
+    /// All planes cover their documented `tokens` extents. Activation codes
+    /// cover packed E2M1 `[tokens,4096]`; scales cover E4M3 `[tokens,256]`;
+    /// every pointer is aligned, disjoint, context-local, and live through
+    /// stream completion.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_prefill(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        attention: *mut f32,
+        qkv: *const u16,
+        activation: *mut u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        for (name, value) in [
+            ("input", input_scale_divisor),
+            ("weight", weight_scale_divisor),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(GpuError::invalid_launch(format!(
+                    "Qwen3.5 NVFP4 attention-output {name} scale divisor must be finite and positive"
+                )));
+            }
+        }
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        attention,
+                        qkv,
+                        activation,
+                        activation_codes,
+                        activation_scales,
+                        weight_codes,
+                        weight_scales,
+                        input_scale_divisor,
+                        weight_scale_divisor,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match tokens {
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
+            _ => Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 NVFP4 attention-output prefill tokens {tokens} must be 32, 64, or 128"
+            ))),
+        }
+    }
 }
 
 /// PTX symbols retained for every exact Qwen3.5 attention-output stage.
@@ -665,14 +979,23 @@ pub(crate) fn qwen35_nvfp4_attention_output_ptx_names() -> Vec<&'static str> {
         kernels::qwen35_nvfp4_attention_output_a16_ptx_name::<6>(),
         kernels::qwen35_nvfp4_attention_output_a16_ptx_name::<7>(),
         kernels::qwen35_nvfp4_attention_output_a16_ptx_name::<8>(),
+        kernels::qwen35_nvfp4_attention_output_gate_bf16_prefill_ptx_name::<32>(),
+        kernels::qwen35_nvfp4_attention_output_gate_bf16_prefill_ptx_name::<64>(),
+        kernels::qwen35_nvfp4_attention_output_gate_bf16_prefill_ptx_name::<128>(),
+        kernels::qwen35_nvfp4_attention_output_quantize_ptx_name::<32>(),
+        kernels::qwen35_nvfp4_attention_output_quantize_ptx_name::<64>(),
+        kernels::qwen35_nvfp4_attention_output_quantize_ptx_name::<128>(),
+        kernels::qwen35_nvfp4_attention_output_w4a4_ptx_name::<32>(),
+        kernels::qwen35_nvfp4_attention_output_w4a4_ptx_name::<64>(),
+        kernels::qwen35_nvfp4_attention_output_w4a4_ptx_name::<128>(),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        GROUPS_PER_ROW, MAX_BATCH, OUTPUT_ROWS, PHASES, SHARED_U32, WARPS, admitted_batch,
-        qwen35_nvfp4_attention_output_ptx_names,
+        GROUPS_PER_ROW, MAX_BATCH, OUTPUT_ROWS, PHASES, PREFILL_TOKENS, SHARED_U32, WARPS,
+        admitted_batch, qwen35_nvfp4_attention_output_ptx_names,
     };
     use std::collections::BTreeSet;
 
@@ -688,7 +1011,8 @@ mod tests {
         }
 
         let names = qwen35_nvfp4_attention_output_ptx_names();
-        assert_eq!(names.len(), 2 * MAX_BATCH);
+        assert_eq!(PREFILL_TOKENS, [32, 64, 128]);
+        assert_eq!(names.len(), 2 * MAX_BATCH + 3 * PREFILL_TOKENS.len());
         assert_eq!(
             names.iter().copied().collect::<BTreeSet<_>>().len(),
             names.len()
