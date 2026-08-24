@@ -19,6 +19,8 @@ use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const DECODE_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
+const QWEN35_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
+const QWEN35_MAX_TOKENS: usize = 128;
 const QWEN36_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 const QWEN36_MAX_TOKENS: usize = 128;
 const ALIGNMENT: usize = 256;
@@ -104,8 +106,8 @@ trait BenchPagedGqaOp {
 
 impl BenchPagedGqaOp for Qwen35PagedGqaOp {
     type Target = Qwen35_9B;
-    const ROUTES: &'static [usize] = &DECODE_ROUTES;
-    const MAX_TOKENS: usize = MAX_BATCH;
+    const ROUTES: &'static [usize] = &QWEN35_ROUTES;
+    const MAX_TOKENS: usize = QWEN35_MAX_TOKENS;
     const ROUTE: &'static str = "qwen35_paged_gqa/online_softmax_bf16_kv";
     const SUITE: &'static str = "bench-qwen35-paged-gqa";
     const CACHE_OWNER: &'static str = "qwen35_paged_gqa/kv_cache";
@@ -114,14 +116,18 @@ impl BenchPagedGqaOp for Qwen35PagedGqaOp {
     const CACHE_DESCRIPTION: &'static str =
         "24 physical pages, four KV heads, 64 positions, represented BF16 K/V";
     const WORKSPACE_DESCRIPTION: &'static str =
-        "B=8 query/output plus page-table, row, and length metadata";
+        "T=128 query/output plus page-table, row, and length metadata";
 
     fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
         Qwen35PagedGqaOp::new(context)
     }
 
-    fn workload(batch: usize) -> BenchmarkWorkload {
-        BenchmarkWorkload::warm_operator_decode(batch as u32)
+    fn workload(tokens: usize) -> BenchmarkWorkload {
+        if tokens <= MAX_BATCH {
+            BenchmarkWorkload::warm_operator_decode(tokens as u32)
+        } else {
+            BenchmarkWorkload::warm_operator_prefill(tokens as u64)
+        }
     }
 
     fn launch(&self, stream: &CudaStream, batch: usize, addresses: &Addresses) -> GpuResult<()> {
@@ -486,7 +492,7 @@ fn benchmark_target<O: BenchPagedGqaOp>(
     )
 }
 
-/// Measures every exact Qwen3.5 BF16 paged-GQA graph at 130 context tokens.
+/// Measures every exact Qwen3.5 represented-BF16 paged-GQA decode and prompt route.
 pub fn benchmark_qwen35_paged_gqa(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
@@ -510,7 +516,8 @@ pub fn benchmark_mtp_bf16_paged_gqa(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_TOKENS, MAX_BATCH, QWEN36_MAX_TOKENS, QWEN36_ROUTES, layout, logical_bytes,
+        CONTEXT_TOKENS, MAX_BATCH, QWEN35_MAX_TOKENS, QWEN35_ROUTES, QWEN36_MAX_TOKENS,
+        QWEN36_ROUTES, layout, logical_bytes,
     };
     use std::mem::size_of;
     use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
@@ -527,16 +534,28 @@ mod tests {
 
         assert_eq!(logical_bytes::<Qwen35_9B>(1), per_token);
         assert_eq!(logical_bytes::<Qwen35_9B>(MAX_BATCH), MAX_BATCH * per_token);
+
+        let prompt_per_token = 2 * Qwen35_9B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>()
+            + 2 * Qwen35_9B::NUM_KV_HEADS * CONTEXT_TOKENS * Qwen35_9B::HEAD_DIM * size_of::<u16>()
+            + 2 * size_of::<u32>()
+            + Qwen35_9B::NUM_KV_HEADS * CONTEXT_TOKENS * size_of::<u32>();
+        for tokens in [32, 64, 128] {
+            assert_eq!(
+                logical_bytes::<Qwen35_9B>(tokens),
+                tokens * prompt_per_token
+            );
+        }
+        assert_eq!(QWEN35_ROUTES.len(), 11);
     }
 
     #[test]
     fn qwen35_bf16_arena_accounting_exposes_every_padding_byte() {
-        let (layout, regions) = layout::<Qwen35_9B>(MAX_BATCH).unwrap();
+        let (layout, regions) = layout::<Qwen35_9B>(QWEN35_MAX_TOKENS).unwrap();
 
         assert_eq!(regions.cache_bytes(), 6_291_456);
-        assert_eq!(regions.payload_bytes(), 6_553_760);
-        assert_eq!(layout.byte_len(), 6_554_368);
-        assert_eq!(layout.byte_len() - regions.payload_bytes(), 608);
+        assert_eq!(regions.payload_bytes(), 10_486_880);
+        assert_eq!(layout.byte_len(), 10_487_040);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 160);
     }
 
     #[test]

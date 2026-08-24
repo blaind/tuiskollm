@@ -9443,7 +9443,7 @@ fn gate_qwen35_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         root,
         QWEN35_PAGED_GQA_RESOURCE_BASELINE,
         "qwen35_paged_gqa_exact_TID_",
-        None,
+        Some(("qwen35_paged_gqa_prefill_shared_exact_TID_", 3, 128)),
         "Qwen3.5",
         "qwen35-bf16-paged-gqa-gate.cubin",
     )
@@ -9454,7 +9454,7 @@ fn gate_qwen36_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         root,
         QWEN36_PAGED_GQA_RESOURCE_BASELINE,
         "qwen36_paged_gqa_exact_TID_",
-        Some(("qwen36_paged_gqa_prefill_shared_exact_TID_", 3)),
+        Some(("qwen36_paged_gqa_prefill_shared_exact_TID_", 3, 256)),
         "Qwen3.6",
         "qwen36-bf16-paged-gqa-gate.cubin",
     )
@@ -9464,7 +9464,7 @@ fn gate_bf16_paged_gqa_target(
     root: &Path,
     baseline_path: &str,
     entry_prefix: &str,
-    prefill_inventory: Option<(&str, usize)>,
+    prefill_inventory: Option<(&str, usize, u32)>,
     target: &str,
     cubin_name: &str,
 ) -> Result<(), Box<dyn Error>> {
@@ -9477,14 +9477,14 @@ fn gate_bf16_paged_gqa_target(
         .iter()
         .filter(|entry| entry.name.starts_with(entry_prefix))
         .collect::<Vec<_>>();
-    let prefill = prefill_inventory.map_or_else(Vec::new, |(prefix, _)| {
+    let prefill = prefill_inventory.map_or_else(Vec::new, |(prefix, _, _)| {
         entries
             .iter()
             .filter(|entry| entry.name.starts_with(prefix))
             .collect::<Vec<_>>()
     });
     require_count(&format!("{target} BF16 paged GQA"), attention.len(), 8)?;
-    if let Some((_, expected)) = prefill_inventory {
+    if let Some((_, expected, _)) = prefill_inventory {
         require_count(
             &format!("{target} BF16 paged GQA prefill"),
             prefill.len(),
@@ -9501,10 +9501,13 @@ fn gate_bf16_paged_gqa_target(
         }
     }
     for entry in &prefill {
-        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 1") {
+        let threads = prefill_inventory.map_or(0, |(_, _, threads)| threads);
+        if !entry.body.contains(&format!(".reqntid {threads}, 1, 1"))
+            || !entry.body.contains(".minnctapersm 1")
+        {
             return Err(format!(
-                "entry `{}` lost its 256-thread/one-CTA launch bounds",
-                entry.name
+                "entry `{}` lost its {threads}-thread/one-CTA launch bounds",
+                entry.name,
             )
             .into());
         }

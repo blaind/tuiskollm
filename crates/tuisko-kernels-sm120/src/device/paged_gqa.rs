@@ -13,6 +13,7 @@ const PREFILL_KEY_TILE: usize = 64;
 const PREFILL_PLANE_WORDS: usize = PREFILL_KEY_TILE * 256 / size_of::<u32>();
 pub(crate) const PREFILL_SHARED_BYTES: usize = 2 * PREFILL_PLANE_WORDS * size_of::<u32>();
 pub(crate) const BF16_PREFILL_THREADS: usize = 256;
+pub(crate) const QWEN35_BF16_PREFILL_THREADS: usize = 128;
 const BF16_PREFILL_PLANE_VALUES: usize = PREFILL_KEY_TILE * 256;
 pub(crate) const BF16_PREFILL_SHARED_BYTES: usize =
     2 * BF16_PREFILL_PLANE_VALUES * size_of::<u16>();
@@ -1353,7 +1354,7 @@ pub(crate) unsafe fn bf16_paged_gqa_prefill_shared<A: Arch, const TOKENS: usize>
                     if valid { 16 } else { 0 },
                 );
             }
-            task += BF16_PREFILL_THREADS;
+            task += WARP_THREADS * query_heads_per_kv;
         }
         unsafe {
             cp_async_commit_group();
