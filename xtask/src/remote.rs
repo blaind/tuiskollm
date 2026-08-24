@@ -330,13 +330,10 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
             Benchmark::MtpPromptPrime => {
                 crate::prepare_remote_mtp_prompt_prime_benchmark(root, options.gpu)?
             }
-            Benchmark::ResidentMtp => {
-                crate::prepare_remote_resident_mtp_benchmark(root, options.gpu)?
-            }
-            Benchmark::GenerationMtpGreedy => {
-                crate::prepare_remote_resident_mtp_benchmark(root, options.gpu)?
-            }
-            Benchmark::GenerationMtpSampling => {
+            Benchmark::ResidentMtp
+            | Benchmark::GenerationMtpGreedy
+            | Benchmark::GenerationMtpSampling
+            | Benchmark::GenerationMtpBatch => {
                 crate::prepare_remote_resident_mtp_benchmark(root, options.gpu)?
             }
             Benchmark::ResidentModel => {
@@ -644,6 +641,9 @@ mod tests {
             Benchmark::parse("bench-generation-mtp-sampling").expect("known benchmark");
         assert_eq!(sampling_mtp.name(), "generation-mtp-sampling");
         assert!(sampling_mtp.source_snapshot());
+        let batch_mtp = Benchmark::parse("bench-generation-mtp-batch").expect("known benchmark");
+        assert_eq!(batch_mtp.name(), "generation-mtp-batch");
+        assert!(batch_mtp.source_snapshot());
         assert_eq!(
             Benchmark::parse("bench-attention-qk-prepare")
                 .expect("known benchmark")
