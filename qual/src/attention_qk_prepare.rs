@@ -10,13 +10,18 @@ use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
     device_memory_info,
 };
-use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, Qwen35AttentionQkPrepareOp};
-use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen35_9B, Qwen38_27B};
+use tuisko_kernels_sm120::{
+    ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, Qwen35AttentionQkPrepareOp,
+    Qwen36AttentionQkPrepareOp,
+};
+use tuisko_model::{
+    Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen35_9B, Qwen36Moe35B, Qwen38_27B,
+};
 
 const MAX_BATCH: usize = 8;
 const MAX_TOKENS: usize = 1_024;
 const ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
-const QWEN35_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
+const BF16_ROUTES: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
 const ALIGNMENT: usize = 256;
 const PHYSICAL_PAGES: usize = 16;
 const TABLE_ROWS: usize = 8;
@@ -254,7 +259,7 @@ impl_qualified_op!(AttentionQkPrepareOp, Qwen38_27B, &ROUTES, MAX_TOKENS);
 
 impl QualifiedQkPrepareOp for Qwen35AttentionQkPrepareOp {
     type Target = Qwen35_9B;
-    const ROUTES: &'static [usize] = &QWEN35_ROUTES;
+    const ROUTES: &'static [usize] = &BF16_ROUTES;
     const MAX_TOKENS: usize = MAX_BATCH;
     const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16Exact;
@@ -285,6 +290,60 @@ impl QualifiedQkPrepareOp for Qwen35AttentionQkPrepareOp {
     ) -> GpuResult<()> {
         // SAFETY: the qualification layout reserves aligned BF16 cache planes;
         // this byte-typed seam is shared only to keep the Qwen3.8 oracle path.
+        unsafe {
+            self.launch(
+                stream,
+                batch,
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages.cast(),
+                value_pages.cast(),
+            )
+        }
+    }
+}
+
+impl QualifiedQkPrepareOp for Qwen36AttentionQkPrepareOp {
+    type Target = Qwen36Moe35B;
+    const ROUTES: &'static [usize] = &BF16_ROUTES;
+    const MAX_TOKENS: usize = MAX_BATCH;
+    const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
+    const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16Exact;
+
+    fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        Qwen36AttentionQkPrepareOp::new(context)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &self,
+        stream: &tuisko_gpu::CudaStream,
+        batch: usize,
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: usize,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u8,
+        value_pages: *mut u8,
+        _key_scale: f32,
+        _value_scale: f32,
+    ) -> GpuResult<()> {
+        // SAFETY: the qualification layout reserves aligned BF16 cache planes
+        // for the complete Qwen3.6 target geometry.
         unsafe {
             self.launch(
                 stream,
@@ -371,6 +430,12 @@ pub fn qualify_attention_qk_prepare()
 pub fn qualify_qwen35_attention_qk_prepare()
 -> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
     qualify_target::<Qwen35AttentionQkPrepareOp>(None)
+}
+
+/// Qualifies Qwen3.6 eager and captured Q/K preparation at exact `B=1..=8`.
+pub fn qualify_qwen36_attention_qk_prepare()
+-> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
+    qualify_target::<Qwen36AttentionQkPrepareOp>(None)
 }
 
 /// Qualifies source-backed MTP Q/K preparation at exact `B=1..=8` and prompt tiles.
@@ -1068,9 +1133,10 @@ fn verify_replay(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BATCH, MAX_TOKENS, PHYSICAL_PAGES, Qwen35_9B, Qwen38_27B, ROUTES, TABLE_ROWS,
-        TABLE_STRIDE, layout, qualify_attention_qk_prepare, qualify_mtp_bf16_qk_prepare,
-        qualify_qwen35_attention_qk_prepare,
+        MAX_BATCH, MAX_TOKENS, PHYSICAL_PAGES, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, ROUTES,
+        TABLE_ROWS, TABLE_STRIDE, layout, qualify_attention_qk_prepare,
+        qualify_mtp_bf16_qk_prepare, qualify_qwen35_attention_qk_prepare,
+        qualify_qwen36_attention_qk_prepare,
     };
     use std::{mem::size_of, path::PathBuf};
     use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -1152,6 +1218,41 @@ mod tests {
         assert_eq!(report.weight_bytes, regions.weight_bytes());
         assert_eq!(report.cache_bytes, regions.cache_bytes());
         assert_eq!(report.workspace_bytes, regions.workspace_bytes());
+        assert!(report.maximum_query_error <= 0.003);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
+    fn qwen36_exact_batches_match_independent_oracles_and_graph_replay()
+    -> Result<(), super::AttentionQkPrepareQualificationError> {
+        let report = qualify_qwen36_attention_qk_prepare()?;
+        let active_tokens = (1..=MAX_BATCH).sum::<usize>();
+        let query_per_token = Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS;
+        let cache_elements_per_token = 2 * Qwen36Moe35B::ATTENTION_KV_ROWS;
+        let cache_bytes_per_token = cache_elements_per_token * size_of::<u16>();
+        let plane_bytes = PHYSICAL_PAGES
+            * Qwen36Moe35B::NUM_KV_HEADS
+            * ATTENTION_PAGE_SIZE
+            * Qwen36Moe35B::HEAD_DIM
+            * size_of::<u16>();
+        let replay_per_route = MAX_BATCH * query_per_token + 2 * plane_bytes;
+        let total_observable = MAX_BATCH * replay_per_route;
+
+        assert_eq!(report.query_values, active_tokens * query_per_token);
+        assert_eq!(
+            report.appended_cache_values,
+            active_tokens * cache_elements_per_token
+        );
+        assert_eq!(
+            report.untouched_values,
+            total_observable - active_tokens * (query_per_token + cache_bytes_per_token)
+        );
+        assert_eq!(report.graph_replay_values, total_observable);
+        let (layout, regions) = layout::<Qwen36Moe35B>(MAX_BATCH, size_of::<u16>())?;
+        assert_eq!(report.arena_bytes, layout.byte_len());
+        assert_eq!(report.arena_bytes - report.padding_bytes, 2_379_392);
+        assert_eq!(regions.payload_bytes(), 2_379_392);
         assert!(report.maximum_query_error <= 0.003);
         Ok(())
     }

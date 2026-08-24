@@ -269,11 +269,12 @@ pub use attention_output_prefill::{
 pub use attention_qk_prepare::{
     AttentionQkPrepareQualification, AttentionQkPrepareQualificationError,
     qualify_attention_qk_prepare, qualify_mtp_bf16_qk_prepare, qualify_qwen35_attention_qk_prepare,
+    qualify_qwen36_attention_qk_prepare,
 };
 #[cfg(feature = "device")]
 pub use attention_qk_prepare_benchmark::{
     benchmark_attention_qk_prepare, benchmark_mtp_bf16_qk_prepare,
-    benchmark_qwen35_attention_qk_prepare,
+    benchmark_qwen35_attention_qk_prepare, benchmark_qwen36_attention_qk_prepare,
 };
 #[cfg(feature = "device")]
 pub use dense_fp8_gdn_layer::{

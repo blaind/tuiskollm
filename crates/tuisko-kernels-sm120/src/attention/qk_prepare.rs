@@ -1,11 +1,11 @@
 //! Exact-batch Q/K normalization, MRoPE, and KV-cache append.
 
 use crate::Sm120Arch;
-use crate::device::attention_qk_prepare::{attention_qk_prepare, qwen35_attention_qk_prepare};
+use crate::device::attention_qk_prepare::{attention_qk_prepare, bf16_attention_qk_prepare};
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
-use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 /// Number of token positions held by one physical KV-cache page.
 pub const ATTENTION_PAGE_SIZE: usize = 64;
@@ -51,6 +51,23 @@ fn require_qwen35_geometry() -> GpuResult<()> {
     {
         return Err(GpuError::invalid_launch(
             "Qwen3.5 geometry is incompatible with its admitted attention Q/K prepare schedule",
+        ));
+    }
+
+    Ok(())
+}
+
+fn require_qwen36_geometry() -> GpuResult<()> {
+    if Qwen36Moe35B::NUM_ATTENTION_HEADS != 16
+        || Qwen36Moe35B::NUM_KV_HEADS != 2
+        || Qwen36Moe35B::HEAD_DIM != 256
+        || Qwen36Moe35B::ATTENTION_QUERY_ROWS != 8_192
+        || Qwen36Moe35B::ATTENTION_KV_ROWS != 512
+        || Qwen36Moe35B::ATTENTION_QKV_ROWS != 9_216
+        || Qwen36Moe35B::RMS_NORM_EPSILON != 1.0e-6
+    {
+        return Err(GpuError::invalid_launch(
+            "Qwen3.6 geometry is incompatible with its admitted attention Q/K prepare schedule",
         ));
     }
 
@@ -193,7 +210,53 @@ mod kernels {
         // existing one-warp/head reduction and MRoPE order exactly; its paired
         // performance slice decides whether a different topology is owed.
         unsafe {
-            qwen35_attention_qk_prepare::<Qwen35_9B, TOKENS>(
+            bf16_attention_qk_prepare::<Qwen35_9B, TOKENS>(
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+            );
+        }
+    }
+
+    /// Prepares Qwen3.6 Q/K and appends K/V for one exact decode batch.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_attention_qk_prepare_exact<const TOKENS: usize>(
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u16,
+        value_pages: *mut u16,
+    ) {
+        // Qwen3.6 has 18 head-warps per token. Eight warps per CTA produce
+        // 18 CTAs at B=8 while preserving the same one-warp/head reduction,
+        // 64-wide MRoPE exchange, and BF16 store order as Qwen3.5.
+        unsafe {
+            bf16_attention_qk_prepare::<Qwen36Moe35B, TOKENS>(
                 qkv,
                 query_norm,
                 key_norm,
@@ -398,6 +461,68 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
                 value_pages,
             )
             .map_err(|source| GpuError::launch("launching Qwen3.5 attention Q/K prepare", source))
+    }
+}
+
+struct PreparedQwen36Route<const TOKENS: usize> {
+    prepare: PreparedLaunch<kernels::__qwen36_attention_qk_prepare_exact_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedQwen36Route<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let blocks = u32::try_from(
+            (TOKENS * (Qwen36Moe35B::NUM_ATTENTION_HEADS + Qwen36Moe35B::NUM_KV_HEADS))
+                .div_ceil(WARPS_PER_CTA),
+        )
+        .map_err(|_| GpuError::invalid_launch("Qwen3.6 attention Q/K grid exceeds u32"))?;
+
+        Ok(Self {
+            prepare: module
+                .prepare_qwen36_attention_qk_prepare_exact::<TOKENS>(LaunchConfig1D::new(
+                    blocks, THREADS, 0,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.6 attention Q/K route", source)
+                })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u16,
+        value_pages: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen36_attention_qk_prepare_exact::<TOKENS>(
+                stream,
+                &self.prepare,
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.6 attention Q/K prepare", source))
     }
 }
 
@@ -659,6 +784,119 @@ impl Qwen35AttentionQkPrepareOp {
     }
 }
 
+/// Prepared Qwen3.6 Q/K normalization, MRoPE, and BF16 KV-cache routes for `B=1..8`.
+pub struct Qwen36AttentionQkPrepareOp {
+    module: kernels::LoadedModule,
+    b1: PreparedQwen36Route<1>,
+    b2: PreparedQwen36Route<2>,
+    b3: PreparedQwen36Route<3>,
+    b4: PreparedQwen36Route<4>,
+    b5: PreparedQwen36Route<5>,
+    b6: PreparedQwen36Route<6>,
+    b7: PreparedQwen36Route<7>,
+    b8: PreparedQwen36Route<8>,
+}
+
+impl Qwen36AttentionQkPrepareOp {
+    /// Loads the embedded module and prepares every exact Qwen3.6 decode route.
+    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        require_qwen36_geometry()?;
+        let _ = qwen36_attention_qk_prepare_ptx_names();
+        // SAFETY: this crate owns the embedded cuda-oxide module artifact.
+        let module = unsafe { kernels::load(context) }
+            .map_err(|source| GpuError::module("loading Qwen3.6 attention Q/K prepare", source))?;
+
+        Ok(Self {
+            b1: PreparedQwen36Route::prepare(&module)?,
+            b2: PreparedQwen36Route::prepare(&module)?,
+            b3: PreparedQwen36Route::prepare(&module)?,
+            b4: PreparedQwen36Route::prepare(&module)?,
+            b5: PreparedQwen36Route::prepare(&module)?,
+            b6: PreparedQwen36Route::prepare(&module)?,
+            b7: PreparedQwen36Route::prepare(&module)?,
+            b8: PreparedQwen36Route::prepare(&module)?,
+            module,
+        })
+    }
+
+    /// Normalizes and rotates Q/K, then appends represented BF16 K/V values.
+    ///
+    /// # Safety
+    ///
+    /// `qkv` covers `[batch,9216]` BF16 values in query/gate, key, value order.
+    /// Norms cover 256 values; rotary planes cover `[batch,32]`; metadata
+    /// covers `batch`; and each selected block-table row covers its cache
+    /// position. Query covers `[batch,16,256]` FP32 values. Cache planes use
+    /// page-major `[physical_page,2,64,256]` BF16 values. Allocations are
+    /// aligned, non-overlapping, live through completion, and context-local.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: usize,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u16,
+        value_pages: *mut u16,
+    ) -> GpuResult<()> {
+        if !admitted_batch(batch) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 attention Q/K prepare batch {batch} is outside the admitted range 1..={MAX_BATCH}"
+            )));
+        }
+        let table_stride = u32::try_from(table_stride).map_err(|_| {
+            GpuError::invalid_launch("Qwen3.6 attention Q/K block-table stride exceeds u32")
+        })?;
+        if table_stride == 0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.6 attention Q/K block-table stride must be nonzero",
+            ));
+        }
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        qkv,
+                        query_norm,
+                        key_norm,
+                        rope_cos,
+                        rope_sin,
+                        block_tables,
+                        table_rows,
+                        table_stride,
+                        cache_positions,
+                        query,
+                        key_pages,
+                        value_pages,
+                    )
+                }
+            };
+        }
+
+        match batch {
+            1 => launch!(b1),
+            2 => launch!(b2),
+            3 => launch!(b3),
+            4 => launch!(b4),
+            5 => launch!(b5),
+            6 => launch!(b6),
+            7 => launch!(b7),
+            8 => launch!(b8),
+            _ => unreachable!(),
+        }
+    }
+}
+
 /// PTX symbols retained for every exact attention Q/K prepare route.
 pub(crate) fn attention_qk_prepare_ptx_names() -> Vec<&'static str> {
     vec![
@@ -691,11 +929,25 @@ pub(crate) fn qwen35_attention_qk_prepare_ptx_names() -> [&'static str; MAX_BATC
     ]
 }
 
+/// PTX symbols retained for every exact Qwen3.6 attention Q/K prepare route.
+pub(crate) fn qwen36_attention_qk_prepare_ptx_names() -> [&'static str; MAX_BATCH] {
+    [
+        kernels::qwen36_attention_qk_prepare_exact_ptx_name::<1>(),
+        kernels::qwen36_attention_qk_prepare_exact_ptx_name::<2>(),
+        kernels::qwen36_attention_qk_prepare_exact_ptx_name::<3>(),
+        kernels::qwen36_attention_qk_prepare_exact_ptx_name::<4>(),
+        kernels::qwen36_attention_qk_prepare_exact_ptx_name::<5>(),
+        kernels::qwen36_attention_qk_prepare_exact_ptx_name::<6>(),
+        kernels::qwen36_attention_qk_prepare_exact_ptx_name::<7>(),
+        kernels::qwen36_attention_qk_prepare_exact_ptx_name::<8>(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         THREADS, admitted_tokens, attention_qk_prepare_ptx_names,
-        qwen35_attention_qk_prepare_ptx_names,
+        qwen35_attention_qk_prepare_ptx_names, qwen36_attention_qk_prepare_ptx_names,
     };
     use std::collections::BTreeSet;
 
@@ -732,5 +984,12 @@ mod tests {
         assert_eq!(qwen35.len(), 8);
         assert_eq!(qwen35_unique.len(), qwen35.len());
         assert!(names.iter().all(|name| !qwen35_unique.contains(name)));
+
+        let qwen36 = qwen36_attention_qk_prepare_ptx_names();
+        let qwen36_unique = qwen36.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(qwen36.len(), 8);
+        assert_eq!(qwen36_unique.len(), qwen36.len());
+        assert!(names.iter().all(|name| !qwen36_unique.contains(name)));
+        assert!(qwen35_unique.is_disjoint(&qwen36_unique));
     }
 }

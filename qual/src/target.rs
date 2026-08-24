@@ -7,11 +7,11 @@ pub(crate) use tuisko_kernels_sm89::{
 #[cfg(feature = "device")]
 pub(crate) use tuisko_kernels_sm120::{
     FullAttentionQkvOp, MtpBf16AttentionOutputOp, MtpBf16FusionOp, MtpBf16MlpOp,
-    MtpBf16QkPrepareOp, MtpBf16QkvOp, Qwen35Nvfp4AttentionOutputOp, Qwen35Nvfp4DownOp,
-    Qwen35Bf16LmHeadOp, Qwen35GdnPrepareOp, Qwen35GdnRecurrenceOp, Qwen35Nvfp4GdnInputOp,
-    Qwen35Nvfp4GdnOutputOp,
-    Qwen35Nvfp4QkvOp, Qwen35Nvfp4SwiGluOp, Qwen35ResidualNormOp, Qwen36Fp8QkvOp, Qwen36GdnInputOp,
-    Qwen36GdnOutputOp, Qwen36MoeExpertsOp, Qwen36MoeRouterOp, Qwen36ResidualNormOp, ResidualNormOp,
+    MtpBf16QkPrepareOp, MtpBf16QkvOp, Qwen35Bf16LmHeadOp, Qwen35GdnPrepareOp,
+    Qwen35GdnRecurrenceOp, Qwen35Nvfp4AttentionOutputOp, Qwen35Nvfp4DownOp, Qwen35Nvfp4GdnInputOp,
+    Qwen35Nvfp4GdnOutputOp, Qwen35Nvfp4QkvOp, Qwen35Nvfp4SwiGluOp, Qwen35ResidualNormOp,
+    Qwen36Fp8QkvOp, Qwen36GdnInputOp, Qwen36GdnOutputOp, Qwen36MoeExpertsOp, Qwen36MoeRouterOp,
+    Qwen36ResidualNormOp, ResidualNormOp,
 };
 
 #[cfg(feature = "device")]

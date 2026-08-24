@@ -22,7 +22,11 @@ pub use paged_gqa::{
     paged_gqa_prefill_partitions,
 };
 pub(crate) use paged_gqa::{paged_gqa_ptx_names, qwen35_paged_gqa_ptx_names};
-pub use qk_prepare::{ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, Qwen35AttentionQkPrepareOp};
+pub use qk_prepare::{
+    ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, Qwen35AttentionQkPrepareOp,
+    Qwen36AttentionQkPrepareOp,
+};
 pub(crate) use qk_prepare::{
     attention_qk_prepare_ptx_names, qwen35_attention_qk_prepare_ptx_names,
+    qwen36_attention_qk_prepare_ptx_names,
 };
