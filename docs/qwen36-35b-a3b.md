@@ -166,8 +166,9 @@ represented-value dots including scale-layout seams, preserves 13,905,920 inacti
 proves its 286,064,640 weight bytes immutable with stable addresses and no post-warmup growth.
 The eight A16 entries use 40--111 registers, 9,216 bytes shared, and zero stack/local memory; their
 pinned PTX/SASS retains represented E2M1 conversion, warp reduction, and BF16 publication. Direct
-timing remains unreported because the available card was occupied. The source-backed endpoint owner
-remains unimplemented.
+timing remains unreported because the available card was occupied. Exact endpoint bindings retain
+the mmap-backed BF16 embeddings/final norm and losslessly swizzle the LM-head E4M3 plane while
+borrowing its packed E2M1 words. The resident endpoint owner remains unimplemented.
 
 ## Implementation order
 

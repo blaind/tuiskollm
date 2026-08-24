@@ -1969,6 +1969,44 @@ impl<'a> Bf16TextEndpointBindings<'a> {
     }
 }
 
+/// Exact source planes for the Qwen3.6 text endpoints.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen36TextEndpointBindings<'a> {
+    /// BF16 token embedding matrix `[vocab, hidden]`.
+    pub embedding: Bf16View<'a, 2>,
+    /// BF16 final RMSNorm weights `[hidden]`.
+    pub final_norm: Bf16View<'a, 1>,
+    /// ModelOpt NVFP4 language-model head `[vocab, hidden]`.
+    pub lm_head: ModelOptNvfp4LinearBindings<'a>,
+}
+
+impl<'a> Qwen36TextEndpointBindings<'a> {
+    /// Binds the exact Qwen3.6 embedding, final norm, and NVFP4 LM head.
+    pub fn bind(snapshot: &'a CheckpointSnapshot<Qwen36Moe35B>) -> CheckpointResult<Self> {
+        Self::bind_from(Qwen36Moe35B::VOCAB, Qwen36Moe35B::HIDDEN, |name| {
+            snapshot.tensor(name)
+        })
+    }
+
+    fn bind_from(
+        vocab: usize,
+        hidden: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        Ok(Self {
+            embedding: Bf16View::bind(tensor(EMBEDDING)?, [vocab as u64, hidden as u64])?,
+            final_norm: Bf16View::bind(tensor(FINAL_NORM)?, [hidden as u64])?,
+            lm_head: ModelOptNvfp4LinearBindings::bind_from(
+                "lm_head",
+                vocab,
+                hidden,
+                Qwen36Moe35B::LAYERS,
+                |name| tensor(name),
+            )?,
+        })
+    }
+}
+
 /// Shape- and dtype-checked source views for the text input and output endpoints.
 #[derive(Clone, Copy, Debug)]
 pub struct TextEndpointBindings<'a> {
@@ -2227,14 +2265,15 @@ fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> Checkpo
 mod tests {
     use super::{
         Bf16TextEndpointBindings, DenseFp8DownBindings, DenseFp8GateUpBindings,
-        DenseFp8MlpBindings, E2M1_VALUES_PER_BYTE, FullAttentionPostBindings,
-        FullAttentionQkvBindings, GdnBindings, ModelOptNvfp4AttentionBindings,
-        ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings, MtpBindings, NVFP4_GROUP_SIZE,
-        Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings, Qwen36FullAttentionBindings,
-        Qwen36GdnBindings, Qwen36MoeLayerBindings, TextEndpointBindings, VisionBindings,
-        dense_fp8_next_norm_name, positive_bf16, qwen36_next_norm_name, require_adjacent,
-        require_dense_fp8_mlp_layer, require_full_attention_layer, require_gdn_layer,
-        require_mtp_contract, require_nvfp4_mlp_layer, validate_nvfp4_scales,
+        DenseFp8MlpBindings, E2M1_VALUES_PER_BYTE, EMBEDDING, FINAL_NORM,
+        FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings, LM_HEAD, LM_HEAD_SCALE,
+        ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings,
+        MtpBindings, NVFP4_GROUP_SIZE, Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings,
+        Qwen36FullAttentionBindings, Qwen36GdnBindings, Qwen36MoeLayerBindings,
+        Qwen36TextEndpointBindings, TextEndpointBindings, VisionBindings, dense_fp8_next_norm_name,
+        positive_bf16, qwen36_next_norm_name, require_adjacent, require_dense_fp8_mlp_layer,
+        require_full_attention_layer, require_gdn_layer, require_mtp_contract,
+        require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
     use crate::{
         Arch, CheckpointContract, CheckpointErrorCode, CheckpointResult, CheckpointSnapshot, DType,
@@ -2401,6 +2440,36 @@ mod tests {
         ] {
             append_bf16_tensor(&mut header, &mut payload, name, shape);
         }
+
+        (Value::Object(header), payload)
+    }
+
+    fn qwen36_endpoint_fixture() -> (Value, Vec<u8>) {
+        const VOCAB: usize = 128;
+        const HIDDEN: usize = 64;
+
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+        append_bf16_tensor(&mut header, &mut payload, EMBEDDING, vec![VOCAB, HIDDEN]);
+        append_bf16_tensor(&mut header, &mut payload, FINAL_NORM, vec![HIDDEN]);
+        append_rank_zero_f32(&mut header, &mut payload, "lm_head.input_scale", 0.25);
+        append_raw_tensor(
+            &mut header,
+            &mut payload,
+            LM_HEAD,
+            "U8",
+            vec![VOCAB, HIDDEN / E2M1_VALUES_PER_BYTE],
+            0x21,
+        );
+        append_raw_tensor(
+            &mut header,
+            &mut payload,
+            LM_HEAD_SCALE,
+            "F8_E4M3",
+            vec![VOCAB, HIDDEN / NVFP4_GROUP_SIZE],
+            0x38,
+        );
+        append_rank_zero_f32(&mut header, &mut payload, "lm_head.weight_scale_2", 0.125);
 
         (Value::Object(header), payload)
     }
@@ -3431,6 +3500,29 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
         assert!(error.to_string().contains("text endpoints"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn binds_exact_qwen36_text_endpoint_contract() {
+        const VOCAB: usize = 128;
+        const HIDDEN: usize = 64;
+
+        let path = fixture_path("qwen36-endpoints");
+        let (header, payload) = qwen36_endpoint_fixture();
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let bindings =
+            Qwen36TextEndpointBindings::bind_from(VOCAB, HIDDEN, |name| file.tensor(name)).unwrap();
+
+        assert_eq!(bindings.embedding.shape(), &[VOCAB as u64, HIDDEN as u64]);
+        assert_eq!(bindings.final_norm.shape(), &[HIDDEN as u64]);
+        assert_eq!(bindings.lm_head.weight.shape(), &[VOCAB as u64, 32]);
+        assert_eq!(bindings.lm_head.block_scale.shape(), &[VOCAB as u64, 4]);
+        assert_eq!(bindings.lm_head.input_scale.value(0), Some(0.25));
+        assert_eq!(bindings.lm_head.weight_scale_2.value(0), Some(0.125));
 
         fs::remove_file(path).unwrap();
     }
