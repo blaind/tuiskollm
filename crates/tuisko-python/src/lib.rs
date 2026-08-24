@@ -37,6 +37,7 @@ create_exception!(
 #[derive(Clone, Debug)]
 struct PromptEncoding {
     token_ids: Vec<u32>,
+    message_boundary_tokens: usize,
     reused_tokens: usize,
     rendered_bytes: usize,
     fresh_bytes: usize,
@@ -46,6 +47,7 @@ impl From<RustPromptEncoding> for PromptEncoding {
     fn from(encoding: RustPromptEncoding) -> Self {
         Self {
             token_ids: encoding.token_ids,
+            message_boundary_tokens: encoding.message_boundary_tokens,
             reused_tokens: encoding.reused_tokens,
             rendered_bytes: encoding.rendered_bytes,
             fresh_bytes: encoding.fresh_bytes,
@@ -57,8 +59,9 @@ impl From<RustPromptEncoding> for PromptEncoding {
 impl PromptEncoding {
     fn __repr__(&self) -> String {
         format!(
-            "PromptEncoding(tokens={}, reused_tokens={}, rendered_bytes={}, fresh_bytes={})",
+            "PromptEncoding(tokens={}, message_boundary_tokens={}, reused_tokens={}, rendered_bytes={}, fresh_bytes={})",
             self.token_ids.len(),
+            self.message_boundary_tokens,
             self.reused_tokens,
             self.rendered_bytes,
             self.fresh_bytes

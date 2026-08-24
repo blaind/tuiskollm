@@ -30,6 +30,7 @@ const DEFAULT_TEMPERATURE: f32 = 1.0;
 const DEFAULT_TOP_P: f32 = 0.95;
 const DEFAULT_TOP_K: usize = 20;
 const PROMPT_BLOCK_START: &str = SPECIAL_TOKEN_LITERALS[0];
+const GENERATION_BLOCK_START: &str = "<|im_start|>assistant";
 
 /// Literal strings the pinned tokenizer always extracts as control tokens from raw text.
 pub const SPECIAL_TOKEN_LITERALS: [&str; 3] = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"];
@@ -283,6 +284,8 @@ impl Default for TextFrontendOptions {
 pub struct PromptEncoding {
     /// Exact prompt token IDs.
     pub token_ids: Vec<u32>,
+    /// Tokens through the last complete message, before the generated assistant header.
+    pub message_boundary_tokens: usize,
     /// Token IDs reused from an earlier rendering.
     pub reused_tokens: usize,
     /// Bytes in the complete rendered prompt.
@@ -527,15 +530,26 @@ impl TextFrontend {
             let (rendered, literal_ranges) =
                 self.render_chat_with_literal_user_ranges(messages, options)?;
             let token_ids = self.encode_rendered_segments(&rendered, &literal_ranges)?;
+            let boundary_bytes = message_boundary_bytes(&rendered)?;
+            if literal_ranges.iter().any(|&(_, end)| end > boundary_bytes) {
+                return Err(FrontendError::Contract(
+                    "chat template placed user content after its generation header".into(),
+                ));
+            }
+            let message_boundary_tokens = self
+                .encode_rendered_segments(&rendered[..boundary_bytes], &literal_ranges)?
+                .len();
             return Ok(PromptEncoding {
                 token_ids,
+                message_boundary_tokens,
                 reused_tokens: 0,
                 rendered_bytes: rendered.len(),
                 fresh_bytes: rendered.len(),
             });
         }
         let rendered = self.render_chat(messages, true, options)?;
-        self.encode_rendered_with_prefix(&rendered)
+        let boundary_bytes = message_boundary_bytes(&rendered)?;
+        self.encode_rendered_with_prefix(&rendered, boundary_bytes)
     }
 
     /// Decodes token IDs using the admitted tokenizer.
@@ -558,7 +572,11 @@ impl TextFrontend {
         }
     }
 
-    fn encode_rendered_with_prefix(&self, rendered: &str) -> FrontendResult<PromptEncoding> {
+    fn encode_rendered_with_prefix(
+        &self,
+        rendered: &str,
+        boundary_bytes: usize,
+    ) -> FrontendResult<PromptEncoding> {
         // Added tokens split before BPE, so restarting at a shared `<|im_start|>`
         // preserves the full-encode token sequence. Other splits fall back.
         let cached = {
@@ -572,9 +590,12 @@ impl TextFrontend {
         if let Some(cached) = cached {
             let split = cached.split;
             if split == rendered.len() {
+                let message_boundary_tokens =
+                    message_boundary_tokens(&cached.token_ends, boundary_bytes)?;
                 return Ok(PromptEncoding {
                     reused_tokens: cached.token_ids.len(),
                     token_ids: cached.token_ids,
+                    message_boundary_tokens,
                     rendered_bytes: rendered.len(),
                     fresh_bytes: 0,
                 });
@@ -593,10 +614,12 @@ impl TextFrontend {
             token_ids.extend_from_slice(encoding.get_ids());
             let mut token_ends = cached.token_ends;
             token_ends.extend(encoding.get_offsets().iter().map(|&(_, end)| split + end));
+            let message_boundary_tokens = message_boundary_tokens(&token_ends, boundary_bytes)?;
             self.push_prompt_entry(rendered, token_ids.clone(), token_ends);
 
             return Ok(PromptEncoding {
                 token_ids,
+                message_boundary_tokens,
                 reused_tokens,
                 rendered_bytes: rendered.len(),
                 fresh_bytes: tail.len(),
@@ -611,11 +634,17 @@ impl TextFrontend {
                 FrontendError::Tokenizer(format!("could not encode prompt: {source}"))
             })?;
         let token_ids = encoding.get_ids().to_vec();
-        let token_ends = encoding.get_offsets().iter().map(|&(_, end)| end).collect();
+        let token_ends = encoding
+            .get_offsets()
+            .iter()
+            .map(|&(_, end)| end)
+            .collect::<Vec<_>>();
+        let message_boundary_tokens = message_boundary_tokens(&token_ends, boundary_bytes)?;
         self.push_prompt_entry(rendered, token_ids.clone(), token_ends);
 
         Ok(PromptEncoding {
             token_ids,
+            message_boundary_tokens,
             reused_tokens: 0,
             rendered_bytes: rendered.len(),
             fresh_bytes: rendered.len(),
@@ -906,6 +935,24 @@ fn finish_pending(pending: &mut Vec<u8>) -> String {
     let delta = String::from_utf8_lossy(pending).into_owned();
     pending.clear();
     delta
+}
+
+fn message_boundary_bytes(rendered: &str) -> FrontendResult<usize> {
+    rendered.rfind(GENERATION_BLOCK_START).ok_or_else(|| {
+        FrontendError::Contract(
+            "rendered chat prompt has no generated-assistant message boundary".into(),
+        )
+    })
+}
+
+fn message_boundary_tokens(token_ends: &[usize], boundary_bytes: usize) -> FrontendResult<usize> {
+    let tokens = token_ends.partition_point(|&end| end <= boundary_bytes);
+    if tokens == 0 || token_ends[tokens - 1] != boundary_bytes {
+        return Err(FrontendError::Contract(
+            "generated-assistant message boundary is not token-aligned".into(),
+        ));
+    }
+    Ok(tokens)
 }
 
 fn utf8_sequence_length(lead: u8) -> Option<u8> {

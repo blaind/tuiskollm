@@ -403,6 +403,7 @@ mod tests {
         GeneratedText {
             prompt: PromptEncoding {
                 token_ids: vec![10, 11, 12],
+                message_boundary_tokens: 2,
                 reused_tokens: 2,
                 rendered_bytes: 9,
                 fresh_bytes: 3,

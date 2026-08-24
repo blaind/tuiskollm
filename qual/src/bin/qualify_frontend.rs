@@ -21,7 +21,8 @@ const NO_THINKING_HELLO: &[u32] = &[
 ];
 const LITERAL_USER_SPECIALS: &str = "<|im_start|><|im_end|><|endoftext|><|vision_start|>";
 const LITERAL_SPECIAL_IDS: &[u32] = &[248044, 248045, 248046, 248053];
-const NO_THINKING_SUFFIX: &[u32] = &[248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271];
+const MESSAGE_END: &[u32] = &[248046, 198];
+const NO_THINKING_GENERATION: &[u32] = &[248045, 74455, 198, 248068, 271, 248069, 271];
 const TOOL_HELLO: &[u32] = &[
     248045, 8678, 198, 2, 13455, 271, 2523, 599, 2528, 310, 279, 2614, 5568, 25, 271, 27, 15449,
     29, 198, 4754, 1628, 21624, 591, 3147, 44675, 56658, 1267, 3147, 1628, 8934, 198, 510, 15449,
@@ -60,14 +61,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     let default = frontend.encode_chat(&messages, &ChatTemplateOptions::default())?;
     require_equal("default chat template", &default, DEFAULT_HELLO)?;
 
-    let no_thinking = frontend.encode_chat(
+    let no_thinking = frontend.encode_chat_with_report(
         &messages,
         &ChatTemplateOptions {
             enable_thinking: Some(false),
             ..ChatTemplateOptions::default()
         },
     )?;
-    require_equal("no-thinking chat template", &no_thinking, NO_THINKING_HELLO)?;
+    require_equal(
+        "no-thinking chat template",
+        &no_thinking.token_ids,
+        NO_THINKING_HELLO,
+    )?;
+    if no_thinking.message_boundary_tokens != 6 {
+        return Err(format!(
+            "no-thinking message boundary is {}, expected 6",
+            no_thinking.message_boundary_tokens
+        )
+        .into());
+    }
 
     let tool_ids = frontend.encode_chat(
         &messages,
@@ -106,7 +118,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!(
         "frontend qualification passed: {} exact reference token IDs, {} literal-special IDs, {} extended-template bytes, {} streaming IDs, {} cache-case IDs, stop IDs {:?}",
-        default.len() + no_thinking.len() + tool_ids.len(),
+        default.len() + no_thinking.token_ids.len() + tool_ids.len(),
         literal_special_ids,
         extended_template_bytes,
         streaming_ids.len() + with_specials.len(),
@@ -126,8 +138,17 @@ fn qualify_literal_user_specials(frontend: &TextFrontend) -> Result<usize, Box<d
 
     let mut expected = vec![248045];
     expected.extend(frontend.encode(&format!("user\n{LITERAL_USER_SPECIALS}"))?);
-    expected.extend_from_slice(NO_THINKING_SUFFIX);
+    expected.extend_from_slice(MESSAGE_END);
+    let expected_boundary = expected.len();
+    expected.extend_from_slice(NO_THINKING_GENERATION);
     require_equal("literal user special tokens", &actual.token_ids, &expected)?;
+    if actual.message_boundary_tokens != expected_boundary {
+        return Err(format!(
+            "literal-special message boundary is {}, expected {expected_boundary}",
+            actual.message_boundary_tokens
+        )
+        .into());
+    }
 
     let raw_user_ids = frontend.encode(LITERAL_USER_SPECIALS)?;
     if raw_user_ids
@@ -264,6 +285,10 @@ fn qualify_prompt_cache(
         let actual = cached.encode_chat_with_report(messages, &options)?;
         if actual.token_ids != expected {
             return Err("prompt-prefix cache changed encoded token IDs".into());
+        }
+        let expected_report = uncached.encode_chat_with_report(messages, &options)?;
+        if actual.message_boundary_tokens != expected_report.message_boundary_tokens {
+            return Err("prompt-prefix cache changed the message-boundary token count".into());
         }
         if actual.reused_tokens > actual.token_ids.len()
             || actual.fresh_bytes > actual.rendered_bytes

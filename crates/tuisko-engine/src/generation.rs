@@ -127,6 +127,11 @@ impl GenerationSession {
         &self.prompt.token_ids
     }
 
+    /// Exact prompt prefix through the last complete chat message.
+    pub fn message_boundary_token_ids(&self) -> &[u32] {
+        &self.prompt.token_ids[..self.prompt.message_boundary_tokens]
+    }
+
     /// Prompt-cache accounting for request instrumentation.
     pub const fn prompt_encoding(&self) -> &PromptEncoding {
         &self.prompt
