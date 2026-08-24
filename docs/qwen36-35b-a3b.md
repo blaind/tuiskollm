@@ -116,10 +116,16 @@ Every decode and prompt route passes the independent control/convolution oracle,
 inactive sentinels, immutable inputs, stable-address, and zero-growth checks. All 14 entries use
 zero stack/local memory. At a diagnostic 2,115 MHz median SM clock, its unblessed intrinsic prompt
 path measures 3.739/4.689/6.259 us and its complete graph measures 6.140/6.148/8.192 us at
-T=32/64/128. The next FP32 recurrence stage can share the same geometry only after its causal
-prompt oracle closes that arithmetic separately. Compile-time geometry assertions and separate
-Qwen3.6 oracle entry points make shared binaries executable rather than conventional. The final
-GDN projection preserves its source E4M3 `[2048,4096]` plane and static
+T=32/64/128. The FP32 recurrence stage shares that geometry through a separate causal prompt
+oracle covering every exact `B=1..8` and
+`T=32/64/128` route through one mapped causal state. It compares 20,447,232 FP32 state values and
+1,064,960 BF16 gated-normalized outputs with the independent FP64 formula, then checks eager/graph
+agreement, inactive state rows, stable addresses, and zero post-warmup growth. The three prompt
+entries use 48 registers with zero stack/local memory. At locked 2,197/13,801 MHz SM/memory
+clocks, their unblessed direct graphs measure 168.134/330.475/654.471 us at T=32/64/128 after an
+untimed exact-state restore; B=1/8 measure 11.372/13.864 us. Compile-time geometry assertions and
+separate Qwen3.6 oracle entry points make the shared binary contract executable rather than
+conventional. The final GDN projection preserves its source E4M3 `[2048,4096]` plane and static
 FP8 scales. Its exact `B=1..8` routes pass 147,456 activation-code, 73,728 FP64-formula output,
 221,184 graph-replay, and 344,064 inactive-sentinel comparisons while retaining immutable sources,
 stable addresses, and zero post-warmup growth. All 16 entries have zero stack/local memory. At a

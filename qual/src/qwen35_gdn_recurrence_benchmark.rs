@@ -1,24 +1,27 @@
-//! Paired timings for exact Qwen3.5 GDN recurrence routes.
+//! Paired timings for exact Qwen3.5/Qwen3.6 GDN recurrence routes.
 
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
     DeviceBenchmarkOptions, DeviceBenchmarkReport, ExactDeviceCase, MemoryRecorder,
-    OperationAccounting, RepeatedGraph, finish_report, generator_baseline_sha256, measure_cases,
-    preflight, require_current_process_exclusive, warmup_launches,
+    OperationAccounting, finish_report, generator_baseline_sha256, measure_cases, preflight,
+    require_current_process_exclusive, warmup_launches,
 };
 use crate::qwen35_gdn_recurrence::{
-    HEAD_DIM, MAX_BATCH, Regions, STATE_PER_ROW, VALUE_HEADS, VALUE_WIDTH, launch, layout,
-    make_fixture, upload_fixture,
+    EXACT_ROUTES, HEAD_DIM, MAX_BATCH, Regions, STATE_PER_ROW, VALUE_HEADS, VALUE_WIDTH, launch,
+    layout, make_fixture, upload_fixture,
 };
 use crate::target::Qwen35GdnRecurrenceOp;
 use std::sync::Arc;
-use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer};
+use tuisko_gpu::{
+    CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer,
+    PinnedHostBuffer,
+};
 use tuisko_model::{Arch, Qwen35_9B};
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
+    preparation: CudaGraph,
     leaf: CudaGraph,
-    repeated: CudaGraph,
 }
 
 #[derive(Clone, Copy)]
@@ -70,12 +73,13 @@ struct Session {
     _op: Qwen35GdnRecurrenceOp,
     arena: DeviceArena,
     regions: Regions,
+    _state_seed: PinnedHostBuffer<f32>,
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
 }
 
 impl Session {
-    fn new(repeated_operations: u64) -> Result<Self, DeviceBenchmarkError> {
+    fn new() -> Result<Self, DeviceBenchmarkError> {
         let context = CudaContext::new(0).map_err(GpuError::from)?;
         let capability = context.compute_capability().map_err(GpuError::from)?;
         if capability != (12, 0) {
@@ -90,10 +94,13 @@ impl Session {
         let arena = DeviceArena::zeroed(&stream, &layout)?;
         let fixture = make_fixture();
         upload_fixture(&arena, &stream, regions, &fixture)?;
+        let state_seed =
+            PinnedHostBuffer::from_slice(&context, &fixture.state).map_err(GpuError::from)?;
         stream.synchronize().map_err(GpuError::from)?;
         let op = Qwen35GdnRecurrenceOp::new(&context)?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| capture_route(&op, &arena, &stream, regions, batch, repeated_operations))
+        let routes = EXACT_ROUTES
+            .iter()
+            .map(|&rows| capture_route(&op, &arena, &stream, regions, &state_seed, rows))
             .collect::<GpuResult<Vec<_>>>()?;
 
         Ok(Self {
@@ -102,6 +109,7 @@ impl Session {
             _op: op,
             arena,
             regions,
+            _state_seed: state_seed,
             stream,
             _context: context,
         })
@@ -111,28 +119,38 @@ impl Session {
         for _ in 0..launches {
             for route in &self.routes {
                 // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
+                unsafe { route.preparation.launch(&self.stream) }?;
+                // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
                 unsafe { route.leaf.launch(&self.stream) }?;
             }
         }
         self.stream.synchronize().map_err(GpuError::from)
     }
 
-    fn cases(&self, target: Target, repeated_operations: u64) -> Vec<ExactDeviceCase<'_>> {
+    fn cases(&self, target: Target) -> Vec<ExactDeviceCase<'_>> {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     target.route(),
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
                     &route.leaf,
-                    Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
+                    None,
                 )
+                .with_preparation(&route.preparation)
             })
             .collect()
     }
@@ -143,21 +161,27 @@ fn capture_route(
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
-    batch: usize,
-    repeated_operations: u64,
+    state_seed: &PinnedHostBuffer<f32>,
+    rows: usize,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch))?;
-    let repeated = CudaGraph::capture(stream, || {
-        for _ in 0..repeated_operations {
-            launch(op, arena, stream, regions, batch)?;
+    let preparation = CudaGraph::capture(stream, || {
+        // SAFETY: Session owns the immutable pinned seed through every graph
+        // replay, and the region covers the complete eight-row state owner.
+        unsafe {
+            arena.copy_prefix_from_pinned_host_async(
+                stream,
+                regions.state,
+                state_seed,
+                state_seed.len(),
+            )
         }
-        Ok(())
     })?;
+    let leaf = CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows))?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
+        preparation,
         leaf,
-        repeated,
     })
 }
 
@@ -194,7 +218,7 @@ fn benchmark(
     let warmup_launches = warmup_launches(options)?;
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
-    let session = Session::new(options.launches_per_sample)?;
+    let session = Session::new()?;
     let weight_bytes = session.regions.weight_bytes();
     let padding_bytes = session.arena.byte_len() - session.regions.payload_bytes();
     memory.register_owned(
@@ -207,7 +231,7 @@ fn benchmark(
         target.workspace(),
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes - padding_bytes,
-        "eight FP32 state rows and exact-B workspace",
+        "eight FP32 state rows and max_rows=128 workspace",
     )?;
     memory.register_owned(
         target.padding(),
@@ -219,7 +243,7 @@ fn benchmark(
     session.warm(warmup_launches)?;
     memory.capture("after_warmup")?;
     require_current_process_exclusive()?;
-    let cases = session.cases(target, options.launches_per_sample);
+    let cases = session.cases(target);
     let (metrics, energy_metrics, telemetry) =
         measure_cases(&session.stream, &session.timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
@@ -228,7 +252,7 @@ fn benchmark(
         BenchmarkReportSpec {
             suite: target.suite(),
             classification: "performance_sensitive_stateful_leaf",
-            timing_scope: "paired Rust submission/completion, production graph, and repeated-operation graph",
+            timing_scope: "paired Rust submission/completion and production graph after untimed exact-state restore",
         },
         preflight,
         baseline_sha256,
@@ -243,6 +267,7 @@ fn benchmark(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qwen35_gdn_recurrence::MAX_ROWS;
 
     #[test]
     fn accounting_covers_the_complete_state_transition() {
@@ -250,5 +275,7 @@ mod tests {
 
         assert_eq!(logical_bytes(1), 256 + per_token);
         assert_eq!(logical_bytes(MAX_BATCH), 256 + MAX_BATCH * per_token);
+        assert_eq!(logical_bytes(MAX_ROWS), 256 + MAX_ROWS * per_token);
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
     }
 }
