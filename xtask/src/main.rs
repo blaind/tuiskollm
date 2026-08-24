@@ -703,6 +703,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen36-moe-experts") if remaining.is_empty() => {
             qualify_qwen36_moe_experts(root)
         }
+        Some("qualify-qwen36-fp8-qkv") if remaining.is_empty() => qualify_qwen36_fp8_qkv(root),
         Some("qualify-qwen36-gdn-input") if remaining.is_empty() => qualify_qwen36_gdn_input(root),
         Some("qualify-qwen36-gdn-output") if remaining.is_empty() => {
             qualify_qwen36_gdn_output(root)
@@ -1575,6 +1576,31 @@ fn qualify_qwen36_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
     )?;
     gate_qwen36_gdn_input(root)
+}
+
+fn qualify_qwen36_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen36_fp8_qkv",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )
 }
 
 fn qualify_qwen36_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
