@@ -112,6 +112,28 @@ impl Drop for PodGuard {
     }
 }
 
+struct SshTarget {
+    key_file: PathBuf,
+    host: String,
+    port: u16,
+    user: String,
+}
+
+impl SshTarget {
+    fn connect_with_retries(&self, deadline: Instant) -> RemoteResult<Ssh> {
+        loop {
+            match Ssh::connect(&self.key_file, &self.host, self.port, &self.user) {
+                Ok(ssh) => return Ok(ssh),
+                Err(error) if Instant::now() < deadline => {
+                    eprintln!("SSH not ready ({error}); retrying in 5s");
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 /// Validates the local API and SSH credentials before an expensive build.
 pub fn check_credentials() -> RemoteResult<()> {
     let _ = resolve_api_key()?;
@@ -145,7 +167,7 @@ pub fn run_probe(options: &ProbeOptions) -> RemoteResult<()> {
     let started = Instant::now();
     let budget = Duration::from_secs(u64::from(options.max_minutes) * 60);
     let provisioning_deadline = started + PROVISIONING_DEADLINE.min(budget);
-    let (guard, ssh, pod_id, cost_per_hour) = open_pod(
+    let (guard, mut ssh, target, pod_id, cost_per_hour) = open_pod(
         &api,
         options.gpu,
         &options.image,
@@ -154,7 +176,7 @@ pub fn run_probe(options: &ProbeOptions) -> RemoteResult<()> {
         budget,
         provisioning_deadline,
     )?;
-    wait_for_precheck(&ssh, options.gpu, provisioning_deadline)?;
+    wait_for_precheck(&mut ssh, &target, options.gpu, provisioning_deadline)?;
 
     finish_run(&api, guard, &pod_id, 0, started, cost_per_hour)
 }
@@ -187,7 +209,7 @@ pub fn run_qualification(
     let started = Instant::now();
     let budget = Duration::from_secs(u64::from(options.max_minutes) * 60);
     let provisioning_deadline = started + PROVISIONING_DEADLINE.min(budget);
-    let (mut guard, ssh, pod_id, cost_per_hour) = open_pod(
+    let (mut guard, mut ssh, target, pod_id, cost_per_hour) = open_pod(
         &api,
         options.gpu,
         &options.image,
@@ -197,7 +219,7 @@ pub fn run_qualification(
         provisioning_deadline,
     )?;
 
-    wait_for_precheck(&ssh, options.gpu, provisioning_deadline)?;
+    wait_for_precheck(&mut ssh, &target, options.gpu, provisioning_deadline)?;
 
     let elapsed = started.elapsed();
     let run_seconds = budget
@@ -276,7 +298,7 @@ pub fn run_benchmark(workspace_root: &Path, options: &BenchmarkOptions) -> Remot
     let started = Instant::now();
     let budget = Duration::from_secs(u64::from(options.max_minutes) * 60);
     let provisioning_deadline = started + PROVISIONING_DEADLINE.min(budget);
-    let (mut guard, ssh, pod_id, cost_per_hour) = open_pod(
+    let (mut guard, mut ssh, target, pod_id, cost_per_hour) = open_pod(
         &api,
         options.gpu,
         &options.image,
@@ -286,7 +308,7 @@ pub fn run_benchmark(workspace_root: &Path, options: &BenchmarkOptions) -> Remot
         provisioning_deadline,
     )?;
 
-    wait_for_precheck(&ssh, options.gpu, provisioning_deadline)?;
+    wait_for_precheck(&mut ssh, &target, options.gpu, provisioning_deadline)?;
 
     let elapsed = started.elapsed();
     let run_seconds = budget
@@ -435,7 +457,7 @@ fn open_pod(
     key_file: PathBuf,
     budget: Duration,
     deadline: Instant,
-) -> RemoteResult<(PodGuard, Ssh, String, Option<f64>)> {
+) -> RemoteResult<(PodGuard, Ssh, SshTarget, String, Option<f64>)> {
     let ownership_directory = ownership_directory()?;
     let name = leased_pod_name(unix_seconds(), budget, keep_on_fail);
     println!("creating {name} (1x secure {})", gpu.device_name());
@@ -476,21 +498,23 @@ fn open_pod(
         .filter(|user| !user.is_empty())
         .unwrap_or_else(|| "root".to_owned());
     println!("direct ssh/sftp: {user}@{host}:{port}");
-    let ssh = loop {
-        match Ssh::connect(&key_file, &host, port, &user) {
-            Ok(ssh) => break ssh,
-            Err(error) if Instant::now() < deadline => {
-                eprintln!("SSH not ready ({error}); retrying in 5s");
-                std::thread::sleep(Duration::from_secs(5));
-            }
-            Err(error) => return Err(error),
-        }
+    let target = SshTarget {
+        key_file,
+        host,
+        port,
+        user,
     };
+    let ssh = target.connect_with_retries(deadline)?;
 
-    Ok((guard, ssh, pod_id, cost))
+    Ok((guard, ssh, target, pod_id, cost))
 }
 
-fn wait_for_precheck(ssh: &Ssh, gpu: GpuTarget, deadline: Instant) -> RemoteResult<()> {
+fn wait_for_precheck(
+    ssh: &mut Ssh,
+    target: &SshTarget,
+    gpu: GpuTarget,
+    deadline: Instant,
+) -> RemoteResult<()> {
     loop {
         match precheck(ssh, gpu) {
             Ok(()) => return Ok(()),
@@ -498,6 +522,9 @@ fn wait_for_precheck(ssh: &Ssh, gpu: GpuTarget, deadline: Instant) -> RemoteResu
             Err(error) if Instant::now() < deadline => {
                 eprintln!("pod not ready ({error}); retrying in 5s");
                 std::thread::sleep(Duration::from_secs(5));
+                if matches!(error, RemoteError::Ssh { .. } | RemoteError::SshIo { .. }) {
+                    *ssh = target.connect_with_retries(deadline)?;
+                }
             }
             Err(error) => return Err(error),
         }
