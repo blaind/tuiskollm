@@ -722,21 +722,80 @@ impl DeviceArena {
         source: ArenaRegion<T>,
         len: usize,
     ) -> GpuResult<()> {
+        unsafe {
+            self.copy_slice_from_arena_async(stream, destination, 0, source_arena, source, 0, len)
+        }
+    }
+
+    /// Enqueues a typed subrange copy between two checked arena regions.
+    ///
+    /// # Safety
+    ///
+    /// Both arenas must remain live until the stream reaches the copy. Captured copies require
+    /// stable arena addresses through their final replay. The selected subranges must not overlap
+    /// unless their addresses are identical.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn copy_slice_from_arena_async<T: DeviceCopy>(
+        &self,
+        stream: &CudaStream,
+        destination: ArenaRegion<T>,
+        destination_start: usize,
+        source_arena: &DeviceArena,
+        source: ArenaRegion<T>,
+        source_start: usize,
+        len: usize,
+    ) -> GpuResult<()> {
         self.require_stream_context(stream, "copying between device arenas")?;
         source_arena.require_stream_context(stream, "copying between device arenas")?;
-        if len > destination.len || len > source.len {
+        let destination_end = destination_start
+            .checked_add(len)
+            .ok_or_else(|| GpuError::arena("device-copy destination subrange overflows"))?;
+        let source_end = source_start
+            .checked_add(len)
+            .ok_or_else(|| GpuError::arena("device-copy source subrange overflows"))?;
+        if destination_end > destination.len || source_end > source.len {
             return Err(GpuError::arena(format!(
-                "device copy length {len} exceeds destination {} or source {} elements",
-                destination.len, source.len
+                "device copy selects destination {destination_start}..{destination_end} of {} and source {source_start}..{source_end} of {} elements",
+                destination.len, source.len,
             )));
         }
-        let destination_address = self.address(destination)? as u64;
-        let source_address = source_arena.address(source)? as u64;
+        let destination_offset = destination_start
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena("device-copy destination byte offset overflows"))?;
+        let source_offset = source_start
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena("device-copy source byte offset overflows"))?;
+        let destination_address = (self.address(destination)? as u64)
+            .checked_add(u64::try_from(destination_offset).map_err(|_| {
+                GpuError::arena("device-copy destination offset exceeds the address width")
+            })?)
+            .ok_or_else(|| GpuError::arena("device-copy destination address overflows"))?;
+        let source_address = (source_arena.address(source)? as u64)
+            .checked_add(u64::try_from(source_offset).map_err(|_| {
+                GpuError::arena("device-copy source offset exceeds the address width")
+            })?)
+            .ok_or_else(|| GpuError::arena("device-copy source address overflows"))?;
         let bytes = len
             .checked_mul(size_of::<T>())
             .ok_or_else(|| GpuError::arena("device copy byte count overflows"))?;
         if bytes == 0 {
             return Ok(());
+        }
+        let bytes_u64 = u64::try_from(bytes)
+            .map_err(|_| GpuError::arena("device-copy byte count exceeds the address width"))?;
+        let destination_limit = destination_address
+            .checked_add(bytes_u64)
+            .ok_or_else(|| GpuError::arena("device-copy destination range overflows"))?;
+        let source_limit = source_address
+            .checked_add(bytes_u64)
+            .ok_or_else(|| GpuError::arena("device-copy source range overflows"))?;
+        if destination_address != source_address
+            && destination_address < source_limit
+            && source_address < destination_limit
+        {
+            return Err(GpuError::arena(
+                "device-copy source and destination subranges overlap",
+            ));
         }
 
         stream
@@ -1052,6 +1111,13 @@ mod tests {
         arena
             .copy_slice_from_host(&stream, values, 3, &[11, 22])
             .unwrap();
+        // SAFETY: the selected same-arena ranges are disjoint and the stream is synchronized by
+        // the following host download.
+        unsafe {
+            arena
+                .copy_slice_from_arena_async(&stream, values, 0, &arena, values, 3, 2)
+                .unwrap();
+        }
 
         let mut copied = [0; 2];
         arena
@@ -1065,8 +1131,8 @@ mod tests {
         assert_eq!(
             arena.copy_to_host(&stream, values).unwrap(),
             [
-                0xa5a5_a5a5,
-                0xa5a5_a5a5,
+                11,
+                22,
                 0xa5a5_a5a5,
                 11,
                 22,
@@ -1094,5 +1160,19 @@ mod tests {
         ] {
             assert_eq!(error.code(), GpuErrorCode::Arena);
         }
+        // SAFETY: these calls deliberately exercise checked range rejection before enqueue.
+        let overlap = unsafe {
+            arena
+                .copy_slice_from_arena_async(&stream, values, 0, &arena, values, 1, 2)
+                .unwrap_err()
+        };
+        // SAFETY: this deliberately exercises checked destination bounds before enqueue.
+        let out_of_bounds = unsafe {
+            arena
+                .copy_slice_from_arena_async(&stream, values, 7, &arena, values, 0, 2)
+                .unwrap_err()
+        };
+        assert_eq!(overlap.code(), GpuErrorCode::Arena);
+        assert_eq!(out_of_bounds.code(), GpuErrorCode::Arena);
     }
 }

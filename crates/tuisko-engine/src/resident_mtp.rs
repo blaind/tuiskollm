@@ -13,7 +13,7 @@ use tuisko_kernels_sm120::{
     ATTENTION_PAGE_SIZE, LmHeadOp, MtpBf16AttentionOutputOp, MtpBf16FusionOp, MtpBf16MlpOp,
     MtpBf16PagedGqaOp, MtpBf16QkPrepareOp, MtpBf16QkvOp, ResidualNormOp,
 };
-use tuisko_model::{Arch, MtpBindings, Qwen38_27B, TextEndpointBindings};
+use tuisko_model::{Arch, CheckpointSnapshot, MtpBindings, Qwen38_27B, TextEndpointBindings};
 
 const ROTARY_PAIRS: usize = 32;
 const PROMPT_ROUTES: [usize; 5] = [1, 32, 64, 128, MTP_PROMPT_ROWS];
@@ -96,6 +96,7 @@ struct Graphs {
     prompt: [CudaGraph; PROMPT_ROUTES.len()],
     draft: [CudaGraph; MAX_BATCH],
     continue_draft: [CudaGraph; MAX_BATCH],
+    staged_continue_draft: [CudaGraph; MAX_BATCH],
     prime: [CudaGraph; REALIGN_ROUTES],
     realign: [CudaGraph; REALIGN_ROUTES],
 }
@@ -119,6 +120,7 @@ pub struct ResidentMtpProgram {
     lengths_stager: PinnedHostBuffer<u32>,
     rope_cos_stager: PinnedHostBuffer<f32>,
     rope_sin_stager: PinnedHostBuffer<f32>,
+    continuation_hidden_stager: PinnedHostBuffer<u16>,
     target: ResidentModelProgram,
     context: Arc<CudaContext>,
     layout: ResidentMtpLayout,
@@ -347,20 +349,63 @@ struct Stagers<'a> {
     lengths: &'a PinnedHostBuffer<u32>,
     rope_cos: &'a PinnedHostBuffer<f32>,
     rope_sin: &'a PinnedHostBuffer<f32>,
+    continuation_hidden: &'a PinnedHostBuffer<u16>,
+}
+
+pub(crate) struct ResidentMtpArenaReservation {
+    layout: ResidentMtpLayout,
+    arena: DeviceArena,
+    cache_arena: DeviceArena,
+}
+
+impl ResidentMtpArenaReservation {
+    pub(crate) fn allocate(stream: &CudaStream) -> EngineResult<Self> {
+        let layout = ResidentMtpLayout::build()?;
+        let arena = DeviceArena::zeroed(stream, layout.arena())?;
+        let cache_arena = DeviceArena::zeroed(stream, layout.cache_arena())?;
+        Ok(Self {
+            layout,
+            arena,
+            cache_arena,
+        })
+    }
 }
 
 impl ResidentMtpProgram {
+    /// Loads the target and MTP arenas before either owner instantiates its resident graphs.
+    pub fn from_snapshot(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+    ) -> EngineResult<Self> {
+        let (target, reservation) =
+            ResidentModelProgram::from_snapshot_reserving_mtp(context, snapshot)?;
+        Self::from_target_reservation(target, reservation)
+    }
+
     /// Adds one exact resident MTP owner around an already-loaded target program.
     pub fn from_target(target: ResidentModelProgram) -> EngineResult<Self> {
         let context = target.context().clone();
+        let stream = context.new_stream().map_err(GpuError::from)?;
+        let reservation = ResidentMtpArenaReservation::allocate(&stream)?;
+        stream.synchronize().map_err(GpuError::from)?;
+        Self::from_target_reservation(target, reservation)
+    }
+
+    fn from_target_reservation(
+        target: ResidentModelProgram,
+        reservation: ResidentMtpArenaReservation,
+    ) -> EngineResult<Self> {
+        let context = target.context().clone();
         let mtp = MtpBindings::bind(target.snapshot().as_ref())?;
         let qkv = mtp.materialize_qkv()?;
-        let layout = ResidentMtpLayout::build()?;
+        let ResidentMtpArenaReservation {
+            layout,
+            arena,
+            cache_arena,
+        } = reservation;
         let regions = layout.regions();
         let cache_regions = layout.cache_regions();
         let stream = context.new_stream().map_err(GpuError::from)?;
-        let arena = DeviceArena::zeroed(&stream, layout.arena())?;
-        let cache_arena = DeviceArena::zeroed(&stream, layout.cache_arena())?;
 
         arena.copy_region_bytes_from_host(
             &stream,
@@ -422,6 +467,15 @@ impl ResidentMtpProgram {
             PinnedHostBuffer::zeroed(&context, rotary_values).map_err(GpuError::from)?;
         let rope_sin_stager =
             PinnedHostBuffer::zeroed(&context, rotary_values).map_err(GpuError::from)?;
+        let continuation_hidden_stager = PinnedHostBuffer::zeroed(
+            &context,
+            product(
+                "resident MTP compact continuation hidden stager",
+                MAX_BATCH,
+                Qwen38_27B::HIDDEN,
+            )?,
+        )
+        .map_err(GpuError::from)?;
         let pointers = Pointers::bind(&arena, &cache_arena, regions, cache_regions, &target)?;
         let ops = Ops {
             fusion: &fusion,
@@ -440,6 +494,7 @@ impl ResidentMtpProgram {
             lengths: &lengths_stager,
             rope_cos: &rope_cos_stager,
             rope_sin: &rope_sin_stager,
+            continuation_hidden: &continuation_hidden_stager,
         };
         let graphs = capture_graphs(&stream, &target, &arena, regions, pointers, ops, stagers)?;
         stream.synchronize().map_err(GpuError::from)?;
@@ -463,6 +518,7 @@ impl ResidentMtpProgram {
             lengths_stager,
             rope_cos_stager,
             rope_sin_stager,
+            continuation_hidden_stager,
             target,
             context,
             layout,
@@ -528,6 +584,36 @@ impl ResidentMtpProgram {
         }
         self.stage_rows(stream, next_token_ids, slots, positions, rope_cos, rope_sin)?;
         Ok(ResidentMtpDraftRoute { batch: slots.len() })
+    }
+
+    /// Stages compact draft rows with explicit prior target-conditioned hidden values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_continuation_draft(
+        &mut self,
+        stream: &CudaStream,
+        slots: &[usize],
+        positions: &[u32],
+        next_token_ids: &[u32],
+        target_hidden: &[u16],
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<ResidentMtpDraftRoute> {
+        require_batch(slots.len())?;
+        let values = product(
+            "resident MTP compact continuation hidden values",
+            slots.len(),
+            Qwen38_27B::HIDDEN,
+        )?;
+        if target_hidden.len() != values {
+            return Err(EngineError::layout(format!(
+                "resident MTP compact continuation hidden plane has {} values, expected {values}",
+                target_hidden.len()
+            )));
+        }
+        let route =
+            self.stage_draft(stream, slots, positions, next_token_ids, rope_cos, rope_sin)?;
+        self.continuation_hidden_stager[..values].copy_from_slice(target_hidden);
+        Ok(route)
     }
 
     /// Stages one causal target-conditioned realignment sequence.
@@ -682,6 +768,17 @@ impl ResidentMtpProgram {
         Ok(())
     }
 
+    /// Replays an exact compact continuation from explicitly staged hidden rows.
+    pub fn replay_staged_continue_draft(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpDraftRoute,
+    ) -> EngineResult<()> {
+        require_batch(route.batch)?;
+        self.graphs.staged_continue_draft[route.batch - 1].launch(stream)?;
+        Ok(())
+    }
+
     /// Replays one prime-only realignment graph for exact `K=1..4`.
     pub fn replay_prime(
         &self,
@@ -756,6 +853,35 @@ impl ResidentMtpProgram {
         self.arena.copy_slice_to_host_slice(
             stream,
             self.layout.regions().logits,
+            start,
+            destination,
+        )?;
+        Ok(())
+    }
+
+    /// Reads one exact final-residual row into reusable host storage.
+    pub fn read_residual_row_into(
+        &self,
+        stream: &CudaStream,
+        row: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        if row >= MAX_BATCH {
+            return Err(EngineError::route(format!(
+                "resident MTP residual row {row} is outside 0..{MAX_BATCH}"
+            )));
+        }
+        if destination.len() != Qwen38_27B::HIDDEN {
+            return Err(EngineError::layout(format!(
+                "resident MTP residual-row destination has {} values, expected {}",
+                destination.len(),
+                Qwen38_27B::HIDDEN
+            )));
+        }
+        let start = product("resident MTP residual-row offset", row, Qwen38_27B::HIDDEN)?;
+        self.arena.copy_slice_to_host_slice(
+            stream,
+            self.layout.regions().residual_output,
             start,
             destination,
         )?;
@@ -932,11 +1058,12 @@ impl ResidentMtpProgram {
             + self.lengths_stager.num_bytes()
             + self.rope_cos_stager.num_bytes()
             + self.rope_sin_stager.num_bytes()
+            + self.continuation_hidden_stager.num_bytes()
     }
 
-    /// Exact prompt, seeded draft, compact continuation, prime, and realignment inventory.
+    /// Exact prompt, seeded draft, two continuation, prime, and realignment inventories.
     pub const fn graph_count(&self) -> usize {
-        PROMPT_ROUTES.len() + 2 * MAX_BATCH + 2 * REALIGN_ROUTES
+        PROMPT_ROUTES.len() + 3 * MAX_BATCH + 2 * REALIGN_ROUTES
     }
 
     /// Checked resident MTP layout.
@@ -993,6 +1120,26 @@ impl ResidentMtpProgram {
     ) -> EngineResult<()> {
         require_batch(route.batch)?;
         launch_continue_upload(
+            stream,
+            route.batch,
+            &self.target,
+            &self.arena,
+            self.layout.regions(),
+            self.stagers(),
+        )?;
+        launch_full(stream, route.batch, self.ops(), self.pointers()?)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Launches one exact explicitly staged compact continuation eagerly.
+    pub fn qualification_launch_eager_staged_continue_draft(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpDraftRoute,
+    ) -> EngineResult<()> {
+        require_batch(route.batch)?;
+        launch_staged_continue_upload(
             stream,
             route.batch,
             &self.target,
@@ -1145,11 +1292,35 @@ impl ResidentMtpProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Returns one immutable production explicitly staged continuation graph.
+    pub fn qualification_staged_continue_draft_graph(
+        &self,
+        route: ResidentMtpDraftRoute,
+    ) -> EngineResult<&CudaGraph> {
+        require_batch(route.batch)?;
+        Ok(&self.graphs.staged_continue_draft[route.batch - 1])
+    }
+
+    #[cfg(feature = "qualification")]
     /// Returns every local and borrowed device address captured by MTP graphs.
     pub fn qualification_addresses(&self) -> EngineResult<Vec<usize>> {
         let mut addresses = self.pointers()?.addresses();
         addresses.extend(self.target.qualification_mtp_prompt_source_addresses()?);
         Ok(addresses)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns every page-locked source address retained by local MTP graphs.
+    pub fn qualification_host_stager_addresses(&self) -> [usize; 7] {
+        [
+            self.embedding_stager.as_ptr().addr(),
+            self.table_rows_stager.as_ptr().addr(),
+            self.positions_stager.as_ptr().addr(),
+            self.lengths_stager.as_ptr().addr(),
+            self.rope_cos_stager.as_ptr().addr(),
+            self.rope_sin_stager.as_ptr().addr(),
+            self.continuation_hidden_stager.as_ptr().addr(),
+        ]
     }
 
     #[cfg(feature = "qualification")]
@@ -1402,6 +1573,7 @@ impl ResidentMtpProgram {
             lengths: &self.lengths_stager,
             rope_cos: &self.rope_cos_stager,
             rope_sin: &self.rope_sin_stager,
+            continuation_hidden: &self.continuation_hidden_stager,
         }
     }
 }
@@ -1494,6 +1666,13 @@ fn capture_graphs(
             launch_full(stream, rows, ops, pointers)
         })?);
     }
+    let mut staged_continue_draft = Vec::with_capacity(MAX_BATCH);
+    for rows in 1..=MAX_BATCH {
+        staged_continue_draft.push(CudaGraph::capture(stream, || {
+            launch_staged_continue_upload(stream, rows, target, arena, regions, stagers)?;
+            launch_full(stream, rows, ops, pointers)
+        })?);
+    }
     let mut prime = Vec::with_capacity(REALIGN_ROUTES);
     for rows in 1..=REALIGN_ROUTES {
         prime.push(CudaGraph::capture(stream, || {
@@ -1517,6 +1696,9 @@ fn capture_graphs(
             .map_err(|_| EngineError::layout("resident MTP draft graph inventory differs"))?,
         continue_draft: continue_draft.try_into().map_err(|_| {
             EngineError::layout("resident MTP continuation graph inventory differs")
+        })?,
+        staged_continue_draft: staged_continue_draft.try_into().map_err(|_| {
+            EngineError::layout("resident MTP staged-continuation graph inventory differs")
         })?,
         prime: prime
             .try_into()
@@ -1639,6 +1821,65 @@ fn launch_continue_upload(
             arena,
             regions.residual_output,
             hidden_values,
+        )?;
+        target.enqueue_mtp_block_table_handoff(stream, arena, regions.block_tables)?;
+    }
+    Ok(())
+}
+
+fn launch_staged_continue_upload(
+    stream: &CudaStream,
+    rows: usize,
+    target: &ResidentModelProgram,
+    arena: &DeviceArena,
+    regions: ResidentMtpRegions,
+    stagers: Stagers<'_>,
+) -> GpuResult<()> {
+    let hidden_values = rows.checked_mul(Qwen38_27B::HIDDEN).ok_or_else(|| {
+        GpuError::invalid_launch("resident MTP staged continuation hidden count overflows")
+    })?;
+    let rotary_values = rows.checked_mul(ROTARY_PAIRS).ok_or_else(|| {
+        GpuError::invalid_launch("resident MTP staged continuation rotary count overflows")
+    })?;
+    // B=1..8 uploads one exact 10,240-byte BF16 hidden row per lane; the kernels retain their
+    // independently qualified exact-B launch shapes.
+    unsafe {
+        arena.copy_prefix_from_pinned_host_async(
+            stream,
+            regions.embedding,
+            stagers.embedding,
+            hidden_values,
+        )?;
+        arena.copy_prefix_from_pinned_host_async(
+            stream,
+            regions.target_hidden,
+            stagers.continuation_hidden,
+            hidden_values,
+        )?;
+        arena.copy_prefix_from_pinned_host_async(
+            stream,
+            regions.table_rows,
+            stagers.table_rows,
+            rows,
+        )?;
+        arena.copy_prefix_from_pinned_host_async(
+            stream,
+            regions.cache_positions,
+            stagers.positions,
+            rows,
+        )?;
+        arena.copy_prefix_from_pinned_host_async(stream, regions.lengths, stagers.lengths, rows)?;
+        arena.copy_prefix_from_pinned_host_async(
+            stream,
+            regions.rope_cos,
+            stagers.rope_cos,
+            rotary_values,
+        )?;
+        arena.copy_prefix_from_pinned_host_async(
+            stream,
+            regions.rope_sin,
+            stagers.rope_sin,
+            rotary_values,
         )?;
         target.enqueue_mtp_block_table_handoff(stream, arena, regions.block_tables)?;
     }

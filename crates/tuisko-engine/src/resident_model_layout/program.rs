@@ -8,6 +8,7 @@ use super::{
 #[cfg(feature = "qualification")]
 use crate::PagedKvSlotState;
 use crate::long_context_kv_layout::LayerKvRegions;
+use crate::resident_mtp::ResidentMtpArenaReservation;
 use crate::{
     EngineError, EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, PagedKvSlotPool,
     PagedKvTableUpdate, full_attention_layer_layout::CONTEXT_CAPACITY as SHORT_CONTEXT_CAPACITY,
@@ -609,7 +610,22 @@ impl ResidentModelProgram {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
-        Self::from_snapshot_with_mode(context, snapshot, PRODUCTION_LOAD_MODE, None)
+        Self::from_snapshot_with_mode(context, snapshot, PRODUCTION_LOAD_MODE, None, false)
+            .map(|(program, _)| program)
+    }
+
+    pub(crate) fn from_snapshot_reserving_mtp(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
+    ) -> EngineResult<(Self, ResidentMtpArenaReservation)> {
+        let (program, reservation) =
+            Self::from_snapshot_with_mode(context, snapshot, PRODUCTION_LOAD_MODE, None, true)?;
+        Ok((
+            program,
+            reservation.ok_or_else(|| {
+                EngineError::layout("resident target did not return its requested MTP reservation")
+            })?,
+        ))
     }
 
     pub(crate) fn from_snapshot_with_progress(
@@ -617,7 +633,14 @@ impl ResidentModelProgram {
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
         progress: &ResidentLoadProgress,
     ) -> EngineResult<Self> {
-        Self::from_snapshot_with_mode(context, snapshot, PRODUCTION_LOAD_MODE, Some(progress))
+        Self::from_snapshot_with_mode(
+            context,
+            snapshot,
+            PRODUCTION_LOAD_MODE,
+            Some(progress),
+            false,
+        )
+        .map(|(program, _)| program)
     }
 
     /// Loads through selective initialization for focused qualification.
@@ -626,7 +649,8 @@ impl ResidentModelProgram {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
-        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Selective, None)
+        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Selective, None, false)
+            .map(|(program, _)| program)
     }
 
     /// Loads through the retained eager-zeroing A/B authority.
@@ -635,7 +659,8 @@ impl ResidentModelProgram {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
-        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Legacy, None)
+        Self::from_snapshot_with_mode(context, snapshot, ResidentLoadMode::Legacy, None, false)
+            .map(|(program, _)| program)
     }
 
     fn from_snapshot_with_mode(
@@ -643,7 +668,8 @@ impl ResidentModelProgram {
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
         mode: ResidentLoadMode,
         progress: Option<&ResidentLoadProgress>,
-    ) -> EngineResult<Self> {
+        reserve_mtp: bool,
+    ) -> EngineResult<(Self, Option<ResidentMtpArenaReservation>)> {
         let layout_start = Instant::now();
         let layout = ResidentModelLayout::build()?;
         let upload_plan = ResidentUploadPlan::build(&layout)?;
@@ -669,6 +695,10 @@ impl ResidentModelProgram {
         };
         stream.synchronize().map_err(GpuError::from)?;
         let arena_allocation_ns = elapsed_ns("resident arena allocation", allocation_start)?;
+        let mtp_reservation = reserve_mtp
+            .then(|| ResidentMtpArenaReservation::allocate(&stream))
+            .transpose()?;
+        stream.synchronize().map_err(GpuError::from)?;
 
         let operator_start = Instant::now();
         let kv_slots = PagedKvSlotPool::new(LONG_CONTEXT_PHYSICAL_PAGES)?;
@@ -918,37 +948,40 @@ impl ResidentModelProgram {
             progress.finish();
         }
 
-        Ok(Self {
-            graphs,
-            dense_mlp_maps,
-            arena,
-            kv_arena,
-            kv_slots,
-            _norm: norm,
-            _gdn_input: gdn_input,
-            _gdn_prepare: gdn_prepare,
-            _gdn_recurrence: gdn_recurrence,
-            _gdn_state_snapshot: gdn_state_snapshot,
-            _gdn_output: gdn_output,
-            _attention_qkv: attention_qkv,
-            _attention_qk_prepare: attention_qk_prepare,
-            _paged_gqa: paged_gqa,
-            _long_context_paged_gqa: long_context_paged_gqa,
-            _attention_output: attention_output,
-            _dense_swiglu: dense_swiglu,
-            _dense_down: dense_down,
-            _nvfp4_swiglu: nvfp4_swiglu,
-            _nvfp4_down: nvfp4_down,
-            _lm_head: lm_head,
-            embedding_stager,
-            snapshot,
-            context: context.clone(),
-            layout,
-            _pointers: pointers,
-            base_address,
-            kv_base_address,
-            load_stats,
-        })
+        Ok((
+            Self {
+                graphs,
+                dense_mlp_maps,
+                arena,
+                kv_arena,
+                kv_slots,
+                _norm: norm,
+                _gdn_input: gdn_input,
+                _gdn_prepare: gdn_prepare,
+                _gdn_recurrence: gdn_recurrence,
+                _gdn_state_snapshot: gdn_state_snapshot,
+                _gdn_output: gdn_output,
+                _attention_qkv: attention_qkv,
+                _attention_qk_prepare: attention_qk_prepare,
+                _paged_gqa: paged_gqa,
+                _long_context_paged_gqa: long_context_paged_gqa,
+                _attention_output: attention_output,
+                _dense_swiglu: dense_swiglu,
+                _dense_down: dense_down,
+                _nvfp4_swiglu: nvfp4_swiglu,
+                _nvfp4_down: nvfp4_down,
+                _lm_head: lm_head,
+                embedding_stager,
+                snapshot,
+                context: context.clone(),
+                layout,
+                _pointers: pointers,
+                base_address,
+                kv_base_address,
+                load_stats,
+            },
+            mtp_reservation,
+        ))
     }
 
     /// Copies exact mmap-backed BF16 embedding rows into the first residual plane.
@@ -1592,6 +1625,84 @@ impl ResidentModelProgram {
         Ok(self
             .arena
             .copy_prefix_to_host(stream, self.layout.workspace.logits, values)?)
+    }
+
+    /// Preserves every lane-major final target residual before per-lane MTP realignment.
+    pub fn backup_target_mtp_segmented_residuals(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpSegmentedVerifyRoute,
+    ) -> EngineResult<()> {
+        let values = product(
+            "segmented target MTP residual backup values",
+            route.rows(),
+            Qwen38_27B::HIDDEN,
+        )?;
+        let workspace = self.layout.workspace;
+        // SAFETY: residual A and B are disjoint, address-stable maximum-row planes owned by this
+        // program. Stream order keeps the backup ahead of every later lane selection.
+        unsafe {
+            self.arena.copy_prefix_from_arena_async(
+                stream,
+                workspace.residual_b,
+                &self.arena,
+                workspace.residual_a,
+                values,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Selects one backed-up lane prefix for the existing exact-K MTP realignment graph.
+    pub fn select_target_mtp_segmented_residual_lane(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpSegmentedVerifyRoute,
+        lane: usize,
+        rows: usize,
+    ) -> EngineResult<()> {
+        if lane >= route.batch {
+            return Err(EngineError::route(format!(
+                "segmented target MTP residual lane {lane} is outside B={}",
+                route.batch
+            )));
+        }
+        if !(1..=route.tokens).contains(&rows) {
+            return Err(EngineError::route(format!(
+                "segmented target MTP residual lane selects {rows} rows from K={}",
+                route.tokens
+            )));
+        }
+        let source_row = product(
+            "segmented target MTP residual source row",
+            lane,
+            route.tokens,
+        )?;
+        let source = product(
+            "segmented target MTP residual source values",
+            source_row,
+            Qwen38_27B::HIDDEN,
+        )?;
+        let values = product(
+            "segmented target MTP selected residual values",
+            rows,
+            Qwen38_27B::HIDDEN,
+        )?;
+        let workspace = self.layout.workspace;
+        // SAFETY: the complete lane-major plane was copied to disjoint residual B first. The
+        // destination prefix is consumed before another selection and cannot corrupt the backup.
+        unsafe {
+            self.arena.copy_slice_from_arena_async(
+                stream,
+                workspace.residual_a,
+                0,
+                &self.arena,
+                workspace.residual_b,
+                source,
+                values,
+            )?;
+        }
+        Ok(())
     }
 
     /// Reads the final-token BF16 vocabulary logits from one prefill graph.

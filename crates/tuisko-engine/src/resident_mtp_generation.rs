@@ -89,8 +89,7 @@ impl ResidentMtpTextGenerator {
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     ) -> EngineResult<Self> {
         let frontend = TextFrontend::open(snapshot.as_ref())?;
-        let target = crate::ResidentModelProgram::from_snapshot(context, snapshot)?;
-        let program = ResidentMtpProgram::from_target(target)?;
+        let program = ResidentMtpProgram::from_snapshot(context, snapshot)?;
         let stream = context.new_stream().map_err(GpuError::from)?;
         let logit_values = Qwen38_27B::VOCAB
             .checked_mul(LOGIT_ROWS)

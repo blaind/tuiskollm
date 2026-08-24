@@ -18,6 +18,7 @@ use tuisko_gpu::{CudaGraph, CudaStream, GpuTimer};
 const DEVICE_INDEX: &str = "0";
 const MAX_IDLE_MEMORY_MIB: u32 = 1_024;
 const IDLE_UTILIZATION_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+const OWNED_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_UTILIZATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MIN_TELEMETRY_SAMPLES: usize = 3;
 const LOADED_CLOCK_PROBE_DURATION: Duration = Duration::from_secs(2);
@@ -1125,6 +1126,32 @@ pub(crate) fn preflight() -> Result<DevicePreflight, DeviceBenchmarkError> {
         },
         memory: snapshot,
     })
+}
+
+pub(crate) fn wait_for_owned_child_cleanup() -> Result<(), DeviceBenchmarkError> {
+    let deadline = Instant::now() + OWNED_CHILD_CLEANUP_TIMEOUT;
+    loop {
+        let snapshot = device_snapshot()?;
+        if snapshot.identity.name != EXPECTED_DEVICE_NAME {
+            return Err(DeviceBenchmarkError::Precondition(format!(
+                "device zero is `{}`, expected `{EXPECTED_DEVICE_NAME}`",
+                snapshot.identity.name
+            )));
+        }
+        require_compute_process_count(0)?;
+        if snapshot.utilization_percent == 0 && snapshot.memory_used_mib <= MAX_IDLE_MEMORY_MIB {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(DeviceBenchmarkError::Precondition(format!(
+                "owned qualification child cleanup did not settle within {} seconds: utilization={}%, memory={} MiB",
+                OWNED_CHILD_CLEANUP_TIMEOUT.as_secs(),
+                snapshot.utilization_percent,
+                snapshot.memory_used_mib
+            )));
+        }
+        thread::sleep(IDLE_UTILIZATION_POLL_INTERVAL);
+    }
 }
 
 pub(crate) fn require_current_process_exclusive() -> Result<(), DeviceBenchmarkError> {

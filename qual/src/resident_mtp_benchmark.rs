@@ -8,7 +8,7 @@ use crate::device_benchmark::{
 };
 use std::path::Path;
 use std::sync::Arc;
-use tuisko_engine::{MAX_BATCH, ResidentModelProgram, ResidentMtpDraftRoute, ResidentMtpProgram};
+use tuisko_engine::{MAX_BATCH, ResidentMtpDraftRoute, ResidentMtpProgram};
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, GpuError, GpuTimer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
@@ -42,12 +42,11 @@ impl Session {
             )));
         }
         let stream = context.new_stream().map_err(GpuError::from)?;
-        let mut target = ResidentModelProgram::from_snapshot(&context, snapshot)?;
+        let mut program = ResidentMtpProgram::from_snapshot(&context, snapshot)?;
         for slot in 0..MAX_BATCH {
-            target.activate_kv_slot(slot)?;
-            target.reserve_kv_slot_tokens(&stream, slot, 1_024)?;
+            program.activate_kv_slot(slot)?;
+            program.reserve_kv_slot_tokens(&stream, slot, 1_024)?;
         }
-        let mut program = ResidentMtpProgram::from_target(target)?;
         let slots = (0..MAX_BATCH).collect::<Vec<_>>();
         let positions = [CACHE_POSITION; MAX_BATCH];
         let token_ids = token_ids(MAX_BATCH);
@@ -61,6 +60,14 @@ impl Session {
         if staged.batch() != MAX_BATCH {
             return Err(DeviceBenchmarkError::Precondition(
                 "resident MTP benchmark did not stage the B=8 prefix superset".to_string(),
+            ));
+        }
+        let staged = program.stage_continuation_draft(
+            &stream, &slots, &positions, &token_ids, &hidden, &cosine, &sine,
+        )?;
+        if staged.batch() != MAX_BATCH {
+            return Err(DeviceBenchmarkError::Precondition(
+                "resident MTP benchmark did not stage the B=8 hidden-handoff superset".to_string(),
             ));
         }
         let routes = (1..=MAX_BATCH)
@@ -97,6 +104,8 @@ impl Session {
                 self.program.replay_draft(&self.stream, route.route)?;
                 self.program
                     .replay_continue_draft(&self.stream, route.route)?;
+                self.program
+                    .replay_staged_continue_draft(&self.stream, route.route)?;
             }
         }
         self.stream.synchronize().map_err(GpuError::from)?;
@@ -107,7 +116,7 @@ impl Session {
         &self,
         repeated_operations: u64,
     ) -> Result<Vec<ExactDeviceCase<'_>>, DeviceBenchmarkError> {
-        let mut cases = Vec::with_capacity(2 * MAX_BATCH);
+        let mut cases = Vec::with_capacity(3 * MAX_BATCH);
         for route in &self.routes {
             let batch = route.route.batch();
             cases.push(ExactDeviceCase::new(
@@ -133,12 +142,25 @@ impl Session {
                     repeated_operations,
                 )),
             ));
+            cases.push(ExactDeviceCase::new(
+                "qwen3_8/mtp/resident_staged_continuation",
+                format!("B={batch}"),
+                BenchmarkWorkload::warm_operator_mtp(batch as u64),
+                OperationAccounting::new(
+                    staged_logical_bytes(batch),
+                    batch as u64,
+                    "staged_continuation",
+                ),
+                self.program
+                    .qualification_staged_continue_draft_graph(route.route)?,
+                None,
+            ));
         }
         Ok(cases)
     }
 }
 
-/// Measures every exact resident MTP seeded-draft and continuation `B=1..8` graph directly.
+/// Measures every exact seeded and same-round/staged continuation `B=1..8` graph directly.
 pub fn benchmark_resident_mtp(
     root: &Path,
     options: DeviceBenchmarkOptions,
@@ -237,7 +259,7 @@ pub fn benchmark_resident_mtp(
         BenchmarkReportSpec {
             suite: "bench-resident-mtp",
             classification: "performance_sensitive_model",
-            timing_scope: "paired Rust production-graph submission/completion and repeated resident seeded target-handoff or prior-residual continuation through the long-context MTP route",
+            timing_scope: "paired Rust production-graph submission/completion for seeded target-handoff, same-round residual continuation, or explicit hidden-handoff continuation through the long-context MTP route; existing seeded and same-round routes also retain repeated-graph device timing",
         },
         preflight,
         baseline_sha256,
@@ -294,6 +316,10 @@ fn logical_bytes(batch: usize) -> usize {
     weights + table_handoff + cache_reads + batch * (route_uploads + residual_handoff + internal)
 }
 
+fn staged_logical_bytes(batch: usize) -> usize {
+    logical_bytes(batch) - batch * 2 * Qwen38_27B::HIDDEN
+}
+
 fn f32_to_bf16(value: f32) -> u16 {
     let bits = value.to_bits();
     (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
@@ -301,7 +327,7 @@ fn f32_to_bf16(value: f32) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTEXT_TOKENS, MAX_BATCH, logical_bytes};
+    use super::{CONTEXT_TOKENS, MAX_BATCH, logical_bytes, staged_logical_bytes};
 
     #[test]
     fn resident_mtp_benchmark_inventory_and_accounting_are_exact() {
@@ -309,5 +335,7 @@ mod tests {
         assert_eq!(CONTEXT_TOKENS, 131);
         assert_eq!(logical_bytes(1), 2_125_301_900);
         assert_eq!(logical_bytes(8), 2_151_818_208);
+        assert_eq!(staged_logical_bytes(1), 2_125_291_660);
+        assert_eq!(staged_logical_bytes(8), 2_151_736_288);
     }
 }
