@@ -23,6 +23,7 @@ use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedSender, channel, error::TryRecvError, error::TrySendError,
     unbounded_channel,
 };
+use tokio::sync::oneshot;
 use tuisko_engine::{
     MAX_BATCH, ResidentBatchGenerator, ResidentLoadPhase, ResidentLoadProgress, ResidentRequestId,
 };
@@ -52,6 +53,9 @@ pub enum ServerError {
     /// Resident worker exited without completing its startup handshake.
     #[error("resident engine worker disconnected during startup")]
     StartupDisconnected,
+    /// Resident worker loop stopped after startup; serving would leave a zombie listener.
+    #[error("resident engine worker failed: {0}")]
+    WorkerFailed(String),
 }
 
 #[derive(Clone)]
@@ -92,7 +96,7 @@ pub fn run(config: ServerConfig) -> Result<(), ServerError> {
     let stdout = std::io::stdout();
     let interactive = stdout.is_terminal();
     let color = interactive && std::env::var_os("NO_COLOR").is_none();
-    let (state, ready) = {
+    let (state, ready, worker_failure) = {
         let mut stdout = stdout.lock();
         stdout.write_all(render_loading(color, interactive).as_bytes())?;
         stdout.flush()?;
@@ -107,9 +111,21 @@ pub fn run(config: ServerConfig) -> Result<(), ServerError> {
         let mut stdout = stdout.lock();
         stdout.write_all(output.as_bytes())?;
         stdout.flush()?;
-        axum::serve(listener, router(state)).await?;
-        Ok(())
+        serve_until_worker_failure(listener, router(state), worker_failure).await
     })
+}
+
+async fn serve_until_worker_failure(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    worker_failure: oneshot::Receiver<String>,
+) -> Result<(), ServerError> {
+    tokio::select! {
+        result = axum::serve(listener, router) => result.map_err(ServerError::Io),
+        failure = worker_failure => Err(ServerError::WorkerFailed(
+            failure.unwrap_or_else(|_| "resident engine worker exited".into()),
+        )),
+    }
 }
 
 fn start_worker(
@@ -117,9 +133,10 @@ fn start_worker(
     output: &mut impl IoWrite,
     interactive: bool,
     color: bool,
-) -> Result<(AppState, Ready), ServerError> {
+) -> Result<(AppState, Ready, oneshot::Receiver<String>), ServerError> {
     let (jobs_tx, jobs_rx) = channel(MAX_BATCH);
     let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+    let (failure_tx, failure_rx) = oneshot::channel();
     let worker_ready = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(ResidentLoadProgress::new());
     let snapshot = snapshot.to_owned();
@@ -132,6 +149,7 @@ fn start_worker(
                 snapshot,
                 jobs_rx,
                 ready_tx,
+                failure_tx,
                 worker_ready_clone,
                 worker_progress,
             )
@@ -174,6 +192,7 @@ fn start_worker(
             worker_ready,
         },
         ready,
+        failure_rx,
     ))
 }
 
@@ -181,6 +200,7 @@ fn engine_worker(
     snapshot: PathBuf,
     mut jobs: Receiver<Job>,
     ready: std_mpsc::SyncSender<Result<Ready, String>>,
+    failure: oneshot::Sender<String>,
     worker_ready: Arc<AtomicBool>,
     progress: Arc<ResidentLoadProgress>,
 ) {
@@ -239,7 +259,8 @@ fn engine_worker(
     let mut jobs_open = true;
     loop {
         if let Err(error) = cancel_disconnected(&mut generator, &mut replies) {
-            fail_all(&mut replies, error);
+            fail_all(&mut replies, error.clone());
+            let _ = failure.send(error);
             break;
         }
 
@@ -269,7 +290,9 @@ fn engine_worker(
         let events = match generator.step() {
             Ok(events) => events,
             Err(error) => {
-                fail_all(&mut replies, error.to_string());
+                let error = error.to_string();
+                fail_all(&mut replies, error.clone());
+                let _ = failure.send(error);
                 break;
             }
         };
@@ -601,8 +624,9 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, EnqueueError, Job, Ready, chat_completions, enqueue_job, health, models,
-        render_loading, render_startup, render_weight_progress,
+        AppState, EnqueueError, Job, Ready, ServerError, chat_completions, enqueue_job, health,
+        models, render_loading, render_startup, render_weight_progress, router,
+        serve_until_worker_failure,
     };
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
     use axum::Json;
@@ -710,6 +734,42 @@ mod tests {
         drop(receiver);
         let closed = enqueue_job(&jobs, job().0).unwrap_err();
         assert_eq!(closed, EnqueueError::Closed);
+    }
+
+    #[test]
+    fn worker_failure_stops_serving_with_the_underlying_error() {
+        runtime().block_on(async {
+            let (jobs, _receiver) = channel(1);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (failure_tx, failure_rx) = tokio::sync::oneshot::channel();
+            let serve = tokio::spawn(serve_until_worker_failure(
+                listener,
+                router(state(jobs, true)),
+                failure_rx,
+            ));
+            failure_tx.send("device launch failed".into()).unwrap();
+            let error = serve.await.unwrap().unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "resident engine worker failed: device launch failed"
+            );
+
+            let (jobs, _receiver) = channel(1);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (failure_tx, failure_rx) = tokio::sync::oneshot::channel::<String>();
+            let serve = tokio::spawn(serve_until_worker_failure(
+                listener,
+                router(state(jobs, true)),
+                failure_rx,
+            ));
+            drop(failure_tx);
+            let error = serve.await.unwrap().unwrap_err();
+            assert!(matches!(error, ServerError::WorkerFailed(_)));
+            assert_eq!(
+                error.to_string(),
+                "resident engine worker failed: resident engine worker exited"
+            );
+        });
     }
 
     #[test]
