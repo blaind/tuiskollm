@@ -1,6 +1,6 @@
 //! Resident source-backed Qwen3.6 GDN plus MoE decoder layer.
 
-use crate::qwen36_gdn_moe_layer_layout::Qwen36GdnMoeLayerRegions;
+use crate::qwen36_gdn_moe_layer_layout::{QWEN36_GDN_MAX_ROWS, Qwen36GdnMoeLayerRegions};
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen36GdnMoeLayerLayout};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
@@ -12,10 +12,11 @@ use tuisko_model::{
     Arch, CheckpointSnapshot, Qwen36GdnBindings, Qwen36Moe35B, Qwen36MoeLayerBindings,
 };
 
-/// One Qwen3.6 linear-attention layer with immutable exact-batch graph routes.
+/// One Qwen3.6 linear-attention layer with immutable exact decode and prefill graphs.
 pub struct Qwen36GdnMoeLayerProgram {
     // Drop graphs before the arena and loaded modules whose handles they retain.
     graphs: [CudaGraph; MAX_BATCH],
+    prefill_graphs: [CudaGraph; 3],
     arena: DeviceArena,
     _norm: Qwen36ResidualNormOp,
     _input: Qwen36GdnInputOp,
@@ -217,7 +218,7 @@ struct Ops<'a> {
 }
 
 impl Qwen36GdnMoeLayerProgram {
-    /// Loads one admitted source layer and captures exact `B=1..=8` decode routes.
+    /// Loads one source layer and captures exact `B=1..8` and `T=32,64,128` routes.
     pub fn from_snapshot(
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
@@ -368,10 +369,12 @@ impl Qwen36GdnMoeLayerProgram {
             router: &router,
             experts: &experts,
         };
-        let graphs = capture_routes(&stream, ops, pointers, source_scales)?;
+        let graphs = capture_decode_routes(&stream, ops, pointers, source_scales)?;
+        let prefill_graphs = capture_prefill_routes(&stream, ops, pointers, source_scales)?;
 
         Ok(Self {
             graphs,
+            prefill_graphs,
             arena,
             _norm: norm,
             _input: input,
@@ -389,18 +392,18 @@ impl Qwen36GdnMoeLayerProgram {
         })
     }
 
-    /// Uploads exactly `batch` BF16 residual rows into stable input storage.
+    /// Uploads one exact decode or prefill width into stable input storage.
     pub fn load_residual(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         values: &[u16],
     ) -> EngineResult<()> {
-        require_batch(batch)?;
-        let expected = product("Qwen3.6 layer input", batch, Qwen36Moe35B::HIDDEN)?;
+        require_rows(rows)?;
+        let expected = product("Qwen3.6 layer input", rows, Qwen36Moe35B::HIDDEN)?;
         if values.len() != expected {
             return Err(EngineError::layout(format!(
-                "Qwen3.6 layer input has {} values, expected {expected} for B={batch}",
+                "Qwen3.6 layer input has {} values, expected {expected} for rows={rows}",
                 values.len()
             )));
         }
@@ -419,20 +422,20 @@ impl Qwen36GdnMoeLayerProgram {
         Ok(())
     }
 
-    /// Replays the immutable graph for one exact batch.
-    pub fn replay(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
+    /// Replays the immutable graph for one admitted row count.
+    pub fn replay(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        let graph = self.graph(rows)?;
         // SAFETY: this Qwen36GdnMoeLayerProgram owns every captured allocation
         // (arena, op modules) for its whole life and drops the graphs first.
-        unsafe { self.graphs[batch - 1].launch(stream) }?;
+        unsafe { graph.launch(stream) }?;
 
         Ok(())
     }
 
     /// Reads active BF16 residual output rows.
-    pub fn read_residual(&self, stream: &CudaStream, batch: usize) -> EngineResult<Vec<u16>> {
-        require_batch(batch)?;
-        let values = product("Qwen3.6 layer output", batch, Qwen36Moe35B::HIDDEN)?;
+    pub fn read_residual(&self, stream: &CudaStream, rows: usize) -> EngineResult<Vec<u16>> {
+        require_rows(rows)?;
+        let values = product("Qwen3.6 layer output", rows, Qwen36Moe35B::HIDDEN)?;
 
         Ok(self
             .arena
@@ -474,6 +477,11 @@ impl Qwen36GdnMoeLayerProgram {
         MAX_BATCH
     }
 
+    /// Largest admitted exact row count.
+    pub const fn row_capacity(&self) -> usize {
+        QWEN36_GDN_MAX_ROWS
+    }
+
     /// Checked owner layout.
     pub const fn layout(&self) -> &Qwen36GdnMoeLayerLayout {
         &self.layout
@@ -484,31 +492,45 @@ impl Qwen36GdnMoeLayerProgram {
         &self.snapshot
     }
 
+    fn graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
+        if (1..=MAX_BATCH).contains(&rows) {
+            return Ok(&self.graphs[rows - 1]);
+        }
+        let index = prefill_index(rows).ok_or_else(|| {
+            EngineError::route(format!(
+                "Qwen3.6 GDN/MoE row count {rows} is outside 1..={MAX_BATCH},32,64,128"
+            ))
+        })?;
+
+        Ok(&self.prefill_graphs[index])
+    }
+
     /// Launches this layer from another resident owner's BF16 residual plane.
     ///
     /// # Safety
-    /// `input` covers `batch * 2,048` BF16 values in this CUDA context.
+    /// `input` covers `rows * 2,048` BF16 values in this CUDA context.
     #[allow(dead_code)]
     pub(crate) unsafe fn launch_from(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         input: *const u16,
     ) -> GpuResult<*const u16> {
         let mut pointers = Pointers::bind(&self.arena, self.layout.regions())?;
         pointers.residual_input = input;
-        launch_route(stream, batch, self.ops(), pointers, self.source_scales)?;
+        require_rows(rows).map_err(|error| GpuError::invalid_launch(error.to_string()))?;
+        launch_route(stream, rows, self.ops(), pointers, self.source_scales)?;
 
         Ok(pointers.residual_output.cast_const())
     }
 
     #[cfg(feature = "qualification")]
     /// Launches the production route eagerly for graph-agreement qualification.
-    pub fn launch_eager(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
+    pub fn launch_eager(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        require_rows(rows)?;
         launch_route(
             stream,
-            batch,
+            rows,
             self.ops(),
             Pointers::bind(&self.arena, self.layout.regions())?,
             self.source_scales,
@@ -519,9 +541,8 @@ impl Qwen36GdnMoeLayerProgram {
 
     #[cfg(feature = "qualification")]
     /// Returns one captured production graph.
-    pub fn qualification_graph(&self, batch: usize) -> EngineResult<&CudaGraph> {
-        require_batch(batch)?;
-        Ok(&self.graphs[batch - 1])
+    pub fn qualification_graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
+        self.graph(rows)
     }
 
     #[cfg(feature = "qualification")]
@@ -529,10 +550,10 @@ impl Qwen36GdnMoeLayerProgram {
     pub fn qualification_repeated_graph(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         operations: u64,
     ) -> EngineResult<CudaGraph> {
-        require_batch(batch)?;
+        require_rows(rows)?;
         if operations == 0 {
             return Err(EngineError::route(
                 "repeated Qwen3.6 GDN/MoE graph requires at least one operation",
@@ -544,7 +565,7 @@ impl Qwen36GdnMoeLayerProgram {
 
         Ok(CudaGraph::capture(stream, || {
             for _ in 0..operations {
-                launch_route(stream, batch, ops, pointers, scales)?;
+                launch_route(stream, rows, ops, pointers, scales)?;
             }
             Ok(())
         })?)
@@ -554,6 +575,20 @@ impl Qwen36GdnMoeLayerProgram {
     /// Returns every stable arena address in layout order.
     pub fn qualification_addresses(&self) -> EngineResult<Vec<usize>> {
         Ok(Pointers::bind(&self.arena, self.layout.regions())?.addresses())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads every graph input whose contents may vary between launches.
+    pub fn qualification_runtime_inputs(
+        &self,
+        stream: &CudaStream,
+    ) -> EngineResult<Qwen36GdnMoeLayerInputs> {
+        let regions = self.layout.regions();
+
+        Ok(Qwen36GdnMoeLayerInputs {
+            residual_input: self.arena.copy_to_host(stream, regions.residual_input)?,
+            state_rows: self.arena.copy_to_host(stream, regions.state_rows)?,
+        })
     }
 
     #[cfg(feature = "qualification")]
@@ -727,6 +762,15 @@ impl Qwen36GdnMoeLayerProgram {
 }
 
 #[cfg(feature = "qualification")]
+/// Runtime-owned planes that must remain immutable during a layer launch.
+pub struct Qwen36GdnMoeLayerInputs {
+    /// BF16 residual rows consumed by the layer.
+    pub residual_input: Vec<u16>,
+    /// Persistent state row selected by each decode slot or prompt sequence.
+    pub state_rows: Vec<u32>,
+}
+
+#[cfg(feature = "qualification")]
 /// Complete mutable planes exposed to the qualification crate.
 pub struct Qwen36GdnMoeLayerObservables {
     /// Pre-mixer normalized rows.
@@ -826,44 +870,66 @@ pub struct Qwen36GdnMoeLayerImmutable {
     pub next_norm: Vec<u16>,
 }
 
-fn capture_routes(
+fn capture_decode_routes(
     stream: &CudaStream,
     ops: Ops<'_>,
     pointers: Pointers,
     scales: SourceScales,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
     let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for batch in 1..=MAX_BATCH {
+    for rows in 1..=MAX_BATCH {
         graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, batch, ops, pointers, scales)
+            launch_route(stream, rows, ops, pointers, scales)
         })?);
     }
 
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("Qwen3.6 GDN/MoE graph inventory has wrong cardinality"))
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("Qwen3.6 GDN/MoE decode graph inventory has wrong cardinality")
+    })
+}
+
+fn capture_prefill_routes(
+    stream: &CudaStream,
+    ops: Ops<'_>,
+    pointers: Pointers,
+    scales: SourceScales,
+) -> EngineResult<[CudaGraph; 3]> {
+    // T=128 would otherwise require sixteen B=8 layer graphs and 15 extra
+    // boundaries. One graph composes the same seven qualified T=128 leaves;
+    // each leaf retains its accumulation and rounding order.
+    let mut graphs = Vec::with_capacity(3);
+    for rows in [32, 64, 128] {
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_route(stream, rows, ops, pointers, scales)
+        })?);
+    }
+
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("Qwen3.6 GDN/MoE prefill graph inventory has wrong cardinality")
+    })
 }
 
 fn launch_route(
     stream: &CudaStream,
-    batch: usize,
+    rows: usize,
     ops: Ops<'_>,
     pointers: Pointers,
     scales: SourceScales,
 ) -> GpuResult<()> {
-    // SAFETY: one arena owns aligned, disjoint maximum-batch planes; each
-    // exact-B launcher bounds work to active rows and mapped slot state.
+    // SAFETY: one arena owns aligned, disjoint 128-row working planes and
+    // eight persistent state slots. Prompt leaves advance state row zero
+    // causally; every leaf selects the same exact row count.
     unsafe {
         ops.norm.launch_plain(
             stream,
-            batch,
+            rows,
             pointers.residual_input,
             pointers.input_norm,
             pointers.mixer_normalized,
         )?;
         ops.input.launch(
             stream,
-            batch,
+            rows,
             pointers.mixer_normalized,
             pointers.input_activation_codes,
             scales.input,
@@ -876,7 +942,7 @@ fn launch_route(
         )?;
         ops.prepare.launch(
             stream,
-            batch,
+            rows,
             pointers.projected_controls,
             pointers.a_log,
             pointers.dt_bias,
@@ -890,7 +956,7 @@ fn launch_route(
         )?;
         ops.recurrence.launch(
             stream,
-            batch,
+            rows,
             pointers.convolved,
             pointers.projected,
             pointers.log_decay,
@@ -902,7 +968,7 @@ fn launch_route(
         )?;
         ops.output.launch(
             stream,
-            batch,
+            rows,
             pointers.recurrent_output,
             pointers.output_activation_codes,
             scales.output_input,
@@ -912,7 +978,7 @@ fn launch_route(
         )?;
         ops.norm.launch_residual(
             stream,
-            batch,
+            rows,
             pointers.residual_input,
             pointers.mixer_branch,
             pointers.post_attention_norm,
@@ -921,7 +987,7 @@ fn launch_route(
         )?;
         ops.router.launch(
             stream,
-            batch,
+            rows,
             pointers.moe_normalized,
             pointers.router_weight,
             pointers.router_logits,
@@ -930,7 +996,7 @@ fn launch_route(
         )?;
         ops.experts.launch(
             stream,
-            batch,
+            rows,
             pointers.moe_normalized,
             pointers.expert_indices,
             pointers.routing_weights,
@@ -954,7 +1020,7 @@ fn launch_route(
         )?;
         ops.norm.launch_residual(
             stream,
-            batch,
+            rows,
             pointers.mixer_residual,
             pointers.moe_branch,
             pointers.next_norm,
@@ -980,14 +1046,23 @@ fn bf16_words(bytes: &[u8]) -> EngineResult<Vec<u16>> {
         .collect())
 }
 
-fn require_batch(batch: usize) -> EngineResult<()> {
-    if !(1..=MAX_BATCH).contains(&batch) {
-        return Err(EngineError::route(format!(
-            "Qwen3.6 GDN/MoE batch {batch} is outside the exact range 1..={MAX_BATCH}"
-        )));
+fn prefill_index(rows: usize) -> Option<usize> {
+    match rows {
+        32 => Some(0),
+        64 => Some(1),
+        128 => Some(2),
+        _ => None,
+    }
+}
+
+fn require_rows(rows: usize) -> EngineResult<()> {
+    if (1..=MAX_BATCH).contains(&rows) || prefill_index(rows).is_some() {
+        return Ok(());
     }
 
-    Ok(())
+    Err(EngineError::route(format!(
+        "Qwen3.6 GDN/MoE row count {rows} is outside 1..={MAX_BATCH},32,64,128"
+    )))
 }
 
 fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
@@ -997,16 +1072,16 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bf16_words, require_batch};
+    use super::{bf16_words, prefill_index, require_rows};
     use crate::EngineErrorCode;
 
     #[test]
     fn exact_batch_table_rejects_every_boundary_neighbor() {
         for batch in 1..=8 {
-            require_batch(batch).unwrap();
+            require_rows(batch).unwrap();
         }
         for batch in [0, 9, 16, usize::MAX] {
-            let error = require_batch(batch).unwrap_err();
+            let error = require_rows(batch).unwrap_err();
             assert_eq!(error.code(), Some(EngineErrorCode::Route));
         }
     }
@@ -1021,5 +1096,22 @@ mod tests {
             bf16_words(&[0]).unwrap_err().code(),
             Some(EngineErrorCode::Layout)
         );
+    }
+
+    #[test]
+    fn exact_row_table_covers_decode_and_prefill_only() {
+        for rows in [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128] {
+            require_rows(rows).unwrap();
+        }
+        assert_eq!(prefill_index(32), Some(0));
+        assert_eq!(prefill_index(64), Some(1));
+        assert_eq!(prefill_index(128), Some(2));
+        for rows in [0, 9, 31, 33, 63, 65, 127, 129, usize::MAX] {
+            assert_eq!(prefill_index(rows), None);
+            assert_eq!(
+                require_rows(rows).unwrap_err().code(),
+                Some(EngineErrorCode::Route)
+            );
+        }
     }
 }

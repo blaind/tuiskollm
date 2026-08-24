@@ -146,7 +146,9 @@ pub use qwen36_full_attention_layer::{
     Qwen36FullAttentionLayerObservables,
 };
 #[cfg(feature = "qualification")]
-pub use qwen36_gdn_moe_layer::{Qwen36GdnMoeLayerImmutable, Qwen36GdnMoeLayerObservables};
+pub use qwen36_gdn_moe_layer::{
+    Qwen36GdnMoeLayerImmutable, Qwen36GdnMoeLayerInputs, Qwen36GdnMoeLayerObservables,
+};
 #[cfg(feature = "qualification")]
 pub use qwen36_resident_model::Qwen36ResidentModelObservables;
 #[cfg(feature = "qualification")]

@@ -143,14 +143,13 @@ sources, stable addresses, and zero post-warmup growth. All 22 entries have zero
 memory. The prompt projections retain 50 registers and native `QMMA.16832.F32.E4M3.E4M3`. At a
 2,197 MHz median SM clock, the unblessed prompt graph measures 61.586/63.466/63.479 us at
 T=32/64/128; the repeated intrinsic path measures 60.514/61.420/61.656 us. B=1/8 graph medians are
-10.853/24.554 us. One source-backed layer-0 owner now
-composes both residual boundaries, the complete GDN path, router, eight routed experts, and the
-shared expert into eight immutable exact-B graphs over 47 stable addresses. It owns 489,703,808
-weight bytes and 18,251,056 workspace/state bytes in one 507,955,968-byte arena. Every batch passes
-eager/graph agreement, inactive seam checks, immutable source checks, and zero post-warmup growth;
-B=1 additionally passes the complete represented source formula. At a diagnostic 2,107 MHz median
-SM clock, its direct graph measures 67.869/201.387 us at B=1/8. Full-attention layers, the endpoint,
-and model inference remain unimplemented. The full-attention source seam is
+10.853/24.554 us. One source-backed layer-0 owner now composes both residual boundaries, the
+complete GDN path, router, eight routed experts, and the shared expert into exact `B=1..8` and
+`T=32/64/128` graphs over 47 stable addresses. It owns 489,703,808 weight bytes and 34,459,936
+workspace/state bytes in one 524,164,352-byte arena. All eleven routes pass eager/graph agreement,
+inactive seam/state checks, immutable source/runtime checks, and zero post-warmup growth; B=1
+additionally passes the complete represented source formula. The retained decode diagnostic at a
+2,107 MHz median SM clock measures 67.869/201.387 us at B=1/8. The full-attention source seam is
 now admitted separately: Q, K, and V preserve their E4M3 bytes and three scalar FP32 weight scales
 while losslessly gathering into one `[9216,2048]` Q/K/V plane; the source-native
 `[2048,4096]` output plane remains zero-copy. The first full-attention compute leaf statically
@@ -220,8 +219,8 @@ direct graph measures 199.142/448.010 us at B=1/8; the repeated intrinsic path m
 
 The initial resident text layout then composes 30 GDN/MoE layers, ten full-attention/MoE layers,
 and the endpoint into 41 address-stable arenas. It accounts 19,808,036,096 device weight bytes,
-31,457,280 short-context BF16 cache bytes, 737,446,176 workspace/state bytes, and 41,440 alignment
-bytes for a 20,576,980,992-byte allocation. Eight whole-model decode graphs chain each layer's
+31,457,280 short-context BF16 cache bytes, 1,223,712,576 workspace/state bytes, and 26,560 alignment
+bytes for a 21,063,232,512-byte allocation. Eight whole-model decode graphs chain each layer's
 BF16 publication directly into the next owner. The real checkpoint passes all eight eager/graph
 routes, 76,032 represented endpoint-oracle values, 8,939,520 finite logits, inactive-row and
 replacement-input checks, all 41 stable addresses, zero post-warmup growth, and the complete

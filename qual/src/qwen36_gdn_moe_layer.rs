@@ -10,8 +10,8 @@ use crate::{DeviceBenchmarkError, device_benchmark};
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
-    EngineError, MAX_BATCH, Qwen36GdnMoeLayerImmutable, Qwen36GdnMoeLayerObservables,
-    Qwen36GdnMoeLayerProgram,
+    EngineError, MAX_BATCH, Qwen36GdnMoeLayerImmutable, Qwen36GdnMoeLayerInputs,
+    Qwen36GdnMoeLayerObservables, Qwen36GdnMoeLayerProgram,
 };
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, device_memory_info};
 use tuisko_model::{
@@ -36,6 +36,8 @@ const SLOTS: usize = TOP_K + 1;
 const INTERMEDIATE: usize = Qwen36Moe35B::INTERMEDIATE;
 const RMS_EPSILON: f64 = 1.0e-6;
 const QUERY_SCALE: f64 = 0.088_388_35;
+const MAX_ROWS: usize = 128;
+const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, MAX_ROWS];
 
 /// Failure of the complete source-backed Qwen3.6 GDN/MoE layer gate.
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +76,8 @@ pub struct Qwen36GdnMoeLayerQualification {
     pub inactive_values: usize,
     /// Immutable source/materialized device values proved unchanged.
     pub immutable_values: usize,
+    /// Runtime-owned graph-input values proved unchanged.
+    pub runtime_input_values: usize,
     /// Complete one-allocation owner bytes.
     pub arena_bytes: usize,
     /// Exact source-backed device weight bytes.
@@ -97,7 +101,7 @@ struct SourceMaterialized<'a> {
     moe: MaterializedQwen36MoeLayer<'a>,
 }
 
-/// Qualifies source-backed Qwen3.6 layer 0 at every exact decode batch.
+/// Qualifies source-backed Qwen3.6 layer 0 at every exact decode and prefill route.
 pub fn qualify_qwen36_gdn_moe_layer(
     root: &Path,
 ) -> Result<Qwen36GdnMoeLayerQualification, Qwen36GdnMoeLayerQualificationError> {
@@ -138,6 +142,7 @@ pub fn qualify_qwen36_gdn_moe_layer(
         graph_replay_values: 0,
         inactive_values: 0,
         immutable_values: 0,
+        runtime_input_values: 0,
         arena_bytes: program.arena_bytes(),
         weight_bytes: program.resident_weight_bytes(),
         workspace_bytes: program.workspace_bytes(),
@@ -149,35 +154,45 @@ pub fn qualify_qwen36_gdn_moe_layer(
 
     verify_scales(&program, &source)?;
 
-    for batch in 1..=MAX_BATCH {
-        let first_input = make_input(batch, 0);
-        prepare_run(&program, &stream, batch, &first_input)?;
-        program.launch_eager(&stream, batch)?;
+    for rows in EXACT_ROUTES {
+        let first_input = make_input(rows, 0);
+        prepare_run(&program, &stream, rows, &first_input)?;
+        program.launch_eager(&stream, rows)?;
         let first = program.qualification_observables(&stream)?;
 
-        let input = make_input(batch, 1);
-        prepare_run(&program, &stream, batch, &input)?;
-        program.replay(&stream, batch)?;
+        let input = make_input(rows, 1);
+        prepare_run(&program, &stream, rows, &input)?;
+        let replay_inputs = program.qualification_runtime_inputs(&stream)?;
+        verify_runtime_input_contract(rows, &input, &replay_inputs)?;
+        program.replay(&stream, rows)?;
         let replay = program.qualification_observables(&stream)?;
+        let replay_inputs_after = program.qualification_runtime_inputs(&stream)?;
+        report.runtime_input_values +=
+            verify_runtime_inputs_unchanged(rows, &replay_inputs, &replay_inputs_after)?;
 
-        prepare_run(&program, &stream, batch, &input)?;
-        program.launch_eager(&stream, batch)?;
+        prepare_run(&program, &stream, rows, &input)?;
+        let eager_inputs = program.qualification_runtime_inputs(&stream)?;
+        program.launch_eager(&stream, rows)?;
         let eager = program.qualification_observables(&stream)?;
+        let eager_inputs_after = program.qualification_runtime_inputs(&stream)?;
+        report.runtime_input_values +=
+            verify_runtime_inputs_unchanged(rows, &eager_inputs, &eager_inputs_after)?;
 
-        verify_boundaries(batch, &input, bindings, &replay, &mut report)?;
-        if batch == 1 {
+        verify_boundaries(rows, &input, bindings, &replay, &mut report)?;
+        if rows == 1 {
             verify_source_formula(bindings, &source, &replay, &mut report)?;
         }
-        verify_replay(batch, &eager, &replay, &mut report)?;
-        verify_replacement_input(batch, &first, &replay)?;
-        verify_inactive(batch, &replay, &mut report)?;
-        verify_inactive(batch, &eager, &mut report)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
+        verify_replacement_input(rows, &first, &replay)?;
+        verify_inactive(rows, &replay, &mut report)?;
+        verify_inactive(rows, &eager, &mut report)?;
 
         if program.base_address() != stable_base
             || program.qualification_addresses()? != stable_addresses
         {
             return Err(Qwen36GdnMoeLayerQualificationError::Mismatch(format!(
-                "Qwen3.6 layer owner addresses changed while qualifying B={batch}"
+                "Qwen3.6 layer owner addresses changed while qualifying {}",
+                route_label(rows)
             )));
         }
     }
@@ -193,12 +208,12 @@ pub fn qualify_qwen36_gdn_moe_layer(
     Ok(report)
 }
 
-fn make_input(batch: usize, salt: usize) -> Vec<u16> {
+fn make_input(rows: usize, salt: usize) -> Vec<u16> {
     const PATTERN: [f32; 16] = [
         0.875, -0.875, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0625, -0.0625, 0.03125, -0.03125,
         0.0, 0.5, -0.25, 0.125,
     ];
-    (0..batch * HIDDEN)
+    (0..rows * HIDDEN)
         .map(|index| f32_to_bf16(PATTERN[(index + salt * 5 + index / HIDDEN) & 15]))
         .collect()
 }
@@ -206,14 +221,52 @@ fn make_input(batch: usize, salt: usize) -> Vec<u16> {
 fn prepare_run(
     program: &Qwen36GdnMoeLayerProgram,
     stream: &CudaStream,
-    batch: usize,
+    rows: usize,
     input: &[u16],
 ) -> Result<(), Qwen36GdnMoeLayerQualificationError> {
     program.reset_state(stream)?;
-    program.load_residual(stream, batch, input)?;
+    program.load_residual(stream, rows, input)?;
     program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
 
     Ok(())
+}
+
+fn verify_runtime_input_contract(
+    rows: usize,
+    input: &[u16],
+    actual: &Qwen36GdnMoeLayerInputs,
+) -> Result<(), Qwen36GdnMoeLayerQualificationError> {
+    compare_exact(
+        "runtime residual input",
+        &actual.residual_input[..rows * HIDDEN],
+        input,
+    )?;
+    compare_exact(
+        "runtime state rows",
+        &actual.state_rows,
+        &(0..8u32).collect::<Vec<_>>(),
+    )?;
+
+    Ok(())
+}
+
+fn verify_runtime_inputs_unchanged(
+    rows: usize,
+    before: &Qwen36GdnMoeLayerInputs,
+    after: &Qwen36GdnMoeLayerInputs,
+) -> Result<usize, Qwen36GdnMoeLayerQualificationError> {
+    compare_exact(
+        &format!("{} immutable residual input", route_label(rows)),
+        &after.residual_input,
+        &before.residual_input,
+    )?;
+    compare_exact(
+        &format!("{} immutable state rows", route_label(rows)),
+        &after.state_rows,
+        &before.state_rows,
+    )?;
+
+    Ok(after.residual_input.len() + after.state_rows.len())
 }
 
 fn verify_scales(
@@ -784,7 +837,7 @@ fn verify_experts(
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     eager: &Qwen36GdnMoeLayerObservables,
     replay: &Qwen36GdnMoeLayerObservables,
     report: &mut Qwen36GdnMoeLayerQualification,
@@ -792,7 +845,7 @@ fn verify_replay(
     macro_rules! same {
         ($field:ident) => {
             compare_exact(
-                &format!("B={batch} graph plane `{}`", stringify!($field)),
+                &format!("{} graph plane `{}`", route_label(rows), stringify!($field)),
                 &replay.$field,
                 &eager.$field,
             )?;
@@ -801,7 +854,7 @@ fn verify_replay(
     macro_rules! same_f32 {
         ($field:ident) => {
             compare_exact(
-                &format!("B={batch} graph plane `{}`", stringify!($field)),
+                &format!("{} graph plane `{}`", route_label(rows), stringify!($field)),
                 &replay
                     .$field
                     .iter()
@@ -871,14 +924,15 @@ fn observable_values(values: &Qwen36GdnMoeLayerObservables) -> usize {
 }
 
 fn verify_replacement_input(
-    batch: usize,
+    rows: usize,
     first: &Qwen36GdnMoeLayerObservables,
     replay: &Qwen36GdnMoeLayerObservables,
 ) -> Result<(), Qwen36GdnMoeLayerQualificationError> {
-    let active = batch * HIDDEN;
+    let active = rows * HIDDEN;
     if first.residual_output[..active] == replay.residual_output[..active] {
         return Err(Qwen36GdnMoeLayerQualificationError::Mismatch(format!(
-            "B={batch} graph ignored replacement residual rows"
+            "{} graph ignored replacement residual rows",
+            route_label(rows)
         )));
     }
 
@@ -886,19 +940,20 @@ fn verify_replacement_input(
 }
 
 fn verify_inactive(
-    batch: usize,
+    rows: usize,
     observed: &Qwen36GdnMoeLayerObservables,
     report: &mut Qwen36GdnMoeLayerQualification,
 ) -> Result<(), Qwen36GdnMoeLayerQualificationError> {
     macro_rules! sentinel_u16 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|&value| value != BF16_SENTINEL)
             {
                 return Err(Qwen36GdnMoeLayerQualificationError::Mismatch(format!(
-                    "B={batch} modified inactive `{}` value",
+                    "{} modified inactive `{}` value",
+                    route_label(rows),
                     stringify!($field)
                 )));
             }
@@ -907,13 +962,14 @@ fn verify_inactive(
     }
     macro_rules! sentinel_u8 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|&value| value != BYTE_SENTINEL)
             {
                 return Err(Qwen36GdnMoeLayerQualificationError::Mismatch(format!(
-                    "B={batch} modified inactive `{}` value",
+                    "{} modified inactive `{}` value",
+                    route_label(rows),
                     stringify!($field)
                 )));
             }
@@ -922,13 +978,14 @@ fn verify_inactive(
     }
     macro_rules! sentinel_f32 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|value| value.to_bits() != F32_SENTINEL_BITS)
             {
                 return Err(Qwen36GdnMoeLayerQualificationError::Mismatch(format!(
-                    "B={batch} modified inactive `{}` value",
+                    "{} modified inactive `{}` value",
+                    route_label(rows),
                     stringify!($field)
                 )));
             }
@@ -959,23 +1016,26 @@ fn verify_inactive(
     inactive += sentinel_u16!(residual_output, HIDDEN);
     inactive += sentinel_u16!(next_normalized, HIDDEN);
 
-    let history_begin = batch * QKV_ROWS * 3;
+    let state_slots = if rows <= MAX_BATCH { rows } else { 1 };
+    let history_begin = state_slots * QKV_ROWS * 3;
     if observed.history[history_begin..]
         .iter()
         .any(|&value| value != 0)
     {
         return Err(Qwen36GdnMoeLayerQualificationError::Mismatch(format!(
-            "B={batch} modified inactive history"
+            "{} modified inactive history",
+            route_label(rows)
         )));
     }
     inactive += observed.history.len() - history_begin;
-    let state_begin = batch * STATE_PER_ROW;
+    let state_begin = state_slots * STATE_PER_ROW;
     if observed.state[state_begin..]
         .iter()
         .any(|&value| value.to_bits() != 0)
     {
         return Err(Qwen36GdnMoeLayerQualificationError::Mismatch(format!(
-            "B={batch} modified inactive recurrent state"
+            "{} modified inactive recurrent state",
+            route_label(rows)
         )));
     }
     inactive += observed.state.len() - state_begin;
@@ -1084,12 +1144,12 @@ fn verify_no_device_allocation(
     program: &Qwen36GdnMoeLayerProgram,
     stream: &CudaStream,
 ) -> Result<(), Qwen36GdnMoeLayerQualificationError> {
-    program.replay(stream, MAX_BATCH)?;
+    program.replay(stream, MAX_ROWS)?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
     for _ in 0..2 {
-        for batch in [1, 8, 3, 6, 2, 7, 4, 5] {
-            program.replay(stream, batch)?;
+        for rows in [128, 1, 64, 8, 32, 3, 6, 2, 7, 4, 5] {
+            program.replay(stream, rows)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -1109,6 +1169,14 @@ fn residual_oracle(input: &[u16], branch: &[u16]) -> Vec<u16> {
         .zip(branch)
         .map(|(&input, &branch)| f32_to_bf16(bf16_to_f32(input) + bf16_to_f32(branch)))
         .collect()
+}
+
+fn route_label(rows: usize) -> String {
+    if rows <= MAX_BATCH {
+        format!("B={rows}")
+    } else {
+        format!("T={rows}")
+    }
 }
 
 fn compare_exact<T: PartialEq>(
@@ -1220,6 +1288,7 @@ mod tests {
         assert_eq!(SOURCE_LAYER, 0);
         assert_eq!(Qwen36Moe35B::GDN_INPUT_ROWS, 12_288);
         assert_eq!(Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN, 8);
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
     }
 
     #[test]
@@ -1233,15 +1302,16 @@ mod tests {
         })?;
         let report = qualify_qwen36_gdn_moe_layer(Path::new(&root))?;
 
-        assert_eq!(report.boundary_values, 368_640);
+        assert_eq!(report.boundary_values, 2_662_400);
         assert_eq!(report.weight_bytes, 489_703_808);
-        assert_eq!(report.workspace_bytes, 18_251_056);
-        assert_eq!(report.arena_bytes, 507_955_968);
-        assert_eq!(report.padding_bytes, 1_104);
+        assert_eq!(report.workspace_bytes, 34_459_936);
+        assert_eq!(report.arena_bytes, 524_164_352);
+        assert_eq!(report.padding_bytes, 608);
         assert!(report.source_values > 0);
         assert!(report.graph_replay_values > 0);
         assert!(report.inactive_values > 0);
         assert!(report.immutable_values > 0);
+        assert!(report.runtime_input_values > 0);
         assert!(report.maximum_absolute_error.is_finite());
 
         Ok(())
