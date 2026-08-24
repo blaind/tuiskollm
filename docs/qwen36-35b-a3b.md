@@ -164,8 +164,10 @@ codes plus losslessly swizzled E4M3 scales, and applies the exact second-stage s
 Every `B=1..8` route publishes and graph-replays 8,939,520 finite logits, checks 4,608 independent
 represented-value dots including scale-layout seams, preserves 13,905,920 inactive sentinels, and
 proves its 286,064,640 weight bytes immutable with stable addresses and no post-warmup growth.
-Static resource evidence and direct timing are the next separate slice; the source-backed endpoint
-owner remains unimplemented.
+The eight A16 entries use 40--111 registers, 9,216 bytes shared, and zero stack/local memory; their
+pinned PTX/SASS retains represented E2M1 conversion, warp reduction, and BF16 publication. Direct
+timing remains unreported because the available card was occupied. The source-backed endpoint owner
+remains unimplemented.
 
 ## Implementation order
 

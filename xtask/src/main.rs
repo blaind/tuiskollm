@@ -31,6 +31,8 @@ const QWEN35_NVFP4_QKV_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-qk
 const QWEN35_BF16_LM_HEAD_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-bf16-lm-head-sm120.txt";
 const QWEN36_MOE_ROUTER_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-moe-router-sm120.txt";
 const QWEN36_MOE_EXPERTS_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-moe-experts-sm120.txt";
+const QWEN36_NVFP4_LM_HEAD_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen36-nvfp4-lm-head-sm120.txt";
 const QWEN36_FP8_QKV_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-fp8-qkv-sm120.txt";
 const QWEN36_GDN_INPUT_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-gdn-input-sm120.txt";
 const QWEN36_GDN_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-gdn-output-sm120.txt";
@@ -108,6 +110,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     QWEN35_BF16_LM_HEAD_RESOURCE_BASELINE,
     QWEN36_MOE_ROUTER_RESOURCE_BASELINE,
     QWEN36_MOE_EXPERTS_RESOURCE_BASELINE,
+    QWEN36_NVFP4_LM_HEAD_RESOURCE_BASELINE,
     QWEN36_FP8_QKV_RESOURCE_BASELINE,
     QWEN36_GDN_INPUT_RESOURCE_BASELINE,
     QWEN36_GDN_OUTPUT_RESOURCE_BASELINE,
@@ -836,6 +839,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-qwen35-nvfp4-qkv") => bench_qwen35_nvfp4_qkv(root, &remaining),
         Some("bench-qwen36-moe-router") => bench_qwen36_moe_router(root, &remaining),
         Some("bench-qwen36-moe-experts") => bench_qwen36_moe_experts(root, &remaining),
+        Some("bench-qwen36-nvfp4-lm-head") => bench_qwen36_nvfp4_lm_head(root, &remaining),
         Some("bench-qwen36-fp8-qkv") => bench_qwen36_fp8_qkv(root, &remaining),
         Some("bench-qwen36-gdn-input") => bench_qwen36_gdn_input(root, &remaining),
         Some("bench-qwen36-gdn-output") => bench_qwen36_gdn_output(root, &remaining),
@@ -920,6 +924,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("gate-qwen35-bf16-lm-head") if remaining.is_empty() => gate_qwen35_bf16_lm_head(root),
         Some("gate-qwen36-moe-router") if remaining.is_empty() => gate_qwen36_moe_router(root),
         Some("gate-qwen36-moe-experts") if remaining.is_empty() => gate_qwen36_moe_experts(root),
+        Some("gate-qwen36-nvfp4-lm-head") if remaining.is_empty() => {
+            gate_qwen36_nvfp4_lm_head(root)
+        }
         Some("gate-qwen36-fp8-qkv") if remaining.is_empty() => gate_qwen36_fp8_qkv(root),
         Some("gate-qwen36-gdn-input") if remaining.is_empty() => gate_qwen36_gdn_input(root),
         Some("gate-qwen36-gdn-output") if remaining.is_empty() => gate_qwen36_gdn_output(root),
@@ -1023,6 +1030,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "gate-residual-norm"
                     | "gate-qwen35-residual-norm"
                     | "gate-qwen36-residual-norm"
+                    | "gate-qwen36-nvfp4-lm-head"
                     | "gate-qwen36-fp8-qkv"
                     | "gate-qwen36-gdn-input"
                     | "gate-qwen36-gdn-output"
@@ -1243,6 +1251,7 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_qwen35_bf16_lm_head(root)?;
     gate_qwen36_moe_router(root)?;
     gate_qwen36_moe_experts(root)?;
+    gate_qwen36_nvfp4_lm_head(root)?;
     gate_qwen36_fp8_qkv(root)?;
     gate_qwen36_gdn_input(root)?;
     gate_qwen36_gdn_output(root)?;
@@ -1640,7 +1649,8 @@ fn qualify_qwen36_nvfp4_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
             "--nocapture",
             "--test-threads=1",
         ],
-    )
+    )?;
+    gate_qwen36_nvfp4_lm_head(root)
 }
 
 fn qualify_qwen36_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -3844,6 +3854,34 @@ fn bench_qwen36_moe_experts(
             .env(
                 "TUISKO_GENERATOR_BASELINE_SHA256",
                 sha256(&fs::read(root.join(QWEN36_MOE_EXPERTS_RESOURCE_BASELINE))?),
+            ),
+    )
+}
+
+fn bench_qwen36_nvfp4_lm_head(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen36-nvfp4-lm-head")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(
+                    root.join(QWEN36_NVFP4_LM_HEAD_RESOURCE_BASELINE),
+                )?),
             ),
     )
 }
@@ -10477,6 +10515,83 @@ fn gate_qwen36_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn gate_qwen36_nvfp4_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN36_NVFP4_LM_HEAD_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+    let ptx_path = root.join(PTX);
+    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}; run the pinned release device build first",
+            ptx_path.display()
+        )
+    })?;
+    let entries = parse_entries(&ptx);
+    let routes = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen36_nvfp4_lm_head_a16_TID_"))
+        .collect::<Vec<_>>();
+    require_count("Qwen3.6 NVFP4 LM head", routes.len(), 8)?;
+
+    for entry in &routes {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        for instruction in ["cvt.rn.f16x2.e2m1x2", "shfl.sync.down.b32", "st.global.b16"] {
+            if !entry.body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` PTX", entry.name).into(),
+                );
+            }
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    let mut registers = Vec::with_capacity(routes.len());
+    let mut shared = Vec::with_capacity(routes.len());
+    for entry in routes {
+        let resource = resources.get(entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted Qwen3.6 NVFP4 LM-head entry `{}`",
+                entry.name
+            )
+        })?;
+        require_spill_free(entry.name, resource)?;
+        let body = sass_function_body(sass, entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted Qwen3.6 NVFP4 LM-head SASS `{}`",
+                entry.name
+            )
+        })?;
+        for instruction in ["F2FP.F16.E2M1", "SHFL.DOWN", "STG.E.U16"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+        registers.push(resource.registers);
+        shared.push(resource.shared);
+    }
+    registers.sort_unstable();
+    shared.sort_unstable();
+    require_registers(&baseline, "lm_head_registers", &registers)?;
+    require_uniform_value(&baseline, "shared_bytes", &shared)?;
+
+    println!(
+        "Qwen3.6 NVFP4 LM-head gate passed: 8 A16 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, E2M1/SHFL/BF16-store present",
+        registers, shared
+    );
+    Ok(())
+}
+
 fn gate_qwen36_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(
         root.join(QWEN36_FP8_QKV_RESOURCE_BASELINE),
@@ -12045,6 +12160,7 @@ mod tests {
                 "qual/baselines/qwen35-bf16-lm-head-sm120.txt",
                 "qual/baselines/qwen36-moe-router-sm120.txt",
                 "qual/baselines/qwen36-moe-experts-sm120.txt",
+                "qual/baselines/qwen36-nvfp4-lm-head-sm120.txt",
                 "qual/baselines/qwen36-fp8-qkv-sm120.txt",
                 "qual/baselines/qwen36-gdn-input-sm120.txt",
                 "qual/baselines/qwen36-gdn-output-sm120.txt",
