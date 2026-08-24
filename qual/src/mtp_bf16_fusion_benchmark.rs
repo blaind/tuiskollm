@@ -91,7 +91,7 @@ impl Session {
                 ExactDeviceCase::new(
                     "qwen3_8/mtp/bf16_input_fusion",
                     format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
+                    BenchmarkWorkload::warm_operator_mtp(route.batch as u64),
                     OperationAccounting::new(
                         logical_bytes(route.batch),
                         route.batch as u64,
