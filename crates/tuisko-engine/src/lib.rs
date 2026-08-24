@@ -20,6 +20,8 @@ mod paged_kv_slots;
 mod program;
 mod qwen35_full_attention_layer;
 mod qwen35_full_attention_layer_layout;
+mod qwen35_gdn_layer;
+mod qwen35_gdn_layer_layout;
 mod qwen35_nvfp4_mlp;
 mod resident_generation;
 mod resident_model_layout;
@@ -55,6 +57,8 @@ pub use paged_kv_slots::{PagedKvRoute, PagedKvSlotPool, PagedKvSlotState, PagedK
 pub use program::TextEndpointProgram;
 pub use qwen35_full_attention_layer::Qwen35FullAttentionLayerProgram;
 pub use qwen35_full_attention_layer_layout::Qwen35FullAttentionLayerLayout;
+pub use qwen35_gdn_layer::Qwen35GdnLayerProgram;
+pub use qwen35_gdn_layer_layout::Qwen35GdnLayerLayout;
 pub use qwen35_nvfp4_mlp::Qwen35Nvfp4MlpProgram;
 pub use resident_generation::{
     ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentBatchGenerator,
@@ -104,6 +108,8 @@ pub use program::EndpointObservables;
 pub use qwen35_full_attention_layer::{
     Qwen35FullAttentionLayerImmutable, Qwen35FullAttentionLayerObservables,
 };
+#[cfg(feature = "qualification")]
+pub use qwen35_gdn_layer::{Qwen35GdnLayerImmutable, Qwen35GdnLayerObservables};
 #[cfg(feature = "qualification")]
 pub use resident_model_layout::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
