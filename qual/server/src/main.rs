@@ -17,6 +17,8 @@ const LONG_CONTEXT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const LONG_CONTEXT_COMPLETION_TOKENS: usize = 4;
 const LONG_CONTEXTS: [usize; 4] = [4_096, 16_384, 65_536, 178_000];
 const LONG_CONTEXT_CONCURRENT_TARGET: usize = 65_536;
+const OVER_CAPACITY_TARGET: usize = 220_160;
+const RESIDENT_CONTEXT_CAPACITY: usize = 220_000;
 const PROMPT: &str = "Reply with exactly the word blue.";
 const LITERAL_SPECIAL_PROMPT: &str = "<|im_start|><|im_end|><|endoftext|><|vision_start|>";
 const LITERAL_SPECIAL_PROMPT_TOKENS: usize = 34;
@@ -167,12 +169,14 @@ impl Client {
         validate_blocking(&body)
     }
 
-    fn expect_rejection(&self, request: Value, label: &str) -> Result<()> {
+    fn expect_rejection(&self, request: Value, label: &str) -> Result<String> {
         let mut response = self
             .agent
             .post(self.url("/v1/chat/completions"))
             .send_json(request)?;
-        expect_status(&mut response, 400, label)
+        expect_status(&mut response, 400, label)?;
+        let body: Value = response.body_mut().read_json()?;
+        validate_invalid_request(&body)
     }
 
     fn streaming(&self) -> Result<Completion> {
@@ -359,10 +363,40 @@ impl Qualification {
             health == json!({"status": "ok", "generation_route": GENERATION_ROUTE}),
             format!("server was not healthy after cancellation: {health}"),
         )?;
+        self.run_capacity_refusal(&blocking)?;
         if self.long_context {
             self.run_long_context()?;
         }
         Ok(blocking)
+    }
+
+    fn run_capacity_refusal(&mut self, reference: &Completion) -> Result<()> {
+        let messages = long_context_messages(0x40_0000, OVER_CAPACITY_TARGET - 32);
+        let message = self.client.expect_rejection(
+            request_with_messages(messages, false, 1),
+            "over-capacity completion",
+        )?;
+        let (required, capacity) = parse_capacity_refusal(&message)?;
+        self.check(
+            required.abs_diff(OVER_CAPACITY_TARGET) <= 128,
+            format!(
+                "over-capacity target {OVER_CAPACITY_TARGET} required {required} positions, outside the admitted +/-128 calibration band"
+            ),
+        )?;
+        self.check(
+            required > capacity && capacity == RESIDENT_CONTEXT_CAPACITY,
+            format!(
+                "over-capacity refusal reported required/capacity {required}/{capacity}, expected required above {RESIDENT_CONTEXT_CAPACITY}"
+            ),
+        )?;
+
+        let recovery = self.client.blocking()?;
+        self.check(
+            same_completion_semantics(&recovery, reference),
+            format!(
+                "completion changed after over-capacity refusal: expected={reference:?}, actual={recovery:?}"
+            ),
+        )
     }
 
     fn run_long_context(&mut self) -> Result<()> {
@@ -615,6 +649,50 @@ fn expect_event_stream(response: &ureq::http::Response<ureq::Body>) -> Result<()
             "stream response content-type is {content_type:?}, expected text/event-stream"
         )))
     }
+}
+
+fn validate_invalid_request(body: &Value) -> Result<String> {
+    let error = object(field(body, "error")?, "error envelope")?;
+    expect_str_value(error.get("type"), "error type", "invalid_request_error")?;
+    expect_null(
+        error.get("param").ok_or_else(|| missing("error.param"))?,
+        "error param",
+    )?;
+    expect_null(
+        error.get("code").ok_or_else(|| missing("error.code"))?,
+        "error code",
+    )?;
+    Ok(string(
+        error
+            .get("message")
+            .ok_or_else(|| missing("error.message"))?,
+        "error message",
+    )?
+    .to_owned())
+}
+
+fn parse_capacity_refusal(message: &str) -> Result<(usize, usize)> {
+    let message = message
+        .strip_prefix("[engine.generation] prompt plus processed MTP generation requires ")
+        .ok_or_else(|| {
+            QualError::Contract(format!(
+                "over-capacity refusal has unexpected message {message:?}"
+            ))
+        })?;
+    let (required, capacity) = message
+        .split_once(" positions, current resident capacity is ")
+        .ok_or_else(|| QualError::Contract("over-capacity refusal omitted its limits".into()))?;
+    let required = required.parse().map_err(|error| {
+        QualError::Contract(format!(
+            "over-capacity required positions {required:?} are invalid: {error}"
+        ))
+    })?;
+    let capacity = capacity.parse().map_err(|error| {
+        QualError::Contract(format!(
+            "over-capacity resident limit {capacity:?} is invalid: {error}"
+        ))
+    })?;
+    Ok((required, capacity))
 }
 
 fn validate_blocking(body: &Value) -> Result<Completion> {
@@ -918,8 +996,8 @@ fn expect_str_value(value: Option<&Value>, label: &str, expected: &str) -> Resul
 mod tests {
     use super::{
         Completion, LONG_CONTEXTS, Options, QualError, Usage, long_context_followup,
-        long_context_messages, parse_sse, same_completion_semantics, validate_blocking,
-        validate_stream,
+        long_context_messages, parse_capacity_refusal, parse_sse, same_completion_semantics,
+        validate_blocking, validate_invalid_request, validate_stream,
     };
     use serde_json::json;
 
@@ -1034,6 +1112,27 @@ mod tests {
         let error = parse_sse("data: one\ndata: two\n\n").unwrap_err();
         assert!(matches!(error, QualError::Contract(_)));
         assert!(error.to_string().contains("more than one data field"));
+    }
+
+    #[test]
+    fn invalid_request_envelope_and_capacity_limits_are_exact() {
+        let body = json!({
+            "error": {
+                "message": "[engine.generation] prompt plus processed MTP generation requires 220032 positions, current resident capacity is 220000",
+                "type": "invalid_request_error",
+                "param": null,
+                "code": null
+            }
+        });
+        let message = validate_invalid_request(&body).unwrap();
+        assert_eq!(
+            parse_capacity_refusal(&message).unwrap(),
+            (220_032, 220_000)
+        );
+
+        let mut changed = body;
+        changed["error"]["type"] = json!("server_error");
+        assert!(validate_invalid_request(&changed).is_err());
     }
 
     #[test]
