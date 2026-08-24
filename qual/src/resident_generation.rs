@@ -14,6 +14,7 @@ use tuisko_model::{CheckpointError, CheckpointSnapshot, Qwen38_27B};
 // 8f20cb4fdf7ab2e5ff9def3598b433f4cafcd9c02aa62d9cfa19eee400bf225a and
 // 4ff0853747ac857814a12455869dc4f111eb7d40e2af544a1389a8c73e107041.
 const VLLM_CASES: [(&[u32], u32); 2] = [(&[151_643], 198), (&[151_643, 151_644], 30_350)];
+const NATIVE_PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1024];
 
 /// Failure of the concrete resident-generation integration gate.
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +46,8 @@ pub struct ResidentGenerationQualification {
     pub reference_cases: usize,
     /// Production chat steps streamed and reassembled.
     pub chat_steps: usize,
+    /// Exact from-empty prefill graphs selected through the production dispatch.
+    pub native_prefill_routes: usize,
     /// Exact device arena bytes owned by the generator.
     pub arena_bytes: usize,
     /// Exact page-locked embedding and logit staging bytes.
@@ -74,12 +77,32 @@ pub fn qualify_resident_generation(
 
     // Warm every host/device transfer path before observing allocation stability.
     let _ = generator.qualification_greedy_after_tokens(VLLM_CASES[0].0)?;
+    let mut native_tokens = [0u32; NATIVE_PREFILL_ROUTES.len()];
+    for (index, tokens) in NATIVE_PREFILL_ROUTES.into_iter().enumerate() {
+        let fixture = vec![151_643; tokens];
+        let (token, selected) = generator.qualification_greedy_after_tokens_with_route(&fixture)?;
+        if selected != tokens {
+            return Err(ResidentGenerationQualificationError::Mismatch(format!(
+                "T={tokens} production dispatch selected {selected} native prefill tokens"
+            )));
+        }
+        native_tokens[index] = token;
+    }
     let before = device_memory_info(generator.context())?;
     for (tokens, expected) in VLLM_CASES {
         let actual = generator.qualification_greedy_after_tokens(tokens)?;
         if actual != expected {
             return Err(ResidentGenerationQualificationError::Mismatch(format!(
                 "vLLM next-token fixture {tokens:?} selected {actual}, expected {expected}"
+            )));
+        }
+    }
+    for (index, tokens) in NATIVE_PREFILL_ROUTES.into_iter().enumerate() {
+        let fixture = vec![151_643; tokens];
+        let (token, selected) = generator.qualification_greedy_after_tokens_with_route(&fixture)?;
+        if selected != tokens || token != native_tokens[index] {
+            return Err(ResidentGenerationQualificationError::Mismatch(format!(
+                "T={tokens} native prefill replay changed dispatch or greedy output"
             )));
         }
     }
@@ -156,6 +179,7 @@ pub fn qualify_resident_generation(
     Ok(ResidentGenerationQualification {
         reference_cases: VLLM_CASES.len(),
         chat_steps: step_tokens.len(),
+        native_prefill_routes: NATIVE_PREFILL_ROUTES.len(),
         arena_bytes: generator.arena_bytes(),
         host_stager_bytes: generator.host_stager_bytes(),
         kv_route_host_bytes: generator.kv_route_host_bytes(),
@@ -204,6 +228,7 @@ mod tests {
         let report = qualify_resident_generation(&PathBuf::from(root))?;
         assert_eq!(report.reference_cases, 2);
         assert!((1..=2).contains(&report.chat_steps));
+        assert_eq!(report.native_prefill_routes, 4);
         assert_eq!(report.arena_bytes, 28_380_566_016);
         assert_eq!(report.host_stager_bytes, 10_982_400);
         Ok(())

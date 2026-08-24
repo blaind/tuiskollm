@@ -11,6 +11,8 @@ use tuisko_frontend::{ChatMessage, ChatTemplateOptions, FrontendError, TextFront
 use tuisko_gpu::{CudaContext, GpuError, device_memory_info};
 use tuisko_model::{CheckpointError, CheckpointSnapshot, Qwen38_27B};
 
+const NATIVE_PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1024];
+
 /// Failure of the compact resident-generation integration gate.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidentBatchGenerationQualificationError {
@@ -43,6 +45,8 @@ pub struct ResidentBatchGenerationQualification {
     pub rounds: usize,
     /// Exact pending replay batches exercised across B=1..8.
     pub route_batches: usize,
+    /// Exact from-empty prefill routes exercised through batch admission.
+    pub native_prefill_routes: usize,
     /// Physical hole recycled while surviving requests remained active.
     pub recycled_slot: usize,
     /// Active cancellation boundaries exercised.
@@ -66,6 +70,10 @@ pub fn qualify_resident_batch_generation(
     let _preflight = device_benchmark::preflight()?;
     let snapshot = Arc::new(CheckpointSnapshot::<Qwen38_27B>::open(root)?);
     let oracle_frontend = TextFrontend::open(snapshot.as_ref())?;
+    let native_requests = NATIVE_PREFILL_ROUTES
+        .into_iter()
+        .map(|tokens| exact_prompt_request(&oracle_frontend, tokens))
+        .collect::<Result<Vec<_>, _>>()?;
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
     if capability != (12, 0) {
@@ -89,6 +97,8 @@ pub fn qualify_resident_batch_generation(
     for request in &requests {
         expected.push(run_alone(&mut generator, request)?);
     }
+    verify_native_prefill_inventory(&mut generator, &native_requests)?;
+    generator.qualification_clear_retained()?;
     verify_exact_batch_inventory(&mut generator, &requests[0], &expected[0])?;
     generator.qualification_clear_retained()?;
     let before = device_memory_info(generator.context())?;
@@ -173,6 +183,7 @@ pub fn qualify_resident_batch_generation(
         requests: requests.len(),
         rounds: 3,
         route_batches: 8,
+        native_prefill_routes: NATIVE_PREFILL_ROUTES.len(),
         recycled_slot: 1,
         cancellations: 2,
         exact_prefix_reuses: 1,
@@ -181,6 +192,113 @@ pub fn qualify_resident_batch_generation(
         host_stager_bytes: generator.host_stager_bytes(),
         kv_route_host_bytes: generator.kv_route_host_bytes(),
     })
+}
+
+fn exact_prompt_request(
+    frontend: &TextFrontend,
+    target_tokens: usize,
+) -> Result<ChatGenerationRequest, ResidentBatchGenerationQualificationError> {
+    let mut lower = 1usize;
+    let mut upper = target_tokens;
+    while lower < upper {
+        let words = lower + (upper - lower) / 2;
+        let request = greedy_request(&vec!["x"; words].join(" "), 1);
+        let tokens = frontend
+            .encode_chat(&request.messages, &request.template)?
+            .len();
+        if tokens < target_tokens {
+            lower = words + 1;
+        } else {
+            upper = words;
+        }
+    }
+    let request = greedy_request(&vec!["x"; lower].join(" "), 1);
+    let actual = frontend
+        .encode_chat(&request.messages, &request.template)?
+        .len();
+    if actual != target_tokens {
+        return Err(ResidentBatchGenerationQualificationError::Mismatch(
+            format!(
+                "could not construct exact T={target_tokens} rendered prompt; nearest deterministic fixture has T={actual}"
+            ),
+        ));
+    }
+    Ok(request)
+}
+
+fn verify_native_prefill_inventory(
+    generator: &mut ResidentBatchGenerator,
+    requests: &[ChatGenerationRequest],
+) -> Result<(), ResidentBatchGenerationQualificationError> {
+    for (&tokens, request) in NATIVE_PREFILL_ROUTES.iter().zip(requests) {
+        let admission = generator.admit(request)?;
+        if admission.prompt_tokens != tokens
+            || admission.device_reused_tokens != 0
+            || admission.native_prefill_tokens != tokens
+        {
+            return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                format!(
+                    "T={tokens} batch admission reported prompt={}, reused={}, native={}",
+                    admission.prompt_tokens,
+                    admission.device_reused_tokens,
+                    admission.native_prefill_tokens
+                ),
+            ));
+        }
+        let events = generator.step()?;
+        let event = events.iter().next().ok_or_else(|| {
+            ResidentBatchGenerationQualificationError::Mismatch(format!(
+                "T={tokens} native prefill produced no generation event"
+            ))
+        })?;
+        if events.len() != 1
+            || event.request_id != admission.request_id
+            || event.completed.is_none()
+        {
+            return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                format!("T={tokens} native prefill changed its terminal scheduler seam"),
+            ));
+        }
+        let native_output = event
+            .completed
+            .as_ref()
+            .expect("native terminal output was checked")
+            .clone();
+
+        let reused = generator.admit(request)?;
+        if reused.prompt_tokens != tokens
+            || reused.device_reused_tokens != tokens
+            || reused.native_prefill_tokens != 0
+        {
+            return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                format!(
+                    "T={tokens} retained admission reported prompt={}, reused={}, native={}",
+                    reused.prompt_tokens, reused.device_reused_tokens, reused.native_prefill_tokens
+                ),
+            ));
+        }
+        let reused_events = generator.step()?;
+        let reused_event = reused_events.iter().next().ok_or_else(|| {
+            ResidentBatchGenerationQualificationError::Mismatch(format!(
+                "T={tokens} retained admission produced no generation event"
+            ))
+        })?;
+        let reused_output = reused_event.completed.as_ref();
+        if reused_events.len() != 1
+            || reused_event.request_id != reused.request_id
+            || reused_output.is_none_or(|output| {
+                output.prompt.token_ids != native_output.prompt.token_ids
+                    || output.token_ids != native_output.token_ids
+                    || output.text != native_output.text
+                    || output.finish_reason != native_output.finish_reason
+            })
+        {
+            return Err(ResidentBatchGenerationQualificationError::Mismatch(
+                format!("T={tokens} retained admission changed its terminal scheduler seam"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verify_prefix_reuse_and_cancellation(
@@ -482,6 +600,7 @@ mod tests {
         assert_eq!(report.requests, 4);
         assert_eq!(report.rounds, 3);
         assert_eq!(report.route_batches, 8);
+        assert_eq!(report.native_prefill_routes, 4);
         assert_eq!(report.recycled_slot, 1);
         assert_eq!(report.cancellations, 2);
         assert_eq!(report.exact_prefix_reuses, 1);

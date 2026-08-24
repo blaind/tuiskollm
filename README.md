@@ -55,10 +55,11 @@ resident graphs through the 220,000-position ceiling. The compact owner preserve
 token as pending, packs only requests needing device work, cancels without advancing that pending
 token, and recycles holes without moving survivor state. Inactive slots retain their exact processed
 token span and may skip only a prefix that the next prompt contains in full; divergence falls back
-to cold priming. Server prompt priming still uses the exact B=1 decode route until the resident
-prefill owner is wired into scheduling, so long prompts remain a correctness path rather than a
-production-TTFT path. Vision inputs and MTP generation are not served yet and are rejected or remain
-outside the HTTP contract rather than silently taking another route.
+to cold priming. Fresh prompts of exactly `T=32,64,128,1024` use the corresponding whole-model
+prefill graph through both single-request and compact scheduler admission. Reused prefixes and
+other prompt lengths retain the qualified B=1 decode priming path; arbitrary prompt tiling is not
+silently inferred from the from-empty graphs. Vision inputs and MTP generation are not served yet
+and are rejected or remain outside the HTTP contract rather than silently taking another route.
 
 The standalone SM120 operator inventory also includes partitioned paged GQA through 220,000
 positions at every exact `B=1..8` route. The resident program owns its maximum-B partial workspace
@@ -106,8 +107,8 @@ each CTA advances tokens serially. GDN output retains one token-owned dynamic qu
 row and projects `T=32,64,128` with 32x32 native E4M3 MMA tiles or `T=1024` with 64x32 macro tiles.
 The source-backed dense-FP8 GDN owner composes every mixer, recurrent-state, residual, MLP, and
 next-normalization seam at the same four prefill widths, with one mapped prefill state/history row
-and stable TMA descriptors for its macro MLP. Resident/server routing remains separate, so these
-routes do not yet change server priming.
+and stable TMA descriptors for its macro MLP. The resident owner composes these leaves and server
+admission selects its exact from-empty prompt graphs only at the four admitted widths.
 
 ## Current device slice
 
