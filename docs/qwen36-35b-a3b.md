@@ -151,13 +151,15 @@ now admitted separately: Q, K, and V preserve their E4M3 bytes and three scalar 
 while losslessly gathering into one `[9216,2048]` Q/K/V plane; the source-native
 `[2048,4096]` output plane remains zero-copy. The first full-attention compute leaf statically
 quantizes BF16 inputs with the checkpoint's shared scalar input scale and projects every exact
-`B=1..8` route. It passes 73,728 activation-code, 331,776 FP64-formula output, 405,504 graph-replay,
-and 630,784 inactive-sentinel comparisons with immutable sources, stable addresses, and zero
-post-warmup growth. Its eight quantizers retain 25 registers, the eight projections retain sorted
-register counts `[31,32,35,38,38,40,44,45]`, and every entry uses zero stack/local memory. At a
-diagnostic 2,167 MHz median SM clock, its unblessed warm repeated path
-measures 8.064/21.350 us at B=1/8; the production graph boundary measures 10.240/22.544 us. The
-following BF16 Q/K seam reuses the exact width-256 normalization and 64-wide `[11,11,10]`
+`B=1..8` and `T=32/64/128` route. It passes 532,480 exact activation-code, 2,396,160 FP64-formula
+output, 2,928,640 graph-replay, and 25,862,144 inactive-sentinel comparisons with immutable sources,
+stable addresses, and zero post-warmup growth. Its decode quantizers retain 25 registers and its
+projections retain sorted register counts `[31,32,35,38,38,40,44,45]`; the prompt quantizers retain
+25 registers and the native `QMMA.16832.F32.E4M3.E4M3` projections retain 54. Every entry uses zero
+stack/local memory. At a loaded 2,190 MHz median SM clock, the unblessed prompt path measures
+32.644/34.347/59.671 us and the complete graph measures 34.802/36.656/61.432 us at T=32/64/128.
+B=1/8 measure 8.148/21.263 us for the path and 10.240/22.539 us for the graph. The following BF16
+Q/K seam reuses the exact width-256 normalization and 64-wide `[11,11,10]`
 interleaved MRoPE arithmetic already qualified for Qwen3.5, but owns separate Qwen3.6 symbols and
 the narrower two-KV-head page layout. Its eight routes pass 147,456 prepared-query values, 36,864
 exact BF16 cache values, complete eager/graph agreement, untouched pages, immutable inputs, stable

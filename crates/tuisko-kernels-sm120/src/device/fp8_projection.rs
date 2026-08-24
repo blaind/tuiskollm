@@ -606,8 +606,10 @@ unsafe fn store_prefill_projection_mma_tile<const TOKENS: usize, const STATIC_SC
     weight_scales: *const u16,
     static_activation_scale: f32,
     static_scale_split: usize,
+    static_second_scale_split: usize,
     static_first_weight_scale: f32,
     static_second_weight_scale: f32,
+    static_third_weight_scale: f32,
     output: *mut u16,
     first_token: usize,
     first_output: usize,
@@ -616,8 +618,10 @@ unsafe fn store_prefill_projection_mma_tile<const TOKENS: usize, const STATIC_SC
     let first_weight_scale = if STATIC_SCALES {
         if first_output < static_scale_split {
             static_first_weight_scale
-        } else {
+        } else if first_output < static_second_scale_split {
             static_second_weight_scale
+        } else {
+            static_third_weight_scale
         }
     } else {
         // SAFETY: the exact projection tile maps the source scale word.
@@ -626,8 +630,10 @@ unsafe fn store_prefill_projection_mma_tile<const TOKENS: usize, const STATIC_SC
     let second_weight_scale = if STATIC_SCALES {
         if first_output + 1 < static_scale_split {
             static_first_weight_scale
-        } else {
+        } else if first_output + 1 < static_second_scale_split {
             static_second_weight_scale
+        } else {
+            static_third_weight_scale
         }
     } else {
         // SAFETY: output columns are paired and the second scale is adjacent.
@@ -695,6 +701,8 @@ pub(crate) unsafe fn prefill_projection_mma<
             weight_scales,
             0.0,
             0,
+            0,
+            0.0,
             0.0,
             0.0,
             output,
@@ -733,8 +741,52 @@ pub(crate) unsafe fn prefill_projection_mma_static_scales<
             core::ptr::null(),
             static_activation_scale,
             static_scale_split,
+            output_rows,
             static_first_weight_scale,
             static_second_weight_scale,
+            static_second_weight_scale,
+            output,
+            k_tiles,
+            output_rows,
+        );
+    }
+}
+
+/// Projects one admitted FP8 prefill width with three exact static weight-scale bands.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn prefill_projection_mma_static_three_scales<
+    const INPUT_COLUMNS: usize,
+    const TOKENS: usize,
+    const BM: usize,
+    const BK_WORDS: usize,
+    const K_SUBTILES: usize,
+>(
+    activation_codes: *const u32,
+    static_activation_scale: f32,
+    weight_codes: *const u32,
+    static_first_scale_split: usize,
+    static_second_scale_split: usize,
+    static_first_weight_scale: f32,
+    static_second_weight_scale: f32,
+    static_third_weight_scale: f32,
+    output: *mut u16,
+    k_tiles: u32,
+    output_rows: usize,
+) {
+    // SAFETY: the three source families are contiguous bands in the fused Q/K/V plane.
+    unsafe {
+        prefill_projection_mma_impl::<INPUT_COLUMNS, TOKENS, BM, BK_WORDS, K_SUBTILES, true>(
+            activation_codes,
+            core::ptr::null(),
+            weight_codes,
+            core::ptr::null(),
+            static_activation_scale,
+            static_first_scale_split,
+            static_second_scale_split,
+            static_first_weight_scale,
+            static_second_weight_scale,
+            static_third_weight_scale,
             output,
             k_tiles,
             output_rows,
@@ -758,8 +810,10 @@ unsafe fn prefill_projection_mma_impl<
     weight_scales: *const u16,
     static_activation_scale: f32,
     static_scale_split: usize,
+    static_second_scale_split: usize,
     static_first_weight_scale: f32,
     static_second_weight_scale: f32,
+    static_third_weight_scale: f32,
     output: *mut u16,
     k_tiles: u32,
     output_rows: usize,
@@ -942,8 +996,10 @@ unsafe fn prefill_projection_mma_impl<
             weight_scales,
             static_activation_scale,
             static_scale_split,
+            static_second_scale_split,
             static_first_weight_scale,
             static_second_weight_scale,
+            static_third_weight_scale,
             output,
             first_token,
             first_output,
@@ -955,8 +1011,10 @@ unsafe fn prefill_projection_mma_impl<
             weight_scales,
             static_activation_scale,
             static_scale_split,
+            static_second_scale_split,
             static_first_weight_scale,
             static_second_weight_scale,
+            static_third_weight_scale,
             output,
             first_token,
             first_output + 8,
@@ -968,8 +1026,10 @@ unsafe fn prefill_projection_mma_impl<
             weight_scales,
             static_activation_scale,
             static_scale_split,
+            static_second_scale_split,
             static_first_weight_scale,
             static_second_weight_scale,
+            static_third_weight_scale,
             output,
             first_token,
             first_output + 16,
@@ -981,8 +1041,10 @@ unsafe fn prefill_projection_mma_impl<
             weight_scales,
             static_activation_scale,
             static_scale_split,
+            static_second_scale_split,
             static_first_weight_scale,
             static_second_weight_scale,
+            static_third_weight_scale,
             output,
             first_token,
             first_output + 24,

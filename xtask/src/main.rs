@@ -10991,16 +10991,38 @@ fn gate_qwen36_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_attention_fp8_quantize_TID_"))
         .collect::<Vec<_>>();
+    let prefill_quantize = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen36_attention_fp8_quantize_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
     let projection = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_fp8_qkv_TID_"))
+        .collect::<Vec<_>>();
+    let prefill_projection = entries
+        .iter()
+        .filter(|entry| entry.name.starts_with("qwen36_fp8_qkv_prefill_TID_"))
         .collect::<Vec<_>>();
     require_count(
         "Qwen3.6 attention static FP8 quantization",
         quantize.len(),
         8,
     )?;
+    require_count(
+        "Qwen3.6 attention prefill static FP8 quantization",
+        prefill_quantize.len(),
+        3,
+    )?;
     require_count("Qwen3.6 FP8 QKV projection", projection.len(), 8)?;
+    require_count(
+        "Qwen3.6 FP8 QKV prefill projection",
+        prefill_projection.len(),
+        3,
+    )?;
 
     for (role, routes, instructions) in [
         (
@@ -11017,6 +11039,16 @@ fn gate_qwen36_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
                 "shfl.sync.down.b32",
                 "cvt.rn.bf16x2.f32",
             ][..],
+        ),
+        (
+            "prefill static quantization",
+            prefill_quantize.as_slice(),
+            &["div.rn.f32", "cvt.rn.satfinite.e4m3x2.f32"][..],
+        ),
+        (
+            "QKV prefill projection",
+            prefill_projection.as_slice(),
+            &[][..],
         ),
     ] {
         for entry in routes {
@@ -11044,8 +11076,12 @@ fn gate_qwen36_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
     let resources = &artifact.resources;
     let sass = artifact.sass()?;
     let mut quantize_registers = Vec::with_capacity(quantize.len());
+    let mut prefill_quantize_registers = Vec::with_capacity(prefill_quantize.len());
     let mut projection_registers = Vec::with_capacity(projection.len());
-    let mut shared = Vec::with_capacity(quantize.len() + projection.len());
+    let mut prefill_projection_registers = Vec::with_capacity(prefill_projection.len());
+    let mut shared = Vec::with_capacity(
+        quantize.len() + prefill_quantize.len() + projection.len() + prefill_projection.len(),
+    );
     for (role, routes, instructions, registers) in [
         (
             "static quantization",
@@ -11058,6 +11094,18 @@ fn gate_qwen36_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
             projection,
             &["F2FP.F16.E4M3", "FFMA", "SHFL.DOWN", "STG.E.U16"][..],
             &mut projection_registers,
+        ),
+        (
+            "prefill static quantization",
+            prefill_quantize,
+            &["F2FP.SATFINITE.E4M3", "STG.E.U16"][..],
+            &mut prefill_quantize_registers,
+        ),
+        (
+            "QKV prefill projection",
+            prefill_projection,
+            &["QMMA.16832.F32.E4M3.E4M3", "LDGSTS", "STG.E.U16"][..],
+            &mut prefill_projection_registers,
         ),
     ] {
         for entry in routes {
@@ -11088,15 +11136,35 @@ fn gate_qwen36_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
     quantize_registers.sort_unstable();
+    prefill_quantize_registers.sort_unstable();
     projection_registers.sort_unstable();
+    prefill_projection_registers.sort_unstable();
     shared.sort_unstable();
     require_registers(&baseline, "quantize_registers", &quantize_registers)?;
     require_registers(&baseline, "projection_registers", &projection_registers)?;
+    for (key, registers) in [
+        (
+            "prefill_quantize_registers",
+            prefill_quantize_registers.as_slice(),
+        ),
+        (
+            "prefill_projection_registers",
+            prefill_projection_registers.as_slice(),
+        ),
+    ] {
+        if baseline.contains_key(key) {
+            require_registers(&baseline, key, registers)?;
+        }
+    }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "Qwen3.6 FP8 QKV gate passed: 8 static quantize + 8 projection entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/FFMA/SHFL/BF16-store present",
-        quantize_registers, projection_registers, shared
+        "Qwen3.6 FP8 QKV gate passed: 8 decode + 3 prefill routes, REG quantize {:?} / {:?}, projection {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/QMMA/FFMA/SHFL/BF16-store present",
+        quantize_registers,
+        prefill_quantize_registers,
+        projection_registers,
+        prefill_projection_registers,
+        shared
     );
     Ok(())
 }

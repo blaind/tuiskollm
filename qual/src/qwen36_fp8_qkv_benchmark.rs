@@ -7,15 +7,15 @@ use crate::device_benchmark::{
     preflight, require_current_process_exclusive, warmup_launches,
 };
 use crate::qwen36_fp8_qkv::{
-    INPUT_COLUMNS, INPUT_SCALE, KEY_WEIGHT_SCALE, MAX_BATCH, PROJECTED_ROWS, QUERY_WEIGHT_SCALE,
-    Regions, VALUE_WEIGHT_SCALE, layout, make_fixture,
+    EXACT_ROUTES, INPUT_COLUMNS, INPUT_SCALE, KEY_WEIGHT_SCALE, MAX_BATCH, PROJECTED_ROWS,
+    QUERY_WEIGHT_SCALE, Regions, VALUE_WEIGHT_SCALE, layout, make_fixture,
 };
 use crate::target::Qwen36Fp8QkvOp;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer};
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
@@ -65,8 +65,9 @@ impl Session {
             weight_codes: arena.address(regions.weight_codes)?,
             output: arena.address(regions.output)?,
         };
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| capture_route(&op, &stream, &addresses, batch, repeated_operations))
+        let routes = EXACT_ROUTES
+            .iter()
+            .map(|&rows| capture_route(&op, &stream, &addresses, rows, repeated_operations))
             .collect::<GpuResult<Vec<_>>>()?;
 
         Ok(Self {
@@ -94,15 +95,22 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     "qwen36_35b_a3b/full_attention/static_fp8_qkv",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
                     &route.leaf,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 )
@@ -115,19 +123,19 @@ fn capture_route(
     op: &Qwen36Fp8QkvOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, batch))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, batch)?;
+            launch(op, stream, addresses, rows)?;
         }
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
         leaf,
         repeated,
     })
@@ -137,12 +145,12 @@ fn launch(
     op: &Qwen36Fp8QkvOp,
     stream: &CudaStream,
     addresses: &Addresses,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     unsafe {
         op.launch(
             stream,
-            batch,
+            rows,
             addresses.input,
             addresses.activation_codes,
             INPUT_SCALE,
@@ -155,16 +163,16 @@ fn launch(
     }
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(rows: usize) -> usize {
     let weights = PROJECTED_ROWS * INPUT_COLUMNS;
-    let input = batch * INPUT_COLUMNS * size_of::<u16>();
-    let activation_codes = batch * INPUT_COLUMNS;
-    let output = batch * PROJECTED_ROWS * size_of::<u16>();
+    let input = rows * INPUT_COLUMNS * size_of::<u16>();
+    let activation_codes = rows * INPUT_COLUMNS;
+    let output = rows * PROJECTED_ROWS * size_of::<u16>();
 
     weights + input + activation_codes + output
 }
 
-/// Measures every exact Qwen3.6 static-FP8 full-attention QKV route.
+/// Measures every exact Qwen3.6 static-FP8 full-attention QKV decode and prompt route.
 pub fn benchmark_qwen36_fp8_qkv(
     options: DeviceBenchmarkOptions,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
@@ -185,7 +193,7 @@ pub fn benchmark_qwen36_fp8_qkv(
         "qwen36_35b_a3b/full_attention/qkv_workspace",
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes - padding_bytes,
-        "max_batch=8 static activation codes and BF16 QKV output",
+        "max_rows=128 static activation codes and BF16 QKV output",
     )?;
     memory.register_owned(
         "qwen36_35b_a3b/full_attention/qkv_alignment_padding",
@@ -221,18 +229,19 @@ pub fn benchmark_qwen36_fp8_qkv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qwen36_fp8_qkv::MAX_ROWS;
 
     #[test]
     fn accounting_covers_static_quantize_and_qkv_projection() {
         let (layout, regions) = layout().unwrap();
-        let b8 = regions.weight_bytes()
-            + MAX_BATCH
+        let t128 = regions.weight_bytes()
+            + MAX_ROWS
                 * (INPUT_COLUMNS * (size_of::<u16>() + size_of::<u8>())
                     + PROJECTED_ROWS * size_of::<u16>());
 
-        assert_eq!(logical_bytes(MAX_BATCH), b8);
-        assert_eq!(layout.byte_len(), 19_070_976);
+        assert_eq!(logical_bytes(MAX_ROWS), t128);
+        assert_eq!(layout.byte_len(), 22_020_096);
         assert_eq!(regions.weight_bytes(), 18_874_368);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 196_608);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 3_145_728);
     }
 }
