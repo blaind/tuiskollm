@@ -8,9 +8,13 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::convert::Infallible;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::sync::mpsc::{Receiver, channel};
+use tokio_stream::wrappers::ReceiverStream;
 use tuisko_engine::GeneratedText;
+
+// Bounded so a connected-but-stalled client backpressures the pump instead of buffering
+// the whole generation in RAM.
+const STREAM_EVENT_BUFFER: usize = 32;
 
 /// One exact scheduler-to-HTTP reply.
 pub enum GenerationReply {
@@ -33,7 +37,7 @@ struct Usage {
 
 /// Collects one generation channel into an OpenAI blocking response.
 pub async fn blocking_response(
-    mut replies: UnboundedReceiver<GenerationReply>,
+    mut replies: Receiver<GenerationReply>,
     id: String,
     created: u64,
     split_reasoning: bool,
@@ -101,14 +105,14 @@ pub async fn blocking_response(
 /// not a rejection before committing to the stream shape.
 pub fn streaming_response(
     first: GenerationReply,
-    mut replies: UnboundedReceiver<GenerationReply>,
+    mut replies: Receiver<GenerationReply>,
     id: String,
     created: u64,
     split_reasoning: bool,
     parse_tools: bool,
     include_usage: bool,
 ) -> Response {
-    let (events_tx, events_rx) = unbounded_channel::<Result<Event, Infallible>>();
+    let (events_tx, events_rx) = channel::<Result<Event, Infallible>>(STREAM_EVENT_BUFFER);
     tokio::spawn(async move {
         let role = stream_chunk(
             json!({
@@ -122,6 +126,7 @@ pub fn streaming_response(
         );
         if events_tx
             .send(Ok(Event::default().data(role.to_string())))
+            .await
             .is_err()
         {
             return;
@@ -142,7 +147,7 @@ pub fn streaming_response(
                 GenerationReply::Delta(delta) => {
                     let parsed = parser.push(&delta);
                     if let Some(event) = assistant_delta_event(&id, created, parsed, include_usage)
-                        && events_tx.send(Ok(event)).is_err()
+                        && events_tx.send(Ok(event)).await.is_err()
                     {
                         return;
                     }
@@ -152,13 +157,13 @@ pub fn streaming_response(
                     let parsed = parser.finish();
                     if let Some(event) =
                         assistant_delta_event(&id, created, parsed.delta, include_usage)
-                        && events_tx.send(Ok(event)).is_err()
+                        && events_tx.send(Ok(event)).await.is_err()
                     {
                         return;
                     }
                     if let Some(event) =
                         tool_calls_event(&id, created, &parsed.tool_calls, include_usage)
-                        && events_tx.send(Ok(event)).is_err()
+                        && events_tx.send(Ok(event)).await.is_err()
                     {
                         return;
                     }
@@ -179,6 +184,7 @@ pub fn streaming_response(
                     );
                     if events_tx
                         .send(Ok(Event::default().data(event.to_string())))
+                        .await
                         .is_err()
                     {
                         return;
@@ -194,6 +200,7 @@ pub fn streaming_response(
                         });
                         if events_tx
                             .send(Ok(Event::default().data(event.to_string())))
+                            .await
                             .is_err()
                         {
                             return;
@@ -213,6 +220,7 @@ pub fn streaming_response(
                     });
                     if events_tx
                         .send(Ok(Event::default().data(event.to_string())))
+                        .await
                         .is_err()
                     {
                         return;
@@ -230,14 +238,15 @@ pub fn streaming_response(
             });
             if events_tx
                 .send(Ok(Event::default().data(event.to_string())))
+                .await
                 .is_err()
             {
                 return;
             }
         }
-        let _ = events_tx.send(Ok(Event::default().data("[DONE]")));
+        let _ = events_tx.send(Ok(Event::default().data("[DONE]"))).await;
     });
-    let stream = UnboundedReceiverStream::new(events_rx);
+    let stream = ReceiverStream::new(events_rx);
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
@@ -354,12 +363,12 @@ fn stream_chunk(mut chunk: Value, include_usage: bool) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{GenerationReply, blocking_response, streaming_response};
+    use super::{GenerationReply, STREAM_EVENT_BUFFER, blocking_response, streaming_response};
     use axum::body::to_bytes;
     use axum::http::{StatusCode, header};
     use serde_json::{Value, json};
     use tokio::runtime::Builder;
-    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::mpsc::{channel, error::TrySendError};
     use tuisko_engine::{FinishReason, GeneratedText};
     use tuisko_frontend::PromptEncoding;
 
@@ -389,12 +398,12 @@ mod tests {
     #[test]
     fn blocking_response_carries_reasoning_content_and_exact_usage() {
         runtime().block_on(async {
-            let (sender, receiver) = unbounded_channel();
+            let (sender, receiver) = channel(8);
             sender
-                .send(GenerationReply::Delta("think</think>\n\nanswer".into()))
+                .try_send(GenerationReply::Delta("think</think>\n\nanswer".into()))
                 .unwrap();
             sender
-                .send(GenerationReply::Done(output(
+                .try_send(GenerationReply::Done(output(
                     "think</think>\n\nanswer",
                     FinishReason::Length,
                 )))
@@ -417,15 +426,15 @@ mod tests {
     #[test]
     fn streaming_response_emits_role_tool_usage_and_done_events() {
         runtime().block_on(async {
-            let (sender, receiver) = unbounded_channel();
+            let (sender, receiver) = channel(8);
             sender
-                .send(GenerationReply::Delta(
+                .try_send(GenerationReply::Delta(
                     "call><function=bash><parameter=command>ls</parameter></function></tool_call>"
                         .into(),
                 ))
                 .unwrap();
             sender
-                .send(GenerationReply::Done(output(
+                .try_send(GenerationReply::Done(output(
                     "inspect</think>\n\n<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>",
                     FinishReason::Stop,
                 )))
@@ -476,25 +485,25 @@ mod tests {
     #[test]
     fn blocking_disconnect_and_engine_error_are_distinct() {
         runtime().block_on(async {
-            let (sender, receiver) = unbounded_channel();
+            let (sender, receiver) = channel(8);
             sender
-                .send(GenerationReply::Rejected("bad sampling".into()))
+                .try_send(GenerationReply::Rejected("bad sampling".into()))
                 .unwrap();
             let response = blocking_response(receiver, "id".into(), 1, false, false).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let error: Value = serde_json::from_str(&body(response).await).unwrap();
             assert_eq!(error["error"]["message"], "bad sampling");
 
-            let (sender, receiver) = unbounded_channel();
+            let (sender, receiver) = channel(8);
             sender
-                .send(GenerationReply::Failed("device launch failed".into()))
+                .try_send(GenerationReply::Failed("device launch failed".into()))
                 .unwrap();
             let response = blocking_response(receiver, "id".into(), 1, false, false).await;
             assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
             let error: Value = serde_json::from_str(&body(response).await).unwrap();
             assert_eq!(error["error"]["type"], "server_error");
 
-            let (sender, receiver) = unbounded_channel::<GenerationReply>();
+            let (sender, receiver) = channel::<GenerationReply>(8);
             drop(sender);
             let response = blocking_response(receiver, "id".into(), 1, false, false).await;
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -502,9 +511,41 @@ mod tests {
     }
 
     #[test]
+    fn stalled_clients_stop_accepting_replies_at_the_channel_bounds() {
+        runtime().block_on(async {
+            let (sender, receiver) = channel(4);
+            let response = streaming_response(
+                GenerationReply::Delta("data ".into()),
+                receiver,
+                "id".into(),
+                1,
+                false,
+                false,
+                false,
+            );
+            let mut buffered = 0;
+            loop {
+                match sender.try_send(GenerationReply::Delta("data ".into())) {
+                    Ok(()) => {
+                        buffered += 1;
+                        assert!(
+                            buffered <= STREAM_EVENT_BUFFER + 8,
+                            "an unread stream kept accepting replies"
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                    Err(TrySendError::Full(_)) => break,
+                    Err(TrySendError::Closed(_)) => panic!("pump dropped the reply channel"),
+                }
+            }
+            drop(response);
+        });
+    }
+
+    #[test]
     fn streaming_failure_and_disconnect_stay_in_stream() {
         runtime().block_on(async {
-            let (_sender, receiver) = unbounded_channel();
+            let (_sender, receiver) = channel(8);
             let response = streaming_response(
                 GenerationReply::Failed("device launch failed".into()),
                 receiver,
@@ -524,7 +565,7 @@ mod tests {
             assert_eq!(error["error"]["message"], "device launch failed");
             assert_eq!(error["error"]["type"], "server_error");
 
-            let (sender, receiver) = unbounded_channel::<GenerationReply>();
+            let (sender, receiver) = channel::<GenerationReply>(8);
             drop(sender);
             let response = streaming_response(
                 GenerationReply::Delta("partial".into()),
