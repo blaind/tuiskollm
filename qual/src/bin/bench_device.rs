@@ -31,7 +31,7 @@ use tuisko_qual::{
     benchmark_qwen36_full_attention_layer, benchmark_qwen36_gdn_input,
     benchmark_qwen36_gdn_moe_layer, benchmark_qwen36_gdn_output, benchmark_qwen36_gdn_prepare,
     benchmark_qwen36_gdn_recurrence, benchmark_qwen36_moe_experts, benchmark_qwen36_moe_router,
-    benchmark_qwen36_paged_gqa, benchmark_qwen36_residual_norm,
+    benchmark_qwen36_nvfp4_lm_head, benchmark_qwen36_paged_gqa, benchmark_qwen36_residual_norm,
     benchmark_resident_long_context_model, benchmark_resident_model, benchmark_resident_mtp,
     benchmark_resident_mtp_batch_generation, benchmark_resident_mtp_generation,
     benchmark_resident_mtp_sampling, benchmark_resident_prefill, benchmark_target_mtp_verify,
@@ -58,7 +58,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
     let suite = arguments
         .next()
-        .ok_or("usage: bench-device <attention-qk-prepare|qwen35-attention-qk-prepare|qwen36-attention-qk-prepare|paged-gqa|qwen35-paged-gqa|qwen36-paged-gqa|long-context-paged-gqa|attention-output|qwen35-nvfp4-attention-output|qwen36-attention-output|mtp-bf16-fusion|mtp-bf16-qkv|mtp-bf16-qk-prepare|mtp-bf16-paged-gqa|mtp-bf16-attention-output|mtp-bf16-mlp|mtp-layer|mtp-prompt-prime|resident-mtp|generation-mtp-greedy|generation-mtp-sampling|generation-mtp-batch|target-mtp-verify|residual-norm|qwen35-residual-norm|qwen35-nvfp4-swiglu|qwen35-nvfp4-down|qwen35-nvfp4-qkv|qwen35-nvfp4-gdn-input|qwen35-gdn-prepare|qwen35-gdn-recurrence|qwen35-nvfp4-gdn-output|qwen35-nvfp4-mlp|qwen35-text-endpoint|qwen35-resident-model|qwen36-residual-norm|qwen36-moe-router|qwen36-moe-experts|qwen36-fp8-qkv|qwen36-gdn-input|qwen36-gdn-prepare|qwen36-gdn-recurrence|qwen36-gdn-output|qwen36-gdn-moe-layer|qwen36-full-attention-layer|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|nvfp4-swiglu|nvfp4-down|nvfp4-mlp|gdn-prepare|gdn-recurrence|gdn-output|dense-fp8-mlp|dense-fp8-gdn-layer|full-attention-layer|qwen35-full-attention-layer|qwen35-gdn-layer|resident-model|resident-prefill|resident-long-context-model|text-endpoint|profile-resident-model|qualify-fp8-lm-head> [SNAPSHOT] [options]")?;
+        .ok_or("usage: bench-device <attention-qk-prepare|qwen35-attention-qk-prepare|qwen36-attention-qk-prepare|paged-gqa|qwen35-paged-gqa|qwen36-paged-gqa|long-context-paged-gqa|attention-output|qwen35-nvfp4-attention-output|qwen36-attention-output|mtp-bf16-fusion|mtp-bf16-qkv|mtp-bf16-qk-prepare|mtp-bf16-paged-gqa|mtp-bf16-attention-output|mtp-bf16-mlp|mtp-layer|mtp-prompt-prime|resident-mtp|generation-mtp-greedy|generation-mtp-sampling|generation-mtp-batch|target-mtp-verify|residual-norm|qwen35-residual-norm|qwen35-nvfp4-swiglu|qwen35-nvfp4-down|qwen35-nvfp4-qkv|qwen35-nvfp4-gdn-input|qwen35-gdn-prepare|qwen35-gdn-recurrence|qwen35-nvfp4-gdn-output|qwen35-nvfp4-mlp|qwen35-text-endpoint|qwen35-resident-model|qwen36-residual-norm|qwen36-moe-router|qwen36-moe-experts|qwen36-nvfp4-lm-head|qwen36-fp8-qkv|qwen36-gdn-input|qwen36-gdn-prepare|qwen36-gdn-recurrence|qwen36-gdn-output|qwen36-gdn-moe-layer|qwen36-full-attention-layer|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|nvfp4-swiglu|nvfp4-down|nvfp4-mlp|gdn-prepare|gdn-recurrence|gdn-output|dense-fp8-mlp|dense-fp8-gdn-layer|full-attention-layer|qwen35-full-attention-layer|qwen35-gdn-layer|resident-model|resident-prefill|resident-long-context-model|text-endpoint|profile-resident-model|qualify-fp8-lm-head> [SNAPSHOT] [options]")?;
     #[cfg(feature = "device")]
     if suite == "profile-resident-model" {
         return run_resident_profile(arguments);
@@ -299,6 +299,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             let (options, json_path) =
                 parse_options(arguments, DeviceBenchmarkOptions::short_graph())?;
             (benchmark_qwen36_moe_experts(options)?, json_path)
+        }
+        #[cfg(feature = "device")]
+        "qwen36-nvfp4-lm-head" => {
+            let (options, json_path) =
+                parse_options(arguments, DeviceBenchmarkOptions::short_graph())?;
+            (benchmark_qwen36_nvfp4_lm_head(options)?, json_path)
         }
         #[cfg(feature = "device")]
         "qwen36-gdn-input" => {

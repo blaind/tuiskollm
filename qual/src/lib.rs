@@ -219,6 +219,10 @@ mod qwen36_moe_router;
 #[cfg(feature = "device")]
 mod qwen36_moe_router_benchmark;
 #[cfg(feature = "device")]
+mod qwen36_nvfp4_lm_head;
+#[cfg(feature = "device")]
+mod qwen36_nvfp4_lm_head_benchmark;
+#[cfg(feature = "device")]
 mod resident_batch_generation;
 #[cfg(feature = "device")]
 mod resident_generation;
@@ -576,6 +580,13 @@ pub use qwen36_moe_router::{
 };
 #[cfg(feature = "device")]
 pub use qwen36_moe_router_benchmark::benchmark_qwen36_moe_router;
+#[cfg(feature = "device")]
+pub use qwen36_nvfp4_lm_head::{
+    Qwen36Nvfp4LmHeadQualification, Qwen36Nvfp4LmHeadQualificationError,
+    qualify_qwen36_nvfp4_lm_head,
+};
+#[cfg(feature = "device")]
+pub use qwen36_nvfp4_lm_head_benchmark::benchmark_qwen36_nvfp4_lm_head;
 #[cfg(feature = "device")]
 pub use resident_batch_generation::{
     ResidentBatchGenerationQualification, ResidentBatchGenerationQualificationError,
