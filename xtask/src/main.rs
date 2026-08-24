@@ -56,6 +56,8 @@ const ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/attention-qk-prepare-sm120.txt";
 const QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-attention-qk-prepare-sm120.txt";
+const QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen36-attention-qk-prepare-sm120.txt";
 const PAGED_GQA_RESOURCE_BASELINE: &str = "qual/baselines/paged-gqa-sm120.txt";
 const QWEN35_PAGED_GQA_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-paged-gqa-sm120.txt";
 const LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE: &str =
@@ -116,6 +118,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     GDN_OUTPUT_RESOURCE_BASELINE,
     ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+    QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     PAGED_GQA_RESOURCE_BASELINE,
     QWEN35_PAGED_GQA_RESOURCE_BASELINE,
     LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE,
@@ -820,6 +823,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-qwen35-attention-qk-prepare") => {
             bench_qwen35_attention_qk_prepare(root, &remaining)
         }
+        Some("bench-qwen36-attention-qk-prepare") => {
+            bench_qwen36_attention_qk_prepare(root, &remaining)
+        }
         Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
         Some("bench-fp8-gdn-input") => bench_fp8_gdn_input(root, &remaining),
         Some("bench-fp8-lm-head") => bench_fp8_lm_head(root, &remaining),
@@ -895,6 +901,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("gate-qwen35-attention-qk-prepare") if remaining.is_empty() => {
             gate_qwen35_attention_qk_prepare(root)
+        }
+        Some("gate-qwen36-attention-qk-prepare") if remaining.is_empty() => {
+            gate_qwen36_attention_qk_prepare(root)
         }
         Some("gate-fp8-qkv") if remaining.is_empty() => gate_fp8_qkv(root),
         Some("gate-fp8-gdn-input") if remaining.is_empty() => gate_fp8_gdn_input(root),
@@ -978,6 +987,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "gate-qwen36-gdn-input"
                     | "gate-qwen36-gdn-output"
                     | "gate-qwen35-attention-qk-prepare"
+                    | "gate-qwen36-attention-qk-prepare"
                     | "gate-qwen35-nvfp4-attention-output"
                     | "gate-qwen35-gdn-prepare"
                     | "gate-qwen35-gdn-recurrence"
@@ -1204,6 +1214,7 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_gdn_output(root)?;
     gate_attention_qk_prepare(root)?;
     gate_qwen35_attention_qk_prepare(root)?;
+    gate_qwen36_attention_qk_prepare(root)?;
     gate_paged_gqa(root)?;
     gate_qwen35_paged_gqa(root)?;
     gate_long_context_paged_gqa(root)?;
@@ -2371,7 +2382,8 @@ fn qualify_qwen36_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>
             "attention_qk_prepare_benchmark::tests::qwen36_",
             "--nocapture",
         ],
-    )
+    )?;
+    gate_qwen36_attention_qk_prepare(root)
 }
 
 fn qualify_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -3958,6 +3970,34 @@ fn bench_qwen35_attention_qk_prepare(
                 "TUISKO_GENERATOR_BASELINE_SHA256",
                 sha256(&fs::read(
                     root.join(QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE),
+                )?),
+            ),
+    )
+}
+
+fn bench_qwen36_attention_qk_prepare(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen36-attention-qk-prepare")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(
+                    root.join(QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE),
                 )?),
             ),
     )
@@ -8301,6 +8341,18 @@ fn gate_mtp_bf16_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
     )
 }
 
+fn gate_qwen36_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
+    gate_attention_qk_prepare_target(
+        root,
+        QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+        "qwen36_attention_qk_prepare_exact_TID_",
+        None,
+        "Qwen3.6 attention Q/K prepare",
+        "F2FP.BF16.F32.PACK_AB",
+        "BF16",
+    )
+}
+
 fn gate_attention_qk_prepare_target(
     root: &Path,
     baseline_path: &str,
@@ -11616,6 +11668,7 @@ mod tests {
                 "qual/baselines/gdn-output-sm120.txt",
                 "qual/baselines/attention-qk-prepare-sm120.txt",
                 "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",
+                "qual/baselines/qwen36-attention-qk-prepare-sm120.txt",
                 "qual/baselines/paged-gqa-sm120.txt",
                 "qual/baselines/qwen35-paged-gqa-sm120.txt",
                 "qual/baselines/long-context-paged-gqa-sm120.txt",

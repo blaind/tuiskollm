@@ -135,10 +135,11 @@ following BF16 Q/K seam reuses the exact width-256 normalization and 64-wide `[1
 interleaved MRoPE arithmetic already qualified for Qwen3.5, but owns separate Qwen3.6 symbols and
 the narrower two-KV-head page layout. Its eight routes pass 147,456 prepared-query values, 36,864
 exact BF16 cache values, complete eager/graph agreement, untouched pages, immutable inputs, stable
-addresses, and zero post-warmup growth in a 2,380,288-byte arena. At a diagnostic locked 2,197 MHz
-SM clock, its warm repeated path measures 2.825/3.141 us at B=1/8; the 4.104-us graph boundary is
-dispatch-limited throughout this small leaf. Paged attention, gated output, and the full layer
-owner remain separate qualification slices.
+addresses, and zero post-warmup growth in a 2,380,288-byte arena. All eight entries retain 54
+registers, zero stack/local memory, and 1,024 bytes of shared memory. At a diagnostic locked
+2,197 MHz SM clock, its warm repeated path measures 2.825/3.141 us at B=1/8; the 4.104-us graph
+boundary is dispatch-limited throughout this small leaf. Paged attention, gated output, and the
+full layer owner remain separate qualification slices.
 
 ## Implementation order
 
