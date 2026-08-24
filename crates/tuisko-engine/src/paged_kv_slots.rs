@@ -435,6 +435,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_admission_rollback_restores_the_exact_retained_prefix() {
+        let mut pool = PagedKvSlotPool::new(6).unwrap();
+        pool.activate(0).unwrap();
+        pool.reserve_tokens(0, 3 * 64).unwrap();
+        pool.activate(1).unwrap();
+        pool.reserve_tokens(1, 70).unwrap();
+        pool.retain(1).unwrap();
+        let routes = [pool.route(1, 0).unwrap(), pool.route(1, 69).unwrap()];
+
+        pool.activate(1).unwrap();
+        let error = pool.reserve_tokens(1, 200).unwrap_err();
+        assert!(error.to_string().contains("only 1 are free"));
+        assert_eq!(pool.truncate_tokens(1, 70).unwrap(), 0);
+        pool.retain(1).unwrap();
+
+        assert_eq!(pool.state(1).unwrap(), PagedKvSlotState::Retained);
+        assert_eq!(pool.token_count(1).unwrap(), 70);
+        assert_eq!(pool.page_count(1).unwrap(), 2);
+        assert_eq!(pool.free_pages(), 1);
+        assert_eq!(pool.route(1, 0).unwrap(), routes[0]);
+        assert_eq!(pool.route(1, 69).unwrap(), routes[1]);
+
+        pool.truncate_tokens(0, 64).unwrap();
+        pool.activate(1).unwrap();
+        pool.reserve_tokens(1, 200).unwrap();
+        assert_eq!(pool.route(1, 0).unwrap(), routes[0]);
+        assert_eq!(pool.route(1, 69).unwrap(), routes[1]);
+        assert_eq!(pool.token_count(1).unwrap(), 200);
+    }
+
+    #[test]
     fn partial_page_truncation_preserves_only_the_exact_processed_length() {
         let mut pool = PagedKvSlotPool::new(8).unwrap();
         pool.activate(0).unwrap();

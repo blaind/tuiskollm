@@ -354,12 +354,23 @@ impl ResidentBatchGenerator {
         if reset {
             self.program.recycle_kv_slot(&self.stream, slot)?;
             self.program.reset_slot(&self.stream, slot)?;
-            self.program.activate_kv_slot(slot)?;
-        } else {
-            self.program.activate_kv_slot(slot)?;
         }
-        self.program
-            .reserve_kv_slot_tokens(&self.stream, slot, required_positions)?;
+        self.program.activate_kv_slot(slot)?;
+        if let Err(error) = self
+            .program
+            .reserve_kv_slot_tokens(&self.stream, slot, required_positions)
+        {
+            // No replay has happened yet, so the retained prefix is still exact.
+            if reset {
+                self.program.recycle_kv_slot(&self.stream, slot)?;
+            } else {
+                self.program
+                    .truncate_kv_slot_tokens(&self.stream, slot, device_reused_tokens)?;
+                self.program.retain_kv_slot(slot)?;
+            }
+            return Err(error);
+        }
+        self.retained[slot] = None;
         self.program.load_slot_routes(&self.stream, &[slot])?;
         let native_prefill_tokens = prime_prompt(
             &mut self.program,
@@ -584,7 +595,6 @@ impl ResidentBatchGenerator {
             })
             .max_by_key(|&(_, tokens, last_used)| (tokens, last_used));
         if let Some((slot, tokens, _)) = prefix {
-            self.retained[slot] = None;
             return Ok((slot, tokens, false));
         }
         if let Some(slot) = (0..MAX_BATCH)
