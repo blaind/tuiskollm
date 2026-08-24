@@ -1,14 +1,20 @@
 //! Exact-target NVFP4 down projection.
 
 use crate::Sm120Arch;
+use cuda_device::async_copy::{
+    cp_async_ca_4, cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group,
+};
 use cuda_device::{
     SharedArray, cuda_module, kernel, launch_bounds, launch_contract, ptx_asm, thread,
 };
 use std::sync::Arc;
-use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_gpu::{
+    CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, LaunchConfig2D, PreparedLaunch,
+};
 use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const PREFILL_ROWS: [usize; 4] = [32, 64, 128, 1_024];
 const HIDDEN: usize = Qwen38_27B::HIDDEN;
 const INPUT_COLUMNS: usize = Qwen38_27B::INTERMEDIATE;
 const OUTPUT_ROWS: usize = HIDDEN;
@@ -38,6 +44,34 @@ const B1_SHARED_LANE_STRIDE: usize = GROUP_K / 2 + 1;
 const B1_SHARED_PHASE_U32: usize = 32 * B1_SHARED_LANE_STRIDE;
 const SHARED_U32: usize = MAX_BATCH * PHASE_PACKED_PAIRS;
 
+// Twelve warps cover a native 48-token by 64-output tile. Two 256-wide K
+// stages occupy 36 KiB, retaining two CTAs per SM while all 68 K tiles traverse
+// the source 17,408-wide represented plane without padding or chunking.
+const W4_BLOCK_M: usize = 64;
+const W4_TILE_M: usize = 48;
+const W4_BLOCK_N: usize = 64;
+const W4_BLOCK_K: usize = 256;
+const W4_WARPS_N: usize = 4;
+const W4_WARP_M: usize = 16;
+const W4_WARP_N: usize = W4_BLOCK_N / W4_WARPS_N;
+const W4_MMA_N: usize = W4_WARP_N / 8;
+const W4_STAGES: usize = 2;
+const W4_K64_PER_STAGE: usize = W4_BLOCK_K / 64;
+const W4_CODE_ROW_BYTES: usize = W4_BLOCK_K / 2;
+const W4_SEGMENTS_PER_ROW: usize = W4_CODE_ROW_BYTES / 16;
+const W4_THREADS: u32 = ((W4_TILE_M / W4_WARP_M) * W4_WARPS_N * 32) as u32;
+
+const W4_A_CODE_BYTES: usize = W4_STAGES * W4_BLOCK_M * W4_CODE_ROW_BYTES;
+const W4_B_CODE_BYTES: usize = W4_STAGES * W4_BLOCK_N * W4_CODE_ROW_BYTES;
+const W4_A_SCALE_BYTES: usize = W4_STAGES * W4_BLOCK_M * W4_K64_PER_STAGE * 4;
+const W4_B_SCALE_BYTES: usize = W4_STAGES * W4_BLOCK_N * W4_K64_PER_STAGE * 4;
+const W4_A_CODE_OFFSET: usize = 0;
+const W4_B_CODE_OFFSET: usize = W4_A_CODE_OFFSET + W4_A_CODE_BYTES;
+const W4_A_SCALE_OFFSET: usize = W4_B_CODE_OFFSET + W4_B_CODE_BYTES;
+const W4_B_SCALE_OFFSET: usize = W4_A_SCALE_OFFSET + W4_A_SCALE_BYTES;
+const W4_SHARED_BYTES: usize = W4_B_SCALE_OFFSET + W4_B_SCALE_BYTES;
+const W4_SHARED_U32: usize = W4_SHARED_BYTES / 4;
+
 const _: () = assert!(HIDDEN == 5_120);
 const _: () = assert!(INPUT_COLUMNS == 17_408);
 const _: () = assert!(OUTPUT_ROWS == 5_120);
@@ -46,11 +80,14 @@ const _: () = assert!(Qwen35_9B::HIDDEN == 4_096);
 const _: () = assert!(Qwen35_9B::INTERMEDIATE == 12_288);
 const _: () = assert!(PHASES * CODE_WORDS_PER_PHASE == CODE_BYTES_PER_ROW / size_of::<u32>());
 const _: () = assert!(SHARED_U32 * size_of::<u32>() == 8_192);
+const _: () = assert!(INPUT_COLUMNS.is_multiple_of(W4_BLOCK_K));
+const _: () = assert!(OUTPUT_ROWS.is_multiple_of(W4_BLOCK_N));
+const _: () = assert!(W4_SHARED_BYTES == 36_864);
 
 #[cuda_module]
 mod kernels {
     use super::*;
-    use cuda_device::{convert, float, warp};
+    use cuda_device::{convert, float, tcgen05, warp, wmma};
 
     #[inline(always)]
     fn weight_scale_offset<A: Arch>(parent_row: usize, scale_tile: usize) -> usize {
@@ -453,6 +490,569 @@ mod kernels {
             );
         }
     }
+
+    #[inline(always)]
+    fn w4_swizzled_byte(row: usize, logical_byte: usize) -> usize {
+        let logical_segment = logical_byte >> 4;
+        let byte_in_segment = logical_byte & 15;
+        let physical_segment = logical_segment ^ (row & (W4_SEGMENTS_PER_ROW - 1));
+
+        physical_segment * 16 + byte_in_segment
+    }
+
+    #[inline(always)]
+    unsafe fn load_u32x4(source: *const u32) -> (u32, u32, u32, u32) {
+        let first: u32;
+        let second: u32;
+        let third: u32;
+        let fourth: u32;
+
+        unsafe {
+            ptx_asm!(
+                "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];",
+                out("=r") first,
+                out("=r") second,
+                out("=r") third,
+                out("=r") fourth,
+                in("l") source,
+                clobber("memory"),
+            );
+        }
+
+        (first, second, third, fourth)
+    }
+
+    #[inline(always)]
+    fn accumulate_max_abs(maximum: f32, value: f32) -> f32 {
+        let mut result = maximum;
+
+        unsafe {
+            ptx_asm!(
+                "{ .reg .f32 absolute; abs.f32 absolute, %1; max.f32 %0, %0, absolute; }",
+                inout("+f") result,
+                in("f") value,
+                options(register_only),
+            );
+        }
+
+        result
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn pack_e2m1x16(
+        v0: f32,
+        v1: f32,
+        v2: f32,
+        v3: f32,
+        v4: f32,
+        v5: f32,
+        v6: f32,
+        v7: f32,
+        v8: f32,
+        v9: f32,
+        v10: f32,
+        v11: f32,
+        v12: f32,
+        v13: f32,
+        v14: f32,
+        v15: f32,
+    ) -> (u32, u32) {
+        let codes_lo: u32;
+        let codes_hi: u32;
+
+        unsafe {
+            ptx_asm!(
+                "{ .reg .b8 b0; .reg .b8 b1; .reg .b8 b2; .reg .b8 b3; \
+                   .reg .b8 b4; .reg .b8 b5; .reg .b8 b6; .reg .b8 b7; \
+                   cvt.rn.satfinite.e2m1x2.f32 b0, %3, %2; \
+                   cvt.rn.satfinite.e2m1x2.f32 b1, %5, %4; \
+                   cvt.rn.satfinite.e2m1x2.f32 b2, %7, %6; \
+                   cvt.rn.satfinite.e2m1x2.f32 b3, %9, %8; \
+                   cvt.rn.satfinite.e2m1x2.f32 b4, %11, %10; \
+                   cvt.rn.satfinite.e2m1x2.f32 b5, %13, %12; \
+                   cvt.rn.satfinite.e2m1x2.f32 b6, %15, %14; \
+                   cvt.rn.satfinite.e2m1x2.f32 b7, %17, %16; \
+                   mov.b32 %0, {b0, b1, b2, b3}; \
+                   mov.b32 %1, {b4, b5, b6, b7}; }",
+                out("=r") codes_lo,
+                out("=r") codes_hi,
+                in("f") v0,
+                in("f") v1,
+                in("f") v2,
+                in("f") v3,
+                in("f") v4,
+                in("f") v5,
+                in("f") v6,
+                in("f") v7,
+                in("f") v8,
+                in("f") v9,
+                in("f") v10,
+                in("f") v11,
+                in("f") v12,
+                in("f") v13,
+                in("f") v14,
+                in("f") v15,
+                options(register_only),
+            );
+        }
+
+        (codes_lo, codes_hi)
+    }
+
+    #[inline(always)]
+    unsafe fn quantize_prefill_body<const TOKENS: usize>(
+        task: usize,
+        input: *const u32,
+        codes: *mut u32,
+        scales: *mut u8,
+        input_scale_divisor: f32,
+    ) {
+        if task >= TOKENS * GROUPS_PER_ROW {
+            return;
+        }
+
+        let token = task / GROUPS_PER_ROW;
+        let group = task - token * GROUPS_PER_ROW;
+        let source = unsafe { input.add(token * (INPUT_COLUMNS / 2) + group * (GROUP_K / 2)) };
+        let (p0, p1, p2, p3) = unsafe { load_u32x4(source) };
+        let (p4, p5, p6, p7) = unsafe { load_u32x4(source.add(4)) };
+        let (v0, v1) = convert::cvt_f32x2_bf16x2(p0);
+        let (v2, v3) = convert::cvt_f32x2_bf16x2(p1);
+        let (v4, v5) = convert::cvt_f32x2_bf16x2(p2);
+        let (v6, v7) = convert::cvt_f32x2_bf16x2(p3);
+        let (v8, v9) = convert::cvt_f32x2_bf16x2(p4);
+        let (v10, v11) = convert::cvt_f32x2_bf16x2(p5);
+        let (v12, v13) = convert::cvt_f32x2_bf16x2(p6);
+        let (v14, v15) = convert::cvt_f32x2_bf16x2(p7);
+        let values = [
+            v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15,
+        ];
+        let mut max_abs = 0.0f32;
+        let mut index = 0usize;
+
+        while index < GROUP_K {
+            max_abs = accumulate_max_abs(max_abs, values[index]);
+            index += 1;
+        }
+
+        let scale_unencoded = float::div_rn_f32(input_scale_divisor * max_abs, 6.0);
+        let encoded_pair = convert::cvt_rn_satfinite_e4m3x2_f32(scale_unencoded, scale_unencoded);
+        let scale = encoded_pair as u8;
+        let code_destination =
+            unsafe { codes.add(token * (INPUT_COLUMNS / 8) + group * (GROUP_K / 8)) };
+
+        if scale == 0 {
+            unsafe {
+                *code_destination = 0;
+                *code_destination.add(1) = 0;
+                *scales.add(task) = 0;
+            }
+            return;
+        }
+
+        let decoded_scale = e4m3_to_f32(scale);
+        let (codes_lo, codes_hi) = pack_e2m1x16(
+            float::div_rn_f32(v0 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v1 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v2 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v3 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v4 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v5 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v6 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v7 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v8 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v9 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v10 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v11 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v12 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v13 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v14 * input_scale_divisor, decoded_scale),
+            float::div_rn_f32(v15 * input_scale_divisor, decoded_scale),
+        );
+
+        unsafe {
+            *code_destination = codes_lo;
+            *code_destination.add(1) = codes_hi;
+            *scales.add(task) = scale;
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn nvfp4_down_quantize<const TOKENS: usize>(
+        input: *const u32,
+        codes: *mut u32,
+        scales: *mut u8,
+        input_scale_divisor: f32,
+    ) {
+        unsafe {
+            quantize_prefill_body::<TOKENS>(
+                thread::index_1d().get(),
+                input,
+                codes,
+                scales,
+                input_scale_divisor,
+            );
+        }
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn stage_w4_tile<const TOKENS: usize>(
+        shared: *mut u8,
+        activation_codes: *const u32,
+        activation_scales: *const u8,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        stage: usize,
+        k_tile: usize,
+        token_begin: usize,
+        row_begin: usize,
+        tid: usize,
+    ) {
+        if tid < W4_TILE_M * W4_SEGMENTS_PER_ROW {
+            let row = tid / W4_SEGMENTS_PER_ROW;
+            let segment = tid - row * W4_SEGMENTS_PER_ROW;
+            let valid = token_begin + row < TOKENS;
+            let source_token = if valid { token_begin + row } else { 0 };
+            let physical = w4_swizzled_byte(row, segment * 16);
+            let destination = unsafe {
+                shared
+                    .add(
+                        W4_A_CODE_OFFSET
+                            + (stage * W4_BLOCK_M + row) * W4_CODE_ROW_BYTES
+                            + physical,
+                    )
+                    .cast::<u32>()
+            };
+            let source = unsafe {
+                activation_codes.add(
+                    source_token * (INPUT_COLUMNS / 8)
+                        + k_tile * (W4_CODE_ROW_BYTES / 4)
+                        + segment * 4,
+                )
+            };
+
+            unsafe {
+                cp_async_cg_zfill_16(destination, source.cast::<u8>(), if valid { 16 } else { 0 });
+            }
+        }
+
+        if tid < W4_TILE_M {
+            let valid = token_begin + tid < TOKENS;
+            let source_token = if valid { token_begin + tid } else { 0 };
+            let destination = unsafe {
+                shared
+                    .add(W4_A_SCALE_OFFSET + (stage * W4_BLOCK_M + tid) * W4_K64_PER_STAGE * 4)
+                    .cast::<u32>()
+            };
+            let source = unsafe {
+                activation_scales.add(source_token * GROUPS_PER_ROW + k_tile * W4_K64_PER_STAGE * 4)
+            };
+
+            unsafe {
+                cp_async_cg_zfill_16(destination, source, if valid { 16 } else { 0 });
+            }
+        }
+
+        let mut task = tid;
+        while task < W4_BLOCK_N * W4_SEGMENTS_PER_ROW {
+            let row = task / W4_SEGMENTS_PER_ROW;
+            let segment = task - row * W4_SEGMENTS_PER_ROW;
+            let parent_row = row_begin + row;
+            let physical = w4_swizzled_byte(row, segment * 16);
+            let destination = unsafe {
+                shared
+                    .add(
+                        W4_B_CODE_OFFSET
+                            + (stage * W4_BLOCK_N + row) * W4_CODE_ROW_BYTES
+                            + physical,
+                    )
+                    .cast::<u32>()
+            };
+            let source = unsafe {
+                weight_codes.add(
+                    parent_row * (INPUT_COLUMNS / 8)
+                        + k_tile * (W4_CODE_ROW_BYTES / 4)
+                        + segment * 4,
+                )
+            };
+
+            unsafe { cp_async_cg_16(destination, source) };
+            task += W4_THREADS as usize;
+        }
+
+        let mut scale_task = tid;
+        while scale_task < W4_BLOCK_N * W4_K64_PER_STAGE {
+            let row = scale_task / W4_K64_PER_STAGE;
+            let local_k64 = scale_task - row * W4_K64_PER_STAGE;
+            let parent_row = row_begin + row;
+            let global_k64 = k_tile * W4_K64_PER_STAGE + local_k64;
+            let destination = unsafe {
+                shared
+                    .add(
+                        W4_B_SCALE_OFFSET
+                            + (stage * W4_BLOCK_N * W4_K64_PER_STAGE + scale_task) * 4,
+                    )
+                    .cast::<u32>()
+            };
+            let source = unsafe {
+                weight_scales.add(weight_scale_offset::<Qwen38_27B>(parent_row, global_k64))
+            };
+
+            unsafe { cp_async_ca_4(destination, source.cast::<u32>()) };
+            scale_task += W4_THREADS as usize;
+        }
+    }
+
+    #[inline(always)]
+    fn mma_nvfp4(
+        accumulators: &mut [f32; 4],
+        a: [u32; 4],
+        b: [u32; 2],
+        scale_a: u32,
+        scale_b: u32,
+    ) {
+        let scale_block_id = 0u16;
+        let scale_thread_id = 0u16;
+
+        unsafe {
+            ptx_asm!(
+                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.\
+                 m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 \
+                 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, \
+                 {%10}, {%11,%12}, {%13}, {%14,%15};",
+                inout("+f") accumulators[0],
+                inout("+f") accumulators[1],
+                inout("+f") accumulators[2],
+                inout("+f") accumulators[3],
+                in("r") a[0],
+                in("r") a[1],
+                in("r") a[2],
+                in("r") a[3],
+                in("r") b[0],
+                in("r") b[1],
+                in("r") scale_a,
+                in("h") scale_block_id,
+                in("h") scale_thread_id,
+                in("r") scale_b,
+                in("h") scale_block_id,
+                in("h") scale_thread_id,
+                options(register_only),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn down_w4a4_body<const TOKENS: usize>(
+        activation_codes: *const u32,
+        activation_scales: *const u8,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        output: *mut u16,
+        alpha: f32,
+    ) {
+        static mut SHARED: SharedArray<u32, W4_SHARED_U32, 16> = SharedArray::UNINIT;
+        let shared = core::ptr::addr_of_mut!(SHARED).cast::<u8>();
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp = tid >> 5;
+        let warp_m = warp / W4_WARPS_N;
+        let warp_n = warp - warp_m * W4_WARPS_N;
+        let token_begin = thread::blockIdx_y() as usize * W4_TILE_M;
+        let row_begin = thread::blockIdx_x() as usize * W4_BLOCK_N;
+        let mut stage = 0usize;
+
+        while stage < W4_STAGES {
+            unsafe {
+                stage_w4_tile::<TOKENS>(
+                    shared,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    stage,
+                    stage,
+                    token_begin,
+                    row_begin,
+                    tid,
+                );
+                cp_async_commit_group();
+            }
+            stage += 1;
+        }
+
+        let mut accumulators = [[0.0f32; 4]; W4_MMA_N];
+        let a_matrix = lane >> 3;
+        let a_row_offset = (lane & 7) + ((a_matrix & 1) << 3);
+        let a_column_byte = (a_matrix >> 1) * 16;
+        let b_row_offset = lane & 7;
+        let b_column_byte = ((lane >> 3) & 1) * 16;
+        let scale_a_row_offset = ((lane & 1) << 3) | (lane >> 2);
+        let scale_b_row_offset = lane >> 2;
+        let mut k_tile = 0usize;
+
+        while k_tile < INPUT_COLUMNS / W4_BLOCK_K {
+            stage = k_tile % W4_STAGES;
+            unsafe { cp_async_wait_group(1) };
+            thread::sync_threads();
+
+            let mut local_k64 = 0usize;
+            while local_k64 < W4_K64_PER_STAGE {
+                let a_row = warp_m * W4_WARP_M + a_row_offset;
+                let a_logical_byte = local_k64 * 32 + a_column_byte;
+                let a_physical_byte = w4_swizzled_byte(a_row, a_logical_byte);
+                let a_address = unsafe {
+                    shared
+                        .add(
+                            W4_A_CODE_OFFSET
+                                + (stage * W4_BLOCK_M + a_row) * W4_CODE_ROW_BYTES
+                                + a_physical_byte,
+                        )
+                        .cast::<u32>()
+                };
+                let a_fragments = unsafe { wmma::ldmatrix_x4(a_address) };
+                let scale_a_row = warp_m * W4_WARP_M + scale_a_row_offset;
+                let scale_a = unsafe {
+                    *shared
+                        .add(
+                            W4_A_SCALE_OFFSET
+                                + (stage * W4_BLOCK_M + scale_a_row) * W4_K64_PER_STAGE * 4
+                                + local_k64 * 4,
+                        )
+                        .cast::<u32>()
+                };
+                let mut mma_n = 0usize;
+
+                while mma_n < W4_MMA_N {
+                    let b_row = warp_n * W4_WARP_N + mma_n * 8 + b_row_offset;
+                    let b_logical_byte = local_k64 * 32 + b_column_byte;
+                    let b_physical_byte = w4_swizzled_byte(b_row, b_logical_byte);
+                    let b_address = unsafe {
+                        shared
+                            .add(
+                                W4_B_CODE_OFFSET
+                                    + (stage * W4_BLOCK_N + b_row) * W4_CODE_ROW_BYTES
+                                    + b_physical_byte,
+                            )
+                            .cast::<u32>()
+                    };
+                    let b_fragments = unsafe { wmma::ldmatrix_x2(b_address) };
+                    let scale_b_row = warp_n * W4_WARP_N + mma_n * 8 + scale_b_row_offset;
+                    let scale_b = unsafe {
+                        *shared
+                            .add(
+                                W4_B_SCALE_OFFSET
+                                    + (stage * W4_BLOCK_N + scale_b_row) * W4_K64_PER_STAGE * 4
+                                    + local_k64 * 4,
+                            )
+                            .cast::<u32>()
+                    };
+
+                    mma_nvfp4(
+                        &mut accumulators[mma_n],
+                        a_fragments,
+                        b_fragments,
+                        scale_a,
+                        scale_b,
+                    );
+                    mma_n += 1;
+                }
+                local_k64 += 1;
+            }
+
+            thread::sync_threads();
+            let next_k_tile = k_tile + W4_STAGES;
+            if next_k_tile < INPUT_COLUMNS / W4_BLOCK_K {
+                unsafe {
+                    stage_w4_tile::<TOKENS>(
+                        shared,
+                        activation_codes,
+                        activation_scales,
+                        weight_codes,
+                        weight_scales,
+                        stage,
+                        next_k_tile,
+                        token_begin,
+                        row_begin,
+                        tid,
+                    );
+                }
+            }
+            unsafe { cp_async_commit_group() };
+            k_tile += 1;
+        }
+
+        let accumulator_row = lane >> 2;
+        let accumulator_col = 2 * (lane & 3);
+        let token0 = warp_m * W4_WARP_M + accumulator_row;
+        let token1 = token0 + 8;
+        let mut mma_n = 0usize;
+
+        while mma_n < W4_MMA_N {
+            let local_row = warp_n * W4_WARP_N + mma_n * 8 + accumulator_col;
+            let values = accumulators[mma_n];
+
+            if token_begin + token0 < TOKENS {
+                let destination = unsafe {
+                    output
+                        .add((token_begin + token0) * OUTPUT_ROWS + row_begin + local_row)
+                        .cast::<u32>()
+                };
+                unsafe {
+                    *destination = tcgen05::cvt_f32x2_bf16x2(values[0] * alpha, values[1] * alpha);
+                }
+            }
+            if token_begin + token1 < TOKENS {
+                let destination = unsafe {
+                    output
+                        .add((token_begin + token1) * OUTPUT_ROWS + row_begin + local_row)
+                        .cast::<u32>()
+                };
+                unsafe {
+                    *destination = tcgen05::cvt_f32x2_bf16x2(values[2] * alpha, values[3] * alpha);
+                }
+            }
+            mma_n += 1;
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(384, 2)]
+    #[launch_contract(
+        domain = 2,
+        coordinates = u32,
+        block = (384, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn nvfp4_down_w4a4<const TOKENS: usize>(
+        activation_codes: *const u32,
+        activation_scales: *const u8,
+        weight_codes: *const u32,
+        weight_scales: *const u8,
+        output: *mut u16,
+        alpha: f32,
+    ) {
+        unsafe {
+            down_w4a4_body::<TOKENS>(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                alpha,
+            );
+        }
+    }
 }
 
 fn launch_config() -> LaunchConfig1D {
@@ -582,8 +1182,87 @@ impl<const TOKENS: usize> PreparedQwen35BatchRoute<TOKENS> {
     }
 }
 
-/// PTX symbols retained for every exact SM120 NVFP4 down projection batch.
-pub(crate) fn nvfp4_down_ptx_names() -> [&'static str; MAX_BATCH] {
+struct PreparedPrefillRoute<const TOKENS: usize> {
+    quantize: PreparedLaunch<kernels::__nvfp4_down_quantize_CudaKernel<TOKENS>>,
+    projection: PreparedLaunch<kernels::__nvfp4_down_w4a4_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        // A thread owns one represented K16 group. At 256 threads, exact
+        // T=32/64/128/1024 use 136 CTAs per token without partial groups.
+        let quantize_blocks = (TOKENS * GROUPS_PER_ROW).div_ceil(256);
+        let quantize_blocks = u32::try_from(quantize_blocks).map_err(|_| {
+            GpuError::invalid_launch("NVFP4 down quantization grid exceeds CUDA width")
+        })?;
+        // Each twelve-warp CTA emits a native 48x64 tile. The 80 exact output
+        // columns combine with 1/2/3/22 token tiles and require no N padding.
+        let projection_blocks = u32::try_from(OUTPUT_ROWS / W4_BLOCK_N)
+            .map_err(|_| GpuError::invalid_launch("NVFP4 down grid exceeds CUDA width"))?;
+        let token_tiles = u32::try_from(TOKENS.div_ceil(W4_TILE_M))
+            .map_err(|_| GpuError::invalid_launch("NVFP4 down grid exceeds CUDA height"))?;
+        let quantize = module
+            .prepare_nvfp4_down_quantize::<TOKENS>(LaunchConfig1D::new(quantize_blocks, 256, 0))
+            .map_err(|source| {
+                GpuError::launch("preparing NVFP4 down activation quantization", source)
+            })?;
+        let projection = module
+            .prepare_nvfp4_down_w4a4::<TOKENS>(LaunchConfig2D::new(
+                (projection_blocks, token_tiles),
+                (W4_THREADS, 1),
+                0,
+            ))
+            .map_err(|source| GpuError::launch("preparing NVFP4 W4A4 down", source))?;
+
+        Ok(Self {
+            quantize,
+            projection,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .nvfp4_down_quantize::<TOKENS>(
+                stream,
+                &self.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                input_scale_divisor,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching NVFP4 down activation quantization", source)
+            })?;
+        module
+            .nvfp4_down_w4a4::<TOKENS>(
+                stream,
+                &self.projection,
+                activation_codes.cast::<u32>(),
+                activation_scales,
+                weight_codes.cast::<u32>(),
+                weight_scales,
+                output,
+                1.0 / (input_scale_divisor * weight_scale_divisor),
+            )
+            .map_err(|source| GpuError::launch("launching NVFP4 W4A4 down", source))
+    }
+}
+
+/// PTX symbols retained for every exact SM120 NVFP4 down schedule.
+pub(crate) fn nvfp4_down_ptx_names() -> [&'static str; 16] {
     [
         "nvfp4_down_a16_b1",
         kernels::nvfp4_down_a16_ptx_name::<Qwen38_27B, 2>(),
@@ -593,6 +1272,14 @@ pub(crate) fn nvfp4_down_ptx_names() -> [&'static str; MAX_BATCH] {
         kernels::nvfp4_down_a16_ptx_name::<Qwen38_27B, 6>(),
         kernels::nvfp4_down_a16_ptx_name::<Qwen38_27B, 7>(),
         kernels::nvfp4_down_a16_ptx_name::<Qwen38_27B, 8>(),
+        kernels::nvfp4_down_quantize_ptx_name::<32>(),
+        kernels::nvfp4_down_quantize_ptx_name::<64>(),
+        kernels::nvfp4_down_quantize_ptx_name::<128>(),
+        kernels::nvfp4_down_quantize_ptx_name::<1_024>(),
+        kernels::nvfp4_down_w4a4_ptx_name::<32>(),
+        kernels::nvfp4_down_w4a4_ptx_name::<64>(),
+        kernels::nvfp4_down_w4a4_ptx_name::<128>(),
+        kernels::nvfp4_down_w4a4_ptx_name::<1_024>(),
     ]
 }
 
@@ -621,6 +1308,10 @@ pub struct Nvfp4DownOp<A: Sm120Arch = Qwen38_27B> {
     b6: PreparedBatchRoute<A, 6>,
     b7: PreparedBatchRoute<A, 7>,
     b8: PreparedBatchRoute<A, 8>,
+    t32: PreparedPrefillRoute<32>,
+    t64: PreparedPrefillRoute<64>,
+    t128: PreparedPrefillRoute<128>,
+    t1024: PreparedPrefillRoute<1_024>,
 }
 
 impl<A: Sm120Arch> Nvfp4DownOp<A> {
@@ -641,6 +1332,10 @@ impl<A: Sm120Arch> Nvfp4DownOp<A> {
             b6: PreparedBatchRoute::prepare(&module)?,
             b7: PreparedBatchRoute::prepare(&module)?,
             b8: PreparedBatchRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
+            t1024: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -701,6 +1396,75 @@ impl<A: Sm120Arch> Nvfp4DownOp<A> {
             _ => Err(GpuError::invalid_launch(format!(
                 "NVFP4 down projection batch {batch} is outside the exact range 1..={MAX_BATCH}"
             ))),
+        }
+    }
+
+    /// Dynamically quantizes and projects exact `T=32,64,128,1024` rows.
+    ///
+    /// # Safety
+    ///
+    /// `input` covers `rows * 17_408` BF16 values; activation scratch covers
+    /// `rows * 8_704` code bytes and `rows * 1_088` scale bytes;
+    /// `weight_codes` covers packed `[5_120, 17_408]` E2M1 values;
+    /// `weight_scales` covers swizzled `[5_120, 1_088]` E4M3 values; and
+    /// `output` covers `rows * 5_120` BF16 values. Four-byte-loaded planes are
+    /// aligned. Divisors are finite and positive. All allocations belong to
+    /// `stream`'s context, remain live through completion, and do not overlap.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_prefill(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        if !PREFILL_ROWS.contains(&rows) {
+            return Err(GpuError::invalid_launch(format!(
+                "NVFP4 down prefill row count {rows} is outside the exact T=32,64,128,1024 routes"
+            )));
+        }
+        if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "NVFP4 down input scale divisor must be finite and positive",
+            ));
+        }
+        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "NVFP4 down weight scale divisor must be finite and positive",
+            ));
+        }
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        input,
+                        activation_codes,
+                        activation_scales,
+                        weight_codes,
+                        weight_scales,
+                        input_scale_divisor,
+                        weight_scale_divisor,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match rows {
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
+            1_024 => launch!(t1024),
+            _ => unreachable!("row count was validated above"),
         }
     }
 }
@@ -803,7 +1567,8 @@ impl Qwen35Nvfp4DownOp {
 mod tests {
     use super::{
         CODE_WORDS_PER_PHASE, GROUP_K, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_BATCH, OUTPUT_ROWS,
-        PHASE_GROUPS, PHASES, SHARED_U32, WARPS, nvfp4_down_ptx_names, qwen35_nvfp4_down_ptx_names,
+        PHASE_GROUPS, PHASES, PREFILL_ROWS, SHARED_U32, WARPS, nvfp4_down_ptx_names,
+        qwen35_nvfp4_down_ptx_names,
     };
     use std::collections::BTreeSet;
     use tuisko_model::{Arch, Qwen35_9B};
@@ -831,12 +1596,12 @@ mod tests {
         let names = nvfp4_down_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), MAX_BATCH);
+        assert_eq!(names.len(), MAX_BATCH + 2 * PREFILL_ROWS.len());
         assert_eq!(unique.len(), names.len());
 
         let qwen35 = qwen35_nvfp4_down_ptx_names();
         let all = names.into_iter().chain(qwen35).collect::<BTreeSet<_>>();
         assert_eq!(qwen35.len(), MAX_BATCH);
-        assert_eq!(all.len(), 2 * MAX_BATCH);
+        assert_eq!(all.len(), 2 * MAX_BATCH + 2 * PREFILL_ROWS.len());
     }
 }

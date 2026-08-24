@@ -86,6 +86,8 @@ down projection admits exact `T=32,64,128` K=128 MMA tails plus a separate `T=10
 three-stage TMA route over its source-native `[5120,17408]` weight plane with the same explicit
 descriptor ownership. NVFP4 gate/up SwiGLU admits exact `T=32,64,128,1024` W4A4 routes with
 represented E2M1 activation codes, E4M3 block scales, and tail-safe 48-row token tiles. The
+NVFP4 down projection admits the same exact widths through native 48x64 W4A4 tiles over its
+complete 17,408-wide source plane, retaining separate activation-code and block-scale seams. The
 source-backed dense-FP8 MLP owner composes residual norms, gate/up,
 SwiGLU, down projection, and residual publication into directly qualified graphs at every
 `B=1..8` and `T=32,64,128,1024`. The source-backed full-attention owner composes that MLP with

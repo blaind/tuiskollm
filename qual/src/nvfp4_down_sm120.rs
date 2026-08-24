@@ -1,4 +1,4 @@
-//! Independent represented-value qualification for SM120 NVFP4 A16 down projection.
+//! Independent represented-value qualification for SM120 NVFP4 down projection.
 
 use crate::{DeviceBenchmarkError, device_benchmark};
 use tuisko_gpu::{
@@ -9,6 +9,8 @@ use tuisko_kernels_sm120::Nvfp4DownOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+const MAX_ROWS: usize = 1_024;
+const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const ALIGNMENT: usize = 256;
 const HIDDEN: usize = Qwen38_27B::HIDDEN;
 const INPUT_COLUMNS: usize = Qwen38_27B::INTERMEDIATE;
@@ -16,13 +18,15 @@ const OUTPUT_ROWS: usize = HIDDEN;
 const GROUP: usize = 16;
 const GROUPS_PER_ROW: usize = INPUT_COLUMNS / GROUP;
 const CODE_BYTES_PER_ROW: usize = INPUT_COLUMNS / 2;
+const INPUT_SCALE_DIVISOR: f32 = 3.0;
 const WEIGHT_SCALE_DIVISOR: f32 = 0.125;
+const BYTE_SENTINEL: u8 = 0xa5;
 const BF16_SENTINEL: u16 = 0xa5a5;
 const INPUT_PATTERN: [f32; GROUP] = [
     0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0, 0.5,
     -0.5,
 ];
-const TOKEN_FACTORS: [f32; MAX_BATCH] = [1.0, 0.5, 0.25, 0.125, 1.0, 0.5, 0.25, 0.125];
+const TOKEN_FACTORS: [f32; MAX_BATCH] = [1.0, 0.5, 0.25, 0.125, -1.0, -0.5, -0.25, -0.125];
 
 /// Failure of the exact-target NVFP4 down projection qualification gate.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +47,10 @@ pub enum Nvfp4DownQualificationError {
 /// Observable counts and worst error from every exact batch route.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Nvfp4DownQualification {
+    /// Dynamically generated E2M1 activation codes compared bit-exactly.
+    pub activation_codes: usize,
+    /// Dynamically generated E4M3 activation scales compared bit-exactly.
+    pub activation_scales: usize,
     /// BF16 outputs compared with the independent FP64 represented-value oracle.
     pub output_values: usize,
     /// Active BF16 outputs reproduced bit-exactly by graph replay.
@@ -66,6 +74,8 @@ pub struct Nvfp4DownQualification {
 #[derive(Clone, Copy)]
 struct Regions {
     input: ArenaRegion<u16>,
+    activation_codes: ArenaRegion<u8>,
+    activation_scales: ArenaRegion<u8>,
     weight_codes: ArenaRegion<u8>,
     weight_scales: ArenaRegion<u8>,
     output: ArenaRegion<u16>,
@@ -77,18 +87,36 @@ impl Regions {
     }
 
     fn payload_bytes(self) -> usize {
-        self.input.byte_len() + self.weight_bytes() + self.output.byte_len()
+        self.input.byte_len()
+            + self.activation_codes.byte_len()
+            + self.activation_scales.byte_len()
+            + self.weight_bytes()
+            + self.output.byte_len()
     }
 }
 
 struct Fixture {
     input_bf16: Vec<u16>,
     input_f32: Vec<f32>,
+    activation_codes: Vec<u8>,
+    activation_scales: Vec<u8>,
     weight_codes: Vec<u8>,
     weight_scales: Vec<u8>,
 }
 
-/// Qualifies eager and captured NVFP4 A16 down projection at every exact `B=1..=8`.
+struct Observed {
+    activation_codes: Vec<u8>,
+    activation_scales: Vec<u8>,
+    output: Vec<u16>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Schedule {
+    A16,
+    W4a4,
+}
+
+/// Qualifies eager and captured NVFP4 down projection at every admitted row count.
 pub fn qualify_nvfp4_down() -> Result<Nvfp4DownQualification, Nvfp4DownQualificationError> {
     let _preflight = device_benchmark::preflight()?;
     let context = CudaContext::new(0).map_err(GpuError::from)?;
@@ -104,13 +132,15 @@ pub fn qualify_nvfp4_down() -> Result<Nvfp4DownQualification, Nvfp4DownQualifica
     let (layout, regions) = layout()?;
     let arena = DeviceArena::zeroed(&stream, &layout)?;
     let op = Nvfp4DownOp::new(&context)?;
-    let fixture = make_fixture();
+    let fixture = make_fixture()?;
 
     arena.copy_from_host(&stream, regions.input, &fixture.input_bf16)?;
     arena.copy_from_host(&stream, regions.weight_codes, &fixture.weight_codes)?;
     arena.copy_from_host(&stream, regions.weight_scales, &fixture.weight_scales)?;
     let stable_addresses = addresses(&arena, regions)?;
     let mut report = Nvfp4DownQualification {
+        activation_codes: 0,
+        activation_scales: 0,
         output_values: 0,
         graph_replay_values: 0,
         inactive_values: 0,
@@ -122,25 +152,27 @@ pub fn qualify_nvfp4_down() -> Result<Nvfp4DownQualification, Nvfp4DownQualifica
         maximum_absolute_error: 0.0,
     };
 
-    for batch in 1..=MAX_BATCH {
-        arena.fill(&stream, regions.output, BF16_SENTINEL as u8)?;
-        launch(&op, &arena, &stream, regions, batch)?;
-        let eager = arena.copy_to_host(&stream, regions.output)?;
-        verify_eager(batch, &fixture, &eager, &mut report)?;
+    for rows in EXACT_ROUTES {
+        let schedule = schedule(rows);
+        reset_observed(&arena, &stream, regions)?;
+        launch(&op, &arena, &stream, regions, rows)?;
+        let eager = read_observed(&arena, &stream, regions)?;
+        verify_eager(rows, schedule, &fixture, &eager, &mut report)?;
         verify_immutable(&arena, &stream, regions, &fixture, &mut report)?;
 
-        arena.fill(&stream, regions.output, BF16_SENTINEL as u8)?;
+        reset_observed(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
+        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, rows))?;
         graph.launch(&stream)?;
         graph.launch(&stream)?;
-        let replay = arena.copy_to_host(&stream, regions.output)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        let replay = read_observed(&arena, &stream, regions)?;
+        verify_replay(rows, schedule, &eager, &replay, &mut report)?;
         verify_immutable(&arena, &stream, regions, &fixture, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(Nvfp4DownQualificationError::Mismatch(format!(
-                "device addresses changed while qualifying B={batch}"
+                "device addresses changed while qualifying {}",
+                route_name(rows)
             )));
         }
     }
@@ -153,15 +185,19 @@ pub fn qualify_nvfp4_down() -> Result<Nvfp4DownQualification, Nvfp4DownQualifica
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let input = layout.reserve(MAX_BATCH * INPUT_COLUMNS, ALIGNMENT)?;
+    let input = layout.reserve(MAX_ROWS * INPUT_COLUMNS, ALIGNMENT)?;
+    let activation_codes = layout.reserve(MAX_ROWS * CODE_BYTES_PER_ROW, ALIGNMENT)?;
+    let activation_scales = layout.reserve(MAX_ROWS * GROUPS_PER_ROW, ALIGNMENT)?;
     let weight_codes = layout.reserve(OUTPUT_ROWS * CODE_BYTES_PER_ROW, ALIGNMENT)?;
     let weight_scales = layout.reserve(OUTPUT_ROWS * GROUPS_PER_ROW, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * OUTPUT_ROWS, ALIGNMENT)?;
+    let output = layout.reserve(MAX_ROWS * OUTPUT_ROWS, ALIGNMENT)?;
 
     Ok((
         layout,
         Regions {
             input,
+            activation_codes,
+            activation_scales,
             weight_codes,
             weight_scales,
             output,
@@ -169,9 +205,11 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     ))
 }
 
-fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 4]> {
+fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 6]> {
     Ok([
         arena.address(regions.input)?.addr(),
+        arena.address(regions.activation_codes)?.addr(),
+        arena.address(regions.activation_scales)?.addr(),
         arena.address(regions.weight_codes)?.addr(),
         arena.address(regions.weight_scales)?.addr(),
         arena.address(regions.output)?.addr(),
@@ -183,9 +221,11 @@ fn launch(
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
-    batch: usize,
+    rows: usize,
 ) -> GpuResult<()> {
     let input = arena.address(regions.input)?;
+    let activation_codes = arena.address(regions.activation_codes)?;
+    let activation_scales = arena.address(regions.activation_scales)?;
     let weight_codes = arena.address(regions.weight_codes)?;
     let weight_scales = arena.address(regions.weight_scales)?;
     let output = arena.address(regions.output)?;
@@ -193,23 +233,38 @@ fn launch(
     // SAFETY: the disjoint arena regions are aligned, context-local, and own
     // every maximum-batch extent documented by the production operation.
     unsafe {
-        op.launch(
-            stream,
-            batch,
-            input,
-            weight_codes,
-            weight_scales,
-            WEIGHT_SCALE_DIVISOR,
-            output,
-        )
+        if rows <= MAX_BATCH {
+            op.launch(
+                stream,
+                rows,
+                input,
+                weight_codes,
+                weight_scales,
+                WEIGHT_SCALE_DIVISOR,
+                output,
+            )
+        } else {
+            op.launch_prefill(
+                stream,
+                rows,
+                input,
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                INPUT_SCALE_DIVISOR,
+                WEIGHT_SCALE_DIVISOR,
+                output,
+            )
+        }
     }
 }
 
-fn make_fixture() -> Fixture {
-    let input_bf16 = (0..MAX_BATCH * INPUT_COLUMNS)
+fn make_fixture() -> Result<Fixture, Nvfp4DownQualificationError> {
+    let input_bf16 = (0..MAX_ROWS * INPUT_COLUMNS)
         .map(|index| {
             let token = index / INPUT_COLUMNS;
-            f32_to_bf16(INPUT_PATTERN[index & (GROUP - 1)] * TOKEN_FACTORS[token])
+            f32_to_bf16(INPUT_PATTERN[index & (GROUP - 1)] * TOKEN_FACTORS[token & 7])
         })
         .collect::<Vec<_>>();
     let input_f32 = input_bf16
@@ -217,14 +272,70 @@ fn make_fixture() -> Fixture {
         .copied()
         .map(bf16_to_f32)
         .collect::<Vec<_>>();
+    let (activation_codes, activation_scales) = quantize_oracle(&input_f32)?;
     let (weight_codes, weight_scales) = make_weights();
 
-    Fixture {
+    Ok(Fixture {
         input_bf16,
         input_f32,
+        activation_codes,
+        activation_scales,
         weight_codes,
         weight_scales,
+    })
+}
+
+fn quantize_oracle(input: &[f32]) -> Result<(Vec<u8>, Vec<u8>), Nvfp4DownQualificationError> {
+    let tokens = input.len() / INPUT_COLUMNS;
+    let mut codes = vec![0u8; tokens * CODE_BYTES_PER_ROW];
+    let mut scales = vec![0u8; tokens * GROUPS_PER_ROW];
+
+    for token in 0..tokens {
+        for group in 0..GROUPS_PER_ROW {
+            let input_begin = token * INPUT_COLUMNS + group * GROUP;
+            let values = &input[input_begin..input_begin + GROUP];
+            let maximum = values
+                .iter()
+                .fold(0.0f32, |current, value| current.max(value.abs()));
+            let scale = encode_e4m3fn(INPUT_SCALE_DIVISOR * maximum / 6.0)?;
+            scales[token * GROUPS_PER_ROW + group] = scale;
+            if scale == 0 {
+                continue;
+            }
+
+            let decoded_scale = decode_e4m3fn(scale)?;
+            for pair in 0..GROUP / 2 {
+                let low = encode_e2m1(values[2 * pair] * INPUT_SCALE_DIVISOR / decoded_scale);
+                let high = encode_e2m1(values[2 * pair + 1] * INPUT_SCALE_DIVISOR / decoded_scale);
+                let destination = token * CODE_BYTES_PER_ROW + group * (GROUP / 2) + pair;
+                codes[destination] = low | (high << 4);
+            }
+        }
     }
+
+    Ok((codes, scales))
+}
+
+fn reset_observed(
+    arena: &DeviceArena,
+    stream: &tuisko_gpu::CudaStream,
+    regions: Regions,
+) -> GpuResult<()> {
+    arena.fill(stream, regions.activation_codes, BYTE_SENTINEL)?;
+    arena.fill(stream, regions.activation_scales, BYTE_SENTINEL)?;
+    arena.fill(stream, regions.output, BYTE_SENTINEL)
+}
+
+fn read_observed(
+    arena: &DeviceArena,
+    stream: &tuisko_gpu::CudaStream,
+    regions: Regions,
+) -> GpuResult<Observed> {
+    Ok(Observed {
+        activation_codes: arena.copy_to_host(stream, regions.activation_codes)?,
+        activation_scales: arena.copy_to_host(stream, regions.activation_scales)?,
+        output: arena.copy_to_host(stream, regions.output)?,
+    })
 }
 
 fn make_weights() -> (Vec<u8>, Vec<u8>) {
@@ -313,8 +424,9 @@ fn verify_no_post_warmup_allocation(
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
 ) -> Result<(), Nvfp4DownQualificationError> {
-    let graphs = (1..=MAX_BATCH)
-        .map(|batch| CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch)))
+    let graphs = EXACT_ROUTES
+        .into_iter()
+        .map(|rows| CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows)))
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
         graph.launch(stream)?;
@@ -322,8 +434,8 @@ fn verify_no_post_warmup_allocation(
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
-        for &batch in &[1usize, 8, 3, 6, 2, 7, 4, 5] {
-            graphs[batch - 1].launch(stream)?;
+        for graph in graphs.iter().rev() {
+            graph.launch(stream)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -338,16 +450,19 @@ fn verify_no_post_warmup_allocation(
 }
 
 fn verify_eager(
-    batch: usize,
+    rows: usize,
+    schedule: Schedule,
     fixture: &Fixture,
-    observed: &[u16],
+    observed: &Observed,
     report: &mut Nvfp4DownQualification,
 ) -> Result<(), Nvfp4DownQualificationError> {
-    for token in 0..batch {
+    verify_scratch(rows, schedule, fixture, observed)?;
+
+    for token in 0..rows {
         for row in 0..OUTPUT_ROWS {
-            let expected = down_oracle(token, row, fixture)?;
+            let expected = down_oracle(token, row, schedule, fixture)?;
             let index = token * OUTPUT_ROWS + row;
-            let actual = f64::from(bf16_to_f32(observed[index]));
+            let actual = f64::from(bf16_to_f32(observed.output[index]));
             let absolute_error = (actual - expected).abs();
             let tolerance = 0.25f64.max(expected.abs() * 0.025);
             report.maximum_absolute_error =
@@ -355,75 +470,231 @@ fn verify_eager(
 
             if absolute_error > tolerance {
                 return Err(Nvfp4DownQualificationError::Mismatch(format!(
-                    "B={batch} output at token={token}, row={row}: device={actual}, oracle={expected}, tolerance={tolerance}",
+                    "{} output at token={token}, row={row}: device={actual}, oracle={expected}, tolerance={tolerance}",
+                    route_name(rows),
                 )));
             }
         }
     }
 
-    verify_inactive(batch, observed)?;
-    report.output_values += batch * OUTPUT_ROWS;
-    report.inactive_values += (MAX_BATCH - batch) * OUTPUT_ROWS;
+    verify_inactive(rows, schedule, observed)?;
+    report.output_values += rows * OUTPUT_ROWS;
+    if schedule == Schedule::W4a4 {
+        report.activation_codes += rows * CODE_BYTES_PER_ROW;
+        report.activation_scales += rows * GROUPS_PER_ROW;
+    }
+    report.inactive_values += inactive_values(rows, schedule);
 
     Ok(())
 }
 
 fn verify_replay(
-    batch: usize,
-    eager: &[u16],
-    replay: &[u16],
+    rows: usize,
+    schedule: Schedule,
+    eager: &Observed,
+    replay: &Observed,
     report: &mut Nvfp4DownQualification,
 ) -> Result<(), Nvfp4DownQualificationError> {
+    for (name, actual, expected) in [
+        (
+            "activation code",
+            replay.activation_codes.as_slice(),
+            eager.activation_codes.as_slice(),
+        ),
+        (
+            "activation scale",
+            replay.activation_scales.as_slice(),
+            eager.activation_scales.as_slice(),
+        ),
+    ] {
+        if let Some(index) = actual
+            .iter()
+            .zip(expected)
+            .position(|(actual, expected)| actual != expected)
+        {
+            return Err(Nvfp4DownQualificationError::Mismatch(format!(
+                "{} graph {name} {index} differs: replay={:#04x}, eager={:#04x}",
+                route_name(rows),
+                actual[index],
+                expected[index]
+            )));
+        }
+    }
     if let Some(index) = replay
+        .output
         .iter()
-        .zip(eager)
+        .zip(&eager.output)
         .position(|(actual, expected)| actual != expected)
     {
         return Err(Nvfp4DownQualificationError::Mismatch(format!(
-            "B={batch} graph output {index} differs: replay={:#06x}, eager={:#06x}",
-            replay[index], eager[index]
+            "{} graph output {index} differs: replay={:#06x}, eager={:#06x}",
+            route_name(rows),
+            replay.output[index],
+            eager.output[index]
         )));
     }
 
-    verify_inactive(batch, replay)?;
-    report.graph_replay_values += batch * OUTPUT_ROWS;
-    report.inactive_values += (MAX_BATCH - batch) * OUTPUT_ROWS;
+    verify_inactive(rows, schedule, replay)?;
+    report.graph_replay_values += rows * OUTPUT_ROWS;
+    if schedule == Schedule::W4a4 {
+        report.graph_replay_values += rows * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
+    }
+    report.inactive_values += inactive_values(rows, schedule);
 
     Ok(())
 }
 
-fn verify_inactive(batch: usize, observed: &[u16]) -> Result<(), Nvfp4DownQualificationError> {
-    let begin = batch * OUTPUT_ROWS;
-    if let Some(relative) = observed[begin..]
+fn verify_scratch(
+    rows: usize,
+    schedule: Schedule,
+    fixture: &Fixture,
+    observed: &Observed,
+) -> Result<(), Nvfp4DownQualificationError> {
+    let active_codes = if schedule == Schedule::W4a4 {
+        rows * CODE_BYTES_PER_ROW
+    } else {
+        0
+    };
+    let active_scales = if schedule == Schedule::W4a4 {
+        rows * GROUPS_PER_ROW
+    } else {
+        0
+    };
+
+    if let Some(relative) = observed.activation_codes[..active_codes]
         .iter()
-        .position(|&value| value != BF16_SENTINEL)
+        .zip(&fixture.activation_codes[..active_codes])
+        .position(|(actual, expected)| actual != expected)
     {
         return Err(Nvfp4DownQualificationError::Mismatch(format!(
-            "B={batch} modified inactive output {}",
-            begin + relative
+            "{} activation code {relative}: device={:#04x}, oracle={:#04x}",
+            route_name(rows),
+            observed.activation_codes[relative],
+            fixture.activation_codes[relative]
+        )));
+    }
+    if let Some(relative) = observed.activation_scales[..active_scales]
+        .iter()
+        .zip(&fixture.activation_scales[..active_scales])
+        .position(|(actual, expected)| actual != expected)
+    {
+        return Err(Nvfp4DownQualificationError::Mismatch(format!(
+            "{} activation scale {relative}: device={:#04x}, oracle={:#04x}",
+            route_name(rows),
+            observed.activation_scales[relative],
+            fixture.activation_scales[relative]
         )));
     }
 
     Ok(())
+}
+
+fn verify_inactive(
+    rows: usize,
+    schedule: Schedule,
+    observed: &Observed,
+) -> Result<(), Nvfp4DownQualificationError> {
+    let code_begin = if schedule == Schedule::W4a4 {
+        rows * CODE_BYTES_PER_ROW
+    } else {
+        0
+    };
+    let scale_begin = if schedule == Schedule::W4a4 {
+        rows * GROUPS_PER_ROW
+    } else {
+        0
+    };
+    let output_begin = rows * OUTPUT_ROWS;
+
+    for (name, begin, relative) in [
+        (
+            "activation code",
+            code_begin,
+            observed.activation_codes[code_begin..]
+                .iter()
+                .position(|&value| value != BYTE_SENTINEL),
+        ),
+        (
+            "activation scale",
+            scale_begin,
+            observed.activation_scales[scale_begin..]
+                .iter()
+                .position(|&value| value != BYTE_SENTINEL),
+        ),
+    ] {
+        if let Some(relative) = relative {
+            return Err(Nvfp4DownQualificationError::Mismatch(format!(
+                "{} modified inactive {name} {}",
+                route_name(rows),
+                begin + relative
+            )));
+        }
+    }
+
+    if let Some(relative) = observed.output[output_begin..]
+        .iter()
+        .position(|&value| value != BF16_SENTINEL)
+    {
+        return Err(Nvfp4DownQualificationError::Mismatch(format!(
+            "{} modified inactive output {}",
+            route_name(rows),
+            output_begin + relative
+        )));
+    }
+
+    Ok(())
+}
+
+fn inactive_values(rows: usize, schedule: Schedule) -> usize {
+    let inactive_codes = if schedule == Schedule::W4a4 {
+        (MAX_ROWS - rows) * CODE_BYTES_PER_ROW
+    } else {
+        MAX_ROWS * CODE_BYTES_PER_ROW
+    };
+    let inactive_scales = if schedule == Schedule::W4a4 {
+        (MAX_ROWS - rows) * GROUPS_PER_ROW
+    } else {
+        MAX_ROWS * GROUPS_PER_ROW
+    };
+
+    inactive_codes + inactive_scales + (MAX_ROWS - rows) * OUTPUT_ROWS
+}
+
+fn schedule(rows: usize) -> Schedule {
+    if rows <= MAX_BATCH {
+        Schedule::A16
+    } else {
+        Schedule::W4a4
+    }
+}
+
+fn route_name(rows: usize) -> String {
+    if rows <= MAX_BATCH {
+        format!("B={rows}")
+    } else {
+        format!("T={rows}")
+    }
 }
 
 fn down_oracle(
     token: usize,
     row: usize,
+    schedule: Schedule,
     fixture: &Fixture,
 ) -> Result<f64, Nvfp4DownQualificationError> {
-    dot_oracle(token, row, fixture)
+    dot_oracle(token, row, schedule, fixture)
 }
 
 fn dot_oracle(
     token: usize,
     row: usize,
+    schedule: Schedule,
     fixture: &Fixture,
 ) -> Result<f64, Nvfp4DownQualificationError> {
     let exceptional = exceptional_group(row);
     let ordinary = (exceptional + 1) % GROUPS_PER_ROW;
-    let ordinary_dot = group_dot(token, row, ordinary, fixture);
-    let exceptional_dot = group_dot(token, row, exceptional, fixture);
+    let ordinary_dot = group_dot(token, row, ordinary, schedule, fixture)?;
+    let exceptional_dot = group_dot(token, row, exceptional, schedule, fixture)?;
     let ordinary_scale = decode_e4m3fn(fixture.weight_scales[scale_offset(row, ordinary)])?;
     let exceptional_scale = decode_e4m3fn(fixture.weight_scales[scale_offset(row, exceptional)])?;
 
@@ -434,9 +705,21 @@ fn dot_oracle(
     )
 }
 
-fn group_dot(token: usize, row: usize, group: usize, fixture: &Fixture) -> f64 {
+fn group_dot(
+    token: usize,
+    row: usize,
+    group: usize,
+    schedule: Schedule,
+    fixture: &Fixture,
+) -> Result<f64, Nvfp4DownQualificationError> {
     let weight_begin = row * CODE_BYTES_PER_ROW + group * (GROUP / 2);
     let input_begin = token * INPUT_COLUMNS + group * GROUP;
+    let activation_begin = token * CODE_BYTES_PER_ROW + group * (GROUP / 2);
+    let activation_scale = if schedule == Schedule::W4a4 {
+        decode_e4m3fn(fixture.activation_scales[token * GROUPS_PER_ROW + group])?
+    } else {
+        1.0
+    };
     let mut sum = 0.0f64;
 
     for column in 0..GROUP {
@@ -446,11 +729,23 @@ fn group_dot(token: usize, row: usize, group: usize, fixture: &Fixture) -> f64 {
         } else {
             packed >> 4
         };
-        let activation = f64::from(fixture.input_f32[input_begin + column]);
+        let activation = match schedule {
+            Schedule::A16 => f64::from(fixture.input_f32[input_begin + column]),
+            Schedule::W4a4 => {
+                let packed = fixture.activation_codes[activation_begin + column / 2];
+                let code = if column & 1 == 0 {
+                    packed & 15
+                } else {
+                    packed >> 4
+                };
+
+                f64::from(decode_e2m1(code) * activation_scale / INPUT_SCALE_DIVISOR)
+            }
+        };
         sum += activation * f64::from(decode_e2m1(code));
     }
 
-    sum
+    Ok(sum)
 }
 
 fn exceptional_group(row: usize) -> usize {
@@ -471,11 +766,52 @@ fn scale_offset(row: usize, group: usize) -> usize {
         + scale_lane
 }
 
+pub(crate) fn encode_e2m1(value: f32) -> u8 {
+    let mut best = 0u8;
+    let mut best_distance = f32::INFINITY;
+    let candidates = if value.is_sign_negative() {
+        8u8..16
+    } else {
+        0u8..8
+    };
+
+    for code in candidates {
+        let distance = (value - decode_e2m1(code)).abs();
+        if distance < best_distance || (distance == best_distance && code & 1 == 0) {
+            best = code;
+            best_distance = distance;
+        }
+    }
+
+    best
+}
+
 pub(crate) fn decode_e2m1(code: u8) -> f32 {
     const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let magnitude = MAGNITUDES[(code & 7) as usize];
 
     if code & 8 == 0 { magnitude } else { -magnitude }
+}
+
+pub(crate) fn encode_e4m3fn(value: f32) -> Result<u8, Nvfp4DownQualificationError> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(Nvfp4DownQualificationError::Mismatch(
+            "oracle E4M3 scale is not finite and non-negative".to_string(),
+        ));
+    }
+
+    let mut best = 0u8;
+    let mut best_distance = f32::INFINITY;
+    for code in 0u8..=0x7e {
+        let represented = decode_e4m3fn(code)?;
+        let distance = (value - represented).abs();
+        if distance < best_distance || (distance == best_distance && code & 1 == 0) {
+            best = code;
+            best_distance = distance;
+        }
+    }
+
+    Ok(best)
 }
 
 pub(crate) fn decode_e4m3fn(word: u8) -> Result<f32, Nvfp4DownQualificationError> {
@@ -513,9 +849,10 @@ pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CODE_BYTES_PER_ROW, GROUP, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_BATCH,
-        Nvfp4DownQualificationError, OUTPUT_ROWS, decode_e2m1, decode_e4m3fn, down_oracle,
-        exceptional_group, layout, make_fixture, qualify_nvfp4_down, scale_offset,
+        CODE_BYTES_PER_ROW, EXACT_ROUTES, GROUP, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_ROWS,
+        Nvfp4DownQualificationError, OUTPUT_ROWS, Schedule, decode_e2m1, decode_e4m3fn,
+        down_oracle, exceptional_group, inactive_values, layout, make_fixture, qualify_nvfp4_down,
+        scale_offset, schedule,
     };
 
     #[test]
@@ -533,7 +870,7 @@ mod tests {
 
     #[test]
     fn structured_fixture_exercises_one_exceptional_group_per_row() {
-        let fixture = make_fixture();
+        let fixture = make_fixture().unwrap();
 
         for row in [0, 1, 127, 128, OUTPUT_ROWS - 1] {
             let exceptional = exceptional_group(row);
@@ -550,7 +887,7 @@ mod tests {
                 fixture.weight_scales[scale_offset(row, ordinary)],
             );
             assert!(
-                down_oracle(0, row % OUTPUT_ROWS, &fixture)
+                down_oracle(0, row % OUTPUT_ROWS, Schedule::A16, &fixture)
                     .unwrap()
                     .is_finite()
             );
@@ -559,24 +896,35 @@ mod tests {
 
     #[test]
     #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
-    fn exact_batches_match_independent_oracles_and_graph_replay()
+    fn exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), Nvfp4DownQualificationError> {
         let report = qualify_nvfp4_down()?;
-        let active_rows = (1..=MAX_BATCH).sum::<usize>();
-        let inactive_rows = (1..=MAX_BATCH)
-            .map(|batch| MAX_BATCH - batch)
+        let active_rows = EXACT_ROUTES.into_iter().sum::<usize>();
+        let prefill_rows = EXACT_ROUTES
+            .into_iter()
+            .filter(|&rows| schedule(rows) == Schedule::W4a4)
+            .sum::<usize>();
+        let inactive = EXACT_ROUTES
+            .into_iter()
+            .map(|rows| inactive_values(rows, schedule(rows)))
             .sum::<usize>();
 
+        assert_eq!(report.activation_codes, prefill_rows * CODE_BYTES_PER_ROW);
+        assert_eq!(report.activation_scales, prefill_rows * GROUPS_PER_ROW);
         assert_eq!(report.output_values, active_rows * OUTPUT_ROWS);
-        assert_eq!(report.graph_replay_values, active_rows * OUTPUT_ROWS);
-        assert_eq!(report.inactive_values, 2 * inactive_rows * OUTPUT_ROWS);
+        assert_eq!(
+            report.graph_replay_values,
+            active_rows * OUTPUT_ROWS + prefill_rows * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW)
+        );
+        assert_eq!(report.inactive_values, 2 * inactive);
         assert_eq!(
             report.immutable_input_values,
-            16 * (MAX_BATCH * INPUT_COLUMNS + OUTPUT_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW))
+            2 * EXACT_ROUTES.len()
+                * (MAX_ROWS * INPUT_COLUMNS + OUTPUT_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW))
         );
-        assert_eq!(report.arena_bytes, 50_495_488);
+        assert_eq!(report.arena_bytes, 106_299_392);
         assert_eq!(report.weight_bytes, 50_135_040);
-        assert_eq!(report.workspace_bytes, 360_448);
+        assert_eq!(report.workspace_bytes, 56_164_352);
         assert_eq!(report.padding_bytes, 0);
         assert!(report.maximum_absolute_error.is_finite());
 
@@ -587,9 +935,9 @@ mod tests {
     fn arena_accounting_exposes_every_owned_byte() {
         let (layout, regions) = layout().unwrap();
 
-        assert_eq!(layout.byte_len(), 50_495_488);
+        assert_eq!(layout.byte_len(), 106_299_392);
         assert_eq!(regions.weight_bytes(), 50_135_040);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 360_448);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 56_164_352);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 0);
     }
 }
