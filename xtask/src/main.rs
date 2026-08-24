@@ -5,6 +5,7 @@ mod perf_artifact;
 mod perf_iteration;
 mod performance;
 mod remote;
+mod server_bench;
 mod server_qualification;
 mod server_qual;
 
@@ -854,6 +855,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("qualify-text-endpoint") => qualify_text_endpoint(root, &remaining),
         Some("bench-startup") => bench_startup(root, &remaining),
+        Some("bench-server") => server_bench::run(root, &remaining),
         Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
         Some("bench-qwen35-residual-norm") => bench_qwen35_residual_norm(root, &remaining),
         Some("bench-qwen36-residual-norm") => bench_qwen36_residual_norm(root, &remaining),

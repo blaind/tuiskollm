@@ -45,6 +45,7 @@ struct Options {
     output: PathBuf,
     samples: usize,
     long_context: bool,
+    load_probe_seconds: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -57,6 +58,7 @@ struct Report {
     status: &'static str,
     samples_per_case: usize,
     long_context_enabled: bool,
+    setup_completion_tokens: usize,
     cases: Vec<CaseReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     in_progress_case: Option<InProgressCase>,
@@ -135,6 +137,20 @@ fn main() {
         }
     };
     let client = Client::new(options.base_url.clone());
+    if let Some(seconds) = options.load_probe_seconds {
+        match load_probe(client, seconds) {
+            Ok(requests) => {
+                println!(
+                    "PASS server loaded-clock probe: {requests} requests completed across eight external lanes in at least {seconds:.1} seconds"
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("FAIL server loaded-clock probe: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     let mut report = Report {
         schema_version: 1,
         suite: "server-http",
@@ -144,6 +160,7 @@ fn main() {
         status: "running",
         samples_per_case: options.samples,
         long_context_enabled: options.long_context,
+        setup_completion_tokens: 0,
         cases: Vec::new(),
         in_progress_case: None,
         error: None,
@@ -190,6 +207,7 @@ impl Options {
         let mut output = None;
         let mut samples = DEFAULT_SAMPLES;
         let mut long_context = false;
+        let mut load_probe_seconds: Option<f64> = None;
         while let Some(argument) = args.next() {
             match argument.as_str() {
                 "--json" => {
@@ -207,6 +225,22 @@ impl Options {
                         })?;
                 }
                 "--long-context" => long_context = true,
+                "--load-probe-seconds" => {
+                    load_probe_seconds = Some(
+                        args.next()
+                            .ok_or_else(|| {
+                                BenchError::Contract(
+                                    "--load-probe-seconds requires a duration".into(),
+                                )
+                            })?
+                            .parse()
+                            .map_err(|error| {
+                                BenchError::Contract(format!(
+                                    "invalid loaded-probe duration: {error}"
+                                ))
+                            })?,
+                    );
+                }
                 flag if flag.starts_with("--") => {
                     return Err(BenchError::Contract(format!(
                         "unknown benchmark option {flag:?}"
@@ -231,6 +265,18 @@ impl Options {
                 "--samples must be in the exact range 3..=40".into(),
             ));
         }
+        if let Some(seconds) = load_probe_seconds
+            && (!seconds.is_finite() || !(2.0..=10.0).contains(&seconds))
+        {
+            return Err(BenchError::Contract(
+                "--load-probe-seconds must be finite and in 2..=10".into(),
+            ));
+        }
+        if load_probe_seconds.is_some() && long_context {
+            return Err(BenchError::Contract(
+                "--load-probe-seconds cannot be combined with --long-context".into(),
+            ));
+        }
         let output = output.ok_or_else(|| {
             BenchError::Contract(format!(
                 "usage: {program} [http://HOST:PORT] --json target/PATH [--samples N] [--long-context]"
@@ -242,6 +288,7 @@ impl Options {
             output,
             samples,
             long_context,
+            load_probe_seconds,
         })
     }
 }
@@ -393,9 +440,10 @@ impl Client {
 
 fn run(client: &Client, options: &Options, report: &mut Report) -> Result<()> {
     let reusable = reusable_messages();
-    let _prime = client.blocking(reusable.clone(), STREAM_COMPLETION_TOKENS)?;
+    let prime = client.blocking(reusable.clone(), STREAM_COMPLETION_TOKENS)?;
     let warmup = client.streaming(reusable.clone(), STREAM_COMPLETION_TOKENS)?;
     require_full_reuse(&warmup, "reused-stream warmup")?;
+    report.setup_completion_tokens = prime.completion_tokens + warmup.completion_tokens;
     measure_case(
         report,
         options,
@@ -462,6 +510,36 @@ fn run(client: &Client, options: &Options, report: &mut Report) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn load_probe(client: Client, seconds: f64) -> Result<usize> {
+    let lanes = 8;
+    let barrier = Arc::new(Barrier::new(lanes));
+    let deadline = Instant::now() + Duration::from_secs_f64(seconds);
+    let handles = (0..lanes)
+        .map(|lane| {
+            let barrier = Arc::clone(&barrier);
+            let client = client.clone();
+            thread::spawn(move || -> Result<usize> {
+                barrier.wait();
+                let mut requests = 0;
+                loop {
+                    let nonce = 0x40_0000 + lane * 0x1_0000 + requests;
+                    let observation =
+                        client.blocking(fresh_messages(nonce, 256), STREAM_COMPLETION_TOKENS)?;
+                    require_low_reuse(&observation, "loaded-clock probe")?;
+                    requests += 1;
+                    if Instant::now() >= deadline {
+                        return Ok(requests);
+                    }
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    handles
+        .into_iter()
+        .map(|handle| handle.join().map_err(|_| BenchError::ThreadPanic)?)
+        .sum()
 }
 
 fn concurrent_group(client: Client, concurrency: usize, sample: usize) -> Result<Observation> {

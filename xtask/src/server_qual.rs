@@ -20,67 +20,100 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const ROUTE: &str = "mtp-draft-3";
 
 pub(super) fn run(root: &Path, arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
+    let snapshot = parse_snapshot(arguments, "qualify-server")?;
+    let (tools, mut server) = start(root, snapshot, "server qualification setup")?;
+    let qualification = run_visible(
+        Command::new(tools.qualifier())
+            .arg(server.base_url())
+            .current_dir(root),
+    );
+    let stop = server.stop_and_wait();
+    qualification?;
+    stop?;
+
+    println!(
+        "production server qualification passed; lifecycle log: {}",
+        server.log_path().display()
+    );
+    Ok(())
+}
+
+pub(super) fn parse_snapshot<'a>(
+    arguments: &'a [OsString],
+    command: &str,
+) -> Result<&'a Path, Box<dyn Error>> {
     let [snapshot] = arguments else {
-        return Err("usage: cargo run -p xtask -- qualify-server SNAPSHOT".into());
+        return Err(format!("usage: cargo run -p xtask -- {command} SNAPSHOT").into());
     };
     let snapshot = Path::new(snapshot);
     if !snapshot.is_dir() {
         return Err(format!("snapshot `{}` is not a directory", snapshot.display()).into());
     }
-
-    require_device_idle("server qualification setup")?;
-    let qualifier = build_qualifier(root)?;
-    build_server(root)?;
-    require_device_idle("server qualification setup")?;
-
-    let address = private_address()?;
-    let log_path = root.join("target/server-qualification/server.log");
-    let mut server = ServerChild::spawn(
-        root,
-        &root.join(CUDA_OXIDE_BUILD_TARGET).join("release/tuiskollm"),
-        snapshot,
-        address,
-        &log_path,
-    )?;
-    if let Err(error) = server.wait_ready(address, &log_path) {
-        let stop = server.stop();
-        let idle = wait_for_device_idle();
-        stop?;
-        idle?;
-        return Err(error);
-    }
-
-    let base_url = format!("http://{address}");
-    let qualification = run_visible(Command::new(qualifier).arg(&base_url).current_dir(root));
-    let stop = server.stop();
-    let idle = wait_for_device_idle();
-    qualification?;
-    stop?;
-    idle?;
-
-    println!(
-        "production server qualification passed; lifecycle log: {}",
-        log_path.display()
-    );
-    Ok(())
+    Ok(snapshot)
 }
 
-fn build_qualifier(root: &Path) -> Result<PathBuf, Box<dyn Error>> {
+pub(super) struct HostTools {
+    qualifier: PathBuf,
+    benchmark: PathBuf,
+}
+
+impl HostTools {
+    pub(super) fn qualifier(&self) -> &Path {
+        &self.qualifier
+    }
+
+    pub(super) fn benchmark(&self) -> &Path {
+        &self.benchmark
+    }
+}
+
+fn build_host_tools(root: &Path) -> Result<HostTools, Box<dyn Error>> {
     run_visible(
         Command::new("cargo")
             .current_dir(root)
             .args(["build", "--package", "tuisko-server-qual", "--release"])
             .env("CARGO_HOME", task_cargo_home(root)),
     )?;
-    let executable = root.join("target/release/tuisko-server-qual");
-    if !executable.is_file() {
+    let qualifier = root.join("target/release/tuisko-server-qual");
+    let benchmark = root.join("target/release/bench-server");
+    if !qualifier.is_file() || !benchmark.is_file() {
         return Err(format!(
-            "host build omitted server qualifier `{}`",
-            executable.display()
+            "host build omitted server tools `{}` or `{}`",
+            qualifier.display(),
+            benchmark.display()
         )
         .into());
     }
-    Ok(executable)
+    Ok(HostTools {
+        qualifier,
+        benchmark,
+    })
+}
+
+pub(super) fn start(
+    root: &Path,
+    snapshot: &Path,
+    activity: &str,
+) -> Result<(HostTools, ProductionServer), Box<dyn Error>> {
+    require_device_idle(activity)?;
+    let tools = build_host_tools(root)?;
+    build_server(root)?;
+    require_device_idle(activity)?;
+
+    let address = private_address()?;
+    let log_path = root.join("target/server-qualification/server.log");
+    let mut server = ProductionServer::spawn(
+        root,
+        &root.join(CUDA_OXIDE_BUILD_TARGET).join("release/tuiskollm"),
+        snapshot,
+        address,
+        log_path,
+    )?;
+    if let Err(error) = server.wait_ready() {
+        server.stop_and_wait()?;
+        return Err(error);
+    }
+    Ok((tools, server))
 }
 
 fn private_address() -> Result<SocketAddr, Box<dyn Error>> {
@@ -90,24 +123,26 @@ fn private_address() -> Result<SocketAddr, Box<dyn Error>> {
     Ok(address)
 }
 
-struct ServerChild {
+pub(super) struct ProductionServer {
     child: Option<Child>,
+    address: SocketAddr,
+    log_path: PathBuf,
 }
 
-impl ServerChild {
+impl ProductionServer {
     fn spawn(
         root: &Path,
         executable: &Path,
         snapshot: &Path,
         address: SocketAddr,
-        log_path: &Path,
+        log_path: PathBuf,
     ) -> Result<Self, Box<dyn Error>> {
         fs::create_dir_all(
             log_path
                 .parent()
                 .ok_or("server qualification log has no parent")?,
         )?;
-        let stdout = File::create(log_path)?;
+        let stdout = File::create(&log_path)?;
         let stderr = stdout.try_clone()?;
         let child = Command::new(executable)
             .current_dir(root)
@@ -118,27 +153,31 @@ impl ServerChild {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()?;
-        Ok(Self { child: Some(child) })
+        Ok(Self {
+            child: Some(child),
+            address,
+            log_path,
+        })
     }
 
-    fn wait_ready(&mut self, address: SocketAddr, log_path: &Path) -> Result<(), Box<dyn Error>> {
+    fn wait_ready(&mut self) -> Result<(), Box<dyn Error>> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
             if let Some(status) = self.status()? {
                 return Err(format!(
                     "production server exited with {status} before becoming ready; inspect {}",
-                    log_path.display()
+                    self.log_path.display()
                 )
                 .into());
             }
-            if probe_health(address)? {
+            if probe_health(self.address)? {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(format!(
                     "production server did not become ready within {} seconds; inspect {}",
                     STARTUP_TIMEOUT.as_secs(),
-                    log_path.display()
+                    self.log_path.display()
                 )
                 .into());
             }
@@ -163,9 +202,31 @@ impl ServerChild {
         let _status = child.wait()?;
         Ok(())
     }
+
+    pub(super) fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    pub(super) fn pid(&self) -> Result<u32, Box<dyn Error>> {
+        self.child
+            .as_ref()
+            .map(Child::id)
+            .ok_or_else(|| "production server child is no longer running".into())
+    }
+
+    pub(super) fn log_path(&self) -> &Path {
+        &self.log_path
+    }
+
+    pub(super) fn stop_and_wait(&mut self) -> Result<(), Box<dyn Error>> {
+        let stop = self.stop();
+        let idle = wait_for_device_idle();
+        stop?;
+        idle
+    }
 }
 
-impl Drop for ServerChild {
+impl Drop for ProductionServer {
     fn drop(&mut self) {
         let _ = self.stop();
     }
