@@ -25,7 +25,10 @@ const DEFAULT_EOS_IDS: [u32; 2] = [IM_END_ID, END_OF_TEXT_ID];
 const DEFAULT_TEMPERATURE: f32 = 1.0;
 const DEFAULT_TOP_P: f32 = 0.95;
 const DEFAULT_TOP_K: usize = 20;
-const PROMPT_BLOCK_START: &str = "<|im_start|>";
+const PROMPT_BLOCK_START: &str = SPECIAL_TOKEN_LITERALS[0];
+
+/// Literal strings the pinned tokenizer always extracts as control tokens from raw text.
+pub const SPECIAL_TOKEN_LITERALS: [&str; 3] = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"];
 
 /// One text message supplied to the checkpoint chat template.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -715,10 +718,11 @@ fn validate_tokenizer(tokenizer: &Tokenizer) -> FrontendResult<()> {
         )));
     }
 
+    let [im_start, im_end, end_of_text] = SPECIAL_TOKEN_LITERALS;
     for (token, expected) in [
-        ("<|im_start|>", IM_START_ID),
-        ("<|im_end|>", IM_END_ID),
-        ("<|endoftext|>", END_OF_TEXT_ID),
+        (im_start, IM_START_ID),
+        (im_end, IM_END_ID),
+        (end_of_text, END_OF_TEXT_ID),
     ] {
         let actual = tokenizer.token_to_id(token);
         if actual != Some(expected) {

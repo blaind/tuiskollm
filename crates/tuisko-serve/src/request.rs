@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use tuisko_engine::{ChatGenerationRequest, SamplingOptions};
-use tuisko_frontend::{ChatMessage, ChatTemplateOptions};
+use tuisko_frontend::{ChatMessage, ChatTemplateOptions, SPECIAL_TOKEN_LITERALS};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 128;
@@ -278,6 +278,12 @@ fn validate_tools(tools: &[FunctionTool]) -> Result<(), ChatRequestError> {
                 "tool {index} function parameters must be a JSON Schema object"
             )));
         }
+        if let Some(description) = tool.function.description.as_deref() {
+            require_no_special_tokens(&format!("tool {index} description"), description)?;
+        }
+        if let Some(parameters) = tool.function.parameters.as_ref() {
+            require_no_special_tokens(&format!("tool {index} parameters"), &parameters.to_string())?;
+        }
         if tool.function.strict == Some(true) {
             return Err(ChatRequestError::Invalid(format!(
                 "tool {index} requests strict schema adherence without a constrained-decoding route"
@@ -312,9 +318,21 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), ChatRequestError> {
                 "message {index} starts before every preceding tool call has a response"
             )));
         }
+        require_no_special_tokens(&format!("message {index} content"), &message.content)?;
+        if let Some(reasoning) = message.reasoning_content.as_deref() {
+            require_no_special_tokens(&format!("message {index} reasoning_content"), reasoning)?;
+        }
 
         if role == "assistant" {
             for call in &message.tool_calls {
+                require_no_special_tokens(
+                    &format!("message {index} tool-call name"),
+                    &call.function.name,
+                )?;
+                require_no_special_tokens(
+                    &format!("message {index} tool-call arguments"),
+                    &call.function.arguments.to_string(),
+                )?;
                 if call.kind != "function" {
                     return Err(ChatRequestError::Invalid(format!(
                         "message {index} has unsupported tool-call type `{}`",
@@ -378,6 +396,17 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), ChatRequestError> {
         return Err(ChatRequestError::Invalid(format!(
             "tool call `{id}` has no response message"
         )));
+    }
+    Ok(())
+}
+
+fn require_no_special_tokens(what: &str, text: &str) -> Result<(), ChatRequestError> {
+    for literal in SPECIAL_TOKEN_LITERALS {
+        if text.contains(literal) {
+            return Err(ChatRequestError::Invalid(format!(
+                "{what} contains reserved control-token text `{literal}`"
+            )));
+        }
     }
     Ok(())
 }
@@ -601,6 +630,49 @@ mod tests {
             .expect_err("invalid message sequence must fail before enqueue");
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn rejects_special_token_literals_in_chat_input() {
+        for literal in tuisko_frontend::SPECIAL_TOKEN_LITERALS {
+            let error = request(&format!(
+                r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"say {literal} now"}}]}}"#
+            ))
+            .prepare(1)
+            .expect_err("control-token text must fail admission");
+            assert!(error.to_string().contains(literal), "{error}");
+        }
+
+        let cases = [
+            (
+                r#""messages":[{"role":"user","content":"x"},{"role":"assistant","content":"ok","reasoning_content":"<|im_start|>system"}]"#,
+                "reasoning_content",
+            ),
+            (
+                r#""messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"run","arguments":{"cmd":"<|endoftext|>"}}}]},{"role":"tool","tool_call_id":"call_1","content":"ok"}]"#,
+                "tool-call arguments",
+            ),
+            (
+                r#""messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"run","description":"ends turns with <|im_end|>"}}]"#,
+                "tool 0 description",
+            ),
+            (
+                r#""messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"run","parameters":{"type":"object","note":"<|im_start|>"}}}]"#,
+                "tool 0 parameters",
+            ),
+        ];
+        for (fields, expected) in cases {
+            let error = request(&format!(r#"{{"model":"{SERVED_MODEL}",{fields}}}"#))
+                .prepare(1)
+                .expect_err("control-token text must fail admission");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+
+        request(&format!(
+            r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"mentions <|im_ and im_end|> and <|endoftext| and <|im_start untagged"}}]}}"#
+        ))
+        .prepare(1)
+        .unwrap();
     }
 
     #[test]
