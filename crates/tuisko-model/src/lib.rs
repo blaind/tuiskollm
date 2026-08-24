@@ -15,8 +15,8 @@ pub use bindings::{
     ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4LinearBindings,
     ModelOptNvfp4MlpBindings, MtpBindings, NVFP4_MLP_LAYER_END, Nvfp4DownBindings,
     Nvfp4GateUpBindings, Nvfp4MlpBindings, Qwen36Fp8LinearBindings, Qwen36FullAttentionBindings,
-    Qwen36GdnBindings, Qwen36MoeExpertBindings, Qwen36MoeLayerBindings, TextEndpointBindings,
-    VisionBindings, VisionBlockBindings,
+    Qwen36GdnBindings, Qwen36MoeExpertBindings, Qwen36MoeLayerBindings, Qwen36TextEndpointBindings,
+    TextEndpointBindings, VisionBindings, VisionBlockBindings,
 };
 pub use config::validate_config;
 pub use dtype::DType;
@@ -27,7 +27,8 @@ pub use materialize::{
     MaterializedModelOptNvfp4Linear, MaterializedModelOptNvfp4Mlp, MaterializedMtpQkv,
     MaterializedNvfp4Down, MaterializedNvfp4GateUp, MaterializedQwen36Fp8Linear,
     MaterializedQwen36FullAttention, MaterializedQwen36Gdn, MaterializedQwen36MoeExperts,
-    MaterializedQwen36MoeLayer, nvfp4_scale_materialization_workers,
+    MaterializedQwen36MoeLayer, MaterializedQwen36TextEndpoint,
+    nvfp4_scale_materialization_workers,
 };
 pub use safetensors::{SafeTensorFile, TensorView};
 pub use views::{Bf16View, F32View, Fp8E4M3View, U8View};

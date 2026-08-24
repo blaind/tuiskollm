@@ -9,7 +9,7 @@ use crate::{
     ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4LinearBindings,
     ModelOptNvfp4MlpBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
     Qwen36Fp8LinearBindings, Qwen36FullAttentionBindings, Qwen36GdnBindings, Qwen36Moe35B,
-    Qwen36MoeExpertBindings, Qwen36MoeLayerBindings,
+    Qwen36MoeExpertBindings, Qwen36MoeLayerBindings, Qwen36TextEndpointBindings,
 };
 use rayon::prelude::*;
 use std::mem::size_of;
@@ -731,6 +731,56 @@ pub struct MaterializedModelOptNvfp4Linear<'a> {
     pub columns: usize,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+/// Runtime-native Qwen3.6 text endpoint sources.
+#[derive(Debug)]
+pub struct MaterializedQwen36TextEndpoint<'a> {
+    /// Mmap-backed BF16 token embeddings.
+    pub embedding: Bf16View<'a, 2>,
+    /// BF16 final RMSNorm weights.
+    pub final_norm: Bf16View<'a, 1>,
+    /// Packed E2M1 LM-head source words.
+    pub lm_head_weight_e2m1: &'a [u8],
+    /// Losslessly swizzled LM-head E4M3 block scales.
+    pub lm_head_scale_e4m3_swizzled: Vec<u8>,
+    /// Exact source activation scale retained for the endpoint contract.
+    pub lm_head_input_scale: f32,
+    /// Exact source second-stage weight scale consumed by the A16 route.
+    pub lm_head_weight_scale_2: f32,
+}
+
+impl<'a> Qwen36TextEndpointBindings<'a> {
+    /// Swizzles the LM-head scale plane without changing represented values.
+    pub fn materialize(self) -> CheckpointResult<MaterializedQwen36TextEndpoint<'a>> {
+        self.materialize_with_contract(Qwen36Moe35B::VOCAB, Qwen36Moe35B::HIDDEN)
+    }
+
+    fn materialize_with_contract(
+        self,
+        vocab: usize,
+        hidden: usize,
+    ) -> CheckpointResult<MaterializedQwen36TextEndpoint<'a>> {
+        let lm_head = materialize_modelopt_linear(self.lm_head, Qwen36Moe35B::LAYERS, "LM head")?;
+        if self.embedding.shape() != &[vocab as u64, hidden as u64]
+            || self.final_norm.shape() != &[hidden as u64]
+            || lm_head.rows != vocab
+            || lm_head.columns != hidden
+        {
+            return Err(CheckpointError::source_binding(
+                "Qwen3.6 text endpoint source geometry differs from its contract",
+            ));
+        }
+
+        Ok(MaterializedQwen36TextEndpoint {
+            embedding: self.embedding,
+            final_norm: self.final_norm,
+            lm_head_weight_e2m1: lm_head.weight_e2m1,
+            lm_head_scale_e4m3_swizzled: lm_head.scale_e4m3_swizzled,
+            lm_head_input_scale: lm_head.input_scale,
+            lm_head_weight_scale_2: lm_head.weight_scale_2,
+        })
+    }
 }
 
 /// Runtime-native Qwen3.5 full-attention planes.
@@ -1826,7 +1876,7 @@ mod tests {
         ModelOptNvfp4LinearBindings, ModelOptNvfp4MlpBindings, Nvfp4DownBindings,
         Nvfp4GateUpBindings, Qwen35_9B, Qwen36Fp8LinearBindings, Qwen36FullAttentionBindings,
         Qwen36GdnBindings, Qwen36Moe35B, Qwen36MoeExpertBindings, Qwen36MoeLayerBindings,
-        TensorView, U8View,
+        Qwen36TextEndpointBindings, TensorView, U8View,
     };
 
     const ROWS: usize = 128;
@@ -2590,6 +2640,104 @@ mod tests {
         assert_eq!(materialized.input_norm.word(0), Some(0x3f80));
         assert_eq!(materialized.next_norm.word(0), Some(0x4000));
         assert_eq!(materialized.layer, 3);
+    }
+
+    #[test]
+    fn qwen36_endpoint_materialization_preserves_source_words_and_scales() {
+        const VOCAB: usize = 128;
+        const HIDDEN: usize = 64;
+        const GROUPS: usize = HIDDEN / 16;
+
+        let embedding_shape = [VOCAB as u64, HIDDEN as u64];
+        let norm_shape = [HIDDEN as u64];
+        let weight_shape = [VOCAB as u64, (HIDDEN / 2) as u64];
+        let scale_shape = [VOCAB as u64, GROUPS as u64];
+        let embedding = vec![0x20; VOCAB * HIDDEN * 2];
+        let norm = vec![0x30; HIDDEN * 2];
+        let weight = (0..VOCAB * HIDDEN / 2)
+            .map(|index| index as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..VOCAB * GROUPS)
+            .map(|index| ((index * 37 + 17) % 0x7f) as u8)
+            .collect::<Vec<_>>();
+        let input_scale = 0.25f32.to_le_bytes();
+        let weight_scale_2 = 0.125f32.to_le_bytes();
+        let bindings = Qwen36TextEndpointBindings {
+            embedding: bf16_view("embedding", &embedding_shape, &embedding),
+            final_norm: bf16_vector("final-norm", &norm_shape, &norm),
+            lm_head: ModelOptNvfp4LinearBindings {
+                weight: u8_view("lm-head", &weight_shape, &weight),
+                block_scale: fp8_view("lm-head-scale", &scale_shape, &scales),
+                input_scale: f32_scalar_view("input-scale", &input_scale),
+                weight_scale_2: f32_scalar_view("weight-scale", &weight_scale_2),
+                rows: VOCAB,
+                columns: HIDDEN,
+            },
+        };
+
+        let error = Qwen36TextEndpointBindings {
+            lm_head: ModelOptNvfp4LinearBindings {
+                rows: VOCAB + 128,
+                ..bindings.lm_head
+            },
+            ..bindings
+        }
+        .materialize_with_contract(VOCAB, HIDDEN)
+        .unwrap_err();
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("source geometry differs"));
+
+        let materialized = bindings.materialize_with_contract(VOCAB, HIDDEN).unwrap();
+
+        assert_eq!(materialized.lm_head_weight_e2m1, weight);
+        assert_eq!(materialized.lm_head_weight_e2m1.as_ptr(), weight.as_ptr());
+        assert_eq!(
+            materialized.lm_head_scale_e4m3_swizzled,
+            block_scale_oracle(&scales, VOCAB, GROUPS)
+        );
+        assert_eq!(
+            materialized.lm_head_input_scale.to_bits(),
+            0.25f32.to_bits()
+        );
+        assert_eq!(
+            materialized.lm_head_weight_scale_2.to_bits(),
+            0.125f32.to_bits()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN36_SNAPSHOT with the pinned complete Qwen3.6 checkpoint"]
+    fn qwen36_source_text_endpoint_materializes_losslessly() {
+        let root = std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+            .expect("TUISKO_QWEN36_SNAPSHOT is required for the source-backed gate");
+        let snapshot =
+            CheckpointSnapshot::<Qwen36Moe35B>::open(std::path::Path::new(&root)).unwrap();
+        let bindings = Qwen36TextEndpointBindings::bind(&snapshot).unwrap();
+        let source_codes = bindings.lm_head.weight.bytes();
+        let source_scales = bindings.lm_head.block_scale.codes();
+        let source_input_scale = bindings.lm_head.input_scale.value(0).unwrap();
+        let source_weight_scale = bindings.lm_head.weight_scale_2.value(0).unwrap();
+        let materialized = bindings.materialize().unwrap();
+
+        assert_eq!(materialized.embedding.shape(), &[248_320, 2_048]);
+        assert_eq!(materialized.final_norm.shape(), &[2_048]);
+        assert_eq!(
+            materialized.lm_head_weight_e2m1.as_ptr(),
+            source_codes.as_ptr()
+        );
+        assert_eq!(materialized.lm_head_weight_e2m1.len(), 254_279_680);
+        assert_eq!(
+            materialized.lm_head_scale_e4m3_swizzled,
+            block_scale_oracle(source_scales, 248_320, 128)
+        );
+        assert_eq!(
+            materialized.lm_head_input_scale.to_bits(),
+            source_input_scale.to_bits()
+        );
+        assert_eq!(
+            materialized.lm_head_weight_scale_2.to_bits(),
+            source_weight_scale.to_bits()
+        );
     }
 
     #[test]
