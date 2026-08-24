@@ -12,8 +12,10 @@ use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     GpuTimer,
 };
-use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, MtpBf16PagedGqaOp, Qwen35PagedGqaOp};
-use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
+use tuisko_kernels_sm120::{
+    ATTENTION_PAGE_SIZE, MtpBf16PagedGqaOp, Qwen35PagedGqaOp, Qwen36PagedGqaOp,
+};
+use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const ALIGNMENT: usize = 256;
@@ -104,6 +106,42 @@ impl BenchPagedGqaOp for Qwen35PagedGqaOp {
 
     fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
         Qwen35PagedGqaOp::new(context)
+    }
+
+    fn workload(batch: usize) -> BenchmarkWorkload {
+        BenchmarkWorkload::warm_operator_decode(batch as u32)
+    }
+
+    fn launch(&self, stream: &CudaStream, batch: usize, addresses: &Addresses) -> GpuResult<()> {
+        // SAFETY: the session owns all 24 pages and metadata rows for the
+        // 130-position context throughout every captured graph replay.
+        unsafe {
+            self.launch(
+                stream,
+                batch,
+                addresses.query,
+                addresses.key_pages,
+                addresses.value_pages,
+                addresses.block_tables,
+                addresses.table_rows,
+                TABLE_STRIDE,
+                addresses.lengths,
+                addresses.output,
+            )
+        }
+    }
+}
+
+impl BenchPagedGqaOp for Qwen36PagedGqaOp {
+    type Target = Qwen36Moe35B;
+    const ROUTE: &'static str = "qwen36_paged_gqa/online_softmax_bf16_kv";
+    const SUITE: &'static str = "bench-qwen36-paged-gqa";
+    const CACHE_OWNER: &'static str = "qwen36_paged_gqa/kv_cache";
+    const WORKSPACE_OWNER: &'static str = "qwen36_paged_gqa/address_stable_workspace";
+    const PADDING_OWNER: &'static str = "qwen36_paged_gqa/alignment_padding";
+
+    fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        Qwen36PagedGqaOp::new(context)
     }
 
     fn workload(batch: usize) -> BenchmarkWorkload {
@@ -407,6 +445,13 @@ pub fn benchmark_qwen35_paged_gqa(
     benchmark_target::<Qwen35PagedGqaOp>(options)
 }
 
+/// Measures every exact Qwen3.6 represented-BF16 paged-GQA batch.
+pub fn benchmark_qwen36_paged_gqa(
+    options: DeviceBenchmarkOptions,
+) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
+    benchmark_target::<Qwen36PagedGqaOp>(options)
+}
+
 /// Measures every exact Qwen3.8 MTP BF16 paged-GQA graph at 130 context tokens.
 pub fn benchmark_mtp_bf16_paged_gqa(
     options: DeviceBenchmarkOptions,
@@ -418,7 +463,7 @@ pub fn benchmark_mtp_bf16_paged_gqa(
 mod tests {
     use super::{CONTEXT_TOKENS, MAX_BATCH, layout, logical_bytes};
     use std::mem::size_of;
-    use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
     #[test]
     fn qwen35_bf16_byte_accounting_covers_every_query_head_cache_read() {
@@ -441,6 +486,29 @@ mod tests {
         assert_eq!(regions.cache_bytes(), 6_291_456);
         assert_eq!(regions.payload_bytes(), 6_553_760);
         assert_eq!(layout.byte_len(), 6_554_368);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 608);
+    }
+
+    #[test]
+    fn qwen36_bf16_byte_and_arena_accounting_cover_the_two_head_cache() {
+        let per_token = 2 * Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>()
+            + 2 * Qwen36Moe35B::NUM_ATTENTION_HEADS
+                * CONTEXT_TOKENS
+                * Qwen36Moe35B::HEAD_DIM
+                * size_of::<u16>()
+            + 2 * size_of::<u32>()
+            + Qwen36Moe35B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * size_of::<u32>();
+
+        assert_eq!(logical_bytes::<Qwen36Moe35B>(1), per_token);
+        assert_eq!(
+            logical_bytes::<Qwen36Moe35B>(MAX_BATCH),
+            MAX_BATCH * per_token
+        );
+
+        let (layout, regions) = layout::<Qwen36Moe35B>().unwrap();
+        assert_eq!(regions.cache_bytes(), 3_145_728);
+        assert_eq!(regions.payload_bytes(), 3_408_032);
+        assert_eq!(layout.byte_len(), 3_408_640);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 608);
     }
 

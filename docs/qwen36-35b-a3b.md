@@ -138,8 +138,13 @@ exact BF16 cache values, complete eager/graph agreement, untouched pages, immuta
 addresses, and zero post-warmup growth in a 2,380,288-byte arena. All eight entries retain 54
 registers, zero stack/local memory, and 1,024 bytes of shared memory. At a diagnostic locked
 2,197 MHz SM clock, its warm repeated path measures 2.825/3.141 us at B=1/8; the 4.104-us graph
-boundary is dispatch-limited throughout this small leaf. Paged attention, gated output, and the
-full layer owner remain separate qualification slices.
+boundary is dispatch-limited throughout this small leaf. The following BF16 paged-GQA leaf owns a
+separate 8:1 query/KV-head route at every `B=1..8`. Its independent FP64 page/online-softmax oracle
+passes 147,456 active outputs, 114,688 inactive sentinels, 262,144 graph-replay values, and complete
+read-only input checks in a 3,408,640-byte arena. All eight generated entries use 48 registers,
+zero stack/local memory, and 1,024 bytes shared. Timing remains unreported because the available
+diagnostic run failed the exclusive-device precondition. Gated output and the full layer owner
+remain separate qualification slices.
 
 ## Implementation order
 
