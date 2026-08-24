@@ -12127,7 +12127,46 @@ fn gate_qwen35_nvfp4_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("qwen35_nvfp4_gdn_input_a16_TID_"))
         .collect::<Vec<_>>();
+    let quantize = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_nvfp4_gdn_input_quantize_TID_")
+        })
+        .collect::<Vec<_>>();
+    let projected_w4a4 = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_nvfp4_gdn_input_projected_w4a4_TID_")
+        })
+        .collect::<Vec<_>>();
+    let control_w4a4 = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_nvfp4_gdn_input_control_w4a4_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.5 NVFP4 GDN input", routes.len(), 8)?;
+    require_count(
+        "Qwen3.5 NVFP4 GDN input prefill quantization",
+        quantize.len(),
+        3,
+    )?;
+    require_count(
+        "Qwen3.5 NVFP4 projected GDN input prefill",
+        projected_w4a4.len(),
+        3,
+    )?;
+    require_count(
+        "Qwen3.5 NVFP4 control GDN input prefill",
+        control_w4a4.len(),
+        3,
+    )?;
 
     for entry in &routes {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
@@ -12141,30 +12180,38 @@ fn gate_qwen35_nvfp4_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
             return Err(format!("entry `{}` lost represented E2M1 conversion", entry.name).into());
         }
     }
+    for entry in &quantize {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in projected_w4a4.iter().chain(&control_w4a4) {
+        if !entry.body.contains(".reqntid 384, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 384-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        if !entry
+            .body
+            .contains("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X")
+        {
+            return Err(format!(
+                "entry `{}` lost its exact NVFP4 inline PTX instruction",
+                entry.name
+            )
+            .into());
+        }
+    }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("qwen35-nvfp4-gdn-input-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let mut registers = Vec::new();
     let mut shared = Vec::new();
     for entry in routes {
@@ -12175,7 +12222,7 @@ fn gate_qwen35_nvfp4_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
             )
         })?;
         require_spill_free(entry.name, resource)?;
-        if sass_function_body(&sass, entry.name).is_none() {
+        if sass_function_body(sass, entry.name).is_none() {
             return Err(format!(
                 "cuobjdump omitted Qwen3.5 NVFP4 GDN input SASS `{}`",
                 entry.name
@@ -12190,9 +12237,110 @@ fn gate_qwen35_nvfp4_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
     require_registers(&baseline, "nvfp4_registers", &registers)?;
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
+    let mut quantize_registers = Vec::new();
+    let mut quantize_shared = Vec::new();
+    for entry in quantize {
+        let resource = resources.get(entry.name).ok_or_else(|| {
+            format!(
+                "cuobjdump omitted Qwen3.5 NVFP4 GDN input quantization entry `{}`",
+                entry.name
+            )
+        })?;
+        require_spill_free(entry.name, resource)?;
+        if sass_function_body(sass, entry.name).is_none() {
+            return Err(format!(
+                "cuobjdump omitted Qwen3.5 NVFP4 GDN input quantization SASS `{}`",
+                entry.name
+            )
+            .into());
+        }
+        quantize_registers.push(resource.registers);
+        quantize_shared.push(resource.shared);
+    }
+    quantize_registers.sort_unstable();
+    if baseline.contains_key("prefill_quantize_registers") {
+        require_registers(&baseline, "prefill_quantize_registers", &quantize_registers)?;
+        require_uniform_value(&baseline, "prefill_quantize_shared_bytes", &quantize_shared)?;
+    }
+
+    let mut projected_registers = Vec::new();
+    let mut projected_shared = Vec::new();
+    let mut control_registers = Vec::new();
+    let mut control_shared = Vec::new();
+    for (role, entries, registers, shared_bytes) in [
+        (
+            "projected",
+            projected_w4a4,
+            &mut projected_registers,
+            &mut projected_shared,
+        ),
+        (
+            "control",
+            control_w4a4,
+            &mut control_registers,
+            &mut control_shared,
+        ),
+    ] {
+        for entry in entries {
+            let resource = resources.get(entry.name).ok_or_else(|| {
+                format!(
+                    "cuobjdump omitted Qwen3.5 NVFP4 {role} GDN input entry `{}`",
+                    entry.name
+                )
+            })?;
+            require_spill_free(entry.name, resource)?;
+            let body = sass_function_body(sass, entry.name).ok_or_else(|| {
+                format!(
+                    "cuobjdump omitted Qwen3.5 NVFP4 {role} GDN input SASS `{}`",
+                    entry.name
+                )
+            })?;
+            if !body.contains("OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X") {
+                return Err(format!(
+                    "entry `{}` lost native Blackwell NVFP4 MMA selection",
+                    entry.name
+                )
+                .into());
+            }
+            registers.push(resource.registers);
+            shared_bytes.push(resource.shared);
+        }
+    }
+    projected_registers.sort_unstable();
+    control_registers.sort_unstable();
+    for (key, registers) in [
+        (
+            "prefill_projected_registers",
+            projected_registers.as_slice(),
+        ),
+        ("prefill_control_registers", control_registers.as_slice()),
+    ] {
+        if baseline.contains_key(key) {
+            require_registers(&baseline, key, registers)?;
+        }
+    }
+    for (key, shared) in [
+        (
+            "prefill_projected_shared_bytes",
+            projected_shared.as_slice(),
+        ),
+        ("prefill_control_shared_bytes", control_shared.as_slice()),
+    ] {
+        if baseline.contains_key(key) {
+            require_uniform_value(&baseline, key, shared)?;
+        }
+    }
+
     println!(
-        "Qwen3.5 NVFP4 GDN input gate passed: 8 A16 entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}",
-        registers, shared
+        "Qwen3.5 NVFP4 GDN input gate passed: 8 A16 + 3 prefill quantize + 3 projected W4A4 + 3 control W4A4 entries, REG {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?} / {:?}",
+        registers,
+        quantize_registers,
+        projected_registers,
+        control_registers,
+        shared,
+        quantize_shared,
+        projected_shared,
+        control_shared
     );
     Ok(())
 }
