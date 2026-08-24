@@ -20,8 +20,13 @@ const STREAM_EVENT_BUFFER: usize = 32;
 pub enum GenerationReply {
     /// Newly decoded text.
     Delta(String),
-    /// Terminal generated output and accounting.
-    Done(GeneratedText),
+    /// Terminal generated output and resident device-prefix accounting.
+    Done {
+        /// Complete generated output.
+        output: GeneratedText,
+        /// Prompt tokens restored from retained device state at admission.
+        cached_prompt_tokens: usize,
+    },
     /// Request admission failed before any device work was scheduled.
     Rejected(String),
     /// Resident execution failed after admission.
@@ -31,8 +36,14 @@ pub enum GenerationReply {
 #[derive(Serialize)]
 struct Usage {
     prompt_tokens: usize,
+    prompt_tokens_details: PromptTokensDetails,
     completion_tokens: usize,
     total_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct PromptTokensDetails {
+    cached_tokens: usize,
 }
 
 /// Collects one generation channel into an OpenAI blocking response.
@@ -48,7 +59,10 @@ pub async fn blocking_response(
     while let Some(reply) = replies.recv().await {
         match reply {
             GenerationReply::Delta(delta) => text.push_str(&delta),
-            GenerationReply::Done(output) => {
+            GenerationReply::Done {
+                output,
+                cached_prompt_tokens,
+            } => {
                 debug_assert_eq!(text, output.text, "streamed and terminal text diverged");
                 let parsed = crate::parse_assistant_output(&text, split_reasoning, parse_tools);
                 let mut message = json!({
@@ -70,7 +84,7 @@ pub async fn blocking_response(
                 } else {
                     "tool_calls"
                 };
-                let usage = usage(&output);
+                let usage = usage(&output, cached_prompt_tokens);
                 return Json(json!({
                     "id": id,
                     "object": "chat.completion",
@@ -155,7 +169,10 @@ pub fn streaming_response(
                         return;
                     }
                 }
-                GenerationReply::Done(output) => {
+                GenerationReply::Done {
+                    output,
+                    cached_prompt_tokens,
+                } => {
                     terminal = true;
                     let parsed = parser.finish();
                     if let Some(event) =
@@ -199,7 +216,7 @@ pub fn streaming_response(
                             "created": created,
                             "model": model_id,
                             "choices": [],
-                            "usage": usage(&output)
+                            "usage": usage(&output, cached_prompt_tokens)
                         });
                         if events_tx
                             .send(Ok(Event::default().data(event.to_string())))
@@ -266,9 +283,12 @@ pub fn openai_error(status: StatusCode, message: String, error_type: &'static st
         .into_response()
 }
 
-fn usage(output: &GeneratedText) -> Usage {
+fn usage(output: &GeneratedText, cached_prompt_tokens: usize) -> Usage {
     Usage {
         prompt_tokens: output.prompt.token_ids.len(),
+        prompt_tokens_details: PromptTokensDetails {
+            cached_tokens: cached_prompt_tokens,
+        },
         completion_tokens: output.token_ids.len(),
         total_tokens: output.prompt.token_ids.len() + output.token_ids.len(),
     }
@@ -410,10 +430,10 @@ mod tests {
                 .try_send(GenerationReply::Delta("think</think>\n\nanswer".into()))
                 .unwrap();
             sender
-                .try_send(GenerationReply::Done(output(
-                    "think</think>\n\nanswer",
-                    FinishReason::Length,
-                )))
+                .try_send(GenerationReply::Done {
+                    output: output("think</think>\n\nanswer", FinishReason::Length),
+                    cached_prompt_tokens: 2,
+                })
                 .unwrap();
             let response = blocking_response(
                 receiver,
@@ -433,7 +453,12 @@ mod tests {
             assert_eq!(value["model"], TEST_MODEL);
             assert_eq!(
                 value["usage"],
-                json!({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
+                json!({
+                    "prompt_tokens": 3,
+                    "prompt_tokens_details": {"cached_tokens": 2},
+                    "completion_tokens": 2,
+                    "total_tokens": 5
+                })
             );
         });
     }
@@ -449,10 +474,13 @@ mod tests {
                 ))
                 .unwrap();
             sender
-                .try_send(GenerationReply::Done(output(
-                    "inspect</think>\n\n<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>",
-                    FinishReason::Stop,
-                )))
+                .try_send(GenerationReply::Done {
+                    output: output(
+                        "inspect</think>\n\n<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>",
+                        FinishReason::Stop,
+                    ),
+                    cached_prompt_tokens: 2,
+                })
                 .unwrap();
             let response = streaming_response(
                 GenerationReply::Delta("inspect</think>\n\n<tool_".into()),
@@ -496,6 +524,10 @@ mod tests {
             assert_eq!(events[4]["choices"], json!([]));
             assert_eq!(events[4]["usage"]["total_tokens"], 5);
             assert!(events.iter().all(|event| event["model"] == TEST_MODEL));
+            assert_eq!(
+                events[4]["usage"]["prompt_tokens_details"]["cached_tokens"],
+                2
+            );
         });
     }
 

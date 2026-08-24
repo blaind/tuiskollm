@@ -36,6 +36,9 @@ It exposes `GET /health`, `GET /v1/models`, and OpenAI-compatible blocking or SS
 `POST /v1/chat/completions`. The server loads and admits the complete checkpoint before binding the
 listener, owns one bounded resident scheduling queue, and refuses a different model identity or
 request options that the current product cannot honor.
+Blocking usage and the final optional SSE usage chunk report exact retained-prefix reuse as
+`prompt_tokens_details.cached_tokens`; the count comes from the resident prompt owner rather than
+an HTTP timing inference.
 
 Passing the pinned Qwen3.5 snapshot selects its concrete 32-layer resident program and greedy
 checkpoint defaults once at startup. It currently serves one request at a time through its B=1
