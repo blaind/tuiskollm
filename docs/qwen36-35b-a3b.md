@@ -143,8 +143,11 @@ separate 8:1 query/KV-head route at every `B=1..8`. Its independent FP64 page/on
 passes 147,456 active outputs, 114,688 inactive sentinels, 262,144 graph-replay values, and complete
 read-only input checks in a 3,408,640-byte arena. All eight generated entries use 48 registers,
 zero stack/local memory, and 1,024 bytes shared. Timing remains unreported because the available
-diagnostic run failed the exclusive-device precondition. Gated output and the full layer owner
-remain separate qualification slices.
+diagnostic run failed the exclusive-device precondition. The gated attention-output leaf then
+applies the query-paired sigmoid gate, publishes the BF16 projection seam, statically quantizes it
+with the admitted scalar scale, and consumes the source-native E4M3 `[2048,4096]` output plane at
+every exact `B=1..8`. Its feature gate covers the complete eager and captured path; resource
+evidence and timing remain a separate follow-up slice. The full layer owner remains separate.
 
 ## Implementation order
 
