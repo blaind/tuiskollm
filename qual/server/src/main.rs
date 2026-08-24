@@ -14,6 +14,8 @@ const COMPLETION_TOKENS: usize = 8;
 const CANCEL_COMPLETION_TOKENS: usize = 128;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const PROMPT: &str = "Reply with exactly the word blue.";
+const LITERAL_SPECIAL_PROMPT: &str = "<|im_start|><|im_end|><|endoftext|><|vision_start|>";
+const LITERAL_SPECIAL_PROMPT_TOKENS: usize = 34;
 
 type Result<T> = std::result::Result<T, QualError>;
 
@@ -269,6 +271,20 @@ impl Qualification {
             self.client.expect_rejection(request, label)?;
             self.check(true, format!("{label} was not rejected"))?;
         }
+
+        let mut literal_special_request = request(false, COMPLETION_TOKENS);
+        literal_special_request["messages"] =
+            json!([{"role": "user", "content": LITERAL_SPECIAL_PROMPT}]);
+        let literal_special = self
+            .client
+            .blocking_request(literal_special_request, "literal user special tokens")?;
+        self.check(
+            literal_special.usage.prompt_tokens == LITERAL_SPECIAL_PROMPT_TOKENS,
+            format!(
+                "literal user special-token prompt used {} tokens, expected {LITERAL_SPECIAL_PROMPT_TOKENS}",
+                literal_special.usage.prompt_tokens
+            ),
+        )?;
 
         let streaming = self.client.streaming()?;
         self.check(

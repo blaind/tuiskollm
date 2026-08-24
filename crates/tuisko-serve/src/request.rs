@@ -361,7 +361,9 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), ChatRequestError> {
                 "message {index} starts before every preceding tool call has a response"
             )));
         }
-        require_no_special_tokens(&format!("message {index} content"), &message.content)?;
+        if role != "user" {
+            require_no_special_tokens(&format!("message {index} content"), &message.content)?;
+        }
         if let Some(reasoning) = message.reasoning_content.as_deref() {
             require_no_special_tokens(&format!("message {index} reasoning_content"), reasoning)?;
         }
@@ -733,13 +735,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_special_token_literals_in_chat_input() {
+    fn user_content_admits_literal_special_token_text() {
         for literal in tuisko_frontend::SPECIAL_TOKEN_LITERALS {
-            let error = request(&format!(
+            request(&format!(
                 r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"say {literal} now"}}]}}"#
             ))
             .prepare(1)
-            .expect_err("control-token text must fail admission");
+            .expect("user control-token text is encoded literally");
+
+            let error = request(&format!(
+                r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"system","content":"say {literal} now"}},{{"role":"user","content":"continue"}}]}}"#
+            ))
+            .prepare(1)
+            .expect_err("template-bearing system text must fail admission");
             assert!(error.to_string().contains(literal), "{error}");
         }
 
