@@ -200,6 +200,19 @@ const QWEN35_GDN_LAYER_RESOURCE_BASELINES: &[&str] = &[
     QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE,
     QWEN35_NVFP4_DOWN_RESOURCE_BASELINE,
 ];
+const QWEN35_RESIDENT_MODEL_RESOURCE_BASELINES: &[&str] = &[
+    QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE,
+    QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE,
+    QWEN35_NVFP4_DOWN_RESOURCE_BASELINE,
+    QWEN35_NVFP4_QKV_RESOURCE_BASELINE,
+    QWEN35_BF16_LM_HEAD_RESOURCE_BASELINE,
+    QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE,
+    QWEN35_GDN_PREPARE_RESOURCE_BASELINE,
+    QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE,
+    QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE,
+    QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+    QWEN35_PAGED_GQA_RESOURCE_BASELINE,
+];
 const TEXT_ENDPOINT_RESOURCE_BASELINES: &[&str] = &[
     RESIDUAL_NORM_RESOURCE_BASELINE,
     FP8_LM_HEAD_RESOURCE_BASELINE,
@@ -791,6 +804,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("bench-qwen35-gdn-layer") => bench_qwen35_gdn_layer(root, &remaining),
         Some("bench-qwen35-text-endpoint") => bench_qwen35_text_endpoint(root, &remaining),
+        Some("bench-qwen35-resident-model") => bench_qwen35_resident_model(root, &remaining),
         Some("bench-resident-model") => bench_resident_model(root, &remaining),
         Some("bench-resident-prefill") => bench_resident_prefill(root, &remaining),
         Some("bench-resident-long-context-model") => {
@@ -3999,6 +4013,39 @@ fn bench_qwen35_text_endpoint(
     run_visible(
         Command::new(executable)
             .arg("qwen35-text-endpoint")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_qwen35_resident_model(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-qwen35-resident-model SNAPSHOT [options]".into(),
+        );
+    };
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = Vec::new();
+    for baseline in QWEN35_RESIDENT_MODEL_RESOURCE_BASELINES {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen35-resident-model")
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),

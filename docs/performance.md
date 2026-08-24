@@ -245,6 +245,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-resident-long-context-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head long graph with one 131,073-token row and compact one-token survivors | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-text-endpoint SNAPSHOT` | Measure every source-backed Qwen3.5 final-norm plus BF16 LM-head graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen35-resident-model SNAPSHOT` | Directly measure every complete 32-layer plus BF16-endpoint graph at a 131-token context | terminal or `--json PATH` |
 | `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
 | `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
 | `cargo run -p xtask -- perf energy` | Full leaf reports plus a sustained power window per route | `target/benchmarks/perf-energy/*.json` |
@@ -353,6 +354,12 @@ leaf-wide `perf` commands until its first reviewed baseline is blessed.
 `bench-qwen35-text-endpoint SNAPSHOT` directly measures the source-backed final RMSNorm plus BF16
 LM-head graph at every exact `B=1..8`. It remains outside leaf-wide `perf` until a locked-clock
 baseline is reviewed.
+
+`bench-qwen35-resident-model SNAPSHOT` directly measures the complete 32-layer plus endpoint graph
+at every exact `B=1..8`; it never infers whole-model latency from leaf medians. It remains outside
+leaf-wide `perf` until a locked-clock baseline is reviewed. A controlled 2,182 MHz SM / 13,801 MHz
+memory diagnostic measured 6.261 ms at `B=1` and 8.485 ms at `B=8`, with about 1.2 us host submit
+time and zero timed device-memory growth.
 
 `bench-dense-fp8-mlp SNAPSHOT` directly measures the complete source-backed layer-60 MLP graph at
 every exact `B=1..8` and `T=32,64,128,1024` with the same options. It does not infer composition
