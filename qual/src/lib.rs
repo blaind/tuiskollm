@@ -191,6 +191,10 @@ mod qwen36_gdn_input;
 #[cfg(feature = "device")]
 mod qwen36_gdn_input_benchmark;
 #[cfg(feature = "device")]
+mod qwen36_gdn_moe_layer;
+#[cfg(feature = "device")]
+mod qwen36_gdn_moe_layer_benchmark;
+#[cfg(feature = "device")]
 mod qwen36_gdn_output;
 #[cfg(feature = "device")]
 mod qwen36_gdn_output_benchmark;
@@ -512,6 +516,13 @@ pub use qwen36_gdn_input::{
 };
 #[cfg(feature = "device")]
 pub use qwen36_gdn_input_benchmark::benchmark_qwen36_gdn_input;
+#[cfg(feature = "device")]
+pub use qwen36_gdn_moe_layer::{
+    Qwen36GdnMoeLayerQualification, Qwen36GdnMoeLayerQualificationError,
+    qualify_qwen36_gdn_moe_layer,
+};
+#[cfg(feature = "device")]
+pub use qwen36_gdn_moe_layer_benchmark::benchmark_qwen36_gdn_moe_layer;
 #[cfg(feature = "device")]
 pub use qwen36_gdn_output::{
     Qwen36GdnOutputQualification, Qwen36GdnOutputQualificationError, qualify_qwen36_gdn_output,

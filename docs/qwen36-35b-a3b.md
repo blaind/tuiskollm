@@ -113,8 +113,14 @@ FP8 scales. Its exact `B=1..8` routes pass 147,456 activation-code, 73,728 FP64-
 221,184 graph-replay, and 344,064 inactive-sentinel comparisons while retaining immutable sources,
 stable addresses, and zero post-warmup growth. All 16 entries have zero stack/local memory. At a
 2,190 MHz median SM clock, the unblessed warm repeated path measures 9.543/22.031 us at B=1/8;
-the complete two-node graph measures 10.852/24.567 us. Composed layers, exact prefill expert
-routes, and model inference remain unimplemented.
+the complete two-node graph measures 10.852/24.567 us. One source-backed layer-0 owner now
+composes both residual boundaries, the complete GDN path, router, eight routed experts, and the
+shared expert into eight immutable exact-B graphs over 47 stable addresses. It owns 489,703,808
+weight bytes and 18,251,056 workspace/state bytes in one 507,955,968-byte arena. Every batch passes
+eager/graph agreement, inactive seam checks, immutable source checks, and zero post-warmup growth;
+B=1 additionally passes the complete represented source formula. At a diagnostic 2,107 MHz median
+SM clock, its direct graph measures 67.869/201.387 us at B=1/8. Full-attention layers, the endpoint,
+exact prefill experts, and model inference remain unimplemented.
 
 ## Implementation order
 

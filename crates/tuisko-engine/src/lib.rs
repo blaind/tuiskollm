@@ -26,6 +26,8 @@ mod qwen35_nvfp4_mlp;
 mod qwen35_resident_model;
 mod qwen35_text_endpoint;
 mod qwen35_text_endpoint_layout;
+mod qwen36_gdn_moe_layer;
+mod qwen36_gdn_moe_layer_layout;
 mod resident_generation;
 mod resident_model_layout;
 mod resident_mtp;
@@ -68,6 +70,8 @@ pub use qwen35_resident_model::{
 };
 pub use qwen35_text_endpoint::Qwen35TextEndpointProgram;
 pub use qwen35_text_endpoint_layout::Qwen35TextEndpointLayout;
+pub use qwen36_gdn_moe_layer::Qwen36GdnMoeLayerProgram;
+pub use qwen36_gdn_moe_layer_layout::Qwen36GdnMoeLayerLayout;
 pub use resident_generation::{
     Qwen35ResidentGenerationSession, Qwen35ResidentTextGenerator, ResidentBatchAdmission,
     ResidentBatchEvent, ResidentBatchEvents, ResidentBatchGenerator, ResidentCancellation,
@@ -123,6 +127,8 @@ pub use qwen35_gdn_layer::{Qwen35GdnLayerImmutable, Qwen35GdnLayerObservables};
 pub use qwen35_resident_model::Qwen35ResidentModelObservables;
 #[cfg(feature = "qualification")]
 pub use qwen35_text_endpoint::Qwen35EndpointObservables;
+#[cfg(feature = "qualification")]
+pub use qwen36_gdn_moe_layer::{Qwen36GdnMoeLayerImmutable, Qwen36GdnMoeLayerObservables};
 #[cfg(feature = "qualification")]
 pub use resident_model_layout::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
