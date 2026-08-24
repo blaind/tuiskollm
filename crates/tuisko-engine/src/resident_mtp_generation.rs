@@ -1,8 +1,9 @@
-//! Single-slot greedy generation over the resident target-plus-MTP owner.
+//! Single-slot greedy and unbiased sampled generation over the resident target-plus-MTP owner.
 
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
     GenerationSession, GenerationStep, ResidentMtpProgram, ResidentMtpVerifyRoute,
+    SamplingDistribution, speculative_decision,
 };
 use std::sync::Arc;
 use tuisko_frontend::TextFrontend;
@@ -17,9 +18,9 @@ const VERIFY_ROWS: usize = DRAFT_WINDOW + 1;
 const MAX_NATIVE_PREFILL_TOKENS: usize = 1_024;
 const LOGIT_ROWS: usize = VERIFY_ROWS + 1;
 
-/// Exact greedy speculative activity observed by one generation session.
+/// Exact speculative activity observed by one generation session.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ResidentMtpGreedyStats {
+pub struct ResidentMtpGenerationStats {
     /// Target verification routes selected for K=1,2,3,4.
     pub verification_routes: [usize; VERIFY_ROWS],
     /// Draft tokens proposed before target verification.
@@ -30,7 +31,30 @@ pub struct ResidentMtpGreedyStats {
     pub verified_outputs: usize,
 }
 
-/// Concrete single-slot owner for exact greedy draft-three generation.
+/// Backward-compatible name for the greedy slice's generation counters.
+pub type ResidentMtpGreedyStats = ResidentMtpGenerationStats;
+
+/// Host decision for one exact draft-three sampled MTP transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentMtpSampledRound {
+    tokens: [u32; VERIFY_ROWS],
+    committed: usize,
+    accepted: usize,
+}
+
+impl ResidentMtpSampledRound {
+    /// Target-licensed output prefix, including one correction or bonus when applicable.
+    pub fn token_ids(&self) -> &[u32] {
+        &self.tokens[..self.committed]
+    }
+
+    /// Draft proposals accepted before correction, stop, or full acceptance.
+    pub const fn accepted_drafts(&self) -> usize {
+        self.accepted
+    }
+}
+
+/// Concrete single-slot owner for exact draft-three generation.
 pub struct ResidentMtpTextGenerator {
     frontend: TextFrontend,
     program: ResidentMtpProgram,
@@ -54,7 +78,8 @@ pub struct ResidentMtpGenerationSession<'a> {
     queue_len: usize,
     visible_generated: usize,
     native_prefill_tokens: usize,
-    stats: ResidentMtpGreedyStats,
+    greedy: bool,
+    stats: ResidentMtpGenerationStats,
 }
 
 impl ResidentMtpTextGenerator {
@@ -80,16 +105,12 @@ impl ResidentMtpTextGenerator {
         })
     }
 
-    /// Renders one exact greedy request and primes both target and MTP prompt state.
+    /// Renders one admitted request and primes both target and MTP prompt state.
     pub fn start<'a>(
         &'a mut self,
         request: &ChatGenerationRequest,
     ) -> EngineResult<ResidentMtpGenerationSession<'a>> {
-        if !request.sampling.is_greedy() {
-            return Err(EngineError::generation(
-                "resident MTP greedy generation requires temperature=0 or top_k=1",
-            ));
-        }
+        let greedy = request.sampling.is_greedy();
         let stop_ids =
             self.frontend.stop_ids().try_into().map_err(|_| {
                 EngineError::generation("frontend returned the wrong stop-ID count")
@@ -135,7 +156,8 @@ impl ResidentMtpTextGenerator {
             queue_len: 0,
             visible_generated: 0,
             native_prefill_tokens,
-            stats: ResidentMtpGreedyStats::default(),
+            greedy,
+            stats: ResidentMtpGenerationStats::default(),
         })
     }
 
@@ -209,7 +231,7 @@ impl ResidentMtpGenerationSession<'_> {
     }
 
     /// Exact route and acceptance counters for this request.
-    pub const fn stats(&self) -> ResidentMtpGreedyStats {
+    pub const fn stats(&self) -> ResidentMtpGenerationStats {
         self.stats
     }
 
@@ -329,17 +351,29 @@ impl ResidentMtpGenerationSession<'_> {
         }
         let extent = DRAFT_WINDOW.min(remaining - 1);
         let mut drafts = [0u32; DRAFT_WINDOW];
-        for (draft, draft_token) in drafts.iter_mut().take(extent).enumerate() {
-            let decision = crate::Sampler::new(crate::SamplingOptions::greedy(), self.stop_ids)?
-                .sample(draft_logits(self.logits))?;
-            *draft_token = decision.token_id;
+        let mut draft_laws: [Option<SamplingDistribution>; DRAFT_WINDOW] =
+            std::array::from_fn(|_| None);
+        for draft in 0..extent {
+            let draft_token = if self.greedy {
+                self.control
+                    .propose_logits(draft_logits(self.logits), &drafts[..draft])?
+                    .token_id
+            } else {
+                let law = self
+                    .control
+                    .sampling_distribution(draft_logits(self.logits), &drafts[..draft])?;
+                let token = self.control.draw_distribution(&law)?;
+                draft_laws[draft] = Some(law);
+                token
+            };
+            drafts[draft] = draft_token;
             self.stats.draft_proposals += 1;
             if draft + 1 < extent {
                 let position = self
                     .next_position
                     .checked_add(draft)
                     .ok_or_else(|| EngineError::generation("resident MTP position overflows"))?;
-                self.continue_proposal(decision.token_id, position)?;
+                self.continue_proposal(draft_token, position)?;
             }
         }
 
@@ -353,34 +387,11 @@ impl ResidentMtpGenerationSession<'_> {
         inputs[1..extent + 1].copy_from_slice(&drafts[..extent]);
         let route = self.verify_target(&inputs[..extent + 1])?;
 
-        let mut committed = 0;
-        let mut accepted = 0;
-        for (draft, &draft_token) in drafts.iter().take(extent).enumerate() {
-            let step = self
-                .control
-                .accept_logits(target_logits(self.logits, draft))?;
-            let matches = step.token_id == draft_token;
-            self.queued[committed] = Some(step);
-            committed += 1;
-            if matches {
-                accepted += 1;
-            }
-            let terminal = self.queued[committed - 1]
-                .as_ref()
-                .expect("committed MTP step exists")
-                .finish_reason
-                .is_some();
-            if terminal || !matches {
-                break;
-            }
-        }
-        if accepted == extent && self.control.finish_reason().is_none() {
-            self.queued[committed] = Some(
-                self.control
-                    .accept_logits(target_logits(self.logits, extent))?,
-            );
-            committed += 1;
-        }
+        let (committed, accepted) = if self.greedy {
+            self.decide_greedy_round(&drafts[..extent])?
+        } else {
+            self.decide_sampled_round(&drafts[..extent], &draft_laws[..extent])?
+        };
         if committed == 0 {
             return Err(EngineError::generation(
                 "resident MTP verification committed no output",
@@ -411,6 +422,100 @@ impl ResidentMtpGenerationSession<'_> {
         self.stats.verified_outputs += committed;
         self.proposal_ready = !terminal;
         Ok(())
+    }
+
+    fn decide_greedy_round(&mut self, drafts: &[u32]) -> EngineResult<(usize, usize)> {
+        let mut committed = 0;
+        let mut accepted = 0;
+        for (draft, &draft_token) in drafts.iter().enumerate() {
+            let step = self
+                .control
+                .accept_logits(target_logits(self.logits, draft))?;
+            let matches = step.token_id == draft_token;
+            self.queued[committed] = Some(step);
+            committed += 1;
+            if matches {
+                accepted += 1;
+            }
+            let terminal = self.queued[committed - 1]
+                .as_ref()
+                .expect("committed MTP step exists")
+                .finish_reason
+                .is_some();
+            if terminal || !matches {
+                break;
+            }
+        }
+        if accepted == drafts.len() && self.control.finish_reason().is_none() {
+            self.queued[committed] = Some(
+                self.control
+                    .accept_logits(target_logits(self.logits, drafts.len()))?,
+            );
+            committed += 1;
+        }
+        Ok((committed, accepted))
+    }
+
+    fn decide_sampled_round(
+        &mut self,
+        drafts: &[u32],
+        draft_laws: &[Option<SamplingDistribution>],
+    ) -> EngineResult<(usize, usize)> {
+        if draft_laws.len() != drafts.len() {
+            return Err(EngineError::generation(
+                "every sampled MTP proposal requires its draft distribution",
+            ));
+        }
+        let mut target_laws: [Option<SamplingDistribution>; VERIFY_ROWS] =
+            std::array::from_fn(|_| None);
+        for row in 0..=drafts.len() {
+            target_laws[row] = Some(self.control.sampling_distribution(
+                target_logits(self.logits, row),
+                &drafts[..row.min(drafts.len())],
+            )?);
+        }
+        let mut acceptance_units = [0.0f64; DRAFT_WINDOW];
+        let mut residual_units = [0.0f64; DRAFT_WINDOW];
+        for row in 0..drafts.len() {
+            acceptance_units[row] = self.control.random_unit();
+            residual_units[row] = self.control.random_unit();
+        }
+        let bonus_unit = self.control.random_unit();
+        let target_laws = target_laws[..drafts.len() + 1]
+            .iter()
+            .enumerate()
+            .map(|(row, law)| {
+                law.as_ref().ok_or_else(|| {
+                    EngineError::generation(format!(
+                        "sampled MTP target row {row} has no distribution"
+                    ))
+                })
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        let draft_laws = draft_laws
+            .iter()
+            .enumerate()
+            .map(|(row, law)| {
+                law.as_ref().ok_or_else(|| {
+                    EngineError::generation(format!(
+                        "sampled MTP proposal {row} has no draft distribution"
+                    ))
+                })
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        let round = decide_sampled_tokens(
+            drafts,
+            &target_laws,
+            &draft_laws,
+            self.stop_ids,
+            &acceptance_units[..drafts.len()],
+            &residual_units[..drafts.len()],
+            bonus_unit,
+        )?;
+        for (index, &token) in round.token_ids().iter().enumerate() {
+            self.queued[index] = Some(self.control.accept_token(token)?);
+        }
+        Ok((round.token_ids().len(), round.accepted_drafts()))
     }
 
     fn verify_target(&mut self, inputs: &[u32]) -> EngineResult<ResidentMtpVerifyRoute> {
@@ -476,6 +581,80 @@ impl ResidentMtpGenerationSession<'_> {
         }
         Ok(step)
     }
+}
+
+fn decide_sampled_tokens(
+    drafts: &[u32],
+    target_laws: &[&SamplingDistribution],
+    draft_laws: &[&SamplingDistribution],
+    stop_ids: [u32; 2],
+    acceptance_units: &[f64],
+    residual_units: &[f64],
+    bonus_unit: f64,
+) -> EngineResult<ResidentMtpSampledRound> {
+    let extent = drafts.len();
+    if !(1..=DRAFT_WINDOW).contains(&extent)
+        || target_laws.len() != extent + 1
+        || draft_laws.len() != extent
+        || acceptance_units.len() != extent
+        || residual_units.len() != extent
+    {
+        return Err(EngineError::generation(format!(
+            "sampled MTP round inventory differs: drafts={extent}, target={}, draft={}, acceptance={}, residual={}",
+            target_laws.len(),
+            draft_laws.len(),
+            acceptance_units.len(),
+            residual_units.len()
+        )));
+    }
+    let mut round = ResidentMtpSampledRound {
+        tokens: [0; VERIFY_ROWS],
+        committed: 0,
+        accepted: 0,
+    };
+    for row in 0..extent {
+        let decision = speculative_decision(
+            drafts[row],
+            target_laws[row],
+            draft_laws[row],
+            acceptance_units[row],
+            residual_units[row],
+        )?;
+        round.tokens[round.committed] = decision.token_id;
+        round.committed += 1;
+        if !decision.accepted {
+            return Ok(round);
+        }
+        round.accepted += 1;
+        if stop_ids.contains(&decision.token_id) {
+            return Ok(round);
+        }
+    }
+    round.tokens[round.committed] = target_laws[extent].draw_at(bonus_unit)?;
+    round.committed += 1;
+    Ok(round)
+}
+
+#[cfg(feature = "qualification")]
+/// Runs the exact host commit rule for the independent speculative-sampling oracle.
+pub fn qualification_decide_sampled_tokens(
+    drafts: &[u32],
+    target_laws: &[&SamplingDistribution],
+    draft_laws: &[&SamplingDistribution],
+    stop_ids: [u32; 2],
+    acceptance_units: &[f64],
+    residual_units: &[f64],
+    bonus_unit: f64,
+) -> EngineResult<ResidentMtpSampledRound> {
+    decide_sampled_tokens(
+        drafts,
+        target_laws,
+        draft_laws,
+        stop_ids,
+        acceptance_units,
+        residual_units,
+        bonus_unit,
+    )
 }
 
 fn prime_prompt(

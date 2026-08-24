@@ -170,10 +170,16 @@ mod resident_mtp_benchmark;
 mod resident_mtp_generation;
 #[cfg(feature = "device")]
 mod resident_mtp_generation_benchmark;
+#[cfg(feature = "device")]
+mod resident_mtp_sampling;
+#[cfg(feature = "device")]
+mod resident_mtp_sampling_benchmark;
 mod residual_norm;
 mod residual_norm_benchmark;
 #[cfg(feature = "device")]
 mod residual_norm_prefill;
+#[cfg(feature = "engine")]
+mod speculative_sampling;
 #[cfg(feature = "device")]
 mod startup_benchmark;
 #[cfg(feature = "device")]
@@ -419,6 +425,13 @@ pub use resident_mtp_generation::{
 #[cfg(feature = "device")]
 pub use resident_mtp_generation_benchmark::benchmark_resident_mtp_generation;
 #[cfg(feature = "device")]
+pub use resident_mtp_sampling::{
+    ResidentMtpSamplingQualification, ResidentMtpSamplingQualificationError,
+    qualify_resident_mtp_sampling,
+};
+#[cfg(feature = "device")]
+pub use resident_mtp_sampling_benchmark::benchmark_resident_mtp_sampling;
+#[cfg(feature = "device")]
 pub use residual_norm::qualify_qwen35_residual_norm;
 pub use residual_norm::{
     ResidualNormQualification, ResidualNormQualificationError, qualify_residual_norm,
@@ -431,6 +444,8 @@ pub use residual_norm_prefill::{
     ResidualNormPrefillQualification, ResidualNormPrefillQualificationError,
     qualify_residual_norm_prefill,
 };
+#[cfg(feature = "engine")]
+pub use speculative_sampling::{SpeculativeSamplingQualification, qualify_speculative_sampling};
 #[cfg(feature = "device")]
 pub use startup_benchmark::run_startup_benchmark_cli;
 #[cfg(feature = "device")]

@@ -1,9 +1,13 @@
 //! Host generation state over production logit rows.
 
-use crate::{EngineError, EngineResult, Sampler, SamplingOptions};
+use crate::{
+    EngineError, EngineResult, SampleDecision, Sampler, SamplingDistribution, SamplingOptions,
+};
+use std::collections::HashMap;
 use tuisko_frontend::{
     ChatMessage, ChatTemplateOptions, PromptEncoding, StreamingDecoder, TextFrontend,
 };
+use tuisko_model::{Arch, Qwen38_27B};
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 128;
 
@@ -92,6 +96,7 @@ pub struct GenerationSession {
     sampler: Sampler,
     decoder: StreamingDecoder,
     generated: Vec<u32>,
+    occurrences: HashMap<u32, u32>,
     max_new_tokens: usize,
     finish_reason: Option<FinishReason>,
 }
@@ -111,6 +116,11 @@ impl GenerationSession {
             sampler,
             decoder: frontend.streaming_decoder(),
             generated: Vec::with_capacity(request.max_new_tokens.min(4_096)),
+            occurrences: HashMap::with_capacity(if request.sampling.penalties.is_identity() {
+                0
+            } else {
+                request.max_new_tokens.min(Qwen38_27B::VOCAB)
+            }),
             max_new_tokens: request.max_new_tokens,
             finish_reason: (request.max_new_tokens == 0).then_some(FinishReason::Length),
         })
@@ -144,13 +154,61 @@ impl GenerationSession {
             ));
         }
 
-        let decision = self.sampler.sample(logits)?;
+        let decision = self
+            .sampler
+            .sample_with_counts(logits, &self.occurrences, &[])?;
+        self.accept_decision(decision)
+    }
+
+    pub(crate) fn propose_logits(
+        &mut self,
+        logits: &[u16],
+        provisional: &[u32],
+    ) -> EngineResult<SampleDecision> {
+        self.sampler
+            .sample_with_counts(logits, &self.occurrences, provisional)
+    }
+
+    pub(crate) fn sampling_distribution(
+        &self,
+        logits: &[u16],
+        provisional: &[u32],
+    ) -> EngineResult<SamplingDistribution> {
+        self.sampler
+            .distribution(logits, &self.occurrences, provisional)
+    }
+
+    pub(crate) fn draw_distribution(
+        &mut self,
+        distribution: &SamplingDistribution,
+    ) -> EngineResult<u32> {
+        self.sampler.draw(distribution)
+    }
+
+    pub(crate) fn random_unit(&mut self) -> f64 {
+        self.sampler.unit_f64()
+    }
+
+    pub(crate) fn accept_token(&mut self, token_id: u32) -> EngineResult<GenerationStep> {
+        if self.finish_reason.is_some() {
+            return Err(EngineError::generation(
+                "cannot consume a token after generation finished",
+            ));
+        }
+        let decision = self.sampler.decision_for_token(token_id)?;
+        self.accept_decision(decision)
+    }
+
+    fn accept_decision(&mut self, decision: SampleDecision) -> EngineResult<GenerationStep> {
         let mut delta = if decision.stopped {
             None
         } else {
             self.decoder.push(decision.token_id)?
         };
         self.generated.push(decision.token_id);
+        if !self.sampler.options().penalties.is_identity() {
+            *self.occurrences.entry(decision.token_id).or_insert(0) += 1;
+        }
 
         let finish_reason =
             completion_reason(decision.stopped, self.generated.len(), self.max_new_tokens);

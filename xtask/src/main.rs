@@ -685,6 +685,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-mtp-prompt-prime") => qualify_mtp_prompt_prime(root, &remaining),
         Some("qualify-resident-mtp") => qualify_resident_mtp(root, &remaining),
         Some("qualify-generation-mtp-greedy") => qualify_generation_mtp_greedy(root, &remaining),
+        Some("qualify-generation-mtp-sampling") => {
+            qualify_generation_mtp_sampling(root, &remaining)
+        }
         Some("qualify-qwen35-full-attention-layer") => {
             qualify_qwen35_full_attention_layer(root, &remaining)
         }
@@ -739,6 +742,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-mtp-prompt-prime") => bench_mtp_prompt_prime(root, &remaining),
         Some("bench-resident-mtp") => bench_resident_mtp(root, &remaining),
         Some("bench-generation-mtp-greedy") => bench_generation_mtp_greedy(root, &remaining),
+        Some("bench-generation-mtp-sampling") => bench_generation_mtp_sampling(root, &remaining),
         Some("bench-qwen35-full-attention-layer") => {
             bench_qwen35_full_attention_layer(root, &remaining)
         }
@@ -2292,6 +2296,39 @@ fn qualify_generation_mtp_greedy(
     gate_resident_mtp(root)
 }
 
+fn qualify_generation_mtp_sampling(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-generation-mtp-sampling SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "resident_mtp_sampling_suite_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_resident_mtp(root)
+}
+
 pub(crate) fn gate_mtp_prompt_prime(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_residual_norm(root)?;
     gate_mtp_bf16_fusion(root)?;
@@ -3184,6 +3221,39 @@ fn bench_generation_mtp_greedy(
     run_visible(
         Command::new(executable)
             .arg("generation-mtp-greedy")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_generation_mtp_sampling(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-generation-mtp-sampling SNAPSHOT [options]".into(),
+        );
+    };
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = Vec::new();
+    for baseline in RESIDENT_MTP_RESOURCE_BASELINES {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("generation-mtp-sampling")
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),

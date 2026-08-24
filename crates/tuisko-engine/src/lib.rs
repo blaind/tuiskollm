@@ -68,11 +68,18 @@ pub use resident_model_layout::{
 pub use resident_mtp::{
     ResidentMtpDraftRoute, ResidentMtpProgram, ResidentMtpPromptRoute, ResidentMtpRealignRoute,
 };
+#[cfg(feature = "qualification")]
+pub use resident_mtp_generation::qualification_decide_sampled_tokens;
 pub use resident_mtp_generation::{
-    ResidentMtpGenerationSession, ResidentMtpGreedyStats, ResidentMtpTextGenerator,
+    ResidentMtpGenerationSession, ResidentMtpGenerationStats, ResidentMtpGreedyStats,
+    ResidentMtpSampledRound, ResidentMtpTextGenerator,
 };
 pub use resident_mtp_layout::ResidentMtpLayout;
-pub use sampling::{SampleDecision, Sampler, SamplingOptions};
+pub use sampling::{
+    SampleDecision, Sampler, SamplingDistribution, SamplingOptions, SamplingPenalties,
+    SpeculativeDecision, speculative_accept_probability, speculative_decision,
+    speculative_residual,
+};
 
 #[cfg(feature = "qualification")]
 pub use dense_fp8_gdn_layer::DenseFp8GdnLayerObservables;

@@ -98,14 +98,6 @@ pub fn qualify_resident_mtp_generation(
         ));
     }
 
-    let mut sampled = greedy_request(2);
-    sampled.sampling = SamplingOptions::default();
-    if generator.start(&sampled).is_ok() {
-        return Err(ResidentMtpGenerationQualificationError::Mismatch(
-            "greedy MTP owner admitted checkpoint-default sampling".to_string(),
-        ));
-    }
-
     // Warm the complete K=4 transaction and all owned transfers before the memory observation.
     let _ = run_mtp(&mut generator, &requests[3])?;
     let before = device_memory_info(generator.context())?;
