@@ -6,6 +6,7 @@ use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, P
 use tuisko_model::{Arch, Qwen36Moe35B};
 
 const MAX_BATCH: usize = 8;
+const PREFILL_ROWS: [usize; 3] = [32, 64, 128];
 const HIDDEN: usize = Qwen36Moe35B::HIDDEN;
 const EXPERTS: usize = Qwen36Moe35B::NUM_EXPERTS;
 const TOP_K: usize = Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN;
@@ -29,6 +30,10 @@ const _: () = assert!(TOP_K == 8);
 const _: () = assert!(HIDDEN.is_multiple_of(64));
 const _: () = assert!(EXPERTS.is_multiple_of(PROJECTION_WARPS));
 
+fn admitted_rows(rows: usize) -> bool {
+    (1..=MAX_BATCH).contains(&rows) || PREFILL_ROWS.contains(&rows)
+}
+
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -45,17 +50,8 @@ mod kernels {
         value
     }
 
-    /// Projects represented BF16 rows through the exact 256-row router.
-    #[kernel]
-    #[launch_bounds(256, 2)]
-    #[launch_contract(
-        domain = 1,
-        coordinates = u32,
-        block = (256, 1, 1),
-        dynamic_shared = 0,
-        min_compute_capability = (12, 0),
-    )]
-    pub fn qwen36_moe_router_logits<const TOKENS: usize>(
+    #[inline(always)]
+    unsafe fn router_logits<const TOKENS: usize>(
         input: *const u32,
         weights: *const u32,
         logits: *mut u16,
@@ -89,17 +85,44 @@ mod kernels {
         }
     }
 
-    /// Selects and normalizes the exact top-eight router experts.
+    /// Projects represented BF16 decode rows through the exact 256-row router.
     #[kernel]
-    #[launch_bounds(32, 1)]
+    #[launch_bounds(256, 2)]
     #[launch_contract(
         domain = 1,
         coordinates = u32,
-        block = (32, 1, 1),
+        block = (256, 1, 1),
         dynamic_shared = 0,
         min_compute_capability = (12, 0),
     )]
-    pub fn qwen36_moe_router_select<const TOKENS: usize>(
+    pub fn qwen36_moe_router_logits<const TOKENS: usize>(
+        input: *const u32,
+        weights: *const u32,
+        logits: *mut u16,
+    ) {
+        unsafe { router_logits::<TOKENS>(input, weights, logits) }
+    }
+
+    /// Projects represented BF16 prompt rows through the exact 256-row router.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_moe_router_logits_prefill<const TOKENS: usize>(
+        input: *const u32,
+        weights: *const u32,
+        logits: *mut u16,
+    ) {
+        unsafe { router_logits::<TOKENS>(input, weights, logits) }
+    }
+
+    #[inline(always)]
+    unsafe fn router_select<const TOKENS: usize>(
         logits: *const u16,
         expert_indices: *mut u16,
         expert_weights: *mut u16,
@@ -186,6 +209,42 @@ mod kernels {
             position += 1;
         }
     }
+
+    /// Selects and normalizes the exact top-eight decode experts.
+    #[kernel]
+    #[launch_bounds(32, 1)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (32, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_moe_router_select<const TOKENS: usize>(
+        logits: *const u16,
+        expert_indices: *mut u16,
+        expert_weights: *mut u16,
+    ) {
+        unsafe { router_select::<TOKENS>(logits, expert_indices, expert_weights) }
+    }
+
+    /// Selects and normalizes the exact top-eight prompt experts.
+    #[kernel]
+    #[launch_bounds(32, 1)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (32, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_moe_router_select_prefill<const TOKENS: usize>(
+        logits: *const u16,
+        expert_indices: *mut u16,
+        expert_weights: *mut u16,
+    ) {
+        unsafe { router_select::<TOKENS>(logits, expert_indices, expert_weights) }
+    }
 }
 
 fn projection_config<const TOKENS: usize>() -> LaunchConfig1D {
@@ -203,6 +262,11 @@ struct PreparedBatchRoute<const TOKENS: usize> {
 
 impl<const TOKENS: usize> PreparedBatchRoute<TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !(1..=MAX_BATCH).contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 MoE router decode row count {TOKENS} is not admitted"
+            )));
+        }
         Ok(Self {
             projection: module
                 .prepare_qwen36_moe_router_logits::<TOKENS>(projection_config::<TOKENS>())
@@ -249,25 +313,101 @@ impl<const TOKENS: usize> PreparedBatchRoute<TOKENS> {
     }
 }
 
+struct PreparedPrefillRoute<const TOKENS: usize> {
+    projection: PreparedLaunch<kernels::__qwen36_moe_router_logits_prefill_CudaKernel<TOKENS>>,
+    select: PreparedLaunch<kernels::__qwen36_moe_router_select_prefill_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !PREFILL_ROWS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 MoE router prefill row count {TOKENS} is not admitted"
+            )));
+        }
+        // T=128 exposes 4,096 projection CTAs and 128 selector CTAs. The
+        // existing eight-warps-per-eight-experts topology already fills the
+        // device; prompt specialization changes only the independent token
+        // count, while every expert dot and top-eight comparison keeps its
+        // exact decode order.
+        Ok(Self {
+            projection: module
+                .prepare_qwen36_moe_router_logits_prefill::<TOKENS>(projection_config::<TOKENS>())
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.6 MoE prompt router logits", source)
+                })?,
+            select: module
+                .prepare_qwen36_moe_router_select_prefill::<TOKENS>(select_config::<TOKENS>())
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.6 MoE prompt top-8 selection", source)
+                })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        weights: *const u16,
+        logits: *mut u16,
+        expert_indices: *mut u16,
+        expert_weights: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen36_moe_router_logits_prefill::<TOKENS>(
+                stream,
+                &self.projection,
+                input.cast::<u32>(),
+                weights.cast::<u32>(),
+                logits,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching Qwen3.6 MoE prompt router logits", source)
+            })?;
+        module
+            .qwen36_moe_router_select_prefill::<TOKENS>(
+                stream,
+                &self.select,
+                logits,
+                expert_indices,
+                expert_weights,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching Qwen3.6 MoE prompt top-8 selection", source)
+            })
+    }
+}
+
 /// PTX symbols retained for every exact Qwen3.6 router batch.
 pub(crate) fn qwen36_moe_router_ptx_names() -> Vec<&'static str> {
-    let mut names = Vec::with_capacity(2 * MAX_BATCH);
+    let mut names = Vec::with_capacity(2 * (MAX_BATCH + PREFILL_ROWS.len()));
 
-    macro_rules! push_route {
+    macro_rules! push_decode {
         ($tokens:literal) => {
             names.push(kernels::qwen36_moe_router_logits_ptx_name::<$tokens>());
             names.push(kernels::qwen36_moe_router_select_ptx_name::<$tokens>());
         };
     }
+    macro_rules! push_prefill {
+        ($tokens:literal) => {
+            names.push(kernels::qwen36_moe_router_logits_prefill_ptx_name::<$tokens>());
+            names.push(kernels::qwen36_moe_router_select_prefill_ptx_name::<$tokens>());
+        };
+    }
 
-    push_route!(1);
-    push_route!(2);
-    push_route!(3);
-    push_route!(4);
-    push_route!(5);
-    push_route!(6);
-    push_route!(7);
-    push_route!(8);
+    push_decode!(1);
+    push_decode!(2);
+    push_decode!(3);
+    push_decode!(4);
+    push_decode!(5);
+    push_decode!(6);
+    push_decode!(7);
+    push_decode!(8);
+    push_prefill!(32);
+    push_prefill!(64);
+    push_prefill!(128);
     names
 }
 
@@ -282,6 +422,9 @@ pub struct Qwen36MoeRouterOp {
     b6: PreparedBatchRoute<6>,
     b7: PreparedBatchRoute<7>,
     b8: PreparedBatchRoute<8>,
+    t32: PreparedPrefillRoute<32>,
+    t64: PreparedPrefillRoute<64>,
+    t128: PreparedPrefillRoute<128>,
 }
 
 impl Qwen36MoeRouterOp {
@@ -300,6 +443,9 @@ impl Qwen36MoeRouterOp {
             b6: PreparedBatchRoute::prepare(&module)?,
             b7: PreparedBatchRoute::prepare(&module)?,
             b8: PreparedBatchRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
@@ -308,21 +454,26 @@ impl Qwen36MoeRouterOp {
     ///
     /// # Safety
     ///
-    /// `input` covers `batch * 2_048` BF16 values, `weights` covers BF16
-    /// `[256, 2_048]`, `logits` covers `batch * 256` BF16 values, and both
-    /// top-8 outputs cover `batch * 8` values. Four-byte-loaded input and
+    /// `input` covers `rows * 2_048` BF16 values, `weights` covers BF16
+    /// `[256, 2_048]`, `logits` covers `rows * 256` BF16 values, and both
+    /// top-8 outputs cover `rows * 8` values. Four-byte-loaded input and
     /// weight planes are aligned, disjoint, and live through stream completion.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         input: *const u16,
         weights: *const u16,
         logits: *mut u16,
         expert_indices: *mut u16,
         expert_weights: *mut u16,
     ) -> GpuResult<()> {
+        if !admitted_rows(rows) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 MoE router row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128"
+            )));
+        }
         macro_rules! launch {
             ($route:ident) => {
                 unsafe {
@@ -339,7 +490,7 @@ impl Qwen36MoeRouterOp {
             };
         }
 
-        match batch {
+        match rows {
             1 => launch!(b1),
             2 => launch!(b2),
             3 => launch!(b3),
@@ -348,8 +499,11 @@ impl Qwen36MoeRouterOp {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
             _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.6 MoE router batch {batch} is outside the exact range 1..={MAX_BATCH}"
+                "Qwen3.6 MoE router row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128"
             ))),
         }
     }
@@ -357,7 +511,10 @@ impl Qwen36MoeRouterOp {
 
 #[cfg(test)]
 mod tests {
-    use super::{EXPERT_BLOCKS, MAX_BATCH, WORDS_PER_ROW, qwen36_moe_router_ptx_names};
+    use super::{
+        EXPERT_BLOCKS, MAX_BATCH, PREFILL_ROWS, WORDS_PER_ROW, admitted_rows,
+        qwen36_moe_router_ptx_names,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -366,10 +523,29 @@ mod tests {
         assert_eq!(WORDS_PER_ROW, 1_024);
 
         let names = qwen36_moe_router_ptx_names();
-        assert_eq!(names.len(), 2 * MAX_BATCH);
+        assert_eq!(names.len(), 2 * (MAX_BATCH + PREFILL_ROWS.len()));
         assert_eq!(
             names.iter().copied().collect::<BTreeSet<_>>().len(),
             names.len()
         );
+    }
+
+    #[test]
+    fn row_table_covers_only_exact_decode_and_prefill_routes() {
+        for (rows, expected) in [
+            (0, false),
+            (1, true),
+            (8, true),
+            (9, false),
+            (16, false),
+            (32, true),
+            (33, false),
+            (64, true),
+            (65, false),
+            (128, true),
+            (129, false),
+        ] {
+            assert_eq!(admitted_rows(rows), expected, "rows={rows}");
+        }
     }
 }

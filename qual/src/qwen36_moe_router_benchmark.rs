@@ -7,14 +7,14 @@ use crate::device_benchmark::{
     preflight, require_current_process_exclusive, warmup_launches,
 };
 use crate::qwen36_moe_router::{
-    EXPERTS, HIDDEN, MAX_BATCH, Regions, TOP_K, launch, layout, make_fixture,
+    EXACT_ROUTES, EXPERTS, HIDDEN, MAX_BATCH, Regions, TOP_K, launch, layout, make_fixture,
 };
 use crate::target::Qwen36MoeRouterOp;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer};
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
@@ -49,8 +49,9 @@ impl Session {
         stream.synchronize().map_err(GpuError::from)?;
 
         let op = Qwen36MoeRouterOp::new(&context)?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| capture_route(&op, &arena, &stream, regions, batch, repeated_operations))
+        let routes = EXACT_ROUTES
+            .iter()
+            .map(|&rows| capture_route(&op, &arena, &stream, regions, rows, repeated_operations))
             .collect::<GpuResult<Vec<_>>>()?;
 
         Ok(Self {
@@ -78,15 +79,22 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     "qwen36_35b_a3b/moe_router/bf16_top8",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
                     &route.leaf,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 )
@@ -100,29 +108,29 @@ fn capture_route(
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
-    batch: usize,
+    rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, arena, stream, regions, batch)?;
+            launch(op, arena, stream, regions, rows)?;
         }
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
         leaf,
         repeated,
     })
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(rows: usize) -> usize {
     let weights = EXPERTS * HIDDEN * size_of::<u16>();
-    let input = batch * HIDDEN * size_of::<u16>();
-    let logits = batch * EXPERTS * size_of::<u16>();
-    let selected = batch * TOP_K * 2 * size_of::<u16>();
+    let input = rows * HIDDEN * size_of::<u16>();
+    let logits = rows * EXPERTS * size_of::<u16>();
+    let selected = rows * TOP_K * 2 * size_of::<u16>();
 
     weights + input + logits + selected
 }
@@ -148,7 +156,7 @@ pub fn benchmark_qwen36_moe_router(
         "qwen36_35b_a3b/moe_router/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes - padding_bytes,
-        "max_batch=8 logits, top-eight indices, and normalized weights",
+        "max_rows=128 logits, top-eight indices, and normalized weights",
     )?;
     memory.register_owned(
         "qwen36_35b_a3b/moe_router/alignment_padding",
@@ -184,6 +192,7 @@ pub fn benchmark_qwen36_moe_router(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qwen36_moe_router::MAX_ROWS;
 
     #[test]
     fn accounting_covers_router_projection_and_selection() {
@@ -196,8 +205,10 @@ mod tests {
                     + 2 * TOP_K * size_of::<u16>());
 
         assert_eq!(logical_bytes(MAX_BATCH), b8);
-        assert_eq!(layout.byte_len(), 1_085_824);
+        assert_eq!(logical_bytes(MAX_ROWS), 1_642_496);
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
+        assert_eq!(layout.byte_len(), 1_642_496);
         assert_eq!(regions.weight_bytes(), 1_048_576);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 37_120);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 593_920);
     }
 }

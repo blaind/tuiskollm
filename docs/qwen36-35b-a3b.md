@@ -85,12 +85,18 @@ top eight, renormalization over those eight probabilities, routed expert output,
 `sigmoid(shared_expert_gate) * shared_expert_output`. Ties and the eight-expert accumulation order
 must be explicitly pinned rather than inherited from an unstable library primitive.
 
-The current partial slice admits the complete source inventory and lossless expert materialization,
-then qualifies BF16 router logits, normalized top-eight selection, all selected routed experts, the
-always-active shared expert, and their fixed-order combination at every exact `B=1..8`. The expert
-owner retains all 256 numeric-order expert planes in 454,760,448 weight bytes and uses 434,448
-address-stable workspace bytes. Its 24 gate/up, down, and combine entries use zero stack/local
-memory and pass complete eager/oracle plus CUDA Graph agreement.
+The current partial slice admits the complete source inventory and lossless expert materialization.
+The BF16 router now covers every exact `B=1..8` and `T=32/64/128` route. Across those routes it
+checks 66,560 logits, 2,080 selected indices, 2,080 normalized weights, 70,720 graph-replay values,
+624,512 inactive sentinels, and 786,432 immutable input/weight values against the independent
+oracle, with no post-warmup device growth. All 22 projection/selection entries use zero stack/local
+memory. At a 2,182 MHz median SM clock, the unblessed complete prompt graphs measure
+26.612/31.980/43.252 us at T=32/64/128; B=1/8 measure 18.444/20.491 us. The expert path separately
+qualifies all selected routed experts, the always-active shared expert, and their fixed-order
+combination at every exact `B=1..8`. Its owner retains all 256 numeric-order expert planes in
+454,760,448 weight bytes and uses 434,448 address-stable workspace bytes. Its 24 gate/up, down, and
+combine entries use zero stack/local memory and pass complete eager/oracle plus CUDA Graph
+agreement.
 
 At a measured 2,182 MHz median SM clock, the warm expert-only repeated path is 12.726 us at B=1
 and 76.390 us at B=8. The rise after B=6 coincides with the selected expert working set exceeding
