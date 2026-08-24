@@ -125,6 +125,7 @@ fn private_address() -> Result<SocketAddr, Box<dyn Error>> {
 
 pub(super) struct ProductionServer {
     child: Option<Child>,
+    executable: PathBuf,
     address: SocketAddr,
     log_path: PathBuf,
 }
@@ -155,6 +156,7 @@ impl ProductionServer {
             .spawn()?;
         Ok(Self {
             child: Some(child),
+            executable: executable.to_path_buf(),
             address,
             log_path,
         })
@@ -216,6 +218,10 @@ impl ProductionServer {
 
     pub(super) fn log_path(&self) -> &Path {
         &self.log_path
+    }
+
+    pub(super) fn executable(&self) -> &Path {
+        &self.executable
     }
 
     pub(super) fn stop_and_wait(&mut self) -> Result<(), Box<dyn Error>> {
