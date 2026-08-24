@@ -1184,6 +1184,159 @@ fn require_qwen36_moe_layer(layer: usize, layer_count: usize) -> CheckpointResul
     Ok(())
 }
 
+/// Exact scalar-scaled FP8 source plane used by Qwen3.6 projections.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen36Fp8LinearBindings<'a> {
+    /// Source E4M3 weights `[rows, columns]`.
+    pub weight: Fp8E4M3View<'a, 2>,
+    /// Positive source activation scale stored as one rank-zero F32 value.
+    pub input_scale: F32View<'a, 0>,
+    /// Positive source weight scale stored as one rank-zero F32 value.
+    pub weight_scale: F32View<'a, 0>,
+    /// Logical output row count.
+    pub rows: usize,
+    /// Logical input column count.
+    pub columns: usize,
+}
+
+impl<'a> Qwen36Fp8LinearBindings<'a> {
+    fn bind_from(
+        prefix: &str,
+        rows: usize,
+        columns: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        Ok(Self {
+            input_scale: positive_rank_zero_f32(tensor(&format!("{prefix}.input_scale"))?)?,
+            weight: Fp8E4M3View::bind(
+                tensor(&format!("{prefix}.weight"))?,
+                [rows as u64, columns as u64],
+            )?,
+            weight_scale: positive_rank_zero_f32(tensor(&format!("{prefix}.weight_scale"))?)?,
+            rows,
+            columns,
+        })
+    }
+}
+
+/// Complete mixed-FP8/BF16 source family for one Qwen3.6 GDN layer.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen36GdnBindings<'a> {
+    /// Fused query, key, and value FP8 projection.
+    pub qkv: Qwen36Fp8LinearBindings<'a>,
+    /// Z-gate FP8 projection.
+    pub z: Qwen36Fp8LinearBindings<'a>,
+    /// Per-value-head BF16 A-control projection `[control_rows, hidden]`.
+    pub a_control: Bf16View<'a, 2>,
+    /// Per-value-head BF16 B-control projection `[control_rows, hidden]`.
+    pub b_control: Bf16View<'a, 2>,
+    /// Recurrent-state FP8 output projection.
+    pub output: Qwen36Fp8LinearBindings<'a>,
+    /// Width-four causal-convolution weights `[qkv_rows, 1, kernel]`.
+    pub convolution_weight: Bf16View<'a, 3>,
+    /// Log-space recurrence decay parameters `[control_rows]`.
+    pub a_log: Bf16View<'a, 1>,
+    /// Recurrence time-step bias `[control_rows]`.
+    pub dt_bias: Bf16View<'a, 1>,
+    /// Per-head gated RMSNorm weights `[head_dim]`.
+    pub norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the mixer `[hidden]`.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before the MoE boundary `[hidden]`.
+    pub post_attention_norm: Bf16View<'a, 1>,
+    /// Decoder layer owning these sources.
+    pub layer: usize,
+}
+
+impl<'a> Qwen36GdnBindings<'a> {
+    /// Binds one exact Qwen3.6 mixed-FP8/BF16 GDN source family.
+    pub fn bind(
+        snapshot: &'a CheckpointSnapshot<Qwen36Moe35B>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Self::bind_from(
+            layer,
+            Qwen36Moe35B::LAYERS,
+            Qwen36Moe35B::FULL_ATTENTION_INTERVAL,
+            Qwen36Moe35B::HIDDEN,
+            Qwen36Moe35B::GDN_QKV_ROWS,
+            Qwen36Moe35B::GDN_VALUE_ROWS,
+            Qwen36Moe35B::GDN_CONTROL_ROWS,
+            Qwen36Moe35B::LINEAR_CONV_KERNEL_DIM,
+            Qwen36Moe35B::LINEAR_HEAD_DIM,
+            |name| snapshot.tensor(name),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_from(
+        layer: usize,
+        layer_count: usize,
+        full_attention_interval: usize,
+        hidden: usize,
+        qkv_rows: usize,
+        value_rows: usize,
+        control_rows: usize,
+        convolution_width: usize,
+        head_dim: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        require_gdn_layer_route(layer, layer_count, full_attention_interval)?;
+
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let prefix = format!("{layer_prefix}.linear_attn");
+        let qkv = Qwen36Fp8LinearBindings::bind_from(
+            &format!("{prefix}.in_proj_qkv"),
+            qkv_rows,
+            hidden,
+            |name| tensor(name),
+        )?;
+        let z = Qwen36Fp8LinearBindings::bind_from(
+            &format!("{prefix}.in_proj_z"),
+            value_rows,
+            hidden,
+            |name| tensor(name),
+        )?;
+
+        require_same_rank_zero_f32(layer, "QKV/Z input_scale", &qkv.input_scale, &z.input_scale)?;
+
+        Ok(Self {
+            qkv,
+            z,
+            a_control: Bf16View::bind(
+                tensor(&format!("{prefix}.in_proj_a.weight"))?,
+                [control_rows as u64, hidden as u64],
+            )?,
+            b_control: Bf16View::bind(
+                tensor(&format!("{prefix}.in_proj_b.weight"))?,
+                [control_rows as u64, hidden as u64],
+            )?,
+            output: Qwen36Fp8LinearBindings::bind_from(
+                &format!("{prefix}.out_proj"),
+                hidden,
+                value_rows,
+                |name| tensor(name),
+            )?,
+            convolution_weight: Bf16View::bind(
+                tensor(&format!("{prefix}.conv1d.weight"))?,
+                [qkv_rows as u64, 1, convolution_width as u64],
+            )?,
+            a_log: Bf16View::bind(tensor(&format!("{prefix}.A_log"))?, [control_rows as u64])?,
+            dt_bias: Bf16View::bind(tensor(&format!("{prefix}.dt_bias"))?, [control_rows as u64])?,
+            norm: Bf16View::bind(tensor(&format!("{prefix}.norm.weight"))?, [head_dim as u64])?,
+            input_norm: Bf16View::bind(
+                tensor(&format!("{layer_prefix}.input_layernorm.weight"))?,
+                [hidden as u64],
+            )?,
+            post_attention_norm: Bf16View::bind(
+                tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+                [hidden as u64],
+            )?,
+            layer,
+        })
+    }
+}
+
 fn modelopt_nvfp4_next_norm_name<A: Arch>(layer: usize) -> CheckpointResult<String> {
     require_modelopt_nvfp4_mlp_layer::<A>(layer)?;
     let next_layer = layer
@@ -1956,9 +2109,9 @@ mod tests {
         DenseFp8MlpBindings, E2M1_VALUES_PER_BYTE, FullAttentionPostBindings,
         FullAttentionQkvBindings, GdnBindings, ModelOptNvfp4AttentionBindings,
         ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings, MtpBindings, NVFP4_GROUP_SIZE,
-        Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings, Qwen36MoeLayerBindings,
-        TextEndpointBindings, VisionBindings, dense_fp8_next_norm_name, positive_bf16,
-        qwen36_next_norm_name, require_adjacent, require_dense_fp8_mlp_layer,
+        Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings, Qwen36GdnBindings,
+        Qwen36MoeLayerBindings, TextEndpointBindings, VisionBindings, dense_fp8_next_norm_name,
+        positive_bf16, qwen36_next_norm_name, require_adjacent, require_dense_fp8_mlp_layer,
         require_full_attention_layer, require_gdn_layer, require_mtp_contract,
         require_nvfp4_mlp_layer, validate_nvfp4_scales,
     };
@@ -2340,6 +2493,117 @@ mod tests {
         );
 
         (Value::Object(header), payload)
+    }
+
+    fn qwen36_gdn_fixture(layer: usize) -> (Value, Vec<u8>) {
+        const HIDDEN: usize = 32;
+        const QKV_ROWS: usize = 16;
+        const VALUE_ROWS: usize = 8;
+        const CONTROL_ROWS: usize = 4;
+        const HEAD_DIM: usize = 4;
+        const CONVOLUTION_WIDTH: usize = 4;
+
+        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let prefix = format!("{layer_prefix}.linear_attn");
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+
+        append_qwen36_fp8_linear(
+            &mut header,
+            &mut payload,
+            &format!("{prefix}.in_proj_qkv"),
+            QKV_ROWS,
+            HIDDEN,
+            0.25,
+            0.125,
+            0x10,
+        );
+        append_qwen36_fp8_linear(
+            &mut header,
+            &mut payload,
+            &format!("{prefix}.in_proj_z"),
+            VALUE_ROWS,
+            HIDDEN,
+            0.25,
+            0.0625,
+            0x20,
+        );
+        append_bf16_tensor(
+            &mut header,
+            &mut payload,
+            format!("{prefix}.in_proj_a.weight"),
+            vec![CONTROL_ROWS, HIDDEN],
+        );
+        append_bf16_tensor(
+            &mut header,
+            &mut payload,
+            format!("{prefix}.in_proj_b.weight"),
+            vec![CONTROL_ROWS, HIDDEN],
+        );
+        append_qwen36_fp8_linear(
+            &mut header,
+            &mut payload,
+            &format!("{prefix}.out_proj"),
+            HIDDEN,
+            VALUE_ROWS,
+            0.5,
+            0.03125,
+            0x30,
+        );
+        for (name, shape) in [
+            (
+                format!("{prefix}.conv1d.weight"),
+                vec![QKV_ROWS, 1, CONVOLUTION_WIDTH],
+            ),
+            (format!("{prefix}.A_log"), vec![CONTROL_ROWS]),
+            (format!("{prefix}.dt_bias"), vec![CONTROL_ROWS]),
+            (format!("{prefix}.norm.weight"), vec![HEAD_DIM]),
+            (
+                format!("{layer_prefix}.input_layernorm.weight"),
+                vec![HIDDEN],
+            ),
+            (
+                format!("{layer_prefix}.post_attention_layernorm.weight"),
+                vec![HIDDEN],
+            ),
+        ] {
+            append_bf16_tensor(&mut header, &mut payload, name, shape);
+        }
+
+        (Value::Object(header), payload)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_qwen36_fp8_linear(
+        header: &mut serde_json::Map<String, Value>,
+        payload: &mut Vec<u8>,
+        prefix: &str,
+        rows: usize,
+        columns: usize,
+        input_scale: f32,
+        weight_scale: f32,
+        marker: u8,
+    ) {
+        append_rank_zero_f32(
+            header,
+            payload,
+            format!("{prefix}.input_scale"),
+            input_scale,
+        );
+        append_raw_tensor(
+            header,
+            payload,
+            format!("{prefix}.weight"),
+            "F8_E4M3",
+            vec![rows, columns],
+            marker,
+        );
+        append_rank_zero_f32(
+            header,
+            payload,
+            format!("{prefix}.weight_scale"),
+            weight_scale,
+        );
     }
 
     fn append_qwen36_expert(
@@ -3196,6 +3460,111 @@ mod tests {
                 Err(message) => assert!(result.unwrap_err().to_string().contains(message)),
             }
         }
+    }
+
+    #[test]
+    fn binds_exact_qwen36_mixed_gdn_source_family() {
+        let path = fixture_path("qwen36-gdn");
+        let (header, payload) = qwen36_gdn_fixture(0);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let bindings =
+            Qwen36GdnBindings::bind_from(0, 2, 2, 32, 16, 8, 4, 4, 4, |name| file.tensor(name))
+                .unwrap();
+
+        assert_eq!(bindings.qkv.weight.shape(), &[16, 32]);
+        assert_eq!(bindings.qkv.weight.codes()[0], 0x10);
+        assert_eq!(bindings.qkv.input_scale.value(0), Some(0.25));
+        assert_eq!(bindings.qkv.weight_scale.value(0), Some(0.125));
+        assert_eq!(bindings.z.weight.shape(), &[8, 32]);
+        assert_eq!(bindings.z.weight.codes()[0], 0x20);
+        assert_eq!(bindings.a_control.shape(), &[4, 32]);
+        assert_eq!(bindings.b_control.shape(), &[4, 32]);
+        assert_eq!(bindings.output.weight.shape(), &[32, 8]);
+        assert_eq!(bindings.output.weight.codes()[0], 0x30);
+        assert_eq!(bindings.convolution_weight.shape(), &[16, 1, 4]);
+        assert_eq!(bindings.a_log.shape(), &[4]);
+        assert_eq!(bindings.dt_bias.shape(), &[4]);
+        assert_eq!(bindings.norm.shape(), &[4]);
+        assert_eq!(bindings.input_norm.shape(), &[32]);
+        assert_eq!(bindings.post_attention_norm.shape(), &[32]);
+        assert_eq!(bindings.layer, 0);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_qwen36_gdn_route_shape_and_scale_drift() {
+        let error = Qwen36GdnBindings::bind_from(1, 2, 2, 32, 16, 8, 4, 4, 4, |_| {
+            panic!("the route check must reject before tensor lookup")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("GDN source contract"));
+
+        let path = fixture_path("qwen36-gdn-shape");
+        let (mut header, payload) = qwen36_gdn_fixture(0);
+        header["model.language_model.layers.0.linear_attn.in_proj_a.weight"]["shape"] =
+            json!([2, 64]);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let error =
+            Qwen36GdnBindings::bind_from(0, 2, 2, 32, 16, 8, 4, 4, 4, |name| file.tensor(name))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("in_proj_a.weight"));
+        fs::remove_file(path).unwrap();
+
+        let path = fixture_path("qwen36-gdn-scale");
+        let (header, mut payload) = qwen36_gdn_fixture(0);
+        let name = "model.language_model.layers.0.linear_attn.in_proj_z.input_scale";
+        let offset = tensor_offset(&header, name);
+        payload[offset..offset + 4].copy_from_slice(&0.5f32.to_le_bytes());
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let error =
+            Qwen36GdnBindings::bind_from(0, 2, 2, 32, 16, 8, 4, 4, 4, |name| file.tensor(name))
+                .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(
+            error
+                .to_string()
+                .contains("QKV/Z input_scale values differ")
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN36_SNAPSHOT with the exact pinned snapshot"]
+    fn binds_all_real_qwen36_gdn_layers() {
+        let root = std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+            .expect("TUISKO_QWEN36_SNAPSHOT must name the exact pinned snapshot");
+        let snapshot = CheckpointSnapshot::<Qwen36Moe35B>::open(Path::new(&root)).unwrap();
+        let mut bound = 0;
+
+        for layer in 0..Qwen36Moe35B::LAYERS {
+            if (layer + 1).is_multiple_of(Qwen36Moe35B::FULL_ATTENTION_INTERVAL) {
+                continue;
+            }
+
+            let bindings = Qwen36GdnBindings::bind(&snapshot, layer).unwrap();
+
+            assert_eq!(bindings.qkv.weight.shape(), &[8_192, 2_048]);
+            assert_eq!(bindings.z.weight.shape(), &[4_096, 2_048]);
+            assert_eq!(bindings.a_control.shape(), &[32, 2_048]);
+            assert_eq!(bindings.b_control.shape(), &[32, 2_048]);
+            assert_eq!(bindings.output.weight.shape(), &[2_048, 4_096]);
+            assert_eq!(bindings.convolution_weight.shape(), &[8_192, 1, 4]);
+            assert_eq!(bindings.norm.shape(), &[128]);
+            assert_eq!(bindings.input_norm.shape(), &[2_048]);
+            assert_eq!(bindings.post_attention_norm.shape(), &[2_048]);
+            assert_eq!(bindings.layer, layer);
+            bound += 1;
+        }
+
+        assert_eq!(bound, 30);
     }
 
     #[test]
