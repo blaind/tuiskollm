@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
-use tuisko_engine::{ChatGenerationRequest, SamplingOptions};
+use tuisko_engine::{ChatGenerationRequest, SamplingOptions, SamplingPenalties};
 use tuisko_frontend::{ChatMessage, ChatTemplateOptions, SPECIAL_TOKEN_LITERALS};
 use tuisko_model::{Arch, Qwen38_27B};
 
@@ -160,9 +160,6 @@ impl ChatCompletionRequest {
                 "only one completion choice is admitted".into(),
             ));
         }
-        require_default_float("presence_penalty", self.presence_penalty, 0.0)?;
-        require_default_float("frequency_penalty", self.frequency_penalty, 0.0)?;
-        require_default_float("repetition_penalty", self.repetition_penalty, 1.0)?;
         if self.stop.as_ref().is_some_and(|stop| !stop.is_null()) {
             return Err(ChatRequestError::Invalid(
                 "custom stop sequences are not admitted; the checkpoint EOS set is fixed".into(),
@@ -218,7 +215,11 @@ impl ChatCompletionRequest {
             top_p: self.top_p.unwrap_or(0.95),
             top_k: self.top_k.unwrap_or(20),
             seed: self.seed.unwrap_or(default_seed),
-            penalties: Default::default(),
+            penalties: SamplingPenalties {
+                presence: self.presence_penalty.unwrap_or(0.0),
+                frequency: self.frequency_penalty.unwrap_or(0.0),
+                repetition: self.repetition_penalty.unwrap_or(1.0),
+            },
         };
         if sampling.temperature > 2.0 {
             return Err(ChatRequestError::Invalid(
@@ -411,22 +412,9 @@ fn require_no_special_tokens(what: &str, text: &str) -> Result<(), ChatRequestEr
     Ok(())
 }
 
-fn require_default_float(
-    name: &str,
-    value: Option<f32>,
-    default: f32,
-) -> Result<(), ChatRequestError> {
-    if value.is_some_and(|value| value != default) {
-        return Err(ChatRequestError::Invalid(format!(
-            "{name} is not implemented by the current sampler"
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ChatCompletionRequest, ChatRequestError, SERVED_MODEL};
+    use super::{ChatCompletionRequest, ChatRequestError, SERVED_MODEL, SamplingPenalties};
 
     fn request(body: &str) -> ChatCompletionRequest {
         serde_json::from_str(body).unwrap()
@@ -448,6 +436,9 @@ mod tests {
                 "top_p":0.8,
                 "top_k":9,
                 "seed":17,
+                "presence_penalty":0.5,
+                "frequency_penalty":0.25,
+                "repetition_penalty":1.1,
                 "store":false,
                 "stream":true,
                 "stream_options":{{"include_usage":true,"include_obfuscation":false}},
@@ -467,6 +458,14 @@ mod tests {
         assert_eq!(prepared.generation.sampling.top_p, 0.8);
         assert_eq!(prepared.generation.sampling.top_k, 9);
         assert_eq!(prepared.generation.sampling.seed, 17);
+        assert_eq!(
+            prepared.generation.sampling.penalties,
+            SamplingPenalties {
+                presence: 0.5,
+                frequency: 0.25,
+                repetition: 1.1,
+            }
+        );
         assert_eq!(
             prepared.generation.template.reasoning_effort.as_deref(),
             Some("medium")
@@ -510,10 +509,6 @@ mod tests {
             (
                 r#""messages":[{"role":"user","content":"x"}],"store":true"#,
                 "store=true",
-            ),
-            (
-                r#""messages":[{"role":"user","content":"x"}],"presence_penalty":1.5"#,
-                "presence_penalty",
             ),
             (
                 r#""messages":[{"role":"user","content":"x"}],"stop":"done""#,
@@ -722,6 +717,9 @@ mod tests {
             (r#""temperature":2.1"#, "0..=2"),
             (r#""top_p":1.1"#, "top_p"),
             (r#""top_k":0"#, "top_k"),
+            (r#""presence_penalty":2.5"#, "presence_penalty"),
+            (r#""frequency_penalty":-2.5"#, "frequency_penalty"),
+            (r#""repetition_penalty":0.0"#, "repetition_penalty"),
         ];
         for (control, expected) in cases {
             let error = request(&format!(
