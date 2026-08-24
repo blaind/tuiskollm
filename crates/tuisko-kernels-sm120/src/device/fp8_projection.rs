@@ -672,7 +672,7 @@ unsafe fn store_prefill_projection_mma_tile<const TOKENS: usize, const STATIC_SC
 /// Projects one admitted FP8 prefill width with the retained 16x64 tensor-core tile.
 #[inline(always)]
 pub(crate) unsafe fn prefill_projection_mma<
-    A: Arch,
+    const INPUT_COLUMNS: usize,
     const TOKENS: usize,
     const BM: usize,
     const BK_WORDS: usize,
@@ -688,7 +688,7 @@ pub(crate) unsafe fn prefill_projection_mma<
 ) {
     // SAFETY: the public pointer contract supplies dynamic per-row scales.
     unsafe {
-        prefill_projection_mma_impl::<A, TOKENS, BM, BK_WORDS, K_SUBTILES, false>(
+        prefill_projection_mma_impl::<INPUT_COLUMNS, TOKENS, BM, BK_WORDS, K_SUBTILES, false>(
             activation_codes,
             activation_scales,
             weight_codes,
@@ -708,7 +708,7 @@ pub(crate) unsafe fn prefill_projection_mma<
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn prefill_projection_mma_static_scales<
-    A: Arch,
+    const INPUT_COLUMNS: usize,
     const TOKENS: usize,
     const BM: usize,
     const BK_WORDS: usize,
@@ -726,7 +726,7 @@ pub(crate) unsafe fn prefill_projection_mma_static_scales<
 ) {
     // SAFETY: the static route has no scale planes; the const specialization removes those loads.
     unsafe {
-        prefill_projection_mma_impl::<A, TOKENS, BM, BK_WORDS, K_SUBTILES, true>(
+        prefill_projection_mma_impl::<INPUT_COLUMNS, TOKENS, BM, BK_WORDS, K_SUBTILES, true>(
             activation_codes,
             core::ptr::null(),
             weight_codes,
@@ -745,7 +745,7 @@ pub(crate) unsafe fn prefill_projection_mma_static_scales<
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn prefill_projection_mma_impl<
-    A: Arch,
+    const INPUT_COLUMNS: usize,
     const TOKENS: usize,
     const BM: usize,
     const BK_WORDS: usize,
@@ -773,7 +773,7 @@ unsafe fn prefill_projection_mma_impl<
     let warp_index = tid >> 5;
     let lane_group = lane >> 2;
     let thread_in_group = lane & 3;
-    let words_per_row = A::HIDDEN / 4;
+    let words_per_row = INPUT_COLUMNS / 4;
     let output_tiles = output_rows / OUTPUT_ROWS_PER_BLOCK;
     let token_tile = block / output_tiles;
     let output_tile = block - token_tile * output_tiles;

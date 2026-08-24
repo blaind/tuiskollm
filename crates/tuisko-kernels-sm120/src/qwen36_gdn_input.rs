@@ -316,7 +316,7 @@ mod kernels {
         // SAFETY: the exact 64x64 CTA inventory covers all active prompt/output tiles.
         unsafe {
             prefill_projection_mma_static_scales::<
-                Qwen36Moe35B,
+                INPUT_COLUMNS,
                 TOKENS,
                 PREFILL_BLOCK_ROWS,
                 PREFILL_K_WORDS,

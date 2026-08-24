@@ -249,7 +249,7 @@ mod kernels {
         // SAFETY: the prepared route instantiates only T=32/64/128 with a complete
         // padded 64-row activation tile and exact 64-row output tiles.
         unsafe {
-            prefill_projection_mma::<Qwen38_27B, TOKENS, 64, 32, 4>(
+            prefill_projection_mma::<{ Qwen38_27B::HIDDEN }, TOKENS, 64, 32, 4>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
@@ -281,7 +281,7 @@ mod kernels {
     ) {
         // SAFETY: the fixed launch covers every 64-row token tile and QKV output tile.
         unsafe {
-            prefill_projection_mma::<Qwen38_27B, 1024, 64, 16, 2>(
+            prefill_projection_mma::<{ Qwen38_27B::HIDDEN }, 1024, 64, 16, 2>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
@@ -314,7 +314,7 @@ mod kernels {
         // SAFETY: the exact 64x64 CTA tile preserves every m16n8k32 accumulation
         // and exposes 256 output CTAs per token tile for the 16,384-row GDN plane.
         unsafe {
-            prefill_projection_mma::<Qwen38_27B, TOKENS, 64, 32, 4>(
+            prefill_projection_mma::<{ Qwen38_27B::HIDDEN }, TOKENS, 64, 32, 4>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
@@ -347,7 +347,7 @@ mod kernels {
         // SAFETY: 16 K words keep the two-stage tile at 16 KiB while the 4,096
         // CTAs cover every 64-token by 64-output tile exactly once.
         unsafe {
-            prefill_projection_mma::<Qwen38_27B, 1024, 64, 16, 2>(
+            prefill_projection_mma::<{ Qwen38_27B::HIDDEN }, 1024, 64, 16, 2>(
                 activation_codes,
                 activation_scales,
                 weight_codes,

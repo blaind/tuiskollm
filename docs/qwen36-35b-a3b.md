@@ -117,20 +117,23 @@ inactive sentinels, immutable inputs, stable-address, and zero-growth checks. Al
 zero stack/local memory. At a diagnostic 2,115 MHz median SM clock, its unblessed intrinsic prompt
 path measures 3.739/4.689/6.259 us and its complete graph measures 6.140/6.148/8.192 us at
 T=32/64/128. The FP32 recurrence stage shares that geometry through a separate causal prompt
-oracle covering every exact `B=1..8` and
-`T=32/64/128` route through one mapped causal state. It compares 20,447,232 FP32 state values and
+oracle covering every exact `B=1..8` and `T=32/64/128` route through one mapped causal state. It
+compares 20,447,232 FP32 state values and
 1,064,960 BF16 gated-normalized outputs with the independent FP64 formula, then checks eager/graph
 agreement, inactive state rows, stable addresses, and zero post-warmup growth. The three prompt
 entries use 48 registers with zero stack/local memory. At locked 2,197/13,801 MHz SM/memory
 clocks, their unblessed direct graphs measure 168.134/330.475/654.471 us at T=32/64/128 after an
 untimed exact-state restore; B=1/8 measure 11.372/13.864 us. Compile-time geometry assertions and
 separate Qwen3.6 oracle entry points make the shared binary contract executable rather than
-conventional. The final GDN projection preserves its source E4M3 `[2048,4096]` plane and static
-FP8 scales. Its exact `B=1..8` routes pass 147,456 activation-code, 73,728 FP64-formula output,
-221,184 graph-replay, and 344,064 inactive-sentinel comparisons while retaining immutable sources,
-stable addresses, and zero post-warmup growth. All 16 entries have zero stack/local memory. At a
-2,190 MHz median SM clock, the unblessed warm repeated path measures 9.543/22.031 us at B=1/8;
-the complete two-node graph measures 10.852/24.567 us. One source-backed layer-0 owner now
+conventional. The final GDN projection preserves its source E4M3 `[2048,4096]` plane and static FP8
+scales. Exact
+`B=1..8` and `T=32/64/128` routes pass 1,064,960 activation-code, 532,480 FP64-formula output,
+1,597,440 graph-replay, and 14,106,624 inactive-sentinel comparisons while retaining immutable
+sources, stable addresses, and zero post-warmup growth. All 22 entries have zero stack/local
+memory. The prompt projections retain 50 registers and native `QMMA.16832.F32.E4M3.E4M3`. At a
+2,197 MHz median SM clock, the unblessed prompt graph measures 61.586/63.466/63.479 us at
+T=32/64/128; the repeated intrinsic path measures 60.514/61.420/61.656 us. B=1/8 graph medians are
+10.853/24.554 us. One source-backed layer-0 owner now
 composes both residual boundaries, the complete GDN path, router, eight routed experts, and the
 shared expert into eight immutable exact-B graphs over 47 stable addresses. It owns 489,703,808
 weight bytes and 18,251,056 workspace/state bytes in one 507,955,968-byte arena. Every batch passes

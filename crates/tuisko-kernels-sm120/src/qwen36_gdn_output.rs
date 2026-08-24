@@ -1,5 +1,6 @@
 //! Exact Qwen3.6 static-FP8 GDN output projection.
 
+use crate::device::fp8_projection::prefill_projection_mma_static_scales;
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -12,6 +13,14 @@ const QUANTIZE_THREADS: u32 = 256;
 const PROJECTION_WARPS: usize = 4;
 const PROJECTION_THREADS: u32 = (PROJECTION_WARPS * 32) as u32;
 const ROWS_PER_CTA: usize = 2 * PROJECTION_WARPS;
+const PREFILL_ROUTES: [usize; 3] = [32, 64, 128];
+const PREFILL_BLOCK_ROWS: usize = 64;
+const PREFILL_OUTPUT_ROWS: usize = 64;
+const PREFILL_K_WORDS: usize = 32;
+const PREFILL_K_SUBTILES: usize = 4;
+const PREFILL_THREADS: u32 = 256;
+const PREFILL_SHARED_BYTES: u32 =
+    (2 * (PREFILL_BLOCK_ROWS + PREFILL_OUTPUT_ROWS) * PREFILL_K_WORDS * size_of::<u32>()) as u32;
 
 const _: () = assert!(INPUT_COLUMNS == 4_096);
 const _: () = assert!(OUTPUT_ROWS == 2_048);
@@ -39,17 +48,8 @@ mod kernels {
         value
     }
 
-    /// Quantizes exact BF16 recurrence rows with the checkpoint's static scale.
-    #[kernel]
-    #[launch_bounds(256, 2)]
-    #[launch_contract(
-        domain = 1,
-        coordinates = u32,
-        block = (256, 1, 1),
-        dynamic_shared = 0,
-        min_compute_capability = (12, 0),
-    )]
-    pub fn qwen36_gdn_output_static_quantize<const TOKENS: usize>(
+    #[inline(always)]
+    unsafe fn static_fp8_quantize<const TOKENS: usize>(
         input: *const u32,
         input_scale: f32,
         codes: *mut u16,
@@ -74,6 +74,42 @@ mod kernels {
             }
             pair += QUANTIZE_THREADS as usize;
         }
+    }
+
+    /// Quantizes exact BF16 recurrence rows with the checkpoint's static scale.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_gdn_output_static_quantize<const TOKENS: usize>(
+        input: *const u32,
+        input_scale: f32,
+        codes: *mut u16,
+    ) {
+        unsafe { static_fp8_quantize::<TOKENS>(input, input_scale, codes) }
+    }
+
+    /// Quantizes exact BF16 prompt rows with the checkpoint's static scale.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_gdn_output_static_quantize_prefill<const TOKENS: usize>(
+        input: *const u32,
+        input_scale: f32,
+        codes: *mut u16,
+    ) {
+        unsafe { static_fp8_quantize::<TOKENS>(input, input_scale, codes) }
     }
 
     /// Projects static E4M3 recurrence rows to the residual width.
@@ -163,6 +199,46 @@ mod kernels {
         store!(6);
         store!(7);
     }
+
+    /// Projects one exact prompt tile through source-static E4M3 output weights.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 32768,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_gdn_output_projection_prefill<const TOKENS: usize>(
+        activation_codes: *const u32,
+        input_scale: f32,
+        weight_codes: *const u32,
+        weight_scale: f32,
+        output: *mut u16,
+        k_tiles: u32,
+    ) {
+        // SAFETY: the exact 64x64 CTA inventory covers all active prompt/output tiles.
+        unsafe {
+            prefill_projection_mma_static_scales::<
+                INPUT_COLUMNS,
+                TOKENS,
+                PREFILL_BLOCK_ROWS,
+                PREFILL_K_WORDS,
+                PREFILL_K_SUBTILES,
+            >(
+                activation_codes,
+                input_scale,
+                weight_codes,
+                OUTPUT_ROWS,
+                weight_scale,
+                weight_scale,
+                output,
+                k_tiles,
+                OUTPUT_ROWS,
+            );
+        }
+    }
 }
 
 struct PreparedRoute<const TOKENS: usize> {
@@ -238,6 +314,85 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
     }
 }
 
+struct PreparedPrefillRoute<const TOKENS: usize> {
+    quantize:
+        PreparedLaunch<kernels::__qwen36_gdn_output_static_quantize_prefill_CudaKernel<TOKENS>>,
+    projection: PreparedLaunch<kernels::__qwen36_gdn_output_projection_prefill_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !PREFILL_ROUTES.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 GDN output prefill route T={TOKENS} is not admitted"
+            )));
+        }
+        let quantize = module
+            .prepare_qwen36_gdn_output_static_quantize_prefill::<TOKENS>(LaunchConfig1D::new(
+                TOKENS as u32,
+                QUANTIZE_THREADS,
+                0,
+            ))
+            .map_err(|source| {
+                GpuError::launch("preparing Qwen3.6 GDN output prefill quantization", source)
+            })?;
+        let token_tiles = TOKENS.div_ceil(PREFILL_BLOCK_ROWS);
+        let projection_blocks = OUTPUT_ROWS / PREFILL_OUTPUT_ROWS * token_tiles;
+        // At T=128 the decode topology would scan the 8 MiB weight plane 16
+        // times. Two 64-token MMA tiles scan it twice instead, while every
+        // output retains the ordered m16n8k32 K sequence and exact scalar scales.
+        let projection = module
+            .prepare_qwen36_gdn_output_projection_prefill::<TOKENS>(LaunchConfig1D::new(
+                projection_blocks as u32,
+                PREFILL_THREADS,
+                PREFILL_SHARED_BYTES,
+            ))
+            .map_err(|source| GpuError::launch("preparing Qwen3.6 GDN output prefill", source))?;
+
+        Ok(Self {
+            quantize,
+            projection,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        input_scale: f32,
+        weight_codes: *const u8,
+        weight_scale: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen36_gdn_output_static_quantize_prefill::<TOKENS>(
+                stream,
+                &self.quantize,
+                input.cast::<u32>(),
+                input_scale,
+                activation_codes.cast::<u16>(),
+            )
+            .map_err(|source| {
+                GpuError::launch("launching Qwen3.6 GDN output prefill quantization", source)
+            })?;
+        module
+            .qwen36_gdn_output_projection_prefill::<TOKENS>(
+                stream,
+                &self.projection,
+                activation_codes.cast::<u32>(),
+                input_scale,
+                weight_codes.cast::<u32>(),
+                weight_scale,
+                output,
+                (INPUT_COLUMNS / 4 / PREFILL_K_WORDS) as u32,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.6 GDN output prefill", source))
+    }
+}
+
 /// PTX symbols retained for every exact Qwen3.6 GDN output route.
 pub(crate) fn qwen36_gdn_output_ptx_names() -> Vec<&'static str> {
     vec![
@@ -257,10 +412,16 @@ pub(crate) fn qwen36_gdn_output_ptx_names() -> Vec<&'static str> {
         kernels::qwen36_gdn_output_projection_ptx_name::<6>(),
         kernels::qwen36_gdn_output_projection_ptx_name::<7>(),
         kernels::qwen36_gdn_output_projection_ptx_name::<8>(),
+        kernels::qwen36_gdn_output_static_quantize_prefill_ptx_name::<32>(),
+        kernels::qwen36_gdn_output_static_quantize_prefill_ptx_name::<64>(),
+        kernels::qwen36_gdn_output_static_quantize_prefill_ptx_name::<128>(),
+        kernels::qwen36_gdn_output_projection_prefill_ptx_name::<32>(),
+        kernels::qwen36_gdn_output_projection_prefill_ptx_name::<64>(),
+        kernels::qwen36_gdn_output_projection_prefill_ptx_name::<128>(),
     ]
 }
 
-/// Prepared exact-batch Qwen3.6 GDN output routes on SM120.
+/// Prepared exact-row Qwen3.6 GDN output routes on SM120.
 pub struct Qwen36GdnOutputOp {
     module: kernels::LoadedModule,
     b1: PreparedRoute<1>,
@@ -271,6 +432,9 @@ pub struct Qwen36GdnOutputOp {
     b6: PreparedRoute<6>,
     b7: PreparedRoute<7>,
     b8: PreparedRoute<8>,
+    t32: PreparedPrefillRoute<32>,
+    t64: PreparedPrefillRoute<64>,
+    t128: PreparedPrefillRoute<128>,
 }
 
 impl Qwen36GdnOutputOp {
@@ -289,23 +453,26 @@ impl Qwen36GdnOutputOp {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            t32: PreparedPrefillRoute::prepare(&module)?,
+            t64: PreparedPrefillRoute::prepare(&module)?,
+            t128: PreparedPrefillRoute::prepare(&module)?,
             module,
         })
     }
 
-    /// Runs static-FP8 recurrent output projection at exact `B=1..=8`.
+    /// Runs static-FP8 recurrent output projection at one exact row count.
     ///
     /// # Safety
     ///
-    /// The input covers BF16 `[batch,4096]`, the code workspace covers E4M3
-    /// `[batch,4096]`, weights cover E4M3 `[2048,4096]`, and output covers
-    /// BF16 `[batch,2048]`. All planes are aligned, disjoint, context-local,
+    /// The input covers BF16 `[rows,4096]`, the code workspace covers E4M3
+    /// `[rows,4096]`, weights cover E4M3 `[2048,4096]`, and output covers
+    /// BF16 `[rows,2048]`. All planes are aligned, disjoint, context-local,
     /// and live until `stream` completes.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         input: *const u16,
         activation_codes: *mut u8,
         input_scale: f32,
@@ -339,7 +506,7 @@ impl Qwen36GdnOutputOp {
             };
         }
 
-        match batch {
+        match rows {
             1 => launch!(b1),
             2 => launch!(b2),
             3 => launch!(b3),
@@ -348,8 +515,11 @@ impl Qwen36GdnOutputOp {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
             _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.6 GDN output batch {batch} is outside the exact range 1..={MAX_BATCH}"
+                "Qwen3.6 GDN output row count {rows} is outside 1..={MAX_BATCH}, 32, 64, and 128"
             ))),
         }
     }
@@ -366,9 +536,11 @@ mod tests {
         assert_eq!(OUTPUT_ROWS, 2_048);
         assert_eq!(PROJECTION_THREADS, 128);
         assert_eq!(OUTPUT_ROWS / ROWS_PER_CTA, 256);
+        assert_eq!(PREFILL_ROUTES, [32, 64, 128]);
+        assert_eq!(PREFILL_SHARED_BYTES, 32_768);
 
         let names = qwen36_gdn_output_ptx_names();
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 22);
         assert_eq!(
             names.iter().copied().collect::<BTreeSet<_>>().len(),
             names.len()

@@ -179,7 +179,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-qwen36-attention-qk-prepare` | Check Qwen3.6 Q/K zero-centered normalization, 64-wide three-axis MRoPE, represented BF16 cache append, exact-B graph replay, inactive extents, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-attention-output` | Check Qwen3.6 query-paired sigmoid gating, static E4M3 output projection, immutable sources, exact-B graph replay, inactive extents, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-gdn-input` | Check Qwen3.6 static E4M3 Q/K/V/Z, BF16 A/B controls, immutable sources, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-gdn-output` | Check Qwen3.6 static E4M3 GDN output, immutable sources, exact-B graph replay, inactive extents, and allocation behavior at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-qwen36-gdn-output` | Check Qwen3.6 static E4M3 GDN output, immutable sources, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-gdn-prepare` | Check Qwen3.6 decay/beta controls, causal width-four convolution/history publication, graph replay, and allocation behavior at B=1..8 and T=32/64/128 through the shared exact Qwen3.5 binary route | terminal |
 | `cargo run -p xtask -- qualify-qwen36-gdn-recurrence` | Check Qwen3.6 causal FP32 state transitions, gated normalization, graph replay, and allocation behavior at B=1..8 and T=32/64/128 through the shared exact Qwen3.5 binary route | terminal |
 | `cargo run -p xtask -- qualify-qwen35-bf16-lm-head SNAPSHOT` | Check the source BF16 LM head against sampled FP64 dots, eager/graph agreement, immutable inputs, stable addresses, and allocation behavior at B=1..8 | terminal |
@@ -256,7 +256,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-qwen36-residual-norm` | Measure every exact Qwen3.6 plain and fused-residual RMSNorm graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-fp8-qkv` | Measure every exact Qwen3.6 static-FP8 full-attention Q/K/V graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-input` | Measure every exact Qwen3.6 static-FP8 Q/K/V/Z plus BF16 A/B control graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-gdn-output` | Measure every exact Qwen3.6 static-FP8 GDN output graph | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-gdn-output` | Measure every exact Qwen3.6 static-FP8 GDN output graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-attention-output` | Measure every complete Qwen3.6 sigmoid-gate, BF16-stage, and static-FP8 output graph with input restoration outside timing | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-prepare` | Measure every exact Qwen3.6 decode and T=32/64/128 control/convolution graph through the shared exact-geometry binary route | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-gdn-recurrence` | Measure every exact Qwen3.6 decode and T=32/64/128 recurrent-state graph after an untimed exact-state restore | terminal or `--json PATH` |
