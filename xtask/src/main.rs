@@ -714,6 +714,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen35-full-attention-layer") => {
             qualify_qwen35_full_attention_layer(root, &remaining)
         }
+        Some("qualify-qwen35-gdn-layer") => qualify_qwen35_gdn_layer(root, &remaining),
         Some("qualify-resident-model") => qualify_resident_model(root, &remaining),
         Some("qualify-resident-generation") => qualify_resident_generation(root, &remaining),
         Some("qualify-resident-batch-generation") => {
@@ -2610,6 +2611,45 @@ fn qualify_qwen35_full_attention_layer(
     gate_qwen35_nvfp4_qkv(root)?;
     gate_qwen35_attention_qk_prepare(root)?;
     gate_qwen35_paged_gqa(root)?;
+    gate_qwen35_nvfp4_attention_output(root)?;
+    gate_qwen35_nvfp4_swiglu(root)?;
+    gate_qwen35_nvfp4_down(root)
+}
+
+fn qualify_qwen35_gdn_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-qwen35-gdn-layer SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen35_gdn_layer::tests",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_qwen35_residual_norm(root)?;
+    gate_qwen35_nvfp4_gdn_input(root)?;
+    gate_qwen35_gdn_prepare(root)?;
+    gate_qwen35_gdn_recurrence(root)?;
     gate_qwen35_nvfp4_attention_output(root)?;
     gate_qwen35_nvfp4_swiglu(root)?;
     gate_qwen35_nvfp4_down(root)

@@ -717,7 +717,7 @@ fn verify_source_formula(
     Ok(())
 }
 
-fn verify_a16_projection(
+pub(crate) fn verify_a16_projection(
     role: &str,
     activation: &[u16],
     binding: ModelOptNvfp4LinearBindings<'_>,
@@ -757,13 +757,13 @@ fn verify_a16_projection(
 }
 
 #[derive(Clone, Copy)]
-struct QuantizedActivation<'a> {
-    codes: &'a [u8],
-    scales: &'a [u8],
-    scale_divisor: f32,
+pub(crate) struct QuantizedActivation<'a> {
+    pub(crate) codes: &'a [u8],
+    pub(crate) scales: &'a [u8],
+    pub(crate) scale_divisor: f32,
 }
 
-fn nvfp4_dot_w4a4(
+pub(crate) fn nvfp4_dot_w4a4(
     activation: QuantizedActivation<'_>,
     weights: &[u8],
     scales: &[u8],
@@ -829,7 +829,7 @@ fn nvfp4_dot_a16(
     Ok(sum)
 }
 
-fn quantize_oracle(
+pub(crate) fn quantize_oracle(
     input: &[u16],
     input_scale_divisor: f32,
 ) -> Result<(Vec<u8>, Vec<u8>), Qwen35FullAttentionLayerQualificationError> {
