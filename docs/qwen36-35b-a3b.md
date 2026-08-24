@@ -173,7 +173,9 @@ without rescanning the LM-head source and captures final-norm plus NVFP4 LM-head
 exact `B=1..8`. Its source-backed gate passes 73,728 exact embedding values, 73,728 final-norm
 values, 2,304 sampled full-formula represented NVFP4 logits, complete eager/graph agreement,
 inactive-row sentinels, immutable source planes, stable addresses, and zero post-warmup device
-growth in one 290,107,392-byte arena. Direct endpoint timing remains a separate unblessed slice.
+growth in one 290,107,392-byte arena. At locked 2,197/13,801 MHz SM/memory clocks, its unblessed
+direct graph measures 199.142/448.010 us at B=1/8; the repeated intrinsic path measures
+197.736/446.026 us and the B=1 route reads the 286 MB endpoint at 1,349.78 GiB/s.
 
 ## Implementation order
 
