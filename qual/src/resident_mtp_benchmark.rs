@@ -18,7 +18,8 @@ const ROTARY_PAIRS: usize = 32;
 
 struct RouteGraph {
     route: ResidentMtpDraftRoute,
-    repeated: CudaGraph,
+    repeated_draft: CudaGraph,
+    repeated_continuation: CudaGraph,
 }
 
 struct Session {
@@ -67,7 +68,12 @@ impl Session {
                 let route = ResidentMtpDraftRoute::qualified(batch)?;
                 Ok(RouteGraph {
                     route,
-                    repeated: program.qualification_repeated_draft_graph(
+                    repeated_draft: program.qualification_repeated_draft_graph(
+                        &stream,
+                        batch,
+                        repeated_operations,
+                    )?,
+                    repeated_continuation: program.qualification_repeated_continue_draft_graph(
                         &stream,
                         batch,
                         repeated_operations,
@@ -89,6 +95,8 @@ impl Session {
         for _ in 0..launches {
             for route in &self.routes {
                 self.program.replay_draft(&self.stream, route.route)?;
+                self.program
+                    .replay_continue_draft(&self.stream, route.route)?;
             }
         }
         self.stream.synchronize().map_err(GpuError::from)?;
@@ -99,24 +107,38 @@ impl Session {
         &self,
         repeated_operations: u64,
     ) -> Result<Vec<ExactDeviceCase<'_>>, DeviceBenchmarkError> {
-        self.routes
-            .iter()
-            .map(|route| {
-                let batch = route.route.batch();
-                Ok(ExactDeviceCase::new(
-                    "qwen3_8/mtp/resident_draft",
-                    format!("B={batch}"),
-                    BenchmarkWorkload::warm_operator_mtp(batch as u64),
-                    OperationAccounting::new(logical_bytes(batch), batch as u64, "draft"),
-                    self.program.qualification_draft_graph(route.route)?,
-                    Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
-                ))
-            })
-            .collect()
+        let mut cases = Vec::with_capacity(2 * MAX_BATCH);
+        for route in &self.routes {
+            let batch = route.route.batch();
+            cases.push(ExactDeviceCase::new(
+                "qwen3_8/mtp/resident_draft",
+                format!("B={batch}"),
+                BenchmarkWorkload::warm_operator_mtp(batch as u64),
+                OperationAccounting::new(logical_bytes(batch), batch as u64, "draft"),
+                self.program.qualification_draft_graph(route.route)?,
+                Some(RepeatedGraph::new(
+                    &route.repeated_draft,
+                    repeated_operations,
+                )),
+            ));
+            cases.push(ExactDeviceCase::new(
+                "qwen3_8/mtp/resident_continuation",
+                format!("B={batch}"),
+                BenchmarkWorkload::warm_operator_mtp(batch as u64),
+                OperationAccounting::new(logical_bytes(batch), batch as u64, "continuation"),
+                self.program
+                    .qualification_continue_draft_graph(route.route)?,
+                Some(RepeatedGraph::new(
+                    &route.repeated_continuation,
+                    repeated_operations,
+                )),
+            ));
+        }
+        Ok(cases)
     }
 }
 
-/// Measures every exact resident MTP draft `B=1..8` production graph directly.
+/// Measures every exact resident MTP seeded-draft and continuation `B=1..8` graph directly.
 pub fn benchmark_resident_mtp(
     root: &Path,
     options: DeviceBenchmarkOptions,
@@ -215,7 +237,7 @@ pub fn benchmark_resident_mtp(
         BenchmarkReportSpec {
             suite: "bench-resident-mtp",
             classification: "performance_sensitive_model",
-            timing_scope: "paired Rust production-graph submission/completion and repeated resident target-handoff plus long-context MTP draft route",
+            timing_scope: "paired Rust production-graph submission/completion and repeated resident seeded target-handoff or prior-residual continuation through the long-context MTP route",
         },
         preflight,
         baseline_sha256,

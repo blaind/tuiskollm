@@ -95,7 +95,7 @@ impl ResidentMtpRealignRoute {
 struct Graphs {
     prompt: [CudaGraph; PROMPT_ROUTES.len()],
     draft: [CudaGraph; MAX_BATCH],
-    continue_draft: CudaGraph,
+    continue_draft: [CudaGraph; MAX_BATCH],
     prime: [CudaGraph; REALIGN_ROUTES],
     realign: [CudaGraph; REALIGN_ROUTES],
 }
@@ -671,19 +671,14 @@ impl ResidentMtpProgram {
         Ok(())
     }
 
-    /// Replays the exact single-slot continuation whose hidden input is the prior MTP residual.
+    /// Replays an exact compact continuation whose hidden rows are prior residuals in lane order.
     pub fn replay_continue_draft(
         &self,
         stream: &CudaStream,
         route: ResidentMtpDraftRoute,
     ) -> EngineResult<()> {
-        if route.batch != 1 {
-            return Err(EngineError::route(format!(
-                "resident MTP continuation requires B=1, got B={}",
-                route.batch
-            )));
-        }
-        self.graphs.continue_draft.launch(stream)?;
+        require_batch(route.batch)?;
+        self.graphs.continue_draft[route.batch - 1].launch(stream)?;
         Ok(())
     }
 
@@ -910,9 +905,9 @@ impl ResidentMtpProgram {
             + self.rope_sin_stager.num_bytes()
     }
 
-    /// Exact prompt, seeded draft, single-lane continuation, prime, and realignment inventory.
+    /// Exact prompt, seeded draft, compact continuation, prime, and realignment inventory.
     pub const fn graph_count(&self) -> usize {
-        PROMPT_ROUTES.len() + MAX_BATCH + 1 + 2 * REALIGN_ROUTES
+        PROMPT_ROUTES.len() + 2 * MAX_BATCH + 2 * REALIGN_ROUTES
     }
 
     /// Checked resident MTP layout.
@@ -961,26 +956,22 @@ impl ResidentMtpProgram {
     }
 
     #[cfg(feature = "qualification")]
-    /// Launches the exact single-slot continuation eagerly.
+    /// Launches one exact compact continuation eagerly.
     pub fn qualification_launch_eager_continue_draft(
         &self,
         stream: &CudaStream,
         route: ResidentMtpDraftRoute,
     ) -> EngineResult<()> {
-        if route.batch != 1 {
-            return Err(EngineError::route(format!(
-                "resident MTP continuation requires B=1, got B={}",
-                route.batch
-            )));
-        }
+        require_batch(route.batch)?;
         launch_continue_upload(
             stream,
+            route.batch,
             &self.target,
             &self.arena,
             self.layout.regions(),
             self.stagers(),
         )?;
-        launch_full(stream, 1, self.ops(), self.pointers()?)?;
+        launch_full(stream, route.batch, self.ops(), self.pointers()?)?;
         Ok(())
     }
 
@@ -1058,6 +1049,39 @@ impl ResidentMtpProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Captures repeated compact continuation work for intrinsic timing.
+    pub fn qualification_repeated_continue_draft_graph(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        operations: u64,
+    ) -> EngineResult<CudaGraph> {
+        require_batch(batch)?;
+        if operations == 0 {
+            return Err(EngineError::route(
+                "repeated resident MTP continuation graph requires at least one operation",
+            ));
+        }
+        let pointers = self.pointers()?;
+        let ops = self.ops();
+        let stagers = self.stagers();
+        Ok(CudaGraph::capture(stream, || {
+            for _ in 0..operations {
+                launch_continue_upload(
+                    stream,
+                    batch,
+                    &self.target,
+                    &self.arena,
+                    self.layout.regions(),
+                    stagers,
+                )?;
+                launch_full(stream, batch, ops, pointers)?;
+            }
+            Ok(())
+        })?)
+    }
+
+    #[cfg(feature = "qualification")]
     /// Returns one immutable production prompt graph.
     pub fn qualification_prompt_graph(
         &self,
@@ -1079,6 +1103,16 @@ impl ResidentMtpProgram {
     ) -> EngineResult<&CudaGraph> {
         require_batch(route.batch)?;
         Ok(&self.graphs.draft[route.batch - 1])
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns one immutable production continuation graph.
+    pub fn qualification_continue_draft_graph(
+        &self,
+        route: ResidentMtpDraftRoute,
+    ) -> EngineResult<&CudaGraph> {
+        require_batch(route.batch)?;
+        Ok(&self.graphs.continue_draft[route.batch - 1])
     }
 
     #[cfg(feature = "qualification")]
@@ -1424,10 +1458,13 @@ fn capture_graphs(
             launch_full(stream, rows, ops, pointers)
         })?);
     }
-    let continue_draft = CudaGraph::capture(stream, || {
-        launch_continue_upload(stream, target, arena, regions, stagers)?;
-        launch_full(stream, 1, ops, pointers)
-    })?;
+    let mut continue_draft = Vec::with_capacity(MAX_BATCH);
+    for rows in 1..=MAX_BATCH {
+        continue_draft.push(CudaGraph::capture(stream, || {
+            launch_continue_upload(stream, rows, target, arena, regions, stagers)?;
+            launch_full(stream, rows, ops, pointers)
+        })?);
+    }
     let mut prime = Vec::with_capacity(REALIGN_ROUTES);
     for rows in 1..=REALIGN_ROUTES {
         prime.push(CudaGraph::capture(stream, || {
@@ -1449,7 +1486,9 @@ fn capture_graphs(
         draft: draft
             .try_into()
             .map_err(|_| EngineError::layout("resident MTP draft graph inventory differs"))?,
-        continue_draft,
+        continue_draft: continue_draft.try_into().map_err(|_| {
+            EngineError::layout("resident MTP continuation graph inventory differs")
+        })?,
         prime: prime
             .try_into()
             .map_err(|_| EngineError::layout("resident MTP prime graph inventory differs"))?,
@@ -1519,51 +1558,58 @@ fn launch_upload(
 
 fn launch_continue_upload(
     stream: &CudaStream,
+    rows: usize,
     target: &ResidentModelProgram,
     arena: &DeviceArena,
     regions: ResidentMtpRegions,
     stagers: Stagers<'_>,
 ) -> GpuResult<()> {
-    // One single-slot continuation consumes the prior MTP residual before the full route
-    // overwrites it. Metadata and the current shared target page table remain graph inputs.
+    let hidden_values = rows.checked_mul(Qwen38_27B::HIDDEN).ok_or_else(|| {
+        GpuError::invalid_launch("resident MTP continuation hidden count overflows")
+    })?;
+    let rotary_values = rows.checked_mul(ROTARY_PAIRS).ok_or_else(|| {
+        GpuError::invalid_launch("resident MTP continuation rotary count overflows")
+    })?;
+    // Every compact row consumes the same row of the prior MTP residual before
+    // the full B route overwrites it. B=1..8 retains the qualified leaf tilings.
     unsafe {
         arena.copy_prefix_from_pinned_host_async(
             stream,
             regions.embedding,
             stagers.embedding,
-            Qwen38_27B::HIDDEN,
+            hidden_values,
         )?;
         arena.copy_prefix_from_pinned_host_async(
             stream,
             regions.table_rows,
             stagers.table_rows,
-            1,
+            rows,
         )?;
         arena.copy_prefix_from_pinned_host_async(
             stream,
             regions.cache_positions,
             stagers.positions,
-            1,
+            rows,
         )?;
-        arena.copy_prefix_from_pinned_host_async(stream, regions.lengths, stagers.lengths, 1)?;
+        arena.copy_prefix_from_pinned_host_async(stream, regions.lengths, stagers.lengths, rows)?;
         arena.copy_prefix_from_pinned_host_async(
             stream,
             regions.rope_cos,
             stagers.rope_cos,
-            ROTARY_PAIRS,
+            rotary_values,
         )?;
         arena.copy_prefix_from_pinned_host_async(
             stream,
             regions.rope_sin,
             stagers.rope_sin,
-            ROTARY_PAIRS,
+            rotary_values,
         )?;
         arena.copy_prefix_from_arena_async(
             stream,
             regions.target_hidden,
             arena,
             regions.residual_output,
-            Qwen38_27B::HIDDEN,
+            hidden_values,
         )?;
         target.enqueue_mtp_block_table_handoff(stream, arena, regions.block_tables)?;
     }
