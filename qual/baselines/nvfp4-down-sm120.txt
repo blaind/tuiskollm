@@ -5,3 +5,7 @@ cuda_toolkit_release=13.3
 cuda_toolkit_version=13.3.73
 nvfp4_registers=36,89,95,96,96,106,112,112
 shared_bytes=9216
+prefill_quantize_registers=38,38,38,38
+prefill_quantize_shared_bytes=1024
+prefill_w4a4_registers=80,80,80,80
+prefill_w4a4_shared_bytes=37888
