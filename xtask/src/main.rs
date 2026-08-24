@@ -8397,8 +8397,8 @@ fn gate_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
         .filter(|entry| entry.name.starts_with("qwen35_nvfp4_swiglu_w4a4_TID_"))
         .collect::<Vec<_>>();
     require_count("Qwen3.5 NVFP4 SwiGLU A16", a16.len(), 4)?;
-    require_count("Qwen3.5 NVFP4 activation quantization", quantize.len(), 8)?;
-    require_count("Qwen3.5 NVFP4 SwiGLU W4A4", w4a4.len(), 8)?;
+    require_count("Qwen3.5 NVFP4 activation quantization", quantize.len(), 12)?;
+    require_count("Qwen3.5 NVFP4 SwiGLU W4A4", w4a4.len(), 12)?;
 
     for entry in &a16 {
         let minimum_ctas = if entry.name == "qwen35_nvfp4_swiglu_a16_t1" {
@@ -8512,7 +8512,7 @@ fn gate_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
     require_uniform_value(&baseline, "w4a4_shared_bytes", &w4a4_shared)?;
 
     println!(
-        "Qwen3.5 NVFP4 SwiGLU gate passed: 4 A16 + 8 quantize + 8 W4A4 entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}",
+        "Qwen3.5 NVFP4 SwiGLU gate passed: 4 A16 + 12 quantize (8 decode/4 prefill) + 12 W4A4 (8 decode/4 prefill) entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}",
         a16_registers, quantize_registers, w4a4_registers, a16_shared, quantize_shared, w4a4_shared,
     );
     Ok(())

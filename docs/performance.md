@@ -169,6 +169,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-fp8-swiglu` | Run the exhaustive represented-value gate/up SwiGLU oracle and graph-replay gate | terminal |
 | `cargo run -p xtask -- qualify-fp8-down` | Run the exhaustive represented-value dense-FP8 down oracle and graph-replay gate | terminal |
 | `cargo run -p xtask -- qualify-nvfp4-swiglu` | Check represented E2M1/E4M3 seams, A16/W4A4 production routing, immutable weights, graph replay, stable addresses, and post-warmup allocation at B=1..8 and T=32/64/128/1024 | terminal |
+| `cargo run -p xtask -- qualify-qwen35-nvfp4-swiglu` | Check the Qwen3.5 represented gate/up seams, route selection, immutable sources, graph replay, stable addresses, and allocation behavior at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-nvfp4-down` | Check represented E2M1/E4M3 activation and down-projection seams, immutable input/weights, graph replay, stable addresses, and post-warmup allocation at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-down` | Check the Qwen3.5 represented activation/down seams, immutable sources, graph replay, stable addresses, and allocation behavior at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT` | Check source layer 55, route-specific A16/W4A4 scratch, every observable seam, exact B=1..8 and T=32/64/128/1024 graphs, immutable weights, stable addresses, and owner allocation | terminal |

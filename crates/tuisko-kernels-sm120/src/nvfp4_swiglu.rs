@@ -1518,6 +1518,12 @@ impl<const TOKENS: usize> PreparedQwen35W4a4Route<TOKENS> {
             u32::try_from(Qwen35_9B::INTERMEDIATE / ROWS_PER_BRANCH).map_err(|_| {
                 GpuError::invalid_launch("Qwen3.5 NVFP4 projection grid exceeds CUDA width")
             })?;
+        // The retained 48-row tile needs 1/2/3/22 token tiles at
+        // T=32/64/128/1024. Extending grid Y preserves every m16n8k64
+        // accumulation and only assigns the same arithmetic to more rows.
+        let token_tiles = u32::try_from(TOKENS.div_ceil(SMALL_BLOCK_M)).map_err(|_| {
+            GpuError::invalid_launch("Qwen3.5 NVFP4 token grid exceeds CUDA height")
+        })?;
         let quantize = module
             .prepare_qwen35_nvfp4_quantize::<TOKENS>(LaunchConfig1D::new(quantize_blocks, 256, 0))
             .map_err(|source| {
@@ -1525,7 +1531,7 @@ impl<const TOKENS: usize> PreparedQwen35W4a4Route<TOKENS> {
             })?;
         let projection = module
             .prepare_qwen35_nvfp4_swiglu_w4a4::<TOKENS>(LaunchConfig2D::new(
-                (projection_blocks, 1),
+                (projection_blocks, token_tiles),
                 (W4A4_THREADS, 1),
                 0,
             ))
@@ -1607,7 +1613,7 @@ pub(crate) fn nvfp4_swiglu_ptx_names() -> [&'static str; 22] {
 }
 
 /// PTX symbols retained for Qwen3.5 production and crossover comparison.
-pub(crate) fn qwen35_nvfp4_swiglu_ptx_names() -> [&'static str; 20] {
+pub(crate) fn qwen35_nvfp4_swiglu_ptx_names() -> [&'static str; 28] {
     [
         "qwen35_nvfp4_swiglu_a16_t1",
         "qwen35_nvfp4_swiglu_a16_t2",
@@ -1621,6 +1627,10 @@ pub(crate) fn qwen35_nvfp4_swiglu_ptx_names() -> [&'static str; 20] {
         kernels::qwen35_nvfp4_quantize_ptx_name::<6>(),
         kernels::qwen35_nvfp4_quantize_ptx_name::<7>(),
         kernels::qwen35_nvfp4_quantize_ptx_name::<8>(),
+        kernels::qwen35_nvfp4_quantize_ptx_name::<32>(),
+        kernels::qwen35_nvfp4_quantize_ptx_name::<64>(),
+        kernels::qwen35_nvfp4_quantize_ptx_name::<128>(),
+        kernels::qwen35_nvfp4_quantize_ptx_name::<1_024>(),
         kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<1>(),
         kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<2>(),
         kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<3>(),
@@ -1629,6 +1639,10 @@ pub(crate) fn qwen35_nvfp4_swiglu_ptx_names() -> [&'static str; 20] {
         kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<6>(),
         kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<7>(),
         kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<8>(),
+        kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<32>(),
+        kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<64>(),
+        kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<128>(),
+        kernels::qwen35_nvfp4_swiglu_w4a4_ptx_name::<1_024>(),
     ]
 }
 
@@ -1862,6 +1876,10 @@ pub struct Qwen35Nvfp4SwiGluOp {
     w4a4_b6: PreparedQwen35W4a4Route<6>,
     w4a4_b7: PreparedQwen35W4a4Route<7>,
     w4a4_b8: PreparedQwen35W4a4Route<8>,
+    w4a4_t32: PreparedQwen35W4a4Route<32>,
+    w4a4_t64: PreparedQwen35W4a4Route<64>,
+    w4a4_t128: PreparedQwen35W4a4Route<128>,
+    w4a4_t1024: PreparedQwen35W4a4Route<1_024>,
 }
 
 impl Qwen35Nvfp4SwiGluOp {
@@ -1895,6 +1913,10 @@ impl Qwen35Nvfp4SwiGluOp {
             w4a4_b6: PreparedQwen35W4a4Route::prepare(&module)?,
             w4a4_b7: PreparedQwen35W4a4Route::prepare(&module)?,
             w4a4_b8: PreparedQwen35W4a4Route::prepare(&module)?,
+            w4a4_t32: PreparedQwen35W4a4Route::prepare(&module)?,
+            w4a4_t64: PreparedQwen35W4a4Route::prepare(&module)?,
+            w4a4_t128: PreparedQwen35W4a4Route::prepare(&module)?,
+            w4a4_t1024: PreparedQwen35W4a4Route::prepare(&module)?,
             module,
         })
     }
@@ -2098,6 +2120,69 @@ impl Qwen35Nvfp4SwiGluOp {
             ))),
         }
     }
+
+    /// Quantizes and executes W4A4 at exact `T=32,64,128,1024`.
+    ///
+    /// # Safety
+    ///
+    /// The planes satisfy [`Self::launch`] for `rows` rather than `batch`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_prefill(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        if !PREFILL_ROWS.contains(&rows) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 NVFP4 SwiGLU prefill row count {rows} is outside the exact T=32,64,128,1024 routes"
+            )));
+        }
+        if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 NVFP4 input scale divisor must be finite and positive",
+            ));
+        }
+        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 NVFP4 weight scale divisor must be finite and positive",
+            ));
+        }
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        input,
+                        activation_codes,
+                        activation_scales,
+                        weight_codes,
+                        weight_scales,
+                        input_scale_divisor,
+                        weight_scale_divisor,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match rows {
+            32 => launch!(w4a4_t32),
+            64 => launch!(w4a4_t64),
+            128 => launch!(w4a4_t128),
+            1_024 => launch!(w4a4_t1024),
+            _ => unreachable!("row count was validated above"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2131,7 +2216,7 @@ mod tests {
         let names = qwen35_nvfp4_swiglu_ptx_names();
         let unique = names.into_iter().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 20);
+        assert_eq!(names.len(), 28);
         assert_eq!(unique.len(), names.len());
         assert_eq!(qwen35_swiglu_schedule(0), None);
         assert_eq!(
