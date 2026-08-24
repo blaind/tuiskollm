@@ -395,27 +395,43 @@ pub fn check(workspace_root: &Path) -> RemoteResult<()> {
 pub fn sweep_stale(workspace_root: &Path) -> RemoteResult<u32> {
     let api = V2::new(resolve_api_key()?);
     let now = unix_seconds();
-    let mut targets = owned_pod_ids(workspace_root)?
-        .into_iter()
-        .map(|pod_id| (pod_id, "current-worktree ownership"))
-        .collect::<BTreeMap<_, _>>();
+    let owned_ids = owned_pod_ids(workspace_root)?;
+    let mut present_owned = BTreeSet::new();
+    let mut targets = BTreeMap::new();
     for pod in api.list_pods()? {
-        if !pod
+        let expired = pod
             .name
             .as_deref()
-            .is_some_and(|name| lease_expired(name, now))
-        {
+            .is_some_and(|name| lease_expired(name, now));
+        let Some(pod_id) = pod.id.filter(|id| !id.is_empty()) else {
+            if expired {
+                return Err(RemoteError::Api {
+                    operation: "list pods",
+                    status: 0,
+                    body: "expired remote lease is missing its pod id".to_owned(),
+                });
+            }
             continue;
+        };
+        let owned = owned_ids.contains(&pod_id);
+        if owned {
+            present_owned.insert(pod_id.clone());
         }
-        let pod_id = pod
-            .id
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| RemoteError::Api {
-                operation: "list pods",
-                status: 0,
-                body: "expired remote lease is missing its pod id".to_owned(),
-            })?;
-        targets.entry(pod_id).or_insert("expired lease");
+        if expired {
+            targets.insert(
+                pod_id,
+                if owned {
+                    "expired current-worktree lease"
+                } else {
+                    "expired lease"
+                },
+            );
+        }
+    }
+    for pod_id in owned_ids.difference(&present_owned) {
+        forget_owned_pod(&owned_pod_path(workspace_root, pod_id));
+        std::fs::remove_file(crate::sentry::keep_file_path(pod_id)).ok();
+        println!("forgot remote pod {pod_id} (absent from the account)");
     }
     let mut swept = 0u32;
     for (pod_id, reason) in targets {
