@@ -1047,7 +1047,7 @@ fn verify_owner(program: &ResidentModelProgram) -> Result<(), ResidentModelQuali
         || program.cache_bytes() != 7_210_008_576
         || program.kv_table_bytes() != 110_016
         || program.workspace_bytes() != 948_860_932
-        || program.descriptor_bytes() != 4_096
+        || program.descriptor_bytes() != 16_384
         || program.padding_bytes() != 15_676
         || program.resident_arena_bytes() != 21_284_111_616
         || program.kv_arena_bytes() != 7_210_118_656
@@ -1064,10 +1064,10 @@ fn verify_owner(program: &ResidentModelProgram) -> Result<(), ResidentModelQuali
         ));
     }
     let addresses = program.qualification_addresses();
-    if addresses.len() != 1_168 || addresses.iter().copied().collect::<BTreeSet<_>>().len() != 1_168
+    if addresses.len() != 1_264 || addresses.iter().copied().collect::<BTreeSet<_>>().len() != 1_264
     {
         return Err(ResidentModelQualificationError::Mismatch(format!(
-            "owner exposes {} addresses, expected 1,168 unique addresses",
+            "owner exposes {} addresses, expected 1,264 unique addresses",
             addresses.len()
         )));
     }

@@ -8688,20 +8688,25 @@ fn gate_fp8_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
         .collect::<Vec<_>>();
     let gdn_input_t1024 = entries
         .iter()
-        .filter(|entry| entry.name == "fp8_gdn_input_mma_t1024")
+        .filter(|entry| entry.name == "fp8_gdn_input_tma_t1024")
         .collect::<Vec<_>>();
     require_count("FP8 GDN input", gdn_input.len(), 8)?;
     require_count("FP8 GDN input T=32/64/128", gdn_input_prefill.len(), 3)?;
     require_count("FP8 GDN input T=1024", gdn_input_t1024.len(), 1)?;
 
-    for entry in gdn_input
-        .iter()
-        .chain(&gdn_input_prefill)
-        .chain(&gdn_input_t1024)
-    {
+    for entry in gdn_input.iter().chain(&gdn_input_prefill) {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in &gdn_input_t1024 {
+        if !entry.body.contains(".reqntid 288, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 288-thread/two-CTA TMA launch bounds",
                 entry.name
             )
             .into());

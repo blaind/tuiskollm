@@ -7,7 +7,7 @@ use crate::fp8_projection_oracle::{
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
 };
-use tuisko_kernels_sm120::GdnInputProjectionOp;
+use tuisko_kernels_sm120::{DenseFp8GdnInputTmaMaps, GdnInputProjectionOp};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -88,6 +88,14 @@ pub fn qualify_fp8_gdn_input() -> Result<Fp8GdnInputQualification, Fp8GdnInputQu
     arena.copy_from_host(&stream, regions.input, &input)?;
     arena.copy_from_host(&stream, regions.weight_codes, &weight_codes)?;
     arena.copy_from_host(&stream, regions.weight_scales, &weight_scales)?;
+    // SAFETY: the arena owns exact stable T=1024 activation and source weight planes.
+    let maps = unsafe {
+        DenseFp8GdnInputTmaMaps::new(
+            &stream,
+            arena.address(regions.activation_codes)?,
+            arena.address(regions.weight_codes)?,
+        )?
+    };
     let stable_addresses = addresses(&arena, regions)?;
     let mut report = Fp8GdnInputQualification {
         activation_codes: 0,
@@ -100,13 +108,15 @@ pub fn qualify_fp8_gdn_input() -> Result<Fp8GdnInputQualification, Fp8GdnInputQu
 
     for rows in EXACT_ROUTES {
         reset_outputs(&arena, &stream, regions)?;
-        launch(&op, &arena, &stream, regions, rows)?;
+        launch(&op, &maps, &arena, &stream, regions, rows)?;
         let eager = read_observed(&arena, &stream, regions)?;
         verify_eager(rows, &token_oracles, &eager, &mut report)?;
 
         reset_outputs(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, rows))?;
+        let graph = CudaGraph::capture(&stream, || {
+            launch(&op, &maps, &arena, &stream, regions, rows)
+        })?;
         // SAFETY: every allocation this graph captured is owned by this scope or
         // its caller and outlives the replays and the synchronize that follows.
         unsafe { graph.launch(&stream) }?;
@@ -201,6 +211,7 @@ fn reset_outputs(
 
 fn launch(
     op: &GdnInputProjectionOp,
+    maps: &DenseFp8GdnInputTmaMaps,
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
@@ -216,16 +227,29 @@ fn launch(
     // SAFETY: the arena regions are aligned, non-overlapping, context-local, and
     // cover the maximum extents admitted by every exact-B route.
     unsafe {
-        op.launch(
-            stream,
-            rows,
-            input,
-            activation_codes,
-            activation_scales,
-            weight_codes,
-            weight_scales,
-            output,
-        )
+        if rows == MAX_ROWS {
+            op.launch_macro_prefill(
+                stream,
+                input,
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+                maps,
+            )
+        } else {
+            op.launch(
+                stream,
+                rows,
+                input,
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                output,
+            )
+        }
     }
 }
 

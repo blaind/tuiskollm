@@ -40,8 +40,9 @@ pub use attention::{
 };
 pub use bf16_lm_head::Qwen35Bf16LmHeadOp;
 pub use fp8::{
-    DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps,
-    FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp, LmHeadOp,
+    DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8GdnInputTmaMaps, DenseFp8SwiGluOp,
+    DenseFp8SwiGluTmaMaps, FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp,
+    LmHeadOp,
 };
 pub use gdn::{
     GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp, Qwen35GdnPrepareOp, Qwen35GdnRecurrenceOp,
