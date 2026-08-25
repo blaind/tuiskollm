@@ -1,4 +1,4 @@
-use super::{
+use super::resident_model_layout::{
     AttentionWeights, DenseFp8MlpWeights, EndpointWeights, GdnPersistent, GdnWeights, MixerWeights,
     MlpWeights, Nvfp4MlpWeights, PersistentState, ResidentModelLayout, SharedWorkspace,
 };

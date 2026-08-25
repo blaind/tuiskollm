@@ -17,6 +17,7 @@ pub use common::mtp::qualification_decide_sampled_tokens;
 pub use common::mtp::{
     ResidentMtpGenerationStats, ResidentMtpGreedyStats, ResidentMtpSampledRound,
 };
+pub use common::progress::{ResidentLoadPhase, ResidentLoadProgress};
 pub use error::{EngineError, EngineErrorCode, EngineResult};
 pub use generation::{
     CancelledText, ChatGenerationRequest, FinishReason, GeneratedText, GenerationSession,
@@ -85,10 +86,9 @@ pub use qwen38::mtp_prompt_prime_layout::MtpPromptPrimeLayout;
 pub use qwen38::nvfp4_mlp::Nvfp4MlpProgram;
 pub use qwen38::nvfp4_mlp_layout::Nvfp4MlpLayout;
 pub use qwen38::resident_model_layout::{
-    ResidentDecodeRoute, ResidentLayerKind, ResidentLoadMode, ResidentLoadPhase,
-    ResidentLoadProgress, ResidentLoadStats, ResidentModelLayout, ResidentModelProgram,
-    ResidentMtpSegmentedVerifyRoute, ResidentMtpVerifyRoute, ResidentPrefillRoute,
-    ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
+    ResidentDecodeRoute, ResidentLayerKind, ResidentLoadMode, ResidentLoadStats,
+    ResidentModelLayout, ResidentModelProgram, ResidentMtpSegmentedVerifyRoute,
+    ResidentMtpVerifyRoute, ResidentPrefillRoute,
 };
 pub use qwen38::resident_mtp::{
     ResidentMtpDraftRoute, ResidentMtpLoadStats, ResidentMtpProgram, ResidentMtpPromptRoute,
@@ -99,6 +99,9 @@ pub use qwen38::resident_mtp_batch_generation::{
 };
 pub use qwen38::resident_mtp_generation::{ResidentMtpGenerationSession, ResidentMtpTextGenerator};
 pub use qwen38::resident_mtp_layout::ResidentMtpLayout;
+pub use qwen38::upload_plan::{
+    ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
+};
 pub use resident_generation::{
     Qwen35ResidentGenerationSession, Qwen35ResidentTextGenerator, Qwen36ResidentGenerationSession,
     Qwen36ResidentTextGenerator, ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents,

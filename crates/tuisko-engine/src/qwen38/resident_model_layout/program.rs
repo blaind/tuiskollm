@@ -2,14 +2,17 @@
 
 use super::{
     AttentionWeights, EndpointWeights, GdnPersistent, GdnWeights, MixerWeights, MlpWeights,
-    ResidentLoadProgress, ResidentModelLayout, ResidentUploadArena, ResidentUploadPlan,
-    ResidentUploadPreparation,
+    ResidentModelLayout,
 };
 #[cfg(feature = "qualification")]
 use crate::PagedKvSlotState;
 use crate::common::math::{bf16_to_f32, product};
+use crate::common::progress::ResidentLoadProgress;
 use crate::qwen38::long_context_kv_layout::LayerKvRegions;
 use crate::qwen38::resident_mtp::ResidentMtpArenaReservation;
+use crate::qwen38::upload_plan::{
+    ResidentUploadArena, ResidentUploadPlan, ResidentUploadPreparation,
+};
 use crate::{
     EngineError, EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, PagedKvSlotPool,
     PagedKvTableUpdate,
