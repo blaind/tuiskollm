@@ -17,6 +17,8 @@ const ROTARY_PAIRS: usize = ROTARY_DIM / 2;
 const ROPE_THETA: f64 = 10_000_000.0;
 const LOGIT_BANK_ROWS: usize = 2 * MAX_BATCH;
 const MAX_NATIVE_PREFILL_TOKENS: usize = 1024;
+const QWEN35_NATIVE_PREFILL_ROUTES: [usize; 3] = [32, 64, 128];
+const QWEN35_MAX_NATIVE_PREFILL_TOKENS: usize = 128;
 const QWEN36_NATIVE_PREFILL_ROUTES: [usize; 3] = [32, 64, 128];
 const QWEN36_MAX_NATIVE_PREFILL_TOKENS: usize = 128;
 
@@ -135,6 +137,7 @@ pub struct Qwen35ResidentGenerationSession<'a> {
     logits: &'a mut [u16],
     pending_token: Option<u32>,
     next_position: u32,
+    native_prefill_tokens: usize,
 }
 
 /// One Qwen3.6 streaming request borrowing the single resident slot.
@@ -340,9 +343,7 @@ impl Qwen35ResidentTextGenerator {
         })
     }
 
-    /// Renders one request and serially evaluates its prompt through the B=1 graph.
-    ///
-    /// This is the initial short-context correctness route, not an optimized prefill route.
+    /// Renders one request and primes its largest qualified native prompt prefix.
     pub fn start<'a>(
         &'a mut self,
         request: &ChatGenerationRequest,
@@ -359,19 +360,12 @@ impl Qwen35ResidentTextGenerator {
             request.max_new_tokens,
             program.context_capacity(),
         )?;
+        let mut native_prefill_tokens = 0;
 
         if control.finish_reason().is_none() {
             program.reset_state(stream)?;
-            for (position, &token) in control.prompt_token_ids().iter().enumerate() {
-                replay_qwen35_token(
-                    program,
-                    stream,
-                    token,
-                    u32::try_from(position).map_err(|_| {
-                        EngineError::generation("prompt position exceeds the exact route width")
-                    })?,
-                )?;
-            }
+            native_prefill_tokens =
+                prime_qwen35_prompt(program, stream, control.prompt_token_ids())?;
             program.read_logits_into(stream, 1, logits)?;
         }
         let next_position = u32::try_from(control.prompt_token_ids().len())
@@ -384,6 +378,7 @@ impl Qwen35ResidentTextGenerator {
             logits,
             pending_token: None,
             next_position,
+            native_prefill_tokens,
         })
     }
 
@@ -420,15 +415,27 @@ impl Qwen35ResidentTextGenerator {
     #[cfg(feature = "qualification")]
     /// Runs raw token IDs through the production path and returns the next greedy token.
     pub fn qualification_greedy_after_tokens(&mut self, token_ids: &[u32]) -> EngineResult<u32> {
+        self.qualification_greedy_after_tokens_with_route(token_ids)
+            .map(|(token, _)| token)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Runs raw tokens and reports how many used one native from-empty prompt graph.
+    pub fn qualification_greedy_after_tokens_with_route(
+        &mut self,
+        token_ids: &[u32],
+    ) -> EngineResult<(u32, usize)> {
         require_generation_capacity(token_ids.len(), 1, self.program.context_capacity())?;
         self.program.reset_state(&self.stream)?;
-        for (position, &token) in token_ids.iter().enumerate() {
-            replay_qwen35_token(&mut self.program, &self.stream, token, position as u32)?;
-        }
+        let native_prefill_tokens =
+            prime_qwen35_prompt(&mut self.program, &self.stream, token_ids)?;
         self.program
             .read_logits_into(&self.stream, 1, &mut self.logits)?;
         let mut sampler = Sampler::new(SamplingOptions::greedy(), self.frontend.stop_ids())?;
-        Ok(sampler.sample(&self.logits)?.token_id)
+        Ok((
+            sampler.sample(&self.logits)?.token_id,
+            native_prefill_tokens,
+        ))
     }
 
     #[cfg(feature = "qualification")]
@@ -1091,6 +1098,11 @@ impl Qwen35ResidentGenerationSession<'_> {
         self.control.prompt_metrics()
     }
 
+    /// Prompt tokens processed by one exact from-empty whole-model prefill graph.
+    pub const fn native_prefill_tokens(&self) -> usize {
+        self.native_prefill_tokens
+    }
+
     /// Current terminal state.
     pub const fn finish_reason(&self) -> Option<FinishReason> {
         self.control.finish_reason()
@@ -1326,6 +1338,63 @@ fn replay_qwen35_token(
     program.replay(stream, 1)
 }
 
+fn prime_qwen35_prompt(
+    program: &mut Qwen35ResidentModelProgram,
+    stream: &CudaStream,
+    token_ids: &[u32],
+) -> EngineResult<usize> {
+    let native_tokens = qwen35_native_prefill_tokens(token_ids.len()).unwrap_or(0);
+    if native_tokens != 0 {
+        let rotary_values = native_tokens
+            .checked_mul(ROTARY_PAIRS)
+            .ok_or_else(|| EngineError::generation("Qwen3.5 prompt rotary values overflow"))?;
+        let mut rope_cos = [0.0f32; QWEN35_MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+        let mut rope_sin = [0.0f32; QWEN35_MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+        for position in 0..native_tokens {
+            let position_u32 = u32::try_from(position).map_err(|_| {
+                EngineError::generation("prompt position exceeds the exact route width")
+            })?;
+            let (cosine, sine) = text_rope(position_u32);
+            let begin = position * ROTARY_PAIRS;
+            rope_cos[begin..begin + ROTARY_PAIRS].copy_from_slice(&cosine);
+            rope_sin[begin..begin + ROTARY_PAIRS].copy_from_slice(&sine);
+        }
+        program.stage_prefill_embeddings(stream, &token_ids[..native_tokens])?;
+        let route = program.load_prefill_state(
+            stream,
+            native_tokens,
+            &rope_cos[..rotary_values],
+            &rope_sin[..rotary_values],
+        )?;
+        program.replay_prefill(stream, route)?;
+    }
+
+    for (offset, &token) in token_ids[native_tokens..].iter().enumerate() {
+        let position = native_tokens + offset;
+        replay_qwen35_token(
+            program,
+            stream,
+            token,
+            u32::try_from(position).map_err(|_| {
+                EngineError::generation("prompt position exceeds the exact route width")
+            })?,
+        )?;
+    }
+
+    Ok(native_tokens)
+}
+
+const fn qwen35_native_prefill_tokens(prompt_tokens: usize) -> Option<usize> {
+    let mut index = QWEN35_NATIVE_PREFILL_ROUTES.len();
+    while index != 0 {
+        index -= 1;
+        if QWEN35_NATIVE_PREFILL_ROUTES[index] <= prompt_tokens {
+            return Some(QWEN35_NATIVE_PREFILL_ROUTES[index]);
+        }
+    }
+    None
+}
+
 fn replay_qwen36_token(
     program: &mut Qwen36ResidentModelProgram,
     stream: &CudaStream,
@@ -1431,8 +1500,9 @@ fn require_generation_capacity(
 #[cfg(test)]
 mod tests {
     use super::{
-        QWEN36_NATIVE_PREFILL_ROUTES, ROTARY_PAIRS, next_native_prefill_tile,
-        qwen36_native_prefill_tokens, require_generation_capacity, text_rope,
+        QWEN35_NATIVE_PREFILL_ROUTES, QWEN36_NATIVE_PREFILL_ROUTES, ROTARY_PAIRS,
+        next_native_prefill_tile, qwen35_native_prefill_tokens, qwen36_native_prefill_tokens,
+        require_generation_capacity, text_rope,
     };
     use crate::EngineErrorCode;
 
@@ -1516,6 +1586,28 @@ mod tests {
             (usize::MAX, Some(128)),
         ] {
             assert_eq!(qwen36_native_prefill_tokens(prompt), expected);
+        }
+    }
+
+    #[test]
+    fn qwen35_native_prefill_uses_the_largest_exact_prefix() {
+        assert_eq!(QWEN35_NATIVE_PREFILL_ROUTES, [32, 64, 128]);
+        for (prompt, expected) in [
+            (0, None),
+            (1, None),
+            (31, None),
+            (32, Some(32)),
+            (33, Some(32)),
+            (63, Some(32)),
+            (64, Some(64)),
+            (65, Some(64)),
+            (127, Some(64)),
+            (128, Some(128)),
+            (129, Some(128)),
+            (192, Some(128)),
+            (usize::MAX, Some(128)),
+        ] {
+            assert_eq!(qwen35_native_prefill_tokens(prompt), expected);
         }
     }
 }
