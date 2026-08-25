@@ -8,6 +8,15 @@ use crate::{
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, DeviceArena, GpuError};
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Qwen35AttentionKvBinding {
+    pub(crate) block_tables: u64,
+    pub(crate) key_pages: u64,
+    pub(crate) value_pages: u64,
+    pub(crate) table_stride: usize,
+    pub(crate) context_capacity: usize,
+}
+
 /// Fixed shared BF16 KV allocation and its allocation-free page lifecycle.
 pub struct Qwen35LongContextKvProgram {
     arena: DeviceArena,
@@ -91,15 +100,21 @@ impl Qwen35LongContextKvProgram {
 
     /// Clears all page ownership and represented cache values.
     pub fn reset(&mut self, stream: &CudaStream) -> EngineResult<()> {
+        self.reset_ownership(stream)?;
+        for layer in self.layout.layers() {
+            self.arena.fill(stream, layer.key, 0)?;
+            self.arena.fill(stream, layer.value, 0)?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn reset_ownership(&mut self, stream: &CudaStream) -> EngineResult<()> {
         for slot in 0..MAX_BATCH {
             self.slots.recycle(slot)?;
         }
         self.arena
             .fill(stream, self.layout.block_tables(), u8::MAX)?;
-        for layer in self.layout.layers() {
-            self.arena.fill(stream, layer.key, 0)?;
-            self.arena.fill(stream, layer.value, 0)?;
-        }
 
         Ok(())
     }
@@ -152,6 +167,25 @@ impl Qwen35LongContextKvProgram {
     /// Checked page-pool layout.
     pub const fn layout(&self) -> &Qwen35LongContextKvLayout {
         &self.layout
+    }
+
+    pub(crate) fn layer_binding(
+        &self,
+        attention_layer: usize,
+    ) -> EngineResult<Qwen35AttentionKvBinding> {
+        let regions = self.layout.layers().get(attention_layer).ok_or_else(|| {
+            EngineError::layout(format!(
+                "Qwen3.5 attention layer {attention_layer} is outside the shared KV inventory"
+            ))
+        })?;
+
+        Ok(Qwen35AttentionKvBinding {
+            block_tables: self.arena.address(self.layout.block_tables())?.addr() as u64,
+            key_pages: self.arena.address(regions.key)?.addr() as u64,
+            value_pages: self.arena.address(regions.value)?.addr() as u64,
+            table_stride: self.layout.block_table_stride(),
+            context_capacity: QWEN35_MAX_CONTEXT_TOKENS,
+        })
     }
 
     #[cfg(feature = "qualification")]

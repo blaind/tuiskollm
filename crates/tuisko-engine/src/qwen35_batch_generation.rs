@@ -76,7 +76,7 @@ impl Qwen35ResidentBatchGenerator {
         request: &ChatGenerationRequest,
     ) -> EngineResult<ResidentBatchAdmission> {
         let control = GenerationSession::start(&self.frontend, request)?;
-        require_generation_capacity(
+        let required_positions = require_generation_capacity(
             control.prompt_token_ids().len(),
             request.max_new_tokens,
             self.program.context_capacity(),
@@ -103,6 +103,14 @@ impl Qwen35ResidentBatchGenerator {
         let slot = first_free_slot(occupied)
             .ok_or_else(|| EngineError::route("all eight Qwen3.5 generation slots are active"))?;
         self.program.reset_slot(&self.stream, slot)?;
+        self.program.activate_kv_slot(slot)?;
+        if let Err(error) =
+            self.program
+                .reserve_kv_slot_tokens(&self.stream, slot, required_positions)
+        {
+            self.program.recycle_kv_slot(&self.stream, slot)?;
+            return Err(error);
+        }
         let native_prefill_tokens = prime_qwen35_prompt(
             &mut self.program,
             &self.stream,
@@ -166,6 +174,7 @@ impl Qwen35ResidentBatchGenerator {
                 let session = self.sessions[slot]
                     .take()
                     .expect("terminal Qwen3.5 session exists");
+                self.program.recycle_kv_slot(&self.stream, slot)?;
                 Some(session.control.into_output()?)
             } else {
                 survivors[surviving] = slot;
@@ -203,6 +212,7 @@ impl Qwen35ResidentBatchGenerator {
         }
         self.active -= 1;
         self.active_slots[self.active] = usize::MAX;
+        self.program.recycle_kv_slot(&self.stream, slot)?;
 
         Ok(ResidentCancellation {
             request_id,
@@ -241,7 +251,7 @@ impl Qwen35ResidentBatchGenerator {
         self.program.host_stager_bytes() + self.logits.num_bytes()
     }
 
-    /// Fixed short-context capacity of each physical slot.
+    /// Maximum context admitted by the pinned Qwen3.5 config.
     pub const fn context_capacity(&self) -> usize {
         self.program.context_capacity()
     }

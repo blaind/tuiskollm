@@ -53,6 +53,12 @@ impl Session {
         let mut program = Qwen35ResidentModelProgram::from_snapshot(&context, snapshot)?;
         program.stage_embeddings(&stream, &benchmark_token_ids())?;
         program.reset_state(&stream)?;
+        let slots = (0..MAX_BATCH).collect::<Vec<_>>();
+        for &slot in &slots {
+            program.activate_kv_slot(slot)?;
+            program.reserve_kv_slot_tokens(&stream, slot, CONTEXT_TOKENS)?;
+        }
+        program.load_slot_routes(&stream, &slots)?;
         let (rope_cos, rope_sin) = benchmark_rope();
         program.load_decode_state(
             &stream,

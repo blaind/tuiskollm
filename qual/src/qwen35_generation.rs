@@ -526,9 +526,9 @@ fn verify_prompt_fixtures(
 fn verify_owner(
     generator: &Qwen35ResidentTextGenerator,
 ) -> Result<(), Qwen35GenerationQualificationError> {
-    if generator.arena_bytes() != 7_039_870_976
+    if generator.arena_bytes() != 15_629_936_640
         || generator.host_stager_bytes() != 1_610_752
-        || generator.context_capacity() != 192
+        || generator.context_capacity() != 262_144
     {
         return Err(Qwen35GenerationQualificationError::Mismatch(
             "Qwen3.5 generation owner bytes or capacity changed".into(),
@@ -538,7 +538,7 @@ fn verify_owner(
     let mut unique = addresses.clone();
     unique.sort_unstable();
     unique.dedup();
-    if addresses.len() != 34 || unique.len() != addresses.len() || addresses.contains(&0) {
+    if addresses.len() != 35 || unique.len() != addresses.len() || addresses.contains(&0) {
         return Err(Qwen35GenerationQualificationError::Mismatch(
             "Qwen3.5 generation owner addresses are invalid".into(),
         ));
@@ -549,9 +549,9 @@ fn verify_owner(
 fn verify_compact_owner(
     generator: &Qwen35ResidentBatchGenerator,
 ) -> Result<(), Qwen35GenerationQualificationError> {
-    if generator.arena_bytes() != 7_039_870_976
+    if generator.arena_bytes() != 15_629_936_640
         || generator.host_stager_bytes() != 9_060_352
-        || generator.context_capacity() != 192
+        || generator.context_capacity() != 262_144
     {
         return Err(Qwen35GenerationQualificationError::Mismatch(
             "Qwen3.5 compact owner bytes or capacity changed".into(),
@@ -561,7 +561,7 @@ fn verify_compact_owner(
     let mut unique = addresses.clone();
     unique.sort_unstable();
     unique.dedup();
-    if addresses.len() != 34 || unique.len() != addresses.len() || addresses.contains(&0) {
+    if addresses.len() != 35 || unique.len() != addresses.len() || addresses.contains(&0) {
         return Err(Qwen35GenerationQualificationError::Mismatch(
             "Qwen3.5 compact owner addresses are invalid".into(),
         ));
@@ -587,9 +587,9 @@ mod tests {
         assert_eq!(report.prompt_cases, 2);
         assert!((1..=2).contains(&report.chat_steps));
         assert_eq!(report.native_prefill_tokens, [0, 32, 32, 64, 64, 128, 128]);
-        assert_eq!(report.arena_bytes, 7_039_870_976);
+        assert_eq!(report.arena_bytes, 15_629_936_640);
         assert_eq!(report.host_stager_bytes, 1_610_752);
-        assert_eq!(report.stable_addresses, 34);
+        assert_eq!(report.stable_addresses, 35);
         eprintln!("Qwen3.5 generation qualification passed: {report:?}");
         Ok(())
     }
@@ -609,9 +609,9 @@ mod tests {
         assert_eq!(report.recycled_slot, 1);
         assert_eq!(report.concurrent_prefill_tokens, 32);
         assert_eq!(report.cancellations, 1);
-        assert_eq!(report.arena_bytes, 7_039_870_976);
+        assert_eq!(report.arena_bytes, 15_629_936_640);
         assert_eq!(report.host_stager_bytes, 9_060_352);
-        assert_eq!(report.stable_addresses, 34);
+        assert_eq!(report.stable_addresses, 35);
         eprintln!("Qwen3.5 compact generation qualification passed: {report:?}");
         Ok(())
     }
