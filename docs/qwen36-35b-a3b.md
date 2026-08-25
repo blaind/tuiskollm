@@ -239,7 +239,9 @@ retained device/host addresses remain stable, and device memory does not grow af
 frontend-to-device state-transition evidence, not an external same-model logit-parity claim. The
 generation route selects the largest qualified from-empty `T=32/64/128` prefix and evaluates the
 remaining prompt tail through exact B=1 decode. The active server slot now admits the checkpoint's
-262,144-position limit through the shared page owner.
+262,144-position limit through the shared page owner. Every GDN and attention layer also admits a
+bijective compact-row-to-physical-slot map and isolated per-slot reset; the server scheduler still
+exposes one slot until the compact generation owner is qualified.
 The server now selects this concrete target from the pinned revision directory and publishes
 `nvidia/Qwen3.6-35B-A3B-NVFP4` through the OpenAI health, models, blocking chat, and SSE routes. A
 real localhost thinking-mode `Hello` request emits the two-token reasoning text `Here's`; blocking

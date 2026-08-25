@@ -212,6 +212,20 @@ impl ResidentLayer {
         }
     }
 
+    fn reset_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        match self {
+            Self::GdnMoe(program) => program.reset_slot(stream, slot),
+            Self::FullAttentionMoe(_) => Ok(()),
+        }
+    }
+
+    fn load_slot_routes(&self, stream: &CudaStream, slots: &[usize]) -> EngineResult<()> {
+        match self {
+            Self::GdnMoe(program) => program.load_slot_routes(stream, slots),
+            Self::FullAttentionMoe(program) => program.load_slot_routes(stream, slots),
+        }
+    }
+
     fn load_decode_state(
         &self,
         stream: &CudaStream,
@@ -238,7 +252,7 @@ impl ResidentLayer {
         rope_sin: &[f32],
     ) -> EngineResult<()> {
         match self {
-            Self::GdnMoe(_) => Ok(()),
+            Self::GdnMoe(program) => program.load_prefill_slot(stream, slot),
             Self::FullAttentionMoe(program) => program.load_prefill_slot_state_at(
                 stream,
                 tokens,
@@ -415,6 +429,16 @@ impl Qwen36ResidentModelProgram {
         Ok(())
     }
 
+    /// Maps compact decode rows to distinct physical persistent slots.
+    pub fn load_slot_routes(&self, stream: &CudaStream, slots: &[usize]) -> EngineResult<()> {
+        slot_rows(slots)?;
+        for layer in &self.layers {
+            layer.load_slot_routes(stream, slots)?;
+        }
+
+        Ok(())
+    }
+
     /// Updates every attention layer for one contiguous from-empty prompt tile.
     pub fn load_prefill_state(
         &self,
@@ -453,6 +477,17 @@ impl Qwen36ResidentModelProgram {
             layer.reset(stream)?;
         }
         self.long_context_kv.reset_ownership(stream)?;
+
+        Ok(())
+    }
+
+    /// Clears one GDN slot and releases its shared attention pages.
+    pub fn reset_slot(&mut self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        require_slot(slot)?;
+        for layer in &self.layers {
+            layer.reset_slot(stream, slot)?;
+        }
+        self.long_context_kv.recycle_slot(stream, slot)?;
 
         Ok(())
     }
@@ -859,6 +894,31 @@ fn require_batch(batch: usize) -> EngineResult<()> {
     Ok(())
 }
 
+fn slot_rows(slots: &[usize]) -> EngineResult<[u32; MAX_BATCH]> {
+    require_batch(slots.len())?;
+    let mut seen = [false; MAX_BATCH];
+    let mut rows = [0u32; MAX_BATCH];
+    for (row, &slot) in rows.iter_mut().zip(slots) {
+        require_slot(slot)?;
+        if std::mem::replace(&mut seen[slot], true) {
+            return Err(EngineError::route(format!(
+                "Qwen3.6 physical slot {slot} appears more than once"
+            )));
+        }
+        *row = slot as u32;
+    }
+    Ok(rows)
+}
+
+fn require_slot(slot: usize) -> EngineResult<()> {
+    if slot >= MAX_BATCH {
+        return Err(EngineError::route(format!(
+            "Qwen3.6 physical slot {slot} is outside 0..{MAX_BATCH}"
+        )));
+    }
+    Ok(())
+}
+
 const fn prefill_index(tokens: usize) -> Option<usize> {
     match tokens {
         32 => Some(0),
@@ -897,7 +957,8 @@ fn sum_products(name: &str, terms: &[(usize, usize)]) -> EngineResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Qwen36ResidentLayerKind, Qwen36ResidentModelLayout, prefill_index, require_prefill,
+        MAX_BATCH, Qwen36ResidentLayerKind, Qwen36ResidentModelLayout, prefill_index,
+        require_prefill, slot_rows,
     };
     use crate::EngineErrorCode;
 
@@ -950,6 +1011,14 @@ mod tests {
                 require_prefill(tokens).unwrap_err().code(),
                 Some(EngineErrorCode::Route)
             );
+        }
+    }
+
+    #[test]
+    fn compact_slot_table_rejects_aliases_and_boundaries() {
+        assert_eq!(slot_rows(&[7, 1, 4]).unwrap()[..3], [7, 1, 4]);
+        for slots in [&[][..], &[2, 2], &[MAX_BATCH], &[0, 1, 2, 3, 4, 5, 6, 7, 0]] {
+            assert!(slot_rows(slots).is_err(), "slots={slots:?}");
         }
     }
 }
