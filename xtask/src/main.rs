@@ -74,6 +74,8 @@ const QWEN36_FP8_ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
 const PAGED_GQA_RESOURCE_BASELINE: &str = "qual/baselines/paged-gqa-sm120.txt";
 const QWEN35_PAGED_GQA_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-paged-gqa-sm120.txt";
 const QWEN36_PAGED_GQA_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-paged-gqa-sm120.txt";
+const QWEN36_FP8_PAGED_GQA_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen36-fp8-paged-gqa-sm120.txt";
 const LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE: &str =
     "qual/baselines/long-context-paged-gqa-sm120.txt";
 const ATTENTION_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/attention-output-sm120.txt";
@@ -140,6 +142,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     PAGED_GQA_RESOURCE_BASELINE,
     QWEN35_PAGED_GQA_RESOURCE_BASELINE,
     QWEN36_PAGED_GQA_RESOURCE_BASELINE,
+    QWEN36_FP8_PAGED_GQA_RESOURCE_BASELINE,
     LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE,
     ATTENTION_OUTPUT_RESOURCE_BASELINE,
     MTP_BF16_FUSION_RESOURCE_BASELINE,
@@ -935,6 +938,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-paged-gqa") => bench_paged_gqa(root, &remaining),
         Some("bench-qwen35-paged-gqa") => bench_qwen35_paged_gqa(root, &remaining),
         Some("bench-qwen36-paged-gqa") => bench_qwen36_paged_gqa(root, &remaining),
+        Some("bench-qwen36-fp8-paged-gqa") => bench_qwen36_fp8_paged_gqa(root, &remaining),
         Some("bench-long-context-paged-gqa") => bench_long_context_paged_gqa(root, &remaining),
         Some("bench-attention-output") => bench_attention_output(root, &remaining),
         Some("bench-mtp-bf16-fusion") => bench_mtp_bf16_fusion(root, &remaining),
@@ -1033,6 +1037,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("gate-paged-gqa") if remaining.is_empty() => gate_paged_gqa(root),
         Some("gate-qwen35-paged-gqa") if remaining.is_empty() => gate_qwen35_paged_gqa(root),
         Some("gate-qwen36-paged-gqa") if remaining.is_empty() => gate_qwen36_paged_gqa(root),
+        Some("gate-qwen36-fp8-paged-gqa") if remaining.is_empty() => {
+            gate_qwen36_fp8_paged_gqa(root)
+        }
         Some("gate-qwen36-attention-output") if remaining.is_empty() => {
             gate_qwen36_attention_output(root)
         }
@@ -1137,6 +1144,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "gate-paged-gqa"
                     | "gate-qwen35-paged-gqa"
                     | "gate-qwen36-paged-gqa"
+                    | "gate-qwen36-fp8-paged-gqa"
                     | "gate-long-context-paged-gqa"
                     | "gate-mtp-bf16-fusion"
                     | "gate-mtp-bf16-attention-output"
@@ -1354,6 +1362,7 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_paged_gqa(root)?;
     gate_qwen35_paged_gqa(root)?;
     gate_qwen36_paged_gqa(root)?;
+    gate_qwen36_fp8_paged_gqa(root)?;
     gate_long_context_paged_gqa(root)?;
     gate_attention_output(root)?;
     gate_mtp_bf16_fusion(root)?;
@@ -5026,6 +5035,34 @@ fn bench_qwen36_paged_gqa(
             .env(
                 "TUISKO_GENERATOR_BASELINE_SHA256",
                 sha256(&fs::read(root.join(QWEN36_PAGED_GQA_RESOURCE_BASELINE))?),
+            ),
+    )
+}
+
+fn bench_qwen36_fp8_paged_gqa(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen36-fp8-paged-gqa")
+            .args(arguments)
+            .env(
+                "TUISKO_GENERATOR_BASELINE_SHA256",
+                sha256(&fs::read(
+                    root.join(QWEN36_FP8_PAGED_GQA_RESOURCE_BASELINE),
+                )?),
             ),
     )
 }
@@ -10049,34 +10086,50 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn gate_qwen35_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
-    gate_bf16_paged_gqa_target(
+    gate_paged_gqa_target(
         root,
         QWEN35_PAGED_GQA_RESOURCE_BASELINE,
         "qwen35_paged_gqa_exact_TID_",
         Some(("qwen35_paged_gqa_prefill_shared_exact_TID_", 3, 128)),
         "Qwen3.5",
         "qwen35-bf16-paged-gqa-gate.cubin",
+        false,
     )
 }
 
 fn gate_qwen36_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
-    gate_bf16_paged_gqa_target(
+    gate_paged_gqa_target(
         root,
         QWEN36_PAGED_GQA_RESOURCE_BASELINE,
         "qwen36_paged_gqa_exact_TID_",
         Some(("qwen36_paged_gqa_prefill_shared_exact_TID_", 3, 256)),
         "Qwen3.6",
         "qwen36-bf16-paged-gqa-gate.cubin",
+        false,
     )
 }
 
-fn gate_bf16_paged_gqa_target(
+fn gate_qwen36_fp8_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
+    gate_paged_gqa_target(
+        root,
+        QWEN36_FP8_PAGED_GQA_RESOURCE_BASELINE,
+        "qwen36_fp8_paged_gqa_exact_TID_",
+        Some(("qwen36_fp8_paged_gqa_prefill_shared_exact_TID_", 3, 256)),
+        "Qwen3.6",
+        "qwen36-fp8-paged-gqa-gate.cubin",
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gate_paged_gqa_target(
     root: &Path,
     baseline_path: &str,
     entry_prefix: &str,
     prefill_inventory: Option<(&str, usize, u32)>,
     target: &str,
     cubin_name: &str,
+    e4m3_cache: bool,
 ) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(root.join(baseline_path))?)?;
     verify_generator_stamp(root, &baseline)?;
@@ -10093,10 +10146,11 @@ fn gate_bf16_paged_gqa_target(
             .filter(|entry| entry.name.starts_with(prefix))
             .collect::<Vec<_>>()
     });
-    require_count(&format!("{target} BF16 paged GQA"), attention.len(), 8)?;
+    let cache = if e4m3_cache { "FP8" } else { "BF16" };
+    require_count(&format!("{target} {cache} paged GQA"), attention.len(), 8)?;
     if let Some((_, expected, _)) = prefill_inventory {
         require_count(
-            &format!("{target} BF16 paged GQA prefill"),
+            &format!("{target} {cache} paged GQA prefill"),
             prefill.len(),
             expected,
         )?;
@@ -10150,18 +10204,23 @@ fn gate_bf16_paged_gqa_target(
     let mut shared = Vec::new();
     let mut prefill_registers = Vec::new();
     let mut prefill_shared = Vec::new();
+    let decode_instructions = if e4m3_cache {
+        &["F2FP.F16.E4M3.UNPACK_B", "SHFL.BFLY", "MUFU.EX2"][..]
+    } else {
+        &["LDG.E.U16", "SHFL.BFLY", "MUFU.EX2"][..]
+    };
+    let prefill_instructions = if e4m3_cache {
+        &["F2FP.F16.E4M3.UNPACK_B", "LDGSTS", "SHFL.BFLY", "MUFU.EX2"][..]
+    } else {
+        &["LDGSTS", "SHFL.BFLY", "MUFU.EX2"][..]
+    };
     for (entries, registers, shared, instructions) in [
-        (
-            &attention,
-            &mut registers,
-            &mut shared,
-            &["LDG.E.U16", "SHFL.BFLY", "MUFU.EX2"][..],
-        ),
+        (&attention, &mut registers, &mut shared, decode_instructions),
         (
             &prefill,
             &mut prefill_registers,
             &mut prefill_shared,
-            &["LDGSTS", "SHFL.BFLY", "MUFU.EX2"][..],
+            prefill_instructions,
         ),
     ] {
         for entry in entries {
@@ -10183,7 +10242,7 @@ fn gate_bf16_paged_gqa_target(
                     .into());
                 }
             }
-            if body.contains("F2FP.F16.E4M3.UNPACK_B") {
+            if !e4m3_cache && body.contains("F2FP.F16.E4M3.UNPACK_B") {
                 return Err(format!(
                     "entry `{}` unexpectedly decodes {target} cache as E4M3",
                     entry.name,
@@ -10204,12 +10263,13 @@ fn gate_bf16_paged_gqa_target(
     }
 
     println!(
-        "{target} BF16 paged GQA gate passed: 8 decode + {} prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}, U16/LDGSTS/SHFL/EX2 present and E4M3 absent",
+        "{target} {cache} paged GQA gate passed: 8 decode + {} prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}, {}/LDGSTS/SHFL/EX2 present",
         prefill.len(),
         registers,
         prefill_registers,
         shared,
         prefill_shared,
+        if e4m3_cache { "E4M3" } else { "U16" },
     );
     Ok(())
 }
@@ -14508,6 +14568,7 @@ mod tests {
                 "qual/baselines/paged-gqa-sm120.txt",
                 "qual/baselines/qwen35-paged-gqa-sm120.txt",
                 "qual/baselines/qwen36-paged-gqa-sm120.txt",
+                "qual/baselines/qwen36-fp8-paged-gqa-sm120.txt",
                 "qual/baselines/long-context-paged-gqa-sm120.txt",
                 "qual/baselines/attention-output-sm120.txt",
                 "qual/baselines/mtp-bf16-fusion-sm120.txt",
