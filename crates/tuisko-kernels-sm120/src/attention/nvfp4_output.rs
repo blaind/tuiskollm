@@ -700,6 +700,9 @@ pub struct Qwen35Nvfp4GdnOutputOp {
     b6: PreparedProjectionRoute<6>,
     b7: PreparedProjectionRoute<7>,
     b8: PreparedProjectionRoute<8>,
+    t32: PreparedPrefillProjection<32>,
+    t64: PreparedPrefillProjection<64>,
+    t128: PreparedPrefillProjection<128>,
 }
 
 impl Qwen35Nvfp4GdnOutputOp {
@@ -719,6 +722,9 @@ impl Qwen35Nvfp4GdnOutputOp {
             b6: PreparedProjectionRoute::prepare(&module)?,
             b7: PreparedProjectionRoute::prepare(&module)?,
             b8: PreparedProjectionRoute::prepare(&module)?,
+            t32: PreparedPrefillProjection::prepare(&module)?,
+            t64: PreparedPrefillProjection::prepare(&module)?,
+            t128: PreparedPrefillProjection::prepare(&module)?,
             module,
         })
     }
@@ -780,6 +786,69 @@ impl Qwen35Nvfp4GdnOutputOp {
             7 => launch!(b7),
             8 => launch!(b8),
             _ => unreachable!(),
+        }
+    }
+
+    /// Quantizes and projects exact `T=32,64,128` recurrent-output rows.
+    ///
+    /// # Safety
+    ///
+    /// `input` and `output` cover `tokens * 4_096` BF16 values. Activation
+    /// scratch covers packed E2M1 `[tokens, 4_096]` and E4M3
+    /// `[tokens, 256]`. Weight planes satisfy [`Self::launch`]. Four-byte-loaded
+    /// planes are aligned, divisors are finite and positive, and disjoint
+    /// allocations remain live in `stream`'s context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_prefill(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 NVFP4 GDN-output input scale divisor must be finite and positive",
+            ));
+        }
+        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 NVFP4 GDN-output weight scale divisor must be finite and positive",
+            ));
+        }
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        input,
+                        activation_codes,
+                        activation_scales,
+                        weight_codes,
+                        weight_scales,
+                        input_scale_divisor,
+                        weight_scale_divisor,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match tokens {
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
+            _ => Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 NVFP4 GDN-output prefill tokens {tokens} must be 32, 64, or 128"
+            ))),
         }
     }
 }

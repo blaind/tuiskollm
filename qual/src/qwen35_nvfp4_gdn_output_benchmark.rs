@@ -7,7 +7,7 @@ use crate::device_benchmark::{
     preflight, require_current_process_exclusive, warmup_launches,
 };
 use crate::qwen35_nvfp4_attention_output::{
-    CODE_BYTES_PER_ROW, COLUMNS, GROUPS_PER_ROW, MAX_BATCH, OUTPUT_ROWS, make_fixture,
+    CODE_BYTES_PER_ROW, COLUMNS, EXACT_ROUTES, GROUPS_PER_ROW, MAX_BATCH, OUTPUT_ROWS, make_fixture,
 };
 use crate::qwen35_nvfp4_gdn_output::{Regions, launch, layout, upload_fixture};
 use crate::target::Qwen35Nvfp4GdnOutputOp;
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer};
 
 struct RouteGraphs {
-    batch: usize,
+    rows: usize,
     leaf: CudaGraph,
     repeated: CudaGraph,
 }
@@ -52,8 +52,9 @@ impl Session {
         upload_fixture(&arena, &stream, regions, &fixture)?;
         stream.synchronize().map_err(GpuError::from)?;
         let op = Qwen35Nvfp4GdnOutputOp::new(&context)?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| capture_route(&op, &arena, &stream, regions, batch, repeated_operations))
+        let routes = EXACT_ROUTES
+            .into_iter()
+            .map(|rows| capture_route(&op, &arena, &stream, regions, rows, repeated_operations))
             .collect::<GpuResult<Vec<_>>>()?;
 
         Ok(Self {
@@ -81,15 +82,22 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_operator_decode(route.rows as u32),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_operator_prefill(route.rows as u64),
+                    )
+                };
                 ExactDeviceCase::new(
                     "qwen35_9b/gdn_output/nvfp4_projection",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_operator_decode(route.batch as u32),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
                     &route.leaf,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 )
@@ -103,29 +111,34 @@ fn capture_route(
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
-    batch: usize,
+    rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, arena, stream, regions, batch)?;
+            launch(op, arena, stream, regions, rows)?;
         }
         Ok(())
     })?;
 
     Ok(RouteGraphs {
-        batch,
+        rows,
         leaf,
         repeated,
     })
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn logical_bytes(rows: usize) -> usize {
     let weights = OUTPUT_ROWS * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW);
     let per_token = (COLUMNS + OUTPUT_ROWS) * size_of::<u16>();
+    let scratch = if rows > MAX_BATCH {
+        2 * rows * (CODE_BYTES_PER_ROW + GROUPS_PER_ROW)
+    } else {
+        0
+    };
 
-    weights + batch * per_token
+    weights + rows * per_token + scratch
 }
 
 /// Measures every exact Qwen3.5 recurrent-output NVFP4 projection.
@@ -149,7 +162,7 @@ pub fn benchmark_qwen35_nvfp4_gdn_output(
         "qwen35_9b/gdn_output/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.arena.byte_len() - weight_bytes - padding_bytes,
-        "max_batch=8 activation and output rows",
+        "max_rows=128 activation, quantization scratch, and output rows",
     )?;
     memory.register_owned(
         "qwen35_9b/gdn_output/alignment_padding",
@@ -192,6 +205,8 @@ mod tests {
 
         assert_eq!(logical_bytes(1), weights + 16_384);
         assert_eq!(logical_bytes(MAX_BATCH), weights + MAX_BATCH * 16_384);
+        assert_eq!(logical_bytes(32), weights + 32 * 20_992);
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
         assert_eq!(
             crate::qwen35_nvfp4_attention_output::WEIGHT_SCALE_DIVISOR,
             16.0
