@@ -29,6 +29,7 @@ pub(crate) struct Qwen36GdnMoeLayerRegions {
     pub(crate) convolved: ArenaRegion<u16>,
     pub(crate) recurrent_norm: ArenaRegion<u16>,
     pub(crate) state: ArenaRegion<f32>,
+    pub(crate) recurrent_plane: ArenaRegion<f32>,
     pub(crate) recurrent_output: ArenaRegion<u16>,
     pub(crate) output_activation_codes: ArenaRegion<u8>,
     pub(crate) output_weight_codes: ArenaRegion<u8>,
@@ -198,6 +199,7 @@ impl Qwen36GdnMoeLayerLayout {
             convolved: builder.reserve(row_qkv, ALIGNMENT)?,
             recurrent_norm: builder.reserve(A::LINEAR_HEAD_DIM, ALIGNMENT)?,
             state: builder.reserve(state, ALIGNMENT)?,
+            recurrent_plane: builder.reserve(row_value, ALIGNMENT)?,
             recurrent_output: builder.reserve(row_value, ALIGNMENT)?,
             output_activation_codes: builder.reserve(row_value, ALIGNMENT)?,
             output_weight_codes: builder.reserve(A::HIDDEN * A::GDN_VALUE_ROWS, ALIGNMENT)?,
@@ -271,6 +273,7 @@ impl Qwen36GdnMoeLayerLayout {
                 regions.beta.byte_len(),
                 regions.convolved.byte_len(),
                 regions.state.byte_len(),
+                regions.recurrent_plane.byte_len(),
                 regions.recurrent_output.byte_len(),
                 regions.output_activation_codes.byte_len(),
                 regions.mixer_branch.byte_len(),
@@ -373,9 +376,9 @@ mod tests {
         assert_eq!(Qwen36Moe35B::GDN_INPUT_ROWS, 12_288);
         assert_eq!(Qwen36Moe35B::NUM_EXPERTS, 256);
         assert_eq!(layout.resident_weight_bytes(), 489_703_808);
-        assert_eq!(layout.workspace_bytes(), 34_459_936);
-        assert_eq!(layout.owner_bytes(), 524_163_744);
-        assert_eq!(layout.arena_bytes(), 524_164_352);
+        assert_eq!(layout.workspace_bytes(), 36_557_088);
+        assert_eq!(layout.owner_bytes(), 526_260_896);
+        assert_eq!(layout.arena_bytes(), 526_261_504);
         assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 608);
         assert_eq!(layout.row_capacity(), 128);
     }
@@ -403,6 +406,7 @@ mod tests {
             span(regions.convolved),
             span(regions.recurrent_norm),
             span(regions.state),
+            span(regions.recurrent_plane),
             span(regions.recurrent_output),
             span(regions.output_activation_codes),
             span(regions.output_weight_codes),

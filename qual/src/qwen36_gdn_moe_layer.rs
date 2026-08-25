@@ -1481,8 +1481,8 @@ mod tests {
 
         assert_eq!(report.boundary_values, 2_662_400);
         assert_eq!(report.weight_bytes, 489_703_808);
-        assert_eq!(report.workspace_bytes, 34_459_936);
-        assert_eq!(report.arena_bytes, 524_164_352);
+        assert_eq!(report.workspace_bytes, 36_557_088);
+        assert_eq!(report.arena_bytes, 526_261_504);
         assert_eq!(report.padding_bytes, 608);
         assert!(report.source_values > 0);
         assert!(report.graph_replay_values > 0);

@@ -82,6 +82,7 @@ pub(crate) struct Regions {
     pub(crate) norm_weight: ArenaRegion<u16>,
     pub(crate) state_rows: ArenaRegion<u32>,
     pub(crate) state: ArenaRegion<f32>,
+    pub(crate) recurrent_plane: ArenaRegion<f32>,
     pub(crate) output: ArenaRegion<u16>,
 }
 
@@ -98,6 +99,7 @@ impl Regions {
             + self.norm_weight.byte_len()
             + self.state_rows.byte_len()
             + self.state.byte_len()
+            + self.recurrent_plane.byte_len()
             + self.output.byte_len()
     }
 }
@@ -217,6 +219,7 @@ pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let norm_weight = layout.reserve(HEAD_DIM, ALIGNMENT)?;
     let state_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
     let state = layout.reserve(MAX_BATCH * STATE_PER_ROW, ALIGNMENT)?;
+    let recurrent_plane = layout.reserve(MAX_ROWS * VALUE_WIDTH, ALIGNMENT)?;
     let output = layout.reserve(MAX_ROWS * VALUE_WIDTH, ALIGNMENT)?;
 
     Ok((
@@ -229,6 +232,7 @@ pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
             norm_weight,
             state_rows,
             state,
+            recurrent_plane,
             output,
         },
     ))
@@ -301,7 +305,7 @@ fn reset_state(
     arena.fill(stream, regions.output, BYTE_SENTINEL)
 }
 
-fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 8]> {
+fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 9]> {
     Ok([
         arena.address(regions.qkv)?.addr(),
         arena.address(regions.projected)?.addr(),
@@ -310,6 +314,7 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 8]> {
         arena.address(regions.norm_weight)?.addr(),
         arena.address(regions.state_rows)?.addr(),
         arena.address(regions.state)?.addr(),
+        arena.address(regions.recurrent_plane)?.addr(),
         arena.address(regions.output)?.addr(),
     ])
 }
@@ -332,6 +337,7 @@ pub(crate) fn launch(
             arena.address(regions.norm_weight)?,
             arena.address(regions.state_rows)?,
             arena.address(regions.state)?,
+            arena.address(regions.recurrent_plane)?,
             arena.address(regions.output)?,
         )
     }
@@ -600,9 +606,9 @@ mod tests {
         let (layout, regions) = layout().unwrap();
 
         assert_eq!(regions.weight_bytes(), 256);
-        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 23_101_472);
-        assert_eq!(regions.payload_bytes(), 23_101_728);
-        assert_eq!(layout.byte_len(), 23_101_952);
+        assert_eq!(regions.payload_bytes() - regions.weight_bytes(), 25_198_624);
+        assert_eq!(regions.payload_bytes(), 25_198_880);
+        assert_eq!(layout.byte_len(), 25_199_104);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 224);
     }
 
@@ -633,9 +639,9 @@ mod tests {
             inactive_state_rows * STATE_PER_ROW + inactive_output_rows * VALUE_WIDTH
         );
         assert_eq!(report.immutable_input_values, 2_629_768);
-        assert_eq!(report.arena_bytes, 23_101_952);
+        assert_eq!(report.arena_bytes, 25_199_104);
         assert_eq!(report.weight_bytes, 256);
-        assert_eq!(report.workspace_bytes, 23_101_472);
+        assert_eq!(report.workspace_bytes, 25_198_624);
         assert_eq!(report.padding_bytes, 224);
         assert!(report.maximum_state_error <= 0.002);
         assert!(report.maximum_output_error <= 0.03125);
@@ -651,7 +657,7 @@ mod tests {
 
         assert_eq!(report.state_values, 22_020_096);
         assert_eq!(report.output_values, 1_101_824);
-        assert_eq!(report.arena_bytes, 23_101_952);
+        assert_eq!(report.arena_bytes, 25_199_104);
         assert_eq!(report.weight_bytes, 256);
         assert!(report.maximum_state_error <= 0.002);
         assert!(report.maximum_output_error <= 0.03125);

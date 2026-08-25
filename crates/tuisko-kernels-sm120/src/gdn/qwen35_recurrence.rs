@@ -14,6 +14,10 @@ const VALUE_WIDTH: usize = VALUE_HEADS * HEAD_DIM;
 const WARPS: usize = 16;
 const THREADS: u32 = (WARPS * 32) as u32;
 const CAUSAL_ROWS: [usize; 3] = [2, 3, 4];
+// Two CTAs advance each value head's state plane; every row's update stays
+// wholly inside one CTA, so the split changes scheduling, never arithmetic.
+const SPLIT_CTAS_PER_HEAD: usize = 2;
+const SPLIT_ROWS: usize = HEAD_DIM / SPLIT_CTAS_PER_HEAD;
 const PREFILL_ROWS: [usize; 3] = [32, 64, 128];
 const RMS_EPSILON: f32 = 1.0e-6;
 const QUERY_SCALE: f32 = 0.088_388_35;
@@ -70,9 +74,44 @@ mod kernels {
         unsafe { *shared }
     }
 
+    /// Reduces two independent values with one barrier pair; each value walks
+    /// exactly the tree `block_sum` walks, so both sums stay bit-identical to
+    /// two separate `block_sum` calls while paying half the synchronization.
+    #[inline(always)]
+    fn block_sum2(a: f32, b: f32, shared: *mut f32, lane: usize, warp_index: usize) -> (f32, f32) {
+        let a = warp::reduce_sum_f32(a);
+        let b = warp::reduce_sum_f32(b);
+        if lane == 0 {
+            unsafe { *shared.add(warp_index) = a };
+            unsafe { *shared.add(WARPS + warp_index) = b };
+        }
+        thread::sync_threads();
+        if warp_index == 0 {
+            let a = if lane < WARPS {
+                unsafe { *shared.add(lane) }
+            } else {
+                0.0
+            };
+            let b = if lane < WARPS {
+                unsafe { *shared.add(WARPS + lane) }
+            } else {
+                0.0
+            };
+            let a = warp::reduce_sum_f32(a);
+            let b = warp::reduce_sum_f32(b);
+            if lane == 0 {
+                unsafe { *shared = a };
+                unsafe { *shared.add(1) = b };
+            }
+        }
+        thread::sync_threads();
+
+        (unsafe { *shared }, unsafe { *shared.add(1) })
+    }
+
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn recurrence_token(
+    unsafe fn recurrence_token<const PREFILL: bool>(
         qkv: *const u16,
         projected: *const u16,
         log_decay: *const f32,
@@ -87,6 +126,8 @@ mod kernels {
         key: *mut f32,
         recurrent_output: *mut f32,
         reduction: *mut f32,
+        value: *mut f32,
+        row_offset: usize,
     ) {
         let key_head = value_head / (VALUE_HEADS / KEY_HEADS);
         let tid = thread::threadIdx_x() as usize;
@@ -102,43 +143,169 @@ mod kernels {
                 *key.add(tid) = load_bf16(key_row.add(tid));
             }
         }
-        thread::sync_threads();
-
-        let query_square = if tid < HEAD_DIM {
-            let value = unsafe { *query.add(tid) };
-            value * value
-        } else {
-            0.0
-        };
-        let query_norm = float::rsqrt_approx_f32(
-            block_sum(query_square, reduction, lane, warp_index) + RMS_EPSILON,
-        );
-        if tid < HEAD_DIM {
-            unsafe { *query.add(tid) *= query_norm };
+        if PREFILL && tid < HEAD_DIM {
+            // Prefetching the value row through the same barrier removes a
+            // dependent global load from every row iteration; the conversion
+            // is the identical load_bf16, so the consumed value is bit-exact.
+            let prefetch_value_row = unsafe { token_qkv.add(2 * QK_WIDTH + value_head * HEAD_DIM) };
+            unsafe { *value.add(tid) = load_bf16(prefetch_value_row.add(tid)) };
         }
         thread::sync_threads();
 
-        let key_square = if tid < HEAD_DIM {
-            let value = unsafe { *key.add(tid) };
-            value * value
+        // The prefill route fuses both squared-sum reductions into one barrier
+        // pair and applies the norm scalars at every use site instead of
+        // writing normalized rows back to shared; each sum walks the identical
+        // reduction tree and each normalized element is the identical
+        // two-operand multiply, so every downstream value stays bit-exact.
+        // The decode route keeps its original statement sequence untouched.
+        let (query_norm, key_norm) = if PREFILL {
+            let (query_square, key_square) = if tid < HEAD_DIM {
+                let query_value = unsafe { *query.add(tid) };
+                let key_value = unsafe { *key.add(tid) };
+                (query_value * query_value, key_value * key_value)
+            } else {
+                (0.0, 0.0)
+            };
+            let (query_sum, key_sum) =
+                block_sum2(query_square, key_square, reduction, lane, warp_index);
+            (
+                float::rsqrt_approx_f32(query_sum + RMS_EPSILON),
+                float::rsqrt_approx_f32(key_sum + RMS_EPSILON),
+            )
         } else {
-            0.0
+            let query_square = if tid < HEAD_DIM {
+                let value = unsafe { *query.add(tid) };
+                value * value
+            } else {
+                0.0
+            };
+            let query_norm = float::rsqrt_approx_f32(
+                block_sum(query_square, reduction, lane, warp_index) + RMS_EPSILON,
+            );
+            if tid < HEAD_DIM {
+                unsafe { *query.add(tid) *= query_norm };
+            }
+            thread::sync_threads();
+
+            let key_square = if tid < HEAD_DIM {
+                let value = unsafe { *key.add(tid) };
+                value * value
+            } else {
+                0.0
+            };
+            let key_norm = float::rsqrt_approx_f32(
+                block_sum(key_square, reduction, lane, warp_index) + RMS_EPSILON,
+            );
+            if tid < HEAD_DIM {
+                unsafe { *key.add(tid) *= key_norm };
+            }
+            thread::sync_threads();
+            (1.0, 1.0)
         };
-        let key_norm = float::rsqrt_approx_f32(
-            block_sum(key_square, reduction, lane, warp_index) + RMS_EPSILON,
-        );
-        if tid < HEAD_DIM {
-            unsafe { *key.add(tid) *= key_norm };
-        }
-        thread::sync_threads();
 
         let control = token * VALUE_HEADS + value_head;
         let decay =
             float::ex2_approx_f32(unsafe { *log_decay.add(control) } * core::f32::consts::LOG2_E);
         let beta = unsafe { *beta.add(control) };
         let value_row = unsafe { token_qkv.add(2 * QK_WIDTH + value_head * HEAD_DIM) };
-        let state =
-            unsafe { state.add((state_row * VALUE_HEADS + value_head) * HEAD_DIM * HEAD_DIM) };
+        let state = if PREFILL {
+            state
+        } else {
+            unsafe { state.add((state_row * VALUE_HEADS + value_head) * HEAD_DIM * HEAD_DIM) }
+        };
+        if PREFILL {
+            // The prefill route hoists the loop-invariant normalized q/k lanes
+            // into registers, consumes the prefetched value row from shared,
+            // and walks its eight state rows as four interleaved pairs so the
+            // two dependent shuffle-reduce chains of a pair overlap. Every
+            // per-row formula and its operand order are identical to the
+            // decode walk, so all published values stay bit-exact.
+            let column0 = lane;
+            let column1 = lane + 32;
+            let column2 = lane + 64;
+            let column3 = lane + 96;
+            let k0 = unsafe { *key.add(column0) } * key_norm;
+            let k1 = unsafe { *key.add(column1) } * key_norm;
+            let k2 = unsafe { *key.add(column2) } * key_norm;
+            let k3 = unsafe { *key.add(column3) } * key_norm;
+            let q0 = unsafe { *query.add(column0) } * query_norm;
+            let q1 = unsafe { *query.add(column1) } * query_norm;
+            let q2 = unsafe { *query.add(column2) } * query_norm;
+            let q3 = unsafe { *query.add(column3) } * query_norm;
+            let mut row = warp_index;
+            while row < SPLIT_ROWS {
+                let row_b = row + WARPS;
+                let state_row_a = unsafe { state.add(row * HEAD_DIM) };
+                let state_row_b = unsafe { state.add(row_b * HEAD_DIM) };
+                let old0_a = unsafe { *state_row_a.add(column0) };
+                let old0_b = unsafe { *state_row_b.add(column0) };
+                let old1_a = unsafe { *state_row_a.add(column1) };
+                let old1_b = unsafe { *state_row_b.add(column1) };
+                let old2_a = unsafe { *state_row_a.add(column2) };
+                let old2_b = unsafe { *state_row_b.add(column2) };
+                let old3_a = unsafe { *state_row_a.add(column3) };
+                let old3_b = unsafe { *state_row_b.add(column3) };
+                let state_key_a = warp::reduce_sum_f32(float::fma_rn_f32(
+                    old0_a,
+                    k0,
+                    float::fma_rn_f32(old1_a, k1, float::fma_rn_f32(old2_a, k2, old3_a * k3)),
+                ));
+                let state_key_b = warp::reduce_sum_f32(float::fma_rn_f32(
+                    old0_b,
+                    k0,
+                    float::fma_rn_f32(old1_b, k1, float::fma_rn_f32(old2_b, k2, old3_b * k3)),
+                ));
+                let update_a =
+                    beta * (unsafe { *value.add(row_offset + row) } - decay * state_key_a);
+                let update_b =
+                    beta * (unsafe { *value.add(row_offset + row_b) } - decay * state_key_b);
+                let new0_a = float::fma_rn_f32(old0_a, decay, k0 * update_a);
+                let new1_a = float::fma_rn_f32(old1_a, decay, k1 * update_a);
+                let new2_a = float::fma_rn_f32(old2_a, decay, k2 * update_a);
+                let new3_a = float::fma_rn_f32(old3_a, decay, k3 * update_a);
+                let new0_b = float::fma_rn_f32(old0_b, decay, k0 * update_b);
+                let new1_b = float::fma_rn_f32(old1_b, decay, k1 * update_b);
+                let new2_b = float::fma_rn_f32(old2_b, decay, k2 * update_b);
+                let new3_b = float::fma_rn_f32(old3_b, decay, k3 * update_b);
+                unsafe {
+                    *state_row_a.add(column0) = new0_a;
+                    *state_row_a.add(column1) = new1_a;
+                    *state_row_a.add(column2) = new2_a;
+                    *state_row_a.add(column3) = new3_a;
+                    *state_row_b.add(column0) = new0_b;
+                    *state_row_b.add(column1) = new1_b;
+                    *state_row_b.add(column2) = new2_b;
+                    *state_row_b.add(column3) = new3_b;
+                }
+                let recurrent_a = warp::reduce_sum_f32(float::fma_rn_f32(
+                    new0_a,
+                    q0,
+                    float::fma_rn_f32(new1_a, q1, float::fma_rn_f32(new2_a, q2, new3_a * q3)),
+                ));
+                let recurrent_b = warp::reduce_sum_f32(float::fma_rn_f32(
+                    new0_b,
+                    q0,
+                    float::fma_rn_f32(new1_b, q1, float::fma_rn_f32(new2_b, q2, new3_b * q3)),
+                ));
+                if lane == 0 {
+                    // Publishing the scaled recurrent rows to the caller's
+                    // plane defers the RMS/gate epilogue to a fully parallel
+                    // kernel; the stored products are the identical values the
+                    // epilogue's reduction consumes.
+                    let plane = unsafe {
+                        recurrent_output
+                            .add(token * VALUE_WIDTH + value_head * HEAD_DIM + row_offset)
+                    };
+                    unsafe { *plane.add(row) = recurrent_a * QUERY_SCALE };
+                    unsafe { *plane.add(row_b) = recurrent_b * QUERY_SCALE };
+                }
+                row += 2 * WARPS;
+            }
+            // The value tile is re-filled by the next token's prefetch; one
+            // barrier keeps that write ordered behind this token's row walk.
+            thread::sync_threads();
+            return;
+        }
         let mut row = warp_index;
 
         while row < HEAD_DIM {
@@ -258,7 +425,7 @@ mod kernels {
         let value_head = block - token * VALUE_HEADS;
         let state_row = unsafe { *state_rows.add(token) as usize };
         unsafe {
-            recurrence_token(
+            recurrence_token::<false>(
                 qkv,
                 projected,
                 log_decay,
@@ -273,6 +440,8 @@ mod kernels {
                 core::ptr::addr_of_mut!(KEY).cast::<f32>(),
                 core::ptr::addr_of_mut!(RECURRENT_OUTPUT).cast::<f32>(),
                 core::ptr::addr_of_mut!(REDUCTION).cast::<f32>(),
+                core::ptr::null_mut(),
+                0,
             );
         }
     }
@@ -280,7 +449,7 @@ mod kernels {
     /// Advances one mapped prompt state causally and emits every token.
     #[allow(clippy::too_many_arguments)]
     #[kernel]
-    #[launch_bounds(512, 2)]
+    #[launch_bounds(512, 1)]
     #[launch_contract(
         domain = 1,
         coordinates = u32,
@@ -296,43 +465,136 @@ mod kernels {
         norm_weight: *const u16,
         state_rows: *const u32,
         state: *mut f32,
+        recurrent: *mut f32,
         output: *mut u16,
     ) {
         static mut QUERY: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
         static mut KEY: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
-        static mut RECURRENT_OUTPUT: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
-        static mut REDUCTION: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
+        static mut REDUCTION: SharedArray<f32, { 2 * WARPS }, 16> = SharedArray::UNINIT;
+        static mut STATE_TILE: SharedArray<f32, { SPLIT_ROWS * HEAD_DIM }, 16> =
+            SharedArray::UNINIT;
+        static mut VALUE: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
 
-        let value_head = thread::blockIdx_x() as usize;
+        let block = thread::blockIdx_x() as usize;
+        let value_head = block / SPLIT_CTAS_PER_HEAD;
+        let half = block - value_head * SPLIT_CTAS_PER_HEAD;
         if value_head >= VALUE_HEADS {
             return;
         }
+        let row_offset = half * SPLIT_ROWS;
         let state_row = unsafe { *state_rows as usize };
-        // Flattening T=128 would launch 4,096 CTAs that race one recurrent
-        // state. Thirty-two head CTAs instead advance 128 tokens serially;
-        // each token retains decode's sixteen-warp row and reduction order, so
-        // the only changed dimension is the required causal token schedule.
+        // Two CTAs per value head advance the causal token loop against
+        // shared-resident 32KB halves of the state plane, loaded once and
+        // written back once. Every row's dot products, update, and publish
+        // stay wholly inside one CTA in decode's operand order, and the
+        // paired epilogue kernel applies the RMS/gate/store phase over whole
+        // rows, so outputs and final state stay bit-exact.
+        let state_tile = core::ptr::addr_of_mut!(STATE_TILE).cast::<f32>();
+        let resident = unsafe {
+            state.add(
+                (state_row * VALUE_HEADS + value_head) * HEAD_DIM * HEAD_DIM
+                    + row_offset * HEAD_DIM,
+            )
+        };
+        let tid = thread::threadIdx_x() as usize;
+        let mut element = tid;
+        while element < SPLIT_ROWS * HEAD_DIM {
+            unsafe { *state_tile.add(element) = *resident.add(element) };
+            element += WARPS * 32;
+        }
+        thread::sync_threads();
         let mut token = 0;
         while token < TOKENS {
             unsafe {
-                recurrence_token(
+                recurrence_token::<true>(
                     qkv,
                     projected,
                     log_decay,
                     beta,
                     norm_weight,
-                    state,
+                    state_tile,
                     output,
                     token,
                     value_head,
                     state_row,
                     core::ptr::addr_of_mut!(QUERY).cast::<f32>(),
                     core::ptr::addr_of_mut!(KEY).cast::<f32>(),
-                    core::ptr::addr_of_mut!(RECURRENT_OUTPUT).cast::<f32>(),
+                    recurrent,
                     core::ptr::addr_of_mut!(REDUCTION).cast::<f32>(),
+                    core::ptr::addr_of_mut!(VALUE).cast::<f32>(),
+                    row_offset,
                 );
             }
             token += 1;
+        }
+        thread::sync_threads();
+        let mut element = tid;
+        while element < SPLIT_ROWS * HEAD_DIM {
+            unsafe { *resident.add(element) = *state_tile.add(element) };
+            element += WARPS * 32;
+        }
+    }
+
+    /// Applies the deferred prefill RMS/gate/store epilogue in parallel.
+    #[kernel]
+    #[launch_bounds(512, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (512, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_gdn_recurrence_prefill_epilogue_exact<const TOKENS: usize>(
+        projected: *const u16,
+        norm_weight: *const u16,
+        recurrent: *const f32,
+        output: *mut u16,
+    ) {
+        static mut REDUCTION: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
+        let reduction = core::ptr::addr_of_mut!(REDUCTION).cast::<f32>();
+
+        // One CTA per (token, value head) replicates the serial loop's
+        // sixteen-warp RMS reduction tree over the published recurrent row,
+        // so the emitted gated values are bit-exact.
+        let block = thread::blockIdx_x() as usize;
+        let token = block / VALUE_HEADS;
+        if token >= TOKENS {
+            return;
+        }
+        let value_head = block - token * VALUE_HEADS;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_index = tid >> 5;
+        let row_base = unsafe { recurrent.add(token * VALUE_WIDTH + value_head * HEAD_DIM) };
+
+        let square = if tid < HEAD_DIM {
+            let value = unsafe { *row_base.add(tid) };
+            value * value
+        } else {
+            0.0
+        };
+        let inverse_rms = float::rsqrt_approx_f32(
+            block_sum(square, reduction, lane, warp_index) / HEAD_DIM as f32 + RMS_EPSILON,
+        );
+        if tid < HEAD_DIM {
+            let normalized = unsafe { *row_base.add(tid) }
+                * inverse_rms
+                * load_bf16(unsafe { norm_weight.add(tid) });
+            let gate = load_bf16(unsafe {
+                projected.add(
+                    token * Qwen35_9B::GDN_INPUT_ROWS
+                        + Qwen35_9B::GDN_QKV_ROWS
+                        + value_head * HEAD_DIM
+                        + tid,
+                )
+            });
+            let silu = gate / (1.0 + float::ex2_approx_f32(-gate * core::f32::consts::LOG2_E));
+            unsafe {
+                *output.add(token * VALUE_WIDTH + value_head * HEAD_DIM + tid) =
+                    tcgen05::f32_to_bf16_rne(normalized * silu);
+            }
         }
     }
 
@@ -373,7 +635,7 @@ mod kernels {
         let mut token = 0;
         while token < TOKENS {
             unsafe {
-                recurrence_token(
+                recurrence_token::<false>(
                     qkv,
                     projected,
                     log_decay,
@@ -388,6 +650,8 @@ mod kernels {
                     core::ptr::addr_of_mut!(KEY).cast::<f32>(),
                     core::ptr::addr_of_mut!(RECURRENT_OUTPUT).cast::<f32>(),
                     core::ptr::addr_of_mut!(REDUCTION).cast::<f32>(),
+                    core::ptr::null_mut(),
+                    0,
                 );
             }
             token += 1;
@@ -445,6 +709,8 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
 
 struct PreparedPrefillRoute<const TOKENS: usize> {
     launch: PreparedLaunch<kernels::__qwen35_gdn_recurrence_prefill_exact_CudaKernel<TOKENS>>,
+    epilogue:
+        PreparedLaunch<kernels::__qwen35_gdn_recurrence_prefill_epilogue_exact_CudaKernel<TOKENS>>,
 }
 
 impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
@@ -456,15 +722,25 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
         }
         let launch = module
             .prepare_qwen35_gdn_recurrence_prefill_exact::<TOKENS>(LaunchConfig1D::new(
-                VALUE_HEADS as u32,
+                (VALUE_HEADS * SPLIT_CTAS_PER_HEAD) as u32,
                 THREADS,
                 0,
             ))
             .map_err(|source| {
                 GpuError::launch("preparing 2,048-wide GDN prompt recurrence", source)
             })?;
+        let epilogue_blocks = u32::try_from(TOKENS * VALUE_HEADS)
+            .map_err(|_| GpuError::invalid_launch("GDN prompt epilogue grid exceeds u32"))?;
+        let epilogue =
+            module
+                .prepare_qwen35_gdn_recurrence_prefill_epilogue_exact::<TOKENS>(
+                    LaunchConfig1D::new(epilogue_blocks, THREADS, 0),
+                )
+                .map_err(|source| {
+                    GpuError::launch("preparing 2,048-wide GDN prompt epilogue", source)
+                })?;
 
-        Ok(Self { launch })
+        Ok(Self { launch, epilogue })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -479,8 +755,11 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
         norm_weight: *const u16,
         state_rows: *const u32,
         state: *mut f32,
+        recurrent: *mut f32,
         output: *mut u16,
     ) -> GpuResult<()> {
+        // The epilogue reads the plane the serial pass just published on the
+        // same stream, so ordering is inherent.
         module
             .qwen35_gdn_recurrence_prefill_exact::<TOKENS>(
                 stream,
@@ -492,11 +771,22 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
                 norm_weight,
                 state_rows,
                 state,
+                recurrent,
                 output,
             )
             .map_err(|source| {
                 GpuError::launch("launching 2,048-wide GDN prompt recurrence", source)
-            })
+            })?;
+        module
+            .qwen35_gdn_recurrence_prefill_epilogue_exact::<TOKENS>(
+                stream,
+                &self.epilogue,
+                projected,
+                norm_weight,
+                recurrent.cast_const(),
+                output,
+            )
+            .map_err(|source| GpuError::launch("launching 2,048-wide GDN prompt epilogue", source))
     }
 }
 
@@ -608,9 +898,11 @@ impl Qwen35GdnRecurrenceOp {
     ///
     /// `qkv` and `projected` cover BF16 `[rows, 8_192]` and `[rows,
     /// 12_288]`. Controls cover FP32 `[rows, 32]`; `norm_weight` covers 128
-    /// BF16 values. Every state row is within `[rows, 32, 128, 128]`, and
-    /// `output` covers BF16 `[rows, 4_096]`. Prompt routes read the first
-    /// state-row index and advance that row across the contiguous sequence.
+    /// BF16 values. Every state row is within `[rows, 32, 128, 128]`;
+    /// `recurrent` covers FP32 `[rows, 4_096]`; and `output` covers BF16
+    /// `[rows, 4_096]`. Prompt routes read the first state-row index, advance
+    /// that row across the contiguous sequence, and use `recurrent` as their
+    /// intermediate output plane.
     /// Allocations are aligned, disjoint, live through completion, and belong
     /// to the stream's context.
     #[allow(clippy::too_many_arguments)]
@@ -625,6 +917,7 @@ impl Qwen35GdnRecurrenceOp {
         norm_weight: *const u16,
         state_rows: *const u32,
         state: *mut f32,
+        recurrent: *mut f32,
         output: *mut u16,
     ) -> GpuResult<()> {
         if !admitted_rows(rows) {
@@ -652,6 +945,26 @@ impl Qwen35GdnRecurrenceOp {
             };
         }
 
+        macro_rules! launch_prefill {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        qkv,
+                        projected,
+                        log_decay,
+                        beta,
+                        norm_weight,
+                        state_rows,
+                        state,
+                        recurrent,
+                        output,
+                    )
+                }
+            };
+        }
+
         match rows {
             1 => launch!(b1),
             2 => launch!(b2),
@@ -661,9 +974,9 @@ impl Qwen35GdnRecurrenceOp {
             6 => launch!(b6),
             7 => launch!(b7),
             8 => launch!(b8),
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
+            32 => launch_prefill!(t32),
+            64 => launch_prefill!(t64),
+            128 => launch_prefill!(t128),
             _ => unreachable!(),
         }
     }
@@ -742,6 +1055,9 @@ pub(crate) fn qwen35_gdn_recurrence_ptx_names() -> Vec<&'static str> {
         kernels::qwen35_gdn_recurrence_prefill_exact_ptx_name::<32>(),
         kernels::qwen35_gdn_recurrence_prefill_exact_ptx_name::<64>(),
         kernels::qwen35_gdn_recurrence_prefill_exact_ptx_name::<128>(),
+        kernels::qwen35_gdn_recurrence_prefill_epilogue_exact_ptx_name::<32>(),
+        kernels::qwen35_gdn_recurrence_prefill_epilogue_exact_ptx_name::<64>(),
+        kernels::qwen35_gdn_recurrence_prefill_epilogue_exact_ptx_name::<128>(),
     ]
 }
 
@@ -785,7 +1101,7 @@ mod tests {
         assert_eq!(PREFILL_ROWS, [32, 64, 128]);
         assert_eq!(
             names.len(),
-            MAX_BATCH + CAUSAL_ROWS.len() + PREFILL_ROWS.len()
+            MAX_BATCH + CAUSAL_ROWS.len() + 2 * PREFILL_ROWS.len()
         );
         assert_eq!(
             names.iter().copied().collect::<BTreeSet<_>>().len(),

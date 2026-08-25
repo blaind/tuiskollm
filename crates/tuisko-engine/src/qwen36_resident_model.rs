@@ -1016,10 +1016,10 @@ mod tests {
 
         assert_eq!(layout.resident_weight_bytes(), 19_808_036_096);
         assert_eq!(layout.cache_bytes(), 2_700_083_200);
-        assert_eq!(layout.workspace_bytes(), 1_223_843_648);
-        assert_eq!(layout.owner_bytes(), 23_731_962_944);
+        assert_eq!(layout.workspace_bytes(), 1_286_758_208);
+        assert_eq!(layout.owner_bytes(), 23_794_877_504);
         assert_eq!(layout.padding_bytes(), 26_560);
-        assert_eq!(layout.arena_bytes(), 23_731_989_504);
+        assert_eq!(layout.arena_bytes(), 23_794_904_064);
         assert_eq!(layout.arena_count(), 42);
         assert_eq!(
             layout.source_mapped_embedding_bytes().unwrap(),

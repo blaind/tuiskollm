@@ -59,6 +59,7 @@ struct Pointers {
     convolved: *mut u16,
     recurrent_norm: *const u16,
     state: *mut f32,
+    recurrent_plane: *mut f32,
     recurrent_output: *mut u16,
     output_activation_codes: *mut u8,
     output_activation_scales: *mut u8,
@@ -108,6 +109,7 @@ impl Pointers {
             convolved: arena.address(regions.convolved)?,
             recurrent_norm: arena.address(regions.recurrent_norm)?.cast_const(),
             state: arena.address(regions.state)?,
+            recurrent_plane: arena.address(regions.recurrent_plane)?,
             recurrent_output: arena.address(regions.recurrent_output)?,
             output_activation_codes: arena.address(regions.output_activation_codes)?,
             output_activation_scales: arena.address(regions.output_activation_scales)?,
@@ -1226,6 +1228,7 @@ fn launch_route_kind(
                 pointers.recurrent_norm,
                 pointers.state_rows,
                 pointers.state,
+                pointers.recurrent_plane,
                 pointers.recurrent_output,
             )?;
         }

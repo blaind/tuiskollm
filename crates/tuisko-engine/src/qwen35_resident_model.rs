@@ -1319,10 +1319,10 @@ mod tests {
 
         assert_eq!(layout.resident_weight_bytes(), 5_931_820_032);
         assert_eq!(layout.cache_bytes(), 8_640_266_240);
-        assert_eq!(layout.workspace_bytes(), 1_109_340_416);
-        assert_eq!(layout.owner_bytes(), 15_681_426_688);
+        assert_eq!(layout.workspace_bytes(), 1_159_672_064);
+        assert_eq!(layout.owner_bytes(), 15_731_758_336);
         assert_eq!(layout.padding_bytes(), 21_248);
-        assert_eq!(layout.arena_bytes(), 15_681_447_936);
+        assert_eq!(layout.arena_bytes(), 15_731_779_584);
         assert_eq!(layout.arena_count(), 34);
         assert_eq!(
             layout.source_mapped_embedding_bytes().unwrap(),
