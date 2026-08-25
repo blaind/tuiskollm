@@ -387,6 +387,7 @@ pub use mtp_bf16_attention_output_benchmark::benchmark_mtp_bf16_attention_output
 #[cfg(feature = "device")]
 pub use mtp_bf16_fusion::{
     MtpBf16FusionQualification, MtpBf16FusionQualificationError, qualify_mtp_bf16_fusion,
+    qualify_qwen35_mtp_bf16_fusion,
 };
 #[cfg(feature = "device")]
 pub use mtp_bf16_fusion_benchmark::benchmark_mtp_bf16_fusion;

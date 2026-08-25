@@ -48,7 +48,7 @@ pub use gdn::{
 pub use inventory::kernel_ptx_names;
 pub use moe::{Qwen36MoeExpertsOp, Qwen36MoeRouterOp};
 pub use mtp_bf16_attention_output::MtpBf16AttentionOutputOp;
-pub use mtp_bf16_fusion::MtpBf16FusionOp;
+pub use mtp_bf16_fusion::{MtpBf16FusionOp, Qwen35MtpBf16FusionOp};
 pub use mtp_bf16_mlp::MtpBf16MlpOp;
 pub use mtp_bf16_paged_gqa::MtpBf16PagedGqaOp;
 pub use mtp_bf16_qk_prepare::MtpBf16QkPrepareOp;
