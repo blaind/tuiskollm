@@ -7,8 +7,10 @@ use memmap2::{Mmap, MmapOptions};
 #[cfg(target_os = "linux")]
 use rayon::prelude::*;
 use serde::Deserialize;
+use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,44 @@ struct TensorDescriptor {
 impl TensorDescriptor {
     fn range(&self) -> Range<u64> {
         self.data_offsets[0]..self.data_offsets[1]
+    }
+}
+
+/// First header key a `serde_json` map would have silently collapsed, if any.
+struct DuplicateTensorName(Option<String>);
+
+impl<'de> Deserialize<'de> for DuplicateTensorName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DuplicateVisitor;
+
+        impl<'de> Visitor<'de> for DuplicateVisitor {
+            type Value = DuplicateTensorName;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a safetensors header object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut seen = BTreeSet::new();
+                let mut duplicate = None;
+                while let Some((name, IgnoredAny)) = map.next_entry::<String, IgnoredAny>()? {
+                    if seen.contains(&name) {
+                        duplicate.get_or_insert(name);
+                    } else {
+                        seen.insert(name);
+                    }
+                }
+                Ok(DuplicateTensorName(duplicate))
+            }
+        }
+
+        deserializer.deserialize_map(DuplicateVisitor)
     }
 }
 
@@ -89,6 +129,17 @@ impl SafeTensorFile {
                 path.display()
             ))
         })?;
+
+        // `header` keeps only the last of any repeated key, hiding the discarded descriptor
+        // from every check below.
+        let duplicate: DuplicateTensorName = serde_json::from_slice(&mmap[8..data_start])
+            .map_err(|source| CheckpointError::json(path, source))?;
+        if let Some(name) = duplicate.0 {
+            return Err(CheckpointError::safetensors(format!(
+                "{} declares tensor `{name}` more than once",
+                path.display()
+            )));
+        }
 
         let payload_len = file_len - data_start_u64;
         let mut tensors = BTreeMap::new();
@@ -396,7 +447,11 @@ mod tests {
     }
 
     fn write_safetensors(path: &Path, header: Value, payload: &[u8]) {
-        let mut header = serde_json::to_vec(&header).unwrap();
+        write_raw_safetensors(path, &serde_json::to_string(&header).unwrap(), payload);
+    }
+
+    fn write_raw_safetensors(path: &Path, header: &str, payload: &[u8]) {
+        let mut header = header.as_bytes().to_vec();
 
         while !header.len().is_multiple_of(8) {
             header.push(b' ');
@@ -469,6 +524,31 @@ mod tests {
 
         assert_eq!(error.code(), CheckpointErrorCode::Safetensors);
         assert!(error.to_string().contains("overlap"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_tensor_names() {
+        let path = fixture_path("duplicate-name");
+        write_raw_safetensors(
+            &path,
+            concat!(
+                r#"{"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4]},"#,
+                r#""a":{"dtype":"U8","shape":[4],"data_offsets":[4,8]}}"#
+            ),
+            &[0; 8],
+        );
+
+        let error = SafeTensorFile::open(&path).err().unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::Safetensors);
+        assert!(
+            error
+                .to_string()
+                .contains("declares tensor `a` more than once"),
+            "{error}"
+        );
 
         fs::remove_file(path).unwrap();
     }
