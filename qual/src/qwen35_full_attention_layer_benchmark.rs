@@ -13,13 +13,15 @@ use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, GpuError, GpuTimer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B};
 
 const SOURCE_LAYER: usize = 31;
+const MAX_ROWS: usize = 128;
+const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, MAX_ROWS];
 const CACHE_POSITION: u32 = 130;
 const CONTEXT_TOKENS: usize = CACHE_POSITION as usize + 1;
 const ROTARY_PAIRS: usize = 32;
 const NVFP4_GROUP: usize = 16;
 
 struct RouteGraph {
-    batch: usize,
+    rows: usize,
     repeated: CudaGraph,
 }
 
@@ -45,7 +47,7 @@ impl Session {
         let stream = context.new_stream().map_err(GpuError::from)?;
         let program =
             Qwen35FullAttentionLayerProgram::from_snapshot(&context, snapshot, SOURCE_LAYER)?;
-        program.load_residual(&stream, MAX_BATCH, &benchmark_input())?;
+        program.load_residual(&stream, MAX_ROWS, &benchmark_input())?;
         program.reset_cache(&stream)?;
         let (rope_cos, rope_sin) = benchmark_rope();
         program.load_decode_state(
@@ -55,13 +57,16 @@ impl Session {
             &rope_cos,
             &rope_sin,
         )?;
-        let routes = (1..=MAX_BATCH)
-            .map(|batch| {
+        let (prefill_cos, prefill_sin) = prefill_rope(MAX_ROWS);
+        program.load_prefill_state(&stream, MAX_ROWS, &prefill_cos, &prefill_sin)?;
+        let routes = EXACT_ROUTES
+            .into_iter()
+            .map(|rows| {
                 Ok(RouteGraph {
-                    batch,
+                    rows,
                     repeated: program.qualification_repeated_graph(
                         &stream,
-                        batch,
+                        rows,
                         repeated_operations,
                     )?,
                 })
@@ -80,8 +85,8 @@ impl Session {
 
     fn warm(&self, launches: u64) -> Result<(), DeviceBenchmarkError> {
         for _ in 0..launches {
-            for batch in 1..=MAX_BATCH {
-                let graph = self.program.qualification_graph(batch)?;
+            for rows in EXACT_ROUTES {
+                let graph = self.program.qualification_graph(rows)?;
                 // SAFETY: this Session's program owns the graph and every
                 // allocation it captured, outliving the replay and synchronize.
                 unsafe { graph.launch(&self.stream) }?;
@@ -99,19 +104,26 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
+                let (shape, workload) = if route.rows <= MAX_BATCH {
+                    (
+                        format!("B={}", route.rows),
+                        BenchmarkWorkload::warm_attention_layer_decode(
+                            route.rows as u32,
+                            CONTEXT_TOKENS as u64,
+                        ),
+                    )
+                } else {
+                    (
+                        format!("T={}", route.rows),
+                        BenchmarkWorkload::warm_attention_layer_prefill(route.rows as u64),
+                    )
+                };
                 Ok(ExactDeviceCase::new(
                     "qwen35_9b/full_attention/layer31",
-                    format!("B={}", route.batch),
-                    BenchmarkWorkload::warm_attention_layer_decode(
-                        route.batch as u32,
-                        CONTEXT_TOKENS as u64,
-                    ),
-                    OperationAccounting::new(
-                        logical_bytes(route.batch),
-                        route.batch as u64,
-                        "token",
-                    ),
-                    self.program.qualification_graph(route.batch)?,
+                    shape,
+                    workload,
+                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
+                    self.program.qualification_graph(route.rows)?,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 ))
             })
@@ -122,7 +134,7 @@ impl Session {
 fn benchmark_input() -> Vec<u16> {
     const PATTERN: [f32; 8] = [0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625];
 
-    (0..MAX_BATCH * Qwen35_9B::HIDDEN)
+    (0..MAX_ROWS * Qwen35_9B::HIDDEN)
         .map(|index| f32_to_bf16(PATTERN[(index + index / Qwen35_9B::HIDDEN) & 7]))
         .collect()
 }
@@ -143,7 +155,23 @@ fn benchmark_rope() -> (Vec<f32>, Vec<f32>) {
     (cosine, sine)
 }
 
-fn logical_bytes(batch: usize) -> usize {
+fn prefill_rope(tokens: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut cosine = vec![0.0; tokens * ROTARY_PAIRS];
+    let mut sine = vec![0.0; tokens * ROTARY_PAIRS];
+    for token in 0..tokens {
+        for pair in 0..ROTARY_PAIRS {
+            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
+            let angle = token as f64 * frequency;
+            let (sin, cos) = angle.sin_cos();
+            cosine[token * ROTARY_PAIRS + pair] = cos as f32;
+            sine[token * ROTARY_PAIRS + pair] = sin as f32;
+        }
+    }
+
+    (cosine, sine)
+}
+
+fn logical_bytes(rows: usize) -> usize {
     let hidden = Qwen35_9B::HIDDEN;
     let qkv = Qwen35_9B::ATTENTION_QKV_ROWS;
     let attention = Qwen35_9B::ATTENTION_OUTPUT_COLUMNS;
@@ -158,7 +186,8 @@ fn logical_bytes(batch: usize) -> usize {
         + hidden * down_packed_row;
 
     let plain_norm = 3 * hidden * size_of::<u16>();
-    let qkv_projection = (hidden + qkv) * size_of::<u16>();
+    let prompt = rows > MAX_BATCH;
+    let qkv_projection = (hidden + qkv) * size_of::<u16>() + usize::from(prompt) * 2 * packed_row;
     let qk_prepare = {
         let heads = Qwen35_9B::NUM_ATTENTION_HEADS + Qwen35_9B::NUM_KV_HEADS;
         let source = attention + 2 * kv;
@@ -170,35 +199,41 @@ fn logical_bytes(batch: usize) -> usize {
             + attention * size_of::<f32>()
             + 2 * kv * size_of::<u16>()
     };
+    let context_values = if rows <= MAX_BATCH {
+        rows * CONTEXT_TOKENS
+    } else {
+        rows * (rows + 1) / 2
+    };
     let paged_gqa = {
         let cache = 2
             * Qwen35_9B::NUM_ATTENTION_HEADS
-            * CONTEXT_TOKENS
+            * context_values
             * Qwen35_9B::HEAD_DIM
             * size_of::<u16>();
-        let metadata = 2 * size_of::<u32>()
-            + Qwen35_9B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * size_of::<u32>();
-        2 * attention * size_of::<f32>() + cache + metadata
+        let metadata = rows * 2 * size_of::<u32>()
+            + Qwen35_9B::NUM_ATTENTION_HEADS * context_values * size_of::<u32>();
+        rows * 2 * attention * size_of::<f32>() + cache + metadata
     };
-    let attention_output = 14 * attention + 2 * hidden;
+    let attention_output =
+        14 * attention + 2 * hidden + usize::from(prompt) * 2 * output_packed_row;
     let fused_residual = 5 * hidden * size_of::<u16>();
     let swiglu =
-        (hidden + intermediate) * size_of::<u16>() + usize::from(uses_w4a4(batch)) * 2 * packed_row;
-    let down = (intermediate + hidden) * size_of::<u16>();
-    let per_token = plain_norm
+        (hidden + intermediate) * size_of::<u16>() + usize::from(uses_w4a4(rows)) * 2 * packed_row;
+    let down =
+        (intermediate + hidden) * size_of::<u16>() + usize::from(prompt) * 2 * down_packed_row;
+    let per_token_without_gqa = plain_norm
         + qkv_projection
         + qk_prepare
-        + paged_gqa
         + attention_output
         + 2 * fused_residual
         + swiglu
         + down;
 
-    projection_weights + batch * per_token
+    projection_weights + rows * per_token_without_gqa + paged_gqa
 }
 
-fn uses_w4a4(batch: usize) -> bool {
-    batch == 1 || batch >= 3
+fn uses_w4a4(rows: usize) -> bool {
+    rows > MAX_BATCH || rows == 1 || rows >= 3
 }
 
 /// Measures every exact graph of one source-backed Qwen3.5 attention layer.
@@ -227,7 +262,7 @@ pub fn benchmark_qwen35_full_attention_layer(
         "qwen35_9b/full_attention/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.program.workspace_bytes(),
-        "max_batch=8 including metadata and every published seam",
+        "max_rows=128 including decode/prefill metadata and every published seam",
     )?;
     memory.register_owned(
         "qwen35_9b/full_attention/alignment_padding",
@@ -272,7 +307,7 @@ fn f32_to_bf16(value: f32) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTEXT_TOKENS, MAX_BATCH, logical_bytes, uses_w4a4};
+    use super::{CONTEXT_TOKENS, EXACT_ROUTES, MAX_BATCH, MAX_ROWS, logical_bytes, uses_w4a4};
 
     #[test]
     fn accounting_covers_bf16_cache_and_both_mlp_routes() {
@@ -280,9 +315,15 @@ mod tests {
         assert_eq!(logical_bytes(1), 120_471_252);
         assert_eq!(logical_bytes(2), 122_968_488);
         assert_eq!(logical_bytes(MAX_BATCH), 138_016_416);
+        assert_eq!(logical_bytes(32), 138_643_072);
+        assert_eq!(logical_bytes(64), 176_164_096);
+        assert_eq!(logical_bytes(MAX_ROWS), 301_734_400);
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
         assert_eq!(
-            (1..=MAX_BATCH).map(uses_w4a4).collect::<Vec<_>>(),
-            [true, false, true, true, true, true, true, true]
+            EXACT_ROUTES.map(uses_w4a4),
+            [
+                true, false, true, true, true, true, true, true, true, true, true
+            ]
         );
     }
 }

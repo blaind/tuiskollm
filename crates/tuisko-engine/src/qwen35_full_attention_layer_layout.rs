@@ -1,4 +1,4 @@
-//! Single-allocation layout for one Qwen3.5 full-attention decoder layer.
+//! Single-allocation layout for one Qwen3.5 full-attention layer.
 
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
@@ -10,12 +10,18 @@ const NVFP4_GROUP: usize = 16;
 pub(crate) const QWEN35_PHYSICAL_PAGES: usize = 24;
 pub(crate) const QWEN35_TABLE_STRIDE: usize = 3;
 pub(crate) const QWEN35_CONTEXT_CAPACITY: usize = QWEN35_TABLE_STRIDE * ATTENTION_PAGE_SIZE;
+pub(crate) const QWEN35_PREFILL_TABLE_STRIDE: usize = QWEN35_PHYSICAL_PAGES;
+pub(crate) const QWEN35_PREFILL_CONTEXT_CAPACITY: usize =
+    QWEN35_PREFILL_TABLE_STRIDE * ATTENTION_PAGE_SIZE;
+pub(crate) const QWEN35_ATTENTION_MAX_ROWS: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Qwen35FullAttentionLayerRegions {
     pub(crate) residual_input: ArenaRegion<u16>,
     pub(crate) input_norm: ArenaRegion<u16>,
     pub(crate) mixer_normalized: ArenaRegion<u16>,
+    pub(crate) qkv_activation_codes: ArenaRegion<u8>,
+    pub(crate) qkv_activation_scales: ArenaRegion<u8>,
     pub(crate) qkv_weight_codes: ArenaRegion<u8>,
     pub(crate) qkv_weight_scales: ArenaRegion<u8>,
     pub(crate) qkv: ArenaRegion<u16>,
@@ -27,11 +33,18 @@ pub(crate) struct Qwen35FullAttentionLayerRegions {
     pub(crate) table_rows: ArenaRegion<u32>,
     pub(crate) cache_positions: ArenaRegion<u32>,
     pub(crate) lengths: ArenaRegion<u32>,
+    pub(crate) prefill_rope_cos: ArenaRegion<f32>,
+    pub(crate) prefill_rope_sin: ArenaRegion<f32>,
+    pub(crate) prefill_table_rows: ArenaRegion<u32>,
+    pub(crate) prefill_cache_positions: ArenaRegion<u32>,
+    pub(crate) prefill_lengths: ArenaRegion<u32>,
     pub(crate) query: ArenaRegion<f32>,
     pub(crate) key_pages: ArenaRegion<u16>,
     pub(crate) value_pages: ArenaRegion<u16>,
     pub(crate) attention: ArenaRegion<f32>,
     pub(crate) output_activation: ArenaRegion<u16>,
+    pub(crate) output_activation_codes: ArenaRegion<u8>,
+    pub(crate) output_activation_scales: ArenaRegion<u8>,
     pub(crate) output_weight_codes: ArenaRegion<u8>,
     pub(crate) output_weight_scales: ArenaRegion<u8>,
     pub(crate) mixer_branch: ArenaRegion<u16>,
@@ -44,6 +57,8 @@ pub(crate) struct Qwen35FullAttentionLayerRegions {
     pub(crate) up_weight_codes: ArenaRegion<u8>,
     pub(crate) gate_up_weight_scales: ArenaRegion<u8>,
     pub(crate) swiglu: ArenaRegion<u16>,
+    pub(crate) down_activation_codes: ArenaRegion<u8>,
+    pub(crate) down_activation_scales: ArenaRegion<u8>,
     pub(crate) down_weight_codes: ArenaRegion<u8>,
     pub(crate) down_weight_scales: ArenaRegion<u8>,
     pub(crate) mlp_branch: ArenaRegion<u16>,
@@ -63,28 +78,31 @@ pub struct Qwen35FullAttentionLayerLayout {
 }
 
 impl Qwen35FullAttentionLayerLayout {
-    /// Reserves every source and seam for exact decode `B=1..=8` and 192-token slots.
+    /// Reserves every source and exact decode/prefill seam through `T=128`.
     pub fn build() -> EngineResult<Self> {
         type A = Qwen35_9B;
         require_geometry::<A>()?;
 
-        let batch_hidden = product(
-            "Qwen3.5 attention batch-hidden elements",
-            MAX_BATCH,
+        let row_hidden = product(
+            "Qwen3.5 attention row-hidden elements",
+            QWEN35_ATTENTION_MAX_ROWS,
             A::HIDDEN,
         )?;
-        let batch_qkv = product(
+        let row_qkv = product(
             "Qwen3.5 attention fused QKV elements",
-            MAX_BATCH,
+            QWEN35_ATTENTION_MAX_ROWS,
             A::ATTENTION_QKV_ROWS,
         )?;
-        let batch_attention = product(
+        let row_attention = product(
             "Qwen3.5 attention output elements",
-            MAX_BATCH,
+            QWEN35_ATTENTION_MAX_ROWS,
             A::ATTENTION_OUTPUT_COLUMNS,
         )?;
-        let batch_intermediate =
-            product("Qwen3.5 attention MLP elements", MAX_BATCH, A::INTERMEDIATE)?;
+        let row_intermediate = product(
+            "Qwen3.5 attention MLP elements",
+            QWEN35_ATTENTION_MAX_ROWS,
+            A::INTERMEDIATE,
+        )?;
         let qkv_weight_codes = packed_codes(
             "Qwen3.5 attention QKV weight codes",
             A::ATTENTION_QKV_ROWS,
@@ -141,12 +159,14 @@ impl Qwen35FullAttentionLayerLayout {
 
         let mut builder = ArenaLayout::new();
         let regions = Qwen35FullAttentionLayerRegions {
-            residual_input: builder.reserve(batch_hidden, ALIGNMENT)?,
+            residual_input: builder.reserve(row_hidden, ALIGNMENT)?,
             input_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            mixer_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
+            mixer_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            qkv_activation_codes: builder.reserve(row_hidden / 2, ALIGNMENT)?,
+            qkv_activation_scales: builder.reserve(row_hidden / NVFP4_GROUP, ALIGNMENT)?,
             qkv_weight_codes: builder.reserve(qkv_weight_codes, ALIGNMENT)?,
             qkv_weight_scales: builder.reserve(qkv_weight_scales, ALIGNMENT)?,
-            qkv: builder.reserve(batch_qkv, ALIGNMENT)?,
+            qkv: builder.reserve(row_qkv, ALIGNMENT)?,
             query_norm: builder.reserve(A::HEAD_DIM, ALIGNMENT)?,
             key_norm: builder.reserve(A::HEAD_DIM, ALIGNMENT)?,
             rope_cos: builder.reserve(MAX_BATCH * 32, ALIGNMENT)?,
@@ -155,29 +175,38 @@ impl Qwen35FullAttentionLayerLayout {
             table_rows: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             cache_positions: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             lengths: builder.reserve(MAX_BATCH, ALIGNMENT)?,
-            query: builder.reserve(batch_attention, ALIGNMENT)?,
+            prefill_rope_cos: builder.reserve(QWEN35_ATTENTION_MAX_ROWS * 32, ALIGNMENT)?,
+            prefill_rope_sin: builder.reserve(QWEN35_ATTENTION_MAX_ROWS * 32, ALIGNMENT)?,
+            prefill_table_rows: builder.reserve(QWEN35_ATTENTION_MAX_ROWS, ALIGNMENT)?,
+            prefill_cache_positions: builder.reserve(QWEN35_ATTENTION_MAX_ROWS, ALIGNMENT)?,
+            prefill_lengths: builder.reserve(QWEN35_ATTENTION_MAX_ROWS, ALIGNMENT)?,
+            query: builder.reserve(row_attention, ALIGNMENT)?,
             key_pages: builder.reserve(cache_plane, ALIGNMENT)?,
             value_pages: builder.reserve(cache_plane, ALIGNMENT)?,
-            attention: builder.reserve(batch_attention, ALIGNMENT)?,
-            output_activation: builder.reserve(batch_attention, ALIGNMENT)?,
+            attention: builder.reserve(row_attention, ALIGNMENT)?,
+            output_activation: builder.reserve(row_attention, ALIGNMENT)?,
+            output_activation_codes: builder.reserve(row_attention / 2, ALIGNMENT)?,
+            output_activation_scales: builder.reserve(row_attention / NVFP4_GROUP, ALIGNMENT)?,
             output_weight_codes: builder.reserve(output_weight_codes, ALIGNMENT)?,
             output_weight_scales: builder.reserve(output_weight_scales, ALIGNMENT)?,
-            mixer_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
+            mixer_branch: builder.reserve(row_hidden, ALIGNMENT)?,
             post_attention_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            mixer_residual: builder.reserve(batch_hidden, ALIGNMENT)?,
-            mlp_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
-            gate_up_activation_codes: builder.reserve(batch_hidden / 2, ALIGNMENT)?,
-            gate_up_activation_scales: builder.reserve(batch_hidden / NVFP4_GROUP, ALIGNMENT)?,
+            mixer_residual: builder.reserve(row_hidden, ALIGNMENT)?,
+            mlp_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            gate_up_activation_codes: builder.reserve(row_hidden / 2, ALIGNMENT)?,
+            gate_up_activation_scales: builder.reserve(row_hidden / NVFP4_GROUP, ALIGNMENT)?,
             gate_weight_codes: builder.reserve(gate_codes, ALIGNMENT)?,
             up_weight_codes: builder.reserve(gate_codes, ALIGNMENT)?,
             gate_up_weight_scales: builder.reserve(gate_up_scales, ALIGNMENT)?,
-            swiglu: builder.reserve(batch_intermediate, ALIGNMENT)?,
+            swiglu: builder.reserve(row_intermediate, ALIGNMENT)?,
+            down_activation_codes: builder.reserve(row_intermediate / 2, ALIGNMENT)?,
+            down_activation_scales: builder.reserve(row_intermediate / NVFP4_GROUP, ALIGNMENT)?,
             down_weight_codes: builder.reserve(down_weight_codes, ALIGNMENT)?,
             down_weight_scales: builder.reserve(down_weight_scales, ALIGNMENT)?,
-            mlp_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
+            mlp_branch: builder.reserve(row_hidden, ALIGNMENT)?,
             next_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            residual_output: builder.reserve(batch_hidden, ALIGNMENT)?,
-            next_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
+            residual_output: builder.reserve(row_hidden, ALIGNMENT)?,
+            next_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
         };
         let resident_weight_bytes = sum(
             "Qwen3.5 full-attention resident weight bytes",
@@ -207,6 +236,8 @@ impl Qwen35FullAttentionLayerLayout {
             &[
                 regions.residual_input.byte_len(),
                 regions.mixer_normalized.byte_len(),
+                regions.qkv_activation_codes.byte_len(),
+                regions.qkv_activation_scales.byte_len(),
                 regions.qkv.byte_len(),
                 regions.rope_cos.byte_len(),
                 regions.rope_sin.byte_len(),
@@ -214,15 +245,24 @@ impl Qwen35FullAttentionLayerLayout {
                 regions.table_rows.byte_len(),
                 regions.cache_positions.byte_len(),
                 regions.lengths.byte_len(),
+                regions.prefill_rope_cos.byte_len(),
+                regions.prefill_rope_sin.byte_len(),
+                regions.prefill_table_rows.byte_len(),
+                regions.prefill_cache_positions.byte_len(),
+                regions.prefill_lengths.byte_len(),
                 regions.query.byte_len(),
                 regions.attention.byte_len(),
                 regions.output_activation.byte_len(),
+                regions.output_activation_codes.byte_len(),
+                regions.output_activation_scales.byte_len(),
                 regions.mixer_branch.byte_len(),
                 regions.mixer_residual.byte_len(),
                 regions.mlp_normalized.byte_len(),
                 regions.gate_up_activation_codes.byte_len(),
                 regions.gate_up_activation_scales.byte_len(),
                 regions.swiglu.byte_len(),
+                regions.down_activation_codes.byte_len(),
+                regions.down_activation_scales.byte_len(),
                 regions.mlp_branch.byte_len(),
                 regions.residual_output.byte_len(),
                 regions.next_normalized.byte_len(),
@@ -275,6 +315,16 @@ impl Qwen35FullAttentionLayerLayout {
     pub const fn context_capacity(&self) -> usize {
         QWEN35_CONTEXT_CAPACITY
     }
+
+    /// Largest exact row route owned by the layer.
+    pub const fn row_capacity(&self) -> usize {
+        QWEN35_ATTENTION_MAX_ROWS
+    }
+
+    /// Shared from-empty prompt cache capacity.
+    pub const fn prefill_context_capacity(&self) -> usize {
+        QWEN35_PREFILL_CONTEXT_CAPACITY
+    }
 }
 
 fn require_geometry<A: Arch>() -> EngineResult<()> {
@@ -314,7 +364,10 @@ fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALIGNMENT, QWEN35_CONTEXT_CAPACITY, Qwen35FullAttentionLayerLayout};
+    use super::{
+        ALIGNMENT, QWEN35_ATTENTION_MAX_ROWS, QWEN35_CONTEXT_CAPACITY,
+        QWEN35_PREFILL_CONTEXT_CAPACITY, Qwen35FullAttentionLayerLayout,
+    };
 
     #[test]
     fn byte_accounting_is_exact() {
@@ -322,9 +375,9 @@ mod tests {
 
         assert_eq!(layout.resident_weight_bytes(), 117_990_400);
         assert_eq!(layout.cache_bytes(), 6_291_456);
-        assert_eq!(layout.workspace_bytes(), 1_233_088);
-        assert_eq!(layout.owner_bytes(), 125_514_944);
-        assert_eq!(layout.arena_bytes(), 125_515_776);
+        assert_eq!(layout.workspace_bytes(), 21_204_672);
+        assert_eq!(layout.owner_bytes(), 145_486_528);
+        assert_eq!(layout.arena_bytes(), 145_487_360);
         assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 832);
     }
 
@@ -336,6 +389,8 @@ mod tests {
             span(regions.residual_input),
             span(regions.input_norm),
             span(regions.mixer_normalized),
+            span(regions.qkv_activation_codes),
+            span(regions.qkv_activation_scales),
             span(regions.qkv_weight_codes),
             span(regions.qkv_weight_scales),
             span(regions.qkv),
@@ -347,11 +402,18 @@ mod tests {
             span(regions.table_rows),
             span(regions.cache_positions),
             span(regions.lengths),
+            span(regions.prefill_rope_cos),
+            span(regions.prefill_rope_sin),
+            span(regions.prefill_table_rows),
+            span(regions.prefill_cache_positions),
+            span(regions.prefill_lengths),
             span(regions.query),
             span(regions.key_pages),
             span(regions.value_pages),
             span(regions.attention),
             span(regions.output_activation),
+            span(regions.output_activation_codes),
+            span(regions.output_activation_scales),
             span(regions.output_weight_codes),
             span(regions.output_weight_scales),
             span(regions.mixer_branch),
@@ -364,6 +426,8 @@ mod tests {
             span(regions.up_weight_codes),
             span(regions.gate_up_weight_scales),
             span(regions.swiglu),
+            span(regions.down_activation_codes),
+            span(regions.down_activation_scales),
             span(regions.down_weight_codes),
             span(regions.down_weight_scales),
             span(regions.mlp_branch),
@@ -388,6 +452,13 @@ mod tests {
 
         assert_eq!(layout.context_capacity(), QWEN35_CONTEXT_CAPACITY);
         assert_eq!(layout.context_capacity(), 192);
+        assert_eq!(layout.row_capacity(), QWEN35_ATTENTION_MAX_ROWS);
+        assert_eq!(layout.row_capacity(), 128);
+        assert_eq!(
+            layout.prefill_context_capacity(),
+            QWEN35_PREFILL_CONTEXT_CAPACITY
+        );
+        assert_eq!(layout.prefill_context_capacity(), 1_536);
         assert_eq!(layout.cache_bytes(), 6_291_456);
     }
 
