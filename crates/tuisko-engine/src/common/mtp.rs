@@ -1,10 +1,12 @@
 //! Target-neutral MTP host coordination shared by every speculative target.
 
+use crate::common::banks::row;
 use crate::common::rope::{ROTARY_PAIRS, fill_contiguous_rope};
 use crate::{
-    EngineError, EngineResult, GenerationSession, GenerationStep, SamplingDistribution,
+    EngineError, EngineResult, GenerationSession, GenerationStep, MAX_BATCH, SamplingDistribution,
     speculative_decision,
 };
+use std::ops::Range;
 
 pub(crate) const DRAFT_WINDOW: usize = 3;
 pub(crate) const VERIFY_ROWS: usize = DRAFT_WINDOW + 1;
@@ -259,6 +261,139 @@ pub(crate) fn decide_sampled_round(
     )?;
     for (index, &token) in round.token_ids().iter().enumerate() {
         queued[index] = Some(control.accept_token(token)?);
+    }
+    Ok((round.token_ids().len(), round.accepted_drafts()))
+}
+
+/// Ordered outputs one compact-batch slot committed in a single MTP transaction.
+pub(crate) struct MtpEventBuilder {
+    steps: [Option<GenerationStep>; VERIFY_ROWS],
+    len: usize,
+}
+
+impl MtpEventBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            steps: std::array::from_fn(|_| None),
+            len: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, step: GenerationStep) -> EngineResult<()> {
+        let destination = self.steps.get_mut(self.len).ok_or_else(|| {
+            EngineError::generation("one MTP transaction produced more than four outputs")
+        })?;
+        *destination = Some(step);
+        self.len += 1;
+        Ok(())
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn step(&self, index: usize) -> Option<&GenerationStep> {
+        self.steps.get(index).and_then(Option::as_ref)
+    }
+
+    /// Removes the committed prefix, leaving the accumulated length observable.
+    pub(crate) fn take_steps(&mut self) -> [Option<GenerationStep>; VERIFY_ROWS] {
+        std::mem::replace(&mut self.steps, std::array::from_fn(|_| None))
+    }
+
+    pub(crate) fn token_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.steps[..self.len].iter().map(|step| {
+            step.as_ref()
+                .expect("MTP event prefix is initialized")
+                .token_id
+        })
+    }
+}
+
+/// Compact download row `index`, which follows the bank's eight per-slot rows.
+fn download_row(index: usize, vocab: usize) -> Range<usize> {
+    row(MAX_BATCH + index, vocab)
+}
+
+/// Runs the greedy acceptance law over one compact-batch verification lane.
+pub(crate) fn decide_greedy_lane(
+    control: &mut GenerationSession,
+    logits: &[u16],
+    vocab: usize,
+    lane: usize,
+    drafts: &[u32],
+    builder: &mut MtpEventBuilder,
+) -> EngineResult<(usize, usize)> {
+    let tokens = drafts.len() + 1;
+    let mut accepted = 0;
+    for (draft, &draft_token) in drafts.iter().enumerate() {
+        let row = download_row(lane * tokens + draft, vocab);
+        let step = control.accept_logits(&logits[row])?;
+        let matches = step.token_id == draft_token;
+        let terminal = step.finish_reason.is_some();
+        builder.push(step)?;
+        if matches {
+            accepted += 1;
+        }
+        if terminal || !matches {
+            return Ok((builder.len(), accepted));
+        }
+    }
+    if control.finish_reason().is_none() {
+        let row = download_row(lane * tokens + drafts.len(), vocab);
+        builder.push(control.accept_logits(&logits[row])?)?;
+    }
+    Ok((builder.len(), accepted))
+}
+
+/// Runs the unbiased sampled acceptance law over one compact-batch lane.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decide_sampled_lane(
+    control: &mut GenerationSession,
+    logits: &[u16],
+    vocab: usize,
+    stop_ids: &[u32],
+    lane: usize,
+    drafts: &[u32],
+    draft_laws: &[Option<SamplingDistribution>],
+    builder: &mut MtpEventBuilder,
+) -> EngineResult<(usize, usize)> {
+    let tokens = drafts.len() + 1;
+    let mut target_laws = Vec::with_capacity(tokens);
+    for row in 0..tokens {
+        let logit_row = download_row(lane * tokens + row, vocab);
+        target_laws.push(
+            control.sampling_distribution(&logits[logit_row], &drafts[..row.min(drafts.len())])?,
+        );
+    }
+    let mut acceptance_units = [0.0f64; DRAFT_WINDOW];
+    let mut residual_units = [0.0f64; DRAFT_WINDOW];
+    for row in 0..drafts.len() {
+        acceptance_units[row] = control.random_unit();
+        residual_units[row] = control.random_unit();
+    }
+    let bonus_unit = control.random_unit();
+    let target_refs = target_laws.iter().collect::<Vec<_>>();
+    let draft_refs = draft_laws
+        .iter()
+        .enumerate()
+        .map(|(row, law)| {
+            law.as_ref().ok_or_else(|| {
+                EngineError::generation(format!("sampled MTP proposal {row} has no distribution"))
+            })
+        })
+        .collect::<EngineResult<Vec<_>>>()?;
+    let round = decide_sampled_tokens(
+        drafts,
+        &target_refs,
+        &draft_refs,
+        stop_ids,
+        &acceptance_units[..drafts.len()],
+        &residual_units[..drafts.len()],
+        bonus_unit,
+    )?;
+    for &token in round.token_ids() {
+        builder.push(control.accept_token(token)?)?;
     }
     Ok((round.token_ids().len(), round.accepted_drafts()))
 }

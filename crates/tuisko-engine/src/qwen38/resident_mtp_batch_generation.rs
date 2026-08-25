@@ -2,7 +2,8 @@
 
 use crate::common::banks::{compact, row};
 use crate::common::mtp::{
-    DRAFT_WINDOW, VERIFY_ROWS, decide_sampled_tokens, require_generation_capacity,
+    DRAFT_WINDOW, MtpEventBuilder, VERIFY_ROWS, decide_greedy_lane, decide_sampled_lane,
+    require_generation_capacity,
 };
 use crate::common::rope::{ROTARY_PAIRS, fill_contiguous_rope, text_rope};
 use crate::common::slots::device_zero_context;
@@ -81,11 +82,6 @@ struct RetainedMtpSlot {
     last_used: u64,
 }
 
-struct EventBuilder {
-    steps: [Option<GenerationStep>; VERIFY_ROWS],
-    len: usize,
-}
-
 struct LaneDrafts {
     tokens: [u32; DRAFT_WINDOW],
     laws: [Option<SamplingDistribution>; DRAFT_WINDOW],
@@ -95,32 +91,6 @@ struct LaneDrafts {
 enum TargetRoundRoute {
     Single(ResidentMtpVerifyRoute),
     Segmented(ResidentMtpSegmentedVerifyRoute),
-}
-
-impl EventBuilder {
-    fn new() -> Self {
-        Self {
-            steps: std::array::from_fn(|_| None),
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, step: GenerationStep) -> EngineResult<()> {
-        let destination = self.steps.get_mut(self.len).ok_or_else(|| {
-            EngineError::generation("one MTP transaction produced more than four outputs")
-        })?;
-        *destination = Some(step);
-        self.len += 1;
-        Ok(())
-    }
-
-    fn token_ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.steps[..self.len].iter().map(|step| {
-            step.as_ref()
-                .expect("MTP event prefix is initialized")
-                .token_id
-        })
-    }
 }
 
 impl LaneDrafts {
@@ -438,7 +408,8 @@ impl ResidentMtpBatchGenerator {
         }
         let active = self.active;
         let active_slots = self.active_slots;
-        let mut builders: [EventBuilder; MAX_BATCH] = std::array::from_fn(|_| EventBuilder::new());
+        let mut builders: [MtpEventBuilder; MAX_BATCH] =
+            std::array::from_fn(|_| MtpEventBuilder::new());
         let mut started = [false; MAX_BATCH];
         let mut fresh = [usize::MAX; MAX_BATCH];
         let mut fresh_count = 0;
@@ -705,7 +676,7 @@ impl ResidentMtpBatchGenerator {
     fn start_anchors(
         &mut self,
         slots: &[usize],
-        builders: &mut [EventBuilder; MAX_BATCH],
+        builders: &mut [MtpEventBuilder; MAX_BATCH],
     ) -> EngineResult<()> {
         let mut positions = [0u32; MAX_BATCH];
         let mut anchors = [0u32; MAX_BATCH];
@@ -779,7 +750,7 @@ impl ResidentMtpBatchGenerator {
     fn run_tail(
         &mut self,
         slots: &[usize],
-        builders: &mut [EventBuilder; MAX_BATCH],
+        builders: &mut [MtpEventBuilder; MAX_BATCH],
     ) -> EngineResult<()> {
         let mut inputs = Vec::with_capacity(slots.len());
         for &slot in slots {
@@ -807,7 +778,7 @@ impl ResidentMtpBatchGenerator {
     fn run_speculative(
         &mut self,
         slots: &[usize],
-        builders: &mut [EventBuilder; MAX_BATCH],
+        builders: &mut [MtpEventBuilder; MAX_BATCH],
     ) -> EngineResult<()> {
         let remaining = slots
             .iter()
@@ -1062,31 +1033,19 @@ impl ResidentMtpBatchGenerator {
         lane: usize,
         extent: usize,
         drafts: &LaneDrafts,
-        builder: &mut EventBuilder,
+        builder: &mut MtpEventBuilder,
     ) -> EngineResult<(usize, usize)> {
-        let tokens = extent + 1;
         let session = self.sessions[slot]
             .as_mut()
             .expect("greedy resident MTP session exists");
-        let mut accepted = 0;
-        for draft in 0..extent {
-            let row = target_download_row(lane * tokens + draft);
-            let step = session.control.accept_logits(&self.target_logits[row])?;
-            let matches = step.token_id == drafts.tokens[draft];
-            let terminal = step.finish_reason.is_some();
-            builder.push(step)?;
-            if matches {
-                accepted += 1;
-            }
-            if terminal || !matches {
-                return Ok((builder.len, accepted));
-            }
-        }
-        if session.control.finish_reason().is_none() {
-            let row = target_download_row(lane * tokens + extent);
-            builder.push(session.control.accept_logits(&self.target_logits[row])?)?;
-        }
-        Ok((builder.len, accepted))
+        decide_greedy_lane(
+            &mut session.control,
+            &self.target_logits,
+            Qwen38_27B::VOCAB,
+            lane,
+            &drafts.tokens[..extent],
+            builder,
+        )
     }
 
     fn decide_sampled(
@@ -1095,59 +1054,28 @@ impl ResidentMtpBatchGenerator {
         lane: usize,
         extent: usize,
         drafts: &mut LaneDrafts,
-        builder: &mut EventBuilder,
+        builder: &mut MtpEventBuilder,
     ) -> EngineResult<(usize, usize)> {
-        let tokens = extent + 1;
         let session = self.sessions[slot]
             .as_mut()
             .expect("sampled resident MTP session exists");
-        let mut target_laws = Vec::with_capacity(tokens);
-        for row in 0..tokens {
-            let logits = target_download_row(lane * tokens + row);
-            target_laws.push(session.control.sampling_distribution(
-                &self.target_logits[logits],
-                &drafts.tokens[..row.min(extent)],
-            )?);
-        }
-        let mut acceptance_units = [0.0f64; DRAFT_WINDOW];
-        let mut residual_units = [0.0f64; DRAFT_WINDOW];
-        for row in 0..extent {
-            acceptance_units[row] = session.control.random_unit();
-            residual_units[row] = session.control.random_unit();
-        }
-        let bonus_unit = session.control.random_unit();
-        let target_refs = target_laws.iter().collect::<Vec<_>>();
-        let draft_refs = drafts.laws[..extent]
-            .iter()
-            .enumerate()
-            .map(|(row, law)| {
-                law.as_ref().ok_or_else(|| {
-                    EngineError::generation(format!(
-                        "sampled MTP proposal {row} has no distribution"
-                    ))
-                })
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
-        let round = decide_sampled_tokens(
-            &drafts.tokens[..extent],
-            &target_refs,
-            &draft_refs,
+        decide_sampled_lane(
+            &mut session.control,
+            &self.target_logits,
+            Qwen38_27B::VOCAB,
             &self.stop_ids,
-            &acceptance_units[..extent],
-            &residual_units[..extent],
-            bonus_unit,
-        )?;
-        for &token in round.token_ids() {
-            builder.push(session.control.accept_token(token)?)?;
-        }
-        Ok((round.token_ids().len(), round.accepted_drafts()))
+            lane,
+            &drafts.tokens[..extent],
+            &drafts.laws[..extent],
+            builder,
+        )
     }
 
     fn commit_and_realign(
         &mut self,
         route: TargetRoundRoute,
         slots: &[usize],
-        builders: &[EventBuilder; MAX_BATCH],
+        builders: &[MtpEventBuilder; MAX_BATCH],
         committed: &[usize],
         accepted: &[usize],
     ) -> EngineResult<()> {
@@ -1260,14 +1188,14 @@ impl ResidentMtpBatchGenerator {
     fn finish_events(
         &mut self,
         active_slots: &[usize],
-        mut builders: [EventBuilder; MAX_BATCH],
+        mut builders: [MtpEventBuilder; MAX_BATCH],
     ) -> EngineResult<ResidentMtpBatchEvents> {
         let mut events = std::array::from_fn(|_| None);
         let mut survivors = [usize::MAX; MAX_BATCH];
         let mut surviving = 0;
         for (index, &slot) in active_slots.iter().enumerate() {
-            let builder = std::mem::replace(&mut builders[slot], EventBuilder::new());
-            if builder.len == 0 {
+            let mut builder = std::mem::replace(&mut builders[slot], MtpEventBuilder::new());
+            if builder.len() == 0 {
                 return Err(EngineError::generation(
                     "active resident MTP request produced no event",
                 ));
@@ -1300,8 +1228,8 @@ impl ResidentMtpBatchGenerator {
             };
             events[index] = Some(ResidentMtpBatchEvent {
                 request_id,
-                steps: builder.steps,
-                len: builder.len,
+                steps: builder.take_steps(),
+                len: builder.len(),
                 completed,
                 stats,
             });
