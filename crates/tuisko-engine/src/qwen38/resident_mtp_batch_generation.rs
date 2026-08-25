@@ -6,7 +6,7 @@ use crate::common::mtp::{
 };
 use crate::common::rope::{ROTARY_PAIRS, fill_contiguous_rope, text_rope};
 use crate::common::slots::device_zero_context;
-use crate::resident_mtp_generation::prime_prompt;
+use crate::qwen38::resident_mtp_generation::prime_prompt;
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, GeneratedText, GenerationSession,
     GenerationStep, MAX_BATCH, ResidentBatchAdmission, ResidentCancellation, ResidentLoadProgress,

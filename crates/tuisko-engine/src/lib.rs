@@ -10,7 +10,6 @@ mod qwen35;
 mod qwen36;
 mod qwen38;
 mod resident_generation;
-mod resident_mtp_generation;
 mod sampling;
 
 #[cfg(feature = "qualification")]
@@ -98,6 +97,7 @@ pub use qwen38::resident_mtp::{
 pub use qwen38::resident_mtp_batch_generation::{
     ResidentMtpBatchEvent, ResidentMtpBatchEvents, ResidentMtpBatchGenerator,
 };
+pub use qwen38::resident_mtp_generation::{ResidentMtpGenerationSession, ResidentMtpTextGenerator};
 pub use qwen38::resident_mtp_layout::ResidentMtpLayout;
 pub use resident_generation::{
     Qwen35ResidentGenerationSession, Qwen35ResidentTextGenerator, Qwen36ResidentGenerationSession,
@@ -105,7 +105,6 @@ pub use resident_generation::{
     ResidentBatchGenerator, ResidentCancellation, ResidentGenerationSession, ResidentRequestId,
     ResidentTextGenerator,
 };
-pub use resident_mtp_generation::{ResidentMtpGenerationSession, ResidentMtpTextGenerator};
 pub use sampling::{
     SampleDecision, Sampler, SamplingDistribution, SamplingOptions, SamplingPenalties,
     SpeculativeDecision, speculative_accept_probability, speculative_decision,
