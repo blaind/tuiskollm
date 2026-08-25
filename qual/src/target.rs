@@ -9,11 +9,11 @@ pub(crate) use tuisko_kernels_sm120::{
     FullAttentionQkvOp, MtpBf16AttentionOutputOp, MtpBf16FusionOp, MtpBf16MlpOp,
     MtpBf16QkPrepareOp, MtpBf16QkvOp, Qwen35Bf16LmHeadOp, Qwen35GdnPrepareOp,
     Qwen35GdnRecurrenceOp, Qwen35MtpBf16AttentionOutputOp, Qwen35MtpBf16FusionOp,
-    Qwen35MtpBf16QkPrepareOp, Qwen35MtpBf16QkvOp, Qwen35Nvfp4AttentionOutputOp, Qwen35Nvfp4DownOp,
-    Qwen35Nvfp4GdnInputOp, Qwen35Nvfp4GdnOutputOp, Qwen35Nvfp4QkvOp, Qwen35Nvfp4SwiGluOp,
-    Qwen35ResidualNormOp, Qwen36AttentionOutputOp, Qwen36Fp8QkvOp, Qwen36GdnInputOp,
-    Qwen36GdnOutputOp, Qwen36MoeExpertsOp, Qwen36MoeRouterOp, Qwen36Nvfp4LmHeadOp,
-    Qwen36ResidualNormOp, ResidualNormOp,
+    Qwen35MtpBf16MlpOp, Qwen35MtpBf16QkPrepareOp, Qwen35MtpBf16QkvOp, Qwen35Nvfp4AttentionOutputOp,
+    Qwen35Nvfp4DownOp, Qwen35Nvfp4GdnInputOp, Qwen35Nvfp4GdnOutputOp, Qwen35Nvfp4QkvOp,
+    Qwen35Nvfp4SwiGluOp, Qwen35ResidualNormOp, Qwen36AttentionOutputOp, Qwen36Fp8QkvOp,
+    Qwen36GdnInputOp, Qwen36GdnOutputOp, Qwen36MoeExpertsOp, Qwen36MoeRouterOp,
+    Qwen36Nvfp4LmHeadOp, Qwen36ResidualNormOp, ResidualNormOp,
 };
 
 #[cfg(feature = "device")]
