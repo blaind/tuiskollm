@@ -24,7 +24,7 @@ use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::T
 use tokio::sync::oneshot;
 use tuisko_engine::{
     EngineError, GenerationStep, MAX_BATCH, Qwen35ResidentMtpBatchGenerator,
-    Qwen36ResidentTextGenerator, ResidentBatchAdmission, ResidentLoadPhase, ResidentLoadProgress,
+    Qwen36ResidentBatchGenerator, ResidentBatchAdmission, ResidentLoadPhase, ResidentLoadProgress,
     ResidentMtpBatchGenerator, ResidentRequestId,
 };
 use tuisko_frontend::GenerationDefaults;
@@ -37,7 +37,7 @@ const DEFAULT_SEED_SCRAMBLE: u64 = 0x9e37_79b9_7f4a_7c15;
 const GENERATION_REPLY_BUFFER: usize = 32;
 const MTP_GENERATION_ROUTE: &str = "mtp-draft-3";
 const QWEN35_MTP_GENERATION_ROUTE: &str = "mtp-b1-compact-b2-8";
-const SINGLE_TOKEN_GENERATION_ROUTE: &str = "single-token";
+const QWEN36_COMPACT_GENERATION_ROUTE: &str = "compact-b1-8";
 
 /// Startup configuration for the one exact resident server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,7 +147,7 @@ impl ResidentTarget {
         match self {
             Self::Qwen38 => MTP_GENERATION_ROUTE,
             Self::Qwen35 => QWEN35_MTP_GENERATION_ROUTE,
-            Self::Qwen36 => SINGLE_TOKEN_GENERATION_ROUTE,
+            Self::Qwen36 => QWEN36_COMPACT_GENERATION_ROUTE,
         }
     }
 }
@@ -294,7 +294,7 @@ fn engine_worker(
         return;
     }
     if target == ResidentTarget::Qwen36 {
-        qwen36_engine_worker(snapshot, jobs, ready, worker_ready);
+        qwen36_engine_worker(snapshot, jobs, ready, failure, worker_ready);
         return;
     }
     let generator = (|| {
@@ -492,6 +492,8 @@ fn qwen35_engine_worker(
     loop {
         if let Err(error) = cancel_qwen35_disconnected(&mut generator, &mut replies) {
             fail_all(&mut replies, error.clone());
+            jobs.close();
+            fail_queued(&mut jobs, &error);
             let _ = failure.send(error);
             break;
         }
@@ -568,6 +570,7 @@ fn qwen36_engine_worker(
     snapshot: PathBuf,
     mut jobs: Receiver<Job>,
     ready: std_mpsc::SyncSender<Result<Ready, String>>,
+    failure: oneshot::Sender<String>,
     worker_ready: Arc<AtomicBool>,
 ) {
     let loaded = (|| {
@@ -578,8 +581,8 @@ fn qwen36_engine_worker(
         let checkpoint_admission = checkpoint_start.elapsed();
         let tensor_count = snapshot.tensor_count();
         let load_start = Instant::now();
-        let generator = Qwen36ResidentTextGenerator::from_snapshot_device_zero(snapshot)
-            .map_err(|error| format!("loading the resident Qwen3.6 text program: {error}"))?;
+        let generator = Qwen36ResidentBatchGenerator::from_snapshot_device_zero(snapshot)
+            .map_err(|error| format!("loading the resident Qwen3.6 compact program: {error}"))?;
         let resident_load = load_start.elapsed();
         let device_name = generator
             .context()
@@ -615,7 +618,7 @@ fn qwen36_engine_worker(
         prefault_bytes: 0,
         arena_bytes: generator.arena_bytes(),
         host_stager_bytes: generator.host_stager_bytes(),
-        slot_capacity: 1,
+        slot_capacity: MAX_BATCH,
         context_capacity: generator.context_capacity(),
         detailed_load_timing: false,
     };
@@ -624,94 +627,80 @@ fn qwen36_engine_worker(
         return;
     }
 
-    while let Some(job) = jobs.blocking_recv() {
-        run_qwen36_job(&mut generator, job);
-    }
-}
+    let mut replies = HashMap::new();
+    let mut jobs_open = true;
+    loop {
+        if let Err(error) = cancel_qwen36_disconnected(&mut generator, &mut replies) {
+            fail_all(&mut replies, error.clone());
+            jobs.close();
+            fail_queued(&mut jobs, &error);
+            let _ = failure.send(error);
+            break;
+        }
 
-fn run_qwen36_job(generator: &mut Qwen36ResidentTextGenerator, mut job: Job) {
-    if job.reply.is_closed() {
-        job.log.finish(None, 0, 0, "cancelled", None);
-        return;
-    }
-    let mut session = match generator.start(&job.request) {
-        Ok(session) => session,
-        Err(error) => {
-            let message = error.to_string();
-            let _ = job
-                .reply
-                .blocking_send(GenerationReply::Rejected(message.clone()));
-            job.log.finish(None, 0, 0, "error", Some(&message));
-            return;
+        if generator.active_requests() == 0 && jobs_open {
+            match jobs.blocking_recv() {
+                Some(job) => admit_qwen36_job(&mut generator, &mut replies, job),
+                None => jobs_open = false,
+            }
         }
-    };
-    job.log.observe_prompt(session.prompt_metrics().clone());
-    while session.finish_reason().is_none() {
-        if job.reply.is_closed() {
-            job.log.finish(
-                Some(session.prompt_encoding()),
-                session.generated_token_ids().len(),
-                0,
-                "cancelled",
-                None,
-            );
-            return;
+        while jobs_open && generator.active_requests() < MAX_BATCH {
+            match jobs.try_recv() {
+                Ok(job) => admit_qwen36_job(&mut generator, &mut replies, job),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    jobs_open = false;
+                    break;
+                }
+            }
         }
-        let step = match session.step() {
-            Ok(step) => step,
+        if generator.active_requests() == 0 {
+            if jobs_open {
+                continue;
+            }
+            break;
+        }
+
+        let events = match generator.step() {
+            Ok(events) => events,
             Err(error) => {
-                let message = error.to_string();
-                let _ = job
-                    .reply
-                    .blocking_send(GenerationReply::Failed(message.clone()));
-                job.log.finish(
-                    Some(session.prompt_encoding()),
-                    session.generated_token_ids().len(),
-                    0,
-                    "error",
-                    Some(&message),
-                );
-                return;
+                let error = error.to_string();
+                fail_all(&mut replies, error.clone());
+                jobs.close();
+                fail_queued(&mut jobs, &error);
+                let _ = failure.send(error);
+                break;
             }
         };
-        if let Some(delta) = step.delta {
-            job.log.observe_output();
-            if job
-                .reply
-                .blocking_send(GenerationReply::Delta(delta))
-                .is_err()
+        for event in events.iter() {
+            let failed = replies.get_mut(&event.request_id).is_some_and(|reply| {
+                if event.step.delta.is_some() {
+                    reply.log.observe_output();
+                }
+                reply.sender.as_ref().is_none_or(|sender| {
+                    !try_send_generation_steps(sender, core::iter::once(&event.step))
+                })
+            });
+            if failed && let Some(reply) = replies.get_mut(&event.request_id) {
+                reply.sender = None;
+            }
+            if let Some(output) = &event.completed
+                && let Some(mut reply) = replies.remove(&event.request_id)
             {
-                job.log.finish(
-                    Some(session.prompt_encoding()),
-                    session.generated_token_ids().len(),
-                    0,
-                    "cancelled",
+                if let Some(sender) = reply.sender.take() {
+                    let _ = sender.try_send(GenerationReply::Done {
+                        output: output.clone(),
+                        cached_prompt_tokens: reply.cached_prompt_tokens,
+                    });
+                }
+                reply.log.finish(
+                    Some(&output.prompt),
+                    output.token_ids.len(),
+                    reply.cached_prompt_tokens,
+                    output.finish_reason.as_str(),
                     None,
                 );
-                return;
             }
-        }
-    }
-    match session.into_output() {
-        Ok(output) => {
-            let _ = job.reply.blocking_send(GenerationReply::Done {
-                output: output.clone(),
-                cached_prompt_tokens: 0,
-            });
-            job.log.finish(
-                Some(&output.prompt),
-                output.token_ids.len(),
-                0,
-                output.finish_reason.as_str(),
-                None,
-            );
-        }
-        Err(error) => {
-            let message = error.to_string();
-            let _ = job
-                .reply
-                .blocking_send(GenerationReply::Failed(message.clone()));
-            job.log.finish(None, 0, 0, "error", Some(&message));
         }
     }
 }
@@ -896,6 +885,19 @@ fn admit_qwen35_job(
     record_admission(replies, job, admission);
 }
 
+fn admit_qwen36_job(
+    generator: &mut Qwen36ResidentBatchGenerator,
+    replies: &mut HashMap<ResidentRequestId, ActiveReply>,
+    job: Job,
+) {
+    if job.reply.is_closed() {
+        job.log.finish(None, 0, 0, "cancelled", None);
+        return;
+    }
+    let admission = generator.admit(&job.request);
+    record_admission(replies, job, admission);
+}
+
 fn record_admission(
     replies: &mut HashMap<ResidentRequestId, ActiveReply>,
     job: Job,
@@ -977,6 +979,44 @@ fn cancel_disconnected(
 
 fn cancel_qwen35_disconnected(
     generator: &mut Qwen35ResidentMtpBatchGenerator,
+    replies: &mut HashMap<ResidentRequestId, ActiveReply>,
+) -> Result<(), String> {
+    let cancelled = generator
+        .active_request_ids()
+        .filter(|request| {
+            replies
+                .get(request)
+                .is_none_or(|reply| reply.sender.as_ref().is_none_or(Sender::is_closed))
+        })
+        .collect::<Vec<_>>();
+    for request in cancelled {
+        let reply = replies.remove(&request);
+        match generator.cancel(request) {
+            Ok(cancelled) => {
+                if let Some(reply) = reply {
+                    reply.log.finish(
+                        Some(&cancelled.output.prompt),
+                        cancelled.output.token_ids.len(),
+                        reply.cached_prompt_tokens,
+                        "cancelled",
+                        None,
+                    );
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if let Some(reply) = reply {
+                    reply.log.finish(None, 0, 0, "error", Some(&message));
+                }
+                return Err(message);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cancel_qwen36_disconnected(
+    generator: &mut Qwen36ResidentBatchGenerator,
     replies: &mut HashMap<ResidentRequestId, ActiveReply>,
 ) -> Result<(), String> {
     let cancelled = generator
@@ -1557,7 +1597,7 @@ mod tests {
                 Qwen36Moe35B::REVISION,
                 ResidentTarget::Qwen36,
                 Qwen36Moe35B::MODEL_ID,
-                "single-token",
+                "compact-b1-8",
             ),
         ] {
             let target = ResidentTarget::from_snapshot(std::path::Path::new(revision)).unwrap();

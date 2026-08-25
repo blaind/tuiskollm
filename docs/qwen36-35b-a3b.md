@@ -242,15 +242,14 @@ remaining prompt tail through exact B=1 decode. The active server slot now admit
 262,144-position limit through the shared page owner. Every GDN and attention layer also admits a
 bijective compact-row-to-physical-slot map and isolated per-slot reset. A concrete compact owner
 matches sequential output at every `B=1..8`, cancels and reuses a live slot hole, and admits a
-native `T=128` prompt while other requests remain active. The server still exposes one slot until
-that owner replaces its singleton worker.
+native `T=128` prompt while other requests remain active. The server worker now owns that scheduler
+and advertises the exact `compact-b1-8` route with eight physical slots.
 The server now selects this concrete target from the pinned revision directory and publishes
 `nvidia/Qwen3.6-35B-A3B-NVFP4` through the OpenAI health, models, blocking chat, and SSE routes. A
 real localhost thinking-mode `Hello` request emits the two-token reasoning text `Here's`; blocking
 and SSE responses both report 11 prompt tokens, two completion tokens, `finish_reason=length`, and
 the exact model identity. `xtask qualify-qwen36-server` makes those public-boundary checks
-repeatable and stops only the server child it starts. Startup still exposes one slot rather than
-implying compact batching.
+repeatable and stops only the server child it starts.
 
 ## Implementation order
 
