@@ -185,6 +185,10 @@ const MTP_LAYER_RESOURCE_BASELINES: &[&str] = &[
     MTP_BF16_MLP_RESOURCE_BASELINE,
     FP8_LM_HEAD_RESOURCE_BASELINE,
 ];
+const QWEN35_MTP_LAYER_RESOURCE_BASELINES: &[&str] = &[
+    QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE,
+    QWEN35_MTP_RESOURCE_BASELINE,
+];
 const MTP_PROMPT_PRIME_RESOURCE_BASELINES: &[&str] = &[
     RESIDUAL_NORM_RESOURCE_BASELINE,
     MTP_BF16_FUSION_RESOURCE_BASELINE,
@@ -845,6 +849,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-dense-fp8-gdn-layer") => qualify_dense_fp8_gdn_layer(root, &remaining),
         Some("qualify-full-attention-layer") => qualify_full_attention_layer(root, &remaining),
         Some("qualify-mtp-layer") => qualify_mtp_layer(root, &remaining),
+        Some("qualify-qwen35-mtp-layer") => qualify_qwen35_mtp_layer(root, &remaining),
         Some("qualify-target-mtp-verify") => qualify_target_mtp_verify(root, &remaining),
         Some("qualify-mtp-prompt-prime") => qualify_mtp_prompt_prime(root, &remaining),
         Some("qualify-resident-mtp") => qualify_resident_mtp(root, &remaining),
@@ -927,6 +932,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-dense-fp8-gdn-layer") => bench_dense_fp8_gdn_layer(root, &remaining),
         Some("bench-full-attention-layer") => bench_full_attention_layer(root, &remaining),
         Some("bench-mtp-layer") => bench_mtp_layer(root, &remaining),
+        Some("bench-qwen35-mtp-layer") => bench_qwen35_mtp_layer(root, &remaining),
         Some("bench-target-mtp-verify") => bench_target_mtp_verify(root, &remaining),
         Some("bench-mtp-prompt-prime") => bench_mtp_prompt_prime(root, &remaining),
         Some("bench-resident-mtp") => bench_resident_mtp(root, &remaining),
@@ -1074,6 +1080,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-mtp-bf16-qk-prepare"
                     | "qualify-mtp-bf16-paged-gqa"
                     | "qualify-target-mtp-verify"
+                    | "qualify-qwen35-mtp-layer"
                     | "gate-residual-norm"
                     | "gate-qwen35-residual-norm"
                     | "gate-qwen36-residual-norm"
@@ -3330,6 +3337,45 @@ fn qualify_mtp_layer(root: &Path, arguments: &[std::ffi::OsString]) -> Result<()
     gate_mtp_layer(root)
 }
 
+fn qualify_qwen35_mtp_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-qwen35-mtp-layer SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen35_mtp_layer_suite_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    for baseline in QWEN35_MTP_LAYER_RESOURCE_BASELINES {
+        if !root.join(baseline).is_file() {
+            return Err(format!("missing Qwen3.5 MTP layer resource baseline `{baseline}`").into());
+        }
+    }
+    gate_qwen35_residual_norm(root)?;
+    gate_qwen35_mtp_resources(root)
+}
+
 fn qualify_target_mtp_verify(
     root: &Path,
     arguments: &[std::ffi::OsString],
@@ -4903,6 +4949,39 @@ fn bench_mtp_layer(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), 
     run_visible(
         Command::new(executable)
             .arg("mtp-layer")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_qwen35_mtp_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-qwen35-mtp-layer SNAPSHOT [options]".into(),
+        );
+    };
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = Vec::new();
+    for baseline in QWEN35_MTP_LAYER_RESOURCE_BASELINES {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen35-mtp-layer")
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),

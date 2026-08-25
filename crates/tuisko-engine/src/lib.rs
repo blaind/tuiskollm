@@ -25,6 +25,8 @@ mod qwen35_gdn_layer;
 mod qwen35_gdn_layer_layout;
 mod qwen35_long_context_kv;
 mod qwen35_long_context_kv_layout;
+mod qwen35_mtp_layer;
+mod qwen35_mtp_layer_layout;
 mod qwen35_nvfp4_mlp;
 mod qwen35_resident_model;
 mod qwen35_text_endpoint;
@@ -77,6 +79,8 @@ pub use qwen35_long_context_kv::Qwen35LongContextKvProgram;
 pub use qwen35_long_context_kv_layout::{
     QWEN35_LONG_CONTEXT_PHYSICAL_PAGES, QWEN35_MAX_CONTEXT_TOKENS, Qwen35LongContextKvLayout,
 };
+pub use qwen35_mtp_layer::Qwen35MtpLayerProgram;
+pub use qwen35_mtp_layer_layout::Qwen35MtpLayerLayout;
 pub use qwen35_nvfp4_mlp::Qwen35Nvfp4MlpProgram;
 pub use qwen35_resident_model::{
     Qwen35ResidentLayerKind, Qwen35ResidentModelLayout, Qwen35ResidentModelProgram,
@@ -146,6 +150,8 @@ pub use qwen35_full_attention_layer::{
 };
 #[cfg(feature = "qualification")]
 pub use qwen35_gdn_layer::{Qwen35GdnLayerImmutable, Qwen35GdnLayerObservables};
+#[cfg(feature = "qualification")]
+pub use qwen35_mtp_layer::Qwen35MtpLayerObservables;
 #[cfg(feature = "qualification")]
 pub use qwen35_resident_model::Qwen35ResidentModelObservables;
 #[cfg(feature = "qualification")]
