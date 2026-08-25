@@ -225,7 +225,7 @@ fn verify_prompt_fixtures(
 fn verify_owner(
     generator: &Qwen35ResidentTextGenerator,
 ) -> Result<(), Qwen35GenerationQualificationError> {
-    if generator.arena_bytes() != 7_039_864_832
+    if generator.arena_bytes() != 7_039_870_976
         || generator.host_stager_bytes() != 1_610_752
         || generator.context_capacity() != 192
     {
@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(report.prompt_cases, 2);
         assert!((1..=2).contains(&report.chat_steps));
         assert_eq!(report.native_prefill_tokens, [0, 32, 32, 64, 64, 128, 128]);
-        assert_eq!(report.arena_bytes, 7_039_864_832);
+        assert_eq!(report.arena_bytes, 7_039_870_976);
         assert_eq!(report.host_stager_bytes, 1_610_752);
         assert_eq!(report.stable_addresses, 34);
         eprintln!("Qwen3.5 generation qualification passed: {report:?}");

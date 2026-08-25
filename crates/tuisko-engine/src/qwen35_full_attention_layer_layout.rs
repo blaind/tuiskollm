@@ -9,10 +9,8 @@ const ALIGNMENT: usize = 256;
 const NVFP4_GROUP: usize = 16;
 pub(crate) const QWEN35_PHYSICAL_PAGES: usize = 24;
 pub(crate) const QWEN35_TABLE_STRIDE: usize = 3;
-pub(crate) const QWEN35_CONTEXT_CAPACITY: usize = QWEN35_TABLE_STRIDE * ATTENTION_PAGE_SIZE;
 pub(crate) const QWEN35_PREFILL_TABLE_STRIDE: usize = QWEN35_PHYSICAL_PAGES;
-pub(crate) const QWEN35_PREFILL_CONTEXT_CAPACITY: usize =
-    QWEN35_PREFILL_TABLE_STRIDE * ATTENTION_PAGE_SIZE;
+pub(crate) const QWEN35_CONTEXT_CAPACITY: usize = QWEN35_TABLE_STRIDE * ATTENTION_PAGE_SIZE;
 pub(crate) const QWEN35_ATTENTION_MAX_ROWS: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
@@ -65,6 +63,7 @@ pub(crate) struct Qwen35FullAttentionLayerRegions {
     pub(crate) next_norm: ArenaRegion<u16>,
     pub(crate) residual_output: ArenaRegion<u16>,
     pub(crate) next_normalized: ArenaRegion<u16>,
+    pub(crate) prefill_block_tables: ArenaRegion<u32>,
 }
 
 /// Checked weights, BF16 KV cache, metadata, and workspace for one Qwen3.5 layer.
@@ -207,6 +206,8 @@ impl Qwen35FullAttentionLayerLayout {
             next_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
             residual_output: builder.reserve(row_hidden, ALIGNMENT)?,
             next_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            prefill_block_tables: builder
+                .reserve(MAX_BATCH * QWEN35_PREFILL_TABLE_STRIDE, ALIGNMENT)?,
         };
         let resident_weight_bytes = sum(
             "Qwen3.5 full-attention resident weight bytes",
@@ -242,6 +243,7 @@ impl Qwen35FullAttentionLayerLayout {
                 regions.rope_cos.byte_len(),
                 regions.rope_sin.byte_len(),
                 regions.block_tables.byte_len(),
+                regions.prefill_block_tables.byte_len(),
                 regions.table_rows.byte_len(),
                 regions.cache_positions.byte_len(),
                 regions.lengths.byte_len(),
@@ -321,9 +323,9 @@ impl Qwen35FullAttentionLayerLayout {
         QWEN35_ATTENTION_MAX_ROWS
     }
 
-    /// Shared from-empty prompt cache capacity.
+    /// Per-slot from-empty prompt cache capacity.
     pub const fn prefill_context_capacity(&self) -> usize {
-        QWEN35_PREFILL_CONTEXT_CAPACITY
+        QWEN35_CONTEXT_CAPACITY
     }
 }
 
@@ -366,7 +368,7 @@ fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {
 mod tests {
     use super::{
         ALIGNMENT, QWEN35_ATTENTION_MAX_ROWS, QWEN35_CONTEXT_CAPACITY,
-        QWEN35_PREFILL_CONTEXT_CAPACITY, Qwen35FullAttentionLayerLayout,
+        Qwen35FullAttentionLayerLayout,
     };
 
     #[test]
@@ -375,9 +377,9 @@ mod tests {
 
         assert_eq!(layout.resident_weight_bytes(), 117_990_400);
         assert_eq!(layout.cache_bytes(), 6_291_456);
-        assert_eq!(layout.workspace_bytes(), 21_204_672);
-        assert_eq!(layout.owner_bytes(), 145_486_528);
-        assert_eq!(layout.arena_bytes(), 145_487_360);
+        assert_eq!(layout.workspace_bytes(), 21_205_440);
+        assert_eq!(layout.owner_bytes(), 145_487_296);
+        assert_eq!(layout.arena_bytes(), 145_488_128);
         assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 832);
     }
 
@@ -434,6 +436,7 @@ mod tests {
             span(regions.next_norm),
             span(regions.residual_output),
             span(regions.next_normalized),
+            span(regions.prefill_block_tables),
         ];
         spans.sort_unstable_by_key(|(offset, _)| *offset);
 
@@ -454,11 +457,8 @@ mod tests {
         assert_eq!(layout.context_capacity(), 192);
         assert_eq!(layout.row_capacity(), QWEN35_ATTENTION_MAX_ROWS);
         assert_eq!(layout.row_capacity(), 128);
-        assert_eq!(
-            layout.prefill_context_capacity(),
-            QWEN35_PREFILL_CONTEXT_CAPACITY
-        );
-        assert_eq!(layout.prefill_context_capacity(), 1_536);
+        assert_eq!(layout.prefill_context_capacity(), QWEN35_CONTEXT_CAPACITY);
+        assert_eq!(layout.prefill_context_capacity(), 192);
         assert_eq!(layout.cache_bytes(), 6_291_456);
     }
 

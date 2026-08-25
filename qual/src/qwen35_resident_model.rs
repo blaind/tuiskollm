@@ -171,6 +171,8 @@ pub fn qualify_qwen35_resident_model(
         }
     }
 
+    verify_prefill_slot_equivalence(&mut program, &stream)?;
+
     verify_no_post_warmup_allocation(&mut program, &stream)?;
     device_benchmark::require_current_process_exclusive()?;
 
@@ -208,6 +210,53 @@ fn prepare_run(
     let rope_sin = vec![0.0f32; batch * ROTARY_PAIRS];
     program.load_decode_state(stream, batch, &positions, &rope_cos, &rope_sin)?;
     program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+
+    Ok(())
+}
+
+fn verify_prefill_slot_equivalence(
+    program: &mut Qwen35ResidentModelProgram,
+    stream: &CudaStream,
+) -> Result<(), Qwen35ResidentModelQualificationError> {
+    const TOKENS: usize = 32;
+    const SLOT: usize = 5;
+    let ids = prefill_token_ids(TOKENS, 7);
+    let rope_cos = vec![1.0f32; TOKENS * ROTARY_PAIRS];
+    let rope_sin = vec![0.0f32; TOKENS * ROTARY_PAIRS];
+
+    program.reset_state(stream)?;
+    program.stage_prefill_embeddings(stream, &ids)?;
+    let mapped_route =
+        program.load_prefill_slot_state(stream, TOKENS, SLOT, &rope_cos, &rope_sin)?;
+    program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+    program.replay_prefill(stream, mapped_route)?;
+    let mapped = program.qualification_prefill_observables(stream, mapped_route)?;
+
+    program.reset_state(stream)?;
+    program.stage_prefill_embeddings(stream, &ids)?;
+    let row_zero_route = program.load_prefill_state(stream, TOKENS, &rope_cos, &rope_sin)?;
+    program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+    program.replay_prefill(stream, row_zero_route)?;
+    let row_zero = program.qualification_prefill_observables(stream, row_zero_route)?;
+
+    compare_prefill_words(
+        TOKENS,
+        "slot-independent prompt residual",
+        &mapped.final_residual,
+        &row_zero.final_residual,
+    )?;
+    compare_prefill_words(
+        TOKENS,
+        "slot-independent prompt normalization",
+        &mapped.normalized,
+        &row_zero.normalized,
+    )?;
+    compare_prefill_words(
+        TOKENS,
+        "slot-independent prompt logits",
+        &mapped.logits,
+        &row_zero.logits,
+    )?;
 
     Ok(())
 }
@@ -656,8 +705,8 @@ mod tests {
         assert_eq!(report.arena_addresses, 33);
         assert_eq!(report.weight_bytes, 5_931_820_032);
         assert_eq!(report.cache_bytes, 50_331_648);
-        assert_eq!(report.workspace_bytes, 1_057_691_904);
-        assert_eq!(report.arena_bytes, 7_039_864_832);
+        assert_eq!(report.workspace_bytes, 1_057_698_048);
+        assert_eq!(report.arena_bytes, 7_039_870_976);
         assert_eq!(report.host_stager_bytes, 1_114_112);
         assert!(report.maximum_normalization_error.is_finite());
         assert!(report.maximum_logit_error.is_finite());
