@@ -310,6 +310,222 @@ const TEXT_ENDPOINT_RESOURCE_BASELINES: &[&str] = &[
     RESIDUAL_NORM_RESOURCE_BASELINE,
     FP8_LM_HEAD_RESOURCE_BASELINE,
 ];
+/// Qwen 3.5 resident MTP baselines: the resident model set followed by the
+/// MTP layer set. The repeated residual-norm entry is deliberate; the
+/// concatenation is hashed positionally and is never deduplicated.
+const QWEN35_RESIDENT_MTP_RESOURCE_BASELINES: &[&str] = &[
+    QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE,
+    QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE,
+    QWEN35_NVFP4_DOWN_RESOURCE_BASELINE,
+    QWEN35_NVFP4_QKV_RESOURCE_BASELINE,
+    QWEN35_BF16_LM_HEAD_RESOURCE_BASELINE,
+    QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE,
+    QWEN35_GDN_PREPARE_RESOURCE_BASELINE,
+    QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE,
+    QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE,
+    QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+    QWEN35_PAGED_GQA_RESOURCE_BASELINE,
+    QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE,
+    QWEN35_MTP_RESOURCE_BASELINE,
+];
+/// Ordered resource baselines for each canonical `bench-device` suite. The
+/// order feeds `TUISKO_GENERATOR_BASELINE_SHA256` and binds the benchmark's
+/// measurement identity, so entries are never reordered or deduplicated.
+const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
+    (
+        "qwen35-residual-norm",
+        &[QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen36-residual-norm",
+        &[QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen35-nvfp4-swiglu",
+        &[QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE],
+    ),
+    ("qwen35-nvfp4-down", &[QWEN35_NVFP4_DOWN_RESOURCE_BASELINE]),
+    ("qwen35-nvfp4-qkv", &[QWEN35_NVFP4_QKV_RESOURCE_BASELINE]),
+    ("qwen36-moe-router", &[QWEN36_MOE_ROUTER_RESOURCE_BASELINE]),
+    (
+        "qwen36-moe-experts",
+        &[QWEN36_MOE_EXPERTS_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen36-nvfp4-lm-head",
+        &[QWEN36_NVFP4_LM_HEAD_RESOURCE_BASELINE],
+    ),
+    ("qwen36-fp8-qkv", &[QWEN36_FP8_QKV_RESOURCE_BASELINE]),
+    ("qwen36-gdn-input", &[QWEN36_GDN_INPUT_RESOURCE_BASELINE]),
+    ("qwen36-gdn-output", &[QWEN36_GDN_OUTPUT_RESOURCE_BASELINE]),
+    (
+        "qwen36-attention-output",
+        QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINES,
+    ),
+    (
+        "qwen36-gdn-prepare",
+        &[QWEN35_GDN_PREPARE_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen36-gdn-recurrence",
+        &[QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen35-nvfp4-gdn-input",
+        &[QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen35-gdn-prepare",
+        &[QWEN35_GDN_PREPARE_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen35-gdn-recurrence",
+        &[QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen35-nvfp4-gdn-output",
+        &[QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen35-nvfp4-attention-output",
+        &[QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen35-nvfp4-mlp",
+        &[
+            QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE,
+            QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE,
+            QWEN35_NVFP4_DOWN_RESOURCE_BASELINE,
+        ],
+    ),
+    (
+        "qwen35-attention-qk-prepare",
+        &[QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen36-attention-qk-prepare",
+        &[QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen36-fp8-attention-qk-prepare",
+        &[QWEN36_FP8_ATTENTION_QK_PREPARE_RESOURCE_BASELINE],
+    ),
+    (
+        "nvfp4-mlp",
+        &[
+            RESIDUAL_NORM_RESOURCE_BASELINE,
+            NVFP4_SWIGLU_RESOURCE_BASELINE,
+            NVFP4_DOWN_RESOURCE_BASELINE,
+        ],
+    ),
+    ("qwen35-paged-gqa", &[QWEN35_PAGED_GQA_RESOURCE_BASELINE]),
+    ("qwen36-paged-gqa", &[QWEN36_PAGED_GQA_RESOURCE_BASELINE]),
+    (
+        "qwen36-fp8-paged-gqa",
+        &[QWEN36_FP8_PAGED_GQA_RESOURCE_BASELINE],
+    ),
+    (
+        "dense-fp8-mlp",
+        &[
+            RESIDUAL_NORM_RESOURCE_BASELINE,
+            FP8_SWIGLU_RESOURCE_BASELINE,
+            FP8_DOWN_RESOURCE_BASELINE,
+        ],
+    ),
+    (
+        "dense-fp8-gdn-layer",
+        &[
+            RESIDUAL_NORM_RESOURCE_BASELINE,
+            FP8_GDN_INPUT_RESOURCE_BASELINE,
+            GDN_PREPARE_RESOURCE_BASELINE,
+            GDN_RECURRENCE_RESOURCE_BASELINE,
+            GDN_OUTPUT_RESOURCE_BASELINE,
+            FP8_SWIGLU_RESOURCE_BASELINE,
+            FP8_DOWN_RESOURCE_BASELINE,
+        ],
+    ),
+    (
+        "full-attention-layer",
+        &[
+            RESIDUAL_NORM_RESOURCE_BASELINE,
+            FP8_QKV_RESOURCE_BASELINE,
+            ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
+            PAGED_GQA_RESOURCE_BASELINE,
+            ATTENTION_OUTPUT_RESOURCE_BASELINE,
+            FP8_SWIGLU_RESOURCE_BASELINE,
+            FP8_DOWN_RESOURCE_BASELINE,
+        ],
+    ),
+    ("mtp-layer", MTP_LAYER_RESOURCE_BASELINES),
+    ("qwen35-mtp-layer", QWEN35_MTP_LAYER_RESOURCE_BASELINES),
+    ("qwen36-mtp-layer", &[QWEN36_MTP_RESOURCE_BASELINE]),
+    (
+        "qwen35-resident-mtp",
+        QWEN35_RESIDENT_MTP_RESOURCE_BASELINES,
+    ),
+    (
+        "qwen35-mtp-generation",
+        QWEN35_RESIDENT_MTP_RESOURCE_BASELINES,
+    ),
+    (
+        "qwen35-mtp-batch-generation",
+        QWEN35_RESIDENT_MTP_RESOURCE_BASELINES,
+    ),
+    ("target-mtp-verify", RESIDENT_MODEL_RESOURCE_BASELINES),
+    ("mtp-prompt-prime", MTP_PROMPT_PRIME_RESOURCE_BASELINES),
+    ("resident-mtp", RESIDENT_MTP_RESOURCE_BASELINES),
+    ("generation-mtp-greedy", RESIDENT_MTP_RESOURCE_BASELINES),
+    ("generation-mtp-sampling", RESIDENT_MTP_RESOURCE_BASELINES),
+    ("generation-mtp-batch", RESIDENT_MTP_RESOURCE_BASELINES),
+    (
+        "qwen35-full-attention-layer",
+        QWEN35_FULL_ATTENTION_LAYER_RESOURCE_BASELINES,
+    ),
+    ("qwen35-gdn-layer", QWEN35_GDN_LAYER_RESOURCE_BASELINES),
+    (
+        "qwen36-gdn-moe-layer",
+        QWEN36_GDN_MOE_LAYER_RESOURCE_BASELINES,
+    ),
+    (
+        "qwen36-full-attention-layer",
+        QWEN36_FULL_ATTENTION_LAYER_RESOURCE_BASELINES,
+    ),
+    ("resident-model", RESIDENT_MODEL_RESOURCE_BASELINES),
+    ("resident-prefill", RESIDENT_MODEL_RESOURCE_BASELINES),
+    (
+        "resident-long-context-model",
+        RESIDENT_MODEL_RESOURCE_BASELINES,
+    ),
+    (
+        "text-endpoint",
+        &[
+            RESIDUAL_NORM_RESOURCE_BASELINE,
+            FP8_LM_HEAD_RESOURCE_BASELINE,
+        ],
+    ),
+    (
+        "qwen35-text-endpoint",
+        &[
+            QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE,
+            QWEN35_BF16_LM_HEAD_RESOURCE_BASELINE,
+        ],
+    ),
+    (
+        "qwen36-text-endpoint",
+        &[
+            QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE,
+            QWEN36_NVFP4_LM_HEAD_RESOURCE_BASELINE,
+        ],
+    ),
+    (
+        "qwen35-resident-model",
+        QWEN35_RESIDENT_MODEL_RESOURCE_BASELINES,
+    ),
+    (
+        "qwen36-resident-model",
+        QWEN36_RESIDENT_MODEL_RESOURCE_BASELINES,
+    ),
+];
 const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
 const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build-sm120";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
@@ -1317,6 +1533,76 @@ fn build_sm120_for_performance(root: &Path) -> Result<(), Box<dyn Error>> {
     require_performance_device_idle()?;
     build_sm120(root)?;
     wait_for_device_idle()
+}
+
+/// Concatenates the resource baselines binding one benchmark's measurement
+/// identity. The given order is part of that identity: it feeds
+/// `TUISKO_GENERATOR_BASELINE_SHA256`, so it is never sorted or deduplicated.
+fn concatenated_resource_baselines(
+    root: &Path,
+    baseline_paths: &[&str],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut baselines = Vec::new();
+    for baseline in baseline_paths {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    Ok(baselines)
+}
+
+/// The declared baselines for one canonical `bench-device` suite. An
+/// undeclared suite is a wiring error, never a silently empty hash.
+fn bench_device_baselines(suite_name: &str) -> Result<&'static [&'static str], Box<dyn Error>> {
+    BENCH_DEVICE_BASELINES
+        .iter()
+        .find(|(suite, _)| *suite == suite_name)
+        .map(|(_, baselines)| *baselines)
+        .ok_or_else(|| {
+            format!("no resource baselines are declared for benchmark suite `{suite_name}`").into()
+        })
+}
+
+/// The canonical `bench-device` command line: the suite name, then the
+/// caller's arguments verbatim, then the concatenated baseline hash.
+fn bench_device_command(
+    executable: &Path,
+    suite_name: &str,
+    arguments: &[std::ffi::OsString],
+    baseline_hash: &str,
+) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .arg(suite_name)
+        .args(arguments)
+        .env("TUISKO_GENERATOR_BASELINE_SHA256", baseline_hash);
+    command
+}
+
+/// Run one canonical `bench-device` suite. The device build precedes the
+/// baseline reads so a stale executable fails before any hashing.
+fn run_bench_device(
+    root: &Path,
+    suite_name: &str,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let baseline_paths = bench_device_baselines(suite_name)?;
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let baselines = concatenated_resource_baselines(root, baseline_paths)?;
+    run_visible(&mut bench_device_command(
+        &executable,
+        suite_name,
+        arguments,
+        &sha256(&baselines),
+    ))
 }
 
 fn build_startup_benchmark(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -3008,627 +3294,166 @@ fn bench_qwen35_residual_norm(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-residual-norm")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(
-                    root.join(QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE),
-                )?),
-            ),
-    )
+    run_bench_device(root, "qwen35-residual-norm", arguments)
 }
 
 fn bench_qwen36_residual_norm(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-residual-norm")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(
-                    root.join(QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE),
-                )?),
-            ),
-    )
+    run_bench_device(root, "qwen36-residual-norm", arguments)
 }
 
 fn bench_qwen35_nvfp4_swiglu(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-nvfp4-swiglu")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(root.join(QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE))?),
-            ),
-    )
+    run_bench_device(root, "qwen35-nvfp4-swiglu", arguments)
 }
 
 fn bench_qwen35_nvfp4_down(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-nvfp4-down")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(root.join(QWEN35_NVFP4_DOWN_RESOURCE_BASELINE))?),
-            ),
-    )
+    run_bench_device(root, "qwen35-nvfp4-down", arguments)
 }
 
 fn bench_qwen35_nvfp4_qkv(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-nvfp4-qkv")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(root.join(QWEN35_NVFP4_QKV_RESOURCE_BASELINE))?),
-            ),
-    )
+    run_bench_device(root, "qwen35-nvfp4-qkv", arguments)
 }
 
 fn bench_qwen36_moe_router(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-moe-router")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(root.join(QWEN36_MOE_ROUTER_RESOURCE_BASELINE))?),
-            ),
-    )
+    run_bench_device(root, "qwen36-moe-router", arguments)
 }
 
 fn bench_qwen36_moe_experts(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-moe-experts")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(root.join(QWEN36_MOE_EXPERTS_RESOURCE_BASELINE))?),
-            ),
-    )
+    run_bench_device(root, "qwen36-moe-experts", arguments)
 }
 
 fn bench_qwen36_nvfp4_lm_head(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-nvfp4-lm-head")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(
-                    root.join(QWEN36_NVFP4_LM_HEAD_RESOURCE_BASELINE),
-                )?),
-            ),
-    )
+    run_bench_device(root, "qwen36-nvfp4-lm-head", arguments)
 }
 
 fn bench_qwen36_fp8_qkv(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-fp8-qkv")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(root.join(QWEN36_FP8_QKV_RESOURCE_BASELINE))?),
-            ),
-    )
+    run_bench_device(root, "qwen36-fp8-qkv", arguments)
 }
 
 fn bench_qwen36_gdn_input(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-gdn-input")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(root.join(QWEN36_GDN_INPUT_RESOURCE_BASELINE))?),
-            ),
-    )
+    run_bench_device(root, "qwen36-gdn-input", arguments)
 }
 
 fn bench_qwen36_gdn_output(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-gdn-output")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(root.join(QWEN36_GDN_OUTPUT_RESOURCE_BASELINE))?),
-            ),
-    )
+    run_bench_device(root, "qwen36-gdn-output", arguments)
 }
 
 fn bench_qwen36_attention_output(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    let mut baselines = Vec::new();
-    for baseline in QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-attention-output")
-            .args(arguments)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen36-attention-output", arguments)
 }
 
 fn bench_qwen36_gdn_prepare(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-gdn-prepare")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(root.join(QWEN35_GDN_PREPARE_RESOURCE_BASELINE))?),
-            ),
-    )
+    run_bench_device(root, "qwen36-gdn-prepare", arguments)
 }
 
 fn bench_qwen36_gdn_recurrence(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-gdn-recurrence")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(
-                    root.join(QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE),
-                )?),
-            ),
-    )
+    run_bench_device(root, "qwen36-gdn-recurrence", arguments)
 }
 
 fn bench_qwen35_nvfp4_gdn_input(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-nvfp4-gdn-input")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(
-                    root.join(QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE),
-                )?),
-            ),
-    )
+    run_bench_device(root, "qwen35-nvfp4-gdn-input", arguments)
 }
 
 fn bench_qwen35_gdn_prepare(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-gdn-prepare")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(root.join(QWEN35_GDN_PREPARE_RESOURCE_BASELINE))?),
-            ),
-    )
+    run_bench_device(root, "qwen35-gdn-prepare", arguments)
 }
 
 fn bench_qwen35_gdn_recurrence(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-gdn-recurrence")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(
-                    root.join(QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE),
-                )?),
-            ),
-    )
+    run_bench_device(root, "qwen35-gdn-recurrence", arguments)
 }
 
 fn bench_qwen35_nvfp4_gdn_output(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-nvfp4-gdn-output")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(
-                    root.join(QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE),
-                )?),
-            ),
-    )
+    run_bench_device(root, "qwen35-nvfp4-gdn-output", arguments)
 }
 
 fn bench_qwen35_nvfp4_attention_output(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-nvfp4-attention-output")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(
-                    root.join(QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE),
-                )?),
-            ),
-    )
+    run_bench_device(root, "qwen35-nvfp4-attention-output", arguments)
 }
 
 fn bench_qwen35_nvfp4_mlp(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen35-nvfp4-mlp SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = fs::read(root.join(QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE))?;
-    baselines.extend_from_slice(&fs::read(root.join(QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE))?);
-    baselines.extend_from_slice(&fs::read(root.join(QWEN35_NVFP4_DOWN_RESOURCE_BASELINE))?);
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-nvfp4-mlp")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen35-nvfp4-mlp", arguments)
 }
 
 fn bench_qwen35_attention_qk_prepare(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-attention-qk-prepare")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(
-                    root.join(QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE),
-                )?),
-            ),
-    )
+    run_bench_device(root, "qwen35-attention-qk-prepare", arguments)
 }
 
 fn bench_qwen36_attention_qk_prepare(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-attention-qk-prepare")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(
-                    root.join(QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE),
-                )?),
-            ),
-    )
+    run_bench_device(root, "qwen36-attention-qk-prepare", arguments)
 }
 
 fn bench_qwen36_fp8_attention_qk_prepare(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-fp8-attention-qk-prepare")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(
-                    root.join(QWEN36_FP8_ATTENTION_QK_PREPARE_RESOURCE_BASELINE),
-                )?),
-            ),
-    )
+    run_bench_device(root, "qwen36-fp8-attention-qk-prepare", arguments)
 }
 
 fn bench_fp8_qkv(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
@@ -3663,30 +3488,10 @@ fn bench_nvfp4_down(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(),
 }
 
 fn bench_nvfp4_mlp(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err("usage: cargo run -p xtask -- bench-nvfp4-mlp SNAPSHOT [options]".into());
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = fs::read(root.join(RESIDUAL_NORM_RESOURCE_BASELINE))?;
-    baselines.extend_from_slice(&fs::read(root.join(NVFP4_SWIGLU_RESOURCE_BASELINE))?);
-    baselines.extend_from_slice(&fs::read(root.join(NVFP4_DOWN_RESOURCE_BASELINE))?);
-    run_visible(
-        Command::new(executable)
-            .arg("nvfp4-mlp")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "nvfp4-mlp", arguments)
 }
 
 fn bench_gdn_prepare(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
@@ -3719,80 +3524,21 @@ fn bench_qwen35_paged_gqa(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-paged-gqa")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(root.join(QWEN35_PAGED_GQA_RESOURCE_BASELINE))?),
-            ),
-    )
+    run_bench_device(root, "qwen35-paged-gqa", arguments)
 }
 
 fn bench_qwen36_paged_gqa(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-paged-gqa")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(root.join(QWEN36_PAGED_GQA_RESOURCE_BASELINE))?),
-            ),
-    )
+    run_bench_device(root, "qwen36-paged-gqa", arguments)
 }
 
 fn bench_qwen36_fp8_paged_gqa(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-fp8-paged-gqa")
-            .args(arguments)
-            .env(
-                "TUISKO_GENERATOR_BASELINE_SHA256",
-                sha256(&fs::read(
-                    root.join(QWEN36_FP8_PAGED_GQA_RESOURCE_BASELINE),
-                )?),
-            ),
-    )
+    run_bench_device(root, "qwen36-fp8-paged-gqa", arguments)
 }
 
 fn bench_long_context_paged_gqa(
@@ -3849,638 +3595,219 @@ fn bench_dense_fp8_mlp(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err("usage: cargo run -p xtask -- bench-dense-fp8-mlp SNAPSHOT [options]".into());
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = fs::read(root.join(RESIDUAL_NORM_RESOURCE_BASELINE))?;
-    baselines.extend_from_slice(&fs::read(root.join(FP8_SWIGLU_RESOURCE_BASELINE))?);
-    baselines.extend_from_slice(&fs::read(root.join(FP8_DOWN_RESOURCE_BASELINE))?);
-    run_visible(
-        Command::new(executable)
-            .arg("dense-fp8-mlp")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "dense-fp8-mlp", arguments)
 }
 
 fn bench_dense_fp8_gdn_layer(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = fs::read(root.join(RESIDUAL_NORM_RESOURCE_BASELINE))?;
-    for baseline in [
-        FP8_GDN_INPUT_RESOURCE_BASELINE,
-        GDN_PREPARE_RESOURCE_BASELINE,
-        GDN_RECURRENCE_RESOURCE_BASELINE,
-        GDN_OUTPUT_RESOURCE_BASELINE,
-        FP8_SWIGLU_RESOURCE_BASELINE,
-        FP8_DOWN_RESOURCE_BASELINE,
-    ] {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("dense-fp8-gdn-layer")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "dense-fp8-gdn-layer", arguments)
 }
 
 fn bench_full_attention_layer(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-full-attention-layer SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in [
-        RESIDUAL_NORM_RESOURCE_BASELINE,
-        FP8_QKV_RESOURCE_BASELINE,
-        ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
-        PAGED_GQA_RESOURCE_BASELINE,
-        ATTENTION_OUTPUT_RESOURCE_BASELINE,
-        FP8_SWIGLU_RESOURCE_BASELINE,
-        FP8_DOWN_RESOURCE_BASELINE,
-    ] {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("full-attention-layer")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "full-attention-layer", arguments)
 }
 
 fn bench_mtp_layer(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err("usage: cargo run -p xtask -- bench-mtp-layer SNAPSHOT [options]".into());
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in MTP_LAYER_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("mtp-layer")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "mtp-layer", arguments)
 }
 
 fn bench_qwen35_mtp_layer(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen35-mtp-layer SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in QWEN35_MTP_LAYER_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-mtp-layer")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen35-mtp-layer", arguments)
 }
 
 fn bench_qwen36_mtp_layer(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen36-mtp-layer SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let baseline = fs::read(root.join(QWEN36_MTP_RESOURCE_BASELINE))?;
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-mtp-layer")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baseline)),
-    )
+    run_bench_device(root, "qwen36-mtp-layer", arguments)
 }
 
 fn bench_qwen35_resident_mtp(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen35-resident-mtp SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in QWEN35_RESIDENT_MODEL_RESOURCE_BASELINES
-        .iter()
-        .chain(QWEN35_MTP_LAYER_RESOURCE_BASELINES)
-    {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-resident-mtp")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen35-resident-mtp", arguments)
 }
 
 fn bench_qwen35_mtp_generation(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen35-mtp-generation SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in QWEN35_RESIDENT_MODEL_RESOURCE_BASELINES
-        .iter()
-        .chain(QWEN35_MTP_LAYER_RESOURCE_BASELINES)
-    {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-mtp-generation")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen35-mtp-generation", arguments)
 }
 
 fn bench_qwen35_mtp_batch_generation(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen35-mtp-batch-generation SNAPSHOT [options]"
                 .into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in QWEN35_RESIDENT_MODEL_RESOURCE_BASELINES
-        .iter()
-        .chain(QWEN35_MTP_LAYER_RESOURCE_BASELINES)
-    {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-mtp-batch-generation")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen35-mtp-batch-generation", arguments)
 }
 
 fn bench_target_mtp_verify(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-target-mtp-verify SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in RESIDENT_MODEL_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("target-mtp-verify")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "target-mtp-verify", arguments)
 }
 
 fn bench_mtp_prompt_prime(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-mtp-prompt-prime SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in MTP_PROMPT_PRIME_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("mtp-prompt-prime")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "mtp-prompt-prime", arguments)
 }
 
 fn bench_resident_mtp(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err("usage: cargo run -p xtask -- bench-resident-mtp SNAPSHOT [options]".into());
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in RESIDENT_MTP_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("resident-mtp")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "resident-mtp", arguments)
 }
 
 fn bench_generation_mtp_greedy(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-generation-mtp-greedy SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in RESIDENT_MTP_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("generation-mtp-greedy")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "generation-mtp-greedy", arguments)
 }
 
 fn bench_generation_mtp_sampling(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-generation-mtp-sampling SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in RESIDENT_MTP_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("generation-mtp-sampling")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "generation-mtp-sampling", arguments)
 }
 
 fn bench_generation_mtp_batch(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-generation-mtp-batch SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in RESIDENT_MTP_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("generation-mtp-batch")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "generation-mtp-batch", arguments)
 }
 
 fn bench_qwen35_full_attention_layer(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen35-full-attention-layer SNAPSHOT [options]"
                 .into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in QWEN35_FULL_ATTENTION_LAYER_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-full-attention-layer")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen35-full-attention-layer", arguments)
 }
 
 fn bench_qwen35_gdn_layer(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen35-gdn-layer SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in QWEN35_GDN_LAYER_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-gdn-layer")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen35-gdn-layer", arguments)
 }
 
 fn bench_qwen36_gdn_moe_layer(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen36-gdn-moe-layer SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in QWEN36_GDN_MOE_LAYER_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-gdn-moe-layer")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen36-gdn-moe-layer", arguments)
 }
 
 fn bench_qwen36_full_attention_layer(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen36-full-attention-layer SNAPSHOT [options]"
                 .into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in QWEN36_FULL_ATTENTION_LAYER_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-full-attention-layer")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen36-full-attention-layer", arguments)
 }
 
 fn bench_resident_model(
@@ -4540,190 +3867,68 @@ fn bench_resident_model_variant(
     command: &str,
     suite: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(format!("usage: cargo run -p xtask -- {command} SNAPSHOT [options]").into());
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in RESIDENT_MODEL_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg(suite)
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, suite, arguments)
 }
 
 fn bench_text_endpoint(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err("usage: cargo run -p xtask -- bench-text-endpoint SNAPSHOT [options]".into());
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = fs::read(root.join(RESIDUAL_NORM_RESOURCE_BASELINE))?;
-    baselines.extend_from_slice(&fs::read(root.join(FP8_LM_HEAD_RESOURCE_BASELINE))?);
-    run_visible(
-        Command::new(executable)
-            .arg("text-endpoint")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "text-endpoint", arguments)
 }
 
 fn bench_qwen35_text_endpoint(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen35-text-endpoint SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = fs::read(root.join(QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE))?;
-    baselines.extend_from_slice(&fs::read(root.join(QWEN35_BF16_LM_HEAD_RESOURCE_BASELINE))?);
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-text-endpoint")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen35-text-endpoint", arguments)
 }
 
 fn bench_qwen36_text_endpoint(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen36-text-endpoint SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = fs::read(root.join(QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE))?;
-    baselines.extend_from_slice(&fs::read(
-        root.join(QWEN36_NVFP4_LM_HEAD_RESOURCE_BASELINE),
-    )?);
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-text-endpoint")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen36-text-endpoint", arguments)
 }
 
 fn bench_qwen35_resident_model(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen35-resident-model SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in QWEN35_RESIDENT_MODEL_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen35-resident-model")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen35-resident-model", arguments)
 }
 
 fn bench_qwen36_resident_model(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let Some((snapshot, options)) = arguments.split_first() else {
+    if arguments.is_empty() {
         return Err(
             "usage: cargo run -p xtask -- bench-qwen36-resident-model SNAPSHOT [options]".into(),
         );
-    };
-    build_sm120_for_performance(root)?;
-    let executable = root
-        .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-device");
-    if !executable.is_file() {
-        return Err(format!(
-            "benchmark executable is missing at {}",
-            executable.display()
-        )
-        .into());
     }
-    let mut baselines = Vec::new();
-    for baseline in QWEN36_RESIDENT_MODEL_RESOURCE_BASELINES {
-        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
-    }
-    run_visible(
-        Command::new(executable)
-            .arg("qwen36-resident-model")
-            .arg(snapshot)
-            .args(options)
-            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
-    )
+    run_bench_device(root, "qwen36-resident-model", arguments)
 }
 
 fn bench_suite(
