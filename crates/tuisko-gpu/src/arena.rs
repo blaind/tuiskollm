@@ -383,6 +383,12 @@ impl InitializationCoverage {
     }
 }
 
+/// Drains the context after a failed download so the enqueued copy cannot outlive the
+/// host destination this frame is about to release, recording that failure as well.
+fn drain_failed_download(stream: &CudaStream) {
+    stream.context().record_err(stream.context().synchronize());
+}
+
 fn overlap_error(range: &Range<usize>, start: usize, end: usize) -> GpuError {
     GpuError::arena(format!(
         "loading-arena initialization {}..{} overlaps {start}..{end}",
@@ -542,9 +548,10 @@ impl DeviceArena {
             .context()
             .bind_to_thread()
             .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
-        self.storage
-            .to_host_vec(stream)
-            .map_err(|source| GpuError::driver("copying a device arena to the host", source))
+        self.storage.to_host_vec(stream).map_err(|source| {
+            drain_failed_download(stream);
+            GpuError::driver("copying a device arena to the host", source)
+        })
     }
 
     /// Copies one complete typed region from a host slice.
@@ -990,9 +997,10 @@ impl DeviceArena {
             )
         }
         .map_err(|source| GpuError::driver("copying a device arena region to the host", source))?;
-        stream
-            .synchronize()
-            .map_err(|source| GpuError::driver("synchronizing a device arena download", source))?;
+        stream.synchronize().map_err(|source| {
+            drain_failed_download(stream);
+            GpuError::driver("synchronizing a device arena download", source)
+        })?;
         // SAFETY: the completed copy initialized all `len` elements.
         unsafe { host.set_len(len) };
 
@@ -1054,9 +1062,10 @@ impl DeviceArena {
             )
         }
         .map_err(|source| GpuError::driver("copying a device arena region to the host", source))?;
-        stream
-            .synchronize()
-            .map_err(|source| GpuError::driver("synchronizing a device arena download", source))
+        stream.synchronize().map_err(|source| {
+            drain_failed_download(stream);
+            GpuError::driver("synchronizing a device arena download", source)
+        })
     }
 
     fn require_stream_context(&self, stream: &CudaStream, operation: &str) -> GpuResult<()> {
