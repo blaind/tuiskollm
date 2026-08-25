@@ -543,6 +543,68 @@ impl Qwen35FullAttentionLayerProgram {
         Ok(())
     }
 
+    /// Stages one contiguous `K=1..4` verification span in a shared cache slot.
+    pub(crate) fn load_verify_state(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        slot: usize,
+        first_position: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        if !(1..=4).contains(&rows) {
+            return Err(EngineError::route(format!(
+                "Qwen3.5 attention verification row count {rows} is outside 1..=4"
+            )));
+        }
+        require_slot(slot)?;
+        let rotary_values = product(
+            "Qwen3.5 attention verification rotary values",
+            rows,
+            ROTARY_PAIRS,
+        )?;
+        if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
+            return Err(EngineError::layout(format!(
+                "Qwen3.5 attention verification rotary planes must each have {rotary_values} values for K={rows}"
+            )));
+        }
+        let end = first_position
+            .checked_add(rows)
+            .ok_or_else(|| EngineError::route("Qwen3.5 attention verification range overflows"))?;
+        if end > self.context_capacity() {
+            return Err(EngineError::route(format!(
+                "Qwen3.5 attention verification positions {first_position}..{end} exceed the {}-token slot capacity",
+                self.context_capacity()
+            )));
+        }
+
+        let mut positions = [0u32; 4];
+        let mut lengths = [0u32; 4];
+        for row in 0..rows {
+            positions[row] = u32::try_from(first_position + row).map_err(|_| {
+                EngineError::route("Qwen3.5 attention verification position exceeds u32")
+            })?;
+            lengths[row] = positions[row].checked_add(1).ok_or_else(|| {
+                EngineError::route("Qwen3.5 attention verification length overflows")
+            })?;
+        }
+        let table_rows = [slot as u32; 4];
+        let regions = self.layout.regions();
+        self.arena
+            .copy_prefix_from_host(stream, regions.table_rows, &table_rows[..rows])?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.cache_positions, &positions[..rows])?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.lengths, &lengths[..rows])?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.rope_cos, rope_cos)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.rope_sin, rope_sin)?;
+
+        Ok(())
+    }
+
     /// Maps compact decode rows to distinct physical cache slots.
     pub fn load_slot_routes(&self, stream: &CudaStream, slots: &[usize]) -> EngineResult<()> {
         let rows = slot_rows(slots)?;

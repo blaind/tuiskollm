@@ -13,6 +13,7 @@ const QK_WIDTH: usize = KEY_HEADS * HEAD_DIM;
 const VALUE_WIDTH: usize = VALUE_HEADS * HEAD_DIM;
 const WARPS: usize = 16;
 const THREADS: u32 = (WARPS * 32) as u32;
+const CAUSAL_ROWS: [usize; 3] = [2, 3, 4];
 const PREFILL_ROWS: [usize; 3] = [32, 64, 128];
 const RMS_EPSILON: f32 = 1.0e-6;
 const QUERY_SCALE: f32 = 0.088_388_35;
@@ -334,6 +335,64 @@ mod kernels {
             token += 1;
         }
     }
+
+    /// Advances one mapped state across an exact short verification span.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(512, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (512, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_gdn_recurrence_causal_exact<const TOKENS: usize>(
+        qkv: *const u16,
+        projected: *const u16,
+        log_decay: *const f32,
+        beta: *const f32,
+        norm_weight: *const u16,
+        state_rows: *const u32,
+        state: *mut f32,
+        output: *mut u16,
+    ) {
+        static mut QUERY: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
+        static mut KEY: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
+        static mut RECURRENT_OUTPUT: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
+        static mut REDUCTION: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
+
+        let value_head = thread::blockIdx_x() as usize;
+        if value_head >= VALUE_HEADS {
+            return;
+        }
+        let state_row = unsafe { *state_rows as usize };
+        // K=4 replaces 128 mutually racing decode CTAs with 32 head CTAs.
+        // Each CTA performs the same four recurrence_token calls in order, so
+        // every state FMA, reduction, and BF16 publication remains unchanged.
+        let mut token = 0;
+        while token < TOKENS {
+            unsafe {
+                recurrence_token(
+                    qkv,
+                    projected,
+                    log_decay,
+                    beta,
+                    norm_weight,
+                    state,
+                    output,
+                    token,
+                    value_head,
+                    state_row,
+                    core::ptr::addr_of_mut!(QUERY).cast::<f32>(),
+                    core::ptr::addr_of_mut!(KEY).cast::<f32>(),
+                    core::ptr::addr_of_mut!(RECURRENT_OUTPUT).cast::<f32>(),
+                    core::ptr::addr_of_mut!(REDUCTION).cast::<f32>(),
+                );
+            }
+            token += 1;
+        }
+    }
 }
 
 struct PreparedRoute<const TOKENS: usize> {
@@ -441,6 +500,62 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
     }
 }
 
+struct PreparedCausalRoute<const TOKENS: usize> {
+    launch: PreparedLaunch<kernels::__qwen35_gdn_recurrence_causal_exact_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedCausalRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !CAUSAL_ROWS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "2,048-wide GDN recurrence causal route K={TOKENS} is not admitted"
+            )));
+        }
+        let launch = module
+            .prepare_qwen35_gdn_recurrence_causal_exact::<TOKENS>(LaunchConfig1D::new(
+                VALUE_HEADS as u32,
+                THREADS,
+                0,
+            ))
+            .map_err(|source| {
+                GpuError::launch("preparing 2,048-wide causal GDN recurrence", source)
+            })?;
+        Ok(Self { launch })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        qkv: *const u16,
+        projected: *const u16,
+        log_decay: *const f32,
+        beta: *const f32,
+        norm_weight: *const u16,
+        state_rows: *const u32,
+        state: *mut f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_gdn_recurrence_causal_exact::<TOKENS>(
+                stream,
+                &self.launch,
+                qkv,
+                projected,
+                log_decay,
+                beta,
+                norm_weight,
+                state_rows,
+                state,
+                output,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching 2,048-wide causal GDN recurrence", source)
+            })
+    }
+}
+
 /// Prepared recurrent-state routes for exact Qwen3.5/Qwen3.6 row counts.
 pub struct Qwen35GdnRecurrenceOp {
     module: kernels::LoadedModule,
@@ -452,6 +567,9 @@ pub struct Qwen35GdnRecurrenceOp {
     b6: PreparedRoute<6>,
     b7: PreparedRoute<7>,
     b8: PreparedRoute<8>,
+    c2: PreparedCausalRoute<2>,
+    c3: PreparedCausalRoute<3>,
+    c4: PreparedCausalRoute<4>,
     t32: PreparedPrefillRoute<32>,
     t64: PreparedPrefillRoute<64>,
     t128: PreparedPrefillRoute<128>,
@@ -474,6 +592,9 @@ impl Qwen35GdnRecurrenceOp {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            c2: PreparedCausalRoute::prepare(&module)?,
+            c3: PreparedCausalRoute::prepare(&module)?,
+            c4: PreparedCausalRoute::prepare(&module)?,
             t32: PreparedPrefillRoute::prepare(&module)?,
             t64: PreparedPrefillRoute::prepare(&module)?,
             t128: PreparedPrefillRoute::prepare(&module)?,
@@ -546,6 +667,55 @@ impl Qwen35GdnRecurrenceOp {
             _ => unreachable!(),
         }
     }
+
+    /// Advances one mapped FP32 state causally across an exact `K=2..4` transaction.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`], but `state_rows[0]`
+    /// selects the single state advanced by every ordered token.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_causal(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        qkv: *const u16,
+        projected: *const u16,
+        log_decay: *const f32,
+        beta: *const f32,
+        norm_weight: *const u16,
+        state_rows: *const u32,
+        state: *mut f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        qkv,
+                        projected,
+                        log_decay,
+                        beta,
+                        norm_weight,
+                        state_rows,
+                        state,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match rows {
+            2 => launch!(c2),
+            3 => launch!(c3),
+            4 => launch!(c4),
+            _ => Err(GpuError::invalid_launch(format!(
+                "2,048-wide GDN recurrence causal row count {rows} is outside 2..=4"
+            ))),
+        }
+    }
 }
 
 /// Qwen3.6 uses the exact Qwen3.5 recurrent-state binary route.
@@ -566,6 +736,9 @@ pub(crate) fn qwen35_gdn_recurrence_ptx_names() -> Vec<&'static str> {
         kernels::qwen35_gdn_recurrence_exact_ptx_name::<6>(),
         kernels::qwen35_gdn_recurrence_exact_ptx_name::<7>(),
         kernels::qwen35_gdn_recurrence_exact_ptx_name::<8>(),
+        kernels::qwen35_gdn_recurrence_causal_exact_ptx_name::<2>(),
+        kernels::qwen35_gdn_recurrence_causal_exact_ptx_name::<3>(),
+        kernels::qwen35_gdn_recurrence_causal_exact_ptx_name::<4>(),
         kernels::qwen35_gdn_recurrence_prefill_exact_ptx_name::<32>(),
         kernels::qwen35_gdn_recurrence_prefill_exact_ptx_name::<64>(),
         kernels::qwen35_gdn_recurrence_prefill_exact_ptx_name::<128>(),
@@ -575,8 +748,8 @@ pub(crate) fn qwen35_gdn_recurrence_ptx_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HEAD_DIM, KEY_HEADS, MAX_BATCH, PREFILL_ROWS, QK_WIDTH, THREADS, VALUE_HEADS, VALUE_WIDTH,
-        admitted_batch, admitted_rows, qwen35_gdn_recurrence_ptx_names,
+        CAUSAL_ROWS, HEAD_DIM, KEY_HEADS, MAX_BATCH, PREFILL_ROWS, QK_WIDTH, THREADS, VALUE_HEADS,
+        VALUE_WIDTH, admitted_batch, admitted_rows, qwen35_gdn_recurrence_ptx_names,
     };
     use std::collections::BTreeSet;
     use tuisko_model::{Arch, Qwen36Moe35B};
@@ -608,8 +781,12 @@ mod tests {
         }
 
         let names = qwen35_gdn_recurrence_ptx_names();
+        assert_eq!(CAUSAL_ROWS, [2, 3, 4]);
         assert_eq!(PREFILL_ROWS, [32, 64, 128]);
-        assert_eq!(names.len(), MAX_BATCH + PREFILL_ROWS.len());
+        assert_eq!(
+            names.len(),
+            MAX_BATCH + CAUSAL_ROWS.len() + PREFILL_ROWS.len()
+        );
         assert_eq!(
             names.iter().copied().collect::<BTreeSet<_>>().len(),
             names.len()

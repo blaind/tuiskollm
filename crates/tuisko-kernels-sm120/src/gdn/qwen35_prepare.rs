@@ -14,6 +14,7 @@ const QKV_ROWS: usize = Qwen35_9B::GDN_QKV_ROWS;
 const HISTORY_TAPS: usize = Qwen35_9B::LINEAR_CONV_KERNEL_DIM - 1;
 const THREADS: u32 = 256;
 const CTAS_PER_TOKEN: usize = QKV_ROWS / THREADS as usize;
+const CAUSAL_ROWS: [usize; 3] = [2, 3, 4];
 const PREFILL_ROWS: [usize; 3] = [32, 64, 128];
 
 // The input projection already emits 64 A/B controls, so a standalone control
@@ -240,6 +241,87 @@ mod kernels {
             gdn_convolution_prefill_history::<Qwen35_9B, TOKENS>(projected, state_rows, history);
         }
     }
+
+    /// Converts controls and applies an exact short causal verification span.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_gdn_prepare_causal_exact<const TOKENS: usize>(
+        projected_controls: *const u16,
+        a_log: *const u16,
+        dt_bias: *const u16,
+        projected: *const u16,
+        convolution_weights: *const u16,
+        state_rows: *const u32,
+        history: *const u16,
+        log_decay: *mut f32,
+        beta: *mut f32,
+        convolved: *mut u16,
+    ) {
+        let block = thread::blockIdx_x() as usize;
+        let tile = block % CTAS_PER_TOKEN;
+        let token = block / CTAS_PER_TOKEN;
+        if token >= TOKENS {
+            return;
+        }
+
+        let tid = thread::threadIdx_x() as usize;
+        if tile == 0 && tid < 2 * CONTROL_ROWS {
+            let row = tid & (CONTROL_ROWS - 1);
+            let raw = unsafe { bf16(projected_controls.add(token * CONTROL_STRIDE + tid)) };
+            if tid < CONTROL_ROWS {
+                let control = raw + unsafe { bf16(dt_bias.add(row)) };
+                unsafe {
+                    *log_decay.add(token * CONTROL_ROWS + row) =
+                        -fast_exp(bf16(a_log.add(row))) * softplus(control);
+                }
+            } else {
+                unsafe {
+                    *beta.add(token * CONTROL_ROWS + row) = sigmoid(raw);
+                }
+            }
+        }
+
+        // K=4 uses 128 independent channel CTAs, the same count as four B=1
+        // nodes, but reads the preceding represented rows without racing four
+        // in-place history shifts. The ordered four-tap FMA is unchanged.
+        unsafe {
+            gdn_convolution_prefill::<Qwen35_9B, TOKENS>(
+                projected,
+                convolution_weights,
+                state_rows,
+                history,
+                convolved,
+            );
+        }
+    }
+
+    /// Publishes a short verified span's last three represented values.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_gdn_prepare_causal_history_exact<const TOKENS: usize>(
+        projected: *const u16,
+        state_rows: *const u32,
+        history: *mut u16,
+    ) {
+        unsafe {
+            gdn_convolution_prefill_history::<Qwen35_9B, TOKENS>(projected, state_rows, history);
+        }
+    }
 }
 
 struct PreparedRoute<const TOKENS: usize> {
@@ -375,6 +457,86 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
     }
 }
 
+struct PreparedCausalRoute<const TOKENS: usize> {
+    prepare: PreparedLaunch<kernels::__qwen35_gdn_prepare_causal_exact_CudaKernel<TOKENS>>,
+    history: PreparedLaunch<kernels::__qwen35_gdn_prepare_causal_history_exact_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedCausalRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !CAUSAL_ROWS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "2,048-wide GDN prepare causal route K={TOKENS} is not admitted"
+            )));
+        }
+        Ok(Self {
+            prepare: module
+                .prepare_qwen35_gdn_prepare_causal_exact::<TOKENS>(LaunchConfig1D::new(
+                    (TOKENS * CTAS_PER_TOKEN) as u32,
+                    THREADS,
+                    0,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing 2,048-wide causal GDN convolution", source)
+                })?,
+            history: module
+                .prepare_qwen35_gdn_prepare_causal_history_exact::<TOKENS>(LaunchConfig1D::new(
+                    CTAS_PER_TOKEN as u32,
+                    THREADS,
+                    0,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing 2,048-wide causal GDN history", source)
+                })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        projected_controls: *const u16,
+        a_log: *const u16,
+        dt_bias: *const u16,
+        projected: *const u16,
+        convolution_weights: *const u16,
+        state_rows: *const u32,
+        history: *mut u16,
+        log_decay: *mut f32,
+        beta: *mut f32,
+        convolved: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_gdn_prepare_causal_exact::<TOKENS>(
+                stream,
+                &self.prepare,
+                projected_controls,
+                a_log,
+                dt_bias,
+                projected,
+                convolution_weights,
+                state_rows,
+                history,
+                log_decay,
+                beta,
+                convolved,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching 2,048-wide causal GDN convolution", source)
+            })?;
+        module
+            .qwen35_gdn_prepare_causal_history_exact::<TOKENS>(
+                stream,
+                &self.history,
+                projected,
+                state_rows,
+                history,
+            )
+            .map_err(|source| GpuError::launch("launching causal GDN history", source))
+    }
+}
+
 /// PTX symbols retained for every exact Qwen3.5/Qwen3.6 GDN prepare route.
 pub(crate) fn qwen35_gdn_prepare_ptx_names() -> Vec<&'static str> {
     vec![
@@ -386,9 +548,15 @@ pub(crate) fn qwen35_gdn_prepare_ptx_names() -> Vec<&'static str> {
         kernels::qwen35_gdn_prepare_exact_ptx_name::<6>(),
         kernels::qwen35_gdn_prepare_exact_ptx_name::<7>(),
         kernels::qwen35_gdn_prepare_exact_ptx_name::<8>(),
+        kernels::qwen35_gdn_prepare_causal_exact_ptx_name::<2>(),
+        kernels::qwen35_gdn_prepare_causal_exact_ptx_name::<3>(),
+        kernels::qwen35_gdn_prepare_causal_exact_ptx_name::<4>(),
         kernels::qwen35_gdn_prepare_prefill_exact_ptx_name::<32>(),
         kernels::qwen35_gdn_prepare_prefill_exact_ptx_name::<64>(),
         kernels::qwen35_gdn_prepare_prefill_exact_ptx_name::<128>(),
+        kernels::qwen35_gdn_prepare_causal_history_exact_ptx_name::<2>(),
+        kernels::qwen35_gdn_prepare_causal_history_exact_ptx_name::<3>(),
+        kernels::qwen35_gdn_prepare_causal_history_exact_ptx_name::<4>(),
         kernels::qwen35_gdn_prepare_prefill_history_exact_ptx_name::<32>(),
         kernels::qwen35_gdn_prepare_prefill_history_exact_ptx_name::<64>(),
         kernels::qwen35_gdn_prepare_prefill_history_exact_ptx_name::<128>(),
@@ -406,6 +574,9 @@ pub struct Qwen35GdnPrepareOp {
     b6: PreparedRoute<6>,
     b7: PreparedRoute<7>,
     b8: PreparedRoute<8>,
+    c2: PreparedCausalRoute<2>,
+    c3: PreparedCausalRoute<3>,
+    c4: PreparedCausalRoute<4>,
     t32: PreparedPrefillRoute<32>,
     t64: PreparedPrefillRoute<64>,
     t128: PreparedPrefillRoute<128>,
@@ -428,6 +599,9 @@ impl Qwen35GdnPrepareOp {
             b6: PreparedRoute::prepare(&module)?,
             b7: PreparedRoute::prepare(&module)?,
             b8: PreparedRoute::prepare(&module)?,
+            c2: PreparedCausalRoute::prepare(&module)?,
+            c3: PreparedCausalRoute::prepare(&module)?,
+            c4: PreparedCausalRoute::prepare(&module)?,
             t32: PreparedPrefillRoute::prepare(&module)?,
             t64: PreparedPrefillRoute::prepare(&module)?,
             t128: PreparedPrefillRoute::prepare(&module)?,
@@ -505,6 +679,59 @@ impl Qwen35GdnPrepareOp {
             _ => unreachable!(),
         }
     }
+
+    /// Advances one mapped history row causally across an exact `K=2..4` transaction.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`], but `state_rows[0]`
+    /// selects the single state advanced by every ordered token.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_causal(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        projected_controls: *const u16,
+        a_log: *const u16,
+        dt_bias: *const u16,
+        projected: *const u16,
+        convolution_weights: *const u16,
+        state_rows: *const u32,
+        history: *mut u16,
+        log_decay: *mut f32,
+        beta: *mut f32,
+        convolved: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        projected_controls,
+                        a_log,
+                        dt_bias,
+                        projected,
+                        convolution_weights,
+                        state_rows,
+                        history,
+                        log_decay,
+                        beta,
+                        convolved,
+                    )
+                }
+            };
+        }
+
+        match rows {
+            2 => launch!(c2),
+            3 => launch!(c3),
+            4 => launch!(c4),
+            _ => Err(GpuError::invalid_launch(format!(
+                "2,048-wide GDN prepare causal row count {rows} is outside 2..=4"
+            ))),
+        }
+    }
 }
 
 /// Qwen3.6 uses the exact Qwen3.5 control/convolution binary route.
@@ -517,8 +744,8 @@ pub type Qwen36GdnPrepareOp = Qwen35GdnPrepareOp;
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_ROWS, CONTROL_STRIDE, CTAS_PER_TOKEN, MAX_BATCH, PREFILL_ROWS, PROJECTED_STRIDE,
-        QKV_ROWS, admitted_batch, admitted_rows, qwen35_gdn_prepare_ptx_names,
+        CAUSAL_ROWS, CONTROL_ROWS, CONTROL_STRIDE, CTAS_PER_TOKEN, MAX_BATCH, PREFILL_ROWS,
+        PROJECTED_STRIDE, QKV_ROWS, admitted_batch, admitted_rows, qwen35_gdn_prepare_ptx_names,
     };
     use std::collections::BTreeSet;
     use tuisko_model::{Arch, Qwen36Moe35B};
@@ -550,8 +777,12 @@ mod tests {
         }
 
         let names = qwen35_gdn_prepare_ptx_names();
+        assert_eq!(CAUSAL_ROWS, [2, 3, 4]);
         assert_eq!(PREFILL_ROWS, [32, 64, 128]);
-        assert_eq!(names.len(), MAX_BATCH + 2 * PREFILL_ROWS.len());
+        assert_eq!(
+            names.len(),
+            MAX_BATCH + 2 * CAUSAL_ROWS.len() + 2 * PREFILL_ROWS.len()
+        );
         assert_eq!(
             names.iter().copied().collect::<BTreeSet<_>>().len(),
             names.len()

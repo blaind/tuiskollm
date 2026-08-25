@@ -14,6 +14,7 @@ use tuisko_model::{
 
 const ROTARY_PAIRS: usize = 32;
 const PROMPT_ROUTES: [usize; 3] = [32, 64, 128];
+const VERIFY_ROUTES: [usize; 4] = [1, 2, 3, 4];
 const PAGE_VALUES: usize = 4 * 64 * 256;
 const DECODE_PAGES: usize = 3;
 const SENTINEL: u8 = 0xA5;
@@ -51,6 +52,10 @@ pub struct Qwen35ResidentMtpQualification {
     pub prompt_routes: usize,
     /// Prompt K/V values compared after eager and graph execution.
     pub prompt_cache_values: usize,
+    /// Exact causal target-verification routes compared eager-to-graph.
+    pub target_verify_routes: usize,
+    /// Target logits, residuals, and cache words compared exactly across replay modes.
+    pub target_verify_values: usize,
     /// Lifecycle transitions retaining identical physical mappings.
     pub lifecycle_transitions: usize,
     /// Stable addresses retained across all routes.
@@ -95,6 +100,8 @@ pub fn qualify_qwen35_resident_mtp(
         sampled_logits: 0,
         prompt_routes: 0,
         prompt_cache_values: 0,
+        target_verify_routes: 0,
+        target_verify_values: 0,
         lifecycle_transitions: 0,
         stable_addresses: stable_addresses.len(),
         weight_bytes: layout.resident_weight_bytes(),
@@ -147,11 +154,127 @@ pub fn qualify_qwen35_resident_mtp(
         report.prompt_cache_values += graph.0.len() + graph.1.len();
     }
 
+    report.target_verify_values = verify_target_routes(&mut program, &stream)?;
+    report.target_verify_routes = VERIFY_ROUTES.len();
+
     report.lifecycle_transitions = verify_lifecycle(&mut program, &stream)?;
     verify_no_post_warmup_allocation(&mut program, &stream)?;
     device_benchmark::require_current_process_exclusive()?;
 
     Ok(report)
+}
+
+fn verify_target_routes(
+    program: &mut Qwen35ResidentMtpProgram,
+    stream: &CudaStream,
+) -> Result<usize, Qwen35ResidentMtpQualificationError> {
+    const FIRST_POSITION: usize = 32;
+    let mut compared = 0;
+    for rows in VERIFY_ROUTES {
+        prepare_target_prefix(program, stream, FIRST_POSITION + rows)?;
+        let token_ids = (0..rows).map(|row| 900 + row as u32).collect::<Vec<_>>();
+        let rope_cos = vec![1.0f32; rows * ROTARY_PAIRS];
+        let rope_sin = vec![0.0f32; rows * ROTARY_PAIRS];
+        program.stage_target_verify(stream, &token_ids, 0, FIRST_POSITION, &rope_cos, &rope_sin)?;
+        program.qualification_launch_target_verify(stream, rows)?;
+        let eager_logits = program.read_logits(stream, rows)?;
+        let eager_residual = program.qualification_target_residual(stream, rows)?;
+        let physical_page = usize::try_from(
+            program
+                .qualification_kv_route(0, FIRST_POSITION)?
+                .physical_page(),
+        )
+        .map_err(|_| {
+            Qwen35ResidentMtpQualificationError::Mismatch(
+                "target physical page does not fit usize".to_string(),
+            )
+        })?;
+        let eager_cache = program.qualification_target_cache_page(stream, physical_page)?;
+
+        prepare_target_prefix(program, stream, FIRST_POSITION + rows)?;
+        program.stage_target_verify(stream, &token_ids, 0, FIRST_POSITION, &rope_cos, &rope_sin)?;
+        program.replay_target_verify(stream, rows)?;
+        let verify_logits = program.read_logits(stream, rows)?;
+        let verify_residual = program.qualification_target_residual(stream, rows)?;
+        let verify_cache = program.qualification_target_cache_page(stream, physical_page)?;
+
+        compare_words(
+            &format!("K={rows} target verification graph residual"),
+            &eager_residual,
+            &verify_residual,
+        )?;
+        compare_exact(
+            "target verification graph key cache",
+            &eager_cache.0,
+            &verify_cache.0,
+        )?;
+        compare_exact(
+            "target verification graph value cache",
+            &eager_cache.1,
+            &verify_cache.1,
+        )?;
+        compare_exact(
+            "target verification graph logits",
+            &eager_logits,
+            &verify_logits,
+        )?;
+
+        if rows == 1 {
+            prepare_target_prefix(program, stream, FIRST_POSITION + 1)?;
+            program.stage_target_embeddings(stream, &token_ids)?;
+            program.load_decode_state(
+                stream,
+                &[FIRST_POSITION as u32],
+                &[0],
+                &[1.0; ROTARY_PAIRS],
+                &[0.0; ROTARY_PAIRS],
+            )?;
+            program.replay_target(stream, 1)?;
+            compare_words(
+                "K=1 target verification production residual",
+                &program.qualification_target_residual(stream, 1)?,
+                &verify_residual,
+            )?;
+            compare_exact(
+                "K=1 target verification production logits",
+                &program.read_logits(stream, 1)?,
+                &verify_logits,
+            )?;
+            let serial_cache = program.qualification_target_cache_page(stream, physical_page)?;
+            compare_exact(
+                "K=1 target verification production key cache",
+                &serial_cache.0,
+                &verify_cache.0,
+            )?;
+            compare_exact(
+                "K=1 target verification production value cache",
+                &serial_cache.1,
+                &verify_cache.1,
+            )?;
+        }
+        compared += verify_logits.len()
+            + verify_residual.len()
+            + verify_cache.0.len()
+            + verify_cache.1.len();
+    }
+    Ok(compared)
+}
+
+fn prepare_target_prefix(
+    program: &mut Qwen35ResidentMtpProgram,
+    stream: &CudaStream,
+    reserved_tokens: usize,
+) -> Result<(), Qwen35ResidentMtpQualificationError> {
+    const ROWS: usize = 32;
+    program.reset_state(stream)?;
+    program.activate_kv_slot(0)?;
+    program.reserve_kv_slot_tokens(stream, 0, reserved_tokens)?;
+    let token_ids = (0..ROWS).map(|row| 700 + row as u32).collect::<Vec<_>>();
+    let rope_cos = vec![1.0f32; ROWS * ROTARY_PAIRS];
+    let rope_sin = vec![0.0f32; ROWS * ROTARY_PAIRS];
+    let route = program.stage_target_prefill(stream, &token_ids, 0, 0, &rope_cos, &rope_sin)?;
+    program.replay_target_prefill(stream, route)?;
+    Ok(())
 }
 
 fn verify_sampled_logits(
@@ -386,14 +509,41 @@ fn compare_exact<T: PartialEq>(
     Ok(())
 }
 
+fn compare_words(
+    role: &str,
+    actual: &[u16],
+    expected: &[u16],
+) -> Result<(), Qwen35ResidentMtpQualificationError> {
+    if actual.len() != expected.len() {
+        return Err(Qwen35ResidentMtpQualificationError::Mismatch(format!(
+            "{role} has {}/{} values",
+            actual.len(),
+            expected.len()
+        )));
+    }
+    if let Some((index, (&actual, &expected))) = actual
+        .iter()
+        .zip(expected)
+        .enumerate()
+        .find(|(_, (actual, expected))| actual != expected)
+    {
+        return Err(Qwen35ResidentMtpQualificationError::Mismatch(format!(
+            "{role} differs at value {index}: {actual:#06x}/{expected:#06x}"
+        )));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PROMPT_ROUTES, qualify_qwen35_resident_mtp};
+    use super::{PROMPT_ROUTES, VERIFY_ROUTES, qualify_qwen35_resident_mtp};
     use std::path::PathBuf;
 
     #[test]
     fn qwen35_resident_mtp_suite_inventory_is_exact() {
         assert_eq!(PROMPT_ROUTES, [32, 64, 128]);
+        assert_eq!(VERIFY_ROUTES, [1, 2, 3, 4]);
     }
 
     #[test]
@@ -407,6 +557,8 @@ mod tests {
         assert_eq!(report.draft_routes, 8);
         assert_eq!(report.sampled_logits, 288);
         assert_eq!(report.prompt_routes, 3);
+        assert_eq!(report.target_verify_routes, 4);
+        assert_eq!(report.target_verify_values, 6_718_464);
         assert_eq!(report.lifecycle_transitions, 6);
         assert_eq!(report.weight_bytes, 6_418_401_280);
         assert_eq!(report.cache_bytes, 9_714_008_064);
