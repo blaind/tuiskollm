@@ -34,6 +34,7 @@ const QWEN35_RESIDENT_MODEL_TEST_FILTER: &str = "qwen35_resident_model_suite_";
 const QWEN35_RESIDENT_MTP_TEST_FILTER: &str = "qwen35_resident_mtp_suite_";
 const QWEN35_MTP_GENERATION_TEST_FILTER: &str = "qwen35_mtp_generation_suite_";
 const QWEN35_MTP_BATCH_GENERATION_TEST_FILTER: &str = "qwen35_mtp_batch_generation_suite_";
+const QWEN36_MTP_LAYER_TEST_FILTER: &str = "qwen36_mtp_layer_suite_";
 const QWEN36_LONG_CONTEXT_KV_TEST_FILTER: &str = "qwen36_long_context_kv::tests";
 const QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen36-residual-norm-sm120.txt";
@@ -885,6 +886,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-full-attention-layer") => qualify_full_attention_layer(root, &remaining),
         Some("qualify-mtp-layer") => qualify_mtp_layer(root, &remaining),
         Some("qualify-qwen35-mtp-layer") => qualify_qwen35_mtp_layer(root, &remaining),
+        Some("qualify-qwen36-mtp-layer") => qualify_qwen36_mtp_layer(root, &remaining),
         Some("qualify-target-mtp-verify") => qualify_target_mtp_verify(root, &remaining),
         Some("qualify-mtp-prompt-prime") => qualify_mtp_prompt_prime(root, &remaining),
         Some("qualify-resident-mtp") => qualify_resident_mtp(root, &remaining),
@@ -972,6 +974,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-full-attention-layer") => bench_full_attention_layer(root, &remaining),
         Some("bench-mtp-layer") => bench_mtp_layer(root, &remaining),
         Some("bench-qwen35-mtp-layer") => bench_qwen35_mtp_layer(root, &remaining),
+        Some("bench-qwen36-mtp-layer") => bench_qwen36_mtp_layer(root, &remaining),
         Some("bench-target-mtp-verify") => bench_target_mtp_verify(root, &remaining),
         Some("bench-mtp-prompt-prime") => bench_mtp_prompt_prime(root, &remaining),
         Some("bench-resident-mtp") => bench_resident_mtp(root, &remaining),
@@ -1139,6 +1142,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-mtp-bf16-paged-gqa"
                     | "qualify-target-mtp-verify"
                     | "qualify-qwen35-mtp-layer"
+                    | "qualify-qwen36-mtp-layer"
                     | "gate-residual-norm"
                     | "gate-qwen35-residual-norm"
                     | "gate-qwen36-residual-norm"
@@ -3748,6 +3752,40 @@ fn qualify_qwen35_mtp_layer(
     gate_qwen35_mtp_resources(root)
 }
 
+fn qualify_qwen36_mtp_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-qwen36-mtp-layer SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            QWEN36_MTP_LAYER_TEST_FILTER,
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_qwen36_residual_norm(root)?;
+    gate_qwen36_mtp_resources(root)
+}
+
 fn qualify_target_mtp_verify(
     root: &Path,
     arguments: &[std::ffi::OsString],
@@ -5413,6 +5451,36 @@ fn bench_qwen35_mtp_layer(
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_qwen36_mtp_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-qwen36-mtp-layer SNAPSHOT [options]".into(),
+        );
+    };
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let baseline = fs::read(root.join(QWEN36_MTP_RESOURCE_BASELINE))?;
+    run_visible(
+        Command::new(executable)
+            .arg("qwen36-mtp-layer")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baseline)),
     )
 }
 
@@ -14617,13 +14685,13 @@ mod tests {
         QWEN35_MTP_BATCH_GENERATION_TEST_FILTER, QWEN35_MTP_GENERATION_TEST_FILTER,
         QWEN35_RESIDENT_MODEL_TEST_FILTER, QWEN35_RESIDENT_MTP_TEST_FILTER,
         QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN35_TEXT_ENDPOINT_TEST_FILTER,
-        QWEN36_LONG_CONTEXT_KV_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
-        SM120_RESOURCE_BASELINES, device_is_idle, parse_baseline, parse_compute_pids,
-        parse_cuda_toolkit_identity, parse_entries, parse_performance_device_sample,
-        parse_performance_iteration, parse_resources, parse_rustc_identity,
-        preflight_performance_baselines, require_consumed_baseline_keys, require_count,
-        require_registers, require_uniform_value, resolve_target_output, sass_function_body,
-        workspace_root,
+        QWEN36_LONG_CONTEXT_KV_TEST_FILTER, QWEN36_MTP_LAYER_TEST_FILTER,
+        QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, device_is_idle,
+        parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
+        parse_performance_device_sample, parse_performance_iteration, parse_resources,
+        parse_rustc_identity, preflight_performance_baselines, require_consumed_baseline_keys,
+        require_count, require_registers, require_uniform_value, resolve_target_output,
+        sass_function_body, workspace_root,
     };
     use std::ffi::OsString;
 
@@ -14714,6 +14782,20 @@ mod tests {
             for test in tests {
                 assert!(test.contains(filter), "`{filter}` does not select `{test}`");
             }
+        }
+    }
+
+    #[test]
+    fn qwen36_mtp_layer_filter_selects_oracle_and_accounting() {
+        for test in [
+            "qwen36_mtp_layer::tests::qwen36_mtp_layer_suite_route_and_byte_inventory_is_exact",
+            "qwen36_mtp_layer::tests::qwen36_mtp_layer_suite_source_owner_matches_all_draft_prime_and_realign_routes",
+            "qwen36_mtp_layer_benchmark::tests::qwen36_mtp_layer_suite_benchmark_inventory_and_accounting_are_exact",
+        ] {
+            assert!(
+                test.contains(QWEN36_MTP_LAYER_TEST_FILTER),
+                "`{QWEN36_MTP_LAYER_TEST_FILTER}` does not select `{test}`"
+            );
         }
     }
 

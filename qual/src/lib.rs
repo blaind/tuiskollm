@@ -243,6 +243,10 @@ mod qwen36_moe_router_benchmark;
 #[cfg(feature = "device")]
 mod qwen36_mtp_bf16_moe;
 #[cfg(feature = "device")]
+mod qwen36_mtp_layer;
+#[cfg(feature = "device")]
+mod qwen36_mtp_layer_benchmark;
+#[cfg(feature = "device")]
 mod qwen36_nvfp4_lm_head;
 #[cfg(feature = "device")]
 mod qwen36_nvfp4_lm_head_benchmark;
@@ -657,6 +661,12 @@ pub use qwen36_moe_router::{
 pub use qwen36_moe_router_benchmark::benchmark_qwen36_moe_router;
 #[cfg(feature = "device")]
 pub use qwen36_mtp_bf16_moe::{Qwen36MtpBf16MoeQualification, qualify_qwen36_mtp_bf16_moe};
+#[cfg(feature = "device")]
+pub use qwen36_mtp_layer::{
+    Qwen36MtpLayerQualification, Qwen36MtpLayerQualificationError, qualify_qwen36_mtp_layer,
+};
+#[cfg(feature = "device")]
+pub use qwen36_mtp_layer_benchmark::benchmark_qwen36_mtp_layer;
 #[cfg(feature = "device")]
 pub use qwen36_nvfp4_lm_head::{
     Qwen36Nvfp4LmHeadQualification, Qwen36Nvfp4LmHeadQualificationError,
