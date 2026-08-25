@@ -1,6 +1,8 @@
 //! Address-stable Qwen3.5 MTP cache storage with mirrored page ownership.
 
-use crate::qwen35_mtp_kv_layout::{Qwen35MtpKvLayout, Qwen35MtpKvRegions};
+use crate::qwen35_mtp_kv_layout::Qwen35MtpKvLayout;
+#[cfg(feature = "qualification")]
+use crate::qwen35_mtp_kv_layout::Qwen35MtpKvRegions;
 use crate::qwen35_mtp_layer::Qwen35MtpKvBinding;
 use crate::{
     EngineError, EngineResult, PagedKvRoute, PagedKvSlotPool, PagedKvSlotState, PagedKvTableUpdate,
