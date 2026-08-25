@@ -1,7 +1,10 @@
 //! Qwen3.8-27B compressed-tensors source bindings.
 
 use crate::common::inventory::CheckpointSnapshot;
-use crate::common::naming::{EMBEDDING, FINAL_NORM, LM_HEAD, LM_HEAD_SCALE, MTP_LAYER};
+use crate::common::naming::{
+    EMBEDDING, FINAL_NORM, LM_HEAD, LM_HEAD_SCALE, MTP_LAYER, input_layernorm, layer_module_prefix,
+    layer_prefix,
+};
 use crate::common::nvfp4::{Nvfp4DownBindings, Nvfp4GateUpBindings};
 use crate::common::routes::{
     E2M1_VALUES_PER_BYTE, NVFP4_GROUP_SIZE, NVFP4_MLP_LAYER_END, codec_columns,
@@ -51,7 +54,7 @@ impl<'a> DenseFp8GateUpBindings<'a> {
 
         let intermediate = A::INTERMEDIATE as u64;
         let hidden = A::HIDDEN as u64;
-        let prefix = format!("model.language_model.layers.{layer}.mlp");
+        let prefix = layer_module_prefix(layer, "mlp");
         let gate_weight_name = format!("{prefix}.gate_proj.weight");
         let up_weight_name = format!("{prefix}.up_proj.weight");
         let gate_scale_name = format!("{prefix}.gate_proj.weight_scale");
@@ -119,7 +122,7 @@ impl<'a> DenseFp8DownBindings<'a> {
 
         let hidden = A::HIDDEN as u64;
         let intermediate = A::INTERMEDIATE as u64;
-        let prefix = format!("model.language_model.layers.{layer}.mlp.down_proj");
+        let prefix = layer_module_prefix(layer, "mlp.down_proj");
         let weight =
             Fp8E4M3View::bind(tensor(&format!("{prefix}.weight"))?, [hidden, intermediate])?;
         let scale = Bf16View::bind(tensor(&format!("{prefix}.weight_scale"))?, [hidden, 1])?;
@@ -173,7 +176,7 @@ impl<'a> DenseFp8MlpBindings<'a> {
             |first, second, role| adjacent(first, second, role),
         )?;
         let down = DenseFp8DownBindings::bind_from::<A>(layer, |name| tensor(name))?;
-        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let layer_prefix = layer_prefix(layer);
         let input_norm = Bf16View::bind(
             tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
             [A::HIDDEN as u64],
@@ -200,7 +203,7 @@ fn dense_fp8_next_norm_name<A: Arch>(layer: usize) -> CheckpointResult<String> {
     Ok(if next_layer == A::LAYERS {
         FINAL_NORM.to_string()
     } else {
-        format!("model.language_model.layers.{next_layer}.input_layernorm.weight")
+        input_layernorm(next_layer)
     })
 }
 
@@ -243,7 +246,7 @@ impl<'a> FullAttentionQkvBindings<'a> {
         let query_rows = A::ATTENTION_QUERY_ROWS as u64;
         let kv_rows = A::ATTENTION_KV_ROWS as u64;
         let hidden = A::HIDDEN as u64;
-        let prefix = format!("model.language_model.layers.{layer}.self_attn");
+        let prefix = layer_module_prefix(layer, "self_attn");
         let query_gate_weight = Fp8E4M3View::bind(
             tensor(&format!("{prefix}.q_proj.weight"))?,
             [query_rows, hidden],
@@ -370,7 +373,7 @@ impl<'a> FullAttentionPostBindings<'a> {
         let hidden = A::HIDDEN as u64;
         let output_columns = A::ATTENTION_OUTPUT_COLUMNS as u64;
         let head_dim = A::HEAD_DIM as u64;
-        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let layer_prefix = layer_prefix(layer);
         let prefix = format!("{layer_prefix}.self_attn");
         let output_weight = Fp8E4M3View::bind(
             tensor(&format!("{prefix}.o_proj.weight"))?,
@@ -471,7 +474,7 @@ impl<'a> GdnBindings<'a> {
         let control_rows = A::GDN_CONTROL_ROWS as u64;
         let head_dim = A::LINEAR_HEAD_DIM as u64;
         let convolution = A::LINEAR_CONV_KERNEL_DIM as u64;
-        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let layer_prefix = layer_prefix(layer);
         let prefix = format!("{layer_prefix}.linear_attn");
         let qkv_weight_name = format!("{prefix}.in_proj_qkv.weight");
         let z_weight_name = format!("{prefix}.in_proj_z.weight");
@@ -703,7 +706,7 @@ impl<'a> Nvfp4GateUpBindings<'a> {
         let intermediate = A::INTERMEDIATE as u64;
         let packed_columns = codec_columns(A::HIDDEN, E2M1_VALUES_PER_BYTE, "packed E2M1")?;
         let scale_columns = codec_columns(A::HIDDEN, NVFP4_GROUP_SIZE, "E4M3 block-scale")?;
-        let prefix = format!("model.language_model.layers.{layer}.mlp");
+        let prefix = layer_module_prefix(layer, "mlp");
 
         let gate_weight = tensor(&format!("{prefix}.gate_proj.weight_packed"))?;
         let up_weight = tensor(&format!("{prefix}.up_proj.weight_packed"))?;
@@ -786,7 +789,7 @@ impl<'a> Nvfp4MlpBindings<'a> {
     ) -> CheckpointResult<Self> {
         let gate_up = Nvfp4GateUpBindings::bind_from::<A>(layer, |name| tensor(name))?;
         let down = Nvfp4DownBindings::bind_from::<A>(layer, |name| tensor(name))?;
-        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let layer_prefix = layer_prefix(layer);
         let input_norm = Bf16View::bind(
             tensor(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
             [A::HIDDEN as u64],
@@ -815,7 +818,7 @@ fn nvfp4_next_norm_name<A: Arch>(layer: usize) -> CheckpointResult<String> {
     Ok(if next_layer == A::LAYERS {
         FINAL_NORM.to_string()
     } else {
-        format!("model.language_model.layers.{next_layer}.input_layernorm.weight")
+        input_layernorm(next_layer)
     })
 }
 
@@ -837,7 +840,7 @@ impl<'a> Nvfp4DownBindings<'a> {
         let hidden = A::HIDDEN as u64;
         let packed_columns = codec_columns(A::INTERMEDIATE, E2M1_VALUES_PER_BYTE, "packed E2M1")?;
         let scale_columns = codec_columns(A::INTERMEDIATE, NVFP4_GROUP_SIZE, "E4M3 block-scale")?;
-        let prefix = format!("model.language_model.layers.{layer}.mlp.down_proj");
+        let prefix = layer_module_prefix(layer, "mlp.down_proj");
 
         let weight = U8View::bind(
             tensor(&format!("{prefix}.weight_packed"))?,
