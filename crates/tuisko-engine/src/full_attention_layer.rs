@@ -1,8 +1,7 @@
 //! Resident source-backed dense-FP8 full-attention decoder layer.
 
 use crate::full_attention_layer_layout::{
-    CONTEXT_CAPACITY, FullAttentionLayerRegions, MAX_ROWS, PREFILL_CONTEXT_CAPACITY,
-    PREFILL_TABLE_STRIDE, TABLE_STRIDE,
+    CONTEXT_CAPACITY, FullAttentionLayerRegions, MAX_ROWS, PREFILL_TABLE_STRIDE, TABLE_STRIDE,
 };
 use crate::{EngineError, EngineResult, FullAttentionLayerLayout, MAX_BATCH};
 use std::marker::PhantomData;
@@ -394,11 +393,6 @@ impl<A: Sm120Arch> FullAttentionLayerProgram<A> {
         if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
             return Err(EngineError::layout(format!(
                 "full-attention prefill rotary planes must each have {rotary_values} values for T={tokens}"
-            )));
-        }
-        if tokens > PREFILL_CONTEXT_CAPACITY {
-            return Err(EngineError::route(format!(
-                "full-attention prefill T={tokens} exceeds the {PREFILL_CONTEXT_CAPACITY}-token shared cache"
             )));
         }
 
