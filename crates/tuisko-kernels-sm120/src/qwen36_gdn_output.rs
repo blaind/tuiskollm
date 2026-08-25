@@ -10,9 +10,11 @@ const MAX_BATCH: usize = 8;
 const INPUT_COLUMNS: usize = Qwen36Moe35B::GDN_VALUE_ROWS;
 const OUTPUT_ROWS: usize = Qwen36Moe35B::HIDDEN;
 const QUANTIZE_THREADS: u32 = 256;
+// One output row per warp exposes 512 CTAs for the 2,048-row decode projection,
+// enough to cover 170 SMs while preserving each row's stride-32 FMA order.
 const PROJECTION_WARPS: usize = 4;
 const PROJECTION_THREADS: u32 = (PROJECTION_WARPS * 32) as u32;
-const ROWS_PER_CTA: usize = 2 * PROJECTION_WARPS;
+const ROWS_PER_CTA: usize = PROJECTION_WARPS;
 const PREFILL_ROUTES: [usize; 3] = [32, 64, 128];
 const PREFILL_BLOCK_ROWS: usize = 64;
 const PREFILL_OUTPUT_ROWS: usize = 64;
@@ -131,31 +133,22 @@ mod kernels {
     ) {
         let tid = thread::threadIdx_x() as usize;
         let lane = tid & 31;
-        let first_row = (thread::blockIdx_x() as usize * PROJECTION_WARPS + (tid >> 5)) * 2;
+        let row = thread::blockIdx_x() as usize * PROJECTION_WARPS + (tid >> 5);
         let pairs = INPUT_COLUMNS / 2;
-        let first_weight = unsafe { weight_codes.add(first_row * pairs) };
-        let second_weight = unsafe { first_weight.add(pairs) };
-        let mut first_sums = [0.0f32; TOKENS];
-        let mut second_sums = [0.0f32; TOKENS];
+        let row_weight = unsafe { weight_codes.add(row * pairs) };
+        let mut sums = [0.0f32; TOKENS];
         let mut pair = lane;
 
         while pair < pairs {
-            let first = e4m3x2_to_f32(unsafe { *first_weight.add(pair) });
-            let second = e4m3x2_to_f32(unsafe { *second_weight.add(pair) });
+            let weight = e4m3x2_to_f32(unsafe { *row_weight.add(pair) });
 
             macro_rules! accumulate {
                 ($token:literal) => {
                     if TOKENS > $token {
                         let activation =
                             e4m3x2_to_f32(unsafe { *activation_codes.add($token * pairs + pair) });
-                        first_sums[$token] =
-                            float::fma_rn_f32(first.0, activation.0, first_sums[$token]);
-                        first_sums[$token] =
-                            float::fma_rn_f32(first.1, activation.1, first_sums[$token]);
-                        second_sums[$token] =
-                            float::fma_rn_f32(second.0, activation.0, second_sums[$token]);
-                        second_sums[$token] =
-                            float::fma_rn_f32(second.1, activation.1, second_sums[$token]);
+                        sums[$token] = float::fma_rn_f32(weight.0, activation.0, sums[$token]);
+                        sums[$token] = float::fma_rn_f32(weight.1, activation.1, sums[$token]);
                     }
                 };
             }
@@ -174,16 +167,11 @@ mod kernels {
         macro_rules! store {
             ($token:literal) => {
                 if TOKENS > $token {
-                    let first =
-                        reduce_sum_lane_zero(first_sums[$token]) * input_scale * weight_scale;
-                    let second =
-                        reduce_sum_lane_zero(second_sums[$token]) * input_scale * weight_scale;
+                    let value = reduce_sum_lane_zero(sums[$token]) * input_scale * weight_scale;
                     if lane == 0 {
                         unsafe {
-                            *output.add($token * OUTPUT_ROWS + first_row) =
-                                tcgen05::cvt_f32x2_bf16x2(first, 0.0) as u16;
-                            *output.add($token * OUTPUT_ROWS + first_row + 1) =
-                                tcgen05::cvt_f32x2_bf16x2(second, 0.0) as u16;
+                            *output.add($token * OUTPUT_ROWS + row) =
+                                tcgen05::cvt_f32x2_bf16x2(value, 0.0) as u16;
                         }
                     }
                 }
@@ -259,10 +247,8 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
             .map_err(|source| {
                 GpuError::launch("preparing Qwen3.6 GDN output quantization", source)
             })?;
-        // The 8 MiB weight plane would expose only 128 CTAs with the existing
-        // eight-warp/two-row topology. Four warps produce 256 CTAs over 170
-        // SMs while every warp keeps the same adjacent row pair, 64 ordered
-        // pairs per lane, and reduction order; arithmetic is unchanged.
+        // Four one-row warps produce 512 CTAs over 170 SMs. Each warp retains
+        // its row's 64 ordered pairs per lane and the original reduction order.
         let projection = module
             .prepare_qwen36_gdn_output_projection::<TOKENS>(LaunchConfig1D::new(
                 (OUTPUT_ROWS / ROWS_PER_CTA) as u32,
