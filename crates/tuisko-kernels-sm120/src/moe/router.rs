@@ -132,53 +132,64 @@ mod kernels {
         let indices = unsafe { expert_indices.add(token * TOP_K) };
         let weights = unsafe { expert_weights.add(token * TOP_K) };
         let logits = unsafe { logits.add(token * EXPERTS) };
-        let mut position = 0usize;
 
+        // Each lane loads its eight owned logits once and the eight selection
+        // passes run entirely in registers: consumption is a register mask on
+        // the owner lane and the butterfly hands every lane the pass winner.
+        // The per-lane maximum, the cross-lane comparison, and the
+        // lowest-index tie-break are the exact predicates of the original
+        // global-memory walk, so the selected experts, their order, and every
+        // published weight are bit-identical.
+        const OWNED: usize = EXPERTS / 32;
+        let mut owned_values = [0.0f32; OWNED];
+        let mut owned_taken = 0u32;
+        let mut slot = 0usize;
+        while slot < OWNED {
+            let expert = slot * 32 + lane as usize;
+            let bits = unsafe { *logits.add(expert) };
+            owned_values[slot] = f32::from_bits(u32::from(bits) << 16);
+            slot += 1;
+        }
+
+        let mut winner_values = [0.0f32; TOP_K];
+        let mut position = 0usize;
         while position < TOP_K {
             let mut best_value = f32::NEG_INFINITY;
             let mut best_index = u16::MAX;
-            let mut expert = lane as usize;
-
-            while expert < EXPERTS {
-                let mut prior = 0usize;
-                let mut selected = false;
-                while prior < position {
-                    if unsafe { *indices.add(prior) } as usize == expert {
-                        selected = true;
-                    }
-                    prior += 1;
-                }
-                if !selected {
-                    let bits = unsafe { *logits.add(expert) };
-                    let value = f32::from_bits(u32::from(bits) << 16);
-                    let better =
-                        value > best_value || (value == best_value && expert < best_index as usize);
+            let mut slot = 0usize;
+            while slot < OWNED {
+                if owned_taken & (1u32 << slot) == 0 {
+                    let value = owned_values[slot];
+                    let index = (slot * 32 + lane as usize) as u16;
+                    let better = value > best_value || (value == best_value && index < best_index);
                     if better {
                         best_value = value;
-                        best_index = expert as u16;
+                        best_index = index;
                     }
                 }
-                expert += 32;
+                slot += 1;
             }
 
             let mut delta = 16u32;
             while delta != 0 {
-                let other_value = warp::shuffle_down_f32(best_value, delta);
-                let other_index = warp::shuffle_down(u32::from(best_index), delta) as u16;
-                if lane + delta < 32 {
-                    let better = other_value > best_value
-                        || (other_value == best_value && other_index < best_index);
-                    if better {
-                        best_value = other_value;
-                        best_index = other_index;
-                    }
+                let other_value = warp::shuffle_xor_f32_sync(u32::MAX, best_value, delta);
+                let other_index =
+                    warp::shuffle_xor_sync(u32::MAX, u32::from(best_index), delta) as u16;
+                let better = other_value > best_value
+                    || (other_value == best_value && other_index < best_index);
+                if better {
+                    best_value = other_value;
+                    best_index = other_index;
                 }
                 delta >>= 1;
             }
             if lane == 0 {
                 unsafe { *indices.add(position) = best_index };
             }
-            warp::sync_mask(u32::MAX);
+            winner_values[position] = best_value;
+            if (best_index as usize & 31) == lane as usize {
+                owned_taken |= 1u32 << ((best_index as usize) >> 5);
+            }
             position += 1;
         }
 
@@ -188,22 +199,21 @@ mod kernels {
 
         // The common 256-way softmax denominator cancels when the selected
         // probabilities are normalized again, leaving an exact top-8 softmax.
-        let maximum_index = unsafe { *indices } as usize;
-        let maximum = f32::from_bits(u32::from(unsafe { *logits.add(maximum_index) }) << 16);
+        // winner_values holds the identical logit values the original re-read
+        // from global memory, in the identical selection order.
+        let maximum = winner_values[0];
         let mut denominator = 0.0f32;
         position = 0;
 
         while position < TOP_K {
-            let expert = unsafe { *indices.add(position) } as usize;
-            let value = f32::from_bits(u32::from(unsafe { *logits.add(expert) }) << 16);
+            let value = winner_values[position];
             denominator += float::ex2_approx_f32((value - maximum) * core::f32::consts::LOG2_E);
             position += 1;
         }
 
         position = 0;
         while position < TOP_K {
-            let expert = unsafe { *indices.add(position) } as usize;
-            let value = f32::from_bits(u32::from(unsafe { *logits.add(expert) }) << 16);
+            let value = winner_values[position];
             let exponential = float::ex2_approx_f32((value - maximum) * core::f32::consts::LOG2_E);
             unsafe { *weights.add(position) = tcgen05::f32_to_bf16_rne(exponential / denominator) };
             position += 1;
