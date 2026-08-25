@@ -1,5 +1,6 @@
 //! Resident source-backed Qwen3.5 NVFP4 MLP program.
 
+use crate::common::graph::capture_batch_graphs;
 use crate::common::math::checked_product;
 #[cfg(feature = "qualification")]
 use crate::qwen38::nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
@@ -453,16 +454,11 @@ fn capture_routes(
     pointers: Pointers,
     divisors: Divisors,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
-    let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for batch in 1..=MAX_BATCH {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, batch, norm, swiglu, down, pointers, divisors)
-        })?);
-    }
-
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("Qwen3.5 NVFP4 MLP graph inventory has wrong cardinality"))
+    capture_batch_graphs(
+        stream,
+        "Qwen3.5 NVFP4 MLP graph inventory has wrong cardinality",
+        |batch| launch_route(stream, batch, norm, swiglu, down, pointers, divisors),
+    )
 }
 
 fn launch_route(

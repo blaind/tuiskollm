@@ -1,5 +1,6 @@
 //! Resident final-normalization and LM-head program.
 
+use crate::common::graph::capture_batch_graphs;
 use crate::common::math::checked_product;
 use crate::{EndpointLayout, EngineError, EngineResult, MAX_BATCH};
 use std::marker::PhantomData;
@@ -310,16 +311,11 @@ fn capture_routes<A: Sm120Arch>(
     lm_head: &LmHeadOp<A>,
     pointers: EndpointPointers,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
-    let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for batch in 1..=MAX_BATCH {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, batch, norm, lm_head, pointers)
-        })?);
-    }
-
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("exact-batch graph inventory has the wrong cardinality"))
+    capture_batch_graphs(
+        stream,
+        "exact-batch graph inventory has the wrong cardinality",
+        |batch| launch_route(stream, batch, norm, lm_head, pointers),
+    )
 }
 
 fn launch_route<A: Sm120Arch>(

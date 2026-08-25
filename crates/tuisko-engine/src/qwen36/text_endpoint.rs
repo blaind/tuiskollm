@@ -1,5 +1,6 @@
 //! Resident Qwen3.6 final normalization and NVFP4 LM head.
 
+use crate::common::graph::capture_batch_graphs;
 use crate::common::slots::require_batch;
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen36TextEndpointLayout};
 use std::sync::Arc;
@@ -375,15 +376,11 @@ fn capture_routes(
     pointers: EndpointPointers,
     weight_scale_2: f32,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
-    let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for batch in 1..=MAX_BATCH {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, batch, norm, lm_head, pointers, weight_scale_2)
-        })?);
-    }
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("Qwen3.6 endpoint graph inventory is incomplete"))
+    capture_batch_graphs(
+        stream,
+        "Qwen3.6 endpoint graph inventory is incomplete",
+        |batch| launch_route(stream, batch, norm, lm_head, pointers, weight_scale_2),
+    )
 }
 
 fn launch_route(

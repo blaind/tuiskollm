@@ -1,5 +1,6 @@
 //! Resident source-backed Qwen3.6 full-attention plus MoE decoder layer.
 
+use crate::common::graph::{capture_batch_graphs, capture_route_graphs};
 use crate::common::math::product;
 use crate::qwen36::full_attention_layer_layout::{
     QWEN36_MAX_ROWS, QWEN36_PREFILL_TABLE_STRIDE, QWEN36_TABLE_STRIDE,
@@ -1144,16 +1145,11 @@ fn capture_decode_routes(
     pointers: Pointers,
     scales: LaunchScales,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
-    let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for batch in 1..=MAX_BATCH {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, batch, ops, pointers, scales)
-        })?);
-    }
-
-    graphs.try_into().map_err(|_| {
-        EngineError::layout("Qwen3.6 full-attention decode graph inventory has wrong cardinality")
-    })
+    capture_batch_graphs(
+        stream,
+        "Qwen3.6 full-attention decode graph inventory has wrong cardinality",
+        |batch| launch_route(stream, batch, ops, pointers, scales),
+    )
 }
 
 fn capture_prefill_routes(
@@ -1165,16 +1161,12 @@ fn capture_prefill_routes(
     // T=128 would otherwise require sixteen B=8 layer graphs and 15 extra
     // graph boundaries. This composes the same seven qualified T=128 leaves,
     // so every leaf retains its accumulation and rounding order.
-    let mut graphs = Vec::with_capacity(3);
-    for rows in [32, 64, 128] {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, rows, ops, pointers, scales)
-        })?);
-    }
-
-    graphs.try_into().map_err(|_| {
-        EngineError::layout("Qwen3.6 full-attention prefill graph inventory has wrong cardinality")
-    })
+    capture_route_graphs(
+        stream,
+        [32, 64, 128],
+        "Qwen3.6 full-attention prefill graph inventory has wrong cardinality",
+        |rows| launch_route(stream, rows, ops, pointers, scales),
+    )
 }
 
 fn launch_route(

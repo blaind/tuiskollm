@@ -1,5 +1,6 @@
 //! Resident source-backed NVFP4 MLP program.
 
+use crate::common::graph::{capture_batch_graphs, capture_route_graphs};
 use crate::common::math::checked_product;
 use crate::qwen38::nvfp4_mlp_layout::MAX_ROWS;
 use crate::{EngineError, EngineResult, MAX_BATCH, Nvfp4MlpLayout};
@@ -510,16 +511,11 @@ fn capture_decode_routes<A: Sm120Arch>(
     pointers: Pointers,
     divisors: Divisors,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
-    let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for batch in 1..=MAX_BATCH {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, batch, norm, swiglu, down, pointers, divisors)
-        })?);
-    }
-
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("NVFP4 MLP graph inventory has wrong cardinality"))
+    capture_batch_graphs(
+        stream,
+        "NVFP4 MLP graph inventory has wrong cardinality",
+        |batch| launch_route(stream, batch, norm, swiglu, down, pointers, divisors),
+    )
 }
 
 fn capture_prefill_routes<A: Sm120Arch>(
@@ -530,16 +526,12 @@ fn capture_prefill_routes<A: Sm120Arch>(
     pointers: Pointers,
     divisors: Divisors,
 ) -> EngineResult<[CudaGraph; 4]> {
-    let mut graphs = Vec::with_capacity(4);
-    for rows in [32, 64, 128, MAX_ROWS] {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, rows, norm, swiglu, down, pointers, divisors)
-        })?);
-    }
-
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("NVFP4 MLP prefill graph inventory has wrong cardinality"))
+    capture_route_graphs(
+        stream,
+        [32, 64, 128, MAX_ROWS],
+        "NVFP4 MLP prefill graph inventory has wrong cardinality",
+        |rows| launch_route(stream, rows, norm, swiglu, down, pointers, divisors),
+    )
 }
 
 fn launch_route<A: Sm120Arch>(
