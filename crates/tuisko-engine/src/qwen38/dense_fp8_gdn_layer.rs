@@ -1,6 +1,6 @@
 //! Resident source-backed dense-FP8 GDN decoder layer.
 
-use crate::dense_fp8_gdn_layer_layout::{GdnLayerRegions, MAX_ROWS};
+use crate::qwen38::dense_fp8_gdn_layer_layout::{GdnLayerRegions, MAX_ROWS};
 use crate::{DenseFp8GdnLayerLayout, EngineError, EngineResult, MAX_BATCH};
 use std::marker::PhantomData;
 use std::sync::Arc;

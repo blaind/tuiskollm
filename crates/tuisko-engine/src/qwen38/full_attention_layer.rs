@@ -1,6 +1,6 @@
 //! Resident source-backed dense-FP8 full-attention decoder layer.
 
-use crate::full_attention_layer_layout::{
+use crate::qwen38::full_attention_layer_layout::{
     CONTEXT_CAPACITY, FullAttentionLayerRegions, MAX_ROWS, PREFILL_TABLE_STRIDE, TABLE_STRIDE,
 };
 use crate::{EngineError, EngineResult, FullAttentionLayerLayout, MAX_BATCH};

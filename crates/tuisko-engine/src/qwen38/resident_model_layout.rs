@@ -21,7 +21,7 @@ pub use upload_plan::{
 
 use crate::{
     EngineError, EngineResult, KvCacheCodec, MAX_BATCH, SharedPagedKvLayout,
-    long_context_kv_layout::MAX_CONTEXT_TOKENS,
+    qwen38::long_context_kv_layout::MAX_CONTEXT_TOKENS,
 };
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::{

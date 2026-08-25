@@ -1,45 +1,52 @@
-//! Resident source-backed Qwen3.6 GDN plus MoE decoder layer.
+//! Resident source-backed Qwen3.6 full-attention plus MoE decoder layer.
 
-use crate::qwen36_gdn_moe_layer_layout::{QWEN36_GDN_MAX_ROWS, Qwen36GdnMoeLayerRegions};
-use crate::{EngineError, EngineResult, MAX_BATCH, Qwen36GdnMoeLayerLayout};
+use crate::qwen36::full_attention_layer_layout::{
+    QWEN36_MAX_ROWS, QWEN36_PREFILL_TABLE_STRIDE, QWEN36_TABLE_STRIDE,
+    Qwen36FullAttentionLayerRegions,
+};
+use crate::qwen36::long_context_kv::Qwen36AttentionKvBinding;
+use crate::{EngineError, EngineResult, MAX_BATCH, Qwen36FullAttentionLayerLayout};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
 use tuisko_kernels_sm120::{
-    Qwen36GdnInputOp, Qwen36GdnOutputOp, Qwen36GdnPrepareOp, Qwen36GdnRecurrenceOp,
+    Qwen36AttentionOutputOp, Qwen36Fp8AttentionQkPrepareOp, Qwen36Fp8PagedGqaOp, Qwen36Fp8QkvOp,
     Qwen36MoeExpertsOp, Qwen36MoeRouterOp, Qwen36ResidualNormOp,
 };
 use tuisko_model::{
-    Arch, CheckpointSnapshot, Qwen36GdnBindings, Qwen36Moe35B, Qwen36MoeLayerBindings,
+    Arch, CheckpointSnapshot, Qwen36FullAttentionBindings, Qwen36Moe35B, Qwen36MoeLayerBindings,
 };
 
-/// One Qwen3.6 linear-attention layer with immutable exact decode and prefill graphs.
-pub struct Qwen36GdnMoeLayerProgram {
+const ROTARY_PAIRS: usize = 32;
+
+/// One Qwen3.6 full-attention layer with immutable exact decode and prefill graphs.
+pub struct Qwen36FullAttentionLayerProgram {
     // Drop graphs before the arena and loaded modules whose handles they retain.
     graphs: [CudaGraph; MAX_BATCH],
     prefill_graphs: [CudaGraph; 3],
     arena: DeviceArena,
     _norm: Qwen36ResidualNormOp,
-    _input: Qwen36GdnInputOp,
-    _prepare: Qwen36GdnPrepareOp,
-    _recurrence: Qwen36GdnRecurrenceOp,
-    _output: Qwen36GdnOutputOp,
+    _qkv: Qwen36Fp8QkvOp,
+    _qk_prepare: Qwen36Fp8AttentionQkPrepareOp,
+    _paged_gqa: Qwen36Fp8PagedGqaOp,
+    _attention_output: Qwen36AttentionOutputOp,
     _router: Qwen36MoeRouterOp,
     _experts: Qwen36MoeExpertsOp,
     snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
     context: Arc<CudaContext>,
-    layout: Qwen36GdnMoeLayerLayout,
+    layout: Qwen36FullAttentionLayerLayout,
     base_address: u64,
-    source_scales: SourceScales,
+    scales: LaunchScales,
+    kv_binding: Option<Qwen36AttentionKvBinding>,
     layer: usize,
 }
 
 #[derive(Clone, Copy)]
-struct SourceScales {
-    input: f32,
-    qkv_weight: f32,
-    z_weight: f32,
+struct LaunchScales {
+    qkv_input: f32,
+    qkv_weight: [f32; 3],
     output_input: f32,
     output_weight: f32,
+    cache: f32,
     shared_gate_up_weight: f32,
     shared_down_weight: f32,
 }
@@ -49,23 +56,27 @@ struct Pointers {
     residual_input: *const u16,
     input_norm: *const u16,
     mixer_normalized: *mut u16,
-    input_activation_codes: *mut u8,
-    input_weight_codes: *const u8,
-    control_weight_bf16: *const u16,
-    projected: *mut u16,
-    projected_controls: *mut u16,
-    a_log: *const u16,
-    dt_bias: *const u16,
-    convolution_weights: *const u16,
-    state_rows: *const u32,
-    history: *mut u16,
-    log_decay: *mut f32,
-    beta: *mut f32,
-    convolved: *mut u16,
-    recurrent_norm: *const u16,
-    state: *mut f32,
-    recurrent_plane: *mut f32,
-    recurrent_output: *mut u16,
+    qkv_activation_codes: *mut u8,
+    qkv_weight_codes: *const u8,
+    qkv: *mut u16,
+    query_norm: *const u16,
+    key_norm: *const u16,
+    rope_cos: *const f32,
+    rope_sin: *const f32,
+    block_tables: *const u32,
+    table_rows: *const u32,
+    cache_positions: *const u32,
+    lengths: *const u32,
+    prefill_rope_cos: *const f32,
+    prefill_rope_sin: *const f32,
+    prefill_table_rows: *const u32,
+    prefill_cache_positions: *const u32,
+    prefill_lengths: *const u32,
+    query: *mut f32,
+    key_pages: *mut u8,
+    value_pages: *mut u8,
+    attention: *mut f32,
+    output_activation: *mut u16,
     output_activation_codes: *mut u8,
     output_weight_codes: *const u8,
     mixer_branch: *mut u16,
@@ -94,31 +105,41 @@ struct Pointers {
     next_norm: *const u16,
     residual_output: *mut u16,
     next_normalized: *mut u16,
+    decode_table_stride: usize,
+    prefill_table_stride: usize,
 }
 
 impl Pointers {
-    fn bind(arena: &DeviceArena, regions: Qwen36GdnMoeLayerRegions) -> GpuResult<Self> {
-        Ok(Self {
+    fn bind_with_kv(
+        arena: &DeviceArena,
+        regions: Qwen36FullAttentionLayerRegions,
+        binding: Option<Qwen36AttentionKvBinding>,
+    ) -> GpuResult<Self> {
+        let mut pointers = Self {
             residual_input: arena.address(regions.residual_input)?.cast_const(),
             input_norm: arena.address(regions.input_norm)?.cast_const(),
             mixer_normalized: arena.address(regions.mixer_normalized)?,
-            input_activation_codes: arena.address(regions.input_activation_codes)?,
-            input_weight_codes: arena.address(regions.input_weight_codes)?.cast_const(),
-            control_weight_bf16: arena.address(regions.control_weight_bf16)?.cast_const(),
-            projected: arena.address(regions.projected)?,
-            projected_controls: arena.address(regions.projected_controls)?,
-            a_log: arena.address(regions.a_log)?.cast_const(),
-            dt_bias: arena.address(regions.dt_bias)?.cast_const(),
-            convolution_weights: arena.address(regions.convolution_weights)?.cast_const(),
-            state_rows: arena.address(regions.state_rows)?.cast_const(),
-            history: arena.address(regions.history)?,
-            log_decay: arena.address(regions.log_decay)?,
-            beta: arena.address(regions.beta)?,
-            convolved: arena.address(regions.convolved)?,
-            recurrent_norm: arena.address(regions.recurrent_norm)?.cast_const(),
-            state: arena.address(regions.state)?,
-            recurrent_plane: arena.address(regions.recurrent_plane)?,
-            recurrent_output: arena.address(regions.recurrent_output)?,
+            qkv_activation_codes: arena.address(regions.qkv_activation_codes)?,
+            qkv_weight_codes: arena.address(regions.qkv_weight_codes)?.cast_const(),
+            qkv: arena.address(regions.qkv)?,
+            query_norm: arena.address(regions.query_norm)?.cast_const(),
+            key_norm: arena.address(regions.key_norm)?.cast_const(),
+            rope_cos: arena.address(regions.rope_cos)?.cast_const(),
+            rope_sin: arena.address(regions.rope_sin)?.cast_const(),
+            block_tables: arena.address(regions.block_tables)?.cast_const(),
+            table_rows: arena.address(regions.table_rows)?.cast_const(),
+            cache_positions: arena.address(regions.cache_positions)?.cast_const(),
+            lengths: arena.address(regions.lengths)?.cast_const(),
+            prefill_rope_cos: arena.address(regions.prefill_rope_cos)?.cast_const(),
+            prefill_rope_sin: arena.address(regions.prefill_rope_sin)?.cast_const(),
+            prefill_table_rows: arena.address(regions.prefill_table_rows)?.cast_const(),
+            prefill_cache_positions: arena.address(regions.prefill_cache_positions)?.cast_const(),
+            prefill_lengths: arena.address(regions.prefill_lengths)?.cast_const(),
+            query: arena.address(regions.query)?,
+            key_pages: arena.address(regions.key_pages)?,
+            value_pages: arena.address(regions.value_pages)?,
+            attention: arena.address(regions.attention)?,
+            output_activation: arena.address(regions.output_activation)?,
             output_activation_codes: arena.address(regions.output_activation_codes)?,
             output_weight_codes: arena.address(regions.output_weight_codes)?.cast_const(),
             mixer_branch: arena.address(regions.mixer_branch)?,
@@ -151,7 +172,18 @@ impl Pointers {
             next_norm: arena.address(regions.next_norm)?.cast_const(),
             residual_output: arena.address(regions.residual_output)?,
             next_normalized: arena.address(regions.next_normalized)?,
-        })
+            decode_table_stride: QWEN36_TABLE_STRIDE,
+            prefill_table_stride: QWEN36_PREFILL_TABLE_STRIDE,
+        };
+        if let Some(binding) = binding {
+            pointers.block_tables = binding.block_tables as *const u32;
+            pointers.key_pages = binding.key_pages as *mut u8;
+            pointers.value_pages = binding.value_pages as *mut u8;
+            pointers.decode_table_stride = binding.table_stride;
+            pointers.prefill_table_stride = binding.table_stride;
+        }
+
+        Ok(pointers)
     }
 
     #[cfg(feature = "qualification")]
@@ -160,22 +192,27 @@ impl Pointers {
             self.residual_input.addr(),
             self.input_norm.addr(),
             self.mixer_normalized.addr(),
-            self.input_activation_codes.addr(),
-            self.input_weight_codes.addr(),
-            self.control_weight_bf16.addr(),
-            self.projected.addr(),
-            self.projected_controls.addr(),
-            self.a_log.addr(),
-            self.dt_bias.addr(),
-            self.convolution_weights.addr(),
-            self.state_rows.addr(),
-            self.history.addr(),
-            self.log_decay.addr(),
-            self.beta.addr(),
-            self.convolved.addr(),
-            self.recurrent_norm.addr(),
-            self.state.addr(),
-            self.recurrent_output.addr(),
+            self.qkv_activation_codes.addr(),
+            self.qkv_weight_codes.addr(),
+            self.qkv.addr(),
+            self.query_norm.addr(),
+            self.key_norm.addr(),
+            self.rope_cos.addr(),
+            self.rope_sin.addr(),
+            self.block_tables.addr(),
+            self.table_rows.addr(),
+            self.cache_positions.addr(),
+            self.lengths.addr(),
+            self.prefill_rope_cos.addr(),
+            self.prefill_rope_sin.addr(),
+            self.prefill_table_rows.addr(),
+            self.prefill_cache_positions.addr(),
+            self.prefill_lengths.addr(),
+            self.query.addr(),
+            self.key_pages.addr(),
+            self.value_pages.addr(),
+            self.attention.addr(),
+            self.output_activation.addr(),
             self.output_activation_codes.addr(),
             self.output_weight_codes.addr(),
             self.mixer_branch.addr(),
@@ -211,74 +248,91 @@ impl Pointers {
 #[derive(Clone, Copy)]
 struct Ops<'a> {
     norm: &'a Qwen36ResidualNormOp,
-    input: &'a Qwen36GdnInputOp,
-    prepare: &'a Qwen36GdnPrepareOp,
-    recurrence: &'a Qwen36GdnRecurrenceOp,
-    output: &'a Qwen36GdnOutputOp,
+    qkv: &'a Qwen36Fp8QkvOp,
+    qk_prepare: &'a Qwen36Fp8AttentionQkPrepareOp,
+    paged_gqa: &'a Qwen36Fp8PagedGqaOp,
+    attention_output: &'a Qwen36AttentionOutputOp,
     router: &'a Qwen36MoeRouterOp,
     experts: &'a Qwen36MoeExpertsOp,
 }
 
-impl Qwen36GdnMoeLayerProgram {
+impl Qwen36FullAttentionLayerProgram {
     /// Loads one source layer and captures exact `B=1..8` and `T=32,64,128` routes.
     pub fn from_snapshot(
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
         layer: usize,
     ) -> EngineResult<Self> {
-        let gdn = Qwen36GdnBindings::bind(snapshot.as_ref(), layer)?.materialize()?;
+        Self::from_snapshot_inner(context, snapshot, layer, None)
+    }
+
+    /// Captures this layer against cache storage retained by its resident parent.
+    ///
+    /// # Safety
+    /// The binding must name complete page-table and E4M3 K/V planes in `context`
+    /// that outlive this program and all graphs captured by it.
+    pub(crate) unsafe fn from_snapshot_with_kv(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
+        layer: usize,
+        binding: Qwen36AttentionKvBinding,
+    ) -> EngineResult<Self> {
+        Self::from_snapshot_inner(context, snapshot, layer, Some(binding))
+    }
+
+    fn from_snapshot_inner(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
+        layer: usize,
+        kv_binding: Option<Qwen36AttentionKvBinding>,
+    ) -> EngineResult<Self> {
+        let attention =
+            Qwen36FullAttentionBindings::bind(snapshot.as_ref(), layer)?.materialize()?;
         let moe = Qwen36MoeLayerBindings::bind(snapshot.as_ref(), layer)?.materialize()?;
-        let post_attention_norm = gdn.post_attention_norm.words().collect::<Vec<_>>();
+        let post_attention_norm = attention.post_attention_norm.words().collect::<Vec<_>>();
         if post_attention_norm != moe.input_norm.words().collect::<Vec<_>>() {
             return Err(EngineError::layout(format!(
-                "Qwen3.6 layer {layer} GDN/MoE boundary norms differ"
+                "Qwen3.6 layer {layer} attention/MoE boundary norms differ"
             )));
         }
 
-        let layout = Qwen36GdnMoeLayerLayout::build()?;
+        let layout = Qwen36FullAttentionLayerLayout::build()?;
         let regions = layout.regions();
         let stream = context.new_stream().map_err(GpuError::from)?;
         let arena = DeviceArena::zeroed(&stream, layout.builder())?;
         let norm = Qwen36ResidualNormOp::new(context)?;
-        let input = Qwen36GdnInputOp::new(context)?;
-        let prepare = Qwen36GdnPrepareOp::new(context)?;
-        let recurrence = Qwen36GdnRecurrenceOp::new(context)?;
-        let output = Qwen36GdnOutputOp::new(context)?;
+        let qkv = Qwen36Fp8QkvOp::new(context)?;
+        let qk_prepare = Qwen36Fp8AttentionQkPrepareOp::new(context)?;
+        let paged_gqa = Qwen36Fp8PagedGqaOp::new(context)?;
+        let attention_output = Qwen36AttentionOutputOp::new(context)?;
         let router = Qwen36MoeRouterOp::new(context)?;
         let experts = Qwen36MoeExpertsOp::new(context)?;
 
         arena.copy_from_host(
             &stream,
             regions.input_norm,
-            &gdn.input_norm.words().collect::<Vec<_>>(),
-        )?;
-        arena.copy_from_host(&stream, regions.input_weight_codes, &gdn.input_weight_e4m3)?;
-        arena.copy_from_host(
-            &stream,
-            regions.control_weight_bf16,
-            &bf16_words(&gdn.control_weight_bf16)?,
+            &attention.input_norm.words().collect::<Vec<_>>(),
         )?;
         arena.copy_from_host(
             &stream,
-            regions.a_log,
-            &gdn.a_log.words().collect::<Vec<_>>(),
+            regions.qkv_weight_codes,
+            &attention.qkv_weight_e4m3,
         )?;
         arena.copy_from_host(
             &stream,
-            regions.dt_bias,
-            &gdn.dt_bias.words().collect::<Vec<_>>(),
+            regions.query_norm,
+            &attention.query_norm.words().collect::<Vec<_>>(),
         )?;
         arena.copy_from_host(
             &stream,
-            regions.convolution_weights,
-            &gdn.convolution_weight.words().collect::<Vec<_>>(),
+            regions.key_norm,
+            &attention.key_norm.words().collect::<Vec<_>>(),
         )?;
         arena.copy_from_host(
             &stream,
-            regions.recurrent_norm,
-            &gdn.norm.words().collect::<Vec<_>>(),
+            regions.output_weight_codes,
+            attention.output.weight_e4m3,
         )?;
-        arena.copy_from_host(&stream, regions.output_weight_codes, gdn.output.weight_e4m3)?;
         arena.copy_from_host(&stream, regions.post_attention_norm, &post_attention_norm)?;
         arena.copy_from_host(
             &stream,
@@ -347,49 +401,55 @@ impl Qwen36GdnMoeLayerProgram {
         )?;
         arena.copy_from_host(
             &stream,
-            regions.state_rows,
+            regions.block_tables,
+            &(0..(MAX_BATCH * QWEN36_TABLE_STRIDE) as u32).collect::<Vec<_>>(),
+        )?;
+        arena.copy_from_host(
+            &stream,
+            regions.table_rows,
             &(0..MAX_BATCH as u32).collect::<Vec<_>>(),
         )?;
 
-        let source_scales = SourceScales {
-            input: gdn.input_scale,
-            qkv_weight: gdn.input_weight_scales[0],
-            z_weight: gdn.input_weight_scales[1],
-            output_input: gdn.output.input_scale,
-            output_weight: gdn.output.weight_scale,
+        let scales = LaunchScales {
+            qkv_input: attention.qkv_input_scale,
+            qkv_weight: attention.qkv_weight_scales,
+            output_input: attention.output.input_scale,
+            output_weight: attention.output.weight_scale,
+            cache: Qwen36Moe35B::FP8_CACHE_SCALE,
             shared_gate_up_weight: moe.shared_expert.gate_up_weight_scales_2[0],
             shared_down_weight: moe.shared_expert.down_weight_scales_2[0],
         };
-        let pointers = Pointers::bind(&arena, regions)?;
+        let pointers = Pointers::bind_with_kv(&arena, regions, kv_binding)?;
         let base_address = arena.base_address();
         let ops = Ops {
             norm: &norm,
-            input: &input,
-            prepare: &prepare,
-            recurrence: &recurrence,
-            output: &output,
+            qkv: &qkv,
+            qk_prepare: &qk_prepare,
+            paged_gqa: &paged_gqa,
+            attention_output: &attention_output,
             router: &router,
             experts: &experts,
         };
-        let graphs = capture_decode_routes(&stream, ops, pointers, source_scales)?;
-        let prefill_graphs = capture_prefill_routes(&stream, ops, pointers, source_scales)?;
+        let graphs = capture_decode_routes(&stream, ops, pointers, scales)?;
+        let prefill_graphs = capture_prefill_routes(&stream, ops, pointers, scales)?;
 
         Ok(Self {
             graphs,
             prefill_graphs,
             arena,
             _norm: norm,
-            _input: input,
-            _prepare: prepare,
-            _recurrence: recurrence,
-            _output: output,
+            _qkv: qkv,
+            _qk_prepare: qk_prepare,
+            _paged_gqa: paged_gqa,
+            _attention_output: attention_output,
             _router: router,
             _experts: experts,
             snapshot,
             context: context.clone(),
             layout,
             base_address,
-            source_scales,
+            scales,
+            kv_binding,
             layer,
         })
     }
@@ -402,10 +462,10 @@ impl Qwen36GdnMoeLayerProgram {
         values: &[u16],
     ) -> EngineResult<()> {
         require_rows(rows)?;
-        let expected = product("Qwen3.6 layer input", rows, Qwen36Moe35B::HIDDEN)?;
+        let expected = product("Qwen3.6 attention input", rows, Qwen36Moe35B::HIDDEN)?;
         if values.len() != expected {
             return Err(EngineError::layout(format!(
-                "Qwen3.6 layer input has {} values, expected {expected} for rows={rows}",
+                "Qwen3.6 attention input has {} values, expected {expected} for rows={rows}",
                 values.len()
             )));
         }
@@ -415,45 +475,175 @@ impl Qwen36GdnMoeLayerProgram {
         Ok(())
     }
 
-    /// Clears all slot-owned causal history and recurrent state.
-    pub fn reset_state(&self, stream: &CudaStream) -> EngineResult<()> {
+    /// Loads a contiguous from-empty causal prefill tile and its 32 MRoPE pairs.
+    pub fn load_prefill_state(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        self.load_prefill_slot_state_at(stream, tokens, 0, 0, rope_cos, rope_sin)
+    }
+
+    pub(crate) fn load_prefill_slot_state_at(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        slot: usize,
+        first_position: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        if prefill_index(tokens).is_none() {
+            return Err(EngineError::route(format!(
+                "Qwen3.6 full-attention prefill tokens {tokens} are outside 32,64,128"
+            )));
+        }
+        require_slot(slot)?;
+        let rotary_values = product(
+            "Qwen3.6 attention prefill rotary values",
+            tokens,
+            ROTARY_PAIRS,
+        )?;
+        if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
+            return Err(EngineError::layout(format!(
+                "Qwen3.6 attention prefill rotary planes must each have {rotary_values} values for T={tokens}"
+            )));
+        }
+        let context_tokens = first_position.checked_add(tokens).ok_or_else(|| {
+            EngineError::route("Qwen3.6 attention prefill context length overflows")
+        })?;
+        if context_tokens > self.prefill_context_capacity() {
+            return Err(EngineError::route(format!(
+                "Qwen3.6 attention prefill positions {first_position}..{context_tokens} exceed the {}-token shared cache",
+                self.prefill_context_capacity()
+            )));
+        }
+
+        let positions = (0..tokens)
+            .map(|token| {
+                u32::try_from(first_position + token).map_err(|_| {
+                    EngineError::route("Qwen3.6 attention prefill position exceeds u32")
+                })
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        let lengths = positions
+            .iter()
+            .map(|position| {
+                position
+                    .checked_add(1)
+                    .ok_or_else(|| EngineError::route("Qwen3.6 attention prefill length overflows"))
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        let table_rows = vec![slot as u32; tokens];
         let regions = self.layout.regions();
-        self.arena.fill(stream, regions.history, 0)?;
-        self.arena.fill(stream, regions.state, 0)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.prefill_table_rows, &table_rows)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.prefill_cache_positions, &positions)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.prefill_lengths, &lengths)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.prefill_rope_cos, rope_cos)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.prefill_rope_sin, rope_sin)?;
 
         Ok(())
     }
 
-    /// Maps compact rows to distinct physical recurrent-state slots.
+    /// Maps compact decode rows to distinct physical cache slots.
     pub fn load_slot_routes(&self, stream: &CudaStream, slots: &[usize]) -> EngineResult<()> {
         let rows = slot_rows(slots)?;
         self.arena.copy_prefix_from_host(
             stream,
-            self.layout.regions().state_rows,
+            self.layout.regions().table_rows,
             &rows[..slots.len()],
         )?;
 
         Ok(())
     }
 
-    /// Selects one physical recurrent-state slot for a causal prompt route.
-    pub fn load_prefill_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
-        require_slot(slot)?;
-        self.arena.copy_prefix_from_host(
-            stream,
-            self.layout.regions().state_rows,
-            &[slot as u32],
-        )?;
+    /// Updates active positions, causal lengths, and 32 MRoPE pairs per token.
+    pub fn load_decode_state(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        positions: &[u32],
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        require_batch(batch)?;
+        if positions.len() != batch {
+            return Err(EngineError::layout(format!(
+                "Qwen3.6 attention positions have {} values, expected {batch}",
+                positions.len()
+            )));
+        }
+        let rotary_values = product("Qwen3.6 attention rotary values", batch, ROTARY_PAIRS)?;
+        if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
+            return Err(EngineError::layout(format!(
+                "Qwen3.6 attention rotary planes must each have {rotary_values} values for B={batch}"
+            )));
+        }
+        let lengths = positions
+            .iter()
+            .map(|&position| {
+                if position as usize >= self.context_capacity() {
+                    return Err(EngineError::route(format!(
+                        "Qwen3.6 attention cache position {position} exceeds the {}-token slot capacity",
+                        self.context_capacity()
+                    )));
+                }
+                position.checked_add(1).ok_or_else(|| {
+                    EngineError::route("Qwen3.6 attention cache length overflows")
+                })
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        let regions = self.layout.regions();
+        self.arena
+            .copy_prefix_from_host(stream, regions.cache_positions, positions)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.lengths, &lengths)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.rope_cos, rope_cos)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.rope_sin, rope_sin)?;
 
         Ok(())
     }
 
-    /// Clears one physical slot's causal history and recurrent state.
-    pub fn reset_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
-        require_slot(slot)?;
+    /// Replaces both complete represented E4M3 cache planes.
+    pub fn load_cache(
+        &self,
+        stream: &CudaStream,
+        key_pages: &[u8],
+        value_pages: &[u8],
+    ) -> EngineResult<()> {
+        self.require_internal_cache("load")?;
         let regions = self.layout.regions();
-        fill_slot(&self.arena, stream, regions.history, slot)?;
-        fill_slot(&self.arena, stream, regions.state, slot)?;
+        if key_pages.len() != regions.key_pages.len()
+            || value_pages.len() != regions.value_pages.len()
+        {
+            return Err(EngineError::layout(format!(
+                "Qwen3.6 attention cache planes must each have {} E4M3 values",
+                regions.key_pages.len()
+            )));
+        }
+        self.arena
+            .copy_from_host(stream, regions.key_pages, key_pages)?;
+        self.arena
+            .copy_from_host(stream, regions.value_pages, value_pages)?;
+
+        Ok(())
+    }
+
+    /// Clears all slot-owned represented key/value cache pages.
+    pub fn reset_cache(&self, stream: &CudaStream) -> EngineResult<()> {
+        self.require_internal_cache("reset")?;
+        let regions = self.layout.regions();
+        self.arena.fill(stream, regions.key_pages, 0)?;
+        self.arena.fill(stream, regions.value_pages, 0)?;
 
         Ok(())
     }
@@ -461,8 +651,8 @@ impl Qwen36GdnMoeLayerProgram {
     /// Replays the immutable graph for one admitted row count.
     pub fn replay(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
         let graph = self.graph(rows)?;
-        // SAFETY: this Qwen36GdnMoeLayerProgram owns every captured allocation
-        // (arena, op modules) for its whole life and drops the graphs first.
+        // SAFETY: this Qwen36FullAttentionLayerProgram owns every captured
+        // allocation (arena, op modules) for its whole life and drops the graphs first.
         unsafe { graph.launch(stream) }?;
 
         Ok(())
@@ -471,7 +661,7 @@ impl Qwen36GdnMoeLayerProgram {
     /// Reads active BF16 residual output rows.
     pub fn read_residual(&self, stream: &CudaStream, rows: usize) -> EngineResult<Vec<u16>> {
         require_rows(rows)?;
-        let values = product("Qwen3.6 layer output", rows, Qwen36Moe35B::HIDDEN)?;
+        let values = product("Qwen3.6 attention output", rows, Qwen36Moe35B::HIDDEN)?;
 
         Ok(self
             .arena
@@ -483,7 +673,7 @@ impl Qwen36GdnMoeLayerProgram {
         self.layer
     }
 
-    /// CUDA context shared by the arena, graphs, and prepared operators.
+    /// CUDA context shared by the arena, graphs, and operators.
     pub const fn context(&self) -> &Arc<CudaContext> {
         &self.context
     }
@@ -498,7 +688,12 @@ impl Qwen36GdnMoeLayerProgram {
         self.layout.resident_weight_bytes()
     }
 
-    /// Exact address-stable workspace and recurrent-state bytes.
+    /// Exact represented E4M3 key/value cache bytes.
+    pub const fn cache_bytes(&self) -> usize {
+        self.layout.cache_bytes()
+    }
+
+    /// Exact address-stable non-cache workspace bytes.
     pub const fn workspace_bytes(&self) -> usize {
         self.layout.workspace_bytes()
     }
@@ -508,6 +703,19 @@ impl Qwen36GdnMoeLayerProgram {
         self.layout.arena_bytes()
     }
 
+    /// Fixed short-context capacity of each decode slot.
+    pub const fn context_capacity(&self) -> usize {
+        match self.kv_binding {
+            Some(binding) => binding.context_capacity,
+            None => self.layout.context_capacity(),
+        }
+    }
+
+    /// From-empty prompt capacity of the shared physical-page row.
+    pub const fn prefill_context_capacity(&self) -> usize {
+        self.context_capacity()
+    }
+
     /// Largest admitted exact batch.
     pub const fn batch_capacity(&self) -> usize {
         MAX_BATCH
@@ -515,11 +723,11 @@ impl Qwen36GdnMoeLayerProgram {
 
     /// Largest admitted exact row count.
     pub const fn row_capacity(&self) -> usize {
-        QWEN36_GDN_MAX_ROWS
+        QWEN36_MAX_ROWS
     }
 
     /// Checked owner layout.
-    pub const fn layout(&self) -> &Qwen36GdnMoeLayerLayout {
+    pub const fn layout(&self) -> &Qwen36FullAttentionLayerLayout {
         &self.layout
     }
 
@@ -529,7 +737,20 @@ impl Qwen36GdnMoeLayerProgram {
     }
 
     pub(crate) fn input_address(&self) -> GpuResult<*const u16> {
-        Ok(Pointers::bind(&self.arena, self.layout.regions())?.residual_input)
+        Ok(self.pointers()?.residual_input)
+    }
+
+    fn pointers(&self) -> GpuResult<Pointers> {
+        Pointers::bind_with_kv(&self.arena, self.layout.regions(), self.kv_binding)
+    }
+
+    fn require_internal_cache(&self, action: &str) -> EngineResult<()> {
+        if self.kv_binding.is_some() {
+            return Err(EngineError::route(format!(
+                "cannot {action} an externally owned Qwen3.6 attention cache through the layer"
+            )));
+        }
+        Ok(())
     }
 
     fn graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
@@ -538,7 +759,7 @@ impl Qwen36GdnMoeLayerProgram {
         }
         let index = prefill_index(rows).ok_or_else(|| {
             EngineError::route(format!(
-                "Qwen3.6 GDN/MoE row count {rows} is outside 1..={MAX_BATCH},32,64,128"
+                "Qwen3.6 full-attention row count {rows} is outside 1..={MAX_BATCH},32,64,128"
             ))
         })?;
 
@@ -556,10 +777,10 @@ impl Qwen36GdnMoeLayerProgram {
         rows: usize,
         input: *const u16,
     ) -> GpuResult<*const u16> {
-        let mut pointers = Pointers::bind(&self.arena, self.layout.regions())?;
+        let mut pointers = self.pointers()?;
         pointers.residual_input = input;
         require_rows(rows).map_err(|error| GpuError::invalid_launch(error.to_string()))?;
-        launch_route(stream, rows, self.ops(), pointers, self.source_scales)?;
+        launch_route(stream, rows, self.ops(), pointers, self.scales)?;
 
         Ok(pointers.residual_output.cast_const())
     }
@@ -568,13 +789,7 @@ impl Qwen36GdnMoeLayerProgram {
     /// Launches the production route eagerly for graph-agreement qualification.
     pub fn launch_eager(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
         require_rows(rows)?;
-        launch_route(
-            stream,
-            rows,
-            self.ops(),
-            Pointers::bind(&self.arena, self.layout.regions())?,
-            self.source_scales,
-        )?;
+        launch_route(stream, rows, self.ops(), self.pointers()?, self.scales)?;
 
         Ok(())
     }
@@ -596,12 +811,12 @@ impl Qwen36GdnMoeLayerProgram {
         require_rows(rows)?;
         if operations == 0 {
             return Err(EngineError::route(
-                "repeated Qwen3.6 GDN/MoE graph requires at least one operation",
+                "repeated Qwen3.6 full-attention graph requires at least one operation",
             ));
         }
-        let pointers = Pointers::bind(&self.arena, self.layout.regions())?;
+        let pointers = self.pointers()?;
         let ops = self.ops();
-        let scales = self.source_scales;
+        let scales = self.scales;
 
         Ok(CudaGraph::capture(stream, || {
             for _ in 0..operations {
@@ -614,47 +829,34 @@ impl Qwen36GdnMoeLayerProgram {
     #[cfg(feature = "qualification")]
     /// Returns every stable arena address in layout order.
     pub fn qualification_addresses(&self) -> EngineResult<Vec<usize>> {
-        Ok(Pointers::bind(&self.arena, self.layout.regions())?.addresses())
+        Ok(self.pointers()?.addresses())
     }
 
     #[cfg(feature = "qualification")]
-    /// Reads every graph input whose contents may vary between launches.
-    pub fn qualification_runtime_inputs(
-        &self,
-        stream: &CudaStream,
-    ) -> EngineResult<Qwen36GdnMoeLayerInputs> {
-        let regions = self.layout.regions();
-
-        Ok(Qwen36GdnMoeLayerInputs {
-            residual_input: self.arena.copy_to_host(stream, regions.residual_input)?,
-            state_rows: self.arena.copy_to_host(stream, regions.state_rows)?,
-        })
-    }
-
-    #[cfg(feature = "qualification")]
-    /// Returns the exact static scales passed to the projection and shared-expert routes.
-    pub const fn qualification_source_scales(&self) -> [f32; 7] {
+    /// Returns exact source scales plus the pinned FP8-cast cache scale in launch order.
+    pub const fn qualification_source_scales(&self) -> [f32; 10] {
         [
-            self.source_scales.input,
-            self.source_scales.qkv_weight,
-            self.source_scales.z_weight,
-            self.source_scales.output_input,
-            self.source_scales.output_weight,
-            self.source_scales.shared_gate_up_weight,
-            self.source_scales.shared_down_weight,
+            self.scales.qkv_input,
+            self.scales.qkv_weight[0],
+            self.scales.qkv_weight[1],
+            self.scales.qkv_weight[2],
+            self.scales.output_input,
+            self.scales.output_weight,
+            self.scales.cache,
+            self.scales.shared_gate_up_weight,
+            self.scales.shared_down_weight,
+            Qwen36Moe35B::RMS_NORM_EPSILON,
         ]
     }
 
     #[cfg(feature = "qualification")]
-    /// Fills all non-state mutable seams with one byte sentinel.
+    /// Fills every non-cache mutable seam with one byte sentinel.
     pub fn qualification_reset_outputs(&self, stream: &CudaStream, byte: u8) -> EngineResult<()> {
         let regions = self.layout.regions();
         for region in [
             regions.mixer_normalized,
-            regions.projected,
-            regions.projected_controls,
-            regions.convolved,
-            regions.recurrent_output,
+            regions.qkv,
+            regions.output_activation,
             regions.mixer_branch,
             regions.mixer_residual,
             regions.moe_normalized,
@@ -671,12 +873,12 @@ impl Qwen36GdnMoeLayerProgram {
             self.arena.fill(stream, region, byte)?;
         }
         for region in [
-            regions.input_activation_codes,
+            regions.qkv_activation_codes,
             regions.output_activation_codes,
         ] {
             self.arena.fill(stream, region, byte)?;
         }
-        for region in [regions.log_decay, regions.beta] {
+        for region in [regions.query, regions.attention] {
             self.arena.fill(stream, region, byte)?;
         }
 
@@ -684,28 +886,24 @@ impl Qwen36GdnMoeLayerProgram {
     }
 
     #[cfg(feature = "qualification")]
-    /// Reads all mutable planes, including inactive rows.
+    /// Reads every mutable seam, including complete persistent cache planes.
     pub fn qualification_observables(
         &self,
         stream: &CudaStream,
-    ) -> EngineResult<Qwen36GdnMoeLayerObservables> {
+    ) -> EngineResult<Qwen36FullAttentionLayerObservables> {
         let regions = self.layout.regions();
 
-        Ok(Qwen36GdnMoeLayerObservables {
+        Ok(Qwen36FullAttentionLayerObservables {
             mixer_normalized: self.arena.copy_to_host(stream, regions.mixer_normalized)?,
-            input_activation_codes: self
+            qkv_activation_codes: self
                 .arena
-                .copy_to_host(stream, regions.input_activation_codes)?,
-            projected: self.arena.copy_to_host(stream, regions.projected)?,
-            projected_controls: self
-                .arena
-                .copy_to_host(stream, regions.projected_controls)?,
-            log_decay: self.arena.copy_to_host(stream, regions.log_decay)?,
-            beta: self.arena.copy_to_host(stream, regions.beta)?,
-            convolved: self.arena.copy_to_host(stream, regions.convolved)?,
-            history: self.arena.copy_to_host(stream, regions.history)?,
-            state: self.arena.copy_to_host(stream, regions.state)?,
-            recurrent_output: self.arena.copy_to_host(stream, regions.recurrent_output)?,
+                .copy_to_host(stream, regions.qkv_activation_codes)?,
+            qkv: self.arena.copy_to_host(stream, regions.qkv)?,
+            query: self.arena.copy_to_host(stream, regions.query)?,
+            key_pages: self.arena.copy_to_host(stream, regions.key_pages)?,
+            value_pages: self.arena.copy_to_host(stream, regions.value_pages)?,
+            attention: self.arena.copy_to_host(stream, regions.attention)?,
+            output_activation: self.arena.copy_to_host(stream, regions.output_activation)?,
             output_activation_codes: self
                 .arena
                 .copy_to_host(stream, regions.output_activation_codes)?,
@@ -727,27 +925,46 @@ impl Qwen36GdnMoeLayerProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Reads every graph input whose contents may vary between launches.
+    pub fn qualification_runtime_inputs(
+        &self,
+        stream: &CudaStream,
+    ) -> EngineResult<Qwen36FullAttentionLayerInputs> {
+        let regions = self.layout.regions();
+
+        Ok(Qwen36FullAttentionLayerInputs {
+            residual_input: self.arena.copy_to_host(stream, regions.residual_input)?,
+            block_tables: self.arena.copy_to_host(stream, regions.block_tables)?,
+            rope_cos: self.arena.copy_to_host(stream, regions.rope_cos)?,
+            rope_sin: self.arena.copy_to_host(stream, regions.rope_sin)?,
+            table_rows: self.arena.copy_to_host(stream, regions.table_rows)?,
+            cache_positions: self.arena.copy_to_host(stream, regions.cache_positions)?,
+            lengths: self.arena.copy_to_host(stream, regions.lengths)?,
+            prefill_rope_cos: self.arena.copy_to_host(stream, regions.prefill_rope_cos)?,
+            prefill_rope_sin: self.arena.copy_to_host(stream, regions.prefill_rope_sin)?,
+            prefill_table_rows: self
+                .arena
+                .copy_to_host(stream, regions.prefill_table_rows)?,
+            prefill_cache_positions: self
+                .arena
+                .copy_to_host(stream, regions.prefill_cache_positions)?,
+            prefill_lengths: self.arena.copy_to_host(stream, regions.prefill_lengths)?,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
     /// Reads every immutable device plane in source/materialized order.
     pub fn qualification_immutable(
         &self,
         stream: &CudaStream,
-    ) -> EngineResult<Qwen36GdnMoeLayerImmutable> {
+    ) -> EngineResult<Qwen36FullAttentionLayerImmutable> {
         let regions = self.layout.regions();
 
-        Ok(Qwen36GdnMoeLayerImmutable {
+        Ok(Qwen36FullAttentionLayerImmutable {
             input_norm: self.arena.copy_to_host(stream, regions.input_norm)?,
-            input_weight_codes: self
-                .arena
-                .copy_to_host(stream, regions.input_weight_codes)?,
-            control_weight_bf16: self
-                .arena
-                .copy_to_host(stream, regions.control_weight_bf16)?,
-            a_log: self.arena.copy_to_host(stream, regions.a_log)?,
-            dt_bias: self.arena.copy_to_host(stream, regions.dt_bias)?,
-            convolution_weights: self
-                .arena
-                .copy_to_host(stream, regions.convolution_weights)?,
-            recurrent_norm: self.arena.copy_to_host(stream, regions.recurrent_norm)?,
+            qkv_weight_codes: self.arena.copy_to_host(stream, regions.qkv_weight_codes)?,
+            query_norm: self.arena.copy_to_host(stream, regions.query_norm)?,
+            key_norm: self.arena.copy_to_host(stream, regions.key_norm)?,
             output_weight_codes: self
                 .arena
                 .copy_to_host(stream, regions.output_weight_codes)?,
@@ -791,10 +1008,10 @@ impl Qwen36GdnMoeLayerProgram {
     fn ops(&self) -> Ops<'_> {
         Ops {
             norm: &self._norm,
-            input: &self._input,
-            prepare: &self._prepare,
-            recurrence: &self._recurrence,
-            output: &self._output,
+            qkv: &self._qkv,
+            qk_prepare: &self._qk_prepare,
+            paged_gqa: &self._paged_gqa,
+            attention_output: &self._attention_output,
             router: &self._router,
             experts: &self._experts,
         }
@@ -803,49 +1020,65 @@ impl Qwen36GdnMoeLayerProgram {
 
 #[cfg(feature = "qualification")]
 /// Runtime-owned planes that must remain immutable during a layer launch.
-pub struct Qwen36GdnMoeLayerInputs {
+pub struct Qwen36FullAttentionLayerInputs {
     /// BF16 residual rows consumed by the layer.
     pub residual_input: Vec<u16>,
-    /// Persistent state row selected by each decode slot or prompt sequence.
-    pub state_rows: Vec<u32>,
+    /// Complete physical-page inventory shared by both attention routes.
+    pub block_tables: Vec<u32>,
+    /// Decode MRoPE cosine values.
+    pub rope_cos: Vec<f32>,
+    /// Decode MRoPE sine values.
+    pub rope_sin: Vec<f32>,
+    /// Decode block-table rows.
+    pub table_rows: Vec<u32>,
+    /// Decode cache positions.
+    pub cache_positions: Vec<u32>,
+    /// Decode causal lengths.
+    pub lengths: Vec<u32>,
+    /// Prefill MRoPE cosine values.
+    pub prefill_rope_cos: Vec<f32>,
+    /// Prefill MRoPE sine values.
+    pub prefill_rope_sin: Vec<f32>,
+    /// Prefill block-table rows.
+    pub prefill_table_rows: Vec<u32>,
+    /// Prefill cache positions.
+    pub prefill_cache_positions: Vec<u32>,
+    /// Prefill causal lengths.
+    pub prefill_lengths: Vec<u32>,
 }
 
 #[cfg(feature = "qualification")]
 /// Complete mutable planes exposed to the qualification crate.
-pub struct Qwen36GdnMoeLayerObservables {
-    /// Pre-mixer normalized rows.
+pub struct Qwen36FullAttentionLayerObservables {
+    /// Pre-attention normalized rows.
     pub mixer_normalized: Vec<u16>,
-    /// Static E4M3 mixer-input activation codes.
-    pub input_activation_codes: Vec<u8>,
-    /// Fused Q/K/V/Z projection rows.
-    pub projected: Vec<u16>,
-    /// BF16 A/B control projection rows.
-    pub projected_controls: Vec<u16>,
-    /// Per-value-head log decays.
-    pub log_decay: Vec<f32>,
-    /// Per-value-head update gates.
-    pub beta: Vec<f32>,
-    /// Causal-convolved Q/K/V rows.
-    pub convolved: Vec<u16>,
-    /// Slot-owned causal history.
-    pub history: Vec<u16>,
-    /// Slot-owned FP32 recurrent state.
-    pub state: Vec<f32>,
-    /// Gated normalized recurrent values.
-    pub recurrent_output: Vec<u16>,
-    /// Static E4M3 output-projection activation codes.
+    /// Static E4M3 QKV activation codes.
+    pub qkv_activation_codes: Vec<u8>,
+    /// Fused query/gate, key, and value rows.
+    pub qkv: Vec<u16>,
+    /// Prepared FP32 query heads.
+    pub query: Vec<f32>,
+    /// Complete represented E4M3 key cache.
+    pub key_pages: Vec<u8>,
+    /// Complete represented E4M3 value cache.
+    pub value_pages: Vec<u8>,
+    /// FP32 GQA output, gated in place by attention output.
+    pub attention: Vec<f32>,
+    /// Gated BF16 attention values.
+    pub output_activation: Vec<u16>,
+    /// Static E4M3 attention-output activation codes.
     pub output_activation_codes: Vec<u8>,
-    /// GDN output-projection branch.
+    /// Attention output-projection branch.
     pub mixer_branch: Vec<u16>,
-    /// Residual after the GDN mixer.
+    /// Residual after attention.
     pub mixer_residual: Vec<u16>,
     /// Pre-MoE normalized rows.
     pub moe_normalized: Vec<u16>,
-    /// BF16 logits for all 256 routed experts.
+    /// Router logits for all experts.
     pub router_logits: Vec<u16>,
     /// Selected top-eight expert indices.
     pub expert_indices: Vec<u16>,
-    /// Renormalized top-eight BF16 routing weights.
+    /// Renormalized top-eight routing weights.
     pub routing_weights: Vec<u16>,
     /// Routed and shared expert SwiGLU values.
     pub expert_intermediate: Vec<u16>,
@@ -863,24 +1096,18 @@ pub struct Qwen36GdnMoeLayerObservables {
 
 #[cfg(feature = "qualification")]
 /// Immutable source-backed planes exposed to the qualification crate.
-pub struct Qwen36GdnMoeLayerImmutable {
+pub struct Qwen36FullAttentionLayerImmutable {
     /// Input RMSNorm weights.
     pub input_norm: Vec<u16>,
-    /// Fused source E4M3 Q/K/V/Z weights.
-    pub input_weight_codes: Vec<u8>,
-    /// BF16 A/B control weights.
-    pub control_weight_bf16: Vec<u16>,
-    /// Log-space recurrence decay parameters.
-    pub a_log: Vec<u16>,
-    /// Recurrence time-step bias.
-    pub dt_bias: Vec<u16>,
-    /// Width-four convolution weights.
-    pub convolution_weights: Vec<u16>,
-    /// Per-head recurrent RMSNorm weights.
-    pub recurrent_norm: Vec<u16>,
-    /// Source E4M3 recurrent-output projection weights.
+    /// Fused source E4M3 QKV weights.
+    pub qkv_weight_codes: Vec<u8>,
+    /// Per-head query RMSNorm weights.
+    pub query_norm: Vec<u16>,
+    /// Per-head key RMSNorm weights.
+    pub key_norm: Vec<u16>,
+    /// Source E4M3 attention-output weights.
     pub output_weight_codes: Vec<u8>,
-    /// Post-mixer RMSNorm weights shared with the MoE boundary.
+    /// Post-attention RMSNorm weights.
     pub post_attention_norm: Vec<u16>,
     /// BF16 router weights.
     pub router_weight: Vec<u16>,
@@ -914,17 +1141,17 @@ fn capture_decode_routes(
     stream: &CudaStream,
     ops: Ops<'_>,
     pointers: Pointers,
-    scales: SourceScales,
+    scales: LaunchScales,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
     let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for rows in 1..=MAX_BATCH {
+    for batch in 1..=MAX_BATCH {
         graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, rows, ops, pointers, scales)
+            launch_route(stream, batch, ops, pointers, scales)
         })?);
     }
 
     graphs.try_into().map_err(|_| {
-        EngineError::layout("Qwen3.6 GDN/MoE decode graph inventory has wrong cardinality")
+        EngineError::layout("Qwen3.6 full-attention decode graph inventory has wrong cardinality")
     })
 }
 
@@ -932,11 +1159,11 @@ fn capture_prefill_routes(
     stream: &CudaStream,
     ops: Ops<'_>,
     pointers: Pointers,
-    scales: SourceScales,
+    scales: LaunchScales,
 ) -> EngineResult<[CudaGraph; 3]> {
     // T=128 would otherwise require sixteen B=8 layer graphs and 15 extra
-    // boundaries. One graph composes the same seven qualified T=128 leaves;
-    // each leaf retains its accumulation and rounding order.
+    // graph boundaries. This composes the same seven qualified T=128 leaves,
+    // so every leaf retains its accumulation and rounding order.
     let mut graphs = Vec::with_capacity(3);
     for rows in [32, 64, 128] {
         graphs.push(CudaGraph::capture(stream, || {
@@ -945,7 +1172,7 @@ fn capture_prefill_routes(
     }
 
     graphs.try_into().map_err(|_| {
-        EngineError::layout("Qwen3.6 GDN/MoE prefill graph inventory has wrong cardinality")
+        EngineError::layout("Qwen3.6 full-attention prefill graph inventory has wrong cardinality")
     })
 }
 
@@ -954,11 +1181,31 @@ fn launch_route(
     rows: usize,
     ops: Ops<'_>,
     pointers: Pointers,
-    scales: SourceScales,
+    scales: LaunchScales,
 ) -> GpuResult<()> {
-    // SAFETY: one arena owns aligned, disjoint 128-row working planes and
-    // eight persistent state slots. Prompt leaves advance state row zero
-    // causally; every leaf selects the same exact row count.
+    let (rope_cos, rope_sin, table_rows, cache_positions, lengths, table_stride) =
+        if rows <= MAX_BATCH {
+            (
+                pointers.rope_cos,
+                pointers.rope_sin,
+                pointers.table_rows,
+                pointers.cache_positions,
+                pointers.lengths,
+                pointers.decode_table_stride,
+            )
+        } else {
+            (
+                pointers.prefill_rope_cos,
+                pointers.prefill_rope_sin,
+                pointers.prefill_table_rows,
+                pointers.prefill_cache_positions,
+                pointers.prefill_lengths,
+                pointers.prefill_table_stride,
+            )
+        };
+    // SAFETY: one arena owns aligned, disjoint 128-row planes. Decode uses
+    // three-page slot rows; prefill uses one shared 24-page row. Each leaf
+    // selects the same exact row count, preserving its qualified arithmetic.
     unsafe {
         ops.norm.launch_plain(
             stream,
@@ -967,50 +1214,56 @@ fn launch_route(
             pointers.input_norm,
             pointers.mixer_normalized,
         )?;
-        ops.input.launch(
+        ops.qkv.launch(
             stream,
             rows,
             pointers.mixer_normalized,
-            pointers.input_activation_codes,
-            scales.input,
-            pointers.input_weight_codes,
-            scales.qkv_weight,
-            scales.z_weight,
-            pointers.control_weight_bf16,
-            pointers.projected,
-            pointers.projected_controls,
+            pointers.qkv_activation_codes,
+            scales.qkv_input,
+            pointers.qkv_weight_codes,
+            scales.qkv_weight[0],
+            scales.qkv_weight[1],
+            scales.qkv_weight[2],
+            pointers.qkv,
         )?;
-        ops.prepare.launch(
+        ops.qk_prepare.launch(
             stream,
             rows,
-            pointers.projected_controls,
-            pointers.a_log,
-            pointers.dt_bias,
-            pointers.projected,
-            pointers.convolution_weights,
-            pointers.state_rows,
-            pointers.history,
-            pointers.log_decay,
-            pointers.beta,
-            pointers.convolved,
+            pointers.qkv,
+            pointers.query_norm,
+            pointers.key_norm,
+            rope_cos,
+            rope_sin,
+            pointers.block_tables,
+            table_rows,
+            table_stride,
+            cache_positions,
+            pointers.query,
+            pointers.key_pages,
+            pointers.value_pages,
+            scales.cache,
+            scales.cache,
         )?;
-        ops.recurrence.launch(
+        ops.paged_gqa.launch(
             stream,
             rows,
-            pointers.convolved,
-            pointers.projected,
-            pointers.log_decay,
-            pointers.beta,
-            pointers.recurrent_norm,
-            pointers.state_rows,
-            pointers.state,
-            pointers.recurrent_plane,
-            pointers.recurrent_output,
+            pointers.query,
+            pointers.key_pages,
+            pointers.value_pages,
+            pointers.block_tables,
+            table_rows,
+            table_stride,
+            lengths,
+            pointers.attention,
+            scales.cache,
+            scales.cache,
         )?;
-        ops.output.launch(
+        ops.attention_output.launch(
             stream,
             rows,
-            pointers.recurrent_output,
+            pointers.attention,
+            pointers.qkv,
+            pointers.output_activation,
             pointers.output_activation_codes,
             scales.output_input,
             pointers.output_weight_codes,
@@ -1073,27 +1326,14 @@ fn launch_route(
     Ok(())
 }
 
-fn bf16_words(bytes: &[u8]) -> EngineResult<Vec<u16>> {
-    let (words, remainder) = bytes.as_chunks::<2>();
-    if !remainder.is_empty() {
-        return Err(EngineError::layout(
-            "Qwen3.6 BF16 source plane has an odd byte length",
-        ));
+fn require_batch(batch: usize) -> EngineResult<()> {
+    if !(1..=MAX_BATCH).contains(&batch) {
+        return Err(EngineError::route(format!(
+            "Qwen3.6 full-attention batch {batch} is outside 1..={MAX_BATCH}"
+        )));
     }
 
-    Ok(words
-        .iter()
-        .map(|bytes| u16::from_le_bytes(*bytes))
-        .collect())
-}
-
-fn prefill_index(rows: usize) -> Option<usize> {
-    match rows {
-        32 => Some(0),
-        64 => Some(1),
-        128 => Some(2),
-        _ => None,
-    }
+    Ok(())
 }
 
 fn slot_rows(slots: &[usize]) -> EngineResult<[u32; MAX_BATCH]> {
@@ -1112,15 +1352,6 @@ fn slot_rows(slots: &[usize]) -> EngineResult<[u32; MAX_BATCH]> {
     Ok(rows)
 }
 
-fn require_batch(batch: usize) -> EngineResult<()> {
-    if !(1..=MAX_BATCH).contains(&batch) {
-        return Err(EngineError::route(format!(
-            "Qwen3.6 compact batch {batch} is outside 1..={MAX_BATCH}"
-        )));
-    }
-    Ok(())
-}
-
 fn require_slot(slot: usize) -> EngineResult<()> {
     if slot >= MAX_BATCH {
         return Err(EngineError::route(format!(
@@ -1130,22 +1361,13 @@ fn require_slot(slot: usize) -> EngineResult<()> {
     Ok(())
 }
 
-fn fill_slot<T: tuisko_gpu::DeviceCopy>(
-    arena: &DeviceArena,
-    stream: &CudaStream,
-    region: tuisko_gpu::ArenaRegion<T>,
-    slot: usize,
-) -> EngineResult<()> {
-    if !region.len().is_multiple_of(MAX_BATCH) {
-        return Err(EngineError::layout(format!(
-            "Qwen3.6 persistent region of {} values is not divisible by {MAX_BATCH} slots",
-            region.len()
-        )));
+fn prefill_index(rows: usize) -> Option<usize> {
+    match rows {
+        32 => Some(0),
+        64 => Some(1),
+        128 => Some(2),
+        _ => None,
     }
-    let width = region.len() / MAX_BATCH;
-    let start = product("Qwen3.6 persistent slot offset", slot, width)?;
-    arena.fill_slice(stream, region, start, width, 0)?;
-    Ok(())
 }
 
 fn require_rows(rows: usize) -> EngineResult<()> {
@@ -1154,7 +1376,7 @@ fn require_rows(rows: usize) -> EngineResult<()> {
     }
 
     Err(EngineError::route(format!(
-        "Qwen3.6 GDN/MoE row count {rows} is outside 1..={MAX_BATCH},32,64,128"
+        "Qwen3.6 full-attention row count {rows} is outside 1..={MAX_BATCH},32,64,128"
     )))
 }
 
@@ -1165,30 +1387,21 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, bf16_words, prefill_index, require_rows, slot_rows};
+    use super::{MAX_BATCH, ROTARY_PAIRS, prefill_index, require_batch, require_rows, slot_rows};
     use crate::EngineErrorCode;
+    use tuisko_model::Qwen36Moe35B;
 
     #[test]
     fn exact_batch_table_rejects_every_boundary_neighbor() {
-        for batch in 1..=8 {
-            require_rows(batch).unwrap();
+        for batch in 1..=MAX_BATCH {
+            require_batch(batch).unwrap();
         }
         for batch in [0, 9, 16, usize::MAX] {
-            let error = require_rows(batch).unwrap_err();
+            let error = require_batch(batch).unwrap_err();
             assert_eq!(error.code(), Some(EngineErrorCode::Route));
         }
-    }
-
-    #[test]
-    fn bf16_source_words_are_little_endian_and_even() {
-        assert_eq!(
-            bf16_words(&[0x80, 0x3f, 0x00, 0xbf]).unwrap(),
-            [0x3f80, 0xbf00]
-        );
-        assert_eq!(
-            bf16_words(&[0]).unwrap_err().code(),
-            Some(EngineErrorCode::Layout)
-        );
+        assert_eq!(ROTARY_PAIRS, 32);
+        assert_eq!(Qwen36Moe35B::FP8_CACHE_SCALE.to_bits(), 1.0f32.to_bits());
     }
 
     #[test]
@@ -1209,10 +1422,13 @@ mod tests {
     }
 
     #[test]
-    fn compact_state_slot_table_is_bijective() {
-        assert_eq!(slot_rows(&[4, 0, 7]).unwrap()[..3], [4, 0, 7]);
-        for slots in [&[][..], &[3, 3], &[MAX_BATCH], &[0, 1, 2, 3, 4, 5, 6, 7, 0]] {
-            assert!(slot_rows(slots).is_err(), "slots={slots:?}");
+    fn compact_cache_slot_table_is_bijective() {
+        assert_eq!(slot_rows(&[7, 2, 5]).unwrap()[..3], [7, 2, 5]);
+        for slots in [&[][..], &[0, 0], &[8]] {
+            assert_eq!(
+                slot_rows(slots).unwrap_err().code(),
+                Some(EngineErrorCode::Route)
+            );
         }
     }
 }

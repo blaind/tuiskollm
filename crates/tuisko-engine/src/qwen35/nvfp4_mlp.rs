@@ -1,7 +1,7 @@
 //! Resident source-backed Qwen3.5 NVFP4 MLP program.
 
 #[cfg(feature = "qualification")]
-use crate::nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
+use crate::qwen38::nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
 use crate::{EngineError, EngineResult, MAX_BATCH, Nvfp4MlpLayout};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};

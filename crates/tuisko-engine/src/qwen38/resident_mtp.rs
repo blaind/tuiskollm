@@ -1,6 +1,8 @@
 //! Resident long-context ownership for the exact Qwen3.8 MTP layer.
 
-use crate::resident_mtp_layout::{MTP_PROMPT_ROWS, ResidentMtpCacheRegions, ResidentMtpRegions};
+use crate::qwen38::resident_mtp_layout::{
+    MTP_PROMPT_ROWS, ResidentMtpCacheRegions, ResidentMtpRegions,
+};
 use crate::{
     EngineError, EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, PagedKvTableUpdate,
     ResidentLoadProgress, ResidentLoadStats, ResidentModelProgram, ResidentMtpLayout,

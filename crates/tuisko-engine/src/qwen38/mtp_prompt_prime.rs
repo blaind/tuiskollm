@@ -1,6 +1,6 @@
 //! Exact target-residual handoff and prompt priming for the Qwen3.8 MTP layer.
 
-use crate::mtp_prompt_prime_layout::{
+use crate::qwen38::mtp_prompt_prime_layout::{
     MTP_PROMPT_TILE_CAPACITY, MtpPromptPrimeLayout, MtpPromptPrimeRegions,
 };
 use crate::{

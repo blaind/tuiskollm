@@ -1,147 +1,103 @@
 //! Resident text inference ownership.
 
-mod dense_fp8_gdn_layer;
-mod dense_fp8_gdn_layer_layout;
-mod dense_fp8_mlp;
-mod dense_fp8_mlp_layout;
 mod error;
-mod full_attention_layer;
-mod full_attention_layer_layout;
 mod generation;
 mod layout;
-mod long_context_kv_layout;
-mod mtp_layer;
-mod mtp_layer_layout;
-mod mtp_prompt_prime;
-mod mtp_prompt_prime_layout;
-mod nvfp4_mlp;
-mod nvfp4_mlp_layout;
 mod paged_kv_slots;
 mod program;
-mod qwen35_batch_generation;
-mod qwen35_full_attention_layer;
-mod qwen35_full_attention_layer_layout;
-mod qwen35_gdn_layer;
-mod qwen35_gdn_layer_layout;
-mod qwen35_long_context_kv;
-mod qwen35_long_context_kv_layout;
-mod qwen35_mtp_batch_generation;
-mod qwen35_mtp_generation;
-mod qwen35_mtp_kv;
-mod qwen35_mtp_kv_layout;
-mod qwen35_mtp_layer;
-mod qwen35_mtp_layer_layout;
-mod qwen35_nvfp4_mlp;
-mod qwen35_resident_model;
-mod qwen35_resident_mtp;
-mod qwen35_resident_mtp_layout;
-mod qwen35_text_endpoint;
-mod qwen35_text_endpoint_layout;
-mod qwen36_batch_generation;
-mod qwen36_full_attention_layer;
-mod qwen36_full_attention_layer_layout;
-mod qwen36_gdn_moe_layer;
-mod qwen36_gdn_moe_layer_layout;
-mod qwen36_long_context_kv;
-mod qwen36_long_context_kv_layout;
-mod qwen36_mtp_layer;
-mod qwen36_mtp_layer_layout;
-mod qwen36_resident_model;
-mod qwen36_text_endpoint;
-mod qwen36_text_endpoint_layout;
+mod qwen35;
+mod qwen36;
+mod qwen38;
 mod resident_generation;
-mod resident_model_layout;
-mod resident_mtp;
-mod resident_mtp_batch_generation;
 mod resident_mtp_generation;
-mod resident_mtp_layout;
 mod sampling;
 
-pub use dense_fp8_gdn_layer::DenseFp8GdnLayerProgram;
-pub use dense_fp8_gdn_layer_layout::DenseFp8GdnLayerLayout;
-pub use dense_fp8_mlp::DenseFp8MlpProgram;
-pub use dense_fp8_mlp_layout::DenseFp8MlpLayout;
 pub use error::{EngineError, EngineErrorCode, EngineResult};
-pub use full_attention_layer::FullAttentionLayerProgram;
-pub use full_attention_layer_layout::FullAttentionLayerLayout;
 pub use generation::{
     CancelledText, ChatGenerationRequest, FinishReason, GeneratedText, GenerationSession,
     GenerationStep,
 };
 pub use layout::{EndpointLayout, MAX_BATCH};
-pub use long_context_kv_layout::{
-    KvCacheCodec, KvCacheCodecDescriptor, LONG_CONTEXT_PHYSICAL_PAGES, MAX_CONTEXT_TOKENS,
-    ResidentKvCapacityPlan, SharedPagedKvLayout, plan_resident_kv_capacity,
-};
-pub use mtp_layer::MtpLayerProgram;
-pub use mtp_layer_layout::MtpLayerLayout;
-pub use mtp_prompt_prime::{MtpPromptPrimeProgram, MtpPromptPrimeRoute};
-pub use mtp_prompt_prime_layout::MtpPromptPrimeLayout;
-pub use nvfp4_mlp::Nvfp4MlpProgram;
-pub use nvfp4_mlp_layout::Nvfp4MlpLayout;
 pub use paged_kv_slots::{PagedKvRoute, PagedKvSlotPool, PagedKvSlotState, PagedKvTableUpdate};
 pub use program::TextEndpointProgram;
-pub use qwen35_batch_generation::Qwen35ResidentBatchGenerator;
-pub use qwen35_full_attention_layer::Qwen35FullAttentionLayerProgram;
-pub use qwen35_full_attention_layer_layout::Qwen35FullAttentionLayerLayout;
-pub use qwen35_gdn_layer::Qwen35GdnLayerProgram;
-pub use qwen35_gdn_layer_layout::Qwen35GdnLayerLayout;
-pub use qwen35_long_context_kv::Qwen35LongContextKvProgram;
-pub use qwen35_long_context_kv_layout::{
+pub use qwen35::batch_generation::Qwen35ResidentBatchGenerator;
+pub use qwen35::full_attention_layer::Qwen35FullAttentionLayerProgram;
+pub use qwen35::full_attention_layer_layout::Qwen35FullAttentionLayerLayout;
+pub use qwen35::gdn_layer::Qwen35GdnLayerProgram;
+pub use qwen35::gdn_layer_layout::Qwen35GdnLayerLayout;
+pub use qwen35::long_context_kv::Qwen35LongContextKvProgram;
+pub use qwen35::long_context_kv_layout::{
     QWEN35_LONG_CONTEXT_PHYSICAL_PAGES, QWEN35_MAX_CONTEXT_TOKENS, Qwen35LongContextKvLayout,
 };
-pub use qwen35_mtp_batch_generation::{
+pub use qwen35::mtp_batch_generation::{
     Qwen35ResidentMtpBatchEvent, Qwen35ResidentMtpBatchEvents, Qwen35ResidentMtpBatchGenerator,
 };
-pub use qwen35_mtp_generation::{
+pub use qwen35::mtp_generation::{
     Qwen35ResidentMtpGenerationSession, Qwen35ResidentMtpTextGenerator,
 };
-pub use qwen35_mtp_layer::Qwen35MtpLayerProgram;
-pub use qwen35_mtp_layer_layout::Qwen35MtpLayerLayout;
-pub use qwen35_nvfp4_mlp::Qwen35Nvfp4MlpProgram;
-pub use qwen35_resident_model::{
+pub use qwen35::mtp_layer::Qwen35MtpLayerProgram;
+pub use qwen35::mtp_layer_layout::Qwen35MtpLayerLayout;
+pub use qwen35::nvfp4_mlp::Qwen35Nvfp4MlpProgram;
+pub use qwen35::resident_model::{
     Qwen35ResidentLayerKind, Qwen35ResidentModelLayout, Qwen35ResidentModelProgram,
     Qwen35ResidentPrefillRoute,
 };
-pub use qwen35_resident_mtp::{Qwen35MtpPromptRoute, Qwen35ResidentMtpProgram};
-pub use qwen35_resident_mtp_layout::Qwen35ResidentMtpLayout;
-pub use qwen35_text_endpoint::Qwen35TextEndpointProgram;
-pub use qwen35_text_endpoint_layout::Qwen35TextEndpointLayout;
-pub use qwen36_batch_generation::Qwen36ResidentBatchGenerator;
-pub use qwen36_full_attention_layer::Qwen36FullAttentionLayerProgram;
-pub use qwen36_full_attention_layer_layout::Qwen36FullAttentionLayerLayout;
-pub use qwen36_gdn_moe_layer::Qwen36GdnMoeLayerProgram;
-pub use qwen36_gdn_moe_layer_layout::Qwen36GdnMoeLayerLayout;
-pub use qwen36_long_context_kv::Qwen36LongContextKvProgram;
-pub use qwen36_long_context_kv_layout::{
+pub use qwen35::resident_mtp::{Qwen35MtpPromptRoute, Qwen35ResidentMtpProgram};
+pub use qwen35::resident_mtp_layout::Qwen35ResidentMtpLayout;
+pub use qwen35::text_endpoint::Qwen35TextEndpointProgram;
+pub use qwen35::text_endpoint_layout::Qwen35TextEndpointLayout;
+pub use qwen36::batch_generation::Qwen36ResidentBatchGenerator;
+pub use qwen36::full_attention_layer::Qwen36FullAttentionLayerProgram;
+pub use qwen36::full_attention_layer_layout::Qwen36FullAttentionLayerLayout;
+pub use qwen36::gdn_moe_layer::Qwen36GdnMoeLayerProgram;
+pub use qwen36::gdn_moe_layer_layout::Qwen36GdnMoeLayerLayout;
+pub use qwen36::long_context_kv::Qwen36LongContextKvProgram;
+pub use qwen36::long_context_kv_layout::{
     QWEN36_LONG_CONTEXT_PHYSICAL_PAGES, QWEN36_MAX_CONTEXT_TOKENS, Qwen36LongContextKvLayout,
 };
-pub use qwen36_mtp_layer::Qwen36MtpLayerProgram;
-pub use qwen36_mtp_layer_layout::Qwen36MtpLayerLayout;
-pub use qwen36_resident_model::{
+pub use qwen36::mtp_layer::Qwen36MtpLayerProgram;
+pub use qwen36::mtp_layer_layout::Qwen36MtpLayerLayout;
+pub use qwen36::resident_model::{
     Qwen36ResidentLayerKind, Qwen36ResidentModelLayout, Qwen36ResidentModelProgram,
     Qwen36ResidentPrefillRoute,
 };
-pub use qwen36_text_endpoint::Qwen36TextEndpointProgram;
-pub use qwen36_text_endpoint_layout::Qwen36TextEndpointLayout;
-pub use resident_generation::{
-    Qwen35ResidentGenerationSession, Qwen35ResidentTextGenerator, Qwen36ResidentGenerationSession,
-    Qwen36ResidentTextGenerator, ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents,
-    ResidentBatchGenerator, ResidentCancellation, ResidentGenerationSession, ResidentRequestId,
-    ResidentTextGenerator,
+pub use qwen36::text_endpoint::Qwen36TextEndpointProgram;
+pub use qwen36::text_endpoint_layout::Qwen36TextEndpointLayout;
+pub use qwen38::dense_fp8_gdn_layer::DenseFp8GdnLayerProgram;
+pub use qwen38::dense_fp8_gdn_layer_layout::DenseFp8GdnLayerLayout;
+pub use qwen38::dense_fp8_mlp::DenseFp8MlpProgram;
+pub use qwen38::dense_fp8_mlp_layout::DenseFp8MlpLayout;
+pub use qwen38::full_attention_layer::FullAttentionLayerProgram;
+pub use qwen38::full_attention_layer_layout::FullAttentionLayerLayout;
+pub use qwen38::long_context_kv_layout::{
+    KvCacheCodec, KvCacheCodecDescriptor, LONG_CONTEXT_PHYSICAL_PAGES, MAX_CONTEXT_TOKENS,
+    ResidentKvCapacityPlan, SharedPagedKvLayout, plan_resident_kv_capacity,
 };
-pub use resident_model_layout::{
+pub use qwen38::mtp_layer::MtpLayerProgram;
+pub use qwen38::mtp_layer_layout::MtpLayerLayout;
+pub use qwen38::mtp_prompt_prime::{MtpPromptPrimeProgram, MtpPromptPrimeRoute};
+pub use qwen38::mtp_prompt_prime_layout::MtpPromptPrimeLayout;
+pub use qwen38::nvfp4_mlp::Nvfp4MlpProgram;
+pub use qwen38::nvfp4_mlp_layout::Nvfp4MlpLayout;
+pub use qwen38::resident_model_layout::{
     ResidentDecodeRoute, ResidentLayerKind, ResidentLoadMode, ResidentLoadPhase,
     ResidentLoadProgress, ResidentLoadStats, ResidentModelLayout, ResidentModelProgram,
     ResidentMtpSegmentedVerifyRoute, ResidentMtpVerifyRoute, ResidentPrefillRoute,
     ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
 };
-pub use resident_mtp::{
+pub use qwen38::resident_mtp::{
     ResidentMtpDraftRoute, ResidentMtpLoadStats, ResidentMtpProgram, ResidentMtpPromptRoute,
     ResidentMtpRealignRoute,
 };
-pub use resident_mtp_batch_generation::{
+pub use qwen38::resident_mtp_batch_generation::{
     ResidentMtpBatchEvent, ResidentMtpBatchEvents, ResidentMtpBatchGenerator,
+};
+pub use qwen38::resident_mtp_layout::ResidentMtpLayout;
+pub use resident_generation::{
+    Qwen35ResidentGenerationSession, Qwen35ResidentTextGenerator, Qwen36ResidentGenerationSession,
+    Qwen36ResidentTextGenerator, ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents,
+    ResidentBatchGenerator, ResidentCancellation, ResidentGenerationSession, ResidentRequestId,
+    ResidentTextGenerator,
 };
 #[cfg(feature = "qualification")]
 pub use resident_mtp_generation::qualification_decide_sampled_tokens;
@@ -149,7 +105,6 @@ pub use resident_mtp_generation::{
     ResidentMtpGenerationSession, ResidentMtpGenerationStats, ResidentMtpGreedyStats,
     ResidentMtpSampledRound, ResidentMtpTextGenerator,
 };
-pub use resident_mtp_layout::ResidentMtpLayout;
 pub use sampling::{
     SampleDecision, Sampler, SamplingDistribution, SamplingOptions, SamplingPenalties,
     SpeculativeDecision, speculative_accept_probability, speculative_decision,
@@ -157,53 +112,53 @@ pub use sampling::{
 };
 
 #[cfg(feature = "qualification")]
-pub use dense_fp8_gdn_layer::DenseFp8GdnLayerObservables;
-#[cfg(feature = "qualification")]
-pub use dense_fp8_mlp::DenseFp8MlpObservables;
-#[cfg(feature = "qualification")]
-pub use full_attention_layer::FullAttentionLayerObservables;
-#[cfg(feature = "qualification")]
-pub use mtp_layer::MtpLayerObservables;
-#[cfg(feature = "qualification")]
-pub use mtp_prompt_prime::MtpPromptPrimeObservables;
-#[cfg(feature = "qualification")]
-pub use nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
-#[cfg(feature = "qualification")]
 pub use program::EndpointObservables;
 #[cfg(feature = "qualification")]
-pub use qwen35_full_attention_layer::{
+pub use qwen35::full_attention_layer::{
     Qwen35FullAttentionLayerImmutable, Qwen35FullAttentionLayerObservables,
 };
 #[cfg(feature = "qualification")]
-pub use qwen35_gdn_layer::{Qwen35GdnLayerImmutable, Qwen35GdnLayerObservables};
+pub use qwen35::gdn_layer::{Qwen35GdnLayerImmutable, Qwen35GdnLayerObservables};
 #[cfg(feature = "qualification")]
-pub use qwen35_mtp_layer::Qwen35MtpLayerObservables;
+pub use qwen35::mtp_layer::Qwen35MtpLayerObservables;
 #[cfg(feature = "qualification")]
-pub use qwen35_resident_model::Qwen35ResidentModelObservables;
+pub use qwen35::resident_model::Qwen35ResidentModelObservables;
 #[cfg(feature = "qualification")]
-pub use qwen35_resident_mtp::Qwen35ResidentMtpObservables;
+pub use qwen35::resident_mtp::Qwen35ResidentMtpObservables;
 #[cfg(feature = "qualification")]
-pub use qwen35_text_endpoint::Qwen35EndpointObservables;
+pub use qwen35::text_endpoint::Qwen35EndpointObservables;
 #[cfg(feature = "qualification")]
-pub use qwen36_full_attention_layer::{
+pub use qwen36::full_attention_layer::{
     Qwen36FullAttentionLayerImmutable, Qwen36FullAttentionLayerInputs,
     Qwen36FullAttentionLayerObservables,
 };
 #[cfg(feature = "qualification")]
-pub use qwen36_gdn_moe_layer::{
+pub use qwen36::gdn_moe_layer::{
     Qwen36GdnMoeLayerImmutable, Qwen36GdnMoeLayerInputs, Qwen36GdnMoeLayerObservables,
 };
 #[cfg(feature = "qualification")]
-pub use qwen36_mtp_layer::Qwen36MtpLayerObservables;
+pub use qwen36::mtp_layer::Qwen36MtpLayerObservables;
 #[cfg(feature = "qualification")]
-pub use qwen36_resident_model::Qwen36ResidentModelObservables;
+pub use qwen36::resident_model::Qwen36ResidentModelObservables;
 #[cfg(feature = "qualification")]
-pub use qwen36_text_endpoint::{Qwen36EndpointImmutable, Qwen36EndpointObservables};
+pub use qwen36::text_endpoint::{Qwen36EndpointImmutable, Qwen36EndpointObservables};
 #[cfg(feature = "qualification")]
-pub use resident_model_layout::{
+pub use qwen38::dense_fp8_gdn_layer::DenseFp8GdnLayerObservables;
+#[cfg(feature = "qualification")]
+pub use qwen38::dense_fp8_mlp::DenseFp8MlpObservables;
+#[cfg(feature = "qualification")]
+pub use qwen38::full_attention_layer::FullAttentionLayerObservables;
+#[cfg(feature = "qualification")]
+pub use qwen38::mtp_layer::MtpLayerObservables;
+#[cfg(feature = "qualification")]
+pub use qwen38::mtp_prompt_prime::MtpPromptPrimeObservables;
+#[cfg(feature = "qualification")]
+pub use qwen38::nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
+#[cfg(feature = "qualification")]
+pub use qwen38::resident_model_layout::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
     ResidentMtpGdnObservables, ResidentMtpLayerObservables, ResidentMtpSegmentedStageGraph,
     ResidentMtpVerifyObservables, ResidentPrefillStageGraph,
 };
 #[cfg(feature = "qualification")]
-pub use resident_mtp::ResidentMtpObservables;
+pub use qwen38::resident_mtp::ResidentMtpObservables;
