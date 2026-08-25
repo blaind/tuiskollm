@@ -422,6 +422,40 @@ impl Qwen36GdnMoeLayerProgram {
         Ok(())
     }
 
+    /// Maps compact rows to distinct physical recurrent-state slots.
+    pub fn load_slot_routes(&self, stream: &CudaStream, slots: &[usize]) -> EngineResult<()> {
+        let rows = slot_rows(slots)?;
+        self.arena.copy_prefix_from_host(
+            stream,
+            self.layout.regions().state_rows,
+            &rows[..slots.len()],
+        )?;
+
+        Ok(())
+    }
+
+    /// Selects one physical recurrent-state slot for a causal prompt route.
+    pub fn load_prefill_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        require_slot(slot)?;
+        self.arena.copy_prefix_from_host(
+            stream,
+            self.layout.regions().state_rows,
+            &[slot as u32],
+        )?;
+
+        Ok(())
+    }
+
+    /// Clears one physical slot's causal history and recurrent state.
+    pub fn reset_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        require_slot(slot)?;
+        let regions = self.layout.regions();
+        fill_slot(&self.arena, stream, regions.history, slot)?;
+        fill_slot(&self.arena, stream, regions.state, slot)?;
+
+        Ok(())
+    }
+
     /// Replays the immutable graph for one admitted row count.
     pub fn replay(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
         let graph = self.graph(rows)?;
@@ -1059,6 +1093,58 @@ fn prefill_index(rows: usize) -> Option<usize> {
     }
 }
 
+fn slot_rows(slots: &[usize]) -> EngineResult<[u32; MAX_BATCH]> {
+    require_batch(slots.len())?;
+    let mut seen = [false; MAX_BATCH];
+    let mut rows = [0u32; MAX_BATCH];
+    for (row, &slot) in rows.iter_mut().zip(slots) {
+        require_slot(slot)?;
+        if std::mem::replace(&mut seen[slot], true) {
+            return Err(EngineError::route(format!(
+                "Qwen3.6 physical slot {slot} appears more than once"
+            )));
+        }
+        *row = slot as u32;
+    }
+    Ok(rows)
+}
+
+fn require_batch(batch: usize) -> EngineResult<()> {
+    if !(1..=MAX_BATCH).contains(&batch) {
+        return Err(EngineError::route(format!(
+            "Qwen3.6 compact batch {batch} is outside 1..={MAX_BATCH}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_slot(slot: usize) -> EngineResult<()> {
+    if slot >= MAX_BATCH {
+        return Err(EngineError::route(format!(
+            "Qwen3.6 physical slot {slot} is outside 0..{MAX_BATCH}"
+        )));
+    }
+    Ok(())
+}
+
+fn fill_slot<T: tuisko_gpu::DeviceCopy>(
+    arena: &DeviceArena,
+    stream: &CudaStream,
+    region: tuisko_gpu::ArenaRegion<T>,
+    slot: usize,
+) -> EngineResult<()> {
+    if !region.len().is_multiple_of(MAX_BATCH) {
+        return Err(EngineError::layout(format!(
+            "Qwen3.6 persistent region of {} values is not divisible by {MAX_BATCH} slots",
+            region.len()
+        )));
+    }
+    let width = region.len() / MAX_BATCH;
+    let start = product("Qwen3.6 persistent slot offset", slot, width)?;
+    arena.fill_slice(stream, region, start, width, 0)?;
+    Ok(())
+}
+
 fn require_rows(rows: usize) -> EngineResult<()> {
     if (1..=MAX_BATCH).contains(&rows) || prefill_index(rows).is_some() {
         return Ok(());
@@ -1076,7 +1162,7 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bf16_words, prefill_index, require_rows};
+    use super::{MAX_BATCH, bf16_words, prefill_index, require_rows, slot_rows};
     use crate::EngineErrorCode;
 
     #[test]
@@ -1116,6 +1202,14 @@ mod tests {
                 require_rows(rows).unwrap_err().code(),
                 Some(EngineErrorCode::Route)
             );
+        }
+    }
+
+    #[test]
+    fn compact_state_slot_table_is_bijective() {
+        assert_eq!(slot_rows(&[4, 0, 7]).unwrap()[..3], [4, 0, 7]);
+        for slots in [&[][..], &[3, 3], &[MAX_BATCH], &[0, 1, 2, 3, 4, 5, 6, 7, 0]] {
+            assert!(slot_rows(slots).is_err(), "slots={slots:?}");
         }
     }
 }

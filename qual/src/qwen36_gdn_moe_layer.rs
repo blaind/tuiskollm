@@ -197,6 +197,8 @@ pub fn qualify_qwen36_gdn_moe_layer(
         }
     }
 
+    verify_slot_routing(&program, &stream, &mut report)?;
+
     verify_immutable(
         &program.qualification_immutable(&stream)?,
         &source,
@@ -228,6 +230,181 @@ fn prepare_run(
     program.load_residual(stream, rows, input)?;
     program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
 
+    Ok(())
+}
+
+fn verify_slot_routing(
+    program: &Qwen36GdnMoeLayerProgram,
+    stream: &CudaStream,
+    report: &mut Qwen36GdnMoeLayerQualification,
+) -> Result<(), Qwen36GdnMoeLayerQualificationError> {
+    let decode_slots = [7usize, 2];
+    let decode_rows = decode_slots.len();
+    program.reset_state(stream)?;
+    program.load_slot_routes(stream, &decode_slots)?;
+    program.load_residual(stream, decode_rows, &make_input(decode_rows, 5))?;
+    program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+    program.replay(stream, decode_rows)?;
+    let before_reset = program.qualification_observables(stream)?;
+    let before_inputs = program.qualification_runtime_inputs(stream)?;
+    compare_exact(
+        "compact Qwen3.6 GDN state rows",
+        &before_inputs.state_rows[..decode_rows],
+        &[7, 2],
+    )?;
+    verify_selected_state_slots("decode", &before_reset, &decode_slots, report)?;
+
+    program.reset_slot(stream, decode_slots[0])?;
+    let after_reset = program.qualification_observables(stream)?;
+    verify_reset_history_slot(
+        &before_reset.history,
+        &after_reset.history,
+        decode_slots[0],
+        report,
+    )?;
+    verify_reset_state_slot(
+        &before_reset.state,
+        &after_reset.state,
+        decode_slots[0],
+        report,
+    )?;
+
+    const PREFILL_SLOT: usize = 5;
+    const PREFILL_TOKENS: usize = 32;
+    let input = make_input(PREFILL_TOKENS, 6);
+    program.reset_state(stream)?;
+    program.load_prefill_slot(stream, PREFILL_SLOT)?;
+    program.load_residual(stream, PREFILL_TOKENS, &input)?;
+    program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+    program.replay(stream, PREFILL_TOKENS)?;
+    let mapped = program.qualification_observables(stream)?;
+    let mapped_inputs = program.qualification_runtime_inputs(stream)?;
+    compare_exact(
+        "Qwen3.6 prompt GDN state row",
+        &mapped_inputs.state_rows[..1],
+        &[PREFILL_SLOT as u32],
+    )?;
+    verify_selected_state_slots("prefill", &mapped, &[PREFILL_SLOT], report)?;
+
+    program.reset_state(stream)?;
+    program.load_prefill_slot(stream, 0)?;
+    program.load_residual(stream, PREFILL_TOKENS, &input)?;
+    program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+    program.replay(stream, PREFILL_TOKENS)?;
+    let row_zero = program.qualification_observables(stream)?;
+    compare_exact(
+        "slot-independent Qwen3.6 prompt residual",
+        &mapped.residual_output[..PREFILL_TOKENS * HIDDEN],
+        &row_zero.residual_output[..PREFILL_TOKENS * HIDDEN],
+    )?;
+    let history_width = QKV_ROWS * (Qwen36Moe35B::LINEAR_CONV_KERNEL_DIM - 1);
+    compare_exact(
+        "slot-independent Qwen3.6 prompt history",
+        &mapped.history[PREFILL_SLOT * history_width..(PREFILL_SLOT + 1) * history_width],
+        &row_zero.history[..history_width],
+    )?;
+    let state_begin = PREFILL_SLOT * STATE_PER_ROW;
+    compare_f32_bits(
+        "slot-independent Qwen3.6 prompt state",
+        &mapped.state[state_begin..state_begin + STATE_PER_ROW],
+        &row_zero.state[..STATE_PER_ROW],
+    )?;
+    report.graph_replay_values += PREFILL_TOKENS * HIDDEN + history_width + STATE_PER_ROW;
+    report.runtime_input_values += decode_rows + 1;
+
+    Ok(())
+}
+
+fn verify_selected_state_slots(
+    route: &str,
+    observed: &Qwen36GdnMoeLayerObservables,
+    selected: &[usize],
+    report: &mut Qwen36GdnMoeLayerQualification,
+) -> Result<(), Qwen36GdnMoeLayerQualificationError> {
+    let history_width = QKV_ROWS * (Qwen36Moe35B::LINEAR_CONV_KERNEL_DIM - 1);
+    for slot in 0..MAX_BATCH {
+        let history = &observed.history[slot * history_width..(slot + 1) * history_width];
+        let state = &observed.state[slot * STATE_PER_ROW..(slot + 1) * STATE_PER_ROW];
+        let is_selected = selected.contains(&slot);
+        if is_selected
+            && (history.iter().all(|&value| value == 0)
+                || state.iter().all(|&value| value.to_bits() == 0))
+        {
+            return Err(Qwen36GdnMoeLayerQualificationError::Mismatch(format!(
+                "{route} did not advance selected Qwen3.6 physical slot {slot}"
+            )));
+        }
+        if !is_selected
+            && (history.iter().any(|&value| value != 0)
+                || state.iter().any(|&value| value.to_bits() != 0))
+        {
+            return Err(Qwen36GdnMoeLayerQualificationError::Mismatch(format!(
+                "{route} modified inactive Qwen3.6 physical slot {slot}"
+            )));
+        }
+        report.inactive_values += history.len() + state.len();
+    }
+    Ok(())
+}
+
+fn verify_reset_history_slot(
+    before: &[u16],
+    after: &[u16],
+    reset_slot: usize,
+    report: &mut Qwen36GdnMoeLayerQualification,
+) -> Result<(), Qwen36GdnMoeLayerQualificationError> {
+    let width = QKV_ROWS * (Qwen36Moe35B::LINEAR_CONV_KERNEL_DIM - 1);
+    for index in 0..after.len() {
+        let slot = index / width;
+        let expected = if slot == reset_slot { 0 } else { before[index] };
+        if after[index] != expected {
+            return Err(Qwen36GdnMoeLayerQualificationError::Mismatch(format!(
+                "reset Qwen3.6 history differs at value {index} for slot {reset_slot}"
+            )));
+        }
+    }
+    report.inactive_values += after.len();
+    Ok(())
+}
+
+fn verify_reset_state_slot(
+    before: &[f32],
+    after: &[f32],
+    reset_slot: usize,
+    report: &mut Qwen36GdnMoeLayerQualification,
+) -> Result<(), Qwen36GdnMoeLayerQualificationError> {
+    for index in 0..after.len() {
+        let slot = index / STATE_PER_ROW;
+        let expected = if slot == reset_slot {
+            0
+        } else {
+            before[index].to_bits()
+        };
+        if after[index].to_bits() != expected {
+            return Err(Qwen36GdnMoeLayerQualificationError::Mismatch(format!(
+                "reset Qwen3.6 recurrent state differs at value {index} for slot {reset_slot}"
+            )));
+        }
+    }
+    report.inactive_values += after.len();
+    Ok(())
+}
+
+fn compare_f32_bits(
+    role: &str,
+    actual: &[f32],
+    expected: &[f32],
+) -> Result<(), Qwen36GdnMoeLayerQualificationError> {
+    require_same_len(role, actual.len(), expected.len())?;
+    if let Some(index) = actual
+        .iter()
+        .zip(expected)
+        .position(|(actual, expected)| actual.to_bits() != expected.to_bits())
+    {
+        return Err(Qwen36GdnMoeLayerQualificationError::Mismatch(format!(
+            "{role} differs at value {index}"
+        )));
+    }
     Ok(())
 }
 
