@@ -730,6 +730,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-frontend") => qualify_frontend(root, &remaining),
         Some("qualify-generation") => qualify_generation(root, &remaining),
         Some("qualify-server") => server_qual::run(root, &remaining),
+        Some("qualify-server-long-context") => server_qual::run_long_context(root, &remaining),
         Some("qualify-host") if remaining.is_empty() => qualify_host(root),
         Some("qualify-residual-norm") if remaining.is_empty() => qualify_residual_norm(root),
         Some("qualify-qwen35-residual-norm") if remaining.is_empty() => {

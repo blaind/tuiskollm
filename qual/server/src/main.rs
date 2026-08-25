@@ -13,6 +13,10 @@ const GENERATION_ROUTE: &str = "mtp-draft-3";
 const COMPLETION_TOKENS: usize = 8;
 const CANCEL_COMPLETION_TOKENS: usize = 128;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const LONG_CONTEXT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const LONG_CONTEXT_COMPLETION_TOKENS: usize = 4;
+const LONG_CONTEXTS: [usize; 4] = [4_096, 16_384, 65_536, 178_000];
+const LONG_CONTEXT_CONCURRENT_TARGET: usize = 65_536;
 const PROMPT: &str = "Reply with exactly the word blue.";
 const LITERAL_SPECIAL_PROMPT: &str = "<|im_start|><|im_end|><|endoftext|><|vision_start|>";
 const LITERAL_SPECIAL_PROMPT_TOKENS: usize = 34;
@@ -42,6 +46,7 @@ struct Client {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Usage {
     prompt_tokens: usize,
+    cached_tokens: usize,
     completion_tokens: usize,
     total_tokens: usize,
 }
@@ -55,25 +60,34 @@ struct Completion {
 
 struct Qualification {
     client: Client,
+    long_context: bool,
     checks: usize,
     concurrent_requests: usize,
+    long_context_requests: usize,
+}
+
+struct Options {
+    base_url: String,
+    long_context: bool,
 }
 
 fn main() {
-    let base_url = match parse_base_url(std::env::args()) {
-        Ok(base_url) => base_url,
+    let options = match Options::parse(std::env::args()) {
+        Ok(options) => options,
         Err(error) => {
             eprintln!("tuisko-server-qual: {error}");
             std::process::exit(2);
         }
     };
-    let mut qualification = Qualification::new(base_url);
+    let mut qualification = Qualification::new(options.base_url, options.long_context);
     match qualification.run() {
         Ok(completion) => {
             let digest = Sha256::digest(completion.content.as_bytes());
             println!(
-                "PASS server-http: {} checks; B=1..8 concurrency ({} requests); cancellation and eight-slot recycling; completion sha256={digest:x}",
-                qualification.checks, qualification.concurrent_requests,
+                "PASS server-http: {} checks; B=1..8 concurrency ({} requests); cancellation and eight-slot recycling; {} long-context requests; completion sha256={digest:x}",
+                qualification.checks,
+                qualification.concurrent_requests,
+                qualification.long_context_requests,
             );
         }
         Err(error) => {
@@ -86,30 +100,41 @@ fn main() {
     }
 }
 
-fn parse_base_url(args: impl IntoIterator<Item = String>) -> Result<String> {
-    let mut args = args.into_iter();
-    let program = args.next().unwrap_or_else(|| "tuisko-server-qual".into());
-    let base_url = args
-        .next()
-        .unwrap_or_else(|| "http://127.0.0.1:8000".into());
-    if args.next().is_some() {
-        return Err(QualError::Contract(format!(
-            "usage: {program} [http://HOST:PORT]"
-        )));
+impl Options {
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut args = args.into_iter();
+        let program = args.next().unwrap_or_else(|| "tuisko-server-qual".into());
+        let usage = || format!("usage: {program} [http://HOST:PORT] [--long-context]");
+        let mut base_url = None;
+        let mut long_context = false;
+        for argument in args {
+            if argument == "--long-context" {
+                if long_context {
+                    return Err(QualError::Contract(usage()));
+                }
+                long_context = true;
+            } else if argument.starts_with('-') || base_url.replace(argument).is_some() {
+                return Err(QualError::Contract(usage()));
+            }
+        }
+        let base_url = base_url.unwrap_or_else(|| "http://127.0.0.1:8000".into());
+        let base_url = base_url.trim_end_matches('/');
+        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+            return Err(QualError::Contract(
+                "server URL must begin with http:// or https://".into(),
+            ));
+        }
+        Ok(Self {
+            base_url: base_url.into(),
+            long_context,
+        })
     }
-    let base_url = base_url.trim_end_matches('/');
-    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
-        return Err(QualError::Contract(
-            "server URL must begin with http:// or https://".into(),
-        ));
-    }
-    Ok(base_url.into())
 }
 
 impl Client {
-    fn new(base_url: String) -> Self {
+    fn new(base_url: String, timeout: Duration) -> Self {
         let config = ureq::Agent::config_builder()
-            .timeout_global(Some(REQUEST_TIMEOUT))
+            .timeout_global(Some(timeout))
             .http_status_as_error(false)
             .build();
         Self {
@@ -124,7 +149,7 @@ impl Client {
 
     fn get_json(&self, path: &str) -> Result<Value> {
         let mut response = self.agent.get(self.url(path)).call()?;
-        expect_status(&response, 200, path)?;
+        expect_status(&mut response, 200, path)?;
         Ok(response.body_mut().read_json()?)
     }
 
@@ -137,37 +162,41 @@ impl Client {
             .agent
             .post(self.url("/v1/chat/completions"))
             .send_json(request)?;
-        expect_status(&response, 200, label)?;
+        expect_status(&mut response, 200, label)?;
         let body: Value = response.body_mut().read_json()?;
         validate_blocking(&body)
     }
 
     fn expect_rejection(&self, request: Value, label: &str) -> Result<()> {
-        let response = self
-            .agent
-            .post(self.url("/v1/chat/completions"))
-            .send_json(request)?;
-        expect_status(&response, 400, label)
-    }
-
-    fn streaming(&self) -> Result<Completion> {
         let mut response = self
             .agent
             .post(self.url("/v1/chat/completions"))
-            .send_json(request(true, COMPLETION_TOKENS))?;
-        expect_status(&response, 200, "streaming completion")?;
+            .send_json(request)?;
+        expect_status(&mut response, 400, label)
+    }
+
+    fn streaming(&self) -> Result<Completion> {
+        self.streaming_request(request(true, COMPLETION_TOKENS), "streaming completion")
+    }
+
+    fn streaming_request(&self, request: Value, label: &str) -> Result<Completion> {
+        let mut response = self
+            .agent
+            .post(self.url("/v1/chat/completions"))
+            .send_json(request)?;
+        expect_status(&mut response, 200, label)?;
         expect_event_stream(&response)?;
         let body = response.body_mut().read_to_string()?;
         validate_stream(&parse_sse(&body)?)
     }
 
     fn disconnect_stream(&self) -> Result<()> {
-        let response = self
+        let mut response = self
             .agent
             .post(self.url("/v1/chat/completions"))
             .header("connection", "close")
             .send_json(request(true, CANCEL_COMPLETION_TOKENS))?;
-        expect_status(&response, 200, "cancellation stream")?;
+        expect_status(&mut response, 200, "cancellation stream")?;
         expect_event_stream(&response)?;
 
         let (_, body) = response.into_parts();
@@ -190,11 +219,18 @@ impl Client {
 }
 
 impl Qualification {
-    fn new(base_url: String) -> Self {
+    fn new(base_url: String, long_context: bool) -> Self {
+        let timeout = if long_context {
+            LONG_CONTEXT_REQUEST_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        };
         Self {
-            client: Client::new(base_url),
+            client: Client::new(base_url, timeout),
+            long_context,
             checks: 0,
             concurrent_requests: 0,
+            long_context_requests: 0,
         }
     }
 
@@ -239,7 +275,7 @@ impl Qualification {
             request["stop"] = stop;
             let completion = self.client.blocking_request(request, label)?;
             self.check(
-                completion == blocking,
+                same_completion_semantics(&completion, &blocking),
                 format!(
                     "{label} changed completion semantics: expected={blocking:?}, actual={completion:?}"
                 ),
@@ -288,7 +324,7 @@ impl Qualification {
 
         let streaming = self.client.streaming()?;
         self.check(
-            streaming == blocking,
+            same_completion_semantics(&streaming, &blocking),
             format!(
                 "blocking and streaming semantics differ: blocking={blocking:?}, streaming={streaming:?}"
             ),
@@ -298,7 +334,7 @@ impl Qualification {
             for completion in concurrent(self.client.clone(), batch)? {
                 self.concurrent_requests += 1;
                 self.check(
-                    completion == blocking,
+                    same_completion_semantics(&completion, &blocking),
                     format!(
                         "greedy completion changed during B={batch}: expected={blocking:?}, actual={completion:?}"
                     ),
@@ -311,7 +347,7 @@ impl Qualification {
         for completion in concurrent(self.client.clone(), 8)? {
             self.concurrent_requests += 1;
             self.check(
-                completion == blocking,
+                same_completion_semantics(&completion, &blocking),
                 format!(
                     "completion changed after cancellation and slot recycling: expected={blocking:?}, actual={completion:?}"
                 ),
@@ -323,14 +359,136 @@ impl Qualification {
             health == json!({"status": "ok", "generation_route": GENERATION_ROUTE}),
             format!("server was not healthy after cancellation: {health}"),
         )?;
+        if self.long_context {
+            self.run_long_context()?;
+        }
         Ok(blocking)
+    }
+
+    fn run_long_context(&mut self) -> Result<()> {
+        for &target in &LONG_CONTEXTS[..3] {
+            self.run_long_context_case(target)?;
+        }
+        self.run_long_context_concurrency()?;
+
+        // The first five prefixes occupy about 217K positions; recycle all eight slots
+        // before admitting the independent 178K case into the exact 220K pool.
+        self.recycle_retained_slots()?;
+        self.run_long_context_case(LONG_CONTEXTS[3])
+    }
+
+    fn run_long_context_case(&mut self, target: usize) -> Result<()> {
+        let messages = long_context_messages(0x10_0000 + target, target - 32);
+        let fresh = self.client.streaming_request(
+            request_with_messages(messages.clone(), true, LONG_CONTEXT_COMPLETION_TOKENS),
+            &format!("fresh {target}-token long-context stream"),
+        )?;
+        self.long_context_requests += 1;
+        self.check_long_context_usage(&fresh, target, None)?;
+        self.check(
+            !fresh.content.is_empty(),
+            format!("fresh {target}-token long-context stream returned empty content"),
+        )?;
+
+        let followup = long_context_followup(&messages, &fresh.content)?;
+        let reused = self.client.blocking_request(
+            request_with_messages(followup, false, LONG_CONTEXT_COMPLETION_TOKENS),
+            &format!("reused {target}-token long-context completion"),
+        )?;
+        self.long_context_requests += 1;
+        self.check_long_context_usage(&reused, target, Some(fresh.usage.prompt_tokens))?;
+        self.check(
+            !reused.content.is_empty(),
+            format!("reused {target}-token long-context completion returned empty content"),
+        )
+    }
+
+    fn run_long_context_concurrency(&mut self) -> Result<()> {
+        let messages = (0..2)
+            .map(|lane| {
+                long_context_messages(0x20_0000 + lane, LONG_CONTEXT_CONCURRENT_TARGET - 32)
+            })
+            .collect();
+        for (lane, completion) in concurrent_messages(
+            self.client.clone(),
+            messages,
+            LONG_CONTEXT_COMPLETION_TOKENS,
+            "concurrent 65K",
+        )?
+        .into_iter()
+        .enumerate()
+        {
+            self.long_context_requests += 1;
+            self.check_long_context_usage(&completion, LONG_CONTEXT_CONCURRENT_TARGET, None)?;
+            self.check(
+                !completion.content.is_empty(),
+                format!("concurrent 65K lane {lane} returned empty content"),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn recycle_retained_slots(&mut self) -> Result<()> {
+        let messages = (0..8)
+            .map(|lane| long_context_messages(0x30_0000 + lane, 4))
+            .collect();
+        for completion in concurrent_messages(self.client.clone(), messages, 1, "slot recycling")? {
+            self.check(
+                completion.usage.completion_tokens == 1,
+                format!(
+                    "slot-recycling completion reported {} tokens, expected one",
+                    completion.usage.completion_tokens
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn check_long_context_usage(
+        &mut self,
+        completion: &Completion,
+        target: usize,
+        minimum_cached_tokens: Option<usize>,
+    ) -> Result<()> {
+        self.check(
+            completion.usage.prompt_tokens.abs_diff(target) <= 128,
+            format!(
+                "long-context target {target} produced {} prompt tokens, outside the admitted +/-128 calibration band",
+                completion.usage.prompt_tokens
+            ),
+        )?;
+        if let Some(minimum_cached_tokens) = minimum_cached_tokens {
+            self.check(
+                completion.usage.cached_tokens >= minimum_cached_tokens,
+                format!(
+                    "reused target {target} reported {}/{} cached prompt tokens, expected at least the complete {minimum_cached_tokens}-token preceding prompt",
+                    completion.usage.cached_tokens, completion.usage.prompt_tokens,
+                ),
+            )
+        } else {
+            self.check(
+                completion.usage.cached_tokens <= completion.usage.prompt_tokens / 4,
+                format!(
+                    "fresh target {target} reported {}/{} cached prompt tokens, expected at most 25%",
+                    completion.usage.cached_tokens, completion.usage.prompt_tokens
+                ),
+            )
+        }
     }
 }
 
 fn request(stream: bool, max_completion_tokens: usize) -> Value {
+    request_with_messages(
+        json!([{"role": "user", "content": PROMPT}]),
+        stream,
+        max_completion_tokens,
+    )
+}
+
+fn request_with_messages(messages: Value, stream: bool, max_completion_tokens: usize) -> Value {
     let mut request = json!({
         "model": Qwen38_27B::MODEL_ID,
-        "messages": [{"role": "user", "content": PROMPT}],
+        "messages": messages,
         "max_completion_tokens": max_completion_tokens,
         "temperature": 0.0,
         "top_p": 1.0,
@@ -363,8 +521,70 @@ fn concurrent(client: Client, count: usize) -> Result<Vec<Completion>> {
         .collect()
 }
 
+fn concurrent_messages(
+    client: Client,
+    messages: Vec<Value>,
+    max_completion_tokens: usize,
+    label: &'static str,
+) -> Result<Vec<Completion>> {
+    let barrier = Arc::new(Barrier::new(messages.len()));
+    let handles = messages
+        .into_iter()
+        .enumerate()
+        .map(|(lane, messages)| {
+            let barrier = Arc::clone(&barrier);
+            let client = client.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                client.blocking_request(
+                    request_with_messages(messages, false, max_completion_tokens),
+                    &format!("{label} lane {lane}"),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    handles
+        .into_iter()
+        .map(|handle| handle.join().map_err(|_| QualError::ThreadPanic)?)
+        .collect()
+}
+
+fn long_context_messages(nonce: usize, repeated_tokens: usize) -> Value {
+    let content = format!(
+        "{nonce:016x} begin unique qualification prompt.{}",
+        " blue".repeat(repeated_tokens)
+    );
+    json!([{"role": "user", "content": content}])
+}
+
+fn long_context_followup(messages: &Value, assistant: &str) -> Result<Value> {
+    let content = string(
+        field(
+            messages
+                .as_array()
+                .and_then(|messages| messages.first())
+                .ok_or_else(|| missing("long-context user message"))?,
+            "content",
+        )?,
+        "long-context user content",
+    )?;
+    Ok(json!([
+        {"role": "user", "content": content},
+        {"role": "assistant", "content": assistant},
+        {"role": "user", "content": "Reply with exactly the word green."}
+    ]))
+}
+
+fn same_completion_semantics(left: &Completion, right: &Completion) -> bool {
+    left.content == right.content
+        && left.finish_reason == right.finish_reason
+        && left.usage.prompt_tokens == right.usage.prompt_tokens
+        && left.usage.completion_tokens == right.usage.completion_tokens
+        && left.usage.total_tokens == right.usage.total_tokens
+}
+
 fn expect_status(
-    response: &ureq::http::Response<ureq::Body>,
+    response: &mut ureq::http::Response<ureq::Body>,
     expected: u16,
     label: &str,
 ) -> Result<()> {
@@ -372,8 +592,12 @@ fn expect_status(
     if actual == expected {
         Ok(())
     } else {
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|error| format!("<response body read failed: {error}>"));
         Err(QualError::Contract(format!(
-            "{label} returned HTTP {actual}, expected {expected}"
+            "{label} returned HTTP {actual}, expected {expected}: {body}"
         )))
     }
 }
@@ -601,6 +825,7 @@ fn parse_usage(value: &Value) -> Result<Usage> {
     }
     Ok(Usage {
         prompt_tokens,
+        cached_tokens,
         completion_tokens,
         total_tokens,
     })
@@ -692,19 +917,36 @@ fn expect_str_value(value: Option<&Value>, label: &str, expected: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        Completion, QualError, Usage, parse_base_url, parse_sse, validate_blocking, validate_stream,
+        Completion, LONG_CONTEXTS, Options, QualError, Usage, long_context_followup,
+        long_context_messages, parse_sse, same_completion_semantics, validate_blocking,
+        validate_stream,
     };
     use serde_json::json;
 
     #[test]
-    fn base_url_defaults_and_trims_one_argument() {
+    fn options_default_and_accept_long_context_in_either_order() {
         assert_eq!(
-            parse_base_url(["qual".into()]).unwrap(),
+            Options::parse(["qual".into()]).unwrap().base_url,
             "http://127.0.0.1:8000"
         );
-        assert_eq!(
-            parse_base_url(["qual".into(), "http://server:9000/".into()]).unwrap(),
-            "http://server:9000"
+        for arguments in [
+            ["http://server:9000/", "--long-context"],
+            ["--long-context", "http://server:9000/"],
+        ] {
+            let options = Options::parse(
+                std::iter::once("qual".to_owned()).chain(arguments.into_iter().map(str::to_owned)),
+            )
+            .unwrap();
+            assert_eq!(options.base_url, "http://server:9000");
+            assert!(options.long_context);
+        }
+        assert!(
+            Options::parse([
+                "qual".into(),
+                "--long-context".into(),
+                "--long-context".into()
+            ])
+            .is_err()
         );
     }
 
@@ -742,12 +984,49 @@ mod tests {
             finish_reason: "stop".into(),
             usage: Usage {
                 prompt_tokens: 11,
+                cached_tokens: 7,
                 completion_tokens: 2,
                 total_tokens: 13,
             },
         };
         assert_eq!(validate_blocking(&blocking).unwrap(), expected);
         assert_eq!(validate_stream(&parse_sse(sse).unwrap()).unwrap(), expected);
+    }
+
+    #[test]
+    fn completion_semantics_ignore_only_cache_accounting() {
+        let left = Completion {
+            content: "blue".into(),
+            finish_reason: "stop".into(),
+            usage: Usage {
+                prompt_tokens: 11,
+                cached_tokens: 0,
+                completion_tokens: 2,
+                total_tokens: 13,
+            },
+        };
+        let mut right = left.clone();
+        right.usage.cached_tokens = 11;
+        assert!(same_completion_semantics(&left, &right));
+        right.content.push('!');
+        assert!(!same_completion_semantics(&left, &right));
+    }
+
+    #[test]
+    fn long_context_inventory_and_prompt_shape_are_exact() {
+        assert_eq!(LONG_CONTEXTS, [4_096, 16_384, 65_536, 178_000]);
+        let first = long_context_messages(7, 4);
+        let second = long_context_messages(8, 4);
+        assert_eq!(first[0]["role"], "user");
+        assert_eq!(
+            first[0]["content"],
+            "0000000000000007 begin unique qualification prompt. blue blue blue blue"
+        );
+        assert_ne!(first, second);
+        let followup = long_context_followup(&first, "blue").unwrap();
+        assert_eq!(followup[0], first[0]);
+        assert_eq!(followup[1], json!({"role": "assistant", "content": "blue"}));
+        assert_eq!(followup[2]["role"], "user");
     }
 
     #[test]
