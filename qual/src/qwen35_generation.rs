@@ -18,7 +18,7 @@ const HELLO_THINKING: [u32; 11] = [
 const HELLO_NO_THINKING: [u32; 13] = [
     248_045, 846, 198, 9_419, 248_046, 198, 248_045, 74_455, 198, 248_068, 271, 248_069, 271,
 ];
-const PREFILL_ROUTE_CASES: [(usize, usize); 7] = [
+const PREFILL_ROUTE_CASES: [(usize, usize); 9] = [
     (31, 0),
     (32, 32),
     (33, 32),
@@ -26,6 +26,8 @@ const PREFILL_ROUTE_CASES: [(usize, usize); 7] = [
     (65, 64),
     (128, 128),
     (129, 128),
+    (192, 192),
+    (193, 192),
 ];
 
 /// Failure of the concrete Qwen3.5 generation integration gate.
@@ -239,7 +241,7 @@ pub fn qualify_qwen35_compact_generation(
 
     let request = greedy_request("Hello", 2);
     let alternate = greedy_request("Name one color.", 2);
-    let exact_prefill = exact_prompt_request(&frontend, 32)?;
+    let exact_prefill = exact_prompt_request(&frontend, 192)?;
     let expected = run_compact_alone(&mut generator, &request)?;
     let alternate_expected = run_compact_alone(&mut generator, &alternate)?;
     let prefill_expected = run_compact_alone(&mut generator, &exact_prefill)?;
@@ -277,7 +279,7 @@ pub fn qualify_qwen35_compact_generation(
         route_batches: 8,
         requests: 4,
         recycled_slot,
-        concurrent_prefill_tokens: 32,
+        concurrent_prefill_tokens: 192,
         cancellations: 1,
         arena_bytes: generator.arena_bytes(),
         host_stager_bytes: generator.host_stager_bytes(),
@@ -419,11 +421,11 @@ fn verify_hole_reuse(
     }
 
     let joined = generator.admit(prefill)?;
-    if joined.native_prefill_tokens != 32
+    if joined.native_prefill_tokens != 192
         || generator.qualification_slot(joined.request_id) != Some(1)
     {
         return Err(Qwen35GenerationQualificationError::Mismatch(format!(
-            "concurrent T=32 admission selected native={} slot={:?}",
+            "concurrent T=192 admission selected native={} slot={:?}",
             joined.native_prefill_tokens,
             generator.qualification_slot(joined.request_id)
         )));
@@ -586,7 +588,10 @@ mod tests {
         let report = qualify_qwen35_generation(&PathBuf::from(root))?;
         assert_eq!(report.prompt_cases, 2);
         assert!((1..=2).contains(&report.chat_steps));
-        assert_eq!(report.native_prefill_tokens, [0, 32, 32, 64, 64, 128, 128]);
+        assert_eq!(
+            report.native_prefill_tokens,
+            [0, 32, 32, 64, 64, 128, 128, 192, 192]
+        );
         assert_eq!(report.arena_bytes, 15_629_936_640);
         assert_eq!(report.host_stager_bytes, 1_610_752);
         assert_eq!(report.stable_addresses, 35);
@@ -607,7 +612,7 @@ mod tests {
         assert_eq!(report.route_batches, 8);
         assert_eq!(report.requests, 4);
         assert_eq!(report.recycled_slot, 1);
-        assert_eq!(report.concurrent_prefill_tokens, 32);
+        assert_eq!(report.concurrent_prefill_tokens, 192);
         assert_eq!(report.cancellations, 1);
         assert_eq!(report.arena_bytes, 15_629_936_640);
         assert_eq!(report.host_stager_bytes, 9_060_352);

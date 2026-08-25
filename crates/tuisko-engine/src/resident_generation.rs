@@ -1358,35 +1358,20 @@ pub(crate) fn prime_qwen35_prompt(
     slot: usize,
 ) -> EngineResult<usize> {
     program.load_slot_routes(stream, &[slot])?;
-    let native_tokens = qwen35_native_prefill_tokens(token_ids.len()).unwrap_or(0);
-    if native_tokens != 0 {
-        let rotary_values = native_tokens
-            .checked_mul(ROTARY_PAIRS)
-            .ok_or_else(|| EngineError::generation("Qwen3.5 prompt rotary values overflow"))?;
-        let mut rope_cos = [0.0f32; QWEN35_MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
-        let mut rope_sin = [0.0f32; QWEN35_MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
-        for position in 0..native_tokens {
-            let position_u32 = u32::try_from(position).map_err(|_| {
-                EngineError::generation("prompt position exceeds the exact route width")
-            })?;
-            let (cosine, sine) = text_rope(position_u32);
-            let begin = position * ROTARY_PAIRS;
-            rope_cos[begin..begin + ROTARY_PAIRS].copy_from_slice(&cosine);
-            rope_sin[begin..begin + ROTARY_PAIRS].copy_from_slice(&sine);
-        }
-        program.stage_prefill_embeddings(stream, &token_ids[..native_tokens])?;
-        let route = program.load_prefill_slot_state(
+    let mut cursor = 0;
+    while let Some(tokens) = next_qwen35_native_prefill_tile(token_ids.len() - cursor) {
+        replay_qwen35_prefill_tile(
+            program,
             stream,
-            native_tokens,
+            &token_ids[cursor..cursor + tokens],
             slot,
-            &rope_cos[..rotary_values],
-            &rope_sin[..rotary_values],
+            cursor,
         )?;
-        program.replay_prefill(stream, route)?;
+        cursor += tokens;
     }
 
-    for (offset, &token) in token_ids[native_tokens..].iter().enumerate() {
-        let position = native_tokens + offset;
+    for (offset, &token) in token_ids[cursor..].iter().enumerate() {
+        let position = cursor + offset;
         replay_qwen35_token(
             program,
             stream,
@@ -1397,14 +1382,51 @@ pub(crate) fn prime_qwen35_prompt(
         )?;
     }
 
-    Ok(native_tokens)
+    Ok(cursor)
 }
 
-const fn qwen35_native_prefill_tokens(prompt_tokens: usize) -> Option<usize> {
+fn replay_qwen35_prefill_tile(
+    program: &mut Qwen35ResidentModelProgram,
+    stream: &CudaStream,
+    token_ids: &[u32],
+    slot: usize,
+    first_position: usize,
+) -> EngineResult<()> {
+    let rotary_values = token_ids
+        .len()
+        .checked_mul(ROTARY_PAIRS)
+        .ok_or_else(|| EngineError::generation("Qwen3.5 prompt rotary values overflow"))?;
+    let mut rope_cos = [0.0f32; QWEN35_MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+    let mut rope_sin = [0.0f32; QWEN35_MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+    for token in 0..token_ids.len() {
+        let position = first_position
+            .checked_add(token)
+            .and_then(|position| u32::try_from(position).ok())
+            .ok_or_else(|| {
+                EngineError::generation("prompt position exceeds the exact route width")
+            })?;
+        let (cosine, sine) = text_rope(position);
+        let begin = token * ROTARY_PAIRS;
+        rope_cos[begin..begin + ROTARY_PAIRS].copy_from_slice(&cosine);
+        rope_sin[begin..begin + ROTARY_PAIRS].copy_from_slice(&sine);
+    }
+    program.stage_prefill_embeddings(stream, token_ids)?;
+    let route = program.load_prefill_slot_state_at(
+        stream,
+        token_ids.len(),
+        slot,
+        first_position,
+        &rope_cos[..rotary_values],
+        &rope_sin[..rotary_values],
+    )?;
+    program.replay_prefill(stream, route)
+}
+
+const fn next_qwen35_native_prefill_tile(remaining: usize) -> Option<usize> {
     let mut index = QWEN35_NATIVE_PREFILL_ROUTES.len();
     while index != 0 {
         index -= 1;
-        if QWEN35_NATIVE_PREFILL_ROUTES[index] <= prompt_tokens {
+        if QWEN35_NATIVE_PREFILL_ROUTES[index] <= remaining {
             return Some(QWEN35_NATIVE_PREFILL_ROUTES[index]);
         }
     }
@@ -1517,7 +1539,7 @@ pub(crate) fn require_generation_capacity(
 mod tests {
     use super::{
         QWEN35_NATIVE_PREFILL_ROUTES, QWEN36_NATIVE_PREFILL_ROUTES, ROTARY_PAIRS,
-        next_native_prefill_tile, qwen35_native_prefill_tokens, qwen36_native_prefill_tokens,
+        next_native_prefill_tile, next_qwen35_native_prefill_tile, qwen36_native_prefill_tokens,
         require_generation_capacity, text_rope,
     };
     use crate::EngineErrorCode;
@@ -1606,24 +1628,34 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_native_prefill_uses_the_largest_exact_prefix() {
+    fn qwen35_native_prefill_tiles_cover_every_long_context_corner() {
         assert_eq!(QWEN35_NATIVE_PREFILL_ROUTES, [32, 64, 128]);
-        for (prompt, expected) in [
-            (0, None),
-            (1, None),
-            (31, None),
-            (32, Some(32)),
-            (33, Some(32)),
-            (63, Some(32)),
-            (64, Some(64)),
-            (65, Some(64)),
-            (127, Some(64)),
-            (128, Some(128)),
-            (129, Some(128)),
-            (192, Some(128)),
-            (usize::MAX, Some(128)),
+        for (prompt, expected_native, expected_tail) in [
+            (0, 0, 0),
+            (1, 0, 1),
+            (31, 0, 31),
+            (32, 32, 0),
+            (33, 32, 1),
+            (63, 32, 31),
+            (64, 64, 0),
+            (65, 64, 1),
+            (127, 96, 31),
+            (128, 128, 0),
+            (129, 128, 1),
+            (192, 192, 0),
+            (193, 192, 1),
+            (4_096, 4_096, 0),
+            (262_143, 262_112, 31),
+            (262_144, 262_144, 0),
         ] {
-            assert_eq!(qwen35_native_prefill_tokens(prompt), expected);
+            let mut remaining = prompt;
+            let mut native = 0;
+            while let Some(tile) = next_qwen35_native_prefill_tile(remaining) {
+                assert!(QWEN35_NATIVE_PREFILL_ROUTES.contains(&tile));
+                native += tile;
+                remaining -= tile;
+            }
+            assert_eq!((native, remaining), (expected_native, expected_tail));
         }
     }
 }
