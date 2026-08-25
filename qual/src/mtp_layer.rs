@@ -203,6 +203,7 @@ fn run_leaf_oracles(root: &Path) -> Result<(), MtpLayerQualificationError> {
                     $name
                 ))
             })?;
+            device_benchmark::wait_for_owned_child_cleanup()?;
         };
     }
     oracle!("input fusion", qualify_mtp_bf16_fusion(root));

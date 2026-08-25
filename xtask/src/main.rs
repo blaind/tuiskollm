@@ -38,6 +38,8 @@ const QWEN36_MTP_LAYER_TEST_FILTER: &str = "qwen36_mtp_layer_suite_";
 const QWEN36_LONG_CONTEXT_KV_TEST_FILTER: &str = "qwen36_long_context_kv::tests";
 const MTP_BF16_PAGED_GQA_BENCHMARK_FILTER: &str =
     "bf16_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_";
+const MTP_LAYER_TEST_FILTER: &str = "mtp_layer::tests::mtp_layer_suite_";
+const MTP_LAYER_BENCHMARK_FILTER: &str = "mtp_layer_benchmark::tests::mtp_layer_suite_";
 const QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen36-residual-norm-sm120.txt";
 const QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt";
@@ -3818,12 +3820,33 @@ fn qualify_mtp_layer(root: &Path, arguments: &[std::ffi::OsString]) -> Result<()
             "--release",
             "--lib",
             "--",
-            "mtp_layer_suite_",
+            MTP_LAYER_TEST_FILTER,
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
         ],
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            MTP_LAYER_BENCHMARK_FILTER,
+            "--nocapture",
+            "--test-threads=1",
+        ],
     )?;
     gate_mtp_layer(root)
 }
@@ -14947,13 +14970,13 @@ fn require_uniform_value(
 mod tests {
     use super::{
         COMPOSED_PERFORMANCE_SUITES, MAX_IDLE_DEVICE_MEMORY_MIB, MTP_LAYER_RESOURCE_BASELINES,
-        MTP_BF16_PAGED_GQA_BENCHMARK_FILTER, OptimizationSuite, PERFORMANCE_SUITES,
-        PerformanceSuite, QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
-        QWEN35_MTP_BATCH_GENERATION_TEST_FILTER, QWEN35_MTP_GENERATION_TEST_FILTER,
-        QWEN35_RESIDENT_MODEL_TEST_FILTER, QWEN35_RESIDENT_MTP_TEST_FILTER,
-        QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN35_TEXT_ENDPOINT_TEST_FILTER,
-        QWEN36_LONG_CONTEXT_KV_TEST_FILTER, QWEN36_MTP_LAYER_TEST_FILTER,
-        QWEN36_RESIDENT_MODEL_TEST_FILTER,
+        MTP_BF16_PAGED_GQA_BENCHMARK_FILTER, MTP_LAYER_BENCHMARK_FILTER,
+        MTP_LAYER_TEST_FILTER, OptimizationSuite, PERFORMANCE_SUITES, PerformanceSuite,
+        QWEN35_LONG_CONTEXT_KV_TEST_FILTER, QWEN35_MTP_BATCH_GENERATION_TEST_FILTER,
+        QWEN35_MTP_GENERATION_TEST_FILTER, QWEN35_RESIDENT_MODEL_TEST_FILTER,
+        QWEN35_RESIDENT_MTP_TEST_FILTER, QWEN35_RESIDUAL_NORM_TEST_FILTER,
+        QWEN35_TEXT_ENDPOINT_TEST_FILTER, QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
+        QWEN36_MTP_LAYER_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
         SM120_RESOURCE_BASELINES, device_is_idle, parse_baseline, parse_compute_pids,
         parse_cuda_toolkit_identity, parse_entries, parse_performance_device_sample,
         parse_performance_iteration, parse_resources, parse_rustc_identity,
@@ -15085,6 +15108,19 @@ mod tests {
         ] {
             assert!(test.contains(MTP_BF16_PAGED_GQA_BENCHMARK_FILTER));
         }
+    }
+
+    #[test]
+    fn mtp_layer_filters_exclude_qwen35_and_select_q38_accounting() {
+        assert!(
+            "mtp_layer::tests::mtp_layer_suite_source_owner_matches_all_draft_prime_and_realign_routes"
+                .contains(MTP_LAYER_TEST_FILTER)
+        );
+        assert!(
+            "mtp_layer_benchmark::tests::mtp_layer_suite_benchmark_inventory_and_accounting_are_exact"
+                .contains(MTP_LAYER_BENCHMARK_FILTER)
+        );
+        assert!(!"qwen35_mtp_layer::tests::qwen35_mtp_layer_suite_source_owner_matches_all_draft_prime_and_realign_routes".contains(MTP_LAYER_TEST_FILTER));
     }
 
     #[test]
