@@ -10497,7 +10497,7 @@ fn gate_paged_gqa_target(
     let decode_instructions = if e4m3_cache {
         &["F2FP.F16.E4M3.UNPACK_B", "SHFL.BFLY", "MUFU.EX2"][..]
     } else {
-        &["LDG.E.U16", "SHFL.BFLY", "MUFU.EX2"][..]
+        &["LDGSTS", "SHFL.BFLY", "MUFU.EX2"][..]
     };
     let prefill_instructions = if e4m3_cache {
         &["F2FP.F16.E4M3.UNPACK_B", "LDGSTS", "SHFL.BFLY", "MUFU.EX2"][..]
@@ -10601,7 +10601,7 @@ fn gate_mtp_bf16_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
 
         let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
-        for instruction in ["LDG.E.U16", "SHFL.BFLY", "MUFU.EX2"] {
+        for instruction in ["LDGSTS", "SHFL.BFLY", "MUFU.EX2"] {
             if !body.contains(instruction) {
                 return Err(
                     format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
@@ -10980,7 +10980,7 @@ fn gate_qwen35_mtp_resources(root: &Path) -> Result<(), Box<dyn Error>> {
             minimum_ctas_per_sm: 16,
             register_key: "paged_gqa_registers",
             ptx_instructions: &[],
-            sass_instructions: &["LDG.E.U16", "SHFL.BFLY", "MUFU.EX2"],
+            sass_instructions: &["LDGSTS", "SHFL.BFLY", "MUFU.EX2"],
             forbidden_sass: &["F2FP.F16.E4M3.UNPACK_B"],
         },
         ExactResourceFamily {

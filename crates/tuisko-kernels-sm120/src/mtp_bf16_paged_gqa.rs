@@ -1,6 +1,6 @@
 //! Source-BF16 paged grouped-query attention for admitted MTP layers.
 
-use crate::device::paged_gqa::bf16_paged_gqa;
+use crate::device::paged_gqa::{DECODE_RING_SHARED_BYTES, bf16_paged_gqa};
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -26,7 +26,8 @@ mod kernels {
         domain = 1,
         coordinates = u32,
         block = (32, 1, 1),
-        dynamic_shared = 0,
+        dynamic_shared = 8192,
+        dynamic_shared_alignment = 16,
         min_compute_capability = (12, 0),
     )]
     pub fn mtp_bf16_paged_gqa<const TOKENS: usize>(
@@ -156,7 +157,11 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
 
         Ok(Self {
             attention: module
-                .prepare_mtp_bf16_paged_gqa::<TOKENS>(LaunchConfig1D::new(blocks, THREADS, 0))
+                .prepare_mtp_bf16_paged_gqa::<TOKENS>(LaunchConfig1D::new(
+                    blocks,
+                    THREADS,
+                    DECODE_RING_SHARED_BYTES as u32,
+                ))
                 .map_err(|source| GpuError::launch("preparing MTP BF16 paged GQA", source))?,
         })
     }

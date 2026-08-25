@@ -1,5 +1,7 @@
 use crate::device::fp8_projection::e4m3x2_to_f32;
-use cuda_device::async_copy::{cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group};
+use cuda_device::async_copy::{
+    cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group,
+};
 use cuda_device::{DynamicSharedArray, convert, f16x2, float, thread, warp, wmma};
 use tuisko_model::Arch;
 
@@ -48,6 +50,13 @@ pub(crate) const FLASH_PREFILL_P16_SHARED_BYTES: usize =
     flash_prefill_shared_bytes(FLASH_PREFILL_P16_KEY_TILE);
 const _: () = assert!(FLASH_PREFILL_P8_SHARED_BYTES == 78_336);
 const _: () = assert!(FLASH_PREFILL_P16_SHARED_BYTES == 43_520);
+// Eight in-flight positions give the one-warp decode scan enough lookahead
+// to cover K/V load latency; K and V halves of one slot are 512 bytes each.
+const DECODE_RING_DEPTH: usize = 8;
+pub(crate) const DECODE_RING_SHARED_BYTES: usize = DECODE_RING_DEPTH * 2 * 256 * size_of::<u16>();
+const _: () = assert!(DECODE_RING_DEPTH.is_power_of_two());
+const _: () = assert!(DECODE_RING_SHARED_BYTES == 8_192);
+
 pub(crate) const LONG_CONTEXT_PARTITION_SIZE: usize = 256;
 pub(crate) const LONG_CONTEXT_MAX_TOKENS: usize = 220_000;
 pub(crate) const LONG_CONTEXT_MAX_PARTITIONS: usize =
@@ -1608,16 +1617,52 @@ pub(crate) unsafe fn bf16_paged_gqa<A: Arch, const TOKENS: usize>(
     let mut accumulator = [0.0f32; VALUES_PER_LANE];
     let mut maximum = -1.0e30f32;
     let mut denominator = 0.0f32;
-    let mut position = 0usize;
 
-    while position < length {
+    // Each lane async-copies its own 16-byte K and V slices eight positions
+    // ahead into a shared ring, so the serial per-position chain no longer
+    // stalls on a dependent global load. Every iteration commits exactly one
+    // (possibly empty) group, keeping the wait depth a compile-time constant;
+    // lanes only ever read the bytes they copied, so no barrier is needed.
+    let ring = DynamicSharedArray::<u32, 16>::get();
+    let slot_words = 2 * A::HEAD_DIM / 2;
+    let lane_words = dimension / 2;
+    let issue = |position: usize| {
         let physical_page = unsafe { *block_table.add(position / PAGE_SIZE) as usize };
         let page_offset = position & (PAGE_SIZE - 1);
         let cache_element = A::HEAD_DIM
             * (page_offset + PAGE_SIZE * (kv_head + A::NUM_KV_HEADS * physical_page))
             + dimension;
-        let key = unsafe { load_bf16x8(key_pages.add(cache_element)) };
-        let value = unsafe { load_bf16x8(value_pages.add(cache_element)) };
+        let slot = (position & (DECODE_RING_DEPTH - 1)) * slot_words;
+        unsafe {
+            cp_async_cg_16(
+                ring.add(slot + lane_words),
+                key_pages.add(cache_element).cast::<u32>(),
+            );
+            cp_async_cg_16(
+                ring.add(slot + A::HEAD_DIM / 2 + lane_words),
+                value_pages.add(cache_element).cast::<u32>(),
+            );
+        }
+    };
+    let mut ahead = 0usize;
+    while ahead < DECODE_RING_DEPTH {
+        if ahead < length {
+            issue(ahead);
+        }
+        // SAFETY: the preceding copies form one device-side asynchronous group.
+        unsafe { cp_async_commit_group() };
+        ahead += 1;
+    }
+    let mut position = 0usize;
+
+    while position < length {
+        // SAFETY: eight groups were committed before the first wait and one
+        // replacement group is committed after every consumed position.
+        unsafe { cp_async_wait_group(DECODE_RING_DEPTH as u32 - 1) };
+        let slot = (position & (DECODE_RING_DEPTH - 1)) * slot_words;
+        let key = unsafe { load_bf16x8(ring.add(slot + lane_words).cast::<u16>()) };
+        let value =
+            unsafe { load_bf16x8(ring.add(slot + A::HEAD_DIM / 2 + lane_words).cast::<u16>()) };
         let mut score = 0.0f32;
         let mut element = 0usize;
         while element < VALUES_PER_LANE {
@@ -1646,6 +1691,11 @@ pub(crate) unsafe fn bf16_paged_gqa<A: Arch, const TOKENS: usize>(
                 element += 1;
             }
         }
+        if position + DECODE_RING_DEPTH < length {
+            issue(position + DECODE_RING_DEPTH);
+        }
+        // SAFETY: this closes the replacement group, including empty tail groups.
+        unsafe { cp_async_commit_group() };
         position += 1;
     }
 
