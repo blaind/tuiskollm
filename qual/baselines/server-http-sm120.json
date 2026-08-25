@@ -1,0 +1,294 @@
+{
+  "schema_version": 1,
+  "suite": "server-http",
+  "model": "unsloth/Qwen3.8-27B-NVFP4",
+  "checkpoint_revision": "16b6615af3548b88e2d8e382457bc705b00479cf",
+  "device": "NVIDIA GeForce RTX 5090",
+  "driver": "580.173.02",
+  "compute_capability": "12.0",
+  "blessed_server_binary_sha256": "da8e1fa223fba17b884b03f6cb0963492ef7163a12ddb07eaf84292d997954b4",
+  "long_context_enabled": false,
+  "minimum_samples_per_case": 5,
+  "loaded_sm_clock_band_mhz": {
+    "minimum": 2107,
+    "maximum": 2212
+  },
+  "loaded_memory_clock_band_mhz": {
+    "minimum": 13751,
+    "maximum": 13851
+  },
+  "measurement_sm_clock_band_mhz": {
+    "minimum": 2107,
+    "maximum": 2212
+  },
+  "measurement_memory_clock_band_mhz": {
+    "minimum": 13751,
+    "maximum": 13851
+  },
+  "device_total_memory_mib": 32607,
+  "resident_memory_reference_mib": 30556,
+  "resident_memory_tolerance_mib": 16,
+  "resident_memory_enforced": true,
+  "metrics": [
+    {
+      "case": "blocking/external-concurrency-1",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.93316378262917,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-1",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 895.5393849999999,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-2",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.622127617938764,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-2",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 1855.690464,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-3",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.601638000247545,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-3",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 2790.166245,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-4",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.71757331269798,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-4",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 3670.746302,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-5",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.63653493457524,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-5",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 4631.487083999999,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-6",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.62645113608379,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-6",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 5564.281214000001,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-7",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.726647673539793,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-7",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 6417.126266,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-8",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.769706253280603,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-8",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 7297.849911,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/full-prefix",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 11.232248666529904,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "stream/full-prefix",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 445.14684,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/full-prefix",
+      "metric": "mean_intertoken_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 0.0009800000000126374,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/full-prefix",
+      "metric": "ttft_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 445.1388,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/low-reuse-256",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 26.300795403202212,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "stream/low-reuse-256",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 1216.693241,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/low-reuse-256",
+      "metric": "mean_intertoken_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 13.11096403225806,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/low-reuse-256",
+      "metric": "ttft_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 810.358017,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "suite",
+      "metric": "above_idle_energy_per_completion_token",
+      "unit": "joules_per_token",
+      "direction": "lower_is_better",
+      "reference": 20.006014062534344,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.01,
+      "enforced": true
+    },
+    {
+      "case": "suite",
+      "metric": "whole_board_energy_per_completion_token",
+      "unit": "joules_per_token",
+      "direction": "lower_is_better",
+      "reference": 27.341738285244524,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.01,
+      "enforced": true
+    }
+  ]
+}
