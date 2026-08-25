@@ -52,6 +52,8 @@ pub struct ResidentMtpBatchGenerationQualification {
     pub safe_cold_fallbacks: usize,
     /// Sampled scheduler lanes completed with deterministic per-request RNG state.
     pub sampled_lanes: usize,
+    /// Complete greedy lanes compared with the independent B=1 sequence.
+    pub greedy_invariant_lanes: usize,
     /// Complete target-plus-MTP device ownership.
     pub device_owner_bytes: usize,
     /// Complete page-locked program and scheduler ownership.
@@ -103,6 +105,8 @@ pub fn qualify_resident_mtp_batch_generation(
     generator.qualification_clear_retained()?;
     let sampled_lanes = qualify_sampled_batch(&mut generator)?;
     generator.qualification_clear_retained()?;
+    let greedy_invariant_lanes = qualify_greedy_batch_invariance(&mut generator)?;
+    generator.qualification_clear_retained()?;
 
     let after = device_memory_info(generator.context())?;
     if before != after {
@@ -127,6 +131,7 @@ pub fn qualify_resident_mtp_batch_generation(
         exact_prefix_reuses,
         safe_cold_fallbacks,
         sampled_lanes,
+        greedy_invariant_lanes,
         device_owner_bytes: generator.device_owner_bytes(),
         host_stager_bytes: generator.host_stager_bytes(),
         message_boundary_snapshot_bytes: generator.message_boundary_snapshot_bytes(),
@@ -352,6 +357,81 @@ fn qualify_sampled_batch(
     Ok(3)
 }
 
+fn qualify_greedy_batch_invariance(
+    generator: &mut ResidentMtpBatchGenerator,
+) -> Result<usize, ResidentMtpBatchGenerationQualificationError> {
+    let request = greedy_request("Reply with exactly the word blue.", 8);
+    let mut expected: Option<GeneratedText> = None;
+    let mut checked = 0;
+
+    for batch in EXACT_BATCHES {
+        let mut admissions = Vec::with_capacity(batch);
+        for _ in 0..batch {
+            admissions.push(generator.admit(&request)?);
+        }
+        let mut streamed_tokens: [Vec<u32>; 8] = std::array::from_fn(|_| Vec::new());
+        let mut streamed_text: [String; 8] = std::array::from_fn(|_| String::new());
+        let mut outputs: [Option<GeneratedText>; 8] = std::array::from_fn(|_| None);
+
+        while generator.active_requests() != 0 {
+            let events = generator.step()?;
+            for event in events.iter() {
+                let lane = admissions
+                    .iter()
+                    .position(|admission| admission.request_id == event.request_id)
+                    .ok_or_else(|| {
+                        ResidentMtpBatchGenerationQualificationError::Mismatch(format!(
+                            "B={batch} greedy transaction returned an unknown request"
+                        ))
+                    })?;
+                for step in event.steps() {
+                    streamed_tokens[lane].push(step.token_id);
+                    if let Some(delta) = &step.delta {
+                        streamed_text[lane].push_str(delta);
+                    }
+                }
+                if let Some(output) = &event.completed {
+                    outputs[lane] = Some(output.clone());
+                }
+            }
+        }
+
+        for lane in 0..batch {
+            let actual = outputs[lane].as_ref().ok_or_else(|| {
+                ResidentMtpBatchGenerationQualificationError::Mismatch(format!(
+                    "B={batch} greedy lane {lane} did not complete"
+                ))
+            })?;
+            if streamed_tokens[lane] != actual.token_ids || streamed_text[lane] != actual.text {
+                return Err(ResidentMtpBatchGenerationQualificationError::Mismatch(
+                    format!("B={batch} greedy lane {lane} changed its streaming boundary"),
+                ));
+            }
+            if let Some(expected) = &expected {
+                if actual.prompt.rendered_bytes != expected.prompt.rendered_bytes
+                    || actual.prompt.token_ids != expected.prompt.token_ids
+                    || actual.token_ids != expected.token_ids
+                    || actual.text != expected.text
+                    || actual.finish_reason != expected.finish_reason
+                {
+                    return Err(ResidentMtpBatchGenerationQualificationError::Mismatch(
+                        format!(
+                            "B={batch} greedy lane {lane} diverged from B=1: {:?} versus {:?}",
+                            actual.token_ids, expected.token_ids
+                        ),
+                    ));
+                }
+            } else {
+                expected = Some(actual.clone());
+            }
+            checked += 1;
+        }
+        generator.qualification_clear_retained()?;
+    }
+
+    Ok(checked)
+}
+
 fn one_token(
     events: &tuisko_engine::ResidentMtpBatchEvents,
     request: ResidentRequestId,
@@ -515,6 +595,7 @@ mod tests {
         assert_eq!(report.exact_prefix_reuses, 2);
         assert_eq!(report.safe_cold_fallbacks, 1);
         assert_eq!(report.sampled_lanes, 3);
+        assert_eq!(report.greedy_invariant_lanes, 36);
         assert_eq!(report.device_owner_bytes, 30_342_618_624);
         assert_eq!(report.host_stager_bytes, 1_281_019_904);
         assert_eq!(report.message_boundary_snapshot_bytes, 1_231_634_432);
