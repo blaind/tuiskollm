@@ -4,6 +4,9 @@ use crate::Sm120Arch;
 use crate::device::fp8_projection::{
     fp8_projection, prefill_projection_mma, qkv_projection_mma_t16, quantize_activation,
 };
+use crate::fp8::gdn_input_tma::{
+    DenseFp8GdnInputTmaMaps, DenseFp8GdnInputTmaRoute, ptx_name as gdn_input_tma_ptx_name,
+};
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -315,39 +318,6 @@ mod kernels {
         // and exposes 256 output CTAs per token tile for the 16,384-row GDN plane.
         unsafe {
             prefill_projection_mma::<{ Qwen38_27B::HIDDEN }, TOKENS, 64, 32, 4>(
-                activation_codes,
-                activation_scales,
-                weight_codes,
-                weight_scales,
-                output,
-                k_tiles,
-                Qwen38_27B::GDN_INPUT_ROWS,
-            );
-        }
-    }
-
-    /// Projects exactly 1,024 GDN input rows with the low-shared-memory tile.
-    #[kernel]
-    #[launch_bounds(256, 2)]
-    #[launch_contract(
-        domain = 1,
-        coordinates = u32,
-        block = (256, 1, 1),
-        dynamic_shared = 16384,
-        min_compute_capability = (12, 0),
-    )]
-    pub fn fp8_gdn_input_mma_t1024(
-        activation_codes: *const u32,
-        activation_scales: *const f32,
-        weight_codes: *const u32,
-        weight_scales: *const u16,
-        output: *mut u16,
-        k_tiles: u32,
-    ) {
-        // SAFETY: 16 K words keep the two-stage tile at 16 KiB while the 4,096
-        // CTAs cover every 64-token by 64-output tile exactly once.
-        unsafe {
-            prefill_projection_mma::<{ Qwen38_27B::HIDDEN }, 1024, 64, 16, 2>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
@@ -823,46 +793,28 @@ impl<const TOKENS: usize> PreparedGdnInputPrefillRoute<TOKENS> {
 
 struct PreparedGdnInputT1024Route {
     quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
-    projection: PreparedLaunch<kernels::__fp8_gdn_input_mma_t1024_CudaKernel>,
+    projection: DenseFp8GdnInputTmaRoute,
 }
 
 impl PreparedGdnInputT1024Route {
-    fn prepare<A: Arch>(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let token_tiles = QKV_MMA_MACRO_TOKENS / QKV_MMA_PREFILL_BLOCK_ROWS;
-        let projection_blocks = A::GDN_INPUT_ROWS / QKV_MMA_OUTPUT_ROWS * token_tiles;
-        let projection_blocks = u32::try_from(projection_blocks).map_err(|_| {
-            GpuError::invalid_launch("FP8 GDN input macro-prefill grid exceeds CUDA width")
-        })?;
-        let projection = module
-            .prepare_fp8_gdn_input_mma_t1024(LaunchConfig1D::new(
-                projection_blocks,
-                QKV_MMA_PREFILL_THREADS,
-                QKV_MMA_MACRO_SHARED_BYTES,
-            ))
-            .map_err(|source| {
-                GpuError::launch(
-                    "preparing the FP8 GDN input macro-prefill projection",
-                    source,
-                )
-            })?;
-
+    fn prepare(context: &Arc<CudaContext>, module: &kernels::LoadedModule) -> GpuResult<Self> {
         Ok(Self {
             quantize: prepare_quantize::<QKV_MMA_MACRO_TOKENS>(module)?,
-            projection,
+            projection: DenseFp8GdnInputTmaRoute::new(context)?,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn launch<A: Arch>(
+    unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
         stream: &CudaStream,
         input: *const u16,
         activation_codes: *mut u8,
         activation_scales: *mut f32,
-        weight_codes: *const u8,
         weight_scales: *const u16,
         output: *mut u16,
+        maps: &DenseFp8GdnInputTmaMaps,
     ) -> GpuResult<()> {
         module
             .quantize_activation_e4m3(
@@ -873,24 +825,11 @@ impl PreparedGdnInputT1024Route {
                 activation_scales,
             )
             .map_err(|source| GpuError::launch("launching FP8 activation quantization", source))?;
-        let k_tiles = A::HIDDEN / 4 / QKV_MMA_MACRO_K_WORDS;
-        module
-            .fp8_gdn_input_mma_t1024(
-                stream,
-                &self.projection,
-                activation_codes.cast::<u32>(),
-                activation_scales,
-                weight_codes.cast::<u32>(),
-                weight_scales,
-                output,
-                k_tiles as u32,
-            )
-            .map_err(|source| {
-                GpuError::launch(
-                    "launching the FP8 GDN input macro-prefill projection",
-                    source,
-                )
-            })
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.projection
+                .launch(stream, maps, activation_scales, weight_scales, output)
+        }
     }
 }
 
@@ -928,7 +867,7 @@ pub(crate) fn fp8_gdn_input_ptx_names() -> [&'static str; 12] {
         kernels::fp8_gdn_input_mma_ptx_name::<32>(),
         kernels::fp8_gdn_input_mma_ptx_name::<64>(),
         kernels::fp8_gdn_input_mma_ptx_name::<128>(),
-        "fp8_gdn_input_mma_t1024",
+        gdn_input_tma_ptx_name(),
     ]
 }
 
@@ -1146,9 +1085,50 @@ impl<A: Sm120Arch> GdnInputProjectionOp<A> {
             t32: PreparedGdnInputPrefillRoute::prepare::<A>(&module)?,
             t64: PreparedGdnInputPrefillRoute::prepare::<A>(&module)?,
             t128: PreparedGdnInputPrefillRoute::prepare::<A>(&module)?,
-            t1024: PreparedGdnInputT1024Route::prepare::<A>(&module)?,
+            t1024: PreparedGdnInputT1024Route::prepare(context, &module)?,
             module,
         })
+    }
+
+    /// Dynamically quantizes and applies the exact T=1024 TMA GDN input route.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`] at exactly 1024 rows.
+    /// `maps` was constructed for the same `activation_codes` and
+    /// `weight_codes` addresses, which remain live and stable through replay.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_macro_prefill(
+        &self,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+        maps: &DenseFp8GdnInputTmaMaps,
+    ) -> GpuResult<()> {
+        if maps.activation_codes() != activation_codes.addr()
+            || maps.weight_codes() != weight_codes.addr()
+        {
+            return Err(GpuError::invalid_launch(
+                "dense-FP8 GDN input tensor maps do not match the launch addresses",
+            ));
+        }
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.t1024.launch(
+                &self.module,
+                stream,
+                input,
+                activation_codes,
+                activation_scales,
+                weight_scales,
+                output,
+                maps,
+            )
+        }
     }
 
     /// Dynamically quantizes an exact row count and projects fused GDN Q/K/V/Z output.
@@ -1237,18 +1217,9 @@ impl<A: Sm120Arch> GdnInputProjectionOp<A> {
                     output,
                 )
             },
-            1_024 => unsafe {
-                self.t1024.launch::<A>(
-                    &self.module,
-                    stream,
-                    input,
-                    activation_codes,
-                    activation_scales,
-                    weight_codes,
-                    weight_scales,
-                    output,
-                )
-            },
+            1_024 => Err(GpuError::invalid_launch(
+                "FP8 GDN input T=1024 requires launch_macro_prefill with its tensor maps",
+            )),
             _ => Err(GpuError::invalid_launch(format!(
                 "FP8 GDN input row count {rows} is outside the admitted routes 1..={MAX_BATCH}, 32, 64, 128, and 1024"
             ))),

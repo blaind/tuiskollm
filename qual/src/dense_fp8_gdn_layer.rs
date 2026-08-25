@@ -115,16 +115,16 @@ pub fn qualify_dense_fp8_gdn_layer(
     let stable_base = program.base_address();
     let stable_addresses = program.qualification_addresses()?;
     let stable_descriptors = program.qualification_descriptors(&stream)?;
-    if stable_addresses.len() != 45 {
+    if stable_addresses.len() != 47 {
         return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
-            "owner exposes {} addresses, expected 45",
+            "owner exposes {} addresses, expected 47",
             stable_addresses.len()
         )));
     }
     if program.resident_weight_bytes() != 383_949_248
         || program.workspace_bytes() != 272_482_336
         || program.arena_bytes() != 656_432_128
-        || program.descriptor_bytes() != 512
+        || program.descriptor_bytes() != 768
     {
         return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
             "owner byte accounting differs from the admitted layout: weights {} workspace {} arena {} descriptors {}",
@@ -971,13 +971,13 @@ mod tests {
                 .map(|&rows| inactive_values(rows))
                 .sum::<usize>()
         );
-        assert_eq!(report.immutable_descriptor_words, 768);
+        assert_eq!(report.immutable_descriptor_words, 1_152);
         assert_eq!(report.resident_weight_bytes, 383_949_248);
         assert_eq!(report.workspace_bytes, 272_482_336);
         assert_eq!(report.owner_bytes, 656_431_584);
         assert_eq!(report.arena_bytes, 656_432_128);
         assert_eq!(report.padding_bytes, 544);
-        assert_eq!(report.descriptor_bytes, 512);
+        assert_eq!(report.descriptor_bytes, 768);
         assert!(report.maximum_absolute_error.is_finite());
         Ok(())
     }

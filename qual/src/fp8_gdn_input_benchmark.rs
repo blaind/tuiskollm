@@ -12,7 +12,7 @@ use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     GpuTimer,
 };
-use tuisko_kernels_sm120::GdnInputProjectionOp;
+use tuisko_kernels_sm120::{DenseFp8GdnInputTmaMaps, GdnInputProjectionOp};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -54,6 +54,7 @@ struct Session {
     routes: Vec<RouteGraphs>,
     timer: GpuTimer,
     _op: GdnInputProjectionOp,
+    _maps: DenseFp8GdnInputTmaMaps,
     arena: DeviceArena,
     regions: Regions,
     stream: Arc<CudaStream>,
@@ -88,10 +89,19 @@ impl Session {
             weight_scales: arena.address(regions.weight_scales)?,
             output: arena.address(regions.output)?,
         };
+        // SAFETY: the arena owns exact stable T=1024 activation and weight planes.
+        let maps = unsafe {
+            DenseFp8GdnInputTmaMaps::new(
+                &stream,
+                addresses.activation_codes.cast_const(),
+                addresses.weight_codes,
+            )?
+        };
         let mut routes = Vec::with_capacity(EXACT_ROUTES.len());
         for rows in EXACT_ROUTES {
             routes.push(capture_route(
                 &op,
+                &maps,
                 &stream,
                 &addresses,
                 rows,
@@ -104,6 +114,7 @@ impl Session {
             routes,
             timer,
             _op: op,
+            _maps: maps,
             arena,
             regions,
             stream,
@@ -223,15 +234,16 @@ fn make_weight_scales() -> Vec<u16> {
 
 fn capture_route(
     op: &GdnInputProjectionOp,
+    maps: &DenseFp8GdnInputTmaMaps,
     stream: &CudaStream,
     addresses: &Addresses,
     rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows))?;
+    let leaf = CudaGraph::capture(stream, || launch(op, maps, stream, addresses, rows))?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, rows)?;
+            launch(op, maps, stream, addresses, rows)?;
         }
 
         Ok(())
@@ -246,22 +258,36 @@ fn capture_route(
 
 fn launch(
     op: &GdnInputProjectionOp,
+    maps: &DenseFp8GdnInputTmaMaps,
     stream: &CudaStream,
     addresses: &Addresses,
     rows: usize,
 ) -> GpuResult<()> {
     // SAFETY: every pointer names its complete, aligned maximum-row arena region.
     unsafe {
-        op.launch(
-            stream,
-            rows,
-            addresses.input,
-            addresses.activation_codes,
-            addresses.activation_scales,
-            addresses.weight_codes,
-            addresses.weight_scales,
-            addresses.output,
-        )
+        if rows == MAX_ROWS {
+            op.launch_macro_prefill(
+                stream,
+                addresses.input,
+                addresses.activation_codes,
+                addresses.activation_scales,
+                addresses.weight_codes,
+                addresses.weight_scales,
+                addresses.output,
+                maps,
+            )
+        } else {
+            op.launch(
+                stream,
+                rows,
+                addresses.input,
+                addresses.activation_codes,
+                addresses.activation_scales,
+                addresses.weight_codes,
+                addresses.weight_scales,
+                addresses.output,
+            )
+        }
     }
 }
 

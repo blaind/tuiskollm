@@ -24,10 +24,11 @@ use tuisko_gpu::{
 };
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_kernels_sm120::{
-    AttentionOutputOp, AttentionQkPrepareOp, DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp,
-    DenseFp8SwiGluTmaMaps, FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp,
-    GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp, LONG_CONTEXT_GQA_PARTITION_BUCKETS,
-    LONG_CONTEXT_GQA_PARTITION_SIZE, LmHeadOp, LongContextPagedGqaOp, Nvfp4DownOp, Nvfp4SwiGluOp,
+    AttentionOutputOp, AttentionQkPrepareOp, DenseFp8DownOp, DenseFp8DownTmaMaps,
+    DenseFp8GdnInputTmaMaps, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps, FullAttentionQkvOp,
+    GdnInputProjectionOp, GdnOutputProjectionOp, GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp,
+    LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE, LmHeadOp,
+    LongContextPagedGqaOp, Nvfp4DownOp, Nvfp4SwiGluOp,
     PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PagedGqaOp, ResidualNormOp,
 };
 use tuisko_model::{
@@ -533,6 +534,7 @@ pub struct ResidentModelProgram {
     // Graphs retain both arena addresses and module handles, so they drop first.
     graphs: ResidentGraphs,
     dense_mlp_maps: Vec<DenseMlpMaps>,
+    gdn_input_maps: Vec<DenseFp8GdnInputTmaMaps>,
     arena: DeviceArena,
     kv_arena: DeviceArena,
     kv_slots: PagedKvSlotPool,
@@ -973,6 +975,7 @@ impl ResidentModelProgram {
         let graph_start = Instant::now();
         let pointers = ProgramPointers::bind(&arena, &kv_arena, &layout, &scalars)?;
         let dense_mlp_maps = DenseMlpMaps::bind_all(&stream, &pointers)?;
+        let gdn_input_maps = DenseMlpMaps::bind_gdn_input(&stream, &pointers)?;
         let base_address = arena.base_address();
         let kv_base_address = kv_arena.base_address();
         let ops = Ops {
@@ -993,7 +996,7 @@ impl ResidentModelProgram {
             nvfp4_down: &nvfp4_down,
             lm_head: &lm_head,
         };
-        let graphs = capture_routes(&stream, ops, &pointers, &dense_mlp_maps)?;
+        let graphs = capture_routes(&stream, ops, &pointers, &dense_mlp_maps, &gdn_input_maps)?;
         load_stats.graph_capture_ns = elapsed_ns("resident graph capture", graph_start)?;
         if let Some(progress) = progress
             && progress_tail_upload_bytes == 0
@@ -1005,6 +1008,7 @@ impl ResidentModelProgram {
             Self {
                 graphs,
                 dense_mlp_maps,
+                gdn_input_maps,
                 arena,
                 kv_arena,
                 kv_slots,
@@ -2179,9 +2183,17 @@ impl ResidentModelProgram {
         self.layout.workspace_bytes()
     }
 
-    /// Exact address-bound tensor-map bytes across the eight dense MLP layers.
+    /// Exact address-bound tensor-map bytes across the dense MLP and GDN input layers.
     pub fn descriptor_bytes(&self) -> usize {
-        self.dense_mlp_maps.iter().map(DenseMlpMaps::byte_len).sum()
+        self.dense_mlp_maps
+            .iter()
+            .map(DenseMlpMaps::byte_len)
+            .sum::<usize>()
+            + self
+                .gdn_input_maps
+                .iter()
+                .map(DenseFp8GdnInputTmaMaps::byte_len)
+                .sum::<usize>()
     }
 
     /// Complete device arena bytes, including exact alignment padding.
@@ -2282,6 +2294,7 @@ impl ResidentModelProgram {
             self.ops(),
             &self._pointers,
             &self.dense_mlp_maps,
+            &self.gdn_input_maps,
         )?;
         Ok(())
     }
@@ -2424,7 +2437,14 @@ impl ResidentModelProgram {
         let ops = self.ops();
         Ok(CudaGraph::capture(stream, || {
             for _ in 0..operations {
-                launch_prefill_route(stream, route, ops, &self._pointers, &self.dense_mlp_maps)?;
+                launch_prefill_route(
+                    stream,
+                    route,
+                    ops,
+                    &self._pointers,
+                    &self.dense_mlp_maps,
+                    &self.gdn_input_maps,
+                )?;
             }
             Ok(())
         })?)
@@ -2784,6 +2804,9 @@ impl ResidentModelProgram {
         let mut addresses = self._pointers.addresses();
         for maps in &self.dense_mlp_maps {
             maps.push_addresses(&mut addresses);
+        }
+        for maps in &self.gdn_input_maps {
+            addresses.extend(maps.device_addresses());
         }
         addresses
     }
@@ -4321,6 +4344,28 @@ impl DenseMlpMaps {
         Ok(maps)
     }
 
+    fn bind_gdn_input(
+        stream: &CudaStream,
+        pointers: &ProgramPointers,
+    ) -> EngineResult<Vec<DenseFp8GdnInputTmaMaps>> {
+        let mut maps = Vec::new();
+        for layer in &pointers.layers {
+            let MixerPointers::Gdn(gdn) = layer.mixer else {
+                continue;
+            };
+            // SAFETY: resident arenas keep the shared scratch and this layer's
+            // source-native weight addresses stable for every captured graph.
+            maps.push(unsafe {
+                DenseFp8GdnInputTmaMaps::new(
+                    stream,
+                    pointers.workspace.activation_codes.cast_const(),
+                    gdn.input_weight_codes,
+                )?
+            });
+        }
+        Ok(maps)
+    }
+
     fn byte_len(&self) -> usize {
         self.gate_up.byte_len() + self.down.byte_len()
     }
@@ -4595,6 +4640,7 @@ fn capture_routes(
     ops: Ops<'_>,
     pointers: &ProgramPointers,
     dense_mlp_maps: &[DenseMlpMaps],
+    gdn_input_maps: &[DenseFp8GdnInputTmaMaps],
 ) -> EngineResult<ResidentGraphs> {
     let mut short = Vec::with_capacity(MAX_BATCH);
     for batch in 1..=MAX_BATCH {
@@ -4636,7 +4682,7 @@ fn capture_routes(
     let mut prefill = Vec::with_capacity(PREFILL_GRAPH_ROUTE_COUNT);
     for route in prefill_graph_routes() {
         prefill.push(CudaGraph::capture(stream, || {
-            launch_prefill_route(stream, route, ops, pointers, dense_mlp_maps)
+            launch_prefill_route(stream, route, ops, pointers, dense_mlp_maps, gdn_input_maps)
         })?);
     }
     let prefill = prefill.try_into().map_err(|_| {
@@ -5306,6 +5352,7 @@ fn launch_prefill_route(
     ops: Ops<'_>,
     pointers: &ProgramPointers,
     dense_mlp_maps: &[DenseMlpMaps],
+    gdn_input_maps: &[DenseFp8GdnInputTmaMaps],
 ) -> GpuResult<()> {
     let rows = route.tokens;
     let workspace = pointers.workspace;
@@ -5327,7 +5374,7 @@ fn launch_prefill_route(
 
     let mut residual_input = workspace.residual_a;
     for (index, layer) in pointers.layers.iter().enumerate() {
-        launch_prefill_mixer(stream, route, ops, workspace, layer.mixer)?;
+        launch_prefill_mixer(stream, route, ops, workspace, layer.mixer, gdn_input_maps)?;
         // SAFETY: branch and residual planes are disjoint MAX_ROWS regions.
         unsafe {
             ops.norm.launch_residual(
@@ -5396,6 +5443,7 @@ fn launch_prefill_mixer(
     ops: Ops<'_>,
     workspace: WorkspacePointers,
     mixer: MixerPointers,
+    gdn_input_maps: &[DenseFp8GdnInputTmaMaps],
 ) -> GpuResult<()> {
     let rows = route.tokens;
     // SAFETY: shared scratch is consumed before reuse. All prefill rows map to
@@ -5403,16 +5451,40 @@ fn launch_prefill_mixer(
     unsafe {
         match mixer {
             MixerPointers::Gdn(p) => {
-                ops.gdn_input.launch(
-                    stream,
-                    rows,
-                    workspace.mixer_normalized,
-                    workspace.activation_codes,
-                    workspace.activation_scales,
-                    p.input_weight_codes,
-                    p.input_weight_scales,
-                    workspace.projected,
-                )?;
+                if rows == super::MAX_ROWS {
+                    // T=1024 amortizes address-bound TMA setup across the tile;
+                    // each map is selected by its encoded weight address, which
+                    // launch_macro_prefill re-validates against the pointers.
+                    let maps = gdn_input_maps
+                        .iter()
+                        .find(|maps| maps.source_addresses()[1] == p.input_weight_codes.addr())
+                        .ok_or_else(|| {
+                            GpuError::invalid_launch(
+                                "resident GDN input tensor-map inventory is missing this layer",
+                            )
+                        })?;
+                    ops.gdn_input.launch_macro_prefill(
+                        stream,
+                        workspace.mixer_normalized,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.input_weight_codes,
+                        p.input_weight_scales,
+                        workspace.projected,
+                        maps,
+                    )?;
+                } else {
+                    ops.gdn_input.launch(
+                        stream,
+                        rows,
+                        workspace.mixer_normalized,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.input_weight_codes,
+                        p.input_weight_scales,
+                        workspace.projected,
+                    )?;
+                }
                 ops.gdn_prepare.launch(
                     stream,
                     rows,
