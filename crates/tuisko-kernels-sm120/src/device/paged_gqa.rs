@@ -20,6 +20,10 @@ const BF16_PREFILL_PLANE_VALUES: usize = PREFILL_KEY_TILE * 256;
 pub(crate) const BF16_PREFILL_SHARED_BYTES: usize =
     2 * BF16_PREFILL_PLANE_VALUES * size_of::<u16>();
 pub(crate) const PREFILL_PARTIAL_VALUES: usize = 258;
+pub(crate) const DECODE_WARPS: usize = 8;
+pub(crate) const DECODE_THREADS: usize = DECODE_WARPS * WARP_THREADS;
+pub(crate) const DECODE_PARTIAL_VALUES: usize = 258;
+pub(crate) const DECODE_SHARED_VALUES: usize = DECODE_WARPS * DECODE_PARTIAL_VALUES;
 const FLASH_PREFILL_MMA_ROWS: usize = 16;
 const FLASH_PREFILL_QUERY_GROUPS: usize = 2;
 const FLASH_PREFILL_QUERY_ROWS: usize = FLASH_PREFILL_QUERY_GROUPS * FLASH_PREFILL_MMA_ROWS;
@@ -1626,6 +1630,154 @@ pub(crate) unsafe fn paged_gqa<A: Arch, const TOKENS: usize>(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn paged_gqa_partitioned<A: Arch, const TOKENS: usize>(
+    query: *const f32,
+    key_pages: *const u8,
+    value_pages: *const u8,
+    block_tables: *const u32,
+    table_rows: *const u32,
+    table_stride: u32,
+    lengths: *const u32,
+    output: *mut f32,
+    key_scale: f32,
+    value_scale: f32,
+    partials: *mut f32,
+) {
+    let block = thread::blockIdx_x() as usize;
+    let token = block / A::NUM_ATTENTION_HEADS;
+    if token >= TOKENS {
+        return;
+    }
+    let query_head = block - token * A::NUM_ATTENTION_HEADS;
+    let kv_head = query_head / (A::NUM_ATTENTION_HEADS / A::NUM_KV_HEADS);
+    let tid = thread::threadIdx_x() as usize;
+    let warp_index = tid / WARP_THREADS;
+    let lane = tid & (WARP_THREADS - 1);
+    let dimension = lane * VALUES_PER_LANE;
+    let query = unsafe {
+        query.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
+    };
+    let output = unsafe {
+        output.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
+    };
+    let table_row = unsafe { *table_rows.add(token) as usize };
+    let block_table = unsafe { block_tables.add(table_row * table_stride as usize) };
+    let length = unsafe { *lengths.add(token) as usize };
+    let q = unsafe {
+        [
+            *query,
+            *query.add(1),
+            *query.add(2),
+            *query.add(3),
+            *query.add(4),
+            *query.add(5),
+            *query.add(6),
+            *query.add(7),
+        ]
+    };
+    // Each warp owns one contiguous context slice and keeps the established
+    // per-position online-softmax order inside its slice. Warp zero merges
+    // slice states below in ascending order.
+    let slice_positions = length.div_ceil(DECODE_WARPS);
+    let slice_begin = warp_index * slice_positions;
+    let slice_end = core::cmp::min(slice_begin + slice_positions, length);
+    let mut accumulator = [0.0f32; VALUES_PER_LANE];
+    let mut maximum = -1.0e30f32;
+    let mut denominator = 0.0f32;
+    let mut position = slice_begin;
+
+    while position < slice_end {
+        let physical_page = unsafe { *block_table.add(position / PAGE_SIZE) as usize };
+        let page_offset = position & (PAGE_SIZE - 1);
+        let cache_element = A::HEAD_DIM
+            * (page_offset + PAGE_SIZE * (kv_head + A::NUM_KV_HEADS * physical_page))
+            + dimension;
+        let key = unsafe { load_e4m3x8(key_pages.add(cache_element), key_scale) };
+        let value = unsafe { load_e4m3x8(value_pages.add(cache_element), value_scale) };
+        let mut score = 0.0f32;
+        let mut element = 0usize;
+        while element < VALUES_PER_LANE {
+            score = float::fma_rn_f32(q[element], key[element], score);
+            element += 1;
+        }
+        score = warp::reduce_sum_f32(score) * 0.0625;
+
+        if score > maximum {
+            let old_scale = fast_exp(maximum - score);
+            denominator = denominator * old_scale + 1.0;
+            maximum = score;
+            element = 0;
+            while element < VALUES_PER_LANE {
+                accumulator[element] =
+                    float::fma_rn_f32(1.0, value[element], accumulator[element] * old_scale);
+                element += 1;
+            }
+        } else {
+            let weight = fast_exp(score - maximum);
+            denominator += weight;
+            element = 0;
+            while element < VALUES_PER_LANE {
+                accumulator[element] =
+                    float::fma_rn_f32(weight, value[element], accumulator[element]);
+                element += 1;
+            }
+        }
+        position += 1;
+    }
+
+    let partial_base = warp_index * DECODE_PARTIAL_VALUES;
+    if lane == 0 {
+        unsafe {
+            *partials.add(partial_base) = maximum;
+            *partials.add(partial_base + 1) = denominator;
+        }
+    }
+    let mut element = 0usize;
+    while element < VALUES_PER_LANE {
+        unsafe { *partials.add(partial_base + 2 + dimension + element) = accumulator[element] };
+        element += 1;
+    }
+    thread::sync_threads();
+    if warp_index != 0 {
+        return;
+    }
+
+    let mut merged = [0.0f32; VALUES_PER_LANE];
+    let mut merged_maximum = -1.0e30f32;
+    let mut merged_denominator = 0.0f32;
+    let mut slice = 0usize;
+    while slice < DECODE_WARPS {
+        let base = slice * DECODE_PARTIAL_VALUES;
+        let slice_denominator = unsafe { *partials.add(base + 1) };
+        if slice_denominator > 0.0 {
+            let slice_maximum = unsafe { *partials.add(base) };
+            let next_maximum = merged_maximum.max(slice_maximum);
+            let old_scale = fast_exp(merged_maximum - next_maximum);
+            let slice_scale = fast_exp(slice_maximum - next_maximum);
+            merged_denominator = merged_denominator * old_scale + slice_denominator * slice_scale;
+            merged_maximum = next_maximum;
+            let mut element = 0usize;
+            while element < VALUES_PER_LANE {
+                merged[element] = float::fma_rn_f32(
+                    unsafe { *partials.add(base + 2 + dimension + element) },
+                    slice_scale,
+                    merged[element] * old_scale,
+                );
+                element += 1;
+            }
+        }
+        slice += 1;
+    }
+
+    let mut element = 0usize;
+    while element < VALUES_PER_LANE {
+        unsafe { *output.add(element) = merged[element] / merged_denominator };
+        element += 1;
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn bf16_paged_gqa<A: Arch, const TOKENS: usize>(
     query: *const f32,
     key_pages: *const u16,
@@ -1754,6 +1906,151 @@ pub(crate) unsafe fn bf16_paged_gqa<A: Arch, const TOKENS: usize>(
     let mut element = 0usize;
     while element < VALUES_PER_LANE {
         unsafe { *output.add(element) = accumulator[element] / denominator };
+        element += 1;
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn bf16_paged_gqa_partitioned<A: Arch, const TOKENS: usize>(
+    query: *const f32,
+    key_pages: *const u16,
+    value_pages: *const u16,
+    block_tables: *const u32,
+    table_rows: *const u32,
+    table_stride: u32,
+    lengths: *const u32,
+    output: *mut f32,
+    partials: *mut f32,
+) {
+    let block = thread::blockIdx_x() as usize;
+    let token = block / A::NUM_ATTENTION_HEADS;
+    if token >= TOKENS {
+        return;
+    }
+    let query_head = block - token * A::NUM_ATTENTION_HEADS;
+    let kv_head = query_head / (A::NUM_ATTENTION_HEADS / A::NUM_KV_HEADS);
+    let tid = thread::threadIdx_x() as usize;
+    let warp_index = tid / WARP_THREADS;
+    let lane = tid & (WARP_THREADS - 1);
+    let dimension = lane * VALUES_PER_LANE;
+    let query = unsafe {
+        query.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
+    };
+    let output = unsafe {
+        output.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
+    };
+    let table_row = unsafe { *table_rows.add(token) as usize };
+    let block_table = unsafe { block_tables.add(table_row * table_stride as usize) };
+    let length = unsafe { *lengths.add(token) as usize };
+    let q = unsafe {
+        [
+            *query,
+            *query.add(1),
+            *query.add(2),
+            *query.add(3),
+            *query.add(4),
+            *query.add(5),
+            *query.add(6),
+            *query.add(7),
+        ]
+    };
+    // The represented-BF16 route uses the same contiguous slice and ordered
+    // merge schedule as the FP8 target route.
+    let slice_positions = length.div_ceil(DECODE_WARPS);
+    let slice_begin = warp_index * slice_positions;
+    let slice_end = core::cmp::min(slice_begin + slice_positions, length);
+    let mut accumulator = [0.0f32; VALUES_PER_LANE];
+    let mut maximum = -1.0e30f32;
+    let mut denominator = 0.0f32;
+    let mut position = slice_begin;
+
+    while position < slice_end {
+        let physical_page = unsafe { *block_table.add(position / PAGE_SIZE) as usize };
+        let page_offset = position & (PAGE_SIZE - 1);
+        let cache_element = A::HEAD_DIM
+            * (page_offset + PAGE_SIZE * (kv_head + A::NUM_KV_HEADS * physical_page))
+            + dimension;
+        let key = unsafe { load_bf16x8(key_pages.add(cache_element)) };
+        let value = unsafe { load_bf16x8(value_pages.add(cache_element)) };
+        let mut score = 0.0f32;
+        let mut element = 0usize;
+        while element < VALUES_PER_LANE {
+            score = float::fma_rn_f32(q[element], key[element], score);
+            element += 1;
+        }
+        score = warp::reduce_sum_f32(score) * 0.0625;
+
+        if score > maximum {
+            let old_scale = fast_exp(maximum - score);
+            denominator = denominator * old_scale + 1.0;
+            maximum = score;
+            element = 0;
+            while element < VALUES_PER_LANE {
+                accumulator[element] =
+                    float::fma_rn_f32(1.0, value[element], accumulator[element] * old_scale);
+                element += 1;
+            }
+        } else {
+            let weight = fast_exp(score - maximum);
+            denominator += weight;
+            element = 0;
+            while element < VALUES_PER_LANE {
+                accumulator[element] =
+                    float::fma_rn_f32(weight, value[element], accumulator[element]);
+                element += 1;
+            }
+        }
+        position += 1;
+    }
+
+    let partial_base = warp_index * DECODE_PARTIAL_VALUES;
+    if lane == 0 {
+        unsafe {
+            *partials.add(partial_base) = maximum;
+            *partials.add(partial_base + 1) = denominator;
+        }
+    }
+    let mut element = 0usize;
+    while element < VALUES_PER_LANE {
+        unsafe { *partials.add(partial_base + 2 + dimension + element) = accumulator[element] };
+        element += 1;
+    }
+    thread::sync_threads();
+    if warp_index != 0 {
+        return;
+    }
+
+    let mut merged = [0.0f32; VALUES_PER_LANE];
+    let mut merged_maximum = -1.0e30f32;
+    let mut merged_denominator = 0.0f32;
+    let mut slice = 0usize;
+    while slice < DECODE_WARPS {
+        let base = slice * DECODE_PARTIAL_VALUES;
+        let slice_denominator = unsafe { *partials.add(base + 1) };
+        if slice_denominator > 0.0 {
+            let slice_maximum = unsafe { *partials.add(base) };
+            let next_maximum = merged_maximum.max(slice_maximum);
+            let old_scale = fast_exp(merged_maximum - next_maximum);
+            let slice_scale = fast_exp(slice_maximum - next_maximum);
+            merged_denominator = merged_denominator * old_scale + slice_denominator * slice_scale;
+            merged_maximum = next_maximum;
+            let mut element = 0usize;
+            while element < VALUES_PER_LANE {
+                merged[element] = float::fma_rn_f32(
+                    unsafe { *partials.add(base + 2 + dimension + element) },
+                    slice_scale,
+                    merged[element] * old_scale,
+                );
+                element += 1;
+            }
+        }
+        slice += 1;
+    }
+
+    let mut element = 0usize;
+    while element < VALUES_PER_LANE {
+        unsafe { *output.add(element) = merged[element] / merged_denominator };
         element += 1;
     }
 }
