@@ -5,7 +5,8 @@ use crate::{
 };
 use std::collections::HashMap;
 use tuisko_frontend::{
-    ChatMessage, ChatTemplateOptions, PromptEncoding, StreamingDecoder, TextFrontend,
+    ChatMessage, ChatTemplateOptions, PromptEncoding, PromptEncodingMetrics, StreamingDecoder,
+    TextFrontend,
 };
 use tuisko_model::{Arch, Qwen38_27B};
 
@@ -93,6 +94,7 @@ pub struct CancelledText {
 /// Per-request host state consuming one exact BF16 vocabulary row at a time.
 pub struct GenerationSession {
     prompt: PromptEncoding,
+    prompt_metrics: PromptEncodingMetrics,
     sampler: Sampler,
     decoder: StreamingDecoder,
     generated: Vec<u32>,
@@ -104,11 +106,13 @@ pub struct GenerationSession {
 impl GenerationSession {
     /// Renders and tokenizes the prompt and initializes sampling state.
     pub fn start(frontend: &TextFrontend, request: &ChatGenerationRequest) -> EngineResult<Self> {
-        let prompt = frontend.encode_chat_with_report(&request.messages, &request.template)?;
+        let (prompt, prompt_metrics) =
+            frontend.encode_chat_with_metrics(&request.messages, &request.template)?;
         let sampler = Sampler::new(request.sampling, frontend.stop_ids())?;
 
         Ok(Self {
             prompt,
+            prompt_metrics,
             sampler,
             decoder: frontend.streaming_decoder(),
             generated: Vec::with_capacity(request.max_new_tokens.min(4_096)),
@@ -135,6 +139,11 @@ impl GenerationSession {
     /// Prompt-cache accounting for request instrumentation.
     pub const fn prompt_encoding(&self) -> &PromptEncoding {
         &self.prompt
+    }
+
+    /// Observation-only frontend timings and prefix-lookup detail.
+    pub const fn prompt_metrics(&self) -> &PromptEncodingMetrics {
+        &self.prompt_metrics
     }
 
     /// Tokens selected so far.

@@ -306,6 +306,7 @@ impl ResidentMtpBatchGenerator {
         let control = GenerationSession::start(&self.frontend, request)?;
         let prompt_tokens = control.prompt_token_ids().len();
         let message_boundary_tokens = control.message_boundary_token_ids().len();
+        let prompt_metrics = control.prompt_metrics().clone();
         let required_positions = require_generation_capacity(
             prompt_tokens,
             request.max_new_tokens,
@@ -322,6 +323,7 @@ impl ResidentMtpBatchGenerator {
                 prompt_tokens,
                 device_reused_tokens: 0,
                 native_prefill_tokens: 0,
+                prompt_metrics,
                 completed: Some(control.into_output()?),
             });
         }
@@ -419,6 +421,7 @@ impl ResidentMtpBatchGenerator {
             prompt_tokens,
             device_reused_tokens: reused,
             native_prefill_tokens,
+            prompt_metrics,
             completed: None,
         })
     }

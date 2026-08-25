@@ -294,6 +294,17 @@ pub struct PromptEncoding {
     pub fresh_bytes: usize,
 }
 
+/// Observation-only frontend timing and prefix-lookup detail for one prompt.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PromptEncodingMetrics {
+    /// Wall time spent rendering the checkpoint chat template.
+    pub render_us: u64,
+    /// Wall time spent on prefix lookup and tokenization.
+    pub encode_us: u64,
+    /// Stable cache-miss reason, empty when any exact prefix was reused.
+    pub miss_reason: String,
+}
+
 /// Sampling defaults admitted from `generation_config.json`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GenerationDefaults {
@@ -526,9 +537,22 @@ impl TextFrontend {
         messages: &[ChatMessage],
         options: &ChatTemplateOptions,
     ) -> FrontendResult<PromptEncoding> {
+        self.encode_chat_with_metrics(messages, options)
+            .map(|(encoding, _)| encoding)
+    }
+
+    /// Renders and encodes one prompt with separate observation-only metrics.
+    pub fn encode_chat_with_metrics(
+        &self,
+        messages: &[ChatMessage],
+        options: &ChatTemplateOptions,
+    ) -> FrontendResult<(PromptEncoding, PromptEncodingMetrics)> {
+        let render_start = std::time::Instant::now();
         if self.has_literal_user_specials(messages) {
             let (rendered, literal_ranges) =
                 self.render_chat_with_literal_user_ranges(messages, options)?;
+            let render_us = elapsed_microseconds(render_start);
+            let encode_start = std::time::Instant::now();
             let token_ids = self.encode_rendered_segments(&rendered, &literal_ranges)?;
             let boundary_bytes = message_boundary_bytes(&rendered)?;
             if literal_ranges.iter().any(|&(_, end)| end > boundary_bytes) {
@@ -539,17 +563,35 @@ impl TextFrontend {
             let message_boundary_tokens = self
                 .encode_rendered_segments(&rendered[..boundary_bytes], &literal_ranges)?
                 .len();
-            return Ok(PromptEncoding {
-                token_ids,
-                message_boundary_tokens,
-                reused_tokens: 0,
-                rendered_bytes: rendered.len(),
-                fresh_bytes: rendered.len(),
-            });
+            return Ok((
+                PromptEncoding {
+                    token_ids,
+                    message_boundary_tokens,
+                    reused_tokens: 0,
+                    rendered_bytes: rendered.len(),
+                    fresh_bytes: rendered.len(),
+                },
+                PromptEncodingMetrics {
+                    render_us,
+                    encode_us: elapsed_microseconds(encode_start),
+                    miss_reason: "literal-user-specials".into(),
+                },
+            ));
         }
         let rendered = self.render_chat(messages, true, options)?;
+        let render_us = elapsed_microseconds(render_start);
         let boundary_bytes = message_boundary_bytes(&rendered)?;
-        self.encode_rendered_with_prefix(&rendered, boundary_bytes)
+        let encode_start = std::time::Instant::now();
+        let (encoding, miss_reason) =
+            self.encode_rendered_with_prefix(&rendered, boundary_bytes)?;
+        Ok((
+            encoding,
+            PromptEncodingMetrics {
+                render_us,
+                encode_us: elapsed_microseconds(encode_start),
+                miss_reason: miss_reason.into(),
+            },
+        ))
     }
 
     /// Decodes token IDs using the admitted tokenizer.
@@ -576,10 +618,10 @@ impl TextFrontend {
         &self,
         rendered: &str,
         boundary_bytes: usize,
-    ) -> FrontendResult<PromptEncoding> {
+    ) -> FrontendResult<(PromptEncoding, &'static str)> {
         // Added tokens split before BPE, so restarting at a shared `<|im_start|>`
         // preserves the full-encode token sequence. Other splits fall back.
-        let cached = {
+        let (cached, miss_reason) = {
             let cache = self
                 .prompt_cache
                 .lock()
@@ -592,13 +634,16 @@ impl TextFrontend {
             if split == rendered.len() {
                 let message_boundary_tokens =
                     message_boundary_tokens(&cached.token_ends, boundary_bytes)?;
-                return Ok(PromptEncoding {
-                    reused_tokens: cached.token_ids.len(),
-                    token_ids: cached.token_ids,
-                    message_boundary_tokens,
-                    rendered_bytes: rendered.len(),
-                    fresh_bytes: 0,
-                });
+                return Ok((
+                    PromptEncoding {
+                        reused_tokens: cached.token_ids.len(),
+                        token_ids: cached.token_ids,
+                        message_boundary_tokens,
+                        rendered_bytes: rendered.len(),
+                        fresh_bytes: 0,
+                    },
+                    "",
+                ));
             }
 
             let tail = &rendered[split..];
@@ -617,13 +662,16 @@ impl TextFrontend {
             let message_boundary_tokens = message_boundary_tokens(&token_ends, boundary_bytes)?;
             self.push_prompt_entry(rendered, token_ids.clone(), token_ends);
 
-            return Ok(PromptEncoding {
-                token_ids,
-                message_boundary_tokens,
-                reused_tokens,
-                rendered_bytes: rendered.len(),
-                fresh_bytes: tail.len(),
-            });
+            return Ok((
+                PromptEncoding {
+                    token_ids,
+                    message_boundary_tokens,
+                    reused_tokens,
+                    rendered_bytes: rendered.len(),
+                    fresh_bytes: tail.len(),
+                },
+                "",
+            ));
         }
 
         let encoding = self
@@ -642,13 +690,16 @@ impl TextFrontend {
         let message_boundary_tokens = message_boundary_tokens(&token_ends, boundary_bytes)?;
         self.push_prompt_entry(rendered, token_ids.clone(), token_ends);
 
-        Ok(PromptEncoding {
-            token_ids,
-            message_boundary_tokens,
-            reused_tokens: 0,
-            rendered_bytes: rendered.len(),
-            fresh_bytes: rendered.len(),
-        })
+        Ok((
+            PromptEncoding {
+                token_ids,
+                message_boundary_tokens,
+                reused_tokens: 0,
+                rendered_bytes: rendered.len(),
+                fresh_bytes: rendered.len(),
+            },
+            miss_reason,
+        ))
     }
 
     fn has_literal_user_specials(&self, messages: &[ChatMessage]) -> bool {
@@ -990,8 +1041,16 @@ fn is_valid_utf8_prefix(bytes: &[u8]) -> bool {
         .all(|byte| (0x80..=0xbf).contains(byte))
 }
 
-fn best_cached_prefix(cache: &VecDeque<PromptPrefixEntry>, rendered: &str) -> Option<CachedPrefix> {
+fn best_cached_prefix(
+    cache: &VecDeque<PromptPrefixEntry>,
+    rendered: &str,
+) -> (Option<CachedPrefix>, &'static str) {
+    if cache.is_empty() {
+        return (None, "cache-empty");
+    }
+
     let mut best = None;
+    let mut saw_block_start = false;
     for entry in cache {
         if entry.rendered == rendered {
             best = Some(CachedPrefix {
@@ -1006,6 +1065,7 @@ fn best_cached_prefix(cache: &VecDeque<PromptPrefixEntry>, rendered: &str) -> Op
         let Some(split) = rendered[..common].rfind(PROMPT_BLOCK_START) else {
             continue;
         };
+        saw_block_start = true;
         let Some(last_token) = entry.token_ends.iter().position(|&end| end == split) else {
             continue;
         };
@@ -1021,7 +1081,18 @@ fn best_cached_prefix(cache: &VecDeque<PromptPrefixEntry>, rendered: &str) -> Op
             });
         }
     }
-    best
+    let miss_reason = if best.is_some() {
+        ""
+    } else if saw_block_start {
+        "block-start-not-token-end"
+    } else {
+        "no-shared-block-start"
+    };
+    (best, miss_reason)
+}
+
+fn elapsed_microseconds(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn common_prefix_bytes(left: &str, right: &str) -> usize {
@@ -1543,13 +1614,42 @@ mod tests {
             token_ends: vec![6, second_split],
         }]);
 
+        let (cached, miss_reason) =
+            best_cached_prefix(&cache, "prefix<|im_start|>one<|im_start|>new");
         let CachedPrefix {
             split,
             token_ids,
             token_ends,
-        } = best_cached_prefix(&cache, "prefix<|im_start|>one<|im_start|>new").unwrap();
+        } = cached.unwrap();
         assert_eq!(split, second_split);
         assert_eq!(token_ids, [10, 11]);
         assert_eq!(token_ends, [6, second_split]);
+        assert_eq!(miss_reason, "");
+    }
+
+    #[test]
+    fn cache_miss_reasons_distinguish_lookup_failures() {
+        let (cached, reason) = best_cached_prefix(&VecDeque::new(), "new");
+        assert!(cached.is_none());
+        assert_eq!(reason, "cache-empty");
+
+        let cache = VecDeque::from([PromptPrefixEntry {
+            rendered: "unrelated".into(),
+            token_ids: vec![10],
+            token_ends: vec![9],
+        }]);
+        let (cached, reason) = best_cached_prefix(&cache, "different");
+        assert!(cached.is_none());
+        assert_eq!(reason, "no-shared-block-start");
+
+        let rendered = "prefix<|im_start|>old";
+        let cache = VecDeque::from([PromptPrefixEntry {
+            rendered: rendered.into(),
+            token_ids: vec![10],
+            token_ends: vec![rendered.len()],
+        }]);
+        let (cached, reason) = best_cached_prefix(&cache, "prefix<|im_start|>new");
+        assert!(cached.is_none());
+        assert_eq!(reason, "block-start-not-token-end");
     }
 }

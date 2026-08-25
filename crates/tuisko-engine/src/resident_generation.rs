@@ -8,7 +8,7 @@ use crate::{
 #[cfg(feature = "qualification")]
 use crate::{Sampler, SamplingOptions};
 use std::sync::Arc;
-use tuisko_frontend::{GenerationDefaults, TextFrontend};
+use tuisko_frontend::{GenerationDefaults, PromptEncodingMetrics, TextFrontend};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
@@ -72,6 +72,8 @@ pub struct ResidentBatchAdmission {
     pub device_reused_tokens: usize,
     /// Prompt tokens processed by exact whole-model prefill graphs.
     pub native_prefill_tokens: usize,
+    /// Observation-only frontend timing and prefix-lookup detail.
+    pub prompt_metrics: PromptEncodingMetrics,
     /// Immediate output for a request with `max_new_tokens == 0`.
     pub completed: Option<GeneratedText>,
 }
@@ -651,12 +653,14 @@ impl ResidentBatchGenerator {
             .checked_add(1)
             .ok_or_else(|| EngineError::generation("resident request identity overflows"))?;
         let prompt_tokens = control.prompt_token_ids().len();
+        let prompt_metrics = control.prompt_metrics().clone();
         if control.finish_reason().is_some() {
             return Ok(ResidentBatchAdmission {
                 request_id,
                 prompt_tokens,
                 device_reused_tokens: 0,
                 native_prefill_tokens: 0,
+                prompt_metrics,
                 completed: Some(control.into_output()?),
             });
         }
@@ -710,6 +714,7 @@ impl ResidentBatchGenerator {
             prompt_tokens,
             device_reused_tokens,
             native_prefill_tokens,
+            prompt_metrics,
             completed: None,
         })
     }
@@ -1076,6 +1081,16 @@ impl Qwen35ResidentGenerationSession<'_> {
         self.control.generated_token_ids()
     }
 
+    /// Prompt encoding and frontend prefix-cache accounting.
+    pub const fn prompt_encoding(&self) -> &tuisko_frontend::PromptEncoding {
+        self.control.prompt_encoding()
+    }
+
+    /// Observation-only frontend timing and prefix-lookup detail.
+    pub const fn prompt_metrics(&self) -> &PromptEncodingMetrics {
+        self.control.prompt_metrics()
+    }
+
     /// Current terminal state.
     pub const fn finish_reason(&self) -> Option<FinishReason> {
         self.control.finish_reason()
@@ -1114,6 +1129,16 @@ impl Qwen36ResidentGenerationSession<'_> {
     /// Tokens selected so far, including an unprocessed final token.
     pub fn generated_token_ids(&self) -> &[u32] {
         self.control.generated_token_ids()
+    }
+
+    /// Prompt encoding and frontend prefix-cache accounting.
+    pub const fn prompt_encoding(&self) -> &tuisko_frontend::PromptEncoding {
+        self.control.prompt_encoding()
+    }
+
+    /// Observation-only frontend timing and prefix-lookup detail.
+    pub const fn prompt_metrics(&self) -> &PromptEncodingMetrics {
+        self.control.prompt_metrics()
     }
 
     /// Prompt tokens processed by one exact from-empty whole-model prefill graph.

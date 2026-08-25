@@ -40,6 +40,13 @@ Blocking usage and the final optional SSE usage chunk report exact retained-pref
 `prompt_tokens_details.cached_tokens`; the count comes from the resident prompt owner rather than
 an HTTP timing inference.
 
+Every admitted request emits one terminal stderr line with its numeric request ID, server-relative
+admission time, queue-inclusive wall time and TTFT, prompt/generated token counts, resident-device
+prefix reuse, route, frontend render/encode time, BPE-tail work, and finish reason. `cached` is the
+device prefix restored by the resident owner; `bpe-tail` and an optional `miss:` label describe the
+separate frontend prefix lookup. Decode throughput excludes the first generated token and the TTFT
+interval. Cancelled, refused, and failed admitted jobs use the same terminal format.
+
 Passing the pinned Qwen3.5 snapshot selects its concrete 32-layer resident program and greedy
 checkpoint defaults once at startup. It currently serves one request at a time through its B=1
 short-context graph; compact batching and optimized prefill remain separate qualification work.

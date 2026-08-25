@@ -44,6 +44,7 @@ fn run_mode(root: &Path, arguments: &[OsString], long_context: bool) -> Result<(
     let stop = server.stop_and_wait();
     qualification?;
     stop?;
+    validate_request_log(&fs::read_to_string(server.log_path())?)?;
 
     println!(
         "production {command} passed; lifecycle log: {}",
@@ -297,9 +298,35 @@ fn validate_health_response(response: &[u8]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn validate_request_log(log: &str) -> Result<(), Box<dyn Error>> {
+    const REQUIRED: [&str; 10] = [
+        " ms (+",
+        "), prompt ",
+        " tok, cached ",
+        " tok, gen ",
+        " tok, ttft ",
+        " ms, decode ",
+        " tok/s, route ",
+        ", render ",
+        ", encode ",
+        ", bpe-tail ",
+    ];
+    let complete = log.lines().find(|line| {
+        line.starts_with("TuiskoLLM request ")
+            && (line.contains(", finish stop") || line.contains(", finish length"))
+    });
+    let Some(complete) = complete else {
+        return Err("server log omitted a completed request timing line".into());
+    };
+    if let Some(missing) = REQUIRED.iter().find(|marker| !complete.contains(**marker)) {
+        return Err(format!("server request timing line omitted `{missing}`: {complete}").into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_health_response;
+    use super::{validate_health_response, validate_request_log};
 
     #[test]
     fn health_probe_requires_the_exact_ready_route() {
@@ -321,5 +348,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("503 Service Unavailable"));
+    }
+
+    #[test]
+    fn production_log_requires_one_complete_request_timing_line() {
+        validate_request_log(
+            "startup\nTuiskoLLM request 4: 12 ms (+120.0 ms), prompt 10 tok, cached 5 tok (50.0%), input 5 tok, gen 3 tok, ttft 80.0 ms, decode 50.0 tok/s, route mtp-draft-3, render 1.0 ms, encode 2.0 ms, bpe-tail 4 tok, finish length\n",
+        )
+        .unwrap();
+        let error = validate_request_log("startup only\n").unwrap_err();
+        assert!(error.to_string().contains("completed request timing line"));
     }
 }
