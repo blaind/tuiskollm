@@ -100,28 +100,24 @@ mod mtp_prompt_prime;
 mod mtp_prompt_prime_benchmark;
 #[cfg(feature = "sm89")]
 mod nvfp4_down;
-#[cfg(feature = "device")]
-#[path = "nvfp4_down_sm120.rs"]
-mod nvfp4_down;
 #[cfg(feature = "sm89")]
 mod nvfp4_down_benchmark;
 #[cfg(feature = "device")]
-#[path = "nvfp4_down_benchmark_sm120.rs"]
-mod nvfp4_down_benchmark;
+mod nvfp4_down_benchmark_sm120;
+#[cfg(feature = "device")]
+mod nvfp4_down_sm120;
 #[cfg(feature = "device")]
 mod nvfp4_mlp;
 #[cfg(feature = "device")]
 mod nvfp4_mlp_benchmark;
 #[cfg(any(feature = "sm89", feature = "sm86"))]
 mod nvfp4_swiglu;
-#[cfg(feature = "device")]
-#[path = "nvfp4_swiglu_sm120.rs"]
-mod nvfp4_swiglu;
 #[cfg(any(feature = "sm89", feature = "sm86"))]
 mod nvfp4_swiglu_benchmark;
 #[cfg(feature = "device")]
-#[path = "nvfp4_swiglu_benchmark_sm120.rs"]
-mod nvfp4_swiglu_benchmark;
+mod nvfp4_swiglu_benchmark_sm120;
+#[cfg(feature = "device")]
+mod nvfp4_swiglu_sm120;
 #[cfg(feature = "device")]
 mod paged_gqa;
 #[cfg(feature = "device")]
@@ -433,22 +429,34 @@ pub use mtp_prompt_prime::{
 };
 #[cfg(feature = "device")]
 pub use mtp_prompt_prime_benchmark::benchmark_mtp_prompt_prime;
-#[cfg(any(feature = "device", feature = "sm89"))]
+#[cfg(feature = "sm89")]
 pub use nvfp4_down::{Nvfp4DownQualification, Nvfp4DownQualificationError, qualify_nvfp4_down};
-#[cfg(any(feature = "device", feature = "sm89"))]
+#[cfg(feature = "sm89")]
 pub use nvfp4_down_benchmark::benchmark_nvfp4_down;
+#[cfg(feature = "device")]
+pub use nvfp4_down_benchmark_sm120::benchmark_nvfp4_down;
+#[cfg(feature = "device")]
+pub use nvfp4_down_sm120::{
+    Nvfp4DownQualification, Nvfp4DownQualificationError, qualify_nvfp4_down,
+};
 #[cfg(feature = "device")]
 pub use nvfp4_mlp::{
     Nvfp4MlpQualification, Nvfp4MlpQualificationError, qualify_nvfp4_mlp, qualify_qwen35_nvfp4_mlp,
 };
 #[cfg(feature = "device")]
 pub use nvfp4_mlp_benchmark::benchmark_nvfp4_mlp;
-#[cfg(any(feature = "device", feature = "sm89", feature = "sm86"))]
+#[cfg(any(feature = "sm89", feature = "sm86"))]
 pub use nvfp4_swiglu::{
     Nvfp4SwiGluQualification, Nvfp4SwiGluQualificationError, qualify_nvfp4_swiglu,
 };
-#[cfg(any(feature = "device", feature = "sm89", feature = "sm86"))]
+#[cfg(any(feature = "sm89", feature = "sm86"))]
 pub use nvfp4_swiglu_benchmark::benchmark_nvfp4_swiglu;
+#[cfg(feature = "device")]
+pub use nvfp4_swiglu_benchmark_sm120::benchmark_nvfp4_swiglu;
+#[cfg(feature = "device")]
+pub use nvfp4_swiglu_sm120::{
+    Nvfp4SwiGluQualification, Nvfp4SwiGluQualificationError, qualify_nvfp4_swiglu,
+};
 #[cfg(feature = "device")]
 pub use paged_gqa::{
     PagedGqaQualification, PagedGqaQualificationError, qualify_mtp_bf16_paged_gqa,

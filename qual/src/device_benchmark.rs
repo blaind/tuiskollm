@@ -1740,11 +1740,7 @@ fn metric(
     }
 
     samples.sort_by(f64::total_cmp);
-    let percentile = |numerator: usize| {
-        let index = (samples.len() - 1) * numerator / 10;
-        samples[index]
-    };
-    let median = percentile(5);
+    let median = percentile(&samples, 5);
     let logical_bytes_per_operation = case.logical_bytes as u64;
     let logical_gib_per_second = measurement.is_device().then(|| {
         logical_bytes_per_operation as f64 / median / (1024.0 * 1024.0 * 1024.0) * 1_000_000.0
@@ -1765,12 +1761,18 @@ fn metric(
         workload: case.workload.clone(),
         measurement,
         median_microseconds: median,
-        p10_microseconds: percentile(1),
-        p90_microseconds: percentile(9),
+        p10_microseconds: percentile(&samples, 1),
+        p90_microseconds: percentile(&samples, 9),
         operations_per_interval,
         logical_bytes_per_operation,
         logical_gib_per_second,
     })
+}
+
+/// Floor-rank percentile at `tenths / 10` over ascending samples, the convention
+/// every blessed performance baseline was produced with.
+pub(crate) fn percentile(sorted: &[f64], tenths: usize) -> f64 {
+    sorted[(sorted.len() - 1) * tenths / 10]
 }
 
 pub(crate) fn host_completion_metric(
@@ -1791,18 +1793,14 @@ pub(crate) fn host_completion_metric(
         )));
     }
     samples.sort_by(f64::total_cmp);
-    let percentile = |numerator: usize| {
-        let index = (samples.len() - 1) * numerator / 10;
-        samples[index]
-    };
     Ok(DeviceBenchmarkMetric {
         route,
         shape,
         workload,
         measurement: BenchmarkMeasurement::HostCompletion,
-        median_microseconds: percentile(5),
-        p10_microseconds: percentile(1),
-        p90_microseconds: percentile(9),
+        median_microseconds: percentile(&samples, 5),
+        p10_microseconds: percentile(&samples, 1),
+        p90_microseconds: percentile(&samples, 9),
         operations_per_interval,
         logical_bytes_per_operation,
         logical_gib_per_second: None,

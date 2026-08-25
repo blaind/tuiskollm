@@ -1,7 +1,7 @@
 //! Qwen3.5 recurrent-output NVFP4 projection qualification.
 
 use crate::device_benchmark;
-use crate::nvfp4_down::bf16_to_f32;
+use crate::nvfp4_down_sm120::bf16_to_f32;
 use crate::qwen35_nvfp4_attention_output::{
     CODE_BYTES_PER_ROW, COLUMNS, EXACT_ROUTES, Fixture, GROUPS_PER_ROW, INPUT_SCALE_DIVISOR,
     MAX_BATCH, MAX_ROWS, OUTPUT_ROWS, WEIGHT_SCALE_DIVISOR, dot_oracle_for_rows, make_fixture,

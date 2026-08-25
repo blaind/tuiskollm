@@ -1,7 +1,7 @@
 //! Source-backed qualification for the complete resident Qwen3.6 text model.
 
 use crate::fp8_projection_oracle::{BF16_SENTINEL, BYTE_SENTINEL, bf16_to_f32};
-use crate::nvfp4_down::{decode_e2m1, decode_e4m3fn};
+use crate::nvfp4_down_sm120::{decode_e2m1, decode_e4m3fn};
 use crate::residual_norm::rms_norm_oracle;
 use crate::{DeviceBenchmarkError, device_benchmark};
 use std::path::Path;
