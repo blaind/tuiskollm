@@ -1,5 +1,6 @@
 //! Exact target-residual handoff and prompt priming for the Qwen3.8 MTP layer.
 
+use crate::common::math::product;
 use crate::qwen38::mtp_prompt_prime_layout::{
     MTP_PROMPT_TILE_CAPACITY, MtpPromptPrimeLayout, MtpPromptPrimeRegions,
 };
@@ -805,11 +806,6 @@ fn cache_page_values() -> EngineResult<usize> {
         )?,
         Qwen38_27B::HEAD_DIM,
     )
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Resident source-backed Qwen3.6 GDN plus MoE decoder layer.
 
+use crate::common::math::product;
 use crate::qwen36::gdn_moe_layer_layout::{QWEN36_GDN_MAX_ROWS, Qwen36GdnMoeLayerRegions};
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen36GdnMoeLayerLayout};
 use std::sync::Arc;
@@ -1156,11 +1157,6 @@ fn require_rows(rows: usize) -> EngineResult<()> {
     Err(EngineError::route(format!(
         "Qwen3.6 GDN/MoE row count {rows} is outside 1..={MAX_BATCH},32,64,128"
     )))
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

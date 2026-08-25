@@ -1,5 +1,6 @@
 //! Resident source-backed dense-FP8 MLP program.
 
+use crate::common::math::checked_product;
 use crate::qwen38::dense_fp8_mlp_layout::MAX_ROWS;
 use crate::{DenseFp8MlpLayout, EngineError, EngineResult, MAX_BATCH};
 use std::marker::PhantomData;
@@ -663,11 +664,6 @@ fn require_rows(rows: usize) -> EngineResult<()> {
     }
 
     Ok(())
-}
-
-fn checked_product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

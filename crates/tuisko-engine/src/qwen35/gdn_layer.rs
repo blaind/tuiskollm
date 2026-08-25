@@ -1,5 +1,6 @@
 //! Resident source-backed Qwen3.5 GDN decoder layer.
 
+use crate::common::math::product;
 use crate::qwen35::gdn_layer_layout::{QWEN35_GDN_MAX_ROWS, Qwen35GdnLayerRegions};
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen35GdnLayerLayout};
 use std::sync::Arc;
@@ -1404,11 +1405,6 @@ fn route_name(rows: usize) -> String {
     } else {
         format!("T={rows}")
     }
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Resident source-backed Qwen3.5 full-attention layer.
 
+use crate::common::math::product;
 use crate::qwen35::full_attention_layer_layout::{
     QWEN35_ATTENTION_MAX_ROWS, QWEN35_PREFILL_TABLE_STRIDE, QWEN35_TABLE_STRIDE,
     Qwen35FullAttentionLayerRegions,
@@ -1543,11 +1544,6 @@ fn route_name(rows: usize) -> String {
     } else {
         format!("T={rows}")
     }
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

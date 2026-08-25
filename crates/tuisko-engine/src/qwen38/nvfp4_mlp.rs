@@ -1,5 +1,6 @@
 //! Resident source-backed NVFP4 MLP program.
 
+use crate::common::math::checked_product;
 use crate::qwen38::nvfp4_mlp_layout::MAX_ROWS;
 use crate::{EngineError, EngineResult, MAX_BATCH, Nvfp4MlpLayout};
 use std::marker::PhantomData;
@@ -628,11 +629,6 @@ const fn prefill_index(rows: usize) -> Option<usize> {
         MAX_ROWS => Some(3),
         _ => None,
     }
-}
-
-fn checked_product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

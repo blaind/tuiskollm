@@ -1,5 +1,6 @@
 //! Resident long-context ownership for the exact Qwen3.8 MTP layer.
 
+use crate::common::math::product;
 use crate::qwen38::resident_mtp_layout::{
     MTP_PROMPT_ROWS, ResidentMtpCacheRegions, ResidentMtpRegions,
 };
@@ -2246,11 +2247,6 @@ fn copy_embedding_row(source: &[u8], token: usize, destination: &mut [u16]) -> E
         *target = u16::from_le_bytes(*bytes);
     }
     Ok(())
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 fn elapsed_ns(phase: &str, started: Instant) -> EngineResult<u64> {

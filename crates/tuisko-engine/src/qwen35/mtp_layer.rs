@@ -1,5 +1,6 @@
 //! Resident source-backed Qwen3.5 MTP transformer layer.
 
+use crate::common::math::product;
 use crate::qwen35::mtp_layer_layout::{
     QWEN35_MTP_PHYSICAL_PAGES, QWEN35_MTP_PROMPT_ROWS, QWEN35_MTP_TABLE_STRIDE,
     Qwen35MtpLayerRegions,
@@ -1256,11 +1257,6 @@ fn require_rows_or_prompt(rows: usize) -> EngineResult<()> {
             "Qwen3.5 MTP rows {rows} are outside 1..={MAX_BATCH},32,64,128"
         )))
     }
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 fn little_endian_words(bytes: &[u8]) -> EngineResult<Vec<u16>> {

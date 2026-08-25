@@ -1,5 +1,6 @@
 //! Resident composition of every Qwen3.6 text layer and endpoint.
 
+use crate::common::math::{checked_sum, product, sum_products};
 use crate::qwen36::long_context_kv::Qwen36AttentionKvBinding;
 use crate::{
     EngineError, EngineResult, MAX_BATCH, Qwen36FullAttentionLayerLayout,
@@ -965,22 +966,6 @@ fn require_prefill(tokens: usize) -> EngineResult<()> {
     Err(EngineError::route(format!(
         "Qwen3.6 resident prefill token count {tokens} is outside 32,64,128"
     )))
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn checked_sum(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_add(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn sum_products(name: &str, terms: &[(usize, usize)]) -> EngineResult<usize> {
-    terms.iter().try_fold(0usize, |total, &(count, bytes)| {
-        checked_sum(name, total, product(name, count, bytes)?)
-    })
 }
 
 #[cfg(test)]

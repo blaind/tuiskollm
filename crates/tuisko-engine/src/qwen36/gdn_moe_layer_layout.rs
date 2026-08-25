@@ -1,5 +1,6 @@
 //! Single-allocation layout for one Qwen3.6 GDN plus MoE decoder layer.
 
+use crate::common::math::{product, sum};
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::{Arch, Qwen36Moe35B};
@@ -349,19 +350,6 @@ fn require_geometry() -> EngineResult<()> {
     }
 
     Ok(())
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {
-    values.iter().try_fold(0usize, |total, &value| {
-        total
-            .checked_add(value)
-            .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-    })
 }
 
 #[cfg(test)]

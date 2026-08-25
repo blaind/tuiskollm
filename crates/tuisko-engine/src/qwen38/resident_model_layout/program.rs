@@ -7,6 +7,7 @@ use super::{
 };
 #[cfg(feature = "qualification")]
 use crate::PagedKvSlotState;
+use crate::common::math::{bf16_to_f32, product};
 use crate::qwen38::long_context_kv_layout::LayerKvRegions;
 use crate::qwen38::resident_mtp::ResidentMtpArenaReservation;
 use crate::{
@@ -6684,10 +6685,6 @@ fn copy_embedding_row(source: &[u8], token: usize, destination: &mut [u16]) -> E
     Ok(())
 }
 
-fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
-}
-
 fn require_batch(batch: usize) -> EngineResult<()> {
     if !(1..=MAX_BATCH).contains(&batch) {
         return Err(EngineError::route(format!(
@@ -6713,11 +6710,6 @@ fn measure_preparation<T>(
         .checked_add(elapsed_ns(phase, started)?)
         .ok_or_else(|| EngineError::layout(format!("{phase} timing overflows")))?;
     result
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Resident source-backed Qwen3.6 MTP transformer layer.
 
+use crate::common::math::product;
 use crate::qwen36::mtp_layer_layout::{
     QWEN36_MTP_PHYSICAL_PAGES, QWEN36_MTP_PROMPT_ROWS, QWEN36_MTP_TABLE_STRIDE,
     Qwen36MtpLayerRegions,
@@ -1314,11 +1315,6 @@ fn require_rows_or_prompt(rows: usize) -> EngineResult<()> {
             "Qwen3.6 MTP rows {rows} are outside 1..={MAX_BATCH},32,64,128"
         )))
     }
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(feature = "qualification")]

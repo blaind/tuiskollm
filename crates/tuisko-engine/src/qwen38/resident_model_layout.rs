@@ -19,6 +19,7 @@ pub use upload_plan::{
     ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
 };
 
+use crate::common::math::{checked_sum, product};
 use crate::{
     EngineError, EngineResult, KvCacheCodec, MAX_BATCH, SharedPagedKvLayout,
     qwen38::long_context_kv_layout::MAX_CONTEXT_TOKENS,
@@ -967,16 +968,6 @@ fn gdn_state_bytes() -> EngineResult<usize> {
         )?,
         size_of::<f32>(),
     )
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn checked_sum(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_add(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

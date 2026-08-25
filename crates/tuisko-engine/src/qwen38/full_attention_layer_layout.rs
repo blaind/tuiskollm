@@ -1,6 +1,7 @@
 //! Single-allocation layout for one late dense-FP8 full-attention decoder layer.
 
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::common::math::{product, sum};
+use crate::{EngineResult, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES};
 use tuisko_model::Arch;
@@ -286,19 +287,6 @@ impl FullAttentionLayerLayout {
     pub const fn prefill_context_capacity(&self) -> usize {
         PREFILL_CONTEXT_CAPACITY
     }
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {
-    values.iter().try_fold(0usize, |total, &value| {
-        total
-            .checked_add(value)
-            .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-    })
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Resident text inference ownership.
 
+mod common;
 mod error;
 mod generation;
 mod layout;

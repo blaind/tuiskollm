@@ -1,5 +1,6 @@
 //! Resident source-backed Qwen3.5 NVFP4 MLP program.
 
+use crate::common::math::checked_product;
 #[cfg(feature = "qualification")]
 use crate::qwen38::nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
 use crate::{EngineError, EngineResult, MAX_BATCH, Nvfp4MlpLayout};
@@ -524,11 +525,6 @@ fn require_batch(batch: usize) -> EngineResult<()> {
     }
 
     Ok(())
-}
-
-fn checked_product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

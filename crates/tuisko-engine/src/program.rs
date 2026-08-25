@@ -1,5 +1,6 @@
 //! Resident final-normalization and LM-head program.
 
+use crate::common::math::checked_product;
 use crate::{EndpointLayout, EngineError, EngineResult, MAX_BATCH};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -389,11 +390,6 @@ fn require_batch(batch: usize) -> EngineResult<()> {
     }
 
     Ok(())
-}
-
-fn checked_product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

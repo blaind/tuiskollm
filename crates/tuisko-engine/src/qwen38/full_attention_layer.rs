@@ -1,5 +1,6 @@
 //! Resident source-backed dense-FP8 full-attention decoder layer.
 
+use crate::common::math::{bf16_to_f32, little_endian_words, product};
 use crate::qwen38::full_attention_layer_layout::{
     CONTEXT_CAPACITY, FullAttentionLayerRegions, MAX_ROWS, PREFILL_TABLE_STRIDE, TABLE_STRIDE,
 };
@@ -1164,29 +1165,6 @@ fn require_rows(rows: usize) -> EngineResult<()> {
     }
 
     Ok(())
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn little_endian_words(bytes: &[u8]) -> EngineResult<Vec<u16>> {
-    if !bytes.len().is_multiple_of(2) {
-        return Err(EngineError::layout(
-            "BF16 source plane has an odd byte length",
-        ));
-    }
-    Ok(bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|word| u16::from_le_bytes(*word))
-        .collect())
-}
-
-const fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
 }
 
 #[cfg(test)]

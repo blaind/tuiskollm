@@ -1,6 +1,7 @@
 //! Address-stable text-endpoint layout.
 
-use crate::{EngineError, EngineResult};
+use crate::EngineResult;
+use crate::common::math::{product, sum};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::Arch;
 
@@ -131,19 +132,6 @@ impl EndpointLayout {
     pub(crate) const fn logits(&self) -> ArenaRegion<u16> {
         self.logits
     }
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {
-    values.iter().try_fold(0usize, |total, &value| {
-        total
-            .checked_add(value)
-            .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-    })
 }
 
 #[cfg(test)]

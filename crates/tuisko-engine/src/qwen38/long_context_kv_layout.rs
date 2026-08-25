@@ -3,6 +3,7 @@
 //! The NVFP4 variant reserves the future represented planes only. Selecting that
 //! layout does not admit an append or attention execution route.
 
+use crate::common::math::{checked_sum, product};
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -483,16 +484,6 @@ fn require_exact_geometry() -> EngineResult<()> {
     }
 
     Ok(())
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn checked_sum(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_add(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

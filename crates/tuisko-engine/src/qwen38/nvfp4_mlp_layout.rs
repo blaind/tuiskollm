@@ -1,5 +1,6 @@
 //! Single-allocation layout for one resident NVFP4 MLP boundary.
 
+use crate::common::math::product;
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::Arch;
@@ -250,11 +251,6 @@ fn require_geometry<A: Arch>() -> EngineResult<()> {
     }
 
     Ok(())
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {

@@ -1,5 +1,6 @@
 //! Resident source-backed Qwen3.6 full-attention plus MoE decoder layer.
 
+use crate::common::math::product;
 use crate::qwen36::full_attention_layer_layout::{
     QWEN36_MAX_ROWS, QWEN36_PREFILL_TABLE_STRIDE, QWEN36_TABLE_STRIDE,
     Qwen36FullAttentionLayerRegions,
@@ -1378,11 +1379,6 @@ fn require_rows(rows: usize) -> EngineResult<()> {
     Err(EngineError::route(format!(
         "Qwen3.6 full-attention row count {rows} is outside 1..={MAX_BATCH},32,64,128"
     )))
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]
