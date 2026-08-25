@@ -182,16 +182,14 @@ impl<'a> VisionBindings<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::test_support::sources::{
-        TestArch, append_bf16_tensor, fixture_path, write_safetensors_payload,
-    };
+    use crate::common::test_builder::SafeTensorTestBuilder;
+    use crate::common::test_support::sources::{TestArch, fixture_path, write_safetensors_payload};
     use crate::{CheckpointErrorCode, SafeTensorFile};
-    use serde_json::{Value, json};
+    use serde_json::json;
     use std::fs;
 
-    fn vision_fixture() -> (Value, Vec<u8>) {
-        let mut header = serde_json::Map::new();
-        let mut payload = Vec::new();
+    fn vision_fixture() -> SafeTensorTestBuilder {
+        let mut fixture = SafeTensorTestBuilder::new();
 
         for block in 0..TestArch::VISION_DEPTH {
             let prefix = format!("model.visual.blocks.{block}");
@@ -210,12 +208,7 @@ mod tests {
                 ("norm2.bias", vec![4]),
                 ("norm2.weight", vec![4]),
             ] {
-                append_bf16_tensor(
-                    &mut header,
-                    &mut payload,
-                    format!("{prefix}.{suffix}"),
-                    shape,
-                );
+                fixture.add_bf16_ordinal(format!("{prefix}.{suffix}"), &shape);
             }
         }
 
@@ -230,17 +223,16 @@ mod tests {
             ("model.visual.patch_embed.proj.weight", vec![4, 3, 2, 2, 2]),
             ("model.visual.pos_embed.weight", vec![8, 4]),
         ] {
-            append_bf16_tensor(&mut header, &mut payload, name, shape);
+            fixture.add_bf16_ordinal(name, &shape);
         }
 
-        (Value::Object(header), payload)
+        fixture
     }
 
     #[test]
     fn binds_complete_vision_source_contract() {
         let path = fixture_path("vision");
-        let (header, payload) = vision_fixture();
-        write_safetensors_payload(&path, header, &payload);
+        vision_fixture().write(&path);
         let file = SafeTensorFile::open(&path).unwrap();
         let bindings = VisionBindings::bind_from::<TestArch>(|name| file.tensor(name)).unwrap();
 
@@ -300,7 +292,7 @@ mod tests {
             ),
         ] {
             let path = fixture_path(label);
-            let (mut header, payload) = vision_fixture();
+            let (mut header, payload) = vision_fixture().into_parts();
 
             if dtype_mismatch {
                 header[tensor_name]["dtype"] = json!("F32");
