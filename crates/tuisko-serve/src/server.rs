@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
 use tokio::sync::oneshot;
 use tuisko_engine::{
-    EngineError, GenerationStep, MAX_BATCH, Qwen35ResidentBatchGenerator,
+    EngineError, GenerationStep, MAX_BATCH, Qwen35ResidentMtpBatchGenerator,
     Qwen36ResidentTextGenerator, ResidentBatchAdmission, ResidentLoadPhase, ResidentLoadProgress,
     ResidentMtpBatchGenerator, ResidentRequestId,
 };
@@ -36,7 +36,7 @@ const DEFAULT_SEED_SCRAMBLE: u64 = 0x9e37_79b9_7f4a_7c15;
 // lane is treated exactly like a disconnected one.
 const GENERATION_REPLY_BUFFER: usize = 32;
 const MTP_GENERATION_ROUTE: &str = "mtp-draft-3";
-const COMPACT_GENERATION_ROUTE: &str = "compact-b1-8";
+const QWEN35_MTP_GENERATION_ROUTE: &str = "mtp-b1-compact-b2-8";
 const SINGLE_TOKEN_GENERATION_ROUTE: &str = "single-token";
 
 /// Startup configuration for the one exact resident server.
@@ -146,7 +146,7 @@ impl ResidentTarget {
     const fn generation_route(self) -> &'static str {
         match self {
             Self::Qwen38 => MTP_GENERATION_ROUTE,
-            Self::Qwen35 => COMPACT_GENERATION_ROUTE,
+            Self::Qwen35 => QWEN35_MTP_GENERATION_ROUTE,
             Self::Qwen36 => SINGLE_TOKEN_GENERATION_ROUTE,
         }
     }
@@ -441,8 +441,8 @@ fn qwen35_engine_worker(
         let checkpoint_admission = checkpoint_start.elapsed();
         let tensor_count = snapshot.tensor_count();
         let load_start = Instant::now();
-        let generator = Qwen35ResidentBatchGenerator::from_snapshot_device_zero(snapshot)
-            .map_err(|error| format!("loading the resident Qwen3.5 text program: {error}"))?;
+        let generator = Qwen35ResidentMtpBatchGenerator::from_snapshot_device_zero(snapshot)
+            .map_err(|error| format!("loading the resident Qwen3.5 MTP program: {error}"))?;
         let resident_load = load_start.elapsed();
         let device_name = generator
             .context()
@@ -532,12 +532,13 @@ fn qwen35_engine_worker(
         };
         for event in events.iter() {
             let failed = replies.get_mut(&event.request_id).is_some_and(|reply| {
-                if event.step.delta.is_some() {
+                if event.steps().any(|step| step.delta.is_some()) {
                     reply.log.observe_output();
                 }
-                reply.sender.as_ref().is_none_or(|sender| {
-                    !try_send_generation_steps(sender, core::iter::once(&event.step))
-                })
+                reply
+                    .sender
+                    .as_ref()
+                    .is_none_or(|sender| !try_send_generation_steps(sender, event.steps()))
             });
             if failed && let Some(reply) = replies.get_mut(&event.request_id) {
                 reply.sender = None;
@@ -864,7 +865,7 @@ fn admit_job(
 }
 
 fn admit_qwen35_job(
-    generator: &mut Qwen35ResidentBatchGenerator,
+    generator: &mut Qwen35ResidentMtpBatchGenerator,
     replies: &mut HashMap<ResidentRequestId, ActiveReply>,
     job: Job,
 ) {
@@ -956,7 +957,7 @@ fn cancel_disconnected(
 }
 
 fn cancel_qwen35_disconnected(
-    generator: &mut Qwen35ResidentBatchGenerator,
+    generator: &mut Qwen35ResidentMtpBatchGenerator,
     replies: &mut HashMap<ResidentRequestId, ActiveReply>,
 ) -> Result<(), String> {
     let cancelled = generator
@@ -1325,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_startup_reports_aggregate_loading_and_compact_slots() {
+    fn qwen35_startup_reports_mtp_compact_route_and_slots() {
         let ready = Ready {
             model_id: Qwen35_9B::MODEL_ID,
             generation_route: ResidentTarget::Qwen35.generation_route(),
@@ -1359,7 +1360,7 @@ mod tests {
 
         assert_eq!(lines.len(), 4);
         assert!(lines[2].contains("725.0 ms · 6.00 GiB weights and graphs"));
-        assert!(lines[3].contains("compact-b1-8 · 8 slots · context 192"));
+        assert!(lines[3].contains("mtp-b1-compact-b2-8 · 8 slots · context 192"));
         assert!(!output.contains("source pages"));
     }
 
@@ -1531,7 +1532,7 @@ mod tests {
                 Qwen35_9B::REVISION,
                 ResidentTarget::Qwen35,
                 Qwen35_9B::MODEL_ID,
-                "compact-b1-8",
+                "mtp-b1-compact-b2-8",
             ),
             (
                 Qwen36Moe35B::REVISION,
