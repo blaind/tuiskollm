@@ -675,11 +675,45 @@ fn verify_qk_prepare(
         }
     }
 
-    compare_exact("BF16 key cache", &observed.key_pages, &expected_key)?;
+    compare_bf16_adjacent(
+        "BF16 key cache",
+        &observed.key_pages,
+        &expected_key,
+        &mut report.maximum_absolute_error,
+    )?;
     compare_exact("BF16 value cache", &observed.value_pages, &expected_value)?;
     report.qk_values +=
         rows * (Qwen35_9B::ATTENTION_OUTPUT_COLUMNS + 2 * Qwen35_9B::ATTENTION_KV_ROWS);
 
+    Ok(())
+}
+
+fn compare_bf16_adjacent(
+    role: &str,
+    actual: &[u16],
+    expected: &[u16],
+    maximum: &mut f32,
+) -> Result<(), Qwen35FullAttentionLayerQualificationError> {
+    if actual.len() != expected.len() {
+        return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
+            format!(
+                "{role} has {} values, expected {}",
+                actual.len(),
+                expected.len()
+            ),
+        ));
+    }
+    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        let error = (bf16_to_f32(actual) - bf16_to_f32(expected)).abs();
+        *maximum = maximum.max(error);
+        if actual != expected && actual.abs_diff(expected) > 1 {
+            return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
+                format!(
+                    "{role} differs by more than one adjacent BF16 value at {index}: actual=0x{actual:04x}, expected=0x{expected:04x}"
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1415,7 +1449,7 @@ fn require_close(
 mod tests {
     use super::{
         EXACT_ROUTES, Qwen35FullAttentionLayerQualificationError, SOURCE_LAYER, W4A4_BATCHES,
-        qualify_qwen35_full_attention_layer, uses_w4a4,
+        compare_bf16_adjacent, qualify_qwen35_full_attention_layer, uses_w4a4,
     };
 
     #[test]
@@ -1431,6 +1465,23 @@ mod tests {
                 .into_iter()
                 .all(|rows| rows == 2 || uses_w4a4(rows))
         );
+    }
+
+    #[test]
+    fn normalized_bf16_cache_oracle_allows_only_one_adjacent_value() {
+        let mut maximum = 0.0;
+        compare_bf16_adjacent(
+            "key cache",
+            &[0x3f80, 0xbf49],
+            &[0x3f80, 0xbf4a],
+            &mut maximum,
+        )
+        .unwrap();
+        assert_eq!(maximum.to_bits(), (0.003_906_25f32).to_bits());
+
+        let error =
+            compare_bf16_adjacent("key cache", &[0x3f82], &[0x3f80], &mut maximum).unwrap_err();
+        assert!(error.to_string().contains("more than one adjacent BF16"));
     }
 
     #[test]
