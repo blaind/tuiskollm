@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
-use tuisko_provision::{Provisioning, ProvisioningProgress, ProvisioningStage};
+use tuisko_provision::{Provisioning, ProvisioningProgress, ProvisioningStage, SnapshotResolution};
 use tuisko_serve::ServerConfig;
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8000";
@@ -56,12 +56,19 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     let resolution = {
         let mut stdout = stdout.lock();
         let mut display = ProvisioningDisplay::new(interactive, color);
-        let resolution =
-            tuisko_provision::resolve_snapshot_with_progress(args.snapshot, |progress| {
+        let resolution = match args.snapshot {
+            // The worker applies the selected model's exact checkpoint inventory;
+            // provisioning owns only the default Qwen3.8 download manifest.
+            Some(path) => Ok(SnapshotResolution {
+                path,
+                provisioning: None,
+            }),
+            None => tuisko_provision::resolve_snapshot_with_progress(None, |progress| {
                 display
                     .update(&mut stdout, progress)
                     .map_err(|error| format!("writing provisioning progress: {error}"))
-            });
+            }),
+        };
         display
             .finish(&mut stdout)
             .map_err(|error| format!("finishing provisioning progress: {error}"))?;
