@@ -150,6 +150,13 @@ Vision is not part of this stack. Multimodal prompt embeddings may later feed
 the same admitted text transition, but Vision ownership and qualification stay
 separate.
 
+The source-BF16 input fusion, gathered Q/gate/K/V projection, and gated
+attention-output projection now have separate Qwen3.6 `B=1..8` entries plus
+`T=32,64,128` fusion/QKV entries. Their real-snapshot qualification covers the
+complete source formulas, eager/graph agreement, immutable weights, inactive
+regions, stable addresses, and zero post-warmup growth. Q/K preparation and
+paged GQA reuse only the already-qualified Qwen3.6 FP8-cache entries.
+
 ## MR sequence
 
 1. `docs/qwen36-mtp-design`

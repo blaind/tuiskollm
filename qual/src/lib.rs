@@ -402,13 +402,14 @@ pub use long_context_paged_gqa_benchmark::benchmark_long_context_paged_gqa;
 pub use mtp_bf16_attention_output::{
     MtpBf16AttentionOutputQualification, MtpBf16AttentionOutputQualificationError,
     qualify_mtp_bf16_attention_output, qualify_qwen35_mtp_bf16_attention_output,
+    qualify_qwen36_mtp_bf16_attention_output,
 };
 #[cfg(feature = "device")]
 pub use mtp_bf16_attention_output_benchmark::benchmark_mtp_bf16_attention_output;
 #[cfg(feature = "device")]
 pub use mtp_bf16_fusion::{
     MtpBf16FusionQualification, MtpBf16FusionQualificationError, qualify_mtp_bf16_fusion,
-    qualify_qwen35_mtp_bf16_fusion,
+    qualify_qwen35_mtp_bf16_fusion, qualify_qwen36_mtp_bf16_fusion,
 };
 #[cfg(feature = "device")]
 pub use mtp_bf16_fusion_benchmark::benchmark_mtp_bf16_fusion;
@@ -422,7 +423,7 @@ pub use mtp_bf16_mlp_benchmark::benchmark_mtp_bf16_mlp;
 #[cfg(feature = "device")]
 pub use mtp_bf16_qkv::{
     MtpBf16QkvQualification, MtpBf16QkvQualificationError, qualify_mtp_bf16_qkv,
-    qualify_qwen35_mtp_bf16_qkv,
+    qualify_qwen35_mtp_bf16_qkv, qualify_qwen36_mtp_bf16_qkv,
 };
 #[cfg(feature = "device")]
 pub use mtp_bf16_qkv_benchmark::benchmark_mtp_bf16_qkv;

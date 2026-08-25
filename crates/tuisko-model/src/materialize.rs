@@ -9,7 +9,7 @@ use crate::{
     ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4LinearBindings,
     ModelOptNvfp4MlpBindings, MtpBindings, Nvfp4DownBindings, Nvfp4GateUpBindings,
     Qwen36Fp8LinearBindings, Qwen36FullAttentionBindings, Qwen36GdnBindings, Qwen36Moe35B,
-    Qwen36MoeExpertBindings, Qwen36MoeLayerBindings, Qwen36TextEndpointBindings,
+    Qwen36MoeExpertBindings, Qwen36MoeLayerBindings, Qwen36MtpBindings, Qwen36TextEndpointBindings,
 };
 use rayon::prelude::*;
 use std::mem::size_of;
@@ -163,6 +163,47 @@ impl MtpBindings<'_> {
                 self.value_weight.bytes(),
             ],
             "MTP QKV weights",
+        )?;
+
+        Ok(MaterializedMtpQkv {
+            weight_bf16,
+            rows,
+            columns,
+        })
+    }
+}
+
+impl Qwen36MtpBindings<'_> {
+    /// Gathers the non-contiguous draft QKV planes without changing BF16 words.
+    pub fn materialize_qkv(&self) -> CheckpointResult<MaterializedMtpQkv> {
+        let [query_rows, columns] = host_shape(
+            self.query_gate_weight.shape(),
+            "Qwen3.6 MTP query/gate weights",
+        )?;
+        let [key_rows, key_columns] =
+            host_shape(self.key_weight.shape(), "Qwen3.6 MTP key weights")?;
+        let [value_rows, value_columns] =
+            host_shape(self.value_weight.shape(), "Qwen3.6 MTP value weights")?;
+
+        if key_rows != value_rows || columns != key_columns || columns != value_columns {
+            return Err(CheckpointError::source_binding(
+                "Qwen3.6 MTP QKV source planes have incompatible shapes",
+            ));
+        }
+
+        let rows = query_rows
+            .checked_add(key_rows)
+            .and_then(|rows| rows.checked_add(value_rows))
+            .ok_or_else(|| {
+                CheckpointError::source_binding("Qwen3.6 MTP QKV row count overflows")
+            })?;
+        let weight_bf16 = gather_source_planes(
+            [
+                self.query_gate_weight.bytes(),
+                self.key_weight.bytes(),
+                self.value_weight.bytes(),
+            ],
+            "Qwen3.6 MTP QKV weights",
         )?;
 
         Ok(MaterializedMtpQkv {
@@ -1876,7 +1917,7 @@ mod tests {
         ModelOptNvfp4LinearBindings, ModelOptNvfp4MlpBindings, Nvfp4DownBindings,
         Nvfp4GateUpBindings, Qwen35_9B, Qwen36Fp8LinearBindings, Qwen36FullAttentionBindings,
         Qwen36GdnBindings, Qwen36Moe35B, Qwen36MoeExpertBindings, Qwen36MoeLayerBindings,
-        Qwen36TextEndpointBindings, TensorView, U8View,
+        Qwen36MtpBindings, Qwen36TextEndpointBindings, TensorView, U8View,
     };
 
     const ROWS: usize = 128;
@@ -3412,6 +3453,28 @@ mod tests {
         assert_eq!(materialized.post_attention_norm.shape(), &[2_048]);
         assert_eq!(materialized.owned_bytes(), 18_874_368);
         assert_eq!(materialized.layer, 3);
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN36_SNAPSHOT with the pinned complete Qwen3.6 checkpoint"]
+    fn qwen36_mtp_qkv_materializes_losslessly() {
+        let root = std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+            .expect("TUISKO_QWEN36_SNAPSHOT is required for the source-backed gate");
+        let snapshot =
+            CheckpointSnapshot::<Qwen36Moe35B>::open(std::path::Path::new(&root)).unwrap();
+        let bindings = Qwen36MtpBindings::bind(&snapshot).unwrap();
+        let source = [
+            bindings.query_gate_weight.bytes(),
+            bindings.key_weight.bytes(),
+            bindings.value_weight.bytes(),
+        ]
+        .concat();
+        let materialized = bindings.materialize_qkv().unwrap();
+
+        assert_eq!(materialized.weight_bf16, source);
+        assert_eq!(materialized.rows, Qwen36Moe35B::ATTENTION_QKV_ROWS);
+        assert_eq!(materialized.columns, Qwen36Moe35B::HIDDEN);
+        assert_eq!(materialized.weight_bf16.len(), 37_748_736);
     }
 
     #[test]
