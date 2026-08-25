@@ -1,7 +1,8 @@
 //! Compact Qwen3.6 text generation over eight physical persistent-state slots.
 
+use crate::common::rope::text_rope;
 use crate::resident_generation::{
-    device_zero_context, prime_qwen36_prompt, require_generation_capacity, text_rope,
+    device_zero_context, prime_qwen36_prompt, require_generation_capacity,
 };
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, GenerationSession, MAX_BATCH,

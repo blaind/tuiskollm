@@ -1,5 +1,6 @@
 //! Single-slot text generation over the exact resident model owner.
 
+use crate::common::rope::{ROTARY_PAIRS, text_rope};
 use crate::{
     CancelledText, ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
     GenerationSession, GenerationStep, MAX_BATCH, Qwen35ResidentModelProgram,
@@ -12,9 +13,6 @@ use tuisko_frontend::{GenerationDefaults, PromptEncodingMetrics, TextFrontend};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
-const ROTARY_DIM: usize = 64;
-const ROTARY_PAIRS: usize = ROTARY_DIM / 2;
-const ROPE_THETA: f64 = 10_000_000.0;
 const LOGIT_BANK_ROWS: usize = 2 * MAX_BATCH;
 const MAX_NATIVE_PREFILL_TOKENS: usize = 1024;
 const QWEN35_NATIVE_PREFILL_ROUTES: [usize; 3] = [32, 64, 128];
@@ -1511,18 +1509,6 @@ const fn qwen36_native_prefill_tokens(prompt_tokens: usize) -> Option<usize> {
     None
 }
 
-pub(crate) fn text_rope(position: u32) -> ([f32; ROTARY_PAIRS], [f32; ROTARY_PAIRS]) {
-    let mut cosine = [0.0f32; ROTARY_PAIRS];
-    let mut sine = [0.0f32; ROTARY_PAIRS];
-    for pair in 0..ROTARY_PAIRS {
-        let frequency = ROPE_THETA.powf(-((2 * pair) as f64) / ROTARY_DIM as f64);
-        let angle = f64::from(position) * frequency;
-        cosine[pair] = angle.cos() as f32;
-        sine[pair] = angle.sin() as f32;
-    }
-    (cosine, sine)
-}
-
 pub(crate) fn require_generation_capacity(
     prompt_tokens: usize,
     maximum_new_tokens: usize,
@@ -1547,9 +1533,8 @@ pub(crate) fn require_generation_capacity(
 #[cfg(test)]
 mod tests {
     use super::{
-        QWEN35_NATIVE_PREFILL_ROUTES, QWEN36_NATIVE_PREFILL_ROUTES, ROTARY_PAIRS,
-        next_native_prefill_tile, next_qwen35_native_prefill_tile, qwen36_native_prefill_tokens,
-        require_generation_capacity, text_rope,
+        QWEN35_NATIVE_PREFILL_ROUTES, QWEN36_NATIVE_PREFILL_ROUTES, next_native_prefill_tile,
+        next_qwen35_native_prefill_tile, qwen36_native_prefill_tokens, require_generation_capacity,
     };
     use crate::EngineErrorCode;
 
@@ -1567,21 +1552,6 @@ mod tests {
                 Some(EngineErrorCode::Generation)
             );
         }
-    }
-
-    #[test]
-    fn text_rope_uses_the_checkpoint_theta_and_64_wide_pairing() {
-        let (zero_cos, zero_sin) = text_rope(0);
-        assert_eq!(zero_cos, [1.0; ROTARY_PAIRS]);
-        assert_eq!(zero_sin, [0.0; ROTARY_PAIRS]);
-
-        let (cosine, sine) = text_rope(130);
-        let frequency = 10_000_000.0f64.powf(-62.0 / 64.0);
-        let angle = 130.0 * frequency;
-        assert_eq!(cosine[0].to_bits(), (130.0f64.cos() as f32).to_bits());
-        assert_eq!(sine[0].to_bits(), (130.0f64.sin() as f32).to_bits());
-        assert_eq!(cosine[31].to_bits(), (angle.cos() as f32).to_bits());
-        assert_eq!(sine[31].to_bits(), (angle.sin() as f32).to_bits());
     }
 
     #[test]

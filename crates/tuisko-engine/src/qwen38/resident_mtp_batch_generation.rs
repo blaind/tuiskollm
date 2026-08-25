@@ -3,7 +3,8 @@
 use crate::common::mtp::{
     DRAFT_WINDOW, VERIFY_ROWS, decide_sampled_tokens, require_generation_capacity,
 };
-use crate::resident_mtp_generation::{ROTARY_PAIRS, fill_contiguous_rope, prime_prompt, text_rope};
+use crate::common::rope::{ROTARY_PAIRS, fill_contiguous_rope, text_rope};
+use crate::resident_mtp_generation::prime_prompt;
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, GeneratedText, GenerationSession,
     GenerationStep, MAX_BATCH, ResidentBatchAdmission, ResidentCancellation, ResidentLoadProgress,

@@ -1,9 +1,10 @@
 //! Compact Qwen3.5 MTP generation over eight mirrored target/draft slots.
 
 use crate::common::mtp::{DRAFT_WINDOW, VERIFY_ROWS, decide_sampled_tokens};
+use crate::common::rope::fill_contiguous_rope;
+use crate::common::rope::text_rope;
 use crate::qwen35::mtp_generation::prime_qwen35_mtp_prompt;
-use crate::resident_generation::{device_zero_context, require_generation_capacity, text_rope};
-use crate::resident_mtp_generation::fill_contiguous_rope;
+use crate::resident_generation::{device_zero_context, require_generation_capacity};
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, GeneratedText, GenerationSession,
     GenerationStep, MAX_BATCH, Qwen35ResidentMtpProgram, ResidentBatchAdmission,

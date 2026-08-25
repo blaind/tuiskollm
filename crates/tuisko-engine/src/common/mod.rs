@@ -2,3 +2,4 @@
 
 pub(crate) mod math;
 pub(crate) mod mtp;
+pub(crate) mod rope;

@@ -4,6 +4,7 @@ use crate::common::mtp::{
     DRAFT_WINDOW, MAX_NATIVE_PREFILL_TOKENS, ResidentMtpGenerationStats, VERIFY_ROWS,
     decide_sampled_tokens, next_native_prefill_tile, require_generation_capacity,
 };
+use crate::common::rope::{ROTARY_PAIRS, fill_contiguous_rope, text_rope};
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
     GenerationSession, GenerationStep, ResidentMtpProgram, ResidentMtpVerifyRoute,
@@ -14,9 +15,6 @@ use tuisko_frontend::TextFrontend;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
-const ROTARY_DIM: usize = 64;
-pub(crate) const ROTARY_PAIRS: usize = ROTARY_DIM / 2;
-const ROPE_THETA: f64 = 10_000_000.0;
 const LOGIT_ROWS: usize = VERIFY_ROWS + 1;
 
 /// Concrete single-slot owner for exact draft-three generation.
@@ -674,52 +672,6 @@ fn replay_prefill_tile(
         sine,
     )?;
     program.target().replay_prefill(stream, route)
-}
-
-pub(crate) fn fill_contiguous_rope(
-    first_position: usize,
-    rows: usize,
-    cosine: &mut [f32],
-    sine: &mut [f32],
-) -> EngineResult<usize> {
-    if rows == 0 || rows > MAX_NATIVE_PREFILL_TOKENS {
-        return Err(EngineError::route(format!(
-            "resident MTP rotary rows {rows} are outside 1..={MAX_NATIVE_PREFILL_TOKENS}"
-        )));
-    }
-    let values = rows
-        .checked_mul(ROTARY_PAIRS)
-        .ok_or_else(|| EngineError::generation("resident MTP rotary values overflow"))?;
-    if cosine.len() < values || sine.len() < values {
-        return Err(EngineError::layout(format!(
-            "resident MTP rotary destinations have {}/{} values, expected at least {values}",
-            cosine.len(),
-            sine.len()
-        )));
-    }
-    for row in 0..rows {
-        let position = first_position
-            .checked_add(row)
-            .and_then(|position| u32::try_from(position).ok())
-            .ok_or_else(|| EngineError::generation("resident MTP position exceeds u32"))?;
-        let (row_cosine, row_sine) = text_rope(position);
-        let begin = row * ROTARY_PAIRS;
-        cosine[begin..begin + ROTARY_PAIRS].copy_from_slice(&row_cosine);
-        sine[begin..begin + ROTARY_PAIRS].copy_from_slice(&row_sine);
-    }
-    Ok(values)
-}
-
-pub(crate) fn text_rope(position: u32) -> ([f32; ROTARY_PAIRS], [f32; ROTARY_PAIRS]) {
-    let mut cosine = [0.0f32; ROTARY_PAIRS];
-    let mut sine = [0.0f32; ROTARY_PAIRS];
-    for pair in 0..ROTARY_PAIRS {
-        let frequency = ROPE_THETA.powf(-((2 * pair) as f64) / ROTARY_DIM as f64);
-        let angle = f64::from(position) * frequency;
-        cosine[pair] = angle.cos() as f32;
-        sine[pair] = angle.sin() as f32;
-    }
-    (cosine, sine)
 }
 
 fn target_logits(logits: &[u16], row: usize) -> &[u16] {
