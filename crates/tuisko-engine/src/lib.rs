@@ -13,6 +13,11 @@ mod resident_generation;
 mod resident_mtp_generation;
 mod sampling;
 
+#[cfg(feature = "qualification")]
+pub use common::mtp::qualification_decide_sampled_tokens;
+pub use common::mtp::{
+    ResidentMtpGenerationStats, ResidentMtpGreedyStats, ResidentMtpSampledRound,
+};
 pub use error::{EngineError, EngineErrorCode, EngineResult};
 pub use generation::{
     CancelledText, ChatGenerationRequest, FinishReason, GeneratedText, GenerationSession,
@@ -100,12 +105,7 @@ pub use resident_generation::{
     ResidentBatchGenerator, ResidentCancellation, ResidentGenerationSession, ResidentRequestId,
     ResidentTextGenerator,
 };
-#[cfg(feature = "qualification")]
-pub use resident_mtp_generation::qualification_decide_sampled_tokens;
-pub use resident_mtp_generation::{
-    ResidentMtpGenerationSession, ResidentMtpGenerationStats, ResidentMtpGreedyStats,
-    ResidentMtpSampledRound, ResidentMtpTextGenerator,
-};
+pub use resident_mtp_generation::{ResidentMtpGenerationSession, ResidentMtpTextGenerator};
 pub use sampling::{
     SampleDecision, Sampler, SamplingDistribution, SamplingOptions, SamplingPenalties,
     SpeculativeDecision, speculative_accept_probability, speculative_decision,
