@@ -5,7 +5,7 @@ use crate::common::math::{checked_sum, product, sum_products};
 use crate::common::slots::require_batch;
 use crate::qwen35::long_context_kv::Qwen35AttentionKvBinding;
 use crate::{
-    EngineError, EngineResult, MAX_BATCH, Qwen35FullAttentionLayerLayout,
+    EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH, Qwen35FullAttentionLayerLayout,
     Qwen35FullAttentionLayerProgram, Qwen35GdnLayerLayout, Qwen35GdnLayerProgram,
     Qwen35LongContextKvLayout, Qwen35LongContextKvProgram, Qwen35TextEndpointLayout,
     Qwen35TextEndpointProgram,
@@ -171,6 +171,24 @@ impl Qwen35ResidentModelLayout {
     /// Maximum context admitted by the pinned Qwen3.5 config.
     pub const fn context_capacity(&self) -> usize {
         crate::QWEN35_MAX_CONTEXT_TOKENS
+    }
+}
+
+impl LayerMemoryLayout for Qwen35ResidentModelLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 
