@@ -68,7 +68,7 @@ impl Qwen35ResidentMtpProgram {
             Qwen35MtpLayerProgram::from_snapshot_with_kv(
                 context,
                 snapshot.as_ref(),
-                mtp_kv.binding()?,
+                mtp_kv.plane_binding(0)?,
             )?
         };
         let embedding_stager =
@@ -554,7 +554,7 @@ impl Qwen35ResidentMtpProgram {
 
     /// Fixed target plus MTP host page-owner bytes.
     pub const fn kv_host_owner_bytes(&self) -> usize {
-        self.target.kv_host_owner_bytes() + self.mtp_kv.host_owner_bytes()
+        self.target.kv_host_owner_bytes() + self.mtp_kv.host_allocation_bytes()
     }
 
     fn require_active_positions(&self, positions: &[u32], slots: &[usize]) -> EngineResult<()> {
@@ -580,34 +580,15 @@ impl Qwen35ResidentMtpProgram {
                 "Qwen3.5 resident MTP position {position} exceeds slot {slot}'s {tokens} reserved tokens"
             )));
         }
-        if self.target.kv_route(slot, position)? != self.mtp_kv.route(slot, position)? {
-            return Err(EngineError::generation(format!(
-                "Qwen3.5 target/MTP slot {slot} maps position {position} differently"
-            )));
-        }
-
-        Ok(())
+        self.target
+            .long_context_kv()
+            .require_mirrored_route(&self.mtp_kv, slot, position)
     }
 
     fn require_mirror(&self, slot: usize) -> EngineResult<()> {
-        let target_state = self.target.kv_slot_state(slot)?;
-        let mtp_state = self.mtp_kv.state(slot)?;
-        let target_tokens = self.target.kv_slot_token_count(slot)?;
-        let mtp_tokens = self.mtp_kv.token_count(slot)?;
-        if target_state != mtp_state || target_tokens != mtp_tokens {
-            return Err(EngineError::generation(format!(
-                "Qwen3.5 target/MTP slot {slot} lifecycle differs: {target_state:?}/{mtp_state:?}, {target_tokens}/{mtp_tokens} tokens"
-            )));
-        }
-        for position in (0..target_tokens).step_by(64) {
-            if self.target.kv_route(slot, position)? != self.mtp_kv.route(slot, position)? {
-                return Err(EngineError::generation(format!(
-                    "Qwen3.5 target/MTP slot {slot} page mapping differs at position {position}"
-                )));
-            }
-        }
-
-        Ok(())
+        self.target
+            .long_context_kv()
+            .require_mirror(&self.mtp_kv, slot)
     }
 
     #[cfg(feature = "qualification")]
@@ -707,7 +688,7 @@ impl Qwen35ResidentMtpProgram {
         position: usize,
     ) -> EngineResult<crate::PagedKvRoute> {
         self.require_slot_route(slot, position)?;
-        self.target.kv_route(slot, position)
+        self.target.long_context_kv().route(slot, position)
     }
 
     #[cfg(feature = "qualification")]

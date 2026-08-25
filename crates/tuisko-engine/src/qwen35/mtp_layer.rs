@@ -2,6 +2,7 @@
 
 use crate::common::graph::capture_batch_graphs;
 use crate::common::math::product;
+use crate::common::paged_kv::PagedKvBinding;
 use crate::qwen35::mtp_layer_layout::{
     QWEN35_MTP_PHYSICAL_PAGES, QWEN35_MTP_PROMPT_ROWS, QWEN35_MTP_TABLE_STRIDE,
     Qwen35MtpLayerRegions,
@@ -19,14 +20,7 @@ const ROTARY_PAIRS: usize = 32;
 const REALIGN_ROUTES: usize = 4;
 const PROMPT_ROUTES: [usize; 3] = [32, 64, QWEN35_MTP_PROMPT_ROWS];
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Qwen35MtpKvBinding {
-    pub(crate) block_tables: u64,
-    pub(crate) key_pages: u64,
-    pub(crate) value_pages: u64,
-    pub(crate) table_stride: usize,
-    pub(crate) context_capacity: usize,
-}
+pub(crate) type Qwen35MtpKvBinding = PagedKvBinding;
 
 /// One exact source-backed Qwen3.5 MTP layer without a duplicate text endpoint.
 pub struct Qwen35MtpLayerProgram {

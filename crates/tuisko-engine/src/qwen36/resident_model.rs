@@ -361,7 +361,7 @@ impl Qwen36ResidentModelProgram {
         let mut attention_layer = 0;
         for layer in 0..Qwen36Moe35B::LAYERS {
             let kv_binding = if layer_kind(layer) == Qwen36ResidentLayerKind::FullAttentionMoe {
-                let binding = long_context_kv.layer_binding(attention_layer)?;
+                let binding = long_context_kv.plane_binding(attention_layer)?;
                 attention_layer += 1;
                 Some(binding)
             } else {

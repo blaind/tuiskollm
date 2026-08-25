@@ -1,8 +1,10 @@
 //! Long-context BF16 cache mirror for the exact Qwen3.5 MTP layer.
 
 use crate::common::math::product;
+use crate::common::paged_kv::{PagedKvLayout, PagedKvPlanes, sealed};
 use crate::{
     EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH, QWEN35_LONG_CONTEXT_PHYSICAL_PAGES,
+    QWEN35_MAX_CONTEXT_TOKENS,
 };
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -10,18 +12,12 @@ use tuisko_model::{Arch, Qwen35_9B};
 
 const ALIGNMENT: usize = 256;
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Qwen35MtpKvRegions {
-    pub(crate) block_tables: ArenaRegion<u32>,
-    pub(crate) key_pages: ArenaRegion<u16>,
-    pub(crate) value_pages: ArenaRegion<u16>,
-}
-
 /// One address-stable BF16 K/V mirror and eight stable table rows.
 #[derive(Clone, Debug)]
 pub(crate) struct Qwen35MtpKvLayout {
     builder: ArenaLayout,
-    regions: Qwen35MtpKvRegions,
+    block_tables: ArenaRegion<u32>,
+    planes: [PagedKvPlanes<u16>; 1],
 }
 
 impl Qwen35MtpKvLayout {
@@ -42,48 +38,39 @@ impl Qwen35MtpKvLayout {
             page_values()?,
         )?;
         let mut builder = ArenaLayout::new();
-        let regions = Qwen35MtpKvRegions {
-            block_tables: builder.reserve(
-                product(
-                    "Qwen3.5 MTP block-table entries",
-                    MAX_BATCH,
-                    QWEN35_LONG_CONTEXT_PHYSICAL_PAGES,
-                )?,
-                ALIGNMENT,
+        let block_tables = builder.reserve(
+            product(
+                "Qwen3.5 MTP block-table entries",
+                MAX_BATCH,
+                QWEN35_LONG_CONTEXT_PHYSICAL_PAGES,
             )?,
-            key_pages: builder.reserve(plane_values, ALIGNMENT)?,
-            value_pages: builder.reserve(plane_values, ALIGNMENT)?,
-        };
+            ALIGNMENT,
+        )?;
+        let planes = [PagedKvPlanes {
+            key: builder.reserve(plane_values, ALIGNMENT)?,
+            value: builder.reserve(plane_values, ALIGNMENT)?,
+        }];
 
-        Ok(Self { builder, regions })
-    }
-
-    pub(crate) const fn builder(&self) -> &ArenaLayout {
-        &self.builder
-    }
-
-    pub(crate) const fn regions(&self) -> Qwen35MtpKvRegions {
-        self.regions
+        Ok(Self {
+            builder,
+            block_tables,
+            planes,
+        })
     }
 
     #[cfg(test)]
     fn physical_pages(&self) -> usize {
-        self.regions.key_pages.len() / page_values().unwrap()
-    }
-
-    /// Fixed columns in every stable block-table row.
-    pub const fn table_stride(&self) -> usize {
-        QWEN35_LONG_CONTEXT_PHYSICAL_PAGES
+        self.planes[0].key.len() / page_values().unwrap()
     }
 
     /// Represented BF16 K/V bytes.
     pub const fn cache_bytes(&self) -> usize {
-        self.regions.key_pages.byte_len() + self.regions.value_pages.byte_len()
+        self.planes[0].key.byte_len() + self.planes[0].value.byte_len()
     }
 
     /// Device block-table bytes.
     pub const fn block_table_bytes(&self) -> usize {
-        self.regions.block_tables.byte_len()
+        self.block_tables.byte_len()
     }
 
     /// Complete single-allocation bytes.
@@ -94,6 +81,35 @@ impl Qwen35MtpKvLayout {
     #[cfg(test)]
     fn owner_bytes(&self) -> usize {
         self.cache_bytes() + self.block_table_bytes()
+    }
+}
+
+impl sealed::Sealed for Qwen35MtpKvLayout {}
+
+impl PagedKvLayout for Qwen35MtpKvLayout {
+    type Value = u16;
+
+    const NAME: &'static str = "Qwen3.5 MTP";
+    const FULL_PHYSICAL_PAGES: usize = QWEN35_LONG_CONTEXT_PHYSICAL_PAGES;
+    const MAX_CONTEXT_TOKENS: usize = QWEN35_MAX_CONTEXT_TOKENS;
+    // The mirror writes only its accepted positions, so a reused page keeps the
+    // previous owner's represented values unless the reservation clears it.
+    const CLEARS_REUSED_PAGES: bool = true;
+
+    fn build_for_pages(physical_pages: usize) -> EngineResult<Self> {
+        Qwen35MtpKvLayout::build_for_pages(physical_pages)
+    }
+
+    fn builder(&self) -> &ArenaLayout {
+        &self.builder
+    }
+
+    fn block_tables(&self) -> ArenaRegion<u32> {
+        self.block_tables
+    }
+
+    fn planes(&self) -> &[PagedKvPlanes<u16>] {
+        &self.planes
     }
 }
 
@@ -131,7 +147,7 @@ fn page_values() -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Qwen35MtpKvLayout, page_values};
+    use super::{PagedKvLayout, Qwen35MtpKvLayout, page_values};
 
     #[test]
     fn qwen35_mtp_full_mirror_accounting_is_exact() {
@@ -139,7 +155,7 @@ mod tests {
 
         assert_eq!(page_values().unwrap(), 65_536);
         assert_eq!(layout.physical_pages(), 4_096);
-        assert_eq!(layout.table_stride(), 4_096);
+        assert_eq!(Qwen35MtpKvLayout::FULL_PHYSICAL_PAGES, 4_096);
         assert_eq!(layout.cache_bytes(), 1_073_741_824);
         assert_eq!(layout.block_table_bytes(), 131_072);
         assert_eq!(layout.owner_bytes(), 1_073_872_896);
