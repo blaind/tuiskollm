@@ -1,6 +1,8 @@
 //! Source-BF16 paged grouped-query attention for admitted MTP layers.
 
-use crate::device::paged_gqa::{DECODE_SHARED_VALUES, DECODE_THREADS, bf16_paged_gqa};
+use crate::device::paged_gqa::{
+    DECODE_SHARED_VALUES, DECODE_THREADS, bf16_paged_gqa, bf16_paged_gqa_partitioned,
+};
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -8,6 +10,7 @@ use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const THREADS: u32 = DECODE_THREADS as u32;
+const QWEN35_THREADS: u32 = 32;
 
 fn admitted_batch(batch: usize) -> bool {
     (1..=MAX_BATCH).contains(&batch)
@@ -46,7 +49,7 @@ mod kernels {
         // Eight warps use the same represented-BF16 slice schedule as the
         // target decode route.
         unsafe {
-            bf16_paged_gqa::<Qwen38_27B, TOKENS>(
+            bf16_paged_gqa_partitioned::<Qwen38_27B, TOKENS>(
                 query,
                 key_pages,
                 value_pages,
@@ -114,7 +117,9 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
         Ok(Self {
             attention: module
                 .prepare_qwen35_mtp_bf16_paged_gqa::<TOKENS>(LaunchConfig1D::new(
-                    blocks, THREADS, 0,
+                    blocks,
+                    QWEN35_THREADS,
+                    0,
                 ))
                 .map_err(|source| {
                     GpuError::launch("preparing Qwen3.5 MTP BF16 paged GQA", source)
@@ -452,7 +457,8 @@ impl Qwen35MtpBf16PagedGqaOp {
 #[cfg(test)]
 mod tests {
     use super::{
-        THREADS, admitted_batch, mtp_bf16_paged_gqa_ptx_names, qwen35_mtp_bf16_paged_gqa_ptx_names,
+        QWEN35_THREADS, THREADS, admitted_batch, mtp_bf16_paged_gqa_ptx_names,
+        qwen35_mtp_bf16_paged_gqa_ptx_names,
     };
     use std::collections::BTreeSet;
 
@@ -474,5 +480,6 @@ mod tests {
         let names = qwen35_mtp_bf16_paged_gqa_ptx_names();
         assert_eq!(names.len(), 8);
         assert_eq!(names.iter().copied().collect::<BTreeSet<_>>().len(), 8);
+        assert_eq!(QWEN35_THREADS, 32);
     }
 }

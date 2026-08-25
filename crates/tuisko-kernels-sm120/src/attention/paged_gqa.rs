@@ -5,8 +5,8 @@ use crate::device::paged_gqa::{
     BF16_PREFILL_SHARED_BYTES, BF16_PREFILL_THREADS, DECODE_SHARED_VALUES, DECODE_THREADS,
     FLASH_PREFILL_P8_SHARED_BYTES, FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS,
     PREFILL_PARTIAL_VALUES, PREFILL_SHARED_BYTES, PREFILL_THREADS, QWEN35_BF16_PREFILL_THREADS,
-    QWEN36_FP8_PREFILL_THREADS,
-    bf16_paged_gqa, bf16_paged_gqa_prefill_shared, paged_gqa, paged_gqa_prefill_flash_partitioned,
+    QWEN36_FP8_PREFILL_THREADS, bf16_paged_gqa, bf16_paged_gqa_prefill_shared, paged_gqa,
+    paged_gqa_partitioned, paged_gqa_prefill_flash_partitioned,
     paged_gqa_prefill_partitioned_reduce, paged_gqa_prefill_shared,
 };
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
@@ -143,7 +143,7 @@ mod kernels {
         // Eight warps split the context into contiguous slices and merge their
         // online-softmax states in ascending slice order.
         unsafe {
-            paged_gqa::<A, TOKENS>(
+            paged_gqa_partitioned::<A, TOKENS>(
                 query,
                 key_pages,
                 value_pages,
@@ -203,12 +203,12 @@ mod kernels {
 
     /// Applies Qwen3.5 paged BF16 GQA for one exact decode batch.
     #[kernel]
-    #[launch_bounds(256, 2)]
+    #[launch_bounds(32, 16)]
     #[allow(clippy::too_many_arguments)]
     #[launch_contract(
         domain = 1,
         coordinates = u32,
-        block = (256, 1, 1),
+        block = (32, 1, 1),
         dynamic_shared = 0,
         min_compute_capability = (12, 0),
     )]
@@ -222,10 +222,10 @@ mod kernels {
         lengths: *const u32,
         output: *mut f32,
     ) {
-        static mut DECODE_PARTIALS: SharedArray<f32, DECODE_SHARED_VALUES, 16> =
-            SharedArray::UNINIT;
-        let partials = core::ptr::addr_of_mut!(DECODE_PARTIALS).cast::<f32>();
-
+        // One warp covers the 256 columns as eight values/lane and scans
+        // 130 * 256 * 2 * 2 = 133,120 BF16 cache bytes/head at the benchmark
+        // context. The 16/128 B=1/B=8 CTAs preserve the established per-head
+        // online-softmax order; grouping heads would be a new arithmetic route.
         unsafe {
             bf16_paged_gqa::<Qwen35_9B, TOKENS>(
                 query,
@@ -236,7 +236,6 @@ mod kernels {
                 table_stride,
                 lengths,
                 output,
-                partials,
             );
         }
     }
@@ -284,12 +283,12 @@ mod kernels {
 
     /// Applies Qwen3.6 paged BF16 GQA for one exact decode batch.
     #[kernel]
-    #[launch_bounds(256, 2)]
+    #[launch_bounds(32, 16)]
     #[allow(clippy::too_many_arguments)]
     #[launch_contract(
         domain = 1,
         coordinates = u32,
-        block = (256, 1, 1),
+        block = (32, 1, 1),
         dynamic_shared = 0,
         min_compute_capability = (12, 0),
     )]
@@ -303,10 +302,9 @@ mod kernels {
         lengths: *const u32,
         output: *mut f32,
     ) {
-        static mut DECODE_PARTIALS: SharedArray<f32, DECODE_SHARED_VALUES, 16> =
-            SharedArray::UNINIT;
-        let partials = core::ptr::addr_of_mut!(DECODE_PARTIALS).cast::<f32>();
-
+        // One warp preserves the qualified 256-column online-softmax order.
+        // Qwen3.6's 16 query heads still expose 16/128 B=1/B=8 CTAs, while
+        // its 8:1 query/KV grouping changes only the selected cache head.
         unsafe {
             bf16_paged_gqa::<Qwen36Moe35B, TOKENS>(
                 query,
@@ -317,7 +315,6 @@ mod kernels {
                 table_stride,
                 lengths,
                 output,
-                partials,
             );
         }
     }
@@ -802,11 +799,7 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
 
         Ok(Self {
             attention: module
-                .prepare_qwen35_paged_gqa_exact::<TOKENS>(LaunchConfig1D::new(
-                    blocks,
-                    DECODE_THREADS_U32,
-                    0,
-                ))
+                .prepare_qwen35_paged_gqa_exact::<TOKENS>(LaunchConfig1D::new(blocks, THREADS, 0))
                 .map_err(|source| GpuError::launch("preparing Qwen3.5 paged GQA", source))?,
         })
     }
@@ -911,11 +904,7 @@ impl<const TOKENS: usize> PreparedQwen36Route<TOKENS> {
 
         Ok(Self {
             attention: module
-                .prepare_qwen36_paged_gqa_exact::<TOKENS>(LaunchConfig1D::new(
-                    blocks,
-                    DECODE_THREADS_U32,
-                    0,
-                ))
+                .prepare_qwen36_paged_gqa_exact::<TOKENS>(LaunchConfig1D::new(blocks, THREADS, 0))
                 .map_err(|source| GpuError::launch("preparing Qwen3.6 paged GQA", source))?,
         })
     }

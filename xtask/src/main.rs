@@ -10568,9 +10568,9 @@ fn gate_paged_gqa_target(
         )?;
     }
     for entry in &attention {
-        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+        if !entry.body.contains(".reqntid 32, 1, 1") || !entry.body.contains(".minnctapersm 16") {
             return Err(format!(
-                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                "entry `{}` lost its 32-thread/sixteen-CTA launch bounds",
                 entry.name
             )
             .into());
