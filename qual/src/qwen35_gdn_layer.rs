@@ -1,4 +1,4 @@
-//! Source-backed qualification for one Qwen3.5 GDN decoder layer.
+//! Source-backed qualification for one Qwen3.5 GDN layer.
 
 use crate::fp8_projection_oracle::{
     BF16_SENTINEL, BYTE_SENTINEL, F32_SENTINEL_BITS, bf16_to_f32, f32_to_bf16,
@@ -31,6 +31,7 @@ const STATE_PER_ROW: usize = VALUE_HEADS * HEAD_DIM * HEAD_DIM;
 const RMS_EPSILON: f64 = 1.0e-6;
 const QUERY_SCALE: f64 = 0.088_388_35;
 const W4A4_BATCHES: [bool; MAX_BATCH] = [true, false, true, true, true, true, true, true];
+const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 
 /// Failure of the complete source-backed Qwen3.5 GDN-layer gate.
 #[derive(Debug, thiserror::Error)]
@@ -55,9 +56,9 @@ pub enum Qwen35GdnLayerQualificationError {
 /// Observable counts, ownership, and worst error from one source-backed layer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Qwen35GdnLayerQualification {
-    /// Residual and normalization values checked at every exact batch.
+    /// Residual and normalization values checked at every exact route.
     pub boundary_values: usize,
-    /// Gate/up activation codes and scales checked on W4A4 routes.
+    /// Exact activation codes and scales checked on every W4A4 stage.
     pub activation_values: usize,
     /// Complete real-source mixer and MLP values checked through B=1.
     pub source_values: usize,
@@ -90,7 +91,7 @@ struct SourceMaterialized<'a> {
     mlp: MaterializedModelOptNvfp4Mlp<'a>,
 }
 
-/// Qualifies source-backed Qwen3.5 layer 0 at every exact decode batch.
+/// Qualifies source-backed Qwen3.5 layer 0 at every exact row route.
 pub fn qualify_qwen35_gdn_layer(
     root: &Path,
 ) -> Result<Qwen35GdnLayerQualification, Qwen35GdnLayerQualificationError> {
@@ -116,9 +117,9 @@ pub fn qualify_qwen35_gdn_layer(
     let program = Qwen35GdnLayerProgram::from_snapshot(&context, snapshot.clone(), SOURCE_LAYER)?;
     let stable_base = program.base_address();
     let stable_addresses = program.qualification_addresses()?;
-    if stable_addresses.len() != 38 {
+    if stable_addresses.len() != 44 {
         return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
-            "Qwen3.5 GDN owner exposes {} addresses, expected 38",
+            "Qwen3.5 GDN owner exposes {} addresses, expected 44",
             stable_addresses.len()
         )));
     }
@@ -145,36 +146,37 @@ pub fn qualify_qwen35_gdn_layer(
         &mut report,
     )?;
 
-    for batch in 1..=MAX_BATCH {
-        let first_input = make_input(batch, 0);
-        prepare_run(&program, &stream, batch, &first_input)?;
-        program.launch_eager(&stream, batch)?;
+    for rows in EXACT_ROUTES {
+        let first_input = make_input(rows, 0);
+        prepare_run(&program, &stream, rows, &first_input)?;
+        program.launch_eager(&stream, rows)?;
         let first = program.qualification_observables(&stream)?;
 
-        let input = make_input(batch, 1);
-        prepare_run(&program, &stream, batch, &input)?;
-        program.replay(&stream, batch)?;
+        let input = make_input(rows, 1);
+        prepare_run(&program, &stream, rows, &input)?;
+        program.replay(&stream, rows)?;
         let replay = program.qualification_observables(&stream)?;
 
-        prepare_run(&program, &stream, batch, &input)?;
-        program.launch_eager(&stream, batch)?;
+        prepare_run(&program, &stream, rows, &input)?;
+        program.launch_eager(&stream, rows)?;
         let eager = program.qualification_observables(&stream)?;
 
-        verify_boundaries(batch, &input, bindings, &replay, &mut report)?;
-        verify_activation_quantization(batch, &materialized, &replay, &mut report)?;
-        if batch == 1 {
+        verify_boundaries(rows, &input, bindings, &replay, &mut report)?;
+        verify_activation_quantization(rows, &materialized, &replay, &mut report)?;
+        if rows == 1 {
             verify_source_formula(bindings, &materialized, &replay, &mut report)?;
         }
-        verify_replay(batch, &eager, &replay, &mut report)?;
-        verify_replacement_input(batch, &first, &replay)?;
-        verify_inactive(batch, &replay, &mut report)?;
-        verify_inactive(batch, &eager, &mut report)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
+        verify_replacement_input(rows, &first, &replay)?;
+        verify_inactive(rows, &replay, &mut report)?;
+        verify_inactive(rows, &eager, &mut report)?;
 
         if program.base_address() != stable_base
             || program.qualification_addresses()? != stable_addresses
         {
             return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
-                "Qwen3.5 GDN owner addresses changed while qualifying B={batch}"
+                "Qwen3.5 GDN owner addresses changed while qualifying {}",
+                route_label(rows)
             )));
         }
     }
@@ -190,12 +192,12 @@ pub fn qualify_qwen35_gdn_layer(
     Ok(report)
 }
 
-fn make_input(batch: usize, salt: usize) -> Vec<u16> {
+fn make_input(rows: usize, salt: usize) -> Vec<u16> {
     const PATTERN: [f32; 16] = [
         0.875, -0.875, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0625, -0.0625, 0.03125, -0.03125,
         0.0, 0.5, -0.25, 0.125,
     ];
-    (0..batch * Qwen35_9B::HIDDEN)
+    (0..rows * Qwen35_9B::HIDDEN)
         .map(|index| f32_to_bf16(PATTERN[(index + salt * 5 + index / Qwen35_9B::HIDDEN) & 15]))
         .collect()
 }
@@ -203,11 +205,11 @@ fn make_input(batch: usize, salt: usize) -> Vec<u16> {
 fn prepare_run(
     program: &Qwen35GdnLayerProgram,
     stream: &CudaStream,
-    batch: usize,
+    rows: usize,
     input: &[u16],
 ) -> Result<(), Qwen35GdnLayerQualificationError> {
     program.reset_state(stream)?;
-    program.load_residual(stream, batch, input)?;
+    program.load_residual(stream, rows, input)?;
     program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
 
     Ok(())
@@ -315,7 +317,7 @@ fn verify_immutable(
 }
 
 fn verify_boundaries(
-    batch: usize,
+    rows: usize,
     input: &[u16],
     sources: SourceBindings<'_>,
     observed: &Qwen35GdnLayerObservables,
@@ -325,7 +327,7 @@ fn verify_boundaries(
     let post_norm = sources.gdn.post_attention_norm.words().collect::<Vec<_>>();
     let next_norm = sources.mlp.next_norm.words().collect::<Vec<_>>();
 
-    for token in 0..batch {
+    for token in 0..rows {
         let begin = token * Qwen35_9B::HIDDEN;
         let end = begin + Qwen35_9B::HIDDEN;
         let mixer_normalized = rms_norm_oracle::<Qwen35_9B>(&input[begin..end], &input_norm);
@@ -369,49 +371,103 @@ fn verify_boundaries(
         )?;
     }
 
-    report.boundary_values += batch * Qwen35_9B::HIDDEN * 5;
+    report.boundary_values += rows * Qwen35_9B::HIDDEN * 5;
 
     Ok(())
 }
 
 fn verify_activation_quantization(
-    batch: usize,
+    rows: usize,
     source: &SourceMaterialized<'_>,
     observed: &Qwen35GdnLayerObservables,
     report: &mut Qwen35GdnLayerQualification,
 ) -> Result<(), Qwen35GdnLayerQualificationError> {
-    let code_width = Qwen35_9B::HIDDEN / 2;
-    let scale_width = Qwen35_9B::HIDDEN / GROUP;
-    if W4A4_BATCHES[batch - 1] {
-        for token in 0..batch {
-            let begin = token * Qwen35_9B::HIDDEN;
-            let (codes, scales) = quantize_oracle(
-                &observed.mlp_normalized[begin..begin + Qwen35_9B::HIDDEN],
-                source.mlp.gate_up.input_scale_divisor,
-            )
-            .map_err(|error| Qwen35GdnLayerQualificationError::Mismatch(error.to_string()))?;
-            compare_exact(
-                "gate/up activation codes",
-                &observed.gate_up_activation_codes[token * code_width..(token + 1) * code_width],
-                &codes,
-            )?;
-            compare_exact(
-                "gate/up activation scales",
-                &observed.gate_up_activation_scales[token * scale_width..(token + 1) * scale_width],
-                &scales,
-            )?;
-        }
-        report.activation_values += batch * (code_width + scale_width);
-    } else if observed
-        .gate_up_activation_codes
-        .iter()
-        .chain(&observed.gate_up_activation_scales)
-        .any(|&value| value != BYTE_SENTINEL)
-    {
-        return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
-            "B={batch} A16 SwiGLU modified W4A4 scratch"
-        )));
+    if rows > MAX_BATCH {
+        verify_quantized_rows(
+            "GDN input",
+            rows,
+            Qwen35_9B::HIDDEN,
+            &observed.mixer_normalized,
+            &observed.input_activation_codes,
+            &observed.input_activation_scales,
+            source.gdn.input_scale_divisor,
+            report,
+        )?;
+        verify_quantized_rows(
+            "GDN output",
+            rows,
+            Qwen35_9B::GDN_VALUE_ROWS,
+            &observed.recurrent_output,
+            &observed.output_activation_codes,
+            &observed.output_activation_scales,
+            source.gdn.output.input_scale_divisor,
+            report,
+        )?;
+        verify_quantized_rows(
+            "gate/up",
+            rows,
+            Qwen35_9B::HIDDEN,
+            &observed.mlp_normalized,
+            &observed.gate_up_activation_codes,
+            &observed.gate_up_activation_scales,
+            source.mlp.gate_up.input_scale_divisor,
+            report,
+        )?;
+        verify_quantized_rows(
+            "down",
+            rows,
+            Qwen35_9B::INTERMEDIATE,
+            &observed.swiglu,
+            &observed.down_activation_codes,
+            &observed.down_activation_scales,
+            source.mlp.down.input_scale_divisor,
+            report,
+        )?;
+    } else if W4A4_BATCHES[rows - 1] {
+        verify_quantized_rows(
+            "gate/up",
+            rows,
+            Qwen35_9B::HIDDEN,
+            &observed.mlp_normalized,
+            &observed.gate_up_activation_codes,
+            &observed.gate_up_activation_scales,
+            source.mlp.gate_up.input_scale_divisor,
+            report,
+        )?;
     }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_quantized_rows(
+    role: &str,
+    rows: usize,
+    columns: usize,
+    input: &[u16],
+    observed_codes: &[u8],
+    observed_scales: &[u8],
+    divisor: f32,
+    report: &mut Qwen35GdnLayerQualification,
+) -> Result<(), Qwen35GdnLayerQualificationError> {
+    let code_width = columns / 2;
+    let scale_width = columns / GROUP;
+    for token in 0..rows {
+        let input_begin = token * columns;
+        let (codes, scales) = quantize_oracle(&input[input_begin..input_begin + columns], divisor)
+            .map_err(|error| Qwen35GdnLayerQualificationError::Mismatch(error.to_string()))?;
+        compare_exact(
+            &format!("{role} activation codes"),
+            &observed_codes[token * code_width..(token + 1) * code_width],
+            &codes,
+        )?;
+        compare_exact(
+            &format!("{role} activation scales"),
+            &observed_scales[token * scale_width..(token + 1) * scale_width],
+            &scales,
+        )?;
+    }
+    report.activation_values += rows * (code_width + scale_width);
 
     Ok(())
 }
@@ -688,7 +744,7 @@ fn verify_recurrence(
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     eager: &Qwen35GdnLayerObservables,
     replay: &Qwen35GdnLayerObservables,
     report: &mut Qwen35GdnLayerQualification,
@@ -702,7 +758,8 @@ fn verify_replay(
                 .position(|(actual, expected)| actual != expected)
             {
                 return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
-                    "B={batch} graph plane `{}` differs at value {index}",
+                    "{} graph plane `{}` differs at value {index}",
+                    route_label(rows),
                     stringify!($field)
                 )));
             }
@@ -718,7 +775,8 @@ fn verify_replay(
                 .position(|(actual, expected)| actual != expected)
             {
                 return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
-                    "B={batch} graph plane `{}` differs at value {index}",
+                    "{} graph plane `{}` differs at value {index}",
+                    route_label(rows),
                     stringify!($field)
                 )));
             }
@@ -726,6 +784,8 @@ fn verify_replay(
     }
 
     same!(mixer_normalized);
+    same!(input_activation_codes);
+    same!(input_activation_scales);
     same!(projected);
     same!(projected_controls);
     same_f32!(log_decay);
@@ -734,12 +794,16 @@ fn verify_replay(
     same!(history);
     same_f32!(state);
     same!(recurrent_output);
+    same!(output_activation_codes);
+    same!(output_activation_scales);
     same!(mixer_branch);
     same!(mixer_residual);
     same!(mlp_normalized);
     same!(gate_up_activation_codes);
     same!(gate_up_activation_scales);
     same!(swiglu);
+    same!(down_activation_codes);
+    same!(down_activation_scales);
     same!(mlp_branch);
     same!(residual_output);
     same!(next_normalized);
@@ -750,6 +814,8 @@ fn verify_replay(
 
 fn observable_values(values: &Qwen35GdnLayerObservables) -> usize {
     values.mixer_normalized.len()
+        + values.input_activation_codes.len()
+        + values.input_activation_scales.len()
         + values.projected.len()
         + values.projected_controls.len()
         + values.log_decay.len()
@@ -758,26 +824,31 @@ fn observable_values(values: &Qwen35GdnLayerObservables) -> usize {
         + values.history.len()
         + values.state.len()
         + values.recurrent_output.len()
+        + values.output_activation_codes.len()
+        + values.output_activation_scales.len()
         + values.mixer_branch.len()
         + values.mixer_residual.len()
         + values.mlp_normalized.len()
         + values.gate_up_activation_codes.len()
         + values.gate_up_activation_scales.len()
         + values.swiglu.len()
+        + values.down_activation_codes.len()
+        + values.down_activation_scales.len()
         + values.mlp_branch.len()
         + values.residual_output.len()
         + values.next_normalized.len()
 }
 
 fn verify_replacement_input(
-    batch: usize,
+    rows: usize,
     first: &Qwen35GdnLayerObservables,
     replay: &Qwen35GdnLayerObservables,
 ) -> Result<(), Qwen35GdnLayerQualificationError> {
-    let active = batch * Qwen35_9B::HIDDEN;
+    let active = rows * Qwen35_9B::HIDDEN;
     if first.residual_output[..active] == replay.residual_output[..active] {
         return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
-            "B={batch} graph ignored replacement residual rows"
+            "{} graph ignored replacement residual rows",
+            route_label(rows)
         )));
     }
 
@@ -785,19 +856,20 @@ fn verify_replacement_input(
 }
 
 fn verify_inactive(
-    batch: usize,
+    rows: usize,
     observed: &Qwen35GdnLayerObservables,
     report: &mut Qwen35GdnLayerQualification,
 ) -> Result<(), Qwen35GdnLayerQualificationError> {
     macro_rules! sentinel_u16 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|&value| value != BF16_SENTINEL)
             {
                 return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
-                    "B={batch} modified inactive `{}` value",
+                    "{} modified inactive `{}` value",
+                    route_label(rows),
                     stringify!($field)
                 )));
             }
@@ -806,13 +878,30 @@ fn verify_inactive(
     }
     macro_rules! sentinel_f32 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|value| value.to_bits() != F32_SENTINEL_BITS)
             {
                 return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
-                    "B={batch} modified inactive `{}` value",
+                    "{} modified inactive `{}` value",
+                    route_label(rows),
+                    stringify!($field)
+                )));
+            }
+            observed.$field.len() - begin
+        }};
+    }
+    macro_rules! sentinel_u8 {
+        ($field:ident, $begin:expr) => {{
+            let begin = $begin;
+            if observed.$field[begin..]
+                .iter()
+                .any(|&value| value != BYTE_SENTINEL)
+            {
+                return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
+                    "{} modified inactive `{}` value",
+                    route_label(rows),
                     stringify!($field)
                 )));
             }
@@ -836,66 +925,72 @@ fn verify_inactive(
     inactive += sentinel_u16!(residual_output, Qwen35_9B::HIDDEN);
     inactive += sentinel_u16!(next_normalized, Qwen35_9B::HIDDEN);
 
-    for token in 0..batch {
+    for token in 0..rows {
         let padding = &observed.projected_controls
             [token * CONTROL_STRIDE + 2 * VALUE_HEADS..(token + 1) * CONTROL_STRIDE];
         if padding.iter().any(|&value| value != 0) {
             return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
-                "B={batch} active control padding is not zero for token {token}"
+                "{} active control padding is not zero for token {token}",
+                route_label(rows)
             )));
         }
     }
 
-    let history_begin = batch * Qwen35_9B::GDN_QKV_ROWS * 3;
+    let active_state_rows = if rows <= MAX_BATCH { rows } else { 1 };
+    let history_begin = active_state_rows * Qwen35_9B::GDN_QKV_ROWS * 3;
     if observed.history[history_begin..]
         .iter()
         .any(|&value| value != 0)
     {
         return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
-            "B={batch} modified inactive history"
+            "{} modified inactive history",
+            route_label(rows)
         )));
     }
     inactive += observed.history.len() - history_begin;
-    let state_begin = batch * STATE_PER_ROW;
+    let state_begin = active_state_rows * STATE_PER_ROW;
     if observed.state[state_begin..]
         .iter()
         .any(|&value| value.to_bits() != 0)
     {
         return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
-            "B={batch} modified inactive recurrent state"
+            "{} modified inactive recurrent state",
+            route_label(rows)
         )));
     }
     inactive += observed.state.len() - state_begin;
 
-    let code_width = Qwen35_9B::HIDDEN / 2;
-    let scale_width = Qwen35_9B::HIDDEN / GROUP;
-    let code_begin = if W4A4_BATCHES[batch - 1] {
-        batch * code_width
+    let hidden_codes = Qwen35_9B::HIDDEN / 2;
+    let hidden_scales = Qwen35_9B::HIDDEN / GROUP;
+    let intermediate_codes = Qwen35_9B::INTERMEDIATE / 2;
+    let intermediate_scales = Qwen35_9B::INTERMEDIATE / GROUP;
+    let prompt = rows > MAX_BATCH;
+    let prompt_hidden_code_begin = if prompt { rows * hidden_codes } else { 0 };
+    let prompt_hidden_scale_begin = if prompt { rows * hidden_scales } else { 0 };
+    let gate_code_begin = if uses_w4a4(rows) {
+        rows * hidden_codes
     } else {
         0
     };
-    let scale_begin = if W4A4_BATCHES[batch - 1] {
-        batch * scale_width
+    let gate_scale_begin = if uses_w4a4(rows) {
+        rows * hidden_scales
     } else {
         0
     };
-    for (role, values) in [
-        (
-            "gate/up activation codes",
-            &observed.gate_up_activation_codes[code_begin..],
-        ),
-        (
-            "gate/up activation scales",
-            &observed.gate_up_activation_scales[scale_begin..],
-        ),
-    ] {
-        if values.iter().any(|&value| value != BYTE_SENTINEL) {
-            return Err(Qwen35GdnLayerQualificationError::Mismatch(format!(
-                "B={batch} modified inactive {role}"
-            )));
-        }
-        inactive += values.len();
-    }
+    let down_code_begin = if prompt { rows * intermediate_codes } else { 0 };
+    let down_scale_begin = if prompt {
+        rows * intermediate_scales
+    } else {
+        0
+    };
+    inactive += sentinel_u8!(input_activation_codes, prompt_hidden_code_begin);
+    inactive += sentinel_u8!(input_activation_scales, prompt_hidden_scale_begin);
+    inactive += sentinel_u8!(output_activation_codes, prompt_hidden_code_begin);
+    inactive += sentinel_u8!(output_activation_scales, prompt_hidden_scale_begin);
+    inactive += sentinel_u8!(gate_up_activation_codes, gate_code_begin);
+    inactive += sentinel_u8!(gate_up_activation_scales, gate_scale_begin);
+    inactive += sentinel_u8!(down_activation_codes, down_code_begin);
+    inactive += sentinel_u8!(down_activation_scales, down_scale_begin);
 
     report.inactive_values += inactive;
 
@@ -906,12 +1001,12 @@ fn verify_no_device_allocation(
     program: &Qwen35GdnLayerProgram,
     stream: &CudaStream,
 ) -> Result<(), Qwen35GdnLayerQualificationError> {
-    program.replay(stream, MAX_BATCH)?;
+    program.replay(stream, 128)?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
     for _ in 0..2 {
-        for batch in [1, 8, 3, 6, 2, 7, 4, 5] {
-            program.replay(stream, batch)?;
+        for rows in [128, 1, 64, 8, 32, 3, 6, 2, 7, 4, 5] {
+            program.replay(stream, rows)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -923,6 +1018,18 @@ fn verify_no_device_allocation(
     }
 
     Ok(())
+}
+
+fn uses_w4a4(rows: usize) -> bool {
+    rows > MAX_BATCH || W4A4_BATCHES[rows - 1]
+}
+
+fn route_label(rows: usize) -> String {
+    if rows <= MAX_BATCH {
+        format!("B={rows}")
+    } else {
+        format!("T={rows}")
+    }
 }
 
 fn residual_oracle(input: &[u16], branch: &[u16]) -> Vec<u16> {
@@ -1016,7 +1123,8 @@ fn require_close(
 #[cfg(test)]
 mod tests {
     use super::{
-        Qwen35GdnLayerQualificationError, SOURCE_LAYER, W4A4_BATCHES, qualify_qwen35_gdn_layer,
+        EXACT_ROUTES, Qwen35GdnLayerQualificationError, SOURCE_LAYER, W4A4_BATCHES,
+        qualify_qwen35_gdn_layer, uses_w4a4,
     };
 
     #[test]
@@ -1025,6 +1133,12 @@ mod tests {
         assert_eq!(
             W4A4_BATCHES,
             [true, false, true, true, true, true, true, true]
+        );
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
+        assert!(
+            EXACT_ROUTES
+                .into_iter()
+                .all(|rows| rows == 2 || uses_w4a4(rows))
         );
     }
 
@@ -1039,11 +1153,11 @@ mod tests {
         })?;
         let report = qualify_qwen35_gdn_layer(std::path::Path::new(&root))?;
 
-        assert_eq!(report.boundary_values, 737_280);
-        assert_eq!(report.activation_values, 78_336);
+        assert_eq!(report.boundary_values, 5_324_800);
+        assert_eq!(report.activation_values, 3_174_912);
         assert_eq!(report.weight_bytes, 123_068_800);
-        assert_eq!(report.workspace_bytes, 18_307_104);
-        assert_eq!(report.arena_bytes, 141_376_512);
+        assert_eq!(report.workspace_bytes, 36_831_264);
+        assert_eq!(report.arena_bytes, 159_900_672);
         assert_eq!(report.padding_bytes, 608);
         assert!(report.source_values > 0);
         assert!(report.graph_replay_values > 0);
