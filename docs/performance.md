@@ -185,6 +185,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-qwen36-server SNAPSHOT` | Start the release server, check the exact health/model inventory plus deterministic blocking and SSE responses, and stop the owned child process | terminal |
 | `cargo run -p xtask -- qualify-qwen36-fp8-qkv` | Check Qwen3.6 static E4M3 full-attention Q/K/V, scalar FP32 scales, immutable sources, exact-B graph replay, inactive extents, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-attention-qk-prepare` | Check Qwen3.6 Q/K zero-centered normalization, 64-wide three-axis MRoPE, represented BF16 cache append, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
+| `cargo run -p xtask -- qualify-qwen36-fp8-attention-qk-prepare` | Check the same exact Qwen3.6 routes with represented E4M3 K/V append for the long-context cache | terminal |
 | `cargo run -p xtask -- qualify-qwen36-attention-output` | Check Qwen3.6 query-paired sigmoid gating, static E4M3 output projection, immutable sources, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-gdn-input` | Check Qwen3.6 static E4M3 Q/K/V/Z, BF16 A/B controls, immutable sources, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
 | `cargo run -p xtask -- qualify-qwen36-gdn-output` | Check Qwen3.6 static E4M3 GDN output, immutable sources, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
@@ -283,6 +284,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-qwen35-nvfp4-attention-output` | Measure every complete Qwen3.5 sigmoid-gate, BF16-stage, and NVFP4 output graph with input restoration outside timing | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-attention-qk-prepare` | Measure every exact Qwen3.5 Q/K prepare and cache-append graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen36-attention-qk-prepare` | Measure every exact Qwen3.6 Q/K prepare and cache-append graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen36-fp8-attention-qk-prepare` | Measure every exact Qwen3.6 Q/K prepare and E4M3 cache-append graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT` | Measure every complete source-backed layer-60 graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-full-attention-layer SNAPSHOT` | Measure every complete source-backed layer-63 B=1..8 graph at a 131-token context and every from-empty T=32/64/128/1024 prefill graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-qwen35-full-attention-layer SNAPSHOT` | Measure every complete Qwen3.5 source-backed layer-31 graph at a 131-token, three-page BF16 context | terminal or `--json PATH` |
