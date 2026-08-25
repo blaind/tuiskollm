@@ -2,19 +2,22 @@
 
 use crate::device_benchmark;
 use crate::fp8_projection_oracle::bf16_to_f32;
-use crate::{DeviceBenchmarkError, target::MtpBf16MlpOp};
+use crate::{
+    DeviceBenchmarkError,
+    target::{MtpBf16MlpOp, Qwen35MtpBf16MlpOp},
+};
 use std::path::Path;
+use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     device_memory_info,
 };
-use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen38_27B};
+use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen35_9B, Qwen38_27B};
 
 pub(crate) const MAX_BATCH: usize = 8;
 const ALIGNMENT: usize = 256;
 pub(crate) const HIDDEN: usize = Qwen38_27B::HIDDEN;
 pub(crate) const INTERMEDIATE: usize = Qwen38_27B::INTERMEDIATE;
-const GATE_UP_ROWS: usize = 2 * INTERMEDIATE;
 const BF16_SENTINEL: u16 = 0xa5a5;
 const BYTE_SENTINEL: u8 = 0xa5;
 const INPUT_PATTERN: [f32; 16] = [
@@ -105,18 +108,85 @@ struct Observed {
     output: Vec<u16>,
 }
 
+trait QualifiedMlpOp: Sized {
+    fn new(context: &Arc<CudaContext>) -> GpuResult<Self>;
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        input: *const u16,
+        gate_up_weight: *const u16,
+        activation: *mut u16,
+        down_weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+macro_rules! impl_qualified_mlp_op {
+    ($op:ty) => {
+        impl QualifiedMlpOp for $op {
+            fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+                <$op>::new(context)
+            }
+
+            unsafe fn launch(
+                &self,
+                stream: &CudaStream,
+                batch: usize,
+                input: *const u16,
+                gate_up_weight: *const u16,
+                activation: *mut u16,
+                down_weight: *const u16,
+                output: *mut u16,
+            ) -> GpuResult<()> {
+                unsafe {
+                    <$op>::launch(
+                        self,
+                        stream,
+                        batch,
+                        input,
+                        gate_up_weight,
+                        activation,
+                        down_weight,
+                        output,
+                    )
+                }
+            }
+        }
+    };
+}
+
+impl_qualified_mlp_op!(MtpBf16MlpOp);
+impl_qualified_mlp_op!(Qwen35MtpBf16MlpOp);
+
 /// Qualifies the source-BF16 MTP MLP at exact `B=1..=8`.
 pub fn qualify_mtp_bf16_mlp(
     root: &Path,
 ) -> Result<MtpBf16MlpQualification, MtpBf16MlpQualificationError> {
+    qualify_mlp::<Qwen38_27B, MtpBf16MlpOp>(root)
+}
+
+/// Qualifies the Qwen3.5 source-BF16 MTP MLP at exact `B=1..=8`.
+pub fn qualify_qwen35_mtp_bf16_mlp(
+    root: &Path,
+) -> Result<MtpBf16MlpQualification, MtpBf16MlpQualificationError> {
+    qualify_mlp::<Qwen35_9B, Qwen35MtpBf16MlpOp>(root)
+}
+
+fn qualify_mlp<A: Arch, O: QualifiedMlpOp>(
+    root: &Path,
+) -> Result<MtpBf16MlpQualification, MtpBf16MlpQualificationError> {
     let _preflight = device_benchmark::preflight()?;
-    let snapshot = CheckpointSnapshot::<Qwen38_27B>::open(root)?;
+    let snapshot = CheckpointSnapshot::<A>::open(root)?;
     let bindings = MtpBindings::bind(&snapshot)?;
-    let fixture = make_fixture(
+    let fixture = make_fixture::<A>(
         bf16_words(bindings.gate_up_weight_bf16)?,
         bindings.down_weight.words().collect(),
     )?;
-    let source_activation = source_swiglu_oracle(&fixture.input[..HIDDEN], &fixture.gate_up_weight);
+    let source_activation =
+        source_swiglu_oracle::<A>(&fixture.input[..A::HIDDEN], &fixture.gate_up_weight);
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
     if capability != (12, 0) {
@@ -127,14 +197,14 @@ pub fn qualify_mtp_bf16_mlp(
     }
 
     let stream = context.new_stream().map_err(GpuError::from)?;
-    let (layout, regions) = layout()?;
+    let (layout, regions) = layout_for::<A>()?;
     let arena = DeviceArena::zeroed(&stream, &layout)?;
-    let op = MtpBf16MlpOp::new(&context)?;
+    let op = O::new(&context)?;
     load_immutable(&arena, &stream, regions, &fixture)?;
     let stable_addresses = addresses(&arena, regions)?;
-    let route_reference = b1_route_references(&op, &arena, &stream, regions, &fixture)?;
-    let source_output = source_projection_oracle(
-        &route_reference.activation[..INTERMEDIATE],
+    let route_reference = b1_route_references::<A, O>(&op, &arena, &stream, regions)?;
+    let source_output = source_projection_oracle::<A>(
+        &route_reference.activation[..A::INTERMEDIATE],
         &fixture.down_weight,
     );
     let mut report = MtpBf16MlpQualification {
@@ -157,7 +227,7 @@ pub fn qualify_mtp_bf16_mlp(
         reset(&arena, &stream, regions)?;
         launch(&op, &arena, &stream, regions, batch)?;
         let eager = observe(&arena, &stream, regions)?;
-        verify_outputs(
+        verify_outputs::<A>(
             batch,
             &route_reference,
             &source_activation,
@@ -173,7 +243,7 @@ pub fn qualify_mtp_bf16_mlp(
         // its caller and outlives the replays and the synchronize that follows.
         unsafe { graph.launch(&stream) }?;
         let replay = observe(&arena, &stream, regions)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay::<A>(batch, &eager, &replay, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(MtpBf16MlpQualificationError::Mismatch(format!(
@@ -183,19 +253,23 @@ pub fn qualify_mtp_bf16_mlp(
     }
 
     verify_immutable(&arena, &stream, regions, &fixture, &mut report)?;
-    verify_no_post_warmup_allocation(&context, &op, &arena, &stream, regions)?;
+    verify_no_post_warmup_allocation::<O>(&context, &op, &arena, &stream, regions)?;
     device_benchmark::require_current_process_exclusive()?;
 
     Ok(report)
 }
 
 pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
+    layout_for::<Qwen38_27B>()
+}
+
+fn layout_for<A: Arch>() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let input = layout.reserve(MAX_BATCH * HIDDEN, ALIGNMENT)?;
-    let gate_up_weight = layout.reserve(GATE_UP_ROWS * HIDDEN, ALIGNMENT)?;
-    let activation = layout.reserve(MAX_BATCH * INTERMEDIATE, ALIGNMENT)?;
-    let down_weight = layout.reserve(HIDDEN * INTERMEDIATE, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * HIDDEN, ALIGNMENT)?;
+    let input = layout.reserve(MAX_BATCH * A::HIDDEN, ALIGNMENT)?;
+    let gate_up_weight = layout.reserve(2 * A::INTERMEDIATE * A::HIDDEN, ALIGNMENT)?;
+    let activation = layout.reserve(MAX_BATCH * A::INTERMEDIATE, ALIGNMENT)?;
+    let down_weight = layout.reserve(A::HIDDEN * A::INTERMEDIATE, ALIGNMENT)?;
+    let output = layout.reserve(MAX_BATCH * A::HIDDEN, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -221,20 +295,22 @@ fn bf16_words(bytes: &[u8]) -> Result<Vec<u16>, MtpBf16MlpQualificationError> {
         .collect())
 }
 
-fn make_fixture(
+fn make_fixture<A: Arch>(
     gate_up_weight: Vec<u16>,
     down_weight: Vec<u16>,
 ) -> Result<Fixture, MtpBf16MlpQualificationError> {
-    if gate_up_weight.len() != GATE_UP_ROWS * HIDDEN || down_weight.len() != HIDDEN * INTERMEDIATE {
+    if gate_up_weight.len() != 2 * A::INTERMEDIATE * A::HIDDEN
+        || down_weight.len() != A::HIDDEN * A::INTERMEDIATE
+    {
         return Err(MtpBf16MlpQualificationError::Mismatch(format!(
             "source MLP geometry differs: gate/up {}, down {}",
             gate_up_weight.len(),
             down_weight.len()
         )));
     }
-    let input = (0..MAX_BATCH * HIDDEN)
+    let input = (0..MAX_BATCH * A::HIDDEN)
         .map(|index| {
-            let token = index / HIDDEN;
+            let token = index / A::HIDDEN;
             let value = INPUT_PATTERN[(index + 3 * token) & 15] * TOKEN_FACTORS[token];
             f32_to_bf16(value)
         })
@@ -279,8 +355,8 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 5]> {
     ])
 }
 
-fn launch(
-    op: &MtpBf16MlpOp,
+fn launch<O: QualifiedMlpOp>(
+    op: &O,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
@@ -300,8 +376,8 @@ fn launch(
     }
 }
 
-fn launch_b1_row(
-    op: &MtpBf16MlpOp,
+fn launch_b1_row<A: Arch, O: QualifiedMlpOp>(
+    op: &O,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
@@ -312,25 +388,26 @@ fn launch_b1_row(
         op.launch(
             stream,
             1,
-            arena.address(regions.input)?.add(row * HIDDEN),
+            arena.address(regions.input)?.add(row * A::HIDDEN),
             arena.address(regions.gate_up_weight)?,
-            arena.address(regions.activation)?.add(row * INTERMEDIATE),
+            arena
+                .address(regions.activation)?
+                .add(row * A::INTERMEDIATE),
             arena.address(regions.down_weight)?,
-            arena.address(regions.output)?.add(row * HIDDEN),
+            arena.address(regions.output)?.add(row * A::HIDDEN),
         )
     }
 }
 
-fn b1_route_references(
-    op: &MtpBf16MlpOp,
+fn b1_route_references<A: Arch, O: QualifiedMlpOp>(
+    op: &O,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
-    _fixture: &Fixture,
 ) -> GpuResult<Observed> {
     reset(arena, stream, regions)?;
     for row in 0..MAX_BATCH {
-        launch_b1_row(op, arena, stream, regions, row)?;
+        launch_b1_row::<A, O>(op, arena, stream, regions, row)?;
     }
     observe(arena, stream, regions)
 }
@@ -342,10 +419,10 @@ fn observe(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuRes
     })
 }
 
-fn source_swiglu_oracle(input: &[u16], gate_up_weight: &[u16]) -> Vec<f64> {
-    let (gate, up) = gate_up_weight.split_at(INTERMEDIATE * HIDDEN);
-    gate.chunks_exact(HIDDEN)
-        .zip(up.chunks_exact(HIDDEN))
+fn source_swiglu_oracle<A: Arch>(input: &[u16], gate_up_weight: &[u16]) -> Vec<f64> {
+    let (gate, up) = gate_up_weight.split_at(A::INTERMEDIATE * A::HIDDEN);
+    gate.chunks_exact(A::HIDDEN)
+        .zip(up.chunks_exact(A::HIDDEN))
         .map(|(gate_row, up_row)| {
             let gate = dot(input, gate_row);
             let up = dot(input, up_row);
@@ -354,9 +431,9 @@ fn source_swiglu_oracle(input: &[u16], gate_up_weight: &[u16]) -> Vec<f64> {
         .collect()
 }
 
-fn source_projection_oracle(input: &[u16], weight: &[u16]) -> Vec<f64> {
+fn source_projection_oracle<A: Arch>(input: &[u16], weight: &[u16]) -> Vec<f64> {
     weight
-        .chunks_exact(INTERMEDIATE)
+        .chunks_exact(A::INTERMEDIATE)
         .map(|row| dot(input, row))
         .collect()
 }
@@ -367,7 +444,7 @@ fn dot(left: &[u16], right: &[u16]) -> f64 {
     })
 }
 
-fn verify_outputs(
+fn verify_outputs<A: Arch>(
     batch: usize,
     route_reference: &Observed,
     source_activation: &[f64],
@@ -375,8 +452,8 @@ fn verify_outputs(
     observed: &Observed,
     report: &mut MtpBf16MlpQualification,
 ) -> Result<(), MtpBf16MlpQualificationError> {
-    let active_activation = batch * INTERMEDIATE;
-    let active_output = batch * HIDDEN;
+    let active_activation = batch * A::INTERMEDIATE;
+    let active_output = batch * A::HIDDEN;
     if let Some(index) = observed.activation[..active_activation]
         .iter()
         .zip(&route_reference.activation[..active_activation])
@@ -396,7 +473,7 @@ fn verify_outputs(
         )));
     }
     if batch == 1 {
-        for (row, (&actual, &expected)) in observed.activation[..INTERMEDIATE]
+        for (row, (&actual, &expected)) in observed.activation[..A::INTERMEDIATE]
             .iter()
             .zip(source_activation)
             .enumerate()
@@ -411,7 +488,7 @@ fn verify_outputs(
                 )));
             }
         }
-        for (row, (&actual, &expected)) in observed.output[..HIDDEN]
+        for (row, (&actual, &expected)) in observed.output[..A::HIDDEN]
             .iter()
             .zip(source_output)
             .enumerate()
@@ -426,25 +503,25 @@ fn verify_outputs(
                 )));
             }
         }
-        report.source_activation_values += INTERMEDIATE;
-        report.source_output_values += HIDDEN;
+        report.source_activation_values += A::INTERMEDIATE;
+        report.source_output_values += A::HIDDEN;
     }
 
-    verify_inactive(batch, observed)?;
+    verify_inactive::<A>(batch, observed)?;
     report.activation_values += active_activation;
     report.output_values += active_output;
-    report.inactive_values += inactive_values(batch);
+    report.inactive_values += inactive_values::<A>(batch);
     Ok(())
 }
 
-fn verify_replay(
+fn verify_replay<A: Arch>(
     batch: usize,
     eager: &Observed,
     replay: &Observed,
     report: &mut MtpBf16MlpQualification,
 ) -> Result<(), MtpBf16MlpQualificationError> {
-    let active_activation = batch * INTERMEDIATE;
-    let active_output = batch * HIDDEN;
+    let active_activation = batch * A::INTERMEDIATE;
+    let active_output = batch * A::HIDDEN;
     if replay.activation[..active_activation] != eager.activation[..active_activation]
         || replay.output[..active_output] != eager.output[..active_output]
     {
@@ -452,17 +529,20 @@ fn verify_replay(
             "B={batch} graph replay differs from eager execution"
         )));
     }
-    verify_inactive(batch, replay)?;
+    verify_inactive::<A>(batch, replay)?;
     report.graph_replay_values += active_activation + active_output;
-    report.inactive_values += inactive_values(batch);
+    report.inactive_values += inactive_values::<A>(batch);
     Ok(())
 }
 
-fn verify_inactive(batch: usize, observed: &Observed) -> Result<(), MtpBf16MlpQualificationError> {
-    if observed.activation[batch * INTERMEDIATE..]
+fn verify_inactive<A: Arch>(
+    batch: usize,
+    observed: &Observed,
+) -> Result<(), MtpBf16MlpQualificationError> {
+    if observed.activation[batch * A::INTERMEDIATE..]
         .iter()
         .any(|&value| value != BF16_SENTINEL)
-        || observed.output[batch * HIDDEN..]
+        || observed.output[batch * A::HIDDEN..]
             .iter()
             .any(|&value| value != BF16_SENTINEL)
     {
@@ -473,8 +553,8 @@ fn verify_inactive(batch: usize, observed: &Observed) -> Result<(), MtpBf16MlpQu
     Ok(())
 }
 
-fn inactive_values(batch: usize) -> usize {
-    (MAX_BATCH - batch) * (INTERMEDIATE + HIDDEN)
+fn inactive_values<A: Arch>(batch: usize) -> usize {
+    (MAX_BATCH - batch) * (A::INTERMEDIATE + A::HIDDEN)
 }
 
 fn verify_immutable(
@@ -499,9 +579,9 @@ fn verify_immutable(
     Ok(())
 }
 
-fn verify_no_post_warmup_allocation(
+fn verify_no_post_warmup_allocation<O: QualifiedMlpOp>(
     context: &CudaContext,
-    op: &MtpBf16MlpOp,
+    op: &O,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
@@ -535,8 +615,12 @@ fn verify_no_post_warmup_allocation(
 
 #[cfg(test)]
 mod tests {
-    use super::{HIDDEN, INTERMEDIATE, MAX_BATCH, layout, qualify_mtp_bf16_mlp};
+    use super::{
+        HIDDEN, INTERMEDIATE, MAX_BATCH, layout, layout_for, qualify_mtp_bf16_mlp,
+        qualify_qwen35_mtp_bf16_mlp,
+    };
     use std::path::PathBuf;
+    use tuisko_model::{Arch, Qwen35_9B};
 
     #[test]
     fn mtp_bf16_mlp_suite_route_and_byte_inventory_is_exact() {
@@ -572,6 +656,45 @@ mod tests {
         assert_eq!(report.weight_bytes, 534_773_760);
         assert_eq!(report.workspace_bytes, 442_368);
         assert_eq!(report.arena_bytes, 535_216_128);
+        assert_eq!(report.padding_bytes, 0);
+        assert!(report.maximum_activation_error.is_finite());
+        assert!(report.maximum_output_error.is_finite());
+    }
+
+    #[test]
+    fn qwen35_mtp_mlp_suite_route_and_byte_inventory_is_exact() {
+        let (layout, regions) = layout_for::<Qwen35_9B>().unwrap();
+
+        assert_eq!(Qwen35_9B::HIDDEN, 4_096);
+        assert_eq!(Qwen35_9B::INTERMEDIATE, 12_288);
+        assert_eq!(regions.weight_bytes(), 301_989_888);
+        assert_eq!(regions.workspace_bytes(), 327_680);
+        assert_eq!(regions.payload_bytes(), 302_317_568);
+        assert_eq!(layout.byte_len(), regions.payload_bytes());
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive SM120 device and the pinned Qwen3.5 snapshot"]
+    fn qwen35_mtp_mlp_suite_source_values_match_every_seam_route_and_graph() {
+        let root = PathBuf::from(
+            std::env::var_os("TUISKO_QWEN35_SNAPSHOT")
+                .expect("TUISKO_QWEN35_SNAPSHOT must name the snapshot"),
+        );
+        let report =
+            qualify_qwen35_mtp_bf16_mlp(&root).expect("Qwen3.5 MTP BF16 MLP qualification");
+        let hidden = Qwen35_9B::HIDDEN;
+        let intermediate = Qwen35_9B::INTERMEDIATE;
+
+        assert_eq!(report.activation_values, 36 * intermediate);
+        assert_eq!(report.output_values, 36 * hidden);
+        assert_eq!(report.source_activation_values, intermediate);
+        assert_eq!(report.source_output_values, hidden);
+        assert_eq!(report.graph_replay_values, 36 * (intermediate + hidden));
+        assert_eq!(report.inactive_values, 2 * 28 * (intermediate + hidden));
+        assert_eq!(report.immutable_values, 151_027_712);
+        assert_eq!(report.weight_bytes, 301_989_888);
+        assert_eq!(report.workspace_bytes, 327_680);
+        assert_eq!(report.arena_bytes, 302_317_568);
         assert_eq!(report.padding_bytes, 0);
         assert!(report.maximum_activation_error.is_finite());
         assert!(report.maximum_output_error.is_finite());

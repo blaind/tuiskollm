@@ -775,6 +775,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen35-mtp-bf16-attention") => {
             qualify_qwen35_mtp_bf16_attention(root, &remaining)
         }
+        Some("qualify-qwen35-mtp-bf16-mlp") => qualify_qwen35_mtp_bf16_mlp(root, &remaining),
         Some("qualify-qwen35-text-endpoint") => qualify_qwen35_text_endpoint(root, &remaining),
         Some("qualify-qwen36-text-endpoint") => qualify_qwen36_text_endpoint(root, &remaining),
         Some("qualify-qwen36-resident-model") => qualify_qwen36_resident_model(root, &remaining),
@@ -1038,6 +1039,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-qwen35-attention-qk-prepare"
                     | "qualify-qwen35-mtp-bf16-fusion"
                     | "qualify-qwen35-mtp-bf16-attention"
+                    | "qualify-qwen35-mtp-bf16-mlp"
                     | "qualify-qwen36-attention-qk-prepare"
                     | "qualify-qwen35-nvfp4-attention-output"
                     | "qualify-qwen35-gdn-prepare"
@@ -1944,6 +1946,38 @@ fn qualify_qwen35_mtp_bf16_attention(
             "--lib",
             "--",
             "qwen35_mtp_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
+    )
+}
+
+fn qualify_qwen35_mtp_bf16_mlp(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-qwen35-mtp-bf16-mlp SNAPSHOT".into());
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen35_mtp_mlp_suite_",
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",

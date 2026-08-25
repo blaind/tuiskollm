@@ -394,6 +394,7 @@ pub use mtp_bf16_fusion_benchmark::benchmark_mtp_bf16_fusion;
 #[cfg(feature = "device")]
 pub use mtp_bf16_mlp::{
     MtpBf16MlpQualification, MtpBf16MlpQualificationError, qualify_mtp_bf16_mlp,
+    qualify_qwen35_mtp_bf16_mlp,
 };
 #[cfg(feature = "device")]
 pub use mtp_bf16_mlp_benchmark::benchmark_mtp_bf16_mlp;
