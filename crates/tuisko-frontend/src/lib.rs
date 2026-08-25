@@ -10,54 +10,103 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
-use tuisko_model::{CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
+use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 pub use error::{FrontendError, FrontendErrorCode, FrontendResult};
 
 const TOKENIZER_FILE: &str = "tokenizer.json";
 const TEMPLATE_FILE: &str = "chat_template.jinja";
 const GENERATION_CONFIG_FILE: &str = "generation_config.json";
-const QWEN38_TOKENIZER_ENTRIES: usize = 248_077;
-const QWEN35_TOKENIZER_ENTRIES: usize = 248_070;
-const QWEN36_TOKENIZER_ENTRIES: usize = 248_070;
 const IM_START_ID: u32 = 248_045;
 const IM_END_ID: u32 = 248_046;
 const END_OF_TEXT_ID: u32 = 248_044;
-const QWEN38_EOS_IDS: [u32; 2] = [IM_END_ID, END_OF_TEXT_ID];
-const QWEN35_EOS_IDS: [u32; 1] = [END_OF_TEXT_ID];
-const QWEN36_EOS_IDS: [u32; 2] = [IM_END_ID, END_OF_TEXT_ID];
-const DEFAULT_TEMPERATURE: f32 = 1.0;
-const DEFAULT_TOP_P: f32 = 0.95;
-const DEFAULT_TOP_K: usize = 20;
 const PROMPT_BLOCK_START: &str = SPECIAL_TOKEN_LITERALS[0];
 const GENERATION_BLOCK_START: &str = "<|im_start|>assistant";
 
 /// Literal strings the pinned tokenizer always extracts as control tokens from raw text.
 pub const SPECIAL_TOKEN_LITERALS: [&str; 3] = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"];
 
-#[derive(Clone, Copy)]
-enum FrontendContract {
-    Qwen38,
-    Qwen35,
-    Qwen36,
+/// Pinned tokenizer identity of every control literal an admitted schema may list.
+const CONTROL_TOKEN_IDS: [(&str, u32); 3] = [
+    (SPECIAL_TOKEN_LITERALS[0], IM_START_ID),
+    (SPECIAL_TOKEN_LITERALS[1], IM_END_ID),
+    (SPECIAL_TOKEN_LITERALS[2], END_OF_TEXT_ID),
+];
+
+mod private {
+    /// Seals `TokenizedSchema` to the targets this crate has admitted tokenizers for.
+    pub trait Sealed {}
+
+    impl Sealed for tuisko_model::Qwen38_27B {}
+
+    impl Sealed for tuisko_model::Qwen35_9B {}
+
+    impl Sealed for tuisko_model::Qwen36Moe35B {}
 }
 
-impl FrontendContract {
-    const fn tokenizer_entries(self) -> usize {
-        match self {
-            Self::Qwen38 => QWEN38_TOKENIZER_ENTRIES,
-            Self::Qwen35 => QWEN35_TOKENIZER_ENTRIES,
-            Self::Qwen36 => QWEN36_TOKENIZER_ENTRIES,
-        }
-    }
+/// Shape the pinned `generation_config.json` uses to state sampling defaults.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenerationAdmission {
+    /// `do_sample` is true and `temperature`, `top_p`, and `top_k` are all present.
+    Sampled,
+    /// `do_sample` is false or absent and every sampling field is absent.
+    Greedy,
+}
 
-    const fn eos_ids(self) -> &'static [u32] {
-        match self {
-            Self::Qwen38 => &QWEN38_EOS_IDS,
-            Self::Qwen35 => &QWEN35_EOS_IDS,
-            Self::Qwen36 => &QWEN36_EOS_IDS,
-        }
-    }
+/// Tokenizer, stop-token, and generation metadata of one admitted target.
+///
+/// Sealed per Part I §3 Bound C: `tuisko-frontend` owns tokenizer admission, so only
+/// targets whose pinned tokenizer, template, and generation config this crate already
+/// admits implement it. Widening it would make an unfinished target constructible.
+pub trait TokenizedSchema: Arch + private::Sealed {
+    /// Entries in `tokenizer.json`, distinct from `Arch::VOCAB`'s padded LM-head width.
+    const TOKENIZER_ENTRIES: usize;
+    /// Stop token IDs registered in `generation_config.json`, in file order.
+    const EOS_IDS: &'static [u32];
+    /// Shape this target's `generation_config.json` must take.
+    const GENERATION_ADMISSION: GenerationAdmission;
+    /// Sampling defaults the pinned `generation_config.json` must state.
+    const DEFAULT_GENERATION: GenerationDefaults;
+    /// Control token literals extracted before BPE tokenization. Required, with no trait
+    /// default: the Qwen chat-control tokens are coincidental family metadata, not an
+    /// invariant, and a future family must never inherit `<|im_start|>` silently.
+    const SPECIAL_TOKENS: &'static [&'static str];
+}
+
+impl TokenizedSchema for Qwen38_27B {
+    const TOKENIZER_ENTRIES: usize = 248_077;
+    const EOS_IDS: &'static [u32] = &[IM_END_ID, END_OF_TEXT_ID];
+    const GENERATION_ADMISSION: GenerationAdmission = GenerationAdmission::Sampled;
+    const DEFAULT_GENERATION: GenerationDefaults = GenerationDefaults {
+        temperature: 1.0,
+        top_p: 0.95,
+        top_k: 20,
+    };
+    const SPECIAL_TOKENS: &'static [&'static str] = &SPECIAL_TOKEN_LITERALS;
+}
+
+impl TokenizedSchema for Qwen35_9B {
+    const TOKENIZER_ENTRIES: usize = 248_070;
+    const EOS_IDS: &'static [u32] = &[END_OF_TEXT_ID];
+    const GENERATION_ADMISSION: GenerationAdmission = GenerationAdmission::Greedy;
+    const DEFAULT_GENERATION: GenerationDefaults = GenerationDefaults {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 1,
+    };
+    const SPECIAL_TOKENS: &'static [&'static str] = &SPECIAL_TOKEN_LITERALS;
+}
+
+impl TokenizedSchema for Qwen36Moe35B {
+    const TOKENIZER_ENTRIES: usize = 248_070;
+    const EOS_IDS: &'static [u32] = &[IM_END_ID, END_OF_TEXT_ID];
+    const GENERATION_ADMISSION: GenerationAdmission = GenerationAdmission::Sampled;
+    const DEFAULT_GENERATION: GenerationDefaults = GenerationDefaults {
+        temperature: 1.0,
+        top_p: 0.95,
+        top_k: 20,
+    };
+    const SPECIAL_TOKENS: &'static [&'static str] = &SPECIAL_TOKEN_LITERALS;
 }
 
 /// One text message supplied to the checkpoint chat template.
@@ -374,22 +423,22 @@ pub struct StreamingDecoder {
 }
 
 impl TextFrontend {
-    /// Loads and validates frontend files from an admitted snapshot.
-    pub fn open(snapshot: &CheckpointSnapshot<Qwen38_27B>) -> FrontendResult<Self> {
+    /// Loads and validates tokenizer, template, and generation metadata for an admitted schema.
+    pub fn open<A: TokenizedSchema>(snapshot: &CheckpointSnapshot<A>) -> FrontendResult<Self> {
         Self::open_with_options(snapshot, TextFrontendOptions::default())
     }
 
-    /// Loads the frontend with explicit startup options.
-    pub fn open_with_options(
-        snapshot: &CheckpointSnapshot<Qwen38_27B>,
+    /// Loads the frontend for an admitted schema with explicit startup options.
+    pub fn open_with_options<A: TokenizedSchema>(
+        snapshot: &CheckpointSnapshot<A>,
         options: TextFrontendOptions,
     ) -> FrontendResult<Self> {
-        Self::open_root(snapshot.root(), options, FrontendContract::Qwen38)
+        Self::open_root::<A>(snapshot.root(), options)
     }
 
     /// Loads and validates the pinned Qwen3.5 tokenizer, template, and generation metadata.
     pub fn open_qwen35(snapshot: &CheckpointSnapshot<Qwen35_9B>) -> FrontendResult<Self> {
-        Self::open_qwen35_with_options(snapshot, TextFrontendOptions::default())
+        Self::open(snapshot)
     }
 
     /// Loads the Qwen3.5 frontend with explicit startup options.
@@ -397,12 +446,12 @@ impl TextFrontend {
         snapshot: &CheckpointSnapshot<Qwen35_9B>,
         options: TextFrontendOptions,
     ) -> FrontendResult<Self> {
-        Self::open_root(snapshot.root(), options, FrontendContract::Qwen35)
+        Self::open_with_options(snapshot, options)
     }
 
     /// Loads and validates the pinned Qwen3.6 tokenizer, template, and generation metadata.
     pub fn open_qwen36(snapshot: &CheckpointSnapshot<Qwen36Moe35B>) -> FrontendResult<Self> {
-        Self::open_qwen36_with_options(snapshot, TextFrontendOptions::default())
+        Self::open(snapshot)
     }
 
     /// Loads the Qwen3.6 frontend with explicit startup options.
@@ -410,13 +459,12 @@ impl TextFrontend {
         snapshot: &CheckpointSnapshot<Qwen36Moe35B>,
         options: TextFrontendOptions,
     ) -> FrontendResult<Self> {
-        Self::open_root(snapshot.root(), options, FrontendContract::Qwen36)
+        Self::open_with_options(snapshot, options)
     }
 
-    fn open_root(
+    fn open_root<A: TokenizedSchema>(
         root: &Path,
         options: TextFrontendOptions,
-        contract: FrontendContract,
     ) -> FrontendResult<Self> {
         let tokenizer_path = root.join(TOKENIZER_FILE);
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(tokenizer_error(
@@ -426,15 +474,15 @@ impl TextFrontend {
             .with_truncation(None)
             .map_err(tokenizer_error("could not disable truncation"))?;
         let byte_table = byte_level_table();
-        validate_tokenizer(&tokenizer, contract, &byte_table)?;
+        validate_tokenizer::<A>(&tokenizer, &byte_table)?;
 
         let template_path = root.join(TEMPLATE_FILE);
         let template = read_string(&template_path)?;
 
         let generation_path = root.join(GENERATION_CONFIG_FILE);
         let generation = read_json(&generation_path)?;
-        let stop_ids = parse_stop_ids(&generation, contract)?;
-        let generation_defaults = parse_generation_defaults(&generation, contract)?;
+        let stop_ids = parse_stop_ids::<A>(&generation)?;
+        let generation_defaults = parse_generation_defaults::<A>(&generation)?;
         let mut special_encode_tokens = tokenizer
             .get_added_tokens_decoder()
             .iter()
@@ -1115,25 +1163,25 @@ fn tokenizer_error<E: std::fmt::Display>(context: &str) -> impl FnOnce(E) -> Fro
     move |source| FrontendError::Tokenizer(format!("{context}: {source}"))
 }
 
-fn validate_tokenizer(
+fn validate_tokenizer<A: TokenizedSchema>(
     tokenizer: &Tokenizer,
-    contract: FrontendContract,
     byte_table: &HashMap<char, u8>,
 ) -> FrontendResult<()> {
     let entries = tokenizer.get_vocab_size(true);
-    let expected_entries = contract.tokenizer_entries();
+    let expected_entries = A::TOKENIZER_ENTRIES;
     if entries != expected_entries {
         return Err(FrontendError::Contract(format!(
             "tokenizer has {entries} entries, expected {expected_entries}"
         )));
     }
 
-    let [im_start, im_end, end_of_text] = SPECIAL_TOKEN_LITERALS;
-    for (token, expected) in [
-        (im_start, IM_START_ID),
-        (im_end, IM_END_ID),
-        (end_of_text, END_OF_TEXT_ID),
-    ] {
+    for &token in A::SPECIAL_TOKENS {
+        let expected = CONTROL_TOKEN_IDS
+            .iter()
+            .find_map(|&(literal, id)| (literal == token).then_some(id))
+            .ok_or_else(|| {
+                FrontendError::Contract(format!("control token `{token}` has no pinned ID"))
+            })?;
         let actual = tokenizer.token_to_id(token);
         if actual != Some(expected) {
             return Err(FrontendError::Contract(format!(
@@ -1189,7 +1237,7 @@ fn read_json(path: &Path) -> FrontendResult<Value> {
     })
 }
 
-fn parse_stop_ids(generation: &Value, contract: FrontendContract) -> FrontendResult<Vec<u32>> {
+fn parse_stop_ids<A: TokenizedSchema>(generation: &Value) -> FrontendResult<Vec<u32>> {
     let value = generation.get("eos_token_id").ok_or_else(|| {
         FrontendError::Contract("generation_config.json is missing `eos_token_id`".into())
     })?;
@@ -1204,7 +1252,7 @@ fn parse_stop_ids(generation: &Value, contract: FrontendContract) -> FrontendRes
         .ok_or_else(|| {
             FrontendError::Contract("generation_config.json contains a non-u32 stop ID".into())
         })?;
-    let expected = contract.eos_ids();
+    let expected = A::EOS_IDS;
     if stop_ids != expected {
         return Err(FrontendError::Contract(format!(
             "generation stop IDs {stop_ids:?} do not match {expected:?}"
@@ -1214,19 +1262,23 @@ fn parse_stop_ids(generation: &Value, contract: FrontendContract) -> FrontendRes
     Ok(stop_ids)
 }
 
-fn parse_generation_defaults(
+fn parse_generation_defaults<A: TokenizedSchema>(
     generation: &Value,
-    contract: FrontendContract,
 ) -> FrontendResult<GenerationDefaults> {
-    match contract {
-        FrontendContract::Qwen38 | FrontendContract::Qwen36 => {
-            parse_sampled_generation_defaults(generation)
+    match A::GENERATION_ADMISSION {
+        GenerationAdmission::Sampled => {
+            parse_sampled_generation_defaults(generation, A::DEFAULT_GENERATION)
         }
-        FrontendContract::Qwen35 => parse_qwen35_generation_defaults(generation),
+        GenerationAdmission::Greedy => {
+            parse_greedy_generation_defaults(generation, A::DEFAULT_GENERATION)
+        }
     }
 }
 
-fn parse_sampled_generation_defaults(generation: &Value) -> FrontendResult<GenerationDefaults> {
+fn parse_sampled_generation_defaults(
+    generation: &Value,
+    expected: GenerationDefaults,
+) -> FrontendResult<GenerationDefaults> {
     if generation.get("do_sample").and_then(Value::as_bool) != Some(true) {
         return Err(FrontendError::Contract(
             "generation_config.json `do_sample` must be true".into(),
@@ -1256,11 +1308,6 @@ fn parse_sampled_generation_defaults(generation: &Value) -> FrontendResult<Gener
         top_p,
         top_k,
     };
-    let expected = GenerationDefaults {
-        temperature: DEFAULT_TEMPERATURE,
-        top_p: DEFAULT_TOP_P,
-        top_k: DEFAULT_TOP_K,
-    };
     if defaults != expected {
         return Err(FrontendError::Contract(format!(
             "generation defaults {defaults:?} do not match {expected:?}"
@@ -1270,7 +1317,10 @@ fn parse_sampled_generation_defaults(generation: &Value) -> FrontendResult<Gener
     Ok(defaults)
 }
 
-fn parse_qwen35_generation_defaults(generation: &Value) -> FrontendResult<GenerationDefaults> {
+fn parse_greedy_generation_defaults(
+    generation: &Value,
+    defaults: GenerationDefaults,
+) -> FrontendResult<GenerationDefaults> {
     if generation
         .get("do_sample")
         .is_some_and(|value| value.as_bool() != Some(false))
@@ -1287,26 +1337,22 @@ fn parse_qwen35_generation_defaults(generation: &Value) -> FrontendResult<Genera
         }
     }
 
-    Ok(GenerationDefaults {
-        temperature: 0.0,
-        top_p: 1.0,
-        top_k: 1,
-    })
+    Ok(defaults)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedPrefix, ChatMessage, ChatTemplateOptions, FrontendContract, FrontendErrorCode,
-        PROMPT_BLOCK_START, PromptPrefixEntry, TextFrontend, best_cached_prefix, byte_level_table,
-        common_prefix_bytes, finish_pending, is_valid_utf8_prefix, parse_generation_defaults,
-        parse_stop_ids, push_stream_byte, utf8_sequence_length, validate_added_token_alphabet,
+        CachedPrefix, ChatMessage, ChatTemplateOptions, FrontendErrorCode, PROMPT_BLOCK_START,
+        PromptPrefixEntry, TextFrontend, best_cached_prefix, byte_level_table, common_prefix_bytes,
+        finish_pending, is_valid_utf8_prefix, parse_generation_defaults, parse_stop_ids,
+        push_stream_byte, utf8_sequence_length, validate_added_token_alphabet,
     };
     use serde_json::json;
     use std::collections::{HashSet, VecDeque};
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::{AddedToken, Tokenizer};
-    use tuisko_model::{CheckpointSnapshot, Qwen36Moe35B};
+    use tuisko_model::{CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
     // Transformers 5.2.0 `apply_chat_template` and tokenizer output from the pinned snapshot.
     const QWEN36_HELLO_THINKING: [u32; 11] = [
@@ -1433,15 +1479,12 @@ mod tests {
         let qwen35 = json!({"eos_token_id": 248044});
         let qwen36 = json!({"eos_token_id": [248046, 248044]});
         assert_eq!(
-            parse_stop_ids(&qwen38, FrontendContract::Qwen38).unwrap(),
+            parse_stop_ids::<Qwen38_27B>(&qwen38).unwrap(),
             [248046, 248044]
         );
+        assert_eq!(parse_stop_ids::<Qwen35_9B>(&qwen35).unwrap(), [248044]);
         assert_eq!(
-            parse_stop_ids(&qwen35, FrontendContract::Qwen35).unwrap(),
-            [248044]
-        );
-        assert_eq!(
-            parse_stop_ids(&qwen36, FrontendContract::Qwen36).unwrap(),
+            parse_stop_ids::<Qwen36Moe35B>(&qwen36).unwrap(),
             [248046, 248044]
         );
     }
@@ -1455,7 +1498,7 @@ mod tests {
             json!({"eos_token_id": [248046, 248043]}),
             json!({"eos_token_id": [248046, -1]}),
         ] {
-            let error = parse_stop_ids(&generation, FrontendContract::Qwen38).unwrap_err();
+            let error = parse_stop_ids::<Qwen38_27B>(&generation).unwrap_err();
             assert_eq!(error.code(), FrontendErrorCode::Contract);
         }
         for generation in [
@@ -1463,7 +1506,7 @@ mod tests {
             json!({"eos_token_id": [248044, 248046]}),
             json!({"eos_token_id": -1}),
         ] {
-            let error = parse_stop_ids(&generation, FrontendContract::Qwen35).unwrap_err();
+            let error = parse_stop_ids::<Qwen35_9B>(&generation).unwrap_err();
             assert_eq!(error.code(), FrontendErrorCode::Contract);
         }
         for generation in [
@@ -1471,7 +1514,7 @@ mod tests {
             json!({"eos_token_id": 248046}),
             json!({"eos_token_id": [248044, 248046]}),
         ] {
-            let error = parse_stop_ids(&generation, FrontendContract::Qwen36).unwrap_err();
+            let error = parse_stop_ids::<Qwen36Moe35B>(&generation).unwrap_err();
             assert_eq!(error.code(), FrontendErrorCode::Contract);
         }
     }
@@ -1640,13 +1683,13 @@ mod tests {
             "top_p": 0.95,
             "top_k": 20
         });
-        let defaults = parse_generation_defaults(&exact, FrontendContract::Qwen38).unwrap();
+        let defaults = parse_generation_defaults::<Qwen38_27B>(&exact).unwrap();
 
         assert_eq!(defaults.temperature, 1.0);
         assert_eq!(defaults.top_p, 0.95);
         assert_eq!(defaults.top_k, 20);
         assert_eq!(
-            parse_generation_defaults(&exact, FrontendContract::Qwen36).unwrap(),
+            parse_generation_defaults::<Qwen36Moe35B>(&exact).unwrap(),
             defaults
         );
 
@@ -1656,12 +1699,11 @@ mod tests {
             json!({"do_sample": true, "temperature": 1.0, "top_p": 0.9, "top_k": 20}),
             json!({"do_sample": true, "temperature": 1.0, "top_p": 0.95, "top_k": 40}),
         ] {
-            assert!(parse_generation_defaults(&changed, FrontendContract::Qwen38).is_err());
+            assert!(parse_generation_defaults::<Qwen38_27B>(&changed).is_err());
         }
 
         let defaults =
-            parse_generation_defaults(&json!({"eos_token_id": 248044}), FrontendContract::Qwen35)
-                .unwrap();
+            parse_generation_defaults::<Qwen35_9B>(&json!({"eos_token_id": 248044})).unwrap();
         assert_eq!(defaults.temperature, 0.0);
         assert_eq!(defaults.top_p, 1.0);
         assert_eq!(defaults.top_k, 1);
@@ -1671,7 +1713,7 @@ mod tests {
             json!({"top_p": 0.95}),
             json!({"top_k": 20}),
         ] {
-            assert!(parse_generation_defaults(&changed, FrontendContract::Qwen35).is_err());
+            assert!(parse_generation_defaults::<Qwen35_9B>(&changed).is_err());
         }
     }
 
