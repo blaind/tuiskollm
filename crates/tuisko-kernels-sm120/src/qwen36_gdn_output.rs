@@ -521,7 +521,7 @@ mod tests {
         assert_eq!(INPUT_COLUMNS, 4_096);
         assert_eq!(OUTPUT_ROWS, 2_048);
         assert_eq!(PROJECTION_THREADS, 128);
-        assert_eq!(OUTPUT_ROWS / ROWS_PER_CTA, 256);
+        assert_eq!(OUTPUT_ROWS / ROWS_PER_CTA, 512);
         assert_eq!(PREFILL_ROUTES, [32, 64, 128]);
         assert_eq!(PREFILL_SHARED_BYTES, 32_768);
 
