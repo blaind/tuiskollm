@@ -9,18 +9,54 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const MODEL: &str = "nvidia/Qwen3.6-35B-A3B-NVFP4";
-const GENERATION_ROUTE: &str = "compact-b1-8";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+#[derive(Clone, Copy)]
+struct ServerProfile {
+    label: &'static str,
+    model: &'static str,
+    generation_route: &'static str,
+    reasoning: &'static str,
+    tensor_count: usize,
+}
+
+const QWEN35: ServerProfile = ServerProfile {
+    label: "Qwen3.5",
+    model: "AxionML/Qwen3.5-9B-NVFP4",
+    generation_route: "mtp-b1-compact-b2-8",
+    reasoning: "Thinking Process",
+    tensor_count: 1_519,
+};
+
+const QWEN36: ServerProfile = ServerProfile {
+    label: "Qwen3.6",
+    model: "nvidia/Qwen3.6-35B-A3B-NVFP4",
+    generation_route: "compact-b1-8",
+    reasoning: "Here's",
+    tensor_count: 124_468,
+};
+
+pub(crate) fn qualify_qwen35(executable: &Path, snapshot: &Path) -> Result<(), Box<dyn Error>> {
+    qualify(QWEN35, executable, snapshot)
+}
+
 pub(crate) fn qualify_qwen36(executable: &Path, snapshot: &Path) -> Result<(), Box<dyn Error>> {
+    qualify(QWEN36, executable, snapshot)
+}
+
+fn qualify(
+    profile: ServerProfile,
+    executable: &Path,
+    snapshot: &Path,
+) -> Result<(), Box<dyn Error>> {
     if !executable.is_file() {
         return Err(format!("server binary `{}` does not exist", executable.display()).into());
     }
     let snapshot = snapshot.canonicalize().map_err(|error| {
         format!(
-            "resolving Qwen3.6 snapshot `{}`: {error}",
+            "resolving {} snapshot `{}`: {error}",
+            profile.label,
             snapshot.display()
         )
     })?;
@@ -42,11 +78,11 @@ pub(crate) fn qualify_qwen36(executable: &Path, snapshot: &Path) -> Result<(), B
     let agent = http_agent();
     let base = format!("http://{address}");
 
-    wait_until_ready(&agent, &base, &mut server)?;
-    validate_models(&get_json(&agent, &format!("{base}/v1/models"))?)?;
+    wait_until_ready(profile, &agent, &base, &mut server)?;
+    validate_models(profile, &get_json(&agent, &format!("{base}/v1/models"))?)?;
 
     let request = json!({
-        "model": MODEL,
+        "model": profile.model,
         "messages": [{"role": "user", "content": "Hello"}],
         "temperature": 0,
         "max_completion_tokens": 2,
@@ -57,7 +93,7 @@ pub(crate) fn qualify_qwen36(executable: &Path, snapshot: &Path) -> Result<(), B
         &request,
         "application/json",
     )?;
-    validate_blocking(&blocking)?;
+    validate_blocking(profile, &blocking)?;
 
     let mut streaming_request = request;
     streaming_request["stream"] = Value::Bool(true);
@@ -68,12 +104,13 @@ pub(crate) fn qualify_qwen36(executable: &Path, snapshot: &Path) -> Result<(), B
         &streaming_request,
         "text/event-stream",
     )?;
-    validate_streaming(&streaming)?;
+    validate_streaming(profile, &streaming)?;
 
     let output = server.stop()?;
-    validate_startup_output(&output)?;
+    validate_startup_output(profile, &output)?;
     println!(
-        "Qwen3.6 server qualification passed: health + exact model inventory + blocking + SSE; prompt/completion/total tokens 11/2/13"
+        "{} server qualification passed: health + exact model inventory + blocking + SSE; prompt/completion/total tokens 11/2/13",
+        profile.label
     );
     Ok(())
 }
@@ -88,6 +125,7 @@ fn http_agent() -> ureq::Agent {
 }
 
 fn wait_until_ready(
+    profile: ServerProfile,
     agent: &ureq::Agent,
     base: &str,
     server: &mut ServerProcess,
@@ -102,7 +140,7 @@ fn wait_until_ready(
         match agent.get(&health_url).call() {
             Ok(response) => {
                 let body = read_response("GET", &health_url, "application/json", Ok(response))?;
-                validate_health(&body)?;
+                validate_health(profile, &body)?;
                 return Ok(());
             }
             Err(ureq::Error::Io(_) | ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed) => {}
@@ -168,20 +206,20 @@ fn parse_json(label: &str, body: &str) -> Result<Value, String> {
     serde_json::from_str(body).map_err(|error| format!("{label} returned invalid JSON: {error}"))
 }
 
-fn validate_health(body: &str) -> Result<(), String> {
+fn validate_health(profile: ServerProfile, body: &str) -> Result<(), String> {
     let value = parse_json("health", body)?;
-    let expected = json!({"status": "ok", "generation_route": GENERATION_ROUTE});
+    let expected = json!({"status": "ok", "generation_route": profile.generation_route});
     if value != expected {
         return Err(format!("health returned {value}, expected {expected}"));
     }
     Ok(())
 }
 
-fn validate_models(body: &str) -> Result<(), String> {
+fn validate_models(profile: ServerProfile, body: &str) -> Result<(), String> {
     let value = parse_json("models", body)?;
     let expected = json!({
         "object": "list",
-        "data": [{"id": MODEL, "object": "model", "owned_by": "tuiskollm"}],
+        "data": [{"id": profile.model, "object": "model", "owned_by": "tuiskollm"}],
     });
     if value != expected {
         return Err(format!("models returned {value}, expected {expected}"));
@@ -189,28 +227,29 @@ fn validate_models(body: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_blocking(body: &str) -> Result<(), String> {
+fn validate_blocking(profile: ServerProfile, body: &str) -> Result<(), String> {
     let value = parse_json("blocking completion", body)?;
     let choices = value["choices"]
         .as_array()
         .ok_or_else(|| "blocking completion omitted choices".to_owned())?;
     if value["object"] != "chat.completion"
-        || value["model"] != MODEL
+        || value["model"] != profile.model
         || choices.len() != 1
         || choices[0]["index"] != 0
         || choices[0]["finish_reason"] != "length"
         || choices[0]["message"]["role"] != "assistant"
         || choices[0]["message"]["content"] != ""
-        || choices[0]["message"]["reasoning_content"] != "Here's"
+        || choices[0]["message"]["reasoning_content"] != profile.reasoning
     {
         return Err(format!(
-            "blocking completion did not match the exact Qwen3.6 response: {value}"
+            "blocking completion did not match the exact {} response: {value}",
+            profile.label
         ));
     }
     validate_usage("blocking completion", &value["usage"])
 }
 
-fn validate_streaming(body: &str) -> Result<(), String> {
+fn validate_streaming(profile: ServerProfile, body: &str) -> Result<(), String> {
     let data = body
         .lines()
         .filter_map(|line| line.strip_prefix("data: "))
@@ -227,7 +266,7 @@ fn validate_streaming(body: &str) -> Result<(), String> {
     }
     if events
         .iter()
-        .any(|event| event["object"] != "chat.completion.chunk" || event["model"] != MODEL)
+        .any(|event| event["object"] != "chat.completion.chunk" || event["model"] != profile.model)
     {
         return Err("streaming completion emitted the wrong object or model identity".into());
     }
@@ -236,9 +275,10 @@ fn validate_streaming(body: &str) -> Result<(), String> {
         .iter()
         .filter_map(|event| event["choices"][0]["delta"]["reasoning_content"].as_str())
         .collect::<String>();
-    if reasoning != "Here's" {
+    if reasoning != profile.reasoning {
         return Err(format!(
-            "streaming completion produced reasoning {reasoning:?}, expected \"Here's\""
+            "streaming completion produced reasoning {reasoning:?}, expected {:?}",
+            profile.reasoning
         ));
     }
     let terminal = events
@@ -278,9 +318,15 @@ fn validate_usage(label: &str, usage: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_startup_output(output: &Output) -> Result<(), Box<dyn Error>> {
+fn validate_startup_output(profile: ServerProfile, output: &Output) -> Result<(), Box<dyn Error>> {
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for evidence in [MODEL, "124468 tensors", "READY", "8 slots · context 262144"] {
+    let tensor_count = format!("{} tensors", profile.tensor_count);
+    for evidence in [
+        profile.model,
+        tensor_count.as_str(),
+        "READY",
+        "8 slots · context 262144",
+    ] {
         if !stdout.contains(evidence) {
             return Err(format!(
                 "server startup omitted {evidence:?}{}",
@@ -337,108 +383,115 @@ impl Drop for ServerProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::{MODEL, validate_blocking, validate_health, validate_models, validate_streaming};
+    use super::{
+        QWEN35, QWEN36, ServerProfile, validate_blocking, validate_health, validate_models,
+        validate_streaming,
+    };
     use serde_json::json;
 
-    #[test]
-    fn exact_json_boundaries_are_admitted() {
-        validate_health(r#"{"status":"ok","generation_route":"compact-b1-8"}"#).unwrap();
-        validate_models(
-            &json!({
-                "object": "list",
-                "data": [{"id": MODEL, "object": "model", "owned_by": "tuiskollm"}],
-            })
-            .to_string(),
-        )
-        .unwrap();
-        validate_blocking(
-            &json!({
-                "object": "chat.completion",
-                "model": MODEL,
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "length",
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "reasoning_content": "Here's",
-                    },
-                }],
-                "usage": {
-                    "prompt_tokens": 11,
-                    "completion_tokens": 2,
-                    "total_tokens": 13,
-                    "prompt_tokens_details": {"cached_tokens": 0},
-                },
-            })
-            .to_string(),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn health_requires_the_qwen36_generation_route() {
-        let error =
-            validate_health(r#"{"status":"ok","generation_route":"mtp-draft-3"}"#).unwrap_err();
-        assert!(error.contains("compact-b1-8"));
-    }
-
-    #[test]
-    fn exact_streaming_boundary_is_admitted() {
-        let body = format!(
-            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-            json!({
-                "object": "chat.completion.chunk",
-                "model": MODEL,
-                "choices": [{"delta": {"role": "assistant"}, "finish_reason": null}],
-            }),
-            json!({
-                "object": "chat.completion.chunk",
-                "model": MODEL,
-                "choices": [{"delta": {"reasoning_content": "Here"}, "finish_reason": null}],
-            }),
-            json!({
-                "object": "chat.completion.chunk",
-                "model": MODEL,
-                "choices": [{"delta": {"reasoning_content": "'s"}, "finish_reason": "length"}],
-            }),
-            json!({
-                "object": "chat.completion.chunk",
-                "model": MODEL,
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": 11,
-                    "completion_tokens": 2,
-                    "total_tokens": 13,
-                    "prompt_tokens_details": {"cached_tokens": 0},
-                },
-            }),
-        );
-        validate_streaming(&body).unwrap();
-    }
-
-    #[test]
-    fn changed_usage_and_incomplete_streams_are_rejected() {
-        let blocking = json!({
+    fn blocking(profile: ServerProfile) -> String {
+        json!({
             "object": "chat.completion",
-            "model": MODEL,
+            "model": profile.model,
             "choices": [{
                 "index": 0,
                 "finish_reason": "length",
                 "message": {
                     "role": "assistant",
                     "content": "",
-                    "reasoning_content": "Here's",
+                    "reasoning_content": profile.reasoning,
                 },
             }],
             "usage": {
-                "prompt_tokens": 10,
+                "prompt_tokens": 11,
                 "completion_tokens": 2,
-                "total_tokens": 12,
+                "total_tokens": 13,
                 "prompt_tokens_details": {"cached_tokens": 0},
             },
-        });
-        assert!(validate_blocking(&blocking.to_string()).is_err());
-        assert!(validate_streaming("data: {}\n\n").is_err());
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn exact_json_boundaries_are_admitted_for_both_targets() {
+        for profile in [QWEN35, QWEN36] {
+            validate_health(
+                profile,
+                &json!({"status": "ok", "generation_route": profile.generation_route}).to_string(),
+            )
+            .unwrap();
+            validate_models(
+                profile,
+                &json!({
+                    "object": "list",
+                    "data": [{"id": profile.model, "object": "model", "owned_by": "tuiskollm"}],
+                })
+                .to_string(),
+            )
+            .unwrap();
+            validate_blocking(profile, &blocking(profile)).unwrap();
+        }
+    }
+
+    #[test]
+    fn health_requires_the_exact_target_route() {
+        let qwen35 = validate_health(
+            QWEN35,
+            r#"{"status":"ok","generation_route":"compact-b1-8"}"#,
+        )
+        .unwrap_err();
+        assert!(qwen35.contains("mtp-b1-compact-b2-8"));
+        let qwen36 = validate_health(
+            QWEN36,
+            r#"{"status":"ok","generation_route":"mtp-b1-compact-b2-8"}"#,
+        )
+        .unwrap_err();
+        assert!(qwen36.contains("compact-b1-8"));
+    }
+
+    #[test]
+    fn exact_streaming_boundary_is_admitted_for_both_targets() {
+        for profile in [QWEN35, QWEN36] {
+            let split = profile.reasoning.len() / 2;
+            let body = format!(
+                "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({
+                    "object": "chat.completion.chunk",
+                    "model": profile.model,
+                    "choices": [{"delta": {"role": "assistant"}, "finish_reason": null}],
+                }),
+                json!({
+                    "object": "chat.completion.chunk",
+                    "model": profile.model,
+                    "choices": [{"delta": {"reasoning_content": &profile.reasoning[..split]}, "finish_reason": null}],
+                }),
+                json!({
+                    "object": "chat.completion.chunk",
+                    "model": profile.model,
+                    "choices": [{"delta": {"reasoning_content": &profile.reasoning[split..]}, "finish_reason": "length"}],
+                }),
+                json!({
+                    "object": "chat.completion.chunk",
+                    "model": profile.model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 11,
+                        "completion_tokens": 2,
+                        "total_tokens": 13,
+                        "prompt_tokens_details": {"cached_tokens": 0},
+                    },
+                }),
+            );
+            validate_streaming(profile, &body).unwrap();
+        }
+    }
+
+    #[test]
+    fn changed_usage_and_incomplete_streams_are_rejected() {
+        let mut blocking = serde_json::from_str::<serde_json::Value>(&blocking(QWEN35)).unwrap();
+        blocking["usage"]["prompt_tokens"] = json!(10);
+        blocking["usage"]["total_tokens"] = json!(12);
+        assert!(validate_blocking(QWEN35, &blocking.to_string()).is_err());
+        assert!(validate_streaming(QWEN35, "data: {}\n\n").is_err());
     }
 }

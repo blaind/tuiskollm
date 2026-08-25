@@ -797,6 +797,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen36-resident-model") => qualify_qwen36_resident_model(root, &remaining),
         Some("qualify-qwen36-generation") => qualify_qwen36_generation(root, &remaining),
         Some("qualify-qwen36-server") => qualify_qwen36_server(root, &remaining),
+        Some("qualify-qwen35-server") => qualify_qwen35_server(root, &remaining),
         Some("qualify-qwen35-resident-model") => qualify_qwen35_resident_model(root, &remaining),
         Some("qualify-qwen35-resident-mtp") => qualify_qwen35_resident_mtp(root, &remaining),
         Some("qualify-qwen35-mtp-generation") => qualify_qwen35_mtp_generation(root, &remaining),
@@ -2251,6 +2252,20 @@ fn qualify_qwen36_server(
     require_performance_device_idle()?;
     let executable = root.join(CUDA_OXIDE_BUILD_TARGET).join("release/tuiskollm");
     server_qualification::qualify_qwen36(&executable, Path::new(snapshot))
+}
+
+fn qualify_qwen35_server(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err("usage: cargo run -p xtask -- qualify-qwen35-server SNAPSHOT".into());
+    };
+    require_performance_device_idle()?;
+    build_server(root)?;
+    require_performance_device_idle()?;
+    let executable = root.join(CUDA_OXIDE_BUILD_TARGET).join("release/tuiskollm");
+    server_qualification::qualify_qwen35(&executable, Path::new(snapshot))
 }
 
 fn qualify_qwen35_resident_model(
