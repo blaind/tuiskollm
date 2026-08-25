@@ -1,5 +1,6 @@
 //! Resident Qwen3.6 final normalization and NVFP4 LM head.
 
+use crate::common::slots::require_batch;
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen36TextEndpointLayout};
 use std::sync::Arc;
 use tuisko_gpu::{
@@ -467,15 +468,6 @@ fn gather_embedding_rows(
         )?;
     }
 
-    Ok(())
-}
-
-fn require_batch(batch: usize) -> EngineResult<()> {
-    if !(1..=MAX_BATCH).contains(&batch) {
-        return Err(EngineError::route(format!(
-            "batch {batch} is outside the exact range 1..={MAX_BATCH}"
-        )));
-    }
     Ok(())
 }
 

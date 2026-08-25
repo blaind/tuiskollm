@@ -1,9 +1,11 @@
 //! Compact greedy and sampled MTP generation over the resident target-plus-draft owner.
 
+use crate::common::banks::{compact, row};
 use crate::common::mtp::{
     DRAFT_WINDOW, VERIFY_ROWS, decide_sampled_tokens, require_generation_capacity,
 };
 use crate::common::rope::{ROTARY_PAIRS, fill_contiguous_rope, text_rope};
+use crate::common::slots::device_zero_context;
 use crate::resident_mtp_generation::prime_prompt;
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, GeneratedText, GenerationSession,
@@ -1397,8 +1399,7 @@ fn target_slot_logits(slot: usize) -> std::ops::Range<usize> {
 }
 
 fn target_download_logits(rows: usize) -> std::ops::Range<usize> {
-    let begin = MAX_BATCH * Qwen38_27B::VOCAB;
-    begin..begin + rows * Qwen38_27B::VOCAB
+    compact(rows, Qwen38_27B::VOCAB)
 }
 
 fn target_download_row(row_index: usize) -> std::ops::Range<usize> {
@@ -1410,8 +1411,7 @@ fn draft_slot_logits(slot: usize) -> std::ops::Range<usize> {
 }
 
 fn compact_draft_logits(rows: usize) -> std::ops::Range<usize> {
-    let begin = MAX_BATCH * Qwen38_27B::VOCAB;
-    begin..begin + rows * Qwen38_27B::VOCAB
+    compact(rows, Qwen38_27B::VOCAB)
 }
 
 fn compact_draft_row(row_index: usize) -> std::ops::Range<usize> {
@@ -1423,29 +1423,11 @@ fn hidden_slot(slot: usize) -> std::ops::Range<usize> {
 }
 
 fn compact_hidden(rows: usize) -> std::ops::Range<usize> {
-    let begin = MAX_BATCH * Qwen38_27B::HIDDEN;
-    begin..begin + rows * Qwen38_27B::HIDDEN
+    compact(rows, Qwen38_27B::HIDDEN)
 }
 
 fn compact_hidden_row(row_index: usize) -> std::ops::Range<usize> {
     row(MAX_BATCH + row_index, Qwen38_27B::HIDDEN)
-}
-
-fn row(index: usize, columns: usize) -> std::ops::Range<usize> {
-    let begin = index * columns;
-    begin..begin + columns
-}
-
-fn device_zero_context() -> EngineResult<Arc<CudaContext>> {
-    let context = CudaContext::new(0).map_err(GpuError::from)?;
-    let capability = context.compute_capability().map_err(GpuError::from)?;
-    if capability != (12, 0) {
-        return Err(EngineError::route(format!(
-            "device zero has compute capability {}.{}, expected 12.0",
-            capability.0, capability.1
-        )));
-    }
-    Ok(context)
 }
 
 #[cfg(test)]

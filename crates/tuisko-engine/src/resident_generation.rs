@@ -1,6 +1,8 @@
 //! Single-slot text generation over the exact resident model owner.
 
+use crate::common::banks::{compact, row};
 use crate::common::rope::{ROTARY_PAIRS, text_rope};
+use crate::common::slots::{device_zero_context, require_generation_capacity};
 use crate::{
     CancelledText, ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
     GenerationSession, GenerationStep, MAX_BATCH, Qwen35ResidentModelProgram,
@@ -1037,18 +1039,6 @@ impl ResidentBatchGenerator {
     }
 }
 
-pub(crate) fn device_zero_context() -> EngineResult<Arc<CudaContext>> {
-    let context = CudaContext::new(0).map_err(GpuError::from)?;
-    let capability = context.compute_capability().map_err(GpuError::from)?;
-    if capability != (12, 0) {
-        return Err(EngineError::route(format!(
-            "device zero has compute capability {}.{}, expected 12.0",
-            capability.0, capability.1
-        )));
-    }
-    Ok(context)
-}
-
 impl ResidentGenerationSession<'_> {
     /// Exact prompt token IDs selected by the admitted frontend.
     pub fn prompt_token_ids(&self) -> &[u32] {
@@ -1205,13 +1195,11 @@ impl Qwen36ResidentGenerationSession<'_> {
 }
 
 fn slot_logits(slot: usize) -> std::ops::Range<usize> {
-    let begin = slot * Qwen38_27B::VOCAB;
-    begin..begin + Qwen38_27B::VOCAB
+    row(slot, Qwen38_27B::VOCAB)
 }
 
 fn compact_download_logits(rows: usize) -> std::ops::Range<usize> {
-    let begin = MAX_BATCH * Qwen38_27B::VOCAB;
-    begin..begin + rows * Qwen38_27B::VOCAB
+    compact(rows, Qwen38_27B::VOCAB)
 }
 
 fn compact_download_row(row: usize) -> std::ops::Range<usize> {
@@ -1507,27 +1495,6 @@ const fn qwen36_native_prefill_tokens(prompt_tokens: usize) -> Option<usize> {
         }
     }
     None
-}
-
-pub(crate) fn require_generation_capacity(
-    prompt_tokens: usize,
-    maximum_new_tokens: usize,
-    context_capacity: usize,
-) -> EngineResult<usize> {
-    if prompt_tokens == 0 {
-        return Err(EngineError::generation(
-            "resident generation requires a nonempty prompt",
-        ));
-    }
-    let evaluated = prompt_tokens
-        .checked_add(maximum_new_tokens.saturating_sub(1))
-        .ok_or_else(|| EngineError::generation("generation token budget overflows"))?;
-    if evaluated > context_capacity {
-        return Err(EngineError::generation(format!(
-            "prompt plus processed generation requires {evaluated} positions, current resident capacity is {context_capacity}"
-        )));
-    }
-    Ok(evaluated)
 }
 
 #[cfg(test)]

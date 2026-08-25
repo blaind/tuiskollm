@@ -1,6 +1,7 @@
 //! Resident composition of every Qwen3.6 text layer and endpoint.
 
 use crate::common::math::{checked_sum, product, sum_products};
+use crate::common::slots::require_batch;
 use crate::qwen36::long_context_kv::Qwen36AttentionKvBinding;
 use crate::{
     EngineError, EngineResult, MAX_BATCH, Qwen36FullAttentionLayerLayout,
@@ -911,15 +912,6 @@ fn require_geometry() -> EngineResult<()> {
         return Err(EngineError::layout(
             "resident model geometry does not match the admitted Qwen3.6 layer routes",
         ));
-    }
-    Ok(())
-}
-
-fn require_batch(batch: usize) -> EngineResult<()> {
-    if !(1..=MAX_BATCH).contains(&batch) {
-        return Err(EngineError::route(format!(
-            "batch {batch} is outside the exact range 1..={MAX_BATCH}"
-        )));
     }
     Ok(())
 }

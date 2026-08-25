@@ -1,9 +1,9 @@
 //! Compact Qwen3.5 text generation over eight physical persistent-state slots.
 
+use crate::common::banks::{compact, row};
 use crate::common::rope::text_rope;
-use crate::resident_generation::{
-    device_zero_context, prime_qwen35_prompt, require_generation_capacity,
-};
+use crate::common::slots::{device_zero_context, first_free_slot, require_generation_capacity};
+use crate::resident_generation::prime_qwen35_prompt;
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, GenerationSession, MAX_BATCH,
     Qwen35ResidentModelProgram, ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents,
@@ -349,18 +349,12 @@ impl Qwen35ResidentBatchGenerator {
     }
 }
 
-fn first_free_slot(occupied: [bool; MAX_BATCH]) -> Option<usize> {
-    occupied.iter().position(|&occupied| !occupied)
-}
-
 fn slot_logits(slot: usize) -> Range<usize> {
-    let begin = slot * Qwen35_9B::VOCAB;
-    begin..begin + Qwen35_9B::VOCAB
+    row(slot, Qwen35_9B::VOCAB)
 }
 
 fn compact_download_logits(rows: usize) -> Range<usize> {
-    let begin = MAX_BATCH * Qwen35_9B::VOCAB;
-    begin..begin + rows * Qwen35_9B::VOCAB
+    compact(rows, Qwen35_9B::VOCAB)
 }
 
 fn compact_download_row(row: usize) -> Range<usize> {
