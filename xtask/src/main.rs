@@ -311,6 +311,7 @@ const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build-sm120";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
 const CUDA_OXIDE_REPOSITORY: &str = "https://github.com/NVlabs/cuda-oxide.git";
 const CUDA_OXIDE_REVISION: &str = "1f4d813719012d384f2db12b88efc9314c8bf50c";
+const MAX_IDLE_DEVICE_MEMORY_MIB: u64 = 2_048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PerformanceSuite {
@@ -2787,6 +2788,31 @@ fn qualify_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
             "--lib",
             "--",
             "fp8_qkv",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+            "--skip",
+            "qwen36_fp8_qkv",
+        ],
+    )?;
+    wait_for_device_idle()?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen36_fp8_qkv",
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -7376,7 +7402,7 @@ fn require_performance_device_idle() -> Result<(), Box<dyn Error>> {
 
 fn require_device_idle(activity: &str) -> Result<(), Box<dyn Error>> {
     let (utilization, memory_mib, pids) = device_idle_evidence(activity)?;
-    if utilization != 0 || memory_mib > 1_024 {
+    if utilization != 0 || memory_mib > MAX_IDLE_DEVICE_MEMORY_MIB {
         return Err(format!(
             "device zero is busy before {activity}: utilization={utilization}%, memory={memory_mib} MiB"
         )
@@ -7429,7 +7455,7 @@ fn device_idle_evidence(activity: &str) -> Result<(u32, u64, Vec<u32>), Box<dyn 
 }
 
 fn device_is_idle(utilization: u32, memory_mib: u64, pids: &[u32]) -> bool {
-    utilization == 0 && memory_mib <= 1_024 && pids.is_empty()
+    utilization == 0 && memory_mib <= MAX_IDLE_DEVICE_MEMORY_MIB && pids.is_empty()
 }
 
 fn performance_device_identity_sha256() -> Result<String, Box<dyn Error>> {
@@ -14918,18 +14944,19 @@ fn require_uniform_value(
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPOSED_PERFORMANCE_SUITES, MTP_LAYER_RESOURCE_BASELINES, OptimizationSuite,
-        PERFORMANCE_SUITES, PerformanceSuite, QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
-        QWEN35_MTP_BATCH_GENERATION_TEST_FILTER, QWEN35_MTP_GENERATION_TEST_FILTER,
-        QWEN35_RESIDENT_MODEL_TEST_FILTER, QWEN35_RESIDENT_MTP_TEST_FILTER,
-        QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN35_TEXT_ENDPOINT_TEST_FILTER,
-        QWEN36_LONG_CONTEXT_KV_TEST_FILTER, QWEN36_MTP_LAYER_TEST_FILTER,
-        QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, device_is_idle,
-        parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
-        parse_performance_device_sample, parse_performance_iteration, parse_resources,
-        parse_rustc_identity, preflight_performance_baselines, require_consumed_baseline_keys,
-        require_count, require_registers, require_uniform_value, resolve_target_output,
-        sass_function_body, workspace_root,
+        COMPOSED_PERFORMANCE_SUITES, MAX_IDLE_DEVICE_MEMORY_MIB, MTP_LAYER_RESOURCE_BASELINES,
+        OptimizationSuite, PERFORMANCE_SUITES, PerformanceSuite,
+        QWEN35_LONG_CONTEXT_KV_TEST_FILTER, QWEN35_MTP_BATCH_GENERATION_TEST_FILTER,
+        QWEN35_MTP_GENERATION_TEST_FILTER, QWEN35_RESIDENT_MODEL_TEST_FILTER,
+        QWEN35_RESIDENT_MTP_TEST_FILTER, QWEN35_RESIDUAL_NORM_TEST_FILTER,
+        QWEN35_TEXT_ENDPOINT_TEST_FILTER, QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
+        QWEN36_MTP_LAYER_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
+        SM120_RESOURCE_BASELINES, device_is_idle, parse_baseline, parse_compute_pids,
+        parse_cuda_toolkit_identity, parse_entries, parse_performance_device_sample,
+        parse_performance_iteration, parse_resources, parse_rustc_identity,
+        preflight_performance_baselines, require_consumed_baseline_keys, require_count,
+        require_registers, require_uniform_value, resolve_target_output, sass_function_body,
+        workspace_root,
     };
     use std::ffi::OsString;
 
@@ -15320,8 +15347,9 @@ mod tests {
     #[test]
     fn idle_evidence_requires_all_three_signals() {
         assert!(device_is_idle(0, 234, &[]));
+        assert!(device_is_idle(0, MAX_IDLE_DEVICE_MEMORY_MIB, &[]));
         assert!(!device_is_idle(1, 234, &[]));
-        assert!(!device_is_idle(0, 1_025, &[]));
+        assert!(!device_is_idle(0, MAX_IDLE_DEVICE_MEMORY_MIB + 1, &[]));
         assert!(!device_is_idle(0, 234, &[123]));
     }
 

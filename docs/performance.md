@@ -716,7 +716,7 @@ Before measurement, the runner requires:
 - device zero is exactly `NVIDIA GeForce RTX 5090`;
 - `CUDA_VISIBLE_DEVICES` is unset or exactly `0`;
 - GPU utilization is zero;
-- at most 1,024 MiB is already used;
+- at most 2,048 MiB is already used, admitting the product workstation's desktop footprint;
 - no foreign compute PID is present; and
 - the runtime compute capability is 12.0.
 
