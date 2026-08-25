@@ -15,8 +15,8 @@ pub use bindings::{
     ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4LinearBindings,
     ModelOptNvfp4MlpBindings, MtpBindings, NVFP4_MLP_LAYER_END, Nvfp4DownBindings,
     Nvfp4GateUpBindings, Nvfp4MlpBindings, Qwen36Fp8LinearBindings, Qwen36FullAttentionBindings,
-    Qwen36GdnBindings, Qwen36MoeExpertBindings, Qwen36MoeLayerBindings, Qwen36TextEndpointBindings,
-    TextEndpointBindings, VisionBindings, VisionBlockBindings,
+    Qwen36GdnBindings, Qwen36MoeExpertBindings, Qwen36MoeLayerBindings, Qwen36MtpBindings,
+    Qwen36TextEndpointBindings, TextEndpointBindings, VisionBindings, VisionBlockBindings,
 };
 pub use config::validate_config;
 pub use dtype::DType;

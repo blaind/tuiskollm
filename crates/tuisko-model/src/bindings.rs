@@ -689,6 +689,160 @@ impl<'a> MtpBindings<'a> {
     }
 }
 
+/// Complete BF16 source planes for the admitted Qwen3.6 MoE MTP layer.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen36MtpBindings<'a> {
+    /// Projection combining draft hidden and base embedding inputs `[hidden, 2 * hidden]`.
+    pub input_projection: Bf16View<'a, 2>,
+    /// Normalization for the base embedding input `[hidden]`.
+    pub embedding_norm: Bf16View<'a, 1>,
+    /// Normalization for the draft hidden input `[hidden]`.
+    pub hidden_norm: Bf16View<'a, 1>,
+    /// Query rows followed by gate rows `[attention_query_rows, hidden]`.
+    pub query_gate_weight: Bf16View<'a, 2>,
+    /// Key projection `[attention_kv_rows, hidden]`.
+    pub key_weight: Bf16View<'a, 2>,
+    /// Value projection `[attention_kv_rows, hidden]`.
+    pub value_weight: Bf16View<'a, 2>,
+    /// Attention output projection `[hidden, attention_output_columns]`.
+    pub attention_output_weight: Bf16View<'a, 2>,
+    /// Per-head query RMSNorm weights `[head_dim]`.
+    pub query_norm: Bf16View<'a, 1>,
+    /// Per-head key RMSNorm weights `[head_dim]`.
+    pub key_norm: Bf16View<'a, 1>,
+    /// Zero-centered RMSNorm weights before attention `[hidden]`.
+    pub input_norm: Bf16View<'a, 1>,
+    /// Top-eight router weights `[experts, hidden]`.
+    pub router_weight: Bf16View<'a, 2>,
+    /// Routed expert gate/up planes `[experts, 2 * intermediate, hidden]`.
+    pub routed_gate_up_weight: Bf16View<'a, 3>,
+    /// Routed expert down planes `[experts, hidden, intermediate]`.
+    pub routed_down_weight: Bf16View<'a, 3>,
+    /// Shared-expert gate weights `[1, hidden]`.
+    pub shared_expert_gate_weight: Bf16View<'a, 2>,
+    /// Shared-expert gate projection `[intermediate, hidden]`.
+    pub shared_gate_weight: Bf16View<'a, 2>,
+    /// Shared-expert up projection `[intermediate, hidden]`.
+    pub shared_up_weight: Bf16View<'a, 2>,
+    /// Shared-expert down projection `[hidden, intermediate]`.
+    pub shared_down_weight: Bf16View<'a, 2>,
+    /// Zero-centered RMSNorm weights before the MoE boundary `[hidden]`.
+    pub post_attention_norm: Bf16View<'a, 1>,
+    /// Final draft hidden-state normalization `[hidden]`.
+    pub final_norm: Bf16View<'a, 1>,
+}
+
+impl<'a> Qwen36MtpBindings<'a> {
+    /// Binds the exact admitted Qwen3.6 MTP source family.
+    pub fn bind(snapshot: &'a CheckpointSnapshot<Qwen36Moe35B>) -> CheckpointResult<Self> {
+        Self::bind_from(
+            Qwen36Moe35B::HIDDEN,
+            Qwen36Moe35B::INTERMEDIATE,
+            Qwen36Moe35B::NUM_EXPERTS,
+            Qwen36Moe35B::ATTENTION_QUERY_ROWS,
+            Qwen36Moe35B::ATTENTION_KV_ROWS,
+            Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS,
+            Qwen36Moe35B::HEAD_DIM,
+            |name| snapshot.tensor(name),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_from(
+        hidden: usize,
+        intermediate: usize,
+        experts: usize,
+        query_rows: usize,
+        kv_rows: usize,
+        output_columns: usize,
+        head_dim: usize,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        let input_columns = hidden.checked_mul(2).ok_or_else(|| {
+            CheckpointError::source_binding("Qwen3.6 MTP input projection width overflows")
+        })?;
+        let gate_up_rows = intermediate.checked_mul(2).ok_or_else(|| {
+            CheckpointError::source_binding("Qwen3.6 MTP gate/up row count overflows")
+        })?;
+        let prefix = "mtp.layers.0";
+        let attention = format!("{prefix}.self_attn");
+        let mlp = format!("{prefix}.mlp");
+
+        Ok(Self {
+            input_projection: Bf16View::bind(
+                tensor("mtp.fc.weight")?,
+                [hidden as u64, input_columns as u64],
+            )?,
+            embedding_norm: Bf16View::bind(
+                tensor("mtp.pre_fc_norm_embedding.weight")?,
+                [hidden as u64],
+            )?,
+            hidden_norm: Bf16View::bind(tensor("mtp.pre_fc_norm_hidden.weight")?, [hidden as u64])?,
+            query_gate_weight: Bf16View::bind(
+                tensor(&format!("{attention}.q_proj.weight"))?,
+                [query_rows as u64, hidden as u64],
+            )?,
+            key_weight: Bf16View::bind(
+                tensor(&format!("{attention}.k_proj.weight"))?,
+                [kv_rows as u64, hidden as u64],
+            )?,
+            value_weight: Bf16View::bind(
+                tensor(&format!("{attention}.v_proj.weight"))?,
+                [kv_rows as u64, hidden as u64],
+            )?,
+            attention_output_weight: Bf16View::bind(
+                tensor(&format!("{attention}.o_proj.weight"))?,
+                [hidden as u64, output_columns as u64],
+            )?,
+            query_norm: Bf16View::bind(
+                tensor(&format!("{attention}.q_norm.weight"))?,
+                [head_dim as u64],
+            )?,
+            key_norm: Bf16View::bind(
+                tensor(&format!("{attention}.k_norm.weight"))?,
+                [head_dim as u64],
+            )?,
+            input_norm: Bf16View::bind(
+                tensor(&format!("{prefix}.input_layernorm.weight"))?,
+                [hidden as u64],
+            )?,
+            router_weight: Bf16View::bind(
+                tensor(&format!("{mlp}.gate.weight"))?,
+                [experts as u64, hidden as u64],
+            )?,
+            routed_gate_up_weight: Bf16View::bind(
+                tensor(&format!("{mlp}.experts.gate_up_proj"))?,
+                [experts as u64, gate_up_rows as u64, hidden as u64],
+            )?,
+            routed_down_weight: Bf16View::bind(
+                tensor(&format!("{mlp}.experts.down_proj"))?,
+                [experts as u64, hidden as u64, intermediate as u64],
+            )?,
+            shared_expert_gate_weight: Bf16View::bind(
+                tensor(&format!("{mlp}.shared_expert_gate.weight"))?,
+                [1, hidden as u64],
+            )?,
+            shared_gate_weight: Bf16View::bind(
+                tensor(&format!("{mlp}.shared_expert.gate_proj.weight"))?,
+                [intermediate as u64, hidden as u64],
+            )?,
+            shared_up_weight: Bf16View::bind(
+                tensor(&format!("{mlp}.shared_expert.up_proj.weight"))?,
+                [intermediate as u64, hidden as u64],
+            )?,
+            shared_down_weight: Bf16View::bind(
+                tensor(&format!("{mlp}.shared_expert.down_proj.weight"))?,
+                [hidden as u64, intermediate as u64],
+            )?,
+            post_attention_norm: Bf16View::bind(
+                tensor(&format!("{prefix}.post_attention_layernorm.weight"))?,
+                [hidden as u64],
+            )?,
+            final_norm: Bf16View::bind(tensor("mtp.norm.weight")?, [hidden as u64])?,
+        })
+    }
+}
+
 /// BF16 source planes for one Vision transformer block.
 #[derive(Clone, Copy, Debug)]
 pub struct VisionBlockBindings<'a> {
@@ -2279,7 +2433,7 @@ mod tests {
         FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings, LM_HEAD, LM_HEAD_SCALE,
         ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings,
         MtpBindings, NVFP4_GROUP_SIZE, Nvfp4DownBindings, Nvfp4GateUpBindings, Nvfp4MlpBindings,
-        Qwen36FullAttentionBindings, Qwen36GdnBindings, Qwen36MoeLayerBindings,
+        Qwen36FullAttentionBindings, Qwen36GdnBindings, Qwen36MoeLayerBindings, Qwen36MtpBindings,
         Qwen36TextEndpointBindings, TextEndpointBindings, VisionBindings, dense_fp8_next_norm_name,
         positive_bf16, qwen36_next_norm_name, require_adjacent, require_dense_fp8_mlp_layer,
         require_full_attention_layer, require_gdn_layer, require_mtp_contract,
@@ -3192,6 +3346,75 @@ mod tests {
             }),
             payload,
         )
+    }
+
+    fn qwen36_mtp_fixture() -> (Value, Vec<u8>) {
+        const HIDDEN: usize = 8;
+        const INTERMEDIATE: usize = 4;
+        const EXPERTS: usize = 3;
+        const QUERY_ROWS: usize = 6;
+        const KV_ROWS: usize = 2;
+        const OUTPUT_COLUMNS: usize = 3;
+        const HEAD_DIM: usize = 1;
+
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+
+        for (name, shape) in [
+            ("mtp.fc.weight", vec![HIDDEN, 2 * HIDDEN]),
+            ("mtp.norm.weight", vec![HIDDEN]),
+            ("mtp.pre_fc_norm_embedding.weight", vec![HIDDEN]),
+            ("mtp.pre_fc_norm_hidden.weight", vec![HIDDEN]),
+            ("mtp.layers.0.input_layernorm.weight", vec![HIDDEN]),
+            (
+                "mtp.layers.0.mlp.experts.down_proj",
+                vec![EXPERTS, HIDDEN, INTERMEDIATE],
+            ),
+            (
+                "mtp.layers.0.mlp.experts.gate_up_proj",
+                vec![EXPERTS, 2 * INTERMEDIATE, HIDDEN],
+            ),
+            ("mtp.layers.0.mlp.gate.weight", vec![EXPERTS, HIDDEN]),
+            (
+                "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+                vec![HIDDEN, INTERMEDIATE],
+            ),
+            (
+                "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+                vec![INTERMEDIATE, HIDDEN],
+            ),
+            (
+                "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+                vec![INTERMEDIATE, HIDDEN],
+            ),
+            (
+                "mtp.layers.0.mlp.shared_expert_gate.weight",
+                vec![1, HIDDEN],
+            ),
+            ("mtp.layers.0.post_attention_layernorm.weight", vec![HIDDEN]),
+            ("mtp.layers.0.self_attn.k_norm.weight", vec![HEAD_DIM]),
+            (
+                "mtp.layers.0.self_attn.k_proj.weight",
+                vec![KV_ROWS, HIDDEN],
+            ),
+            (
+                "mtp.layers.0.self_attn.o_proj.weight",
+                vec![HIDDEN, OUTPUT_COLUMNS],
+            ),
+            ("mtp.layers.0.self_attn.q_norm.weight", vec![HEAD_DIM]),
+            (
+                "mtp.layers.0.self_attn.q_proj.weight",
+                vec![QUERY_ROWS, HIDDEN],
+            ),
+            (
+                "mtp.layers.0.self_attn.v_proj.weight",
+                vec![KV_ROWS, HIDDEN],
+            ),
+        ] {
+            append_bf16_tensor(&mut header, &mut payload, name, shape);
+        }
+
+        (Value::Object(header), payload)
     }
 
     fn append_modelopt_linear(
@@ -4371,6 +4594,117 @@ mod tests {
         assert!(error.to_string().contains("expected [32, 64]"));
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn binds_exact_qwen36_mtp_moe_source_contract() {
+        let path = fixture_path("qwen36-mtp");
+        let (header, payload) = qwen36_mtp_fixture();
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let bindings =
+            Qwen36MtpBindings::bind_from(8, 4, 3, 6, 2, 3, 1, |name| file.tensor(name)).unwrap();
+
+        assert_eq!(bindings.input_projection.shape(), &[8, 16]);
+        assert_eq!(bindings.embedding_norm.shape(), &[8]);
+        assert_eq!(bindings.hidden_norm.shape(), &[8]);
+        assert_eq!(bindings.query_gate_weight.shape(), &[6, 8]);
+        assert_eq!(bindings.key_weight.shape(), &[2, 8]);
+        assert_eq!(bindings.value_weight.shape(), &[2, 8]);
+        assert_eq!(bindings.attention_output_weight.shape(), &[8, 3]);
+        assert_eq!(bindings.query_norm.shape(), &[1]);
+        assert_eq!(bindings.key_norm.shape(), &[1]);
+        assert_eq!(bindings.input_norm.shape(), &[8]);
+        assert_eq!(bindings.router_weight.shape(), &[3, 8]);
+        assert_eq!(bindings.routed_gate_up_weight.shape(), &[3, 8, 8]);
+        assert_eq!(bindings.routed_down_weight.shape(), &[3, 8, 4]);
+        assert_eq!(bindings.shared_expert_gate_weight.shape(), &[1, 8]);
+        assert_eq!(bindings.shared_gate_weight.shape(), &[4, 8]);
+        assert_eq!(bindings.shared_up_weight.shape(), &[4, 8]);
+        assert_eq!(bindings.shared_down_weight.shape(), &[8, 4]);
+        assert_eq!(bindings.post_attention_norm.shape(), &[8]);
+        assert_eq!(bindings.final_norm.shape(), &[8]);
+        assert_eq!(
+            bindings.routed_down_weight.name(),
+            "mtp.layers.0.mlp.experts.down_proj"
+        );
+        assert_eq!(
+            bindings.routed_gate_up_weight.name(),
+            "mtp.layers.0.mlp.experts.gate_up_proj"
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_qwen36_mtp_routed_expert_shape_mismatch() {
+        let path = fixture_path("qwen36-mtp-shape");
+        let (mut header, payload) = qwen36_mtp_fixture();
+        header["mtp.layers.0.mlp.experts.gate_up_proj"]["shape"] = json!([3, 16, 4]);
+        write_safetensors_payload(&path, header, &payload);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let error = Qwen36MtpBindings::bind_from(8, 4, 3, 6, 2, 3, 1, |name| file.tensor(name))
+            .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::Tensor);
+        assert!(
+            error
+                .to_string()
+                .contains("mtp.layers.0.mlp.experts.gate_up_proj")
+        );
+        assert!(error.to_string().contains("expected [3, 8, 8]"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN36_SNAPSHOT with the exact pinned snapshot"]
+    fn binds_real_qwen36_mtp_source_contract() {
+        let root = std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+            .expect("TUISKO_QWEN36_SNAPSHOT must name the exact pinned snapshot");
+        let snapshot = CheckpointSnapshot::<Qwen36Moe35B>::open(Path::new(&root)).unwrap();
+        let bindings = Qwen36MtpBindings::bind(&snapshot).unwrap();
+
+        assert_eq!(bindings.input_projection.shape(), &[2_048, 4_096]);
+        assert_eq!(bindings.query_gate_weight.shape(), &[8_192, 2_048]);
+        assert_eq!(bindings.key_weight.shape(), &[512, 2_048]);
+        assert_eq!(bindings.value_weight.shape(), &[512, 2_048]);
+        assert_eq!(bindings.attention_output_weight.shape(), &[2_048, 4_096]);
+        assert_eq!(bindings.router_weight.shape(), &[256, 2_048]);
+        assert_eq!(bindings.routed_gate_up_weight.shape(), &[256, 1_024, 2_048]);
+        assert_eq!(bindings.routed_down_weight.shape(), &[256, 2_048, 512]);
+        assert_eq!(bindings.shared_expert_gate_weight.shape(), &[1, 2_048]);
+        assert_eq!(bindings.shared_gate_weight.shape(), &[512, 2_048]);
+        assert_eq!(bindings.shared_up_weight.shape(), &[512, 2_048]);
+        assert_eq!(bindings.shared_down_weight.shape(), &[2_048, 512]);
+        assert_eq!(bindings.query_norm.shape(), &[256]);
+        assert_eq!(bindings.key_norm.shape(), &[256]);
+
+        let source_bytes = [
+            bindings.input_projection.bytes().len(),
+            bindings.embedding_norm.bytes().len(),
+            bindings.hidden_norm.bytes().len(),
+            bindings.query_gate_weight.bytes().len(),
+            bindings.key_weight.bytes().len(),
+            bindings.value_weight.bytes().len(),
+            bindings.attention_output_weight.bytes().len(),
+            bindings.query_norm.bytes().len(),
+            bindings.key_norm.bytes().len(),
+            bindings.input_norm.bytes().len(),
+            bindings.router_weight.bytes().len(),
+            bindings.routed_gate_up_weight.bytes().len(),
+            bindings.routed_down_weight.bytes().len(),
+            bindings.shared_expert_gate_weight.bytes().len(),
+            bindings.shared_gate_weight.bytes().len(),
+            bindings.shared_up_weight.bytes().len(),
+            bindings.shared_down_weight.bytes().len(),
+            bindings.post_attention_norm.bytes().len(),
+            bindings.final_norm.bytes().len(),
+        ]
+        .into_iter()
+        .sum::<usize>();
+
+        assert_eq!(source_bytes, 1_689_281_536);
     }
 
     #[test]
