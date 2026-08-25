@@ -97,7 +97,7 @@ impl BuildTargetProfile for GpuTarget {
     }
 }
 
-#[cfg(any(feature = "remote", test))]
+#[cfg(feature = "remote")]
 pub(crate) const fn has_full_kernel_inventory(target: GpuTarget) -> bool {
     matches!(target, GpuTarget::Sm120)
 }
