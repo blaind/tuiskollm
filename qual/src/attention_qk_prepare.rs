@@ -3,7 +3,7 @@
 use crate::fp8_projection_oracle::{
     BYTE_SENTINEL, F32_SENTINEL_BITS, bf16_to_f32, encode_e4m3fn, f32_to_bf16,
 };
-use crate::target::MtpBf16QkPrepareOp;
+use crate::target::{MtpBf16QkPrepareOp, Qwen35MtpBf16QkPrepareOp};
 use crate::{DeviceBenchmarkError, device_benchmark};
 use std::{mem::size_of, path::Path, sync::Arc};
 use tuisko_gpu::{
@@ -23,6 +23,8 @@ const MAX_TOKENS: usize = 1_024;
 const ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const QWEN36_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 const QWEN36_MAX_TOKENS: usize = 128;
+const QWEN35_MTP_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
+const QWEN35_MTP_MAX_TOKENS: usize = 128;
 const ALIGNMENT: usize = 256;
 const PHYSICAL_PAGES: usize = 16;
 const TABLE_ROWS: usize = 8;
@@ -420,6 +422,59 @@ impl QualifiedQkPrepareOp for MtpBf16QkPrepareOp {
     }
 }
 
+impl QualifiedQkPrepareOp for Qwen35MtpBf16QkPrepareOp {
+    type Target = Qwen35_9B;
+    const ROUTES: &'static [usize] = &QWEN35_MTP_ROUTES;
+    const MAX_TOKENS: usize = QWEN35_MTP_MAX_TOKENS;
+    const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
+    const CACHE_FORMAT: CacheFormat = CacheFormat::Bf16Math;
+
+    fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        Qwen35MtpBf16QkPrepareOp::new(context)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &self,
+        stream: &tuisko_gpu::CudaStream,
+        batch: usize,
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: usize,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u8,
+        value_pages: *mut u8,
+        _key_scale: f32,
+        _value_scale: f32,
+    ) -> GpuResult<()> {
+        // SAFETY: the shared harness owns complete aligned Qwen3.5 BF16 planes.
+        unsafe {
+            self.launch(
+                stream,
+                batch,
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages.cast(),
+                value_pages.cast(),
+            )
+        }
+    }
+}
+
 /// Qualifies eager and captured Q/K preparation routes at exact `B=1..=8`
 /// and `T=32,64,128,1024`.
 pub fn qualify_attention_qk_prepare()
@@ -452,6 +507,20 @@ pub fn qualify_mtp_bf16_qk_prepare(
     };
 
     qualify_target::<MtpBf16QkPrepareOp>(Some(&source))
+}
+
+/// Qualifies source-backed Qwen3.5 MTP Q/K preparation at every exact route.
+pub fn qualify_qwen35_mtp_bf16_qk_prepare(
+    root: &Path,
+) -> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
+    let snapshot = CheckpointSnapshot::<Qwen35_9B>::open(root)?;
+    let bindings = MtpBindings::bind(&snapshot)?;
+    let source = SourceNorms {
+        query: bindings.query_norm.words().collect(),
+        key: bindings.key_norm.words().collect(),
+    };
+
+    qualify_target::<Qwen35MtpBf16QkPrepareOp>(Some(&source))
 }
 
 fn qualify_target<O>(
@@ -1134,10 +1203,11 @@ fn verify_replay(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BATCH, MAX_TOKENS, PHYSICAL_PAGES, QWEN36_MAX_TOKENS, QWEN36_ROUTES, Qwen35_9B,
-        Qwen36Moe35B, Qwen38_27B, ROUTES, TABLE_ROWS, TABLE_STRIDE, layout,
-        qualify_attention_qk_prepare, qualify_mtp_bf16_qk_prepare,
-        qualify_qwen35_attention_qk_prepare, qualify_qwen36_attention_qk_prepare,
+        MAX_BATCH, MAX_TOKENS, PHYSICAL_PAGES, QWEN35_MTP_MAX_TOKENS, QWEN35_MTP_ROUTES,
+        QWEN36_MAX_TOKENS, QWEN36_ROUTES, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, ROUTES, TABLE_ROWS,
+        TABLE_STRIDE, layout, qualify_attention_qk_prepare, qualify_mtp_bf16_qk_prepare,
+        qualify_qwen35_attention_qk_prepare, qualify_qwen35_mtp_bf16_qk_prepare,
+        qualify_qwen36_attention_qk_prepare,
     };
     use std::{mem::size_of, path::PathBuf};
     use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -1305,6 +1375,61 @@ mod tests {
         assert_eq!(report.workspace_bytes, 54_796_864);
         assert_eq!(report.arena_bytes, 58_992_640);
         assert_eq!(report.padding_bytes, 448);
+        assert!(report.maximum_query_error <= 0.003);
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive SM120 device and the pinned Qwen3.5 snapshot"]
+    fn qwen35_mtp_qk_suite_source_norms_match_every_route_and_graph_replay() {
+        let root = PathBuf::from(
+            std::env::var_os("TUISKO_QWEN35_SNAPSHOT")
+                .expect("TUISKO_QWEN35_SNAPSHOT must name the snapshot"),
+        );
+        let report =
+            qualify_qwen35_mtp_bf16_qk_prepare(&root).expect("Qwen3.5 MTP BF16 Q/K qualification");
+        let active_tokens = QWEN35_MTP_ROUTES.iter().sum::<usize>();
+        let query_per_token = Qwen35_9B::ATTENTION_OUTPUT_COLUMNS;
+        let cache_per_token = 2 * Qwen35_9B::ATTENTION_KV_ROWS;
+        let plane_bytes = PHYSICAL_PAGES
+            * Qwen35_9B::NUM_KV_HEADS
+            * ATTENTION_PAGE_SIZE
+            * Qwen35_9B::HEAD_DIM
+            * size_of::<u16>();
+        let replay_per_route = QWEN35_MTP_MAX_TOKENS * query_per_token + 2 * plane_bytes;
+        let total_observable = QWEN35_MTP_ROUTES.len() * replay_per_route;
+        let immutable_per_check = QWEN35_MTP_MAX_TOKENS * Qwen35_9B::ATTENTION_QKV_ROWS
+            + 2 * Qwen35_9B::HEAD_DIM
+            + 2 * QWEN35_MTP_MAX_TOKENS * super::ROTARY_PAIRS
+            + TABLE_ROWS * TABLE_STRIDE
+            + 2 * MAX_BATCH
+            + 2 * QWEN35_MTP_MAX_TOKENS;
+
+        assert_eq!(active_tokens, 260);
+        assert_eq!(report.query_values, active_tokens * query_per_token);
+        assert_eq!(
+            report.appended_cache_values,
+            active_tokens * cache_per_token
+        );
+        assert_eq!(
+            report.untouched_values,
+            total_observable
+                - active_tokens * (query_per_token + cache_per_token * size_of::<u16>())
+        );
+        assert_eq!(
+            report.immutable_input_values,
+            2 * QWEN35_MTP_ROUTES.len() * immutable_per_check
+        );
+        assert_eq!(report.graph_replay_values, total_observable);
+        let (layout, regions) =
+            layout::<Qwen35_9B>(QWEN35_MTP_MAX_TOKENS, size_of::<u16>()).unwrap();
+        assert_eq!(report.arena_bytes, layout.byte_len());
+        assert_eq!(
+            report.arena_bytes - report.padding_bytes,
+            regions.payload_bytes()
+        );
+        assert_eq!(report.weight_bytes, regions.weight_bytes());
+        assert_eq!(report.cache_bytes, regions.cache_bytes());
+        assert_eq!(report.workspace_bytes, regions.workspace_bytes());
         assert!(report.maximum_query_error <= 0.003);
     }
 }

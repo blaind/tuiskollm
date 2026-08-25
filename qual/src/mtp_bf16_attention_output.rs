@@ -2,18 +2,21 @@
 
 use crate::device_benchmark;
 use crate::fp8_projection_oracle::{bf16_to_f32, f32_to_bf16};
-use crate::{DeviceBenchmarkError, target::MtpBf16AttentionOutputOp};
+use crate::{
+    DeviceBenchmarkError,
+    target::{MtpBf16AttentionOutputOp, Qwen35MtpBf16AttentionOutputOp},
+};
 use std::path::Path;
+use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     device_memory_info,
 };
-use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen38_27B};
+use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen35_9B, Qwen38_27B};
 
 pub(crate) const MAX_BATCH: usize = 8;
 const ALIGNMENT: usize = 256;
 pub(crate) const COLUMNS: usize = Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
-pub(crate) const QKV_ROWS: usize = Qwen38_27B::ATTENTION_QKV_ROWS;
 pub(crate) const OUTPUT_ROWS: usize = Qwen38_27B::HIDDEN;
 const BF16_SENTINEL: u16 = 0xa5a5;
 const BYTE_SENTINEL: u8 = 0xa5;
@@ -115,15 +118,77 @@ struct Observed {
     output: Vec<u16>,
 }
 
+trait QualifiedAttentionOutputOp: Sized {
+    fn new(context: &Arc<CudaContext>) -> GpuResult<Self>;
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        attention: *mut f32,
+        qkv: *const u16,
+        activation: *mut u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+macro_rules! impl_qualified_attention_output_op {
+    ($op:ty) => {
+        impl QualifiedAttentionOutputOp for $op {
+            fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+                <$op>::new(context)
+            }
+
+            unsafe fn launch(
+                &self,
+                stream: &CudaStream,
+                batch: usize,
+                attention: *mut f32,
+                qkv: *const u16,
+                activation: *mut u16,
+                weight: *const u16,
+                output: *mut u16,
+            ) -> GpuResult<()> {
+                unsafe {
+                    <$op>::launch(
+                        self, stream, batch, attention, qkv, activation, weight, output,
+                    )
+                }
+            }
+        }
+    };
+}
+
+impl_qualified_attention_output_op!(MtpBf16AttentionOutputOp);
+impl_qualified_attention_output_op!(Qwen35MtpBf16AttentionOutputOp);
+
 /// Qualifies source-BF16 MTP gated attention output at exact `B=1..=8`.
 pub fn qualify_mtp_bf16_attention_output(
     root: &Path,
 ) -> Result<MtpBf16AttentionOutputQualification, MtpBf16AttentionOutputQualificationError> {
+    qualify_attention_output::<Qwen38_27B, MtpBf16AttentionOutputOp>(root)
+}
+
+/// Qualifies Qwen3.5 source-BF16 MTP gated attention output at exact `B=1..=8`.
+pub fn qualify_qwen35_mtp_bf16_attention_output(
+    root: &Path,
+) -> Result<MtpBf16AttentionOutputQualification, MtpBf16AttentionOutputQualificationError> {
+    qualify_attention_output::<Qwen35_9B, Qwen35MtpBf16AttentionOutputOp>(root)
+}
+
+fn qualify_attention_output<A: Arch, O: QualifiedAttentionOutputOp>(
+    root: &Path,
+) -> Result<MtpBf16AttentionOutputQualification, MtpBf16AttentionOutputQualificationError> {
     let _preflight = device_benchmark::preflight()?;
-    let snapshot = CheckpointSnapshot::<Qwen38_27B>::open(root)?;
+    let snapshot = CheckpointSnapshot::<A>::open(root)?;
     let bindings = MtpBindings::bind(&snapshot)?;
-    let fixture = make_fixture(bindings.attention_output_weight.words().collect());
-    let source_expected = source_oracle(&fixture.activation[..COLUMNS], &fixture.weight);
+    let fixture = make_fixture_for::<A>(bindings.attention_output_weight.words().collect());
+    let source_expected = source_oracle::<A>(
+        &fixture.activation[..A::ATTENTION_OUTPUT_COLUMNS],
+        &fixture.weight,
+    );
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
     if capability != (12, 0) {
@@ -134,12 +199,12 @@ pub fn qualify_mtp_bf16_attention_output(
     }
 
     let stream = context.new_stream().map_err(GpuError::from)?;
-    let (layout, regions) = layout()?;
+    let (layout, regions) = layout_for::<A>()?;
     let arena = DeviceArena::zeroed(&stream, &layout)?;
-    let op = MtpBf16AttentionOutputOp::new(&context)?;
+    let op = O::new(&context)?;
     load_immutable(&arena, &stream, regions, &fixture)?;
     let stable_addresses = addresses(&arena, regions)?;
-    let route_reference = b1_route_references(&op, &arena, &stream, regions, &fixture)?;
+    let route_reference = b1_route_references::<A, O>(&op, &arena, &stream, regions, &fixture)?;
     let mut report = MtpBf16AttentionOutputQualification {
         gated_values: 0,
         activation_values: 0,
@@ -157,10 +222,10 @@ pub fn qualify_mtp_bf16_attention_output(
     };
 
     for batch in 1..=MAX_BATCH {
-        reset(&arena, &stream, regions, &fixture, batch)?;
+        reset::<A>(&arena, &stream, regions, &fixture, batch)?;
         launch(&op, &arena, &stream, regions, batch)?;
         let eager = observe(&arena, &stream, regions)?;
-        verify_outputs(
+        verify_outputs::<A>(
             batch,
             &fixture,
             &route_reference,
@@ -169,14 +234,14 @@ pub fn qualify_mtp_bf16_attention_output(
             &mut report,
         )?;
 
-        reset(&arena, &stream, regions, &fixture, batch)?;
+        reset::<A>(&arena, &stream, regions, &fixture, batch)?;
         stream.synchronize().map_err(GpuError::from)?;
         let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
         // SAFETY: every allocation this graph captured is owned by this scope or
         // its caller and outlives the replays and the synchronize that follows.
         unsafe { graph.launch(&stream) }?;
         let replay = observe(&arena, &stream, regions)?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
+        verify_replay::<A>(batch, &eager, &replay, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(MtpBf16AttentionOutputQualificationError::Mismatch(format!(
@@ -186,19 +251,23 @@ pub fn qualify_mtp_bf16_attention_output(
     }
 
     verify_immutable(&arena, &stream, regions, &fixture, &mut report)?;
-    verify_no_post_warmup_allocation(&context, &op, &arena, &stream, regions, &fixture)?;
+    verify_no_post_warmup_allocation::<A, O>(&context, &op, &arena, &stream, regions, &fixture)?;
     device_benchmark::require_current_process_exclusive()?;
 
     Ok(report)
 }
 
 pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
+    layout_for::<Qwen38_27B>()
+}
+
+fn layout_for<A: Arch>() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let attention = layout.reserve(MAX_BATCH * COLUMNS, ALIGNMENT)?;
-    let qkv = layout.reserve(MAX_BATCH * QKV_ROWS, ALIGNMENT)?;
-    let activation = layout.reserve(MAX_BATCH * COLUMNS, ALIGNMENT)?;
-    let weight = layout.reserve(OUTPUT_ROWS * COLUMNS, ALIGNMENT)?;
-    let output = layout.reserve(MAX_BATCH * OUTPUT_ROWS, ALIGNMENT)?;
+    let attention = layout.reserve(MAX_BATCH * A::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let qkv = layout.reserve(MAX_BATCH * A::ATTENTION_QKV_ROWS, ALIGNMENT)?;
+    let activation = layout.reserve(MAX_BATCH * A::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let weight = layout.reserve(A::HIDDEN * A::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let output = layout.reserve(MAX_BATCH * A::HIDDEN, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -212,26 +281,26 @@ pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     ))
 }
 
-pub(crate) fn make_fixture(weight: Vec<u16>) -> Fixture {
-    let attention = (0..MAX_BATCH * COLUMNS)
+fn make_fixture_for<A: Arch>(weight: Vec<u16>) -> Fixture {
+    let attention = (0..MAX_BATCH * A::ATTENTION_OUTPUT_COLUMNS)
         .map(|index| {
-            let token = index / COLUMNS;
+            let token = index / A::ATTENTION_OUTPUT_COLUMNS;
             ATTENTION_PATTERN[index & 15] * TOKEN_FACTORS[token]
         })
         .collect::<Vec<_>>();
-    let mut qkv = vec![BF16_SENTINEL; MAX_BATCH * QKV_ROWS];
+    let mut qkv = vec![BF16_SENTINEL; MAX_BATCH * A::ATTENTION_QKV_ROWS];
     for token in 0..MAX_BATCH {
-        for head in 0..Qwen38_27B::NUM_ATTENTION_HEADS {
-            for dimension in 0..Qwen38_27B::HEAD_DIM {
-                let gate = token * QKV_ROWS
-                    + head * 2 * Qwen38_27B::HEAD_DIM
-                    + Qwen38_27B::HEAD_DIM
+        for head in 0..A::NUM_ATTENTION_HEADS {
+            for dimension in 0..A::HEAD_DIM {
+                let gate = token * A::ATTENTION_QKV_ROWS
+                    + head * 2 * A::HEAD_DIM
+                    + A::HEAD_DIM
                     + dimension;
                 qkv[gate] = f32_to_bf16(GATE_PATTERN[dimension & 15]);
             }
         }
     }
-    let gated = (0..MAX_BATCH * COLUMNS)
+    let gated = (0..MAX_BATCH * A::ATTENTION_OUTPUT_COLUMNS)
         .map(|index| {
             let gate = f64::from(GATE_PATTERN[index & 15]);
             (f64::from(attention[index]) / (1.0 + (-gate).exp())) as f32
@@ -268,7 +337,7 @@ fn load_immutable(
     arena.copy_from_host(stream, regions.weight, &fixture.weight)
 }
 
-fn reset(
+fn reset<A: Arch>(
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
@@ -279,14 +348,14 @@ fn reset(
     arena.copy_prefix_from_host(
         stream,
         regions.attention,
-        &fixture.attention[..batch * COLUMNS],
+        &fixture.attention[..batch * A::ATTENTION_OUTPUT_COLUMNS],
     )?;
     arena.fill(stream, regions.activation, BYTE_SENTINEL)?;
     arena.fill(stream, regions.output, BYTE_SENTINEL)
 }
 
-fn launch(
-    op: &MtpBf16AttentionOutputOp,
+fn launch<O: QualifiedAttentionOutputOp>(
+    op: &O,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
@@ -306,8 +375,8 @@ fn launch(
     }
 }
 
-fn launch_b1_row(
-    op: &MtpBf16AttentionOutputOp,
+fn launch_b1_row<A: Arch, O: QualifiedAttentionOutputOp>(
+    op: &O,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
@@ -318,17 +387,21 @@ fn launch_b1_row(
         op.launch(
             stream,
             1,
-            arena.address(regions.attention)?.add(row * COLUMNS),
-            arena.address(regions.qkv)?.add(row * QKV_ROWS),
-            arena.address(regions.activation)?.add(row * COLUMNS),
+            arena
+                .address(regions.attention)?
+                .add(row * A::ATTENTION_OUTPUT_COLUMNS),
+            arena.address(regions.qkv)?.add(row * A::ATTENTION_QKV_ROWS),
+            arena
+                .address(regions.activation)?
+                .add(row * A::ATTENTION_OUTPUT_COLUMNS),
             arena.address(regions.weight)?,
-            arena.address(regions.output)?.add(row * OUTPUT_ROWS),
+            arena.address(regions.output)?.add(row * A::HIDDEN),
         )
     }
 }
 
-fn b1_route_references(
-    op: &MtpBf16AttentionOutputOp,
+fn b1_route_references<A: Arch, O: QualifiedAttentionOutputOp>(
+    op: &O,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
@@ -338,7 +411,7 @@ fn b1_route_references(
     arena.fill(stream, regions.activation, BYTE_SENTINEL)?;
     arena.fill(stream, regions.output, BYTE_SENTINEL)?;
     for row in 0..MAX_BATCH {
-        launch_b1_row(op, arena, stream, regions, row)?;
+        launch_b1_row::<A, O>(op, arena, stream, regions, row)?;
     }
     arena.copy_to_host(stream, regions.output)
 }
@@ -351,9 +424,9 @@ fn observe(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuRes
     })
 }
 
-fn source_oracle(input: &[u16], weight: &[u16]) -> Vec<f64> {
+fn source_oracle<A: Arch>(input: &[u16], weight: &[u16]) -> Vec<f64> {
     weight
-        .chunks_exact(COLUMNS)
+        .chunks_exact(A::ATTENTION_OUTPUT_COLUMNS)
         .map(|row| {
             input.iter().zip(row).fold(0.0f64, |sum, (&x, &w)| {
                 sum + f64::from(bf16_to_f32(x)) * f64::from(bf16_to_f32(w))
@@ -362,7 +435,7 @@ fn source_oracle(input: &[u16], weight: &[u16]) -> Vec<f64> {
         .collect()
 }
 
-fn verify_outputs(
+fn verify_outputs<A: Arch>(
     batch: usize,
     fixture: &Fixture,
     route_reference: &[u16],
@@ -371,8 +444,8 @@ fn verify_outputs(
     report: &mut MtpBf16AttentionOutputQualification,
 ) -> Result<(), MtpBf16AttentionOutputQualificationError> {
     for token in 0..batch {
-        let begin = token * COLUMNS;
-        for column in 0..COLUMNS {
+        let begin = token * A::ATTENTION_OUTPUT_COLUMNS;
+        for column in 0..A::ATTENTION_OUTPUT_COLUMNS {
             let actual = observed.attention[begin + column];
             let expected = fixture.gated[begin + column];
             let error = (actual - expected).abs();
@@ -384,19 +457,19 @@ fn verify_outputs(
                 )));
             }
         }
-        if let Some(column) = observed.activation[begin..begin + COLUMNS]
+        if let Some(column) = observed.activation[begin..begin + A::ATTENTION_OUTPUT_COLUMNS]
             .iter()
-            .zip(&fixture.activation[begin..begin + COLUMNS])
+            .zip(&fixture.activation[begin..begin + A::ATTENTION_OUTPUT_COLUMNS])
             .position(|(actual, expected)| actual != expected)
         {
             return Err(MtpBf16AttentionOutputQualificationError::Mismatch(format!(
                 "B={batch} BF16 activation token={token}, column={column} differs"
             )));
         }
-        let output_begin = token * OUTPUT_ROWS;
-        if let Some(output) = observed.output[output_begin..output_begin + OUTPUT_ROWS]
+        let output_begin = token * A::HIDDEN;
+        if let Some(output) = observed.output[output_begin..output_begin + A::HIDDEN]
             .iter()
-            .zip(&route_reference[output_begin..output_begin + OUTPUT_ROWS])
+            .zip(&route_reference[output_begin..output_begin + A::HIDDEN])
             .position(|(actual, expected)| actual != expected)
         {
             return Err(MtpBf16AttentionOutputQualificationError::Mismatch(format!(
@@ -405,7 +478,7 @@ fn verify_outputs(
         }
     }
     if batch == 1 {
-        for (output, (&actual, &expected)) in observed.output[..OUTPUT_ROWS]
+        for (output, (&actual, &expected)) in observed.output[..A::HIDDEN]
             .iter()
             .zip(source_expected)
             .enumerate()
@@ -420,25 +493,25 @@ fn verify_outputs(
                 )));
             }
         }
-        report.source_output_values += OUTPUT_ROWS;
+        report.source_output_values += A::HIDDEN;
     }
 
-    verify_inactive(batch, observed)?;
-    report.gated_values += batch * COLUMNS;
-    report.activation_values += batch * COLUMNS;
-    report.output_values += batch * OUTPUT_ROWS;
-    report.inactive_values += inactive_values(batch);
+    verify_inactive::<A>(batch, observed)?;
+    report.gated_values += batch * A::ATTENTION_OUTPUT_COLUMNS;
+    report.activation_values += batch * A::ATTENTION_OUTPUT_COLUMNS;
+    report.output_values += batch * A::HIDDEN;
+    report.inactive_values += inactive_values::<A>(batch);
     Ok(())
 }
 
-fn verify_replay(
+fn verify_replay<A: Arch>(
     batch: usize,
     eager: &Observed,
     replay: &Observed,
     report: &mut MtpBf16AttentionOutputQualification,
 ) -> Result<(), MtpBf16AttentionOutputQualificationError> {
-    let active_columns = batch * COLUMNS;
-    let active_outputs = batch * OUTPUT_ROWS;
+    let active_columns = batch * A::ATTENTION_OUTPUT_COLUMNS;
+    let active_outputs = batch * A::HIDDEN;
     let same = replay.attention[..active_columns]
         .iter()
         .map(|value| value.to_bits())
@@ -452,18 +525,18 @@ fn verify_replay(
             "B={batch} graph replay differs from eager execution"
         )));
     }
-    verify_inactive(batch, replay)?;
-    report.graph_replay_values += batch * (2 * COLUMNS + OUTPUT_ROWS);
-    report.inactive_values += inactive_values(batch);
+    verify_inactive::<A>(batch, replay)?;
+    report.graph_replay_values += batch * (2 * A::ATTENTION_OUTPUT_COLUMNS + A::HIDDEN);
+    report.inactive_values += inactive_values::<A>(batch);
     Ok(())
 }
 
-fn verify_inactive(
+fn verify_inactive<A: Arch>(
     batch: usize,
     observed: &Observed,
 ) -> Result<(), MtpBf16AttentionOutputQualificationError> {
-    let columns_begin = batch * COLUMNS;
-    let output_begin = batch * OUTPUT_ROWS;
+    let columns_begin = batch * A::ATTENTION_OUTPUT_COLUMNS;
+    let output_begin = batch * A::HIDDEN;
     if observed.attention[columns_begin..]
         .iter()
         .any(|value| value.to_bits() != F32_SENTINEL_BITS)
@@ -481,8 +554,8 @@ fn verify_inactive(
     Ok(())
 }
 
-fn inactive_values(batch: usize) -> usize {
-    (MAX_BATCH - batch) * (2 * COLUMNS + OUTPUT_ROWS)
+fn inactive_values<A: Arch>(batch: usize) -> usize {
+    (MAX_BATCH - batch) * (2 * A::ATTENTION_OUTPUT_COLUMNS + A::HIDDEN)
 }
 
 fn verify_immutable(
@@ -503,9 +576,9 @@ fn verify_immutable(
     Ok(())
 }
 
-fn verify_no_post_warmup_allocation(
+fn verify_no_post_warmup_allocation<A: Arch, O: QualifiedAttentionOutputOp>(
     context: &CudaContext,
-    op: &MtpBf16AttentionOutputOp,
+    op: &O,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
@@ -513,7 +586,7 @@ fn verify_no_post_warmup_allocation(
 ) -> Result<(), MtpBf16AttentionOutputQualificationError> {
     let graphs = (1..=MAX_BATCH)
         .map(|batch| {
-            reset(arena, stream, regions, fixture, batch)?;
+            reset::<A>(arena, stream, regions, fixture, batch)?;
             stream.synchronize().map_err(GpuError::from)?;
             CudaGraph::capture(stream, || launch(op, arena, stream, regions, batch))
         })
@@ -544,8 +617,12 @@ fn verify_no_post_warmup_allocation(
 
 #[cfg(test)]
 mod tests {
-    use super::{COLUMNS, MAX_BATCH, OUTPUT_ROWS, layout, qualify_mtp_bf16_attention_output};
+    use super::{
+        COLUMNS, MAX_BATCH, OUTPUT_ROWS, layout, layout_for, qualify_mtp_bf16_attention_output,
+        qualify_qwen35_mtp_bf16_attention_output,
+    };
     use std::path::PathBuf;
+    use tuisko_model::{Arch, Qwen35_9B};
 
     #[test]
     fn mtp_bf16_attention_output_suite_route_and_byte_inventory_is_exact() {
@@ -582,6 +659,45 @@ mod tests {
         assert_eq!(report.weight_bytes, 62_914_560);
         assert_eq!(report.workspace_bytes, 606_208);
         assert_eq!(report.arena_bytes, 63_520_768);
+        assert_eq!(report.padding_bytes, 0);
+        assert!(report.maximum_gated_error.is_finite());
+        assert!(report.maximum_projection_error.is_finite());
+    }
+
+    #[test]
+    fn qwen35_mtp_output_suite_route_and_byte_inventory_is_exact() {
+        let (layout, regions) = layout_for::<Qwen35_9B>().unwrap();
+
+        assert_eq!(Qwen35_9B::ATTENTION_OUTPUT_COLUMNS, 4_096);
+        assert_eq!(Qwen35_9B::HIDDEN, 4_096);
+        assert_eq!(regions.weight_bytes(), 33_554_432);
+        assert_eq!(regions.workspace_bytes(), 425_984);
+        assert_eq!(regions.payload_bytes(), 33_980_416);
+        assert_eq!(layout.byte_len(), regions.payload_bytes());
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive SM120 device and the pinned Qwen3.5 snapshot"]
+    fn qwen35_mtp_output_suite_source_values_match_every_seam_route_and_graph() {
+        let root = PathBuf::from(
+            std::env::var_os("TUISKO_QWEN35_SNAPSHOT")
+                .expect("TUISKO_QWEN35_SNAPSHOT must name the snapshot"),
+        );
+        let report = qualify_qwen35_mtp_bf16_attention_output(&root)
+            .expect("Qwen3.5 MTP BF16 attention-output qualification");
+        let columns = Qwen35_9B::ATTENTION_OUTPUT_COLUMNS;
+        let output_rows = Qwen35_9B::HIDDEN;
+
+        assert_eq!(report.gated_values, 36 * columns);
+        assert_eq!(report.activation_values, 36 * columns);
+        assert_eq!(report.output_values, 36 * output_rows);
+        assert_eq!(report.source_output_values, output_rows);
+        assert_eq!(report.graph_replay_values, 36 * (2 * columns + output_rows));
+        assert_eq!(report.inactive_values, 2 * 28 * (2 * columns + output_rows));
+        assert_eq!(report.immutable_values, 16_859_136);
+        assert_eq!(report.weight_bytes, 33_554_432);
+        assert_eq!(report.workspace_bytes, 425_984);
+        assert_eq!(report.arena_bytes, 33_980_416);
         assert_eq!(report.padding_bytes, 0);
         assert!(report.maximum_gated_error.is_finite());
         assert!(report.maximum_projection_error.is_finite());
