@@ -219,9 +219,9 @@ fn verify_accounting(
 ) -> Result<(), Qwen35MtpLayerQualificationError> {
     if program.resident_weight_bytes() != 486_581_248
         || program.cache_bytes() != 6_291_456
-        || program.workspace_bytes() != 1_476_800
-        || program.owner_bytes() != 494_349_504
-        || program.arena_bytes() != 494_350_336
+        || program.workspace_bytes() != 11_830_880
+        || program.owner_bytes() != 504_703_584
+        || program.arena_bytes() != 504_703_744
         || program.graph_count() != 16
     {
         return Err(Qwen35MtpLayerQualificationError::Mismatch(
@@ -686,13 +686,15 @@ fn verify_replay(
 }
 
 fn observable_values() -> usize {
-    MAX_BATCH
-        * (12 * Qwen35_9B::HIDDEN
-            + Qwen35_9B::ATTENTION_QKV_ROWS
-            + 3 * Qwen35_9B::ATTENTION_OUTPUT_COLUMNS
-            + Qwen35_9B::INTERMEDIATE
-            + 2 * ROTARY_PAIRS
-            + 3)
+    128 * (6 * Qwen35_9B::HIDDEN
+        + Qwen35_9B::ATTENTION_QKV_ROWS
+        + Qwen35_9B::ATTENTION_OUTPUT_COLUMNS
+        + 2 * ROTARY_PAIRS
+        + 3)
+        + MAX_BATCH
+            * (6 * Qwen35_9B::HIDDEN
+                + 2 * Qwen35_9B::ATTENTION_OUTPUT_COLUMNS
+                + Qwen35_9B::INTERMEDIATE)
         + 2 * PHYSICAL_PAGES * Qwen35_9B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen35_9B::HEAD_DIM
         + PHYSICAL_PAGES
 }
@@ -890,7 +892,7 @@ mod tests {
     fn qwen35_mtp_layer_suite_route_and_byte_inventory_is_exact() {
         assert_eq!(MAX_BATCH, 8);
         assert_eq!(REALIGN_ROUTES, 4);
-        assert_eq!(observable_values(), 3_818_032);
+        assert_eq!(observable_values(), 8_495_512);
     }
 
     #[test]
@@ -904,10 +906,10 @@ mod tests {
         assert_eq!(report.leaf_oracle_suites, 6);
         assert_eq!(report.resident_weight_bytes, 486_581_248);
         assert_eq!(report.cache_bytes, 6_291_456);
-        assert_eq!(report.workspace_bytes, 1_476_800);
-        assert_eq!(report.owner_bytes, 494_349_504);
-        assert_eq!(report.arena_bytes, 494_350_336);
-        assert_eq!(report.padding_bytes, 832);
+        assert_eq!(report.workspace_bytes, 11_830_880);
+        assert_eq!(report.owner_bytes, 504_703_584);
+        assert_eq!(report.arena_bytes, 504_703_744);
+        assert_eq!(report.padding_bytes, 160);
         assert_eq!(report.graph_count, 16);
         assert!(report.graph_replay_values > 0);
         assert!(report.maximum_absolute_error <= 0.03125);

@@ -278,6 +278,13 @@ impl ResidentLayer {
         }
     }
 
+    fn output_address(&self) -> GpuResult<*const u16> {
+        match self {
+            Self::Gdn(program) => program.output_address(),
+            Self::FullAttention(program) => program.output_address(),
+        }
+    }
+
     /// # Safety
     /// `input` names the active BF16 residual rows in the shared CUDA context.
     unsafe fn launch_from(
@@ -621,6 +628,50 @@ impl Qwen35ResidentModelProgram {
             .last()
             .ok_or_else(|| EngineError::layout("Qwen3.5 resident layer inventory is empty"))?
             .read_residual(stream, route.tokens)
+    }
+
+    pub(crate) fn gather_embedding_rows(
+        &self,
+        token_ids: &[u32],
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        self.endpoint.gather_embedding_rows(token_ids, destination)
+    }
+
+    pub(crate) fn final_residual_address(&self) -> GpuResult<*const u16> {
+        self.layers
+            .last()
+            .ok_or_else(|| GpuError::invalid_launch("Qwen3.5 resident layer inventory is empty"))?
+            .output_address()
+    }
+
+    /// Projects externally final-normalized rows with the shared BF16 LM head.
+    ///
+    /// # Safety
+    /// `normalized` must cover `batch * 4096` BF16 values until completion.
+    pub(crate) unsafe fn launch_lm_head_from(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        normalized: *const u16,
+    ) -> GpuResult<()> {
+        unsafe { self.endpoint.launch_lm_head_from(stream, batch, normalized) }
+    }
+
+    pub(crate) fn kv_slot_state(&self, slot: usize) -> EngineResult<crate::PagedKvSlotState> {
+        self.long_context_kv.slot_state(slot)
+    }
+
+    pub(crate) fn kv_slot_token_count(&self, slot: usize) -> EngineResult<usize> {
+        self.long_context_kv.slot_token_count(slot)
+    }
+
+    pub(crate) fn kv_route(
+        &self,
+        slot: usize,
+        position: usize,
+    ) -> EngineResult<crate::PagedKvRoute> {
+        self.long_context_kv.route(slot, position)
     }
 
     /// CUDA context shared by every resident owner.

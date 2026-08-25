@@ -506,6 +506,12 @@ impl Qwen35GdnLayerProgram {
         Ok(Pointers::bind(&self.arena, self.layout.regions())?.residual_input)
     }
 
+    pub(crate) fn output_address(&self) -> GpuResult<*const u16> {
+        Ok(Pointers::bind(&self.arena, self.layout.regions())?
+            .residual_output
+            .cast_const())
+    }
+
     fn graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
         if (1..=MAX_BATCH).contains(&rows) {
             return Ok(&self.graphs[rows - 1]);

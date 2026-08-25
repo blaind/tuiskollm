@@ -193,6 +193,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-qwen35-bf16-lm-head SNAPSHOT` | Check the source BF16 LM head against sampled FP64 dots, eager/graph agreement, immutable inputs, stable addresses, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-text-endpoint SNAPSHOT` | Check exact source embeddings, final RMSNorm, sampled full-formula BF16 logits, graph replay, stable addresses, and post-warmup allocation at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-resident-model SNAPSHOT` | Check every complete Qwen3.5 text layer plus endpoint graph against eager replay, endpoint source formulas, finite logits, stable addresses, and owner allocation at B=1..8 | terminal |
+| `cargo run -p xtask -- qualify-qwen35-resident-mtp SNAPSHOT` | Check Qwen3.5 target/MTP cache mirroring, T=32/64/128 priming, exact B=1..8 draft graphs, sampled source-BF16 LM-head dots, stable ownership, and zero post-warmup allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-generation SNAPSHOT` | Check exact Transformers prompt IDs, greedy streaming, compact B=1..8 output agreement, cancellation, slot reuse, concurrent native prefill, stable ownership, and zero post-warmup device allocation | terminal |
 | `cargo run -p xtask -- qualify-qwen35-nvfp4-gdn-input` | Check Qwen3.5 fused Q/K/V/Z and padded A/B represented values, immutable inputs, graph replay, stable addresses, and allocation behavior at B=1..8 | terminal |
 | `cargo run -p xtask -- qualify-qwen35-gdn-prepare` | Check Qwen3.5 projected A/B controls, mapped causal width-four convolution/history updates, immutable inputs, graph replay, stable addresses, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
@@ -250,6 +251,7 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- bench-mtp-bf16-mlp` | Measure every exact B=1..8 production graph for source-BF16 gate/up SwiGLU and down projection | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-mtp-layer SNAPSHOT` | Directly measure every complete source-backed MTP draft B=1..8 production graph at a 131-token, three-page BF16 context | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-resident-mtp SNAPSHOT` | Directly measure every resident long-context MTP seeded-draft, same-round residual-continuation, and explicit hidden-handoff B=1..8 graph, including pinned input upload, the respective target/prior-residual handoff, shared target LM head, and the production cache regime | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen35-resident-mtp SNAPSHOT` | Directly measure every source-BF16 Qwen3.5 MTP layer plus shared BF16 LM-head graph at B=1..8 | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-target-mtp-verify SNAPSHOT` | Directly measure every exact lane-major `(B=1..8, K=1..4)` target verification and verification-plus-full-prefix commit graph at a 132-token context, with matching production metadata restored outside timing | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-generation-mtp-greedy SNAPSHOT` | Directly measure host completion for one proposal-ready draft-three/K=4/realignment round and one production prompt-plus-eight-output greedy MTP request; prompt preparation for the round is outside its timing rather than estimated from leaf medians | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-generation-mtp-sampling SNAPSHOT` | Directly measure host completion for one seeded sampled draft-three/K=4 round, one complete sampled request, and the same request with non-identity output-history penalties; the round excludes prompt preparation and no boundary is estimated from leaf medians | terminal or `--json PATH` |
@@ -409,6 +411,10 @@ at every exact `B=1..8`; it never infers whole-model latency from leaf medians. 
 leaf-wide `perf` until a locked-clock baseline is reviewed. A controlled 2,182 MHz SM / 13,801 MHz
 memory diagnostic measured 6.261 ms at `B=1` and 8.485 ms at `B=8`, with about 1.2 us host submit
 time and zero timed device-memory growth.
+
+`bench-qwen35-resident-mtp SNAPSHOT` directly measures the source-BF16 draft layer and shared
+BF16 LM head at every exact `B=1..8`, after an untimed target-model handoff at a 131-token context.
+It remains outside leaf-wide `perf` until a locked-clock baseline is reviewed.
 
 `bench-qwen36-resident-model SNAPSHOT` directly measures the complete 40-layer plus represented
 NVFP4 endpoint graph at every exact `B=1..8` and from-empty `T=32,64,128`; it never infers
