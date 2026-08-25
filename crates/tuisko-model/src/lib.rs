@@ -11,6 +11,7 @@ mod views;
 
 pub use common::config_util::validate_config;
 pub use common::inventory::CheckpointSnapshot;
+pub use common::materialized::MaterializedMemory;
 pub use common::modelopt_codec::{MaterializedModelOptNvfp4Linear, ModelOptNvfp4LinearBindings};
 pub use common::mtp::MaterializedMtpQkv;
 pub use common::nvfp4::{

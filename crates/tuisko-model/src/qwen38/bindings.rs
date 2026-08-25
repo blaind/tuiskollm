@@ -1004,6 +1004,7 @@ fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> Checkpo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MaterializedMemory;
     use crate::common::nvfp4::{Nvfp4DownBindings, Nvfp4GateUpBindings};
     use crate::common::test_builder::SafeTensorTestBuilder;
     use crate::common::test_support::sources::{
@@ -1693,6 +1694,7 @@ mod tests {
         assert_eq!(&materialized.weight_bf16[..query_end], query_bytes);
         assert_eq!(&materialized.weight_bf16[query_end..key_end], key_bytes);
         assert_eq!(&materialized.weight_bf16[key_end..], value_bytes);
+        assert_eq!(materialized.host_bytes(), 256);
         assert_eq!((materialized.rows, materialized.columns), (4, 32));
 
         fs::remove_file(path).unwrap();

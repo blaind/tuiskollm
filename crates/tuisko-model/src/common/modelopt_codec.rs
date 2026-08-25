@@ -1,5 +1,6 @@
 //! ModelOpt scale validation and reciprocal divisor conversion shared by the ModelOpt targets.
 
+use crate::common::materialized::{MaterializedMemory, sealed};
 use crate::common::routes::{
     E2M1_VALUES_PER_BYTE, NVFP4_GROUP_SIZE, codec_columns, positive_rank_zero_f32,
     validate_nvfp4_scales,
@@ -77,6 +78,14 @@ pub struct MaterializedModelOptNvfp4Linear<'a> {
     pub columns: usize,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl sealed::Sealed for MaterializedModelOptNvfp4Linear<'_> {}
+
+impl MaterializedMemory for MaterializedModelOptNvfp4Linear<'_> {
+    fn host_bytes(&self) -> usize {
+        self.scale_e4m3_swizzled.len()
+    }
 }
 
 pub(crate) fn materialize_modelopt_linear<'a>(

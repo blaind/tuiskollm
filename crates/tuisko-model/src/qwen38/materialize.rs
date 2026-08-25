@@ -1,5 +1,6 @@
 //! Qwen3.8-27B lossless materialization into runtime-native host layouts.
 
+use crate::common::materialized::{MaterializedMemory, sealed};
 use crate::common::mtp::MaterializedMtpQkv;
 use crate::common::routes::require_full_attention_layer;
 use crate::common::scale_swizzle::{PlaneGatherer, host_shape};
@@ -19,6 +20,14 @@ pub struct MaterializedFullAttentionQkv {
     pub columns: usize,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl sealed::Sealed for MaterializedFullAttentionQkv {}
+
+impl MaterializedMemory for MaterializedFullAttentionQkv {
+    fn host_bytes(&self) -> usize {
+        self.weight_e4m3.len() + self.scale_bf16.len()
+    }
 }
 
 impl FullAttentionQkvBindings<'_> {
@@ -132,6 +141,7 @@ impl MtpBindings<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::MaterializedMemory;
 
     use crate::CheckpointErrorCode;
     use crate::common::test_support::sources::{bf16_bytes, bf16_view, fp8_view};
@@ -191,6 +201,7 @@ mod tests {
             key_scale
         );
         assert_eq!(&materialized.scale_bf16[key_scale_end..], value_scale);
+        assert_eq!(materialized.host_bytes(), 30);
         assert_eq!((materialized.rows, materialized.columns), (6, 3));
         assert_eq!(materialized.layer, 3);
     }

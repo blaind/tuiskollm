@@ -1,5 +1,6 @@
 //! Qwen3.6-35B-A3B MoE lossless materialization into runtime-native host layouts.
 
+use crate::common::materialized::{MaterializedMemory, sealed};
 use crate::common::modelopt_codec::{
     MaterializedModelOptNvfp4Linear, ModelOptScaleCodec, materialize_modelopt_linear,
 };
@@ -94,9 +95,10 @@ pub struct MaterializedQwen36MoeExperts {
     pub layer: usize,
 }
 
-impl MaterializedQwen36MoeExperts {
-    /// Host bytes owned by this expert layout.
-    pub fn owned_bytes(&self) -> usize {
+impl sealed::Sealed for MaterializedQwen36MoeExperts {}
+
+impl MaterializedMemory for MaterializedQwen36MoeExperts {
+    fn host_bytes(&self) -> usize {
         [
             self.gate_up_weight_e2m1.len(),
             self.gate_up_scale_e4m3_swizzled.len(),
@@ -135,10 +137,11 @@ pub struct MaterializedQwen36MoeLayer<'a> {
     pub layer: usize,
 }
 
-impl MaterializedQwen36MoeLayer<'_> {
-    /// Host bytes owned by the two expert layouts.
-    pub fn owned_bytes(&self) -> usize {
-        self.experts.owned_bytes() + self.shared_expert.owned_bytes()
+impl sealed::Sealed for MaterializedQwen36MoeLayer<'_> {}
+
+impl MaterializedMemory for MaterializedQwen36MoeLayer<'_> {
+    fn host_bytes(&self) -> usize {
+        self.experts.host_bytes() + self.shared_expert.host_bytes()
     }
 }
 
@@ -157,6 +160,14 @@ pub struct MaterializedQwen36Fp8Linear<'a> {
     pub columns: usize,
     /// Decoder layer owning this projection.
     pub layer: usize,
+}
+
+impl sealed::Sealed for MaterializedQwen36Fp8Linear<'_> {}
+
+impl MaterializedMemory for MaterializedQwen36Fp8Linear<'_> {
+    fn host_bytes(&self) -> usize {
+        0
+    }
 }
 
 /// Runtime-native mixed-FP8/BF16 planes for one Qwen3.6 GDN layer.
@@ -198,10 +209,11 @@ pub struct MaterializedQwen36Gdn<'a> {
     pub layer: usize,
 }
 
-impl MaterializedQwen36Gdn<'_> {
-    /// Host bytes owned by the two fused source planes.
-    pub fn owned_bytes(&self) -> usize {
-        self.input_weight_e4m3.len() + self.control_weight_bf16.len()
+impl sealed::Sealed for MaterializedQwen36Gdn<'_> {}
+
+impl MaterializedMemory for MaterializedQwen36Gdn<'_> {
+    fn host_bytes(&self) -> usize {
+        self.input_weight_e4m3.len() + self.control_weight_bf16.len() + self.output.host_bytes()
     }
 }
 
@@ -335,10 +347,11 @@ pub struct MaterializedQwen36FullAttention<'a> {
     pub layer: usize,
 }
 
-impl MaterializedQwen36FullAttention<'_> {
-    /// Host bytes owned by the fused Q/K/V plane.
-    pub fn owned_bytes(&self) -> usize {
-        self.qkv_weight_e4m3.len()
+impl sealed::Sealed for MaterializedQwen36FullAttention<'_> {}
+
+impl MaterializedMemory for MaterializedQwen36FullAttention<'_> {
+    fn host_bytes(&self) -> usize {
+        self.qkv_weight_e4m3.len() + self.output.host_bytes()
     }
 }
 
@@ -491,6 +504,14 @@ pub struct MaterializedQwen36TextEndpoint<'a> {
     pub lm_head_input_scale: f32,
     /// Exact source second-stage weight scale consumed by the A16 route.
     pub lm_head_weight_scale_2: f32,
+}
+
+impl sealed::Sealed for MaterializedQwen36TextEndpoint<'_> {}
+
+impl MaterializedMemory for MaterializedQwen36TextEndpoint<'_> {
+    fn host_bytes(&self) -> usize {
+        self.lm_head_scale_e4m3_swizzled.len()
+    }
 }
 
 impl<'a> Qwen36TextEndpointBindings<'a> {
@@ -834,6 +855,7 @@ fn reserved_scalars(count: usize, layer: usize, role: &str) -> CheckpointResult<
 
 #[cfg(test)]
 mod tests {
+    use crate::MaterializedMemory;
     use crate::common::inventory::CheckpointSnapshot;
     use crate::common::modelopt_codec::ModelOptNvfp4LinearBindings;
     use crate::common::test_support::sources::{
@@ -984,9 +1006,9 @@ mod tests {
         assert_eq!(materialized.experts.down_input_scale_divisors, vec![2.0; 2]);
         assert_eq!(materialized.shared_expert.expert_count, 1);
         assert_eq!(materialized.router_weight.bytes().as_ptr(), router.as_ptr());
-        assert_eq!(materialized.experts.owned_bytes(), 55_360);
-        assert_eq!(materialized.shared_expert.owned_bytes(), 27_680);
-        assert_eq!(materialized.owned_bytes(), 83_040);
+        assert_eq!(materialized.experts.host_bytes(), 55_360);
+        assert_eq!(materialized.shared_expert.host_bytes(), 27_680);
+        assert_eq!(materialized.host_bytes(), 83_040);
     }
 
     #[test]
@@ -1119,9 +1141,9 @@ mod tests {
         assert_eq!(materialized.experts.expert_count, 256);
         assert_eq!(materialized.experts.hidden, 2_048);
         assert_eq!(materialized.experts.intermediate, 512);
-        assert_eq!(materialized.experts.owned_bytes(), 452_993_024);
-        assert_eq!(materialized.shared_expert.owned_bytes(), 1_769_504);
-        assert_eq!(materialized.owned_bytes(), 454_762_528);
+        assert_eq!(materialized.experts.host_bytes(), 452_993_024);
+        assert_eq!(materialized.shared_expert.host_bytes(), 1_769_504);
+        assert_eq!(materialized.host_bytes(), 454_762_528);
         assert_eq!(materialized.router_weight.bytes().as_ptr(), router.as_ptr());
 
         for expert in 0..source.experts.len() {
@@ -1226,6 +1248,7 @@ mod tests {
             materialized.lm_head_weight_scale_2.to_bits(),
             source_weight_scale.to_bits()
         );
+        assert_eq!(materialized.host_bytes(), source_scales.len());
     }
 
     #[test]
@@ -1339,7 +1362,7 @@ mod tests {
         assert_eq!(materialized.input_norm.word(0), Some(0x40e0));
         assert_eq!(materialized.post_attention_norm.word(0), Some(0x4100));
         assert_eq!(
-            materialized.owned_bytes(),
+            materialized.host_bytes(),
             2 * ROWS * COLUMNS + 4 * 32 * COLUMNS
         );
         assert_eq!(materialized.layer, 0);
@@ -1463,7 +1486,7 @@ mod tests {
         assert_eq!(materialized.input_norm.word(0), Some(0x4040));
         assert_eq!(materialized.post_attention_norm.word(0), Some(0x4080));
         assert_eq!(
-            materialized.owned_bytes(),
+            materialized.host_bytes(),
             (QUERY_ROWS + 2 * KV_ROWS) * COLUMNS
         );
         assert_eq!(materialized.layer, 1);
@@ -1512,7 +1535,7 @@ mod tests {
         assert_eq!(materialized.key_norm.shape(), &[256]);
         assert_eq!(materialized.input_norm.shape(), &[2_048]);
         assert_eq!(materialized.post_attention_norm.shape(), &[2_048]);
-        assert_eq!(materialized.owned_bytes(), 18_874_368);
+        assert_eq!(materialized.host_bytes(), 18_874_368);
         assert_eq!(materialized.layer, 3);
     }
 
@@ -1577,7 +1600,7 @@ mod tests {
             materialized.output.weight_e4m3.as_ptr(),
             output_weight.as_ptr()
         );
-        assert_eq!(materialized.owned_bytes(), 25_427_968);
+        assert_eq!(materialized.host_bytes(), 25_427_968);
         assert_eq!(materialized.layer, 0);
     }
 }

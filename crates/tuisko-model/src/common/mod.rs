@@ -11,6 +11,7 @@
 
 pub(crate) mod config_util;
 pub(crate) mod inventory;
+pub(crate) mod materialized;
 pub(crate) mod modelopt_codec;
 pub(crate) mod mtp;
 pub(crate) mod naming;
