@@ -3,5 +3,5 @@ rustc_release=1.96.0-nightly
 rustc_commit=55e86c996809902e8bbad512cfb4d2c18be446d9
 cuda_toolkit_release=13.3
 cuda_toolkit_version=13.3.73
-attention_registers=53,53,53,53,53,53,53,53
+attention_registers=48,55,55,55,55,55,55,55
 shared_bytes=1024
