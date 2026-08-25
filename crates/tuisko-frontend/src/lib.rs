@@ -78,6 +78,8 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
 }
 
+// `deny_unknown_fields` deliberately rejects OpenAI's optional `name`: the pinned chat
+// template never renders it, so admitting it would silently drop caller intent.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireChatMessage {
@@ -198,13 +200,6 @@ where
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum WireChatContent {
-    Text(String),
-    Parts(Vec<WireChatContentPart>),
-}
-
-#[derive(Deserialize)]
 struct WireChatContentPart {
     #[serde(rename = "type")]
     kind: String,
@@ -218,12 +213,15 @@ fn deserialize_wire_chat_content<'de, D>(deserializer: D) -> Result<WireMessageC
 where
     D: Deserializer<'de>,
 {
-    match Option::<WireChatContent>::deserialize(deserializer)? {
-        None => Ok(WireMessageContent::Null),
-        Some(WireChatContent::Text(text)) => Ok(WireMessageContent::Text(text)),
-        Some(WireChatContent::Parts(parts)) => {
+    match Value::deserialize(deserializer)? {
+        Value::Null => Ok(WireMessageContent::Null),
+        Value::String(text) => Ok(WireMessageContent::Text(text)),
+        Value::Array(parts) => {
             let mut text = String::new();
-            for part in parts {
+            for (index, part) in parts.into_iter().enumerate() {
+                let part = WireChatContentPart::deserialize(part).map_err(|source| {
+                    D::Error::custom(format!("chat content part {index} is malformed: {source}"))
+                })?;
                 if part.kind != "text" {
                     let detail = if part.kind == "image_url" || part.kind == "image" {
                         "image parts are not served yet: the vision tower has no device implementation"
@@ -248,6 +246,21 @@ where
             }
             Ok(WireMessageContent::Text(text))
         }
+        other => Err(D::Error::custom(format!(
+            "message `content` must be a string, an array of content parts, or null, not {}",
+            json_type_name(&other)
+        ))),
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
@@ -406,16 +419,14 @@ impl TextFrontend {
         contract: FrontendContract,
     ) -> FrontendResult<Self> {
         let tokenizer_path = root.join(TOKENIZER_FILE);
-        let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|source| {
-            FrontendError::Tokenizer(format!(
-                "could not load {}: {source}",
-                tokenizer_path.display()
-            ))
-        })?;
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(tokenizer_error(
+            &format!("could not load {}", tokenizer_path.display()),
+        ))?;
         tokenizer
             .with_truncation(None)
-            .map_err(|source| FrontendError::Tokenizer(source.to_string()))?;
-        validate_tokenizer(&tokenizer, contract)?;
+            .map_err(tokenizer_error("could not disable truncation"))?;
+        let byte_table = byte_level_table();
+        validate_tokenizer(&tokenizer, contract, &byte_table)?;
 
         let template_path = root.join(TEMPLATE_FILE);
         let template = read_string(&template_path)?;
@@ -444,7 +455,7 @@ impl TextFrontend {
             decode: Arc::new(DecodeState {
                 tokenizer,
                 literal_tokenizer,
-                byte_table: byte_level_table(),
+                byte_table,
                 special_decode_ids,
                 special_encode_tokens,
             }),
@@ -518,7 +529,7 @@ impl TextFrontend {
             .literal_tokenizer
             .encode(text, false)
             .map(|encoding| encoding.get_ids().to_vec())
-            .map_err(|source| FrontendError::Tokenizer(format!("could not encode text: {source}")))
+            .map_err(tokenizer_error("could not encode text"))
     }
 
     /// Renders and encodes one generation prompt.
@@ -599,9 +610,7 @@ impl TextFrontend {
         self.decode
             .tokenizer
             .decode(token_ids, skip_special_tokens)
-            .map_err(|source| {
-                FrontendError::Tokenizer(format!("could not decode token IDs: {source}"))
-            })
+            .map_err(tokenizer_error("could not decode token IDs"))
     }
 
     /// Starts a special-token-skipping streaming decoder.
@@ -651,9 +660,7 @@ impl TextFrontend {
                 .decode
                 .tokenizer
                 .encode(tail, false)
-                .map_err(|source| {
-                    FrontendError::Tokenizer(format!("could not encode prompt tail: {source}"))
-                })?;
+                .map_err(tokenizer_error("could not encode prompt tail"))?;
             let reused_tokens = cached.token_ids.len();
             let mut token_ids = cached.token_ids;
             token_ids.extend_from_slice(encoding.get_ids());
@@ -678,9 +685,7 @@ impl TextFrontend {
             .decode
             .tokenizer
             .encode(rendered, false)
-            .map_err(|source| {
-                FrontendError::Tokenizer(format!("could not encode prompt: {source}"))
-            })?;
+            .map_err(tokenizer_error("could not encode prompt"))?;
         let token_ids = encoding.get_ids().to_vec();
         let token_ends = encoding
             .get_offsets()
@@ -841,9 +846,7 @@ impl TextFrontend {
             .decode
             .literal_tokenizer
             .encode(text, false)
-            .map_err(|source| {
-                FrontendError::Tokenizer(format!("could not encode literal prompt text: {source}"))
-            })?;
+            .map_err(tokenizer_error("could not encode literal prompt text"))?;
         token_ids.extend_from_slice(encoding.get_ids());
         Ok(())
     }
@@ -965,11 +968,10 @@ fn push_stream_byte(pending: &mut Vec<u8>, output: &mut String, byte: u8) {
     let mut candidate = pending.clone();
     candidate.push(byte);
     if (0x80..=0xbf).contains(&byte) && is_valid_utf8_prefix(&candidate) {
+        // `is_valid_utf8_prefix` accepts exactly the well-formed prefixes, so a candidate that
+        // does not decode is always an incomplete sequence.
         if let Ok(text) = std::str::from_utf8(&candidate) {
             output.push_str(text);
-            pending.clear();
-        } else if candidate.len() == usize::from(utf8_sequence_length(candidate[0]).unwrap()) {
-            output.push_str(&"\u{fffd}".repeat(candidate.len()));
             pending.clear();
         } else {
             *pending = candidate;
@@ -1109,7 +1111,15 @@ fn common_prefix_bytes(left: &str, right: &str) -> usize {
     length
 }
 
-fn validate_tokenizer(tokenizer: &Tokenizer, contract: FrontendContract) -> FrontendResult<()> {
+fn tokenizer_error<E: std::fmt::Display>(context: &str) -> impl FnOnce(E) -> FrontendError + '_ {
+    move |source| FrontendError::Tokenizer(format!("{context}: {source}"))
+}
+
+fn validate_tokenizer(
+    tokenizer: &Tokenizer,
+    contract: FrontendContract,
+    byte_table: &HashMap<char, u8>,
+) -> FrontendResult<()> {
     let entries = tokenizer.get_vocab_size(true);
     let expected_entries = contract.tokenizer_entries();
     if entries != expected_entries {
@@ -1130,6 +1140,32 @@ fn validate_tokenizer(tokenizer: &Tokenizer, contract: FrontendContract) -> Fron
                 "tokenizer maps `{token}` to {actual:?}, expected {expected}"
             )));
         }
+    }
+
+    validate_added_token_alphabet(tokenizer, byte_table)
+}
+
+/// Pins the streaming decoder's assumption that every decodable added token is byte-level.
+fn validate_added_token_alphabet(
+    tokenizer: &Tokenizer,
+    byte_table: &HashMap<char, u8>,
+) -> FrontendResult<()> {
+    let offender = tokenizer
+        .get_added_tokens_decoder()
+        .into_iter()
+        .filter(|(_, token)| !token.special)
+        .filter_map(|(id, token)| {
+            token
+                .content
+                .chars()
+                .find(|character| !byte_table.contains_key(character))
+                .map(|character| (id, character))
+        })
+        .min_by_key(|&(id, _)| id);
+    if let Some((id, character)) = offender {
+        return Err(FrontendError::Contract(format!(
+            "added token {id} contains non-byte-level character {character:?}"
+        )));
     }
 
     Ok(())
@@ -1263,13 +1299,13 @@ mod tests {
     use super::{
         CachedPrefix, ChatMessage, ChatTemplateOptions, FrontendContract, FrontendErrorCode,
         PROMPT_BLOCK_START, PromptPrefixEntry, TextFrontend, best_cached_prefix, byte_level_table,
-        common_prefix_bytes, finish_pending, parse_generation_defaults, parse_stop_ids,
-        push_stream_byte,
+        common_prefix_bytes, finish_pending, is_valid_utf8_prefix, parse_generation_defaults,
+        parse_stop_ids, push_stream_byte, utf8_sequence_length, validate_added_token_alphabet,
     };
     use serde_json::json;
     use std::collections::{HashSet, VecDeque};
-    use tokenizers::Tokenizer;
     use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::{AddedToken, Tokenizer};
     use tuisko_model::{CheckpointSnapshot, Qwen36Moe35B};
 
     // Transformers 5.2.0 `apply_chat_template` and tokenizer output from the pinned snapshot.
@@ -1327,6 +1363,27 @@ mod tests {
         assert!(error.contains("image_url"), "{error}");
         assert!(error.contains("not served yet"), "{error}");
         assert!(error.contains("device"), "{error}");
+    }
+
+    #[test]
+    fn malformed_content_parts_keep_their_own_diagnostics() {
+        for (message, expected) in [
+            (
+                r#"{"role":"user","content":[{"text":"hello"}]}"#,
+                "chat content part 0 is malformed: missing field `type`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"hi"},{"type":7}]}"#,
+                "chat content part 1 is malformed",
+            ),
+            (
+                r#"{"role":"user","content":7}"#,
+                "message `content` must be a string, an array of content parts, or null, not a number",
+            ),
+        ] {
+            let error = serde_json::from_str::<ChatMessage>(message).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
@@ -1448,6 +1505,59 @@ mod tests {
             assert_eq!(actual, String::from_utf8_lossy(&bytes));
             assert!(pending.is_empty());
         }
+    }
+
+    #[test]
+    fn accepted_full_length_utf8_candidates_always_decode() {
+        fn walk(candidate: &mut Vec<u8>, length: usize) {
+            if candidate.len() == length {
+                assert!(std::str::from_utf8(candidate).is_ok(), "{candidate:02x?}");
+                return;
+            }
+            for byte in 0x80..=0xbfu8 {
+                candidate.push(byte);
+                if is_valid_utf8_prefix(candidate) {
+                    walk(candidate, length);
+                }
+                candidate.pop();
+            }
+        }
+
+        for lead in 0..=u8::MAX {
+            let Some(length) = utf8_sequence_length(lead) else {
+                continue;
+            };
+            walk(&mut vec![lead], usize::from(length));
+        }
+    }
+
+    #[test]
+    fn added_tokens_outside_the_byte_level_alphabet_fail_admission() {
+        let vocab = [("<unk>".to_owned(), 0), ("北".to_owned(), 1)]
+            .into_iter()
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".into())
+            .build()
+            .unwrap();
+        let byte_table = byte_level_table();
+
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer
+            .add_special_tokens([AddedToken::from("北", true)])
+            .unwrap();
+        validate_added_token_alphabet(&tokenizer, &byte_table).unwrap();
+
+        tokenizer
+            .add_tokens([AddedToken::from("北", false)])
+            .unwrap();
+        let error = validate_added_token_alphabet(&tokenizer, &byte_table).unwrap_err();
+        assert_eq!(error.code(), FrontendErrorCode::Contract);
+        assert!(
+            error.to_string().contains("non-byte-level character"),
+            "{error}"
+        );
     }
 
     #[test]

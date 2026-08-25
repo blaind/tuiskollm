@@ -41,7 +41,7 @@ impl fmt::Display for FrontendErrorCode {
 #[non_exhaustive]
 pub enum FrontendError {
     /// A required snapshot file could not be read.
-    #[error("frontend.io: could not read {}: {source}", path.display())]
+    #[error("{}: could not read {}: {source}", FrontendErrorCode::Io, path.display())]
     Io {
         /// File that could not be read.
         path: PathBuf,
@@ -50,7 +50,7 @@ pub enum FrontendError {
         source: io::Error,
     },
     /// A JSON file could not be decoded.
-    #[error("frontend.json: could not decode {}: {source}", path.display())]
+    #[error("{}: could not decode {}: {source}", FrontendErrorCode::Json, path.display())]
     Json {
         /// File that could not be decoded.
         path: PathBuf,
@@ -59,13 +59,13 @@ pub enum FrontendError {
         source: serde_json::Error,
     },
     /// The tokenizer rejected an operation.
-    #[error("frontend.tokenizer: {0}")]
+    #[error("{}: {}", FrontendErrorCode::Tokenizer, .0)]
     Tokenizer(String),
     /// The chat template could not render the request.
-    #[error("frontend.template: {0}")]
+    #[error("{}: {}", FrontendErrorCode::Template, .0)]
     Template(#[from] minijinja::Error),
     /// Snapshot metadata differs from the pinned contract.
-    #[error("frontend.contract: {0}")]
+    #[error("{}: {}", FrontendErrorCode::Contract, .0)]
     Contract(String),
 }
 
@@ -118,5 +118,30 @@ mod tests {
         let error = FrontendError::Contract("bad fixture".into());
         assert_eq!(error.code(), FrontendErrorCode::Contract);
         assert_eq!(error.to_string(), "frontend.contract: bad fixture");
+    }
+
+    #[test]
+    fn every_variant_message_starts_with_its_code() {
+        let errors = [
+            FrontendError::Io {
+                path: "snapshot.json".into(),
+                source: std::io::Error::other("bad fixture"),
+            },
+            FrontendError::Json {
+                path: "snapshot.json".into(),
+                source: serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+            },
+            FrontendError::Tokenizer("bad fixture".into()),
+            FrontendError::Template(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                "bad fixture",
+            )),
+            FrontendError::Contract("bad fixture".into()),
+        ];
+
+        for error in errors {
+            let prefix = format!("{}: ", error.code());
+            assert!(error.to_string().starts_with(&prefix), "{error}");
+        }
     }
 }
