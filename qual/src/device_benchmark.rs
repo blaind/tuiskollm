@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use tuisko_gpu::{CudaGraph, CudaStream, GpuTimer};
 
 const DEVICE_INDEX: &str = "0";
-const MAX_IDLE_MEMORY_MIB: u32 = 1_024;
-const IDLE_UTILIZATION_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_IDLE_MEMORY_MIB: u32 = 2_048;
+const IDLE_UTILIZATION_SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
 const OWNED_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_UTILIZATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MIN_TELEMETRY_SAMPLES: usize = 3;

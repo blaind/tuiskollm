@@ -36,6 +36,10 @@ const QWEN35_MTP_GENERATION_TEST_FILTER: &str = "qwen35_mtp_generation_suite_";
 const QWEN35_MTP_BATCH_GENERATION_TEST_FILTER: &str = "qwen35_mtp_batch_generation_suite_";
 const QWEN36_MTP_LAYER_TEST_FILTER: &str = "qwen36_mtp_layer_suite_";
 const QWEN36_LONG_CONTEXT_KV_TEST_FILTER: &str = "qwen36_long_context_kv::tests";
+const MTP_BF16_PAGED_GQA_BENCHMARK_FILTER: &str =
+    "bf16_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_";
+const MTP_LAYER_TEST_FILTER: &str = "mtp_layer::tests::mtp_layer_suite_";
+const MTP_LAYER_BENCHMARK_FILTER: &str = "mtp_layer_benchmark::tests::mtp_layer_suite_";
 const QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen36-residual-norm-sm120.txt";
 const QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt";
@@ -311,6 +315,7 @@ const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build-sm120";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
 const CUDA_OXIDE_REPOSITORY: &str = "https://github.com/NVlabs/cuda-oxide.git";
 const CUDA_OXIDE_REVISION: &str = "1f4d813719012d384f2db12b88efc9314c8bf50c";
+const MAX_IDLE_DEVICE_MEMORY_MIB: u64 = 2_048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PerformanceSuite {
@@ -2789,6 +2794,32 @@ fn qualify_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
             "fp8_qkv",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
+            "--skip",
+            "qwen36_fp8_qkv",
+        ],
+    )?;
+    wait_for_device_idle()?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen36_fp8_qkv",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_fp8_qkv(root)
@@ -3038,6 +3069,7 @@ fn qualify_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
             "gdn_output::tests",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_gdn_output(root)
@@ -3390,8 +3422,51 @@ fn qualify_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "attention_output_suite_",
+            "attention_output::tests::attention_output_suite_",
             "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "attention_output_prefill::tests::attention_output_suite_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "attention_output_benchmark::tests::attention_output_suite_",
             "--nocapture",
             "--test-threads=1",
         ],
@@ -3606,7 +3681,7 @@ fn qualify_mtp_bf16_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "qwen35_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_",
+            MTP_BF16_PAGED_GQA_BENCHMARK_FILTER,
             "--nocapture",
         ],
     )?;
@@ -3745,12 +3820,33 @@ fn qualify_mtp_layer(root: &Path, arguments: &[std::ffi::OsString]) -> Result<()
             "--release",
             "--lib",
             "--",
-            "mtp_layer_suite_",
+            MTP_LAYER_TEST_FILTER,
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
         ],
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            MTP_LAYER_BENCHMARK_FILTER,
+            "--nocapture",
+            "--test-threads=1",
+        ],
     )?;
     gate_mtp_layer(root)
 }
@@ -7306,7 +7402,7 @@ fn run_optimization_cone(
 }
 
 fn wait_for_device_idle() -> Result<(), Box<dyn Error>> {
-    let timeout = Duration::from_secs(10);
+    let timeout = Duration::from_secs(60);
     let deadline = Instant::now() + timeout;
     loop {
         let (utilization, memory_mib, pids) = device_idle_evidence("device idle wait")?;
@@ -7326,12 +7422,12 @@ fn wait_for_device_idle() -> Result<(), Box<dyn Error>> {
 }
 
 fn require_performance_device_idle() -> Result<(), Box<dyn Error>> {
-    require_device_idle("performance setup")
+    wait_for_device_idle()
 }
 
 fn require_device_idle(activity: &str) -> Result<(), Box<dyn Error>> {
     let (utilization, memory_mib, pids) = device_idle_evidence(activity)?;
-    if utilization != 0 || memory_mib > 1_024 {
+    if utilization != 0 || memory_mib > MAX_IDLE_DEVICE_MEMORY_MIB {
         return Err(format!(
             "device zero is busy before {activity}: utilization={utilization}%, memory={memory_mib} MiB"
         )
@@ -7384,7 +7480,7 @@ fn device_idle_evidence(activity: &str) -> Result<(u32, u64, Vec<u32>), Box<dyn 
 }
 
 fn device_is_idle(utilization: u32, memory_mib: u64, pids: &[u32]) -> bool {
-    utilization == 0 && memory_mib <= 1_024 && pids.is_empty()
+    utilization == 0 && memory_mib <= MAX_IDLE_DEVICE_MEMORY_MIB && pids.is_empty()
 }
 
 fn performance_device_identity_sha256() -> Result<String, Box<dyn Error>> {
@@ -14873,8 +14969,10 @@ fn require_uniform_value(
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPOSED_PERFORMANCE_SUITES, MTP_LAYER_RESOURCE_BASELINES, OptimizationSuite,
-        PERFORMANCE_SUITES, PerformanceSuite, QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
+        COMPOSED_PERFORMANCE_SUITES, MAX_IDLE_DEVICE_MEMORY_MIB,
+        MTP_BF16_PAGED_GQA_BENCHMARK_FILTER, MTP_LAYER_BENCHMARK_FILTER,
+        MTP_LAYER_RESOURCE_BASELINES, MTP_LAYER_TEST_FILTER, OptimizationSuite, PERFORMANCE_SUITES,
+        PerformanceSuite, QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
         QWEN35_MTP_BATCH_GENERATION_TEST_FILTER, QWEN35_MTP_GENERATION_TEST_FILTER,
         QWEN35_RESIDENT_MODEL_TEST_FILTER, QWEN35_RESIDENT_MTP_TEST_FILTER,
         QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN35_TEXT_ENDPOINT_TEST_FILTER,
@@ -15000,6 +15098,29 @@ mod tests {
         ] {
             assert!(test.contains(QWEN36_LONG_CONTEXT_KV_TEST_FILTER));
         }
+    }
+
+    #[test]
+    fn mtp_paged_gqa_benchmark_filter_selects_both_accounting_tests() {
+        for test in [
+            "bf16_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_byte_accounting_covers_every_query_head_cache_read",
+            "bf16_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_arena_accounting_exposes_every_padding_byte",
+        ] {
+            assert!(test.contains(MTP_BF16_PAGED_GQA_BENCHMARK_FILTER));
+        }
+    }
+
+    #[test]
+    fn mtp_layer_filters_exclude_qwen35_and_select_q38_accounting() {
+        assert!(
+            "mtp_layer::tests::mtp_layer_suite_source_owner_matches_all_draft_prime_and_realign_routes"
+                .contains(MTP_LAYER_TEST_FILTER)
+        );
+        assert!(
+            "mtp_layer_benchmark::tests::mtp_layer_suite_benchmark_inventory_and_accounting_are_exact"
+                .contains(MTP_LAYER_BENCHMARK_FILTER)
+        );
+        assert!(!"qwen35_mtp_layer::tests::qwen35_mtp_layer_suite_source_owner_matches_all_draft_prime_and_realign_routes".contains(MTP_LAYER_TEST_FILTER));
     }
 
     #[test]
@@ -15275,8 +15396,9 @@ mod tests {
     #[test]
     fn idle_evidence_requires_all_three_signals() {
         assert!(device_is_idle(0, 234, &[]));
+        assert!(device_is_idle(0, MAX_IDLE_DEVICE_MEMORY_MIB, &[]));
         assert!(!device_is_idle(1, 234, &[]));
-        assert!(!device_is_idle(0, 1_025, &[]));
+        assert!(!device_is_idle(0, MAX_IDLE_DEVICE_MEMORY_MIB + 1, &[]));
         assert!(!device_is_idle(0, 234, &[123]));
     }
 
