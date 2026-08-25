@@ -41,6 +41,7 @@ mod qwen36_full_attention_layer;
 mod qwen36_full_attention_layer_layout;
 mod qwen36_gdn_moe_layer;
 mod qwen36_gdn_moe_layer_layout;
+mod qwen36_long_context_kv_layout;
 mod qwen36_resident_model;
 mod qwen36_text_endpoint;
 mod qwen36_text_endpoint_layout;
@@ -106,6 +107,9 @@ pub use qwen36_full_attention_layer::Qwen36FullAttentionLayerProgram;
 pub use qwen36_full_attention_layer_layout::Qwen36FullAttentionLayerLayout;
 pub use qwen36_gdn_moe_layer::Qwen36GdnMoeLayerProgram;
 pub use qwen36_gdn_moe_layer_layout::Qwen36GdnMoeLayerLayout;
+pub use qwen36_long_context_kv_layout::{
+    QWEN36_LONG_CONTEXT_PHYSICAL_PAGES, QWEN36_MAX_CONTEXT_TOKENS, Qwen36LongContextKvLayout,
+};
 pub use qwen36_resident_model::{
     Qwen36ResidentLayerKind, Qwen36ResidentModelLayout, Qwen36ResidentModelProgram,
     Qwen36ResidentPrefillRoute,
