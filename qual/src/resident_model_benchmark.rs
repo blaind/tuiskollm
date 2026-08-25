@@ -717,7 +717,10 @@ fn resident_prefill_profile_manifest(
                     Some(layer),
                     "gdn_recurrence",
                     source_route,
-                    vec!["gdn_recurrence_prefill_exact"],
+                    vec![
+                        "gdn_recurrence_prefill_exact",
+                        "gdn_recurrence_prefill_epilogue_exact",
+                    ],
                 );
                 push(
                     Some(layer),
@@ -1270,8 +1273,8 @@ mod tests {
         assert_eq!(manifest.prompt_tokens, Some(1_024));
         assert_eq!(manifest.context_tokens, 1_024);
         assert_eq!(manifest.stages.len(), 514);
-        assert_eq!(manifest.graph_kernel_nodes, 883);
+        assert_eq!(manifest.graph_kernel_nodes, 931);
         let last = manifest.stages.last().unwrap();
-        assert_eq!(last.first_graph_node_ordinal + last.kernel_nodes - 1, 883);
+        assert_eq!(last.first_graph_node_ordinal + last.kernel_nodes - 1, 931);
     }
 }

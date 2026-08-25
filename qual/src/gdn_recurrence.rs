@@ -70,6 +70,7 @@ struct Regions {
     norm_weight: ArenaRegion<u16>,
     state_rows: ArenaRegion<u32>,
     state: ArenaRegion<f32>,
+    recurrent_plane: ArenaRegion<f32>,
     output: ArenaRegion<u16>,
 }
 
@@ -82,6 +83,7 @@ impl Regions {
             + self.norm_weight.byte_len()
             + self.state_rows.byte_len()
             + self.state.byte_len()
+            + self.recurrent_plane.byte_len()
             + self.output.byte_len()
     }
 }
@@ -252,6 +254,7 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let norm_weight = layout.reserve(HEAD_DIM, ALIGNMENT)?;
     let state_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
     let state = layout.reserve(MAX_BATCH * STATE_PER_ROW, ALIGNMENT)?;
+    let recurrent_plane = layout.reserve(MAX_ROWS * VALUE_WIDTH, ALIGNMENT)?;
     let output = layout.reserve(MAX_ROWS * VALUE_WIDTH, ALIGNMENT)?;
 
     Ok((
@@ -264,6 +267,7 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
             norm_weight,
             state_rows,
             state,
+            recurrent_plane,
             output,
         },
     ))
@@ -368,6 +372,7 @@ fn launch(
             arena.address(regions.norm_weight)?,
             arena.address(regions.state_rows)?,
             arena.address(regions.state)?,
+            arena.address(regions.recurrent_plane)?,
             arena.address(regions.output)?,
         )
     }
@@ -393,6 +398,7 @@ fn launch_causal(
             arena.address(regions.norm_weight)?,
             arena.address(regions.state_rows)?,
             arena.address(regions.state)?,
+            arena.address(regions.recurrent_plane)?,
             arena.address(regions.output)?,
         )
     }
