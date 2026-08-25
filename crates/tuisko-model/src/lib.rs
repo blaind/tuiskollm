@@ -9,7 +9,6 @@ mod qwen38;
 mod safetensors;
 mod views;
 
-pub use common::config_util::validate_config;
 pub use common::inventory::CheckpointSnapshot;
 pub use common::materialized::MaterializedMemory;
 pub use common::modelopt_codec::{MaterializedModelOptNvfp4Linear, ModelOptNvfp4LinearBindings};
@@ -19,6 +18,7 @@ pub use common::nvfp4::{
 };
 pub use common::routes::NVFP4_MLP_LAYER_END;
 pub use common::scale_swizzle::nvfp4_scale_materialization_workers;
+pub use common::schema::validate_config;
 pub use common::source_binding::SourceLayerBinding;
 pub use common::vision::{VisionBindings, VisionBlockBindings};
 pub use dtype::DType;

@@ -1,15 +1,11 @@
 //! Shared config admission: contract dispatch plus text and vision schema validation.
 
 use crate::common::routes::NVFP4_MLP_LAYER_END;
-use crate::qwen35::config::{ModelOptConfig, validate_modelopt};
-use crate::qwen36::config::{Qwen36Config, validate_qwen36, validate_qwen36_hf_quantization};
-use crate::qwen38::config::{ModelConfig, validate_compressed};
-use crate::{Arch, CheckpointContract, CheckpointError, CheckpointResult};
+use crate::{Arch, CheckpointError, CheckpointResult};
 use serde::Deserialize;
 #[cfg(test)]
 use serde_json::Value;
 use std::fmt::Debug;
-use std::fs;
 use std::path::Path;
 
 pub(crate) const ARCHITECTURE: &str = "Qwen3_5ForConditionalGeneration";
@@ -75,30 +71,6 @@ pub(crate) struct VisionConfig {
 pub(crate) struct ModelOptProducer {
     pub(crate) name: String,
     pub(crate) version: String,
-}
-
-/// Validates a checkpoint config against the selected architecture.
-pub fn validate_config<A: Arch>(path: &Path) -> CheckpointResult<()> {
-    let bytes = fs::read(path).map_err(|source| CheckpointError::io("reading", path, source))?;
-
-    match A::CHECKPOINT_CONTRACT {
-        CheckpointContract::CompressedTensors => {
-            let config: ModelConfig = serde_json::from_slice(&bytes)
-                .map_err(|source| CheckpointError::json(path, source))?;
-            validate_compressed::<A>(path, &config)
-        }
-        CheckpointContract::ModelOptNvfp4 => {
-            let config: ModelOptConfig = serde_json::from_slice(&bytes)
-                .map_err(|source| CheckpointError::json(path, source))?;
-            validate_modelopt::<A>(path, &config)
-        }
-        CheckpointContract::ModelOptNvfp4Moe => {
-            let config: Qwen36Config = serde_json::from_slice(&bytes)
-                .map_err(|source| CheckpointError::json(path, source))?;
-            validate_qwen36::<A>(path, &config)?;
-            validate_qwen36_hf_quantization::<A>(path)
-        }
-    }
 }
 
 pub(crate) fn validate_text<A: Arch>(path: &Path, text: &TextConfig) -> CheckpointResult<()> {

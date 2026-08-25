@@ -202,7 +202,7 @@ fn modelopt_ignored_targets<A: Arch>() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::config_util::validate_config;
+    use crate::common::schema::validate_config;
     use crate::common::test_support::configs::write_config;
     use crate::{CheckpointErrorCode, Qwen35_9B};
     use serde_json::{Value, json};
