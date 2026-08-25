@@ -7377,7 +7377,7 @@ fn run_optimization_cone(
 }
 
 fn wait_for_device_idle() -> Result<(), Box<dyn Error>> {
-    let timeout = Duration::from_secs(10);
+    let timeout = Duration::from_secs(60);
     let deadline = Instant::now() + timeout;
     loop {
         let (utilization, memory_mib, pids) = device_idle_evidence("device idle wait")?;
