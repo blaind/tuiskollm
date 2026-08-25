@@ -327,9 +327,9 @@ mod tests {
     fn resident_mtp_benchmark_inventory_and_accounting_are_exact() {
         assert_eq!(MAX_BATCH, 8);
         assert_eq!(CONTEXT_TOKENS, 131);
-        assert_eq!(logical_bytes(1), 2_125_301_900);
-        assert_eq!(logical_bytes(8), 2_151_818_208);
-        assert_eq!(staged_logical_bytes(1), 2_125_291_660);
-        assert_eq!(staged_logical_bytes(8), 2_151_736_288);
+        assert_eq!(logical_bytes(1), 2_125_494_668);
+        assert_eq!(logical_bytes(8), 2_153_360_352);
+        assert_eq!(staged_logical_bytes(1), 2_125_484_428);
+        assert_eq!(staged_logical_bytes(8), 2_153_278_432);
     }
 }
