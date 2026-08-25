@@ -1,7 +1,7 @@
 //! Qwen3.6-35B-A3B MoE lossless materialization into runtime-native host layouts.
 
 use crate::common::modelopt_codec::{
-    MaterializedModelOptNvfp4Linear, materialize_modelopt_linear, require_same_modelopt_scale,
+    MaterializedModelOptNvfp4Linear, ModelOptScaleCodec, materialize_modelopt_linear,
 };
 use crate::common::mtp::MaterializedMtpQkv;
 use crate::common::routes::{require_full_attention_layer, require_gdn_layer_route};
@@ -644,13 +644,13 @@ fn prepare_qwen36_expert<'a>(
     layer: usize,
     role: &str,
 ) -> CheckpointResult<PreparedQwen36Expert<'a>> {
-    require_same_modelopt_scale(
+    ModelOptScaleCodec::require_same_source_scale(
         layer,
         &format!("{role} gate/up input_scale"),
         &binding.gate.input_scale,
         &binding.up.input_scale,
     )?;
-    require_same_modelopt_scale(
+    ModelOptScaleCodec::require_same_source_scale(
         layer,
         &format!("{role} gate/up weight_scale_2"),
         &binding.gate.weight_scale_2,

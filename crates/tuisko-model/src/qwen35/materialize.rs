@@ -1,8 +1,8 @@
 //! Qwen3.5-9B lossless materialization into runtime-native host layouts.
 
 use crate::common::modelopt_codec::{
-    MaterializedModelOptNvfp4Linear, ModelOptNvfp4LinearBindings, logical_columns,
-    materialize_modelopt_linear, modelopt_scale, reciprocal_scale, require_same_modelopt_scale,
+    MaterializedModelOptNvfp4Linear, ModelOptNvfp4LinearBindings, ModelOptScaleCodec,
+    logical_columns, materialize_modelopt_linear,
 };
 use crate::common::nvfp4::{
     MaterializedNvfp4Down, MaterializedNvfp4GateUp, Nvfp4DownBindings, Nvfp4GateUpBindings,
@@ -138,21 +138,26 @@ impl<'a> ModelOptNvfp4GdnBindings<'a> {
             ("QKV/A-control input_scale", &self.a_control.input_scale),
             ("QKV/B-control input_scale", &self.b_control.input_scale),
         ] {
-            require_same_modelopt_scale(self.layer, role, &self.qkv.input_scale, scale)?;
+            ModelOptScaleCodec::require_same_source_scale(
+                self.layer,
+                role,
+                &self.qkv.input_scale,
+                scale,
+            )?;
         }
-        require_same_modelopt_scale(
+        ModelOptScaleCodec::require_same_source_scale(
             self.layer,
             "QKV/Z weight_scale_2",
             &self.qkv.weight_scale_2,
             &self.z.weight_scale_2,
         )?;
-        require_same_modelopt_scale(
+        ModelOptScaleCodec::require_same_source_scale(
             self.layer,
             "A/B control input_scale",
             &self.a_control.input_scale,
             &self.b_control.input_scale,
         )?;
-        require_same_modelopt_scale(
+        ModelOptScaleCodec::require_same_source_scale(
             self.layer,
             "A/B control weight_scale_2",
             &self.a_control.weight_scale_2,
@@ -306,16 +311,26 @@ fn materialize_modelopt_controls(
         "A/B controls",
     )?;
 
-    let input_scale = modelopt_scale(layer, "A/B control input_scale", &a.input_scale)?;
-    let weight_scale_2 = modelopt_scale(layer, "A/B control weight_scale_2", &a.weight_scale_2)?;
+    let input_scale =
+        ModelOptScaleCodec::source_scale(layer, "A/B control input_scale", &a.input_scale)?;
+    let weight_scale_2 =
+        ModelOptScaleCodec::source_scale(layer, "A/B control weight_scale_2", &a.weight_scale_2)?;
 
     Ok(MaterializedModelOptControls {
         weight_e2m1_padded,
         scale_e4m3_swizzled,
         input_scale,
         weight_scale_2,
-        input_scale_divisor: reciprocal_scale(layer, "A/B control input", input_scale)?,
-        weight_scale_divisor: reciprocal_scale(layer, "A/B control weight", weight_scale_2)?,
+        input_scale_divisor: ModelOptScaleCodec::to_reciprocal_divisor(
+            layer,
+            "A/B control input",
+            input_scale,
+        )?,
+        weight_scale_divisor: ModelOptScaleCodec::to_reciprocal_divisor(
+            layer,
+            "A/B control weight",
+            weight_scale_2,
+        )?,
         rows,
         padded_rows,
         columns,
@@ -326,13 +341,13 @@ impl<'a> ModelOptNvfp4AttentionBindings<'a> {
     /// Gathers Q/K/V and converts ModelOpt scales without changing represented values.
     pub fn materialize(self) -> CheckpointResult<MaterializedModelOptNvfp4Attention<'a>> {
         require_full_attention_layer(self.layer, self.layer_count, self.full_attention_interval)?;
-        require_same_modelopt_scale(
+        ModelOptScaleCodec::require_same_source_scale(
             self.layer,
             "query/key input_scale",
             &self.query_gate.input_scale,
             &self.key.input_scale,
         )?;
-        require_same_modelopt_scale(
+        ModelOptScaleCodec::require_same_source_scale(
             self.layer,
             "query/value input_scale",
             &self.query_gate.input_scale,
@@ -412,30 +427,39 @@ impl<'a> ModelOptNvfp4MlpBindings<'a> {
             )));
         }
 
-        require_same_modelopt_scale(
+        ModelOptScaleCodec::require_same_source_scale(
             self.layer,
             "gate/up input_scale",
             &self.gate.input_scale,
             &self.up.input_scale,
         )?;
-        require_same_modelopt_scale(
+        ModelOptScaleCodec::require_same_source_scale(
             self.layer,
             "gate/up weight_scale_2",
             &self.gate.weight_scale_2,
             &self.up.weight_scale_2,
         )?;
 
-        let gate_up_input_scale =
-            modelopt_scale(self.layer, "gate/up input_scale", &self.gate.input_scale)?;
-        let gate_up_weight_scale_2 = modelopt_scale(
+        let gate_up_input_scale = ModelOptScaleCodec::source_scale(
+            self.layer,
+            "gate/up input_scale",
+            &self.gate.input_scale,
+        )?;
+        let gate_up_weight_scale_2 = ModelOptScaleCodec::source_scale(
             self.layer,
             "gate/up weight_scale_2",
             &self.gate.weight_scale_2,
         )?;
-        let down_input_scale =
-            modelopt_scale(self.layer, "down input_scale", &self.down.input_scale)?;
-        let down_weight_scale_2 =
-            modelopt_scale(self.layer, "down weight_scale_2", &self.down.weight_scale_2)?;
+        let down_input_scale = ModelOptScaleCodec::source_scale(
+            self.layer,
+            "down input_scale",
+            &self.down.input_scale,
+        )?;
+        let down_weight_scale_2 = ModelOptScaleCodec::source_scale(
+            self.layer,
+            "down weight_scale_2",
+            &self.down.weight_scale_2,
+        )?;
 
         // ModelOpt exports amax / (E2M1_MAX * E4M3_MAX). The kernels take the
         // reciprocal global divisor, so this changes convention, not represented values.
@@ -444,12 +468,12 @@ impl<'a> ModelOptNvfp4MlpBindings<'a> {
             up_weight: self.up.weight,
             gate_scale: self.gate.block_scale,
             up_scale: self.up.block_scale,
-            input_scale_divisor: reciprocal_scale(
+            input_scale_divisor: ModelOptScaleCodec::to_reciprocal_divisor(
                 self.layer,
                 "gate/up input",
                 gate_up_input_scale,
             )?,
-            weight_scale_divisor: reciprocal_scale(
+            weight_scale_divisor: ModelOptScaleCodec::to_reciprocal_divisor(
                 self.layer,
                 "gate/up weight",
                 gate_up_weight_scale_2,
@@ -461,8 +485,16 @@ impl<'a> ModelOptNvfp4MlpBindings<'a> {
         let down = Nvfp4DownBindings {
             weight: self.down.weight,
             scale: self.down.block_scale,
-            input_scale_divisor: reciprocal_scale(self.layer, "down input", down_input_scale)?,
-            weight_scale_divisor: reciprocal_scale(self.layer, "down weight", down_weight_scale_2)?,
+            input_scale_divisor: ModelOptScaleCodec::to_reciprocal_divisor(
+                self.layer,
+                "down input",
+                down_input_scale,
+            )?,
+            weight_scale_divisor: ModelOptScaleCodec::to_reciprocal_divisor(
+                self.layer,
+                "down weight",
+                down_weight_scale_2,
+            )?,
             layer: self.layer,
             layer_count: self.layer_count,
         }
