@@ -28,6 +28,7 @@ pub(crate) struct GdnLayerRegions {
     pub(crate) convolved: ArenaRegion<u16>,
     pub(crate) recurrent_norm: ArenaRegion<u16>,
     pub(crate) state: ArenaRegion<f32>,
+    pub(crate) recurrent_plane: ArenaRegion<f32>,
     pub(crate) recurrent_output: ArenaRegion<u16>,
     pub(crate) output_activation_codes: ArenaRegion<u8>,
     pub(crate) output_activation_scales: ArenaRegion<f32>,
@@ -126,6 +127,7 @@ impl DenseFp8GdnLayerLayout {
             convolved: builder.reserve(row_qkv, ALIGNMENT)?,
             recurrent_norm: builder.reserve(A::LINEAR_HEAD_DIM, ALIGNMENT)?,
             state: builder.reserve(state, ALIGNMENT)?,
+            recurrent_plane: builder.reserve(row_value, ALIGNMENT)?,
             recurrent_output: builder.reserve(row_value, ALIGNMENT)?,
             output_activation_codes: builder.reserve(row_value, ALIGNMENT)?,
             output_activation_scales: builder.reserve(MAX_ROWS, ALIGNMENT)?,
@@ -184,6 +186,7 @@ impl DenseFp8GdnLayerLayout {
                 regions.beta.byte_len(),
                 regions.convolved.byte_len(),
                 regions.state.byte_len(),
+                regions.recurrent_plane.byte_len(),
                 regions.recurrent_output.byte_len(),
                 regions.output_activation_codes.byte_len(),
                 regions.output_activation_scales.byte_len(),
@@ -261,9 +264,9 @@ mod tests {
         let layout = DenseFp8GdnLayerLayout::build::<Qwen38_27B>().unwrap();
 
         assert_eq!(layout.resident_weight_bytes(), 383_949_248);
-        assert_eq!(layout.workspace_bytes(), 247_316_512);
-        assert_eq!(layout.owner_bytes(), 631_265_760);
-        assert_eq!(layout.arena_bytes(), 631_266_304);
+        assert_eq!(layout.workspace_bytes(), 272_482_336);
+        assert_eq!(layout.owner_bytes(), 656_431_584);
+        assert_eq!(layout.arena_bytes(), 656_432_128);
         assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 544);
     }
 
@@ -291,6 +294,7 @@ mod tests {
             span(regions.convolved),
             span(regions.recurrent_norm),
             span(regions.state),
+            span(regions.recurrent_plane),
             span(regions.recurrent_output),
             span(regions.output_activation_codes),
             span(regions.output_activation_scales),

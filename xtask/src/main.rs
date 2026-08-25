@@ -2952,27 +2952,34 @@ fn qualify_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn qualify_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
-        root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "gdn_recurrence::tests",
-            "--include-ignored",
-            "--nocapture",
-        ],
-    )?;
+    for test in [
+        "gdn_recurrence::tests::route_inventory_and_arena_accounting_are_exact",
+        "gdn_recurrence::tests::exact_routes_match_independent_oracles_and_graph_replay",
+    ] {
+        run_oxide(
+            root,
+            &[
+                "test",
+                "--arch",
+                "sm_120a",
+                "--cargo-target-dir",
+                CUDA_OXIDE_TEST_TARGET,
+                "--device-codegen-crate",
+                "tuisko-kernels-sm120",
+                "--",
+                "--package",
+                "tuisko-qual",
+                "--release",
+                "--lib",
+                "--",
+                test,
+                "--exact",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+        )?;
+    }
     gate_gdn_recurrence(root)
 }
 
@@ -9585,9 +9592,18 @@ fn gate_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("gdn_recurrence_prefill_exact_TID_"))
         .collect::<Vec<_>>();
+    let epilogue = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("gdn_recurrence_prefill_epilogue_exact_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("GDN recurrence", recurrence.len(), 8)?;
     require_count("GDN recurrence causal/prefill", prefill.len(), 8)?;
-    for entry in recurrence.iter().chain(&prefill) {
+    require_count("GDN recurrence prefill epilogue", epilogue.len(), 8)?;
+    for entry in &recurrence {
         if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 512-thread/two-CTA launch bounds",
@@ -9596,16 +9612,30 @@ fn gate_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    let artifact = sm120_gate_artifact(root)?;
-    let resources = &artifact.resources;
-    let sass = artifact.sass()?;
     for entry in &prefill {
-        if sass_function_body(sass, entry.name).is_none() {
+        if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
-                "cuobjdump omitted GDN recurrence prefill SASS `{}`",
+                "entry `{}` lost its 512-thread/split-head launch bounds",
                 entry.name
             )
             .into());
+        }
+    }
+    for entry in &epilogue {
+        if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 512-thread/two-CTA epilogue launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    for entry in recurrence.iter().chain(&prefill).chain(&epilogue) {
+        if sass_function_body(sass, entry.name).is_none() {
+            return Err(format!("cuobjdump omitted GDN recurrence SASS `{}`", entry.name).into());
         }
     }
     let mut registers = Vec::new();
@@ -9645,9 +9675,26 @@ fn gate_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
             &prefill_shared,
         )?;
     }
+    let mut epilogue_registers = Vec::new();
+    let mut epilogue_shared = Vec::new();
+    for entry in epilogue {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        epilogue_registers.push(resource.registers);
+        epilogue_shared.push(resource.shared);
+    }
+    epilogue_registers.sort_unstable();
+    if baseline.contains_key("prefill_epilogue_registers") {
+        require_registers(&baseline, "prefill_epilogue_registers", &epilogue_registers)?;
+    }
+    if baseline.contains_key("prefill_epilogue_shared_bytes") {
+        require_uniform_value(&baseline, "prefill_epilogue_shared_bytes", &epilogue_shared)?;
+    }
     println!(
-        "GDN recurrence gate passed: 8 decode + 4 causal + 4 prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?}, SASS present",
-        registers, prefill_registers, shared, prefill_shared
+        "GDN recurrence gate passed: 8 decode + 4 causal + 4 prefill + 4 causal/4 prefill epilogue entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}, SASS present",
+        registers, prefill_registers, epilogue_registers, shared, prefill_shared, epilogue_shared,
     );
     Ok(())
 }

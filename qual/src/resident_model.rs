@@ -1046,12 +1046,12 @@ fn verify_owner(program: &ResidentModelProgram) -> Result<(), ResidentModelQuali
         || program.state_bytes() != 1_207_959_552
         || program.cache_bytes() != 7_210_008_576
         || program.kv_table_bytes() != 110_016
-        || program.workspace_bytes() != 923_695_108
+        || program.workspace_bytes() != 948_860_932
         || program.descriptor_bytes() != 4_096
         || program.padding_bytes() != 15_676
-        || program.resident_arena_bytes() != 21_258_945_792
+        || program.resident_arena_bytes() != 21_284_111_616
         || program.kv_arena_bytes() != 7_210_118_656
-        || program.arena_bytes() != 28_469_064_448
+        || program.arena_bytes() != 28_494_230_272
         || program.host_stager_bytes() != 10_485_760
         || program.kv_route_host_bytes() != 113_454
         || program.batch_capacity() != 8

@@ -4105,6 +4105,7 @@ struct WorkspacePointers {
     partial_denominator: *mut f32,
     partial_numerator: *mut f32,
     prefill_partials: *mut f32,
+    recurrent_plane: *mut f32,
     attention: *mut f32,
     mixer_branch: *mut u16,
     swiglu: *mut u16,
@@ -4182,6 +4183,7 @@ impl WorkspacePointers {
             partial_denominator: self.partial_denominator,
             partial_numerator: self.partial_numerator,
             prefill_partials: self.prefill_partials,
+            recurrent_plane: self.recurrent_plane,
             attention: self
                 .attention
                 .wrapping_add(rows * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS),
@@ -4392,6 +4394,7 @@ impl WorkspacePointers {
             partial_denominator: arena.address(regions.partial_denominator)?,
             partial_numerator: arena.address(regions.partial_numerator)?,
             prefill_partials: arena.address(regions.prefill_partials)?,
+            recurrent_plane: arena.address(regions.recurrent_plane)?,
             attention: arena.address(regions.attention)?,
             mixer_branch: arena.address(regions.mixer_branch)?,
             swiglu: arena.address(regions.swiglu)?,
@@ -5077,6 +5080,7 @@ fn launch_target_mtp_mixer(
                     p.recurrent_norm,
                     workspace.provisional_state_row,
                     provisional_state,
+                    workspace.recurrent_plane,
                     workspace.recurrent_output,
                 )?;
                 ops.gdn_output.launch(
@@ -5211,6 +5215,7 @@ fn launch_target_mtp_commit(
                 p.recurrent_norm,
                 workspace.state_rows,
                 p.state,
+                workspace.recurrent_plane,
                 workspace.recurrent_output,
             )?;
         }
@@ -5280,6 +5285,7 @@ fn launch_target_mtp_segmented_commit(
                     p.recurrent_norm,
                     workspace.state_rows,
                     p.state,
+                    workspace.recurrent_plane,
                     workspace.recurrent_output,
                 )?;
             }
@@ -5432,6 +5438,7 @@ fn launch_prefill_mixer(
                     p.recurrent_norm,
                     workspace.state_rows,
                     p.state,
+                    workspace.recurrent_plane,
                     workspace.recurrent_output,
                 )?;
                 ops.gdn_output.launch(
@@ -5589,6 +5596,7 @@ fn launch_mixer(
                     p.recurrent_norm,
                     workspace.state_rows,
                     p.state,
+                    workspace.recurrent_plane,
                     workspace.recurrent_output,
                 )?;
                 ops.gdn_output.launch(

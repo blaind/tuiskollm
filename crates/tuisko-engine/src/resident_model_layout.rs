@@ -487,6 +487,7 @@ struct SharedWorkspace {
     partial_denominator: ArenaRegion<f32>,
     partial_numerator: ArenaRegion<f32>,
     prefill_partials: ArenaRegion<f32>,
+    recurrent_plane: ArenaRegion<f32>,
     attention: ArenaRegion<f32>,
     mixer_branch: ArenaRegion<u16>,
     swiglu: ArenaRegion<u16>,
@@ -609,6 +610,10 @@ impl SharedWorkspace {
                 PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES / size_of::<f32>(),
                 ALIGNMENT,
             )?,
+            // The prefill recurrence publishes its scaled recurrent rows here
+            // for the parallel RMS/gate epilogue; the plane is scratch between
+            // the paired kernels of one GDN layer.
+            recurrent_plane: builder.reserve(row_value, ALIGNMENT)?,
             attention: builder.reserve(row_attention, ALIGNMENT)?,
             mixer_branch: builder.reserve(row_hidden, ALIGNMENT)?,
             swiglu: builder.reserve(row_intermediate, ALIGNMENT)?,
@@ -651,6 +656,7 @@ impl SharedWorkspace {
             self.partial_denominator,
             self.partial_numerator,
             self.prefill_partials,
+            self.recurrent_plane,
             self.attention,
             self.mixer_branch,
             self.swiglu,
@@ -1014,13 +1020,13 @@ mod tests {
         assert_eq!(layout.state_bytes(), 1_207_959_552);
         assert_eq!(layout.cache_bytes(), 7_210_008_576);
         assert_eq!(layout.kv_table_bytes(), 110_016);
-        assert_eq!(layout.workspace_bytes(), 923_695_108);
+        assert_eq!(layout.workspace_bytes(), 948_860_932);
         assert_eq!(
             layout.source_mapped_embedding_bytes().unwrap(),
             2_542_796_800
         );
         assert_eq!(layout.context_capacity(), 220_000);
-        assert_eq!(layout.owner_bytes(), 28_469_048_772);
+        assert_eq!(layout.owner_bytes(), 28_494_214_596);
     }
 
     #[test]
@@ -1044,6 +1050,7 @@ mod tests {
             layout.workspace.prefill_partials.byte_len(),
             PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES,
         );
+        assert_eq!(layout.workspace.recurrent_plane.len(), 1_024 * 48 * 128);
         assert_eq!(layout.workspace.logits.len(), 8 * 4 * 248_320);
         assert_eq!(layout.workspace.provisional_history.len(), 8 * 10_240 * 3);
         assert_eq!(layout.workspace.provisional_state.len(), 8 * 48 * 128 * 128);
@@ -1054,9 +1061,9 @@ mod tests {
         );
         assert_eq!(layout.workspace.recorded_log_decay.len(), 48 * 8 * 4 * 48);
         assert_eq!(layout.workspace.recorded_beta.len(), 48 * 8 * 4 * 48);
-        assert_eq!(layout.resident_arena_bytes(), 21_258_945_792);
+        assert_eq!(layout.resident_arena_bytes(), 21_284_111_616);
         assert_eq!(layout.kv_arena_bytes(), 7_210_118_656);
         assert_eq!(layout.padding_bytes(), 15_676);
-        assert_eq!(layout.arena_bytes(), 28_469_064_448);
+        assert_eq!(layout.arena_bytes(), 28_494_230_272);
     }
 }
