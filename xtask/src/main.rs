@@ -964,6 +964,490 @@ impl OptimizationSuite {
     }
 }
 
+type NoArgumentHandler = fn(&Path) -> Result<(), Box<dyn Error>>;
+type ForwardingHandler = fn(&Path, &[std::ffi::OsString]) -> Result<(), Box<dyn Error>>;
+
+/// How a subcommand consumes what follows its name. The policy is table data,
+/// so `dispatch` enforces it in one place and no row can omit the check.
+#[derive(Clone, Copy)]
+enum Handler {
+    NoArguments(NoArgumentHandler),
+    Forwarded(ForwardingHandler),
+}
+
+/// One CLI subcommand: the name `main` matches and the handler it reaches.
+struct Subcommand {
+    name: &'static str,
+    run: Handler,
+}
+
+const fn no_args(name: &'static str, run: NoArgumentHandler) -> Subcommand {
+    Subcommand {
+        name,
+        run: Handler::NoArguments(run),
+    }
+}
+
+const fn forwarded(name: &'static str, run: ForwardingHandler) -> Subcommand {
+    Subcommand {
+        name,
+        run: Handler::Forwarded(run),
+    }
+}
+
+/// The complete subcommand set, in the order the legacy dispatch matched.
+/// `subcommand_table_matches_legacy_dispatch` is the authority on its
+/// membership and on each row's argument policy.
+const SUBCOMMANDS: &[Subcommand] = &[
+    no_args("bootstrap-cuda-oxide", bootstrap_cuda_oxide),
+    no_args("build-sm120", build_sm120),
+    forwarded("build-residual-norm", build_residual_norm),
+    forwarded("build-residual-bench", build_residual_bench),
+    no_args("build-server", build_server),
+    forwarded("qualify-frontend", qualify_frontend),
+    forwarded("qualify-generation", qualify_generation),
+    forwarded("qualify-server", server_qual::run),
+    forwarded("qualify-server-long-context", server_qual::run_long_context),
+    no_args("qualify-host", qualify_host),
+    no_args("qualify-residual-norm", qualify_residual_norm),
+    no_args("qualify-qwen35-residual-norm", qualify_qwen35_residual_norm),
+    no_args("qualify-qwen36-residual-norm", qualify_qwen36_residual_norm),
+    no_args("qualify-qwen35-nvfp4-swiglu", qualify_qwen35_nvfp4_swiglu),
+    no_args("qualify-qwen35-nvfp4-down", qualify_qwen35_nvfp4_down),
+    no_args("qualify-qwen35-nvfp4-qkv", qualify_qwen35_nvfp4_qkv),
+    no_args("qualify-qwen36-moe-router", qualify_qwen36_moe_router),
+    no_args("qualify-qwen36-moe-experts", qualify_qwen36_moe_experts),
+    no_args("qualify-qwen36-nvfp4-lm-head", qualify_qwen36_nvfp4_lm_head),
+    no_args("qualify-qwen36-fp8-qkv", qualify_qwen36_fp8_qkv),
+    no_args("qualify-qwen36-gdn-input", qualify_qwen36_gdn_input),
+    no_args("qualify-qwen36-gdn-output", qualify_qwen36_gdn_output),
+    no_args(
+        "qualify-qwen36-attention-output",
+        qualify_qwen36_attention_output,
+    ),
+    no_args("qualify-qwen36-gdn-prepare", qualify_qwen36_gdn_prepare),
+    no_args(
+        "qualify-qwen36-gdn-recurrence",
+        qualify_qwen36_gdn_recurrence,
+    ),
+    forwarded("qualify-qwen35-bf16-lm-head", qualify_qwen35_bf16_lm_head),
+    forwarded(
+        "qualify-qwen35-mtp-bf16-fusion",
+        qualify_qwen35_mtp_bf16_fusion,
+    ),
+    forwarded(
+        "qualify-qwen35-mtp-bf16-attention",
+        qualify_qwen35_mtp_bf16_attention,
+    ),
+    forwarded(
+        "qualify-qwen36-mtp-bf16-attention",
+        qualify_qwen36_mtp_bf16_attention,
+    ),
+    no_args("qualify-qwen36-mtp-bf16-moe", qualify_qwen36_mtp_bf16_moe),
+    forwarded("qualify-qwen35-mtp-bf16-mlp", qualify_qwen35_mtp_bf16_mlp),
+    forwarded("qualify-qwen35-text-endpoint", qualify_qwen35_text_endpoint),
+    forwarded("qualify-qwen36-text-endpoint", qualify_qwen36_text_endpoint),
+    forwarded(
+        "qualify-qwen36-resident-model",
+        qualify_qwen36_resident_model,
+    ),
+    forwarded("qualify-qwen36-generation", qualify_qwen36_generation),
+    forwarded("qualify-qwen36-server", qualify_qwen36_server),
+    forwarded("qualify-qwen35-server", qualify_qwen35_server),
+    forwarded(
+        "qualify-qwen35-resident-model",
+        qualify_qwen35_resident_model,
+    ),
+    forwarded("qualify-qwen35-resident-mtp", qualify_qwen35_resident_mtp),
+    forwarded(
+        "qualify-qwen35-mtp-generation",
+        qualify_qwen35_mtp_generation,
+    ),
+    forwarded(
+        "qualify-qwen35-mtp-batch-generation",
+        qualify_qwen35_mtp_batch_generation,
+    ),
+    forwarded("qualify-qwen35-generation", qualify_qwen35_generation),
+    no_args(
+        "qualify-qwen35-long-context-kv",
+        qualify_qwen35_long_context_kv,
+    ),
+    no_args(
+        "qualify-qwen36-long-context-kv",
+        qualify_qwen36_long_context_kv,
+    ),
+    no_args(
+        "qualify-qwen35-nvfp4-gdn-input",
+        qualify_qwen35_nvfp4_gdn_input,
+    ),
+    no_args("qualify-qwen35-gdn-prepare", qualify_qwen35_gdn_prepare),
+    no_args(
+        "qualify-qwen35-gdn-recurrence",
+        qualify_qwen35_gdn_recurrence,
+    ),
+    no_args(
+        "qualify-qwen35-nvfp4-gdn-output",
+        qualify_qwen35_nvfp4_gdn_output,
+    ),
+    no_args(
+        "qualify-qwen35-nvfp4-attention-output",
+        qualify_qwen35_nvfp4_attention_output,
+    ),
+    forwarded("qualify-qwen35-nvfp4-mlp", qualify_qwen35_nvfp4_mlp),
+    no_args(
+        "qualify-qwen35-attention-qk-prepare",
+        qualify_qwen35_attention_qk_prepare,
+    ),
+    no_args(
+        "qualify-qwen36-attention-qk-prepare",
+        qualify_qwen36_attention_qk_prepare,
+    ),
+    no_args(
+        "qualify-qwen36-fp8-attention-qk-prepare",
+        qualify_qwen36_fp8_attention_qk_prepare,
+    ),
+    no_args("qualify-fp8-qkv", qualify_fp8_qkv),
+    no_args("qualify-fp8-gdn-input", qualify_fp8_gdn_input),
+    no_args("qualify-fp8-lm-head", qualify_fp8_lm_head),
+    no_args("qualify-fp8-swiglu", qualify_fp8_swiglu),
+    no_args("qualify-fp8-down", qualify_fp8_down),
+    no_args("qualify-nvfp4-swiglu", qualify_nvfp4_swiglu),
+    no_args("qualify-nvfp4-down", qualify_nvfp4_down),
+    forwarded("qualify-nvfp4-mlp", qualify_nvfp4_mlp),
+    no_args("qualify-gdn-prepare", qualify_gdn_prepare),
+    no_args("qualify-gdn-recurrence", qualify_gdn_recurrence),
+    no_args("qualify-gdn-output", qualify_gdn_output),
+    no_args("qualify-attention-qk-prepare", qualify_attention_qk_prepare),
+    no_args("qualify-paged-gqa", qualify_paged_gqa),
+    no_args("qualify-qwen35-paged-gqa", qualify_qwen35_paged_gqa),
+    no_args("qualify-qwen36-paged-gqa", qualify_qwen36_paged_gqa),
+    no_args("qualify-qwen36-fp8-paged-gqa", qualify_qwen36_fp8_paged_gqa),
+    no_args(
+        "qualify-long-context-paged-gqa",
+        qualify_long_context_paged_gqa,
+    ),
+    no_args("qualify-attention-output", qualify_attention_output),
+    forwarded("qualify-mtp-bf16-fusion", qualify_mtp_bf16_fusion),
+    forwarded(
+        "qualify-mtp-bf16-attention-output",
+        qualify_mtp_bf16_attention_output,
+    ),
+    forwarded("qualify-mtp-bf16-mlp", qualify_mtp_bf16_mlp),
+    forwarded("qualify-mtp-bf16-qkv", qualify_mtp_bf16_qkv),
+    forwarded("qualify-mtp-bf16-qk-prepare", qualify_mtp_bf16_qk_prepare),
+    no_args("qualify-mtp-bf16-paged-gqa", qualify_mtp_bf16_paged_gqa),
+    forwarded("qualify-dense-fp8-mlp", qualify_dense_fp8_mlp),
+    forwarded("qualify-dense-fp8-gdn-layer", qualify_dense_fp8_gdn_layer),
+    forwarded("qualify-full-attention-layer", qualify_full_attention_layer),
+    forwarded("qualify-mtp-layer", qualify_mtp_layer),
+    forwarded("qualify-qwen35-mtp-layer", qualify_qwen35_mtp_layer),
+    forwarded("qualify-qwen36-mtp-layer", qualify_qwen36_mtp_layer),
+    forwarded("qualify-target-mtp-verify", qualify_target_mtp_verify),
+    forwarded("qualify-mtp-prompt-prime", qualify_mtp_prompt_prime),
+    forwarded("qualify-resident-mtp", qualify_resident_mtp),
+    forwarded(
+        "qualify-generation-mtp-greedy",
+        qualify_generation_mtp_greedy,
+    ),
+    forwarded(
+        "qualify-generation-mtp-sampling",
+        qualify_generation_mtp_sampling,
+    ),
+    forwarded("qualify-generation-mtp-batch", qualify_generation_mtp_batch),
+    forwarded(
+        "qualify-qwen35-full-attention-layer",
+        qualify_qwen35_full_attention_layer,
+    ),
+    forwarded(
+        "qualify-qwen36-full-attention-layer",
+        qualify_qwen36_full_attention_layer,
+    ),
+    forwarded("qualify-qwen35-gdn-layer", qualify_qwen35_gdn_layer),
+    forwarded("qualify-qwen36-gdn-moe-layer", qualify_qwen36_gdn_moe_layer),
+    forwarded("qualify-resident-model", qualify_resident_model),
+    forwarded("qualify-resident-generation", qualify_resident_generation),
+    forwarded(
+        "qualify-resident-batch-generation",
+        qualify_resident_batch_generation,
+    ),
+    forwarded("qualify-text-endpoint", qualify_text_endpoint),
+    forwarded("bench-startup", bench_startup),
+    forwarded("bench-server", server_bench::run),
+    forwarded("bench-residual-norm", bench_residual_norm),
+    forwarded("bench-qwen35-residual-norm", bench_qwen35_residual_norm),
+    forwarded("bench-qwen36-residual-norm", bench_qwen36_residual_norm),
+    forwarded("bench-qwen35-nvfp4-swiglu", bench_qwen35_nvfp4_swiglu),
+    forwarded("bench-qwen35-nvfp4-down", bench_qwen35_nvfp4_down),
+    forwarded("bench-qwen35-nvfp4-qkv", bench_qwen35_nvfp4_qkv),
+    forwarded("bench-qwen36-moe-router", bench_qwen36_moe_router),
+    forwarded("bench-qwen36-moe-experts", bench_qwen36_moe_experts),
+    forwarded("bench-qwen36-nvfp4-lm-head", bench_qwen36_nvfp4_lm_head),
+    forwarded("bench-qwen36-fp8-qkv", bench_qwen36_fp8_qkv),
+    forwarded("bench-qwen36-gdn-input", bench_qwen36_gdn_input),
+    forwarded("bench-qwen36-gdn-output", bench_qwen36_gdn_output),
+    forwarded(
+        "bench-qwen36-attention-output",
+        bench_qwen36_attention_output,
+    ),
+    forwarded("bench-qwen36-gdn-prepare", bench_qwen36_gdn_prepare),
+    forwarded("bench-qwen36-gdn-recurrence", bench_qwen36_gdn_recurrence),
+    forwarded("bench-qwen35-nvfp4-gdn-input", bench_qwen35_nvfp4_gdn_input),
+    forwarded("bench-qwen35-gdn-prepare", bench_qwen35_gdn_prepare),
+    forwarded("bench-qwen35-gdn-recurrence", bench_qwen35_gdn_recurrence),
+    forwarded(
+        "bench-qwen35-nvfp4-gdn-output",
+        bench_qwen35_nvfp4_gdn_output,
+    ),
+    forwarded(
+        "bench-qwen35-nvfp4-attention-output",
+        bench_qwen35_nvfp4_attention_output,
+    ),
+    forwarded("bench-qwen35-nvfp4-mlp", bench_qwen35_nvfp4_mlp),
+    forwarded(
+        "bench-qwen35-attention-qk-prepare",
+        bench_qwen35_attention_qk_prepare,
+    ),
+    forwarded(
+        "bench-qwen36-attention-qk-prepare",
+        bench_qwen36_attention_qk_prepare,
+    ),
+    forwarded(
+        "bench-qwen36-fp8-attention-qk-prepare",
+        bench_qwen36_fp8_attention_qk_prepare,
+    ),
+    forwarded("bench-fp8-qkv", bench_fp8_qkv),
+    forwarded("bench-fp8-gdn-input", bench_fp8_gdn_input),
+    forwarded("bench-fp8-lm-head", bench_fp8_lm_head),
+    forwarded("bench-fp8-swiglu", bench_fp8_swiglu),
+    forwarded("bench-fp8-down", bench_fp8_down),
+    forwarded("bench-nvfp4-swiglu", bench_nvfp4_swiglu),
+    forwarded("bench-nvfp4-down", bench_nvfp4_down),
+    forwarded("bench-nvfp4-mlp", bench_nvfp4_mlp),
+    forwarded("bench-gdn-prepare", bench_gdn_prepare),
+    forwarded("bench-gdn-recurrence", bench_gdn_recurrence),
+    forwarded("bench-gdn-output", bench_gdn_output),
+    forwarded("bench-attention-qk-prepare", bench_attention_qk_prepare),
+    forwarded("bench-paged-gqa", bench_paged_gqa),
+    forwarded("bench-qwen35-paged-gqa", bench_qwen35_paged_gqa),
+    forwarded("bench-qwen36-paged-gqa", bench_qwen36_paged_gqa),
+    forwarded("bench-qwen36-fp8-paged-gqa", bench_qwen36_fp8_paged_gqa),
+    forwarded("bench-long-context-paged-gqa", bench_long_context_paged_gqa),
+    forwarded("bench-attention-output", bench_attention_output),
+    forwarded("bench-mtp-bf16-fusion", bench_mtp_bf16_fusion),
+    forwarded(
+        "bench-mtp-bf16-attention-output",
+        bench_mtp_bf16_attention_output,
+    ),
+    forwarded("bench-mtp-bf16-mlp", bench_mtp_bf16_mlp),
+    forwarded("bench-mtp-bf16-qkv", bench_mtp_bf16_qkv),
+    forwarded("bench-mtp-bf16-qk-prepare", bench_mtp_bf16_qk_prepare),
+    forwarded("bench-mtp-bf16-paged-gqa", bench_mtp_bf16_paged_gqa),
+    forwarded("bench-dense-fp8-mlp", bench_dense_fp8_mlp),
+    forwarded("bench-dense-fp8-gdn-layer", bench_dense_fp8_gdn_layer),
+    forwarded("bench-full-attention-layer", bench_full_attention_layer),
+    forwarded("bench-mtp-layer", bench_mtp_layer),
+    forwarded("bench-qwen35-mtp-layer", bench_qwen35_mtp_layer),
+    forwarded("bench-qwen36-mtp-layer", bench_qwen36_mtp_layer),
+    forwarded("bench-target-mtp-verify", bench_target_mtp_verify),
+    forwarded("bench-mtp-prompt-prime", bench_mtp_prompt_prime),
+    forwarded("bench-resident-mtp", bench_resident_mtp),
+    forwarded("bench-qwen35-resident-mtp", bench_qwen35_resident_mtp),
+    forwarded("bench-qwen35-mtp-generation", bench_qwen35_mtp_generation),
+    forwarded(
+        "bench-qwen35-mtp-batch-generation",
+        bench_qwen35_mtp_batch_generation,
+    ),
+    forwarded("bench-generation-mtp-greedy", bench_generation_mtp_greedy),
+    forwarded(
+        "bench-generation-mtp-sampling",
+        bench_generation_mtp_sampling,
+    ),
+    forwarded("bench-generation-mtp-batch", bench_generation_mtp_batch),
+    forwarded(
+        "bench-qwen35-full-attention-layer",
+        bench_qwen35_full_attention_layer,
+    ),
+    forwarded("bench-qwen35-gdn-layer", bench_qwen35_gdn_layer),
+    forwarded("bench-qwen36-gdn-moe-layer", bench_qwen36_gdn_moe_layer),
+    forwarded(
+        "bench-qwen36-full-attention-layer",
+        bench_qwen36_full_attention_layer,
+    ),
+    forwarded("bench-qwen35-text-endpoint", bench_qwen35_text_endpoint),
+    forwarded("bench-qwen36-text-endpoint", bench_qwen36_text_endpoint),
+    forwarded("bench-qwen35-resident-model", bench_qwen35_resident_model),
+    forwarded("bench-qwen36-resident-model", bench_qwen36_resident_model),
+    forwarded("bench-resident-model", bench_resident_model),
+    forwarded("bench-resident-prefill", bench_resident_prefill),
+    forwarded(
+        "bench-resident-long-context-model",
+        bench_resident_long_context_model,
+    ),
+    forwarded("bench-text-endpoint", bench_text_endpoint),
+    no_args("gate-residual-norm", gate_residual_norm),
+    no_args("gate-qwen35-residual-norm", gate_qwen35_residual_norm),
+    no_args("gate-qwen36-residual-norm", gate_qwen36_residual_norm),
+    no_args("gate-qwen35-nvfp4-swiglu", gate_qwen35_nvfp4_swiglu),
+    no_args("gate-qwen35-nvfp4-down", gate_qwen35_nvfp4_down),
+    no_args("gate-qwen35-nvfp4-qkv", gate_qwen35_nvfp4_qkv),
+    no_args("gate-qwen35-bf16-lm-head", gate_qwen35_bf16_lm_head),
+    no_args("gate-qwen36-moe-router", gate_qwen36_moe_router),
+    no_args("gate-qwen36-moe-experts", gate_qwen36_moe_experts),
+    no_args("gate-qwen36-nvfp4-lm-head", gate_qwen36_nvfp4_lm_head),
+    no_args("gate-qwen36-fp8-qkv", gate_qwen36_fp8_qkv),
+    no_args("gate-qwen36-gdn-input", gate_qwen36_gdn_input),
+    no_args("gate-qwen36-gdn-output", gate_qwen36_gdn_output),
+    no_args("gate-qwen35-nvfp4-gdn-input", gate_qwen35_nvfp4_gdn_input),
+    no_args("gate-qwen35-gdn-prepare", gate_qwen35_gdn_prepare),
+    no_args("gate-qwen35-gdn-recurrence", gate_qwen35_gdn_recurrence),
+    no_args(
+        "gate-qwen35-nvfp4-attention-output",
+        gate_qwen35_nvfp4_attention_output,
+    ),
+    no_args(
+        "gate-qwen35-attention-qk-prepare",
+        gate_qwen35_attention_qk_prepare,
+    ),
+    no_args(
+        "gate-qwen36-attention-qk-prepare",
+        gate_qwen36_attention_qk_prepare,
+    ),
+    no_args(
+        "gate-qwen36-fp8-attention-qk-prepare",
+        gate_qwen36_fp8_attention_qk_prepare,
+    ),
+    no_args("gate-fp8-qkv", gate_fp8_qkv),
+    no_args("gate-fp8-gdn-input", gate_fp8_gdn_input),
+    no_args("gate-fp8-lm-head", gate_fp8_lm_head),
+    no_args("gate-fp8-swiglu", gate_fp8_swiglu),
+    no_args("gate-fp8-down", gate_fp8_down),
+    no_args("gate-nvfp4-swiglu", gate_nvfp4_swiglu),
+    no_args("gate-nvfp4-down", gate_nvfp4_down),
+    no_args("gate-gdn-prepare", gate_gdn_prepare),
+    no_args("gate-gdn-recurrence", gate_gdn_recurrence),
+    no_args("gate-gdn-output", gate_gdn_output),
+    no_args("gate-attention-qk-prepare", gate_attention_qk_prepare),
+    no_args("gate-paged-gqa", gate_paged_gqa),
+    no_args("gate-qwen35-paged-gqa", gate_qwen35_paged_gqa),
+    no_args("gate-qwen36-paged-gqa", gate_qwen36_paged_gqa),
+    no_args("gate-qwen36-fp8-paged-gqa", gate_qwen36_fp8_paged_gqa),
+    no_args("gate-qwen36-attention-output", gate_qwen36_attention_output),
+    no_args("gate-long-context-paged-gqa", gate_long_context_paged_gqa),
+    no_args("gate-attention-output", gate_attention_output),
+    no_args("gate-mtp-bf16-fusion", gate_mtp_bf16_fusion),
+    no_args(
+        "gate-mtp-bf16-attention-output",
+        gate_mtp_bf16_attention_output,
+    ),
+    no_args("gate-mtp-bf16-mlp", gate_mtp_bf16_mlp),
+    no_args("gate-mtp-bf16-qkv", gate_mtp_bf16_qkv),
+    no_args("gate-mtp-bf16-qk-prepare", gate_mtp_bf16_qk_prepare),
+    no_args("gate-mtp-bf16-paged-gqa", gate_mtp_bf16_paged_gqa),
+    no_args("gate-qwen35-mtp-resources", gate_qwen35_mtp_resources),
+    no_args("gate-qwen36-mtp-resources", gate_qwen36_mtp_resources),
+    forwarded("perf", perf),
+    forwarded("profile", profile),
+    forwarded("remote", remote::run),
+];
+
+/// Reject arguments a subcommand does not take.
+fn require_no_args(arguments: &[std::ffi::OsString], name: &str) -> Result<(), Box<dyn Error>> {
+    if arguments.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!("`{name}` takes no arguments").into())
+}
+
+/// Resolve one command name against `SUBCOMMANDS` and run its handler.
+fn dispatch(
+    root: &Path,
+    command: &OsStr,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let subcommand = command
+        .to_str()
+        .and_then(|name| {
+            SUBCOMMANDS
+                .iter()
+                .find(|subcommand| subcommand.name == name)
+        })
+        .ok_or_else(|| format!("unknown xtask command `{}`", command.to_string_lossy()))?;
+
+    match subcommand.run {
+        Handler::NoArguments(run) => {
+            require_no_args(arguments, subcommand.name)?;
+            run(root)
+        }
+        Handler::Forwarded(run) => run(root, arguments),
+    }
+}
+
+/// Test-only interception of the two canonical device spawners. The dispatch
+/// tests drive real `SUBCOMMANDS` rows and observe the suite, filter, flags and
+/// snapshot variable each handler passes; the recorded call aborts its handler,
+/// so neither a build nor the gates behind it ever run.
+#[cfg(test)]
+mod dispatch_probe {
+    use std::cell::RefCell;
+    use std::error::Error;
+    use std::ffi::{OsStr, OsString};
+
+    pub(super) const ABORTED: &str = "dispatch probe intercepted the device spawn";
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) enum Spawn {
+        BenchDevice {
+            suite: String,
+            arguments: Vec<OsString>,
+            baselines: Vec<&'static str>,
+        },
+        Qualification {
+            filter: String,
+            trailing: Vec<String>,
+            environment: Option<(String, OsString)>,
+        },
+    }
+
+    thread_local! {
+        static RECORDER: RefCell<Option<Option<Spawn>>> = const { RefCell::new(None) };
+    }
+
+    /// Record the first spawn of an armed dispatch and abort its handler.
+    /// Unarmed, it yields `None` and the caller spawns as usual.
+    pub(super) fn intercept(spawn: Spawn) -> Option<Result<(), Box<dyn Error>>> {
+        RECORDER.with(|recorder| {
+            let mut recorder = recorder.borrow_mut();
+            let slot = recorder.as_mut()?;
+            if slot.is_none() {
+                *slot = Some(spawn);
+            }
+
+            Some(Err(ABORTED.into()))
+        })
+    }
+
+    /// Run one subcommand through the real router and return the device spawn
+    /// its handler reached.
+    pub(super) fn observe(command: &str, arguments: &[OsString]) -> Spawn {
+        RECORDER.with(|recorder| *recorder.borrow_mut() = Some(None));
+        let outcome = super::dispatch(
+            super::workspace_root().unwrap(),
+            OsStr::new(command),
+            arguments,
+        );
+        let recorded = RECORDER.with(|recorder| recorder.borrow_mut().take().flatten());
+
+        match outcome {
+            Err(error) if error.to_string() == ABORTED => {}
+            Err(error) => panic!("`{command}` failed before its device spawn: {error}"),
+            Ok(()) => panic!("`{command}` returned without a device spawn"),
+        }
+
+        recorded.unwrap_or_else(|| panic!("`{command}` recorded no device spawn"))
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
@@ -973,452 +1457,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
 
-    match command.to_str() {
-        Some("bootstrap-cuda-oxide") if remaining.is_empty() => bootstrap_cuda_oxide(root),
-        Some("build-sm120") if remaining.is_empty() => build_sm120(root),
-        Some("build-residual-norm") => build_residual_norm(root, &remaining),
-        Some("build-residual-bench") => build_residual_bench(root, &remaining),
-        Some("build-server") if remaining.is_empty() => build_server(root),
-        Some("qualify-frontend") => qualify_frontend(root, &remaining),
-        Some("qualify-generation") => qualify_generation(root, &remaining),
-        Some("qualify-server") => server_qual::run(root, &remaining),
-        Some("qualify-server-long-context") => server_qual::run_long_context(root, &remaining),
-        Some("qualify-host") if remaining.is_empty() => qualify_host(root),
-        Some("qualify-residual-norm") if remaining.is_empty() => qualify_residual_norm(root),
-        Some("qualify-qwen35-residual-norm") if remaining.is_empty() => {
-            qualify_qwen35_residual_norm(root)
-        }
-        Some("qualify-qwen36-residual-norm") if remaining.is_empty() => {
-            qualify_qwen36_residual_norm(root)
-        }
-        Some("qualify-qwen35-nvfp4-swiglu") if remaining.is_empty() => {
-            qualify_qwen35_nvfp4_swiglu(root)
-        }
-        Some("qualify-qwen35-nvfp4-down") if remaining.is_empty() => {
-            qualify_qwen35_nvfp4_down(root)
-        }
-        Some("qualify-qwen35-nvfp4-qkv") if remaining.is_empty() => qualify_qwen35_nvfp4_qkv(root),
-        Some("qualify-qwen36-moe-router") if remaining.is_empty() => {
-            qualify_qwen36_moe_router(root)
-        }
-        Some("qualify-qwen36-moe-experts") if remaining.is_empty() => {
-            qualify_qwen36_moe_experts(root)
-        }
-        Some("qualify-qwen36-nvfp4-lm-head") if remaining.is_empty() => {
-            qualify_qwen36_nvfp4_lm_head(root)
-        }
-        Some("qualify-qwen36-fp8-qkv") if remaining.is_empty() => qualify_qwen36_fp8_qkv(root),
-        Some("qualify-qwen36-gdn-input") if remaining.is_empty() => qualify_qwen36_gdn_input(root),
-        Some("qualify-qwen36-gdn-output") if remaining.is_empty() => {
-            qualify_qwen36_gdn_output(root)
-        }
-        Some("qualify-qwen36-attention-output") if remaining.is_empty() => {
-            qualify_qwen36_attention_output(root)
-        }
-        Some("qualify-qwen36-gdn-prepare") if remaining.is_empty() => {
-            qualify_qwen36_gdn_prepare(root)
-        }
-        Some("qualify-qwen36-gdn-recurrence") if remaining.is_empty() => {
-            qualify_qwen36_gdn_recurrence(root)
-        }
-        Some("qualify-qwen35-bf16-lm-head") => qualify_qwen35_bf16_lm_head(root, &remaining),
-        Some("qualify-qwen35-mtp-bf16-fusion") => qualify_qwen35_mtp_bf16_fusion(root, &remaining),
-        Some("qualify-qwen35-mtp-bf16-attention") => {
-            qualify_qwen35_mtp_bf16_attention(root, &remaining)
-        }
-        Some("qualify-qwen36-mtp-bf16-attention") => {
-            qualify_qwen36_mtp_bf16_attention(root, &remaining)
-        }
-        Some("qualify-qwen36-mtp-bf16-moe") if remaining.is_empty() => {
-            qualify_qwen36_mtp_bf16_moe(root)
-        }
-        Some("qualify-qwen35-mtp-bf16-mlp") => qualify_qwen35_mtp_bf16_mlp(root, &remaining),
-        Some("qualify-qwen35-text-endpoint") => qualify_qwen35_text_endpoint(root, &remaining),
-        Some("qualify-qwen36-text-endpoint") => qualify_qwen36_text_endpoint(root, &remaining),
-        Some("qualify-qwen36-resident-model") => qualify_qwen36_resident_model(root, &remaining),
-        Some("qualify-qwen36-generation") => qualify_qwen36_generation(root, &remaining),
-        Some("qualify-qwen36-server") => qualify_qwen36_server(root, &remaining),
-        Some("qualify-qwen35-server") => qualify_qwen35_server(root, &remaining),
-        Some("qualify-qwen35-resident-model") => qualify_qwen35_resident_model(root, &remaining),
-        Some("qualify-qwen35-resident-mtp") => qualify_qwen35_resident_mtp(root, &remaining),
-        Some("qualify-qwen35-mtp-generation") => qualify_qwen35_mtp_generation(root, &remaining),
-        Some("qualify-qwen35-mtp-batch-generation") => {
-            qualify_qwen35_mtp_batch_generation(root, &remaining)
-        }
-        Some("qualify-qwen35-generation") => qualify_qwen35_generation(root, &remaining),
-        Some("qualify-qwen35-long-context-kv") if remaining.is_empty() => {
-            qualify_qwen35_long_context_kv(root)
-        }
-        Some("qualify-qwen36-long-context-kv") if remaining.is_empty() => {
-            qualify_qwen36_long_context_kv(root)
-        }
-        Some("qualify-qwen35-nvfp4-gdn-input") if remaining.is_empty() => {
-            qualify_qwen35_nvfp4_gdn_input(root)
-        }
-        Some("qualify-qwen35-gdn-prepare") if remaining.is_empty() => {
-            qualify_qwen35_gdn_prepare(root)
-        }
-        Some("qualify-qwen35-gdn-recurrence") if remaining.is_empty() => {
-            qualify_qwen35_gdn_recurrence(root)
-        }
-        Some("qualify-qwen35-nvfp4-gdn-output") if remaining.is_empty() => {
-            qualify_qwen35_nvfp4_gdn_output(root)
-        }
-        Some("qualify-qwen35-nvfp4-attention-output") if remaining.is_empty() => {
-            qualify_qwen35_nvfp4_attention_output(root)
-        }
-        Some("qualify-qwen35-nvfp4-mlp") => qualify_qwen35_nvfp4_mlp(root, &remaining),
-        Some("qualify-qwen35-attention-qk-prepare") if remaining.is_empty() => {
-            qualify_qwen35_attention_qk_prepare(root)
-        }
-        Some("qualify-qwen36-attention-qk-prepare") if remaining.is_empty() => {
-            qualify_qwen36_attention_qk_prepare(root)
-        }
-        Some("qualify-qwen36-fp8-attention-qk-prepare") if remaining.is_empty() => {
-            qualify_qwen36_fp8_attention_qk_prepare(root)
-        }
-        Some("qualify-fp8-qkv") if remaining.is_empty() => qualify_fp8_qkv(root),
-        Some("qualify-fp8-gdn-input") if remaining.is_empty() => qualify_fp8_gdn_input(root),
-        Some("qualify-fp8-lm-head") if remaining.is_empty() => qualify_fp8_lm_head(root),
-        Some("qualify-fp8-swiglu") if remaining.is_empty() => qualify_fp8_swiglu(root),
-        Some("qualify-fp8-down") if remaining.is_empty() => qualify_fp8_down(root),
-        Some("qualify-nvfp4-swiglu") if remaining.is_empty() => qualify_nvfp4_swiglu(root),
-        Some("qualify-nvfp4-down") if remaining.is_empty() => qualify_nvfp4_down(root),
-        Some("qualify-nvfp4-mlp") => qualify_nvfp4_mlp(root, &remaining),
-        Some("qualify-gdn-prepare") if remaining.is_empty() => qualify_gdn_prepare(root),
-        Some("qualify-gdn-recurrence") if remaining.is_empty() => qualify_gdn_recurrence(root),
-        Some("qualify-gdn-output") if remaining.is_empty() => qualify_gdn_output(root),
-        Some("qualify-attention-qk-prepare") if remaining.is_empty() => {
-            qualify_attention_qk_prepare(root)
-        }
-        Some("qualify-paged-gqa") if remaining.is_empty() => qualify_paged_gqa(root),
-        Some("qualify-qwen35-paged-gqa") if remaining.is_empty() => qualify_qwen35_paged_gqa(root),
-        Some("qualify-qwen36-paged-gqa") if remaining.is_empty() => qualify_qwen36_paged_gqa(root),
-        Some("qualify-qwen36-fp8-paged-gqa") if remaining.is_empty() => {
-            qualify_qwen36_fp8_paged_gqa(root)
-        }
-        Some("qualify-long-context-paged-gqa") if remaining.is_empty() => {
-            qualify_long_context_paged_gqa(root)
-        }
-        Some("qualify-attention-output") if remaining.is_empty() => qualify_attention_output(root),
-        Some("qualify-mtp-bf16-fusion") => qualify_mtp_bf16_fusion(root, &remaining),
-        Some("qualify-mtp-bf16-attention-output") => {
-            qualify_mtp_bf16_attention_output(root, &remaining)
-        }
-        Some("qualify-mtp-bf16-mlp") => qualify_mtp_bf16_mlp(root, &remaining),
-        Some("qualify-mtp-bf16-qkv") => qualify_mtp_bf16_qkv(root, &remaining),
-        Some("qualify-mtp-bf16-qk-prepare") => qualify_mtp_bf16_qk_prepare(root, &remaining),
-        Some("qualify-mtp-bf16-paged-gqa") if remaining.is_empty() => {
-            qualify_mtp_bf16_paged_gqa(root)
-        }
-        Some("qualify-dense-fp8-mlp") => qualify_dense_fp8_mlp(root, &remaining),
-        Some("qualify-dense-fp8-gdn-layer") => qualify_dense_fp8_gdn_layer(root, &remaining),
-        Some("qualify-full-attention-layer") => qualify_full_attention_layer(root, &remaining),
-        Some("qualify-mtp-layer") => qualify_mtp_layer(root, &remaining),
-        Some("qualify-qwen35-mtp-layer") => qualify_qwen35_mtp_layer(root, &remaining),
-        Some("qualify-qwen36-mtp-layer") => qualify_qwen36_mtp_layer(root, &remaining),
-        Some("qualify-target-mtp-verify") => qualify_target_mtp_verify(root, &remaining),
-        Some("qualify-mtp-prompt-prime") => qualify_mtp_prompt_prime(root, &remaining),
-        Some("qualify-resident-mtp") => qualify_resident_mtp(root, &remaining),
-        Some("qualify-generation-mtp-greedy") => qualify_generation_mtp_greedy(root, &remaining),
-        Some("qualify-generation-mtp-sampling") => {
-            qualify_generation_mtp_sampling(root, &remaining)
-        }
-        Some("qualify-generation-mtp-batch") => qualify_generation_mtp_batch(root, &remaining),
-        Some("qualify-qwen35-full-attention-layer") => {
-            qualify_qwen35_full_attention_layer(root, &remaining)
-        }
-        Some("qualify-qwen36-full-attention-layer") => {
-            qualify_qwen36_full_attention_layer(root, &remaining)
-        }
-        Some("qualify-qwen35-gdn-layer") => qualify_qwen35_gdn_layer(root, &remaining),
-        Some("qualify-qwen36-gdn-moe-layer") => qualify_qwen36_gdn_moe_layer(root, &remaining),
-        Some("qualify-resident-model") => qualify_resident_model(root, &remaining),
-        Some("qualify-resident-generation") => qualify_resident_generation(root, &remaining),
-        Some("qualify-resident-batch-generation") => {
-            qualify_resident_batch_generation(root, &remaining)
-        }
-        Some("qualify-text-endpoint") => qualify_text_endpoint(root, &remaining),
-        Some("bench-startup") => bench_startup(root, &remaining),
-        Some("bench-server") => server_bench::run(root, &remaining),
-        Some("bench-residual-norm") => bench_residual_norm(root, &remaining),
-        Some("bench-qwen35-residual-norm") => bench_qwen35_residual_norm(root, &remaining),
-        Some("bench-qwen36-residual-norm") => bench_qwen36_residual_norm(root, &remaining),
-        Some("bench-qwen35-nvfp4-swiglu") => bench_qwen35_nvfp4_swiglu(root, &remaining),
-        Some("bench-qwen35-nvfp4-down") => bench_qwen35_nvfp4_down(root, &remaining),
-        Some("bench-qwen35-nvfp4-qkv") => bench_qwen35_nvfp4_qkv(root, &remaining),
-        Some("bench-qwen36-moe-router") => bench_qwen36_moe_router(root, &remaining),
-        Some("bench-qwen36-moe-experts") => bench_qwen36_moe_experts(root, &remaining),
-        Some("bench-qwen36-nvfp4-lm-head") => bench_qwen36_nvfp4_lm_head(root, &remaining),
-        Some("bench-qwen36-fp8-qkv") => bench_qwen36_fp8_qkv(root, &remaining),
-        Some("bench-qwen36-gdn-input") => bench_qwen36_gdn_input(root, &remaining),
-        Some("bench-qwen36-gdn-output") => bench_qwen36_gdn_output(root, &remaining),
-        Some("bench-qwen36-attention-output") => bench_qwen36_attention_output(root, &remaining),
-        Some("bench-qwen36-gdn-prepare") => bench_qwen36_gdn_prepare(root, &remaining),
-        Some("bench-qwen36-gdn-recurrence") => bench_qwen36_gdn_recurrence(root, &remaining),
-        Some("bench-qwen35-nvfp4-gdn-input") => bench_qwen35_nvfp4_gdn_input(root, &remaining),
-        Some("bench-qwen35-gdn-prepare") => bench_qwen35_gdn_prepare(root, &remaining),
-        Some("bench-qwen35-gdn-recurrence") => bench_qwen35_gdn_recurrence(root, &remaining),
-        Some("bench-qwen35-nvfp4-gdn-output") => bench_qwen35_nvfp4_gdn_output(root, &remaining),
-        Some("bench-qwen35-nvfp4-attention-output") => {
-            bench_qwen35_nvfp4_attention_output(root, &remaining)
-        }
-        Some("bench-qwen35-nvfp4-mlp") => bench_qwen35_nvfp4_mlp(root, &remaining),
-        Some("bench-qwen35-attention-qk-prepare") => {
-            bench_qwen35_attention_qk_prepare(root, &remaining)
-        }
-        Some("bench-qwen36-attention-qk-prepare") => {
-            bench_qwen36_attention_qk_prepare(root, &remaining)
-        }
-        Some("bench-qwen36-fp8-attention-qk-prepare") => {
-            bench_qwen36_fp8_attention_qk_prepare(root, &remaining)
-        }
-        Some("bench-fp8-qkv") => bench_fp8_qkv(root, &remaining),
-        Some("bench-fp8-gdn-input") => bench_fp8_gdn_input(root, &remaining),
-        Some("bench-fp8-lm-head") => bench_fp8_lm_head(root, &remaining),
-        Some("bench-fp8-swiglu") => bench_fp8_swiglu(root, &remaining),
-        Some("bench-fp8-down") => bench_fp8_down(root, &remaining),
-        Some("bench-nvfp4-swiglu") => bench_nvfp4_swiglu(root, &remaining),
-        Some("bench-nvfp4-down") => bench_nvfp4_down(root, &remaining),
-        Some("bench-nvfp4-mlp") => bench_nvfp4_mlp(root, &remaining),
-        Some("bench-gdn-prepare") => bench_gdn_prepare(root, &remaining),
-        Some("bench-gdn-recurrence") => bench_gdn_recurrence(root, &remaining),
-        Some("bench-gdn-output") => bench_gdn_output(root, &remaining),
-        Some("bench-attention-qk-prepare") => bench_attention_qk_prepare(root, &remaining),
-        Some("bench-paged-gqa") => bench_paged_gqa(root, &remaining),
-        Some("bench-qwen35-paged-gqa") => bench_qwen35_paged_gqa(root, &remaining),
-        Some("bench-qwen36-paged-gqa") => bench_qwen36_paged_gqa(root, &remaining),
-        Some("bench-qwen36-fp8-paged-gqa") => bench_qwen36_fp8_paged_gqa(root, &remaining),
-        Some("bench-long-context-paged-gqa") => bench_long_context_paged_gqa(root, &remaining),
-        Some("bench-attention-output") => bench_attention_output(root, &remaining),
-        Some("bench-mtp-bf16-fusion") => bench_mtp_bf16_fusion(root, &remaining),
-        Some("bench-mtp-bf16-attention-output") => {
-            bench_mtp_bf16_attention_output(root, &remaining)
-        }
-        Some("bench-mtp-bf16-mlp") => bench_mtp_bf16_mlp(root, &remaining),
-        Some("bench-mtp-bf16-qkv") => bench_mtp_bf16_qkv(root, &remaining),
-        Some("bench-mtp-bf16-qk-prepare") => bench_mtp_bf16_qk_prepare(root, &remaining),
-        Some("bench-mtp-bf16-paged-gqa") => bench_mtp_bf16_paged_gqa(root, &remaining),
-        Some("bench-dense-fp8-mlp") => bench_dense_fp8_mlp(root, &remaining),
-        Some("bench-dense-fp8-gdn-layer") => bench_dense_fp8_gdn_layer(root, &remaining),
-        Some("bench-full-attention-layer") => bench_full_attention_layer(root, &remaining),
-        Some("bench-mtp-layer") => bench_mtp_layer(root, &remaining),
-        Some("bench-qwen35-mtp-layer") => bench_qwen35_mtp_layer(root, &remaining),
-        Some("bench-qwen36-mtp-layer") => bench_qwen36_mtp_layer(root, &remaining),
-        Some("bench-target-mtp-verify") => bench_target_mtp_verify(root, &remaining),
-        Some("bench-mtp-prompt-prime") => bench_mtp_prompt_prime(root, &remaining),
-        Some("bench-resident-mtp") => bench_resident_mtp(root, &remaining),
-        Some("bench-qwen35-resident-mtp") => bench_qwen35_resident_mtp(root, &remaining),
-        Some("bench-qwen35-mtp-generation") => bench_qwen35_mtp_generation(root, &remaining),
-        Some("bench-qwen35-mtp-batch-generation") => {
-            bench_qwen35_mtp_batch_generation(root, &remaining)
-        }
-        Some("bench-generation-mtp-greedy") => bench_generation_mtp_greedy(root, &remaining),
-        Some("bench-generation-mtp-sampling") => bench_generation_mtp_sampling(root, &remaining),
-        Some("bench-generation-mtp-batch") => bench_generation_mtp_batch(root, &remaining),
-        Some("bench-qwen35-full-attention-layer") => {
-            bench_qwen35_full_attention_layer(root, &remaining)
-        }
-        Some("bench-qwen35-gdn-layer") => bench_qwen35_gdn_layer(root, &remaining),
-        Some("bench-qwen36-gdn-moe-layer") => bench_qwen36_gdn_moe_layer(root, &remaining),
-        Some("bench-qwen36-full-attention-layer") => {
-            bench_qwen36_full_attention_layer(root, &remaining)
-        }
-        Some("bench-qwen35-text-endpoint") => bench_qwen35_text_endpoint(root, &remaining),
-        Some("bench-qwen36-text-endpoint") => bench_qwen36_text_endpoint(root, &remaining),
-        Some("bench-qwen35-resident-model") => bench_qwen35_resident_model(root, &remaining),
-        Some("bench-qwen36-resident-model") => bench_qwen36_resident_model(root, &remaining),
-        Some("bench-resident-model") => bench_resident_model(root, &remaining),
-        Some("bench-resident-prefill") => bench_resident_prefill(root, &remaining),
-        Some("bench-resident-long-context-model") => {
-            bench_resident_long_context_model(root, &remaining)
-        }
-        Some("bench-text-endpoint") => bench_text_endpoint(root, &remaining),
-        Some("gate-residual-norm") if remaining.is_empty() => gate_residual_norm(root),
-        Some("gate-qwen35-residual-norm") if remaining.is_empty() => {
-            gate_qwen35_residual_norm(root)
-        }
-        Some("gate-qwen36-residual-norm") if remaining.is_empty() => {
-            gate_qwen36_residual_norm(root)
-        }
-        Some("gate-qwen35-nvfp4-swiglu") if remaining.is_empty() => gate_qwen35_nvfp4_swiglu(root),
-        Some("gate-qwen35-nvfp4-down") if remaining.is_empty() => gate_qwen35_nvfp4_down(root),
-        Some("gate-qwen35-nvfp4-qkv") if remaining.is_empty() => gate_qwen35_nvfp4_qkv(root),
-        Some("gate-qwen35-bf16-lm-head") if remaining.is_empty() => gate_qwen35_bf16_lm_head(root),
-        Some("gate-qwen36-moe-router") if remaining.is_empty() => gate_qwen36_moe_router(root),
-        Some("gate-qwen36-moe-experts") if remaining.is_empty() => gate_qwen36_moe_experts(root),
-        Some("gate-qwen36-nvfp4-lm-head") if remaining.is_empty() => {
-            gate_qwen36_nvfp4_lm_head(root)
-        }
-        Some("gate-qwen36-fp8-qkv") if remaining.is_empty() => gate_qwen36_fp8_qkv(root),
-        Some("gate-qwen36-gdn-input") if remaining.is_empty() => gate_qwen36_gdn_input(root),
-        Some("gate-qwen36-gdn-output") if remaining.is_empty() => gate_qwen36_gdn_output(root),
-        Some("gate-qwen35-nvfp4-gdn-input") if remaining.is_empty() => {
-            gate_qwen35_nvfp4_gdn_input(root)
-        }
-        Some("gate-qwen35-gdn-prepare") if remaining.is_empty() => gate_qwen35_gdn_prepare(root),
-        Some("gate-qwen35-gdn-recurrence") if remaining.is_empty() => {
-            gate_qwen35_gdn_recurrence(root)
-        }
-        Some("gate-qwen35-nvfp4-attention-output") if remaining.is_empty() => {
-            gate_qwen35_nvfp4_attention_output(root)
-        }
-        Some("gate-qwen35-attention-qk-prepare") if remaining.is_empty() => {
-            gate_qwen35_attention_qk_prepare(root)
-        }
-        Some("gate-qwen36-attention-qk-prepare") if remaining.is_empty() => {
-            gate_qwen36_attention_qk_prepare(root)
-        }
-        Some("gate-qwen36-fp8-attention-qk-prepare") if remaining.is_empty() => {
-            gate_qwen36_fp8_attention_qk_prepare(root)
-        }
-        Some("gate-fp8-qkv") if remaining.is_empty() => gate_fp8_qkv(root),
-        Some("gate-fp8-gdn-input") if remaining.is_empty() => gate_fp8_gdn_input(root),
-        Some("gate-fp8-lm-head") if remaining.is_empty() => gate_fp8_lm_head(root),
-        Some("gate-fp8-swiglu") if remaining.is_empty() => gate_fp8_swiglu(root),
-        Some("gate-fp8-down") if remaining.is_empty() => gate_fp8_down(root),
-        Some("gate-nvfp4-swiglu") if remaining.is_empty() => gate_nvfp4_swiglu(root),
-        Some("gate-nvfp4-down") if remaining.is_empty() => gate_nvfp4_down(root),
-        Some("gate-gdn-prepare") if remaining.is_empty() => gate_gdn_prepare(root),
-        Some("gate-gdn-recurrence") if remaining.is_empty() => gate_gdn_recurrence(root),
-        Some("gate-gdn-output") if remaining.is_empty() => gate_gdn_output(root),
-        Some("gate-attention-qk-prepare") if remaining.is_empty() => {
-            gate_attention_qk_prepare(root)
-        }
-        Some("gate-paged-gqa") if remaining.is_empty() => gate_paged_gqa(root),
-        Some("gate-qwen35-paged-gqa") if remaining.is_empty() => gate_qwen35_paged_gqa(root),
-        Some("gate-qwen36-paged-gqa") if remaining.is_empty() => gate_qwen36_paged_gqa(root),
-        Some("gate-qwen36-fp8-paged-gqa") if remaining.is_empty() => {
-            gate_qwen36_fp8_paged_gqa(root)
-        }
-        Some("gate-qwen36-attention-output") if remaining.is_empty() => {
-            gate_qwen36_attention_output(root)
-        }
-        Some("gate-long-context-paged-gqa") if remaining.is_empty() => {
-            gate_long_context_paged_gqa(root)
-        }
-        Some("gate-attention-output") if remaining.is_empty() => gate_attention_output(root),
-        Some("gate-mtp-bf16-fusion") if remaining.is_empty() => gate_mtp_bf16_fusion(root),
-        Some("gate-mtp-bf16-attention-output") if remaining.is_empty() => {
-            gate_mtp_bf16_attention_output(root)
-        }
-        Some("gate-mtp-bf16-mlp") if remaining.is_empty() => gate_mtp_bf16_mlp(root),
-        Some("gate-mtp-bf16-qkv") if remaining.is_empty() => gate_mtp_bf16_qkv(root),
-        Some("gate-mtp-bf16-qk-prepare") if remaining.is_empty() => gate_mtp_bf16_qk_prepare(root),
-        Some("gate-mtp-bf16-paged-gqa") if remaining.is_empty() => gate_mtp_bf16_paged_gqa(root),
-        Some("gate-qwen35-mtp-resources") if remaining.is_empty() => {
-            gate_qwen35_mtp_resources(root)
-        }
-        Some("gate-qwen36-mtp-resources") if remaining.is_empty() => {
-            gate_qwen36_mtp_resources(root)
-        }
-        Some("perf") => perf(root, &remaining),
-        Some("profile") => profile(root, &remaining),
-        Some("remote") => remote::run(root, &remaining),
-        Some(known)
-            if matches!(
-                known,
-                "bootstrap-cuda-oxide"
-                    | "build-sm120"
-                    | "build-residual-norm"
-                    | "build-residual-bench"
-                    | "build-server"
-                    | "qualify-host"
-                    | "qualify-residual-norm"
-                    | "qualify-qwen35-residual-norm"
-                    | "qualify-qwen36-residual-norm"
-                    | "qualify-qwen36-fp8-qkv"
-                    | "qualify-qwen36-gdn-input"
-                    | "qualify-qwen36-gdn-output"
-                    | "qualify-qwen36-attention-output"
-                    | "qualify-qwen36-gdn-prepare"
-                    | "qualify-qwen36-gdn-recurrence"
-                    | "qualify-qwen35-attention-qk-prepare"
-                    | "qualify-qwen35-mtp-bf16-fusion"
-                    | "qualify-qwen35-mtp-bf16-attention"
-                    | "qualify-qwen35-mtp-bf16-mlp"
-                    | "qualify-qwen36-mtp-bf16-attention"
-                    | "qualify-qwen36-mtp-bf16-moe"
-                    | "qualify-qwen36-attention-qk-prepare"
-                    | "qualify-qwen36-fp8-attention-qk-prepare"
-                    | "qualify-qwen35-nvfp4-attention-output"
-                    | "qualify-qwen35-gdn-prepare"
-                    | "qualify-qwen35-gdn-recurrence"
-                    | "qualify-qwen35-nvfp4-gdn-output"
-                    | "qualify-fp8-qkv"
-                    | "qualify-fp8-gdn-input"
-                    | "qualify-fp8-lm-head"
-                    | "qualify-fp8-swiglu"
-                    | "qualify-fp8-down"
-                    | "qualify-nvfp4-swiglu"
-                    | "qualify-nvfp4-down"
-                    | "qualify-gdn-prepare"
-                    | "qualify-gdn-recurrence"
-                    | "qualify-gdn-output"
-                    | "qualify-attention-qk-prepare"
-                    | "qualify-paged-gqa"
-                    | "qualify-qwen35-paged-gqa"
-                    | "qualify-qwen35-long-context-kv"
-                    | "qualify-qwen36-long-context-kv"
-                    | "qualify-qwen36-paged-gqa"
-                    | "qualify-qwen36-fp8-paged-gqa"
-                    | "qualify-long-context-paged-gqa"
-                    | "qualify-attention-output"
-                    | "qualify-mtp-bf16-fusion"
-                    | "qualify-mtp-bf16-attention-output"
-                    | "qualify-mtp-bf16-mlp"
-                    | "qualify-mtp-bf16-qkv"
-                    | "qualify-mtp-bf16-qk-prepare"
-                    | "qualify-mtp-bf16-paged-gqa"
-                    | "qualify-target-mtp-verify"
-                    | "qualify-qwen35-mtp-layer"
-                    | "qualify-qwen36-mtp-layer"
-                    | "gate-residual-norm"
-                    | "gate-qwen35-residual-norm"
-                    | "gate-qwen36-residual-norm"
-                    | "gate-qwen36-nvfp4-lm-head"
-                    | "gate-qwen36-fp8-qkv"
-                    | "gate-qwen36-gdn-input"
-                    | "gate-qwen36-gdn-output"
-                    | "gate-qwen36-attention-output"
-                    | "gate-qwen35-attention-qk-prepare"
-                    | "gate-qwen36-attention-qk-prepare"
-                    | "gate-qwen36-fp8-attention-qk-prepare"
-                    | "gate-qwen35-nvfp4-attention-output"
-                    | "gate-qwen35-gdn-prepare"
-                    | "gate-qwen35-gdn-recurrence"
-                    | "gate-qwen35-bf16-lm-head"
-                    | "gate-fp8-qkv"
-                    | "gate-fp8-gdn-input"
-                    | "gate-fp8-lm-head"
-                    | "gate-fp8-swiglu"
-                    | "gate-fp8-down"
-                    | "gate-nvfp4-swiglu"
-                    | "gate-nvfp4-down"
-                    | "gate-gdn-prepare"
-                    | "gate-gdn-recurrence"
-                    | "gate-gdn-output"
-                    | "gate-attention-qk-prepare"
-                    | "gate-paged-gqa"
-                    | "gate-qwen35-paged-gqa"
-                    | "gate-qwen36-paged-gqa"
-                    | "gate-qwen36-fp8-paged-gqa"
-                    | "gate-long-context-paged-gqa"
-                    | "gate-mtp-bf16-fusion"
-                    | "gate-mtp-bf16-attention-output"
-                    | "gate-mtp-bf16-mlp"
-                    | "gate-mtp-bf16-qkv"
-                    | "gate-mtp-bf16-qk-prepare"
-                    | "gate-mtp-bf16-paged-gqa"
-                    | "gate-qwen35-mtp-resources"
-                    | "gate-qwen36-mtp-resources"
-                    | "gate-attention-output"
-            ) =>
-        {
-            Err(format!("`{known}` takes no arguments").into())
-        }
-        _ => Err(format!("unknown xtask command `{}`", command.to_string_lossy()).into()),
-    }?;
+    dispatch(root, &command, &remaining)?;
 
     require_consumed_baseline_keys()
 }
@@ -1585,6 +1624,16 @@ fn run_bench_device(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     let baseline_paths = bench_device_baselines(suite_name)?;
+
+    #[cfg(test)]
+    if let Some(intercepted) = dispatch_probe::intercept(dispatch_probe::Spawn::BenchDevice {
+        suite: suite_name.to_owned(),
+        arguments: arguments.to_vec(),
+        baselines: baseline_paths.to_vec(),
+    }) {
+        return intercepted;
+    }
+
     build_sm120_for_performance(root)?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
@@ -5284,6 +5333,15 @@ fn run_qualification_test(
     trailing: &[&str],
     environment: Option<(&str, &OsStr)>,
 ) -> Result<(), Box<dyn Error>> {
+    #[cfg(test)]
+    if let Some(intercepted) = dispatch_probe::intercept(dispatch_probe::Spawn::Qualification {
+        filter: test_filter.to_owned(),
+        trailing: trailing.iter().map(|flag| (*flag).to_owned()).collect(),
+        environment: environment.map(|(key, value)| (key.to_owned(), value.to_owned())),
+    }) {
+        return intercepted;
+    }
+
     let arguments = qualification_test_arguments(test_filter, trailing);
     run_oxide_with_env(root, &arguments, environment)
 }
@@ -12449,7 +12507,7 @@ fn require_uniform_value(
 #[cfg(test)]
 mod tests {
     use super::{
-        BENCH_DEVICE_BASELINES, COMPOSED_PERFORMANCE_SUITES, MAX_IDLE_DEVICE_MEMORY_MIB,
+        BENCH_DEVICE_BASELINES, COMPOSED_PERFORMANCE_SUITES, Handler, MAX_IDLE_DEVICE_MEMORY_MIB,
         MTP_BF16_PAGED_GQA_BENCHMARK_FILTER, MTP_LAYER_BENCHMARK_FILTER,
         MTP_LAYER_RESOURCE_BASELINES, MTP_LAYER_TEST_FILTER, OptimizationSuite, PERFORMANCE_SUITES,
         PerformanceSuite, QUALIFICATION_IGNORED_FLAGS, QUALIFICATION_IGNORED_SERIAL_FLAGS,
@@ -12458,14 +12516,16 @@ mod tests {
         QWEN35_RESIDENT_MODEL_TEST_FILTER, QWEN35_RESIDENT_MTP_TEST_FILTER,
         QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN35_TEXT_ENDPOINT_TEST_FILTER,
         QWEN36_LONG_CONTEXT_KV_TEST_FILTER, QWEN36_MTP_LAYER_TEST_FILTER,
-        QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, bench_device_baselines,
-        bench_device_command, concatenated_resource_baselines, device_is_idle, parse_baseline,
-        parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
-        parse_performance_device_sample, parse_performance_iteration, parse_resources,
-        parse_rustc_identity, preflight_performance_baselines, qualification_test_arguments,
+        QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, SUBCOMMANDS,
+        bench_device_baselines, bench_device_command, concatenated_resource_baselines,
+        device_is_idle, dispatch, dispatch_probe, parse_baseline, parse_compute_pids,
+        parse_cuda_toolkit_identity, parse_entries, parse_performance_device_sample,
+        parse_performance_iteration, parse_resources, parse_rustc_identity,
+        preflight_performance_baselines, qualification_test_arguments,
         require_consumed_baseline_keys, require_count, require_registers, require_uniform_value,
         resolve_target_output, sass_function_body, sha256, workspace_root,
     };
+    use std::collections::BTreeSet;
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::Path;
@@ -14321,5 +14381,919 @@ mod tests {
             b"betaalpha"
         );
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The router must name exactly the subcommands the legacy
+    /// `match command.to_str()` named and give each the same argument policy.
+    /// This test, not a hand-counted number, is the authority on the table.
+    #[test]
+    fn subcommand_table_matches_legacy_dispatch() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum LegacyArm {
+            /// `Some("name") if remaining.is_empty() => handler(root)`
+            Guarded,
+            /// `Some("name") => handler(root, &remaining)`
+            Forwarding,
+        }
+
+        // Transcribed from the pre-router match arms, in source order.
+        const LEGACY_DISPATCH: &[(&str, LegacyArm)] = &[
+            ("bootstrap-cuda-oxide", LegacyArm::Guarded),
+            ("build-sm120", LegacyArm::Guarded),
+            ("build-residual-norm", LegacyArm::Forwarding),
+            ("build-residual-bench", LegacyArm::Forwarding),
+            ("build-server", LegacyArm::Guarded),
+            ("qualify-frontend", LegacyArm::Forwarding),
+            ("qualify-generation", LegacyArm::Forwarding),
+            ("qualify-server", LegacyArm::Forwarding),
+            ("qualify-server-long-context", LegacyArm::Forwarding),
+            ("qualify-host", LegacyArm::Guarded),
+            ("qualify-residual-norm", LegacyArm::Guarded),
+            ("qualify-qwen35-residual-norm", LegacyArm::Guarded),
+            ("qualify-qwen36-residual-norm", LegacyArm::Guarded),
+            ("qualify-qwen35-nvfp4-swiglu", LegacyArm::Guarded),
+            ("qualify-qwen35-nvfp4-down", LegacyArm::Guarded),
+            ("qualify-qwen35-nvfp4-qkv", LegacyArm::Guarded),
+            ("qualify-qwen36-moe-router", LegacyArm::Guarded),
+            ("qualify-qwen36-moe-experts", LegacyArm::Guarded),
+            ("qualify-qwen36-nvfp4-lm-head", LegacyArm::Guarded),
+            ("qualify-qwen36-fp8-qkv", LegacyArm::Guarded),
+            ("qualify-qwen36-gdn-input", LegacyArm::Guarded),
+            ("qualify-qwen36-gdn-output", LegacyArm::Guarded),
+            ("qualify-qwen36-attention-output", LegacyArm::Guarded),
+            ("qualify-qwen36-gdn-prepare", LegacyArm::Guarded),
+            ("qualify-qwen36-gdn-recurrence", LegacyArm::Guarded),
+            ("qualify-qwen35-bf16-lm-head", LegacyArm::Forwarding),
+            ("qualify-qwen35-mtp-bf16-fusion", LegacyArm::Forwarding),
+            ("qualify-qwen35-mtp-bf16-attention", LegacyArm::Forwarding),
+            ("qualify-qwen36-mtp-bf16-attention", LegacyArm::Forwarding),
+            ("qualify-qwen36-mtp-bf16-moe", LegacyArm::Guarded),
+            ("qualify-qwen35-mtp-bf16-mlp", LegacyArm::Forwarding),
+            ("qualify-qwen35-text-endpoint", LegacyArm::Forwarding),
+            ("qualify-qwen36-text-endpoint", LegacyArm::Forwarding),
+            ("qualify-qwen36-resident-model", LegacyArm::Forwarding),
+            ("qualify-qwen36-generation", LegacyArm::Forwarding),
+            ("qualify-qwen36-server", LegacyArm::Forwarding),
+            ("qualify-qwen35-server", LegacyArm::Forwarding),
+            ("qualify-qwen35-resident-model", LegacyArm::Forwarding),
+            ("qualify-qwen35-resident-mtp", LegacyArm::Forwarding),
+            ("qualify-qwen35-mtp-generation", LegacyArm::Forwarding),
+            ("qualify-qwen35-mtp-batch-generation", LegacyArm::Forwarding),
+            ("qualify-qwen35-generation", LegacyArm::Forwarding),
+            ("qualify-qwen35-long-context-kv", LegacyArm::Guarded),
+            ("qualify-qwen36-long-context-kv", LegacyArm::Guarded),
+            ("qualify-qwen35-nvfp4-gdn-input", LegacyArm::Guarded),
+            ("qualify-qwen35-gdn-prepare", LegacyArm::Guarded),
+            ("qualify-qwen35-gdn-recurrence", LegacyArm::Guarded),
+            ("qualify-qwen35-nvfp4-gdn-output", LegacyArm::Guarded),
+            ("qualify-qwen35-nvfp4-attention-output", LegacyArm::Guarded),
+            ("qualify-qwen35-nvfp4-mlp", LegacyArm::Forwarding),
+            ("qualify-qwen35-attention-qk-prepare", LegacyArm::Guarded),
+            ("qualify-qwen36-attention-qk-prepare", LegacyArm::Guarded),
+            (
+                "qualify-qwen36-fp8-attention-qk-prepare",
+                LegacyArm::Guarded,
+            ),
+            ("qualify-fp8-qkv", LegacyArm::Guarded),
+            ("qualify-fp8-gdn-input", LegacyArm::Guarded),
+            ("qualify-fp8-lm-head", LegacyArm::Guarded),
+            ("qualify-fp8-swiglu", LegacyArm::Guarded),
+            ("qualify-fp8-down", LegacyArm::Guarded),
+            ("qualify-nvfp4-swiglu", LegacyArm::Guarded),
+            ("qualify-nvfp4-down", LegacyArm::Guarded),
+            ("qualify-nvfp4-mlp", LegacyArm::Forwarding),
+            ("qualify-gdn-prepare", LegacyArm::Guarded),
+            ("qualify-gdn-recurrence", LegacyArm::Guarded),
+            ("qualify-gdn-output", LegacyArm::Guarded),
+            ("qualify-attention-qk-prepare", LegacyArm::Guarded),
+            ("qualify-paged-gqa", LegacyArm::Guarded),
+            ("qualify-qwen35-paged-gqa", LegacyArm::Guarded),
+            ("qualify-qwen36-paged-gqa", LegacyArm::Guarded),
+            ("qualify-qwen36-fp8-paged-gqa", LegacyArm::Guarded),
+            ("qualify-long-context-paged-gqa", LegacyArm::Guarded),
+            ("qualify-attention-output", LegacyArm::Guarded),
+            ("qualify-mtp-bf16-fusion", LegacyArm::Forwarding),
+            ("qualify-mtp-bf16-attention-output", LegacyArm::Forwarding),
+            ("qualify-mtp-bf16-mlp", LegacyArm::Forwarding),
+            ("qualify-mtp-bf16-qkv", LegacyArm::Forwarding),
+            ("qualify-mtp-bf16-qk-prepare", LegacyArm::Forwarding),
+            ("qualify-mtp-bf16-paged-gqa", LegacyArm::Guarded),
+            ("qualify-dense-fp8-mlp", LegacyArm::Forwarding),
+            ("qualify-dense-fp8-gdn-layer", LegacyArm::Forwarding),
+            ("qualify-full-attention-layer", LegacyArm::Forwarding),
+            ("qualify-mtp-layer", LegacyArm::Forwarding),
+            ("qualify-qwen35-mtp-layer", LegacyArm::Forwarding),
+            ("qualify-qwen36-mtp-layer", LegacyArm::Forwarding),
+            ("qualify-target-mtp-verify", LegacyArm::Forwarding),
+            ("qualify-mtp-prompt-prime", LegacyArm::Forwarding),
+            ("qualify-resident-mtp", LegacyArm::Forwarding),
+            ("qualify-generation-mtp-greedy", LegacyArm::Forwarding),
+            ("qualify-generation-mtp-sampling", LegacyArm::Forwarding),
+            ("qualify-generation-mtp-batch", LegacyArm::Forwarding),
+            ("qualify-qwen35-full-attention-layer", LegacyArm::Forwarding),
+            ("qualify-qwen36-full-attention-layer", LegacyArm::Forwarding),
+            ("qualify-qwen35-gdn-layer", LegacyArm::Forwarding),
+            ("qualify-qwen36-gdn-moe-layer", LegacyArm::Forwarding),
+            ("qualify-resident-model", LegacyArm::Forwarding),
+            ("qualify-resident-generation", LegacyArm::Forwarding),
+            ("qualify-resident-batch-generation", LegacyArm::Forwarding),
+            ("qualify-text-endpoint", LegacyArm::Forwarding),
+            ("bench-startup", LegacyArm::Forwarding),
+            ("bench-server", LegacyArm::Forwarding),
+            ("bench-residual-norm", LegacyArm::Forwarding),
+            ("bench-qwen35-residual-norm", LegacyArm::Forwarding),
+            ("bench-qwen36-residual-norm", LegacyArm::Forwarding),
+            ("bench-qwen35-nvfp4-swiglu", LegacyArm::Forwarding),
+            ("bench-qwen35-nvfp4-down", LegacyArm::Forwarding),
+            ("bench-qwen35-nvfp4-qkv", LegacyArm::Forwarding),
+            ("bench-qwen36-moe-router", LegacyArm::Forwarding),
+            ("bench-qwen36-moe-experts", LegacyArm::Forwarding),
+            ("bench-qwen36-nvfp4-lm-head", LegacyArm::Forwarding),
+            ("bench-qwen36-fp8-qkv", LegacyArm::Forwarding),
+            ("bench-qwen36-gdn-input", LegacyArm::Forwarding),
+            ("bench-qwen36-gdn-output", LegacyArm::Forwarding),
+            ("bench-qwen36-attention-output", LegacyArm::Forwarding),
+            ("bench-qwen36-gdn-prepare", LegacyArm::Forwarding),
+            ("bench-qwen36-gdn-recurrence", LegacyArm::Forwarding),
+            ("bench-qwen35-nvfp4-gdn-input", LegacyArm::Forwarding),
+            ("bench-qwen35-gdn-prepare", LegacyArm::Forwarding),
+            ("bench-qwen35-gdn-recurrence", LegacyArm::Forwarding),
+            ("bench-qwen35-nvfp4-gdn-output", LegacyArm::Forwarding),
+            ("bench-qwen35-nvfp4-attention-output", LegacyArm::Forwarding),
+            ("bench-qwen35-nvfp4-mlp", LegacyArm::Forwarding),
+            ("bench-qwen35-attention-qk-prepare", LegacyArm::Forwarding),
+            ("bench-qwen36-attention-qk-prepare", LegacyArm::Forwarding),
+            (
+                "bench-qwen36-fp8-attention-qk-prepare",
+                LegacyArm::Forwarding,
+            ),
+            ("bench-fp8-qkv", LegacyArm::Forwarding),
+            ("bench-fp8-gdn-input", LegacyArm::Forwarding),
+            ("bench-fp8-lm-head", LegacyArm::Forwarding),
+            ("bench-fp8-swiglu", LegacyArm::Forwarding),
+            ("bench-fp8-down", LegacyArm::Forwarding),
+            ("bench-nvfp4-swiglu", LegacyArm::Forwarding),
+            ("bench-nvfp4-down", LegacyArm::Forwarding),
+            ("bench-nvfp4-mlp", LegacyArm::Forwarding),
+            ("bench-gdn-prepare", LegacyArm::Forwarding),
+            ("bench-gdn-recurrence", LegacyArm::Forwarding),
+            ("bench-gdn-output", LegacyArm::Forwarding),
+            ("bench-attention-qk-prepare", LegacyArm::Forwarding),
+            ("bench-paged-gqa", LegacyArm::Forwarding),
+            ("bench-qwen35-paged-gqa", LegacyArm::Forwarding),
+            ("bench-qwen36-paged-gqa", LegacyArm::Forwarding),
+            ("bench-qwen36-fp8-paged-gqa", LegacyArm::Forwarding),
+            ("bench-long-context-paged-gqa", LegacyArm::Forwarding),
+            ("bench-attention-output", LegacyArm::Forwarding),
+            ("bench-mtp-bf16-fusion", LegacyArm::Forwarding),
+            ("bench-mtp-bf16-attention-output", LegacyArm::Forwarding),
+            ("bench-mtp-bf16-mlp", LegacyArm::Forwarding),
+            ("bench-mtp-bf16-qkv", LegacyArm::Forwarding),
+            ("bench-mtp-bf16-qk-prepare", LegacyArm::Forwarding),
+            ("bench-mtp-bf16-paged-gqa", LegacyArm::Forwarding),
+            ("bench-dense-fp8-mlp", LegacyArm::Forwarding),
+            ("bench-dense-fp8-gdn-layer", LegacyArm::Forwarding),
+            ("bench-full-attention-layer", LegacyArm::Forwarding),
+            ("bench-mtp-layer", LegacyArm::Forwarding),
+            ("bench-qwen35-mtp-layer", LegacyArm::Forwarding),
+            ("bench-qwen36-mtp-layer", LegacyArm::Forwarding),
+            ("bench-target-mtp-verify", LegacyArm::Forwarding),
+            ("bench-mtp-prompt-prime", LegacyArm::Forwarding),
+            ("bench-resident-mtp", LegacyArm::Forwarding),
+            ("bench-qwen35-resident-mtp", LegacyArm::Forwarding),
+            ("bench-qwen35-mtp-generation", LegacyArm::Forwarding),
+            ("bench-qwen35-mtp-batch-generation", LegacyArm::Forwarding),
+            ("bench-generation-mtp-greedy", LegacyArm::Forwarding),
+            ("bench-generation-mtp-sampling", LegacyArm::Forwarding),
+            ("bench-generation-mtp-batch", LegacyArm::Forwarding),
+            ("bench-qwen35-full-attention-layer", LegacyArm::Forwarding),
+            ("bench-qwen35-gdn-layer", LegacyArm::Forwarding),
+            ("bench-qwen36-gdn-moe-layer", LegacyArm::Forwarding),
+            ("bench-qwen36-full-attention-layer", LegacyArm::Forwarding),
+            ("bench-qwen35-text-endpoint", LegacyArm::Forwarding),
+            ("bench-qwen36-text-endpoint", LegacyArm::Forwarding),
+            ("bench-qwen35-resident-model", LegacyArm::Forwarding),
+            ("bench-qwen36-resident-model", LegacyArm::Forwarding),
+            ("bench-resident-model", LegacyArm::Forwarding),
+            ("bench-resident-prefill", LegacyArm::Forwarding),
+            ("bench-resident-long-context-model", LegacyArm::Forwarding),
+            ("bench-text-endpoint", LegacyArm::Forwarding),
+            ("gate-residual-norm", LegacyArm::Guarded),
+            ("gate-qwen35-residual-norm", LegacyArm::Guarded),
+            ("gate-qwen36-residual-norm", LegacyArm::Guarded),
+            ("gate-qwen35-nvfp4-swiglu", LegacyArm::Guarded),
+            ("gate-qwen35-nvfp4-down", LegacyArm::Guarded),
+            ("gate-qwen35-nvfp4-qkv", LegacyArm::Guarded),
+            ("gate-qwen35-bf16-lm-head", LegacyArm::Guarded),
+            ("gate-qwen36-moe-router", LegacyArm::Guarded),
+            ("gate-qwen36-moe-experts", LegacyArm::Guarded),
+            ("gate-qwen36-nvfp4-lm-head", LegacyArm::Guarded),
+            ("gate-qwen36-fp8-qkv", LegacyArm::Guarded),
+            ("gate-qwen36-gdn-input", LegacyArm::Guarded),
+            ("gate-qwen36-gdn-output", LegacyArm::Guarded),
+            ("gate-qwen35-nvfp4-gdn-input", LegacyArm::Guarded),
+            ("gate-qwen35-gdn-prepare", LegacyArm::Guarded),
+            ("gate-qwen35-gdn-recurrence", LegacyArm::Guarded),
+            ("gate-qwen35-nvfp4-attention-output", LegacyArm::Guarded),
+            ("gate-qwen35-attention-qk-prepare", LegacyArm::Guarded),
+            ("gate-qwen36-attention-qk-prepare", LegacyArm::Guarded),
+            ("gate-qwen36-fp8-attention-qk-prepare", LegacyArm::Guarded),
+            ("gate-fp8-qkv", LegacyArm::Guarded),
+            ("gate-fp8-gdn-input", LegacyArm::Guarded),
+            ("gate-fp8-lm-head", LegacyArm::Guarded),
+            ("gate-fp8-swiglu", LegacyArm::Guarded),
+            ("gate-fp8-down", LegacyArm::Guarded),
+            ("gate-nvfp4-swiglu", LegacyArm::Guarded),
+            ("gate-nvfp4-down", LegacyArm::Guarded),
+            ("gate-gdn-prepare", LegacyArm::Guarded),
+            ("gate-gdn-recurrence", LegacyArm::Guarded),
+            ("gate-gdn-output", LegacyArm::Guarded),
+            ("gate-attention-qk-prepare", LegacyArm::Guarded),
+            ("gate-paged-gqa", LegacyArm::Guarded),
+            ("gate-qwen35-paged-gqa", LegacyArm::Guarded),
+            ("gate-qwen36-paged-gqa", LegacyArm::Guarded),
+            ("gate-qwen36-fp8-paged-gqa", LegacyArm::Guarded),
+            ("gate-qwen36-attention-output", LegacyArm::Guarded),
+            ("gate-long-context-paged-gqa", LegacyArm::Guarded),
+            ("gate-attention-output", LegacyArm::Guarded),
+            ("gate-mtp-bf16-fusion", LegacyArm::Guarded),
+            ("gate-mtp-bf16-attention-output", LegacyArm::Guarded),
+            ("gate-mtp-bf16-mlp", LegacyArm::Guarded),
+            ("gate-mtp-bf16-qkv", LegacyArm::Guarded),
+            ("gate-mtp-bf16-qk-prepare", LegacyArm::Guarded),
+            ("gate-mtp-bf16-paged-gqa", LegacyArm::Guarded),
+            ("gate-qwen35-mtp-resources", LegacyArm::Guarded),
+            ("gate-qwen36-mtp-resources", LegacyArm::Guarded),
+            ("perf", LegacyArm::Forwarding),
+            ("profile", LegacyArm::Forwarding),
+            ("remote", LegacyArm::Forwarding),
+        ];
+
+        assert_eq!(LEGACY_DISPATCH.len(), 223);
+        assert_eq!(SUBCOMMANDS.len(), LEGACY_DISPATCH.len());
+
+        let names = SUBCOMMANDS
+            .iter()
+            .map(|subcommand| subcommand.name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), SUBCOMMANDS.len(), "the table repeats a name");
+        assert_eq!(
+            names,
+            LEGACY_DISPATCH
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<BTreeSet<_>>()
+        );
+
+        let root = workspace_root().unwrap();
+        let stray = [OsString::from("--stray")];
+        for &(name, arm) in LEGACY_DISPATCH {
+            let subcommand = SUBCOMMANDS
+                .iter()
+                .find(|subcommand| subcommand.name == name)
+                .unwrap();
+            let policy = match subcommand.run {
+                Handler::NoArguments(_) => LegacyArm::Guarded,
+                Handler::Forwarded(_) => LegacyArm::Forwarding,
+            };
+            assert_eq!(policy, arm, "`{name}` argument policy");
+
+            if arm == LegacyArm::Guarded {
+                // `require_no_args` runs before the handler, so this never
+                // spawns. The legacy dispatch reached this message through a
+                // hand-maintained `matches!` list that had drifted: 13 guarded
+                // arms it omitted reported `unknown xtask command` for a stray
+                // argument, and 14 names it listed were already unreachable.
+                // The router derives the message from the row instead.
+                let error = dispatch(root, OsStr::new(name), &stray).unwrap_err();
+                assert_eq!(error.to_string(), format!("`{name}` takes no arguments"));
+            }
+        }
+
+        let error = dispatch(root, OsStr::new("qualify-nothing"), &[]).unwrap_err();
+        assert_eq!(error.to_string(), "unknown xtask command `qualify-nothing`");
+    }
+
+    /// Every canonical `bench-device` subcommand must reach the handler that
+    /// names its own suite, forwards its arguments unchanged, and resolves the
+    /// baselines that suite declares. Subcommand, handler and suite are bound
+    /// in one chain here, so a call site that named a sibling's suite surfaces
+    /// as a failure rather than as a silently mis-hashed run;
+    /// `bench_device_command_reproduces_legacy_argv` remains the authority on
+    /// which files each suite declares.
+    #[test]
+    fn bench_device_subcommands_bind_their_suite() {
+        // The `bench-*` subcommands that do not run a `bench-device` suite:
+        // the startup and server harnesses and the `PerformanceSuite`
+        // comparator commands, transcribed from their handlers.
+        const HOST_BENCH_SUBCOMMANDS: &[&str] = &[
+            "bench-startup",
+            "bench-server",
+            "bench-residual-norm",
+            "bench-fp8-qkv",
+            "bench-fp8-gdn-input",
+            "bench-fp8-lm-head",
+            "bench-fp8-swiglu",
+            "bench-fp8-down",
+            "bench-nvfp4-swiglu",
+            "bench-nvfp4-down",
+            "bench-gdn-prepare",
+            "bench-gdn-recurrence",
+            "bench-gdn-output",
+            "bench-attention-qk-prepare",
+            "bench-paged-gqa",
+            "bench-long-context-paged-gqa",
+            "bench-attention-output",
+            "bench-mtp-bf16-fusion",
+            "bench-mtp-bf16-attention-output",
+            "bench-mtp-bf16-mlp",
+            "bench-mtp-bf16-qkv",
+            "bench-mtp-bf16-qk-prepare",
+            "bench-mtp-bf16-paged-gqa",
+        ];
+
+        let arguments = [
+            OsString::from("/snapshot"),
+            OsString::from("--batch"),
+            OsString::from("8"),
+        ];
+
+        for (suite, baselines) in BENCH_DEVICE_BASELINES {
+            let command = format!("bench-{suite}");
+            assert_eq!(
+                dispatch_probe::observe(&command, &arguments),
+                dispatch_probe::Spawn::BenchDevice {
+                    suite: (*suite).to_owned(),
+                    arguments: arguments.to_vec(),
+                    baselines: baselines.to_vec(),
+                },
+                "`{command}`"
+            );
+        }
+
+        // No other `bench-*` row may reach `run_bench_device`: every device
+        // suite is named by exactly one subcommand, and that subcommand is
+        // `bench-` followed by the suite.
+        let device = BENCH_DEVICE_BASELINES
+            .iter()
+            .map(|(suite, _)| format!("bench-{suite}"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(device.len(), BENCH_DEVICE_BASELINES.len());
+        let rows = SUBCOMMANDS
+            .iter()
+            .map(|subcommand| subcommand.name)
+            .filter(|name| name.starts_with("bench-"))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            rows,
+            device
+                .union(
+                    &HOST_BENCH_SUBCOMMANDS
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect()
+                )
+                .cloned()
+                .collect()
+        );
+    }
+
+    /// Every canonical `qualify-*` subcommand must reach the handler that runs
+    /// its own test filter, under its own harness flags and its own snapshot
+    /// variable. Together with `qualification_test_arguments_reproduce_legacy_argv`
+    /// this binds the whole chain: subcommand, handler, filter, spawned argv.
+    #[test]
+    fn qualification_subcommands_bind_their_test_filter() {
+        // The four harness flag lists, transcribed as literals so a retargeted
+        // `QUALIFICATION_*_FLAGS` constant cannot make a row pass vacuously.
+        const SERIAL: &[&str] = &["--include-ignored", "--nocapture", "--test-threads=1"];
+        const IGNORED: &[&str] = &["--include-ignored", "--nocapture"];
+        const EXACT_SERIAL: &[&str] = &[
+            "--exact",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ];
+        const SERIAL_SKIPPING_FP8_QKV: &[&str] = &[
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+            "--skip",
+            "qwen36_fp8_qkv",
+        ];
+        const NO_SNAPSHOT: Option<&str> = None;
+        const SNAPSHOT: Option<&str> = Some("TUISKO_SNAPSHOT");
+        const QWEN35_SNAPSHOT: Option<&str> = Some("TUISKO_QWEN35_SNAPSHOT");
+        const QWEN36_SNAPSHOT: Option<&str> = Some("TUISKO_QWEN36_SNAPSHOT");
+
+        // (subcommand, the filter its handler runs first, that call's harness
+        // flags, the snapshot variable it binds) — transcribed from the
+        // handler bodies, in dispatch order.
+        const LEGACY_QUALIFICATION_ROUTES: &[(&str, &str, &[&str], Option<&str>)] = &[
+            (
+                "qualify-residual-norm",
+                "residual_norm_suite_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-residual-norm",
+                "qwen35_residual_norm",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-residual-norm",
+                "qwen36_residual_norm",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-nvfp4-swiglu",
+                "qwen35_nvfp4_swiglu",
+                IGNORED,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-nvfp4-down",
+                "qwen35_nvfp4_down",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-nvfp4-qkv",
+                "qwen35_nvfp4_qkv",
+                IGNORED,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-moe-router",
+                "qwen36_moe_router::tests::exact_routes_match_independent_oracles_and_graph_replay",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-moe-experts",
+                "qwen36_moe_experts::tests::exact_routes_match_independent_oracles_and_graph_replay",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-nvfp4-lm-head",
+                "qwen36_nvfp4_lm_head",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-fp8-qkv",
+                "qwen36_fp8_qkv",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-gdn-input",
+                "qwen36_gdn_input",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-gdn-output",
+                "qwen36_gdn_output::tests::exact_routes_match_independent_oracles_and_graph_replay",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-attention-output",
+                "qwen36_attention_output",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-gdn-prepare",
+                "qwen35_gdn_prepare::tests::qwen36_exact_routes_match_shared_independent_oracle",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-gdn-recurrence",
+                "qwen35_gdn_recurrence::tests::qwen36_exact_routes_match_shared_independent_oracle",
+                EXACT_SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-bf16-lm-head",
+                "qwen35_bf16_lm_head::tests",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-mtp-bf16-fusion",
+                "qwen35_fusion_suite_",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-mtp-bf16-attention",
+                "qwen35_mtp_",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-mtp-bf16-attention",
+                "qwen36_mtp_",
+                SERIAL,
+                QWEN36_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-mtp-bf16-moe",
+                "qwen36_mtp_bf16_moe_suite_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-mtp-bf16-mlp",
+                "qwen35_mtp_mlp_suite_",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-text-endpoint",
+                "qwen35_text_endpoint_suite_",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-text-endpoint",
+                "qwen36_text_endpoint::tests",
+                SERIAL,
+                QWEN36_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-resident-model",
+                "qwen36_resident_model",
+                SERIAL,
+                QWEN36_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-generation",
+                "qwen36_generation::tests",
+                SERIAL,
+                QWEN36_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-resident-model",
+                "qwen35_resident_model_suite_",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-resident-mtp",
+                "qwen35_resident_mtp_suite_",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-mtp-generation",
+                "qwen35_mtp_generation_suite_",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-mtp-batch-generation",
+                "qwen35_mtp_batch_generation_suite_",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-generation",
+                "qwen35_generation::tests",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-long-context-kv",
+                "qwen35_long_context_kv::tests",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-long-context-kv",
+                "qwen36_long_context_kv::tests",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-nvfp4-gdn-input",
+                "qwen35_nvfp4_gdn_input",
+                IGNORED,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-gdn-prepare",
+                "qwen35_gdn_prepare",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-gdn-recurrence",
+                "qwen35_gdn_recurrence",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-nvfp4-gdn-output",
+                "qwen35_nvfp4_gdn_output",
+                IGNORED,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-nvfp4-attention-output",
+                "qwen35_nvfp4_attention_output::tests::exact_batches_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-nvfp4-mlp",
+                "nvfp4_mlp::tests::qwen35_source_layer0_matches_complete_oracles_and_graph_replay",
+                IGNORED,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-attention-qk-prepare",
+                "attention_qk_prepare::tests::qwen35_",
+                IGNORED,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-attention-qk-prepare",
+                "attention_qk_prepare::tests::qwen36_exact_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-fp8-attention-qk-prepare",
+                "attention_qk_prepare::tests::qwen36_fp8_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-fp8-qkv",
+                "fp8_qkv",
+                SERIAL_SKIPPING_FP8_QKV,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-fp8-gdn-input",
+                "fp8_gdn_input",
+                IGNORED,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-fp8-swiglu",
+                "fp8_swiglu_suite_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            ("qualify-fp8-down", "fp8_down_suite_", SERIAL, NO_SNAPSHOT),
+            ("qualify-nvfp4-swiglu", "nvfp4_swiglu", IGNORED, NO_SNAPSHOT),
+            ("qualify-nvfp4-down", "nvfp4_down", IGNORED, NO_SNAPSHOT),
+            (
+                "qualify-nvfp4-mlp",
+                "nvfp4_mlp::tests::source_layer55_matches_complete_oracles_and_graph_replay",
+                IGNORED,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-gdn-prepare",
+                "gdn_prepare::tests",
+                IGNORED,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-gdn-recurrence",
+                "gdn_recurrence::tests::route_inventory_and_arena_accounting_are_exact",
+                EXACT_SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-gdn-output",
+                "gdn_output::tests",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-attention-qk-prepare",
+                "attention_qk_prepare",
+                IGNORED,
+                NO_SNAPSHOT,
+            ),
+            ("qualify-paged-gqa", "paged_gqa_suite_", SERIAL, NO_SNAPSHOT),
+            (
+                "qualify-qwen35-paged-gqa",
+                "paged_gqa::tests::qwen35_bf16_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-paged-gqa",
+                "paged_gqa::tests::qwen36_bf16_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-fp8-paged-gqa",
+                "paged_gqa::tests::qwen36_fp8_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-long-context-paged-gqa",
+                "long_context_paged_gqa",
+                IGNORED,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-attention-output",
+                "attention_output::tests::attention_output_suite_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-mtp-bf16-fusion",
+                "mtp_bf16_fusion_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-mtp-bf16-attention-output",
+                "mtp_bf16_attention_output_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-mtp-bf16-mlp",
+                "mtp_bf16_mlp_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-mtp-bf16-qkv",
+                "mtp_bf16_qkv_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-mtp-bf16-qk-prepare",
+                "mtp_bf16_qk_prepare_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-mtp-bf16-paged-gqa",
+                "mtp_bf16_paged_gqa_suite_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-dense-fp8-mlp",
+                "dense_fp8_mlp_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-dense-fp8-gdn-layer",
+                "dense_fp8_gdn_layer::tests::source_layer60_matches_complete_seam_oracles_and_graph_replay",
+                IGNORED,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-full-attention-layer",
+                "full_attention_layer_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-mtp-layer",
+                "mtp_layer::tests::mtp_layer_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-mtp-layer",
+                "qwen35_mtp_layer_suite_",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-mtp-layer",
+                "qwen36_mtp_layer_suite_",
+                SERIAL,
+                QWEN36_SNAPSHOT,
+            ),
+            (
+                "qualify-target-mtp-verify",
+                "target_mtp_verify::tests::exact_target_verify_and_commit_match_source_oracles",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-mtp-prompt-prime",
+                "mtp_prompt_prime_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-resident-mtp",
+                "resident_mtp_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-generation-mtp-greedy",
+                "resident_mtp_generation_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-generation-mtp-sampling",
+                "resident_mtp_sampling_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-generation-mtp-batch",
+                "resident_mtp_batch_suite_",
+                SERIAL,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-full-attention-layer",
+                "qwen35_full_attention_layer::tests",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-full-attention-layer",
+                "qwen36_full_attention_layer::tests",
+                SERIAL,
+                QWEN36_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen35-gdn-layer",
+                "qwen35_gdn_layer::tests",
+                SERIAL,
+                QWEN35_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen36-gdn-moe-layer",
+                "qwen36_gdn_moe_layer::tests",
+                SERIAL,
+                QWEN36_SNAPSHOT,
+            ),
+            (
+                "qualify-resident-model",
+                "resident_model::tests::source_model_matches_final_oracle_and_exact_graph_replay",
+                IGNORED,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-resident-generation",
+                "resident_generation::tests::source_frontend_generation_matches_vllm_tokens_and_streaming",
+                IGNORED,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-resident-batch-generation",
+                "resident_batch_generation::tests::compact_scheduler_matches_sequential_requests_and_recycles_holes",
+                IGNORED,
+                SNAPSHOT,
+            ),
+            (
+                "qualify-text-endpoint",
+                "text_endpoint::tests::source_endpoint_matches_independent_oracles_and_graph_replay",
+                IGNORED,
+                SNAPSHOT,
+            ),
+        ];
+
+        assert_eq!(LEGACY_QUALIFICATION_ROUTES.len(), 84);
+
+        let snapshot = OsString::from("/snapshot");
+        for &(command, filter, trailing, variable) in LEGACY_QUALIFICATION_ROUTES {
+            let arguments: &[OsString] = match variable {
+                Some(_) => std::slice::from_ref(&snapshot),
+                None => &[],
+            };
+            assert_eq!(
+                dispatch_probe::observe(command, arguments),
+                dispatch_probe::Spawn::Qualification {
+                    filter: filter.to_owned(),
+                    trailing: trailing.iter().map(|flag| (*flag).to_owned()).collect(),
+                    environment: variable.map(|key| (key.to_owned(), snapshot.clone())),
+                },
+                "`{command}`"
+            );
+        }
     }
 }
