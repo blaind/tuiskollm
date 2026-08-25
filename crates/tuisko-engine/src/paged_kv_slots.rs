@@ -76,6 +76,8 @@ impl PagedKvTableUpdate {
 #[derive(Debug)]
 pub struct PagedKvSlotPool {
     physical_pages: usize,
+    table_stride: usize,
+    max_context_tokens: usize,
     page_tables: Box<[u32]>,
     page_owners: Box<[u8]>,
     states: [PagedKvSlotState; MAX_BATCH],
@@ -93,12 +95,43 @@ impl PagedKvSlotPool {
                 "paged KV slot pool has {physical_pages} pages, maximum is {LONG_CONTEXT_PHYSICAL_PAGES}"
             )));
         }
+
+        Self::new_with_limits(
+            physical_pages,
+            LONG_CONTEXT_PHYSICAL_PAGES,
+            MAX_CONTEXT_TOKENS,
+        )
+    }
+
+    pub(crate) fn new_with_limits(
+        physical_pages: usize,
+        table_stride: usize,
+        max_context_tokens: usize,
+    ) -> EngineResult<Self> {
+        if table_stride == 0 {
+            return Err(EngineError::layout("paged KV table stride must be nonzero"));
+        }
+        let table_capacity = table_stride
+            .checked_mul(ATTENTION_PAGE_SIZE)
+            .ok_or_else(|| EngineError::layout("paged KV table capacity overflows"))?;
+        if max_context_tokens == 0 || max_context_tokens > table_capacity {
+            return Err(EngineError::layout(format!(
+                "paged KV maximum context {max_context_tokens} is outside 1..={table_capacity}"
+            )));
+        }
+        if physical_pages > table_stride {
+            return Err(EngineError::layout(format!(
+                "paged KV pool has {physical_pages} physical pages, table stride is {table_stride}"
+            )));
+        }
         let table_entries = MAX_BATCH
-            .checked_mul(LONG_CONTEXT_PHYSICAL_PAGES)
+            .checked_mul(table_stride)
             .ok_or_else(|| EngineError::layout("paged KV page-table entries overflow"))?;
 
         Ok(Self {
             physical_pages,
+            table_stride,
+            max_context_tokens,
             page_tables: vec![UNUSED_PAGE; table_entries].into_boxed_slice(),
             page_owners: vec![FREE_PAGE_OWNER; physical_pages].into_boxed_slice(),
             states: [PagedKvSlotState::Vacant; MAX_BATCH],
@@ -186,9 +219,10 @@ impl PagedKvSlotPool {
     ) -> EngineResult<PagedKvTableUpdate> {
         require_slot(slot)?;
         require_active(self.states[slot], slot)?;
-        if token_count > MAX_CONTEXT_TOKENS {
+        if token_count > self.max_context_tokens {
             return Err(EngineError::generation(format!(
-                "paged KV slot {slot} requires {token_count} tokens, maximum is {MAX_CONTEXT_TOKENS}"
+                "paged KV slot {slot} requires {token_count} tokens, maximum is {}",
+                self.max_context_tokens
             )));
         }
         if token_count < self.token_counts[slot] {
@@ -208,7 +242,7 @@ impl PagedKvSlotPool {
             )));
         }
 
-        let table_begin = table_row_begin(slot)?;
+        let table_begin = self.table_row_begin(slot)?;
         let mut search = self.next_free_hint;
         for entry in existing_pages..required_pages {
             while search < self.physical_pages && self.page_owners[search] != FREE_PAGE_OWNER {
@@ -254,7 +288,7 @@ impl PagedKvSlotPool {
 
         let retained_pages = token_count.div_ceil(ATTENTION_PAGE_SIZE);
         let existing_pages = self.page_counts[slot];
-        let table_begin = table_row_begin(slot)?;
+        let table_begin = self.table_row_begin(slot)?;
         for entry in retained_pages..existing_pages {
             let table_index = table_begin + entry;
             let physical_page = usize::try_from(self.page_tables[table_index])
@@ -291,8 +325,8 @@ impl PagedKvSlotPool {
     /// Full stable device-table row, with unused columns set to `u32::MAX`.
     pub fn page_table(&self, slot: usize) -> EngineResult<&[u32]> {
         require_slot(slot)?;
-        let begin = table_row_begin(slot)?;
-        Ok(&self.page_tables[begin..begin + LONG_CONTEXT_PHYSICAL_PAGES])
+        let begin = self.table_row_begin(slot)?;
+        Ok(&self.page_tables[begin..begin + self.table_stride])
     }
 
     /// Physical route for one already-owned cached position.
@@ -317,6 +351,11 @@ impl PagedKvSlotPool {
             page_offset: position % ATTENTION_PAGE_SIZE,
         })
     }
+
+    fn table_row_begin(&self, slot: usize) -> EngineResult<usize> {
+        slot.checked_mul(self.table_stride)
+            .ok_or_else(|| EngineError::layout("paged KV table row offset overflows"))
+    }
 }
 
 fn require_slot(slot: usize) -> EngineResult<()> {
@@ -335,11 +374,6 @@ fn require_active(state: PagedKvSlotState, slot: usize) -> EngineResult<()> {
         )));
     }
     Ok(())
-}
-
-fn table_row_begin(slot: usize) -> EngineResult<usize> {
-    slot.checked_mul(LONG_CONTEXT_PHYSICAL_PAGES)
-        .ok_or_else(|| EngineError::layout("paged KV table row offset overflows"))
 }
 
 #[cfg(test)]
@@ -497,5 +531,18 @@ mod tests {
         pool.recycle(0).unwrap();
         assert_eq!(pool.page_table(0).unwrap().as_ptr(), table_address);
         assert_eq!(pool.host_allocation_bytes(), allocation_bytes);
+    }
+
+    #[test]
+    fn exact_qwen35_limits_reuse_the_allocation_free_owner() {
+        let mut pool = PagedKvSlotPool::new_with_limits(4_096, 4_096, 262_144).unwrap();
+        pool.activate(7).unwrap();
+        pool.reserve_tokens(7, 262_144).unwrap();
+
+        assert_eq!(pool.page_table(7).unwrap().len(), 4_096);
+        assert_eq!(pool.page_count(7).unwrap(), 4_096);
+        assert_eq!(pool.route(7, 262_143).unwrap().physical_page(), 4_095);
+        assert_eq!(pool.route(7, 262_143).unwrap().page_offset(), 63);
+        assert_eq!(pool.host_allocation_bytes(), 8 * 4_096 * 4 + 4_096);
     }
 }
