@@ -5,6 +5,8 @@ use crate::nvfp4_down_sm120::{
     Nvfp4DownQualification, Nvfp4DownQualificationError, bf16_to_f32, decode_e2m1, decode_e4m3fn,
     f32_to_bf16,
 };
+use crate::oracles::codecs;
+use crate::oracles::codecs::encode_e2m1;
 use crate::target::Qwen35Nvfp4DownOp;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
@@ -695,45 +697,12 @@ fn scale_offset(row: usize, group: usize) -> usize {
         + scale_lane
 }
 
-fn encode_e2m1(value: f32) -> u8 {
-    let mut best = 0u8;
-    let mut best_distance = f32::INFINITY;
-    let candidates = if value.is_sign_negative() {
-        8u8..16
-    } else {
-        0u8..8
-    };
-
-    for code in candidates {
-        let distance = (value - decode_e2m1(code)).abs();
-        if distance < best_distance || (distance == best_distance && code & 1 == 0) {
-            best = code;
-            best_distance = distance;
-        }
-    }
-
-    best
-}
-
 fn encode_e4m3fn(value: f32) -> Result<u8, Nvfp4DownQualificationError> {
-    if !value.is_finite() || value < 0.0 {
-        return Err(Nvfp4DownQualificationError::Mismatch(
+    codecs::encode_e4m3fn_scale(value).ok_or_else(|| {
+        Nvfp4DownQualificationError::Mismatch(
             "Qwen3.5 oracle E4M3 scale is not finite and non-negative".to_string(),
-        ));
-    }
-
-    let mut best = 0u8;
-    let mut best_distance = f32::INFINITY;
-    for code in 0u8..=0x7e {
-        let represented = decode_e4m3fn(code)?;
-        let distance = (value - represented).abs();
-        if distance < best_distance || (distance == best_distance && code & 1 == 0) {
-            best = code;
-            best_distance = distance;
-        }
-    }
-
-    Ok(best)
+        )
+    })
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 //! Source-backed qualification for one resident NVFP4 MLP owner.
 
 use crate::fp8_projection_oracle::{BF16_SENTINEL, BYTE_SENTINEL, bf16_to_f32, f32_to_bf16};
+use crate::oracles::codecs::{self, decode_e2m1, encode_e2m1};
 use crate::residual_norm::rms_norm_oracle;
 use crate::{DeviceBenchmarkError, device_benchmark};
 use std::path::Path;
@@ -1203,72 +1204,18 @@ fn require_close(
     Ok(())
 }
 
-fn encode_e2m1(value: f32) -> u8 {
-    let mut best = 0u8;
-    let mut best_distance = f32::INFINITY;
-    let candidates = if value.is_sign_negative() {
-        8u8..16
-    } else {
-        0u8..8
-    };
-
-    for code in candidates {
-        let distance = (value - decode_e2m1(code)).abs();
-        if distance < best_distance || (distance == best_distance && code & 1 == 0) {
-            best = code;
-            best_distance = distance;
-        }
-    }
-
-    best
-}
-
-fn decode_e2m1(code: u8) -> f32 {
-    const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let magnitude = MAGNITUDES[(code & 7) as usize];
-
-    if code & 8 == 0 { magnitude } else { -magnitude }
-}
-
 fn encode_e4m3fn(value: f32) -> Result<u8, Nvfp4MlpQualificationError> {
-    if !value.is_finite() || value < 0.0 {
-        return Err(Nvfp4MlpQualificationError::Mismatch(
+    codecs::encode_e4m3fn_scale(value).ok_or_else(|| {
+        Nvfp4MlpQualificationError::Mismatch(
             "oracle E4M3 scale is not finite and non-negative".to_string(),
-        ));
-    }
-
-    let mut best = 0u8;
-    let mut best_distance = f32::INFINITY;
-    for code in 0u8..=0x7e {
-        let represented = decode_e4m3fn(code)?;
-        let distance = (value - represented).abs();
-        if distance < best_distance || (distance == best_distance && code & 1 == 0) {
-            best = code;
-            best_distance = distance;
-        }
-    }
-
-    Ok(best)
+        )
+    })
 }
 
 fn decode_e4m3fn(word: u8) -> Result<f32, Nvfp4MlpQualificationError> {
-    let sign = if word & 0x80 == 0 { 1.0 } else { -1.0 };
-    let exponent = (word >> 3) & 15;
-    let fraction = word & 7;
-    let magnitude = match (exponent, fraction) {
-        (0, 0) => 0.0,
-        (0, fraction) => f32::from(fraction) * 2.0f32.powi(-9),
-        (15, 7) => {
-            return Err(Nvfp4MlpQualificationError::Mismatch(
-                "oracle encountered an E4M3FN NaN".to_string(),
-            ));
-        }
-        (exponent, fraction) => {
-            (1.0 + f32::from(fraction) / 8.0) * 2.0f32.powi(i32::from(exponent) - 7)
-        }
-    };
-
-    Ok(sign * magnitude)
+    codecs::decode_e4m3fn(word).ok_or_else(|| {
+        Nvfp4MlpQualificationError::Mismatch("oracle encountered an E4M3FN NaN".to_string())
+    })
 }
 
 #[cfg(test)]

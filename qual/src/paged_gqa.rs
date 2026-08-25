@@ -1,6 +1,7 @@
 //! Numerical and graph qualification for exact paged GQA routes.
 
 use crate::fp8_projection_oracle::{BYTE_SENTINEL, F32_SENTINEL_BITS, bf16_to_f32, f32_to_bf16};
+use crate::oracles::codecs::decode_e4m3fn_f64;
 use crate::{DeviceBenchmarkError, device_benchmark};
 use std::{mem::size_of, sync::Arc};
 use tuisko_gpu::{
@@ -611,7 +612,7 @@ fn write_cache_value(
         CacheFormat::E4m3 => plane[element] = e4m3_code,
         CacheFormat::Bf16 => {
             let byte = element * size_of::<u16>();
-            let value = (decode_e4m3(e4m3_code) * f64::from(scale)) as f32;
+            let value = (decode_e4m3fn_f64(e4m3_code) * f64::from(scale)) as f32;
             plane[byte..byte + size_of::<u16>()].copy_from_slice(&f32_to_bf16(value).to_le_bytes());
         }
     }
@@ -772,28 +773,13 @@ fn oracle<A: Arch>(
 
 fn cache_value(plane: &[u8], element: usize, format: CacheFormat, scale: f32) -> f64 {
     match format {
-        CacheFormat::E4m3 => decode_e4m3(plane[element]) * f64::from(scale),
+        CacheFormat::E4m3 => decode_e4m3fn_f64(plane[element]) * f64::from(scale),
         CacheFormat::Bf16 => {
             let byte = element * size_of::<u16>();
             let bits = u16::from_le_bytes([plane[byte], plane[byte + 1]]);
             f64::from(bf16_to_f32(bits))
         }
     }
-}
-
-fn decode_e4m3(code: u8) -> f64 {
-    let sign = if code & 0x80 == 0 { 1.0 } else { -1.0 };
-    let exponent = (code >> 3) & 0x0f;
-    let fraction = code & 0x07;
-    let magnitude = match (exponent, fraction) {
-        (0, 0) => 0.0,
-        (0, fraction) => f64::from(fraction) * 2.0f64.powi(-9),
-        (15, 7) => f64::NAN,
-        (exponent, fraction) => {
-            (1.0 + f64::from(fraction) / 8.0) * 2.0f64.powi(i32::from(exponent) - 7)
-        }
-    };
-    sign * magnitude
 }
 
 const fn cache_element_bytes(format: CacheFormat) -> usize {

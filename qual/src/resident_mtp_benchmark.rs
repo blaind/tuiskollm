@@ -6,6 +6,7 @@ use crate::device_benchmark::{
     OperationAccounting, RepeatedGraph, finish_report, generator_baseline_sha256, measure_cases,
     preflight, require_current_process_exclusive, warmup_launches,
 };
+use crate::oracles::codecs::f32_to_bf16;
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{MAX_BATCH, ResidentMtpDraftRoute, ResidentMtpProgram};
@@ -318,11 +319,6 @@ fn logical_bytes(batch: usize) -> usize {
 
 fn staged_logical_bytes(batch: usize) -> usize {
     logical_bytes(batch) - batch * 2 * Qwen38_27B::HIDDEN
-}
-
-fn f32_to_bf16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
 }
 
 #[cfg(test)]

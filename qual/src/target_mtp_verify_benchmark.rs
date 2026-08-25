@@ -6,6 +6,7 @@ use crate::device_benchmark::{
     OperationAccounting, finish_report, generator_baseline_sha256, measure_cases, preflight,
     require_current_process_exclusive, warmup_launches,
 };
+use crate::oracles::attention::rope_tables;
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
@@ -210,17 +211,7 @@ impl Session {
 }
 
 fn rope(positions: &[u32]) -> (Vec<f32>, Vec<f32>) {
-    let mut cosine = vec![0.0; positions.len() * ROTARY_PAIRS];
-    let mut sine = vec![0.0; positions.len() * ROTARY_PAIRS];
-    for (row, &position) in positions.iter().enumerate() {
-        for pair in 0..ROTARY_PAIRS {
-            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
-            let (sin, cos) = (f64::from(position) * frequency).sin_cos();
-            cosine[row * ROTARY_PAIRS + pair] = cos as f32;
-            sine[row * ROTARY_PAIRS + pair] = sin as f32;
-        }
-    }
-    (cosine, sine)
+    rope_tables(positions, ROTARY_PAIRS, 2 * ROTARY_PAIRS, 10_000_000.0)
 }
 
 fn short_gqa_bytes(lengths: impl IntoIterator<Item = usize>) -> usize {

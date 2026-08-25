@@ -1,5 +1,6 @@
 //! Numerical and graph qualification for the exact residual-norm routes.
 
+pub(crate) use crate::oracles::codecs::{bf16_to_f32, f32_to_bf16};
 use crate::target::{EXPECTED_COMPUTE_CAPABILITY, ResidualNormOp};
 #[cfg(feature = "device")]
 use crate::target::{Qwen35ResidualNormOp, Qwen36ResidualNormOp};
@@ -644,17 +645,6 @@ fn check_close(
     }
 
     Ok(())
-}
-
-pub(crate) fn f32_to_bf16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-
-    (rounded >> 16) as u16
-}
-
-pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
 }
 
 #[cfg(test)]

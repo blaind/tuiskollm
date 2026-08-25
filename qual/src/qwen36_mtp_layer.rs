@@ -2,6 +2,8 @@
 
 use crate::device_benchmark;
 use crate::fp8_projection_oracle::{BF16_SENTINEL, F32_SENTINEL_BITS, bf16_to_f32, f32_to_bf16};
+use crate::oracles::attention::rope_tables;
+use crate::oracles::norm::residual_oracle;
 use crate::residual_norm::rms_norm_oracle;
 use crate::{
     DeviceBenchmarkError, qualify_qwen36_fp8_attention_qk_prepare, qualify_qwen36_fp8_paged_gqa,
@@ -339,18 +341,7 @@ fn fixture() -> Fixture {
 }
 
 fn rope(positions: &[u32]) -> (Vec<f32>, Vec<f32>) {
-    let mut cosine = vec![0.0; positions.len() * ROTARY_PAIRS];
-    let mut sine = vec![0.0; positions.len() * ROTARY_PAIRS];
-    for (row, &position) in positions.iter().enumerate() {
-        for pair in 0..ROTARY_PAIRS {
-            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / ROTARY_DIM as f64);
-            let angle = f64::from(position) * frequency;
-            let (sin, cos) = angle.sin_cos();
-            cosine[row * ROTARY_PAIRS + pair] = cos as f32;
-            sine[row * ROTARY_PAIRS + pair] = sin as f32;
-        }
-    }
-    (cosine, sine)
+    rope_tables(positions, ROTARY_PAIRS, ROTARY_DIM, 10_000_000.0)
 }
 
 fn prepare_draft(
@@ -989,13 +980,6 @@ fn verify_no_post_warmup_allocation(
         )));
     }
     Ok(())
-}
-
-fn residual_oracle(left: &[u16], right: &[u16]) -> Vec<u16> {
-    left.iter()
-        .zip(right)
-        .map(|(&left, &right)| f32_to_bf16(bf16_to_f32(left) + bf16_to_f32(right)))
-        .collect()
 }
 
 fn compare_bf16(

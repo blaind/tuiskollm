@@ -1,5 +1,7 @@
 //! Independent represented-value qualification for SM120 NVFP4 down projection.
 
+use crate::oracles::codecs;
+pub(crate) use crate::oracles::codecs::{bf16_to_f32, decode_e2m1, encode_e2m1, f32_to_bf16};
 use crate::{DeviceBenchmarkError, device_benchmark};
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
@@ -774,84 +776,18 @@ fn scale_offset(row: usize, group: usize) -> usize {
         + scale_lane
 }
 
-pub(crate) fn encode_e2m1(value: f32) -> u8 {
-    let mut best = 0u8;
-    let mut best_distance = f32::INFINITY;
-    let candidates = if value.is_sign_negative() {
-        8u8..16
-    } else {
-        0u8..8
-    };
-
-    for code in candidates {
-        let distance = (value - decode_e2m1(code)).abs();
-        if distance < best_distance || (distance == best_distance && code & 1 == 0) {
-            best = code;
-            best_distance = distance;
-        }
-    }
-
-    best
-}
-
-pub(crate) fn decode_e2m1(code: u8) -> f32 {
-    const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let magnitude = MAGNITUDES[(code & 7) as usize];
-
-    if code & 8 == 0 { magnitude } else { -magnitude }
-}
-
 pub(crate) fn encode_e4m3fn(value: f32) -> Result<u8, Nvfp4DownQualificationError> {
-    if !value.is_finite() || value < 0.0 {
-        return Err(Nvfp4DownQualificationError::Mismatch(
+    codecs::encode_e4m3fn_scale(value).ok_or_else(|| {
+        Nvfp4DownQualificationError::Mismatch(
             "oracle E4M3 scale is not finite and non-negative".to_string(),
-        ));
-    }
-
-    let mut best = 0u8;
-    let mut best_distance = f32::INFINITY;
-    for code in 0u8..=0x7e {
-        let represented = decode_e4m3fn(code)?;
-        let distance = (value - represented).abs();
-        if distance < best_distance || (distance == best_distance && code & 1 == 0) {
-            best = code;
-            best_distance = distance;
-        }
-    }
-
-    Ok(best)
+        )
+    })
 }
 
 pub(crate) fn decode_e4m3fn(word: u8) -> Result<f32, Nvfp4DownQualificationError> {
-    let sign = if word & 0x80 == 0 { 1.0 } else { -1.0 };
-    let exponent = (word >> 3) & 15;
-    let fraction = word & 7;
-    let magnitude = match (exponent, fraction) {
-        (0, 0) => 0.0,
-        (0, fraction) => f32::from(fraction) * 2.0f32.powi(-9),
-        (15, 7) => {
-            return Err(Nvfp4DownQualificationError::Mismatch(
-                "oracle encountered an E4M3FN NaN".to_string(),
-            ));
-        }
-        (exponent, fraction) => {
-            (1.0 + f32::from(fraction) / 8.0) * 2.0f32.powi(i32::from(exponent) - 7)
-        }
-    };
-
-    Ok(sign * magnitude)
-}
-
-pub(crate) fn f32_to_bf16(value: f32) -> u16 {
-    let mut bits = value.to_bits();
-    let tie = (bits >> 16) & 1;
-    bits = bits.wrapping_add(0x7fff + tie);
-
-    (bits >> 16) as u16
-}
-
-pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
+    codecs::decode_e4m3fn(word).ok_or_else(|| {
+        Nvfp4DownQualificationError::Mismatch("oracle encountered an E4M3FN NaN".to_string())
+    })
 }
 
 #[cfg(test)]

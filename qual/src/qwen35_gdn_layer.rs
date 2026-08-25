@@ -3,6 +3,7 @@
 use crate::fp8_projection_oracle::{
     BF16_SENTINEL, BYTE_SENTINEL, F32_SENTINEL_BITS, bf16_to_f32, f32_to_bf16,
 };
+use crate::oracles::norm::residual_oracle;
 use crate::qwen35_full_attention_layer::{
     QuantizedActivation, nvfp4_dot_w4a4, quantize_oracle, verify_a16_projection,
 };
@@ -1210,14 +1211,6 @@ fn route_label(rows: usize) -> String {
     } else {
         format!("T={rows}")
     }
-}
-
-fn residual_oracle(input: &[u16], branch: &[u16]) -> Vec<u16> {
-    input
-        .iter()
-        .zip(branch)
-        .map(|(&input, &branch)| f32_to_bf16(bf16_to_f32(input) + bf16_to_f32(branch)))
-        .collect()
 }
 
 fn compare_exact<T: PartialEq>(

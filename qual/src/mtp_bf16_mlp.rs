@@ -2,6 +2,7 @@
 
 use crate::device_benchmark;
 use crate::fp8_projection_oracle::bf16_to_f32;
+use crate::oracles::codecs::f32_to_bf16;
 use crate::{
     DeviceBenchmarkError,
     target::{MtpBf16MlpOp, Qwen35MtpBf16MlpOp},
@@ -321,12 +322,6 @@ fn make_fixture<A: Arch>(
         gate_up_weight,
         down_weight,
     })
-}
-
-fn f32_to_bf16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-    (rounded >> 16) as u16
 }
 
 fn load_immutable(

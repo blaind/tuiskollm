@@ -7,6 +7,7 @@ use crate::device_benchmark::{
     preflight, require_current_process_exclusive, warmup_launches,
 };
 use crate::mtp_bf16_mlp::{HIDDEN, INTERMEDIATE, MAX_BATCH, Regions, layout};
+use crate::oracles::codecs::f32_to_bf16;
 use crate::target::MtpBf16MlpOp;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer};
@@ -123,12 +124,6 @@ fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> G
     arena.copy_from_host(stream, regions.input, &input)?;
     arena.copy_from_host(stream, regions.gate_up_weight, &gate_up_weight)?;
     arena.copy_from_host(stream, regions.down_weight, &down_weight)
-}
-
-fn f32_to_bf16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-    (rounded >> 16) as u16
 }
 
 fn capture_route(

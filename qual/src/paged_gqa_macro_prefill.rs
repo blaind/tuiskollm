@@ -3,6 +3,7 @@
 use crate::fp8_projection_oracle::{
     BYTE_SENTINEL, F32_SENTINEL_BITS, decode_e4m3fn, encode_e4m3fn, f16_to_f32, f32_to_f16,
 };
+use crate::oracles::codecs::decode_e4m3fn_f64;
 use crate::{DeviceBenchmarkError, device_benchmark};
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
@@ -414,7 +415,9 @@ fn score_classes(
                 .iter()
                 .enumerate()
                 .map(|(dimension, &query)| {
-                    query * decode_e4m3(KEY_CODES[(class + dimension) & 7]) * f64::from(KEY_SCALE)
+                    query
+                        * decode_e4m3fn_f64(KEY_CODES[(class + dimension) & 7])
+                        * f64::from(KEY_SCALE)
                 })
                 .sum::<f64>()
                 * 0.0625;
@@ -429,7 +432,7 @@ fn value_classes() -> [[f64; 8]; 8] {
     for (class, class_values) in values.iter_mut().enumerate() {
         for (dimension, value) in class_values.iter_mut().enumerate() {
             let unrounded =
-                decode_e4m3(VALUE_CODES[(class + dimension) & 7]) * f64::from(VALUE_SCALE);
+                decode_e4m3fn_f64(VALUE_CODES[(class + dimension) & 7]) * f64::from(VALUE_SCALE);
             *value = f64::from(f16_to_f32(f32_to_f16(unrounded as f32)));
         }
     }
@@ -668,21 +671,6 @@ fn cache_offset(physical: usize, head: usize, position: usize, dimension: usize)
     Qwen38_27B::HEAD_DIM
         * (position + ATTENTION_PAGE_SIZE * (head + Qwen38_27B::NUM_KV_HEADS * physical))
         + dimension
-}
-
-fn decode_e4m3(code: u8) -> f64 {
-    let sign = if code & 0x80 == 0 { 1.0 } else { -1.0 };
-    let exponent = (code >> 3) & 0x0f;
-    let fraction = code & 0x07;
-    let magnitude = match (exponent, fraction) {
-        (0, 0) => 0.0,
-        (0, fraction) => f64::from(fraction) * 2.0f64.powi(-9),
-        (15, 7) => f64::NAN,
-        (exponent, fraction) => {
-            (1.0 + f64::from(fraction) / 8.0) * 2.0f64.powi(i32::from(exponent) - 7)
-        }
-    };
-    sign * magnitude
 }
 
 fn verify_no_post_warmup_allocation(

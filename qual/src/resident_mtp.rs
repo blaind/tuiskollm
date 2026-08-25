@@ -3,6 +3,7 @@
 use crate::DeviceBenchmarkError;
 use crate::device_benchmark;
 use crate::fp8_projection_oracle::f32_to_bf16;
+use crate::oracles::attention::rope_tables;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -1130,17 +1131,7 @@ fn positions(first: usize, rows: usize) -> Result<Vec<u32>, ResidentMtpQualifica
 }
 
 fn rope(positions: &[u32]) -> (Vec<f32>, Vec<f32>) {
-    let mut cosine = vec![0.0; positions.len() * ROTARY_PAIRS];
-    let mut sine = vec![0.0; positions.len() * ROTARY_PAIRS];
-    for (row, &position) in positions.iter().enumerate() {
-        for pair in 0..ROTARY_PAIRS {
-            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
-            let (sin, cos) = (f64::from(position) * frequency).sin_cos();
-            cosine[row * ROTARY_PAIRS + pair] = cos as f32;
-            sine[row * ROTARY_PAIRS + pair] = sin as f32;
-        }
-    }
-    (cosine, sine)
+    rope_tables(positions, ROTARY_PAIRS, 2 * ROTARY_PAIRS, 10_000_000.0)
 }
 
 fn cache_page_values() -> usize {
