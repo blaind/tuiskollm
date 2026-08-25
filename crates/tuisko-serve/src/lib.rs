@@ -2,6 +2,7 @@
 
 mod assistant;
 mod request;
+mod request_log;
 mod response;
 mod server;
 
