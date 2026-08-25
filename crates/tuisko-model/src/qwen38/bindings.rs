@@ -1005,362 +1005,377 @@ fn require_same_divisor(layer: usize, role: &str, gate: f32, up: f32) -> Checkpo
 mod tests {
     use super::*;
     use crate::common::nvfp4::{Nvfp4DownBindings, Nvfp4GateUpBindings};
+    use crate::common::test_builder::SafeTensorTestBuilder;
     use crate::common::test_support::sources::{
         Nvfp4Arch, TestArch, fixture_path, write_safetensors_payload,
     };
     use crate::{CheckpointErrorCode, CheckpointResult, DType, SafeTensorFile, TensorView};
-    use serde_json::{Value, json};
+    use serde_json::json;
     use std::fs;
-    use std::path::Path;
 
-    fn endpoint_header() -> Value {
-        json!({
-            "model.language_model.embed_tokens.weight": {
-                "dtype": "BF16",
-                "shape": [3, 4],
-                "data_offsets": [0, 24]
-            },
-            "model.language_model.norm.weight": {
-                "dtype": "BF16",
-                "shape": [4],
-                "data_offsets": [24, 32]
-            },
-            "lm_head.weight": {
-                "dtype": "F8_E4M3",
-                "shape": [3, 4],
-                "data_offsets": [32, 44]
-            },
-            "lm_head.weight_scale": {
-                "dtype": "BF16",
-                "shape": [3, 1],
-                "data_offsets": [44, 50]
-            }
-        })
+    fn endpoint_fixture() -> SafeTensorTestBuilder {
+        let mut source = 0u8..;
+        let mut ramp = |_| source.next().unwrap();
+        let mut fixture = SafeTensorTestBuilder::new();
+
+        fixture
+            .add_with(
+                "model.language_model.embed_tokens.weight",
+                DType::Bf16,
+                &[3, 4],
+                &mut ramp,
+            )
+            .add_with(
+                "model.language_model.norm.weight",
+                DType::Bf16,
+                &[4],
+                &mut ramp,
+            )
+            .add_with("lm_head.weight", DType::Fp8E4M3, &[3, 4], &mut ramp)
+            .add_with("lm_head.weight_scale", DType::Bf16, &[3, 1], &mut ramp);
+
+        fixture
     }
 
-    fn write_safetensors(path: &Path, header: Value) {
-        let payload = (0u8..50).collect::<Vec<_>>();
-
-        write_safetensors_payload(path, header, &payload);
-    }
-
-    fn nvfp4_mlp_fixture(layer: usize) -> (Value, Vec<u8>) {
+    fn nvfp4_mlp_fixture(layer: usize) -> SafeTensorTestBuilder {
         let prefix = format!("model.language_model.layers.{layer}.mlp");
         let down = format!("{prefix}.down_proj");
         let layer_prefix = format!("model.language_model.layers.{layer}");
         let next_layer_prefix = format!("model.language_model.layers.{}", layer + 1);
-        let mut payload = vec![0x38; 1_016];
+        let mut fixture = SafeTensorTestBuilder::new();
 
-        payload[0..4].copy_from_slice(&3.0f32.to_le_bytes());
-        payload[4..8].copy_from_slice(&0.125f32.to_le_bytes());
-        payload[8..12].copy_from_slice(&3.0f32.to_le_bytes());
-        payload[12..16].copy_from_slice(&0.125f32.to_le_bytes());
-        payload[592..596].copy_from_slice(&19.0f32.to_le_bytes());
-        payload[596..600].copy_from_slice(&3_376.0f32.to_le_bytes());
-        payload[888..952].fill(0x70);
-        payload[952..1_016].fill(0x80);
+        fixture
+            .add_f32(format!("{prefix}.gate_proj.input_global_scale"), &[1], 3.0)
+            .add_f32(
+                format!("{prefix}.gate_proj.weight_global_scale"),
+                &[1],
+                0.125,
+            )
+            .add_f32(format!("{prefix}.up_proj.input_global_scale"), &[1], 3.0)
+            .add_f32(format!("{prefix}.up_proj.weight_global_scale"), &[1], 0.125)
+            .add_raw(
+                format!("{prefix}.gate_proj.weight_packed"),
+                DType::U8,
+                &[16, 16],
+                0x38,
+            )
+            .add_raw(
+                format!("{prefix}.up_proj.weight_packed"),
+                DType::U8,
+                &[16, 16],
+                0x38,
+            )
+            .add_raw(
+                format!("{prefix}.gate_proj.weight_scale"),
+                DType::Fp8E4M3,
+                &[16, 2],
+                0x38,
+            )
+            .add_raw(
+                format!("{prefix}.up_proj.weight_scale"),
+                DType::Fp8E4M3,
+                &[16, 2],
+                0x38,
+            )
+            .add_f32(format!("{down}.input_global_scale"), &[1], 19.0)
+            .add_f32(format!("{down}.weight_global_scale"), &[1], 3_376.0)
+            .add_raw(format!("{down}.weight_packed"), DType::U8, &[32, 8], 0x38)
+            .add_raw(
+                format!("{down}.weight_scale"),
+                DType::Fp8E4M3,
+                &[32, 1],
+                0x38,
+            )
+            .add_raw(
+                format!("{layer_prefix}.post_attention_layernorm.weight"),
+                DType::Bf16,
+                &[32],
+                0x70,
+            )
+            .add_raw(
+                format!("{next_layer_prefix}.input_layernorm.weight"),
+                DType::Bf16,
+                &[32],
+                0x80,
+            );
 
-        (
-            json!({
-                format!("{prefix}.gate_proj.input_global_scale"): {
-                    "dtype":"F32", "shape":[1], "data_offsets":[0,4]
-                },
-                format!("{prefix}.gate_proj.weight_global_scale"): {
-                    "dtype":"F32", "shape":[1], "data_offsets":[4,8]
-                },
-                format!("{prefix}.up_proj.input_global_scale"): {
-                    "dtype":"F32", "shape":[1], "data_offsets":[8,12]
-                },
-                format!("{prefix}.up_proj.weight_global_scale"): {
-                    "dtype":"F32", "shape":[1], "data_offsets":[12,16]
-                },
-                format!("{prefix}.gate_proj.weight_packed"): {
-                    "dtype":"U8", "shape":[16,16], "data_offsets":[16,272]
-                },
-                format!("{prefix}.up_proj.weight_packed"): {
-                    "dtype":"U8", "shape":[16,16], "data_offsets":[272,528]
-                },
-                format!("{prefix}.gate_proj.weight_scale"): {
-                    "dtype":"F8_E4M3", "shape":[16,2], "data_offsets":[528,560]
-                },
-                format!("{prefix}.up_proj.weight_scale"): {
-                    "dtype":"F8_E4M3", "shape":[16,2], "data_offsets":[560,592]
-                },
-                format!("{down}.input_global_scale"): {
-                    "dtype":"F32", "shape":[1], "data_offsets":[592,596]
-                },
-                format!("{down}.weight_global_scale"): {
-                    "dtype":"F32", "shape":[1], "data_offsets":[596,600]
-                },
-                format!("{down}.weight_packed"): {
-                    "dtype":"U8", "shape":[32,8], "data_offsets":[600,856]
-                },
-                format!("{down}.weight_scale"): {
-                    "dtype":"F8_E4M3", "shape":[32,1], "data_offsets":[856,888]
-                },
-                format!("{layer_prefix}.post_attention_layernorm.weight"): {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[888,952]
-                },
-                format!("{next_layer_prefix}.input_layernorm.weight"): {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[952,1016]
-                }
-            }),
-            payload,
-        )
+        fixture
     }
 
-    fn dense_fp8_mlp_fixture(layer: usize) -> (Value, Vec<u8>) {
+    fn dense_fp8_mlp_fixture(layer: usize) -> SafeTensorTestBuilder {
         let prefix = format!("model.language_model.layers.{layer}.mlp");
         let down = format!("{prefix}.down_proj");
         let layer_prefix = format!("model.language_model.layers.{layer}");
         let next_layer_prefix = format!("model.language_model.layers.{}", layer + 1);
-        let mut payload = vec![0; 1_792];
+        let mut fixture = SafeTensorTestBuilder::new();
 
-        payload[0..512].fill(0x10);
-        payload[512..1_024].fill(0x20);
-        payload[1_024..1_056].fill(0x30);
-        payload[1_056..1_088].fill(0x40);
-        payload[1_088..1_600].fill(0x50);
-        payload[1_600..1_664].fill(0x60);
-        payload[1_664..1_728].fill(0x70);
-        payload[1_728..1_792].fill(0x80);
+        fixture
+            .add_raw(
+                format!("{prefix}.gate_proj.weight"),
+                DType::Fp8E4M3,
+                &[16, 32],
+                0x10,
+            )
+            .add_raw(
+                format!("{prefix}.up_proj.weight"),
+                DType::Fp8E4M3,
+                &[16, 32],
+                0x20,
+            )
+            .add_raw(
+                format!("{prefix}.gate_proj.weight_scale"),
+                DType::Bf16,
+                &[16, 1],
+                0x30,
+            )
+            .add_raw(
+                format!("{prefix}.up_proj.weight_scale"),
+                DType::Bf16,
+                &[16, 1],
+                0x40,
+            )
+            .add_raw(format!("{down}.weight"), DType::Fp8E4M3, &[32, 16], 0x50)
+            .add_raw(format!("{down}.weight_scale"), DType::Bf16, &[32, 1], 0x60)
+            .add_raw(
+                format!("{layer_prefix}.post_attention_layernorm.weight"),
+                DType::Bf16,
+                &[32],
+                0x70,
+            )
+            .add_raw(
+                format!("{next_layer_prefix}.input_layernorm.weight"),
+                DType::Bf16,
+                &[32],
+                0x80,
+            );
 
-        (
-            json!({
-                format!("{prefix}.gate_proj.weight"): {
-                    "dtype":"F8_E4M3", "shape":[16,32], "data_offsets":[0,512]
-                },
-                format!("{prefix}.up_proj.weight"): {
-                    "dtype":"F8_E4M3", "shape":[16,32], "data_offsets":[512,1024]
-                },
-                format!("{prefix}.gate_proj.weight_scale"): {
-                    "dtype":"BF16", "shape":[16,1], "data_offsets":[1024,1056]
-                },
-                format!("{prefix}.up_proj.weight_scale"): {
-                    "dtype":"BF16", "shape":[16,1], "data_offsets":[1056,1088]
-                },
-                format!("{down}.weight"): {
-                    "dtype":"F8_E4M3", "shape":[32,16], "data_offsets":[1088,1600]
-                },
-                format!("{down}.weight_scale"): {
-                    "dtype":"BF16", "shape":[32,1], "data_offsets":[1600,1664]
-                },
-                format!("{layer_prefix}.post_attention_layernorm.weight"): {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[1664,1728]
-                },
-                format!("{next_layer_prefix}.input_layernorm.weight"): {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[1728,1792]
-                }
-            }),
-            payload,
-        )
+        fixture
     }
 
-    fn full_attention_fixture(layer: usize) -> (Value, Vec<u8>) {
+    fn full_attention_fixture(layer: usize) -> SafeTensorTestBuilder {
         let layer_prefix = format!("model.language_model.layers.{layer}");
         let prefix = format!("{layer_prefix}.self_attn");
-        let mut payload = vec![0x80; 368];
+        let mut fixture = SafeTensorTestBuilder::new();
 
-        payload[0..64].fill(0x10);
-        payload[64..96].fill(0x20);
-        payload[96..128].fill(0x30);
-        payload[128..132].fill(0x40);
-        payload[132..134].fill(0x50);
-        payload[134..136].fill(0x60);
-        payload[136..168].fill(0x70);
-        payload[168..232]
-            .as_chunks_mut::<2>()
-            .0
-            .fill(0x3f80u16.to_le_bytes());
-        payload[364..366].copy_from_slice(&0x3f80u16.to_le_bytes());
-        payload[366..368].copy_from_slice(&0x3f00u16.to_le_bytes());
+        fixture
+            .add_raw(
+                format!("{prefix}.q_proj.weight"),
+                DType::Fp8E4M3,
+                &[2, 32],
+                0x10,
+            )
+            .add_raw(
+                format!("{prefix}.k_proj.weight"),
+                DType::Fp8E4M3,
+                &[1, 32],
+                0x20,
+            )
+            .add_raw(
+                format!("{prefix}.v_proj.weight"),
+                DType::Fp8E4M3,
+                &[1, 32],
+                0x30,
+            )
+            .add_raw(
+                format!("{prefix}.q_proj.weight_scale"),
+                DType::Bf16,
+                &[2, 1],
+                0x40,
+            )
+            .add_raw(
+                format!("{prefix}.k_proj.weight_scale"),
+                DType::Bf16,
+                &[1, 1],
+                0x50,
+            )
+            .add_raw(
+                format!("{prefix}.v_proj.weight_scale"),
+                DType::Bf16,
+                &[1, 1],
+                0x60,
+            )
+            .add_raw(
+                format!("{prefix}.o_proj.weight"),
+                DType::Fp8E4M3,
+                &[32, 1],
+                0x70,
+            )
+            .add_bf16(format!("{prefix}.o_proj.weight_scale"), &[32, 1], 0x3f80)
+            .add_raw(
+                format!("{layer_prefix}.input_layernorm.weight"),
+                DType::Bf16,
+                &[32],
+                0x80,
+            )
+            .add_raw(
+                format!("{layer_prefix}.post_attention_layernorm.weight"),
+                DType::Bf16,
+                &[32],
+                0x80,
+            )
+            .add_raw(format!("{prefix}.q_norm.weight"), DType::Bf16, &[1], 0x80)
+            .add_raw(format!("{prefix}.k_norm.weight"), DType::Bf16, &[1], 0x80)
+            .add_bf16(format!("{prefix}.k_scale"), &[1], 0x3f80)
+            .add_bf16(format!("{prefix}.v_scale"), &[1], 0x3f00);
 
-        (
-            json!({
-                format!("{prefix}.q_proj.weight"): {
-                    "dtype":"F8_E4M3", "shape":[2,32], "data_offsets":[0,64]
-                },
-                format!("{prefix}.k_proj.weight"): {
-                    "dtype":"F8_E4M3", "shape":[1,32], "data_offsets":[64,96]
-                },
-                format!("{prefix}.v_proj.weight"): {
-                    "dtype":"F8_E4M3", "shape":[1,32], "data_offsets":[96,128]
-                },
-                format!("{prefix}.q_proj.weight_scale"): {
-                    "dtype":"BF16", "shape":[2,1], "data_offsets":[128,132]
-                },
-                format!("{prefix}.k_proj.weight_scale"): {
-                    "dtype":"BF16", "shape":[1,1], "data_offsets":[132,134]
-                },
-                format!("{prefix}.v_proj.weight_scale"): {
-                    "dtype":"BF16", "shape":[1,1], "data_offsets":[134,136]
-                },
-                format!("{prefix}.o_proj.weight"): {
-                    "dtype":"F8_E4M3", "shape":[32,1], "data_offsets":[136,168]
-                },
-                format!("{prefix}.o_proj.weight_scale"): {
-                    "dtype":"BF16", "shape":[32,1], "data_offsets":[168,232]
-                },
-                format!("{layer_prefix}.input_layernorm.weight"): {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[232,296]
-                },
-                format!("{layer_prefix}.post_attention_layernorm.weight"): {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[296,360]
-                },
-                format!("{prefix}.q_norm.weight"): {
-                    "dtype":"BF16", "shape":[1], "data_offsets":[360,362]
-                },
-                format!("{prefix}.k_norm.weight"): {
-                    "dtype":"BF16", "shape":[1], "data_offsets":[362,364]
-                },
-                format!("{prefix}.k_scale"): {
-                    "dtype":"BF16", "shape":[1], "data_offsets":[364,366]
-                },
-                format!("{prefix}.v_scale"): {
-                    "dtype":"BF16", "shape":[1], "data_offsets":[366,368]
-                }
-            }),
-            payload,
-        )
+        fixture
     }
 
-    fn gdn_fixture(layer: usize) -> (Value, Vec<u8>) {
+    fn gdn_fixture(layer: usize) -> SafeTensorTestBuilder {
         let layer_prefix = format!("model.language_model.layers.{layer}");
         let prefix = format!("{layer_prefix}.linear_attn");
-        let mut payload = vec![0x80; 518];
+        let mut fixture = SafeTensorTestBuilder::new();
 
-        payload[0..96].fill(0x10);
-        payload[96..128].fill(0x20);
-        payload[128..160].fill(0x30);
-        payload[160..168]
-            .as_chunks_mut::<2>()
-            .0
-            .fill(0x3f80u16.to_le_bytes());
-        payload[168..232]
-            .as_chunks_mut::<2>()
-            .0
-            .fill(0x3f00u16.to_le_bytes());
+        fixture
+            .add_raw(
+                format!("{prefix}.in_proj_qkv.weight"),
+                DType::Fp8E4M3,
+                &[3, 32],
+                0x10,
+            )
+            .add_raw(
+                format!("{prefix}.in_proj_z.weight"),
+                DType::Fp8E4M3,
+                &[1, 32],
+                0x20,
+            )
+            .add_raw(
+                format!("{prefix}.out_proj.weight"),
+                DType::Fp8E4M3,
+                &[32, 1],
+                0x30,
+            )
+            .add_bf16(
+                format!("{prefix}.in_proj_qkv.weight_scale"),
+                &[3, 1],
+                0x3f80,
+            )
+            .add_bf16(format!("{prefix}.in_proj_z.weight_scale"), &[1, 1], 0x3f80)
+            .add_bf16(format!("{prefix}.out_proj.weight_scale"), &[32, 1], 0x3f00)
+            .add_raw(
+                format!("{prefix}.in_proj_a.weight"),
+                DType::Bf16,
+                &[1, 32],
+                0x80,
+            )
+            .add_raw(
+                format!("{prefix}.in_proj_b.weight"),
+                DType::Bf16,
+                &[1, 32],
+                0x80,
+            )
+            .add_raw(
+                format!("{prefix}.conv1d.weight"),
+                DType::Bf16,
+                &[3, 1, 4],
+                0x80,
+            )
+            .add_raw(format!("{prefix}.A_log"), DType::Bf16, &[1], 0x80)
+            .add_raw(format!("{prefix}.dt_bias"), DType::Bf16, &[1], 0x80)
+            .add_raw(format!("{prefix}.norm.weight"), DType::Bf16, &[1], 0x80)
+            .add_raw(
+                format!("{layer_prefix}.input_layernorm.weight"),
+                DType::Bf16,
+                &[32],
+                0x80,
+            )
+            .add_raw(
+                format!("{layer_prefix}.post_attention_layernorm.weight"),
+                DType::Bf16,
+                &[32],
+                0x80,
+            );
 
-        (
-            json!({
-                format!("{prefix}.in_proj_qkv.weight"): {
-                    "dtype":"F8_E4M3", "shape":[3,32], "data_offsets":[0,96]
-                },
-                format!("{prefix}.in_proj_z.weight"): {
-                    "dtype":"F8_E4M3", "shape":[1,32], "data_offsets":[96,128]
-                },
-                format!("{prefix}.out_proj.weight"): {
-                    "dtype":"F8_E4M3", "shape":[32,1], "data_offsets":[128,160]
-                },
-                format!("{prefix}.in_proj_qkv.weight_scale"): {
-                    "dtype":"BF16", "shape":[3,1], "data_offsets":[160,166]
-                },
-                format!("{prefix}.in_proj_z.weight_scale"): {
-                    "dtype":"BF16", "shape":[1,1], "data_offsets":[166,168]
-                },
-                format!("{prefix}.out_proj.weight_scale"): {
-                    "dtype":"BF16", "shape":[32,1], "data_offsets":[168,232]
-                },
-                format!("{prefix}.in_proj_a.weight"): {
-                    "dtype":"BF16", "shape":[1,32], "data_offsets":[232,296]
-                },
-                format!("{prefix}.in_proj_b.weight"): {
-                    "dtype":"BF16", "shape":[1,32], "data_offsets":[296,360]
-                },
-                format!("{prefix}.conv1d.weight"): {
-                    "dtype":"BF16", "shape":[3,1,4], "data_offsets":[360,384]
-                },
-                format!("{prefix}.A_log"): {
-                    "dtype":"BF16", "shape":[1], "data_offsets":[384,386]
-                },
-                format!("{prefix}.dt_bias"): {
-                    "dtype":"BF16", "shape":[1], "data_offsets":[386,388]
-                },
-                format!("{prefix}.norm.weight"): {
-                    "dtype":"BF16", "shape":[1], "data_offsets":[388,390]
-                },
-                format!("{layer_prefix}.input_layernorm.weight"): {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[390,454]
-                },
-                format!("{layer_prefix}.post_attention_layernorm.weight"): {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[454,518]
-                }
-            }),
-            payload,
-        )
+        fixture
     }
 
-    fn mtp_fixture() -> (Value, Vec<u8>) {
-        let mut payload = vec![0x80; 7_812];
+    fn mtp_fixture() -> SafeTensorTestBuilder {
+        let mut fixture = SafeTensorTestBuilder::new();
 
-        payload[0..4_096].fill(0x10);
-        payload[5_184..6_208].fill(0x20);
-        payload[6_208..7_232].fill(0x30);
-        payload[7_298..7_362].fill(0x40);
-        payload[7_362..7_426].fill(0x50);
-        payload[7_428..7_556].fill(0x60);
-        payload[7_556..7_620].fill(0x70);
+        fixture
+            .add_raw("mtp.fc.weight", DType::Bf16, &[32, 64], 0x10)
+            .add_raw(
+                "mtp.layers.0.input_layernorm.weight",
+                DType::Bf16,
+                &[32],
+                0x80,
+            )
+            .add_raw(
+                "mtp.layers.0.mlp.down_proj.weight",
+                DType::Bf16,
+                &[32, 16],
+                0x80,
+            )
+            .add_raw(
+                "mtp.layers.0.mlp.gate_proj.weight",
+                DType::Bf16,
+                &[16, 32],
+                0x20,
+            )
+            .add_raw(
+                "mtp.layers.0.mlp.up_proj.weight",
+                DType::Bf16,
+                &[16, 32],
+                0x30,
+            )
+            .add_raw(
+                "mtp.layers.0.post_attention_layernorm.weight",
+                DType::Bf16,
+                &[32],
+                0x80,
+            )
+            .add_raw(
+                "mtp.layers.0.self_attn.k_norm.weight",
+                DType::Bf16,
+                &[1],
+                0x80,
+            )
+            .add_raw(
+                "mtp.layers.0.self_attn.k_proj.weight",
+                DType::Bf16,
+                &[1, 32],
+                0x40,
+            )
+            .add_raw(
+                "mtp.layers.0.self_attn.o_proj.weight",
+                DType::Bf16,
+                &[32, 1],
+                0x50,
+            )
+            .add_raw(
+                "mtp.layers.0.self_attn.q_norm.weight",
+                DType::Bf16,
+                &[1],
+                0x80,
+            )
+            .add_raw(
+                "mtp.layers.0.self_attn.q_proj.weight",
+                DType::Bf16,
+                &[2, 32],
+                0x60,
+            )
+            .add_raw(
+                "mtp.layers.0.self_attn.v_proj.weight",
+                DType::Bf16,
+                &[1, 32],
+                0x70,
+            )
+            .add_raw("mtp.norm.weight", DType::Bf16, &[32], 0x80)
+            .add_raw("mtp.pre_fc_norm_embedding.weight", DType::Bf16, &[32], 0x80)
+            .add_raw("mtp.pre_fc_norm_hidden.weight", DType::Bf16, &[32], 0x80);
 
-        (
-            json!({
-                "mtp.fc.weight": {
-                    "dtype":"BF16", "shape":[32,64], "data_offsets":[0,4096]
-                },
-                "mtp.layers.0.input_layernorm.weight": {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[4096,4160]
-                },
-                "mtp.layers.0.mlp.down_proj.weight": {
-                    "dtype":"BF16", "shape":[32,16], "data_offsets":[4160,5184]
-                },
-                "mtp.layers.0.mlp.gate_proj.weight": {
-                    "dtype":"BF16", "shape":[16,32], "data_offsets":[5184,6208]
-                },
-                "mtp.layers.0.mlp.up_proj.weight": {
-                    "dtype":"BF16", "shape":[16,32], "data_offsets":[6208,7232]
-                },
-                "mtp.layers.0.post_attention_layernorm.weight": {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[7232,7296]
-                },
-                "mtp.layers.0.self_attn.k_norm.weight": {
-                    "dtype":"BF16", "shape":[1], "data_offsets":[7296,7298]
-                },
-                "mtp.layers.0.self_attn.k_proj.weight": {
-                    "dtype":"BF16", "shape":[1,32], "data_offsets":[7298,7362]
-                },
-                "mtp.layers.0.self_attn.o_proj.weight": {
-                    "dtype":"BF16", "shape":[32,1], "data_offsets":[7362,7426]
-                },
-                "mtp.layers.0.self_attn.q_norm.weight": {
-                    "dtype":"BF16", "shape":[1], "data_offsets":[7426,7428]
-                },
-                "mtp.layers.0.self_attn.q_proj.weight": {
-                    "dtype":"BF16", "shape":[2,32], "data_offsets":[7428,7556]
-                },
-                "mtp.layers.0.self_attn.v_proj.weight": {
-                    "dtype":"BF16", "shape":[1,32], "data_offsets":[7556,7620]
-                },
-                "mtp.norm.weight": {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[7620,7684]
-                },
-                "mtp.pre_fc_norm_embedding.weight": {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[7684,7748]
-                },
-                "mtp.pre_fc_norm_hidden.weight": {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[7748,7812]
-                }
-            }),
-            payload,
-        )
+        fixture
     }
 
     fn assert_rejects_bf16_scale(
         label: &str,
-        header: Value,
-        mut payload: Vec<u8>,
+        fixture: SafeTensorTestBuilder,
         offset: usize,
         tensor_name: &str,
         bind: impl FnOnce(&SafeTensorFile) -> CheckpointResult<()>,
     ) {
+        let (header, mut payload) = fixture.into_parts();
+
         payload[offset..offset + 2].copy_from_slice(&0x7fc0u16.to_le_bytes());
 
         let path = fixture_path(label);
@@ -1383,7 +1398,7 @@ mod tests {
     #[test]
     fn binds_exact_text_endpoint_contract() {
         let path = fixture_path("valid");
-        write_safetensors(&path, endpoint_header());
+        endpoint_fixture().write(&path);
         let file = SafeTensorFile::open(&path).unwrap();
 
         let bindings =
@@ -1402,9 +1417,9 @@ mod tests {
     #[test]
     fn rejects_endpoint_dtype_mismatch() {
         let path = fixture_path("dtype");
-        let mut header = endpoint_header();
+        let (mut header, payload) = endpoint_fixture().into_parts();
         header["lm_head.weight"]["dtype"] = json!("U8");
-        write_safetensors(&path, header);
+        write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
 
         let error = TextEndpointBindings::bind_from::<TestArch>(|name| file.tensor(name))
@@ -1421,9 +1436,9 @@ mod tests {
     #[test]
     fn rejects_endpoint_shape_mismatch() {
         let path = fixture_path("shape");
-        let mut header = endpoint_header();
+        let (mut header, payload) = endpoint_fixture().into_parts();
         header["lm_head.weight_scale"]["shape"] = json!([3]);
-        write_safetensors(&path, header);
+        write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
 
         let error = TextEndpointBindings::bind_from::<TestArch>(|name| file.tensor(name))
@@ -1440,7 +1455,7 @@ mod tests {
     #[test]
     fn binds_exact_nvfp4_mlp_source_contract() {
         let path = fixture_path("nvfp4-mlp");
-        let (header, payload) = nvfp4_mlp_fixture(55);
+        let (header, payload) = nvfp4_mlp_fixture(55).into_parts();
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
 
@@ -1473,7 +1488,7 @@ mod tests {
     #[test]
     fn binds_exact_dense_fp8_mlp_source_contract() {
         let path = fixture_path("dense-fp8-mlp");
-        let (header, payload) = dense_fp8_mlp_fixture(56);
+        let (header, payload) = dense_fp8_mlp_fixture(56).into_parts();
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
 
@@ -1546,7 +1561,7 @@ mod tests {
     #[test]
     fn binds_exact_full_attention_source_contract() {
         let path = fixture_path("full-attention");
-        let (header, payload) = full_attention_fixture(63);
+        let (header, payload) = full_attention_fixture(63).into_parts();
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
 
@@ -1583,7 +1598,7 @@ mod tests {
     #[test]
     fn binds_exact_gdn_source_contract() {
         let path = fixture_path("gdn");
-        let (header, payload) = gdn_fixture(62);
+        let (header, payload) = gdn_fixture(62).into_parts();
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
         let bindings = GdnBindings::bind_from::<Nvfp4Arch>(
@@ -1619,7 +1634,7 @@ mod tests {
     #[test]
     fn rejects_gdn_convolution_shape_mismatch() {
         let path = fixture_path("gdn-convolution-shape");
-        let (mut header, payload) = gdn_fixture(62);
+        let (mut header, payload) = gdn_fixture(62).into_parts();
         header["model.language_model.layers.62.linear_attn.conv1d.weight"]["shape"] = json!([3, 4]);
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
@@ -1641,7 +1656,7 @@ mod tests {
     #[test]
     fn binds_and_materializes_exact_mtp_source_contract() {
         let path = fixture_path("mtp");
-        let (header, payload) = mtp_fixture();
+        let (header, payload) = mtp_fixture().into_parts();
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
         let bindings = MtpBindings::bind_from::<Nvfp4Arch>(
@@ -1686,7 +1701,7 @@ mod tests {
     #[test]
     fn rejects_mtp_input_projection_shape_mismatch() {
         let path = fixture_path("mtp-input-shape");
-        let (mut header, payload) = mtp_fixture();
+        let (mut header, payload) = mtp_fixture().into_parts();
         header["mtp.fc.weight"]["shape"] = json!([64, 32]);
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
@@ -1706,11 +1721,9 @@ mod tests {
 
     #[test]
     fn rejects_invalid_fp8_bf16_scale_planes() {
-        let endpoint_payload = (0u8..50).collect::<Vec<_>>();
         assert_rejects_bf16_scale(
             "endpoint-scale",
-            endpoint_header(),
-            endpoint_payload,
+            endpoint_fixture(),
             44,
             "lm_head.weight_scale",
             |file| {
@@ -1718,11 +1731,9 @@ mod tests {
             },
         );
 
-        let (header, payload) = dense_fp8_mlp_fixture(56);
         assert_rejects_bf16_scale(
             "dense-gate-scale",
-            header,
-            payload,
+            dense_fp8_mlp_fixture(56),
             1_024,
             "gate_proj.weight_scale",
             |file| {
@@ -1735,11 +1746,9 @@ mod tests {
             },
         );
 
-        let (header, payload) = dense_fp8_mlp_fixture(56);
         assert_rejects_bf16_scale(
             "dense-down-scale",
-            header,
-            payload,
+            dense_fp8_mlp_fixture(56),
             1_600,
             "down_proj.weight_scale",
             |file| {
@@ -1748,11 +1757,9 @@ mod tests {
             },
         );
 
-        let (header, payload) = full_attention_fixture(63);
         assert_rejects_bf16_scale(
             "attention-qkv-scale",
-            header,
-            payload,
+            full_attention_fixture(63),
             128,
             "q_proj.weight_scale",
             |file| {
@@ -1761,11 +1768,9 @@ mod tests {
             },
         );
 
-        let (header, payload) = full_attention_fixture(63);
         assert_rejects_bf16_scale(
             "attention-output-scale",
-            header,
-            payload,
+            full_attention_fixture(63),
             168,
             "o_proj.weight_scale",
             |file| {
@@ -1774,11 +1779,9 @@ mod tests {
             },
         );
 
-        let (header, payload) = gdn_fixture(62);
         assert_rejects_bf16_scale(
             "gdn-input-scale",
-            header,
-            payload,
+            gdn_fixture(62),
             160,
             "in_proj_qkv.weight_scale",
             |file| {
@@ -1791,11 +1794,9 @@ mod tests {
             },
         );
 
-        let (header, payload) = gdn_fixture(62);
         assert_rejects_bf16_scale(
             "gdn-output-scale",
-            header,
-            payload,
+            gdn_fixture(62),
             168,
             "out_proj.weight_scale",
             |file| {
@@ -1839,7 +1840,7 @@ mod tests {
     #[test]
     fn rejects_full_attention_projection_shape_mismatch() {
         let path = fixture_path("full-attention-shape");
-        let (mut header, payload) = full_attention_fixture(63);
+        let (mut header, payload) = full_attention_fixture(63).into_parts();
         header["model.language_model.layers.63.self_attn.q_proj.weight"]["shape"] = json!([1, 64]);
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
@@ -1885,7 +1886,7 @@ mod tests {
     #[test]
     fn rejects_dense_fp8_weight_dtype_mismatch() {
         let path = fixture_path("dense-fp8-dtype");
-        let (mut header, payload) = dense_fp8_mlp_fixture(56);
+        let (mut header, payload) = dense_fp8_mlp_fixture(56).into_parts();
         header["model.language_model.layers.56.mlp.gate_proj.weight"]["dtype"] = json!("U8");
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
@@ -1907,7 +1908,7 @@ mod tests {
     #[test]
     fn rejects_nvfp4_gate_up_with_different_divisors() {
         let path = fixture_path("nvfp4-divisor");
-        let (header, mut payload) = nvfp4_mlp_fixture(55);
+        let (header, mut payload) = nvfp4_mlp_fixture(55).into_parts();
         payload[8..12].copy_from_slice(&4.0f32.to_le_bytes());
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
