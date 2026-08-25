@@ -102,8 +102,12 @@ pub fn qualify_nvfp4_down() -> Result<Nvfp4DownQualification, Nvfp4DownQualifica
         arena.fill(&stream, regions.output, BF16_SENTINEL as u8)?;
         stream.synchronize().map_err(GpuError::from)?;
         let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, batch))?;
-        graph.launch(&stream)?;
-        graph.launch(&stream)?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
+        // SAFETY: every allocation this graph captured is owned by this scope or
+        // its caller and outlives the replays and the synchronize that follows.
+        unsafe { graph.launch(&stream) }?;
         let replay = arena.copy_to_host(&stream, regions.output)?;
         verify_replay(batch, &eager, &replay, &mut report)?;
 

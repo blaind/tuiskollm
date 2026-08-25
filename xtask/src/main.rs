@@ -1481,9 +1481,27 @@ fn qualify_generation(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(
     )
 }
 
+/// The sm89/sm86 qualification configurations have no engine consumer, so this
+/// host check is the only thing keeping them compiling.
+fn check_portable_qualification(root: &Path) -> Result<(), Box<dyn Error>> {
+    for arch in ["sm89", "sm86"] {
+        run_visible(Command::new("cargo").current_dir(root).args([
+            "check",
+            "--package",
+            "tuisko-qual",
+            "--no-default-features",
+            "--features",
+            arch,
+        ]))?;
+    }
+
+    Ok(())
+}
+
 /// Runs every non-`#[ignore]` (host-side) tuisko-qual unit test with the GPU
 /// hidden, so stale host asserts fail before any device work.
 fn qualify_host(root: &Path) -> Result<(), Box<dyn Error>> {
+    check_portable_qualification(root)?;
     run_oxide_with_env(
         root,
         &[
