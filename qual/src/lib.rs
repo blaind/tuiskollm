@@ -486,7 +486,9 @@ pub use qwen35_gdn_recurrence_benchmark::{
 };
 #[cfg(feature = "device")]
 pub use qwen35_generation::{
-    Qwen35GenerationQualification, Qwen35GenerationQualificationError, qualify_qwen35_generation,
+    Qwen35CompactGenerationQualification, Qwen35GenerationQualification,
+    Qwen35GenerationQualificationError, qualify_qwen35_compact_generation,
+    qualify_qwen35_generation,
 };
 #[cfg(feature = "device")]
 pub use qwen35_nvfp4_attention_output::{

@@ -163,6 +163,13 @@ impl ResidentRequestId {
 }
 
 impl ResidentBatchEvents {
+    pub(crate) const fn from_events(
+        events: [Option<ResidentBatchEvent>; MAX_BATCH],
+        len: usize,
+    ) -> Self {
+        Self { events, len }
+    }
+
     /// Number of requests that produced an event in this scheduler round.
     pub const fn len(&self) -> usize {
         self.len
@@ -365,7 +372,7 @@ impl Qwen35ResidentTextGenerator {
         if control.finish_reason().is_none() {
             program.reset_state(stream)?;
             native_prefill_tokens =
-                prime_qwen35_prompt(program, stream, control.prompt_token_ids())?;
+                prime_qwen35_prompt(program, stream, control.prompt_token_ids(), 0)?;
             program.read_logits_into(stream, 1, logits)?;
         }
         let next_position = u32::try_from(control.prompt_token_ids().len())
@@ -428,7 +435,7 @@ impl Qwen35ResidentTextGenerator {
         require_generation_capacity(token_ids.len(), 1, self.program.context_capacity())?;
         self.program.reset_state(&self.stream)?;
         let native_prefill_tokens =
-            prime_qwen35_prompt(&mut self.program, &self.stream, token_ids)?;
+            prime_qwen35_prompt(&mut self.program, &self.stream, token_ids, 0)?;
         self.program
             .read_logits_into(&self.stream, 1, &mut self.logits)?;
         let mut sampler = Sampler::new(SamplingOptions::greedy(), self.frontend.stop_ids())?;
@@ -1020,7 +1027,7 @@ impl ResidentBatchGenerator {
     }
 }
 
-fn device_zero_context() -> EngineResult<Arc<CudaContext>> {
+pub(crate) fn device_zero_context() -> EngineResult<Arc<CudaContext>> {
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
     if capability != (12, 0) {
@@ -1338,11 +1345,13 @@ fn replay_qwen35_token(
     program.replay(stream, 1)
 }
 
-fn prime_qwen35_prompt(
+pub(crate) fn prime_qwen35_prompt(
     program: &mut Qwen35ResidentModelProgram,
     stream: &CudaStream,
     token_ids: &[u32],
+    slot: usize,
 ) -> EngineResult<usize> {
+    program.load_slot_routes(stream, &[slot])?;
     let native_tokens = qwen35_native_prefill_tokens(token_ids.len()).unwrap_or(0);
     if native_tokens != 0 {
         let rotary_values = native_tokens
@@ -1360,9 +1369,10 @@ fn prime_qwen35_prompt(
             rope_sin[begin..begin + ROTARY_PAIRS].copy_from_slice(&sine);
         }
         program.stage_prefill_embeddings(stream, &token_ids[..native_tokens])?;
-        let route = program.load_prefill_state(
+        let route = program.load_prefill_slot_state(
             stream,
             native_tokens,
+            slot,
             &rope_cos[..rotary_values],
             &rope_sin[..rotary_values],
         )?;
@@ -1464,7 +1474,7 @@ const fn qwen36_native_prefill_tokens(prompt_tokens: usize) -> Option<usize> {
     None
 }
 
-fn text_rope(position: u32) -> ([f32; ROTARY_PAIRS], [f32; ROTARY_PAIRS]) {
+pub(crate) fn text_rope(position: u32) -> ([f32; ROTARY_PAIRS], [f32; ROTARY_PAIRS]) {
     let mut cosine = [0.0f32; ROTARY_PAIRS];
     let mut sine = [0.0f32; ROTARY_PAIRS];
     for pair in 0..ROTARY_PAIRS {
@@ -1476,7 +1486,7 @@ fn text_rope(position: u32) -> ([f32; ROTARY_PAIRS], [f32; ROTARY_PAIRS]) {
     (cosine, sine)
 }
 
-fn require_generation_capacity(
+pub(crate) fn require_generation_capacity(
     prompt_tokens: usize,
     maximum_new_tokens: usize,
     context_capacity: usize,
