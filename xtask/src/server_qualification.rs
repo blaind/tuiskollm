@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MODEL: &str = "nvidia/Qwen3.6-35B-A3B-NVFP4";
-const GENERATION_ROUTE: &str = "single-token";
+const GENERATION_ROUTE: &str = "compact-b1-8";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -268,6 +268,7 @@ fn validate_usage(label: &str, usage: &Value) -> Result<(), String> {
         "prompt_tokens": 11,
         "completion_tokens": 2,
         "total_tokens": 13,
+        "prompt_tokens_details": {"cached_tokens": 0},
     });
     if usage != &expected {
         return Err(format!(
@@ -279,7 +280,7 @@ fn validate_usage(label: &str, usage: &Value) -> Result<(), String> {
 
 fn validate_startup_output(output: &Output) -> Result<(), Box<dyn Error>> {
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for evidence in [MODEL, "124468 tensors", "READY", "1 slots · context 262144"] {
+    for evidence in [MODEL, "124468 tensors", "READY", "8 slots · context 262144"] {
         if !stdout.contains(evidence) {
             return Err(format!(
                 "server startup omitted {evidence:?}{}",
@@ -341,7 +342,7 @@ mod tests {
 
     #[test]
     fn exact_json_boundaries_are_admitted() {
-        validate_health(r#"{"status":"ok","generation_route":"single-token"}"#).unwrap();
+        validate_health(r#"{"status":"ok","generation_route":"compact-b1-8"}"#).unwrap();
         validate_models(
             &json!({
                 "object": "list",
@@ -363,7 +364,12 @@ mod tests {
                         "reasoning_content": "Here's",
                     },
                 }],
-                "usage": {"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 13},
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 2,
+                    "total_tokens": 13,
+                    "prompt_tokens_details": {"cached_tokens": 0},
+                },
             })
             .to_string(),
         )
@@ -374,7 +380,7 @@ mod tests {
     fn health_requires_the_qwen36_generation_route() {
         let error =
             validate_health(r#"{"status":"ok","generation_route":"mtp-draft-3"}"#).unwrap_err();
-        assert!(error.contains("single-token"));
+        assert!(error.contains("compact-b1-8"));
     }
 
     #[test]
@@ -400,7 +406,12 @@ mod tests {
                 "object": "chat.completion.chunk",
                 "model": MODEL,
                 "choices": [],
-                "usage": {"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 13},
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 2,
+                    "total_tokens": 13,
+                    "prompt_tokens_details": {"cached_tokens": 0},
+                },
             }),
         );
         validate_streaming(&body).unwrap();
@@ -420,7 +431,12 @@ mod tests {
                     "reasoning_content": "Here's",
                 },
             }],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 0},
+            },
         });
         assert!(validate_blocking(&blocking.to_string()).is_err());
         assert!(validate_streaming("data: {}\n\n").is_err());
