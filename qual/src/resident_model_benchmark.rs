@@ -66,9 +66,11 @@ pub struct ResidentModelProfileManifest {
     pub schema_version: u32,
     /// Exact profiling boundary.
     pub suite: &'static str,
-    /// Compiled decode batch.
-    pub batch_size: usize,
-    /// Fixed warmed attention context.
+    /// Compiled decode batch; absent for a prefill graph.
+    pub batch_size: Option<usize>,
+    /// Active prompt rows; absent for a decode graph.
+    pub prompt_tokens: Option<usize>,
+    /// Exact attention context represented by the graph.
     pub context_tokens: usize,
     /// Warmups completed before the captured replays.
     pub warmup_launches: u64,
@@ -591,6 +593,236 @@ pub fn profile_resident_model(
     ))
 }
 
+/// Captures profiler-scoped replays of one exact from-empty prefill chunk graph.
+pub fn profile_resident_prefill(
+    root: &Path,
+    tokens: usize,
+    warmup_launches: u64,
+    captured_replays: u64,
+    graph_dot: &Path,
+) -> Result<ResidentModelProfileManifest, DeviceBenchmarkError> {
+    if tokens != 1_024 || warmup_launches == 0 || captured_replays == 0 {
+        return Err(DeviceBenchmarkError::Precondition(
+            "resident prefill profile requires T=1024 and nonzero warmup/captured replay counts"
+                .to_string(),
+        ));
+    }
+    let _preflight = preflight()?;
+    let session = PrefillSession::new(root)?;
+    let index = session
+        .routes
+        .iter()
+        .position(|route| route.tokens() == tokens && route.first_position() == 0)
+        .ok_or_else(|| {
+            DeviceBenchmarkError::Precondition(format!(
+                "resident prefill profile tokens {tokens} has no from-empty route"
+            ))
+        })?;
+    let stage_graphs = session.stage_graphs()?;
+    session.warm(&stage_graphs, warmup_launches)?;
+    require_current_process_exclusive()?;
+    let route = session.routes[index];
+    session
+        .program
+        .qualification_prefill_graph(route)?
+        .debug_dot(graph_dot)?;
+    profiler_start(&session._context)?;
+    for _ in 0..captured_replays {
+        // SAFETY: the stage graph borrows the session's program, which owns
+        // every captured device allocation, and itself retains its pinned
+        // sources; both outlive the replays and the synchronizes that follow.
+        unsafe { stage_graphs[index].graph().launch(&session.stream) }?;
+        session.stream.synchronize().map_err(GpuError::from)?;
+        let graph = session.program.qualification_prefill_graph(route)?;
+        // SAFETY: the session's program owns the graph and every allocation it
+        // captured, outliving the replay and the synchronize that follows.
+        unsafe { graph.launch(&session.stream) }?;
+        session.stream.synchronize().map_err(GpuError::from)?;
+    }
+    profiler_stop(&session._context)?;
+    require_current_process_exclusive()?;
+
+    Ok(resident_prefill_profile_manifest(
+        session.program.layout(),
+        route.tokens(),
+        route.first_position(),
+        route.context_tokens(),
+        route.partition_capacity(),
+        warmup_launches,
+        captured_replays,
+        graph_dot,
+    ))
+}
+
+fn resident_prefill_profile_manifest(
+    layout: &ResidentModelLayout,
+    tokens: usize,
+    first_position: usize,
+    context_tokens: usize,
+    partitions: Option<usize>,
+    warmup_launches: u64,
+    captured_replays: u64,
+    graph_dot: &Path,
+) -> ResidentModelProfileManifest {
+    assert_eq!(tokens, 1_024);
+    assert_eq!(first_position, 0);
+    assert_eq!(context_tokens, 1_024);
+    assert_eq!(partitions, Some(4));
+
+    let mut stages = Vec::new();
+    let mut next_node = 1usize;
+    let mut push = |layer, component, source_route, kernel_families: Vec<&'static str>| {
+        let kernel_nodes = kernel_families.len();
+        stages.push(ResidentProfileStage {
+            ordinal: stages.len() + 1,
+            first_graph_node_ordinal: next_node,
+            kernel_nodes,
+            layer,
+            component,
+            source_route,
+            kernel_families,
+        });
+        next_node += kernel_nodes;
+    };
+    push(None, "input_norm", "shared", vec!["rms_norm_prefill"]);
+    for layer in 0..layout.layer_count() {
+        let kind = layout
+            .layer_kind(layer)
+            .expect("resident layout layer count and kind inventory agree");
+        let source_route = match kind {
+            ResidentLayerKind::Nvfp4Gdn => "nvfp4_gdn",
+            ResidentLayerKind::Nvfp4Attention => "nvfp4_attention",
+            ResidentLayerKind::DenseFp8Gdn => "dense_fp8_gdn",
+            ResidentLayerKind::DenseFp8Attention => "dense_fp8_attention",
+        };
+        match kind {
+            ResidentLayerKind::Nvfp4Gdn | ResidentLayerKind::DenseFp8Gdn => {
+                push(
+                    Some(layer),
+                    "gdn_input",
+                    source_route,
+                    vec!["quantize_activation_e4m3", "fp8_gdn_input_mma_t1024"],
+                );
+                push(
+                    Some(layer),
+                    "gdn_prepare",
+                    source_route,
+                    vec![
+                        "gdn_control_prefill_exact",
+                        "gdn_convolution_prefill_exact",
+                        "gdn_convolution_prefill_history_exact",
+                    ],
+                );
+                push(
+                    Some(layer),
+                    "gdn_recurrence",
+                    source_route,
+                    vec!["gdn_recurrence_prefill_exact"],
+                );
+                push(
+                    Some(layer),
+                    "gdn_output",
+                    source_route,
+                    vec!["gdn_output_quantize", "gdn_output_projection_mma_t1024"],
+                );
+            }
+            ResidentLayerKind::Nvfp4Attention | ResidentLayerKind::DenseFp8Attention => {
+                push(
+                    Some(layer),
+                    "attention_qkv",
+                    source_route,
+                    vec!["quantize_activation_e4m3", "fp8_qkv_mma_t1024"],
+                );
+                push(
+                    Some(layer),
+                    "attention_qk_prepare",
+                    source_route,
+                    vec!["attention_qk_prepare_prefill_exact"],
+                );
+                push(
+                    Some(layer),
+                    "paged_gqa",
+                    source_route,
+                    vec![
+                        "paged_gqa_prefill_flash_macro_exact",
+                        "paged_gqa_prefill_macro_reduce_exact",
+                    ],
+                );
+                push(
+                    Some(layer),
+                    "attention_output",
+                    source_route,
+                    vec![
+                        "attention_gate_quantize_exact",
+                        "attention_output_projection_mma_t1024",
+                    ],
+                );
+            }
+        }
+        push(
+            Some(layer),
+            "post_mixer_residual_norm",
+            source_route,
+            vec!["residual_rms_norm_prefill"],
+        );
+        match kind {
+            ResidentLayerKind::Nvfp4Gdn | ResidentLayerKind::Nvfp4Attention => {
+                push(
+                    Some(layer),
+                    "mlp_swiglu",
+                    source_route,
+                    vec!["nvfp4_quantize", "nvfp4_swiglu_w4a4"],
+                );
+                push(
+                    Some(layer),
+                    "mlp_down",
+                    source_route,
+                    vec!["nvfp4_down_quantize", "nvfp4_down_w4a4"],
+                );
+            }
+            ResidentLayerKind::DenseFp8Gdn | ResidentLayerKind::DenseFp8Attention => {
+                push(
+                    Some(layer),
+                    "mlp_swiglu",
+                    source_route,
+                    vec!["fp8_swiglu_quantize", "fp8_swiglu_tma_t1024"],
+                );
+                push(
+                    Some(layer),
+                    "mlp_down",
+                    source_route,
+                    vec!["fp8_down_quantize", "fp8_down_tma_t1024"],
+                );
+            }
+        }
+        push(
+            Some(layer),
+            "post_mlp_residual_norm",
+            source_route,
+            vec!["residual_rms_norm_prefill"],
+        );
+    }
+    push(
+        None,
+        "lm_head",
+        "text_endpoint",
+        vec!["quantize_activation_e4m3", "fp8_lm_head"],
+    );
+
+    ResidentModelProfileManifest {
+        schema_version: 1,
+        suite: "resident_model/text_prefill",
+        batch_size: None,
+        prompt_tokens: Some(tokens),
+        context_tokens,
+        warmup_launches,
+        captured_replays,
+        graph_dot: graph_dot.display().to_string(),
+        graph_kernel_nodes: next_node - 1,
+        stages,
+    }
+}
+
 fn resident_profile_manifest(
     layout: &ResidentModelLayout,
     batch: usize,
@@ -724,7 +956,8 @@ fn resident_profile_manifest(
     ResidentModelProfileManifest {
         schema_version: 1,
         suite: "resident_model/text_decode",
-        batch_size: batch,
+        batch_size: Some(batch),
+        prompt_tokens: None,
         context_tokens: CONTEXT_TOKENS,
         warmup_launches,
         captured_replays,
@@ -960,7 +1193,7 @@ fn benchmark_resident_profile(
 mod tests {
     use super::{
         CONTEXT_TOKENS, LONG_CONTEXT_TOKENS, MAX_BATCH, logical_bytes, prefill_logical_bytes,
-        resident_profile_manifest,
+        resident_prefill_profile_manifest, resident_profile_manifest,
     };
     use std::path::Path;
     use tuisko_engine::ResidentModelLayout;
@@ -1016,5 +1249,29 @@ mod tests {
         assert_eq!(b1.stages.first().unwrap().first_graph_node_ordinal, 1);
         let last = b1.stages.last().unwrap();
         assert_eq!(last.first_graph_node_ordinal + last.kernel_nodes - 1, 763);
+    }
+
+    #[test]
+    fn semantic_prefill_manifest_covers_the_exact_macro_graph() {
+        let layout = ResidentModelLayout::build().unwrap();
+        let manifest = resident_prefill_profile_manifest(
+            &layout,
+            1_024,
+            0,
+            1_024,
+            Some(4),
+            16,
+            3,
+            Path::new("graph.dot"),
+        );
+
+        assert_eq!(manifest.suite, "resident_model/text_prefill");
+        assert_eq!(manifest.batch_size, None);
+        assert_eq!(manifest.prompt_tokens, Some(1_024));
+        assert_eq!(manifest.context_tokens, 1_024);
+        assert_eq!(manifest.stages.len(), 514);
+        assert_eq!(manifest.graph_kernel_nodes, 883);
+        let last = manifest.stages.last().unwrap();
+        assert_eq!(last.first_graph_node_ordinal + last.kernel_nodes - 1, 883);
     }
 }

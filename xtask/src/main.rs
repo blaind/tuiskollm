@@ -6233,12 +6233,17 @@ fn run_optimization_benchmark(
 
 fn profile(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
     let [scope, snapshot, remaining @ ..] = arguments else {
-        return Err("usage: cargo run -p xtask -- profile resident-model SNAPSHOT [--batch B] [--replays N] [--tool nsys|ncu] [--kernel REGEX] [--output-dir PATH]".into());
+        return Err("usage: cargo run -p xtask -- profile <resident-model|resident-prefill> SNAPSHOT [--batch B | --tokens T] [--replays N] [--tool nsys|ncu] [--kernel REGEX] [--output-dir PATH]".into());
     };
-    if scope != "resident-model" {
-        return Err(format!("unknown profile scope `{}`", scope.to_string_lossy()).into());
-    }
+    let prefill = match scope.to_str() {
+        Some("resident-model") => false,
+        Some("resident-prefill") => true,
+        _ => {
+            return Err(format!("unknown profile scope `{}`", scope.to_string_lossy()).into());
+        }
+    };
     let mut batch = 1u32;
+    let mut tokens = 1_024u32;
     let mut replays = 3u64;
     let mut tool = "nsys";
     let mut kernel = None;
@@ -6249,7 +6254,14 @@ fn profile(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn 
             .next()
             .ok_or_else(|| format!("`{}` requires a value", argument.to_string_lossy()))?;
         match argument.to_str().ok_or("profile argument is not UTF-8")? {
+            "--batch" if prefill => {
+                return Err("resident-prefill profiling does not accept `--batch`".into());
+            }
             "--batch" => batch = value.to_str().ok_or("batch is not UTF-8")?.parse()?,
+            "--tokens" if !prefill => {
+                return Err("resident-model profiling does not accept `--tokens`".into());
+            }
+            "--tokens" => tokens = value.to_str().ok_or("tokens is not UTF-8")?.parse()?,
             "--replays" => replays = value.to_str().ok_or("replays is not UTF-8")?.parse()?,
             "--tool" => tool = value.to_str().ok_or("profile tool is not UTF-8")?,
             "--kernel" => kernel = Some(value.to_str().ok_or("kernel filter is not UTF-8")?),
@@ -6259,6 +6271,9 @@ fn profile(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn 
     }
     if !(1..=8).contains(&batch) || replays == 0 {
         return Err("resident profile requires `--batch 1..=8` and nonzero `--replays`".into());
+    }
+    if prefill && tokens != 1_024 {
+        return Err("resident prefill profile currently requires `--tokens 1024`".into());
     }
     if !matches!(tool, "nsys" | "ncu") {
         return Err("resident profile tool must be `nsys` or `ncu`".into());
@@ -6278,19 +6293,34 @@ fn profile(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn 
         )
         .into());
     }
-    let output_dir =
-        output_dir.unwrap_or_else(|| root.join(format!("target/profiles/resident-model-b{batch}")));
+    let stem = if prefill {
+        format!("resident-prefill-t{tokens}")
+    } else {
+        format!("resident-model-b{batch}")
+    };
+    let output_dir = output_dir.unwrap_or_else(|| root.join(format!("target/profiles/{stem}")));
     fs::create_dir_all(&output_dir)?;
-    let stem = format!("resident-model-b{batch}");
     let graph_dot = output_dir.join(format!("{stem}-graph.dot"));
     let manifest = output_dir.join(format!("{stem}-semantic.json"));
     let profile_prefix = output_dir.join(format!("{stem}-{tool}"));
     let warmup_launches = if tool == "ncu" { 1 } else { 16 };
     let profile_arguments = [
-        "profile-resident-model".into(),
+        if prefill {
+            "profile-resident-prefill".into()
+        } else {
+            "profile-resident-model".into()
+        },
         snapshot.clone(),
-        "--batch".into(),
-        batch.to_string().into(),
+        if prefill {
+            "--tokens".into()
+        } else {
+            "--batch".into()
+        },
+        if prefill {
+            tokens.to_string().into()
+        } else {
+            batch.to_string().into()
+        },
         "--warmup-launches".into(),
         warmup_launches.to_string().into(),
         "--captured-replays".into(),
@@ -6358,8 +6388,9 @@ fn profile(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn 
     )?;
     let metadata = serde_json::json!({
         "schema_version": 1,
-        "scope": "resident-model",
-        "batch_size": batch,
+        "scope": if prefill { "resident-prefill" } else { "resident-model" },
+        "batch_size": (!prefill).then_some(batch),
+        "prompt_tokens": prefill.then_some(tokens),
         "captured_replays": replays,
         "warmup_launches": warmup_launches,
         "tool": tool,

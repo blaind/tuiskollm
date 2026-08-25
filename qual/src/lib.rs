@@ -706,6 +706,7 @@ pub use resident_model::{
 pub use resident_model_benchmark::{
     ResidentModelProfileManifest, ResidentProfileStage, benchmark_resident_long_context_model,
     benchmark_resident_model, benchmark_resident_prefill, profile_resident_model,
+    profile_resident_prefill,
 };
 #[cfg(feature = "device")]
 pub use resident_mtp::{
