@@ -9,7 +9,6 @@ mod program;
 mod qwen35;
 mod qwen36;
 mod qwen38;
-mod resident_generation;
 mod sampling;
 
 #[cfg(feature = "qualification")]
@@ -18,6 +17,10 @@ pub use common::mtp::{
     ResidentMtpGenerationStats, ResidentMtpGreedyStats, ResidentMtpSampledRound,
 };
 pub use common::progress::{ResidentLoadPhase, ResidentLoadProgress};
+pub use common::text_generator::{
+    ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentCancellation,
+    ResidentRequestId,
+};
 pub use error::{EngineError, EngineErrorCode, EngineResult};
 pub use generation::{
     CancelledText, ChatGenerationRequest, FinishReason, GeneratedText, GenerationSession,
@@ -69,6 +72,7 @@ pub use qwen36::resident_model::{
 };
 pub use qwen36::text_endpoint::Qwen36TextEndpointProgram;
 pub use qwen36::text_endpoint_layout::Qwen36TextEndpointLayout;
+pub use qwen38::batch_generation::ResidentBatchGenerator;
 pub use qwen38::dense_fp8_gdn_layer::DenseFp8GdnLayerProgram;
 pub use qwen38::dense_fp8_gdn_layer_layout::DenseFp8GdnLayerLayout;
 pub use qwen38::dense_fp8_mlp::DenseFp8MlpProgram;
@@ -101,10 +105,6 @@ pub use qwen38::resident_mtp_generation::{ResidentMtpGenerationSession, Resident
 pub use qwen38::resident_mtp_layout::ResidentMtpLayout;
 pub use qwen38::upload_plan::{
     ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
-};
-pub use resident_generation::{
-    ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentBatchGenerator,
-    ResidentCancellation, ResidentRequestId,
 };
 /// Single-slot Qwen3.5 streaming request over the resident text program.
 pub type Qwen35ResidentGenerationSession<'a> =

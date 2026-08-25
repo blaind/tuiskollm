@@ -1,14 +1,14 @@
-//! Target-neutral single-slot text generation shared by every resident model owner.
+//! Target-neutral single-slot text generation and compact-batch scheduler vocabulary.
 
 use crate::common::slots::require_generation_capacity;
 use crate::{
-    ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
-    GenerationSession, GenerationStep,
+    CancelledText, ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
+    GenerationSession, GenerationStep, MAX_BATCH,
 };
 #[cfg(feature = "qualification")]
 use crate::{Sampler, SamplingOptions};
 use std::sync::Arc;
-use tuisko_frontend::{GenerationDefaults, TextFrontend};
+use tuisko_frontend::{GenerationDefaults, PromptEncodingMetrics, TextFrontend};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
 use tuisko_model::{Arch, CheckpointSnapshot};
 
@@ -255,5 +255,88 @@ impl<M: ModelProgram> SingleSlotGenerationSession<'_, M> {
             self.pending_token = Some(step.token_id);
         }
         Ok(step)
+    }
+}
+
+/// Stable request identity assigned by the compact scheduler.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ResidentRequestId(u64);
+
+/// Admission result, including an immediate zero-token completion when requested.
+pub struct ResidentBatchAdmission {
+    /// Scheduler-assigned request identity.
+    pub request_id: ResidentRequestId,
+    /// Exact rendered prompt length in tokens.
+    pub prompt_tokens: usize,
+    /// Prompt tokens restored from an exact retained device-state prefix.
+    pub device_reused_tokens: usize,
+    /// Prompt tokens processed by exact whole-model prefill graphs.
+    pub native_prefill_tokens: usize,
+    /// Observation-only frontend timing and prefix-lookup detail.
+    pub prompt_metrics: PromptEncodingMetrics,
+    /// Immediate output for a request with `max_new_tokens == 0`.
+    pub completed: Option<GeneratedText>,
+}
+
+/// One streamed scheduler event and its optional complete terminal output.
+pub struct ResidentBatchEvent {
+    /// Request that produced this event.
+    pub request_id: ResidentRequestId,
+    /// Newly selected token, streaming delta, and terminal boundary.
+    pub step: GenerationStep,
+    /// Complete output when `step` finished the request.
+    pub completed: Option<GeneratedText>,
+}
+
+/// Observable state returned when an active resident request is cancelled.
+pub struct ResidentCancellation {
+    /// Cancelled scheduler request.
+    pub request_id: ResidentRequestId,
+    /// Tokens and text emitted before cancellation.
+    pub output: CancelledText,
+    /// Processed prefix tokens whose device state remains retained.
+    pub device_retained_tokens: usize,
+}
+
+/// At most eight events returned in the scheduler's stable active order.
+pub struct ResidentBatchEvents {
+    events: [Option<ResidentBatchEvent>; MAX_BATCH],
+    len: usize,
+}
+
+impl ResidentRequestId {
+    pub(crate) const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Numeric identity suitable for transport correlation and logs.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl ResidentBatchEvents {
+    pub(crate) const fn from_events(
+        events: [Option<ResidentBatchEvent>; MAX_BATCH],
+        len: usize,
+    ) -> Self {
+        Self { events, len }
+    }
+
+    /// Number of requests that produced an event in this scheduler round.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether this scheduler round produced no events.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Events in the active order that existed at the start of the round.
+    pub fn iter(&self) -> impl Iterator<Item = &ResidentBatchEvent> {
+        self.events[..self.len]
+            .iter()
+            .map(|event| event.as_ref().expect("active event prefix is initialized"))
     }
 }
