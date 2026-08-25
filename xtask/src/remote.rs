@@ -410,7 +410,7 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
         let options = parse_options(&arguments[1..], false)?;
         tuisko_remote::check_credentials().map_err(|error| format!("{error}"))?;
         tuisko_remote::run_probe(&tuisko_remote::ProbeOptions {
-            gpu: options.gpu.remote_gpu(),
+            gpu: options.gpu,
             image: options.image,
             max_minutes: options.max_minutes,
             keep_on_fail: options.keep_on_fail,
@@ -452,7 +452,7 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     suite: route.suite().to_owned(),
                     executable: prepared.executable,
                     test_args: prepared.test_args,
-                    gpu: options.gpu.remote_gpu(),
+                    gpu: options.gpu,
                     source_snapshot: route.source_snapshot,
                     image: options.image,
                     max_minutes: options.max_minutes,
@@ -471,7 +471,7 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     executable: prepared.executable,
                     benchmark_args: options.benchmark_args,
                     generator_baseline_sha256: prepared.generator_baseline_sha256,
-                    gpu: options.gpu.remote_gpu(),
+                    gpu: options.gpu,
                     source_snapshot: route.source_snapshot,
                     image: options.image,
                     max_minutes: options.max_minutes,

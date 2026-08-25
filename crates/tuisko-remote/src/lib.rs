@@ -1,7 +1,6 @@
 //! Runs prebuilt qualification and benchmark executables on ephemeral RunPod GPU pods.
 
 mod error;
-mod gpu;
 mod key;
 mod run;
 mod sentry;
@@ -9,7 +8,10 @@ mod ssh;
 mod v2;
 
 pub use error::RemoteError;
-pub use gpu::GpuTarget;
+/// Exact GPU identity a remote run demands, shared with build, qualification,
+/// and startup selection.
+pub use tuisko_targets::TargetProfile as GpuTarget;
+
 pub use run::{
     BenchmarkOptions, ProbeOptions, QualificationOptions, check, check_credentials, run_benchmark,
     run_probe, run_qualification, sweep_stale,

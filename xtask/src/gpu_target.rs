@@ -13,9 +13,6 @@ pub(crate) trait BuildTargetProfile {
     fn nvfp4_swiglu_resource_baseline(self) -> Option<&'static str>;
     fn nvfp4_down_resource_baseline(self) -> Option<&'static str>;
     fn fp8_qkv_resource_baseline(self) -> Option<&'static str>;
-
-    #[cfg(feature = "remote")]
-    fn remote_gpu(self) -> tuisko_remote::GpuTarget;
 }
 
 impl BuildTargetProfile for GpuTarget {
@@ -89,11 +86,6 @@ impl BuildTargetProfile for GpuTarget {
             Self::Sm89 => Some("qual/baselines/fp8-qkv-sm89.txt"),
             Self::Sm86 => None,
         }
-    }
-
-    #[cfg(feature = "remote")]
-    fn remote_gpu(self) -> tuisko_remote::GpuTarget {
-        tuisko_remote::GpuTarget::new(self.device_name(), self.compute_capability_text())
     }
 }
 
