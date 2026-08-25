@@ -2,9 +2,10 @@
 
 use crate::Sm120Arch;
 use crate::device::paged_gqa::{
-    BF16_PREFILL_SHARED_BYTES, BF16_PREFILL_THREADS, FLASH_PREFILL_P8_SHARED_BYTES,
-    FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS, PREFILL_PARTIAL_VALUES,
-    PREFILL_SHARED_BYTES, PREFILL_THREADS, QWEN35_BF16_PREFILL_THREADS, QWEN36_FP8_PREFILL_THREADS,
+    BF16_PREFILL_SHARED_BYTES, BF16_PREFILL_THREADS, DECODE_RING_SHARED_BYTES,
+    FLASH_PREFILL_P8_SHARED_BYTES, FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS,
+    PREFILL_PARTIAL_VALUES, PREFILL_SHARED_BYTES, PREFILL_THREADS, QWEN35_BF16_PREFILL_THREADS,
+    QWEN36_FP8_PREFILL_THREADS,
     bf16_paged_gqa, bf16_paged_gqa_prefill_shared, paged_gqa, paged_gqa_prefill_flash_partitioned,
     paged_gqa_prefill_partitioned_reduce, paged_gqa_prefill_shared,
 };
@@ -204,7 +205,8 @@ mod kernels {
         domain = 1,
         coordinates = u32,
         block = (32, 1, 1),
-        dynamic_shared = 0,
+        dynamic_shared = 8192,
+        dynamic_shared_alignment = 16,
         min_compute_capability = (12, 0),
     )]
     pub fn qwen35_paged_gqa_exact<const TOKENS: usize>(
@@ -284,7 +286,8 @@ mod kernels {
         domain = 1,
         coordinates = u32,
         block = (32, 1, 1),
-        dynamic_shared = 0,
+        dynamic_shared = 8192,
+        dynamic_shared_alignment = 16,
         min_compute_capability = (12, 0),
     )]
     pub fn qwen36_paged_gqa_exact<const TOKENS: usize>(
@@ -790,7 +793,11 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
 
         Ok(Self {
             attention: module
-                .prepare_qwen35_paged_gqa_exact::<TOKENS>(LaunchConfig1D::new(blocks, THREADS, 0))
+                .prepare_qwen35_paged_gqa_exact::<TOKENS>(LaunchConfig1D::new(
+                    blocks,
+                    THREADS,
+                    DECODE_RING_SHARED_BYTES as u32,
+                ))
                 .map_err(|source| GpuError::launch("preparing Qwen3.5 paged GQA", source))?,
         })
     }
@@ -895,7 +902,11 @@ impl<const TOKENS: usize> PreparedQwen36Route<TOKENS> {
 
         Ok(Self {
             attention: module
-                .prepare_qwen36_paged_gqa_exact::<TOKENS>(LaunchConfig1D::new(blocks, THREADS, 0))
+                .prepare_qwen36_paged_gqa_exact::<TOKENS>(LaunchConfig1D::new(
+                    blocks,
+                    THREADS,
+                    DECODE_RING_SHARED_BYTES as u32,
+                ))
                 .map_err(|source| GpuError::launch("preparing Qwen3.6 paged GQA", source))?,
         })
     }
