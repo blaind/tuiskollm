@@ -7422,7 +7422,7 @@ fn wait_for_device_idle() -> Result<(), Box<dyn Error>> {
 }
 
 fn require_performance_device_idle() -> Result<(), Box<dyn Error>> {
-    require_device_idle("performance setup")
+    wait_for_device_idle()
 }
 
 fn require_device_idle(activity: &str) -> Result<(), Box<dyn Error>> {
@@ -14969,20 +14969,20 @@ fn require_uniform_value(
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPOSED_PERFORMANCE_SUITES, MAX_IDLE_DEVICE_MEMORY_MIB, MTP_LAYER_RESOURCE_BASELINES,
+        COMPOSED_PERFORMANCE_SUITES, MAX_IDLE_DEVICE_MEMORY_MIB,
         MTP_BF16_PAGED_GQA_BENCHMARK_FILTER, MTP_LAYER_BENCHMARK_FILTER,
-        MTP_LAYER_TEST_FILTER, OptimizationSuite, PERFORMANCE_SUITES, PerformanceSuite,
-        QWEN35_LONG_CONTEXT_KV_TEST_FILTER, QWEN35_MTP_BATCH_GENERATION_TEST_FILTER,
-        QWEN35_MTP_GENERATION_TEST_FILTER, QWEN35_RESIDENT_MODEL_TEST_FILTER,
-        QWEN35_RESIDENT_MTP_TEST_FILTER, QWEN35_RESIDUAL_NORM_TEST_FILTER,
-        QWEN35_TEXT_ENDPOINT_TEST_FILTER, QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
-        QWEN36_MTP_LAYER_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
-        SM120_RESOURCE_BASELINES, device_is_idle, parse_baseline, parse_compute_pids,
-        parse_cuda_toolkit_identity, parse_entries, parse_performance_device_sample,
-        parse_performance_iteration, parse_resources, parse_rustc_identity,
-        preflight_performance_baselines, require_consumed_baseline_keys, require_count,
-        require_registers, require_uniform_value, resolve_target_output, sass_function_body,
-        workspace_root,
+        MTP_LAYER_RESOURCE_BASELINES, MTP_LAYER_TEST_FILTER, OptimizationSuite, PERFORMANCE_SUITES,
+        PerformanceSuite, QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
+        QWEN35_MTP_BATCH_GENERATION_TEST_FILTER, QWEN35_MTP_GENERATION_TEST_FILTER,
+        QWEN35_RESIDENT_MODEL_TEST_FILTER, QWEN35_RESIDENT_MTP_TEST_FILTER,
+        QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN35_TEXT_ENDPOINT_TEST_FILTER,
+        QWEN36_LONG_CONTEXT_KV_TEST_FILTER, QWEN36_MTP_LAYER_TEST_FILTER,
+        QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, device_is_idle,
+        parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
+        parse_performance_device_sample, parse_performance_iteration, parse_resources,
+        parse_rustc_identity, preflight_performance_baselines, require_consumed_baseline_keys,
+        require_count, require_registers, require_uniform_value, resolve_target_output,
+        sass_function_body, workspace_root,
     };
     use std::ffi::OsString;
 
