@@ -1,5 +1,7 @@
 //! Qwen3.5-9B lossless materialization into runtime-native host layouts.
 
+use crate::Arch;
+use crate::common::inventory::CheckpointSnapshot;
 use crate::common::materialized::{MaterializedMemory, sealed};
 use crate::common::modelopt_codec::{
     MaterializedModelOptNvfp4Linear, ModelOptNvfp4LinearBindings, ModelOptScaleCodec,
@@ -12,6 +14,7 @@ use crate::common::routes::{
     require_full_attention_layer, require_gdn_layer_route, validate_nvfp4_scales,
 };
 use crate::common::scale_swizzle::{PlaneGatherer, SCALE_TILE_ROWS, host_shape};
+use crate::common::source_binding::{SourceLayerBinding, sealed as binding_sealed};
 use crate::qwen35::bindings::{
     ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings,
 };
@@ -38,6 +41,20 @@ pub struct MaterializedModelOptNvfp4Mlp<'a> {
     pub next_norm: Bf16View<'a, 1>,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl binding_sealed::Sealed for ModelOptNvfp4MlpBindings<'_> {}
+
+impl<'a, A: Arch> SourceLayerBinding<'a, A> for ModelOptNvfp4MlpBindings<'a> {
+    type Materialized = MaterializedModelOptNvfp4Mlp<'a>;
+
+    fn bind(snapshot: &'a CheckpointSnapshot<A>, layer: usize) -> CheckpointResult<Self> {
+        Self::bind::<A>(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Self::materialize(self)
+    }
 }
 
 impl sealed::Sealed for MaterializedModelOptNvfp4Mlp<'_> {}
@@ -79,6 +96,20 @@ pub struct MaterializedModelOptNvfp4Attention<'a> {
     pub post_attention_norm: Bf16View<'a, 1>,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl binding_sealed::Sealed for ModelOptNvfp4AttentionBindings<'_> {}
+
+impl<'a, A: Arch> SourceLayerBinding<'a, A> for ModelOptNvfp4AttentionBindings<'a> {
+    type Materialized = MaterializedModelOptNvfp4Attention<'a>;
+
+    fn bind(snapshot: &'a CheckpointSnapshot<A>, layer: usize) -> CheckpointResult<Self> {
+        Self::bind::<A>(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Self::materialize(self)
+    }
 }
 
 impl sealed::Sealed for MaterializedModelOptNvfp4Attention<'_> {}
@@ -142,6 +173,20 @@ pub struct MaterializedModelOptNvfp4Gdn<'a> {
     pub post_attention_norm: Bf16View<'a, 1>,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl binding_sealed::Sealed for ModelOptNvfp4GdnBindings<'_> {}
+
+impl<'a, A: Arch> SourceLayerBinding<'a, A> for ModelOptNvfp4GdnBindings<'a> {
+    type Materialized = MaterializedModelOptNvfp4Gdn<'a>;
+
+    fn bind(snapshot: &'a CheckpointSnapshot<A>, layer: usize) -> CheckpointResult<Self> {
+        Self::bind::<A>(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Self::materialize(self)
+    }
 }
 
 impl sealed::Sealed for MaterializedModelOptNvfp4Gdn<'_> {}

@@ -1,9 +1,12 @@
 //! NVFP4 gate/up and down source carriers shared by the compressed-tensors and ModelOpt MLP routes.
 
+use crate::Arch;
+use crate::common::inventory::CheckpointSnapshot;
 use crate::common::materialized::{MaterializedMemory, sealed};
 use crate::common::modelopt_codec::{logical_columns, validate_divisor};
 use crate::common::routes::{require_nvfp4_mlp_layer, validate_nvfp4_scales};
 use crate::common::scale_swizzle::{PlaneGatherer, host_shape};
+use crate::common::source_binding::{SourceLayerBinding, sealed as binding_sealed};
 use crate::{CheckpointError, CheckpointResult, Fp8E4M3View, U8View};
 
 /// Exact packed gate/up source planes for one NVFP4 MLP layer.
@@ -63,6 +66,20 @@ pub struct MaterializedNvfp4GateUp<'a> {
     pub columns: usize,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl binding_sealed::Sealed for Nvfp4GateUpBindings<'_> {}
+
+impl<'a, A: Arch> SourceLayerBinding<'a, A> for Nvfp4GateUpBindings<'a> {
+    type Materialized = MaterializedNvfp4GateUp<'a>;
+
+    fn bind(snapshot: &'a CheckpointSnapshot<A>, layer: usize) -> CheckpointResult<Self> {
+        Self::bind::<A>(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Self::materialize(self)
+    }
 }
 
 impl sealed::Sealed for MaterializedNvfp4GateUp<'_> {}
@@ -145,6 +162,20 @@ pub struct MaterializedNvfp4Down<'a> {
     pub columns: usize,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl binding_sealed::Sealed for Nvfp4DownBindings<'_> {}
+
+impl<'a, A: Arch> SourceLayerBinding<'a, A> for Nvfp4DownBindings<'a> {
+    type Materialized = MaterializedNvfp4Down<'a>;
+
+    fn bind(snapshot: &'a CheckpointSnapshot<A>, layer: usize) -> CheckpointResult<Self> {
+        Self::bind::<A>(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Self::materialize(self)
+    }
 }
 
 impl sealed::Sealed for MaterializedNvfp4Down<'_> {}

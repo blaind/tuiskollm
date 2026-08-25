@@ -1,5 +1,6 @@
 //! Qwen3.6-35B-A3B MoE lossless materialization into runtime-native host layouts.
 
+use crate::common::inventory::CheckpointSnapshot;
 use crate::common::materialized::{MaterializedMemory, sealed};
 use crate::common::modelopt_codec::{
     MaterializedModelOptNvfp4Linear, ModelOptScaleCodec, materialize_modelopt_linear,
@@ -9,6 +10,7 @@ use crate::common::routes::{require_full_attention_layer, require_gdn_layer_rout
 use crate::common::scale_swizzle::{
     PlaneGatherer, host_shape, materialization_pool, materialization_workers,
 };
+use crate::common::source_binding::{SourceLayerBinding, sealed as binding_sealed};
 use crate::qwen36::bindings::{
     Qwen36Fp8LinearBindings, Qwen36FullAttentionBindings, Qwen36GdnBindings,
     Qwen36MoeExpertBindings, Qwen36MoeLayerBindings, Qwen36MtpBindings, Qwen36TextEndpointBindings,
@@ -137,6 +139,23 @@ pub struct MaterializedQwen36MoeLayer<'a> {
     pub layer: usize,
 }
 
+impl binding_sealed::Sealed for Qwen36MoeLayerBindings<'_> {}
+
+impl<'a> SourceLayerBinding<'a, Qwen36Moe35B> for Qwen36MoeLayerBindings<'a> {
+    type Materialized = MaterializedQwen36MoeLayer<'a>;
+
+    fn bind(
+        snapshot: &'a CheckpointSnapshot<Qwen36Moe35B>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Qwen36MoeLayerBindings::bind(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Qwen36MoeLayerBindings::materialize(self)
+    }
+}
+
 impl sealed::Sealed for MaterializedQwen36MoeLayer<'_> {}
 
 impl MaterializedMemory for MaterializedQwen36MoeLayer<'_> {
@@ -207,6 +226,23 @@ pub struct MaterializedQwen36Gdn<'a> {
     pub post_attention_norm: Bf16View<'a, 1>,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl binding_sealed::Sealed for Qwen36GdnBindings<'_> {}
+
+impl<'a> SourceLayerBinding<'a, Qwen36Moe35B> for Qwen36GdnBindings<'a> {
+    type Materialized = MaterializedQwen36Gdn<'a>;
+
+    fn bind(
+        snapshot: &'a CheckpointSnapshot<Qwen36Moe35B>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Qwen36GdnBindings::bind(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Qwen36GdnBindings::materialize(self)
+    }
 }
 
 impl sealed::Sealed for MaterializedQwen36Gdn<'_> {}
@@ -345,6 +381,23 @@ pub struct MaterializedQwen36FullAttention<'a> {
     pub post_attention_norm: Bf16View<'a, 1>,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl binding_sealed::Sealed for Qwen36FullAttentionBindings<'_> {}
+
+impl<'a> SourceLayerBinding<'a, Qwen36Moe35B> for Qwen36FullAttentionBindings<'a> {
+    type Materialized = MaterializedQwen36FullAttention<'a>;
+
+    fn bind(
+        snapshot: &'a CheckpointSnapshot<Qwen36Moe35B>,
+        layer: usize,
+    ) -> CheckpointResult<Self> {
+        Qwen36FullAttentionBindings::bind(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Qwen36FullAttentionBindings::materialize(self)
+    }
 }
 
 impl sealed::Sealed for MaterializedQwen36FullAttention<'_> {}

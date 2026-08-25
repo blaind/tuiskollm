@@ -18,6 +18,7 @@ pub(crate) mod naming;
 pub(crate) mod nvfp4;
 pub(crate) mod routes;
 pub(crate) mod scale_swizzle;
+pub(crate) mod source_binding;
 #[cfg(test)]
 pub(crate) mod test_builder;
 #[cfg(test)]

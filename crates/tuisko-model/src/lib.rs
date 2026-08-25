@@ -19,6 +19,7 @@ pub use common::nvfp4::{
 };
 pub use common::routes::NVFP4_MLP_LAYER_END;
 pub use common::scale_swizzle::nvfp4_scale_materialization_workers;
+pub use common::source_binding::SourceLayerBinding;
 pub use common::vision::{VisionBindings, VisionBlockBindings};
 pub use dtype::DType;
 pub use error::{CheckpointError, CheckpointErrorCode, CheckpointResult};
