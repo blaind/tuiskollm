@@ -345,7 +345,7 @@ pub(crate) fn make_fixture() -> Result<Fixture, Qwen35Nvfp4AttentionOutputQualif
             }
         }
     }
-    let gated = (0..MAX_BATCH * COLUMNS)
+    let gated = (0..MAX_ROWS * COLUMNS)
         .map(|index| {
             let token = index / COLUMNS;
             let column = index - token * COLUMNS;
