@@ -190,10 +190,7 @@ pub struct LoadingDeviceArena {
 impl LoadingDeviceArena {
     /// Allocates the storage required by `layout` without enqueueing a full-arena memset.
     pub fn allocate(stream: &Arc<CudaStream>, layout: &ArenaLayout) -> GpuResult<Self> {
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the loading-arena CUDA context", source))?;
+        bind_context(stream, "binding the loading-arena CUDA context")?;
         // SAFETY: this type exposes only writes until `seal` proves complete initialization and
         // synchronizes their stream. No safe operation can read the returned storage beforehand.
         let storage = unsafe { DeviceBuffer::uninitialized_async(stream, layout.byte_len()) }
@@ -351,10 +348,7 @@ impl LoadingDeviceArena {
     }
 
     fn bind_context(&self) -> GpuResult<()> {
-        self.stream
-            .context()
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the loading-arena CUDA context", source))
+        bind_context(&self.stream, "binding the loading-arena CUDA context")
     }
 }
 
@@ -434,16 +428,69 @@ fn overlap_error(range: &Range<usize>, start: usize, end: usize) -> GpuError {
     ))
 }
 
+/// Makes `stream`'s context current, naming the failing operation.
+fn bind_context(stream: &CudaStream, operation: &'static str) -> GpuResult<()> {
+    stream
+        .context()
+        .bind_to_thread()
+        .map_err(|source| GpuError::driver(operation, source))
+}
+
+/// Enqueues one host-to-device copy and drains `stream` before returning.
+///
+/// # Safety
+///
+/// `source..source + bytes` must be a live host range, and `address..address + bytes` must lie
+/// inside a device allocation that stays live until `stream` completes the copy.
+unsafe fn upload<T>(
+    stream: &CudaStream,
+    address: u64,
+    source: *const T,
+    bytes: usize,
+    operation: &'static str,
+) -> GpuResult<()> {
+    bind_context(stream, "binding the arena CUDA context")?;
+    // SAFETY: the caller proved both ranges cover `bytes`.
+    unsafe { cuda_core::memory::memcpy_htod_async(address, source, bytes, stream.cu_stream()) }
+        .map_err(|source| GpuError::driver(operation, source))?;
+    stream
+        .synchronize()
+        .map_err(|source| GpuError::driver("synchronizing a device arena upload", source))
+}
+
+/// Enqueues one device-to-host copy and drains `stream` before returning.
+///
+/// # Safety
+///
+/// `destination..destination + bytes` must be a live writable host range, and
+/// `address..address + bytes` must lie inside a device allocation that stays live until
+/// `stream` completes the copy.
+unsafe fn download<T>(
+    stream: &CudaStream,
+    destination: *mut T,
+    address: u64,
+    bytes: usize,
+    operation: &'static str,
+) -> GpuResult<()> {
+    bind_context(stream, "binding the arena CUDA context")?;
+    // SAFETY: the caller proved both ranges cover `bytes`.
+    unsafe {
+        cuda_core::memory::memcpy_dtoh_async(destination, address, bytes, stream.cu_stream())
+    }
+    .map_err(|source| GpuError::driver(operation, source))?;
+    stream.synchronize().map_err(|source| {
+        drain_failed_download(stream);
+        GpuError::driver("synchronizing a device arena download", source)
+    })
+}
+
 impl DeviceArena {
     /// Allocates and zeroes the storage required by `layout`.
     ///
     /// Synchronizes `stream` before returning, so later operations observe the
     /// zeroed bytes from any stream in the same context.
     pub fn zeroed(stream: &CudaStream, layout: &ArenaLayout) -> GpuResult<Self> {
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
+        bind_context(stream, "binding the arena CUDA context")?;
         let storage = DeviceBuffer::zeroed(stream, layout.byte_len())
             .map_err(|source| GpuError::driver("allocating a zeroed device arena", source))?;
         layout.require_base_alignment(storage.cu_deviceptr())?;
@@ -519,6 +566,42 @@ impl DeviceArena {
         Ok(address as *mut T)
     }
 
+    /// Returns the checked device address and byte count of one typed element subrange.
+    ///
+    /// `label` names the operation in every rejection this validation can produce.
+    fn subrange_address<T: DeviceCopy>(
+        &self,
+        region: ArenaRegion<T>,
+        start: usize,
+        len: usize,
+        label: &str,
+    ) -> GpuResult<(u64, usize)> {
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| GpuError::arena(format!("{label} subrange overflows")))?;
+        if end > region.len {
+            return Err(GpuError::arena(format!(
+                "{label} subrange {start}..{end} exceeds a region of {} elements",
+                region.len
+            )));
+        }
+        let byte_start = start
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena(format!("{label} byte offset overflows")))?;
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| GpuError::arena(format!("{label} byte count overflows")))?;
+        let address = (self.address(region)? as u64)
+            .checked_add(u64::try_from(byte_start).map_err(|_| {
+                GpuError::arena(format!(
+                    "{label} byte offset exceeds the device address width"
+                ))
+            })?)
+            .ok_or_else(|| GpuError::arena(format!("{label} device address overflows")))?;
+
+        Ok((address, bytes))
+    }
+
     /// Enqueues a byte fill over one checked region.
     pub fn fill<T: DeviceCopy>(
         &self,
@@ -532,10 +615,7 @@ impl DeviceArena {
             return Ok(());
         }
 
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
+        bind_context(stream, "binding the arena CUDA context")?;
         // SAFETY: `address..address + bytes` was checked against this live allocation.
         unsafe {
             cuda_core::memory::memset_d8_async(address, value, region.bytes, stream.cu_stream())
@@ -553,35 +633,15 @@ impl DeviceArena {
         value: u8,
     ) -> GpuResult<()> {
         self.require_stream_context(stream, "filling a device arena subrange")?;
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| GpuError::arena("arena fill subrange overflows"))?;
-        if end > region.len {
-            return Err(GpuError::arena(format!(
-                "arena fill subrange {start}..{end} exceeds a region of {} elements",
-                region.len
-            )));
+        if len == 0 {
+            return Ok(());
         }
-        let element_bytes = size_of::<T>();
-        let byte_start = start
-            .checked_mul(element_bytes)
-            .ok_or_else(|| GpuError::arena("arena fill byte offset overflows"))?;
-        let bytes = len
-            .checked_mul(element_bytes)
-            .ok_or_else(|| GpuError::arena("arena fill byte count overflows"))?;
+        let (address, bytes) = self.subrange_address(region, start, len, "arena fill")?;
         if bytes == 0 {
             return Ok(());
         }
-        let address = (self.address(region)? as u64)
-            .checked_add(u64::try_from(byte_start).map_err(|_| {
-                GpuError::arena("arena fill byte offset exceeds the device address width")
-            })?)
-            .ok_or_else(|| GpuError::arena("arena fill device address overflows"))?;
 
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
+        bind_context(stream, "binding the arena CUDA context")?;
         // SAFETY: the typed element subrange was checked inside the live region.
         unsafe { cuda_core::memory::memset_d8_async(address, value, bytes, stream.cu_stream()) }
             .map_err(|source| GpuError::driver("filling a device arena subrange", source))
@@ -590,10 +650,7 @@ impl DeviceArena {
     /// Copies the complete arena into a host byte vector.
     pub fn to_host_vec(&self, stream: &CudaStream) -> GpuResult<Vec<u8>> {
         self.require_stream_context(stream, "copying a device arena to the host")?;
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
+        bind_context(stream, "binding the arena CUDA context")?;
         self.storage.to_host_vec(stream).map_err(|source| {
             drain_failed_download(stream);
             GpuError::driver("copying a device arena to the host", source)
@@ -638,23 +695,16 @@ impl DeviceArena {
             return Ok(());
         }
         let address = self.address(region)? as u64;
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
         // SAFETY: the checked typed region and source slice both cover the exact byte count.
         unsafe {
-            cuda_core::memory::memcpy_htod_async(
+            upload(
+                stream,
                 address,
                 source.as_ptr(),
                 source.len(),
-                stream.cu_stream(),
+                "copying source bytes into a device arena",
             )
         }
-        .map_err(|source| GpuError::driver("copying source bytes into a device arena", source))?;
-        stream
-            .synchronize()
-            .map_err(|source| GpuError::driver("synchronizing a device arena upload", source))
     }
 
     /// Copies a typed host slice into the beginning of one region.
@@ -686,36 +736,22 @@ impl DeviceArena {
                 region.len
             )));
         }
-        let byte_start = start
-            .checked_mul(size_of::<T>())
-            .ok_or_else(|| GpuError::arena("arena upload byte offset overflows"))?;
-        let address = (self.address(region)? as u64)
-            .checked_add(u64::try_from(byte_start).map_err(|_| {
-                GpuError::arena("arena upload byte offset exceeds the device address width")
-            })?)
-            .ok_or_else(|| GpuError::arena("arena upload device address overflows"))?;
-        let bytes = size_of_val(source);
+        let (address, bytes) =
+            self.subrange_address(region, start, source.len(), "arena upload")?;
         if bytes == 0 {
             return Ok(());
         }
 
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
         // SAFETY: the checked typed subrange and source slice both cover `bytes`.
         unsafe {
-            cuda_core::memory::memcpy_htod_async(
+            upload(
+                stream,
                 address,
                 source.as_ptr(),
                 bytes,
-                stream.cu_stream(),
+                "copying a host slice into a device arena",
             )
         }
-        .map_err(|source| GpuError::driver("copying a host slice into a device arena", source))?;
-        stream
-            .synchronize()
-            .map_err(|source| GpuError::driver("synchronizing a device arena upload", source))
     }
 
     /// Enqueues a pinned-host prefix upload without synchronizing the stream.
@@ -769,25 +805,13 @@ impl DeviceArena {
                 region.len
             )));
         }
-        let byte_start = destination_start
-            .checked_mul(size_of::<T>())
-            .ok_or_else(|| GpuError::arena("pinned upload byte offset overflows"))?;
-        let address = (self.address(region)? as u64)
-            .checked_add(u64::try_from(byte_start).map_err(|_| {
-                GpuError::arena("pinned upload byte offset exceeds the device address width")
-            })?)
-            .ok_or_else(|| GpuError::arena("pinned upload device address overflows"))?;
-        let bytes = len
-            .checked_mul(size_of::<T>())
-            .ok_or_else(|| GpuError::arena("pinned upload byte count overflows"))?;
+        let (address, bytes) =
+            self.subrange_address(region, destination_start, len, "pinned upload")?;
         if bytes == 0 {
             return Ok(());
         }
 
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
+        bind_context(stream, "binding the arena CUDA context")?;
         // SAFETY: the checked arena region covers `bytes`; the caller owns the pinned-source
         // lifetime and immutability contract documented by this method.
         unsafe {
@@ -836,27 +860,16 @@ impl DeviceArena {
                 destination.len()
             )));
         }
-        let byte_start = source_start
-            .checked_mul(size_of::<T>())
-            .ok_or_else(|| GpuError::arena("pinned download byte offset overflows"))?;
-        let address = (self.address(region)? as u64)
-            .checked_add(u64::try_from(byte_start).map_err(|_| {
-                GpuError::arena("pinned download byte offset exceeds the device address width")
-            })?)
-            .ok_or_else(|| GpuError::arena("pinned download device address overflows"))?;
-        let bytes = len
-            .checked_mul(size_of::<T>())
-            .ok_or_else(|| GpuError::arena("pinned download byte count overflows"))?;
+        let (address, bytes) =
+            self.subrange_address(region, source_start, len, "pinned download")?;
         if bytes == 0 {
             return Ok(());
         }
 
-        stream.context().bind_to_thread().map_err(|source| {
-            GpuError::driver(
-                "binding the arena CUDA context for a pinned download",
-                source,
-            )
-        })?;
+        bind_context(
+            stream,
+            "binding the arena CUDA context for a pinned download",
+        )?;
         unsafe {
             cuda_core::memory::memcpy_dtoh_async(
                 destination.as_mut_ptr().add(destination_start),
@@ -920,25 +933,14 @@ impl DeviceArena {
                 destination.len, source.len,
             )));
         }
-        let destination_offset = destination_start
-            .checked_mul(size_of::<T>())
-            .ok_or_else(|| GpuError::arena("device-copy destination byte offset overflows"))?;
-        let source_offset = source_start
-            .checked_mul(size_of::<T>())
-            .ok_or_else(|| GpuError::arena("device-copy source byte offset overflows"))?;
-        let destination_address = (self.address(destination)? as u64)
-            .checked_add(u64::try_from(destination_offset).map_err(|_| {
-                GpuError::arena("device-copy destination offset exceeds the address width")
-            })?)
-            .ok_or_else(|| GpuError::arena("device-copy destination address overflows"))?;
-        let source_address = (source_arena.address(source)? as u64)
-            .checked_add(u64::try_from(source_offset).map_err(|_| {
-                GpuError::arena("device-copy source offset exceeds the address width")
-            })?)
-            .ok_or_else(|| GpuError::arena("device-copy source address overflows"))?;
-        let bytes = len
-            .checked_mul(size_of::<T>())
-            .ok_or_else(|| GpuError::arena("device copy byte count overflows"))?;
+        let (destination_address, bytes) = self.subrange_address(
+            destination,
+            destination_start,
+            len,
+            "device-copy destination",
+        )?;
+        let (source_address, _) =
+            source_arena.subrange_address(source, source_start, len, "device-copy source")?;
         if bytes == 0 {
             return Ok(());
         }
@@ -959,10 +961,7 @@ impl DeviceArena {
             ));
         }
 
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the device-copy CUDA context", source))?;
+        bind_context(stream, "binding the device-copy CUDA context")?;
         // SAFETY: both checked typed prefixes cover `bytes`; the caller owns the asynchronous
         // lifetimes and non-overlap contract documented by this method.
         unsafe {
@@ -1004,49 +1003,22 @@ impl DeviceArena {
         len: usize,
     ) -> GpuResult<Vec<T>> {
         self.require_stream_context(stream, "copying a device arena region to the host")?;
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| GpuError::arena("arena download subrange overflows"))?;
-        if end > region.len {
-            return Err(GpuError::arena(format!(
-                "arena download subrange {start}..{end} exceeds a region of {} elements",
-                region.len
-            )));
-        }
-        let byte_start = start
-            .checked_mul(size_of::<T>())
-            .ok_or_else(|| GpuError::arena("arena download byte offset overflows"))?;
-        let address = (self.address(region)? as u64)
-            .checked_add(u64::try_from(byte_start).map_err(|_| {
-                GpuError::arena("arena download byte offset exceeds the device address width")
-            })?)
-            .ok_or_else(|| GpuError::arena("arena download device address overflows"))?;
-        let bytes = len
-            .checked_mul(size_of::<T>())
-            .ok_or_else(|| GpuError::arena("arena copy byte count overflows"))?;
+        let (address, bytes) = self.subrange_address(region, start, len, "arena download")?;
         let mut host = Vec::with_capacity(len);
         if bytes == 0 {
             return Ok(host);
         }
 
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
         // SAFETY: the checked region and reserved vector capacity both cover `bytes`.
         unsafe {
-            cuda_core::memory::memcpy_dtoh_async(
+            download(
+                stream,
                 host.as_mut_ptr(),
                 address,
                 bytes,
-                stream.cu_stream(),
-            )
+                "copying a device arena region to the host",
+            )?;
         }
-        .map_err(|source| GpuError::driver("copying a device arena region to the host", source))?;
-        stream.synchronize().map_err(|source| {
-            drain_failed_download(stream);
-            GpuError::driver("synchronizing a device arena download", source)
-        })?;
         // SAFETY: the completed copy initialized all `len` elements.
         unsafe { host.set_len(len) };
 
@@ -1072,46 +1044,22 @@ impl DeviceArena {
         destination: &mut [T],
     ) -> GpuResult<()> {
         self.require_stream_context(stream, "copying a device arena region to the host")?;
-        let end = start
-            .checked_add(destination.len())
-            .ok_or_else(|| GpuError::arena("arena download subrange overflows"))?;
-        if end > region.len {
-            return Err(GpuError::arena(format!(
-                "arena download subrange {start}..{end} exceeds a region of {} elements",
-                region.len
-            )));
-        }
-        let byte_start = start
-            .checked_mul(size_of::<T>())
-            .ok_or_else(|| GpuError::arena("arena download byte offset overflows"))?;
-        let address = (self.address(region)? as u64)
-            .checked_add(u64::try_from(byte_start).map_err(|_| {
-                GpuError::arena("arena download byte offset exceeds the device address width")
-            })?)
-            .ok_or_else(|| GpuError::arena("arena download device address overflows"))?;
-        let bytes = size_of_val(destination);
+        let (address, bytes) =
+            self.subrange_address(region, start, destination.len(), "arena download")?;
         if bytes == 0 {
             return Ok(());
         }
 
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the arena CUDA context", source))?;
         // SAFETY: the checked region and initialized destination both cover `bytes`.
         unsafe {
-            cuda_core::memory::memcpy_dtoh_async(
+            download(
+                stream,
                 destination.as_mut_ptr(),
                 address,
                 bytes,
-                stream.cu_stream(),
+                "copying a device arena region to the host",
             )
         }
-        .map_err(|source| GpuError::driver("copying a device arena region to the host", source))?;
-        stream.synchronize().map_err(|source| {
-            drain_failed_download(stream);
-            GpuError::driver("synchronizing a device arena download", source)
-        })
     }
 
     fn require_stream_context(&self, stream: &CudaStream, operation: &str) -> GpuResult<()> {
