@@ -29,6 +29,8 @@ const ROTARY_DIM: usize = 64;
 const PHYSICAL_PAGES: usize = MAX_BATCH * TABLE_STRIDE;
 const CACHE_POSITIONS: [u32; MAX_BATCH] = [0, 1, 63, 64, 65, 97, 128, 130];
 const W4A4_BATCHES: [bool; MAX_BATCH] = [true, false, true, true, true, true, true, true];
+const MAX_ROWS: usize = 128;
+const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, MAX_ROWS];
 
 /// Failure of the complete source-backed Qwen3.5 attention-layer gate.
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +88,8 @@ struct Fixture {
     value_pages: Vec<u16>,
     rope_cos: Vec<f32>,
     rope_sin: Vec<f32>,
+    prefill_rope_cos: Vec<f32>,
+    prefill_rope_sin: Vec<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -99,7 +103,7 @@ struct SourceMaterialized<'a> {
     mlp: MaterializedModelOptNvfp4Mlp<'a>,
 }
 
-/// Qualifies source-backed Qwen3.5 layer 31 at every exact decode batch.
+/// Qualifies source-backed Qwen3.5 layer 31 at every exact decode and prefill route.
 pub fn qualify_qwen35_full_attention_layer(
     root: &Path,
 ) -> Result<Qwen35FullAttentionLayerQualification, Qwen35FullAttentionLayerQualificationError> {
@@ -129,10 +133,10 @@ pub fn qualify_qwen35_full_attention_layer(
         Qwen35FullAttentionLayerProgram::from_snapshot(&context, snapshot.clone(), SOURCE_LAYER)?;
     let stable_base = program.base_address();
     let stable_addresses = program.qualification_addresses()?;
-    if stable_addresses.len() != 37 {
+    if stable_addresses.len() != 48 {
         return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
             format!(
-                "Qwen3.5 owner exposes {} addresses, expected 37",
+                "Qwen3.5 owner exposes {} addresses, expected 48",
                 stable_addresses.len()
             ),
         ));
@@ -163,37 +167,40 @@ pub fn qualify_qwen35_full_attention_layer(
         &mut report,
     )?;
 
-    for batch in 1..=MAX_BATCH {
-        let first_input = make_input(batch, 0);
-        prepare_run(&program, &stream, batch, &first_input, &fixture)?;
-        program.launch_eager(&stream, batch)?;
+    for rows in EXACT_ROUTES {
+        let first_input = make_input(rows, 0);
+        prepare_run(&program, &stream, rows, &first_input, &fixture)?;
+        program.launch_eager(&stream, rows)?;
         let first = program.qualification_observables(&stream)?;
 
-        let input = make_input(batch, 1);
-        prepare_run(&program, &stream, batch, &input, &fixture)?;
-        program.replay(&stream, batch)?;
+        let input = make_input(rows, 1);
+        prepare_run(&program, &stream, rows, &input, &fixture)?;
+        program.replay(&stream, rows)?;
         let replay = program.qualification_observables(&stream)?;
 
-        prepare_run(&program, &stream, batch, &input, &fixture)?;
-        program.launch_eager(&stream, batch)?;
+        prepare_run(&program, &stream, rows, &input, &fixture)?;
+        program.launch_eager(&stream, rows)?;
         let eager = program.qualification_observables(&stream)?;
 
-        verify_boundaries(batch, &input, bindings, &replay, &mut report)?;
-        verify_activation_quantization(batch, &materialized, &replay, &mut report)?;
-        verify_qk_prepare(batch, bindings, &fixture, &replay, &mut report)?;
-        if batch == 1 {
+        verify_boundaries(rows, &input, bindings, &replay, &mut report)?;
+        verify_activation_quantization(rows, &materialized, &replay, &mut report)?;
+        verify_qk_prepare(rows, bindings, &fixture, &replay, &mut report)?;
+        if rows == 1 {
             verify_source_formula(bindings, &materialized, &replay, &mut report)?;
         }
-        verify_replay(batch, &eager, &replay, &mut report)?;
-        verify_replacement_input(batch, &first, &replay)?;
-        verify_inactive(batch, &fixture, &replay, &mut report)?;
-        verify_inactive(batch, &fixture, &eager, &mut report)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
+        verify_replacement_input(rows, &first, &replay)?;
+        verify_inactive(rows, &fixture, &replay, &mut report)?;
+        verify_inactive(rows, &fixture, &eager, &mut report)?;
 
         if program.base_address() != stable_base
             || program.qualification_addresses()? != stable_addresses
         {
             return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
-                format!("Qwen3.5 owner addresses changed while qualifying B={batch}"),
+                format!(
+                    "Qwen3.5 owner addresses changed while qualifying {}",
+                    route_name(rows)
+                ),
             ));
         }
     }
@@ -229,21 +236,34 @@ fn fixture() -> Fixture {
             rope_sin[token * ROTARY_PAIRS + pair] = sin as f32;
         }
     }
+    let mut prefill_rope_cos = vec![0.0; MAX_ROWS * ROTARY_PAIRS];
+    let mut prefill_rope_sin = vec![0.0; MAX_ROWS * ROTARY_PAIRS];
+    for position in 0..MAX_ROWS {
+        for pair in 0..ROTARY_PAIRS {
+            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / ROTARY_DIM as f64);
+            let angle = position as f64 * frequency;
+            let (sin, cos) = angle.sin_cos();
+            prefill_rope_cos[position * ROTARY_PAIRS + pair] = cos as f32;
+            prefill_rope_sin[position * ROTARY_PAIRS + pair] = sin as f32;
+        }
+    }
 
     Fixture {
         key_pages,
         value_pages,
         rope_cos,
         rope_sin,
+        prefill_rope_cos,
+        prefill_rope_sin,
     }
 }
 
-fn make_input(batch: usize, salt: usize) -> Vec<u16> {
+fn make_input(rows: usize, salt: usize) -> Vec<u16> {
     const PATTERN: [f32; 16] = [
         0.875, -0.875, 0.5, -0.5, 0.25, -0.25, 0.125, -0.125, 0.0625, -0.0625, 0.03125, -0.03125,
         0.0, 0.5, -0.25, 0.125,
     ];
-    (0..batch * Qwen35_9B::HIDDEN)
+    (0..rows * Qwen35_9B::HIDDEN)
         .map(|index| f32_to_bf16(PATTERN[(index + salt * 5 + index / Qwen35_9B::HIDDEN) & 15]))
         .collect()
 }
@@ -251,19 +271,28 @@ fn make_input(batch: usize, salt: usize) -> Vec<u16> {
 fn prepare_run(
     program: &Qwen35FullAttentionLayerProgram,
     stream: &CudaStream,
-    batch: usize,
+    rows: usize,
     input: &[u16],
     fixture: &Fixture,
 ) -> Result<(), Qwen35FullAttentionLayerQualificationError> {
-    program.load_residual(stream, batch, input)?;
+    program.load_residual(stream, rows, input)?;
     program.load_cache(stream, &fixture.key_pages, &fixture.value_pages)?;
-    program.load_decode_state(
-        stream,
-        batch,
-        &CACHE_POSITIONS[..batch],
-        &fixture.rope_cos[..batch * ROTARY_PAIRS],
-        &fixture.rope_sin[..batch * ROTARY_PAIRS],
-    )?;
+    if rows <= MAX_BATCH {
+        program.load_decode_state(
+            stream,
+            rows,
+            &CACHE_POSITIONS[..rows],
+            &fixture.rope_cos[..rows * ROTARY_PAIRS],
+            &fixture.rope_sin[..rows * ROTARY_PAIRS],
+        )?;
+    } else {
+        program.load_prefill_state(
+            stream,
+            rows,
+            &fixture.prefill_rope_cos[..rows * ROTARY_PAIRS],
+            &fixture.prefill_rope_sin[..rows * ROTARY_PAIRS],
+        )?;
+    }
     program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
 
     Ok(())
@@ -435,48 +464,94 @@ fn verify_boundaries(
 }
 
 fn verify_activation_quantization(
-    batch: usize,
+    rows: usize,
     source: &SourceMaterialized<'_>,
     observed: &Qwen35FullAttentionLayerObservables,
     report: &mut Qwen35FullAttentionLayerQualification,
 ) -> Result<(), Qwen35FullAttentionLayerQualificationError> {
-    let code_width = Qwen35_9B::HIDDEN / 2;
-    let scale_width = Qwen35_9B::HIDDEN / GROUP;
-    if W4A4_BATCHES[batch - 1] {
-        for token in 0..batch {
-            let begin = token * Qwen35_9B::HIDDEN;
-            let (codes, scales) = quantize_oracle(
-                &observed.mlp_normalized[begin..begin + Qwen35_9B::HIDDEN],
-                source.mlp.gate_up.input_scale_divisor,
-            )?;
-            compare_exact(
-                "gate/up activation codes",
-                &observed.gate_up_activation_codes[token * code_width..(token + 1) * code_width],
-                &codes,
-            )?;
-            compare_exact(
-                "gate/up activation scales",
-                &observed.gate_up_activation_scales[token * scale_width..(token + 1) * scale_width],
-                &scales,
-            )?;
-        }
-        report.activation_values += batch * (code_width + scale_width);
-    } else if observed
-        .gate_up_activation_codes
-        .iter()
-        .chain(&observed.gate_up_activation_scales)
-        .any(|&value| value != BYTE_SENTINEL)
-    {
-        return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
-            format!("B={batch} A16 SwiGLU modified W4A4 scratch"),
-        ));
+    if rows > MAX_BATCH {
+        verify_quantized_rows(
+            "QKV input",
+            rows,
+            Qwen35_9B::HIDDEN,
+            &observed.mixer_normalized,
+            &observed.qkv_activation_codes,
+            &observed.qkv_activation_scales,
+            source.attention.qkv_input_scale_divisor,
+            report,
+        )?;
+        verify_quantized_rows(
+            "attention output",
+            rows,
+            Qwen35_9B::ATTENTION_OUTPUT_COLUMNS,
+            &observed.output_activation,
+            &observed.output_activation_codes,
+            &observed.output_activation_scales,
+            source.attention.output.input_scale_divisor,
+            report,
+        )?;
+        verify_quantized_rows(
+            "down input",
+            rows,
+            Qwen35_9B::INTERMEDIATE,
+            &observed.swiglu,
+            &observed.down_activation_codes,
+            &observed.down_activation_scales,
+            source.mlp.down.input_scale_divisor,
+            report,
+        )?;
+    }
+
+    if uses_w4a4(rows) {
+        verify_quantized_rows(
+            "gate/up input",
+            rows,
+            Qwen35_9B::HIDDEN,
+            &observed.mlp_normalized,
+            &observed.gate_up_activation_codes,
+            &observed.gate_up_activation_scales,
+            source.mlp.gate_up.input_scale_divisor,
+            report,
+        )?;
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn verify_quantized_rows(
+    role: &str,
+    rows: usize,
+    width: usize,
+    input: &[u16],
+    actual_codes: &[u8],
+    actual_scales: &[u8],
+    divisor: f32,
+    report: &mut Qwen35FullAttentionLayerQualification,
+) -> Result<(), Qwen35FullAttentionLayerQualificationError> {
+    let code_width = width / 2;
+    let scale_width = width / GROUP;
+    for row in 0..rows {
+        let begin = row * width;
+        let (codes, scales) = quantize_oracle(&input[begin..begin + width], divisor)?;
+        compare_exact(
+            &format!("{role} activation codes"),
+            &actual_codes[row * code_width..(row + 1) * code_width],
+            &codes,
+        )?;
+        compare_exact(
+            &format!("{role} activation scales"),
+            &actual_scales[row * scale_width..(row + 1) * scale_width],
+            &scales,
+        )?;
+    }
+    report.activation_values += rows * (code_width + scale_width);
+
+    Ok(())
+}
+
 fn verify_qk_prepare(
-    batch: usize,
+    rows: usize,
     sources: SourceBindings<'_>,
     fixture: &Fixture,
     observed: &Qwen35FullAttentionLayerObservables,
@@ -487,10 +562,71 @@ fn verify_qk_prepare(
     let mut expected_key = fixture.key_pages.clone();
     let mut expected_value = fixture.value_pages.clone();
 
-    for (token, &position) in CACHE_POSITIONS.iter().enumerate().take(batch) {
+    if rows > MAX_BATCH {
+        let positions = (0..rows as u32).collect::<Vec<_>>();
+        let lengths = (1..=rows as u32).collect::<Vec<_>>();
+        compare_exact(
+            "prefill table rows",
+            &observed.prefill_table_rows[..rows],
+            &vec![0; rows],
+        )?;
+        compare_exact(
+            "prefill cache positions",
+            &observed.prefill_cache_positions[..rows],
+            &positions,
+        )?;
+        compare_exact(
+            "prefill causal lengths",
+            &observed.prefill_lengths[..rows],
+            &lengths,
+        )?;
+        compare_exact(
+            "prefill rotary cosine",
+            &observed.prefill_rope_cos[..rows * ROTARY_PAIRS]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            &fixture.prefill_rope_cos[..rows * ROTARY_PAIRS]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        )?;
+        compare_exact(
+            "prefill rotary sine",
+            &observed.prefill_rope_sin[..rows * ROTARY_PAIRS]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            &fixture.prefill_rope_sin[..rows * ROTARY_PAIRS]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        )?;
+    }
+
+    for token in 0..rows {
+        let position = if rows <= MAX_BATCH {
+            CACHE_POSITIONS.get(token).copied().ok_or_else(|| {
+                Qwen35FullAttentionLayerQualificationError::Mismatch(format!(
+                    "decode route {} has no cache position for row {token}",
+                    route_name(rows)
+                ))
+            })?
+        } else {
+            token as u32
+        };
         let qkv_base = token * Qwen35_9B::ATTENTION_QKV_ROWS;
-        let cosine = &fixture.rope_cos[token * ROTARY_PAIRS..(token + 1) * ROTARY_PAIRS];
-        let sine = &fixture.rope_sin[token * ROTARY_PAIRS..(token + 1) * ROTARY_PAIRS];
+        let (cosine, sine) = if rows <= MAX_BATCH {
+            (
+                &fixture.rope_cos[token * ROTARY_PAIRS..(token + 1) * ROTARY_PAIRS],
+                &fixture.rope_sin[token * ROTARY_PAIRS..(token + 1) * ROTARY_PAIRS],
+            )
+        } else {
+            (
+                &fixture.prefill_rope_cos[token * ROTARY_PAIRS..(token + 1) * ROTARY_PAIRS],
+                &fixture.prefill_rope_sin[token * ROTARY_PAIRS..(token + 1) * ROTARY_PAIRS],
+            )
+        };
         for head in 0..Qwen35_9B::NUM_ATTENTION_HEADS {
             let source = qkv_base + head * 2 * Qwen35_9B::HEAD_DIM;
             let destination = (token * Qwen35_9B::NUM_ATTENTION_HEADS + head) * Qwen35_9B::HEAD_DIM;
@@ -513,7 +649,11 @@ fn verify_qk_prepare(
         }
 
         let position = position as usize;
-        let physical_page = token * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE;
+        let physical_page = if rows <= MAX_BATCH {
+            token * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE
+        } else {
+            position / ATTENTION_PAGE_SIZE
+        };
         let key_source = qkv_base + Qwen35_9B::ATTENTION_QUERY_ROWS;
         let value_source = key_source + Qwen35_9B::ATTENTION_KV_ROWS;
         for head in 0..Qwen35_9B::NUM_KV_HEADS {
@@ -538,7 +678,7 @@ fn verify_qk_prepare(
     compare_exact("BF16 key cache", &observed.key_pages, &expected_key)?;
     compare_exact("BF16 value cache", &observed.value_pages, &expected_value)?;
     report.qk_values +=
-        batch * (Qwen35_9B::ATTENTION_OUTPUT_COLUMNS + 2 * Qwen35_9B::ATTENTION_KV_ROWS);
+        rows * (Qwen35_9B::ATTENTION_OUTPUT_COLUMNS + 2 * Qwen35_9B::ATTENTION_KV_ROWS);
 
     Ok(())
 }
@@ -900,7 +1040,7 @@ fn decode_scale(code: u8) -> Result<f32, Qwen35FullAttentionLayerQualificationEr
 }
 
 fn verify_replay(
-    batch: usize,
+    rows: usize,
     eager: &Qwen35FullAttentionLayerObservables,
     replay: &Qwen35FullAttentionLayerObservables,
     report: &mut Qwen35FullAttentionLayerQualification,
@@ -915,7 +1055,8 @@ fn verify_replay(
             {
                 return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
                     format!(
-                        "B={batch} graph plane `{}` differs at value {index}",
+                        "{} graph plane `{}` differs at value {index}",
+                        route_name(rows),
                         stringify!($field)
                     ),
                 ));
@@ -933,7 +1074,8 @@ fn verify_replay(
             {
                 return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
                     format!(
-                        "B={batch} graph plane `{}` differs at value {index}",
+                        "{} graph plane `{}` differs at value {index}",
+                        route_name(rows),
                         stringify!($field)
                     ),
                 ));
@@ -942,18 +1084,29 @@ fn verify_replay(
     }
 
     same!(mixer_normalized);
+    same!(qkv_activation_codes);
+    same!(qkv_activation_scales);
     same!(qkv);
+    same_f32!(prefill_rope_cos);
+    same_f32!(prefill_rope_sin);
+    same!(prefill_table_rows);
+    same!(prefill_cache_positions);
+    same!(prefill_lengths);
     same_f32!(query);
     same!(key_pages);
     same!(value_pages);
     same_f32!(attention);
     same!(output_activation);
+    same!(output_activation_codes);
+    same!(output_activation_scales);
     same!(mixer_branch);
     same!(mixer_residual);
     same!(mlp_normalized);
     same!(gate_up_activation_codes);
     same!(gate_up_activation_scales);
     same!(swiglu);
+    same!(down_activation_codes);
+    same!(down_activation_scales);
     same!(mlp_branch);
     same!(residual_output);
     same!(next_normalized);
@@ -964,32 +1117,46 @@ fn verify_replay(
 
 fn observable_values(values: &Qwen35FullAttentionLayerObservables) -> usize {
     values.mixer_normalized.len()
+        + values.qkv_activation_codes.len()
+        + values.qkv_activation_scales.len()
         + values.qkv.len()
+        + values.prefill_rope_cos.len()
+        + values.prefill_rope_sin.len()
+        + values.prefill_table_rows.len()
+        + values.prefill_cache_positions.len()
+        + values.prefill_lengths.len()
         + values.query.len()
         + values.key_pages.len()
         + values.value_pages.len()
         + values.attention.len()
         + values.output_activation.len()
+        + values.output_activation_codes.len()
+        + values.output_activation_scales.len()
         + values.mixer_branch.len()
         + values.mixer_residual.len()
         + values.mlp_normalized.len()
         + values.gate_up_activation_codes.len()
         + values.gate_up_activation_scales.len()
         + values.swiglu.len()
+        + values.down_activation_codes.len()
+        + values.down_activation_scales.len()
         + values.mlp_branch.len()
         + values.residual_output.len()
         + values.next_normalized.len()
 }
 
 fn verify_replacement_input(
-    batch: usize,
+    rows: usize,
     first: &Qwen35FullAttentionLayerObservables,
     replay: &Qwen35FullAttentionLayerObservables,
 ) -> Result<(), Qwen35FullAttentionLayerQualificationError> {
-    let active = batch * Qwen35_9B::HIDDEN;
+    let active = rows * Qwen35_9B::HIDDEN;
     if first.residual_output[..active] == replay.residual_output[..active] {
         return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
-            format!("B={batch} graph ignored replacement residual rows"),
+            format!(
+                "{} graph ignored replacement residual rows",
+                route_name(rows)
+            ),
         ));
     }
 
@@ -997,20 +1164,24 @@ fn verify_replacement_input(
 }
 
 fn verify_inactive(
-    batch: usize,
-    fixture: &Fixture,
+    rows: usize,
+    _fixture: &Fixture,
     observed: &Qwen35FullAttentionLayerObservables,
     report: &mut Qwen35FullAttentionLayerQualification,
 ) -> Result<(), Qwen35FullAttentionLayerQualificationError> {
     macro_rules! sentinel_u16 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|&value| value != BF16_SENTINEL)
             {
                 return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
-                    format!("B={batch} modified inactive `{}` value", stringify!($field)),
+                    format!(
+                        "{} modified inactive `{}` value",
+                        route_name(rows),
+                        stringify!($field)
+                    ),
                 ));
             }
             observed.$field.len() - begin
@@ -1018,13 +1189,17 @@ fn verify_inactive(
     }
     macro_rules! sentinel_f32 {
         ($field:ident, $width:expr) => {{
-            let begin = batch * $width;
+            let begin = rows * $width;
             if observed.$field[begin..]
                 .iter()
                 .any(|value| value.to_bits() != F32_SENTINEL_BITS)
             {
                 return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
-                    format!("B={batch} modified inactive `{}` value", stringify!($field)),
+                    format!(
+                        "{} modified inactive `{}` value",
+                        route_name(rows),
+                        stringify!($field)
+                    ),
                 ));
             }
             observed.$field.len() - begin
@@ -1045,47 +1220,56 @@ fn verify_inactive(
     inactive += sentinel_u16!(residual_output, Qwen35_9B::HIDDEN);
     inactive += sentinel_u16!(next_normalized, Qwen35_9B::HIDDEN);
 
-    let code_width = Qwen35_9B::HIDDEN / 2;
-    let scale_width = Qwen35_9B::HIDDEN / GROUP;
-    let code_begin = if W4A4_BATCHES[batch - 1] {
-        batch * code_width
-    } else {
-        0
-    };
-    let scale_begin = if W4A4_BATCHES[batch - 1] {
-        batch * scale_width
-    } else {
-        0
-    };
-    for (role, values) in [
-        (
-            "gate/up activation codes",
-            &observed.gate_up_activation_codes[code_begin..],
-        ),
-        (
-            "gate/up activation scales",
-            &observed.gate_up_activation_scales[scale_begin..],
-        ),
-    ] {
-        if values.iter().any(|&value| value != BYTE_SENTINEL) {
-            return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
-                format!("B={batch} modified inactive {role}"),
-            ));
-        }
-        inactive += values.len();
+    macro_rules! sentinel_u8 {
+        ($field:ident, $width:expr, $active:expr) => {{
+            let begin = if $active { rows * $width } else { 0 };
+            if observed.$field[begin..]
+                .iter()
+                .any(|&value| value != BYTE_SENTINEL)
+            {
+                return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
+                    format!(
+                        "{} modified inactive `{}` value",
+                        route_name(rows),
+                        stringify!($field)
+                    ),
+                ));
+            }
+            observed.$field.len() - begin
+        }};
     }
+    let prompt = rows > MAX_BATCH;
+    inactive += sentinel_u8!(qkv_activation_codes, Qwen35_9B::HIDDEN / 2, prompt);
+    inactive += sentinel_u8!(qkv_activation_scales, Qwen35_9B::HIDDEN / GROUP, prompt);
+    inactive += sentinel_u8!(
+        output_activation_codes,
+        Qwen35_9B::ATTENTION_OUTPUT_COLUMNS / 2,
+        prompt
+    );
+    inactive += sentinel_u8!(
+        output_activation_scales,
+        Qwen35_9B::ATTENTION_OUTPUT_COLUMNS / GROUP,
+        prompt
+    );
+    inactive += sentinel_u8!(
+        gate_up_activation_codes,
+        Qwen35_9B::HIDDEN / 2,
+        uses_w4a4(rows)
+    );
+    inactive += sentinel_u8!(
+        gate_up_activation_scales,
+        Qwen35_9B::HIDDEN / GROUP,
+        uses_w4a4(rows)
+    );
+    inactive += sentinel_u8!(down_activation_codes, Qwen35_9B::INTERMEDIATE / 2, prompt);
+    inactive += sentinel_u8!(
+        down_activation_scales,
+        Qwen35_9B::INTERMEDIATE / GROUP,
+        prompt
+    );
 
-    let first_inactive_cache =
-        batch * TABLE_STRIDE * Qwen35_9B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen35_9B::HEAD_DIM;
-    if observed.key_pages[first_inactive_cache..] != fixture.key_pages[first_inactive_cache..]
-        || observed.value_pages[first_inactive_cache..]
-            != fixture.value_pages[first_inactive_cache..]
-    {
-        return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
-            format!("B={batch} modified an inactive slot cache page"),
-        ));
-    }
-    inactive += 2 * (observed.key_pages.len() - first_inactive_cache);
+    let written_cache_values = rows * Qwen35_9B::NUM_KV_HEADS * Qwen35_9B::HEAD_DIM;
+    inactive += 2 * (observed.key_pages.len() - written_cache_values);
     report.inactive_values += inactive;
 
     Ok(())
@@ -1095,12 +1279,12 @@ fn verify_no_device_allocation(
     program: &Qwen35FullAttentionLayerProgram,
     stream: &CudaStream,
 ) -> Result<(), Qwen35FullAttentionLayerQualificationError> {
-    program.replay(stream, MAX_BATCH)?;
+    program.replay(stream, MAX_ROWS)?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
     for _ in 0..2 {
-        for batch in [1, 8, 3, 6, 2, 7, 4, 5] {
-            program.replay(stream, batch)?;
+        for rows in [1, 128, 8, 32, 3, 64, 6, 2, 7, 4, 5] {
+            program.replay(stream, rows)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -1119,6 +1303,18 @@ fn cache_offset(physical_page: usize, head: usize, position: usize, dimension: u
         * ((position & (ATTENTION_PAGE_SIZE - 1))
             + ATTENTION_PAGE_SIZE * (head + Qwen35_9B::NUM_KV_HEADS * physical_page))
         + dimension
+}
+
+fn uses_w4a4(rows: usize) -> bool {
+    rows > MAX_BATCH || W4A4_BATCHES[rows - 1]
+}
+
+fn route_name(rows: usize) -> String {
+    if rows <= MAX_BATCH {
+        format!("B={rows}")
+    } else {
+        format!("T={rows}")
+    }
 }
 
 fn residual_oracle(input: &[u16], branch: &[u16]) -> Vec<u16> {
@@ -1218,8 +1414,8 @@ fn require_close(
 #[cfg(test)]
 mod tests {
     use super::{
-        Qwen35FullAttentionLayerQualificationError, SOURCE_LAYER, W4A4_BATCHES,
-        qualify_qwen35_full_attention_layer,
+        EXACT_ROUTES, Qwen35FullAttentionLayerQualificationError, SOURCE_LAYER, W4A4_BATCHES,
+        qualify_qwen35_full_attention_layer, uses_w4a4,
     };
 
     #[test]
@@ -1228,6 +1424,12 @@ mod tests {
         assert_eq!(
             W4A4_BATCHES,
             [true, false, true, true, true, true, true, true]
+        );
+        assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
+        assert!(
+            EXACT_ROUTES
+                .into_iter()
+                .all(|rows| rows == 2 || uses_w4a4(rows))
         );
     }
 
@@ -1242,14 +1444,14 @@ mod tests {
         })?;
         let report = qualify_qwen35_full_attention_layer(std::path::Path::new(&root))?;
 
-        assert_eq!(report.boundary_values, 737_280);
-        assert_eq!(report.qk_values, 221_184);
-        assert_eq!(report.activation_values, 78_336);
+        assert_eq!(report.boundary_values, 5_324_800);
+        assert_eq!(report.qk_values, 1_597_440);
+        assert_eq!(report.activation_values, 3_174_912);
         assert_eq!(report.source_values, 34_816);
         assert_eq!(report.weight_bytes, 117_990_400);
         assert_eq!(report.cache_bytes, 6_291_456);
-        assert_eq!(report.workspace_bytes, 1_233_088);
-        assert_eq!(report.arena_bytes, 125_515_776);
+        assert_eq!(report.workspace_bytes, 21_204_672);
+        assert_eq!(report.arena_bytes, 145_487_360);
         assert_eq!(report.padding_bytes, 832);
         assert!(report.graph_replay_values > 0);
         assert!(report.inactive_values > 0);
