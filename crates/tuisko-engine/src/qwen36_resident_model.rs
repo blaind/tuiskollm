@@ -1,9 +1,11 @@
 //! Resident composition of every Qwen3.6 text layer and endpoint.
 
+use crate::qwen36_long_context_kv::Qwen36AttentionKvBinding;
 use crate::{
     EngineError, EngineResult, MAX_BATCH, Qwen36FullAttentionLayerLayout,
     Qwen36FullAttentionLayerProgram, Qwen36GdnMoeLayerLayout, Qwen36GdnMoeLayerProgram,
-    Qwen36TextEndpointLayout, Qwen36TextEndpointProgram,
+    Qwen36LongContextKvLayout, Qwen36LongContextKvProgram, Qwen36TextEndpointLayout,
+    Qwen36TextEndpointProgram,
 };
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, GpuError, GpuResult, PinnedHostBuffer};
@@ -52,6 +54,7 @@ impl Qwen36ResidentModelLayout {
         require_geometry()?;
         let gdn = Qwen36GdnMoeLayerLayout::build()?;
         let attention = Qwen36FullAttentionLayerLayout::build()?;
+        let long_context = Qwen36LongContextKvLayout::build()?;
         let endpoint = Qwen36TextEndpointLayout::build()?;
         let layers = core::array::from_fn(layer_kind);
         let gdn_layers = layers
@@ -67,10 +70,14 @@ impl Qwen36ResidentModelLayout {
                 (1, endpoint.resident_weight_bytes()),
             ],
         )?;
-        let cache_bytes = product(
+        let cache_bytes = checked_sum(
             "Qwen3.6 resident E4M3 cache bytes",
-            attention_layers,
-            attention.cache_bytes(),
+            product(
+                "Qwen3.6 resident short E4M3 cache bytes",
+                attention_layers,
+                attention.cache_bytes(),
+            )?,
+            long_context.cache_bytes(),
         )?;
         let workspace_bytes = sum_products(
             "Qwen3.6 resident workspace bytes",
@@ -78,6 +85,7 @@ impl Qwen36ResidentModelLayout {
                 (gdn_layers, gdn.workspace_bytes()),
                 (attention_layers, attention.workspace_bytes()),
                 (1, endpoint.workspace_bytes()),
+                (1, long_context.block_table_bytes()),
             ],
         )?;
         let arena_bytes = sum_products(
@@ -86,6 +94,7 @@ impl Qwen36ResidentModelLayout {
                 (gdn_layers, gdn.arena_bytes()),
                 (attention_layers, attention.arena_bytes()),
                 (1, endpoint.arena_bytes()),
+                (1, long_context.arena_bytes()),
             ],
         )?;
 
@@ -113,7 +122,7 @@ impl Qwen36ResidentModelLayout {
         self.resident_weight_bytes
     }
 
-    /// E4M3 K/V bytes across all ten full-attention layers.
+    /// E4M3 K/V bytes in the shared pool and retained layer-local fallback planes.
     pub const fn cache_bytes(&self) -> usize {
         self.cache_bytes
     }
@@ -123,7 +132,7 @@ impl Qwen36ResidentModelLayout {
         self.workspace_bytes
     }
 
-    /// Complete device allocation across the 40 layer arenas and endpoint arena.
+    /// Complete device allocation across layers, shared KV, and endpoint arenas.
     pub const fn arena_bytes(&self) -> usize {
         self.arena_bytes
     }
@@ -133,14 +142,14 @@ impl Qwen36ResidentModelLayout {
         self.resident_weight_bytes + self.cache_bytes + self.workspace_bytes
     }
 
-    /// Aggregate alignment padding across the 41 stable arenas.
+    /// Aggregate alignment padding across the 42 stable arenas.
     pub const fn padding_bytes(&self) -> usize {
         self.arena_bytes - self.owner_bytes()
     }
 
     /// Number of independently allocated, address-stable device arenas.
     pub const fn arena_count(&self) -> usize {
-        Qwen36Moe35B::LAYERS + 1
+        Qwen36Moe35B::LAYERS + 2
     }
 
     /// mmap-backed BF16 embeddings intentionally excluded from device residency.
@@ -156,9 +165,9 @@ impl Qwen36ResidentModelLayout {
         )
     }
 
-    /// Fixed short-context capacity of each full-attention slot.
+    /// Maximum context admitted by the pinned Qwen3.6 config.
     pub const fn context_capacity(&self) -> usize {
-        192
+        crate::QWEN36_MAX_CONTEXT_TOKENS
     }
 }
 
@@ -172,21 +181,34 @@ impl ResidentLayer {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
         layer: usize,
+        kv_binding: Option<Qwen36AttentionKvBinding>,
     ) -> EngineResult<Self> {
         match layer_kind(layer) {
             Qwen36ResidentLayerKind::GdnMoe => Ok(Self::GdnMoe(Box::new(
                 Qwen36GdnMoeLayerProgram::from_snapshot(context, snapshot, layer)?,
             ))),
-            Qwen36ResidentLayerKind::FullAttentionMoe => Ok(Self::FullAttentionMoe(Box::new(
-                Qwen36FullAttentionLayerProgram::from_snapshot(context, snapshot, layer)?,
-            ))),
+            Qwen36ResidentLayerKind::FullAttentionMoe => {
+                let binding = kv_binding.ok_or_else(|| {
+                    EngineError::layout(format!(
+                        "Qwen3.6 full-attention layer {layer} has no shared KV binding"
+                    ))
+                })?;
+                // SAFETY: the resident program declares graph-bearing layers before
+                // the shared KV owner, so every captured address outlives them.
+                let program = unsafe {
+                    Qwen36FullAttentionLayerProgram::from_snapshot_with_kv(
+                        context, snapshot, layer, binding,
+                    )?
+                };
+                Ok(Self::FullAttentionMoe(Box::new(program)))
+            }
         }
     }
 
     fn reset(&self, stream: &CudaStream) -> EngineResult<()> {
         match self {
             Self::GdnMoe(program) => program.reset_state(stream),
-            Self::FullAttentionMoe(program) => program.reset_cache(stream),
+            Self::FullAttentionMoe(_) => Ok(()),
         }
     }
 
@@ -210,14 +232,21 @@ impl ResidentLayer {
         &self,
         stream: &CudaStream,
         tokens: usize,
+        slot: usize,
+        first_position: usize,
         rope_cos: &[f32],
         rope_sin: &[f32],
     ) -> EngineResult<()> {
         match self {
             Self::GdnMoe(_) => Ok(()),
-            Self::FullAttentionMoe(program) => {
-                program.load_prefill_state(stream, tokens, rope_cos, rope_sin)
-            }
+            Self::FullAttentionMoe(program) => program.load_prefill_slot_state_at(
+                stream,
+                tokens,
+                slot,
+                first_position,
+                rope_cos,
+                rope_sin,
+            ),
         }
     }
 
@@ -273,10 +302,11 @@ impl ResidentLayer {
 
 /// Every Qwen3.6 text layer and the NVFP4 endpoint held at stable addresses.
 pub struct Qwen36ResidentModelProgram {
-    // Drop whole-model graphs before the layer arenas and loaded modules they retain.
+    // Drop graphs and layers before the shared KV arena whose addresses they retain.
     graphs: [CudaGraph; MAX_BATCH],
     prefill_graphs: [CudaGraph; 3],
     layers: Vec<ResidentLayer>,
+    long_context_kv: Qwen36LongContextKvProgram,
     endpoint: Qwen36TextEndpointProgram,
     prefill_embedding_stager: PinnedHostBuffer<u16>,
     context: Arc<CudaContext>,
@@ -291,13 +321,29 @@ impl Qwen36ResidentModelProgram {
     ) -> EngineResult<Self> {
         let layout = Qwen36ResidentModelLayout::build()?;
         let stream = context.new_stream().map_err(GpuError::from)?;
+        let long_context_kv = Qwen36LongContextKvProgram::new(context)?;
         let mut layers = Vec::with_capacity(Qwen36Moe35B::LAYERS);
+        let mut attention_layer = 0;
         for layer in 0..Qwen36Moe35B::LAYERS {
+            let kv_binding = if layer_kind(layer) == Qwen36ResidentLayerKind::FullAttentionMoe {
+                let binding = long_context_kv.layer_binding(attention_layer)?;
+                attention_layer += 1;
+                Some(binding)
+            } else {
+                None
+            };
             layers.push(ResidentLayer::from_snapshot(
                 context,
                 Arc::clone(&snapshot),
                 layer,
+                kv_binding,
             )?);
+        }
+        if attention_layer != long_context_kv.layout().layers().len() {
+            return Err(EngineError::layout(format!(
+                "Qwen3.6 resident model bound {attention_layer} attention layers, shared KV owner has {}",
+                long_context_kv.layout().layers().len()
+            )));
         }
         let endpoint = Qwen36TextEndpointProgram::from_snapshot(context, snapshot)?;
         let prefill_embedding_stager =
@@ -312,6 +358,7 @@ impl Qwen36ResidentModelProgram {
             graphs,
             prefill_graphs,
             layers,
+            long_context_kv,
             endpoint,
             prefill_embedding_stager,
             context: Arc::clone(context),
@@ -377,6 +424,12 @@ impl Qwen36ResidentModelProgram {
         rope_sin: &[f32],
     ) -> EngineResult<Qwen36ResidentPrefillRoute> {
         require_prefill(tokens)?;
+        let reserved_tokens = self.long_context_kv.slot_token_count(0)?;
+        if tokens > reserved_tokens {
+            return Err(EngineError::route(format!(
+                "Qwen3.6 resident prefill T={tokens} exceeds slot 0's {reserved_tokens} reserved tokens"
+            )));
+        }
         let rotary_values = product(
             "Qwen3.6 resident prefill rotary values",
             tokens,
@@ -388,19 +441,42 @@ impl Qwen36ResidentModelProgram {
             )));
         }
         for layer in &self.layers {
-            layer.load_prefill_state(stream, tokens, rope_cos, rope_sin)?;
+            layer.load_prefill_state(stream, tokens, 0, 0, rope_cos, rope_sin)?;
         }
 
         Ok(Qwen36ResidentPrefillRoute { tokens })
     }
 
-    /// Clears every GDN history/state and full-attention E4M3 cache plane.
-    pub fn reset_state(&self, stream: &CudaStream) -> EngineResult<()> {
+    /// Clears every GDN state and recycles all shared attention page-table rows.
+    pub fn reset_state(&mut self, stream: &CudaStream) -> EngineResult<()> {
         for layer in &self.layers {
             layer.reset(stream)?;
         }
+        self.long_context_kv.reset_ownership(stream)?;
 
         Ok(())
+    }
+
+    /// Marks one stable page-table row active for a new request.
+    pub fn activate_kv_slot(&mut self, slot: usize) -> EngineResult<()> {
+        self.long_context_kv.activate_slot(slot)
+    }
+
+    /// Reserves the pages required by one request's admitted position capacity.
+    pub fn reserve_kv_slot_tokens(
+        &mut self,
+        stream: &CudaStream,
+        slot: usize,
+        token_count: usize,
+    ) -> EngineResult<()> {
+        self.long_context_kv
+            .reserve_slot_tokens(stream, slot, token_count)?;
+        Ok(())
+    }
+
+    /// Releases all pages held by one active or retained slot.
+    pub fn recycle_kv_slot(&mut self, stream: &CudaStream, slot: usize) -> EngineResult<usize> {
+        self.long_context_kv.recycle_slot(stream, slot)
     }
 
     /// Replays the immutable whole-model graph for one exact batch.
@@ -472,11 +548,12 @@ impl Qwen36ResidentModelProgram {
         &self.context
     }
 
-    /// Stable base address of every layer arena followed by the endpoint arena.
+    /// Stable base address of every layer, shared KV, and endpoint arena.
     pub fn base_addresses(&self) -> Vec<u64> {
         self.layers
             .iter()
             .map(ResidentLayer::base_address)
+            .chain(core::iter::once(self.long_context_kv.base_address()))
             .chain(core::iter::once(self.endpoint.base_address()))
             .collect()
     }
@@ -491,7 +568,7 @@ impl Qwen36ResidentModelProgram {
         MAX_BATCH
     }
 
-    /// Fixed short-context capacity of each full-attention slot.
+    /// Maximum context admitted by the pinned checkpoint.
     pub const fn context_capacity(&self) -> usize {
         self.layout.context_capacity()
     }
@@ -499,6 +576,11 @@ impl Qwen36ResidentModelProgram {
     /// Page-locked bytes used to gather mmap-backed embedding rows.
     pub fn host_stager_bytes(&self) -> usize {
         self.endpoint.host_stager_bytes() + self.prefill_embedding_stager.num_bytes()
+    }
+
+    /// Fixed host page-table and owner-map bytes for the shared cache.
+    pub const fn kv_host_owner_bytes(&self) -> usize {
+        self.long_context_kv.host_allocation_bytes()
     }
 
     fn prefill_graph(&self, route: Qwen36ResidentPrefillRoute) -> EngineResult<&CudaGraph> {
@@ -646,6 +728,11 @@ impl Qwen36ResidentModelProgram {
                 layer.arena_bytes(),
             )
         })?;
+        let arena_bytes = checked_sum(
+            "Qwen3.6 resident program shared KV bytes",
+            arena_bytes,
+            self.long_context_kv.arena_bytes(),
+        )?;
         let arena_bytes = checked_sum(
             "Qwen3.6 resident program endpoint bytes",
             arena_bytes,
@@ -838,17 +925,17 @@ mod tests {
         let layout = Qwen36ResidentModelLayout::build().unwrap();
 
         assert_eq!(layout.resident_weight_bytes(), 19_808_036_096);
-        assert_eq!(layout.cache_bytes(), 15_728_640);
-        assert_eq!(layout.workspace_bytes(), 1_223_712_576);
-        assert_eq!(layout.owner_bytes(), 21_047_477_312);
+        assert_eq!(layout.cache_bytes(), 2_700_083_200);
+        assert_eq!(layout.workspace_bytes(), 1_223_843_648);
+        assert_eq!(layout.owner_bytes(), 23_731_962_944);
         assert_eq!(layout.padding_bytes(), 26_560);
-        assert_eq!(layout.arena_bytes(), 21_047_503_872);
-        assert_eq!(layout.arena_count(), 41);
+        assert_eq!(layout.arena_bytes(), 23_731_989_504);
+        assert_eq!(layout.arena_count(), 42);
         assert_eq!(
             layout.source_mapped_embedding_bytes().unwrap(),
             1_017_118_720
         );
-        assert_eq!(layout.context_capacity(), 192);
+        assert_eq!(layout.context_capacity(), 262_144);
     }
 
     #[test]

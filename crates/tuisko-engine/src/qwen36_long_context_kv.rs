@@ -8,6 +8,15 @@ use crate::{
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, DeviceArena, GpuError};
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Qwen36AttentionKvBinding {
+    pub(crate) block_tables: u64,
+    pub(crate) key_pages: u64,
+    pub(crate) value_pages: u64,
+    pub(crate) table_stride: usize,
+    pub(crate) context_capacity: usize,
+}
+
 /// Fixed shared E4M3 KV allocation and its allocation-free page lifecycle.
 pub struct Qwen36LongContextKvProgram {
     arena: DeviceArena,
@@ -158,6 +167,25 @@ impl Qwen36LongContextKvProgram {
     /// Checked page-pool layout.
     pub const fn layout(&self) -> &Qwen36LongContextKvLayout {
         &self.layout
+    }
+
+    pub(crate) fn layer_binding(
+        &self,
+        attention_layer: usize,
+    ) -> EngineResult<Qwen36AttentionKvBinding> {
+        let regions = self.layout.layers().get(attention_layer).ok_or_else(|| {
+            EngineError::layout(format!(
+                "Qwen3.6 attention layer {attention_layer} is outside the shared KV inventory"
+            ))
+        })?;
+
+        Ok(Qwen36AttentionKvBinding {
+            block_tables: self.arena.address(self.layout.block_tables())?.addr() as u64,
+            key_pages: self.arena.address(regions.key)?.addr() as u64,
+            value_pages: self.arena.address(regions.value)?.addr() as u64,
+            table_stride: self.layout.block_table_stride(),
+            context_capacity: QWEN36_MAX_CONTEXT_TOKENS,
+        })
     }
 
     #[cfg(feature = "qualification")]

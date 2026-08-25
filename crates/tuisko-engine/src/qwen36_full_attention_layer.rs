@@ -1,9 +1,10 @@
 //! Resident source-backed Qwen3.6 full-attention plus MoE decoder layer.
 
 use crate::qwen36_full_attention_layer_layout::{
-    QWEN36_CONTEXT_CAPACITY, QWEN36_MAX_ROWS, QWEN36_PREFILL_CONTEXT_CAPACITY,
-    QWEN36_PREFILL_TABLE_STRIDE, QWEN36_TABLE_STRIDE, Qwen36FullAttentionLayerRegions,
+    QWEN36_MAX_ROWS, QWEN36_PREFILL_TABLE_STRIDE, QWEN36_TABLE_STRIDE,
+    Qwen36FullAttentionLayerRegions,
 };
+use crate::qwen36_long_context_kv::Qwen36AttentionKvBinding;
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen36FullAttentionLayerLayout};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
@@ -35,6 +36,7 @@ pub struct Qwen36FullAttentionLayerProgram {
     layout: Qwen36FullAttentionLayerLayout,
     base_address: u64,
     scales: LaunchScales,
+    kv_binding: Option<Qwen36AttentionKvBinding>,
     layer: usize,
 }
 
@@ -103,11 +105,17 @@ struct Pointers {
     next_norm: *const u16,
     residual_output: *mut u16,
     next_normalized: *mut u16,
+    decode_table_stride: usize,
+    prefill_table_stride: usize,
 }
 
 impl Pointers {
-    fn bind(arena: &DeviceArena, regions: Qwen36FullAttentionLayerRegions) -> GpuResult<Self> {
-        Ok(Self {
+    fn bind_with_kv(
+        arena: &DeviceArena,
+        regions: Qwen36FullAttentionLayerRegions,
+        binding: Option<Qwen36AttentionKvBinding>,
+    ) -> GpuResult<Self> {
+        let mut pointers = Self {
             residual_input: arena.address(regions.residual_input)?.cast_const(),
             input_norm: arena.address(regions.input_norm)?.cast_const(),
             mixer_normalized: arena.address(regions.mixer_normalized)?,
@@ -164,7 +172,18 @@ impl Pointers {
             next_norm: arena.address(regions.next_norm)?.cast_const(),
             residual_output: arena.address(regions.residual_output)?,
             next_normalized: arena.address(regions.next_normalized)?,
-        })
+            decode_table_stride: QWEN36_TABLE_STRIDE,
+            prefill_table_stride: QWEN36_PREFILL_TABLE_STRIDE,
+        };
+        if let Some(binding) = binding {
+            pointers.block_tables = binding.block_tables as *const u32;
+            pointers.key_pages = binding.key_pages as *mut u8;
+            pointers.value_pages = binding.value_pages as *mut u8;
+            pointers.decode_table_stride = binding.table_stride;
+            pointers.prefill_table_stride = binding.table_stride;
+        }
+
+        Ok(pointers)
     }
 
     #[cfg(feature = "qualification")]
@@ -243,6 +262,29 @@ impl Qwen36FullAttentionLayerProgram {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
         layer: usize,
+    ) -> EngineResult<Self> {
+        Self::from_snapshot_inner(context, snapshot, layer, None)
+    }
+
+    /// Captures this layer against cache storage retained by its resident parent.
+    ///
+    /// # Safety
+    /// The binding must name complete page-table and E4M3 K/V planes in `context`
+    /// that outlive this program and all graphs captured by it.
+    pub(crate) unsafe fn from_snapshot_with_kv(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
+        layer: usize,
+        binding: Qwen36AttentionKvBinding,
+    ) -> EngineResult<Self> {
+        Self::from_snapshot_inner(context, snapshot, layer, Some(binding))
+    }
+
+    fn from_snapshot_inner(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen36Moe35B>>,
+        layer: usize,
+        kv_binding: Option<Qwen36AttentionKvBinding>,
     ) -> EngineResult<Self> {
         let attention =
             Qwen36FullAttentionBindings::bind(snapshot.as_ref(), layer)?.materialize()?;
@@ -377,7 +419,7 @@ impl Qwen36FullAttentionLayerProgram {
             shared_gate_up_weight: moe.shared_expert.gate_up_weight_scales_2[0],
             shared_down_weight: moe.shared_expert.down_weight_scales_2[0],
         };
-        let pointers = Pointers::bind(&arena, regions)?;
+        let pointers = Pointers::bind_with_kv(&arena, regions, kv_binding)?;
         let base_address = arena.base_address();
         let ops = Ops {
             norm: &norm,
@@ -407,6 +449,7 @@ impl Qwen36FullAttentionLayerProgram {
             layout,
             base_address,
             scales,
+            kv_binding,
             layer,
         })
     }
@@ -440,11 +483,24 @@ impl Qwen36FullAttentionLayerProgram {
         rope_cos: &[f32],
         rope_sin: &[f32],
     ) -> EngineResult<()> {
+        self.load_prefill_slot_state_at(stream, tokens, 0, 0, rope_cos, rope_sin)
+    }
+
+    pub(crate) fn load_prefill_slot_state_at(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        slot: usize,
+        first_position: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
         if prefill_index(tokens).is_none() {
             return Err(EngineError::route(format!(
                 "Qwen3.6 full-attention prefill tokens {tokens} are outside 32,64,128"
             )));
         }
+        require_slot(slot)?;
         let rotary_values = product(
             "Qwen3.6 attention prefill rotary values",
             tokens,
@@ -455,15 +511,32 @@ impl Qwen36FullAttentionLayerProgram {
                 "Qwen3.6 attention prefill rotary planes must each have {rotary_values} values for T={tokens}"
             )));
         }
-        if tokens > QWEN36_PREFILL_CONTEXT_CAPACITY {
+        let context_tokens = first_position.checked_add(tokens).ok_or_else(|| {
+            EngineError::route("Qwen3.6 attention prefill context length overflows")
+        })?;
+        if context_tokens > self.prefill_context_capacity() {
             return Err(EngineError::route(format!(
-                "Qwen3.6 attention prefill T={tokens} exceeds the {QWEN36_PREFILL_CONTEXT_CAPACITY}-token shared cache"
+                "Qwen3.6 attention prefill positions {first_position}..{context_tokens} exceed the {}-token shared cache",
+                self.prefill_context_capacity()
             )));
         }
 
-        let positions = (0..tokens as u32).collect::<Vec<_>>();
-        let lengths = (1..=tokens as u32).collect::<Vec<_>>();
-        let table_rows = vec![0u32; tokens];
+        let positions = (0..tokens)
+            .map(|token| {
+                u32::try_from(first_position + token).map_err(|_| {
+                    EngineError::route("Qwen3.6 attention prefill position exceeds u32")
+                })
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        let lengths = positions
+            .iter()
+            .map(|position| {
+                position
+                    .checked_add(1)
+                    .ok_or_else(|| EngineError::route("Qwen3.6 attention prefill length overflows"))
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        let table_rows = vec![slot as u32; tokens];
         let regions = self.layout.regions();
         self.arena
             .copy_prefix_from_host(stream, regions.prefill_table_rows, &table_rows)?;
@@ -475,6 +548,18 @@ impl Qwen36FullAttentionLayerProgram {
             .copy_prefix_from_host(stream, regions.prefill_rope_cos, rope_cos)?;
         self.arena
             .copy_prefix_from_host(stream, regions.prefill_rope_sin, rope_sin)?;
+
+        Ok(())
+    }
+
+    /// Maps compact decode rows to distinct physical cache slots.
+    pub fn load_slot_routes(&self, stream: &CudaStream, slots: &[usize]) -> EngineResult<()> {
+        let rows = slot_rows(slots)?;
+        self.arena.copy_prefix_from_host(
+            stream,
+            self.layout.regions().table_rows,
+            &rows[..slots.len()],
+        )?;
 
         Ok(())
     }
@@ -504,9 +589,10 @@ impl Qwen36FullAttentionLayerProgram {
         let lengths = positions
             .iter()
             .map(|&position| {
-                if position as usize >= QWEN36_CONTEXT_CAPACITY {
+                if position as usize >= self.context_capacity() {
                     return Err(EngineError::route(format!(
-                        "Qwen3.6 attention cache position {position} exceeds the {QWEN36_CONTEXT_CAPACITY}-token slot capacity"
+                        "Qwen3.6 attention cache position {position} exceeds the {}-token slot capacity",
+                        self.context_capacity()
                     )));
                 }
                 position.checked_add(1).ok_or_else(|| {
@@ -534,6 +620,7 @@ impl Qwen36FullAttentionLayerProgram {
         key_pages: &[u8],
         value_pages: &[u8],
     ) -> EngineResult<()> {
+        self.require_internal_cache("load")?;
         let regions = self.layout.regions();
         if key_pages.len() != regions.key_pages.len()
             || value_pages.len() != regions.value_pages.len()
@@ -553,6 +640,7 @@ impl Qwen36FullAttentionLayerProgram {
 
     /// Clears all slot-owned represented key/value cache pages.
     pub fn reset_cache(&self, stream: &CudaStream) -> EngineResult<()> {
+        self.require_internal_cache("reset")?;
         let regions = self.layout.regions();
         self.arena.fill(stream, regions.key_pages, 0)?;
         self.arena.fill(stream, regions.value_pages, 0)?;
@@ -617,12 +705,15 @@ impl Qwen36FullAttentionLayerProgram {
 
     /// Fixed short-context capacity of each decode slot.
     pub const fn context_capacity(&self) -> usize {
-        self.layout.context_capacity()
+        match self.kv_binding {
+            Some(binding) => binding.context_capacity,
+            None => self.layout.context_capacity(),
+        }
     }
 
     /// From-empty prompt capacity of the shared physical-page row.
     pub const fn prefill_context_capacity(&self) -> usize {
-        self.layout.prefill_context_capacity()
+        self.context_capacity()
     }
 
     /// Largest admitted exact batch.
@@ -646,7 +737,20 @@ impl Qwen36FullAttentionLayerProgram {
     }
 
     pub(crate) fn input_address(&self) -> GpuResult<*const u16> {
-        Ok(Pointers::bind(&self.arena, self.layout.regions())?.residual_input)
+        Ok(self.pointers()?.residual_input)
+    }
+
+    fn pointers(&self) -> GpuResult<Pointers> {
+        Pointers::bind_with_kv(&self.arena, self.layout.regions(), self.kv_binding)
+    }
+
+    fn require_internal_cache(&self, action: &str) -> EngineResult<()> {
+        if self.kv_binding.is_some() {
+            return Err(EngineError::route(format!(
+                "cannot {action} an externally owned Qwen3.6 attention cache through the layer"
+            )));
+        }
+        Ok(())
     }
 
     fn graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
@@ -673,7 +777,7 @@ impl Qwen36FullAttentionLayerProgram {
         rows: usize,
         input: *const u16,
     ) -> GpuResult<*const u16> {
-        let mut pointers = Pointers::bind(&self.arena, self.layout.regions())?;
+        let mut pointers = self.pointers()?;
         pointers.residual_input = input;
         require_rows(rows).map_err(|error| GpuError::invalid_launch(error.to_string()))?;
         launch_route(stream, rows, self.ops(), pointers, self.scales)?;
@@ -685,13 +789,7 @@ impl Qwen36FullAttentionLayerProgram {
     /// Launches the production route eagerly for graph-agreement qualification.
     pub fn launch_eager(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
         require_rows(rows)?;
-        launch_route(
-            stream,
-            rows,
-            self.ops(),
-            Pointers::bind(&self.arena, self.layout.regions())?,
-            self.scales,
-        )?;
+        launch_route(stream, rows, self.ops(), self.pointers()?, self.scales)?;
 
         Ok(())
     }
@@ -716,7 +814,7 @@ impl Qwen36FullAttentionLayerProgram {
                 "repeated Qwen3.6 full-attention graph requires at least one operation",
             ));
         }
-        let pointers = Pointers::bind(&self.arena, self.layout.regions())?;
+        let pointers = self.pointers()?;
         let ops = self.ops();
         let scales = self.scales;
 
@@ -731,7 +829,7 @@ impl Qwen36FullAttentionLayerProgram {
     #[cfg(feature = "qualification")]
     /// Returns every stable arena address in layout order.
     pub fn qualification_addresses(&self) -> EngineResult<Vec<usize>> {
-        Ok(Pointers::bind(&self.arena, self.layout.regions())?.addresses())
+        Ok(self.pointers()?.addresses())
     }
 
     #[cfg(feature = "qualification")]
@@ -1093,7 +1191,7 @@ fn launch_route(
                 pointers.table_rows,
                 pointers.cache_positions,
                 pointers.lengths,
-                QWEN36_TABLE_STRIDE,
+                pointers.decode_table_stride,
             )
         } else {
             (
@@ -1102,7 +1200,7 @@ fn launch_route(
                 pointers.prefill_table_rows,
                 pointers.prefill_cache_positions,
                 pointers.prefill_lengths,
-                QWEN36_PREFILL_TABLE_STRIDE,
+                pointers.prefill_table_stride,
             )
         };
     // SAFETY: one arena owns aligned, disjoint 128-row planes. Decode uses
@@ -1238,6 +1336,31 @@ fn require_batch(batch: usize) -> EngineResult<()> {
     Ok(())
 }
 
+fn slot_rows(slots: &[usize]) -> EngineResult<[u32; MAX_BATCH]> {
+    require_batch(slots.len())?;
+    let mut seen = [false; MAX_BATCH];
+    let mut rows = [0u32; MAX_BATCH];
+    for (row, &slot) in rows.iter_mut().zip(slots) {
+        require_slot(slot)?;
+        if std::mem::replace(&mut seen[slot], true) {
+            return Err(EngineError::route(format!(
+                "Qwen3.6 physical slot {slot} appears more than once"
+            )));
+        }
+        *row = slot as u32;
+    }
+    Ok(rows)
+}
+
+fn require_slot(slot: usize) -> EngineResult<()> {
+    if slot >= MAX_BATCH {
+        return Err(EngineError::route(format!(
+            "Qwen3.6 physical slot {slot} is outside 0..{MAX_BATCH}"
+        )));
+    }
+    Ok(())
+}
+
 fn prefill_index(rows: usize) -> Option<usize> {
     match rows {
         32 => Some(0),
@@ -1264,7 +1387,7 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, ROTARY_PAIRS, prefill_index, require_batch, require_rows};
+    use super::{MAX_BATCH, ROTARY_PAIRS, prefill_index, require_batch, require_rows, slot_rows};
     use crate::EngineErrorCode;
     use tuisko_model::Qwen36Moe35B;
 
@@ -1293,6 +1416,17 @@ mod tests {
             assert_eq!(prefill_index(rows), None);
             assert_eq!(
                 require_rows(rows).unwrap_err().code(),
+                Some(EngineErrorCode::Route)
+            );
+        }
+    }
+
+    #[test]
+    fn compact_cache_slot_table_is_bijective() {
+        assert_eq!(slot_rows(&[7, 2, 5]).unwrap()[..3], [7, 2, 5]);
+        for slots in [&[][..], &[0, 0], &[8]] {
+            assert_eq!(
+                slot_rows(slots).unwrap_err().code(),
                 Some(EngineErrorCode::Route)
             );
         }

@@ -186,6 +186,10 @@ fn prepare_run(
     salt: usize,
 ) -> Result<(), Qwen36ResidentModelQualificationError> {
     program.reset_state(stream)?;
+    for slot in 0..batch {
+        program.activate_kv_slot(slot)?;
+        program.reserve_kv_slot_tokens(stream, slot, 1)?;
+    }
     let ids = token_ids(batch, salt);
     program.stage_embeddings(stream, &ids[..batch])?;
     let positions = vec![0u32; batch];
@@ -204,6 +208,8 @@ fn prepare_prefill_run(
     salt: usize,
 ) -> Result<Qwen36ResidentPrefillRoute, Qwen36ResidentModelQualificationError> {
     program.reset_state(stream)?;
+    program.activate_kv_slot(0)?;
+    program.reserve_kv_slot_tokens(stream, 0, tokens)?;
     let ids = prefill_token_ids(tokens, salt);
     program.stage_prefill_embeddings(stream, &ids)?;
     let rope_cos = vec![1.0f32; tokens * ROTARY_PAIRS];
@@ -673,11 +679,11 @@ mod tests {
         assert_eq!(report.prefill_graph_replay_values, 1_209_856);
         assert_eq!(report.prefill_finite_logits, 744_960);
         assert_eq!(report.prefill_replacement_cases, 3);
-        assert_eq!(report.arena_addresses, 41);
+        assert_eq!(report.arena_addresses, 42);
         assert_eq!(report.weight_bytes, 19_808_036_096);
-        assert_eq!(report.cache_bytes, 15_728_640);
-        assert_eq!(report.workspace_bytes, 1_223_712_576);
-        assert_eq!(report.arena_bytes, 21_047_503_872);
+        assert_eq!(report.cache_bytes, 2_700_083_200);
+        assert_eq!(report.workspace_bytes, 1_223_843_648);
+        assert_eq!(report.arena_bytes, 23_731_989_504);
         assert_eq!(report.host_stager_bytes, 557_056);
         assert!(report.maximum_normalization_error.is_finite());
         assert!(report.maximum_logit_error.is_finite());

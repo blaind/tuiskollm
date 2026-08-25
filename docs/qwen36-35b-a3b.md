@@ -212,20 +212,20 @@ growth in one 290,107,392-byte arena. At locked 2,197/13,801 MHz SM/memory clock
 direct graph measures 199.142/448.010 us at B=1/8; the repeated intrinsic path measures
 197.736/446.026 us and the B=1 route reads the 286 MB endpoint at 1,349.78 GiB/s.
 
-The initial resident text layout then composes 30 GDN/MoE layers, ten full-attention/MoE layers,
-and the endpoint into 41 address-stable arenas. It accounts 19,808,036,096 device weight bytes,
-15,728,640 short-context E4M3 cache bytes, 1,223,712,576 workspace/state bytes, and 26,560 alignment
-bytes for a 21,047,503,872-byte allocation. Eight whole-model decode graphs and three from-empty
+The resident text layout then composes 30 GDN/MoE layers, ten full-attention/MoE layers, one shared
+4,096-page E4M3 cache, and the endpoint into 42 address-stable arenas. It accounts 19,808,036,096
+device weight bytes, 2,700,083,200 cache bytes, 1,223,843,648 workspace/state/page-table bytes, and
+26,560 alignment bytes for a 23,731,989,504-byte allocation. The cache total includes
+2,684,354,560 shared production bytes plus the layer-local qualification planes retained by the
+standalone owners. Eight whole-model decode graphs and three from-empty
 `T=32/64/128` prompt graphs chain each layer's BF16 publication directly into the next owner. The
 prompt input uses a 524,288-byte pinned embedding stager and layer zero's retained 128-row plane;
 only the final prompt row enters the existing endpoint, avoiding a prompt-wide vocabulary-logit
 allocation. The real checkpoint passes all eight decode eager/graph
 routes, 76,032 represented endpoint-oracle values, 8,939,520 finite logits, inactive-row and
-replacement-input checks, all 41 stable addresses, zero post-warmup growth, and the complete
-downstream spill/resource cone. An unblessed diagnostic while the SM clock spans 2,107--2,182 MHz
-measures 4.994/9.334 ms at B=1/8 and 23.362/37.790/67.475 ms at T=32/64/128. The timed region has
-zero device-memory growth, but clock drift makes these values descriptive rather than baseline
-authority. The prompt routes have separate complete-model eager/graph, represented endpoint,
+replacement-input checks, all 42 stable device addresses, zero post-warmup growth, and the complete
+downstream spill/resource cone. The preceding timing predates shared-cache graph binding and is no
+longer performance authority. The prompt routes have separate complete-model eager/graph, represented endpoint,
 inactive-extent, stable-address, and post-warmup allocation gates.
 
 The text frontend separately admits the snapshot's 248,070-entry tokenizer, Qwen3.6 chat template,
@@ -234,18 +234,19 @@ ordered stop IDs `[248046, 248044]`, and sampled defaults `temperature=1`, `top_
 fixtures exactly; this contract is not aliased to Qwen3.5 even though their tokenizer files match.
 A concrete single-slot generation owner now joins that frontend to the complete resident model.
 For the exact thinking-mode `Hello` prompt, production streaming and separately driven raw-token
-transitions select the same two greedy tokens `[8160, 579]`; reset replay is deterministic, all 42
-device/host addresses remain stable, and device memory does not grow after warmup. This is
+transitions select the same two greedy tokens `[8160, 579]`; reset replay is deterministic, all 43
+retained device/host addresses remain stable, and device memory does not grow after warmup. This is
 frontend-to-device state-transition evidence, not an external same-model logit-parity claim. The
 generation route selects the largest qualified from-empty `T=32/64/128` prefix and evaluates the
-remaining prompt tail through exact B=1 decode, while retaining the 192-position capacity.
+remaining prompt tail through exact B=1 decode. The active server slot now admits the checkpoint's
+262,144-position limit through the shared page owner.
 The server now selects this concrete target from the pinned revision directory and publishes
 `nvidia/Qwen3.6-35B-A3B-NVFP4` through the OpenAI health, models, blocking chat, and SSE routes. A
 real localhost thinking-mode `Hello` request emits the two-token reasoning text `Here's`; blocking
 and SSE responses both report 11 prompt tokens, two completion tokens, `finish_reason=length`, and
 the exact model identity. `xtask qualify-qwen36-server` makes those public-boundary checks
-repeatable and stops only the server child it starts. Startup exposes one slot and the same
-192-position limit rather than implying compact batching.
+repeatable and stops only the server child it starts. Startup still exposes one slot rather than
+implying compact batching.
 
 ## Implementation order
 

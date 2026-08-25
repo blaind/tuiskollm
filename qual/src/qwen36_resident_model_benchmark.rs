@@ -56,6 +56,10 @@ impl Session {
         let mut program = Qwen36ResidentModelProgram::from_snapshot(&context, snapshot)?;
         program.stage_embeddings(&stream, &benchmark_token_ids())?;
         program.reset_state(&stream)?;
+        for slot in 0..MAX_BATCH {
+            program.activate_kv_slot(slot)?;
+            program.reserve_kv_slot_tokens(&stream, slot, CONTEXT_TOKENS)?;
+        }
         let (rope_cos, rope_sin) = benchmark_rope();
         program.load_decode_state(
             &stream,
@@ -388,19 +392,19 @@ pub fn benchmark_qwen36_resident_model(
         "qwen36_35b_a3b/resident_model/e4m3_kv_cache",
         BenchmarkMemoryKind::KvCache,
         layout.cache_bytes(),
-        "10 attention layers * 8 slots * 192 positions",
+        "10 attention layers * 4,096 shared pages plus standalone fallback planes",
     )?;
     memory.register_owned(
         "qwen36_35b_a3b/resident_model/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         layout.workspace_bytes(),
-        "40 retained layer arenas plus endpoint workspace",
+        "40 retained layer arenas, shared page table, and endpoint workspace",
     )?;
     memory.register_owned(
         "qwen36_35b_a3b/resident_model/alignment_padding",
         BenchmarkMemoryKind::Other,
         layout.padding_bytes(),
-        "aggregate 256-byte alignment across 41 arenas",
+        "aggregate 256-byte alignment across 42 arenas",
     )?;
     memory.capture("after_setup")?;
     session.warm(warmup_launches)?;

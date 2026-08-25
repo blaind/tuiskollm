@@ -65,9 +65,10 @@ cache configuration inherits the target cache dtype in the upstream MTP
 contract. Target and MTP therefore own separate E4M3 K/V storage but share one
 logical page lifecycle and the same stable per-slot page mappings.
 
-The current Qwen3.6 resident program's 192-position E4M3 cache is short-context
-qualification scaffolding. It uses the export recipe's exact unit-scale FP8-cast codec,
-but its ownership must be replaced before MTP or compact serving is admitted. The replacement has:
+The target resident program now owns the export recipe's unit-scale E4M3 cache in one shared
+4,096-page pool. Its ten attention-layer graph inventories bind that owner directly while retaining
+their small internal planes only for standalone qualification. The remaining MTP cache must follow
+the same lifecycle without aliasing target storage. The complete design has:
 
 - one shared physical page pool across at most eight active or retained slots;
 - ten target full-attention K/V layer pairs and one separate MTP K/V pair;
@@ -79,8 +80,8 @@ but its ownership must be replaced before MTP or compact serving is admitted. Th
 
 At the full 4,096-page capacity, target cache data is 2,684,354,560 bytes and
 the MTP mirror is 268,435,456 bytes. Page tables, alignment, CUDA context,
-graphs, MTP weights, and workspaces remain additional. A real resident-layout
-and device-headroom gate must pass before the server route can be enabled.
+graphs, MTP weights, and workspaces remain additional. Target resident-layout,
+generation, and device-headroom gates are closed; the MTP mirror gate remains open.
 
 Every target page-table mutation publishes the identical mapping to the MTP
 table. Storage never aliases. A mismatched route, token count, or ownership

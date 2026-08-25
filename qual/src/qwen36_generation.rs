@@ -228,10 +228,10 @@ fn verify_prompt_fixtures(
 fn verify_owner(
     generator: &Qwen36ResidentTextGenerator,
 ) -> Result<(), Qwen36GenerationQualificationError> {
-    if generator.arena_bytes() != 21_047_503_872
+    if generator.arena_bytes() != 23_731_989_504
         || generator.resident_weight_bytes() != 19_808_036_096
         || generator.host_stager_bytes() != 1_053_696
-        || generator.context_capacity() != 192
+        || generator.context_capacity() != 262_144
     {
         return Err(Qwen36GenerationQualificationError::Mismatch(
             "Qwen3.6 generation owner bytes or capacity changed".into(),
@@ -247,7 +247,7 @@ fn verify_owner(
     let mut unique = addresses.clone();
     unique.sort_unstable();
     unique.dedup();
-    if addresses.len() != 42 || unique.len() != addresses.len() || addresses.contains(&0) {
+    if addresses.len() != 43 || unique.len() != addresses.len() || addresses.contains(&0) {
         return Err(Qwen36GenerationQualificationError::Mismatch(
             "Qwen3.6 generation owner addresses are invalid".into(),
         ));
@@ -273,10 +273,10 @@ mod tests {
         assert_eq!(report.prompt_cases, 2);
         assert!((1..=2).contains(&report.chat_steps));
         assert_eq!(report.native_prefill_tokens, [0, 32, 32, 64, 64, 128, 128]);
-        assert_eq!(report.arena_bytes, 21_047_503_872);
+        assert_eq!(report.arena_bytes, 23_731_989_504);
         assert_eq!(report.resident_weight_bytes, 19_808_036_096);
         assert_eq!(report.host_stager_bytes, 1_053_696);
-        assert_eq!(report.stable_addresses, 42);
+        assert_eq!(report.stable_addresses, 43);
         eprintln!("Qwen3.6 generation qualification passed: {report:?}");
         Ok(())
     }
