@@ -778,8 +778,8 @@ mod tests {
         assert_eq!(report.arena_addresses, 34);
         assert_eq!(report.weight_bytes, 5_931_820_032);
         assert_eq!(report.cache_bytes, 8_640_266_240);
-        assert_eq!(report.workspace_bytes, 1_109_340_416);
-        assert_eq!(report.arena_bytes, 15_681_447_936);
+        assert_eq!(report.workspace_bytes, 1_159_672_064);
+        assert_eq!(report.arena_bytes, 15_731_779_584);
         assert_eq!(report.host_stager_bytes, 1_114_112);
         assert_eq!(report.kv_host_owner_bytes, 135_168);
         assert!(report.maximum_normalization_error.is_finite());

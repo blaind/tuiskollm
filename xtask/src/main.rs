@@ -1929,6 +1929,7 @@ fn qualify_qwen36_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
             "--lib",
             "--",
             "qwen35_gdn_recurrence::tests::qwen36_exact_routes_match_shared_independent_oracle",
+            "--exact",
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -13868,6 +13869,14 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
                 .starts_with("qwen35_gdn_recurrence_prefill_exact_TID_")
         })
         .collect::<Vec<_>>();
+    let epilogue = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_gdn_recurrence_prefill_epilogue_exact_TID_")
+        })
+        .collect::<Vec<_>>();
     let causal = entries
         .iter()
         .filter(|entry| {
@@ -13879,8 +13888,13 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
     require_count("Qwen3.5 GDN recurrence", routes.len(), 8)?;
     require_count("Qwen3.5 GDN recurrence causal", causal.len(), 3)?;
     require_count("Qwen3.5/Qwen3.6 GDN recurrence prefill", prefill.len(), 3)?;
+    require_count(
+        "Qwen3.5/Qwen3.6 GDN recurrence prefill epilogue",
+        epilogue.len(),
+        3,
+    )?;
 
-    for entry in routes.iter().chain(&causal).chain(&prefill) {
+    for entry in routes.iter().chain(&causal) {
         if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 512-thread/two-CTA launch bounds",
@@ -13888,6 +13902,31 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
+    }
+    for entry in &prefill {
+        if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 1") {
+            return Err(format!(
+                "entry `{}` lost its 512-thread/shared-resident-state launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in &epilogue {
+        if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 512-thread/two-CTA epilogue launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in routes
+        .iter()
+        .chain(&causal)
+        .chain(&prefill)
+        .chain(&epilogue)
+    {
         if !entry.body.contains("rsqrt.approx.f32") || !entry.body.contains("ex2.approx.f32") {
             return Err(format!(
                 "entry `{}` lost normalization or recurrent decay",
@@ -13924,10 +13963,25 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
     let mut causal_registers = Vec::new();
     let mut prefill_registers = Vec::new();
     let mut shared = Vec::new();
-    for (role, entries, role_registers) in [
-        ("decode", routes, &mut registers),
-        ("causal", causal, &mut causal_registers),
-        ("prefill", prefill, &mut prefill_registers),
+    let mut causal_shared = Vec::new();
+    let mut prefill_shared = Vec::new();
+    let mut epilogue_registers = Vec::new();
+    let mut epilogue_shared = Vec::new();
+    for (role, entries, role_registers, role_shared) in [
+        ("decode", routes, &mut registers, &mut shared),
+        ("causal", causal, &mut causal_registers, &mut causal_shared),
+        (
+            "prefill",
+            prefill,
+            &mut prefill_registers,
+            &mut prefill_shared,
+        ),
+        (
+            "prefill epilogue",
+            epilogue,
+            &mut epilogue_registers,
+            &mut epilogue_shared,
+        ),
     ] {
         for entry in entries {
             let resource = resources.get(entry.name).ok_or_else(|| {
@@ -13953,13 +14007,17 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
                 }
             }
             role_registers.push(resource.registers);
-            shared.push(resource.shared);
+            role_shared.push(resource.shared);
         }
     }
     registers.sort_unstable();
     causal_registers.sort_unstable();
     prefill_registers.sort_unstable();
     shared.sort_unstable();
+    causal_shared.sort_unstable();
+    prefill_shared.sort_unstable();
+    epilogue_registers.sort_unstable();
+    epilogue_shared.sort_unstable();
     require_registers(&baseline, "recurrence_registers", &registers)?;
     if baseline.contains_key("causal_registers") {
         require_registers(&baseline, "causal_registers", &causal_registers)?;
@@ -13967,11 +14025,29 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
     if baseline.contains_key("prefill_registers") {
         require_registers(&baseline, "prefill_registers", &prefill_registers)?;
     }
-    require_uniform_value(&baseline, "shared_bytes", &shared)?;
+    let mut decode_and_causal_shared = shared.clone();
+    decode_and_causal_shared.extend_from_slice(&causal_shared);
+    decode_and_causal_shared.sort_unstable();
+    require_uniform_value(&baseline, "shared_bytes", &decode_and_causal_shared)?;
+    if baseline.contains_key("prefill_shared_bytes") {
+        require_uniform_value(&baseline, "prefill_shared_bytes", &prefill_shared)?;
+    }
+    if baseline.contains_key("prefill_epilogue_registers") {
+        require_registers(&baseline, "prefill_epilogue_registers", &epilogue_registers)?;
+    }
+    if baseline.contains_key("prefill_epilogue_shared_bytes") {
+        require_uniform_value(&baseline, "prefill_epilogue_shared_bytes", &epilogue_shared)?;
+    }
 
     println!(
-        "Qwen3.5/Qwen3.6 GDN recurrence gate passed: 8 decode + 3 causal + 3 prefill entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/EX2 present",
-        registers, causal_registers, prefill_registers, shared
+        "Qwen3.5/Qwen3.6 GDN recurrence gate passed: 8 decode + 3 causal + 3 prefill + 3 prefill epilogue entries, REG {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?} / {:?} / {:?}, RSQ/EX2 present",
+        registers,
+        causal_registers,
+        prefill_registers,
+        epilogue_registers,
+        decode_and_causal_shared,
+        prefill_shared,
+        epilogue_shared,
     );
     Ok(())
 }
