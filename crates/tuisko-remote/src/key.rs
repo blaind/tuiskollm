@@ -21,22 +21,42 @@ fn credentials_path() -> RemoteResult<PathBuf> {
 
 /// Resolves the API key in precedence order:
 /// `RUNPOD_API_KEY` env var, `~/.runpod/credentials.json`, then a `.env`
-/// file found by walking up from the current directory.
+/// file found by walking up from the current directory. The credentials file
+/// is the only step `resolve_env` does not share.
 pub fn resolve_api_key() -> RemoteResult<String> {
-    if let Some(key) = env_key() {
-        return Ok(key);
-    }
-    if let Some(key) = credentials_file_key() {
-        return Ok(key);
-    }
-    dotenv_key().ok_or_else(|| RemoteError::MissingKey)
+    process_env(ENV_VAR)
+        .or_else(credentials_file_key)
+        .or_else(|| dotenv_value(ENV_VAR))
+        .ok_or(RemoteError::MissingKey)
 }
 
-/// The key from the environment, if set non-empty.
-fn env_key() -> Option<String> {
-    std::env::var(ENV_VAR)
+/// Resolves a configuration value: the process environment first, then
+/// the nearest `.env` file (so `.env` works for every `RUNPOD_*` knob,
+/// not only the API key).
+pub fn resolve_env(name: &str) -> Option<String> {
+    process_env(name).or_else(|| dotenv_value(name))
+}
+
+/// One value from the process environment, trimmed, if it is set non-empty.
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
         .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// One value from the nearest `.env` above the current directory.
+fn dotenv_value(name: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(find_dotenv()?).ok()?;
+    dotenv_lookup(&raw, name)
+}
+
+/// The first non-empty binding of `name` in one `.env` file's contents.
+fn dotenv_lookup(raw: &str, name: &str) -> Option<String> {
+    raw.lines()
+        .filter_map(parse_dotenv_line)
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
         .filter(|value| !value.is_empty())
 }
 
@@ -50,36 +70,6 @@ fn credentials_file_key() -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .map(|key| key.trim().to_owned())
         .filter(|key| !key.is_empty())
-}
-
-/// Resolves a configuration value: the process environment first, then
-/// the nearest `.env` file (so `.env` works for every `RUNPOD_*` knob,
-/// not only the API key).
-pub fn resolve_env(name: &str) -> Option<String> {
-    if let Ok(value) = std::env::var(name) {
-        let value = value.trim();
-        if !value.is_empty() {
-            return Some(value.to_owned());
-        }
-    }
-    let path = find_dotenv()?;
-    let raw = std::fs::read_to_string(path).ok()?;
-    raw.lines()
-        .filter_map(parse_dotenv_line)
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value)
-        .filter(|value| !value.is_empty())
-}
-
-/// The key from the nearest `.env` file above the current directory.
-fn dotenv_key() -> Option<String> {
-    let path = find_dotenv()?;
-    let raw = std::fs::read_to_string(path).ok()?;
-    raw.lines()
-        .filter_map(parse_dotenv_line)
-        .find(|(key, _)| key == ENV_VAR)
-        .map(|(_, value)| value)
-        .filter(|value| !value.is_empty())
 }
 
 /// Finds the nearest `.env` walking upward from the current directory.
@@ -117,9 +107,29 @@ fn parse_dotenv_line(raw: &str) -> Option<(String, String)> {
     }
     Some((key.to_owned(), value.to_owned()))
 }
+
 #[cfg(test)]
 mod tests {
-    use super::parse_dotenv_line;
+    use super::{dotenv_lookup, parse_dotenv_line};
+
+    /// The API key and every other `RUNPOD_*` knob now share one `.env`
+    /// lookup; it must still select the first non-empty binding of the
+    /// requested name and nothing else.
+    #[test]
+    fn dotenv_lookup_selects_one_named_binding() {
+        const FILE: &str = "# comment\nRUNPOD_API_KEY=\"abc123\"\nRUNPOD_SSH_KEY_FILE=/tmp/id\nRUNPOD_API_KEY=later\nRUNPOD_EMPTY=\n";
+
+        assert_eq!(
+            dotenv_lookup(FILE, "RUNPOD_API_KEY").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            dotenv_lookup(FILE, "RUNPOD_SSH_KEY_FILE").as_deref(),
+            Some("/tmp/id")
+        );
+        assert_eq!(dotenv_lookup(FILE, "RUNPOD_EMPTY"), None);
+        assert_eq!(dotenv_lookup(FILE, "RUNPOD_ABSENT"), None);
+    }
 
     #[test]
     fn plain_value_is_parsed() {
