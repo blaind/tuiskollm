@@ -103,11 +103,28 @@ pub use qwen38::upload_plan::{
     ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
 };
 pub use resident_generation::{
-    Qwen35ResidentGenerationSession, Qwen35ResidentTextGenerator, Qwen36ResidentGenerationSession,
-    Qwen36ResidentTextGenerator, ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents,
-    ResidentBatchGenerator, ResidentCancellation, ResidentGenerationSession, ResidentRequestId,
-    ResidentTextGenerator,
+    ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentBatchGenerator,
+    ResidentCancellation, ResidentRequestId,
 };
+/// Single-slot Qwen3.5 streaming request over the resident text program.
+pub type Qwen35ResidentGenerationSession<'a> =
+    common::text_generator::SingleSlotGenerationSession<'a, Qwen35ResidentModelProgram>;
+/// Single-slot Qwen3.5 frontend, resident program, stream, and host-logit owner.
+pub type Qwen35ResidentTextGenerator =
+    common::text_generator::SingleSlotTextGenerator<Qwen35ResidentModelProgram>;
+/// Single-slot Qwen3.6 streaming request over the resident text program.
+pub type Qwen36ResidentGenerationSession<'a> =
+    common::text_generator::SingleSlotGenerationSession<'a, Qwen36ResidentModelProgram>;
+/// Single-slot Qwen3.6 frontend, resident program, stream, and host-logit owner.
+pub type Qwen36ResidentTextGenerator =
+    common::text_generator::SingleSlotTextGenerator<Qwen36ResidentModelProgram>;
+/// Single-slot Qwen3.8 streaming request over the resident text program.
+pub type ResidentGenerationSession<'a> =
+    common::text_generator::SingleSlotGenerationSession<'a, ResidentModelProgram>;
+/// Single-slot Qwen3.8 frontend, resident program, stream, and host-logit owner.
+pub type ResidentTextGenerator =
+    common::text_generator::SingleSlotTextGenerator<ResidentModelProgram>;
+
 pub use sampling::{
     SampleDecision, Sampler, SamplingDistribution, SamplingOptions, SamplingPenalties,
     SpeculativeDecision, speculative_accept_probability, speculative_decision,

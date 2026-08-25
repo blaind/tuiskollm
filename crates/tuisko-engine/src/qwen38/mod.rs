@@ -19,4 +19,5 @@ pub(crate) mod resident_mtp;
 pub(crate) mod resident_mtp_batch_generation;
 pub(crate) mod resident_mtp_generation;
 pub(crate) mod resident_mtp_layout;
+pub(crate) mod text_generation;
 pub(crate) mod upload_plan;

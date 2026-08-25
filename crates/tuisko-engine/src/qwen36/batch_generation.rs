@@ -3,7 +3,7 @@
 use crate::common::banks::{compact, row};
 use crate::common::rope::text_rope;
 use crate::common::slots::{device_zero_context, first_free_slot, require_generation_capacity};
-use crate::resident_generation::prime_qwen36_prompt;
+use crate::qwen36::text_generation::prime_prompt;
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, GenerationSession, MAX_BATCH,
     Qwen36ResidentModelProgram, ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents,
@@ -112,7 +112,7 @@ impl Qwen36ResidentBatchGenerator {
             self.program.recycle_kv_slot(&self.stream, slot)?;
             return Err(error);
         }
-        let native_prefill_tokens = prime_qwen36_prompt(
+        let native_prefill_tokens = prime_prompt(
             &mut self.program,
             &self.stream,
             control.prompt_token_ids(),
