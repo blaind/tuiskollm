@@ -10495,7 +10495,7 @@ fn gate_paged_gqa_target(
     let mut prefill_registers = Vec::new();
     let mut prefill_shared = Vec::new();
     let decode_instructions = if e4m3_cache {
-        &["F2FP.F16.E4M3.UNPACK_B", "SHFL.BFLY", "MUFU.EX2"][..]
+        &["F2FP.F16.E4M3.UNPACK_B", "LDGSTS", "SHFL.BFLY", "MUFU.EX2"][..]
     } else {
         &["LDGSTS", "SHFL.BFLY", "MUFU.EX2"][..]
     };
