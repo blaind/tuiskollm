@@ -935,7 +935,6 @@ impl Qwen35MtpLayerProgram {
         })
     }
 
-    #[cfg(feature = "qualification")]
     fn ops(&self) -> Ops<'_> {
         Ops {
             fusion: &self.fusion,
