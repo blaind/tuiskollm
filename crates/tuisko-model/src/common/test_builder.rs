@@ -57,6 +57,23 @@ impl SafeTensorTestBuilder {
         self.declare(name, DType::Bf16, shape, begin)
     }
 
+    /// Appends a BF16 tensor whose every element carries this tensor's own 1-based declaration
+    /// ordinal as its source word, so a fixture's tensors stay distinguishable by value.
+    pub(crate) fn add_bf16_ordinal(
+        &mut self,
+        name: impl Into<String>,
+        shape: &[usize],
+    ) -> &mut Self {
+        let word = u16::try_from(self.header.len() + 1).unwrap();
+
+        self.add_bf16(name, shape, word)
+    }
+
+    /// Appends a rank-0 F32 scalar carrying the exact source bits of `value`.
+    pub(crate) fn add_rank0_f32(&mut self, name: impl Into<String>, value: f32) -> &mut Self {
+        self.add_f32(name, &[], value)
+    }
+
     /// Appends an F32 tensor whose every element carries the exact source bits of `value`.
     pub(crate) fn add_f32(
         &mut self,
