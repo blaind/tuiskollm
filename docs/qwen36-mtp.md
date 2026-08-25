@@ -163,6 +163,10 @@ shared gating, fixed-order reduction, immutable source planes, graph replay,
 inactive rows, stable addresses, and zero post-warmup growth against an
 independent represented-value formula.
 
+The complete 71-entry MTP leaf inventory retains its exact launch bounds and
+toolchain-stamped register envelopes with 1,024 shared bytes and zero stack or
+local memory in every entry.
+
 ## MR sequence
 
 1. `docs/qwen36-mtp-design`
