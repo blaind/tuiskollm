@@ -492,7 +492,7 @@ fn validate_authority(report: AuthorityReport) -> Result<Candidate, Box<dyn Erro
     }
     validate_device(&report.device)?;
     if report.clock_policy.minimum_samples != 3
-        || report.clock_policy.maximum_sm_clock_spread_mhz != 50
+        || report.clock_policy.maximum_sm_clock_spread_mhz != 75
         || report.clock_policy.maximum_memory_clock_spread_mhz != 250
     {
         return Err("server authority report used an unsupported clock policy".into());
@@ -1419,7 +1419,7 @@ mod tests {
             server_pid: 42,
             clock_policy: ClockPolicy {
                 minimum_samples: 3,
-                maximum_sm_clock_spread_mhz: 50,
+                maximum_sm_clock_spread_mhz: 75,
                 maximum_memory_clock_spread_mhz: 250,
             },
             idle: telemetry(),
