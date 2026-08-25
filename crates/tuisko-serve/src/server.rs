@@ -1,6 +1,7 @@
 //! Concrete HTTP server and resident scheduler worker.
 
 use crate::request_log::RequestLog;
+use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
 use crate::{
     ChatCompletionRequest, ChatRequestError, GenerationReply, PreparedChatRequest,
     blocking_response, openai_error, streaming_response,
@@ -272,11 +273,10 @@ fn start_worker(
         failure_rx,
     ))
 }
-
 fn engine_worker(
     snapshot: PathBuf,
     target: ResidentTarget,
-    mut jobs: Receiver<Job>,
+    jobs: Receiver<Job>,
     ready: std_mpsc::SyncSender<Result<Ready, String>>,
     failure: oneshot::Sender<String>,
     worker_ready: Arc<AtomicBool>,
@@ -289,40 +289,42 @@ fn engine_worker(
         }
     }
     let _readiness_guard = ReadinessGuard(Arc::clone(&worker_ready));
-    if target == ResidentTarget::Qwen35 {
-        qwen35_engine_worker(snapshot, jobs, ready, failure, worker_ready);
-        return;
-    }
-    if target == ResidentTarget::Qwen36 {
-        qwen36_engine_worker(snapshot, jobs, ready, failure, worker_ready);
-        return;
-    }
-    let generator = (|| {
-        let checkpoint_start = Instant::now();
-        let snapshot = CheckpointSnapshot::<Qwen38_27B>::open(&snapshot)
-            .map(Arc::new)
-            .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
-        let checkpoint_admission = checkpoint_start.elapsed();
-        let tensor_count = snapshot.tensor_count();
-        let generator = ResidentMtpBatchGenerator::from_snapshot_device_zero_with_progress(
-            snapshot,
-            progress.as_ref(),
-        )
-        .map_err(|error| format!("loading the resident text program: {error}"))?;
-        let device_name = generator
-            .context()
-            .device_name()
-            .map_err(|error| format!("reading the CUDA device name: {error}"))?;
-        Ok::<_, String>((generator, checkpoint_admission, tensor_count, device_name))
-    })();
-    let (mut generator, checkpoint_admission, tensor_count, device_name) = match generator {
-        Ok(result) => result,
-        Err(error) => {
-            let _ = ready.send(Err(error));
-            return;
+    match target {
+        ResidentTarget::Qwen38 => start_generator(
+            load_qwen38(&snapshot, progress.as_ref()),
+            jobs,
+            ready,
+            failure,
+            &worker_ready,
+        ),
+        ResidentTarget::Qwen35 => {
+            start_generator(load_qwen35(&snapshot), jobs, ready, failure, &worker_ready)
         }
-    };
+        ResidentTarget::Qwen36 => {
+            start_generator(load_qwen36(&snapshot), jobs, ready, failure, &worker_ready)
+        }
+    }
+}
+
+fn load_qwen38(
+    snapshot: &Path,
+    progress: &ResidentLoadProgress,
+) -> Result<(ResidentMtpBatchGenerator, Ready), String> {
+    let checkpoint_start = Instant::now();
+    let admitted = CheckpointSnapshot::<Qwen38_27B>::open(snapshot)
+        .map(Arc::new)
+        .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
+    let checkpoint_admission = checkpoint_start.elapsed();
+    let tensor_count = admitted.tensor_count();
+    let generator =
+        ResidentMtpBatchGenerator::from_snapshot_device_zero_with_progress(admitted, progress)
+            .map_err(|error| format!("loading the resident text program: {error}"))?;
+    let device_name = generator
+        .context()
+        .device_name()
+        .map_err(|error| format!("reading the CUDA device name: {error}"))?;
     let load_stats = generator.load_stats();
+
     let startup = Ready {
         model_id: Qwen38_27B::MODEL_ID,
         generation_route: ResidentTarget::Qwen38.generation_route(),
@@ -341,11 +343,115 @@ fn engine_worker(
         context_capacity: generator.context_capacity(),
         detailed_load_timing: true,
     };
+
+    Ok((generator, startup))
+}
+
+fn load_qwen35(snapshot: &Path) -> Result<(Qwen35ResidentMtpBatchGenerator, Ready), String> {
+    let checkpoint_start = Instant::now();
+    let admitted = CheckpointSnapshot::<Qwen35_9B>::open(snapshot)
+        .map(Arc::new)
+        .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
+    let checkpoint_admission = checkpoint_start.elapsed();
+    let tensor_count = admitted.tensor_count();
+    let load_start = Instant::now();
+    let generator = Qwen35ResidentMtpBatchGenerator::from_snapshot_device_zero(admitted)
+        .map_err(|error| format!("loading the resident Qwen3.5 MTP program: {error}"))?;
+    let resident_load = load_start.elapsed();
+    let device_name = generator
+        .context()
+        .device_name()
+        .map_err(|error| format!("reading the CUDA device name: {error}"))?;
+
+    let startup = Ready {
+        model_id: Qwen35_9B::MODEL_ID,
+        generation_route: ResidentTarget::Qwen35.generation_route(),
+        generation_defaults: generator.generation_defaults(),
+        device_name,
+        checkpoint_admission,
+        weight_load: resident_load,
+        source_prefault: Duration::ZERO,
+        graph_capture: Duration::ZERO,
+        tensor_count,
+        upload_bytes: generator.resident_weight_bytes(),
+        prefault_bytes: 0,
+        arena_bytes: generator.arena_bytes(),
+        host_stager_bytes: generator.host_stager_bytes(),
+        slot_capacity: MAX_BATCH,
+        context_capacity: generator.context_capacity(),
+        detailed_load_timing: false,
+    };
+
+    Ok((generator, startup))
+}
+
+fn load_qwen36(snapshot: &Path) -> Result<(Qwen36ResidentBatchGenerator, Ready), String> {
+    let checkpoint_start = Instant::now();
+    let admitted = CheckpointSnapshot::<Qwen36Moe35B>::open(snapshot)
+        .map(Arc::new)
+        .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
+    let checkpoint_admission = checkpoint_start.elapsed();
+    let tensor_count = admitted.tensor_count();
+    let load_start = Instant::now();
+    let generator = Qwen36ResidentBatchGenerator::from_snapshot_device_zero(admitted)
+        .map_err(|error| format!("loading the resident Qwen3.6 compact program: {error}"))?;
+    let resident_load = load_start.elapsed();
+    let device_name = generator
+        .context()
+        .device_name()
+        .map_err(|error| format!("reading the CUDA device name: {error}"))?;
+
+    let startup = Ready {
+        model_id: Qwen36Moe35B::MODEL_ID,
+        generation_route: ResidentTarget::Qwen36.generation_route(),
+        generation_defaults: generator.generation_defaults(),
+        device_name,
+        checkpoint_admission,
+        weight_load: resident_load,
+        source_prefault: Duration::ZERO,
+        graph_capture: Duration::ZERO,
+        tensor_count,
+        upload_bytes: generator.resident_weight_bytes(),
+        prefault_bytes: 0,
+        arena_bytes: generator.arena_bytes(),
+        host_stager_bytes: generator.host_stager_bytes(),
+        slot_capacity: MAX_BATCH,
+        context_capacity: generator.context_capacity(),
+        detailed_load_timing: false,
+    };
+
+    Ok((generator, startup))
+}
+
+/// Publishes readiness for one loaded target, then serves its requests forever.
+fn start_generator<G: TextGenerator>(
+    loaded: Result<(G, Ready), String>,
+    jobs: Receiver<Job>,
+    ready: std_mpsc::SyncSender<Result<Ready, String>>,
+    failure: oneshot::Sender<String>,
+    worker_ready: &AtomicBool,
+) {
+    let (generator, startup) = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
     worker_ready.store(true, Ordering::Release);
     if ready.send(Ok(startup)).is_err() {
         return;
     }
 
+    serve_requests(generator, jobs, failure);
+}
+
+/// One resident scheduler round loop, identical for every admitted target.
+fn serve_requests<G: TextGenerator>(
+    mut generator: G,
+    mut jobs: Receiver<Job>,
+    failure: oneshot::Sender<String>,
+) {
     let mut replies = HashMap::new();
     let mut jobs_open = true;
     loop {
@@ -392,7 +498,8 @@ fn engine_worker(
             }
         };
         for event in events.iter() {
-            let failed = replies.get_mut(&event.request_id).is_some_and(|reply| {
+            let request_id = event.request_id();
+            let failed = replies.get_mut(&request_id).is_some_and(|reply| {
                 if event.steps().any(|step| step.delta.is_some()) {
                     reply.log.observe_output();
                 }
@@ -401,291 +508,12 @@ fn engine_worker(
                     .as_ref()
                     .is_none_or(|sender| !try_send_generation_steps(sender, event.steps()))
             });
-            if failed && let Some(reply) = replies.get_mut(&event.request_id) {
+            if failed && let Some(reply) = replies.get_mut(&request_id) {
                 // The active log remains owned until cancellation or completion.
                 reply.sender = None;
             }
-            if let Some(output) = &event.completed
-                && let Some(mut reply) = replies.remove(&event.request_id)
-            {
-                if let Some(sender) = reply.sender.take() {
-                    let _ = sender.try_send(GenerationReply::Done {
-                        output: output.clone(),
-                        cached_prompt_tokens: reply.cached_prompt_tokens,
-                    });
-                }
-                reply.log.finish(
-                    Some(&output.prompt),
-                    output.token_ids.len(),
-                    reply.cached_prompt_tokens,
-                    output.finish_reason.as_str(),
-                    None,
-                );
-            }
-        }
-    }
-}
-
-fn qwen35_engine_worker(
-    snapshot: PathBuf,
-    mut jobs: Receiver<Job>,
-    ready: std_mpsc::SyncSender<Result<Ready, String>>,
-    failure: oneshot::Sender<String>,
-    worker_ready: Arc<AtomicBool>,
-) {
-    let loaded = (|| {
-        let checkpoint_start = Instant::now();
-        let snapshot = CheckpointSnapshot::<Qwen35_9B>::open(&snapshot)
-            .map(Arc::new)
-            .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
-        let checkpoint_admission = checkpoint_start.elapsed();
-        let tensor_count = snapshot.tensor_count();
-        let load_start = Instant::now();
-        let generator = Qwen35ResidentMtpBatchGenerator::from_snapshot_device_zero(snapshot)
-            .map_err(|error| format!("loading the resident Qwen3.5 MTP program: {error}"))?;
-        let resident_load = load_start.elapsed();
-        let device_name = generator
-            .context()
-            .device_name()
-            .map_err(|error| format!("reading the CUDA device name: {error}"))?;
-        Ok::<_, String>((
-            generator,
-            checkpoint_admission,
-            resident_load,
-            tensor_count,
-            device_name,
-        ))
-    })();
-    let (mut generator, checkpoint_admission, resident_load, tensor_count, device_name) =
-        match loaded {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = ready.send(Err(error));
-                return;
-            }
-        };
-    let startup = Ready {
-        model_id: Qwen35_9B::MODEL_ID,
-        generation_route: ResidentTarget::Qwen35.generation_route(),
-        generation_defaults: generator.generation_defaults(),
-        device_name,
-        checkpoint_admission,
-        weight_load: resident_load,
-        source_prefault: Duration::ZERO,
-        graph_capture: Duration::ZERO,
-        tensor_count,
-        upload_bytes: generator.resident_weight_bytes(),
-        prefault_bytes: 0,
-        arena_bytes: generator.arena_bytes(),
-        host_stager_bytes: generator.host_stager_bytes(),
-        slot_capacity: MAX_BATCH,
-        context_capacity: generator.context_capacity(),
-        detailed_load_timing: false,
-    };
-    worker_ready.store(true, Ordering::Release);
-    if ready.send(Ok(startup)).is_err() {
-        return;
-    }
-
-    let mut replies = HashMap::new();
-    let mut jobs_open = true;
-    loop {
-        if let Err(error) = cancel_qwen35_disconnected(&mut generator, &mut replies) {
-            fail_all(&mut replies, error.clone());
-            jobs.close();
-            fail_queued(&mut jobs, &error);
-            let _ = failure.send(error);
-            break;
-        }
-
-        if generator.active_requests() == 0 && jobs_open {
-            match jobs.blocking_recv() {
-                Some(job) => admit_qwen35_job(&mut generator, &mut replies, job),
-                None => jobs_open = false,
-            }
-        }
-        while jobs_open && generator.active_requests() < MAX_BATCH {
-            match jobs.try_recv() {
-                Ok(job) => admit_qwen35_job(&mut generator, &mut replies, job),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    jobs_open = false;
-                    break;
-                }
-            }
-        }
-        if generator.active_requests() == 0 {
-            if jobs_open {
-                continue;
-            }
-            break;
-        }
-
-        let events = match generator.step() {
-            Ok(events) => events,
-            Err(error) => {
-                let error = error.to_string();
-                fail_all(&mut replies, error.clone());
-                jobs.close();
-                fail_queued(&mut jobs, &error);
-                let _ = failure.send(error);
-                break;
-            }
-        };
-        for event in events.iter() {
-            let failed = replies.get_mut(&event.request_id).is_some_and(|reply| {
-                if event.steps().any(|step| step.delta.is_some()) {
-                    reply.log.observe_output();
-                }
-                reply
-                    .sender
-                    .as_ref()
-                    .is_none_or(|sender| !try_send_generation_steps(sender, event.steps()))
-            });
-            if failed && let Some(reply) = replies.get_mut(&event.request_id) {
-                reply.sender = None;
-            }
-            if let Some(output) = &event.completed
-                && let Some(mut reply) = replies.remove(&event.request_id)
-            {
-                if let Some(sender) = reply.sender.take() {
-                    let _ = sender.try_send(GenerationReply::Done {
-                        output: output.clone(),
-                        cached_prompt_tokens: reply.cached_prompt_tokens,
-                    });
-                }
-                reply.log.finish(
-                    Some(&output.prompt),
-                    output.token_ids.len(),
-                    reply.cached_prompt_tokens,
-                    output.finish_reason.as_str(),
-                    None,
-                );
-            }
-        }
-    }
-}
-
-fn qwen36_engine_worker(
-    snapshot: PathBuf,
-    mut jobs: Receiver<Job>,
-    ready: std_mpsc::SyncSender<Result<Ready, String>>,
-    failure: oneshot::Sender<String>,
-    worker_ready: Arc<AtomicBool>,
-) {
-    let loaded = (|| {
-        let checkpoint_start = Instant::now();
-        let snapshot = CheckpointSnapshot::<Qwen36Moe35B>::open(&snapshot)
-            .map(Arc::new)
-            .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
-        let checkpoint_admission = checkpoint_start.elapsed();
-        let tensor_count = snapshot.tensor_count();
-        let load_start = Instant::now();
-        let generator = Qwen36ResidentBatchGenerator::from_snapshot_device_zero(snapshot)
-            .map_err(|error| format!("loading the resident Qwen3.6 compact program: {error}"))?;
-        let resident_load = load_start.elapsed();
-        let device_name = generator
-            .context()
-            .device_name()
-            .map_err(|error| format!("reading the CUDA device name: {error}"))?;
-        Ok::<_, String>((
-            generator,
-            checkpoint_admission,
-            resident_load,
-            tensor_count,
-            device_name,
-        ))
-    })();
-    let (mut generator, checkpoint_admission, resident_load, tensor_count, device_name) =
-        match loaded {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = ready.send(Err(error));
-                return;
-            }
-        };
-    let startup = Ready {
-        model_id: Qwen36Moe35B::MODEL_ID,
-        generation_route: ResidentTarget::Qwen36.generation_route(),
-        generation_defaults: generator.generation_defaults(),
-        device_name,
-        checkpoint_admission,
-        weight_load: resident_load,
-        source_prefault: Duration::ZERO,
-        graph_capture: Duration::ZERO,
-        tensor_count,
-        upload_bytes: generator.resident_weight_bytes(),
-        prefault_bytes: 0,
-        arena_bytes: generator.arena_bytes(),
-        host_stager_bytes: generator.host_stager_bytes(),
-        slot_capacity: MAX_BATCH,
-        context_capacity: generator.context_capacity(),
-        detailed_load_timing: false,
-    };
-    worker_ready.store(true, Ordering::Release);
-    if ready.send(Ok(startup)).is_err() {
-        return;
-    }
-
-    let mut replies = HashMap::new();
-    let mut jobs_open = true;
-    loop {
-        if let Err(error) = cancel_qwen36_disconnected(&mut generator, &mut replies) {
-            fail_all(&mut replies, error.clone());
-            jobs.close();
-            fail_queued(&mut jobs, &error);
-            let _ = failure.send(error);
-            break;
-        }
-
-        if generator.active_requests() == 0 && jobs_open {
-            match jobs.blocking_recv() {
-                Some(job) => admit_qwen36_job(&mut generator, &mut replies, job),
-                None => jobs_open = false,
-            }
-        }
-        while jobs_open && generator.active_requests() < MAX_BATCH {
-            match jobs.try_recv() {
-                Ok(job) => admit_qwen36_job(&mut generator, &mut replies, job),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    jobs_open = false;
-                    break;
-                }
-            }
-        }
-        if generator.active_requests() == 0 {
-            if jobs_open {
-                continue;
-            }
-            break;
-        }
-
-        let events = match generator.step() {
-            Ok(events) => events,
-            Err(error) => {
-                let error = error.to_string();
-                fail_all(&mut replies, error.clone());
-                jobs.close();
-                fail_queued(&mut jobs, &error);
-                let _ = failure.send(error);
-                break;
-            }
-        };
-        for event in events.iter() {
-            let failed = replies.get_mut(&event.request_id).is_some_and(|reply| {
-                if event.step.delta.is_some() {
-                    reply.log.observe_output();
-                }
-                reply.sender.as_ref().is_none_or(|sender| {
-                    !try_send_generation_steps(sender, core::iter::once(&event.step))
-                })
-            });
-            if failed && let Some(reply) = replies.get_mut(&event.request_id) {
-                reply.sender = None;
-            }
-            if let Some(output) = &event.completed
-                && let Some(mut reply) = replies.remove(&event.request_id)
+            if let Some(output) = event.completed()
+                && let Some(mut reply) = replies.remove(&request_id)
             {
                 if let Some(sender) = reply.sender.take() {
                     let _ = sender.try_send(GenerationReply::Done {
@@ -859,34 +687,8 @@ fn mebibytes(bytes: usize) -> f64 {
     bytes as f64 / (1_u64 << 20) as f64
 }
 
-fn admit_job(
-    generator: &mut ResidentMtpBatchGenerator,
-    replies: &mut HashMap<ResidentRequestId, ActiveReply>,
-    job: Job,
-) {
-    if job.reply.is_closed() {
-        job.log.finish(None, 0, 0, "cancelled", None);
-        return;
-    }
-    let admission = generator.admit(&job.request);
-    record_admission(replies, job, admission);
-}
-
-fn admit_qwen35_job(
-    generator: &mut Qwen35ResidentMtpBatchGenerator,
-    replies: &mut HashMap<ResidentRequestId, ActiveReply>,
-    job: Job,
-) {
-    if job.reply.is_closed() {
-        job.log.finish(None, 0, 0, "cancelled", None);
-        return;
-    }
-    let admission = generator.admit(&job.request);
-    record_admission(replies, job, admission);
-}
-
-fn admit_qwen36_job(
-    generator: &mut Qwen36ResidentBatchGenerator,
+fn admit_job<G: TextGenerator>(
+    generator: &mut G,
     replies: &mut HashMap<ResidentRequestId, ActiveReply>,
     job: Job,
 ) {
@@ -939,84 +741,8 @@ fn record_admission(
     }
 }
 
-fn cancel_disconnected(
-    generator: &mut ResidentMtpBatchGenerator,
-    replies: &mut HashMap<ResidentRequestId, ActiveReply>,
-) -> Result<(), String> {
-    let cancelled = generator
-        .active_request_ids()
-        .filter(|request| {
-            replies
-                .get(request)
-                .is_none_or(|reply| reply.sender.as_ref().is_none_or(Sender::is_closed))
-        })
-        .collect::<Vec<_>>();
-    for request in cancelled {
-        let reply = replies.remove(&request);
-        match generator.cancel(request) {
-            Ok(cancelled) => {
-                if let Some(reply) = reply {
-                    reply.log.finish(
-                        Some(&cancelled.output.prompt),
-                        cancelled.output.token_ids.len(),
-                        reply.cached_prompt_tokens,
-                        "cancelled",
-                        None,
-                    );
-                }
-            }
-            Err(error) => {
-                let message = error.to_string();
-                if let Some(reply) = reply {
-                    reply.log.finish(None, 0, 0, "error", Some(&message));
-                }
-                return Err(message);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn cancel_qwen35_disconnected(
-    generator: &mut Qwen35ResidentMtpBatchGenerator,
-    replies: &mut HashMap<ResidentRequestId, ActiveReply>,
-) -> Result<(), String> {
-    let cancelled = generator
-        .active_request_ids()
-        .filter(|request| {
-            replies
-                .get(request)
-                .is_none_or(|reply| reply.sender.as_ref().is_none_or(Sender::is_closed))
-        })
-        .collect::<Vec<_>>();
-    for request in cancelled {
-        let reply = replies.remove(&request);
-        match generator.cancel(request) {
-            Ok(cancelled) => {
-                if let Some(reply) = reply {
-                    reply.log.finish(
-                        Some(&cancelled.output.prompt),
-                        cancelled.output.token_ids.len(),
-                        reply.cached_prompt_tokens,
-                        "cancelled",
-                        None,
-                    );
-                }
-            }
-            Err(error) => {
-                let message = error.to_string();
-                if let Some(reply) = reply {
-                    reply.log.finish(None, 0, 0, "error", Some(&message));
-                }
-                return Err(message);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn cancel_qwen36_disconnected(
-    generator: &mut Qwen36ResidentBatchGenerator,
+fn cancel_disconnected<G: TextGenerator>(
+    generator: &mut G,
     replies: &mut HashMap<ResidentRequestId, ActiveReply>,
 ) -> Result<(), String> {
     let cancelled = generator

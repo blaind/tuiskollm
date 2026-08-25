@@ -1,0 +1,223 @@
+//! Serving boundary over the exact resident compact schedulers.
+//!
+//! This is the only abstraction `tuisko-serve` holds over a resident target.
+//! It is crate-private, so it is sealed by construction and can never become an
+//! open backend extension point, and the worker monomorphizes over it: no `dyn`,
+//! no vtable, and no heap indirection on the scheduler's round path.
+//!
+//! The traits describe admission, stepping, and cancellation only. Round
+//! ordering, acceptance laws, and device commit protocol remain concrete per
+//! target inside `tuisko-engine`.
+
+use tuisko_engine::{
+    ChatGenerationRequest, EngineError, GeneratedText, GenerationStep, Qwen35ResidentMtpBatchEvent,
+    Qwen35ResidentMtpBatchEvents, Qwen35ResidentMtpBatchGenerator, Qwen36ResidentBatchGenerator,
+    ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentCancellation,
+    ResidentMtpBatchEvent, ResidentMtpBatchEvents, ResidentMtpBatchGenerator, ResidentRequestId,
+};
+
+/// One request's committed steps and terminal output from a scheduler round.
+pub(crate) trait GenerationEvent {
+    /// Request that produced this event.
+    fn request_id(&self) -> ResidentRequestId;
+
+    /// Streaming steps in target-licensed order.
+    fn steps(&self) -> impl Iterator<Item = &GenerationStep>;
+
+    /// Complete output when this round terminated the request.
+    fn completed(&self) -> Option<&GeneratedText>;
+}
+
+/// One scheduler round's events in the stable active order at round entry.
+pub(crate) trait GenerationEvents {
+    /// Per-request event this target's scheduler emits.
+    type Event: GenerationEvent;
+
+    /// Events in the active order that existed at the start of the round.
+    fn iter(&self) -> impl Iterator<Item = &Self::Event>;
+}
+
+/// Compact-scheduler surface the resident worker drives identically per target.
+pub(crate) trait TextGenerator {
+    /// Round events this target's scheduler returns from one step.
+    type Events: GenerationEvents;
+
+    /// Admits one request into an available compact batch slot.
+    fn admit(
+        &mut self,
+        request: &ChatGenerationRequest,
+    ) -> Result<ResidentBatchAdmission, EngineError>;
+
+    /// Advances every active request by exactly one scheduler round.
+    fn step(&mut self) -> Result<Self::Events, EngineError>;
+
+    /// Cancels one active request and releases its physical slot.
+    fn cancel(
+        &mut self,
+        request_id: ResidentRequestId,
+    ) -> Result<ResidentCancellation, EngineError>;
+
+    /// Current number of active device-backed requests.
+    fn active_requests(&self) -> usize;
+
+    /// Active request identities in compact scheduler order.
+    fn active_request_ids(&self) -> impl Iterator<Item = ResidentRequestId>;
+}
+
+impl GenerationEvent for ResidentMtpBatchEvent {
+    fn request_id(&self) -> ResidentRequestId {
+        self.request_id
+    }
+
+    fn steps(&self) -> impl Iterator<Item = &GenerationStep> {
+        ResidentMtpBatchEvent::steps(self)
+    }
+
+    fn completed(&self) -> Option<&GeneratedText> {
+        self.completed.as_ref()
+    }
+}
+
+impl GenerationEvents for ResidentMtpBatchEvents {
+    type Event = ResidentMtpBatchEvent;
+
+    fn iter(&self) -> impl Iterator<Item = &Self::Event> {
+        ResidentMtpBatchEvents::iter(self)
+    }
+}
+
+impl TextGenerator for ResidentMtpBatchGenerator {
+    type Events = ResidentMtpBatchEvents;
+
+    fn admit(
+        &mut self,
+        request: &ChatGenerationRequest,
+    ) -> Result<ResidentBatchAdmission, EngineError> {
+        ResidentMtpBatchGenerator::admit(self, request)
+    }
+
+    fn step(&mut self) -> Result<Self::Events, EngineError> {
+        ResidentMtpBatchGenerator::step(self)
+    }
+
+    fn cancel(
+        &mut self,
+        request_id: ResidentRequestId,
+    ) -> Result<ResidentCancellation, EngineError> {
+        ResidentMtpBatchGenerator::cancel(self, request_id)
+    }
+
+    fn active_requests(&self) -> usize {
+        ResidentMtpBatchGenerator::active_requests(self)
+    }
+
+    fn active_request_ids(&self) -> impl Iterator<Item = ResidentRequestId> {
+        ResidentMtpBatchGenerator::active_request_ids(self)
+    }
+}
+
+impl GenerationEvent for Qwen35ResidentMtpBatchEvent {
+    fn request_id(&self) -> ResidentRequestId {
+        self.request_id
+    }
+
+    fn steps(&self) -> impl Iterator<Item = &GenerationStep> {
+        Qwen35ResidentMtpBatchEvent::steps(self)
+    }
+
+    fn completed(&self) -> Option<&GeneratedText> {
+        self.completed.as_ref()
+    }
+}
+
+impl GenerationEvents for Qwen35ResidentMtpBatchEvents {
+    type Event = Qwen35ResidentMtpBatchEvent;
+
+    fn iter(&self) -> impl Iterator<Item = &Self::Event> {
+        Qwen35ResidentMtpBatchEvents::iter(self)
+    }
+}
+
+impl TextGenerator for Qwen35ResidentMtpBatchGenerator {
+    type Events = Qwen35ResidentMtpBatchEvents;
+
+    fn admit(
+        &mut self,
+        request: &ChatGenerationRequest,
+    ) -> Result<ResidentBatchAdmission, EngineError> {
+        Qwen35ResidentMtpBatchGenerator::admit(self, request)
+    }
+
+    fn step(&mut self) -> Result<Self::Events, EngineError> {
+        Qwen35ResidentMtpBatchGenerator::step(self)
+    }
+
+    fn cancel(
+        &mut self,
+        request_id: ResidentRequestId,
+    ) -> Result<ResidentCancellation, EngineError> {
+        Qwen35ResidentMtpBatchGenerator::cancel(self, request_id)
+    }
+
+    fn active_requests(&self) -> usize {
+        Qwen35ResidentMtpBatchGenerator::active_requests(self)
+    }
+
+    fn active_request_ids(&self) -> impl Iterator<Item = ResidentRequestId> {
+        Qwen35ResidentMtpBatchGenerator::active_request_ids(self)
+    }
+}
+
+// The Qwen3.6 compact scheduler commits exactly one token per request per round,
+// so its event carries a single step where the MTP schedulers carry a committed run.
+impl GenerationEvent for ResidentBatchEvent {
+    fn request_id(&self) -> ResidentRequestId {
+        self.request_id
+    }
+
+    fn steps(&self) -> impl Iterator<Item = &GenerationStep> {
+        core::iter::once(&self.step)
+    }
+
+    fn completed(&self) -> Option<&GeneratedText> {
+        self.completed.as_ref()
+    }
+}
+
+impl GenerationEvents for ResidentBatchEvents {
+    type Event = ResidentBatchEvent;
+
+    fn iter(&self) -> impl Iterator<Item = &Self::Event> {
+        ResidentBatchEvents::iter(self)
+    }
+}
+
+impl TextGenerator for Qwen36ResidentBatchGenerator {
+    type Events = ResidentBatchEvents;
+
+    fn admit(
+        &mut self,
+        request: &ChatGenerationRequest,
+    ) -> Result<ResidentBatchAdmission, EngineError> {
+        Qwen36ResidentBatchGenerator::admit(self, request)
+    }
+
+    fn step(&mut self) -> Result<Self::Events, EngineError> {
+        Qwen36ResidentBatchGenerator::step(self)
+    }
+
+    fn cancel(
+        &mut self,
+        request_id: ResidentRequestId,
+    ) -> Result<ResidentCancellation, EngineError> {
+        Qwen36ResidentBatchGenerator::cancel(self, request_id)
+    }
+
+    fn active_requests(&self) -> usize {
+        Qwen36ResidentBatchGenerator::active_requests(self)
+    }
+
+    fn active_request_ids(&self) -> impl Iterator<Item = ResidentRequestId> {
+        Qwen36ResidentBatchGenerator::active_request_ids(self)
+    }
+}
