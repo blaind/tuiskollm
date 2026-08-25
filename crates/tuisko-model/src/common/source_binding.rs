@@ -1,4 +1,22 @@
 //! Two-phase lifecycle shared by every admitted decoder-layer source binding.
+//!
+//! The lifecycle is shared here; the layer binding structs stay concrete and per-target. A
+//! generic layer struct over the ModelOpt pair's linear representation was considered and
+//! rejected against this tree:
+//!
+//! 1. The GDN control planes are not the same source shape. Qwen3.5 binds `in_proj_a` and
+//!    `in_proj_b` as four-tensor ModelOpt NVFP4 linears (packed weight, E4M3 block scale,
+//!    `input_scale`, `weight_scale_2`); Qwen3.6 binds one BF16 `in_proj_a.weight`. One linear
+//!    parameter cannot express slots that are a linear in one checkpoint and a raw plane in
+//!    the other, and a second parameter would make source shapes neither checkpoint has
+//!    constructible.
+//! 2. The two targets re-validate their layer route from different state. Qwen3.5 carries
+//!    `layer_count` and `full_attention_interval` on the binding; Qwen3.6 re-derives them from
+//!    its own `Arch` constants at materialization. Merging changes admission strictness on one
+//!    target.
+//! 3. The sibling-scale admission errors are per-target text (`query/key input_scale` against
+//!    `Q/K input_scale`), so a shared body would change the observable admission surface of two
+//!    mature targets as a deduplication side effect.
 
 use crate::common::inventory::CheckpointSnapshot;
 use crate::common::materialized::MaterializedMemory;
