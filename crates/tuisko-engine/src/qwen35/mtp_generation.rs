@@ -1,7 +1,9 @@
 //! Single-slot Qwen3.5 generation over the resident target and source-BF16 MTP layer.
 
-use crate::common::mtp::{DRAFT_WINDOW, VERIFY_ROWS, decide_sampled_tokens};
-use crate::common::rope::{fill_contiguous_rope, text_rope};
+use crate::common::mtp::{
+    DRAFT_WINDOW, MtpRoundRope, VERIFY_ROWS, decide_greedy_round, decide_sampled_round,
+};
+use crate::common::rope::{ROTARY_PAIRS, fill_contiguous_rope, text_rope};
 use crate::common::slots::{device_zero_context, require_generation_capacity};
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
@@ -13,7 +15,6 @@ use tuisko_frontend::TextFrontend;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B};
 
-const ROTARY_PAIRS: usize = 32;
 const LOGIT_ROWS: usize = VERIFY_ROWS + 1;
 
 /// Concrete single-slot owner for Qwen3.5 draft-three generation.
@@ -383,35 +384,13 @@ impl Qwen35ResidentMtpGenerationSession<'_> {
     }
 
     fn decide_greedy_round(&mut self, drafts: &[u32]) -> EngineResult<(usize, usize)> {
-        let mut committed = 0;
-        let mut accepted = 0;
-        for (row, &draft_token) in drafts.iter().enumerate() {
-            let step = self
-                .control
-                .accept_logits(target_logits(self.logits, row))?;
-            let matches = step.token_id == draft_token;
-            self.queued[committed] = Some(step);
-            committed += 1;
-            if matches {
-                accepted += 1;
-            }
-            let terminal = self.queued[committed - 1]
-                .as_ref()
-                .expect("committed MTP step exists")
-                .finish_reason
-                .is_some();
-            if terminal || !matches {
-                break;
-            }
-        }
-        if accepted == drafts.len() && self.control.finish_reason().is_none() {
-            self.queued[committed] = Some(
-                self.control
-                    .accept_logits(target_logits(self.logits, drafts.len()))?,
-            );
-            committed += 1;
-        }
-        Ok((committed, accepted))
+        decide_greedy_round(
+            &mut self.control,
+            &mut self.queued,
+            self.logits,
+            Qwen35_9B::VOCAB,
+            drafts,
+        )
     }
 
     fn decide_sampled_round(
@@ -419,48 +398,15 @@ impl Qwen35ResidentMtpGenerationSession<'_> {
         drafts: &[u32],
         draft_laws: &[Option<SamplingDistribution>],
     ) -> EngineResult<(usize, usize)> {
-        let mut target_laws: [Option<SamplingDistribution>; VERIFY_ROWS] =
-            std::array::from_fn(|_| None);
-        for row in 0..=drafts.len() {
-            target_laws[row] = Some(self.control.sampling_distribution(
-                target_logits(self.logits, row),
-                &drafts[..row.min(drafts.len())],
-            )?);
-        }
-        let mut acceptance_units = [0.0f64; DRAFT_WINDOW];
-        let mut residual_units = [0.0f64; DRAFT_WINDOW];
-        for row in 0..drafts.len() {
-            acceptance_units[row] = self.control.random_unit();
-            residual_units[row] = self.control.random_unit();
-        }
-        let bonus_unit = self.control.random_unit();
-        let target_laws = target_laws[..drafts.len() + 1]
-            .iter()
-            .map(|law| {
-                law.as_ref()
-                    .ok_or_else(|| EngineError::generation("Qwen3.5 sampled target law is missing"))
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
-        let draft_laws = draft_laws
-            .iter()
-            .map(|law| {
-                law.as_ref()
-                    .ok_or_else(|| EngineError::generation("Qwen3.5 sampled draft law is missing"))
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
-        let round = decide_sampled_tokens(
-            drafts,
-            &target_laws,
-            &draft_laws,
+        decide_sampled_round(
+            &mut self.control,
+            &mut self.queued,
+            self.logits,
+            Qwen35_9B::VOCAB,
             &self.stop_ids,
-            &acceptance_units[..drafts.len()],
-            &residual_units[..drafts.len()],
-            bonus_unit,
-        )?;
-        for (index, &token) in round.token_ids().iter().enumerate() {
-            self.queued[index] = Some(self.control.accept_token(token)?);
-        }
-        Ok((round.token_ids().len(), round.accepted_drafts()))
+            drafts,
+            draft_laws,
+        )
     }
 
     fn verify_target(&mut self, inputs: &[u32]) -> EngineResult<()> {
@@ -493,26 +439,20 @@ impl Qwen35ResidentMtpGenerationSession<'_> {
     }
 
     fn replay_target_span(&mut self, inputs: &[u32]) -> EngineResult<()> {
-        let mut cosine = [0.0f32; VERIFY_ROWS * ROTARY_PAIRS];
-        let mut sine = [0.0f32; VERIFY_ROWS * ROTARY_PAIRS];
-        let rotary_values =
-            fill_contiguous_rope(self.next_position, inputs.len(), &mut cosine, &mut sine)?;
+        let rope = MtpRoundRope::contiguous(self.next_position, inputs.len())?;
         self.program.stage_target_verify(
             self.stream,
             inputs,
             0,
             self.next_position,
-            &cosine[..rotary_values],
-            &sine[..rotary_values],
+            rope.cosine(),
+            rope.sine(),
         )?;
         self.program.replay_target_verify(self.stream, inputs.len())
     }
 
     fn realign(&mut self, outputs: &[u32], prime_only: bool) -> EngineResult<()> {
-        let mut cosine = [0.0f32; VERIFY_ROWS * ROTARY_PAIRS];
-        let mut sine = [0.0f32; VERIFY_ROWS * ROTARY_PAIRS];
-        let rotary_values =
-            fill_contiguous_rope(self.next_position, outputs.len(), &mut cosine, &mut sine)?;
+        let rope = MtpRoundRope::contiguous(self.next_position, outputs.len())?;
         let hidden_values = outputs.len() * Qwen35_9B::HIDDEN;
         self.program.stage_realign(
             self.stream,
@@ -520,8 +460,8 @@ impl Qwen35ResidentMtpGenerationSession<'_> {
             &self.target_hidden[..hidden_values],
             0,
             self.next_position,
-            &cosine[..rotary_values],
-            &sine[..rotary_values],
+            rope.cosine(),
+            rope.sine(),
         )?;
         self.program
             .replay_realign(self.stream, outputs.len(), prime_only)?;
