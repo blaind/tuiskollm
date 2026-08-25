@@ -1,4 +1,5 @@
 use crate::DeviceBenchmarkError;
+use crate::device_benchmark::percentile;
 use crate::startup_h2d::{
     H2dCalibrationReport, measure_h2d_calibration, pinned_h2d_gib_s, print_h2d_calibration,
 };
@@ -647,14 +648,9 @@ fn summarize(phase: &'static str, values: impl Iterator<Item = f64>) -> StartupT
     StartupTimingSummary {
         phase,
         minimum_ms: values[0],
-        median_ms: percentile(&values, 0.5),
+        median_ms: percentile(&values, 5),
         maximum_ms: values[values.len() - 1],
     }
-}
-
-fn percentile(sorted: &[f64], percentile: f64) -> f64 {
-    let index = ((sorted.len() - 1) as f64 * percentile).round() as usize;
-    sorted[index]
 }
 
 fn milliseconds(duration: Duration) -> f64 {

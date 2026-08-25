@@ -1,4 +1,4 @@
-//! Numerical and graph qualification for full-attention Q/K preparation.
+//! Numerical and graph qualification for every Q/K preparation target, full-attention and MTP.
 
 use crate::fp8_projection_oracle::{
     BYTE_SENTINEL, F32_SENTINEL_BITS, bf16_to_f32, encode_e4m3fn, f32_to_bf16,

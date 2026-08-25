@@ -3,8 +3,8 @@
 use crate::fp8_projection_oracle::{
     BF16_SENTINEL, BYTE_SENTINEL, F32_SENTINEL_BITS, bf16_to_f32, f32_to_bf16,
 };
-use crate::nvfp4_down::{decode_e2m1, decode_e4m3fn};
-use crate::nvfp4_swiglu::encode_e4m3fn;
+use crate::nvfp4_down_sm120::{decode_e2m1, decode_e4m3fn};
+use crate::nvfp4_swiglu_sm120::encode_e4m3fn;
 use crate::residual_norm::rms_norm_oracle;
 use crate::{DeviceBenchmarkError, device_benchmark};
 use std::path::Path;

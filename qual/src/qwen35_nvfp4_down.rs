@@ -1,7 +1,7 @@
 //! Qwen3.5 represented-value qualification for NVFP4 down projection.
 
 use crate::device_benchmark;
-use crate::nvfp4_down::{
+use crate::nvfp4_down_sm120::{
     Nvfp4DownQualification, Nvfp4DownQualificationError, bf16_to_f32, decode_e2m1, decode_e4m3fn,
     f32_to_bf16,
 };

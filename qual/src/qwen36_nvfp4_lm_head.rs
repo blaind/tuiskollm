@@ -1,7 +1,7 @@
 //! Represented-value qualification for the Qwen3.6 NVFP4 LM head.
 
 use crate::device_benchmark;
-use crate::nvfp4_down::{bf16_to_f32, decode_e2m1, decode_e4m3fn, f32_to_bf16};
+use crate::nvfp4_down_sm120::{bf16_to_f32, decode_e2m1, decode_e4m3fn, f32_to_bf16};
 use crate::target::Qwen36Nvfp4LmHeadOp;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,

@@ -1,7 +1,7 @@
 //! Qwen3.5 represented-value qualification for NVFP4 gate/up SwiGLU.
 
 use crate::device_benchmark;
-use crate::nvfp4_swiglu::{
+use crate::nvfp4_swiglu_sm120::{
     Nvfp4SwiGluQualification, Nvfp4SwiGluQualificationError, bf16_to_f32, decode_e2m1,
     decode_e4m3fn, encode_e2m1, encode_e4m3fn, f32_to_bf16,
 };

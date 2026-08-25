@@ -1,4 +1,4 @@
-//! Direct timings for exact full-attention Q/K preparation graph routes.
+//! Direct timings for every exact Q/K preparation graph route, full-attention and MTP.
 
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
