@@ -3,18 +3,24 @@
 use crate::device_benchmark;
 use crate::fp8_projection_oracle::{bf16_to_f32, f32_to_bf16};
 use crate::residual_norm::rms_norm_oracle;
-use crate::{DeviceBenchmarkError, target::MtpBf16FusionOp};
+use crate::{
+    DeviceBenchmarkError,
+    target::{MtpBf16FusionOp, Qwen35MtpBf16FusionOp},
+};
 use std::path::Path;
+use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     device_memory_info,
 };
-use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen38_27B};
+use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen35_9B, Qwen38_27B};
 
 #[cfg(test)]
 const MAX_BATCH: usize = 8;
 const MAX_TOKENS: usize = 1_024;
 const ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
+const QWEN35_MAX_TOKENS: usize = 128;
+const QWEN35_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 const ALIGNMENT: usize = 256;
 const BF16_SENTINEL: u16 = 0xa5a5;
 const INPUT_PATTERN: [f32; 16] = [
@@ -116,20 +122,105 @@ struct Observed {
     output: Vec<u16>,
 }
 
+trait FusionOp: Sized {
+    fn new(context: &Arc<CudaContext>) -> GpuResult<Self>;
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        embedding: *const u16,
+        hidden: *const u16,
+        embedding_norm_weight: *const u16,
+        hidden_norm_weight: *const u16,
+        normalized_embedding: *mut u16,
+        normalized_hidden: *mut u16,
+        projection_weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+macro_rules! impl_fusion_op {
+    ($op:ty) => {
+        impl FusionOp for $op {
+            fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+                <$op>::new(context)
+            }
+
+            unsafe fn launch(
+                &self,
+                stream: &CudaStream,
+                rows: usize,
+                embedding: *const u16,
+                hidden: *const u16,
+                embedding_norm_weight: *const u16,
+                hidden_norm_weight: *const u16,
+                normalized_embedding: *mut u16,
+                normalized_hidden: *mut u16,
+                projection_weight: *const u16,
+                output: *mut u16,
+            ) -> GpuResult<()> {
+                unsafe {
+                    <$op>::launch(
+                        self,
+                        stream,
+                        rows,
+                        embedding,
+                        hidden,
+                        embedding_norm_weight,
+                        hidden_norm_weight,
+                        normalized_embedding,
+                        normalized_hidden,
+                        projection_weight,
+                        output,
+                    )
+                }
+            }
+        }
+    };
+}
+
+impl_fusion_op!(MtpBf16FusionOp);
+impl_fusion_op!(Qwen35MtpBf16FusionOp);
+
 /// Qualifies source-backed MTP input fusion at every decode and prompt-tile route.
 pub fn qualify_mtp_bf16_fusion(
     root: &Path,
 ) -> Result<MtpBf16FusionQualification, MtpBf16FusionQualificationError> {
+    qualify_fusion::<Qwen38_27B, MtpBf16FusionOp>(root, &ROUTES, MAX_TOKENS, 0.03125, 0.015625)
+}
+
+/// Qualifies source-backed Qwen3.5 MTP input fusion at every exact route.
+pub fn qualify_qwen35_mtp_bf16_fusion(
+    root: &Path,
+) -> Result<MtpBf16FusionQualification, MtpBf16FusionQualificationError> {
+    qualify_fusion::<Qwen35_9B, Qwen35MtpBf16FusionOp>(
+        root,
+        &QWEN35_ROUTES,
+        QWEN35_MAX_TOKENS,
+        0.00390625,
+        0.001953125,
+    )
+}
+
+fn qualify_fusion<A: Arch, O: FusionOp>(
+    root: &Path,
+    routes: &[usize],
+    max_tokens: usize,
+    embedding_step: f32,
+    hidden_step: f32,
+) -> Result<MtpBf16FusionQualification, MtpBf16FusionQualificationError> {
     let _preflight = device_benchmark::preflight()?;
-    let snapshot = CheckpointSnapshot::<Qwen38_27B>::open(root)?;
+    let snapshot = CheckpointSnapshot::<A>::open(root)?;
     let bindings = MtpBindings::bind(&snapshot)?;
     let source = Source {
         embedding_norm: bindings.embedding_norm.words().collect(),
         hidden_norm: bindings.hidden_norm.words().collect(),
         projection: bindings.input_projection.words().collect(),
     };
-    let first_fixture = make_fixture(0);
-    let replacement_fixture = make_fixture(1);
+    let first_fixture = make_fixture::<A>(max_tokens, 0, embedding_step, hidden_step);
+    let replacement_fixture = make_fixture::<A>(max_tokens, 1, embedding_step, hidden_step);
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     let capability = context.compute_capability().map_err(GpuError::from)?;
     if capability != (12, 0) {
@@ -140,14 +231,14 @@ pub fn qualify_mtp_bf16_fusion(
     }
 
     let stream = context.new_stream().map_err(GpuError::from)?;
-    let (layout, regions) = layout()?;
+    let (layout, regions) = layout_for::<A>(max_tokens)?;
     let arena = DeviceArena::zeroed(&stream, &layout)?;
-    let op = MtpBf16FusionOp::new(&context)?;
+    let op = O::new(&context)?;
     upload_source(&arena, &stream, regions, &source)?;
     upload_fixture(&arena, &stream, regions, &replacement_fixture)?;
     let stable_addresses = addresses(&arena, regions)?;
-    let route_reference = b1_route_references(&op, &arena, &stream, regions)?;
-    let source_expected = source_projection_oracle(&replacement_fixture, &source);
+    let route_reference = b1_route_references::<A, O>(&op, &arena, &stream, regions, max_tokens)?;
+    let source_expected = source_projection_oracle::<A>(&replacement_fixture, &source);
     let mut report = MtpBf16FusionQualification {
         normalized_values: 0,
         projection_values: 0,
@@ -162,7 +253,7 @@ pub fn qualify_mtp_bf16_fusion(
         maximum_absolute_error: 0.0,
     };
 
-    for batch in ROUTES {
+    for &batch in routes {
         upload_fixture(&arena, &stream, regions, &first_fixture)?;
         reset_outputs(&arena, &stream, regions)?;
         launch(&op, &arena, &stream, regions, batch)?;
@@ -184,7 +275,7 @@ pub fn qualify_mtp_bf16_fusion(
         launch(&op, &arena, &stream, regions, batch)?;
         let eager = read_observed(&arena, &stream, regions)?;
 
-        verify_seams(
+        verify_seams::<A>(
             batch,
             &replacement_fixture,
             &source,
@@ -193,14 +284,15 @@ pub fn qualify_mtp_bf16_fusion(
             &replay,
             &mut report,
         )?;
-        verify_replay(batch, &eager, &replay, &mut report)?;
-        verify_replacement(batch, &first, &replay)?;
-        verify_inactive(batch, &eager, &mut report)?;
-        verify_inactive(batch, &replay, &mut report)?;
+        verify_replay::<A>(batch, &eager, &replay, &mut report)?;
+        verify_replacement::<A>(batch, &first, &replay)?;
+        verify_inactive::<A>(batch, max_tokens, &eager, &mut report)?;
+        verify_inactive::<A>(batch, max_tokens, &replay, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(MtpBf16FusionQualificationError::Mismatch(format!(
-                "device addresses changed while qualifying B={batch}"
+                "{} device addresses changed while qualifying rows={batch}",
+                A::MODEL_ID
             )));
         }
     }
@@ -213,23 +305,27 @@ pub fn qualify_mtp_bf16_fusion(
         &source,
         &mut report,
     )?;
-    verify_no_post_warmup_allocation(&context, &op, &arena, &stream, regions)?;
+    verify_no_post_warmup_allocation(&context, &op, &arena, &stream, regions, routes, max_tokens)?;
     device_benchmark::require_current_process_exclusive()?;
 
     Ok(report)
 }
 
 pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
-    let hidden = Qwen38_27B::HIDDEN;
+    layout_for::<Qwen38_27B>(MAX_TOKENS)
+}
+
+fn layout_for<A: Arch>(max_tokens: usize) -> GpuResult<(ArenaLayout, Regions)> {
+    let hidden = A::HIDDEN;
     let mut layout = ArenaLayout::new();
-    let embedding = layout.reserve(MAX_TOKENS * hidden, ALIGNMENT)?;
-    let hidden_input = layout.reserve(MAX_TOKENS * hidden, ALIGNMENT)?;
+    let embedding = layout.reserve(max_tokens * hidden, ALIGNMENT)?;
+    let hidden_input = layout.reserve(max_tokens * hidden, ALIGNMENT)?;
     let embedding_norm_weight = layout.reserve(hidden, ALIGNMENT)?;
     let hidden_norm_weight = layout.reserve(hidden, ALIGNMENT)?;
-    let normalized_embedding = layout.reserve(MAX_TOKENS * hidden, ALIGNMENT)?;
-    let normalized_hidden = layout.reserve(MAX_TOKENS * hidden, ALIGNMENT)?;
+    let normalized_embedding = layout.reserve(max_tokens * hidden, ALIGNMENT)?;
+    let normalized_hidden = layout.reserve(max_tokens * hidden, ALIGNMENT)?;
     let projection_weight = layout.reserve(hidden * 2 * hidden, ALIGNMENT)?;
-    let output = layout.reserve(MAX_TOKENS * hidden, ALIGNMENT)?;
+    let output = layout.reserve(max_tokens * hidden, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -246,22 +342,28 @@ pub(crate) fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     ))
 }
 
-fn make_fixture(salt: usize) -> Fixture {
-    let elements = MAX_TOKENS * Qwen38_27B::HIDDEN;
+fn make_fixture<A: Arch>(
+    max_tokens: usize,
+    salt: usize,
+    embedding_step: f32,
+    hidden_step: f32,
+) -> Fixture {
+    let elements = max_tokens * A::HIDDEN;
     let embedding = (0..elements)
         .map(|index| {
-            let token = index / Qwen38_27B::HIDDEN;
+            let token = index / A::HIDDEN;
             f32_to_bf16(
-                INPUT_PATTERN[(index + salt * 3 + token) & 15] * (1.0 - token as f32 * 0.03125),
+                INPUT_PATTERN[(index + salt * 3 + token) & 15]
+                    * (1.0 - token as f32 * embedding_step),
             )
         })
         .collect();
     let hidden = (0..elements)
         .map(|index| {
-            let token = index / Qwen38_27B::HIDDEN;
+            let token = index / A::HIDDEN;
             f32_to_bf16(
                 INPUT_PATTERN[(index * 5 + salt * 7 + token * 3) & 15]
-                    * (0.75 + token as f32 * 0.015625),
+                    * (0.75 + token as f32 * hidden_step),
             )
         })
         .collect();
@@ -300,8 +402,8 @@ fn reset_outputs(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> 
     arena.fill(stream, regions.output, BF16_SENTINEL as u8)
 }
 
-fn launch(
-    op: &MtpBf16FusionOp,
+fn launch<O: FusionOp>(
+    op: &O,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
@@ -325,15 +427,15 @@ fn launch(
     }
 }
 
-fn launch_b1_row(
-    op: &MtpBf16FusionOp,
+fn launch_b1_row<A: Arch, O: FusionOp>(
+    op: &O,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
     row: usize,
 ) -> GpuResult<()> {
-    let offset = row * Qwen38_27B::HIDDEN;
-    // SAFETY: `row < MAX_TOKENS`; offset pointers retain four-byte alignment and
+    let offset = row * A::HIDDEN;
+    // SAFETY: `row < max_tokens`; offset pointers retain four-byte alignment and
     // each selected suffix covers one complete B=1 row.
     unsafe {
         op.launch(
@@ -351,15 +453,16 @@ fn launch_b1_row(
     }
 }
 
-fn b1_route_references(
-    op: &MtpBf16FusionOp,
+fn b1_route_references<A: Arch, O: FusionOp>(
+    op: &O,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
+    max_tokens: usize,
 ) -> GpuResult<Vec<u16>> {
     reset_outputs(arena, stream, regions)?;
-    for row in 0..MAX_TOKENS {
-        launch_b1_row(op, arena, stream, regions, row)?;
+    for row in 0..max_tokens {
+        launch_b1_row::<A, O>(op, arena, stream, regions, row)?;
     }
     arena.copy_to_host(stream, regions.output)
 }
@@ -389,12 +492,10 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 8]> {
     ])
 }
 
-fn source_projection_oracle(fixture: &Fixture, source: &Source) -> Vec<f64> {
-    let hidden = Qwen38_27B::HIDDEN;
-    let embedding =
-        rms_norm_oracle::<Qwen38_27B>(&fixture.embedding[..hidden], &source.embedding_norm);
-    let hidden_input =
-        rms_norm_oracle::<Qwen38_27B>(&fixture.hidden[..hidden], &source.hidden_norm);
+fn source_projection_oracle<A: Arch>(fixture: &Fixture, source: &Source) -> Vec<f64> {
+    let hidden = A::HIDDEN;
+    let embedding = rms_norm_oracle::<A>(&fixture.embedding[..hidden], &source.embedding_norm);
+    let hidden_input = rms_norm_oracle::<A>(&fixture.hidden[..hidden], &source.hidden_norm);
     source
         .projection
         .chunks_exact(2 * hidden)
@@ -411,7 +512,7 @@ fn source_projection_oracle(fixture: &Fixture, source: &Source) -> Vec<f64> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn verify_seams(
+fn verify_seams<A: Arch>(
     batch: usize,
     fixture: &Fixture,
     source: &Source,
@@ -420,14 +521,13 @@ fn verify_seams(
     observed: &Observed,
     report: &mut MtpBf16FusionQualification,
 ) -> Result<(), MtpBf16FusionQualificationError> {
-    let hidden = Qwen38_27B::HIDDEN;
+    let hidden = A::HIDDEN;
     for row in 0..batch {
         let begin = row * hidden;
         let end = begin + hidden;
         let embedding =
-            rms_norm_oracle::<Qwen38_27B>(&fixture.embedding[begin..end], &source.embedding_norm);
-        let hidden_input =
-            rms_norm_oracle::<Qwen38_27B>(&fixture.hidden[begin..end], &source.hidden_norm);
+            rms_norm_oracle::<A>(&fixture.embedding[begin..end], &source.embedding_norm);
+        let hidden_input = rms_norm_oracle::<A>(&fixture.hidden[begin..end], &source.hidden_norm);
         compare_close_slice(
             &format!("normalized embedding at B={batch}, row={row}"),
             &observed.normalized_embedding[begin..end],
@@ -510,13 +610,13 @@ fn require_close(
     Ok(())
 }
 
-fn verify_replay(
+fn verify_replay<A: Arch>(
     batch: usize,
     eager: &Observed,
     replay: &Observed,
     report: &mut MtpBf16FusionQualification,
 ) -> Result<(), MtpBf16FusionQualificationError> {
-    let active = batch * Qwen38_27B::HIDDEN;
+    let active = batch * A::HIDDEN;
     for (role, eager, replay) in [
         (
             "normalized embedding",
@@ -548,12 +648,12 @@ fn verify_replay(
     Ok(())
 }
 
-fn verify_replacement(
+fn verify_replacement<A: Arch>(
     batch: usize,
     first: &Observed,
     replacement: &Observed,
 ) -> Result<(), MtpBf16FusionQualificationError> {
-    let active = batch * Qwen38_27B::HIDDEN;
+    let active = batch * A::HIDDEN;
     if first.normalized_embedding[..active] == replacement.normalized_embedding[..active]
         || first.normalized_hidden[..active] == replacement.normalized_hidden[..active]
         || first.output[..active] == replacement.output[..active]
@@ -565,12 +665,13 @@ fn verify_replacement(
     Ok(())
 }
 
-fn verify_inactive(
+fn verify_inactive<A: Arch>(
     batch: usize,
+    max_tokens: usize,
     observed: &Observed,
     report: &mut MtpBf16FusionQualification,
 ) -> Result<(), MtpBf16FusionQualificationError> {
-    let begin = batch * Qwen38_27B::HIDDEN;
+    let begin = batch * A::HIDDEN;
     for (role, values) in [
         (
             "normalized embedding",
@@ -585,7 +686,7 @@ fn verify_inactive(
             )));
         }
     }
-    report.inactive_values += 3 * (MAX_TOKENS - batch) * Qwen38_27B::HIDDEN;
+    report.inactive_values += 3 * (max_tokens - batch) * A::HIDDEN;
     Ok(())
 }
 
@@ -634,18 +735,20 @@ fn verify_immutable(
     Ok(())
 }
 
-fn verify_no_post_warmup_allocation(
+fn verify_no_post_warmup_allocation<O: FusionOp>(
     context: &std::sync::Arc<CudaContext>,
-    op: &MtpBf16FusionOp,
+    op: &O,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
+    routes: &[usize],
+    max_tokens: usize,
 ) -> Result<(), MtpBf16FusionQualificationError> {
-    launch(op, arena, stream, regions, MAX_TOKENS)?;
+    launch(op, arena, stream, regions, max_tokens)?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
-        for batch in ROUTES {
+        for &batch in routes {
             launch(op, arena, stream, regions, batch)?;
         }
     }
@@ -661,9 +764,12 @@ fn verify_no_post_warmup_allocation(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, MAX_TOKENS, ROUTES, qualify_mtp_bf16_fusion};
+    use super::{
+        MAX_BATCH, MAX_TOKENS, QWEN35_MAX_TOKENS, QWEN35_ROUTES, ROUTES, qualify_mtp_bf16_fusion,
+        qualify_qwen35_mtp_bf16_fusion,
+    };
     use std::path::PathBuf;
-    use tuisko_model::{Arch, Qwen38_27B};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
     #[test]
     fn mtp_bf16_fusion_suite_route_inventory_is_exact() {
@@ -683,15 +789,66 @@ mod tests {
             std::env::var_os("TUISKO_SNAPSHOT").expect("TUISKO_SNAPSHOT must name the snapshot"),
         );
         let report = qualify_mtp_bf16_fusion(&root).expect("MTP BF16 fusion qualification");
+        let route_rows = ROUTES.iter().sum::<usize>();
+        let inactive_rows = ROUTES.len() * MAX_TOKENS - route_rows;
 
-        assert_eq!(report.normalized_values, 2 * 1_320 * Qwen38_27B::HIDDEN);
-        assert_eq!(report.projection_values, 1_320 * Qwen38_27B::HIDDEN);
+        assert_eq!(route_rows, 1_284);
+        assert_eq!(inactive_rows, 11_004);
+        assert_eq!(
+            report.normalized_values,
+            2 * route_rows * Qwen38_27B::HIDDEN
+        );
+        assert_eq!(report.projection_values, route_rows * Qwen38_27B::HIDDEN);
         assert_eq!(report.source_projection_values, Qwen38_27B::HIDDEN);
-        assert_eq!(report.graph_replay_values, 3 * 1_320 * Qwen38_27B::HIDDEN);
-        assert_eq!(report.inactive_values, 2 * 3 * 10_968 * Qwen38_27B::HIDDEN);
+        assert_eq!(
+            report.graph_replay_values,
+            3 * route_rows * Qwen38_27B::HIDDEN
+        );
+        assert_eq!(
+            report.inactive_values,
+            2 * 3 * inactive_rows * Qwen38_27B::HIDDEN
+        );
         assert_eq!(report.weight_bytes, 104_878_080);
         assert_eq!(report.workspace_bytes, 52_428_800);
         assert_eq!(report.arena_bytes, 157_306_880);
+        assert_eq!(report.padding_bytes, 0);
+    }
+
+    #[test]
+    fn qwen35_fusion_suite_route_inventory_is_exact() {
+        assert_eq!(QWEN35_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
+        assert_eq!(QWEN35_MAX_TOKENS, 128);
+        assert_eq!(Qwen35_9B::HIDDEN, 4_096);
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive SM120 device and the pinned Qwen3.5 snapshot"]
+    fn qwen35_fusion_suite_source_values_match_every_route() {
+        let root = PathBuf::from(
+            std::env::var_os("TUISKO_QWEN35_SNAPSHOT")
+                .expect("TUISKO_QWEN35_SNAPSHOT must name the snapshot"),
+        );
+        let report =
+            qualify_qwen35_mtp_bf16_fusion(&root).expect("Qwen3.5 MTP BF16 fusion qualification");
+        let route_rows = QWEN35_ROUTES.iter().sum::<usize>();
+        let inactive_rows = QWEN35_ROUTES.len() * QWEN35_MAX_TOKENS - route_rows;
+
+        assert_eq!(route_rows, 260);
+        assert_eq!(inactive_rows, 1_148);
+        assert_eq!(report.normalized_values, 2 * route_rows * Qwen35_9B::HIDDEN);
+        assert_eq!(report.projection_values, route_rows * Qwen35_9B::HIDDEN);
+        assert_eq!(report.source_projection_values, Qwen35_9B::HIDDEN);
+        assert_eq!(
+            report.graph_replay_values,
+            3 * route_rows * Qwen35_9B::HIDDEN
+        );
+        assert_eq!(
+            report.inactive_values,
+            6 * inactive_rows * Qwen35_9B::HIDDEN
+        );
+        assert_eq!(report.weight_bytes, 67_125_248);
+        assert_eq!(report.workspace_bytes, 5_242_880);
+        assert_eq!(report.arena_bytes, 72_368_128);
         assert_eq!(report.padding_bytes, 0);
     }
 }
