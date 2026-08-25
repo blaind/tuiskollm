@@ -39,7 +39,7 @@ use tuisko_qual::{
     benchmark_resident_model, benchmark_resident_mtp, benchmark_resident_mtp_batch_generation,
     benchmark_resident_mtp_generation, benchmark_resident_mtp_sampling, benchmark_resident_prefill,
     benchmark_target_mtp_verify, benchmark_text_endpoint, profile_resident_model,
-    qualify_fp8_lm_head,
+    profile_resident_prefill, qualify_fp8_lm_head,
 };
 
 fn main() -> ExitCode {
@@ -62,10 +62,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
     let suite = arguments
         .next()
-        .ok_or("usage: bench-device <attention-qk-prepare|qwen35-attention-qk-prepare|qwen36-attention-qk-prepare|qwen36-fp8-attention-qk-prepare|paged-gqa|qwen35-paged-gqa|qwen36-paged-gqa|qwen36-fp8-paged-gqa|long-context-paged-gqa|attention-output|qwen35-nvfp4-attention-output|qwen36-attention-output|mtp-bf16-fusion|mtp-bf16-qkv|mtp-bf16-qk-prepare|mtp-bf16-paged-gqa|mtp-bf16-attention-output|mtp-bf16-mlp|mtp-layer|qwen35-mtp-layer|qwen36-mtp-layer|mtp-prompt-prime|resident-mtp|qwen35-resident-mtp|qwen35-mtp-generation|generation-mtp-greedy|generation-mtp-sampling|generation-mtp-batch|target-mtp-verify|residual-norm|qwen35-residual-norm|qwen35-nvfp4-swiglu|qwen35-nvfp4-down|qwen35-nvfp4-qkv|qwen35-nvfp4-gdn-input|qwen35-gdn-prepare|qwen35-gdn-recurrence|qwen35-nvfp4-gdn-output|qwen35-nvfp4-mlp|qwen35-text-endpoint|qwen35-resident-model|qwen36-residual-norm|qwen36-moe-router|qwen36-moe-experts|qwen36-nvfp4-lm-head|qwen36-text-endpoint|qwen36-resident-model|qwen36-fp8-qkv|qwen36-gdn-input|qwen36-gdn-prepare|qwen36-gdn-recurrence|qwen36-gdn-output|qwen36-gdn-moe-layer|qwen36-full-attention-layer|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|nvfp4-swiglu|nvfp4-down|nvfp4-mlp|gdn-prepare|gdn-recurrence|gdn-output|dense-fp8-mlp|dense-fp8-gdn-layer|full-attention-layer|qwen35-full-attention-layer|qwen35-gdn-layer|resident-model|resident-prefill|resident-long-context-model|text-endpoint|profile-resident-model|qualify-fp8-lm-head> [SNAPSHOT] [options]")?;
+        .ok_or("usage: bench-device <attention-qk-prepare|qwen35-attention-qk-prepare|qwen36-attention-qk-prepare|qwen36-fp8-attention-qk-prepare|paged-gqa|qwen35-paged-gqa|qwen36-paged-gqa|qwen36-fp8-paged-gqa|long-context-paged-gqa|attention-output|qwen35-nvfp4-attention-output|qwen36-attention-output|mtp-bf16-fusion|mtp-bf16-qkv|mtp-bf16-qk-prepare|mtp-bf16-paged-gqa|mtp-bf16-attention-output|mtp-bf16-mlp|mtp-layer|qwen35-mtp-layer|qwen36-mtp-layer|mtp-prompt-prime|resident-mtp|qwen35-resident-mtp|qwen35-mtp-generation|generation-mtp-greedy|generation-mtp-sampling|generation-mtp-batch|target-mtp-verify|residual-norm|qwen35-residual-norm|qwen35-nvfp4-swiglu|qwen35-nvfp4-down|qwen35-nvfp4-qkv|qwen35-nvfp4-gdn-input|qwen35-gdn-prepare|qwen35-gdn-recurrence|qwen35-nvfp4-gdn-output|qwen35-nvfp4-mlp|qwen35-text-endpoint|qwen35-resident-model|qwen36-residual-norm|qwen36-moe-router|qwen36-moe-experts|qwen36-nvfp4-lm-head|qwen36-text-endpoint|qwen36-resident-model|qwen36-fp8-qkv|qwen36-gdn-input|qwen36-gdn-prepare|qwen36-gdn-recurrence|qwen36-gdn-output|qwen36-gdn-moe-layer|qwen36-full-attention-layer|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|nvfp4-swiglu|nvfp4-down|nvfp4-mlp|gdn-prepare|gdn-recurrence|gdn-output|dense-fp8-mlp|dense-fp8-gdn-layer|full-attention-layer|qwen35-full-attention-layer|qwen35-gdn-layer|resident-model|resident-prefill|resident-long-context-model|text-endpoint|profile-resident-model|profile-resident-prefill|qualify-fp8-lm-head> [SNAPSHOT] [options]")?;
     #[cfg(feature = "device")]
     if suite == "profile-resident-model" {
         return run_resident_profile(arguments);
+    }
+    #[cfg(feature = "device")]
+    if suite == "profile-resident-prefill" {
+        return run_resident_prefill_profile(arguments);
     }
     #[cfg(feature = "device")]
     if suite == "qualify-fp8-lm-head" {
@@ -761,6 +765,63 @@ fn run_resident_profile(mut arguments: impl Iterator<Item = String>) -> Result<(
     let manifest = profile_resident_model(
         &snapshot,
         batch,
+        warmup_launches,
+        captured_replays,
+        &graph_dot,
+    )?;
+    let mut json = serde_json::to_vec_pretty(&manifest)?;
+    json.push(b'\n');
+    std::fs::write(&manifest_path, json)?;
+    eprintln!("CUDA Graph DOT: {}", graph_dot.display());
+    eprintln!("semantic manifest: {}", manifest_path.display());
+
+    Ok(())
+}
+
+#[cfg(feature = "device")]
+fn run_resident_prefill_profile(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let snapshot = PathBuf::from(
+        arguments
+            .next()
+            .ok_or("profile-resident-prefill requires the admitted snapshot path")?,
+    );
+    let mut tokens = 1_024usize;
+    let mut warmup_launches = 16u64;
+    let mut captured_replays = 3u64;
+    let mut graph_dot = None;
+    let mut manifest_path = None;
+    while let Some(argument) = arguments.next() {
+        let value = arguments
+            .next()
+            .ok_or_else(|| format!("`{argument}` requires a value"))?;
+        match argument.as_str() {
+            "--tokens" => tokens = value.parse()?,
+            "--warmup-launches" => warmup_launches = value.parse()?,
+            "--captured-replays" => captured_replays = value.parse()?,
+            "--graph-dot" => graph_dot = Some(PathBuf::from(value)),
+            "--manifest" => manifest_path = Some(PathBuf::from(value)),
+            _ => {
+                return Err(
+                    format!("unknown resident prefill profile argument `{argument}`").into(),
+                );
+            }
+        }
+    }
+    let graph_dot = graph_dot.ok_or("profile-resident-prefill requires --graph-dot PATH")?;
+    let manifest_path = manifest_path.ok_or("profile-resident-prefill requires --manifest PATH")?;
+    for path in [&graph_dot, &manifest_path] {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let manifest = profile_resident_prefill(
+        &snapshot,
+        tokens,
         warmup_launches,
         captured_replays,
         &graph_dot,
