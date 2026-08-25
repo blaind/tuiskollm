@@ -1,66 +1,180 @@
 //! Shape- and dtype-checked zero-copy views over admitted tensor bytes.
 
 use crate::{CheckpointError, CheckpointResult, DType, TensorView};
+use std::marker::PhantomData;
 
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Source element admitted by a typed view.
+///
+/// Sealed: the four marker types below are the complete admitted element set, and no other
+/// crate can add a fifth. Admitting a new source element is a checkpoint-contract change,
+/// never a downstream extension.
+pub trait TensorElement: sealed::Sealed + Copy + 'static {
+    /// Exact source dtype every view of this element validates against.
+    const DTYPE: DType;
+}
+
+/// Little-endian BF16 source words.
 #[derive(Clone, Copy, Debug)]
-struct ValidatedView<'a, const RANK: usize> {
+pub struct Bf16;
+
+/// Little-endian F32 source values.
+#[derive(Clone, Copy, Debug)]
+pub struct F32;
+
+/// FP8 E4M3 source codes.
+#[derive(Clone, Copy, Debug)]
+pub struct Fp8E4M3;
+
+/// Raw U8 source elements.
+#[derive(Clone, Copy, Debug)]
+pub struct U8;
+
+impl sealed::Sealed for Bf16 {}
+impl sealed::Sealed for F32 {}
+impl sealed::Sealed for Fp8E4M3 {}
+impl sealed::Sealed for U8 {}
+
+impl TensorElement for Bf16 {
+    const DTYPE: DType = DType::Bf16;
+}
+
+impl TensorElement for F32 {
+    const DTYPE: DType = DType::F32;
+}
+
+impl TensorElement for Fp8E4M3 {
+    const DTYPE: DType = DType::Fp8E4M3;
+}
+
+impl TensorElement for U8 {
+    const DTYPE: DType = DType::U8;
+}
+
+/// Validated zero-copy view of admitted source bytes for one element type.
+#[derive(Clone, Copy, Debug)]
+pub struct TypedView<'a, E: TensorElement, const RANK: usize> {
     name: &'a str,
     shape: [u64; RANK],
     bytes: &'a [u8],
+    element: PhantomData<E>,
 }
 
 /// Validated zero-copy view of little-endian BF16 source words.
-#[derive(Clone, Copy, Debug)]
-pub struct Bf16View<'a, const RANK: usize> {
-    view: ValidatedView<'a, RANK>,
+pub type Bf16View<'a, const RANK: usize> = TypedView<'a, Bf16, RANK>;
+
+/// Validated zero-copy view of little-endian F32 source values.
+pub type F32View<'a, const RANK: usize> = TypedView<'a, F32, RANK>;
+
+/// Validated zero-copy view of FP8 E4M3 source codes.
+pub type Fp8E4M3View<'a, const RANK: usize> = TypedView<'a, Fp8E4M3, RANK>;
+
+/// Validated zero-copy view of raw U8 source elements.
+pub type U8View<'a, const RANK: usize> = TypedView<'a, U8, RANK>;
+
+impl<'a, E: TensorElement, const RANK: usize> TypedView<'a, E, RANK> {
+    /// Returns the source tensor name.
+    pub fn name(&self) -> &'a str {
+        self.name
+    }
+
+    /// Returns the validated tensor shape.
+    pub fn shape(&self) -> &[u64; RANK] {
+        &self.shape
+    }
+
+    /// Returns the number of represented source elements.
+    pub fn len(&self) -> usize {
+        self.bytes.len() / E::DTYPE.byte_width() as usize
+    }
+
+    /// Returns whether the view contains no source elements.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Validates one public tensor descriptor as an exact view of this element.
+    ///
+    /// Per-element `bind` constructors keep their own visibility; this is the shared body.
+    fn bind_validated(
+        tensor: TensorView<'a>,
+        expected_shape: [u64; RANK],
+    ) -> CheckpointResult<Self> {
+        let expected_dtype = E::DTYPE;
+
+        if tensor.dtype != expected_dtype {
+            return Err(CheckpointError::tensor(format!(
+                "tensor `{}` has dtype `{}`, expected `{expected_dtype}`",
+                tensor.name, tensor.dtype
+            )));
+        }
+
+        if tensor.shape != expected_shape {
+            return Err(CheckpointError::tensor(format!(
+                "tensor `{}` has shape {:?}, expected {expected_shape:?}",
+                tensor.name, tensor.shape
+            )));
+        }
+
+        let elements = expected_shape.iter().try_fold(1u64, |count, &dimension| {
+            count.checked_mul(dimension).ok_or_else(|| {
+                CheckpointError::tensor(format!("tensor `{}` shape overflows", tensor.name))
+            })
+        })?;
+        let expected_bytes = elements
+            .checked_mul(expected_dtype.byte_width())
+            .ok_or_else(|| {
+                CheckpointError::tensor(format!("tensor `{}` byte length overflows", tensor.name))
+            })?;
+        let actual_bytes = u64::try_from(tensor.bytes.len()).map_err(|_| {
+            CheckpointError::tensor(format!(
+                "tensor `{}` is too large for this host",
+                tensor.name
+            ))
+        })?;
+
+        if actual_bytes != expected_bytes {
+            return Err(CheckpointError::tensor(format!(
+                "tensor `{}` has {actual_bytes} bytes, expected {expected_bytes}",
+                tensor.name
+            )));
+        }
+
+        Ok(Self {
+            name: tensor.name,
+            shape: expected_shape,
+            bytes: tensor.bytes,
+            element: PhantomData,
+        })
+    }
 }
 
 impl<'a, const RANK: usize> Bf16View<'a, RANK> {
     /// Validates one public tensor descriptor as an exact BF16 view.
     pub fn bind(tensor: TensorView<'a>, expected_shape: [u64; RANK]) -> CheckpointResult<Self> {
-        Ok(Self {
-            view: validate(tensor, DType::Bf16, expected_shape)?,
-        })
-    }
-
-    /// Returns the source tensor name.
-    pub fn name(&self) -> &'a str {
-        self.view.name
-    }
-
-    /// Returns the validated tensor shape.
-    pub fn shape(&self) -> &[u64; RANK] {
-        &self.view.shape
+        Self::bind_validated(tensor, expected_shape)
     }
 
     /// Returns the unmodified little-endian BF16 bytes.
     pub fn bytes(&self) -> &'a [u8] {
-        self.view.bytes
-    }
-
-    /// Returns the number of BF16 words.
-    pub fn len(&self) -> usize {
-        self.view.bytes.len() / 2
-    }
-
-    /// Returns whether the view contains no BF16 words.
-    pub fn is_empty(&self) -> bool {
-        self.view.bytes.is_empty()
+        self.bytes
     }
 
     /// Returns the source BF16 word at `index`.
     pub fn word(&self, index: usize) -> Option<u16> {
         let begin = index.checked_mul(2)?;
         let end = begin.checked_add(2)?;
-        let bytes: [u8; 2] = self.view.bytes.get(begin..end)?.try_into().ok()?;
+        let bytes: [u8; 2] = self.bytes.get(begin..end)?.try_into().ok()?;
 
         Some(u16::from_le_bytes(bytes))
     }
 
     /// Iterates over the source BF16 words.
     pub fn words(&self) -> impl DoubleEndedIterator<Item = u16> + ExactSizeIterator + '_ {
-        self.view
-            .bytes
+        self.bytes
             .as_chunks::<2>()
             .0
             .iter()
@@ -69,52 +183,24 @@ impl<'a, const RANK: usize> Bf16View<'a, RANK> {
     }
 }
 
-/// Validated zero-copy view of little-endian F32 source values.
-#[derive(Clone, Copy, Debug)]
-pub struct F32View<'a, const RANK: usize> {
-    view: ValidatedView<'a, RANK>,
-}
-
 impl<'a, const RANK: usize> F32View<'a, RANK> {
     pub(crate) fn bind(
         tensor: TensorView<'a>,
         expected_shape: [u64; RANK],
     ) -> CheckpointResult<Self> {
-        Ok(Self {
-            view: validate(tensor, DType::F32, expected_shape)?,
-        })
-    }
-
-    /// Returns the source tensor name.
-    pub fn name(&self) -> &'a str {
-        self.view.name
-    }
-
-    /// Returns the validated tensor shape.
-    pub fn shape(&self) -> &[u64; RANK] {
-        &self.view.shape
+        Self::bind_validated(tensor, expected_shape)
     }
 
     /// Returns the unmodified little-endian F32 bytes.
     pub fn bytes(&self) -> &'a [u8] {
-        self.view.bytes
-    }
-
-    /// Returns the number of F32 values.
-    pub fn len(&self) -> usize {
-        self.view.bytes.len() / 4
-    }
-
-    /// Returns whether the view contains no F32 values.
-    pub fn is_empty(&self) -> bool {
-        self.view.bytes.is_empty()
+        self.bytes
     }
 
     /// Returns the source F32 bits at `index`.
     pub fn bits(&self, index: usize) -> Option<u32> {
         let begin = index.checked_mul(4)?;
         let end = begin.checked_add(4)?;
-        let bytes: [u8; 4] = self.view.bytes.get(begin..end)?.try_into().ok()?;
+        let bytes: [u8; 4] = self.bytes.get(begin..end)?.try_into().ok()?;
 
         Some(u32::from_le_bytes(bytes))
     }
@@ -125,140 +211,72 @@ impl<'a, const RANK: usize> F32View<'a, RANK> {
     }
 }
 
-/// Validated zero-copy view of FP8 E4M3 source codes.
-#[derive(Clone, Copy, Debug)]
-pub struct Fp8E4M3View<'a, const RANK: usize> {
-    view: ValidatedView<'a, RANK>,
-}
-
 impl<'a, const RANK: usize> Fp8E4M3View<'a, RANK> {
     /// Binds a validated view from an admitted tensor descriptor.
     pub fn bind(tensor: TensorView<'a>, expected_shape: [u64; RANK]) -> CheckpointResult<Self> {
-        Ok(Self {
-            view: validate(tensor, DType::Fp8E4M3, expected_shape)?,
-        })
-    }
-
-    /// Returns the source tensor name.
-    pub fn name(&self) -> &'a str {
-        self.view.name
-    }
-
-    /// Returns the validated tensor shape.
-    pub fn shape(&self) -> &[u64; RANK] {
-        &self.view.shape
+        Self::bind_validated(tensor, expected_shape)
     }
 
     /// Returns the unmodified FP8 E4M3 source codes.
     pub fn codes(&self) -> &'a [u8] {
-        self.view.bytes
+        self.bytes
     }
-
-    /// Returns the number of FP8 E4M3 codes.
-    pub fn len(&self) -> usize {
-        self.view.bytes.len()
-    }
-
-    /// Returns whether the view contains no FP8 E4M3 codes.
-    pub fn is_empty(&self) -> bool {
-        self.view.bytes.is_empty()
-    }
-}
-
-/// Validated zero-copy view of raw U8 source elements.
-#[derive(Clone, Copy, Debug)]
-pub struct U8View<'a, const RANK: usize> {
-    view: ValidatedView<'a, RANK>,
 }
 
 impl<'a, const RANK: usize> U8View<'a, RANK> {
     /// Binds a validated view from an admitted tensor descriptor.
     pub fn bind(tensor: TensorView<'a>, expected_shape: [u64; RANK]) -> CheckpointResult<Self> {
-        Ok(Self {
-            view: validate(tensor, DType::U8, expected_shape)?,
-        })
-    }
-
-    /// Returns the source tensor name.
-    pub fn name(&self) -> &'a str {
-        self.view.name
-    }
-
-    /// Returns the validated tensor shape.
-    pub fn shape(&self) -> &[u64; RANK] {
-        &self.view.shape
+        Self::bind_validated(tensor, expected_shape)
     }
 
     /// Returns the unmodified U8 source elements.
     pub fn bytes(&self) -> &'a [u8] {
-        self.view.bytes
+        self.bytes
     }
-
-    /// Returns the number of U8 elements.
-    pub fn len(&self) -> usize {
-        self.view.bytes.len()
-    }
-
-    /// Returns whether the view contains no U8 elements.
-    pub fn is_empty(&self) -> bool {
-        self.view.bytes.is_empty()
-    }
-}
-
-fn validate<'a, const RANK: usize>(
-    tensor: TensorView<'a>,
-    expected_dtype: DType,
-    expected_shape: [u64; RANK],
-) -> CheckpointResult<ValidatedView<'a, RANK>> {
-    if tensor.dtype != expected_dtype {
-        return Err(CheckpointError::tensor(format!(
-            "tensor `{}` has dtype `{}`, expected `{expected_dtype}`",
-            tensor.name, tensor.dtype
-        )));
-    }
-
-    if tensor.shape != expected_shape {
-        return Err(CheckpointError::tensor(format!(
-            "tensor `{}` has shape {:?}, expected {expected_shape:?}",
-            tensor.name, tensor.shape
-        )));
-    }
-
-    let elements = expected_shape.iter().try_fold(1u64, |count, &dimension| {
-        count.checked_mul(dimension).ok_or_else(|| {
-            CheckpointError::tensor(format!("tensor `{}` shape overflows", tensor.name))
-        })
-    })?;
-    let expected_bytes = elements
-        .checked_mul(expected_dtype.byte_width())
-        .ok_or_else(|| {
-            CheckpointError::tensor(format!("tensor `{}` byte length overflows", tensor.name))
-        })?;
-    let actual_bytes = u64::try_from(tensor.bytes.len()).map_err(|_| {
-        CheckpointError::tensor(format!(
-            "tensor `{}` is too large for this host",
-            tensor.name
-        ))
-    })?;
-
-    if actual_bytes != expected_bytes {
-        return Err(CheckpointError::tensor(format!(
-            "tensor `{}` has {actual_bytes} bytes, expected {expected_bytes}",
-            tensor.name
-        )));
-    }
-
-    Ok(ValidatedView {
-        name: tensor.name,
-        shape: expected_shape,
-        bytes: tensor.bytes,
-    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Bf16View, F32View, Fp8E4M3View, U8View};
+    use super::{Bf16, Bf16View, F32, F32View, Fp8E4M3, Fp8E4M3View, TensorElement, U8, U8View};
     use crate::{CheckpointErrorCode, DType, TensorView};
+
+    #[test]
+    fn typed_view_elements_pin_their_source_dtype_and_element_width() {
+        const PAYLOAD: [u8; 16] = [0; 16];
+
+        let descriptor = |dtype: DType| TensorView {
+            name: "typed",
+            dtype,
+            shape: &[4],
+            bytes: &PAYLOAD[..4 * dtype.byte_width() as usize],
+            data_range: 0..0,
+        };
+
+        assert_eq!(Bf16::DTYPE, DType::Bf16);
+        assert_eq!(F32::DTYPE, DType::F32);
+        assert_eq!(Fp8E4M3::DTYPE, DType::Fp8E4M3);
+        assert_eq!(U8::DTYPE, DType::U8);
+
+        let bf16 = Bf16View::bind(descriptor(DType::Bf16), [4]).unwrap();
+        let f32 = F32View::bind(descriptor(DType::F32), [4]).unwrap();
+        let fp8 = Fp8E4M3View::bind(descriptor(DType::Fp8E4M3), [4]).unwrap();
+        let u8 = U8View::bind(descriptor(DType::U8), [4]).unwrap();
+
+        assert_eq!(
+            [bf16.len(), f32.len(), fp8.len(), u8.len()],
+            [4, 4, 4, 4],
+            "element widths must divide the source byte length"
+        );
+        assert_eq!(
+            [
+                bf16.bytes().len(),
+                f32.bytes().len(),
+                fp8.codes().len(),
+                u8.bytes().len()
+            ],
+            [8, 16, 4, 4]
+        );
+    }
 
     #[test]
     fn bf16_words_preserve_little_endian_source_bits() {
