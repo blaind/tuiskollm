@@ -264,6 +264,23 @@ impl ResidentLayer {
         }
     }
 
+    fn load_verify_state(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        slot: usize,
+        first_position: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        match self {
+            Self::Gdn(program) => program.load_verify_slot(stream, slot),
+            Self::FullAttention(program) => {
+                program.load_verify_state(stream, rows, slot, first_position, rope_cos, rope_sin)
+            }
+        }
+    }
+
     fn load_residual(&self, stream: &CudaStream, rows: usize, values: &[u16]) -> EngineResult<()> {
         match self {
             Self::Gdn(program) => program.load_residual(stream, rows, values),
@@ -299,6 +316,20 @@ impl ResidentLayer {
         }
     }
 
+    /// # Safety
+    /// `input` names `rows * 4,096` retained BF16 values in this CUDA context.
+    unsafe fn launch_verify_from(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        input: *const u16,
+    ) -> GpuResult<*const u16> {
+        match self {
+            Self::Gdn(program) => unsafe { program.launch_verify_from(stream, rows, input) },
+            Self::FullAttention(program) => unsafe { program.launch_from(stream, rows, input) },
+        }
+    }
+
     fn read_residual(&self, stream: &CudaStream, rows: usize) -> EngineResult<Vec<u16>> {
         match self {
             Self::Gdn(program) => program.read_residual(stream, rows),
@@ -325,6 +356,7 @@ impl ResidentLayer {
 pub struct Qwen35ResidentModelProgram {
     // Drop whole-model graphs and layers before the shared KV arena they retain.
     graphs: [CudaGraph; MAX_BATCH],
+    verify_graphs: [CudaGraph; 4],
     prefill_graphs: [CudaGraph; 3],
     layers: Vec<ResidentLayer>,
     long_context_kv: Qwen35LongContextKvProgram,
@@ -374,9 +406,11 @@ impl Qwen35ResidentModelProgram {
             layer.reset(&stream)?;
         }
         let graphs = capture_decode_routes(&stream, &layers, &endpoint)?;
+        let verify_graphs = capture_verify_routes(&stream, &layers, &endpoint)?;
         let prefill_graphs = capture_prefill_routes(&stream, &layers, &endpoint)?;
         let program = Self {
             graphs,
+            verify_graphs,
             prefill_graphs,
             layers,
             long_context_kv,
@@ -441,6 +475,40 @@ impl Qwen35ResidentModelProgram {
         slot_rows(slots)?;
         for layer in &self.layers {
             layer.load_slot_routes(stream, slots)?;
+        }
+
+        Ok(())
+    }
+
+    /// Stages one contiguous `K=1..4` causal target span in a physical slot.
+    pub(crate) fn load_verify_state(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        slot: usize,
+        first_position: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        require_verify_rows(rows)?;
+        require_slot(slot)?;
+        let end = first_position
+            .checked_add(rows)
+            .ok_or_else(|| EngineError::route("Qwen3.5 verification range overflows"))?;
+        let reserved_tokens = self.long_context_kv.slot_token_count(slot)?;
+        if end > reserved_tokens {
+            return Err(EngineError::route(format!(
+                "Qwen3.5 verification positions {first_position}..{end} exceed slot {slot}'s {reserved_tokens} reserved tokens"
+            )));
+        }
+        let rotary_values = product("Qwen3.5 verification rotary values", rows, ROTARY_PAIRS)?;
+        if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
+            return Err(EngineError::layout(format!(
+                "Qwen3.5 verification rotary planes must each have {rotary_values} values for K={rows}"
+            )));
+        }
+        for layer in &self.layers {
+            layer.load_verify_state(stream, rows, slot, first_position, rope_cos, rope_sin)?;
         }
 
         Ok(())
@@ -572,6 +640,15 @@ impl Qwen35ResidentModelProgram {
         // SAFETY: this Qwen35ResidentModelProgram owns every captured allocation
         // (layer owners and endpoint) for its whole life and drops the graphs first.
         unsafe { self.graphs[batch - 1].launch(stream) }?;
+
+        Ok(())
+    }
+
+    /// Replays one exact causal target-verification graph.
+    pub(crate) fn replay_verify(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        require_verify_rows(rows)?;
+        // SAFETY: this owner retains all addresses captured by the K-route.
+        unsafe { self.verify_graphs[rows - 1].launch(stream) }?;
 
         Ok(())
     }
@@ -733,6 +810,22 @@ impl Qwen35ResidentModelProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Launches one causal target-verification route eagerly.
+    pub fn qualification_launch_verify(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+    ) -> EngineResult<()> {
+        require_verify_rows(rows)?;
+        Ok(launch_verify_route(
+            stream,
+            rows,
+            &self.layers,
+            &self.endpoint,
+        )?)
+    }
+
+    #[cfg(feature = "qualification")]
     /// Returns one immutable production graph.
     pub fn qualification_graph(&self, batch: usize) -> EngineResult<&CudaGraph> {
         require_batch(batch)?;
@@ -747,6 +840,17 @@ impl Qwen35ResidentModelProgram {
         position: usize,
     ) -> EngineResult<crate::PagedKvRoute> {
         self.long_context_kv.route(slot, position)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads one complete physical K/V page from every attention layer.
+    pub fn qualification_cache_page(
+        &self,
+        stream: &CudaStream,
+        physical_page: usize,
+    ) -> EngineResult<(Vec<u16>, Vec<u16>)> {
+        self.long_context_kv
+            .qualification_cache_page(stream, physical_page)
     }
 
     #[cfg(feature = "qualification")]
@@ -916,6 +1020,26 @@ fn capture_decode_routes(
         .map_err(|_| EngineError::layout("Qwen3.5 whole-model graph inventory is incomplete"))
 }
 
+fn capture_verify_routes(
+    stream: &CudaStream,
+    layers: &[ResidentLayer],
+    endpoint: &Qwen35TextEndpointProgram,
+) -> EngineResult<[CudaGraph; 4]> {
+    // Four serial B=1 passes cost 24.996 ms inside the measured 32.825-ms K=4
+    // transaction. The K routes reuse each decode matrix pass across rows;
+    // GDN history/state retains token order, while attention publishes the
+    // complete represented K/V span before the causal row-length reads.
+    let mut graphs = Vec::with_capacity(4);
+    for rows in 1..=4 {
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_verify_route(stream, rows, layers, endpoint)
+        })?);
+    }
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("Qwen3.5 target-verification graph inventory is incomplete")
+    })
+}
+
 fn capture_prefill_routes(
     stream: &CudaStream,
     layers: &[ResidentLayer],
@@ -951,6 +1075,25 @@ fn launch_route(
     }
     // The final layer's stable output remains live for the endpoint launch and graph lifetime.
     unsafe { endpoint.launch_from(stream, batch, residual) }
+}
+
+fn launch_verify_route(
+    stream: &CudaStream,
+    rows: usize,
+    layers: &[ResidentLayer],
+    endpoint: &Qwen35TextEndpointProgram,
+) -> GpuResult<()> {
+    // K=1 has no shared-state race; reusing B=1 preserves the production
+    // transition bit-for-bit instead of compiling a second equivalent route.
+    if verify_uses_decode(rows) {
+        return launch_route(stream, rows, layers, endpoint);
+    }
+
+    let mut residual = endpoint.input_address()?;
+    for layer in layers {
+        residual = unsafe { layer.launch_verify_from(stream, rows, residual)? };
+    }
+    unsafe { endpoint.launch_from(stream, rows, residual) }
 }
 
 fn launch_prefill_route(
@@ -998,6 +1141,19 @@ fn require_batch(batch: usize) -> EngineResult<()> {
         )));
     }
     Ok(())
+}
+
+fn require_verify_rows(rows: usize) -> EngineResult<()> {
+    if (1..=4).contains(&rows) {
+        return Ok(());
+    }
+    Err(EngineError::route(format!(
+        "Qwen3.5 target-verification row count {rows} is outside 1..=4"
+    )))
+}
+
+const fn verify_uses_decode(rows: usize) -> bool {
+    rows == 1
 }
 
 fn slot_rows(slots: &[usize]) -> EngineResult<[u32; MAX_BATCH]> {
@@ -1064,7 +1220,7 @@ fn sum_products(name: &str, terms: &[(usize, usize)]) -> EngineResult<usize> {
 mod tests {
     use super::{
         Qwen35ResidentLayerKind, Qwen35ResidentModelLayout, prefill_index, require_prefill,
-        slot_rows,
+        require_verify_rows, slot_rows, verify_uses_decode,
     };
     use crate::EngineErrorCode;
 
@@ -1126,6 +1282,31 @@ mod tests {
                 require_prefill(tokens).unwrap_err().code(),
                 Some(EngineErrorCode::Route)
             );
+        }
+    }
+
+    #[test]
+    fn exact_verification_inventory_covers_only_k1_through_k4() {
+        for rows in 1..=4 {
+            require_verify_rows(rows).unwrap();
+        }
+        for rows in [0, 5, 8, 16, 32, usize::MAX] {
+            assert_eq!(
+                require_verify_rows(rows).unwrap_err().code(),
+                Some(EngineErrorCode::Route),
+                "rows={rows}"
+            );
+        }
+        for (rows, expected) in [
+            (0, false),
+            (1, true),
+            (2, false),
+            (3, false),
+            (4, false),
+            (5, false),
+            (usize::MAX, false),
+        ] {
+            assert_eq!(verify_uses_decode(rows), expected, "rows={rows}");
         }
     }
 }

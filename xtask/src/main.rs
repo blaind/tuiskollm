@@ -2374,6 +2374,7 @@ fn qualify_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
             "qwen35_gdn_prepare",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_qwen35_gdn_prepare(root)
@@ -2399,6 +2400,7 @@ fn qualify_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
             "qwen35_gdn_recurrence",
             "--include-ignored",
             "--nocapture",
+            "--test-threads=1",
         ],
     )?;
     gate_qwen35_gdn_recurrence(root)
@@ -12906,7 +12908,29 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
                 .starts_with("qwen35_gdn_prepare_prefill_history_exact_TID_")
         })
         .collect::<Vec<_>>();
+    let causal = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_gdn_prepare_causal_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    let causal_history = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_gdn_prepare_causal_history_exact_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.5 GDN prepare", routes.len(), 8)?;
+    require_count("Qwen3.5 GDN prepare causal", causal.len(), 3)?;
+    require_count(
+        "Qwen3.5 GDN prepare causal history",
+        causal_history.len(),
+        3,
+    )?;
     require_count("Qwen3.5/Qwen3.6 GDN prepare prefill", prefill.len(), 3)?;
     require_count(
         "Qwen3.5/Qwen3.6 GDN prepare prefill history",
@@ -12914,7 +12938,13 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         3,
     )?;
 
-    for entry in routes.iter().chain(&prefill).chain(&prefill_history) {
+    for entry in routes
+        .iter()
+        .chain(&causal)
+        .chain(&causal_history)
+        .chain(&prefill)
+        .chain(&prefill_history)
+    {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
@@ -12922,7 +12952,7 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
-        if !entry.name.contains("prefill_history")
+        if !entry.name.contains("history")
             && (!entry.body.contains("ex2.approx.f32") || !entry.body.contains("lg2.approx.f32"))
         {
             return Err(format!(
@@ -12957,11 +12987,19 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
     let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
     let sass = String::from_utf8(sass.stdout)?;
     let mut registers = Vec::new();
+    let mut causal_registers = Vec::new();
+    let mut causal_history_registers = Vec::new();
     let mut prefill_registers = Vec::new();
     let mut prefill_history_registers = Vec::new();
     let mut shared = Vec::new();
     for (role, entries, role_registers) in [
         ("decode", routes, &mut registers),
+        ("causal", causal, &mut causal_registers),
+        (
+            "causal history",
+            causal_history,
+            &mut causal_history_registers,
+        ),
         ("prefill", prefill, &mut prefill_registers),
         (
             "prefill history",
@@ -12991,11 +13029,18 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
     registers.sort_unstable();
+    causal_registers.sort_unstable();
+    causal_history_registers.sort_unstable();
     prefill_registers.sort_unstable();
     prefill_history_registers.sort_unstable();
     shared.sort_unstable();
     require_registers(&baseline, "prepare_registers", &registers)?;
     for (key, registers) in [
+        ("causal_registers", causal_registers.as_slice()),
+        (
+            "causal_history_registers",
+            causal_history_registers.as_slice(),
+        ),
         ("prefill_registers", prefill_registers.as_slice()),
         (
             "prefill_history_registers",
@@ -13009,8 +13054,13 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "Qwen3.5/Qwen3.6 GDN prepare gate passed: 8 decode + 3 prefill + 3 history entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}",
-        registers, prefill_registers, prefill_history_registers, shared
+        "Qwen3.5/Qwen3.6 GDN prepare gate passed: 8 decode + 3 causal/3 history + 3 prefill/3 history entries, REG {:?} / {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}",
+        registers,
+        causal_registers,
+        causal_history_registers,
+        prefill_registers,
+        prefill_history_registers,
+        shared
     );
     Ok(())
 }
@@ -13040,10 +13090,19 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
                 .starts_with("qwen35_gdn_recurrence_prefill_exact_TID_")
         })
         .collect::<Vec<_>>();
+    let causal = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen35_gdn_recurrence_causal_exact_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("Qwen3.5 GDN recurrence", routes.len(), 8)?;
+    require_count("Qwen3.5 GDN recurrence causal", causal.len(), 3)?;
     require_count("Qwen3.5/Qwen3.6 GDN recurrence prefill", prefill.len(), 3)?;
 
-    for entry in routes.iter().chain(&prefill) {
+    for entry in routes.iter().chain(&causal).chain(&prefill) {
         if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 512-thread/two-CTA launch bounds",
@@ -13084,10 +13143,12 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
     let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
     let sass = String::from_utf8(sass.stdout)?;
     let mut registers = Vec::new();
+    let mut causal_registers = Vec::new();
     let mut prefill_registers = Vec::new();
     let mut shared = Vec::new();
     for (role, entries, role_registers) in [
         ("decode", routes, &mut registers),
+        ("causal", causal, &mut causal_registers),
         ("prefill", prefill, &mut prefill_registers),
     ] {
         for entry in entries {
@@ -13118,17 +13179,21 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
     registers.sort_unstable();
+    causal_registers.sort_unstable();
     prefill_registers.sort_unstable();
     shared.sort_unstable();
     require_registers(&baseline, "recurrence_registers", &registers)?;
+    if baseline.contains_key("causal_registers") {
+        require_registers(&baseline, "causal_registers", &causal_registers)?;
+    }
     if baseline.contains_key("prefill_registers") {
         require_registers(&baseline, "prefill_registers", &prefill_registers)?;
     }
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "Qwen3.5/Qwen3.6 GDN recurrence gate passed: 8 decode + 3 prefill entries, REG {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/EX2 present",
-        registers, prefill_registers, shared
+        "Qwen3.5/Qwen3.6 GDN recurrence gate passed: 8 decode + 3 causal + 3 prefill entries, REG {:?} / {:?} / {:?}, STACK:0 LOCAL:0, SHARED {:?}, RSQ/EX2 present",
+        registers, causal_registers, prefill_registers, shared
     );
     Ok(())
 }

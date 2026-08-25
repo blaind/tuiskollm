@@ -201,6 +201,43 @@ impl Qwen35ResidentMtpProgram {
         self.target.replay(stream, batch)
     }
 
+    /// Stages one contiguous exact `K=1..4` target-verification span.
+    pub fn stage_target_verify(
+        &mut self,
+        stream: &CudaStream,
+        token_ids: &[u32],
+        slot: usize,
+        first_position: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        if !(1..=4).contains(&token_ids.len()) {
+            return Err(EngineError::route(format!(
+                "Qwen3.5 target verification width {} is outside 1..=4",
+                token_ids.len()
+            )));
+        }
+        self.target.stage_embeddings(stream, token_ids)?;
+        self.target.load_verify_state(
+            stream,
+            token_ids.len(),
+            slot,
+            first_position,
+            rope_cos,
+            rope_sin,
+        )?;
+        let last_position = first_position
+            .checked_add(token_ids.len())
+            .and_then(|end| end.checked_sub(1))
+            .ok_or_else(|| EngineError::route("Qwen3.5 target verification range overflows"))?;
+        self.require_slot_route(slot, last_position)
+    }
+
+    /// Replays one exact causal target-verification graph.
+    pub fn replay_target_verify(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        self.target.replay_verify(stream, rows)
+    }
+
     /// Stages one exact target prompt tile.
     pub fn stage_target_prefill(
         &mut self,
@@ -430,6 +467,16 @@ impl Qwen35ResidentMtpProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Launches one target-verification route without graph replay.
+    pub fn qualification_launch_target_verify(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+    ) -> EngineResult<()> {
+        self.target.qualification_launch_verify(stream, rows)
+    }
+
+    #[cfg(feature = "qualification")]
     /// Launches one prompt-prime route without graph replay.
     pub fn qualification_launch_prompt(
         &self,
@@ -491,6 +538,26 @@ impl Qwen35ResidentMtpProgram {
     ) -> EngineResult<crate::PagedKvRoute> {
         self.require_slot_route(slot, position)?;
         self.target.kv_route(slot, position)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads active target residual rows for serial/K-route comparison.
+    pub fn qualification_target_residual(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+    ) -> EngineResult<Vec<u16>> {
+        self.target.read_final_residual(stream, rows)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads one target physical K/V page from every attention layer.
+    pub fn qualification_target_cache_page(
+        &self,
+        stream: &CudaStream,
+        physical_page: usize,
+    ) -> EngineResult<(Vec<u16>, Vec<u16>)> {
+        self.target.qualification_cache_page(stream, physical_page)
     }
 
     #[cfg(feature = "qualification")]

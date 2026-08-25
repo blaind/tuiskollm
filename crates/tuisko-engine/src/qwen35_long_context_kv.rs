@@ -212,6 +212,38 @@ impl Qwen35LongContextKvProgram {
         [self.arena.base_address() as usize, host[0], host[1]]
     }
 
+    #[cfg(feature = "qualification")]
+    /// Reads one complete physical K/V page from every attention layer.
+    pub fn qualification_cache_page(
+        &self,
+        stream: &CudaStream,
+        physical_page: usize,
+    ) -> EngineResult<(Vec<u16>, Vec<u16>)> {
+        if physical_page >= self.layout.physical_pages() {
+            return Err(EngineError::route(format!(
+                "Qwen3.5 physical KV page {physical_page} is outside 0..{}",
+                self.layout.physical_pages()
+            )));
+        }
+        let mut key = Vec::new();
+        let mut value = Vec::new();
+        for layer in self.layout.layers() {
+            let page_values = layer.key.len() / self.layout.physical_pages();
+            let start = physical_page
+                .checked_mul(page_values)
+                .ok_or_else(|| EngineError::layout("Qwen3.5 KV page offset overflows"))?;
+            key.extend(
+                self.arena
+                    .copy_slice_to_host(stream, layer.key, start, page_values)?,
+            );
+            value.extend(
+                self.arena
+                    .copy_slice_to_host(stream, layer.value, start, page_values)?,
+            );
+        }
+        Ok((key, value))
+    }
+
     fn upload_update(&self, stream: &CudaStream, update: PagedKvTableUpdate) -> EngineResult<()> {
         self.upload_entries(
             stream,

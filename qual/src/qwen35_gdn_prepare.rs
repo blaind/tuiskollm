@@ -12,6 +12,7 @@ use tuisko_model::{Arch, Qwen35_9B};
 pub(crate) const MAX_BATCH: usize = 8;
 pub(crate) const MAX_ROWS: usize = 128;
 pub(crate) const EXACT_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, MAX_BATCH, 32, 64, MAX_ROWS];
+pub(crate) const CAUSAL_ROUTES: [usize; 3] = [2, 3, 4];
 const ALIGNMENT: usize = 256;
 pub(crate) const CONTROL_ROWS: usize = Qwen35_9B::GDN_CONTROL_ROWS;
 pub(crate) const CONTROL_STRIDE: usize = 128;
@@ -164,7 +165,7 @@ pub fn qualify_qwen35_gdn_prepare()
         reset_state(&arena, &stream, regions, &fixture)?;
         launch(&op, &arena, &stream, regions, rows)?;
         let eager = observe(&arena, &stream, regions)?;
-        verify_oracle(rows, &fixture, &eager, &mut report)?;
+        verify_oracle(rows, false, &fixture, &eager, &mut report)?;
 
         reset_state(&arena, &stream, regions, &fixture)?;
         stream.synchronize().map_err(GpuError::from)?;
@@ -179,6 +180,22 @@ pub fn qualify_qwen35_gdn_prepare()
                 "device addresses changed while qualifying row count {rows}"
             )));
         }
+    }
+    for rows in CAUSAL_ROUTES {
+        reset_state(&arena, &stream, regions, &fixture)?;
+        launch_causal(&op, &arena, &stream, regions, rows)?;
+        let eager = observe(&arena, &stream, regions)?;
+        verify_oracle(rows, true, &fixture, &eager, &mut report)?;
+
+        reset_state(&arena, &stream, regions, &fixture)?;
+        stream.synchronize().map_err(GpuError::from)?;
+        let graph = CudaGraph::capture(&stream, || {
+            launch_causal(&op, &arena, &stream, regions, rows)
+        })?;
+        // SAFETY: every captured allocation remains live through synchronized replay.
+        unsafe { graph.launch(&stream) }?;
+        let replay = observe(&arena, &stream, regions)?;
+        verify_replay(rows, &eager, &replay, &mut report)?;
     }
 
     verify_immutable(&arena, &stream, regions, &fixture, &mut report)?;
@@ -341,6 +358,31 @@ pub(crate) fn launch(
     }
 }
 
+fn launch_causal(
+    op: &Qwen35GdnPrepareOp,
+    arena: &DeviceArena,
+    stream: &CudaStream,
+    regions: Regions,
+    rows: usize,
+) -> GpuResult<()> {
+    unsafe {
+        op.launch_causal(
+            stream,
+            rows,
+            arena.address(regions.projected_controls)?,
+            arena.address(regions.a_log)?,
+            arena.address(regions.dt_bias)?,
+            arena.address(regions.projected)?,
+            arena.address(regions.convolution_weights)?,
+            arena.address(regions.state_rows)?,
+            arena.address(regions.history)?,
+            arena.address(regions.log_decay)?,
+            arena.address(regions.beta)?,
+            arena.address(regions.convolved)?,
+        )
+    }
+}
+
 fn observe(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuResult<Observed> {
     Ok(Observed {
         log_decay: arena.copy_to_host(stream, regions.log_decay)?,
@@ -352,12 +394,13 @@ fn observe(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuRes
 
 fn verify_oracle(
     rows: usize,
+    causal: bool,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut Qwen35GdnPrepareQualification,
 ) -> Result<(), Qwen35GdnPrepareQualificationError> {
     verify_controls(rows, fixture, observed, report)?;
-    verify_convolution(rows, fixture, observed, report)?;
+    verify_convolution(rows, causal, fixture, observed, report)?;
     verify_inactive(rows, observed)?;
 
     report.control_values += rows * 2 * CONTROL_ROWS;
@@ -405,16 +448,17 @@ fn verify_controls(
 
 fn verify_convolution(
     rows: usize,
+    causal: bool,
     fixture: &Fixture,
     observed: &Observed,
     report: &mut Qwen35GdnPrepareQualification,
 ) -> Result<(), Qwen35GdnPrepareQualificationError> {
     let mut expected_history = fixture.history.clone();
     for token in 0..rows {
-        let state_row = if rows <= MAX_BATCH {
-            STATE_ROWS[token]
-        } else {
+        let state_row = if causal || rows > MAX_BATCH {
             STATE_ROWS[0]
+        } else {
+            STATE_ROWS[token]
         };
         for channel in 0..QKV_ROWS {
             let history_base = (state_row as usize * QKV_ROWS + channel) * HISTORY_TAPS;
@@ -570,6 +614,9 @@ fn verify_no_post_warmup_allocation(
     let graphs = EXACT_ROUTES
         .iter()
         .map(|&rows| CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows)))
+        .chain(CAUSAL_ROUTES.iter().map(|&rows| {
+            CudaGraph::capture(stream, || launch_causal(op, arena, stream, regions, rows))
+        }))
         .collect::<GpuResult<Vec<_>>>()?;
     for graph in &graphs {
         // SAFETY: the qualification harness retains every captured allocation through this synchronized replay.
@@ -614,19 +661,21 @@ mod tests {
     fn exact_routes_match_independent_oracles_and_graph_replay()
     -> Result<(), Qwen35GdnPrepareQualificationError> {
         let report = qualify_qwen35_gdn_prepare()?;
-        let active_rows = EXACT_ROUTES.iter().sum::<usize>();
+        let active_rows = EXACT_ROUTES.iter().chain(&CAUSAL_ROUTES).sum::<usize>();
         let inactive_rows = EXACT_ROUTES
             .iter()
+            .chain(&CAUSAL_ROUTES)
             .map(|rows| MAX_ROWS - rows)
             .sum::<usize>();
         let complete_history = MAX_BATCH * QKV_ROWS * HISTORY_TAPS;
+        let routes = EXACT_ROUTES.len() + CAUSAL_ROUTES.len();
 
         assert_eq!(report.control_values, active_rows * 2 * CONTROL_ROWS);
         assert_eq!(report.convolution_values, active_rows * QKV_ROWS);
-        assert_eq!(report.history_values, EXACT_ROUTES.len() * complete_history);
+        assert_eq!(report.history_values, routes * complete_history);
         assert_eq!(
             report.graph_replay_values,
-            active_rows * (2 * CONTROL_ROWS + QKV_ROWS) + EXACT_ROUTES.len() * complete_history
+            active_rows * (2 * CONTROL_ROWS + QKV_ROWS) + routes * complete_history
         );
         assert_eq!(
             report.inactive_values,
@@ -649,8 +698,8 @@ mod tests {
     -> Result<(), Qwen36GdnPrepareQualificationError> {
         let report = qualify_qwen36_gdn_prepare()?;
 
-        assert_eq!(report.control_values, 16_640);
-        assert_eq!(report.convolution_values, 2_129_920);
+        assert_eq!(report.control_values, 17_216);
+        assert_eq!(report.convolution_values, 2_203_648);
         assert_eq!(report.arena_bytes, 5_767_936);
         assert_eq!(report.weight_bytes, 65_664);
         assert!(report.maximum_control_error <= 0.002);

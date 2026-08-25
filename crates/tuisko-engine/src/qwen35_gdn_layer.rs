@@ -423,6 +423,11 @@ impl Qwen35GdnLayerProgram {
         Ok(())
     }
 
+    /// Selects one physical state row for an exact causal verification route.
+    pub(crate) fn load_verify_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        self.load_prefill_slot(stream, slot)
+    }
+
     /// Clears one physical slot's causal history and recurrent state.
     pub fn reset_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
         require_slot(slot)?;
@@ -539,6 +544,29 @@ impl Qwen35GdnLayerProgram {
         pointers.residual_input = input;
         require_rows(rows).map_err(|error| GpuError::invalid_launch(error.to_string()))?;
         launch_route(
+            stream,
+            rows,
+            self.ops(),
+            pointers,
+            launch_divisors(self.scale_divisors),
+        )?;
+
+        Ok(pointers.residual_output.cast_const())
+    }
+
+    /// Launches one causal target-verification route from another retained residual plane.
+    ///
+    /// # Safety
+    /// `input` covers `rows * 4,096` BF16 values in this CUDA context.
+    pub(crate) unsafe fn launch_verify_from(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        input: *const u16,
+    ) -> GpuResult<*const u16> {
+        let mut pointers = Pointers::bind(&self.arena, self.layout.regions())?;
+        pointers.residual_input = input;
+        launch_verify_route(
             stream,
             rows,
             self.ops(),
@@ -938,6 +966,50 @@ fn launch_route(
     pointers: Pointers,
     divisors: Divisors,
 ) -> GpuResult<()> {
+    launch_route_kind(
+        stream,
+        rows,
+        ops,
+        pointers,
+        divisors,
+        if rows <= MAX_BATCH {
+            RouteKind::Decode
+        } else {
+            RouteKind::Prefill
+        },
+    )
+}
+
+fn launch_verify_route(
+    stream: &CudaStream,
+    rows: usize,
+    ops: Ops<'_>,
+    pointers: Pointers,
+    divisors: Divisors,
+) -> GpuResult<()> {
+    if !(1..=4).contains(&rows) {
+        return Err(GpuError::invalid_launch(format!(
+            "Qwen3.5 GDN verification row count {rows} is outside 1..=4"
+        )));
+    }
+    launch_route_kind(stream, rows, ops, pointers, divisors, RouteKind::Verify)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RouteKind {
+    Decode,
+    Verify,
+    Prefill,
+}
+
+fn launch_route_kind(
+    stream: &CudaStream,
+    rows: usize,
+    ops: Ops<'_>,
+    pointers: Pointers,
+    divisors: Divisors,
+    kind: RouteKind,
+) -> GpuResult<()> {
     // SAFETY: one arena owns aligned, disjoint 128-row working planes and
     // eight persistent state slots. Prompt leaves advance state row zero
     // causally; every leaf selects the same exact row count.
@@ -949,7 +1021,7 @@ fn launch_route(
             pointers.input_norm,
             pointers.mixer_normalized,
         )?;
-        if rows <= MAX_BATCH {
+        if kind != RouteKind::Prefill {
             ops.input.launch(
                 stream,
                 rows,
@@ -981,33 +1053,62 @@ fn launch_route(
                 pointers.projected_controls,
             )?;
         }
-        ops.prepare.launch(
-            stream,
-            rows,
-            pointers.projected_controls,
-            pointers.a_log,
-            pointers.dt_bias,
-            pointers.projected,
-            pointers.convolution_weights,
-            pointers.state_rows,
-            pointers.history,
-            pointers.log_decay,
-            pointers.beta,
-            pointers.convolved,
-        )?;
-        ops.recurrence.launch(
-            stream,
-            rows,
-            pointers.convolved,
-            pointers.projected,
-            pointers.log_decay,
-            pointers.beta,
-            pointers.recurrent_norm,
-            pointers.state_rows,
-            pointers.state,
-            pointers.recurrent_output,
-        )?;
-        if rows <= MAX_BATCH {
+        if kind == RouteKind::Verify {
+            ops.prepare.launch_causal(
+                stream,
+                rows,
+                pointers.projected_controls,
+                pointers.a_log,
+                pointers.dt_bias,
+                pointers.projected,
+                pointers.convolution_weights,
+                pointers.state_rows,
+                pointers.history,
+                pointers.log_decay,
+                pointers.beta,
+                pointers.convolved,
+            )?;
+            ops.recurrence.launch_causal(
+                stream,
+                rows,
+                pointers.convolved,
+                pointers.projected,
+                pointers.log_decay,
+                pointers.beta,
+                pointers.recurrent_norm,
+                pointers.state_rows,
+                pointers.state,
+                pointers.recurrent_output,
+            )?;
+        } else {
+            ops.prepare.launch(
+                stream,
+                rows,
+                pointers.projected_controls,
+                pointers.a_log,
+                pointers.dt_bias,
+                pointers.projected,
+                pointers.convolution_weights,
+                pointers.state_rows,
+                pointers.history,
+                pointers.log_decay,
+                pointers.beta,
+                pointers.convolved,
+            )?;
+            ops.recurrence.launch(
+                stream,
+                rows,
+                pointers.convolved,
+                pointers.projected,
+                pointers.log_decay,
+                pointers.beta,
+                pointers.recurrent_norm,
+                pointers.state_rows,
+                pointers.state,
+                pointers.recurrent_output,
+            )?;
+        }
+        if kind != RouteKind::Prefill {
             ops.output.launch(
                 stream,
                 rows,
@@ -1040,7 +1141,7 @@ fn launch_route(
             pointers.mixer_residual,
             pointers.mlp_normalized,
         )?;
-        if rows <= MAX_BATCH {
+        if kind != RouteKind::Prefill {
             ops.swiglu.launch(
                 stream,
                 rows,
