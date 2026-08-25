@@ -819,6 +819,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen36-attention-qk-prepare") if remaining.is_empty() => {
             qualify_qwen36_attention_qk_prepare(root)
         }
+        Some("qualify-qwen36-fp8-attention-qk-prepare") if remaining.is_empty() => {
+            qualify_qwen36_fp8_attention_qk_prepare(root)
+        }
         Some("qualify-fp8-qkv") if remaining.is_empty() => qualify_fp8_qkv(root),
         Some("qualify-fp8-gdn-input") if remaining.is_empty() => qualify_fp8_gdn_input(root),
         Some("qualify-fp8-lm-head") if remaining.is_empty() => qualify_fp8_lm_head(root),
@@ -1062,6 +1065,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-qwen35-mtp-bf16-attention"
                     | "qualify-qwen35-mtp-bf16-mlp"
                     | "qualify-qwen36-attention-qk-prepare"
+                    | "qualify-qwen36-fp8-attention-qk-prepare"
                     | "qualify-qwen35-nvfp4-attention-output"
                     | "qualify-qwen35-gdn-prepare"
                     | "qualify-qwen35-gdn-recurrence"
@@ -2929,7 +2933,7 @@ fn qualify_qwen36_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>
             "--release",
             "--lib",
             "--",
-            "attention_qk_prepare::tests::qwen36_",
+            "attention_qk_prepare::tests::qwen36_exact_",
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -2951,11 +2955,56 @@ fn qualify_qwen36_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>
             "--release",
             "--lib",
             "--",
-            "attention_qk_prepare_benchmark::tests::qwen36_",
+            "attention_qk_prepare_benchmark::tests::qwen36_bf16_",
             "--nocapture",
         ],
     )?;
     gate_qwen36_attention_qk_prepare(root)
+}
+
+fn qualify_qwen36_fp8_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "attention_qk_prepare::tests::qwen36_fp8_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "attention_qk_prepare_benchmark::tests::qwen36_fp8_",
+            "--nocapture",
+        ],
+    )
 }
 
 fn qualify_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
