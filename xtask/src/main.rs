@@ -36,6 +36,8 @@ const QWEN35_MTP_GENERATION_TEST_FILTER: &str = "qwen35_mtp_generation_suite_";
 const QWEN35_MTP_BATCH_GENERATION_TEST_FILTER: &str = "qwen35_mtp_batch_generation_suite_";
 const QWEN36_MTP_LAYER_TEST_FILTER: &str = "qwen36_mtp_layer_suite_";
 const QWEN36_LONG_CONTEXT_KV_TEST_FILTER: &str = "qwen36_long_context_kv::tests";
+const MTP_BF16_PAGED_GQA_BENCHMARK_FILTER: &str =
+    "bf16_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_";
 const QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen36-residual-norm-sm120.txt";
 const QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt";
@@ -3677,7 +3679,7 @@ fn qualify_mtp_bf16_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             "--release",
             "--lib",
             "--",
-            "qwen35_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_",
+            MTP_BF16_PAGED_GQA_BENCHMARK_FILTER,
             "--nocapture",
         ],
     )?;
@@ -14945,12 +14947,13 @@ fn require_uniform_value(
 mod tests {
     use super::{
         COMPOSED_PERFORMANCE_SUITES, MAX_IDLE_DEVICE_MEMORY_MIB, MTP_LAYER_RESOURCE_BASELINES,
-        OptimizationSuite, PERFORMANCE_SUITES, PerformanceSuite,
-        QWEN35_LONG_CONTEXT_KV_TEST_FILTER, QWEN35_MTP_BATCH_GENERATION_TEST_FILTER,
-        QWEN35_MTP_GENERATION_TEST_FILTER, QWEN35_RESIDENT_MODEL_TEST_FILTER,
-        QWEN35_RESIDENT_MTP_TEST_FILTER, QWEN35_RESIDUAL_NORM_TEST_FILTER,
-        QWEN35_TEXT_ENDPOINT_TEST_FILTER, QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
-        QWEN36_MTP_LAYER_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
+        MTP_BF16_PAGED_GQA_BENCHMARK_FILTER, OptimizationSuite, PERFORMANCE_SUITES,
+        PerformanceSuite, QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
+        QWEN35_MTP_BATCH_GENERATION_TEST_FILTER, QWEN35_MTP_GENERATION_TEST_FILTER,
+        QWEN35_RESIDENT_MODEL_TEST_FILTER, QWEN35_RESIDENT_MTP_TEST_FILTER,
+        QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN35_TEXT_ENDPOINT_TEST_FILTER,
+        QWEN36_LONG_CONTEXT_KV_TEST_FILTER, QWEN36_MTP_LAYER_TEST_FILTER,
+        QWEN36_RESIDENT_MODEL_TEST_FILTER,
         SM120_RESOURCE_BASELINES, device_is_idle, parse_baseline, parse_compute_pids,
         parse_cuda_toolkit_identity, parse_entries, parse_performance_device_sample,
         parse_performance_iteration, parse_resources, parse_rustc_identity,
@@ -15071,6 +15074,16 @@ mod tests {
             "qwen36_long_context_kv::tests::qwen36_long_context_kv_suite_lifecycle_is_address_stable",
         ] {
             assert!(test.contains(QWEN36_LONG_CONTEXT_KV_TEST_FILTER));
+        }
+    }
+
+    #[test]
+    fn mtp_paged_gqa_benchmark_filter_selects_both_accounting_tests() {
+        for test in [
+            "bf16_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_byte_accounting_covers_every_query_head_cache_read",
+            "bf16_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_arena_accounting_exposes_every_padding_byte",
+        ] {
+            assert!(test.contains(MTP_BF16_PAGED_GQA_BENCHMARK_FILTER));
         }
     }
 
