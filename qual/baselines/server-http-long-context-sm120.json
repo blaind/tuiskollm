@@ -1,0 +1,454 @@
+{
+  "schema_version": 1,
+  "suite": "server-http",
+  "model": "unsloth/Qwen3.8-27B-NVFP4",
+  "checkpoint_revision": "16b6615af3548b88e2d8e382457bc705b00479cf",
+  "device": "NVIDIA GeForce RTX 5090",
+  "driver": "580.173.02",
+  "compute_capability": "12.0",
+  "blessed_server_binary_sha256": "ecd0de40f6b8a716bc34e1ab9af0497048a6a911f8ef51a65bc1460491671ac8",
+  "long_context_enabled": true,
+  "minimum_samples_per_case": 5,
+  "loaded_sm_clock_band_mhz": {
+    "minimum": 2107,
+    "maximum": 2212
+  },
+  "loaded_memory_clock_band_mhz": {
+    "minimum": 13751,
+    "maximum": 13851
+  },
+  "measurement_sm_clock_band_mhz": {
+    "minimum": 2107,
+    "maximum": 2212
+  },
+  "measurement_memory_clock_band_mhz": {
+    "minimum": 13751,
+    "maximum": 13851
+  },
+  "device_total_memory_mib": 32607,
+  "resident_memory_reference_mib": 30556,
+  "resident_memory_tolerance_mib": 16,
+  "resident_memory_enforced": true,
+  "metrics": [
+    {
+      "case": "blocking/external-concurrency-1",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 9.000768248197769,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-1",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 888.8130189999999,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-2",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.700637743369358,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-2",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 1838.945658,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-3",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.714609841438088,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-3",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 2753.995926,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-4",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.824612322281446,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-4",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 3626.221621,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-5",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.744773872814454,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-5",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 4574.160588,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-6",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.73504384473549,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-6",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 5495.1069339999995,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-7",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.829911098304349,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-7",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 6342.079708,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-8",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 8.871051759156966,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "blocking/external-concurrency-8",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 7214.477126000001,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/full-prefix",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 11.355372284994644,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "stream/full-prefix",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 440.320218,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/full-prefix",
+      "metric": "mean_intertoken_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 0.0013200000000068712,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/full-prefix",
+      "metric": "ttft_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 440.3111679999999,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-16384",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 0.4194532559607453,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-16384",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 9536.223508,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-16384",
+      "metric": "mean_intertoken_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 9.753318333333178,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-16384",
+      "metric": "ttft_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 9506.960873,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-178000",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 0.02765003287702136,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-178000",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 144665.289108,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-178000",
+      "metric": "mean_intertoken_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 96.9877943333316,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-178000",
+      "metric": "ttft_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 144398.058553,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-4096",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 1.3779135899323107,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-4096",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 2902.939654,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-4096",
+      "metric": "mean_intertoken_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 3.590613,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-4096",
+      "metric": "ttft_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 2892.3946969999997,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-65536",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 0.09677144122422192,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-65536",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 41334.508915,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-65536",
+      "metric": "mean_intertoken_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 36.280193666668005,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/long-context-65536",
+      "metric": "ttft_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 41224.284772,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/low-reuse-256",
+      "metric": "completion_throughput_median",
+      "unit": "tokens_per_second",
+      "direction": "higher_is_better",
+      "reference": 26.452228676977494,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 1.0,
+      "enforced": true
+    },
+    {
+      "case": "stream/low-reuse-256",
+      "metric": "e2e_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 1209.727936,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/low-reuse-256",
+      "metric": "mean_intertoken_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 13.08391380645162,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "stream/low-reuse-256",
+      "metric": "ttft_median",
+      "unit": "ms",
+      "direction": "lower_is_better",
+      "reference": 801.241357,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.5,
+      "enforced": true
+    },
+    {
+      "case": "suite",
+      "metric": "above_idle_energy_per_completion_token",
+      "unit": "joules_per_token",
+      "direction": "lower_is_better",
+      "reference": 139.2272053969269,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.01,
+      "enforced": true
+    },
+    {
+      "case": "suite",
+      "metric": "whole_board_energy_per_completion_token",
+      "unit": "joules_per_token",
+      "direction": "lower_is_better",
+      "reference": 183.85823551394716,
+      "relative_tolerance_percent": 15.0,
+      "absolute_tolerance": 0.01,
+      "enforced": true
+    }
+  ]
+}
