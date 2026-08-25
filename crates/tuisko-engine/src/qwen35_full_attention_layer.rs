@@ -1,8 +1,8 @@
 //! Resident source-backed Qwen3.5 full-attention layer.
 
 use crate::qwen35_full_attention_layer_layout::{
-    QWEN35_ATTENTION_MAX_ROWS, QWEN35_CONTEXT_CAPACITY, QWEN35_PREFILL_CONTEXT_CAPACITY,
-    QWEN35_PREFILL_TABLE_STRIDE, QWEN35_TABLE_STRIDE, Qwen35FullAttentionLayerRegions,
+    QWEN35_ATTENTION_MAX_ROWS, QWEN35_CONTEXT_CAPACITY, QWEN35_PREFILL_TABLE_STRIDE,
+    QWEN35_TABLE_STRIDE, Qwen35FullAttentionLayerRegions,
 };
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen35FullAttentionLayerLayout};
 use std::sync::Arc;
@@ -91,6 +91,7 @@ struct Pointers {
     next_norm: *const u16,
     residual_output: *mut u16,
     next_normalized: *mut u16,
+    prefill_block_tables: *const u32,
 }
 
 impl Pointers {
@@ -144,6 +145,7 @@ impl Pointers {
             next_norm: arena.address(regions.next_norm)?.cast_const(),
             residual_output: arena.address(regions.residual_output)?,
             next_normalized: arena.address(regions.next_normalized)?,
+            prefill_block_tables: arena.address(regions.prefill_block_tables)?.cast_const(),
         };
         if pointers.up_weight_codes.addr()
             != pointers.gate_weight_codes.addr() + regions.gate_weight_codes.byte_len()
@@ -207,6 +209,7 @@ impl Pointers {
             self.next_norm.addr(),
             self.residual_output.addr(),
             self.next_normalized.addr(),
+            self.prefill_block_tables.addr(),
         ]
     }
 }
@@ -314,6 +317,11 @@ impl Qwen35FullAttentionLayerProgram {
         )?;
         arena.copy_from_host(
             &stream,
+            regions.prefill_block_tables,
+            &prefill_block_tables(),
+        )?;
+        arena.copy_from_host(
+            &stream,
             regions.table_rows,
             &(0..MAX_BATCH as u32).collect::<Vec<_>>(),
         )?;
@@ -412,11 +420,24 @@ impl Qwen35FullAttentionLayerProgram {
         rope_cos: &[f32],
         rope_sin: &[f32],
     ) -> EngineResult<()> {
+        self.load_prefill_slot_state(stream, tokens, 0, rope_cos, rope_sin)
+    }
+
+    /// Loads one from-empty causal prompt tile into one physical cache slot.
+    pub fn load_prefill_slot_state(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        slot: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
         if prefill_index(tokens).is_none() {
             return Err(EngineError::route(format!(
                 "Qwen3.5 full-attention prefill tokens {tokens} are outside 32,64,128"
             )));
         }
+        require_slot(slot)?;
         let rotary_values = product(
             "Qwen3.5 attention prefill rotary values",
             tokens,
@@ -427,15 +448,15 @@ impl Qwen35FullAttentionLayerProgram {
                 "Qwen3.5 attention prefill rotary planes must each have {rotary_values} values for T={tokens}"
             )));
         }
-        if tokens > QWEN35_PREFILL_CONTEXT_CAPACITY {
+        if tokens > QWEN35_CONTEXT_CAPACITY {
             return Err(EngineError::route(format!(
-                "Qwen3.5 attention prefill T={tokens} exceeds the {QWEN35_PREFILL_CONTEXT_CAPACITY}-token shared cache"
+                "Qwen3.5 attention prefill T={tokens} exceeds the {QWEN35_CONTEXT_CAPACITY}-token slot capacity"
             )));
         }
 
         let positions = (0..tokens as u32).collect::<Vec<_>>();
         let lengths = (1..=tokens as u32).collect::<Vec<_>>();
-        let table_rows = vec![0u32; tokens];
+        let table_rows = vec![slot as u32; tokens];
         let regions = self.layout.regions();
         self.arena
             .copy_prefix_from_host(stream, regions.prefill_table_rows, &table_rows)?;
@@ -447,6 +468,18 @@ impl Qwen35FullAttentionLayerProgram {
             .copy_prefix_from_host(stream, regions.prefill_rope_cos, rope_cos)?;
         self.arena
             .copy_prefix_from_host(stream, regions.prefill_rope_sin, rope_sin)?;
+
+        Ok(())
+    }
+
+    /// Maps compact decode rows to distinct physical cache slots.
+    pub fn load_slot_routes(&self, stream: &CudaStream, slots: &[usize]) -> EngineResult<()> {
+        let rows = slot_rows(slots)?;
+        self.arena.copy_prefix_from_host(
+            stream,
+            self.layout.regions().table_rows,
+            &rows[..slots.len()],
+        )?;
 
         Ok(())
     }
@@ -528,6 +561,16 @@ impl Qwen35FullAttentionLayerProgram {
         let regions = self.layout.regions();
         self.arena.fill(stream, regions.key_pages, 0)?;
         self.arena.fill(stream, regions.value_pages, 0)?;
+
+        Ok(())
+    }
+
+    /// Clears one physical slot's represented key/value cache pages.
+    pub fn reset_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        require_slot(slot)?;
+        let regions = self.layout.regions();
+        fill_slot(&self.arena, stream, regions.key_pages, slot)?;
+        fill_slot(&self.arena, stream, regions.value_pages, slot)?;
 
         Ok(())
     }
@@ -781,6 +824,9 @@ impl Qwen35FullAttentionLayerProgram {
                 .arena
                 .copy_to_host(stream, regions.qkv_activation_scales)?,
             qkv: self.arena.copy_to_host(stream, regions.qkv)?,
+            block_tables: self.arena.copy_to_host(stream, regions.block_tables)?,
+            table_rows: self.arena.copy_to_host(stream, regions.table_rows)?,
+            cache_positions: self.arena.copy_to_host(stream, regions.cache_positions)?,
             prefill_rope_cos: self.arena.copy_to_host(stream, regions.prefill_rope_cos)?,
             prefill_rope_sin: self.arena.copy_to_host(stream, regions.prefill_rope_sin)?,
             prefill_table_rows: self
@@ -883,6 +929,12 @@ pub struct Qwen35FullAttentionLayerObservables {
     pub qkv_activation_scales: Vec<u8>,
     /// Fused query/gate, key, and value projection rows.
     pub qkv: Vec<u16>,
+    /// Decode physical-page lookup table.
+    pub block_tables: Vec<u32>,
+    /// Physical cache-table row selected by each compact token row.
+    pub table_rows: Vec<u32>,
+    /// Cache append position selected by each compact token row.
+    pub cache_positions: Vec<u32>,
     /// Prompt MRoPE cosine values.
     pub prefill_rope_cos: Vec<f32>,
     /// Prompt MRoPE sine values.
@@ -1034,11 +1086,12 @@ fn launch_route(
     pointers: Pointers,
     divisors: Divisors,
 ) -> GpuResult<()> {
-    let (rope_cos, rope_sin, table_rows, cache_positions, lengths, table_stride) =
+    let (rope_cos, rope_sin, block_tables, table_rows, cache_positions, lengths, table_stride) =
         if rows <= MAX_BATCH {
             (
                 pointers.rope_cos,
                 pointers.rope_sin,
+                pointers.block_tables,
                 pointers.table_rows,
                 pointers.cache_positions,
                 pointers.lengths,
@@ -1048,6 +1101,7 @@ fn launch_route(
             (
                 pointers.prefill_rope_cos,
                 pointers.prefill_rope_sin,
+                pointers.prefill_block_tables,
                 pointers.prefill_table_rows,
                 pointers.prefill_cache_positions,
                 pointers.prefill_lengths,
@@ -1055,8 +1109,9 @@ fn launch_route(
             )
         };
     // SAFETY: one arena owns aligned, disjoint 128-row working planes. Decode
-    // uses three-page slot rows; prefill uses one shared 24-page row. Every
-    // leaf selects the same exact row count and retains its qualified arithmetic.
+    // uses three-page decode rows and prefill selects an isolated 24-entry
+    // table row whose first three entries name the same slot pages. T=128
+    // needs only two pages, so slot isolation changes no arithmetic order.
     unsafe {
         ops.norm.launch_plain(
             stream,
@@ -1097,7 +1152,7 @@ fn launch_route(
             pointers.key_norm,
             rope_cos,
             rope_sin,
-            pointers.block_tables,
+            block_tables,
             table_rows,
             table_stride,
             cache_positions,
@@ -1111,7 +1166,7 @@ fn launch_route(
             pointers.query,
             pointers.key_pages,
             pointers.value_pages,
-            pointers.block_tables,
+            block_tables,
             table_rows,
             table_stride,
             lengths,
@@ -1226,6 +1281,60 @@ fn require_batch(batch: usize) -> EngineResult<()> {
     Ok(())
 }
 
+fn prefill_block_tables() -> Vec<u32> {
+    let mut tables = vec![0; MAX_BATCH * QWEN35_PREFILL_TABLE_STRIDE];
+    for slot in 0..MAX_BATCH {
+        for logical_page in 0..QWEN35_TABLE_STRIDE {
+            tables[slot * QWEN35_PREFILL_TABLE_STRIDE + logical_page] =
+                (slot * QWEN35_TABLE_STRIDE + logical_page) as u32;
+        }
+    }
+    tables
+}
+
+fn slot_rows(slots: &[usize]) -> EngineResult<[u32; MAX_BATCH]> {
+    require_batch(slots.len())?;
+    let mut seen = [false; MAX_BATCH];
+    let mut rows = [0u32; MAX_BATCH];
+    for (row, &slot) in rows.iter_mut().zip(slots) {
+        require_slot(slot)?;
+        if std::mem::replace(&mut seen[slot], true) {
+            return Err(EngineError::route(format!(
+                "Qwen3.5 physical slot {slot} appears more than once"
+            )));
+        }
+        *row = slot as u32;
+    }
+    Ok(rows)
+}
+
+fn require_slot(slot: usize) -> EngineResult<()> {
+    if slot >= MAX_BATCH {
+        return Err(EngineError::route(format!(
+            "Qwen3.5 physical slot {slot} is outside 0..{MAX_BATCH}"
+        )));
+    }
+    Ok(())
+}
+
+fn fill_slot<T: tuisko_gpu::DeviceCopy>(
+    arena: &DeviceArena,
+    stream: &CudaStream,
+    region: tuisko_gpu::ArenaRegion<T>,
+    slot: usize,
+) -> EngineResult<()> {
+    if !region.len().is_multiple_of(MAX_BATCH) {
+        return Err(EngineError::layout(format!(
+            "Qwen3.5 persistent region of {} values is not divisible by {MAX_BATCH} slots",
+            region.len()
+        )));
+    }
+    let width = region.len() / MAX_BATCH;
+    let start = product("Qwen3.5 persistent slot offset", slot, width)?;
+    arena.fill_slice(stream, region, start, width, 0)?;
+    Ok(())
+}
+
 fn prefill_index(rows: usize) -> Option<usize> {
     match rows {
         32 => Some(0),
@@ -1260,7 +1369,10 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, ROTARY_PAIRS, prefill_index, require_batch, require_rows};
+    use super::{
+        MAX_BATCH, QWEN35_PREFILL_TABLE_STRIDE, QWEN35_TABLE_STRIDE, ROTARY_PAIRS,
+        prefill_block_tables, prefill_index, require_batch, require_rows, slot_rows,
+    };
 
     #[test]
     fn exact_batch_table_rejects_every_uncompiled_route() {
@@ -1269,6 +1381,33 @@ mod tests {
         }
         assert_eq!(MAX_BATCH, 8);
         assert_eq!(ROTARY_PAIRS, 32);
+    }
+
+    #[test]
+    fn compact_cache_slot_table_is_bijective() {
+        assert_eq!(slot_rows(&[6, 2, 7]).unwrap()[..3], [6, 2, 7]);
+        for slots in [
+            &[][..],
+            &[1, 1],
+            &[0, MAX_BATCH],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 0],
+        ] {
+            assert!(slot_rows(slots).is_err(), "slots={slots:?}");
+        }
+    }
+
+    #[test]
+    fn prefill_tables_name_each_decode_slots_pages() {
+        let tables = prefill_block_tables();
+        for slot in 0..MAX_BATCH {
+            for logical_page in 0..QWEN35_TABLE_STRIDE {
+                let expected = (slot * QWEN35_TABLE_STRIDE + logical_page) as u32;
+                assert_eq!(
+                    tables[slot * QWEN35_PREFILL_TABLE_STRIDE + logical_page],
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

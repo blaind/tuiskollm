@@ -133,10 +133,10 @@ pub fn qualify_qwen35_full_attention_layer(
         Qwen35FullAttentionLayerProgram::from_snapshot(&context, snapshot.clone(), SOURCE_LAYER)?;
     let stable_base = program.base_address();
     let stable_addresses = program.qualification_addresses()?;
-    if stable_addresses.len() != 48 {
+    if stable_addresses.len() != 49 {
         return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
             format!(
-                "Qwen3.5 owner exposes {} addresses, expected 48",
+                "Qwen3.5 owner exposes {} addresses, expected 49",
                 stable_addresses.len()
             ),
         ));
@@ -184,7 +184,14 @@ pub fn qualify_qwen35_full_attention_layer(
 
         verify_boundaries(rows, &input, bindings, &replay, &mut report)?;
         verify_activation_quantization(rows, &materialized, &replay, &mut report)?;
-        verify_qk_prepare(rows, bindings, &fixture, &replay, &mut report)?;
+        verify_qk_prepare(rows, bindings, &fixture, None, 0, &replay, &mut report).map_err(
+            |error| {
+                Qwen35FullAttentionLayerQualificationError::Mismatch(format!(
+                    "{} graph Q/K oracle: {error}",
+                    route_name(rows)
+                ))
+            },
+        )?;
         if rows == 1 {
             verify_source_formula(bindings, &materialized, &replay, &mut report)?;
         }
@@ -204,6 +211,8 @@ pub fn qualify_qwen35_full_attention_layer(
             ));
         }
     }
+
+    verify_slot_routing(&program, &stream, bindings, &fixture, &mut report)?;
 
     verify_immutable(
         &program.qualification_immutable(&stream)?,
@@ -294,6 +303,126 @@ fn prepare_run(
         )?;
     }
     program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+
+    Ok(())
+}
+
+fn verify_slot_routing(
+    program: &Qwen35FullAttentionLayerProgram,
+    stream: &CudaStream,
+    bindings: SourceBindings<'_>,
+    fixture: &Fixture,
+    report: &mut Qwen35FullAttentionLayerQualification,
+) -> Result<(), Qwen35FullAttentionLayerQualificationError> {
+    let decode_slots = [7usize, 2];
+    let decode_rows = decode_slots.len();
+    program.load_residual(stream, decode_rows, &make_input(decode_rows, 3))?;
+    program.load_cache(stream, &fixture.key_pages, &fixture.value_pages)?;
+    program.load_slot_routes(stream, &decode_slots)?;
+    program.load_decode_state(
+        stream,
+        decode_rows,
+        &CACHE_POSITIONS[..decode_rows],
+        &fixture.rope_cos[..decode_rows * ROTARY_PAIRS],
+        &fixture.rope_sin[..decode_rows * ROTARY_PAIRS],
+    )?;
+    program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+    program.replay(stream, decode_rows)?;
+    let decode = program.qualification_observables(stream)?;
+    compare_exact(
+        "compact decode table rows",
+        &decode.table_rows[..decode_rows],
+        &[7, 2],
+    )?;
+    verify_qk_prepare(
+        decode_rows,
+        bindings,
+        fixture,
+        Some(&decode_slots),
+        0,
+        &decode,
+        report,
+    )
+    .map_err(|error| {
+        Qwen35FullAttentionLayerQualificationError::Mismatch(format!(
+            "compact decode Q/K oracle: {error}"
+        ))
+    })?;
+
+    const PREFILL_SLOT: usize = 5;
+    const PREFILL_TOKENS: usize = 32;
+    program.load_residual(stream, PREFILL_TOKENS, &make_input(PREFILL_TOKENS, 4))?;
+    program.load_cache(stream, &fixture.key_pages, &fixture.value_pages)?;
+    program.load_prefill_slot_state(
+        stream,
+        PREFILL_TOKENS,
+        PREFILL_SLOT,
+        &fixture.prefill_rope_cos[..PREFILL_TOKENS * ROTARY_PAIRS],
+        &fixture.prefill_rope_sin[..PREFILL_TOKENS * ROTARY_PAIRS],
+    )?;
+    program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+    program.replay(stream, PREFILL_TOKENS)?;
+    let prefill = program.qualification_observables(stream)?;
+    verify_qk_prepare(
+        PREFILL_TOKENS,
+        bindings,
+        fixture,
+        None,
+        PREFILL_SLOT,
+        &prefill,
+        report,
+    )
+    .map_err(|error| {
+        Qwen35FullAttentionLayerQualificationError::Mismatch(format!(
+            "slot prefill Q/K oracle: {error}"
+        ))
+    })?;
+
+    program.load_cache(stream, &fixture.key_pages, &fixture.value_pages)?;
+    program.reset_slot(stream, PREFILL_SLOT)?;
+    let reset = program.qualification_observables(stream)?;
+    verify_reset_cache_plane(
+        "key",
+        &fixture.key_pages,
+        &reset.key_pages,
+        PREFILL_SLOT,
+        report,
+    )?;
+    verify_reset_cache_plane(
+        "value",
+        &fixture.value_pages,
+        &reset.value_pages,
+        PREFILL_SLOT,
+        report,
+    )?;
+
+    Ok(())
+}
+
+fn verify_reset_cache_plane(
+    role: &str,
+    before: &[u16],
+    after: &[u16],
+    slot: usize,
+    report: &mut Qwen35FullAttentionLayerQualification,
+) -> Result<(), Qwen35FullAttentionLayerQualificationError> {
+    let slot_values =
+        TABLE_STRIDE * Qwen35_9B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen35_9B::HEAD_DIM;
+    let begin = slot * slot_values;
+    let end = begin + slot_values;
+    for index in 0..after.len() {
+        let expected = if (begin..end).contains(&index) {
+            0
+        } else {
+            before[index]
+        };
+        if after[index] != expected {
+            return Err(Qwen35FullAttentionLayerQualificationError::Mismatch(
+                format!("reset {role} cache differs at value {index} for slot {slot}"),
+            ));
+        }
+    }
+    report.inactive_values += after.len();
 
     Ok(())
 }
@@ -554,6 +683,8 @@ fn verify_qk_prepare(
     rows: usize,
     sources: SourceBindings<'_>,
     fixture: &Fixture,
+    decode_slots: Option<&[usize]>,
+    prefill_slot: usize,
     observed: &Qwen35FullAttentionLayerObservables,
     report: &mut Qwen35FullAttentionLayerQualification,
 ) -> Result<(), Qwen35FullAttentionLayerQualificationError> {
@@ -562,13 +693,32 @@ fn verify_qk_prepare(
     let mut expected_key = fixture.key_pages.clone();
     let mut expected_value = fixture.value_pages.clone();
 
-    if rows > MAX_BATCH {
+    if rows <= MAX_BATCH {
+        compare_exact(
+            "decode block tables",
+            &observed.block_tables,
+            &(0..PHYSICAL_PAGES as u32).collect::<Vec<_>>(),
+        )?;
+        let expected_rows = (0..rows)
+            .map(|token| decode_slots.map_or(token, |slots| slots[token]) as u32)
+            .collect::<Vec<_>>();
+        compare_exact(
+            "decode table rows",
+            &observed.table_rows[..rows],
+            &expected_rows,
+        )?;
+        compare_exact(
+            "decode cache positions",
+            &observed.cache_positions[..rows],
+            &CACHE_POSITIONS[..rows],
+        )?;
+    } else {
         let positions = (0..rows as u32).collect::<Vec<_>>();
         let lengths = (1..=rows as u32).collect::<Vec<_>>();
         compare_exact(
             "prefill table rows",
             &observed.prefill_table_rows[..rows],
-            &vec![0; rows],
+            &vec![prefill_slot as u32; rows],
         )?;
         compare_exact(
             "prefill cache positions",
@@ -650,9 +800,10 @@ fn verify_qk_prepare(
 
         let position = position as usize;
         let physical_page = if rows <= MAX_BATCH {
-            token * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE
+            let slot = decode_slots.map_or(token, |slots| slots[token]);
+            slot * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE
         } else {
-            position / ATTENTION_PAGE_SIZE
+            prefill_slot * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE
         };
         let key_source = qkv_base + Qwen35_9B::ATTENTION_QUERY_ROWS;
         let value_source = key_source + Qwen35_9B::ATTENTION_KV_ROWS;
@@ -1496,13 +1647,13 @@ mod tests {
         let report = qualify_qwen35_full_attention_layer(std::path::Path::new(&root))?;
 
         assert_eq!(report.boundary_values, 5_324_800);
-        assert_eq!(report.qk_values, 1_597_440);
+        assert_eq!(report.qk_values, 1_806_336);
         assert_eq!(report.activation_values, 3_174_912);
         assert_eq!(report.source_values, 34_816);
         assert_eq!(report.weight_bytes, 117_990_400);
         assert_eq!(report.cache_bytes, 6_291_456);
-        assert_eq!(report.workspace_bytes, 21_204_672);
-        assert_eq!(report.arena_bytes, 145_487_360);
+        assert_eq!(report.workspace_bytes, 21_205_440);
+        assert_eq!(report.arena_bytes, 145_488_128);
         assert_eq!(report.padding_bytes, 832);
         assert!(report.graph_replay_values > 0);
         assert!(report.inactive_values > 0);
