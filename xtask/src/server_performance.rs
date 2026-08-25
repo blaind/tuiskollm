@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 const AUTHORITY_SCHEMA: u32 = 1;
-const BENCHMARK_SCHEMA: u32 = 1;
+const BENCHMARK_SCHEMA: u32 = 2;
 const BASELINE_SCHEMA: u32 = 1;
 const MODEL: &str = "unsloth/Qwen3.8-27B-NVFP4";
 const REVISION: &str = "16b6615af3548b88e2d8e382457bc705b00479cf";
@@ -362,6 +362,7 @@ struct Observation {
     request_count: usize,
     prompt_tokens: usize,
     cached_prompt_tokens: usize,
+    required_cached_prefix_tokens: Option<usize>,
     completion_tokens: usize,
     visible_chunks: usize,
     ttft_ms: Option<f64>,
@@ -826,12 +827,25 @@ fn validate_case(
             expected_throughput,
             "completion throughput",
         )?;
-        if expected.cache_regime == "reported full prompt reuse" {
-            if observation.cached_prompt_tokens != observation.prompt_tokens {
-                return Err("full-prefix server case did not report complete reuse".into());
+        if expected.cache_regime == "reported complete preceding-prompt reuse" {
+            let required = observation
+                .required_cached_prefix_tokens
+                .ok_or("full-prefix server case omitted its required cache floor")?;
+            if required == 0
+                || required > observation.prompt_tokens
+                || observation.cached_prompt_tokens < required
+            {
+                return Err(
+                    "full-prefix server case did not reuse its complete preceding prompt".into(),
+                );
             }
-        } else if observation.cached_prompt_tokens.saturating_mul(4) > observation.prompt_tokens {
-            return Err("low-reuse server case exceeded its 25% cached-token ceiling".into());
+        } else {
+            if observation.required_cached_prefix_tokens.is_some() {
+                return Err("low-reuse server case declared a cache floor".into());
+            }
+            if observation.cached_prompt_tokens.saturating_mul(4) > observation.prompt_tokens {
+                return Err("low-reuse server case exceeded its 25% cached-token ceiling".into());
+            }
         }
         if expected.streaming {
             if observation.visible_chunks == 0
@@ -955,7 +969,7 @@ fn expected_cases(long_context: bool) -> Vec<ExpectedCase> {
         ExpectedCase {
             name: "stream/full-prefix".into(),
             timing_boundary: "SSE request start through DONE",
-            cache_regime: "reported full prompt reuse",
+            cache_regime: "reported complete preceding-prompt reuse",
             concurrency: 1,
             streaming: true,
         },
@@ -1496,10 +1510,12 @@ mod tests {
                     let completion_tokens = if expected.streaming { 32 } else { 8 };
                     let prompt_tokens = 300 * expected.concurrency;
                     let cached_prompt_tokens = if expected.name == "stream/full-prefix" {
-                        prompt_tokens
+                        prompt_tokens - 20
                     } else {
                         0
                     };
+                    let required_cached_prefix_tokens =
+                        (expected.name == "stream/full-prefix").then_some(prompt_tokens - 20);
                     let e2e_ms = 10.0 + expected.concurrency as f64;
                     let throughput = completion_tokens as f64 * 1_000.0 / e2e_ms;
                     let observations = (0..5)
@@ -1507,6 +1523,7 @@ mod tests {
                             request_count: expected.concurrency,
                             prompt_tokens,
                             cached_prompt_tokens,
+                            required_cached_prefix_tokens,
                             completion_tokens,
                             visible_chunks: usize::from(expected.streaming),
                             ttft_ms: expected.streaming.then_some(5.0),

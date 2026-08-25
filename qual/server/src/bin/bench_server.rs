@@ -17,6 +17,7 @@ const CONCURRENT_COMPLETION_TOKENS: usize = 8;
 const LONG_COMPLETION_TOKENS: usize = 4;
 const DEFAULT_SAMPLES: usize = 5;
 const LONG_CONTEXTS: [usize; 4] = [4_096, 16_384, 65_536, 178_000];
+const BENCHMARK_SCHEMA: u32 = 2;
 
 type Result<T> = std::result::Result<T, BenchError>;
 
@@ -91,6 +92,8 @@ struct Observation {
     request_count: usize,
     prompt_tokens: usize,
     cached_prompt_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_cached_prefix_tokens: Option<usize>,
     completion_tokens: usize,
     visible_chunks: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,6 +131,11 @@ struct Usage {
     completion_tokens: usize,
 }
 
+struct TimedCompletion {
+    observation: Observation,
+    content: String,
+}
+
 fn main() {
     let options = match Options::parse(std::env::args()) {
         Ok(options) => options,
@@ -152,7 +160,7 @@ fn main() {
         }
     }
     let mut report = Report {
-        schema_version: 1,
+        schema_version: BENCHMARK_SCHEMA,
         suite: "server-http",
         model: Qwen38_27B::MODEL_ID,
         server_url: options.base_url.clone(),
@@ -310,12 +318,17 @@ impl Client {
     }
 
     fn blocking(&self, messages: Value, max_tokens: usize) -> Result<Observation> {
+        self.blocking_completion(messages, max_tokens)
+            .map(|completion| completion.observation)
+    }
+
+    fn blocking_completion(&self, messages: Value, max_tokens: usize) -> Result<TimedCompletion> {
         let started = Instant::now();
         let mut response = self
             .agent
             .post(self.completion_url())
             .send_json(request(messages, max_tokens, false))?;
-        expect_status(&response, "blocking benchmark request")?;
+        expect_status(&mut response, "blocking benchmark request")?;
         let body: Value = response.body_mut().read_json()?;
         let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
         let usage = parse_usage(field(&body, "usage")?)?;
@@ -325,17 +338,25 @@ impl Client {
                 usage.completion_tokens
             )));
         }
-        validate_blocking(&body)?;
-        Ok(observation(usage, 0, None, None, elapsed, 1))
+        let content = validate_blocking(&body)?;
+        Ok(TimedCompletion {
+            observation: observation(usage, 0, None, None, elapsed, 1),
+            content,
+        })
     }
 
     fn streaming(&self, messages: Value, max_tokens: usize) -> Result<Observation> {
+        self.streaming_completion(messages, max_tokens)
+            .map(|completion| completion.observation)
+    }
+
+    fn streaming_completion(&self, messages: Value, max_tokens: usize) -> Result<TimedCompletion> {
         let started = Instant::now();
-        let response = self
+        let mut response = self
             .agent
             .post(self.completion_url())
             .send_json(request(messages, max_tokens, true))?;
-        expect_status(&response, "streaming benchmark request")?;
+        expect_status(&mut response, "streaming benchmark request")?;
         let content_type = response
             .headers()
             .get("content-type")
@@ -354,6 +375,7 @@ impl Client {
         let mut terminal = None;
         let mut usage = None;
         let mut visible_chunks = 0;
+        let mut content = String::new();
         let mut done = false;
         loop {
             line.clear();
@@ -389,6 +411,9 @@ impl Client {
             }
             let choice = &choices[0];
             let delta = field(choice, "delta")?;
+            if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                content.push_str(text);
+            }
             if delta
                 .get("content")
                 .and_then(Value::as_str)
@@ -427,36 +452,82 @@ impl Client {
         let e2e_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let mean_intertoken_ms = (usage.completion_tokens > 1)
             .then(|| (terminal_ms - ttft_ms) / (usage.completion_tokens - 1) as f64);
-        Ok(observation(
-            usage,
-            visible_chunks,
-            Some(ttft_ms),
-            mean_intertoken_ms,
-            e2e_ms,
-            1,
-        ))
+        Ok(TimedCompletion {
+            observation: observation(
+                usage,
+                visible_chunks,
+                Some(ttft_ms),
+                mean_intertoken_ms,
+                e2e_ms,
+                1,
+            ),
+            content,
+        })
     }
 }
 
 fn run(client: &Client, options: &Options, report: &mut Report) -> Result<()> {
-    let reusable = reusable_messages();
-    let prime = client.blocking(reusable.clone(), STREAM_COMPLETION_TOKENS)?;
-    let warmup = client.streaming(reusable.clone(), STREAM_COMPLETION_TOKENS)?;
-    require_full_reuse(&warmup, "reused-stream warmup")?;
-    report.setup_completion_tokens = prime.completion_tokens + warmup.completion_tokens;
+    let prime_messages = reusable_messages();
+    let prime = client.blocking_completion(prime_messages.clone(), STREAM_COMPLETION_TOKENS)?;
+    let warmup_messages = conversation_followup(&prime_messages, &prime.content)?;
+    let warmup = client.streaming_completion(warmup_messages, STREAM_COMPLETION_TOKENS)?;
+    require_preceding_prompt_reuse(
+        &warmup.observation,
+        prime.observation.prompt_tokens,
+        "reused-stream warmup",
+    )?;
+    report.setup_completion_tokens =
+        prime.observation.completion_tokens + warmup.observation.completion_tokens;
+    let expected_prime_content = prime.content;
+    let expected_prompt_tokens = warmup.observation.prompt_tokens;
+    let mut reuse_setup_completion_tokens = 0usize;
     measure_case(
         report,
         options,
         "stream/full-prefix".into(),
         "SSE request start through DONE",
-        "reported full prompt reuse",
+        "reported complete preceding-prompt reuse",
         1,
         |_: usize| {
-            let observation = client.streaming(reusable.clone(), STREAM_COMPLETION_TOKENS)?;
-            require_full_reuse(&observation, "reused-stream sample")?;
+            let prime =
+                client.blocking_completion(prime_messages.clone(), STREAM_COMPLETION_TOKENS)?;
+            require_low_reuse(&prime.observation, "reuse-sample prime")?;
+            if prime.content != expected_prime_content {
+                return Err(BenchError::Contract(
+                    "greedy reuse-sample prime changed its represented content".into(),
+                ));
+            }
+            reuse_setup_completion_tokens = reuse_setup_completion_tokens
+                .checked_add(prime.observation.completion_tokens)
+                .ok_or_else(|| {
+                    BenchError::Contract("reuse setup completion-token accounting overflows".into())
+                })?;
+            let preceding_prompt_tokens = prime.observation.prompt_tokens;
+            let messages = conversation_followup(&prime_messages, &prime.content)?;
+            let completion = client.streaming_completion(messages, STREAM_COMPLETION_TOKENS)?;
+            let mut observation = completion.observation;
+            require_preceding_prompt_reuse(
+                &observation,
+                preceding_prompt_tokens,
+                "reused-stream sample",
+            )?;
+            if observation.prompt_tokens != expected_prompt_tokens {
+                return Err(BenchError::Contract(format!(
+                    "reuse sample used {} prompt tokens, expected the exact {expected_prompt_tokens}-token shape",
+                    observation.prompt_tokens
+                )));
+            }
+            observation.required_cached_prefix_tokens = Some(preceding_prompt_tokens);
             Ok(observation)
         },
     )?;
+    report.setup_completion_tokens = report
+        .setup_completion_tokens
+        .checked_add(reuse_setup_completion_tokens)
+        .ok_or_else(|| {
+            BenchError::Contract("setup completion-token accounting overflows".into())
+        })?;
+    write_report(&options.output, report)?;
 
     measure_case(
         report,
@@ -487,6 +558,7 @@ fn run(client: &Client, options: &Options, report: &mut Report) -> Result<()> {
 
     if options.long_context {
         for target in LONG_CONTEXTS {
+            let mut recycling_completion_tokens = 0usize;
             measure_case(
                 report,
                 options,
@@ -495,6 +567,15 @@ fn run(client: &Client, options: &Options, report: &mut Report) -> Result<()> {
                 "reported cached prompt tokens at most 25%",
                 1,
                 |sample| {
+                    let recycled =
+                        recycle_retained_slots(client, 0x60_0000 + target * 0x100 + sample * 8)?;
+                    recycling_completion_tokens = recycling_completion_tokens
+                        .checked_add(recycled)
+                        .ok_or_else(|| {
+                            BenchError::Contract(
+                                "recycling completion-token accounting overflows".into(),
+                            )
+                        })?;
                     let messages = fresh_messages(0x10_0000 + target + sample, target - 32);
                     let observation = client.streaming(messages, LONG_COMPLETION_TOKENS)?;
                     require_low_reuse(&observation, "long-context sample")?;
@@ -507,6 +588,13 @@ fn run(client: &Client, options: &Options, report: &mut Report) -> Result<()> {
                     Ok(observation)
                 },
             )?;
+            report.setup_completion_tokens = report
+                .setup_completion_tokens
+                .checked_add(recycling_completion_tokens)
+                .ok_or_else(|| {
+                    BenchError::Contract("setup completion-token accounting overflows".into())
+                })?;
+            write_report(&options.output, report)?;
         }
     }
     Ok(())
@@ -579,6 +667,7 @@ fn concurrent_group(client: Client, concurrency: usize, sample: usize) -> Result
         request_count: concurrency,
         prompt_tokens,
         cached_prompt_tokens,
+        required_cached_prefix_tokens: None,
         completion_tokens,
         visible_chunks: 0,
         ttft_ms: None,
@@ -613,6 +702,19 @@ fn reusable_messages() -> Value {
     }])
 }
 
+fn conversation_followup(messages: &Value, assistant: &str) -> Result<Value> {
+    let mut messages = messages
+        .as_array()
+        .cloned()
+        .ok_or_else(|| BenchError::Contract("reusable messages is not an array".into()))?;
+    messages.push(json!({"role": "assistant", "content": assistant}));
+    messages.push(json!({
+        "role": "user",
+        "content": "Continue with one more distinct color."
+    }));
+    Ok(Value::Array(messages))
+}
+
 fn fresh_messages(nonce: usize, repeated_tokens: usize) -> Value {
     let content = format!(
         "{nonce:016x} begin unique benchmark prompt.{}",
@@ -633,6 +735,7 @@ fn observation(
         request_count,
         prompt_tokens: usage.prompt_tokens,
         cached_prompt_tokens: usage.cached_tokens,
+        required_cached_prefix_tokens: None,
         completion_tokens: usage.completion_tokens,
         visible_chunks,
         ttft_ms,
@@ -642,15 +745,49 @@ fn observation(
     }
 }
 
-fn require_full_reuse(observation: &Observation, label: &str) -> Result<()> {
-    if observation.cached_prompt_tokens == observation.prompt_tokens {
+fn require_preceding_prompt_reuse(
+    observation: &Observation,
+    preceding_prompt_tokens: usize,
+    label: &str,
+) -> Result<()> {
+    if preceding_prompt_tokens != 0
+        && preceding_prompt_tokens <= observation.prompt_tokens
+        && observation.cached_prompt_tokens >= preceding_prompt_tokens
+    {
         Ok(())
     } else {
         Err(BenchError::Contract(format!(
-            "{label} reported {}/{} cached prompt tokens, expected full reuse",
-            observation.cached_prompt_tokens, observation.prompt_tokens
+            "{label} reported {}/{} cached prompt tokens, expected the complete {preceding_prompt_tokens}-token preceding prompt",
+            observation.cached_prompt_tokens, observation.prompt_tokens,
         )))
     }
+}
+
+fn recycle_retained_slots(client: &Client, nonce: usize) -> Result<usize> {
+    let barrier = Arc::new(Barrier::new(8));
+    let handles = (0..8)
+        .map(|lane| {
+            let barrier = Arc::clone(&barrier);
+            let client = client.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                client.blocking(fresh_messages(nonce + lane, 4), 1)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut completion_tokens = 0usize;
+    for handle in handles {
+        let observation = handle.join().map_err(|_| BenchError::ThreadPanic)??;
+        require_low_reuse(&observation, "long-context slot recycling")?;
+        if observation.completion_tokens != 1 {
+            return Err(BenchError::Contract(format!(
+                "long-context slot recycling reported {} completion tokens, expected one",
+                observation.completion_tokens
+            )));
+        }
+        completion_tokens += observation.completion_tokens;
+    }
+    Ok(completion_tokens)
 }
 
 fn require_low_reuse(observation: &Observation, label: &str) -> Result<()> {
@@ -806,7 +943,7 @@ fn parse_usage(value: &Value) -> Result<Usage> {
     })
 }
 
-fn validate_blocking(body: &Value) -> Result<()> {
+fn validate_blocking(body: &Value) -> Result<String> {
     if field(body, "object")? != "chat.completion" || field(body, "model")? != Qwen38_27B::MODEL_ID
     {
         return Err(BenchError::Contract(format!(
@@ -824,16 +961,23 @@ fn validate_blocking(body: &Value) -> Result<()> {
             "blocking response has an invalid assistant choice".into(),
         ));
     }
-    Ok(())
+    Ok(choices[0]["message"]["content"]
+        .as_str()
+        .expect("assistant content was validated as a string")
+        .to_owned())
 }
 
-fn expect_status(response: &ureq::http::Response<ureq::Body>, label: &str) -> Result<()> {
+fn expect_status(response: &mut ureq::http::Response<ureq::Body>, label: &str) -> Result<()> {
     let status = response.status().as_u16();
     if status == 200 {
         Ok(())
     } else {
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|error| format!("<response body read failed: {error}>"));
         Err(BenchError::Contract(format!(
-            "{label} returned HTTP {status}"
+            "{label} returned HTTP {status}: {body}"
         )))
     }
 }
@@ -879,7 +1023,8 @@ fn write_report(path: &Path, report: &Report) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Client, Observation, Options, fresh_messages, parse_usage, summarize, summarize_case,
+        Client, Observation, Options, conversation_followup, fresh_messages, parse_usage,
+        require_preceding_prompt_reuse, summarize, summarize_case,
     };
     use serde_json::json;
     use std::io::{Read, Write};
@@ -925,6 +1070,21 @@ mod tests {
             observation(Some(3.0)),
         ];
         assert!(summarize_case(&observations).is_err());
+    }
+
+    #[test]
+    fn conversation_followup_preserves_history_and_cache_floor() {
+        let first = fresh_messages(7, 4);
+        let second = conversation_followup(&first, "blue").unwrap();
+        assert_eq!(second[0], first[0]);
+        assert_eq!(second[1], json!({"role": "assistant", "content": "blue"}));
+        assert_eq!(second[2]["role"], "user");
+
+        let mut observation = observation(Some(1.0));
+        observation.prompt_tokens = 20;
+        observation.cached_prompt_tokens = 15;
+        assert!(require_preceding_prompt_reuse(&observation, 15, "fixture").is_ok());
+        assert!(require_preceding_prompt_reuse(&observation, 16, "fixture").is_err());
     }
 
     #[test]
@@ -982,6 +1142,7 @@ mod tests {
             request_count: 1,
             prompt_tokens: 10,
             cached_prompt_tokens: 5,
+            required_cached_prefix_tokens: None,
             completion_tokens: 2,
             visible_chunks: 2,
             ttft_ms,
