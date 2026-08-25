@@ -13,6 +13,7 @@ pub(crate) mod mtp_prompt_prime;
 pub(crate) mod mtp_prompt_prime_layout;
 pub(crate) mod nvfp4_mlp;
 pub(crate) mod nvfp4_mlp_layout;
+pub(crate) mod resident_model;
 pub(crate) mod resident_model_layout;
 pub(crate) mod resident_mtp;
 pub(crate) mod resident_mtp_batch_generation;

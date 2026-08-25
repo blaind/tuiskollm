@@ -1,6 +1,6 @@
 //! Resident exact-target execution owner for the complete text model.
 
-use super::{
+use super::resident_model_layout::{
     AttentionWeights, EndpointWeights, GdnPersistent, GdnWeights, MixerWeights, MlpWeights,
     ResidentModelLayout,
 };
@@ -776,7 +776,7 @@ impl ResidentModelProgram {
             context,
             product(
                 "resident embedding stager elements",
-                super::MAX_ROWS,
+                super::resident_model_layout::MAX_ROWS,
                 Qwen38_27B::HIDDEN,
             )?,
         )
@@ -1370,9 +1370,9 @@ impl ResidentModelProgram {
 
         let slot = u32::try_from(slot)
             .map_err(|_| EngineError::layout("resident prefill slot exceeds u32"))?;
-        let mut positions = [0u32; super::MAX_ROWS];
-        let mut lengths = [0u32; super::MAX_ROWS];
-        let mut rows = [0u32; super::MAX_ROWS];
+        let mut positions = [0u32; super::resident_model_layout::MAX_ROWS];
+        let mut lengths = [0u32; super::resident_model_layout::MAX_ROWS];
+        let mut rows = [0u32; super::resident_model_layout::MAX_ROWS];
         for token in 0..tokens {
             let position = first_position
                 .checked_add(token)
@@ -1495,7 +1495,7 @@ impl ResidentModelProgram {
     /// Clears all recurrent owners and the complete shared physical cache pool.
     pub fn reset_state(&self, stream: &CudaStream) -> EngineResult<()> {
         for layer in &self.layout.layers {
-            if let super::PersistentState::Gdn(state) = layer.persistent {
+            if let super::resident_model_layout::PersistentState::Gdn(state) = layer.persistent {
                 self.arena.fill(stream, state.history, 0)?;
                 self.arena.fill(stream, state.state, 0)?;
             }
@@ -1514,11 +1514,11 @@ impl ResidentModelProgram {
         let mut attention_layer = 0;
         for layer in &self.layout.layers {
             match layer.persistent {
-                super::PersistentState::Gdn(state) => {
+                super::resident_model_layout::PersistentState::Gdn(state) => {
                     fill_slot(&self.arena, stream, state.history, slot)?;
                     fill_slot(&self.arena, stream, state.state, slot)?;
                 }
-                super::PersistentState::Attention => attention_layer += 1,
+                super::resident_model_layout::PersistentState::Attention => attention_layer += 1,
             }
         }
         if attention_layer != self.layout.kv_layout.layers().len() {
@@ -1552,7 +1552,8 @@ impl ResidentModelProgram {
             self.gdn_slot_state_values(),
         )?;
         for layer in &self.layout.layers {
-            let super::PersistentState::Gdn(persistent) = layer.persistent else {
+            let super::resident_model_layout::PersistentState::Gdn(persistent) = layer.persistent
+            else {
                 continue;
             };
             let history_values = persistent.history.len() / MAX_BATCH;
@@ -1607,7 +1608,8 @@ impl ResidentModelProgram {
             self.gdn_slot_state_values(),
         )?;
         for layer in &self.layout.layers {
-            let super::PersistentState::Gdn(persistent) = layer.persistent else {
+            let super::resident_model_layout::PersistentState::Gdn(persistent) = layer.persistent
+            else {
                 continue;
             };
             let history_values = persistent.history.len() / MAX_BATCH;
@@ -2022,10 +2024,10 @@ impl ResidentModelProgram {
         target_hidden: ArenaRegion<u16>,
         block_tables: ArenaRegion<u32>,
     ) -> GpuResult<()> {
-        if !(1..=super::MAX_ROWS).contains(&rows) {
+        if !(1..=super::resident_model_layout::MAX_ROWS).contains(&rows) {
             return Err(GpuError::invalid_launch(format!(
                 "MTP prompt handoff rows {rows} are outside 1..={}",
-                super::MAX_ROWS
+                super::resident_model_layout::MAX_ROWS
             )));
         }
         let hidden_values = rows.checked_mul(Qwen38_27B::HIDDEN).ok_or_else(|| {
@@ -2236,7 +2238,7 @@ impl ResidentModelProgram {
 
     /// Largest admitted exact prompt tile.
     pub const fn row_capacity(&self) -> usize {
-        super::MAX_ROWS
+        super::resident_model_layout::MAX_ROWS
     }
 
     /// Immutable singleton/segmented provisional-verify and accepted-prefix graph entries.
@@ -2911,7 +2913,8 @@ impl ResidentModelProgram {
         let mut history_offset = 0;
         let mut state_offset = 0;
         for layer in &self.layout.layers {
-            let super::PersistentState::Gdn(persistent) = layer.persistent else {
+            let super::resident_model_layout::PersistentState::Gdn(persistent) = layer.persistent
+            else {
                 continue;
             };
             let history_values = persistent.history.len() / MAX_BATCH;
@@ -2950,7 +2953,8 @@ impl ResidentModelProgram {
         let mut history_offset = slot * self.gdn_slot_history_values();
         let mut state_offset = slot * self.gdn_slot_state_values();
         for layer in &self.layout.layers {
-            let super::PersistentState::Gdn(persistent) = layer.persistent else {
+            let super::resident_model_layout::PersistentState::Gdn(persistent) = layer.persistent
+            else {
                 continue;
             };
             let history_values = persistent.history.len() / MAX_BATCH;
@@ -3053,7 +3057,8 @@ impl ResidentModelProgram {
         let mut live_state =
             Vec::with_capacity(self.layout.state_bytes() / MAX_BATCH / size_of::<f32>());
         for layer in &self.layout.layers {
-            let super::PersistentState::Gdn(persistent) = layer.persistent else {
+            let super::resident_model_layout::PersistentState::Gdn(persistent) = layer.persistent
+            else {
                 continue;
             };
             let history_values = persistent.history.len() / MAX_BATCH;
@@ -3165,7 +3170,9 @@ impl ResidentModelProgram {
             let slot = usize::try_from(state_rows[lane * route.tokens])
                 .map_err(|_| EngineError::layout("segmented target MTP slot exceeds usize"))?;
             for layer in &self.layout.layers {
-                let super::PersistentState::Gdn(persistent) = layer.persistent else {
+                let super::resident_model_layout::PersistentState::Gdn(persistent) =
+                    layer.persistent
+                else {
                     continue;
                 };
                 live_history.extend(self.arena.copy_slice_to_host(
@@ -3312,7 +3319,9 @@ impl ResidentModelProgram {
             .layers
             .first()
             .ok_or_else(|| EngineError::layout("resident layout layer inventory is empty"))?;
-        let super::PersistentState::Gdn(persistent_regions) = layout_layer.persistent else {
+        let super::resident_model_layout::PersistentState::Gdn(persistent_regions) =
+            layout_layer.persistent
+        else {
             return Err(EngineError::layout(
                 "resident first layout layer is not GDN",
             ));
@@ -3600,11 +3609,11 @@ impl ResidentModelProgram {
         let mut value_guard_pages = Vec::with_capacity(guard_values * attention_layers);
         for layer in &self.layout.layers {
             match layer.persistent {
-                super::PersistentState::Gdn(regions) => {
+                super::resident_model_layout::PersistentState::Gdn(regions) => {
                     history.extend(self.arena.copy_to_host(stream, regions.history)?);
                     state.extend(self.arena.copy_to_host(stream, regions.state)?);
                 }
-                super::PersistentState::Attention => {}
+                super::resident_model_layout::PersistentState::Attention => {}
             }
         }
         for cache in self.layout.kv_layout.layers() {
@@ -4256,8 +4265,8 @@ impl ProgramPointers {
         let mut dense_mlp = 0;
         for (layer, scalars) in layout.layers.iter().zip(scalars) {
             let cache = match layer.persistent {
-                super::PersistentState::Gdn(_) => None,
-                super::PersistentState::Attention => {
+                super::resident_model_layout::PersistentState::Gdn(_) => None,
+                super::resident_model_layout::PersistentState::Attention => {
                     let cache = layout
                         .kv_layout
                         .layers()
@@ -4510,20 +4519,20 @@ fn bind_mixer(
     arena: &DeviceArena,
     kv_arena: &DeviceArena,
     weights: MixerWeights,
-    persistent: super::PersistentState,
+    persistent: super::resident_model_layout::PersistentState,
     cache: Option<LayerKvRegions>,
     scalars: MixerScalars,
 ) -> EngineResult<MixerPointers> {
     match (weights, persistent, cache, scalars) {
         (
             MixerWeights::Gdn(weights),
-            super::PersistentState::Gdn(persistent),
+            super::resident_model_layout::PersistentState::Gdn(persistent),
             None,
             MixerScalars::Gdn,
         ) => Ok(MixerPointers::Gdn(bind_gdn(arena, weights, persistent)?)),
         (
             MixerWeights::Attention(weights),
-            super::PersistentState::Attention,
+            super::resident_model_layout::PersistentState::Attention,
             Some(cache),
             MixerScalars::Attention(scalars),
         ) => Ok(MixerPointers::Attention(bind_attention(
@@ -5459,7 +5468,7 @@ fn launch_prefill_mixer(
     unsafe {
         match mixer {
             MixerPointers::Gdn(p) => {
-                if rows == super::MAX_ROWS {
+                if rows == super::resident_model_layout::MAX_ROWS {
                     // T=1024 amortizes address-bound TMA setup across the tile;
                     // each map is selected by its encoded weight address, which
                     // launch_macro_prefill re-validates against the pointers.
@@ -5820,7 +5829,7 @@ fn launch_mlp(
                 }
             }
             MlpPointers::DenseFp8(p) => {
-                if rows == super::MAX_ROWS {
+                if rows == super::resident_model_layout::MAX_ROWS {
                     let maps = dense_mlp_maps.get(p.map_index).ok_or_else(|| {
                         GpuError::invalid_launch(
                             "resident dense MLP tensor-map index is outside its owner inventory",
@@ -6248,14 +6257,14 @@ fn initialize_metadata(
     layout: &ResidentModelLayout,
 ) -> EngineResult<()> {
     let workspace = layout.workspace;
-    let mut state_rows = vec![0u32; super::MAX_ROWS];
+    let mut state_rows = vec![0u32; super::resident_model_layout::MAX_ROWS];
     for (row, state_row) in state_rows.iter_mut().take(MAX_BATCH).enumerate() {
         *state_row = row as u32;
     }
     arena.copy_from_host(stream, workspace.state_rows, &state_rows)?;
     let block_tables = vec![u32::MAX; MAX_BATCH * LONG_CONTEXT_PHYSICAL_PAGES];
     kv_arena.copy_from_host(stream, layout.kv_layout.block_tables(), &block_tables)?;
-    let mut table_rows = vec![0u32; super::MAX_ROWS];
+    let mut table_rows = vec![0u32; super::resident_model_layout::MAX_ROWS];
     for (row, table_row) in table_rows.iter_mut().take(MAX_BATCH).enumerate() {
         *table_row = row as u32;
     }
@@ -6290,12 +6299,12 @@ fn initialize_selective_nonweights(
     }
 
     let mut submissions = 0;
-    let mut state_rows = vec![0u32; super::MAX_ROWS];
+    let mut state_rows = vec![0u32; super::resident_model_layout::MAX_ROWS];
     for (row, state_row) in state_rows.iter_mut().take(MAX_BATCH).enumerate() {
         *state_row = row as u32;
     }
     submissions += upload_region(stream, arena, layout.workspace.state_rows, &state_rows)?;
-    let mut table_rows = vec![0u32; super::MAX_ROWS];
+    let mut table_rows = vec![0u32; super::resident_model_layout::MAX_ROWS];
     for (row, table_row) in table_rows.iter_mut().take(MAX_BATCH).enumerate() {
         *table_row = row as u32;
     }
@@ -6424,9 +6433,9 @@ const fn prefill_graph_routes() -> [ResidentPrefillRoute; PREFILL_GRAPH_ROUTE_CO
             attention: PrefillAttentionRoute::Partitioned { partitions: 16 },
         },
         ResidentPrefillRoute {
-            tokens: super::MAX_ROWS,
+            tokens: super::resident_model_layout::MAX_ROWS,
             first_position: 0,
-            context_tokens: super::MAX_ROWS,
+            context_tokens: super::resident_model_layout::MAX_ROWS,
             attention: PrefillAttentionRoute::Macro { partitions: 4 },
         },
     ]
@@ -6464,7 +6473,7 @@ fn select_prefill_route(
             // 32,769-token crossover through the 220,000-token ceiling.
             PrefillAttentionRoute::Partitioned { partitions: 16 }
         }
-        super::MAX_ROWS => {
+        super::resident_model_layout::MAX_ROWS => {
             // P4 exposes 3,072 producer CTAs and is the directly benchmarked
             // macro route at both 32,768 and 98,304 context positions.
             PrefillAttentionRoute::Macro { partitions: 4 }
@@ -6486,7 +6495,10 @@ fn prefill_graph_index(route: ResidentPrefillRoute) -> EngineResult<usize> {
         (128, PrefillAttentionRoute::Shared) => Ok(2),
         (128, PrefillAttentionRoute::Partitioned { partitions: 8 }) => Ok(3),
         (128, PrefillAttentionRoute::Partitioned { partitions: 16 }) => Ok(4),
-        (super::MAX_ROWS, PrefillAttentionRoute::Macro { partitions: 4 }) => Ok(5),
+        (
+            super::resident_model_layout::MAX_ROWS,
+            PrefillAttentionRoute::Macro { partitions: 4 },
+        ) => Ok(5),
         _ => Err(EngineError::route(format!(
             "resident prefill T={} context {} has no exact attention graph",
             route.tokens, route.context_tokens
@@ -6499,7 +6511,7 @@ const fn prefill_index(rows: usize) -> Option<usize> {
         32 => Some(0),
         64 => Some(1),
         128 => Some(2),
-        super::MAX_ROWS => Some(3),
+        super::resident_model_layout::MAX_ROWS => Some(3),
         _ => None,
     }
 }

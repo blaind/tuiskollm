@@ -85,11 +85,11 @@ pub use qwen38::mtp_prompt_prime::{MtpPromptPrimeProgram, MtpPromptPrimeRoute};
 pub use qwen38::mtp_prompt_prime_layout::MtpPromptPrimeLayout;
 pub use qwen38::nvfp4_mlp::Nvfp4MlpProgram;
 pub use qwen38::nvfp4_mlp_layout::Nvfp4MlpLayout;
-pub use qwen38::resident_model_layout::{
-    ResidentDecodeRoute, ResidentLayerKind, ResidentLoadMode, ResidentLoadStats,
-    ResidentModelLayout, ResidentModelProgram, ResidentMtpSegmentedVerifyRoute,
-    ResidentMtpVerifyRoute, ResidentPrefillRoute,
+pub use qwen38::resident_model::{
+    ResidentDecodeRoute, ResidentLoadMode, ResidentLoadStats, ResidentModelProgram,
+    ResidentMtpSegmentedVerifyRoute, ResidentMtpVerifyRoute, ResidentPrefillRoute,
 };
+pub use qwen38::resident_model_layout::{ResidentLayerKind, ResidentModelLayout};
 pub use qwen38::resident_mtp::{
     ResidentMtpDraftRoute, ResidentMtpLoadStats, ResidentMtpProgram, ResidentMtpPromptRoute,
     ResidentMtpRealignRoute,
@@ -158,7 +158,7 @@ pub use qwen38::mtp_prompt_prime::MtpPromptPrimeObservables;
 #[cfg(feature = "qualification")]
 pub use qwen38::nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
 #[cfg(feature = "qualification")]
-pub use qwen38::resident_model_layout::{
+pub use qwen38::resident_model::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
     ResidentMtpGdnObservables, ResidentMtpLayerObservables, ResidentMtpSegmentedStageGraph,
     ResidentMtpVerifyObservables, ResidentPrefillStageGraph,

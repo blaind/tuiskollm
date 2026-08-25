@@ -1,18 +1,5 @@
 //! Exact resident and shared-KV arena plan for the Qwen3.8 text model.
 
-mod program;
-
-pub use program::{
-    ResidentDecodeRoute, ResidentLoadMode, ResidentLoadStats, ResidentModelProgram,
-    ResidentMtpSegmentedVerifyRoute, ResidentMtpVerifyRoute, ResidentPrefillRoute,
-};
-#[cfg(feature = "qualification")]
-pub use program::{
-    ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
-    ResidentMtpGdnObservables, ResidentMtpLayerObservables, ResidentMtpSegmentedStageGraph,
-    ResidentMtpVerifyObservables, ResidentPrefillStageGraph,
-};
-
 use crate::common::math::{checked_sum, product};
 use crate::{
     EngineError, EngineResult, KvCacheCodec, MAX_BATCH, SharedPagedKvLayout,
@@ -676,7 +663,7 @@ impl SharedWorkspace {
 /// Checked exact-target layout for all resident text weights, state, caches, and shared scratch.
 #[derive(Clone, Debug)]
 pub struct ResidentModelLayout {
-    builder: ArenaLayout,
+    pub(super) builder: ArenaLayout,
     pub(super) kv_layout: SharedPagedKvLayout,
     pub(super) layers: Vec<ResidentLayerLayout>,
     pub(super) endpoint: EndpointWeights,
