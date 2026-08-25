@@ -636,7 +636,9 @@ pub use qwen36_gdn_output::{
 pub use qwen36_gdn_output_benchmark::benchmark_qwen36_gdn_output;
 #[cfg(feature = "device")]
 pub use qwen36_generation::{
-    Qwen36GenerationQualification, Qwen36GenerationQualificationError, qualify_qwen36_generation,
+    Qwen36CompactGenerationQualification, Qwen36GenerationQualification,
+    Qwen36GenerationQualificationError, qualify_qwen36_compact_generation,
+    qualify_qwen36_generation,
 };
 #[cfg(feature = "device")]
 pub use qwen36_moe_experts::{

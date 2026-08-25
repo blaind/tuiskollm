@@ -447,11 +447,40 @@ impl Qwen36ResidentModelProgram {
         rope_cos: &[f32],
         rope_sin: &[f32],
     ) -> EngineResult<Qwen36ResidentPrefillRoute> {
+        self.load_prefill_slot_state(stream, tokens, 0, rope_cos, rope_sin)
+    }
+
+    /// Updates every persistent layer for one from-empty prompt in `slot`.
+    pub fn load_prefill_slot_state(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        slot: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<Qwen36ResidentPrefillRoute> {
+        self.load_prefill_slot_state_at(stream, tokens, slot, 0, rope_cos, rope_sin)
+    }
+
+    /// Updates every persistent layer for one exact prompt tile at an existing offset.
+    pub fn load_prefill_slot_state_at(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        slot: usize,
+        first_position: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<Qwen36ResidentPrefillRoute> {
         require_prefill(tokens)?;
-        let reserved_tokens = self.long_context_kv.slot_token_count(0)?;
-        if tokens > reserved_tokens {
+        require_slot(slot)?;
+        let context_tokens = first_position.checked_add(tokens).ok_or_else(|| {
+            EngineError::route("Qwen3.6 resident prefill context length overflows")
+        })?;
+        let reserved_tokens = self.long_context_kv.slot_token_count(slot)?;
+        if context_tokens > reserved_tokens {
             return Err(EngineError::route(format!(
-                "Qwen3.6 resident prefill T={tokens} exceeds slot 0's {reserved_tokens} reserved tokens"
+                "Qwen3.6 resident prefill positions {first_position}..{context_tokens} exceed slot {slot}'s {reserved_tokens} reserved tokens"
             )));
         }
         let rotary_values = product(
@@ -465,7 +494,7 @@ impl Qwen36ResidentModelProgram {
             )));
         }
         for layer in &self.layers {
-            layer.load_prefill_state(stream, tokens, 0, 0, rope_cos, rope_sin)?;
+            layer.load_prefill_state(stream, tokens, slot, first_position, rope_cos, rope_sin)?;
         }
 
         Ok(Qwen36ResidentPrefillRoute { tokens })

@@ -240,8 +240,10 @@ frontend-to-device state-transition evidence, not an external same-model logit-p
 generation route selects the largest qualified from-empty `T=32/64/128` prefix and evaluates the
 remaining prompt tail through exact B=1 decode. The active server slot now admits the checkpoint's
 262,144-position limit through the shared page owner. Every GDN and attention layer also admits a
-bijective compact-row-to-physical-slot map and isolated per-slot reset; the server scheduler still
-exposes one slot until the compact generation owner is qualified.
+bijective compact-row-to-physical-slot map and isolated per-slot reset. A concrete compact owner
+matches sequential output at every `B=1..8`, cancels and reuses a live slot hole, and admits a
+native `T=128` prompt while other requests remain active. The server still exposes one slot until
+that owner replaces its singleton worker.
 The server now selects this concrete target from the pinned revision directory and publishes
 `nvidia/Qwen3.6-35B-A3B-NVFP4` through the OpenAI health, models, blocking chat, and SSE routes. A
 real localhost thinking-mode `Hello` request emits the two-token reasoning text `Here's`; blocking

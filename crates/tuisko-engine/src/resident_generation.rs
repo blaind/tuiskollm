@@ -515,7 +515,7 @@ impl Qwen36ResidentTextGenerator {
             program.activate_kv_slot(0)?;
             program.reserve_kv_slot_tokens(stream, 0, required_positions)?;
             native_prefill_tokens =
-                prime_qwen36_prompt(program, stream, control.prompt_token_ids())?;
+                prime_qwen36_prompt(program, stream, control.prompt_token_ids(), 0)?;
             program.read_logits_into(stream, 1, logits)?;
         }
         let next_position = u32::try_from(control.prompt_token_ids().len())
@@ -582,7 +582,7 @@ impl Qwen36ResidentTextGenerator {
         self.program
             .reserve_kv_slot_tokens(&self.stream, 0, required_positions)?;
         let native_prefill_tokens =
-            prime_qwen36_prompt(&mut self.program, &self.stream, token_ids)?;
+            prime_qwen36_prompt(&mut self.program, &self.stream, token_ids, 0)?;
         self.program
             .read_logits_into(&self.stream, 1, &mut self.logits)?;
         let mut sampler = Sampler::new(SamplingOptions::greedy(), self.frontend.stop_ids())?;
@@ -1451,11 +1451,13 @@ fn replay_qwen36_token(
     program.replay(stream, 1)
 }
 
-fn prime_qwen36_prompt(
+pub(crate) fn prime_qwen36_prompt(
     program: &mut Qwen36ResidentModelProgram,
     stream: &CudaStream,
     token_ids: &[u32],
+    slot: usize,
 ) -> EngineResult<usize> {
+    program.load_slot_routes(stream, &[slot])?;
     let native_tokens = qwen36_native_prefill_tokens(token_ids.len()).unwrap_or(0);
     if native_tokens != 0 {
         let rotary_values = native_tokens
@@ -1473,9 +1475,10 @@ fn prime_qwen36_prompt(
             rope_sin[begin..begin + ROTARY_PAIRS].copy_from_slice(&sine);
         }
         program.stage_prefill_embeddings(stream, &token_ids[..native_tokens])?;
-        let route = program.load_prefill_state(
+        let route = program.load_prefill_slot_state(
             stream,
             native_tokens,
+            slot,
             &rope_cos[..rotary_values],
             &rope_sin[..rotary_values],
         )?;
