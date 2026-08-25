@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MODEL: &str = "nvidia/Qwen3.6-35B-A3B-NVFP4";
+const GENERATION_ROUTE: &str = "single-token";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -169,10 +170,9 @@ fn parse_json(label: &str, body: &str) -> Result<Value, String> {
 
 fn validate_health(body: &str) -> Result<(), String> {
     let value = parse_json("health", body)?;
-    if value != json!({"status": "ok"}) {
-        return Err(format!(
-            "health returned {value}, expected exactly status=ok"
-        ));
+    let expected = json!({"status": "ok", "generation_route": GENERATION_ROUTE});
+    if value != expected {
+        return Err(format!("health returned {value}, expected {expected}"));
     }
     Ok(())
 }
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn exact_json_boundaries_are_admitted() {
-        validate_health(r#"{"status":"ok"}"#).unwrap();
+        validate_health(r#"{"status":"ok","generation_route":"single-token"}"#).unwrap();
         validate_models(
             &json!({
                 "object": "list",
@@ -368,6 +368,13 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn health_requires_the_qwen36_generation_route() {
+        let error =
+            validate_health(r#"{"status":"ok","generation_route":"mtp-draft-3"}"#).unwrap_err();
+        assert!(error.contains("single-token"));
     }
 
     #[test]
