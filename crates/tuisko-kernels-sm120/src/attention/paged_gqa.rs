@@ -2,11 +2,11 @@
 
 use crate::Sm120Arch;
 use crate::device::paged_gqa::{
-    BF16_PREFILL_SHARED_BYTES, BF16_PREFILL_THREADS, DECODE_RING_SHARED_BYTES,
-    FLASH_PREFILL_P8_SHARED_BYTES, FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS,
-    PREFILL_PARTIAL_VALUES, PREFILL_SHARED_BYTES, PREFILL_THREADS, QWEN35_BF16_PREFILL_THREADS,
-    QWEN36_FP8_PREFILL_THREADS,
-    bf16_paged_gqa, bf16_paged_gqa_prefill_shared, paged_gqa, paged_gqa_prefill_flash_partitioned,
+    BF16_PREFILL_SHARED_BYTES, BF16_PREFILL_THREADS, DECODE_RING_E4M3_SHARED_BYTES,
+    DECODE_RING_SHARED_BYTES, FLASH_PREFILL_P8_SHARED_BYTES, FLASH_PREFILL_P16_SHARED_BYTES,
+    FLASH_PREFILL_THREADS, PREFILL_PARTIAL_VALUES, PREFILL_SHARED_BYTES, PREFILL_THREADS,
+    QWEN35_BF16_PREFILL_THREADS, QWEN36_FP8_PREFILL_THREADS, bf16_paged_gqa,
+    bf16_paged_gqa_prefill_shared, paged_gqa, paged_gqa_prefill_flash_partitioned,
     paged_gqa_prefill_partitioned_reduce, paged_gqa_prefill_shared,
 };
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
@@ -120,7 +120,8 @@ mod kernels {
         domain = 1,
         coordinates = u32,
         block = (32, 1, 1),
-        dynamic_shared = 0,
+        dynamic_shared = 4096,
+        dynamic_shared_alignment = 16,
         min_compute_capability = (12, 0),
     )]
     pub fn paged_gqa_exact<A: Arch, const TOKENS: usize>(
@@ -627,7 +628,11 @@ impl<A: Arch, const TOKENS: usize> PreparedRoute<A, TOKENS> {
 
         Ok(Self {
             attention: module
-                .prepare_paged_gqa_exact::<A, TOKENS>(LaunchConfig1D::new(blocks, THREADS, 0))
+                .prepare_paged_gqa_exact::<A, TOKENS>(LaunchConfig1D::new(
+                    blocks,
+                    THREADS,
+                    DECODE_RING_E4M3_SHARED_BYTES as u32,
+                ))
                 .map_err(|source| GpuError::launch("preparing paged GQA route", source))?,
         })
     }
