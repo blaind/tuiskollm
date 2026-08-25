@@ -226,6 +226,29 @@ impl Qwen35TextEndpointProgram {
         Ok(())
     }
 
+    /// Projects externally normalized BF16 rows with the resident LM head.
+    ///
+    /// # Safety
+    /// `normalized` must address at least `batch * Qwen35_9B::HIDDEN` BF16 values in this context.
+    pub(crate) unsafe fn launch_lm_head_from(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        normalized: *const u16,
+    ) -> GpuResult<()> {
+        require_batch(batch).map_err(engine_into_gpu)?;
+        let pointers = EndpointPointers::bind(&self.arena, &self.layout)?;
+        unsafe {
+            self.lm_head.launch(
+                stream,
+                batch,
+                normalized,
+                pointers.lm_head_weight,
+                pointers.logits,
+            )
+        }
+    }
+
     #[cfg(feature = "qualification")]
     /// Launches the same route eagerly for graph-agreement checks.
     pub fn launch_eager(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
@@ -371,6 +394,10 @@ fn launch_route(
             pointers.logits,
         )
     }
+}
+
+fn engine_into_gpu(error: EngineError) -> GpuError {
+    GpuError::invalid_launch(error.to_string())
 }
 
 fn copy_embedding_row(

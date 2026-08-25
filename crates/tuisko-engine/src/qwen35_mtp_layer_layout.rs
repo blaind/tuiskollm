@@ -6,6 +6,7 @@ use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{Arch, Qwen35_9B};
 
 const ALIGNMENT: usize = 256;
+pub(crate) const QWEN35_MTP_PROMPT_ROWS: usize = 128;
 pub(crate) const QWEN35_MTP_PHYSICAL_PAGES: usize = 24;
 pub(crate) const QWEN35_MTP_TABLE_STRIDE: usize = QWEN35_MTP_PHYSICAL_PAGES / MAX_BATCH;
 pub(crate) const QWEN35_MTP_CONTEXT_CAPACITY: usize = QWEN35_MTP_TABLE_STRIDE * ATTENTION_PAGE_SIZE;
@@ -62,20 +63,33 @@ pub struct Qwen35MtpLayerLayout {
 }
 
 impl Qwen35MtpLayerLayout {
-    /// Reserves the complete exact `B=1..=8` and causal `K=1..=4` owner.
+    /// Reserves exact decode, causal realignment, and `T=32,64,128` prime workspace.
     pub fn build() -> EngineResult<Self> {
-        let row_hidden = product(
-            "Qwen3.5 MTP row-hidden elements",
-            MAX_BATCH,
+        Self::build_with_cache(QWEN35_MTP_PHYSICAL_PAGES)
+    }
+
+    pub(crate) fn build_for_external_cache() -> EngineResult<Self> {
+        Self::build_with_cache(0)
+    }
+
+    fn build_with_cache(cache_pages: usize) -> EngineResult<Self> {
+        let prompt_hidden = product(
+            "Qwen3.5 MTP prompt-hidden elements",
+            QWEN35_MTP_PROMPT_ROWS,
             Qwen35_9B::HIDDEN,
         )?;
-        let row_qkv = product(
-            "Qwen3.5 MTP row-QKV elements",
-            MAX_BATCH,
+        let prompt_qkv = product(
+            "Qwen3.5 MTP prompt-QKV elements",
+            QWEN35_MTP_PROMPT_ROWS,
             Qwen35_9B::ATTENTION_QKV_ROWS,
         )?;
-        let row_attention = product(
-            "Qwen3.5 MTP row-attention elements",
+        let prompt_attention = product(
+            "Qwen3.5 MTP prompt-attention elements",
+            QWEN35_MTP_PROMPT_ROWS,
+            Qwen35_9B::ATTENTION_OUTPUT_COLUMNS,
+        )?;
+        let batch_attention = product(
+            "Qwen3.5 MTP batch-attention elements",
             MAX_BATCH,
             Qwen35_9B::ATTENTION_OUTPUT_COLUMNS,
         )?;
@@ -113,7 +127,7 @@ impl Qwen35MtpLayerLayout {
             "Qwen3.5 MTP cache plane elements",
             product(
                 "Qwen3.5 MTP cache page heads",
-                QWEN35_MTP_PHYSICAL_PAGES,
+                cache_pages,
                 Qwen35_9B::NUM_KV_HEADS,
             )?,
             product(
@@ -125,43 +139,43 @@ impl Qwen35MtpLayerLayout {
 
         let mut builder = ArenaLayout::new();
         let regions = Qwen35MtpLayerRegions {
-            embedding: builder.reserve(row_hidden, ALIGNMENT)?,
-            target_hidden: builder.reserve(row_hidden, ALIGNMENT)?,
+            embedding: builder.reserve(prompt_hidden, ALIGNMENT)?,
+            target_hidden: builder.reserve(prompt_hidden, ALIGNMENT)?,
             embedding_norm: builder.reserve(Qwen35_9B::HIDDEN, ALIGNMENT)?,
             hidden_norm: builder.reserve(Qwen35_9B::HIDDEN, ALIGNMENT)?,
-            normalized_embedding: builder.reserve(row_hidden, ALIGNMENT)?,
-            normalized_hidden: builder.reserve(row_hidden, ALIGNMENT)?,
+            normalized_embedding: builder.reserve(prompt_hidden, ALIGNMENT)?,
+            normalized_hidden: builder.reserve(prompt_hidden, ALIGNMENT)?,
             input_projection: builder.reserve(input_projection, ALIGNMENT)?,
-            residual: builder.reserve(row_hidden, ALIGNMENT)?,
+            residual: builder.reserve(prompt_hidden, ALIGNMENT)?,
             input_norm: builder.reserve(Qwen35_9B::HIDDEN, ALIGNMENT)?,
-            attention_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            attention_normalized: builder.reserve(prompt_hidden, ALIGNMENT)?,
             qkv_weight: builder.reserve(qkv_weight, ALIGNMENT)?,
-            qkv: builder.reserve(row_qkv, ALIGNMENT)?,
+            qkv: builder.reserve(prompt_qkv, ALIGNMENT)?,
             query_norm: builder.reserve(Qwen35_9B::HEAD_DIM, ALIGNMENT)?,
             key_norm: builder.reserve(Qwen35_9B::HEAD_DIM, ALIGNMENT)?,
-            rope_cos: builder.reserve(MAX_BATCH * 32, ALIGNMENT)?,
-            rope_sin: builder.reserve(MAX_BATCH * 32, ALIGNMENT)?,
+            rope_cos: builder.reserve(QWEN35_MTP_PROMPT_ROWS * 32, ALIGNMENT)?,
+            rope_sin: builder.reserve(QWEN35_MTP_PROMPT_ROWS * 32, ALIGNMENT)?,
             block_tables: builder.reserve(QWEN35_MTP_PHYSICAL_PAGES, ALIGNMENT)?,
-            table_rows: builder.reserve(MAX_BATCH, ALIGNMENT)?,
-            cache_positions: builder.reserve(MAX_BATCH, ALIGNMENT)?,
-            lengths: builder.reserve(MAX_BATCH, ALIGNMENT)?,
-            query: builder.reserve(row_attention, ALIGNMENT)?,
+            table_rows: builder.reserve(QWEN35_MTP_PROMPT_ROWS, ALIGNMENT)?,
+            cache_positions: builder.reserve(QWEN35_MTP_PROMPT_ROWS, ALIGNMENT)?,
+            lengths: builder.reserve(QWEN35_MTP_PROMPT_ROWS, ALIGNMENT)?,
+            query: builder.reserve(prompt_attention, ALIGNMENT)?,
             key_pages: builder.reserve(cache_plane, ALIGNMENT)?,
             value_pages: builder.reserve(cache_plane, ALIGNMENT)?,
-            attention: builder.reserve(row_attention, ALIGNMENT)?,
-            attention_activation: builder.reserve(row_attention, ALIGNMENT)?,
+            attention: builder.reserve(batch_attention, ALIGNMENT)?,
+            attention_activation: builder.reserve(batch_attention, ALIGNMENT)?,
             attention_output_weight: builder.reserve(attention_output_weight, ALIGNMENT)?,
-            attention_branch: builder.reserve(row_hidden, ALIGNMENT)?,
+            attention_branch: builder.reserve(MAX_BATCH * Qwen35_9B::HIDDEN, ALIGNMENT)?,
             post_attention_norm: builder.reserve(Qwen35_9B::HIDDEN, ALIGNMENT)?,
-            post_attention_residual: builder.reserve(row_hidden, ALIGNMENT)?,
-            mlp_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            post_attention_residual: builder.reserve(MAX_BATCH * Qwen35_9B::HIDDEN, ALIGNMENT)?,
+            mlp_normalized: builder.reserve(MAX_BATCH * Qwen35_9B::HIDDEN, ALIGNMENT)?,
             gate_up_weight: builder.reserve(gate_up_weight, ALIGNMENT)?,
             swiglu: builder.reserve(row_intermediate, ALIGNMENT)?,
             down_weight: builder.reserve(down_weight, ALIGNMENT)?,
-            mlp_branch: builder.reserve(row_hidden, ALIGNMENT)?,
+            mlp_branch: builder.reserve(MAX_BATCH * Qwen35_9B::HIDDEN, ALIGNMENT)?,
             final_norm: builder.reserve(Qwen35_9B::HIDDEN, ALIGNMENT)?,
-            residual_output: builder.reserve(row_hidden, ALIGNMENT)?,
-            final_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            residual_output: builder.reserve(MAX_BATCH * Qwen35_9B::HIDDEN, ALIGNMENT)?,
+            final_normalized: builder.reserve(MAX_BATCH * Qwen35_9B::HIDDEN, ALIGNMENT)?,
         };
         let resident_weight_bytes = sum(
             "Qwen3.5 MTP represented weight bytes",
@@ -276,7 +290,9 @@ fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALIGNMENT, QWEN35_MTP_CONTEXT_CAPACITY, Qwen35MtpLayerLayout};
+    use super::{
+        ALIGNMENT, QWEN35_MTP_CONTEXT_CAPACITY, QWEN35_MTP_PROMPT_ROWS, Qwen35MtpLayerLayout,
+    };
 
     #[test]
     fn qwen35_mtp_layer_byte_accounting_is_exact() {
@@ -284,12 +300,22 @@ mod tests {
 
         assert_eq!(layout.resident_weight_bytes(), 486_581_248);
         assert_eq!(layout.cache_bytes(), 6_291_456);
-        assert_eq!(layout.workspace_bytes(), 1_476_800);
-        assert_eq!(layout.owner_bytes(), 494_349_504);
-        assert_eq!(layout.arena_bytes(), 494_350_336);
-        assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 832);
+        assert_eq!(layout.workspace_bytes(), 11_830_880);
+        assert_eq!(layout.owner_bytes(), 504_703_584);
+        assert_eq!(layout.arena_bytes(), 504_703_744);
+        assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 160);
         assert_eq!(layout.context_capacity(), QWEN35_MTP_CONTEXT_CAPACITY);
         assert_eq!(layout.context_capacity(), 192);
+        assert_eq!(QWEN35_MTP_PROMPT_ROWS, 128);
+    }
+
+    #[test]
+    fn external_cache_layout_owns_no_duplicate_cache_plane() {
+        let layout = Qwen35MtpLayerLayout::build_for_external_cache().unwrap();
+
+        assert_eq!(layout.cache_bytes(), 0);
+        assert_eq!(layout.owner_bytes(), 498_412_128);
+        assert_eq!(layout.arena_bytes(), 498_412_288);
     }
 
     #[test]

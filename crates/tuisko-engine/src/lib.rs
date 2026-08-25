@@ -25,10 +25,14 @@ mod qwen35_gdn_layer;
 mod qwen35_gdn_layer_layout;
 mod qwen35_long_context_kv;
 mod qwen35_long_context_kv_layout;
+mod qwen35_mtp_kv;
+mod qwen35_mtp_kv_layout;
 mod qwen35_mtp_layer;
 mod qwen35_mtp_layer_layout;
 mod qwen35_nvfp4_mlp;
 mod qwen35_resident_model;
+mod qwen35_resident_mtp;
+mod qwen35_resident_mtp_layout;
 mod qwen35_text_endpoint;
 mod qwen35_text_endpoint_layout;
 mod qwen36_full_attention_layer;
@@ -86,6 +90,8 @@ pub use qwen35_resident_model::{
     Qwen35ResidentLayerKind, Qwen35ResidentModelLayout, Qwen35ResidentModelProgram,
     Qwen35ResidentPrefillRoute,
 };
+pub use qwen35_resident_mtp::{Qwen35MtpPromptRoute, Qwen35ResidentMtpProgram};
+pub use qwen35_resident_mtp_layout::Qwen35ResidentMtpLayout;
 pub use qwen35_text_endpoint::Qwen35TextEndpointProgram;
 pub use qwen35_text_endpoint_layout::Qwen35TextEndpointLayout;
 pub use qwen36_full_attention_layer::Qwen36FullAttentionLayerProgram;
@@ -154,6 +160,8 @@ pub use qwen35_gdn_layer::{Qwen35GdnLayerImmutable, Qwen35GdnLayerObservables};
 pub use qwen35_mtp_layer::Qwen35MtpLayerObservables;
 #[cfg(feature = "qualification")]
 pub use qwen35_resident_model::Qwen35ResidentModelObservables;
+#[cfg(feature = "qualification")]
+pub use qwen35_resident_mtp::Qwen35ResidentMtpObservables;
 #[cfg(feature = "qualification")]
 pub use qwen35_text_endpoint::Qwen35EndpointObservables;
 #[cfg(feature = "qualification")]

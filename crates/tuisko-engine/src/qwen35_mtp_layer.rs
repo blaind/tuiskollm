@@ -1,7 +1,7 @@
 //! Resident source-backed Qwen3.5 MTP transformer layer.
 
 use crate::qwen35_mtp_layer_layout::{
-    QWEN35_MTP_CONTEXT_CAPACITY, QWEN35_MTP_PHYSICAL_PAGES, QWEN35_MTP_TABLE_STRIDE,
+    QWEN35_MTP_PHYSICAL_PAGES, QWEN35_MTP_PROMPT_ROWS, QWEN35_MTP_TABLE_STRIDE,
     Qwen35MtpLayerRegions,
 };
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen35MtpLayerLayout};
@@ -15,6 +15,16 @@ use tuisko_model::{Arch, CheckpointSnapshot, MtpBindings, Qwen35_9B};
 
 const ROTARY_PAIRS: usize = 32;
 const REALIGN_ROUTES: usize = 4;
+const PROMPT_ROUTES: [usize; 3] = [32, 64, QWEN35_MTP_PROMPT_ROWS];
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Qwen35MtpKvBinding {
+    pub(crate) block_tables: u64,
+    pub(crate) key_pages: u64,
+    pub(crate) value_pages: u64,
+    pub(crate) table_stride: usize,
+    pub(crate) context_capacity: usize,
+}
 
 /// One exact source-backed Qwen3.5 MTP layer without a duplicate text endpoint.
 pub struct Qwen35MtpLayerProgram {
@@ -33,6 +43,7 @@ pub struct Qwen35MtpLayerProgram {
     context: Arc<CudaContext>,
     layout: Qwen35MtpLayerLayout,
     base_address: u64,
+    kv_binding: Option<Qwen35MtpKvBinding>,
 }
 
 #[derive(Clone, Copy)]
@@ -74,6 +85,7 @@ struct Pointers {
     final_norm: *const u16,
     residual_output: *mut u16,
     final_normalized: *mut u16,
+    table_stride: usize,
 }
 
 impl Pointers {
@@ -116,7 +128,24 @@ impl Pointers {
             final_norm: arena.address(regions.final_norm)?.cast_const(),
             residual_output: arena.address(regions.residual_output)?,
             final_normalized: arena.address(regions.final_normalized)?,
+            table_stride: QWEN35_MTP_TABLE_STRIDE,
         })
+    }
+
+    fn bind_with_kv(
+        arena: &DeviceArena,
+        regions: Qwen35MtpLayerRegions,
+        binding: Option<Qwen35MtpKvBinding>,
+    ) -> GpuResult<Self> {
+        let mut pointers = Self::bind(arena, regions)?;
+        if let Some(binding) = binding {
+            pointers.block_tables = binding.block_tables as *const u32;
+            pointers.key_pages = binding.key_pages as *mut u16;
+            pointers.value_pages = binding.value_pages as *mut u16;
+            pointers.table_stride = binding.table_stride;
+        }
+
+        Ok(pointers)
     }
 
     fn offset_rows(self, rows: usize) -> Self {
@@ -222,9 +251,38 @@ impl Qwen35MtpLayerProgram {
         context: &Arc<CudaContext>,
         snapshot: &CheckpointSnapshot<Qwen35_9B>,
     ) -> EngineResult<Self> {
+        Self::from_snapshot_inner(context, snapshot, None)
+    }
+
+    /// Loads the layer while borrowing one stable, externally owned MTP cache.
+    ///
+    /// # Safety
+    /// The binding owner must outlive this program and every replay of its graphs.
+    pub(crate) unsafe fn from_snapshot_with_kv(
+        context: &Arc<CudaContext>,
+        snapshot: &CheckpointSnapshot<Qwen35_9B>,
+        binding: Qwen35MtpKvBinding,
+    ) -> EngineResult<Self> {
+        if binding.table_stride == 0 || binding.context_capacity == 0 {
+            return Err(EngineError::layout(
+                "external Qwen3.5 MTP cache requires nonzero table stride and capacity",
+            ));
+        }
+        Self::from_snapshot_inner(context, snapshot, Some(binding))
+    }
+
+    fn from_snapshot_inner(
+        context: &Arc<CudaContext>,
+        snapshot: &CheckpointSnapshot<Qwen35_9B>,
+        kv_binding: Option<Qwen35MtpKvBinding>,
+    ) -> EngineResult<Self> {
         let mtp = MtpBindings::bind(snapshot)?;
         let qkv = mtp.materialize_qkv()?;
-        let layout = Qwen35MtpLayerLayout::build()?;
+        let layout = if kv_binding.is_some() {
+            Qwen35MtpLayerLayout::build_for_external_cache()?
+        } else {
+            Qwen35MtpLayerLayout::build()?
+        };
         let regions = layout.regions();
         let stream = context.new_stream().map_err(GpuError::from)?;
         let arena = DeviceArena::zeroed(&stream, layout.builder())?;
@@ -289,11 +347,13 @@ impl Qwen35MtpLayerProgram {
             regions.final_norm,
             &mtp.final_norm.words().collect::<Vec<_>>(),
         )?;
-        arena.copy_from_host(
-            &stream,
-            regions.block_tables,
-            &(0..QWEN35_MTP_PHYSICAL_PAGES as u32).collect::<Vec<_>>(),
-        )?;
+        if kv_binding.is_none() {
+            arena.copy_from_host(
+                &stream,
+                regions.block_tables,
+                &(0..QWEN35_MTP_PHYSICAL_PAGES as u32).collect::<Vec<_>>(),
+            )?;
+        }
 
         let fusion = Qwen35MtpBf16FusionOp::new(context)?;
         let norm = Qwen35ResidualNormOp::new(context)?;
@@ -302,7 +362,7 @@ impl Qwen35MtpLayerProgram {
         let paged_gqa = Qwen35MtpBf16PagedGqaOp::new(context)?;
         let attention_output = Qwen35MtpBf16AttentionOutputOp::new(context)?;
         let mlp = Qwen35MtpBf16MlpOp::new(context)?;
-        let pointers = Pointers::bind(&arena, regions)?;
+        let pointers = Pointers::bind_with_kv(&arena, regions, kv_binding)?;
         let ops = Ops {
             fusion: &fusion,
             norm: &norm,
@@ -332,6 +392,7 @@ impl Qwen35MtpLayerProgram {
             context: Arc::clone(context),
             layout,
             base_address,
+            kv_binding,
         })
     }
 
@@ -360,6 +421,27 @@ impl Qwen35MtpLayerProgram {
         Ok(())
     }
 
+    /// Uploads next-token embedding rows for a resident target handoff.
+    pub fn load_embeddings(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        embedding: &[u16],
+    ) -> EngineResult<()> {
+        require_rows_or_prompt(rows)?;
+        let values = product("Qwen3.5 MTP embedding values", rows, Qwen35_9B::HIDDEN)?;
+        if embedding.len() != values {
+            return Err(EngineError::layout(format!(
+                "Qwen3.5 MTP embedding input has {} values, expected {values} for rows={rows}",
+                embedding.len()
+            )));
+        }
+        self.arena
+            .copy_prefix_from_host(stream, self.layout.regions().embedding, embedding)?;
+
+        Ok(())
+    }
+
     /// Selects one independent cache slot per active draft lane.
     pub fn load_draft_state(
         &self,
@@ -375,6 +457,81 @@ impl Qwen35MtpLayerProgram {
             batch,
             positions,
             &(0..batch as u32).collect::<Vec<_>>(),
+            rope_cos,
+            rope_sin,
+        )
+    }
+
+    /// Selects explicit stable slots for compact resident draft rows.
+    pub fn load_compact_draft_state(
+        &self,
+        stream: &CudaStream,
+        positions: &[u32],
+        slots: &[usize],
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        require_batch(positions.len())?;
+        if slots.len() != positions.len() {
+            return Err(EngineError::layout(format!(
+                "Qwen3.5 MTP compact route has {} positions and {} slots",
+                positions.len(),
+                slots.len()
+            )));
+        }
+        let mut seen = [false; MAX_BATCH];
+        let table_rows = slots
+            .iter()
+            .map(|&slot| {
+                if slot >= MAX_BATCH || seen[slot] {
+                    return Err(EngineError::route(format!(
+                        "Qwen3.5 MTP compact slot {slot} is repeated or outside 0..{MAX_BATCH}"
+                    )));
+                }
+                seen[slot] = true;
+                u32::try_from(slot).map_err(|_| EngineError::layout("Qwen3.5 MTP slot exceeds u32"))
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        self.load_state(
+            stream,
+            positions.len(),
+            positions,
+            &table_rows,
+            rope_cos,
+            rope_sin,
+        )
+    }
+
+    /// Stages one exact prompt-prime tile into a stable MTP cache row.
+    pub fn load_prompt_state(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        slot: usize,
+        first_position: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        require_prompt(rows)?;
+        if slot >= MAX_BATCH {
+            return Err(EngineError::route(format!(
+                "Qwen3.5 MTP prompt slot {slot} is outside 0..{MAX_BATCH}"
+            )));
+        }
+        let end = first_position
+            .checked_add(rows)
+            .ok_or_else(|| EngineError::route("Qwen3.5 MTP prompt positions overflow"))?;
+        let positions = (first_position..end)
+            .map(|position| {
+                u32::try_from(position)
+                    .map_err(|_| EngineError::route("Qwen3.5 MTP prompt position exceeds u32"))
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        self.load_state(
+            stream,
+            rows,
+            &positions,
+            &vec![slot as u32; rows],
             rope_cos,
             rope_sin,
         )
@@ -439,9 +596,10 @@ impl Qwen35MtpLayerProgram {
         let lengths = positions
             .iter()
             .map(|&position| {
-                if position as usize >= QWEN35_MTP_CONTEXT_CAPACITY {
+                if position as usize >= self.context_capacity() {
                     return Err(EngineError::route(format!(
-                        "Qwen3.5 MTP cache position {position} exceeds the {QWEN35_MTP_CONTEXT_CAPACITY}-token isolated capacity"
+                        "Qwen3.5 MTP cache position {position} exceeds the {}-token capacity",
+                        self.context_capacity()
                     )));
                 }
                 position
@@ -533,6 +691,15 @@ impl Qwen35MtpLayerProgram {
         )?)
     }
 
+    /// Reads active final draft-residual BF16 rows.
+    pub fn read_residual_output(&self, stream: &CudaStream, rows: usize) -> EngineResult<Vec<u16>> {
+        require_rows(rows)?;
+        let values = product("Qwen3.5 MTP residual values", rows, Qwen35_9B::HIDDEN)?;
+        Ok(self
+            .arena
+            .copy_prefix_to_host(stream, self.layout.regions().residual_output, values)?)
+    }
+
     /// CUDA context shared by all owner allocations and graphs.
     pub const fn context(&self) -> &Arc<CudaContext> {
         &self.context
@@ -570,7 +737,10 @@ impl Qwen35MtpLayerProgram {
 
     /// Short per-slot cache capacity of this isolated composition owner.
     pub const fn context_capacity(&self) -> usize {
-        self.layout.context_capacity()
+        match self.kv_binding {
+            Some(binding) => binding.context_capacity,
+            None => self.layout.context_capacity(),
+        }
     }
 
     /// Number of immutable exact graph entries.
@@ -578,16 +748,55 @@ impl Qwen35MtpLayerProgram {
         MAX_BATCH + 2 * REALIGN_ROUTES
     }
 
+    fn pointers(&self) -> GpuResult<Pointers> {
+        Pointers::bind_with_kv(&self.arena, self.layout.regions(), self.kv_binding)
+    }
+
+    pub(crate) fn final_normalized_address(&self) -> GpuResult<*const u16> {
+        Ok(self.pointers()?.final_normalized.cast_const())
+    }
+
+    /// Launches a draft route from one external stable target-hidden plane.
+    ///
+    /// # Safety
+    /// `target_hidden` must cover `batch * 4096` BF16 values until completion.
+    pub(crate) unsafe fn launch_draft_from(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        target_hidden: *const u16,
+    ) -> EngineResult<()> {
+        require_batch(batch)?;
+        let mut pointers = self.pointers()?;
+        pointers.target_hidden = target_hidden;
+        launch_full(stream, batch, self.ops(), pointers)?;
+
+        Ok(())
+    }
+
+    /// Launches a prompt-prime tile from the target's stable residual plane.
+    ///
+    /// # Safety
+    /// `target_hidden` must cover `rows * 4096` BF16 values until completion.
+    pub(crate) unsafe fn launch_prompt_prime_from(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        target_hidden: *const u16,
+    ) -> EngineResult<()> {
+        require_prompt(rows)?;
+        let mut pointers = self.pointers()?;
+        pointers.target_hidden = target_hidden;
+        launch_prime(stream, rows, self.ops(), pointers)?;
+
+        Ok(())
+    }
+
     #[cfg(feature = "qualification")]
     /// Launches one complete transformer-layer route eagerly.
     pub fn launch_eager_draft(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
         require_batch(batch)?;
-        launch_full(
-            stream,
-            batch,
-            self.ops(),
-            Pointers::bind(&self.arena, self.layout.regions())?,
-        )?;
+        launch_full(stream, batch, self.ops(), self.pointers()?)?;
         Ok(())
     }
 
@@ -599,12 +808,7 @@ impl Qwen35MtpLayerProgram {
                 "Qwen3.5 MTP qualification row {row} is outside 0..{MAX_BATCH}"
             )));
         }
-        launch_full(
-            stream,
-            1,
-            self.ops(),
-            Pointers::bind(&self.arena, self.layout.regions())?.offset_rows(row),
-        )?;
+        launch_full(stream, 1, self.ops(), self.pointers()?.offset_rows(row))?;
         Ok(())
     }
 
@@ -612,12 +816,7 @@ impl Qwen35MtpLayerProgram {
     /// Launches one prime-only route eagerly.
     pub fn launch_eager_prime(&self, stream: &CudaStream, tokens: usize) -> EngineResult<()> {
         require_realign(tokens)?;
-        launch_prime(
-            stream,
-            tokens,
-            self.ops(),
-            Pointers::bind(&self.arena, self.layout.regions())?,
-        )?;
+        launch_prime(stream, tokens, self.ops(), self.pointers()?)?;
         Ok(())
     }
 
@@ -625,12 +824,7 @@ impl Qwen35MtpLayerProgram {
     /// Launches one causal realignment route eagerly.
     pub fn launch_eager_realign(&self, stream: &CudaStream, tokens: usize) -> EngineResult<()> {
         require_realign(tokens)?;
-        launch_realign(
-            stream,
-            tokens,
-            self.ops(),
-            Pointers::bind(&self.arena, self.layout.regions())?,
-        )?;
+        launch_realign(stream, tokens, self.ops(), self.pointers()?)?;
         Ok(())
     }
 
@@ -655,7 +849,7 @@ impl Qwen35MtpLayerProgram {
                 "repeated Qwen3.5 MTP layer graph requires at least one operation",
             ));
         }
-        let pointers = Pointers::bind(&self.arena, self.layout.regions())?;
+        let pointers = self.pointers()?;
         let ops = self.ops();
         Ok(CudaGraph::capture(stream, || {
             for _ in 0..operations {
@@ -668,7 +862,7 @@ impl Qwen35MtpLayerProgram {
     #[cfg(feature = "qualification")]
     /// Returns every arena address in checked layout order.
     pub fn qualification_addresses(&self) -> EngineResult<Vec<usize>> {
-        Ok(Pointers::bind(&self.arena, self.layout.regions())?.addresses())
+        Ok(self.pointers()?.addresses())
     }
 
     #[cfg(feature = "qualification")]
@@ -903,7 +1097,7 @@ fn launch_prime(
             pointers.rope_sin,
             pointers.block_tables,
             pointers.table_rows,
-            QWEN35_MTP_TABLE_STRIDE,
+            pointers.table_stride,
             pointers.cache_positions,
             pointers.query,
             pointers.key_pages,
@@ -932,7 +1126,7 @@ fn launch_full(
             pointers.value_pages,
             pointers.block_tables,
             pointers.table_rows,
-            QWEN35_MTP_TABLE_STRIDE,
+            pointers.table_stride,
             pointers.lengths,
             pointers.attention,
         )?;
@@ -1013,6 +1207,25 @@ fn require_rows(rows: usize) -> EngineResult<()> {
         )));
     }
     Ok(())
+}
+
+fn require_prompt(rows: usize) -> EngineResult<()> {
+    if !PROMPT_ROUTES.contains(&rows) {
+        return Err(EngineError::route(format!(
+            "Qwen3.5 MTP prompt rows {rows} are outside 32,64,128"
+        )));
+    }
+    Ok(())
+}
+
+fn require_rows_or_prompt(rows: usize) -> EngineResult<()> {
+    if (1..=MAX_BATCH).contains(&rows) || PROMPT_ROUTES.contains(&rows) {
+        Ok(())
+    } else {
+        Err(EngineError::route(format!(
+            "Qwen3.5 MTP rows {rows} are outside 1..={MAX_BATCH},32,64,128"
+        )))
+    }
 }
 
 fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {

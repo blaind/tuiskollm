@@ -189,6 +189,10 @@ mod qwen35_resident_model;
 #[cfg(feature = "device")]
 mod qwen35_resident_model_benchmark;
 #[cfg(feature = "device")]
+mod qwen35_resident_mtp;
+#[cfg(feature = "device")]
+mod qwen35_resident_mtp_benchmark;
+#[cfg(feature = "device")]
 mod qwen35_text_endpoint;
 #[cfg(feature = "device")]
 mod qwen35_text_endpoint_benchmark;
@@ -550,6 +554,13 @@ pub use qwen35_resident_model::{
 };
 #[cfg(feature = "device")]
 pub use qwen35_resident_model_benchmark::benchmark_qwen35_resident_model;
+#[cfg(feature = "device")]
+pub use qwen35_resident_mtp::{
+    Qwen35ResidentMtpQualification, Qwen35ResidentMtpQualificationError,
+    qualify_qwen35_resident_mtp,
+};
+#[cfg(feature = "device")]
+pub use qwen35_resident_mtp_benchmark::benchmark_qwen35_resident_mtp;
 #[cfg(feature = "device")]
 pub use qwen35_text_endpoint::{
     Qwen35TextEndpointQualification, Qwen35TextEndpointQualificationError,

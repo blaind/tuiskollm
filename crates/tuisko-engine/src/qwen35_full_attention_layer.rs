@@ -746,6 +746,10 @@ impl Qwen35FullAttentionLayerProgram {
         Ok(self.pointers()?.residual_input)
     }
 
+    pub(crate) fn output_address(&self) -> GpuResult<*const u16> {
+        Ok(self.pointers()?.residual_output.cast_const())
+    }
+
     fn pointers(&self) -> GpuResult<Pointers> {
         Pointers::bind_with_kv(&self.arena, self.layout.regions(), self.kv_binding)
     }
