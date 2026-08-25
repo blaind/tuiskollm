@@ -29,6 +29,7 @@ const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-residual-norm-sm120.txt";
 const QWEN35_RESIDUAL_NORM_TEST_FILTER: &str = "qwen35_residual_norm";
 const QWEN35_LONG_CONTEXT_KV_TEST_FILTER: &str = "qwen35_long_context_kv::tests";
+const QWEN36_LONG_CONTEXT_KV_TEST_FILTER: &str = "qwen36_long_context_kv::tests";
 const QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen36-residual-norm-sm120.txt";
 const QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt";
@@ -803,6 +804,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen35-long-context-kv") if remaining.is_empty() => {
             qualify_qwen35_long_context_kv(root)
         }
+        Some("qualify-qwen36-long-context-kv") if remaining.is_empty() => {
+            qualify_qwen36_long_context_kv(root)
+        }
         Some("qualify-qwen35-nvfp4-gdn-input") if remaining.is_empty() => {
             qualify_qwen35_nvfp4_gdn_input(root)
         }
@@ -1103,6 +1107,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-paged-gqa"
                     | "qualify-qwen35-paged-gqa"
                     | "qualify-qwen35-long-context-kv"
+                    | "qualify-qwen36-long-context-kv"
                     | "qualify-qwen36-paged-gqa"
                     | "qualify-qwen36-fp8-paged-gqa"
                     | "qualify-long-context-paged-gqa"
@@ -2448,6 +2453,31 @@ fn qualify_qwen35_long_context_kv(root: &Path) -> Result<(), Box<dyn Error>> {
             "--lib",
             "--",
             QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+    )
+}
+
+fn qualify_qwen36_long_context_kv(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -14343,13 +14373,13 @@ mod tests {
     use super::{
         COMPOSED_PERFORMANCE_SUITES, MTP_LAYER_RESOURCE_BASELINES, OptimizationSuite,
         PERFORMANCE_SUITES, PerformanceSuite, QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
-        QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
-        SM120_RESOURCE_BASELINES, device_is_idle, parse_baseline, parse_compute_pids,
-        parse_cuda_toolkit_identity, parse_entries, parse_performance_device_sample,
-        parse_performance_iteration, parse_resources, parse_rustc_identity,
-        preflight_performance_baselines, require_consumed_baseline_keys, require_count,
-        require_registers, require_uniform_value, resolve_target_output, sass_function_body,
-        workspace_root,
+        QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
+        QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, device_is_idle,
+        parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
+        parse_performance_device_sample, parse_performance_iteration, parse_resources,
+        parse_rustc_identity, preflight_performance_baselines, require_consumed_baseline_keys,
+        require_count, require_registers, require_uniform_value, resolve_target_output,
+        sass_function_body, workspace_root,
     };
     use std::ffi::OsString;
 
@@ -14391,6 +14421,16 @@ mod tests {
             "qwen35_long_context_kv::tests::qwen35_long_context_kv_suite_lifecycle_is_address_stable",
         ] {
             assert!(test.contains(QWEN35_LONG_CONTEXT_KV_TEST_FILTER));
+        }
+    }
+
+    #[test]
+    fn qwen36_long_context_filter_selects_lifecycle_and_accounting() {
+        for test in [
+            "qwen36_long_context_kv::tests::qwen36_long_context_kv_suite_byte_accounting_is_exact",
+            "qwen36_long_context_kv::tests::qwen36_long_context_kv_suite_lifecycle_is_address_stable",
+        ] {
+            assert!(test.contains(QWEN36_LONG_CONTEXT_KV_TEST_FILTER));
         }
     }
 

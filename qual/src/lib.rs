@@ -231,6 +231,8 @@ mod qwen36_gdn_output_benchmark;
 #[cfg(feature = "device")]
 mod qwen36_generation;
 #[cfg(feature = "device")]
+mod qwen36_long_context_kv;
+#[cfg(feature = "device")]
 mod qwen36_moe_experts;
 #[cfg(feature = "device")]
 mod qwen36_moe_experts_benchmark;
