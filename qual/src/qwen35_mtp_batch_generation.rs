@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the pinned Qwen3.5 snapshot and an exclusive SM120 device"]
-    fn compact_scheduler_matches_target_and_reuses_rejected_slots()
+    fn qwen35_mtp_batch_generation_suite_compact_scheduler_matches_target_and_reuses_rejected_slots()
     -> Result<(), super::Qwen35MtpBatchQualificationError> {
         let root = std::env::var_os("TUISKO_QWEN35_SNAPSHOT").ok_or_else(|| {
             super::Qwen35MtpBatchQualificationError::Mismatch(

@@ -419,7 +419,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token_and_logit_samples_cover_boundaries() {
+    fn qwen35_text_endpoint_suite_token_and_logit_samples_cover_boundaries() {
         assert_eq!(sampled_rows()[0], 0);
         assert_eq!(sampled_rows()[LOGIT_SAMPLES - 1], Qwen35_9B::VOCAB - 1);
         for batch in 1..=MAX_BATCH {
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the pinned Qwen3.5 snapshot and an exclusive compute-capability 12.0 device"]
-    fn source_endpoint_matches_complete_oracles_and_graph_replay()
+    fn qwen35_text_endpoint_suite_source_endpoint_matches_complete_oracles_and_graph_replay()
     -> Result<(), Qwen35TextEndpointQualificationError> {
         let root = std::env::var("TUISKO_QWEN35_SNAPSHOT").map_err(|_| {
             Qwen35TextEndpointQualificationError::Mismatch(

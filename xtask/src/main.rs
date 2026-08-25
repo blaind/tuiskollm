@@ -29,6 +29,11 @@ const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-residual-norm-sm120.txt";
 const QWEN35_RESIDUAL_NORM_TEST_FILTER: &str = "qwen35_residual_norm";
 const QWEN35_LONG_CONTEXT_KV_TEST_FILTER: &str = "qwen35_long_context_kv::tests";
+const QWEN35_TEXT_ENDPOINT_TEST_FILTER: &str = "qwen35_text_endpoint_suite_";
+const QWEN35_RESIDENT_MODEL_TEST_FILTER: &str = "qwen35_resident_model_suite_";
+const QWEN35_RESIDENT_MTP_TEST_FILTER: &str = "qwen35_resident_mtp_suite_";
+const QWEN35_MTP_GENERATION_TEST_FILTER: &str = "qwen35_mtp_generation_suite_";
+const QWEN35_MTP_BATCH_GENERATION_TEST_FILTER: &str = "qwen35_mtp_batch_generation_suite_";
 const QWEN36_LONG_CONTEXT_KV_TEST_FILTER: &str = "qwen36_long_context_kv::tests";
 const QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen36-residual-norm-sm120.txt";
@@ -2106,7 +2111,7 @@ fn qualify_qwen35_text_endpoint(
             "--release",
             "--lib",
             "--",
-            "qwen35_text_endpoint::tests",
+            QWEN35_TEXT_ENDPOINT_TEST_FILTER,
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -2276,7 +2281,7 @@ fn qualify_qwen35_resident_model(
             "--release",
             "--lib",
             "--",
-            "qwen35_resident_model::tests",
+            QWEN35_RESIDENT_MODEL_TEST_FILTER,
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -2319,7 +2324,7 @@ fn qualify_qwen35_resident_mtp(
             "--release",
             "--lib",
             "--",
-            "qwen35_resident_mtp::tests",
+            QWEN35_RESIDENT_MTP_TEST_FILTER,
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -2363,7 +2368,7 @@ fn qualify_qwen35_mtp_generation(
             "--release",
             "--lib",
             "--",
-            "qwen35_mtp_generation::tests",
+            QWEN35_MTP_GENERATION_TEST_FILTER,
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -2409,7 +2414,7 @@ fn qualify_qwen35_mtp_batch_generation(
             "--release",
             "--lib",
             "--",
-            "qwen35_mtp_batch_generation::tests",
+            QWEN35_MTP_BATCH_GENERATION_TEST_FILTER,
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -14411,13 +14416,16 @@ mod tests {
     use super::{
         COMPOSED_PERFORMANCE_SUITES, MTP_LAYER_RESOURCE_BASELINES, OptimizationSuite,
         PERFORMANCE_SUITES, PerformanceSuite, QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
-        QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
-        QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, device_is_idle,
-        parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
-        parse_performance_device_sample, parse_performance_iteration, parse_resources,
-        parse_rustc_identity, preflight_performance_baselines, require_consumed_baseline_keys,
-        require_count, require_registers, require_uniform_value, resolve_target_output,
-        sass_function_body, workspace_root,
+        QWEN35_MTP_BATCH_GENERATION_TEST_FILTER, QWEN35_MTP_GENERATION_TEST_FILTER,
+        QWEN35_RESIDENT_MODEL_TEST_FILTER, QWEN35_RESIDENT_MTP_TEST_FILTER,
+        QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN35_TEXT_ENDPOINT_TEST_FILTER,
+        QWEN36_LONG_CONTEXT_KV_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
+        SM120_RESOURCE_BASELINES, device_is_idle, parse_baseline, parse_compute_pids,
+        parse_cuda_toolkit_identity, parse_entries, parse_performance_device_sample,
+        parse_performance_iteration, parse_resources, parse_rustc_identity,
+        preflight_performance_baselines, require_consumed_baseline_keys, require_count,
+        require_registers, require_uniform_value, resolve_target_output, sass_function_body,
+        workspace_root,
     };
     use std::ffi::OsString;
 
@@ -14459,6 +14467,55 @@ mod tests {
             "qwen35_long_context_kv::tests::qwen35_long_context_kv_suite_lifecycle_is_address_stable",
         ] {
             assert!(test.contains(QWEN35_LONG_CONTEXT_KV_TEST_FILTER));
+        }
+    }
+
+    #[test]
+    fn qwen35_composed_filters_select_oracles_and_accounting() {
+        for (filter, tests) in [
+            (
+                QWEN35_TEXT_ENDPOINT_TEST_FILTER,
+                &[
+                    "qwen35_text_endpoint::tests::qwen35_text_endpoint_suite_token_and_logit_samples_cover_boundaries",
+                    "qwen35_text_endpoint::tests::qwen35_text_endpoint_suite_source_endpoint_matches_complete_oracles_and_graph_replay",
+                    "qwen35_text_endpoint_benchmark::tests::qwen35_text_endpoint_suite_benchmark_accounting_covers_bf16_endpoint_operations",
+                ][..],
+            ),
+            (
+                QWEN35_RESIDENT_MODEL_TEST_FILTER,
+                &[
+                    "qwen35_resident_model::tests::qwen35_resident_model_suite_samples_cover_exact_boundaries",
+                    "qwen35_resident_model::tests::qwen35_resident_model_suite_whole_model_matches_endpoint_oracles_and_graph_replay",
+                    "qwen35_resident_model_benchmark::tests::qwen35_resident_model_suite_benchmark_accounting_covers_every_layer_endpoint_and_route",
+                ][..],
+            ),
+            (
+                QWEN35_RESIDENT_MTP_TEST_FILTER,
+                &[
+                    "qwen35_resident_mtp::tests::qwen35_resident_mtp_suite_inventory_is_exact",
+                    "qwen35_resident_mtp::tests::qwen35_resident_mtp_suite_composes_draft_prompt_and_mirrored_lifecycle",
+                    "qwen35_resident_mtp_benchmark::tests::qwen35_resident_mtp_suite_benchmark_inventory_and_accounting_are_exact",
+                ][..],
+            ),
+            (
+                QWEN35_MTP_GENERATION_TEST_FILTER,
+                &[
+                    "qwen35_mtp_generation::tests::qwen35_mtp_generation_suite_inventory_selects_every_k",
+                    "qwen35_mtp_generation::tests::qwen35_mtp_generation_suite_matches_target_only_greedy",
+                    "qwen35_mtp_generation_benchmark::tests::qwen35_mtp_generation_suite_benchmark_uses_one_complete_k4_request",
+                ][..],
+            ),
+            (
+                QWEN35_MTP_BATCH_GENERATION_TEST_FILTER,
+                &[
+                    "qwen35_mtp_batch_generation::tests::qwen35_mtp_batch_generation_suite_compact_scheduler_matches_target_and_reuses_rejected_slots",
+                    "qwen35_mtp_batch_generation_benchmark::tests::qwen35_mtp_batch_generation_suite_benchmark_inventory_is_exact",
+                ][..],
+            ),
+        ] {
+            for test in tests {
+                assert!(test.contains(filter), "`{filter}` does not select `{test}`");
+            }
         }
     }
 

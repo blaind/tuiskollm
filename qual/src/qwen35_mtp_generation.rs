@@ -317,7 +317,7 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn qwen35_mtp_generation_inventory_selects_every_k() {
+    fn qwen35_mtp_generation_suite_inventory_selects_every_k() {
         assert_eq!(LIMIT_CASES, [2, 3, 4, 8]);
         assert_eq!(LIMIT_CASES.map(|limit| (limit - 1).min(4)), [1, 2, 3, 4]);
         assert_eq!(
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the admitted Qwen3.5 snapshot and an exclusive RTX 5090"]
-    fn qwen35_mtp_generation_matches_target_only_greedy() {
+    fn qwen35_mtp_generation_suite_matches_target_only_greedy() {
         let root = std::env::var_os("TUISKO_QWEN35_SNAPSHOT")
             .expect("TUISKO_QWEN35_SNAPSHOT must name the admitted Qwen3.5 snapshot");
         let report = super::qualify_qwen35_mtp_generation(Path::new(&root)).unwrap();
