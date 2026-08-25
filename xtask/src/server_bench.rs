@@ -20,6 +20,7 @@ const LOADED_PROBE_SECONDS: f64 = 3.0;
 const MAX_SM_CLOCK_SPREAD_MHZ: u32 = 50;
 const MAX_MEMORY_CLOCK_SPREAD_MHZ: u32 = 250;
 const DEFAULT_SAMPLES: usize = 5;
+const DIAGNOSTIC_CLOCK_ENV: &str = "TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT";
 
 pub(super) fn run(root: &Path, arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
     let options = Options::parse(arguments)?;
@@ -249,7 +250,10 @@ fn run_authority(
     require_only_server_process(server_pid)?;
 
     let device = device_identity()?;
-    if let Err(refusal) = require_comparable_clocks(&loaded_probe.summary) {
+    let loaded_clock_refusal = require_comparable_clocks(&loaded_probe.summary).err();
+    if let Some(refusal) = loaded_clock_refusal.as_ref()
+        && !preserve_refused_measurements()
+    {
         let report = AuthorityReport {
             schema_version: 1,
             suite: "server",
@@ -269,7 +273,12 @@ fn run_authority(
             benchmark: None,
         };
         write_authority(&options.output, &report)?;
-        return Err(refusal.into());
+        return Err(refusal.clone().into());
+    }
+    if let Some(refusal) = loaded_clock_refusal.as_ref() {
+        eprintln!(
+            "{refusal}; {DIAGNOSTIC_CLOCK_ENV}=1 preserves the directly measured suite as refused evidence"
+        );
     }
 
     if raw_path.exists() {
@@ -289,15 +298,12 @@ fn run_authority(
     let measurement = sampler.finish()?;
     require_only_server_process(server_pid)?;
     let benchmark = read_json_if_present(&raw_path)?;
-    let clock_result = require_comparable_clocks(&measurement.summary);
-    let status = if benchmark_result.is_err() {
-        "failed"
-    } else if clock_result.is_err() {
-        "refused_measurement_clocks"
-    } else {
-        "complete"
-    };
-    let refusal = clock_result.err();
+    let measurement_clock_refusal = require_comparable_clocks(&measurement.summary).err();
+    let (status, refusal) = authority_outcome(
+        benchmark_result.is_err(),
+        loaded_clock_refusal,
+        measurement_clock_refusal,
+    );
     let energy = benchmark
         .as_ref()
         .and_then(completion_tokens)
@@ -333,6 +339,35 @@ fn run_authority(
         raw_path.display()
     );
     Ok(())
+}
+
+fn preserve_refused_measurements() -> bool {
+    std::env::var(DIAGNOSTIC_CLOCK_ENV).as_deref() == Ok("1")
+}
+
+fn authority_outcome(
+    benchmark_failed: bool,
+    loaded_clock_refusal: Option<String>,
+    measurement_clock_refusal: Option<String>,
+) -> (&'static str, Option<String>) {
+    let status = if benchmark_failed {
+        "failed"
+    } else if loaded_clock_refusal.is_some() {
+        "refused_loaded_clocks"
+    } else if measurement_clock_refusal.is_some() {
+        "refused_measurement_clocks"
+    } else {
+        "complete"
+    };
+    let refusal = match (loaded_clock_refusal, measurement_clock_refusal) {
+        (Some(loaded), Some(measurement)) => Some(format!(
+            "loaded probe refused: {loaded}; complete measurement refused: {measurement}"
+        )),
+        (Some(loaded), None) => Some(loaded),
+        (None, Some(measurement)) => Some(measurement),
+        (None, None) => None,
+    };
+    (status, refusal)
 }
 
 struct TelemetrySampler {
@@ -715,7 +750,8 @@ fn parse_u64(value: &str, label: &str) -> Result<u64, String> {
 mod tests {
     use super::{
         BaselineAction, MAX_MEMORY_CLOCK_SPREAD_MHZ, MAX_SM_CLOCK_SPREAD_MHZ, Options,
-        completion_tokens, parse_telemetry_row, require_comparable_clocks, summarize_telemetry,
+        authority_outcome, completion_tokens, parse_telemetry_row, require_comparable_clocks,
+        summarize_telemetry,
     };
     use serde_json::json;
     use std::ffi::OsString;
@@ -770,6 +806,27 @@ mod tests {
             ]
         });
         assert_eq!(completion_tokens(&report), Some(84));
+    }
+
+    #[test]
+    fn loaded_clock_refusal_remains_terminal_after_preserved_measurement() {
+        let (status, refusal) = authority_outcome(
+            false,
+            Some("loaded drift".into()),
+            Some("measurement drift".into()),
+        );
+        assert_eq!(status, "refused_loaded_clocks");
+        let refusal = refusal.unwrap();
+        assert!(refusal.contains("loaded probe refused: loaded drift"));
+        assert!(refusal.contains("complete measurement refused: measurement drift"));
+
+        let (status, refusal) = authority_outcome(false, None, None);
+        assert_eq!(status, "complete");
+        assert!(refusal.is_none());
+
+        let (status, refusal) = authority_outcome(true, Some("loaded drift".into()), None);
+        assert_eq!(status, "failed");
+        assert_eq!(refusal.as_deref(), Some("loaded drift"));
     }
 
     #[test]
