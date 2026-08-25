@@ -19,10 +19,11 @@ pub use paged_gqa::{
     PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PAGED_GQA_PREFILL_MACRO_MAX_PARTITIONS,
     PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES, PAGED_GQA_PREFILL_MACRO_TOKENS,
     PAGED_GQA_PREFILL_MAX_CONTEXT, PAGED_GQA_PREFILL_PARTIAL_BYTES, PagedGqaOp, Qwen35PagedGqaOp,
-    Qwen36PagedGqaOp, paged_gqa_prefill_partitions,
+    Qwen36Fp8PagedGqaOp, Qwen36PagedGqaOp, paged_gqa_prefill_partitions,
 };
 pub(crate) use paged_gqa::{
-    paged_gqa_ptx_names, qwen35_paged_gqa_ptx_names, qwen36_paged_gqa_ptx_names,
+    paged_gqa_ptx_names, qwen35_paged_gqa_ptx_names, qwen36_fp8_paged_gqa_ptx_names,
+    qwen36_paged_gqa_ptx_names,
 };
 pub use qk_prepare::{
     ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, Qwen35AttentionQkPrepareOp,

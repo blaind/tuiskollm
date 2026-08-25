@@ -1,4 +1,4 @@
-//! Direct timings for exact represented-BF16 paged-GQA graphs.
+//! Direct timings for exact represented-cache paged-GQA graphs.
 
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
@@ -13,7 +13,7 @@ use tuisko_gpu::{
     GpuTimer,
 };
 use tuisko_kernels_sm120::{
-    ATTENTION_PAGE_SIZE, MtpBf16PagedGqaOp, Qwen35PagedGqaOp, Qwen36PagedGqaOp,
+    ATTENTION_PAGE_SIZE, MtpBf16PagedGqaOp, Qwen35PagedGqaOp, Qwen36Fp8PagedGqaOp, Qwen36PagedGqaOp,
 };
 use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
@@ -28,6 +28,8 @@ const PHYSICAL_PAGES: usize = 24;
 const TABLE_ROWS: usize = 8;
 const TABLE_STRIDE: usize = 3;
 const CONTEXT_TOKENS: usize = 130;
+const KEY_SCALE: f32 = 0.03125;
+const VALUE_SCALE: f32 = 0.0625;
 const TABLE_ROW_IDS: [u32; MAX_BATCH] = [7, 0, 5, 2, 6, 1, 4, 3];
 const BLOCK_TABLES: [u32; TABLE_ROWS * TABLE_STRIDE] = [
     17, 2, 21, 4, 15, 0, 23, 7, 12, 1, 18, 9, 14, 5, 22, 8, 19, 3, 20, 6, 13, 10, 16, 11,
@@ -41,12 +43,14 @@ const KEY_VALUES: [f32; 8] = [
 const VALUE_VALUES: [f32; 8] = [
     0.125, -0.125, 0.0625, -0.0625, 0.03125, -0.03125, 0.015625, -0.015625,
 ];
+const KEY_CODES: [u8; 8] = [0x00, 0x28, 0x30, 0x38, 0xa8, 0xb0, 0xb8, 0x20];
+const VALUE_CODES: [u8; 8] = [0x38, 0xb8, 0x30, 0xb0, 0x28, 0xa8, 0x20, 0xa0];
 
 #[derive(Clone, Copy)]
 struct Regions {
     query: ArenaRegion<f32>,
-    key_pages: ArenaRegion<u16>,
-    value_pages: ArenaRegion<u16>,
+    key_pages: ArenaRegion<u8>,
+    value_pages: ArenaRegion<u8>,
     block_tables: ArenaRegion<u32>,
     table_rows: ArenaRegion<u32>,
     lengths: ArenaRegion<u32>,
@@ -71,8 +75,8 @@ impl Regions {
 
 struct Addresses {
     query: *const f32,
-    key_pages: *const u16,
-    value_pages: *const u16,
+    key_pages: *const u8,
+    value_pages: *const u8,
     block_tables: *const u32,
     table_rows: *const u32,
     lengths: *const u32,
@@ -87,6 +91,7 @@ struct RouteGraphs {
 
 trait BenchPagedGqaOp {
     type Target: Arch;
+    const CACHE_ELEMENT_BYTES: usize;
     const ROUTES: &'static [usize];
     const MAX_TOKENS: usize;
     const ROUTE: &'static str;
@@ -101,11 +106,13 @@ trait BenchPagedGqaOp {
     where
         Self: Sized;
     fn workload(batch: usize) -> BenchmarkWorkload;
+    fn cache_fixture(plane_elements: usize) -> (Vec<u8>, Vec<u8>);
     fn launch(&self, stream: &CudaStream, batch: usize, addresses: &Addresses) -> GpuResult<()>;
 }
 
 impl BenchPagedGqaOp for Qwen35PagedGqaOp {
     type Target = Qwen35_9B;
+    const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const ROUTES: &'static [usize] = &QWEN35_ROUTES;
     const MAX_TOKENS: usize = QWEN35_MAX_TOKENS;
     const ROUTE: &'static str = "qwen35_paged_gqa/online_softmax_bf16_kv";
@@ -130,6 +137,10 @@ impl BenchPagedGqaOp for Qwen35PagedGqaOp {
         }
     }
 
+    fn cache_fixture(plane_elements: usize) -> (Vec<u8>, Vec<u8>) {
+        bf16_cache_fixture::<Self::Target>(plane_elements)
+    }
+
     fn launch(&self, stream: &CudaStream, batch: usize, addresses: &Addresses) -> GpuResult<()> {
         // SAFETY: the session owns all 24 pages and metadata rows for the
         // 130-position context throughout every captured graph replay.
@@ -138,8 +149,8 @@ impl BenchPagedGqaOp for Qwen35PagedGqaOp {
                 stream,
                 batch,
                 addresses.query,
-                addresses.key_pages,
-                addresses.value_pages,
+                addresses.key_pages.cast(),
+                addresses.value_pages.cast(),
                 addresses.block_tables,
                 addresses.table_rows,
                 TABLE_STRIDE,
@@ -152,6 +163,7 @@ impl BenchPagedGqaOp for Qwen35PagedGqaOp {
 
 impl BenchPagedGqaOp for Qwen36PagedGqaOp {
     type Target = Qwen36Moe35B;
+    const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const ROUTES: &'static [usize] = &QWEN36_ROUTES;
     const MAX_TOKENS: usize = QWEN36_MAX_TOKENS;
     const ROUTE: &'static str = "qwen36_paged_gqa/online_softmax_bf16_kv";
@@ -176,6 +188,10 @@ impl BenchPagedGqaOp for Qwen36PagedGqaOp {
         }
     }
 
+    fn cache_fixture(plane_elements: usize) -> (Vec<u8>, Vec<u8>) {
+        bf16_cache_fixture::<Self::Target>(plane_elements)
+    }
+
     fn launch(&self, stream: &CudaStream, batch: usize, addresses: &Addresses) -> GpuResult<()> {
         // SAFETY: the session owns all 24 pages and metadata rows for the
         // 130-position context throughout every captured graph replay.
@@ -184,8 +200,8 @@ impl BenchPagedGqaOp for Qwen36PagedGqaOp {
                 stream,
                 batch,
                 addresses.query,
-                addresses.key_pages,
-                addresses.value_pages,
+                addresses.key_pages.cast(),
+                addresses.value_pages.cast(),
                 addresses.block_tables,
                 addresses.table_rows,
                 TABLE_STRIDE,
@@ -198,6 +214,7 @@ impl BenchPagedGqaOp for Qwen36PagedGqaOp {
 
 impl BenchPagedGqaOp for MtpBf16PagedGqaOp {
     type Target = Qwen38_27B;
+    const CACHE_ELEMENT_BYTES: usize = size_of::<u16>();
     const ROUTES: &'static [usize] = &DECODE_ROUTES;
     const MAX_TOKENS: usize = MAX_BATCH;
     const ROUTE: &'static str = "mtp_bf16_paged_gqa/online_softmax_bf16_kv";
@@ -218,6 +235,61 @@ impl BenchPagedGqaOp for MtpBf16PagedGqaOp {
         BenchmarkWorkload::warm_operator_mtp(batch as u64)
     }
 
+    fn cache_fixture(plane_elements: usize) -> (Vec<u8>, Vec<u8>) {
+        bf16_cache_fixture::<Self::Target>(plane_elements)
+    }
+
+    fn launch(&self, stream: &CudaStream, batch: usize, addresses: &Addresses) -> GpuResult<()> {
+        // SAFETY: the session owns all 24 pages and metadata rows for the
+        // 130-position context throughout every captured graph replay.
+        unsafe {
+            self.launch(
+                stream,
+                batch,
+                addresses.query,
+                addresses.key_pages.cast(),
+                addresses.value_pages.cast(),
+                addresses.block_tables,
+                addresses.table_rows,
+                TABLE_STRIDE,
+                addresses.lengths,
+                addresses.output,
+            )
+        }
+    }
+}
+
+impl BenchPagedGqaOp for Qwen36Fp8PagedGqaOp {
+    type Target = Qwen36Moe35B;
+    const CACHE_ELEMENT_BYTES: usize = size_of::<u8>();
+    const ROUTES: &'static [usize] = &QWEN36_ROUTES;
+    const MAX_TOKENS: usize = QWEN36_MAX_TOKENS;
+    const ROUTE: &'static str = "qwen36_fp8_paged_gqa/online_softmax_e4m3_kv";
+    const SUITE: &'static str = "bench-qwen36-fp8-paged-gqa";
+    const CACHE_OWNER: &'static str = "qwen36_fp8_paged_gqa/kv_cache";
+    const WORKSPACE_OWNER: &'static str = "qwen36_fp8_paged_gqa/address_stable_workspace";
+    const PADDING_OWNER: &'static str = "qwen36_fp8_paged_gqa/alignment_padding";
+    const CACHE_DESCRIPTION: &'static str =
+        "24 physical pages, two KV heads, 64 positions, represented E4M3 K/V";
+    const WORKSPACE_DESCRIPTION: &'static str =
+        "T=128 query/output plus page-table, row, and length metadata";
+
+    fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        Qwen36Fp8PagedGqaOp::new(context)
+    }
+
+    fn workload(tokens: usize) -> BenchmarkWorkload {
+        if tokens <= MAX_BATCH {
+            BenchmarkWorkload::warm_operator_decode(tokens as u32)
+        } else {
+            BenchmarkWorkload::warm_operator_prefill(tokens as u64)
+        }
+    }
+
+    fn cache_fixture(plane_elements: usize) -> (Vec<u8>, Vec<u8>) {
+        fp8_cache_fixture::<Self::Target>(plane_elements)
+    }
+
     fn launch(&self, stream: &CudaStream, batch: usize, addresses: &Addresses) -> GpuResult<()> {
         // SAFETY: the session owns all 24 pages and metadata rows for the
         // 130-position context throughout every captured graph replay.
@@ -233,6 +305,8 @@ impl BenchPagedGqaOp for MtpBf16PagedGqaOp {
                 TABLE_STRIDE,
                 addresses.lengths,
                 addresses.output,
+                KEY_SCALE,
+                VALUE_SCALE,
             )
         }
     }
@@ -259,9 +333,9 @@ impl<O: BenchPagedGqaOp> Session<O> {
             )));
         }
         let stream = context.new_stream().map_err(GpuError::from)?;
-        let (layout, regions) = layout::<O::Target>(O::MAX_TOKENS)?;
+        let (layout, regions) = layout::<O::Target>(O::MAX_TOKENS, O::CACHE_ELEMENT_BYTES)?;
         let arena = DeviceArena::zeroed(&stream, &layout)?;
-        load_fixture::<O::Target>(&arena, &stream, regions, O::MAX_TOKENS)?;
+        load_fixture::<O>(&arena, &stream, regions, O::MAX_TOKENS)?;
         stream.synchronize().map_err(GpuError::from)?;
         let op = O::new(&context)?;
         let addresses = addresses(&arena, regions)?;
@@ -313,7 +387,7 @@ impl<O: BenchPagedGqaOp> Session<O> {
                     },
                     workload,
                     OperationAccounting::new(
-                        logical_bytes::<O::Target>(route.batch),
+                        logical_bytes::<O::Target>(route.batch, O::CACHE_ELEMENT_BYTES),
                         route.batch as u64,
                         "token",
                     ),
@@ -325,12 +399,15 @@ impl<O: BenchPagedGqaOp> Session<O> {
     }
 }
 
-fn layout<A: Arch>(max_tokens: usize) -> GpuResult<(ArenaLayout, Regions)> {
+fn layout<A: Arch>(
+    max_tokens: usize,
+    cache_element_bytes: usize,
+) -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
     let query = layout.reserve(max_tokens * A::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
     let plane_elements = PHYSICAL_PAGES * A::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * A::HEAD_DIM;
-    let key_pages = layout.reserve(plane_elements, ALIGNMENT)?;
-    let value_pages = layout.reserve(plane_elements, ALIGNMENT)?;
+    let key_pages = layout.reserve(plane_elements * cache_element_bytes, ALIGNMENT)?;
+    let value_pages = layout.reserve(plane_elements * cache_element_bytes, ALIGNMENT)?;
     let block_tables = layout.reserve(TABLE_ROWS * TABLE_STRIDE, ALIGNMENT)?;
     let table_rows = layout.reserve(max_tokens, ALIGNMENT)?;
     let lengths = layout.reserve(max_tokens, ALIGNMENT)?;
@@ -350,22 +427,18 @@ fn layout<A: Arch>(max_tokens: usize) -> GpuResult<(ArenaLayout, Regions)> {
     ))
 }
 
-fn load_fixture<A: Arch>(
+fn load_fixture<O: BenchPagedGqaOp>(
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
     max_tokens: usize,
 ) -> GpuResult<()> {
-    let query = (0..max_tokens * A::ATTENTION_OUTPUT_COLUMNS)
-        .map(|index| QUERY_VALUES[(index + index / A::HEAD_DIM) & 7])
+    let query = (0..max_tokens * O::Target::ATTENTION_OUTPUT_COLUMNS)
+        .map(|index| QUERY_VALUES[(index + index / O::Target::HEAD_DIM) & 7])
         .collect::<Vec<_>>();
-    let plane_elements = PHYSICAL_PAGES * A::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * A::HEAD_DIM;
-    let key_pages = (0..plane_elements)
-        .map(|index| f32_to_bf16(KEY_VALUES[(index + index / A::HEAD_DIM) & 7]))
-        .collect::<Vec<_>>();
-    let value_pages = (0..plane_elements)
-        .map(|index| f32_to_bf16(VALUE_VALUES[(index * 3 + index / A::HEAD_DIM) & 7]))
-        .collect::<Vec<_>>();
+    let plane_elements =
+        PHYSICAL_PAGES * O::Target::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * O::Target::HEAD_DIM;
+    let (key_pages, value_pages) = O::cache_fixture(plane_elements);
 
     arena.copy_from_host(stream, regions.query, &query)?;
     arena.copy_from_host(stream, regions.key_pages, &key_pages)?;
@@ -377,6 +450,28 @@ fn load_fixture<A: Arch>(
     let lengths = vec![CONTEXT_TOKENS as u32; max_tokens];
     arena.copy_from_host(stream, regions.table_rows, &table_rows)?;
     arena.copy_from_host(stream, regions.lengths, &lengths)
+}
+
+fn bf16_cache_fixture<A: Arch>(plane_elements: usize) -> (Vec<u8>, Vec<u8>) {
+    let key_pages = (0..plane_elements)
+        .flat_map(|index| f32_to_bf16(KEY_VALUES[(index + index / A::HEAD_DIM) & 7]).to_le_bytes())
+        .collect();
+    let value_pages = (0..plane_elements)
+        .flat_map(|index| {
+            f32_to_bf16(VALUE_VALUES[(index * 3 + index / A::HEAD_DIM) & 7]).to_le_bytes()
+        })
+        .collect();
+    (key_pages, value_pages)
+}
+
+fn fp8_cache_fixture<A: Arch>(plane_elements: usize) -> (Vec<u8>, Vec<u8>) {
+    let key_pages = (0..plane_elements)
+        .map(|index| KEY_CODES[(index + index / A::HEAD_DIM) & 7])
+        .collect();
+    let value_pages = (0..plane_elements)
+        .map(|index| VALUE_CODES[(index * 3 + index / A::HEAD_DIM) & 7])
+        .collect();
+    (key_pages, value_pages)
 }
 
 fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<Addresses> {
@@ -422,7 +517,7 @@ fn launch<O: BenchPagedGqaOp>(
     op.launch(stream, batch, addresses)
 }
 
-fn logical_bytes<A: Arch>(batch: usize) -> usize {
+fn logical_bytes<A: Arch>(batch: usize, cache_element_bytes: usize) -> usize {
     let query = A::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>();
     let output = A::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>();
     let scanned_positions = batch * CONTEXT_TOKENS;
@@ -431,7 +526,7 @@ fn logical_bytes<A: Arch>(batch: usize) -> usize {
     } else {
         A::NUM_KV_HEADS
     };
-    let cache = 2 * cache_heads * scanned_positions * A::HEAD_DIM * size_of::<u16>();
+    let cache = 2 * cache_heads * scanned_positions * A::HEAD_DIM * cache_element_bytes;
     let metadata =
         2 * batch * size_of::<u32>() + cache_heads * scanned_positions * size_of::<u32>();
 
@@ -506,6 +601,13 @@ pub fn benchmark_qwen36_paged_gqa(
     benchmark_target::<Qwen36PagedGqaOp>(options)
 }
 
+/// Measures every exact Qwen3.6 represented-E4M3 paged-GQA decode and prompt route.
+pub fn benchmark_qwen36_fp8_paged_gqa(
+    options: DeviceBenchmarkOptions,
+) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
+    benchmark_target::<Qwen36Fp8PagedGqaOp>(options)
+}
+
 /// Measures every exact Qwen3.8 MTP BF16 paged-GQA graph at 130 context tokens.
 pub fn benchmark_mtp_bf16_paged_gqa(
     options: DeviceBenchmarkOptions,
@@ -532,8 +634,11 @@ mod tests {
             + 2 * size_of::<u32>()
             + Qwen35_9B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * size_of::<u32>();
 
-        assert_eq!(logical_bytes::<Qwen35_9B>(1), per_token);
-        assert_eq!(logical_bytes::<Qwen35_9B>(MAX_BATCH), MAX_BATCH * per_token);
+        assert_eq!(logical_bytes::<Qwen35_9B>(1, size_of::<u16>()), per_token);
+        assert_eq!(
+            logical_bytes::<Qwen35_9B>(MAX_BATCH, size_of::<u16>()),
+            MAX_BATCH * per_token
+        );
 
         let prompt_per_token = 2 * Qwen35_9B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>()
             + 2 * Qwen35_9B::NUM_KV_HEADS * CONTEXT_TOKENS * Qwen35_9B::HEAD_DIM * size_of::<u16>()
@@ -541,7 +646,7 @@ mod tests {
             + Qwen35_9B::NUM_KV_HEADS * CONTEXT_TOKENS * size_of::<u32>();
         for tokens in [32, 64, 128] {
             assert_eq!(
-                logical_bytes::<Qwen35_9B>(tokens),
+                logical_bytes::<Qwen35_9B>(tokens, size_of::<u16>()),
                 tokens * prompt_per_token
             );
         }
@@ -550,7 +655,7 @@ mod tests {
 
     #[test]
     fn qwen35_bf16_arena_accounting_exposes_every_padding_byte() {
-        let (layout, regions) = layout::<Qwen35_9B>(QWEN35_MAX_TOKENS).unwrap();
+        let (layout, regions) = layout::<Qwen35_9B>(QWEN35_MAX_TOKENS, size_of::<u16>()).unwrap();
 
         assert_eq!(regions.cache_bytes(), 6_291_456);
         assert_eq!(regions.payload_bytes(), 10_486_880);
@@ -568,9 +673,12 @@ mod tests {
             + 2 * size_of::<u32>()
             + Qwen36Moe35B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * size_of::<u32>();
 
-        assert_eq!(logical_bytes::<Qwen36Moe35B>(1), per_token);
         assert_eq!(
-            logical_bytes::<Qwen36Moe35B>(MAX_BATCH),
+            logical_bytes::<Qwen36Moe35B>(1, size_of::<u16>()),
+            per_token
+        );
+        assert_eq!(
+            logical_bytes::<Qwen36Moe35B>(MAX_BATCH, size_of::<u16>()),
             MAX_BATCH * per_token
         );
         let prompt_per_token = 2 * Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>()
@@ -582,16 +690,53 @@ mod tests {
             + Qwen36Moe35B::NUM_KV_HEADS * CONTEXT_TOKENS * size_of::<u32>();
         for tokens in [32, 64, 128] {
             assert_eq!(
-                logical_bytes::<Qwen36Moe35B>(tokens),
+                logical_bytes::<Qwen36Moe35B>(tokens, size_of::<u16>()),
                 tokens * prompt_per_token
             );
         }
         assert_eq!(QWEN36_ROUTES.len(), 11);
 
-        let (layout, regions) = layout::<Qwen36Moe35B>(QWEN36_MAX_TOKENS).unwrap();
+        let (layout, regions) =
+            layout::<Qwen36Moe35B>(QWEN36_MAX_TOKENS, size_of::<u16>()).unwrap();
         assert_eq!(regions.cache_bytes(), 3_145_728);
         assert_eq!(regions.payload_bytes(), 7_341_152);
         assert_eq!(layout.byte_len(), 7_341_312);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 160);
+    }
+
+    #[test]
+    fn qwen36_fp8_byte_and_arena_accounting_cover_the_two_head_cache() {
+        let per_token = 2 * Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>()
+            + 2 * Qwen36Moe35B::NUM_ATTENTION_HEADS
+                * CONTEXT_TOKENS
+                * Qwen36Moe35B::HEAD_DIM
+                * size_of::<u8>()
+            + 2 * size_of::<u32>()
+            + Qwen36Moe35B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * size_of::<u32>();
+
+        assert_eq!(logical_bytes::<Qwen36Moe35B>(1, size_of::<u8>()), per_token);
+        assert_eq!(
+            logical_bytes::<Qwen36Moe35B>(MAX_BATCH, size_of::<u8>()),
+            MAX_BATCH * per_token
+        );
+        let prompt_per_token = 2 * Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS * size_of::<f32>()
+            + 2 * Qwen36Moe35B::NUM_KV_HEADS
+                * CONTEXT_TOKENS
+                * Qwen36Moe35B::HEAD_DIM
+                * size_of::<u8>()
+            + 2 * size_of::<u32>()
+            + Qwen36Moe35B::NUM_KV_HEADS * CONTEXT_TOKENS * size_of::<u32>();
+        for tokens in [32, 64, 128] {
+            assert_eq!(
+                logical_bytes::<Qwen36Moe35B>(tokens, size_of::<u8>()),
+                tokens * prompt_per_token
+            );
+        }
+
+        let (layout, regions) = layout::<Qwen36Moe35B>(QWEN36_MAX_TOKENS, size_of::<u8>()).unwrap();
+        assert_eq!(regions.cache_bytes(), 1_572_864);
+        assert_eq!(regions.payload_bytes(), 5_768_288);
+        assert_eq!(layout.byte_len(), 5_768_448);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 160);
     }
 
@@ -605,16 +750,16 @@ mod tests {
             + 2 * size_of::<u32>()
             + Qwen38_27B::NUM_ATTENTION_HEADS * CONTEXT_TOKENS * size_of::<u32>();
 
-        assert_eq!(logical_bytes::<Qwen38_27B>(1), per_token);
+        assert_eq!(logical_bytes::<Qwen38_27B>(1, size_of::<u16>()), per_token);
         assert_eq!(
-            logical_bytes::<Qwen38_27B>(MAX_BATCH),
+            logical_bytes::<Qwen38_27B>(MAX_BATCH, size_of::<u16>()),
             MAX_BATCH * per_token
         );
     }
 
     #[test]
     fn mtp_bf16_paged_gqa_arena_accounting_exposes_every_padding_byte() {
-        let (layout, regions) = layout::<Qwen38_27B>(MAX_BATCH).unwrap();
+        let (layout, regions) = layout::<Qwen38_27B>(MAX_BATCH, size_of::<u16>()).unwrap();
 
         assert_eq!(regions.cache_bytes(), 6_291_456);
         assert_eq!(regions.payload_bytes(), 6_684_832);

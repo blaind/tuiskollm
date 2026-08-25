@@ -4,8 +4,8 @@ use crate::Sm120Arch;
 use crate::device::paged_gqa::{
     BF16_PREFILL_SHARED_BYTES, BF16_PREFILL_THREADS, FLASH_PREFILL_P8_SHARED_BYTES,
     FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS, PREFILL_PARTIAL_VALUES,
-    PREFILL_SHARED_BYTES, PREFILL_THREADS, QWEN35_BF16_PREFILL_THREADS, bf16_paged_gqa,
-    bf16_paged_gqa_prefill_shared, paged_gqa, paged_gqa_prefill_flash_partitioned,
+    PREFILL_SHARED_BYTES, PREFILL_THREADS, QWEN35_BF16_PREFILL_THREADS, QWEN36_FP8_PREFILL_THREADS,
+    bf16_paged_gqa, bf16_paged_gqa_prefill_shared, paged_gqa, paged_gqa_prefill_flash_partitioned,
     paged_gqa_prefill_partitioned_reduce, paged_gqa_prefill_shared,
 };
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
@@ -181,7 +181,7 @@ mod kernels {
         // cover two tokens by six query heads while one 64-position, 32-KiB
         // K/V tile serves every consumer; T=32 still exposes 64 CTAs.
         unsafe {
-            paged_gqa_prefill_shared::<A, TOKENS>(
+            paged_gqa_prefill_shared::<A, TOKENS, 2, 6>(
                 query,
                 key_pages,
                 value_pages,
@@ -351,6 +351,91 @@ mod kernels {
                 table_stride,
                 lengths,
                 output,
+            );
+        }
+    }
+
+    /// Applies paged E4M3 GQA for one exact Qwen3.6 decode batch.
+    #[kernel]
+    #[launch_bounds(32, 16)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (32, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_fp8_paged_gqa_exact<const TOKENS: usize>(
+        query: *const f32,
+        key_pages: *const u8,
+        value_pages: *const u8,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        lengths: *const u32,
+        output: *mut f32,
+        key_scale: f32,
+        value_scale: f32,
+    ) {
+        // One warp preserves the qualified 256-column online-softmax order.
+        // Qwen3.6 exposes 16/128 B=1/B=8 CTAs; the 8:1 query/KV grouping
+        // changes only the selected represented E4M3 cache head.
+        unsafe {
+            paged_gqa::<Qwen36Moe35B, TOKENS>(
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                output,
+                key_scale,
+                value_scale,
+            );
+        }
+    }
+
+    /// Applies shared-cache E4M3 GQA for one exact Qwen3.6 prompt width.
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 32768,
+        dynamic_shared_alignment = 16,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen36_fp8_paged_gqa_prefill_shared_exact<const TOKENS: usize>(
+        query: *const f32,
+        key_pages: *const u8,
+        value_pages: *const u8,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        lengths: *const u32,
+        output: *mut f32,
+        key_scale: f32,
+        value_scale: f32,
+    ) {
+        // At T=128, 256 one-token/KV-head CTAs replace 2,048 one-warp CTAs.
+        // Eight query-head warps share one 32,768-byte E4M3 K/V tile while
+        // retaining each head's key order, reduction, and softmax recurrence.
+        unsafe {
+            paged_gqa_prefill_shared::<Qwen36Moe35B, TOKENS, 1, 8>(
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                output,
+                key_scale,
+                value_scale,
             );
         }
     }
@@ -843,6 +928,123 @@ impl<const TOKENS: usize> PreparedQwen36Route<TOKENS> {
                 output,
             )
             .map_err(|source| GpuError::launch("launching Qwen3.6 paged GQA", source))
+    }
+}
+
+struct PreparedQwen36Fp8Route<const TOKENS: usize> {
+    attention: PreparedLaunch<kernels::__qwen36_fp8_paged_gqa_exact_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedQwen36Fp8Route<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let blocks = u32::try_from(TOKENS * Qwen36Moe35B::NUM_ATTENTION_HEADS)
+            .map_err(|_| GpuError::invalid_launch("Qwen3.6 FP8 paged GQA grid exceeds u32"))?;
+
+        Ok(Self {
+            attention: module
+                .prepare_qwen36_fp8_paged_gqa_exact::<TOKENS>(LaunchConfig1D::new(
+                    blocks, THREADS, 0,
+                ))
+                .map_err(|source| GpuError::launch("preparing Qwen3.6 FP8 paged GQA", source))?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        query: *const f32,
+        key_pages: *const u8,
+        value_pages: *const u8,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        lengths: *const u32,
+        output: *mut f32,
+        key_scale: f32,
+        value_scale: f32,
+    ) -> GpuResult<()> {
+        module
+            .qwen36_fp8_paged_gqa_exact::<TOKENS>(
+                stream,
+                &self.attention,
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                output,
+                key_scale,
+                value_scale,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.6 FP8 paged GQA", source))
+    }
+}
+
+struct PreparedQwen36Fp8PrefillRoute<const TOKENS: usize> {
+    attention:
+        PreparedLaunch<kernels::__qwen36_fp8_paged_gqa_prefill_shared_exact_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedQwen36Fp8PrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !QWEN36_PREFILL_TOKENS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 FP8 paged GQA prefill route T={TOKENS} is not admitted"
+            )));
+        }
+        let blocks = u32::try_from(TOKENS * Qwen36Moe35B::NUM_KV_HEADS).map_err(|_| {
+            GpuError::invalid_launch("Qwen3.6 FP8 paged GQA prefill grid exceeds u32")
+        })?;
+
+        Ok(Self {
+            attention: module
+                .prepare_qwen36_fp8_paged_gqa_prefill_shared_exact::<TOKENS>(LaunchConfig1D::new(
+                    blocks,
+                    QWEN36_FP8_PREFILL_THREADS as u32,
+                    PREFILL_SHARED_BYTES_U32,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.6 FP8 paged GQA prefill", source)
+                })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        query: *const f32,
+        key_pages: *const u8,
+        value_pages: *const u8,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        lengths: *const u32,
+        output: *mut f32,
+        key_scale: f32,
+        value_scale: f32,
+    ) -> GpuResult<()> {
+        module
+            .qwen36_fp8_paged_gqa_prefill_shared_exact::<TOKENS>(
+                stream,
+                &self.attention,
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                output,
+                key_scale,
+                value_scale,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.6 FP8 paged GQA prefill", source))
     }
 }
 
@@ -1656,6 +1858,117 @@ impl Qwen36PagedGqaOp {
     }
 }
 
+/// Prepared Qwen3.6 E4M3 paged GQA routes for exact decode and prompt widths.
+pub struct Qwen36Fp8PagedGqaOp {
+    module: kernels::LoadedModule,
+    b1: PreparedQwen36Fp8Route<1>,
+    b2: PreparedQwen36Fp8Route<2>,
+    b3: PreparedQwen36Fp8Route<3>,
+    b4: PreparedQwen36Fp8Route<4>,
+    b5: PreparedQwen36Fp8Route<5>,
+    b6: PreparedQwen36Fp8Route<6>,
+    b7: PreparedQwen36Fp8Route<7>,
+    b8: PreparedQwen36Fp8Route<8>,
+    t32: PreparedQwen36Fp8PrefillRoute<32>,
+    t64: PreparedQwen36Fp8PrefillRoute<64>,
+    t128: PreparedQwen36Fp8PrefillRoute<128>,
+}
+
+impl Qwen36Fp8PagedGqaOp {
+    /// Loads the embedded module and prepares every admitted route.
+    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        require_qwen36_geometry()?;
+        let _ = qwen36_fp8_paged_gqa_ptx_names();
+        // SAFETY: this crate owns the embedded cuda-oxide module artifact.
+        let module = unsafe { kernels::load(context) }
+            .map_err(|source| GpuError::module("loading Qwen3.6 FP8 paged GQA", source))?;
+
+        Ok(Self {
+            b1: PreparedQwen36Fp8Route::prepare(&module)?,
+            b2: PreparedQwen36Fp8Route::prepare(&module)?,
+            b3: PreparedQwen36Fp8Route::prepare(&module)?,
+            b4: PreparedQwen36Fp8Route::prepare(&module)?,
+            b5: PreparedQwen36Fp8Route::prepare(&module)?,
+            b6: PreparedQwen36Fp8Route::prepare(&module)?,
+            b7: PreparedQwen36Fp8Route::prepare(&module)?,
+            b8: PreparedQwen36Fp8Route::prepare(&module)?,
+            t32: PreparedQwen36Fp8PrefillRoute::prepare(&module)?,
+            t64: PreparedQwen36Fp8PrefillRoute::prepare(&module)?,
+            t128: PreparedQwen36Fp8PrefillRoute::prepare(&module)?,
+            module,
+        })
+    }
+
+    /// Applies online-softmax GQA over page-major represented E4M3 K/V.
+    ///
+    /// # Safety
+    ///
+    /// Query and output cover `[tokens,16,256]` FP32 values. Cache planes use
+    /// `[physical_page,2,64,256]` E4M3 bytes. Metadata covers `tokens`; each
+    /// length is nonzero, its table row covers that length rounded up to 64,
+    /// and every selected physical page is resident. Allocations are aligned,
+    /// disjoint, live through completion, and context-local.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        tokens: usize,
+        query: *const f32,
+        key_pages: *const u8,
+        value_pages: *const u8,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: usize,
+        lengths: *const u32,
+        output: *mut f32,
+        key_scale: f32,
+        value_scale: f32,
+    ) -> GpuResult<()> {
+        if !admitted_batch(tokens) && !QWEN36_PREFILL_TOKENS.contains(&tokens) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.6 FP8 paged GQA tokens {tokens} must be one of 1..={MAX_BATCH},32,64,128"
+            )));
+        }
+        let table_stride = validate_launch(table_stride, key_scale, value_scale)?;
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        query,
+                        key_pages,
+                        value_pages,
+                        block_tables,
+                        table_rows,
+                        table_stride,
+                        lengths,
+                        output,
+                        key_scale,
+                        value_scale,
+                    )
+                }
+            };
+        }
+
+        match tokens {
+            1 => launch!(b1),
+            2 => launch!(b2),
+            3 => launch!(b3),
+            4 => launch!(b4),
+            5 => launch!(b5),
+            6 => launch!(b6),
+            7 => launch!(b7),
+            8 => launch!(b8),
+            32 => launch!(t32),
+            64 => launch!(t64),
+            128 => launch!(t128),
+            _ => unreachable!(),
+        }
+    }
+}
+
 /// PTX symbols retained for every exact paged GQA route.
 pub(crate) fn paged_gqa_ptx_names() -> Vec<&'static str> {
     vec![
@@ -1717,6 +2030,23 @@ pub(crate) fn qwen36_paged_gqa_ptx_names() -> Vec<&'static str> {
     ]
 }
 
+/// PTX symbols retained for every exact Qwen3.6 E4M3 paged GQA route.
+pub(crate) fn qwen36_fp8_paged_gqa_ptx_names() -> Vec<&'static str> {
+    vec![
+        kernels::qwen36_fp8_paged_gqa_exact_ptx_name::<1>(),
+        kernels::qwen36_fp8_paged_gqa_exact_ptx_name::<2>(),
+        kernels::qwen36_fp8_paged_gqa_exact_ptx_name::<3>(),
+        kernels::qwen36_fp8_paged_gqa_exact_ptx_name::<4>(),
+        kernels::qwen36_fp8_paged_gqa_exact_ptx_name::<5>(),
+        kernels::qwen36_fp8_paged_gqa_exact_ptx_name::<6>(),
+        kernels::qwen36_fp8_paged_gqa_exact_ptx_name::<7>(),
+        kernels::qwen36_fp8_paged_gqa_exact_ptx_name::<8>(),
+        kernels::qwen36_fp8_paged_gqa_prefill_shared_exact_ptx_name::<32>(),
+        kernels::qwen36_fp8_paged_gqa_prefill_shared_exact_ptx_name::<64>(),
+        kernels::qwen36_fp8_paged_gqa_prefill_shared_exact_ptx_name::<128>(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1724,9 +2054,10 @@ mod tests {
         FLASH_PREFILL_P16_SHARED_BYTES, FLASH_PREFILL_THREADS,
         PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES,
         PAGED_GQA_PREFILL_MACRO_TOKENS, PAGED_GQA_PREFILL_PARTIAL_BYTES, PREFILL_SHARED_BYTES,
-        PREFILL_THREADS, QWEN35_BF16_PREFILL_THREADS, QWEN35_PREFILL_TOKENS, QWEN36_PREFILL_TOKENS,
-        THREADS, admitted_batch, admitted_macro_partitions, paged_gqa_prefill_partitions,
-        paged_gqa_ptx_names, qwen35_paged_gqa_ptx_names, qwen36_paged_gqa_ptx_names,
+        PREFILL_THREADS, QWEN35_BF16_PREFILL_THREADS, QWEN35_PREFILL_TOKENS,
+        QWEN36_FP8_PREFILL_THREADS, QWEN36_PREFILL_TOKENS, THREADS, admitted_batch,
+        admitted_macro_partitions, paged_gqa_prefill_partitions, paged_gqa_ptx_names,
+        qwen35_paged_gqa_ptx_names, qwen36_fp8_paged_gqa_ptx_names, qwen36_paged_gqa_ptx_names,
     };
     use std::collections::BTreeSet;
 
@@ -1763,6 +2094,12 @@ mod tests {
         let qwen36 = qwen36_paged_gqa_ptx_names();
         let qwen36_unique = qwen36.iter().copied().collect::<BTreeSet<_>>();
         assert_eq!(qwen36.len(), 11);
+        let qwen36_fp8 = qwen36_fp8_paged_gqa_ptx_names();
+        let qwen36_fp8_unique = qwen36_fp8.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(qwen36_fp8.len(), 11);
+        assert_eq!(qwen36_fp8_unique.len(), qwen36_fp8.len());
+        assert!(qwen36_fp8_unique.is_disjoint(&qwen36_unique));
+        assert_eq!(QWEN36_FP8_PREFILL_THREADS, 256);
         assert_eq!(qwen36_unique.len(), qwen36.len());
         assert!(names.iter().all(|name| !qwen36_unique.contains(name)));
         assert!(qwen35_unique.is_disjoint(&qwen36_unique));
