@@ -116,8 +116,8 @@ pub(crate) struct Fixture {
     gated: Vec<f32>,
     pub(crate) activation_bf16: Vec<u16>,
     pub(crate) activation_f32: Vec<f32>,
-    activation_codes: Vec<u8>,
-    activation_scales: Vec<u8>,
+    pub(crate) activation_codes: Vec<u8>,
+    pub(crate) activation_scales: Vec<u8>,
     pub(crate) weight_codes: Vec<u8>,
     pub(crate) weight_scales: Vec<u8>,
 }
@@ -723,12 +723,13 @@ fn verify_no_post_warmup_allocation(
     Ok(())
 }
 
-pub(crate) fn dot_oracle(
+pub(crate) fn dot_oracle_for_rows(
     token: usize,
     row: usize,
+    rows: usize,
     fixture: &Fixture,
 ) -> Result<f64, Qwen35Nvfp4AttentionOutputQualificationError> {
-    dot_oracle_for_schedule(token, row, Schedule::A16, fixture)
+    dot_oracle_for_schedule(token, row, schedule(rows), fixture)
 }
 
 fn dot_oracle_for_schedule(
