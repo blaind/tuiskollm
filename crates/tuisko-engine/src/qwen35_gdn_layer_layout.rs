@@ -1,4 +1,4 @@
-//! Single-allocation layout for one Qwen3.5 GDN decoder layer.
+//! Single-allocation layout for one Qwen3.5 GDN layer.
 
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
@@ -7,12 +7,15 @@ use tuisko_model::{Arch, Qwen35_9B};
 const ALIGNMENT: usize = 256;
 const NVFP4_GROUP: usize = 16;
 const PADDED_CONTROL_ROWS: usize = 128;
+pub(crate) const QWEN35_GDN_MAX_ROWS: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Qwen35GdnLayerRegions {
     pub(crate) residual_input: ArenaRegion<u16>,
     pub(crate) input_norm: ArenaRegion<u16>,
     pub(crate) mixer_normalized: ArenaRegion<u16>,
+    pub(crate) input_activation_codes: ArenaRegion<u8>,
+    pub(crate) input_activation_scales: ArenaRegion<u8>,
     pub(crate) input_weight_codes: ArenaRegion<u8>,
     pub(crate) input_weight_scales: ArenaRegion<u8>,
     pub(crate) control_weight_codes: ArenaRegion<u8>,
@@ -30,6 +33,8 @@ pub(crate) struct Qwen35GdnLayerRegions {
     pub(crate) recurrent_norm: ArenaRegion<u16>,
     pub(crate) state: ArenaRegion<f32>,
     pub(crate) recurrent_output: ArenaRegion<u16>,
+    pub(crate) output_activation_codes: ArenaRegion<u8>,
+    pub(crate) output_activation_scales: ArenaRegion<u8>,
     pub(crate) output_weight_codes: ArenaRegion<u8>,
     pub(crate) output_weight_scales: ArenaRegion<u8>,
     pub(crate) mixer_branch: ArenaRegion<u16>,
@@ -42,6 +47,8 @@ pub(crate) struct Qwen35GdnLayerRegions {
     pub(crate) up_weight_codes: ArenaRegion<u8>,
     pub(crate) gate_up_weight_scales: ArenaRegion<u8>,
     pub(crate) swiglu: ArenaRegion<u16>,
+    pub(crate) down_activation_codes: ArenaRegion<u8>,
+    pub(crate) down_activation_scales: ArenaRegion<u8>,
     pub(crate) down_weight_codes: ArenaRegion<u8>,
     pub(crate) down_weight_scales: ArenaRegion<u8>,
     pub(crate) mlp_branch: ArenaRegion<u16>,
@@ -60,34 +67,46 @@ pub struct Qwen35GdnLayerLayout {
 }
 
 impl Qwen35GdnLayerLayout {
-    /// Reserves every source plane and exact decode seam for `B=1..=8`.
+    /// Reserves every source plane and exact seam through `T=128`.
     pub fn build() -> EngineResult<Self> {
         type A = Qwen35_9B;
         require_geometry::<A>()?;
 
-        let batch_hidden = product("Qwen3.5 GDN batch-hidden elements", MAX_BATCH, A::HIDDEN)?;
-        let batch_input = product(
+        let row_hidden = product(
+            "Qwen3.5 GDN row-hidden elements",
+            QWEN35_GDN_MAX_ROWS,
+            A::HIDDEN,
+        )?;
+        let row_input = product(
             "Qwen3.5 GDN projected elements",
-            MAX_BATCH,
+            QWEN35_GDN_MAX_ROWS,
             A::GDN_INPUT_ROWS,
         )?;
-        let batch_qkv = product("Qwen3.5 GDN convolved elements", MAX_BATCH, A::GDN_QKV_ROWS)?;
-        let batch_value = product(
+        let row_qkv = product(
+            "Qwen3.5 GDN convolved elements",
+            QWEN35_GDN_MAX_ROWS,
+            A::GDN_QKV_ROWS,
+        )?;
+        let row_value = product(
             "Qwen3.5 GDN recurrent output elements",
-            MAX_BATCH,
+            QWEN35_GDN_MAX_ROWS,
             A::GDN_VALUE_ROWS,
         )?;
-        let batch_control = product(
+        let row_control = product(
             "Qwen3.5 GDN control elements",
-            MAX_BATCH,
+            QWEN35_GDN_MAX_ROWS,
             A::GDN_CONTROL_ROWS,
         )?;
-        let batch_padded_control = product(
+        let row_padded_control = product(
             "Qwen3.5 GDN padded control elements",
-            MAX_BATCH,
+            QWEN35_GDN_MAX_ROWS,
             PADDED_CONTROL_ROWS,
         )?;
-        let batch_intermediate = product("Qwen3.5 GDN MLP elements", MAX_BATCH, A::INTERMEDIATE)?;
+        let row_intermediate = product(
+            "Qwen3.5 GDN MLP elements",
+            QWEN35_GDN_MAX_ROWS,
+            A::INTERMEDIATE,
+        )?;
         let input_weight_codes = packed_codes(
             "Qwen3.5 GDN input weight codes",
             A::GDN_INPUT_ROWS,
@@ -152,44 +171,50 @@ impl Qwen35GdnLayerLayout {
 
         let mut builder = ArenaLayout::new();
         let regions = Qwen35GdnLayerRegions {
-            residual_input: builder.reserve(batch_hidden, ALIGNMENT)?,
+            residual_input: builder.reserve(row_hidden, ALIGNMENT)?,
             input_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            mixer_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
+            mixer_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            input_activation_codes: builder.reserve(row_hidden / 2, ALIGNMENT)?,
+            input_activation_scales: builder.reserve(row_hidden / NVFP4_GROUP, ALIGNMENT)?,
             input_weight_codes: builder.reserve(input_weight_codes, ALIGNMENT)?,
             input_weight_scales: builder.reserve(input_weight_scales, ALIGNMENT)?,
             control_weight_codes: builder.reserve(control_weight_codes, ALIGNMENT)?,
             control_weight_scales: builder.reserve(control_weight_scales, ALIGNMENT)?,
-            projected: builder.reserve(batch_input, ALIGNMENT)?,
-            projected_controls: builder.reserve(batch_padded_control, ALIGNMENT)?,
+            projected: builder.reserve(row_input, ALIGNMENT)?,
+            projected_controls: builder.reserve(row_padded_control, ALIGNMENT)?,
             a_log: builder.reserve(A::GDN_CONTROL_ROWS, ALIGNMENT)?,
             dt_bias: builder.reserve(A::GDN_CONTROL_ROWS, ALIGNMENT)?,
             convolution_weights: builder.reserve(convolution_weights, ALIGNMENT)?,
             state_rows: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             history: builder.reserve(history, ALIGNMENT)?,
-            log_decay: builder.reserve(batch_control, ALIGNMENT)?,
-            beta: builder.reserve(batch_control, ALIGNMENT)?,
-            convolved: builder.reserve(batch_qkv, ALIGNMENT)?,
+            log_decay: builder.reserve(row_control, ALIGNMENT)?,
+            beta: builder.reserve(row_control, ALIGNMENT)?,
+            convolved: builder.reserve(row_qkv, ALIGNMENT)?,
             recurrent_norm: builder.reserve(A::LINEAR_HEAD_DIM, ALIGNMENT)?,
             state: builder.reserve(state, ALIGNMENT)?,
-            recurrent_output: builder.reserve(batch_value, ALIGNMENT)?,
+            recurrent_output: builder.reserve(row_value, ALIGNMENT)?,
+            output_activation_codes: builder.reserve(row_hidden / 2, ALIGNMENT)?,
+            output_activation_scales: builder.reserve(row_hidden / NVFP4_GROUP, ALIGNMENT)?,
             output_weight_codes: builder.reserve(output_weight_codes, ALIGNMENT)?,
             output_weight_scales: builder.reserve(output_weight_scales, ALIGNMENT)?,
-            mixer_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
+            mixer_branch: builder.reserve(row_hidden, ALIGNMENT)?,
             post_attention_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            mixer_residual: builder.reserve(batch_hidden, ALIGNMENT)?,
-            mlp_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
-            gate_up_activation_codes: builder.reserve(batch_hidden / 2, ALIGNMENT)?,
-            gate_up_activation_scales: builder.reserve(batch_hidden / NVFP4_GROUP, ALIGNMENT)?,
+            mixer_residual: builder.reserve(row_hidden, ALIGNMENT)?,
+            mlp_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
+            gate_up_activation_codes: builder.reserve(row_hidden / 2, ALIGNMENT)?,
+            gate_up_activation_scales: builder.reserve(row_hidden / NVFP4_GROUP, ALIGNMENT)?,
             gate_weight_codes: builder.reserve(gate_codes, ALIGNMENT)?,
             up_weight_codes: builder.reserve(gate_codes, ALIGNMENT)?,
             gate_up_weight_scales: builder.reserve(gate_up_scales, ALIGNMENT)?,
-            swiglu: builder.reserve(batch_intermediate, ALIGNMENT)?,
+            swiglu: builder.reserve(row_intermediate, ALIGNMENT)?,
+            down_activation_codes: builder.reserve(row_intermediate / 2, ALIGNMENT)?,
+            down_activation_scales: builder.reserve(row_intermediate / NVFP4_GROUP, ALIGNMENT)?,
             down_weight_codes: builder.reserve(down_weight_codes, ALIGNMENT)?,
             down_weight_scales: builder.reserve(down_weight_scales, ALIGNMENT)?,
-            mlp_branch: builder.reserve(batch_hidden, ALIGNMENT)?,
+            mlp_branch: builder.reserve(row_hidden, ALIGNMENT)?,
             next_norm: builder.reserve(A::HIDDEN, ALIGNMENT)?,
-            residual_output: builder.reserve(batch_hidden, ALIGNMENT)?,
-            next_normalized: builder.reserve(batch_hidden, ALIGNMENT)?,
+            residual_output: builder.reserve(row_hidden, ALIGNMENT)?,
+            next_normalized: builder.reserve(row_hidden, ALIGNMENT)?,
         };
         let resident_weight_bytes = sum(
             "Qwen3.5 GDN resident weight bytes",
@@ -219,6 +244,8 @@ impl Qwen35GdnLayerLayout {
             &[
                 regions.residual_input.byte_len(),
                 regions.mixer_normalized.byte_len(),
+                regions.input_activation_codes.byte_len(),
+                regions.input_activation_scales.byte_len(),
                 regions.projected.byte_len(),
                 regions.projected_controls.byte_len(),
                 regions.state_rows.byte_len(),
@@ -228,12 +255,16 @@ impl Qwen35GdnLayerLayout {
                 regions.convolved.byte_len(),
                 regions.state.byte_len(),
                 regions.recurrent_output.byte_len(),
+                regions.output_activation_codes.byte_len(),
+                regions.output_activation_scales.byte_len(),
                 regions.mixer_branch.byte_len(),
                 regions.mixer_residual.byte_len(),
                 regions.mlp_normalized.byte_len(),
                 regions.gate_up_activation_codes.byte_len(),
                 regions.gate_up_activation_scales.byte_len(),
                 regions.swiglu.byte_len(),
+                regions.down_activation_codes.byte_len(),
+                regions.down_activation_scales.byte_len(),
                 regions.mlp_branch.byte_len(),
                 regions.residual_output.byte_len(),
                 regions.next_normalized.byte_len(),
@@ -269,6 +300,11 @@ impl Qwen35GdnLayerLayout {
     /// Exact address-stable working and recurrent-state bytes.
     pub const fn workspace_bytes(&self) -> usize {
         self.workspace_bytes
+    }
+
+    /// Largest exact row route backed by the workspace.
+    pub const fn row_capacity(&self) -> usize {
+        QWEN35_GDN_MAX_ROWS
     }
 
     /// Resident weights plus workspace, excluding alignment padding.
@@ -315,7 +351,7 @@ fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALIGNMENT, Qwen35GdnLayerLayout};
+    use super::{ALIGNMENT, QWEN35_GDN_MAX_ROWS, Qwen35GdnLayerLayout};
     use tuisko_model::{Arch, Qwen35_9B};
 
     #[test]
@@ -323,9 +359,9 @@ mod tests {
         let layout = Qwen35GdnLayerLayout::build().unwrap();
 
         assert_eq!(layout.resident_weight_bytes(), 123_068_800);
-        assert_eq!(layout.workspace_bytes(), 18_307_104);
-        assert_eq!(layout.owner_bytes(), 141_375_904);
-        assert_eq!(layout.arena_bytes(), 141_376_512);
+        assert_eq!(layout.workspace_bytes(), 36_831_264);
+        assert_eq!(layout.owner_bytes(), 159_900_064);
+        assert_eq!(layout.arena_bytes(), 159_900_672);
         assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 608);
     }
 
@@ -337,6 +373,8 @@ mod tests {
             span(regions.residual_input),
             span(regions.input_norm),
             span(regions.mixer_normalized),
+            span(regions.input_activation_codes),
+            span(regions.input_activation_scales),
             span(regions.input_weight_codes),
             span(regions.input_weight_scales),
             span(regions.control_weight_codes),
@@ -354,6 +392,8 @@ mod tests {
             span(regions.recurrent_norm),
             span(regions.state),
             span(regions.recurrent_output),
+            span(regions.output_activation_codes),
+            span(regions.output_activation_scales),
             span(regions.output_weight_codes),
             span(regions.output_weight_scales),
             span(regions.mixer_branch),
@@ -366,6 +406,8 @@ mod tests {
             span(regions.up_weight_codes),
             span(regions.gate_up_weight_scales),
             span(regions.swiglu),
+            span(regions.down_activation_codes),
+            span(regions.down_activation_scales),
             span(regions.down_weight_codes),
             span(regions.down_weight_scales),
             span(regions.mlp_branch),
@@ -404,8 +446,9 @@ mod tests {
         );
         assert_eq!(
             regions.projected_controls.len(),
-            8 * super::PADDED_CONTROL_ROWS
+            QWEN35_GDN_MAX_ROWS * super::PADDED_CONTROL_ROWS
         );
+        assert_eq!(layout.row_capacity(), 128);
     }
 
     fn span<T: Copy>(region: ArenaRegion<T>) -> (usize, usize) {

@@ -1,6 +1,6 @@
 //! Resident source-backed Qwen3.5 GDN decoder layer.
 
-use crate::qwen35_gdn_layer_layout::Qwen35GdnLayerRegions;
+use crate::qwen35_gdn_layer_layout::{QWEN35_GDN_MAX_ROWS, Qwen35GdnLayerRegions};
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen35GdnLayerLayout};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
@@ -12,10 +12,11 @@ use tuisko_model::{
     Arch, CheckpointSnapshot, ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings, Qwen35_9B,
 };
 
-/// One Qwen3.5 GDN layer with immutable exact-batch graph routes.
+/// One Qwen3.5 GDN layer with immutable exact decode and prefill graphs.
 pub struct Qwen35GdnLayerProgram {
     // Drop graphs before the arena and loaded modules whose handles they retain.
     graphs: [CudaGraph; MAX_BATCH],
+    prefill_graphs: [CudaGraph; 3],
     arena: DeviceArena,
     _norm: Qwen35ResidualNormOp,
     _input: Qwen35Nvfp4GdnInputOp,
@@ -40,6 +41,8 @@ struct Pointers {
     residual_input: *const u16,
     input_norm: *const u16,
     mixer_normalized: *mut u16,
+    input_activation_codes: *mut u8,
+    input_activation_scales: *mut u8,
     input_weight_codes: *const u8,
     input_weight_scales: *const u8,
     control_weight_codes: *const u8,
@@ -57,6 +60,8 @@ struct Pointers {
     recurrent_norm: *const u16,
     state: *mut f32,
     recurrent_output: *mut u16,
+    output_activation_codes: *mut u8,
+    output_activation_scales: *mut u8,
     output_weight_codes: *const u8,
     output_weight_scales: *const u8,
     mixer_branch: *mut u16,
@@ -69,6 +74,8 @@ struct Pointers {
     up_weight_codes: *const u8,
     gate_up_weight_scales: *const u8,
     swiglu: *mut u16,
+    down_activation_codes: *mut u8,
+    down_activation_scales: *mut u8,
     down_weight_codes: *const u8,
     down_weight_scales: *const u8,
     mlp_branch: *mut u16,
@@ -83,6 +90,8 @@ impl Pointers {
             residual_input: arena.address(regions.residual_input)?.cast_const(),
             input_norm: arena.address(regions.input_norm)?.cast_const(),
             mixer_normalized: arena.address(regions.mixer_normalized)?,
+            input_activation_codes: arena.address(regions.input_activation_codes)?,
+            input_activation_scales: arena.address(regions.input_activation_scales)?,
             input_weight_codes: arena.address(regions.input_weight_codes)?.cast_const(),
             input_weight_scales: arena.address(regions.input_weight_scales)?.cast_const(),
             control_weight_codes: arena.address(regions.control_weight_codes)?.cast_const(),
@@ -100,6 +109,8 @@ impl Pointers {
             recurrent_norm: arena.address(regions.recurrent_norm)?.cast_const(),
             state: arena.address(regions.state)?,
             recurrent_output: arena.address(regions.recurrent_output)?,
+            output_activation_codes: arena.address(regions.output_activation_codes)?,
+            output_activation_scales: arena.address(regions.output_activation_scales)?,
             output_weight_codes: arena.address(regions.output_weight_codes)?.cast_const(),
             output_weight_scales: arena.address(regions.output_weight_scales)?.cast_const(),
             mixer_branch: arena.address(regions.mixer_branch)?,
@@ -112,6 +123,8 @@ impl Pointers {
             up_weight_codes: arena.address(regions.up_weight_codes)?.cast_const(),
             gate_up_weight_scales: arena.address(regions.gate_up_weight_scales)?.cast_const(),
             swiglu: arena.address(regions.swiglu)?,
+            down_activation_codes: arena.address(regions.down_activation_codes)?,
+            down_activation_scales: arena.address(regions.down_activation_scales)?,
             down_weight_codes: arena.address(regions.down_weight_codes)?.cast_const(),
             down_weight_scales: arena.address(regions.down_weight_scales)?.cast_const(),
             mlp_branch: arena.address(regions.mlp_branch)?,
@@ -136,6 +149,8 @@ impl Pointers {
             self.residual_input.addr(),
             self.input_norm.addr(),
             self.mixer_normalized.addr(),
+            self.input_activation_codes.addr(),
+            self.input_activation_scales.addr(),
             self.input_weight_codes.addr(),
             self.input_weight_scales.addr(),
             self.control_weight_codes.addr(),
@@ -153,6 +168,8 @@ impl Pointers {
             self.recurrent_norm.addr(),
             self.state.addr(),
             self.recurrent_output.addr(),
+            self.output_activation_codes.addr(),
+            self.output_activation_scales.addr(),
             self.output_weight_codes.addr(),
             self.output_weight_scales.addr(),
             self.mixer_branch.addr(),
@@ -165,6 +182,8 @@ impl Pointers {
             self.up_weight_codes.addr(),
             self.gate_up_weight_scales.addr(),
             self.swiglu.addr(),
+            self.down_activation_codes.addr(),
+            self.down_activation_scales.addr(),
             self.down_weight_codes.addr(),
             self.down_weight_scales.addr(),
             self.mlp_branch.addr(),
@@ -177,16 +196,19 @@ impl Pointers {
 
 #[derive(Clone, Copy)]
 struct Divisors {
+    input_activation: f32,
     input_weight: f32,
     control_weight: f32,
+    output_input: f32,
     output_weight: f32,
     gate_up_input: f32,
     gate_up_weight: f32,
+    down_input: f32,
     down_weight: f32,
 }
 
 impl Qwen35GdnLayerProgram {
-    /// Loads one admitted source layer and captures exact `B=1..=8` decode routes.
+    /// Loads one source layer and captures exact `B=1..8` and `T=32,64,128` routes.
     pub fn from_snapshot(
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen35_9B>>,
@@ -321,10 +343,13 @@ impl Qwen35GdnLayerProgram {
             swiglu: &swiglu,
             down: &down,
         };
-        let graphs = capture_routes(&stream, ops, pointers, launch_divisors(scale_divisors))?;
+        let divisors = launch_divisors(scale_divisors);
+        let graphs = capture_decode_routes(&stream, ops, pointers, divisors)?;
+        let prefill_graphs = capture_prefill_routes(&stream, ops, pointers, divisors)?;
 
         Ok(Self {
             graphs,
+            prefill_graphs,
             arena,
             _norm: norm,
             _input: input,
@@ -343,19 +368,20 @@ impl Qwen35GdnLayerProgram {
         })
     }
 
-    /// Uploads exactly `batch` BF16 residual rows into stable input storage.
+    /// Uploads one exact route's BF16 residual rows into stable input storage.
     pub fn load_residual(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         values: &[u16],
     ) -> EngineResult<()> {
-        require_batch(batch)?;
-        let expected = product("Qwen3.5 GDN input elements", batch, Qwen35_9B::HIDDEN)?;
+        require_rows(rows)?;
+        let expected = product("Qwen3.5 GDN input elements", rows, Qwen35_9B::HIDDEN)?;
         if values.len() != expected {
             return Err(EngineError::layout(format!(
-                "Qwen3.5 GDN input has {} values, expected {expected} for B={batch}",
-                values.len()
+                "Qwen3.5 GDN input has {} values, expected {expected} for {}",
+                values.len(),
+                route_name(rows),
             )));
         }
         self.arena
@@ -373,20 +399,19 @@ impl Qwen35GdnLayerProgram {
         Ok(())
     }
 
-    /// Replays the immutable graph for one exact batch.
-    pub fn replay(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
+    /// Replays the immutable graph for one exact row route.
+    pub fn replay(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
         // SAFETY: this Qwen35GdnLayerProgram owns every captured allocation
         // (arena, op modules) for its whole life and drops the graphs first.
-        unsafe { self.graphs[batch - 1].launch(stream) }?;
+        unsafe { self.graph(rows)?.launch(stream) }?;
 
         Ok(())
     }
 
     /// Reads active BF16 residual output rows.
-    pub fn read_residual(&self, stream: &CudaStream, batch: usize) -> EngineResult<Vec<u16>> {
-        require_batch(batch)?;
-        let values = product("Qwen3.5 GDN output elements", batch, Qwen35_9B::HIDDEN)?;
+    pub fn read_residual(&self, stream: &CudaStream, rows: usize) -> EngineResult<Vec<u16>> {
+        require_rows(rows)?;
+        let values = product("Qwen3.5 GDN output elements", rows, Qwen35_9B::HIDDEN)?;
 
         Ok(self
             .arena
@@ -428,6 +453,11 @@ impl Qwen35GdnLayerProgram {
         MAX_BATCH
     }
 
+    /// Largest exact row route backed by the workspace.
+    pub const fn row_capacity(&self) -> usize {
+        QWEN35_GDN_MAX_ROWS
+    }
+
     /// Checked owner layout.
     pub const fn layout(&self) -> &Qwen35GdnLayerLayout {
         &self.layout
@@ -438,21 +468,35 @@ impl Qwen35GdnLayerProgram {
         &self.snapshot
     }
 
+    fn graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
+        if (1..=MAX_BATCH).contains(&rows) {
+            return Ok(&self.graphs[rows - 1]);
+        }
+        let index = prefill_index(rows).ok_or_else(|| {
+            EngineError::route(format!(
+                "Qwen3.5 GDN row count {rows} is outside 1..={MAX_BATCH},32,64,128"
+            ))
+        })?;
+
+        Ok(&self.prefill_graphs[index])
+    }
+
     /// Launches this layer from another resident owner's BF16 residual plane.
     ///
     /// # Safety
-    /// `input` must address at least `batch * Qwen35_9B::HIDDEN` BF16 values in this context.
+    /// `input` covers `rows * 4,096` BF16 values in this CUDA context.
     pub(crate) unsafe fn launch_from(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         input: *const u16,
     ) -> GpuResult<*const u16> {
         let mut pointers = Pointers::bind(&self.arena, self.layout.regions())?;
         pointers.residual_input = input;
+        require_rows(rows).map_err(|error| GpuError::invalid_launch(error.to_string()))?;
         launch_route(
             stream,
-            batch,
+            rows,
             self.ops(),
             pointers,
             launch_divisors(self.scale_divisors),
@@ -463,11 +507,11 @@ impl Qwen35GdnLayerProgram {
 
     #[cfg(feature = "qualification")]
     /// Launches the production route eagerly for graph-agreement qualification.
-    pub fn launch_eager(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
-        require_batch(batch)?;
+    pub fn launch_eager(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        require_rows(rows)?;
         launch_route(
             stream,
-            batch,
+            rows,
             self.ops(),
             Pointers::bind(&self.arena, self.layout.regions())?,
             launch_divisors(self.scale_divisors),
@@ -478,9 +522,8 @@ impl Qwen35GdnLayerProgram {
 
     #[cfg(feature = "qualification")]
     /// Returns one captured production graph.
-    pub fn qualification_graph(&self, batch: usize) -> EngineResult<&CudaGraph> {
-        require_batch(batch)?;
-        Ok(&self.graphs[batch - 1])
+    pub fn qualification_graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
+        self.graph(rows)
     }
 
     #[cfg(feature = "qualification")]
@@ -488,10 +531,10 @@ impl Qwen35GdnLayerProgram {
     pub fn qualification_repeated_graph(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         operations: u64,
     ) -> EngineResult<CudaGraph> {
-        require_batch(batch)?;
+        require_rows(rows)?;
         if operations == 0 {
             return Err(EngineError::route(
                 "repeated Qwen3.5 GDN graph requires at least one operation",
@@ -503,7 +546,7 @@ impl Qwen35GdnLayerProgram {
 
         Ok(CudaGraph::capture(stream, || {
             for _ in 0..operations {
-                launch_route(stream, batch, ops, pointers, divisors)?;
+                launch_route(stream, rows, ops, pointers, divisors)?;
             }
             Ok(())
         })?)
@@ -548,8 +591,14 @@ impl Qwen35GdnLayerProgram {
             self.arena.fill(stream, region, byte)?;
         }
         for region in [
+            regions.input_activation_codes,
+            regions.input_activation_scales,
+            regions.output_activation_codes,
+            regions.output_activation_scales,
             regions.gate_up_activation_codes,
             regions.gate_up_activation_scales,
+            regions.down_activation_codes,
+            regions.down_activation_scales,
         ] {
             self.arena.fill(stream, region, byte)?;
         }
@@ -570,6 +619,12 @@ impl Qwen35GdnLayerProgram {
 
         Ok(Qwen35GdnLayerObservables {
             mixer_normalized: self.arena.copy_to_host(stream, regions.mixer_normalized)?,
+            input_activation_codes: self
+                .arena
+                .copy_to_host(stream, regions.input_activation_codes)?,
+            input_activation_scales: self
+                .arena
+                .copy_to_host(stream, regions.input_activation_scales)?,
             projected: self.arena.copy_to_host(stream, regions.projected)?,
             projected_controls: self
                 .arena
@@ -580,6 +635,12 @@ impl Qwen35GdnLayerProgram {
             history: self.arena.copy_to_host(stream, regions.history)?,
             state: self.arena.copy_to_host(stream, regions.state)?,
             recurrent_output: self.arena.copy_to_host(stream, regions.recurrent_output)?,
+            output_activation_codes: self
+                .arena
+                .copy_to_host(stream, regions.output_activation_codes)?,
+            output_activation_scales: self
+                .arena
+                .copy_to_host(stream, regions.output_activation_scales)?,
             mixer_branch: self.arena.copy_to_host(stream, regions.mixer_branch)?,
             mixer_residual: self.arena.copy_to_host(stream, regions.mixer_residual)?,
             mlp_normalized: self.arena.copy_to_host(stream, regions.mlp_normalized)?,
@@ -590,6 +651,12 @@ impl Qwen35GdnLayerProgram {
                 .arena
                 .copy_to_host(stream, regions.gate_up_activation_scales)?,
             swiglu: self.arena.copy_to_host(stream, regions.swiglu)?,
+            down_activation_codes: self
+                .arena
+                .copy_to_host(stream, regions.down_activation_codes)?,
+            down_activation_scales: self
+                .arena
+                .copy_to_host(stream, regions.down_activation_scales)?,
             mlp_branch: self.arena.copy_to_host(stream, regions.mlp_branch)?,
             residual_output: self.arena.copy_to_host(stream, regions.residual_output)?,
             next_normalized: self.arena.copy_to_host(stream, regions.next_normalized)?,
@@ -664,6 +731,10 @@ impl Qwen35GdnLayerProgram {
 pub struct Qwen35GdnLayerObservables {
     /// Pre-mixer normalized rows.
     pub mixer_normalized: Vec<u16>,
+    /// Packed E2M1 mixer-input activation codes.
+    pub input_activation_codes: Vec<u8>,
+    /// E4M3 mixer-input activation scales.
+    pub input_activation_scales: Vec<u8>,
     /// Fused Q/K/V/Z projection rows.
     pub projected: Vec<u16>,
     /// Padded A/B control projection rows.
@@ -680,6 +751,10 @@ pub struct Qwen35GdnLayerObservables {
     pub state: Vec<f32>,
     /// Gated normalized recurrent values.
     pub recurrent_output: Vec<u16>,
+    /// Packed E2M1 recurrent-output activation codes.
+    pub output_activation_codes: Vec<u8>,
+    /// E4M3 recurrent-output activation scales.
+    pub output_activation_scales: Vec<u8>,
     /// GDN output-projection branch.
     pub mixer_branch: Vec<u16>,
     /// Residual after the mixer.
@@ -692,6 +767,10 @@ pub struct Qwen35GdnLayerObservables {
     pub gate_up_activation_scales: Vec<u8>,
     /// Fused BF16 SwiGLU rows.
     pub swiglu: Vec<u16>,
+    /// Packed E2M1 down-projection activation codes.
+    pub down_activation_codes: Vec<u8>,
+    /// E4M3 down-projection activation scales.
+    pub down_activation_scales: Vec<u8>,
     /// NVFP4 down-projection branch.
     pub mlp_branch: Vec<u16>,
     /// Published layer residual rows.
@@ -754,16 +833,19 @@ struct Ops<'a> {
 
 fn launch_divisors(values: [f32; 10]) -> Divisors {
     Divisors {
+        input_activation: values[0],
         input_weight: values[1],
         control_weight: values[3],
+        output_input: values[4],
         output_weight: values[5],
         gate_up_input: values[6],
         gate_up_weight: values[7],
+        down_input: values[8],
         down_weight: values[9],
     }
 }
 
-fn capture_routes(
+fn capture_decode_routes(
     stream: &CudaStream,
     ops: Ops<'_>,
     pointers: Pointers,
@@ -776,44 +858,85 @@ fn capture_routes(
         })?);
     }
 
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("Qwen3.5 GDN graph inventory has wrong cardinality"))
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("Qwen3.5 GDN decode graph inventory has wrong cardinality")
+    })
+}
+
+fn capture_prefill_routes(
+    stream: &CudaStream,
+    ops: Ops<'_>,
+    pointers: Pointers,
+    divisors: Divisors,
+) -> EngineResult<[CudaGraph; 3]> {
+    // T=128 would otherwise require sixteen B=8 layer graphs and 15 extra
+    // boundaries. One graph composes the same eight qualified T=128 leaves;
+    // every leaf retains its accumulation and rounding order.
+    let mut graphs = Vec::with_capacity(3);
+    for rows in [32, 64, 128] {
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_route(stream, rows, ops, pointers, divisors)
+        })?);
+    }
+
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("Qwen3.5 GDN prefill graph inventory has wrong cardinality")
+    })
 }
 
 fn launch_route(
     stream: &CudaStream,
-    batch: usize,
+    rows: usize,
     ops: Ops<'_>,
     pointers: Pointers,
     divisors: Divisors,
 ) -> GpuResult<()> {
-    // SAFETY: the one arena owns aligned, disjoint maximum-batch planes;
-    // exact-B dispatch bounds every kernel to active rows and mapped state.
+    // SAFETY: one arena owns aligned, disjoint 128-row working planes and
+    // eight persistent state slots. Prompt leaves advance state row zero
+    // causally; every leaf selects the same exact row count.
     unsafe {
         ops.norm.launch_plain(
             stream,
-            batch,
+            rows,
             pointers.residual_input,
             pointers.input_norm,
             pointers.mixer_normalized,
         )?;
-        ops.input.launch(
-            stream,
-            batch,
-            pointers.mixer_normalized,
-            pointers.input_weight_codes,
-            pointers.input_weight_scales,
-            divisors.input_weight,
-            pointers.control_weight_codes,
-            pointers.control_weight_scales,
-            divisors.control_weight,
-            pointers.projected,
-            pointers.projected_controls,
-        )?;
+        if rows <= MAX_BATCH {
+            ops.input.launch(
+                stream,
+                rows,
+                pointers.mixer_normalized,
+                pointers.input_weight_codes,
+                pointers.input_weight_scales,
+                divisors.input_weight,
+                pointers.control_weight_codes,
+                pointers.control_weight_scales,
+                divisors.control_weight,
+                pointers.projected,
+                pointers.projected_controls,
+            )?;
+        } else {
+            ops.input.launch_prefill(
+                stream,
+                rows,
+                pointers.mixer_normalized,
+                pointers.input_activation_codes,
+                pointers.input_activation_scales,
+                pointers.input_weight_codes,
+                pointers.input_weight_scales,
+                divisors.input_weight,
+                pointers.control_weight_codes,
+                pointers.control_weight_scales,
+                divisors.control_weight,
+                divisors.input_activation,
+                pointers.projected,
+                pointers.projected_controls,
+            )?;
+        }
         ops.prepare.launch(
             stream,
-            batch,
+            rows,
             pointers.projected_controls,
             pointers.a_log,
             pointers.dt_bias,
@@ -827,7 +950,7 @@ fn launch_route(
         )?;
         ops.recurrence.launch(
             stream,
-            batch,
+            rows,
             pointers.convolved,
             pointers.projected,
             pointers.log_decay,
@@ -837,48 +960,90 @@ fn launch_route(
             pointers.state,
             pointers.recurrent_output,
         )?;
-        ops.output.launch(
-            stream,
-            batch,
-            pointers.recurrent_output,
-            pointers.output_weight_codes,
-            pointers.output_weight_scales,
-            divisors.output_weight,
-            pointers.mixer_branch,
-        )?;
+        if rows <= MAX_BATCH {
+            ops.output.launch(
+                stream,
+                rows,
+                pointers.recurrent_output,
+                pointers.output_weight_codes,
+                pointers.output_weight_scales,
+                divisors.output_weight,
+                pointers.mixer_branch,
+            )?;
+        } else {
+            ops.output.launch_prefill(
+                stream,
+                rows,
+                pointers.recurrent_output,
+                pointers.output_activation_codes,
+                pointers.output_activation_scales,
+                pointers.output_weight_codes,
+                pointers.output_weight_scales,
+                divisors.output_input,
+                divisors.output_weight,
+                pointers.mixer_branch,
+            )?;
+        }
         ops.norm.launch_residual(
             stream,
-            batch,
+            rows,
             pointers.residual_input,
             pointers.mixer_branch,
             pointers.post_attention_norm,
             pointers.mixer_residual,
             pointers.mlp_normalized,
         )?;
-        ops.swiglu.launch(
-            stream,
-            batch,
-            pointers.mlp_normalized,
-            pointers.gate_up_activation_codes,
-            pointers.gate_up_activation_scales,
-            pointers.gate_weight_codes,
-            pointers.gate_up_weight_scales,
-            divisors.gate_up_input,
-            divisors.gate_up_weight,
-            pointers.swiglu,
-        )?;
-        ops.down.launch(
-            stream,
-            batch,
-            pointers.swiglu,
-            pointers.down_weight_codes,
-            pointers.down_weight_scales,
-            divisors.down_weight,
-            pointers.mlp_branch,
-        )?;
+        if rows <= MAX_BATCH {
+            ops.swiglu.launch(
+                stream,
+                rows,
+                pointers.mlp_normalized,
+                pointers.gate_up_activation_codes,
+                pointers.gate_up_activation_scales,
+                pointers.gate_weight_codes,
+                pointers.gate_up_weight_scales,
+                divisors.gate_up_input,
+                divisors.gate_up_weight,
+                pointers.swiglu,
+            )?;
+            ops.down.launch(
+                stream,
+                rows,
+                pointers.swiglu,
+                pointers.down_weight_codes,
+                pointers.down_weight_scales,
+                divisors.down_weight,
+                pointers.mlp_branch,
+            )?;
+        } else {
+            ops.swiglu.launch_prefill(
+                stream,
+                rows,
+                pointers.mlp_normalized,
+                pointers.gate_up_activation_codes,
+                pointers.gate_up_activation_scales,
+                pointers.gate_weight_codes,
+                pointers.gate_up_weight_scales,
+                divisors.gate_up_input,
+                divisors.gate_up_weight,
+                pointers.swiglu,
+            )?;
+            ops.down.launch_prefill(
+                stream,
+                rows,
+                pointers.swiglu,
+                pointers.down_activation_codes,
+                pointers.down_activation_scales,
+                pointers.down_weight_codes,
+                pointers.down_weight_scales,
+                divisors.down_input,
+                divisors.down_weight,
+                pointers.mlp_branch,
+            )?;
+        }
         ops.norm.launch_residual(
             stream,
-            batch,
+            rows,
             pointers.mixer_residual,
             pointers.mlp_branch,
             pointers.next_norm,
@@ -890,14 +1055,31 @@ fn launch_route(
     Ok(())
 }
 
-fn require_batch(batch: usize) -> EngineResult<()> {
-    if !(1..=MAX_BATCH).contains(&batch) {
-        return Err(EngineError::route(format!(
-            "Qwen3.5 GDN batch {batch} is outside the exact range 1..={MAX_BATCH}"
-        )));
+fn prefill_index(rows: usize) -> Option<usize> {
+    match rows {
+        32 => Some(0),
+        64 => Some(1),
+        128 => Some(2),
+        _ => None,
+    }
+}
+
+fn require_rows(rows: usize) -> EngineResult<()> {
+    if (1..=MAX_BATCH).contains(&rows) || prefill_index(rows).is_some() {
+        return Ok(());
     }
 
-    Ok(())
+    Err(EngineError::route(format!(
+        "Qwen3.5 GDN row count {rows} is outside 1..={MAX_BATCH},32,64,128"
+    )))
+}
+
+fn route_name(rows: usize) -> String {
+    if rows <= MAX_BATCH {
+        format!("B={rows}")
+    } else {
+        format!("T={rows}")
+    }
 }
 
 fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
@@ -907,16 +1089,20 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::require_batch;
+    use super::{prefill_index, require_rows};
     use crate::EngineErrorCode;
 
     #[test]
     fn exact_batch_table_rejects_every_boundary_neighbor() {
         for batch in 1..=8 {
-            require_batch(batch).unwrap();
+            require_rows(batch).unwrap();
         }
-        for batch in [0, 9, 16, usize::MAX] {
-            let error = require_batch(batch).unwrap_err();
+        for rows in [32, 64, 128] {
+            assert!(prefill_index(rows).is_some());
+            require_rows(rows).unwrap();
+        }
+        for rows in [0, 9, 16, 31, 33, 63, 65, 127, 129, usize::MAX] {
+            let error = require_rows(rows).unwrap_err();
             assert_eq!(error.code(), Some(EngineErrorCode::Route));
         }
     }
