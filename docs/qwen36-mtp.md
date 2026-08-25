@@ -167,6 +167,12 @@ The complete 71-entry MTP leaf inventory retains its exact launch bounds and
 toolchain-stamped register envelopes with 1,024 shared bytes and zero stack or
 local memory in every entry.
 
+One 1,699,257,856-byte source-backed layer owner now composes those leaves over 19 immutable
+graphs: draft `B=1..8`, prime and causal realignment `K=1..4`, and prompt cache priming at
+`T=32,64,128`. The isolated owner retains 1,689,281,536 unchanged BF16 weight bytes, a 1,572,864-byte
+E4M3 short cache, and 8,402,800 workspace bytes; resident long-context cache binding remains the
+next ownership slice.
+
 ## MR sequence
 
 1. `docs/qwen36-mtp-design`

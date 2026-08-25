@@ -44,6 +44,8 @@ mod qwen36_gdn_moe_layer;
 mod qwen36_gdn_moe_layer_layout;
 mod qwen36_long_context_kv;
 mod qwen36_long_context_kv_layout;
+mod qwen36_mtp_layer;
+mod qwen36_mtp_layer_layout;
 mod qwen36_resident_model;
 mod qwen36_text_endpoint;
 mod qwen36_text_endpoint_layout;
@@ -114,6 +116,8 @@ pub use qwen36_long_context_kv::Qwen36LongContextKvProgram;
 pub use qwen36_long_context_kv_layout::{
     QWEN36_LONG_CONTEXT_PHYSICAL_PAGES, QWEN36_MAX_CONTEXT_TOKENS, Qwen36LongContextKvLayout,
 };
+pub use qwen36_mtp_layer::Qwen36MtpLayerProgram;
+pub use qwen36_mtp_layer_layout::Qwen36MtpLayerLayout;
 pub use qwen36_resident_model::{
     Qwen36ResidentLayerKind, Qwen36ResidentModelLayout, Qwen36ResidentModelProgram,
     Qwen36ResidentPrefillRoute,
@@ -189,6 +193,8 @@ pub use qwen36_full_attention_layer::{
 pub use qwen36_gdn_moe_layer::{
     Qwen36GdnMoeLayerImmutable, Qwen36GdnMoeLayerInputs, Qwen36GdnMoeLayerObservables,
 };
+#[cfg(feature = "qualification")]
+pub use qwen36_mtp_layer::Qwen36MtpLayerObservables;
 #[cfg(feature = "qualification")]
 pub use qwen36_resident_model::Qwen36ResidentModelObservables;
 #[cfg(feature = "qualification")]
