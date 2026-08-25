@@ -219,6 +219,13 @@ impl ResidentLayer {
         }
     }
 
+    fn gdn(&self) -> Option<&Qwen35GdnLayerProgram> {
+        match self {
+            Self::Gdn(program) => Some(program),
+            Self::FullAttention(_) => None,
+        }
+    }
+
     fn load_slot_routes(&self, stream: &CudaStream, slots: &[usize]) -> EngineResult<()> {
         match self {
             Self::Gdn(program) => program.load_slot_routes(stream, slots),
@@ -334,6 +341,18 @@ impl ResidentLayer {
         match self {
             Self::Gdn(program) => program.read_residual(stream, rows),
             Self::FullAttention(program) => program.read_residual(stream, rows),
+        }
+    }
+
+    fn read_residual_into(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        match self {
+            Self::Gdn(program) => program.read_residual_into(stream, rows, destination),
+            Self::FullAttention(program) => program.read_residual_into(stream, rows, destination),
         }
     }
 
@@ -596,6 +615,26 @@ impl Qwen35ResidentModelProgram {
         Ok(())
     }
 
+    /// Captures one physical slot's exact GDN state into device-resident scratch.
+    pub fn capture_gdn_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        require_slot(slot)?;
+        for layer in self.layers.iter().filter_map(ResidentLayer::gdn) {
+            layer.capture_slot(stream, slot)?;
+        }
+
+        Ok(())
+    }
+
+    /// Restores one physical slot from its device-resident GDN snapshot.
+    pub fn restore_gdn_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        require_slot(slot)?;
+        for layer in self.layers.iter().filter_map(ResidentLayer::gdn) {
+            layer.restore_slot(stream, slot)?;
+        }
+
+        Ok(())
+    }
+
     /// Marks one stable page-table row active for a new or retained request.
     pub fn activate_kv_slot(&mut self, slot: usize) -> EngineResult<()> {
         self.long_context_kv.activate_slot(slot)
@@ -692,6 +731,20 @@ impl Qwen35ResidentModelProgram {
             .last()
             .ok_or_else(|| EngineError::layout("Qwen3.5 resident layer inventory is empty"))?
             .read_residual(stream, batch)
+    }
+
+    /// Reads the final decoder residual into one reusable host row bank.
+    pub fn read_final_residual_into(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        require_batch(batch)?;
+        self.layers
+            .last()
+            .ok_or_else(|| EngineError::layout("Qwen3.5 resident layer inventory is empty"))?
+            .read_residual_into(stream, batch, destination)
     }
 
     /// Reads every final-layer residual row emitted by one exact prompt tile.
@@ -800,6 +853,23 @@ impl Qwen35ResidentModelProgram {
         })?;
 
         Ok(&self.prefill_graphs[index])
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Whether one live GDN slot equals its device-resident snapshot.
+    pub fn qualification_gdn_slot_matches_snapshot(
+        &self,
+        stream: &CudaStream,
+        slot: usize,
+    ) -> EngineResult<bool> {
+        require_slot(slot)?;
+        for layer in self.layers.iter().filter_map(ResidentLayer::gdn) {
+            if !layer.slot_matches_snapshot(stream, slot)? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     #[cfg(feature = "qualification")]
@@ -1249,10 +1319,10 @@ mod tests {
 
         assert_eq!(layout.resident_weight_bytes(), 5_931_820_032);
         assert_eq!(layout.cache_bytes(), 8_640_266_240);
-        assert_eq!(layout.workspace_bytes(), 1_057_829_120);
-        assert_eq!(layout.owner_bytes(), 15_629_915_392);
+        assert_eq!(layout.workspace_bytes(), 1_109_340_416);
+        assert_eq!(layout.owner_bytes(), 15_681_426_688);
         assert_eq!(layout.padding_bytes(), 21_248);
-        assert_eq!(layout.arena_bytes(), 15_629_936_640);
+        assert_eq!(layout.arena_bytes(), 15_681_447_936);
         assert_eq!(layout.arena_count(), 34);
         assert_eq!(
             layout.source_mapped_embedding_bytes().unwrap(),

@@ -1129,7 +1129,7 @@ impl ResidentMtpBatchGenerator {
             &drafts.tokens[..extent],
             &target_refs,
             &draft_refs,
-            self.stop_ids,
+            &self.stop_ids,
             &acceptance_units[..extent],
             &residual_units[..extent],
             bonus_unit,

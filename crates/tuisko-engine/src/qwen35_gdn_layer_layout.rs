@@ -27,11 +27,13 @@ pub(crate) struct Qwen35GdnLayerRegions {
     pub(crate) convolution_weights: ArenaRegion<u16>,
     pub(crate) state_rows: ArenaRegion<u32>,
     pub(crate) history: ArenaRegion<u16>,
+    pub(crate) snapshot_history: ArenaRegion<u16>,
     pub(crate) log_decay: ArenaRegion<f32>,
     pub(crate) beta: ArenaRegion<f32>,
     pub(crate) convolved: ArenaRegion<u16>,
     pub(crate) recurrent_norm: ArenaRegion<u16>,
     pub(crate) state: ArenaRegion<f32>,
+    pub(crate) snapshot_state: ArenaRegion<f32>,
     pub(crate) recurrent_output: ArenaRegion<u16>,
     pub(crate) output_activation_codes: ArenaRegion<u8>,
     pub(crate) output_activation_scales: ArenaRegion<u8>,
@@ -187,11 +189,13 @@ impl Qwen35GdnLayerLayout {
             convolution_weights: builder.reserve(convolution_weights, ALIGNMENT)?,
             state_rows: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             history: builder.reserve(history, ALIGNMENT)?,
+            snapshot_history: builder.reserve(history / MAX_BATCH, ALIGNMENT)?,
             log_decay: builder.reserve(row_control, ALIGNMENT)?,
             beta: builder.reserve(row_control, ALIGNMENT)?,
             convolved: builder.reserve(row_qkv, ALIGNMENT)?,
             recurrent_norm: builder.reserve(A::LINEAR_HEAD_DIM, ALIGNMENT)?,
             state: builder.reserve(state, ALIGNMENT)?,
+            snapshot_state: builder.reserve(state / MAX_BATCH, ALIGNMENT)?,
             recurrent_output: builder.reserve(row_value, ALIGNMENT)?,
             output_activation_codes: builder.reserve(row_hidden / 2, ALIGNMENT)?,
             output_activation_scales: builder.reserve(row_hidden / NVFP4_GROUP, ALIGNMENT)?,
@@ -250,10 +254,12 @@ impl Qwen35GdnLayerLayout {
                 regions.projected_controls.byte_len(),
                 regions.state_rows.byte_len(),
                 regions.history.byte_len(),
+                regions.snapshot_history.byte_len(),
                 regions.log_decay.byte_len(),
                 regions.beta.byte_len(),
                 regions.convolved.byte_len(),
                 regions.state.byte_len(),
+                regions.snapshot_state.byte_len(),
                 regions.recurrent_output.byte_len(),
                 regions.output_activation_codes.byte_len(),
                 regions.output_activation_scales.byte_len(),
@@ -359,9 +365,9 @@ mod tests {
         let layout = Qwen35GdnLayerLayout::build().unwrap();
 
         assert_eq!(layout.resident_weight_bytes(), 123_068_800);
-        assert_eq!(layout.workspace_bytes(), 36_831_264);
-        assert_eq!(layout.owner_bytes(), 159_900_064);
-        assert_eq!(layout.arena_bytes(), 159_900_672);
+        assert_eq!(layout.workspace_bytes(), 38_977_568);
+        assert_eq!(layout.owner_bytes(), 162_046_368);
+        assert_eq!(layout.arena_bytes(), 162_046_976);
         assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 608);
     }
 
@@ -386,11 +392,13 @@ mod tests {
             span(regions.convolution_weights),
             span(regions.state_rows),
             span(regions.history),
+            span(regions.snapshot_history),
             span(regions.log_decay),
             span(regions.beta),
             span(regions.convolved),
             span(regions.recurrent_norm),
             span(regions.state),
+            span(regions.snapshot_state),
             span(regions.recurrent_output),
             span(regions.output_activation_codes),
             span(regions.output_activation_scales),
@@ -440,6 +448,8 @@ mod tests {
                 * Qwen35_9B::LINEAR_HEAD_DIM
                 * Qwen35_9B::LINEAR_HEAD_DIM
         );
+        assert_eq!(regions.snapshot_history.len(), regions.history.len() / 8);
+        assert_eq!(regions.snapshot_state.len(), regions.state.len() / 8);
         assert_eq!(
             regions.input_weight_scales.len(),
             Qwen35_9B::GDN_INPUT_ROWS * Qwen35_9B::HIDDEN / 16

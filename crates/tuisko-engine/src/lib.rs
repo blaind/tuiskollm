@@ -25,6 +25,7 @@ mod qwen35_gdn_layer;
 mod qwen35_gdn_layer_layout;
 mod qwen35_long_context_kv;
 mod qwen35_long_context_kv_layout;
+mod qwen35_mtp_generation;
 mod qwen35_mtp_kv;
 mod qwen35_mtp_kv_layout;
 mod qwen35_mtp_layer;
@@ -82,6 +83,9 @@ pub use qwen35_gdn_layer_layout::Qwen35GdnLayerLayout;
 pub use qwen35_long_context_kv::Qwen35LongContextKvProgram;
 pub use qwen35_long_context_kv_layout::{
     QWEN35_LONG_CONTEXT_PHYSICAL_PAGES, QWEN35_MAX_CONTEXT_TOKENS, Qwen35LongContextKvLayout,
+};
+pub use qwen35_mtp_generation::{
+    Qwen35ResidentMtpGenerationSession, Qwen35ResidentMtpTextGenerator,
 };
 pub use qwen35_mtp_layer::Qwen35MtpLayerProgram;
 pub use qwen35_mtp_layer_layout::Qwen35MtpLayerLayout;

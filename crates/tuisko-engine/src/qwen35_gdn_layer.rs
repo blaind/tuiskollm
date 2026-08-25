@@ -438,6 +438,104 @@ impl Qwen35GdnLayerProgram {
         Ok(())
     }
 
+    pub(crate) const fn slot_history_values(&self) -> usize {
+        self.layout.regions().history.len() / MAX_BATCH
+    }
+
+    pub(crate) const fn slot_state_values(&self) -> usize {
+        self.layout.regions().state.len() / MAX_BATCH
+    }
+
+    pub(crate) fn capture_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        require_slot(slot)?;
+        let regions = self.layout.regions();
+        let history_values = self.slot_history_values();
+        let state_values = self.slot_state_values();
+        // SAFETY: the exact live and snapshot regions are disjoint and retained by this owner;
+        // provisional work follows these copies on the same ordered stream.
+        unsafe {
+            self.arena.copy_slice_from_arena_async(
+                stream,
+                regions.snapshot_history,
+                0,
+                &self.arena,
+                regions.history,
+                slot * history_values,
+                history_values,
+            )?;
+            self.arena.copy_slice_from_arena_async(
+                stream,
+                regions.snapshot_state,
+                0,
+                &self.arena,
+                regions.state,
+                slot * state_values,
+                state_values,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn restore_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        require_slot(slot)?;
+        let regions = self.layout.regions();
+        let history_values = self.slot_history_values();
+        let state_values = self.slot_state_values();
+        // SAFETY: the snapshot and live slot regions are disjoint and retained; committed target
+        // work consumes the restored state later on this same ordered stream.
+        unsafe {
+            self.arena.copy_slice_from_arena_async(
+                stream,
+                regions.history,
+                slot * history_values,
+                &self.arena,
+                regions.snapshot_history,
+                0,
+                history_values,
+            )?;
+            self.arena.copy_slice_from_arena_async(
+                stream,
+                regions.state,
+                slot * state_values,
+                &self.arena,
+                regions.snapshot_state,
+                0,
+                state_values,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    pub(crate) fn slot_matches_snapshot(
+        &self,
+        stream: &CudaStream,
+        slot: usize,
+    ) -> EngineResult<bool> {
+        require_slot(slot)?;
+        let regions = self.layout.regions();
+        let history_values = self.slot_history_values();
+        let state_values = self.slot_state_values();
+        let live_history = self.arena.copy_slice_to_host(
+            stream,
+            regions.history,
+            slot * history_values,
+            history_values,
+        )?;
+        let live_state = self.arena.copy_slice_to_host(
+            stream,
+            regions.state,
+            slot * state_values,
+            state_values,
+        )?;
+        let snapshot_history = self.arena.copy_to_host(stream, regions.snapshot_history)?;
+        let snapshot_state = self.arena.copy_to_host(stream, regions.snapshot_state)?;
+
+        Ok(live_history == snapshot_history && live_state == snapshot_state)
+    }
+
     /// Replays the immutable graph for one exact row route.
     pub fn replay(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
         // SAFETY: this Qwen35GdnLayerProgram owns every captured allocation
@@ -455,6 +553,29 @@ impl Qwen35GdnLayerProgram {
         Ok(self
             .arena
             .copy_prefix_to_host(stream, self.layout.regions().residual_output, values)?)
+    }
+
+    pub(crate) fn read_residual_into(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        require_rows(rows)?;
+        let values = product("Qwen3.5 GDN output elements", rows, Qwen35_9B::HIDDEN)?;
+        if destination.len() != values {
+            return Err(EngineError::layout(format!(
+                "Qwen3.5 GDN residual destination has {} values, expected {values}",
+                destination.len()
+            )));
+        }
+        self.arena.copy_prefix_to_host_slice(
+            stream,
+            self.layout.regions().residual_output,
+            destination,
+        )?;
+
+        Ok(())
     }
 
     /// Decoder layer owned by this program.
