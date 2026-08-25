@@ -23,7 +23,7 @@ pub use generation::{
     CancelledText, ChatGenerationRequest, FinishReason, GeneratedText, GenerationSession,
     GenerationStep,
 };
-pub use layout::{EndpointLayout, MAX_BATCH};
+pub use layout::{EndpointLayout, LayerMemoryLayout, MAX_BATCH};
 pub use paged_kv_slots::{PagedKvRoute, PagedKvSlotPool, PagedKvSlotState, PagedKvTableUpdate};
 pub use program::TextEndpointProgram;
 pub use qwen35::batch_generation::Qwen35ResidentBatchGenerator;

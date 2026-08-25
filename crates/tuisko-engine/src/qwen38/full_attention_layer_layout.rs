@@ -1,7 +1,7 @@
 //! Single-allocation layout for one late dense-FP8 full-attention decoder layer.
 
 use crate::common::math::{product, sum};
-use crate::{EngineResult, MAX_BATCH};
+use crate::{EngineResult, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES};
 use tuisko_model::Arch;
@@ -286,6 +286,24 @@ impl FullAttentionLayerLayout {
     /// Complete shared-page capacity used by exact from-empty prefill.
     pub const fn prefill_context_capacity(&self) -> usize {
         PREFILL_CONTEXT_CAPACITY
+    }
+}
+
+impl LayerMemoryLayout for FullAttentionLayerLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 

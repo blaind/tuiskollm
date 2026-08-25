@@ -1,7 +1,9 @@
 //! Long-context BF16 cache mirror for the exact Qwen3.5 MTP layer.
 
 use crate::common::math::product;
-use crate::{EngineError, EngineResult, MAX_BATCH, QWEN35_LONG_CONTEXT_PHYSICAL_PAGES};
+use crate::{
+    EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH, QWEN35_LONG_CONTEXT_PHYSICAL_PAGES,
+};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{Arch, Qwen35_9B};
@@ -92,6 +94,26 @@ impl Qwen35MtpKvLayout {
     #[cfg(test)]
     fn owner_bytes(&self) -> usize {
         self.cache_bytes() + self.block_table_bytes()
+    }
+}
+
+impl LayerMemoryLayout for Qwen35MtpKvLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    // A paged cache owner carries no source-backed weights.
+    fn resident_weight_bytes(&self) -> usize {
+        0
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    // Block tables are the owner's only address-stable non-cache bytes.
+    fn workspace_bytes(&self) -> usize {
+        self.block_table_bytes()
     }
 }
 

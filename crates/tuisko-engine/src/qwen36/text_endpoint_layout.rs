@@ -1,7 +1,7 @@
 //! Address-stable Qwen3.6 text-endpoint layout.
 
 use crate::common::math::product;
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::{EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::{Arch, Qwen36Moe35B};
 
@@ -122,6 +122,25 @@ impl Qwen36TextEndpointLayout {
 
     pub(crate) const fn logits(&self) -> ArenaRegion<u16> {
         self.logits
+    }
+}
+
+impl LayerMemoryLayout for Qwen36TextEndpointLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    // This owner holds no paged key/value cache.
+    fn cache_bytes(&self) -> usize {
+        0
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 

@@ -1,7 +1,7 @@
 //! Single-allocation layout for one Qwen3.6 GDN plus MoE decoder layer.
 
 use crate::common::math::{product, sum};
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::{EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::{Arch, Qwen36Moe35B};
 
@@ -331,6 +331,25 @@ impl Qwen36GdnMoeLayerLayout {
     /// Largest exact row route owned by the layer.
     pub const fn row_capacity(&self) -> usize {
         QWEN36_GDN_MAX_ROWS
+    }
+}
+
+impl LayerMemoryLayout for Qwen36GdnMoeLayerLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    // This owner holds no paged key/value cache.
+    fn cache_bytes(&self) -> usize {
+        0
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 

@@ -4,7 +4,7 @@
 //! layout does not admit an append or attention execution route.
 
 use crate::common::math::{checked_sum, product};
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::{EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{Arch, Qwen38_27B};
@@ -296,6 +296,26 @@ impl SharedPagedKvLayout {
         }
 
         Ok(())
+    }
+}
+
+impl LayerMemoryLayout for SharedPagedKvLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    // A paged cache owner carries no source-backed weights.
+    fn resident_weight_bytes(&self) -> usize {
+        0
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    // Block tables are the owner's only address-stable non-cache bytes.
+    fn workspace_bytes(&self) -> usize {
+        self.block_table_bytes()
     }
 }
 

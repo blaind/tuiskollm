@@ -1,7 +1,7 @@
 //! Single-allocation layout for one resident NVFP4 MLP boundary.
 
 use crate::common::math::product;
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::{EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::Arch;
 
@@ -240,6 +240,25 @@ impl Nvfp4MlpLayout {
 
     pub(crate) const fn next_normalized(&self) -> ArenaRegion<u16> {
         self.next_normalized
+    }
+}
+
+impl LayerMemoryLayout for Nvfp4MlpLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    // This owner holds no paged key/value cache.
+    fn cache_bytes(&self) -> usize {
+        0
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 

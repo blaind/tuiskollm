@@ -1,7 +1,7 @@
 //! Long-context resident layout for the exact Qwen3.8 MTP layer.
 
 use crate::common::math::{product, sum};
-use crate::{EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH};
+use crate::{EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{Arch, Qwen38_27B};
@@ -298,6 +298,24 @@ impl ResidentMtpLayout {
     /// Alignment bytes outside represented weights, cache, and typed workspace regions.
     pub const fn padding_bytes(&self) -> usize {
         self.owner_bytes() - self.weight_bytes - self.cache_bytes - self.workspace_bytes
+    }
+}
+
+impl LayerMemoryLayout for ResidentMtpLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 

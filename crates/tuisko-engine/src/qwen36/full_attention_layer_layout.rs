@@ -1,7 +1,7 @@
 //! Single-allocation layout for one Qwen3.6 attention plus MoE decoder layer.
 
 use crate::common::math::{product, sum};
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::{EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{Arch, Qwen36Moe35B};
@@ -358,6 +358,24 @@ impl Qwen36FullAttentionLayerLayout {
     /// Shared from-empty prompt cache capacity.
     pub const fn prefill_context_capacity(&self) -> usize {
         QWEN36_PREFILL_CONTEXT_CAPACITY
+    }
+}
+
+impl LayerMemoryLayout for Qwen36FullAttentionLayerLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 
