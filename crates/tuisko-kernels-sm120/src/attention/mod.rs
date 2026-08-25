@@ -26,9 +26,9 @@ pub(crate) use paged_gqa::{
 };
 pub use qk_prepare::{
     ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, Qwen35AttentionQkPrepareOp,
-    Qwen36AttentionQkPrepareOp,
+    Qwen36AttentionQkPrepareOp, Qwen36Fp8AttentionQkPrepareOp,
 };
 pub(crate) use qk_prepare::{
     attention_qk_prepare_ptx_names, qwen35_attention_qk_prepare_ptx_names,
-    qwen36_attention_qk_prepare_ptx_names,
+    qwen36_attention_qk_prepare_ptx_names, qwen36_fp8_attention_qk_prepare_ptx_names,
 };

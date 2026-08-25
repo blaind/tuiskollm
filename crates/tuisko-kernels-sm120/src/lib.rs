@@ -34,7 +34,8 @@ pub use attention::{
     PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES, PAGED_GQA_PREFILL_MACRO_TOKENS,
     PAGED_GQA_PREFILL_MAX_CONTEXT, PAGED_GQA_PREFILL_PARTIAL_BYTES, PagedGqaOp,
     Qwen35AttentionQkPrepareOp, Qwen35Nvfp4AttentionOutputOp, Qwen35Nvfp4GdnOutputOp,
-    Qwen35PagedGqaOp, Qwen36AttentionQkPrepareOp, Qwen36PagedGqaOp, paged_gqa_prefill_partitions,
+    Qwen35PagedGqaOp, Qwen36AttentionQkPrepareOp, Qwen36Fp8AttentionQkPrepareOp, Qwen36PagedGqaOp,
+    paged_gqa_prefill_partitions,
 };
 pub use bf16_lm_head::Qwen35Bf16LmHeadOp;
 pub use fp8::{

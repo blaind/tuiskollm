@@ -12,7 +12,7 @@ use tuisko_gpu::{
 };
 use tuisko_kernels_sm120::{
     ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, Qwen35AttentionQkPrepareOp,
-    Qwen36AttentionQkPrepareOp,
+    Qwen36AttentionQkPrepareOp, Qwen36Fp8AttentionQkPrepareOp,
 };
 use tuisko_model::{
     Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen35_9B, Qwen36Moe35B, Qwen38_27B,
@@ -259,6 +259,12 @@ macro_rules! impl_qualified_op {
 }
 
 impl_qualified_op!(AttentionQkPrepareOp, Qwen38_27B, &ROUTES, MAX_TOKENS);
+impl_qualified_op!(
+    Qwen36Fp8AttentionQkPrepareOp,
+    Qwen36Moe35B,
+    &QWEN36_ROUTES,
+    QWEN36_MAX_TOKENS
+);
 
 impl QualifiedQkPrepareOp for Qwen35AttentionQkPrepareOp {
     type Target = Qwen35_9B;
@@ -493,6 +499,12 @@ pub fn qualify_qwen35_attention_qk_prepare()
 pub fn qualify_qwen36_attention_qk_prepare()
 -> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
     qualify_target::<Qwen36AttentionQkPrepareOp>(None)
+}
+
+/// Qualifies Qwen3.6 E4M3-cache Q/K preparation at every admitted route.
+pub fn qualify_qwen36_fp8_attention_qk_prepare()
+-> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
+    qualify_target::<Qwen36Fp8AttentionQkPrepareOp>(None)
 }
 
 /// Qualifies source-backed MTP Q/K preparation at exact `B=1..=8` and prompt tiles.
@@ -1207,7 +1219,7 @@ mod tests {
         QWEN36_MAX_TOKENS, QWEN36_ROUTES, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, ROUTES, TABLE_ROWS,
         TABLE_STRIDE, layout, qualify_attention_qk_prepare, qualify_mtp_bf16_qk_prepare,
         qualify_qwen35_attention_qk_prepare, qualify_qwen35_mtp_bf16_qk_prepare,
-        qualify_qwen36_attention_qk_prepare,
+        qualify_qwen36_attention_qk_prepare, qualify_qwen36_fp8_attention_qk_prepare,
     };
     use std::{mem::size_of, path::PathBuf};
     use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -1340,6 +1352,54 @@ mod tests {
         assert_eq!(report.arena_bytes, layout.byte_len());
         assert_eq!(report.arena_bytes - report.padding_bytes, 6_588_992);
         assert_eq!(regions.payload_bytes(), 6_588_992);
+        assert!(report.maximum_query_error <= 0.003);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
+    fn qwen36_fp8_cache_routes_match_independent_oracles_and_graph_replay()
+    -> Result<(), super::AttentionQkPrepareQualificationError> {
+        let report = qualify_qwen36_fp8_attention_qk_prepare()?;
+        let active_tokens = QWEN36_ROUTES.iter().sum::<usize>();
+        let query_per_token = Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS;
+        let cache_per_token = 2 * Qwen36Moe35B::ATTENTION_KV_ROWS;
+        let plane_bytes = PHYSICAL_PAGES
+            * Qwen36Moe35B::NUM_KV_HEADS
+            * ATTENTION_PAGE_SIZE
+            * Qwen36Moe35B::HEAD_DIM;
+        let replay_per_route = QWEN36_MAX_TOKENS * query_per_token + 2 * plane_bytes;
+        let total_observable = QWEN36_ROUTES.len() * replay_per_route;
+        let immutable_per_check = QWEN36_MAX_TOKENS * Qwen36Moe35B::ATTENTION_QKV_ROWS
+            + 2 * Qwen36Moe35B::HEAD_DIM
+            + 2 * QWEN36_MAX_TOKENS * super::ROTARY_PAIRS
+            + TABLE_ROWS * TABLE_STRIDE
+            + 2 * MAX_BATCH
+            + 2 * QWEN36_MAX_TOKENS;
+
+        assert_eq!(report.query_values, active_tokens * query_per_token);
+        assert_eq!(
+            report.appended_cache_values,
+            active_tokens * cache_per_token
+        );
+        assert_eq!(
+            report.untouched_values,
+            total_observable - active_tokens * (query_per_token + cache_per_token)
+        );
+        assert_eq!(
+            report.immutable_input_values,
+            2 * QWEN36_ROUTES.len() * immutable_per_check
+        );
+        assert_eq!(report.graph_replay_values, total_observable);
+        let (layout, regions) = layout::<Qwen36Moe35B>(QWEN36_MAX_TOKENS, size_of::<u8>())?;
+        assert_eq!(report.arena_bytes, layout.byte_len());
+        assert_eq!(
+            report.arena_bytes - report.padding_bytes,
+            regions.payload_bytes()
+        );
+        assert_eq!(report.weight_bytes, regions.weight_bytes());
+        assert_eq!(report.cache_bytes, regions.cache_bytes());
+        assert_eq!(report.workspace_bytes, regions.workspace_bytes());
         assert!(report.maximum_query_error <= 0.003);
         Ok(())
     }
