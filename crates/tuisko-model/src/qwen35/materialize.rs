@@ -10,9 +10,7 @@ use crate::common::nvfp4::{
 use crate::common::routes::{
     require_full_attention_layer, require_gdn_layer_route, validate_nvfp4_scales,
 };
-use crate::common::scale_swizzle::{
-    SCALE_TILE_ROWS, gather_source_planes, host_shape, swizzle_scale_planes,
-};
+use crate::common::scale_swizzle::{PlaneGatherer, SCALE_TILE_ROWS, host_shape};
 use crate::qwen35::bindings::{
     ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings,
 };
@@ -179,13 +177,13 @@ impl<'a> ModelOptNvfp4GdnBindings<'a> {
                 self.layer
             ))
         })?;
-        let input_weight_e2m1 = gather_source_planes(
+        let input_weight_e2m1 = PlaneGatherer::gather(
             [qkv.weight_e2m1, z.weight_e2m1],
             &format!("layer-{} ModelOpt NVFP4 QKV/Z weights", self.layer),
         )?;
         // Both exact row families end on 128-row scale-tile boundaries, so
         // concatenating their complete swizzled tiles preserves fused row order.
-        let input_scale_e4m3_swizzled = gather_source_planes(
+        let input_scale_e4m3_swizzled = PlaneGatherer::gather(
             [
                 qkv.scale_e4m3_swizzled.as_slice(),
                 z.scale_e4m3_swizzled.as_slice(),
@@ -293,17 +291,17 @@ fn materialize_modelopt_controls(
 
     // The source has 64 represented control rows while the Blackwell scale
     // layout owns 128-row tiles. Rows 64..128 are never dispatched.
-    let mut weight_e2m1_padded = gather_source_planes(
+    let mut weight_e2m1_padded = PlaneGatherer::gather(
         [a.weight.bytes(), b.weight.bytes()],
         &format!("layer-{layer} ModelOpt NVFP4 A/B control weights"),
     )?;
     weight_e2m1_padded.resize(padded_weight_bytes, 0);
-    let mut row_major_scales = gather_source_planes(
+    let mut row_major_scales = PlaneGatherer::gather(
         [a.block_scale.codes(), b.block_scale.codes()],
         &format!("layer-{layer} ModelOpt NVFP4 A/B control scales"),
     )?;
     row_major_scales.resize(padded_scale_bytes, 0);
-    let scale_e4m3_swizzled = swizzle_scale_planes(
+    let scale_e4m3_swizzled = PlaneGatherer::swizzle_scales(
         &[&row_major_scales],
         padded_rows,
         groups,
@@ -375,13 +373,13 @@ impl<'a> ModelOptNvfp4AttentionBindings<'a> {
                     self.layer
                 ))
             })?;
-        let qkv_weight_e2m1 = gather_source_planes(
+        let qkv_weight_e2m1 = PlaneGatherer::gather(
             [query_gate.weight_e2m1, key.weight_e2m1, value.weight_e2m1],
             &format!("layer-{} ModelOpt NVFP4 QKV weights", self.layer),
         )?;
         // Each admitted Q/K/V row family is independently tiled by 128 rows,
         // so concatenating complete swizzled tiles preserves fused row order.
-        let qkv_scale_e4m3_swizzled = gather_source_planes(
+        let qkv_scale_e4m3_swizzled = PlaneGatherer::gather(
             [
                 query_gate.scale_e4m3_swizzled.as_slice(),
                 key.scale_e4m3_swizzled.as_slice(),

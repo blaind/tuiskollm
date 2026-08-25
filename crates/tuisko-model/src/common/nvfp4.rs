@@ -2,7 +2,7 @@
 
 use crate::common::modelopt_codec::{logical_columns, validate_divisor};
 use crate::common::routes::{require_nvfp4_mlp_layer, validate_nvfp4_scales};
-use crate::common::scale_swizzle::{host_shape, swizzle_scale_planes};
+use crate::common::scale_swizzle::{PlaneGatherer, host_shape};
 use crate::{CheckpointError, CheckpointResult, Fp8E4M3View, U8View};
 
 /// Exact packed gate/up source planes for one NVFP4 MLP layer.
@@ -98,7 +98,7 @@ impl<'a> Nvfp4GateUpBindings<'a> {
         validate_divisor(self.layer, "gate/up input", self.input_scale_divisor)?;
         validate_divisor(self.layer, "gate/up weight", self.weight_scale_divisor)?;
 
-        let scale_e4m3_swizzled = swizzle_scale_planes(
+        let scale_e4m3_swizzled = PlaneGatherer::swizzle_scales(
             &[self.gate_scale.codes(), self.up_scale.codes()],
             gate_rows,
             groups,
@@ -160,7 +160,7 @@ impl<'a> Nvfp4DownBindings<'a> {
         validate_divisor(self.layer, "down weight", self.weight_scale_divisor)?;
 
         let scale_e4m3_swizzled =
-            swizzle_scale_planes(&[self.scale.codes()], rows, groups, self.layer, "down")?;
+            PlaneGatherer::swizzle_scales(&[self.scale.codes()], rows, groups, self.layer, "down")?;
 
         Ok(MaterializedNvfp4Down {
             weight_e2m1: self.weight.bytes(),

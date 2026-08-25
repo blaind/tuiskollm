@@ -4,7 +4,7 @@ use crate::common::routes::{
     E2M1_VALUES_PER_BYTE, NVFP4_GROUP_SIZE, codec_columns, positive_rank_zero_f32,
     validate_nvfp4_scales,
 };
-use crate::common::scale_swizzle::{host_shape, swizzle_scale_planes};
+use crate::common::scale_swizzle::{PlaneGatherer, host_shape};
 use crate::{CheckpointError, CheckpointResult, F32View, Fp8E4M3View, TensorView, U8View};
 
 /// Exact ModelOpt NVFP4 planes for one linear projection.
@@ -123,7 +123,7 @@ pub(crate) fn materialize_modelopt_linear<'a>(
         weight_scale_2,
     )?;
     let scale_e4m3_swizzled =
-        swizzle_scale_planes(&[binding.block_scale.codes()], rows, groups, layer, role)?;
+        PlaneGatherer::swizzle_scales(&[binding.block_scale.codes()], rows, groups, layer, role)?;
 
     Ok(MaterializedModelOptNvfp4Linear {
         weight_e2m1: binding.weight.bytes(),

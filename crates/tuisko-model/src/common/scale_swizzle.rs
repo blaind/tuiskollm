@@ -37,126 +37,139 @@ pub(crate) fn host_shape(shape: &[u64; 2], role: &str) -> CheckpointResult<[usiz
     Ok([rows, columns])
 }
 
-pub(crate) fn gather_source_planes<const N: usize>(
-    planes: [&[u8]; N],
-    role: &str,
-) -> CheckpointResult<Vec<u8>> {
-    let bytes = planes.iter().try_fold(0usize, |bytes, plane| {
-        bytes
-            .checked_add(plane.len())
-            .ok_or_else(|| CheckpointError::source_binding(format!("{role} length overflows")))
-    })?;
+/// Source-plane gatherer for the shared NVFP4 materialization pipeline.
+///
+/// Both operations are byte permutations of the checkpoint's source planes: `gather`
+/// concatenates them in the given order, and `swizzle_scales` applies the Blackwell
+/// `BlockScaleK16M128x4` address mapping. Neither decodes, requantizes, or reorders a
+/// represented value within a plane, so the parallel and sequential paths must stay
+/// byte-identical.
+pub(crate) struct PlaneGatherer;
 
-    let mut gathered = Vec::new();
+impl PlaneGatherer {
+    /// Concatenates source planes in order, in parallel above the measured byte bound.
+    pub(crate) fn gather<const N: usize>(
+        planes: [&[u8]; N],
+        role: &str,
+    ) -> CheckpointResult<Vec<u8>> {
+        let bytes = planes.iter().try_fold(0usize, |bytes, plane| {
+            bytes
+                .checked_add(plane.len())
+                .ok_or_else(|| CheckpointError::source_binding(format!("{role} length overflows")))
+        })?;
 
-    gathered.try_reserve_exact(bytes).map_err(|_| {
-        CheckpointError::source_binding(format!("{role} cannot reserve {bytes} host bytes"))
-    })?;
+        let mut gathered = Vec::new();
 
-    if bytes >= PARALLEL_GATHER_MIN_BYTES && materialization_workers() > 1 {
-        match planes.as_slice() {
-            [first, second] => {
-                materialization_pool(role)?.install(|| {
-                    first
-                        .par_iter()
-                        .copied()
-                        .chain(second.par_iter().copied())
-                        .collect_into_vec(&mut gathered);
-                });
-                return Ok(gathered);
+        gathered.try_reserve_exact(bytes).map_err(|_| {
+            CheckpointError::source_binding(format!("{role} cannot reserve {bytes} host bytes"))
+        })?;
+
+        if bytes >= PARALLEL_GATHER_MIN_BYTES && materialization_workers() > 1 {
+            match planes.as_slice() {
+                [first, second] => {
+                    materialization_pool(role)?.install(|| {
+                        first
+                            .par_iter()
+                            .copied()
+                            .chain(second.par_iter().copied())
+                            .collect_into_vec(&mut gathered);
+                    });
+                    return Ok(gathered);
+                }
+                [first, second, third] => {
+                    materialization_pool(role)?.install(|| {
+                        first
+                            .par_iter()
+                            .copied()
+                            .chain(second.par_iter().copied())
+                            .chain(third.par_iter().copied())
+                            .collect_into_vec(&mut gathered);
+                    });
+                    return Ok(gathered);
+                }
+                _ => {}
             }
-            [first, second, third] => {
-                materialization_pool(role)?.install(|| {
-                    first
-                        .par_iter()
-                        .copied()
-                        .chain(second.par_iter().copied())
-                        .chain(third.par_iter().copied())
-                        .collect_into_vec(&mut gathered);
-                });
-                return Ok(gathered);
-            }
-            _ => {}
         }
+
+        for plane in planes {
+            gathered.extend_from_slice(plane);
+        }
+
+        Ok(gathered)
     }
 
-    for plane in planes {
-        gathered.extend_from_slice(plane);
-    }
+    /// Permutes source scale planes into the `BlockScaleK16M128x4` layout.
+    pub(crate) fn swizzle_scales(
+        planes: &[&[u8]],
+        rows_per_plane: usize,
+        groups_per_row: usize,
+        layer: usize,
+        role: &str,
+    ) -> CheckpointResult<Vec<u8>> {
+        let rows = rows_per_plane.checked_mul(planes.len()).ok_or_else(|| {
+            CheckpointError::source_binding(format!(
+                "layer-{layer} NVFP4 {role} fused scale row count overflows"
+            ))
+        })?;
 
-    Ok(gathered)
-}
+        if rows == 0 || !rows.is_multiple_of(SCALE_TILE_ROWS) {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{layer} NVFP4 {role} scale rows {rows} are not tiled by {SCALE_TILE_ROWS}"
+            )));
+        }
 
-pub(crate) fn swizzle_scale_planes(
-    planes: &[&[u8]],
-    rows_per_plane: usize,
-    groups_per_row: usize,
-    layer: usize,
-    role: &str,
-) -> CheckpointResult<Vec<u8>> {
-    let rows = rows_per_plane.checked_mul(planes.len()).ok_or_else(|| {
-        CheckpointError::source_binding(format!(
-            "layer-{layer} NVFP4 {role} fused scale row count overflows"
-        ))
-    })?;
+        if groups_per_row == 0 || !groups_per_row.is_multiple_of(SCALE_TILE_GROUPS) {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{layer} NVFP4 {role} scale groups {groups_per_row} are not tiled by {SCALE_TILE_GROUPS}"
+            )));
+        }
 
-    if rows == 0 || !rows.is_multiple_of(SCALE_TILE_ROWS) {
-        return Err(CheckpointError::source_binding(format!(
-            "layer-{layer} NVFP4 {role} scale rows {rows} are not tiled by {SCALE_TILE_ROWS}"
-        )));
-    }
+        let plane_len = rows_per_plane.checked_mul(groups_per_row).ok_or_else(|| {
+            CheckpointError::source_binding(format!(
+                "layer-{layer} NVFP4 {role} source scale length overflows"
+            ))
+        })?;
+        let output_len = rows.checked_mul(groups_per_row).ok_or_else(|| {
+            CheckpointError::source_binding(format!(
+                "layer-{layer} NVFP4 {role} materialized scale length overflows"
+            ))
+        })?;
 
-    if groups_per_row == 0 || !groups_per_row.is_multiple_of(SCALE_TILE_GROUPS) {
-        return Err(CheckpointError::source_binding(format!(
-            "layer-{layer} NVFP4 {role} scale groups {groups_per_row} are not tiled by {SCALE_TILE_GROUPS}"
-        )));
-    }
+        if planes.iter().any(|plane| plane.len() != plane_len) {
+            return Err(CheckpointError::source_binding(format!(
+                "layer-{layer} NVFP4 {role} source scale plane length does not match its shape"
+            )));
+        }
 
-    let plane_len = rows_per_plane.checked_mul(groups_per_row).ok_or_else(|| {
-        CheckpointError::source_binding(format!(
-            "layer-{layer} NVFP4 {role} source scale length overflows"
-        ))
-    })?;
-    let output_len = rows.checked_mul(groups_per_row).ok_or_else(|| {
-        CheckpointError::source_binding(format!(
-            "layer-{layer} NVFP4 {role} materialized scale length overflows"
-        ))
-    })?;
+        let mut swizzled = vec![0; output_len];
+        let scale_tiles_per_row = groups_per_row / SCALE_TILE_GROUPS;
+        let swizzle_tile = |(tile_index, destination): (usize, &mut [u8])| {
+            swizzle_scale_tile(
+                destination,
+                tile_index,
+                scale_tiles_per_row,
+                planes,
+                rows_per_plane,
+                groups_per_row,
+            );
+        };
 
-    if planes.iter().any(|plane| plane.len() != plane_len) {
-        return Err(CheckpointError::source_binding(format!(
-            "layer-{layer} NVFP4 {role} source scale plane length does not match its shape"
-        )));
-    }
-
-    let mut swizzled = vec![0; output_len];
-    let scale_tiles_per_row = groups_per_row / SCALE_TILE_GROUPS;
-    let swizzle_tile = |(tile_index, destination): (usize, &mut [u8])| {
-        swizzle_scale_tile(
-            destination,
-            tile_index,
-            scale_tiles_per_row,
-            planes,
-            rows_per_plane,
-            groups_per_row,
-        );
-    };
-
-    if output_len >= PARALLEL_SWIZZLE_MIN_BYTES {
-        materialization_pool(&format!("layer-{layer} NVFP4 {role} scales"))?.install(|| {
+        if output_len >= PARALLEL_SWIZZLE_MIN_BYTES {
+            materialization_pool(&format!("layer-{layer} NVFP4 {role} scales"))?.install(|| {
+                swizzled
+                    .par_chunks_mut(SCALE_TILE_BYTES)
+                    .enumerate()
+                    .for_each(swizzle_tile);
+            });
+        } else {
             swizzled
-                .par_chunks_mut(SCALE_TILE_BYTES)
+                .chunks_mut(SCALE_TILE_BYTES)
                 .enumerate()
                 .for_each(swizzle_tile);
-        });
-    } else {
-        swizzled
-            .chunks_mut(SCALE_TILE_BYTES)
-            .enumerate()
-            .for_each(swizzle_tile);
-    }
+        }
 
-    Ok(swizzled)
+        Ok(swizzled)
+    }
 }
 
 fn swizzle_scale_tile(
@@ -206,7 +219,7 @@ pub(crate) fn materialization_pool(role: &str) -> CheckpointResult<&'static rayo
 mod tests {
     use super::*;
     use crate::CheckpointErrorCode;
-    use crate::common::test_support::sources::{GROUPS, ROWS};
+    use crate::common::test_support::sources::{GROUPS, ROWS, block_scale_oracle};
 
     #[test]
     fn parallel_gather_preserves_three_plane_order_exactly() {
@@ -218,7 +231,7 @@ mod tests {
             .map(|index| (index as u8).wrapping_mul(5))
             .collect::<Vec<_>>();
 
-        let gathered = gather_source_planes([&first, &second, &third], "test QKV").unwrap();
+        let gathered = PlaneGatherer::gather([&first, &second, &third], "test QKV").unwrap();
         let second_end = first.len() + second.len();
 
         assert_eq!(&gathered[..first.len()], first.as_slice());
@@ -233,10 +246,37 @@ mod tests {
             .map(|index| (index as u8).wrapping_mul(5))
             .collect::<Vec<_>>();
 
-        let gathered = gather_source_planes([&first, &second], "test fused planes").unwrap();
+        let gathered = PlaneGatherer::gather([&first, &second], "test fused planes").unwrap();
 
         assert_eq!(&gathered[..first.len()], first.as_slice());
         assert_eq!(&gathered[first.len()..], second.as_slice());
+    }
+
+    #[test]
+    fn swizzle_pins_the_fused_scale_permutation_on_both_paths() {
+        // The 512-row case crosses PARALLEL_SWIZZLE_MIN_BYTES, so this pins the parallel and
+        // sequential tile loops against the same independent BlockScaleK16M128x4 oracle.
+        for (rows_per_plane, groups, plane_count) in [(ROWS, GROUPS, 3), (512, 1_024, 2)] {
+            let planes = (0..plane_count)
+                .map(|plane| {
+                    (0..rows_per_plane * groups)
+                        .map(|index| ((index * 37 + plane * 11) % 0x7f) as u8)
+                        .collect::<Vec<u8>>()
+                })
+                .collect::<Vec<_>>();
+            let borrowed = planes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+
+            let swizzled =
+                PlaneGatherer::swizzle_scales(&borrowed, rows_per_plane, groups, 55, "test")
+                    .unwrap();
+            let expected =
+                block_scale_oracle(&planes.concat(), rows_per_plane * plane_count, groups);
+
+            assert_eq!(
+                swizzled, expected,
+                "{plane_count} planes of {rows_per_plane}"
+            );
+        }
     }
 
     #[test]
@@ -245,7 +285,7 @@ mod tests {
             (127, 8, "scale rows 127 are not tiled by 128"),
             (128, 6, "scale groups 6 are not tiled by 4"),
         ] {
-            let error = swizzle_scale_planes(&[&[]], rows, groups, 55, "test")
+            let error = PlaneGatherer::swizzle_scales(&[&[]], rows, groups, 55, "test")
                 .err()
                 .unwrap();
 
@@ -253,7 +293,7 @@ mod tests {
             assert!(error.to_string().contains(message), "{error}");
         }
 
-        let error = swizzle_scale_planes(&[&[]], ROWS, GROUPS, 55, "test")
+        let error = PlaneGatherer::swizzle_scales(&[&[]], ROWS, GROUPS, 55, "test")
             .err()
             .unwrap();
 
