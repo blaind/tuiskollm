@@ -279,7 +279,7 @@ fn validate_usage(label: &str, usage: &Value) -> Result<(), String> {
 
 fn validate_startup_output(output: &Output) -> Result<(), Box<dyn Error>> {
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for evidence in [MODEL, "124468 tensors", "READY", "1 slots · context 192"] {
+    for evidence in [MODEL, "124468 tensors", "READY", "1 slots · context 262144"] {
         if !stdout.contains(evidence) {
             return Err(format!(
                 "server startup omitted {evidence:?}{}",

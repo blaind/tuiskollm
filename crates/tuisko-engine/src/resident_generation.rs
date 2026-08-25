@@ -503,7 +503,7 @@ impl Qwen36ResidentTextGenerator {
             logits,
         } = self;
         let control = GenerationSession::start(frontend, request)?;
-        require_generation_capacity(
+        let required_positions = require_generation_capacity(
             control.prompt_token_ids().len(),
             request.max_new_tokens,
             program.context_capacity(),
@@ -512,6 +512,8 @@ impl Qwen36ResidentTextGenerator {
 
         if control.finish_reason().is_none() {
             program.reset_state(stream)?;
+            program.activate_kv_slot(0)?;
+            program.reserve_kv_slot_tokens(stream, 0, required_positions)?;
             native_prefill_tokens =
                 prime_qwen36_prompt(program, stream, control.prompt_token_ids())?;
             program.read_logits_into(stream, 1, logits)?;
@@ -530,7 +532,7 @@ impl Qwen36ResidentTextGenerator {
         })
     }
 
-    /// Exact device bytes across the 41 retained Qwen3.6 arenas.
+    /// Exact device bytes across the 42 retained Qwen3.6 arenas.
     pub const fn arena_bytes(&self) -> usize {
         self.program.layout().arena_bytes()
     }
@@ -545,7 +547,7 @@ impl Qwen36ResidentTextGenerator {
         self.program.host_stager_bytes() + self.logits.num_bytes()
     }
 
-    /// Current short-context token capacity of the single slot.
+    /// Maximum token capacity admitted by the pinned checkpoint.
     pub const fn context_capacity(&self) -> usize {
         self.program.context_capacity()
     }
@@ -573,8 +575,12 @@ impl Qwen36ResidentTextGenerator {
         &mut self,
         token_ids: &[u32],
     ) -> EngineResult<(u32, usize)> {
-        require_generation_capacity(token_ids.len(), 1, self.program.context_capacity())?;
+        let required_positions =
+            require_generation_capacity(token_ids.len(), 1, self.program.context_capacity())?;
         self.program.reset_state(&self.stream)?;
+        self.program.activate_kv_slot(0)?;
+        self.program
+            .reserve_kv_slot_tokens(&self.stream, 0, required_positions)?;
         let native_prefill_tokens =
             prime_qwen36_prompt(&mut self.program, &self.stream, token_ids)?;
         self.program
