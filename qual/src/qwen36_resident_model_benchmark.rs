@@ -301,7 +301,7 @@ fn attention_logical_bytes(batch: usize) -> usize {
         + rotary * size_of::<f32>()
         + 3 * size_of::<u32>()
         + attention * size_of::<f32>()
-        + 2 * kv * size_of::<u16>();
+        + 2 * kv * size_of::<u8>();
     let context_values = if batch <= MAX_BATCH {
         batch * CONTEXT_TOKENS
     } else {
@@ -311,7 +311,7 @@ fn attention_logical_bytes(batch: usize) -> usize {
         * Qwen36Moe35B::NUM_ATTENTION_HEADS
         * context_values
         * Qwen36Moe35B::HEAD_DIM
-        * size_of::<u16>();
+        * size_of::<u8>();
     let metadata = batch * 2 * size_of::<u32>()
         + Qwen36Moe35B::NUM_ATTENTION_HEADS * context_values * size_of::<u32>();
     let paged_gqa = batch * 2 * attention * size_of::<f32>() + cache + metadata;
@@ -385,7 +385,7 @@ pub fn benchmark_qwen36_resident_model(
         "40 decoder layers, final norm, and represented NVFP4 LM head",
     )?;
     memory.register_owned(
-        "qwen36_35b_a3b/resident_model/bf16_kv_cache",
+        "qwen36_35b_a3b/resident_model/e4m3_kv_cache",
         BenchmarkMemoryKind::KvCache,
         layout.cache_bytes(),
         "10 attention layers * 8 slots * 192 positions",
@@ -436,14 +436,13 @@ mod tests {
         assert_eq!(CONTEXT_TOKENS, 131);
         assert_eq!(gdn_logical_bytes(1), 55_424_712);
         assert_eq!(gdn_logical_bytes(MAX_BATCH), 199_339_840);
-        assert_eq!(attention_logical_bytes(1), 46_735_636);
-        assert_eq!(attention_logical_bytes(MAX_BATCH), 175_704_224);
+        assert_eq!(attention_logical_bytes(1), 45_661_460);
+        assert_eq!(attention_logical_bytes(MAX_BATCH), 167_110_816);
         assert_eq!(endpoint_logical_bytes(1), 286_581_768);
         assert_eq!(endpoint_logical_bytes(MAX_BATCH), 290_172_992);
-        assert_eq!(logical_bytes(1), 2_416_679_488);
-        assert_eq!(logical_bytes(MAX_BATCH), 8_027_410_432);
+        assert_eq!(logical_bytes(1), 2_405_937_728);
+        assert_eq!(logical_bytes(MAX_BATCH), 7_941_476_352);
         let prefill = PREFILL_ROUTES.map(prefill_logical_bytes);
-        assert!(prefill.windows(2).all(|pair| pair[1] > pair[0]));
-        assert!(prefill[2] > 2 * prefill[1]);
+        assert_eq!(prefill, [26_602_054_648, 51_672_990_968, 102_068_487_928]);
     }
 }

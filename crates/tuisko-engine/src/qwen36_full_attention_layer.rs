@@ -8,8 +8,8 @@ use crate::{EngineError, EngineResult, MAX_BATCH, Qwen36FullAttentionLayerLayout
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
 use tuisko_kernels_sm120::{
-    Qwen36AttentionOutputOp, Qwen36AttentionQkPrepareOp, Qwen36Fp8QkvOp, Qwen36MoeExpertsOp,
-    Qwen36MoeRouterOp, Qwen36PagedGqaOp, Qwen36ResidualNormOp,
+    Qwen36AttentionOutputOp, Qwen36Fp8AttentionQkPrepareOp, Qwen36Fp8PagedGqaOp, Qwen36Fp8QkvOp,
+    Qwen36MoeExpertsOp, Qwen36MoeRouterOp, Qwen36ResidualNormOp,
 };
 use tuisko_model::{
     Arch, CheckpointSnapshot, Qwen36FullAttentionBindings, Qwen36Moe35B, Qwen36MoeLayerBindings,
@@ -25,8 +25,8 @@ pub struct Qwen36FullAttentionLayerProgram {
     arena: DeviceArena,
     _norm: Qwen36ResidualNormOp,
     _qkv: Qwen36Fp8QkvOp,
-    _qk_prepare: Qwen36AttentionQkPrepareOp,
-    _paged_gqa: Qwen36PagedGqaOp,
+    _qk_prepare: Qwen36Fp8AttentionQkPrepareOp,
+    _paged_gqa: Qwen36Fp8PagedGqaOp,
     _attention_output: Qwen36AttentionOutputOp,
     _router: Qwen36MoeRouterOp,
     _experts: Qwen36MoeExpertsOp,
@@ -34,16 +34,17 @@ pub struct Qwen36FullAttentionLayerProgram {
     context: Arc<CudaContext>,
     layout: Qwen36FullAttentionLayerLayout,
     base_address: u64,
-    scales: SourceScales,
+    scales: LaunchScales,
     layer: usize,
 }
 
 #[derive(Clone, Copy)]
-struct SourceScales {
+struct LaunchScales {
     qkv_input: f32,
     qkv_weight: [f32; 3],
     output_input: f32,
     output_weight: f32,
+    cache: f32,
     shared_gate_up_weight: f32,
     shared_down_weight: f32,
 }
@@ -70,8 +71,8 @@ struct Pointers {
     prefill_cache_positions: *const u32,
     prefill_lengths: *const u32,
     query: *mut f32,
-    key_pages: *mut u16,
-    value_pages: *mut u16,
+    key_pages: *mut u8,
+    value_pages: *mut u8,
     attention: *mut f32,
     output_activation: *mut u16,
     output_activation_codes: *mut u8,
@@ -229,8 +230,8 @@ impl Pointers {
 struct Ops<'a> {
     norm: &'a Qwen36ResidualNormOp,
     qkv: &'a Qwen36Fp8QkvOp,
-    qk_prepare: &'a Qwen36AttentionQkPrepareOp,
-    paged_gqa: &'a Qwen36PagedGqaOp,
+    qk_prepare: &'a Qwen36Fp8AttentionQkPrepareOp,
+    paged_gqa: &'a Qwen36Fp8PagedGqaOp,
     attention_output: &'a Qwen36AttentionOutputOp,
     router: &'a Qwen36MoeRouterOp,
     experts: &'a Qwen36MoeExpertsOp,
@@ -259,8 +260,8 @@ impl Qwen36FullAttentionLayerProgram {
         let arena = DeviceArena::zeroed(&stream, layout.builder())?;
         let norm = Qwen36ResidualNormOp::new(context)?;
         let qkv = Qwen36Fp8QkvOp::new(context)?;
-        let qk_prepare = Qwen36AttentionQkPrepareOp::new(context)?;
-        let paged_gqa = Qwen36PagedGqaOp::new(context)?;
+        let qk_prepare = Qwen36Fp8AttentionQkPrepareOp::new(context)?;
+        let paged_gqa = Qwen36Fp8PagedGqaOp::new(context)?;
         let attention_output = Qwen36AttentionOutputOp::new(context)?;
         let router = Qwen36MoeRouterOp::new(context)?;
         let experts = Qwen36MoeExpertsOp::new(context)?;
@@ -367,11 +368,12 @@ impl Qwen36FullAttentionLayerProgram {
             &(0..MAX_BATCH as u32).collect::<Vec<_>>(),
         )?;
 
-        let scales = SourceScales {
+        let scales = LaunchScales {
             qkv_input: attention.qkv_input_scale,
             qkv_weight: attention.qkv_weight_scales,
             output_input: attention.output.input_scale,
             output_weight: attention.output.weight_scale,
+            cache: Qwen36Moe35B::FP8_CACHE_SCALE,
             shared_gate_up_weight: moe.shared_expert.gate_up_weight_scales_2[0],
             shared_down_weight: moe.shared_expert.down_weight_scales_2[0],
         };
@@ -525,19 +527,19 @@ impl Qwen36FullAttentionLayerProgram {
         Ok(())
     }
 
-    /// Replaces both complete represented BF16 cache planes.
+    /// Replaces both complete represented E4M3 cache planes.
     pub fn load_cache(
         &self,
         stream: &CudaStream,
-        key_pages: &[u16],
-        value_pages: &[u16],
+        key_pages: &[u8],
+        value_pages: &[u8],
     ) -> EngineResult<()> {
         let regions = self.layout.regions();
         if key_pages.len() != regions.key_pages.len()
             || value_pages.len() != regions.value_pages.len()
         {
             return Err(EngineError::layout(format!(
-                "Qwen3.6 attention cache planes must each have {} BF16 values",
+                "Qwen3.6 attention cache planes must each have {} E4M3 values",
                 regions.key_pages.len()
             )));
         }
@@ -598,7 +600,7 @@ impl Qwen36FullAttentionLayerProgram {
         self.layout.resident_weight_bytes()
     }
 
-    /// Exact represented BF16 key/value cache bytes.
+    /// Exact represented E4M3 key/value cache bytes.
     pub const fn cache_bytes(&self) -> usize {
         self.layout.cache_bytes()
     }
@@ -733,8 +735,8 @@ impl Qwen36FullAttentionLayerProgram {
     }
 
     #[cfg(feature = "qualification")]
-    /// Returns exact scalar FP8 and shared-expert scales in launch order.
-    pub const fn qualification_source_scales(&self) -> [f32; 9] {
+    /// Returns exact source scales plus the pinned FP8-cast cache scale in launch order.
+    pub const fn qualification_source_scales(&self) -> [f32; 10] {
         [
             self.scales.qkv_input,
             self.scales.qkv_weight[0],
@@ -742,6 +744,7 @@ impl Qwen36FullAttentionLayerProgram {
             self.scales.qkv_weight[2],
             self.scales.output_input,
             self.scales.output_weight,
+            self.scales.cache,
             self.scales.shared_gate_up_weight,
             self.scales.shared_down_weight,
             Qwen36Moe35B::RMS_NORM_EPSILON,
@@ -957,10 +960,10 @@ pub struct Qwen36FullAttentionLayerObservables {
     pub qkv: Vec<u16>,
     /// Prepared FP32 query heads.
     pub query: Vec<f32>,
-    /// Complete represented BF16 key cache.
-    pub key_pages: Vec<u16>,
-    /// Complete represented BF16 value cache.
-    pub value_pages: Vec<u16>,
+    /// Complete represented E4M3 key cache.
+    pub key_pages: Vec<u8>,
+    /// Complete represented E4M3 value cache.
+    pub value_pages: Vec<u8>,
     /// FP32 GQA output, gated in place by attention output.
     pub attention: Vec<f32>,
     /// Gated BF16 attention values.
@@ -1040,7 +1043,7 @@ fn capture_decode_routes(
     stream: &CudaStream,
     ops: Ops<'_>,
     pointers: Pointers,
-    scales: SourceScales,
+    scales: LaunchScales,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
     let mut graphs = Vec::with_capacity(MAX_BATCH);
     for batch in 1..=MAX_BATCH {
@@ -1058,7 +1061,7 @@ fn capture_prefill_routes(
     stream: &CudaStream,
     ops: Ops<'_>,
     pointers: Pointers,
-    scales: SourceScales,
+    scales: LaunchScales,
 ) -> EngineResult<[CudaGraph; 3]> {
     // T=128 would otherwise require sixteen B=8 layer graphs and 15 extra
     // graph boundaries. This composes the same seven qualified T=128 leaves,
@@ -1080,7 +1083,7 @@ fn launch_route(
     rows: usize,
     ops: Ops<'_>,
     pointers: Pointers,
-    scales: SourceScales,
+    scales: LaunchScales,
 ) -> GpuResult<()> {
     let (rope_cos, rope_sin, table_rows, cache_positions, lengths, table_stride) =
         if rows <= MAX_BATCH {
@@ -1140,6 +1143,8 @@ fn launch_route(
             pointers.query,
             pointers.key_pages,
             pointers.value_pages,
+            scales.cache,
+            scales.cache,
         )?;
         ops.paged_gqa.launch(
             stream,
@@ -1152,6 +1157,8 @@ fn launch_route(
             table_stride,
             lengths,
             pointers.attention,
+            scales.cache,
+            scales.cache,
         )?;
         ops.attention_output.launch(
             stream,
@@ -1259,6 +1266,7 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
 mod tests {
     use super::{MAX_BATCH, ROTARY_PAIRS, prefill_index, require_batch, require_rows};
     use crate::EngineErrorCode;
+    use tuisko_model::Qwen36Moe35B;
 
     #[test]
     fn exact_batch_table_rejects_every_boundary_neighbor() {
@@ -1270,6 +1278,7 @@ mod tests {
             assert_eq!(error.code(), Some(EngineErrorCode::Route));
         }
         assert_eq!(ROTARY_PAIRS, 32);
+        assert_eq!(Qwen36Moe35B::FP8_CACHE_SCALE.to_bits(), 1.0f32.to_bits());
     }
 
     #[test]

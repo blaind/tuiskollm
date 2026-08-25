@@ -65,7 +65,7 @@ pub struct Qwen36ResidentModelQualification {
     pub arena_addresses: usize,
     /// Exact resident device weight bytes.
     pub weight_bytes: usize,
-    /// Exact BF16 K/V cache bytes.
+    /// Exact E4M3 K/V cache bytes.
     pub cache_bytes: usize,
     /// Exact address-stable state and workspace bytes.
     pub workspace_bytes: usize,
@@ -675,9 +675,9 @@ mod tests {
         assert_eq!(report.prefill_replacement_cases, 3);
         assert_eq!(report.arena_addresses, 41);
         assert_eq!(report.weight_bytes, 19_808_036_096);
-        assert_eq!(report.cache_bytes, 31_457_280);
+        assert_eq!(report.cache_bytes, 15_728_640);
         assert_eq!(report.workspace_bytes, 1_223_712_576);
-        assert_eq!(report.arena_bytes, 21_063_232_512);
+        assert_eq!(report.arena_bytes, 21_047_503_872);
         assert_eq!(report.host_stager_bytes, 557_056);
         assert!(report.maximum_normalization_error.is_finite());
         assert!(report.maximum_logit_error.is_finite());

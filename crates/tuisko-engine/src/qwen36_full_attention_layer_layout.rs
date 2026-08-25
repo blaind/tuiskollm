@@ -38,8 +38,8 @@ pub(crate) struct Qwen36FullAttentionLayerRegions {
     pub(crate) prefill_cache_positions: ArenaRegion<u32>,
     pub(crate) prefill_lengths: ArenaRegion<u32>,
     pub(crate) query: ArenaRegion<f32>,
-    pub(crate) key_pages: ArenaRegion<u16>,
-    pub(crate) value_pages: ArenaRegion<u16>,
+    pub(crate) key_pages: ArenaRegion<u8>,
+    pub(crate) value_pages: ArenaRegion<u8>,
     pub(crate) attention: ArenaRegion<f32>,
     pub(crate) output_activation: ArenaRegion<u16>,
     pub(crate) output_activation_codes: ArenaRegion<u8>,
@@ -72,7 +72,7 @@ pub(crate) struct Qwen36FullAttentionLayerRegions {
     pub(crate) next_normalized: ArenaRegion<u16>,
 }
 
-/// Checked weights, BF16 KV cache, and workspace for one Qwen3.6 attention layer.
+/// Checked weights, E4M3 KV cache, and workspace for one Qwen3.6 attention layer.
 #[derive(Clone, Debug)]
 pub struct Qwen36FullAttentionLayerLayout {
     builder: ArenaLayout,
@@ -100,7 +100,7 @@ impl Qwen36FullAttentionLayerLayout {
             A::ATTENTION_OUTPUT_COLUMNS,
         )?;
         let cache_plane = product(
-            "Qwen3.6 attention BF16 cache plane",
+            "Qwen3.6 attention E4M3 cache plane",
             product(
                 "Qwen3.6 attention cache page heads",
                 QWEN36_PHYSICAL_PAGES,
@@ -262,7 +262,7 @@ impl Qwen36FullAttentionLayerLayout {
             ],
         )?;
         let cache_bytes = sum(
-            "Qwen3.6 full-attention BF16 cache",
+            "Qwen3.6 full-attention E4M3 cache",
             &[regions.key_pages.byte_len(), regions.value_pages.byte_len()],
         )?;
         let workspace_bytes = sum(
@@ -329,7 +329,7 @@ impl Qwen36FullAttentionLayerLayout {
         self.resident_weight_bytes
     }
 
-    /// Exact represented BF16 key/value cache bytes.
+    /// Exact represented E4M3 key/value cache bytes.
     pub const fn cache_bytes(&self) -> usize {
         self.cache_bytes
     }
@@ -402,10 +402,10 @@ mod tests {
         let layout = Qwen36FullAttentionLayerLayout::build().unwrap();
 
         assert_eq!(layout.resident_weight_bytes(), 483_085_312);
-        assert_eq!(layout.cache_bytes(), 3_145_728);
+        assert_eq!(layout.cache_bytes(), 1_572_864);
         assert_eq!(layout.workspace_bytes(), 18_587_584);
-        assert_eq!(layout.owner_bytes(), 504_818_624);
-        assert_eq!(layout.arena_bytes(), 504_819_456);
+        assert_eq!(layout.owner_bytes(), 503_245_760);
+        assert_eq!(layout.arena_bytes(), 503_246_592);
         assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 832);
         assert_eq!(layout.context_capacity(), 192);
         assert_eq!(layout.row_capacity(), 128);

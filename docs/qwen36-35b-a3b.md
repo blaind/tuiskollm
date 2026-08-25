@@ -161,25 +161,19 @@ projections retain sorted register counts `[31,32,35,38,38,40,44,45]`; the promp
 25 registers and the native `QMMA.16832.F32.E4M3.E4M3` projections retain 54. Every entry uses zero
 stack/local memory. At a loaded 2,190 MHz median SM clock, the unblessed prompt path measures
 32.644/34.347/59.671 us and the complete graph measures 34.802/36.656/61.432 us at T=32/64/128.
-B=1/8 measure 8.148/21.263 us for the path and 10.240/22.539 us for the graph. The following BF16
-Q/K seam reuses the exact width-256 normalization and 64-wide `[11,11,10]` interleaved MRoPE
-arithmetic already qualified for Qwen3.5, but owns separate Qwen3.6 symbols and the narrower
-two-KV-head page layout. Its exact `B=1..8` and `T=32/64/128` routes pass 1,064,960 prepared-query
-values, 266,240 exact BF16 cache values, 28,835,840 graph-replay values, 27,238,400 untouched
-output/cache values, and 26,152,544 immutable-input checks with stable addresses and zero
-post-warmup growth in a 6,589,440-byte arena. All 11 entries retain 54 registers, zero stack/local
-memory, and 1,024 bytes of shared memory. At a loaded 2,167 MHz median SM clock, its unblessed
-prompt path measures 3.228/3.750/4.936 us and the complete graph measures 4.100/6.109/6.148 us at
-T=32/64/128. B=1/8 measure 2.820/3.124 us for the path; the 4.100-us graph boundary remains
-dispatch-limited at decode width. The following BF16 paged-GQA leaf owns separate 8:1
-query/KV-head routes at every `B=1..8` and `T=32/64/128`. Prompt CTAs let eight query-head warps
-share each 65,536-byte BF16 K/V tile without changing the per-head online-softmax order. Its
-independent FP64 page/online-softmax oracle passes 1,064,960 active outputs, 4,702,208 inactive
-sentinels, 5,767,168 graph-replay values, and 80,746,512 immutable-input checks in a 7,341,312-byte
-arena with stable addresses and zero post-warmup growth. The eight decode entries use 48 registers;
-the three prompt entries use 54. All 11 have zero stack/local memory and 1,024 bytes static shared,
-while prompt launches request the exact 65,536-byte dynamic tile. Timing remains unreported because
-the available diagnostic run failed the exclusive-device precondition. The gated attention-output
+B=1/8 measure 8.148/21.263 us for the path and 10.240/22.539 us for the graph. The production Q/K
+seam reuses the exact width-256 normalization and 64-wide `[11,11,10]` interleaved MRoPE arithmetic,
+then writes the export recipe's unit-scale E4M3 cache. Its exact `B=1..8` and `T=32/64/128` routes
+pass 1,064,960 prepared-query values, 266,240 exact E4M3 cache codes, complete graph replay,
+untouched extents, immutable inputs, stable addresses, and zero post-warmup growth. All 11 entries
+use 56 registers, zero stack/local memory, and 1,024 bytes shared. The following E4M3 paged-GQA
+leaf owns separate 8:1 query/KV-head routes over the same exact inventory. Prompt CTAs let eight
+query-head warps share each 32,768-byte K/V tile without changing the per-head online-softmax
+order. Its independent FP64 page/online-softmax oracle passes 1,064,960 active outputs, 4,702,208
+inactive sentinels, 5,767,168 graph-replay values, and complete immutable-input checks in a
+5,768,448-byte arena with stable addresses and zero post-warmup growth. The decode entries use 47
+registers and the prompt entries use 53; all have zero stack/local memory and 1,024 bytes static
+shared. Timing for the production E4M3 leaves remains unreported. The gated attention-output
 leaf then applies the query-paired sigmoid gate, publishes the BF16 projection seam, statically
 quantizes it with the admitted scalar scale, and consumes the source-native E4M3 `[2048,4096]`
 output plane at every exact `B=1..8` and `T=32,64,128`. Its independent oracle passes 1,064,960
@@ -191,12 +185,13 @@ bytes shared; the reused static-FP8 projection retains its separately checked re
 At a fixed 2,197 MHz SM and 13,801 MHz memory clock, the unblessed complete graph measures
 71.294/71.714/73.003 us at T=32/64/128; B=1/8 measure 18.440/32.642 us. One source-backed layer-3
 owner composes these leaves, both residual seams, and the routed/shared MoE boundary into exact
-`B=1..8` and `T=32/64/128` graphs over one 504,819,456-byte arena. The complete source and
+`B=1..8` and `T=32/64/128` graphs over one 503,246,592-byte arena. The complete source and
 lifecycle gate covers all eleven routes, immutable runtime inputs, inactive cache and workspace
 extents, stable addresses, and zero post-warmup growth. It owns 483,085,312 resident weight bytes,
-3,145,728 BF16 cache bytes, and 18,587,584 workspace bytes. An uncontrolled-clock diagnostic
-measures 122.720/254.824 us at B=1/8 and 400.194/636.714/1,149.554 us at T=32/64/128 while SM
-clocks span 2,122--2,175 MHz; these values are not baseline authority.
+1,572,864 E4M3 cache bytes, and 18,587,584 workspace bytes. An unblessed diagnostic while the SM
+clock spans 2,092--2,175 MHz measures 117.305/252.807 us at B=1/8 and
+395.447/629.190/1,120.917 us at T=32/64/128; clock drift makes these values descriptive rather than
+baseline authority.
 
 The NVFP4 endpoint prerequisite now owns eight exact A16 LM-head routes over the source-represented
 `[248320,2048]` plane. It retains BF16 activations rather than requantizing them, reads packed E2M1
@@ -219,19 +214,19 @@ direct graph measures 199.142/448.010 us at B=1/8; the repeated intrinsic path m
 
 The initial resident text layout then composes 30 GDN/MoE layers, ten full-attention/MoE layers,
 and the endpoint into 41 address-stable arenas. It accounts 19,808,036,096 device weight bytes,
-31,457,280 short-context BF16 cache bytes, 1,223,712,576 workspace/state bytes, and 26,560 alignment
-bytes for a 21,063,232,512-byte allocation. Eight whole-model decode graphs and three from-empty
+15,728,640 short-context E4M3 cache bytes, 1,223,712,576 workspace/state bytes, and 26,560 alignment
+bytes for a 21,047,503,872-byte allocation. Eight whole-model decode graphs and three from-empty
 `T=32/64/128` prompt graphs chain each layer's BF16 publication directly into the next owner. The
 prompt input uses a 524,288-byte pinned embedding stager and layer zero's retained 128-row plane;
 only the final prompt row enters the existing endpoint, avoiding a prompt-wide vocabulary-logit
 allocation. The real checkpoint passes all eight decode eager/graph
 routes, 76,032 represented endpoint-oracle values, 8,939,520 finite logits, inactive-row and
 replacement-input checks, all 41 stable addresses, zero post-warmup growth, and the complete
-downstream spill/resource cone. An unblessed direct diagnostic at an observed 2,100--2,137 MHz SM
-and 13,801 MHz memory clock measures 5.051/9.364 ms at B=1/8, or about 198/854 aggregate rows per
-second. Production-graph and repeated complete-path medians agree within 0.01%, and the timed
-region has zero device-memory growth. The prompt routes have separate complete-model eager/graph,
-represented endpoint, inactive-extent, stable-address, and post-warmup allocation gates.
+downstream spill/resource cone. An unblessed diagnostic while the SM clock spans 2,107--2,182 MHz
+measures 4.994/9.334 ms at B=1/8 and 23.362/37.790/67.475 ms at T=32/64/128. The timed region has
+zero device-memory growth, but clock drift makes these values descriptive rather than baseline
+authority. The prompt routes have separate complete-model eager/graph, represented endpoint,
+inactive-extent, stable-address, and post-warmup allocation gates.
 
 The text frontend separately admits the snapshot's 248,070-entry tokenizer, Qwen3.6 chat template,
 ordered stop IDs `[248046, 248044]`, and sampled defaults `temperature=1`, `top_p=0.95`, and

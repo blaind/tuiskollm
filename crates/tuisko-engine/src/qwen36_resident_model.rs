@@ -68,7 +68,7 @@ impl Qwen36ResidentModelLayout {
             ],
         )?;
         let cache_bytes = product(
-            "Qwen3.6 resident BF16 cache bytes",
+            "Qwen3.6 resident E4M3 cache bytes",
             attention_layers,
             attention.cache_bytes(),
         )?;
@@ -113,7 +113,7 @@ impl Qwen36ResidentModelLayout {
         self.resident_weight_bytes
     }
 
-    /// BF16 K/V bytes across all ten full-attention layers.
+    /// E4M3 K/V bytes across all ten full-attention layers.
     pub const fn cache_bytes(&self) -> usize {
         self.cache_bytes
     }
@@ -394,7 +394,7 @@ impl Qwen36ResidentModelProgram {
         Ok(Qwen36ResidentPrefillRoute { tokens })
     }
 
-    /// Clears every GDN history/state and full-attention BF16 cache plane.
+    /// Clears every GDN history/state and full-attention E4M3 cache plane.
     pub fn reset_state(&self, stream: &CudaStream) -> EngineResult<()> {
         for layer in &self.layers {
             layer.reset(stream)?;
@@ -838,11 +838,11 @@ mod tests {
         let layout = Qwen36ResidentModelLayout::build().unwrap();
 
         assert_eq!(layout.resident_weight_bytes(), 19_808_036_096);
-        assert_eq!(layout.cache_bytes(), 31_457_280);
+        assert_eq!(layout.cache_bytes(), 15_728_640);
         assert_eq!(layout.workspace_bytes(), 1_223_712_576);
-        assert_eq!(layout.owner_bytes(), 21_063_205_952);
+        assert_eq!(layout.owner_bytes(), 21_047_477_312);
         assert_eq!(layout.padding_bytes(), 26_560);
-        assert_eq!(layout.arena_bytes(), 21_063_232_512);
+        assert_eq!(layout.arena_bytes(), 21_047_503_872);
         assert_eq!(layout.arena_count(), 41);
         assert_eq!(
             layout.source_mapped_embedding_bytes().unwrap(),

@@ -2151,8 +2151,8 @@ fn qualify_qwen36_resident_model(
     gate_qwen36_moe_router(root)?;
     gate_qwen36_moe_experts(root)?;
     gate_qwen36_fp8_qkv(root)?;
-    gate_qwen36_attention_qk_prepare(root)?;
-    gate_qwen36_paged_gqa(root)?;
+    gate_qwen36_fp8_attention_qk_prepare(root)?;
+    gate_qwen36_fp8_paged_gqa(root)?;
     gate_qwen36_attention_output(root)?;
     gate_qwen36_nvfp4_lm_head(root)
 }
@@ -2195,8 +2195,8 @@ fn qualify_qwen36_generation(
     gate_qwen36_moe_router(root)?;
     gate_qwen36_moe_experts(root)?;
     gate_qwen36_fp8_qkv(root)?;
-    gate_qwen36_attention_qk_prepare(root)?;
-    gate_qwen36_paged_gqa(root)?;
+    gate_qwen36_fp8_attention_qk_prepare(root)?;
+    gate_qwen36_fp8_paged_gqa(root)?;
     gate_qwen36_attention_output(root)?;
     gate_qwen36_nvfp4_lm_head(root)
 }
@@ -4105,8 +4105,8 @@ fn qualify_qwen36_full_attention_layer(
     )?;
     gate_qwen36_residual_norm(root)?;
     gate_qwen36_fp8_qkv(root)?;
-    gate_qwen36_attention_qk_prepare(root)?;
-    gate_qwen36_paged_gqa(root)?;
+    gate_qwen36_fp8_attention_qk_prepare(root)?;
+    gate_qwen36_fp8_paged_gqa(root)?;
     gate_qwen36_attention_output(root)?;
     gate_qwen36_moe_router(root)?;
     gate_qwen36_moe_experts(root)

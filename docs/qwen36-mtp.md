@@ -65,9 +65,9 @@ cache configuration inherits the target cache dtype in the upstream MTP
 contract. Target and MTP therefore own separate E4M3 K/V storage but share one
 logical page lifecycle and the same stable per-slot page mappings.
 
-The current Qwen3.6 resident program's 192-position BF16 cache is qualification
-scaffolding. It is not the production cache and must be replaced before MTP or
-compact serving is admitted. The replacement has:
+The current Qwen3.6 resident program's 192-position E4M3 cache is short-context
+qualification scaffolding. It uses the export recipe's exact unit-scale FP8-cast codec,
+but its ownership must be replaced before MTP or compact serving is admitted. The replacement has:
 
 - one shared physical page pool across at most eight active or retained slots;
 - ten target full-attention K/V layer pairs and one separate MTP K/V pair;
@@ -166,7 +166,7 @@ separate.
 13. `feat/qwen36-mtp-serving`
 
 The cache branch includes target long-context ownership because production MTP
-cannot be correct over the current short BF16 cache. If its implementation
+cannot be correct over the current short E4M3 cache. If its implementation
 reveals independently reviewable codec and lifecycle slices, split them without
 changing this ordering dependency.
 

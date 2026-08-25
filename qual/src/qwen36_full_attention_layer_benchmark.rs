@@ -185,7 +185,7 @@ fn logical_bytes(rows: usize) -> usize {
             + rotary * size_of::<f32>()
             + 3 * size_of::<u32>()
             + attention * size_of::<f32>()
-            + 2 * kv * size_of::<u16>()
+            + 2 * kv * size_of::<u8>()
     };
     let context_values = if rows <= MAX_BATCH {
         rows * CONTEXT_TOKENS
@@ -197,7 +197,7 @@ fn logical_bytes(rows: usize) -> usize {
             * Qwen36Moe35B::NUM_ATTENTION_HEADS
             * context_values
             * Qwen36Moe35B::HEAD_DIM
-            * size_of::<u16>();
+            * size_of::<u8>();
         let metadata = rows * 2 * size_of::<u32>()
             + Qwen36Moe35B::NUM_ATTENTION_HEADS * context_values * size_of::<u32>();
         rows * 2 * attention * size_of::<f32>() + cache + metadata
@@ -248,10 +248,10 @@ pub fn benchmark_qwen36_full_attention_layer(
         "layer=3 source-native FP8 attention and losslessly materialized MoE weights",
     )?;
     memory.register_owned(
-        "qwen36_35b_a3b/full_attention/bf16_kv_cache",
+        "qwen36_35b_a3b/full_attention/e4m3_kv_cache",
         BenchmarkMemoryKind::KvCache,
         session.program.cache_bytes(),
-        "8 slots * 3 pages * 2 KV heads * 64 tokens * 256 BF16 values * K/V",
+        "8 slots * 3 pages * 2 KV heads * 64 tokens * 256 E4M3 values * K/V",
     )?;
     memory.register_owned(
         "qwen36_35b_a3b/full_attention/address_stable_workspace",
@@ -305,8 +305,8 @@ mod tests {
     #[test]
     fn accounting_covers_attention_cache_and_selected_experts() {
         assert_eq!(CONTEXT_TOKENS, 131);
-        assert_eq!(logical_bytes(1), 46_735_636);
-        assert_eq!(logical_bytes(MAX_BATCH), 175_704_224);
+        assert_eq!(logical_bytes(1), 45_661_460);
+        assert_eq!(logical_bytes(MAX_BATCH), 167_110_816);
         assert!(logical_bytes(MAX_ROWS) > logical_bytes(64));
         assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
     }
