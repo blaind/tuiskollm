@@ -110,8 +110,13 @@ impl Qwen35ResidentMtpTextGenerator {
             program.target_mut().reset_slot(stream, 0)?;
             program.activate_kv_slot(0)?;
             program.reserve_kv_slot_tokens(stream, 0, required_positions)?;
-            native_prefill_tokens =
-                prime_prompt(program, stream, control.prompt_token_ids(), target_hidden)?;
+            native_prefill_tokens = prime_qwen35_mtp_prompt(
+                program,
+                stream,
+                control.prompt_token_ids(),
+                0,
+                target_hidden,
+            )?;
             program.read_logits_into(stream, 1, target_logits_mut(logits, 1))?;
         }
 
@@ -269,7 +274,7 @@ impl Qwen35ResidentMtpGenerationSession<'_> {
 
     fn continue_proposal(&mut self, token: u32, position: usize) -> EngineResult<()> {
         self.stage_draft(token, position)?;
-        self.program.replay_continue_draft(self.stream)?;
+        self.program.replay_continue_draft(self.stream, 1)?;
         self.program
             .read_logits_into(self.stream, 1, draft_logits_mut(self.logits))
     }
@@ -542,11 +547,12 @@ impl Qwen35ResidentMtpGenerationSession<'_> {
     }
 }
 
-fn prime_prompt(
+pub(crate) fn prime_qwen35_mtp_prompt(
     program: &mut Qwen35ResidentMtpProgram,
     stream: &CudaStream,
     token_ids: &[u32],
-    target_hidden: &mut PinnedHostBuffer<u16>,
+    slot: usize,
+    target_hidden: &mut [u16],
 ) -> EngineResult<usize> {
     if token_ids.is_empty() {
         return Err(EngineError::generation(
@@ -563,7 +569,7 @@ fn prime_prompt(
         let target_route = program.stage_target_prefill(
             stream,
             &token_ids[cursor..cursor + rows],
-            0,
+            slot,
             cursor,
             &cosine[..rotary_values],
             &sine[..rotary_values],
@@ -572,7 +578,7 @@ fn prime_prompt(
         let mtp_route = program.stage_prompt_prime(
             stream,
             &token_ids[cursor + 1..cursor + rows + 1],
-            0,
+            slot,
             cursor,
             &cosine[..rotary_values],
             &sine[..rotary_values],
@@ -582,7 +588,7 @@ fn prime_prompt(
         native += rows;
     }
     while cursor < primed {
-        replay_prompt_target_token(program, stream, token_ids[cursor], cursor)?;
+        replay_prompt_target_token(program, stream, token_ids[cursor], slot, cursor)?;
         program.target().read_final_residual_into(
             stream,
             1,
@@ -595,7 +601,7 @@ fn prime_prompt(
             stream,
             &token_ids[cursor + 1..cursor + 2],
             &target_hidden[..Qwen35_9B::HIDDEN],
-            0,
+            slot,
             cursor,
             &row_cosine,
             &row_sine,
@@ -603,7 +609,7 @@ fn prime_prompt(
         program.replay_realign(stream, 1, true)?;
         cursor += 1;
     }
-    replay_prompt_target_token(program, stream, token_ids[primed], primed)?;
+    replay_prompt_target_token(program, stream, token_ids[primed], slot, primed)?;
 
     Ok(native)
 }
@@ -612,13 +618,14 @@ fn replay_prompt_target_token(
     program: &mut Qwen35ResidentMtpProgram,
     stream: &CudaStream,
     token: u32,
+    slot: usize,
     position: usize,
 ) -> EngineResult<()> {
     let position = u32::try_from(position)
         .map_err(|_| EngineError::generation("Qwen3.5 prompt position exceeds u32"))?;
     let (cosine, sine) = text_rope(position);
     program.stage_target_embeddings(stream, &[token])?;
-    program.target().load_slot_routes(stream, &[0])?;
+    program.target().load_slot_routes(stream, &[slot])?;
     program
         .target()
         .load_decode_state(stream, 1, &[position], &cosine, &sine)?;

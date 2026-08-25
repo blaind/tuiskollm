@@ -700,6 +700,29 @@ impl Qwen35MtpLayerProgram {
             .copy_prefix_to_host(stream, self.layout.regions().residual_output, values)?)
     }
 
+    pub(crate) fn read_residual_output_into(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        require_rows(rows)?;
+        let values = product("Qwen3.5 MTP residual values", rows, Qwen35_9B::HIDDEN)?;
+        if destination.len() != values {
+            return Err(EngineError::layout(format!(
+                "Qwen3.5 MTP residual destination has {} values, expected {values}",
+                destination.len()
+            )));
+        }
+        self.arena.copy_prefix_to_host_slice(
+            stream,
+            self.layout.regions().residual_output,
+            destination,
+        )?;
+
+        Ok(())
+    }
+
     /// CUDA context shared by all owner allocations and graphs.
     pub const fn context(&self) -> &Arc<CudaContext> {
         &self.context
@@ -754,6 +777,10 @@ impl Qwen35MtpLayerProgram {
 
     pub(crate) fn final_normalized_address(&self) -> GpuResult<*const u16> {
         Ok(self.pointers()?.final_normalized.cast_const())
+    }
+
+    pub(crate) fn target_hidden_address(&self) -> GpuResult<*const u16> {
+        Ok(self.pointers()?.target_hidden)
     }
 
     pub(crate) fn residual_output_address(&self) -> GpuResult<*const u16> {
