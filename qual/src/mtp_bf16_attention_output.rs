@@ -4,7 +4,9 @@ use crate::device_benchmark;
 use crate::fp8_projection_oracle::{bf16_to_f32, f32_to_bf16};
 use crate::{
     DeviceBenchmarkError,
-    target::{MtpBf16AttentionOutputOp, Qwen35MtpBf16AttentionOutputOp},
+    target::{
+        MtpBf16AttentionOutputOp, Qwen35MtpBf16AttentionOutputOp, Qwen36MtpBf16AttentionOutputOp,
+    },
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -12,7 +14,10 @@ use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     device_memory_info,
 };
-use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen35_9B, Qwen38_27B};
+use tuisko_model::{
+    Arch, CheckpointError, CheckpointResult, CheckpointSnapshot, MtpBindings, Qwen35_9B,
+    Qwen36Moe35B, Qwen36MtpBindings, Qwen38_27B,
+};
 
 pub(crate) const MAX_BATCH: usize = 8;
 const ALIGNMENT: usize = 256;
@@ -163,6 +168,36 @@ macro_rules! impl_qualified_attention_output_op {
 
 impl_qualified_attention_output_op!(MtpBf16AttentionOutputOp);
 impl_qualified_attention_output_op!(Qwen35MtpBf16AttentionOutputOp);
+impl_qualified_attention_output_op!(Qwen36MtpBf16AttentionOutputOp);
+
+trait AttentionOutputSource: Arch {
+    fn output_weight(snapshot: &CheckpointSnapshot<Self>) -> CheckpointResult<Vec<u16>>;
+}
+
+macro_rules! impl_dense_attention_output_source {
+    ($arch:ty) => {
+        impl AttentionOutputSource for $arch {
+            fn output_weight(snapshot: &CheckpointSnapshot<Self>) -> CheckpointResult<Vec<u16>> {
+                Ok(MtpBindings::bind(snapshot)?
+                    .attention_output_weight
+                    .words()
+                    .collect())
+            }
+        }
+    };
+}
+
+impl_dense_attention_output_source!(Qwen38_27B);
+impl_dense_attention_output_source!(Qwen35_9B);
+
+impl AttentionOutputSource for Qwen36Moe35B {
+    fn output_weight(snapshot: &CheckpointSnapshot<Self>) -> CheckpointResult<Vec<u16>> {
+        Ok(Qwen36MtpBindings::bind(snapshot)?
+            .attention_output_weight
+            .words()
+            .collect())
+    }
+}
 
 /// Qualifies source-BF16 MTP gated attention output at exact `B=1..=8`.
 pub fn qualify_mtp_bf16_attention_output(
@@ -178,13 +213,19 @@ pub fn qualify_qwen35_mtp_bf16_attention_output(
     qualify_attention_output::<Qwen35_9B, Qwen35MtpBf16AttentionOutputOp>(root)
 }
 
-fn qualify_attention_output<A: Arch, O: QualifiedAttentionOutputOp>(
+/// Qualifies Qwen3.6 source-BF16 MTP gated attention output at exact `B=1..=8`.
+pub fn qualify_qwen36_mtp_bf16_attention_output(
+    root: &Path,
+) -> Result<MtpBf16AttentionOutputQualification, MtpBf16AttentionOutputQualificationError> {
+    qualify_attention_output::<Qwen36Moe35B, Qwen36MtpBf16AttentionOutputOp>(root)
+}
+
+fn qualify_attention_output<A: AttentionOutputSource, O: QualifiedAttentionOutputOp>(
     root: &Path,
 ) -> Result<MtpBf16AttentionOutputQualification, MtpBf16AttentionOutputQualificationError> {
     let _preflight = device_benchmark::preflight()?;
     let snapshot = CheckpointSnapshot::<A>::open(root)?;
-    let bindings = MtpBindings::bind(&snapshot)?;
-    let fixture = make_fixture_for::<A>(bindings.attention_output_weight.words().collect());
+    let fixture = make_fixture_for::<A>(A::output_weight(&snapshot)?);
     let source_expected = source_oracle::<A>(
         &fixture.activation[..A::ATTENTION_OUTPUT_COLUMNS],
         &fixture.weight,
@@ -619,10 +660,10 @@ fn verify_no_post_warmup_allocation<A: Arch, O: QualifiedAttentionOutputOp>(
 mod tests {
     use super::{
         COLUMNS, MAX_BATCH, OUTPUT_ROWS, layout, layout_for, qualify_mtp_bf16_attention_output,
-        qualify_qwen35_mtp_bf16_attention_output,
+        qualify_qwen35_mtp_bf16_attention_output, qualify_qwen36_mtp_bf16_attention_output,
     };
     use std::path::PathBuf;
-    use tuisko_model::{Arch, Qwen35_9B};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B};
 
     #[test]
     fn mtp_bf16_attention_output_suite_route_and_byte_inventory_is_exact() {
@@ -698,6 +739,45 @@ mod tests {
         assert_eq!(report.weight_bytes, 33_554_432);
         assert_eq!(report.workspace_bytes, 425_984);
         assert_eq!(report.arena_bytes, 33_980_416);
+        assert_eq!(report.padding_bytes, 0);
+        assert!(report.maximum_gated_error.is_finite());
+        assert!(report.maximum_projection_error.is_finite());
+    }
+
+    #[test]
+    fn qwen36_mtp_output_suite_route_and_byte_inventory_is_exact() {
+        let (layout, regions) = layout_for::<Qwen36Moe35B>().unwrap();
+
+        assert_eq!(Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS, 4_096);
+        assert_eq!(Qwen36Moe35B::HIDDEN, 2_048);
+        assert_eq!(regions.weight_bytes(), 16_777_216);
+        assert_eq!(regions.workspace_bytes(), 376_832);
+        assert_eq!(regions.payload_bytes(), 17_154_048);
+        assert_eq!(layout.byte_len(), regions.payload_bytes());
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive SM120 device and the pinned Qwen3.6 snapshot"]
+    fn qwen36_mtp_output_suite_source_values_match_every_seam_route_and_graph() {
+        let root = PathBuf::from(
+            std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+                .expect("TUISKO_QWEN36_SNAPSHOT must name the snapshot"),
+        );
+        let report = qualify_qwen36_mtp_bf16_attention_output(&root)
+            .expect("Qwen3.6 MTP BF16 attention-output qualification");
+        let columns = Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS;
+        let output_rows = Qwen36Moe35B::HIDDEN;
+
+        assert_eq!(report.gated_values, 36 * columns);
+        assert_eq!(report.activation_values, 36 * columns);
+        assert_eq!(report.output_values, 36 * output_rows);
+        assert_eq!(report.source_output_values, output_rows);
+        assert_eq!(report.graph_replay_values, 36 * (2 * columns + output_rows));
+        assert_eq!(report.inactive_values, 2 * 28 * (2 * columns + output_rows));
+        assert_eq!(report.immutable_values, 8_462_336);
+        assert_eq!(report.weight_bytes, 16_777_216);
+        assert_eq!(report.workspace_bytes, 376_832);
+        assert_eq!(report.arena_bytes, 17_154_048);
         assert_eq!(report.padding_bytes, 0);
         assert!(report.maximum_gated_error.is_finite());
         assert!(report.maximum_projection_error.is_finite());

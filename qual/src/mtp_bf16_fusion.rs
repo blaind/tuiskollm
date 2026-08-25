@@ -5,7 +5,7 @@ use crate::fp8_projection_oracle::{bf16_to_f32, f32_to_bf16};
 use crate::residual_norm::rms_norm_oracle;
 use crate::{
     DeviceBenchmarkError,
-    target::{MtpBf16FusionOp, Qwen35MtpBf16FusionOp},
+    target::{MtpBf16FusionOp, Qwen35MtpBf16FusionOp, Qwen36MtpBf16FusionOp},
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -13,7 +13,10 @@ use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     device_memory_info,
 };
-use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen35_9B, Qwen38_27B};
+use tuisko_model::{
+    Arch, CheckpointError, CheckpointResult, CheckpointSnapshot, MtpBindings, Qwen35_9B,
+    Qwen36Moe35B, Qwen36MtpBindings, Qwen38_27B,
+};
 
 #[cfg(test)]
 const MAX_BATCH: usize = 8;
@@ -183,6 +186,40 @@ macro_rules! impl_fusion_op {
 
 impl_fusion_op!(MtpBf16FusionOp);
 impl_fusion_op!(Qwen35MtpBf16FusionOp);
+impl_fusion_op!(Qwen36MtpBf16FusionOp);
+
+trait FusionSource: Arch {
+    fn load_source(snapshot: &CheckpointSnapshot<Self>) -> CheckpointResult<Source>;
+}
+
+macro_rules! impl_dense_fusion_source {
+    ($arch:ty) => {
+        impl FusionSource for $arch {
+            fn load_source(snapshot: &CheckpointSnapshot<Self>) -> CheckpointResult<Source> {
+                let bindings = MtpBindings::bind(snapshot)?;
+                Ok(Source {
+                    embedding_norm: bindings.embedding_norm.words().collect(),
+                    hidden_norm: bindings.hidden_norm.words().collect(),
+                    projection: bindings.input_projection.words().collect(),
+                })
+            }
+        }
+    };
+}
+
+impl_dense_fusion_source!(Qwen38_27B);
+impl_dense_fusion_source!(Qwen35_9B);
+
+impl FusionSource for Qwen36Moe35B {
+    fn load_source(snapshot: &CheckpointSnapshot<Self>) -> CheckpointResult<Source> {
+        let bindings = Qwen36MtpBindings::bind(snapshot)?;
+        Ok(Source {
+            embedding_norm: bindings.embedding_norm.words().collect(),
+            hidden_norm: bindings.hidden_norm.words().collect(),
+            projection: bindings.input_projection.words().collect(),
+        })
+    }
+}
 
 /// Qualifies source-backed MTP input fusion at every decode and prompt-tile route.
 pub fn qualify_mtp_bf16_fusion(
@@ -204,7 +241,20 @@ pub fn qualify_qwen35_mtp_bf16_fusion(
     )
 }
 
-fn qualify_fusion<A: Arch, O: FusionOp>(
+/// Qualifies source-backed Qwen3.6 MTP input fusion at every exact route.
+pub fn qualify_qwen36_mtp_bf16_fusion(
+    root: &Path,
+) -> Result<MtpBf16FusionQualification, MtpBf16FusionQualificationError> {
+    qualify_fusion::<Qwen36Moe35B, Qwen36MtpBf16FusionOp>(
+        root,
+        &QWEN35_ROUTES,
+        QWEN35_MAX_TOKENS,
+        0.0078125,
+        0.00390625,
+    )
+}
+
+fn qualify_fusion<A: FusionSource, O: FusionOp>(
     root: &Path,
     routes: &[usize],
     max_tokens: usize,
@@ -213,12 +263,7 @@ fn qualify_fusion<A: Arch, O: FusionOp>(
 ) -> Result<MtpBf16FusionQualification, MtpBf16FusionQualificationError> {
     let _preflight = device_benchmark::preflight()?;
     let snapshot = CheckpointSnapshot::<A>::open(root)?;
-    let bindings = MtpBindings::bind(&snapshot)?;
-    let source = Source {
-        embedding_norm: bindings.embedding_norm.words().collect(),
-        hidden_norm: bindings.hidden_norm.words().collect(),
-        projection: bindings.input_projection.words().collect(),
-    };
+    let source = A::load_source(&snapshot)?;
     let first_fixture = make_fixture::<A>(max_tokens, 0, embedding_step, hidden_step);
     let replacement_fixture = make_fixture::<A>(max_tokens, 1, embedding_step, hidden_step);
     let context = CudaContext::new(0).map_err(GpuError::from)?;
@@ -766,10 +811,10 @@ fn verify_no_post_warmup_allocation<O: FusionOp>(
 mod tests {
     use super::{
         MAX_BATCH, MAX_TOKENS, QWEN35_MAX_TOKENS, QWEN35_ROUTES, ROUTES, qualify_mtp_bf16_fusion,
-        qualify_qwen35_mtp_bf16_fusion,
+        qualify_qwen35_mtp_bf16_fusion, qualify_qwen36_mtp_bf16_fusion,
     };
     use std::path::PathBuf;
-    use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
     #[test]
     fn mtp_bf16_fusion_suite_route_inventory_is_exact() {
@@ -849,6 +894,38 @@ mod tests {
         assert_eq!(report.weight_bytes, 67_125_248);
         assert_eq!(report.workspace_bytes, 5_242_880);
         assert_eq!(report.arena_bytes, 72_368_128);
+        assert_eq!(report.padding_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive SM120 device and the pinned Qwen3.6 snapshot"]
+    fn qwen36_mtp_fusion_suite_source_values_match_every_route() {
+        let root = PathBuf::from(
+            std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+                .expect("TUISKO_QWEN36_SNAPSHOT must name the snapshot"),
+        );
+        let report =
+            qualify_qwen36_mtp_bf16_fusion(&root).expect("Qwen3.6 MTP BF16 fusion qualification");
+        let route_rows = QWEN35_ROUTES.iter().sum::<usize>();
+        let inactive_rows = QWEN35_ROUTES.len() * QWEN35_MAX_TOKENS - route_rows;
+
+        assert_eq!(
+            report.normalized_values,
+            2 * route_rows * Qwen36Moe35B::HIDDEN
+        );
+        assert_eq!(report.projection_values, route_rows * Qwen36Moe35B::HIDDEN);
+        assert_eq!(report.source_projection_values, Qwen36Moe35B::HIDDEN);
+        assert_eq!(
+            report.graph_replay_values,
+            3 * route_rows * Qwen36Moe35B::HIDDEN
+        );
+        assert_eq!(
+            report.inactive_values,
+            2 * 3 * inactive_rows * Qwen36Moe35B::HIDDEN
+        );
+        assert_eq!(report.weight_bytes, 16_785_408);
+        assert_eq!(report.workspace_bytes, 2_621_440);
+        assert_eq!(report.arena_bytes, 19_406_848);
         assert_eq!(report.padding_bytes, 0);
     }
 }

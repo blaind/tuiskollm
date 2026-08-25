@@ -4,15 +4,19 @@ use crate::device_benchmark;
 use crate::fp8_projection_oracle::{bf16_to_f32, f32_to_bf16};
 use crate::{
     DeviceBenchmarkError,
-    target::{MtpBf16QkvOp, Qwen35MtpBf16QkvOp},
+    target::{MtpBf16QkvOp, Qwen35MtpBf16QkvOp, Qwen36MtpBf16QkvOp},
 };
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     device_memory_info,
 };
-use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen35_9B, Qwen38_27B};
+use tuisko_model::{
+    Arch, CheckpointError, CheckpointResult, CheckpointSnapshot, MtpBindings, Qwen35_9B,
+    Qwen36Moe35B, Qwen36MtpBindings, Qwen38_27B,
+};
 
 pub(crate) const MAX_BATCH: usize = 8;
 pub(crate) const MAX_TOKENS: usize = 1_024;
@@ -132,6 +136,32 @@ macro_rules! impl_qualified_qkv_op {
 
 impl_qualified_qkv_op!(MtpBf16QkvOp);
 impl_qualified_qkv_op!(Qwen35MtpBf16QkvOp);
+impl_qualified_qkv_op!(Qwen36MtpBf16QkvOp);
+
+trait QkvSource: Arch {
+    fn materialize(snapshot: &CheckpointSnapshot<Self>) -> CheckpointResult<Vec<u8>>;
+}
+
+macro_rules! impl_dense_qkv_source {
+    ($arch:ty) => {
+        impl QkvSource for $arch {
+            fn materialize(snapshot: &CheckpointSnapshot<Self>) -> CheckpointResult<Vec<u8>> {
+                Ok(MtpBindings::bind(snapshot)?.materialize_qkv()?.weight_bf16)
+            }
+        }
+    };
+}
+
+impl_dense_qkv_source!(Qwen38_27B);
+impl_dense_qkv_source!(Qwen35_9B);
+
+impl QkvSource for Qwen36Moe35B {
+    fn materialize(snapshot: &CheckpointSnapshot<Self>) -> CheckpointResult<Vec<u8>> {
+        Ok(Qwen36MtpBindings::bind(snapshot)?
+            .materialize_qkv()?
+            .weight_bf16)
+    }
+}
 
 /// Qualifies gathered source-BF16 MTP Q/gate/K/V projection at decode and prompt widths.
 pub fn qualify_mtp_bf16_qkv(
@@ -152,7 +182,19 @@ pub fn qualify_qwen35_mtp_bf16_qkv(
     )
 }
 
-fn qualify_qkv<A: Arch, O: QualifiedQkvOp>(
+/// Qualifies gathered Qwen3.6 source-BF16 MTP Q/gate/K/V projection.
+pub fn qualify_qwen36_mtp_bf16_qkv(
+    root: &Path,
+) -> Result<MtpBf16QkvQualification, MtpBf16QkvQualificationError> {
+    qualify_qkv::<Qwen36Moe35B, Qwen36MtpBf16QkvOp>(
+        root,
+        &QWEN35_ROUTES,
+        QWEN35_MAX_TOKENS,
+        0.00390625,
+    )
+}
+
+fn qualify_qkv<A: QkvSource, O: QualifiedQkvOp>(
     root: &Path,
     routes: &[usize],
     max_tokens: usize,
@@ -160,22 +202,21 @@ fn qualify_qkv<A: Arch, O: QualifiedQkvOp>(
 ) -> Result<MtpBf16QkvQualification, MtpBf16QkvQualificationError> {
     let _preflight = device_benchmark::preflight()?;
     let snapshot = CheckpointSnapshot::<A>::open(root)?;
-    let bindings = MtpBindings::bind(&snapshot)?;
-    let gathered = bindings.materialize_qkv()?;
-    if gathered.rows != A::ATTENTION_QKV_ROWS || gathered.columns != A::HIDDEN {
+    let gathered = A::materialize(&snapshot)?;
+    let expected_bytes = A::ATTENTION_QKV_ROWS
+        .checked_mul(A::HIDDEN)
+        .and_then(|values| values.checked_mul(size_of::<u16>()))
+        .ok_or_else(|| MtpBf16QkvQualificationError::Mismatch("QKV bytes overflow".into()))?;
+    if gathered.len() != expected_bytes {
         return Err(MtpBf16QkvQualificationError::Mismatch(format!(
-            "gathered source shape is [{},{}], expected [{},{}]",
-            gathered.rows,
-            gathered.columns,
-            A::ATTENTION_QKV_ROWS,
-            A::HIDDEN
+            "gathered source has {} bytes, expected {expected_bytes}",
+            gathered.len()
         )));
     }
     let fixture = Fixture {
         first_input: make_input::<A>(max_tokens, 0, token_step),
         replacement_input: make_input::<A>(max_tokens, 1, token_step),
         weight: gathered
-            .weight_bf16
             .chunks_exact(2)
             .map(|word| u16::from_le_bytes([word[0], word[1]]))
             .collect(),
@@ -521,10 +562,10 @@ fn verify_no_post_warmup_allocation<O: QualifiedQkvOp>(
 mod tests {
     use super::{
         MAX_BATCH, MAX_TOKENS, OUTPUT_ROWS, QWEN35_MAX_TOKENS, QWEN35_ROUTES, ROUTES, layout,
-        layout_for, qualify_mtp_bf16_qkv, qualify_qwen35_mtp_bf16_qkv,
+        layout_for, qualify_mtp_bf16_qkv, qualify_qwen35_mtp_bf16_qkv, qualify_qwen36_mtp_bf16_qkv,
     };
     use std::path::PathBuf;
-    use tuisko_model::{Arch, Qwen35_9B};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B};
 
     #[test]
     fn mtp_bf16_qkv_suite_route_and_byte_inventory_is_exact() {
@@ -615,6 +656,43 @@ mod tests {
         assert_eq!(report.weight_bytes, 83_886_080);
         assert_eq!(report.workspace_bytes, 3_670_016);
         assert_eq!(report.arena_bytes, 87_556_096);
+        assert_eq!(report.padding_bytes, 0);
+    }
+
+    #[test]
+    fn qwen36_mtp_qkv_suite_route_and_byte_inventory_is_exact() {
+        let (layout, regions) = layout_for::<Qwen36Moe35B>(QWEN35_MAX_TOKENS).unwrap();
+
+        assert_eq!(Qwen36Moe35B::ATTENTION_QKV_ROWS, 9_216);
+        assert_eq!(regions.weight_bytes(), 37_748_736);
+        assert_eq!(regions.workspace_bytes(), 2_883_584);
+        assert_eq!(regions.payload_bytes(), 40_632_320);
+        assert_eq!(layout.byte_len(), regions.payload_bytes());
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive SM120 device and the pinned Qwen3.6 snapshot"]
+    fn qwen36_mtp_qkv_suite_source_values_match_every_route_and_graph_replay() {
+        let root = PathBuf::from(
+            std::env::var_os("TUISKO_QWEN36_SNAPSHOT")
+                .expect("TUISKO_QWEN36_SNAPSHOT must name the snapshot"),
+        );
+        let report =
+            qualify_qwen36_mtp_bf16_qkv(&root).expect("Qwen3.6 MTP BF16 QKV qualification");
+        let active_tokens = QWEN35_ROUTES.iter().sum::<usize>();
+        let inactive_tokens = QWEN35_ROUTES
+            .iter()
+            .map(|&batch| QWEN35_MAX_TOKENS - batch)
+            .sum::<usize>();
+        let output_rows = Qwen36Moe35B::ATTENTION_QKV_ROWS;
+
+        assert_eq!(report.output_values, active_tokens * output_rows);
+        assert_eq!(report.source_output_values, output_rows);
+        assert_eq!(report.graph_replay_values, active_tokens * output_rows);
+        assert_eq!(report.inactive_values, 2 * inactive_tokens * output_rows);
+        assert_eq!(report.weight_bytes, 37_748_736);
+        assert_eq!(report.workspace_bytes, 2_883_584);
+        assert_eq!(report.arena_bytes, 40_632_320);
         assert_eq!(report.padding_bytes, 0);
     }
 }

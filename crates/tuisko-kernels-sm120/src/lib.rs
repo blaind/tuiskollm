@@ -48,12 +48,14 @@ pub use gdn::{
 };
 pub use inventory::kernel_ptx_names;
 pub use moe::{Qwen36MoeExpertsOp, Qwen36MoeRouterOp};
-pub use mtp_bf16_attention_output::{MtpBf16AttentionOutputOp, Qwen35MtpBf16AttentionOutputOp};
-pub use mtp_bf16_fusion::{MtpBf16FusionOp, Qwen35MtpBf16FusionOp};
+pub use mtp_bf16_attention_output::{
+    MtpBf16AttentionOutputOp, Qwen35MtpBf16AttentionOutputOp, Qwen36MtpBf16AttentionOutputOp,
+};
+pub use mtp_bf16_fusion::{MtpBf16FusionOp, Qwen35MtpBf16FusionOp, Qwen36MtpBf16FusionOp};
 pub use mtp_bf16_mlp::{MtpBf16MlpOp, Qwen35MtpBf16MlpOp};
 pub use mtp_bf16_paged_gqa::{MtpBf16PagedGqaOp, Qwen35MtpBf16PagedGqaOp};
 pub use mtp_bf16_qk_prepare::{MtpBf16QkPrepareOp, Qwen35MtpBf16QkPrepareOp};
-pub use mtp_bf16_qkv::{MtpBf16QkvOp, Qwen35MtpBf16QkvOp};
+pub use mtp_bf16_qkv::{MtpBf16QkvOp, Qwen35MtpBf16QkvOp, Qwen36MtpBf16QkvOp};
 pub use nvfp4_down::{Nvfp4DownOp, Qwen35Nvfp4DownOp};
 pub use nvfp4_gdn_input::Qwen35Nvfp4GdnInputOp;
 pub use nvfp4_qkv::Qwen35Nvfp4QkvOp;
