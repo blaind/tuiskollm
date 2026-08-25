@@ -528,7 +528,7 @@ fn verify_prompt_fixtures(
 fn verify_owner(
     generator: &Qwen35ResidentTextGenerator,
 ) -> Result<(), Qwen35GenerationQualificationError> {
-    if generator.arena_bytes() != 15_629_936_640
+    if generator.arena_bytes() != 15_681_447_936
         || generator.host_stager_bytes() != 1_610_752
         || generator.context_capacity() != 262_144
     {
@@ -551,7 +551,7 @@ fn verify_owner(
 fn verify_compact_owner(
     generator: &Qwen35ResidentBatchGenerator,
 ) -> Result<(), Qwen35GenerationQualificationError> {
-    if generator.arena_bytes() != 15_629_936_640
+    if generator.arena_bytes() != 15_681_447_936
         || generator.host_stager_bytes() != 9_060_352
         || generator.context_capacity() != 262_144
     {
@@ -592,7 +592,7 @@ mod tests {
             report.native_prefill_tokens,
             [0, 32, 32, 64, 64, 128, 128, 192, 192]
         );
-        assert_eq!(report.arena_bytes, 15_629_936_640);
+        assert_eq!(report.arena_bytes, 15_681_447_936);
         assert_eq!(report.host_stager_bytes, 1_610_752);
         assert_eq!(report.stable_addresses, 35);
         eprintln!("Qwen3.5 generation qualification passed: {report:?}");
@@ -614,7 +614,7 @@ mod tests {
         assert_eq!(report.recycled_slot, 1);
         assert_eq!(report.concurrent_prefill_tokens, 192);
         assert_eq!(report.cancellations, 1);
-        assert_eq!(report.arena_bytes, 15_629_936_640);
+        assert_eq!(report.arena_bytes, 15_681_447_936);
         assert_eq!(report.host_stager_bytes, 9_060_352);
         assert_eq!(report.stable_addresses, 35);
         eprintln!("Qwen3.5 compact generation qualification passed: {report:?}");

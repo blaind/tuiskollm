@@ -473,9 +473,9 @@ fn verify_accounting(
     let layout = program.layout();
     if layout.resident_weight_bytes() != 6_418_401_280
         || layout.cache_bytes() != 9_714_008_064
-        || layout.workspace_bytes() != 1_069_791_072
-        || layout.owner_bytes() != 17_202_200_416
-        || layout.arena_bytes() != 17_202_221_824
+        || layout.workspace_bytes() != 1_121_302_368
+        || layout.owner_bytes() != 17_253_711_712
+        || layout.arena_bytes() != 17_253_733_120
         || layout.padding_bytes() != 21_408
         || program.host_stager_bytes() != 2_162_688
         || program.kv_host_owner_bytes() != 270_336
@@ -562,8 +562,8 @@ mod tests {
         assert_eq!(report.lifecycle_transitions, 6);
         assert_eq!(report.weight_bytes, 6_418_401_280);
         assert_eq!(report.cache_bytes, 9_714_008_064);
-        assert_eq!(report.workspace_bytes, 1_069_791_072);
-        assert_eq!(report.arena_bytes, 17_202_221_824);
+        assert_eq!(report.workspace_bytes, 1_121_302_368);
+        assert_eq!(report.arena_bytes, 17_253_733_120);
         assert_eq!(report.host_stager_bytes, 2_162_688);
         assert_eq!(report.kv_host_owner_bytes, 270_336);
         Ok(())

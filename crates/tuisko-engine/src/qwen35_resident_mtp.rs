@@ -41,6 +41,7 @@ impl Qwen35MtpPromptRoute {
 pub struct Qwen35ResidentMtpProgram {
     // Drop cross-owner graphs before every allocation and module they retain.
     draft_graphs: [CudaGraph; MAX_BATCH],
+    continue_draft_graph: CudaGraph,
     prompt_graphs: [CudaGraph; PROMPT_ROUTES.len()],
     mtp: Qwen35MtpLayerProgram,
     target: Qwen35ResidentModelProgram,
@@ -71,10 +72,14 @@ impl Qwen35ResidentMtpProgram {
         let embedding_stager =
             PinnedHostBuffer::zeroed(context, 128 * Qwen35_9B::HIDDEN).map_err(GpuError::from)?;
         let draft_graphs = capture_draft_routes(&stream, &target, &mtp)?;
+        let continue_draft_graph = CudaGraph::capture(&stream, || {
+            launch_draft(&stream, 1, &target, &mtp, mtp.residual_output_address()?)
+        })?;
         let prompt_graphs = capture_prompt_routes(&stream, &target, &mtp)?;
 
         Ok(Self {
             draft_graphs,
+            continue_draft_graph,
             prompt_graphs,
             mtp,
             target,
@@ -165,6 +170,14 @@ impl Qwen35ResidentMtpProgram {
         require_rows(batch)?;
         // SAFETY: this owner retains all target, MTP, cache, and endpoint addresses.
         unsafe { self.draft_graphs[batch - 1].launch(stream) }?;
+
+        Ok(())
+    }
+
+    /// Continues one singleton proposal from the preceding MTP residual boundary.
+    pub fn replay_continue_draft(&self, stream: &CudaStream) -> EngineResult<()> {
+        // SAFETY: the graph reads and then replaces planes in this retained MTP owner.
+        unsafe { self.continue_draft_graph.launch(stream) }?;
 
         Ok(())
     }
@@ -273,9 +286,97 @@ impl Qwen35ResidentMtpProgram {
         self.target.read_logits(stream, rows)
     }
 
+    /// Reads active target or draft logits into one reusable pinned bank.
+    pub fn read_logits_into(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        self.target.read_logits_into(stream, rows, destination)
+    }
+
     /// Reads active MTP residual rows for accepted-prefix realignment.
     pub fn read_mtp_residuals(&self, stream: &CudaStream, rows: usize) -> EngineResult<Vec<u16>> {
         self.mtp.read_residual_output(stream, rows)
+    }
+
+    pub(crate) fn target(&self) -> &Qwen35ResidentModelProgram {
+        &self.target
+    }
+
+    pub(crate) fn target_mut(&mut self) -> &mut Qwen35ResidentModelProgram {
+        &mut self.target
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_realign(
+        &mut self,
+        stream: &CudaStream,
+        outputs: &[u32],
+        target_hidden: &[u16],
+        slot: usize,
+        first_position: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        require_rows(outputs.len())?;
+        let values = outputs
+            .len()
+            .checked_mul(Qwen35_9B::HIDDEN)
+            .ok_or_else(|| EngineError::layout("Qwen3.5 MTP realignment inputs overflow"))?;
+        if target_hidden.len() != values {
+            return Err(EngineError::layout(format!(
+                "Qwen3.5 MTP realignment has {} target-hidden values, expected {values}",
+                target_hidden.len()
+            )));
+        }
+        self.target
+            .gather_embedding_rows(outputs, &mut self.embedding_stager[..values])?;
+        self.mtp.load_inputs(
+            stream,
+            outputs.len(),
+            &self.embedding_stager[..values],
+            target_hidden,
+        )?;
+        let end = first_position
+            .checked_add(outputs.len())
+            .ok_or_else(|| EngineError::generation("Qwen3.5 MTP realignment range overflows"))?;
+        let positions = (first_position..end)
+            .map(|position| {
+                u32::try_from(position)
+                    .map_err(|_| EngineError::generation("Qwen3.5 MTP position exceeds u32"))
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        self.mtp
+            .load_realign_state(stream, outputs.len(), slot, &positions, rope_cos, rope_sin)
+    }
+
+    pub(crate) fn replay_realign(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        prime_only: bool,
+    ) -> EngineResult<()> {
+        require_rows(rows)?;
+        if prime_only {
+            self.mtp.replay_prime(stream, rows)?;
+        } else {
+            self.mtp.replay_realign(stream, rows)?;
+            // SAFETY: the MTP graph published the exact final normalized row and both resident
+            // owners remain live until the ordered LM-head launch completes.
+            unsafe {
+                self.target.launch_lm_head_from(
+                    stream,
+                    1,
+                    self.mtp
+                        .final_normalized_address()?
+                        .add((rows - 1) * Qwen35_9B::HIDDEN),
+                )?
+            };
+        }
+
+        Ok(())
     }
 
     /// Activates one target/MTP slot pair after verifying equal lifecycle state.

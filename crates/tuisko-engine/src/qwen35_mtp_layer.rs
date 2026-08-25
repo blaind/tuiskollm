@@ -756,6 +756,10 @@ impl Qwen35MtpLayerProgram {
         Ok(self.pointers()?.final_normalized.cast_const())
     }
 
+    pub(crate) fn residual_output_address(&self) -> GpuResult<*const u16> {
+        Ok(self.pointers()?.residual_output.cast_const())
+    }
+
     /// Launches a draft route from one external stable target-hidden plane.
     ///
     /// # Safety
