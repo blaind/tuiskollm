@@ -12449,7 +12449,7 @@ fn require_uniform_value(
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPOSED_PERFORMANCE_SUITES, MAX_IDLE_DEVICE_MEMORY_MIB,
+        BENCH_DEVICE_BASELINES, COMPOSED_PERFORMANCE_SUITES, MAX_IDLE_DEVICE_MEMORY_MIB,
         MTP_BF16_PAGED_GQA_BENCHMARK_FILTER, MTP_LAYER_BENCHMARK_FILTER,
         MTP_LAYER_RESOURCE_BASELINES, MTP_LAYER_TEST_FILTER, OptimizationSuite, PERFORMANCE_SUITES,
         PerformanceSuite, QUALIFICATION_IGNORED_FLAGS, QUALIFICATION_IGNORED_SERIAL_FLAGS,
@@ -12458,14 +12458,17 @@ mod tests {
         QWEN35_RESIDENT_MODEL_TEST_FILTER, QWEN35_RESIDENT_MTP_TEST_FILTER,
         QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN35_TEXT_ENDPOINT_TEST_FILTER,
         QWEN36_LONG_CONTEXT_KV_TEST_FILTER, QWEN36_MTP_LAYER_TEST_FILTER,
-        QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, device_is_idle,
-        parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
+        QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, bench_device_baselines,
+        bench_device_command, concatenated_resource_baselines, device_is_idle, parse_baseline,
+        parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
         parse_performance_device_sample, parse_performance_iteration, parse_resources,
         parse_rustc_identity, preflight_performance_baselines, qualification_test_arguments,
         require_consumed_baseline_keys, require_count, require_registers, require_uniform_value,
-        resolve_target_output, sass_function_body, workspace_root,
+        resolve_target_output, sass_function_body, sha256, workspace_root,
     };
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
+    use std::fs;
+    use std::path::Path;
 
     #[test]
     fn parses_hashed_and_concrete_entries() {
@@ -13646,5 +13649,677 @@ mod tests {
                 "{function} invocation {index}"
             );
         }
+    }
+
+    /// Every converted `bench_*` invocation must spawn the command line its
+    /// legacy inline body spawned: the same suite argument, the same forwarded
+    /// arguments, and the same ordered baseline concatenation behind
+    /// `TUISKO_GENERATOR_BASELINE_SHA256`.
+    #[test]
+    fn bench_device_command_reproduces_legacy_argv() {
+        // (suite, owning function, the baseline paths its legacy inline body
+        // read, in order). The paths are transcribed as literals from those
+        // bodies, independently of the `*_RESOURCE_BASELINE` constants
+        // `BENCH_DEVICE_BASELINES` is built from, so a retargeted constant cannot
+        // make this pass vacuously. The 52 converted functions cover 54 spawned
+        // call sites: `bench_resident_model_variant` takes its suite as a
+        // parameter and its three callers pass three different suites.
+        const LEGACY_BENCH_CALL_SITES: &[(&str, &str, &[&str])] = &[
+            (
+                "qwen35-residual-norm",
+                "bench_qwen35_residual_norm",
+                &["qual/baselines/qwen35-residual-norm-sm120.txt"],
+            ),
+            (
+                "qwen36-residual-norm",
+                "bench_qwen36_residual_norm",
+                &["qual/baselines/qwen36-residual-norm-sm120.txt"],
+            ),
+            (
+                "qwen35-nvfp4-swiglu",
+                "bench_qwen35_nvfp4_swiglu",
+                &["qual/baselines/qwen35-nvfp4-swiglu-sm120.txt"],
+            ),
+            (
+                "qwen35-nvfp4-down",
+                "bench_qwen35_nvfp4_down",
+                &["qual/baselines/qwen35-nvfp4-down-sm120.txt"],
+            ),
+            (
+                "qwen35-nvfp4-qkv",
+                "bench_qwen35_nvfp4_qkv",
+                &["qual/baselines/qwen35-nvfp4-qkv-sm120.txt"],
+            ),
+            (
+                "qwen36-moe-router",
+                "bench_qwen36_moe_router",
+                &["qual/baselines/qwen36-moe-router-sm120.txt"],
+            ),
+            (
+                "qwen36-moe-experts",
+                "bench_qwen36_moe_experts",
+                &["qual/baselines/qwen36-moe-experts-sm120.txt"],
+            ),
+            (
+                "qwen36-nvfp4-lm-head",
+                "bench_qwen36_nvfp4_lm_head",
+                &["qual/baselines/qwen36-nvfp4-lm-head-sm120.txt"],
+            ),
+            (
+                "qwen36-fp8-qkv",
+                "bench_qwen36_fp8_qkv",
+                &["qual/baselines/qwen36-fp8-qkv-sm120.txt"],
+            ),
+            (
+                "qwen36-gdn-input",
+                "bench_qwen36_gdn_input",
+                &["qual/baselines/qwen36-gdn-input-sm120.txt"],
+            ),
+            (
+                "qwen36-gdn-output",
+                "bench_qwen36_gdn_output",
+                &["qual/baselines/qwen36-gdn-output-sm120.txt"],
+            ),
+            (
+                "qwen36-attention-output",
+                "bench_qwen36_attention_output",
+                &[
+                    "qual/baselines/qwen36-attention-output-sm120.txt",
+                    "qual/baselines/qwen36-gdn-output-sm120.txt",
+                ],
+            ),
+            (
+                "qwen36-gdn-prepare",
+                "bench_qwen36_gdn_prepare",
+                &["qual/baselines/qwen35-gdn-prepare-sm120.txt"],
+            ),
+            (
+                "qwen36-gdn-recurrence",
+                "bench_qwen36_gdn_recurrence",
+                &["qual/baselines/qwen35-gdn-recurrence-sm120.txt"],
+            ),
+            (
+                "qwen35-nvfp4-gdn-input",
+                "bench_qwen35_nvfp4_gdn_input",
+                &["qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt"],
+            ),
+            (
+                "qwen35-gdn-prepare",
+                "bench_qwen35_gdn_prepare",
+                &["qual/baselines/qwen35-gdn-prepare-sm120.txt"],
+            ),
+            (
+                "qwen35-gdn-recurrence",
+                "bench_qwen35_gdn_recurrence",
+                &["qual/baselines/qwen35-gdn-recurrence-sm120.txt"],
+            ),
+            (
+                "qwen35-nvfp4-gdn-output",
+                "bench_qwen35_nvfp4_gdn_output",
+                &["qual/baselines/qwen35-nvfp4-attention-output-sm120.txt"],
+            ),
+            (
+                "qwen35-nvfp4-attention-output",
+                "bench_qwen35_nvfp4_attention_output",
+                &["qual/baselines/qwen35-nvfp4-attention-output-sm120.txt"],
+            ),
+            (
+                "qwen35-nvfp4-mlp",
+                "bench_qwen35_nvfp4_mlp",
+                &[
+                    "qual/baselines/qwen35-residual-norm-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-down-sm120.txt",
+                ],
+            ),
+            (
+                "qwen35-attention-qk-prepare",
+                "bench_qwen35_attention_qk_prepare",
+                &["qual/baselines/qwen35-attention-qk-prepare-sm120.txt"],
+            ),
+            (
+                "qwen36-attention-qk-prepare",
+                "bench_qwen36_attention_qk_prepare",
+                &["qual/baselines/qwen36-attention-qk-prepare-sm120.txt"],
+            ),
+            (
+                "qwen36-fp8-attention-qk-prepare",
+                "bench_qwen36_fp8_attention_qk_prepare",
+                &["qual/baselines/qwen36-fp8-attention-qk-prepare-sm120.txt"],
+            ),
+            (
+                "nvfp4-mlp",
+                "bench_nvfp4_mlp",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/nvfp4-down-sm120.txt",
+                ],
+            ),
+            (
+                "qwen35-paged-gqa",
+                "bench_qwen35_paged_gqa",
+                &["qual/baselines/qwen35-paged-gqa-sm120.txt"],
+            ),
+            (
+                "qwen36-paged-gqa",
+                "bench_qwen36_paged_gqa",
+                &["qual/baselines/qwen36-paged-gqa-sm120.txt"],
+            ),
+            (
+                "qwen36-fp8-paged-gqa",
+                "bench_qwen36_fp8_paged_gqa",
+                &["qual/baselines/qwen36-fp8-paged-gqa-sm120.txt"],
+            ),
+            (
+                "dense-fp8-mlp",
+                "bench_dense_fp8_mlp",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/fp8-swiglu-sm120.txt",
+                    "qual/baselines/fp8-down-sm120.txt",
+                ],
+            ),
+            (
+                "dense-fp8-gdn-layer",
+                "bench_dense_fp8_gdn_layer",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/fp8-gdn-input-sm120.txt",
+                    "qual/baselines/gdn-prepare-sm120.txt",
+                    "qual/baselines/gdn-recurrence-sm120.txt",
+                    "qual/baselines/gdn-output-sm120.txt",
+                    "qual/baselines/fp8-swiglu-sm120.txt",
+                    "qual/baselines/fp8-down-sm120.txt",
+                ],
+            ),
+            (
+                "full-attention-layer",
+                "bench_full_attention_layer",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/fp8-qkv-sm120.txt",
+                    "qual/baselines/attention-qk-prepare-sm120.txt",
+                    "qual/baselines/paged-gqa-sm120.txt",
+                    "qual/baselines/attention-output-sm120.txt",
+                    "qual/baselines/fp8-swiglu-sm120.txt",
+                    "qual/baselines/fp8-down-sm120.txt",
+                ],
+            ),
+            (
+                "mtp-layer",
+                "bench_mtp_layer",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/mtp-bf16-fusion-sm120.txt",
+                    "qual/baselines/mtp-bf16-qkv-sm120.txt",
+                    "qual/baselines/mtp-bf16-qk-prepare-sm120.txt",
+                    "qual/baselines/mtp-bf16-paged-gqa-sm120.txt",
+                    "qual/baselines/mtp-bf16-attention-output-sm120.txt",
+                    "qual/baselines/mtp-bf16-mlp-sm120.txt",
+                    "qual/baselines/fp8-lm-head-sm120.txt",
+                ],
+            ),
+            (
+                "qwen35-mtp-layer",
+                "bench_qwen35_mtp_layer",
+                &[
+                    "qual/baselines/qwen35-residual-norm-sm120.txt",
+                    "qual/baselines/qwen35-mtp-sm120.txt",
+                ],
+            ),
+            (
+                "qwen36-mtp-layer",
+                "bench_qwen36_mtp_layer",
+                &["qual/baselines/qwen36-mtp-sm120.txt"],
+            ),
+            (
+                "qwen35-resident-mtp",
+                "bench_qwen35_resident_mtp",
+                &[
+                    "qual/baselines/qwen35-residual-norm-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-down-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-qkv-sm120.txt",
+                    "qual/baselines/qwen35-bf16-lm-head-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt",
+                    "qual/baselines/qwen35-gdn-prepare-sm120.txt",
+                    "qual/baselines/qwen35-gdn-recurrence-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-attention-output-sm120.txt",
+                    "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",
+                    "qual/baselines/qwen35-paged-gqa-sm120.txt",
+                    "qual/baselines/qwen35-residual-norm-sm120.txt",
+                    "qual/baselines/qwen35-mtp-sm120.txt",
+                ],
+            ),
+            (
+                "qwen35-mtp-generation",
+                "bench_qwen35_mtp_generation",
+                &[
+                    "qual/baselines/qwen35-residual-norm-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-down-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-qkv-sm120.txt",
+                    "qual/baselines/qwen35-bf16-lm-head-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt",
+                    "qual/baselines/qwen35-gdn-prepare-sm120.txt",
+                    "qual/baselines/qwen35-gdn-recurrence-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-attention-output-sm120.txt",
+                    "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",
+                    "qual/baselines/qwen35-paged-gqa-sm120.txt",
+                    "qual/baselines/qwen35-residual-norm-sm120.txt",
+                    "qual/baselines/qwen35-mtp-sm120.txt",
+                ],
+            ),
+            (
+                "qwen35-mtp-batch-generation",
+                "bench_qwen35_mtp_batch_generation",
+                &[
+                    "qual/baselines/qwen35-residual-norm-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-down-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-qkv-sm120.txt",
+                    "qual/baselines/qwen35-bf16-lm-head-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt",
+                    "qual/baselines/qwen35-gdn-prepare-sm120.txt",
+                    "qual/baselines/qwen35-gdn-recurrence-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-attention-output-sm120.txt",
+                    "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",
+                    "qual/baselines/qwen35-paged-gqa-sm120.txt",
+                    "qual/baselines/qwen35-residual-norm-sm120.txt",
+                    "qual/baselines/qwen35-mtp-sm120.txt",
+                ],
+            ),
+            (
+                "target-mtp-verify",
+                "bench_target_mtp_verify",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/fp8-qkv-sm120.txt",
+                    "qual/baselines/fp8-gdn-input-sm120.txt",
+                    "qual/baselines/fp8-lm-head-sm120.txt",
+                    "qual/baselines/fp8-swiglu-sm120.txt",
+                    "qual/baselines/fp8-down-sm120.txt",
+                    "qual/baselines/nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/nvfp4-down-sm120.txt",
+                    "qual/baselines/gdn-prepare-sm120.txt",
+                    "qual/baselines/gdn-recurrence-sm120.txt",
+                    "qual/baselines/gdn-state-snapshot-sm120.txt",
+                    "qual/baselines/gdn-output-sm120.txt",
+                    "qual/baselines/attention-qk-prepare-sm120.txt",
+                    "qual/baselines/paged-gqa-sm120.txt",
+                    "qual/baselines/long-context-paged-gqa-sm120.txt",
+                    "qual/baselines/attention-output-sm120.txt",
+                ],
+            ),
+            (
+                "mtp-prompt-prime",
+                "bench_mtp_prompt_prime",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/mtp-bf16-fusion-sm120.txt",
+                    "qual/baselines/mtp-bf16-qkv-sm120.txt",
+                    "qual/baselines/mtp-bf16-qk-prepare-sm120.txt",
+                ],
+            ),
+            (
+                "resident-mtp",
+                "bench_resident_mtp",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/fp8-qkv-sm120.txt",
+                    "qual/baselines/fp8-gdn-input-sm120.txt",
+                    "qual/baselines/fp8-lm-head-sm120.txt",
+                    "qual/baselines/fp8-swiglu-sm120.txt",
+                    "qual/baselines/fp8-down-sm120.txt",
+                    "qual/baselines/nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/nvfp4-down-sm120.txt",
+                    "qual/baselines/gdn-prepare-sm120.txt",
+                    "qual/baselines/gdn-recurrence-sm120.txt",
+                    "qual/baselines/gdn-state-snapshot-sm120.txt",
+                    "qual/baselines/gdn-output-sm120.txt",
+                    "qual/baselines/attention-qk-prepare-sm120.txt",
+                    "qual/baselines/paged-gqa-sm120.txt",
+                    "qual/baselines/long-context-paged-gqa-sm120.txt",
+                    "qual/baselines/attention-output-sm120.txt",
+                    "qual/baselines/mtp-bf16-fusion-sm120.txt",
+                    "qual/baselines/mtp-bf16-qkv-sm120.txt",
+                    "qual/baselines/mtp-bf16-qk-prepare-sm120.txt",
+                    "qual/baselines/mtp-bf16-paged-gqa-sm120.txt",
+                    "qual/baselines/mtp-bf16-attention-output-sm120.txt",
+                    "qual/baselines/mtp-bf16-mlp-sm120.txt",
+                ],
+            ),
+            (
+                "generation-mtp-greedy",
+                "bench_generation_mtp_greedy",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/fp8-qkv-sm120.txt",
+                    "qual/baselines/fp8-gdn-input-sm120.txt",
+                    "qual/baselines/fp8-lm-head-sm120.txt",
+                    "qual/baselines/fp8-swiglu-sm120.txt",
+                    "qual/baselines/fp8-down-sm120.txt",
+                    "qual/baselines/nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/nvfp4-down-sm120.txt",
+                    "qual/baselines/gdn-prepare-sm120.txt",
+                    "qual/baselines/gdn-recurrence-sm120.txt",
+                    "qual/baselines/gdn-state-snapshot-sm120.txt",
+                    "qual/baselines/gdn-output-sm120.txt",
+                    "qual/baselines/attention-qk-prepare-sm120.txt",
+                    "qual/baselines/paged-gqa-sm120.txt",
+                    "qual/baselines/long-context-paged-gqa-sm120.txt",
+                    "qual/baselines/attention-output-sm120.txt",
+                    "qual/baselines/mtp-bf16-fusion-sm120.txt",
+                    "qual/baselines/mtp-bf16-qkv-sm120.txt",
+                    "qual/baselines/mtp-bf16-qk-prepare-sm120.txt",
+                    "qual/baselines/mtp-bf16-paged-gqa-sm120.txt",
+                    "qual/baselines/mtp-bf16-attention-output-sm120.txt",
+                    "qual/baselines/mtp-bf16-mlp-sm120.txt",
+                ],
+            ),
+            (
+                "generation-mtp-sampling",
+                "bench_generation_mtp_sampling",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/fp8-qkv-sm120.txt",
+                    "qual/baselines/fp8-gdn-input-sm120.txt",
+                    "qual/baselines/fp8-lm-head-sm120.txt",
+                    "qual/baselines/fp8-swiglu-sm120.txt",
+                    "qual/baselines/fp8-down-sm120.txt",
+                    "qual/baselines/nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/nvfp4-down-sm120.txt",
+                    "qual/baselines/gdn-prepare-sm120.txt",
+                    "qual/baselines/gdn-recurrence-sm120.txt",
+                    "qual/baselines/gdn-state-snapshot-sm120.txt",
+                    "qual/baselines/gdn-output-sm120.txt",
+                    "qual/baselines/attention-qk-prepare-sm120.txt",
+                    "qual/baselines/paged-gqa-sm120.txt",
+                    "qual/baselines/long-context-paged-gqa-sm120.txt",
+                    "qual/baselines/attention-output-sm120.txt",
+                    "qual/baselines/mtp-bf16-fusion-sm120.txt",
+                    "qual/baselines/mtp-bf16-qkv-sm120.txt",
+                    "qual/baselines/mtp-bf16-qk-prepare-sm120.txt",
+                    "qual/baselines/mtp-bf16-paged-gqa-sm120.txt",
+                    "qual/baselines/mtp-bf16-attention-output-sm120.txt",
+                    "qual/baselines/mtp-bf16-mlp-sm120.txt",
+                ],
+            ),
+            (
+                "generation-mtp-batch",
+                "bench_generation_mtp_batch",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/fp8-qkv-sm120.txt",
+                    "qual/baselines/fp8-gdn-input-sm120.txt",
+                    "qual/baselines/fp8-lm-head-sm120.txt",
+                    "qual/baselines/fp8-swiglu-sm120.txt",
+                    "qual/baselines/fp8-down-sm120.txt",
+                    "qual/baselines/nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/nvfp4-down-sm120.txt",
+                    "qual/baselines/gdn-prepare-sm120.txt",
+                    "qual/baselines/gdn-recurrence-sm120.txt",
+                    "qual/baselines/gdn-state-snapshot-sm120.txt",
+                    "qual/baselines/gdn-output-sm120.txt",
+                    "qual/baselines/attention-qk-prepare-sm120.txt",
+                    "qual/baselines/paged-gqa-sm120.txt",
+                    "qual/baselines/long-context-paged-gqa-sm120.txt",
+                    "qual/baselines/attention-output-sm120.txt",
+                    "qual/baselines/mtp-bf16-fusion-sm120.txt",
+                    "qual/baselines/mtp-bf16-qkv-sm120.txt",
+                    "qual/baselines/mtp-bf16-qk-prepare-sm120.txt",
+                    "qual/baselines/mtp-bf16-paged-gqa-sm120.txt",
+                    "qual/baselines/mtp-bf16-attention-output-sm120.txt",
+                    "qual/baselines/mtp-bf16-mlp-sm120.txt",
+                ],
+            ),
+            (
+                "qwen35-full-attention-layer",
+                "bench_qwen35_full_attention_layer",
+                &[
+                    "qual/baselines/qwen35-residual-norm-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-qkv-sm120.txt",
+                    "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",
+                    "qual/baselines/qwen35-paged-gqa-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-attention-output-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-down-sm120.txt",
+                ],
+            ),
+            (
+                "qwen35-gdn-layer",
+                "bench_qwen35_gdn_layer",
+                &[
+                    "qual/baselines/qwen35-residual-norm-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt",
+                    "qual/baselines/qwen35-gdn-prepare-sm120.txt",
+                    "qual/baselines/qwen35-gdn-recurrence-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-attention-output-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-down-sm120.txt",
+                ],
+            ),
+            (
+                "qwen36-gdn-moe-layer",
+                "bench_qwen36_gdn_moe_layer",
+                &[
+                    "qual/baselines/qwen36-residual-norm-sm120.txt",
+                    "qual/baselines/qwen36-gdn-input-sm120.txt",
+                    "qual/baselines/qwen35-gdn-prepare-sm120.txt",
+                    "qual/baselines/qwen35-gdn-recurrence-sm120.txt",
+                    "qual/baselines/qwen36-gdn-output-sm120.txt",
+                    "qual/baselines/qwen36-moe-router-sm120.txt",
+                    "qual/baselines/qwen36-moe-experts-sm120.txt",
+                ],
+            ),
+            (
+                "qwen36-full-attention-layer",
+                "bench_qwen36_full_attention_layer",
+                &[
+                    "qual/baselines/qwen36-residual-norm-sm120.txt",
+                    "qual/baselines/qwen36-fp8-qkv-sm120.txt",
+                    "qual/baselines/qwen36-attention-qk-prepare-sm120.txt",
+                    "qual/baselines/qwen36-paged-gqa-sm120.txt",
+                    "qual/baselines/qwen36-attention-output-sm120.txt",
+                    "qual/baselines/qwen36-gdn-output-sm120.txt",
+                    "qual/baselines/qwen36-moe-router-sm120.txt",
+                    "qual/baselines/qwen36-moe-experts-sm120.txt",
+                ],
+            ),
+            (
+                "resident-model",
+                "bench_resident_model_variant",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/fp8-qkv-sm120.txt",
+                    "qual/baselines/fp8-gdn-input-sm120.txt",
+                    "qual/baselines/fp8-lm-head-sm120.txt",
+                    "qual/baselines/fp8-swiglu-sm120.txt",
+                    "qual/baselines/fp8-down-sm120.txt",
+                    "qual/baselines/nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/nvfp4-down-sm120.txt",
+                    "qual/baselines/gdn-prepare-sm120.txt",
+                    "qual/baselines/gdn-recurrence-sm120.txt",
+                    "qual/baselines/gdn-state-snapshot-sm120.txt",
+                    "qual/baselines/gdn-output-sm120.txt",
+                    "qual/baselines/attention-qk-prepare-sm120.txt",
+                    "qual/baselines/paged-gqa-sm120.txt",
+                    "qual/baselines/long-context-paged-gqa-sm120.txt",
+                    "qual/baselines/attention-output-sm120.txt",
+                ],
+            ),
+            (
+                "resident-prefill",
+                "bench_resident_model_variant",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/fp8-qkv-sm120.txt",
+                    "qual/baselines/fp8-gdn-input-sm120.txt",
+                    "qual/baselines/fp8-lm-head-sm120.txt",
+                    "qual/baselines/fp8-swiglu-sm120.txt",
+                    "qual/baselines/fp8-down-sm120.txt",
+                    "qual/baselines/nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/nvfp4-down-sm120.txt",
+                    "qual/baselines/gdn-prepare-sm120.txt",
+                    "qual/baselines/gdn-recurrence-sm120.txt",
+                    "qual/baselines/gdn-state-snapshot-sm120.txt",
+                    "qual/baselines/gdn-output-sm120.txt",
+                    "qual/baselines/attention-qk-prepare-sm120.txt",
+                    "qual/baselines/paged-gqa-sm120.txt",
+                    "qual/baselines/long-context-paged-gqa-sm120.txt",
+                    "qual/baselines/attention-output-sm120.txt",
+                ],
+            ),
+            (
+                "resident-long-context-model",
+                "bench_resident_model_variant",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/fp8-qkv-sm120.txt",
+                    "qual/baselines/fp8-gdn-input-sm120.txt",
+                    "qual/baselines/fp8-lm-head-sm120.txt",
+                    "qual/baselines/fp8-swiglu-sm120.txt",
+                    "qual/baselines/fp8-down-sm120.txt",
+                    "qual/baselines/nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/nvfp4-down-sm120.txt",
+                    "qual/baselines/gdn-prepare-sm120.txt",
+                    "qual/baselines/gdn-recurrence-sm120.txt",
+                    "qual/baselines/gdn-state-snapshot-sm120.txt",
+                    "qual/baselines/gdn-output-sm120.txt",
+                    "qual/baselines/attention-qk-prepare-sm120.txt",
+                    "qual/baselines/paged-gqa-sm120.txt",
+                    "qual/baselines/long-context-paged-gqa-sm120.txt",
+                    "qual/baselines/attention-output-sm120.txt",
+                ],
+            ),
+            (
+                "text-endpoint",
+                "bench_text_endpoint",
+                &[
+                    "qual/baselines/residual-norm-sm120.txt",
+                    "qual/baselines/fp8-lm-head-sm120.txt",
+                ],
+            ),
+            (
+                "qwen35-text-endpoint",
+                "bench_qwen35_text_endpoint",
+                &[
+                    "qual/baselines/qwen35-residual-norm-sm120.txt",
+                    "qual/baselines/qwen35-bf16-lm-head-sm120.txt",
+                ],
+            ),
+            (
+                "qwen36-text-endpoint",
+                "bench_qwen36_text_endpoint",
+                &[
+                    "qual/baselines/qwen36-residual-norm-sm120.txt",
+                    "qual/baselines/qwen36-nvfp4-lm-head-sm120.txt",
+                ],
+            ),
+            (
+                "qwen35-resident-model",
+                "bench_qwen35_resident_model",
+                &[
+                    "qual/baselines/qwen35-residual-norm-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-down-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-qkv-sm120.txt",
+                    "qual/baselines/qwen35-bf16-lm-head-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-gdn-input-sm120.txt",
+                    "qual/baselines/qwen35-gdn-prepare-sm120.txt",
+                    "qual/baselines/qwen35-gdn-recurrence-sm120.txt",
+                    "qual/baselines/qwen35-nvfp4-attention-output-sm120.txt",
+                    "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",
+                    "qual/baselines/qwen35-paged-gqa-sm120.txt",
+                ],
+            ),
+            (
+                "qwen36-resident-model",
+                "bench_qwen36_resident_model",
+                &[
+                    "qual/baselines/qwen36-residual-norm-sm120.txt",
+                    "qual/baselines/qwen36-gdn-input-sm120.txt",
+                    "qual/baselines/qwen35-gdn-prepare-sm120.txt",
+                    "qual/baselines/qwen35-gdn-recurrence-sm120.txt",
+                    "qual/baselines/qwen36-gdn-output-sm120.txt",
+                    "qual/baselines/qwen36-moe-router-sm120.txt",
+                    "qual/baselines/qwen36-moe-experts-sm120.txt",
+                    "qual/baselines/qwen36-fp8-qkv-sm120.txt",
+                    "qual/baselines/qwen36-attention-qk-prepare-sm120.txt",
+                    "qual/baselines/qwen36-paged-gqa-sm120.txt",
+                    "qual/baselines/qwen36-attention-output-sm120.txt",
+                    "qual/baselines/qwen36-nvfp4-lm-head-sm120.txt",
+                ],
+            ),
+        ];
+        assert_eq!(LEGACY_BENCH_CALL_SITES.len(), 54);
+        assert_eq!(BENCH_DEVICE_BASELINES.len(), 54);
+
+        let executable =
+            Path::new("/repository/target/cuda-oxide-build-sm120/release/bench-device");
+        let arguments = [
+            std::ffi::OsString::from("/snapshot"),
+            std::ffi::OsString::from("--batch"),
+            std::ffi::OsString::from("8"),
+        ];
+
+        for &(suite, function, legacy_paths) in LEGACY_BENCH_CALL_SITES {
+            // The suite the converted call site names must resolve to exactly the
+            // files its legacy body concatenated, in the same order.
+            assert_eq!(
+                bench_device_baselines(suite).unwrap(),
+                legacy_paths,
+                "{function} baseline paths"
+            );
+
+            let mut baselines = Vec::new();
+            for path in legacy_paths {
+                baselines.extend_from_slice(path.as_bytes());
+            }
+            let baseline_hash = sha256(&baselines);
+            let command = bench_device_command(executable, suite, &arguments, &baseline_hash);
+
+            assert_eq!(command.get_program(), executable.as_os_str(), "{function}");
+
+            let mut legacy_argv = vec![OsStr::new(suite)];
+            legacy_argv.extend(arguments.iter().map(std::ffi::OsString::as_os_str));
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                legacy_argv,
+                "{function} argv"
+            );
+
+            assert_eq!(
+                command.get_envs().collect::<Vec<_>>(),
+                vec![(
+                    OsStr::new("TUISKO_GENERATOR_BASELINE_SHA256"),
+                    Some(OsStr::new(baseline_hash.as_str())),
+                )],
+                "{function} environment"
+            );
+        }
+
+        // An undeclared suite must fail loudly rather than hash nothing.
+        assert!(bench_device_baselines("no-such-suite").is_err());
+
+        // The hashed input is the baseline file contents concatenated in the
+        // declared order, so a reordered list must not hash equal.
+        let root =
+            std::env::temp_dir().join(format!("xtask-bench-baselines-{}", std::process::id()));
+        fs::create_dir_all(root.join("qual/baselines")).unwrap();
+        fs::write(root.join("qual/baselines/first.txt"), b"alpha").unwrap();
+        fs::write(root.join("qual/baselines/second.txt"), b"beta").unwrap();
+        let forward = ["qual/baselines/first.txt", "qual/baselines/second.txt"];
+        let reversed = ["qual/baselines/second.txt", "qual/baselines/first.txt"];
+        assert_eq!(
+            concatenated_resource_baselines(&root, &forward).unwrap(),
+            b"alphabeta"
+        );
+        assert_eq!(
+            concatenated_resource_baselines(&root, &reversed).unwrap(),
+            b"betaalpha"
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 }
