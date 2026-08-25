@@ -79,7 +79,7 @@ pub struct Qwen36FullAttentionLayerQualification {
     pub arena_bytes: usize,
     /// Exact source-backed device weight bytes.
     pub weight_bytes: usize,
-    /// Exact represented BF16 cache bytes.
+    /// Exact represented E4M3 cache bytes.
     pub cache_bytes: usize,
     /// Exact address-stable non-cache workspace bytes.
     pub workspace_bytes: usize,
@@ -385,6 +385,7 @@ fn verify_scales(
         source.attention.qkv_weight_scales[2],
         source.attention.output.input_scale,
         source.attention.output.weight_scale,
+        Qwen36Moe35B::FP8_CACHE_SCALE,
         source.moe.shared_expert.gate_up_weight_scales_2[0],
         source.moe.shared_expert.down_weight_scales_2[0],
         Qwen36Moe35B::RMS_NORM_EPSILON,
@@ -525,16 +526,30 @@ fn verify_attention(
             &key_norm,
         );
         let page = head * ATTENTION_PAGE_SIZE * HEAD_DIM;
-        let expected = normalized.into_iter().map(f32_to_bf16).collect::<Vec<_>>();
+        let expected = normalized
+            .into_iter()
+            .map(|value| {
+                encode_e4m3fn(value / Qwen36Moe35B::FP8_CACHE_SCALE)
+                    .map_err(Qwen36FullAttentionLayerQualificationError::Mismatch)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         compare_exact(
             "represented key cache",
             &observed.key_pages[page..page + HEAD_DIM],
             &expected,
         )?;
+        let expected = observed.qkv
+            [value_begin + head * HEAD_DIM..value_begin + (head + 1) * HEAD_DIM]
+            .iter()
+            .map(|&bits| {
+                encode_e4m3fn(bf16_to_f32(bits) / Qwen36Moe35B::FP8_CACHE_SCALE)
+                    .map_err(Qwen36FullAttentionLayerQualificationError::Mismatch)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         compare_exact(
             "represented value cache",
             &observed.value_pages[page..page + HEAD_DIM],
-            &observed.qkv[value_begin + head * HEAD_DIM..value_begin + (head + 1) * HEAD_DIM],
+            &expected,
         )?;
     }
 
@@ -543,7 +558,10 @@ fn verify_attention(
         let kv_head = head / (QUERY_HEADS / KV_HEADS);
         let gate_begin = head * 2 * HEAD_DIM + HEAD_DIM;
         for dimension in 0..HEAD_DIM {
-            let value = bf16_to_f32(observed.qkv[value_begin + kv_head * HEAD_DIM + dimension]);
+            let cache = cache_offset(0, kv_head, 0, dimension);
+            let value = decode_e4m3fn(observed.value_pages[cache])
+                .map_err(Qwen36FullAttentionLayerQualificationError::Mismatch)?
+                * Qwen36Moe35B::FP8_CACHE_SCALE;
             let gate = bf16_to_f32(observed.qkv[gate_begin + dimension]);
             gated[head * HEAD_DIM + dimension] = value / (1.0 + (-gate).exp());
         }
@@ -1329,8 +1347,8 @@ mod tests {
         assert_eq!(ATTENTION_PAGE_SIZE, 64);
         assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]);
         assert_eq!(
-            2 * 24 * KV_HEADS * ATTENTION_PAGE_SIZE * HEAD_DIM * 2,
-            3_145_728
+            2 * 24 * KV_HEADS * ATTENTION_PAGE_SIZE * HEAD_DIM,
+            1_572_864
         );
     }
 
@@ -1347,9 +1365,9 @@ mod tests {
 
         assert_eq!(report.boundary_values, 2_662_400);
         assert_eq!(report.weight_bytes, 483_085_312);
-        assert_eq!(report.cache_bytes, 3_145_728);
+        assert_eq!(report.cache_bytes, 1_572_864);
         assert_eq!(report.workspace_bytes, 18_587_584);
-        assert_eq!(report.arena_bytes, 504_819_456);
+        assert_eq!(report.arena_bytes, 503_246_592);
         assert_eq!(report.padding_bytes, 832);
         assert!(report.source_values > 0);
         assert!(report.graph_replay_values > 0);

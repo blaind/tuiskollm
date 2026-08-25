@@ -201,6 +201,8 @@ impl Arch for Qwen35_9B {
 pub struct Qwen36Moe35B;
 
 impl Qwen36Moe35B {
+    /// Unit cache scale selected by the checkpoint's constant-amax E4M3 cast recipe.
+    pub const FP8_CACHE_SCALE: f32 = 1.0;
     /// Maximum text position admitted by the pinned config.
     pub const MAX_POSITION_EMBEDDINGS: usize = 262_144;
     /// Routed experts owned by every decoder layer.
@@ -433,6 +435,7 @@ mod tests {
             assert!(!A::MTP_USES_DEDICATED_EMBEDDINGS);
         }
         assert_eq!(A::RMS_NORM_EPSILON, 1.0e-6);
+        assert_eq!(A::FP8_CACHE_SCALE.to_bits(), 1.0f32.to_bits());
     }
 
     #[test]
