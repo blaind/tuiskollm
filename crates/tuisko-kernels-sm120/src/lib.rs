@@ -22,6 +22,7 @@ mod qwen36_attention_output;
 mod qwen36_fp8_qkv;
 mod qwen36_gdn_input;
 mod qwen36_gdn_output;
+mod qwen36_mtp_bf16_moe;
 mod qwen36_nvfp4_lm_head;
 mod residual_norm;
 
@@ -64,6 +65,7 @@ pub use qwen36_attention_output::Qwen36AttentionOutputOp;
 pub use qwen36_fp8_qkv::Qwen36Fp8QkvOp;
 pub use qwen36_gdn_input::Qwen36GdnInputOp;
 pub use qwen36_gdn_output::Qwen36GdnOutputOp;
+pub use qwen36_mtp_bf16_moe::Qwen36MtpBf16MoeOp;
 pub use qwen36_nvfp4_lm_head::Qwen36Nvfp4LmHeadOp;
 pub use residual_norm::{Qwen35ResidualNormOp, Qwen36ResidualNormOp, ResidualNormOp};
 
