@@ -41,7 +41,8 @@ impl Qwen35MtpPromptRoute {
 pub struct Qwen35ResidentMtpProgram {
     // Drop cross-owner graphs before every allocation and module they retain.
     draft_graphs: [CudaGraph; MAX_BATCH],
-    continue_draft_graph: CudaGraph,
+    staged_draft_graphs: [CudaGraph; MAX_BATCH],
+    continue_draft_graphs: [CudaGraph; MAX_BATCH],
     prompt_graphs: [CudaGraph; PROMPT_ROUTES.len()],
     mtp: Qwen35MtpLayerProgram,
     target: Qwen35ResidentModelProgram,
@@ -72,14 +73,14 @@ impl Qwen35ResidentMtpProgram {
         let embedding_stager =
             PinnedHostBuffer::zeroed(context, 128 * Qwen35_9B::HIDDEN).map_err(GpuError::from)?;
         let draft_graphs = capture_draft_routes(&stream, &target, &mtp)?;
-        let continue_draft_graph = CudaGraph::capture(&stream, || {
-            launch_draft(&stream, 1, &target, &mtp, mtp.residual_output_address()?)
-        })?;
+        let staged_draft_graphs = capture_staged_draft_routes(&stream, &target, &mtp)?;
+        let continue_draft_graphs = capture_continue_draft_routes(&stream, &target, &mtp)?;
         let prompt_graphs = capture_prompt_routes(&stream, &target, &mtp)?;
 
         Ok(Self {
             draft_graphs,
-            continue_draft_graph,
+            staged_draft_graphs,
+            continue_draft_graphs,
             prompt_graphs,
             mtp,
             target,
@@ -121,6 +122,49 @@ impl Qwen35ResidentMtpProgram {
         self.target.load_slot_routes(stream, slots)?;
         self.target
             .load_decode_state(stream, positions.len(), positions, rope_cos, rope_sin)?;
+        self.mtp
+            .load_compact_draft_state(stream, positions, slots, rope_cos, rope_sin)
+    }
+
+    /// Stages compact draft rows from explicit prior target-conditioned hidden values.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_continuation_draft(
+        &mut self,
+        stream: &CudaStream,
+        token_ids: &[u32],
+        target_hidden: &[u16],
+        positions: &[u32],
+        slots: &[usize],
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> EngineResult<()> {
+        require_rows(token_ids.len())?;
+        self.require_active_positions(positions, slots)?;
+        if token_ids.len() != slots.len() {
+            return Err(EngineError::layout(format!(
+                "Qwen3.5 MTP continuation has {} tokens and {} slots",
+                token_ids.len(),
+                slots.len()
+            )));
+        }
+        let values = token_ids
+            .len()
+            .checked_mul(Qwen35_9B::HIDDEN)
+            .ok_or_else(|| EngineError::layout("Qwen3.5 MTP continuation input overflows"))?;
+        if target_hidden.len() != values {
+            return Err(EngineError::layout(format!(
+                "Qwen3.5 MTP continuation hidden plane has {} values, expected {values}",
+                target_hidden.len()
+            )));
+        }
+        self.target
+            .gather_embedding_rows(token_ids, &mut self.embedding_stager[..values])?;
+        self.mtp.load_inputs(
+            stream,
+            token_ids.len(),
+            &self.embedding_stager[..values],
+            target_hidden,
+        )?;
         self.mtp
             .load_compact_draft_state(stream, positions, slots, rope_cos, rope_sin)
     }
@@ -174,10 +218,24 @@ impl Qwen35ResidentMtpProgram {
         Ok(())
     }
 
+    /// Replays a compact draft from explicitly uploaded target-hidden rows.
+    pub(crate) fn replay_staged_draft(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+    ) -> EngineResult<()> {
+        require_rows(batch)?;
+        // SAFETY: staging populated the retained MTP target-hidden plane captured here.
+        unsafe { self.staged_draft_graphs[batch - 1].launch(stream) }?;
+
+        Ok(())
+    }
+
     /// Continues one singleton proposal from the preceding MTP residual boundary.
-    pub fn replay_continue_draft(&self, stream: &CudaStream) -> EngineResult<()> {
-        // SAFETY: the graph reads and then replaces planes in this retained MTP owner.
-        unsafe { self.continue_draft_graph.launch(stream) }?;
+    pub fn replay_continue_draft(&self, stream: &CudaStream, batch: usize) -> EngineResult<()> {
+        require_rows(batch)?;
+        // SAFETY: the graph reads and then replaces compact planes in this retained MTP owner.
+        unsafe { self.continue_draft_graphs[batch - 1].launch(stream) }?;
 
         Ok(())
     }
@@ -299,6 +357,16 @@ impl Qwen35ResidentMtpProgram {
     /// Reads active MTP residual rows for accepted-prefix realignment.
     pub fn read_mtp_residuals(&self, stream: &CudaStream, rows: usize) -> EngineResult<Vec<u16>> {
         self.mtp.read_residual_output(stream, rows)
+    }
+
+    pub(crate) fn read_mtp_residuals_into(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        self.mtp
+            .read_residual_output_into(stream, rows, destination)
     }
 
     pub(crate) fn target(&self) -> &Qwen35ResidentModelProgram {
@@ -724,6 +792,43 @@ fn capture_draft_routes(
     }
     graphs.try_into().map_err(|_| {
         EngineError::layout("Qwen3.5 resident MTP draft graph inventory is incomplete")
+    })
+}
+
+fn capture_continue_draft_routes(
+    stream: &CudaStream,
+    target: &Qwen35ResidentModelProgram,
+    mtp: &Qwen35MtpLayerProgram,
+) -> EngineResult<[CudaGraph; MAX_BATCH]> {
+    // Continuing proposals previously used a B=1 graph once per lane. The
+    // exact B=1..8 graphs retain the same per-row MTP arithmetic while sharing
+    // one launch and one LM-head weight pass across compact active rows.
+    let target_hidden = mtp.residual_output_address()?;
+    let mut graphs = Vec::with_capacity(MAX_BATCH);
+    for batch in 1..=MAX_BATCH {
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_draft(stream, batch, target, mtp, target_hidden)
+        })?);
+    }
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("Qwen3.5 resident MTP continuation inventory is incomplete")
+    })
+}
+
+fn capture_staged_draft_routes(
+    stream: &CudaStream,
+    target: &Qwen35ResidentModelProgram,
+    mtp: &Qwen35MtpLayerProgram,
+) -> EngineResult<[CudaGraph; MAX_BATCH]> {
+    let target_hidden = mtp.target_hidden_address()?;
+    let mut graphs = Vec::with_capacity(MAX_BATCH);
+    for batch in 1..=MAX_BATCH {
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_draft(stream, batch, target, mtp, target_hidden)
+        })?);
+    }
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("Qwen3.5 resident MTP staged-draft inventory is incomplete")
     })
 }
 

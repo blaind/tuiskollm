@@ -790,6 +790,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen35-resident-model") => qualify_qwen35_resident_model(root, &remaining),
         Some("qualify-qwen35-resident-mtp") => qualify_qwen35_resident_mtp(root, &remaining),
         Some("qualify-qwen35-mtp-generation") => qualify_qwen35_mtp_generation(root, &remaining),
+        Some("qualify-qwen35-mtp-batch-generation") => {
+            qualify_qwen35_mtp_batch_generation(root, &remaining)
+        }
         Some("qualify-qwen35-generation") => qualify_qwen35_generation(root, &remaining),
         Some("qualify-qwen35-long-context-kv") if remaining.is_empty() => {
             qualify_qwen35_long_context_kv(root)
@@ -940,6 +943,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("bench-resident-mtp") => bench_resident_mtp(root, &remaining),
         Some("bench-qwen35-resident-mtp") => bench_qwen35_resident_mtp(root, &remaining),
         Some("bench-qwen35-mtp-generation") => bench_qwen35_mtp_generation(root, &remaining),
+        Some("bench-qwen35-mtp-batch-generation") => {
+            bench_qwen35_mtp_batch_generation(root, &remaining)
+        }
         Some("bench-generation-mtp-greedy") => bench_generation_mtp_greedy(root, &remaining),
         Some("bench-generation-mtp-sampling") => bench_generation_mtp_sampling(root, &remaining),
         Some("bench-generation-mtp-batch") => bench_generation_mtp_batch(root, &remaining),
@@ -2287,6 +2293,52 @@ fn qualify_qwen35_mtp_generation(
             "--lib",
             "--",
             "qwen35_mtp_generation::tests",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
+        Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_qwen35_residual_norm(root)?;
+    gate_qwen35_nvfp4_swiglu(root)?;
+    gate_qwen35_nvfp4_down(root)?;
+    gate_qwen35_nvfp4_qkv(root)?;
+    gate_qwen35_bf16_lm_head(root)?;
+    gate_qwen35_nvfp4_gdn_input(root)?;
+    gate_qwen35_gdn_prepare(root)?;
+    gate_qwen35_gdn_recurrence(root)?;
+    gate_qwen35_attention_qk_prepare(root)?;
+    gate_qwen35_paged_gqa(root)?;
+    gate_qwen35_nvfp4_attention_output(root)?;
+    gate_qwen35_mtp_resources(root)
+}
+
+fn qualify_qwen35_mtp_batch_generation(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err(
+            "usage: cargo run -p xtask -- qualify-qwen35-mtp-batch-generation SNAPSHOT".into(),
+        );
+    };
+    run_oxide_with_env(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen35_mtp_batch_generation::tests",
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
@@ -5148,6 +5200,43 @@ fn bench_qwen35_mtp_generation(
     run_visible(
         Command::new(executable)
             .arg("qwen35-mtp-generation")
+            .arg(snapshot)
+            .args(options)
+            .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),
+    )
+}
+
+fn bench_qwen35_mtp_batch_generation(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-qwen35-mtp-batch-generation SNAPSHOT [options]"
+                .into(),
+        );
+    };
+    build_sm120_for_performance(root)?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-device");
+    if !executable.is_file() {
+        return Err(format!(
+            "benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut baselines = Vec::new();
+    for baseline in QWEN35_RESIDENT_MODEL_RESOURCE_BASELINES
+        .iter()
+        .chain(QWEN35_MTP_LAYER_RESOURCE_BASELINES)
+    {
+        baselines.extend_from_slice(&fs::read(root.join(baseline))?);
+    }
+    run_visible(
+        Command::new(executable)
+            .arg("qwen35-mtp-batch-generation")
             .arg(snapshot)
             .args(options)
             .env("TUISKO_GENERATOR_BASELINE_SHA256", sha256(&baselines)),

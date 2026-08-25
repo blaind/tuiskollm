@@ -155,6 +155,10 @@ mod qwen35_generation;
 #[cfg(feature = "device")]
 mod qwen35_long_context_kv;
 #[cfg(feature = "device")]
+mod qwen35_mtp_batch_generation;
+#[cfg(feature = "device")]
+mod qwen35_mtp_batch_generation_benchmark;
+#[cfg(feature = "device")]
 mod qwen35_mtp_generation;
 #[cfg(feature = "device")]
 mod qwen35_mtp_generation_benchmark;
@@ -508,6 +512,13 @@ pub use qwen35_generation::{
     Qwen35GenerationQualificationError, qualify_qwen35_compact_generation,
     qualify_qwen35_generation,
 };
+#[cfg(feature = "device")]
+pub use qwen35_mtp_batch_generation::{
+    Qwen35MtpBatchQualification, Qwen35MtpBatchQualificationError,
+    qualify_qwen35_mtp_batch_generation,
+};
+#[cfg(feature = "device")]
+pub use qwen35_mtp_batch_generation_benchmark::benchmark_qwen35_mtp_batch_generation;
 #[cfg(feature = "device")]
 pub use qwen35_mtp_generation::{
     Qwen35MtpGenerationQualification, Qwen35MtpGenerationQualificationError,

@@ -22,12 +22,12 @@ use tuisko_qual::{
     benchmark_mtp_layer, benchmark_mtp_prompt_prime, benchmark_nvfp4_mlp, benchmark_paged_gqa,
     benchmark_qwen35_attention_qk_prepare, benchmark_qwen35_full_attention_layer,
     benchmark_qwen35_gdn_layer, benchmark_qwen35_gdn_prepare, benchmark_qwen35_gdn_recurrence,
-    benchmark_qwen35_mtp_generation, benchmark_qwen35_mtp_layer,
-    benchmark_qwen35_nvfp4_attention_output, benchmark_qwen35_nvfp4_down,
-    benchmark_qwen35_nvfp4_gdn_input, benchmark_qwen35_nvfp4_gdn_output,
-    benchmark_qwen35_nvfp4_mlp, benchmark_qwen35_nvfp4_qkv, benchmark_qwen35_nvfp4_swiglu,
-    benchmark_qwen35_paged_gqa, benchmark_qwen35_resident_model, benchmark_qwen35_resident_mtp,
-    benchmark_qwen35_residual_norm, benchmark_qwen35_text_endpoint,
+    benchmark_qwen35_mtp_batch_generation, benchmark_qwen35_mtp_generation,
+    benchmark_qwen35_mtp_layer, benchmark_qwen35_nvfp4_attention_output,
+    benchmark_qwen35_nvfp4_down, benchmark_qwen35_nvfp4_gdn_input,
+    benchmark_qwen35_nvfp4_gdn_output, benchmark_qwen35_nvfp4_mlp, benchmark_qwen35_nvfp4_qkv,
+    benchmark_qwen35_nvfp4_swiglu, benchmark_qwen35_paged_gqa, benchmark_qwen35_resident_model,
+    benchmark_qwen35_resident_mtp, benchmark_qwen35_residual_norm, benchmark_qwen35_text_endpoint,
     benchmark_qwen36_attention_output, benchmark_qwen36_attention_qk_prepare,
     benchmark_qwen36_fp8_qkv, benchmark_qwen36_full_attention_layer, benchmark_qwen36_gdn_input,
     benchmark_qwen36_gdn_moe_layer, benchmark_qwen36_gdn_output, benchmark_qwen36_gdn_prepare,
@@ -228,6 +228,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                 parse_options(arguments, DeviceBenchmarkOptions::resident_model())?;
             (
                 benchmark_qwen35_mtp_generation(&PathBuf::from(snapshot), options)?,
+                json_path,
+            )
+        }
+        #[cfg(feature = "device")]
+        "qwen35-mtp-batch-generation" => {
+            let snapshot = arguments
+                .next()
+                .ok_or("qwen35-mtp-batch-generation requires the admitted snapshot path")?;
+            let (options, json_path) =
+                parse_options(arguments, DeviceBenchmarkOptions::resident_model())?;
+            (
+                benchmark_qwen35_mtp_batch_generation(&PathBuf::from(snapshot), options)?,
                 json_path,
             )
         }
