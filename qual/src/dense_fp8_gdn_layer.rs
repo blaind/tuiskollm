@@ -122,13 +122,17 @@ pub fn qualify_dense_fp8_gdn_layer(
         )));
     }
     if program.resident_weight_bytes() != 383_949_248
-        || program.workspace_bytes() != 247_316_512
-        || program.arena_bytes() != 631_266_304
+        || program.workspace_bytes() != 272_482_336
+        || program.arena_bytes() != 656_432_128
         || program.descriptor_bytes() != 512
     {
-        return Err(DenseFp8GdnLayerQualificationError::Mismatch(
-            "owner byte accounting differs from the admitted layout".to_string(),
-        ));
+        return Err(DenseFp8GdnLayerQualificationError::Mismatch(format!(
+            "owner byte accounting differs from the admitted layout: weights {} workspace {} arena {} descriptors {}",
+            program.resident_weight_bytes(),
+            program.workspace_bytes(),
+            program.arena_bytes(),
+            program.descriptor_bytes(),
+        )));
     }
     let mut report = DenseFp8GdnLayerQualification {
         boundary_values: 0,
@@ -969,9 +973,9 @@ mod tests {
         );
         assert_eq!(report.immutable_descriptor_words, 768);
         assert_eq!(report.resident_weight_bytes, 383_949_248);
-        assert_eq!(report.workspace_bytes, 247_316_512);
-        assert_eq!(report.owner_bytes, 631_265_760);
-        assert_eq!(report.arena_bytes, 631_266_304);
+        assert_eq!(report.workspace_bytes, 272_482_336);
+        assert_eq!(report.owner_bytes, 656_431_584);
+        assert_eq!(report.arena_bytes, 656_432_128);
         assert_eq!(report.padding_bytes, 544);
         assert_eq!(report.descriptor_bytes, 512);
         assert!(report.maximum_absolute_error.is_finite());
