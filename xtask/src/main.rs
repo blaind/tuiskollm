@@ -3285,7 +3285,28 @@ fn qualify_qwen36_fp8_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             "--nocapture",
             "--test-threads=1",
         ],
-    )
+    )?;
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "bf16_paged_gqa_benchmark::tests::qwen36_fp8_",
+            "--nocapture",
+        ],
+    )?;
+    gate_qwen36_fp8_paged_gqa(root)
 }
 
 fn qualify_qwen35_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -10723,7 +10744,7 @@ fn gate_mtp_bf16_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
 
         let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
-        for instruction in ["LDGSTS", "SHFL.BFLY", "MUFU.EX2"] {
+        for instruction in ["LDG.E.U16", "SHFL.BFLY", "MUFU.EX2"] {
             if !body.contains(instruction) {
                 return Err(
                     format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),

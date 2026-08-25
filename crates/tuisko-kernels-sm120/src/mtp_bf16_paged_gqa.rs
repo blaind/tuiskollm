@@ -1,7 +1,8 @@
 //! Source-BF16 paged grouped-query attention for admitted MTP layers.
 
 use crate::device::paged_gqa::{
-    DECODE_SHARED_VALUES, DECODE_THREADS, bf16_paged_gqa, bf16_paged_gqa_partitioned,
+    DECODE_RING_SHARED_BYTES, DECODE_SHARED_VALUES, DECODE_THREADS, bf16_paged_gqa,
+    bf16_paged_gqa_partitioned,
 };
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
@@ -71,7 +72,8 @@ mod kernels {
         domain = 1,
         coordinates = u32,
         block = (32, 1, 1),
-        dynamic_shared = 0,
+        dynamic_shared = 8192,
+        dynamic_shared_alignment = 16,
         min_compute_capability = (12, 0),
     )]
     pub fn qwen35_mtp_bf16_paged_gqa<const TOKENS: usize>(
@@ -119,7 +121,7 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
                 .prepare_qwen35_mtp_bf16_paged_gqa::<TOKENS>(LaunchConfig1D::new(
                     blocks,
                     QWEN35_THREADS,
-                    0,
+                    DECODE_RING_SHARED_BYTES as u32,
                 ))
                 .map_err(|source| {
                     GpuError::launch("preparing Qwen3.5 MTP BF16 paged GQA", source)
