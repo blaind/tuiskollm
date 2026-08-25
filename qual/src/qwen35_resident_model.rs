@@ -738,7 +738,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn samples_cover_exact_boundaries() {
+    fn qwen35_resident_model_suite_samples_cover_exact_boundaries() {
         assert_eq!(sampled_rows()[0], 0);
         assert_eq!(sampled_rows()[LOGIT_SAMPLES - 1], Qwen35_9B::VOCAB - 1);
         assert!(
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the pinned Qwen3.5 snapshot and an exclusive compute-capability 12.0 device"]
-    fn whole_model_matches_endpoint_oracles_and_graph_replay()
+    fn qwen35_resident_model_suite_whole_model_matches_endpoint_oracles_and_graph_replay()
     -> Result<(), Qwen35ResidentModelQualificationError> {
         let root = std::env::var("TUISKO_QWEN35_SNAPSHOT").map_err(|_| {
             Qwen35ResidentModelQualificationError::Mismatch(

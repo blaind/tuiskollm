@@ -410,7 +410,7 @@ mod tests {
     use super::{MAX_BATCH, PREFILL_ROUTES, logical_bytes, prefill_logical_bytes, uses_w4a4};
 
     #[test]
-    fn accounting_covers_every_layer_endpoint_and_route() {
+    fn qwen35_resident_model_suite_benchmark_accounting_covers_every_layer_endpoint_and_route() {
         assert_eq!(logical_bytes(1), 6_061_839_016);
         assert_eq!(logical_bytes(2), 6_191_767_888);
         assert_eq!(logical_bytes(MAX_BATCH), 6_973_405_504);

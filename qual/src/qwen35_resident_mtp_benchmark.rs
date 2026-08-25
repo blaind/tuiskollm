@@ -219,7 +219,7 @@ mod tests {
     use super::{CONTEXT_TOKENS, MAX_BATCH, logical_bytes};
 
     #[test]
-    fn resident_mtp_benchmark_inventory_and_accounting_are_exact() {
+    fn qwen35_resident_mtp_suite_benchmark_inventory_and_accounting_are_exact() {
         assert_eq!(MAX_BATCH, 8);
         assert_eq!(CONTEXT_TOKENS, 131);
         assert_eq!(logical_bytes(1), 2_523_646_208);

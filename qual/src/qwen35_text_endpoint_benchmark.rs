@@ -175,7 +175,7 @@ mod tests {
     use super::{MAX_BATCH, logical_bytes};
 
     #[test]
-    fn byte_accounting_covers_bf16_endpoint_operations() {
+    fn qwen35_text_endpoint_suite_benchmark_accounting_covers_bf16_endpoint_operations() {
         assert_eq!(logical_bytes(1), 2_034_775_048);
         assert_eq!(logical_bytes(MAX_BATCH), 2_038_480_960);
     }

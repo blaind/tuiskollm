@@ -258,7 +258,7 @@ mod tests {
     use super::OUTPUT_TOKENS;
 
     #[test]
-    fn qwen35_mtp_benchmark_uses_one_complete_k4_request() {
+    fn qwen35_mtp_generation_suite_benchmark_uses_one_complete_k4_request() {
         assert_eq!(OUTPUT_TOKENS, 8);
     }
 }

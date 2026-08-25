@@ -313,7 +313,7 @@ fn register_memory(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn qwen35_compact_mtp_benchmark_inventory_is_exact() {
+    fn qwen35_mtp_batch_generation_suite_benchmark_inventory_is_exact() {
         assert_eq!(
             super::selected_batches(None).unwrap(),
             (1..=8).collect::<Vec<_>>()
