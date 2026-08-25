@@ -93,6 +93,7 @@ const MTP_BF16_QKV_RESOURCE_BASELINE: &str = "qual/baselines/mtp-bf16-qkv-sm120.
 const MTP_BF16_QK_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/mtp-bf16-qk-prepare-sm120.txt";
 const MTP_BF16_PAGED_GQA_RESOURCE_BASELINE: &str = "qual/baselines/mtp-bf16-paged-gqa-sm120.txt";
 const QWEN35_MTP_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-mtp-sm120.txt";
+const QWEN36_MTP_RESOURCE_BASELINE: &str = "qual/baselines/qwen36-mtp-sm120.txt";
 const RESIDENT_MODEL_RESOURCE_BASELINES: &[&str] = &[
     RESIDUAL_NORM_RESOURCE_BASELINE,
     FP8_QKV_RESOURCE_BASELINE,
@@ -158,6 +159,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     MTP_BF16_QK_PREPARE_RESOURCE_BASELINE,
     MTP_BF16_PAGED_GQA_RESOURCE_BASELINE,
     QWEN35_MTP_RESOURCE_BASELINE,
+    QWEN36_MTP_RESOURCE_BASELINE,
 ];
 const NVFP4_MLP_RESOURCE_BASELINES: &[&str] = &[
     RESIDUAL_NORM_RESOURCE_BASELINE,
@@ -1074,6 +1076,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("gate-qwen35-mtp-resources") if remaining.is_empty() => {
             gate_qwen35_mtp_resources(root)
         }
+        Some("gate-qwen36-mtp-resources") if remaining.is_empty() => {
+            gate_qwen36_mtp_resources(root)
+        }
         Some("perf") => perf(root, &remaining),
         Some("profile") => profile(root, &remaining),
         Some("remote") => remote::run(root, &remaining),
@@ -1172,6 +1177,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "gate-mtp-bf16-qk-prepare"
                     | "gate-mtp-bf16-paged-gqa"
                     | "gate-qwen35-mtp-resources"
+                    | "gate-qwen36-mtp-resources"
                     | "gate-attention-output"
             ) =>
         {
@@ -1389,7 +1395,9 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_mtp_bf16_mlp(root)?;
     gate_mtp_bf16_qkv(root)?;
     gate_mtp_bf16_qk_prepare(root)?;
-    gate_mtp_bf16_paged_gqa(root)
+    gate_mtp_bf16_paged_gqa(root)?;
+    gate_qwen35_mtp_resources(root)?;
+    gate_qwen36_mtp_resources(root)
 }
 
 fn build_residual_norm(
@@ -2057,7 +2065,8 @@ fn qualify_qwen36_mtp_bf16_attention(
             "--test-threads=1",
         ],
         Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
-    )
+    )?;
+    gate_qwen36_mtp_resources(root)
 }
 
 fn qualify_qwen36_mtp_bf16_moe(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -2082,7 +2091,8 @@ fn qualify_qwen36_mtp_bf16_moe(root: &Path) -> Result<(), Box<dyn Error>> {
             "--nocapture",
             "--test-threads=1",
         ],
-    )
+    )?;
+    gate_qwen36_mtp_resources(root)
 }
 
 fn qualify_qwen35_mtp_bf16_mlp(
@@ -10860,6 +10870,20 @@ fn gate_qwen35_mtp_resources(root: &Path) -> Result<(), Box<dyn Error>> {
         },
     ];
 
+    let entry_count = gate_exact_resource_families(&baseline, &entries, artifact, sass, &families)?;
+    println!(
+        "Qwen3.5 MTP resource gate passed: {entry_count} entries, STACK:0 LOCAL:0, SHARED:1024; launch bounds, BF16 HMMA/cache paths, and register envelopes retained"
+    );
+    Ok(())
+}
+
+fn gate_exact_resource_families(
+    baseline: &Baseline,
+    entries: &[Entry<'_>],
+    artifact: &Sm120GateArtifact,
+    sass: &str,
+    families: &[ExactResourceFamily<'_>],
+) -> Result<usize, Box<dyn Error>> {
     let mut all_shared = Vec::new();
     for family in families {
         let matched = entries
@@ -10917,12 +10941,142 @@ fn gate_qwen35_mtp_resources(root: &Path) -> Result<(), Box<dyn Error>> {
             }
         }
         registers.sort_unstable();
-        require_registers(&baseline, family.register_key, &registers)?;
+        require_registers(baseline, family.register_key, &registers)?;
     }
-    require_uniform_value(&baseline, "shared_bytes", &all_shared)?;
+    require_uniform_value(baseline, "shared_bytes", &all_shared)?;
+    Ok(all_shared.len())
+}
+
+fn gate_qwen36_mtp_resources(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN36_MTP_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+    let ptx = fs::read_to_string(root.join(PTX))?;
+    let entries = parse_entries(&ptx);
+    let artifact = sm120_gate_artifact(root)?;
+    let sass = artifact.sass()?;
+    let bf16_mma_ptx = [
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32",
+        "cvt.rn.bf16x2.f32",
+    ];
+    let bf16_mma_sass = ["HMMA.16816.F32.BF16", "F2FP.BF16.F32.PACK_AB"];
+    let families = [
+        ExactResourceFamily {
+            label: "Qwen3.6 MTP BF16 fusion",
+            prefix: "qwen36_mtp_bf16_fusion_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "fusion_registers",
+            ptx_instructions: &bf16_mma_ptx,
+            sass_instructions: &bf16_mma_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.6 MTP BF16 fusion prefill",
+            prefix: "qwen36_mtp_bf16_fusion_prefill_TID_",
+            count: 3,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "fusion_prefill_registers",
+            ptx_instructions: &bf16_mma_ptx,
+            sass_instructions: &bf16_mma_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.6 MTP BF16 QKV",
+            prefix: "qwen36_mtp_bf16_qkv_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "qkv_registers",
+            ptx_instructions: &bf16_mma_ptx,
+            sass_instructions: &bf16_mma_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.6 MTP BF16 QKV prefill",
+            prefix: "qwen36_mtp_bf16_qkv_prefill_TID_",
+            count: 3,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "qkv_prefill_registers",
+            ptx_instructions: &bf16_mma_ptx,
+            sass_instructions: &bf16_mma_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.6 MTP BF16 attention gate",
+            prefix: "qwen36_mtp_bf16_attention_gate_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "attention_gate_registers",
+            ptx_instructions: &["ex2.approx.f32", "rcp.rn.f32", "st.global.b16"],
+            sass_instructions: &["MUFU.EX2", "MUFU.RCP", "STG.E.U16"],
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.6 MTP BF16 attention output",
+            prefix: "qwen36_mtp_bf16_attention_output_TID_",
+            count: 8,
+            threads: 128,
+            minimum_ctas_per_sm: 4,
+            register_key: "attention_output_registers",
+            ptx_instructions: &bf16_mma_ptx,
+            sass_instructions: &bf16_mma_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.6 MTP BF16 expert gate/up",
+            prefix: "qwen36_mtp_bf16_expert_gate_up_TID_",
+            count: 11,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "expert_gate_up_registers",
+            ptx_instructions: &[
+                "fma.rn.f32",
+                "shfl.sync.down.b32",
+                "ex2.approx.f32",
+                "div.rn.f32",
+                "st.global.b16",
+            ],
+            sass_instructions: &["FFMA", "SHFL.DOWN", "MUFU.EX2", "MUFU.RCP", "STG.E.U16"],
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.6 MTP BF16 expert down",
+            prefix: "qwen36_mtp_bf16_expert_down_TID_",
+            count: 11,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "expert_down_registers",
+            ptx_instructions: &["fma.rn.f32", "shfl.sync.down.b32", "st.global.b16"],
+            sass_instructions: &["FFMA", "SHFL.DOWN", "STG.E.U16"],
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.6 MTP BF16 expert combine",
+            prefix: "qwen36_mtp_bf16_expert_combine_TID_",
+            count: 11,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "expert_combine_registers",
+            ptx_instructions: &[
+                "fma.rn.f32",
+                "ex2.approx.f32",
+                "rcp.rn.f32",
+                "st.global.b16",
+            ],
+            sass_instructions: &["FFMA", "MUFU.EX2", "MUFU.RCP", "STG.E.U16"],
+            forbidden_sass: &[],
+        },
+    ];
+
+    let entry_count = gate_exact_resource_families(&baseline, &entries, artifact, sass, &families)?;
     println!(
-        "Qwen3.5 MTP resource gate passed: {} entries, STACK:0 LOCAL:0, SHARED:1024; launch bounds, BF16 HMMA/cache paths, and register envelopes retained",
-        all_shared.len()
+        "Qwen3.6 MTP resource gate passed: {entry_count} entries, STACK:0 LOCAL:0, SHARED:1024; launch bounds, BF16 tensor/scalar paths, and register envelopes retained"
     );
     Ok(())
 }
@@ -14757,6 +14911,7 @@ mod tests {
                 "qual/baselines/mtp-bf16-qk-prepare-sm120.txt",
                 "qual/baselines/mtp-bf16-paged-gqa-sm120.txt",
                 "qual/baselines/qwen35-mtp-sm120.txt",
+                "qual/baselines/qwen36-mtp-sm120.txt",
             ]
         );
     }
