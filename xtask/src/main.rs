@@ -4,9 +4,6 @@ mod gpu_target;
 mod perf_artifact;
 mod perf_iteration;
 mod performance;
-// The remote runner is a `--features remote` surface; its route table stays
-// compiled under `cfg(test)` so the default host checks still validate it.
-#[cfg(any(feature = "remote", test))]
 mod remote;
 mod server_bench;
 mod server_performance;
@@ -1350,18 +1347,13 @@ const SUBCOMMANDS: &[Subcommand] = &[
     no_args("gate-qwen36-mtp-resources", gate_qwen36_mtp_resources),
     forwarded("perf", perf),
     forwarded("profile", profile),
-    // Billable: the row exists only when the runner is compiled in, so the
-    // table is the compile-time authority on the dispatchable surface.
+    // Billable: the subcommand is real in every build, but only the feature
+    // links the runner. Without it the handler names the flag.
     #[cfg(feature = "remote")]
     forwarded("remote", remote::run),
+    #[cfg(not(feature = "remote"))]
+    forwarded("remote", remote::unavailable),
 ];
-
-/// Command summary for a bare `cargo run -p xtask`. `remote` is named only
-/// when the build carries it.
-#[cfg(feature = "remote")]
-const USAGE: &str = "usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|build-server|qualify-...|bench-...|gate-...|perf|profile|remote>";
-#[cfg(not(feature = "remote"))]
-const USAGE: &str = "usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|build-server|qualify-...|bench-...|gate-...|perf|profile>";
 
 /// Reject arguments a subcommand does not take.
 fn require_no_args(arguments: &[std::ffi::OsString], name: &str) -> Result<(), Box<dyn Error>> {
@@ -1465,7 +1457,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        return Err(USAGE.into());
+        return Err("usage: cargo run -p xtask -- <bootstrap-cuda-oxide|build-sm120|build-server|qualify-...|bench-...|gate-...|perf|profile|remote>".into());
     };
     let remaining = arguments.collect::<Vec<_>>();
     let root = workspace_root()?;
@@ -14639,24 +14631,11 @@ mod tests {
             ("gate-qwen36-mtp-resources", LegacyArm::Guarded),
             ("perf", LegacyArm::Forwarding),
             ("profile", LegacyArm::Forwarding),
-            // The legacy dispatch matched `remote` unconditionally and reported
-            // the missing feature from inside the handler. The row is now
-            // feature-gated, so the two builds have two different correct
-            // answers and each must assert its own.
-            #[cfg(feature = "remote")]
             ("remote", LegacyArm::Forwarding),
         ];
 
-        const LEGACY_LEN: usize = if cfg!(feature = "remote") { 223 } else { 222 };
-        assert_eq!(LEGACY_DISPATCH.len(), LEGACY_LEN);
+        assert_eq!(LEGACY_DISPATCH.len(), 223);
         assert_eq!(SUBCOMMANDS.len(), LEGACY_DISPATCH.len());
-        assert_eq!(
-            SUBCOMMANDS
-                .iter()
-                .any(|subcommand| subcommand.name == "remote"),
-            cfg!(feature = "remote"),
-            "`remote` is dispatchable exactly when the runner is compiled in"
-        );
 
         let names = SUBCOMMANDS
             .iter()
@@ -14699,11 +14678,24 @@ mod tests {
         let error = dispatch(root, OsStr::new("qualify-nothing"), &[]).unwrap_err();
         assert_eq!(error.to_string(), "unknown xtask command `qualify-nothing`");
 
+        // `remote` is one row in both builds; only its handler is
+        // feature-gated. A bare `remote` reaches the runner's own usage when
+        // the feature is on, and otherwise reports the flag it needs. That
+        // message is transcribed from the pre-table handler: a forgotten
+        // `--features remote` must never degrade to `unknown xtask command`.
+        let error = dispatch(root, OsStr::new("remote"), &[]).unwrap_err();
+        #[cfg(feature = "remote")]
+        assert!(
+            error
+                .to_string()
+                .starts_with("usage: cargo run -p xtask --features remote -- remote <"),
+            "`remote` reached {error}"
+        );
         #[cfg(not(feature = "remote"))]
-        {
-            let error = dispatch(root, OsStr::new("remote"), &[]).unwrap_err();
-            assert_eq!(error.to_string(), "unknown xtask command `remote`");
-        }
+        assert_eq!(
+            error.to_string(),
+            "remote execution requires `cargo run -p xtask --features remote -- remote ...`"
+        );
     }
 
     /// Every canonical `bench-device` subcommand must reach the handler that

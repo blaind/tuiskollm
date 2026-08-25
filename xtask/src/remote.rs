@@ -1,9 +1,7 @@
 //! Remote execution of prebuilt device qualification and benchmark artifacts.
 
 use std::error::Error;
-#[cfg(feature = "remote")]
 use std::ffi::OsString;
-#[cfg(feature = "remote")]
 use std::path::Path;
 
 #[cfg(any(feature = "remote", test))]
@@ -562,6 +560,14 @@ fn tuisko_remote_default_image() -> String {
 #[cfg(all(test, not(feature = "remote")))]
 fn tuisko_remote_default_image() -> String {
     "default-image".to_owned()
+}
+
+/// `xtask remote` in a build without the runner. The subcommand is real in
+/// every build, so a forgotten `--features remote` names the flag it needs
+/// instead of being reported as an unknown command.
+#[cfg(not(feature = "remote"))]
+pub fn unavailable(_root: &Path, _arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
+    Err("remote execution requires `cargo run -p xtask --features remote -- remote ...`".into())
 }
 
 #[cfg(feature = "remote")]
