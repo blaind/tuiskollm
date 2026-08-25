@@ -72,6 +72,7 @@ pub use qwen35_gdn_layer_layout::Qwen35GdnLayerLayout;
 pub use qwen35_nvfp4_mlp::Qwen35Nvfp4MlpProgram;
 pub use qwen35_resident_model::{
     Qwen35ResidentLayerKind, Qwen35ResidentModelLayout, Qwen35ResidentModelProgram,
+    Qwen35ResidentPrefillRoute,
 };
 pub use qwen35_text_endpoint::Qwen35TextEndpointProgram;
 pub use qwen35_text_endpoint_layout::Qwen35TextEndpointLayout;
