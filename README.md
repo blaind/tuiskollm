@@ -2,9 +2,10 @@
 
 TuiskoLLM is an exact-target Rust/SM120 inference server for pinned NVFP4 checkpoints on one NVIDIA
 GeForce RTX 5090. The complete product target is `unsloth/Qwen3.8-27B-NVFP4` at revision
-`16b6615af3548b88e2d8e382457bc705b00479cf`. Initial 192-token text routes also admit
-`AxionML/Qwen3.5-9B-NVFP4` at revision `97aef92393f126bf649f310cd40861be8dad3279` and
-`nvidia/Qwen3.6-35B-A3B-NVFP4` at revision `491c2f1ea524c639598bf8fa787a93fed5a6fbce`.
+`16b6615af3548b88e2d8e382457bc705b00479cf`. The compact-MTP text server also admits
+`AxionML/Qwen3.5-9B-NVFP4` at revision `97aef92393f126bf649f310cd40861be8dad3279`.
+An initial 192-token text route admits `nvidia/Qwen3.6-35B-A3B-NVFP4` at revision
+`491c2f1ea524c639598bf8fa787a93fed5a6fbce`.
 
 ## Development
 
@@ -47,10 +48,13 @@ device prefix restored by the resident owner; `bpe-tail` and an optional `miss:`
 separate frontend prefix lookup. Decode throughput excludes the first generated token and the TTFT
 interval. Cancelled, refused, and failed admitted jobs use the same terminal format.
 
-Passing the pinned Qwen3.5 snapshot selects its concrete 32-layer resident program and greedy
-checkpoint defaults once at startup. Eight physical state/cache slots feed exact compact B=1..8
-decode graphs; prompt priming uses the largest exact T=32/64/128 prefix and B=1 for its tail.
-Long-context paging, MTP, and Vision remain outside this route.
+Passing the pinned Qwen3.5 snapshot selects its concrete 32-layer target plus source-BF16 MTP
+program and checkpoint defaults once at startup. Eight stable slots feed exact compact B=1..8
+target graphs. A shared 4,096-page BF16 target pool and separate MTP mirror admit 262,144 rounded
+positions across active and retained requests. Prompt priming uses the largest exact T=32/64/128
+prefix and B=1 for its tail. Singleton speculative rounds use exact K=1..4 target verification;
+concurrent rounds use compact target execution without moving survivor state. Vision remains
+outside this route.
 
 Passing the pinned Qwen3.6 snapshot selects its concrete 40-layer GDN/MoE and attention/MoE text
 program. Prompt priming uses the largest exact T=32/64/128 whole-model prefix and B=1 for its tail.
