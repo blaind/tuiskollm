@@ -32,8 +32,9 @@ use tuisko_kernels_sm120::{
 };
 use tuisko_model::{
     Arch, CheckpointSnapshot, DenseFp8DownBindings, DenseFp8GateUpBindings,
-    FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings, Nvfp4DownBindings,
-    Nvfp4GateUpBindings, Qwen38_27B, TextEndpointBindings, nvfp4_scale_materialization_workers,
+    FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings, NVFP4_MLP_LAYER_END,
+    Nvfp4DownBindings, Nvfp4GateUpBindings, Qwen38_27B, TextEndpointBindings,
+    nvfp4_scale_materialization_workers,
 };
 
 const ROTARY_PAIRS: usize = 32;
@@ -46,7 +47,9 @@ const PREFILL_GRAPH_ROUTE_COUNT: usize = 6;
 const TARGET_VERIFY_ROUTE_COUNT: usize = 4;
 const TARGET_SEGMENTED_BATCH_ROUTES: usize = MAX_BATCH - 1;
 const TARGET_VERIFY_ROWS: usize = MAX_BATCH * TARGET_VERIFY_ROUTE_COUNT;
-const GDN_LAYER_COUNT: usize = 48;
+const GDN_LAYER_COUNT: usize =
+    Qwen38_27B::LAYERS - Qwen38_27B::LAYERS / Qwen38_27B::FULL_ATTENTION_INTERVAL;
+const DENSE_MLP_LAYER_COUNT: usize = Qwen38_27B::LAYERS - NVFP4_MLP_LAYER_END;
 
 /// Exact resident graph selected by one checked decode-state upload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4312,9 +4315,9 @@ impl DenseMlpMaps {
             };
             maps.push(Self { gate_up, down });
         }
-        if maps.len() != 8 {
+        if maps.len() != DENSE_MLP_LAYER_COUNT {
             return Err(EngineError::layout(format!(
-                "resident dense MLP tensor-map inventory has {} layers, expected 8",
+                "resident dense MLP tensor-map inventory has {} layers, expected {DENSE_MLP_LAYER_COUNT}",
                 maps.len()
             )));
         }
@@ -6209,18 +6212,19 @@ fn initialize_selective_nonweights(
         }
     }
 
+    let mut submissions = 0;
     let mut state_rows = vec![0u32; super::MAX_ROWS];
     for (row, state_row) in state_rows.iter_mut().take(MAX_BATCH).enumerate() {
         *state_row = row as u32;
     }
-    upload_region(stream, arena, layout.workspace.state_rows, &state_rows)?;
+    submissions += upload_region(stream, arena, layout.workspace.state_rows, &state_rows)?;
     let mut table_rows = vec![0u32; super::MAX_ROWS];
     for (row, table_row) in table_rows.iter_mut().take(MAX_BATCH).enumerate() {
         *table_row = row as u32;
     }
-    upload_region(stream, arena, layout.workspace.table_rows, &table_rows)?;
+    submissions += upload_region(stream, arena, layout.workspace.table_rows, &table_rows)?;
     let block_tables = vec![u32::MAX; MAX_BATCH * LONG_CONTEXT_PHYSICAL_PAGES];
-    upload_region(
+    submissions += upload_region(
         stream,
         kv_arena,
         layout.kv_layout.block_tables(),
@@ -6229,7 +6233,7 @@ fn initialize_selective_nonweights(
     stream.synchronize().map_err(GpuError::from)?;
     Ok(MetadataUploadStats {
         bytes: plan.host_derived_bytes(),
-        submissions: 3,
+        submissions,
     })
 }
 
@@ -6243,7 +6247,7 @@ fn upload_region<T: DeviceCopy>(
     arena: &mut LoadingDeviceArena,
     region: ArenaRegion<T>,
     source: &[T],
-) -> EngineResult<()> {
+) -> EngineResult<usize> {
     let end = region
         .offset_bytes()
         .checked_add(region.byte_len())
@@ -6251,7 +6255,7 @@ fn upload_region<T: DeviceCopy>(
     // SAFETY: `initialize_selective_nonweights` synchronizes before its local sources can be
     // released, and the loading arena checks the exact destination range.
     unsafe { arena.copy_from_host_async(stream, region.offset_bytes()..end, source)? };
-    Ok(())
+    Ok(1)
 }
 
 fn decode_lengths(positions: &[u32], capacity: usize) -> EngineResult<[u32; MAX_BATCH]> {

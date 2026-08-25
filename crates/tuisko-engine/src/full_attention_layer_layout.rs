@@ -7,11 +7,14 @@ use tuisko_model::Arch;
 
 const ALIGNMENT: usize = 256;
 pub(crate) const PHYSICAL_PAGES: usize = 24;
-pub(crate) const TABLE_STRIDE: usize = 3;
+pub(crate) const TABLE_STRIDE: usize = PHYSICAL_PAGES / MAX_BATCH;
 pub(crate) const CONTEXT_CAPACITY: usize = TABLE_STRIDE * ATTENTION_PAGE_SIZE;
 pub(crate) const PREFILL_TABLE_STRIDE: usize = PHYSICAL_PAGES;
 pub(crate) const PREFILL_CONTEXT_CAPACITY: usize = PREFILL_TABLE_STRIDE * ATTENTION_PAGE_SIZE;
 pub(crate) const MAX_ROWS: usize = 1_024;
+
+const _: () = assert!(MAX_BATCH * TABLE_STRIDE == PHYSICAL_PAGES);
+const _: () = assert!(MAX_ROWS <= PREFILL_CONTEXT_CAPACITY);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FullAttentionLayerRegions {
@@ -133,7 +136,7 @@ impl FullAttentionLayerLayout {
             key_norm: builder.reserve(A::HEAD_DIM, ALIGNMENT)?,
             rope_cos: builder.reserve(MAX_BATCH * 32, ALIGNMENT)?,
             rope_sin: builder.reserve(MAX_BATCH * 32, ALIGNMENT)?,
-            block_tables: builder.reserve(PHYSICAL_PAGES, ALIGNMENT)?,
+            block_tables: builder.reserve(MAX_BATCH * TABLE_STRIDE, ALIGNMENT)?,
             table_rows: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             cache_positions: builder.reserve(MAX_BATCH, ALIGNMENT)?,
             lengths: builder.reserve(MAX_BATCH, ALIGNMENT)?,

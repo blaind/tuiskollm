@@ -249,6 +249,7 @@ impl PagedKvSlotPool {
                 search += 1;
             }
             if search == self.physical_pages {
+                self.release_partial_pages(table_begin, existing_pages, entry);
                 return Err(EngineError::generation(
                     "paged KV free-page accounting disagrees with its owner inventory",
                 ));
@@ -350,6 +351,18 @@ impl PagedKvSlotPool {
             physical_page,
             page_offset: position % ATTENTION_PAGE_SIZE,
         })
+    }
+
+    /// Returns the pages assigned by an aborted reservation, leaving it atomic.
+    fn release_partial_pages(&mut self, table_begin: usize, first_entry: usize, end_entry: usize) {
+        for entry in first_entry..end_entry {
+            let table_index = table_begin + entry;
+            let physical_page = self.page_tables[table_index] as usize;
+            if physical_page < self.physical_pages {
+                self.page_owners[physical_page] = FREE_PAGE_OWNER;
+            }
+            self.page_tables[table_index] = UNUSED_PAGE;
+        }
     }
 
     fn table_row_begin(&self, slot: usize) -> EngineResult<usize> {
