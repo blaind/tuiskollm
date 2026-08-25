@@ -24,7 +24,6 @@ struct RouteGraph {
 
 struct Session<'a> {
     routes: Vec<RouteGraph>,
-    timer: GpuTimer,
     program: MtpPromptPrimeProgram<'a>,
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
@@ -67,10 +66,8 @@ impl<'a> Session<'a> {
                 })
             })
             .collect::<Result<Vec<_>, DeviceBenchmarkError>>()?;
-        let timer = GpuTimer::new(context)?;
         Ok(Self {
             routes,
-            timer,
             program,
             stream: stream.clone(),
             _context: context.clone(),
@@ -183,6 +180,7 @@ pub fn benchmark_mtp_prompt_prime(
     let mut memory = MemoryRecorder::new(&preflight)?;
     let (context, stream, target) = prepare_target(root)?;
     let session = Session::new(&target, &context, &stream, options.launches_per_sample)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     for (name, kind, bytes, description) in [
         (
             "mtp_prompt_prime/target_weights",
@@ -265,7 +263,7 @@ pub fn benchmark_mtp_prompt_prime(
     require_current_process_exclusive()?;
     let cases = session.cases(options.launches_per_sample)?;
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
     finish_report(
         BenchmarkReportSpec {

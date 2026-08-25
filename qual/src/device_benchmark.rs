@@ -1328,7 +1328,7 @@ pub(crate) fn finish_report(
 
 pub(crate) fn measure_cases(
     stream: &CudaStream,
-    timer: &GpuTimer,
+    timer: &mut GpuTimer,
     cases: &[ExactDeviceCase<'_>],
     options: DeviceBenchmarkOptions,
 ) -> Result<
@@ -1486,7 +1486,7 @@ fn selected_cases<'a>(
 
 fn validate_loaded_clock_policy(
     stream: &CudaStream,
-    timer: &GpuTimer,
+    timer: &mut GpuTimer,
     cases: &[ExactDeviceCase<'_>],
 ) -> Result<(), DeviceBenchmarkError> {
     let case = cases
@@ -1578,7 +1578,7 @@ fn loaded_clock_probe_replays(
 
 fn measure_energy(
     stream: &CudaStream,
-    timer: &GpuTimer,
+    timer: &mut GpuTimer,
     cases: &[ExactDeviceCase<'_>],
     device_graph_medians: &[f64],
     target_seconds: f64,

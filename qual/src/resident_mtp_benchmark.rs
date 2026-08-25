@@ -25,7 +25,6 @@ struct RouteGraph {
 
 struct Session {
     routes: Vec<RouteGraph>,
-    timer: GpuTimer,
     program: ResidentMtpProgram,
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
@@ -89,10 +88,8 @@ impl Session {
                 })
             })
             .collect::<Result<Vec<_>, DeviceBenchmarkError>>()?;
-        let timer = GpuTimer::new(&context)?;
         Ok(Self {
             routes,
-            timer,
             program,
             stream,
             _context: context,
@@ -171,6 +168,7 @@ pub fn benchmark_resident_mtp(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(root, options.launches_per_sample)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     let target = session.program.target();
     for (name, kind, bytes, description) in [
         (
@@ -254,7 +252,7 @@ pub fn benchmark_resident_mtp(
     require_current_process_exclusive()?;
     let cases = session.cases(options.launches_per_sample)?;
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
     finish_report(
         BenchmarkReportSpec {

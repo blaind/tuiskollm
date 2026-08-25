@@ -314,7 +314,6 @@ impl BenchPagedGqaOp for Qwen36Fp8PagedGqaOp {
 
 struct Session<O> {
     routes: Vec<RouteGraphs>,
-    timer: GpuTimer,
     _op: O,
     arena: DeviceArena,
     regions: Regions,
@@ -343,11 +342,9 @@ impl<O: BenchPagedGqaOp> Session<O> {
             .iter()
             .map(|&tokens| capture_route(&op, &stream, &addresses, tokens, repeated_operations))
             .collect::<GpuResult<Vec<_>>>()?;
-        let timer = GpuTimer::new(&context)?;
 
         Ok(Self {
             routes,
-            timer,
             _op: op,
             arena,
             regions,
@@ -541,6 +538,7 @@ fn benchmark_target<O: BenchPagedGqaOp>(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::<O>::new(options.launches_per_sample)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     let padding_bytes = session.arena.byte_len() - session.regions.payload_bytes();
     let cache_bytes = session.regions.cache_bytes();
     let workspace_bytes = session.arena.byte_len() - cache_bytes - padding_bytes;
@@ -568,7 +566,7 @@ fn benchmark_target<O: BenchPagedGqaOp>(
     require_current_process_exclusive()?;
     let cases = session.cases(options.launches_per_sample);
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
 
     finish_report(

@@ -16,6 +16,10 @@ pub struct GpuTiming {
 }
 
 /// A reusable pair of timing-enabled CUDA events.
+///
+/// Measurements take `&mut self` because one event pair can only describe one
+/// interval: overlapping or re-entrant measurements would re-record the same
+/// events and report an interval nobody asked for.
 pub struct GpuTimer {
     start: CudaEvent,
     end: CudaEvent,
@@ -36,7 +40,7 @@ impl GpuTimer {
     }
 
     /// Measures only the device work enqueued by `record` on `stream`.
-    pub fn measure<F>(&self, stream: &CudaStream, record: F) -> GpuResult<Duration>
+    pub fn measure<F>(&mut self, stream: &CudaStream, record: F) -> GpuResult<Duration>
     where
         F: FnOnce() -> GpuResult<()>,
     {
@@ -44,7 +48,7 @@ impl GpuTimer {
     }
 
     /// Measures paired host submission, host completion, and CUDA-event time.
-    pub fn measure_with_host<F>(&self, stream: &CudaStream, record: F) -> GpuResult<GpuTiming>
+    pub fn measure_with_host<F>(&mut self, stream: &CudaStream, record: F) -> GpuResult<GpuTiming>
     where
         F: FnOnce() -> GpuResult<()>,
     {

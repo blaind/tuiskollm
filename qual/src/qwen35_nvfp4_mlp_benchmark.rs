@@ -23,7 +23,6 @@ struct RouteGraph {
 
 struct Session {
     routes: Vec<RouteGraph>,
-    timer: GpuTimer,
     program: Qwen35Nvfp4MlpProgram,
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
@@ -55,11 +54,9 @@ impl Session {
                 })
             })
             .collect::<Result<Vec<_>, DeviceBenchmarkError>>()?;
-        let timer = GpuTimer::new(&context)?;
 
         Ok(Self {
             routes,
-            timer,
             program,
             stream,
             _context: context,
@@ -144,6 +141,7 @@ pub fn benchmark_qwen35_nvfp4_mlp(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(root, options.launches_per_sample)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     memory.register_owned(
         "qwen35_9b/nvfp4_mlp/resident_weights",
         BenchmarkMemoryKind::Weights,
@@ -170,7 +168,7 @@ pub fn benchmark_qwen35_nvfp4_mlp(
     require_current_process_exclusive()?;
     let cases = session.cases(options.launches_per_sample)?;
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
 
     finish_report(

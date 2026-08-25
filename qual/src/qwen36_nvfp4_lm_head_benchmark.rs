@@ -21,7 +21,6 @@ struct RouteGraph {
 struct Session {
     arena: DeviceArena,
     routes: Vec<RouteGraph>,
-    timer: GpuTimer,
     regions: Regions,
     stream: Arc<CudaStream>,
     _op: Qwen36Nvfp4LmHeadOp,
@@ -62,12 +61,10 @@ impl Session {
                 })
             })
             .collect::<Result<Vec<_>, DeviceBenchmarkError>>()?;
-        let timer = GpuTimer::new(&context)?;
 
         Ok(Self {
             arena,
             routes,
-            timer,
             regions,
             stream,
             _op: op,
@@ -124,6 +121,7 @@ pub fn benchmark_qwen36_nvfp4_lm_head(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(options.launches_per_sample)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     memory.register_owned(
         "qwen36_35b_a3b/nvfp4_lm_head/weights",
         BenchmarkMemoryKind::Weights,
@@ -148,7 +146,7 @@ pub fn benchmark_qwen36_nvfp4_lm_head(
     require_current_process_exclusive()?;
     let cases = session.cases(options.launches_per_sample);
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
 
     finish_report(

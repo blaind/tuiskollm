@@ -946,8 +946,8 @@ impl ResidentModelProgram {
                 {
                     progress.finish_upload()?;
                 }
-                let arena = arena.seal(&stream)?;
-                let kv_arena = kv_arena.seal(&stream)?;
+                let arena = arena.seal()?;
+                let kv_arena = kv_arena.seal()?;
                 let nonweight_init_ns = elapsed_ns(
                     "resident selective non-weight initialization",
                     nonweight_start,
@@ -5979,8 +5979,7 @@ impl SelectiveWeightSink<'_> {
                 // SAFETY: borrowed upload-plan entries point into the admitted snapshot mmaps;
                 // `ResidentModelProgram` retains that snapshot beyond the final arena seal.
                 unsafe {
-                    self.arena
-                        .copy_from_host_async(stream, offset..end, source)?;
+                    self.arena.copy_from_host_async(offset..end, source)?;
                 }
             }
             ResidentUploadPreparation::GatheredSource
@@ -5988,8 +5987,7 @@ impl SelectiveWeightSink<'_> {
                 // SAFETY: synchronization below completes the copy before its temporary source
                 // can be released by the caller.
                 unsafe {
-                    self.arena
-                        .copy_from_host_async(stream, offset..end, source)?;
+                    self.arena.copy_from_host_async(offset..end, source)?;
                 }
                 stream.synchronize().map_err(GpuError::from)?;
             }
@@ -6290,10 +6288,10 @@ fn initialize_selective_nonweights(
             .ok_or_else(|| EngineError::layout("resident zero destination overflows"))?;
         match entry.arena() {
             ResidentUploadArena::Resident => {
-                arena.fill_async(stream, entry.offset_bytes()..end, 0)?;
+                arena.fill_async(entry.offset_bytes()..end, 0)?;
             }
             ResidentUploadArena::Kv => {
-                kv_arena.fill_async(stream, entry.offset_bytes()..end, 0)?;
+                kv_arena.fill_async(entry.offset_bytes()..end, 0)?;
             }
         }
     }
@@ -6303,19 +6301,14 @@ fn initialize_selective_nonweights(
     for (row, state_row) in state_rows.iter_mut().take(MAX_BATCH).enumerate() {
         *state_row = row as u32;
     }
-    submissions += upload_region(stream, arena, layout.workspace.state_rows, &state_rows)?;
+    submissions += upload_region(arena, layout.workspace.state_rows, &state_rows)?;
     let mut table_rows = vec![0u32; super::resident_model_layout::MAX_ROWS];
     for (row, table_row) in table_rows.iter_mut().take(MAX_BATCH).enumerate() {
         *table_row = row as u32;
     }
-    submissions += upload_region(stream, arena, layout.workspace.table_rows, &table_rows)?;
+    submissions += upload_region(arena, layout.workspace.table_rows, &table_rows)?;
     let block_tables = vec![u32::MAX; MAX_BATCH * LONG_CONTEXT_PHYSICAL_PAGES];
-    submissions += upload_region(
-        stream,
-        kv_arena,
-        layout.kv_layout.block_tables(),
-        &block_tables,
-    )?;
+    submissions += upload_region(kv_arena, layout.kv_layout.block_tables(), &block_tables)?;
     stream.synchronize().map_err(GpuError::from)?;
     Ok(MetadataUploadStats {
         bytes: plan.host_derived_bytes(),
@@ -6329,7 +6322,6 @@ struct MetadataUploadStats {
 }
 
 fn upload_region<T: DeviceCopy>(
-    stream: &CudaStream,
     arena: &mut LoadingDeviceArena,
     region: ArenaRegion<T>,
     source: &[T],
@@ -6340,7 +6332,7 @@ fn upload_region<T: DeviceCopy>(
         .ok_or_else(|| EngineError::layout("resident metadata destination overflows"))?;
     // SAFETY: `initialize_selective_nonweights` synchronizes before its local sources can be
     // released, and the loading arena checks the exact destination range.
-    unsafe { arena.copy_from_host_async(stream, region.offset_bytes()..end, source)? };
+    unsafe { arena.copy_from_host_async(region.offset_bytes()..end, source)? };
     Ok(1)
 }
 
