@@ -638,7 +638,9 @@ fn run_qwen36_job(generator: &mut Qwen36ResidentTextGenerator, mut job: Job) {
         Ok(session) => session,
         Err(error) => {
             let message = error.to_string();
-            let _ = job.reply.send(GenerationReply::Rejected(message.clone()));
+            let _ = job
+                .reply
+                .blocking_send(GenerationReply::Rejected(message.clone()));
             job.log.finish(None, 0, 0, "error", Some(&message));
             return;
         }
@@ -659,7 +661,9 @@ fn run_qwen36_job(generator: &mut Qwen36ResidentTextGenerator, mut job: Job) {
             Ok(step) => step,
             Err(error) => {
                 let message = error.to_string();
-                let _ = job.reply.send(GenerationReply::Failed(message.clone()));
+                let _ = job
+                    .reply
+                    .blocking_send(GenerationReply::Failed(message.clone()));
                 job.log.finish(
                     Some(session.prompt_encoding()),
                     session.generated_token_ids().len(),
@@ -672,12 +676,25 @@ fn run_qwen36_job(generator: &mut Qwen36ResidentTextGenerator, mut job: Job) {
         };
         if let Some(delta) = step.delta {
             job.log.observe_output();
-            let _ = job.reply.send(GenerationReply::Delta(delta));
+            if job
+                .reply
+                .blocking_send(GenerationReply::Delta(delta))
+                .is_err()
+            {
+                job.log.finish(
+                    Some(session.prompt_encoding()),
+                    session.generated_token_ids().len(),
+                    0,
+                    "cancelled",
+                    None,
+                );
+                return;
+            }
         }
     }
     match session.into_output() {
         Ok(output) => {
-            let _ = job.reply.send(GenerationReply::Done {
+            let _ = job.reply.blocking_send(GenerationReply::Done {
                 output: output.clone(),
                 cached_prompt_tokens: 0,
             });
@@ -691,7 +708,9 @@ fn run_qwen36_job(generator: &mut Qwen36ResidentTextGenerator, mut job: Job) {
         }
         Err(error) => {
             let message = error.to_string();
-            let _ = job.reply.send(GenerationReply::Failed(message.clone()));
+            let _ = job
+                .reply
+                .blocking_send(GenerationReply::Failed(message.clone()));
             job.log.finish(None, 0, 0, "error", Some(&message));
         }
     }
