@@ -157,6 +157,12 @@ complete source formulas, eager/graph agreement, immutable weights, inactive
 regions, stable addresses, and zero post-warmup growth. Q/K preparation and
 paged GQA reuse only the already-qualified Qwen3.6 FP8-cache entries.
 
+The source-BF16 routed and shared experts likewise have separate Qwen3.6
+`B=1..8` and `T=32,64,128` entries. Qualification pins top-eight dispatch,
+shared gating, fixed-order reduction, immutable source planes, graph replay,
+inactive rows, stable addresses, and zero post-warmup growth against an
+independent represented-value formula.
+
 ## MR sequence
 
 1. `docs/qwen36-mtp-design`

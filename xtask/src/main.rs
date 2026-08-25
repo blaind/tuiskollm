@@ -796,6 +796,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("qualify-qwen36-mtp-bf16-attention") => {
             qualify_qwen36_mtp_bf16_attention(root, &remaining)
         }
+        Some("qualify-qwen36-mtp-bf16-moe") if remaining.is_empty() => {
+            qualify_qwen36_mtp_bf16_moe(root)
+        }
         Some("qualify-qwen35-mtp-bf16-mlp") => qualify_qwen35_mtp_bf16_mlp(root, &remaining),
         Some("qualify-qwen35-text-endpoint") => qualify_qwen35_text_endpoint(root, &remaining),
         Some("qualify-qwen36-text-endpoint") => qualify_qwen36_text_endpoint(root, &remaining),
@@ -1097,6 +1100,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | "qualify-qwen35-mtp-bf16-attention"
                     | "qualify-qwen35-mtp-bf16-mlp"
                     | "qualify-qwen36-mtp-bf16-attention"
+                    | "qualify-qwen36-mtp-bf16-moe"
                     | "qualify-qwen36-attention-qk-prepare"
                     | "qualify-qwen36-fp8-attention-qk-prepare"
                     | "qualify-qwen35-nvfp4-attention-output"
@@ -2053,6 +2057,31 @@ fn qualify_qwen36_mtp_bf16_attention(
             "--test-threads=1",
         ],
         Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
+    )
+}
+
+fn qualify_qwen36_mtp_bf16_moe(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_TEST_TARGET,
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+            "qwen36_mtp_bf16_moe_suite_",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ],
     )
 }
 
