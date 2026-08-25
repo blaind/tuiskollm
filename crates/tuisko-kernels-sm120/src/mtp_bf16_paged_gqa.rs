@@ -1,10 +1,10 @@
-//! Source-BF16 paged grouped-query attention for the Qwen3.8 MTP layer.
+//! Source-BF16 paged grouped-query attention for admitted MTP layers.
 
 use crate::device::paged_gqa::bf16_paged_gqa;
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
-use tuisko_model::{Arch, Qwen38_27B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
 const THREADS: u32 = 32;
@@ -55,10 +55,98 @@ mod kernels {
             );
         }
     }
+
+    /// Applies represented-BF16 paged GQA for one exact Qwen3.5 MTP batch.
+    #[kernel]
+    #[launch_bounds(32, 16)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (32, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen35_mtp_bf16_paged_gqa<const TOKENS: usize>(
+        query: *const f32,
+        key_pages: *const u16,
+        value_pages: *const u16,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        lengths: *const u32,
+        output: *mut f32,
+    ) {
+        // One warp retains one 256-wide head and its online-softmax order.
+        // Qwen3.5 B=8 exposes 128 CTAs for 16 query heads; combining heads
+        // would change the represented reduction rather than just its tiling.
+        unsafe {
+            bf16_paged_gqa::<Qwen35_9B, TOKENS>(
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                output,
+            );
+        }
+    }
 }
 
 struct PreparedRoute<const TOKENS: usize> {
     attention: PreparedLaunch<kernels::__mtp_bf16_paged_gqa_CudaKernel<TOKENS>>,
+}
+
+struct PreparedQwen35Route<const TOKENS: usize> {
+    attention: PreparedLaunch<kernels::__qwen35_mtp_bf16_paged_gqa_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let blocks = u32::try_from(TOKENS * Qwen35_9B::NUM_ATTENTION_HEADS)
+            .map_err(|_| GpuError::invalid_launch("Qwen3.5 MTP BF16 paged GQA grid exceeds u32"))?;
+        Ok(Self {
+            attention: module
+                .prepare_qwen35_mtp_bf16_paged_gqa::<TOKENS>(LaunchConfig1D::new(
+                    blocks, THREADS, 0,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.5 MTP BF16 paged GQA", source)
+                })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        query: *const f32,
+        key_pages: *const u16,
+        value_pages: *const u16,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        lengths: *const u32,
+        output: *mut f32,
+    ) -> GpuResult<()> {
+        module
+            .qwen35_mtp_bf16_paged_gqa::<TOKENS>(
+                stream,
+                &self.attention,
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                output,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.5 MTP BF16 paged GQA", source))
+    }
 }
 
 impl<const TOKENS: usize> PreparedRoute<TOKENS> {
@@ -115,6 +203,20 @@ pub(crate) fn mtp_bf16_paged_gqa_ptx_names() -> [&'static str; MAX_BATCH] {
         kernels::mtp_bf16_paged_gqa_ptx_name::<6>(),
         kernels::mtp_bf16_paged_gqa_ptx_name::<7>(),
         kernels::mtp_bf16_paged_gqa_ptx_name::<8>(),
+    ]
+}
+
+/// Stable PTX inventory for every exact Qwen3.5 MTP BF16 paged-GQA batch.
+pub(crate) fn qwen35_mtp_bf16_paged_gqa_ptx_names() -> [&'static str; MAX_BATCH] {
+    [
+        kernels::qwen35_mtp_bf16_paged_gqa_ptx_name::<1>(),
+        kernels::qwen35_mtp_bf16_paged_gqa_ptx_name::<2>(),
+        kernels::qwen35_mtp_bf16_paged_gqa_ptx_name::<3>(),
+        kernels::qwen35_mtp_bf16_paged_gqa_ptx_name::<4>(),
+        kernels::qwen35_mtp_bf16_paged_gqa_ptx_name::<5>(),
+        kernels::qwen35_mtp_bf16_paged_gqa_ptx_name::<6>(),
+        kernels::qwen35_mtp_bf16_paged_gqa_ptx_name::<7>(),
+        kernels::qwen35_mtp_bf16_paged_gqa_ptx_name::<8>(),
     ]
 }
 
@@ -231,9 +333,123 @@ impl MtpBf16PagedGqaOp {
     }
 }
 
+/// Prepared Qwen3.5 MTP represented-BF16 paged-GQA routes.
+pub struct Qwen35MtpBf16PagedGqaOp {
+    module: kernels::LoadedModule,
+    b1: PreparedQwen35Route<1>,
+    b2: PreparedQwen35Route<2>,
+    b3: PreparedQwen35Route<3>,
+    b4: PreparedQwen35Route<4>,
+    b5: PreparedQwen35Route<5>,
+    b6: PreparedQwen35Route<6>,
+    b7: PreparedQwen35Route<7>,
+    b8: PreparedQwen35Route<8>,
+}
+
+impl Qwen35MtpBf16PagedGqaOp {
+    /// Loads the embedded module and prepares every exact Qwen3.5 route.
+    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        if Qwen35_9B::NUM_ATTENTION_HEADS != 16
+            || Qwen35_9B::NUM_KV_HEADS != 4
+            || Qwen35_9B::HEAD_DIM != 256
+            || Qwen35_9B::ATTENTION_OUTPUT_COLUMNS != 4_096
+        {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 geometry is incompatible with the MTP BF16 paged-GQA schedule",
+            ));
+        }
+        let _ = qwen35_mtp_bf16_paged_gqa_ptx_names();
+        // SAFETY: this crate owns the embedded exact MTP artifact.
+        let module = unsafe { kernels::load(context) }
+            .map_err(|source| GpuError::module("loading Qwen3.5 MTP BF16 paged GQA", source))?;
+
+        Ok(Self {
+            b1: PreparedQwen35Route::prepare(&module)?,
+            b2: PreparedQwen35Route::prepare(&module)?,
+            b3: PreparedQwen35Route::prepare(&module)?,
+            b4: PreparedQwen35Route::prepare(&module)?,
+            b5: PreparedQwen35Route::prepare(&module)?,
+            b6: PreparedQwen35Route::prepare(&module)?,
+            b7: PreparedQwen35Route::prepare(&module)?,
+            b8: PreparedQwen35Route::prepare(&module)?,
+            module,
+        })
+    }
+
+    /// Applies online-softmax GQA over page-major represented BF16 K/V.
+    ///
+    /// # Safety
+    ///
+    /// Query and output cover `[batch, 16, 256]` FP32 values. Cache planes
+    /// use `[physical_page, 4, 64, 256]` BF16 values. Metadata covers `batch`;
+    /// every nonzero length has enough resident table entries. Allocations are
+    /// aligned, disjoint, live through completion, and context-local.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        query: *const f32,
+        key_pages: *const u16,
+        value_pages: *const u16,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: usize,
+        lengths: *const u32,
+        output: *mut f32,
+    ) -> GpuResult<()> {
+        if !admitted_batch(batch) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.5 MTP BF16 paged GQA batch {batch} is outside 1..={MAX_BATCH}"
+            )));
+        }
+        let table_stride = u32::try_from(table_stride).map_err(|_| {
+            GpuError::invalid_launch("Qwen3.5 MTP BF16 paged GQA table stride exceeds u32")
+        })?;
+        if table_stride == 0 {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 MTP BF16 paged GQA table stride must be nonzero",
+            ));
+        }
+
+        macro_rules! launch {
+            ($route:ident) => {
+                unsafe {
+                    self.$route.launch(
+                        &self.module,
+                        stream,
+                        query,
+                        key_pages,
+                        value_pages,
+                        block_tables,
+                        table_rows,
+                        table_stride,
+                        lengths,
+                        output,
+                    )
+                }
+            };
+        }
+
+        match batch {
+            1 => launch!(b1),
+            2 => launch!(b2),
+            3 => launch!(b3),
+            4 => launch!(b4),
+            5 => launch!(b5),
+            6 => launch!(b6),
+            7 => launch!(b7),
+            8 => launch!(b8),
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{THREADS, admitted_batch, mtp_bf16_paged_gqa_ptx_names};
+    use super::{
+        THREADS, admitted_batch, mtp_bf16_paged_gqa_ptx_names, qwen35_mtp_bf16_paged_gqa_ptx_names,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -247,5 +463,12 @@ mod tests {
         for batch in 0..=9 {
             assert_eq!(admitted_batch(batch), (1..=8).contains(&batch));
         }
+    }
+
+    #[test]
+    fn qwen35_inventory_has_every_exact_batch_once() {
+        let names = qwen35_mtp_bf16_paged_gqa_ptx_names();
+        assert_eq!(names.len(), 8);
+        assert_eq!(names.iter().copied().collect::<BTreeSet<_>>().len(), 8);
     }
 }
