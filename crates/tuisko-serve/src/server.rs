@@ -34,7 +34,8 @@ const DEFAULT_SEED_SCRAMBLE: u64 = 0x9e37_79b9_7f4a_7c15;
 // Bounded so the single-threaded worker never blocks on a stalled client; a full
 // lane is treated exactly like a disconnected one.
 const GENERATION_REPLY_BUFFER: usize = 32;
-const GENERATION_ROUTE: &str = "mtp-draft-3";
+const MTP_GENERATION_ROUTE: &str = "mtp-draft-3";
+const SINGLE_TOKEN_GENERATION_ROUTE: &str = "single-token";
 
 /// Startup configuration for the one exact resident server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +70,7 @@ struct AppState {
     worker_ready: Arc<AtomicBool>,
     server_started: Instant,
     model_id: &'static str,
+    generation_route: &'static str,
     generation_defaults: GenerationDefaults,
 }
 
@@ -92,6 +94,7 @@ enum EnqueueError {
 
 struct Ready {
     model_id: &'static str,
+    generation_route: &'static str,
     generation_defaults: GenerationDefaults,
     device_name: String,
     checkpoint_admission: Duration,
@@ -135,6 +138,13 @@ impl ResidentTarget {
             Self::Qwen38 => Qwen38_27B::MODEL_ID,
             Self::Qwen35 => Qwen35_9B::MODEL_ID,
             Self::Qwen36 => Qwen36Moe35B::MODEL_ID,
+        }
+    }
+
+    const fn generation_route(self) -> &'static str {
+        match self {
+            Self::Qwen38 => MTP_GENERATION_ROUTE,
+            Self::Qwen35 | Self::Qwen36 => SINGLE_TOKEN_GENERATION_ROUTE,
         }
     }
 }
@@ -252,6 +262,7 @@ fn start_worker(
             worker_ready,
             server_started,
             model_id: ready.model_id,
+            generation_route: ready.generation_route,
             generation_defaults: ready.generation_defaults,
         },
         ready,
@@ -311,6 +322,7 @@ fn engine_worker(
     let load_stats = generator.load_stats();
     let startup = Ready {
         model_id: Qwen38_27B::MODEL_ID,
+        generation_route: ResidentTarget::Qwen38.generation_route(),
         generation_defaults: generator.generation_defaults(),
         device_name,
         checkpoint_admission,
@@ -450,6 +462,7 @@ fn qwen35_engine_worker(
         };
     let startup = Ready {
         model_id: Qwen35_9B::MODEL_ID,
+        generation_route: ResidentTarget::Qwen35.generation_route(),
         generation_defaults: generator.generation_defaults(),
         device_name,
         checkpoint_admission,
@@ -582,6 +595,7 @@ fn qwen36_engine_worker(
         };
     let startup = Ready {
         model_id: Qwen36Moe35B::MODEL_ID,
+        generation_route: ResidentTarget::Qwen36.generation_route(),
         generation_defaults: generator.generation_defaults(),
         device_name,
         checkpoint_admission,
@@ -760,7 +774,6 @@ fn render_startup(ready: &Ready, total: Duration, address: SocketAddr, color: bo
     } else {
         ("", "", "")
     };
-    let generation_route = generation_route(ready.model_id);
     writeln!(
         output,
         "{ok}OK{reset} device                 · {}",
@@ -806,8 +819,9 @@ fn render_startup(ready: &Ready, total: Duration, address: SocketAddr, color: bo
     }
     writeln!(
         output,
-        "{ready_label}READY{reset}          {:>7.1} ms · http://{address} · {generation_route} · {} slots · context {} · {:.2} GiB device · {:.2} MiB pinned",
+        "{ready_label}READY{reset}          {:>7.1} ms · http://{address} · {} · {} slots · context {} · {:.2} GiB device · {:.2} MiB pinned",
         milliseconds(total),
+        ready.generation_route,
         ready.slot_capacity,
         ready.context_capacity,
         gibibytes(ready.arena_bytes),
@@ -961,7 +975,7 @@ fn router(state: AppState) -> Router {
 
 async fn health(State(state): State<AppState>) -> Response {
     if state.worker_ready.load(Ordering::Acquire) {
-        Json(json!({"status": "ok", "generation_route": GENERATION_ROUTE})).into_response()
+        Json(json!({"status": "ok", "generation_route": state.generation_route})).into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1031,7 +1045,7 @@ async fn chat_completions(
                 numeric_id,
                 accepted,
                 state.server_started,
-                generation_route(state.model_id),
+                state.generation_route,
             ),
         },
     ) {
@@ -1074,14 +1088,6 @@ async fn chat_completions(
             parse_tools,
         )
         .await
-    }
-}
-
-fn generation_route(model_id: &str) -> &'static str {
-    if model_id == Qwen38_27B::MODEL_ID {
-        GENERATION_ROUTE
-    } else {
-        "single-token"
     }
 }
 
@@ -1179,6 +1185,7 @@ mod tests {
             worker_ready: Arc::new(AtomicBool::new(ready)),
             server_started: std::time::Instant::now(),
             model_id: SERVED_MODEL,
+            generation_route: ResidentTarget::Qwen38.generation_route(),
             generation_defaults: GenerationDefaults {
                 temperature: 1.0,
                 top_p: 0.95,
@@ -1191,6 +1198,7 @@ mod tests {
     fn startup_output_is_exact_plain_text_or_terminal_color() {
         let ready = Ready {
             model_id: SERVED_MODEL,
+            generation_route: ResidentTarget::Qwen38.generation_route(),
             generation_defaults: GenerationDefaults {
                 temperature: 1.0,
                 top_p: 0.95,
@@ -1257,6 +1265,7 @@ mod tests {
     fn qwen35_startup_reports_aggregate_loading_and_one_slot() {
         let ready = Ready {
             model_id: Qwen35_9B::MODEL_ID,
+            generation_route: ResidentTarget::Qwen35.generation_route(),
             generation_defaults: GenerationDefaults {
                 temperature: 0.0,
                 top_p: 1.0,
@@ -1448,26 +1457,30 @@ mod tests {
 
     #[test]
     fn snapshot_revision_selects_one_concrete_resident_target() {
-        for (revision, expected, model) in [
+        for (revision, expected, model, route) in [
             (
                 Qwen38_27B::REVISION,
                 ResidentTarget::Qwen38,
                 Qwen38_27B::MODEL_ID,
+                "mtp-draft-3",
             ),
             (
                 Qwen35_9B::REVISION,
                 ResidentTarget::Qwen35,
                 Qwen35_9B::MODEL_ID,
+                "single-token",
             ),
             (
                 Qwen36Moe35B::REVISION,
                 ResidentTarget::Qwen36,
                 Qwen36Moe35B::MODEL_ID,
+                "single-token",
             ),
         ] {
             let target = ResidentTarget::from_snapshot(std::path::Path::new(revision)).unwrap();
             assert_eq!(target, expected);
             assert_eq!(target.model_id(), model);
+            assert_eq!(target.generation_route(), route);
         }
         assert!(ResidentTarget::from_snapshot(std::path::Path::new("moving-main")).is_err());
     }
