@@ -1,17 +1,22 @@
 //! Numerical and graph qualification for the source-native FP8 GDN output.
 
 use crate::fp8_projection_oracle::{
-    BF16_SENTINEL, BYTE_SENTINEL, F32_SENTINEL_BITS, SCALE_VALUES, TokenOracle, WEIGHT_CODES,
-    WEIGHT_VALUES, bf16_to_f32, f32_to_bf16, quantize_oracle,
+    SCALE_VALUES, TokenOracle, WEIGHT_CODES, WEIGHT_VALUES, bf16_to_f32, f32_to_bf16,
+    quantize_oracle,
+};
+use crate::harness::graph_replay::post_warmup_allocation_drift;
+use crate::harness::immutable_sentinel::{
+    SentinelPattern, first_bit_difference_f32, first_difference, first_non_sentinel,
+    first_non_sentinel_f32,
 };
 use crate::{DeviceBenchmarkError, device_benchmark};
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
-    device_memory_info,
 };
 use tuisko_kernels_sm120::GdnOutputProjectionOp;
 use tuisko_model::{Arch, Qwen38_27B};
 
+const SENTINEL: SentinelPattern = SentinelPattern::new(0xa5);
 const MAX_BATCH: usize = 8;
 const MAX_ROWS: usize = 1_024;
 const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, MAX_BATCH, 32, 64, 128, MAX_ROWS];
@@ -233,9 +238,9 @@ fn load_fixture(
 }
 
 fn reset(arena: &DeviceArena, stream: &tuisko_gpu::CudaStream, regions: Regions) -> GpuResult<()> {
-    arena.fill(stream, regions.codes, BYTE_SENTINEL)?;
-    arena.fill(stream, regions.scales, BYTE_SENTINEL)?;
-    arena.fill(stream, regions.output, BYTE_SENTINEL)
+    arena.fill(stream, regions.codes, SENTINEL.byte())?;
+    arena.fill(stream, regions.scales, SENTINEL.byte())?;
+    arena.fill(stream, regions.output, SENTINEL.byte())
 }
 
 fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 6]> {
@@ -297,10 +302,8 @@ fn verify_eager(
     let output_rows = Qwen38_27B::HIDDEN;
     for (token, oracle) in oracles[..rows].iter().enumerate() {
         let begin = token * columns;
-        if let Some(column) = observed.codes[begin..begin + columns]
-            .iter()
-            .zip(&oracle.codes)
-            .position(|(actual, expected)| actual != expected)
+        if let Some(column) =
+            first_difference(&observed.codes[begin..begin + columns], &oracle.codes)
         {
             return Err(GdnOutputQualificationError::Mismatch(format!(
                 "activation code at rows={rows}, token={token}, column={column} differs"
@@ -339,15 +342,9 @@ fn verify_eager(
 fn verify_inactive(rows: usize, observed: &Observed) -> Result<(), GdnOutputQualificationError> {
     let code_begin = rows * Qwen38_27B::GDN_VALUE_ROWS;
     let output_begin = rows * Qwen38_27B::HIDDEN;
-    if observed.codes[code_begin..]
-        .iter()
-        .any(|&value| value != BYTE_SENTINEL)
-        || observed.scales[rows..]
-            .iter()
-            .any(|value| value.to_bits() != F32_SENTINEL_BITS)
-        || observed.output[output_begin..]
-            .iter()
-            .any(|&value| value != BF16_SENTINEL)
+    if first_non_sentinel(&observed.codes[code_begin..], SENTINEL.byte()).is_some()
+        || first_non_sentinel_f32(&observed.scales[rows..], SENTINEL.word_bits()).is_some()
+        || first_non_sentinel(&observed.output[output_begin..], SENTINEL.half()).is_some()
     {
         return Err(GdnOutputQualificationError::Mismatch(format!(
             "rows={rows} modified an inactive value"
@@ -365,32 +362,17 @@ fn verify_immutable(
     fixture: &Fixture,
     observed: &Observed,
 ) -> Result<(), GdnOutputQualificationError> {
-    if let Some(index) = observed
-        .input
-        .iter()
-        .zip(&fixture.input)
-        .position(|(actual, expected)| actual != expected)
-    {
+    if let Some(index) = first_difference(&observed.input, &fixture.input) {
         return Err(GdnOutputQualificationError::Mismatch(format!(
             "rows={rows} modified immutable input value {index}"
         )));
     }
-    if let Some(index) = observed
-        .weight_codes
-        .iter()
-        .zip(&fixture.weight_codes)
-        .position(|(actual, expected)| actual != expected)
-    {
+    if let Some(index) = first_difference(&observed.weight_codes, &fixture.weight_codes) {
         return Err(GdnOutputQualificationError::Mismatch(format!(
             "rows={rows} modified immutable weight code {index}"
         )));
     }
-    if let Some(index) = observed
-        .weight_scales
-        .iter()
-        .zip(&fixture.weight_scales)
-        .position(|(actual, expected)| actual != expected)
-    {
+    if let Some(index) = first_difference(&observed.weight_scales, &fixture.weight_scales) {
         return Err(GdnOutputQualificationError::Mismatch(format!(
             "rows={rows} modified immutable weight scale {index}"
         )));
@@ -413,11 +395,7 @@ fn verify_replay(
 ) -> Result<(), GdnOutputQualificationError> {
     let same = replay.codes == eager.codes
         && replay.output == eager.output
-        && replay
-            .scales
-            .iter()
-            .zip(&eager.scales)
-            .all(|(actual, expected)| actual.to_bits() == expected.to_bits());
+        && first_bit_difference_f32(&replay.scales, &eager.scales).is_none();
     if !same {
         return Err(GdnOutputQualificationError::Mismatch(format!(
             "rows={rows} graph replay {replay_index} differs from eager"
@@ -442,26 +420,10 @@ fn verify_no_post_warmup_allocation(
         .iter()
         .map(|&rows| CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows)))
         .collect::<GpuResult<Vec<_>>>()?;
-    for graph in &graphs {
-        // SAFETY: every allocation this graph captured is owned by this scope or
-        // its caller and outlives the replays and the synchronize that follows.
-        unsafe { graph.launch(stream) }?;
-    }
-    stream.synchronize().map_err(GpuError::from)?;
-    let before = device_memory_info(context)?;
-    for _ in 0..4 {
-        for graph in graphs.iter().rev() {
-            // SAFETY: every allocation this graph captured is owned by this scope or
-            // its caller and outlives the replays and the synchronize that follows.
-            unsafe { graph.launch(stream) }?;
-        }
-    }
-    stream.synchronize().map_err(GpuError::from)?;
-    let after = device_memory_info(context)?;
-    if before != after {
-        return Err(GdnOutputQualificationError::Mismatch(format!(
-            "device memory changed after warmup: before={before:?}, after={after:?}"
-        )));
+    // SAFETY: every allocation these graphs captured is owned by this scope or
+    // its caller and outlives the replays and the synchronize that follows.
+    if let Some(drift) = unsafe { post_warmup_allocation_drift(context, stream, &graphs, 4) }? {
+        return Err(GdnOutputQualificationError::Mismatch(drift));
     }
 
     Ok(())
