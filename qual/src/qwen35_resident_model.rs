@@ -59,6 +59,8 @@ pub struct Qwen35ResidentModelQualification {
     pub prefill_finite_logits: usize,
     /// Prompt routes whose replacement embeddings changed the final residual.
     pub prefill_replacement_cases: usize,
+    /// Prompt graph routes exercised beyond the former 192-token cache boundary.
+    pub long_context_cases: usize,
     /// Stable layer and endpoint arena addresses retained by the owner.
     pub arena_addresses: usize,
     /// Exact resident weight bytes.
@@ -71,6 +73,8 @@ pub struct Qwen35ResidentModelQualification {
     pub arena_bytes: usize,
     /// Page-locked decode and prompt embedding staging bytes.
     pub host_stager_bytes: usize,
+    /// Fixed host page-table and physical-owner inventory bytes.
+    pub kv_host_owner_bytes: usize,
     /// Largest final-normalization absolute error.
     pub maximum_normalization_error: f32,
     /// Largest sampled-logit absolute error.
@@ -107,12 +111,14 @@ pub fn qualify_qwen35_resident_model(
         prefill_graph_replay_values: 0,
         prefill_finite_logits: 0,
         prefill_replacement_cases: 0,
+        long_context_cases: 0,
         arena_addresses: stable_addresses.len(),
         weight_bytes: layout.resident_weight_bytes(),
         cache_bytes: layout.cache_bytes(),
         workspace_bytes: layout.workspace_bytes(),
         arena_bytes: layout.arena_bytes(),
         host_stager_bytes: program.host_stager_bytes(),
+        kv_host_owner_bytes: program.kv_host_owner_bytes(),
         maximum_normalization_error: 0.0,
         maximum_logit_error: 0.0,
     };
@@ -172,11 +178,65 @@ pub fn qualify_qwen35_resident_model(
     }
 
     verify_prefill_slot_equivalence(&mut program, &stream)?;
+    verify_long_context_graph_route(&mut program, &stream, &mut report)?;
 
     verify_no_post_warmup_allocation(&mut program, &stream)?;
     device_benchmark::require_current_process_exclusive()?;
 
     Ok(report)
+}
+
+fn verify_long_context_graph_route(
+    program: &mut Qwen35ResidentModelProgram,
+    stream: &CudaStream,
+    report: &mut Qwen35ResidentModelQualification,
+) -> Result<(), Qwen35ResidentModelQualificationError> {
+    const TOKENS: usize = 32;
+    const SLOT: usize = 7;
+    const FIRST_POSITION: usize = 4_096;
+    let ids = prefill_token_ids(TOKENS, 11);
+    let rope_cos = vec![1.0f32; TOKENS * ROTARY_PAIRS];
+    let rope_sin = vec![0.0f32; TOKENS * ROTARY_PAIRS];
+
+    let prepare = |program: &mut Qwen35ResidentModelProgram| -> Result<
+        Qwen35ResidentPrefillRoute,
+        Qwen35ResidentModelQualificationError,
+    > {
+        program.reset_state(stream)?;
+        program.activate_kv_slot(SLOT)?;
+        program.reserve_kv_slot_tokens(stream, SLOT, FIRST_POSITION + TOKENS)?;
+        let route = program.qualification_kv_route(SLOT, FIRST_POSITION)?;
+        if route.physical_page() != 64 || route.page_offset() != 0 {
+            return Err(Qwen35ResidentModelQualificationError::Mismatch(format!(
+                "Qwen3.5 logical position {FIRST_POSITION} mapped to page {} offset {}, expected page 64 offset 0",
+                route.physical_page(),
+                route.page_offset()
+            )));
+        }
+        program.stage_prefill_embeddings(stream, &ids)?;
+        let route = program.load_prefill_slot_state_at(
+            stream,
+            TOKENS,
+            SLOT,
+            FIRST_POSITION,
+            &rope_cos,
+            &rope_sin,
+        )?;
+        program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+        Ok(route)
+    };
+
+    let eager_route = prepare(program)?;
+    program.launch_prefill_eager(stream, eager_route)?;
+    let eager = program.qualification_prefill_observables(stream, eager_route)?;
+
+    let replay_route = prepare(program)?;
+    program.replay_prefill(stream, replay_route)?;
+    let replay = program.qualification_prefill_observables(stream, replay_route)?;
+    verify_prefill_replay(TOKENS, &eager, &replay, report)?;
+    report.long_context_cases += 1;
+
+    Ok(())
 }
 
 fn prepare_prefill_run(
@@ -186,6 +246,8 @@ fn prepare_prefill_run(
     salt: usize,
 ) -> Result<Qwen35ResidentPrefillRoute, Qwen35ResidentModelQualificationError> {
     program.reset_state(stream)?;
+    program.activate_kv_slot(0)?;
+    program.reserve_kv_slot_tokens(stream, 0, tokens)?;
     let ids = prefill_token_ids(tokens, salt);
     program.stage_prefill_embeddings(stream, &ids)?;
     let rope_cos = vec![1.0f32; tokens * ROTARY_PAIRS];
@@ -203,6 +265,12 @@ fn prepare_run(
     salt: usize,
 ) -> Result<(), Qwen35ResidentModelQualificationError> {
     program.reset_state(stream)?;
+    let slots = (0..batch).collect::<Vec<_>>();
+    for &slot in &slots {
+        program.activate_kv_slot(slot)?;
+        program.reserve_kv_slot_tokens(stream, slot, 1)?;
+    }
+    program.load_slot_routes(stream, &slots)?;
     let ids = token_ids(batch, salt);
     program.stage_embeddings(stream, &ids[..batch])?;
     let positions = vec![0u32; batch];
@@ -225,6 +293,8 @@ fn verify_prefill_slot_equivalence(
     let rope_sin = vec![0.0f32; TOKENS * ROTARY_PAIRS];
 
     program.reset_state(stream)?;
+    program.activate_kv_slot(SLOT)?;
+    program.reserve_kv_slot_tokens(stream, SLOT, TOKENS)?;
     program.stage_prefill_embeddings(stream, &ids)?;
     let mapped_route =
         program.load_prefill_slot_state(stream, TOKENS, SLOT, &rope_cos, &rope_sin)?;
@@ -233,6 +303,8 @@ fn verify_prefill_slot_equivalence(
     let mapped = program.qualification_prefill_observables(stream, mapped_route)?;
 
     program.reset_state(stream)?;
+    program.activate_kv_slot(0)?;
+    program.reserve_kv_slot_tokens(stream, 0, TOKENS)?;
     program.stage_prefill_embeddings(stream, &ids)?;
     let row_zero_route = program.load_prefill_state(stream, TOKENS, &rope_cos, &rope_sin)?;
     program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
@@ -699,15 +771,17 @@ mod tests {
         assert_eq!(report.inactive_values, 24_736_768);
         assert_eq!(report.replacement_cases, 8);
         assert_eq!(report.prefill_oracle_values, 12_480);
-        assert_eq!(report.prefill_graph_replay_values, 1_674_752);
+        assert_eq!(report.prefill_graph_replay_values, 2_058_240);
         assert_eq!(report.prefill_finite_logits, 744_960);
         assert_eq!(report.prefill_replacement_cases, 3);
-        assert_eq!(report.arena_addresses, 33);
+        assert_eq!(report.long_context_cases, 1);
+        assert_eq!(report.arena_addresses, 34);
         assert_eq!(report.weight_bytes, 5_931_820_032);
-        assert_eq!(report.cache_bytes, 50_331_648);
-        assert_eq!(report.workspace_bytes, 1_057_698_048);
-        assert_eq!(report.arena_bytes, 7_039_870_976);
+        assert_eq!(report.cache_bytes, 8_640_266_240);
+        assert_eq!(report.workspace_bytes, 1_057_829_120);
+        assert_eq!(report.arena_bytes, 15_629_936_640);
         assert_eq!(report.host_stager_bytes, 1_114_112);
+        assert_eq!(report.kv_host_owner_bytes, 135_168);
         assert!(report.maximum_normalization_error.is_finite());
         assert!(report.maximum_logit_error.is_finite());
 
