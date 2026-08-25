@@ -9,7 +9,7 @@ use tuisko_gpu::{
 };
 use tuisko_kernels_sm120::{
     ATTENTION_PAGE_SIZE, MtpBf16PagedGqaOp, PagedGqaOp, Qwen35MtpBf16PagedGqaOp, Qwen35PagedGqaOp,
-    Qwen36PagedGqaOp,
+    Qwen36Fp8PagedGqaOp, Qwen36PagedGqaOp,
 };
 use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
@@ -177,6 +177,54 @@ impl QualifiedPagedGqaOp for PagedGqaOp {
     ) -> GpuResult<()> {
         // SAFETY: the qualification arena establishes the complete pointer
         // contract before dispatching through this safe seam.
+        unsafe {
+            self.launch(
+                stream,
+                batch,
+                query,
+                key_pages,
+                value_pages,
+                block_tables,
+                table_rows,
+                table_stride,
+                lengths,
+                output,
+                key_scale,
+                value_scale,
+            )
+        }
+    }
+}
+
+impl QualifiedPagedGqaOp for Qwen36Fp8PagedGqaOp {
+    type Target = Qwen36Moe35B;
+    const ROUTES: &'static [usize] = &QWEN36_ROUTES;
+    const MAX_TOKENS: usize = QWEN36_MAX_TOKENS;
+    const CACHE_ELEMENT_BYTES: usize = size_of::<u8>();
+    const CACHE_FORMAT: CacheFormat = CacheFormat::E4m3;
+
+    fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        Qwen36Fp8PagedGqaOp::new(context)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &self,
+        stream: &tuisko_gpu::CudaStream,
+        batch: usize,
+        query: *const f32,
+        key_pages: *const u8,
+        value_pages: *const u8,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: usize,
+        lengths: *const u32,
+        output: *mut f32,
+        key_scale: f32,
+        value_scale: f32,
+    ) -> GpuResult<()> {
+        // SAFETY: the shared arena owns every represented E4M3 page and
+        // establishes the exact Qwen3.6 metadata contract before dispatch.
         unsafe {
             self.launch(
                 stream,
@@ -394,6 +442,11 @@ pub fn qualify_qwen35_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQuali
 /// and `T=32,64,128`.
 pub fn qualify_qwen36_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificationError> {
     qualify_target::<Qwen36PagedGqaOp>()
+}
+
+/// Qualifies Qwen3.6 E4M3 paged GQA at every admitted decode and prompt width.
+pub fn qualify_qwen36_fp8_paged_gqa() -> Result<PagedGqaQualification, PagedGqaQualificationError> {
+    qualify_target::<Qwen36Fp8PagedGqaOp>()
 }
 
 /// Qualifies Qwen3.8 MTP eager and captured BF16 paged GQA at exact `B=1..=8`.
@@ -851,7 +904,7 @@ mod tests {
         MAX_BATCH, PHYSICAL_PAGES, QWEN35_MAX_TOKENS, QWEN35_ROUTES, QWEN36_MAX_TOKENS,
         QWEN36_ROUTES, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, TABLE_ROWS, TABLE_STRIDE, layout,
         qualify_mtp_bf16_paged_gqa, qualify_paged_gqa, qualify_qwen35_mtp_bf16_paged_gqa,
-        qualify_qwen35_paged_gqa, qualify_qwen36_paged_gqa,
+        qualify_qwen35_paged_gqa, qualify_qwen36_fp8_paged_gqa, qualify_qwen36_paged_gqa,
     };
     use std::mem::size_of;
     use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -949,6 +1002,45 @@ mod tests {
         assert_eq!(arena.byte_len(), 7_341_312);
         assert_eq!(arena.byte_len() - regions.payload_bytes(), 160);
 
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
+    fn qwen36_fp8_exact_decode_and_prompt_routes_match_independent_oracles_and_graph_replay()
+    -> Result<(), super::PagedGqaQualificationError> {
+        let report = qualify_qwen36_fp8_paged_gqa()?;
+        let active_tokens = QWEN36_ROUTES.iter().sum::<usize>();
+        let output_per_token = Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS;
+        let plane_bytes = PHYSICAL_PAGES
+            * Qwen36Moe35B::NUM_KV_HEADS
+            * ATTENTION_PAGE_SIZE
+            * Qwen36Moe35B::HEAD_DIM;
+        let immutable_per_check = QWEN36_MAX_TOKENS * output_per_token
+            + 2 * plane_bytes
+            + TABLE_ROWS * TABLE_STRIDE
+            + 2 * QWEN36_MAX_TOKENS;
+
+        assert_eq!(report.output_values, active_tokens * output_per_token);
+        assert_eq!(report.untouched_values, 4_702_208);
+        assert_eq!(report.graph_replay_values, 5_767_168);
+        assert_eq!(
+            report.immutable_input_values,
+            2 * QWEN36_ROUTES.len() * immutable_per_check
+        );
+        assert_eq!(report.cache_bytes, 1_572_864);
+        assert_eq!(report.workspace_bytes, 4_195_424);
+        assert_eq!(report.arena_bytes - report.padding_bytes, 5_768_288);
+        let (arena, regions) = layout::<Qwen36Moe35B>(QWEN36_MAX_TOKENS, size_of::<u8>())?;
+        assert_eq!(report.arena_bytes, 5_768_448);
+        assert_eq!(report.padding_bytes, 160);
+        assert_eq!(report.arena_bytes, arena.byte_len());
+        assert_eq!(
+            report.arena_bytes - report.padding_bytes,
+            regions.payload_bytes()
+        );
+        assert_eq!(report.workspace_bytes, regions.workspace_bytes());
+        assert!(report.maximum_absolute_error <= 0.003);
         Ok(())
     }
 

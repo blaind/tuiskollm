@@ -6,9 +6,9 @@ use tuisko_model::Arch;
 const VALUES_PER_LANE: usize = 8;
 const PAGE_SIZE: usize = 64;
 const WARP_THREADS: usize = 32;
-const PREFILL_TOKEN_GROUP: usize = 2;
 const PREFILL_QUERY_WARPS: usize = 6;
 pub(crate) const PREFILL_THREADS: usize = 384;
+pub(crate) const QWEN36_FP8_PREFILL_THREADS: usize = 256;
 const PREFILL_KEY_TILE: usize = 64;
 const PREFILL_PLANE_WORDS: usize = PREFILL_KEY_TILE * 256 / size_of::<u32>();
 pub(crate) const PREFILL_SHARED_BYTES: usize = 2 * PREFILL_PLANE_WORDS * size_of::<u32>();
@@ -1125,7 +1125,12 @@ pub(crate) unsafe fn paged_gqa_prefill_flash_partitioned<A: Arch, const KEY_TILE
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn paged_gqa_prefill_shared<A: Arch, const TOKENS: usize>(
+pub(crate) unsafe fn paged_gqa_prefill_shared<
+    A: Arch,
+    const TOKENS: usize,
+    const TOKEN_GROUP: usize,
+    const QUERY_WARPS: usize,
+>(
     query: *const f32,
     key_pages: *const u8,
     value_pages: *const u8,
@@ -1138,16 +1143,16 @@ pub(crate) unsafe fn paged_gqa_prefill_shared<A: Arch, const TOKENS: usize>(
     value_scale: f32,
 ) {
     let block = thread::blockIdx_x() as usize;
-    let token_pair = block / A::NUM_KV_HEADS;
-    let kv_head = block - token_pair * A::NUM_KV_HEADS;
-    let first_token = token_pair * PREFILL_TOKEN_GROUP;
+    let token_group = block / A::NUM_KV_HEADS;
+    let kv_head = block - token_group * A::NUM_KV_HEADS;
+    let first_token = token_group * TOKEN_GROUP;
     let tid = thread::threadIdx_x() as usize;
     let warp_index = tid / WARP_THREADS;
     let lane = tid & (WARP_THREADS - 1);
-    let token_in_group = warp_index / PREFILL_QUERY_WARPS;
-    let query_in_group = warp_index - token_in_group * PREFILL_QUERY_WARPS;
+    let token_in_group = warp_index / QUERY_WARPS;
+    let query_in_group = warp_index - token_in_group * QUERY_WARPS;
     let token = first_token + token_in_group;
-    let query_head = kv_head * PREFILL_QUERY_WARPS + query_in_group;
+    let query_head = kv_head * QUERY_WARPS + query_in_group;
     let dimension = lane * VALUES_PER_LANE;
     let query = unsafe {
         query.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
@@ -1156,7 +1161,11 @@ pub(crate) unsafe fn paged_gqa_prefill_shared<A: Arch, const TOKENS: usize>(
         output.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
     };
     let length0 = unsafe { *lengths.add(first_token) as usize };
-    let length1 = unsafe { *lengths.add(first_token + 1) as usize };
+    let length1 = if TOKEN_GROUP == 2 {
+        unsafe { *lengths.add(first_token + 1) as usize }
+    } else {
+        length0
+    };
     let group_length = length0.max(length1);
     let q = unsafe {
         [
@@ -1208,7 +1217,7 @@ pub(crate) unsafe fn paged_gqa_prefill_shared<A: Arch, const TOKENS: usize>(
                     if valid { 16 } else { 0 },
                 );
             }
-            task += PREFILL_THREADS;
+            task += WARP_THREADS * TOKEN_GROUP * QUERY_WARPS;
         }
         unsafe {
             cp_async_commit_group();

@@ -320,7 +320,8 @@ pub use attention_qk_prepare_benchmark::{
 };
 #[cfg(feature = "device")]
 pub use bf16_paged_gqa_benchmark::{
-    benchmark_mtp_bf16_paged_gqa, benchmark_qwen35_paged_gqa, benchmark_qwen36_paged_gqa,
+    benchmark_mtp_bf16_paged_gqa, benchmark_qwen35_paged_gqa, benchmark_qwen36_fp8_paged_gqa,
+    benchmark_qwen36_paged_gqa,
 };
 #[cfg(feature = "device")]
 pub use dense_fp8_gdn_layer::{
@@ -453,7 +454,7 @@ pub use nvfp4_swiglu_benchmark::benchmark_nvfp4_swiglu;
 pub use paged_gqa::{
     PagedGqaQualification, PagedGqaQualificationError, qualify_mtp_bf16_paged_gqa,
     qualify_paged_gqa, qualify_qwen35_mtp_bf16_paged_gqa, qualify_qwen35_paged_gqa,
-    qualify_qwen36_paged_gqa,
+    qualify_qwen36_fp8_paged_gqa, qualify_qwen36_paged_gqa,
 };
 #[cfg(feature = "device")]
 pub use paged_gqa_benchmark::benchmark_paged_gqa;
