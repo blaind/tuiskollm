@@ -1313,7 +1313,23 @@ fn build_server(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Reconciles `tuisko_kernels_sm120::kernel_ptx_names()` against the entries
+/// the build emitted. It runs as a test of the kernel crate rather than from
+/// here because that crate cannot be an xtask dependency: its CUDA bindings
+/// need a toolkit the host CI runner that builds xtask does not have.
+fn gate_kernel_inventory(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_visible(Command::new("cargo").current_dir(root).args([
+        "test",
+        "--package",
+        "tuisko-kernels-sm120",
+        "--lib",
+        "--",
+        "--include-ignored",
+    ]))
+}
+
 fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
+    gate_kernel_inventory(root)?;
     gate_residual_norm(root)?;
     gate_qwen35_residual_norm(root)?;
     gate_qwen36_residual_norm(root)?;
