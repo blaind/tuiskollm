@@ -153,6 +153,8 @@ mod qwen35_gdn_recurrence_benchmark;
 #[cfg(feature = "device")]
 mod qwen35_generation;
 #[cfg(feature = "device")]
+mod qwen35_long_context_kv;
+#[cfg(feature = "device")]
 mod qwen35_nvfp4_attention_output;
 #[cfg(feature = "device")]
 mod qwen35_nvfp4_attention_output_benchmark;

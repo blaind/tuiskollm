@@ -126,6 +126,18 @@ impl Qwen35LongContextKvLayout {
         self.arena_bytes() - self.owner_bytes()
     }
 
+    pub(crate) const fn builder(&self) -> &ArenaLayout {
+        &self.builder
+    }
+
+    pub(crate) const fn block_tables(&self) -> ArenaRegion<u32> {
+        self.block_tables
+    }
+
+    pub(crate) fn layers(&self) -> &[Qwen35LayerKvRegions] {
+        &self.layers
+    }
+
     fn validate_regions(&self) -> EngineResult<()> {
         let mut spans = Vec::with_capacity(1 + self.layers.len() * 2);
         spans.push((
