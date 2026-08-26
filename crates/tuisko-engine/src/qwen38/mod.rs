@@ -1,5 +1,6 @@
 //! Qwen3.8-27B target layer, endpoint, and MTP programs.
 
+pub(crate) mod batch_generation;
 pub(crate) mod dense_fp8_gdn_layer;
 pub(crate) mod dense_fp8_gdn_layer_layout;
 pub(crate) mod dense_fp8_mlp;

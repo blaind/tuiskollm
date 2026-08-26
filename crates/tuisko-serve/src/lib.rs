@@ -5,6 +5,7 @@ mod request;
 mod request_log;
 mod response;
 mod server;
+mod text_generator;
 
 pub use assistant::{
     AssistantDelta, AssistantStreamFinish, AssistantStreamParser, ParsedAssistantOutput,
