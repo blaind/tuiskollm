@@ -6,6 +6,7 @@ use cuda_device::{
 };
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_simt::e4m3_to_f32;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -58,18 +59,6 @@ mod kernels {
     #[inline(always)]
     fn weight_group_scale_offset(parent_row: usize, group: usize) -> usize {
         weight_scale_offset(parent_row, group >> 2) + (group & 3)
-    }
-
-    #[inline(always)]
-    fn e4m3_to_f32(code: u8) -> f32 {
-        let exponent = (code >> 3) & 15;
-        let fraction = code & 7;
-
-        if exponent == 0 {
-            fraction as f32 * (1.0 / 512.0)
-        } else {
-            f32::from_bits(((exponent as u32 + 120) << 23) | ((fraction as u32) << 20))
-        }
     }
 
     #[inline(always)]
