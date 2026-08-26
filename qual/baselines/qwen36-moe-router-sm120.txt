@@ -7,4 +7,4 @@ projection_registers=25,25,25,25,25,25,25,25
 selection_registers=42,42,42,42,42,42,42,42
 prefill_projection_registers=25,25,25
 prefill_selection_registers=42,42,42
-shared_bytes=1024
+shared_bytes=0

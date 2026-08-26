@@ -11,4 +11,4 @@ prefill_down_registers=56,56,56
 prefill_combine_registers=28,28,28
 gate_up_shared_bytes=5120
 down_shared_bytes=2048
-combine_shared_bytes=1024
+combine_shared_bytes=0

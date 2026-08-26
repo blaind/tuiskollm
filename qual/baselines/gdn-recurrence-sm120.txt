@@ -7,4 +7,4 @@ recurrence_registers=40,40,40,40,40,40,40,40
 prefill_recurrence_registers=48,56,56,56,56,56,56,56
 prefill_recurrence_shared_bytes=35456
 prefill_epilogue_registers=22,22,22,22,22,22,22,22
-prefill_epilogue_shared_bytes=1152
+prefill_epilogue_shared_bytes=1088
