@@ -17,6 +17,11 @@ pub use common::mtp::{
     ResidentMtpGenerationStats, ResidentMtpGreedyStats, ResidentMtpSampledRound,
 };
 pub use common::progress::{ResidentLoadPhase, ResidentLoadProgress};
+pub use common::streaming::{
+    STREAMING_ABSENT_ITEM, STREAMING_ABSENT_SLOT, StreamingMappedPrimary, StreamingPrimarySource,
+    StreamingRound, StreamingSlotAssignment, StreamingSlotCache, StreamingWeightLayout,
+    StreamingWeightPool,
+};
 pub use common::text_generator::{
     ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentCancellation,
     ResidentRequestId,
@@ -26,7 +31,7 @@ pub use generation::{
     CancelledText, ChatGenerationRequest, FinishReason, GeneratedText, GenerationSession,
     GenerationStep,
 };
-pub use layout::{EndpointLayout, LayerMemoryLayout, MAX_BATCH};
+pub use layout::{EndpointLayout, LayerMemoryLayout, MAX_BATCH, StreamingResidencyAccounting};
 pub use paged_kv_slots::{PagedKvRoute, PagedKvSlotPool, PagedKvSlotState, PagedKvTableUpdate};
 pub use program::TextEndpointProgram;
 pub use qwen35::batch_generation::Qwen35ResidentBatchGenerator;
