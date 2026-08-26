@@ -1,7 +1,7 @@
 //! Single-allocation layout for one dense-FP8 GDN decoder layer.
 
 use crate::common::math::{product, sum};
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::{EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::Arch;
 
@@ -239,6 +239,25 @@ impl DenseFp8GdnLayerLayout {
     /// Resident weights plus workspace, excluding alignment padding.
     pub const fn owner_bytes(&self) -> usize {
         self.resident_weight_bytes + self.workspace_bytes
+    }
+}
+
+impl LayerMemoryLayout for DenseFp8GdnLayerLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    // This owner holds no paged key/value cache.
+    fn cache_bytes(&self) -> usize {
+        0
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 

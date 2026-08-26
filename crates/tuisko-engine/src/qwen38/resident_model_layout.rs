@@ -2,7 +2,7 @@
 
 use crate::common::math::{checked_sum, product};
 use crate::{
-    EngineError, EngineResult, KvCacheCodec, MAX_BATCH, SharedPagedKvLayout,
+    EngineError, EngineResult, KvCacheCodec, LayerMemoryLayout, MAX_BATCH, SharedPagedKvLayout,
     qwen38::long_context_kv_layout::MAX_CONTEXT_TOKENS,
 };
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
@@ -864,6 +864,24 @@ impl ResidentModelLayout {
         }
 
         Ok(())
+    }
+}
+
+impl LayerMemoryLayout for ResidentModelLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 

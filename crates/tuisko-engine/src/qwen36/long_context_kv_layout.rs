@@ -1,7 +1,7 @@
 //! Shared E4M3 KV ownership for the exact Qwen3.6 text geometry.
 
 use crate::common::math::product;
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::{EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{Arch, Qwen36Moe35B};
@@ -172,6 +172,26 @@ impl Qwen36LongContextKvLayout {
         }
 
         Ok(())
+    }
+}
+
+impl LayerMemoryLayout for Qwen36LongContextKvLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    // A paged cache owner carries no source-backed weights.
+    fn resident_weight_bytes(&self) -> usize {
+        0
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    // Block tables are the owner's only address-stable non-cache bytes.
+    fn workspace_bytes(&self) -> usize {
+        self.block_table_bytes()
     }
 }
 

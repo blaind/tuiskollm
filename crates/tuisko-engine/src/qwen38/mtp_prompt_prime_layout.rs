@@ -1,7 +1,7 @@
 //! Address-stable prompt-priming layout for the exact Qwen3.8 MTP layer.
 
 use crate::common::math::{product, sum};
-use crate::{EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH};
+use crate::{EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{Arch, Qwen38_27B};
@@ -194,6 +194,24 @@ impl MtpPromptPrimeLayout {
     /// Alignment bytes not attributed to a represented owner plane.
     pub const fn padding_bytes(&self) -> usize {
         self.arena_bytes() - self.owner_bytes()
+    }
+}
+
+impl LayerMemoryLayout for MtpPromptPrimeLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 

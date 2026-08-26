@@ -1,7 +1,7 @@
 //! Single-allocation layout for one Qwen3.5 full-attention layer.
 
 use crate::common::math::{product, sum};
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::{EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{Arch, Qwen35_9B};
@@ -327,6 +327,24 @@ impl Qwen35FullAttentionLayerLayout {
     /// Per-slot from-empty prompt cache capacity.
     pub const fn prefill_context_capacity(&self) -> usize {
         QWEN35_CONTEXT_CAPACITY
+    }
+}
+
+impl LayerMemoryLayout for Qwen35FullAttentionLayerLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 

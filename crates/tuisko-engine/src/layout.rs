@@ -5,6 +5,24 @@ use crate::common::math::{product, sum};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::Arch;
 
+/// Byte accounting shared by every resident layout.
+///
+/// Inspection only: it reports totals for auditing and metrics and never constructs a layout,
+/// selects a route, or exposes device state.
+pub trait LayerMemoryLayout {
+    /// Complete allocation size in bytes including alignment padding.
+    fn arena_bytes(&self) -> usize;
+
+    /// Source-backed resident device weight bytes.
+    fn resident_weight_bytes(&self) -> usize;
+
+    /// Quantized key/value cache bytes.
+    fn cache_bytes(&self) -> usize;
+
+    /// Address-stable activation and transient workspace bytes.
+    fn workspace_bytes(&self) -> usize;
+}
+
 /// Largest admitted compact decode batch.
 pub const MAX_BATCH: usize = 8;
 
@@ -131,6 +149,25 @@ impl EndpointLayout {
 
     pub(crate) const fn logits(&self) -> ArenaRegion<u16> {
         self.logits
+    }
+}
+
+impl LayerMemoryLayout for EndpointLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    // This owner holds no paged key/value cache.
+    fn cache_bytes(&self) -> usize {
+        0
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 

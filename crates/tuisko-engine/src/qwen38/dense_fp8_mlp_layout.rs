@@ -1,7 +1,7 @@
 //! Single-allocation layout for one resident dense-FP8 MLP boundary.
 
-use crate::EngineResult;
 use crate::common::math::{product, sum};
+use crate::{EngineResult, LayerMemoryLayout};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::Arch;
 
@@ -200,6 +200,25 @@ impl DenseFp8MlpLayout {
 
     pub(crate) const fn next_normalized(&self) -> ArenaRegion<u16> {
         self.next_normalized
+    }
+}
+
+impl LayerMemoryLayout for DenseFp8MlpLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    // This owner holds no paged key/value cache.
+    fn cache_bytes(&self) -> usize {
+        0
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 

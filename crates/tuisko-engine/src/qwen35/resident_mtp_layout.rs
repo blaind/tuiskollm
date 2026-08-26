@@ -1,7 +1,9 @@
 //! Aggregate ownership for the exact Qwen3.5 target and MTP resident programs.
 
 use crate::qwen35::mtp_kv_layout::Qwen35MtpKvLayout;
-use crate::{EngineError, EngineResult, Qwen35MtpLayerLayout, Qwen35ResidentModelLayout};
+use crate::{
+    EngineError, EngineResult, LayerMemoryLayout, Qwen35MtpLayerLayout, Qwen35ResidentModelLayout,
+};
 
 /// Exact target, MTP weight, cache-mirror, and workspace byte accounting.
 #[derive(Clone, Debug)]
@@ -87,6 +89,24 @@ impl Qwen35ResidentMtpLayout {
     /// Maximum context admitted by both page-table owners.
     pub const fn context_capacity(&self) -> usize {
         self.target.context_capacity()
+    }
+}
+
+impl LayerMemoryLayout for Qwen35ResidentMtpLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 

@@ -5,7 +5,7 @@ use crate::common::math::{checked_sum, product, sum_products};
 use crate::common::slots::require_batch;
 use crate::qwen36::long_context_kv::Qwen36AttentionKvBinding;
 use crate::{
-    EngineError, EngineResult, MAX_BATCH, Qwen36FullAttentionLayerLayout,
+    EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH, Qwen36FullAttentionLayerLayout,
     Qwen36FullAttentionLayerProgram, Qwen36GdnMoeLayerLayout, Qwen36GdnMoeLayerProgram,
     Qwen36LongContextKvLayout, Qwen36LongContextKvProgram, Qwen36TextEndpointLayout,
     Qwen36TextEndpointProgram,
@@ -171,6 +171,24 @@ impl Qwen36ResidentModelLayout {
     /// Maximum context admitted by the pinned Qwen3.6 config.
     pub const fn context_capacity(&self) -> usize {
         crate::QWEN36_MAX_CONTEXT_TOKENS
+    }
+}
+
+impl LayerMemoryLayout for Qwen36ResidentModelLayout {
+    fn arena_bytes(&self) -> usize {
+        self.arena_bytes()
+    }
+
+    fn resident_weight_bytes(&self) -> usize {
+        self.resident_weight_bytes()
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes()
     }
 }
 
