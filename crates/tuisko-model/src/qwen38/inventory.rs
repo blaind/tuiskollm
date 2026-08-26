@@ -137,11 +137,11 @@ mod tests {
     use crate::common::inventory::{
         CheckpointSnapshot, ExpectedTensor, INDEX_FILE, MODEL_FILE, validate_exact_tensors,
     };
+    use crate::common::test_builder::SafeTensorTestBuilder;
     use crate::{Arch, CheckpointErrorCode, DType, SafeTensorFile};
-    use serde_json::{Value, json};
+    use serde_json::json;
     use std::collections::BTreeMap;
-    use std::fs::{self, File};
-    use std::io::Write;
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -311,31 +311,13 @@ mod tests {
     }
 
     fn write_safetensors(path: &Path, names: &[&str]) {
-        let mut header = serde_json::Map::new();
+        let mut fixture = SafeTensorTestBuilder::new();
 
-        for (offset, name) in names.iter().enumerate() {
-            header.insert(
-                (*name).to_owned(),
-                json!({
-                    "dtype": "U8",
-                    "shape": [1],
-                    "data_offsets": [offset, offset + 1]
-                }),
-            );
+        for name in names {
+            fixture.add_raw(*name, DType::U8, &[1], 0);
         }
 
-        let mut header = serde_json::to_vec(&Value::Object(header)).unwrap();
-
-        while !header.len().is_multiple_of(8) {
-            header.push(b' ');
-        }
-
-        let mut file = File::create(path).unwrap();
-
-        file.write_all(&(header.len() as u64).to_le_bytes())
-            .unwrap();
-        file.write_all(&header).unwrap();
-        file.write_all(&vec![0; names.len()]).unwrap();
+        fixture.write(path);
     }
 
     fn write_index(root: &Path, total_bytes: u64, weight_map: &BTreeMap<String, String>) -> u64 {

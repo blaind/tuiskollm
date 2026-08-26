@@ -4,7 +4,7 @@
 pub(crate) mod sources {
     use crate::common::scale_swizzle::{SCALE_TILE_GROUPS, SCALE_TILE_ROWS};
     use crate::{Arch, Bf16View, DType, F32View, Fp8E4M3View, TensorView, U8View};
-    use serde_json::{Value, json};
+    use serde_json::Value;
     use std::fs::File;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -99,30 +99,6 @@ pub(crate) mod sources {
             .unwrap();
         file.write_all(&header).unwrap();
         file.write_all(payload).unwrap();
-    }
-
-    pub(crate) fn append_bf16_tensor(
-        header: &mut serde_json::Map<String, Value>,
-        payload: &mut Vec<u8>,
-        name: impl Into<String>,
-        shape: Vec<usize>,
-    ) {
-        let begin = payload.len();
-        let elements = shape.iter().product::<usize>();
-        let word = u16::try_from(header.len() + 1).unwrap().to_le_bytes();
-
-        for _ in 0..elements {
-            payload.extend_from_slice(&word);
-        }
-
-        header.insert(
-            name.into(),
-            json!({
-                "dtype": "BF16",
-                "shape": shape,
-                "data_offsets": [begin, payload.len()]
-            }),
-        );
     }
 
     pub(crate) const ROWS: usize = 128;

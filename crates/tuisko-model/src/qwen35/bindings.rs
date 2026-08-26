@@ -419,11 +419,11 @@ fn require_modelopt_contract<A: Arch>(role: &str) -> CheckpointResult<()> {
 mod tests {
     use super::*;
     use crate::common::routes::{E2M1_VALUES_PER_BYTE, NVFP4_GROUP_SIZE};
+    use crate::common::test_builder::SafeTensorTestBuilder;
     use crate::common::test_support::sources::{
-        Nvfp4Arch, append_bf16_tensor, fixture_path, write_safetensors_payload,
+        Nvfp4Arch, fixture_path, write_safetensors_payload,
     };
-    use crate::{Arch, CheckpointContract, CheckpointErrorCode, SafeTensorFile};
-    use serde_json::{Value, json};
+    use crate::{Arch, CheckpointContract, CheckpointErrorCode, DType, SafeTensorFile};
     use std::fs;
 
     #[derive(Clone, Copy)]
@@ -460,97 +460,90 @@ mod tests {
         const VISION_TEMPORAL_PATCH_SIZE: usize = 1;
     }
 
-    fn modelopt_endpoint_fixture() -> (Value, Vec<u8>) {
-        let mut header = serde_json::Map::new();
-        let mut payload = Vec::new();
+    fn modelopt_endpoint_fixture() -> SafeTensorTestBuilder {
+        let mut fixture = SafeTensorTestBuilder::new();
 
-        for (name, shape) in [
-            (
+        fixture
+            .add_bf16_ordinal(
                 "model.language_model.embed_tokens.weight",
-                vec![ModelOptArch::VOCAB, ModelOptArch::HIDDEN],
-            ),
-            (
-                "model.language_model.norm.weight",
-                vec![ModelOptArch::HIDDEN],
-            ),
-            (
+                &[ModelOptArch::VOCAB, ModelOptArch::HIDDEN],
+            )
+            .add_bf16_ordinal("model.language_model.norm.weight", &[ModelOptArch::HIDDEN])
+            .add_bf16_ordinal(
                 "lm_head.weight",
-                vec![ModelOptArch::VOCAB, ModelOptArch::HIDDEN],
-            ),
-        ] {
-            append_bf16_tensor(&mut header, &mut payload, name, shape);
-        }
+                &[ModelOptArch::VOCAB, ModelOptArch::HIDDEN],
+            );
 
-        (Value::Object(header), payload)
+        fixture
     }
 
-    fn modelopt_nvfp4_mlp_fixture(layer: usize) -> (Value, Vec<u8>) {
+    fn modelopt_nvfp4_mlp_fixture(layer: usize) -> SafeTensorTestBuilder {
         let prefix = format!("model.language_model.layers.{layer}.mlp");
         let layer_prefix = format!("model.language_model.layers.{layer}");
         let next_layer_prefix = format!("model.language_model.layers.{}", layer + 1);
-        let mut payload = vec![0x38; 1_016];
+        let mut fixture = SafeTensorTestBuilder::new();
 
-        payload[0..4].copy_from_slice(&0.25f32.to_le_bytes());
-        payload[4..8].copy_from_slice(&0.125f32.to_le_bytes());
-        payload[8..12].copy_from_slice(&0.25f32.to_le_bytes());
-        payload[12..16].copy_from_slice(&0.125f32.to_le_bytes());
-        payload[16..20].copy_from_slice(&0.5f32.to_le_bytes());
-        payload[20..24].copy_from_slice(&0.0625f32.to_le_bytes());
-        payload[888..952].fill(0x70);
-        payload[952..1_016].fill(0x80);
+        fixture
+            .add_rank0_f32(format!("{prefix}.gate_proj.input_scale"), 0.25)
+            .add_rank0_f32(format!("{prefix}.gate_proj.weight_scale_2"), 0.125)
+            .add_rank0_f32(format!("{prefix}.up_proj.input_scale"), 0.25)
+            .add_rank0_f32(format!("{prefix}.up_proj.weight_scale_2"), 0.125)
+            .add_rank0_f32(format!("{prefix}.down_proj.input_scale"), 0.5)
+            .add_rank0_f32(format!("{prefix}.down_proj.weight_scale_2"), 0.0625)
+            .add_raw(
+                format!("{prefix}.gate_proj.weight_scale"),
+                DType::Fp8E4M3,
+                &[16, 2],
+                0x38,
+            )
+            .add_raw(
+                format!("{prefix}.up_proj.weight_scale"),
+                DType::Fp8E4M3,
+                &[16, 2],
+                0x38,
+            )
+            .add_raw(
+                format!("{prefix}.down_proj.weight_scale"),
+                DType::Fp8E4M3,
+                &[32, 1],
+                0x38,
+            )
+            .add_raw(
+                format!("{prefix}.gate_proj.weight"),
+                DType::U8,
+                &[16, 16],
+                0x38,
+            )
+            .add_raw(
+                format!("{prefix}.up_proj.weight"),
+                DType::U8,
+                &[16, 16],
+                0x38,
+            )
+            .add_raw(
+                format!("{prefix}.down_proj.weight"),
+                DType::U8,
+                &[32, 8],
+                0x38,
+            )
+            .add_raw(
+                format!("{layer_prefix}.post_attention_layernorm.weight"),
+                DType::Bf16,
+                &[32],
+                0x70,
+            )
+            .add_raw(
+                format!("{next_layer_prefix}.input_layernorm.weight"),
+                DType::Bf16,
+                &[32],
+                0x80,
+            );
 
-        (
-            json!({
-                format!("{prefix}.gate_proj.input_scale"): {
-                    "dtype":"F32", "shape":[], "data_offsets":[0,4]
-                },
-                format!("{prefix}.gate_proj.weight_scale_2"): {
-                    "dtype":"F32", "shape":[], "data_offsets":[4,8]
-                },
-                format!("{prefix}.up_proj.input_scale"): {
-                    "dtype":"F32", "shape":[], "data_offsets":[8,12]
-                },
-                format!("{prefix}.up_proj.weight_scale_2"): {
-                    "dtype":"F32", "shape":[], "data_offsets":[12,16]
-                },
-                format!("{prefix}.down_proj.input_scale"): {
-                    "dtype":"F32", "shape":[], "data_offsets":[16,20]
-                },
-                format!("{prefix}.down_proj.weight_scale_2"): {
-                    "dtype":"F32", "shape":[], "data_offsets":[20,24]
-                },
-                format!("{prefix}.gate_proj.weight_scale"): {
-                    "dtype":"F8_E4M3", "shape":[16,2], "data_offsets":[24,56]
-                },
-                format!("{prefix}.up_proj.weight_scale"): {
-                    "dtype":"F8_E4M3", "shape":[16,2], "data_offsets":[56,88]
-                },
-                format!("{prefix}.down_proj.weight_scale"): {
-                    "dtype":"F8_E4M3", "shape":[32,1], "data_offsets":[88,120]
-                },
-                format!("{prefix}.gate_proj.weight"): {
-                    "dtype":"U8", "shape":[16,16], "data_offsets":[120,376]
-                },
-                format!("{prefix}.up_proj.weight"): {
-                    "dtype":"U8", "shape":[16,16], "data_offsets":[376,632]
-                },
-                format!("{prefix}.down_proj.weight"): {
-                    "dtype":"U8", "shape":[32,8], "data_offsets":[632,888]
-                },
-                format!("{layer_prefix}.post_attention_layernorm.weight"): {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[888,952]
-                },
-                format!("{next_layer_prefix}.input_layernorm.weight"): {
-                    "dtype":"BF16", "shape":[32], "data_offsets":[952,1016]
-                }
-            }),
-            payload,
-        )
+        fixture
     }
 
     fn append_modelopt_linear(
-        header: &mut serde_json::Map<String, Value>,
-        payload: &mut Vec<u8>,
+        fixture: &mut SafeTensorTestBuilder,
         prefix: &str,
         geometry: [usize; 2],
         scales: [f32; 2],
@@ -559,53 +552,27 @@ mod tests {
         let [rows, columns] = geometry;
         let [input_scale, weight_scale_2] = scales;
 
-        for (suffix, value) in [
-            ("input_scale", input_scale),
-            ("weight_scale_2", weight_scale_2),
-        ] {
-            let begin = payload.len();
-            payload.extend_from_slice(&value.to_le_bytes());
-            header.insert(
-                format!("{prefix}.{suffix}"),
-                json!({
-                    "dtype": "F32",
-                    "shape": [],
-                    "data_offsets": [begin, payload.len()]
-                }),
+        fixture
+            .add_rank0_f32(format!("{prefix}.input_scale"), input_scale)
+            .add_rank0_f32(format!("{prefix}.weight_scale_2"), weight_scale_2)
+            .add_raw(
+                format!("{prefix}.weight_scale"),
+                DType::Fp8E4M3,
+                &[rows, columns / NVFP4_GROUP_SIZE],
+                0x38,
+            )
+            .add_raw(
+                format!("{prefix}.weight"),
+                DType::U8,
+                &[rows, columns / E2M1_VALUES_PER_BYTE],
+                weight_code,
             );
-        }
-
-        let scale_begin = payload.len();
-        payload.resize(scale_begin + rows * (columns / NVFP4_GROUP_SIZE), 0x38);
-        header.insert(
-            format!("{prefix}.weight_scale"),
-            json!({
-                "dtype": "F8_E4M3",
-                "shape": [rows, columns / NVFP4_GROUP_SIZE],
-                "data_offsets": [scale_begin, payload.len()]
-            }),
-        );
-
-        let weight_begin = payload.len();
-        payload.resize(
-            weight_begin + rows * (columns / E2M1_VALUES_PER_BYTE),
-            weight_code,
-        );
-        header.insert(
-            format!("{prefix}.weight"),
-            json!({
-                "dtype": "U8",
-                "shape": [rows, columns / E2M1_VALUES_PER_BYTE],
-                "data_offsets": [weight_begin, payload.len()]
-            }),
-        );
     }
 
-    fn modelopt_gdn_fixture(layer: usize) -> (Value, Vec<u8>) {
+    fn modelopt_gdn_fixture(layer: usize) -> SafeTensorTestBuilder {
         let layer_prefix = format!("model.language_model.layers.{layer}");
         let prefix = format!("{layer_prefix}.linear_attn");
-        let mut header = serde_json::Map::new();
-        let mut payload = Vec::new();
+        let mut fixture = SafeTensorTestBuilder::new();
 
         for (projection, rows, input_scale, weight_scale, code) in [
             ("in_proj_qkv", ModelOptArch::GDN_QKV_ROWS, 0.25, 0.125, 0x10),
@@ -614,8 +581,7 @@ mod tests {
             ("in_proj_b", ModelOptArch::GDN_CONTROL_ROWS, 0.25, 1.0, 0x40),
         ] {
             append_modelopt_linear(
-                &mut header,
-                &mut payload,
+                &mut fixture,
                 &format!("{prefix}.{projection}"),
                 [rows, ModelOptArch::HIDDEN],
                 [input_scale, weight_scale],
@@ -623,8 +589,7 @@ mod tests {
             );
         }
         append_modelopt_linear(
-            &mut header,
-            &mut payload,
+            &mut fixture,
             &format!("{prefix}.out_proj"),
             [ModelOptArch::HIDDEN, ModelOptArch::GDN_VALUE_ROWS],
             [0.5, 0.0625],
@@ -661,17 +626,16 @@ mod tests {
                 vec![ModelOptArch::HIDDEN],
             ),
         ] {
-            append_bf16_tensor(&mut header, &mut payload, name, shape);
+            fixture.add_bf16_ordinal(name, &shape);
         }
 
-        (Value::Object(header), payload)
+        fixture
     }
 
-    fn modelopt_attention_fixture(layer: usize) -> (Value, Vec<u8>) {
+    fn modelopt_attention_fixture(layer: usize) -> SafeTensorTestBuilder {
         let layer_prefix = format!("model.language_model.layers.{layer}");
         let prefix = format!("{layer_prefix}.self_attn");
-        let mut header = serde_json::Map::new();
-        let mut payload = Vec::new();
+        let mut fixture = SafeTensorTestBuilder::new();
 
         for (projection, rows, input_scale, weight_scale, code) in [
             (
@@ -685,8 +649,7 @@ mod tests {
             ("v_proj", ModelOptArch::ATTENTION_KV_ROWS, 0.25, 0.5, 0x30),
         ] {
             append_modelopt_linear(
-                &mut header,
-                &mut payload,
+                &mut fixture,
                 &format!("{prefix}.{projection}"),
                 [rows, ModelOptArch::HIDDEN],
                 [input_scale, weight_scale],
@@ -694,8 +657,7 @@ mod tests {
             );
         }
         append_modelopt_linear(
-            &mut header,
-            &mut payload,
+            &mut fixture,
             &format!("{prefix}.o_proj"),
             [ModelOptArch::HIDDEN, ModelOptArch::ATTENTION_OUTPUT_COLUMNS],
             [0.5, 0.0625],
@@ -720,17 +682,16 @@ mod tests {
                 vec![ModelOptArch::HIDDEN],
             ),
         ] {
-            append_bf16_tensor(&mut header, &mut payload, name, shape);
+            fixture.add_bf16_ordinal(name, &shape);
         }
 
-        (Value::Object(header), payload)
+        fixture
     }
 
     #[test]
     fn binds_exact_bf16_text_endpoint_contract() {
         let path = fixture_path("modelopt-endpoints");
-        let (header, payload) = modelopt_endpoint_fixture();
-        write_safetensors_payload(&path, header, &payload);
+        modelopt_endpoint_fixture().write(&path);
         let file = SafeTensorFile::open(&path).unwrap();
 
         let bindings =
@@ -754,8 +715,7 @@ mod tests {
     #[test]
     fn binds_exact_modelopt_nvfp4_mlp_source_contract() {
         let path = fixture_path("modelopt-nvfp4-mlp");
-        let (header, payload) = modelopt_nvfp4_mlp_fixture(0);
-        write_safetensors_payload(&path, header, &payload);
+        modelopt_nvfp4_mlp_fixture(0).write(&path);
         let file = SafeTensorFile::open(&path).unwrap();
 
         let bindings =
@@ -782,7 +742,7 @@ mod tests {
 
     #[test]
     fn rejects_modelopt_nvfp4_scale_and_route_drift() {
-        let (header, payload) = modelopt_nvfp4_mlp_fixture(0);
+        let (header, payload) = modelopt_nvfp4_mlp_fixture(0).into_parts();
 
         for (label, offset, bytes, expected) in [
             (
@@ -838,8 +798,7 @@ mod tests {
     #[test]
     fn binds_exact_modelopt_nvfp4_attention_source_contract() {
         let path = fixture_path("modelopt-attention");
-        let (header, payload) = modelopt_attention_fixture(1);
-        write_safetensors_payload(&path, header, &payload);
+        modelopt_attention_fixture(1).write(&path);
         let file = SafeTensorFile::open(&path).unwrap();
 
         let bindings =
@@ -866,7 +825,7 @@ mod tests {
     #[test]
     fn rejects_modelopt_attention_route_and_shared_input_scale_drift() {
         let path = fixture_path("modelopt-attention-scale-drift");
-        let (header, mut payload) = modelopt_attention_fixture(1);
+        let (header, mut payload) = modelopt_attention_fixture(1).into_parts();
         let offset =
             header["model.language_model.layers.1.self_attn.k_proj.input_scale"]["data_offsets"][0]
                 .as_u64()
@@ -899,8 +858,7 @@ mod tests {
     #[test]
     fn binds_exact_modelopt_nvfp4_gdn_source_contract() {
         let path = fixture_path("modelopt-gdn");
-        let (header, payload) = modelopt_gdn_fixture(0);
-        write_safetensors_payload(&path, header, &payload);
+        modelopt_gdn_fixture(0).write(&path);
         let file = SafeTensorFile::open(&path).unwrap();
 
         let bindings =
@@ -930,7 +888,7 @@ mod tests {
     #[test]
     fn rejects_modelopt_gdn_route_and_shared_input_scale_drift() {
         let path = fixture_path("modelopt-gdn-scale-drift");
-        let (header, mut payload) = modelopt_gdn_fixture(0);
+        let (header, mut payload) = modelopt_gdn_fixture(0).into_parts();
         let offset = header["model.language_model.layers.0.linear_attn.in_proj_z.input_scale"]
             ["data_offsets"][0]
             .as_u64()

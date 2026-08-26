@@ -673,42 +673,38 @@ mod tests {
     use crate::common::inventory::CheckpointSnapshot;
     use crate::common::naming::{EMBEDDING, FINAL_NORM, LM_HEAD, LM_HEAD_SCALE};
     use crate::common::routes::{E2M1_VALUES_PER_BYTE, NVFP4_GROUP_SIZE};
-    use crate::common::test_support::sources::{
-        append_bf16_tensor, fixture_path, write_safetensors_payload,
-    };
-    use crate::{Arch, CheckpointErrorCode, Qwen36Moe35B, SafeTensorFile};
+    use crate::common::test_builder::SafeTensorTestBuilder;
+    use crate::common::test_support::sources::{fixture_path, write_safetensors_payload};
+    use crate::{Arch, CheckpointErrorCode, DType, Qwen36Moe35B, SafeTensorFile};
     use serde_json::{Value, json};
     use std::fs;
     use std::path::Path;
 
-    fn qwen36_endpoint_fixture() -> (Value, Vec<u8>) {
+    fn qwen36_endpoint_fixture() -> SafeTensorTestBuilder {
         const VOCAB: usize = 128;
         const HIDDEN: usize = 64;
 
-        let mut header = serde_json::Map::new();
-        let mut payload = Vec::new();
-        append_bf16_tensor(&mut header, &mut payload, EMBEDDING, vec![VOCAB, HIDDEN]);
-        append_bf16_tensor(&mut header, &mut payload, FINAL_NORM, vec![HIDDEN]);
-        append_rank_zero_f32(&mut header, &mut payload, "lm_head.input_scale", 0.25);
-        append_raw_tensor(
-            &mut header,
-            &mut payload,
-            LM_HEAD,
-            "U8",
-            vec![VOCAB, HIDDEN / E2M1_VALUES_PER_BYTE],
-            0x21,
-        );
-        append_raw_tensor(
-            &mut header,
-            &mut payload,
-            LM_HEAD_SCALE,
-            "F8_E4M3",
-            vec![VOCAB, HIDDEN / NVFP4_GROUP_SIZE],
-            0x38,
-        );
-        append_rank_zero_f32(&mut header, &mut payload, "lm_head.weight_scale_2", 0.125);
+        let mut fixture = SafeTensorTestBuilder::new();
 
-        (Value::Object(header), payload)
+        fixture
+            .add_bf16_ordinal(EMBEDDING, &[VOCAB, HIDDEN])
+            .add_bf16_ordinal(FINAL_NORM, &[HIDDEN])
+            .add_rank0_f32("lm_head.input_scale", 0.25)
+            .add_raw(
+                LM_HEAD,
+                DType::U8,
+                &[VOCAB, HIDDEN / E2M1_VALUES_PER_BYTE],
+                0x21,
+            )
+            .add_raw(
+                LM_HEAD_SCALE,
+                DType::Fp8E4M3,
+                &[VOCAB, HIDDEN / NVFP4_GROUP_SIZE],
+                0x38,
+            )
+            .add_rank0_f32("lm_head.weight_scale_2", 0.125);
+
+        fixture
     }
 
     fn qwen36_moe_fixture(
@@ -716,29 +712,21 @@ mod tests {
         hidden: usize,
         intermediate: usize,
         experts: usize,
-    ) -> (Value, Vec<u8>) {
+    ) -> SafeTensorTestBuilder {
         let layer_prefix = format!("model.language_model.layers.{layer}");
         let mlp_prefix = format!("{layer_prefix}.mlp");
-        let mut header = serde_json::Map::new();
-        let mut payload = Vec::new();
+        let mut fixture = SafeTensorTestBuilder::new();
 
-        append_bf16_tensor(
-            &mut header,
-            &mut payload,
-            format!("{mlp_prefix}.gate.weight"),
-            vec![experts, hidden],
-        );
-        append_bf16_tensor(
-            &mut header,
-            &mut payload,
-            format!("{mlp_prefix}.shared_expert_gate.weight"),
-            vec![1, hidden],
-        );
+        fixture
+            .add_bf16_ordinal(format!("{mlp_prefix}.gate.weight"), &[experts, hidden])
+            .add_bf16_ordinal(
+                format!("{mlp_prefix}.shared_expert_gate.weight"),
+                &[1, hidden],
+            );
 
         for expert in 0..experts {
             append_qwen36_expert(
-                &mut header,
-                &mut payload,
+                &mut fixture,
                 &format!("{mlp_prefix}.experts.{expert}"),
                 hidden,
                 intermediate,
@@ -746,33 +734,29 @@ mod tests {
             );
         }
         append_qwen36_expert(
-            &mut header,
-            &mut payload,
+            &mut fixture,
             &format!("{mlp_prefix}.shared_expert"),
             hidden,
             intermediate,
             0x40,
         );
-        append_bf16_tensor(
-            &mut header,
-            &mut payload,
-            format!("{layer_prefix}.post_attention_layernorm.weight"),
-            vec![hidden],
-        );
-        append_bf16_tensor(
-            &mut header,
-            &mut payload,
-            format!(
-                "model.language_model.layers.{}.input_layernorm.weight",
-                layer + 1
-            ),
-            vec![hidden],
-        );
+        fixture
+            .add_bf16_ordinal(
+                format!("{layer_prefix}.post_attention_layernorm.weight"),
+                &[hidden],
+            )
+            .add_bf16_ordinal(
+                format!(
+                    "model.language_model.layers.{}.input_layernorm.weight",
+                    layer + 1
+                ),
+                &[hidden],
+            );
 
-        (Value::Object(header), payload)
+        fixture
     }
 
-    fn qwen36_gdn_fixture(layer: usize) -> (Value, Vec<u8>) {
+    fn qwen36_gdn_fixture(layer: usize) -> SafeTensorTestBuilder {
         const HIDDEN: usize = 32;
         const QKV_ROWS: usize = 16;
         const VALUE_ROWS: usize = 8;
@@ -782,12 +766,10 @@ mod tests {
 
         let layer_prefix = format!("model.language_model.layers.{layer}");
         let prefix = format!("{layer_prefix}.linear_attn");
-        let mut header = serde_json::Map::new();
-        let mut payload = Vec::new();
+        let mut fixture = SafeTensorTestBuilder::new();
 
         append_qwen36_fp8_linear(
-            &mut header,
-            &mut payload,
+            &mut fixture,
             &format!("{prefix}.in_proj_qkv"),
             QKV_ROWS,
             HIDDEN,
@@ -796,8 +778,7 @@ mod tests {
             0x10,
         );
         append_qwen36_fp8_linear(
-            &mut header,
-            &mut payload,
+            &mut fixture,
             &format!("{prefix}.in_proj_z"),
             VALUE_ROWS,
             HIDDEN,
@@ -805,21 +786,17 @@ mod tests {
             0.0625,
             0x20,
         );
-        append_bf16_tensor(
-            &mut header,
-            &mut payload,
-            format!("{prefix}.in_proj_a.weight"),
-            vec![CONTROL_ROWS, HIDDEN],
-        );
-        append_bf16_tensor(
-            &mut header,
-            &mut payload,
-            format!("{prefix}.in_proj_b.weight"),
-            vec![CONTROL_ROWS, HIDDEN],
-        );
+        fixture
+            .add_bf16_ordinal(
+                format!("{prefix}.in_proj_a.weight"),
+                &[CONTROL_ROWS, HIDDEN],
+            )
+            .add_bf16_ordinal(
+                format!("{prefix}.in_proj_b.weight"),
+                &[CONTROL_ROWS, HIDDEN],
+            );
         append_qwen36_fp8_linear(
-            &mut header,
-            &mut payload,
+            &mut fixture,
             &format!("{prefix}.out_proj"),
             HIDDEN,
             VALUE_ROWS,
@@ -844,13 +821,13 @@ mod tests {
                 vec![HIDDEN],
             ),
         ] {
-            append_bf16_tensor(&mut header, &mut payload, name, shape);
+            fixture.add_bf16_ordinal(name, &shape);
         }
 
-        (Value::Object(header), payload)
+        fixture
     }
 
-    fn qwen36_attention_fixture(layer: usize) -> (Value, Vec<u8>) {
+    fn qwen36_attention_fixture(layer: usize) -> SafeTensorTestBuilder {
         const HIDDEN: usize = 32;
         const QUERY_ROWS: usize = 16;
         const KV_ROWS: usize = 4;
@@ -859,8 +836,7 @@ mod tests {
 
         let layer_prefix = format!("model.language_model.layers.{layer}");
         let prefix = format!("{layer_prefix}.self_attn");
-        let mut header = serde_json::Map::new();
-        let mut payload = Vec::new();
+        let mut fixture = SafeTensorTestBuilder::new();
 
         for (projection, rows, columns, weight_scale, marker) in [
             ("q_proj", QUERY_ROWS, HIDDEN, 0.125, 0x10),
@@ -868,8 +844,7 @@ mod tests {
             ("v_proj", KV_ROWS, HIDDEN, 0.03125, 0x30),
         ] {
             append_qwen36_fp8_linear(
-                &mut header,
-                &mut payload,
+                &mut fixture,
                 &format!("{prefix}.{projection}"),
                 rows,
                 columns,
@@ -879,8 +854,7 @@ mod tests {
             );
         }
         append_qwen36_fp8_linear(
-            &mut header,
-            &mut payload,
+            &mut fixture,
             &format!("{prefix}.o_proj"),
             HIDDEN,
             OUTPUT_COLUMNS,
@@ -900,16 +874,15 @@ mod tests {
                 vec![HIDDEN],
             ),
         ] {
-            append_bf16_tensor(&mut header, &mut payload, name, shape);
+            fixture.add_bf16_ordinal(name, &shape);
         }
 
-        (Value::Object(header), payload)
+        fixture
     }
 
     #[allow(clippy::too_many_arguments)]
     fn append_qwen36_fp8_linear(
-        header: &mut serde_json::Map<String, Value>,
-        payload: &mut Vec<u8>,
+        fixture: &mut SafeTensorTestBuilder,
         prefix: &str,
         rows: usize,
         columns: usize,
@@ -917,31 +890,19 @@ mod tests {
         weight_scale: f32,
         marker: u8,
     ) {
-        append_rank_zero_f32(
-            header,
-            payload,
-            format!("{prefix}.input_scale"),
-            input_scale,
-        );
-        append_raw_tensor(
-            header,
-            payload,
-            format!("{prefix}.weight"),
-            "F8_E4M3",
-            vec![rows, columns],
-            marker,
-        );
-        append_rank_zero_f32(
-            header,
-            payload,
-            format!("{prefix}.weight_scale"),
-            weight_scale,
-        );
+        fixture
+            .add_rank0_f32(format!("{prefix}.input_scale"), input_scale)
+            .add_raw(
+                format!("{prefix}.weight"),
+                DType::Fp8E4M3,
+                &[rows, columns],
+                marker,
+            )
+            .add_rank0_f32(format!("{prefix}.weight_scale"), weight_scale);
     }
 
     fn append_qwen36_expert(
-        header: &mut serde_json::Map<String, Value>,
-        payload: &mut Vec<u8>,
+        fixture: &mut SafeTensorTestBuilder,
         prefix: &str,
         hidden: usize,
         intermediate: usize,
@@ -954,80 +915,29 @@ mod tests {
         ] {
             let projection = format!("{prefix}.{projection}");
 
-            append_rank_zero_f32(
-                header,
-                payload,
-                format!("{projection}.input_scale"),
-                input_scale,
-            );
-            append_raw_tensor(
-                header,
-                payload,
-                format!("{projection}.weight"),
-                "U8",
-                vec![rows, columns / E2M1_VALUES_PER_BYTE],
-                marker,
-            );
-            append_raw_tensor(
-                header,
-                payload,
-                format!("{projection}.weight_scale"),
-                "F8_E4M3",
-                vec![rows, columns / NVFP4_GROUP_SIZE],
-                0x38,
-            );
-            append_rank_zero_f32(
-                header,
-                payload,
-                format!("{projection}.weight_scale_2"),
-                weight_scale_2,
-            );
+            fixture
+                .add_rank0_f32(format!("{projection}.input_scale"), input_scale)
+                .add_raw(
+                    format!("{projection}.weight"),
+                    DType::U8,
+                    &[rows, columns / E2M1_VALUES_PER_BYTE],
+                    marker,
+                )
+                .add_raw(
+                    format!("{projection}.weight_scale"),
+                    DType::Fp8E4M3,
+                    &[rows, columns / NVFP4_GROUP_SIZE],
+                    0x38,
+                )
+                .add_rank0_f32(format!("{projection}.weight_scale_2"), weight_scale_2);
         }
-    }
-
-    fn append_rank_zero_f32(
-        header: &mut serde_json::Map<String, Value>,
-        payload: &mut Vec<u8>,
-        name: impl Into<String>,
-        value: f32,
-    ) {
-        let begin = payload.len();
-        payload.extend_from_slice(&value.to_le_bytes());
-        header.insert(
-            name.into(),
-            json!({
-                "dtype": "F32",
-                "shape": [],
-                "data_offsets": [begin, payload.len()]
-            }),
-        );
-    }
-
-    fn append_raw_tensor(
-        header: &mut serde_json::Map<String, Value>,
-        payload: &mut Vec<u8>,
-        name: impl Into<String>,
-        dtype: &str,
-        shape: Vec<usize>,
-        value: u8,
-    ) {
-        let begin = payload.len();
-        payload.resize(begin + shape.iter().product::<usize>(), value);
-        header.insert(
-            name.into(),
-            json!({
-                "dtype": dtype,
-                "shape": shape,
-                "data_offsets": [begin, payload.len()]
-            }),
-        );
     }
 
     fn tensor_offset(header: &Value, name: &str) -> usize {
         header[name]["data_offsets"][0].as_u64().unwrap() as usize
     }
 
-    fn qwen36_mtp_fixture() -> (Value, Vec<u8>) {
+    fn qwen36_mtp_fixture() -> SafeTensorTestBuilder {
         const HIDDEN: usize = 8;
         const INTERMEDIATE: usize = 4;
         const EXPERTS: usize = 3;
@@ -1036,8 +946,7 @@ mod tests {
         const OUTPUT_COLUMNS: usize = 3;
         const HEAD_DIM: usize = 1;
 
-        let mut header = serde_json::Map::new();
-        let mut payload = Vec::new();
+        let mut fixture = SafeTensorTestBuilder::new();
 
         for (name, shape) in [
             ("mtp.fc.weight", vec![HIDDEN, 2 * HIDDEN]),
@@ -1090,10 +999,10 @@ mod tests {
                 vec![KV_ROWS, HIDDEN],
             ),
         ] {
-            append_bf16_tensor(&mut header, &mut payload, name, shape);
+            fixture.add_bf16_ordinal(name, &shape);
         }
 
-        (Value::Object(header), payload)
+        fixture
     }
 
     #[test]
@@ -1102,7 +1011,7 @@ mod tests {
         const HIDDEN: usize = 64;
 
         let path = fixture_path("qwen36-endpoints");
-        let (header, payload) = qwen36_endpoint_fixture();
+        let (header, payload) = qwen36_endpoint_fixture().into_parts();
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
 
@@ -1122,7 +1031,7 @@ mod tests {
     #[test]
     fn binds_qwen36_moe_experts_in_numeric_order() {
         let path = fixture_path("qwen36-moe");
-        let (header, payload) = qwen36_moe_fixture(0, 32, 16, 3);
+        let (header, payload) = qwen36_moe_fixture(0, 32, 16, 3).into_parts();
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
 
@@ -1171,7 +1080,7 @@ mod tests {
     #[test]
     fn binds_exact_qwen36_mixed_gdn_source_family() {
         let path = fixture_path("qwen36-gdn");
-        let (header, payload) = qwen36_gdn_fixture(0);
+        let (header, payload) = qwen36_gdn_fixture(0).into_parts();
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
         let bindings =
@@ -1210,7 +1119,7 @@ mod tests {
         assert!(error.to_string().contains("GDN source contract"));
 
         let path = fixture_path("qwen36-gdn-shape");
-        let (mut header, payload) = qwen36_gdn_fixture(0);
+        let (mut header, payload) = qwen36_gdn_fixture(0).into_parts();
         header["model.language_model.layers.0.linear_attn.in_proj_a.weight"]["shape"] =
             json!([2, 64]);
         write_safetensors_payload(&path, header, &payload);
@@ -1223,7 +1132,7 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         let path = fixture_path("qwen36-gdn-scale");
-        let (header, mut payload) = qwen36_gdn_fixture(0);
+        let (header, mut payload) = qwen36_gdn_fixture(0).into_parts();
         let name = "model.language_model.layers.0.linear_attn.in_proj_z.input_scale";
         let offset = tensor_offset(&header, name);
         payload[offset..offset + 4].copy_from_slice(&0.5f32.to_le_bytes());
@@ -1276,7 +1185,7 @@ mod tests {
     #[test]
     fn binds_exact_qwen36_full_attention_source_family() {
         let path = fixture_path("qwen36-attention");
-        let (header, payload) = qwen36_attention_fixture(1);
+        let (header, payload) = qwen36_attention_fixture(1).into_parts();
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
         let bindings = Qwen36FullAttentionBindings::bind_from(1, 2, 2, 32, 16, 4, 8, 4, |name| {
@@ -1315,7 +1224,7 @@ mod tests {
         assert!(error.to_string().contains("full-attention source contract"));
 
         let path = fixture_path("qwen36-attention-shape");
-        let (mut header, payload) = qwen36_attention_fixture(1);
+        let (mut header, payload) = qwen36_attention_fixture(1).into_parts();
         header["model.language_model.layers.1.self_attn.q_norm.weight"]["shape"] = json!([2, 2]);
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
@@ -1328,7 +1237,7 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         let path = fixture_path("qwen36-attention-scale");
-        let (header, mut payload) = qwen36_attention_fixture(1);
+        let (header, mut payload) = qwen36_attention_fixture(1).into_parts();
         let name = "model.language_model.layers.1.self_attn.k_proj.input_scale";
         let offset = tensor_offset(&header, name);
         payload[offset..offset + 4].copy_from_slice(&0.5f32.to_le_bytes());
@@ -1385,7 +1294,7 @@ mod tests {
         assert!(error.to_string().contains("Qwen3.6 MoE source contract"));
 
         let path = fixture_path("qwen36-moe-shape");
-        let (mut header, payload) = qwen36_moe_fixture(0, 32, 16, 3);
+        let (mut header, payload) = qwen36_moe_fixture(0, 32, 16, 3).into_parts();
         header["model.language_model.layers.0.mlp.experts.1.gate_proj.weight"]["shape"] =
             json!([8, 32]);
         write_safetensors_payload(&path, header, &payload);
@@ -1398,7 +1307,7 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         let path = fixture_path("qwen36-moe-scale");
-        let (header, mut payload) = qwen36_moe_fixture(0, 32, 16, 3);
+        let (header, mut payload) = qwen36_moe_fixture(0, 32, 16, 3).into_parts();
         let name = "model.language_model.layers.0.mlp.experts.1.up_proj.input_scale";
         let offset = tensor_offset(&header, name);
         payload[offset..offset + 4].copy_from_slice(&0.5f32.to_le_bytes());
@@ -1444,7 +1353,7 @@ mod tests {
     #[test]
     fn binds_exact_qwen36_mtp_moe_source_contract() {
         let path = fixture_path("qwen36-mtp");
-        let (header, payload) = qwen36_mtp_fixture();
+        let (header, payload) = qwen36_mtp_fixture().into_parts();
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();
         let bindings =
@@ -1484,7 +1393,7 @@ mod tests {
     #[test]
     fn rejects_qwen36_mtp_routed_expert_shape_mismatch() {
         let path = fixture_path("qwen36-mtp-shape");
-        let (mut header, payload) = qwen36_mtp_fixture();
+        let (mut header, payload) = qwen36_mtp_fixture().into_parts();
         header["mtp.layers.0.mlp.experts.gate_up_proj"]["shape"] = json!([3, 16, 4]);
         write_safetensors_payload(&path, header, &payload);
         let file = SafeTensorFile::open(&path).unwrap();

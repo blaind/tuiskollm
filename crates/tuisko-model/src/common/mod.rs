@@ -18,5 +18,7 @@ pub(crate) mod nvfp4;
 pub(crate) mod routes;
 pub(crate) mod scale_swizzle;
 #[cfg(test)]
+pub(crate) mod test_builder;
+#[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod vision;
