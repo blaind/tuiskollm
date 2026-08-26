@@ -2,7 +2,7 @@
 
 use crate::common::inventory::CheckpointSnapshot;
 use crate::common::modelopt_codec::ModelOptNvfp4LinearBindings;
-use crate::common::naming::{EMBEDDING, FINAL_NORM, LM_HEAD};
+use crate::common::naming::{EMBEDDING, FINAL_NORM, LM_HEAD, input_layernorm, layer_prefix};
 use crate::common::routes::{
     require_full_attention_layer, require_gdn_layer, require_same_rank_zero_f32,
 };
@@ -41,7 +41,7 @@ impl<'a> ModelOptNvfp4MlpBindings<'a> {
     ) -> CheckpointResult<Self> {
         require_modelopt_nvfp4_mlp_layer::<A>(layer)?;
 
-        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let layer_prefix = layer_prefix(layer);
         let mlp_prefix = format!("{layer_prefix}.mlp");
         let gate = ModelOptNvfp4LinearBindings::bind_from(
             &format!("{mlp_prefix}.gate_proj"),
@@ -108,7 +108,7 @@ fn modelopt_nvfp4_next_norm_name<A: Arch>(layer: usize) -> CheckpointResult<Stri
     Ok(if next_layer == A::LAYERS {
         FINAL_NORM.to_string()
     } else {
-        format!("model.language_model.layers.{next_layer}.input_layernorm.weight")
+        input_layernorm(next_layer)
     })
 }
 
@@ -153,7 +153,7 @@ impl<'a> ModelOptNvfp4AttentionBindings<'a> {
         require_modelopt_contract::<A>("full attention")?;
         require_full_attention_layer(layer, A::LAYERS, A::FULL_ATTENTION_INTERVAL)?;
 
-        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let layer_prefix = layer_prefix(layer);
         let prefix = format!("{layer_prefix}.self_attn");
         let query_gate = ModelOptNvfp4LinearBindings::bind_from(
             &format!("{prefix}.q_proj"),
@@ -272,7 +272,7 @@ impl<'a> ModelOptNvfp4GdnBindings<'a> {
         require_modelopt_contract::<A>("GDN")?;
         require_gdn_layer::<A>(layer)?;
 
-        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let layer_prefix = layer_prefix(layer);
         let prefix = format!("{layer_prefix}.linear_attn");
         let qkv = ModelOptNvfp4LinearBindings::bind_from(
             &format!("{prefix}.in_proj_qkv"),

@@ -1,12 +1,12 @@
 //! Qwen3.6-35B-A3B MoE lossless materialization into runtime-native host layouts.
 
 use crate::common::modelopt_codec::{
-    MaterializedModelOptNvfp4Linear, materialize_modelopt_linear, require_same_modelopt_scale,
+    MaterializedModelOptNvfp4Linear, ModelOptScaleCodec, materialize_modelopt_linear,
 };
 use crate::common::mtp::MaterializedMtpQkv;
 use crate::common::routes::{require_full_attention_layer, require_gdn_layer_route};
 use crate::common::scale_swizzle::{
-    gather_source_planes, host_shape, materialization_pool, materialization_workers,
+    PlaneGatherer, host_shape, materialization_pool, materialization_workers,
 };
 use crate::qwen36::bindings::{
     Qwen36Fp8LinearBindings, Qwen36FullAttentionBindings, Qwen36GdnBindings,
@@ -40,7 +40,7 @@ impl Qwen36MtpBindings<'_> {
             .ok_or_else(|| {
                 CheckpointError::source_binding("Qwen3.6 MTP QKV row count overflows")
             })?;
-        let weight_bf16 = gather_source_planes(
+        let weight_bf16 = PlaneGatherer::gather(
             [
                 self.query_gate_weight.bytes(),
                 self.key_weight.bytes(),
@@ -273,11 +273,11 @@ impl<'a> Qwen36GdnBindings<'a> {
                 self.layer
             ))
         })?;
-        let input_weight_e4m3 = gather_source_planes(
+        let input_weight_e4m3 = PlaneGatherer::gather(
             [qkv.weight_e4m3, z.weight_e4m3],
             &format!("layer-{} Qwen3.6 QKV/Z weights", self.layer),
         )?;
-        let control_weight_bf16 = gather_source_planes(
+        let control_weight_bf16 = PlaneGatherer::gather(
             [self.a_control.bytes(), self.b_control.bytes()],
             &format!("layer-{} Qwen3.6 A/B control weights", self.layer),
         )?;
@@ -410,7 +410,7 @@ impl<'a> Qwen36FullAttentionBindings<'a> {
                     self.layer
                 ))
             })?;
-        let qkv_weight_e4m3 = gather_source_planes(
+        let qkv_weight_e4m3 = PlaneGatherer::gather(
             [query_gate.weight_e4m3, key.weight_e4m3, value.weight_e4m3],
             &format!("layer-{} Qwen3.6 Q/K/V weights", self.layer),
         )?;
@@ -644,13 +644,13 @@ fn prepare_qwen36_expert<'a>(
     layer: usize,
     role: &str,
 ) -> CheckpointResult<PreparedQwen36Expert<'a>> {
-    require_same_modelopt_scale(
+    ModelOptScaleCodec::require_same_source_scale(
         layer,
         &format!("{role} gate/up input_scale"),
         &binding.gate.input_scale,
         &binding.up.input_scale,
     )?;
-    require_same_modelopt_scale(
+    ModelOptScaleCodec::require_same_source_scale(
         layer,
         &format!("{role} gate/up weight_scale_2"),
         &binding.gate.weight_scale_2,

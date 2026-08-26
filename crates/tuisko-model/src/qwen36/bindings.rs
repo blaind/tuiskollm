@@ -2,7 +2,7 @@
 
 use crate::common::inventory::CheckpointSnapshot;
 use crate::common::modelopt_codec::ModelOptNvfp4LinearBindings;
-use crate::common::naming::{EMBEDDING, FINAL_NORM};
+use crate::common::naming::{EMBEDDING, FINAL_NORM, input_layernorm, layer_prefix};
 use crate::common::routes::{
     positive_rank_zero_f32, require_full_attention_layer, require_gdn_layer_route,
     require_same_rank_zero_f32,
@@ -224,7 +224,7 @@ impl<'a> Qwen36MoeLayerBindings<'a> {
     ) -> CheckpointResult<Self> {
         require_qwen36_moe_layer(layer, layer_count)?;
 
-        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let layer_prefix = layer_prefix(layer);
         let mlp_prefix = format!("{layer_prefix}.mlp");
         let router_weight = Bf16View::bind(
             tensor(&format!("{mlp_prefix}.gate.weight"))?,
@@ -331,7 +331,7 @@ fn qwen36_next_norm_name(layer: usize, layer_count: usize) -> CheckpointResult<S
     Ok(if next_layer == layer_count {
         FINAL_NORM.to_string()
     } else {
-        format!("model.language_model.layers.{next_layer}.input_layernorm.weight")
+        input_layernorm(next_layer)
     })
 }
 
@@ -444,7 +444,7 @@ impl<'a> Qwen36GdnBindings<'a> {
     ) -> CheckpointResult<Self> {
         require_gdn_layer_route(layer, layer_count, full_attention_interval)?;
 
-        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let layer_prefix = layer_prefix(layer);
         let prefix = format!("{layer_prefix}.linear_attn");
         let qkv = Qwen36Fp8LinearBindings::bind_from(
             &format!("{prefix}.in_proj_qkv"),
@@ -554,7 +554,7 @@ impl<'a> Qwen36FullAttentionBindings<'a> {
     ) -> CheckpointResult<Self> {
         require_full_attention_layer(layer, layer_count, full_attention_interval)?;
 
-        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let layer_prefix = layer_prefix(layer);
         let prefix = format!("{layer_prefix}.self_attn");
         let query_gate = Qwen36Fp8LinearBindings::bind_from(
             &format!("{prefix}.q_proj"),

@@ -5,6 +5,7 @@ use crate::common::config_util::{
     VIDEO_TOKEN_ID, VISION_END_TOKEN_ID, VISION_START_TOKEN_ID, VisionConfig, invalid_field,
     require, validate_layer_types, validate_vision,
 };
+use crate::common::naming::{layer_module_prefix, layer_prefix};
 use crate::{Arch, CheckpointError, CheckpointResult};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -571,7 +572,7 @@ fn validate_qwen36_quantized_layers<A: Arch>(
 fn qwen36_fp8_targets<A: Arch>() -> Vec<String> {
     let mut targets = Vec::new();
     for layer in 0..A::LAYERS {
-        let prefix = format!("model.language_model.layers.{layer}");
+        let prefix = layer_prefix(layer);
         if (layer + 1).is_multiple_of(A::FULL_ATTENTION_INTERVAL) {
             for projection in ["k_proj", "o_proj", "q_proj", "v_proj"] {
                 targets.push(format!("{prefix}.self_attn.{projection}"));
@@ -589,7 +590,7 @@ fn qwen36_fp8_targets<A: Arch>() -> Vec<String> {
 fn qwen36_nvfp4_targets<A: Arch>() -> Vec<String> {
     let mut targets = vec![String::from("lm_head")];
     for layer in 0..A::LAYERS {
-        let prefix = format!("model.language_model.layers.{layer}.mlp");
+        let prefix = layer_module_prefix(layer, "mlp");
         targets.push(format!("{prefix}.experts"));
         for projection in ["down_proj", "gate_proj", "up_proj"] {
             targets.push(format!("{prefix}.shared_expert.{projection}"));

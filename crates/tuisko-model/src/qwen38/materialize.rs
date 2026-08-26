@@ -2,7 +2,7 @@
 
 use crate::common::mtp::MaterializedMtpQkv;
 use crate::common::routes::require_full_attention_layer;
-use crate::common::scale_swizzle::{gather_source_planes, host_shape};
+use crate::common::scale_swizzle::{PlaneGatherer, host_shape};
 use crate::qwen38::bindings::{FullAttentionQkvBindings, MtpBindings};
 use crate::{CheckpointError, CheckpointResult};
 
@@ -66,7 +66,7 @@ impl FullAttentionQkvBindings<'_> {
                 ))
             })?;
 
-        let weight_e4m3 = gather_source_planes(
+        let weight_e4m3 = PlaneGatherer::gather(
             [
                 self.query_gate_weight.codes(),
                 self.key_weight.codes(),
@@ -74,7 +74,7 @@ impl FullAttentionQkvBindings<'_> {
             ],
             &format!("layer-{} full-attention QKV weights", self.layer),
         )?;
-        let scale_bf16 = gather_source_planes(
+        let scale_bf16 = PlaneGatherer::gather(
             [
                 self.query_gate_scale.bytes(),
                 self.key_scale.bytes(),
@@ -113,7 +113,7 @@ impl MtpBindings<'_> {
             .and_then(|rows| rows.checked_add(value_rows))
             .ok_or_else(|| CheckpointError::source_binding("MTP QKV row count overflows"))?;
 
-        let weight_bf16 = gather_source_planes(
+        let weight_bf16 = PlaneGatherer::gather(
             [
                 self.query_gate_weight.bytes(),
                 self.key_weight.bytes(),

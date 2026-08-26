@@ -48,7 +48,7 @@ pub(crate) struct ExpectedTensor {
     pub(crate) shape: Vec<u64>,
 }
 
-pub(crate) fn add_qwen35_vision<A: Arch>(
+pub(crate) fn add_vision_expected_tensors<A: Arch>(
     expected: &mut BTreeMap<String, ExpectedTensor>,
 ) -> CheckpointResult<()> {
     let hidden = dimension(A::VISION_HIDDEN, "Vision hidden width")?;

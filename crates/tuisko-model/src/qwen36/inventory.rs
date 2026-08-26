@@ -4,9 +4,10 @@ use crate::CheckpointSnapshot;
 use crate::common::config_util::validate_config;
 use crate::common::inventory::{
     CONFIG_FILE, ExpectedTensor, INDEX_FILE, Shard, add_expected, add_modelopt_linear,
-    add_qwen35_vision, dimension, read_index, require_count, validate_expected_tensor,
+    add_vision_expected_tensors, dimension, read_index, require_count, validate_expected_tensor,
     validate_file_length, validate_revision,
 };
+use crate::common::naming::layer_prefix;
 use crate::{Arch, CheckpointError, CheckpointResult, DType, SafeTensorFile};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -105,7 +106,7 @@ fn qwen36_expected_tensors<A: Arch>() -> CheckpointResult<BTreeMap<String, Expec
     )?;
 
     for layer in 0..A::LAYERS {
-        let layer_prefix = format!("model.language_model.layers.{layer}");
+        let layer_prefix = layer_prefix(layer);
 
         for name in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
             add_expected(
@@ -214,7 +215,7 @@ fn qwen36_expected_tensors<A: Arch>() -> CheckpointResult<BTreeMap<String, Expec
     }
 
     add_qwen36_mtp::<A>(&mut expected)?;
-    add_qwen35_vision::<A>(&mut expected)?;
+    add_vision_expected_tensors::<A>(&mut expected)?;
 
     Ok(expected)
 }
