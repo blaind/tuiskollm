@@ -1,4 +1,5 @@
 use cuda_device::{convert, float, ptx_asm, thread, warp};
+use tuisko_kernels_simt::f32_to_bf16;
 use tuisko_model::Arch;
 
 const VALUES_PER_LANE: usize = 16;
@@ -44,14 +45,6 @@ fn reduce_sum_lane_zero(mut value: f32) -> f32 {
     value += warp::shuffle_down_f32(value, 1);
 
     value
-}
-
-#[inline(always)]
-fn f32_to_bf16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-
-    (rounded >> 16) as u16
 }
 
 #[inline(always)]

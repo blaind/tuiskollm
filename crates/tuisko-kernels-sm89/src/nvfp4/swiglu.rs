@@ -6,7 +6,7 @@ use cuda_device::{
 };
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
-use tuisko_kernels_simt::e4m3_to_f32;
+use tuisko_kernels_simt::{e2m1x2_to_f32, e4m3_to_f32, f32_to_bf16};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -59,27 +59,6 @@ mod kernels {
     #[inline(always)]
     fn weight_group_scale_offset(parent_row: usize, group: usize) -> usize {
         weight_scale_offset(parent_row, group >> 2) + (group & 3)
-    }
-
-    #[inline(always)]
-    fn e2m1_to_f32(code: u8) -> f32 {
-        let magnitude = match code & 7 {
-            0 => 0.0,
-            1 => 0.5,
-            2 => 1.0,
-            3 => 1.5,
-            4 => 2.0,
-            5 => 3.0,
-            6 => 4.0,
-            _ => 6.0,
-        };
-
-        if code & 8 == 0 { magnitude } else { -magnitude }
-    }
-
-    #[inline(always)]
-    fn e2m1x2_to_f32(packed: u8) -> (f32, f32) {
-        (e2m1_to_f32(packed & 15), e2m1_to_f32(packed >> 4))
     }
 
     #[inline(always)]
@@ -141,14 +120,6 @@ mod kernels {
         } else {
             value * exp_negative_absolute / (1.0 + exp_negative_absolute)
         }
-    }
-
-    #[inline(always)]
-    fn f32_to_bf16(value: f32) -> u16 {
-        let bits = value.to_bits();
-        let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-
-        (rounded >> 16) as u16
     }
 
     #[inline(always)]
