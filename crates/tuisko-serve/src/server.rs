@@ -1,6 +1,7 @@
 //! Concrete HTTP server and resident scheduler worker.
 
 use crate::request_log::RequestLog;
+use crate::response::overloaded_response;
 use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
 use crate::{
     ChatCompletionRequest, ChatRequestError, GenerationReply, PreparedChatRequest,
@@ -8,7 +9,7 @@ use crate::{
 };
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderValue, StatusCode, header::RETRY_AFTER};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -24,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
 use tokio::sync::oneshot;
 use tuisko_engine::{
-    EngineError, GenerationStep, MAX_BATCH, Qwen35ResidentMtpBatchGenerator,
+    EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, Qwen35ResidentMtpBatchGenerator,
     Qwen36ResidentBatchGenerator, ResidentBatchAdmission, ResidentLoadPhase, ResidentLoadProgress,
     ResidentMtpBatchGenerator, ResidentRequestId,
 };
@@ -735,7 +736,12 @@ fn record_admission(
         }
         Err(error) => {
             let message = error.to_string();
-            let _ = reply.try_send(GenerationReply::Rejected(message.clone()));
+            let response = if error.code() == Some(EngineErrorCode::Capacity) {
+                GenerationReply::Overloaded(message.clone())
+            } else {
+                GenerationReply::Rejected(message.clone())
+            };
+            let _ = reply.try_send(response);
             log.finish(None, 0, 0, "error", Some(&message));
         }
     }
@@ -911,6 +917,7 @@ async fn chat_completions(
             Some(GenerationReply::Rejected(message)) => {
                 openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error")
             }
+            Some(GenerationReply::Overloaded(message)) => overloaded_response(message),
             Some(first) => streaming_response(
                 first,
                 reply_rx,
@@ -968,17 +975,7 @@ fn enqueue_job(jobs: &Sender<Job>, job: Job) -> Result<(), EnqueueError> {
 
 fn enqueue_error_response(error: EnqueueError) -> Response {
     match error {
-        EnqueueError::Full => {
-            let mut response = openai_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "resident inference queue is full".into(),
-                "server_overloaded",
-            );
-            response
-                .headers_mut()
-                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
-            response
-        }
+        EnqueueError::Full => overloaded_response("resident inference queue is full".into()),
         EnqueueError::Closed => openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "resident engine worker is unavailable".into(),
@@ -991,7 +988,7 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
 mod tests {
     use super::{
         AppState, EnqueueError, Job, Ready, ResidentTarget, ServerError, chat_completions,
-        enqueue_job, fail_queued, health, models, render_loading, render_startup,
+        enqueue_job, fail_queued, health, models, record_admission, render_loading, render_startup,
         render_weight_progress, router, serve_until_worker_failure, try_send_generation_steps,
     };
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
@@ -1000,13 +997,17 @@ mod tests {
     use axum::extract::State;
     use axum::http::{StatusCode, header::RETRY_AFTER};
     use serde_json::Value;
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::time::Duration;
     use tokio::runtime::Builder;
     use tokio::sync::mpsc::channel;
-    use tuisko_engine::{ChatGenerationRequest, FinishReason, GenerationStep, MAX_BATCH};
+    use tuisko_engine::{
+        ChatGenerationRequest, EngineError, EngineErrorCode, FinishReason, GenerationStep,
+        MAX_BATCH,
+    };
     use tuisko_frontend::{ChatMessage, GenerationDefaults};
     use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
@@ -1159,6 +1160,27 @@ mod tests {
         drop(receiver);
         let closed = enqueue_job(&jobs, job().0).unwrap_err();
         assert_eq!(closed, EnqueueError::Closed);
+    }
+
+    #[test]
+    fn resident_capacity_failure_is_retryable() {
+        let (job, mut receiver) = job();
+        let mut replies = HashMap::new();
+        record_admission(
+            &mut replies,
+            job,
+            Err(EngineError::Contract {
+                code: EngineErrorCode::Capacity,
+                message: "shared KV pages remain active".into(),
+            }),
+        );
+
+        assert!(replies.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(GenerationReply::Overloaded(message))
+                if message.contains("shared KV pages remain active")
+        ));
     }
 
     #[test]
@@ -1391,6 +1413,32 @@ mod tests {
                 "prompt exceeds the resident context"
             );
             assert_eq!(error["error"]["type"], "invalid_request_error");
+        });
+    }
+
+    #[test]
+    fn streaming_capacity_rejection_is_retryable_not_a_stream() {
+        runtime().block_on(async {
+            let (jobs, mut receiver) = channel(1);
+            let state = state(jobs, true);
+            let handler = tokio::spawn(chat_completions(
+                State(state),
+                Ok(Json(streaming_request())),
+            ));
+
+            let queued = receiver.recv().await.unwrap();
+            queued
+                .reply
+                .try_send(GenerationReply::Overloaded(
+                    "shared KV pages are busy".into(),
+                ))
+                .unwrap();
+            let response = handler.await.unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()[RETRY_AFTER], "1");
+            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let error: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error["error"]["type"], "server_overloaded");
         });
     }
 
