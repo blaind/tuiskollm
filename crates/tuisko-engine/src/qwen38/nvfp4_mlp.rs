@@ -1,6 +1,6 @@
 //! Resident source-backed NVFP4 MLP program.
 
-use crate::nvfp4_mlp_layout::MAX_ROWS;
+use crate::qwen38::nvfp4_mlp_layout::MAX_ROWS;
 use crate::{EngineError, EngineResult, MAX_BATCH, Nvfp4MlpLayout};
 use std::marker::PhantomData;
 use std::sync::Arc;

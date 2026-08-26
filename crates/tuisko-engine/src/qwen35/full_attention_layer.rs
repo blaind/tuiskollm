@@ -1,10 +1,10 @@
 //! Resident source-backed Qwen3.5 full-attention layer.
 
-use crate::qwen35_full_attention_layer_layout::{
+use crate::qwen35::full_attention_layer_layout::{
     QWEN35_ATTENTION_MAX_ROWS, QWEN35_PREFILL_TABLE_STRIDE, QWEN35_TABLE_STRIDE,
     Qwen35FullAttentionLayerRegions,
 };
-use crate::qwen35_long_context_kv::Qwen35AttentionKvBinding;
+use crate::qwen35::long_context_kv::Qwen35AttentionKvBinding;
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen35FullAttentionLayerLayout};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};

@@ -1,6 +1,6 @@
 //! Resident source-backed Qwen3.5 GDN decoder layer.
 
-use crate::qwen35_gdn_layer_layout::{QWEN35_GDN_MAX_ROWS, Qwen35GdnLayerRegions};
+use crate::qwen35::gdn_layer_layout::{QWEN35_GDN_MAX_ROWS, Qwen35GdnLayerRegions};
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen35GdnLayerLayout};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};

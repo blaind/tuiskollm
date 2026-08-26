@@ -7,12 +7,13 @@ use super::{
 };
 #[cfg(feature = "qualification")]
 use crate::PagedKvSlotState;
-use crate::long_context_kv_layout::LayerKvRegions;
-use crate::resident_mtp::ResidentMtpArenaReservation;
+use crate::qwen38::long_context_kv_layout::LayerKvRegions;
+use crate::qwen38::resident_mtp::ResidentMtpArenaReservation;
 use crate::{
     EngineError, EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, PagedKvSlotPool,
-    PagedKvTableUpdate, full_attention_layer_layout::CONTEXT_CAPACITY as SHORT_CONTEXT_CAPACITY,
-    long_context_kv_layout::MAX_CONTEXT_TOKENS,
+    PagedKvTableUpdate,
+    qwen38::full_attention_layer_layout::CONTEXT_CAPACITY as SHORT_CONTEXT_CAPACITY,
+    qwen38::long_context_kv_layout::MAX_CONTEXT_TOKENS,
 };
 #[cfg(feature = "qualification")]
 use std::marker::PhantomData;

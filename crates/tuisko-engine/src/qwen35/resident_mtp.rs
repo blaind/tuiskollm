@@ -1,6 +1,6 @@
 //! Resident Qwen3.5 target plus one source-BF16 MTP draft program.
 
-use crate::qwen35_mtp_kv::Qwen35MtpKvProgram;
+use crate::qwen35::mtp_kv::Qwen35MtpKvProgram;
 use crate::{
     EngineError, EngineResult, MAX_BATCH, Qwen35MtpLayerProgram, Qwen35ResidentModelProgram,
     Qwen35ResidentMtpLayout, Qwen35ResidentPrefillRoute,

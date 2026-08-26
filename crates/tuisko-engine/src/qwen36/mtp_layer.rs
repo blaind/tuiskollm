@@ -1,49 +1,42 @@
-//! Resident source-backed Qwen3.5 MTP transformer layer.
+//! Resident source-backed Qwen3.6 MTP transformer layer.
 
-use crate::qwen35_mtp_layer_layout::{
-    QWEN35_MTP_PHYSICAL_PAGES, QWEN35_MTP_PROMPT_ROWS, QWEN35_MTP_TABLE_STRIDE,
-    Qwen35MtpLayerRegions,
+use crate::qwen36::mtp_layer_layout::{
+    QWEN36_MTP_PHYSICAL_PAGES, QWEN36_MTP_PROMPT_ROWS, QWEN36_MTP_TABLE_STRIDE,
+    Qwen36MtpLayerRegions,
 };
-use crate::{EngineError, EngineResult, MAX_BATCH, Qwen35MtpLayerLayout};
+use crate::{EngineError, EngineResult, MAX_BATCH, Qwen36MtpLayerLayout};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
 use tuisko_kernels_sm120::{
-    Qwen35MtpBf16AttentionOutputOp, Qwen35MtpBf16FusionOp, Qwen35MtpBf16MlpOp,
-    Qwen35MtpBf16PagedGqaOp, Qwen35MtpBf16QkPrepareOp, Qwen35MtpBf16QkvOp, Qwen35ResidualNormOp,
+    Qwen36Fp8AttentionQkPrepareOp, Qwen36Fp8PagedGqaOp, Qwen36MoeRouterOp,
+    Qwen36MtpBf16AttentionOutputOp, Qwen36MtpBf16FusionOp, Qwen36MtpBf16MoeOp, Qwen36MtpBf16QkvOp,
+    Qwen36ResidualNormOp,
 };
-use tuisko_model::{Arch, CheckpointSnapshot, MtpBindings, Qwen35_9B};
+use tuisko_model::{Arch, CheckpointSnapshot, Qwen36Moe35B, Qwen36MtpBindings};
 
 const ROTARY_PAIRS: usize = 32;
 const REALIGN_ROUTES: usize = 4;
-const PROMPT_ROUTES: [usize; 3] = [32, 64, QWEN35_MTP_PROMPT_ROWS];
+const PROMPT_ROUTES: [usize; 3] = [32, 64, QWEN36_MTP_PROMPT_ROWS];
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Qwen35MtpKvBinding {
-    pub(crate) block_tables: u64,
-    pub(crate) key_pages: u64,
-    pub(crate) value_pages: u64,
-    pub(crate) table_stride: usize,
-    pub(crate) context_capacity: usize,
-}
-
-/// One exact source-backed Qwen3.5 MTP layer without a duplicate text endpoint.
-pub struct Qwen35MtpLayerProgram {
+/// One exact source-backed Qwen3.6 MTP layer without a duplicate text endpoint.
+pub struct Qwen36MtpLayerProgram {
     // Drop graphs before the arena and loaded modules whose handles they retain.
     draft_graphs: [CudaGraph; MAX_BATCH],
     prime_graphs: [CudaGraph; REALIGN_ROUTES],
     realign_graphs: [CudaGraph; REALIGN_ROUTES],
+    prompt_graphs: [CudaGraph; PROMPT_ROUTES.len()],
     arena: DeviceArena,
-    fusion: Qwen35MtpBf16FusionOp,
-    norm: Qwen35ResidualNormOp,
-    qkv: Qwen35MtpBf16QkvOp,
-    qk_prepare: Qwen35MtpBf16QkPrepareOp,
-    paged_gqa: Qwen35MtpBf16PagedGqaOp,
-    attention_output: Qwen35MtpBf16AttentionOutputOp,
-    mlp: Qwen35MtpBf16MlpOp,
+    _fusion: Qwen36MtpBf16FusionOp,
+    _norm: Qwen36ResidualNormOp,
+    _qkv: Qwen36MtpBf16QkvOp,
+    _qk_prepare: Qwen36Fp8AttentionQkPrepareOp,
+    _paged_gqa: Qwen36Fp8PagedGqaOp,
+    _attention_output: Qwen36MtpBf16AttentionOutputOp,
+    _router: Qwen36MoeRouterOp,
+    _experts: Qwen36MtpBf16MoeOp,
     context: Arc<CudaContext>,
-    layout: Qwen35MtpLayerLayout,
+    layout: Qwen36MtpLayerLayout,
     base_address: u64,
-    kv_binding: Option<Qwen35MtpKvBinding>,
 }
 
 #[derive(Clone, Copy)]
@@ -69,19 +62,29 @@ struct Pointers {
     cache_positions: *const u32,
     lengths: *const u32,
     query: *mut f32,
-    key_pages: *mut u16,
-    value_pages: *mut u16,
+    key_pages: *mut u8,
+    value_pages: *mut u8,
     attention: *mut f32,
     attention_activation: *mut u16,
     attention_output_weight: *const u16,
     attention_branch: *mut u16,
     post_attention_norm: *const u16,
     post_attention_residual: *mut u16,
-    mlp_normalized: *mut u16,
-    gate_up_weight: *const u16,
-    swiglu: *mut u16,
-    down_weight: *const u16,
-    mlp_branch: *mut u16,
+    moe_normalized: *mut u16,
+    router_weight: *const u16,
+    router_logits: *mut u16,
+    expert_indices: *mut u16,
+    routing_weights: *mut u16,
+    routed_gate_up_weight: *const u16,
+    routed_down_weight: *const u16,
+    shared_gate_weight: *const u16,
+    shared_up_weight: *const u16,
+    shared_down_weight: *const u16,
+    shared_expert_gate_weight: *const u16,
+    expert_intermediate: *mut u16,
+    expert_output: *mut u16,
+    shared_gate_output: *mut u16,
+    moe_branch: *mut u16,
     final_norm: *const u16,
     residual_output: *mut u16,
     final_normalized: *mut u16,
@@ -89,7 +92,7 @@ struct Pointers {
 }
 
 impl Pointers {
-    fn bind(arena: &DeviceArena, regions: Qwen35MtpLayerRegions) -> GpuResult<Self> {
+    fn bind(arena: &DeviceArena, regions: Qwen36MtpLayerRegions) -> GpuResult<Self> {
         Ok(Self {
             embedding: arena.address(regions.embedding)?.cast_const(),
             target_hidden: arena.address(regions.target_hidden)?.cast_const(),
@@ -120,49 +123,47 @@ impl Pointers {
             attention_branch: arena.address(regions.attention_branch)?,
             post_attention_norm: arena.address(regions.post_attention_norm)?.cast_const(),
             post_attention_residual: arena.address(regions.post_attention_residual)?,
-            mlp_normalized: arena.address(regions.mlp_normalized)?,
-            gate_up_weight: arena.address(regions.gate_up_weight)?.cast_const(),
-            swiglu: arena.address(regions.swiglu)?,
-            down_weight: arena.address(regions.down_weight)?.cast_const(),
-            mlp_branch: arena.address(regions.mlp_branch)?,
+            moe_normalized: arena.address(regions.moe_normalized)?,
+            router_weight: arena.address(regions.router_weight)?.cast_const(),
+            router_logits: arena.address(regions.router_logits)?,
+            expert_indices: arena.address(regions.expert_indices)?,
+            routing_weights: arena.address(regions.routing_weights)?,
+            routed_gate_up_weight: arena.address(regions.routed_gate_up_weight)?.cast_const(),
+            routed_down_weight: arena.address(regions.routed_down_weight)?.cast_const(),
+            shared_gate_weight: arena.address(regions.shared_gate_weight)?.cast_const(),
+            shared_up_weight: arena.address(regions.shared_up_weight)?.cast_const(),
+            shared_down_weight: arena.address(regions.shared_down_weight)?.cast_const(),
+            shared_expert_gate_weight: arena
+                .address(regions.shared_expert_gate_weight)?
+                .cast_const(),
+            expert_intermediate: arena.address(regions.expert_intermediate)?,
+            expert_output: arena.address(regions.expert_output)?,
+            shared_gate_output: arena.address(regions.shared_gate_output)?,
+            moe_branch: arena.address(regions.moe_branch)?,
             final_norm: arena.address(regions.final_norm)?.cast_const(),
             residual_output: arena.address(regions.residual_output)?,
             final_normalized: arena.address(regions.final_normalized)?,
-            table_stride: QWEN35_MTP_TABLE_STRIDE,
+            table_stride: QWEN36_MTP_TABLE_STRIDE,
         })
-    }
-
-    fn bind_with_kv(
-        arena: &DeviceArena,
-        regions: Qwen35MtpLayerRegions,
-        binding: Option<Qwen35MtpKvBinding>,
-    ) -> GpuResult<Self> {
-        let mut pointers = Self::bind(arena, regions)?;
-        if let Some(binding) = binding {
-            pointers.block_tables = binding.block_tables as *const u32;
-            pointers.key_pages = binding.key_pages as *mut u16;
-            pointers.value_pages = binding.value_pages as *mut u16;
-            pointers.table_stride = binding.table_stride;
-        }
-
-        Ok(pointers)
     }
 
     fn offset_rows(self, rows: usize) -> Self {
         Self {
-            embedding: self.embedding.wrapping_add(rows * Qwen35_9B::HIDDEN),
-            target_hidden: self.target_hidden.wrapping_add(rows * Qwen35_9B::HIDDEN),
+            embedding: self.embedding.wrapping_add(rows * Qwen36Moe35B::HIDDEN),
+            target_hidden: self.target_hidden.wrapping_add(rows * Qwen36Moe35B::HIDDEN),
             normalized_embedding: self
                 .normalized_embedding
-                .wrapping_add(rows * Qwen35_9B::HIDDEN),
+                .wrapping_add(rows * Qwen36Moe35B::HIDDEN),
             normalized_hidden: self
                 .normalized_hidden
-                .wrapping_add(rows * Qwen35_9B::HIDDEN),
-            residual: self.residual.wrapping_add(rows * Qwen35_9B::HIDDEN),
+                .wrapping_add(rows * Qwen36Moe35B::HIDDEN),
+            residual: self.residual.wrapping_add(rows * Qwen36Moe35B::HIDDEN),
             attention_normalized: self
                 .attention_normalized
-                .wrapping_add(rows * Qwen35_9B::HIDDEN),
-            qkv: self.qkv.wrapping_add(rows * Qwen35_9B::ATTENTION_QKV_ROWS),
+                .wrapping_add(rows * Qwen36Moe35B::HIDDEN),
+            qkv: self
+                .qkv
+                .wrapping_add(rows * Qwen36Moe35B::ATTENTION_QKV_ROWS),
             rope_cos: self.rope_cos.wrapping_add(rows * ROTARY_PAIRS),
             rope_sin: self.rope_sin.wrapping_add(rows * ROTARY_PAIRS),
             table_rows: self.table_rows.wrapping_add(rows),
@@ -170,22 +171,45 @@ impl Pointers {
             lengths: self.lengths.wrapping_add(rows),
             query: self
                 .query
-                .wrapping_add(rows * Qwen35_9B::ATTENTION_OUTPUT_COLUMNS),
+                .wrapping_add(rows * Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS),
             attention: self
                 .attention
-                .wrapping_add(rows * Qwen35_9B::ATTENTION_OUTPUT_COLUMNS),
+                .wrapping_add(rows * Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS),
             attention_activation: self
                 .attention_activation
-                .wrapping_add(rows * Qwen35_9B::ATTENTION_OUTPUT_COLUMNS),
-            attention_branch: self.attention_branch.wrapping_add(rows * Qwen35_9B::HIDDEN),
+                .wrapping_add(rows * Qwen36Moe35B::ATTENTION_OUTPUT_COLUMNS),
+            attention_branch: self
+                .attention_branch
+                .wrapping_add(rows * Qwen36Moe35B::HIDDEN),
             post_attention_residual: self
                 .post_attention_residual
-                .wrapping_add(rows * Qwen35_9B::HIDDEN),
-            mlp_normalized: self.mlp_normalized.wrapping_add(rows * Qwen35_9B::HIDDEN),
-            swiglu: self.swiglu.wrapping_add(rows * Qwen35_9B::INTERMEDIATE),
-            mlp_branch: self.mlp_branch.wrapping_add(rows * Qwen35_9B::HIDDEN),
-            residual_output: self.residual_output.wrapping_add(rows * Qwen35_9B::HIDDEN),
-            final_normalized: self.final_normalized.wrapping_add(rows * Qwen35_9B::HIDDEN),
+                .wrapping_add(rows * Qwen36Moe35B::HIDDEN),
+            moe_normalized: self
+                .moe_normalized
+                .wrapping_add(rows * Qwen36Moe35B::HIDDEN),
+            router_logits: self
+                .router_logits
+                .wrapping_add(rows * Qwen36Moe35B::NUM_EXPERTS),
+            expert_indices: self
+                .expert_indices
+                .wrapping_add(rows * Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN),
+            routing_weights: self
+                .routing_weights
+                .wrapping_add(rows * Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN),
+            expert_intermediate: self.expert_intermediate.wrapping_add(
+                rows * (Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN + 1) * Qwen36Moe35B::INTERMEDIATE,
+            ),
+            expert_output: self.expert_output.wrapping_add(
+                rows * (Qwen36Moe35B::NUM_EXPERTS_PER_TOKEN + 1) * Qwen36Moe35B::HIDDEN,
+            ),
+            shared_gate_output: self.shared_gate_output.wrapping_add(rows),
+            moe_branch: self.moe_branch.wrapping_add(rows * Qwen36Moe35B::HIDDEN),
+            residual_output: self
+                .residual_output
+                .wrapping_add(rows * Qwen36Moe35B::HIDDEN),
+            final_normalized: self
+                .final_normalized
+                .wrapping_add(rows * Qwen36Moe35B::HIDDEN),
             ..self
         }
     }
@@ -222,11 +246,21 @@ impl Pointers {
             self.attention_branch.addr(),
             self.post_attention_norm.addr(),
             self.post_attention_residual.addr(),
-            self.mlp_normalized.addr(),
-            self.gate_up_weight.addr(),
-            self.swiglu.addr(),
-            self.down_weight.addr(),
-            self.mlp_branch.addr(),
+            self.moe_normalized.addr(),
+            self.router_weight.addr(),
+            self.router_logits.addr(),
+            self.expert_indices.addr(),
+            self.routing_weights.addr(),
+            self.routed_gate_up_weight.addr(),
+            self.routed_down_weight.addr(),
+            self.shared_gate_weight.addr(),
+            self.shared_up_weight.addr(),
+            self.shared_down_weight.addr(),
+            self.shared_expert_gate_weight.addr(),
+            self.expert_intermediate.addr(),
+            self.expert_output.addr(),
+            self.shared_gate_output.addr(),
+            self.moe_branch.addr(),
             self.final_norm.addr(),
             self.residual_output.addr(),
             self.final_normalized.addr(),
@@ -236,133 +270,105 @@ impl Pointers {
 
 #[derive(Clone, Copy)]
 struct Ops<'a> {
-    fusion: &'a Qwen35MtpBf16FusionOp,
-    norm: &'a Qwen35ResidualNormOp,
-    qkv: &'a Qwen35MtpBf16QkvOp,
-    qk_prepare: &'a Qwen35MtpBf16QkPrepareOp,
-    paged_gqa: &'a Qwen35MtpBf16PagedGqaOp,
-    attention_output: &'a Qwen35MtpBf16AttentionOutputOp,
-    mlp: &'a Qwen35MtpBf16MlpOp,
+    fusion: &'a Qwen36MtpBf16FusionOp,
+    norm: &'a Qwen36ResidualNormOp,
+    qkv: &'a Qwen36MtpBf16QkvOp,
+    qk_prepare: &'a Qwen36Fp8AttentionQkPrepareOp,
+    paged_gqa: &'a Qwen36Fp8PagedGqaOp,
+    attention_output: &'a Qwen36MtpBf16AttentionOutputOp,
+    router: &'a Qwen36MoeRouterOp,
+    experts: &'a Qwen36MtpBf16MoeOp,
 }
 
-impl Qwen35MtpLayerProgram {
-    /// Loads the complete Qwen3.5 MTP source family and captures exact routes.
+impl Qwen36MtpLayerProgram {
+    /// Loads the complete Qwen3.6 MTP source family and captures exact routes.
     pub fn from_snapshot(
         context: &Arc<CudaContext>,
-        snapshot: &CheckpointSnapshot<Qwen35_9B>,
+        snapshot: &CheckpointSnapshot<Qwen36Moe35B>,
     ) -> EngineResult<Self> {
-        Self::from_snapshot_inner(context, snapshot, None)
-    }
-
-    /// Loads the layer while borrowing one stable, externally owned MTP cache.
-    ///
-    /// # Safety
-    /// The binding owner must outlive this program and every replay of its graphs.
-    pub(crate) unsafe fn from_snapshot_with_kv(
-        context: &Arc<CudaContext>,
-        snapshot: &CheckpointSnapshot<Qwen35_9B>,
-        binding: Qwen35MtpKvBinding,
-    ) -> EngineResult<Self> {
-        if binding.table_stride == 0 || binding.context_capacity == 0 {
-            return Err(EngineError::layout(
-                "external Qwen3.5 MTP cache requires nonzero table stride and capacity",
-            ));
-        }
-        Self::from_snapshot_inner(context, snapshot, Some(binding))
-    }
-
-    fn from_snapshot_inner(
-        context: &Arc<CudaContext>,
-        snapshot: &CheckpointSnapshot<Qwen35_9B>,
-        kv_binding: Option<Qwen35MtpKvBinding>,
-    ) -> EngineResult<Self> {
-        let mtp = MtpBindings::bind(snapshot)?;
+        let mtp = Qwen36MtpBindings::bind(snapshot)?;
         let qkv = mtp.materialize_qkv()?;
-        let layout = if kv_binding.is_some() {
-            Qwen35MtpLayerLayout::build_for_external_cache()?
-        } else {
-            Qwen35MtpLayerLayout::build()?
-        };
+        let layout = Qwen36MtpLayerLayout::build()?;
         let regions = layout.regions();
         let stream = context.new_stream().map_err(GpuError::from)?;
         let arena = DeviceArena::zeroed(&stream, layout.builder())?;
 
-        arena.copy_from_host(
+        arena.copy_region_bytes_from_host(
             &stream,
             regions.embedding_norm,
-            &mtp.embedding_norm.words().collect::<Vec<_>>(),
+            mtp.embedding_norm.bytes(),
         )?;
-        arena.copy_from_host(
-            &stream,
-            regions.hidden_norm,
-            &mtp.hidden_norm.words().collect::<Vec<_>>(),
-        )?;
-        arena.copy_from_host(
+        arena.copy_region_bytes_from_host(&stream, regions.hidden_norm, mtp.hidden_norm.bytes())?;
+        arena.copy_region_bytes_from_host(
             &stream,
             regions.input_projection,
-            &mtp.input_projection.words().collect::<Vec<_>>(),
+            mtp.input_projection.bytes(),
         )?;
-        arena.copy_from_host(
-            &stream,
-            regions.input_norm,
-            &mtp.input_norm.words().collect::<Vec<_>>(),
-        )?;
-        arena.copy_from_host(
-            &stream,
-            regions.qkv_weight,
-            &little_endian_words(&qkv.weight_bf16)?,
-        )?;
-        arena.copy_from_host(
-            &stream,
-            regions.query_norm,
-            &mtp.query_norm.words().collect::<Vec<_>>(),
-        )?;
-        arena.copy_from_host(
-            &stream,
-            regions.key_norm,
-            &mtp.key_norm.words().collect::<Vec<_>>(),
-        )?;
-        arena.copy_from_host(
+        arena.copy_region_bytes_from_host(&stream, regions.input_norm, mtp.input_norm.bytes())?;
+        arena.copy_region_bytes_from_host(&stream, regions.qkv_weight, &qkv.weight_bf16)?;
+        arena.copy_region_bytes_from_host(&stream, regions.query_norm, mtp.query_norm.bytes())?;
+        arena.copy_region_bytes_from_host(&stream, regions.key_norm, mtp.key_norm.bytes())?;
+        arena.copy_region_bytes_from_host(
             &stream,
             regions.attention_output_weight,
-            &mtp.attention_output_weight.words().collect::<Vec<_>>(),
+            mtp.attention_output_weight.bytes(),
         )?;
-        arena.copy_from_host(
+        arena.copy_region_bytes_from_host(
             &stream,
             regions.post_attention_norm,
-            &mtp.post_attention_norm.words().collect::<Vec<_>>(),
+            mtp.post_attention_norm.bytes(),
         )?;
+        arena.copy_region_bytes_from_host(
+            &stream,
+            regions.router_weight,
+            mtp.router_weight.bytes(),
+        )?;
+        arena.copy_region_bytes_from_host(
+            &stream,
+            regions.routed_gate_up_weight,
+            mtp.routed_gate_up_weight.bytes(),
+        )?;
+        arena.copy_region_bytes_from_host(
+            &stream,
+            regions.routed_down_weight,
+            mtp.routed_down_weight.bytes(),
+        )?;
+        arena.copy_region_bytes_from_host(
+            &stream,
+            regions.shared_gate_weight,
+            mtp.shared_gate_weight.bytes(),
+        )?;
+        arena.copy_region_bytes_from_host(
+            &stream,
+            regions.shared_up_weight,
+            mtp.shared_up_weight.bytes(),
+        )?;
+        arena.copy_region_bytes_from_host(
+            &stream,
+            regions.shared_down_weight,
+            mtp.shared_down_weight.bytes(),
+        )?;
+        arena.copy_region_bytes_from_host(
+            &stream,
+            regions.shared_expert_gate_weight,
+            mtp.shared_expert_gate_weight.bytes(),
+        )?;
+        arena.copy_region_bytes_from_host(&stream, regions.final_norm, mtp.final_norm.bytes())?;
         arena.copy_from_host(
             &stream,
-            regions.gate_up_weight,
-            &little_endian_words(mtp.gate_up_weight_bf16)?,
+            regions.block_tables,
+            &(0..QWEN36_MTP_PHYSICAL_PAGES as u32).collect::<Vec<_>>(),
         )?;
-        arena.copy_from_host(
-            &stream,
-            regions.down_weight,
-            &mtp.down_weight.words().collect::<Vec<_>>(),
-        )?;
-        arena.copy_from_host(
-            &stream,
-            regions.final_norm,
-            &mtp.final_norm.words().collect::<Vec<_>>(),
-        )?;
-        if kv_binding.is_none() {
-            arena.copy_from_host(
-                &stream,
-                regions.block_tables,
-                &(0..QWEN35_MTP_PHYSICAL_PAGES as u32).collect::<Vec<_>>(),
-            )?;
-        }
 
-        let fusion = Qwen35MtpBf16FusionOp::new(context)?;
-        let norm = Qwen35ResidualNormOp::new(context)?;
-        let qkv_op = Qwen35MtpBf16QkvOp::new(context)?;
-        let qk_prepare = Qwen35MtpBf16QkPrepareOp::new(context)?;
-        let paged_gqa = Qwen35MtpBf16PagedGqaOp::new(context)?;
-        let attention_output = Qwen35MtpBf16AttentionOutputOp::new(context)?;
-        let mlp = Qwen35MtpBf16MlpOp::new(context)?;
-        let pointers = Pointers::bind_with_kv(&arena, regions, kv_binding)?;
+        let fusion = Qwen36MtpBf16FusionOp::new(context)?;
+        let norm = Qwen36ResidualNormOp::new(context)?;
+        let qkv_op = Qwen36MtpBf16QkvOp::new(context)?;
+        let qk_prepare = Qwen36Fp8AttentionQkPrepareOp::new(context)?;
+        let paged_gqa = Qwen36Fp8PagedGqaOp::new(context)?;
+        let attention_output = Qwen36MtpBf16AttentionOutputOp::new(context)?;
+        let router = Qwen36MoeRouterOp::new(context)?;
+        let experts = Qwen36MtpBf16MoeOp::new(context)?;
+        let pointers = Pointers::bind(&arena, regions)?;
         let ops = Ops {
             fusion: &fusion,
             norm: &norm,
@@ -370,29 +376,32 @@ impl Qwen35MtpLayerProgram {
             qk_prepare: &qk_prepare,
             paged_gqa: &paged_gqa,
             attention_output: &attention_output,
-            mlp: &mlp,
+            router: &router,
+            experts: &experts,
         };
         let draft_graphs = capture_draft_routes(&stream, ops, pointers)?;
         let prime_graphs = capture_prime_routes(&stream, ops, pointers)?;
         let realign_graphs = capture_realign_routes(&stream, ops, pointers)?;
+        let prompt_graphs = capture_prompt_routes(&stream, ops, pointers)?;
         let base_address = arena.base_address();
 
         Ok(Self {
             draft_graphs,
             prime_graphs,
             realign_graphs,
+            prompt_graphs,
             arena,
-            fusion,
-            norm,
-            qkv: qkv_op,
-            qk_prepare,
-            paged_gqa,
-            attention_output,
-            mlp,
+            _fusion: fusion,
+            _norm: norm,
+            _qkv: qkv_op,
+            _qk_prepare: qk_prepare,
+            _paged_gqa: paged_gqa,
+            _attention_output: attention_output,
+            _router: router,
+            _experts: experts,
             context: Arc::clone(context),
             layout,
             base_address,
-            kv_binding,
         })
     }
 
@@ -404,11 +413,11 @@ impl Qwen35MtpLayerProgram {
         embedding: &[u16],
         target_hidden: &[u16],
     ) -> EngineResult<()> {
-        require_rows(rows)?;
-        let values = product("Qwen3.5 MTP input values", rows, Qwen35_9B::HIDDEN)?;
+        require_rows_or_prompt(rows)?;
+        let values = product("Qwen3.6 MTP input values", rows, Qwen36Moe35B::HIDDEN)?;
         if embedding.len() != values || target_hidden.len() != values {
             return Err(EngineError::layout(format!(
-                "Qwen3.5 MTP inputs have {}/{} values, expected {values} for rows={rows}",
+                "Qwen3.6 MTP inputs have {}/{} values, expected {values} for rows={rows}",
                 embedding.len(),
                 target_hidden.len()
             )));
@@ -429,10 +438,10 @@ impl Qwen35MtpLayerProgram {
         embedding: &[u16],
     ) -> EngineResult<()> {
         require_rows_or_prompt(rows)?;
-        let values = product("Qwen3.5 MTP embedding values", rows, Qwen35_9B::HIDDEN)?;
+        let values = product("Qwen3.6 MTP embedding values", rows, Qwen36Moe35B::HIDDEN)?;
         if embedding.len() != values {
             return Err(EngineError::layout(format!(
-                "Qwen3.5 MTP embedding input has {} values, expected {values} for rows={rows}",
+                "Qwen3.6 MTP embedding input has {} values, expected {values} for rows={rows}",
                 embedding.len()
             )));
         }
@@ -474,7 +483,7 @@ impl Qwen35MtpLayerProgram {
         require_batch(positions.len())?;
         if slots.len() != positions.len() {
             return Err(EngineError::layout(format!(
-                "Qwen3.5 MTP compact route has {} positions and {} slots",
+                "Qwen3.6 MTP compact route has {} positions and {} slots",
                 positions.len(),
                 slots.len()
             )));
@@ -485,11 +494,11 @@ impl Qwen35MtpLayerProgram {
             .map(|&slot| {
                 if slot >= MAX_BATCH || seen[slot] {
                     return Err(EngineError::route(format!(
-                        "Qwen3.5 MTP compact slot {slot} is repeated or outside 0..{MAX_BATCH}"
+                        "Qwen3.6 MTP compact slot {slot} is repeated or outside 0..{MAX_BATCH}"
                     )));
                 }
                 seen[slot] = true;
-                u32::try_from(slot).map_err(|_| EngineError::layout("Qwen3.5 MTP slot exceeds u32"))
+                u32::try_from(slot).map_err(|_| EngineError::layout("Qwen3.6 MTP slot exceeds u32"))
             })
             .collect::<EngineResult<Vec<_>>>()?;
         self.load_state(
@@ -515,16 +524,16 @@ impl Qwen35MtpLayerProgram {
         require_prompt(rows)?;
         if slot >= MAX_BATCH {
             return Err(EngineError::route(format!(
-                "Qwen3.5 MTP prompt slot {slot} is outside 0..{MAX_BATCH}"
+                "Qwen3.6 MTP prompt slot {slot} is outside 0..{MAX_BATCH}"
             )));
         }
         let end = first_position
             .checked_add(rows)
-            .ok_or_else(|| EngineError::route("Qwen3.5 MTP prompt positions overflow"))?;
+            .ok_or_else(|| EngineError::route("Qwen3.6 MTP prompt positions overflow"))?;
         let positions = (first_position..end)
             .map(|position| {
                 u32::try_from(position)
-                    .map_err(|_| EngineError::route("Qwen3.5 MTP prompt position exceeds u32"))
+                    .map_err(|_| EngineError::route("Qwen3.6 MTP prompt position exceeds u32"))
             })
             .collect::<EngineResult<Vec<_>>>()?;
         self.load_state(
@@ -550,7 +559,7 @@ impl Qwen35MtpLayerProgram {
         require_realign(tokens)?;
         if slot >= MAX_BATCH {
             return Err(EngineError::route(format!(
-                "Qwen3.5 MTP realignment slot {slot} is outside 0..{MAX_BATCH}"
+                "Qwen3.6 MTP realignment slot {slot} is outside 0..{MAX_BATCH}"
             )));
         }
         if positions
@@ -558,7 +567,7 @@ impl Qwen35MtpLayerProgram {
             .any(|pair| pair[1] != pair[0].saturating_add(1))
         {
             return Err(EngineError::route(
-                "Qwen3.5 MTP realignment positions must form one contiguous sequence",
+                "Qwen3.6 MTP realignment positions must form one contiguous sequence",
             ));
         }
         self.load_state(
@@ -582,15 +591,15 @@ impl Qwen35MtpLayerProgram {
     ) -> EngineResult<()> {
         if positions.len() != rows || table_rows.len() != rows {
             return Err(EngineError::layout(format!(
-                "Qwen3.5 MTP route metadata has {}/{} rows, expected {rows}",
+                "Qwen3.6 MTP route metadata has {}/{} rows, expected {rows}",
                 positions.len(),
                 table_rows.len()
             )));
         }
-        let rotary_values = product("Qwen3.5 MTP rotary values", rows, ROTARY_PAIRS)?;
+        let rotary_values = product("Qwen3.6 MTP rotary values", rows, ROTARY_PAIRS)?;
         if rope_cos.len() != rotary_values || rope_sin.len() != rotary_values {
             return Err(EngineError::layout(format!(
-                "Qwen3.5 MTP rotary planes must each have {rotary_values} values for rows={rows}"
+                "Qwen3.6 MTP rotary planes must each have {rotary_values} values for rows={rows}"
             )));
         }
         let lengths = positions
@@ -598,13 +607,13 @@ impl Qwen35MtpLayerProgram {
             .map(|&position| {
                 if position as usize >= self.context_capacity() {
                     return Err(EngineError::route(format!(
-                        "Qwen3.5 MTP cache position {position} exceeds the {}-token capacity",
+                        "Qwen3.6 MTP cache position {position} exceeds the {}-token capacity",
                         self.context_capacity()
                     )));
                 }
                 position
                     .checked_add(1)
-                    .ok_or_else(|| EngineError::route("Qwen3.5 MTP cache length overflows"))
+                    .ok_or_else(|| EngineError::route("Qwen3.6 MTP cache length overflows"))
             })
             .collect::<EngineResult<Vec<_>>>()?;
         let regions = self.layout.regions();
@@ -621,19 +630,19 @@ impl Qwen35MtpLayerProgram {
         Ok(())
     }
 
-    /// Replaces both complete represented BF16 cache planes.
+    /// Replaces both complete represented E4M3 cache planes.
     pub fn load_cache(
         &self,
         stream: &CudaStream,
-        key_pages: &[u16],
-        value_pages: &[u16],
+        key_pages: &[u8],
+        value_pages: &[u8],
     ) -> EngineResult<()> {
         let regions = self.layout.regions();
         if key_pages.len() != regions.key_pages.len()
             || value_pages.len() != regions.value_pages.len()
         {
             return Err(EngineError::layout(format!(
-                "Qwen3.5 MTP cache planes must each have {} BF16 values",
+                "Qwen3.6 MTP cache planes must each have {} E4M3 values",
                 regions.key_pages.len()
             )));
         }
@@ -644,7 +653,7 @@ impl Qwen35MtpLayerProgram {
         Ok(())
     }
 
-    /// Clears every represented BF16 MTP cache page.
+    /// Clears every represented E4M3 MTP cache page.
     pub fn reset_cache(&self, stream: &CudaStream) -> EngineResult<()> {
         let regions = self.layout.regions();
         self.arena.fill(stream, regions.key_pages, 0)?;
@@ -676,6 +685,15 @@ impl Qwen35MtpLayerProgram {
         Ok(())
     }
 
+    /// Replays one exact `T=32,64,128` prompt cache-prime graph.
+    pub fn replay_prompt_prime(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        let route = prompt_route(rows)?;
+        // SAFETY: this owner retains the arena and modules captured by every graph.
+        unsafe { self.prompt_graphs[route].launch(stream) }?;
+
+        Ok(())
+    }
+
     /// Reads active final-normalized BF16 rows for shared endpoint projection.
     pub fn read_final_normalized(
         &self,
@@ -683,7 +701,7 @@ impl Qwen35MtpLayerProgram {
         rows: usize,
     ) -> EngineResult<Vec<u16>> {
         require_rows(rows)?;
-        let values = product("Qwen3.5 MTP normalized values", rows, Qwen35_9B::HIDDEN)?;
+        let values = product("Qwen3.6 MTP normalized values", rows, Qwen36Moe35B::HIDDEN)?;
         Ok(self.arena.copy_prefix_to_host(
             stream,
             self.layout.regions().final_normalized,
@@ -694,33 +712,10 @@ impl Qwen35MtpLayerProgram {
     /// Reads active final draft-residual BF16 rows.
     pub fn read_residual_output(&self, stream: &CudaStream, rows: usize) -> EngineResult<Vec<u16>> {
         require_rows(rows)?;
-        let values = product("Qwen3.5 MTP residual values", rows, Qwen35_9B::HIDDEN)?;
+        let values = product("Qwen3.6 MTP residual values", rows, Qwen36Moe35B::HIDDEN)?;
         Ok(self
             .arena
             .copy_prefix_to_host(stream, self.layout.regions().residual_output, values)?)
-    }
-
-    pub(crate) fn read_residual_output_into(
-        &self,
-        stream: &CudaStream,
-        rows: usize,
-        destination: &mut [u16],
-    ) -> EngineResult<()> {
-        require_rows(rows)?;
-        let values = product("Qwen3.5 MTP residual values", rows, Qwen35_9B::HIDDEN)?;
-        if destination.len() != values {
-            return Err(EngineError::layout(format!(
-                "Qwen3.5 MTP residual destination has {} values, expected {values}",
-                destination.len()
-            )));
-        }
-        self.arena.copy_prefix_to_host_slice(
-            stream,
-            self.layout.regions().residual_output,
-            destination,
-        )?;
-
-        Ok(())
     }
 
     /// CUDA context shared by all owner allocations and graphs.
@@ -738,7 +733,7 @@ impl Qwen35MtpLayerProgram {
         self.layout.resident_weight_bytes()
     }
 
-    /// Exact represented BF16 short-cache bytes.
+    /// Exact represented E4M3 short-cache bytes.
     pub const fn cache_bytes(&self) -> usize {
         self.layout.cache_bytes()
     }
@@ -760,67 +755,17 @@ impl Qwen35MtpLayerProgram {
 
     /// Short per-slot cache capacity of this isolated composition owner.
     pub const fn context_capacity(&self) -> usize {
-        match self.kv_binding {
-            Some(binding) => binding.context_capacity,
-            None => self.layout.context_capacity(),
-        }
+        self.layout.context_capacity()
     }
 
     /// Number of immutable exact graph entries.
     pub const fn graph_count(&self) -> usize {
-        MAX_BATCH + 2 * REALIGN_ROUTES
+        MAX_BATCH + 2 * REALIGN_ROUTES + PROMPT_ROUTES.len()
     }
 
+    #[cfg(feature = "qualification")]
     fn pointers(&self) -> GpuResult<Pointers> {
-        Pointers::bind_with_kv(&self.arena, self.layout.regions(), self.kv_binding)
-    }
-
-    pub(crate) fn final_normalized_address(&self) -> GpuResult<*const u16> {
-        Ok(self.pointers()?.final_normalized.cast_const())
-    }
-
-    pub(crate) fn target_hidden_address(&self) -> GpuResult<*const u16> {
-        Ok(self.pointers()?.target_hidden)
-    }
-
-    pub(crate) fn residual_output_address(&self) -> GpuResult<*const u16> {
-        Ok(self.pointers()?.residual_output.cast_const())
-    }
-
-    /// Launches a draft route from one external stable target-hidden plane.
-    ///
-    /// # Safety
-    /// `target_hidden` must cover `batch * 4096` BF16 values until completion.
-    pub(crate) unsafe fn launch_draft_from(
-        &self,
-        stream: &CudaStream,
-        batch: usize,
-        target_hidden: *const u16,
-    ) -> EngineResult<()> {
-        require_batch(batch)?;
-        let mut pointers = self.pointers()?;
-        pointers.target_hidden = target_hidden;
-        launch_full(stream, batch, self.ops(), pointers)?;
-
-        Ok(())
-    }
-
-    /// Launches a prompt-prime tile from the target's stable residual plane.
-    ///
-    /// # Safety
-    /// `target_hidden` must cover `rows * 4096` BF16 values until completion.
-    pub(crate) unsafe fn launch_prompt_prime_from(
-        &self,
-        stream: &CudaStream,
-        rows: usize,
-        target_hidden: *const u16,
-    ) -> EngineResult<()> {
-        require_prompt(rows)?;
-        let mut pointers = self.pointers()?;
-        pointers.target_hidden = target_hidden;
-        launch_prime(stream, rows, self.ops(), pointers)?;
-
-        Ok(())
+        Pointers::bind(&self.arena, self.layout.regions())
     }
 
     #[cfg(feature = "qualification")]
@@ -836,7 +781,7 @@ impl Qwen35MtpLayerProgram {
     pub fn launch_eager_draft_row(&self, stream: &CudaStream, row: usize) -> EngineResult<()> {
         if row >= MAX_BATCH {
             return Err(EngineError::route(format!(
-                "Qwen3.5 MTP qualification row {row} is outside 0..{MAX_BATCH}"
+                "Qwen3.6 MTP qualification row {row} is outside 0..{MAX_BATCH}"
             )));
         }
         launch_full(stream, 1, self.ops(), self.pointers()?.offset_rows(row))?;
@@ -848,6 +793,15 @@ impl Qwen35MtpLayerProgram {
     pub fn launch_eager_prime(&self, stream: &CudaStream, tokens: usize) -> EngineResult<()> {
         require_realign(tokens)?;
         launch_prime(stream, tokens, self.ops(), self.pointers()?)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Launches one exact prompt-prime route eagerly.
+    pub fn launch_eager_prompt_prime(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+        require_prompt(rows)?;
+        launch_prime(stream, rows, self.ops(), self.pointers()?)?;
+
         Ok(())
     }
 
@@ -877,7 +831,7 @@ impl Qwen35MtpLayerProgram {
         require_batch(batch)?;
         if operations == 0 {
             return Err(EngineError::route(
-                "repeated Qwen3.5 MTP layer graph requires at least one operation",
+                "repeated Qwen3.6 MTP layer graph requires at least one operation",
             ));
         }
         let pointers = self.pointers()?;
@@ -897,6 +851,36 @@ impl Qwen35MtpLayerProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Samples the beginning, middle, and end of every immutable weight plane.
+    pub fn qualification_immutable_samples(&self, stream: &CudaStream) -> EngineResult<Vec<u16>> {
+        let regions = self.layout.regions();
+        let mut samples = Vec::with_capacity(17 * 24);
+        for region in [
+            regions.embedding_norm,
+            regions.hidden_norm,
+            regions.input_projection,
+            regions.input_norm,
+            regions.qkv_weight,
+            regions.query_norm,
+            regions.key_norm,
+            regions.attention_output_weight,
+            regions.post_attention_norm,
+            regions.router_weight,
+            regions.routed_gate_up_weight,
+            regions.routed_down_weight,
+            regions.shared_gate_weight,
+            regions.shared_up_weight,
+            regions.shared_down_weight,
+            regions.shared_expert_gate_weight,
+            regions.final_norm,
+        ] {
+            samples.extend(sample_region(&self.arena, stream, region)?);
+        }
+
+        Ok(samples)
+    }
+
+    #[cfg(feature = "qualification")]
     /// Fills every mutable non-cache output plane with one byte sentinel.
     pub fn qualification_reset_outputs(&self, stream: &CudaStream, byte: u8) -> EngineResult<()> {
         let regions = self.layout.regions();
@@ -909,9 +893,14 @@ impl Qwen35MtpLayerProgram {
             regions.attention_activation,
             regions.attention_branch,
             regions.post_attention_residual,
-            regions.mlp_normalized,
-            regions.swiglu,
-            regions.mlp_branch,
+            regions.moe_normalized,
+            regions.router_logits,
+            regions.expert_indices,
+            regions.routing_weights,
+            regions.expert_intermediate,
+            regions.expert_output,
+            regions.shared_gate_output,
+            regions.moe_branch,
             regions.residual_output,
             regions.final_normalized,
         ] {
@@ -927,9 +916,9 @@ impl Qwen35MtpLayerProgram {
     pub fn qualification_observables(
         &self,
         stream: &CudaStream,
-    ) -> EngineResult<Qwen35MtpLayerObservables> {
+    ) -> EngineResult<Qwen36MtpLayerObservables> {
         let regions = self.layout.regions();
-        Ok(Qwen35MtpLayerObservables {
+        Ok(Qwen36MtpLayerObservables {
             embedding: self.arena.copy_to_host(stream, regions.embedding)?,
             target_hidden: self.arena.copy_to_host(stream, regions.target_hidden)?,
             normalized_embedding: self
@@ -958,30 +947,41 @@ impl Qwen35MtpLayerProgram {
             post_attention_residual: self
                 .arena
                 .copy_to_host(stream, regions.post_attention_residual)?,
-            mlp_normalized: self.arena.copy_to_host(stream, regions.mlp_normalized)?,
-            swiglu: self.arena.copy_to_host(stream, regions.swiglu)?,
-            mlp_branch: self.arena.copy_to_host(stream, regions.mlp_branch)?,
+            moe_normalized: self.arena.copy_to_host(stream, regions.moe_normalized)?,
+            router_logits: self.arena.copy_to_host(stream, regions.router_logits)?,
+            expert_indices: self.arena.copy_to_host(stream, regions.expert_indices)?,
+            routing_weights: self.arena.copy_to_host(stream, regions.routing_weights)?,
+            expert_intermediate: self
+                .arena
+                .copy_to_host(stream, regions.expert_intermediate)?,
+            expert_output: self.arena.copy_to_host(stream, regions.expert_output)?,
+            shared_gate_output: self
+                .arena
+                .copy_to_host(stream, regions.shared_gate_output)?,
+            moe_branch: self.arena.copy_to_host(stream, regions.moe_branch)?,
             residual_output: self.arena.copy_to_host(stream, regions.residual_output)?,
             final_normalized: self.arena.copy_to_host(stream, regions.final_normalized)?,
         })
     }
 
+    #[cfg(feature = "qualification")]
     fn ops(&self) -> Ops<'_> {
         Ops {
-            fusion: &self.fusion,
-            norm: &self.norm,
-            qkv: &self.qkv,
-            qk_prepare: &self.qk_prepare,
-            paged_gqa: &self.paged_gqa,
-            attention_output: &self.attention_output,
-            mlp: &self.mlp,
+            fusion: &self._fusion,
+            norm: &self._norm,
+            qkv: &self._qkv,
+            qk_prepare: &self._qk_prepare,
+            paged_gqa: &self._paged_gqa,
+            attention_output: &self._attention_output,
+            router: &self._router,
+            experts: &self._experts,
         }
     }
 }
 
 #[cfg(feature = "qualification")]
-/// Complete mutable Qwen3.5 MTP layer state exposed only to qualification.
-pub struct Qwen35MtpLayerObservables {
+/// Complete mutable Qwen3.6 MTP layer state exposed only to qualification.
+pub struct Qwen36MtpLayerObservables {
     /// Input embedding rows.
     pub embedding: Vec<u16>,
     /// Aligned target-hidden rows.
@@ -1010,10 +1010,10 @@ pub struct Qwen35MtpLayerObservables {
     pub lengths: Vec<u32>,
     /// Prepared FP32 query values.
     pub query: Vec<f32>,
-    /// Complete represented BF16 key cache.
-    pub key_pages: Vec<u16>,
-    /// Complete represented BF16 value cache.
-    pub value_pages: Vec<u16>,
+    /// Complete represented E4M3 key cache.
+    pub key_pages: Vec<u8>,
+    /// Complete represented E4M3 value cache.
+    pub value_pages: Vec<u8>,
     /// FP32 paged-GQA output, gated in place.
     pub attention: Vec<f32>,
     /// Represented BF16 gated attention activation.
@@ -1022,12 +1022,22 @@ pub struct Qwen35MtpLayerObservables {
     pub attention_branch: Vec<u16>,
     /// Residual after the attention branch.
     pub post_attention_residual: Vec<u16>,
-    /// Pre-MLP normalized rows.
-    pub mlp_normalized: Vec<u16>,
-    /// Represented BF16 SwiGLU rows.
-    pub swiglu: Vec<u16>,
-    /// Source-BF16 MLP down branch.
-    pub mlp_branch: Vec<u16>,
+    /// Pre-MoE normalized rows.
+    pub moe_normalized: Vec<u16>,
+    /// Router logits for every expert.
+    pub router_logits: Vec<u16>,
+    /// Selected top-eight expert indices.
+    pub expert_indices: Vec<u16>,
+    /// Renormalized top-eight routing weights.
+    pub routing_weights: Vec<u16>,
+    /// Routed and shared expert SwiGLU values.
+    pub expert_intermediate: Vec<u16>,
+    /// Routed and shared expert output values.
+    pub expert_output: Vec<u16>,
+    /// Per-row shared-expert gate values.
+    pub shared_gate_output: Vec<u16>,
+    /// Combined routed and shared MoE branch.
+    pub moe_branch: Vec<u16>,
     /// Final draft residual rows.
     pub residual_output: Vec<u16>,
     /// Final-normalized rows for the shared endpoint.
@@ -1047,7 +1057,7 @@ fn capture_draft_routes(
     }
     graphs
         .try_into()
-        .map_err(|_| EngineError::layout("Qwen3.5 MTP draft graph inventory has wrong cardinality"))
+        .map_err(|_| EngineError::layout("Qwen3.6 MTP draft graph inventory has wrong cardinality"))
 }
 
 fn capture_prime_routes(
@@ -1063,7 +1073,7 @@ fn capture_prime_routes(
     }
     graphs
         .try_into()
-        .map_err(|_| EngineError::layout("Qwen3.5 MTP prime graph inventory has wrong cardinality"))
+        .map_err(|_| EngineError::layout("Qwen3.6 MTP prime graph inventory has wrong cardinality"))
 }
 
 fn capture_realign_routes(
@@ -1078,7 +1088,23 @@ fn capture_realign_routes(
         })?);
     }
     graphs.try_into().map_err(|_| {
-        EngineError::layout("Qwen3.5 MTP realignment graph inventory has wrong cardinality")
+        EngineError::layout("Qwen3.6 MTP realignment graph inventory has wrong cardinality")
+    })
+}
+
+fn capture_prompt_routes(
+    stream: &CudaStream,
+    ops: Ops<'_>,
+    pointers: Pointers,
+) -> EngineResult<[CudaGraph; PROMPT_ROUTES.len()]> {
+    let mut graphs = Vec::with_capacity(PROMPT_ROUTES.len());
+    for rows in PROMPT_ROUTES {
+        graphs.push(CudaGraph::capture(stream, || {
+            launch_prime(stream, rows, ops, pointers)
+        })?);
+    }
+    graphs.try_into().map_err(|_| {
+        EngineError::layout("Qwen3.6 MTP prompt-prime graph inventory has wrong cardinality")
     })
 }
 
@@ -1132,6 +1158,8 @@ fn launch_prime(
             pointers.query,
             pointers.key_pages,
             pointers.value_pages,
+            Qwen36Moe35B::FP8_CACHE_SCALE,
+            Qwen36Moe35B::FP8_CACHE_SCALE,
         )?;
     }
     Ok(())
@@ -1159,6 +1187,8 @@ fn launch_full(
             pointers.table_stride,
             pointers.lengths,
             pointers.attention,
+            Qwen36Moe35B::FP8_CACHE_SCALE,
+            Qwen36Moe35B::FP8_CACHE_SCALE,
         )?;
         ops.attention_output.launch(
             stream,
@@ -1176,22 +1206,39 @@ fn launch_full(
             pointers.attention_branch,
             pointers.post_attention_norm,
             pointers.post_attention_residual,
-            pointers.mlp_normalized,
+            pointers.moe_normalized,
         )?;
-        ops.mlp.launch(
+        ops.router.launch(
             stream,
             rows,
-            pointers.mlp_normalized,
-            pointers.gate_up_weight,
-            pointers.swiglu,
-            pointers.down_weight,
-            pointers.mlp_branch,
+            pointers.moe_normalized,
+            pointers.router_weight,
+            pointers.router_logits,
+            pointers.expert_indices,
+            pointers.routing_weights,
+        )?;
+        ops.experts.launch(
+            stream,
+            rows,
+            pointers.moe_normalized,
+            pointers.expert_indices,
+            pointers.routing_weights,
+            pointers.routed_gate_up_weight,
+            pointers.routed_down_weight,
+            pointers.shared_gate_weight,
+            pointers.shared_up_weight,
+            pointers.shared_down_weight,
+            pointers.shared_expert_gate_weight,
+            pointers.expert_intermediate,
+            pointers.expert_output,
+            pointers.shared_gate_output,
+            pointers.moe_branch,
         )?;
         ops.norm.launch_residual(
             stream,
             rows,
             pointers.post_attention_residual,
-            pointers.mlp_branch,
+            pointers.moe_branch,
             pointers.final_norm,
             pointers.residual_output,
             pointers.final_normalized,
@@ -1215,7 +1262,7 @@ fn launch_realign(
 fn require_batch(batch: usize) -> EngineResult<()> {
     if !(1..=MAX_BATCH).contains(&batch) {
         return Err(EngineError::route(format!(
-            "Qwen3.5 MTP draft batch {batch} is outside 1..={MAX_BATCH}"
+            "Qwen3.6 MTP draft batch {batch} is outside 1..={MAX_BATCH}"
         )));
     }
     Ok(())
@@ -1224,7 +1271,7 @@ fn require_batch(batch: usize) -> EngineResult<()> {
 fn require_realign(tokens: usize) -> EngineResult<()> {
     if !(1..=REALIGN_ROUTES).contains(&tokens) {
         return Err(EngineError::route(format!(
-            "Qwen3.5 MTP realignment width {tokens} is outside 1..={REALIGN_ROUTES}"
+            "Qwen3.6 MTP realignment width {tokens} is outside 1..={REALIGN_ROUTES}"
         )));
     }
     Ok(())
@@ -1233,7 +1280,7 @@ fn require_realign(tokens: usize) -> EngineResult<()> {
 fn require_rows(rows: usize) -> EngineResult<()> {
     if !(1..=MAX_BATCH).contains(&rows) {
         return Err(EngineError::route(format!(
-            "Qwen3.5 MTP rows {rows} are outside 1..={MAX_BATCH}"
+            "Qwen3.6 MTP rows {rows} are outside 1..={MAX_BATCH}"
         )));
     }
     Ok(())
@@ -1242,10 +1289,21 @@ fn require_rows(rows: usize) -> EngineResult<()> {
 fn require_prompt(rows: usize) -> EngineResult<()> {
     if !PROMPT_ROUTES.contains(&rows) {
         return Err(EngineError::route(format!(
-            "Qwen3.5 MTP prompt rows {rows} are outside 32,64,128"
+            "Qwen3.6 MTP prompt rows {rows} are outside 32,64,128"
         )));
     }
     Ok(())
+}
+
+fn prompt_route(rows: usize) -> EngineResult<usize> {
+    PROMPT_ROUTES
+        .iter()
+        .position(|&route| route == rows)
+        .ok_or_else(|| {
+            EngineError::route(format!(
+                "Qwen3.6 MTP prompt rows {rows} are outside 32,64,128"
+            ))
+        })
 }
 
 fn require_rows_or_prompt(rows: usize) -> EngineResult<()> {
@@ -1253,7 +1311,7 @@ fn require_rows_or_prompt(rows: usize) -> EngineResult<()> {
         Ok(())
     } else {
         Err(EngineError::route(format!(
-            "Qwen3.5 MTP rows {rows} are outside 1..={MAX_BATCH},32,64,128"
+            "Qwen3.6 MTP rows {rows} are outside 1..={MAX_BATCH},32,64,128"
         )))
     }
 }
@@ -1263,27 +1321,30 @@ fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
         .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
-fn little_endian_words(bytes: &[u8]) -> EngineResult<Vec<u16>> {
-    if !bytes.len().is_multiple_of(2) {
-        return Err(EngineError::layout(
-            "Qwen3.5 MTP BF16 source plane has odd byte length",
-        ));
+#[cfg(feature = "qualification")]
+fn sample_region(
+    arena: &DeviceArena,
+    stream: &CudaStream,
+    region: tuisko_gpu::ArenaRegion<u16>,
+) -> EngineResult<Vec<u16>> {
+    let mut samples = Vec::with_capacity(24);
+    for start in [0, region.len() / 2 - 4, region.len() - 8] {
+        samples.extend(arena.copy_slice_to_host(stream, region, start, 8)?);
     }
-    Ok(bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|bytes| u16::from_le_bytes(*bytes))
-        .collect())
+
+    Ok(samples)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{REALIGN_ROUTES, require_batch, require_realign, require_rows};
+    use super::{
+        PROMPT_ROUTES, REALIGN_ROUTES, prompt_route, require_batch, require_prompt,
+        require_realign, require_rows,
+    };
     use crate::{EngineErrorCode, MAX_BATCH};
 
     #[test]
-    fn qwen35_mtp_route_tables_are_exact() {
+    fn qwen36_mtp_route_tables_are_exact() {
         for route in 1..=MAX_BATCH {
             require_batch(route).unwrap();
             require_rows(route).unwrap();
@@ -1299,6 +1360,20 @@ mod tests {
         for route in [0, 5, 8, usize::MAX] {
             assert_eq!(
                 require_realign(route).unwrap_err().code(),
+                Some(EngineErrorCode::Route)
+            );
+        }
+        for (index, route) in PROMPT_ROUTES.into_iter().enumerate() {
+            require_prompt(route).unwrap();
+            assert_eq!(prompt_route(route).unwrap(), index);
+        }
+        for route in [0, 8, 16, 31, 33, 63, 65, 127, 129, usize::MAX] {
+            assert_eq!(
+                require_prompt(route).unwrap_err().code(),
+                Some(EngineErrorCode::Route)
+            );
+            assert_eq!(
+                prompt_route(route).unwrap_err().code(),
                 Some(EngineErrorCode::Route)
             );
         }

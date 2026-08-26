@@ -1,6 +1,8 @@
 //! Resident source-backed Qwen3.8 MTP draft layer.
 
-use crate::mtp_layer_layout::{CONTEXT_CAPACITY, MtpLayerRegions, PHYSICAL_PAGES, TABLE_STRIDE};
+use crate::qwen38::mtp_layer_layout::{
+    CONTEXT_CAPACITY, MtpLayerRegions, PHYSICAL_PAGES, TABLE_STRIDE,
+};
 use crate::{EngineError, EngineResult, MAX_BATCH, MtpLayerLayout};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};

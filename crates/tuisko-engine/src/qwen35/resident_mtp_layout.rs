@@ -1,6 +1,6 @@
 //! Aggregate ownership for the exact Qwen3.5 target and MTP resident programs.
 
-use crate::qwen35_mtp_kv_layout::Qwen35MtpKvLayout;
+use crate::qwen35::mtp_kv_layout::Qwen35MtpKvLayout;
 use crate::{EngineError, EngineResult, Qwen35MtpLayerLayout, Qwen35ResidentModelLayout};
 
 /// Exact target, MTP weight, cache-mirror, and workspace byte accounting.

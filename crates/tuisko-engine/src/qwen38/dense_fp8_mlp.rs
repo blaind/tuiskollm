@@ -1,6 +1,6 @@
 //! Resident source-backed dense-FP8 MLP program.
 
-use crate::dense_fp8_mlp_layout::MAX_ROWS;
+use crate::qwen38::dense_fp8_mlp_layout::MAX_ROWS;
 use crate::{DenseFp8MlpLayout, EngineError, EngineResult, MAX_BATCH};
 use std::marker::PhantomData;
 use std::sync::Arc;
