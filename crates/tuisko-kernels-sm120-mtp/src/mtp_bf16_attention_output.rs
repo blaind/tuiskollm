@@ -3,6 +3,7 @@
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_kernels_sm120_common::attention_output::attention_gate_bf16;
 use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
@@ -285,25 +286,97 @@ mod variant_kernels {
     }
 }
 
-struct PreparedRoute<const TOKENS: usize> {
+mod private {
+    pub trait Sealed {}
+}
+
+/// One architecture's prepared gate and projection entries for an exact batch.
+///
+/// Sealed: the implementors are this module's prepared routes, so an entry
+/// table can never name a route whose entries the module does not emit.
+pub trait MtpAttentionOutputRoute<A: Arch>: Sized + private::Sealed {
+    /// Embedded module that owns this route's entries.
+    ///
+    /// Qwen3.8 compiles into the anchor module and the two variants into a
+    /// second one, so the module type travels with the route.
+    type Module;
+
+    /// Prepares both entries of this route's exact batch.
+    fn prepare(module: &Self::Module) -> GpuResult<Self>;
+
+    /// Launches this route's attention gate and then its output projection.
+    ///
+    /// # Safety
+    ///
+    /// The pointers carry `MtpBf16AttentionOutputOp::launch`'s contract
+    /// unchanged.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &Self::Module,
+        stream: &CudaStream,
+        attention: *mut f32,
+        qkv: *const u16,
+        activation: *mut u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+/// Exact entry table of one admitted architecture's attention-output routes.
+///
+/// The table is parameterized by the architecture instead of bounding
+/// [`Sm120Arch`], so admitting Qwen3.5 and Qwen3.6 here never widens the
+/// artifact-level admission bound. Each table names only the entries its own
+/// model emits, which keeps the compiled inventory fixed while the three
+/// prepared owners share one wrapper.
+pub trait MtpAttentionOutputEntries<A: Arch>: private::Sealed {
+    /// Embedded module this table's entries live in.
+    type Module;
+    /// Prepared decode route for one exact batch.
+    type Decode<const TOKENS: usize>: MtpAttentionOutputRoute<A, Module = Self::Module>;
+
+    /// Message prefix that keeps this table's launch rejections distinct.
+    const LABEL: &'static str;
+
+    /// Rejects an architecture whose geometry the emitted entries do not tile.
+    fn require_geometry() -> GpuResult<()>;
+
+    /// Loads this table's embedded module.
+    fn load(context: &Arc<CudaContext>) -> GpuResult<Self::Module>;
+
+    /// Retained PTX entry names of every route this table admits.
+    fn ptx_names() -> Vec<&'static str>;
+}
+
+/// Prepared Qwen3.8 gate and projection entries for one exact batch.
+pub struct PreparedRoute<const TOKENS: usize> {
     gate: PreparedLaunch<kernels::__mtp_bf16_attention_gate_CudaKernel<TOKENS>>,
     projection: PreparedLaunch<kernels::__mtp_bf16_attention_output_CudaKernel<TOKENS>>,
 }
 
-struct PreparedQwen35Route<const TOKENS: usize> {
+/// Prepared Qwen3.5 gate and projection entries for one exact batch.
+pub struct PreparedQwen35Route<const TOKENS: usize> {
     gate: PreparedLaunch<variant_kernels::__qwen35_mtp_bf16_attention_gate_CudaKernel<TOKENS>>,
     projection:
         PreparedLaunch<variant_kernels::__qwen35_mtp_bf16_attention_output_CudaKernel<TOKENS>>,
 }
 
-struct PreparedQwen36Route<const TOKENS: usize> {
+/// Prepared Qwen3.6 gate and projection entries for one exact batch.
+pub struct PreparedQwen36Route<const TOKENS: usize> {
     gate: PreparedLaunch<variant_kernels::__qwen36_mtp_bf16_attention_gate_CudaKernel<TOKENS>>,
     projection:
         PreparedLaunch<variant_kernels::__qwen36_mtp_bf16_attention_output_CudaKernel<TOKENS>>,
 }
 
-impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
-    fn prepare(module: &variant_kernels::LoadedModule) -> GpuResult<Self> {
+impl<const TOKENS: usize> private::Sealed for PreparedRoute<TOKENS> {}
+impl<const TOKENS: usize> private::Sealed for PreparedQwen35Route<TOKENS> {}
+impl<const TOKENS: usize> private::Sealed for PreparedQwen36Route<TOKENS> {}
+
+impl<const TOKENS: usize> MtpAttentionOutputRoute<Qwen35_9B> for PreparedQwen35Route<TOKENS> {
+    type Module = variant_kernels::LoadedModule;
+
+    fn prepare(module: &Self::Module) -> GpuResult<Self> {
         let gate = module
             .prepare_qwen35_mtp_bf16_attention_gate::<TOKENS>(LaunchConfig1D::new(
                 TOKENS as u32,
@@ -334,7 +407,7 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
     #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
-        module: &variant_kernels::LoadedModule,
+        module: &Self::Module,
         stream: &CudaStream,
         attention: *mut f32,
         qkv: *const u16,
@@ -366,8 +439,10 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
     }
 }
 
-impl<const TOKENS: usize> PreparedQwen36Route<TOKENS> {
-    fn prepare(module: &variant_kernels::LoadedModule) -> GpuResult<Self> {
+impl<const TOKENS: usize> MtpAttentionOutputRoute<Qwen36Moe35B> for PreparedQwen36Route<TOKENS> {
+    type Module = variant_kernels::LoadedModule;
+
+    fn prepare(module: &Self::Module) -> GpuResult<Self> {
         let gate = module
             .prepare_qwen36_mtp_bf16_attention_gate::<TOKENS>(LaunchConfig1D::new(
                 TOKENS as u32,
@@ -398,7 +473,7 @@ impl<const TOKENS: usize> PreparedQwen36Route<TOKENS> {
     #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
-        module: &variant_kernels::LoadedModule,
+        module: &Self::Module,
         stream: &CudaStream,
         attention: *mut f32,
         qkv: *const u16,
@@ -430,8 +505,12 @@ impl<const TOKENS: usize> PreparedQwen36Route<TOKENS> {
     }
 }
 
-impl<const TOKENS: usize> PreparedRoute<TOKENS> {
-    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+// The Qwen3.8 entries compile that model's widths into concrete symbols, so
+// this route stays bound to the sealed artifact-level architecture.
+impl<A: Sm120Arch, const TOKENS: usize> MtpAttentionOutputRoute<A> for PreparedRoute<TOKENS> {
+    type Module = kernels::LoadedModule;
+
+    fn prepare(module: &Self::Module) -> GpuResult<Self> {
         let gate = module
             .prepare_mtp_bf16_attention_gate::<TOKENS>(LaunchConfig1D::new(
                 TOKENS as u32,
@@ -455,7 +534,7 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
     #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
-        module: &kernels::LoadedModule,
+        module: &Self::Module,
         stream: &CudaStream,
         attention: *mut f32,
         qkv: *const u16,
@@ -477,6 +556,109 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
             .map_err(|source| {
                 GpuError::launch("launching the MTP BF16 attention-output projection", source)
             })
+    }
+}
+
+/// Qwen3.8 entry table: the 160-CTA anchor-module gate and projection entries.
+pub struct Qwen38MtpAttentionOutputEntries;
+
+/// Qwen3.5 entry table: the 128-CTA variant-module gate and projection entries.
+pub struct Qwen35MtpAttentionOutputEntries;
+
+/// Qwen3.6 entry table: the 64-CTA variant-module gate and projection entries.
+pub struct Qwen36MtpAttentionOutputEntries;
+
+impl private::Sealed for Qwen38MtpAttentionOutputEntries {}
+impl private::Sealed for Qwen35MtpAttentionOutputEntries {}
+impl private::Sealed for Qwen36MtpAttentionOutputEntries {}
+
+impl<A: Sm120Arch> MtpAttentionOutputEntries<A> for Qwen38MtpAttentionOutputEntries {
+    type Module = kernels::LoadedModule;
+    type Decode<const TOKENS: usize> = PreparedRoute<TOKENS>;
+
+    const LABEL: &'static str = "";
+
+    fn require_geometry() -> GpuResult<()> {
+        if INPUT_COLUMNS != 6_144
+            || OUTPUT_ROWS != 5_120
+            || !INPUT_COLUMNS.is_multiple_of(16)
+            || !OUTPUT_TILES.is_multiple_of(WARPS)
+        {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.8 MTP attention-output geometry does not tile exact BF16 MMA shapes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn load(context: &Arc<CudaContext>) -> GpuResult<Self::Module> {
+        // SAFETY: this crate owns the embedded exact MTP artifact.
+        unsafe { kernels::load(context) }
+            .map_err(|source| GpuError::module("loading MTP BF16 attention output", source))
+    }
+
+    fn ptx_names() -> Vec<&'static str> {
+        mtp_bf16_attention_output_ptx_names()
+    }
+}
+
+impl MtpAttentionOutputEntries<Qwen35_9B> for Qwen35MtpAttentionOutputEntries {
+    type Module = variant_kernels::LoadedModule;
+    type Decode<const TOKENS: usize> = PreparedQwen35Route<TOKENS>;
+
+    const LABEL: &'static str = "Qwen3.5 ";
+
+    fn require_geometry() -> GpuResult<()> {
+        if QWEN35_INPUT_COLUMNS != 4_096
+            || QWEN35_OUTPUT_ROWS != 4_096
+            || !QWEN35_INPUT_COLUMNS.is_multiple_of(16)
+            || !QWEN35_OUTPUT_TILES.is_multiple_of(WARPS)
+        {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 MTP attention-output geometry does not tile exact BF16 MMA shapes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn load(context: &Arc<CudaContext>) -> GpuResult<Self::Module> {
+        // SAFETY: this crate owns the embedded exact MTP artifact.
+        unsafe { variant_kernels::load(context) }
+            .map_err(|source| GpuError::module("loading Qwen3.5 MTP BF16 attention output", source))
+    }
+
+    fn ptx_names() -> Vec<&'static str> {
+        qwen35_mtp_bf16_attention_output_ptx_names()
+    }
+}
+
+impl MtpAttentionOutputEntries<Qwen36Moe35B> for Qwen36MtpAttentionOutputEntries {
+    type Module = variant_kernels::LoadedModule;
+    type Decode<const TOKENS: usize> = PreparedQwen36Route<TOKENS>;
+
+    const LABEL: &'static str = "Qwen3.6 ";
+
+    fn require_geometry() -> GpuResult<()> {
+        if QWEN36_INPUT_COLUMNS != 4_096
+            || QWEN36_OUTPUT_ROWS != 2_048
+            || !QWEN36_INPUT_COLUMNS.is_multiple_of(16)
+            || !QWEN36_OUTPUT_TILES.is_multiple_of(WARPS)
+        {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.6 MTP attention-output geometry does not tile exact BF16 MMA shapes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn load(context: &Arc<CudaContext>) -> GpuResult<Self::Module> {
+        // SAFETY: this crate owns the embedded exact MTP artifact.
+        unsafe { variant_kernels::load(context) }
+            .map_err(|source| GpuError::module("loading Qwen3.6 MTP BF16 attention output", source))
+    }
+
+    fn ptx_names() -> Vec<&'static str> {
+        qwen36_mtp_bf16_attention_output_ptx_names()
     }
 }
 
@@ -547,44 +729,45 @@ pub(crate) fn qwen36_mtp_bf16_attention_output_ptx_names() -> Vec<&'static str> 
 }
 
 /// Prepared gated source-BF16 attention-output routes for exact MTP `B=1..=8`.
-pub struct MtpBf16AttentionOutputOp {
-    module: kernels::LoadedModule,
-    b1: PreparedRoute<1>,
-    b2: PreparedRoute<2>,
-    b3: PreparedRoute<3>,
-    b4: PreparedRoute<4>,
-    b5: PreparedRoute<5>,
-    b6: PreparedRoute<6>,
-    b7: PreparedRoute<7>,
-    b8: PreparedRoute<8>,
+pub struct MtpBf16AttentionOutputOp<
+    A: Arch = Qwen38_27B,
+    E: MtpAttentionOutputEntries<A> = Qwen38MtpAttentionOutputEntries,
+> {
+    module: E::Module,
+    b1: E::Decode<1>,
+    b2: E::Decode<2>,
+    b3: E::Decode<3>,
+    b4: E::Decode<4>,
+    b5: E::Decode<5>,
+    b6: E::Decode<6>,
+    b7: E::Decode<7>,
+    b8: E::Decode<8>,
 }
 
-impl MtpBf16AttentionOutputOp {
+/// Prepared gated attention-output routes for exact Qwen3.5 MTP batches.
+pub type Qwen35MtpBf16AttentionOutputOp =
+    MtpBf16AttentionOutputOp<Qwen35_9B, Qwen35MtpAttentionOutputEntries>;
+
+/// Prepared gated attention-output routes for exact Qwen3.6 MTP batches.
+pub type Qwen36MtpBf16AttentionOutputOp =
+    MtpBf16AttentionOutputOp<Qwen36Moe35B, Qwen36MtpAttentionOutputEntries>;
+
+impl<A: Arch, E: MtpAttentionOutputEntries<A>> MtpBf16AttentionOutputOp<A, E> {
     /// Loads the embedded module and prepares every exact MTP route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        if INPUT_COLUMNS != 6_144
-            || OUTPUT_ROWS != 5_120
-            || !INPUT_COLUMNS.is_multiple_of(16)
-            || !OUTPUT_TILES.is_multiple_of(WARPS)
-        {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.8 MTP attention-output geometry does not tile exact BF16 MMA shapes",
-            ));
-        }
-        let _ = mtp_bf16_attention_output_ptx_names();
-        // SAFETY: this crate owns the embedded exact MTP artifact.
-        let module = unsafe { kernels::load(context) }
-            .map_err(|source| GpuError::module("loading MTP BF16 attention output", source))?;
+        E::require_geometry()?;
+        let _ = E::ptx_names();
+        let module = E::load(context)?;
 
         Ok(Self {
-            b1: PreparedRoute::prepare(&module)?,
-            b2: PreparedRoute::prepare(&module)?,
-            b3: PreparedRoute::prepare(&module)?,
-            b4: PreparedRoute::prepare(&module)?,
-            b5: PreparedRoute::prepare(&module)?,
-            b6: PreparedRoute::prepare(&module)?,
-            b7: PreparedRoute::prepare(&module)?,
-            b8: PreparedRoute::prepare(&module)?,
+            b1: E::Decode::<1>::prepare(&module)?,
+            b2: E::Decode::<2>::prepare(&module)?,
+            b3: E::Decode::<3>::prepare(&module)?,
+            b4: E::Decode::<4>::prepare(&module)?,
+            b5: E::Decode::<5>::prepare(&module)?,
+            b6: E::Decode::<6>::prepare(&module)?,
+            b7: E::Decode::<7>::prepare(&module)?,
+            b8: E::Decode::<8>::prepare(&module)?,
             module,
         })
     }
@@ -593,12 +776,13 @@ impl MtpBf16AttentionOutputOp {
     ///
     /// # Safety
     ///
-    /// `attention` covers `[batch, 6144]` FP32 values and is mutable scratch;
-    /// `qkv` covers `[batch, 14336]` BF16 values; `activation` covers
-    /// `[batch, 6144]` BF16 values; `weight` covers `[5120, 6144]` unchanged
-    /// source BF16 values; and `output` covers `[batch, 5120]` BF16 values.
-    /// Four-byte-loaded regions are aligned, non-overlapping, context-local,
-    /// and live through stream completion.
+    /// `attention` covers `[batch, A::ATTENTION_OUTPUT_COLUMNS]` FP32 values
+    /// and is mutable scratch; `qkv` covers `[batch, A::ATTENTION_QKV_ROWS]`
+    /// BF16 values; `activation` covers `[batch, A::ATTENTION_OUTPUT_COLUMNS]`
+    /// BF16 values; `weight` covers `[A::HIDDEN, A::ATTENTION_OUTPUT_COLUMNS]`
+    /// unchanged source BF16 values; and `output` covers `[batch, A::HIDDEN]`
+    /// BF16 values. Four-byte-loaded regions are aligned, non-overlapping,
+    /// context-local, and live through stream completion.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
@@ -637,199 +821,8 @@ impl MtpBf16AttentionOutputOp {
             7 => launch!(b7),
             8 => launch!(b8),
             _ => Err(GpuError::invalid_launch(format!(
-                "MTP BF16 attention-output batch {batch} is outside exact B=1..={MAX_BATCH}"
-            ))),
-        }
-    }
-}
-
-/// Prepared gated source-BF16 attention-output routes for exact Qwen3.5 MTP batches.
-pub struct Qwen35MtpBf16AttentionOutputOp {
-    module: variant_kernels::LoadedModule,
-    b1: PreparedQwen35Route<1>,
-    b2: PreparedQwen35Route<2>,
-    b3: PreparedQwen35Route<3>,
-    b4: PreparedQwen35Route<4>,
-    b5: PreparedQwen35Route<5>,
-    b6: PreparedQwen35Route<6>,
-    b7: PreparedQwen35Route<7>,
-    b8: PreparedQwen35Route<8>,
-}
-
-impl Qwen35MtpBf16AttentionOutputOp {
-    /// Loads the embedded module and prepares every exact Qwen3.5 route.
-    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        if QWEN35_INPUT_COLUMNS != 4_096
-            || QWEN35_OUTPUT_ROWS != 4_096
-            || !QWEN35_INPUT_COLUMNS.is_multiple_of(16)
-            || !QWEN35_OUTPUT_TILES.is_multiple_of(WARPS)
-        {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 MTP attention-output geometry does not tile exact BF16 MMA shapes",
-            ));
-        }
-        let _ = qwen35_mtp_bf16_attention_output_ptx_names();
-        // SAFETY: this crate owns the embedded exact MTP artifact.
-        let module = unsafe { variant_kernels::load(context) }.map_err(|source| {
-            GpuError::module("loading Qwen3.5 MTP BF16 attention output", source)
-        })?;
-
-        Ok(Self {
-            b1: PreparedQwen35Route::prepare(&module)?,
-            b2: PreparedQwen35Route::prepare(&module)?,
-            b3: PreparedQwen35Route::prepare(&module)?,
-            b4: PreparedQwen35Route::prepare(&module)?,
-            b5: PreparedQwen35Route::prepare(&module)?,
-            b6: PreparedQwen35Route::prepare(&module)?,
-            b7: PreparedQwen35Route::prepare(&module)?,
-            b8: PreparedQwen35Route::prepare(&module)?,
-            module,
-        })
-    }
-
-    /// Gates attention and applies the Qwen3.5 source-BF16 projection.
-    ///
-    /// # Safety
-    ///
-    /// `attention` covers `[batch, 4096]` FP32 values and is mutable scratch;
-    /// `qkv` covers `[batch, 10240]` BF16 values; `activation` covers
-    /// `[batch, 4096]`; weights cover `[4096, 4096]`; and output covers
-    /// `[batch, 4096]`. Four-byte-loaded regions are aligned, non-overlapping,
-    /// context-local, and live through stream completion.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn launch(
-        &self,
-        stream: &CudaStream,
-        batch: usize,
-        attention: *mut f32,
-        qkv: *const u16,
-        activation: *mut u16,
-        weight: *const u16,
-        output: *mut u16,
-    ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        attention,
-                        qkv,
-                        activation,
-                        weight,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 MTP BF16 attention-output batch {batch} is outside exact B=1..={MAX_BATCH}"
-            ))),
-        }
-    }
-}
-
-/// Prepared gated source-BF16 attention-output routes for exact Qwen3.6 MTP batches.
-pub struct Qwen36MtpBf16AttentionOutputOp {
-    module: variant_kernels::LoadedModule,
-    b1: PreparedQwen36Route<1>,
-    b2: PreparedQwen36Route<2>,
-    b3: PreparedQwen36Route<3>,
-    b4: PreparedQwen36Route<4>,
-    b5: PreparedQwen36Route<5>,
-    b6: PreparedQwen36Route<6>,
-    b7: PreparedQwen36Route<7>,
-    b8: PreparedQwen36Route<8>,
-}
-
-impl Qwen36MtpBf16AttentionOutputOp {
-    /// Loads the embedded module and prepares every exact Qwen3.6 route.
-    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        if QWEN36_INPUT_COLUMNS != 4_096
-            || QWEN36_OUTPUT_ROWS != 2_048
-            || !QWEN36_INPUT_COLUMNS.is_multiple_of(16)
-            || !QWEN36_OUTPUT_TILES.is_multiple_of(WARPS)
-        {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.6 MTP attention-output geometry does not tile exact BF16 MMA shapes",
-            ));
-        }
-        let _ = qwen36_mtp_bf16_attention_output_ptx_names();
-        // SAFETY: this crate owns the embedded exact MTP artifact.
-        let module = unsafe { variant_kernels::load(context) }.map_err(|source| {
-            GpuError::module("loading Qwen3.6 MTP BF16 attention output", source)
-        })?;
-
-        Ok(Self {
-            b1: PreparedQwen36Route::prepare(&module)?,
-            b2: PreparedQwen36Route::prepare(&module)?,
-            b3: PreparedQwen36Route::prepare(&module)?,
-            b4: PreparedQwen36Route::prepare(&module)?,
-            b5: PreparedQwen36Route::prepare(&module)?,
-            b6: PreparedQwen36Route::prepare(&module)?,
-            b7: PreparedQwen36Route::prepare(&module)?,
-            b8: PreparedQwen36Route::prepare(&module)?,
-            module,
-        })
-    }
-
-    /// Gates attention and applies the Qwen3.6 source-BF16 projection.
-    ///
-    /// # Safety
-    ///
-    /// `attention` covers `[batch,4_096]` FP32 values, `qkv` covers
-    /// `[batch,9_216]` BF16 values, `activation` covers `[batch,4_096]`,
-    /// weights cover `[2_048,4_096]`, and output covers `[batch,2_048]`.
-    /// All planes are aligned, non-overlapping, context-local, and live
-    /// through stream completion.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn launch(
-        &self,
-        stream: &CudaStream,
-        batch: usize,
-        attention: *mut f32,
-        qkv: *const u16,
-        activation: *mut u16,
-        weight: *const u16,
-        output: *mut u16,
-    ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        attention,
-                        qkv,
-                        activation,
-                        weight,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.6 MTP BF16 attention-output batch {batch} is outside exact B=1..={MAX_BATCH}"
+                "{}MTP BF16 attention-output batch {batch} is outside exact B=1..={MAX_BATCH}",
+                E::LABEL
             ))),
         }
     }
@@ -838,13 +831,15 @@ impl Qwen36MtpBf16AttentionOutputOp {
 #[cfg(test)]
 mod tests {
     use super::{
-        GATE_THREADS, INPUT_COLUMNS, MAX_BATCH, OUTPUT_ROWS, OUTPUT_TILES, PROJECTION_BLOCKS,
-        PROJECTION_THREADS, QWEN35_INPUT_COLUMNS, QWEN35_OUTPUT_ROWS, QWEN35_OUTPUT_TILES,
-        QWEN36_INPUT_COLUMNS, QWEN36_OUTPUT_ROWS, QWEN36_OUTPUT_TILES, WARPS,
-        mtp_bf16_attention_output_ptx_names, qwen35_mtp_bf16_attention_output_ptx_names,
-        qwen36_mtp_bf16_attention_output_ptx_names,
+        GATE_THREADS, INPUT_COLUMNS, MAX_BATCH, MtpAttentionOutputEntries, OUTPUT_ROWS,
+        OUTPUT_TILES, PROJECTION_BLOCKS, PROJECTION_THREADS, QWEN35_INPUT_COLUMNS,
+        QWEN35_OUTPUT_ROWS, QWEN35_OUTPUT_TILES, QWEN36_INPUT_COLUMNS, QWEN36_OUTPUT_ROWS,
+        QWEN36_OUTPUT_TILES, Qwen35MtpAttentionOutputEntries, Qwen36MtpAttentionOutputEntries,
+        Qwen38MtpAttentionOutputEntries, WARPS, mtp_bf16_attention_output_ptx_names,
+        qwen35_mtp_bf16_attention_output_ptx_names, qwen36_mtp_bf16_attention_output_ptx_names,
     };
     use std::collections::BTreeSet;
+    use tuisko_model::{Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
     #[test]
     fn exact_geometry_and_batch_inventory_are_complete() {
@@ -884,5 +879,41 @@ mod tests {
         let names = qwen36_mtp_bf16_attention_output_ptx_names();
         assert_eq!(names.len(), 2 * MAX_BATCH);
         assert_eq!(names.iter().copied().collect::<BTreeSet<_>>().len(), 16);
+    }
+
+    /// Each entry table publishes exactly the list that retains its own
+    /// specializations, so merging the owners cannot merge the inventories.
+    #[test]
+    fn every_entry_table_publishes_its_own_inventory() {
+        assert_eq!(
+            <Qwen38MtpAttentionOutputEntries as MtpAttentionOutputEntries<Qwen38_27B>>::ptx_names(),
+            mtp_bf16_attention_output_ptx_names()
+        );
+        assert_eq!(
+            <Qwen35MtpAttentionOutputEntries as MtpAttentionOutputEntries<Qwen35_9B>>::ptx_names(),
+            qwen35_mtp_bf16_attention_output_ptx_names()
+        );
+        assert_eq!(
+            <Qwen36MtpAttentionOutputEntries as MtpAttentionOutputEntries<Qwen36Moe35B>>::ptx_names(
+            ),
+            qwen36_mtp_bf16_attention_output_ptx_names()
+        );
+    }
+
+    /// The three tables keep their owners' geometry rejections separate.
+    #[test]
+    fn every_entry_table_admits_its_own_geometry() {
+        assert!(
+            <Qwen38MtpAttentionOutputEntries as MtpAttentionOutputEntries<Qwen38_27B>>::require_geometry()
+                .is_ok()
+        );
+        assert!(
+            <Qwen35MtpAttentionOutputEntries as MtpAttentionOutputEntries<Qwen35_9B>>::require_geometry()
+                .is_ok()
+        );
+        assert!(
+            <Qwen36MtpAttentionOutputEntries as MtpAttentionOutputEntries<Qwen36Moe35B>>::require_geometry()
+                .is_ok()
+        );
     }
 }

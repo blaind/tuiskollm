@@ -3,6 +3,7 @@
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -485,13 +486,89 @@ mod qwen35_kernels {
     }
 }
 
-struct PreparedRoute<const TOKENS: usize> {
+mod private {
+    pub trait Sealed {}
+}
+
+/// One architecture's prepared SwiGLU and down entries for an exact batch.
+///
+/// Sealed: the implementors are this module's prepared routes, so an entry
+/// table can never name a route whose entries the module does not emit.
+pub trait MtpMlpRoute<A: Arch>: Sized + private::Sealed {
+    /// Embedded module that owns this route's entries.
+    ///
+    /// The two architectures compile into separate cuda-oxide modules, so the
+    /// module type travels with the route rather than with the wrapper.
+    type Module;
+
+    /// Prepares both entries of this route's exact batch.
+    fn prepare(module: &Self::Module) -> GpuResult<Self>;
+
+    /// Launches this route's SwiGLU entry and then its down projection.
+    ///
+    /// # Safety
+    ///
+    /// The pointers carry `MtpBf16MlpOp::launch`'s contract unchanged.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &Self::Module,
+        stream: &CudaStream,
+        input: *const u16,
+        gate_up_weight: *const u16,
+        activation: *mut u16,
+        down_weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+/// Exact entry table of one admitted architecture's MTP MLP routes.
+///
+/// The table is parameterized by the architecture instead of bounding
+/// [`Sm120Arch`], so admitting Qwen3.5 here never widens the artifact-level
+/// admission bound. Each table names only the entries its own model emits,
+/// which keeps the compiled inventory fixed while both prepared owners share
+/// one wrapper.
+pub trait MtpMlpEntries<A: Arch>: private::Sealed {
+    /// Embedded module this table's entries live in.
+    type Module;
+    /// Prepared decode route for one exact batch.
+    type Decode<const TOKENS: usize>: MtpMlpRoute<A, Module = Self::Module>;
+
+    /// Message prefix that keeps this table's launch rejections distinct.
+    const LABEL: &'static str;
+
+    /// Rejects an architecture whose geometry the emitted entries do not tile.
+    fn require_geometry() -> GpuResult<()>;
+
+    /// Loads this table's embedded module.
+    fn load(context: &Arc<CudaContext>) -> GpuResult<Self::Module>;
+
+    /// Retained PTX entry names of every route this table admits.
+    fn ptx_names() -> Vec<&'static str>;
+}
+
+/// Prepared Qwen3.8 SwiGLU and down entries for one exact batch.
+pub struct PreparedRoute<const TOKENS: usize> {
     swiglu: PreparedLaunch<kernels::__mtp_bf16_swiglu_CudaKernel<TOKENS>>,
     down: PreparedLaunch<kernels::__mtp_bf16_down_CudaKernel<TOKENS>>,
 }
 
-impl<const TOKENS: usize> PreparedRoute<TOKENS> {
-    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+/// Prepared Qwen3.5 SwiGLU and down entries for one exact batch.
+pub struct PreparedQwen35Route<const TOKENS: usize> {
+    swiglu: PreparedLaunch<qwen35_kernels::__qwen35_mtp_bf16_swiglu_CudaKernel<TOKENS>>,
+    down: PreparedLaunch<qwen35_kernels::__qwen35_mtp_bf16_down_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> private::Sealed for PreparedRoute<TOKENS> {}
+impl<const TOKENS: usize> private::Sealed for PreparedQwen35Route<TOKENS> {}
+
+// The Qwen3.8 entries compile that model's widths into concrete symbols, so
+// this route stays bound to the sealed artifact-level architecture.
+impl<A: Sm120Arch, const TOKENS: usize> MtpMlpRoute<A> for PreparedRoute<TOKENS> {
+    type Module = kernels::LoadedModule;
+
+    fn prepare(module: &Self::Module) -> GpuResult<Self> {
         let swiglu = module
             .prepare_mtp_bf16_swiglu::<TOKENS>(LaunchConfig1D::new(GATE_BLOCKS, GATE_THREADS, 0))
             .map_err(|source| GpuError::launch("preparing the MTP BF16 SwiGLU", source))?;
@@ -505,7 +582,7 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
     #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
-        module: &kernels::LoadedModule,
+        module: &Self::Module,
         stream: &CudaStream,
         input: *const u16,
         gate_up_weight: *const u16,
@@ -534,13 +611,10 @@ impl<const TOKENS: usize> PreparedRoute<TOKENS> {
     }
 }
 
-struct PreparedQwen35Route<const TOKENS: usize> {
-    swiglu: PreparedLaunch<qwen35_kernels::__qwen35_mtp_bf16_swiglu_CudaKernel<TOKENS>>,
-    down: PreparedLaunch<qwen35_kernels::__qwen35_mtp_bf16_down_CudaKernel<TOKENS>>,
-}
+impl<const TOKENS: usize> MtpMlpRoute<Qwen35_9B> for PreparedQwen35Route<TOKENS> {
+    type Module = qwen35_kernels::LoadedModule;
 
-impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
-    fn prepare(module: &qwen35_kernels::LoadedModule) -> GpuResult<Self> {
+    fn prepare(module: &Self::Module) -> GpuResult<Self> {
         let swiglu = module
             .prepare_qwen35_mtp_bf16_swiglu::<TOKENS>(LaunchConfig1D::new(
                 QWEN35_GATE_BLOCKS,
@@ -564,7 +638,7 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
     #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
-        module: &qwen35_kernels::LoadedModule,
+        module: &Self::Module,
         stream: &CudaStream,
         input: *const u16,
         gate_up_weight: *const u16,
@@ -592,6 +666,81 @@ impl<const TOKENS: usize> PreparedQwen35Route<TOKENS> {
             .map_err(|source| {
                 GpuError::launch("launching the Qwen3.5 MTP BF16 down projection", source)
             })
+    }
+}
+
+/// Qwen3.8 entry table: the 272-CTA SwiGLU and 160-CTA down entries.
+pub struct Qwen38MtpMlpEntries;
+
+/// Qwen3.5 entry table: the 192-CTA SwiGLU and 128-CTA down entries.
+pub struct Qwen35MtpMlpEntries;
+
+impl private::Sealed for Qwen38MtpMlpEntries {}
+impl private::Sealed for Qwen35MtpMlpEntries {}
+
+impl<A: Sm120Arch> MtpMlpEntries<A> for Qwen38MtpMlpEntries {
+    type Module = kernels::LoadedModule;
+    type Decode<const TOKENS: usize> = PreparedRoute<TOKENS>;
+
+    const LABEL: &'static str = "";
+
+    fn require_geometry() -> GpuResult<()> {
+        if HIDDEN != 5_120
+            || INTERMEDIATE != 17_408
+            || GATE_UP_ROWS != 34_816
+            || !HIDDEN.is_multiple_of(16)
+            || !INTERMEDIATE.is_multiple_of(16)
+            || !GATE_TILES.is_multiple_of(GATE_WARPS)
+            || !DOWN_TILES.is_multiple_of(DOWN_WARPS)
+        {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.8 MTP MLP geometry does not tile exact BF16 MMA shapes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn load(context: &Arc<CudaContext>) -> GpuResult<Self::Module> {
+        // SAFETY: this crate owns the embedded exact MTP MLP artifact.
+        unsafe { kernels::load(context) }
+            .map_err(|source| GpuError::module("loading the MTP BF16 MLP", source))
+    }
+
+    fn ptx_names() -> Vec<&'static str> {
+        mtp_bf16_mlp_ptx_names()
+    }
+}
+
+impl MtpMlpEntries<Qwen35_9B> for Qwen35MtpMlpEntries {
+    type Module = qwen35_kernels::LoadedModule;
+    type Decode<const TOKENS: usize> = PreparedQwen35Route<TOKENS>;
+
+    const LABEL: &'static str = "Qwen3.5 ";
+
+    fn require_geometry() -> GpuResult<()> {
+        if QWEN35_HIDDEN != 4_096
+            || QWEN35_INTERMEDIATE != 12_288
+            || QWEN35_GATE_UP_ROWS != 24_576
+            || !QWEN35_HIDDEN.is_multiple_of(16)
+            || !QWEN35_INTERMEDIATE.is_multiple_of(16)
+            || !QWEN35_GATE_TILES.is_multiple_of(GATE_WARPS)
+            || !QWEN35_DOWN_TILES.is_multiple_of(DOWN_WARPS)
+        {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.5 MTP MLP geometry does not tile exact BF16 MMA shapes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn load(context: &Arc<CudaContext>) -> GpuResult<Self::Module> {
+        // SAFETY: this crate owns the embedded exact Qwen3.5 MTP MLP artifact.
+        unsafe { qwen35_kernels::load(context) }
+            .map_err(|source| GpuError::module("loading the Qwen3.5 MTP BF16 MLP", source))
+    }
+
+    fn ptx_names() -> Vec<&'static str> {
+        qwen35_mtp_bf16_mlp_ptx_names()
     }
 }
 
@@ -640,47 +789,37 @@ pub(crate) fn qwen35_mtp_bf16_mlp_ptx_names() -> Vec<&'static str> {
 }
 
 /// Prepared source-BF16 MTP SwiGLU and down-projection routes for `B=1..=8`.
-pub struct MtpBf16MlpOp {
-    module: kernels::LoadedModule,
-    b1: PreparedRoute<1>,
-    b2: PreparedRoute<2>,
-    b3: PreparedRoute<3>,
-    b4: PreparedRoute<4>,
-    b5: PreparedRoute<5>,
-    b6: PreparedRoute<6>,
-    b7: PreparedRoute<7>,
-    b8: PreparedRoute<8>,
+pub struct MtpBf16MlpOp<A: Arch = Qwen38_27B, E: MtpMlpEntries<A> = Qwen38MtpMlpEntries> {
+    module: E::Module,
+    b1: E::Decode<1>,
+    b2: E::Decode<2>,
+    b3: E::Decode<3>,
+    b4: E::Decode<4>,
+    b5: E::Decode<5>,
+    b6: E::Decode<6>,
+    b7: E::Decode<7>,
+    b8: E::Decode<8>,
 }
 
-impl MtpBf16MlpOp {
+/// Prepared source-BF16 Qwen3.5 MTP SwiGLU and down routes for `B=1..=8`.
+pub type Qwen35MtpBf16MlpOp = MtpBf16MlpOp<Qwen35_9B, Qwen35MtpMlpEntries>;
+
+impl<A: Arch, E: MtpMlpEntries<A>> MtpBf16MlpOp<A, E> {
     /// Loads the embedded module and prepares every exact MTP MLP route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        if HIDDEN != 5_120
-            || INTERMEDIATE != 17_408
-            || GATE_UP_ROWS != 34_816
-            || !HIDDEN.is_multiple_of(16)
-            || !INTERMEDIATE.is_multiple_of(16)
-            || !GATE_TILES.is_multiple_of(GATE_WARPS)
-            || !DOWN_TILES.is_multiple_of(DOWN_WARPS)
-        {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.8 MTP MLP geometry does not tile exact BF16 MMA shapes",
-            ));
-        }
-        let _ = mtp_bf16_mlp_ptx_names();
-        // SAFETY: this crate owns the embedded exact MTP MLP artifact.
-        let module = unsafe { kernels::load(context) }
-            .map_err(|source| GpuError::module("loading the MTP BF16 MLP", source))?;
+        E::require_geometry()?;
+        let _ = E::ptx_names();
+        let module = E::load(context)?;
 
         Ok(Self {
-            b1: PreparedRoute::prepare(&module)?,
-            b2: PreparedRoute::prepare(&module)?,
-            b3: PreparedRoute::prepare(&module)?,
-            b4: PreparedRoute::prepare(&module)?,
-            b5: PreparedRoute::prepare(&module)?,
-            b6: PreparedRoute::prepare(&module)?,
-            b7: PreparedRoute::prepare(&module)?,
-            b8: PreparedRoute::prepare(&module)?,
+            b1: E::Decode::<1>::prepare(&module)?,
+            b2: E::Decode::<2>::prepare(&module)?,
+            b3: E::Decode::<3>::prepare(&module)?,
+            b4: E::Decode::<4>::prepare(&module)?,
+            b5: E::Decode::<5>::prepare(&module)?,
+            b6: E::Decode::<6>::prepare(&module)?,
+            b7: E::Decode::<7>::prepare(&module)?,
+            b8: E::Decode::<8>::prepare(&module)?,
             module,
         })
     }
@@ -691,8 +830,10 @@ impl MtpBf16MlpOp {
     ///
     /// All pointers are four-byte aligned, context-local, non-overlapping, and
     /// live through stream completion. `input` and `output` cover
-    /// `[batch,5120]`, `gate_up_weight` covers `[34816,5120]`, `activation`
-    /// covers `[batch,17408]`, and `down_weight` covers `[5120,17408]` BF16 values.
+    /// `[batch, A::HIDDEN]`, `gate_up_weight` covers
+    /// `[2 * A::INTERMEDIATE, A::HIDDEN]`, `activation` covers
+    /// `[batch, A::INTERMEDIATE]`, and `down_weight` covers
+    /// `[A::HIDDEN, A::INTERMEDIATE]` BF16 values.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
@@ -731,105 +872,8 @@ impl MtpBf16MlpOp {
             7 => launch!(b7),
             8 => launch!(b8),
             _ => Err(GpuError::invalid_launch(format!(
-                "MTP BF16 MLP batch {batch} is outside exact B=1..={MAX_BATCH}"
-            ))),
-        }
-    }
-}
-
-/// Prepared source-BF16 Qwen3.5 MTP SwiGLU and down routes for `B=1..=8`.
-pub struct Qwen35MtpBf16MlpOp {
-    module: qwen35_kernels::LoadedModule,
-    b1: PreparedQwen35Route<1>,
-    b2: PreparedQwen35Route<2>,
-    b3: PreparedQwen35Route<3>,
-    b4: PreparedQwen35Route<4>,
-    b5: PreparedQwen35Route<5>,
-    b6: PreparedQwen35Route<6>,
-    b7: PreparedQwen35Route<7>,
-    b8: PreparedQwen35Route<8>,
-}
-
-impl Qwen35MtpBf16MlpOp {
-    /// Loads the embedded module and prepares every exact Qwen3.5 MTP MLP route.
-    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        if QWEN35_HIDDEN != 4_096
-            || QWEN35_INTERMEDIATE != 12_288
-            || QWEN35_GATE_UP_ROWS != 24_576
-            || !QWEN35_HIDDEN.is_multiple_of(16)
-            || !QWEN35_INTERMEDIATE.is_multiple_of(16)
-            || !QWEN35_GATE_TILES.is_multiple_of(GATE_WARPS)
-            || !QWEN35_DOWN_TILES.is_multiple_of(DOWN_WARPS)
-        {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 MTP MLP geometry does not tile exact BF16 MMA shapes",
-            ));
-        }
-        let _ = qwen35_mtp_bf16_mlp_ptx_names();
-        // SAFETY: this crate owns the embedded exact Qwen3.5 MTP MLP artifact.
-        let module = unsafe { qwen35_kernels::load(context) }
-            .map_err(|source| GpuError::module("loading the Qwen3.5 MTP BF16 MLP", source))?;
-
-        Ok(Self {
-            b1: PreparedQwen35Route::prepare(&module)?,
-            b2: PreparedQwen35Route::prepare(&module)?,
-            b3: PreparedQwen35Route::prepare(&module)?,
-            b4: PreparedQwen35Route::prepare(&module)?,
-            b5: PreparedQwen35Route::prepare(&module)?,
-            b6: PreparedQwen35Route::prepare(&module)?,
-            b7: PreparedQwen35Route::prepare(&module)?,
-            b8: PreparedQwen35Route::prepare(&module)?,
-            module,
-        })
-    }
-
-    /// Applies the exact Qwen3.5 source-BF16 gate/up SwiGLU and down projection.
-    ///
-    /// # Safety
-    ///
-    /// All pointers are four-byte aligned, context-local, non-overlapping, and
-    /// live through stream completion. `input` and `output` cover
-    /// `[batch,4096]`, `gate_up_weight` covers `[24576,4096]`, `activation`
-    /// covers `[batch,12288]`, and `down_weight` covers `[4096,12288]` BF16 values.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn launch(
-        &self,
-        stream: &CudaStream,
-        batch: usize,
-        input: *const u16,
-        gate_up_weight: *const u16,
-        activation: *mut u16,
-        down_weight: *const u16,
-        output: *mut u16,
-    ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: exact-B dispatch preserves the public pointer contract.
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        gate_up_weight,
-                        activation,
-                        down_weight,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 MTP BF16 MLP batch {batch} is outside exact B=1..={MAX_BATCH}"
+                "{}MTP BF16 MLP batch {batch} is outside exact B=1..={MAX_BATCH}",
+                E::LABEL
             ))),
         }
     }
@@ -839,11 +883,13 @@ impl Qwen35MtpBf16MlpOp {
 mod tests {
     use super::{
         DOWN_BLOCKS, DOWN_TILES, DOWN_WARPS, GATE_BLOCKS, GATE_TILES, GATE_UP_ROWS, GATE_WARPS,
-        HIDDEN, INTERMEDIATE, MAX_BATCH, QWEN35_DOWN_BLOCKS, QWEN35_DOWN_TILES, QWEN35_GATE_BLOCKS,
-        QWEN35_GATE_TILES, QWEN35_GATE_UP_ROWS, QWEN35_HIDDEN, QWEN35_INTERMEDIATE,
-        mtp_bf16_mlp_ptx_names, qwen35_mtp_bf16_mlp_ptx_names,
+        HIDDEN, INTERMEDIATE, MAX_BATCH, MtpMlpEntries, QWEN35_DOWN_BLOCKS, QWEN35_DOWN_TILES,
+        QWEN35_GATE_BLOCKS, QWEN35_GATE_TILES, QWEN35_GATE_UP_ROWS, QWEN35_HIDDEN,
+        QWEN35_INTERMEDIATE, Qwen35MtpMlpEntries, Qwen38MtpMlpEntries, mtp_bf16_mlp_ptx_names,
+        qwen35_mtp_bf16_mlp_ptx_names,
     };
     use std::collections::BTreeSet;
+    use tuisko_model::{Qwen35_9B, Qwen38_27B};
 
     #[test]
     fn exact_geometry_covers_both_source_projections() {
@@ -878,5 +924,26 @@ mod tests {
         let names = qwen35_mtp_bf16_mlp_ptx_names();
         assert_eq!(names.len(), 2 * MAX_BATCH);
         assert_eq!(names.iter().copied().collect::<BTreeSet<_>>().len(), 16);
+    }
+
+    /// Each entry table publishes exactly the list that retains its own
+    /// specializations, so merging the owners cannot merge the inventories.
+    #[test]
+    fn every_entry_table_publishes_its_own_inventory() {
+        assert_eq!(
+            <Qwen38MtpMlpEntries as MtpMlpEntries<Qwen38_27B>>::ptx_names(),
+            mtp_bf16_mlp_ptx_names()
+        );
+        assert_eq!(
+            <Qwen35MtpMlpEntries as MtpMlpEntries<Qwen35_9B>>::ptx_names(),
+            qwen35_mtp_bf16_mlp_ptx_names()
+        );
+    }
+
+    /// The two tables keep their owners' geometry rejections separate.
+    #[test]
+    fn every_entry_table_admits_its_own_geometry() {
+        assert!(<Qwen38MtpMlpEntries as MtpMlpEntries<Qwen38_27B>>::require_geometry().is_ok());
+        assert!(<Qwen35MtpMlpEntries as MtpMlpEntries<Qwen35_9B>>::require_geometry().is_ok());
     }
 }
