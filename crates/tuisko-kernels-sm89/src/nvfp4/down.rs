@@ -6,7 +6,7 @@ use cuda_device::{
 };
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
-use tuisko_kernels_simt::e4m3_to_f32;
+use tuisko_kernels_simt::{e2m1x2_to_f32, e4m3_to_f32, f32_to_bf16};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -70,27 +70,6 @@ mod kernels {
     }
 
     #[inline(always)]
-    fn e2m1_to_f32(code: u8) -> f32 {
-        let magnitude = match code & 7 {
-            0 => 0.0,
-            1 => 0.5,
-            2 => 1.0,
-            3 => 1.5,
-            4 => 2.0,
-            5 => 3.0,
-            6 => 4.0,
-            _ => 6.0,
-        };
-
-        if code & 8 == 0 { magnitude } else { -magnitude }
-    }
-
-    #[inline(always)]
-    fn e2m1x2_to_f32(packed: u8) -> (f32, f32) {
-        (e2m1_to_f32(packed & 15), e2m1_to_f32(packed >> 4))
-    }
-
-    #[inline(always)]
     unsafe fn load_u32x2_read_only(source: *const u32) -> (u32, u32) {
         let first: u32;
         let second: u32;
@@ -133,14 +112,6 @@ mod kernels {
         value += warp::shuffle_down_f32(value, 1);
 
         value
-    }
-
-    #[inline(always)]
-    fn f32_to_bf16(value: f32) -> u16 {
-        let bits = value.to_bits();
-        let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-
-        (rounded >> 16) as u16
     }
 
     #[inline(always)]
@@ -360,80 +331,10 @@ fn launch_config() -> LaunchConfig1D {
     LaunchConfig1D::new((OUTPUT_ROWS / (2 * WARPS)) as u32, THREADS, 0)
 }
 
-struct PreparedBatchOneRoute {
-    projection: PreparedLaunch<kernels::__nvfp4_down_a16_b1_CudaKernel>,
-}
-
-struct PreparedBatchRoute<A: Arch, const TOKENS: usize> {
-    projection: PreparedLaunch<kernels::__nvfp4_down_a16_CudaKernel<A, TOKENS>>,
-}
-
-impl PreparedBatchOneRoute {
-    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let projection = module
-            .prepare_nvfp4_down_a16_b1(launch_config())
-            .map_err(|source| GpuError::launch("preparing SM89 NVFP4 A16 B=1", source))?;
-
-        Ok(Self { projection })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn launch(
-        &self,
-        module: &kernels::LoadedModule,
-        stream: &CudaStream,
-        input: *const u16,
-        weight_codes: *const u8,
-        weight_scales: *const u8,
-        weight_scale_reciprocal: f32,
-        output: *mut u16,
-    ) -> GpuResult<()> {
-        module
-            .nvfp4_down_a16_b1(
-                stream,
-                &self.projection,
-                input.cast::<u32>(),
-                weight_codes.cast::<u32>(),
-                weight_scales,
-                weight_scale_reciprocal,
-                output,
-            )
-            .map_err(|source| GpuError::launch("launching SM89 NVFP4 A16 B=1", source))
-    }
-}
-
-impl<A: Arch, const TOKENS: usize> PreparedBatchRoute<A, TOKENS> {
-    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let projection = module
-            .prepare_nvfp4_down_a16::<A, TOKENS>(launch_config())
-            .map_err(|source| GpuError::launch("preparing SM89 NVFP4 A16", source))?;
-
-        Ok(Self { projection })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn launch(
-        &self,
-        module: &kernels::LoadedModule,
-        stream: &CudaStream,
-        input: *const u16,
-        weight_codes: *const u8,
-        weight_scales: *const u8,
-        weight_scale_reciprocal: f32,
-        output: *mut u16,
-    ) -> GpuResult<()> {
-        module
-            .nvfp4_down_a16::<A, TOKENS>(
-                stream,
-                &self.projection,
-                input.cast::<u32>(),
-                weight_codes.cast::<u32>(),
-                weight_scales,
-                weight_scale_reciprocal,
-                output,
-            )
-            .map_err(|source| GpuError::launch("launching SM89 NVFP4 A16", source))
-    }
+tuisko_kernels_simt::nvfp4_a16_batch_routes! {
+    label = "SM89 NVFP4 A16",
+    b1 = { __nvfp4_down_a16_b1_CudaKernel, prepare_nvfp4_down_a16_b1, nvfp4_down_a16_b1 },
+    batched = { __nvfp4_down_a16_CudaKernel, prepare_nvfp4_down_a16, nvfp4_down_a16 },
 }
 
 /// PTX symbols retained for every exact SM89 NVFP4 down projection batch.
