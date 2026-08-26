@@ -139,11 +139,31 @@ cargo fmt --all -- --check
 cargo clippy --workspace --exclude tuiskollm --exclude tuisko-engine \
   --exclude tuisko-gpu --exclude tuisko-kernels-sm86 \
   --exclude tuisko-kernels-sm89 --exclude tuisko-kernels-sm120 \
-  --exclude tuisko-qual --exclude tuisko-serve --all-targets -- -D warnings
+  --exclude tuisko-qual --exclude tuisko-serve \
+  --exclude tuisko-kernels-sm120-attention \
+  --exclude tuisko-kernels-sm120-common \
+  --exclude tuisko-kernels-sm120-fp8-mlp \
+  --exclude tuisko-kernels-sm120-fp8-projection \
+  --exclude tuisko-kernels-sm120-gdn \
+  --exclude tuisko-kernels-sm120-lm-head \
+  --exclude tuisko-kernels-sm120-moe \
+  --exclude tuisko-kernels-sm120-mtp \
+  --exclude tuisko-kernels-sm120-norm \
+  --exclude tuisko-kernels-sm120-nvfp4 --all-targets -- -D warnings
 cargo test --workspace --exclude tuiskollm --exclude tuisko-engine \
   --exclude tuisko-gpu --exclude tuisko-kernels-sm86 \
   --exclude tuisko-kernels-sm89 --exclude tuisko-kernels-sm120 \
-  --exclude tuisko-qual --exclude tuisko-serve
+  --exclude tuisko-qual --exclude tuisko-serve \
+  --exclude tuisko-kernels-sm120-attention \
+  --exclude tuisko-kernels-sm120-common \
+  --exclude tuisko-kernels-sm120-fp8-mlp \
+  --exclude tuisko-kernels-sm120-fp8-projection \
+  --exclude tuisko-kernels-sm120-gdn \
+  --exclude tuisko-kernels-sm120-lm-head \
+  --exclude tuisko-kernels-sm120-moe \
+  --exclude tuisko-kernels-sm120-mtp \
+  --exclude tuisko-kernels-sm120-norm \
+  --exclude tuisko-kernels-sm120-nvfp4
 cargo deny --workspace --all-features check
 ```
 

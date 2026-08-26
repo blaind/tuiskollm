@@ -25,9 +25,9 @@ jobs:
           shared-key: host
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --exclude tuiskollm --exclude tuisko-engine --exclude tuisko-gpu --exclude tuisko-kernels-sm86 --exclude tuisko-kernels-sm89 --exclude tuisko-kernels-sm120 --exclude tuisko-qual --exclude tuisko-serve --all-targets -- -D warnings
+      - run: cargo clippy --workspace --exclude tuiskollm --exclude tuisko-engine --exclude tuisko-gpu --exclude tuisko-kernels-sm86 --exclude tuisko-kernels-sm89 --exclude tuisko-kernels-sm120 --exclude tuisko-qual --exclude tuisko-serve --exclude tuisko-kernels-sm120-attention --exclude tuisko-kernels-sm120-common --exclude tuisko-kernels-sm120-fp8-mlp --exclude tuisko-kernels-sm120-fp8-projection --exclude tuisko-kernels-sm120-gdn --exclude tuisko-kernels-sm120-lm-head --exclude tuisko-kernels-sm120-moe --exclude tuisko-kernels-sm120-mtp --exclude tuisko-kernels-sm120-norm --exclude tuisko-kernels-sm120-nvfp4 --all-targets -- -D warnings
       - run: cargo clippy --package tuisko-qual --no-default-features --bin qualify-frontend -- -D warnings
-      - run: cargo test --workspace --exclude tuiskollm --exclude tuisko-engine --exclude tuisko-gpu --exclude tuisko-kernels-sm86 --exclude tuisko-kernels-sm89 --exclude tuisko-kernels-sm120 --exclude tuisko-qual --exclude tuisko-serve
+      - run: cargo test --workspace --exclude tuiskollm --exclude tuisko-engine --exclude tuisko-gpu --exclude tuisko-kernels-sm86 --exclude tuisko-kernels-sm89 --exclude tuisko-kernels-sm120 --exclude tuisko-qual --exclude tuisko-serve --exclude tuisko-kernels-sm120-attention --exclude tuisko-kernels-sm120-common --exclude tuisko-kernels-sm120-fp8-mlp --exclude tuisko-kernels-sm120-fp8-projection --exclude tuisko-kernels-sm120-gdn --exclude tuisko-kernels-sm120-lm-head --exclude tuisko-kernels-sm120-moe --exclude tuisko-kernels-sm120-mtp --exclude tuisko-kernels-sm120-norm --exclude tuisko-kernels-sm120-nvfp4
       - run: cargo check --package tuisko-frontend --bench text
       - run: cargo bench -p tuisko-model --bench checkpoint -- --sample-size 10
       - uses: taiki-e/install-action@cargo-llvm-cov
