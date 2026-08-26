@@ -109,7 +109,13 @@ mod tests {
         let names = kernel_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 891);
+        // Derived, never memorized: a free-standing total lagged the emitted
+        // artifact across five merges (798 -> 847 -> 880 -> 883 -> 886) because
+        // nothing tied it to the family whose entries moved.
+        assert_eq!(
+            names.len(),
+            FAMILY_COUNTS.iter().map(|(_, count)| count).sum::<usize>()
+        );
         assert_eq!(unique.len(), names.len());
     }
 
