@@ -4,227 +4,367 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::path::Path;
 
-#[cfg(feature = "remote")]
-use crate::gpu_target::BuildTargetProfile;
 #[cfg(any(feature = "remote", test))]
-use crate::gpu_target::{GpuTarget, has_full_kernel_inventory};
-
-#[cfg(feature = "remote")]
-const USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
-    <qualify-residual-norm|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
-    qualify-nvfp4-mlp|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-long-context-paged-gqa|qualify-attention-output|qualify-mtp-bf16-fusion|qualify-mtp-bf16-qkv|qualify-mtp-bf16-qk-prepare|qualify-mtp-bf16-paged-gqa|qualify-mtp-bf16-attention-output|qualify-mtp-bf16-mlp|qualify-full-attention-layer|qualify-mtp-layer|qualify-target-mtp-verify|qualify-mtp-prompt-prime|qualify-resident-mtp|\
-    qualify-resident-model|qualify-resident-generation|qualify-generation-mtp-greedy|qualify-generation-mtp-sampling|qualify-generation-mtp-batch|qualify-resident-batch-generation|\
-    bench-residual-norm|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-fp8-qkv|bench-fp8-gdn-input|\
-    bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-mtp-bf16-fusion|bench-mtp-bf16-qkv|bench-mtp-bf16-qk-prepare|bench-mtp-bf16-paged-gqa|bench-mtp-bf16-attention-output|bench-mtp-bf16-mlp|bench-full-attention-layer|bench-mtp-layer|bench-target-mtp-verify|bench-mtp-prompt-prime|bench-resident-mtp|bench-generation-mtp-greedy|bench-generation-mtp-sampling|bench-generation-mtp-batch|\
-    bench-resident-model|bench-resident-prefill|bench-resident-long-context-model|\
-    probe|check|sweep> \
-    [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
-    [--samples N] [--launches-per-sample N] [--energy-seconds N]";
-
+use crate::PerformanceSuite;
 #[cfg(any(feature = "remote", test))]
-struct Qualification {
-    name: &'static str,
-    filter: &'static str,
-    source_snapshot: bool,
+use crate::gpu_target::GpuTarget;
+#[cfg(feature = "remote")]
+use crate::gpu_target::{BuildTargetProfile, has_full_kernel_inventory};
+
+/// Static resource gate a route proves locally before any billable pod exists.
+/// The row names it, so no substring of a subcommand name can select a sibling
+/// suite's baseline.
+#[cfg(any(feature = "remote", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResourceGate {
+    ResidualNorm,
+    Nvfp4Swiglu,
+    Nvfp4Down,
+    /// Only SM89 has its own FP8 QKV baseline; every other target proves
+    /// residual norm instead.
+    Fp8Qkv,
+    ResidentMtp,
+    MtpPromptPrime,
+    ResidentModel,
+    MtpLayer,
+    MtpBf16Fusion,
+    MtpBf16Qkv,
+    MtpBf16QkPrepare,
+    MtpBf16PagedGqa,
+    MtpBf16AttentionOutput,
+    MtpBf16Mlp,
 }
 
-#[cfg(any(feature = "remote", test))]
-impl Qualification {
-    fn parse(name: &str) -> Option<Self> {
-        let filter = match name {
-            "qualify-residual-norm" => "residual_norm_suite_",
-            "qualify-nvfp4-swiglu" => "nvfp4_swiglu::tests",
-            "qualify-nvfp4-down" => "nvfp4_down::tests",
-            "qualify-fp8-qkv" => "fp8_qkv",
-            "qualify-fp8-gdn-input" => "fp8_gdn_input",
-            "qualify-fp8-lm-head" => "fp8_lm_head",
-            "qualify-nvfp4-mlp" => {
-                "nvfp4_mlp::tests::source_layer55_matches_complete_oracles_and_graph_replay"
-            }
-            "qualify-attention-qk-prepare" => "attention_qk_prepare",
-            "qualify-paged-gqa" => "paged_gqa_suite_",
-            "qualify-long-context-paged-gqa" => "long_context_paged_gqa",
-            "qualify-attention-output" => "attention_output::tests",
-            "qualify-mtp-bf16-fusion" => "mtp_bf16_fusion_suite_",
-            "qualify-mtp-bf16-qkv" => "mtp_bf16_qkv_suite_",
-            "qualify-mtp-bf16-qk-prepare" => "mtp_bf16_qk_prepare_suite_",
-            "qualify-mtp-bf16-paged-gqa" => "mtp_bf16_paged_gqa_suite_",
-            "qualify-mtp-bf16-attention-output" => "mtp_bf16_attention_output_suite_",
-            "qualify-mtp-bf16-mlp" => "mtp_bf16_mlp_suite_",
-            "qualify-full-attention-layer" => {
-                "full_attention_layer::tests::source_layer63_matches_complete_seam_oracles_and_graph_replay"
-            }
-            "qualify-mtp-layer" => "mtp_layer_suite_",
-            "qualify-target-mtp-verify" => {
-                "target_mtp_verify::tests::exact_target_verify_and_commit_match_source_oracles"
-            }
-            "qualify-mtp-prompt-prime" => "mtp_prompt_prime_suite_",
-            "qualify-resident-mtp" => "resident_mtp_suite_",
-            "qualify-generation-mtp-greedy" => "resident_mtp_generation_suite_",
-            "qualify-generation-mtp-sampling" => "resident_mtp_sampling_suite_",
-            "qualify-generation-mtp-batch" => "resident_mtp_batch_suite_",
-            "qualify-resident-model" => {
-                "resident_model::tests::source_model_matches_final_oracle_and_exact_graph_replay"
-            }
-            "qualify-resident-generation" => {
-                "resident_generation::tests::source_frontend_generation_matches_vllm_tokens_and_streaming"
-            }
-            "qualify-resident-batch-generation" => {
-                "resident_batch_generation::tests::compact_scheduler_matches_sequential_requests_and_recycles_holes"
-            }
-            _ => return None,
-        };
-
-        Some(Self {
-            name: match name {
-                "qualify-residual-norm" => "residual-norm",
-                "qualify-nvfp4-swiglu" => "nvfp4-swiglu",
-                "qualify-nvfp4-down" => "nvfp4-down",
-                "qualify-fp8-qkv" => "fp8-qkv",
-                "qualify-fp8-gdn-input" => "fp8-gdn-input",
-                "qualify-fp8-lm-head" => "fp8-lm-head",
-                "qualify-nvfp4-mlp" => "nvfp4-mlp",
-                "qualify-attention-qk-prepare" => "attention-qk-prepare",
-                "qualify-paged-gqa" => "paged-gqa",
-                "qualify-long-context-paged-gqa" => "long-context-paged-gqa",
-                "qualify-attention-output" => "attention-output",
-                "qualify-mtp-bf16-fusion" => "mtp-bf16-fusion",
-                "qualify-mtp-bf16-qkv" => "mtp-bf16-qkv",
-                "qualify-mtp-bf16-qk-prepare" => "mtp-bf16-qk-prepare",
-                "qualify-mtp-bf16-paged-gqa" => "mtp-bf16-paged-gqa",
-                "qualify-mtp-bf16-attention-output" => "mtp-bf16-attention-output",
-                "qualify-mtp-bf16-mlp" => "mtp-bf16-mlp",
-                "qualify-full-attention-layer" => "full-attention-layer",
-                "qualify-mtp-layer" => "mtp-layer",
-                "qualify-target-mtp-verify" => "target-mtp-verify",
-                "qualify-mtp-prompt-prime" => "mtp-prompt-prime",
-                "qualify-resident-mtp" => "resident-mtp",
-                "qualify-generation-mtp-greedy" => "generation-mtp-greedy",
-                "qualify-generation-mtp-sampling" => "generation-mtp-sampling",
-                "qualify-generation-mtp-batch" => "generation-mtp-batch",
-                "qualify-resident-model" => "resident-model",
-                "qualify-resident-generation" => "resident-generation",
-                "qualify-resident-batch-generation" => "resident-batch-generation",
-                _ => unreachable!(),
-            },
-            filter,
-            source_snapshot: matches!(
-                name,
-                "qualify-nvfp4-mlp"
-                    | "qualify-mtp-bf16-fusion"
-                    | "qualify-mtp-bf16-qkv"
-                    | "qualify-mtp-bf16-qk-prepare"
-                    | "qualify-mtp-bf16-attention-output"
-                    | "qualify-mtp-bf16-mlp"
-                    | "qualify-full-attention-layer"
-                    | "qualify-mtp-layer"
-                    | "qualify-target-mtp-verify"
-                    | "qualify-mtp-prompt-prime"
-                    | "qualify-resident-mtp"
-                    | "qualify-generation-mtp-greedy"
-                    | "qualify-generation-mtp-sampling"
-                    | "qualify-generation-mtp-batch"
-                    | "qualify-resident-model"
-                    | "qualify-resident-generation"
-                    | "qualify-resident-batch-generation"
-            ),
-        })
+#[cfg(feature = "remote")]
+impl ResourceGate {
+    fn verify(self, root: &Path, gpu: GpuTarget) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::ResidualNorm => crate::gate_residual_norm_target(root, gpu),
+            Self::Nvfp4Swiglu => crate::gate_nvfp4_swiglu_target(root, gpu),
+            Self::Nvfp4Down => crate::gate_nvfp4_down_target(root, gpu),
+            Self::Fp8Qkv if gpu == GpuTarget::Sm89 => crate::gate_fp8_qkv_sm89(root),
+            Self::Fp8Qkv => crate::gate_residual_norm_target(root, gpu),
+            Self::ResidentMtp => crate::gate_resident_mtp(root),
+            Self::MtpPromptPrime => crate::gate_mtp_prompt_prime(root),
+            Self::ResidentModel => crate::gate_resident_model_resources(root),
+            Self::MtpLayer => crate::gate_mtp_layer(root),
+            Self::MtpBf16Fusion => crate::gate_mtp_bf16_fusion(root),
+            Self::MtpBf16Qkv => crate::gate_mtp_bf16_qkv(root),
+            Self::MtpBf16QkPrepare => crate::gate_mtp_bf16_qk_prepare(root),
+            Self::MtpBf16PagedGqa => crate::gate_mtp_bf16_paged_gqa(root),
+            Self::MtpBf16AttentionOutput => crate::gate_mtp_bf16_attention_output(root),
+            Self::MtpBf16Mlp => crate::gate_mtp_bf16_mlp(root),
+        }
     }
 }
 
+/// Which resources a benchmark's prepared artifact binds: one leaf suite's
+/// baseline, or every leaf resource a composed route launches.
 #[cfg(any(feature = "remote", test))]
-#[derive(Clone, Copy)]
-enum Benchmark {
-    Leaf(crate::PerformanceSuite),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BenchmarkRoute {
+    Leaf(PerformanceSuite),
     Nvfp4Mlp,
     FullAttentionLayer,
     MtpLayer,
-    TargetMtpVerify,
     MtpPromptPrime,
     ResidentMtp,
-    GenerationMtpGreedy,
-    GenerationMtpSampling,
-    GenerationMtpBatch,
     ResidentModel,
-    ResidentPrefill,
-    ResidentLongContextModel,
+}
+
+#[cfg(feature = "remote")]
+impl BenchmarkRoute {
+    fn prepare(
+        self,
+        root: &Path,
+        gpu: GpuTarget,
+    ) -> Result<crate::RemoteBenchmark, Box<dyn Error>> {
+        match self {
+            Self::Leaf(suite) => crate::prepare_remote_benchmark(root, gpu, suite),
+            Self::Nvfp4Mlp => crate::prepare_remote_nvfp4_mlp_benchmark(root, gpu),
+            Self::FullAttentionLayer => {
+                crate::prepare_remote_full_attention_layer_benchmark(root, gpu)
+            }
+            Self::MtpLayer => crate::prepare_remote_mtp_layer_benchmark(root, gpu),
+            Self::MtpPromptPrime => crate::prepare_remote_mtp_prompt_prime_benchmark(root, gpu),
+            Self::ResidentMtp => crate::prepare_remote_resident_mtp_benchmark(root, gpu),
+            Self::ResidentModel => crate::prepare_remote_resident_model_benchmark(root, gpu),
+        }
+    }
+}
+
+/// What one `remote <name>` route runs on the pod.
+#[cfg(any(feature = "remote", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteRun {
+    /// A qualification suite and the libtest filter the pod's `qual` runs.
+    Qualification(&'static str),
+    Benchmark(BenchmarkRoute),
+}
+
+/// One `remote <name>` route: every decision the runner makes before it may
+/// create a billable pod — which targets admit the suite, which static resource
+/// gate proves the local artifact, and whether the pinned source snapshot has
+/// to be staged.
+#[cfg(any(feature = "remote", test))]
+#[derive(Clone, Copy)]
+struct RemoteSubcommand {
+    name: &'static str,
+    run: RemoteRun,
+    source_snapshot: bool,
+    gate: ResourceGate,
+    targets: &'static [GpuTarget],
+}
+
+/// Residual norm and the represented-weight NVFP4 gate/up route.
+#[cfg(any(feature = "remote", test))]
+const EVERY_TARGET: &[GpuTarget] = &GpuTarget::ALL;
+/// The complete inventory is Blackwell-only, and is a route's default.
+#[cfg(any(feature = "remote", test))]
+const SM120_ONLY: &[GpuTarget] = &[GpuTarget::Sm120];
+/// Routes the partial Ada inventory also implements.
+#[cfg(any(feature = "remote", test))]
+const THROUGH_SM89: &[GpuTarget] = &[GpuTarget::Sm120, GpuTarget::Sm89];
+
+#[cfg(any(feature = "remote", test))]
+const fn route(name: &'static str, run: RemoteRun) -> RemoteSubcommand {
+    RemoteSubcommand {
+        name,
+        run,
+        source_snapshot: false,
+        gate: ResourceGate::ResidualNorm,
+        targets: SM120_ONLY,
+    }
 }
 
 #[cfg(any(feature = "remote", test))]
-impl Benchmark {
-    fn parse(name: &str) -> Option<Self> {
-        Some(match name {
-            "bench-residual-norm" => Self::Leaf(crate::PerformanceSuite::ResidualNorm),
-            "bench-fp8-qkv" => Self::Leaf(crate::PerformanceSuite::Fp8Qkv),
-            "bench-fp8-gdn-input" => Self::Leaf(crate::PerformanceSuite::Fp8GdnInput),
-            "bench-fp8-lm-head" => Self::Leaf(crate::PerformanceSuite::Fp8LmHead),
-            "bench-nvfp4-swiglu" => Self::Leaf(crate::PerformanceSuite::Nvfp4SwiGlu),
-            "bench-nvfp4-down" => Self::Leaf(crate::PerformanceSuite::Nvfp4Down),
-            "bench-nvfp4-mlp" => Self::Nvfp4Mlp,
-            "bench-attention-qk-prepare" => Self::Leaf(crate::PerformanceSuite::AttentionQkPrepare),
-            "bench-paged-gqa" => Self::Leaf(crate::PerformanceSuite::PagedGqa),
-            "bench-long-context-paged-gqa" => {
-                Self::Leaf(crate::PerformanceSuite::LongContextPagedGqa)
-            }
-            "bench-attention-output" => Self::Leaf(crate::PerformanceSuite::AttentionOutput),
-            "bench-mtp-bf16-fusion" => Self::Leaf(crate::PerformanceSuite::MtpBf16Fusion),
-            "bench-mtp-bf16-qkv" => Self::Leaf(crate::PerformanceSuite::MtpBf16Qkv),
-            "bench-mtp-bf16-qk-prepare" => Self::Leaf(crate::PerformanceSuite::MtpBf16QkPrepare),
-            "bench-mtp-bf16-paged-gqa" => Self::Leaf(crate::PerformanceSuite::MtpBf16PagedGqa),
-            "bench-mtp-bf16-attention-output" => {
-                Self::Leaf(crate::PerformanceSuite::MtpBf16AttentionOutput)
-            }
-            "bench-mtp-bf16-mlp" => Self::Leaf(crate::PerformanceSuite::MtpBf16Mlp),
-            "bench-full-attention-layer" => Self::FullAttentionLayer,
-            "bench-mtp-layer" => Self::MtpLayer,
-            "bench-target-mtp-verify" => Self::TargetMtpVerify,
-            "bench-mtp-prompt-prime" => Self::MtpPromptPrime,
-            "bench-resident-mtp" => Self::ResidentMtp,
-            "bench-generation-mtp-greedy" => Self::GenerationMtpGreedy,
-            "bench-generation-mtp-sampling" => Self::GenerationMtpSampling,
-            "bench-generation-mtp-batch" => Self::GenerationMtpBatch,
-            "bench-resident-model" => Self::ResidentModel,
-            "bench-resident-prefill" => Self::ResidentPrefill,
-            "bench-resident-long-context-model" => Self::ResidentLongContextModel,
-            _ => return None,
-        })
-    }
+const fn qualify(name: &'static str, filter: &'static str) -> RemoteSubcommand {
+    route(name, RemoteRun::Qualification(filter))
+}
 
-    fn name(self) -> &'static str {
-        match self {
-            Self::Leaf(suite) => suite.name(),
-            Self::Nvfp4Mlp => "nvfp4-mlp",
-            Self::FullAttentionLayer => "full-attention-layer",
-            Self::MtpLayer => "mtp-layer",
-            Self::TargetMtpVerify => "target-mtp-verify",
-            Self::MtpPromptPrime => "mtp-prompt-prime",
-            Self::ResidentMtp => "resident-mtp",
-            Self::GenerationMtpGreedy => "generation-mtp-greedy",
-            Self::GenerationMtpSampling => "generation-mtp-sampling",
-            Self::GenerationMtpBatch => "generation-mtp-batch",
-            Self::ResidentModel => "resident-model",
-            Self::ResidentPrefill => "resident-prefill",
-            Self::ResidentLongContextModel => "resident-long-context-model",
+#[cfg(any(feature = "remote", test))]
+const fn leaf(name: &'static str, suite: PerformanceSuite) -> RemoteSubcommand {
+    route(name, RemoteRun::Benchmark(BenchmarkRoute::Leaf(suite)))
+}
+
+#[cfg(any(feature = "remote", test))]
+const fn bench(name: &'static str, benchmark: BenchmarkRoute) -> RemoteSubcommand {
+    route(name, RemoteRun::Benchmark(benchmark))
+}
+
+#[cfg(any(feature = "remote", test))]
+impl RemoteSubcommand {
+    /// The pod stages the pinned source snapshot for this route.
+    const fn snapshot(self) -> Self {
+        Self {
+            source_snapshot: true,
+            ..self
         }
     }
 
-    fn source_snapshot(self) -> bool {
-        matches!(
-            self,
-            Self::Nvfp4Mlp
-                | Self::FullAttentionLayer
-                | Self::MtpLayer
-                | Self::TargetMtpVerify
-                | Self::MtpPromptPrime
-                | Self::ResidentMtp
-                | Self::GenerationMtpGreedy
-                | Self::GenerationMtpSampling
-                | Self::GenerationMtpBatch
-                | Self::ResidentModel
-                | Self::ResidentPrefill
-                | Self::ResidentLongContextModel
-        )
+    /// This route proves a gate other than residual norm.
+    const fn gated(self, gate: ResourceGate) -> Self {
+        Self { gate, ..self }
     }
+
+    /// Partial-inventory targets that also admit this route.
+    const fn on(self, targets: &'static [GpuTarget]) -> Self {
+        Self { targets, ..self }
+    }
+
+    /// Suite name in the remote report: the subcommand without its verb.
+    fn suite(self) -> &'static str {
+        self.name
+            .strip_prefix("qualify-")
+            .or_else(|| self.name.strip_prefix("bench-"))
+            .unwrap_or(self.name)
+    }
+
+    fn is_benchmark(self) -> bool {
+        matches!(self.run, RemoteRun::Benchmark(_))
+    }
+
+    fn admits(self, gpu: GpuTarget) -> bool {
+        self.targets.contains(&gpu)
+    }
+}
+
+/// The complete `remote` route set, in usage order. Names, filters, gates,
+/// snapshot staging and target admission live here, so the usage line, the
+/// command/target decision table and the spawner cannot drift apart.
+#[cfg(any(feature = "remote", test))]
+const REMOTE_SUBCOMMANDS: &[RemoteSubcommand] = &[
+    qualify("qualify-residual-norm", "residual_norm_suite_").on(EVERY_TARGET),
+    qualify("qualify-nvfp4-swiglu", "nvfp4_swiglu::tests")
+        .gated(ResourceGate::Nvfp4Swiglu)
+        .on(EVERY_TARGET),
+    qualify("qualify-nvfp4-down", "nvfp4_down::tests")
+        .gated(ResourceGate::Nvfp4Down)
+        .on(THROUGH_SM89),
+    qualify("qualify-fp8-qkv", "fp8_qkv")
+        .gated(ResourceGate::Fp8Qkv)
+        .on(THROUGH_SM89),
+    qualify("qualify-fp8-gdn-input", "fp8_gdn_input"),
+    qualify("qualify-fp8-lm-head", "fp8_lm_head"),
+    qualify(
+        "qualify-nvfp4-mlp",
+        "nvfp4_mlp::tests::source_layer55_matches_complete_oracles_and_graph_replay",
+    )
+    .snapshot(),
+    qualify("qualify-attention-qk-prepare", "attention_qk_prepare"),
+    qualify("qualify-paged-gqa", "paged_gqa_suite_"),
+    qualify("qualify-long-context-paged-gqa", "long_context_paged_gqa"),
+    qualify("qualify-attention-output", "attention_output::tests"),
+    qualify("qualify-mtp-bf16-fusion", "mtp_bf16_fusion_suite_")
+        .gated(ResourceGate::MtpBf16Fusion)
+        .snapshot(),
+    qualify("qualify-mtp-bf16-qkv", "mtp_bf16_qkv_suite_")
+        .gated(ResourceGate::MtpBf16Qkv)
+        .snapshot(),
+    qualify("qualify-mtp-bf16-qk-prepare", "mtp_bf16_qk_prepare_suite_")
+        .gated(ResourceGate::MtpBf16QkPrepare)
+        .snapshot(),
+    qualify("qualify-mtp-bf16-paged-gqa", "mtp_bf16_paged_gqa_suite_")
+        .gated(ResourceGate::MtpBf16PagedGqa),
+    qualify(
+        "qualify-mtp-bf16-attention-output",
+        "mtp_bf16_attention_output_suite_",
+    )
+    .gated(ResourceGate::MtpBf16AttentionOutput)
+    .snapshot(),
+    qualify("qualify-mtp-bf16-mlp", "mtp_bf16_mlp_suite_")
+        .gated(ResourceGate::MtpBf16Mlp)
+        .snapshot(),
+    qualify(
+        "qualify-full-attention-layer",
+        "full_attention_layer::tests::source_layer63_matches_complete_seam_oracles_and_graph_replay",
+    )
+    .snapshot(),
+    qualify("qualify-mtp-layer", "mtp_layer_suite_")
+        .gated(ResourceGate::MtpLayer)
+        .snapshot(),
+    qualify(
+        "qualify-target-mtp-verify",
+        "target_mtp_verify::tests::exact_target_verify_and_commit_match_source_oracles",
+    )
+    .gated(ResourceGate::ResidentModel)
+    .snapshot(),
+    qualify("qualify-mtp-prompt-prime", "mtp_prompt_prime_suite_")
+        .gated(ResourceGate::MtpPromptPrime)
+        .snapshot(),
+    qualify("qualify-resident-mtp", "resident_mtp_suite_")
+        .gated(ResourceGate::ResidentMtp)
+        .snapshot(),
+    qualify(
+        "qualify-resident-model",
+        "resident_model::tests::source_model_matches_final_oracle_and_exact_graph_replay",
+    )
+    .snapshot(),
+    qualify(
+        "qualify-resident-generation",
+        "resident_generation::tests::source_frontend_generation_matches_vllm_tokens_and_streaming",
+    )
+    .snapshot(),
+    qualify(
+        "qualify-generation-mtp-greedy",
+        "resident_mtp_generation_suite_",
+    )
+    .snapshot(),
+    qualify(
+        "qualify-generation-mtp-sampling",
+        "resident_mtp_sampling_suite_",
+    )
+    .snapshot(),
+    qualify("qualify-generation-mtp-batch", "resident_mtp_batch_suite_").snapshot(),
+    qualify(
+        "qualify-resident-batch-generation",
+        "resident_batch_generation::tests::compact_scheduler_matches_sequential_requests_and_recycles_holes",
+    )
+    .snapshot(),
+    leaf("bench-residual-norm", PerformanceSuite::ResidualNorm).on(EVERY_TARGET),
+    leaf("bench-nvfp4-swiglu", PerformanceSuite::Nvfp4SwiGlu)
+        .gated(ResourceGate::Nvfp4Swiglu)
+        .on(EVERY_TARGET),
+    leaf("bench-nvfp4-down", PerformanceSuite::Nvfp4Down)
+        .gated(ResourceGate::Nvfp4Down)
+        .on(THROUGH_SM89),
+    bench("bench-nvfp4-mlp", BenchmarkRoute::Nvfp4Mlp).snapshot(),
+    leaf("bench-fp8-qkv", PerformanceSuite::Fp8Qkv)
+        .gated(ResourceGate::Fp8Qkv)
+        .on(THROUGH_SM89),
+    leaf("bench-fp8-gdn-input", PerformanceSuite::Fp8GdnInput),
+    leaf("bench-fp8-lm-head", PerformanceSuite::Fp8LmHead),
+    leaf(
+        "bench-attention-qk-prepare",
+        PerformanceSuite::AttentionQkPrepare,
+    ),
+    leaf("bench-paged-gqa", PerformanceSuite::PagedGqa),
+    leaf(
+        "bench-long-context-paged-gqa",
+        PerformanceSuite::LongContextPagedGqa,
+    ),
+    leaf("bench-attention-output", PerformanceSuite::AttentionOutput),
+    leaf("bench-mtp-bf16-fusion", PerformanceSuite::MtpBf16Fusion)
+        .gated(ResourceGate::MtpBf16Fusion),
+    leaf("bench-mtp-bf16-qkv", PerformanceSuite::MtpBf16Qkv).gated(ResourceGate::MtpBf16Qkv),
+    leaf(
+        "bench-mtp-bf16-qk-prepare",
+        PerformanceSuite::MtpBf16QkPrepare,
+    )
+    .gated(ResourceGate::MtpBf16QkPrepare),
+    leaf("bench-mtp-bf16-paged-gqa", PerformanceSuite::MtpBf16PagedGqa)
+        .gated(ResourceGate::MtpBf16PagedGqa),
+    leaf(
+        "bench-mtp-bf16-attention-output",
+        PerformanceSuite::MtpBf16AttentionOutput,
+    )
+    .gated(ResourceGate::MtpBf16AttentionOutput),
+    leaf("bench-mtp-bf16-mlp", PerformanceSuite::MtpBf16Mlp).gated(ResourceGate::MtpBf16Mlp),
+    bench(
+        "bench-full-attention-layer",
+        BenchmarkRoute::FullAttentionLayer,
+    )
+    .snapshot(),
+    bench("bench-mtp-layer", BenchmarkRoute::MtpLayer)
+        .gated(ResourceGate::MtpLayer)
+        .snapshot(),
+    bench("bench-target-mtp-verify", BenchmarkRoute::ResidentModel)
+        .gated(ResourceGate::ResidentModel)
+        .snapshot(),
+    bench("bench-mtp-prompt-prime", BenchmarkRoute::MtpPromptPrime)
+        .gated(ResourceGate::MtpPromptPrime)
+        .snapshot(),
+    bench("bench-resident-mtp", BenchmarkRoute::ResidentMtp)
+        .gated(ResourceGate::ResidentMtp)
+        .snapshot(),
+    bench("bench-generation-mtp-greedy", BenchmarkRoute::ResidentMtp).snapshot(),
+    bench("bench-generation-mtp-sampling", BenchmarkRoute::ResidentMtp).snapshot(),
+    bench("bench-generation-mtp-batch", BenchmarkRoute::ResidentMtp).snapshot(),
+    bench("bench-resident-model", BenchmarkRoute::ResidentModel).snapshot(),
+    bench("bench-resident-prefill", BenchmarkRoute::ResidentModel).snapshot(),
+    bench(
+        "bench-resident-long-context-model",
+        BenchmarkRoute::ResidentModel,
+    )
+    .snapshot(),
+];
+
+/// The usage line, derived from the route table so no row can go unadvertised.
+/// `usage_lists_every_route` binds it to the legacy text.
+#[cfg(any(feature = "remote", test))]
+fn usage() -> String {
+    let mut names = REMOTE_SUBCOMMANDS
+        .iter()
+        .map(|route| route.name)
+        .collect::<Vec<_>>();
+    names.extend(["probe", "check", "sweep"]);
+
+    format!(
+        "usage: cargo run -p xtask --features remote -- remote <{}> \
+        [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
+        [--samples N] [--launches-per-sample N] [--energy-seconds N]",
+        names.join("|")
+    )
 }
 
 #[cfg(any(feature = "remote", test))]
@@ -237,6 +377,7 @@ struct RemoteOptions {
 }
 
 /// Entry point for `xtask remote`.
+#[cfg(feature = "remote")]
 pub fn run(root: &Path, arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
     let arguments = arguments
         .iter()
@@ -248,7 +389,7 @@ pub fn run(root: &Path, arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
 #[cfg(feature = "remote")]
 fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let Some(command) = arguments.first().map(String::as_str) else {
-        return Err(USAGE.into());
+        return Err(usage().into());
     };
     match command {
         "check" if arguments.len() == 1 => {
@@ -267,7 +408,7 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
         let options = parse_options(&arguments[1..], false)?;
         tuisko_remote::check_credentials().map_err(|error| format!("{error}"))?;
         tuisko_remote::run_probe(&tuisko_remote::ProbeOptions {
-            gpu: options.gpu.remote_gpu(),
+            gpu: options.gpu,
             image: options.image,
             max_minutes: options.max_minutes,
             keep_on_fail: options.keep_on_fail,
@@ -276,14 +417,12 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let qualification = Qualification::parse(command);
-    let benchmark = Benchmark::parse(command);
-    if qualification.is_none() && benchmark.is_none() {
-        return Err(USAGE.into());
-    }
-    let options = parse_options(&arguments[1..], benchmark.is_some())?;
+    let Some(route) = REMOTE_SUBCOMMANDS.iter().find(|row| row.name == command) else {
+        return Err(usage().into());
+    };
+    let options = parse_options(&arguments[1..], route.is_benchmark())?;
 
-    if !target_supports(options.gpu, command) {
+    if !route.admits(options.gpu) {
         return Err(format!(
             "GPU {} does not admit `{command}`; the remaining {} inventory has not been implemented",
             options.gpu.key(),
@@ -295,121 +434,53 @@ fn run_impl(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     tuisko_remote::check_credentials().map_err(|error| format!("{error}"))?;
     if has_full_kernel_inventory(options.gpu) {
         crate::build_sm120(root)?;
-    } else if benchmark.is_some() {
+    } else if route.is_benchmark() {
         crate::build_residual_benchmark_target(root, options.gpu)?;
     }
-    if let Some(qualification) = qualification {
-        let prepared = crate::prepare_remote_qualify(root, options.gpu, qualification.filter)?;
-        gate_static_resources(root, options.gpu, command)?;
-        tuisko_remote::run_qualification(
-            root,
-            &tuisko_remote::QualificationOptions {
-                suite: qualification.name.to_owned(),
-                executable: prepared.executable,
-                test_args: prepared.test_args,
-                gpu: options.gpu.remote_gpu(),
-                source_snapshot: qualification.source_snapshot,
-                image: options.image,
-                max_minutes: options.max_minutes,
-                keep_on_fail: options.keep_on_fail,
-            },
-        )
-        .map_err(|error| format!("{error}"))?;
-    } else if let Some(benchmark) = benchmark {
-        gate_static_resources(root, options.gpu, command)?;
-        let prepared = match benchmark {
-            Benchmark::Leaf(suite) => crate::prepare_remote_benchmark(root, options.gpu, suite)?,
-            Benchmark::Nvfp4Mlp => crate::prepare_remote_nvfp4_mlp_benchmark(root, options.gpu)?,
-            Benchmark::FullAttentionLayer => {
-                crate::prepare_remote_full_attention_layer_benchmark(root, options.gpu)?
-            }
-            Benchmark::MtpLayer => crate::prepare_remote_mtp_layer_benchmark(root, options.gpu)?,
-            Benchmark::TargetMtpVerify => {
-                crate::prepare_remote_resident_model_benchmark(root, options.gpu)?
-            }
-            Benchmark::MtpPromptPrime => {
-                crate::prepare_remote_mtp_prompt_prime_benchmark(root, options.gpu)?
-            }
-            Benchmark::ResidentMtp
-            | Benchmark::GenerationMtpGreedy
-            | Benchmark::GenerationMtpSampling
-            | Benchmark::GenerationMtpBatch => {
-                crate::prepare_remote_resident_mtp_benchmark(root, options.gpu)?
-            }
-            Benchmark::ResidentModel => {
-                crate::prepare_remote_resident_model_benchmark(root, options.gpu)?
-            }
-            Benchmark::ResidentPrefill => {
-                crate::prepare_remote_resident_model_benchmark(root, options.gpu)?
-            }
-            Benchmark::ResidentLongContextModel => {
-                crate::prepare_remote_resident_model_benchmark(root, options.gpu)?
-            }
-        };
-        tuisko_remote::run_benchmark(
-            root,
-            &tuisko_remote::BenchmarkOptions {
-                suite: benchmark.name().to_owned(),
-                executable: prepared.executable,
-                benchmark_args: options.benchmark_args,
-                generator_baseline_sha256: prepared.generator_baseline_sha256,
-                gpu: options.gpu.remote_gpu(),
-                source_snapshot: benchmark.source_snapshot(),
-                image: options.image,
-                max_minutes: options.max_minutes,
-                keep_on_fail: options.keep_on_fail,
-            },
-        )
-        .map_err(|error| format!("{error}"))?;
+
+    match route.run {
+        // A qualification artifact is compiled here, so its gate runs after
+        // that build; a benchmark's artifact is prebuilt and gates first.
+        RemoteRun::Qualification(filter) => {
+            let prepared = crate::prepare_remote_qualify(root, options.gpu, filter)?;
+            route.gate.verify(root, options.gpu)?;
+            tuisko_remote::run_qualification(
+                root,
+                &tuisko_remote::QualificationOptions {
+                    suite: route.suite().to_owned(),
+                    executable: prepared.executable,
+                    test_args: prepared.test_args,
+                    gpu: options.gpu,
+                    source_snapshot: route.source_snapshot,
+                    image: options.image,
+                    max_minutes: options.max_minutes,
+                    keep_on_fail: options.keep_on_fail,
+                },
+            )
+            .map_err(|error| format!("{error}"))?;
+        }
+        RemoteRun::Benchmark(benchmark) => {
+            route.gate.verify(root, options.gpu)?;
+            let prepared = benchmark.prepare(root, options.gpu)?;
+            tuisko_remote::run_benchmark(
+                root,
+                &tuisko_remote::BenchmarkOptions {
+                    suite: route.suite().to_owned(),
+                    executable: prepared.executable,
+                    benchmark_args: options.benchmark_args,
+                    generator_baseline_sha256: prepared.generator_baseline_sha256,
+                    gpu: options.gpu,
+                    source_snapshot: route.source_snapshot,
+                    image: options.image,
+                    max_minutes: options.max_minutes,
+                    keep_on_fail: options.keep_on_fail,
+                },
+            )
+            .map_err(|error| format!("{error}"))?;
+        }
     }
 
     Ok(())
-}
-
-#[cfg(any(feature = "remote", test))]
-fn target_supports(gpu: GpuTarget, command: &str) -> bool {
-    has_full_kernel_inventory(gpu)
-        || matches!(command, "qualify-residual-norm" | "bench-residual-norm")
-        || matches!(gpu, GpuTarget::Sm89)
-            && matches!(
-                command,
-                "qualify-nvfp4-down" | "bench-nvfp4-down" | "qualify-fp8-qkv" | "bench-fp8-qkv"
-            )
-        || matches!(gpu, GpuTarget::Sm89 | GpuTarget::Sm86)
-            && matches!(command, "qualify-nvfp4-swiglu" | "bench-nvfp4-swiglu")
-}
-
-#[cfg(feature = "remote")]
-fn gate_static_resources(root: &Path, gpu: GpuTarget, command: &str) -> Result<(), Box<dyn Error>> {
-    if command.contains("nvfp4-swiglu") {
-        crate::gate_nvfp4_swiglu_target(root, gpu)
-    } else if command.contains("nvfp4-down") {
-        crate::gate_nvfp4_down_target(root, gpu)
-    } else if command.contains("fp8-qkv") && gpu == GpuTarget::Sm89 {
-        crate::gate_fp8_qkv_sm89(root)
-    } else if command.contains("resident-mtp") {
-        crate::gate_resident_mtp(root)
-    } else if command.contains("mtp-prompt-prime") {
-        crate::gate_mtp_prompt_prime(root)
-    } else if command.contains("target-mtp-verify") {
-        crate::gate_resident_model_resources(root)
-    } else if command.contains("mtp-layer") {
-        crate::gate_mtp_layer(root)
-    } else if command.contains("mtp-bf16-fusion") {
-        crate::gate_mtp_bf16_fusion(root)
-    } else if command.contains("mtp-bf16-qkv") {
-        crate::gate_mtp_bf16_qkv(root)
-    } else if command.contains("mtp-bf16-qk-prepare") {
-        crate::gate_mtp_bf16_qk_prepare(root)
-    } else if command.contains("mtp-bf16-paged-gqa") {
-        crate::gate_mtp_bf16_paged_gqa(root)
-    } else if command.contains("mtp-bf16-attention-output") {
-        crate::gate_mtp_bf16_attention_output(root)
-    } else if command.contains("mtp-bf16-mlp") {
-        crate::gate_mtp_bf16_mlp(root)
-    } else {
-        crate::gate_residual_norm_target(root, gpu)
-    }
 }
 
 #[cfg(any(feature = "remote", test))]
@@ -491,6 +562,14 @@ fn tuisko_remote_default_image() -> String {
     "default-image".to_owned()
 }
 
+/// `xtask remote` in a build without the runner. The subcommand is real in
+/// every build, so a forgotten `--features remote` names the flag it needs
+/// instead of being reported as an unknown command.
+#[cfg(not(feature = "remote"))]
+pub fn unavailable(_root: &Path, _arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
+    Err("remote execution requires `cargo run -p xtask --features remote -- remote ...`".into())
+}
+
 #[cfg(feature = "remote")]
 fn run_sentry(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let [_, pod_id, parent_flag, parent, deadline_flag, deadline] = arguments else {
@@ -505,190 +584,469 @@ fn run_sentry(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[cfg(not(feature = "remote"))]
-fn run_impl(_root: &Path, _arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    Err("remote execution requires `cargo run -p xtask --features remote -- remote ...`".into())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Benchmark, Qualification, parse_options, target_supports};
+    use super::{
+        BenchmarkRoute, REMOTE_SUBCOMMANDS, RemoteRun, ResourceGate, parse_options, usage,
+    };
+    use crate::PerformanceSuite;
     use crate::gpu_target::GpuTarget;
+    use std::collections::BTreeSet;
 
+    /// The route table must name exactly the suites the legacy
+    /// `Qualification::parse` and `Benchmark::parse` ladders named, and give
+    /// each the same report name, prepared artifact and snapshot staging.
+    /// Transcribed from those ladders; this test, not a hand-counted number,
+    /// is the authority on the route set.
     #[test]
     fn remote_suite_inventory_is_exact() {
-        let qualification = Qualification::parse("qualify-residual-norm").expect("known suite");
-        assert_eq!(qualification.name, "residual-norm");
-        assert_eq!(qualification.filter, "residual_norm_suite_");
-        let qualification = Qualification::parse("qualify-nvfp4-swiglu").expect("known suite");
-        assert_eq!(qualification.name, "nvfp4-swiglu");
-        assert_eq!(qualification.filter, "nvfp4_swiglu::tests");
-        let qualification = Qualification::parse("qualify-nvfp4-down").expect("known suite");
-        assert_eq!(qualification.name, "nvfp4-down");
-        assert_eq!(qualification.filter, "nvfp4_down::tests");
-        let attention = Qualification::parse("qualify-attention-qk-prepare").expect("known suite");
-        assert_eq!(attention.name, "attention-qk-prepare");
-        assert_eq!(attention.filter, "attention_qk_prepare");
-        let paged = Qualification::parse("qualify-paged-gqa").expect("known suite");
-        assert_eq!(paged.name, "paged-gqa");
-        assert_eq!(paged.filter, "paged_gqa_suite_");
-        let long = Qualification::parse("qualify-long-context-paged-gqa").expect("known suite");
-        assert_eq!(long.name, "long-context-paged-gqa");
-        assert_eq!(long.filter, "long_context_paged_gqa");
-        let output = Qualification::parse("qualify-attention-output").expect("known suite");
-        assert_eq!(output.name, "attention-output");
-        assert_eq!(output.filter, "attention_output::tests");
-        let mtp = Qualification::parse("qualify-mtp-bf16-fusion").expect("known suite");
-        assert_eq!(mtp.name, "mtp-bf16-fusion");
-        assert_eq!(mtp.filter, "mtp_bf16_fusion_suite_");
-        assert!(mtp.source_snapshot);
-        let mtp_qkv = Qualification::parse("qualify-mtp-bf16-qkv").expect("known suite");
-        assert_eq!(mtp_qkv.name, "mtp-bf16-qkv");
-        assert_eq!(mtp_qkv.filter, "mtp_bf16_qkv_suite_");
-        assert!(mtp_qkv.source_snapshot);
-        let mtp_qk = Qualification::parse("qualify-mtp-bf16-qk-prepare").expect("known suite");
-        assert_eq!(mtp_qk.name, "mtp-bf16-qk-prepare");
-        assert_eq!(mtp_qk.filter, "mtp_bf16_qk_prepare_suite_");
-        assert!(mtp_qk.source_snapshot);
-        let mtp_attention =
-            Qualification::parse("qualify-mtp-bf16-paged-gqa").expect("known suite");
-        assert_eq!(mtp_attention.name, "mtp-bf16-paged-gqa");
-        assert_eq!(mtp_attention.filter, "mtp_bf16_paged_gqa_suite_");
-        assert!(!mtp_attention.source_snapshot);
-        let mtp_output =
-            Qualification::parse("qualify-mtp-bf16-attention-output").expect("known suite");
-        assert_eq!(mtp_output.name, "mtp-bf16-attention-output");
-        assert_eq!(mtp_output.filter, "mtp_bf16_attention_output_suite_");
-        assert!(mtp_output.source_snapshot);
-        let mtp_mlp = Qualification::parse("qualify-mtp-bf16-mlp").expect("known suite");
-        assert_eq!(mtp_mlp.name, "mtp-bf16-mlp");
-        assert_eq!(mtp_mlp.filter, "mtp_bf16_mlp_suite_");
-        assert!(mtp_mlp.source_snapshot);
-        let nvfp4_mlp = Qualification::parse("qualify-nvfp4-mlp").expect("known suite");
-        assert_eq!(nvfp4_mlp.name, "nvfp4-mlp");
-        assert!(nvfp4_mlp.source_snapshot);
-        let full = Qualification::parse("qualify-full-attention-layer").expect("known suite");
-        assert_eq!(full.name, "full-attention-layer");
-        assert!(full.source_snapshot);
-        let mtp_layer = Qualification::parse("qualify-mtp-layer").expect("known suite");
-        assert_eq!(mtp_layer.name, "mtp-layer");
-        assert_eq!(mtp_layer.filter, "mtp_layer_suite_");
-        assert!(mtp_layer.source_snapshot);
-        let target = Qualification::parse("qualify-target-mtp-verify").expect("known suite");
-        assert_eq!(target.name, "target-mtp-verify");
-        assert!(target.filter.contains("exact_target_verify_and_commit"));
-        assert!(target.source_snapshot);
-        let prompt = Qualification::parse("qualify-mtp-prompt-prime").expect("known suite");
-        assert_eq!(prompt.name, "mtp-prompt-prime");
-        assert_eq!(prompt.filter, "mtp_prompt_prime_suite_");
-        assert!(prompt.source_snapshot);
-        let resident_mtp = Qualification::parse("qualify-resident-mtp").expect("known suite");
-        assert_eq!(resident_mtp.name, "resident-mtp");
-        assert_eq!(resident_mtp.filter, "resident_mtp_suite_");
-        assert!(resident_mtp.source_snapshot);
-        let mtp_generation =
-            Qualification::parse("qualify-generation-mtp-greedy").expect("known suite");
-        assert_eq!(mtp_generation.name, "generation-mtp-greedy");
-        assert_eq!(mtp_generation.filter, "resident_mtp_generation_suite_");
-        assert!(mtp_generation.source_snapshot);
-        let mtp_sampling =
-            Qualification::parse("qualify-generation-mtp-sampling").expect("known suite");
-        assert_eq!(mtp_sampling.name, "generation-mtp-sampling");
-        assert_eq!(mtp_sampling.filter, "resident_mtp_sampling_suite_");
-        assert!(mtp_sampling.source_snapshot);
-        let mtp_batch = Qualification::parse("qualify-generation-mtp-batch").expect("known suite");
-        assert_eq!(mtp_batch.name, "generation-mtp-batch");
-        assert_eq!(mtp_batch.filter, "resident_mtp_batch_suite_");
-        assert!(mtp_batch.source_snapshot);
-        let generation = Qualification::parse("qualify-resident-generation").expect("known suite");
-        assert_eq!(generation.name, "resident-generation");
-        assert!(generation.source_snapshot);
-        let batch = Qualification::parse("qualify-resident-batch-generation").expect("known suite");
-        assert_eq!(batch.name, "resident-batch-generation");
-        assert!(batch.source_snapshot);
-        assert_eq!(Benchmark::parse("bench-fp8-qkv").unwrap().name(), "fp8-qkv");
+        // (subcommand, report suite, libtest filter, stages the snapshot)
+        const LEGACY_QUALIFICATIONS: &[(&str, &str, &str, bool)] = &[
+            (
+                "qualify-residual-norm",
+                "residual-norm",
+                "residual_norm_suite_",
+                false,
+            ),
+            (
+                "qualify-nvfp4-swiglu",
+                "nvfp4-swiglu",
+                "nvfp4_swiglu::tests",
+                false,
+            ),
+            (
+                "qualify-nvfp4-down",
+                "nvfp4-down",
+                "nvfp4_down::tests",
+                false,
+            ),
+            ("qualify-fp8-qkv", "fp8-qkv", "fp8_qkv", false),
+            (
+                "qualify-fp8-gdn-input",
+                "fp8-gdn-input",
+                "fp8_gdn_input",
+                false,
+            ),
+            ("qualify-fp8-lm-head", "fp8-lm-head", "fp8_lm_head", false),
+            (
+                "qualify-nvfp4-mlp",
+                "nvfp4-mlp",
+                "nvfp4_mlp::tests::source_layer55_matches_complete_oracles_and_graph_replay",
+                true,
+            ),
+            (
+                "qualify-attention-qk-prepare",
+                "attention-qk-prepare",
+                "attention_qk_prepare",
+                false,
+            ),
+            ("qualify-paged-gqa", "paged-gqa", "paged_gqa_suite_", false),
+            (
+                "qualify-long-context-paged-gqa",
+                "long-context-paged-gqa",
+                "long_context_paged_gqa",
+                false,
+            ),
+            (
+                "qualify-attention-output",
+                "attention-output",
+                "attention_output::tests",
+                false,
+            ),
+            (
+                "qualify-mtp-bf16-fusion",
+                "mtp-bf16-fusion",
+                "mtp_bf16_fusion_suite_",
+                true,
+            ),
+            (
+                "qualify-mtp-bf16-qkv",
+                "mtp-bf16-qkv",
+                "mtp_bf16_qkv_suite_",
+                true,
+            ),
+            (
+                "qualify-mtp-bf16-qk-prepare",
+                "mtp-bf16-qk-prepare",
+                "mtp_bf16_qk_prepare_suite_",
+                true,
+            ),
+            (
+                "qualify-mtp-bf16-paged-gqa",
+                "mtp-bf16-paged-gqa",
+                "mtp_bf16_paged_gqa_suite_",
+                false,
+            ),
+            (
+                "qualify-mtp-bf16-attention-output",
+                "mtp-bf16-attention-output",
+                "mtp_bf16_attention_output_suite_",
+                true,
+            ),
+            (
+                "qualify-mtp-bf16-mlp",
+                "mtp-bf16-mlp",
+                "mtp_bf16_mlp_suite_",
+                true,
+            ),
+            (
+                "qualify-full-attention-layer",
+                "full-attention-layer",
+                "full_attention_layer::tests::source_layer63_matches_complete_seam_oracles_and_graph_replay",
+                true,
+            ),
+            ("qualify-mtp-layer", "mtp-layer", "mtp_layer_suite_", true),
+            (
+                "qualify-target-mtp-verify",
+                "target-mtp-verify",
+                "target_mtp_verify::tests::exact_target_verify_and_commit_match_source_oracles",
+                true,
+            ),
+            (
+                "qualify-mtp-prompt-prime",
+                "mtp-prompt-prime",
+                "mtp_prompt_prime_suite_",
+                true,
+            ),
+            (
+                "qualify-resident-mtp",
+                "resident-mtp",
+                "resident_mtp_suite_",
+                true,
+            ),
+            (
+                "qualify-resident-model",
+                "resident-model",
+                "resident_model::tests::source_model_matches_final_oracle_and_exact_graph_replay",
+                true,
+            ),
+            (
+                "qualify-resident-generation",
+                "resident-generation",
+                "resident_generation::tests::source_frontend_generation_matches_vllm_tokens_and_streaming",
+                true,
+            ),
+            (
+                "qualify-generation-mtp-greedy",
+                "generation-mtp-greedy",
+                "resident_mtp_generation_suite_",
+                true,
+            ),
+            (
+                "qualify-generation-mtp-sampling",
+                "generation-mtp-sampling",
+                "resident_mtp_sampling_suite_",
+                true,
+            ),
+            (
+                "qualify-generation-mtp-batch",
+                "generation-mtp-batch",
+                "resident_mtp_batch_suite_",
+                true,
+            ),
+            (
+                "qualify-resident-batch-generation",
+                "resident-batch-generation",
+                "resident_batch_generation::tests::compact_scheduler_matches_sequential_requests_and_recycles_holes",
+                true,
+            ),
+        ];
+
+        // (subcommand, report suite, the artifact its `Benchmark` arm prepared,
+        // stages the snapshot)
+        const LEGACY_BENCHMARKS: &[(&str, &str, BenchmarkRoute, bool)] = &[
+            (
+                "bench-residual-norm",
+                "residual-norm",
+                BenchmarkRoute::Leaf(PerformanceSuite::ResidualNorm),
+                false,
+            ),
+            (
+                "bench-nvfp4-swiglu",
+                "nvfp4-swiglu",
+                BenchmarkRoute::Leaf(PerformanceSuite::Nvfp4SwiGlu),
+                false,
+            ),
+            (
+                "bench-nvfp4-down",
+                "nvfp4-down",
+                BenchmarkRoute::Leaf(PerformanceSuite::Nvfp4Down),
+                false,
+            ),
+            (
+                "bench-nvfp4-mlp",
+                "nvfp4-mlp",
+                BenchmarkRoute::Nvfp4Mlp,
+                true,
+            ),
+            (
+                "bench-fp8-qkv",
+                "fp8-qkv",
+                BenchmarkRoute::Leaf(PerformanceSuite::Fp8Qkv),
+                false,
+            ),
+            (
+                "bench-fp8-gdn-input",
+                "fp8-gdn-input",
+                BenchmarkRoute::Leaf(PerformanceSuite::Fp8GdnInput),
+                false,
+            ),
+            (
+                "bench-fp8-lm-head",
+                "fp8-lm-head",
+                BenchmarkRoute::Leaf(PerformanceSuite::Fp8LmHead),
+                false,
+            ),
+            (
+                "bench-attention-qk-prepare",
+                "attention-qk-prepare",
+                BenchmarkRoute::Leaf(PerformanceSuite::AttentionQkPrepare),
+                false,
+            ),
+            (
+                "bench-paged-gqa",
+                "paged-gqa",
+                BenchmarkRoute::Leaf(PerformanceSuite::PagedGqa),
+                false,
+            ),
+            (
+                "bench-long-context-paged-gqa",
+                "long-context-paged-gqa",
+                BenchmarkRoute::Leaf(PerformanceSuite::LongContextPagedGqa),
+                false,
+            ),
+            (
+                "bench-attention-output",
+                "attention-output",
+                BenchmarkRoute::Leaf(PerformanceSuite::AttentionOutput),
+                false,
+            ),
+            (
+                "bench-mtp-bf16-fusion",
+                "mtp-bf16-fusion",
+                BenchmarkRoute::Leaf(PerformanceSuite::MtpBf16Fusion),
+                false,
+            ),
+            (
+                "bench-mtp-bf16-qkv",
+                "mtp-bf16-qkv",
+                BenchmarkRoute::Leaf(PerformanceSuite::MtpBf16Qkv),
+                false,
+            ),
+            (
+                "bench-mtp-bf16-qk-prepare",
+                "mtp-bf16-qk-prepare",
+                BenchmarkRoute::Leaf(PerformanceSuite::MtpBf16QkPrepare),
+                false,
+            ),
+            (
+                "bench-mtp-bf16-paged-gqa",
+                "mtp-bf16-paged-gqa",
+                BenchmarkRoute::Leaf(PerformanceSuite::MtpBf16PagedGqa),
+                false,
+            ),
+            (
+                "bench-mtp-bf16-attention-output",
+                "mtp-bf16-attention-output",
+                BenchmarkRoute::Leaf(PerformanceSuite::MtpBf16AttentionOutput),
+                false,
+            ),
+            (
+                "bench-mtp-bf16-mlp",
+                "mtp-bf16-mlp",
+                BenchmarkRoute::Leaf(PerformanceSuite::MtpBf16Mlp),
+                false,
+            ),
+            (
+                "bench-full-attention-layer",
+                "full-attention-layer",
+                BenchmarkRoute::FullAttentionLayer,
+                true,
+            ),
+            (
+                "bench-mtp-layer",
+                "mtp-layer",
+                BenchmarkRoute::MtpLayer,
+                true,
+            ),
+            (
+                "bench-target-mtp-verify",
+                "target-mtp-verify",
+                BenchmarkRoute::ResidentModel,
+                true,
+            ),
+            (
+                "bench-mtp-prompt-prime",
+                "mtp-prompt-prime",
+                BenchmarkRoute::MtpPromptPrime,
+                true,
+            ),
+            (
+                "bench-resident-mtp",
+                "resident-mtp",
+                BenchmarkRoute::ResidentMtp,
+                true,
+            ),
+            (
+                "bench-generation-mtp-greedy",
+                "generation-mtp-greedy",
+                BenchmarkRoute::ResidentMtp,
+                true,
+            ),
+            (
+                "bench-generation-mtp-sampling",
+                "generation-mtp-sampling",
+                BenchmarkRoute::ResidentMtp,
+                true,
+            ),
+            (
+                "bench-generation-mtp-batch",
+                "generation-mtp-batch",
+                BenchmarkRoute::ResidentMtp,
+                true,
+            ),
+            (
+                "bench-resident-model",
+                "resident-model",
+                BenchmarkRoute::ResidentModel,
+                true,
+            ),
+            (
+                "bench-resident-prefill",
+                "resident-prefill",
+                BenchmarkRoute::ResidentModel,
+                true,
+            ),
+            (
+                "bench-resident-long-context-model",
+                "resident-long-context-model",
+                BenchmarkRoute::ResidentModel,
+                true,
+            ),
+        ];
+
+        assert_eq!(LEGACY_QUALIFICATIONS.len(), 28);
+        assert_eq!(LEGACY_BENCHMARKS.len(), 28);
         assert_eq!(
-            Benchmark::parse("bench-nvfp4-swiglu").unwrap().name(),
-            "nvfp4-swiglu"
+            REMOTE_SUBCOMMANDS.len(),
+            LEGACY_QUALIFICATIONS.len() + LEGACY_BENCHMARKS.len()
+        );
+
+        let names = REMOTE_SUBCOMMANDS
+            .iter()
+            .map(|route| route.name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names.len(),
+            REMOTE_SUBCOMMANDS.len(),
+            "the table repeats a name"
         );
         assert_eq!(
-            Benchmark::parse("bench-nvfp4-down").unwrap().name(),
-            "nvfp4-down"
+            names,
+            LEGACY_QUALIFICATIONS
+                .iter()
+                .map(|(name, ..)| *name)
+                .chain(LEGACY_BENCHMARKS.iter().map(|(name, ..)| *name))
+                .collect::<BTreeSet<_>>()
         );
-        let mlp = Benchmark::parse("bench-nvfp4-mlp").expect("known benchmark");
-        assert_eq!(mlp.name(), "nvfp4-mlp");
-        assert!(mlp.source_snapshot());
-        let full = Benchmark::parse("bench-full-attention-layer").expect("known benchmark");
-        assert_eq!(full.name(), "full-attention-layer");
-        assert!(full.source_snapshot());
-        let mtp_layer = Benchmark::parse("bench-mtp-layer").expect("known benchmark");
-        assert_eq!(mtp_layer.name(), "mtp-layer");
-        assert!(mtp_layer.source_snapshot());
-        let target = Benchmark::parse("bench-target-mtp-verify").expect("known benchmark");
-        assert_eq!(target.name(), "target-mtp-verify");
-        assert!(target.source_snapshot());
-        let prompt = Benchmark::parse("bench-mtp-prompt-prime").expect("known benchmark");
-        assert_eq!(prompt.name(), "mtp-prompt-prime");
-        assert!(prompt.source_snapshot());
-        let resident_mtp = Benchmark::parse("bench-resident-mtp").expect("known benchmark");
-        assert_eq!(resident_mtp.name(), "resident-mtp");
-        assert!(resident_mtp.source_snapshot());
-        let generation_mtp =
-            Benchmark::parse("bench-generation-mtp-greedy").expect("known benchmark");
-        assert_eq!(generation_mtp.name(), "generation-mtp-greedy");
-        assert!(generation_mtp.source_snapshot());
-        let sampling_mtp =
-            Benchmark::parse("bench-generation-mtp-sampling").expect("known benchmark");
-        assert_eq!(sampling_mtp.name(), "generation-mtp-sampling");
-        assert!(sampling_mtp.source_snapshot());
-        let batch_mtp = Benchmark::parse("bench-generation-mtp-batch").expect("known benchmark");
-        assert_eq!(batch_mtp.name(), "generation-mtp-batch");
-        assert!(batch_mtp.source_snapshot());
-        assert_eq!(
-            Benchmark::parse("bench-attention-qk-prepare")
-                .expect("known benchmark")
-                .name(),
-            "attention-qk-prepare"
-        );
-        assert_eq!(
-            Benchmark::parse("bench-paged-gqa")
-                .expect("known benchmark")
-                .name(),
-            "paged-gqa"
-        );
-        assert_eq!(
-            Benchmark::parse("bench-long-context-paged-gqa")
-                .expect("known benchmark")
-                .name(),
-            "long-context-paged-gqa"
-        );
-        assert_eq!(
-            Benchmark::parse("bench-attention-output")
-                .expect("known benchmark")
-                .name(),
-            "attention-output"
-        );
-        let mtp = Benchmark::parse("bench-mtp-bf16-fusion").expect("known benchmark");
-        assert_eq!(mtp.name(), "mtp-bf16-fusion");
-        assert!(!mtp.source_snapshot());
-        let mtp_qkv = Benchmark::parse("bench-mtp-bf16-qkv").expect("known benchmark");
-        assert_eq!(mtp_qkv.name(), "mtp-bf16-qkv");
-        assert!(!mtp_qkv.source_snapshot());
-        let mtp_qk = Benchmark::parse("bench-mtp-bf16-qk-prepare").expect("known benchmark");
-        assert_eq!(mtp_qk.name(), "mtp-bf16-qk-prepare");
-        assert!(!mtp_qk.source_snapshot());
-        let mtp_attention = Benchmark::parse("bench-mtp-bf16-paged-gqa").expect("known benchmark");
-        assert_eq!(mtp_attention.name(), "mtp-bf16-paged-gqa");
-        assert!(!mtp_attention.source_snapshot());
-        let mtp_output =
-            Benchmark::parse("bench-mtp-bf16-attention-output").expect("known benchmark");
-        assert_eq!(mtp_output.name(), "mtp-bf16-attention-output");
-        assert!(!mtp_output.source_snapshot());
-        let mtp_mlp = Benchmark::parse("bench-mtp-bf16-mlp").expect("known benchmark");
-        assert_eq!(mtp_mlp.name(), "mtp-bf16-mlp");
-        assert!(!mtp_mlp.source_snapshot());
-        assert!(Qualification::parse("bench-residual-norm").is_none());
-        assert!(Benchmark::parse("perf").is_none());
+
+        let find = |name: &str| {
+            *REMOTE_SUBCOMMANDS
+                .iter()
+                .find(|route| route.name == name)
+                .unwrap()
+        };
+
+        for &(name, suite, filter, snapshot) in LEGACY_QUALIFICATIONS {
+            let route = find(name);
+            assert_eq!(route.suite(), suite, "`{name}` report suite");
+            assert_eq!(
+                route.run,
+                RemoteRun::Qualification(filter),
+                "`{name}` route"
+            );
+            assert_eq!(route.source_snapshot, snapshot, "`{name}` snapshot");
+            assert!(!route.is_benchmark(), "`{name}` is a qualification");
+        }
+
+        for &(name, suite, benchmark, snapshot) in LEGACY_BENCHMARKS {
+            let route = find(name);
+            assert_eq!(route.suite(), suite, "`{name}` report suite");
+            assert_eq!(route.run, RemoteRun::Benchmark(benchmark), "`{name}` route");
+            assert_eq!(route.source_snapshot, snapshot, "`{name}` snapshot");
+            // A leaf benchmark reports under its suite's own name, exactly as
+            // `Benchmark::name()` returned it.
+            if let BenchmarkRoute::Leaf(leaf) = benchmark {
+                assert_eq!(leaf.name(), suite, "`{name}` leaf suite name");
+            }
+        }
+
+        for absent in ["perf", "probe", "check", "sweep"] {
+            assert!(!names.contains(absent));
+        }
+    }
+
+    /// Every route names the static resource gate the legacy substring chain
+    /// in `gate_static_resources` selected for it.
+    #[test]
+    fn resource_gates_reproduce_the_legacy_chain() {
+        // Transcribed from `gate_static_resources`, in its `if`/`else if`
+        // order. `Fp8Qkv` stands for the arm that fires only on SM89 and
+        // otherwise falls through to the residual-norm gate.
+        fn legacy_gate(command: &str) -> ResourceGate {
+            if command.contains("nvfp4-swiglu") {
+                ResourceGate::Nvfp4Swiglu
+            } else if command.contains("nvfp4-down") {
+                ResourceGate::Nvfp4Down
+            } else if command.contains("fp8-qkv") {
+                ResourceGate::Fp8Qkv
+            } else if command.contains("resident-mtp") {
+                ResourceGate::ResidentMtp
+            } else if command.contains("mtp-prompt-prime") {
+                ResourceGate::MtpPromptPrime
+            } else if command.contains("target-mtp-verify") {
+                ResourceGate::ResidentModel
+            } else if command.contains("mtp-layer") {
+                ResourceGate::MtpLayer
+            } else if command.contains("mtp-bf16-fusion") {
+                ResourceGate::MtpBf16Fusion
+            } else if command.contains("mtp-bf16-qkv") {
+                ResourceGate::MtpBf16Qkv
+            } else if command.contains("mtp-bf16-qk-prepare") {
+                ResourceGate::MtpBf16QkPrepare
+            } else if command.contains("mtp-bf16-paged-gqa") {
+                ResourceGate::MtpBf16PagedGqa
+            } else if command.contains("mtp-bf16-attention-output") {
+                ResourceGate::MtpBf16AttentionOutput
+            } else if command.contains("mtp-bf16-mlp") {
+                ResourceGate::MtpBf16Mlp
+            } else {
+                ResourceGate::ResidualNorm
+            }
+        }
+
+        for route in REMOTE_SUBCOMMANDS {
+            assert_eq!(route.gate, legacy_gate(route.name), "`{}` gate", route.name);
+        }
+    }
+
+    /// The advertised usage is the route table, so no row can exist
+    /// unadvertised and no advertised name can be missing a row.
+    #[test]
+    fn usage_lists_every_route() {
+        // The pre-table `USAGE` literal, transcribed verbatim.
+        const LEGACY_USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
+            <qualify-residual-norm|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
+            qualify-nvfp4-mlp|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-long-context-paged-gqa|qualify-attention-output|qualify-mtp-bf16-fusion|qualify-mtp-bf16-qkv|qualify-mtp-bf16-qk-prepare|qualify-mtp-bf16-paged-gqa|qualify-mtp-bf16-attention-output|qualify-mtp-bf16-mlp|qualify-full-attention-layer|qualify-mtp-layer|qualify-target-mtp-verify|qualify-mtp-prompt-prime|qualify-resident-mtp|\
+            qualify-resident-model|qualify-resident-generation|qualify-generation-mtp-greedy|qualify-generation-mtp-sampling|qualify-generation-mtp-batch|qualify-resident-batch-generation|\
+            bench-residual-norm|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-fp8-qkv|bench-fp8-gdn-input|\
+            bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-mtp-bf16-fusion|bench-mtp-bf16-qkv|bench-mtp-bf16-qk-prepare|bench-mtp-bf16-paged-gqa|bench-mtp-bf16-attention-output|bench-mtp-bf16-mlp|bench-full-attention-layer|bench-mtp-layer|bench-target-mtp-verify|bench-mtp-prompt-prime|bench-resident-mtp|bench-generation-mtp-greedy|bench-generation-mtp-sampling|bench-generation-mtp-batch|\
+            bench-resident-model|bench-resident-prefill|bench-resident-long-context-model|\
+            probe|check|sweep> \
+            [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
+            [--samples N] [--launches-per-sample N] [--energy-seconds N]";
+
+        assert_eq!(usage(), LEGACY_USAGE);
     }
 
     #[test]
@@ -712,29 +1070,57 @@ mod tests {
 
     #[test]
     fn target_support_is_a_complete_decision_table() {
+        let admits = |command: &str, gpu: GpuTarget| {
+            REMOTE_SUBCOMMANDS
+                .iter()
+                .find(|route| route.name == command)
+                .expect("known route")
+                .admits(gpu)
+        };
+
         for command in [
             "qualify-residual-norm",
             "bench-residual-norm",
             "qualify-fp8-qkv",
             "bench-fp8-qkv",
         ] {
-            assert!(target_supports(GpuTarget::Sm120, command));
+            assert!(admits(command, GpuTarget::Sm120));
         }
         for gpu in [GpuTarget::Sm89, GpuTarget::Sm86] {
-            assert!(target_supports(gpu, "qualify-residual-norm"));
-            assert!(target_supports(gpu, "bench-residual-norm"));
+            assert!(admits("qualify-residual-norm", gpu));
+            assert!(admits("bench-residual-norm", gpu));
         }
-        assert!(target_supports(GpuTarget::Sm89, "qualify-nvfp4-swiglu"));
-        assert!(target_supports(GpuTarget::Sm89, "bench-nvfp4-swiglu"));
-        assert!(target_supports(GpuTarget::Sm89, "qualify-nvfp4-down"));
-        assert!(target_supports(GpuTarget::Sm89, "bench-nvfp4-down"));
-        assert!(target_supports(GpuTarget::Sm89, "qualify-fp8-qkv"));
-        assert!(target_supports(GpuTarget::Sm89, "bench-fp8-qkv"));
-        assert!(target_supports(GpuTarget::Sm86, "qualify-nvfp4-swiglu"));
-        assert!(target_supports(GpuTarget::Sm86, "bench-nvfp4-swiglu"));
-        assert!(!target_supports(GpuTarget::Sm86, "qualify-nvfp4-down"));
-        assert!(!target_supports(GpuTarget::Sm86, "bench-nvfp4-down"));
-        assert!(!target_supports(GpuTarget::Sm86, "qualify-fp8-qkv"));
-        assert!(!target_supports(GpuTarget::Sm86, "bench-fp8-qkv"));
+        assert!(admits("qualify-nvfp4-swiglu", GpuTarget::Sm89));
+        assert!(admits("bench-nvfp4-swiglu", GpuTarget::Sm89));
+        assert!(admits("qualify-nvfp4-down", GpuTarget::Sm89));
+        assert!(admits("bench-nvfp4-down", GpuTarget::Sm89));
+        assert!(admits("qualify-fp8-qkv", GpuTarget::Sm89));
+        assert!(admits("bench-fp8-qkv", GpuTarget::Sm89));
+        assert!(admits("qualify-nvfp4-swiglu", GpuTarget::Sm86));
+        assert!(admits("bench-nvfp4-swiglu", GpuTarget::Sm86));
+        assert!(!admits("qualify-nvfp4-down", GpuTarget::Sm86));
+        assert!(!admits("bench-nvfp4-down", GpuTarget::Sm86));
+        assert!(!admits("qualify-fp8-qkv", GpuTarget::Sm86));
+        assert!(!admits("bench-fp8-qkv", GpuTarget::Sm86));
+
+        // SM120 carries the complete inventory and admits every route; the
+        // partial targets admit exactly the four suites they implement.
+        const PARTIAL: &[&str] = &[
+            "qualify-residual-norm",
+            "bench-residual-norm",
+            "qualify-nvfp4-swiglu",
+            "bench-nvfp4-swiglu",
+            "qualify-nvfp4-down",
+            "bench-nvfp4-down",
+            "qualify-fp8-qkv",
+            "bench-fp8-qkv",
+        ];
+        for route in REMOTE_SUBCOMMANDS {
+            assert!(route.admits(GpuTarget::Sm120), "`{}` on SM120", route.name);
+            if !PARTIAL.contains(&route.name) {
+                assert!(!route.admits(GpuTarget::Sm89), "`{}` on SM89", route.name);
+                assert!(!route.admits(GpuTarget::Sm86), "`{}` on SM86", route.name);
+            }
+        }
     }
 }

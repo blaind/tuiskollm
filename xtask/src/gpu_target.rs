@@ -13,9 +13,6 @@ pub(crate) trait BuildTargetProfile {
     fn nvfp4_swiglu_resource_baseline(self) -> Option<&'static str>;
     fn nvfp4_down_resource_baseline(self) -> Option<&'static str>;
     fn fp8_qkv_resource_baseline(self) -> Option<&'static str>;
-
-    #[cfg(feature = "remote")]
-    fn remote_gpu(self) -> tuisko_remote::GpuTarget;
 }
 
 impl BuildTargetProfile for GpuTarget {
@@ -90,14 +87,9 @@ impl BuildTargetProfile for GpuTarget {
             Self::Sm86 => None,
         }
     }
-
-    #[cfg(feature = "remote")]
-    fn remote_gpu(self) -> tuisko_remote::GpuTarget {
-        tuisko_remote::GpuTarget::new(self.device_name(), self.compute_capability_text())
-    }
 }
 
-#[cfg(any(feature = "remote", test))]
+#[cfg(feature = "remote")]
 pub(crate) const fn has_full_kernel_inventory(target: GpuTarget) -> bool {
     matches!(target, GpuTarget::Sm120)
 }

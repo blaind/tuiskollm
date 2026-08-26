@@ -533,6 +533,12 @@ fn wait_for_precheck(
     }
 }
 
+/// The exact `nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader`
+/// line the admitted target must report.
+fn expected_identity(gpu: GpuTarget) -> String {
+    format!("{}, {}", gpu.device_name(), gpu.compute_capability_text())
+}
+
 fn precheck(ssh: &Ssh, gpu: GpuTarget) -> RemoteResult<()> {
     let (status, _) = ssh.run("whoami", 45)?;
     if status != 0 {
@@ -543,7 +549,7 @@ fn precheck(ssh: &Ssh, gpu: GpuTarget) -> RemoteResult<()> {
     let command = "timeout 30 nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader; \
         echo ---; ldd --version 2>&1 | head -n 1; echo ---; nproc";
     let (status, output) = ssh.run(command, 45)?;
-    let expected = gpu.expected_identity();
+    let expected = expected_identity(gpu);
     let observed_gpu = output.lines().find(|line| line.starts_with("NVIDIA "));
     match observed_gpu {
         Some(observed) if observed == expected => {
@@ -842,9 +848,28 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::{
-        benchmark_command, lease_expired, leased_pod_name, owned_pod_id, qualification_command,
-        sanitize_arguments, source_snapshot_command,
+        GpuTarget, benchmark_command, expected_identity, lease_expired, leased_pod_name,
+        owned_pod_id, qualification_command, sanitize_arguments, source_snapshot_command,
     };
+
+    /// The exact `nvidia-smi --query-gpu=name,compute_cap` line each admitted
+    /// target must report. The precheck compares it verbatim, so these three
+    /// strings are behavior, not formatting.
+    #[test]
+    fn expected_identity_is_the_exact_smi_line() {
+        assert_eq!(
+            expected_identity(GpuTarget::Sm120),
+            "NVIDIA GeForce RTX 5090, 12.0"
+        );
+        assert_eq!(
+            expected_identity(GpuTarget::Sm89),
+            "NVIDIA GeForce RTX 4090, 8.9"
+        );
+        assert_eq!(
+            expected_identity(GpuTarget::Sm86),
+            "NVIDIA GeForce RTX 3090, 8.6"
+        );
+    }
 
     #[test]
     fn qualification_command_preserves_a_failure_after_printing_the_log() {

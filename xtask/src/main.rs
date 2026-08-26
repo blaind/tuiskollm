@@ -1347,7 +1347,12 @@ const SUBCOMMANDS: &[Subcommand] = &[
     no_args("gate-qwen36-mtp-resources", gate_qwen36_mtp_resources),
     forwarded("perf", perf),
     forwarded("profile", profile),
+    // Billable: the subcommand is real in every build, but only the feature
+    // links the runner. Without it the handler names the flag.
+    #[cfg(feature = "remote")]
     forwarded("remote", remote::run),
+    #[cfg(not(feature = "remote"))]
+    forwarded("remote", remote::unavailable),
 ];
 
 /// Reject arguments a subcommand does not take.
@@ -14672,6 +14677,25 @@ mod tests {
 
         let error = dispatch(root, OsStr::new("qualify-nothing"), &[]).unwrap_err();
         assert_eq!(error.to_string(), "unknown xtask command `qualify-nothing`");
+
+        // `remote` is one row in both builds; only its handler is
+        // feature-gated. A bare `remote` reaches the runner's own usage when
+        // the feature is on, and otherwise reports the flag it needs. That
+        // message is transcribed from the pre-table handler: a forgotten
+        // `--features remote` must never degrade to `unknown xtask command`.
+        let error = dispatch(root, OsStr::new("remote"), &[]).unwrap_err();
+        #[cfg(feature = "remote")]
+        assert!(
+            error
+                .to_string()
+                .starts_with("usage: cargo run -p xtask --features remote -- remote <"),
+            "`remote` reached {error}"
+        );
+        #[cfg(not(feature = "remote"))]
+        assert_eq!(
+            error.to_string(),
+            "remote execution requires `cargo run -p xtask --features remote -- remote ...`"
+        );
     }
 
     /// Every canonical `bench-device` subcommand must reach the handler that
