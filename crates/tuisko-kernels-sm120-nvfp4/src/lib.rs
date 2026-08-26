@@ -11,11 +11,19 @@ mod nvfp4_output;
 mod nvfp4_qkv;
 mod nvfp4_swiglu;
 
-pub use nvfp4_down::{Nvfp4DownOp, Qwen35Nvfp4DownOp};
+pub use nvfp4_down::{
+    Nvfp4DownA16Route, Nvfp4DownEntries, Nvfp4DownOp, Nvfp4DownPrefillRoute, PreparedBatchOneRoute,
+    PreparedBatchRoute, PreparedPrefillRoute, PreparedQwen35BatchRoute, PreparedQwen35PrefillRoute,
+    Qwen35Nvfp4DownEntries, Qwen35Nvfp4DownOp, Qwen38Nvfp4DownEntries,
+};
 pub use nvfp4_gdn_input::Qwen35Nvfp4GdnInputOp;
 pub use nvfp4_output::{Qwen35Nvfp4AttentionOutputOp, Qwen35Nvfp4GdnOutputOp};
 pub use nvfp4_qkv::Qwen35Nvfp4QkvOp;
-pub use nvfp4_swiglu::{Nvfp4SwiGluOp, Qwen35Nvfp4SwiGluOp};
+pub use nvfp4_swiglu::{
+    A16Slot, Nvfp4SwiGluEntries, Nvfp4SwiGluOp, PreparedA16Routes, PreparedQwen35A16Routes,
+    PreparedQwen35W4a4Route, PreparedW4a4Route, Qwen35Nvfp4SwiGluEntries, Qwen35Nvfp4SwiGluOp,
+    Qwen38Nvfp4SwiGluEntries, SwiGluA16Routes, SwiGluRoute, SwiGluW4a4Route, UnadmittedRoute,
+};
 
 /// Semantic inventory of every entry this family emits.
 pub fn kernel_ptx_names() -> Vec<&'static str> {

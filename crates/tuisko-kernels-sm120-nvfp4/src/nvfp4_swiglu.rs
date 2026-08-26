@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tuisko_gpu::{
     CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, LaunchConfig2D, PreparedLaunch,
 };
+use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -59,6 +60,7 @@ const SHARED_U32: usize = SHARED_BYTES / 4;
 const _: () = assert!(HIDDEN == 5_120);
 const _: () = assert!(OUTPUT_ROWS == 17_408);
 const _: () = assert!(GATE_UP_ROWS == 34_816);
+const _: () = assert!(GROUPS_PER_ROW == 320);
 const _: () = assert!(Qwen35_9B::HIDDEN == 4_096);
 const _: () = assert!(Qwen35_9B::INTERMEDIATE == 12_288);
 const _: () = assert!(SHARED_BYTES == 36_864);
@@ -1407,48 +1409,408 @@ mod kernels {
     }
 }
 
-fn a16_config() -> LaunchConfig1D {
-    // One eight-warp CTA emits eight gate/up row pairs, so 17,408 outputs
-    // require exactly 2,176 CTAs without a tail route.
-    LaunchConfig1D::new((OUTPUT_ROWS / A16_WARPS) as u32, A16_THREADS, 0)
+fn a16_launch_config<A: Arch>() -> LaunchConfig1D {
+    // One eight-warp CTA emits eight gate/up row pairs, so Qwen3.8's 17,408
+    // outputs require exactly 2,176 CTAs and Qwen3.5's 12,288 exactly 1,536,
+    // neither with a tail route; only the K loop shrinks from ten phases to
+    // eight.
+    LaunchConfig1D::new((A::INTERMEDIATE / A16_WARPS) as u32, A16_THREADS, 0)
 }
 
-fn qwen35_a16_config() -> LaunchConfig1D {
-    // Eight warps still own eight gate/up pairs, so the 12,288 output rows
-    // form 1,536 exact CTAs; only the K loop shrinks from ten to eight phases.
-    LaunchConfig1D::new((Qwen35_9B::INTERMEDIATE / A16_WARPS) as u32, A16_THREADS, 0)
+fn w4a4_launch_configs<A: Arch>(
+    tokens: usize,
+    label: &str,
+) -> GpuResult<(LaunchConfig1D, LaunchConfig2D)> {
+    // One quantizer thread owns one 16-value activation group; 256 groups per
+    // CTA amortize the reduction while preserving the source grouping. Both
+    // admitted rows divide exactly: 320 groups on Qwen3.8, 256 on Qwen3.5.
+    let quantize_blocks =
+        u32::try_from((tokens * (A::HIDDEN / GROUP_K)).div_ceil(256)).map_err(|_| {
+            GpuError::invalid_launch(format!("{label}NVFP4 quantization grid exceeds CUDA width"))
+        })?;
+    // Each projection CTA emits 32 fused gate/up rows, yielding 544 exact
+    // column CTAs on Qwen3.8 and 384 on Qwen3.5 with no output-row padding.
+    // Forty-eight token slots retain two CTAs per SM, so exact
+    // T=32/64/128/1024 use 1/2/3/22 tiles and extending grid Y preserves every
+    // m16n8k64 accumulation.
+    let projection_blocks = u32::try_from(A::INTERMEDIATE / ROWS_PER_BRANCH).map_err(|_| {
+        GpuError::invalid_launch(format!("{label}NVFP4 projection grid exceeds CUDA width"))
+    })?;
+    let token_tiles = u32::try_from(tokens.div_ceil(SMALL_BLOCK_M)).map_err(|_| {
+        GpuError::invalid_launch(format!("{label}NVFP4 token grid exceeds CUDA height"))
+    })?;
+
+    Ok((
+        LaunchConfig1D::new(quantize_blocks, 256, 0),
+        LaunchConfig2D::new((projection_blocks, token_tiles), (W4A4_THREADS, 1), 0),
+    ))
 }
 
-struct PreparedW4a4Route<const TOKENS: usize> {
+mod private {
+    pub trait Sealed {}
+}
+
+/// The A16 entry one exact `B=1..=4` batch selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum A16Slot {
+    /// `B=1`.
+    B1,
+    /// `B=2`.
+    B2,
+    /// `B=3`.
+    B3,
+    /// `B=4`.
+    B4,
+}
+
+/// One architecture's four prepared represented-BF16 A16 entries.
+///
+/// Sealed: the implementors are this module's prepared routes, so an entry
+/// table can never name a route whose entries the module does not emit. The
+/// four entries stay one route because `B=1..=4` is a single retained
+/// comparison schedule that is prepared and qualified together.
+pub trait SwiGluA16Routes<A: Arch>: Sized + private::Sealed {
+    /// Prepares this architecture's four A16 entries.
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self>;
+
+    /// Launches the A16 entry the slot selects.
+    ///
+    /// # Safety
+    ///
+    /// The pointers carry `Nvfp4SwiGluOp::launch_a16`'s contract unchanged.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        slot: A16Slot,
+        input: *const u16,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        weight_scale_reciprocal: f32,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+/// One architecture's prepared quantization and W4A4 entries for exact rows.
+///
+/// Sealed for the same reason as [`SwiGluA16Routes`]. The pair stays one route
+/// because the quantizer's output grouping is the projection's input contract
+/// and the two are never prepared apart.
+pub trait SwiGluW4a4Route<A: Arch>: Sized + private::Sealed {
+    /// Prepares both entries of this route's exact row count.
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self>;
+
+    /// Quantizes the represented activations and launches the W4A4 entry.
+    ///
+    /// # Safety
+    ///
+    /// The pointers carry `Nvfp4SwiGluOp::launch`'s contract unchanged.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+/// Exact entry table of one admitted architecture's NVFP4 gate/up routes.
+///
+/// The table is parameterized by the architecture instead of bounding
+/// [`Sm120Arch`], so admitting Qwen3.5 here never widens the artifact-level
+/// admission bound. Each table names only the entries its own model emits,
+/// which is what keeps the compiled inventory fixed while both prepared owners
+/// share one wrapper.
+pub trait Nvfp4SwiGluEntries<A: Arch>: private::Sealed {
+    /// Prepared A16 entries for `B=1..=4`.
+    type A16: SwiGluA16Routes<A>;
+    /// Prepared W4A4 route for a batch both schedules project through W4A4.
+    type W4a4Decode<const TOKENS: usize>: SwiGluW4a4Route<A>;
+    /// Prepared W4A4 route for `B=2..=4`, where the two schedules disagree.
+    ///
+    /// Qwen3.5 keeps these as measured comparison routes reachable through
+    /// `launch_w4a4`; Qwen3.8's production schedule takes A16 across that
+    /// whole range and prepares no W4A4 entry there.
+    type W4a4Crossover<const TOKENS: usize>: SwiGluW4a4Route<A>;
+    /// Prepared W4A4 route for one exact prefill row count.
+    type W4a4Prefill<const TOKENS: usize>: SwiGluW4a4Route<A>;
+
+    /// Message prefix that keeps this architecture's launch errors distinct.
+    const LABEL: &'static str;
+    /// Context this architecture's module-load failure reports.
+    const MODULE_CONTEXT: &'static str;
+    /// Whether `launch` rejects a non-finite or non-positive activation-scale
+    /// divisor even when the selected schedule keeps represented BF16
+    /// activations and never reads it.
+    ///
+    /// Transcribed, not normalized: Qwen3.8's dispatch validated both divisors
+    /// before selecting a schedule, and Qwen3.5's validated inside the selected
+    /// route, so the two owners' rejection sets differ at their A16 batches.
+    const A16_VALIDATES_INPUT_DIVISOR: bool;
+
+    /// The route this architecture's production dispatch selects for `rows`.
+    fn route(rows: usize) -> Option<SwiGluRoute>;
+
+    /// This architecture's rejection of a row count its schedule does not admit.
+    fn unadmitted_rows(rows: usize) -> GpuError;
+
+    /// Retained PTX entry names of every route this table admits.
+    fn ptx_names() -> Vec<&'static str>;
+}
+
+/// The compiled route one admitted row count selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SwiGluRoute {
+    /// Represented-BF16 A16 entry for `B=1..=4`.
+    A16(A16Slot),
+    /// W4A4 decode entry for `B=1`.
+    W4a4B1,
+    /// W4A4 decode entry for `B=2`.
+    W4a4B2,
+    /// W4A4 decode entry for `B=3`.
+    W4a4B3,
+    /// W4A4 decode entry for `B=4`.
+    W4a4B4,
+    /// W4A4 decode entry for `B=5`.
+    W4a4B5,
+    /// W4A4 decode entry for `B=6`.
+    W4a4B6,
+    /// W4A4 decode entry for `B=7`.
+    W4a4B7,
+    /// W4A4 decode entry for `B=8`.
+    W4a4B8,
+    /// W4A4 prefill entry for `T=32`.
+    W4a4T32,
+    /// W4A4 prefill entry for `T=64`.
+    W4a4T64,
+    /// W4A4 prefill entry for `T=128`.
+    W4a4T128,
+    /// W4A4 prefill entry for `T=1024`.
+    W4a4T1024,
+}
+
+// The retained comparison schedule both owners expose through `launch_a16`:
+// exact B=1..=4 and nothing else.
+fn a16_slot(batch: usize) -> Option<A16Slot> {
+    match batch {
+        1 => Some(A16Slot::B1),
+        2 => Some(A16Slot::B2),
+        3 => Some(A16Slot::B3),
+        4 => Some(A16Slot::B4),
+        _ => None,
+    }
+}
+
+// The W4A4 route an exact prefill row count selects; both owners admit
+// exactly `PREFILL_ROWS` here.
+fn prefill_route(rows: usize) -> Option<SwiGluRoute> {
+    if !PREFILL_ROWS.contains(&rows) {
+        return None;
+    }
+
+    match rows {
+        32 => Some(SwiGluRoute::W4a4T32),
+        64 => Some(SwiGluRoute::W4a4T64),
+        128 => Some(SwiGluRoute::W4a4T128),
+        1_024 => Some(SwiGluRoute::W4a4T1024),
+        _ => unreachable!("PREFILL_ROWS admits only the exact T routes"),
+    }
+}
+
+/// Prepared Qwen3.8 A16 entries for `B=1..=4`.
+pub struct PreparedA16Routes {
+    b1: PreparedLaunch<kernels::__nvfp4_swiglu_a16_t1_CudaKernel>,
+    b2: PreparedLaunch<kernels::__nvfp4_swiglu_a16_t2_CudaKernel>,
+    b3: PreparedLaunch<kernels::__nvfp4_swiglu_a16_t3_CudaKernel>,
+    b4: PreparedLaunch<kernels::__nvfp4_swiglu_a16_t4_CudaKernel>,
+}
+
+/// Prepared Qwen3.5 A16 entries for `B=1..=4`.
+///
+/// `B=1` and `B=2` keep their concrete entries; `B=3` and `B=4` share the
+/// generic entry whose shared footprint they already qualified together.
+pub struct PreparedQwen35A16Routes {
+    b1: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_a16_t1_CudaKernel>,
+    b2: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_a16_t2_CudaKernel>,
+    b3: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_a16_CudaKernel<3>>,
+    b4: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_a16_CudaKernel<4>>,
+}
+
+/// Prepared Qwen3.8 quantization and W4A4 entries for one exact row count.
+pub struct PreparedW4a4Route<const TOKENS: usize> {
     quantize: PreparedLaunch<kernels::__nvfp4_quantize_CudaKernel<TOKENS>>,
     projection: PreparedLaunch<kernels::__nvfp4_swiglu_w4a4_CudaKernel<TOKENS>>,
 }
 
-impl<const TOKENS: usize> PreparedW4a4Route<TOKENS> {
+/// Prepared Qwen3.5 quantization and W4A4 entries for one exact row count.
+pub struct PreparedQwen35W4a4Route<const TOKENS: usize> {
+    quantize: PreparedLaunch<kernels::__qwen35_nvfp4_quantize_CudaKernel<TOKENS>>,
+    projection: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_w4a4_CudaKernel<TOKENS>>,
+}
+
+/// Stands in for a batch an architecture's schedule never routes through W4A4.
+///
+/// It prepares and launches no entry, so an unrouted batch can never reach the
+/// device and never enters the emitted inventory.
+pub struct UnadmittedRoute;
+
+impl private::Sealed for PreparedA16Routes {}
+impl private::Sealed for PreparedQwen35A16Routes {}
+impl<const TOKENS: usize> private::Sealed for PreparedW4a4Route<TOKENS> {}
+impl<const TOKENS: usize> private::Sealed for PreparedQwen35W4a4Route<TOKENS> {}
+impl private::Sealed for UnadmittedRoute {}
+
+// The Qwen3.8 A16 entries compile that model's exact row width into four
+// concrete entries, so they stay bound to the sealed artifact-level
+// architecture.
+impl<A: Sm120Arch> SwiGluA16Routes<A> for PreparedA16Routes {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        // One quantizer thread owns one 16-value activation group; 256 groups
-        // per CTA amortize the reduction while preserving the source grouping.
-        let quantize_blocks = (TOKENS * GROUPS_PER_ROW).div_ceil(256);
-        let quantize_blocks = u32::try_from(quantize_blocks)
-            .map_err(|_| GpuError::invalid_launch("NVFP4 quantization grid exceeds CUDA width"))?;
-        // Each projection CTA emits 32 fused gate/up rows, yielding 544 exact
-        // column CTAs and no output-row padding. Forty-eight token slots retain
-        // two CTAs per SM; exact T=32/64/128/1024 therefore use 1/2/3/22 tiles.
-        let projection_blocks = u32::try_from(OUTPUT_ROWS / ROWS_PER_BRANCH)
-            .map_err(|_| GpuError::invalid_launch("NVFP4 projection grid exceeds CUDA width"))?;
-        let token_tiles = u32::try_from(TOKENS.div_ceil(SMALL_BLOCK_M))
-            .map_err(|_| GpuError::invalid_launch("NVFP4 token grid exceeds CUDA height"))?;
+        let launch = a16_launch_config::<A>();
+
+        Ok(Self {
+            b1: module
+                .prepare_nvfp4_swiglu_a16_t1(launch)
+                .map_err(|source| GpuError::launch("preparing NVFP4 A16 B=1", source))?,
+            b2: module
+                .prepare_nvfp4_swiglu_a16_t2(launch)
+                .map_err(|source| GpuError::launch("preparing NVFP4 A16 B=2", source))?,
+            b3: module
+                .prepare_nvfp4_swiglu_a16_t3(launch)
+                .map_err(|source| GpuError::launch("preparing NVFP4 A16 B=3", source))?,
+            b4: module
+                .prepare_nvfp4_swiglu_a16_t4(launch)
+                .map_err(|source| GpuError::launch("preparing NVFP4 A16 B=4", source))?,
+        })
+    }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        slot: A16Slot,
+        input: *const u16,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        weight_scale_reciprocal: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($method:ident, $prepared:ident, $label:literal) => {
+                module
+                    .$method(
+                        stream,
+                        &self.$prepared,
+                        input.cast::<u32>(),
+                        weight_codes.cast::<u32>(),
+                        weight_scales,
+                        weight_scale_reciprocal,
+                        output,
+                    )
+                    .map_err(|source| GpuError::launch($label, source))
+            };
+        }
+
+        match slot {
+            A16Slot::B1 => launch!(nvfp4_swiglu_a16_t1, b1, "launching NVFP4 A16 B=1"),
+            A16Slot::B2 => launch!(nvfp4_swiglu_a16_t2, b2, "launching NVFP4 A16 B=2"),
+            A16Slot::B3 => launch!(nvfp4_swiglu_a16_t3, b3, "launching NVFP4 A16 B=3"),
+            A16Slot::B4 => launch!(nvfp4_swiglu_a16_t4, b4, "launching NVFP4 A16 B=4"),
+        }
+    }
+}
+
+impl SwiGluA16Routes<Qwen35_9B> for PreparedQwen35A16Routes {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let launch = a16_launch_config::<Qwen35_9B>();
+
+        Ok(Self {
+            b1: module
+                .prepare_qwen35_nvfp4_swiglu_a16_t1(launch)
+                .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 A16 B=1", source))?,
+            b2: module
+                .prepare_qwen35_nvfp4_swiglu_a16_t2(launch)
+                .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 A16 B=2", source))?,
+            b3: module
+                .prepare_qwen35_nvfp4_swiglu_a16::<3>(launch)
+                .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 A16 B=3", source))?,
+            b4: module
+                .prepare_qwen35_nvfp4_swiglu_a16::<4>(launch)
+                .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 A16 B=4", source))?,
+        })
+    }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        slot: A16Slot,
+        input: *const u16,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        weight_scale_reciprocal: f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($method:ident $(::<$tokens:literal>)?, $prepared:ident, $label:literal) => {
+                module
+                    .$method$(::<$tokens>)?(
+                        stream,
+                        &self.$prepared,
+                        input.cast::<u32>(),
+                        weight_codes.cast::<u32>(),
+                        weight_scales,
+                        weight_scale_reciprocal,
+                        output,
+                    )
+                    .map_err(|source| GpuError::launch($label, source))
+            };
+        }
+
+        match slot {
+            A16Slot::B1 => launch!(
+                qwen35_nvfp4_swiglu_a16_t1,
+                b1,
+                "launching Qwen3.5 NVFP4 A16 B=1"
+            ),
+            A16Slot::B2 => launch!(
+                qwen35_nvfp4_swiglu_a16_t2,
+                b2,
+                "launching Qwen3.5 NVFP4 A16 B=2"
+            ),
+            A16Slot::B3 => launch!(
+                qwen35_nvfp4_swiglu_a16::<3>,
+                b3,
+                "launching Qwen3.5 NVFP4 A16 B=3"
+            ),
+            A16Slot::B4 => launch!(
+                qwen35_nvfp4_swiglu_a16::<4>,
+                b4,
+                "launching Qwen3.5 NVFP4 A16 B=4"
+            ),
+        }
+    }
+}
+
+// The Qwen3.8 W4A4 entries compile that model's exact extents, so they stay
+// bound to the sealed artifact-level architecture.
+impl<A: Sm120Arch, const TOKENS: usize> SwiGluW4a4Route<A> for PreparedW4a4Route<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let (quantize_launch, projection_launch) = w4a4_launch_configs::<A>(TOKENS, "")?;
         let quantize = module
-            .prepare_nvfp4_quantize::<TOKENS>(LaunchConfig1D::new(quantize_blocks, 256, 0))
+            .prepare_nvfp4_quantize::<TOKENS>(quantize_launch)
             .map_err(|source| {
                 GpuError::launch("preparing NVFP4 activation quantization", source)
             })?;
         let projection = module
-            .prepare_nvfp4_swiglu_w4a4::<TOKENS>(LaunchConfig2D::new(
-                (projection_blocks, token_tiles),
-                (W4A4_THREADS, 1),
-                0,
-            ))
+            .prepare_nvfp4_swiglu_w4a4::<TOKENS>(projection_launch)
             .map_err(|source| GpuError::launch("preparing NVFP4 W4A4 SwiGLU", source))?;
 
         Ok(Self {
@@ -1457,7 +1819,6 @@ impl<const TOKENS: usize> PreparedW4a4Route<TOKENS> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
@@ -1498,43 +1859,17 @@ impl<const TOKENS: usize> PreparedW4a4Route<TOKENS> {
     }
 }
 
-struct PreparedQwen35W4a4Route<const TOKENS: usize> {
-    quantize: PreparedLaunch<kernels::__qwen35_nvfp4_quantize_CudaKernel<TOKENS>>,
-    projection: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_w4a4_CudaKernel<TOKENS>>,
-}
-
-impl<const TOKENS: usize> PreparedQwen35W4a4Route<TOKENS> {
+impl<const TOKENS: usize> SwiGluW4a4Route<Qwen35_9B> for PreparedQwen35W4a4Route<TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let groups_per_row = Qwen35_9B::HIDDEN / GROUP_K;
-        // Each 4,096-wide row has exactly 256 scale groups, so one quantizer
-        // CTA owns each token without changing the 16-value group arithmetic.
-        let quantize_blocks = (TOKENS * groups_per_row).div_ceil(256);
-        let quantize_blocks = u32::try_from(quantize_blocks).map_err(|_| {
-            GpuError::invalid_launch("Qwen3.5 NVFP4 quantization grid exceeds CUDA width")
-        })?;
-        // One CTA publishes 32 gate/up pairs; 12,288 output rows therefore
-        // use 384 CTAs, with the qualified 64-column MMA tile unchanged.
-        let projection_blocks =
-            u32::try_from(Qwen35_9B::INTERMEDIATE / ROWS_PER_BRANCH).map_err(|_| {
-                GpuError::invalid_launch("Qwen3.5 NVFP4 projection grid exceeds CUDA width")
-            })?;
-        // The retained 48-row tile needs 1/2/3/22 token tiles at
-        // T=32/64/128/1024. Extending grid Y preserves every m16n8k64
-        // accumulation and only assigns the same arithmetic to more rows.
-        let token_tiles = u32::try_from(TOKENS.div_ceil(SMALL_BLOCK_M)).map_err(|_| {
-            GpuError::invalid_launch("Qwen3.5 NVFP4 token grid exceeds CUDA height")
-        })?;
+        let (quantize_launch, projection_launch) =
+            w4a4_launch_configs::<Qwen35_9B>(TOKENS, "Qwen3.5 ")?;
         let quantize = module
-            .prepare_qwen35_nvfp4_quantize::<TOKENS>(LaunchConfig1D::new(quantize_blocks, 256, 0))
+            .prepare_qwen35_nvfp4_quantize::<TOKENS>(quantize_launch)
             .map_err(|source| {
                 GpuError::launch("preparing Qwen3.5 NVFP4 activation quantization", source)
             })?;
         let projection = module
-            .prepare_qwen35_nvfp4_swiglu_w4a4::<TOKENS>(LaunchConfig2D::new(
-                (projection_blocks, token_tiles),
-                (W4A4_THREADS, 1),
-                0,
-            ))
+            .prepare_qwen35_nvfp4_swiglu_w4a4::<TOKENS>(projection_launch)
             .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 W4A4 SwiGLU", source))?;
 
         Ok(Self {
@@ -1543,7 +1878,6 @@ impl<const TOKENS: usize> PreparedQwen35W4a4Route<TOKENS> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
@@ -1581,6 +1915,124 @@ impl<const TOKENS: usize> PreparedQwen35W4a4Route<TOKENS> {
                 1.0 / (input_scale_divisor * weight_scale_divisor),
             )
             .map_err(|source| GpuError::launch("launching Qwen3.5 NVFP4 W4A4 SwiGLU", source))
+    }
+}
+
+// `route` never selects an unadmitted batch, so this is the defensive tail of
+// a route that owns no entry.
+impl<A: Arch> SwiGluW4a4Route<A> for UnadmittedRoute {
+    fn prepare(_module: &kernels::LoadedModule) -> GpuResult<Self> {
+        Ok(Self)
+    }
+
+    unsafe fn launch(
+        &self,
+        _module: &kernels::LoadedModule,
+        _stream: &CudaStream,
+        _input: *const u16,
+        _activation_codes: *mut u8,
+        _activation_scales: *mut u8,
+        _weight_codes: *const u8,
+        _weight_scales: *const u8,
+        _input_scale_divisor: f32,
+        _weight_scale_divisor: f32,
+        _output: *mut u16,
+    ) -> GpuResult<()> {
+        Err(GpuError::invalid_launch(
+            "NVFP4 W4A4 SwiGLU route is not admitted for this architecture",
+        ))
+    }
+}
+
+/// Qwen3.8 entry table: four concrete A16 entries, W4A4 wherever the measured
+/// schedule selects it, and this model's own prefill entries.
+pub struct Qwen38Nvfp4SwiGluEntries;
+
+/// Qwen3.5 entry table: its own A16 entry family and a complete `B=1..=8`
+/// W4A4 family, so the measured crossover stays reproducible.
+pub struct Qwen35Nvfp4SwiGluEntries;
+
+impl private::Sealed for Qwen38Nvfp4SwiGluEntries {}
+impl private::Sealed for Qwen35Nvfp4SwiGluEntries {}
+
+impl<A: Sm120Arch> Nvfp4SwiGluEntries<A> for Qwen38Nvfp4SwiGluEntries {
+    type A16 = PreparedA16Routes;
+    type W4a4Decode<const TOKENS: usize> = PreparedW4a4Route<TOKENS>;
+    type W4a4Crossover<const TOKENS: usize> = UnadmittedRoute;
+    type W4a4Prefill<const TOKENS: usize> = PreparedW4a4Route<TOKENS>;
+
+    const LABEL: &'static str = "";
+    const MODULE_CONTEXT: &'static str = "loading the NVFP4 SwiGLU module";
+    const A16_VALIDATES_INPUT_DIVISOR: bool = true;
+
+    // Transcribed from `Nvfp4SwiGluOp::launch`'s dispatch: B=1 and B=5..=8
+    // dynamically quantize and use W4A4 MMA; B=2..=4 preserve the represented
+    // BF16 activation and use the A16 schedule; exact T=32,64,128,1024 prefill
+    // rows use W4A4 dynamic quantization and MMA.
+    fn route(rows: usize) -> Option<SwiGluRoute> {
+        match rows {
+            1 => Some(SwiGluRoute::W4a4B1),
+            2 => Some(SwiGluRoute::A16(A16Slot::B2)),
+            3 => Some(SwiGluRoute::A16(A16Slot::B3)),
+            4 => Some(SwiGluRoute::A16(A16Slot::B4)),
+            5 => Some(SwiGluRoute::W4a4B5),
+            6 => Some(SwiGluRoute::W4a4B6),
+            7 => Some(SwiGluRoute::W4a4B7),
+            8 => Some(SwiGluRoute::W4a4B8),
+            _ => prefill_route(rows),
+        }
+    }
+
+    fn unadmitted_rows(rows: usize) -> GpuError {
+        GpuError::invalid_launch(format!(
+            "NVFP4 SwiGLU row count {rows} is outside the exact B=1..=8, T=32,64,128,1024 routes"
+        ))
+    }
+
+    fn ptx_names() -> Vec<&'static str> {
+        nvfp4_swiglu_ptx_names().to_vec()
+    }
+}
+
+impl Nvfp4SwiGluEntries<Qwen35_9B> for Qwen35Nvfp4SwiGluEntries {
+    type A16 = PreparedQwen35A16Routes;
+    type W4a4Decode<const TOKENS: usize> = PreparedQwen35W4a4Route<TOKENS>;
+    type W4a4Crossover<const TOKENS: usize> = PreparedQwen35W4a4Route<TOKENS>;
+    type W4a4Prefill<const TOKENS: usize> = PreparedQwen35W4a4Route<TOKENS>;
+
+    const LABEL: &'static str = "Qwen3.5 ";
+    const MODULE_CONTEXT: &'static str = "loading the Qwen3.5 NVFP4 SwiGLU module";
+    const A16_VALIDATES_INPUT_DIVISOR: bool = false;
+
+    // Transcribed from `qwen35_swiglu_schedule`. At 2,197/14,001 MHz
+    // SM/memory clocks, paired device-path medians for A16/W4A4 were
+    // 28.988/27.032 us (B=1), 25.623/27.023 (B=2), 30.726/27.148 (B=3), and
+    // 37.498/27.172 (B=4). Thus only B=2 keeps represented BF16 activations;
+    // the row formula is unchanged in either schedule and both candidates pass
+    // the same independent FP64 oracle. Prefill rows are not admitted here:
+    // they reach the device through `launch_prefill`.
+    fn route(rows: usize) -> Option<SwiGluRoute> {
+        match rows {
+            1 => Some(SwiGluRoute::W4a4B1),
+            2 => Some(SwiGluRoute::A16(A16Slot::B2)),
+            3 => Some(SwiGluRoute::W4a4B3),
+            4 => Some(SwiGluRoute::W4a4B4),
+            5 => Some(SwiGluRoute::W4a4B5),
+            6 => Some(SwiGluRoute::W4a4B6),
+            7 => Some(SwiGluRoute::W4a4B7),
+            8 => Some(SwiGluRoute::W4a4B8),
+            _ => None,
+        }
+    }
+
+    fn unadmitted_rows(rows: usize) -> GpuError {
+        GpuError::invalid_launch(format!(
+            "Qwen3.5 NVFP4 SwiGLU batch {rows} is not an exact B=1..={MAX_BATCH} route"
+        ))
+    }
+
+    fn ptx_names() -> Vec<&'static str> {
+        qwen35_nvfp4_swiglu_ptx_names().to_vec()
     }
 }
 
@@ -1646,73 +2098,72 @@ pub(crate) fn qwen35_nvfp4_swiglu_ptx_names() -> [&'static str; 28] {
     ]
 }
 
-/// Prepared A16 and W4A4 routes for the exact NVFP4 MLP gate/up operation.
-pub struct Nvfp4SwiGluOp {
+/// Prepared A16 and W4A4 routes for one admitted architecture's exact NVFP4
+/// MLP gate/up operation.
+///
+/// Both schedules keep the A16 (`B=1..=4`) and W4A4 candidates their measured
+/// crossover compared, even though production selects one per batch.
+pub struct Nvfp4SwiGluOp<A: Arch = Qwen38_27B, E: Nvfp4SwiGluEntries<A> = Qwen38Nvfp4SwiGluEntries>
+{
     module: kernels::LoadedModule,
-    a16_t1: PreparedLaunch<kernels::__nvfp4_swiglu_a16_t1_CudaKernel>,
-    a16_t2: PreparedLaunch<kernels::__nvfp4_swiglu_a16_t2_CudaKernel>,
-    a16_t3: PreparedLaunch<kernels::__nvfp4_swiglu_a16_t3_CudaKernel>,
-    a16_t4: PreparedLaunch<kernels::__nvfp4_swiglu_a16_t4_CudaKernel>,
-    w4a4_b1: PreparedW4a4Route<1>,
-    w4a4_b5: PreparedW4a4Route<5>,
-    w4a4_b6: PreparedW4a4Route<6>,
-    w4a4_b7: PreparedW4a4Route<7>,
-    w4a4_b8: PreparedW4a4Route<8>,
-    w4a4_t32: PreparedW4a4Route<32>,
-    w4a4_t64: PreparedW4a4Route<64>,
-    w4a4_t128: PreparedW4a4Route<128>,
-    w4a4_t1024: PreparedW4a4Route<1_024>,
+    a16: E::A16,
+    w4a4_b1: E::W4a4Decode<1>,
+    w4a4_b2: E::W4a4Crossover<2>,
+    w4a4_b3: E::W4a4Crossover<3>,
+    w4a4_b4: E::W4a4Crossover<4>,
+    w4a4_b5: E::W4a4Decode<5>,
+    w4a4_b6: E::W4a4Decode<6>,
+    w4a4_b7: E::W4a4Decode<7>,
+    w4a4_b8: E::W4a4Decode<8>,
+    w4a4_t32: E::W4a4Prefill<32>,
+    w4a4_t64: E::W4a4Prefill<64>,
+    w4a4_t128: E::W4a4Prefill<128>,
+    w4a4_t1024: E::W4a4Prefill<1_024>,
 }
 
-impl Nvfp4SwiGluOp {
+/// Prepared production and comparison routes for exact Qwen3.5 NVFP4 gate/up.
+pub type Qwen35Nvfp4SwiGluOp = Nvfp4SwiGluOp<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>;
+
+impl<A: Arch, E: Nvfp4SwiGluEntries<A>> Nvfp4SwiGluOp<A, E> {
     /// Loads the embedded SM120 module and prepares every admitted route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        let _ = nvfp4_swiglu_ptx_names();
+        let _ = E::ptx_names();
         // SAFETY: this crate owns the embedded cuda-oxide module artifact.
         let module = unsafe { kernels::load(context) }
-            .map_err(|source| GpuError::module("loading the NVFP4 SwiGLU module", source))?;
+            .map_err(|source| GpuError::module(E::MODULE_CONTEXT, source))?;
 
         Ok(Self {
-            a16_t1: module
-                .prepare_nvfp4_swiglu_a16_t1(a16_config())
-                .map_err(|source| GpuError::launch("preparing NVFP4 A16 B=1", source))?,
-            a16_t2: module
-                .prepare_nvfp4_swiglu_a16_t2(a16_config())
-                .map_err(|source| GpuError::launch("preparing NVFP4 A16 B=2", source))?,
-            a16_t3: module
-                .prepare_nvfp4_swiglu_a16_t3(a16_config())
-                .map_err(|source| GpuError::launch("preparing NVFP4 A16 B=3", source))?,
-            a16_t4: module
-                .prepare_nvfp4_swiglu_a16_t4(a16_config())
-                .map_err(|source| GpuError::launch("preparing NVFP4 A16 B=4", source))?,
-            w4a4_b1: PreparedW4a4Route::prepare(&module)?,
-            w4a4_b5: PreparedW4a4Route::prepare(&module)?,
-            w4a4_b6: PreparedW4a4Route::prepare(&module)?,
-            w4a4_b7: PreparedW4a4Route::prepare(&module)?,
-            w4a4_b8: PreparedW4a4Route::prepare(&module)?,
-            w4a4_t32: PreparedW4a4Route::prepare(&module)?,
-            w4a4_t64: PreparedW4a4Route::prepare(&module)?,
-            w4a4_t128: PreparedW4a4Route::prepare(&module)?,
-            w4a4_t1024: PreparedW4a4Route::prepare(&module)?,
+            a16: E::A16::prepare(&module)?,
+            w4a4_b1: E::W4a4Decode::<1>::prepare(&module)?,
+            w4a4_b2: E::W4a4Crossover::<2>::prepare(&module)?,
+            w4a4_b3: E::W4a4Crossover::<3>::prepare(&module)?,
+            w4a4_b4: E::W4a4Crossover::<4>::prepare(&module)?,
+            w4a4_b5: E::W4a4Decode::<5>::prepare(&module)?,
+            w4a4_b6: E::W4a4Decode::<6>::prepare(&module)?,
+            w4a4_b7: E::W4a4Decode::<7>::prepare(&module)?,
+            w4a4_b8: E::W4a4Decode::<8>::prepare(&module)?,
+            w4a4_t32: E::W4a4Prefill::<32>::prepare(&module)?,
+            w4a4_t64: E::W4a4Prefill::<64>::prepare(&module)?,
+            w4a4_t128: E::W4a4Prefill::<128>::prepare(&module)?,
+            w4a4_t1024: E::W4a4Prefill::<1_024>::prepare(&module)?,
             module,
         })
     }
 
-    /// Executes the retained production route for exact decode or prefill rows.
-    ///
-    /// B=1 and B=5..8 dynamically quantize the input and use W4A4 MMA; B=2..4
-    /// preserve the represented BF16 activation and use the A16 schedule. Exact
-    /// `T=32,64,128,1024` prefill routes use W4A4 dynamic quantization and MMA.
+    /// Executes the retained production route for this architecture's exact
+    /// decode rows, and for its exact prefill rows where the table admits them.
     ///
     /// # Safety
     ///
-    /// `input` covers `rows * 5_120` BF16 values; activation scratch covers
-    /// `rows * 2_560` code bytes and `rows * 320` scale bytes; `weight_codes`
-    /// covers the fused packed `[34_816, 5_120]` plane; `weight_scales` covers
-    /// its swizzled `[34_816, 320]` plane; and `output` covers
-    /// `rows * 17_408` BF16 values. Four-byte-loaded planes are four-byte
-    /// aligned. Divisors are finite and positive. All allocations belong to
-    /// `stream`'s context, remain live through completion, and do not overlap.
+    /// `input` covers `rows * A::HIDDEN` BF16 values; activation scratch covers
+    /// `rows * A::HIDDEN / 2` code bytes and `rows * A::HIDDEN / 16` scale
+    /// bytes; `weight_codes` covers the fused packed
+    /// `[2 * A::INTERMEDIATE, A::HIDDEN]` plane; `weight_scales` covers its
+    /// swizzled `[2 * A::INTERMEDIATE, A::HIDDEN / 16]` plane; and `output`
+    /// covers `rows * A::INTERMEDIATE` BF16 values. Four-byte-loaded planes are
+    /// four-byte aligned. Divisors are finite and positive. All allocations
+    /// belong to `stream`'s context, remain live through completion, and do not
+    /// overlap.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
@@ -1727,24 +2178,17 @@ impl Nvfp4SwiGluOp {
         weight_scale_divisor: f32,
         output: *mut u16,
     ) -> GpuResult<()> {
-        if !(1..=MAX_BATCH).contains(&rows) && !PREFILL_ROWS.contains(&rows) {
-            return Err(GpuError::invalid_launch(format!(
-                "NVFP4 SwiGLU row count {rows} is outside the exact B=1..=8, T=32,64,128,1024 routes"
-            )));
+        let Some(route) = E::route(rows) else {
+            return Err(E::unadmitted_rows(rows));
+        };
+        if validates_input_divisor::<A, E>(route) {
+            check_input_divisor::<A, E>(input_scale_divisor)?;
         }
-        if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "NVFP4 input scale divisor must be finite and positive",
-            ));
-        }
-        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "NVFP4 weight scale divisor must be finite and positive",
-            ));
-        }
+        check_weight_divisor::<A, E>(weight_scale_divisor)?;
 
         macro_rules! w4a4 {
             ($route:ident) => {
+                // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
                     self.$route.launch(
                         &self.module,
@@ -1762,32 +2206,38 @@ impl Nvfp4SwiGluOp {
             };
         }
 
-        match rows {
-            1 => w4a4!(w4a4_b1),
-            2..=4 => unsafe {
-                self.launch_a16(
-                    stream,
-                    rows,
-                    input,
-                    weight_codes,
-                    weight_scales,
-                    weight_scale_divisor,
-                    output,
-                )
-            },
-            5 => w4a4!(w4a4_b5),
-            6 => w4a4!(w4a4_b6),
-            7 => w4a4!(w4a4_b7),
-            8 => w4a4!(w4a4_b8),
-            32 => w4a4!(w4a4_t32),
-            64 => w4a4!(w4a4_t64),
-            128 => w4a4!(w4a4_t128),
-            1_024 => w4a4!(w4a4_t1024),
-            _ => unreachable!("row count was validated above"),
+        match route {
+            SwiGluRoute::A16(slot) => {
+                // SAFETY: the public method's pointer contract is unchanged by dispatch.
+                unsafe {
+                    self.a16.launch(
+                        &self.module,
+                        stream,
+                        slot,
+                        input,
+                        weight_codes,
+                        weight_scales,
+                        1.0 / weight_scale_divisor,
+                        output,
+                    )
+                }
+            }
+            SwiGluRoute::W4a4B1 => w4a4!(w4a4_b1),
+            SwiGluRoute::W4a4B2 => w4a4!(w4a4_b2),
+            SwiGluRoute::W4a4B3 => w4a4!(w4a4_b3),
+            SwiGluRoute::W4a4B4 => w4a4!(w4a4_b4),
+            SwiGluRoute::W4a4B5 => w4a4!(w4a4_b5),
+            SwiGluRoute::W4a4B6 => w4a4!(w4a4_b6),
+            SwiGluRoute::W4a4B7 => w4a4!(w4a4_b7),
+            SwiGluRoute::W4a4B8 => w4a4!(w4a4_b8),
+            SwiGluRoute::W4a4T32 => w4a4!(w4a4_t32),
+            SwiGluRoute::W4a4T64 => w4a4!(w4a4_t64),
+            SwiGluRoute::W4a4T128 => w4a4!(w4a4_t128),
+            SwiGluRoute::W4a4T1024 => w4a4!(w4a4_t1024),
         }
     }
 
-    /// Executes the retained A16 comparison route for exact `B=1..=4`.
+    /// Executes the retained represented-BF16 A16 route for exact `B=1..=4`.
     ///
     /// # Safety
     ///
@@ -1804,259 +2254,32 @@ impl Nvfp4SwiGluOp {
         weight_scale_divisor: f32,
         output: *mut u16,
     ) -> GpuResult<()> {
-        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "NVFP4 weight scale divisor must be finite and positive",
-            ));
-        }
+        check_weight_divisor::<A, E>(weight_scale_divisor)?;
 
-        let reciprocal = 1.0 / weight_scale_divisor;
-        macro_rules! launch {
-            ($method:ident, $prepared:ident, $label:literal) => {
-                self.module
-                    .$method(
-                        stream,
-                        &self.$prepared,
-                        input.cast::<u32>(),
-                        weight_codes.cast::<u32>(),
-                        weight_scales,
-                        reciprocal,
-                        output,
-                    )
-                    .map_err(|source| GpuError::launch($label, source))
-            };
-        }
+        let Some(slot) = a16_slot(batch) else {
+            return Err(GpuError::invalid_launch(format!(
+                "{}NVFP4 A16 batch {batch} is not an exact B=1..=4 route",
+                E::LABEL
+            )));
+        };
 
-        match batch {
-            1 => launch!(nvfp4_swiglu_a16_t1, a16_t1, "launching NVFP4 A16 B=1"),
-            2 => launch!(nvfp4_swiglu_a16_t2, a16_t2, "launching NVFP4 A16 B=2"),
-            3 => launch!(nvfp4_swiglu_a16_t3, a16_t3, "launching NVFP4 A16 B=3"),
-            4 => launch!(nvfp4_swiglu_a16_t4, a16_t4, "launching NVFP4 A16 B=4"),
-            _ => Err(GpuError::invalid_launch(format!(
-                "NVFP4 A16 batch {batch} is not an exact B=1..=4 route"
-            ))),
+        // SAFETY: the public method's pointer contract is unchanged by dispatch.
+        unsafe {
+            self.a16.launch(
+                &self.module,
+                stream,
+                slot,
+                input,
+                weight_codes,
+                weight_scales,
+                1.0 / weight_scale_divisor,
+                output,
+            )
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Qwen35SwiGluSchedule {
-    A16,
-    W4a4,
-}
-
-fn qwen35_swiglu_schedule(batch: usize) -> Option<Qwen35SwiGluSchedule> {
-    // At 2,197/14,001 MHz SM/memory clocks, paired device-path medians for
-    // A16/W4A4 were 28.988/27.032 us (B=1), 25.623/27.023 (B=2),
-    // 30.726/27.148 (B=3), and 37.498/27.172 (B=4). Thus only B=2 keeps
-    // represented BF16 activations; the row formula is unchanged in either
-    // schedule and both candidates pass the same independent FP64 oracle.
-    match batch {
-        2 => Some(Qwen35SwiGluSchedule::A16),
-        1 | 3..=8 => Some(Qwen35SwiGluSchedule::W4a4),
-        _ => None,
-    }
-}
-
-/// Prepared production and comparison routes for exact Qwen3.5 NVFP4 gate/up.
-///
-/// A16 (`B=1..=4`) and W4A4 (`B=1..=8`) remain available so the measured
-/// crossover can be reproduced even though production selects one per batch.
-pub struct Qwen35Nvfp4SwiGluOp {
-    module: kernels::LoadedModule,
-    a16_t1: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_a16_t1_CudaKernel>,
-    a16_t2: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_a16_t2_CudaKernel>,
-    a16_t3: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_a16_CudaKernel<3>>,
-    a16_t4: PreparedLaunch<kernels::__qwen35_nvfp4_swiglu_a16_CudaKernel<4>>,
-    w4a4_b1: PreparedQwen35W4a4Route<1>,
-    w4a4_b2: PreparedQwen35W4a4Route<2>,
-    w4a4_b3: PreparedQwen35W4a4Route<3>,
-    w4a4_b4: PreparedQwen35W4a4Route<4>,
-    w4a4_b5: PreparedQwen35W4a4Route<5>,
-    w4a4_b6: PreparedQwen35W4a4Route<6>,
-    w4a4_b7: PreparedQwen35W4a4Route<7>,
-    w4a4_b8: PreparedQwen35W4a4Route<8>,
-    w4a4_t32: PreparedQwen35W4a4Route<32>,
-    w4a4_t64: PreparedQwen35W4a4Route<64>,
-    w4a4_t128: PreparedQwen35W4a4Route<128>,
-    w4a4_t1024: PreparedQwen35W4a4Route<1_024>,
 }
 
 impl Qwen35Nvfp4SwiGluOp {
-    /// Loads the SM120 module and prepares every Qwen3.5 candidate route.
-    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        let _ = qwen35_nvfp4_swiglu_ptx_names();
-        // SAFETY: this crate owns the embedded cuda-oxide module artifact.
-        let module = unsafe { kernels::load(context) }.map_err(|source| {
-            GpuError::module("loading the Qwen3.5 NVFP4 SwiGLU module", source)
-        })?;
-        let launch = qwen35_a16_config();
-
-        Ok(Self {
-            a16_t1: module
-                .prepare_qwen35_nvfp4_swiglu_a16_t1(launch)
-                .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 A16 B=1", source))?,
-            a16_t2: module
-                .prepare_qwen35_nvfp4_swiglu_a16_t2(launch)
-                .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 A16 B=2", source))?,
-            a16_t3: module
-                .prepare_qwen35_nvfp4_swiglu_a16::<3>(launch)
-                .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 A16 B=3", source))?,
-            a16_t4: module
-                .prepare_qwen35_nvfp4_swiglu_a16::<4>(launch)
-                .map_err(|source| GpuError::launch("preparing Qwen3.5 NVFP4 A16 B=4", source))?,
-            w4a4_b1: PreparedQwen35W4a4Route::prepare(&module)?,
-            w4a4_b2: PreparedQwen35W4a4Route::prepare(&module)?,
-            w4a4_b3: PreparedQwen35W4a4Route::prepare(&module)?,
-            w4a4_b4: PreparedQwen35W4a4Route::prepare(&module)?,
-            w4a4_b5: PreparedQwen35W4a4Route::prepare(&module)?,
-            w4a4_b6: PreparedQwen35W4a4Route::prepare(&module)?,
-            w4a4_b7: PreparedQwen35W4a4Route::prepare(&module)?,
-            w4a4_b8: PreparedQwen35W4a4Route::prepare(&module)?,
-            w4a4_t32: PreparedQwen35W4a4Route::prepare(&module)?,
-            w4a4_t64: PreparedQwen35W4a4Route::prepare(&module)?,
-            w4a4_t128: PreparedQwen35W4a4Route::prepare(&module)?,
-            w4a4_t1024: PreparedQwen35W4a4Route::prepare(&module)?,
-            module,
-        })
-    }
-
-    /// Executes the measured exact-batch route selected for Qwen3.5.
-    ///
-    /// # Safety
-    ///
-    /// `input` covers `batch * 4_096` BF16 values; scratch covers
-    /// `batch * 2_048` code bytes and `batch * 256` scale bytes;
-    /// `weight_codes` covers packed `[24_576, 4_096]`, `weight_scales`
-    /// covers its swizzled `[24_576, 256]` plane, and `output` covers
-    /// `batch * 12_288` BF16 values. Four-byte-loaded planes are aligned.
-    /// Divisors are finite and positive. Allocations belong to `stream`'s
-    /// context, remain live through completion, and do not overlap.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn launch(
-        &self,
-        stream: &CudaStream,
-        batch: usize,
-        input: *const u16,
-        activation_codes: *mut u8,
-        activation_scales: *mut u8,
-        weight_codes: *const u8,
-        weight_scales: *const u8,
-        input_scale_divisor: f32,
-        weight_scale_divisor: f32,
-        output: *mut u16,
-    ) -> GpuResult<()> {
-        match qwen35_swiglu_schedule(batch) {
-            Some(Qwen35SwiGluSchedule::A16) => unsafe {
-                self.launch_a16(
-                    stream,
-                    batch,
-                    input,
-                    weight_codes,
-                    weight_scales,
-                    weight_scale_divisor,
-                    output,
-                )
-            },
-            Some(Qwen35SwiGluSchedule::W4a4) => unsafe {
-                self.launch_w4a4(
-                    stream,
-                    batch,
-                    input,
-                    activation_codes,
-                    activation_scales,
-                    weight_codes,
-                    weight_scales,
-                    input_scale_divisor,
-                    weight_scale_divisor,
-                    output,
-                )
-            },
-            None => Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 NVFP4 SwiGLU batch {batch} is not an exact B=1..=8 route"
-            ))),
-        }
-    }
-
-    /// Executes the represented-BF16 comparison route at exact `B=1..=4`.
-    ///
-    /// # Safety
-    ///
-    /// The corresponding input, weight, scale, output, alignment, lifetime,
-    /// context, and overlap requirements are documented by [`Self::launch`].
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn launch_a16(
-        &self,
-        stream: &CudaStream,
-        batch: usize,
-        input: *const u16,
-        weight_codes: *const u8,
-        weight_scales: *const u8,
-        weight_scale_divisor: f32,
-        output: *mut u16,
-    ) -> GpuResult<()> {
-        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 NVFP4 weight scale divisor must be finite and positive",
-            ));
-        }
-
-        let reciprocal = 1.0 / weight_scale_divisor;
-        match batch {
-            1 => self
-                .module
-                .qwen35_nvfp4_swiglu_a16_t1(
-                    stream,
-                    &self.a16_t1,
-                    input.cast::<u32>(),
-                    weight_codes.cast::<u32>(),
-                    weight_scales,
-                    reciprocal,
-                    output,
-                )
-                .map_err(|source| GpuError::launch("launching Qwen3.5 NVFP4 A16 B=1", source)),
-            2 => self
-                .module
-                .qwen35_nvfp4_swiglu_a16_t2(
-                    stream,
-                    &self.a16_t2,
-                    input.cast::<u32>(),
-                    weight_codes.cast::<u32>(),
-                    weight_scales,
-                    reciprocal,
-                    output,
-                )
-                .map_err(|source| GpuError::launch("launching Qwen3.5 NVFP4 A16 B=2", source)),
-            3 => self
-                .module
-                .qwen35_nvfp4_swiglu_a16::<3>(
-                    stream,
-                    &self.a16_t3,
-                    input.cast::<u32>(),
-                    weight_codes.cast::<u32>(),
-                    weight_scales,
-                    reciprocal,
-                    output,
-                )
-                .map_err(|source| GpuError::launch("launching Qwen3.5 NVFP4 A16 B=3", source)),
-            4 => self
-                .module
-                .qwen35_nvfp4_swiglu_a16::<4>(
-                    stream,
-                    &self.a16_t4,
-                    input.cast::<u32>(),
-                    weight_codes.cast::<u32>(),
-                    weight_scales,
-                    reciprocal,
-                    output,
-                )
-                .map_err(|source| GpuError::launch("launching Qwen3.5 NVFP4 A16 B=4", source)),
-            _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 NVFP4 A16 batch {batch} is not an exact B=1..=4 route"
-            ))),
-        }
-    }
-
     /// Quantizes BF16 activations and executes W4A4 at exact `B=1..=8`.
     ///
     /// # Safety
@@ -2076,19 +2299,12 @@ impl Qwen35Nvfp4SwiGluOp {
         weight_scale_divisor: f32,
         output: *mut u16,
     ) -> GpuResult<()> {
-        if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 NVFP4 input scale divisor must be finite and positive",
-            ));
-        }
-        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 NVFP4 weight scale divisor must be finite and positive",
-            ));
-        }
+        check_input_divisor::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>(input_scale_divisor)?;
+        check_weight_divisor::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>(weight_scale_divisor)?;
 
         macro_rules! launch {
             ($route:ident) => {
+                // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
                     self.$route.launch(
                         &self.module,
@@ -2116,7 +2332,7 @@ impl Qwen35Nvfp4SwiGluOp {
             7 => launch!(w4a4_b7),
             8 => launch!(w4a4_b8),
             _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 NVFP4 W4A4 batch {batch} is not an exact B=1..=8 route"
+                "Qwen3.5 NVFP4 W4A4 batch {batch} is not an exact B=1..={MAX_BATCH} route"
             ))),
         }
     }
@@ -2140,24 +2356,17 @@ impl Qwen35Nvfp4SwiGluOp {
         weight_scale_divisor: f32,
         output: *mut u16,
     ) -> GpuResult<()> {
-        if !PREFILL_ROWS.contains(&rows) {
+        let Some(route) = prefill_route(rows) else {
             return Err(GpuError::invalid_launch(format!(
                 "Qwen3.5 NVFP4 SwiGLU prefill row count {rows} is outside the exact T=32,64,128,1024 routes"
             )));
-        }
-        if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 NVFP4 input scale divisor must be finite and positive",
-            ));
-        }
-        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 NVFP4 weight scale divisor must be finite and positive",
-            ));
-        }
+        };
+        check_input_divisor::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>(input_scale_divisor)?;
+        check_weight_divisor::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>(weight_scale_divisor)?;
 
         macro_rules! launch {
             ($route:ident) => {
+                // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
                     self.$route.launch(
                         &self.module,
@@ -2175,23 +2384,106 @@ impl Qwen35Nvfp4SwiGluOp {
             };
         }
 
-        match rows {
-            32 => launch!(w4a4_t32),
-            64 => launch!(w4a4_t64),
-            128 => launch!(w4a4_t128),
-            1_024 => launch!(w4a4_t1024),
-            _ => unreachable!("row count was validated above"),
+        match route {
+            SwiGluRoute::W4a4T32 => launch!(w4a4_t32),
+            SwiGluRoute::W4a4T64 => launch!(w4a4_t64),
+            SwiGluRoute::W4a4T128 => launch!(w4a4_t128),
+            SwiGluRoute::W4a4T1024 => launch!(w4a4_t1024),
+            _ => unreachable!("prefill_route only selects the exact T routes"),
         }
     }
+}
+
+// Whether `launch` rejects an invalid activation-scale divisor before it
+// dispatches `route`. Transcribed from the two dispatches this wrapper
+// replaces: Qwen3.8's validated both divisors before selecting a schedule, and
+// Qwen3.5's validated inside the selected route, so only the W4A4 routes and
+// Qwen3.8's A16 batches read the activation divisor before dispatch.
+fn validates_input_divisor<A: Arch, E: Nvfp4SwiGluEntries<A>>(route: SwiGluRoute) -> bool {
+    E::A16_VALIDATES_INPUT_DIVISOR || !matches!(route, SwiGluRoute::A16(_))
+}
+
+fn check_input_divisor<A: Arch, E: Nvfp4SwiGluEntries<A>>(divisor: f32) -> GpuResult<()> {
+    if !divisor.is_finite() || divisor <= 0.0 {
+        return Err(GpuError::invalid_launch(format!(
+            "{}NVFP4 input scale divisor must be finite and positive",
+            E::LABEL
+        )));
+    }
+
+    Ok(())
+}
+
+fn check_weight_divisor<A: Arch, E: Nvfp4SwiGluEntries<A>>(divisor: f32) -> GpuResult<()> {
+    if !divisor.is_finite() || divisor <= 0.0 {
+        return Err(GpuError::invalid_launch(format!(
+            "{}NVFP4 weight scale divisor must be finite and positive",
+            E::LABEL
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BATCH, PREFILL_ROWS, Qwen35SwiGluSchedule, nvfp4_swiglu_ptx_names,
-        qwen35_nvfp4_swiglu_ptx_names, qwen35_swiglu_schedule,
+        A16Slot, GROUP_K, MAX_BATCH, Nvfp4SwiGluEntries, PREFILL_ROWS, Qwen35Nvfp4SwiGluEntries,
+        Qwen38Nvfp4SwiGluEntries, ROWS_PER_BRANCH, SwiGluRoute, W4A4_THREADS, a16_launch_config,
+        a16_slot, check_input_divisor, check_weight_divisor, nvfp4_swiglu_ptx_names, prefill_route,
+        qwen35_nvfp4_swiglu_ptx_names, validates_input_divisor, w4a4_launch_configs,
     };
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+    use tuisko_gpu::{LaunchConfig1D, LaunchConfig2D};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
+
+    /// Qwen3.8's production schedule, transcribed from the dispatch this
+    /// wrapper replaces: `Nvfp4SwiGluOp::launch` matched `1 => w4a4_b1`,
+    /// `2..=4 => launch_a16(rows)`, `5..=8 => w4a4_b5..b8`, and
+    /// `32|64|128|1024 => w4a4_t32..t1024`, rejecting everything else.
+    const QWEN38_SCHEDULE: [(usize, SwiGluRoute); 12] = [
+        (1, SwiGluRoute::W4a4B1),
+        (2, SwiGluRoute::A16(A16Slot::B2)),
+        (3, SwiGluRoute::A16(A16Slot::B3)),
+        (4, SwiGluRoute::A16(A16Slot::B4)),
+        (5, SwiGluRoute::W4a4B5),
+        (6, SwiGluRoute::W4a4B6),
+        (7, SwiGluRoute::W4a4B7),
+        (8, SwiGluRoute::W4a4B8),
+        (32, SwiGluRoute::W4a4T32),
+        (64, SwiGluRoute::W4a4T64),
+        (128, SwiGluRoute::W4a4T128),
+        (1_024, SwiGluRoute::W4a4T1024),
+    ];
+
+    /// Qwen3.5's production schedule, transcribed from `qwen35_swiglu_schedule`
+    /// and the `Qwen35Nvfp4SwiGluOp::launch` arms it drove: `Some(A16)` at
+    /// `B=2` reached `launch_a16(2)`, `Some(W4a4)` at `B=1` and `B=3..=8`
+    /// reached `launch_w4a4(batch)`, and `None` — including every prefill row
+    /// count, which only `launch_prefill` admits — was rejected.
+    const QWEN35_SCHEDULE: [(usize, SwiGluRoute); 8] = [
+        (1, SwiGluRoute::W4a4B1),
+        (2, SwiGluRoute::A16(A16Slot::B2)),
+        (3, SwiGluRoute::W4a4B3),
+        (4, SwiGluRoute::W4a4B4),
+        (5, SwiGluRoute::W4a4B5),
+        (6, SwiGluRoute::W4a4B6),
+        (7, SwiGluRoute::W4a4B7),
+        (8, SwiGluRoute::W4a4B8),
+    ];
+
+    /// Every row count an entry table admits, swept exhaustively so an
+    /// unadmitted width cannot hide between the transcribed ones.
+    fn admitted_schedule<A: Arch, E: Nvfp4SwiGluEntries<A>>() -> Vec<(usize, SwiGluRoute)> {
+        (0..=2_048)
+            .chain([usize::MAX])
+            .filter_map(|rows| E::route(rows).map(|route| (rows, route)))
+            .collect()
+    }
+
+    fn base_name(name: &str) -> &str {
+        name.split_once("_TID_").map_or(name, |(base, _)| base)
+    }
 
     #[test]
     fn inventory_covers_every_exact_route() {
@@ -2212,29 +2504,247 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_inventory_and_routing_are_exact() {
+    fn qwen35_inventory_is_exact() {
         let names = qwen35_nvfp4_swiglu_ptx_names();
         let unique = names.into_iter().collect::<BTreeSet<_>>();
 
         assert_eq!(names.len(), 28);
         assert_eq!(unique.len(), names.len());
-        assert_eq!(qwen35_swiglu_schedule(0), None);
+    }
+
+    /// Each entry table publishes exactly the list that retains its own
+    /// specializations, so merging the owners cannot merge the inventories.
+    #[test]
+    fn every_entry_table_publishes_its_own_inventory() {
         assert_eq!(
-            (1..=MAX_BATCH)
-                .map(qwen35_swiglu_schedule)
+            <Qwen38Nvfp4SwiGluEntries as Nvfp4SwiGluEntries<Qwen38_27B>>::ptx_names(),
+            nvfp4_swiglu_ptx_names().to_vec()
+        );
+        assert_eq!(
+            <Qwen35Nvfp4SwiGluEntries as Nvfp4SwiGluEntries<Qwen35_9B>>::ptx_names(),
+            qwen35_nvfp4_swiglu_ptx_names().to_vec()
+        );
+    }
+
+    /// A generic specialization's `_TID_` hash is only reproducible inside the
+    /// compilation that emitted it, so the stable statement about this file is
+    /// its per-base-name count. These are the counts the pinned SM120 device
+    /// build emits; a wrapper change that instantiates one more specialization
+    /// moves one of them. `UnadmittedRoute` standing in for Qwen3.8's
+    /// `B=2..=4` W4A4 slots is what keeps `nvfp4_quantize` and
+    /// `nvfp4_swiglu_w4a4` at nine rather than twelve.
+    #[test]
+    fn semantic_entry_inventory_is_pinned_per_base_name() {
+        let mut counts = BTreeMap::new();
+        for name in nvfp4_swiglu_ptx_names()
+            .into_iter()
+            .chain(qwen35_nvfp4_swiglu_ptx_names())
+        {
+            *counts.entry(base_name(name)).or_insert(0_usize) += 1;
+        }
+
+        assert_eq!(
+            counts
+                .iter()
+                .map(|(name, count)| (*name, *count))
                 .collect::<Vec<_>>(),
             vec![
-                Some(Qwen35SwiGluSchedule::W4a4),
-                Some(Qwen35SwiGluSchedule::A16),
-                Some(Qwen35SwiGluSchedule::W4a4),
-                Some(Qwen35SwiGluSchedule::W4a4),
-                Some(Qwen35SwiGluSchedule::W4a4),
-                Some(Qwen35SwiGluSchedule::W4a4),
-                Some(Qwen35SwiGluSchedule::W4a4),
-                Some(Qwen35SwiGluSchedule::W4a4),
+                ("nvfp4_quantize", 9),
+                ("nvfp4_swiglu_a16_t1", 1),
+                ("nvfp4_swiglu_a16_t2", 1),
+                ("nvfp4_swiglu_a16_t3", 1),
+                ("nvfp4_swiglu_a16_t4", 1),
+                ("nvfp4_swiglu_w4a4", 9),
+                ("qwen35_nvfp4_quantize", 12),
+                ("qwen35_nvfp4_swiglu_a16", 2),
+                ("qwen35_nvfp4_swiglu_a16_t1", 1),
+                ("qwen35_nvfp4_swiglu_a16_t2", 1),
+                ("qwen35_nvfp4_swiglu_w4a4", 12),
             ]
         );
-        assert_eq!(qwen35_swiglu_schedule(MAX_BATCH + 1), None);
-        assert_eq!(qwen35_swiglu_schedule(usize::MAX), None);
+        assert_eq!(counts.values().sum::<usize>(), 50);
+    }
+
+    /// Route parity, the locked form of the transcription rule: for every
+    /// admitted row count each entry table selects exactly the arm its replaced
+    /// production dispatch took, and admits nothing the replaced dispatch
+    /// rejected. The sweep runs `0..=2_048` plus `usize::MAX`, so the two
+    /// schedules' disagreements — Qwen3.8 taking A16 across `B=2..=4` where
+    /// Qwen3.5 takes it only at `B=2`, and Qwen3.8 admitting prefill rows in
+    /// `launch` where Qwen3.5 rejects them — are pinned rather than assumed.
+    #[test]
+    fn production_route_selection_matches_every_replaced_dispatch() {
+        assert_eq!(
+            admitted_schedule::<Qwen38_27B, Qwen38Nvfp4SwiGluEntries>(),
+            QWEN38_SCHEDULE.to_vec()
+        );
+        assert_eq!(
+            admitted_schedule::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>(),
+            QWEN35_SCHEDULE.to_vec()
+        );
+    }
+
+    /// The sole measured crossover is Qwen3.5 `B=2`; every other Qwen3.5 batch
+    /// quantizes. Stated separately from the table above because this is the
+    /// value an earlier plan revision asserted from memory and inverted twice.
+    #[test]
+    fn qwen35_keeps_represented_activations_only_at_batch_two() {
+        let a16 = (1..=MAX_BATCH)
+            .filter(|batch| {
+                matches!(
+                    <Qwen35Nvfp4SwiGluEntries as Nvfp4SwiGluEntries<Qwen35_9B>>::route(*batch),
+                    Some(SwiGluRoute::A16(_))
+                )
+            })
+            .collect::<Vec<_>>();
+        let qwen38_a16 = (1..=MAX_BATCH)
+            .filter(|batch| {
+                matches!(
+                    <Qwen38Nvfp4SwiGluEntries as Nvfp4SwiGluEntries<Qwen38_27B>>::route(*batch),
+                    Some(SwiGluRoute::A16(_))
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(a16, vec![2]);
+        assert_eq!(qwen38_a16, vec![2, 3, 4]);
+    }
+
+    /// The retained comparison schedule both owners expose is exact `B=1..=4`,
+    /// and the prefill schedule both owners quantize is exact `PREFILL_ROWS`.
+    #[test]
+    fn comparison_and_prefill_schedules_are_exact() {
+        let a16 = (0..=2_048)
+            .chain([usize::MAX])
+            .filter_map(|batch| a16_slot(batch).map(|slot| (batch, slot)))
+            .collect::<Vec<_>>();
+        let prefill = (0..=2_048)
+            .chain([usize::MAX])
+            .filter_map(|rows| prefill_route(rows).map(|route| (rows, route)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            a16,
+            vec![
+                (1, A16Slot::B1),
+                (2, A16Slot::B2),
+                (3, A16Slot::B3),
+                (4, A16Slot::B4),
+            ]
+        );
+        assert_eq!(
+            prefill,
+            vec![
+                (32, SwiGluRoute::W4a4T32),
+                (64, SwiGluRoute::W4a4T64),
+                (128, SwiGluRoute::W4a4T128),
+                (1_024, SwiGluRoute::W4a4T1024),
+            ]
+        );
+    }
+
+    /// Validation-order parity: `Nvfp4SwiGluOp::launch` validated both divisors
+    /// before selecting a schedule, so it rejected an invalid activation
+    /// divisor even at its A16 batches; `Qwen35Nvfp4SwiGluOp::launch` validated
+    /// inside the selected route, so its A16 batch accepted any activation
+    /// divisor. Both rejection sets are preserved, swept over every admitted
+    /// row count.
+    #[test]
+    fn divisor_validation_order_matches_every_replaced_dispatch() {
+        for (rows, route) in QWEN38_SCHEDULE {
+            assert!(
+                validates_input_divisor::<Qwen38_27B, Qwen38Nvfp4SwiGluEntries>(route),
+                "Qwen3.8 row count {rows} must still reject an invalid activation divisor"
+            );
+        }
+        for (rows, route) in QWEN35_SCHEDULE {
+            assert_eq!(
+                validates_input_divisor::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>(route),
+                !matches!(route, SwiGluRoute::A16(_)),
+                "Qwen3.5 row count {rows} changed its activation-divisor rejection"
+            );
+        }
+    }
+
+    /// Each owner's rejection keeps naming the architecture and the wording it
+    /// reported before the merge.
+    #[test]
+    fn rejections_keep_their_original_wording() {
+        for (error, expected) in [
+            (
+                <Qwen38Nvfp4SwiGluEntries as Nvfp4SwiGluEntries<Qwen38_27B>>::unadmitted_rows(9),
+                "NVFP4 SwiGLU row count 9 is outside the exact B=1..=8, T=32,64,128,1024 routes",
+            ),
+            (
+                <Qwen35Nvfp4SwiGluEntries as Nvfp4SwiGluEntries<Qwen35_9B>>::unadmitted_rows(32),
+                "Qwen3.5 NVFP4 SwiGLU batch 32 is not an exact B=1..=8 route",
+            ),
+            (
+                check_input_divisor::<Qwen38_27B, Qwen38Nvfp4SwiGluEntries>(0.0).unwrap_err(),
+                "NVFP4 input scale divisor must be finite and positive",
+            ),
+            (
+                check_weight_divisor::<Qwen38_27B, Qwen38Nvfp4SwiGluEntries>(f32::NAN).unwrap_err(),
+                "NVFP4 weight scale divisor must be finite and positive",
+            ),
+            (
+                check_input_divisor::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>(-1.0).unwrap_err(),
+                "Qwen3.5 NVFP4 input scale divisor must be finite and positive",
+            ),
+            (
+                check_weight_divisor::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>(f32::INFINITY)
+                    .unwrap_err(),
+                "Qwen3.5 NVFP4 weight scale divisor must be finite and positive",
+            ),
+        ] {
+            assert!(
+                error.to_string().ends_with(expected),
+                "{error} does not end with {expected}"
+            );
+        }
+    }
+
+    /// The shared launch geometry reproduces the exact grids the two replaced
+    /// owners hard-coded: 2,176 and 1,536 A16 CTAs, 544 and 384 W4A4 column
+    /// CTAs, and the same 1/2/3/22 token tiles at T=32/64/128/1024.
+    #[test]
+    fn shared_geometry_reproduces_every_replaced_owner_grid() {
+        assert_eq!(
+            a16_launch_config::<Qwen38_27B>(),
+            LaunchConfig1D::new(2_176, 256, 0)
+        );
+        assert_eq!(
+            a16_launch_config::<Qwen35_9B>(),
+            LaunchConfig1D::new(1_536, 256, 0)
+        );
+        assert_eq!(Qwen38_27B::HIDDEN / GROUP_K, 320);
+        assert_eq!(Qwen35_9B::HIDDEN / GROUP_K, 256);
+        assert_eq!(Qwen38_27B::INTERMEDIATE / ROWS_PER_BRANCH, 544);
+        assert_eq!(Qwen35_9B::INTERMEDIATE / ROWS_PER_BRANCH, 384);
+        assert_eq!(W4A4_THREADS, 384);
+
+        for (rows, tiles) in [(1, 1), (8, 1), (32, 1), (64, 2), (128, 3), (1_024, 22)] {
+            let (qwen38_quantize, qwen38_projection) =
+                w4a4_launch_configs::<Qwen38_27B>(rows, "").unwrap();
+            let (qwen35_quantize, qwen35_projection) =
+                w4a4_launch_configs::<Qwen35_9B>(rows, "Qwen3.5 ").unwrap();
+
+            assert_eq!(
+                qwen38_quantize,
+                LaunchConfig1D::new((rows as u32 * 320).div_ceil(256), 256, 0)
+            );
+            assert_eq!(
+                qwen38_projection,
+                LaunchConfig2D::new((544, tiles), (W4A4_THREADS, 1), 0)
+            );
+            assert_eq!(
+                qwen35_quantize,
+                LaunchConfig1D::new((rows as u32 * 256).div_ceil(256), 256, 0)
+            );
+            assert_eq!(
+                qwen35_projection,
+                LaunchConfig2D::new((384, tiles), (W4A4_THREADS, 1), 0)
+            );
+        }
     }
 }

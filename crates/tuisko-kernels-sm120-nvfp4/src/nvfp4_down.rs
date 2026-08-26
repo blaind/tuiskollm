@@ -1113,37 +1113,166 @@ mod kernels {
     }
 }
 
-fn launch_config() -> LaunchConfig1D {
-    // Eight warps emit two rows each, so 320 exact CTAs cover all 5,120
-    // outputs without a tail branch while sharing each staged input phase.
-    LaunchConfig1D::new((OUTPUT_ROWS / (2 * WARPS)) as u32, THREADS, 0)
+fn a16_launch_config<A: Arch>() -> LaunchConfig1D {
+    // Eight warps emit two rows each, so Qwen3.8's 5,120 outputs form 320
+    // exact CTAs and Qwen3.5's 4,096 form 256, both without a tail branch
+    // while each CTA shares one staged input phase. Qwen3.5's row has 768
+    // K16 groups, so the unchanged lane order traverses 24 phases instead of
+    // Qwen3.8's 34 without changing arithmetic.
+    LaunchConfig1D::new((A::HIDDEN / (2 * WARPS)) as u32, THREADS, 0)
 }
 
-fn qwen35_launch_config() -> LaunchConfig1D {
-    // The same eight warps retain two output rows each; 4,096 / 16 gives 256
-    // exact CTAs. Each row has 768 K16 groups, so the unchanged lane order
-    // traverses 24 phases instead of Qwen3.8's 34 without changing arithmetic.
-    LaunchConfig1D::new((Qwen35_9B::HIDDEN / (2 * WARPS)) as u32, THREADS, 0)
+/// Exact W4A4 prefill grid extents for one architecture and row count.
+struct PrefillGeometry {
+    quantize_blocks: usize,
+    projection_blocks: usize,
+    token_tiles: usize,
 }
 
-struct PreparedBatchOneRoute {
+fn prefill_geometry<A: Arch>(tokens: usize) -> PrefillGeometry {
+    // A thread owns one represented K16 group, so 256 threads cover every
+    // architecture-specific group without a partial: T=1,024 has 3,145,728
+    // groups on Qwen3.5 and 12,288 CTAs. Each twelve-warp CTA emits a native
+    // 48x64 tile, giving Qwen3.8 80 output columns and Qwen3.5 64, with
+    // 1/2/3/22 token tiles at T=32/64/128/1024 and no N padding in either.
+    PrefillGeometry {
+        quantize_blocks: (tokens * (A::INTERMEDIATE / GROUP_K)).div_ceil(256),
+        projection_blocks: A::HIDDEN / W4_BLOCK_N,
+        token_tiles: tokens.div_ceil(W4_TILE_M),
+    }
+}
+
+mod private {
+    pub trait Sealed {}
+}
+
+/// One architecture's prepared represented-weight A16 entry for an exact batch.
+///
+/// Sealed: the implementors are this module's prepared routes, so an entry
+/// table can never name a route whose entry the module does not emit.
+pub trait Nvfp4DownA16Route<A: Arch>: Sized + private::Sealed {
+    /// Prepares this route's exact batch entry.
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self>;
+
+    /// Launches this route's A16 entry.
+    ///
+    /// # Safety
+    ///
+    /// The pointers carry `Nvfp4DownOp::launch`'s contract unchanged.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        weight_scale_reciprocal: f32,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+/// One architecture's prepared quantization and W4A4 entries for exact rows.
+///
+/// Sealed for the same reason as [`Nvfp4DownA16Route`]. The pair stays one
+/// route because the quantizer's output grouping is the projection's input
+/// contract and the two are never prepared apart.
+pub trait Nvfp4DownPrefillRoute<A: Arch>: Sized + private::Sealed {
+    /// Prepares both entries of this route's exact row count.
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self>;
+
+    /// Quantizes the represented activations and launches the W4A4 entry.
+    ///
+    /// # Safety
+    ///
+    /// The pointers carry `Nvfp4DownOp::launch_prefill`'s contract unchanged.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut u8,
+        weight_codes: *const u8,
+        weight_scales: *const u8,
+        input_scale_divisor: f32,
+        weight_scale_divisor: f32,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+/// Exact entry table of one admitted architecture's NVFP4 down routes.
+///
+/// The table is parameterized by the architecture instead of bounding
+/// [`Sm120Arch`], so admitting Qwen3.5 here never widens the artifact-level
+/// admission bound. Each table names only the entries its own model emits,
+/// which is what keeps the compiled inventory fixed while both prepared
+/// owners share one wrapper.
+pub trait Nvfp4DownEntries<A: Arch>: private::Sealed {
+    /// Prepared A16 route for `B=1`, which stays separate because Qwen3.8
+    /// anchors it with a concrete entry.
+    type DecodeOne: Nvfp4DownA16Route<A>;
+    /// Prepared A16 route for `B=2..=8`.
+    type Decode<const TOKENS: usize>: Nvfp4DownA16Route<A>;
+    /// Prepared W4A4 route for one exact prefill row count.
+    type Prefill<const TOKENS: usize>: Nvfp4DownPrefillRoute<A>;
+
+    /// Message prefix that keeps this architecture's launch errors distinct.
+    const LABEL: &'static str;
+    /// Operation name this architecture's batch rejection reports.
+    const OPERATION: &'static str;
+
+    /// Retained PTX entry names of every route this table admits.
+    fn ptx_names() -> Vec<&'static str>;
+}
+
+/// Prepared Qwen3.8 `B=1` A16 entry.
+///
+/// `B=1` keeps the concrete entry that anchors the embedded module artifact.
+pub struct PreparedBatchOneRoute {
     projection: PreparedLaunch<kernels::__nvfp4_down_a16_b1_CudaKernel>,
 }
 
-struct PreparedBatchRoute<A: Arch, const TOKENS: usize> {
+/// Prepared generic A16 entry for one exact batch.
+pub struct PreparedBatchRoute<A: Arch, const TOKENS: usize> {
     projection: PreparedLaunch<kernels::__nvfp4_down_a16_CudaKernel<A, TOKENS>>,
 }
 
-impl PreparedBatchOneRoute {
+/// Prepared Qwen3.5 A16 entry for one exact batch.
+pub struct PreparedQwen35BatchRoute<const TOKENS: usize> {
+    projection: PreparedLaunch<kernels::__qwen35_nvfp4_down_a16_CudaKernel<TOKENS>>,
+}
+
+/// Prepared Qwen3.8 quantization and W4A4 entries for one exact row count.
+pub struct PreparedPrefillRoute<const TOKENS: usize> {
+    quantize: PreparedLaunch<kernels::__nvfp4_down_quantize_CudaKernel<TOKENS>>,
+    projection: PreparedLaunch<kernels::__nvfp4_down_w4a4_CudaKernel<TOKENS>>,
+}
+
+/// Prepared Qwen3.5 quantization and W4A4 entries for one exact row count.
+pub struct PreparedQwen35PrefillRoute<const TOKENS: usize> {
+    quantize: PreparedLaunch<kernels::__qwen35_nvfp4_down_quantize_CudaKernel<TOKENS>>,
+    projection: PreparedLaunch<kernels::__qwen35_nvfp4_down_w4a4_CudaKernel<TOKENS>>,
+}
+
+impl private::Sealed for PreparedBatchOneRoute {}
+impl<A: Arch, const TOKENS: usize> private::Sealed for PreparedBatchRoute<A, TOKENS> {}
+impl<const TOKENS: usize> private::Sealed for PreparedQwen35BatchRoute<TOKENS> {}
+impl<const TOKENS: usize> private::Sealed for PreparedPrefillRoute<TOKENS> {}
+impl<const TOKENS: usize> private::Sealed for PreparedQwen35PrefillRoute<TOKENS> {}
+
+// The B=1 anchor compiles the exact Qwen3.8 row width into a concrete entry,
+// so it stays bound to the sealed artifact-level architecture.
+impl<A: Sm120Arch> Nvfp4DownA16Route<A> for PreparedBatchOneRoute {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         let projection = module
-            .prepare_nvfp4_down_a16_b1(launch_config())
+            .prepare_nvfp4_down_a16_b1(a16_launch_config::<A>())
             .map_err(|source| GpuError::launch("preparing SM120 NVFP4 A16 B=1", source))?;
 
         Ok(Self { projection })
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
@@ -1168,16 +1297,15 @@ impl PreparedBatchOneRoute {
     }
 }
 
-impl<A: Arch, const TOKENS: usize> PreparedBatchRoute<A, TOKENS> {
+impl<A: Arch, const TOKENS: usize> Nvfp4DownA16Route<A> for PreparedBatchRoute<A, TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         let projection = module
-            .prepare_nvfp4_down_a16::<A, TOKENS>(launch_config())
+            .prepare_nvfp4_down_a16::<A, TOKENS>(a16_launch_config::<A>())
             .map_err(|source| GpuError::launch("preparing SM120 NVFP4 A16", source))?;
 
         Ok(Self { projection })
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
@@ -1202,20 +1330,15 @@ impl<A: Arch, const TOKENS: usize> PreparedBatchRoute<A, TOKENS> {
     }
 }
 
-struct PreparedQwen35BatchRoute<const TOKENS: usize> {
-    projection: PreparedLaunch<kernels::__qwen35_nvfp4_down_a16_CudaKernel<TOKENS>>,
-}
-
-impl<const TOKENS: usize> PreparedQwen35BatchRoute<TOKENS> {
+impl<const TOKENS: usize> Nvfp4DownA16Route<Qwen35_9B> for PreparedQwen35BatchRoute<TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         let projection = module
-            .prepare_qwen35_nvfp4_down_a16::<TOKENS>(qwen35_launch_config())
+            .prepare_qwen35_nvfp4_down_a16::<TOKENS>(a16_launch_config::<Qwen35_9B>())
             .map_err(|source| GpuError::launch("preparing Qwen3.5 SM120 NVFP4 A16", source))?;
 
         Ok(Self { projection })
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
@@ -1240,24 +1363,17 @@ impl<const TOKENS: usize> PreparedQwen35BatchRoute<TOKENS> {
     }
 }
 
-struct PreparedPrefillRoute<const TOKENS: usize> {
-    quantize: PreparedLaunch<kernels::__nvfp4_down_quantize_CudaKernel<TOKENS>>,
-    projection: PreparedLaunch<kernels::__nvfp4_down_w4a4_CudaKernel<TOKENS>>,
-}
-
-impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
+// The Qwen3.8 prefill entries compile that model's exact extents, so they stay
+// bound to the sealed artifact-level architecture.
+impl<A: Sm120Arch, const TOKENS: usize> Nvfp4DownPrefillRoute<A> for PreparedPrefillRoute<TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        // A thread owns one represented K16 group. At 256 threads, exact
-        // routes cover every architecture-specific group without a partial.
-        let quantize_blocks = (TOKENS * GROUPS_PER_ROW).div_ceil(256);
-        let quantize_blocks = u32::try_from(quantize_blocks).map_err(|_| {
+        let geometry = prefill_geometry::<A>(TOKENS);
+        let quantize_blocks = u32::try_from(geometry.quantize_blocks).map_err(|_| {
             GpuError::invalid_launch("NVFP4 down quantization grid exceeds CUDA width")
         })?;
-        // Each twelve-warp CTA emits a native 48x64 tile. The 80 exact output
-        // columns combine with 1/2/3/22 token tiles and require no N padding.
-        let projection_blocks = u32::try_from(OUTPUT_ROWS / W4_BLOCK_N)
+        let projection_blocks = u32::try_from(geometry.projection_blocks)
             .map_err(|_| GpuError::invalid_launch("NVFP4 down grid exceeds CUDA width"))?;
-        let token_tiles = u32::try_from(TOKENS.div_ceil(W4_TILE_M))
+        let token_tiles = u32::try_from(geometry.token_tiles)
             .map_err(|_| GpuError::invalid_launch("NVFP4 down grid exceeds CUDA height"))?;
         let quantize = module
             .prepare_nvfp4_down_quantize::<TOKENS>(LaunchConfig1D::new(quantize_blocks, 256, 0))
@@ -1278,7 +1394,6 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
@@ -1319,24 +1434,14 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
     }
 }
 
-struct PreparedQwen35PrefillRoute<const TOKENS: usize> {
-    quantize: PreparedLaunch<kernels::__qwen35_nvfp4_down_quantize_CudaKernel<TOKENS>>,
-    projection: PreparedLaunch<kernels::__qwen35_nvfp4_down_w4a4_CudaKernel<TOKENS>>,
-}
-
-impl<const TOKENS: usize> PreparedQwen35PrefillRoute<TOKENS> {
+impl<const TOKENS: usize> Nvfp4DownPrefillRoute<Qwen35_9B> for PreparedQwen35PrefillRoute<TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let groups_per_row = Qwen35_9B::INTERMEDIATE / GROUP_K;
-        // T=1,024 has 3,145,728 independent K16 quantization groups. One
-        // thread per group gives 12,288 CTAs and preserves the exact codec.
-        let quantize_blocks = u32::try_from((TOKENS * groups_per_row).div_ceil(256))
+        let geometry = prefill_geometry::<Qwen35_9B>(TOKENS);
+        let quantize_blocks = u32::try_from(geometry.quantize_blocks)
             .map_err(|_| GpuError::invalid_launch("Qwen3.5 down quantization grid is too wide"))?;
-        // The same 48x64 W4A4 tile covers Qwen3.5 without padding: 64 output
-        // tiles and 1/2/3/22 token tiles for T=32/64/128/1024. Only the exact
-        // architecture extents change; each m16n8k64 accumulation is unchanged.
-        let projection_blocks = u32::try_from(Qwen35_9B::HIDDEN / W4_BLOCK_N)
+        let projection_blocks = u32::try_from(geometry.projection_blocks)
             .map_err(|_| GpuError::invalid_launch("Qwen3.5 down grid is too wide"))?;
-        let token_tiles = u32::try_from(TOKENS.div_ceil(W4_TILE_M))
+        let token_tiles = u32::try_from(geometry.token_tiles)
             .map_err(|_| GpuError::invalid_launch("Qwen3.5 down grid is too tall"))?;
         let quantize = module
             .prepare_qwen35_nvfp4_down_quantize::<TOKENS>(LaunchConfig1D::new(
@@ -1361,7 +1466,6 @@ impl<const TOKENS: usize> PreparedQwen35PrefillRoute<TOKENS> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
@@ -1399,6 +1503,42 @@ impl<const TOKENS: usize> PreparedQwen35PrefillRoute<TOKENS> {
                 1.0 / (input_scale_divisor * weight_scale_divisor),
             )
             .map_err(|source| GpuError::launch("launching Qwen3.5 W4A4 down", source))
+    }
+}
+
+/// Qwen3.8 entry table: the concrete `B=1` artifact anchor, the generic A16
+/// entries at `B=2..=8`, and this model's own prefill entries.
+pub struct Qwen38Nvfp4DownEntries;
+
+/// Qwen3.5 entry table: its own A16 entry family and prefill entries.
+pub struct Qwen35Nvfp4DownEntries;
+
+impl private::Sealed for Qwen38Nvfp4DownEntries {}
+impl private::Sealed for Qwen35Nvfp4DownEntries {}
+
+impl<A: Sm120Arch> Nvfp4DownEntries<A> for Qwen38Nvfp4DownEntries {
+    type DecodeOne = PreparedBatchOneRoute;
+    type Decode<const TOKENS: usize> = PreparedBatchRoute<A, TOKENS>;
+    type Prefill<const TOKENS: usize> = PreparedPrefillRoute<TOKENS>;
+
+    const LABEL: &'static str = "";
+    const OPERATION: &'static str = "NVFP4 down projection";
+
+    fn ptx_names() -> Vec<&'static str> {
+        nvfp4_down_ptx_names().to_vec()
+    }
+}
+
+impl Nvfp4DownEntries<Qwen35_9B> for Qwen35Nvfp4DownEntries {
+    type DecodeOne = PreparedQwen35BatchRoute<1>;
+    type Decode<const TOKENS: usize> = PreparedQwen35BatchRoute<TOKENS>;
+    type Prefill<const TOKENS: usize> = PreparedQwen35PrefillRoute<TOKENS>;
+
+    const LABEL: &'static str = "Qwen3.5 ";
+    const OPERATION: &'static str = "Qwen3.5 NVFP4 down";
+
+    fn ptx_names() -> Vec<&'static str> {
+        qwen35_nvfp4_down_ptx_names().to_vec()
     }
 }
 
@@ -1446,45 +1586,99 @@ pub(crate) fn qwen35_nvfp4_down_ptx_names() -> [&'static str; 16] {
     ]
 }
 
-/// Prepared A16 routes consuming the exact source NVFP4 down owner on SM120.
-pub struct Nvfp4DownOp<A: Sm120Arch = Qwen38_27B> {
-    module: kernels::LoadedModule,
-    b1: PreparedBatchOneRoute,
-    b2: PreparedBatchRoute<A, 2>,
-    b3: PreparedBatchRoute<A, 3>,
-    b4: PreparedBatchRoute<A, 4>,
-    b5: PreparedBatchRoute<A, 5>,
-    b6: PreparedBatchRoute<A, 6>,
-    b7: PreparedBatchRoute<A, 7>,
-    b8: PreparedBatchRoute<A, 8>,
-    t32: PreparedPrefillRoute<32>,
-    t64: PreparedPrefillRoute<64>,
-    t128: PreparedPrefillRoute<128>,
-    t1024: PreparedPrefillRoute<1_024>,
+/// The compiled route one admitted row count selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DownRoute {
+    B1,
+    B2,
+    B3,
+    B4,
+    B5,
+    B6,
+    B7,
+    B8,
+    T32,
+    T64,
+    T128,
+    T1024,
 }
 
-impl<A: Sm120Arch> Nvfp4DownOp<A> {
+// The admitted decode schedule, transcribed from the two prepared dispatches
+// it replaces: both owners project every exact B=1..=8 through the
+// represented-weight A16 entry and admit nothing else.
+fn decode_route(batch: usize) -> Option<DownRoute> {
+    match batch {
+        1 => Some(DownRoute::B1),
+        2 => Some(DownRoute::B2),
+        3 => Some(DownRoute::B3),
+        4 => Some(DownRoute::B4),
+        5 => Some(DownRoute::B5),
+        6 => Some(DownRoute::B6),
+        7 => Some(DownRoute::B7),
+        8 => Some(DownRoute::B8),
+        _ => None,
+    }
+}
+
+// The admitted prefill schedule, transcribed from the same two dispatches:
+// both owners admitted exactly `PREFILL_ROWS` and then matched those four row
+// counts onto their own quantize/W4A4 pairs.
+fn prefill_route(rows: usize) -> Option<DownRoute> {
+    if !PREFILL_ROWS.contains(&rows) {
+        return None;
+    }
+
+    match rows {
+        32 => Some(DownRoute::T32),
+        64 => Some(DownRoute::T64),
+        128 => Some(DownRoute::T128),
+        1_024 => Some(DownRoute::T1024),
+        _ => unreachable!("PREFILL_ROWS admits only the exact T routes"),
+    }
+}
+
+/// Prepared exact-batch NVFP4 down routes for one admitted architecture.
+pub struct Nvfp4DownOp<A: Arch = Qwen38_27B, E: Nvfp4DownEntries<A> = Qwen38Nvfp4DownEntries> {
+    module: kernels::LoadedModule,
+    b1: E::DecodeOne,
+    b2: E::Decode<2>,
+    b3: E::Decode<3>,
+    b4: E::Decode<4>,
+    b5: E::Decode<5>,
+    b6: E::Decode<6>,
+    b7: E::Decode<7>,
+    b8: E::Decode<8>,
+    t32: E::Prefill<32>,
+    t64: E::Prefill<64>,
+    t128: E::Prefill<128>,
+    t1024: E::Prefill<1_024>,
+}
+
+/// Prepared exact-batch Qwen3.5 NVFP4 down routes on SM120.
+pub type Qwen35Nvfp4DownOp = Nvfp4DownOp<Qwen35_9B, Qwen35Nvfp4DownEntries>;
+
+impl<A: Arch, E: Nvfp4DownEntries<A>> Nvfp4DownOp<A, E> {
     /// Loads the embedded SM120 module and prepares every exact-batch route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        let _ = nvfp4_down_ptx_names();
+        let _ = E::ptx_names();
         // SAFETY: this crate owns the embedded cuda-oxide module artifact.
         let module = unsafe { kernels::load(context) }.map_err(|source| {
             GpuError::module("loading the SM120 NVFP4 down projection module", source)
         })?;
 
         Ok(Self {
-            b1: PreparedBatchOneRoute::prepare(&module)?,
-            b2: PreparedBatchRoute::prepare(&module)?,
-            b3: PreparedBatchRoute::prepare(&module)?,
-            b4: PreparedBatchRoute::prepare(&module)?,
-            b5: PreparedBatchRoute::prepare(&module)?,
-            b6: PreparedBatchRoute::prepare(&module)?,
-            b7: PreparedBatchRoute::prepare(&module)?,
-            b8: PreparedBatchRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
-            t1024: PreparedPrefillRoute::prepare(&module)?,
+            b1: E::DecodeOne::prepare(&module)?,
+            b2: E::Decode::<2>::prepare(&module)?,
+            b3: E::Decode::<3>::prepare(&module)?,
+            b4: E::Decode::<4>::prepare(&module)?,
+            b5: E::Decode::<5>::prepare(&module)?,
+            b6: E::Decode::<6>::prepare(&module)?,
+            b7: E::Decode::<7>::prepare(&module)?,
+            b8: E::Decode::<8>::prepare(&module)?,
+            t32: E::Prefill::<32>::prepare(&module)?,
+            t64: E::Prefill::<64>::prepare(&module)?,
+            t128: E::Prefill::<128>::prepare(&module)?,
+            t1024: E::Prefill::<1_024>::prepare(&module)?,
             module,
         })
     }
@@ -1493,12 +1687,13 @@ impl<A: Sm120Arch> Nvfp4DownOp<A> {
     ///
     /// # Safety
     ///
-    /// `input` covers `batch * 17_408` BF16 values; `weight_codes` covers the
-    /// packed `[5_120, 17_408]` E2M1 plane; `weight_scales` covers its
-    /// swizzled `[5_120, 1_088]` E4M3 plane; and `output` covers
-    /// `batch * 5_120` BF16 values. Four-byte-loaded planes are four-byte
-    /// aligned. The divisor is finite and positive. Allocations belong to
-    /// `stream`'s context, remain live through completion, and do not overlap.
+    /// `input` covers `batch * A::INTERMEDIATE` BF16 values; `weight_codes`
+    /// covers the packed `[A::HIDDEN, A::INTERMEDIATE]` E2M1 plane;
+    /// `weight_scales` covers its swizzled `[A::HIDDEN, A::INTERMEDIATE / 16]`
+    /// E4M3 plane; and `output` covers `batch * A::HIDDEN` BF16 values.
+    /// Four-byte-loaded planes are four-byte aligned. The divisor is finite
+    /// and positive. Allocations belong to `stream`'s context, remain live
+    /// through completion, and do not overlap.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
         &self,
@@ -1511,14 +1706,16 @@ impl<A: Sm120Arch> Nvfp4DownOp<A> {
         output: *mut u16,
     ) -> GpuResult<()> {
         if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "NVFP4 weight scale divisor must be finite and positive",
-            ));
+            return Err(GpuError::invalid_launch(format!(
+                "{}NVFP4 weight scale divisor must be finite and positive",
+                E::LABEL
+            )));
         }
 
         let reciprocal = 1.0 / weight_scale_divisor;
         macro_rules! launch {
             ($route:ident) => {
+                // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
                     self.$route.launch(
                         &self.module,
@@ -1533,17 +1730,18 @@ impl<A: Sm120Arch> Nvfp4DownOp<A> {
             };
         }
 
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
+        match decode_route(batch) {
+            Some(DownRoute::B1) => launch!(b1),
+            Some(DownRoute::B2) => launch!(b2),
+            Some(DownRoute::B3) => launch!(b3),
+            Some(DownRoute::B4) => launch!(b4),
+            Some(DownRoute::B5) => launch!(b5),
+            Some(DownRoute::B6) => launch!(b6),
+            Some(DownRoute::B7) => launch!(b7),
+            Some(DownRoute::B8) => launch!(b8),
             _ => Err(GpuError::invalid_launch(format!(
-                "NVFP4 down projection batch {batch} is outside the exact range 1..={MAX_BATCH}"
+                "{} batch {batch} is outside the exact range 1..={MAX_BATCH}",
+                E::OPERATION
             ))),
         }
     }
@@ -1552,13 +1750,13 @@ impl<A: Sm120Arch> Nvfp4DownOp<A> {
     ///
     /// # Safety
     ///
-    /// `input` covers `rows * 17_408` BF16 values; activation scratch covers
-    /// `rows * 8_704` code bytes and `rows * 1_088` scale bytes;
-    /// `weight_codes` covers packed `[5_120, 17_408]` E2M1 values;
-    /// `weight_scales` covers swizzled `[5_120, 1_088]` E4M3 values; and
-    /// `output` covers `rows * 5_120` BF16 values. Four-byte-loaded planes are
-    /// aligned. Divisors are finite and positive. All allocations belong to
-    /// `stream`'s context, remain live through completion, and do not overlap.
+    /// `input` covers `rows * A::INTERMEDIATE` BF16 values; activation scratch
+    /// covers `rows * A::INTERMEDIATE / 2` code bytes and
+    /// `rows * A::INTERMEDIATE / 16` scale bytes; the weight planes satisfy
+    /// [`Self::launch`]; and `output` covers `rows * A::HIDDEN` BF16 values.
+    /// Four-byte-loaded planes are aligned. Divisors are finite and positive.
+    /// All allocations belong to `stream`'s context, remain live through
+    /// completion, and do not overlap.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch_prefill(
         &self,
@@ -1573,24 +1771,28 @@ impl<A: Sm120Arch> Nvfp4DownOp<A> {
         weight_scale_divisor: f32,
         output: *mut u16,
     ) -> GpuResult<()> {
-        if !PREFILL_ROWS.contains(&rows) {
+        let Some(route) = prefill_route(rows) else {
             return Err(GpuError::invalid_launch(format!(
-                "NVFP4 down prefill row count {rows} is outside the exact T=32,64,128,1024 routes"
+                "{}NVFP4 down prefill row count {rows} is outside the exact T=32,64,128,1024 routes",
+                E::LABEL
+            )));
+        };
+        if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
+            return Err(GpuError::invalid_launch(format!(
+                "{}NVFP4 down input scale divisor must be finite and positive",
+                E::LABEL
             )));
         }
-        if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "NVFP4 down input scale divisor must be finite and positive",
-            ));
-        }
         if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "NVFP4 down weight scale divisor must be finite and positive",
-            ));
+            return Err(GpuError::invalid_launch(format!(
+                "{}NVFP4 down weight scale divisor must be finite and positive",
+                E::LABEL
+            )));
         }
 
         macro_rules! launch {
             ($route:ident) => {
+                // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
                     self.$route.launch(
                         &self.module,
@@ -1608,183 +1810,12 @@ impl<A: Sm120Arch> Nvfp4DownOp<A> {
             };
         }
 
-        match rows {
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            1_024 => launch!(t1024),
-            _ => unreachable!("row count was validated above"),
-        }
-    }
-}
-
-/// Prepared exact-batch Qwen3.5 NVFP4 down routes on SM120.
-pub struct Qwen35Nvfp4DownOp {
-    module: kernels::LoadedModule,
-    b1: PreparedQwen35BatchRoute<1>,
-    b2: PreparedQwen35BatchRoute<2>,
-    b3: PreparedQwen35BatchRoute<3>,
-    b4: PreparedQwen35BatchRoute<4>,
-    b5: PreparedQwen35BatchRoute<5>,
-    b6: PreparedQwen35BatchRoute<6>,
-    b7: PreparedQwen35BatchRoute<7>,
-    b8: PreparedQwen35BatchRoute<8>,
-    t32: PreparedQwen35PrefillRoute<32>,
-    t64: PreparedQwen35PrefillRoute<64>,
-    t128: PreparedQwen35PrefillRoute<128>,
-    t1024: PreparedQwen35PrefillRoute<1_024>,
-}
-
-impl Qwen35Nvfp4DownOp {
-    /// Loads the embedded module and prepares every exact Qwen3.5 batch.
-    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        let _ = qwen35_nvfp4_down_ptx_names();
-        // SAFETY: this crate owns the embedded cuda-oxide module artifact.
-        let module = unsafe { kernels::load(context) }.map_err(|source| {
-            GpuError::module("loading the Qwen3.5 SM120 NVFP4 down module", source)
-        })?;
-
-        Ok(Self {
-            b1: PreparedQwen35BatchRoute::prepare(&module)?,
-            b2: PreparedQwen35BatchRoute::prepare(&module)?,
-            b3: PreparedQwen35BatchRoute::prepare(&module)?,
-            b4: PreparedQwen35BatchRoute::prepare(&module)?,
-            b5: PreparedQwen35BatchRoute::prepare(&module)?,
-            b6: PreparedQwen35BatchRoute::prepare(&module)?,
-            b7: PreparedQwen35BatchRoute::prepare(&module)?,
-            b8: PreparedQwen35BatchRoute::prepare(&module)?,
-            t32: PreparedQwen35PrefillRoute::prepare(&module)?,
-            t64: PreparedQwen35PrefillRoute::prepare(&module)?,
-            t128: PreparedQwen35PrefillRoute::prepare(&module)?,
-            t1024: PreparedQwen35PrefillRoute::prepare(&module)?,
-            module,
-        })
-    }
-
-    /// Executes represented-weight A16 at exact `B=1..=8`.
-    ///
-    /// # Safety
-    ///
-    /// `input` covers `batch * 12_288` BF16 values; `weight_codes` covers
-    /// packed E2M1 `[4_096, 12_288]`; `weight_scales` covers swizzled E4M3
-    /// `[4_096, 768]`; and `output` covers `batch * 4_096` BF16 values.
-    /// Four-byte-loaded planes are aligned, the divisor is finite and
-    /// positive, and disjoint allocations remain live in `stream`'s context.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn launch(
-        &self,
-        stream: &CudaStream,
-        batch: usize,
-        input: *const u16,
-        weight_codes: *const u8,
-        weight_scales: *const u8,
-        weight_scale_divisor: f32,
-        output: *mut u16,
-    ) -> GpuResult<()> {
-        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 NVFP4 weight scale divisor must be finite and positive",
-            ));
-        }
-
-        let reciprocal = 1.0 / weight_scale_divisor;
-        macro_rules! launch {
-            ($route:ident) => {
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        weight_codes,
-                        weight_scales,
-                        reciprocal,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 NVFP4 down batch {batch} is outside the exact range 1..={MAX_BATCH}"
-            ))),
-        }
-    }
-
-    /// Dynamically quantizes and projects exact `T=32,64,128,1024` rows.
-    ///
-    /// # Safety
-    ///
-    /// `input` covers `rows * 12_288` BF16 values; activation scratch covers
-    /// `rows * 6_144` code bytes and `rows * 768` scale bytes;
-    /// `weight_codes` covers packed `[4_096, 12_288]` E2M1 values;
-    /// `weight_scales` covers swizzled `[4_096, 768]` E4M3 values; and
-    /// `output` covers `rows * 4_096` BF16 values. Four-byte-loaded planes are
-    /// aligned. Divisors are finite and positive. All allocations belong to
-    /// `stream`'s context, remain live through completion, and do not overlap.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn launch_prefill(
-        &self,
-        stream: &CudaStream,
-        rows: usize,
-        input: *const u16,
-        activation_codes: *mut u8,
-        activation_scales: *mut u8,
-        weight_codes: *const u8,
-        weight_scales: *const u8,
-        input_scale_divisor: f32,
-        weight_scale_divisor: f32,
-        output: *mut u16,
-    ) -> GpuResult<()> {
-        if !PREFILL_ROWS.contains(&rows) {
-            return Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 NVFP4 down prefill row count {rows} is outside the exact T=32,64,128,1024 routes"
-            )));
-        }
-        if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 NVFP4 down input scale divisor must be finite and positive",
-            ));
-        }
-        if !weight_scale_divisor.is_finite() || weight_scale_divisor <= 0.0 {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 NVFP4 down weight scale divisor must be finite and positive",
-            ));
-        }
-
-        macro_rules! launch {
-            ($route:ident) => {
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        activation_codes,
-                        activation_scales,
-                        weight_codes,
-                        weight_scales,
-                        input_scale_divisor,
-                        weight_scale_divisor,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match rows {
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            1_024 => launch!(t1024),
-            _ => unreachable!("row count was validated above"),
+        match route {
+            DownRoute::T32 => launch!(t32),
+            DownRoute::T64 => launch!(t64),
+            DownRoute::T128 => launch!(t128),
+            DownRoute::T1024 => launch!(t1024),
+            _ => unreachable!("prefill_route only selects the exact T routes"),
         }
     }
 }
@@ -1792,12 +1823,48 @@ impl Qwen35Nvfp4DownOp {
 #[cfg(test)]
 mod tests {
     use super::{
-        CODE_WORDS_PER_PHASE, GROUP_K, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_BATCH, OUTPUT_ROWS,
-        PHASE_GROUPS, PHASES, PREFILL_ROWS, SHARED_U32, WARPS, nvfp4_down_ptx_names,
+        CODE_WORDS_PER_PHASE, DownRoute, GROUP_K, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_BATCH,
+        Nvfp4DownEntries, OUTPUT_ROWS, PHASE_GROUPS, PHASES, PREFILL_ROWS, Qwen35Nvfp4DownEntries,
+        Qwen38Nvfp4DownEntries, SHARED_U32, THREADS, W4_BLOCK_N, W4_TILE_M, WARPS,
+        a16_launch_config, decode_route, nvfp4_down_ptx_names, prefill_geometry, prefill_route,
         qwen35_nvfp4_down_ptx_names,
     };
-    use std::collections::BTreeSet;
-    use tuisko_model::{Arch, Qwen35_9B};
+    use std::collections::{BTreeMap, BTreeSet};
+    use tuisko_gpu::LaunchConfig1D;
+    use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
+
+    /// The decode routes every admitted architecture selects, in order.
+    const DECODE_SCHEDULE: [(usize, DownRoute); 8] = [
+        (1, DownRoute::B1),
+        (2, DownRoute::B2),
+        (3, DownRoute::B3),
+        (4, DownRoute::B4),
+        (5, DownRoute::B5),
+        (6, DownRoute::B6),
+        (7, DownRoute::B7),
+        (8, DownRoute::B8),
+    ];
+
+    /// The prefill routes every admitted architecture selects, in order.
+    const PREFILL_SCHEDULE: [(usize, DownRoute); 4] = [
+        (32, DownRoute::T32),
+        (64, DownRoute::T64),
+        (128, DownRoute::T128),
+        (1_024, DownRoute::T1024),
+    ];
+
+    /// Every row count a selector admits, swept exhaustively so an unadmitted
+    /// width cannot hide between the transcribed ones.
+    fn admitted(selector: fn(usize) -> Option<DownRoute>) -> Vec<(usize, DownRoute)> {
+        (0..=2_048)
+            .chain([usize::MAX])
+            .filter_map(|rows| selector(rows).map(|route| (rows, route)))
+            .collect()
+    }
+
+    fn base_name(name: &str) -> &str {
+        name.split_once("_TID_").map_or(name, |(base, _)| base)
+    }
 
     #[test]
     fn exact_geometry_matches_the_source_owner() {
@@ -1818,6 +1885,35 @@ mod tests {
         assert_eq!(PREFILL_ROWS, [32, 64, 128, 1_024]);
     }
 
+    /// The shared launch geometry reproduces the exact grids the two replaced
+    /// owners hard-coded: 320 and 256 A16 CTAs, 80 and 64 W4A4 output tiles,
+    /// and the same 1/2/3/22 token tiles at T=32/64/128/1024.
+    #[test]
+    fn shared_geometry_reproduces_every_replaced_owner_grid() {
+        assert_eq!(
+            a16_launch_config::<Qwen38_27B>(),
+            LaunchConfig1D::new(320, THREADS, 0)
+        );
+        assert_eq!(
+            a16_launch_config::<Qwen35_9B>(),
+            LaunchConfig1D::new(256, THREADS, 0)
+        );
+
+        for (rows, tiles) in [(32, 1), (64, 2), (128, 3), (1_024, 22)] {
+            let qwen38 = prefill_geometry::<Qwen38_27B>(rows);
+            let qwen35 = prefill_geometry::<Qwen35_9B>(rows);
+
+            assert_eq!(qwen38.quantize_blocks, (rows * 1_088).div_ceil(256));
+            assert_eq!(qwen38.projection_blocks, OUTPUT_ROWS / W4_BLOCK_N);
+            assert_eq!(qwen38.projection_blocks, 80);
+            assert_eq!(qwen38.token_tiles, tiles);
+            assert_eq!(qwen35.quantize_blocks, (rows * 768).div_ceil(256));
+            assert_eq!(qwen35.projection_blocks, 64);
+            assert_eq!(qwen35.token_tiles, tiles);
+            assert_eq!(qwen35.token_tiles, rows.div_ceil(W4_TILE_M));
+        }
+    }
+
     #[test]
     fn inventory_has_one_distinct_entry_per_batch() {
         let names = nvfp4_down_ptx_names();
@@ -1830,5 +1926,97 @@ mod tests {
         let all = names.into_iter().chain(qwen35).collect::<BTreeSet<_>>();
         assert_eq!(qwen35.len(), MAX_BATCH + 2 * PREFILL_ROWS.len());
         assert_eq!(all.len(), 2 * MAX_BATCH + 4 * PREFILL_ROWS.len());
+    }
+
+    /// Each entry table publishes exactly the list that retains its own
+    /// specializations, so merging the owners cannot merge the inventories.
+    #[test]
+    fn every_entry_table_publishes_its_own_inventory() {
+        assert_eq!(
+            <Qwen38Nvfp4DownEntries as Nvfp4DownEntries<Qwen38_27B>>::ptx_names(),
+            nvfp4_down_ptx_names().to_vec()
+        );
+        assert_eq!(
+            <Qwen35Nvfp4DownEntries as Nvfp4DownEntries<Qwen35_9B>>::ptx_names(),
+            qwen35_nvfp4_down_ptx_names().to_vec()
+        );
+    }
+
+    /// A generic specialization's `_TID_` hash is only reproducible inside the
+    /// compilation that emitted it, so the stable statement about this file is
+    /// its per-base-name count. These are the counts the pinned SM120 device
+    /// build emits; a wrapper change that instantiates one more specialization
+    /// moves one of them.
+    #[test]
+    fn semantic_entry_inventory_is_pinned_per_base_name() {
+        let mut counts = BTreeMap::new();
+        for name in nvfp4_down_ptx_names()
+            .into_iter()
+            .chain(qwen35_nvfp4_down_ptx_names())
+        {
+            *counts.entry(base_name(name)).or_insert(0_usize) += 1;
+        }
+
+        assert_eq!(
+            counts
+                .iter()
+                .map(|(name, count)| (*name, *count))
+                .collect::<Vec<_>>(),
+            vec![
+                ("nvfp4_down_a16", 7),
+                ("nvfp4_down_a16_b1", 1),
+                ("nvfp4_down_quantize", 4),
+                ("nvfp4_down_w4a4", 4),
+                ("qwen35_nvfp4_down_a16", 8),
+                ("qwen35_nvfp4_down_quantize", 4),
+                ("qwen35_nvfp4_down_w4a4", 4),
+            ]
+        );
+        assert_eq!(counts.values().sum::<usize>(), 32);
+    }
+
+    /// Route parity: the merged selectors reproduce, for every admitted row
+    /// count, the exact arm each replaced dispatch took — `Nvfp4DownOp::launch`
+    /// and `Qwen35Nvfp4DownOp::launch` both matched `B=1..=8` onto their own
+    /// `b1..b8` fields, and both `launch_prefill` bodies matched
+    /// `T=32,64,128,1024` onto `t32..t1024`. Neither owner admitted anything
+    /// else, and the two domains never overlapped.
+    #[test]
+    fn row_routing_is_exact_and_disjoint() {
+        assert_eq!(admitted(decode_route), DECODE_SCHEDULE.to_vec());
+        assert_eq!(admitted(prefill_route), PREFILL_SCHEDULE.to_vec());
+
+        for rows in (0..=2_048).chain([usize::MAX]) {
+            assert!(
+                decode_route(rows).is_none() || prefill_route(rows).is_none(),
+                "row count {rows} reaches both the decode and prefill schedules"
+            );
+        }
+    }
+
+    /// An unadmitted row count keeps naming the architecture that rejected it,
+    /// with each owner's original wording preserved.
+    #[test]
+    fn unadmitted_row_counts_name_their_architecture() {
+        for (operation, expected) in [
+            (
+                <Qwen38Nvfp4DownEntries as Nvfp4DownEntries<Qwen38_27B>>::OPERATION,
+                "NVFP4 down projection",
+            ),
+            (
+                <Qwen35Nvfp4DownEntries as Nvfp4DownEntries<Qwen35_9B>>::OPERATION,
+                "Qwen3.5 NVFP4 down",
+            ),
+        ] {
+            assert_eq!(operation, expected);
+        }
+        assert_eq!(
+            <Qwen38Nvfp4DownEntries as Nvfp4DownEntries<Qwen38_27B>>::LABEL,
+            ""
+        );
+        assert_eq!(
+            <Qwen35Nvfp4DownEntries as Nvfp4DownEntries<Qwen35_9B>>::LABEL,
+            "Qwen3.5 "
+        );
     }
 }
