@@ -493,8 +493,8 @@ pub struct Bf16Cache;
 /// Represented key and value cache scales one E4M3 append applies.
 #[derive(Clone, Copy)]
 pub struct CacheScales {
-    key: f32,
-    value: f32,
+    pub(crate) key: f32,
+    pub(crate) value: f32,
 }
 
 impl private::Sealed for Fp8Cache {}
