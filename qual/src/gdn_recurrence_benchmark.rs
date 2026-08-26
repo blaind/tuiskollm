@@ -8,12 +8,12 @@ use crate::device_benchmark::{
 };
 use crate::fp8_projection_oracle::f32_to_bf16;
 use crate::harness::layout_audit::{
-    ArenaPartitionAudit, RegionSpan, require_spans_exactly_tile_arena, span,
+    AccountedArenaLayout, ArenaPartitionAudit, ArenaPartitionBuilder,
 };
 use std::sync::Arc;
 use tuisko_gpu::{
-    ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
-    GpuTimer, PinnedHostBuffer,
+    ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer,
+    PinnedHostBuffer,
 };
 use tuisko_kernels_sm120::GdnRecurrenceOp;
 use tuisko_model::{Arch, Qwen38_27B};
@@ -27,6 +27,9 @@ const VALUE_HEADS: usize = 48;
 const VALUE_WIDTH: usize = VALUE_HEADS * HEAD_DIM;
 const STATE_PER_ROW: usize = VALUE_HEADS * HEAD_DIM * HEAD_DIM;
 const STATE_ROWS: [u32; MAX_BATCH] = [0, 1, 2, 3, 4, 5, 6, 7];
+const WEIGHTS: &str = "weights";
+const STATE: &str = "state";
+const WORKSPACE: &str = "workspace";
 const VALUES: [f32; 8] = [0.75, -0.625, 0.5, -0.375, 0.25, -0.1875, 0.125, -0.0625];
 
 #[derive(Clone, Copy)]
@@ -64,7 +67,6 @@ struct Session {
     routes: Vec<RouteGraphs>,
     _op: GdnRecurrenceOp,
     _arena: DeviceArena,
-    regions: Regions,
     partition: ArenaPartitionAudit,
     _state_seed: PinnedHostBuffer<f32>,
     stream: Arc<CudaStream>,
@@ -81,14 +83,8 @@ impl Session {
         }
         let stream = context.new_stream().map_err(GpuError::from)?;
         let (layout, regions) = layout()?;
-        let mut spans = regions.spans();
-        let partition =
-            require_spans_exactly_tile_arena(&mut spans, layout.byte_len()).map_err(|error| {
-                DeviceBenchmarkError::Precondition(format!(
-                    "GDN recurrence arena partition is incomplete: {error}"
-                ))
-            })?;
-        let arena = DeviceArena::zeroed(&stream, &layout)?;
+        let arena = DeviceArena::zeroed(&stream, layout.layout())?;
+        let partition = layout.into_audit();
         let state = load_fixture(&arena, &stream, regions)?;
         let state_seed = PinnedHostBuffer::from_slice(&context, &state).map_err(GpuError::from)?;
         stream.synchronize().map_err(GpuError::from)?;
@@ -103,7 +99,6 @@ impl Session {
             routes,
             _op: op,
             _arena: arena,
-            regions,
             partition,
             _state_seed: state_seed,
             stream,
@@ -154,64 +149,36 @@ impl Session {
     }
 
     fn weight_bytes(&self) -> usize {
-        self.regions.norm_weight.byte_len()
+        self.partition.category_bytes(WEIGHTS)
     }
 
     fn state_bytes(&self) -> usize {
-        self.regions.state.byte_len()
+        self.partition.category_bytes(STATE)
     }
 
     fn workspace_bytes(&self) -> usize {
-        self.partition.payload_bytes - self.weight_bytes() - self.state_bytes()
+        self.partition.category_bytes(WORKSPACE)
     }
 
     fn padding_bytes(&self) -> usize {
-        self.partition.padding_bytes
+        self.partition.padding_bytes()
     }
 }
 
-impl Regions {
-    fn spans(self) -> [RegionSpan; 9] {
-        [
-            span("qkv", self.qkv),
-            span("projected", self.projected),
-            span("log_decay", self.log_decay),
-            span("beta", self.beta),
-            span("norm_weight", self.norm_weight),
-            span("state_rows", self.state_rows),
-            span("state", self.state),
-            span("recurrent_plane", self.recurrent_plane),
-            span("output", self.output),
-        ]
-    }
-}
-
-fn layout() -> GpuResult<(ArenaLayout, Regions)> {
-    let mut layout = ArenaLayout::new();
-    let qkv = layout.reserve(MAX_ROWS * Qwen38_27B::GDN_QKV_ROWS, ALIGNMENT)?;
-    let projected = layout.reserve(MAX_ROWS * Qwen38_27B::GDN_INPUT_ROWS, ALIGNMENT)?;
-    let log_decay = layout.reserve(MAX_ROWS * VALUE_HEADS, ALIGNMENT)?;
-    let beta = layout.reserve(MAX_ROWS * VALUE_HEADS, ALIGNMENT)?;
-    let norm_weight = layout.reserve(HEAD_DIM, ALIGNMENT)?;
-    let state_rows = layout.reserve(MAX_BATCH, ALIGNMENT)?;
-    let state = layout.reserve(MAX_BATCH * STATE_PER_ROW, ALIGNMENT)?;
-    let recurrent_plane = layout.reserve(MAX_ROWS * VALUE_WIDTH, ALIGNMENT)?;
-    let output = layout.reserve(MAX_ROWS * VALUE_WIDTH, ALIGNMENT)?;
-
-    Ok((
-        layout,
-        Regions {
-            qkv,
-            projected,
-            log_decay,
-            beta,
-            norm_weight,
-            state_rows,
-            state,
-            recurrent_plane,
-            output,
-        },
-    ))
+fn layout() -> GpuResult<(AccountedArenaLayout, Regions)> {
+    let mut builder = ArenaPartitionBuilder::new();
+    let regions = Regions {
+        qkv: builder.reserve(WORKSPACE, MAX_ROWS * Qwen38_27B::GDN_QKV_ROWS, ALIGNMENT)?,
+        projected: builder.reserve(WORKSPACE, MAX_ROWS * Qwen38_27B::GDN_INPUT_ROWS, ALIGNMENT)?,
+        log_decay: builder.reserve(WORKSPACE, MAX_ROWS * VALUE_HEADS, ALIGNMENT)?,
+        beta: builder.reserve(WORKSPACE, MAX_ROWS * VALUE_HEADS, ALIGNMENT)?,
+        norm_weight: builder.reserve(WEIGHTS, HEAD_DIM, ALIGNMENT)?,
+        state_rows: builder.reserve(WORKSPACE, MAX_BATCH, ALIGNMENT)?,
+        state: builder.reserve(STATE, MAX_BATCH * STATE_PER_ROW, ALIGNMENT)?,
+        recurrent_plane: builder.reserve(WORKSPACE, MAX_ROWS * VALUE_WIDTH, ALIGNMENT)?,
+        output: builder.reserve(WORKSPACE, MAX_ROWS * VALUE_WIDTH, ALIGNMENT)?,
+    };
+    Ok((builder.finish(), regions))
 }
 
 fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuResult<Vec<f32>> {
@@ -392,10 +359,9 @@ pub fn benchmark_gdn_recurrence(
 #[cfg(test)]
 mod tests {
     use super::{
-        EXACT_ROUTES, HEAD_DIM, MAX_BATCH, MAX_ROWS, STATE_PER_ROW, VALUE_HEADS, VALUE_WIDTH,
-        layout, logical_bytes,
+        EXACT_ROUTES, HEAD_DIM, MAX_BATCH, MAX_ROWS, STATE, STATE_PER_ROW, VALUE_HEADS,
+        VALUE_WIDTH, WEIGHTS, WORKSPACE, layout, logical_bytes,
     };
-    use crate::harness::layout_audit::require_spans_exactly_tile_arena;
     use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
@@ -417,14 +383,20 @@ mod tests {
     #[test]
     fn benchmark_route_inventory_and_owner_accounting_are_exact() {
         assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
-        let (layout, regions) = layout().unwrap();
-        let mut spans = regions.spans();
-        let partition = require_spans_exactly_tile_arena(&mut spans, layout.byte_len()).unwrap();
+        let (layout, _) = layout().unwrap();
+        let arena_bytes = layout.layout().byte_len();
+        let partition = layout.into_audit();
 
-        assert_eq!(regions.norm_weight.byte_len(), 256);
-        assert_eq!(regions.state.byte_len(), 25_165_824);
-        assert_eq!(partition.payload_bytes, 117_834_016);
-        assert_eq!(layout.byte_len(), 117_834_240);
-        assert_eq!(partition.padding_bytes, 224);
+        assert_eq!(partition.category_bytes(WEIGHTS), 256);
+        assert_eq!(partition.category_bytes(STATE), 25_165_824);
+        assert_eq!(partition.category_bytes(WORKSPACE), 92_667_936);
+        assert_eq!(
+            partition.category_bytes(WEIGHTS)
+                + partition.category_bytes(STATE)
+                + partition.category_bytes(WORKSPACE),
+            117_834_016
+        );
+        assert_eq!(arena_bytes, 117_834_240);
+        assert_eq!(partition.padding_bytes(), 224);
     }
 }
