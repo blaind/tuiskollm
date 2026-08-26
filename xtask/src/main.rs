@@ -558,7 +558,7 @@ const QUALIFICATION_IGNORED_SERIAL_FLAGS: &[&str] =
 const QUALIFICATION_IGNORED_FLAGS: &[&str] = &["--include-ignored", "--nocapture"];
 /// Trailing harness flags for suites whose tests are not `#[ignore]`d.
 const QUALIFICATION_NOCAPTURE_FLAGS: &[&str] = &["--nocapture"];
-const CUDA_OXIDE_REPOSITORY: &str = "https://github.com/NVlabs/cuda-oxide.git";
+const CUDA_OXIDE_REPOSITORY: &str = "https://github.com/blaind/cuda-oxide.git";
 const CUDA_OXIDE_REVISION: &str = "0199e55572ee78cd2cea97335e5b7392a3f9be4a";
 const MAX_IDLE_DEVICE_MEMORY_MIB: u64 = 2_048;
 
