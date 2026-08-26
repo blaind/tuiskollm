@@ -9,6 +9,7 @@ mod program;
 mod qwen35;
 mod qwen36;
 mod qwen38;
+mod qwen38_flash_next;
 mod sampling;
 
 #[cfg(feature = "qualification")]
@@ -110,6 +111,13 @@ pub use qwen38::resident_mtp_generation::{ResidentMtpGenerationSession, Resident
 pub use qwen38::resident_mtp_layout::ResidentMtpLayout;
 pub use qwen38::upload_plan::{
     ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
+};
+pub use qwen38_flash_next::engram_stager::{
+    Qwen38FlashNextEngramStager, gather_qwen38_flash_next_engram_window,
+};
+pub use qwen38_flash_next::engram_stager_layout::{
+    QWEN38_FLASH_NEXT_ENGRAM_WIDTHS, Qwen38FlashNextEngramStagerLayout,
+    require_qwen38_flash_next_engram_width,
 };
 /// Single-slot Qwen3.5 streaming request over the resident text program.
 pub type Qwen35ResidentGenerationSession<'a> =

@@ -76,6 +76,34 @@ impl Qwen38FlashNextEngramHashConstants {
         })
     }
 
+    /// Builds a smaller structurally valid law for qualification fixtures.
+    #[cfg(feature = "qualification")]
+    pub fn for_qualification(head_vocab_sizes: [i64; NGRAM_HEADS]) -> CheckpointResult<Self> {
+        if head_vocab_sizes.iter().any(|size| *size <= 0) {
+            return Err(law_error(
+                "qualification engram vocabularies must be positive",
+            ));
+        }
+
+        let layer_multipliers = compute_layer_multipliers()?;
+        let head_offsets = compute_head_offsets(&head_vocab_sizes)?;
+        let total_vocab = head_offsets[NGRAM_HEADS - 1]
+            .checked_add(head_vocab_sizes[NGRAM_HEADS - 1])
+            .ok_or_else(|| law_error("summed qualification engram vocabulary overflows"))?;
+        let padded_rows = usize::try_from(total_vocab)
+            .ok()
+            .and_then(|total| total.checked_next_multiple_of(F::NGRAM_VOCAB_DIVISOR))
+            .ok_or_else(|| law_error("qualification engram vocabulary padding overflows"))?;
+
+        Ok(Self {
+            layer_multipliers,
+            head_vocab_sizes,
+            head_offsets,
+            total_vocab,
+            padded_rows,
+        })
+    }
+
     /// Per-position hash multipliers.
     pub const fn layer_multipliers(&self) -> &[i64; NGRAM_SIZE] {
         &self.layer_multipliers
@@ -391,6 +419,23 @@ pub(crate) mod tests {
         assert_eq!(constants.head_offsets, OFFSETS);
         assert_eq!(constants.total_vocab, 320_001_446);
         assert_eq!(constants.padded_rows, 320_001_536);
+    }
+
+    #[cfg(feature = "qualification")]
+    #[test]
+    fn qualification_law_preserves_multipliers_and_derives_its_row_space() {
+        let vocabularies = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53];
+        let constants =
+            Qwen38FlashNextEngramHashConstants::for_qualification(vocabularies).unwrap();
+
+        assert_eq!(constants.layer_multipliers, MULTIPLIERS);
+        assert_eq!(constants.head_vocab_sizes, vocabularies);
+        assert_eq!(constants.total_vocab, 381);
+        assert_eq!(constants.padded_rows, 384);
+
+        let mut invalid = vocabularies;
+        invalid[7] = 0;
+        assert!(Qwen38FlashNextEngramHashConstants::for_qualification(invalid).is_err());
     }
 
     #[test]
