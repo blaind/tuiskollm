@@ -227,13 +227,15 @@ impl SafeTensorFile {
                 CheckpointError::safetensors("prefault byte accounting overflows the host")
             })
         })?;
-        crate::materialize::materialization_pool("checkpoint prefault")?.install(|| {
-            chunks.into_par_iter().try_for_each(|range| {
-                self.mmap
-                    .advise_range(Advice::PopulateRead, range.start, range.len())
-                    .map_err(|error| CheckpointError::io("prefaulting", &self.path, error))
-            })
-        })?;
+        crate::common::scale_swizzle::materialization_pool("checkpoint prefault")?.install(
+            || {
+                chunks.into_par_iter().try_for_each(|range| {
+                    self.mmap
+                        .advise_range(Advice::PopulateRead, range.start, range.len())
+                        .map_err(|error| CheckpointError::io("prefaulting", &self.path, error))
+                })
+            },
+        )?;
         Ok(bytes)
     }
 

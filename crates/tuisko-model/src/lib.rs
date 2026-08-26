@@ -1,35 +1,46 @@
 //! Exact-target checkpoint admission and source-layout ownership.
 
-mod bindings;
-mod config;
+mod common;
 mod dtype;
 mod error;
-mod inventory;
-mod materialize;
+mod qwen35;
+mod qwen36;
+mod qwen38;
 mod safetensors;
 mod views;
 
-pub use bindings::{
-    Bf16TextEndpointBindings, DenseFp8DownBindings, DenseFp8GateUpBindings, DenseFp8MlpBindings,
-    FullAttentionPostBindings, FullAttentionQkvBindings, GdnBindings,
-    ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4LinearBindings,
-    ModelOptNvfp4MlpBindings, MtpBindings, NVFP4_MLP_LAYER_END, Nvfp4DownBindings,
-    Nvfp4GateUpBindings, Nvfp4MlpBindings, Qwen36Fp8LinearBindings, Qwen36FullAttentionBindings,
-    Qwen36GdnBindings, Qwen36MoeExpertBindings, Qwen36MoeLayerBindings, Qwen36MtpBindings,
-    Qwen36TextEndpointBindings, TextEndpointBindings, VisionBindings, VisionBlockBindings,
+pub use common::config_util::validate_config;
+pub use common::inventory::CheckpointSnapshot;
+pub use common::modelopt_codec::{MaterializedModelOptNvfp4Linear, ModelOptNvfp4LinearBindings};
+pub use common::mtp::MaterializedMtpQkv;
+pub use common::nvfp4::{
+    MaterializedNvfp4Down, MaterializedNvfp4GateUp, Nvfp4DownBindings, Nvfp4GateUpBindings,
 };
-pub use config::validate_config;
+pub use common::routes::NVFP4_MLP_LAYER_END;
+pub use common::scale_swizzle::nvfp4_scale_materialization_workers;
+pub use common::vision::{VisionBindings, VisionBlockBindings};
 pub use dtype::DType;
 pub use error::{CheckpointError, CheckpointErrorCode, CheckpointResult};
-pub use inventory::CheckpointSnapshot;
-pub use materialize::{
-    MaterializedFullAttentionQkv, MaterializedModelOptNvfp4Attention, MaterializedModelOptNvfp4Gdn,
-    MaterializedModelOptNvfp4Linear, MaterializedModelOptNvfp4Mlp, MaterializedMtpQkv,
-    MaterializedNvfp4Down, MaterializedNvfp4GateUp, MaterializedQwen36Fp8Linear,
-    MaterializedQwen36FullAttention, MaterializedQwen36Gdn, MaterializedQwen36MoeExperts,
-    MaterializedQwen36MoeLayer, MaterializedQwen36TextEndpoint,
-    nvfp4_scale_materialization_workers,
+pub use qwen35::bindings::{
+    Bf16TextEndpointBindings, ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings,
+    ModelOptNvfp4MlpBindings,
 };
+pub use qwen35::materialize::{
+    MaterializedModelOptNvfp4Attention, MaterializedModelOptNvfp4Gdn, MaterializedModelOptNvfp4Mlp,
+};
+pub use qwen36::bindings::{
+    Qwen36Fp8LinearBindings, Qwen36FullAttentionBindings, Qwen36GdnBindings,
+    Qwen36MoeExpertBindings, Qwen36MoeLayerBindings, Qwen36MtpBindings, Qwen36TextEndpointBindings,
+};
+pub use qwen36::materialize::{
+    MaterializedQwen36Fp8Linear, MaterializedQwen36FullAttention, MaterializedQwen36Gdn,
+    MaterializedQwen36MoeExperts, MaterializedQwen36MoeLayer, MaterializedQwen36TextEndpoint,
+};
+pub use qwen38::bindings::{
+    DenseFp8DownBindings, DenseFp8GateUpBindings, DenseFp8MlpBindings, FullAttentionPostBindings,
+    FullAttentionQkvBindings, GdnBindings, MtpBindings, Nvfp4MlpBindings, TextEndpointBindings,
+};
+pub use qwen38::materialize::MaterializedFullAttentionQkv;
 pub use safetensors::{SafeTensorFile, TensorView};
 pub use views::{Bf16View, F32View, Fp8E4M3View, U8View};
 
