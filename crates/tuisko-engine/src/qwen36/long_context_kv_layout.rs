@@ -1,6 +1,7 @@
 //! Shared E4M3 KV ownership for the exact Qwen3.6 text geometry.
 
 use crate::common::math::product;
+use crate::common::paged_kv::{PagedKvLayout, PagedKvPlanes, sealed};
 use crate::{EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -15,11 +16,7 @@ pub const QWEN36_MAX_CONTEXT_TOKENS: usize = Qwen36Moe35B::MAX_POSITION_EMBEDDIN
 pub const QWEN36_LONG_CONTEXT_PHYSICAL_PAGES: usize =
     QWEN36_MAX_CONTEXT_TOKENS.div_ceil(ATTENTION_PAGE_SIZE);
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Qwen36LayerKvRegions {
-    pub(crate) key: ArenaRegion<u8>,
-    pub(crate) value: ArenaRegion<u8>,
-}
+pub(crate) type Qwen36LayerKvRegions = PagedKvPlanes<u8>;
 
 /// One address-stable E4M3 page pool shared by eight persistent slots.
 #[derive(Clone, Debug)]
@@ -123,14 +120,6 @@ impl Qwen36LongContextKvLayout {
         self.arena_bytes() - self.owner_bytes()
     }
 
-    pub(crate) const fn builder(&self) -> &ArenaLayout {
-        &self.builder
-    }
-
-    pub(crate) const fn block_tables(&self) -> ArenaRegion<u32> {
-        self.block_tables
-    }
-
     pub(crate) fn layers(&self) -> &[Qwen36LayerKvRegions] {
         &self.layers
     }
@@ -172,6 +161,34 @@ impl Qwen36LongContextKvLayout {
         }
 
         Ok(())
+    }
+}
+
+impl sealed::Sealed for Qwen36LongContextKvLayout {}
+
+impl PagedKvLayout for Qwen36LongContextKvLayout {
+    type Value = u8;
+
+    const NAME: &'static str = "Qwen3.6";
+    const FULL_PHYSICAL_PAGES: usize = QWEN36_LONG_CONTEXT_PHYSICAL_PAGES;
+    const MAX_CONTEXT_TOKENS: usize = QWEN36_MAX_CONTEXT_TOKENS;
+    // The exact prefill route writes every reserved target position.
+    const CLEARS_REUSED_PAGES: bool = false;
+
+    fn build_for_pages(physical_pages: usize) -> EngineResult<Self> {
+        Qwen36LongContextKvLayout::build_for_pages(physical_pages)
+    }
+
+    fn builder(&self) -> &ArenaLayout {
+        &self.builder
+    }
+
+    fn block_tables(&self) -> ArenaRegion<u32> {
+        self.block_tables
+    }
+
+    fn planes(&self) -> &[PagedKvPlanes<u8>] {
+        &self.layers
     }
 }
 

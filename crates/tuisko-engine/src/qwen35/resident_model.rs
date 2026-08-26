@@ -419,7 +419,7 @@ impl Qwen35ResidentModelProgram {
         let mut attention_layer = 0;
         for layer in 0..Qwen35_9B::LAYERS {
             let kv_binding = if layer_kind(layer) == Qwen35ResidentLayerKind::FullAttention {
-                let binding = long_context_kv.layer_binding(attention_layer)?;
+                let binding = long_context_kv.plane_binding(attention_layer)?;
                 attention_layer += 1;
                 Some(binding)
             } else {
@@ -809,20 +809,12 @@ impl Qwen35ResidentModelProgram {
         unsafe { self.endpoint.launch_lm_head_from(stream, batch, normalized) }
     }
 
-    pub(crate) fn kv_slot_state(&self, slot: usize) -> EngineResult<crate::PagedKvSlotState> {
-        self.long_context_kv.slot_state(slot)
+    pub(crate) const fn long_context_kv(&self) -> &Qwen35LongContextKvProgram {
+        &self.long_context_kv
     }
 
     pub(crate) fn kv_slot_token_count(&self, slot: usize) -> EngineResult<usize> {
         self.long_context_kv.slot_token_count(slot)
-    }
-
-    pub(crate) fn kv_route(
-        &self,
-        slot: usize,
-        position: usize,
-    ) -> EngineResult<crate::PagedKvRoute> {
-        self.long_context_kv.route(slot, position)
     }
 
     /// CUDA context shared by every resident owner.
