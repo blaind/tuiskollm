@@ -2,7 +2,12 @@
 
 mod residual_norm;
 
-pub use residual_norm::{Qwen35ResidualNormOp, Qwen36ResidualNormOp, ResidualNormOp};
+pub use residual_norm::{
+    PreparedBatchOneRoute, PreparedBatchRoute, PreparedPrefillRoute, PreparedQwen35BatchRoute,
+    Qwen35ResidualNormEntries, Qwen35ResidualNormOp, Qwen36ResidualNormEntries,
+    Qwen36ResidualNormOp, Qwen38ResidualNormEntries, ResidualNormEntries, ResidualNormOp,
+    ResidualNormRoute, UnadmittedRoute,
+};
 
 /// Semantic inventory of every entry this family emits.
 pub fn kernel_ptx_names() -> Vec<&'static str> {

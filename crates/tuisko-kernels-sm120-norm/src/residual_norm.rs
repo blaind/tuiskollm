@@ -352,19 +352,119 @@ mod kernels {
     }
 }
 
-// Prepared generic entries for one exact batch.
-struct PreparedBatchRoute<A: Arch, const TOKENS: usize> {
+mod private {
+    pub trait Sealed {}
+}
+
+/// One architecture's prepared plain and fused entries for an exact row count.
+///
+/// Sealed: the implementors are this module's prepared routes, so an entry
+/// table can never name a route whose entries the module does not emit.
+pub trait ResidualNormRoute<A: Arch>: Sized + private::Sealed {
+    /// Prepares both entries of this route's exact row count.
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self>;
+
+    /// Launches this route's plain RMSNorm entry.
+    ///
+    /// # Safety
+    ///
+    /// The pointers carry `ResidualNormOp::launch_plain`'s contract unchanged.
+    unsafe fn launch_plain(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+
+    /// Launches this route's fused residual RMSNorm entry.
+    ///
+    /// # Safety
+    ///
+    /// The pointers carry `ResidualNormOp::launch_residual`'s contract unchanged.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_residual(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        residual_input: *const u16,
+        branch: *const u16,
+        weight: *const u16,
+        residual_output: *mut u16,
+        normalized_output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+/// Exact entry table of one admitted architecture's RMSNorm routes.
+///
+/// The table is parameterized by the architecture instead of bounding
+/// [`Sm120Arch`], so admitting Qwen3.5 and Qwen3.6 here never widens the
+/// artifact-level admission bound. Each table names only the entries its own
+/// model emits, which is what keeps the compiled inventory fixed while the
+/// three prepared owners share one wrapper.
+pub trait ResidualNormEntries<A: Arch>: private::Sealed {
+    /// Prepared decode route for `B=1`.
+    type DecodeOne: ResidualNormRoute<A>;
+    /// Prepared decode route for `B=2..=8`.
+    type Decode<const TOKENS: usize>: ResidualNormRoute<A>;
+    /// Prepared prefill route for `T=1024`, unadmitted outside Qwen3.8.
+    type Prefill1024: ResidualNormRoute<A>;
+
+    /// Whether `T=1024` is an admitted prefill row count.
+    const HAS_T1024: bool;
+    /// Message prefix that keeps this architecture's launch errors distinct.
+    const LABEL: &'static str;
+
+    /// Retained PTX entry names of every route this table admits.
+    fn ptx_names() -> Vec<&'static str>;
+}
+
+/// Prepared generic decode entries for one exact batch.
+pub struct PreparedBatchRoute<A: Arch, const TOKENS: usize> {
     plain: PreparedLaunch<kernels::__rms_norm_CudaKernel<A, TOKENS>>,
     residual: PreparedLaunch<kernels::__residual_rms_norm_CudaKernel<A, TOKENS>>,
 }
 
-// B=1 keeps the concrete plain entry that anchors the embedded module artifact.
-struct PreparedBatchOneRoute {
+/// Prepared Qwen3.8 `B=1` decode entries.
+///
+/// `B=1` keeps the concrete plain entry that anchors the embedded module
+/// artifact.
+pub struct PreparedBatchOneRoute {
     plain: PreparedLaunch<kernels::__rms_norm_b1_CudaKernel>,
     residual: PreparedLaunch<kernels::__residual_rms_norm_CudaKernel<Qwen38_27B, 1>>,
 }
 
-impl PreparedBatchOneRoute {
+/// Prepared Qwen3.5 decode entries for one exact batch.
+pub struct PreparedQwen35BatchRoute<const TOKENS: usize> {
+    plain: PreparedLaunch<kernels::__qwen35_rms_norm_CudaKernel<TOKENS>>,
+    residual: PreparedLaunch<kernels::__qwen35_residual_rms_norm_CudaKernel<TOKENS>>,
+}
+
+/// Prepared prefill entries for one exact row count.
+///
+/// Prefill retains separate symbols so its resource authority cannot drift
+/// with decode.
+pub struct PreparedPrefillRoute<A: Arch, const TOKENS: usize> {
+    plain: PreparedLaunch<kernels::__rms_norm_prefill_CudaKernel<A, TOKENS>>,
+    residual: PreparedLaunch<kernels::__residual_rms_norm_prefill_CudaKernel<A, TOKENS>>,
+}
+
+/// Stands in for a row count an architecture does not admit.
+///
+/// It prepares and launches no entry, so an unadmitted width can never reach
+/// the device and never enters the emitted inventory.
+pub struct UnadmittedRoute;
+
+impl private::Sealed for PreparedBatchOneRoute {}
+impl<A: Arch, const TOKENS: usize> private::Sealed for PreparedBatchRoute<A, TOKENS> {}
+impl<const TOKENS: usize> private::Sealed for PreparedQwen35BatchRoute<TOKENS> {}
+impl<A: Arch, const TOKENS: usize> private::Sealed for PreparedPrefillRoute<A, TOKENS> {}
+impl private::Sealed for UnadmittedRoute {}
+
+// The B=1 anchor compiles the exact Qwen3.8 row width into a concrete entry,
+// so it stays bound to the sealed artifact-level architecture.
+impl<A: Sm120Arch> ResidualNormRoute<A> for PreparedBatchOneRoute {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         let launch = LaunchConfig1D::new(1, THREADS, 0);
         let plain = module
@@ -423,7 +523,7 @@ impl PreparedBatchOneRoute {
     }
 }
 
-impl<A: Arch, const TOKENS: usize> PreparedBatchRoute<A, TOKENS> {
+impl<A: Arch, const TOKENS: usize> ResidualNormRoute<A> for PreparedBatchRoute<A, TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         let blocks = u32::try_from(TOKENS)
             .map_err(|_| GpuError::invalid_launch("RMSNorm batch exceeds CUDA grid width"))?;
@@ -482,12 +582,7 @@ impl<A: Arch, const TOKENS: usize> PreparedBatchRoute<A, TOKENS> {
     }
 }
 
-struct PreparedQwen35BatchRoute<const TOKENS: usize> {
-    plain: PreparedLaunch<kernels::__qwen35_rms_norm_CudaKernel<TOKENS>>,
-    residual: PreparedLaunch<kernels::__qwen35_residual_rms_norm_CudaKernel<TOKENS>>,
-}
-
-impl<const TOKENS: usize> PreparedQwen35BatchRoute<TOKENS> {
+impl<const TOKENS: usize> ResidualNormRoute<Qwen35_9B> for PreparedQwen35BatchRoute<TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         let blocks = u32::try_from(TOKENS).map_err(|_| {
             GpuError::invalid_launch("Qwen3.5 RMSNorm batch exceeds CUDA grid width")
@@ -551,13 +646,7 @@ impl<const TOKENS: usize> PreparedQwen35BatchRoute<TOKENS> {
     }
 }
 
-// Prefill retains separate symbols so its resource authority cannot drift with decode.
-struct PreparedPrefillRoute<A: Arch, const TOKENS: usize> {
-    plain: PreparedLaunch<kernels::__rms_norm_prefill_CudaKernel<A, TOKENS>>,
-    residual: PreparedLaunch<kernels::__residual_rms_norm_prefill_CudaKernel<A, TOKENS>>,
-}
-
-impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
+impl<A: Arch, const TOKENS: usize> ResidualNormRoute<A> for PreparedPrefillRoute<A, TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         let blocks = u32::try_from(TOKENS)
             .map_err(|_| GpuError::invalid_launch("RMSNorm prefill exceeds CUDA grid width"))?;
@@ -617,6 +706,96 @@ impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
             .map_err(|source| {
                 GpuError::launch("launching the residual RMSNorm prefill kernel", source)
             })
+    }
+}
+
+impl<A: Arch> ResidualNormRoute<A> for UnadmittedRoute {
+    fn prepare(_module: &kernels::LoadedModule) -> GpuResult<Self> {
+        Ok(Self)
+    }
+
+    unsafe fn launch_plain(
+        &self,
+        _module: &kernels::LoadedModule,
+        _stream: &CudaStream,
+        _input: *const u16,
+        _weight: *const u16,
+        _output: *mut u16,
+    ) -> GpuResult<()> {
+        Err(unadmitted_route())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_residual(
+        &self,
+        _module: &kernels::LoadedModule,
+        _stream: &CudaStream,
+        _residual_input: *const u16,
+        _branch: *const u16,
+        _weight: *const u16,
+        _residual_output: *mut u16,
+        _normalized_output: *mut u16,
+    ) -> GpuResult<()> {
+        Err(unadmitted_route())
+    }
+}
+
+// `row_route` rejects an unadmitted width before dispatch, so this is the
+// defensive tail of a route that owns no entry.
+fn unadmitted_route() -> GpuError {
+    GpuError::invalid_launch("RMSNorm route is not admitted for this architecture")
+}
+
+/// Qwen3.8 entry table: the concrete `B=1` artifact anchor, the generic
+/// decode entries at `B=2..=8`, and the admitted `T=1024` prefill route.
+pub struct Qwen38ResidualNormEntries;
+
+/// Qwen3.5 entry table: its own decode entry family and prefill through `T=128`.
+pub struct Qwen35ResidualNormEntries;
+
+/// Qwen3.6 entry table: the generic decode entries and prefill through `T=128`.
+pub struct Qwen36ResidualNormEntries;
+
+impl private::Sealed for Qwen38ResidualNormEntries {}
+impl private::Sealed for Qwen35ResidualNormEntries {}
+impl private::Sealed for Qwen36ResidualNormEntries {}
+
+impl<A: Sm120Arch> ResidualNormEntries<A> for Qwen38ResidualNormEntries {
+    type DecodeOne = PreparedBatchOneRoute;
+    type Decode<const TOKENS: usize> = PreparedBatchRoute<A, TOKENS>;
+    type Prefill1024 = PreparedPrefillRoute<A, 1024>;
+
+    const HAS_T1024: bool = true;
+    const LABEL: &'static str = "";
+
+    fn ptx_names() -> Vec<&'static str> {
+        residual_norm_ptx_names()
+    }
+}
+
+impl ResidualNormEntries<Qwen35_9B> for Qwen35ResidualNormEntries {
+    type DecodeOne = PreparedQwen35BatchRoute<1>;
+    type Decode<const TOKENS: usize> = PreparedQwen35BatchRoute<TOKENS>;
+    type Prefill1024 = UnadmittedRoute;
+
+    const HAS_T1024: bool = false;
+    const LABEL: &'static str = "Qwen3.5 ";
+
+    fn ptx_names() -> Vec<&'static str> {
+        qwen35_residual_norm_ptx_names().to_vec()
+    }
+}
+
+impl ResidualNormEntries<Qwen36Moe35B> for Qwen36ResidualNormEntries {
+    type DecodeOne = PreparedBatchRoute<Qwen36Moe35B, 1>;
+    type Decode<const TOKENS: usize> = PreparedBatchRoute<Qwen36Moe35B, TOKENS>;
+    type Prefill1024 = UnadmittedRoute;
+
+    const HAS_T1024: bool = false;
+    const LABEL: &'static str = "Qwen3.6 ";
+
+    fn ptx_names() -> Vec<&'static str> {
+        qwen36_residual_norm_ptx_names().to_vec()
     }
 }
 
@@ -706,47 +885,126 @@ pub(crate) fn qwen36_residual_norm_ptx_names() -> [&'static str; 22] {
     ]
 }
 
-/// Prepared RMSNorm routes for decode `B=1..=8` and prefill `T=32,64,128,1024`.
-pub struct ResidualNormOp<A: Sm120Arch = Qwen38_27B> {
+/// The compiled route one admitted row count selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RowRoute {
+    B1,
+    B2,
+    B3,
+    B4,
+    B5,
+    B6,
+    B7,
+    B8,
+    T32,
+    T64,
+    T128,
+    T1024,
+}
+
+// The admitted row schedule, transcribed from the three prepared dispatches
+// it replaces: decode B=1..=8 and prefill T=32,64,128 everywhere, and the
+// T=1024 prefill only where the entry table admits it.
+fn row_route<A: Arch, E: ResidualNormEntries<A>>(rows: usize) -> Option<RowRoute> {
+    match rows {
+        1 => Some(RowRoute::B1),
+        2 => Some(RowRoute::B2),
+        3 => Some(RowRoute::B3),
+        4 => Some(RowRoute::B4),
+        5 => Some(RowRoute::B5),
+        6 => Some(RowRoute::B6),
+        7 => Some(RowRoute::B7),
+        8 => Some(RowRoute::B8),
+        32 => Some(RowRoute::T32),
+        64 => Some(RowRoute::T64),
+        128 => Some(RowRoute::T128),
+        1024 if E::HAS_T1024 => Some(RowRoute::T1024),
+        _ => None,
+    }
+}
+
+fn admitted_prefill_rows<A: Arch, E: ResidualNormEntries<A>>() -> &'static str {
+    if E::HAS_T1024 {
+        "32,64,128,1024"
+    } else {
+        "32,64,128"
+    }
+}
+
+fn unsupported_rows<A: Arch, E: ResidualNormEntries<A>>(operation: &str, rows: usize) -> GpuError {
+    GpuError::invalid_launch(format!(
+        "{}{operation} row count {rows} is outside exact decode 1..={MAX_BATCH} and prefill T={}",
+        E::LABEL,
+        admitted_prefill_rows::<A, E>(),
+    ))
+}
+
+/// Prepared RMSNorm routes for decode `B=1..=8` and the entry table's
+/// admitted prefill widths.
+pub struct ResidualNormOp<
+    A: Arch = Qwen38_27B,
+    E: ResidualNormEntries<A> = Qwen38ResidualNormEntries,
+> {
     module: kernels::LoadedModule,
-    b1: PreparedBatchOneRoute,
-    b2: PreparedBatchRoute<A, 2>,
-    b3: PreparedBatchRoute<A, 3>,
-    b4: PreparedBatchRoute<A, 4>,
-    b5: PreparedBatchRoute<A, 5>,
-    b6: PreparedBatchRoute<A, 6>,
-    b7: PreparedBatchRoute<A, 7>,
-    b8: PreparedBatchRoute<A, 8>,
+    b1: E::DecodeOne,
+    b2: E::Decode<2>,
+    b3: E::Decode<3>,
+    b4: E::Decode<4>,
+    b5: E::Decode<5>,
+    b6: E::Decode<6>,
+    b7: E::Decode<7>,
+    b8: E::Decode<8>,
     t32: PreparedPrefillRoute<A, 32>,
     t64: PreparedPrefillRoute<A, 64>,
     t128: PreparedPrefillRoute<A, 128>,
-    t1024: PreparedPrefillRoute<A, 1024>,
+    t1024: E::Prefill1024,
 }
 
-impl<A: Sm120Arch> ResidualNormOp<A> {
+/// Prepared Qwen3.5 RMSNorm routes for decode `B=1..8` and prefill `T=32,64,128`.
+pub type Qwen35ResidualNormOp = ResidualNormOp<Qwen35_9B, Qwen35ResidualNormEntries>;
+
+/// Prepared Qwen3.6 RMSNorm routes for decode `B=1..8` and prefill `T=32,64,128`.
+pub type Qwen36ResidualNormOp = ResidualNormOp<Qwen36Moe35B, Qwen36ResidualNormEntries>;
+
+impl<A: Arch, E: ResidualNormEntries<A>> ResidualNormOp<A, E> {
     /// Loads the embedded SM120 module and prepares every exact-batch route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        residual_norm_geometry::<A>().ok_or_else(|| {
-            GpuError::invalid_launch("RMSNorm requires a positive even hidden width")
+        let geometry = residual_norm_geometry::<A>().ok_or_else(|| {
+            GpuError::invalid_launch(format!(
+                "{}RMSNorm requires a positive even hidden width",
+                E::LABEL
+            ))
         })?;
-        let _ = residual_norm_ptx_names();
+        // Every admitted width divides evenly across the 512-thread CTA:
+        // Qwen3.5/3.6/3.8 consume exactly four/two/five packed pairs per
+        // thread, which is what keeps the qualified 16-warp reduction order.
+        if geometry.pairs_per_thread * THREADS as usize != geometry.pairs_per_row {
+            return Err(GpuError::invalid_launch(format!(
+                "{}RMSNorm requires an exact packed-pair/thread mapping",
+                E::LABEL
+            )));
+        }
+        let _ = E::ptx_names();
         // SAFETY: this crate owns one cuda-oxide module and its embedded artifact.
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module("loading the residual-norm module", source))?;
 
+        // T=128 is 128 independent rows. One 128-CTA launch removes 15
+        // boundaries versus sixteen B=8 launches while each CTA retains the
+        // same 512-thread traversal and reduction order.
         Ok(Self {
-            b1: PreparedBatchOneRoute::prepare(&module)?,
-            b2: PreparedBatchRoute::prepare(&module)?,
-            b3: PreparedBatchRoute::prepare(&module)?,
-            b4: PreparedBatchRoute::prepare(&module)?,
-            b5: PreparedBatchRoute::prepare(&module)?,
-            b6: PreparedBatchRoute::prepare(&module)?,
-            b7: PreparedBatchRoute::prepare(&module)?,
-            b8: PreparedBatchRoute::prepare(&module)?,
+            b1: E::DecodeOne::prepare(&module)?,
+            b2: E::Decode::<2>::prepare(&module)?,
+            b3: E::Decode::<3>::prepare(&module)?,
+            b4: E::Decode::<4>::prepare(&module)?,
+            b5: E::Decode::<5>::prepare(&module)?,
+            b6: E::Decode::<6>::prepare(&module)?,
+            b7: E::Decode::<7>::prepare(&module)?,
+            b8: E::Decode::<8>::prepare(&module)?,
             t32: PreparedPrefillRoute::prepare(&module)?,
             t64: PreparedPrefillRoute::prepare(&module)?,
             t128: PreparedPrefillRoute::prepare(&module)?,
-            t1024: PreparedPrefillRoute::prepare(&module)?,
+            t1024: E::Prefill1024::prepare(&module)?,
             module,
         })
     }
@@ -761,7 +1019,7 @@ impl<A: Sm120Arch> ResidualNormOp<A> {
     pub unsafe fn launch_plain(
         &self,
         stream: &CudaStream,
-        batch: usize,
+        rows: usize,
         input: *const u16,
         weight: *const u16,
         output: *mut u16,
@@ -776,22 +1034,20 @@ impl<A: Sm120Arch> ResidualNormOp<A> {
             };
         }
 
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            1024 => launch!(t1024),
-            _ => Err(GpuError::invalid_launch(format!(
-                "RMSNorm row count {batch} is outside exact decode 1..={MAX_BATCH} and prefill T=32,64,128,1024"
-            ))),
+        match row_route::<A, E>(rows) {
+            Some(RowRoute::B1) => launch!(b1),
+            Some(RowRoute::B2) => launch!(b2),
+            Some(RowRoute::B3) => launch!(b3),
+            Some(RowRoute::B4) => launch!(b4),
+            Some(RowRoute::B5) => launch!(b5),
+            Some(RowRoute::B6) => launch!(b6),
+            Some(RowRoute::B7) => launch!(b7),
+            Some(RowRoute::B8) => launch!(b8),
+            Some(RowRoute::T32) => launch!(t32),
+            Some(RowRoute::T64) => launch!(t64),
+            Some(RowRoute::T128) => launch!(t128),
+            Some(RowRoute::T1024) => launch!(t1024),
+            None => Err(unsupported_rows::<A, E>("RMSNorm", rows)),
         }
     }
 
@@ -800,189 +1056,7 @@ impl<A: Sm120Arch> ResidualNormOp<A> {
     /// # Safety
     ///
     /// Every pointer must be four-byte aligned. Row planes must cover
-    /// `batch * A::HIDDEN` BF16 values and `weight` must cover `A::HIDDEN` values.
-    /// Allocations must belong to `stream`'s context, remain live through
-    /// completion, and not overlap except that the two input planes may alias.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn launch_residual(
-        &self,
-        stream: &CudaStream,
-        batch: usize,
-        residual_input: *const u16,
-        branch: *const u16,
-        weight: *const u16,
-        residual_output: *mut u16,
-        normalized_output: *mut u16,
-    ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: the public method's pointer contract is unchanged by dispatch.
-                unsafe {
-                    self.$route.launch_residual(
-                        &self.module,
-                        stream,
-                        residual_input,
-                        branch,
-                        weight,
-                        residual_output,
-                        normalized_output,
-                    )
-                }
-            };
-        }
-
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            1024 => launch!(t1024),
-            _ => Err(GpuError::invalid_launch(format!(
-                "residual RMSNorm row count {batch} is outside exact decode 1..={MAX_BATCH} and prefill T=32,64,128,1024"
-            ))),
-        }
-    }
-}
-
-/// Prepared Qwen3.5 RMSNorm routes for decode `B=1..8` and prefill `T=32,64,128`.
-pub struct Qwen35ResidualNormOp {
-    module: kernels::LoadedModule,
-    b1: PreparedQwen35BatchRoute<1>,
-    b2: PreparedQwen35BatchRoute<2>,
-    b3: PreparedQwen35BatchRoute<3>,
-    b4: PreparedQwen35BatchRoute<4>,
-    b5: PreparedQwen35BatchRoute<5>,
-    b6: PreparedQwen35BatchRoute<6>,
-    b7: PreparedQwen35BatchRoute<7>,
-    b8: PreparedQwen35BatchRoute<8>,
-    t32: PreparedPrefillRoute<Qwen35_9B, 32>,
-    t64: PreparedPrefillRoute<Qwen35_9B, 64>,
-    t128: PreparedPrefillRoute<Qwen35_9B, 128>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Qwen35RowRoute {
-    B1,
-    B2,
-    B3,
-    B4,
-    B5,
-    B6,
-    B7,
-    B8,
-    T32,
-    T64,
-    T128,
-}
-
-fn qwen35_row_route(rows: usize) -> Option<Qwen35RowRoute> {
-    match rows {
-        1 => Some(Qwen35RowRoute::B1),
-        2 => Some(Qwen35RowRoute::B2),
-        3 => Some(Qwen35RowRoute::B3),
-        4 => Some(Qwen35RowRoute::B4),
-        5 => Some(Qwen35RowRoute::B5),
-        6 => Some(Qwen35RowRoute::B6),
-        7 => Some(Qwen35RowRoute::B7),
-        8 => Some(Qwen35RowRoute::B8),
-        32 => Some(Qwen35RowRoute::T32),
-        64 => Some(Qwen35RowRoute::T64),
-        128 => Some(Qwen35RowRoute::T128),
-        _ => None,
-    }
-}
-
-impl Qwen35ResidualNormOp {
-    /// Loads the embedded SM120 module and prepares every exact Qwen3.5 route.
-    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        let geometry = residual_norm_geometry::<Qwen35_9B>().ok_or_else(|| {
-            GpuError::invalid_launch("Qwen3.5 RMSNorm requires a positive even hidden width")
-        })?;
-        if geometry.pairs_per_thread * THREADS as usize != geometry.pairs_per_row {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.5 RMSNorm requires an exact packed-pair/thread mapping",
-            ));
-        }
-        let _ = qwen35_residual_norm_ptx_names();
-        // SAFETY: this crate owns one cuda-oxide module and its embedded artifact.
-        let module = unsafe { kernels::load(context) }
-            .map_err(|source| GpuError::module("loading the residual-norm module", source))?;
-
-        // T=128 is 128 independent 4,096-wide rows. One 128-CTA launch
-        // removes 15 boundaries versus sixteen B=8 launches while each CTA
-        // retains the same 512-thread traversal and reduction order.
-        Ok(Self {
-            b1: PreparedQwen35BatchRoute::prepare(&module)?,
-            b2: PreparedQwen35BatchRoute::prepare(&module)?,
-            b3: PreparedQwen35BatchRoute::prepare(&module)?,
-            b4: PreparedQwen35BatchRoute::prepare(&module)?,
-            b5: PreparedQwen35BatchRoute::prepare(&module)?,
-            b6: PreparedQwen35BatchRoute::prepare(&module)?,
-            b7: PreparedQwen35BatchRoute::prepare(&module)?,
-            b8: PreparedQwen35BatchRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
-            module,
-        })
-    }
-
-    /// Launches plain zero-centered RMSNorm for one admitted row count.
-    ///
-    /// # Safety
-    ///
-    /// Pointers must be four-byte aligned and cover complete 4,096-value rows.
-    /// Allocations must belong to `stream`'s context, remain live through stream
-    /// completion, and input and output must not overlap.
-    pub unsafe fn launch_plain(
-        &self,
-        stream: &CudaStream,
-        rows: usize,
-        input: *const u16,
-        weight: *const u16,
-        output: *mut u16,
-    ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: the public method's pointer contract is unchanged by dispatch.
-                unsafe {
-                    self.$route
-                        .launch_plain(&self.module, stream, input, weight, output)
-                }
-            };
-        }
-
-        match qwen35_row_route(rows) {
-            Some(Qwen35RowRoute::B1) => launch!(b1),
-            Some(Qwen35RowRoute::B2) => launch!(b2),
-            Some(Qwen35RowRoute::B3) => launch!(b3),
-            Some(Qwen35RowRoute::B4) => launch!(b4),
-            Some(Qwen35RowRoute::B5) => launch!(b5),
-            Some(Qwen35RowRoute::B6) => launch!(b6),
-            Some(Qwen35RowRoute::B7) => launch!(b7),
-            Some(Qwen35RowRoute::B8) => launch!(b8),
-            Some(Qwen35RowRoute::T32) => launch!(t32),
-            Some(Qwen35RowRoute::T64) => launch!(t64),
-            Some(Qwen35RowRoute::T128) => launch!(t128),
-            None => Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 RMSNorm row count {rows} is outside exact decode 1..={MAX_BATCH} and prefill T=32,64,128"
-            ))),
-        }
-    }
-
-    /// Publishes BF16 residual sums and normalizes the represented rows.
-    ///
-    /// # Safety
-    ///
-    /// Pointers must be four-byte aligned. Row planes must cover
-    /// `rows * 4,096` BF16 values and `weight` must cover 4,096 values.
+    /// `rows * A::HIDDEN` BF16 values and `weight` must cover `A::HIDDEN` values.
     /// Allocations must belong to `stream`'s context, remain live through
     /// completion, and not overlap except that the two input planes may alias.
     #[allow(clippy::too_many_arguments)]
@@ -1013,206 +1087,20 @@ impl Qwen35ResidualNormOp {
             };
         }
 
-        match qwen35_row_route(rows) {
-            Some(Qwen35RowRoute::B1) => launch!(b1),
-            Some(Qwen35RowRoute::B2) => launch!(b2),
-            Some(Qwen35RowRoute::B3) => launch!(b3),
-            Some(Qwen35RowRoute::B4) => launch!(b4),
-            Some(Qwen35RowRoute::B5) => launch!(b5),
-            Some(Qwen35RowRoute::B6) => launch!(b6),
-            Some(Qwen35RowRoute::B7) => launch!(b7),
-            Some(Qwen35RowRoute::B8) => launch!(b8),
-            Some(Qwen35RowRoute::T32) => launch!(t32),
-            Some(Qwen35RowRoute::T64) => launch!(t64),
-            Some(Qwen35RowRoute::T128) => launch!(t128),
-            None => Err(GpuError::invalid_launch(format!(
-                "Qwen3.5 residual RMSNorm row count {rows} is outside exact decode 1..={MAX_BATCH} and prefill T=32,64,128"
-            ))),
-        }
-    }
-}
-
-/// Prepared Qwen3.6 RMSNorm routes for decode `B=1..8` and prefill `T=32,64,128`.
-pub struct Qwen36ResidualNormOp {
-    module: kernels::LoadedModule,
-    b1: PreparedBatchRoute<Qwen36Moe35B, 1>,
-    b2: PreparedBatchRoute<Qwen36Moe35B, 2>,
-    b3: PreparedBatchRoute<Qwen36Moe35B, 3>,
-    b4: PreparedBatchRoute<Qwen36Moe35B, 4>,
-    b5: PreparedBatchRoute<Qwen36Moe35B, 5>,
-    b6: PreparedBatchRoute<Qwen36Moe35B, 6>,
-    b7: PreparedBatchRoute<Qwen36Moe35B, 7>,
-    b8: PreparedBatchRoute<Qwen36Moe35B, 8>,
-    t32: PreparedPrefillRoute<Qwen36Moe35B, 32>,
-    t64: PreparedPrefillRoute<Qwen36Moe35B, 64>,
-    t128: PreparedPrefillRoute<Qwen36Moe35B, 128>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Qwen36RowRoute {
-    B1,
-    B2,
-    B3,
-    B4,
-    B5,
-    B6,
-    B7,
-    B8,
-    T32,
-    T64,
-    T128,
-}
-
-fn qwen36_row_route(rows: usize) -> Option<Qwen36RowRoute> {
-    match rows {
-        1 => Some(Qwen36RowRoute::B1),
-        2 => Some(Qwen36RowRoute::B2),
-        3 => Some(Qwen36RowRoute::B3),
-        4 => Some(Qwen36RowRoute::B4),
-        5 => Some(Qwen36RowRoute::B5),
-        6 => Some(Qwen36RowRoute::B6),
-        7 => Some(Qwen36RowRoute::B7),
-        8 => Some(Qwen36RowRoute::B8),
-        32 => Some(Qwen36RowRoute::T32),
-        64 => Some(Qwen36RowRoute::T64),
-        128 => Some(Qwen36RowRoute::T128),
-        _ => None,
-    }
-}
-
-impl Qwen36ResidualNormOp {
-    /// Loads the embedded SM120 module and prepares every exact Qwen3.6 route.
-    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        let geometry = residual_norm_geometry::<Qwen36Moe35B>().ok_or_else(|| {
-            GpuError::invalid_launch("Qwen3.6 RMSNorm requires a positive even hidden width")
-        })?;
-        // The exact 2,048-wide row has 1,024 packed pairs: 512 threads retain
-        // the qualified 16-warp reduction and consume exactly two pairs/thread.
-        // This changes only the independent row width; each lane's two-pair
-        // accumulation and the fixed warp/block reduction order stay explicit.
-        if geometry.pairs_per_thread * THREADS as usize != geometry.pairs_per_row {
-            return Err(GpuError::invalid_launch(
-                "Qwen3.6 RMSNorm requires an exact packed-pair/thread mapping",
-            ));
-        }
-        let _ = qwen36_residual_norm_ptx_names();
-        // SAFETY: this crate owns one cuda-oxide module and its embedded artifact.
-        let module = unsafe { kernels::load(context) }
-            .map_err(|source| GpuError::module("loading the residual-norm module", source))?;
-
-        // T=128 is 128 independent 2,048-wide rows. One 128-CTA launch
-        // removes 15 boundaries versus sixteen B=8 launches while each CTA
-        // retains the same 512-thread pair traversal and reduction order.
-        Ok(Self {
-            b1: PreparedBatchRoute::prepare(&module)?,
-            b2: PreparedBatchRoute::prepare(&module)?,
-            b3: PreparedBatchRoute::prepare(&module)?,
-            b4: PreparedBatchRoute::prepare(&module)?,
-            b5: PreparedBatchRoute::prepare(&module)?,
-            b6: PreparedBatchRoute::prepare(&module)?,
-            b7: PreparedBatchRoute::prepare(&module)?,
-            b8: PreparedBatchRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
-            module,
-        })
-    }
-
-    /// Launches plain zero-centered RMSNorm for one admitted row count.
-    ///
-    /// # Safety
-    ///
-    /// Pointers must be four-byte aligned and cover complete 2,048-value rows.
-    /// Allocations must belong to `stream`'s context, remain live through stream
-    /// completion, and input and output must not overlap.
-    pub unsafe fn launch_plain(
-        &self,
-        stream: &CudaStream,
-        rows: usize,
-        input: *const u16,
-        weight: *const u16,
-        output: *mut u16,
-    ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: the public method's pointer contract is unchanged by dispatch.
-                unsafe {
-                    self.$route
-                        .launch_plain(&self.module, stream, input, weight, output)
-                }
-            };
-        }
-
-        match qwen36_row_route(rows) {
-            Some(Qwen36RowRoute::B1) => launch!(b1),
-            Some(Qwen36RowRoute::B2) => launch!(b2),
-            Some(Qwen36RowRoute::B3) => launch!(b3),
-            Some(Qwen36RowRoute::B4) => launch!(b4),
-            Some(Qwen36RowRoute::B5) => launch!(b5),
-            Some(Qwen36RowRoute::B6) => launch!(b6),
-            Some(Qwen36RowRoute::B7) => launch!(b7),
-            Some(Qwen36RowRoute::B8) => launch!(b8),
-            Some(Qwen36RowRoute::T32) => launch!(t32),
-            Some(Qwen36RowRoute::T64) => launch!(t64),
-            Some(Qwen36RowRoute::T128) => launch!(t128),
-            _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.6 RMSNorm row count {rows} is outside exact decode 1..={MAX_BATCH} and prefill T=32,64,128"
-            ))),
-        }
-    }
-
-    /// Publishes BF16 residual sums and normalizes the represented rows.
-    ///
-    /// # Safety
-    ///
-    /// Pointers must be four-byte aligned. Row planes must cover
-    /// `rows * 2,048` BF16 values and `weight` must cover 2,048 values.
-    /// Allocations must belong to `stream`'s context, remain live through
-    /// completion, and not overlap except that the two input planes may alias.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn launch_residual(
-        &self,
-        stream: &CudaStream,
-        rows: usize,
-        residual_input: *const u16,
-        branch: *const u16,
-        weight: *const u16,
-        residual_output: *mut u16,
-        normalized_output: *mut u16,
-    ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: the public method's pointer contract is unchanged by dispatch.
-                unsafe {
-                    self.$route.launch_residual(
-                        &self.module,
-                        stream,
-                        residual_input,
-                        branch,
-                        weight,
-                        residual_output,
-                        normalized_output,
-                    )
-                }
-            };
-        }
-
-        match qwen36_row_route(rows) {
-            Some(Qwen36RowRoute::B1) => launch!(b1),
-            Some(Qwen36RowRoute::B2) => launch!(b2),
-            Some(Qwen36RowRoute::B3) => launch!(b3),
-            Some(Qwen36RowRoute::B4) => launch!(b4),
-            Some(Qwen36RowRoute::B5) => launch!(b5),
-            Some(Qwen36RowRoute::B6) => launch!(b6),
-            Some(Qwen36RowRoute::B7) => launch!(b7),
-            Some(Qwen36RowRoute::B8) => launch!(b8),
-            Some(Qwen36RowRoute::T32) => launch!(t32),
-            Some(Qwen36RowRoute::T64) => launch!(t64),
-            Some(Qwen36RowRoute::T128) => launch!(t128),
-            _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.6 residual RMSNorm row count {rows} is outside exact decode 1..={MAX_BATCH} and prefill T=32,64,128"
-            ))),
+        match row_route::<A, E>(rows) {
+            Some(RowRoute::B1) => launch!(b1),
+            Some(RowRoute::B2) => launch!(b2),
+            Some(RowRoute::B3) => launch!(b3),
+            Some(RowRoute::B4) => launch!(b4),
+            Some(RowRoute::B5) => launch!(b5),
+            Some(RowRoute::B6) => launch!(b6),
+            Some(RowRoute::B7) => launch!(b7),
+            Some(RowRoute::B8) => launch!(b8),
+            Some(RowRoute::T32) => launch!(t32),
+            Some(RowRoute::T64) => launch!(t64),
+            Some(RowRoute::T128) => launch!(t128),
+            Some(RowRoute::T1024) => launch!(t1024),
+            None => Err(unsupported_rows::<A, E>("residual RMSNorm", rows)),
         }
     }
 }
@@ -1220,13 +1108,42 @@ impl Qwen36ResidualNormOp {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BATCH, Qwen35RowRoute, Qwen36RowRoute, THREADS, WARPS, qwen35_residual_norm_ptx_names,
-        qwen35_row_route, qwen36_residual_norm_ptx_names, qwen36_row_route, residual_norm_geometry,
-        residual_norm_ptx_names,
+        MAX_BATCH, Qwen35ResidualNormEntries, Qwen36ResidualNormEntries, Qwen38ResidualNormEntries,
+        ResidualNormEntries, RowRoute, THREADS, WARPS, qwen35_residual_norm_ptx_names,
+        qwen36_residual_norm_ptx_names, residual_norm_geometry, residual_norm_ptx_names, row_route,
+        unsupported_rows,
     };
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use tuisko_kernels_sm120_common::TestArch;
     use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
+
+    /// The decode and prefill widths every admitted architecture routes.
+    const SHARED_SCHEDULE: [(usize, RowRoute); 11] = [
+        (1, RowRoute::B1),
+        (2, RowRoute::B2),
+        (3, RowRoute::B3),
+        (4, RowRoute::B4),
+        (5, RowRoute::B5),
+        (6, RowRoute::B6),
+        (7, RowRoute::B7),
+        (8, RowRoute::B8),
+        (32, RowRoute::T32),
+        (64, RowRoute::T64),
+        (128, RowRoute::T128),
+    ];
+
+    /// Every row count the entry table admits, swept exhaustively so an
+    /// unadmitted width cannot hide between the transcribed ones.
+    fn admitted_schedule<A: Arch, E: ResidualNormEntries<A>>() -> Vec<(usize, RowRoute)> {
+        (0..=2_048)
+            .chain([usize::MAX])
+            .filter_map(|rows| row_route::<A, E>(rows).map(|route| (rows, route)))
+            .collect()
+    }
+
+    fn base_name(name: &str) -> &str {
+        name.split_once("_TID_").map_or(name, |(base, _)| base)
+    }
 
     #[test]
     fn exact_geometry_is_pair_and_cta_aligned() {
@@ -1253,6 +1170,23 @@ mod tests {
         assert_eq!(qwen36.pairs_per_thread, 2);
         assert_eq!(test.pairs_per_row, 512);
         assert_eq!(test.pairs_per_thread, 1);
+    }
+
+    /// The shared prepare path rejects an inexact packed-pair/thread mapping;
+    /// every admitted architecture satisfies it, so the merged owner keeps
+    /// each model's qualified 16-warp reduction.
+    #[test]
+    fn every_admitted_width_maps_exactly_onto_the_cta() {
+        for geometry in [
+            residual_norm_geometry::<Qwen38_27B>().unwrap(),
+            residual_norm_geometry::<Qwen35_9B>().unwrap(),
+            residual_norm_geometry::<Qwen36Moe35B>().unwrap(),
+        ] {
+            assert_eq!(
+                geometry.pairs_per_thread * THREADS as usize,
+                geometry.pairs_per_row
+            );
+        }
     }
 
     #[test]
@@ -1294,51 +1228,118 @@ mod tests {
         assert_eq!(unique.len(), qwen38.len() + qwen35.len() + qwen36.len());
     }
 
+    /// Each entry table publishes exactly the list that retains its own
+    /// specializations, so merging the owners cannot merge the inventories.
     #[test]
-    fn qwen36_row_routing_is_exact() {
-        assert_eq!(qwen36_row_route(0), None);
+    fn every_entry_table_publishes_its_own_inventory() {
         assert_eq!(
-            [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128].map(qwen36_row_route),
-            [
-                Some(Qwen36RowRoute::B1),
-                Some(Qwen36RowRoute::B2),
-                Some(Qwen36RowRoute::B3),
-                Some(Qwen36RowRoute::B4),
-                Some(Qwen36RowRoute::B5),
-                Some(Qwen36RowRoute::B6),
-                Some(Qwen36RowRoute::B7),
-                Some(Qwen36RowRoute::B8),
-                Some(Qwen36RowRoute::T32),
-                Some(Qwen36RowRoute::T64),
-                Some(Qwen36RowRoute::T128),
-            ]
+            <Qwen38ResidualNormEntries as ResidualNormEntries<Qwen38_27B>>::ptx_names(),
+            residual_norm_ptx_names()
         );
-        for rows in [9, 31, 33, 63, 65, 127, 129, usize::MAX] {
-            assert_eq!(qwen36_row_route(rows), None);
-        }
+        assert_eq!(
+            <Qwen35ResidualNormEntries as ResidualNormEntries<Qwen35_9B>>::ptx_names(),
+            qwen35_residual_norm_ptx_names().to_vec()
+        );
+        assert_eq!(
+            <Qwen36ResidualNormEntries as ResidualNormEntries<Qwen36Moe35B>>::ptx_names(),
+            qwen36_residual_norm_ptx_names().to_vec()
+        );
     }
 
+    /// A generic specialization's `_TID_` hash is only reproducible inside the
+    /// compilation that emitted it, so the stable statement about this family
+    /// is its per-base-name count. These are the counts the pinned SM120
+    /// device build emits; a wrapper change that instantiates one more
+    /// specialization moves one of them.
     #[test]
-    fn qwen35_row_routing_is_exact() {
-        assert_eq!(qwen35_row_route(0), None);
+    fn semantic_entry_inventory_is_pinned_per_base_name() {
+        let mut counts = BTreeMap::new();
+        for name in residual_norm_ptx_names()
+            .into_iter()
+            .chain(qwen35_residual_norm_ptx_names())
+            .chain(qwen36_residual_norm_ptx_names())
+        {
+            *counts.entry(base_name(name)).or_insert(0_usize) += 1;
+        }
+
         assert_eq!(
-            [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128].map(qwen35_row_route),
-            [
-                Some(Qwen35RowRoute::B1),
-                Some(Qwen35RowRoute::B2),
-                Some(Qwen35RowRoute::B3),
-                Some(Qwen35RowRoute::B4),
-                Some(Qwen35RowRoute::B5),
-                Some(Qwen35RowRoute::B6),
-                Some(Qwen35RowRoute::B7),
-                Some(Qwen35RowRoute::B8),
-                Some(Qwen35RowRoute::T32),
-                Some(Qwen35RowRoute::T64),
-                Some(Qwen35RowRoute::T128),
+            counts
+                .iter()
+                .map(|(name, count)| (*name, *count))
+                .collect::<Vec<_>>(),
+            vec![
+                ("qwen35_residual_rms_norm", 8),
+                ("qwen35_rms_norm", 8),
+                ("residual_rms_norm", 16),
+                ("residual_rms_norm_prefill", 10),
+                ("rms_norm", 15),
+                ("rms_norm_b1", 1),
+                ("rms_norm_prefill", 10),
             ]
         );
-        for rows in [9, 31, 33, 63, 65, 127, 129, usize::MAX] {
-            assert_eq!(qwen35_row_route(rows), None);
+        assert_eq!(counts.values().sum::<usize>(), 68);
+    }
+
+    /// The merged schedule, checked against the three dispatches it replaces:
+    /// Qwen3.5 and Qwen3.6 stop at `T=128`, and only Qwen3.8 admits `T=1024`.
+    #[test]
+    fn row_routing_is_exact_for_every_admitted_architecture() {
+        let qwen38 = SHARED_SCHEDULE
+            .iter()
+            .copied()
+            .chain([(1_024, RowRoute::T1024)])
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            admitted_schedule::<Qwen38_27B, Qwen38ResidualNormEntries>(),
+            qwen38
+        );
+        assert_eq!(
+            admitted_schedule::<Qwen35_9B, Qwen35ResidualNormEntries>(),
+            SHARED_SCHEDULE.to_vec()
+        );
+        assert_eq!(
+            admitted_schedule::<Qwen36Moe35B, Qwen36ResidualNormEntries>(),
+            SHARED_SCHEDULE.to_vec()
+        );
+    }
+
+    /// An unadmitted row count keeps naming the architecture that rejected it.
+    #[test]
+    fn unadmitted_row_counts_name_their_architecture() {
+        for (message, error) in [
+            (
+                "RMSNorm row count 9 is outside exact decode 1..=8 and prefill T=32,64,128,1024",
+                unsupported_rows::<Qwen38_27B, Qwen38ResidualNormEntries>("RMSNorm", 9),
+            ),
+            (
+                "residual RMSNorm row count 9 is outside exact decode 1..=8 and prefill T=32,64,128,1024",
+                unsupported_rows::<Qwen38_27B, Qwen38ResidualNormEntries>("residual RMSNorm", 9),
+            ),
+            (
+                "Qwen3.5 RMSNorm row count 1024 is outside exact decode 1..=8 and prefill T=32,64,128",
+                unsupported_rows::<Qwen35_9B, Qwen35ResidualNormEntries>("RMSNorm", 1_024),
+            ),
+            (
+                "Qwen3.5 residual RMSNorm row count 1024 is outside exact decode 1..=8 and prefill T=32,64,128",
+                unsupported_rows::<Qwen35_9B, Qwen35ResidualNormEntries>("residual RMSNorm", 1_024),
+            ),
+            (
+                "Qwen3.6 RMSNorm row count 1024 is outside exact decode 1..=8 and prefill T=32,64,128",
+                unsupported_rows::<Qwen36Moe35B, Qwen36ResidualNormEntries>("RMSNorm", 1_024),
+            ),
+            (
+                "Qwen3.6 residual RMSNorm row count 1024 is outside exact decode 1..=8 and prefill T=32,64,128",
+                unsupported_rows::<Qwen36Moe35B, Qwen36ResidualNormEntries>(
+                    "residual RMSNorm",
+                    1_024,
+                ),
+            ),
+        ] {
+            assert!(
+                error.to_string().ends_with(message),
+                "{error} does not end with {message}"
+            );
         }
     }
 }
