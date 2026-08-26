@@ -85,7 +85,6 @@ pub struct ResidentModelProfileManifest {
 }
 
 struct Session {
-    timer: GpuTimer,
     program: ResidentModelProgram,
     routes: [ResidentDecodeRoute; MAX_BATCH],
     context_lengths: [usize; MAX_BATCH],
@@ -94,7 +93,6 @@ struct Session {
 }
 
 struct PrefillSession {
-    timer: GpuTimer,
     program: ResidentModelProgram,
     routes: [ResidentPrefillRoute; PREFILL_CASES.len()],
     stream: Arc<CudaStream>,
@@ -148,9 +146,7 @@ impl PrefillSession {
                     "resident prefill route inventory has wrong cardinality".to_string(),
                 )
             })?;
-        let timer = GpuTimer::new(&context)?;
         Ok(Self {
-            timer,
             program,
             routes,
             stream,
@@ -304,9 +300,7 @@ impl Session {
                     "resident decode route inventory has wrong cardinality".to_string(),
                 )
             })?;
-        let timer = GpuTimer::new(&context)?;
         Ok(Self {
-            timer,
             program,
             routes,
             context_lengths,
@@ -994,6 +988,7 @@ pub fn benchmark_resident_prefill(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = PrefillSession::new(root)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     let stage_graphs = session.stage_graphs()?;
     for (name, kind, bytes, description) in [
         (
@@ -1053,7 +1048,7 @@ pub fn benchmark_resident_prefill(
     require_current_process_exclusive()?;
     let cases = session.cases(&stage_graphs)?;
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
     finish_report(
         BenchmarkReportSpec {
@@ -1119,6 +1114,7 @@ fn benchmark_resident_profile(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(root, profile)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     let embedding_graphs = session.embedding_graphs()?;
     memory.register_owned(
         names[0],
@@ -1174,7 +1170,7 @@ fn benchmark_resident_profile(
     require_current_process_exclusive()?;
     let cases = session.cases(&embedding_graphs, operation)?;
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
     finish_report(
         BenchmarkReportSpec {

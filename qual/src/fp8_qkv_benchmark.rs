@@ -64,7 +64,6 @@ struct Addresses {
 
 struct Session {
     routes: Vec<RouteGraphs>,
-    timer: GpuTimer,
     _op: FullAttentionQkvOp,
     arena: DeviceArena,
     regions: Regions,
@@ -113,11 +112,9 @@ impl Session {
                 repeated_operations,
             )?);
         }
-        let timer = GpuTimer::new(&context)?;
 
         Ok(Self {
             routes,
-            timer,
             _op: op,
             arena,
             regions,
@@ -294,6 +291,7 @@ pub fn benchmark_fp8_qkv(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(options.launches_per_sample)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     let weight_bytes = session.weight_bytes();
     memory.register_owned(
         "fp8_qkv/weights",
@@ -313,7 +311,7 @@ pub fn benchmark_fp8_qkv(
     require_current_process_exclusive()?;
     let cases = session.cases(options.launches_per_sample);
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
 
     finish_report(

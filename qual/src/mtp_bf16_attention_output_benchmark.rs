@@ -32,7 +32,6 @@ struct RouteGraphs {
 
 struct Session {
     routes: Vec<RouteGraphs>,
-    timer: GpuTimer,
     _op: MtpBf16AttentionOutputOp,
     arena: DeviceArena,
     regions: Regions,
@@ -69,7 +68,6 @@ impl Session {
 
         Ok(Self {
             routes,
-            timer: GpuTimer::new(&context)?,
             _op: op,
             arena,
             regions,
@@ -194,6 +192,7 @@ pub fn benchmark_mtp_bf16_attention_output(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(options.launches_per_sample)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     let padding_bytes = session.arena.byte_len() - session.regions.payload_bytes();
     memory.register_owned(
         "qwen3_8/mtp/bf16_attention_output/weights",
@@ -219,7 +218,7 @@ pub fn benchmark_mtp_bf16_attention_output(
     require_current_process_exclusive()?;
     let cases = session.cases(options.launches_per_sample);
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
 
     finish_report(

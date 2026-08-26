@@ -90,7 +90,7 @@ pub(crate) fn measure_h2d_calibration() -> Result<H2dCalibrationReport, DeviceBe
         stream.synchronize().map_err(GpuError::from)?;
     }
 
-    let timer = GpuTimer::new(&context)?;
+    let mut timer = GpuTimer::new(&context)?;
     let mut pageable_samples = Vec::with_capacity(SAMPLE_COUNT);
     let mut pinned_samples = Vec::with_capacity(SAMPLE_COUNT);
     for sample in 0..SAMPLE_COUNT {

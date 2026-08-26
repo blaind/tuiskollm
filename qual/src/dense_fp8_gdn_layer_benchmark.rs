@@ -24,7 +24,6 @@ struct RouteGraph {
 
 struct Session {
     routes: Vec<RouteGraph>,
-    timer: GpuTimer,
     program: DenseFp8GdnLayerProgram,
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
@@ -54,10 +53,8 @@ impl Session {
                 })
             })
             .collect::<Result<Vec<_>, DeviceBenchmarkError>>()?;
-        let timer = GpuTimer::new(&context)?;
         Ok(Self {
             routes,
-            timer,
             program,
             stream,
             _context: context,
@@ -150,6 +147,7 @@ pub fn benchmark_dense_fp8_gdn_layer(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(root)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     memory.register_owned(
         "dense_fp8_gdn_layer/resident_weights",
         BenchmarkMemoryKind::Weights,
@@ -182,7 +180,7 @@ pub fn benchmark_dense_fp8_gdn_layer(
     require_current_process_exclusive()?;
     let cases = session.cases()?;
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
     finish_report(
         BenchmarkReportSpec {

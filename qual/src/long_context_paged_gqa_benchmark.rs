@@ -90,7 +90,6 @@ struct RouteGraphs {
 
 struct Session {
     routes: Vec<RouteGraphs>,
-    timer: GpuTimer,
     _op: LongContextPagedGqaOp,
     arena: DeviceArena,
     regions: Regions,
@@ -118,11 +117,9 @@ impl Session {
         let routes = (1..=MAX_BATCH)
             .map(|batch| capture_route(&op, &stream, &addresses, batch, repeated_operations))
             .collect::<GpuResult<Vec<_>>>()?;
-        let timer = GpuTimer::new(&context)?;
 
         Ok(Self {
             routes,
-            timer,
             _op: op,
             arena,
             regions,
@@ -363,6 +360,7 @@ pub fn benchmark_long_context_paged_gqa(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(options.launches_per_sample)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     let padding_bytes = session.arena.byte_len() - session.regions.payload_bytes();
     let cache_bytes = session.regions.cache_bytes();
     let workspace_bytes = session.arena.byte_len() - cache_bytes - padding_bytes;
@@ -398,7 +396,7 @@ pub fn benchmark_long_context_paged_gqa(
     require_current_process_exclusive()?;
     let cases = session.cases(options.launches_per_sample);
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
 
     finish_report(

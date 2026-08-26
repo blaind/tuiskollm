@@ -86,7 +86,6 @@ impl Regions {
 
 struct Session<A: Arch, O: ResidualNormLauncher> {
     routes: Vec<RouteGraphs>,
-    timer: GpuTimer,
     _op: O,
     arena: DeviceArena,
     regions: Regions,
@@ -149,11 +148,9 @@ impl<A: Arch, O: ResidualNormLauncher> Session<A, O> {
                 residual: capture_residual(&op, &stream, &addresses, batch, repeated_operations)?,
             });
         }
-        let timer = GpuTimer::new(&context)?;
 
         Ok(Self {
             routes,
-            timer,
             _op: op,
             arena,
             regions,
@@ -416,6 +413,7 @@ fn benchmark_target<A: Arch, O: ResidualNormLauncher>(
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session =
         Session::<A, O>::new(options.launches_per_sample, prepare, exact_routes, max_rows)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     let weight_bytes = session.regions.weight_bytes();
     let padding_bytes = session.arena.byte_len() - session.regions.payload_bytes();
     memory.register_owned(
@@ -442,7 +440,7 @@ fn benchmark_target<A: Arch, O: ResidualNormLauncher>(
     require_current_process_exclusive()?;
     let cases = session.cases(options.launches_per_sample, plain_route, residual_route);
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
     finish_report(
         BenchmarkReportSpec {

@@ -35,7 +35,6 @@ struct Addresses {
 
 struct Session {
     routes: Vec<RouteGraphs>,
-    timer: GpuTimer,
     _op: Qwen35Nvfp4GdnInputOp,
     arena: DeviceArena,
     regions: Regions,
@@ -104,7 +103,6 @@ impl Session {
 
         Ok(Self {
             routes,
-            timer: GpuTimer::new(&context)?,
             _op: op,
             arena,
             regions,
@@ -237,6 +235,7 @@ pub fn benchmark_qwen35_nvfp4_gdn_input(
     let preflight = preflight()?;
     let mut memory = MemoryRecorder::new(&preflight)?;
     let session = Session::new(options.launches_per_sample)?;
+    let mut timer = GpuTimer::new(session.stream.context())?;
     let weight_bytes = session.regions.weight_bytes();
     let padding_bytes = session.arena.byte_len() - session.regions.payload_bytes();
     memory.register_owned(
@@ -263,7 +262,7 @@ pub fn benchmark_qwen35_nvfp4_gdn_input(
     require_current_process_exclusive()?;
     let cases = session.cases(options.launches_per_sample);
     let (metrics, energy_metrics, telemetry) =
-        measure_cases(&session.stream, &session.timer, &cases, options)?;
+        measure_cases(&session.stream, &mut timer, &cases, options)?;
     let memory = memory.finish(&telemetry)?;
 
     finish_report(
