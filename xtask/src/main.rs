@@ -8827,11 +8827,30 @@ fn gate_qwen35_mtp_resources(root: &Path) -> Result<(), Box<dyn Error>> {
         },
     ];
 
-    let entry_count = gate_exact_resource_families(&baseline, entries, artifact, sass, &families)?;
+    let entry_count = gate_exact_resource_families(
+        &baseline,
+        entries,
+        artifact,
+        sass,
+        &families,
+        SharedFootprint::Uniform,
+    )?;
     println!(
         "Qwen3.5 MTP resource gate passed: {entry_count} entries, STACK:0 LOCAL:0, SHARED:1024; launch bounds, BF16 HMMA/cache paths, and register envelopes retained"
     );
     Ok(())
+}
+
+/// How a family group pins its per-entry shared-memory footprint.
+///
+/// `Uniform` is the stronger claim and is kept wherever it is still true. `PerEntry` exists
+/// because the Qwen3.6 MTP family spans two device-codegen crates after the kernel split
+/// (`-mtp` and `-moe`), so its entries no longer share one module arena and their real
+/// footprints differ. The Qwen3.5 MTP family lives entirely in `-mtp` and stays uniform.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SharedFootprint {
+    Uniform,
+    PerEntry,
 }
 
 fn gate_exact_resource_families(
@@ -8840,6 +8859,7 @@ fn gate_exact_resource_families(
     artifact: &Sm120GateArtifact,
     sass: &str,
     families: &[ExactResourceFamily<'_>],
+    shared_footprint: SharedFootprint,
 ) -> Result<usize, Box<dyn Error>> {
     let mut all_shared = Vec::new();
     for family in families {
@@ -8900,7 +8920,10 @@ fn gate_exact_resource_families(
         registers.sort_unstable();
         require_registers(baseline, family.register_key, &registers)?;
     }
-    require_uniform_value(baseline, "shared_bytes", &all_shared)?;
+    match shared_footprint {
+        SharedFootprint::Uniform => require_uniform_value(baseline, "shared_bytes", &all_shared)?,
+        SharedFootprint::PerEntry => require_registers(baseline, "shared_bytes", &all_shared)?,
+    }
     Ok(all_shared.len())
 }
 
@@ -9030,9 +9053,16 @@ fn gate_qwen36_mtp_resources(root: &Path) -> Result<(), Box<dyn Error>> {
         },
     ];
 
-    let entry_count = gate_exact_resource_families(&baseline, entries, artifact, sass, &families)?;
+    let entry_count = gate_exact_resource_families(
+        &baseline,
+        entries,
+        artifact,
+        sass,
+        &families,
+        SharedFootprint::PerEntry,
+    )?;
     println!(
-        "Qwen3.6 MTP resource gate passed: {entry_count} entries, STACK:0 LOCAL:0, SHARED:1024; launch bounds, BF16 tensor/scalar paths, and register envelopes retained"
+        "Qwen3.6 MTP resource gate passed: {entry_count} entries, STACK:0 LOCAL:0, per-entry SHARED pinned; launch bounds, BF16 tensor/scalar paths, and register envelopes retained"
     );
     Ok(())
 }
