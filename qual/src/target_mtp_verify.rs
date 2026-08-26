@@ -4,6 +4,7 @@ use crate::device_benchmark;
 use crate::fp8_projection_oracle::{
     BF16_SENTINEL, BYTE_SENTINEL, F32_SENTINEL_BITS, bf16_to_f32, decode_e4m3fn, quantize_oracle,
 };
+use crate::oracles::attention::rope_tables;
 use crate::residual_norm::rms_norm_oracle;
 use crate::{qualify_gdn_prepare, qualify_gdn_recurrence, qualify_gdn_state_snapshot};
 use std::collections::BTreeSet;
@@ -751,17 +752,7 @@ fn fixture(program: &ResidentModelProgram) -> Fixture {
 }
 
 fn rope(positions: &[u32]) -> (Vec<f32>, Vec<f32>) {
-    let mut cosine = vec![0.0; positions.len() * ROTARY_PAIRS];
-    let mut sine = vec![0.0; positions.len() * ROTARY_PAIRS];
-    for (row, &position) in positions.iter().enumerate() {
-        for pair in 0..ROTARY_PAIRS {
-            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / ROTARY_DIM as f64);
-            let (sin, cos) = (f64::from(position) * frequency).sin_cos();
-            cosine[row * ROTARY_PAIRS + pair] = cos as f32;
-            sine[row * ROTARY_PAIRS + pair] = sin as f32;
-        }
-    }
-    (cosine, sine)
+    rope_tables(positions, ROTARY_PAIRS, ROTARY_DIM, 10_000_000.0)
 }
 
 fn cache_page(

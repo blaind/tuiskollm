@@ -1,6 +1,7 @@
 //! Numerical and graph qualification for partitioned long-context paged GQA.
 
 use crate::fp8_projection_oracle::{BYTE_SENTINEL, F32_SENTINEL_BITS};
+use crate::oracles::codecs::decode_e4m3fn_f64;
 use crate::{DeviceBenchmarkError, device_benchmark};
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
@@ -408,7 +409,7 @@ fn oracle(fixture: &Fixture) -> Result<Oracle, LongContextPagedGqaQualificationE
                             [cache_offset(physical, kv_head, page_position, class)];
                         score += 32.0
                             * f64::from(fixture.query[query_base + class])
-                            * decode_e4m3(key)
+                            * decode_e4m3fn_f64(key)
                             * f64::from(KEY_SCALE);
                         class += 1;
                     }
@@ -430,7 +431,8 @@ fn oracle(fixture: &Fixture) -> Result<Oracle, LongContextPagedGqaQualificationE
                     while class < 8 {
                         let value = fixture.value_pages
                             [cache_offset(physical, kv_head, page_position, class)];
-                        numerator[class] += weight * decode_e4m3(value) * f64::from(VALUE_SCALE);
+                        numerator[class] +=
+                            weight * decode_e4m3fn_f64(value) * f64::from(VALUE_SCALE);
                         class += 1;
                     }
                 }
@@ -765,21 +767,6 @@ fn verify_no_post_warmup_allocation(
     }
 
     Ok(())
-}
-
-fn decode_e4m3(code: u8) -> f64 {
-    let sign = if code & 0x80 == 0 { 1.0 } else { -1.0 };
-    let exponent = (code >> 3) & 0x0f;
-    let fraction = code & 0x07;
-    let magnitude = match (exponent, fraction) {
-        (0, 0) => 0.0,
-        (0, fraction) => f64::from(fraction) * 2.0f64.powi(-9),
-        (15, 7) => f64::NAN,
-        (exponent, fraction) => {
-            (1.0 + f64::from(fraction) / 8.0) * 2.0f64.powi(i32::from(exponent) - 7)
-        }
-    };
-    sign * magnitude
 }
 
 fn cache_offset(physical: usize, head: usize, position: usize, dimension: usize) -> usize {

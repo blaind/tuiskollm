@@ -6,6 +6,7 @@ use crate::device_benchmark::{
     OperationAccounting, RepeatedGraph, finish_report, generator_baseline_sha256, measure_cases,
     preflight, require_current_process_exclusive, warmup_launches,
 };
+use crate::oracles::attention::prefill_rope_tables;
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{MAX_BATCH, Qwen36ResidentModelProgram, Qwen36ResidentPrefillRoute};
@@ -201,18 +202,7 @@ fn prefill_token_ids(tokens: usize) -> Vec<u32> {
 }
 
 fn prefill_rope(tokens: usize) -> (Vec<f32>, Vec<f32>) {
-    let mut cosine = vec![0.0; tokens * ROTARY_PAIRS];
-    let mut sine = vec![0.0; tokens * ROTARY_PAIRS];
-    for token in 0..tokens {
-        for pair in 0..ROTARY_PAIRS {
-            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
-            let angle = token as f64 * frequency;
-            let (sin, cos) = angle.sin_cos();
-            cosine[token * ROTARY_PAIRS + pair] = cos as f32;
-            sine[token * ROTARY_PAIRS + pair] = sin as f32;
-        }
-    }
-    (cosine, sine)
+    prefill_rope_tables(0, tokens, ROTARY_PAIRS, 2 * ROTARY_PAIRS, 10_000_000.0)
 }
 
 fn logical_bytes(batch: usize) -> usize {

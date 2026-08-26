@@ -1,5 +1,6 @@
 //! Independent represented-value qualification for portable NVFP4 A16 SwiGLU.
 
+use crate::oracles::codecs::{self, bf16_to_f32, decode_e2m1, f32_to_bf16};
 use crate::target::{EXPECTED_COMPUTE_CAPABILITY, Nvfp4SwiGluOp};
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
@@ -374,43 +375,10 @@ fn scale_offset(row: usize, group: usize) -> usize {
         + scale_lane
 }
 
-fn decode_e2m1(code: u8) -> f32 {
-    const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let magnitude = MAGNITUDES[(code & 7) as usize];
-
-    if code & 8 == 0 { magnitude } else { -magnitude }
-}
-
 fn decode_e4m3fn(word: u8) -> Result<f32, Nvfp4SwiGluQualificationError> {
-    let sign = if word & 0x80 == 0 { 1.0 } else { -1.0 };
-    let exponent = (word >> 3) & 15;
-    let fraction = word & 7;
-    let magnitude = match (exponent, fraction) {
-        (0, 0) => 0.0,
-        (0, fraction) => f32::from(fraction) * 2.0f32.powi(-9),
-        (15, 7) => {
-            return Err(Nvfp4SwiGluQualificationError::Mismatch(
-                "oracle encountered an E4M3FN NaN".to_string(),
-            ));
-        }
-        (exponent, fraction) => {
-            (1.0 + f32::from(fraction) / 8.0) * 2.0f32.powi(i32::from(exponent) - 7)
-        }
-    };
-
-    Ok(sign * magnitude)
-}
-
-fn f32_to_bf16(value: f32) -> u16 {
-    let mut bits = value.to_bits();
-    let tie = (bits >> 16) & 1;
-    bits = bits.wrapping_add(0x7fff + tie);
-
-    (bits >> 16) as u16
-}
-
-fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
+    codecs::decode_e4m3fn(word).ok_or_else(|| {
+        Nvfp4SwiGluQualificationError::Mismatch("oracle encountered an E4M3FN NaN".to_string())
+    })
 }
 
 #[cfg(test)]

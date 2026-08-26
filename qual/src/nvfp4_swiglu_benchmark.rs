@@ -6,6 +6,7 @@ use crate::device_benchmark::{
     OperationAccounting, RepeatedGraph, finish_report, generator_baseline_sha256, measure_cases,
     preflight, require_current_process_exclusive, warmup_launches,
 };
+use crate::oracles::codecs::f32_to_bf16;
 use crate::target::{EXPECTED_COMPUTE_CAPABILITY, Nvfp4SwiGluOp};
 use std::sync::Arc;
 use tuisko_gpu::{
@@ -291,13 +292,6 @@ fn logical_bytes(batch: usize) -> usize {
     let output = batch * OUTPUT_ROWS * size_of::<u16>();
 
     weights + input + output
-}
-
-fn f32_to_bf16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-
-    (rounded >> 16) as u16
 }
 
 /// Measures every exact-target NVFP4 SwiGLU route with paired timings.

@@ -2,6 +2,7 @@
 
 use crate::device_benchmark;
 use crate::fp8_projection_oracle::{BF16_SENTINEL, F32_SENTINEL_BITS, bf16_to_f32};
+use crate::oracles::attention::rope_tables;
 use crate::residual_norm::rms_norm_oracle;
 use crate::{
     DeviceBenchmarkError, qualify_mtp_bf16_fusion, qualify_mtp_bf16_qk_prepare,
@@ -851,17 +852,7 @@ fn positions(first: usize, rows: usize) -> Result<Vec<u32>, MtpPromptPrimeQualif
 }
 
 fn rope(positions: &[u32]) -> (Vec<f32>, Vec<f32>) {
-    let mut cosine = vec![0.0; positions.len() * ROTARY_PAIRS];
-    let mut sine = vec![0.0; positions.len() * ROTARY_PAIRS];
-    for (row, &position) in positions.iter().enumerate() {
-        for pair in 0..ROTARY_PAIRS {
-            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / ROTARY_DIM as f64);
-            let (sin, cos) = (f64::from(position) * frequency).sin_cos();
-            cosine[row * ROTARY_PAIRS + pair] = cos as f32;
-            sine[row * ROTARY_PAIRS + pair] = sin as f32;
-        }
-    }
-    (cosine, sine)
+    rope_tables(positions, ROTARY_PAIRS, ROTARY_DIM, 10_000_000.0)
 }
 
 fn embedding_rows(

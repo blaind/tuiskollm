@@ -1,6 +1,8 @@
 //! Source-backed qualification for the complete resident text model.
 
 use crate::fp8_projection_oracle::{bf16_to_f32, decode_e4m3fn, quantize_oracle};
+use crate::oracles::attention::prefill_rope_tables;
+use crate::oracles::codecs::f32_to_bf16;
 use crate::residual_norm::rms_norm_oracle;
 use crate::{DeviceBenchmarkError, device_benchmark};
 use std::collections::BTreeSet;
@@ -448,18 +450,13 @@ fn prefill_rope(tokens: usize) -> (Vec<f32>, Vec<f32>) {
 }
 
 fn prefill_rope_at(first_position: usize, tokens: usize) -> (Vec<f32>, Vec<f32>) {
-    let mut cosine = vec![0.0; tokens * ROTARY_PAIRS];
-    let mut sine = vec![0.0; tokens * ROTARY_PAIRS];
-    for token in 0..tokens {
-        for pair in 0..ROTARY_PAIRS {
-            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / 64.0);
-            let angle = (first_position + token) as f64 * frequency;
-            let (sin, cos) = angle.sin_cos();
-            cosine[token * ROTARY_PAIRS + pair] = cos as f32;
-            sine[token * ROTARY_PAIRS + pair] = sin as f32;
-        }
-    }
-    (cosine, sine)
+    prefill_rope_tables(
+        first_position,
+        tokens,
+        ROTARY_PAIRS,
+        2 * ROTARY_PAIRS,
+        10_000_000.0,
+    )
 }
 
 fn read_prefill_cache_pages(
@@ -1936,11 +1933,6 @@ fn require_close(
         )));
     }
     Ok(())
-}
-
-fn f32_to_bf16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
 }
 
 fn verify_no_device_allocation(

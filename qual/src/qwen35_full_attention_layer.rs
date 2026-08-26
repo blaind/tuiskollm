@@ -5,6 +5,8 @@ use crate::fp8_projection_oracle::{
 };
 use crate::nvfp4_down_sm120::{decode_e2m1, decode_e4m3fn};
 use crate::nvfp4_swiglu_sm120::encode_e4m3fn;
+use crate::oracles::codecs::encode_e2m1;
+use crate::oracles::norm::residual_oracle;
 use crate::residual_norm::rms_norm_oracle;
 use crate::{DeviceBenchmarkError, device_benchmark};
 use std::path::Path;
@@ -1199,26 +1201,6 @@ pub(crate) fn quantize_oracle(
     Ok((codes, scales))
 }
 
-fn encode_e2m1(value: f32) -> u8 {
-    let mut best = 0u8;
-    let mut best_distance = f32::INFINITY;
-    let candidates = if value.is_sign_negative() {
-        8u8..16
-    } else {
-        0u8..8
-    };
-
-    for code in candidates {
-        let distance = (value - decode_e2m1(code)).abs();
-        if distance < best_distance || (distance == best_distance && code & 1 == 0) {
-            best = code;
-            best_distance = distance;
-        }
-    }
-
-    best
-}
-
 fn decode_scale(code: u8) -> Result<f32, Qwen35FullAttentionLayerQualificationError> {
     decode_e4m3fn(code)
         .map_err(|error| Qwen35FullAttentionLayerQualificationError::Mismatch(error.to_string()))
@@ -1500,14 +1482,6 @@ fn route_name(rows: usize) -> String {
     } else {
         format!("T={rows}")
     }
-}
-
-fn residual_oracle(input: &[u16], branch: &[u16]) -> Vec<u16> {
-    input
-        .iter()
-        .zip(branch)
-        .map(|(&input, &branch)| f32_to_bf16(bf16_to_f32(input) + bf16_to_f32(branch)))
-        .collect()
 }
 
 fn compare_exact<T: PartialEq>(

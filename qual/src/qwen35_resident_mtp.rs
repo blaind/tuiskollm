@@ -1,5 +1,6 @@
 //! Composition qualification for the Qwen3.5 target and MTP resident owners.
 
+use crate::oracles::codecs::bf16_to_f32;
 use crate::{DeviceBenchmarkError, device_benchmark};
 use std::path::Path;
 use std::sync::Arc;
@@ -313,10 +314,6 @@ fn verify_sampled_logits(
     }
 
     Ok(batch * ROWS.len())
-}
-
-fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
 }
 
 fn prepare_decode(

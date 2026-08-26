@@ -4,6 +4,8 @@ use crate::fp8_projection_oracle::{
     BF16_SENTINEL, BYTE_SENTINEL, F32_SENTINEL_BITS, TokenOracle, bf16_to_f32, decode_e4m3fn,
     encode_e4m3fn, f32_to_bf16, quantize_oracle,
 };
+use crate::oracles::attention::prefill_rope_tables;
+use crate::oracles::norm::residual_oracle;
 use crate::residual_norm::rms_norm_oracle;
 use crate::{DeviceBenchmarkError, device_benchmark};
 use std::path::Path;
@@ -315,18 +317,7 @@ fn prepare_run(
 }
 
 fn prefill_rope(tokens: usize) -> (Vec<f32>, Vec<f32>) {
-    let mut cosine = vec![0.0; tokens * ROTARY_PAIRS];
-    let mut sine = vec![0.0; tokens * ROTARY_PAIRS];
-    for token in 0..tokens {
-        for pair in 0..ROTARY_PAIRS {
-            let frequency = 10_000_000.0f64.powf(-((2 * pair) as f64) / ROTARY_DIM as f64);
-            let angle = token as f64 * frequency;
-            let (sin, cos) = angle.sin_cos();
-            cosine[token * ROTARY_PAIRS + pair] = cos as f32;
-            sine[token * ROTARY_PAIRS + pair] = sin as f32;
-        }
-    }
-    (cosine, sine)
+    prefill_rope_tables(0, tokens, ROTARY_PAIRS, ROTARY_DIM, 10_000_000.0)
 }
 
 fn route_state(rows: usize, fixture: &Fixture) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
@@ -1041,14 +1032,6 @@ fn cache_offset(physical_page: usize, head: usize, position: usize, dimension: u
         * ((position & (ATTENTION_PAGE_SIZE - 1))
             + ATTENTION_PAGE_SIZE * (head + Qwen38_27B::NUM_KV_HEADS * physical_page))
         + dimension
-}
-
-fn residual_oracle(input: &[u16], branch: &[u16]) -> Vec<u16> {
-    input
-        .iter()
-        .zip(branch)
-        .map(|(&input, &branch)| f32_to_bf16(bf16_to_f32(input) + bf16_to_f32(branch)))
-        .collect()
 }
 
 fn compare_exact<T: PartialEq>(

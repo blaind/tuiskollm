@@ -2,6 +2,7 @@
 
 use crate::device_benchmark;
 use crate::fp8_projection_oracle::{bf16_to_f32, f32_to_bf16};
+use crate::oracles::codecs::decode_e2m1;
 use crate::target::Qwen36MoeExpertsOp;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
@@ -708,13 +709,6 @@ pub(crate) fn nvfp4_dot(
     }
 
     sum as f32
-}
-
-fn decode_e2m1(code: u8) -> f32 {
-    const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let magnitude = MAGNITUDES[(code & 7) as usize];
-
-    if code & 8 == 0 { magnitude } else { -magnitude }
 }
 
 fn decode_e4m3(code: u8) -> f32 {

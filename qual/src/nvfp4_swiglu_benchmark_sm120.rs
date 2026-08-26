@@ -6,6 +6,7 @@ use crate::device_benchmark::{
     OperationAccounting, RepeatedGraph, finish_report, generator_baseline_sha256, measure_cases,
     preflight, require_current_process_exclusive, warmup_launches,
 };
+use crate::oracles::codecs::f32_to_bf16;
 use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
@@ -313,14 +314,6 @@ fn logical_bytes(rows: usize) -> usize {
     };
 
     weights + input + output + scratch
-}
-
-fn f32_to_bf16(value: f32) -> u16 {
-    let mut bits = value.to_bits();
-    let tie = (bits >> 16) & 1;
-    bits = bits.wrapping_add(0x7fff + tie);
-
-    (bits >> 16) as u16
 }
 
 /// Measures every exact NVFP4 SwiGLU production route with paired timings.

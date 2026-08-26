@@ -118,6 +118,7 @@ mod nvfp4_swiglu_benchmark;
 mod nvfp4_swiglu_benchmark_sm120;
 #[cfg(feature = "device")]
 mod nvfp4_swiglu_sm120;
+mod oracles;
 #[cfg(feature = "device")]
 mod paged_gqa;
 #[cfg(feature = "device")]

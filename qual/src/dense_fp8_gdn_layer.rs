@@ -4,6 +4,7 @@ use crate::fp8_projection_oracle::{
     BF16_SENTINEL, BYTE_SENTINEL, F32_SENTINEL_BITS, TokenOracle, bf16_to_f32, decode_e4m3fn,
     f32_to_bf16, quantize_oracle,
 };
+use crate::oracles::norm::residual_oracle;
 use crate::residual_norm::rms_norm_oracle;
 use crate::{DeviceBenchmarkError, device_benchmark};
 use std::path::Path;
@@ -806,14 +807,6 @@ fn inactive_values(rows: usize) -> usize {
     let state_per_row = 3 * Qwen38_27B::GDN_QKV_ROWS + STATE_PER_ROW;
 
     (MAX_ROWS - rows) * working_per_row + (MAX_BATCH - active_state_rows(rows)) * state_per_row
-}
-
-fn residual_oracle(input: &[u16], branch: &[u16]) -> Vec<u16> {
-    input
-        .iter()
-        .zip(branch)
-        .map(|(&input, &branch)| f32_to_bf16(bf16_to_f32(input) + bf16_to_f32(branch)))
-        .collect()
 }
 
 fn compare_exact(
