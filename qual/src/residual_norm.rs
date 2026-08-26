@@ -1,5 +1,7 @@
 //! Numerical and graph qualification for the exact residual-norm routes.
 
+use crate::harness::graph_replay::{first_moved_address, post_warmup_allocation_drift, replay};
+use crate::harness::immutable_sentinel::{SentinelPattern, first_difference, first_non_sentinel};
 pub(crate) use crate::oracles::codecs::{bf16_to_f32, f32_to_bf16};
 use crate::target::{EXPECTED_COMPUTE_CAPABILITY, ResidualNormOp};
 #[cfg(feature = "device")]
@@ -7,7 +9,6 @@ use crate::target::{Qwen35ResidualNormOp, Qwen36ResidualNormOp};
 use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
-    device_memory_info,
 };
 use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
@@ -22,7 +23,7 @@ const QWEN36_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 #[cfg(feature = "device")]
 const QWEN36_MAX_ROWS: usize = 128;
 const ALIGNMENT: usize = 256;
-const INACTIVE_SENTINEL: u16 = 0xa5a5;
+const INACTIVE_SENTINEL: SentinelPattern = SentinelPattern::new(0xa5);
 const INPUT_PATTERN: [f32; 16] = [
     0.875, -0.75, 0.625, -0.5, 0.375, -0.25, 0.125, -0.0625, -0.875, 0.75, -0.625, 0.5, -0.375,
     0.25, -0.125, 0.0625,
@@ -317,14 +318,11 @@ fn qualify_target<A: Arch, O: ResidualNormLauncher>(
             CudaGraph::capture(&stream, || launch_all(&op, &arena, &stream, regions, rows))?;
         // SAFETY: every allocation this graph captured is owned by this scope or
         // its caller and outlives the replays and the synchronize that follows.
-        unsafe { graph.launch(&stream) }?;
-        // SAFETY: every allocation this graph captured is owned by this scope or
-        // its caller and outlives the replays and the synchronize that follows.
-        unsafe { graph.launch(&stream) }?;
-        let replay = read_outputs(&arena, &stream, regions)?;
-        verify_replay::<A>(rows, max_rows, &eager, &replay, &mut report)?;
+        unsafe { replay(&graph, &stream, 2) }?;
+        let replayed = read_outputs(&arena, &stream, regions)?;
+        verify_replay::<A>(rows, max_rows, &eager, &replayed, &mut report)?;
 
-        if addresses(&arena, regions)? != stable_addresses {
+        if first_moved_address(&stable_addresses, &addresses(&arena, regions)?).is_some() {
             return Err(ResidualNormQualificationError::Mismatch(format!(
                 "device addresses changed while qualifying rows={rows}"
             )));
@@ -377,9 +375,9 @@ fn reset_outputs(
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
 ) -> GpuResult<()> {
-    arena.fill(stream, regions.plain, 0xa5)?;
-    arena.fill(stream, regions.residual, 0xa5)?;
-    arena.fill(stream, regions.normalized, 0xa5)
+    arena.fill(stream, regions.plain, INACTIVE_SENTINEL.byte())?;
+    arena.fill(stream, regions.residual, INACTIVE_SENTINEL.byte())?;
+    arena.fill(stream, regions.normalized, INACTIVE_SENTINEL.byte())
 }
 
 fn launch_all<O: ResidualNormLauncher>(
@@ -491,11 +489,7 @@ fn verify_replay<A: Arch>(
         ("residual", &eager.1, &replay.1),
         ("normalized", &eager.2, &replay.2),
     ] {
-        if let Some(index) = actual
-            .iter()
-            .zip(expected)
-            .position(|(actual, expected)| actual != expected)
-        {
+        if let Some(index) = first_difference(actual, expected) {
             return Err(ResidualNormQualificationError::Mismatch(format!(
                 "rows={rows} {name} graph replay differs from eager execution at value {index}: replay={:#06x}, eager={:#06x}",
                 actual[index], expected[index]
@@ -520,14 +514,12 @@ fn verify_inactive<A: Arch>(
         ("residual", &observed.1),
         ("normalized", &observed.2),
     ] {
-        if let Some(relative) = plane[active..]
-            .iter()
-            .position(|&value| value != INACTIVE_SENTINEL)
-        {
+        if let Some(relative) = first_non_sentinel(&plane[active..], INACTIVE_SENTINEL.half()) {
             let index = active + relative;
             return Err(ResidualNormQualificationError::Mismatch(format!(
-                "rows={rows} {name} route modified inactive value {index}: device={:#06x}, sentinel={INACTIVE_SENTINEL:#06x}",
-                plane[index]
+                "rows={rows} {name} route modified inactive value {index}: device={:#06x}, sentinel={:#06x}",
+                plane[index],
+                INACTIVE_SENTINEL.half()
             )));
         }
     }
@@ -549,11 +541,7 @@ fn verify_sources_immutable(
         ("weight", regions.weight, weight),
     ] {
         let observed = arena.copy_to_host(stream, region)?;
-        if let Some(index) = observed
-            .iter()
-            .zip(expected)
-            .position(|(observed, expected)| observed != expected)
-        {
+        if let Some(index) = first_difference(&observed, expected) {
             return Err(ResidualNormQualificationError::Mismatch(format!(
                 "{name} changed at value {index}: device={:#06x}, source={:#06x}",
                 observed[index], expected[index]
@@ -578,24 +566,9 @@ fn verify_no_post_warmup_allocation<O: ResidualNormLauncher>(
             launch_all(op, arena, stream, regions, rows)
         })?);
     }
-    for graph in &graphs {
-        // SAFETY: the qualification owner retains every allocation captured by these graphs.
-        unsafe { graph.launch(stream) }?;
-    }
-    stream.synchronize().map_err(GpuError::from)?;
-    let before = device_memory_info(context)?;
-    for _ in 0..4 {
-        for graph in graphs.iter().rev() {
-            // SAFETY: the qualification owner retains every allocation captured by these graphs.
-            unsafe { graph.launch(stream) }?;
-        }
-    }
-    stream.synchronize().map_err(GpuError::from)?;
-    let after = device_memory_info(context)?;
-    if before != after {
-        return Err(ResidualNormQualificationError::Mismatch(format!(
-            "device memory changed after warmup: before={before:?}, after={after:?}"
-        )));
+    // SAFETY: the qualification owner retains every allocation captured by these graphs.
+    if let Some(drift) = unsafe { post_warmup_allocation_drift(context, stream, &graphs, 4) }? {
+        return Err(ResidualNormQualificationError::Mismatch(drift));
     }
 
     Ok(())

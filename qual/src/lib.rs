@@ -70,6 +70,7 @@ mod gdn_recurrence;
 mod gdn_recurrence_benchmark;
 #[cfg(feature = "device")]
 mod gdn_state_snapshot;
+mod harness;
 #[cfg(feature = "device")]
 mod long_context_paged_gqa;
 #[cfg(feature = "device")]
