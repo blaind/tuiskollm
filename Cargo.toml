@@ -15,6 +15,7 @@ members = [
     "crates/tuisko-frontend",
     "crates/tuisko-gpu",
     "crates/tuisko-kernels-simt",
+    "crates/tuisko-kernels-macros",
     "crates/tuisko-kernels-sm120",
     "crates/tuisko-kernels-sm120-attention",
     "crates/tuisko-kernels-sm120-common",
@@ -85,6 +86,7 @@ tuisko-kernels-sm120-moe = { version = "0.1.0", path = "crates/tuisko-kernels-sm
 tuisko-kernels-sm120-mtp = { version = "0.1.0", path = "crates/tuisko-kernels-sm120-mtp" }
 tuisko-kernels-sm120-norm = { version = "0.1.0", path = "crates/tuisko-kernels-sm120-norm" }
 tuisko-kernels-sm120-nvfp4 = { version = "0.1.0", path = "crates/tuisko-kernels-sm120-nvfp4" }
+tuisko-kernels-macros = { version = "0.1.0", path = "crates/tuisko-kernels-macros" }
 tuisko-kernels-simt = { version = "0.1.0", path = "crates/tuisko-kernels-simt" }
 tuisko-model = { version = "0.1.0", path = "crates/tuisko-model" }
 tuisko-provision = { version = "0.1.0", path = "crates/tuisko-provision" }
