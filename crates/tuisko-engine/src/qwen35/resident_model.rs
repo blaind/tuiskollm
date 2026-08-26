@@ -1,5 +1,8 @@
 //! Resident composition of every Qwen3.5 text layer and endpoint.
 
+use crate::common::graph::{capture_batch_graphs, capture_route_graphs};
+use crate::common::math::{checked_sum, product, sum_products};
+use crate::common::slots::require_batch;
 use crate::qwen35::long_context_kv::Qwen35AttentionKvBinding;
 use crate::{
     EngineError, EngineResult, MAX_BATCH, Qwen35FullAttentionLayerLayout,
@@ -1079,15 +1082,11 @@ fn capture_decode_routes(
     layers: &[ResidentLayer],
     endpoint: &Qwen35TextEndpointProgram,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
-    let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for batch in 1..=MAX_BATCH {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, batch, layers, endpoint)
-        })?);
-    }
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("Qwen3.5 whole-model graph inventory is incomplete"))
+    capture_batch_graphs(
+        stream,
+        "Qwen3.5 whole-model graph inventory is incomplete",
+        |batch| launch_route(stream, batch, layers, endpoint),
+    )
 }
 
 fn capture_verify_routes(
@@ -1118,17 +1117,15 @@ fn capture_prefill_routes(
     // T=128 otherwise crosses 32 layer graphs plus the endpoint and exposes
     // 32 host-visible boundaries. This graph composes the same qualified
     // per-layer routes without changing any leaf accumulation order.
-    let mut graphs = Vec::with_capacity(PREFILL_ROUTES.len());
-    for tokens in PREFILL_ROUTES {
-        let route = Qwen35ResidentPrefillRoute { tokens };
-        graphs.push(CudaGraph::capture(stream, || {
+    capture_route_graphs(
+        stream,
+        PREFILL_ROUTES,
+        "Qwen3.5 whole-model prefill graph inventory is incomplete",
+        |tokens| {
+            let route = Qwen35ResidentPrefillRoute { tokens };
             launch_prefill_route(stream, route, layers, endpoint)
-        })?);
-    }
-
-    graphs.try_into().map_err(|_| {
-        EngineError::layout("Qwen3.5 whole-model prefill graph inventory is incomplete")
-    })
+        },
+    )
 }
 
 fn launch_route(
@@ -1204,15 +1201,6 @@ fn require_geometry() -> EngineResult<()> {
     Ok(())
 }
 
-fn require_batch(batch: usize) -> EngineResult<()> {
-    if !(1..=MAX_BATCH).contains(&batch) {
-        return Err(EngineError::route(format!(
-            "batch {batch} is outside the exact range 1..={MAX_BATCH}"
-        )));
-    }
-    Ok(())
-}
-
 fn require_verify_rows(rows: usize) -> EngineResult<()> {
     if (1..=4).contains(&rows) {
         return Ok(());
@@ -1268,22 +1256,6 @@ fn require_prefill(tokens: usize) -> EngineResult<()> {
     Err(EngineError::route(format!(
         "Qwen3.5 resident prefill token count {tokens} is outside 32,64,128"
     )))
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn checked_sum(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_add(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn sum_products(name: &str, terms: &[(usize, usize)]) -> EngineResult<usize> {
-    terms.iter().try_fold(0usize, |total, &(count, bytes)| {
-        checked_sum(name, total, product(name, count, bytes)?)
-    })
 }
 
 #[cfg(test)]

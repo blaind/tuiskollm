@@ -1,5 +1,6 @@
 //! Single-allocation layout for one Qwen3.5 GDN layer.
 
+use crate::common::math::{product, sum};
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::{Arch, Qwen35_9B};
@@ -343,19 +344,6 @@ fn packed_codes(name: &str, rows: usize, columns: usize) -> EngineResult<usize> 
 
 fn scales(name: &str, rows: usize, columns: usize) -> EngineResult<usize> {
     product(name, rows, columns / NVFP4_GROUP)
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {
-    values.iter().try_fold(0usize, |total, &value| {
-        total
-            .checked_add(value)
-            .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-    })
 }
 
 #[cfg(test)]

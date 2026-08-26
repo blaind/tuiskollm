@@ -1,5 +1,8 @@
 //! Single-slot text generation over the exact resident model owner.
 
+use crate::common::banks::{compact, row};
+use crate::common::rope::{ROTARY_PAIRS, text_rope};
+use crate::common::slots::{device_zero_context, require_generation_capacity};
 use crate::{
     CancelledText, ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
     GenerationSession, GenerationStep, MAX_BATCH, Qwen35ResidentModelProgram,
@@ -12,9 +15,6 @@ use tuisko_frontend::{GenerationDefaults, PromptEncodingMetrics, TextFrontend};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
-const ROTARY_DIM: usize = 64;
-const ROTARY_PAIRS: usize = ROTARY_DIM / 2;
-const ROPE_THETA: f64 = 10_000_000.0;
 const LOGIT_BANK_ROWS: usize = 2 * MAX_BATCH;
 const MAX_NATIVE_PREFILL_TOKENS: usize = 1024;
 const QWEN35_NATIVE_PREFILL_ROUTES: [usize; 3] = [32, 64, 128];
@@ -1039,18 +1039,6 @@ impl ResidentBatchGenerator {
     }
 }
 
-pub(crate) fn device_zero_context() -> EngineResult<Arc<CudaContext>> {
-    let context = CudaContext::new(0).map_err(GpuError::from)?;
-    let capability = context.compute_capability().map_err(GpuError::from)?;
-    if capability != (12, 0) {
-        return Err(EngineError::route(format!(
-            "device zero has compute capability {}.{}, expected 12.0",
-            capability.0, capability.1
-        )));
-    }
-    Ok(context)
-}
-
 impl ResidentGenerationSession<'_> {
     /// Exact prompt token IDs selected by the admitted frontend.
     pub fn prompt_token_ids(&self) -> &[u32] {
@@ -1207,13 +1195,11 @@ impl Qwen36ResidentGenerationSession<'_> {
 }
 
 fn slot_logits(slot: usize) -> std::ops::Range<usize> {
-    let begin = slot * Qwen38_27B::VOCAB;
-    begin..begin + Qwen38_27B::VOCAB
+    row(slot, Qwen38_27B::VOCAB)
 }
 
 fn compact_download_logits(rows: usize) -> std::ops::Range<usize> {
-    let begin = MAX_BATCH * Qwen38_27B::VOCAB;
-    begin..begin + rows * Qwen38_27B::VOCAB
+    compact(rows, Qwen38_27B::VOCAB)
 }
 
 fn compact_download_row(row: usize) -> std::ops::Range<usize> {
@@ -1511,45 +1497,11 @@ const fn qwen36_native_prefill_tokens(prompt_tokens: usize) -> Option<usize> {
     None
 }
 
-pub(crate) fn text_rope(position: u32) -> ([f32; ROTARY_PAIRS], [f32; ROTARY_PAIRS]) {
-    let mut cosine = [0.0f32; ROTARY_PAIRS];
-    let mut sine = [0.0f32; ROTARY_PAIRS];
-    for pair in 0..ROTARY_PAIRS {
-        let frequency = ROPE_THETA.powf(-((2 * pair) as f64) / ROTARY_DIM as f64);
-        let angle = f64::from(position) * frequency;
-        cosine[pair] = angle.cos() as f32;
-        sine[pair] = angle.sin() as f32;
-    }
-    (cosine, sine)
-}
-
-pub(crate) fn require_generation_capacity(
-    prompt_tokens: usize,
-    maximum_new_tokens: usize,
-    context_capacity: usize,
-) -> EngineResult<usize> {
-    if prompt_tokens == 0 {
-        return Err(EngineError::generation(
-            "resident generation requires a nonempty prompt",
-        ));
-    }
-    let evaluated = prompt_tokens
-        .checked_add(maximum_new_tokens.saturating_sub(1))
-        .ok_or_else(|| EngineError::generation("generation token budget overflows"))?;
-    if evaluated > context_capacity {
-        return Err(EngineError::generation(format!(
-            "prompt plus processed generation requires {evaluated} positions, current resident capacity is {context_capacity}"
-        )));
-    }
-    Ok(evaluated)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        QWEN35_NATIVE_PREFILL_ROUTES, QWEN36_NATIVE_PREFILL_ROUTES, ROTARY_PAIRS,
-        next_native_prefill_tile, next_qwen35_native_prefill_tile, qwen36_native_prefill_tokens,
-        require_generation_capacity, text_rope,
+        QWEN35_NATIVE_PREFILL_ROUTES, QWEN36_NATIVE_PREFILL_ROUTES, next_native_prefill_tile,
+        next_qwen35_native_prefill_tile, qwen36_native_prefill_tokens, require_generation_capacity,
     };
     use crate::EngineErrorCode;
 
@@ -1567,21 +1519,6 @@ mod tests {
                 Some(EngineErrorCode::Generation)
             );
         }
-    }
-
-    #[test]
-    fn text_rope_uses_the_checkpoint_theta_and_64_wide_pairing() {
-        let (zero_cos, zero_sin) = text_rope(0);
-        assert_eq!(zero_cos, [1.0; ROTARY_PAIRS]);
-        assert_eq!(zero_sin, [0.0; ROTARY_PAIRS]);
-
-        let (cosine, sine) = text_rope(130);
-        let frequency = 10_000_000.0f64.powf(-62.0 / 64.0);
-        let angle = 130.0 * frequency;
-        assert_eq!(cosine[0].to_bits(), (130.0f64.cos() as f32).to_bits());
-        assert_eq!(sine[0].to_bits(), (130.0f64.sin() as f32).to_bits());
-        assert_eq!(cosine[31].to_bits(), (angle.cos() as f32).to_bits());
-        assert_eq!(sine[31].to_bits(), (angle.sin() as f32).to_bits());
     }
 
     #[test]

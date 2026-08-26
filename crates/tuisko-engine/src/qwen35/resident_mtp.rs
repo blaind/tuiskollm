@@ -1,5 +1,6 @@
 //! Resident Qwen3.5 target plus one source-BF16 MTP draft program.
 
+use crate::common::graph::capture_batch_graphs;
 use crate::qwen35::mtp_kv::Qwen35MtpKvProgram;
 use crate::{
     EngineError, EngineResult, MAX_BATCH, Qwen35MtpLayerProgram, Qwen35ResidentModelProgram,
@@ -784,15 +785,11 @@ fn capture_draft_routes(
     mtp: &Qwen35MtpLayerProgram,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
     let target_hidden = target.final_residual_address()?;
-    let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for batch in 1..=MAX_BATCH {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_draft(stream, batch, target, mtp, target_hidden)
-        })?);
-    }
-    graphs.try_into().map_err(|_| {
-        EngineError::layout("Qwen3.5 resident MTP draft graph inventory is incomplete")
-    })
+    capture_batch_graphs(
+        stream,
+        "Qwen3.5 resident MTP draft graph inventory is incomplete",
+        |batch| launch_draft(stream, batch, target, mtp, target_hidden),
+    )
 }
 
 fn capture_continue_draft_routes(

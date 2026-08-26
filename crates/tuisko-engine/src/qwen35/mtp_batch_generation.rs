@@ -1,10 +1,10 @@
 //! Compact Qwen3.5 MTP generation over eight mirrored target/draft slots.
 
+use crate::common::banks::{compact, row};
+use crate::common::mtp::{DRAFT_WINDOW, VERIFY_ROWS, decide_sampled_tokens};
+use crate::common::rope::{fill_contiguous_rope, text_rope};
+use crate::common::slots::{device_zero_context, first_free_slot, require_generation_capacity};
 use crate::qwen35::mtp_generation::prime_qwen35_mtp_prompt;
-use crate::resident_generation::{device_zero_context, require_generation_capacity, text_rope};
-use crate::resident_mtp_generation::{
-    DRAFT_WINDOW, VERIFY_ROWS, decide_sampled_tokens, fill_contiguous_rope,
-};
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, GeneratedText, GenerationSession,
     GenerationStep, MAX_BATCH, Qwen35ResidentMtpProgram, ResidentBatchAdmission,
@@ -1162,10 +1162,6 @@ fn pinned_rows(
         .map_err(Into::into)
 }
 
-fn first_free_slot(occupied: [bool; MAX_BATCH]) -> Option<usize> {
-    occupied.iter().position(|&occupied| !occupied)
-}
-
 const fn round_route(active: usize) -> Option<RoundRoute> {
     match active {
         0 => None,
@@ -1176,14 +1172,12 @@ const fn round_route(active: usize) -> Option<RoundRoute> {
 }
 
 fn target_slot_logits(slot: usize) -> Range<usize> {
-    let begin = slot * Qwen35_9B::VOCAB;
-    begin..begin + Qwen35_9B::VOCAB
+    row(slot, Qwen35_9B::VOCAB)
 }
 
 #[cfg(test)]
 fn target_download_logits(rows: usize) -> Range<usize> {
-    let begin = MAX_BATCH * Qwen35_9B::VOCAB;
-    begin..begin + rows * Qwen35_9B::VOCAB
+    compact(rows, Qwen35_9B::VOCAB)
 }
 
 fn target_download_row(row: usize) -> Range<usize> {
@@ -1197,13 +1191,11 @@ fn lane_target_logits(lane: usize, rows: usize) -> Range<usize> {
 }
 
 fn draft_slot_logits(slot: usize) -> Range<usize> {
-    let begin = slot * Qwen35_9B::VOCAB;
-    begin..begin + Qwen35_9B::VOCAB
+    row(slot, Qwen35_9B::VOCAB)
 }
 
 fn compact_draft_logits(rows: usize) -> Range<usize> {
-    let begin = MAX_BATCH * Qwen35_9B::VOCAB;
-    begin..begin + rows * Qwen35_9B::VOCAB
+    compact(rows, Qwen35_9B::VOCAB)
 }
 
 fn compact_draft_row(row: usize) -> Range<usize> {
@@ -1212,12 +1204,11 @@ fn compact_draft_row(row: usize) -> Range<usize> {
 }
 
 fn hidden_slot(slot: usize) -> Range<usize> {
-    let begin = slot * Qwen35_9B::HIDDEN;
-    begin..begin + Qwen35_9B::HIDDEN
+    row(slot, Qwen35_9B::HIDDEN)
 }
 
 fn compact_hidden(rows: usize) -> Range<usize> {
-    MAX_BATCH * Qwen35_9B::HIDDEN..(MAX_BATCH + rows) * Qwen35_9B::HIDDEN
+    compact(rows, Qwen35_9B::HIDDEN)
 }
 
 fn compact_hidden_row(row: usize) -> Range<usize> {

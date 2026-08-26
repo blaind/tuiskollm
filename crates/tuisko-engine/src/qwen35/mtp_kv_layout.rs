@@ -1,5 +1,6 @@
 //! Long-context BF16 cache mirror for the exact Qwen3.5 MTP layer.
 
+use crate::common::math::product;
 use crate::{EngineError, EngineResult, MAX_BATCH, QWEN35_LONG_CONTEXT_PHYSICAL_PAGES};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -104,11 +105,6 @@ fn page_values() -> EngineResult<usize> {
         )?,
         Qwen35_9B::HEAD_DIM,
     )
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

@@ -1,5 +1,7 @@
 //! Exact target-residual handoff and prompt priming for the Qwen3.8 MTP layer.
 
+use crate::common::graph::capture_route_graphs;
+use crate::common::math::product;
 use crate::qwen38::mtp_prompt_prime_layout::{
     MTP_PROMPT_TILE_CAPACITY, MtpPromptPrimeLayout, MtpPromptPrimeRegions,
 };
@@ -635,15 +637,12 @@ fn capture_routes(
     ops: Ops<'_>,
     stagers: Stagers<'_>,
 ) -> EngineResult<[CudaGraph; PROMPT_ROUTES.len()]> {
-    let mut graphs = Vec::with_capacity(PROMPT_ROUTES.len());
-    for rows in PROMPT_ROUTES {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, rows, target, arena, regions, pointers, ops, stagers)
-        })?);
-    }
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("MTP prompt graph inventory has wrong cardinality"))
+    capture_route_graphs(
+        stream,
+        PROMPT_ROUTES,
+        "MTP prompt graph inventory has wrong cardinality",
+        |rows| launch_route(stream, rows, target, arena, regions, pointers, ops, stagers),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -805,11 +804,6 @@ fn cache_page_values() -> EngineResult<usize> {
         )?,
         Qwen38_27B::HEAD_DIM,
     )
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

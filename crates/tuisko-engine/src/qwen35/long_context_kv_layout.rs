@@ -1,5 +1,6 @@
 //! Shared BF16 KV ownership for the exact Qwen3.5 text geometry.
 
+use crate::common::math::product;
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
@@ -205,11 +206,6 @@ fn require_geometry() -> EngineResult<()> {
     }
 
     Ok(())
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 fn sum(name: &str, left: usize, right: usize) -> EngineResult<usize> {

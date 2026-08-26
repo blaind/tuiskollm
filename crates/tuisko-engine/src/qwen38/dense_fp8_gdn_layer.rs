@@ -1,5 +1,7 @@
 //! Resident source-backed dense-FP8 GDN decoder layer.
 
+use crate::common::graph::{capture_batch_graphs, capture_route_graphs};
+use crate::common::math::{little_endian_words, product};
 use crate::qwen38::dense_fp8_gdn_layer_layout::{GdnLayerRegions, MAX_ROWS};
 use crate::{DenseFp8GdnLayerLayout, EngineError, EngineResult, MAX_BATCH};
 use std::marker::PhantomData;
@@ -725,15 +727,11 @@ fn capture_decode_routes<A: Sm120Arch>(
     ops: Ops<'_, A>,
     pointers: Pointers,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
-    let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for batch in 1..=MAX_BATCH {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, batch, ops, pointers)
-        })?);
-    }
-    graphs.try_into().map_err(|_| {
-        EngineError::layout("dense-FP8 GDN layer graph inventory has wrong cardinality")
-    })
+    capture_batch_graphs(
+        stream,
+        "dense-FP8 GDN layer graph inventory has wrong cardinality",
+        |batch| launch_route(stream, batch, ops, pointers),
+    )
 }
 
 fn capture_prefill_routes<A: Sm120Arch>(
@@ -741,16 +739,12 @@ fn capture_prefill_routes<A: Sm120Arch>(
     ops: Ops<'_, A>,
     pointers: Pointers,
 ) -> EngineResult<[CudaGraph; 4]> {
-    let mut graphs = Vec::with_capacity(4);
-    for rows in [32, 64, 128, MAX_ROWS] {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_route(stream, rows, ops, pointers)
-        })?);
-    }
-
-    graphs.try_into().map_err(|_| {
-        EngineError::layout("dense-FP8 GDN layer prefill graph inventory has wrong cardinality")
-    })
+    capture_route_graphs(
+        stream,
+        [32, 64, 128, MAX_ROWS],
+        "dense-FP8 GDN layer prefill graph inventory has wrong cardinality",
+        |rows| launch_route(stream, rows, ops, pointers),
+    )
 }
 
 fn launch_route<A: Sm120Arch>(
@@ -928,25 +922,6 @@ fn require_rows(rows: usize) -> EngineResult<()> {
         )));
     }
     Ok(())
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn little_endian_words(bytes: &[u8]) -> EngineResult<Vec<u16>> {
-    if !bytes.len().is_multiple_of(2) {
-        return Err(EngineError::layout(
-            "BF16 source plane has an odd byte length",
-        ));
-    }
-    Ok(bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|word| u16::from_le_bytes(*word))
-        .collect())
 }
 
 #[cfg(test)]

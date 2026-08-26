@@ -1,5 +1,6 @@
 //! Address-stable Qwen3.5 text-endpoint layout.
 
+use crate::common::math::product;
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::{Arch, Qwen35_9B};
@@ -104,11 +105,6 @@ impl Qwen35TextEndpointLayout {
     pub(crate) const fn logits(&self) -> ArenaRegion<u16> {
         self.logits
     }
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

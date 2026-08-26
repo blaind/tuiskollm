@@ -1,6 +1,7 @@
 //! Single-allocation layout for the source-BF16 Qwen3.5 MTP layer.
 
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::common::math::{product, sum};
+use crate::{EngineResult, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{Arch, Qwen35_9B};
@@ -273,19 +274,6 @@ impl Qwen35MtpLayerLayout {
     pub const fn context_capacity(&self) -> usize {
         QWEN35_MTP_CONTEXT_CAPACITY
     }
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {
-    values.iter().try_fold(0usize, |total, &value| {
-        total
-            .checked_add(value)
-            .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-    })
 }
 
 #[cfg(test)]

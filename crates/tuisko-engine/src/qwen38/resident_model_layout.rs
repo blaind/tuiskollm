@@ -1,24 +1,6 @@
 //! Exact resident and shared-KV arena plan for the Qwen3.8 text model.
 
-mod program;
-mod progress;
-mod upload_plan;
-
-pub use program::{
-    ResidentDecodeRoute, ResidentLoadMode, ResidentLoadStats, ResidentModelProgram,
-    ResidentMtpSegmentedVerifyRoute, ResidentMtpVerifyRoute, ResidentPrefillRoute,
-};
-#[cfg(feature = "qualification")]
-pub use program::{
-    ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
-    ResidentMtpGdnObservables, ResidentMtpLayerObservables, ResidentMtpSegmentedStageGraph,
-    ResidentMtpVerifyObservables, ResidentPrefillStageGraph,
-};
-pub use progress::{ResidentLoadPhase, ResidentLoadProgress};
-pub use upload_plan::{
-    ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
-};
-
+use crate::common::math::{checked_sum, product};
 use crate::{
     EngineError, EngineResult, KvCacheCodec, MAX_BATCH, SharedPagedKvLayout,
     qwen38::long_context_kv_layout::MAX_CONTEXT_TOKENS,
@@ -50,18 +32,18 @@ pub enum ResidentLayerKind {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct GdnWeights {
-    input_norm: ArenaRegion<u16>,
-    input_weight_codes: ArenaRegion<u8>,
-    input_weight_scales: ArenaRegion<u16>,
-    control_weights: ArenaRegion<u16>,
-    a_log: ArenaRegion<u16>,
-    dt_bias: ArenaRegion<u16>,
-    convolution_weights: ArenaRegion<u16>,
-    recurrent_norm: ArenaRegion<u16>,
-    output_weight_codes: ArenaRegion<u8>,
-    output_weight_scales: ArenaRegion<u16>,
-    post_attention_norm: ArenaRegion<u16>,
+pub(super) struct GdnWeights {
+    pub(super) input_norm: ArenaRegion<u16>,
+    pub(super) input_weight_codes: ArenaRegion<u8>,
+    pub(super) input_weight_scales: ArenaRegion<u16>,
+    pub(super) control_weights: ArenaRegion<u16>,
+    pub(super) a_log: ArenaRegion<u16>,
+    pub(super) dt_bias: ArenaRegion<u16>,
+    pub(super) convolution_weights: ArenaRegion<u16>,
+    pub(super) recurrent_norm: ArenaRegion<u16>,
+    pub(super) output_weight_codes: ArenaRegion<u8>,
+    pub(super) output_weight_scales: ArenaRegion<u16>,
+    pub(super) post_attention_norm: ArenaRegion<u16>,
 }
 
 impl GdnWeights {
@@ -118,15 +100,15 @@ impl GdnWeights {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct AttentionWeights {
-    input_norm: ArenaRegion<u16>,
-    qkv_weight_codes: ArenaRegion<u8>,
-    qkv_weight_scales: ArenaRegion<u16>,
-    query_norm: ArenaRegion<u16>,
-    key_norm: ArenaRegion<u16>,
-    output_weight_codes: ArenaRegion<u8>,
-    output_weight_scales: ArenaRegion<u16>,
-    post_attention_norm: ArenaRegion<u16>,
+pub(super) struct AttentionWeights {
+    pub(super) input_norm: ArenaRegion<u16>,
+    pub(super) qkv_weight_codes: ArenaRegion<u8>,
+    pub(super) qkv_weight_scales: ArenaRegion<u16>,
+    pub(super) query_norm: ArenaRegion<u16>,
+    pub(super) key_norm: ArenaRegion<u16>,
+    pub(super) output_weight_codes: ArenaRegion<u8>,
+    pub(super) output_weight_scales: ArenaRegion<u16>,
+    pub(super) post_attention_norm: ArenaRegion<u16>,
 }
 
 impl AttentionWeights {
@@ -177,7 +159,7 @@ impl AttentionWeights {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum MixerWeights {
+pub(super) enum MixerWeights {
     Gdn(GdnWeights),
     Attention(AttentionWeights),
 }
@@ -199,12 +181,12 @@ impl MixerWeights {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Nvfp4MlpWeights {
-    gate_weight_codes: ArenaRegion<u8>,
-    up_weight_codes: ArenaRegion<u8>,
-    gate_up_weight_scales: ArenaRegion<u8>,
-    down_weight_codes: ArenaRegion<u8>,
-    down_weight_scales: ArenaRegion<u8>,
+pub(super) struct Nvfp4MlpWeights {
+    pub(super) gate_weight_codes: ArenaRegion<u8>,
+    pub(super) up_weight_codes: ArenaRegion<u8>,
+    pub(super) gate_up_weight_scales: ArenaRegion<u8>,
+    pub(super) down_weight_codes: ArenaRegion<u8>,
+    pub(super) down_weight_scales: ArenaRegion<u8>,
 }
 
 impl Nvfp4MlpWeights {
@@ -255,11 +237,11 @@ impl Nvfp4MlpWeights {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct DenseFp8MlpWeights {
-    gate_up_weight_codes: ArenaRegion<u8>,
-    gate_up_weight_scales: ArenaRegion<u16>,
-    down_weight_codes: ArenaRegion<u8>,
-    down_weight_scales: ArenaRegion<u16>,
+pub(super) struct DenseFp8MlpWeights {
+    pub(super) gate_up_weight_codes: ArenaRegion<u8>,
+    pub(super) gate_up_weight_scales: ArenaRegion<u16>,
+    pub(super) down_weight_codes: ArenaRegion<u8>,
+    pub(super) down_weight_scales: ArenaRegion<u16>,
 }
 
 impl DenseFp8MlpWeights {
@@ -302,7 +284,7 @@ impl DenseFp8MlpWeights {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum MlpWeights {
+pub(super) enum MlpWeights {
     Nvfp4(Nvfp4MlpWeights),
     DenseFp8(DenseFp8MlpWeights),
 }
@@ -324,9 +306,9 @@ impl MlpWeights {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct GdnPersistent {
-    history: ArenaRegion<u16>,
-    state: ArenaRegion<f32>,
+pub(super) struct GdnPersistent {
+    pub(super) history: ArenaRegion<u16>,
+    pub(super) state: ArenaRegion<f32>,
 }
 
 impl GdnPersistent {
@@ -361,7 +343,7 @@ impl GdnPersistent {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum PersistentState {
+pub(super) enum PersistentState {
     Gdn(GdnPersistent),
     Attention,
 }
@@ -376,11 +358,11 @@ impl PersistentState {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ResidentLayerLayout {
+pub(super) struct ResidentLayerLayout {
     kind: ResidentLayerKind,
-    mixer: MixerWeights,
-    mlp: MlpWeights,
-    persistent: PersistentState,
+    pub(super) mixer: MixerWeights,
+    pub(super) mlp: MlpWeights,
+    pub(super) persistent: PersistentState,
 }
 
 impl ResidentLayerLayout {
@@ -426,10 +408,10 @@ impl ResidentLayerLayout {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct EndpointWeights {
-    final_norm: ArenaRegion<u16>,
-    lm_head_codes: ArenaRegion<u8>,
-    lm_head_scales: ArenaRegion<u16>,
+pub(super) struct EndpointWeights {
+    pub(super) final_norm: ArenaRegion<u16>,
+    pub(super) lm_head_codes: ArenaRegion<u8>,
+    pub(super) lm_head_scales: ArenaRegion<u16>,
 }
 
 impl EndpointWeights {
@@ -461,44 +443,44 @@ impl EndpointWeights {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SharedWorkspace {
-    residual_a: ArenaRegion<u16>,
-    residual_b: ArenaRegion<u16>,
-    mixer_residual: ArenaRegion<u16>,
-    mixer_normalized: ArenaRegion<u16>,
-    mlp_normalized: ArenaRegion<u16>,
-    activation_codes: ArenaRegion<u8>,
-    activation_scales: ArenaRegion<f32>,
-    nvfp4_activation_codes: ArenaRegion<u8>,
-    nvfp4_activation_scales: ArenaRegion<u8>,
-    projected: ArenaRegion<u16>,
-    state_rows: ArenaRegion<u32>,
-    log_decay: ArenaRegion<f32>,
-    beta: ArenaRegion<f32>,
-    convolved: ArenaRegion<u16>,
-    recurrent_output: ArenaRegion<u16>,
-    rope_cos: ArenaRegion<f32>,
-    rope_sin: ArenaRegion<f32>,
-    table_rows: ArenaRegion<u32>,
-    cache_positions: ArenaRegion<u32>,
-    lengths: ArenaRegion<u32>,
-    query: ArenaRegion<f32>,
-    partial_maximum: ArenaRegion<f32>,
-    partial_denominator: ArenaRegion<f32>,
-    partial_numerator: ArenaRegion<f32>,
-    prefill_partials: ArenaRegion<f32>,
-    recurrent_plane: ArenaRegion<f32>,
-    attention: ArenaRegion<f32>,
-    mixer_branch: ArenaRegion<u16>,
-    swiglu: ArenaRegion<u16>,
-    mlp_branch: ArenaRegion<u16>,
-    logits: ArenaRegion<u16>,
-    provisional_history: ArenaRegion<u16>,
-    provisional_state: ArenaRegion<f32>,
-    provisional_state_row: ArenaRegion<u32>,
-    recorded_projected: ArenaRegion<u16>,
-    recorded_log_decay: ArenaRegion<f32>,
-    recorded_beta: ArenaRegion<f32>,
+pub(super) struct SharedWorkspace {
+    pub(super) residual_a: ArenaRegion<u16>,
+    pub(super) residual_b: ArenaRegion<u16>,
+    pub(super) mixer_residual: ArenaRegion<u16>,
+    pub(super) mixer_normalized: ArenaRegion<u16>,
+    pub(super) mlp_normalized: ArenaRegion<u16>,
+    pub(super) activation_codes: ArenaRegion<u8>,
+    pub(super) activation_scales: ArenaRegion<f32>,
+    pub(super) nvfp4_activation_codes: ArenaRegion<u8>,
+    pub(super) nvfp4_activation_scales: ArenaRegion<u8>,
+    pub(super) projected: ArenaRegion<u16>,
+    pub(super) state_rows: ArenaRegion<u32>,
+    pub(super) log_decay: ArenaRegion<f32>,
+    pub(super) beta: ArenaRegion<f32>,
+    pub(super) convolved: ArenaRegion<u16>,
+    pub(super) recurrent_output: ArenaRegion<u16>,
+    pub(super) rope_cos: ArenaRegion<f32>,
+    pub(super) rope_sin: ArenaRegion<f32>,
+    pub(super) table_rows: ArenaRegion<u32>,
+    pub(super) cache_positions: ArenaRegion<u32>,
+    pub(super) lengths: ArenaRegion<u32>,
+    pub(super) query: ArenaRegion<f32>,
+    pub(super) partial_maximum: ArenaRegion<f32>,
+    pub(super) partial_denominator: ArenaRegion<f32>,
+    pub(super) partial_numerator: ArenaRegion<f32>,
+    pub(super) prefill_partials: ArenaRegion<f32>,
+    pub(super) recurrent_plane: ArenaRegion<f32>,
+    pub(super) attention: ArenaRegion<f32>,
+    pub(super) mixer_branch: ArenaRegion<u16>,
+    pub(super) swiglu: ArenaRegion<u16>,
+    pub(super) mlp_branch: ArenaRegion<u16>,
+    pub(super) logits: ArenaRegion<u16>,
+    pub(super) provisional_history: ArenaRegion<u16>,
+    pub(super) provisional_state: ArenaRegion<f32>,
+    pub(super) provisional_state_row: ArenaRegion<u32>,
+    pub(super) recorded_projected: ArenaRegion<u16>,
+    pub(super) recorded_log_decay: ArenaRegion<f32>,
+    pub(super) recorded_beta: ArenaRegion<f32>,
 }
 
 impl SharedWorkspace {
@@ -681,11 +663,11 @@ impl SharedWorkspace {
 /// Checked exact-target layout for all resident text weights, state, caches, and shared scratch.
 #[derive(Clone, Debug)]
 pub struct ResidentModelLayout {
-    builder: ArenaLayout,
-    kv_layout: SharedPagedKvLayout,
-    layers: Vec<ResidentLayerLayout>,
-    endpoint: EndpointWeights,
-    workspace: SharedWorkspace,
+    pub(super) builder: ArenaLayout,
+    pub(super) kv_layout: SharedPagedKvLayout,
+    pub(super) layers: Vec<ResidentLayerLayout>,
+    pub(super) endpoint: EndpointWeights,
+    pub(super) workspace: SharedWorkspace,
     resident_weight_bytes: usize,
     history_bytes: usize,
     state_bytes: usize,
@@ -967,16 +949,6 @@ fn gdn_state_bytes() -> EngineResult<usize> {
         )?,
         size_of::<f32>(),
     )
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn checked_sum(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_add(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

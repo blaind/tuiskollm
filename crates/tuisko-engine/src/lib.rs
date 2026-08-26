@@ -1,5 +1,6 @@
 //! Resident text inference ownership.
 
+mod common;
 mod error;
 mod generation;
 mod layout;
@@ -9,9 +10,14 @@ mod qwen35;
 mod qwen36;
 mod qwen38;
 mod resident_generation;
-mod resident_mtp_generation;
 mod sampling;
 
+#[cfg(feature = "qualification")]
+pub use common::mtp::qualification_decide_sampled_tokens;
+pub use common::mtp::{
+    ResidentMtpGenerationStats, ResidentMtpGreedyStats, ResidentMtpSampledRound,
+};
+pub use common::progress::{ResidentLoadPhase, ResidentLoadProgress};
 pub use error::{EngineError, EngineErrorCode, EngineResult};
 pub use generation::{
     CancelledText, ChatGenerationRequest, FinishReason, GeneratedText, GenerationSession,
@@ -79,12 +85,11 @@ pub use qwen38::mtp_prompt_prime::{MtpPromptPrimeProgram, MtpPromptPrimeRoute};
 pub use qwen38::mtp_prompt_prime_layout::MtpPromptPrimeLayout;
 pub use qwen38::nvfp4_mlp::Nvfp4MlpProgram;
 pub use qwen38::nvfp4_mlp_layout::Nvfp4MlpLayout;
-pub use qwen38::resident_model_layout::{
-    ResidentDecodeRoute, ResidentLayerKind, ResidentLoadMode, ResidentLoadPhase,
-    ResidentLoadProgress, ResidentLoadStats, ResidentModelLayout, ResidentModelProgram,
+pub use qwen38::resident_model::{
+    ResidentDecodeRoute, ResidentLoadMode, ResidentLoadStats, ResidentModelProgram,
     ResidentMtpSegmentedVerifyRoute, ResidentMtpVerifyRoute, ResidentPrefillRoute,
-    ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
 };
+pub use qwen38::resident_model_layout::{ResidentLayerKind, ResidentModelLayout};
 pub use qwen38::resident_mtp::{
     ResidentMtpDraftRoute, ResidentMtpLoadStats, ResidentMtpProgram, ResidentMtpPromptRoute,
     ResidentMtpRealignRoute,
@@ -92,18 +97,16 @@ pub use qwen38::resident_mtp::{
 pub use qwen38::resident_mtp_batch_generation::{
     ResidentMtpBatchEvent, ResidentMtpBatchEvents, ResidentMtpBatchGenerator,
 };
+pub use qwen38::resident_mtp_generation::{ResidentMtpGenerationSession, ResidentMtpTextGenerator};
 pub use qwen38::resident_mtp_layout::ResidentMtpLayout;
+pub use qwen38::upload_plan::{
+    ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
+};
 pub use resident_generation::{
     Qwen35ResidentGenerationSession, Qwen35ResidentTextGenerator, Qwen36ResidentGenerationSession,
     Qwen36ResidentTextGenerator, ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents,
     ResidentBatchGenerator, ResidentCancellation, ResidentGenerationSession, ResidentRequestId,
     ResidentTextGenerator,
-};
-#[cfg(feature = "qualification")]
-pub use resident_mtp_generation::qualification_decide_sampled_tokens;
-pub use resident_mtp_generation::{
-    ResidentMtpGenerationSession, ResidentMtpGenerationStats, ResidentMtpGreedyStats,
-    ResidentMtpSampledRound, ResidentMtpTextGenerator,
 };
 pub use sampling::{
     SampleDecision, Sampler, SamplingDistribution, SamplingOptions, SamplingPenalties,
@@ -155,7 +158,7 @@ pub use qwen38::mtp_prompt_prime::MtpPromptPrimeObservables;
 #[cfg(feature = "qualification")]
 pub use qwen38::nvfp4_mlp::{Nvfp4MlpImmutable, Nvfp4MlpObservables};
 #[cfg(feature = "qualification")]
-pub use qwen38::resident_model_layout::{
+pub use qwen38::resident_model::{
     ResidentEmbeddingStageGraph, ResidentLongContextObservables, ResidentModelObservables,
     ResidentMtpGdnObservables, ResidentMtpLayerObservables, ResidentMtpSegmentedStageGraph,
     ResidentMtpVerifyObservables, ResidentPrefillStageGraph,

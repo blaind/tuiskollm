@@ -1,9 +1,8 @@
 //! Single-slot Qwen3.5 generation over the resident target and source-BF16 MTP layer.
 
-use crate::resident_generation::{device_zero_context, require_generation_capacity, text_rope};
-use crate::resident_mtp_generation::{
-    DRAFT_WINDOW, VERIFY_ROWS, decide_sampled_tokens, fill_contiguous_rope,
-};
+use crate::common::mtp::{DRAFT_WINDOW, VERIFY_ROWS, decide_sampled_tokens};
+use crate::common::rope::{fill_contiguous_rope, text_rope};
+use crate::common::slots::{device_zero_context, require_generation_capacity};
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
     GenerationSession, GenerationStep, Qwen35ResidentMtpProgram, ResidentMtpGenerationStats,

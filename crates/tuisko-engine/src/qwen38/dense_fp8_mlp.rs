@@ -1,5 +1,7 @@
 //! Resident source-backed dense-FP8 MLP program.
 
+use crate::common::graph::{capture_batch_graphs, capture_route_graphs};
+use crate::common::math::checked_product;
 use crate::qwen38::dense_fp8_mlp_layout::MAX_ROWS;
 use crate::{DenseFp8MlpLayout, EngineError, EngineResult, MAX_BATCH};
 use std::marker::PhantomData;
@@ -490,9 +492,10 @@ fn capture_decode_routes<A: Sm120Arch>(
     down_maps: &DenseFp8DownTmaMaps,
     pointers: Pointers,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
-    let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for batch in 1..=MAX_BATCH {
-        graphs.push(CudaGraph::capture(stream, || {
+    capture_batch_graphs(
+        stream,
+        "dense-FP8 MLP graph inventory has wrong cardinality",
+        |batch| {
             launch_route(
                 stream,
                 batch,
@@ -503,12 +506,8 @@ fn capture_decode_routes<A: Sm120Arch>(
                 down_maps,
                 pointers,
             )
-        })?);
-    }
-
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("dense-FP8 MLP graph inventory has wrong cardinality"))
+        },
+    )
 }
 
 fn capture_prefill_routes<A: Sm120Arch>(
@@ -520,9 +519,11 @@ fn capture_prefill_routes<A: Sm120Arch>(
     down_maps: &DenseFp8DownTmaMaps,
     pointers: Pointers,
 ) -> EngineResult<[CudaGraph; 4]> {
-    let mut graphs = Vec::with_capacity(4);
-    for rows in [32, 64, 128, MAX_ROWS] {
-        graphs.push(CudaGraph::capture(stream, || {
+    capture_route_graphs(
+        stream,
+        [32, 64, 128, MAX_ROWS],
+        "dense-FP8 MLP prefill graph inventory has wrong cardinality",
+        |rows| {
             launch_route(
                 stream,
                 rows,
@@ -533,12 +534,8 @@ fn capture_prefill_routes<A: Sm120Arch>(
                 down_maps,
                 pointers,
             )
-        })?);
-    }
-
-    graphs.try_into().map_err(|_| {
-        EngineError::layout("dense-FP8 MLP prefill graph inventory has wrong cardinality")
-    })
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -663,11 +660,6 @@ fn require_rows(rows: usize) -> EngineResult<()> {
     }
 
     Ok(())
-}
-
-fn checked_product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(test)]

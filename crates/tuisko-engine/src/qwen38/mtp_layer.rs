@@ -1,5 +1,7 @@
 //! Resident source-backed Qwen3.8 MTP draft layer.
 
+use crate::common::graph::capture_batch_graphs;
+use crate::common::math::{little_endian_words, product};
 use crate::qwen38::mtp_layer_layout::{
     CONTEXT_CAPACITY, MtpLayerRegions, PHYSICAL_PAGES, TABLE_STRIDE,
 };
@@ -876,15 +878,11 @@ fn capture_draft_routes(
     ops: Ops<'_>,
     pointers: Pointers,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
-    let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for batch in 1..=MAX_BATCH {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_full(stream, batch, ops, pointers)
-        })?);
-    }
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("MTP draft graph inventory has wrong cardinality"))
+    capture_batch_graphs(
+        stream,
+        "MTP draft graph inventory has wrong cardinality",
+        |batch| launch_full(stream, batch, ops, pointers),
+    )
 }
 
 fn capture_prime_routes(
@@ -892,15 +890,11 @@ fn capture_prime_routes(
     ops: Ops<'_>,
     pointers: Pointers,
 ) -> EngineResult<[CudaGraph; REALIGN_ROUTES]> {
-    let mut graphs = Vec::with_capacity(REALIGN_ROUTES);
-    for tokens in 1..=REALIGN_ROUTES {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_prime(stream, tokens, ops, pointers)
-        })?);
-    }
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("MTP prime graph inventory has wrong cardinality"))
+    capture_batch_graphs(
+        stream,
+        "MTP prime graph inventory has wrong cardinality",
+        |tokens| launch_prime(stream, tokens, ops, pointers),
+    )
 }
 
 fn capture_realign_routes(
@@ -908,15 +902,11 @@ fn capture_realign_routes(
     ops: Ops<'_>,
     pointers: Pointers,
 ) -> EngineResult<[CudaGraph; REALIGN_ROUTES]> {
-    let mut graphs = Vec::with_capacity(REALIGN_ROUTES);
-    for tokens in 1..=REALIGN_ROUTES {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_realign(stream, tokens, ops, pointers)
-        })?);
-    }
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("MTP realignment graph inventory has wrong cardinality"))
+    capture_batch_graphs(
+        stream,
+        "MTP realignment graph inventory has wrong cardinality",
+        |tokens| launch_realign(stream, tokens, ops, pointers),
+    )
 }
 
 fn launch_prime(
@@ -1079,25 +1069,6 @@ fn require_realign(tokens: usize) -> EngineResult<()> {
 
 fn require_rows(rows: usize) -> EngineResult<()> {
     require_batch(rows)
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn little_endian_words(bytes: &[u8]) -> EngineResult<Vec<u16>> {
-    if !bytes.len().is_multiple_of(2) {
-        return Err(EngineError::layout(
-            "BF16 source plane has an odd byte length",
-        ));
-    }
-    Ok(bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|word| u16::from_le_bytes(*word))
-        .collect())
 }
 
 #[cfg(test)]

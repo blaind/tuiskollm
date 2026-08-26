@@ -1,6 +1,7 @@
 //! Single-allocation layout for one resident dense-FP8 MLP boundary.
 
-use crate::{EngineError, EngineResult};
+use crate::EngineResult;
+use crate::common::math::{product, sum};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_model::Arch;
 
@@ -200,19 +201,6 @@ impl DenseFp8MlpLayout {
     pub(crate) const fn next_normalized(&self) -> ArenaRegion<u16> {
         self.next_normalized
     }
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-}
-
-fn sum(name: &str, values: &[usize]) -> EngineResult<usize> {
-    values.iter().try_fold(0usize, |total, &value| {
-        total
-            .checked_add(value)
-            .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
-    })
 }
 
 #[cfg(test)]

@@ -1,5 +1,7 @@
 //! Resident source-backed Qwen3.6 MTP transformer layer.
 
+use crate::common::graph::capture_batch_graphs;
+use crate::common::math::product;
 use crate::qwen36::mtp_layer_layout::{
     QWEN36_MTP_PHYSICAL_PAGES, QWEN36_MTP_PROMPT_ROWS, QWEN36_MTP_TABLE_STRIDE,
     Qwen36MtpLayerRegions,
@@ -1049,15 +1051,11 @@ fn capture_draft_routes(
     ops: Ops<'_>,
     pointers: Pointers,
 ) -> EngineResult<[CudaGraph; MAX_BATCH]> {
-    let mut graphs = Vec::with_capacity(MAX_BATCH);
-    for batch in 1..=MAX_BATCH {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_full(stream, batch, ops, pointers)
-        })?);
-    }
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("Qwen3.6 MTP draft graph inventory has wrong cardinality"))
+    capture_batch_graphs(
+        stream,
+        "Qwen3.6 MTP draft graph inventory has wrong cardinality",
+        |batch| launch_full(stream, batch, ops, pointers),
+    )
 }
 
 fn capture_prime_routes(
@@ -1065,15 +1063,11 @@ fn capture_prime_routes(
     ops: Ops<'_>,
     pointers: Pointers,
 ) -> EngineResult<[CudaGraph; REALIGN_ROUTES]> {
-    let mut graphs = Vec::with_capacity(REALIGN_ROUTES);
-    for tokens in 1..=REALIGN_ROUTES {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_prime(stream, tokens, ops, pointers)
-        })?);
-    }
-    graphs
-        .try_into()
-        .map_err(|_| EngineError::layout("Qwen3.6 MTP prime graph inventory has wrong cardinality"))
+    capture_batch_graphs(
+        stream,
+        "Qwen3.6 MTP prime graph inventory has wrong cardinality",
+        |tokens| launch_prime(stream, tokens, ops, pointers),
+    )
 }
 
 fn capture_realign_routes(
@@ -1081,15 +1075,11 @@ fn capture_realign_routes(
     ops: Ops<'_>,
     pointers: Pointers,
 ) -> EngineResult<[CudaGraph; REALIGN_ROUTES]> {
-    let mut graphs = Vec::with_capacity(REALIGN_ROUTES);
-    for tokens in 1..=REALIGN_ROUTES {
-        graphs.push(CudaGraph::capture(stream, || {
-            launch_realign(stream, tokens, ops, pointers)
-        })?);
-    }
-    graphs.try_into().map_err(|_| {
-        EngineError::layout("Qwen3.6 MTP realignment graph inventory has wrong cardinality")
-    })
+    capture_batch_graphs(
+        stream,
+        "Qwen3.6 MTP realignment graph inventory has wrong cardinality",
+        |tokens| launch_realign(stream, tokens, ops, pointers),
+    )
 }
 
 fn capture_prompt_routes(
@@ -1314,11 +1304,6 @@ fn require_rows_or_prompt(rows: usize) -> EngineResult<()> {
             "Qwen3.6 MTP rows {rows} are outside 1..={MAX_BATCH},32,64,128"
         )))
     }
-}
-
-fn product(name: &str, left: usize, right: usize) -> EngineResult<usize> {
-    left.checked_mul(right)
-        .ok_or_else(|| EngineError::layout(format!("{name} overflows")))
 }
 
 #[cfg(feature = "qualification")]

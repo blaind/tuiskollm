@@ -1,58 +1,21 @@
 //! Single-slot greedy and unbiased sampled generation over the resident target-plus-MTP owner.
 
+use crate::common::mtp::{
+    DRAFT_WINDOW, MAX_NATIVE_PREFILL_TOKENS, ResidentMtpGenerationStats, VERIFY_ROWS,
+    decide_sampled_tokens, next_native_prefill_tile, require_generation_capacity,
+};
+use crate::common::rope::{ROTARY_PAIRS, fill_contiguous_rope, text_rope};
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, FinishReason, GeneratedText,
     GenerationSession, GenerationStep, ResidentMtpProgram, ResidentMtpVerifyRoute,
-    SamplingDistribution, speculative_decision,
+    SamplingDistribution,
 };
 use std::sync::Arc;
 use tuisko_frontend::TextFrontend;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
-const ROTARY_DIM: usize = 64;
-pub(crate) const ROTARY_PAIRS: usize = ROTARY_DIM / 2;
-const ROPE_THETA: f64 = 10_000_000.0;
-pub(crate) const DRAFT_WINDOW: usize = 3;
-pub(crate) const VERIFY_ROWS: usize = DRAFT_WINDOW + 1;
-const MAX_NATIVE_PREFILL_TOKENS: usize = 1_024;
 const LOGIT_ROWS: usize = VERIFY_ROWS + 1;
-
-/// Exact speculative activity observed by one generation session.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ResidentMtpGenerationStats {
-    /// Target verification routes selected for K=1,2,3,4.
-    pub verification_routes: [usize; VERIFY_ROWS],
-    /// Draft tokens proposed before target verification.
-    pub draft_proposals: usize,
-    /// Draft tokens licensed by equal target argmax decisions.
-    pub accepted_drafts: usize,
-    /// Generated tokens committed through target verification routes.
-    pub verified_outputs: usize,
-}
-
-/// Backward-compatible name for the greedy slice's generation counters.
-pub type ResidentMtpGreedyStats = ResidentMtpGenerationStats;
-
-/// Host decision for one exact draft-three sampled MTP transaction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResidentMtpSampledRound {
-    tokens: [u32; VERIFY_ROWS],
-    committed: usize,
-    accepted: usize,
-}
-
-impl ResidentMtpSampledRound {
-    /// Target-licensed output prefix, including one correction or bonus when applicable.
-    pub fn token_ids(&self) -> &[u32] {
-        &self.tokens[..self.committed]
-    }
-
-    /// Draft proposals accepted before correction, stop, or full acceptance.
-    pub const fn accepted_drafts(&self) -> usize {
-        self.accepted
-    }
-}
 
 /// Concrete single-slot owner for exact draft-three generation.
 pub struct ResidentMtpTextGenerator {
@@ -584,80 +547,6 @@ impl ResidentMtpGenerationSession<'_> {
     }
 }
 
-pub(crate) fn decide_sampled_tokens(
-    drafts: &[u32],
-    target_laws: &[&SamplingDistribution],
-    draft_laws: &[&SamplingDistribution],
-    stop_ids: &[u32],
-    acceptance_units: &[f64],
-    residual_units: &[f64],
-    bonus_unit: f64,
-) -> EngineResult<ResidentMtpSampledRound> {
-    let extent = drafts.len();
-    if !(1..=DRAFT_WINDOW).contains(&extent)
-        || target_laws.len() != extent + 1
-        || draft_laws.len() != extent
-        || acceptance_units.len() != extent
-        || residual_units.len() != extent
-    {
-        return Err(EngineError::generation(format!(
-            "sampled MTP round inventory differs: drafts={extent}, target={}, draft={}, acceptance={}, residual={}",
-            target_laws.len(),
-            draft_laws.len(),
-            acceptance_units.len(),
-            residual_units.len()
-        )));
-    }
-    let mut round = ResidentMtpSampledRound {
-        tokens: [0; VERIFY_ROWS],
-        committed: 0,
-        accepted: 0,
-    };
-    for row in 0..extent {
-        let decision = speculative_decision(
-            drafts[row],
-            target_laws[row],
-            draft_laws[row],
-            acceptance_units[row],
-            residual_units[row],
-        )?;
-        round.tokens[round.committed] = decision.token_id;
-        round.committed += 1;
-        if !decision.accepted {
-            return Ok(round);
-        }
-        round.accepted += 1;
-        if stop_ids.contains(&decision.token_id) {
-            return Ok(round);
-        }
-    }
-    round.tokens[round.committed] = target_laws[extent].draw_at(bonus_unit)?;
-    round.committed += 1;
-    Ok(round)
-}
-
-#[cfg(feature = "qualification")]
-/// Runs the exact host commit rule for the independent speculative-sampling oracle.
-pub fn qualification_decide_sampled_tokens(
-    drafts: &[u32],
-    target_laws: &[&SamplingDistribution],
-    draft_laws: &[&SamplingDistribution],
-    stop_ids: [u32; 2],
-    acceptance_units: &[f64],
-    residual_units: &[f64],
-    bonus_unit: f64,
-) -> EngineResult<ResidentMtpSampledRound> {
-    decide_sampled_tokens(
-        drafts,
-        target_laws,
-        draft_laws,
-        &stop_ids,
-        acceptance_units,
-        residual_units,
-        bonus_unit,
-    )
-}
-
 pub(crate) fn prime_prompt(
     program: &mut ResidentMtpProgram,
     stream: &CudaStream,
@@ -785,52 +674,6 @@ fn replay_prefill_tile(
     program.target().replay_prefill(stream, route)
 }
 
-pub(crate) fn fill_contiguous_rope(
-    first_position: usize,
-    rows: usize,
-    cosine: &mut [f32],
-    sine: &mut [f32],
-) -> EngineResult<usize> {
-    if rows == 0 || rows > MAX_NATIVE_PREFILL_TOKENS {
-        return Err(EngineError::route(format!(
-            "resident MTP rotary rows {rows} are outside 1..={MAX_NATIVE_PREFILL_TOKENS}"
-        )));
-    }
-    let values = rows
-        .checked_mul(ROTARY_PAIRS)
-        .ok_or_else(|| EngineError::generation("resident MTP rotary values overflow"))?;
-    if cosine.len() < values || sine.len() < values {
-        return Err(EngineError::layout(format!(
-            "resident MTP rotary destinations have {}/{} values, expected at least {values}",
-            cosine.len(),
-            sine.len()
-        )));
-    }
-    for row in 0..rows {
-        let position = first_position
-            .checked_add(row)
-            .and_then(|position| u32::try_from(position).ok())
-            .ok_or_else(|| EngineError::generation("resident MTP position exceeds u32"))?;
-        let (row_cosine, row_sine) = text_rope(position);
-        let begin = row * ROTARY_PAIRS;
-        cosine[begin..begin + ROTARY_PAIRS].copy_from_slice(&row_cosine);
-        sine[begin..begin + ROTARY_PAIRS].copy_from_slice(&row_sine);
-    }
-    Ok(values)
-}
-
-pub(crate) fn text_rope(position: u32) -> ([f32; ROTARY_PAIRS], [f32; ROTARY_PAIRS]) {
-    let mut cosine = [0.0f32; ROTARY_PAIRS];
-    let mut sine = [0.0f32; ROTARY_PAIRS];
-    for pair in 0..ROTARY_PAIRS {
-        let frequency = ROPE_THETA.powf(-((2 * pair) as f64) / ROTARY_DIM as f64);
-        let angle = f64::from(position) * frequency;
-        cosine[pair] = angle.cos() as f32;
-        sine[pair] = angle.sin() as f32;
-    }
-    (cosine, sine)
-}
-
 fn target_logits(logits: &[u16], row: usize) -> &[u16] {
     let begin = row * Qwen38_27B::VOCAB;
     &logits[begin..begin + Qwen38_27B::VOCAB]
@@ -848,73 +691,4 @@ fn draft_logits(logits: &[u16]) -> &[u16] {
 fn draft_logits_mut(logits: &mut [u16]) -> &mut [u16] {
     let begin = VERIFY_ROWS * Qwen38_27B::VOCAB;
     &mut logits[begin..begin + Qwen38_27B::VOCAB]
-}
-
-const fn next_native_prefill_tile(remaining: usize) -> Option<usize> {
-    if remaining >= 1_024 {
-        Some(1_024)
-    } else if remaining >= 128 {
-        Some(128)
-    } else if remaining >= 64 {
-        Some(64)
-    } else if remaining >= 32 {
-        Some(32)
-    } else {
-        None
-    }
-}
-
-pub(crate) fn require_generation_capacity(
-    prompt_tokens: usize,
-    maximum_new_tokens: usize,
-    context_capacity: usize,
-) -> EngineResult<usize> {
-    if prompt_tokens == 0 {
-        return Err(EngineError::generation(
-            "resident MTP generation requires a nonempty prompt",
-        ));
-    }
-    let evaluated = prompt_tokens
-        .checked_add(maximum_new_tokens.saturating_sub(1))
-        .ok_or_else(|| EngineError::generation("resident MTP token budget overflows"))?;
-    if evaluated > context_capacity {
-        return Err(EngineError::generation(format!(
-            "prompt plus processed MTP generation requires {evaluated} positions, current resident capacity is {context_capacity}"
-        )));
-    }
-    Ok(evaluated)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{next_native_prefill_tile, require_generation_capacity};
-
-    #[test]
-    fn mtp_prompt_plan_excludes_the_final_target_anchor() {
-        for (prompt, expected) in [
-            (1, vec![]),
-            (32, vec![]),
-            (33, vec![32]),
-            (65, vec![64]),
-            (129, vec![128]),
-            (1_025, vec![1_024]),
-        ] {
-            let mut remaining = prompt - 1;
-            let mut plan = Vec::new();
-            while let Some(tile) = next_native_prefill_tile(remaining) {
-                plan.push(tile);
-                remaining -= tile;
-            }
-            assert_eq!(plan, expected);
-            assert!(remaining < 32);
-        }
-    }
-
-    #[test]
-    fn mtp_capacity_counts_only_processed_outputs() {
-        require_generation_capacity(220_000, 1, 220_000).unwrap();
-        require_generation_capacity(1, 220_000, 220_000).unwrap();
-        assert!(require_generation_capacity(220_000, 2, 220_000).is_err());
-        assert!(require_generation_capacity(0, 1, 220_000).is_err());
-    }
 }
