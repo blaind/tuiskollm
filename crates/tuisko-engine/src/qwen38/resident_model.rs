@@ -2107,6 +2107,10 @@ impl ResidentModelProgram {
         self.kv_slots.page_count(slot)
     }
 
+    pub(crate) const fn mtp_kv_free_pages(&self) -> usize {
+        self.kv_slots.free_pages()
+    }
+
     pub(crate) fn mtp_kv_token_count(&self, slot: usize) -> EngineResult<usize> {
         self.kv_slots.token_count(slot)
     }

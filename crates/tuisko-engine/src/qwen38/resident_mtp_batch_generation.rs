@@ -18,6 +18,7 @@ use crate::{
 use std::sync::Arc;
 use tuisko_frontend::{GenerationDefaults, TextFrontend};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
+use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
 const TARGET_DOWNLOAD_ROWS: usize = MAX_BATCH * VERIFY_ROWS;
@@ -307,14 +308,22 @@ impl ResidentMtpBatchGenerator {
                 "resident MTP reused prefix {reused} exceeds message boundary {message_boundary_tokens}"
             )));
         }
-        if reset {
-            self.program.recycle_kv_slot(&self.stream, slot)?;
-            self.program.reset_slot(&self.stream, slot)?;
-            self.message_boundary_valid[slot] = false;
-        }
+        self.prepare_kv_slot(slot, reset, required_positions)?;
         self.program.activate_kv_slot(slot)?;
-        self.program
-            .reserve_kv_slot_tokens(&self.stream, slot, required_positions)?;
+        if let Err(error) =
+            self.program
+                .reserve_kv_slot_tokens(&self.stream, slot, required_positions)
+        {
+            if reset {
+                self.program.recycle_kv_slot(&self.stream, slot)?;
+            } else {
+                self.program
+                    .truncate_kv_slot_tokens(&self.stream, slot, reused)?;
+                self.program.retain_kv_slot(slot)?;
+            }
+            return Err(error);
+        }
+        self.retained[slot] = None;
         self.program
             .target()
             .load_slot_routes(&self.stream, &[slot])?;
@@ -1258,7 +1267,6 @@ impl ResidentMtpBatchGenerator {
             })
             .max_by_key(|&(_, tokens, last_used)| (tokens, last_used));
         if let Some((slot, tokens, _)) = prefix {
-            self.retained[slot] = None;
             return Ok((slot, tokens, false));
         }
         if let Some(slot) = (0..MAX_BATCH)
@@ -1275,9 +1283,77 @@ impl ResidentMtpBatchGenerator {
             })
             .min_by_key(|&(_, last_used)| last_used)
             .map(|(slot, _)| slot)
-            .ok_or_else(|| EngineError::route("all eight resident MTP slots are active"))?;
-        self.retained[eviction] = None;
+            .ok_or_else(|| EngineError::capacity("all eight resident MTP slots are active"))?;
         Ok((eviction, 0, true))
+    }
+
+    fn prepare_kv_slot(
+        &mut self,
+        selected: usize,
+        reset: bool,
+        required_positions: usize,
+    ) -> EngineResult<()> {
+        let existing_pages = self.program.kv_slot_pages(selected)?;
+        let required_pages = required_positions.div_ceil(ATTENTION_PAGE_SIZE);
+        let retained_pages = if reset { 0 } else { existing_pages };
+        let additional_pages = required_pages.checked_sub(retained_pages).ok_or_else(|| {
+            EngineError::generation(format!(
+                "resident MTP slot {selected} retains {retained_pages} pages but admission requires only {required_pages}"
+            ))
+        })?;
+        let free_pages = self.program.kv_free_pages();
+        let free_after_reset = free_pages
+            .checked_add(if reset { existing_pages } else { 0 })
+            .ok_or_else(|| EngineError::generation("available KV pages overflow"))?;
+
+        let mut reclaimable_pages = 0usize;
+        for (slot, retained) in self.retained.iter().enumerate() {
+            if slot != selected && retained.is_some() {
+                reclaimable_pages = reclaimable_pages
+                    .checked_add(self.program.kv_slot_pages(slot)?)
+                    .ok_or_else(|| EngineError::generation("reclaimable KV pages overflow"))?;
+            }
+        }
+        if free_after_reset
+            .checked_add(reclaimable_pages)
+            .ok_or_else(|| EngineError::generation("available KV pages overflow"))?
+            < additional_pages
+        {
+            return Err(EngineError::capacity(format!(
+                "resident MTP KV admission requires {additional_pages} additional pages, {free_after_reset} are immediately available and {reclaimable_pages} belong to other inactive prefixes"
+            )));
+        }
+
+        if reset {
+            self.program.recycle_kv_slot(&self.stream, selected)?;
+            self.retained[selected] = None;
+            self.program.reset_slot(&self.stream, selected)?;
+            self.message_boundary_valid[selected] = false;
+        }
+
+        while self.program.kv_free_pages() < additional_pages {
+            let victim = self
+                .retained
+                .iter()
+                .enumerate()
+                .filter(|(slot, retained)| *slot != selected && retained.is_some())
+                .min_by_key(|(_, retained)| {
+                    retained
+                        .as_ref()
+                        .expect("retained page victim exists")
+                        .last_used
+                })
+                .map(|(slot, _)| slot)
+                .ok_or_else(|| {
+                    EngineError::generation(
+                        "resident MTP reclaimable-page accounting has no retained victim",
+                    )
+                })?;
+            self.program.recycle_kv_slot(&self.stream, victim)?;
+            self.retained[victim] = None;
+            self.message_boundary_valid[victim] = false;
+        }
+        Ok(())
     }
 
     fn store_retained(&mut self, slot: usize, tokens: Vec<u32>) -> EngineResult<()> {

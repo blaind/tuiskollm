@@ -17,6 +17,8 @@ pub enum EngineErrorCode {
     Sampling,
     /// A generation session entered an invalid state.
     Generation,
+    /// A valid request cannot be admitted until resident capacity is released.
+    Capacity,
 }
 
 impl EngineErrorCode {
@@ -27,6 +29,7 @@ impl EngineErrorCode {
             Self::Layout => "engine.layout",
             Self::Sampling => "engine.sampling",
             Self::Generation => "engine.generation",
+            Self::Capacity => "engine.capacity",
         }
     }
 }
@@ -99,6 +102,13 @@ impl EngineError {
             message: message.into(),
         }
     }
+
+    pub(crate) fn capacity(message: impl Into<String>) -> Self {
+        Self::Contract {
+            code: EngineErrorCode::Capacity,
+            message: message.into(),
+        }
+    }
 }
 
 /// Result type for engine operations.
@@ -115,6 +125,7 @@ mod tests {
             EngineErrorCode::Layout,
             EngineErrorCode::Sampling,
             EngineErrorCode::Generation,
+            EngineErrorCode::Capacity,
         ];
         let unique = codes
             .iter()
@@ -127,6 +138,7 @@ mod tests {
         assert_eq!(EngineErrorCode::Layout.as_str(), "engine.layout");
         assert_eq!(EngineErrorCode::Sampling.as_str(), "engine.sampling");
         assert_eq!(EngineErrorCode::Generation.as_str(), "engine.generation");
+        assert_eq!(EngineErrorCode::Capacity.as_str(), "engine.capacity");
     }
 
     #[test]

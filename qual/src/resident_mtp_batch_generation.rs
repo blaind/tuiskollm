@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
-    ChatGenerationRequest, EngineError, GeneratedText, ResidentMtpBatchGenerator,
+    ChatGenerationRequest, EngineError, EngineErrorCode, GeneratedText, ResidentMtpBatchGenerator,
     ResidentRequestId, SamplingOptions,
 };
 use tuisko_frontend::{ChatMessage, ChatTemplateOptions};
@@ -50,6 +50,10 @@ pub struct ResidentMtpBatchGenerationQualification {
     pub exact_prefix_reuses: usize,
     /// Retained spans rejected after divergence before their complete boundary.
     pub safe_cold_fallbacks: usize,
+    /// Full-pool admissions that evicted an unrelated inactive prefix.
+    pub page_pressure_evictions: usize,
+    /// Active-owner page shortages refused without losing retained state.
+    pub page_pressure_refusals: usize,
     /// Sampled scheduler lanes completed with deterministic per-request RNG state.
     pub sampled_lanes: usize,
     /// Complete greedy lanes compared with the independent B=1 sequence.
@@ -103,6 +107,9 @@ pub fn qualify_resident_mtp_batch_generation(
     let (cancellations, exact_prefix_reuses, safe_cold_fallbacks) =
         qualify_reuse_cancellation_and_recycling(&mut generator)?;
     generator.qualification_clear_retained()?;
+    let (page_pressure_evictions, page_pressure_refusals) =
+        qualify_page_pressure_eviction(&mut generator)?;
+    generator.qualification_clear_retained()?;
     let sampled_lanes = qualify_sampled_batch(&mut generator)?;
     generator.qualification_clear_retained()?;
     let greedy_invariant_lanes = qualify_greedy_batch_invariance(&mut generator)?;
@@ -130,6 +137,8 @@ pub fn qualify_resident_mtp_batch_generation(
         cancellations,
         exact_prefix_reuses,
         safe_cold_fallbacks,
+        page_pressure_evictions,
+        page_pressure_refusals,
         sampled_lanes,
         greedy_invariant_lanes,
         device_owner_bytes: generator.device_owner_bytes(),
@@ -291,6 +300,74 @@ fn qualify_reuse_cancellation_and_recycling(
     }
     let _ = generator.cancel(original.request_id)?;
     Ok((7, 2, 1))
+}
+
+fn qualify_page_pressure_eviction(
+    generator: &mut ResidentMtpBatchGenerator,
+) -> Result<(usize, usize), ResidentMtpBatchGenerationQualificationError> {
+    let displaced_request = greedy_request("Describe the color amber briefly.", 1);
+    let displaced = generator.admit(&displaced_request)?;
+    let displaced_slot = generator
+        .qualification_slot(displaced.request_id)
+        .expect("admitted request owns a slot");
+
+    let selected_request = greedy_request("Name one primary color.", 1);
+    let selected = generator.admit(&selected_request)?;
+    let selected_slot = generator
+        .qualification_slot(selected.request_id)
+        .expect("admitted request owns a slot");
+    let selected_retained = generator.cancel(selected.request_id)?;
+    let maximum = generator
+        .context_capacity()
+        .checked_sub(selected.prompt_tokens)
+        .filter(|&tokens| tokens != 0)
+        .ok_or_else(|| {
+            ResidentMtpBatchGenerationQualificationError::Mismatch(
+                "page-pressure fixture prompt fills the resident context".to_string(),
+            )
+        })?;
+
+    let full_request = greedy_request("Name one primary color.", maximum);
+    let error = match generator.admit(&full_request) {
+        Ok(_) => {
+            return Err(ResidentMtpBatchGenerationQualificationError::Mismatch(
+                "full-pool admission ignored pages owned by an active request".to_string(),
+            ));
+        }
+        Err(error) => error,
+    };
+    if error.code() != Some(EngineErrorCode::Capacity)
+        || generator.qualification_retained_tokens(selected_slot)
+            != Some(selected_retained.device_retained_tokens)
+        || generator.qualification_slot(displaced.request_id) != Some(displaced_slot)
+    {
+        return Err(ResidentMtpBatchGenerationQualificationError::Mismatch(
+            "active page pressure did not refuse admission without changing slot state".to_string(),
+        ));
+    }
+
+    let displaced_retained = generator.cancel(displaced.request_id)?;
+    if generator.qualification_retained_tokens(displaced_slot)
+        != Some(displaced_retained.device_retained_tokens)
+    {
+        return Err(ResidentMtpBatchGenerationQualificationError::Mismatch(
+            "page-pressure fixture did not retain its displacement candidate".to_string(),
+        ));
+    }
+    let admitted = generator.admit(&full_request)?;
+    if admitted.device_reused_tokens != selected_retained.device_retained_tokens
+        || generator.qualification_slot(admitted.request_id) != Some(selected_slot)
+        || generator
+            .qualification_retained_tokens(displaced_slot)
+            .is_some()
+    {
+        return Err(ResidentMtpBatchGenerationQualificationError::Mismatch(
+            "full-pool admission did not preserve its prefix and evict the LRU inactive owner"
+                .to_string(),
+        ));
+    }
+    let _ = generator.cancel(admitted.request_id)?;
+    Ok((1, 1))
 }
 
 fn qualify_sampled_batch(
@@ -567,8 +644,12 @@ fn verify_owner(
 
 #[cfg(test)]
 mod tests {
-    use super::{EXACT_BATCHES, EXACT_VERIFY_TOKENS};
+    use super::{EXACT_BATCHES, EXACT_VERIFY_TOKENS, qualify_page_pressure_eviction};
     use std::path::Path;
+    use std::sync::Arc;
+    use tuisko_engine::ResidentMtpBatchGenerator;
+    use tuisko_gpu::CudaContext;
+    use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
     #[test]
     fn resident_mtp_batch_route_inventory_is_exact() {
@@ -594,10 +675,33 @@ mod tests {
         assert_eq!(report.cancellations, 7);
         assert_eq!(report.exact_prefix_reuses, 2);
         assert_eq!(report.safe_cold_fallbacks, 1);
+        assert_eq!(report.page_pressure_evictions, 1);
+        assert_eq!(report.page_pressure_refusals, 1);
         assert_eq!(report.sampled_lanes, 3);
         assert_eq!(report.greedy_invariant_lanes, 36);
         assert_eq!(report.device_owner_bytes, 30_342_618_624);
         assert_eq!(report.host_stager_bytes, 1_281_019_904);
         assert_eq!(report.message_boundary_snapshot_bytes, 1_231_634_432);
+    }
+
+    #[test]
+    #[ignore = "requires the admitted source snapshot and an exclusive RTX 5090"]
+    fn resident_mtp_batch_suite_reclaims_inactive_pages_before_refusing_capacity() {
+        let _preflight = crate::device_benchmark::preflight().unwrap();
+        let root = std::env::var_os("TUISKO_SNAPSHOT")
+            .expect("TUISKO_SNAPSHOT must name the admitted snapshot");
+        let snapshot = Arc::new(
+            CheckpointSnapshot::<Qwen38_27B>::open(Path::new(&root))
+                .expect("snapshot must be admitted"),
+        );
+        let context = CudaContext::new(0).unwrap();
+        let mut generator = ResidentMtpBatchGenerator::from_snapshot(&context, snapshot).unwrap();
+
+        assert_eq!(
+            qualify_page_pressure_eviction(&mut generator).unwrap(),
+            (1, 1)
+        );
+        generator.qualification_clear_retained().unwrap();
+        crate::device_benchmark::require_current_process_exclusive().unwrap();
     }
 }

@@ -1036,6 +1036,16 @@ impl ResidentMtpProgram {
         self.target.activate_kv_slot(slot)
     }
 
+    /// Number of pages currently owned by one shared target/MTP slot.
+    pub(crate) fn kv_slot_pages(&self, slot: usize) -> EngineResult<usize> {
+        self.target.mtp_kv_page_count(slot)
+    }
+
+    /// Number of unowned pages in the shared target/MTP pool.
+    pub(crate) const fn kv_free_pages(&self) -> usize {
+        self.target.mtp_kv_free_pages()
+    }
+
     /// Extends shared ownership and clears both target and MTP pages before returning the route.
     pub fn reserve_kv_slot_tokens(
         &mut self,

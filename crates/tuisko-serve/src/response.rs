@@ -2,7 +2,7 @@
 
 use crate::{AssistantDelta, AssistantStreamParser, ParsedToolCall};
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header::RETRY_AFTER};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
@@ -29,6 +29,8 @@ pub enum GenerationReply {
     },
     /// Request admission failed before any device work was scheduled.
     Rejected(String),
+    /// Request admission must be retried after resident capacity is released.
+    Overloaded(String),
     /// Resident execution failed after admission.
     Failed(String),
 }
@@ -102,6 +104,7 @@ pub async fn blocking_response(
             GenerationReply::Rejected(message) => {
                 return openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
             }
+            GenerationReply::Overloaded(message) => return overloaded_response(message),
             GenerationReply::Failed(message) => {
                 return openai_error(StatusCode::INTERNAL_SERVER_ERROR, message, "server_error");
             }
@@ -232,6 +235,7 @@ pub fn streaming_response(
                     terminal = true;
                     let (message, error_type) = match error {
                         GenerationReply::Rejected(message) => (message, "invalid_request_error"),
+                        GenerationReply::Overloaded(message) => (message, "server_overloaded"),
                         GenerationReply::Failed(message) => (message, "server_error"),
                         _ => unreachable!("delta and terminal replies were handled above"),
                     };
@@ -281,6 +285,14 @@ pub fn openai_error(status: StatusCode, message: String, error_type: &'static st
         })),
     )
         .into_response()
+}
+
+pub(crate) fn overloaded_response(message: String) -> Response {
+    let mut response = openai_error(StatusCode::TOO_MANY_REQUESTS, message, "server_overloaded");
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 fn usage(output: &GeneratedText, cached_prompt_tokens: usize) -> Usage {
@@ -554,6 +566,17 @@ mod tests {
             assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
             let error: Value = serde_json::from_str(&body(response).await).unwrap();
             assert_eq!(error["error"]["type"], "server_error");
+
+            let (sender, receiver) = channel(8);
+            sender
+                .try_send(GenerationReply::Overloaded("KV pages are busy".into()))
+                .unwrap();
+            let response =
+                blocking_response(receiver, "id".into(), 1, TEST_MODEL, false, false).await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            let error: Value = serde_json::from_str(&body(response).await).unwrap();
+            assert_eq!(error["error"]["type"], "server_overloaded");
 
             let (sender, receiver) = channel::<GenerationReply>(8);
             drop(sender);

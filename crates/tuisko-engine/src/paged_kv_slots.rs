@@ -392,6 +392,7 @@ fn require_active(state: PagedKvSlotState, slot: usize) -> EngineResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{PagedKvSlotPool, PagedKvSlotState, UNUSED_PAGE};
+    use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 
     #[test]
     fn one_slot_owns_the_exact_220k_shared_pool() {
@@ -557,5 +558,32 @@ mod tests {
         assert_eq!(pool.route(7, 262_143).unwrap().physical_page(), 4_095);
         assert_eq!(pool.route(7, 262_143).unwrap().page_offset(), 63);
         assert_eq!(pool.host_allocation_bytes(), 8 * 4_096 * 4 + 4_096);
+    }
+
+    #[test]
+    fn retained_page_reclamation_closes_the_observed_admission_shortfall() {
+        let mut pool = PagedKvSlotPool::new(3_438).unwrap();
+        pool.activate(3).unwrap();
+        pool.reserve_tokens(3, 1_236 * ATTENTION_PAGE_SIZE).unwrap();
+        pool.retain(3).unwrap();
+        pool.activate(0).unwrap();
+        pool.reserve_tokens(0, 46 * ATTENTION_PAGE_SIZE).unwrap();
+        pool.retain(0).unwrap();
+        pool.activate(1).unwrap();
+        pool.reserve_tokens(1, 1_678 * ATTENTION_PAGE_SIZE).unwrap();
+        assert_eq!(pool.free_pages(), 478);
+
+        pool.activate(3).unwrap();
+        let error = pool
+            .reserve_tokens(3, 1_760 * ATTENTION_PAGE_SIZE)
+            .unwrap_err();
+        assert!(error.to_string().contains("requires 524 additional pages"));
+        assert_eq!(pool.page_count(3).unwrap(), 1_236);
+        pool.retain(3).unwrap();
+
+        assert_eq!(pool.recycle(0).unwrap(), 46);
+        pool.activate(3).unwrap();
+        pool.reserve_tokens(3, 1_760 * ATTENTION_PAGE_SIZE).unwrap();
+        assert_eq!(pool.free_pages(), 0);
     }
 }
