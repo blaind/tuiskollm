@@ -7,6 +7,9 @@ use crate::device_benchmark::{
     require_current_process_exclusive, warmup_launches,
 };
 use crate::fp8_projection_oracle::f32_to_bf16;
+use crate::harness::layout_audit::{
+    ArenaPartitionAudit, RegionSpan, require_spans_exactly_tile_arena, span,
+};
 use std::sync::Arc;
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
@@ -60,8 +63,9 @@ struct RouteGraphs {
 struct Session {
     routes: Vec<RouteGraphs>,
     _op: GdnRecurrenceOp,
-    arena: DeviceArena,
+    _arena: DeviceArena,
     regions: Regions,
+    partition: ArenaPartitionAudit,
     _state_seed: PinnedHostBuffer<f32>,
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
@@ -77,6 +81,13 @@ impl Session {
         }
         let stream = context.new_stream().map_err(GpuError::from)?;
         let (layout, regions) = layout()?;
+        let mut spans = regions.spans();
+        let partition =
+            require_spans_exactly_tile_arena(&mut spans, layout.byte_len()).map_err(|error| {
+                DeviceBenchmarkError::Precondition(format!(
+                    "GDN recurrence arena partition is incomplete: {error}"
+                ))
+            })?;
         let arena = DeviceArena::zeroed(&stream, &layout)?;
         let state = load_fixture(&arena, &stream, regions)?;
         let state_seed = PinnedHostBuffer::from_slice(&context, &state).map_err(GpuError::from)?;
@@ -91,8 +102,9 @@ impl Session {
         Ok(Self {
             routes,
             _op: op,
-            arena,
+            _arena: arena,
             regions,
+            partition,
             _state_seed: state_seed,
             stream,
             _context: context,
@@ -150,25 +162,27 @@ impl Session {
     }
 
     fn workspace_bytes(&self) -> usize {
-        self.regions.payload_bytes() - self.weight_bytes() - self.state_bytes()
+        self.partition.payload_bytes - self.weight_bytes() - self.state_bytes()
     }
 
     fn padding_bytes(&self) -> usize {
-        self.arena.byte_len() - self.regions.payload_bytes()
+        self.partition.padding_bytes
     }
 }
 
 impl Regions {
-    fn payload_bytes(self) -> usize {
-        self.qkv.byte_len()
-            + self.projected.byte_len()
-            + self.log_decay.byte_len()
-            + self.beta.byte_len()
-            + self.norm_weight.byte_len()
-            + self.state_rows.byte_len()
-            + self.state.byte_len()
-            + self.recurrent_plane.byte_len()
-            + self.output.byte_len()
+    fn spans(self) -> [RegionSpan; 9] {
+        [
+            span("qkv", self.qkv),
+            span("projected", self.projected),
+            span("log_decay", self.log_decay),
+            span("beta", self.beta),
+            span("norm_weight", self.norm_weight),
+            span("state_rows", self.state_rows),
+            span("state", self.state),
+            span("recurrent_plane", self.recurrent_plane),
+            span("output", self.output),
+        ]
     }
 }
 
@@ -381,6 +395,7 @@ mod tests {
         EXACT_ROUTES, HEAD_DIM, MAX_BATCH, MAX_ROWS, STATE_PER_ROW, VALUE_HEADS, VALUE_WIDTH,
         layout, logical_bytes,
     };
+    use crate::harness::layout_audit::require_spans_exactly_tile_arena;
     use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
@@ -403,11 +418,13 @@ mod tests {
     fn benchmark_route_inventory_and_owner_accounting_are_exact() {
         assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
         let (layout, regions) = layout().unwrap();
+        let mut spans = regions.spans();
+        let partition = require_spans_exactly_tile_arena(&mut spans, layout.byte_len()).unwrap();
 
         assert_eq!(regions.norm_weight.byte_len(), 256);
         assert_eq!(regions.state.byte_len(), 25_165_824);
-        assert_eq!(regions.payload_bytes(), 117_834_016);
+        assert_eq!(partition.payload_bytes, 117_834_016);
         assert_eq!(layout.byte_len(), 117_834_240);
-        assert_eq!(layout.byte_len() - regions.payload_bytes(), 224);
+        assert_eq!(partition.padding_bytes, 224);
     }
 }

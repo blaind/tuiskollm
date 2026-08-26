@@ -55,9 +55,8 @@ pub enum GenerationAdmission {
 
 /// Tokenizer, stop-token, and generation metadata of one admitted target.
 ///
-/// Sealed per Part I §3 Bound C: `tuisko-frontend` owns tokenizer admission, so only
-/// targets whose pinned tokenizer, template, and generation config this crate already
-/// admits implement it. Widening it would make an unfinished target constructible.
+/// Sealed because `tuisko-frontend` owns tokenizer admission. Only targets whose pinned
+/// tokenizer, template, and generation config are fully admitted can implement it.
 pub trait TokenizedSchema: Arch + private::Sealed {
     /// Entries in `tokenizer.json`, distinct from `Arch::VOCAB`'s padded LM-head width.
     const TOKENIZER_ENTRIES: usize;
@@ -1343,15 +1342,14 @@ fn parse_greedy_generation_defaults(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_TOKEN_IDS, CachedPrefix, ChatMessage, ChatTemplateOptions, FrontendError,
-        FrontendErrorCode, FrontendResult, GenerationDefaults, PROMPT_BLOCK_START,
-        PromptPrefixEntry, SPECIAL_TOKEN_LITERALS, TextFrontend, TextFrontendOptions,
-        TokenizedSchema, best_cached_prefix, byte_level_table, common_prefix_bytes, finish_pending,
+        CachedPrefix, ChatMessage, ChatTemplateOptions, FrontendErrorCode, FrontendResult,
+        PROMPT_BLOCK_START, PromptPrefixEntry, TextFrontend, TextFrontendOptions, TokenizedSchema,
+        best_cached_prefix, byte_level_table, common_prefix_bytes, finish_pending,
         is_valid_utf8_prefix, parse_generation_defaults, parse_stop_ids, push_stream_byte,
-        utf8_sequence_length, validate_added_token_alphabet, validate_tokenizer,
+        utf8_sequence_length, validate_added_token_alphabet,
     };
-    use serde_json::{Value, json};
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use serde_json::json;
+    use std::collections::{HashSet, VecDeque};
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::{AddedToken, Tokenizer};
     use tuisko_model::{CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
@@ -1806,382 +1804,9 @@ mod tests {
         assert!(cached.is_none());
         assert_eq!(reason, "block-start-not-token-end");
     }
-    /// Per-model contract each legacy `TextFrontend::open*` passed to `open_root` at `67c079ad`,
-    /// frozen here so the unified `open::<A>` is checked against the code it replaced.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum LegacyContract {
-        Qwen38,
-        Qwen35,
-        Qwen36,
-    }
-
-    impl LegacyContract {
-        const fn tokenizer_entries(self) -> usize {
-            match self {
-                Self::Qwen38 => 248_077,
-                Self::Qwen35 => 248_070,
-                Self::Qwen36 => 248_070,
-            }
-        }
-
-        const fn eos_ids(self) -> &'static [u32] {
-            match self {
-                Self::Qwen38 => &[248_046, 248_044],
-                Self::Qwen35 => &[248_044],
-                Self::Qwen36 => &[248_046, 248_044],
-            }
-        }
-
-        const fn special_tokens(self) -> &'static [&'static str] {
-            match self {
-                Self::Qwen38 | Self::Qwen35 | Self::Qwen36 => {
-                    &["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
-                }
-            }
-        }
-    }
-
-    fn legacy_validate_tokenizer(
-        tokenizer: &Tokenizer,
-        contract: LegacyContract,
-        byte_table: &HashMap<char, u8>,
-    ) -> FrontendResult<()> {
-        let entries = tokenizer.get_vocab_size(true);
-        let expected_entries = contract.tokenizer_entries();
-        if entries != expected_entries {
-            return Err(FrontendError::Contract(format!(
-                "tokenizer has {entries} entries, expected {expected_entries}"
-            )));
-        }
-
-        let [im_start, im_end, end_of_text] = SPECIAL_TOKEN_LITERALS;
-        for (token, expected) in [
-            (im_start, 248_045),
-            (im_end, 248_046),
-            (end_of_text, 248_044),
-        ] {
-            let actual = tokenizer.token_to_id(token);
-            if actual != Some(expected) {
-                return Err(FrontendError::Contract(format!(
-                    "tokenizer maps `{token}` to {actual:?}, expected {expected}"
-                )));
-            }
-        }
-
-        validate_added_token_alphabet(tokenizer, byte_table)
-    }
-
-    fn legacy_parse_stop_ids(
-        generation: &Value,
-        contract: LegacyContract,
-    ) -> FrontendResult<Vec<u32>> {
-        let value = generation.get("eos_token_id").ok_or_else(|| {
-            FrontendError::Contract("generation_config.json is missing `eos_token_id`".into())
-        })?;
-        let values = match value {
-            Value::Array(values) => values.clone(),
-            value => vec![value.clone()],
-        };
-        let stop_ids = values
-            .iter()
-            .map(|value| value.as_u64().and_then(|id| u32::try_from(id).ok()))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                FrontendError::Contract("generation_config.json contains a non-u32 stop ID".into())
-            })?;
-        let expected = contract.eos_ids();
-        if stop_ids != expected {
-            return Err(FrontendError::Contract(format!(
-                "generation stop IDs {stop_ids:?} do not match {expected:?}"
-            )));
-        }
-
-        Ok(stop_ids)
-    }
-
-    fn legacy_parse_generation_defaults(
-        generation: &Value,
-        contract: LegacyContract,
-    ) -> FrontendResult<GenerationDefaults> {
-        match contract {
-            LegacyContract::Qwen38 | LegacyContract::Qwen36 => {
-                legacy_sampled_generation_defaults(generation)
-            }
-            LegacyContract::Qwen35 => legacy_qwen35_generation_defaults(generation),
-        }
-    }
-
-    fn legacy_sampled_generation_defaults(
-        generation: &Value,
-    ) -> FrontendResult<GenerationDefaults> {
-        if generation.get("do_sample").and_then(Value::as_bool) != Some(true) {
-            return Err(FrontendError::Contract(
-                "generation_config.json `do_sample` must be true".into(),
-            ));
-        }
-        let temperature = generation
-            .get("temperature")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| {
-                FrontendError::Contract(
-                    "generation_config.json `temperature` must be a number".into(),
-                )
-            })? as f32;
-        let top_p = generation
-            .get("top_p")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| {
-                FrontendError::Contract("generation_config.json `top_p` must be a number".into())
-            })? as f32;
-        let top_k = generation
-            .get("top_k")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| {
-                FrontendError::Contract("generation_config.json `top_k` must be a usize".into())
-            })?;
-        let defaults = GenerationDefaults {
-            temperature,
-            top_p,
-            top_k,
-        };
-        let expected = GenerationDefaults {
-            temperature: 1.0,
-            top_p: 0.95,
-            top_k: 20,
-        };
-        if defaults != expected {
-            return Err(FrontendError::Contract(format!(
-                "generation defaults {defaults:?} do not match {expected:?}"
-            )));
-        }
-
-        Ok(defaults)
-    }
-
-    fn legacy_qwen35_generation_defaults(generation: &Value) -> FrontendResult<GenerationDefaults> {
-        if generation
-            .get("do_sample")
-            .is_some_and(|value| value.as_bool() != Some(false))
-        {
-            return Err(FrontendError::Contract(
-                "generation_config.json `do_sample` must be false or absent".into(),
-            ));
-        }
-        for field in ["temperature", "top_p", "top_k"] {
-            if generation.get(field).is_some() {
-                return Err(FrontendError::Contract(format!(
-                    "generation_config.json `{field}` must be absent when sampling is disabled"
-                )));
-            }
-        }
-
-        Ok(GenerationDefaults {
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: 1,
-        })
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct SchemaContract {
-        tokenizer_entries: usize,
-        eos_ids: &'static [u32],
-        special_tokens: &'static [&'static str],
-    }
-
-    fn schema_contract<A: TokenizedSchema>() -> SchemaContract {
-        SchemaContract {
-            tokenizer_entries: A::TOKENIZER_ENTRIES,
-            eos_ids: A::EOS_IDS,
-            special_tokens: A::SPECIAL_TOKENS,
-        }
-    }
-
-    /// One legacy constructor the unified `open::<A>` subsumes.
-    #[derive(Clone, Copy)]
-    struct LegacyConstructor {
-        name: &'static str,
-        legacy: LegacyContract,
-        /// Prompt-cache capacity the constructor pinned; `None` when the caller supplies options.
-        pinned_capacity: Option<usize>,
-        schema: fn() -> SchemaContract,
-        stop_ids: fn(&Value) -> FrontendResult<Vec<u32>>,
-        generation_defaults: fn(&Value) -> FrontendResult<GenerationDefaults>,
-        validate: fn(&Tokenizer, &HashMap<char, u8>) -> FrontendResult<()>,
-    }
-
-    fn legacy_constructors() -> [LegacyConstructor; 6] {
-        [
-            LegacyConstructor {
-                name: "TextFrontend::open",
-                legacy: LegacyContract::Qwen38,
-                pinned_capacity: Some(4),
-                schema: schema_contract::<Qwen38_27B>,
-                stop_ids: parse_stop_ids::<Qwen38_27B>,
-                generation_defaults: parse_generation_defaults::<Qwen38_27B>,
-                validate: validate_tokenizer::<Qwen38_27B>,
-            },
-            LegacyConstructor {
-                name: "TextFrontend::open_with_options",
-                legacy: LegacyContract::Qwen38,
-                pinned_capacity: None,
-                schema: schema_contract::<Qwen38_27B>,
-                stop_ids: parse_stop_ids::<Qwen38_27B>,
-                generation_defaults: parse_generation_defaults::<Qwen38_27B>,
-                validate: validate_tokenizer::<Qwen38_27B>,
-            },
-            LegacyConstructor {
-                name: "TextFrontend::open_qwen35",
-                legacy: LegacyContract::Qwen35,
-                pinned_capacity: Some(4),
-                schema: schema_contract::<Qwen35_9B>,
-                stop_ids: parse_stop_ids::<Qwen35_9B>,
-                generation_defaults: parse_generation_defaults::<Qwen35_9B>,
-                validate: validate_tokenizer::<Qwen35_9B>,
-            },
-            LegacyConstructor {
-                name: "TextFrontend::open_qwen35_with_options",
-                legacy: LegacyContract::Qwen35,
-                pinned_capacity: None,
-                schema: schema_contract::<Qwen35_9B>,
-                stop_ids: parse_stop_ids::<Qwen35_9B>,
-                generation_defaults: parse_generation_defaults::<Qwen35_9B>,
-                validate: validate_tokenizer::<Qwen35_9B>,
-            },
-            LegacyConstructor {
-                name: "TextFrontend::open_qwen36",
-                legacy: LegacyContract::Qwen36,
-                pinned_capacity: Some(4),
-                schema: schema_contract::<Qwen36Moe35B>,
-                stop_ids: parse_stop_ids::<Qwen36Moe35B>,
-                generation_defaults: parse_generation_defaults::<Qwen36Moe35B>,
-                validate: validate_tokenizer::<Qwen36Moe35B>,
-            },
-            LegacyConstructor {
-                name: "TextFrontend::open_qwen36_with_options",
-                legacy: LegacyContract::Qwen36,
-                pinned_capacity: None,
-                schema: schema_contract::<Qwen36Moe35B>,
-                stop_ids: parse_stop_ids::<Qwen36Moe35B>,
-                generation_defaults: parse_generation_defaults::<Qwen36Moe35B>,
-                validate: validate_tokenizer::<Qwen36Moe35B>,
-            },
-        ]
-    }
-
-    fn generation_corpus() -> Vec<Value> {
-        vec![
-            json!({}),
-            json!({"do_sample": true, "eos_token_id": [248046, 248044], "temperature": 1.0, "top_p": 0.95, "top_k": 20}),
-            json!({"eos_token_id": 248044}),
-            json!({"eos_token_id": [248046, 248044]}),
-            json!({"eos_token_id": [248044, 248046]}),
-            json!({"eos_token_id": [248046]}),
-            json!({"eos_token_id": [248046, 248043]}),
-            json!({"eos_token_id": [248046, -1]}),
-            json!({"eos_token_id": -1}),
-            json!({"eos_token_id": "248044"}),
-            json!({"do_sample": false, "temperature": 1.0, "top_p": 0.95, "top_k": 20}),
-            json!({"do_sample": true, "temperature": 0.8, "top_p": 0.95, "top_k": 20}),
-            json!({"do_sample": true, "temperature": 1.0, "top_p": 0.9, "top_k": 20}),
-            json!({"do_sample": true, "temperature": 1.0, "top_p": 0.95, "top_k": 40}),
-            json!({"do_sample": true, "top_p": 0.95, "top_k": 20}),
-            json!({"do_sample": true, "temperature": 1.0, "top_k": 20}),
-            json!({"do_sample": true, "temperature": 1.0, "top_p": 0.95}),
-            json!({"do_sample": true, "temperature": 1.0, "top_p": 0.95, "top_k": -1}),
-            json!({"do_sample": false}),
-            json!({"temperature": 1.0}),
-            json!({"top_p": 0.95}),
-            json!({"top_k": 20}),
-        ]
-    }
-
-    /// Builds a word-level tokenizer of `entries` IDs, placing the pinned control literals at
-    /// `shift`-displaced IDs so both matching and mismatching admissions are exercised.
-    fn contract_tokenizer(entries: usize, shift: u32) -> Tokenizer {
-        let vocab = (0..entries as u32)
-            .map(|id| {
-                let literal = CONTROL_TOKEN_IDS
-                    .iter()
-                    .find_map(|&(literal, pinned)| (pinned + shift == id).then_some(literal));
-                (literal.map_or_else(|| id.to_string(), str::to_owned), id)
-            })
-            .collect();
-        let model = WordLevel::builder()
-            .vocab(vocab)
-            .unk_token("0".into())
-            .build()
-            .unwrap();
-
-        Tokenizer::new(model)
-    }
 
     #[test]
-    fn unified_open_matches_every_legacy_constructor() {
-        let byte_table = byte_level_table();
-        let mut offending = contract_tokenizer(248_069, 0);
-        offending
-            .add_tokens([AddedToken::from("北", false)])
-            .unwrap();
-        let tokenizers = [
-            contract_tokenizer(248_077, 0),
-            contract_tokenizer(248_070, 0),
-            contract_tokenizer(248_070, 1),
-            contract_tokenizer(64, 0),
-            offending,
-        ];
-        let corpus = generation_corpus();
-
-        for constructor in legacy_constructors() {
-            let name = constructor.name;
-            assert_eq!(
-                (constructor.schema)(),
-                SchemaContract {
-                    tokenizer_entries: constructor.legacy.tokenizer_entries(),
-                    eos_ids: constructor.legacy.eos_ids(),
-                    special_tokens: constructor.legacy.special_tokens(),
-                },
-                "{name}"
-            );
-            let expected_capacity = if name.ends_with("_with_options") {
-                None
-            } else {
-                Some(TextFrontendOptions::default().prompt_cache_capacity)
-            };
-            assert_eq!(constructor.pinned_capacity, expected_capacity, "{name}");
-
-            for generation in &corpus {
-                assert_eq!(
-                    (constructor.stop_ids)(generation).map_err(|error| error.to_string()),
-                    legacy_parse_stop_ids(generation, constructor.legacy)
-                        .map_err(|error| error.to_string()),
-                    "{name} {generation}"
-                );
-                assert_eq!(
-                    (constructor.generation_defaults)(generation)
-                        .map_err(|error| error.to_string()),
-                    legacy_parse_generation_defaults(generation, constructor.legacy)
-                        .map_err(|error| error.to_string()),
-                    "{name} {generation}"
-                );
-            }
-
-            for tokenizer in &tokenizers {
-                assert_eq!(
-                    (constructor.validate)(tokenizer, &byte_table)
-                        .map_err(|error| error.to_string()),
-                    legacy_validate_tokenizer(tokenizer, constructor.legacy, &byte_table)
-                        .map_err(|error| error.to_string()),
-                    "{name} {} entries",
-                    tokenizer.get_vocab_size(true)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn legacy_constructor_signatures_still_resolve() {
+    fn compatibility_constructor_signatures_still_resolve() {
         let _: fn(&CheckpointSnapshot<Qwen38_27B>) -> FrontendResult<TextFrontend> =
             TextFrontend::open;
         let _: fn(
@@ -2201,6 +1826,7 @@ mod tests {
             TextFrontendOptions,
         ) -> FrontendResult<TextFrontend> = TextFrontend::open_qwen36_with_options;
     }
+
     fn pinned_snapshot<A: TokenizedSchema>(variable: &str) -> CheckpointSnapshot<A> {
         let root = std::env::var_os(variable)
             .unwrap_or_else(|| panic!("{variable} is required for the source-backed gate"));
@@ -2208,7 +1834,7 @@ mod tests {
         CheckpointSnapshot::<A>::open(std::path::Path::new(&root)).unwrap()
     }
 
-    /// Admits the pinned frontend files through `open::<A>` and against the legacy alias.
+    /// Admits pinned frontend files through `open::<A>` and its compatibility alias.
     fn assert_pinned_admission<A: TokenizedSchema>(
         snapshot: &CheckpointSnapshot<A>,
         aliased: &TextFrontend,

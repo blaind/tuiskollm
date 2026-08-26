@@ -3,10 +3,8 @@
 //! These helpers carry machinery only: captured-graph replay, address stability, the post-warmup
 //! device-heap gate, sentinel and immutability scans, layout byte accounting, and the paired
 //! benchmark session. Acceptance thresholds, expected values, route sets, sentinel bytes,
-//! warmup and repetition counts, metric route names, suite identity, and refusal texts stay in
-//! each suite and reach the harness as bound parameters — see `docs/architecture-refactoring.md`
-//! Part V §3.B, §3.F and §3.G, and `AGENTS.md`, which treat those as measurement identity. A
-//! suite that deviates from a lifecycle keeps its bespoke form rather than being bent to fit.
+//! repetition counts, metric names, suite identity, and refusal texts stay in each suite because
+//! they are measurement identity. A suite that deviates from a lifecycle keeps its bespoke form.
 
 #[cfg(feature = "device")]
 pub(crate) mod benchmark_session;

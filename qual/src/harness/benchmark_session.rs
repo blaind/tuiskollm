@@ -1,14 +1,8 @@
-//! Generic host-completion benchmark session for the greedy MTP generation suites.
+//! Shared host-completion mechanics for the greedy MTP generation benchmarks.
 //!
-//! Part V §3.B: the session owns the warmup, reference-identity, and paired-sample mechanics
-//! shared by the Qwen3.5 and Qwen3.8 greedy MTP request benchmarks. Everything that identifies a
-//! measurement — metric route names, report suite/classification/timing scope, refusal texts, the
-//! generated output width, and every count carried in `DeviceBenchmarkOptions` — is bound per
-//! suite through `MtpGreedyBenchmarkSpec` and never normalized here.
-//!
-//! The generator bound is sealed (Part I §3 Bound C): only the two production MTP text
-//! generators implement it, and the trait drives their sessions internally so no borrowed
-//! session type crosses the bound.
+//! `MtpGreedyBenchmarkSpec` keeps measurement identity and refusal contracts per suite. The
+//! sealed generator bound admits only the two production MTP text generators and keeps their
+//! borrowed session types internal.
 
 use crate::device_benchmark::{
     BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError, DeviceBenchmarkOptions,
