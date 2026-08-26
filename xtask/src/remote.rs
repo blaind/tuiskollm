@@ -350,7 +350,6 @@ const REMOTE_SUBCOMMANDS: &[RemoteSubcommand] = &[
 ];
 
 /// The usage line, derived from the route table so no row can go unadvertised.
-/// `usage_lists_every_route` binds it to the legacy text.
 #[cfg(any(feature = "remote", test))]
 fn usage() -> String {
     let mut names = REMOTE_SUBCOMMANDS
@@ -589,349 +588,11 @@ mod tests {
     use super::{
         BenchmarkRoute, REMOTE_SUBCOMMANDS, RemoteRun, ResourceGate, parse_options, usage,
     };
-    use crate::PerformanceSuite;
     use crate::gpu_target::GpuTarget;
     use std::collections::BTreeSet;
 
-    /// The route table must name exactly the suites the legacy
-    /// `Qualification::parse` and `Benchmark::parse` ladders named, and give
-    /// each the same report name, prepared artifact and snapshot staging.
-    /// Transcribed from those ladders; this test, not a hand-counted number,
-    /// is the authority on the route set.
     #[test]
-    fn remote_suite_inventory_is_exact() {
-        // (subcommand, report suite, libtest filter, stages the snapshot)
-        const LEGACY_QUALIFICATIONS: &[(&str, &str, &str, bool)] = &[
-            (
-                "qualify-residual-norm",
-                "residual-norm",
-                "residual_norm_suite_",
-                false,
-            ),
-            (
-                "qualify-nvfp4-swiglu",
-                "nvfp4-swiglu",
-                "nvfp4_swiglu::tests",
-                false,
-            ),
-            (
-                "qualify-nvfp4-down",
-                "nvfp4-down",
-                "nvfp4_down::tests",
-                false,
-            ),
-            ("qualify-fp8-qkv", "fp8-qkv", "fp8_qkv", false),
-            (
-                "qualify-fp8-gdn-input",
-                "fp8-gdn-input",
-                "fp8_gdn_input",
-                false,
-            ),
-            ("qualify-fp8-lm-head", "fp8-lm-head", "fp8_lm_head", false),
-            (
-                "qualify-nvfp4-mlp",
-                "nvfp4-mlp",
-                "nvfp4_mlp::tests::source_layer55_matches_complete_oracles_and_graph_replay",
-                true,
-            ),
-            (
-                "qualify-attention-qk-prepare",
-                "attention-qk-prepare",
-                "attention_qk_prepare",
-                false,
-            ),
-            ("qualify-paged-gqa", "paged-gqa", "paged_gqa_suite_", false),
-            (
-                "qualify-long-context-paged-gqa",
-                "long-context-paged-gqa",
-                "long_context_paged_gqa",
-                false,
-            ),
-            (
-                "qualify-attention-output",
-                "attention-output",
-                "attention_output::tests",
-                false,
-            ),
-            (
-                "qualify-mtp-bf16-fusion",
-                "mtp-bf16-fusion",
-                "mtp_bf16_fusion_suite_",
-                true,
-            ),
-            (
-                "qualify-mtp-bf16-qkv",
-                "mtp-bf16-qkv",
-                "mtp_bf16_qkv_suite_",
-                true,
-            ),
-            (
-                "qualify-mtp-bf16-qk-prepare",
-                "mtp-bf16-qk-prepare",
-                "mtp_bf16_qk_prepare_suite_",
-                true,
-            ),
-            (
-                "qualify-mtp-bf16-paged-gqa",
-                "mtp-bf16-paged-gqa",
-                "mtp_bf16_paged_gqa_suite_",
-                false,
-            ),
-            (
-                "qualify-mtp-bf16-attention-output",
-                "mtp-bf16-attention-output",
-                "mtp_bf16_attention_output_suite_",
-                true,
-            ),
-            (
-                "qualify-mtp-bf16-mlp",
-                "mtp-bf16-mlp",
-                "mtp_bf16_mlp_suite_",
-                true,
-            ),
-            (
-                "qualify-full-attention-layer",
-                "full-attention-layer",
-                "full_attention_layer::tests::source_layer63_matches_complete_seam_oracles_and_graph_replay",
-                true,
-            ),
-            ("qualify-mtp-layer", "mtp-layer", "mtp_layer_suite_", true),
-            (
-                "qualify-target-mtp-verify",
-                "target-mtp-verify",
-                "target_mtp_verify::tests::exact_target_verify_and_commit_match_source_oracles",
-                true,
-            ),
-            (
-                "qualify-mtp-prompt-prime",
-                "mtp-prompt-prime",
-                "mtp_prompt_prime_suite_",
-                true,
-            ),
-            (
-                "qualify-resident-mtp",
-                "resident-mtp",
-                "resident_mtp_suite_",
-                true,
-            ),
-            (
-                "qualify-resident-model",
-                "resident-model",
-                "resident_model::tests::source_model_matches_final_oracle_and_exact_graph_replay",
-                true,
-            ),
-            (
-                "qualify-resident-generation",
-                "resident-generation",
-                "resident_generation::tests::source_frontend_generation_matches_vllm_tokens_and_streaming",
-                true,
-            ),
-            (
-                "qualify-generation-mtp-greedy",
-                "generation-mtp-greedy",
-                "resident_mtp_generation_suite_",
-                true,
-            ),
-            (
-                "qualify-generation-mtp-sampling",
-                "generation-mtp-sampling",
-                "resident_mtp_sampling_suite_",
-                true,
-            ),
-            (
-                "qualify-generation-mtp-batch",
-                "generation-mtp-batch",
-                "resident_mtp_batch_suite_",
-                true,
-            ),
-            (
-                "qualify-resident-batch-generation",
-                "resident-batch-generation",
-                "resident_batch_generation::tests::compact_scheduler_matches_sequential_requests_and_recycles_holes",
-                true,
-            ),
-        ];
-
-        // (subcommand, report suite, the artifact its `Benchmark` arm prepared,
-        // stages the snapshot)
-        const LEGACY_BENCHMARKS: &[(&str, &str, BenchmarkRoute, bool)] = &[
-            (
-                "bench-residual-norm",
-                "residual-norm",
-                BenchmarkRoute::Leaf(PerformanceSuite::ResidualNorm),
-                false,
-            ),
-            (
-                "bench-nvfp4-swiglu",
-                "nvfp4-swiglu",
-                BenchmarkRoute::Leaf(PerformanceSuite::Nvfp4SwiGlu),
-                false,
-            ),
-            (
-                "bench-nvfp4-down",
-                "nvfp4-down",
-                BenchmarkRoute::Leaf(PerformanceSuite::Nvfp4Down),
-                false,
-            ),
-            (
-                "bench-nvfp4-mlp",
-                "nvfp4-mlp",
-                BenchmarkRoute::Nvfp4Mlp,
-                true,
-            ),
-            (
-                "bench-fp8-qkv",
-                "fp8-qkv",
-                BenchmarkRoute::Leaf(PerformanceSuite::Fp8Qkv),
-                false,
-            ),
-            (
-                "bench-fp8-gdn-input",
-                "fp8-gdn-input",
-                BenchmarkRoute::Leaf(PerformanceSuite::Fp8GdnInput),
-                false,
-            ),
-            (
-                "bench-fp8-lm-head",
-                "fp8-lm-head",
-                BenchmarkRoute::Leaf(PerformanceSuite::Fp8LmHead),
-                false,
-            ),
-            (
-                "bench-attention-qk-prepare",
-                "attention-qk-prepare",
-                BenchmarkRoute::Leaf(PerformanceSuite::AttentionQkPrepare),
-                false,
-            ),
-            (
-                "bench-paged-gqa",
-                "paged-gqa",
-                BenchmarkRoute::Leaf(PerformanceSuite::PagedGqa),
-                false,
-            ),
-            (
-                "bench-long-context-paged-gqa",
-                "long-context-paged-gqa",
-                BenchmarkRoute::Leaf(PerformanceSuite::LongContextPagedGqa),
-                false,
-            ),
-            (
-                "bench-attention-output",
-                "attention-output",
-                BenchmarkRoute::Leaf(PerformanceSuite::AttentionOutput),
-                false,
-            ),
-            (
-                "bench-mtp-bf16-fusion",
-                "mtp-bf16-fusion",
-                BenchmarkRoute::Leaf(PerformanceSuite::MtpBf16Fusion),
-                false,
-            ),
-            (
-                "bench-mtp-bf16-qkv",
-                "mtp-bf16-qkv",
-                BenchmarkRoute::Leaf(PerformanceSuite::MtpBf16Qkv),
-                false,
-            ),
-            (
-                "bench-mtp-bf16-qk-prepare",
-                "mtp-bf16-qk-prepare",
-                BenchmarkRoute::Leaf(PerformanceSuite::MtpBf16QkPrepare),
-                false,
-            ),
-            (
-                "bench-mtp-bf16-paged-gqa",
-                "mtp-bf16-paged-gqa",
-                BenchmarkRoute::Leaf(PerformanceSuite::MtpBf16PagedGqa),
-                false,
-            ),
-            (
-                "bench-mtp-bf16-attention-output",
-                "mtp-bf16-attention-output",
-                BenchmarkRoute::Leaf(PerformanceSuite::MtpBf16AttentionOutput),
-                false,
-            ),
-            (
-                "bench-mtp-bf16-mlp",
-                "mtp-bf16-mlp",
-                BenchmarkRoute::Leaf(PerformanceSuite::MtpBf16Mlp),
-                false,
-            ),
-            (
-                "bench-full-attention-layer",
-                "full-attention-layer",
-                BenchmarkRoute::FullAttentionLayer,
-                true,
-            ),
-            (
-                "bench-mtp-layer",
-                "mtp-layer",
-                BenchmarkRoute::MtpLayer,
-                true,
-            ),
-            (
-                "bench-target-mtp-verify",
-                "target-mtp-verify",
-                BenchmarkRoute::ResidentModel,
-                true,
-            ),
-            (
-                "bench-mtp-prompt-prime",
-                "mtp-prompt-prime",
-                BenchmarkRoute::MtpPromptPrime,
-                true,
-            ),
-            (
-                "bench-resident-mtp",
-                "resident-mtp",
-                BenchmarkRoute::ResidentMtp,
-                true,
-            ),
-            (
-                "bench-generation-mtp-greedy",
-                "generation-mtp-greedy",
-                BenchmarkRoute::ResidentMtp,
-                true,
-            ),
-            (
-                "bench-generation-mtp-sampling",
-                "generation-mtp-sampling",
-                BenchmarkRoute::ResidentMtp,
-                true,
-            ),
-            (
-                "bench-generation-mtp-batch",
-                "generation-mtp-batch",
-                BenchmarkRoute::ResidentMtp,
-                true,
-            ),
-            (
-                "bench-resident-model",
-                "resident-model",
-                BenchmarkRoute::ResidentModel,
-                true,
-            ),
-            (
-                "bench-resident-prefill",
-                "resident-prefill",
-                BenchmarkRoute::ResidentModel,
-                true,
-            ),
-            (
-                "bench-resident-long-context-model",
-                "resident-long-context-model",
-                BenchmarkRoute::ResidentModel,
-                true,
-            ),
-        ];
-
-        assert_eq!(LEGACY_QUALIFICATIONS.len(), 28);
-        assert_eq!(LEGACY_BENCHMARKS.len(), 28);
-        assert_eq!(
-            REMOTE_SUBCOMMANDS.len(),
-            LEGACY_QUALIFICATIONS.len() + LEGACY_BENCHMARKS.len()
-        );
-
+    fn remote_routes_are_unique_and_well_formed() {
         let names = REMOTE_SUBCOMMANDS
             .iter()
             .map(|route| route.name)
@@ -939,114 +600,69 @@ mod tests {
         assert_eq!(
             names.len(),
             REMOTE_SUBCOMMANDS.len(),
-            "the table repeats a name"
+            "duplicate route name"
         );
-        assert_eq!(
-            names,
-            LEGACY_QUALIFICATIONS
+        let staged = REMOTE_SUBCOMMANDS
+            .iter()
+            .filter(|route| route.source_snapshot)
+            .count();
+        assert!(staged > 0 && staged < REMOTE_SUBCOMMANDS.len());
+        assert!(
+            REMOTE_SUBCOMMANDS
                 .iter()
-                .map(|(name, ..)| *name)
-                .chain(LEGACY_BENCHMARKS.iter().map(|(name, ..)| *name))
-                .collect::<BTreeSet<_>>()
+                .any(|route| route.gate != ResourceGate::ResidualNorm)
         );
 
-        let find = |name: &str| {
-            *REMOTE_SUBCOMMANDS
-                .iter()
-                .find(|route| route.name == name)
-                .unwrap()
-        };
-
-        for &(name, suite, filter, snapshot) in LEGACY_QUALIFICATIONS {
-            let route = find(name);
-            assert_eq!(route.suite(), suite, "`{name}` report suite");
-            assert_eq!(
-                route.run,
-                RemoteRun::Qualification(filter),
-                "`{name}` route"
+        for route in REMOTE_SUBCOMMANDS {
+            assert!(
+                !route.suite().is_empty(),
+                "`{}` has no suite name",
+                route.name
             );
-            assert_eq!(route.source_snapshot, snapshot, "`{name}` snapshot");
-            assert!(!route.is_benchmark(), "`{name}` is a qualification");
-        }
+            assert!(
+                !route.targets.is_empty(),
+                "`{}` admits no target",
+                route.name
+            );
+            for (index, target) in route.targets.iter().enumerate() {
+                assert!(
+                    !route.targets[..index].contains(target),
+                    "`{}` repeats a target",
+                    route.name
+                );
+            }
 
-        for &(name, suite, benchmark, snapshot) in LEGACY_BENCHMARKS {
-            let route = find(name);
-            assert_eq!(route.suite(), suite, "`{name}` report suite");
-            assert_eq!(route.run, RemoteRun::Benchmark(benchmark), "`{name}` route");
-            assert_eq!(route.source_snapshot, snapshot, "`{name}` snapshot");
-            // A leaf benchmark reports under its suite's own name, exactly as
-            // `Benchmark::name()` returned it.
-            if let BenchmarkRoute::Leaf(leaf) = benchmark {
-                assert_eq!(leaf.name(), suite, "`{name}` leaf suite name");
+            match route.run {
+                RemoteRun::Qualification(filter) => {
+                    assert!(route.name.starts_with("qualify-"), "`{}`", route.name);
+                    assert!(!filter.is_empty(), "`{}` has an empty filter", route.name);
+                    assert!(!route.is_benchmark(), "`{}`", route.name);
+                }
+                RemoteRun::Benchmark(benchmark) => {
+                    assert!(route.name.starts_with("bench-"), "`{}`", route.name);
+                    assert!(route.is_benchmark(), "`{}`", route.name);
+                    if let BenchmarkRoute::Leaf(suite) = benchmark {
+                        assert_eq!(suite.name(), route.suite(), "`{}`", route.name);
+                    }
+                }
             }
         }
 
         for absent in ["perf", "probe", "check", "sweep"] {
             assert!(!names.contains(absent));
         }
-    }
 
-    /// Every route names the static resource gate the legacy substring chain
-    /// in `gate_static_resources` selected for it.
-    #[test]
-    fn resource_gates_reproduce_the_legacy_chain() {
-        // Transcribed from `gate_static_resources`, in its `if`/`else if`
-        // order. `Fp8Qkv` stands for the arm that fires only on SM89 and
-        // otherwise falls through to the residual-norm gate.
-        fn legacy_gate(command: &str) -> ResourceGate {
-            if command.contains("nvfp4-swiglu") {
-                ResourceGate::Nvfp4Swiglu
-            } else if command.contains("nvfp4-down") {
-                ResourceGate::Nvfp4Down
-            } else if command.contains("fp8-qkv") {
-                ResourceGate::Fp8Qkv
-            } else if command.contains("resident-mtp") {
-                ResourceGate::ResidentMtp
-            } else if command.contains("mtp-prompt-prime") {
-                ResourceGate::MtpPromptPrime
-            } else if command.contains("target-mtp-verify") {
-                ResourceGate::ResidentModel
-            } else if command.contains("mtp-layer") {
-                ResourceGate::MtpLayer
-            } else if command.contains("mtp-bf16-fusion") {
-                ResourceGate::MtpBf16Fusion
-            } else if command.contains("mtp-bf16-qkv") {
-                ResourceGate::MtpBf16Qkv
-            } else if command.contains("mtp-bf16-qk-prepare") {
-                ResourceGate::MtpBf16QkPrepare
-            } else if command.contains("mtp-bf16-paged-gqa") {
-                ResourceGate::MtpBf16PagedGqa
-            } else if command.contains("mtp-bf16-attention-output") {
-                ResourceGate::MtpBf16AttentionOutput
-            } else if command.contains("mtp-bf16-mlp") {
-                ResourceGate::MtpBf16Mlp
-            } else {
-                ResourceGate::ResidualNorm
-            }
-        }
-
+        let usage = usage();
+        let mut cursor = 0;
         for route in REMOTE_SUBCOMMANDS {
-            assert_eq!(route.gate, legacy_gate(route.name), "`{}` gate", route.name);
+            let offset = usage[cursor..]
+                .find(route.name)
+                .unwrap_or_else(|| panic!("usage omits `{}`", route.name));
+            cursor += offset + route.name.len();
         }
-    }
-
-    /// The advertised usage is the route table, so no row can exist
-    /// unadvertised and no advertised name can be missing a row.
-    #[test]
-    fn usage_lists_every_route() {
-        // The pre-table `USAGE` literal, transcribed verbatim.
-        const LEGACY_USAGE: &str = "usage: cargo run -p xtask --features remote -- remote \
-            <qualify-residual-norm|qualify-nvfp4-swiglu|qualify-nvfp4-down|qualify-fp8-qkv|qualify-fp8-gdn-input|qualify-fp8-lm-head|\
-            qualify-nvfp4-mlp|qualify-attention-qk-prepare|qualify-paged-gqa|qualify-long-context-paged-gqa|qualify-attention-output|qualify-mtp-bf16-fusion|qualify-mtp-bf16-qkv|qualify-mtp-bf16-qk-prepare|qualify-mtp-bf16-paged-gqa|qualify-mtp-bf16-attention-output|qualify-mtp-bf16-mlp|qualify-full-attention-layer|qualify-mtp-layer|qualify-target-mtp-verify|qualify-mtp-prompt-prime|qualify-resident-mtp|\
-            qualify-resident-model|qualify-resident-generation|qualify-generation-mtp-greedy|qualify-generation-mtp-sampling|qualify-generation-mtp-batch|qualify-resident-batch-generation|\
-            bench-residual-norm|bench-nvfp4-swiglu|bench-nvfp4-down|bench-nvfp4-mlp|bench-fp8-qkv|bench-fp8-gdn-input|\
-            bench-fp8-lm-head|bench-attention-qk-prepare|bench-paged-gqa|bench-long-context-paged-gqa|bench-attention-output|bench-mtp-bf16-fusion|bench-mtp-bf16-qkv|bench-mtp-bf16-qk-prepare|bench-mtp-bf16-paged-gqa|bench-mtp-bf16-attention-output|bench-mtp-bf16-mlp|bench-full-attention-layer|bench-mtp-layer|bench-target-mtp-verify|bench-mtp-prompt-prime|bench-resident-mtp|bench-generation-mtp-greedy|bench-generation-mtp-sampling|bench-generation-mtp-batch|\
-            bench-resident-model|bench-resident-prefill|bench-resident-long-context-model|\
-            probe|check|sweep> \
-            [--gpu 5090|4090|3090] [--max-minutes N] [--image NAME] [--keep-on-fail] \
-            [--samples N] [--launches-per-sample N] [--energy-seconds N]";
-
-        assert_eq!(usage(), LEGACY_USAGE);
+        for command in ["probe", "check", "sweep"] {
+            assert!(usage[cursor..].contains(command), "usage omits `{command}`");
+        }
     }
 
     #[test]

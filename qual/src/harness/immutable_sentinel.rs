@@ -1,7 +1,7 @@
 //! Sentinel patterns and the scans that prove inactive tails and read-only sources unchanged.
 //!
-//! Every scan reports the index of the first violation and formats nothing: the sentinel byte and
-//! the failure message remain per-suite contracts (Part V §3.F).
+//! Every scan reports the index of the first violation and formats nothing; sentinel bytes and
+//! failure messages remain per-suite contracts.
 
 /// One device fill byte and the words that fill produces.
 ///

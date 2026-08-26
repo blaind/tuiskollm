@@ -50,9 +50,8 @@ pub mod sealed {
 
 /// Host plan of one exact paged K/V cache family.
 ///
-/// Sealed and monomorphized (Part I Section 3, Bound C): it publishes only the
-/// page geometry and arena regions the storage manager needs, never launch
-/// topology, graph node order, or accumulation order.
+/// Sealed and monomorphized so only admitted cache families are constructible. It publishes page
+/// geometry and arena regions, never launch topology, graph order, or accumulation order.
 pub trait PagedKvLayout: LayerMemoryLayout + Sized + sealed::Sealed {
     /// Represented cache element admitted by this family's kernels.
     type Value: DeviceCopy;

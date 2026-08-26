@@ -1,7 +1,7 @@
 //! Byte-accounting and arena-bounds audits over `tuisko_engine::LayerMemoryLayout`.
 //!
 //! The trait reports four totals per owner and never constructs a layout or touches the device,
-//! so every audit here is pure host arithmetic (Part I §3, Permitted Trait A).
+//! so every audit here is pure host arithmetic.
 
 use tuisko_engine::LayerMemoryLayout;
 use tuisko_gpu::ArenaRegion;
@@ -79,6 +79,8 @@ pub(crate) struct RegionSpan {
     pub(crate) offset_bytes: usize,
     /// Bytes the region occupies.
     pub(crate) byte_len: usize,
+    /// Alignment used when the region was reserved.
+    pub(crate) alignment: usize,
 }
 
 /// Erases one typed region into an auditable span.
@@ -88,7 +90,18 @@ pub(crate) fn span<T: Copy>(name: &'static str, region: ArenaRegion<T>) -> Regio
         name,
         offset_bytes: region.offset_bytes(),
         byte_len: region.byte_len(),
+        alignment: region.alignment(),
     }
+}
+
+/// Exact payload and alignment-padding totals for one arena partition.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ArenaPartitionAudit {
+    /// Bytes occupied by reported regions.
+    pub(crate) payload_bytes: usize,
+    /// Gaps required to align each reported region.
+    pub(crate) padding_bytes: usize,
 }
 
 /// Requires every span to be `alignment`-aligned, inside `arena_bytes`, and pairwise disjoint.
@@ -132,11 +145,75 @@ pub(crate) fn require_spans_aligned_disjoint_and_bounded(
     Ok(())
 }
 
+/// Requires the reported regions and only their required alignment gaps to tile the arena.
+///
+/// A missing middle region leaves a gap larger than the next region's alignment requires; a
+/// missing final region leaves an unclaimed tail. Both fail independently of suite byte totals.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn require_spans_exactly_tile_arena(
+    spans: &mut [RegionSpan],
+    arena_bytes: usize,
+) -> Result<ArenaPartitionAudit, String> {
+    spans.sort_unstable_by_key(|span| span.offset_bytes);
+    let mut cursor = 0usize;
+    let mut payload_bytes = 0usize;
+    let mut padding_bytes = 0usize;
+
+    for span in spans {
+        if !span.alignment.is_power_of_two() {
+            return Err(format!(
+                "region {} has invalid alignment {}",
+                span.name, span.alignment
+            ));
+        }
+        let mask = span.alignment - 1;
+        let expected_offset = cursor
+            .checked_add(mask)
+            .map(|value| value & !mask)
+            .ok_or_else(|| format!("alignment before region {} overflows", span.name))?;
+        if span.offset_bytes != expected_offset {
+            return Err(format!(
+                "region {} begins at {}, expected {} after aligning the preceding end {}",
+                span.name, span.offset_bytes, expected_offset, cursor
+            ));
+        }
+        let end = span
+            .offset_bytes
+            .checked_add(span.byte_len)
+            .ok_or_else(|| format!("region {} overflows the address space", span.name))?;
+        if end > arena_bytes {
+            return Err(format!(
+                "region {} ends at {end}, past the {arena_bytes}-byte arena",
+                span.name
+            ));
+        }
+        padding_bytes = padding_bytes
+            .checked_add(span.offset_bytes - cursor)
+            .ok_or_else(|| "arena padding total overflows".to_string())?;
+        payload_bytes = payload_bytes
+            .checked_add(span.byte_len)
+            .ok_or_else(|| "arena payload total overflows".to_string())?;
+        cursor = end;
+    }
+
+    if cursor != arena_bytes {
+        return Err(format!(
+            "reported regions end at {cursor}, leaving {} unclaimed arena bytes",
+            arena_bytes - cursor
+        ));
+    }
+
+    Ok(ArenaPartitionAudit {
+        payload_bytes,
+        padding_bytes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         LayoutAudit, RegionSpan, require_arena_covers_attribution,
-        require_spans_aligned_disjoint_and_bounded, span,
+        require_spans_aligned_disjoint_and_bounded, require_spans_exactly_tile_arena, span,
     };
     use tuisko_engine::{
         DenseFp8GdnLayerLayout, DenseFp8MlpLayout, EndpointLayout, FullAttentionLayerLayout,
@@ -377,6 +454,13 @@ mod tests {
             .unwrap();
         assert_eq!(spans[0].name, "input");
         assert_eq!(spans[2].name, "output");
+        assert_eq!(
+            require_spans_exactly_tile_arena(&mut spans, builder.byte_len()).unwrap(),
+            super::ArenaPartitionAudit {
+                payload_bytes: 4_288,
+                padding_bytes: 64,
+            }
+        );
     }
 
     #[test]
@@ -385,6 +469,7 @@ mod tests {
             name,
             offset_bytes,
             byte_len,
+            alignment: ALIGNMENT,
         };
 
         let mut misaligned = [aligned("head", 128, 128)];
@@ -401,5 +486,32 @@ mod tests {
         assert!(
             require_spans_aligned_disjoint_and_bounded(&mut overlapping, ALIGNMENT, 4_096).is_err()
         );
+    }
+
+    #[test]
+    fn exact_partition_rejects_missing_middle_and_final_regions() {
+        let mut builder = ArenaLayout::new();
+        let head = builder.reserve::<u8>(13, 1).unwrap();
+        let middle = builder.reserve::<u32>(4, ALIGNMENT).unwrap();
+        let tail = builder.reserve::<u16>(3, 8).unwrap();
+
+        let mut complete = vec![
+            span("tail", tail),
+            span("head", head),
+            span("middle", middle),
+        ];
+        assert_eq!(
+            require_spans_exactly_tile_arena(&mut complete, builder.byte_len()).unwrap(),
+            super::ArenaPartitionAudit {
+                payload_bytes: 35,
+                padding_bytes: 243,
+            }
+        );
+
+        let mut missing_middle = vec![span("head", head), span("tail", tail)];
+        assert!(require_spans_exactly_tile_arena(&mut missing_middle, builder.byte_len()).is_err());
+
+        let mut missing_tail = vec![span("head", head), span("middle", middle)];
+        assert!(require_spans_exactly_tile_arena(&mut missing_tail, builder.byte_len()).is_err());
     }
 }
