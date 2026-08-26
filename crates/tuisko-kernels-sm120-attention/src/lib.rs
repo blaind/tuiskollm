@@ -28,8 +28,13 @@ pub use paged_gqa::{
     Qwen36Fp8PagedGqaOp, Qwen36PagedGqaOp, paged_gqa_prefill_partitions,
 };
 pub use qk_prepare::{
-    ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, Qwen35AttentionQkPrepareOp,
-    Qwen36AttentionQkPrepareOp, Qwen36Fp8AttentionQkPrepareOp,
+    ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, Bf16Cache, CacheFormat, CacheScales, Fp8Cache,
+    PreparedPrefillRoute, PreparedQwen35PrefillRoute, PreparedQwen35Route,
+    PreparedQwen36Fp8PrefillRoute, PreparedQwen36Fp8Route, PreparedQwen36PrefillRoute,
+    PreparedQwen36Route, PreparedRoute, QkPrepareArgs, QkPrepareEntries, QkPrepareRoute,
+    Qwen35AttentionQkPrepareOp, Qwen35QkPrepareEntries, Qwen36AttentionQkPrepareOp,
+    Qwen36Fp8AttentionQkPrepareOp, Qwen36Fp8QkPrepareEntries, Qwen36QkPrepareEntries,
+    Qwen38QkPrepareEntries, UnadmittedRoute,
 };
 
 /// Semantic inventory of every entry this family emits.
