@@ -1,6 +1,12 @@
 //! Target-neutral MTP host coordination shared by every speculative target.
 
-use crate::{EngineError, EngineResult, SamplingDistribution, speculative_decision};
+use crate::common::banks::row;
+use crate::common::rope::{ROTARY_PAIRS, fill_contiguous_rope};
+use crate::{
+    EngineError, EngineResult, GenerationSession, GenerationStep, MAX_BATCH, SamplingDistribution,
+    speculative_decision,
+};
+use std::ops::Range;
 
 pub(crate) const DRAFT_WINDOW: usize = 3;
 pub(crate) const VERIFY_ROWS: usize = DRAFT_WINDOW + 1;
@@ -114,6 +120,282 @@ pub fn qualification_decide_sampled_tokens(
         residual_units,
         bonus_unit,
     )
+}
+
+/// Fixed rotary scratch for one MTP verification or realignment span.
+///
+/// Both spans are bounded by the exact four-row transaction, so the scratch is
+/// stack-resident and never reallocates inside a speculative round.
+pub(crate) struct MtpRoundRope {
+    cosine: [f32; VERIFY_ROWS * ROTARY_PAIRS],
+    sine: [f32; VERIFY_ROWS * ROTARY_PAIRS],
+    values: usize,
+}
+
+impl MtpRoundRope {
+    pub(crate) fn contiguous(first_position: usize, rows: usize) -> EngineResult<Self> {
+        let mut cosine = [0.0f32; VERIFY_ROWS * ROTARY_PAIRS];
+        let mut sine = [0.0f32; VERIFY_ROWS * ROTARY_PAIRS];
+        let values = fill_contiguous_rope(first_position, rows, &mut cosine, &mut sine)?;
+        Ok(Self {
+            cosine,
+            sine,
+            values,
+        })
+    }
+
+    pub(crate) fn cosine(&self) -> &[f32] {
+        &self.cosine[..self.values]
+    }
+
+    pub(crate) fn sine(&self) -> &[f32] {
+        &self.sine[..self.values]
+    }
+}
+
+fn target_row(logits: &[u16], row: usize, vocab: usize) -> &[u16] {
+    let begin = row * vocab;
+    &logits[begin..begin + vocab]
+}
+
+/// Runs the greedy acceptance law over one single-slot verification transaction.
+///
+/// Every draft is licensed only by an equal target argmax decision, so the loop
+/// stops at the first mismatch or terminal step and adds the bonus row only when
+/// the complete draft window survived.
+pub(crate) fn decide_greedy_round(
+    control: &mut GenerationSession,
+    queued: &mut [Option<GenerationStep>; VERIFY_ROWS],
+    logits: &[u16],
+    vocab: usize,
+    drafts: &[u32],
+) -> EngineResult<(usize, usize)> {
+    let mut committed = 0;
+    let mut accepted = 0;
+    for (draft, &draft_token) in drafts.iter().enumerate() {
+        let step = control.accept_logits(target_row(logits, draft, vocab))?;
+        let matches = step.token_id == draft_token;
+        queued[committed] = Some(step);
+        committed += 1;
+        if matches {
+            accepted += 1;
+        }
+        let terminal = queued[committed - 1]
+            .as_ref()
+            .expect("committed MTP step exists")
+            .finish_reason
+            .is_some();
+        if terminal || !matches {
+            break;
+        }
+    }
+    if accepted == drafts.len() && control.finish_reason().is_none() {
+        queued[committed] = Some(control.accept_logits(target_row(logits, drafts.len(), vocab))?);
+        committed += 1;
+    }
+    Ok((committed, accepted))
+}
+
+/// Runs the unbiased sampled acceptance law over one single-slot transaction.
+///
+/// Target laws are built for every verified row first, then the acceptance,
+/// residual, and bonus units are drawn in that fixed order; the commit rule
+/// itself stays in `decide_sampled_tokens`.
+pub(crate) fn decide_sampled_round(
+    control: &mut GenerationSession,
+    queued: &mut [Option<GenerationStep>; VERIFY_ROWS],
+    logits: &[u16],
+    vocab: usize,
+    stop_ids: &[u32],
+    drafts: &[u32],
+    draft_laws: &[Option<SamplingDistribution>],
+) -> EngineResult<(usize, usize)> {
+    if draft_laws.len() != drafts.len() {
+        return Err(EngineError::generation(
+            "every sampled MTP proposal requires its draft distribution",
+        ));
+    }
+    let mut target_laws: [Option<SamplingDistribution>; VERIFY_ROWS] =
+        std::array::from_fn(|_| None);
+    for row in 0..=drafts.len() {
+        target_laws[row] = Some(control.sampling_distribution(
+            target_row(logits, row, vocab),
+            &drafts[..row.min(drafts.len())],
+        )?);
+    }
+    let mut acceptance_units = [0.0f64; DRAFT_WINDOW];
+    let mut residual_units = [0.0f64; DRAFT_WINDOW];
+    for row in 0..drafts.len() {
+        acceptance_units[row] = control.random_unit();
+        residual_units[row] = control.random_unit();
+    }
+    let bonus_unit = control.random_unit();
+    let target_laws = target_laws[..drafts.len() + 1]
+        .iter()
+        .enumerate()
+        .map(|(row, law)| {
+            law.as_ref().ok_or_else(|| {
+                EngineError::generation(format!("sampled MTP target row {row} has no distribution"))
+            })
+        })
+        .collect::<EngineResult<Vec<_>>>()?;
+    let draft_laws = draft_laws
+        .iter()
+        .enumerate()
+        .map(|(row, law)| {
+            law.as_ref().ok_or_else(|| {
+                EngineError::generation(format!(
+                    "sampled MTP proposal {row} has no draft distribution"
+                ))
+            })
+        })
+        .collect::<EngineResult<Vec<_>>>()?;
+    let round = decide_sampled_tokens(
+        drafts,
+        &target_laws,
+        &draft_laws,
+        stop_ids,
+        &acceptance_units[..drafts.len()],
+        &residual_units[..drafts.len()],
+        bonus_unit,
+    )?;
+    for (index, &token) in round.token_ids().iter().enumerate() {
+        queued[index] = Some(control.accept_token(token)?);
+    }
+    Ok((round.token_ids().len(), round.accepted_drafts()))
+}
+
+/// Ordered outputs one compact-batch slot committed in a single MTP transaction.
+pub(crate) struct MtpEventBuilder {
+    steps: [Option<GenerationStep>; VERIFY_ROWS],
+    len: usize,
+}
+
+impl MtpEventBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            steps: std::array::from_fn(|_| None),
+            len: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, step: GenerationStep) -> EngineResult<()> {
+        let destination = self.steps.get_mut(self.len).ok_or_else(|| {
+            EngineError::generation("one MTP transaction produced more than four outputs")
+        })?;
+        *destination = Some(step);
+        self.len += 1;
+        Ok(())
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn step(&self, index: usize) -> Option<&GenerationStep> {
+        self.steps.get(index).and_then(Option::as_ref)
+    }
+
+    /// Removes the committed prefix, leaving the accumulated length observable.
+    pub(crate) fn take_steps(&mut self) -> [Option<GenerationStep>; VERIFY_ROWS] {
+        std::mem::replace(&mut self.steps, std::array::from_fn(|_| None))
+    }
+
+    pub(crate) fn token_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.steps[..self.len].iter().map(|step| {
+            step.as_ref()
+                .expect("MTP event prefix is initialized")
+                .token_id
+        })
+    }
+}
+
+/// Compact download row `index`, which follows the bank's eight per-slot rows.
+fn download_row(index: usize, vocab: usize) -> Range<usize> {
+    row(MAX_BATCH + index, vocab)
+}
+
+/// Runs the greedy acceptance law over one compact-batch verification lane.
+pub(crate) fn decide_greedy_lane(
+    control: &mut GenerationSession,
+    logits: &[u16],
+    vocab: usize,
+    lane: usize,
+    drafts: &[u32],
+    builder: &mut MtpEventBuilder,
+) -> EngineResult<(usize, usize)> {
+    let tokens = drafts.len() + 1;
+    let mut accepted = 0;
+    for (draft, &draft_token) in drafts.iter().enumerate() {
+        let row = download_row(lane * tokens + draft, vocab);
+        let step = control.accept_logits(&logits[row])?;
+        let matches = step.token_id == draft_token;
+        let terminal = step.finish_reason.is_some();
+        builder.push(step)?;
+        if matches {
+            accepted += 1;
+        }
+        if terminal || !matches {
+            return Ok((builder.len(), accepted));
+        }
+    }
+    if control.finish_reason().is_none() {
+        let row = download_row(lane * tokens + drafts.len(), vocab);
+        builder.push(control.accept_logits(&logits[row])?)?;
+    }
+    Ok((builder.len(), accepted))
+}
+
+/// Runs the unbiased sampled acceptance law over one compact-batch lane.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decide_sampled_lane(
+    control: &mut GenerationSession,
+    logits: &[u16],
+    vocab: usize,
+    stop_ids: &[u32],
+    lane: usize,
+    drafts: &[u32],
+    draft_laws: &[Option<SamplingDistribution>],
+    builder: &mut MtpEventBuilder,
+) -> EngineResult<(usize, usize)> {
+    let tokens = drafts.len() + 1;
+    let mut target_laws = Vec::with_capacity(tokens);
+    for row in 0..tokens {
+        let logit_row = download_row(lane * tokens + row, vocab);
+        target_laws.push(
+            control.sampling_distribution(&logits[logit_row], &drafts[..row.min(drafts.len())])?,
+        );
+    }
+    let mut acceptance_units = [0.0f64; DRAFT_WINDOW];
+    let mut residual_units = [0.0f64; DRAFT_WINDOW];
+    for row in 0..drafts.len() {
+        acceptance_units[row] = control.random_unit();
+        residual_units[row] = control.random_unit();
+    }
+    let bonus_unit = control.random_unit();
+    let target_refs = target_laws.iter().collect::<Vec<_>>();
+    let draft_refs = draft_laws
+        .iter()
+        .enumerate()
+        .map(|(row, law)| {
+            law.as_ref().ok_or_else(|| {
+                EngineError::generation(format!("sampled MTP proposal {row} has no distribution"))
+            })
+        })
+        .collect::<EngineResult<Vec<_>>>()?;
+    let round = decide_sampled_tokens(
+        drafts,
+        &target_refs,
+        &draft_refs,
+        stop_ids,
+        &acceptance_units[..drafts.len()],
+        &residual_units[..drafts.len()],
+        bonus_unit,
+    )?;
+    for &token in round.token_ids() {
+        builder.push(control.accept_token(token)?)?;
+    }
+    Ok((round.token_ids().len(), round.accepted_drafts()))
 }
 
 pub(crate) const fn next_native_prefill_tile(remaining: usize) -> Option<usize> {

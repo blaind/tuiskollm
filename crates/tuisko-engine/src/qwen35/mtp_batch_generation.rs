@@ -1,7 +1,9 @@
 //! Compact Qwen3.5 MTP generation over eight mirrored target/draft slots.
 
 use crate::common::banks::{compact, row};
-use crate::common::mtp::{DRAFT_WINDOW, VERIFY_ROWS, decide_sampled_tokens};
+use crate::common::mtp::{
+    DRAFT_WINDOW, MtpEventBuilder, VERIFY_ROWS, decide_greedy_lane, decide_sampled_lane,
+};
 use crate::common::rope::{fill_contiguous_rope, text_rope};
 use crate::common::slots::{device_zero_context, first_free_slot, require_generation_capacity};
 use crate::qwen35::mtp_generation::prime_qwen35_mtp_prompt;
@@ -69,11 +71,6 @@ struct Qwen35MtpBatchSession {
     stats: ResidentMtpGenerationStats,
 }
 
-struct EventBuilder {
-    steps: [Option<GenerationStep>; VERIFY_ROWS],
-    len: usize,
-}
-
 struct LaneDrafts {
     tokens: [u32; DRAFT_WINDOW],
     laws: [Option<SamplingDistribution>; DRAFT_WINDOW],
@@ -83,32 +80,6 @@ struct LaneDrafts {
 enum RoundRoute {
     Mtp,
     CompactTarget,
-}
-
-impl EventBuilder {
-    fn new() -> Self {
-        Self {
-            steps: std::array::from_fn(|_| None),
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, step: GenerationStep) -> EngineResult<()> {
-        let destination = self.steps.get_mut(self.len).ok_or_else(|| {
-            EngineError::generation("one Qwen3.5 MTP transaction produced more than four outputs")
-        })?;
-        *destination = Some(step);
-        self.len += 1;
-        Ok(())
-    }
-
-    fn token_ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.steps[..self.len].iter().map(|step| {
-            step.as_ref()
-                .expect("Qwen3.5 MTP event prefix is initialized")
-                .token_id
-        })
-    }
 }
 
 impl LaneDrafts {
@@ -318,7 +289,8 @@ impl Qwen35ResidentMtpBatchGenerator {
         }
         let active = self.active;
         let active_slots = self.active_slots;
-        let mut builders: [EventBuilder; MAX_BATCH] = std::array::from_fn(|_| EventBuilder::new());
+        let mut builders: [MtpEventBuilder; MAX_BATCH] =
+            std::array::from_fn(|_| MtpEventBuilder::new());
         let mut started = [false; MAX_BATCH];
         let mut fresh = [usize::MAX; MAX_BATCH];
         let mut fresh_count = 0;
@@ -481,7 +453,7 @@ impl Qwen35ResidentMtpBatchGenerator {
     fn start_anchors(
         &mut self,
         slots: &[usize],
-        builders: &mut [EventBuilder; MAX_BATCH],
+        builders: &mut [MtpEventBuilder; MAX_BATCH],
     ) -> EngineResult<()> {
         let mut seeded_slots = [usize::MAX; MAX_BATCH];
         let mut anchors = [0u32; MAX_BATCH];
@@ -503,8 +475,8 @@ impl Qwen35ResidentMtpBatchGenerator {
                 continue;
             }
             seeded_slots[seeded] = slot;
-            anchors[seeded] = builders[slot].steps[0]
-                .as_ref()
+            anchors[seeded] = builders[slot]
+                .step(0)
                 .expect("fresh Qwen3.5 anchor exists")
                 .token_id;
             positions[seeded] = u32::try_from(session.next_position - 1)
@@ -557,7 +529,7 @@ impl Qwen35ResidentMtpBatchGenerator {
     fn run_tail(
         &mut self,
         slots: &[usize],
-        builders: &mut [EventBuilder; MAX_BATCH],
+        builders: &mut [MtpEventBuilder; MAX_BATCH],
     ) -> EngineResult<()> {
         for (lane, &slot) in slots.iter().enumerate() {
             let input = [self.anchor(slot)?];
@@ -576,7 +548,7 @@ impl Qwen35ResidentMtpBatchGenerator {
     fn run_compact_target(
         &mut self,
         slots: &[usize],
-        builders: &mut [EventBuilder; MAX_BATCH],
+        builders: &mut [MtpEventBuilder; MAX_BATCH],
     ) -> EngineResult<()> {
         let mut tokens = [0u32; MAX_BATCH];
         let mut positions = [0u32; MAX_BATCH];
@@ -659,8 +631,8 @@ impl Qwen35ResidentMtpBatchGenerator {
                 continue;
             }
             aligned_slots[aligned] = slot;
-            aligned_tokens[aligned] = builders[slot].steps[0]
-                .as_ref()
+            aligned_tokens[aligned] = builders[slot]
+                .step(0)
                 .expect("compact target step exists")
                 .token_id;
             aligned_positions[aligned] = positions[lane];
@@ -709,7 +681,7 @@ impl Qwen35ResidentMtpBatchGenerator {
     fn run_speculative(
         &mut self,
         slots: &[usize],
-        builders: &mut [EventBuilder; MAX_BATCH],
+        builders: &mut [MtpEventBuilder; MAX_BATCH],
     ) -> EngineResult<()> {
         let extent = slots
             .iter()
@@ -899,30 +871,19 @@ impl Qwen35ResidentMtpBatchGenerator {
         lane: usize,
         extent: usize,
         drafts: &LaneDrafts,
-        builder: &mut EventBuilder,
+        builder: &mut MtpEventBuilder,
     ) -> EngineResult<(usize, usize)> {
         let session = self.sessions[slot]
             .as_mut()
             .expect("greedy Qwen3.5 MTP session exists");
-        let mut accepted = 0;
-        for draft in 0..extent {
-            let row = target_download_row(lane * (extent + 1) + draft);
-            let step = session.control.accept_logits(&self.target_logits[row])?;
-            let matches = step.token_id == drafts.tokens[draft];
-            let terminal = step.finish_reason.is_some();
-            builder.push(step)?;
-            if matches {
-                accepted += 1;
-            }
-            if terminal || !matches {
-                return Ok((builder.len, accepted));
-            }
-        }
-        if session.control.finish_reason().is_none() {
-            let row = target_download_row(lane * (extent + 1) + extent);
-            builder.push(session.control.accept_logits(&self.target_logits[row])?)?;
-        }
-        Ok((builder.len, accepted))
+        decide_greedy_lane(
+            &mut session.control,
+            &self.target_logits,
+            Qwen35_9B::VOCAB,
+            lane,
+            &drafts.tokens[..extent],
+            builder,
+        )
     }
 
     fn decide_sampled(
@@ -931,52 +892,21 @@ impl Qwen35ResidentMtpBatchGenerator {
         lane: usize,
         extent: usize,
         drafts: &mut LaneDrafts,
-        builder: &mut EventBuilder,
+        builder: &mut MtpEventBuilder,
     ) -> EngineResult<(usize, usize)> {
-        let tokens = extent + 1;
         let session = self.sessions[slot]
             .as_mut()
             .expect("sampled Qwen3.5 MTP session exists");
-        let mut target_laws = Vec::with_capacity(tokens);
-        for row in 0..tokens {
-            let logits = target_download_row(lane * tokens + row);
-            target_laws.push(session.control.sampling_distribution(
-                &self.target_logits[logits],
-                &drafts.tokens[..row.min(extent)],
-            )?);
-        }
-        let mut acceptance_units = [0.0f64; DRAFT_WINDOW];
-        let mut residual_units = [0.0f64; DRAFT_WINDOW];
-        for row in 0..extent {
-            acceptance_units[row] = session.control.random_unit();
-            residual_units[row] = session.control.random_unit();
-        }
-        let bonus_unit = session.control.random_unit();
-        let target_refs = target_laws.iter().collect::<Vec<_>>();
-        let draft_refs = drafts.laws[..extent]
-            .iter()
-            .enumerate()
-            .map(|(row, law)| {
-                law.as_ref().ok_or_else(|| {
-                    EngineError::generation(format!(
-                        "sampled Qwen3.5 MTP proposal {row} has no distribution"
-                    ))
-                })
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
-        let round = decide_sampled_tokens(
-            &drafts.tokens[..extent],
-            &target_refs,
-            &draft_refs,
+        decide_sampled_lane(
+            &mut session.control,
+            &self.target_logits,
+            Qwen35_9B::VOCAB,
             &self.stop_ids,
-            &acceptance_units[..extent],
-            &residual_units[..extent],
-            bonus_unit,
-        )?;
-        for &token in round.token_ids() {
-            builder.push(session.control.accept_token(token)?)?;
-        }
-        Ok((round.token_ids().len(), round.accepted_drafts()))
+            lane,
+            &drafts.tokens[..extent],
+            &drafts.laws[..extent],
+            builder,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -985,7 +915,7 @@ impl Qwen35ResidentMtpBatchGenerator {
         slot: usize,
         lane: usize,
         inputs: &[u32],
-        builder: &EventBuilder,
+        builder: &MtpEventBuilder,
         committed: usize,
         accepted: usize,
     ) -> EngineResult<()> {
@@ -1094,14 +1024,14 @@ impl Qwen35ResidentMtpBatchGenerator {
     fn finish_events(
         &mut self,
         active_slots: &[usize],
-        mut builders: [EventBuilder; MAX_BATCH],
+        mut builders: [MtpEventBuilder; MAX_BATCH],
     ) -> EngineResult<Qwen35ResidentMtpBatchEvents> {
         let mut events = std::array::from_fn(|_| None);
         let mut survivors = [usize::MAX; MAX_BATCH];
         let mut surviving = 0;
         for (index, &slot) in active_slots.iter().enumerate() {
             let builder = &mut builders[slot];
-            if builder.len == 0 {
+            if builder.len() == 0 {
                 return Err(EngineError::generation(format!(
                     "Qwen3.5 MTP slot {slot} produced no event"
                 )));
@@ -1133,8 +1063,8 @@ impl Qwen35ResidentMtpBatchGenerator {
             };
             events[index] = Some(Qwen35ResidentMtpBatchEvent {
                 request_id,
-                steps: std::mem::replace(&mut builder.steps, std::array::from_fn(|_| None)),
-                len: builder.len,
+                steps: builder.take_steps(),
+                len: builder.len(),
                 completed,
                 stats,
             });

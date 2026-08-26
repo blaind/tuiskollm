@@ -1,8 +1,9 @@
 //! Single-slot greedy and unbiased sampled generation over the resident target-plus-MTP owner.
 
 use crate::common::mtp::{
-    DRAFT_WINDOW, MAX_NATIVE_PREFILL_TOKENS, ResidentMtpGenerationStats, VERIFY_ROWS,
-    decide_sampled_tokens, next_native_prefill_tile, require_generation_capacity,
+    DRAFT_WINDOW, MAX_NATIVE_PREFILL_TOKENS, MtpRoundRope, ResidentMtpGenerationStats, VERIFY_ROWS,
+    decide_greedy_round, decide_sampled_round, next_native_prefill_tile,
+    require_generation_capacity,
 };
 use crate::common::rope::{ROTARY_PAIRS, fill_contiguous_rope, text_rope};
 use crate::{
@@ -388,35 +389,13 @@ impl ResidentMtpGenerationSession<'_> {
     }
 
     fn decide_greedy_round(&mut self, drafts: &[u32]) -> EngineResult<(usize, usize)> {
-        let mut committed = 0;
-        let mut accepted = 0;
-        for (draft, &draft_token) in drafts.iter().enumerate() {
-            let step = self
-                .control
-                .accept_logits(target_logits(self.logits, draft))?;
-            let matches = step.token_id == draft_token;
-            self.queued[committed] = Some(step);
-            committed += 1;
-            if matches {
-                accepted += 1;
-            }
-            let terminal = self.queued[committed - 1]
-                .as_ref()
-                .expect("committed MTP step exists")
-                .finish_reason
-                .is_some();
-            if terminal || !matches {
-                break;
-            }
-        }
-        if accepted == drafts.len() && self.control.finish_reason().is_none() {
-            self.queued[committed] = Some(
-                self.control
-                    .accept_logits(target_logits(self.logits, drafts.len()))?,
-            );
-            committed += 1;
-        }
-        Ok((committed, accepted))
+        decide_greedy_round(
+            &mut self.control,
+            &mut self.queued,
+            self.logits,
+            Qwen38_27B::VOCAB,
+            drafts,
+        )
     }
 
     fn decide_sampled_round(
@@ -424,78 +403,29 @@ impl ResidentMtpGenerationSession<'_> {
         drafts: &[u32],
         draft_laws: &[Option<SamplingDistribution>],
     ) -> EngineResult<(usize, usize)> {
-        if draft_laws.len() != drafts.len() {
-            return Err(EngineError::generation(
-                "every sampled MTP proposal requires its draft distribution",
-            ));
-        }
-        let mut target_laws: [Option<SamplingDistribution>; VERIFY_ROWS] =
-            std::array::from_fn(|_| None);
-        for row in 0..=drafts.len() {
-            target_laws[row] = Some(self.control.sampling_distribution(
-                target_logits(self.logits, row),
-                &drafts[..row.min(drafts.len())],
-            )?);
-        }
-        let mut acceptance_units = [0.0f64; DRAFT_WINDOW];
-        let mut residual_units = [0.0f64; DRAFT_WINDOW];
-        for row in 0..drafts.len() {
-            acceptance_units[row] = self.control.random_unit();
-            residual_units[row] = self.control.random_unit();
-        }
-        let bonus_unit = self.control.random_unit();
-        let target_laws = target_laws[..drafts.len() + 1]
-            .iter()
-            .enumerate()
-            .map(|(row, law)| {
-                law.as_ref().ok_or_else(|| {
-                    EngineError::generation(format!(
-                        "sampled MTP target row {row} has no distribution"
-                    ))
-                })
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
-        let draft_laws = draft_laws
-            .iter()
-            .enumerate()
-            .map(|(row, law)| {
-                law.as_ref().ok_or_else(|| {
-                    EngineError::generation(format!(
-                        "sampled MTP proposal {row} has no draft distribution"
-                    ))
-                })
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
-        let round = decide_sampled_tokens(
-            drafts,
-            &target_laws,
-            &draft_laws,
+        decide_sampled_round(
+            &mut self.control,
+            &mut self.queued,
+            self.logits,
+            Qwen38_27B::VOCAB,
             &self.stop_ids,
-            &acceptance_units[..drafts.len()],
-            &residual_units[..drafts.len()],
-            bonus_unit,
-        )?;
-        for (index, &token) in round.token_ids().iter().enumerate() {
-            self.queued[index] = Some(self.control.accept_token(token)?);
-        }
-        Ok((round.token_ids().len(), round.accepted_drafts()))
+            drafts,
+            draft_laws,
+        )
     }
 
     fn verify_target(&mut self, inputs: &[u32]) -> EngineResult<ResidentMtpVerifyRoute> {
         self.program
             .target_mut()
             .stage_embeddings(self.stream, inputs)?;
-        let mut cosine = [0.0f32; VERIFY_ROWS * ROTARY_PAIRS];
-        let mut sine = [0.0f32; VERIFY_ROWS * ROTARY_PAIRS];
-        let rotary_values =
-            fill_contiguous_rope(self.next_position, inputs.len(), &mut cosine, &mut sine)?;
+        let rope = MtpRoundRope::contiguous(self.next_position, inputs.len())?;
         let route = self.program.target().load_target_mtp_verify_state(
             self.stream,
             inputs.len(),
             0,
             self.next_position,
-            &cosine[..rotary_values],
-            &sine[..rotary_values],
+            rope.cosine(),
+            rope.sine(),
         )?;
         self.program
             .target()
@@ -508,18 +438,15 @@ impl ResidentMtpGenerationSession<'_> {
     }
 
     fn realign(&mut self, outputs: &[u32], prime_only: bool) -> EngineResult<()> {
-        let mut cosine = [0.0f32; VERIFY_ROWS * ROTARY_PAIRS];
-        let mut sine = [0.0f32; VERIFY_ROWS * ROTARY_PAIRS];
-        let rotary_values =
-            fill_contiguous_rope(self.next_position, outputs.len(), &mut cosine, &mut sine)?;
+        let rope = MtpRoundRope::contiguous(self.next_position, outputs.len())?;
         let route = self.program.stage_realign(
             self.stream,
             outputs.len(),
             0,
             self.next_position,
             outputs,
-            &cosine[..rotary_values],
-            &sine[..rotary_values],
+            rope.cosine(),
+            rope.sine(),
         )?;
         if prime_only {
             self.program.replay_prime(self.stream, route)?;

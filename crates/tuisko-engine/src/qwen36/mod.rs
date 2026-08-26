@@ -12,3 +12,4 @@ pub(crate) mod mtp_layer_layout;
 pub(crate) mod resident_model;
 pub(crate) mod text_endpoint;
 pub(crate) mod text_endpoint_layout;
+pub(crate) mod text_generation;

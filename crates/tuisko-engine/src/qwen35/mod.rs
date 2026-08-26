@@ -19,3 +19,4 @@ pub(crate) mod resident_mtp;
 pub(crate) mod resident_mtp_layout;
 pub(crate) mod text_endpoint;
 pub(crate) mod text_endpoint_layout;
+pub(crate) mod text_generation;
