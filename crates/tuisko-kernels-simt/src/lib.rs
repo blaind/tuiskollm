@@ -1,9 +1,13 @@
-//! Leaf SIMT math shared as source by the pre-Blackwell fallback kernel crates.
+//! Leaf SIMT math and host-launcher scaffolding shared as source by the
+//! pre-Blackwell fallback kernel crates.
 //!
 //! Each consuming `tuisko-kernels-sm*` crate compiles these helpers into its own
-//! per-architecture PTX; nothing here is a shared compiled artifact.
+//! per-architecture PTX; nothing here is a shared compiled artifact. The
+//! `routes` macros expand into host code only and never reach device code.
 
 #![no_std]
+
+mod routes;
 
 /// Decodes one E4M3 group-scale code, including its subnormal range.
 #[inline(always)]
