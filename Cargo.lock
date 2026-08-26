@@ -3355,6 +3355,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuisko-kernels-simt"
+version = "0.1.0"
+
+[[package]]
 name = "tuisko-kernels-sm120"
 version = "0.1.0"
 dependencies = [
@@ -3505,6 +3509,7 @@ dependencies = [
  "cuda-host",
  "cuda-intrinsics",
  "tuisko-gpu",
+ "tuisko-kernels-simt",
  "tuisko-model",
 ]
 
@@ -3517,6 +3522,7 @@ dependencies = [
  "cuda-host",
  "cuda-intrinsics",
  "tuisko-gpu",
+ "tuisko-kernels-simt",
  "tuisko-model",
 ]
 

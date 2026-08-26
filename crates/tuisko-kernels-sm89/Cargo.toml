@@ -10,6 +10,7 @@ cuda-core.workspace = true
 cuda-device.workspace = true
 cuda-host.workspace = true
 cuda-intrinsics.workspace = true
+tuisko-kernels-simt.workspace = true
 tuisko-gpu.workspace = true
 tuisko-model.workspace = true
 
