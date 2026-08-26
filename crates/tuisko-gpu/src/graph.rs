@@ -97,19 +97,7 @@ impl CudaGraph {
 
     /// Writes CUDA's structural graph inventory for an out-of-band profiling artifact.
     pub fn debug_dot(&self, path: &Path) -> GpuResult<()> {
-        self.context
-            .bind_to_thread()
-            .map_err(|source| GpuError::driver("binding the graph CUDA context", source))?;
-        let path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| GpuError::graph("CUDA Graph DOT path contains an interior NUL"))?;
-        let flags = sys::CUgraphDebugDot_flags_enum_CU_GRAPH_DEBUG_DOT_FLAGS_VERBOSE
-            | sys::CUgraphDebugDot_flags_enum_CU_GRAPH_DEBUG_DOT_FLAGS_KERNEL_NODE_PARAMS
-            | sys::CUgraphDebugDot_flags_enum_CU_GRAPH_DEBUG_DOT_FLAGS_EXTRA_TOPO_INFO;
-        // SAFETY: the graph is live, the path is NUL-terminated, and CUDA writes the output file
-        // before returning without retaining either borrowed value.
-        unsafe { sys::cuGraphDebugDotPrint(self.graph, path.as_ptr(), flags) }
-            .result()
-            .map_err(|source| GpuError::driver("writing CUDA Graph DOT inventory", source))
+        debug_dot(&self.context, self.graph, path)
     }
 }
 
