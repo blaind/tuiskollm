@@ -313,6 +313,15 @@ const TEXT_ENDPOINT_RESOURCE_BASELINES: &[&str] = &[
 const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
 const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build-sm120";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
+/// Trailing `tuisko-qual` harness flags: ignored device tests, unbuffered
+/// output, and one test thread so sequential CUDA contexts never race.
+const QUALIFICATION_IGNORED_SERIAL_FLAGS: &[&str] =
+    &["--include-ignored", "--nocapture", "--test-threads=1"];
+/// Trailing harness flags for ignored device tests at the harness default
+/// thread count.
+const QUALIFICATION_IGNORED_FLAGS: &[&str] = &["--include-ignored", "--nocapture"];
+/// Trailing harness flags for suites whose tests are not `#[ignore]`d.
+const QUALIFICATION_NOCAPTURE_FLAGS: &[&str] = &["--nocapture"];
 const CUDA_OXIDE_REPOSITORY: &str = "https://github.com/NVlabs/cuda-oxide.git";
 const CUDA_OXIDE_REVISION: &str = "1f4d813719012d384f2db12b88efc9314c8bf50c";
 const MAX_IDLE_DEVICE_MEMORY_MIB: u64 = 2_048;
@@ -1588,391 +1597,152 @@ fn qualify_host(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn qualify_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "residual_norm_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "residual_norm_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_residual_norm(root)
 }
 
 fn qualify_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            QWEN35_RESIDUAL_NORM_TEST_FILTER,
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        QWEN35_RESIDUAL_NORM_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen35_residual_norm(root)
 }
 
 fn qualify_qwen36_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_residual_norm",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_residual_norm",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen36_residual_norm(root)
 }
 
 fn qualify_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_nvfp4_swiglu",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "qwen35_nvfp4_swiglu",
+        QUALIFICATION_IGNORED_FLAGS,
+        None,
     )?;
     gate_qwen35_nvfp4_swiglu(root)
 }
 
 fn qualify_qwen35_nvfp4_down(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_nvfp4_down",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_nvfp4_down",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen35_nvfp4_down(root)
 }
 
 fn qualify_qwen35_nvfp4_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
-        root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_nvfp4_qkv",
-            "--include-ignored",
-            "--nocapture",
-        ],
-    )?;
+    run_qualification_test(root, "qwen35_nvfp4_qkv", QUALIFICATION_IGNORED_FLAGS, None)?;
     gate_qwen35_nvfp4_qkv(root)
 }
 
 fn qualify_qwen36_moe_router(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_moe_router::tests::exact_routes_match_independent_oracles_and_graph_replay",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_moe_router::tests::exact_routes_match_independent_oracles_and_graph_replay",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen36_moe_router(root)
 }
 
 fn qualify_qwen36_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_moe_experts::tests::exact_routes_match_independent_oracles_and_graph_replay",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_moe_experts::tests::exact_routes_match_independent_oracles_and_graph_replay",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen36_moe_experts(root)
 }
 
 fn qualify_qwen36_nvfp4_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_nvfp4_lm_head",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_nvfp4_lm_head",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen36_nvfp4_lm_head(root)
 }
 
 fn qualify_qwen36_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_gdn_input",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_gdn_input",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen36_gdn_input(root)
 }
 
 fn qualify_qwen36_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_fp8_qkv",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_fp8_qkv",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen36_fp8_qkv(root)
 }
 
 fn qualify_qwen36_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_gdn_output::tests::exact_routes_match_independent_oracles_and_graph_replay",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_gdn_output::tests::exact_routes_match_independent_oracles_and_graph_replay",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen36_gdn_output(root)
 }
 
 fn qualify_qwen36_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_attention_output",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_attention_output",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen36_gdn_output(root)?;
     gate_qwen36_attention_output(root)
 }
 
 fn qualify_qwen36_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_gdn_prepare::tests::qwen36_exact_routes_match_shared_independent_oracle",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_gdn_prepare::tests::qwen36_exact_routes_match_shared_independent_oracle",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen35_gdn_prepare(root)
 }
 
 fn qualify_qwen36_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
+        "qwen35_gdn_recurrence::tests::qwen36_exact_routes_match_shared_independent_oracle",
         &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_gdn_recurrence::tests::qwen36_exact_routes_match_shared_independent_oracle",
             "--exact",
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
         ],
+        None,
     )?;
     gate_qwen35_gdn_recurrence(root)
 }
@@ -1984,27 +1754,10 @@ fn qualify_qwen35_bf16_lm_head(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen35-bf16-lm-head SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_bf16_lm_head::tests",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_bf16_lm_head::tests",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen35_bf16_lm_head(root)
@@ -2017,27 +1770,10 @@ fn qualify_qwen35_mtp_bf16_fusion(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen35-mtp-bf16-fusion SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_fusion_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_fusion_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen35_mtp_resources(root)
@@ -2052,27 +1788,10 @@ fn qualify_qwen35_mtp_bf16_attention(
             "usage: cargo run -p xtask -- qualify-qwen35-mtp-bf16-attention SNAPSHOT".into(),
         );
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_mtp_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_mtp_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen35_mtp_resources(root)
@@ -2087,54 +1806,21 @@ fn qualify_qwen36_mtp_bf16_attention(
             "usage: cargo run -p xtask -- qualify-qwen36-mtp-bf16-attention SNAPSHOT".into(),
         );
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_mtp_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_mtp_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen36_mtp_resources(root)
 }
 
 fn qualify_qwen36_mtp_bf16_moe(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_mtp_bf16_moe_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_mtp_bf16_moe_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen36_mtp_resources(root)
 }
@@ -2146,27 +1832,10 @@ fn qualify_qwen35_mtp_bf16_mlp(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen35-mtp-bf16-mlp SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_mtp_mlp_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_mtp_mlp_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen35_mtp_resources(root)
@@ -2179,27 +1848,10 @@ fn qualify_qwen35_text_endpoint(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen35-text-endpoint SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            QWEN35_TEXT_ENDPOINT_TEST_FILTER,
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        QWEN35_TEXT_ENDPOINT_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen35_residual_norm(root)?;
@@ -2213,27 +1865,10 @@ fn qualify_qwen36_text_endpoint(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen36-text-endpoint SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_text_endpoint::tests",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_text_endpoint::tests",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen36_residual_norm(root)?;
@@ -2247,27 +1882,10 @@ fn qualify_qwen36_resident_model(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen36-resident-model SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            QWEN36_RESIDENT_MODEL_TEST_FILTER,
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        QWEN36_RESIDENT_MODEL_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen36_residual_norm(root)?;
@@ -2291,27 +1909,10 @@ fn qualify_qwen36_generation(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen36-generation SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_generation::tests",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_generation::tests",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen36_residual_norm(root)?;
@@ -2363,27 +1964,10 @@ fn qualify_qwen35_resident_model(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen35-resident-model SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            QWEN35_RESIDENT_MODEL_TEST_FILTER,
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        QWEN35_RESIDENT_MODEL_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen35_residual_norm(root)?;
@@ -2406,27 +1990,10 @@ fn qualify_qwen35_resident_mtp(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen35-resident-mtp SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            QWEN35_RESIDENT_MTP_TEST_FILTER,
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        QWEN35_RESIDENT_MTP_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen35_residual_norm(root)?;
@@ -2450,27 +2017,10 @@ fn qualify_qwen35_mtp_generation(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen35-mtp-generation SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            QWEN35_MTP_GENERATION_TEST_FILTER,
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        QWEN35_MTP_GENERATION_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen35_residual_norm(root)?;
@@ -2496,27 +2046,10 @@ fn qualify_qwen35_mtp_batch_generation(
             "usage: cargo run -p xtask -- qualify-qwen35-mtp-batch-generation SNAPSHOT".into(),
         );
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            QWEN35_MTP_BATCH_GENERATION_TEST_FILTER,
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        QWEN35_MTP_BATCH_GENERATION_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen35_residual_norm(root)?;
@@ -2540,27 +2073,10 @@ fn qualify_qwen35_generation(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen35-generation SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_generation::tests",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_generation::tests",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen35_residual_norm(root)?;
@@ -2577,353 +2093,129 @@ fn qualify_qwen35_generation(
 }
 
 fn qualify_qwen35_long_context_kv(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )
 }
 
 fn qualify_qwen36_long_context_kv(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )
 }
 
 fn qualify_qwen35_nvfp4_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_nvfp4_gdn_input",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "qwen35_nvfp4_gdn_input",
+        QUALIFICATION_IGNORED_FLAGS,
+        None,
     )?;
     gate_qwen35_nvfp4_gdn_input(root)
 }
 
 fn qualify_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_gdn_prepare",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_gdn_prepare",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen35_gdn_prepare(root)
 }
 
 fn qualify_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_gdn_recurrence",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_gdn_recurrence",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_qwen35_gdn_recurrence(root)
 }
 
 fn qualify_qwen35_nvfp4_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_nvfp4_gdn_output",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "qwen35_nvfp4_gdn_output",
+        QUALIFICATION_IGNORED_FLAGS,
+        None,
     )?;
     gate_qwen35_nvfp4_attention_output(root)
 }
 
 fn qualify_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_nvfp4_attention_output::tests::exact_batches_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_nvfp4_attention_output::tests::exact_batches_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_nvfp4_attention_output_benchmark::tests::accounting_",
-            "--nocapture",
-        ],
+        "qwen35_nvfp4_attention_output_benchmark::tests::accounting_",
+        QUALIFICATION_NOCAPTURE_FLAGS,
+        None,
     )?;
     gate_qwen35_nvfp4_attention_output(root)
 }
 
 fn qualify_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
+        "fp8_qkv",
         &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "fp8_qkv",
             "--include-ignored",
             "--nocapture",
             "--test-threads=1",
             "--skip",
             "qwen36_fp8_qkv",
         ],
+        None,
     )?;
     wait_for_device_idle()?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_fp8_qkv",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_fp8_qkv",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_fp8_qkv(root)
 }
 
 fn qualify_fp8_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "fp8_swiglu_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "fp8_swiglu_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_fp8_swiglu(root)
 }
 
 fn qualify_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "fp8_down_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "fp8_down_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_fp8_down(root)
 }
 
 fn qualify_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
-        root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "nvfp4_swiglu",
-            "--include-ignored",
-            "--nocapture",
-        ],
-    )?;
+    run_qualification_test(root, "nvfp4_swiglu", QUALIFICATION_IGNORED_FLAGS, None)?;
     gate_nvfp4_swiglu(root)
 }
 
 fn qualify_nvfp4_down(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
-        root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "nvfp4_down",
-            "--include-ignored",
-            "--nocapture",
-        ],
-    )?;
+    run_qualification_test(root, "nvfp4_down", QUALIFICATION_IGNORED_FLAGS, None)?;
     gate_nvfp4_down(root)
 }
 
@@ -2931,26 +2223,10 @@ fn qualify_nvfp4_mlp(root: &Path, arguments: &[std::ffi::OsString]) -> Result<()
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "nvfp4_mlp::tests::source_layer55_matches_complete_oracles_and_graph_replay",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "nvfp4_mlp::tests::source_layer55_matches_complete_oracles_and_graph_replay",
+        QUALIFICATION_IGNORED_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_residual_norm(root)?;
@@ -2965,26 +2241,10 @@ fn qualify_qwen35_nvfp4_mlp(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen35-nvfp4-mlp SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "nvfp4_mlp::tests::qwen35_source_layer0_matches_complete_oracles_and_graph_replay",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "nvfp4_mlp::tests::qwen35_source_layer0_matches_complete_oracles_and_graph_replay",
+        QUALIFICATION_IGNORED_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen35_residual_norm(root)?;
@@ -2993,26 +2253,11 @@ fn qualify_qwen35_nvfp4_mlp(
 }
 
 fn qualify_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "gdn_prepare::tests",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "gdn_prepare::tests",
+        QUALIFICATION_IGNORED_FLAGS,
+        None,
     )?;
     gate_gdn_prepare(root)
 }
@@ -3022,475 +2267,175 @@ fn qualify_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
         "gdn_recurrence::tests::route_inventory_and_arena_accounting_are_exact",
         "gdn_recurrence::tests::exact_routes_match_independent_oracles_and_graph_replay",
     ] {
-        run_oxide(
+        run_qualification_test(
             root,
+            test,
             &[
-                "test",
-                "--arch",
-                "sm_120a",
-                "--cargo-target-dir",
-                CUDA_OXIDE_TEST_TARGET,
-                "--device-codegen-crate",
-                "tuisko-kernels-sm120",
-                "--",
-                "--package",
-                "tuisko-qual",
-                "--release",
-                "--lib",
-                "--",
-                test,
                 "--exact",
                 "--include-ignored",
                 "--nocapture",
                 "--test-threads=1",
             ],
+            None,
         )?;
     }
     gate_gdn_recurrence(root)
 }
 
 fn qualify_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "gdn_output::tests",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "gdn_output::tests",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_gdn_output(root)
 }
 
 fn qualify_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "attention_qk_prepare",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "attention_qk_prepare",
+        QUALIFICATION_IGNORED_FLAGS,
+        None,
     )?;
     gate_attention_qk_prepare(root)
 }
 
 fn qualify_qwen35_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "attention_qk_prepare::tests::qwen35_",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "attention_qk_prepare::tests::qwen35_",
+        QUALIFICATION_IGNORED_FLAGS,
+        None,
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "attention_qk_prepare_benchmark::tests::qwen35_",
-            "--nocapture",
-        ],
+        "attention_qk_prepare_benchmark::tests::qwen35_",
+        QUALIFICATION_NOCAPTURE_FLAGS,
+        None,
     )?;
     gate_qwen35_attention_qk_prepare(root)
 }
 
 fn qualify_qwen36_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "attention_qk_prepare::tests::qwen36_exact_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "attention_qk_prepare::tests::qwen36_exact_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "attention_qk_prepare_benchmark::tests::qwen36_bf16_",
-            "--nocapture",
-        ],
+        "attention_qk_prepare_benchmark::tests::qwen36_bf16_",
+        QUALIFICATION_NOCAPTURE_FLAGS,
+        None,
     )?;
     gate_qwen36_attention_qk_prepare(root)
 }
 
 fn qualify_qwen36_fp8_attention_qk_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "attention_qk_prepare::tests::qwen36_fp8_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "attention_qk_prepare::tests::qwen36_fp8_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "attention_qk_prepare_benchmark::tests::qwen36_fp8_",
-            "--nocapture",
-        ],
+        "attention_qk_prepare_benchmark::tests::qwen36_fp8_",
+        QUALIFICATION_NOCAPTURE_FLAGS,
+        None,
     )?;
     gate_qwen36_fp8_attention_qk_prepare(root)
 }
 
 fn qualify_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "paged_gqa_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "paged_gqa_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
     gate_paged_gqa(root)
 }
 
 fn qualify_qwen36_fp8_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "paged_gqa::tests::qwen36_fp8_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "paged_gqa::tests::qwen36_fp8_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "bf16_paged_gqa_benchmark::tests::qwen36_fp8_",
-            "--nocapture",
-        ],
+        "bf16_paged_gqa_benchmark::tests::qwen36_fp8_",
+        QUALIFICATION_NOCAPTURE_FLAGS,
+        None,
     )?;
     gate_qwen36_fp8_paged_gqa(root)
 }
 
 fn qualify_qwen35_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "paged_gqa::tests::qwen35_bf16_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "paged_gqa::tests::qwen35_bf16_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "bf16_paged_gqa_benchmark::tests::qwen35_bf16_",
-            "--nocapture",
-        ],
+        "bf16_paged_gqa_benchmark::tests::qwen35_bf16_",
+        QUALIFICATION_NOCAPTURE_FLAGS,
+        None,
     )?;
     gate_qwen35_paged_gqa(root)
 }
 
 fn qualify_qwen36_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "paged_gqa::tests::qwen36_bf16_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "paged_gqa::tests::qwen36_bf16_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "bf16_paged_gqa_benchmark::tests::qwen36_bf16_",
-            "--nocapture",
-        ],
+        "bf16_paged_gqa_benchmark::tests::qwen36_bf16_",
+        QUALIFICATION_NOCAPTURE_FLAGS,
+        None,
     )?;
     gate_qwen36_paged_gqa(root)
 }
 
 fn qualify_long_context_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "long_context_paged_gqa",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "long_context_paged_gqa",
+        QUALIFICATION_IGNORED_FLAGS,
+        None,
     )?;
     gate_long_context_paged_gqa(root)
 }
 
 fn qualify_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "attention_output::tests::attention_output_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "attention_output::tests::attention_output_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "attention_output_prefill::tests::attention_output_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "attention_output_prefill::tests::attention_output_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "attention_output_benchmark::tests::attention_output_suite_",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "attention_output_benchmark::tests::attention_output_suite_",
+        &["--nocapture", "--test-threads=1"],
+        None,
     )?;
     gate_attention_output(root)
 }
@@ -3502,27 +2447,10 @@ fn qualify_mtp_bf16_fusion(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-mtp-bf16-fusion SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "mtp_bf16_fusion_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "mtp_bf16_fusion_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_residual_norm(root)?;
@@ -3538,27 +2466,10 @@ fn qualify_mtp_bf16_attention_output(
             "usage: cargo run -p xtask -- qualify-mtp-bf16-attention-output SNAPSHOT".into(),
         );
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "mtp_bf16_attention_output_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "mtp_bf16_attention_output_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_mtp_bf16_attention_output(root)
@@ -3571,27 +2482,10 @@ fn qualify_mtp_bf16_mlp(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-mtp-bf16-mlp SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "mtp_bf16_mlp_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "mtp_bf16_mlp_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_mtp_bf16_mlp(root)
@@ -3604,27 +2498,10 @@ fn qualify_mtp_bf16_qkv(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-mtp-bf16-qkv SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "mtp_bf16_qkv_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "mtp_bf16_qkv_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_mtp_bf16_qkv(root)
@@ -3637,74 +2514,27 @@ fn qualify_mtp_bf16_qk_prepare(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-mtp-bf16-qk-prepare SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "mtp_bf16_qk_prepare_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "mtp_bf16_qk_prepare_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_mtp_bf16_qk_prepare(root)
 }
 
 fn qualify_mtp_bf16_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "mtp_bf16_paged_gqa_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "mtp_bf16_paged_gqa_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            MTP_BF16_PAGED_GQA_BENCHMARK_FILTER,
-            "--nocapture",
-        ],
+        MTP_BF16_PAGED_GQA_BENCHMARK_FILTER,
+        QUALIFICATION_NOCAPTURE_FLAGS,
+        None,
     )?;
     gate_mtp_bf16_paged_gqa(root)
 }
@@ -3716,27 +2546,10 @@ fn qualify_dense_fp8_mlp(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "dense_fp8_mlp_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "dense_fp8_mlp_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_residual_norm(root)?;
@@ -3751,26 +2564,10 @@ fn qualify_dense_fp8_gdn_layer(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "dense_fp8_gdn_layer::tests::source_layer60_matches_complete_seam_oracles_and_graph_replay",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "dense_fp8_gdn_layer::tests::source_layer60_matches_complete_seam_oracles_and_graph_replay",
+        QUALIFICATION_IGNORED_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_residual_norm(root)?;
@@ -3789,27 +2586,10 @@ fn qualify_full_attention_layer(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "full_attention_layer_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "full_attention_layer_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_residual_norm(root)?;
@@ -3825,49 +2605,17 @@ fn qualify_mtp_layer(root: &Path, arguments: &[std::ffi::OsString]) -> Result<()
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-mtp-layer SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            MTP_LAYER_TEST_FILTER,
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        MTP_LAYER_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            MTP_LAYER_BENCHMARK_FILTER,
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        MTP_LAYER_BENCHMARK_FILTER,
+        &["--nocapture", "--test-threads=1"],
+        None,
     )?;
     gate_mtp_layer(root)
 }
@@ -3879,27 +2627,10 @@ fn qualify_qwen35_mtp_layer(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen35-mtp-layer SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_mtp_layer_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_mtp_layer_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
     for baseline in QWEN35_MTP_LAYER_RESOURCE_BASELINES {
@@ -3918,27 +2649,10 @@ fn qualify_qwen36_mtp_layer(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen36-mtp-layer SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            QWEN36_MTP_LAYER_TEST_FILTER,
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        QWEN36_MTP_LAYER_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_qwen36_residual_norm(root)?;
@@ -3952,27 +2666,10 @@ fn qualify_target_mtp_verify(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-target-mtp-verify SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "target_mtp_verify::tests::exact_target_verify_and_commit_match_source_oracles",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "target_mtp_verify::tests::exact_target_verify_and_commit_match_source_oracles",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_resident_model_resources(root)
@@ -3985,27 +2682,10 @@ fn qualify_mtp_prompt_prime(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-mtp-prompt-prime SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "mtp_prompt_prime_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "mtp_prompt_prime_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_mtp_prompt_prime(root)
@@ -4018,27 +2698,10 @@ fn qualify_resident_mtp(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-resident-mtp SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "resident_mtp_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "resident_mtp_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_resident_mtp(root)
@@ -4051,27 +2714,10 @@ fn qualify_generation_mtp_greedy(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-generation-mtp-greedy SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "resident_mtp_generation_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "resident_mtp_generation_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_resident_mtp(root)
@@ -4084,27 +2730,10 @@ fn qualify_generation_mtp_sampling(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-generation-mtp-sampling SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "resident_mtp_sampling_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "resident_mtp_sampling_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_resident_mtp(root)
@@ -4117,27 +2746,10 @@ fn qualify_generation_mtp_batch(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-generation-mtp-batch SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "resident_mtp_batch_suite_",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "resident_mtp_batch_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_resident_mtp(root)
@@ -4175,48 +2787,17 @@ fn qualify_qwen35_full_attention_layer(
             "usage: cargo run -p xtask -- qualify-qwen35-full-attention-layer SNAPSHOT".into(),
         );
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_full_attention_layer::tests",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_full_attention_layer::tests",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_full_attention_layer_benchmark::tests",
-            "--nocapture",
-        ],
+        "qwen35_full_attention_layer_benchmark::tests",
+        QUALIFICATION_NOCAPTURE_FLAGS,
+        None,
     )?;
     gate_qwen35_residual_norm(root)?;
     gate_qwen35_nvfp4_qkv(root)?;
@@ -4234,48 +2815,17 @@ fn qualify_qwen35_gdn_layer(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen35-gdn-layer SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_gdn_layer::tests",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen35_gdn_layer::tests",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN35_SNAPSHOT", snapshot.as_os_str())),
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen35_gdn_layer_benchmark::tests",
-            "--nocapture",
-        ],
+        "qwen35_gdn_layer_benchmark::tests",
+        QUALIFICATION_NOCAPTURE_FLAGS,
+        None,
     )?;
     gate_qwen35_residual_norm(root)?;
     gate_qwen35_nvfp4_gdn_input(root)?;
@@ -4293,48 +2843,17 @@ fn qualify_qwen36_gdn_moe_layer(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-qwen36-gdn-moe-layer SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_gdn_moe_layer::tests",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_gdn_moe_layer::tests",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_gdn_moe_layer_benchmark::tests",
-            "--nocapture",
-        ],
+        "qwen36_gdn_moe_layer_benchmark::tests",
+        QUALIFICATION_NOCAPTURE_FLAGS,
+        None,
     )?;
     gate_qwen36_residual_norm(root)?;
     gate_qwen36_gdn_input(root)?;
@@ -4354,48 +2873,17 @@ fn qualify_qwen36_full_attention_layer(
             "usage: cargo run -p xtask -- qualify-qwen36-full-attention-layer SNAPSHOT".into(),
         );
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_full_attention_layer::tests",
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
+        "qwen36_full_attention_layer::tests",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_QWEN36_SNAPSHOT", snapshot.as_os_str())),
     )?;
-    run_oxide(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "qwen36_full_attention_layer_benchmark::tests",
-            "--nocapture",
-        ],
+        "qwen36_full_attention_layer_benchmark::tests",
+        QUALIFICATION_NOCAPTURE_FLAGS,
+        None,
     )?;
     gate_qwen36_residual_norm(root)?;
     gate_qwen36_fp8_qkv(root)?;
@@ -4413,26 +2901,10 @@ fn qualify_resident_model(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-resident-model SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "resident_model::tests::source_model_matches_final_oracle_and_exact_graph_replay",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "resident_model::tests::source_model_matches_final_oracle_and_exact_graph_replay",
+        QUALIFICATION_IGNORED_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_resident_model_resources(root)
@@ -4445,26 +2917,10 @@ fn qualify_resident_generation(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-resident-generation SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "resident_generation::tests::source_frontend_generation_matches_vllm_tokens_and_streaming",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "resident_generation::tests::source_frontend_generation_matches_vllm_tokens_and_streaming",
+        QUALIFICATION_IGNORED_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_resident_model_resources(root)
@@ -4479,26 +2935,10 @@ fn qualify_resident_batch_generation(
             "usage: cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT".into(),
         );
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "resident_batch_generation::tests::compact_scheduler_matches_sequential_requests_and_recycles_holes",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "resident_batch_generation::tests::compact_scheduler_matches_sequential_requests_and_recycles_holes",
+        QUALIFICATION_IGNORED_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_resident_model_resources(root)
@@ -4524,27 +2964,7 @@ fn gate_resident_model_resources(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn qualify_fp8_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
-        root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "fp8_gdn_input",
-            "--include-ignored",
-            "--nocapture",
-        ],
-    )?;
+    run_qualification_test(root, "fp8_gdn_input", QUALIFICATION_IGNORED_FLAGS, None)?;
     gate_fp8_gdn_input(root)
 }
 
@@ -4567,26 +2987,10 @@ fn qualify_text_endpoint(
     let [snapshot] = arguments else {
         return Err("usage: cargo run -p xtask -- qualify-text-endpoint SNAPSHOT".into());
     };
-    run_oxide_with_env(
+    run_qualification_test(
         root,
-        &[
-            "test",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_TEST_TARGET,
-            "--device-codegen-crate",
-            "tuisko-kernels-sm120",
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--release",
-            "--lib",
-            "--",
-            "text_endpoint::tests::source_endpoint_matches_independent_oracles_and_graph_replay",
-            "--include-ignored",
-            "--nocapture",
-        ],
+        "text_endpoint::tests::source_endpoint_matches_independent_oracles_and_graph_replay",
+        QUALIFICATION_IGNORED_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
     gate_residual_norm(root)?;
@@ -7640,6 +6044,43 @@ fn run_oxide_with_env(
     }
 
     run_visible(&mut command)
+}
+
+/// Canonical SM120 device qualification test argv. `trailing` is the
+/// test-harness argument list that follows the filter in the legacy inline
+/// arrays; its contents and order are preserved verbatim so the spawned argv
+/// is byte-identical to the pre-refactor call.
+fn qualification_test_arguments<'a>(test_filter: &'a str, trailing: &[&'a str]) -> Vec<&'a str> {
+    let mut arguments = vec![
+        "test",
+        "--arch",
+        "sm_120a",
+        "--cargo-target-dir",
+        CUDA_OXIDE_TEST_TARGET,
+        "--device-codegen-crate",
+        "tuisko-kernels-sm120",
+        "--",
+        "--package",
+        "tuisko-qual",
+        "--release",
+        "--lib",
+        "--",
+        test_filter,
+    ];
+    arguments.extend_from_slice(trailing);
+    arguments
+}
+
+/// Run one canonical `tuisko-qual` device test invocation. Gates stay with the
+/// caller: a suite's gate list is its contract, not boilerplate.
+fn run_qualification_test(
+    root: &Path,
+    test_filter: &str,
+    trailing: &[&str],
+    environment: Option<(&str, &OsStr)>,
+) -> Result<(), Box<dyn Error>> {
+    let arguments = qualification_test_arguments(test_filter, trailing);
+    run_oxide_with_env(root, &arguments, environment)
 }
 
 /// Same as `run_oxide` but captures stdout so the caller can locate
@@ -14996,7 +13437,8 @@ mod tests {
         COMPOSED_PERFORMANCE_SUITES, MAX_IDLE_DEVICE_MEMORY_MIB,
         MTP_BF16_PAGED_GQA_BENCHMARK_FILTER, MTP_LAYER_BENCHMARK_FILTER,
         MTP_LAYER_RESOURCE_BASELINES, MTP_LAYER_TEST_FILTER, OptimizationSuite, PERFORMANCE_SUITES,
-        PerformanceSuite, QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
+        PerformanceSuite, QUALIFICATION_IGNORED_FLAGS, QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        QUALIFICATION_NOCAPTURE_FLAGS, QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
         QWEN35_MTP_BATCH_GENERATION_TEST_FILTER, QWEN35_MTP_GENERATION_TEST_FILTER,
         QWEN35_RESIDENT_MODEL_TEST_FILTER, QWEN35_RESIDENT_MTP_TEST_FILTER,
         QWEN35_RESIDUAL_NORM_TEST_FILTER, QWEN35_TEXT_ENDPOINT_TEST_FILTER,
@@ -15004,9 +13446,9 @@ mod tests {
         QWEN36_RESIDENT_MODEL_TEST_FILTER, SM120_RESOURCE_BASELINES, device_is_idle,
         parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
         parse_performance_device_sample, parse_performance_iteration, parse_resources,
-        parse_rustc_identity, preflight_performance_baselines, require_consumed_baseline_keys,
-        require_count, require_registers, require_uniform_value, resolve_target_output,
-        sass_function_body, workspace_root,
+        parse_rustc_identity, preflight_performance_baselines, qualification_test_arguments,
+        require_consumed_baseline_keys, require_count, require_registers, require_uniform_value,
+        resolve_target_output, sass_function_body, workspace_root,
     };
     use std::ffi::OsString;
 
@@ -15512,5 +13954,682 @@ mod tests {
         assert!(!body.contains("NOP"));
         assert!(sass_function_body(sass, "foo_bar").unwrap().contains("NOP"));
         assert!(sass_function_body(sass, "foo_").is_none());
+    }
+    /// Every converted `qualify_*` invocation must spawn the argv its legacy
+    /// inline array spawned: same flags, same order, same filter position.
+    #[test]
+    fn qualification_test_arguments_reproduce_legacy_argv() {
+        // The prefix every legacy inline array spelled out before its filter,
+        // transcribed independently of `qualification_test_arguments`.
+        const LEGACY_PREFIX: &[&str] = &[
+            "test",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            "target/cuda-oxide-test",
+            "--device-codegen-crate",
+            "tuisko-kernels-sm120",
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--release",
+            "--lib",
+            "--",
+        ];
+        // (function, call index within it, filter, trailing flags) for all 101
+        // spawned invocations across the 84 converted functions;
+        // `qualify_gdn_recurrence` spawns two from one loop.
+        const LEGACY_CALL_SITES: &[(&str, usize, &str, &[&str])] = &[
+            (
+                "qualify_residual_norm",
+                0,
+                "residual_norm_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_residual_norm",
+                0,
+                QWEN35_RESIDUAL_NORM_TEST_FILTER,
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_residual_norm",
+                0,
+                "qwen36_residual_norm",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_nvfp4_swiglu",
+                0,
+                "qwen35_nvfp4_swiglu",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_qwen35_nvfp4_down",
+                0,
+                "qwen35_nvfp4_down",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_nvfp4_qkv",
+                0,
+                "qwen35_nvfp4_qkv",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_qwen36_moe_router",
+                0,
+                "qwen36_moe_router::tests::exact_routes_match_independent_oracles_and_graph_replay",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_moe_experts",
+                0,
+                "qwen36_moe_experts::tests::exact_routes_match_independent_oracles_and_graph_replay",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_nvfp4_lm_head",
+                0,
+                "qwen36_nvfp4_lm_head",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_gdn_input",
+                0,
+                "qwen36_gdn_input",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_fp8_qkv",
+                0,
+                "qwen36_fp8_qkv",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_gdn_output",
+                0,
+                "qwen36_gdn_output::tests::exact_routes_match_independent_oracles_and_graph_replay",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_attention_output",
+                0,
+                "qwen36_attention_output",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_gdn_prepare",
+                0,
+                "qwen35_gdn_prepare::tests::qwen36_exact_routes_match_shared_independent_oracle",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_gdn_recurrence",
+                0,
+                "qwen35_gdn_recurrence::tests::qwen36_exact_routes_match_shared_independent_oracle",
+                &[
+                    "--exact",
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ],
+            ),
+            (
+                "qualify_qwen35_bf16_lm_head",
+                0,
+                "qwen35_bf16_lm_head::tests",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_mtp_bf16_fusion",
+                0,
+                "qwen35_fusion_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_mtp_bf16_attention",
+                0,
+                "qwen35_mtp_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_mtp_bf16_attention",
+                0,
+                "qwen36_mtp_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_mtp_bf16_moe",
+                0,
+                "qwen36_mtp_bf16_moe_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_mtp_bf16_mlp",
+                0,
+                "qwen35_mtp_mlp_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_text_endpoint",
+                0,
+                QWEN35_TEXT_ENDPOINT_TEST_FILTER,
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_text_endpoint",
+                0,
+                "qwen36_text_endpoint::tests",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_resident_model",
+                0,
+                QWEN36_RESIDENT_MODEL_TEST_FILTER,
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_generation",
+                0,
+                "qwen36_generation::tests",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_resident_model",
+                0,
+                QWEN35_RESIDENT_MODEL_TEST_FILTER,
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_resident_mtp",
+                0,
+                QWEN35_RESIDENT_MTP_TEST_FILTER,
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_mtp_generation",
+                0,
+                QWEN35_MTP_GENERATION_TEST_FILTER,
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_mtp_batch_generation",
+                0,
+                QWEN35_MTP_BATCH_GENERATION_TEST_FILTER,
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_generation",
+                0,
+                "qwen35_generation::tests",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_long_context_kv",
+                0,
+                QWEN35_LONG_CONTEXT_KV_TEST_FILTER,
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_long_context_kv",
+                0,
+                QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_nvfp4_gdn_input",
+                0,
+                "qwen35_nvfp4_gdn_input",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_qwen35_gdn_prepare",
+                0,
+                "qwen35_gdn_prepare",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_gdn_recurrence",
+                0,
+                "qwen35_gdn_recurrence",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_nvfp4_gdn_output",
+                0,
+                "qwen35_nvfp4_gdn_output",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_qwen35_nvfp4_attention_output",
+                0,
+                "qwen35_nvfp4_attention_output::tests::exact_batches_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_nvfp4_attention_output",
+                1,
+                "qwen35_nvfp4_attention_output_benchmark::tests::accounting_",
+                QUALIFICATION_NOCAPTURE_FLAGS,
+            ),
+            (
+                "qualify_fp8_qkv",
+                0,
+                "fp8_qkv",
+                &[
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--skip",
+                    "qwen36_fp8_qkv",
+                ],
+            ),
+            (
+                "qualify_fp8_qkv",
+                1,
+                "qwen36_fp8_qkv",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_fp8_swiglu",
+                0,
+                "fp8_swiglu_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_fp8_down",
+                0,
+                "fp8_down_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_nvfp4_swiglu",
+                0,
+                "nvfp4_swiglu",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_nvfp4_down",
+                0,
+                "nvfp4_down",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_nvfp4_mlp",
+                0,
+                "nvfp4_mlp::tests::source_layer55_matches_complete_oracles_and_graph_replay",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_qwen35_nvfp4_mlp",
+                0,
+                "nvfp4_mlp::tests::qwen35_source_layer0_matches_complete_oracles_and_graph_replay",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_gdn_prepare",
+                0,
+                "gdn_prepare::tests",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_gdn_recurrence",
+                0,
+                "gdn_recurrence::tests::route_inventory_and_arena_accounting_are_exact",
+                &[
+                    "--exact",
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ],
+            ),
+            (
+                "qualify_gdn_recurrence",
+                0,
+                "gdn_recurrence::tests::exact_routes_match_independent_oracles_and_graph_replay",
+                &[
+                    "--exact",
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ],
+            ),
+            (
+                "qualify_gdn_output",
+                0,
+                "gdn_output::tests",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_attention_qk_prepare",
+                0,
+                "attention_qk_prepare",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_qwen35_attention_qk_prepare",
+                0,
+                "attention_qk_prepare::tests::qwen35_",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_qwen35_attention_qk_prepare",
+                1,
+                "attention_qk_prepare_benchmark::tests::qwen35_",
+                QUALIFICATION_NOCAPTURE_FLAGS,
+            ),
+            (
+                "qualify_qwen36_attention_qk_prepare",
+                0,
+                "attention_qk_prepare::tests::qwen36_exact_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_attention_qk_prepare",
+                1,
+                "attention_qk_prepare_benchmark::tests::qwen36_bf16_",
+                QUALIFICATION_NOCAPTURE_FLAGS,
+            ),
+            (
+                "qualify_qwen36_fp8_attention_qk_prepare",
+                0,
+                "attention_qk_prepare::tests::qwen36_fp8_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_fp8_attention_qk_prepare",
+                1,
+                "attention_qk_prepare_benchmark::tests::qwen36_fp8_",
+                QUALIFICATION_NOCAPTURE_FLAGS,
+            ),
+            (
+                "qualify_paged_gqa",
+                0,
+                "paged_gqa_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_fp8_paged_gqa",
+                0,
+                "paged_gqa::tests::qwen36_fp8_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_fp8_paged_gqa",
+                1,
+                "bf16_paged_gqa_benchmark::tests::qwen36_fp8_",
+                QUALIFICATION_NOCAPTURE_FLAGS,
+            ),
+            (
+                "qualify_qwen35_paged_gqa",
+                0,
+                "paged_gqa::tests::qwen35_bf16_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_paged_gqa",
+                1,
+                "bf16_paged_gqa_benchmark::tests::qwen35_bf16_",
+                QUALIFICATION_NOCAPTURE_FLAGS,
+            ),
+            (
+                "qualify_qwen36_paged_gqa",
+                0,
+                "paged_gqa::tests::qwen36_bf16_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_paged_gqa",
+                1,
+                "bf16_paged_gqa_benchmark::tests::qwen36_bf16_",
+                QUALIFICATION_NOCAPTURE_FLAGS,
+            ),
+            (
+                "qualify_long_context_paged_gqa",
+                0,
+                "long_context_paged_gqa",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_attention_output",
+                0,
+                "attention_output::tests::attention_output_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_attention_output",
+                1,
+                "attention_output_prefill::tests::attention_output_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_attention_output",
+                2,
+                "attention_output_benchmark::tests::attention_output_suite_",
+                &["--nocapture", "--test-threads=1"],
+            ),
+            (
+                "qualify_mtp_bf16_fusion",
+                0,
+                "mtp_bf16_fusion_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_mtp_bf16_attention_output",
+                0,
+                "mtp_bf16_attention_output_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_mtp_bf16_mlp",
+                0,
+                "mtp_bf16_mlp_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_mtp_bf16_qkv",
+                0,
+                "mtp_bf16_qkv_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_mtp_bf16_qk_prepare",
+                0,
+                "mtp_bf16_qk_prepare_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_mtp_bf16_paged_gqa",
+                0,
+                "mtp_bf16_paged_gqa_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_mtp_bf16_paged_gqa",
+                1,
+                MTP_BF16_PAGED_GQA_BENCHMARK_FILTER,
+                QUALIFICATION_NOCAPTURE_FLAGS,
+            ),
+            (
+                "qualify_dense_fp8_mlp",
+                0,
+                "dense_fp8_mlp_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_dense_fp8_gdn_layer",
+                0,
+                "dense_fp8_gdn_layer::tests::source_layer60_matches_complete_seam_oracles_and_graph_replay",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_full_attention_layer",
+                0,
+                "full_attention_layer_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_mtp_layer",
+                0,
+                MTP_LAYER_TEST_FILTER,
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_mtp_layer",
+                1,
+                MTP_LAYER_BENCHMARK_FILTER,
+                &["--nocapture", "--test-threads=1"],
+            ),
+            (
+                "qualify_qwen35_mtp_layer",
+                0,
+                "qwen35_mtp_layer_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_mtp_layer",
+                0,
+                QWEN36_MTP_LAYER_TEST_FILTER,
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_target_mtp_verify",
+                0,
+                "target_mtp_verify::tests::exact_target_verify_and_commit_match_source_oracles",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_mtp_prompt_prime",
+                0,
+                "mtp_prompt_prime_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_resident_mtp",
+                0,
+                "resident_mtp_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_generation_mtp_greedy",
+                0,
+                "resident_mtp_generation_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_generation_mtp_sampling",
+                0,
+                "resident_mtp_sampling_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_generation_mtp_batch",
+                0,
+                "resident_mtp_batch_suite_",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_full_attention_layer",
+                0,
+                "qwen35_full_attention_layer::tests",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_full_attention_layer",
+                1,
+                "qwen35_full_attention_layer_benchmark::tests",
+                QUALIFICATION_NOCAPTURE_FLAGS,
+            ),
+            (
+                "qualify_qwen35_gdn_layer",
+                0,
+                "qwen35_gdn_layer::tests",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen35_gdn_layer",
+                1,
+                "qwen35_gdn_layer_benchmark::tests",
+                QUALIFICATION_NOCAPTURE_FLAGS,
+            ),
+            (
+                "qualify_qwen36_gdn_moe_layer",
+                0,
+                "qwen36_gdn_moe_layer::tests",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_gdn_moe_layer",
+                1,
+                "qwen36_gdn_moe_layer_benchmark::tests",
+                QUALIFICATION_NOCAPTURE_FLAGS,
+            ),
+            (
+                "qualify_qwen36_full_attention_layer",
+                0,
+                "qwen36_full_attention_layer::tests",
+                QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ),
+            (
+                "qualify_qwen36_full_attention_layer",
+                1,
+                "qwen36_full_attention_layer_benchmark::tests",
+                QUALIFICATION_NOCAPTURE_FLAGS,
+            ),
+            (
+                "qualify_resident_model",
+                0,
+                "resident_model::tests::source_model_matches_final_oracle_and_exact_graph_replay",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_resident_generation",
+                0,
+                "resident_generation::tests::source_frontend_generation_matches_vllm_tokens_and_streaming",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_resident_batch_generation",
+                0,
+                "resident_batch_generation::tests::compact_scheduler_matches_sequential_requests_and_recycles_holes",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_fp8_gdn_input",
+                0,
+                "fp8_gdn_input",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+            (
+                "qualify_text_endpoint",
+                0,
+                "text_endpoint::tests::source_endpoint_matches_independent_oracles_and_graph_replay",
+                QUALIFICATION_IGNORED_FLAGS,
+            ),
+        ];
+
+        assert_eq!(
+            QUALIFICATION_IGNORED_SERIAL_FLAGS,
+            ["--include-ignored", "--nocapture", "--test-threads=1"]
+        );
+        assert_eq!(
+            QUALIFICATION_IGNORED_FLAGS,
+            ["--include-ignored", "--nocapture"]
+        );
+        assert_eq!(QUALIFICATION_NOCAPTURE_FLAGS, ["--nocapture"]);
+        assert_eq!(LEGACY_CALL_SITES.len(), 101);
+
+        for &(function, index, filter, trailing) in LEGACY_CALL_SITES {
+            let mut legacy = LEGACY_PREFIX.to_vec();
+            legacy.push(filter);
+            legacy.extend_from_slice(trailing);
+
+            assert_eq!(
+                qualification_test_arguments(filter, trailing),
+                legacy,
+                "{function} invocation {index}"
+            );
+        }
     }
 }
