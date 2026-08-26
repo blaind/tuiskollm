@@ -47,10 +47,10 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 axum = "0.8"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
-cuda-core = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "1f4d813719012d384f2db12b88efc9314c8bf50c" }
-cuda-device = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "1f4d813719012d384f2db12b88efc9314c8bf50c" }
-cuda-host = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "1f4d813719012d384f2db12b88efc9314c8bf50c" }
-cuda-intrinsics = { version = "0.1.0", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "1f4d813719012d384f2db12b88efc9314c8bf50c" }
+cuda-core = { version = "0.2.1", git = "https://github.com/blaind/cuda-oxide.git", rev = "0199e55572ee78cd2cea97335e5b7392a3f9be4a" }
+cuda-device = { version = "0.2.1", git = "https://github.com/blaind/cuda-oxide.git", rev = "0199e55572ee78cd2cea97335e5b7392a3f9be4a" }
+cuda-host = { version = "0.2.1", git = "https://github.com/blaind/cuda-oxide.git", rev = "0199e55572ee78cd2cea97335e5b7392a3f9be4a" }
+cuda-intrinsics = { version = "0.1.0", git = "https://github.com/blaind/cuda-oxide.git", rev = "0199e55572ee78cd2cea97335e5b7392a3f9be4a" }
 flate2 = "1.1"
 memmap2 = "0.9"
 page_size = "0.6"
