@@ -1,13 +1,13 @@
 //! Qwen3.5-9B single-shard snapshot inventory admission.
 
 use crate::CheckpointSnapshot;
-use crate::common::config_util::validate_config;
 use crate::common::inventory::{
     CONFIG_FILE, ExpectedTensor, MODEL_FILE, Shard, add_expected, add_modelopt_linear,
     add_vision_expected_tensors, dimension, require_count, validate_exact_tensors,
     validate_file_length, validate_revision,
 };
 use crate::common::naming::layer_prefix;
+use crate::common::schema::validate_config;
 use crate::{Arch, CheckpointError, CheckpointResult, DType, SafeTensorFile};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;

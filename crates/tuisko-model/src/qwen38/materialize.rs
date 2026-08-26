@@ -1,8 +1,12 @@
 //! Qwen3.8-27B lossless materialization into runtime-native host layouts.
 
+use crate::Arch;
+use crate::common::inventory::CheckpointSnapshot;
+use crate::common::materialized::{MaterializedMemory, sealed};
 use crate::common::mtp::MaterializedMtpQkv;
 use crate::common::routes::require_full_attention_layer;
 use crate::common::scale_swizzle::{PlaneGatherer, host_shape};
+use crate::common::source_binding::{SourceLayerBinding, sealed as binding_sealed};
 use crate::qwen38::bindings::{FullAttentionQkvBindings, MtpBindings};
 use crate::{CheckpointError, CheckpointResult};
 
@@ -19,6 +23,28 @@ pub struct MaterializedFullAttentionQkv {
     pub columns: usize,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl binding_sealed::Sealed for FullAttentionQkvBindings<'_> {}
+
+impl<'a, A: Arch> SourceLayerBinding<'a, A> for FullAttentionQkvBindings<'a> {
+    type Materialized = MaterializedFullAttentionQkv;
+
+    fn bind(snapshot: &'a CheckpointSnapshot<A>, layer: usize) -> CheckpointResult<Self> {
+        Self::bind::<A>(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Self::materialize(self)
+    }
+}
+
+impl sealed::Sealed for MaterializedFullAttentionQkv {}
+
+impl MaterializedMemory for MaterializedFullAttentionQkv {
+    fn host_bytes(&self) -> usize {
+        self.weight_e4m3.len() + self.scale_bf16.len()
+    }
 }
 
 impl FullAttentionQkvBindings<'_> {
@@ -132,6 +158,8 @@ impl MtpBindings<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::common::source_binding::SourceLayerBinding;
+    use crate::{MaterializedMemory, Qwen38_27B};
 
     use crate::CheckpointErrorCode;
     use crate::common::test_support::sources::{bf16_bytes, bf16_view, fp8_view};
@@ -191,8 +219,20 @@ mod tests {
             key_scale
         );
         assert_eq!(&materialized.scale_bf16[key_scale_end..], value_scale);
+        assert_eq!(materialized.host_bytes(), 30);
         assert_eq!((materialized.rows, materialized.columns), (6, 3));
         assert_eq!(materialized.layer, 3);
+
+        let via_trait =
+            <FullAttentionQkvBindings<'_> as SourceLayerBinding<'_, Qwen38_27B>>::materialize(
+                bindings,
+            )
+            .unwrap();
+
+        assert_eq!(via_trait.weight_e4m3, materialized.weight_e4m3);
+        assert_eq!(via_trait.scale_bf16, materialized.scale_bf16);
+        assert_eq!(via_trait.host_bytes(), materialized.host_bytes());
+        assert_eq!((via_trait.rows, via_trait.columns), (6, 3));
     }
 
     #[test]

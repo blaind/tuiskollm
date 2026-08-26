@@ -11,12 +11,15 @@
 
 pub(crate) mod config_util;
 pub(crate) mod inventory;
+pub(crate) mod materialized;
 pub(crate) mod modelopt_codec;
 pub(crate) mod mtp;
 pub(crate) mod naming;
 pub(crate) mod nvfp4;
 pub(crate) mod routes;
 pub(crate) mod scale_swizzle;
+pub(crate) mod schema;
+pub(crate) mod source_binding;
 #[cfg(test)]
 pub(crate) mod test_builder;
 #[cfg(test)]

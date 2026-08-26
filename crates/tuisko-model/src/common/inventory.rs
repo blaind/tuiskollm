@@ -1,10 +1,7 @@
 //! Shared snapshot inventory admission and mmap-backed tensor lookup.
 
-use crate::qwen36::inventory::QWEN36_INVENTORY;
-use crate::qwen38::inventory::QWEN38_INVENTORY;
-use crate::{
-    Arch, CheckpointContract, CheckpointError, CheckpointResult, DType, SafeTensorFile, TensorView,
-};
+use crate::common::schema::open_snapshot;
+use crate::{Arch, CheckpointError, CheckpointResult, DType, SafeTensorFile, TensorView};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -298,13 +295,7 @@ where
 impl<A: Arch> CheckpointSnapshot<A> {
     /// Opens and validates the pinned snapshot rooted at `root`.
     pub fn open(root: &Path) -> CheckpointResult<Self> {
-        match A::CHECKPOINT_CONTRACT {
-            CheckpointContract::CompressedTensors => {
-                Self::open_split_with_spec(root, QWEN38_INVENTORY)
-            }
-            CheckpointContract::ModelOptNvfp4 => Self::open_modelopt(root),
-            CheckpointContract::ModelOptNvfp4Moe => Self::open_indexed(root, QWEN36_INVENTORY),
-        }
+        open_snapshot::<A>(root)
     }
 
     /// Returns the admitted snapshot root.

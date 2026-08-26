@@ -627,7 +627,7 @@ fn qwen36_quantized_layers<A: Arch>() -> BTreeMap<String, Qwen36QuantizedLayer> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::config_util::validate_config;
+    use crate::common::schema::validate_config;
     use crate::common::test_support::configs::NEXT_FIXTURE;
     use crate::{CheckpointErrorCode, Qwen36Moe35B};
     use serde_json::{Map, Value, json};

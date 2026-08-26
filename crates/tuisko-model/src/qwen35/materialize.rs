@@ -1,5 +1,8 @@
 //! Qwen3.5-9B lossless materialization into runtime-native host layouts.
 
+use crate::Arch;
+use crate::common::inventory::CheckpointSnapshot;
+use crate::common::materialized::{MaterializedMemory, sealed};
 use crate::common::modelopt_codec::{
     MaterializedModelOptNvfp4Linear, ModelOptNvfp4LinearBindings, ModelOptScaleCodec,
     logical_columns, materialize_modelopt_linear,
@@ -11,6 +14,7 @@ use crate::common::routes::{
     require_full_attention_layer, require_gdn_layer_route, validate_nvfp4_scales,
 };
 use crate::common::scale_swizzle::{PlaneGatherer, SCALE_TILE_ROWS, host_shape};
+use crate::common::source_binding::{SourceLayerBinding, sealed as binding_sealed};
 use crate::qwen35::bindings::{
     ModelOptNvfp4AttentionBindings, ModelOptNvfp4GdnBindings, ModelOptNvfp4MlpBindings,
 };
@@ -37,6 +41,28 @@ pub struct MaterializedModelOptNvfp4Mlp<'a> {
     pub next_norm: Bf16View<'a, 1>,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl binding_sealed::Sealed for ModelOptNvfp4MlpBindings<'_> {}
+
+impl<'a, A: Arch> SourceLayerBinding<'a, A> for ModelOptNvfp4MlpBindings<'a> {
+    type Materialized = MaterializedModelOptNvfp4Mlp<'a>;
+
+    fn bind(snapshot: &'a CheckpointSnapshot<A>, layer: usize) -> CheckpointResult<Self> {
+        Self::bind::<A>(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Self::materialize(self)
+    }
+}
+
+impl sealed::Sealed for MaterializedModelOptNvfp4Mlp<'_> {}
+
+impl MaterializedMemory for MaterializedModelOptNvfp4Mlp<'_> {
+    fn host_bytes(&self) -> usize {
+        self.gate_up.host_bytes() + self.down.host_bytes()
+    }
 }
 
 /// Runtime-native Qwen3.5 full-attention planes.
@@ -70,6 +96,28 @@ pub struct MaterializedModelOptNvfp4Attention<'a> {
     pub post_attention_norm: Bf16View<'a, 1>,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl binding_sealed::Sealed for ModelOptNvfp4AttentionBindings<'_> {}
+
+impl<'a, A: Arch> SourceLayerBinding<'a, A> for ModelOptNvfp4AttentionBindings<'a> {
+    type Materialized = MaterializedModelOptNvfp4Attention<'a>;
+
+    fn bind(snapshot: &'a CheckpointSnapshot<A>, layer: usize) -> CheckpointResult<Self> {
+        Self::bind::<A>(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Self::materialize(self)
+    }
+}
+
+impl sealed::Sealed for MaterializedModelOptNvfp4Attention<'_> {}
+
+impl MaterializedMemory for MaterializedModelOptNvfp4Attention<'_> {
+    fn host_bytes(&self) -> usize {
+        self.qkv_weight_e2m1.len() + self.qkv_scale_e4m3_swizzled.len() + self.output.host_bytes()
+    }
 }
 
 /// Runtime-native Qwen3.5 GDN source planes.
@@ -125,6 +173,32 @@ pub struct MaterializedModelOptNvfp4Gdn<'a> {
     pub post_attention_norm: Bf16View<'a, 1>,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl binding_sealed::Sealed for ModelOptNvfp4GdnBindings<'_> {}
+
+impl<'a, A: Arch> SourceLayerBinding<'a, A> for ModelOptNvfp4GdnBindings<'a> {
+    type Materialized = MaterializedModelOptNvfp4Gdn<'a>;
+
+    fn bind(snapshot: &'a CheckpointSnapshot<A>, layer: usize) -> CheckpointResult<Self> {
+        Self::bind::<A>(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Self::materialize(self)
+    }
+}
+
+impl sealed::Sealed for MaterializedModelOptNvfp4Gdn<'_> {}
+
+impl MaterializedMemory for MaterializedModelOptNvfp4Gdn<'_> {
+    fn host_bytes(&self) -> usize {
+        self.input_weight_e2m1.len()
+            + self.input_scale_e4m3_swizzled.len()
+            + self.control_weight_e2m1_padded.len()
+            + self.control_scale_e4m3_swizzled.len()
+            + self.output.host_bytes()
+    }
 }
 
 impl<'a> ModelOptNvfp4GdnBindings<'a> {
@@ -514,6 +588,7 @@ impl<'a> ModelOptNvfp4MlpBindings<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::MaterializedMemory;
 
     use crate::common::inventory::CheckpointSnapshot;
     use crate::common::modelopt_codec::ModelOptNvfp4LinearBindings;
@@ -644,6 +719,7 @@ mod tests {
         assert_eq!(materialized.gate_up.weight_scale_divisor, 8.0);
         assert_eq!(materialized.down.input_scale_divisor, 2.0);
         assert_eq!(materialized.down.weight_scale_divisor, 16.0);
+        assert_eq!(materialized.host_bytes(), 3_072);
         assert_eq!(materialized.input_norm.word(0), Some(0x3f80));
         assert_eq!(materialized.next_norm.word(0), Some(0x4000));
         assert_eq!(materialized.layer, 3);
@@ -787,6 +863,7 @@ mod tests {
         assert_eq!(materialized.qkv_weight_scale_divisors, [8.0, 4.0, 2.0]);
         assert_eq!(materialized.output.input_scale_divisor, 2.0);
         assert_eq!(materialized.output.weight_scale_divisor, 16.0);
+        assert_eq!(materialized.host_bytes(), 37_888);
         assert_eq!(materialized.query_norm.word(0), Some(0x4000));
         assert_eq!(materialized.input_norm.word(0), Some(0x3f80));
         assert_eq!(materialized.layer, 3);
@@ -966,6 +1043,7 @@ mod tests {
         assert_eq!(materialized.input_weight_scale_divisor, 8.0);
         assert_eq!(materialized.control_input_scale_divisor, 4.0);
         assert_eq!(materialized.control_weight_scale_divisor, 2.0);
+        assert_eq!(materialized.host_bytes(), 28_672);
         assert_eq!(materialized.convolution_weight.word(0), Some(0x3f80));
         assert_eq!(materialized.a_log.word(0), Some(0x4000));
         assert_eq!(materialized.dt_bias.word(0), Some(0x4040));

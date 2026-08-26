@@ -1,13 +1,13 @@
 //! Qwen3.6-35B-A3B MoE indexed three-shard snapshot inventory admission.
 
 use crate::CheckpointSnapshot;
-use crate::common::config_util::validate_config;
 use crate::common::inventory::{
     CONFIG_FILE, ExpectedTensor, INDEX_FILE, Shard, add_expected, add_modelopt_linear,
     add_vision_expected_tensors, dimension, read_index, require_count, validate_expected_tensor,
     validate_file_length, validate_revision,
 };
 use crate::common::naming::layer_prefix;
+use crate::common::schema::validate_config;
 use crate::{Arch, CheckpointError, CheckpointResult, DType, SafeTensorFile};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;

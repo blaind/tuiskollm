@@ -1,11 +1,11 @@
 //! Qwen3.8-27B split-shard snapshot inventory admission.
 
 use crate::CheckpointSnapshot;
-use crate::common::config_util::validate_config;
 use crate::common::inventory::{
     CONFIG_FILE, INDEX_FILE, MODEL_FILE, Shard, read_index, require_count, validate_file_length,
     validate_revision,
 };
+use crate::common::schema::validate_config;
 use crate::{Arch, CheckpointError, CheckpointResult, SafeTensorFile};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;

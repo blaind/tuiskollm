@@ -1,8 +1,12 @@
 //! NVFP4 gate/up and down source carriers shared by the compressed-tensors and ModelOpt MLP routes.
 
+use crate::Arch;
+use crate::common::inventory::CheckpointSnapshot;
+use crate::common::materialized::{MaterializedMemory, sealed};
 use crate::common::modelopt_codec::{logical_columns, validate_divisor};
 use crate::common::routes::{require_nvfp4_mlp_layer, validate_nvfp4_scales};
 use crate::common::scale_swizzle::{PlaneGatherer, host_shape};
+use crate::common::source_binding::{SourceLayerBinding, sealed as binding_sealed};
 use crate::{CheckpointError, CheckpointResult, Fp8E4M3View, U8View};
 
 /// Exact packed gate/up source planes for one NVFP4 MLP layer.
@@ -62,6 +66,28 @@ pub struct MaterializedNvfp4GateUp<'a> {
     pub columns: usize,
     /// Decoder layer owning this layout.
     pub layer: usize,
+}
+
+impl binding_sealed::Sealed for Nvfp4GateUpBindings<'_> {}
+
+impl<'a, A: Arch> SourceLayerBinding<'a, A> for Nvfp4GateUpBindings<'a> {
+    type Materialized = MaterializedNvfp4GateUp<'a>;
+
+    fn bind(snapshot: &'a CheckpointSnapshot<A>, layer: usize) -> CheckpointResult<Self> {
+        Self::bind::<A>(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Self::materialize(self)
+    }
+}
+
+impl sealed::Sealed for MaterializedNvfp4GateUp<'_> {}
+
+impl MaterializedMemory for MaterializedNvfp4GateUp<'_> {
+    fn host_bytes(&self) -> usize {
+        self.scale_e4m3_swizzled.len()
+    }
 }
 
 impl<'a> Nvfp4GateUpBindings<'a> {
@@ -138,6 +164,28 @@ pub struct MaterializedNvfp4Down<'a> {
     pub layer: usize,
 }
 
+impl binding_sealed::Sealed for Nvfp4DownBindings<'_> {}
+
+impl<'a, A: Arch> SourceLayerBinding<'a, A> for Nvfp4DownBindings<'a> {
+    type Materialized = MaterializedNvfp4Down<'a>;
+
+    fn bind(snapshot: &'a CheckpointSnapshot<A>, layer: usize) -> CheckpointResult<Self> {
+        Self::bind::<A>(snapshot, layer)
+    }
+
+    fn materialize(self) -> CheckpointResult<Self::Materialized> {
+        Self::materialize(self)
+    }
+}
+
+impl sealed::Sealed for MaterializedNvfp4Down<'_> {}
+
+impl MaterializedMemory for MaterializedNvfp4Down<'_> {
+    fn host_bytes(&self) -> usize {
+        self.scale_e4m3_swizzled.len()
+    }
+}
+
 impl<'a> Nvfp4DownBindings<'a> {
     /// Materializes the down-projection scale layout without requantizing source values.
     pub fn materialize(self) -> CheckpointResult<MaterializedNvfp4Down<'a>> {
@@ -178,6 +226,7 @@ impl<'a> Nvfp4DownBindings<'a> {
 mod tests {
     use super::*;
     use crate::CheckpointErrorCode;
+    use crate::MaterializedMemory;
     use crate::common::test_support::sources::{
         GROUPS, PACKED_COLUMNS, ROWS, block_scale_oracle, fp8_view, scale_codes, u8_view,
     };
@@ -238,6 +287,7 @@ mod tests {
         assert_eq!(materialized.up_weight_e2m1.as_ptr(), up_weight.as_ptr());
         assert_eq!((materialized.rows, materialized.columns), (256, 128));
         assert_eq!(materialized.layer, 55);
+        assert_eq!(materialized.host_bytes(), 2_048);
         assert_eq!(materialized.input_scale_divisor.to_bits(), 3.0f32.to_bits());
         assert_eq!(
             materialized.weight_scale_divisor.to_bits(),
@@ -292,6 +342,7 @@ mod tests {
         assert_eq!(materialized.scale_e4m3_swizzled, expected);
         assert_eq!(materialized.weight_e2m1, weight);
         assert_eq!(materialized.weight_e2m1.as_ptr(), weight.as_ptr());
+        assert_eq!(materialized.host_bytes(), 1_024);
         assert_eq!((materialized.rows, materialized.columns), (128, 128));
         assert_eq!(materialized.layer, 55);
     }

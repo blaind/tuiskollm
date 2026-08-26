@@ -299,7 +299,8 @@ fn validate_scheme(
 #[cfg(test)]
 mod tests {
 
-    use crate::common::config_util::{test_quantization_config, validate_config};
+    use crate::common::config_util::test_quantization_config;
+    use crate::common::schema::validate_config;
     use crate::common::test_support::configs::write_config;
     use crate::{CheckpointErrorCode, Qwen38_27B};
     use serde_json::{Value, json};
