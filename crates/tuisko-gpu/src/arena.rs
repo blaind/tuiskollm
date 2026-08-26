@@ -633,9 +633,7 @@ impl DeviceArena {
         value: u8,
     ) -> GpuResult<()> {
         self.require_stream_context(stream, "filling a device arena subrange")?;
-        if len == 0 {
-            return Ok(());
-        }
+        // Empty fills still validate region identity and bounds.
         let (address, bytes) = self.subrange_address(region, start, len, "arena fill")?;
         if bytes == 0 {
             return Ok(());
@@ -1305,5 +1303,31 @@ mod tests {
         };
         assert_eq!(overlap.code(), GpuErrorCode::Arena);
         assert_eq!(out_of_bounds.code(), GpuErrorCode::Arena);
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
+    fn zero_length_fill_validates_bounds_and_debug_layout_identity() {
+        let context = CudaContext::new(0).unwrap();
+        assert_eq!(context.compute_capability().unwrap(), (12, 0));
+        let stream = context.new_stream().unwrap();
+        let mut layout = ArenaLayout::new();
+        let values = layout.reserve::<u32>(8, 256).unwrap();
+        let arena = DeviceArena::zeroed(&stream, &layout).unwrap();
+
+        let error = arena
+            .fill_slice(&stream, values, values.len() + 1, 0, 0)
+            .unwrap_err();
+        assert_eq!(error.code(), GpuErrorCode::Arena);
+
+        #[cfg(debug_assertions)]
+        {
+            let mut foreign_layout = ArenaLayout::new();
+            let foreign = foreign_layout.reserve::<u32>(8, 256).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                arena.fill_slice(&stream, foreign, 0, 0, 0)
+            }));
+            assert!(result.is_err());
+        }
     }
 }
