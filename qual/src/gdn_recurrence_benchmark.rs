@@ -167,6 +167,7 @@ impl Regions {
             + self.norm_weight.byte_len()
             + self.state_rows.byte_len()
             + self.state.byte_len()
+            + self.recurrent_plane.byte_len()
             + self.output.byte_len()
     }
 }
@@ -405,8 +406,8 @@ mod tests {
 
         assert_eq!(regions.norm_weight.byte_len(), 256);
         assert_eq!(regions.state.byte_len(), 25_165_824);
-        assert_eq!(regions.payload_bytes(), 92_668_192);
-        assert_eq!(layout.byte_len(), 92_668_416);
+        assert_eq!(regions.payload_bytes(), 117_834_016);
+        assert_eq!(layout.byte_len(), 117_834_240);
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 224);
     }
 }
