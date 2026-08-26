@@ -6406,13 +6406,20 @@ pub(crate) fn gate_residual_norm_target(
     verify_generator_stamp(root, &baseline)?;
 
     let ptx_path = root.join(gpu.ptx_path());
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let fallback_ptx;
+    let fallback_entries;
+    let entries = if matches!(gpu, gpu_target::GpuTarget::Sm120) {
+        &sm120_gate_module(root)?.entries
+    } else {
+        fallback_ptx = fs::read_to_string(&ptx_path).map_err(|error| {
+            format!(
+                "could not read {}: {error}; run the pinned release device build first",
+                ptx_path.display()
+            )
+        })?;
+        fallback_entries = parse_entries(&fallback_ptx);
+        &fallback_entries
+    };
     // Generic entry names encode the Rust type only in their hash. The pinned
     // compiler leaves Qwen3.8's exact 5,120 divisor in each decode body.
     let plain = entries
@@ -6589,14 +6596,7 @@ fn gate_qwen35_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let plain = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen35_rms_norm_TID_"))
@@ -6728,14 +6728,7 @@ fn gate_qwen36_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     // The pinned compiler folds Qwen3.6's exact 1/2,048 factor to 0x3A000000.
     // This separates its generic symbols from the Qwen3.8 generic family.
     let plain = entries
@@ -7001,14 +6994,7 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(root.join(FP8_QKV_RESOURCE_BASELINE))?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let quantize = entries
         .iter()
         .filter(|entry| entry.name == "quantize_activation_e4m3")
@@ -7228,14 +7214,7 @@ fn gate_fp8_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
     )?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let gdn_input = entries
         .iter()
         .filter(|entry| entry.name.starts_with("fp8_gdn_input_TID_"))
@@ -7328,14 +7307,7 @@ fn gate_fp8_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
     )?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let lm_head = entries
         .iter()
         .filter(|entry| entry.name.starts_with("fp8_lm_head_TID_"))
@@ -7379,14 +7351,8 @@ fn gate_fp8_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
     )?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let module = sm120_gate_module(root)?;
+    let entries = &module.entries;
     let quantize = entries
         .iter()
         .filter(|entry| entry.name.starts_with("fp8_swiglu_quantize_TID_"))
@@ -7430,7 +7396,10 @@ fn gate_fp8_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
             "dense-FP8 SwiGLU TMA lost its 288-thread/two-CTA single-CTA launch contract".into(),
         );
     }
-    if !ptx.contains(".extern .shared .align 128 .b8 __dynamic_smem_fp8_swiglu_tma_t1024[];") {
+    if !module
+        .ptx
+        .contains(".extern .shared .align 128 .b8 __dynamic_smem_fp8_swiglu_tma_t1024[];")
+    {
         return Err("dense-FP8 SwiGLU TMA lost its 128-byte dynamic-shared alignment".into());
     }
 
@@ -7527,14 +7496,8 @@ fn gate_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(root.join(FP8_DOWN_RESOURCE_BASELINE))?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let module = sm120_gate_module(root)?;
+    let entries = &module.entries;
     let quantize = entries
         .iter()
         .filter(|entry| entry.name.starts_with("fp8_down_quantize_TID_"))
@@ -7596,7 +7559,10 @@ fn gate_fp8_down(root: &Path) -> Result<(), Box<dyn Error>> {
             "dense-FP8 down TMA lost its 288-thread/two-CTA single-CTA launch contract".into(),
         );
     }
-    if !ptx.contains(".extern .shared .align 128 .b8 __dynamic_smem_fp8_down_tma_t1024[];") {
+    if !module
+        .ptx
+        .contains(".extern .shared .align 128 .b8 __dynamic_smem_fp8_down_tma_t1024[];")
+    {
         return Err("dense-FP8 down TMA lost its 128-byte dynamic-shared alignment".into());
     }
 
@@ -7696,14 +7662,7 @@ fn gate_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
     )?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let a16 = entries
         .iter()
         .filter(|entry| entry.name.starts_with("nvfp4_swiglu_a16_t"))
@@ -7838,14 +7797,7 @@ fn gate_qwen35_nvfp4_swiglu(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let a16 = entries
         .iter()
         .filter(|entry| {
@@ -7990,14 +7942,7 @@ fn gate_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
     )?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let control = entries
         .iter()
         .filter(|entry| entry.name.starts_with("gdn_control_exact_TID_"))
@@ -8179,9 +8124,7 @@ fn gate_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(GDN_RECURRENCE_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path)?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let recurrence = entries
         .iter()
         .filter(|entry| entry.name.starts_with("gdn_recurrence_exact_TID_"))
@@ -8302,8 +8245,7 @@ fn gate_gdn_state_snapshot(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(GDN_STATE_SNAPSHOT_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx = fs::read_to_string(root.join(PTX))?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let snapshots = entries
         .iter()
         .filter(|entry| entry.name.starts_with("gdn_state_snapshot_exact_TID_"))
@@ -8348,9 +8290,7 @@ fn gate_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(GDN_OUTPUT_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path)?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let quantize = entries
         .iter()
         .filter(|entry| entry.name.starts_with("gdn_output_quantize"))
@@ -8560,9 +8500,7 @@ fn gate_attention_qk_prepare_target(
 ) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(root.join(baseline_path))?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path)?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let prepare = entries
         .iter()
         .filter(|entry| entry.name.starts_with(entry_prefix))
@@ -8640,9 +8578,7 @@ fn gate_attention_qk_prepare_target(
 fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(root.join(PAGED_GQA_RESOURCE_BASELINE))?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path)?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let attention = entries
         .iter()
         .filter(|entry| entry.name.starts_with("paged_gqa_exact_TID_"))
@@ -8966,7 +8902,6 @@ fn gate_qwen35_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         "qwen35_paged_gqa_exact_TID_",
         Some(("qwen35_paged_gqa_prefill_shared_exact_TID_", 3, 128)),
         "Qwen3.5",
-        "qwen35-bf16-paged-gqa-gate.cubin",
         false,
     )
 }
@@ -8978,7 +8913,6 @@ fn gate_qwen36_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         "qwen36_paged_gqa_exact_TID_",
         Some(("qwen36_paged_gqa_prefill_shared_exact_TID_", 3, 256)),
         "Qwen3.6",
-        "qwen36-bf16-paged-gqa-gate.cubin",
         false,
     )
 }
@@ -8990,26 +8924,21 @@ fn gate_qwen36_fp8_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         "qwen36_fp8_paged_gqa_exact_TID_",
         Some(("qwen36_fp8_paged_gqa_prefill_shared_exact_TID_", 3, 256)),
         "Qwen3.6",
-        "qwen36-fp8-paged-gqa-gate.cubin",
         true,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gate_paged_gqa_target(
     root: &Path,
     baseline_path: &str,
     entry_prefix: &str,
     prefill_inventory: Option<(&str, usize, u32)>,
     target: &str,
-    cubin_name: &str,
     e4m3_cache: bool,
 ) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(root.join(baseline_path))?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path)?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let attention = entries
         .iter()
         .filter(|entry| entry.name.starts_with(entry_prefix))
@@ -9051,29 +8980,9 @@ fn gate_paged_gqa_target(
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join(cubin_name);
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let mut registers = Vec::new();
     let mut shared = Vec::new();
     let mut prefill_registers = Vec::new();
@@ -9105,7 +9014,7 @@ fn gate_paged_gqa_target(
             registers.push(resource.registers);
             shared.push(resource.shared);
 
-            let body = sass_function_body(&sass, entry.name)
+            let body = sass_function_body(sass, entry.name)
                 .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
             for instruction in instructions {
                 if !body.contains(instruction) {
@@ -9153,8 +9062,7 @@ fn gate_mtp_bf16_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(MTP_BF16_PAGED_GQA_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx = fs::read_to_string(root.join(PTX))?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let attention = entries
         .iter()
         .filter(|entry| entry.name.starts_with("mtp_bf16_paged_gqa_TID_"))
@@ -9216,9 +9124,7 @@ fn gate_long_context_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path)?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let partials = entries
         .iter()
         .filter(|entry| {
@@ -9313,9 +9219,7 @@ fn gate_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(ATTENTION_OUTPUT_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path)?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let quantize = entries
         .iter()
         .filter(|entry| entry.name.starts_with("attention_gate_quantize_exact_TID_"))
@@ -9480,8 +9384,7 @@ fn gate_qwen35_mtp_resources(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN35_MTP_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx = fs::read_to_string(root.join(PTX))?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let artifact = sm120_gate_artifact(root)?;
     let sass = artifact.sass()?;
     let bf16_mma_ptx = [
@@ -9617,7 +9520,7 @@ fn gate_qwen35_mtp_resources(root: &Path) -> Result<(), Box<dyn Error>> {
         },
     ];
 
-    let entry_count = gate_exact_resource_families(&baseline, &entries, artifact, sass, &families)?;
+    let entry_count = gate_exact_resource_families(&baseline, entries, artifact, sass, &families)?;
     println!(
         "Qwen3.5 MTP resource gate passed: {entry_count} entries, STACK:0 LOCAL:0, SHARED:1024; launch bounds, BF16 HMMA/cache paths, and register envelopes retained"
     );
@@ -9699,8 +9602,7 @@ fn gate_qwen36_mtp_resources(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN36_MTP_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx = fs::read_to_string(root.join(PTX))?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let artifact = sm120_gate_artifact(root)?;
     let sass = artifact.sass()?;
     let bf16_mma_ptx = [
@@ -9821,7 +9723,7 @@ fn gate_qwen36_mtp_resources(root: &Path) -> Result<(), Box<dyn Error>> {
         },
     ];
 
-    let entry_count = gate_exact_resource_families(&baseline, &entries, artifact, sass, &families)?;
+    let entry_count = gate_exact_resource_families(&baseline, entries, artifact, sass, &families)?;
     println!(
         "Qwen3.6 MTP resource gate passed: {entry_count} entries, STACK:0 LOCAL:0, SHARED:1024; launch bounds, BF16 tensor/scalar paths, and register envelopes retained"
     );
@@ -9833,9 +9735,7 @@ fn gate_mtp_bf16_fusion(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(MTP_BF16_FUSION_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path)?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let routes = entries
         .iter()
         .filter(|entry| entry.name.starts_with("mtp_bf16_fusion_TID_"))
@@ -9916,8 +9816,7 @@ fn gate_mtp_bf16_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(MTP_BF16_ATTENTION_OUTPUT_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx = fs::read_to_string(root.join(PTX))?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let gates = entries
         .iter()
         .filter(|entry| entry.name.starts_with("mtp_bf16_attention_gate_TID_"))
@@ -10025,8 +9924,7 @@ fn gate_mtp_bf16_mlp(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(MTP_BF16_MLP_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx = fs::read_to_string(root.join(PTX))?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let swiglu = entries
         .iter()
         .filter(|entry| entry.name.starts_with("mtp_bf16_swiglu_TID_"))
@@ -10138,8 +10036,7 @@ fn gate_mtp_bf16_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(MTP_BF16_QKV_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx = fs::read_to_string(root.join(PTX))?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let routes = entries
         .iter()
         .filter(|entry| entry.name.starts_with("mtp_bf16_qkv_TID_"))
@@ -10221,14 +10118,7 @@ fn gate_nvfp4_down(root: &Path) -> Result<(), Box<dyn Error>> {
     )?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let routes = entries
         .iter()
         .filter(|entry| {
@@ -10367,14 +10257,7 @@ fn gate_qwen35_nvfp4_down(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN35_NVFP4_DOWN_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let routes = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen35_nvfp4_down_a16_TID_"))
@@ -10528,14 +10411,7 @@ fn gate_qwen35_nvfp4_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN35_NVFP4_QKV_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let routes = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen35_nvfp4_qkv_a16_TID_"))
@@ -10686,14 +10562,7 @@ fn gate_qwen35_bf16_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN35_BF16_LM_HEAD_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let routes = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen35_bf16_lm_head_TID_"))
@@ -10763,14 +10632,7 @@ fn gate_qwen36_moe_router(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN36_MOE_ROUTER_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let projection = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_moe_router_logits_TID_"))
@@ -10935,14 +10797,7 @@ fn gate_qwen36_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN36_MOE_EXPERTS_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let gate_up = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_moe_expert_gate_up_TID_"))
@@ -11188,14 +11043,7 @@ fn gate_qwen36_nvfp4_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN36_NVFP4_LM_HEAD_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let routes = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_nvfp4_lm_head_a16_TID_"))
@@ -11265,14 +11113,7 @@ fn gate_qwen36_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN36_FP8_QKV_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let quantize = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_attention_fp8_quantize_TID_"))
@@ -11460,14 +11301,7 @@ fn gate_qwen36_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN36_GDN_INPUT_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let quantize = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen36_static_fp8_quantize_TID_"))
@@ -11714,14 +11548,7 @@ fn gate_qwen36_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN36_GDN_OUTPUT_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let quantize = entries
         .iter()
         .filter(|entry| {
@@ -11916,14 +11743,7 @@ fn gate_qwen36_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN36_ATTENTION_OUTPUT_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let gates = entries
         .iter()
         .filter(|entry| {
@@ -12024,14 +11844,7 @@ fn gate_qwen35_nvfp4_gdn_input(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN35_NVFP4_GDN_INPUT_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let routes = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen35_nvfp4_gdn_input_a16_TID_"))
@@ -12259,14 +12072,7 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN35_GDN_PREPARE_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let routes = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen35_gdn_prepare_exact_TID_"))
@@ -12342,29 +12148,9 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("qwen35-gdn-prepare-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let mut registers = Vec::new();
     let mut causal_registers = Vec::new();
     let mut causal_history_registers = Vec::new();
@@ -12394,7 +12180,7 @@ fn gate_qwen35_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
                 )
             })?;
             require_spill_free(entry.name, resource)?;
-            let body = sass_function_body(&sass, entry.name).ok_or_else(|| {
+            let body = sass_function_body(sass, entry.name).ok_or_else(|| {
                 format!(
                     "cuobjdump omitted Qwen3.5 GDN prepare {role} SASS `{}`",
                     entry.name
@@ -12449,14 +12235,7 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
         root.join(QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let routes = entries
         .iter()
         .filter(|entry| entry.name.starts_with("qwen35_gdn_recurrence_exact_TID_"))
@@ -12536,29 +12315,9 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("qwen35-gdn-recurrence-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let mut registers = Vec::new();
     let mut causal_registers = Vec::new();
     let mut prefill_registers = Vec::new();
@@ -12591,7 +12350,7 @@ fn gate_qwen35_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
                 )
             })?;
             require_spill_free(entry.name, resource)?;
-            let body = sass_function_body(&sass, entry.name).ok_or_else(|| {
+            let body = sass_function_body(sass, entry.name).ok_or_else(|| {
                 format!(
                     "cuobjdump omitted Qwen3.5 GDN recurrence {role} SASS `{}`",
                     entry.name
@@ -12657,14 +12416,7 @@ fn gate_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>>
         root.join(QWEN35_NVFP4_ATTENTION_OUTPUT_RESOURCE_BASELINE),
     )?)?;
     verify_generator_stamp(root, &baseline)?;
-    let ptx_path = root.join(PTX);
-    let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}; run the pinned release device build first",
-            ptx_path.display()
-        )
-    })?;
-    let entries = parse_entries(&ptx);
+    let entries = &sm120_gate_module(root)?.entries;
     let gates = entries
         .iter()
         .filter(|entry| {
@@ -12767,29 +12519,9 @@ fn gate_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>>
         }
     }
 
-    let temporary = root.join("target/tmp");
-    fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("qwen35-nvfp4-attention-output-gate.cubin");
-    let ptxas = cuda_tool("ptxas");
-    require_success(
-        &ptxas,
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx_path.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let cuobjdump = cuda_tool("cuobjdump");
-    let resources = require_success(
-        &cuobjdump,
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
-    let resources = parse_resources(&String::from_utf8(resources.stdout)?)?;
-    let sass = require_success(&cuobjdump, &[OsStr::new("--dump-sass"), cubin.as_os_str()])?;
-    let sass = String::from_utf8(sass.stdout)?;
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
     let mut gate_registers = Vec::new();
     let mut projection_registers = Vec::new();
     let mut gate_shared = Vec::new();
@@ -12811,7 +12543,7 @@ fn gate_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>>
                 )
             })?;
             require_spill_free(entry.name, resource)?;
-            if sass_function_body(&sass, entry.name).is_none() {
+            if sass_function_body(sass, entry.name).is_none() {
                 return Err(format!(
                     "cuobjdump omitted Qwen3.5 NVFP4 attention-output {label} SASS `{}`",
                     entry.name
@@ -12868,7 +12600,7 @@ fn gate_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>>
                 )
             })?;
             require_spill_free(entry.name, resource)?;
-            let body = sass_function_body(&sass, entry.name).ok_or_else(|| {
+            let body = sass_function_body(sass, entry.name).ok_or_else(|| {
                 format!(
                     "cuobjdump omitted Qwen3.5 NVFP4 attention-output {label} SASS `{}`",
                     entry.name
@@ -12920,7 +12652,27 @@ fn gate_qwen35_nvfp4_attention_output(root: &Path) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-fn verify_generator_stamp(root: &Path, baseline: &Baseline) -> Result<(), Box<dyn Error>> {
+/// The generator identity every resource baseline is stamped against.
+struct GeneratorIdentity {
+    cuda_oxide_commit: String,
+    rustc_release: String,
+    rustc_commit: String,
+    toolkit: CudaToolkitIdentity,
+    lock: String,
+}
+
+/// Collects the generator identity once per process.
+///
+/// Every gate compares the same identity against its own baseline, so the git,
+/// rustc and CUDA Toolkit probes behind it run a single time. The clean-checkout
+/// requirement is part of collecting the identity and therefore still holds
+/// before any stamp is compared.
+fn generator_identity(root: &Path) -> Result<&'static GeneratorIdentity, Box<dyn Error>> {
+    static IDENTITY: OnceLock<GeneratorIdentity> = OnceLock::new();
+    if let Some(identity) = IDENTITY.get() {
+        return Ok(identity);
+    }
+
     let backend = backend_path(root)?;
     let source = cuda_oxide_source(root, &backend)?;
     let commit = command_text("git", &["-C", path_text(&source)?, "rev-parse", "HEAD"])?;
@@ -12937,11 +12689,8 @@ fn verify_generator_stamp(root: &Path, baseline: &Baseline) -> Result<(), Box<dy
     if !changes.trim().is_empty() {
         return Err("cuda-oxide source has tracked changes; restore the pinned checkout".into());
     }
-    require_stamp(baseline, "cuda_oxide_commit", commit.trim())?;
     let rustc = require_success(Path::new("rustc"), &[OsStr::new("-vV")])?;
     let (rustc_release, rustc_commit) = parse_rustc_identity(&String::from_utf8(rustc.stdout)?)?;
-    require_stamp(baseline, "rustc_release", &rustc_release)?;
-    require_stamp(baseline, "rustc_commit", &rustc_commit)?;
 
     let ptxas = cuda_tool("ptxas");
     let cuobjdump = cuda_tool("cuobjdump");
@@ -12959,14 +12708,30 @@ fn verify_generator_stamp(root: &Path, baseline: &Baseline) -> Result<(), Box<dy
         )
         .into());
     }
-    require_stamp(baseline, "cuda_toolkit_release", &ptxas_identity.release)?;
-    require_stamp(baseline, "cuda_toolkit_version", &ptxas_identity.version)?;
 
     let lock = fs::read_to_string(root.join("Cargo.lock"))?;
+
+    Ok(IDENTITY.get_or_init(|| GeneratorIdentity {
+        cuda_oxide_commit: commit.trim().to_string(),
+        rustc_release,
+        rustc_commit,
+        toolkit: ptxas_identity,
+        lock,
+    }))
+}
+
+fn verify_generator_stamp(root: &Path, baseline: &Baseline) -> Result<(), Box<dyn Error>> {
+    let identity = generator_identity(root)?;
+    require_stamp(baseline, "cuda_oxide_commit", &identity.cuda_oxide_commit)?;
+    require_stamp(baseline, "rustc_release", &identity.rustc_release)?;
+    require_stamp(baseline, "rustc_commit", &identity.rustc_commit)?;
+    require_stamp(baseline, "cuda_toolkit_release", &identity.toolkit.release)?;
+    require_stamp(baseline, "cuda_toolkit_version", &identity.toolkit.version)?;
+
     let expected_commit = baseline
         .get("cuda_oxide_commit")
         .ok_or("baseline is missing `cuda_oxide_commit`")?;
-    if !lock.contains(&format!("rev={expected_commit}")) {
+    if !identity.lock.contains(&format!("rev={expected_commit}")) {
         return Err("Cargo.lock does not contain the stamped cuda-oxide revision".into());
     }
 
@@ -13257,43 +13022,38 @@ struct Resource {
     local: u32,
 }
 
-struct Sm120GateArtifact {
+/// The SM120 PTX module and its entry table, read and parsed once per process.
+///
+/// Every resource gate filters the same entry table out of the same module, so
+/// the text and its entries are shared the way the compiled artifact already is.
+struct Sm120GateModule {
     root: PathBuf,
     ptx_sha256: String,
-    cubin: PathBuf,
-    resources: BTreeMap<String, Resource>,
-    sass: OnceLock<Result<String, String>>,
+    ptx: &'static str,
+    entries: Vec<Entry<'static>>,
 }
 
-static SM120_GATE_ARTIFACT: Mutex<Option<&'static Sm120GateArtifact>> = Mutex::new(None);
+static SM120_GATE_MODULE: Mutex<Option<&'static Sm120GateModule>> = Mutex::new(None);
 
-fn sm120_gate_artifact(root: &Path) -> Result<&'static Sm120GateArtifact, Box<dyn Error>> {
-    let mut cached = SM120_GATE_ARTIFACT
+fn sm120_gate_module(root: &Path) -> Result<&'static Sm120GateModule, Box<dyn Error>> {
+    let mut cached = SM120_GATE_MODULE
         .lock()
-        .map_err(|_| "SM120 gate artifact cache is poisoned")?;
-    if let Some(artifact) = *cached {
-        if artifact.root != root {
+        .map_err(|_| "SM120 gate module cache is poisoned")?;
+    let ptx = root.join(PTX);
+    if let Some(module) = *cached {
+        if module.root != root {
             return Err(format!(
                 "one xtask process cannot resource-check SM120 artifacts from both `{}` and `{}`",
-                artifact.root.display(),
+                module.root.display(),
                 root.display()
             )
             .into());
         }
         // perf gate regenerates the PTX after qualification seeds this cache
-        let ptx = root.join(PTX);
-        if ptx.is_file() && artifact.ptx_sha256 == perf_artifact::file_sha256(&ptx)? {
-            return Ok(artifact);
+        if ptx.is_file() && module.ptx_sha256 == perf_artifact::file_sha256(&ptx)? {
+            return Ok(module);
         }
     }
-    // leaked so gate call sites keep borrowing a 'static artifact; rebuilds are rare
-    let artifact = &*Box::leak(Box::new(build_sm120_gate_artifact(root)?));
-    *cached = Some(artifact);
-    Ok(artifact)
-}
-
-fn build_sm120_gate_artifact(root: &Path) -> Result<Sm120GateArtifact, Box<dyn Error>> {
-    let ptx = root.join(PTX);
     if !ptx.is_file() {
         return Err(format!(
             "could not read {}; run the pinned release device build first",
@@ -13302,7 +13062,58 @@ fn build_sm120_gate_artifact(root: &Path) -> Result<Sm120GateArtifact, Box<dyn E
         .into());
     }
     let ptx_sha256 = perf_artifact::file_sha256(&ptx)?;
-    let temporary = root.join("target/tmp");
+    // leaked so the entry table and every gate borrow 'static text; rebuilds are rare
+    let text: &'static str = Box::leak(
+        fs::read_to_string(&ptx)
+            .map_err(|error| {
+                format!(
+                    "could not read {}: {error}; run the pinned release device build first",
+                    ptx.display()
+                )
+            })?
+            .into_boxed_str(),
+    );
+    let module = &*Box::leak(Box::new(Sm120GateModule {
+        root: root.to_path_buf(),
+        ptx_sha256,
+        ptx: text,
+        entries: parse_entries(text),
+    }));
+    *cached = Some(module);
+    Ok(module)
+}
+
+struct Sm120GateArtifact {
+    module: &'static Sm120GateModule,
+    cubin: PathBuf,
+    resources: BTreeMap<String, Resource>,
+    sass: OnceLock<Result<String, String>>,
+}
+
+static SM120_GATE_ARTIFACT: Mutex<Option<&'static Sm120GateArtifact>> = Mutex::new(None);
+
+fn sm120_gate_artifact(root: &Path) -> Result<&'static Sm120GateArtifact, Box<dyn Error>> {
+    let module = sm120_gate_module(root)?;
+    let mut cached = SM120_GATE_ARTIFACT
+        .lock()
+        .map_err(|_| "SM120 gate artifact cache is poisoned")?;
+    // the module cache already rejected a second root and revalidated the PTX
+    if let Some(artifact) = *cached
+        && std::ptr::eq(artifact.module, module)
+    {
+        return Ok(artifact);
+    }
+    // leaked so gate call sites keep borrowing a 'static artifact; rebuilds are rare
+    let artifact = &*Box::leak(Box::new(build_sm120_gate_artifact(module)?));
+    *cached = Some(artifact);
+    Ok(artifact)
+}
+
+fn build_sm120_gate_artifact(
+    module: &'static Sm120GateModule,
+) -> Result<Sm120GateArtifact, Box<dyn Error>> {
+    let ptx = module.root.join(PTX);
+    let temporary = module.root.join("target/tmp");
     fs::create_dir_all(&temporary)?;
     let cubin = temporary.join("sm120-resource-gates.cubin");
     require_success(
@@ -13322,8 +13133,7 @@ fn build_sm120_gate_artifact(root: &Path) -> Result<Sm120GateArtifact, Box<dyn E
     )?;
 
     Ok(Sm120GateArtifact {
-        root: root.to_path_buf(),
-        ptx_sha256,
+        module,
         cubin,
         resources: parse_resources(&String::from_utf8(output.stdout)?)?,
         sass: OnceLock::new(),
