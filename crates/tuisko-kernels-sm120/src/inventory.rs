@@ -1,129 +1,82 @@
-use crate::attention::{
-    attention_output_ptx_names, attention_qk_prepare_ptx_names, long_context_paged_gqa_ptx_names,
-    paged_gqa_ptx_names, qwen35_attention_qk_prepare_ptx_names,
-    qwen35_nvfp4_attention_output_ptx_names, qwen35_paged_gqa_ptx_names,
-    qwen36_attention_qk_prepare_ptx_names, qwen36_fp8_attention_qk_prepare_ptx_names,
-    qwen36_fp8_paged_gqa_ptx_names, qwen36_paged_gqa_ptx_names,
-};
-use crate::bf16_lm_head::qwen35_bf16_lm_head_ptx_names;
-use crate::fp8::gdn_output_ptx_names;
-use crate::fp8::{
-    fp8_down_ptx_names, fp8_gdn_input_ptx_names, fp8_lm_head_ptx_names, fp8_qkv_ptx_names,
-    fp8_swiglu_ptx_names,
-};
-use crate::gdn::{
-    gdn_prepare_ptx_names, gdn_recurrence_ptx_names, gdn_state_snapshot_ptx_name,
-    qwen35_gdn_prepare_ptx_names, qwen35_gdn_recurrence_ptx_names,
-};
-use crate::moe::{qwen36_moe_experts_ptx_names, qwen36_moe_router_ptx_names};
-use crate::mtp_bf16_attention_output::{
-    mtp_bf16_attention_output_ptx_names, qwen35_mtp_bf16_attention_output_ptx_names,
-    qwen36_mtp_bf16_attention_output_ptx_names,
-};
-use crate::mtp_bf16_fusion::{
-    mtp_bf16_fusion_prefill_ptx_names, mtp_bf16_fusion_ptx_names, qwen35_mtp_bf16_fusion_ptx_names,
-    qwen36_mtp_bf16_fusion_ptx_names,
-};
-use crate::mtp_bf16_mlp::{mtp_bf16_mlp_ptx_names, qwen35_mtp_bf16_mlp_ptx_names};
-use crate::mtp_bf16_paged_gqa::{
-    mtp_bf16_paged_gqa_ptx_names, qwen35_mtp_bf16_paged_gqa_ptx_names,
-};
-use crate::mtp_bf16_qk_prepare::{
-    mtp_bf16_qk_prepare_prefill_ptx_names, mtp_bf16_qk_prepare_ptx_names,
-    qwen35_mtp_bf16_qk_prepare_ptx_names,
-};
-use crate::mtp_bf16_qkv::{
-    mtp_bf16_qkv_prefill_ptx_names, mtp_bf16_qkv_ptx_names, qwen35_mtp_bf16_qkv_ptx_names,
-    qwen36_mtp_bf16_qkv_ptx_names,
-};
-use crate::nvfp4_down::{nvfp4_down_ptx_names, qwen35_nvfp4_down_ptx_names};
-use crate::nvfp4_gdn_input::qwen35_nvfp4_gdn_input_ptx_names;
-use crate::nvfp4_qkv::qwen35_nvfp4_qkv_ptx_names;
-use crate::nvfp4_swiglu::{nvfp4_swiglu_ptx_names, qwen35_nvfp4_swiglu_ptx_names};
-use crate::qwen36_attention_output::qwen36_attention_output_ptx_names;
-use crate::qwen36_fp8_qkv::qwen36_fp8_qkv_ptx_names;
-use crate::qwen36_gdn_input::qwen36_gdn_input_ptx_names;
-use crate::qwen36_gdn_output::qwen36_gdn_output_ptx_names;
-use crate::qwen36_mtp_bf16_moe::qwen36_mtp_bf16_moe_ptx_names;
-use crate::qwen36_nvfp4_lm_head::qwen36_nvfp4_lm_head_ptx_names;
-use crate::residual_norm::{
-    qwen35_residual_norm_ptx_names, qwen36_residual_norm_ptx_names, residual_norm_ptx_names,
-};
+/// One device-codegen crate: its PTX module stem and its family inventory.
+type Family = (&'static str, fn() -> Vec<&'static str>);
+
+/// Every SM120 device-codegen crate, in the order `xtask` names them.
+///
+/// Each entry owns exactly one PTX module, so the aggregate inventory is the
+/// concatenation of the family inventories and never an independent list.
+const FAMILIES: &[Family] = &[
+    (
+        "tuisko_kernels_sm120_norm",
+        tuisko_kernels_sm120_norm::kernel_ptx_names,
+    ),
+    (
+        "tuisko_kernels_sm120_attention",
+        tuisko_kernels_sm120_attention::kernel_ptx_names,
+    ),
+    (
+        "tuisko_kernels_sm120_nvfp4",
+        tuisko_kernels_sm120_nvfp4::kernel_ptx_names,
+    ),
+    (
+        "tuisko_kernels_sm120_fp8_projection",
+        tuisko_kernels_sm120_fp8_projection::kernel_ptx_names,
+    ),
+    (
+        "tuisko_kernels_sm120_fp8_mlp",
+        tuisko_kernels_sm120_fp8_mlp::kernel_ptx_names,
+    ),
+    (
+        "tuisko_kernels_sm120_gdn",
+        tuisko_kernels_sm120_gdn::kernel_ptx_names,
+    ),
+    (
+        "tuisko_kernels_sm120_mtp",
+        tuisko_kernels_sm120_mtp::kernel_ptx_names,
+    ),
+    (
+        "tuisko_kernels_sm120_lm_head",
+        tuisko_kernels_sm120_lm_head::kernel_ptx_names,
+    ),
+    (
+        "tuisko_kernels_sm120_moe",
+        tuisko_kernels_sm120_moe::kernel_ptx_names,
+    ),
+];
 
 /// Stable semantic inventory of every admitted SM120 entry.
 pub fn kernel_ptx_names() -> Vec<&'static str> {
-    residual_norm_ptx_names()
-        .into_iter()
-        .chain(qwen35_residual_norm_ptx_names())
-        .chain(qwen36_residual_norm_ptx_names())
-        .chain(attention_qk_prepare_ptx_names())
-        .chain(qwen35_attention_qk_prepare_ptx_names())
-        .chain(qwen36_attention_qk_prepare_ptx_names())
-        .chain(qwen36_fp8_attention_qk_prepare_ptx_names())
-        .chain(paged_gqa_ptx_names())
-        .chain(qwen35_paged_gqa_ptx_names())
-        .chain(qwen36_paged_gqa_ptx_names())
-        .chain(qwen36_fp8_paged_gqa_ptx_names())
-        .chain(qwen35_nvfp4_attention_output_ptx_names())
-        .chain(long_context_paged_gqa_ptx_names())
-        .chain(attention_output_ptx_names())
-        .chain(fp8_qkv_ptx_names())
-        .chain(fp8_gdn_input_ptx_names())
-        .chain(fp8_lm_head_ptx_names())
-        .chain(fp8_swiglu_ptx_names())
-        .chain(fp8_down_ptx_names())
-        .chain(gdn_output_ptx_names())
-        .chain(gdn_prepare_ptx_names())
-        .chain(gdn_recurrence_ptx_names())
-        .chain([gdn_state_snapshot_ptx_name()])
-        .chain(mtp_bf16_fusion_ptx_names())
-        .chain(mtp_bf16_fusion_prefill_ptx_names())
-        .chain(qwen35_mtp_bf16_fusion_ptx_names())
-        .chain(qwen36_mtp_bf16_fusion_ptx_names())
-        .chain(mtp_bf16_mlp_ptx_names())
-        .chain(qwen35_mtp_bf16_mlp_ptx_names())
-        .chain(mtp_bf16_attention_output_ptx_names())
-        .chain(qwen35_mtp_bf16_attention_output_ptx_names())
-        .chain(qwen36_mtp_bf16_attention_output_ptx_names())
-        .chain(mtp_bf16_qkv_ptx_names())
-        .chain(mtp_bf16_qkv_prefill_ptx_names())
-        .chain(qwen35_mtp_bf16_qkv_ptx_names())
-        .chain(qwen36_mtp_bf16_qkv_ptx_names())
-        .chain(mtp_bf16_qk_prepare_ptx_names())
-        .chain(mtp_bf16_qk_prepare_prefill_ptx_names())
-        .chain(qwen35_mtp_bf16_qk_prepare_ptx_names())
-        .chain(mtp_bf16_paged_gqa_ptx_names())
-        .chain(qwen35_mtp_bf16_paged_gqa_ptx_names())
-        .chain(nvfp4_swiglu_ptx_names())
-        .chain(qwen35_nvfp4_swiglu_ptx_names())
-        .chain(nvfp4_down_ptx_names())
-        .chain(qwen35_nvfp4_down_ptx_names())
-        .chain(qwen35_nvfp4_qkv_ptx_names())
-        .chain(qwen35_nvfp4_gdn_input_ptx_names())
-        .chain(qwen35_gdn_prepare_ptx_names())
-        .chain(qwen35_gdn_recurrence_ptx_names())
-        .chain(qwen35_bf16_lm_head_ptx_names())
-        .chain(qwen36_moe_router_ptx_names())
-        .chain(qwen36_moe_experts_ptx_names())
-        .chain(qwen36_mtp_bf16_moe_ptx_names())
-        .chain(qwen36_gdn_input_ptx_names())
-        .chain(qwen36_gdn_output_ptx_names())
-        .chain(qwen36_fp8_qkv_ptx_names())
-        .chain(qwen36_attention_output_ptx_names())
-        .chain(qwen36_nvfp4_lm_head_ptx_names())
-        .collect()
+    FAMILIES
+        .iter()
+        .flat_map(|(_, names)| names())
+        .collect::<Vec<_>>()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::kernel_ptx_names;
+    use super::{FAMILIES, kernel_ptx_names};
     use std::collections::{BTreeMap, BTreeSet};
+    use std::path::PathBuf;
 
-    /// Path `xtask` compiles the pinned SM120 device build to.
-    const PTX: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/cuda/tuisko_kernels_sm120.ptx"
-    );
+    /// Directory `xtask` compiles the pinned SM120 device build's modules to.
+    const PTX_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/cuda");
+
+    /// Declared entry count of every family, and their sum.
+    ///
+    /// The gate contract is three-way: emitted == declared == the sum of these
+    /// counts. A family moving an entry to another crate has to change this
+    /// table, which is what makes the move visible in review.
+    const FAMILY_COUNTS: &[(&str, usize)] = &[
+        ("tuisko_kernels_sm120_norm", 68),
+        ("tuisko_kernels_sm120_attention", 116),
+        ("tuisko_kernels_sm120_nvfp4", 140),
+        ("tuisko_kernels_sm120_fp8_projection", 148),
+        ("tuisko_kernels_sm120_fp8_mlp", 26),
+        ("tuisko_kernels_sm120_gdn", 102),
+        ("tuisko_kernels_sm120_mtp", 187),
+        ("tuisko_kernels_sm120_lm_head", 16),
+        ("tuisko_kernels_sm120_moe", 88),
+    ];
 
     /// A generic specialization is exported as `base_TID_<type hash>`, and that
     /// hash is only reproducible inside the compilation that emitted it — a
@@ -160,32 +113,52 @@ mod tests {
         assert_eq!(unique.len(), names.len());
     }
 
-    /// Reconciles the inventory against the entries the device build actually
-    /// emitted, so a kernel cannot enter the build undeclared and a declaration
-    /// cannot outlive its kernel. `gate_sm120_resources` runs it.
+    #[test]
+    fn every_family_declares_its_pinned_entry_count() {
+        let declared = FAMILIES
+            .iter()
+            .map(|(module, names)| (*module, names().len()))
+            .collect::<Vec<_>>();
+        let pinned = FAMILY_COUNTS.iter().copied().collect::<Vec<_>>();
+
+        assert_eq!(declared, pinned);
+        assert_eq!(
+            pinned.iter().map(|(_, count)| count).sum::<usize>(),
+            kernel_ptx_names().len()
+        );
+    }
+
+    /// Reconciles every family's inventory against the entries its own device
+    /// module actually emitted, so a kernel cannot enter the build undeclared,
+    /// a declaration cannot outlive its kernel, and an entry cannot silently
+    /// migrate to another family's module. `gate_sm120_resources` runs it.
     #[test]
     #[ignore = "requires the pinned SM120 device build's PTX"]
     fn inventory_matches_emitted_entries() {
-        let ptx = std::fs::read_to_string(PTX)
-            .unwrap_or_else(|error| panic!("could not read {PTX}: {error}"));
-        let emitted = counts_by_base_name(emitted_ptx_names(&ptx));
-        let declared = counts_by_base_name(kernel_ptx_names());
-        let drift = declared
-            .keys()
-            .chain(emitted.keys())
-            .map(|name| {
-                (
-                    *name,
-                    declared.get(name).copied(),
-                    emitted.get(name).copied(),
-                )
-            })
-            .filter(|(_, declared, emitted)| declared != emitted)
-            .collect::<BTreeSet<_>>();
+        for (module, names) in FAMILIES {
+            let path = PathBuf::from(PTX_DIRECTORY).join(format!("{module}.ptx"));
+            let ptx = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!("could not read {}: {error}", path.display());
+            });
+            let emitted = counts_by_base_name(emitted_ptx_names(&ptx));
+            let declared = counts_by_base_name(names());
+            let drift = declared
+                .keys()
+                .chain(emitted.keys())
+                .map(|name| {
+                    (
+                        *name,
+                        declared.get(name).copied(),
+                        emitted.get(name).copied(),
+                    )
+                })
+                .filter(|(_, declared, emitted)| declared != emitted)
+                .collect::<BTreeSet<_>>();
 
-        assert!(
-            drift.is_empty(),
-            "the inventory and the emitted PTX disagree on (name, declared, emitted): {drift:?}"
-        );
+            assert!(
+                drift.is_empty(),
+                "{module} and its emitted PTX disagree on (name, declared, emitted): {drift:?}"
+            );
+        }
     }
 }

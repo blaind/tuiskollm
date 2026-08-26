@@ -6,12 +6,16 @@ license.workspace = true
 publish = false
 
 [dependencies]
-cuda-core.workspace = true
-cuda-device.workspace = true
-cuda-host.workspace = true
-cuda-intrinsics.workspace = true
-tuisko-gpu.workspace = true
-tuisko-model.workspace = true
+tuisko-kernels-sm120-attention.workspace = true
+tuisko-kernels-sm120-common.workspace = true
+tuisko-kernels-sm120-fp8-mlp.workspace = true
+tuisko-kernels-sm120-fp8-projection.workspace = true
+tuisko-kernels-sm120-gdn.workspace = true
+tuisko-kernels-sm120-lm-head.workspace = true
+tuisko-kernels-sm120-moe.workspace = true
+tuisko-kernels-sm120-mtp.workspace = true
+tuisko-kernels-sm120-norm.workspace = true
+tuisko-kernels-sm120-nvfp4.workspace = true
 
 [lints.rust]
 missing_docs = "warn"

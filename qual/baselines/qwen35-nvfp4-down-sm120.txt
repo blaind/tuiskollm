@@ -1,4 +1,4 @@
-cuda_oxide_commit=1f4d813719012d384f2db12b88efc9314c8bf50c
+cuda_oxide_commit=0199e55572ee78cd2cea97335e5b7392a3f9be4a
 rustc_release=1.96.0-nightly
 rustc_commit=55e86c996809902e8bbad512cfb4d2c18be446d9
 cuda_toolkit_release=13.3
@@ -6,6 +6,6 @@ cuda_toolkit_version=13.3.73
 nvfp4_registers=42,89,95,96,96,106,112,112
 shared_bytes=9216
 prefill_quantize_registers=38,38,38,38
-prefill_quantize_shared_bytes=1024
+prefill_quantize_shared_bytes=0
 prefill_w4a4_registers=80,80,80,80
 prefill_w4a4_shared_bytes=37888

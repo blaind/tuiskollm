@@ -1,4 +1,4 @@
-cuda_oxide_commit=1f4d813719012d384f2db12b88efc9314c8bf50c
+cuda_oxide_commit=0199e55572ee78cd2cea97335e5b7392a3f9be4a
 rustc_release=1.96.0-nightly
 rustc_commit=55e86c996809902e8bbad512cfb4d2c18be446d9
 cuda_toolkit_release=13.3
@@ -7,4 +7,4 @@ recurrence_registers=40,40,40,40,40,40,40,40
 prefill_recurrence_registers=48,56,56,56,56,56,56,56
 prefill_recurrence_shared_bytes=35456
 prefill_epilogue_registers=22,22,22,22,22,22,22,22
-prefill_epilogue_shared_bytes=1152
+prefill_epilogue_shared_bytes=1088

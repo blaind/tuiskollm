@@ -1,4 +1,4 @@
-cuda_oxide_commit=1f4d813719012d384f2db12b88efc9314c8bf50c
+cuda_oxide_commit=0199e55572ee78cd2cea97335e5b7392a3f9be4a
 rustc_release=1.96.0-nightly
 rustc_commit=55e86c996809902e8bbad512cfb4d2c18be446d9
 cuda_toolkit_release=13.3
@@ -8,6 +8,6 @@ convolution_registers=20,20,20,20,20,20,20,22
 prefill_control_registers=25,25,25,25,25,25,25,25
 prefill_convolution_registers=19,19,20,21,21,21,21,21
 prefill_history_registers=14,16,16,16,16,16,16,16
-prefill_control_shared_bytes=1152
-prefill_convolution_shared_bytes=1024
-prefill_history_shared_bytes=1024
+prefill_control_shared_bytes=1088
+prefill_convolution_shared_bytes=0
+prefill_history_shared_bytes=0

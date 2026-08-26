@@ -8,10 +8,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const RECEIPT_SCHEMA: u32 = 1;
+const RECEIPT_SCHEMA: u32 = 2;
 const BUILD_RECEIPT: &str = "target/perf-state/build-sm120.json";
 const BENCHMARK_EXECUTABLE: &str = "target/cuda-oxide-build-sm120/release/bench-device";
-const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
+/// Every PTX module the split SM120 device build emits, in the order that
+/// binds `ptx_sha256`. A receipt covers the whole artifact, so a missing or
+/// reordered module is a different build, not a partial match.
+const PTX_MODULES: [&str; 9] = [
+    "target/cuda/tuisko_kernels_sm120_attention.ptx",
+    "target/cuda/tuisko_kernels_sm120_fp8_mlp.ptx",
+    "target/cuda/tuisko_kernels_sm120_fp8_projection.ptx",
+    "target/cuda/tuisko_kernels_sm120_gdn.ptx",
+    "target/cuda/tuisko_kernels_sm120_lm_head.ptx",
+    "target/cuda/tuisko_kernels_sm120_moe.ptx",
+    "target/cuda/tuisko_kernels_sm120_mtp.ptx",
+    "target/cuda/tuisko_kernels_sm120_norm.ptx",
+    "target/cuda/tuisko_kernels_sm120_nvfp4.ptx",
+];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct BuildReceipt {
@@ -161,7 +174,9 @@ pub(crate) fn restore_build_from_worktrees(
             &worktree.join(BENCHMARK_EXECUTABLE),
             &root.join(BENCHMARK_EXECUTABLE),
         )?;
-        copy_artifact(&worktree.join(PTX), &root.join(PTX))?;
+        for module in PTX_MODULES {
+            copy_artifact(&worktree.join(module), &root.join(module))?;
+        }
         // the sibling can rebuild between hash and copy; only locally verified bytes count
         if let Err(error) = verify_artifacts(root, &receipt) {
             eprintln!(
@@ -184,17 +199,16 @@ pub(crate) fn record_build(
     cuda_oxide_revision: &str,
 ) -> Result<(), Box<dyn Error>> {
     let executable = root.join(BENCHMARK_EXECUTABLE);
-    let ptx = root.join(PTX);
-    if !executable.is_file() || !ptx.is_file() {
+    if !executable.is_file() || !PTX_MODULES.iter().all(|module| root.join(module).is_file()) {
         return Err(
-            "cannot record SM120 build receipt without bench-device and PTX artifacts".into(),
+            "cannot record SM120 build receipt without bench-device and every PTX module".into(),
         );
     }
     let receipt = BuildReceipt {
         schema_version: RECEIPT_SCHEMA,
         device_input_sha256,
         executable_sha256: file_sha256(&executable)?,
-        ptx_sha256: file_sha256(&ptx)?,
+        ptx_sha256: ptx_modules_sha256(root)?,
         resource_baselines_sha256,
         cuda_oxide_revision: cuda_oxide_revision.to_string(),
         created_unix_milliseconds: now_milliseconds()?,
@@ -271,29 +285,68 @@ fn receipt_matches(
         && receipt.cuda_oxide_revision == cuda_oxide_revision
 }
 
+/// Ordered digest over every emitted PTX module.
+///
+/// The gates and the build receipt both bind the complete artifact, so the
+/// module order and each module's length are part of the digest.
+pub(crate) fn ptx_modules_sha256(root: &Path) -> Result<String, Box<dyn Error>> {
+    let mut digest = Sha256::new();
+    for module in PTX_MODULES {
+        let path = root.join(module);
+        let bytes = fs::read(&path).map_err(|error| {
+            format!(
+                "could not read {}: {error}; run the pinned release device build first",
+                path.display()
+            )
+        })?;
+        digest.update(module.as_bytes());
+        digest.update([0]);
+        digest.update(bytes.len().to_le_bytes());
+        digest.update(&bytes);
+    }
+
+    Ok(hex_digest(digest.finalize().as_slice()))
+}
+
+/// True when every emitted PTX module is present.
+pub(crate) fn ptx_modules_exist(root: &Path) -> bool {
+    PTX_MODULES.iter().all(|module| root.join(module).is_file())
+}
+
 fn verify_artifacts(root: &Path, receipt: &BuildReceipt) -> Result<(), Box<dyn Error>> {
-    for (label, path, expected) in [
-        (
-            "benchmark executable",
-            root.join(BENCHMARK_EXECUTABLE),
-            receipt.executable_sha256.as_str(),
-        ),
-        ("PTX", root.join(PTX), receipt.ptx_sha256.as_str()),
-    ] {
+    let executable = root.join(BENCHMARK_EXECUTABLE);
+    if !executable.is_file() {
+        return Err(format!(
+            "verified build receipt exists but its benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let actual = file_sha256(&executable)?;
+    if actual != receipt.executable_sha256 {
+        return Err(format!(
+            "verified build receipt requires benchmark executable SHA-256 {}, found {actual}",
+            receipt.executable_sha256
+        )
+        .into());
+    }
+    for module in PTX_MODULES {
+        let path = root.join(module);
         if !path.is_file() {
             return Err(format!(
-                "verified build receipt exists but its {label} is missing at {}",
+                "verified build receipt exists but its PTX module is missing at {}",
                 path.display()
             )
             .into());
         }
-        let actual = file_sha256(&path)?;
-        if actual != expected {
-            return Err(format!(
-                "verified build receipt requires {label} SHA-256 {expected}, found {actual}"
-            )
-            .into());
-        }
+    }
+    let actual = ptx_modules_sha256(root)?;
+    if actual != receipt.ptx_sha256 {
+        return Err(format!(
+            "verified build receipt requires PTX SHA-256 {}, found {actual}",
+            receipt.ptx_sha256
+        )
+        .into());
     }
 
     Ok(())
@@ -418,7 +471,7 @@ fn path_text(path: &Path) -> Result<&str, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BENCHMARK_EXECUTABLE, BUILD_RECEIPT, PTX, is_device_input, local_build_is_current,
+        BENCHMARK_EXECUTABLE, BUILD_RECEIPT, PTX_MODULES, is_device_input, local_build_is_current,
         record_build, restore_build_from_worktrees,
     };
     use std::fs;
@@ -486,10 +539,13 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        for (path, bytes) in [
-            (source.join(BENCHMARK_EXECUTABLE), b"executable".as_slice()),
-            (source.join(PTX), b"ptx".as_slice()),
-        ] {
+        let mut artifacts = vec![(source.join(BENCHMARK_EXECUTABLE), b"executable".to_vec())];
+        artifacts.extend(
+            PTX_MODULES
+                .iter()
+                .map(|module| (source.join(module), module.as_bytes().to_vec())),
+        );
+        for (path, bytes) in artifacts {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, bytes).unwrap();
         }
@@ -520,7 +576,7 @@ mod tests {
     #[test]
     fn restore_discards_copies_that_no_longer_match_the_receipt() {
         let (parent, root, _source) = scaffold_worktrees("rehash");
-        let ptx = root.join(PTX);
+        let ptx = root.join(PTX_MODULES[0]);
         fs::create_dir_all(ptx.parent().unwrap()).unwrap();
         // writes through this link vanish, standing in for a sibling rebuild mid-copy
         std::os::unix::fs::symlink("/dev/null", &ptx).unwrap();

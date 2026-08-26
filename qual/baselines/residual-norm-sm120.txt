@@ -1,11 +1,11 @@
-cuda_oxide_commit=1f4d813719012d384f2db12b88efc9314c8bf50c
+cuda_oxide_commit=0199e55572ee78cd2cea97335e5b7392a3f9be4a
 rustc_release=1.96.0-nightly
 rustc_commit=55e86c996809902e8bbad512cfb4d2c18be446d9
 cuda_toolkit_release=13.3
 cuda_toolkit_version=13.3.73
 plain_registers=20,23,23,23,23,23,23,23
 residual_registers=28,32,32,32,32,32,32,32
-shared_bytes=1152
+shared_bytes=1088
 prefill_plain_registers=23,23,23,23
 prefill_residual_registers=32,32,32,32
-prefill_shared_bytes=1152
+prefill_shared_bytes=1088

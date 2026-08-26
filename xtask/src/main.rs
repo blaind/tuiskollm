@@ -526,7 +526,27 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
         QWEN36_RESIDENT_MODEL_RESOURCE_BASELINES,
     ),
 ];
-const PTX: &str = "target/cuda/tuisko_kernels_sm120.ptx";
+/// Device-codegen crates whose PTX modules make up the SM120 artifact.
+///
+/// The kernel families are separate crates so an edit re-runs cuda-oxide
+/// device codegen only for the family it touched. cargo-oxide accepts the
+/// owners as one comma-separated list and emits one PTX module per crate.
+pub(crate) const SM120_DEVICE_CODEGEN_CRATES: &str = "tuisko-kernels-sm120-attention,tuisko-kernels-sm120-fp8-mlp,tuisko-kernels-sm120-fp8-projection,tuisko-kernels-sm120-gdn,tuisko-kernels-sm120-lm-head,tuisko-kernels-sm120-moe,tuisko-kernels-sm120-mtp,tuisko-kernels-sm120-norm,tuisko-kernels-sm120-nvfp4";
+/// Every module the SM120 device build emits, in `SM120_DEVICE_CODEGEN_CRATES`
+/// order. The resource gates read the concatenation: entry names are unique
+/// across the whole artifact, and every module is compiled on its own so the
+/// reported shared-memory footprint is the family's alone.
+const SM120_PTX_MODULES: [&str; 9] = [
+    "target/cuda/tuisko_kernels_sm120_attention.ptx",
+    "target/cuda/tuisko_kernels_sm120_fp8_mlp.ptx",
+    "target/cuda/tuisko_kernels_sm120_fp8_projection.ptx",
+    "target/cuda/tuisko_kernels_sm120_gdn.ptx",
+    "target/cuda/tuisko_kernels_sm120_lm_head.ptx",
+    "target/cuda/tuisko_kernels_sm120_moe.ptx",
+    "target/cuda/tuisko_kernels_sm120_mtp.ptx",
+    "target/cuda/tuisko_kernels_sm120_norm.ptx",
+    "target/cuda/tuisko_kernels_sm120_nvfp4.ptx",
+];
 const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build-sm120";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
 /// Trailing `tuisko-qual` harness flags: ignored device tests, unbuffered
@@ -539,7 +559,7 @@ const QUALIFICATION_IGNORED_FLAGS: &[&str] = &["--include-ignored", "--nocapture
 /// Trailing harness flags for suites whose tests are not `#[ignore]`d.
 const QUALIFICATION_NOCAPTURE_FLAGS: &[&str] = &["--nocapture"];
 const CUDA_OXIDE_REPOSITORY: &str = "https://github.com/NVlabs/cuda-oxide.git";
-const CUDA_OXIDE_REVISION: &str = "1f4d813719012d384f2db12b88efc9314c8bf50c";
+const CUDA_OXIDE_REVISION: &str = "0199e55572ee78cd2cea97335e5b7392a3f9be4a";
 const MAX_IDLE_DEVICE_MEMORY_MIB: u64 = 2_048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1560,7 +1580,7 @@ fn build_sm120(root: &Path) -> Result<(), Box<dyn Error>> {
             "--cargo-target-dir",
             CUDA_OXIDE_BUILD_TARGET,
             "--device-codegen-crate",
-            "tuisko-kernels-sm120",
+            SM120_DEVICE_CODEGEN_CRATES,
             "--",
             "--package",
             "tuisko-qual",
@@ -1669,7 +1689,7 @@ fn build_startup_benchmark(root: &Path) -> Result<(), Box<dyn Error>> {
             "--cargo-target-dir",
             CUDA_OXIDE_BUILD_TARGET,
             "--device-codegen-crate",
-            "tuisko-kernels-sm120",
+            SM120_DEVICE_CODEGEN_CRATES,
             "--",
             "--package",
             "tuisko-qual",
@@ -1691,7 +1711,7 @@ fn build_server(root: &Path) -> Result<(), Box<dyn Error>> {
             "--cargo-target-dir",
             CUDA_OXIDE_BUILD_TARGET,
             "--device-codegen-crate",
-            "tuisko-kernels-sm120",
+            SM120_DEVICE_CODEGEN_CRATES,
             "--",
             "--package",
             "tuiskollm",
@@ -1838,7 +1858,7 @@ pub(crate) fn build_residual_benchmark_target(
             "--cargo-target-dir",
             gpu.oxide_build_target(),
             "--device-codegen-crate",
-            gpu.kernel_crate(),
+            gpu.device_codegen_crates(),
             "--",
             "--package",
             "tuisko-qual",
@@ -1925,7 +1945,7 @@ fn qualify_host(root: &Path) -> Result<(), Box<dyn Error>> {
             "--cargo-target-dir",
             CUDA_OXIDE_TEST_TARGET,
             "--device-codegen-crate",
-            "tuisko-kernels-sm120",
+            SM120_DEVICE_CODEGEN_CRATES,
             "--",
             "--package",
             "tuisko-qual",
@@ -5317,7 +5337,7 @@ fn qualification_test_arguments<'a>(test_filter: &'a str, trailing: &[&'a str]) 
         "--cargo-target-dir",
         CUDA_OXIDE_TEST_TARGET,
         "--device-codegen-crate",
-        "tuisko-kernels-sm120",
+        SM120_DEVICE_CODEGEN_CRATES,
         "--",
         "--package",
         "tuisko-qual",
@@ -5551,7 +5571,7 @@ pub(crate) fn prepare_remote_qualify(
         "--cargo-target-dir".to_string(),
         gpu.oxide_test_target().to_string(),
         "--device-codegen-crate".to_string(),
-        gpu.kernel_crate().to_string(),
+        gpu.device_codegen_crates().to_string(),
         "--".to_string(),
         "--package".to_string(),
         "tuisko-qual".to_string(),
@@ -5660,6 +5680,20 @@ fn require_cuda_oxide_revision(source: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The single-module PTX path of a target that emits one.
+///
+/// SM120 emits one module per kernel family, so its gates go through
+/// `sm120_gate_module` instead of this path.
+fn single_ptx_path(gpu: gpu_target::GpuTarget) -> Result<&'static str, Box<dyn Error>> {
+    gpu.ptx_path().ok_or_else(|| {
+        format!(
+            "GPU {} emits one PTX module per kernel family and has no single module path",
+            gpu.key()
+        )
+        .into()
+    })
+}
+
 fn gate_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_residual_norm_target(root, gpu_target::GpuTarget::Sm120)
 }
@@ -5673,12 +5707,12 @@ pub(crate) fn gate_residual_norm_target(
     )?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let ptx_path = root.join(gpu.ptx_path());
     let fallback_ptx;
     let fallback_entries;
     let entries = if matches!(gpu, gpu_target::GpuTarget::Sm120) {
         &sm120_gate_module(root)?.entries
     } else {
+        let ptx_path = root.join(single_ptx_path(gpu)?);
         fallback_ptx = fs::read_to_string(&ptx_path).map_err(|error| {
             format!(
                 "could not read {}: {error}; run the pinned release device build first",
@@ -5767,6 +5801,7 @@ pub(crate) fn gate_residual_norm_target(
         let temporary = root.join("target/tmp");
         fs::create_dir_all(&temporary)?;
         let cubin = temporary.join(format!("residual-norm-{}-gate.cubin", gpu.key()));
+        let ptx_path = root.join(single_ptx_path(gpu)?);
         require_success(
             &cuda_tool("ptxas"),
             &[
@@ -6133,6 +6168,10 @@ pub(crate) fn gate_nvfp4_swiglu_target(
     root: &Path,
     gpu: gpu_target::GpuTarget,
 ) -> Result<(), Box<dyn Error>> {
+    if gpu == gpu_target::GpuTarget::Sm120 {
+        return gate_nvfp4_swiglu(root);
+    }
+
     let baseline_path = gpu
         .nvfp4_swiglu_resource_baseline()
         .ok_or_else(|| format!("GPU {} has no NVFP4 SwiGLU resource baseline", gpu.key()))?;
@@ -6184,7 +6223,7 @@ fn gate_nvfp4_a16_target(
     let baseline = parse_baseline(&fs::read_to_string(root.join(baseline_path))?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let ptx_path = root.join(gpu.ptx_path());
+    let ptx_path = root.join(single_ptx_path(gpu)?);
     let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
         format!(
             "could not read {}: {error}; run the pinned {} release build first",
@@ -6396,7 +6435,7 @@ pub(crate) fn gate_fp8_qkv_sm89(root: &Path) -> Result<(), Box<dyn Error>> {
     let baseline = parse_baseline(&fs::read_to_string(root.join(baseline_path))?)?;
     verify_generator_stamp(root, &baseline)?;
 
-    let ptx_path = root.join(gpu.ptx_path());
+    let ptx_path = root.join(single_ptx_path(gpu)?);
     let ptx = fs::read_to_string(&ptx_path).map_err(|error| {
         format!(
             "could not read {}: {error}; run the pinned SM89 release build first",
@@ -8788,11 +8827,30 @@ fn gate_qwen35_mtp_resources(root: &Path) -> Result<(), Box<dyn Error>> {
         },
     ];
 
-    let entry_count = gate_exact_resource_families(&baseline, entries, artifact, sass, &families)?;
+    let entry_count = gate_exact_resource_families(
+        &baseline,
+        entries,
+        artifact,
+        sass,
+        &families,
+        SharedFootprint::Uniform,
+    )?;
     println!(
         "Qwen3.5 MTP resource gate passed: {entry_count} entries, STACK:0 LOCAL:0, SHARED:1024; launch bounds, BF16 HMMA/cache paths, and register envelopes retained"
     );
     Ok(())
+}
+
+/// How a family group pins its per-entry shared-memory footprint.
+///
+/// `Uniform` is the stronger claim and is kept wherever it is still true. `PerEntry` exists
+/// because the Qwen3.6 MTP family spans two device-codegen crates after the kernel split
+/// (`-mtp` and `-moe`), so its entries no longer share one module arena and their real
+/// footprints differ. The Qwen3.5 MTP family lives entirely in `-mtp` and stays uniform.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SharedFootprint {
+    Uniform,
+    PerEntry,
 }
 
 fn gate_exact_resource_families(
@@ -8801,6 +8859,7 @@ fn gate_exact_resource_families(
     artifact: &Sm120GateArtifact,
     sass: &str,
     families: &[ExactResourceFamily<'_>],
+    shared_footprint: SharedFootprint,
 ) -> Result<usize, Box<dyn Error>> {
     let mut all_shared = Vec::new();
     for family in families {
@@ -8861,7 +8920,10 @@ fn gate_exact_resource_families(
         registers.sort_unstable();
         require_registers(baseline, family.register_key, &registers)?;
     }
-    require_uniform_value(baseline, "shared_bytes", &all_shared)?;
+    match shared_footprint {
+        SharedFootprint::Uniform => require_uniform_value(baseline, "shared_bytes", &all_shared)?,
+        SharedFootprint::PerEntry => require_registers(baseline, "shared_bytes", &all_shared)?,
+    }
     Ok(all_shared.len())
 }
 
@@ -8991,9 +9053,16 @@ fn gate_qwen36_mtp_resources(root: &Path) -> Result<(), Box<dyn Error>> {
         },
     ];
 
-    let entry_count = gate_exact_resource_families(&baseline, entries, artifact, sass, &families)?;
+    let entry_count = gate_exact_resource_families(
+        &baseline,
+        entries,
+        artifact,
+        sass,
+        &families,
+        SharedFootprint::PerEntry,
+    )?;
     println!(
-        "Qwen3.6 MTP resource gate passed: {entry_count} entries, STACK:0 LOCAL:0, SHARED:1024; launch bounds, BF16 tensor/scalar paths, and register envelopes retained"
+        "Qwen3.6 MTP resource gate passed: {entry_count} entries, STACK:0 LOCAL:0, per-entry SHARED pinned; launch bounds, BF16 tensor/scalar paths, and register envelopes retained"
     );
     Ok(())
 }
@@ -12290,10 +12359,12 @@ struct Resource {
     local: u32,
 }
 
-/// The SM120 PTX module and its entry table, read and parsed once per process.
+/// The SM120 PTX modules and their entry table, read and parsed once per process.
 ///
-/// Every resource gate filters the same entry table out of the same module, so
-/// the text and its entries are shared the way the compiled artifact already is.
+/// Every resource gate filters the same entry table out of the same artifact,
+/// so the text and its entries are shared the way the compiled artifact already
+/// is. Entry names are unique across the split modules, which is what lets one
+/// concatenated table serve every family.
 struct Sm120GateModule {
     root: PathBuf,
     ptx_sha256: String,
@@ -12307,7 +12378,6 @@ fn sm120_gate_module(root: &Path) -> Result<&'static Sm120GateModule, Box<dyn Er
     let mut cached = SM120_GATE_MODULE
         .lock()
         .map_err(|_| "SM120 gate module cache is poisoned")?;
-    let ptx = root.join(PTX);
     if let Some(module) = *cached {
         if module.root != root {
             return Err(format!(
@@ -12318,29 +12388,25 @@ fn sm120_gate_module(root: &Path) -> Result<&'static Sm120GateModule, Box<dyn Er
             .into());
         }
         // perf gate regenerates the PTX after qualification seeds this cache
-        if ptx.is_file() && module.ptx_sha256 == perf_artifact::file_sha256(&ptx)? {
+        if perf_artifact::ptx_modules_exist(root)
+            && module.ptx_sha256 == perf_artifact::ptx_modules_sha256(root)?
+        {
             return Ok(module);
         }
     }
-    if !ptx.is_file() {
-        return Err(format!(
-            "could not read {}; run the pinned release device build first",
-            ptx.display()
-        )
-        .into());
+    let ptx_sha256 = perf_artifact::ptx_modules_sha256(root)?;
+    let mut text = String::new();
+    for path in SM120_PTX_MODULES.map(|module| root.join(module)) {
+        text.push_str(&fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "could not read {}: {error}; run the pinned release device build first",
+                path.display()
+            )
+        })?);
+        text.push('\n');
     }
-    let ptx_sha256 = perf_artifact::file_sha256(&ptx)?;
     // leaked so the entry table and every gate borrow 'static text; rebuilds are rare
-    let text: &'static str = Box::leak(
-        fs::read_to_string(&ptx)
-            .map_err(|error| {
-                format!(
-                    "could not read {}: {error}; run the pinned release device build first",
-                    ptx.display()
-                )
-            })?
-            .into_boxed_str(),
-    );
+    let text: &'static str = Box::leak(text.into_boxed_str());
     let module = &*Box::leak(Box::new(Sm120GateModule {
         root: root.to_path_buf(),
         ptx_sha256,
@@ -12353,7 +12419,7 @@ fn sm120_gate_module(root: &Path) -> Result<&'static Sm120GateModule, Box<dyn Er
 
 struct Sm120GateArtifact {
     module: &'static Sm120GateModule,
-    cubin: PathBuf,
+    cubins: Vec<PathBuf>,
     resources: BTreeMap<String, Resource>,
     sass: OnceLock<Result<String, String>>,
 }
@@ -12377,33 +12443,54 @@ fn sm120_gate_artifact(root: &Path) -> Result<&'static Sm120GateArtifact, Box<dy
     Ok(artifact)
 }
 
+/// Compiles every emitted module on its own and merges the reported resources.
+///
+/// Compiling per module is what makes the reported shared-memory footprint
+/// truthful: `ptxas` charges a module's largest shared arena to every entry in
+/// it, so a family only ever accounts for its own.
 fn build_sm120_gate_artifact(
     module: &'static Sm120GateModule,
 ) -> Result<Sm120GateArtifact, Box<dyn Error>> {
-    let ptx = module.root.join(PTX);
     let temporary = module.root.join("target/tmp");
     fs::create_dir_all(&temporary)?;
-    let cubin = temporary.join("sm120-resource-gates.cubin");
-    require_success(
-        &cuda_tool("ptxas"),
-        &[
-            OsStr::new("-O3"),
-            OsStr::new("--gpu-name"),
-            OsStr::new("sm_120a"),
-            ptx.as_os_str(),
-            OsStr::new("--output-file"),
-            cubin.as_os_str(),
-        ],
-    )?;
-    let output = require_success(
-        &cuda_tool("cuobjdump"),
-        &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
-    )?;
+    let mut cubins = Vec::with_capacity(SM120_PTX_MODULES.len());
+    let mut resources = BTreeMap::new();
+    for path in SM120_PTX_MODULES {
+        let ptx = module.root.join(path);
+        let stem = Path::new(path)
+            .file_stem()
+            .ok_or_else(|| format!("PTX module path `{path}` has no file stem"))?;
+        let cubin = temporary.join(format!("{}-resource-gates.cubin", stem.to_string_lossy()));
+        require_success(
+            &cuda_tool("ptxas"),
+            &[
+                OsStr::new("-O3"),
+                OsStr::new("--gpu-name"),
+                OsStr::new("sm_120a"),
+                ptx.as_os_str(),
+                OsStr::new("--output-file"),
+                cubin.as_os_str(),
+            ],
+        )?;
+        let output = require_success(
+            &cuda_tool("cuobjdump"),
+            &[OsStr::new("--dump-resource-usage"), cubin.as_os_str()],
+        )?;
+        for (name, resource) in parse_resources(&String::from_utf8(output.stdout)?)? {
+            if let Some(previous) = resources.insert(name.clone(), resource) {
+                return Err(format!(
+                    "entry `{name}` is emitted by more than one SM120 module ({previous:?})"
+                )
+                .into());
+            }
+        }
+        cubins.push(cubin);
+    }
 
     Ok(Sm120GateArtifact {
         module,
-        cubin,
-        resources: parse_resources(&String::from_utf8(output.stdout)?)?,
+        cubins,
+        resources,
         sass: OnceLock::new(),
     })
 }
@@ -12411,12 +12498,19 @@ fn build_sm120_gate_artifact(
 impl Sm120GateArtifact {
     fn sass(&self) -> Result<&str, Box<dyn Error>> {
         let sass = self.sass.get_or_init(|| {
-            require_success(
-                &cuda_tool("cuobjdump"),
-                &[OsStr::new("--dump-sass"), self.cubin.as_os_str()],
-            )
-            .and_then(|output| String::from_utf8(output.stdout).map_err(Into::into))
-            .map_err(|error| error.to_string())
+            let mut merged = String::new();
+            for cubin in &self.cubins {
+                let output = require_success(
+                    &cuda_tool("cuobjdump"),
+                    &[OsStr::new("--dump-sass"), cubin.as_os_str()],
+                )
+                .and_then(|output| String::from_utf8(output.stdout).map_err(Into::into))
+                .map_err(|error: Box<dyn Error>| error.to_string())?;
+                merged.push_str(&output);
+                merged.push('\n');
+            }
+
+            Ok(merged)
         });
         match sass {
             Ok(sass) => Ok(sass),
@@ -13043,7 +13137,8 @@ mod tests {
     #[test]
     fn qualification_test_arguments_reproduce_legacy_argv() {
         // The prefix every legacy inline array spelled out before its filter,
-        // transcribed independently of `qualification_test_arguments`.
+        // transcribed independently of `qualification_test_arguments`. The
+        // owner list is the one value the crate split moved.
         const LEGACY_PREFIX: &[&str] = &[
             "test",
             "--arch",
@@ -13051,7 +13146,7 @@ mod tests {
             "--cargo-target-dir",
             "target/cuda-oxide-test",
             "--device-codegen-crate",
-            "tuisko-kernels-sm120",
+            super::SM120_DEVICE_CODEGEN_CRATES,
             "--",
             "--package",
             "tuisko-qual",

@@ -4,11 +4,19 @@ pub(crate) use tuisko_targets::TargetProfile as GpuTarget;
 
 /// Repository-specific build metadata for one shared target profile.
 pub(crate) trait BuildTargetProfile {
+    /// Cargo package that owns this target's kernels. Only the remote gate
+    /// path names it; the device build takes `device_codegen_crates`.
+    #[cfg_attr(not(any(feature = "remote", test)), allow(dead_code))]
     fn kernel_crate(self) -> &'static str;
+    fn device_codegen_crates(self) -> &'static str;
     fn qualification_feature(self) -> &'static str;
     fn oxide_test_target(self) -> &'static str;
     fn oxide_build_target(self) -> &'static str;
-    fn ptx_path(self) -> &'static str;
+    /// Path of this target's single PTX module, when it has one.
+    ///
+    /// SM120 splits its device code across per-family crates, so it emits one
+    /// module per family instead and has no single path.
+    fn ptx_path(self) -> Option<&'static str>;
     fn residual_resource_baseline(self) -> &'static str;
     fn nvfp4_swiglu_resource_baseline(self) -> Option<&'static str>;
     fn nvfp4_down_resource_baseline(self) -> Option<&'static str>;
@@ -19,6 +27,18 @@ impl BuildTargetProfile for GpuTarget {
     fn kernel_crate(self) -> &'static str {
         match self {
             Self::Sm120 => "tuisko-kernels-sm120",
+            Self::Sm89 => "tuisko-kernels-sm89",
+            Self::Sm86 => "tuisko-kernels-sm86",
+        }
+    }
+
+    /// Owners cuda-oxide compiles device code for, as one comma-separated list.
+    ///
+    /// SM120 splits its kernels across per-family crates, so its owner list is
+    /// not its facade package name.
+    fn device_codegen_crates(self) -> &'static str {
+        match self {
+            Self::Sm120 => crate::SM120_DEVICE_CODEGEN_CRATES,
             Self::Sm89 => "tuisko-kernels-sm89",
             Self::Sm86 => "tuisko-kernels-sm86",
         }
@@ -48,11 +68,11 @@ impl BuildTargetProfile for GpuTarget {
         }
     }
 
-    fn ptx_path(self) -> &'static str {
+    fn ptx_path(self) -> Option<&'static str> {
         match self {
-            Self::Sm120 => "target/cuda/tuisko_kernels_sm120.ptx",
-            Self::Sm89 => "target/cuda/tuisko_kernels_sm89.ptx",
-            Self::Sm86 => "target/cuda/tuisko_kernels_sm86.ptx",
+            Self::Sm120 => None,
+            Self::Sm89 => Some("target/cuda/tuisko_kernels_sm89.ptx"),
+            Self::Sm86 => Some("target/cuda/tuisko_kernels_sm86.ptx"),
         }
     }
 
@@ -100,6 +120,14 @@ mod tests {
 
     #[test]
     fn build_target_table_is_exact_and_complete() {
+        assert_eq!(
+            GpuTarget::ALL.map(BuildTargetProfile::device_codegen_crates),
+            [
+                crate::SM120_DEVICE_CODEGEN_CRATES,
+                "tuisko-kernels-sm89",
+                "tuisko-kernels-sm86",
+            ]
+        );
         let rows = GpuTarget::ALL.map(|target| {
             (
                 target,
@@ -118,7 +146,7 @@ mod tests {
                     GpuTarget::Sm120,
                     "tuisko-kernels-sm120",
                     "device",
-                    "target/cuda/tuisko_kernels_sm120.ptx",
+                    None,
                     "qual/baselines/residual-norm-sm120.txt",
                     "target/cuda-oxide-build-sm120",
                 ),
@@ -126,7 +154,7 @@ mod tests {
                     GpuTarget::Sm89,
                     "tuisko-kernels-sm89",
                     "sm89",
-                    "target/cuda/tuisko_kernels_sm89.ptx",
+                    Some("target/cuda/tuisko_kernels_sm89.ptx"),
                     "qual/baselines/residual-norm-sm89.txt",
                     "target/cuda-oxide-build-sm89",
                 ),
@@ -134,7 +162,7 @@ mod tests {
                     GpuTarget::Sm86,
                     "tuisko-kernels-sm86",
                     "sm86",
-                    "target/cuda/tuisko_kernels_sm86.ptx",
+                    Some("target/cuda/tuisko_kernels_sm86.ptx"),
                     "qual/baselines/residual-norm-sm86.txt",
                     "target/cuda-oxide-build-sm86",
                 ),
