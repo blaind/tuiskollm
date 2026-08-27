@@ -10,7 +10,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
-use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
+use tuisko_model::{
+    Arch, CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext,
+};
 
 pub use error::{FrontendError, FrontendErrorCode, FrontendResult};
 
@@ -42,7 +44,12 @@ mod private {
     impl Sealed for tuisko_model::Qwen35_9B {}
 
     impl Sealed for tuisko_model::Qwen36Moe35B {}
+
+    impl Sealed for tuisko_model::Qwen38FlashNext {}
 }
+
+/// Keeps frontend stopping and engram segmentation on the same end-of-text token.
+const _: () = assert!(Qwen38FlashNext::EOS_TOKEN_ID == END_OF_TEXT_ID);
 
 /// Shape the pinned `generation_config.json` uses to state sampling defaults.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +105,22 @@ impl TokenizedSchema for Qwen35_9B {
 
 impl TokenizedSchema for Qwen36Moe35B {
     const TOKENIZER_ENTRIES: usize = 248_070;
+    const EOS_IDS: &'static [u32] = &[IM_END_ID, END_OF_TEXT_ID];
+    const GENERATION_ADMISSION: GenerationAdmission = GenerationAdmission::Sampled;
+    const DEFAULT_GENERATION: GenerationDefaults = GenerationDefaults {
+        temperature: 1.0,
+        top_p: 0.95,
+        top_k: 20,
+    };
+    const SPECIAL_TOKENS: &'static [&'static str] = &SPECIAL_TOKEN_LITERALS;
+}
+
+/// Exact frontend metadata for the pinned Qwen3.8-Flash-Next revision.
+///
+/// Its tokenizer happens to match [`Qwen38_27B`], but the values remain independently pinned.
+/// The admitted template is multimodal; the current transport supplies text content only.
+impl TokenizedSchema for Qwen38FlashNext {
+    const TOKENIZER_ENTRIES: usize = 248_077;
     const EOS_IDS: &'static [u32] = &[IM_END_ID, END_OF_TEXT_ID];
     const GENERATION_ADMISSION: GenerationAdmission = GenerationAdmission::Sampled;
     const DEFAULT_GENERATION: GenerationDefaults = GenerationDefaults {
@@ -1342,17 +1365,21 @@ fn parse_greedy_generation_defaults(
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedPrefix, ChatMessage, ChatTemplateOptions, FrontendErrorCode, FrontendResult,
-        PROMPT_BLOCK_START, PromptPrefixEntry, TextFrontend, TextFrontendOptions, TokenizedSchema,
-        best_cached_prefix, byte_level_table, common_prefix_bytes, finish_pending,
+        CONTROL_TOKEN_IDS, CachedPrefix, ChatFunctionCall, ChatMessage, ChatTemplateOptions,
+        ChatToolCall, END_OF_TEXT_ID, FrontendErrorCode, FrontendResult, GENERATION_CONFIG_FILE,
+        GenerationAdmission, GenerationDefaults, IM_START_ID, PROMPT_BLOCK_START,
+        PromptPrefixEntry, SPECIAL_TOKEN_LITERALS, TextFrontend, TextFrontendOptions,
+        TokenizedSchema, best_cached_prefix, byte_level_table, common_prefix_bytes, finish_pending,
         is_valid_utf8_prefix, parse_generation_defaults, parse_stop_ids, push_stream_byte,
-        utf8_sequence_length, validate_added_token_alphabet,
+        read_json, utf8_sequence_length, validate_added_token_alphabet, validate_tokenizer,
     };
     use serde_json::json;
     use std::collections::{HashSet, VecDeque};
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::{AddedToken, Tokenizer};
-    use tuisko_model::{CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
+    use tuisko_model::{
+        Arch, CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext,
+    };
 
     // Transformers 5.2.0 `apply_chat_template` and tokenizer output from the pinned snapshot.
     const QWEN36_HELLO_THINKING: [u32; 11] = [
@@ -1487,6 +1514,10 @@ mod tests {
             parse_stop_ids::<Qwen36Moe35B>(&qwen36).unwrap(),
             [248046, 248044]
         );
+        assert_eq!(
+            parse_stop_ids::<Qwen38FlashNext>(&json!({"eos_token_id": [248046, 248044]})).unwrap(),
+            [248046, 248044]
+        );
     }
 
     #[test]
@@ -1515,6 +1546,15 @@ mod tests {
             json!({"eos_token_id": [248044, 248046]}),
         ] {
             let error = parse_stop_ids::<Qwen36Moe35B>(&generation).unwrap_err();
+            assert_eq!(error.code(), FrontendErrorCode::Contract);
+        }
+        for generation in [
+            json!({}),
+            json!({"eos_token_id": 248044}),
+            json!({"eos_token_id": [248044, 248046]}),
+            json!({"eos_token_id": [248046, 248044, 248069]}),
+        ] {
+            let error = parse_stop_ids::<Qwen38FlashNext>(&generation).unwrap_err();
             assert_eq!(error.code(), FrontendErrorCode::Contract);
         }
     }
@@ -1692,6 +1732,10 @@ mod tests {
             parse_generation_defaults::<Qwen36Moe35B>(&exact).unwrap(),
             defaults
         );
+        assert_eq!(
+            parse_generation_defaults::<Qwen38FlashNext>(&exact).unwrap(),
+            defaults
+        );
 
         for changed in [
             json!({"do_sample": false, "temperature": 1.0, "top_p": 0.95, "top_k": 20}),
@@ -1700,6 +1744,7 @@ mod tests {
             json!({"do_sample": true, "temperature": 1.0, "top_p": 0.95, "top_k": 40}),
         ] {
             assert!(parse_generation_defaults::<Qwen38_27B>(&changed).is_err());
+            assert!(parse_generation_defaults::<Qwen38FlashNext>(&changed).is_err());
         }
 
         let defaults =
@@ -1886,5 +1931,493 @@ mod tests {
         let aliased = TextFrontend::open_qwen36(&snapshot).unwrap();
 
         assert_pinned_admission(&snapshot, &aliased);
+    }
+
+    /// Vision controls that the text-only path must not render.
+    const QWEN38_FLASH_NEXT_VISION_TOKENS: [(&str, u32); 5] = [
+        ("<|vision_start|>", 248_053),
+        ("<|vision_end|>", 248_054),
+        ("<|vision_pad|>", 248_055),
+        ("<|image_pad|>", 248_056),
+        ("<|video_pad|>", 248_057),
+    ];
+
+    /// Number of tokens the generated-assistant header contributes when thinking stays open.
+    const QWEN38_FLASH_NEXT_THINKING_HEADER_TOKENS: usize = 5;
+
+    /// One byte-exact text-only prompt fixture.
+    struct PromptFixture {
+        name: &'static str,
+        messages: Vec<ChatMessage>,
+        options: ChatTemplateOptions,
+        rendered: &'static str,
+        token_ids: &'static [u32],
+    }
+
+    fn reasoning_effort(effort: &str) -> ChatTemplateOptions {
+        ChatTemplateOptions {
+            reasoning_effort: Some(effort.into()),
+            ..ChatTemplateOptions::default()
+        }
+    }
+
+    fn multi_turn_messages() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::new("system", "You are terse."),
+            ChatMessage::new("user", "First question"),
+            ChatMessage {
+                reasoning_content: Some("earlier thought".into()),
+                ..ChatMessage::new("assistant", "First answer")
+            },
+            ChatMessage::new("user", "Second question"),
+        ]
+    }
+
+    fn tool_flow_messages() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::new("user", "Weather in Oulu?"),
+            ChatMessage {
+                tool_calls: vec![ChatToolCall {
+                    id: Some("call_1".into()),
+                    kind: "function".into(),
+                    function: ChatFunctionCall {
+                        name: "get_weather".into(),
+                        arguments: json!({"city": "Oulu"}),
+                    },
+                }],
+                ..ChatMessage::new("assistant", "")
+            },
+            ChatMessage {
+                tool_call_id: Some("call_1".into()),
+                ..ChatMessage::new("tool", "{\"c\": 3}")
+            },
+        ]
+    }
+
+    /// Golden renders and token IDs from the pinned files and Transformers 5.2.0.
+    fn qwen38_flash_next_prompt_fixtures() -> Vec<PromptFixture> {
+        vec![
+            PromptFixture {
+                name: "hello-xhigh",
+                messages: vec![ChatMessage::new("user", "Hello")],
+                options: ChatTemplateOptions::default(),
+                rendered: "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                token_ids: &[
+                    248_045, 8678, 198, 24_342, 286, 4879, 369, 716, 310, 830, 11_553, 13, 5044,
+                    1683, 15_060, 1472, 279, 3274, 11, 9307, 1328, 30_800, 11, 2814, 47_675,
+                    25_605, 11, 321, 60_445, 55_404, 11, 27_224, 11, 321, 30_246, 303, 279, 1534,
+                    4087, 13, 248_046, 198, 248_045, 846, 198, 9419, 248_046, 198, 248_045, 74_455,
+                    198, 248_068, 198,
+                ],
+            },
+            PromptFixture {
+                name: "hello-no-thinking",
+                messages: vec![ChatMessage::new("user", "Hello")],
+                options: ChatTemplateOptions {
+                    enable_thinking: Some(false),
+                    ..ChatTemplateOptions::default()
+                },
+                rendered: "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                token_ids: &[
+                    248_045, 846, 198, 9419, 248_046, 198, 248_045, 74_455, 198, 248_068, 271,
+                    248_069, 271,
+                ],
+            },
+            PromptFixture {
+                name: "hello-low",
+                messages: vec![ChatMessage::new("user", "Hello")],
+                options: reasoning_effort("low"),
+                rendered: "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                token_ids: &[
+                    248_045, 8678, 198, 24_342, 286, 4879, 369, 716, 310, 3238, 13, 13_262, 678,
+                    7047, 9522, 321, 10_419, 11, 6992, 5774, 310, 279, 16_198, 1973, 24_366,
+                    24_150, 362, 13, 248_046, 198, 248_045, 846, 198, 9419, 248_046, 198, 248_045,
+                    74_455, 198, 248_068, 198,
+                ],
+            },
+            PromptFixture {
+                name: "hello-medium",
+                messages: vec![ChatMessage::new("user", "Hello")],
+                options: reasoning_effort("medium"),
+                rendered: "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                token_ids: &[
+                    248_045, 846, 198, 9419, 248_046, 198, 248_045, 74_455, 198, 248_068, 198,
+                ],
+            },
+            PromptFixture {
+                name: "multi-turn",
+                messages: multi_turn_messages(),
+                options: reasoning_effort("medium"),
+                rendered: "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nFirst question<|im_end|>\n<|im_start|>assistant\n<think>\nearlier thought\n</think>\n\nFirst answer<|im_end|>\n<|im_start|>user\nSecond question<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                token_ids: &[
+                    248_045, 8678, 198, 2523, 513, 48_834, 13, 248_046, 198, 248_045, 846, 198,
+                    5170, 3296, 248_046, 198, 248_045, 74_455, 198, 248_068, 198, 664, 5446, 3272,
+                    198, 248_069, 271, 5170, 4087, 248_046, 198, 248_045, 846, 198, 15_207, 3296,
+                    248_046, 198, 248_045, 74_455, 198, 248_068, 198,
+                ],
+            },
+            PromptFixture {
+                name: "multi-turn-dropped-thinking",
+                messages: multi_turn_messages(),
+                options: ChatTemplateOptions {
+                    preserve_thinking: Some(false),
+                    ..reasoning_effort("medium")
+                },
+                rendered: "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nFirst question<|im_end|>\n<|im_start|>assistant\nFirst answer<|im_end|>\n<|im_start|>user\nSecond question<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                token_ids: &[
+                    248_045, 8678, 198, 2523, 513, 48_834, 13, 248_046, 198, 248_045, 846, 198,
+                    5170, 3296, 248_046, 198, 248_045, 74_455, 198, 5170, 4087, 248_046, 198,
+                    248_045, 846, 198, 15_207, 3296, 248_046, 198, 248_045, 74_455, 198, 248_068,
+                    198,
+                ],
+            },
+            PromptFixture {
+                name: "tool-flow",
+                messages: tool_flow_messages(),
+                options: reasoning_effort("medium"),
+                rendered: "<|im_start|>user\nWeather in Oulu?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOulu\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"c\": 3}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n",
+                token_ids: &[
+                    248_045, 846, 198, 28_034, 303, 496, 23_639, 30, 248_046, 198, 248_045, 74_455,
+                    198, 248_068, 271, 248_069, 271, 248_058, 198, 27, 1628, 27_362, 67_017, 29,
+                    198, 27, 15_704, 28, 8656, 29, 198, 46, 23_639, 198, 510, 15_704, 29, 198, 510,
+                    1628, 29, 198, 248_059, 248_046, 198, 248_045, 846, 198, 248_066, 198, 4754,
+                    66, 763, 220, 18, 92, 198, 248_067, 248_046, 198, 248_045, 74_455, 198,
+                    248_068, 198,
+                ],
+            },
+            PromptFixture {
+                name: "unicode",
+                messages: vec![ChatMessage::new("user", "Hei 🚀 北")],
+                options: reasoning_effort("medium"),
+                rendered: "<|im_start|>user\nHei 🚀 北<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                token_ids: &[
+                    248_045, 846, 198, 1465, 72, 10_838, 248, 222, 220, 96_443, 248_046, 198,
+                    248_045, 74_455, 198, 248_068, 198,
+                ],
+            },
+        ]
+    }
+
+    #[test]
+    fn qwen38_flash_next_pins_its_frontend_contract() {
+        assert_eq!(Qwen38FlashNext::TOKENIZER_ENTRIES, 248_077);
+        assert_eq!(Qwen38FlashNext::EOS_IDS, [248_046, 248_044]);
+        assert_eq!(
+            Qwen38FlashNext::GENERATION_ADMISSION,
+            GenerationAdmission::Sampled
+        );
+        assert_eq!(
+            Qwen38FlashNext::DEFAULT_GENERATION,
+            GenerationDefaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+            }
+        );
+        assert_eq!(Qwen38FlashNext::SPECIAL_TOKENS, SPECIAL_TOKEN_LITERALS);
+
+        // Equal widths are checkpoint facts; neither target derives its value from the other.
+        assert_eq!(Qwen38FlashNext::VOCAB, Qwen38_27B::VOCAB);
+        assert_eq!(
+            Qwen38FlashNext::TOKENIZER_ENTRIES,
+            Qwen38_27B::TOKENIZER_ENTRIES
+        );
+        const {
+            assert!(Qwen38FlashNext::TOKENIZER_ENTRIES < Qwen38FlashNext::VOCAB);
+        }
+
+        assert_eq!(Qwen38FlashNext::EOS_TOKEN_ID, END_OF_TEXT_ID);
+        assert!(Qwen38FlashNext::EOS_IDS.contains(&Qwen38FlashNext::EOS_TOKEN_ID));
+    }
+
+    fn tokenizer_with_inventory(entries: usize, control_shift: u32) -> Tokenizer {
+        let entries = u32::try_from(entries).expect("test inventory fits u32");
+        let vocab = (0..entries)
+            .map(|id| {
+                let control = CONTROL_TOKEN_IDS.iter().find_map(|&(literal, pinned)| {
+                    (pinned + control_shift == id).then_some(literal)
+                });
+                (control.map_or_else(|| id.to_string(), str::to_owned), id)
+            })
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("0".into())
+            .build()
+            .unwrap();
+
+        Tokenizer::new(model)
+    }
+
+    #[test]
+    fn qwen38_flash_next_rejects_a_different_tokenizer_inventory() {
+        let byte_table = byte_level_table();
+
+        validate_tokenizer::<Qwen38FlashNext>(&tokenizer_with_inventory(248_077, 0), &byte_table)
+            .unwrap();
+        for (entries, shift) in [(248_070, 0), (248_320, 0), (248_077, 1)] {
+            let error = validate_tokenizer::<Qwen38FlashNext>(
+                &tokenizer_with_inventory(entries, shift),
+                &byte_table,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), FrontendErrorCode::Contract);
+        }
+    }
+
+    fn qwen38_flash_next_snapshot() -> CheckpointSnapshot<Qwen38FlashNext> {
+        pinned_snapshot::<Qwen38FlashNext>("TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT")
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT with the pinned complete checkpoint"]
+    fn qwen38_flash_next_snapshot_admits_the_frontend_contract() {
+        let snapshot = qwen38_flash_next_snapshot();
+        let aliased =
+            TextFrontend::open_with_options(&snapshot, TextFrontendOptions::default()).unwrap();
+
+        assert_pinned_admission(&snapshot, &aliased);
+        assert_eq!(aliased.stop_ids(), [248_046, 248_044]);
+        assert_eq!(
+            aliased.generation_defaults(),
+            GenerationDefaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+            }
+        );
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT with the pinned complete checkpoint"]
+    fn qwen38_flash_next_snapshot_matches_text_fixtures() {
+        let snapshot = qwen38_flash_next_snapshot();
+        let frontend = TextFrontend::open(&snapshot).unwrap();
+
+        for fixture in qwen38_flash_next_prompt_fixtures() {
+            let rendered = frontend
+                .render_chat(&fixture.messages, true, &fixture.options)
+                .unwrap();
+            assert_eq!(rendered, fixture.rendered, "{}", fixture.name);
+
+            let encoding = frontend
+                .encode_chat_with_report(&fixture.messages, &fixture.options)
+                .unwrap();
+            assert_eq!(encoding.token_ids, fixture.token_ids, "{}", fixture.name);
+            assert_eq!(encoding.rendered_bytes, fixture.rendered.len());
+
+            // Round-trip: the byte-level tokenizer must reproduce the prompt exactly, and the
+            // message boundary must land on the generated-assistant header.
+            assert_eq!(
+                frontend.decode(&encoding.token_ids, false).unwrap(),
+                fixture.rendered,
+                "{}",
+                fixture.name
+            );
+            let boundary = fixture
+                .rendered
+                .rfind(super::GENERATION_BLOCK_START)
+                .unwrap();
+            assert_eq!(
+                frontend
+                    .decode(
+                        &encoding.token_ids[..encoding.message_boundary_tokens],
+                        false
+                    )
+                    .unwrap(),
+                fixture.rendered[..boundary],
+                "{}",
+                fixture.name
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT with the pinned complete checkpoint"]
+    fn qwen38_flash_next_snapshot_keeps_vision_controls_out_of_text() {
+        let snapshot = qwen38_flash_next_snapshot();
+        let frontend = TextFrontend::open(&snapshot).unwrap();
+
+        for (literal, id) in QWEN38_FLASH_NEXT_VISION_TOKENS {
+            // The multimodal family is present in the pinned tokenizer: absence from prompts is
+            // the template's text-only path, not a missing entry.
+            assert_eq!(frontend.decode(&[id], false).unwrap(), literal);
+            // Nothing generated on a vision branch can leak into streamed text either.
+            assert_eq!(frontend.streaming_decoder().push(id).unwrap(), None);
+        }
+
+        for fixture in qwen38_flash_next_prompt_fixtures() {
+            let encoding = frontend
+                .encode_chat_with_report(&fixture.messages, &fixture.options)
+                .unwrap();
+            for (literal, id) in QWEN38_FLASH_NEXT_VISION_TOKENS {
+                assert!(
+                    !fixture.rendered.contains(literal),
+                    "{} rendered {literal}",
+                    fixture.name
+                );
+                assert!(
+                    !encoding.token_ids.contains(&id),
+                    "{} encoded {literal}",
+                    fixture.name
+                );
+            }
+        }
+    }
+
+    /// Exact tool-call syntax emitted by the pinned template.
+    const QWEN38_FLASH_NEXT_TOOL_CALL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n";
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT with the pinned complete checkpoint"]
+    fn qwen38_flash_next_snapshot_renders_tool_definitions() {
+        let snapshot = qwen38_flash_next_snapshot();
+        let frontend = TextFrontend::open(&snapshot).unwrap();
+        let options = ChatTemplateOptions {
+            tools: vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            })],
+            ..reasoning_effort("medium")
+        };
+        let messages = [ChatMessage::new("user", "Weather in Oulu?")];
+        let rendered = frontend.render_chat(&messages, true, &options).unwrap();
+
+        assert!(
+            rendered.starts_with(
+                "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+            ),
+            "{rendered}"
+        );
+        // Pin minijinja's compact and escaped `tojson` output separately from Transformers.
+        assert!(
+            rendered.contains(
+                "{\"function\":{\"description\":\"Get weather\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}},\"type\":\"function\"}\n</tools>"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(QWEN38_FLASH_NEXT_TOOL_CALL_INSTRUCTIONS),
+            "{rendered}"
+        );
+        assert!(
+            rendered.ends_with(
+                "</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Oulu?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+            ),
+            "{rendered}"
+        );
+
+        // A tool list never opens a vision branch either.
+        for (literal, _) in QWEN38_FLASH_NEXT_VISION_TOKENS {
+            assert!(!rendered.contains(literal), "{rendered}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT with the pinned complete checkpoint"]
+    fn qwen38_flash_next_snapshot_prepends_no_bos() {
+        let snapshot = qwen38_flash_next_snapshot();
+        let frontend = TextFrontend::open(&snapshot).unwrap();
+        let generation = read_json(&snapshot.root().join(GENERATION_CONFIG_FILE)).unwrap();
+
+        // `bos_token_id` restates the pad and end-of-text identity; `tokenizer_config.json` sets
+        // `add_bos_token: false` with a null `bos_token`, so no admitted path prepends it.
+        assert_eq!(generation["bos_token_id"], json!(END_OF_TEXT_ID));
+        assert_eq!(generation["pad_token_id"], json!(END_OF_TEXT_ID));
+
+        for fixture in qwen38_flash_next_prompt_fixtures() {
+            let encoding = frontend
+                .encode_chat_with_report(&fixture.messages, &fixture.options)
+                .unwrap();
+            assert_eq!(encoding.token_ids[0], IM_START_ID, "{}", fixture.name);
+            assert!(
+                !encoding.token_ids.contains(&END_OF_TEXT_ID),
+                "{}",
+                fixture.name
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT with the pinned complete checkpoint"]
+    fn qwen38_flash_next_snapshot_streams_utf8() {
+        let snapshot = qwen38_flash_next_snapshot();
+        let frontend = TextFrontend::open(&snapshot).unwrap();
+        let generated = "Sää Oulussa: 3 °C 🚀 北風";
+        let token_ids = frontend.encode(generated).unwrap();
+        assert_eq!(frontend.decode(&token_ids, false).unwrap(), generated);
+
+        let mut decoder = frontend.streaming_decoder();
+        let mut streamed = String::new();
+        for (index, &token_id) in token_ids.iter().enumerate() {
+            // A stop token mid-stream must be skipped without disturbing a pending sequence.
+            if index == token_ids.len() / 2 {
+                assert_eq!(decoder.push(248_046).unwrap(), None);
+            }
+            if let Some(delta) = decoder.push(token_id).unwrap() {
+                streamed.push_str(&delta);
+            }
+        }
+        if let Some(delta) = decoder.finish() {
+            streamed.push_str(&delta);
+        }
+
+        assert_eq!(streamed, generated);
+        assert_eq!(decoder.text(), generated);
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT with the pinned complete checkpoint"]
+    fn qwen38_flash_next_snapshot_reuses_prompt_prefix() {
+        let snapshot = qwen38_flash_next_snapshot();
+        let frontend = TextFrontend::open(&snapshot).unwrap();
+        let options = reasoning_effort("medium");
+        let first = vec![ChatMessage::new("user", "First question")];
+        let follow_up = vec![
+            ChatMessage::new("user", "First question"),
+            ChatMessage {
+                reasoning_content: Some("earlier thought".into()),
+                ..ChatMessage::new("assistant", "First answer")
+            },
+            ChatMessage::new("user", "Second question"),
+        ];
+
+        let (opening, metrics) = frontend.encode_chat_with_metrics(&first, &options).unwrap();
+        assert_eq!(opening.reused_tokens, 0);
+        assert_eq!(metrics.miss_reason, "cache-empty");
+        assert_eq!(
+            opening.message_boundary_tokens + QWEN38_FLASH_NEXT_THINKING_HEADER_TOKENS,
+            opening.token_ids.len()
+        );
+
+        let (extended, metrics) = frontend
+            .encode_chat_with_metrics(&follow_up, &options)
+            .unwrap();
+        assert_eq!(metrics.miss_reason, "");
+        // The shared block ends at the `<|im_start|>` that opened the first prompt's generated
+        // turn, so every token through the first user message is reused verbatim.
+        assert_eq!(extended.reused_tokens, opening.message_boundary_tokens);
+        assert!(extended.fresh_bytes < extended.rendered_bytes);
+        assert_eq!(
+            extended.token_ids[..extended.reused_tokens],
+            opening.token_ids[..extended.reused_tokens]
+        );
+
+        // The identical prompt is served entirely from the cache.
+        let (repeated, metrics) = frontend
+            .encode_chat_with_metrics(&follow_up, &options)
+            .unwrap();
+        assert_eq!(metrics.miss_reason, "");
+        assert_eq!(repeated.token_ids, extended.token_ids);
+        assert_eq!(repeated.reused_tokens, repeated.token_ids.len());
+        assert_eq!(repeated.fresh_bytes, 0);
     }
 }
