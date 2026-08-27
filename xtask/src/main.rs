@@ -32,6 +32,8 @@ const QWEN38_FLASH_NEXT_PLE_RESOURCE_BASELINE: &str =
 const QWEN38_FLASH_NEXT_PLE_TEST_FILTER: &str = "qwen38_flash_next_ple_suite_";
 const QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER: &str = "qwen38_flash_next_projection";
 const QWEN38_FLASH_NEXT_LM_HEAD_TEST_FILTER: &str = "qwen38_flash_next_lm_head";
+const QWEN38_FLASH_NEXT_GDN_LAYER_TEST_FILTER: &str = "qwen38_flash_next_gdn_moe_layer";
+const QWEN38_FLASH_NEXT_QSA_LAYER_TEST_FILTER: &str = "qwen38_flash_next_qsa_moe_layer";
 const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-residual-norm-sm120.txt";
 const QWEN35_RESIDUAL_NORM_TEST_FILTER: &str = "qwen35_residual_norm";
@@ -448,6 +450,18 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
     (
         "qwen38-flash-next-lm-head",
         &[QWEN38_FLASH_NEXT_LM_HEAD_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen38-flash-next-gdn-layer",
+        &[QWEN38_FLASH_NEXT_GDN_RECURRENCE_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen38-flash-next-qsa-layer",
+        &[QWEN38_FLASH_NEXT_QSA_ATTENTION_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen38-flash-next-ple-layer",
+        &[QWEN38_FLASH_NEXT_PLE_RESOURCE_BASELINE],
     ),
     (
         "qwen36-gdn-recurrence",
@@ -1269,6 +1283,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "qualify-qwen38-flash-next-lm-head",
         qualify_qwen38_flash_next_lm_head,
     ),
+    forwarded(
+        "qualify-qwen38-flash-next-gdn-layer",
+        qualify_qwen38_flash_next_gdn_layer,
+    ),
+    forwarded(
+        "qualify-qwen38-flash-next-qsa-layer",
+        qualify_qwen38_flash_next_qsa_layer,
+    ),
     no_args("qualify-gdn-recurrence", qualify_gdn_recurrence),
     no_args("qualify-gdn-output", qualify_gdn_output),
     no_args("qualify-attention-qk-prepare", qualify_attention_qk_prepare),
@@ -1418,6 +1440,18 @@ const SUBCOMMANDS: &[Subcommand] = &[
     forwarded(
         "bench-qwen38-flash-next-lm-head",
         bench_qwen38_flash_next_lm_head,
+    ),
+    forwarded(
+        "bench-qwen38-flash-next-gdn-layer",
+        bench_qwen38_flash_next_gdn_layer,
+    ),
+    forwarded(
+        "bench-qwen38-flash-next-qsa-layer",
+        bench_qwen38_flash_next_qsa_layer,
+    ),
+    forwarded(
+        "bench-qwen38-flash-next-ple-layer",
+        bench_qwen38_flash_next_ple_layer,
     ),
     forwarded("bench-gdn-recurrence", bench_gdn_recurrence),
     forwarded("bench-gdn-output", bench_gdn_output),
@@ -3018,6 +3052,54 @@ fn qualify_qwen38_flash_next_lm_head(root: &Path) -> Result<(), Box<dyn Error>> 
     gate_qwen38_flash_next_lm_head(root)
 }
 
+/// Runs the source-backed GDN/MoE layer gate and every leaf resource gate it composes.
+fn qualify_qwen38_flash_next_gdn_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err(
+            "usage: cargo run -p xtask -- qualify-qwen38-flash-next-gdn-layer SNAPSHOT".into(),
+        );
+    };
+    run_qualification_test(
+        root,
+        QWEN38_FLASH_NEXT_GDN_LAYER_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        Some(("TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_qwen38_flash_next_hyper_connection(root)?;
+    gate_qwen38_flash_next_gdn_prepare(root)?;
+    gate_qwen38_flash_next_gdn_recurrence(root)?;
+    gate_qwen38_flash_next_moe_router(root)?;
+    gate_qwen38_flash_next_moe_experts(root)?;
+    gate_qwen38_flash_next_projections(root)
+}
+
+/// Runs the source-backed QSA/MoE layer gate and every leaf resource gate it composes.
+fn qualify_qwen38_flash_next_qsa_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err(
+            "usage: cargo run -p xtask -- qualify-qwen38-flash-next-qsa-layer SNAPSHOT".into(),
+        );
+    };
+    run_qualification_test(
+        root,
+        QWEN38_FLASH_NEXT_QSA_LAYER_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        Some(("TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_qwen38_flash_next_hyper_connection(root)?;
+    gate_qwen38_flash_next_qsa_prepare(root)?;
+    gate_qwen38_flash_next_qsa_attention(root)?;
+    gate_qwen38_flash_next_moe_router(root)?;
+    gate_qwen38_flash_next_moe_experts(root)?;
+    gate_qwen38_flash_next_projections(root)
+}
+
 fn qualify_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
     run_qualification_test(
         root,
@@ -3906,6 +3988,27 @@ fn bench_qwen38_flash_next_lm_head(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     run_bench_device(root, "qwen38-flash-next-lm-head", arguments)
+}
+
+fn bench_qwen38_flash_next_gdn_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-gdn-layer", arguments)
+}
+
+fn bench_qwen38_flash_next_qsa_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-qsa-layer", arguments)
+}
+
+fn bench_qwen38_flash_next_ple_layer(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-ple-layer", arguments)
 }
 
 fn bench_qwen36_gdn_recurrence(
@@ -14467,8 +14570,9 @@ mod tests {
         QWEN35_RESIDENT_MTP_TEST_FILTER, QWEN35_RESIDUAL_NORM_TEST_FILTER,
         QWEN35_TEXT_ENDPOINT_TEST_FILTER, QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
         QWEN36_MTP_LAYER_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
-        QWEN38_FLASH_NEXT_ENGRAM_STAGING_TEST_FILTER, QWEN38_FLASH_NEXT_LM_HEAD_TEST_FILTER,
-        QWEN38_FLASH_NEXT_PLE_TEST_FILTER, QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER,
+        QWEN38_FLASH_NEXT_ENGRAM_STAGING_TEST_FILTER, QWEN38_FLASH_NEXT_GDN_LAYER_TEST_FILTER,
+        QWEN38_FLASH_NEXT_LM_HEAD_TEST_FILTER, QWEN38_FLASH_NEXT_PLE_TEST_FILTER,
+        QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER, QWEN38_FLASH_NEXT_QSA_LAYER_TEST_FILTER,
         SM120_DEVICE_CODEGEN_CRATES, SM120_RESOURCE_BASELINES, STREAMING_WEIGHT_POOL_TEST_FILTER,
         SUBCOMMANDS, bench_device_baselines, bench_device_command, concatenated_resource_baselines,
         contains_immediate_operand, device_is_idle, dispatch, dispatch_probe, names_opcode,
@@ -14584,6 +14688,30 @@ mod tests {
         ] {
             for test in tests {
                 assert!(test.contains(filter));
+            }
+        }
+    }
+
+    #[test]
+    fn qwen38_flash_next_layer_filters_select_oracles_and_accounting() {
+        for (filter, tests) in [
+            (
+                QWEN38_FLASH_NEXT_GDN_LAYER_TEST_FILTER,
+                &[
+                    "qwen38_flash_next_gdn_moe_layer::tests::source_layer0_matches_the_layer_oracle_and_graph_replay",
+                    "qwen38_flash_next_gdn_moe_layer_benchmark::tests::accounting_grows_with_every_admitted_route",
+                ][..],
+            ),
+            (
+                QWEN38_FLASH_NEXT_QSA_LAYER_TEST_FILTER,
+                &[
+                    "qwen38_flash_next_qsa_moe_layer::tests::source_layer3_matches_the_layer_oracle_and_graph_replay",
+                    "qwen38_flash_next_qsa_moe_layer_benchmark::tests::accounting_grows_with_every_admitted_route",
+                ][..],
+            ),
+        ] {
+            for test in tests {
+                assert!(test.contains(filter), "`{filter}` does not select `{test}`");
             }
         }
     }
@@ -15330,6 +15458,7 @@ mod tests {
         const SNAPSHOT: Option<&str> = Some("TUISKO_SNAPSHOT");
         const QWEN35_SNAPSHOT: Option<&str> = Some("TUISKO_QWEN35_SNAPSHOT");
         const QWEN36_SNAPSHOT: Option<&str> = Some("TUISKO_QWEN36_SNAPSHOT");
+        const QWEN38_FLASH_NEXT_SNAPSHOT: Option<&str> = Some("TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT");
 
         // (subcommand, first filter, harness flags, snapshot variable)
         const EXPECTED_QUALIFICATION_ROUTES: &[(&str, &str, &[&str], Option<&str>)] = &[
@@ -15691,6 +15820,18 @@ mod tests {
                 NO_SNAPSHOT,
             ),
             (
+                "qualify-qwen38-flash-next-gdn-layer",
+                "qwen38_flash_next_gdn_moe_layer",
+                SERIAL,
+                QWEN38_FLASH_NEXT_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen38-flash-next-qsa-layer",
+                "qwen38_flash_next_qsa_moe_layer",
+                SERIAL,
+                QWEN38_FLASH_NEXT_SNAPSHOT,
+            ),
+            (
                 "qualify-gdn-recurrence",
                 "gdn_recurrence::tests::route_inventory_and_arena_accounting_are_exact",
                 EXACT_SERIAL,
@@ -15897,7 +16038,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 97);
+        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 99);
 
         let snapshot = OsString::from("/snapshot");
         for &(command, filter, trailing, variable) in EXPECTED_QUALIFICATION_ROUTES {

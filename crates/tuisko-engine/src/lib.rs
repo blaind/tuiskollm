@@ -119,6 +119,28 @@ pub use qwen38_flash_next::engram_stager_layout::{
     QWEN38_FLASH_NEXT_ENGRAM_WIDTHS, Qwen38FlashNextEngramStagerLayout,
     require_qwen38_flash_next_engram_width,
 };
+pub use qwen38_flash_next::expert_pool_layout::Qwen38FlashNextExpertPoolLayout;
+pub use qwen38_flash_next::gdn_moe_layer::Qwen38FlashNextGdnMoeLayerProgram;
+#[cfg(feature = "qualification")]
+pub use qwen38_flash_next::gdn_moe_layer::{
+    Qwen38FlashNextGdnMoeLayerImmutable, Qwen38FlashNextGdnMoeLayerInputs,
+    Qwen38FlashNextGdnMoeLayerObservables,
+};
+pub use qwen38_flash_next::gdn_moe_layer_layout::Qwen38FlashNextGdnMoeLayerLayout;
+pub use qwen38_flash_next::layer_route::{
+    QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING, QWEN38_FLASH_NEXT_MAX_ROWS,
+    QWEN38_FLASH_NEXT_PREFILL_ROWS, Qwen38FlashNextRowRoute, qwen38_flash_next_row_route,
+    require_qwen38_flash_next_dense_qsa_round, require_qwen38_flash_next_dense_qsa_visible,
+};
+#[cfg(feature = "qualification")]
+pub use qwen38_flash_next::qsa_moe_layer::{
+    Qwen38FlashNextQsaMoeLayerImmutable, Qwen38FlashNextQsaMoeLayerInputs,
+    Qwen38FlashNextQsaMoeLayerObservables,
+};
+pub use qwen38_flash_next::qsa_moe_layer::{
+    Qwen38FlashNextQsaMoeLayerProgram, Qwen38FlashNextQsaRound,
+};
+pub use qwen38_flash_next::qsa_moe_layer_layout::Qwen38FlashNextQsaMoeLayerLayout;
 /// Single-slot Qwen3.5 streaming request over the resident text program.
 pub type Qwen35ResidentGenerationSession<'a> =
     common::text_generator::SingleSlotGenerationSession<'a, Qwen35ResidentModelProgram>;

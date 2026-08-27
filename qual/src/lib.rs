@@ -261,6 +261,10 @@ mod qwen38_flash_next_engram_staging;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_engram_staging_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_gdn_moe_layer;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_gdn_moe_layer_benchmark;
+#[cfg(feature = "device")]
 mod qwen38_flash_next_gdn_prepare;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_gdn_prepare_benchmark;
@@ -272,6 +276,8 @@ mod qwen38_flash_next_gdn_recurrence_benchmark;
 mod qwen38_flash_next_hyper_connection;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_hyper_connection_benchmark;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_layer_oracle;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_lm_head;
 #[cfg(feature = "device")]
@@ -296,6 +302,10 @@ mod qwen38_flash_next_projection_benchmark;
 mod qwen38_flash_next_qsa_attention;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_qsa_attention_benchmark;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_qsa_moe_layer;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_qsa_moe_layer_benchmark;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_qsa_prepare_benchmark;
 #[cfg(feature = "device")]
@@ -749,6 +759,13 @@ pub use qwen36_text_endpoint::{
 #[cfg(feature = "device")]
 pub use qwen36_text_endpoint_benchmark::benchmark_qwen36_text_endpoint;
 #[cfg(feature = "device")]
+pub use qwen38_flash_next_gdn_moe_layer::{
+    Qwen38FlashNextGdnMoeLayerQualification, Qwen38FlashNextGdnMoeLayerQualificationError,
+    qualify_qwen38_flash_next_gdn_moe_layer,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_gdn_moe_layer_benchmark::benchmark_qwen38_flash_next_gdn_moe_layer;
+#[cfg(feature = "device")]
 pub use qwen38_flash_next_gdn_prepare::{
     Qwen38FlashNextGdnPrepareQualification, Qwen38FlashNextGdnPrepareQualificationError,
     qualify_qwen38_flash_next_gdn_prepare,
@@ -811,6 +828,13 @@ pub use qwen38_flash_next_qsa_attention::{
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_qsa_attention_benchmark::benchmark_qwen38_flash_next_qsa_attention;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_qsa_moe_layer::{
+    Qwen38FlashNextQsaMoeLayerQualification, Qwen38FlashNextQsaMoeLayerQualificationError,
+    qualify_qwen38_flash_next_qsa_moe_layer,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_qsa_moe_layer_benchmark::benchmark_qwen38_flash_next_qsa_moe_layer;
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_qsa_prepare_benchmark::benchmark_qwen38_flash_next_qsa_prepare;
 #[cfg(feature = "device")]
