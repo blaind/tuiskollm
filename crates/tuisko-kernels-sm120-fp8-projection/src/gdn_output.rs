@@ -4,6 +4,7 @@ use crate::device::fp8_projection::{fp8_projection, quantize_gdn_output_activati
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_kernels_sm120_common::attention_output::attention_output_projection_mma;
 use tuisko_model::{Arch, Qwen38_27B};
@@ -385,21 +386,45 @@ impl<A: Arch, const TOKENS: usize> Route<A, TOKENS> {
     }
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_gdn_output),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
+    inventory(false)
+)]
+struct GdnOutputRoutes<A: Sm120Arch> {
+    #[route(1)]
+    b1: Route<A, 1>,
+    #[route(2)]
+    b2: Route<A, 2>,
+    #[route(3)]
+    b3: Route<A, 3>,
+    #[route(4)]
+    b4: Route<A, 4>,
+    #[route(5)]
+    b5: Route<A, 5>,
+    #[route(6)]
+    b6: Route<A, 6>,
+    #[route(7)]
+    b7: Route<A, 7>,
+    #[route(8)]
+    b8: Route<A, 8>,
+    #[route(32)]
+    t32: PreparedPrefillRoute<A, 32>,
+    #[route(64)]
+    t64: PreparedPrefillRoute<A, 64>,
+    #[route(128)]
+    t128: PreparedPrefillRoute<A, 128>,
+    #[route(1024)]
+    t1024: PreparedMacroRoute<A>,
+}
+
 /// Prepared source-native FP8 GDN output routes for exact decode and prefill rows.
 pub struct GdnOutputProjectionOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
-    b1: Route<A, 1>,
-    b2: Route<A, 2>,
-    b3: Route<A, 3>,
-    b4: Route<A, 4>,
-    b5: Route<A, 5>,
-    b6: Route<A, 6>,
-    b7: Route<A, 7>,
-    b8: Route<A, 8>,
-    t32: PreparedPrefillRoute<A, 32>,
-    t64: PreparedPrefillRoute<A, 64>,
-    t128: PreparedPrefillRoute<A, 128>,
-    t1024: PreparedMacroRoute<A>,
+    routes: GdnOutputRoutes<A>,
 }
 
 impl<A: Sm120Arch> GdnOutputProjectionOp<A> {
@@ -410,18 +435,7 @@ impl<A: Sm120Arch> GdnOutputProjectionOp<A> {
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module("loading the GDN output module", source))?;
         Ok(Self {
-            b1: Route::prepare(&module)?,
-            b2: Route::prepare(&module)?,
-            b3: Route::prepare(&module)?,
-            b4: Route::prepare(&module)?,
-            b5: Route::prepare(&module)?,
-            b6: Route::prepare(&module)?,
-            b7: Route::prepare(&module)?,
-            b8: Route::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
-            t1024: PreparedMacroRoute::prepare(&module)?,
+            routes: GdnOutputRoutes::prepare(&module)?,
             module,
         })
     }
@@ -453,9 +467,9 @@ impl<A: Sm120Arch> GdnOutputProjectionOp<A> {
             )));
         };
         macro_rules! call {
-            ($route:ident) => {
+            ($route:expr) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         input,
@@ -468,26 +482,8 @@ impl<A: Sm120Arch> GdnOutputProjectionOp<A> {
                 }
             };
         }
-        match class {
-            RouteClass::Decode => match rows {
-                1 => call!(b1),
-                2 => call!(b2),
-                3 => call!(b3),
-                4 => call!(b4),
-                5 => call!(b5),
-                6 => call!(b6),
-                7 => call!(b7),
-                8 => call!(b8),
-                _ => unreachable!(),
-            },
-            RouteClass::Prefill => match rows {
-                32 => call!(t32),
-                64 => call!(t64),
-                128 => call!(t128),
-                _ => unreachable!(),
-            },
-            RouteClass::Macro => call!(t1024),
-        }
+        let _ = class;
+        dispatch_gdn_output!(&self.routes, rows, |route| call!(route), else => unreachable!())
     }
 }
 
