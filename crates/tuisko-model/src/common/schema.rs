@@ -15,6 +15,7 @@ use crate::common::inventory::CheckpointSnapshot;
 use crate::qwen35::ModelOptNvfp4Schema;
 use crate::qwen36::ModelOptNvfp4MoeSchema;
 use crate::qwen38::CompressedTensorsSchema;
+use crate::qwen38_flash_next::Qwen38FlashNextModelOptNvfp4Schema;
 use crate::{Arch, CheckpointContract, CheckpointError, CheckpointResult};
 use std::path::Path;
 
@@ -44,6 +45,9 @@ pub fn validate_config<A: Arch>(path: &Path) -> CheckpointResult<()> {
         CheckpointContract::CompressedTensors => admit_config::<A, CompressedTensorsSchema>(path),
         CheckpointContract::ModelOptNvfp4 => admit_config::<A, ModelOptNvfp4Schema>(path),
         CheckpointContract::ModelOptNvfp4Moe => admit_config::<A, ModelOptNvfp4MoeSchema>(path),
+        CheckpointContract::Qwen38FlashNextModelOptNvfp4 => {
+            admit_config::<A, Qwen38FlashNextModelOptNvfp4Schema>(path)
+        }
     }
 }
 
@@ -52,6 +56,9 @@ pub(crate) fn open_snapshot<A: Arch>(root: &Path) -> CheckpointResult<Checkpoint
         CheckpointContract::CompressedTensors => admit_snapshot::<A, CompressedTensorsSchema>(root),
         CheckpointContract::ModelOptNvfp4 => admit_snapshot::<A, ModelOptNvfp4Schema>(root),
         CheckpointContract::ModelOptNvfp4Moe => admit_snapshot::<A, ModelOptNvfp4MoeSchema>(root),
+        CheckpointContract::Qwen38FlashNextModelOptNvfp4 => {
+            admit_snapshot::<A, Qwen38FlashNextModelOptNvfp4Schema>(root)
+        }
     }
 }
 
@@ -88,8 +95,10 @@ mod tests {
     use crate::qwen35::ModelOptNvfp4Schema;
     use crate::qwen36::ModelOptNvfp4MoeSchema;
     use crate::qwen38::CompressedTensorsSchema;
+    use crate::qwen38_flash_next::Qwen38FlashNextModelOptNvfp4Schema;
     use crate::{
         Arch, CheckpointContract, CheckpointErrorCode, Qwen35_9B, Qwen36Moe35B, Qwen38_27B,
+        Qwen38FlashNext,
     };
 
     #[test]
@@ -106,10 +115,15 @@ mod tests {
             <ModelOptNvfp4MoeSchema as CheckpointSchema<Qwen36Moe35B>>::CONTRACT,
             Qwen36Moe35B::CHECKPOINT_CONTRACT
         );
+        assert_eq!(
+            <Qwen38FlashNextModelOptNvfp4Schema as CheckpointSchema<Qwen38FlashNext>>::CONTRACT,
+            Qwen38FlashNext::CHECKPOINT_CONTRACT
+        );
 
         require_contract::<Qwen38_27B, CompressedTensorsSchema>().unwrap();
         require_contract::<Qwen35_9B, ModelOptNvfp4Schema>().unwrap();
         require_contract::<Qwen36Moe35B, ModelOptNvfp4MoeSchema>().unwrap();
+        require_contract::<Qwen38FlashNext, Qwen38FlashNextModelOptNvfp4Schema>().unwrap();
     }
 
     #[test]
@@ -126,6 +140,12 @@ mod tests {
                     .err()
                     .unwrap(),
                 CheckpointContract::ModelOptNvfp4Moe,
+            ),
+            (
+                require_contract::<Qwen38FlashNext, ModelOptNvfp4Schema>()
+                    .err()
+                    .unwrap(),
+                CheckpointContract::ModelOptNvfp4,
             ),
         ] {
             assert_eq!(error.code(), CheckpointErrorCode::Config);
