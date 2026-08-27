@@ -4,6 +4,7 @@ use crate::qwen36_gdn_output::Qwen36GdnOutputOp;
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::attention_output::attention_gate_bf16;
 use tuisko_model::{Arch, Qwen36Moe35B};
 
@@ -164,22 +165,45 @@ pub(crate) fn qwen36_attention_output_ptx_names() -> [&'static str; ROUTE_COUNT]
     ]
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen36_attention_output_gate),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
+    inventory(false)
+)]
+struct Qwen36AttentionOutputGateRoutes {
+    #[route(1)]
+    b1: PreparedGate<1>,
+    #[route(2)]
+    b2: PreparedGate<2>,
+    #[route(3)]
+    b3: PreparedGate<3>,
+    #[route(4)]
+    b4: PreparedGate<4>,
+    #[route(5)]
+    b5: PreparedGate<5>,
+    #[route(6)]
+    b6: PreparedGate<6>,
+    #[route(7)]
+    b7: PreparedGate<7>,
+    #[route(8)]
+    b8: PreparedGate<8>,
+    #[route(32)]
+    t32: PreparedPrefillGate<32>,
+    #[route(64)]
+    t64: PreparedPrefillGate<64>,
+    #[route(128)]
+    t128: PreparedPrefillGate<128>,
+}
+
 /// Prepared Qwen3.6 gate plus static-FP8 output projection routes for exact
 /// `B=1..8` and `T=32,64,128`.
 pub struct Qwen36AttentionOutputOp {
     gate_module: kernels::LoadedModule,
     projection: Qwen36GdnOutputOp,
-    b1: PreparedGate<1>,
-    b2: PreparedGate<2>,
-    b3: PreparedGate<3>,
-    b4: PreparedGate<4>,
-    b5: PreparedGate<5>,
-    b6: PreparedGate<6>,
-    b7: PreparedGate<7>,
-    b8: PreparedGate<8>,
-    t32: PreparedPrefillGate<32>,
-    t64: PreparedPrefillGate<64>,
-    t128: PreparedPrefillGate<128>,
+    gate_routes: Qwen36AttentionOutputGateRoutes,
 }
 
 impl Qwen36AttentionOutputOp {
@@ -191,17 +215,7 @@ impl Qwen36AttentionOutputOp {
             .map_err(|source| GpuError::module("loading Qwen3.6 attention-output gate", source))?;
 
         Ok(Self {
-            b1: PreparedGate::prepare(&gate_module)?,
-            b2: PreparedGate::prepare(&gate_module)?,
-            b3: PreparedGate::prepare(&gate_module)?,
-            b4: PreparedGate::prepare(&gate_module)?,
-            b5: PreparedGate::prepare(&gate_module)?,
-            b6: PreparedGate::prepare(&gate_module)?,
-            b7: PreparedGate::prepare(&gate_module)?,
-            b8: PreparedGate::prepare(&gate_module)?,
-            t32: PreparedPrefillGate::prepare(&gate_module)?,
-            t64: PreparedPrefillGate::prepare(&gate_module)?,
-            t128: PreparedPrefillGate::prepare(&gate_module)?,
+            gate_routes: Qwen36AttentionOutputGateRoutes::prepare(&gate_module)?,
             projection: Qwen36GdnOutputOp::new(context)?,
             gate_module,
         })
@@ -231,41 +245,16 @@ impl Qwen36AttentionOutputOp {
         output: *mut u16,
     ) -> GpuResult<()> {
         macro_rules! launch_gate {
-            ($route:ident) => {
-                unsafe {
-                    self.$route
-                        .launch(&self.gate_module, stream, attention, qkv, activation)
-                }
+            ($route:expr) => {
+                unsafe { $route.launch(&self.gate_module, stream, attention, qkv, activation) }
             };
         }
 
-        macro_rules! launch_prefill_gate {
-            ($route:ident) => {
-                unsafe {
-                    self.$route
-                        .launch(&self.gate_module, stream, attention, qkv, activation)
-                }
-            };
-        }
-
-        match tokens {
-            1 => launch_gate!(b1)?,
-            2 => launch_gate!(b2)?,
-            3 => launch_gate!(b3)?,
-            4 => launch_gate!(b4)?,
-            5 => launch_gate!(b5)?,
-            6 => launch_gate!(b6)?,
-            7 => launch_gate!(b7)?,
-            8 => launch_gate!(b8)?,
-            32 => launch_prefill_gate!(t32)?,
-            64 => launch_prefill_gate!(t64)?,
-            128 => launch_prefill_gate!(t128)?,
-            _ => {
+        dispatch_qwen36_attention_output_gate!(&self.gate_routes, tokens, |route| launch_gate!(route), else => {
                 return Err(GpuError::invalid_launch(format!(
                     "Qwen3.6 attention output tokens {tokens} must be one of 1..={MAX_BATCH}, 32, 64, or 128"
                 )));
-            }
-        }
+        })?;
 
         unsafe {
             self.projection.launch(

@@ -12,6 +12,7 @@ cuda-host.workspace = true
 cuda-intrinsics.workspace = true
 tuisko-gpu.workspace = true
 tuisko-model.workspace = true
+tuisko-kernels-macros.workspace = true
 
 [lints.rust]
 missing_docs = "warn"

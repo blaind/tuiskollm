@@ -570,7 +570,10 @@ pub(crate) mod tests {
         let tokens = token_stream(31, 256, 6);
         let rows = stream(&hasher, &tokens);
 
-        for token_rows in rows.chunks_exact(QWEN38_FLASH_NEXT_ENGRAM_ROWS_PER_TOKEN) {
+        for token_rows in rows
+            .as_chunks::<QWEN38_FLASH_NEXT_ENGRAM_ROWS_PER_TOKEN>()
+            .0
+        {
             for (head, row) in token_rows.iter().copied().enumerate() {
                 let offset = constants.head_offsets()[head];
 

@@ -4,6 +4,7 @@ use crate::device::fp8_projection::prefill_projection_mma_static_three_scales;
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_model::{Arch, Qwen36Moe35B};
 
 const MAX_BATCH: usize = 8;
@@ -453,20 +454,43 @@ pub(crate) fn qwen36_fp8_qkv_ptx_names() -> Vec<&'static str> {
     ]
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen36_fp8_qkv),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
+    inventory(false)
+)]
+struct Qwen36Fp8QkvRoutes {
+    #[route(1)]
+    b1: PreparedBatchRoute<1>,
+    #[route(2)]
+    b2: PreparedBatchRoute<2>,
+    #[route(3)]
+    b3: PreparedBatchRoute<3>,
+    #[route(4)]
+    b4: PreparedBatchRoute<4>,
+    #[route(5)]
+    b5: PreparedBatchRoute<5>,
+    #[route(6)]
+    b6: PreparedBatchRoute<6>,
+    #[route(7)]
+    b7: PreparedBatchRoute<7>,
+    #[route(8)]
+    b8: PreparedBatchRoute<8>,
+    #[route(32)]
+    t32: PreparedPrefillRoute<32>,
+    #[route(64)]
+    t64: PreparedPrefillRoute<64>,
+    #[route(128)]
+    t128: PreparedPrefillRoute<128>,
+}
+
 /// Prepared exact decode and prompt Qwen3.6 full-attention QKV routes on SM120.
 pub struct Qwen36Fp8QkvOp {
     module: kernels::LoadedModule,
-    b1: PreparedBatchRoute<1>,
-    b2: PreparedBatchRoute<2>,
-    b3: PreparedBatchRoute<3>,
-    b4: PreparedBatchRoute<4>,
-    b5: PreparedBatchRoute<5>,
-    b6: PreparedBatchRoute<6>,
-    b7: PreparedBatchRoute<7>,
-    b8: PreparedBatchRoute<8>,
-    t32: PreparedPrefillRoute<32>,
-    t64: PreparedPrefillRoute<64>,
-    t128: PreparedPrefillRoute<128>,
+    routes: Qwen36Fp8QkvRoutes,
 }
 
 impl Qwen36Fp8QkvOp {
@@ -477,17 +501,7 @@ impl Qwen36Fp8QkvOp {
             .map_err(|source| GpuError::module("loading Qwen3.6 FP8 QKV kernels", source))?;
 
         Ok(Self {
-            b1: PreparedBatchRoute::prepare(&module)?,
-            b2: PreparedBatchRoute::prepare(&module)?,
-            b3: PreparedBatchRoute::prepare(&module)?,
-            b4: PreparedBatchRoute::prepare(&module)?,
-            b5: PreparedBatchRoute::prepare(&module)?,
-            b6: PreparedBatchRoute::prepare(&module)?,
-            b7: PreparedBatchRoute::prepare(&module)?,
-            b8: PreparedBatchRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
+            routes: Qwen36Fp8QkvRoutes::prepare(&module)?,
             module,
         })
     }
@@ -530,9 +544,9 @@ impl Qwen36Fp8QkvOp {
         }
 
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         input,
@@ -548,22 +562,9 @@ impl Qwen36Fp8QkvOp {
             };
         }
 
-        match rows {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_qwen36_fp8_qkv!(&self.routes, rows, |route| launch!(route), else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.6 attention QKV row count {rows} is outside 1..={MAX_BATCH}, 32, 64, and 128"
-            ))),
-        }
+            ))) )
     }
 }
 

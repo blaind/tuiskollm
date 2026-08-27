@@ -4,6 +4,7 @@ use crate::device::fp8_projection::fp8_projection;
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_kernels_sm120_common::attention_output::{
     attention_gate_quantize, attention_output_projection_mma,
@@ -419,21 +420,45 @@ impl<A: Arch> PreparedMacroRoute<A> {
     }
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_attention_output),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
+    inventory(false)
+)]
+struct AttentionOutputRoutes<A: Sm120Arch> {
+    #[route(1)]
+    b1: PreparedRoute<A, 1>,
+    #[route(2)]
+    b2: PreparedRoute<A, 2>,
+    #[route(3)]
+    b3: PreparedRoute<A, 3>,
+    #[route(4)]
+    b4: PreparedRoute<A, 4>,
+    #[route(5)]
+    b5: PreparedRoute<A, 5>,
+    #[route(6)]
+    b6: PreparedRoute<A, 6>,
+    #[route(7)]
+    b7: PreparedRoute<A, 7>,
+    #[route(8)]
+    b8: PreparedRoute<A, 8>,
+    #[route(32)]
+    t32: PreparedPrefillRoute<A, 32>,
+    #[route(64)]
+    t64: PreparedPrefillRoute<A, 64>,
+    #[route(128)]
+    t128: PreparedPrefillRoute<A, 128>,
+    #[route(1024)]
+    t1024: PreparedMacroRoute<A>,
+}
+
 /// Prepared gated FP8 attention-output routes for exact decode and prefill rows.
 pub struct AttentionOutputOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
-    b1: PreparedRoute<A, 1>,
-    b2: PreparedRoute<A, 2>,
-    b3: PreparedRoute<A, 3>,
-    b4: PreparedRoute<A, 4>,
-    b5: PreparedRoute<A, 5>,
-    b6: PreparedRoute<A, 6>,
-    b7: PreparedRoute<A, 7>,
-    b8: PreparedRoute<A, 8>,
-    t32: PreparedPrefillRoute<A, 32>,
-    t64: PreparedPrefillRoute<A, 64>,
-    t128: PreparedPrefillRoute<A, 128>,
-    t1024: PreparedMacroRoute<A>,
+    routes: AttentionOutputRoutes<A>,
 }
 
 impl<A: Sm120Arch> AttentionOutputOp<A> {
@@ -446,18 +471,7 @@ impl<A: Sm120Arch> AttentionOutputOp<A> {
             .map_err(|source| GpuError::module("loading attention output", source))?;
 
         Ok(Self {
-            b1: PreparedRoute::prepare(&module)?,
-            b2: PreparedRoute::prepare(&module)?,
-            b3: PreparedRoute::prepare(&module)?,
-            b4: PreparedRoute::prepare(&module)?,
-            b5: PreparedRoute::prepare(&module)?,
-            b6: PreparedRoute::prepare(&module)?,
-            b7: PreparedRoute::prepare(&module)?,
-            b8: PreparedRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
-            t1024: PreparedMacroRoute::prepare(&module)?,
+            routes: AttentionOutputRoutes::prepare(&module)?,
             module,
         })
     }
@@ -494,9 +508,9 @@ impl<A: Sm120Arch> AttentionOutputOp<A> {
         };
 
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         attention,
@@ -511,26 +525,8 @@ impl<A: Sm120Arch> AttentionOutputOp<A> {
             };
         }
 
-        match class {
-            RouteClass::Decode => match rows {
-                1 => launch!(b1),
-                2 => launch!(b2),
-                3 => launch!(b3),
-                4 => launch!(b4),
-                5 => launch!(b5),
-                6 => launch!(b6),
-                7 => launch!(b7),
-                8 => launch!(b8),
-                _ => unreachable!(),
-            },
-            RouteClass::Prefill => match rows {
-                32 => launch!(t32),
-                64 => launch!(t64),
-                128 => launch!(t128),
-                _ => unreachable!(),
-            },
-            RouteClass::Macro => launch!(t1024),
-        }
+        let _ = class;
+        dispatch_attention_output!(&self.routes, rows, |route| launch!(route), else => unreachable!())
     }
 }
 

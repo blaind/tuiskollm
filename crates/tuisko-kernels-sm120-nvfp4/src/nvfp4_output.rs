@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tuisko_gpu::{
     CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, LaunchConfig2D, PreparedLaunch,
 };
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::attention_output::attention_gate_bf16;
 use tuisko_model::{Arch, Qwen35_9B};
 
@@ -689,20 +690,54 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
     }
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen35_nvfp4_gdn_output_decode),
+    required(1, 2, 3, 4, 5, 6, 7, 8),
+    inventory(false)
+)]
+struct Qwen35Nvfp4GdnOutputDecodeRoutes {
+    #[route(1)]
+    b1: PreparedProjectionRoute<1>,
+    #[route(2)]
+    b2: PreparedProjectionRoute<2>,
+    #[route(3)]
+    b3: PreparedProjectionRoute<3>,
+    #[route(4)]
+    b4: PreparedProjectionRoute<4>,
+    #[route(5)]
+    b5: PreparedProjectionRoute<5>,
+    #[route(6)]
+    b6: PreparedProjectionRoute<6>,
+    #[route(7)]
+    b7: PreparedProjectionRoute<7>,
+    #[route(8)]
+    b8: PreparedProjectionRoute<8>,
+}
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen35_nvfp4_gdn_output_prefill),
+    required(32, 64, 128),
+    inventory(false)
+)]
+struct Qwen35Nvfp4GdnOutputPrefillRoutes {
+    #[route(32)]
+    t32: PreparedPrefillProjection<32>,
+    #[route(64)]
+    t64: PreparedPrefillProjection<64>,
+    #[route(128)]
+    t128: PreparedPrefillProjection<128>,
+}
+
 /// Prepared square NVFP4 projections shared by Qwen3.5 attention and GDN output.
 pub struct Qwen35Nvfp4GdnOutputOp {
     module: kernels::LoadedModule,
-    b1: PreparedProjectionRoute<1>,
-    b2: PreparedProjectionRoute<2>,
-    b3: PreparedProjectionRoute<3>,
-    b4: PreparedProjectionRoute<4>,
-    b5: PreparedProjectionRoute<5>,
-    b6: PreparedProjectionRoute<6>,
-    b7: PreparedProjectionRoute<7>,
-    b8: PreparedProjectionRoute<8>,
-    t32: PreparedPrefillProjection<32>,
-    t64: PreparedPrefillProjection<64>,
-    t128: PreparedPrefillProjection<128>,
+    decode_routes: Qwen35Nvfp4GdnOutputDecodeRoutes,
+    prefill_routes: Qwen35Nvfp4GdnOutputPrefillRoutes,
 }
 
 impl Qwen35Nvfp4GdnOutputOp {
@@ -714,17 +749,8 @@ impl Qwen35Nvfp4GdnOutputOp {
         })?;
 
         Ok(Self {
-            b1: PreparedProjectionRoute::prepare(&module)?,
-            b2: PreparedProjectionRoute::prepare(&module)?,
-            b3: PreparedProjectionRoute::prepare(&module)?,
-            b4: PreparedProjectionRoute::prepare(&module)?,
-            b5: PreparedProjectionRoute::prepare(&module)?,
-            b6: PreparedProjectionRoute::prepare(&module)?,
-            b7: PreparedProjectionRoute::prepare(&module)?,
-            b8: PreparedProjectionRoute::prepare(&module)?,
-            t32: PreparedPrefillProjection::prepare(&module)?,
-            t64: PreparedPrefillProjection::prepare(&module)?,
-            t128: PreparedPrefillProjection::prepare(&module)?,
+            decode_routes: Qwen35Nvfp4GdnOutputDecodeRoutes::prepare(&module)?,
+            prefill_routes: Qwen35Nvfp4GdnOutputPrefillRoutes::prepare(&module)?,
             module,
         })
     }
@@ -761,9 +787,9 @@ impl Qwen35Nvfp4GdnOutputOp {
         }
 
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         input,
@@ -776,17 +802,7 @@ impl Qwen35Nvfp4GdnOutputOp {
             };
         }
 
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            _ => unreachable!(),
-        }
+        dispatch_qwen35_nvfp4_gdn_output_decode!(&self.decode_routes, batch, |route| launch!(route), else => unreachable!())
     }
 
     /// Quantizes and projects exact `T=32,64,128` recurrent-output rows.
@@ -824,9 +840,9 @@ impl Qwen35Nvfp4GdnOutputOp {
         }
 
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         input,
@@ -842,31 +858,60 @@ impl Qwen35Nvfp4GdnOutputOp {
             };
         }
 
-        match tokens {
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_qwen35_nvfp4_gdn_output_prefill!(&self.prefill_routes, tokens, |route| launch!(route), else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.5 NVFP4 GDN-output prefill tokens {tokens} must be 32, 64, or 128"
-            ))),
-        }
+            ))) )
     }
+}
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen35_nvfp4_attention_output_decode),
+    required(1, 2, 3, 4, 5, 6, 7, 8),
+    inventory(false)
+)]
+struct Qwen35Nvfp4AttentionOutputDecodeRoutes {
+    #[route(1)]
+    b1: PreparedRoute<1>,
+    #[route(2)]
+    b2: PreparedRoute<2>,
+    #[route(3)]
+    b3: PreparedRoute<3>,
+    #[route(4)]
+    b4: PreparedRoute<4>,
+    #[route(5)]
+    b5: PreparedRoute<5>,
+    #[route(6)]
+    b6: PreparedRoute<6>,
+    #[route(7)]
+    b7: PreparedRoute<7>,
+    #[route(8)]
+    b8: PreparedRoute<8>,
+}
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen35_nvfp4_attention_output_prefill),
+    required(32, 64, 128),
+    inventory(false)
+)]
+struct Qwen35Nvfp4AttentionOutputPrefillRoutes {
+    #[route(32)]
+    t32: PreparedPrefillRoute<32>,
+    #[route(64)]
+    t64: PreparedPrefillRoute<64>,
+    #[route(128)]
+    t128: PreparedPrefillRoute<128>,
 }
 
 /// Prepared gated NVFP4 attention-output routes for exact decode and prompt widths.
 pub struct Qwen35Nvfp4AttentionOutputOp {
     module: kernels::LoadedModule,
-    b1: PreparedRoute<1>,
-    b2: PreparedRoute<2>,
-    b3: PreparedRoute<3>,
-    b4: PreparedRoute<4>,
-    b5: PreparedRoute<5>,
-    b6: PreparedRoute<6>,
-    b7: PreparedRoute<7>,
-    b8: PreparedRoute<8>,
-    t32: PreparedPrefillRoute<32>,
-    t64: PreparedPrefillRoute<64>,
-    t128: PreparedPrefillRoute<128>,
+    decode_routes: Qwen35Nvfp4AttentionOutputDecodeRoutes,
+    prefill_routes: Qwen35Nvfp4AttentionOutputPrefillRoutes,
 }
 
 impl Qwen35Nvfp4AttentionOutputOp {
@@ -881,17 +926,8 @@ impl Qwen35Nvfp4AttentionOutputOp {
         })?;
 
         Ok(Self {
-            b1: PreparedRoute::prepare(&module)?,
-            b2: PreparedRoute::prepare(&module)?,
-            b3: PreparedRoute::prepare(&module)?,
-            b4: PreparedRoute::prepare(&module)?,
-            b5: PreparedRoute::prepare(&module)?,
-            b6: PreparedRoute::prepare(&module)?,
-            b7: PreparedRoute::prepare(&module)?,
-            b8: PreparedRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
+            decode_routes: Qwen35Nvfp4AttentionOutputDecodeRoutes::prepare(&module)?,
+            prefill_routes: Qwen35Nvfp4AttentionOutputPrefillRoutes::prepare(&module)?,
             module,
         })
     }
@@ -932,9 +968,9 @@ impl Qwen35Nvfp4AttentionOutputOp {
         }
 
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         attention,
@@ -949,17 +985,7 @@ impl Qwen35Nvfp4AttentionOutputOp {
             };
         }
 
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            _ => unreachable!(),
-        }
+        dispatch_qwen35_nvfp4_attention_output_decode!(&self.decode_routes, batch, |route| launch!(route), else => unreachable!())
     }
 
     /// Gates and projects one exact prompt width through represented NVFP4.
@@ -998,9 +1024,9 @@ impl Qwen35Nvfp4AttentionOutputOp {
         }
 
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         attention,
@@ -1018,14 +1044,9 @@ impl Qwen35Nvfp4AttentionOutputOp {
             };
         }
 
-        match tokens {
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_qwen35_nvfp4_attention_output_prefill!(&self.prefill_routes, tokens, |route| launch!(route), else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.5 NVFP4 attention-output prefill tokens {tokens} must be 32, 64, or 128"
-            ))),
-        }
+            ))) )
     }
 }
 

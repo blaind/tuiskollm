@@ -7,6 +7,7 @@ use crate::device::gdn_recurrence::{
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_model::{Arch, Qwen38_27B, Qwen38FlashNext};
 
@@ -683,28 +684,80 @@ impl GdnRecurrenceEntries<Qwen38FlashNext> for Qwen38FlashNextGdnRecurrenceEntri
     }
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_gdn_recurrence_decode),
+    required(1, 2, 3, 4, 5, 6, 7, 8),
+    inventory(false)
+)]
+struct GdnRecurrenceDecodeRoutes<A: Arch, E: GdnRecurrenceEntries<A>> {
+    #[route(1)]
+    b1: E::Decode<1>,
+    #[route(2)]
+    b2: E::Decode<2>,
+    #[route(3)]
+    b3: E::Decode<3>,
+    #[route(4)]
+    b4: E::Decode<4>,
+    #[route(5)]
+    b5: E::Decode<5>,
+    #[route(6)]
+    b6: E::Decode<6>,
+    #[route(7)]
+    b7: E::Decode<7>,
+    #[route(8)]
+    b8: E::Decode<8>,
+}
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_gdn_recurrence_prefill),
+    required(32, 64, 128, 1024),
+    inventory(false)
+)]
+struct GdnRecurrencePrefillRoutes<A: Arch, E: GdnRecurrenceEntries<A>> {
+    #[route(32)]
+    t32: E::Prefill<32>,
+    #[route(64)]
+    t64: E::Prefill<64>,
+    #[route(128)]
+    t128: E::Prefill<128>,
+    #[route(1024)]
+    t1024: E::Prefill<1_024>,
+}
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_gdn_recurrence_causal),
+    required(1, 2, 3, 4),
+    inventory(false)
+)]
+struct GdnRecurrenceCausalRoutes<A: Arch, E: GdnRecurrenceEntries<A>> {
+    #[route(1)]
+    k1: E::Prefill<1>,
+    #[route(2)]
+    k2: E::Prefill<2>,
+    #[route(3)]
+    k3: E::Prefill<3>,
+    #[route(4)]
+    k4: E::Prefill<4>,
+}
+
 /// Prepared FP32 GDN recurrence routes for exact decode and prefill rows.
 pub struct GdnRecurrenceOp<
     A: Arch = Qwen38_27B,
     E: GdnRecurrenceEntries<A> = Qwen38GdnRecurrenceEntries,
 > {
     module: kernels::LoadedModule,
-    b1: E::Decode<1>,
-    b2: E::Decode<2>,
-    b3: E::Decode<3>,
-    b4: E::Decode<4>,
-    b5: E::Decode<5>,
-    b6: E::Decode<6>,
-    b7: E::Decode<7>,
-    b8: E::Decode<8>,
-    k1: E::Prefill<1>,
-    k2: E::Prefill<2>,
-    k3: E::Prefill<3>,
-    k4: E::Prefill<4>,
-    t32: E::Prefill<32>,
-    t64: E::Prefill<64>,
-    t128: E::Prefill<128>,
-    t1024: E::Prefill<1_024>,
+    decode_routes: GdnRecurrenceDecodeRoutes<A, E>,
+    prefill_routes: GdnRecurrencePrefillRoutes<A, E>,
+    causal_routes: GdnRecurrenceCausalRoutes<A, E>,
 }
 
 /// Prepared Flash-Next GDN routes with sigmoid output gating.
@@ -721,22 +774,9 @@ impl<A: Arch, E: GdnRecurrenceEntries<A>> GdnRecurrenceOp<A, E> {
             .map_err(|source| GpuError::module("loading the GDN recurrence module", source))?;
 
         Ok(Self {
-            b1: E::Decode::<1>::prepare(&module)?,
-            b2: E::Decode::<2>::prepare(&module)?,
-            b3: E::Decode::<3>::prepare(&module)?,
-            b4: E::Decode::<4>::prepare(&module)?,
-            b5: E::Decode::<5>::prepare(&module)?,
-            b6: E::Decode::<6>::prepare(&module)?,
-            b7: E::Decode::<7>::prepare(&module)?,
-            b8: E::Decode::<8>::prepare(&module)?,
-            k1: E::Prefill::<1>::prepare(&module)?,
-            k2: E::Prefill::<2>::prepare(&module)?,
-            k3: E::Prefill::<3>::prepare(&module)?,
-            k4: E::Prefill::<4>::prepare(&module)?,
-            t32: E::Prefill::<32>::prepare(&module)?,
-            t64: E::Prefill::<64>::prepare(&module)?,
-            t128: E::Prefill::<128>::prepare(&module)?,
-            t1024: E::Prefill::<1_024>::prepare(&module)?,
+            decode_routes: GdnRecurrenceDecodeRoutes::prepare(&module)?,
+            prefill_routes: GdnRecurrencePrefillRoutes::prepare(&module)?,
+            causal_routes: GdnRecurrenceCausalRoutes::prepare(&module)?,
             module,
         })
     }
@@ -779,10 +819,10 @@ impl<A: Arch, E: GdnRecurrenceEntries<A>> GdnRecurrenceOp<A, E> {
         }
 
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         qkv,
@@ -798,10 +838,10 @@ impl<A: Arch, E: GdnRecurrenceEntries<A>> GdnRecurrenceOp<A, E> {
             };
         }
         macro_rules! launch_prefill {
-            ($route:ident) => {
+            ($route:expr) => {
                 // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         qkv,
@@ -818,20 +858,10 @@ impl<A: Arch, E: GdnRecurrenceEntries<A>> GdnRecurrenceOp<A, E> {
             };
         }
 
-        match rows {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            32 => launch_prefill!(t32),
-            64 => launch_prefill!(t64),
-            128 => launch_prefill!(t128),
-            1_024 => launch_prefill!(t1024),
-            _ => unreachable!(),
+        if rows <= MAX_BATCH {
+            dispatch_gdn_recurrence_decode!(&self.decode_routes, rows, |route| launch!(route), else => unreachable!())
+        } else {
+            dispatch_gdn_recurrence_prefill!(&self.prefill_routes, rows, |route| launch_prefill!(route), else => unreachable!())
         }
     }
 
@@ -863,10 +893,10 @@ impl<A: Arch, E: GdnRecurrenceEntries<A>> GdnRecurrenceOp<A, E> {
         output: *mut u16,
     ) -> GpuResult<()> {
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         qkv,
@@ -883,16 +913,10 @@ impl<A: Arch, E: GdnRecurrenceEntries<A>> GdnRecurrenceOp<A, E> {
             };
         }
 
-        match tokens {
-            1 => launch!(k1),
-            2 => launch!(k2),
-            3 => launch!(k3),
-            4 => launch!(k4),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_gdn_recurrence_causal!(&self.causal_routes, tokens, |route| launch!(route), else => Err(GpuError::invalid_launch(format!(
                 "{}GDN causal recurrence token count {tokens} is outside the admitted routes 1..=4",
                 E::LABEL
-            ))),
-        }
+            ))) )
     }
 }
 

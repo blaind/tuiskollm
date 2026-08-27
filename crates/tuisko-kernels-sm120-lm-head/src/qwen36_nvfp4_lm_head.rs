@@ -5,6 +5,7 @@ use cuda_device::{
 };
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_model::{Arch, Qwen36Moe35B};
 
 const MAX_BATCH: usize = 8;
@@ -343,17 +344,37 @@ pub(crate) fn qwen36_nvfp4_lm_head_ptx_names() -> [&'static str; MAX_BATCH] {
     ]
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen36_nvfp4_lm_head),
+    required(1, 2, 3, 4, 5, 6, 7, 8),
+    inventory(false)
+)]
+struct Qwen36Nvfp4LmHeadRoutes {
+    #[route(1)]
+    b1: PreparedBatchRoute<1>,
+    #[route(2)]
+    b2: PreparedBatchRoute<2>,
+    #[route(3)]
+    b3: PreparedBatchRoute<3>,
+    #[route(4)]
+    b4: PreparedBatchRoute<4>,
+    #[route(5)]
+    b5: PreparedBatchRoute<5>,
+    #[route(6)]
+    b6: PreparedBatchRoute<6>,
+    #[route(7)]
+    b7: PreparedBatchRoute<7>,
+    #[route(8)]
+    b8: PreparedBatchRoute<8>,
+}
+
 /// Prepared exact-batch Qwen3.6 NVFP4 LM-head routes on SM120.
 pub struct Qwen36Nvfp4LmHeadOp {
     module: kernels::LoadedModule,
-    b1: PreparedBatchRoute<1>,
-    b2: PreparedBatchRoute<2>,
-    b3: PreparedBatchRoute<3>,
-    b4: PreparedBatchRoute<4>,
-    b5: PreparedBatchRoute<5>,
-    b6: PreparedBatchRoute<6>,
-    b7: PreparedBatchRoute<7>,
-    b8: PreparedBatchRoute<8>,
+    routes: Qwen36Nvfp4LmHeadRoutes,
 }
 
 impl Qwen36Nvfp4LmHeadOp {
@@ -364,14 +385,7 @@ impl Qwen36Nvfp4LmHeadOp {
             .map_err(|source| GpuError::module("loading Qwen3.6 NVFP4 LM-head kernels", source))?;
 
         Ok(Self {
-            b1: PreparedBatchRoute::prepare(&module)?,
-            b2: PreparedBatchRoute::prepare(&module)?,
-            b3: PreparedBatchRoute::prepare(&module)?,
-            b4: PreparedBatchRoute::prepare(&module)?,
-            b5: PreparedBatchRoute::prepare(&module)?,
-            b6: PreparedBatchRoute::prepare(&module)?,
-            b7: PreparedBatchRoute::prepare(&module)?,
-            b8: PreparedBatchRoute::prepare(&module)?,
+            routes: Qwen36Nvfp4LmHeadRoutes::prepare(&module)?,
             module,
         })
     }
@@ -402,9 +416,9 @@ impl Qwen36Nvfp4LmHeadOp {
         }
 
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         input,
@@ -417,19 +431,9 @@ impl Qwen36Nvfp4LmHeadOp {
             };
         }
 
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_qwen36_nvfp4_lm_head!(&self.routes, batch, |route| launch!(route), else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.6 NVFP4 LM-head batch {batch} is outside the exact range 1..={MAX_BATCH}"
-            ))),
-        }
+            ))) )
     }
 }
 
