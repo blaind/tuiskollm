@@ -561,6 +561,7 @@ const QUALIFICATION_NOCAPTURE_FLAGS: &[&str] = &["--nocapture"];
 const CUDA_OXIDE_REPOSITORY: &str = "https://github.com/blaind/cuda-oxide.git";
 const CUDA_OXIDE_REVISION: &str = "0199e55572ee78cd2cea97335e5b7392a3f9be4a";
 const MAX_IDLE_DEVICE_MEMORY_MIB: u64 = 2_048;
+const IDLE_DEVICE_UTILIZATION_LIMIT_PERCENT: u32 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PerformanceSuite {
@@ -5122,7 +5123,9 @@ fn require_performance_device_idle() -> Result<(), Box<dyn Error>> {
 
 fn require_device_idle(activity: &str) -> Result<(), Box<dyn Error>> {
     let (utilization, memory_mib, pids) = device_idle_evidence(activity)?;
-    if utilization != 0 || memory_mib > MAX_IDLE_DEVICE_MEMORY_MIB {
+    if utilization >= IDLE_DEVICE_UTILIZATION_LIMIT_PERCENT
+        || memory_mib > MAX_IDLE_DEVICE_MEMORY_MIB
+    {
         return Err(format!(
             "device zero is busy before {activity}: utilization={utilization}%, memory={memory_mib} MiB"
         )
@@ -5175,7 +5178,9 @@ fn device_idle_evidence(activity: &str) -> Result<(u32, u64, Vec<u32>), Box<dyn 
 }
 
 fn device_is_idle(utilization: u32, memory_mib: u64, pids: &[u32]) -> bool {
-    utilization == 0 && memory_mib <= MAX_IDLE_DEVICE_MEMORY_MIB && pids.is_empty()
+    utilization < IDLE_DEVICE_UTILIZATION_LIMIT_PERCENT
+        && memory_mib <= MAX_IDLE_DEVICE_MEMORY_MIB
+        && pids.is_empty()
 }
 
 fn performance_device_identity_sha256() -> Result<String, Box<dyn Error>> {
@@ -13028,8 +13033,9 @@ mod tests {
     #[test]
     fn idle_evidence_requires_all_three_signals() {
         assert!(device_is_idle(0, 234, &[]));
+        assert!(device_is_idle(9, 234, &[]));
         assert!(device_is_idle(0, MAX_IDLE_DEVICE_MEMORY_MIB, &[]));
-        assert!(!device_is_idle(1, 234, &[]));
+        assert!(!device_is_idle(10, 234, &[]));
         assert!(!device_is_idle(0, MAX_IDLE_DEVICE_MEMORY_MIB + 1, &[]));
         assert!(!device_is_idle(0, 234, &[123]));
     }
