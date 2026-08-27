@@ -269,6 +269,14 @@ mod qwen38_flash_next_hyper_connection;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_hyper_connection_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_moe_experts;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_moe_experts_benchmark;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_moe_router;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_moe_router_benchmark;
+#[cfg(feature = "device")]
 mod qwen38_flash_next_qsa_attention;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_qsa_attention_benchmark;
@@ -741,6 +749,20 @@ pub use qwen38_flash_next_hyper_connection::{
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_hyper_connection_benchmark::benchmark_qwen38_flash_next_hyper_connection;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_moe_experts::{
+    Qwen38FlashNextMoeExpertsQualification, Qwen38FlashNextMoeExpertsQualificationError,
+    SlotAssignment, qualify_qwen38_flash_next_moe_experts,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_moe_experts_benchmark::benchmark_qwen38_flash_next_moe_experts;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_moe_router::{
+    Qwen38FlashNextMoeRouterQualification, Qwen38FlashNextMoeRouterQualificationError,
+    qualify_qwen38_flash_next_moe_router,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_moe_router_benchmark::benchmark_qwen38_flash_next_moe_router;
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_qsa_attention::{
     Qwen38FlashNextQsaAttentionQualification, Qwen38FlashNextQsaAttentionQualificationError,

@@ -86,6 +86,10 @@ const QWEN38_FLASH_NEXT_QSA_ATTENTION_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen38-flash-next-qsa-attention-sm120.txt";
 const QWEN38_FLASH_NEXT_QSA_SELECTION_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen38-flash-next-qsa-selection-sm120.txt";
+const QWEN38_FLASH_NEXT_MOE_ROUTER_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen38-flash-next-moe-router-sm120.txt";
+const QWEN38_FLASH_NEXT_MOE_EXPERTS_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen38-flash-next-moe-experts-sm120.txt";
 const ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/attention-qk-prepare-sm120.txt";
 const QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
@@ -164,6 +168,8 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     QWEN38_FLASH_NEXT_QSA_PREPARE_RESOURCE_BASELINE,
     QWEN38_FLASH_NEXT_QSA_ATTENTION_RESOURCE_BASELINE,
     QWEN38_FLASH_NEXT_QSA_SELECTION_RESOURCE_BASELINE,
+    QWEN38_FLASH_NEXT_MOE_ROUTER_RESOURCE_BASELINE,
+    QWEN38_FLASH_NEXT_MOE_EXPERTS_RESOURCE_BASELINE,
     ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
@@ -407,6 +413,14 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
     (
         "qwen38-flash-next-qsa-selection",
         &[QWEN38_FLASH_NEXT_QSA_SELECTION_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen38-flash-next-moe-router",
+        &[QWEN38_FLASH_NEXT_MOE_ROUTER_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen38-flash-next-moe-experts",
+        &[QWEN38_FLASH_NEXT_MOE_EXPERTS_RESOURCE_BASELINE],
     ),
     (
         "qwen36-gdn-recurrence",
@@ -1201,6 +1215,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "qualify-qwen38-flash-next-qsa-selection",
         qualify_qwen38_flash_next_qsa_selection,
     ),
+    no_args(
+        "qualify-qwen38-flash-next-moe-router",
+        qualify_qwen38_flash_next_moe_router,
+    ),
+    no_args(
+        "qualify-qwen38-flash-next-moe-experts",
+        qualify_qwen38_flash_next_moe_experts,
+    ),
     no_args("qualify-gdn-recurrence", qualify_gdn_recurrence),
     no_args("qualify-gdn-output", qualify_gdn_output),
     no_args("qualify-attention-qk-prepare", qualify_attention_qk_prepare),
@@ -1334,6 +1356,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "bench-qwen38-flash-next-qsa-selection",
         bench_qwen38_flash_next_qsa_selection,
     ),
+    forwarded(
+        "bench-qwen38-flash-next-moe-router",
+        bench_qwen38_flash_next_moe_router,
+    ),
+    forwarded(
+        "bench-qwen38-flash-next-moe-experts",
+        bench_qwen38_flash_next_moe_experts,
+    ),
     forwarded("bench-gdn-recurrence", bench_gdn_recurrence),
     forwarded("bench-gdn-output", bench_gdn_output),
     forwarded("bench-attention-qk-prepare", bench_attention_qk_prepare),
@@ -1457,6 +1487,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
     no_args(
         "gate-qwen38-flash-next-qsa-selection",
         gate_qwen38_flash_next_qsa_selection,
+    ),
+    no_args(
+        "gate-qwen38-flash-next-moe-router",
+        gate_qwen38_flash_next_moe_router,
+    ),
+    no_args(
+        "gate-qwen38-flash-next-moe-experts",
+        gate_qwen38_flash_next_moe_experts,
     ),
     no_args("gate-gdn-recurrence", gate_gdn_recurrence),
     no_args("gate-gdn-output", gate_gdn_output),
@@ -1900,6 +1938,9 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_qwen38_flash_next_gdn_recurrence(root)?;
     gate_qwen38_flash_next_qsa_prepare(root)?;
     gate_qwen38_flash_next_qsa_attention(root)?;
+    gate_qwen38_flash_next_qsa_selection(root)?;
+    gate_qwen38_flash_next_moe_router(root)?;
+    gate_qwen38_flash_next_moe_experts(root)?;
     gate_gdn_state_snapshot(root)?;
     gate_gdn_output(root)?;
     gate_attention_qk_prepare(root)?;
@@ -2838,6 +2879,28 @@ fn qualify_qwen38_flash_next_qsa_selection(root: &Path) -> Result<(), Box<dyn Er
     gate_qwen38_flash_next_qsa_selection(root)
 }
 
+/// Runs the MoE router oracle, accounting tests, and artifact gate.
+fn qualify_qwen38_flash_next_moe_router(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        "qwen38_flash_next_moe_router",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
+    )?;
+    gate_qwen38_flash_next_moe_router(root)
+}
+
+/// Runs the MoE expert oracle, accounting tests, and artifact gate.
+fn qualify_qwen38_flash_next_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        "qwen38_flash_next_moe_experts",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
+    )?;
+    gate_qwen38_flash_next_moe_experts(root)
+}
+
 fn qualify_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
     run_qualification_test(
         root,
@@ -3691,6 +3754,20 @@ fn bench_qwen38_flash_next_qsa_selection(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     run_bench_device(root, "qwen38-flash-next-qsa-selection", arguments)
+}
+
+fn bench_qwen38_flash_next_moe_router(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-moe-router", arguments)
+}
+
+fn bench_qwen38_flash_next_moe_experts(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-moe-experts", arguments)
 }
 
 fn bench_qwen36_gdn_recurrence(
@@ -8456,6 +8533,210 @@ fn gate_qwen38_flash_next_qsa_selection(root: &Path) -> Result<(), Box<dyn Error
         "Qwen3.8-Flash-Next QSA selection gate passed: 56 entries, STACK:0 LOCAL:0, {measured:?}, exact indexer instruction shapes and SASS present"
     );
 
+    Ok(())
+}
+
+/// Pins every Qwen3.8-Flash-Next MoE router entry and its 512-way softmax.
+fn gate_qwen38_flash_next_moe_router(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN38_FLASH_NEXT_MOE_ROUTER_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let entries = &sm120_gate_module(root)?.entries;
+    let family = |prefix: &str| {
+        entries
+            .iter()
+            .filter(|entry| entry.name.starts_with(prefix))
+            .collect::<Vec<_>>()
+    };
+    let logits = family("qwen38_flash_next_moe_router_logits_TID_");
+    let logits_prefill = family("qwen38_flash_next_moe_router_logits_prefill_TID_");
+    let select = family("qwen38_flash_next_moe_router_select_TID_");
+    let select_prefill = family("qwen38_flash_next_moe_router_select_prefill_TID_");
+    require_count(
+        "Qwen3.8-Flash-Next MoE router decode logits",
+        logits.len(),
+        8,
+    )?;
+    require_count(
+        "Qwen3.8-Flash-Next MoE router prefill logits",
+        logits_prefill.len(),
+        4,
+    )?;
+    require_count(
+        "Qwen3.8-Flash-Next MoE router decode selection",
+        select.len(),
+        8,
+    )?;
+    require_count(
+        "Qwen3.8-Flash-Next MoE router prefill selection",
+        select_prefill.len(),
+        4,
+    )?;
+
+    for entry in logits.iter().chain(&logits_prefill) {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in select.iter().chain(&select_prefill) {
+        if !entry.body.contains(".reqntid 32, 1, 1") {
+            return Err(format!("entry `{}` lost its one-warp launch bounds", entry.name).into());
+        }
+        let exponentials = entry.body.matches("ex2.approx.f32").count();
+        let divisions = entry.body.matches("div.rn.f32").count();
+        if exponentials != 16 || divisions != 26 {
+            return Err(format!(
+                "entry `{}` has {exponentials} exponentials and {divisions} divisions; expected 16 and 26 for the 512-way softmax",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    let mut logit_registers = Vec::new();
+    let mut select_registers = Vec::new();
+    for (group, registers) in [
+        (
+            logits.iter().chain(&logits_prefill).collect::<Vec<_>>(),
+            &mut logit_registers,
+        ),
+        (
+            select.iter().chain(&select_prefill).collect::<Vec<_>>(),
+            &mut select_registers,
+        ),
+    ] {
+        for entry in group {
+            if sass_function_body(sass, entry.name).is_none() {
+                return Err(format!(
+                    "cuobjdump omitted Qwen3.8-Flash-Next MoE router SASS `{}`",
+                    entry.name
+                )
+                .into());
+            }
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+        }
+        registers.sort_unstable();
+    }
+    require_registers(&baseline, "logit_registers", &logit_registers)?;
+    require_registers(&baseline, "select_registers", &select_registers)?;
+
+    println!(
+        "Qwen3.8-Flash-Next MoE router gate passed: 12 logit + 12 selection entries, REG {logit_registers:?} / {select_registers:?}, STACK:0 LOCAL:0, 512-way softmax and SASS present"
+    );
+    Ok(())
+}
+
+/// Pins routed NVFP4, resident BF16, and combine expert entry families.
+fn gate_qwen38_flash_next_moe_experts(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN38_FLASH_NEXT_MOE_EXPERTS_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let entries = &sm120_gate_module(root)?.entries;
+    let family = |prefix: &str| {
+        entries
+            .iter()
+            .filter(|entry| entry.name.starts_with(prefix))
+            .collect::<Vec<_>>()
+    };
+    let routed = [
+        family("qwen38_flash_next_moe_expert_gate_up_TID_"),
+        family("qwen38_flash_next_moe_expert_gate_up_prefill_TID_"),
+        family("qwen38_flash_next_moe_expert_down_TID_"),
+        family("qwen38_flash_next_moe_expert_down_prefill_TID_"),
+    ];
+    let shared = [
+        family("qwen38_flash_next_moe_shared_expert_gate_up_TID_"),
+        family("qwen38_flash_next_moe_shared_expert_gate_up_prefill_TID_"),
+        family("qwen38_flash_next_moe_shared_expert_down_TID_"),
+        family("qwen38_flash_next_moe_shared_expert_down_prefill_TID_"),
+    ];
+    let combine = [
+        family("qwen38_flash_next_moe_expert_combine_TID_"),
+        family("qwen38_flash_next_moe_expert_combine_prefill_TID_"),
+    ];
+    for (label, group) in [
+        ("routed gate/up decode", &routed[0]),
+        ("routed gate/up prefill", &routed[1]),
+        ("routed down decode", &routed[2]),
+        ("routed down prefill", &routed[3]),
+        ("shared gate/up decode", &shared[0]),
+        ("shared gate/up prefill", &shared[1]),
+        ("shared down decode", &shared[2]),
+        ("shared down prefill", &shared[3]),
+        ("combine decode", &combine[0]),
+        ("combine prefill", &combine[1]),
+    ] {
+        require_count(
+            &format!("Qwen3.8-Flash-Next MoE {label}"),
+            group.len(),
+            if label.ends_with("prefill") { 4 } else { 8 },
+        )?;
+    }
+
+    for entry in routed.iter().flatten() {
+        if !entry.body.contains("cvt.rn.f16x2.e2m1x2") {
+            return Err(format!("routed entry `{}` lost its E2M1 decode", entry.name).into());
+        }
+    }
+    for entry in shared.iter().flatten() {
+        if entry.body.contains("cvt.rn.f16x2.e2m1x2") {
+            return Err(format!(
+                "shared-expert entry `{}` decodes E2M1 from its BF16 plane",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    let mut routed_registers = Vec::new();
+    let mut shared_registers = Vec::new();
+    let mut combine_registers = Vec::new();
+    for (groups, registers) in [
+        (&routed[..], &mut routed_registers),
+        (&shared[..], &mut shared_registers),
+        (&combine[..], &mut combine_registers),
+    ] {
+        for entry in groups.iter().flatten() {
+            if sass_function_body(sass, entry.name).is_none() {
+                return Err(format!(
+                    "cuobjdump omitted Qwen3.8-Flash-Next MoE expert SASS `{}`",
+                    entry.name
+                )
+                .into());
+            }
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+        }
+        registers.sort_unstable();
+    }
+    require_registers(&baseline, "routed_registers", &routed_registers)?;
+    require_registers(&baseline, "shared_registers", &shared_registers)?;
+    require_registers(&baseline, "combine_registers", &combine_registers)?;
+
+    println!(
+        "Qwen3.8-Flash-Next MoE expert gate passed: 24 routed + 24 shared + 12 combine entries, REG {routed_registers:?} / {shared_registers:?} / {combine_registers:?}, STACK:0 LOCAL:0, E2M1 routed and BF16 shared representations and SASS present"
+    );
     Ok(())
 }
 
@@ -14057,6 +14338,8 @@ mod tests {
                 "qual/baselines/qwen38-flash-next-qsa-prepare-sm120.txt",
                 "qual/baselines/qwen38-flash-next-qsa-attention-sm120.txt",
                 "qual/baselines/qwen38-flash-next-qsa-selection-sm120.txt",
+                "qual/baselines/qwen38-flash-next-moe-router-sm120.txt",
+                "qual/baselines/qwen38-flash-next-moe-experts-sm120.txt",
                 "qual/baselines/attention-qk-prepare-sm120.txt",
                 "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",
                 "qual/baselines/qwen36-attention-qk-prepare-sm120.txt",
@@ -14797,6 +15080,18 @@ mod tests {
                 NO_SNAPSHOT,
             ),
             (
+                "qualify-qwen38-flash-next-moe-router",
+                "qwen38_flash_next_moe_router",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen38-flash-next-moe-experts",
+                "qwen38_flash_next_moe_experts",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
                 "qualify-gdn-recurrence",
                 "gdn_recurrence::tests::route_inventory_and_arena_accounting_are_exact",
                 EXACT_SERIAL,
@@ -15003,7 +15298,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 90);
+        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 92);
 
         let snapshot = OsString::from("/snapshot");
         for &(command, filter, trailing, variable) in EXPECTED_QUALIFICATION_ROUTES {
