@@ -207,6 +207,8 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-qwen35-attention-qk-prepare` | Check Qwen3.5 Q/K zero-centered normalization, three-axis MRoPE, represented BF16 cache append, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-gdn-prepare` | Check the two control formulas, mapped width-4 convolution/history updates, immutable seams, stable ownership, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-gdn-recurrence` | Check mapped FP32 state transitions, causal prefill, gated normalization, immutable seams, stable ownership, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
+| `cargo run -p xtask -- qualify-qwen38-flash-next-gdn-prepare` | Check target-specific controls, reused convolution/history, and graph replay at B=1..8, K=1..4, and T=32/64/128/1024 | terminal |
+| `cargo run -p xtask -- qualify-qwen38-flash-next-gdn-recurrence` | Check FP32 state/intermediate planes, sigmoid-gated output, and graph replay at B=1..8, K=1..4, and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-gdn-output` | Check dynamic E4M3 quantization, source-native output projection, immutable seams, stable ownership, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-attention-qk-prepare` | Check Q/K zero-centered normalization, three-axis MRoPE, represented E4M3 cache append, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
 | `cargo run -p xtask -- qualify-paged-gqa` | Check exact page lookup, grouped-head mapping, represented E4M3 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8, shared T=32/64/128 prefill, and partitioned T=128 P8/P16 deep tails | terminal |
@@ -243,6 +245,8 @@ replay counts into their performance identity; a baseline comparison refuses whe
 | `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
 | `cargo run -p xtask -- bench-gdn-prepare` | Measure every exact control-plus-convolution graph after an untimed exact-history restore | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-recurrence` | Measure every exact stateful recurrence graph after an untimed exact-state restore | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen38-flash-next-gdn-prepare` | Measure every exact decode, causal, and prefill prepare graph after untimed history restore | terminal or `--json PATH` |
+| `cargo run -p xtask -- bench-qwen38-flash-next-gdn-recurrence` | Measure every exact decode, causal, and prefill recurrence graph after untimed state restore | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-gdn-output` | Measure every exact decode and prefill output quantize-plus-projection graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-attention-qk-prepare` | Measure every exact Q/K prepare and cache-append graph | terminal or `--json PATH` |
 | `cargo run -p xtask -- bench-paged-gqa` | Measure exact B=1..8 graphs at a 130-token context, causal shared T=32/64/128 graphs, partitioned T=128 tails, and production-P4 T=1024 macro graphs at contexts 32,768 and 98,304 | terminal or `--json PATH` |

@@ -19,6 +19,19 @@ fn load_bf16(source: *const u16) -> f32 {
     f32::from_bits((unsafe { *source } as u32) << 16)
 }
 
+/// Applies the route's exact `sigmoid` or SiLU output gate.
+///
+/// Keep `gate / denominator` for SiLU to preserve its represented result.
+#[inline(always)]
+fn output_gate<const SIGMOID: bool>(gate: f32) -> f32 {
+    let denominator = 1.0 + float::ex2_approx_f32(-gate * core::f32::consts::LOG2_E);
+    if SIGMOID {
+        1.0 / denominator
+    } else {
+        gate / denominator
+    }
+}
+
 #[inline(always)]
 fn block_sum(value: f32, shared: *mut f32, lane: usize, warp_index: usize) -> f32 {
     let value = warp::reduce_sum_f32(value);
@@ -79,7 +92,7 @@ fn block_sum2(a: f32, b: f32, shared: *mut f32, lane: usize, warp_index: usize) 
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn gdn_recurrence_token<A: Arch, const PREFILL: bool>(
+unsafe fn gdn_recurrence_token<A: Arch, const PREFILL: bool, const SIGMOID_GATE: bool>(
     qkv: *const u16,
     projected: *const u16,
     log_decay: *const f32,
@@ -341,17 +354,16 @@ unsafe fn gdn_recurrence_token<A: Arch, const PREFILL: bool>(
         let gate = load_bf16(unsafe {
             projected.add(token * A::GDN_INPUT_ROWS + A::GDN_QKV_ROWS + value_head * HEAD_DIM + tid)
         });
-        let silu = gate / (1.0 + float::ex2_approx_f32(-gate * core::f32::consts::LOG2_E));
         unsafe {
             *output.add(token * VALUE_WIDTH + value_head * HEAD_DIM + tid) =
-                tcgen05::f32_to_bf16_rne(normalized * silu);
+                tcgen05::f32_to_bf16_rne(normalized * output_gate::<SIGMOID_GATE>(gate));
         }
     }
 }
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn gdn_recurrence<A: Arch, const TOKENS: usize>(
+pub(crate) unsafe fn gdn_recurrence<A: Arch, const TOKENS: usize, const SIGMOID_GATE: bool>(
     qkv: *const u16,
     projected: *const u16,
     log_decay: *const f32,
@@ -373,7 +385,7 @@ pub(crate) unsafe fn gdn_recurrence<A: Arch, const TOKENS: usize>(
     let value_head = block - token * VALUE_HEADS;
     let state_row = unsafe { *state_rows.add(token) as usize };
     unsafe {
-        gdn_recurrence_token::<A, false>(
+        gdn_recurrence_token::<A, false, SIGMOID_GATE>(
             qkv,
             projected,
             log_decay,
@@ -435,7 +447,8 @@ pub(crate) unsafe fn gdn_recurrence_prefill<A: Arch, const TOKENS: usize>(
     let mut token = 0;
     while token < TOKENS {
         unsafe {
-            gdn_recurrence_token::<A, true>(
+            // Prefill returns before the gate; retain the Qwen3.8-27B monomorphization.
+            gdn_recurrence_token::<A, true, false>(
                 qkv,
                 projected,
                 log_decay,
@@ -468,7 +481,11 @@ pub(crate) unsafe fn gdn_recurrence_prefill<A: Arch, const TOKENS: usize>(
 /// recurrent row in parallel. Each CTA replicates the sixteen-warp reduction
 /// tree the serial loop used, so every emitted value stays bit-exact.
 #[inline(always)]
-pub(crate) unsafe fn gdn_recurrence_prefill_epilogue<A: Arch, const TOKENS: usize>(
+pub(crate) unsafe fn gdn_recurrence_prefill_epilogue<
+    A: Arch,
+    const TOKENS: usize,
+    const SIGMOID_GATE: bool,
+>(
     projected: *const u16,
     norm_weight: *const u16,
     recurrent_plane: *const f32,
@@ -502,10 +519,9 @@ pub(crate) unsafe fn gdn_recurrence_prefill_epilogue<A: Arch, const TOKENS: usiz
         let gate = load_bf16(unsafe {
             projected.add(token * A::GDN_INPUT_ROWS + A::GDN_QKV_ROWS + value_head * HEAD_DIM + tid)
         });
-        let silu = gate / (1.0 + float::ex2_approx_f32(-gate * core::f32::consts::LOG2_E));
         unsafe {
             *output.add(token * VALUE_WIDTH + value_head * HEAD_DIM + tid) =
-                tcgen05::f32_to_bf16_rne(normalized * silu);
+                tcgen05::f32_to_bf16_rne(normalized * output_gate::<SIGMOID_GATE>(gate));
         }
     }
 }

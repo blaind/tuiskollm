@@ -257,6 +257,14 @@ mod qwen36_text_endpoint;
 #[cfg(feature = "device")]
 mod qwen36_text_endpoint_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_gdn_prepare;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_gdn_prepare_benchmark;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_gdn_recurrence;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_gdn_recurrence_benchmark;
+#[cfg(feature = "device")]
 mod resident_batch_generation;
 #[cfg(feature = "device")]
 mod resident_generation;
@@ -698,6 +706,20 @@ pub use qwen36_text_endpoint::{
 };
 #[cfg(feature = "device")]
 pub use qwen36_text_endpoint_benchmark::benchmark_qwen36_text_endpoint;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_gdn_prepare::{
+    Qwen38FlashNextGdnPrepareQualification, Qwen38FlashNextGdnPrepareQualificationError,
+    qualify_qwen38_flash_next_gdn_prepare,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_gdn_prepare_benchmark::benchmark_qwen38_flash_next_gdn_prepare;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_gdn_recurrence::{
+    Qwen38FlashNextGdnRecurrenceQualification, Qwen38FlashNextGdnRecurrenceQualificationError,
+    qualify_qwen38_flash_next_gdn_recurrence,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_gdn_recurrence_benchmark::benchmark_qwen38_flash_next_gdn_recurrence;
 #[cfg(feature = "device")]
 pub use resident_batch_generation::{
     ResidentBatchGenerationQualification, ResidentBatchGenerationQualificationError,

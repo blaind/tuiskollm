@@ -30,7 +30,8 @@ pub use tuisko_kernels_sm120_fp8_projection::{
 };
 pub use tuisko_kernels_sm120_gdn::{
     GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp, Qwen35GdnPrepareOp, Qwen35GdnRecurrenceOp,
-    Qwen36GdnPrepareOp, Qwen36GdnRecurrenceOp,
+    Qwen36GdnPrepareOp, Qwen36GdnRecurrenceOp, Qwen38FlashNextGdnPrepareOp,
+    Qwen38FlashNextGdnRecurrenceOp, Qwen38FlashNextGdnStateSnapshotOp,
 };
 pub use tuisko_kernels_sm120_lm_head::{Qwen35Bf16LmHeadOp, Qwen36Nvfp4LmHeadOp};
 pub use tuisko_kernels_sm120_moe::{Qwen36MoeExpertsOp, Qwen36MoeRouterOp, Qwen36MtpBf16MoeOp};
