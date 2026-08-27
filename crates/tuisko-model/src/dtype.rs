@@ -12,6 +12,8 @@ pub enum DType {
     F32,
     /// One-byte FP8 E4M3 source codes.
     Fp8E4M3,
+    /// Eight-byte signed integers carrying checkpoint-resident lookup constants.
+    I64,
     /// Raw bytes, including packed E2M1 NVFP4 weights.
     U8,
 }
@@ -22,6 +24,7 @@ impl DType {
         match self {
             Self::Bf16 => 2,
             Self::F32 => 4,
+            Self::I64 => 8,
             Self::Fp8E4M3 | Self::U8 => 1,
         }
     }
@@ -32,6 +35,7 @@ impl DType {
             Self::Bf16 => "BF16",
             Self::F32 => "F32",
             Self::Fp8E4M3 => "F8_E4M3",
+            Self::I64 => "I64",
             Self::U8 => "U8",
         }
     }
@@ -54,6 +58,7 @@ impl<'de> Deserialize<'de> for DType {
             "BF16" => Ok(Self::Bf16),
             "F32" => Ok(Self::F32),
             "F8_E4M3" => Ok(Self::Fp8E4M3),
+            "I64" => Ok(Self::I64),
             "U8" => Ok(Self::U8),
             _ => Err(de::Error::custom(format_args!(
                 "unsupported checkpoint dtype `{name}`"
@@ -72,6 +77,7 @@ mod tests {
             ("BF16", DType::Bf16, 2),
             ("F32", DType::F32, 4),
             ("F8_E4M3", DType::Fp8E4M3, 1),
+            ("I64", DType::I64, 8),
             ("U8", DType::U8, 1),
         ] {
             let dtype: DType = serde_json::from_str(&format!("\"{name}\"")).unwrap();

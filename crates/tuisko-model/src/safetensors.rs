@@ -98,7 +98,8 @@ impl SafeTensorFile {
 
         let header_len = u64::from_le_bytes(mmap[..8].try_into().expect("eight bytes checked"));
 
-        if header_len == 0 || header_len % 8 != 0 {
+        // Safetensors headers need not be 8-byte padded. Tensor views decode from byte slices.
+        if header_len == 0 {
             return Err(CheckpointError::safetensors(format!(
                 "{} has invalid safetensors header length {header_len}",
                 path.display()
@@ -489,6 +490,31 @@ mod tests {
         let scales = file.tensor("scales").unwrap();
 
         assert_eq!(scales.bytes, &[0x80, 0x3f, 0x00, 0x40]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn admits_an_unpadded_header_length() {
+        // Written manually because `write_raw_safetensors` pads its headers.
+        let path = fixture_path("unpadded-header");
+        let header = br#"{"x": {"dtype":"BF16", "shape":[2], "data_offsets":[0,4]}}"#;
+
+        assert!(!header.len().is_multiple_of(8));
+
+        let mut file = File::create(&path).unwrap();
+
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header).unwrap();
+        file.write_all(&[0x80, 0x3f, 0x00, 0x40]).unwrap();
+        drop(file);
+
+        let file = SafeTensorFile::open(&path).unwrap();
+        let x = file.tensor("x").unwrap();
+
+        assert_eq!(x.dtype, DType::Bf16);
+        assert_eq!(x.bytes, &[0x80, 0x3f, 0x00, 0x40]);
 
         fs::remove_file(path).unwrap();
     }
