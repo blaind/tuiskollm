@@ -44,6 +44,8 @@ const QWEN36_COMPACT_GENERATION_ROUTE: &str = "compact-b1-8";
 /// Startup configuration for the one exact resident server.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerConfig {
+    /// Exact resident model selected for this process.
+    pub model: ServerModel,
     /// Admitted pinned snapshot directory.
     pub snapshot: PathBuf,
     /// TCP address on which the OpenAI routes listen.
@@ -115,29 +117,36 @@ struct Ready {
     detailed_load_timing: bool,
 }
 
+/// Exact model loaders compiled into the server.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResidentTarget {
+pub enum ServerModel {
+    /// `unsloth/Qwen3.8-27B-NVFP4`.
     Qwen38,
+    /// `AxionML/Qwen3.5-9B-NVFP4`.
     Qwen35,
+    /// `nvidia/Qwen3.6-35B-A3B-NVFP4`.
     Qwen36,
 }
 
-impl ResidentTarget {
-    fn from_snapshot(root: &Path) -> Result<Self, String> {
-        match root.file_name().and_then(|name| name.to_str()) {
-            Some(Qwen38_27B::REVISION) => Ok(Self::Qwen38),
-            Some(Qwen35_9B::REVISION) => Ok(Self::Qwen35),
-            Some(Qwen36Moe35B::REVISION) => Ok(Self::Qwen36),
-            actual => Err(format!(
-                "snapshot revision {actual:?} is not {}, {}, or {}",
-                Qwen38_27B::REVISION,
-                Qwen35_9B::REVISION,
-                Qwen36Moe35B::REVISION
+impl ServerModel {
+    /// Every exact model currently served by this executable.
+    pub const ALL: [Self; 3] = [Self::Qwen38, Self::Qwen35, Self::Qwen36];
+
+    /// Resolves one exact Hugging Face model ID without aliases or discovery.
+    pub fn from_model_id(model_id: &str) -> Result<Self, String> {
+        match model_id {
+            Qwen38_27B::MODEL_ID => Ok(Self::Qwen38),
+            Qwen35_9B::MODEL_ID => Ok(Self::Qwen35),
+            Qwen36Moe35B::MODEL_ID => Ok(Self::Qwen36),
+            _ => Err(format!(
+                "unsupported model `{model_id}`; expected one of: {}",
+                Self::ALL.map(Self::model_id).join(", ")
             )),
         }
     }
 
-    const fn model_id(self) -> &'static str {
+    /// Exact Hugging Face repository admitted by this loader.
+    pub const fn model_id(self) -> &'static str {
         match self {
             Self::Qwen38 => Qwen38_27B::MODEL_ID,
             Self::Qwen35 => Qwen35_9B::MODEL_ID,
@@ -154,10 +163,18 @@ impl ResidentTarget {
     }
 }
 
+impl std::str::FromStr for ServerModel {
+    type Err = String;
+
+    fn from_str(model_id: &str) -> Result<Self, Self::Err> {
+        Self::from_model_id(model_id)
+    }
+}
+
 /// Loads the exact resident model, then serves health, model, blocking, and SSE routes.
 pub fn run(config: ServerConfig) -> Result<(), ServerError> {
     let startup_start = Instant::now();
-    let target = ResidentTarget::from_snapshot(&config.snapshot).map_err(ServerError::Startup)?;
+    let target = config.model;
     let stdout = std::io::stdout();
     let interactive = stdout.is_terminal();
     let color = interactive && std::env::var_os("NO_COLOR").is_none();
@@ -202,7 +219,7 @@ async fn serve_until_worker_failure(
 
 fn start_worker(
     snapshot: &Path,
-    target: ResidentTarget,
+    target: ServerModel,
     output: &mut impl IoWrite,
     interactive: bool,
     color: bool,
@@ -276,7 +293,7 @@ fn start_worker(
 }
 fn engine_worker(
     snapshot: PathBuf,
-    target: ResidentTarget,
+    target: ServerModel,
     jobs: Receiver<Job>,
     ready: std_mpsc::SyncSender<Result<Ready, String>>,
     failure: oneshot::Sender<String>,
@@ -291,17 +308,17 @@ fn engine_worker(
     }
     let _readiness_guard = ReadinessGuard(Arc::clone(&worker_ready));
     match target {
-        ResidentTarget::Qwen38 => start_generator(
+        ServerModel::Qwen38 => start_generator(
             load_qwen38(&snapshot, progress.as_ref()),
             jobs,
             ready,
             failure,
             &worker_ready,
         ),
-        ResidentTarget::Qwen35 => {
+        ServerModel::Qwen35 => {
             start_generator(load_qwen35(&snapshot), jobs, ready, failure, &worker_ready)
         }
-        ResidentTarget::Qwen36 => {
+        ServerModel::Qwen36 => {
             start_generator(load_qwen36(&snapshot), jobs, ready, failure, &worker_ready)
         }
     }
@@ -328,7 +345,7 @@ fn load_qwen38(
 
     let startup = Ready {
         model_id: Qwen38_27B::MODEL_ID,
-        generation_route: ResidentTarget::Qwen38.generation_route(),
+        generation_route: ServerModel::Qwen38.generation_route(),
         generation_defaults: generator.generation_defaults(),
         device_name,
         checkpoint_admission,
@@ -366,7 +383,7 @@ fn load_qwen35(snapshot: &Path) -> Result<(Qwen35ResidentMtpBatchGenerator, Read
 
     let startup = Ready {
         model_id: Qwen35_9B::MODEL_ID,
-        generation_route: ResidentTarget::Qwen35.generation_route(),
+        generation_route: ServerModel::Qwen35.generation_route(),
         generation_defaults: generator.generation_defaults(),
         device_name,
         checkpoint_admission,
@@ -404,7 +421,7 @@ fn load_qwen36(snapshot: &Path) -> Result<(Qwen36ResidentBatchGenerator, Ready),
 
     let startup = Ready {
         model_id: Qwen36Moe35B::MODEL_ID,
-        generation_route: ResidentTarget::Qwen36.generation_route(),
+        generation_route: ServerModel::Qwen36.generation_route(),
         generation_defaults: generator.generation_defaults(),
         device_name,
         checkpoint_admission,
@@ -987,7 +1004,7 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, EnqueueError, Job, Ready, ResidentTarget, ServerError, chat_completions,
+        AppState, EnqueueError, Job, Ready, ServerError, ServerModel, chat_completions,
         enqueue_job, fail_queued, health, models, record_admission, render_loading, render_startup,
         render_weight_progress, router, serve_until_worker_failure, try_send_generation_steps,
     };
@@ -1035,7 +1052,7 @@ mod tests {
             worker_ready: Arc::new(AtomicBool::new(ready)),
             server_started: std::time::Instant::now(),
             model_id: SERVED_MODEL,
-            generation_route: ResidentTarget::Qwen38.generation_route(),
+            generation_route: ServerModel::Qwen38.generation_route(),
             generation_defaults: GenerationDefaults {
                 temperature: 1.0,
                 top_p: 0.95,
@@ -1048,7 +1065,7 @@ mod tests {
     fn startup_output_is_exact_plain_text_or_terminal_color() {
         let ready = Ready {
             model_id: SERVED_MODEL,
-            generation_route: ResidentTarget::Qwen38.generation_route(),
+            generation_route: ServerModel::Qwen38.generation_route(),
             generation_defaults: GenerationDefaults {
                 temperature: 1.0,
                 top_p: 0.95,
@@ -1115,7 +1132,7 @@ mod tests {
     fn qwen35_startup_reports_mtp_compact_route_and_slots() {
         let ready = Ready {
             model_id: Qwen35_9B::MODEL_ID,
-            generation_route: ResidentTarget::Qwen35.generation_route(),
+            generation_route: ServerModel::Qwen35.generation_route(),
             generation_defaults: GenerationDefaults {
                 temperature: 0.0,
                 top_p: 1.0,
@@ -1327,33 +1344,26 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_revision_selects_one_concrete_resident_target() {
-        for (revision, expected, model, route) in [
+    fn exact_model_id_selects_one_concrete_resident_target() {
+        for (model, expected, route) in [
+            (Qwen38_27B::MODEL_ID, ServerModel::Qwen38, "mtp-draft-3"),
             (
-                Qwen38_27B::REVISION,
-                ResidentTarget::Qwen38,
-                Qwen38_27B::MODEL_ID,
-                "mtp-draft-3",
-            ),
-            (
-                Qwen35_9B::REVISION,
-                ResidentTarget::Qwen35,
                 Qwen35_9B::MODEL_ID,
+                ServerModel::Qwen35,
                 "mtp-b1-compact-b2-8",
             ),
-            (
-                Qwen36Moe35B::REVISION,
-                ResidentTarget::Qwen36,
-                Qwen36Moe35B::MODEL_ID,
-                "compact-b1-8",
-            ),
+            (Qwen36Moe35B::MODEL_ID, ServerModel::Qwen36, "compact-b1-8"),
         ] {
-            let target = ResidentTarget::from_snapshot(std::path::Path::new(revision)).unwrap();
+            let target = ServerModel::from_model_id(model).unwrap();
             assert_eq!(target, expected);
             assert_eq!(target.model_id(), model);
             assert_eq!(target.generation_route(), route);
         }
-        assert!(ResidentTarget::from_snapshot(std::path::Path::new("moving-main")).is_err());
+        let error = ServerModel::from_model_id("moving/model").unwrap_err();
+        assert!(error.contains("unsupported model `moving/model`"));
+        for model in ServerModel::ALL {
+            assert!(error.contains(model.model_id()));
+        }
     }
 
     #[test]

@@ -133,8 +133,8 @@ def validate_binary(
     version = command_text([str(binary), "--version"], environment=environment).strip()
     if version != f"{BINARY_NAME} {expected}":
         fail(f"{binary}: --version returned {version!r}")
-    help_text = command_text([str(binary), "--help"], environment=environment)
-    if "tuiskollm serve SNAPSHOT [ADDRESS]" not in help_text:
+    help_text = command_text([str(binary), "serve", "--help"], environment=environment)
+    if "Usage: tuiskollm serve [OPTIONS] <MODEL>" not in help_text:
         fail(f"{binary}: --help omitted the serve command")
 
     binary_bytes = binary.read_bytes()

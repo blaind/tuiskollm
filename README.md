@@ -23,12 +23,15 @@ cargo run -p xtask -- build-server
 ```
 
 The output is `target/cuda-oxide-build-sm120/release/tuiskollm`. A plain `cargo build` cannot
-finalize the embedded device artifacts. Start the exact resident server with the pinned snapshot
-directory and an optional numeric listen address:
+finalize the embedded device artifacts. Select one exact model when starting the resident server:
 
 ```bash
-target/cuda-oxide-build-sm120/release/tuiskollm serve SNAPSHOT 127.0.0.1:8000
+target/cuda-oxide-build-sm120/release/tuiskollm serve \
+  unsloth/Qwen3.8-27B-NVFP4
 ```
+
+Qwen3.8 uses or downloads its pinned Hugging Face snapshot. Qwen3.5 and Qwen3.6 currently require
+`--snapshot SNAPSHOT`. Use `--address 127.0.0.1:8000` to override the default listen address.
 
 Tagged releases attach a stripped Linux x86-64 server and checksum. The archive requires glibc
 2.35 or newer, the NVIDIA driver, and the exact RTX 5090, but not Rust or the CUDA Toolkit.
@@ -48,7 +51,7 @@ device prefix restored by the resident owner; `bpe-tail` and an optional `miss:`
 separate frontend prefix lookup. Decode throughput excludes the first generated token and the TTFT
 interval. Cancelled, refused, and failed admitted jobs use the same terminal format.
 
-Passing the pinned Qwen3.5 snapshot selects its concrete 32-layer target plus source-BF16 MTP
+Selecting Qwen3.5 with its pinned snapshot loads the concrete 32-layer target plus source-BF16 MTP
 program and checkpoint defaults once at startup. Eight stable slots feed exact compact B=1..8
 target graphs. A shared 4,096-page BF16 target pool and separate MTP mirror admit 262,144 rounded
 positions across active and retained requests. Prompt priming uses the largest exact T=32/64/128
@@ -56,10 +59,10 @@ prefix and B=1 for its tail. Singleton speculative rounds use exact K=1..4 targe
 concurrent rounds use compact target execution without moving survivor state. Vision remains
 outside this route.
 
-Passing the pinned Qwen3.6 snapshot selects its concrete 40-layer GDN/MoE and attention/MoE text
-program. Prompt priming uses the largest exact T=32/64/128 whole-model prefix and B=1 for its tail.
-The initial route remains single-request and 192-token; compact batching, MTP, and Vision are not
-part of this text-support claim.
+Selecting Qwen3.6 with its pinned snapshot loads the concrete 40-layer GDN/MoE and attention/MoE
+text program. Prompt priming uses the largest exact T=32/64/128 whole-model prefix and B=1 for its
+tail. The initial route remains single-request and 192-token; compact batching, MTP, and Vision are
+not part of this text-support claim.
 
 The optional `tuisko-llm` Python package exposes the admitted tokenizer and chat-template frontend.
 It does not claim an in-process inference API; see [`python/README.md`](python/README.md).
