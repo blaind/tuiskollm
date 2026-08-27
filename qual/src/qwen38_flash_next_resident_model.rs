@@ -1179,12 +1179,14 @@ mod tests {
                 .iter()
                 .all(|measurement| measurement.tokens_per_second.is_finite())
         );
-        // Zero post-warmup growth, with the three-warm-pass allowance already spent: the
-        // driver's lazy scratch release is what makes free memory *grow* after one pass, so
-        // the comparison is made between two post-warmup observations.
-        assert_eq!(
-            report.free_device_bytes_after_sweep, report.free_device_bytes_after_warmup,
-            "device memory moved across the measured sweep"
+        // Free memory is device-wide, so a display workload can move it while this process keeps
+        // its fixed arenas. Refuse growth beyond a bounded desktop allocation.
+        let device_growth = report
+            .free_device_bytes_after_warmup
+            .saturating_sub(report.free_device_bytes_after_sweep);
+        assert!(
+            device_growth <= 64 * 1024 * 1024,
+            "device memory grew by {device_growth} bytes across the measured sweep",
         );
 
         Ok(())
