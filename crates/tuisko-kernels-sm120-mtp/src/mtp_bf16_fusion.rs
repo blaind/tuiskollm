@@ -3,6 +3,7 @@
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_kernels_sm120_norm::{
     Qwen35ResidualNormEntries, Qwen36ResidualNormEntries, Qwen38ResidualNormEntries,
@@ -733,8 +734,8 @@ impl<A: Arch> MtpFusionRoute<A> for UnadmittedFusionRoute {
     }
 }
 
-// `row_route` rejects an unadmitted width before dispatch, so this is the
-// defensive tail of a route that owns no entry.
+// The derived table rejects an unadmitted width before dispatch, so this is
+// the defensive tail of a route that owns no entry.
 fn unadmitted_route() -> GpuError {
     GpuError::invalid_launch("MTP BF16 fusion route is not admitted for this architecture")
 }
@@ -894,44 +895,6 @@ pub(crate) fn qwen36_mtp_bf16_fusion_ptx_names() -> [&'static str; 11] {
     ]
 }
 
-/// The compiled route one admitted row count selects.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RowRoute {
-    B1,
-    B2,
-    B3,
-    B4,
-    B5,
-    B6,
-    B7,
-    B8,
-    T32,
-    T64,
-    T128,
-    T1024,
-}
-
-// The admitted row schedule, transcribed from the three prepared dispatches it
-// replaces: decode B=1..=8 and prefill T=32,64,128 everywhere, and the T=1024
-// prefill only where the entry table admits it.
-fn row_route<A: Arch, E: MtpFusionEntries<A>>(rows: usize) -> Option<RowRoute> {
-    match rows {
-        1 => Some(RowRoute::B1),
-        2 => Some(RowRoute::B2),
-        3 => Some(RowRoute::B3),
-        4 => Some(RowRoute::B4),
-        5 => Some(RowRoute::B5),
-        6 => Some(RowRoute::B6),
-        7 => Some(RowRoute::B7),
-        8 => Some(RowRoute::B8),
-        32 => Some(RowRoute::T32),
-        64 => Some(RowRoute::T64),
-        128 => Some(RowRoute::T128),
-        1_024 if E::HAS_T1024 => Some(RowRoute::T1024),
-        _ => None,
-    }
-}
-
 fn unsupported_rows<A: Arch, E: MtpFusionEntries<A>>(rows: usize) -> GpuError {
     let admitted = if E::HAS_T1024 {
         format!("{PREFILL_ROUTES:?}")
@@ -944,23 +907,47 @@ fn unsupported_rows<A: Arch, E: MtpFusionEntries<A>>(rows: usize) -> GpuError {
     ))
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_mtp_bf16_fusion),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
+    inventory(false)
+)]
+struct MtpBf16FusionRoutes<A: Arch, E: MtpFusionEntries<A>> {
+    #[route(1)]
+    b1: E::Decode<1>,
+    #[route(2)]
+    b2: E::Decode<2>,
+    #[route(3)]
+    b3: E::Decode<3>,
+    #[route(4)]
+    b4: E::Decode<4>,
+    #[route(5)]
+    b5: E::Decode<5>,
+    #[route(6)]
+    b6: E::Decode<6>,
+    #[route(7)]
+    b7: E::Decode<7>,
+    #[route(8)]
+    b8: E::Decode<8>,
+    #[route(32)]
+    t32: E::Prefill<32>,
+    #[route(64)]
+    t64: E::Prefill<64>,
+    #[route(128)]
+    t128: E::Prefill<128>,
+    #[route(1024, admitted(E::HAS_T1024))]
+    t1024: E::Prefill1024,
+}
+
 /// Prepared source-BF16 input-fusion routes for exact MTP decode `B=1..=8`
 /// and the entry table's admitted prefill widths.
 pub struct MtpBf16FusionOp<A: Arch = Qwen38_27B, E: MtpFusionEntries<A> = Qwen38MtpFusionEntries> {
     norm: ResidualNormOp<A, E::NormEntries>,
     module: kernels::LoadedModule,
-    b1: E::Decode<1>,
-    b2: E::Decode<2>,
-    b3: E::Decode<3>,
-    b4: E::Decode<4>,
-    b5: E::Decode<5>,
-    b6: E::Decode<6>,
-    b7: E::Decode<7>,
-    b8: E::Decode<8>,
-    t32: E::Prefill<32>,
-    t64: E::Prefill<64>,
-    t128: E::Prefill<128>,
-    t1024: E::Prefill1024,
+    routes: MtpBf16FusionRoutes<A, E>,
 }
 
 /// Prepared source-BF16 input-fusion routes for exact Qwen3.5 MTP rows.
@@ -978,21 +965,12 @@ impl<A: Arch, E: MtpFusionEntries<A>> MtpBf16FusionOp<A, E> {
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module(E::MODULE_OPERATION, source))?;
 
+        let routes = MtpBf16FusionRoutes::prepare(&module)?;
+
         Ok(Self {
             norm: ResidualNormOp::<A, E::NormEntries>::new(context)?,
-            b1: E::Decode::<1>::prepare(&module)?,
-            b2: E::Decode::<2>::prepare(&module)?,
-            b3: E::Decode::<3>::prepare(&module)?,
-            b4: E::Decode::<4>::prepare(&module)?,
-            b5: E::Decode::<5>::prepare(&module)?,
-            b6: E::Decode::<6>::prepare(&module)?,
-            b7: E::Decode::<7>::prepare(&module)?,
-            b8: E::Decode::<8>::prepare(&module)?,
-            t32: E::Prefill::<32>::prepare(&module)?,
-            t64: E::Prefill::<64>::prepare(&module)?,
-            t128: E::Prefill::<128>::prepare(&module)?,
-            t1024: E::Prefill1024::prepare(&module)?,
             module,
+            routes,
         })
     }
 
@@ -1034,76 +1012,43 @@ impl<A: Arch, E: MtpFusionEntries<A>> MtpBf16FusionOp<A, E> {
                 .launch_plain(stream, rows, hidden, hidden_norm_weight, normalized_hidden)?;
         }
 
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: dispatch preserves the public pointer and exact-width contracts.
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        normalized_embedding,
-                        normalized_hidden,
-                        projection_weight,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match row_route::<A, E>(rows) {
-            Some(RowRoute::B1) => launch!(b1),
-            Some(RowRoute::B2) => launch!(b2),
-            Some(RowRoute::B3) => launch!(b3),
-            Some(RowRoute::B4) => launch!(b4),
-            Some(RowRoute::B5) => launch!(b5),
-            Some(RowRoute::B6) => launch!(b6),
-            Some(RowRoute::B7) => launch!(b7),
-            Some(RowRoute::B8) => launch!(b8),
-            Some(RowRoute::T32) => launch!(t32),
-            Some(RowRoute::T64) => launch!(t64),
-            Some(RowRoute::T128) => launch!(t128),
-            Some(RowRoute::T1024) => launch!(t1024),
-            None => Err(unsupported_rows::<A, E>(rows)),
-        }
+        dispatch_mtp_bf16_fusion!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    normalized_embedding,
+                    normalized_hidden,
+                    projection_weight,
+                    output,
+                )
+            },
+            else => Err(unsupported_rows::<A, E>(rows))
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCKS, FUSION_COLUMNS, HIDDEN, MtpFusionEntries, OUTPUT_TILES, PREFILL_ROUTES,
-        QWEN35_FUSION_COLUMNS, QWEN35_HIDDEN, QWEN35_OUTPUT_TILES, QWEN35_PREFILL_ROUTES,
-        QWEN36_FUSION_COLUMNS, QWEN36_HIDDEN, QWEN36_OUTPUT_TILES, Qwen35MtpFusionEntries,
-        Qwen36MtpFusionEntries, Qwen38MtpFusionEntries, RowRoute, WARPS,
+        BLOCKS, FUSION_COLUMNS, HIDDEN, MtpBf16FusionRoutes, MtpFusionEntries, OUTPUT_TILES,
+        PREFILL_ROUTES, QWEN35_FUSION_COLUMNS, QWEN35_HIDDEN, QWEN35_OUTPUT_TILES,
+        QWEN35_PREFILL_ROUTES, QWEN36_FUSION_COLUMNS, QWEN36_HIDDEN, QWEN36_OUTPUT_TILES,
+        Qwen35MtpFusionEntries, Qwen36MtpFusionEntries, Qwen38MtpFusionEntries, WARPS,
         mtp_bf16_fusion_prefill_ptx_names, mtp_bf16_fusion_ptx_names,
-        qwen35_mtp_bf16_fusion_ptx_names, qwen36_mtp_bf16_fusion_ptx_names, row_route,
-        unsupported_rows,
+        qwen35_mtp_bf16_fusion_ptx_names, qwen36_mtp_bf16_fusion_ptx_names, unsupported_rows,
     };
     use std::collections::BTreeSet;
     use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
     /// The decode and prefill widths every admitted architecture routes.
-    const SHARED_SCHEDULE: [(usize, RowRoute); 11] = [
-        (1, RowRoute::B1),
-        (2, RowRoute::B2),
-        (3, RowRoute::B3),
-        (4, RowRoute::B4),
-        (5, RowRoute::B5),
-        (6, RowRoute::B6),
-        (7, RowRoute::B7),
-        (8, RowRoute::B8),
-        (32, RowRoute::T32),
-        (64, RowRoute::T64),
-        (128, RowRoute::T128),
-    ];
+    const SHARED_SCHEDULE: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 
-    /// Every row count the entry table admits, swept exhaustively so an
-    /// unadmitted width cannot hide between the transcribed ones.
-    fn admitted_schedule<A: Arch, E: MtpFusionEntries<A>>() -> Vec<(usize, RowRoute)> {
-        (0..=2_048)
-            .chain([usize::MAX])
-            .filter_map(|rows| row_route::<A, E>(rows).map(|route| (rows, route)))
-            .collect()
+    /// The derive's ordered admission inventory for one entry table.
+    fn admitted_schedule<A: Arch, E: MtpFusionEntries<A>>() -> Vec<usize> {
+        MtpBf16FusionRoutes::<A, E>::admitted_rows()
     }
 
     #[test]
@@ -1179,7 +1124,7 @@ mod tests {
         let qwen38 = SHARED_SCHEDULE
             .iter()
             .copied()
-            .chain([(1_024, RowRoute::T1024)])
+            .chain([1_024])
             .collect::<Vec<_>>();
 
         assert_eq!(

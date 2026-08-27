@@ -15,6 +15,7 @@ tuisko-model.workspace = true
 tuisko-kernels-sm120-common.workspace = true
 tuisko-kernels-sm120-attention.workspace = true
 tuisko-kernels-sm120-norm.workspace = true
+tuisko-kernels-macros.workspace = true
 
 [lints.rust]
 missing_docs = "warn"
