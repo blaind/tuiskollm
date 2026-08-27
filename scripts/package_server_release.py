@@ -19,7 +19,7 @@ from typing import NoReturn, cast
 
 WORKSPACE = Path(__file__).resolve().parents[1]
 BINARY_NAME = "tuiskollm"
-ARCHIVE_TARGET = "linux-x86_64-glibc2.35"
+ARCHIVE_TARGET = "linux-x86_64"
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 REQUIRED_LIBRARIES = {"libc.so.6", "libcuda.so.1"}
 ALLOWED_LIBRARIES = REQUIRED_LIBRARIES | {
@@ -375,7 +375,7 @@ def main() -> None:
     package_command.add_argument("--cuda-oxide-commit", required=True)
     package_command.add_argument("--build-host", required=True)
     package_command.add_argument("--cuda-stub", type=Path)
-    package_command.add_argument("--max-glibc", default="2.35")
+    package_command.add_argument("--max-glibc", default="2.34")
 
     verify_command = commands.add_parser("verify")
     verify_command.add_argument("--archive", required=True, type=Path)
