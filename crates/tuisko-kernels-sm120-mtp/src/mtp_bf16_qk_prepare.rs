@@ -3,6 +3,7 @@
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_attention::shared_device::bf16_attention_qk_prepare;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
@@ -547,8 +548,8 @@ impl<A: Arch> MtpQkPrepareRoute<A> for UnadmittedQkPrepareRoute {
     }
 }
 
-// `row_route` rejects an unadmitted width before dispatch, so this is the
-// defensive tail of a route that owns no entry.
+// The derived table rejects an unadmitted width before dispatch, so this is
+// the defensive tail of a route that owns no entry.
 fn unadmitted_route() -> GpuError {
     GpuError::invalid_launch("MTP BF16 Q/K route is not admitted for this architecture")
 }
@@ -666,44 +667,6 @@ pub(crate) fn qwen35_mtp_bf16_qk_prepare_ptx_names() -> [&'static str; 11] {
     ]
 }
 
-/// The compiled route one admitted row count selects.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RowRoute {
-    B1,
-    B2,
-    B3,
-    B4,
-    B5,
-    B6,
-    B7,
-    B8,
-    T32,
-    T64,
-    T128,
-    T1024,
-}
-
-// The admitted row schedule, transcribed from the two prepared dispatches it
-// replaces: decode B=1..=8 and prefill T=32,64,128 for both, and the T=1024
-// prefill only where the entry table admits it.
-fn row_route<A: Arch, E: MtpQkPrepareEntries<A>>(rows: usize) -> Option<RowRoute> {
-    match rows {
-        1 => Some(RowRoute::B1),
-        2 => Some(RowRoute::B2),
-        3 => Some(RowRoute::B3),
-        4 => Some(RowRoute::B4),
-        5 => Some(RowRoute::B5),
-        6 => Some(RowRoute::B6),
-        7 => Some(RowRoute::B7),
-        8 => Some(RowRoute::B8),
-        32 => Some(RowRoute::T32),
-        64 => Some(RowRoute::T64),
-        128 => Some(RowRoute::T128),
-        1_024 if E::HAS_T1024 => Some(RowRoute::T1024),
-        _ => None,
-    }
-}
-
 fn unsupported_rows<A: Arch, E: MtpQkPrepareEntries<A>>(rows: usize) -> GpuError {
     let admitted = if E::HAS_T1024 {
         format!("{PREFILL_ROUTES:?}")
@@ -716,6 +679,41 @@ fn unsupported_rows<A: Arch, E: MtpQkPrepareEntries<A>>(rows: usize) -> GpuError
     ))
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_mtp_bf16_qk_prepare),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
+    inventory(false)
+)]
+struct MtpBf16QkPrepareRoutes<A: Arch, E: MtpQkPrepareEntries<A>> {
+    #[route(1)]
+    b1: E::Decode<1>,
+    #[route(2)]
+    b2: E::Decode<2>,
+    #[route(3)]
+    b3: E::Decode<3>,
+    #[route(4)]
+    b4: E::Decode<4>,
+    #[route(5)]
+    b5: E::Decode<5>,
+    #[route(6)]
+    b6: E::Decode<6>,
+    #[route(7)]
+    b7: E::Decode<7>,
+    #[route(8)]
+    b8: E::Decode<8>,
+    #[route(32)]
+    t32: E::Prefill<32>,
+    #[route(64)]
+    t64: E::Prefill<64>,
+    #[route(128)]
+    t128: E::Prefill<128>,
+    #[route(1024, admitted(E::HAS_T1024))]
+    t1024: E::Prefill1024,
+}
+
 /// Prepared MTP Q/K normalization, MRoPE, and BF16 cache routes for exact
 /// decode `B=1..=8` and the entry table's admitted prefill widths.
 pub struct MtpBf16QkPrepareOp<
@@ -723,18 +721,7 @@ pub struct MtpBf16QkPrepareOp<
     E: MtpQkPrepareEntries<A> = Qwen38MtpQkPrepareEntries,
 > {
     module: kernels::LoadedModule,
-    b1: E::Decode<1>,
-    b2: E::Decode<2>,
-    b3: E::Decode<3>,
-    b4: E::Decode<4>,
-    b5: E::Decode<5>,
-    b6: E::Decode<6>,
-    b7: E::Decode<7>,
-    b8: E::Decode<8>,
-    t32: E::Prefill<32>,
-    t64: E::Prefill<64>,
-    t128: E::Prefill<128>,
-    t1024: E::Prefill1024,
+    routes: MtpBf16QkPrepareRoutes<A, E>,
 }
 
 /// Prepared Qwen3.5 MTP Q/K normalization, MRoPE, and BF16 cache routes.
@@ -749,21 +736,9 @@ impl<A: Arch, E: MtpQkPrepareEntries<A>> MtpBf16QkPrepareOp<A, E> {
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module(E::MODULE_OPERATION, source))?;
 
-        Ok(Self {
-            b1: E::Decode::<1>::prepare(&module)?,
-            b2: E::Decode::<2>::prepare(&module)?,
-            b3: E::Decode::<3>::prepare(&module)?,
-            b4: E::Decode::<4>::prepare(&module)?,
-            b5: E::Decode::<5>::prepare(&module)?,
-            b6: E::Decode::<6>::prepare(&module)?,
-            b7: E::Decode::<7>::prepare(&module)?,
-            b8: E::Decode::<8>::prepare(&module)?,
-            t32: E::Prefill::<32>::prepare(&module)?,
-            t64: E::Prefill::<64>::prepare(&module)?,
-            t128: E::Prefill::<128>::prepare(&module)?,
-            t1024: E::Prefill1024::prepare(&module)?,
-            module,
-        })
+        let routes = MtpBf16QkPrepareRoutes::prepare(&module)?;
+
+        Ok(Self { module, routes })
     }
 
     /// Normalizes and rotates Q/K, then appends represented BF16 K/V values.
@@ -796,7 +771,6 @@ impl<A: Arch, E: MtpQkPrepareEntries<A>> MtpBf16QkPrepareOp<A, E> {
         key_pages: *mut u16,
         value_pages: *mut u16,
     ) -> GpuResult<()> {
-        let route = row_route::<A, E>(rows).ok_or_else(|| unsupported_rows::<A, E>(rows))?;
         let table_stride = u32::try_from(table_stride).map_err(|_| {
             GpuError::invalid_launch(format!("{}MTP BF16 Q/K table stride exceeds u32", E::LABEL))
         })?;
@@ -807,80 +781,38 @@ impl<A: Arch, E: MtpQkPrepareEntries<A>> MtpBf16QkPrepareOp<A, E> {
             )));
         }
 
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: exact-width dispatch preserves the public pointer contract.
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        qkv,
-                        query_norm,
-                        key_norm,
-                        rope_cos,
-                        rope_sin,
-                        block_tables,
-                        table_rows,
-                        table_stride,
-                        cache_positions,
-                        query,
-                        key_pages,
-                        value_pages,
-                    )
-                }
-            };
-        }
-
-        match route {
-            RowRoute::B1 => launch!(b1),
-            RowRoute::B2 => launch!(b2),
-            RowRoute::B3 => launch!(b3),
-            RowRoute::B4 => launch!(b4),
-            RowRoute::B5 => launch!(b5),
-            RowRoute::B6 => launch!(b6),
-            RowRoute::B7 => launch!(b7),
-            RowRoute::B8 => launch!(b8),
-            RowRoute::T32 => launch!(t32),
-            RowRoute::T64 => launch!(t64),
-            RowRoute::T128 => launch!(t128),
-            RowRoute::T1024 => launch!(t1024),
-        }
+        dispatch_mtp_bf16_qk_prepare!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch(
+                    &self.module, stream, qkv, query_norm, key_norm, rope_cos, rope_sin,
+                    block_tables, table_rows, table_stride, cache_positions, query, key_pages,
+                    value_pages,
+                )
+            },
+            else => Err(unsupported_rows::<A, E>(rows))
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BATCH, MtpQkPrepareEntries, PREFILL_ROUTES, QWEN35_PREFILL_ROUTES,
-        Qwen35MtpQkPrepareEntries, Qwen38MtpQkPrepareEntries, RowRoute, THREADS,
+        MAX_BATCH, MtpBf16QkPrepareRoutes, MtpQkPrepareEntries, PREFILL_ROUTES,
+        QWEN35_PREFILL_ROUTES, Qwen35MtpQkPrepareEntries, Qwen38MtpQkPrepareEntries, THREADS,
         mtp_bf16_qk_prepare_prefill_ptx_names, mtp_bf16_qk_prepare_ptx_names,
-        qwen35_mtp_bf16_qk_prepare_ptx_names, row_route, unsupported_rows,
+        qwen35_mtp_bf16_qk_prepare_ptx_names, unsupported_rows,
     };
     use std::collections::BTreeSet;
     use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
     /// The decode and prefill widths both admitted architectures route.
-    const SHARED_SCHEDULE: [(usize, RowRoute); 11] = [
-        (1, RowRoute::B1),
-        (2, RowRoute::B2),
-        (3, RowRoute::B3),
-        (4, RowRoute::B4),
-        (5, RowRoute::B5),
-        (6, RowRoute::B6),
-        (7, RowRoute::B7),
-        (8, RowRoute::B8),
-        (32, RowRoute::T32),
-        (64, RowRoute::T64),
-        (128, RowRoute::T128),
-    ];
+    const SHARED_SCHEDULE: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 
-    /// Every row count the entry table admits, swept exhaustively so an
-    /// unadmitted width cannot hide between the transcribed ones.
-    fn admitted_schedule<A: Arch, E: MtpQkPrepareEntries<A>>() -> Vec<(usize, RowRoute)> {
-        (0..=2_048)
-            .chain([usize::MAX])
-            .filter_map(|rows| row_route::<A, E>(rows).map(|route| (rows, route)))
-            .collect()
+    /// The derive's ordered admission inventory for one entry table.
+    fn admitted_schedule<A: Arch, E: MtpQkPrepareEntries<A>>() -> Vec<usize> {
+        MtpBf16QkPrepareRoutes::<A, E>::admitted_rows()
     }
 
     #[test]
@@ -929,7 +861,7 @@ mod tests {
         let qwen38 = SHARED_SCHEDULE
             .iter()
             .copied()
-            .chain([(1_024, RowRoute::T1024)])
+            .chain([1_024])
             .collect::<Vec<_>>();
 
         assert_eq!(
