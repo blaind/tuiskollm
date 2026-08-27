@@ -44,8 +44,31 @@ pub use qwen38::bindings::{
     FullAttentionQkvBindings, GdnBindings, MtpBindings, Nvfp4MlpBindings, TextEndpointBindings,
 };
 pub use qwen38::materialize::MaterializedFullAttentionQkv;
+pub use qwen38_flash_next::bindings::{
+    Qwen38FlashNextEngramBindings, Qwen38FlashNextExpertBindings, Qwen38FlashNextGdnBindings,
+    Qwen38FlashNextHyperConnectionBindings, Qwen38FlashNextIndexerBindings,
+    Qwen38FlashNextLayerHyperConnections, Qwen38FlashNextMoeBindings,
+    Qwen38FlashNextSharedExpertBindings, Qwen38FlashNextSparseAttentionBindings,
+    Qwen38FlashNextTextEndpointBindings,
+};
+pub use qwen38_flash_next::engram::{
+    Qwen38FlashNextEngramConstantBindings, Qwen38FlashNextEngramHashConstants,
+};
+pub use qwen38_flash_next::engram_hash::{
+    QWEN38_FLASH_NEXT_ENGRAM_CONTEXT_LEN, QWEN38_FLASH_NEXT_ENGRAM_EOS_TOKEN,
+    QWEN38_FLASH_NEXT_ENGRAM_ROWS_PER_TOKEN, Qwen38FlashNextEngramCarry,
+    Qwen38FlashNextEngramRowHasher, Qwen38FlashNextEngramTable,
+    admit_qwen38_flash_next_engram_token,
+};
+pub use qwen38_flash_next::materialize::{
+    MaterializedQwen38FlashNextEngram, MaterializedQwen38FlashNextExpert,
+    MaterializedQwen38FlashNextExpertPool, MaterializedQwen38FlashNextGdn,
+    MaterializedQwen38FlashNextHyperConnections, MaterializedQwen38FlashNextMoe,
+    MaterializedQwen38FlashNextSparseAttention, MaterializedQwen38FlashNextTextEndpoint,
+    Qwen38FlashNextPlaneExtent,
+};
 pub use safetensors::{SafeTensorFile, TensorView};
-pub use views::{Bf16View, F32View, Fp8E4M3View, U8View};
+pub use views::{Bf16View, F32View, Fp8E4M3View, I64View, U8View};
 
 /// Source checkpoint contract selected before config and inventory admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -304,7 +327,7 @@ impl Qwen38FlashNext {
     pub const INDEXER_ROWS: usize =
         (Self::INDEXER_HEADS + Self::INDEXER_KV_HEADS) * Self::INDEXER_HEAD_DIM;
 
-    /// Token id that opens and terminates a sequence and delimits engram segments.
+    /// EOS token and engram segment boundary.
     pub const EOS_TOKEN_ID: u32 = 248_044;
 
     /// Zero-based decoder layer carrying the single engram injection.
