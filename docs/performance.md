@@ -1,903 +1,284 @@
-# Performance and capacity qualification
+# Performance qualification
 
-TuiskoLLM uses a custom device runner for GPU measurements and Criterion for pure host work. GPU
-results are valid only on the exact RTX 5090 target under an exclusive, recorded environment.
+This document defines how TuiskoLLM measures and accepts performance. Product-level results live
+in [`README.md`](../README.md); checked SM120 references live in
+[`qual/baselines/`](../qual/baselines/).
 
-The available device suites cover zero-centered residual/RMSNorm at exact `B=1..8` and
-`T=32,64,128,1024`, and
-dynamically-quantized FP8 QKV at exact `B=1..8`, `T=16` MTP, and `T=32,64,128,1024` prefill
-widths, GDN Q/K/V/Z input projection at exact `B=1..8` and `T=32,64,128,1024`, the
-full-vocabulary FP8 LM head at exact `B=1..8`,
-dense-FP8 gate/up SwiGLU at exact
-`B=1..8` and `T=32,64,128,1024`, dense-FP8 down at exact `B=1..8` and `T=32,64,128,1024`, GDN
-control/convolution and recurrence at exact `B=1..8` and `T=32,64,128,1024`, and the GDN
-source-native output projection at exact `B=1..8`, plus the source-backed
-dense-FP8 MLP at exact `B=1..8` and `T=32,64,128,1024`, complete layer-60 GDN, and final-norm plus
-LM-head owners. NVFP4 gate/up SwiGLU
-uses the exact retained A16 and W4A4 decode schedules at `B=1..8` plus W4A4 prefill at
-`T=32,64,128,1024`; NVFP4 down projection consumes the represented E2M1/E4M3 source planes
-through exact A16 routes at `B=1..8` and native W4A4 prefill at `T=32,64,128,1024`.
-Full-attention Q/K
-preparation covers zero-centered normalization, the 64-wide three-axis MRoPE, and represented E4M3
-KV-cache append at exact `B=1..8` and `T=32,64,128,1024`. Short-context paged GQA covers exact
-24-query/4-KV-head, 256-wide online-softmax decode across page boundaries at `B=1..8` plus causal
-shared-cache prefill tails at `T=32,64,128`. Each prefill CTA stages one 64-position represented
-E4M3 K/V tile once for two adjacent tokens and their twelve grouped-query warps. Deep `T=128`
-prefill tails use 256-thread FP8/F16 flash CTAs over 32 query rows and one query head. P8 uses
-64-position tiles for contexts 129 through 32,768; P16 uses 32-position tiles through 220,000 so
-its 43,520-byte single buffer preserves two-CTA residency. Both publish complete FP32
-maximum/denominator/numerator states and reduce them into the public output seam. Long-context
-`T=1024` macro prefill uses the two-CTA K32 flash producer at exact `P=1,2,4,8,16`, with one
-compile-time reducer per partition count; the intended resident route is P4. Long-context paged
-GQA retains the same represented cache contract and partitions contexts through 220,000 positions
-into 256-position partial softmaxes plus one exact reduction at `B=1..8`. Gated attention output
-publishes its FP32 and dynamic E4M3 seams and applies the source-native projection at exact
-`B=1..8` and `T=32,64,128,1024`; the prefill projection uses exact 32x32 tiles through T=128 and
-64x32 tiles at T=1024. The resident text owner
-composes all 48 GDN layers, 16 attention layers, source-routed MLPs, and the LM head into one
-directly timed graph at every exact `B=1..8` and one from-empty graph at each exact
-`T=32,64,128,1024`; server routing remains separate.
-The source-backed layer-63 full-attention owner separately composes exact `B=1..8` decode and
-from-empty causal `T=32,64,128,1024` prefill graphs; T=1024 selects the admitted P4 macro GQA route.
+Only an exclusive RTX 5090 run with a comparable environment can create performance authority.
+SM89, SM86, uncontrolled-clock, subset, profiler, and remote timings are diagnostic even when their
+numerical and resource gates pass.
 
-SM89 has separate remote-only diagnostic suites for the exact `[34816,5120]` NVFP4 gate/up,
-`[5120,17408]` down, and dynamic-quantize FP8 `[14336,5120]` QKV owners at `B=1..8`. The NVFP4
-routes decode the admitted E2M1 words and swizzled E4M3 scales inside A16 kernels; none creates a
-requantized weight artifact or implies that the partial SM89 inventory is a usable server. The
-SM89 QKV inventory deliberately excludes the Blackwell T=16 specialization. These numerical and
-static-resource gates are authoritative, while their uncontrolled-clock RunPod timings are
-feasibility evidence only.
+## Commands
 
-The first RTX 4090 sweep measured 109.984 us / 849.45 logical GiB/s at `B=1` and 184.320 us /
-508.46 logical GiB/s at `B=8`, with observed SM clocks of 2,625--2,700 MHz and a 10,251 MHz memory
-clock. This establishes a viable source-native SM89 decode path, but the falling multi-row
-bandwidth leaves `B=5..8` open for an Ada-specific reuse schedule before the target inventory can
-make a performance-complete claim.
-
-The first SM89 down sweep measured 46.304 us / 1,009.28 logical GiB/s at `B=1` and 122.176 us /
-384.92 logical GiB/s at `B=8`, with fixed observed clocks of 2,775 MHz SM and 10,251 MHz memory.
-The route is a viable source-native leaf, but its falling multi-row bandwidth likewise leaves an
-Ada-specific reuse schedule open.
-
-The first SM89 QKV sweep measured 24.800 us / 2,759.35 logical GiB/s at `B=1` and 39.872 us /
-1,724.33 logical GiB/s at `B=8`, with fixed observed clocks of 2,520 MHz SM and 10,251 MHz memory.
-This admits the exact decode route and its graph topology; it is not evidence for the absent T=16
-prefill route or a complete SM89 attention owner.
-
-The corresponding RTX 3090 feasibility sweep measured 177.408 us / 526.62 logical GiB/s at `B=1`
-and 412.896 us / 226.98 logical GiB/s at `B=8`, with fixed observed clocks of 1,800 MHz SM and
-9,501 MHz memory. The represented path is correct, but this first Ampere schedule is not efficient
-enough to justify expanding the complete SM86 inventory before a target-specific retune.
-
-## Quick start
-
-Run commands from the repository root. Bootstrap cuda-oxide once:
+Run device commands from the repository root. Bootstrap the pinned cuda-oxide toolchain once:
 
 ```bash
 cargo run -p xtask -- bootstrap-cuda-oxide
 ```
 
-`xtask` places its cuda-oxide checkout, backend, and nested Cargo home under `target/`; do not
-override the outer Cargo invocation's home.
+The main workflows are:
 
-Check that the GPU is idle and has no foreign compute process:
+| Command | Use |
+| --- | --- |
+| `cargo run -p xtask -- build-sm120` | Build the release device artifact and check its entry, launch-bound, register, stack, local-memory, shared-memory, PTX, and SASS contracts. |
+| `cargo run -p xtask -- qualify-<suite> [SNAPSHOT]` | Run the suite's independent numerical oracle, eager/graph checks, allocation checks, and benchmark-accounting tests. |
+| `cargo run -p xtask -- bench-<suite> [SNAPSHOT] [options]` | Measure one complete suite. An explicit `--json` path must be repository-relative and under `target/`. |
+| `cargo run -p xtask -- perf smoke` | Run every registered performance suite with three samples to validate the harness and environment. |
+| `cargo run -p xtask -- perf leaf` | Measure the complete registered leaf inventory. |
+| `cargo run -p xtask -- perf energy` | Measure the leaf inventory with a sustained energy window. |
+| `cargo run -p xtask -- perf gate SNAPSHOT` | Qualify, measure, and compare every registered suite with its checked baseline. |
+| `cargo run -p xtask -- perf candidate SUITE [SNAPSHOT] [options]` | Qualify the changed boundary and directly measure its dependency cone. Diagnostic. |
+| `cargo run -p xtask -- perf check SUITE [SNAPSHOT]` | Requalify and compare the complete authoritative dependency cone. |
+| `cargo run -p xtask -- perf bless SUITE [SNAPSHOT]` | Replace one suite's checked baseline after a reviewed run. It never commits the result. |
+| `cargo run -p xtask -- perf iterate SUITE [SNAPSHOT] --batch B --hypothesis TEXT` | Run one exact-batch optimization iteration with reusable exact-input receipts. Diagnostic. |
 
-```bash
-nvidia-smi
-```
+The `xtask` command registry is the source of truth for suite names. Do not copy its evolving leaf,
+layer, model, and target inventory into prose. Common complete boundaries include
+`resident-model`, `resident-prefill`, `resident-long-context-model`, and `server`.
 
-Then run a quick benchmark:
+Device filters are part of qualification design: `qualify-<suite>` must select both the numerical
+device test and the suite's benchmark-accounting tests. If a filter selects multiple device tests,
+run them serially so their CUDA preflights do not race.
 
-```bash
-cargo run -p xtask -- perf smoke
-```
-
-The human-readable table goes to stderr. The machine-readable report is written to:
-
-```text
-target/benchmarks/perf-smoke/residual-norm.json
-target/benchmarks/perf-smoke/fp8-qkv.json
-target/benchmarks/perf-smoke/fp8-gdn-input.json
-target/benchmarks/perf-smoke/fp8-lm-head.json
-target/benchmarks/perf-smoke/fp8-swiglu.json
-target/benchmarks/perf-smoke/fp8-down.json
-target/benchmarks/perf-smoke/nvfp4-swiglu.json
-target/benchmarks/perf-smoke/nvfp4-down.json
-target/benchmarks/perf-smoke/gdn-prepare.json
-target/benchmarks/perf-smoke/gdn-recurrence.json
-target/benchmarks/perf-smoke/gdn-output.json
-target/benchmarks/perf-smoke/attention-qk-prepare.json
-target/benchmarks/perf-smoke/paged-gqa.json
-target/benchmarks/perf-smoke/long-context-paged-gqa.json
-target/benchmarks/perf-smoke/attention-output.json
-```
-
-Every performance command also executes the release SM120 build and checks the PTX/SASS entry and
-resource inventory before launching the benchmark.
-
-A complete in-process resource sweep compiles the generated SM120 PTX into one shared cubin, parses
-its resource inventory once, and lazily dumps its SASS once. Every suite still independently checks
-its exact entries, launch bounds, registers, stack, local memory, shared memory, and required
-instructions. Reusing the identical compiler artifact removes repeated `ptxas` and `cuobjdump`
-work; it does not turn the suite checks into one aggregate pass.
-
-After owner warmup, the runner sustains the production graph for at least two seconds and applies
-the checked clock-spread policy before collecting the full rotated sample matrix. An unlocked or
-otherwise incomparable device therefore refuses before a long suite spends its timing window.
-The same clock policy remains in force over the complete measurement; the probe is an early guard,
-not a substitute for final telemetry.
-
-To retain exploratory timings on an intentionally uncontrolled clock, set
-`TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT=1`. The resulting JSON records
-`clock_policy: diagnostic_uncontrolled`; `perf bless` refuses it, so diagnostic evidence cannot
-silently become performance authority.
-
-If clocks pass the loaded probe and drift only later during a long measurement, the runner still
-writes the completed medians with `clock_policy: diagnostic_uncontrolled` and then returns a
-refusal. This preserves tuning evidence without weakening the gate or making it blessable.
-
-Benchmark repetition budgets are selected by the timed boundary rather than inherited from one
-global leaf default:
-
-| Duration class | Samples | Replays per sample | Warmup replays | Typical boundary |
-|---|---:|---:|---:|---|
-| short graph | 40 | 256 | 1,024 | microsecond-scale operator |
-| long graph | 40 | 32 | 128 | LM head or composed owner |
-| resident model | 40 | 1 | 16 | complete 64-layer graph |
-
-One resident replay already takes tens of milliseconds, so repeating it 256 times provides no
-useful timer-resolution benefit and creates an avoidable thermal phase. Reports bind the warmup and
-replay counts into their performance identity; a baseline comparison refuses when either changes.
-
-## Command reference
-
-| Command | Purpose | Output |
-|---|---|---|
-| `cargo run -p xtask -- build-sm120` | Build the release device artifact and check entries, registers, stack, local, and shared bytes | terminal |
-| `cargo run -p xtask -- qualify-frontend SNAPSHOT` | Check exact template, tokenizer, streaming, and prefix-cache behavior | terminal |
-| `cargo run -p xtask -- qualify-generation SNAPSHOT` | Check prompt-to-sampling-to-streaming state over exact BF16 logit rows | terminal |
-| `cargo run -p tuisko-server-qual -- http://127.0.0.1:8000` | Check the live exact server's blocking and SSE contracts, greedy concurrency stability at request counts 1 through 8, cancellation, eight-slot recycling, exact 220,000-position refusal, and recovery | terminal |
-| `cargo run -p xtask -- qualify-server SNAPSHOT` | Refuse a nonexclusive device, build and launch the production server on private loopback, run the external HTTP and capacity suite, stop the child, and require the GPU to return idle | terminal; lifecycle log under `target/server-qualification/` |
-| `cargo run -p xtask -- qualify-server-long-context SNAPSHOT` | Extend the production lifecycle gate with fresh and complete preceding-prompt reuse at 4K/16K/65K/178K plus two concurrent fresh 65K requests, checking exact usage and streaming/blocking boundaries | terminal; lifecycle log under `target/server-qualification/` |
-| `cargo run -p tuisko-server-qual --bin bench-server -- http://127.0.0.1:8000 --json target/benchmarks/server-http.json [--samples N] [--long-context]` | Directly time complete preceding-prompt reuse and low-reuse SSE, external concurrency 1 through 8, and optional 4K/16K/65K/178K prompt boundaries; preserve each completed case incrementally | diagnostic JSON under `target/`; never blessable without lifecycle clock authority |
-| `cargo run -p xtask -- bench-server SNAPSHOT [--samples N] [--long-context] [--json target/PATH] [--check\|--bless]` | Own the production lifecycle, run correctness first, require a sustained loaded-clock probe, directly time the HTTP suite with 10 ms clock/power/memory evidence, preserve late-drift measurements as refused evidence, and optionally compare or explicitly bless the matching exact inventory | raw and authoritative JSON under `target/benchmarks/server-authority/` by default; checked baselines are separate source changes |
-| `cargo run -p xtask -- qualify-residual-norm` | Run the independent numerical and graph-replay oracle | terminal |
-| `cargo run -p xtask -- qualify-qwen35-residual-norm` | Check Qwen3.5 zero-centered RMSNorm and fused residual publication at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-residual-norm` | Check Qwen3.6 zero-centered RMSNorm and fused residual publication at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-fp8-qkv` | Check represented activation codes/scales and QKV output for B=1..8, T=16, and T=32/64/128/1024 prefill, including padded T=32 reads and graph replay | terminal |
-| `cargo run -p xtask -- qualify-fp8-gdn-input` | Check represented activation codes/scales and GDN Q/K/V/Z output for B=1..8 and T=32/64/128/1024 prefill, including padded T=32 reads and graph replay | terminal |
-| `cargo run -p xtask -- qualify-fp8-lm-head` | Run the independent represented-value full-vocabulary LM-head oracle and benchmark-accounting test | terminal |
-| `cargo run -p xtask -- qualify-fp8-swiglu` | Run the exhaustive represented-value gate/up SwiGLU oracle and graph-replay gate | terminal |
-| `cargo run -p xtask -- qualify-fp8-down` | Run the exhaustive represented-value dense-FP8 down oracle and graph-replay gate | terminal |
-| `cargo run -p xtask -- qualify-nvfp4-swiglu` | Check represented E2M1/E4M3 seams, A16/W4A4 production routing, immutable weights, graph replay, stable addresses, and post-warmup allocation at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-qwen35-nvfp4-swiglu` | Check the Qwen3.5 represented gate/up seams, route selection, immutable sources, graph replay, stable addresses, and allocation behavior at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-nvfp4-down` | Check represented E2M1/E4M3 activation and down-projection seams, immutable input/weights, graph replay, stable addresses, and post-warmup allocation at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-qwen35-nvfp4-down` | Check the Qwen3.5 represented activation/down seams, immutable sources, graph replay, stable addresses, and allocation behavior at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-nvfp4-mlp SNAPSHOT` | Check source layer 55, route-specific A16/W4A4 scratch, every observable seam, exact B=1..8 and T=32/64/128/1024 graphs, immutable weights, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-qwen35-nvfp4-mlp SNAPSHOT` | Check Qwen3.5 source layer 0, ModelOpt scale conversion, route-specific A16/W4A4 scratch, every observable seam, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-qwen35-nvfp4-qkv` | Check Qwen3.5 fused Q/gate, K, and V represented values with three weight-scale divisors at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-moe-router` | Check Qwen3.6 BF16 router logits, deterministic top-eight experts, normalized BF16 weights, immutable sources, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-moe-experts` | Check Qwen3.6 selected routed experts, shared expert/gate, fixed-order top-eight combination, immutable 256-expert planes, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-nvfp4-lm-head` | Check represented Qwen3.6 NVFP4 LM-head logits, complete publication, immutable source planes, exact-B graph replay, inactive extents, and allocation behavior at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-text-endpoint SNAPSHOT` | Check exact Qwen3.6 source embeddings, final RMSNorm, sampled represented NVFP4 logits, immutable source planes, graph replay, stable addresses, and post-warmup allocation at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-resident-model SNAPSHOT` | Check all 40 Qwen3.6 layers, shared 262,144-position E4M3 cache, and endpoint against eager replay, represented endpoint formulas, finite logits, stable addresses, and post-warmup allocation at B=1..8 and from-empty T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-generation SNAPSHOT` | Check exact Transformers prompt IDs, largest-native-prefix routing across 31/32/33/64/65/128/129 tokens, greedy raw-token/streaming agreement, compact B=1..8 output agreement, cancellation, slot reuse, concurrent T=128 prefill, stable ownership, and zero post-warmup device allocation | terminal |
-| `cargo run -p xtask -- qualify-qwen36-server SNAPSHOT` | Start the release server, check the exact health/model inventory plus deterministic blocking and SSE responses, and stop the owned child process | terminal |
-| `cargo run -p xtask -- qualify-qwen36-fp8-qkv` | Check Qwen3.6 static E4M3 full-attention Q/K/V, scalar FP32 scales, immutable sources, exact-B graph replay, inactive extents, and allocation behavior at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-attention-qk-prepare` | Check Qwen3.6 Q/K zero-centered normalization, 64-wide three-axis MRoPE, represented BF16 cache append, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-fp8-attention-qk-prepare` | Check the same exact Qwen3.6 routes with represented E4M3 K/V append for the long-context cache | terminal |
-| `cargo run -p xtask -- qualify-qwen36-attention-output` | Check Qwen3.6 query-paired sigmoid gating, static E4M3 output projection, immutable sources, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-gdn-input` | Check Qwen3.6 static E4M3 Q/K/V/Z, BF16 A/B controls, immutable sources, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-gdn-output` | Check Qwen3.6 static E4M3 GDN output, immutable sources, graph replay, inactive extents, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-gdn-prepare` | Check Qwen3.6 decay/beta controls, causal width-four convolution/history publication, graph replay, and allocation behavior at B=1..8 and T=32/64/128 through the shared exact Qwen3.5 binary route | terminal |
-| `cargo run -p xtask -- qualify-qwen36-gdn-recurrence` | Check Qwen3.6 causal FP32 state transitions, gated normalization, graph replay, and allocation behavior at B=1..8 and T=32/64/128 through the shared exact Qwen3.5 binary route | terminal |
-| `cargo run -p xtask -- qualify-qwen35-bf16-lm-head SNAPSHOT` | Check the source BF16 LM head against sampled FP64 dots, eager/graph agreement, immutable inputs, stable addresses, and allocation behavior at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen35-text-endpoint SNAPSHOT` | Check exact source embeddings, final RMSNorm, sampled full-formula BF16 logits, graph replay, stable addresses, and post-warmup allocation at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen35-resident-model SNAPSHOT` | Check every complete Qwen3.5 text layer plus endpoint graph against eager replay, endpoint source formulas, finite logits, stable addresses, and owner allocation at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen35-resident-mtp SNAPSHOT` | Check Qwen3.5 target/MTP cache mirroring, T=32/64/128 priming, exact B=1..8 draft graphs, sampled source-BF16 LM-head dots, stable ownership, and zero post-warmup allocation | terminal |
-| `cargo run -p xtask -- qualify-qwen35-mtp-generation SNAPSHOT` | Compare Qwen3.5 draft-three greedy generation with the target-only route at K=1..4, including streaming, reversible GDN state, stable ownership, and zero post-warmup allocation | terminal |
-| `cargo run -p xtask -- qualify-qwen35-mtp-batch-generation SNAPSHOT` | Compare Qwen3.5 singleton MTP plus compact B=2..8 target/MTP alignment with target-only outputs, including every exact draft batch, sampled rollback, cancellation, hole reuse, concurrent T=192 admission, stable ownership, and zero post-warmup allocation | terminal |
-| `cargo run -p xtask -- qualify-qwen35-generation SNAPSHOT` | Check exact Transformers prompt IDs, greedy streaming, compact B=1..8 output agreement, cancellation, slot reuse, concurrent native prefill, stable ownership, and zero post-warmup device allocation | terminal |
-| `cargo run -p xtask -- qualify-qwen35-server SNAPSHOT` | Start the release server, check the exact Qwen3.5 health/model inventory plus deterministic blocking and SSE responses, and stop the owned child process | terminal |
-| `cargo run -p xtask -- qualify-qwen35-nvfp4-gdn-input` | Check Qwen3.5 fused Q/K/V/Z and padded A/B represented values, immutable inputs, graph replay, stable addresses, and allocation behavior at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen35-gdn-prepare` | Check Qwen3.5 projected A/B controls, mapped causal width-four convolution/history updates, immutable inputs, graph replay, stable addresses, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-qwen35-gdn-recurrence` | Check Qwen3.5 mapped causal FP32 state transitions, gated normalization, immutable inputs, graph replay, stable addresses, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-qwen35-nvfp4-gdn-output` | Check Qwen3.5 recurrent BF16 output through the shared represented NVFP4 projection, immutable inputs, graph replay, stable addresses, and allocation behavior at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen35-nvfp4-attention-output` | Check Qwen3.5 sigmoid gating, BF16 projection seam, represented NVFP4 output, immutable inputs, and graph replay at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen35-attention-qk-prepare` | Check Qwen3.5 Q/K zero-centered normalization, three-axis MRoPE, represented BF16 cache append, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-gdn-prepare` | Check the two control formulas, mapped width-4 convolution/history updates, immutable seams, stable ownership, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-gdn-recurrence` | Check mapped FP32 state transitions, causal prefill, gated normalization, immutable seams, stable ownership, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-qwen38-flash-next-gdn-prepare` | Check target-specific controls, reused convolution/history, and graph replay at B=1..8, K=1..4, and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-qwen38-flash-next-gdn-recurrence` | Check FP32 state/intermediate planes, sigmoid-gated output, and graph replay at B=1..8, K=1..4, and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-gdn-output` | Check dynamic E4M3 quantization, source-native output projection, immutable seams, stable ownership, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-attention-qk-prepare` | Check Q/K zero-centered normalization, three-axis MRoPE, represented E4M3 cache append, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-paged-gqa` | Check exact page lookup, grouped-head mapping, represented E4M3 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8, shared T=32/64/128 prefill, and partitioned T=128 P8/P16 deep tails | terminal |
-| `cargo run -p xtask -- qualify-qwen35-paged-gqa` | Check Qwen3.5 exact page lookup, grouped-head mapping, represented BF16 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-qwen35-long-context-kv` | Check the exact 262,144-position BF16 owner accounting plus shared-page reserve, truncate, retain, recycle, stable addresses, and zero post-warmup device growth | terminal |
-| `cargo run -p xtask -- qualify-qwen36-long-context-kv` | Check the exact 262,144-position E4M3 owner accounting plus shared-page reserve, truncate, retain, recycle, stable addresses, and zero post-warmup device growth | terminal |
-| `cargo run -p xtask -- qualify-qwen36-paged-gqa` | Check Qwen3.6 exact page lookup, 8:1 grouped-head mapping, represented BF16 online softmax, immutable seams, graph replay, stable addresses, and allocation behavior at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-qwen36-fp8-paged-gqa` | Check the production Qwen3.6 represented-E4M3 cache path with the same exact page, grouping, oracle, graph, and allocation gates at B=1..8 and T=32/64/128 | terminal |
-| `cargo run -p xtask -- qualify-long-context-paged-gqa` | Check every partition bucket through 220,000 positions, all partial/reduction seams, untouched scratch, and graph replay at B=1..8 | terminal |
-| `cargo run -p xtask -- qualify-attention-output` | Check sigmoid gating, the published FP32 seam, dynamic E4M3 quantization, source-native projection, and graph replay at B=1..8 and T=32/64/128/1024 | terminal |
-| `cargo run -p xtask -- qualify-mtp-bf16-fusion SNAPSHOT` | Check both source zero-centered normalization seams, the complete source-BF16 `[5120,10240]` projection, exact B=1..8 routes, immutable inputs/weights, graph replay, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-mtp-bf16-qkv SNAPSHOT` | Check lossless Q/gate/K/V gathering, the complete source-BF16 `[14336,5120]` projection, exact B=1..8 routes, immutable inputs/weights, graph replay, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-mtp-bf16-qk-prepare SNAPSHOT` | Check source Q/K norms, independent zero-centered normalization and three-axis MRoPE formulas, represented BF16 K/V append, exact B=1..8 routes, immutable inputs/weights/metadata, graph replay, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-mtp-bf16-paged-gqa` | Check exact MTP page lookup, 24-query/4-KV-head grouping, represented BF16 online softmax, immutable query/cache/metadata seams, exact B=1..8 eager and graph replay, stable addresses, and zero post-warmup allocation | terminal |
-| `cargo run -p xtask -- qualify-mtp-bf16-attention-output SNAPSHOT` | Check mathematical sigmoid gating, published FP32 and BF16 seams, the complete source-BF16 `[5120,6144]` projection, exact B=1..8 routes, immutable QKV/weights, graph replay, stable addresses, and zero post-warmup allocation | terminal |
-| `cargo run -p xtask -- qualify-mtp-bf16-mlp SNAPSHOT` | Check the complete source-BF16 gate/up SwiGLU and `[5120,17408]` down formulas, the represented BF16 activation/output seams, exact B=1..8 routes, immutable inputs/weights, graph replay, stable addresses, and zero post-warmup allocation | terminal |
-| `cargo run -p xtask -- qualify-mtp-layer SNAPSHOT` | Check the complete source-backed MTP owner through exact draft B=1..8, prime-only K=1..4, and causal realignment K=1..4; rerun every independent leaf/source oracle; compare every mutable seam under eager and graph replay; and verify stable ownership, exact byte accounting, inactive boundaries, and zero post-warmup allocation | terminal |
-| `cargo run -p xtask -- qualify-resident-mtp SNAPSHOT` | Check the long-context MTP owner through exact prompt, scalar-tail, seeded-draft B=1..8, residual-continuation B=1..8, prime K=1..4, and realignment K=1..4 routes; rerun the complete source-backed MTP authorities; compare eager and graph seams; and verify shared page reset, truncation, retention, reuse, recycling, stable addresses, exact bytes, and zero post-warmup allocation | terminal |
-| `cargo run -p xtask -- qualify-generation-mtp-greedy SNAPSHOT` | Compare single-slot greedy draft-three generation with the target-only production fallback; force target verification K=1..4 through exact output limits; and check continuation, commit, realignment, streaming, stable addresses, exact ownership, and zero post-warmup device growth | terminal |
-| `cargo run -p xtask -- qualify-generation-mtp-sampling SNAPSHOT` | Gate unbiased draft-three sampling with an independent induced-law and sequence oracle that rejects known mutants; force target verification K=1..4; exercise non-identity output-history penalties; and check deterministic seeds, streaming, stable addresses, exact ownership, and zero post-warmup device growth | terminal |
-| `cargo run -p xtask -- qualify-generation-mtp-batch SNAPSHOT` | Gate compact target-plus-MTP scheduling over every exact `(B=1..8, K=1..4)` transaction; compare every committed greedy output with an independent BF16 target-logit argmax and all 36 complete B=1..8 greedy lanes with the B=1 sequence; exercise sampled lanes, cancellation with exact last-complete-message hidden/GDN restoration, divergent next-turn reuse, fallback, slot recycling, stable addresses, exact device and 1,231,634,432-byte page-locked snapshot ownership, and zero post-warmup device growth | terminal |
-| `cargo run -p xtask -- qualify-dense-fp8-mlp SNAPSHOT` | Check source layer 60, every exact B=1..8 and T=32/64/128/1024 graph, all working and residual seams, tensor-map immutability, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-dense-fp8-gdn-layer SNAPSHOT` | Check the complete source layer-60 mixer/MLP seams, persistent state, exact B=1..8 and T=32/64/128/1024 graphs, tensor-map immutability, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-full-attention-layer SNAPSHOT` | Check complete source layer-63 attention/MLP seams, represented KV cache, exact B=1..8 and T=32/64/128/1024 graphs, P4 macro partials, immutable tensor maps, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-qwen35-full-attention-layer SNAPSHOT` | Check complete Qwen3.5 source layer-31 attention/MLP seams, BF16 KV cache, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-qwen35-gdn-layer SNAPSHOT` | Check complete Qwen3.5 source layer-0 GDN/MLP seams, recurrent state/history, exact-B graphs, immutable weights, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-qwen36-gdn-moe-layer SNAPSHOT` | Check complete Qwen3.6 source layer-0 GDN/MoE seams, recurrent state/history, exact B=1..8 and T=32/64/128 graphs, immutable weights/runtime inputs, inactive extents, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-qwen36-full-attention-layer SNAPSHOT` | Check complete Qwen3.6 source layer-3 attention/MoE formulas, unit-scale E4M3 KV cache, exact B=1..8 and T=32/64/128 graphs, immutable weights/runtime inputs, inactive extents, stable addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-qwen36-mtp-layer SNAPSHOT` | Check the complete source-BF16 Qwen3.6 MTP layer through B=1..8 drafts, K=1..4 prime/realignment, T=32/64/128 cache priming, independent leaf authorities, graph replay, immutable source samples, inactive extents, stable addresses, and exact allocation | terminal |
-| `cargo run -p xtask -- qualify-resident-model SNAPSHOT` | Check all 64 source routes, final source-backed formulas, dynamic page recycling/remapping and isolated reset, persistent state/cache, short plus six-bucket exact-B whole-model graphs, six exact prefill graph specializations across from-empty and nonzero-prefix metadata, independent long-attention seam formulas, stable device/host addresses, and owner allocation | terminal |
-| `cargo run -p xtask -- qualify-target-mtp-verify SNAPSHOT` | Check singleton K=1..4 plus every exact lane-major `(B=1..8, K=1..4)` target verification; provisional per-lane GDN rollback; distinct accepted-prefix replay; source endpoint mathematics; every target/cache seam; graph agreement; stable ownership; exact bytes; and zero post-warmup allocation | terminal |
-| `cargo run -p xtask -- qualify-resident-generation SNAPSHOT` | Check pinned vLLM next-token fixtures, exact and composed T1024/T128/T64/T32 prefill plans through the P16 context band, scalar tail boundaries, frontend, greedy control, streaming decode, stable ownership, and zero post-warmup device allocation | terminal |
-| `cargo run -p xtask -- qualify-resident-batch-generation SNAPSHOT` | Compare compact mixed-length scheduling with sequential requests, including every B=1..8 decode route, exact and composed prefill plans, scalar tail boundaries, noncontiguous survivor replay, cancellation, exact retained-prefix reuse, divergence fallback, slot recycling, stable ownership, and zero post-warmup device allocation | terminal |
-| `cargo run -p xtask -- qualify-text-endpoint SNAPSHOT` | Check source embeddings, final norm, sampled full-formula logits, graph replay, stable addresses, and post-warmup allocation | terminal |
-| `cargo run -p xtask -- bench-gdn-prepare` | Measure every exact control-plus-convolution graph after an untimed exact-history restore | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-gdn-recurrence` | Measure every exact stateful recurrence graph after an untimed exact-state restore | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen38-flash-next-gdn-prepare` | Measure every exact decode, causal, and prefill prepare graph after untimed history restore | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen38-flash-next-gdn-recurrence` | Measure every exact decode, causal, and prefill recurrence graph after untimed state restore | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-gdn-output` | Measure every exact decode and prefill output quantize-plus-projection graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-attention-qk-prepare` | Measure every exact Q/K prepare and cache-append graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-paged-gqa` | Measure exact B=1..8 graphs at a 130-token context, causal shared T=32/64/128 graphs, partitioned T=128 tails, and production-P4 T=1024 macro graphs at contexts 32,768 and 98,304 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-paged-gqa` | Measure every exact Qwen3.5 B=1..8 BF16 paged-GQA graph at a 130-token context | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-paged-gqa` | Measure every exact Qwen3.6 B=1..8 and T=32/64/128 BF16 paged-GQA graph at a 130-token context | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-fp8-paged-gqa` | Measure every exact Qwen3.6 B=1..8 and T=32/64/128 E4M3 paged-GQA graph at a 130-token context | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-long-context-paged-gqa` | Measure every exact two-stage paged GQA graph with the complete 3,438-page pool divided among active slots | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-attention-output` | Measure every exact sigmoid-gate, quantize, and output-projection graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-mtp-bf16-fusion` | Measure every exact B=1..8 production graph for both BF16 norms plus the source-BF16 MTP fusion projection | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-mtp-bf16-qkv` | Measure every exact B=1..8 gathered source-BF16 MTP Q/gate/K/V projection graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-mtp-bf16-qk-prepare` | Measure every exact B=1..8 MTP source-norm Q/K preparation and BF16 cache-append graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-mtp-bf16-paged-gqa` | Measure every exact B=1..8 production MTP BF16 paged-GQA graph at a 130-token context | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-mtp-bf16-attention-output` | Measure every exact B=1..8 production graph for sigmoid gating, represented-BF16 activation, and the source-BF16 output projection | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-mtp-bf16-mlp` | Measure every exact B=1..8 production graph for source-BF16 gate/up SwiGLU and down projection | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-mtp-layer SNAPSHOT` | Directly measure every complete source-backed MTP draft B=1..8 production graph at a 131-token, three-page BF16 context | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-resident-mtp SNAPSHOT` | Directly measure every resident long-context MTP seeded-draft, same-round residual-continuation, and explicit hidden-handoff B=1..8 graph, including pinned input upload, the respective target/prior-residual handoff, shared target LM head, and the production cache regime | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-resident-mtp SNAPSHOT` | Directly measure every source-BF16 Qwen3.5 MTP layer plus shared BF16 LM-head graph at B=1..8 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-mtp-layer SNAPSHOT` | Directly measure every complete source-BF16 Qwen3.6 MTP draft graph at B=1..8 and a 131-token E4M3-cache context | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-mtp-generation SNAPSHOT` | Directly measure one complete Qwen3.5 greedy MTP request and one draft-three/K=4 transaction | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-mtp-batch-generation SNAPSHOT` | Directly measure Qwen3.5 singleton draft-three/K=4 and compact target-plus-MTP alignment at every exact B=2..8, or one route with `--batch B` | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-target-mtp-verify SNAPSHOT` | Directly measure every exact lane-major `(B=1..8, K=1..4)` target verification and verification-plus-full-prefix commit graph at a 132-token context, with matching production metadata restored outside timing | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-generation-mtp-greedy SNAPSHOT` | Directly measure host completion for one proposal-ready draft-three/K=4/realignment round and one production prompt-plus-eight-output greedy MTP request; prompt preparation for the round is outside its timing rather than estimated from leaf medians | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-generation-mtp-sampling SNAPSHOT` | Directly measure host completion for one seeded sampled draft-three/K=4 round, one complete sampled request, and the same request with non-identity output-history penalties; the round excludes prompt preparation and no boundary is estimated from leaf medians | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-generation-mtp-batch SNAPSHOT` | Directly measure the production compact scheduler's proposal-ready draft-three/K=4 transaction at every exact B=1..8, including host control, lane-major target verification/commit, per-lane MTP realignment, transfers, and synchronization; also measure a composed cancellation restore plus divergent next-turn admission through the production owner; setup is untimed and no constituent median is summed | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-nvfp4-swiglu` | Measure every exact retained A16/W4A4 NVFP4 gate/up SwiGLU graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-nvfp4-down` | Measure every exact A16 decode and W4A4 prefill NVFP4 down-projection graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed layer-55 decode and prefill MLP graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-nvfp4-mlp SNAPSHOT` | Measure every complete source-backed Qwen3.5 layer-0 MLP graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-nvfp4-qkv` | Measure every exact Qwen3.5 fused NVFP4 QKV graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-moe-router` | Measure every exact Qwen3.6 BF16 router projection plus normalized top-eight graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-moe-experts` | Measure every exact Qwen3.6 routed/shared NVFP4 expert plus combine graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-nvfp4-lm-head` | Measure every exact Qwen3.6 represented-weight NVFP4 full-vocabulary graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-residual-norm` | Measure every exact Qwen3.5 plain and fused-residual RMSNorm graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-residual-norm` | Measure every exact Qwen3.6 plain and fused-residual RMSNorm graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-fp8-qkv` | Measure every exact Qwen3.6 static-FP8 full-attention Q/K/V graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-gdn-input` | Measure every exact Qwen3.6 static-FP8 Q/K/V/Z plus BF16 A/B control graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-gdn-output` | Measure every exact Qwen3.6 static-FP8 GDN output graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-attention-output` | Measure every complete Qwen3.6 sigmoid-gate, BF16-stage, and static-FP8 output graph at B=1..8 and T=32/64/128 with input restoration outside timing | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-gdn-prepare` | Measure every exact Qwen3.6 decode and T=32/64/128 control/convolution graph through the shared exact-geometry binary route | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-gdn-recurrence` | Measure every exact Qwen3.6 decode and T=32/64/128 recurrent-state graph after an untimed exact-state restore | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-nvfp4-gdn-input` | Measure every exact Qwen3.5 fused NVFP4 Q/K/V/Z and A/B graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-gdn-prepare` | Measure every exact Qwen3.5 decode and T=32/64/128 control-plus-convolution graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-gdn-recurrence` | Measure every exact Qwen3.5 decode and T=32/64/128 recurrent-state graph after an untimed exact-state restore | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-nvfp4-gdn-output` | Measure every exact Qwen3.5 recurrent-output NVFP4 projection graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-nvfp4-attention-output` | Measure every complete Qwen3.5 sigmoid-gate, BF16-stage, and NVFP4 output graph with input restoration outside timing | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-attention-qk-prepare` | Measure every exact Qwen3.5 Q/K prepare and cache-append graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-attention-qk-prepare` | Measure every exact Qwen3.6 Q/K prepare and cache-append graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-fp8-attention-qk-prepare` | Measure every exact Qwen3.6 Q/K prepare and E4M3 cache-append graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-dense-fp8-gdn-layer SNAPSHOT` | Measure every complete source-backed layer-60 graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-full-attention-layer SNAPSHOT` | Measure every complete source-backed layer-63 B=1..8 graph at a 131-token context and every from-empty T=32/64/128/1024 prefill graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-full-attention-layer SNAPSHOT` | Measure every complete Qwen3.5 source-backed layer-31 graph at a 131-token, three-page BF16 context | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-gdn-layer SNAPSHOT` | Measure every complete source-backed Qwen3.5 layer-0 GDN/MLP graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-gdn-moe-layer SNAPSHOT` | Measure every complete source-backed Qwen3.6 layer-0 GDN/MoE graph at B=1..8 and T=32/64/128 | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-full-attention-layer SNAPSHOT` | Measure every complete source-backed Qwen3.6 layer-3 attention/MoE decode graph at a 131-token E4M3-cache context and every from-empty T=32/64/128 prompt graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-resident-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head graph at a 131-token context | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-resident-prefill SNAPSHOT` | Directly measure complete T=32/64/128/1024 resident prompt graphs across from-empty, shared-tail, P8/P16 T128, and P4 macro-tail contexts with final-token-only LM head | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-resident-long-context-model SNAPSHOT` | Directly measure every complete 64-layer plus LM-head long graph with one 131,073-token row and compact one-token survivors | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-text-endpoint SNAPSHOT` | Measure every source-backed final-norm plus LM-head graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-text-endpoint SNAPSHOT` | Measure every source-backed Qwen3.5 final-norm plus BF16 LM-head graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-text-endpoint SNAPSHOT` | Measure every source-backed Qwen3.6 final-norm plus represented NVFP4 LM-head graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen35-resident-model SNAPSHOT` | Directly measure every complete 32-layer plus BF16-endpoint graph at a 131-token context | terminal or `--json PATH` |
-| `cargo run -p xtask -- bench-qwen36-resident-model SNAPSHOT` | Directly measure every complete 40-layer plus NVFP4-endpoint decode graph at a 131-token context and every from-empty T=32/64/128 prompt graph | terminal or `--json PATH` |
-| `cargo run -p xtask -- perf smoke` | Three-sample harness and environment smoke test for every suite | `target/benchmarks/perf-smoke/*.json` |
-| `cargo run -p xtask -- perf leaf` | Full registered leaf timing and memory reports | `target/benchmarks/perf-leaf/*.json` |
-| `cargo run -p xtask -- perf energy` | Full leaf reports plus a sustained power window per route | `target/benchmarks/perf-energy/*.json` |
-| `cargo run -p xtask -- perf gate` | Run every oracle, measure every suite, and compare checked baselines | `target/benchmarks/perf-gate/*.json` |
-| `cargo run -p xtask -- perf candidate SUITE [SNAPSHOT] [options]` | Qualify the changed suite, then directly time its exact downstream owner/model cone | `target/benchmarks/perf-candidate/SUITE/*.json` |
-| `cargo run -p xtask -- perf check SUITE [SNAPSHOT]` | Measure the complete authoritative dependency cone and compare each checked baseline | `target/benchmarks/perf-check/SUITE/*.json` |
-| `cargo run -p xtask -- perf bless SUITE [SNAPSHOT]` | Run one oracle and explicitly replace that leaf or composed suite's baseline | `qual/baselines/SUITE-sm120.json` |
-| `cargo run -p xtask -- perf iterate SUITE --batch B --hypothesis TEXT` | Run one exact leaf route through verified qualification/build receipts, timing, and a diagnostic-only comparison | `target/optimization/SUITE/` |
-| `cargo run -p xtask -- perf diagnose-diff SUITE REPORT [--json OUTPUT]` | Compare a complete or exact-B report diagnostically while admitting only case-policy and generator-provenance differences | `target/benchmarks/perf-diagnostic/` |
-| `cargo run -p xtask -- profile resident-model SNAPSHOT --batch B --replays N --tool nsys` | Capture the production graph after warmup and attribute every node to semantic owner, stage, and layer | `target/profiles/resident-model-bB/` |
-| `cargo run -p xtask -- profile resident-model SNAPSHOT --batch B --tool ncu --kernel REGEX` | Collect hardware counters for one selected production kernel family | `target/profiles/resident-model-bB/` |
-
-Host text paths use Criterion with the real snapshot loaded once outside measurement:
+Pure host work uses Criterion. For example:
 
 ```bash
-TUISKO_SNAPSHOT=/path/to/snapshots/16b6615af3548b88e2d8e382457bc705b00479cf \
-  cargo bench --package tuisko-frontend --bench text
+TUISKO_SNAPSHOT=/path/to/snapshot cargo bench -p tuisko-frontend --bench text
+cargo bench -p tuisko-engine --bench sampling
+TUISKO_SNAPSHOT=/path/to/snapshot cargo bench -p tuisko-engine --bench generation
 ```
 
-This measures chat-template rendering, short and long prompt encoding, disabled/partial/identical
-prompt-cache routes, batched decoding, and streaming decoding. Criterion output remains under
-ignored `target/criterion`; it is diagnostic until a checked host-baseline comparator is added.
+Criterion output under `target/criterion/` is diagnostic until a checked host comparator exists.
 
-The complete BF16 vocabulary sampling routes are host-only too:
+## Required order
+
+Performance never admits an implementation. An exact device route must pass, in order:
+
+1. an independent represented-value or mathematical oracle;
+2. eager and CUDA Graph replay agreement;
+3. complete generated-entry and resource checks;
+4. exclusive-device measurement of the production boundary; and
+5. explicit baseline comparison or blessing.
+
+A skipped oracle is not a pass. Run device preflight before opening a large checkpoint. Do not
+change or bless a baseline to hide a correctness, resource, or performance regression.
+
+## What is timed
+
+Every benchmark uses the production operation, allocations, stream, graph, cache regime, shapes,
+and address-stable workspace. Setup, allocation, snapshot loading, and fixture restoration stay
+outside the timed interval unless they are part of the production boundary being measured.
+
+The runner reports:
+
+| Measurement | Boundary |
+| --- | --- |
+| `host_submit` | Rust time spent submitting production CUDA Graph replays. |
+| `host_completion` | Rust time from submission through device completion. |
+| `device_graph` | CUDA-event time per production graph replay. This is the primary device boundary. |
+| `device_path` | CUDA-event time per operation in an optional repeated-operation graph, used only to resolve very short paths. |
+
+The reusable GPU timer brackets repeated work with two CUDA events and synchronizes after the
+interval. It does not mutate the production graph. Reports include median, p10, p90, operation
+count, declared logical bytes, and logical GiB/s. Logical GiB/s is derived from minimum semantic
+reads and writes; it is not physical DRAM traffic from a profiler.
+
+Cases rotate and reverse order to avoid assigning fixed thermal or clock drift to one route. The
+default budgets match the duration of the timed boundary:
+
+| Boundary | Samples | Replays per sample | Warmup replays |
+| --- | ---: | ---: | ---: |
+| Short operator graph | 40 | 256 | 1,024 |
+| Long/composed graph | 40 | 32 | 128 |
+| Resident model graph | 40 | 1 | 16 |
+
+These counts are part of measurement identity. A resident graph must not inherit a microsecond
+leaf's replay count.
+
+Stateful cases restore production input outside every measured replay when an output aliases the
+next input. Inactive-tail checks begin after the widest surviving writer, not automatically after
+the final writer.
+
+Composed layers, resident models, and HTTP requests are timed directly. Never estimate their wall
+time by adding leaf medians: graph scheduling, cache reuse, memory pressure, and host work make the
+sum invalid in either direction.
+
+## Measurement identity
+
+A comparable report binds all of the following:
+
+- suite, route, metric inventory, scope, and phase;
+- exact checkpoint and revision when source-backed;
+- batch, active/prompt/context/output tokens, external concurrency, and execution mode;
+- device-cache and prefix-cache regimes;
+- operation count, sample count, warmup count, replay count, timing scope, and power scope;
+- GPU name, compute capability, framebuffer capacity, driver, and controlled clock bands;
+- cuda-oxide generator/resource provenance and CUDA toolchain identity; and
+- exact owned-memory metrics and their scaling rules.
+
+Unused workload dimensions are `null`, not zero. Comparison refuses when identities or inventories
+differ. An exact `--batch B` run records `case_policy: diagnostic_subset`; it cannot be compared or
+blessed as the complete admitted `B=1..8` inventory.
+
+## Device control and refusal
+
+The local SM120 runner requires:
+
+- device zero to be exactly `NVIDIA GeForce RTX 5090`, compute capability 12.0;
+- `CUDA_VISIBLE_DEVICES` to be unset or exactly `0`;
+- no foreign compute process;
+- utilization settled below 10%; and
+- at most 2,048 MiB already used before the run.
+
+Post-build and benchmark preflights wait up to 60 seconds for process-free desktop utilization to
+settle below that threshold. The memory, process-count, and clock requirements remain unchanged.
+
+The runner records clocks and power but never changes them. After owner warmup it drives the
+production graph for at least two seconds and validates loaded clocks before the long timing
+matrix. It continues sampling clocks, temperature, power, and memory every 10 ms during the run.
+SM120 leaf/model runs admit at most 50 MHz SM-clock spread and 250 MHz memory-clock spread; the
+complete HTTP boundary admits 75 MHz and 250 MHz respectively.
+
+Locking clocks is an explicit machine-administration action:
 
 ```bash
-cargo bench --package tuisko-engine --bench sampling
+sudo nvidia-smi -i 0 --lock-gpu-clocks=2200,2200 \
+  && sudo nvidia-smi -i 0 --lock-memory-clocks=14001,14001
 ```
 
-This measures greedy and checkpoint-default top-k-20/top-p-0.95 selection over all 248,320 logits.
-
-The composed prompt-preparation and one-row generation-control paths use the pinned snapshot:
+Reset them afterward:
 
 ```bash
-TUISKO_SNAPSHOT=/path/to/snapshots/16b6615af3548b88e2d8e382457bc705b00479cf \
-  cargo bench --package tuisko-engine --bench generation
+sudo nvidia-smi -i 0 --reset-gpu-clocks \
+  && sudo nvidia-smi -i 0 --reset-memory-clocks
 ```
 
-`perf gate` cannot run before each suite has an explicit baseline. A baseline update is a reviewed
-source change; blessing one suite at a time keeps that diff independent, and the command never
-commits it.
+The run refuses a wrong or occupied device, a foreign process, insufficient telemetry, invalid
+timings, or incomparable clocks. If the loaded-clock probe fails, timing stops early. If clocks
+drift only after the probe, completed medians are retained as diagnostic evidence before refusal.
 
-The leaf executable can also be controlled directly through `xtask`:
+For an intentionally exploratory run:
 
 ```bash
-cargo run -p xtask -- bench-residual-norm \
-  --samples 40 \
-  --launches-per-sample 256 \
-  --warmup-launches 1024 \
-  --json target/benchmarks/residual-norm.json
+TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT=1 cargo run -p xtask -- bench-<suite> ...
 ```
 
-Use `--batch B` for a fast exact-route diagnostic. The report records
-`case_policy: diagnostic_subset` and `selected_batch_size: B`; it cannot be blessed or compared as
-the complete authority. This is the intended inner loop for a B-specific retile. Remove the option
-before final comparison so every admitted `B=1..8` route is timed.
+Its report records `clock_policy: diagnostic_uncontrolled` and can never be blessed. Remote GPU
+timings are subject to the same non-authoritative rule; remote qualification can satisfy numerical
+and resource gates, but not a performance baseline.
 
-For the qualified inner loop, use the leaf-only wrapper and state the single measured hypothesis:
+## Memory and capacity
 
-```bash
-export TUISKO_AGENT_ITERATION_STARTED_UNIX_MILLISECONDS="$(date +%s%3N)"
-# Make the one-hypothesis source change.
-cargo run -p xtask -- perf iterate nvfp4-down \
-  --batch 1 \
-  --hypothesis "coalesce B=1 weight sectors"
-```
+Reports combine two independent views:
 
-Before any qualification or build work, the wrapper requires device zero to be the exact RTX 5090,
-idle below the admitted memory threshold, free of compute processes, and selected by an unset or
-exactly `0` `CUDA_VISIBLE_DEVICES`. The benchmark process still performs its complete independent
-preflight and telemetry checks immediately before timing. Post-build and benchmark preflights wait
-up to 60 seconds for process-free desktop utilization to settle below 10%; the memory, process-count,
-and clock requirements remain unchanged.
+1. exact byte attribution from production owners; and
+2. whole-process observations from NVML and `/proc/self/status`.
 
-`perf iterate` reuses a numerical qualification only when an ignored receipt matches the complete
-device-input fingerprint and the hashed physical-device/driver identity. It reuses a build only
-when the input, cuda-oxide revision, complete resource-baseline digest, executable digest, and PTX
-digest match. It may copy those two verified build artifacts from another registered Git worktree;
-it never shares a mutable Cargo target directory. A normal `build-sm120` still reruns all resource
-gates after local or cross-worktree reuse, while the inner loop may trust a receipt that was written
-only after those gates passed. A stale, malformed, or hash-mismatched ignored receipt is a cache
-miss and forces fresh evidence; it never blocks the rebuild or weakens validation.
+Snapshots are taken before context creation, after setup, after warmup, and after measurement.
+They record device used/free/reserved memory and current/peak process RSS. Exact owner allocation
+and post-warmup growth default to zero slack. Volatile CUDA-context, driver, NVML, and RSS metrics
+remain visible but informational unless a reviewed product budget enables them.
 
-Each attempt, including a controlled refusal or failure, gets a JSON manifest and raw benchmark
-report under `target/optimization/SUITE/`. A bundled-SQLite index at
-`target/optimization/iterations.sqlite3` records the hypothesis, Git/input identity, result, and
-wall time for preflight, qualification, build, benchmark, comparison, the whole command, and—when
-the environment variable above is set—the complete agent loop. These files are ignored diagnostic
-evidence, not checked authority.
+Use NVML's reported free memory for headroom; do not derive it as total minus used because the
+driver reports reserved framebuffer memory separately. Missing ownership remains unattributed—it
+must not be assigned to a convenient category.
 
-The diagnostic comparator requires the same suite, target, driver, compute capability, controlled
-clock policy and band, sampling identity, timing/power scope, workload keys, operation counts, and
-memory contract as the checked baseline. It permits only the expected complete-versus-exact-B case
-selection and generator/resource-provenance lag. Its JSON always records `authoritative: false`, it
-does not fail merely because a metric regressed, and no diagnostic path calls baseline blessing.
-An explicit diagnostic `--json` output must be a repository-relative path under `target/`.
+Capacity gates are correctness gates. They must exercise the real shared-pool, slot, reclaim, and
+retry behavior at the admitted boundary; a benchmark's healthy headroom is not proof of capacity.
 
-Use `cargo run -p xtask -- bench-fp8-qkv`, `bench-fp8-gdn-input`, `bench-fp8-lm-head`,
-`bench-fp8-swiglu`, `bench-fp8-down`, `bench-gdn-prepare`, `bench-gdn-recurrence`, or
-`bench-gdn-output`, `bench-nvfp4-swiglu`, `bench-nvfp4-down`, `bench-attention-qk-prepare`,
-`bench-paged-gqa`, `bench-long-context-paged-gqa`, `bench-attention-output`, or
-`bench-mtp-bf16-fusion`, `bench-mtp-bf16-qkv`, `bench-mtp-bf16-qk-prepare`, or
-`bench-mtp-bf16-paged-gqa` with the same options for one operator suite only.
+## Energy
 
-`bench-text-endpoint SNAPSHOT` accepts the same options. It is intentionally separate from the
-leaf-wide `perf` commands until its first reviewed baseline is blessed.
+`perf energy` measures a synchronized idle reference, then continuously replays each warmed route
+for at least two seconds while sampling whole-board power. It reports board joules per logical unit,
+above-idle joules per unit, and units per board joule. The unit must state what completed work means,
+such as an active row, prompt token, generated token, or committed MTP token.
 
-`bench-qwen35-text-endpoint SNAPSHOT` directly measures the source-backed final RMSNorm plus BF16
-LM-head graph at every exact `B=1..8`. It remains outside leaf-wide `perf` until a locked-clock
-baseline is reviewed.
+This is whole-board evidence, not energy physically attributable to one leaf. It is most useful for
+sustained resident or server boundaries under an identical environment and remains diagnostic
+unless an explicit checked energy baseline is introduced.
 
-`bench-qwen36-text-endpoint SNAPSHOT` directly measures the source-backed final RMSNorm plus
-represented NVFP4 LM-head graph at every exact `B=1..8`. It remains outside leaf-wide `perf` until
-a locked-clock baseline is reviewed.
+## Baselines
 
-`bench-qwen35-resident-model SNAPSHOT` directly measures the complete 32-layer plus endpoint graph
-at every exact `B=1..8`; it never infers whole-model latency from leaf medians. It remains outside
-leaf-wide `perf` until a locked-clock baseline is reviewed. A controlled 2,182 MHz SM / 13,801 MHz
-memory diagnostic measured 6.261 ms at `B=1` and 8.485 ms at `B=8`, with about 1.2 us host submit
-time and zero timed device-memory growth.
+Checked timing baselines are `qual/baselines/<suite>-sm120.json`. Resource authorities remain
+separate from timing baselines. Raw reports, profiler output, receipts, and optimization history
+belong under ignored `target/` paths.
 
-`bench-qwen35-resident-mtp SNAPSHOT` directly measures the source-BF16 draft layer and shared
-BF16 LM head at every exact `B=1..8`, after an untimed target-model handoff at a 131-token context.
-It remains outside leaf-wide `perf` until a locked-clock baseline is reviewed.
+A report is blessable only when it has:
 
-`bench-qwen36-resident-model SNAPSHOT` directly measures the complete 40-layer plus represented
-NVFP4 endpoint graph at every exact `B=1..8` and from-empty `T=32,64,128`; it never infers
-whole-model latency from leaf medians. Prompt routes retain all final-layer residual rows but send
-only the final row through normalization and the 248,320-wide LM head. It remains outside
-leaf-wide `perf` until a locked-clock baseline is reviewed.
+- the complete admitted case and metric inventory;
+- controlled, comparable clocks on the exact local target;
+- matching device, driver, generator, toolchain, sampling, workload, and memory identity; and
+- passing numerical and resource gates.
 
-`bench-dense-fp8-mlp SNAPSHOT` directly measures the complete source-backed layer-60 MLP graph at
-every exact `B=1..8` and `T=32,64,128,1024` with the same options. It does not infer composition
-time from leaf medians and stays outside leaf-wide `perf` until the source-backed route receives a
-reviewed baseline.
+`perf bless` retains reviewed tolerances and enforcement flags for existing keys; it does not
+silently loosen them. New device timings initially use the larger of 5% or 0.05 us upper slack.
+Host timings initially use the larger of 15% or 0.10 us and are informational. Exact owned memory
+and post-warmup growth use zero slack; volatile observations begin informational with 16 MiB slack.
 
-`bench-nvfp4-mlp SNAPSHOT` directly measures the complete source-backed layer-55 MLP graph at every
-exact `B=1..8` and `T=32,64,128,1024`. Its `B=1,5..8` routes include production E2M1 activation
-quantization and W4A4 gate/up projection; `B=2..4` preserve the BF16 gate/up activation, and all
-decode routes use the represented-weight A16 down projection. Prefill uses W4A4 for both
-projections and retains distinct represented gate/up and down activation seams. It remains outside
-leaf-wide `perf` until a locked-clock local baseline is reviewed.
+Adding or removing a case or metric is an inventory change and requires review. Baseline changes
+are separate source commits. Diagnose an environment change or regression before blessing; never
+bless merely to make a gate green.
 
-`bench-dense-fp8-gdn-layer SNAPSHOT` measures each complete stateful layer-60 decode and prefill
-graph after an untimed production-owner reset of its history and FP32 recurrence. It reports exact
-`B=1..8` and `T=32,64,128,1024` routes; setup and allocation remain outside the timed region.
+## Optimization loop
 
-`bench-full-attention-layer SNAPSHOT` directly measures the complete layer-63 graphs rather than
-summing leaf medians. Decode uses a 131-token warm cache that crosses both 64-token page seams;
-prefill uses one from-empty shared table row and reports the exact T=32/64/128/1024 causal routes,
-including the production P4 macro workspace at T=1024.
+Change one measured hypothesis per iteration. Start with an exact route only for fast diagnosis,
+then qualify the changed numerical/resource boundary and directly time every affected boundary in
+its leaf-to-owner-to-resident/server dependency cone. `perf candidate` and `perf check` use the
+checked cone registry for this relationship.
 
-`bench-qwen35-full-attention-layer SNAPSHOT` applies the same direct boundary to Qwen3.5 layer 31.
-Its accounting distinguishes the B=2 A16 MLP path from the W4A4 paths and records the BF16 cache
-separately from resident weights and workspace.
+A leaf win is not a model win. Before accepting a change, repeat the cone with complete suite
+defaults and every admitted exact route. Keep each composed boundary's baseline independent from
+leaf resource and timing baselines. Revert a rejected implementation before testing the next
+hypothesis.
 
-`bench-resident-model SNAPSHOT` times the complete production graph directly; it never derives a
-model latency from leaf medians. The current 131-token route exercises all 64 layers and the LM
-head with resident weights, shared workspace, recurrent state, and represented KV caches. It omits
-the repeated-operation graph because one complete graph is already long enough for CUDA-event
-resolution and duplicating hundreds of model nodes would measure a different owner. The production
-embedding-staging graph restores represented input rows before each sample and remains outside the
-timed whole-model replay.
+`perf iterate` records the hypothesis, Git/input identity, reports, refusals, and phase wall times
+under `target/optimization/`. It can reuse ignored qualification and build receipts only when their
+complete source, device, driver, toolchain, resource, executable, and PTX identities match. It may
+copy verified immutable artifacts from another registered worktree; it never shares a mutable
+Cargo target directory.
 
-`bench-resident-prefill SNAPSHOT` directly times the same resident owner at exact
-`T=32,64,128,1024`. Its complete inventory includes the four from-empty prompts plus shared
-T32/T64 tails, both absolute-context T128 partition bands, and a nonzero-prefix P4 T1024 macro
-tile. All 64 layers advance one mapped GDN state/history row and one paged-attention table row
-causally. Only the final normalized tile row enters the LM head; represented embedding and exact
-metadata restoration remain outside the timed graph.
+## Profiling
 
-`bench-resident-long-context-model SNAPSHOT` uses the same production owner and direct graph timing.
-Its shared-pool profile assigns 131,073 positions to the first compact row and one position to each
-survivor, selecting the 860-partition graph for every exact `B=1..8` route without inventing eight
-copies of the physical KV pool. Prompt preparation and metadata uploads remain outside timing.
-
-Add `--energy-seconds 2` for sustained energy sampling. At least three samples, one launch per
-sample, and a two-second energy window are required.
-
-## Optimization dependency cones
-
-An optimization starts at one exact suite and moves outward through directly affected production
-owners. `perf candidate` and `perf check` use a checked registry for that relationship; they do not
-estimate a composed boundary by adding leaf medians. Examples include:
-
-```text
-nvfp4-down -> nvfp4-mlp -> resident-model + resident-prefill + resident-long-context-model
-fp8-down -> dense-fp8-mlp -> dense-fp8-gdn-layer + full-attention-layer
-         -> resident-model + resident-prefill + resident-long-context-model
-long-context-paged-gqa -> resident-long-context-model
-```
-
-The candidate mode is diagnostic: it runs the changed suite's oracle once, builds and resource-
-checks once, and measures the direct dependency cone. The check mode requalifies each distinct
-correctness boundary in the cone, uses complete suite defaults, and compares every cone report with
-its independent baseline. The three resident timing profiles share one resident-model oracle. A
-source-backed composed suite needs the admitted snapshot path even when the selected root is a
-synthetic leaf.
-
-Keep resource and timing authorities distinct. A leaf resource change is reviewed in its text
-baseline; each directly measured composed boundary has its own JSON performance baseline. A leaf
-improvement is not a model win until the directly timed resident report shows it.
-
-## Resident graph profiling
-
-The profiling command uses the same resident owner, allocations, stream, warmed cache state, exact
-batch graph, and 131-token context as the production short-context benchmark. Model loading,
-materialization, graph construction, and warmup finish before the application calls the public CUDA
-profiler-control API. Nsight therefore captures only explicit embedding preparation and complete
-resident graph replays.
-
-For Nsight Systems:
+Profile only the production owner or CUDA Graph after allocation and warmup. Nsight Systems is the
+first step:
 
 ```bash
 cargo run -p xtask -- profile resident-model SNAPSHOT \
   --batch 1 --replays 3 --tool nsys
 ```
 
-The command exports the trace to SQLite and processes it in Rust. It refuses unless the observed
-kernel sequence matches the semantic manifest exactly. The output directory contains:
+The command requires the observed kernel sequence to match the exact semantic owner/stage manifest
+and closes complete graph span against kernel time and gaps. Reports, SQLite exports, graph
+inventories, semantic manifests, and timing CSVs are written under `target/profiles/`.
 
-- the native `.nsys-rep` and exported `.sqlite` reports;
-- CUDA's verbose graph `.dot` inventory;
-- a semantic JSON manifest mapping graph-node ranges to exact layers, owners, and source routes;
-- per-node, per-stage, per-layer, and per-replay CSV timings; and
-- tool, Git status, executable hash, and device provenance metadata.
-
-The replay CSV closes complete graph span against the sum of kernel durations and inter-kernel
-gaps. Treat it as profiler evidence, not a regression median: tracing perturbs timing, and profiler
-clocks may differ from the checked benchmark clock band.
-
-Use Nsight Compute only after the Systems trace identifies an Amdahl-relevant kernel family:
+Use Nsight Compute only for a kernel family selected from that graph-level evidence:
 
 ```bash
 cargo run -p xtask -- profile resident-model SNAPSHOT \
-  --batch 1 --replays 1 --tool ncu --kernel 'nvfp4_down_a16_b1'
+  --batch 1 --replays 1 --tool ncu --kernel 'REGEX'
 ```
 
-The NCU report diagnoses physical memory transactions, stalls, occupancy, and instruction-pipeline
-use. Its isolated replay duration is not directly comparable with an uninstrumented resident-model
-baseline, and local speedup estimates must not be added across kernels.
-
-Treat occupancy, wave-tail, and excessive-transaction warnings as experiment selectors rather than
-optimization goals. Before a retile, account for the invariant useful rows or warps and every fixed
-per-CTA cost, including staging, barriers, inactive lanes, and tail guards. Making a grid divide the
-SM count evenly can duplicate that work or weaken a branch-free mapping even when reported
-occupancy rises. Direct production timing decides whether to retain the change; before-and-after
-counters support a causal explanation but do not replace that timing.
-
-## What one timing means
-
-Each exact route reports three boundaries and short routes also report a fourth:
-
-| Measurement | Boundary |
-|---|---|
-| `host_submit` | Rust time spent submitting repeated CUDA Graph replays |
-| `host_completion` | Rust time from submission through device completion |
-| `device_graph` | CUDA-event time per production graph replay |
-| `device_path` | CUDA-event time per complete operation inside one graph containing many repetitions |
-
-`device_graph` is the production graph-replay cost. Optional `device_path` reduces CUDA-event timer
-quantization for a short operation; it is not a different production route. A residual-norm path is
-one kernel. An FP8 projection path is its production quantization and projection pair. The text
-endpoint path is final RMSNorm followed by dynamic activation quantization and the LM-head
-projection over the production graph's stable addresses.
-
-The reusable timer records two events around a repeated interval and synchronizes once after it.
-It does not insert events into or mutate the production graph, and its fixed boundary cost is
-amortized across the reported operation count. The production server does not call the benchmark
-timer.
-
-Every metric records median, p10, p90, operations per measured interval, logical bytes per
-operation, and logical GiB/s for device timings. Logical GiB/s uses the operation's minimum declared
-reads and writes. It is not an `ncu` measurement of physical DRAM traffic.
-
-Cases are measured in rotating and reversing order so a fixed route sequence cannot absorb clock or
-thermal drift. All exact routes share one context, stream, prepared operation, and address-stable
-arena for the complete session.
-
-## Workload identity
-
-A timing key is more than `(route, shape)`. The report and baseline bind each metric to:
-
-- scope: `operator`, `endpoint`, `layer`, `model`, or `server`;
-- phase: `startup`, `prefill`, `decode`, `mtp`, or `request`;
-- compiled batch size;
-- external concurrency;
-- active, prompt, context, and requested output token counts;
-- device-cache regime;
-- prefix-cache regime; and
-- execution mode: eager, CUDA Graph, or server.
-
-Unused dimensions are `null`, not zero. A comparison refuses when any workload dimension or metric
-inventory differs. This prevents, for example, a warm short-context operator result from being
-compared with a cold long-context model result that shares a route name.
-
-The residual-norm `B=1..8`, FP8-QKV `B=1..8`, FP8-GDN-input `B=1..8`, FP8-LM-head, dense-FP8-SwiGLU `B=1..8`,
-dense-FP8-down, NVFP4-SwiGLU, and NVFP4-down cases are `operator/decode`, warm-cache, CUDA-Graph
-workloads. They set batch and active tokens to the exact batch. FP8-QKV `T=16` is an
-`operator/mtp` case; residual norm, FP8-QKV, FP8-GDN-input, GDN-prepare, and GDN-recurrence prompt
-routes are `operator/prefill` cases. The Qwen3.8 residual-norm inventory reaches T=1024, while the
-Qwen3.6 residual-norm inventory admits T=32/64/128. Both projection T=32 routes read a padded
-64-row activation-code tile,
-and their logical-byte accounting includes those immutable padding reads.
-GDN-prepare samples restore the exact mapped history outside the timed interval; the timed graph
-contains only the production control, parallel causal-convolution, and ordered history-publication
-launches.
-GDN-recurrence samples likewise restore mapped FP32 state outside timing. Prefill exposes the 48
-independent value-head CTAs and advances tokens serially inside each CTA because every token reads
-the state produced by its predecessor.
-Paged GQA `B=1..8` cases are `operator/decode` at context 130. Its shared `T=32,64,128` cases are
-`operator/prefill`; token `i` attends a two-token prefix plus the causal span through `i`. Logical
-bytes charge each K/V tile once per adjacent-token/KV-head group rather than duplicating its six
-query-head consumers. The partitioned `T=128` P8/P16 cases are also `operator/prefill`; accounting
-includes one query read per active partition, one K/V load per 32-row/query-head group, exact
-length/table/page metadata reads, and both the producer writes and reducer reads of every complete
-FP32 partial state. Macro `T=1024/P=4` cases use the same accounting at contexts 32,768 and 98,304;
-their resident maximum workspace still covers every qualified `P=1,2,4,8,16` route.
-Dense-FP8-SwiGLU, dense-FP8-down, NVFP4-SwiGLU, and NVFP4-down `T=32,64,128,1024`
-cases are `operator/prefill` with prompt and context lengths equal to the active rows. Each
-dense-FP8 T=1024 owner has
-two 128-byte address-bound TMA descriptors; the NVFP4 route uses its prepared W4A4 launches without
-descriptors. Concurrency, output, and prefix cache do not apply to these leaf suites.
-
-## Memory and capacity
-
-Memory is reported from two independent views:
-
-1. production owners attribute exact address-stable byte counts; and
-2. NVML and `/proc/self/status` observe the whole process and device.
-
-The report captures snapshots at `before_context`, `after_setup`, `after_warmup`, and
-`after_measurement`. Each snapshot contains:
-
-- whole-device used bytes;
-- whole-device free bytes;
-- driver-reserved device bytes;
-- current process RSS; and
-- peak process RSS.
-
-It also emits comparable memory metrics:
-
-| Metric | Meaning | Direction |
-|---|---|---|
-| named owner | Exact bytes registered by one production owner | at most |
-| `summary/accounted_resident` | Sum of registered owner bytes | at most |
-| `summary/setup_device_delta` | NVML used-memory increase from preflight through warm setup | at most |
-| `summary/timed_peak_device_delta` | Highest in-window NVML usage relative to preflight | at most |
-| `summary/timed_growth_after_warmup` | Highest in-window NVML usage above warmed setup | at most |
-| `summary/minimum_device_headroom` | Lowest in-window `memory.free` value | at least |
-| `summary/device_reserved` | NVML `memory.reserved` after warmup | at most |
-| `summary/process_peak_rss` | Process `VmHWM` | at most |
-| `summary/unattributed_setup_delta` | Setup delta not explained by registered owners | at most |
-
-Free headroom is sampled from `memory.free` directly. Do not derive it as `total - used`: the driver
-reports reserved framebuffer memory separately, and on the target card that difference is hundreds
-of MiB. NVML memory observations have MiB resolution; owner accounting remains the exact authority
-for allocations the program controls.
-
-The residual-norm suite attributes its single address-stable arena. Each FP8 projection suite,
-including the 1.27 GB full-vocabulary head, separately attributes source-native weights and the
-remainder of its single address-stable arena as workspace. CUDA context, module, and graph storage
-remain visible in the setup delta and unattributed remainder because their exact allocation sizes
-are not owned by the program.
-
-Owned quantities and post-warmup growth are enforced by default with zero slack. Setup delta,
-timed peak relative to preflight, headroom, driver reservation, RSS, and unattributed setup remain
-in the checked artifact but default to informational: those observations include volatile driver
-and CUDA-context state. A later model or server suite may deliberately enforce a product memory
-budget, such as minimum headroom, by changing that metric in a baseline-only review.
-
-Future resident owners should register weights, KV cache, workspaces, graph storage, and runtime
-storage separately when their exact byte counts are known. A missing attribution must remain visible
-as unattributed memory rather than being assigned to a convenient category.
-
-### Host/device transfers
-
-The arena's synchronous `copy_from_host` and `copy_to_host` helpers currently serve setup and oracle
-readback, so they are not performance cases. Benchmark transfers when a production owner depends on
-them, using its actual pinned staging buffer, direction, payload sizes, and overlap policy. Such a
-case should record the warmed negotiated PCIe generation and width alongside effective GiB/s;
-resident compute cases such as residual norm do not depend on PCIe link state.
-
-## Power and energy
-
-The telemetry sampler records instantaneous whole-board power during timed work. `perf energy`
-first samples the synchronized, warmed device at idle, then creates a separate sustained window of
-at least two seconds for every exact route. It reports whole-board, above-idle, and reciprocal
-efficiency estimates:
-
-```text
-board joules per unit = mean board watts × CUDA-event seconds / completed logical units
-dynamic joules per unit = max(mean board watts - idle board watts, 0)
-                         × CUDA-event seconds / completed logical units
-units per board joule = 1 / board joules per unit
-```
-
-The current unit is a token/active row. Each leaf estimate comes from continuous graph replay, not
-one power sample around a microsecond operation, but it is still a whole-board diagnostic dominated
-by clock, static, dispatch, and runtime power. It is not energy physically attributable to one leaf
-and is not a blessed regression metric. Use energy most confidently for sustained full graphs or
-serving workloads under the same machine and environment.
-
-Future model reports must distinguish joules per prompt token, generated token, and MTP committed
-token. Those denominators describe different work and cannot share a baseline.
-
-## Environment controls and refusal
-
-Before measurement, the runner requires:
-
-- device zero is exactly `NVIDIA GeForce RTX 5090`;
-- `CUDA_VISIBLE_DEVICES` is unset or exactly `0`;
-- GPU utilization is below 10%;
-- at most 2,048 MiB is already used, admitting the product workstation's desktop footprint;
-- no foreign compute PID is present; and
-- the runtime compute capability is 12.0.
-
-During measurement it samples SM clock, memory clock, temperature, board power, used memory, and
-free memory every 10 ms. A run is refused when:
-
-- fewer than three telemetry samples are captured;
-- the SM clock spreads by more than 50 MHz, admitting the target's measured 2,160-to-2,197 MHz
-  light-load P-state step;
-- the memory clock spreads by more than 250 MHz, admitting the target's measured 13,801-to-14,001
-  MHz loaded P-state step;
-- a timing or derived throughput is non-finite or non-positive; or
-- another compute process appears.
-
-The runner records clocks; it does not change clock or power settings. Clock locking, if used, is a
-machine-administration step outside the repository and must remain identical between baseline and
-candidate runs.
-
-Multi-suite `perf` commands wait up to ten seconds between their own benchmark processes for NVML's
-utilization sample to return idle. Direct single-suite commands retain immediate refusal behavior.
-
-For the retained 2,200 MHz target clock and the card's 14,001 MHz memory clock, lock both before the
-run:
-
-```bash
-sudo nvidia-smi -i 0 --lock-gpu-clocks=2200,2200 && \
-sudo nvidia-smi -i 0 --lock-memory-clocks=14001,14001
-```
-
-Reset the administrator-controlled clock state afterward:
-
-```bash
-sudo nvidia-smi -i 0 --reset-gpu-clocks && \
-sudo nvidia-smi -i 0 --reset-memory-clocks
-```
-
-The runner prints these complete commands when it refuses a drifting-clock result. It does not run
-them automatically because changing device clocks requires explicit machine authority.
-
-## Baselines and regression gates
-
-The checked baseline stores one record per timing and memory key. Comparison additionally requires
-the same:
-
-- suite and complete metric inventories;
-- target GPU name, driver, compute capability, and memory capacity;
-- cuda-oxide generator/resource stamp;
-- SM and memory clock bands;
-- minimum sample count;
-- warmup replay count and complete-inventory case policy;
-- timing and power scopes.
-
-The generator stamp records readable cuda-oxide, Rust, and CUDA Toolkit identities. Both `ptxas`
-and `cuobjdump` must report the same exact Toolkit release and patch version so a mixed installation
-is refused. Locally linked compiler-backend bytes are not a portable equality gate.
-
-The raw report records the physical UUID so CUDA execution, NVML telemetry, and memory snapshots can
-be proven to refer to the same device during one run. The checked baseline neither stores nor
-compares that UUID: it describes the declared target class rather than identifying one physical
-runner. It retains the blessed executable hash as provenance, not as a candidate comparison key.
-
-New device timing metrics default to the larger of 5% or 0.05 us of upper slack. Host metrics
-default to the larger of 15% or 0.10 us and are informational unless deliberately enabled. Exact
-owned-memory and post-warmup-growth quantities default to zero slack. Volatile NVML and RSS
-quantities initially receive 16 MiB of absolute slack and remain informational unless a reviewed
-product budget enables them. Each value, tolerance, direction, and enforcement flag is visible in
-the baseline diff and can be reviewed independently.
-
-`perf bless SUITE` retains reviewed tolerances and enforcement flags for that suite's existing keys.
-It updates measured references but does not silently loosen a gate. Adding or removing a workload
-or metric changes the inventory and therefore requires an explicit baseline review.
-
-Do not bless a regression merely to make the gate green. First establish whether the change is an
-intentional schedule improvement, a measurement-environment change, or a real regression. Timings
-from different clocks, drivers, devices, or cache regimes are not comparable.
-
-## Correctness and performance order
-
-Performance does not admit a kernel. The required order is:
-
-1. independent represented-value or mathematical oracle;
-2. eager-versus-graph replay equivalence;
-3. generated entry and resource gate;
-4. exclusive performance measurement; and
-5. explicit baseline comparison or blessing.
-
-`perf gate` mechanizes this order for registered suites. A skipped numerical oracle is not a pass.
-
-Plain `cargo test --workspace` cannot link the SM120 qualification crate because its cuda-oxide
-artifact anchor is produced by the device build. Use the `xtask` qualification command for device
-tests. Ordinary host tests and Criterion benchmarks remain normal Cargo commands.
-
-## Adding another benchmark case
-
-A new production owner should extend the existing runner rather than create an unrelated timing
-loop:
-
-1. prepare one context, stream, operation owner, and address-stable arena for the suite;
-2. capture its production leaf/full graph and, only for timer resolution, an optional
-   repeated-operation graph;
-3. register an exact workload identity and logical-byte/unit accounting;
-4. register every exactly known resident allocation with its owner and scaling rule;
-5. warm or displace caches according to the declared regime;
-6. keep numerical qualification independent from production helpers;
-7. add the exact route to the expected inventory; and
-8. bless a baseline only after the correctness and resource gates pass.
-
-Time composed layers, the whole model, and server requests directly. Do not estimate their wall time
-by summing leaf medians: graph concurrency, cache reuse, scheduling, and host work can make that sum
-wrong in either direction.
-
-For tuning, first use an exact route subset and profiler artifacts to select the change. Then run
-the changed oracle and resource gate, directly measure its composed dependency cone, and finally
-repeat with the complete inventory before comparison or blessing. Preserve profiler reports under
-`target/`; they are diagnostic build products, not checked source.
-
-Criterion remains the harness for pure host work such as checkpoint admission, tokenization,
-template rendering, prefix lookup, sampling, and streaming detokenization. CUDA-event timing,
-exclusive-device controls, NVML telemetry, and device baselines remain in this runner.
-
-## Current limitations
-
-- Decode operator coverage is exact `B=1..8`; prefill remains limited to the explicitly listed
-  residual norm, FP8-QKV, Q/K preparation/cache-append, shared early-context, partitioned deep-tail
-  and macro paged-GQA, attention-output, dense-FP8 MLP, NVFP4 SwiGLU, NVFP4 down,
-  full-attention-layer, FP8-GDN-input, GDN-prepare, GDN-recurrence, GDN-output, and dense-FP8
-  GDN-layer routes. Server admission composes only exact T1024/T128/T64/T32 whole-model graphs for
-  cold prompts and reused-prefix suffixes; an unmatched final span below 32 tokens primes through
-  exact B1 decode.
-- The suite labels warm cache; it does not yet implement a generic cold-cache displacement protocol.
-- External HTTP qualification covers blocking/SSE agreement, greedy stability across concurrent
-  request counts 1 through 8, cancellation, and slot recycling. It does not prove internal batch
-  occupancy. A direct diagnostic HTTP benchmark reports raw and summarized TTFT, mean inter-token
-  cadence, request time, reported prefix reuse, completion throughput, external concurrency, and
-  optional long-context observations. It incrementally preserves completed samples. The
-  lifecycle-owned wrapper binds those timings to the production child, exclusive-process checks,
-  a sustained loaded-clock preflight, and 10 ms clock/power/memory evidence. The preflight normally
-  refuses before direct timing; `TUISKO_DIAGNOSTIC_ALLOW_CLOCK_DRIFT=1` instead preserves the full
-  timing and telemetry as explicitly refused, non-blessable evidence. Late clock drift is likewise
-  preserved as refused evidence. This full-server boundary admits at most 75 MHz of SM spread: the
-  observed 2,122--2,197 MHz boost band is ten discrete steps and 3.4% of its upper clock. Leaf and
-  resident-model suites retain their separate 50 MHz policy. The strict comparator covers exact
-  case identity, median TTFT,
-  inter-token cadence, request latency, completion throughput, whole-board and above-idle energy,
-  resident memory, driver, clock bands, binary provenance, and short versus long-context inventory.
-  Separate checked full-server baselines cover the short-context and optional long-context HTTP
-  inventories. Direct long-context operator and resident-model timing also exists.
-- Power and energy are reportable for the resident model and complete HTTP suite. Full-server
-  energy has no checked regression baseline yet.
-- `ncu` and Nsight Systems traces are first-class diagnostic artifacts, but remain outside checked
-  regression comparison and baseline blessing.
-
-These are scope statements, not inferred passes. New cases should be added with their production
-owners and independent oracles.
+Profiler timings are perturbed diagnostics, never regression references. Occupancy and transaction
+warnings select hypotheses; they do not prove an optimization. Production timing of the complete
+affected boundary decides whether a change survives.
 
 ## Troubleshooting
 
-`device zero is not idle`
-: Stop or wait for the foreign GPU workload. Do not bypass the exclusivity check.
+`device zero is not idle` or `foreign compute process IDs`
+: Wait for or stop the other GPU workload. Do not bypass exclusivity.
 
-`foreign compute process IDs`
-: Another CUDA process appeared after setup. Re-run under an exclusive reservation.
-
-`SM clock moved ... lock clocks before comparing`
-: Cool or stabilize the card, run the complete lock command printed by the refusal, and repeat under
-  the same clock policy as the baseline. Run the printed reset command when finished.
+`SM clock moved ...`
+: Stabilize or lock the card, then repeat under the baseline's clock policy. Use the diagnostic
+  environment variable only when non-authoritative evidence is sufficient.
 
 `performance baseline ... could not read`
-: No reviewed baseline exists. Run `perf leaf`, inspect the report, then use
-  `perf bless SUITE` explicitly for one of the registered suites in the command reference.
+: The suite has no reviewed authority. Produce and inspect a complete run, then invoke
+  `perf bless SUITE` explicitly.
 
 `performance report and baseline metric inventories differ`
-: A route, workload dimension, timing boundary, or memory owner changed. Review the inventory change;
-  do not edit the generated report.
+: A workload, timing boundary, or memory owner changed. Review the inventory; do not hand-edit the
+  generated report.
 
-`cuda_oxide_artifact_anchor` is undefined
-: A device crate was linked through plain Cargo. Use `cargo run -p xtask -- build-sm120` or the
-  qualification/performance commands above.
+`cuda_oxide_artifact_anchor is undefined`
+: A device crate was linked through plain Cargo. Use `build-sm120`, a qualification command, or a
+  performance command so `xtask` finalizes the device artifact.
