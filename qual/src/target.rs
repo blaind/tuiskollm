@@ -7,14 +7,17 @@ pub(crate) use tuisko_kernels_sm89::{
 #[cfg(feature = "device")]
 pub(crate) use tuisko_kernels_sm120::{
     FullAttentionQkvOp, MtpBf16AttentionOutputOp, MtpBf16FusionOp, MtpBf16MlpOp,
-    MtpBf16QkPrepareOp, MtpBf16QkvOp, Qwen35Bf16LmHeadOp, Qwen35GdnPrepareOp,
+    MtpBf16QkPrepareOp, MtpBf16QkvOp, QWEN38_FLASH_NEXT_ABSENT_SLOT,
+    QWEN38_FLASH_NEXT_EXPERT_SLOT_BYTES, Qwen35Bf16LmHeadOp, Qwen35GdnPrepareOp,
     Qwen35GdnRecurrenceOp, Qwen35MtpBf16AttentionOutputOp, Qwen35MtpBf16FusionOp,
     Qwen35MtpBf16MlpOp, Qwen35MtpBf16QkPrepareOp, Qwen35MtpBf16QkvOp, Qwen35Nvfp4AttentionOutputOp,
     Qwen35Nvfp4DownOp, Qwen35Nvfp4GdnInputOp, Qwen35Nvfp4GdnOutputOp, Qwen35Nvfp4QkvOp,
     Qwen35Nvfp4SwiGluOp, Qwen35ResidualNormOp, Qwen36AttentionOutputOp, Qwen36Fp8QkvOp,
     Qwen36GdnInputOp, Qwen36GdnOutputOp, Qwen36MoeExpertsOp, Qwen36MoeRouterOp,
     Qwen36MtpBf16AttentionOutputOp, Qwen36MtpBf16FusionOp, Qwen36MtpBf16MoeOp, Qwen36MtpBf16QkvOp,
-    Qwen36Nvfp4LmHeadOp, Qwen36ResidualNormOp, Qwen38FlashNextHyperConnectionOp, ResidualNormOp,
+    Qwen36Nvfp4LmHeadOp, Qwen36ResidualNormOp, Qwen38FlashNextExpertDispatch,
+    Qwen38FlashNextHyperConnectionOp, Qwen38FlashNextMoeExpertsOp, Qwen38FlashNextMoeRouterOp,
+    ResidualNormOp, qwen38_flash_next_expert_slot_plane,
 };
 
 #[cfg(feature = "device")]
