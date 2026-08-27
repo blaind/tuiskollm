@@ -25,6 +25,7 @@
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract, thread};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_model::{Arch, Qwen38FlashNext};
 
 /// Compact batching owns one compiled route for every `B=1..8`.
@@ -1380,6 +1381,7 @@ pub(crate) fn hyper_connection_ptx_names() -> Vec<&'static str> {
 }
 
 /// The compiled route one admitted row count selects.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RowRoute {
     B1,
@@ -1399,6 +1401,7 @@ enum RowRoute {
 // Decode `B=1..=8` and prefill `T=32,64,128,1024`: the same schedule the other
 // per-token owners route, with the small-batch entries kept separate from the
 // tiles so a shape-aware dispatch never reaches a prefill body at decode.
+#[cfg(test)]
 fn row_route(rows: usize) -> Option<RowRoute> {
     match rows {
         1 => Some(RowRoute::B1),
@@ -1425,22 +1428,46 @@ fn unsupported_rows(operation: &str, rows: usize) -> GpuError {
     ))
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen38_flash_next_hyper_connection),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
+    inventory(false)
+)]
+struct Qwen38FlashNextHyperConnectionRoutes {
+    #[route(1)]
+    b1: PreparedDecodeRoute<1>,
+    #[route(2)]
+    b2: PreparedDecodeRoute<2>,
+    #[route(3)]
+    b3: PreparedDecodeRoute<3>,
+    #[route(4)]
+    b4: PreparedDecodeRoute<4>,
+    #[route(5)]
+    b5: PreparedDecodeRoute<5>,
+    #[route(6)]
+    b6: PreparedDecodeRoute<6>,
+    #[route(7)]
+    b7: PreparedDecodeRoute<7>,
+    #[route(8)]
+    b8: PreparedDecodeRoute<8>,
+    #[route(32)]
+    t32: PreparedPrefillRoute<32>,
+    #[route(64)]
+    t64: PreparedPrefillRoute<64>,
+    #[route(128)]
+    t128: PreparedPrefillRoute<128>,
+    #[route(1024)]
+    t1024: PreparedPrefillRoute<1_024>,
+}
+
 /// Prepared hyper-connection routes for decode `B=1..=8` and prefill
 /// `T=32,64,128,1024`.
 pub struct Qwen38FlashNextHyperConnectionOp {
     module: kernels::LoadedModule,
-    b1: PreparedDecodeRoute<1>,
-    b2: PreparedDecodeRoute<2>,
-    b3: PreparedDecodeRoute<3>,
-    b4: PreparedDecodeRoute<4>,
-    b5: PreparedDecodeRoute<5>,
-    b6: PreparedDecodeRoute<6>,
-    b7: PreparedDecodeRoute<7>,
-    b8: PreparedDecodeRoute<8>,
-    t32: PreparedPrefillRoute<32>,
-    t64: PreparedPrefillRoute<64>,
-    t128: PreparedPrefillRoute<128>,
-    t1024: PreparedPrefillRoute<1_024>,
+    routes: Qwen38FlashNextHyperConnectionRoutes,
 }
 
 impl Qwen38FlashNextHyperConnectionOp {
@@ -1452,18 +1479,7 @@ impl Qwen38FlashNextHyperConnectionOp {
             .map_err(|source| GpuError::module("loading the hyper-connection module", source))?;
 
         Ok(Self {
-            b1: PreparedDecodeRoute::<1>::prepare(&module)?,
-            b2: PreparedDecodeRoute::<2>::prepare(&module)?,
-            b3: PreparedDecodeRoute::<3>::prepare(&module)?,
-            b4: PreparedDecodeRoute::<4>::prepare(&module)?,
-            b5: PreparedDecodeRoute::<5>::prepare(&module)?,
-            b6: PreparedDecodeRoute::<6>::prepare(&module)?,
-            b7: PreparedDecodeRoute::<7>::prepare(&module)?,
-            b8: PreparedDecodeRoute::<8>::prepare(&module)?,
-            t32: PreparedPrefillRoute::<32>::prepare(&module)?,
-            t64: PreparedPrefillRoute::<64>::prepare(&module)?,
-            t128: PreparedPrefillRoute::<128>::prepare(&module)?,
-            t1024: PreparedPrefillRoute::<1_024>::prepare(&module)?,
+            routes: Qwen38FlashNextHyperConnectionRoutes::prepare(&module)?,
             module,
         })
     }
@@ -1501,12 +1517,11 @@ impl Qwen38FlashNextHyperConnectionOp {
         write_gate: *mut u16,
     ) -> GpuResult<()> {
         macro_rules! launch {
-            ($route:ident) => {{
+            ($route:expr) => {{
                 // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
-                    self.$route
-                        .launch_norm(&self.module, stream, residual, weight, normalized)?;
-                    self.$route.launch_mix_down(
+                    $route.launch_norm(&self.module, stream, residual, weight, normalized)?;
+                    $route.launch_mix_down(
                         &self.module,
                         stream,
                         normalized,
@@ -1515,27 +1530,12 @@ impl Qwen38FlashNextHyperConnectionOp {
                         low_rank,
                         write_gate,
                     )?;
-                    self.$route
-                        .launch_mix_up(&self.module, stream, normalized, up, low_rank, mixed)
+                    $route.launch_mix_up(&self.module, stream, normalized, up, low_rank, mixed)
                 }
             }};
         }
 
-        match row_route(rows) {
-            Some(RowRoute::B1) => launch!(b1),
-            Some(RowRoute::B2) => launch!(b2),
-            Some(RowRoute::B3) => launch!(b3),
-            Some(RowRoute::B4) => launch!(b4),
-            Some(RowRoute::B5) => launch!(b5),
-            Some(RowRoute::B6) => launch!(b6),
-            Some(RowRoute::B7) => launch!(b7),
-            Some(RowRoute::B8) => launch!(b8),
-            Some(RowRoute::T32) => launch!(t32),
-            Some(RowRoute::T64) => launch!(t64),
-            Some(RowRoute::T128) => launch!(t128),
-            Some(RowRoute::T1024) => launch!(t1024),
-            None => Err(unsupported_rows("hyper-connection input mix", rows)),
-        }
+        dispatch_qwen38_flash_next_hyper_connection!(&self.routes, rows, |route| launch!(route), else => Err(unsupported_rows("hyper-connection input mix", rows)))
     }
 
     /// Runs the model-level mixer without `block_inject_weight`; this is the
@@ -1559,39 +1559,17 @@ impl Qwen38FlashNextHyperConnectionOp {
         mixed: *mut u16,
     ) -> GpuResult<()> {
         macro_rules! launch {
-            ($route:ident) => {{
+            ($route:expr) => {{
                 // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
-                    self.$route
-                        .launch_norm(&self.module, stream, residual, weight, normalized)?;
-                    self.$route.launch_final_down(
-                        &self.module,
-                        stream,
-                        normalized,
-                        down,
-                        low_rank,
-                    )?;
-                    self.$route
-                        .launch_mix_up(&self.module, stream, normalized, up, low_rank, mixed)
+                    $route.launch_norm(&self.module, stream, residual, weight, normalized)?;
+                    $route.launch_final_down(&self.module, stream, normalized, down, low_rank)?;
+                    $route.launch_mix_up(&self.module, stream, normalized, up, low_rank, mixed)
                 }
             }};
         }
 
-        match row_route(rows) {
-            Some(RowRoute::B1) => launch!(b1),
-            Some(RowRoute::B2) => launch!(b2),
-            Some(RowRoute::B3) => launch!(b3),
-            Some(RowRoute::B4) => launch!(b4),
-            Some(RowRoute::B5) => launch!(b5),
-            Some(RowRoute::B6) => launch!(b6),
-            Some(RowRoute::B7) => launch!(b7),
-            Some(RowRoute::B8) => launch!(b8),
-            Some(RowRoute::T32) => launch!(t32),
-            Some(RowRoute::T64) => launch!(t64),
-            Some(RowRoute::T128) => launch!(t128),
-            Some(RowRoute::T1024) => launch!(t1024),
-            None => Err(unsupported_rows("hyper-connection final mix", rows)),
-        }
+        dispatch_qwen38_flash_next_hyper_connection!(&self.routes, rows, |route| launch!(route), else => Err(unsupported_rows("hyper-connection final mix", rows)))
     }
 
     /// Injects one block output into the raw widened stream.
@@ -1615,10 +1593,10 @@ impl Qwen38FlashNextHyperConnectionOp {
         output: *mut u16,
     ) -> GpuResult<()> {
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
-                    self.$route.launch_write_back(
+                    $route.launch_write_back(
                         &self.module,
                         stream,
                         residual,
@@ -1630,21 +1608,7 @@ impl Qwen38FlashNextHyperConnectionOp {
             };
         }
 
-        match row_route(rows) {
-            Some(RowRoute::B1) => launch!(b1),
-            Some(RowRoute::B2) => launch!(b2),
-            Some(RowRoute::B3) => launch!(b3),
-            Some(RowRoute::B4) => launch!(b4),
-            Some(RowRoute::B5) => launch!(b5),
-            Some(RowRoute::B6) => launch!(b6),
-            Some(RowRoute::B7) => launch!(b7),
-            Some(RowRoute::B8) => launch!(b8),
-            Some(RowRoute::T32) => launch!(t32),
-            Some(RowRoute::T64) => launch!(t64),
-            Some(RowRoute::T128) => launch!(t128),
-            Some(RowRoute::T1024) => launch!(t1024),
-            None => Err(unsupported_rows("hyper-connection write-back", rows)),
-        }
+        dispatch_qwen38_flash_next_hyper_connection!(&self.routes, rows, |route| launch!(route), else => Err(unsupported_rows("hyper-connection write-back", rows)))
     }
 }
 
