@@ -8,7 +8,7 @@ use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contra
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
 use tuisko_kernels_sm120_common::Sm120Arch;
-use tuisko_model::{Arch, Qwen38_27B};
+use tuisko_model::{Arch, Qwen38_27B, Qwen38FlashNext};
 
 const MAX_BATCH: usize = 8;
 const KEY_HEADS: usize = 16;
@@ -18,6 +18,15 @@ const WARPS: usize = 16;
 const THREADS: u32 = (WARPS * 32) as u32;
 const CAUSAL_ROWS: [usize; 4] = [1, 2, 3, 4];
 const PREFILL_ROWS: [usize; 4] = [32, 64, 128, 1_024];
+
+// Bind the reused serial entry to every target-dependent stride it reads.
+const _: () = assert!(Qwen38FlashNext::GDN_QKV_ROWS == Qwen38_27B::GDN_QKV_ROWS);
+const _: () = assert!(Qwen38FlashNext::GDN_INPUT_ROWS == Qwen38_27B::GDN_INPUT_ROWS);
+const _: () = assert!(Qwen38FlashNext::GDN_CONTROL_ROWS == Qwen38_27B::GDN_CONTROL_ROWS);
+const _: () = assert!(Qwen38FlashNext::LINEAR_KEY_HEADS == Qwen38_27B::LINEAR_KEY_HEADS);
+const _: () = assert!(Qwen38FlashNext::LINEAR_VALUE_HEADS == Qwen38_27B::LINEAR_VALUE_HEADS);
+const _: () = assert!(Qwen38FlashNext::LINEAR_HEAD_DIM == Qwen38_27B::LINEAR_HEAD_DIM);
+const _: () = assert!(Qwen38FlashNext::RMS_NORM_EPSILON == Qwen38_27B::RMS_NORM_EPSILON);
 
 fn admitted_batch(batch: usize) -> bool {
     (1..=MAX_BATCH).contains(&batch)
@@ -78,7 +87,7 @@ mod kernels {
         // so route specialization changes only the number of CTAs, never a
         // state's update or reduction order.
         unsafe {
-            gdn_recurrence::<A, TOKENS>(
+            gdn_recurrence::<A, TOKENS, false>(
                 qkv,
                 projected,
                 log_decay,
@@ -177,7 +186,83 @@ mod kernels {
         // sixteen-warp RMS reduction tree over the published recurrent row,
         // so the emitted gated values are bit-exact.
         unsafe {
-            gdn_recurrence_prefill_epilogue::<A, TOKENS>(
+            gdn_recurrence_prefill_epilogue::<A, TOKENS, false>(
+                projected,
+                norm_weight,
+                recurrent,
+                output,
+                core::ptr::addr_of_mut!(REDUCTION).cast::<f32>(),
+            );
+        }
+    }
+
+    /// Updates mapped FP32 state and emits the sigmoid-gated value plane.
+    #[kernel]
+    #[launch_bounds(512, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (512, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen38_flash_next_gdn_recurrence_exact<A: Arch, const TOKENS: usize>(
+        qkv: *const u16,
+        projected: *const u16,
+        log_decay: *const f32,
+        beta: *const f32,
+        norm_weight: *const u16,
+        state_rows: *const u32,
+        state: *mut f32,
+        output: *mut u16,
+    ) {
+        static mut QUERY: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
+        static mut KEY: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
+        static mut RECURRENT_OUTPUT: SharedArray<f32, HEAD_DIM, 16> = SharedArray::UNINIT;
+        static mut REDUCTION: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
+
+        // The checkpoint requires a distinct sigmoid-gated entry.
+        unsafe {
+            gdn_recurrence::<A, TOKENS, true>(
+                qkv,
+                projected,
+                log_decay,
+                beta,
+                norm_weight,
+                state_rows,
+                state,
+                output,
+                core::ptr::addr_of_mut!(QUERY).cast::<f32>(),
+                core::ptr::addr_of_mut!(KEY).cast::<f32>(),
+                core::ptr::addr_of_mut!(RECURRENT_OUTPUT).cast::<f32>(),
+                core::ptr::addr_of_mut!(REDUCTION).cast::<f32>(),
+            );
+        }
+    }
+
+    /// Applies the deferred prefill RMS/sigmoid-gate/store epilogue in parallel.
+    #[kernel]
+    #[launch_bounds(512, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (512, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact<A: Arch, const TOKENS: usize>(
+        projected: *const u16,
+        norm_weight: *const u16,
+        recurrent: *const f32,
+        output: *mut u16,
+    ) {
+        static mut REDUCTION: SharedArray<f32, WARPS, 16> = SharedArray::UNINIT;
+
+        // The shared serial pass returns before this target-specific gate.
+        unsafe {
+            gdn_recurrence_prefill_epilogue::<A, TOKENS, true>(
                 projected,
                 norm_weight,
                 recurrent,
@@ -188,22 +273,148 @@ mod kernels {
     }
 }
 
-struct PreparedRoute<A: Arch, const TOKENS: usize> {
+mod private {
+    pub trait Sealed {}
+}
+
+/// Prepared decode entry for one exact row count.
+pub trait GdnRecurrenceDecodeRoute<A: Arch>: Sized + private::Sealed {
+    /// Prepares this route's decode entry.
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self>;
+
+    /// Launches this route's decode entry.
+    ///
+    /// # Safety
+    ///
+    /// The pointers carry [`GdnRecurrenceOp::launch`]'s contract unchanged.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        qkv: *const u16,
+        projected: *const u16,
+        log_decay: *const f32,
+        beta: *const f32,
+        norm_weight: *const u16,
+        state_rows: *const u32,
+        state: *mut f32,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+/// One architecture's prepared serial-pass and epilogue entries for an exact
+/// causal or prefill row count.
+pub trait GdnRecurrencePrefillRoute<A: Arch>: Sized + private::Sealed {
+    /// Prepares both entries of this route's exact row count.
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self>;
+
+    /// Launches the serial state advance and then its gated epilogue.
+    ///
+    /// # Safety
+    ///
+    /// The pointers carry [`GdnRecurrenceOp::launch`]'s contract unchanged.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        qkv: *const u16,
+        projected: *const u16,
+        log_decay: *const f32,
+        beta: *const f32,
+        norm_weight: *const u16,
+        state_rows: *const u32,
+        state: *mut f32,
+        recurrent: *mut f32,
+        output: *mut u16,
+    ) -> GpuResult<()>;
+}
+
+/// Sealed entry table for one admitted architecture's recurrence routes.
+pub trait GdnRecurrenceEntries<A: Arch>: private::Sealed {
+    /// Prepared decode route for `B=1..=8`.
+    type Decode<const TOKENS: usize>: GdnRecurrenceDecodeRoute<A>;
+    /// Prepared causal or prefill route for one exact row count.
+    type Prefill<const TOKENS: usize>: GdnRecurrencePrefillRoute<A>;
+
+    /// Message prefix that keeps this architecture's launch errors distinct.
+    const LABEL: &'static str;
+    /// Rejects an architecture whose recurrence contract is not this schedule's.
+    fn require_geometry() -> GpuResult<()>;
+
+    /// Retained PTX entry names of every route this table admits.
+    fn ptx_names() -> Vec<&'static str>;
+}
+
+/// Prepared Qwen3.8-27B decode entry for one exact batch.
+pub struct PreparedRoute<A: Arch, const TOKENS: usize> {
     launch: PreparedLaunch<kernels::__gdn_recurrence_exact_CudaKernel<A, TOKENS>>,
 }
 
-impl<A: Arch, const TOKENS: usize> PreparedRoute<A, TOKENS> {
+/// Prepared Flash-Next sigmoid-gated decode entry for one exact batch.
+pub struct Qwen38FlashNextPreparedRoute<const TOKENS: usize> {
+    launch: PreparedLaunch<
+        kernels::__qwen38_flash_next_gdn_recurrence_exact_CudaKernel<Qwen38FlashNext, TOKENS>,
+    >,
+}
+
+/// Prepared Qwen3.8-27B serial-pass and epilogue entries for one exact row count.
+pub struct PreparedPrefillRoute<A: Arch, const TOKENS: usize> {
+    launch: PreparedLaunch<kernels::__gdn_recurrence_prefill_exact_CudaKernel<A, TOKENS>>,
+    epilogue:
+        PreparedLaunch<kernels::__gdn_recurrence_prefill_epilogue_exact_CudaKernel<A, TOKENS>>,
+}
+
+/// Reused serial pass and Flash-Next epilogue for one exact row count.
+pub struct Qwen38FlashNextPreparedPrefillRoute<const TOKENS: usize> {
+    launch: PreparedLaunch<kernels::__gdn_recurrence_prefill_exact_CudaKernel<Qwen38_27B, TOKENS>>,
+    epilogue: PreparedLaunch<
+        kernels::__qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact_CudaKernel<
+            Qwen38FlashNext,
+            TOKENS,
+        >,
+    >,
+}
+
+impl<A: Arch, const TOKENS: usize> private::Sealed for PreparedRoute<A, TOKENS> {}
+impl<const TOKENS: usize> private::Sealed for Qwen38FlashNextPreparedRoute<TOKENS> {}
+impl<A: Arch, const TOKENS: usize> private::Sealed for PreparedPrefillRoute<A, TOKENS> {}
+impl<const TOKENS: usize> private::Sealed for Qwen38FlashNextPreparedPrefillRoute<TOKENS> {}
+
+fn decode_blocks(tokens: usize) -> GpuResult<u32> {
+    u32::try_from(tokens * VALUE_HEADS)
+        .map_err(|_| GpuError::invalid_launch("GDN recurrence grid exceeds u32"))
+}
+
+fn epilogue_blocks(tokens: usize) -> GpuResult<u32> {
+    u32::try_from(tokens * VALUE_HEADS)
+        .map_err(|_| GpuError::invalid_launch("GDN recurrence epilogue grid exceeds u32"))
+}
+
+fn require_admitted_prefill(tokens: usize) -> GpuResult<()> {
+    if !CAUSAL_ROWS.contains(&tokens) && !PREFILL_ROWS.contains(&tokens) {
+        return Err(GpuError::invalid_launch(format!(
+            "GDN recurrence causal route T={tokens} is not admitted"
+        )));
+    }
+
+    Ok(())
+}
+
+impl<A: Sm120Arch, const TOKENS: usize> GdnRecurrenceDecodeRoute<A> for PreparedRoute<A, TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let blocks = u32::try_from(TOKENS * VALUE_HEADS)
-            .map_err(|_| GpuError::invalid_launch("GDN recurrence grid exceeds u32"))?;
         let launch = module
-            .prepare_gdn_recurrence_exact::<A, TOKENS>(LaunchConfig1D::new(blocks, THREADS, 0))
+            .prepare_gdn_recurrence_exact::<A, TOKENS>(LaunchConfig1D::new(
+                decode_blocks(TOKENS)?,
+                THREADS,
+                0,
+            ))
             .map_err(|source| GpuError::launch("preparing GDN recurrence", source))?;
 
         Ok(Self { launch })
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
@@ -234,19 +445,58 @@ impl<A: Arch, const TOKENS: usize> PreparedRoute<A, TOKENS> {
     }
 }
 
-struct PreparedPrefillRoute<A: Arch, const TOKENS: usize> {
-    launch: PreparedLaunch<kernels::__gdn_recurrence_prefill_exact_CudaKernel<A, TOKENS>>,
-    epilogue:
-        PreparedLaunch<kernels::__gdn_recurrence_prefill_epilogue_exact_CudaKernel<A, TOKENS>>,
+impl<const TOKENS: usize> GdnRecurrenceDecodeRoute<Qwen38FlashNext>
+    for Qwen38FlashNextPreparedRoute<TOKENS>
+{
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let launch = module
+            .prepare_qwen38_flash_next_gdn_recurrence_exact::<Qwen38FlashNext, TOKENS>(
+                LaunchConfig1D::new(decode_blocks(TOKENS)?, THREADS, 0),
+            )
+            .map_err(|source| {
+                GpuError::launch("preparing Qwen3.8-Flash-Next GDN recurrence", source)
+            })?;
+
+        Ok(Self { launch })
+    }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        qkv: *const u16,
+        projected: *const u16,
+        log_decay: *const f32,
+        beta: *const f32,
+        norm_weight: *const u16,
+        state_rows: *const u32,
+        state: *mut f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_gdn_recurrence_exact::<Qwen38FlashNext, TOKENS>(
+                stream,
+                &self.launch,
+                qkv,
+                projected,
+                log_decay,
+                beta,
+                norm_weight,
+                state_rows,
+                state,
+                output,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching Qwen3.8-Flash-Next GDN recurrence", source)
+            })
+    }
 }
 
-impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
+impl<A: Sm120Arch, const TOKENS: usize> GdnRecurrencePrefillRoute<A>
+    for PreparedPrefillRoute<A, TOKENS>
+{
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        if !CAUSAL_ROWS.contains(&TOKENS) && !PREFILL_ROWS.contains(&TOKENS) {
-            return Err(GpuError::invalid_launch(format!(
-                "GDN recurrence causal route T={TOKENS} is not admitted"
-            )));
-        }
+        require_admitted_prefill(TOKENS)?;
         let launch = module
             .prepare_gdn_recurrence_prefill_exact::<A, TOKENS>(LaunchConfig1D::new(
                 (VALUE_HEADS * SPLIT_CTAS_PER_HEAD) as u32,
@@ -254,11 +504,9 @@ impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
                 0,
             ))
             .map_err(|source| GpuError::launch("preparing GDN recurrence prefill", source))?;
-        let epilogue_blocks = u32::try_from(TOKENS * VALUE_HEADS)
-            .map_err(|_| GpuError::invalid_launch("GDN recurrence epilogue grid exceeds u32"))?;
         let epilogue = module
             .prepare_gdn_recurrence_prefill_epilogue_exact::<A, TOKENS>(LaunchConfig1D::new(
-                epilogue_blocks,
+                epilogue_blocks(TOKENS)?,
                 THREADS,
                 0,
             ))
@@ -269,7 +517,6 @@ impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
         Ok(Self { launch, epilogue })
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
@@ -314,53 +561,182 @@ impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
     }
 }
 
-/// Prepared FP32 GDN recurrence routes for exact decode and prefill rows.
-pub struct GdnRecurrenceOp<A: Sm120Arch = Qwen38_27B> {
-    module: kernels::LoadedModule,
-    b1: PreparedRoute<A, 1>,
-    b2: PreparedRoute<A, 2>,
-    b3: PreparedRoute<A, 3>,
-    b4: PreparedRoute<A, 4>,
-    b5: PreparedRoute<A, 5>,
-    b6: PreparedRoute<A, 6>,
-    b7: PreparedRoute<A, 7>,
-    b8: PreparedRoute<A, 8>,
-    k1: PreparedPrefillRoute<A, 1>,
-    k2: PreparedPrefillRoute<A, 2>,
-    k3: PreparedPrefillRoute<A, 3>,
-    k4: PreparedPrefillRoute<A, 4>,
-    t32: PreparedPrefillRoute<A, 32>,
-    t64: PreparedPrefillRoute<A, 64>,
-    t128: PreparedPrefillRoute<A, 128>,
-    t1024: PreparedPrefillRoute<A, 1_024>,
+impl<const TOKENS: usize> GdnRecurrencePrefillRoute<Qwen38FlashNext>
+    for Qwen38FlashNextPreparedPrefillRoute<TOKENS>
+{
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        require_admitted_prefill(TOKENS)?;
+        let launch = module
+            .prepare_gdn_recurrence_prefill_exact::<Qwen38_27B, TOKENS>(LaunchConfig1D::new(
+                (VALUE_HEADS * SPLIT_CTAS_PER_HEAD) as u32,
+                THREADS,
+                0,
+            ))
+            .map_err(|source| {
+                GpuError::launch(
+                    "preparing Qwen3.8-Flash-Next GDN recurrence prefill",
+                    source,
+                )
+            })?;
+        let epilogue = module
+            .prepare_qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact::<Qwen38FlashNext, TOKENS>(
+                LaunchConfig1D::new(epilogue_blocks(TOKENS)?, THREADS, 0),
+            )
+            .map_err(|source| {
+                GpuError::launch(
+                    "preparing Qwen3.8-Flash-Next GDN recurrence prefill epilogue",
+                    source,
+                )
+            })?;
+
+        Ok(Self { launch, epilogue })
+    }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        qkv: *const u16,
+        projected: *const u16,
+        log_decay: *const f32,
+        beta: *const f32,
+        norm_weight: *const u16,
+        state_rows: *const u32,
+        state: *mut f32,
+        recurrent: *mut f32,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        // SAFETY: the epilogue reads the plane the serial pass just published
+        // on the same stream, so ordering is inherent.
+        module
+            .gdn_recurrence_prefill_exact::<Qwen38_27B, TOKENS>(
+                stream,
+                &self.launch,
+                qkv,
+                projected,
+                log_decay,
+                beta,
+                norm_weight,
+                state_rows,
+                state,
+                recurrent,
+                output,
+            )
+            .map_err(|source| {
+                GpuError::launch(
+                    "launching Qwen3.8-Flash-Next GDN recurrence prefill",
+                    source,
+                )
+            })?;
+        module
+            .qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact::<Qwen38FlashNext, TOKENS>(
+                stream,
+                &self.epilogue,
+                projected,
+                norm_weight,
+                recurrent.cast_const(),
+                output,
+            )
+            .map_err(|source| {
+                GpuError::launch(
+                    "launching Qwen3.8-Flash-Next GDN recurrence prefill epilogue",
+                    source,
+                )
+            })
+    }
 }
 
-impl<A: Sm120Arch> GdnRecurrenceOp<A> {
+/// Qwen3.8-27B SiLU-gated recurrence entry table.
+pub struct Qwen38GdnRecurrenceEntries;
+
+/// Flash-Next sigmoid entries with the reused Qwen3.8-27B serial pass.
+pub struct Qwen38FlashNextGdnRecurrenceEntries;
+
+impl private::Sealed for Qwen38GdnRecurrenceEntries {}
+impl private::Sealed for Qwen38FlashNextGdnRecurrenceEntries {}
+
+impl<A: Sm120Arch> GdnRecurrenceEntries<A> for Qwen38GdnRecurrenceEntries {
+    type Decode<const TOKENS: usize> = PreparedRoute<A, TOKENS>;
+    type Prefill<const TOKENS: usize> = PreparedPrefillRoute<A, TOKENS>;
+
+    const LABEL: &'static str = "";
+    fn require_geometry() -> GpuResult<()> {
+        require_geometry::<A>()
+    }
+
+    fn ptx_names() -> Vec<&'static str> {
+        gdn_recurrence_ptx_names()
+    }
+}
+
+impl GdnRecurrenceEntries<Qwen38FlashNext> for Qwen38FlashNextGdnRecurrenceEntries {
+    type Decode<const TOKENS: usize> = Qwen38FlashNextPreparedRoute<TOKENS>;
+    type Prefill<const TOKENS: usize> = Qwen38FlashNextPreparedPrefillRoute<TOKENS>;
+
+    const LABEL: &'static str = "Qwen3.8-Flash-Next ";
+    fn require_geometry() -> GpuResult<()> {
+        require_geometry::<Qwen38FlashNext>()
+    }
+
+    fn ptx_names() -> Vec<&'static str> {
+        qwen38_flash_next_gdn_recurrence_ptx_names()
+    }
+}
+
+/// Prepared FP32 GDN recurrence routes for exact decode and prefill rows.
+pub struct GdnRecurrenceOp<
+    A: Arch = Qwen38_27B,
+    E: GdnRecurrenceEntries<A> = Qwen38GdnRecurrenceEntries,
+> {
+    module: kernels::LoadedModule,
+    b1: E::Decode<1>,
+    b2: E::Decode<2>,
+    b3: E::Decode<3>,
+    b4: E::Decode<4>,
+    b5: E::Decode<5>,
+    b6: E::Decode<6>,
+    b7: E::Decode<7>,
+    b8: E::Decode<8>,
+    k1: E::Prefill<1>,
+    k2: E::Prefill<2>,
+    k3: E::Prefill<3>,
+    k4: E::Prefill<4>,
+    t32: E::Prefill<32>,
+    t64: E::Prefill<64>,
+    t128: E::Prefill<128>,
+    t1024: E::Prefill<1_024>,
+}
+
+/// Prepared Flash-Next GDN routes with sigmoid output gating.
+pub type Qwen38FlashNextGdnRecurrenceOp =
+    GdnRecurrenceOp<Qwen38FlashNext, Qwen38FlashNextGdnRecurrenceEntries>;
+
+impl<A: Arch, E: GdnRecurrenceEntries<A>> GdnRecurrenceOp<A, E> {
     /// Loads the embedded SM120 module and prepares every exact-batch route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
-        require_geometry::<A>()?;
-        let _ = gdn_recurrence_ptx_names();
+        E::require_geometry()?;
+        let _ = E::ptx_names();
         // SAFETY: this crate owns the embedded cuda-oxide module artifact.
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module("loading the GDN recurrence module", source))?;
 
         Ok(Self {
-            b1: PreparedRoute::prepare(&module)?,
-            b2: PreparedRoute::prepare(&module)?,
-            b3: PreparedRoute::prepare(&module)?,
-            b4: PreparedRoute::prepare(&module)?,
-            b5: PreparedRoute::prepare(&module)?,
-            b6: PreparedRoute::prepare(&module)?,
-            b7: PreparedRoute::prepare(&module)?,
-            b8: PreparedRoute::prepare(&module)?,
-            k1: PreparedPrefillRoute::prepare(&module)?,
-            k2: PreparedPrefillRoute::prepare(&module)?,
-            k3: PreparedPrefillRoute::prepare(&module)?,
-            k4: PreparedPrefillRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
-            t1024: PreparedPrefillRoute::prepare(&module)?,
+            b1: E::Decode::<1>::prepare(&module)?,
+            b2: E::Decode::<2>::prepare(&module)?,
+            b3: E::Decode::<3>::prepare(&module)?,
+            b4: E::Decode::<4>::prepare(&module)?,
+            b5: E::Decode::<5>::prepare(&module)?,
+            b6: E::Decode::<6>::prepare(&module)?,
+            b7: E::Decode::<7>::prepare(&module)?,
+            b8: E::Decode::<8>::prepare(&module)?,
+            k1: E::Prefill::<1>::prepare(&module)?,
+            k2: E::Prefill::<2>::prepare(&module)?,
+            k3: E::Prefill::<3>::prepare(&module)?,
+            k4: E::Prefill::<4>::prepare(&module)?,
+            t32: E::Prefill::<32>::prepare(&module)?,
+            t64: E::Prefill::<64>::prepare(&module)?,
+            t128: E::Prefill::<128>::prepare(&module)?,
+            t1024: E::Prefill::<1_024>::prepare(&module)?,
             module,
         })
     }
@@ -397,12 +773,14 @@ impl<A: Sm120Arch> GdnRecurrenceOp<A> {
     ) -> GpuResult<()> {
         if !admitted_rows(rows) {
             return Err(GpuError::invalid_launch(format!(
-                "GDN recurrence row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128,1024"
+                "{}GDN recurrence row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128,1024",
+                E::LABEL
             )));
         }
 
         macro_rules! launch {
             ($route:ident) => {
+                // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
                     self.$route.launch(
                         &self.module,
@@ -421,6 +799,7 @@ impl<A: Sm120Arch> GdnRecurrenceOp<A> {
         }
         macro_rules! launch_prefill {
             ($route:ident) => {
+                // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
                     self.$route.launch(
                         &self.module,
@@ -485,6 +864,7 @@ impl<A: Sm120Arch> GdnRecurrenceOp<A> {
     ) -> GpuResult<()> {
         macro_rules! launch {
             ($route:ident) => {
+                // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
                     self.$route.launch(
                         &self.module,
@@ -509,7 +889,8 @@ impl<A: Sm120Arch> GdnRecurrenceOp<A> {
             3 => launch!(k3),
             4 => launch!(k4),
             _ => Err(GpuError::invalid_launch(format!(
-                "GDN causal recurrence token count {tokens} is outside the admitted routes 1..=4"
+                "{}GDN causal recurrence token count {tokens} is outside the admitted routes 1..=4",
+                E::LABEL
             ))),
         }
     }
@@ -545,14 +926,61 @@ pub(crate) fn gdn_recurrence_ptx_names() -> Vec<&'static str> {
     ]
 }
 
+/// Target-specific PTX symbols retained for exact Flash-Next recurrence routes.
+pub(crate) fn qwen38_flash_next_gdn_recurrence_ptx_names() -> Vec<&'static str> {
+    vec![
+        kernels::qwen38_flash_next_gdn_recurrence_exact_ptx_name::<Qwen38FlashNext, 1>(),
+        kernels::qwen38_flash_next_gdn_recurrence_exact_ptx_name::<Qwen38FlashNext, 2>(),
+        kernels::qwen38_flash_next_gdn_recurrence_exact_ptx_name::<Qwen38FlashNext, 3>(),
+        kernels::qwen38_flash_next_gdn_recurrence_exact_ptx_name::<Qwen38FlashNext, 4>(),
+        kernels::qwen38_flash_next_gdn_recurrence_exact_ptx_name::<Qwen38FlashNext, 5>(),
+        kernels::qwen38_flash_next_gdn_recurrence_exact_ptx_name::<Qwen38FlashNext, 6>(),
+        kernels::qwen38_flash_next_gdn_recurrence_exact_ptx_name::<Qwen38FlashNext, 7>(),
+        kernels::qwen38_flash_next_gdn_recurrence_exact_ptx_name::<Qwen38FlashNext, 8>(),
+        kernels::qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact_ptx_name::<
+            Qwen38FlashNext,
+            1,
+        >(),
+        kernels::qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact_ptx_name::<
+            Qwen38FlashNext,
+            2,
+        >(),
+        kernels::qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact_ptx_name::<
+            Qwen38FlashNext,
+            3,
+        >(),
+        kernels::qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact_ptx_name::<
+            Qwen38FlashNext,
+            4,
+        >(),
+        kernels::qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact_ptx_name::<
+            Qwen38FlashNext,
+            32,
+        >(),
+        kernels::qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact_ptx_name::<
+            Qwen38FlashNext,
+            64,
+        >(),
+        kernels::qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact_ptx_name::<
+            Qwen38FlashNext,
+            128,
+        >(),
+        kernels::qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact_ptx_name::<
+            Qwen38FlashNext,
+            1_024,
+        >(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        HEAD_DIM, KEY_HEADS, MAX_BATCH, THREADS, VALUE_HEADS, admitted_batch, admitted_rows,
-        gdn_recurrence_ptx_names,
+        GdnRecurrenceEntries, HEAD_DIM, KEY_HEADS, MAX_BATCH, Qwen38FlashNextGdnRecurrenceEntries,
+        Qwen38GdnRecurrenceEntries, THREADS, VALUE_HEADS, admitted_batch, admitted_rows,
+        gdn_recurrence_ptx_names, qwen38_flash_next_gdn_recurrence_ptx_names,
     };
     use std::collections::BTreeSet;
-    use tuisko_model::{Arch, Qwen38_27B};
+    use tuisko_model::{Arch, Qwen38_27B, Qwen38FlashNext};
 
     #[test]
     fn batch_table_covers_only_exact_decode_routes() {
@@ -595,11 +1023,56 @@ mod tests {
     }
 
     #[test]
+    fn qwen38_flash_next_reuses_the_exact_qwen38_recurrence_geometry() {
+        assert_eq!(
+            Qwen38FlashNext::LINEAR_KEY_HEADS,
+            Qwen38_27B::LINEAR_KEY_HEADS
+        );
+        assert_eq!(
+            Qwen38FlashNext::LINEAR_VALUE_HEADS,
+            Qwen38_27B::LINEAR_VALUE_HEADS
+        );
+        assert_eq!(
+            Qwen38FlashNext::LINEAR_HEAD_DIM,
+            Qwen38_27B::LINEAR_HEAD_DIM
+        );
+        assert_eq!(Qwen38FlashNext::GDN_QKV_ROWS, Qwen38_27B::GDN_QKV_ROWS);
+        assert_eq!(Qwen38FlashNext::GDN_INPUT_ROWS, Qwen38_27B::GDN_INPUT_ROWS);
+        assert_eq!(
+            Qwen38FlashNext::GDN_CONTROL_ROWS,
+            Qwen38_27B::GDN_CONTROL_ROWS
+        );
+        assert_eq!(
+            Qwen38FlashNext::RMS_NORM_EPSILON,
+            Qwen38_27B::RMS_NORM_EPSILON
+        );
+    }
+
+    #[test]
+    fn every_entry_table_publishes_its_inventory() {
+        assert_eq!(Qwen38FlashNext::GDN_OUTPUT_GATE, "sigmoid");
+        assert_eq!(
+            <Qwen38GdnRecurrenceEntries as GdnRecurrenceEntries<Qwen38_27B>>::ptx_names(),
+            gdn_recurrence_ptx_names()
+        );
+        assert_eq!(
+            <Qwen38FlashNextGdnRecurrenceEntries as GdnRecurrenceEntries<Qwen38FlashNext>>::ptx_names(),
+            qwen38_flash_next_gdn_recurrence_ptx_names()
+        );
+    }
+
+    #[test]
     fn ptx_inventory_has_decode_and_prefill_entries() {
         let names = gdn_recurrence_ptx_names();
-        let unique = names.iter().copied().collect::<BTreeSet<_>>();
+        let qwen38_flash_next = qwen38_flash_next_gdn_recurrence_ptx_names();
+        let unique = names
+            .iter()
+            .chain(&qwen38_flash_next)
+            .copied()
+            .collect::<BTreeSet<_>>();
 
         assert_eq!(names.len(), MAX_BATCH + 16);
-        assert_eq!(unique.len(), names.len());
+        assert_eq!(qwen38_flash_next.len(), MAX_BATCH + 8);
+        assert_eq!(unique.len(), names.len() + qwen38_flash_next.len());
     }
 }

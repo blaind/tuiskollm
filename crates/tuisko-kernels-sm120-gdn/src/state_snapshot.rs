@@ -5,10 +5,16 @@ use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
 use tuisko_kernels_sm120_common::Sm120Arch;
-use tuisko_model::{Arch, Qwen38_27B};
+use tuisko_model::{Arch, Qwen38_27B, Qwen38FlashNext};
 
 const THREADS: u32 = 256;
 const VECTOR_BYTES: usize = size_of::<u128>();
+
+const _: () = assert!(Qwen38FlashNext::GDN_QKV_ROWS == Qwen38_27B::GDN_QKV_ROWS);
+const _: () = assert!(Qwen38FlashNext::GDN_CONTROL_ROWS == Qwen38_27B::GDN_CONTROL_ROWS);
+const _: () = assert!(Qwen38FlashNext::LINEAR_HEAD_DIM == Qwen38_27B::LINEAR_HEAD_DIM);
+const _: () =
+    assert!(Qwen38FlashNext::LINEAR_CONV_KERNEL_DIM == Qwen38_27B::LINEAR_CONV_KERNEL_DIM);
 
 fn history_bytes<A: Arch>() -> usize {
     A::GDN_QKV_ROWS * (A::LINEAR_CONV_KERNEL_DIM - 1) * size_of::<u16>()
@@ -115,6 +121,9 @@ impl<A: Sm120Arch> GdnStateSnapshotOp<A> {
     }
 }
 
+/// Flash-Next alias for the exact Qwen3.8-27B snapshot byte extents.
+pub type Qwen38FlashNextGdnStateSnapshotOp = GdnStateSnapshotOp<Qwen38_27B>;
+
 /// PTX symbol retained for the exact GDN state snapshot route.
 pub(crate) fn gdn_state_snapshot_ptx_name() -> &'static str {
     kernels::gdn_state_snapshot_exact_ptx_name::<Qwen38_27B>()
@@ -123,7 +132,7 @@ pub(crate) fn gdn_state_snapshot_ptx_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{THREADS, VECTOR_BYTES, history_bytes, state_bytes};
-    use tuisko_model::Qwen38_27B;
+    use tuisko_model::{Qwen38_27B, Qwen38FlashNext};
 
     #[test]
     fn exact_snapshot_geometry_is_fully_vectorized() {
@@ -137,6 +146,18 @@ mod tests {
         assert_eq!(
             ((history + state) / VECTOR_BYTES).div_ceil(THREADS as usize),
             783
+        );
+    }
+
+    #[test]
+    fn qwen38_flash_next_snapshot_extent_matches_the_aliased_route() {
+        assert_eq!(
+            history_bytes::<Qwen38FlashNext>(),
+            history_bytes::<Qwen38_27B>()
+        );
+        assert_eq!(
+            state_bytes::<Qwen38FlashNext>(),
+            state_bytes::<Qwen38_27B>()
         );
     }
 }

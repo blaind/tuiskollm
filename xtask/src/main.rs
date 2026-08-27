@@ -74,6 +74,10 @@ const GDN_PREPARE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-prepare-sm120.tx
 const GDN_RECURRENCE_RESOURCE_BASELINE: &str = "qual/baselines/gdn-recurrence-sm120.txt";
 const GDN_STATE_SNAPSHOT_RESOURCE_BASELINE: &str = "qual/baselines/gdn-state-snapshot-sm120.txt";
 const GDN_OUTPUT_RESOURCE_BASELINE: &str = "qual/baselines/gdn-output-sm120.txt";
+const QWEN38_FLASH_NEXT_GDN_PREPARE_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen38-flash-next-gdn-prepare-sm120.txt";
+const QWEN38_FLASH_NEXT_GDN_RECURRENCE_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen38-flash-next-gdn-recurrence-sm120.txt";
 const ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/attention-qk-prepare-sm120.txt";
 const QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
@@ -147,6 +151,8 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     GDN_RECURRENCE_RESOURCE_BASELINE,
     GDN_STATE_SNAPSHOT_RESOURCE_BASELINE,
     GDN_OUTPUT_RESOURCE_BASELINE,
+    QWEN38_FLASH_NEXT_GDN_PREPARE_RESOURCE_BASELINE,
+    QWEN38_FLASH_NEXT_GDN_RECURRENCE_RESOURCE_BASELINE,
     ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
@@ -365,6 +371,14 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
     (
         "qwen36-gdn-prepare",
         &[QWEN35_GDN_PREPARE_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen38-flash-next-gdn-prepare",
+        &[QWEN38_FLASH_NEXT_GDN_PREPARE_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen38-flash-next-gdn-recurrence",
+        &[QWEN38_FLASH_NEXT_GDN_RECURRENCE_RESOURCE_BASELINE],
     ),
     (
         "qwen36-gdn-recurrence",
@@ -1134,6 +1148,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
     no_args("qualify-nvfp4-down", qualify_nvfp4_down),
     forwarded("qualify-nvfp4-mlp", qualify_nvfp4_mlp),
     no_args("qualify-gdn-prepare", qualify_gdn_prepare),
+    no_args(
+        "qualify-qwen38-flash-next-gdn-prepare",
+        qualify_qwen38_flash_next_gdn_prepare,
+    ),
+    no_args(
+        "qualify-qwen38-flash-next-gdn-recurrence",
+        qualify_qwen38_flash_next_gdn_recurrence,
+    ),
     no_args("qualify-gdn-recurrence", qualify_gdn_recurrence),
     no_args("qualify-gdn-output", qualify_gdn_output),
     no_args("qualify-attention-qk-prepare", qualify_attention_qk_prepare),
@@ -1243,6 +1265,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
     forwarded("bench-nvfp4-down", bench_nvfp4_down),
     forwarded("bench-nvfp4-mlp", bench_nvfp4_mlp),
     forwarded("bench-gdn-prepare", bench_gdn_prepare),
+    forwarded(
+        "bench-qwen38-flash-next-gdn-prepare",
+        bench_qwen38_flash_next_gdn_prepare,
+    ),
+    forwarded(
+        "bench-qwen38-flash-next-gdn-recurrence",
+        bench_qwen38_flash_next_gdn_recurrence,
+    ),
     forwarded("bench-gdn-recurrence", bench_gdn_recurrence),
     forwarded("bench-gdn-output", bench_gdn_output),
     forwarded("bench-attention-qk-prepare", bench_attention_qk_prepare),
@@ -1343,6 +1373,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
     no_args("gate-nvfp4-swiglu", gate_nvfp4_swiglu),
     no_args("gate-nvfp4-down", gate_nvfp4_down),
     no_args("gate-gdn-prepare", gate_gdn_prepare),
+    no_args(
+        "gate-qwen38-flash-next-gdn-prepare",
+        gate_qwen38_flash_next_gdn_prepare,
+    ),
+    no_args(
+        "gate-qwen38-flash-next-gdn-recurrence",
+        gate_qwen38_flash_next_gdn_recurrence,
+    ),
     no_args("gate-gdn-recurrence", gate_gdn_recurrence),
     no_args("gate-gdn-output", gate_gdn_output),
     no_args("gate-attention-qk-prepare", gate_attention_qk_prepare),
@@ -1781,6 +1819,8 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_qwen35_nvfp4_attention_output(root)?;
     gate_gdn_prepare(root)?;
     gate_gdn_recurrence(root)?;
+    gate_qwen38_flash_next_gdn_prepare(root)?;
+    gate_qwen38_flash_next_gdn_recurrence(root)?;
     gate_gdn_state_snapshot(root)?;
     gate_gdn_output(root)?;
     gate_attention_qk_prepare(root)?;
@@ -2651,6 +2691,30 @@ fn qualify_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_gdn_recurrence(root)
 }
 
+/// Selects the prepare oracle and benchmark-accounting tests by shared prefix.
+fn qualify_qwen38_flash_next_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        "qwen38_flash_next_gdn_prepare",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
+    )?;
+    gate_gdn_prepare(root)?;
+    gate_qwen38_flash_next_gdn_prepare(root)
+}
+
+/// Selects the recurrence oracle and benchmark-accounting tests by shared prefix.
+fn qualify_qwen38_flash_next_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        "qwen38_flash_next_gdn_recurrence",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
+    )?;
+    gate_gdn_recurrence(root)?;
+    gate_qwen38_flash_next_gdn_recurrence(root)
+}
+
 fn qualify_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
     run_qualification_test(
         root,
@@ -3462,6 +3526,20 @@ fn bench_qwen36_gdn_prepare(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     run_bench_device(root, "qwen36-gdn-prepare", arguments)
+}
+
+fn bench_qwen38_flash_next_gdn_prepare(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-gdn-prepare", arguments)
+}
+
+fn bench_qwen38_flash_next_gdn_recurrence(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-gdn-recurrence", arguments)
 }
 
 fn bench_qwen36_gdn_recurrence(
@@ -7417,6 +7495,225 @@ fn gate_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
         prefill_convolution_shared,
         prefill_history_shared,
     );
+    Ok(())
+}
+
+/// Pins the target-specific control entries and their reused convolution dependency.
+fn gate_qwen38_flash_next_gdn_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN38_FLASH_NEXT_GDN_PREPARE_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let entries = &sm120_gate_module(root)?.entries;
+    let control = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen38_flash_next_gdn_control_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    let prefill_control = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen38_flash_next_gdn_control_prefill_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    require_count("Qwen3.8-Flash-Next GDN control", control.len(), 8)?;
+    require_count(
+        "Qwen3.8-Flash-Next GDN causal/prefill control",
+        prefill_control.len(),
+        8,
+    )?;
+    // Reused convolution entries remain part of the admitted route.
+    require_count(
+        "Qwen3.8-Flash-Next GDN reused convolution",
+        entries
+            .iter()
+            .filter(|entry| entry.name.starts_with("gdn_convolution_exact_TID_"))
+            .count(),
+        8,
+    )?;
+
+    for entry in control.iter().chain(&prefill_control) {
+        if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 512-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        // Pin the softplus and beta-sigmoid math.
+        if !entry.body.contains("lg2.approx.f32")
+            || !entry.body.contains("ex2.approx.f32")
+            || !entry.body.contains("rcp.rn.f32")
+        {
+            return Err(format!(
+                "entry `{}` lost its softplus/decay/beta control math",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    for entry in control.iter().chain(&prefill_control) {
+        if sass_function_body(sass, entry.name).is_none() {
+            return Err(format!(
+                "cuobjdump omitted Qwen3.8-Flash-Next GDN control SASS `{}`",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let mut control_registers = Vec::new();
+    let mut control_shared = Vec::new();
+    let mut prefill_registers = Vec::new();
+    let mut prefill_shared = Vec::new();
+    for (entries, registers, shared) in [
+        (&control, &mut control_registers, &mut control_shared),
+        (
+            &prefill_control,
+            &mut prefill_registers,
+            &mut prefill_shared,
+        ),
+    ] {
+        for entry in entries.iter() {
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+            shared.push(resource.shared);
+        }
+        registers.sort_unstable();
+    }
+    require_registers(&baseline, "control_registers", &control_registers)?;
+    require_uniform_value(&baseline, "control_shared_bytes", &control_shared)?;
+    require_registers(&baseline, "prefill_control_registers", &prefill_registers)?;
+    require_uniform_value(&baseline, "prefill_control_shared_bytes", &prefill_shared)?;
+
+    println!(
+        "Qwen3.8-Flash-Next GDN prepare gate passed: 8 control + 8 causal/prefill control entries reusing the qualified convolution leaves, REG {control_registers:?} / {prefill_registers:?}, STACK:0 LOCAL:0, SHARED {control_shared:?} / {prefill_shared:?}, softplus/beta math and SASS present"
+    );
+
+    Ok(())
+}
+
+/// Pins sigmoid recurrence entries by their reciprocal and lack of SiLU division.
+fn gate_qwen38_flash_next_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN38_FLASH_NEXT_GDN_RECURRENCE_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let entries = &sm120_gate_module(root)?.entries;
+    let recurrence = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen38_flash_next_gdn_recurrence_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    let epilogue = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen38_flash_next_gdn_recurrence_prefill_epilogue_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    require_count("Qwen3.8-Flash-Next GDN recurrence", recurrence.len(), 8)?;
+    require_count(
+        "Qwen3.8-Flash-Next GDN recurrence prefill epilogue",
+        epilogue.len(),
+        8,
+    )?;
+    // The reused serial pass remains part of the admitted route.
+    require_count(
+        "Qwen3.8-Flash-Next GDN reused serial prefill",
+        entries
+            .iter()
+            .filter(|entry| entry.name.starts_with("gdn_recurrence_prefill_exact_TID_"))
+            .count(),
+        8,
+    )?;
+
+    for entry in recurrence.iter().chain(&epilogue) {
+        if !entry.body.contains(".reqntid 512, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 512-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        if !entry.body.contains("rsqrt.approx.f32") || !entry.body.contains("ex2.approx.f32") {
+            return Err(format!(
+                "entry `{}` lost its RMS normalization or gate exponential",
+                entry.name
+            )
+            .into());
+        }
+        if !entry.body.contains("rcp.rn.f32") || entry.body.contains("div.rn.f32") {
+            return Err(format!(
+                "entry `{}` is not the sigmoid gated-norm variant: a SiLU epilogue divides by the gate denominator instead of taking its reciprocal",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    for entry in recurrence.iter().chain(&epilogue) {
+        if sass_function_body(sass, entry.name).is_none() {
+            return Err(format!(
+                "cuobjdump omitted Qwen3.8-Flash-Next GDN recurrence SASS `{}`",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let mut recurrence_registers = Vec::new();
+    let mut recurrence_shared = Vec::new();
+    let mut epilogue_registers = Vec::new();
+    let mut epilogue_shared = Vec::new();
+    for (entries, registers, shared) in [
+        (
+            &recurrence,
+            &mut recurrence_registers,
+            &mut recurrence_shared,
+        ),
+        (&epilogue, &mut epilogue_registers, &mut epilogue_shared),
+    ] {
+        for entry in entries.iter() {
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+            shared.push(resource.shared);
+        }
+        registers.sort_unstable();
+    }
+    require_registers(&baseline, "recurrence_registers", &recurrence_registers)?;
+    require_uniform_value(&baseline, "recurrence_shared_bytes", &recurrence_shared)?;
+    require_registers(&baseline, "prefill_epilogue_registers", &epilogue_registers)?;
+    require_uniform_value(&baseline, "prefill_epilogue_shared_bytes", &epilogue_shared)?;
+
+    println!(
+        "Qwen3.8-Flash-Next GDN recurrence gate passed: 8 decode + 8 prefill epilogue entries reusing the qualified serial prefill pass, REG {recurrence_registers:?} / {epilogue_registers:?}, STACK:0 LOCAL:0, SHARED {recurrence_shared:?} / {epilogue_shared:?}, sigmoid reciprocal present and SiLU division absent"
+    );
+
     Ok(())
 }
 
@@ -12927,6 +13224,8 @@ mod tests {
                 "qual/baselines/gdn-recurrence-sm120.txt",
                 "qual/baselines/gdn-state-snapshot-sm120.txt",
                 "qual/baselines/gdn-output-sm120.txt",
+                "qual/baselines/qwen38-flash-next-gdn-prepare-sm120.txt",
+                "qual/baselines/qwen38-flash-next-gdn-recurrence-sm120.txt",
                 "qual/baselines/attention-qk-prepare-sm120.txt",
                 "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",
                 "qual/baselines/qwen36-attention-qk-prepare-sm120.txt",
@@ -13630,6 +13929,18 @@ mod tests {
                 NO_SNAPSHOT,
             ),
             (
+                "qualify-qwen38-flash-next-gdn-prepare",
+                "qwen38_flash_next_gdn_prepare",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen38-flash-next-gdn-recurrence",
+                "qwen38_flash_next_gdn_recurrence",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
                 "qualify-gdn-recurrence",
                 "gdn_recurrence::tests::route_inventory_and_arena_accounting_are_exact",
                 EXACT_SERIAL,
@@ -13836,7 +14147,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 84);
+        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 86);
 
         let snapshot = OsString::from("/snapshot");
         for &(command, filter, trailing, variable) in EXPECTED_QUALIFICATION_ROUTES {
