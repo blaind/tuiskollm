@@ -5,6 +5,7 @@ use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext};
 
@@ -1497,6 +1498,25 @@ enum TokenRoute {
     T1024,
 }
 
+impl TokenRoute {
+    const fn tokens(self) -> usize {
+        match self {
+            Self::B1 => 1,
+            Self::B2 => 2,
+            Self::B3 => 3,
+            Self::B4 => 4,
+            Self::B5 => 5,
+            Self::B6 => 6,
+            Self::B7 => 7,
+            Self::B8 => 8,
+            Self::T32 => 32,
+            Self::T64 => 64,
+            Self::T128 => 128,
+            Self::T1024 => 1_024,
+        }
+    }
+}
+
 // The admitted token schedule, transcribed from the four prepared dispatches
 // it replaces: decode B=1..=8 and prefill T=32,64,128 everywhere, and the
 // T=1024 prefill only where the entry table admits it.
@@ -1580,24 +1600,54 @@ fn checked_cache_scales<A: Arch, E: QkPrepareEntries<A>>(
 /// `C` restates `E::Cache` as a parameter so the E4M3 and BF16 launch
 /// signatures live in disjoint inherent impls: an E4M3 append carries the two
 /// represented cache scales a BF16 append does not have.
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_attention_qk_prepare),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
+    inventory(false)
+)]
+struct AttentionQkPrepareRoutes<A: Arch, E: QkPrepareEntries<A>> {
+    #[route(1)]
+    b1: E::Decode<1>,
+    #[route(2)]
+    b2: E::Decode<2>,
+    #[route(3)]
+    b3: E::Decode<3>,
+    #[route(4)]
+    b4: E::Decode<4>,
+    #[route(5)]
+    b5: E::Decode<5>,
+    #[route(6)]
+    b6: E::Decode<6>,
+    #[route(7)]
+    b7: E::Decode<7>,
+    #[route(8)]
+    b8: E::Decode<8>,
+    #[route(32)]
+    t32: E::Prefill<32>,
+    #[route(64)]
+    t64: E::Prefill<64>,
+    #[route(128)]
+    t128: E::Prefill<128>,
+    #[route(1024, admitted(E::HAS_T1024))]
+    t1024: E::Prefill1024,
+}
+
+/// Prepared Q/K normalization, MRoPE, and KV-cache append routes for exact
+/// `B=1..8` decode and the entry table's admitted prefill widths.
+///
+/// `C` restates `E::Cache` as a parameter so the E4M3 and BF16 launch
+/// signatures live in disjoint inherent impls: an E4M3 append carries the two
+/// represented cache scales a BF16 append does not have.
 pub struct AttentionQkPrepareOp<
     A: Arch = Qwen38_27B,
     C: CacheFormat = Fp8Cache,
     E: QkPrepareEntries<A, Cache = C> = Qwen38QkPrepareEntries,
 > {
     module: kernels::LoadedModule,
-    b1: E::Decode<1>,
-    b2: E::Decode<2>,
-    b3: E::Decode<3>,
-    b4: E::Decode<4>,
-    b5: E::Decode<5>,
-    b6: E::Decode<6>,
-    b7: E::Decode<7>,
-    b8: E::Decode<8>,
-    t32: E::Prefill<32>,
-    t64: E::Prefill<64>,
-    t128: E::Prefill<128>,
-    t1024: E::Prefill1024,
+    routes: AttentionQkPrepareRoutes<A, E>,
     cache: PhantomData<C>,
 }
 
@@ -1628,21 +1678,12 @@ impl<A: Arch, C: CacheFormat, E: QkPrepareEntries<A, Cache = C>> AttentionQkPrep
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module(E::MODULE_OPERATION, source))?;
 
+        let routes = AttentionQkPrepareRoutes::prepare(&module)?;
+
         Ok(Self {
-            b1: E::Decode::<1>::prepare(&module)?,
-            b2: E::Decode::<2>::prepare(&module)?,
-            b3: E::Decode::<3>::prepare(&module)?,
-            b4: E::Decode::<4>::prepare(&module)?,
-            b5: E::Decode::<5>::prepare(&module)?,
-            b6: E::Decode::<6>::prepare(&module)?,
-            b7: E::Decode::<7>::prepare(&module)?,
-            b8: E::Decode::<8>::prepare(&module)?,
-            t32: E::Prefill::<32>::prepare(&module)?,
-            t64: E::Prefill::<64>::prepare(&module)?,
-            t128: E::Prefill::<128>::prepare(&module)?,
-            t1024: E::Prefill1024::prepare(&module)?,
-            cache: PhantomData,
             module,
+            routes,
+            cache: PhantomData,
         })
     }
 
@@ -1657,27 +1698,12 @@ impl<A: Arch, C: CacheFormat, E: QkPrepareEntries<A, Cache = C>> AttentionQkPrep
         route: TokenRoute,
         args: &QkPrepareArgs<C>,
     ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: the caller's contract reaches the entry unchanged.
-                unsafe { self.$route.launch(&self.module, stream, args) }
-            };
-        }
-
-        match route {
-            TokenRoute::B1 => launch!(b1),
-            TokenRoute::B2 => launch!(b2),
-            TokenRoute::B3 => launch!(b3),
-            TokenRoute::B4 => launch!(b4),
-            TokenRoute::B5 => launch!(b5),
-            TokenRoute::B6 => launch!(b6),
-            TokenRoute::B7 => launch!(b7),
-            TokenRoute::B8 => launch!(b8),
-            TokenRoute::T32 => launch!(t32),
-            TokenRoute::T64 => launch!(t64),
-            TokenRoute::T128 => launch!(t128),
-            TokenRoute::T1024 => launch!(t1024),
-        }
+        dispatch_attention_qk_prepare!(
+            &self.routes,
+            route.tokens(),
+            |entry| unsafe { entry.launch(&self.module, stream, args) },
+            else => unreachable!("TokenRoute always names one exact route")
+        )
     }
 }
 
