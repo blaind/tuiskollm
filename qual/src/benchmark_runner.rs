@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const CACHE_SCHEMA: u32 = 1;
+const CACHE_SCHEMA: u32 = 2;
 
 /// Refuses a non-idle device before a combined benchmark opens its checkpoint.
 pub fn benchmark_device_preflight() -> Result<(), DeviceBenchmarkError> {
@@ -125,6 +125,8 @@ pub struct BenchmarkFingerprint {
     pub cuda_oxide_commit: String,
     /// Base revision whose baseline arm was measured.
     pub base_sha: String,
+    /// Exact digest of every device-affecting worktree input.
+    pub device_input_sha256: String,
 }
 
 impl BenchmarkFingerprint {
@@ -133,6 +135,7 @@ impl BenchmarkFingerprint {
         snapshot_revision: impl Into<String>,
         cuda_oxide_commit: impl Into<String>,
         base_sha: impl Into<String>,
+        device_input_sha256: impl Into<String>,
     ) -> Result<Self, DeviceBenchmarkError> {
         let output = Command::new("nvidia-smi")
             .args([
@@ -177,12 +180,17 @@ impl BenchmarkFingerprint {
             snapshot_revision: snapshot_revision.into(),
             cuda_oxide_commit: cuda_oxide_commit.into(),
             base_sha: base_sha.into(),
+            device_input_sha256: device_input_sha256.into(),
         };
         for (name, value) in [
             ("driver version", fingerprint.driver_version.as_str()),
             ("snapshot revision", fingerprint.snapshot_revision.as_str()),
             ("cuda-oxide commit", fingerprint.cuda_oxide_commit.as_str()),
             ("base SHA", fingerprint.base_sha.as_str()),
+            (
+                "device-input SHA-256",
+                fingerprint.device_input_sha256.as_str(),
+            ),
         ] {
             if value.is_empty() {
                 return Err(DeviceBenchmarkError::Precondition(format!(
@@ -200,6 +208,17 @@ impl BenchmarkFingerprint {
                     "benchmark fingerprint {name} must be a 40-character hexadecimal commit"
                 )));
             }
+        }
+        if fingerprint.device_input_sha256.len() != 64
+            || !fingerprint
+                .device_input_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(DeviceBenchmarkError::Precondition(
+                "benchmark fingerprint device-input SHA-256 must be 64 hexadecimal characters"
+                    .to_string(),
+            ));
         }
 
         Ok(fingerprint)
@@ -348,6 +367,7 @@ mod tests {
             snapshot_revision: "snapshot".to_string(),
             cuda_oxide_commit: "oxide".to_string(),
             base_sha: "base".to_string(),
+            device_input_sha256: "device-input".to_string(),
         };
         write_baseline_cache(&path, &fingerprint, &vec![1_u32, 2, 3]).unwrap();
         assert!(matches!(

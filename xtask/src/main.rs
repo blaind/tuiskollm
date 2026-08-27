@@ -4737,13 +4737,53 @@ fn bench_qwen38_flash_next(
         )
         .into());
     }
-    run_visible(
-        Command::new(executable)
-            .arg(snapshot)
-            .args(options)
-            .arg("--cuda-oxide-commit")
-            .arg(CUDA_OXIDE_REVISION),
-    )
+    let mut command = Command::new(executable);
+    command
+        .arg(snapshot)
+        .args(options)
+        .arg("--cuda-oxide-commit")
+        .arg(CUDA_OXIDE_REVISION);
+    append_benchmark_cache_source_identity(root, options, &mut command)?;
+    run_visible(&mut command)
+}
+
+fn append_benchmark_cache_source_identity(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+    command: &mut Command,
+) -> Result<(), Box<dyn Error>> {
+    if !arguments
+        .iter()
+        .any(|argument| argument == "--baseline-cache")
+    {
+        return Ok(());
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument == "--base-sha" || argument == "--device-input-sha256")
+    {
+        return Err("benchmark cache source stamps are supplied by xtask".into());
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let base_sha = String::from_utf8(output.stdout)?.trim().to_string();
+    let device_inputs = perf_artifact::device_input_sha256(root)?;
+    command
+        .arg("--base-sha")
+        .arg(base_sha)
+        .arg("--device-input-sha256")
+        .arg(device_inputs);
+
+    Ok(())
 }
 
 /// Times whole generation requests with production cache state.
@@ -4828,13 +4868,14 @@ fn bench_qwen38_flash_next_resident_model(
         )
         .into());
     }
-    run_visible(
-        Command::new(executable)
-            .arg(snapshot)
-            .args(["--sweeps", "resident"])
-            .args(options)
-            .args(["--cuda-oxide-commit", CUDA_OXIDE_REVISION]),
-    )
+    let mut command = Command::new(executable);
+    command
+        .arg(snapshot)
+        .args(["--sweeps", "resident"])
+        .args(options)
+        .args(["--cuda-oxide-commit", CUDA_OXIDE_REVISION]);
+    append_benchmark_cache_source_identity(root, options, &mut command)?;
+    run_visible(&mut command)
 }
 
 fn bench_startup(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {

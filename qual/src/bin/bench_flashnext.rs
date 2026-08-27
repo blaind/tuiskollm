@@ -106,6 +106,7 @@ struct Options {
     max_cell_wall: Option<Duration>,
     baseline_cache: Option<PathBuf>,
     base_sha: Option<String>,
+    device_input_sha256: Option<String>,
     cuda_oxide_commit: Option<String>,
 }
 
@@ -121,6 +122,7 @@ impl Options {
             max_cell_wall: None,
             baseline_cache: None,
             base_sha: None,
+            device_input_sha256: None,
             cuda_oxide_commit: None,
         };
         while let Some(argument) = arguments.next() {
@@ -139,6 +141,7 @@ impl Options {
                 }
                 "--baseline-cache" => options.baseline_cache = Some(PathBuf::from(value)),
                 "--base-sha" => options.base_sha = Some(value),
+                "--device-input-sha256" => options.device_input_sha256 = Some(value),
                 "--cuda-oxide-commit" => options.cuda_oxide_commit = Some(value),
                 _ => return Err(format!("unknown argument `{argument}`").into()),
             }
@@ -146,9 +149,13 @@ impl Options {
         if options.baseline_cache.is_some()
             && (!options.sweeps.contains(&Sweep::Resident)
                 || options.base_sha.is_none()
+                || options.device_input_sha256.is_none()
                 || options.cuda_oxide_commit.is_none())
         {
-            return Err("`--baseline-cache` requires the resident sweep, `--base-sha`, and the generator stamp".into());
+            return Err(
+                "`--baseline-cache` requires the resident sweep and the injected source stamps"
+                    .into(),
+            );
         }
         if let Some(cell) = options.cells.iter().find(|cell| {
             !matches!(
@@ -177,6 +184,7 @@ impl Options {
             revision,
             self.cuda_oxide_commit.as_deref().unwrap_or_default(),
             self.base_sha.as_deref().unwrap_or_default(),
+            self.device_input_sha256.as_deref().unwrap_or_default(),
         )?))
     }
 
