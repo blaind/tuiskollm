@@ -12,6 +12,7 @@ mod qwen36_attention_output;
 mod qwen36_fp8_qkv;
 mod qwen36_gdn_input;
 mod qwen36_gdn_output;
+mod qwen38_flash_next_attention_output;
 
 pub use attention_output::AttentionOutputOp;
 pub use gdn_input_tma::DenseFp8GdnInputTmaMaps;
@@ -21,6 +22,7 @@ pub use qwen36_attention_output::Qwen36AttentionOutputOp;
 pub use qwen36_fp8_qkv::Qwen36Fp8QkvOp;
 pub use qwen36_gdn_input::Qwen36GdnInputOp;
 pub use qwen36_gdn_output::Qwen36GdnOutputOp;
+pub use qwen38_flash_next_attention_output::Qwen38FlashNextAttentionGateOp;
 
 /// Semantic inventory of every entry this family emits.
 pub fn kernel_ptx_names() -> Vec<&'static str> {
@@ -34,5 +36,6 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .chain(qwen36_gdn_output::qwen36_gdn_output_ptx_names())
         .chain(qwen36_fp8_qkv::qwen36_fp8_qkv_ptx_names())
         .chain(qwen36_attention_output::qwen36_attention_output_ptx_names())
+        .chain(qwen38_flash_next_attention_output::qwen38_flash_next_attention_output_ptx_names())
         .collect()
 }

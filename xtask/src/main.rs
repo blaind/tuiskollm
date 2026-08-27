@@ -80,6 +80,10 @@ const QWEN38_FLASH_NEXT_GDN_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen38-flash-next-gdn-prepare-sm120.txt";
 const QWEN38_FLASH_NEXT_GDN_RECURRENCE_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen38-flash-next-gdn-recurrence-sm120.txt";
+const QWEN38_FLASH_NEXT_QSA_PREPARE_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen38-flash-next-qsa-prepare-sm120.txt";
+const QWEN38_FLASH_NEXT_QSA_ATTENTION_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen38-flash-next-qsa-attention-sm120.txt";
 const ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/attention-qk-prepare-sm120.txt";
 const QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
@@ -155,6 +159,8 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     GDN_OUTPUT_RESOURCE_BASELINE,
     QWEN38_FLASH_NEXT_GDN_PREPARE_RESOURCE_BASELINE,
     QWEN38_FLASH_NEXT_GDN_RECURRENCE_RESOURCE_BASELINE,
+    QWEN38_FLASH_NEXT_QSA_PREPARE_RESOURCE_BASELINE,
+    QWEN38_FLASH_NEXT_QSA_ATTENTION_RESOURCE_BASELINE,
     ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
@@ -386,6 +392,14 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
     (
         "qwen38-flash-next-gdn-recurrence",
         &[QWEN38_FLASH_NEXT_GDN_RECURRENCE_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen38-flash-next-qsa-prepare",
+        &[QWEN38_FLASH_NEXT_QSA_PREPARE_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen38-flash-next-qsa-attention",
+        &[QWEN38_FLASH_NEXT_QSA_ATTENTION_RESOURCE_BASELINE],
     ),
     (
         "qwen36-gdn-recurrence",
@@ -1168,6 +1182,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "qualify-qwen38-flash-next-gdn-recurrence",
         qualify_qwen38_flash_next_gdn_recurrence,
     ),
+    no_args(
+        "qualify-qwen38-flash-next-qsa-prepare",
+        qualify_qwen38_flash_next_qsa_prepare,
+    ),
+    no_args(
+        "qualify-qwen38-flash-next-qsa-attention",
+        qualify_qwen38_flash_next_qsa_attention,
+    ),
     no_args("qualify-gdn-recurrence", qualify_gdn_recurrence),
     no_args("qualify-gdn-output", qualify_gdn_output),
     no_args("qualify-attention-qk-prepare", qualify_attention_qk_prepare),
@@ -1289,6 +1311,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "bench-qwen38-flash-next-gdn-recurrence",
         bench_qwen38_flash_next_gdn_recurrence,
     ),
+    forwarded(
+        "bench-qwen38-flash-next-qsa-prepare",
+        bench_qwen38_flash_next_qsa_prepare,
+    ),
+    forwarded(
+        "bench-qwen38-flash-next-qsa-attention",
+        bench_qwen38_flash_next_qsa_attention,
+    ),
     forwarded("bench-gdn-recurrence", bench_gdn_recurrence),
     forwarded("bench-gdn-output", bench_gdn_output),
     forwarded("bench-attention-qk-prepare", bench_attention_qk_prepare),
@@ -1400,6 +1430,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
     no_args(
         "gate-qwen38-flash-next-gdn-recurrence",
         gate_qwen38_flash_next_gdn_recurrence,
+    ),
+    no_args(
+        "gate-qwen38-flash-next-qsa-prepare",
+        gate_qwen38_flash_next_qsa_prepare,
+    ),
+    no_args(
+        "gate-qwen38-flash-next-qsa-attention",
+        gate_qwen38_flash_next_qsa_attention,
     ),
     no_args("gate-gdn-recurrence", gate_gdn_recurrence),
     no_args("gate-gdn-output", gate_gdn_output),
@@ -1841,6 +1879,8 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_gdn_recurrence(root)?;
     gate_qwen38_flash_next_gdn_prepare(root)?;
     gate_qwen38_flash_next_gdn_recurrence(root)?;
+    gate_qwen38_flash_next_qsa_prepare(root)?;
+    gate_qwen38_flash_next_qsa_attention(root)?;
     gate_gdn_state_snapshot(root)?;
     gate_gdn_output(root)?;
     gate_attention_qk_prepare(root)?;
@@ -2746,6 +2786,28 @@ fn qualify_qwen38_flash_next_gdn_recurrence(root: &Path) -> Result<(), Box<dyn E
     gate_qwen38_flash_next_gdn_recurrence(root)
 }
 
+/// Runs the QSA prepare oracle, accounting tests, and artifact gate.
+fn qualify_qwen38_flash_next_qsa_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        "qwen38_flash_next_qsa_prepare",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
+    )?;
+    gate_qwen38_flash_next_qsa_prepare(root)
+}
+
+/// Runs the QSA attention oracle, accounting tests, and artifact gate.
+fn qualify_qwen38_flash_next_qsa_attention(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        "qwen38_flash_next_qsa_attention",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
+    )?;
+    gate_qwen38_flash_next_qsa_attention(root)
+}
+
 fn qualify_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
     run_qualification_test(
         root,
@@ -3578,6 +3640,20 @@ fn bench_qwen38_flash_next_gdn_recurrence(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     run_bench_device(root, "qwen38-flash-next-gdn-recurrence", arguments)
+}
+
+fn bench_qwen38_flash_next_qsa_prepare(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-qsa-prepare", arguments)
+}
+
+fn bench_qwen38_flash_next_qsa_attention(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-qsa-attention", arguments)
 }
 
 fn bench_qwen36_gdn_recurrence(
@@ -7906,6 +7982,282 @@ fn gate_qwen38_flash_next_gdn_recurrence(root: &Path) -> Result<(), Box<dyn Erro
 
     println!(
         "Qwen3.8-Flash-Next GDN recurrence gate passed: 8 decode + 8 prefill epilogue entries reusing the qualified serial prefill pass, REG {recurrence_registers:?} / {epilogue_registers:?}, STACK:0 LOCAL:0, SHARED {recurrence_shared:?} / {epilogue_shared:?}, sigmoid reciprocal present and SiLU division absent"
+    );
+
+    Ok(())
+}
+
+/// Pins all QSA prepare entries and their target-specific 26-head division.
+fn gate_qwen38_flash_next_qsa_prepare(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN38_FLASH_NEXT_QSA_PREPARE_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let entries = &sm120_gate_module(root)?.entries;
+    let prepare = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen38_flash_next_attention_qk_prepare_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    let prefill_prepare = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen38_flash_next_attention_qk_prepare_prefill_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    require_count("Qwen3.8-Flash-Next QSA prepare", prepare.len(), 8)?;
+    require_count(
+        "Qwen3.8-Flash-Next QSA causal/prefill prepare",
+        prefill_prepare.len(),
+        4,
+    )?;
+
+    for entry in prepare.iter().chain(&prefill_prepare) {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        // Require normalization, MRoPE exchange, and represented cache append.
+        if !entry.body.contains("rsqrt.approx.f32")
+            || !entry.body.contains("shfl.sync")
+            || !entry.body.contains("cvt.rn.satfinite.e4m3x2.f32")
+        {
+            return Err(format!(
+                "entry `{}` lost its RMS reciprocal, warp/MRoPE exchange, or E4M3 cache append",
+                entry.name
+            )
+            .into());
+        }
+        if !contains_immediate_operand(entry.body, "26")
+            || contains_immediate_operand(entry.body, "28")
+        {
+            return Err(format!(
+                "entry `{}` is not the 24/2 QSA head-warp division",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    for entry in prepare.iter().chain(&prefill_prepare) {
+        if sass_function_body(sass, entry.name).is_none() {
+            return Err(format!(
+                "cuobjdump omitted Qwen3.8-Flash-Next QSA prepare SASS `{}`",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let mut prepare_registers = Vec::new();
+    let mut prepare_shared = Vec::new();
+    let mut prefill_registers = Vec::new();
+    let mut prefill_shared = Vec::new();
+    for (entries, registers, shared) in [
+        (&prepare, &mut prepare_registers, &mut prepare_shared),
+        (
+            &prefill_prepare,
+            &mut prefill_registers,
+            &mut prefill_shared,
+        ),
+    ] {
+        for entry in entries.iter() {
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+            shared.push(resource.shared);
+        }
+        registers.sort_unstable();
+    }
+    require_registers(&baseline, "prepare_registers", &prepare_registers)?;
+    require_uniform_value(&baseline, "prepare_shared_bytes", &prepare_shared)?;
+    require_registers(&baseline, "prefill_prepare_registers", &prefill_registers)?;
+    require_uniform_value(&baseline, "prefill_prepare_shared_bytes", &prefill_shared)?;
+
+    println!(
+        "Qwen3.8-Flash-Next QSA prepare gate passed: 8 decode + 4 causal/prefill prepare entries, REG {prepare_registers:?} / {prefill_registers:?}, STACK:0 LOCAL:0, SHARED {prepare_shared:?} / {prefill_shared:?}, RMS reciprocal, MRoPE exchange, E4M3 cache append, the 24/2 head-warp division and SASS present"
+    );
+
+    Ok(())
+}
+
+/// Pins all QSA attention entries and the sigmoid gate instruction shape.
+fn gate_qwen38_flash_next_qsa_attention(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN38_FLASH_NEXT_QSA_ATTENTION_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let entries = &sm120_gate_module(root)?.entries;
+    let decode = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen38_flash_next_paged_gqa_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    let prefill = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen38_flash_next_paged_gqa_prefill_shared_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    let gate = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen38_flash_next_attention_output_gate_bf16_TID_")
+        })
+        .collect::<Vec<_>>();
+    let gate_prefill = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen38_flash_next_attention_output_gate_bf16_prefill_TID_")
+        })
+        .collect::<Vec<_>>();
+    require_count("Qwen3.8-Flash-Next QSA decode attention", decode.len(), 8)?;
+    require_count("Qwen3.8-Flash-Next QSA prefill attention", prefill.len(), 4)?;
+    require_count("Qwen3.8-Flash-Next QSA output gate", gate.len(), 8)?;
+    require_count(
+        "Qwen3.8-Flash-Next QSA causal/prefill output gate",
+        gate_prefill.len(),
+        4,
+    )?;
+
+    for entry in decode.iter() {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        // The online softmax and the represented E4M3 cache load are what make
+        // this the paged decode pass over the quantized cache.
+        if !entry.body.contains("ex2.approx.f32") || !entry.body.contains("cvt.rn.f16x2.e4m3x2") {
+            return Err(format!(
+                "entry `{}` lost its online softmax or E4M3 cache load",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    for entry in prefill.iter() {
+        if !entry.body.contains(".reqntid 384, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 384-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        // `cp.async` is the shared K/V tile fill this pass exists for.
+        if !entry.body.contains("ex2.approx.f32") || !entry.body.contains("cp.async") {
+            return Err(format!(
+                "entry `{}` lost its online softmax or shared K/V tile fill",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    for entry in gate.iter().chain(&gate_prefill) {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        if !entry.body.contains("ex2.approx.f32")
+            || !entry.body.contains("rcp.rn.f32")
+            || entry.body.contains("div.rn.f32")
+        {
+            return Err(format!(
+                "entry `{}` is not the sigmoid output gate: a SiLU gate divides by the gate denominator instead of taking its reciprocal",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    for entry in decode
+        .iter()
+        .chain(&prefill)
+        .chain(&gate)
+        .chain(&gate_prefill)
+    {
+        if sass_function_body(sass, entry.name).is_none() {
+            return Err(format!(
+                "cuobjdump omitted Qwen3.8-Flash-Next QSA attention SASS `{}`",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let mut decode_registers = Vec::new();
+    let mut decode_shared = Vec::new();
+    let mut prefill_registers = Vec::new();
+    let mut prefill_shared = Vec::new();
+    let mut gate_registers = Vec::new();
+    let mut gate_shared = Vec::new();
+    let mut gate_prefill_registers = Vec::new();
+    let mut gate_prefill_shared = Vec::new();
+    for (entries, registers, shared) in [
+        (&decode, &mut decode_registers, &mut decode_shared),
+        (&prefill, &mut prefill_registers, &mut prefill_shared),
+        (&gate, &mut gate_registers, &mut gate_shared),
+        (
+            &gate_prefill,
+            &mut gate_prefill_registers,
+            &mut gate_prefill_shared,
+        ),
+    ] {
+        for entry in entries.iter() {
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+            shared.push(resource.shared);
+        }
+        registers.sort_unstable();
+    }
+    require_registers(&baseline, "decode_registers", &decode_registers)?;
+    require_uniform_value(&baseline, "decode_shared_bytes", &decode_shared)?;
+    require_registers(&baseline, "prefill_registers", &prefill_registers)?;
+    require_uniform_value(&baseline, "prefill_shared_bytes", &prefill_shared)?;
+    require_registers(&baseline, "gate_registers", &gate_registers)?;
+    require_uniform_value(&baseline, "gate_shared_bytes", &gate_shared)?;
+    require_registers(&baseline, "gate_prefill_registers", &gate_prefill_registers)?;
+    require_uniform_value(&baseline, "gate_prefill_shared_bytes", &gate_prefill_shared)?;
+
+    println!(
+        "Qwen3.8-Flash-Next QSA attention gate passed: 8 decode + 4 prefill scoring entries and 8 + 4 output gate entries, REG {decode_registers:?} / {prefill_registers:?} / {gate_registers:?} / {gate_prefill_registers:?}, STACK:0 LOCAL:0, SHARED {decode_shared:?} / {prefill_shared:?} / {gate_shared:?} / {gate_prefill_shared:?}, online softmax, E4M3 cache load, shared K/V tile fill, sigmoid reciprocal present with SiLU division absent, and SASS present"
     );
 
     Ok(())
@@ -13052,6 +13404,46 @@ fn require_count(family: &str, actual: usize, expected: usize) -> Result<(), Box
     Ok(())
 }
 
+/// Reports whether `immediate` appears in `body` as a whole-word arithmetic
+/// operand rather than as a byte displacement inside a `[...]` memory operand.
+///
+/// A structural constant such as a head-warp count reaches the artifact as a
+/// stride multiplier, never as an addressing offset, and every `qk_prepare`
+/// family in this artifact carries `+24` and `+28` displacements regardless of
+/// how many head-warps it divides a token into. Matching the raw body would
+/// therefore find `28` in the Qwen3.8-Flash-Next entries too and prove nothing; masking
+/// memory operands out first is what makes the count discriminating. The
+/// word-boundary check keeps register names such as `%rd26` from matching.
+fn contains_immediate_operand(body: &str, immediate: &str) -> bool {
+    let mut masked = String::with_capacity(body.len());
+    let mut inside_memory_operand = false;
+    for character in body.chars() {
+        match character {
+            '[' => {
+                inside_memory_operand = true;
+                masked.push(' ');
+            }
+            ']' => {
+                inside_memory_operand = false;
+                masked.push(' ');
+            }
+            _ if inside_memory_operand => masked.push(' '),
+            _ => masked.push(character),
+        }
+    }
+
+    let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let bytes = masked.as_bytes();
+    masked.match_indices(immediate).any(|(offset, matched)| {
+        !offset
+            .checked_sub(1)
+            .is_some_and(|index| word(bytes[index]))
+            && !bytes
+                .get(offset + matched.len())
+                .is_some_and(|byte| word(*byte))
+    })
+}
+
 fn require_spill_free(name: &str, resource: &Resource) -> Result<(), Box<dyn Error>> {
     if resource.stack != 0 || resource.local != 0 {
         return Err(format!(
@@ -13101,13 +13493,13 @@ mod tests {
         QWEN35_TEXT_ENDPOINT_TEST_FILTER, QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
         QWEN36_MTP_LAYER_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
         SM120_DEVICE_CODEGEN_CRATES, SM120_RESOURCE_BASELINES, SUBCOMMANDS, bench_device_baselines,
-        bench_device_command, concatenated_resource_baselines, device_is_idle, dispatch,
-        dispatch_probe, parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity,
-        parse_entries, parse_performance_device_sample, parse_performance_iteration,
-        parse_resources, parse_rustc_identity, preflight_performance_baselines,
-        qualification_test_arguments, require_consumed_baseline_keys, require_count,
-        require_registers, require_uniform_value, resolve_target_output, sass_function_body,
-        workspace_root,
+        bench_device_command, concatenated_resource_baselines, contains_immediate_operand,
+        device_is_idle, dispatch, dispatch_probe, parse_baseline, parse_compute_pids,
+        parse_cuda_toolkit_identity, parse_entries, parse_performance_device_sample,
+        parse_performance_iteration, parse_resources, parse_rustc_identity,
+        preflight_performance_baselines, qualification_test_arguments,
+        require_consumed_baseline_keys, require_count, require_registers, require_uniform_value,
+        resolve_target_output, sass_function_body, workspace_root,
     };
     use std::collections::BTreeSet;
     use std::ffi::{OsStr, OsString};
@@ -13304,6 +13696,29 @@ mod tests {
         assert!(require_uniform_value(&baseline, "shared_bytes", &[1_088, 1_024]).is_err());
     }
 
+    /// The head-warp gate reads a structural constant out of PTX, and PTX spells
+    /// byte displacements the same way it spells multipliers. This pins the one
+    /// distinction the gate rests on: only operands outside `[...]` count.
+    #[test]
+    fn immediate_operands_exclude_addressing_offsets() {
+        // the shapes the Qwen3.8-Flash-Next and Qwen3.8-27B prepare entries actually emit
+        let qwen38_flash_next =
+            "\tmad.lo.s64 \t%rd15, %rd14, -26, %rd13;\n\tld.global.b32 \t%r52, [%rd26+28];\n";
+        assert!(contains_immediate_operand(qwen38_flash_next, "26"));
+        assert!(!contains_immediate_operand(qwen38_flash_next, "28"));
+
+        let qwen38 =
+            "\tmad.lo.s64 \t%rd15, %rd14, -28, %rd13;\n\tld.global.b32 \t%r52, [%rd26+28];\n";
+        assert!(contains_immediate_operand(qwen38, "28"));
+        assert!(!contains_immediate_operand(qwen38, "26"));
+
+        // a register name is not an immediate
+        assert!(!contains_immediate_operand(
+            "\tmov.u64 \t%rd26, %rd128;\n",
+            "26"
+        ));
+    }
+
     #[test]
     fn baseline_preflight_lists_every_missing_file() {
         let root = workspace_root().unwrap();
@@ -13420,6 +13835,8 @@ mod tests {
                 "qual/baselines/gdn-output-sm120.txt",
                 "qual/baselines/qwen38-flash-next-gdn-prepare-sm120.txt",
                 "qual/baselines/qwen38-flash-next-gdn-recurrence-sm120.txt",
+                "qual/baselines/qwen38-flash-next-qsa-prepare-sm120.txt",
+                "qual/baselines/qwen38-flash-next-qsa-attention-sm120.txt",
                 "qual/baselines/attention-qk-prepare-sm120.txt",
                 "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",
                 "qual/baselines/qwen36-attention-qk-prepare-sm120.txt",
@@ -14142,6 +14559,18 @@ mod tests {
                 NO_SNAPSHOT,
             ),
             (
+                "qualify-qwen38-flash-next-qsa-prepare",
+                "qwen38_flash_next_qsa_prepare",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen38-flash-next-qsa-attention",
+                "qwen38_flash_next_qsa_attention",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
                 "qualify-gdn-recurrence",
                 "gdn_recurrence::tests::route_inventory_and_arena_accounting_are_exact",
                 EXACT_SERIAL,
@@ -14348,7 +14777,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 87);
+        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 89);
 
         let snapshot = OsString::from("/snapshot");
         for &(command, filter, trailing, variable) in EXPECTED_QUALIFICATION_ROUTES {

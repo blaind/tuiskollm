@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
 use tuisko_kernels_sm120_common::Sm120Arch;
-use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext};
 
 /// Number of token positions held by one physical KV-cache page.
 pub const ATTENTION_PAGE_SIZE: usize = 64;
@@ -58,6 +58,32 @@ fn require_qwen35_geometry() -> GpuResult<()> {
 
     Ok(())
 }
+
+// The 24/2 head split, packed query rows, and cache stride are target-specific.
+fn require_qwen38_flash_next_geometry() -> GpuResult<()> {
+    if Qwen38FlashNext::NUM_ATTENTION_HEADS != 24
+        || Qwen38FlashNext::NUM_KV_HEADS != 2
+        || Qwen38FlashNext::HEAD_DIM != 256
+        || Qwen38FlashNext::ATTENTION_QUERY_ROWS != 12_288
+        || Qwen38FlashNext::ATTENTION_KV_ROWS != 512
+        || Qwen38FlashNext::ATTENTION_QKV_ROWS != 13_312
+        || Qwen38FlashNext::RMS_NORM_EPSILON != 1.0e-6
+    {
+        return Err(GpuError::invalid_launch(
+            "Qwen3.8-Flash-Next geometry is incompatible with its admitted QSA Q/K prepare schedule",
+        ));
+    }
+
+    Ok(())
+}
+
+// Keep generated address arithmetic bound to the admitted geometry.
+const _: () = assert!(Qwen38FlashNext::NUM_ATTENTION_HEADS == 24);
+const _: () = assert!(Qwen38FlashNext::NUM_KV_HEADS == 2);
+const _: () = assert!(Qwen38FlashNext::HEAD_DIM == 256);
+const _: () = assert!(Qwen38FlashNext::ATTENTION_QUERY_ROWS == 12_288);
+const _: () = assert!(Qwen38FlashNext::ATTENTION_KV_ROWS == 512);
+const _: () = assert!(Qwen38FlashNext::ATTENTION_QKV_ROWS == 13_312);
 
 fn require_qwen36_geometry() -> GpuResult<()> {
     if Qwen36Moe35B::NUM_ATTENTION_HEADS != 16
@@ -467,6 +493,108 @@ mod kernels {
             );
         }
     }
+
+    /// Prepares Qwen3.8-Flash-Next QSA Q/K and appends E4M3 K/V for one exact batch.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen38_flash_next_attention_qk_prepare_exact<const TOKENS: usize>(
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u8,
+        value_pages: *mut u8,
+        key_scale: f32,
+        value_scale: f32,
+    ) {
+        // Qwen3.8-Flash-Next has 26 head-warps per token (24 query + 2 KV). Eight
+        // warps per CTA gives 26 CTAs at B=8 while keeping one warp per
+        // complete 256-wide head, which is what preserves the exact RMS
+        // reduction order and the 64-wide partial-MRoPE lane exchange.
+        unsafe {
+            attention_qk_prepare::<Qwen38FlashNext, TOKENS>(
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+                key_scale,
+                value_scale,
+            );
+        }
+    }
+
+    /// Prepares Qwen3.8-Flash-Next QSA Q/K and appends E4M3 K/V for one prompt width.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen38_flash_next_attention_qk_prepare_prefill_exact<const TOKENS: usize>(
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: u32,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u8,
+        value_pages: *mut u8,
+        key_scale: f32,
+        value_scale: f32,
+    ) {
+        // T=32/64/128/1024 supplies 104/208/416/3,328 CTAs. Each warp keeps
+        // the decode route's 256-value reduction, MRoPE exchange, and E4M3
+        // store order, so a prompt and a decode step append bit-identical
+        // cache rows for the same token.
+        unsafe {
+            attention_qk_prepare::<Qwen38FlashNext, TOKENS>(
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+                key_scale,
+                value_scale,
+            );
+        }
+    }
 }
 
 mod private {
@@ -596,6 +724,19 @@ pub struct PreparedQwen36Fp8PrefillRoute<const TOKENS: usize> {
         PreparedLaunch<kernels::__qwen36_fp8_attention_qk_prepare_prefill_exact_CudaKernel<TOKENS>>,
 }
 
+/// Prepared Qwen3.8-Flash-Next QSA E4M3-cache decode entry for one exact batch.
+pub struct PreparedQwen38FlashNextRoute<const TOKENS: usize> {
+    prepare:
+        PreparedLaunch<kernels::__qwen38_flash_next_attention_qk_prepare_exact_CudaKernel<TOKENS>>,
+}
+
+/// Prepared Qwen3.8-Flash-Next QSA E4M3-cache prefill entry for one prompt width.
+pub struct PreparedQwen38FlashNextPrefillRoute<const TOKENS: usize> {
+    prepare: PreparedLaunch<
+        kernels::__qwen38_flash_next_attention_qk_prepare_prefill_exact_CudaKernel<TOKENS>,
+    >,
+}
+
 /// Stands in for a prompt width an architecture does not admit.
 ///
 /// It prepares and launches no entry, so an unadmitted width can never reach
@@ -610,6 +751,8 @@ impl<const TOKENS: usize> private::Sealed for PreparedQwen36Route<TOKENS> {}
 impl<const TOKENS: usize> private::Sealed for PreparedQwen36PrefillRoute<TOKENS> {}
 impl<const TOKENS: usize> private::Sealed for PreparedQwen36Fp8Route<TOKENS> {}
 impl<const TOKENS: usize> private::Sealed for PreparedQwen36Fp8PrefillRoute<TOKENS> {}
+impl<const TOKENS: usize> private::Sealed for PreparedQwen38FlashNextRoute<TOKENS> {}
+impl<const TOKENS: usize> private::Sealed for PreparedQwen38FlashNextPrefillRoute<TOKENS> {}
 impl private::Sealed for UnadmittedRoute {}
 
 impl<A: Arch, const TOKENS: usize> QkPrepareRoute<Fp8Cache> for PreparedRoute<A, TOKENS> {
@@ -978,6 +1121,102 @@ impl<const TOKENS: usize> QkPrepareRoute<Fp8Cache> for PreparedQwen36Fp8PrefillR
     }
 }
 
+impl<const TOKENS: usize> QkPrepareRoute<Fp8Cache> for PreparedQwen38FlashNextRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let blocks = head_warp_blocks::<Qwen38FlashNext>(
+            TOKENS,
+            "Qwen3.8-Flash-Next QSA Q/K grid exceeds u32",
+        )?;
+
+        Ok(Self {
+            prepare: module
+                .prepare_qwen38_flash_next_attention_qk_prepare_exact::<TOKENS>(
+                    LaunchConfig1D::new(blocks, THREADS, 0),
+                )
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.8-Flash-Next QSA Q/K route", source)
+                })?,
+        })
+    }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        args: &QkPrepareArgs<Fp8Cache>,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_attention_qk_prepare_exact::<TOKENS>(
+                stream,
+                &self.prepare,
+                args.qkv,
+                args.query_norm,
+                args.key_norm,
+                args.rope_cos,
+                args.rope_sin,
+                args.block_tables,
+                args.table_rows,
+                args.table_stride,
+                args.cache_positions,
+                args.query,
+                args.key_pages,
+                args.value_pages,
+                args.scales.key,
+                args.scales.value,
+            )
+            .map_err(|source| GpuError::launch("launching Qwen3.8-Flash-Next QSA Q/K", source))
+    }
+}
+
+impl<const TOKENS: usize> QkPrepareRoute<Fp8Cache> for PreparedQwen38FlashNextPrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let blocks = head_warp_blocks::<Qwen38FlashNext>(
+            TOKENS,
+            "Qwen3.8-Flash-Next QSA Q/K prefill grid exceeds u32",
+        )?;
+
+        Ok(Self {
+            prepare: module
+                .prepare_qwen38_flash_next_attention_qk_prepare_prefill_exact::<TOKENS>(
+                    LaunchConfig1D::new(blocks, THREADS, 0),
+                )
+                .map_err(|source| {
+                    GpuError::launch("preparing Qwen3.8-Flash-Next QSA Q/K prefill", source)
+                })?,
+        })
+    }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        args: &QkPrepareArgs<Fp8Cache>,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_attention_qk_prepare_prefill_exact::<TOKENS>(
+                stream,
+                &self.prepare,
+                args.qkv,
+                args.query_norm,
+                args.key_norm,
+                args.rope_cos,
+                args.rope_sin,
+                args.block_tables,
+                args.table_rows,
+                args.table_stride,
+                args.cache_positions,
+                args.query,
+                args.key_pages,
+                args.value_pages,
+                args.scales.key,
+                args.scales.value,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching Qwen3.8-Flash-Next QSA Q/K prefill", source)
+            })
+    }
+}
+
 // `token_route` rejects an unadmitted width before dispatch, so this is the
 // defensive tail of a route that owns no entry.
 impl<C: CacheFormat> QkPrepareRoute<C> for UnadmittedRoute {
@@ -1042,10 +1281,14 @@ pub struct Qwen36QkPrepareEntries;
 /// Qwen3.6 entry table: E4M3 cache, decode `B=1..=8`, prefill through `T=128`.
 pub struct Qwen36Fp8QkPrepareEntries;
 
+/// Qwen3.8-Flash-Next QSA entry table: E4M3 cache, decode `B=1..=8`, prefill to `T=1024`.
+pub struct Qwen38FlashNextQkPrepareEntries;
+
 impl private::Sealed for Qwen38QkPrepareEntries {}
 impl private::Sealed for Qwen35QkPrepareEntries {}
 impl private::Sealed for Qwen36QkPrepareEntries {}
 impl private::Sealed for Qwen36Fp8QkPrepareEntries {}
+impl private::Sealed for Qwen38FlashNextQkPrepareEntries {}
 
 // The Qwen3.8 entries stay bound to the sealed artifact-level architecture:
 // they are the only routes whose kernels are instantiated over `A`.
@@ -1127,6 +1370,44 @@ impl QkPrepareEntries<Qwen36Moe35B> for Qwen36Fp8QkPrepareEntries {
     fn ptx_names() -> Vec<&'static str> {
         qwen36_fp8_attention_qk_prepare_ptx_names()
     }
+}
+
+impl QkPrepareEntries<Qwen38FlashNext> for Qwen38FlashNextQkPrepareEntries {
+    type Cache = Fp8Cache;
+    type Decode<const TOKENS: usize> = PreparedQwen38FlashNextRoute<TOKENS>;
+    type Prefill<const TOKENS: usize> = PreparedQwen38FlashNextPrefillRoute<TOKENS>;
+    type Prefill1024 = PreparedQwen38FlashNextPrefillRoute<1_024>;
+
+    const HAS_T1024: bool = true;
+    const LABEL: &'static str = "Qwen3.8-Flash-Next QSA ";
+    const SCALE_LABEL: &'static str = "Qwen3.8-Flash-Next QSA";
+    const MODULE_OPERATION: &'static str = "loading Qwen3.8-Flash-Next QSA Q/K prepare";
+
+    fn require_geometry() -> GpuResult<()> {
+        require_qwen38_flash_next_geometry()
+    }
+
+    fn ptx_names() -> Vec<&'static str> {
+        qwen38_flash_next_attention_qk_prepare_ptx_names()
+    }
+}
+
+/// PTX symbols retained for every exact Qwen3.8-Flash-Next QSA Q/K prepare route.
+pub(crate) fn qwen38_flash_next_attention_qk_prepare_ptx_names() -> Vec<&'static str> {
+    vec![
+        kernels::qwen38_flash_next_attention_qk_prepare_exact_ptx_name::<1>(),
+        kernels::qwen38_flash_next_attention_qk_prepare_exact_ptx_name::<2>(),
+        kernels::qwen38_flash_next_attention_qk_prepare_exact_ptx_name::<3>(),
+        kernels::qwen38_flash_next_attention_qk_prepare_exact_ptx_name::<4>(),
+        kernels::qwen38_flash_next_attention_qk_prepare_exact_ptx_name::<5>(),
+        kernels::qwen38_flash_next_attention_qk_prepare_exact_ptx_name::<6>(),
+        kernels::qwen38_flash_next_attention_qk_prepare_exact_ptx_name::<7>(),
+        kernels::qwen38_flash_next_attention_qk_prepare_exact_ptx_name::<8>(),
+        kernels::qwen38_flash_next_attention_qk_prepare_prefill_exact_ptx_name::<32>(),
+        kernels::qwen38_flash_next_attention_qk_prepare_prefill_exact_ptx_name::<64>(),
+        kernels::qwen38_flash_next_attention_qk_prepare_prefill_exact_ptx_name::<128>(),
+        kernels::qwen38_flash_next_attention_qk_prepare_prefill_exact_ptx_name::<1_024>(),
+    ]
 }
 
 /// PTX symbols retained for every exact attention Q/K prepare route.
@@ -1332,6 +1613,12 @@ pub type Qwen36AttentionQkPrepareOp =
 pub type Qwen36Fp8AttentionQkPrepareOp =
     AttentionQkPrepareOp<Qwen36Moe35B, Fp8Cache, Qwen36Fp8QkPrepareEntries>;
 
+/// Prepared Qwen3.8-Flash-Next QSA Q/K normalization, partial MRoPE, and KV-cache routes.
+///
+/// Appends normalized, rotated keys and raw values.
+pub type Qwen38FlashNextAttentionQkPrepareOp =
+    AttentionQkPrepareOp<Qwen38FlashNext, Fp8Cache, Qwen38FlashNextQkPrepareEntries>;
+
 impl<A: Arch, C: CacheFormat, E: QkPrepareEntries<A, Cache = C>> AttentionQkPrepareOp<A, C, E> {
     /// Loads the embedded module and prepares every admitted route.
     pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
@@ -1529,8 +1816,11 @@ mod tests {
         qwen36_attention_qk_prepare_ptx_names, qwen36_fp8_attention_qk_prepare_ptx_names,
         token_route, unsupported_tokens,
     };
+    use super::{
+        Qwen38FlashNextQkPrepareEntries, qwen38_flash_next_attention_qk_prepare_ptx_names,
+    };
     use std::collections::{BTreeMap, BTreeSet};
-    use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext};
 
     /// The decode and prefill widths every admitted entry table routes.
     const SHARED_SCHEDULE: [(usize, TokenRoute); 11] = [
@@ -1591,6 +1881,10 @@ mod tests {
             admitted_schedule::<Qwen36Moe35B, Qwen36Fp8QkPrepareEntries>(),
             SHARED_SCHEDULE.to_vec()
         );
+        assert_eq!(
+            admitted_schedule::<Qwen38FlashNext, Qwen38FlashNextQkPrepareEntries>(),
+            with_t1024
+        );
 
         assert_eq!(THREADS, 256);
         assert_eq!(WARPS_PER_CTA, 8);
@@ -1618,6 +1912,10 @@ mod tests {
         assert_eq!(
             cache_element_bytes::<Qwen36Moe35B, Qwen36QkPrepareEntries>(),
             size_of::<<Bf16Cache as CacheFormat>::Element>()
+        );
+        assert_eq!(
+            cache_element_bytes::<Qwen38FlashNext, Qwen38FlashNextQkPrepareEntries>(),
+            size_of::<<Fp8Cache as CacheFormat>::Element>()
         );
     }
 
@@ -1652,6 +1950,20 @@ mod tests {
                 blocks
             );
         }
+        // Qwen3.8-Flash-Next QSA is 26 head-warps per token: 24 query plus 2 KV.
+        for (tokens, blocks) in [
+            (1, 4),
+            (8, 26),
+            (32, 104),
+            (64, 208),
+            (128, 416),
+            (1_024, 3_328),
+        ] {
+            assert_eq!(
+                head_warp_blocks::<Qwen38FlashNext>(tokens, "").unwrap(),
+                blocks
+            );
+        }
     }
 
     #[test]
@@ -1680,6 +1992,19 @@ mod tests {
         assert_eq!(qwen36_fp8.len(), 11);
         assert_eq!(qwen36_fp8_unique.len(), qwen36_fp8.len());
         assert!(qwen36_fp8_unique.is_disjoint(&qwen36_unique));
+
+        let qwen38_flash_next = qwen38_flash_next_attention_qk_prepare_ptx_names();
+        let qwen38_flash_next_unique = qwen38_flash_next.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(qwen38_flash_next.len(), 12);
+        assert_eq!(qwen38_flash_next_unique.len(), qwen38_flash_next.len());
+        assert!(
+            names
+                .iter()
+                .all(|name| !qwen38_flash_next_unique.contains(name))
+        );
+        assert!(qwen38_flash_next_unique.is_disjoint(&qwen35_unique));
+        assert!(qwen38_flash_next_unique.is_disjoint(&qwen36_unique));
+        assert!(qwen38_flash_next_unique.is_disjoint(&qwen36_fp8_unique));
     }
 
     /// Each entry table publishes exactly the list that retains its own
@@ -1702,6 +2027,10 @@ mod tests {
             <Qwen36Fp8QkPrepareEntries as QkPrepareEntries<Qwen36Moe35B>>::ptx_names(),
             qwen36_fp8_attention_qk_prepare_ptx_names()
         );
+        assert_eq!(
+            <Qwen38FlashNextQkPrepareEntries as QkPrepareEntries<Qwen38FlashNext>>::ptx_names(),
+            qwen38_flash_next_attention_qk_prepare_ptx_names()
+        );
     }
 
     /// A generic specialization's `_TID_` hash is only reproducible inside the
@@ -1717,6 +2046,7 @@ mod tests {
             .chain(qwen35_attention_qk_prepare_ptx_names())
             .chain(qwen36_attention_qk_prepare_ptx_names())
             .chain(qwen36_fp8_attention_qk_prepare_ptx_names())
+            .chain(qwen38_flash_next_attention_qk_prepare_ptx_names())
         {
             *counts.entry(base_name(name)).or_insert(0_usize) += 1;
         }
@@ -1735,9 +2065,11 @@ mod tests {
                 ("qwen36_attention_qk_prepare_prefill_exact", 3),
                 ("qwen36_fp8_attention_qk_prepare_exact", 8),
                 ("qwen36_fp8_attention_qk_prepare_prefill_exact", 3),
+                ("qwen38_flash_next_attention_qk_prepare_exact", 8),
+                ("qwen38_flash_next_attention_qk_prepare_prefill_exact", 4),
             ]
         );
-        assert_eq!(counts.values().sum::<usize>(), 46);
+        assert_eq!(counts.values().sum::<usize>(), 58);
     }
 
     /// An unadmitted token count keeps naming the owner that rejected it.

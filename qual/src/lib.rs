@@ -269,6 +269,12 @@ mod qwen38_flash_next_hyper_connection;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_hyper_connection_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_qsa_attention;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_qsa_attention_benchmark;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_qsa_prepare_benchmark;
+#[cfg(feature = "device")]
 mod resident_batch_generation;
 #[cfg(feature = "device")]
 mod resident_generation;
@@ -328,7 +334,7 @@ pub use attention_qk_prepare::{
     AttentionQkPrepareQualification, AttentionQkPrepareQualificationError,
     qualify_attention_qk_prepare, qualify_mtp_bf16_qk_prepare, qualify_qwen35_attention_qk_prepare,
     qualify_qwen35_mtp_bf16_qk_prepare, qualify_qwen36_attention_qk_prepare,
-    qualify_qwen36_fp8_attention_qk_prepare,
+    qualify_qwen36_fp8_attention_qk_prepare, qualify_qwen38_flash_next_qsa_prepare,
 };
 #[cfg(feature = "device")]
 pub use attention_qk_prepare_benchmark::{
@@ -731,6 +737,15 @@ pub use qwen38_flash_next_hyper_connection::{
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_hyper_connection_benchmark::benchmark_qwen38_flash_next_hyper_connection;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_qsa_attention::{
+    Qwen38FlashNextQsaAttentionQualification, Qwen38FlashNextQsaAttentionQualificationError,
+    qualify_qwen38_flash_next_qsa_attention,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_qsa_attention_benchmark::benchmark_qwen38_flash_next_qsa_attention;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_qsa_prepare_benchmark::benchmark_qwen38_flash_next_qsa_prepare;
 #[cfg(feature = "device")]
 pub use resident_batch_generation::{
     ResidentBatchGenerationQualification, ResidentBatchGenerationQualificationError,

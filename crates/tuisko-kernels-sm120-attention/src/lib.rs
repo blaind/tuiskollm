@@ -25,7 +25,7 @@ pub use paged_gqa::{
     PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PAGED_GQA_PREFILL_MACRO_MAX_PARTITIONS,
     PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES, PAGED_GQA_PREFILL_MACRO_TOKENS,
     PAGED_GQA_PREFILL_MAX_CONTEXT, PAGED_GQA_PREFILL_PARTIAL_BYTES, PagedGqaOp, Qwen35PagedGqaOp,
-    Qwen36Fp8PagedGqaOp, Qwen36PagedGqaOp, paged_gqa_prefill_partitions,
+    Qwen36Fp8PagedGqaOp, Qwen36PagedGqaOp, Qwen38FlashNextPagedGqaOp, paged_gqa_prefill_partitions,
 };
 pub use qk_prepare::{
     ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, Bf16Cache, CacheFormat, CacheScales, Fp8Cache,
@@ -34,7 +34,8 @@ pub use qk_prepare::{
     PreparedQwen36Route, PreparedRoute, QkPrepareArgs, QkPrepareEntries, QkPrepareRoute,
     Qwen35AttentionQkPrepareOp, Qwen35QkPrepareEntries, Qwen36AttentionQkPrepareOp,
     Qwen36Fp8AttentionQkPrepareOp, Qwen36Fp8QkPrepareEntries, Qwen36QkPrepareEntries,
-    Qwen38QkPrepareEntries, UnadmittedRoute,
+    Qwen38FlashNextAttentionQkPrepareOp, Qwen38FlashNextQkPrepareEntries, Qwen38QkPrepareEntries,
+    UnadmittedRoute,
 };
 
 /// Semantic inventory of every entry this family emits.
@@ -44,10 +45,12 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .chain(qk_prepare::qwen35_attention_qk_prepare_ptx_names())
         .chain(qk_prepare::qwen36_attention_qk_prepare_ptx_names())
         .chain(qk_prepare::qwen36_fp8_attention_qk_prepare_ptx_names())
+        .chain(qk_prepare::qwen38_flash_next_attention_qk_prepare_ptx_names())
         .chain(paged_gqa::paged_gqa_ptx_names())
         .chain(paged_gqa::qwen35_paged_gqa_ptx_names())
         .chain(paged_gqa::qwen36_paged_gqa_ptx_names())
         .chain(paged_gqa::qwen36_fp8_paged_gqa_ptx_names())
+        .chain(paged_gqa::qwen38_flash_next_paged_gqa_ptx_names())
         .chain(long_context_paged_gqa::long_context_paged_gqa_ptx_names())
         .collect()
 }
@@ -108,8 +111,12 @@ mod tests {
                 ("qwen36_fp8_paged_gqa_prefill_shared_exact", 3),
                 ("qwen36_paged_gqa_exact", 8),
                 ("qwen36_paged_gqa_prefill_shared_exact", 3),
+                ("qwen38_flash_next_attention_qk_prepare_exact", 8),
+                ("qwen38_flash_next_attention_qk_prepare_prefill_exact", 4),
+                ("qwen38_flash_next_paged_gqa_exact", 8),
+                ("qwen38_flash_next_paged_gqa_prefill_shared_exact", 4),
             ]
         );
-        assert_eq!(counts.values().sum::<usize>(), 116);
+        assert_eq!(counts.values().sum::<usize>(), 140);
     }
 }

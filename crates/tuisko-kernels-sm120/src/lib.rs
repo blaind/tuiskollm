@@ -17,7 +17,7 @@ pub use tuisko_kernels_sm120_attention::{
     PAGED_GQA_PREFILL_MAX_CONTEXT, PAGED_GQA_PREFILL_PARTIAL_BYTES, PagedGqaOp,
     Qwen35AttentionQkPrepareOp, Qwen35PagedGqaOp, Qwen36AttentionQkPrepareOp,
     Qwen36Fp8AttentionQkPrepareOp, Qwen36Fp8PagedGqaOp, Qwen36PagedGqaOp,
-    paged_gqa_prefill_partitions,
+    Qwen38FlashNextAttentionQkPrepareOp, Qwen38FlashNextPagedGqaOp, paged_gqa_prefill_partitions,
 };
 pub use tuisko_kernels_sm120_common::Sm120Arch;
 pub use tuisko_kernels_sm120_fp8_mlp::{
@@ -26,7 +26,7 @@ pub use tuisko_kernels_sm120_fp8_mlp::{
 pub use tuisko_kernels_sm120_fp8_projection::{
     AttentionOutputOp, DenseFp8GdnInputTmaMaps, FullAttentionQkvOp, GdnInputProjectionOp,
     GdnOutputProjectionOp, LmHeadOp, Qwen36AttentionOutputOp, Qwen36Fp8QkvOp, Qwen36GdnInputOp,
-    Qwen36GdnOutputOp,
+    Qwen36GdnOutputOp, Qwen38FlashNextAttentionGateOp,
 };
 pub use tuisko_kernels_sm120_gdn::{
     GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp, Qwen35GdnPrepareOp, Qwen35GdnRecurrenceOp,
