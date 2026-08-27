@@ -3519,6 +3519,7 @@ dependencies = [
  "cuda-host",
  "cuda-intrinsics",
  "tuisko-gpu",
+ "tuisko-kernels-macros",
  "tuisko-kernels-sm120-common",
  "tuisko-model",
 ]

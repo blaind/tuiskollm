@@ -4,6 +4,7 @@ use crate::device::gdn_prepare::{gdn_convolution_prefill, gdn_convolution_prefil
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B};
 
 const MAX_BATCH: usize = 8;
@@ -564,22 +565,59 @@ pub(crate) fn qwen35_gdn_prepare_ptx_names() -> Vec<&'static str> {
 }
 
 /// Prepared control and convolution routes for exact Qwen3.5/Qwen3.6 rows.
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen35_gdn_prepare),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
+    inventory(false)
+)]
+struct Qwen35GdnPrepareRoutes {
+    #[route(1)]
+    b1: PreparedRoute<1>,
+    #[route(2)]
+    b2: PreparedRoute<2>,
+    #[route(3)]
+    b3: PreparedRoute<3>,
+    #[route(4)]
+    b4: PreparedRoute<4>,
+    #[route(5)]
+    b5: PreparedRoute<5>,
+    #[route(6)]
+    b6: PreparedRoute<6>,
+    #[route(7)]
+    b7: PreparedRoute<7>,
+    #[route(8)]
+    b8: PreparedRoute<8>,
+    #[route(32)]
+    t32: PreparedPrefillRoute<32>,
+    #[route(64)]
+    t64: PreparedPrefillRoute<64>,
+    #[route(128)]
+    t128: PreparedPrefillRoute<128>,
+}
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen35_gdn_prepare_causal),
+    required(2, 3, 4),
+    inventory(false)
+)]
+struct Qwen35GdnPrepareCausalRoutes {
+    #[route(2)]
+    c2: PreparedCausalRoute<2>,
+    #[route(3)]
+    c3: PreparedCausalRoute<3>,
+    #[route(4)]
+    c4: PreparedCausalRoute<4>,
+}
+/// Prepared control and convolution routes for exact Qwen3.5/Qwen3.6 rows.
 pub struct Qwen35GdnPrepareOp {
     module: kernels::LoadedModule,
-    b1: PreparedRoute<1>,
-    b2: PreparedRoute<2>,
-    b3: PreparedRoute<3>,
-    b4: PreparedRoute<4>,
-    b5: PreparedRoute<5>,
-    b6: PreparedRoute<6>,
-    b7: PreparedRoute<7>,
-    b8: PreparedRoute<8>,
-    c2: PreparedCausalRoute<2>,
-    c3: PreparedCausalRoute<3>,
-    c4: PreparedCausalRoute<4>,
-    t32: PreparedPrefillRoute<32>,
-    t64: PreparedPrefillRoute<64>,
-    t128: PreparedPrefillRoute<128>,
+    routes: Qwen35GdnPrepareRoutes,
+    causal_routes: Qwen35GdnPrepareCausalRoutes,
 }
 
 impl Qwen35GdnPrepareOp {
@@ -591,20 +629,8 @@ impl Qwen35GdnPrepareOp {
         })?;
 
         Ok(Self {
-            b1: PreparedRoute::prepare(&module)?,
-            b2: PreparedRoute::prepare(&module)?,
-            b3: PreparedRoute::prepare(&module)?,
-            b4: PreparedRoute::prepare(&module)?,
-            b5: PreparedRoute::prepare(&module)?,
-            b6: PreparedRoute::prepare(&module)?,
-            b7: PreparedRoute::prepare(&module)?,
-            b8: PreparedRoute::prepare(&module)?,
-            c2: PreparedCausalRoute::prepare(&module)?,
-            c3: PreparedCausalRoute::prepare(&module)?,
-            c4: PreparedCausalRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
+            routes: Qwen35GdnPrepareRoutes::prepare(&module)?,
+            causal_routes: Qwen35GdnPrepareCausalRoutes::prepare(&module)?,
             module,
         })
     }
@@ -646,7 +672,7 @@ impl Qwen35GdnPrepareOp {
         macro_rules! launch {
             ($route:ident) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         projected_controls,
@@ -664,20 +690,7 @@ impl Qwen35GdnPrepareOp {
             };
         }
 
-        match rows {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            _ => unreachable!(),
-        }
+        dispatch_qwen35_gdn_prepare!(&self.routes, rows, |route| launch!(route), else => Err(GpuError::invalid_launch(format!("2,048-wide GDN prepare row count {rows} is outside 1..={MAX_BATCH}, 32, 64, and 128"))) )
     }
 
     /// Advances one mapped history row causally across an exact `K=2..4` transaction.
@@ -705,7 +718,7 @@ impl Qwen35GdnPrepareOp {
         macro_rules! launch {
             ($route:ident) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         projected_controls,
@@ -723,14 +736,9 @@ impl Qwen35GdnPrepareOp {
             };
         }
 
-        match rows {
-            2 => launch!(c2),
-            3 => launch!(c3),
-            4 => launch!(c4),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_qwen35_gdn_prepare_causal!(&self.causal_routes, rows, |route| launch!(route), else => Err(GpuError::invalid_launch(format!(
                 "2,048-wide GDN prepare causal row count {rows} is outside 2..=4"
-            ))),
-        }
+            ))) )
     }
 }
 

@@ -3,6 +3,7 @@
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B};
 
 const MAX_BATCH: usize = 8;
@@ -847,22 +848,70 @@ impl<const TOKENS: usize> PreparedCausalRoute<TOKENS> {
 }
 
 /// Prepared recurrent-state routes for exact Qwen3.5/Qwen3.6 row counts.
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen35_gdn_recurrence_decode),
+    required(1, 2, 3, 4, 5, 6, 7, 8),
+    inventory(false)
+)]
+struct Qwen35GdnRecurrenceDecodeRoutes {
+    #[route(1)]
+    b1: PreparedRoute<1>,
+    #[route(2)]
+    b2: PreparedRoute<2>,
+    #[route(3)]
+    b3: PreparedRoute<3>,
+    #[route(4)]
+    b4: PreparedRoute<4>,
+    #[route(5)]
+    b5: PreparedRoute<5>,
+    #[route(6)]
+    b6: PreparedRoute<6>,
+    #[route(7)]
+    b7: PreparedRoute<7>,
+    #[route(8)]
+    b8: PreparedRoute<8>,
+}
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen35_gdn_recurrence_prefill),
+    required(32, 64, 128),
+    inventory(false)
+)]
+struct Qwen35GdnRecurrencePrefillRoutes {
+    #[route(32)]
+    t32: PreparedPrefillRoute<32>,
+    #[route(64)]
+    t64: PreparedPrefillRoute<64>,
+    #[route(128)]
+    t128: PreparedPrefillRoute<128>,
+}
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen35_gdn_recurrence_causal),
+    required(2, 3, 4),
+    inventory(false)
+)]
+struct Qwen35GdnRecurrenceCausalRoutes {
+    #[route(2)]
+    c2: PreparedCausalRoute<2>,
+    #[route(3)]
+    c3: PreparedCausalRoute<3>,
+    #[route(4)]
+    c4: PreparedCausalRoute<4>,
+}
+/// Prepared recurrent-state routes for exact Qwen3.5/Qwen3.6 row counts.
 pub struct Qwen35GdnRecurrenceOp {
     module: kernels::LoadedModule,
-    b1: PreparedRoute<1>,
-    b2: PreparedRoute<2>,
-    b3: PreparedRoute<3>,
-    b4: PreparedRoute<4>,
-    b5: PreparedRoute<5>,
-    b6: PreparedRoute<6>,
-    b7: PreparedRoute<7>,
-    b8: PreparedRoute<8>,
-    c2: PreparedCausalRoute<2>,
-    c3: PreparedCausalRoute<3>,
-    c4: PreparedCausalRoute<4>,
-    t32: PreparedPrefillRoute<32>,
-    t64: PreparedPrefillRoute<64>,
-    t128: PreparedPrefillRoute<128>,
+    decode_routes: Qwen35GdnRecurrenceDecodeRoutes,
+    prefill_routes: Qwen35GdnRecurrencePrefillRoutes,
+    causal_routes: Qwen35GdnRecurrenceCausalRoutes,
 }
 
 impl Qwen35GdnRecurrenceOp {
@@ -874,20 +923,9 @@ impl Qwen35GdnRecurrenceOp {
         })?;
 
         Ok(Self {
-            b1: PreparedRoute::prepare(&module)?,
-            b2: PreparedRoute::prepare(&module)?,
-            b3: PreparedRoute::prepare(&module)?,
-            b4: PreparedRoute::prepare(&module)?,
-            b5: PreparedRoute::prepare(&module)?,
-            b6: PreparedRoute::prepare(&module)?,
-            b7: PreparedRoute::prepare(&module)?,
-            b8: PreparedRoute::prepare(&module)?,
-            c2: PreparedCausalRoute::prepare(&module)?,
-            c3: PreparedCausalRoute::prepare(&module)?,
-            c4: PreparedCausalRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
+            decode_routes: Qwen35GdnRecurrenceDecodeRoutes::prepare(&module)?,
+            prefill_routes: Qwen35GdnRecurrencePrefillRoutes::prepare(&module)?,
+            causal_routes: Qwen35GdnRecurrenceCausalRoutes::prepare(&module)?,
             module,
         })
     }
@@ -929,7 +967,7 @@ impl Qwen35GdnRecurrenceOp {
         macro_rules! launch {
             ($route:ident) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         qkv,
@@ -948,7 +986,7 @@ impl Qwen35GdnRecurrenceOp {
         macro_rules! launch_prefill {
             ($route:ident) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         qkv,
@@ -965,19 +1003,10 @@ impl Qwen35GdnRecurrenceOp {
             };
         }
 
-        match rows {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            32 => launch_prefill!(t32),
-            64 => launch_prefill!(t64),
-            128 => launch_prefill!(t128),
-            _ => unreachable!(),
+        if rows <= MAX_BATCH {
+            dispatch_qwen35_gdn_recurrence_decode!(&self.decode_routes, rows, |route| launch!(route), else => unreachable!())
+        } else {
+            dispatch_qwen35_gdn_recurrence_prefill!(&self.prefill_routes, rows, |route| launch_prefill!(route), else => Err(GpuError::invalid_launch(format!("2,048-wide GDN recurrence row count {rows} is outside 1..={MAX_BATCH}, 32, 64, and 128"))) )
         }
     }
 
@@ -1004,7 +1033,7 @@ impl Qwen35GdnRecurrenceOp {
         macro_rules! launch {
             ($route:ident) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         qkv,
@@ -1020,14 +1049,9 @@ impl Qwen35GdnRecurrenceOp {
             };
         }
 
-        match rows {
-            2 => launch!(c2),
-            3 => launch!(c3),
-            4 => launch!(c4),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_qwen35_gdn_recurrence_causal!(&self.causal_routes, rows, |route| launch!(route), else => Err(GpuError::invalid_launch(format!(
                 "2,048-wide GDN recurrence causal row count {rows} is outside 2..=4"
-            ))),
-        }
+            ))) )
     }
 }
 
