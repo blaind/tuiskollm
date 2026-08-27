@@ -1,0 +1,16 @@
+cuda_oxide_commit=0199e55572ee78cd2cea97335e5b7392a3f9be4a
+rustc_release=1.96.0-nightly
+rustc_commit=55e86c996809902e8bbad512cfb4d2c18be446d9
+cuda_toolkit_release=13.3
+cuda_toolkit_version=13.3.73
+norm_registers=36,38,38,38,38,38,38,38
+norm_prefill_registers=38,38,38,38
+mix_down_registers=40,46,48,56,62,80,96,104
+mix_down_prefill_registers=56,56,56,56
+final_down_registers=40,46,48,56,62,80,96,104
+final_down_prefill_registers=54,54,54,54
+mix_up_registers=39,48,54,56,63,64,69,72
+mix_up_prefill_registers=63,63,63,63
+write_back_registers=28,28,28,28,28,28,28,30
+write_back_prefill_registers=28,28,28,28
+shared_bytes=1072,1072,1072,1072,1072,1072,1072,1072,1072,1072,1072,1072,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0

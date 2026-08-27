@@ -25,6 +25,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const RESIDUAL_NORM_RESOURCE_BASELINE: &str = "qual/baselines/residual-norm-sm120.txt";
+const QWEN38_FLASH_NEXT_HYPER_CONNECTION_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen38-flash-next-hyper-connection-sm120.txt";
 const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-residual-norm-sm120.txt";
 const QWEN35_RESIDUAL_NORM_TEST_FILTER: &str = "qwen35_residual_norm";
@@ -171,6 +173,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     MTP_BF16_PAGED_GQA_RESOURCE_BASELINE,
     QWEN35_MTP_RESOURCE_BASELINE,
     QWEN36_MTP_RESOURCE_BASELINE,
+    QWEN38_FLASH_NEXT_HYPER_CONNECTION_RESOURCE_BASELINE,
 ];
 const NVFP4_MLP_RESOURCE_BASELINES: &[&str] = &[
     RESIDUAL_NORM_RESOURCE_BASELINE,
@@ -338,6 +341,10 @@ const QWEN35_RESIDENT_MTP_RESOURCE_BASELINES: &[&str] = &[
 /// order feeds `TUISKO_GENERATOR_BASELINE_SHA256` and binds the benchmark's
 /// measurement identity, so entries are never reordered or deduplicated.
 const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
+    (
+        "qwen38-flash-next-hyper-connection",
+        &[QWEN38_FLASH_NEXT_HYPER_CONNECTION_RESOURCE_BASELINE],
+    ),
     (
         "qwen35-residual-norm",
         &[QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE],
@@ -545,16 +552,17 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
 /// The kernel families are separate crates so an edit re-runs cuda-oxide
 /// device codegen only for the family it touched. cargo-oxide accepts the
 /// owners as one comma-separated list and emits one PTX module per crate.
-pub(crate) const SM120_DEVICE_CODEGEN_CRATES: &str = "tuisko-kernels-sm120-attention,tuisko-kernels-sm120-fp8-mlp,tuisko-kernels-sm120-fp8-projection,tuisko-kernels-sm120-gdn,tuisko-kernels-sm120-lm-head,tuisko-kernels-sm120-moe,tuisko-kernels-sm120-mtp,tuisko-kernels-sm120-norm,tuisko-kernels-sm120-nvfp4";
+pub(crate) const SM120_DEVICE_CODEGEN_CRATES: &str = "tuisko-kernels-sm120-attention,tuisko-kernels-sm120-fp8-mlp,tuisko-kernels-sm120-fp8-projection,tuisko-kernels-sm120-gdn,tuisko-kernels-sm120-hyper-connection,tuisko-kernels-sm120-lm-head,tuisko-kernels-sm120-moe,tuisko-kernels-sm120-mtp,tuisko-kernels-sm120-norm,tuisko-kernels-sm120-nvfp4";
 /// Every module the SM120 device build emits, in `SM120_DEVICE_CODEGEN_CRATES`
 /// order. The resource gates read the concatenation: entry names are unique
 /// across the whole artifact, and every module is compiled on its own so the
 /// reported shared-memory footprint is the family's alone.
-const SM120_PTX_MODULES: [&str; 9] = [
+const SM120_PTX_MODULES: [&str; 10] = [
     "target/cuda/tuisko_kernels_sm120_attention.ptx",
     "target/cuda/tuisko_kernels_sm120_fp8_mlp.ptx",
     "target/cuda/tuisko_kernels_sm120_fp8_projection.ptx",
     "target/cuda/tuisko_kernels_sm120_gdn.ptx",
+    "target/cuda/tuisko_kernels_sm120_hyper_connection.ptx",
     "target/cuda/tuisko_kernels_sm120_lm_head.ptx",
     "target/cuda/tuisko_kernels_sm120_moe.ptx",
     "target/cuda/tuisko_kernels_sm120_mtp.ptx",
@@ -1042,6 +1050,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
     forwarded("qualify-server", server_qual::run),
     forwarded("qualify-server-long-context", server_qual::run_long_context),
     no_args("qualify-host", qualify_host),
+    no_args(
+        "qualify-qwen38-flash-next-hyper-connection",
+        qualify_qwen38_flash_next_hyper_connection,
+    ),
     no_args("qualify-residual-norm", qualify_residual_norm),
     no_args("qualify-qwen35-residual-norm", qualify_qwen35_residual_norm),
     no_args("qualify-qwen36-residual-norm", qualify_qwen36_residual_norm),
@@ -1214,6 +1226,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
     forwarded("qualify-text-endpoint", qualify_text_endpoint),
     forwarded("bench-startup", bench_startup),
     forwarded("bench-server", server_bench::run),
+    forwarded(
+        "bench-qwen38-flash-next-hyper-connection",
+        bench_qwen38_flash_next_hyper_connection,
+    ),
     forwarded("bench-residual-norm", bench_residual_norm),
     forwarded("bench-qwen35-residual-norm", bench_qwen35_residual_norm),
     forwarded("bench-qwen36-residual-norm", bench_qwen36_residual_norm),
@@ -1333,6 +1349,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
         bench_resident_long_context_model,
     ),
     forwarded("bench-text-endpoint", bench_text_endpoint),
+    no_args(
+        "gate-qwen38-flash-next-hyper-connection",
+        gate_qwen38_flash_next_hyper_connection,
+    ),
     no_args("gate-residual-norm", gate_residual_norm),
     no_args("gate-qwen35-residual-norm", gate_qwen35_residual_norm),
     no_args("gate-qwen36-residual-norm", gate_qwen36_residual_norm),
@@ -1840,7 +1860,8 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_mtp_bf16_qk_prepare(root)?;
     gate_mtp_bf16_paged_gqa(root)?;
     gate_qwen35_mtp_resources(root)?;
-    gate_qwen36_mtp_resources(root)
+    gate_qwen36_mtp_resources(root)?;
+    gate_qwen38_flash_next_hyper_connection(root)
 }
 
 fn build_residual_norm(
@@ -2003,6 +2024,16 @@ fn qualify_host(root: &Path) -> Result<(), Box<dyn Error>> {
         ],
         Some(("CUDA_VISIBLE_DEVICES", OsStr::new(""))),
     )
+}
+
+fn qualify_qwen38_flash_next_hyper_connection(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        "qwen38_flash_next_hyper_connection_suite_",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
+    )?;
+    gate_qwen38_flash_next_hyper_connection(root)
 }
 
 fn qualify_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -3428,6 +3459,13 @@ fn qualify_text_endpoint(
     )?;
     gate_residual_norm(root)?;
     gate_fp8_lm_head(root)
+}
+
+fn bench_qwen38_flash_next_hyper_connection(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-hyper-connection", arguments)
 }
 
 fn bench_residual_norm(
@@ -5764,6 +5802,162 @@ fn single_ptx_path(gpu: gpu_target::GpuTarget) -> Result<&'static str, Box<dyn E
         )
         .into()
     })
+}
+
+/// Pins the Qwen3.8-Flash-Next hyper-connection family's launch shapes, spill-freedom,
+/// register envelopes, and shared arena.
+///
+/// The grouped reduction, two GEMVs, gated fold, and elementwise injection
+/// retain independent resource groups and register keys.
+/// Decode and prefill stay separate groups because they are separate symbols.
+fn gate_qwen38_flash_next_hyper_connection(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN38_FLASH_NEXT_HYPER_CONNECTION_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+    let entries = &sm120_gate_module(root)?.entries;
+    let artifact = sm120_gate_artifact(root)?;
+    let sass = artifact.sass()?;
+    // The grouped norm is the only stage that takes a reciprocal square root,
+    // and both it and the write-back must keep the packed BF16 store epilogue.
+    let norm_ptx = ["rsqrt.approx.f32", "cvt.rn.bf16x2.f32"];
+    let norm_sass = ["MUFU.RSQ", "F2FP.BF16.F32.PACK_AB"];
+    // Both projections reduce one output row inside one warp and round the
+    // projection through BF16 before their nonlinearity.
+    let projection_ptx = ["shfl.sync.down.b32", "ex2.approx.f32", "st.global.b16"];
+    let projection_sass = ["SHFL", "MUFU.EX2"];
+    // The write-back is elementwise: no reduction, so a shuffle here would mean
+    // the injection had grown a cross-lane dependency it must not have.
+    let write_back_ptx = ["cvt.rn.bf16x2.f32"];
+    let write_back_sass = ["F2FP.BF16.F32.PACK_AB"];
+    let families = [
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next hyper-connection norm",
+            prefix: "qwen38_flash_next_hyper_connection_norm_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "norm_registers",
+            ptx_instructions: &norm_ptx,
+            sass_instructions: &norm_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next hyper-connection norm prefill",
+            prefix: "qwen38_flash_next_hyper_connection_norm_prefill_TID_",
+            count: 4,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "norm_prefill_registers",
+            ptx_instructions: &norm_ptx,
+            sass_instructions: &norm_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next hyper-connection mix projection",
+            prefix: "qwen38_flash_next_hyper_connection_mix_down_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "mix_down_registers",
+            ptx_instructions: &projection_ptx,
+            sass_instructions: &projection_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next hyper-connection mix projection prefill",
+            prefix: "qwen38_flash_next_hyper_connection_mix_down_prefill_TID_",
+            count: 4,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "mix_down_prefill_registers",
+            ptx_instructions: &projection_ptx,
+            sass_instructions: &projection_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next hyper-connection mixer projection",
+            prefix: "qwen38_flash_next_hyper_connection_final_down_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "final_down_registers",
+            ptx_instructions: &projection_ptx,
+            sass_instructions: &projection_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next hyper-connection mixer projection prefill",
+            prefix: "qwen38_flash_next_hyper_connection_final_down_prefill_TID_",
+            count: 4,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "final_down_prefill_registers",
+            ptx_instructions: &projection_ptx,
+            sass_instructions: &projection_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next hyper-connection fold",
+            prefix: "qwen38_flash_next_hyper_connection_mix_up_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "mix_up_registers",
+            ptx_instructions: &projection_ptx,
+            sass_instructions: &projection_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next hyper-connection fold prefill",
+            prefix: "qwen38_flash_next_hyper_connection_mix_up_prefill_TID_",
+            count: 4,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "mix_up_prefill_registers",
+            ptx_instructions: &projection_ptx,
+            sass_instructions: &projection_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next hyper-connection write-back",
+            prefix: "qwen38_flash_next_hyper_connection_write_back_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "write_back_registers",
+            ptx_instructions: &write_back_ptx,
+            sass_instructions: &write_back_sass,
+            forbidden_sass: &["SHFL"],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next hyper-connection write-back prefill",
+            prefix: "qwen38_flash_next_hyper_connection_write_back_prefill_TID_",
+            count: 4,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "write_back_prefill_registers",
+            ptx_instructions: &write_back_ptx,
+            sass_instructions: &write_back_sass,
+            forbidden_sass: &["SHFL"],
+        },
+    ];
+
+    // Only the grouped norm reduces through a shared arena, so this family's
+    // footprint is genuinely per entry: a projection or write-back entry that
+    // grew one would move a zero in the pinned list.
+    let entry_count = gate_exact_resource_families(
+        &baseline,
+        entries,
+        artifact,
+        sass,
+        &families,
+        SharedFootprint::PerEntry,
+    )?;
+    println!(
+        "Qwen3.8-Flash-Next hyper-connection resource gate passed: {entry_count} entries, STACK:0 LOCAL:0, SHARED 1072 on the twelve grouped-norm entries and 0 elsewhere; launch bounds, warp-reduction paths, and register envelopes retained"
+    );
+    Ok(())
 }
 
 fn gate_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -13244,6 +13438,7 @@ mod tests {
                 "qual/baselines/mtp-bf16-paged-gqa-sm120.txt",
                 "qual/baselines/qwen35-mtp-sm120.txt",
                 "qual/baselines/qwen36-mtp-sm120.txt",
+                "qual/baselines/qwen38-flash-next-hyper-connection-sm120.txt",
             ]
         );
     }
@@ -13941,6 +14136,12 @@ mod tests {
                 NO_SNAPSHOT,
             ),
             (
+                "qualify-qwen38-flash-next-hyper-connection",
+                "qwen38_flash_next_hyper_connection_suite_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
                 "qualify-gdn-recurrence",
                 "gdn_recurrence::tests::route_inventory_and_arena_accounting_are_exact",
                 EXACT_SERIAL,
@@ -14147,7 +14348,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 86);
+        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 87);
 
         let snapshot = OsString::from("/snapshot");
         for &(command, filter, trailing, variable) in EXPECTED_QUALIFICATION_ROUTES {
