@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tuisko_gpu::{
     CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, LaunchConfig2D, PreparedLaunch,
 };
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_model::{Arch, Qwen35_9B};
 
 const MAX_BATCH: usize = 8;
@@ -691,20 +692,55 @@ pub(crate) fn qwen35_nvfp4_gdn_input_ptx_names() -> Vec<&'static str> {
     ]
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen35_nvfp4_gdn_input_decode),
+    required(1, 2, 3, 4, 5, 6, 7, 8),
+    inventory(false)
+)]
+struct Qwen35Nvfp4GdnInputDecodeRoutes {
+    #[route(1)]
+    b1: PreparedBatchRoute<1>,
+    #[route(2)]
+    b2: PreparedBatchRoute<2>,
+    #[route(3)]
+    b3: PreparedBatchRoute<3>,
+    #[route(4)]
+    b4: PreparedBatchRoute<4>,
+    #[route(5)]
+    b5: PreparedBatchRoute<5>,
+    #[route(6)]
+    b6: PreparedBatchRoute<6>,
+    #[route(7)]
+    b7: PreparedBatchRoute<7>,
+    #[route(8)]
+    b8: PreparedBatchRoute<8>,
+}
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen35_nvfp4_gdn_input_prefill),
+    required(32, 64, 128),
+    inventory(false)
+)]
+struct Qwen35Nvfp4GdnInputPrefillRoutes {
+    #[route(32)]
+    t32: PreparedPrefillRoute<32>,
+    #[route(64)]
+    t64: PreparedPrefillRoute<64>,
+    #[route(128)]
+    t128: PreparedPrefillRoute<128>,
+}
+
 /// Prepared exact-batch Qwen3.5 NVFP4 GDN input routes on SM120.
 pub struct Qwen35Nvfp4GdnInputOp {
     module: kernels::LoadedModule,
-    b1: PreparedBatchRoute<1>,
-    b2: PreparedBatchRoute<2>,
-    b3: PreparedBatchRoute<3>,
-    b4: PreparedBatchRoute<4>,
-    b5: PreparedBatchRoute<5>,
-    b6: PreparedBatchRoute<6>,
-    b7: PreparedBatchRoute<7>,
-    b8: PreparedBatchRoute<8>,
-    t32: PreparedPrefillRoute<32>,
-    t64: PreparedPrefillRoute<64>,
-    t128: PreparedPrefillRoute<128>,
+    decode_routes: Qwen35Nvfp4GdnInputDecodeRoutes,
+    prefill_routes: Qwen35Nvfp4GdnInputPrefillRoutes,
 }
 
 impl Qwen35Nvfp4GdnInputOp {
@@ -716,17 +752,8 @@ impl Qwen35Nvfp4GdnInputOp {
         })?;
 
         Ok(Self {
-            b1: PreparedBatchRoute::prepare(&module)?,
-            b2: PreparedBatchRoute::prepare(&module)?,
-            b3: PreparedBatchRoute::prepare(&module)?,
-            b4: PreparedBatchRoute::prepare(&module)?,
-            b5: PreparedBatchRoute::prepare(&module)?,
-            b6: PreparedBatchRoute::prepare(&module)?,
-            b7: PreparedBatchRoute::prepare(&module)?,
-            b8: PreparedBatchRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
+            decode_routes: Qwen35Nvfp4GdnInputDecodeRoutes::prepare(&module)?,
+            prefill_routes: Qwen35Nvfp4GdnInputPrefillRoutes::prepare(&module)?,
             module,
         })
     }
@@ -768,9 +795,9 @@ impl Qwen35Nvfp4GdnInputOp {
         let control_weight_reciprocal = 1.0 / control_weight_scale_divisor;
 
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         input,
@@ -787,19 +814,9 @@ impl Qwen35Nvfp4GdnInputOp {
             };
         }
 
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_qwen35_nvfp4_gdn_input_decode!(&self.decode_routes, batch, |route| launch!(route), else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.5 NVFP4 GDN input batch {batch} is outside the exact range 1..={MAX_BATCH}"
-            ))),
-        }
+            ))) )
     }
 
     /// Quantizes exact prompt rows once and projects both GDN input families.
@@ -845,9 +862,9 @@ impl Qwen35Nvfp4GdnInputOp {
         }
 
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         input,
@@ -867,14 +884,9 @@ impl Qwen35Nvfp4GdnInputOp {
             };
         }
 
-        match tokens {
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_qwen35_nvfp4_gdn_input_prefill!(&self.prefill_routes, tokens, |route| launch!(route), else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.5 NVFP4 GDN input prefill row count {tokens} is outside the exact T=32,64,128 routes"
-            ))),
-        }
+            ))) )
     }
 }
 
