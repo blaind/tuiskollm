@@ -84,6 +84,8 @@ const QWEN38_FLASH_NEXT_QSA_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen38-flash-next-qsa-prepare-sm120.txt";
 const QWEN38_FLASH_NEXT_QSA_ATTENTION_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen38-flash-next-qsa-attention-sm120.txt";
+const QWEN38_FLASH_NEXT_QSA_SELECTION_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen38-flash-next-qsa-selection-sm120.txt";
 const ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/attention-qk-prepare-sm120.txt";
 const QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
@@ -161,6 +163,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     QWEN38_FLASH_NEXT_GDN_RECURRENCE_RESOURCE_BASELINE,
     QWEN38_FLASH_NEXT_QSA_PREPARE_RESOURCE_BASELINE,
     QWEN38_FLASH_NEXT_QSA_ATTENTION_RESOURCE_BASELINE,
+    QWEN38_FLASH_NEXT_QSA_SELECTION_RESOURCE_BASELINE,
     ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
@@ -400,6 +403,10 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
     (
         "qwen38-flash-next-qsa-attention",
         &[QWEN38_FLASH_NEXT_QSA_ATTENTION_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen38-flash-next-qsa-selection",
+        &[QWEN38_FLASH_NEXT_QSA_SELECTION_RESOURCE_BASELINE],
     ),
     (
         "qwen36-gdn-recurrence",
@@ -1190,6 +1197,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "qualify-qwen38-flash-next-qsa-attention",
         qualify_qwen38_flash_next_qsa_attention,
     ),
+    no_args(
+        "qualify-qwen38-flash-next-qsa-selection",
+        qualify_qwen38_flash_next_qsa_selection,
+    ),
     no_args("qualify-gdn-recurrence", qualify_gdn_recurrence),
     no_args("qualify-gdn-output", qualify_gdn_output),
     no_args("qualify-attention-qk-prepare", qualify_attention_qk_prepare),
@@ -1319,6 +1330,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "bench-qwen38-flash-next-qsa-attention",
         bench_qwen38_flash_next_qsa_attention,
     ),
+    forwarded(
+        "bench-qwen38-flash-next-qsa-selection",
+        bench_qwen38_flash_next_qsa_selection,
+    ),
     forwarded("bench-gdn-recurrence", bench_gdn_recurrence),
     forwarded("bench-gdn-output", bench_gdn_output),
     forwarded("bench-attention-qk-prepare", bench_attention_qk_prepare),
@@ -1438,6 +1453,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
     no_args(
         "gate-qwen38-flash-next-qsa-attention",
         gate_qwen38_flash_next_qsa_attention,
+    ),
+    no_args(
+        "gate-qwen38-flash-next-qsa-selection",
+        gate_qwen38_flash_next_qsa_selection,
     ),
     no_args("gate-gdn-recurrence", gate_gdn_recurrence),
     no_args("gate-gdn-output", gate_gdn_output),
@@ -2808,6 +2827,17 @@ fn qualify_qwen38_flash_next_qsa_attention(root: &Path) -> Result<(), Box<dyn Er
     gate_qwen38_flash_next_qsa_attention(root)
 }
 
+/// Runs the QSA selection oracle, accounting tests, and artifact gate.
+fn qualify_qwen38_flash_next_qsa_selection(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        "qwen38_flash_next_qsa_selection",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
+    )?;
+    gate_qwen38_flash_next_qsa_selection(root)
+}
+
 fn qualify_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
     run_qualification_test(
         root,
@@ -3654,6 +3684,13 @@ fn bench_qwen38_flash_next_qsa_attention(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     run_bench_device(root, "qwen38-flash-next-qsa-attention", arguments)
+}
+
+fn bench_qwen38_flash_next_qsa_selection(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-qsa-selection", arguments)
 }
 
 fn bench_qwen36_gdn_recurrence(
@@ -8258,6 +8295,165 @@ fn gate_qwen38_flash_next_qsa_attention(root: &Path) -> Result<(), Box<dyn Error
 
     println!(
         "Qwen3.8-Flash-Next QSA attention gate passed: 8 decode + 4 prefill scoring entries and 8 + 4 output gate entries, REG {decode_registers:?} / {prefill_registers:?} / {gate_registers:?} / {gate_prefill_registers:?}, STACK:0 LOCAL:0, SHARED {decode_shared:?} / {prefill_shared:?} / {gate_shared:?} / {gate_prefill_shared:?}, online softmax, E4M3 cache load, shared K/V tile fill, sigmoid reciprocal present with SiLU division absent, and SASS present"
+    );
+
+    Ok(())
+}
+
+/// Pins all QSA selection entries and their defining instruction shapes.
+fn gate_qwen38_flash_next_qsa_selection(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN38_FLASH_NEXT_QSA_SELECTION_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let entries = &sm120_gate_module(root)?.entries;
+    let family = |prefix: &str| {
+        entries
+            .iter()
+            .filter(|entry| entry.name.starts_with(prefix))
+            .collect::<Vec<_>>()
+    };
+    let prepare = family("qwen38_flash_next_indexer_prepare_exact_TID_");
+    let prepare_prefill = family("qwen38_flash_next_indexer_prepare_prefill_exact_TID_");
+    let compress = family("qwen38_flash_next_indexer_block_compress_exact_TID_");
+    let score = family("qwen38_flash_next_indexer_score_exact_TID_");
+    let select = family("qwen38_flash_next_indexer_select_exact_TID_");
+    let attention = family("qwen38_flash_next_paged_gqa_selected_exact_TID_");
+    let attention_prefill = family("qwen38_flash_next_paged_gqa_prefill_selected_exact_TID_");
+    require_count("Qwen3.8-Flash-Next indexer prepare", prepare.len(), 8)?;
+    require_count(
+        "Qwen3.8-Flash-Next indexer prefill prepare",
+        prepare_prefill.len(),
+        4,
+    )?;
+    require_count(
+        "Qwen3.8-Flash-Next indexer block compression",
+        compress.len(),
+        12,
+    )?;
+    require_count("Qwen3.8-Flash-Next indexer scoring", score.len(), 10)?;
+    require_count("Qwen3.8-Flash-Next indexer selection", select.len(), 10)?;
+    require_count(
+        "Qwen3.8-Flash-Next selected decode attention",
+        attention.len(),
+        8,
+    )?;
+    require_count(
+        "Qwen3.8-Flash-Next selected prefill attention",
+        attention_prefill.len(),
+        4,
+    )?;
+
+    for entry in prepare.iter().chain(&prepare_prefill) {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        if !entry.body.contains("rsqrt.approx.f32") || !entry.body.contains("shfl.sync.bfly.b32") {
+            return Err(format!(
+                "entry `{}` lost its RMS reciprocal or MRoPE exchange",
+                entry.name
+            )
+            .into());
+        }
+        if entry.body.contains("e4m3") {
+            return Err(
+                format!("entry `{}` quantizes the raw indexer key plane", entry.name).into(),
+            );
+        }
+    }
+
+    for entry in compress.iter() {
+        if !entry.body.contains("rsqrt.approx.f32") || !entry.body.contains("cvt.rn.bf16x2.f32") {
+            return Err(format!(
+                "entry `{}` lost its pooled-key norm or BF16 store",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    for entry in score.iter() {
+        if !entry.body.contains("max.f32") {
+            return Err(format!("entry `{}` lost its ReLU", entry.name).into());
+        }
+        if entry.body.contains("ex2.approx.f32") {
+            return Err(format!("entry `{}` exponentiates indexer scores", entry.name).into());
+        }
+    }
+
+    for entry in select.iter() {
+        if !entry.body.contains("match.any.sync.b32") {
+            return Err(format!("entry `{}` lost its conflict-free histogram", entry.name).into());
+        }
+        if names_opcode(entry.body, "atom.") || names_opcode(entry.body, "red.") {
+            return Err(format!("entry `{}` uses an atomic histogram", entry.name).into());
+        }
+    }
+
+    for entry in attention.iter().chain(&attention_prefill) {
+        if !entry.body.contains("ex2.approx.f32") || !entry.body.contains("cvt.rn.f16x2.e4m3x2") {
+            return Err(format!(
+                "entry `{}` lost its online softmax or E4M3 cache load",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    for entry in prepare
+        .iter()
+        .chain(&prepare_prefill)
+        .chain(&compress)
+        .chain(&score)
+        .chain(&select)
+        .chain(&attention)
+        .chain(&attention_prefill)
+    {
+        if sass_function_body(sass, entry.name).is_none() {
+            return Err(format!(
+                "cuobjdump omitted Qwen3.8-Flash-Next QSA selection SASS `{}`",
+                entry.name
+            )
+            .into());
+        }
+    }
+
+    let mut measured = Vec::new();
+    for (label, group) in [
+        ("prepare", &prepare),
+        ("prepare_prefill", &prepare_prefill),
+        ("compress", &compress),
+        ("score", &score),
+        ("select", &select),
+        ("attention", &attention),
+        ("attention_prefill", &attention_prefill),
+    ] {
+        let mut registers = Vec::new();
+        let mut shared = Vec::new();
+        for entry in group.iter() {
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+            shared.push(resource.shared);
+        }
+        registers.sort_unstable();
+        require_registers(&baseline, &format!("{label}_registers"), &registers)?;
+        require_uniform_value(&baseline, &format!("{label}_shared_bytes"), &shared)?;
+        measured.push((label, registers, shared[0]));
+    }
+
+    println!(
+        "Qwen3.8-Flash-Next QSA selection gate passed: 56 entries, STACK:0 LOCAL:0, {measured:?}, exact indexer instruction shapes and SASS present"
     );
 
     Ok(())
@@ -13393,6 +13589,14 @@ fn parse_resources(text: &str) -> Result<BTreeMap<String, Resource>, Box<dyn Err
     Ok(resources)
 }
 
+fn names_opcode(body: &str, opcode: &str) -> bool {
+    body.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|first| first.starts_with(opcode))
+    })
+}
+
 fn require_count(family: &str, actual: usize, expected: usize) -> Result<(), Box<dyn Error>> {
     if actual != expected {
         return Err(format!(
@@ -13494,7 +13698,7 @@ mod tests {
         QWEN36_MTP_LAYER_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
         SM120_DEVICE_CODEGEN_CRATES, SM120_RESOURCE_BASELINES, SUBCOMMANDS, bench_device_baselines,
         bench_device_command, concatenated_resource_baselines, contains_immediate_operand,
-        device_is_idle, dispatch, dispatch_probe, parse_baseline, parse_compute_pids,
+        device_is_idle, dispatch, dispatch_probe, names_opcode, parse_baseline, parse_compute_pids,
         parse_cuda_toolkit_identity, parse_entries, parse_performance_device_sample,
         parse_performance_iteration, parse_resources, parse_rustc_identity,
         preflight_performance_baselines, qualification_test_arguments,
@@ -13720,6 +13924,21 @@ mod tests {
     }
 
     #[test]
+    fn opcode_prefix_does_not_match_shared_memory_suffixes() {
+        let store = "\tst.shared.b32 \t[%r1], %r2;\n";
+        assert!(!names_opcode(store, "red."));
+        assert!(!names_opcode(store, "atom."));
+        assert!(names_opcode(
+            "\tred.global.add.u32 \t[%rd1], %r2;\n",
+            "red."
+        ));
+        assert!(names_opcode(
+            "\tatom.shared.add.u32 \t%r1, [%r2], %r3;\n",
+            "atom."
+        ));
+    }
+
+    #[test]
     fn baseline_preflight_lists_every_missing_file() {
         let root = workspace_root().unwrap();
         preflight_performance_baselines(root, ["qual/baselines/nvfp4-down-sm120.json"]).unwrap();
@@ -13837,6 +14056,7 @@ mod tests {
                 "qual/baselines/qwen38-flash-next-gdn-recurrence-sm120.txt",
                 "qual/baselines/qwen38-flash-next-qsa-prepare-sm120.txt",
                 "qual/baselines/qwen38-flash-next-qsa-attention-sm120.txt",
+                "qual/baselines/qwen38-flash-next-qsa-selection-sm120.txt",
                 "qual/baselines/attention-qk-prepare-sm120.txt",
                 "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",
                 "qual/baselines/qwen36-attention-qk-prepare-sm120.txt",
@@ -14571,6 +14791,12 @@ mod tests {
                 NO_SNAPSHOT,
             ),
             (
+                "qualify-qwen38-flash-next-qsa-selection",
+                "qwen38_flash_next_qsa_selection",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
                 "qualify-gdn-recurrence",
                 "gdn_recurrence::tests::route_inventory_and_arena_accounting_are_exact",
                 EXACT_SERIAL,
@@ -14777,7 +15003,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 89);
+        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 90);
 
         let snapshot = OsString::from("/snapshot");
         for &(command, filter, trailing, variable) in EXPECTED_QUALIFICATION_ROUTES {

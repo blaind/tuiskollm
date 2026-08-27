@@ -2249,3 +2249,332 @@ pub(crate) unsafe fn long_context_paged_gqa_reduce<A: Arch, const TOKENS: usize>
         element += 1;
     }
 }
+
+/// Runs one exact decode step over a selected-position list.
+///
+/// The body is `paged_gqa_partitioned` with its contiguous position walk
+/// replaced by an indirection through `selected`. The slice division, the
+/// per-position online-softmax order and the ascending slice merge are
+/// unchanged, so a list that names every visible position in ascending order
+/// reproduces the dense route's bits exactly, which makes the
+/// selection route admissible below the indexer's budget.
+///
+/// # Safety
+///
+/// Every plane must address one complete row per launched block, `selected`
+/// must cover `[TOKENS, selected_stride]` ascending positions, and every named
+/// position must be mapped by the token's block-table row.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn selected_paged_gqa_partitioned<A: Arch, const TOKENS: usize>(
+    query: *const f32,
+    key_pages: *const u8,
+    value_pages: *const u8,
+    block_tables: *const u32,
+    table_rows: *const u32,
+    table_stride: u32,
+    selected: *const u32,
+    selected_counts: *const u32,
+    selected_stride: u32,
+    output: *mut f32,
+    key_scale: f32,
+    value_scale: f32,
+    partials: *mut f32,
+) {
+    let block = thread::blockIdx_x() as usize;
+    let token = block / A::NUM_ATTENTION_HEADS;
+    if token >= TOKENS {
+        return;
+    }
+    let query_head = block - token * A::NUM_ATTENTION_HEADS;
+    let kv_head = query_head / (A::NUM_ATTENTION_HEADS / A::NUM_KV_HEADS);
+    let tid = thread::threadIdx_x() as usize;
+    let warp_index = tid / WARP_THREADS;
+    let lane = tid & (WARP_THREADS - 1);
+    let dimension = lane * VALUES_PER_LANE;
+    let query = unsafe {
+        query.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
+    };
+    let output = unsafe {
+        output.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
+    };
+    let table_row = unsafe { *table_rows.add(token) as usize };
+    let block_table = unsafe { block_tables.add(table_row * table_stride as usize) };
+    let selected = unsafe { selected.add(token * selected_stride as usize) };
+    let length = unsafe { *selected_counts.add(token) as usize };
+    let q = unsafe {
+        [
+            *query,
+            *query.add(1),
+            *query.add(2),
+            *query.add(3),
+            *query.add(4),
+            *query.add(5),
+            *query.add(6),
+            *query.add(7),
+        ]
+    };
+    let slice_positions = length.div_ceil(DECODE_WARPS);
+    let slice_begin = warp_index * slice_positions;
+    let slice_end = core::cmp::min(slice_begin + slice_positions, length);
+    let mut accumulator = [0.0f32; VALUES_PER_LANE];
+    let mut maximum = -1.0e30f32;
+    let mut denominator = 0.0f32;
+    let mut entry = slice_begin;
+
+    while entry < slice_end {
+        let position = unsafe { *selected.add(entry) as usize };
+        let physical_page = unsafe { *block_table.add(position / PAGE_SIZE) as usize };
+        let page_offset = position & (PAGE_SIZE - 1);
+        let cache_element = A::HEAD_DIM
+            * (page_offset + PAGE_SIZE * (kv_head + A::NUM_KV_HEADS * physical_page))
+            + dimension;
+        let key = unsafe { load_e4m3x8(key_pages.add(cache_element), key_scale) };
+        let value = unsafe { load_e4m3x8(value_pages.add(cache_element), value_scale) };
+        let mut score = 0.0f32;
+        let mut element = 0usize;
+        while element < VALUES_PER_LANE {
+            score = float::fma_rn_f32(q[element], key[element], score);
+            element += 1;
+        }
+        score = warp::reduce_sum_f32(score) * 0.0625;
+
+        if score > maximum {
+            let old_scale = fast_exp(maximum - score);
+            denominator = denominator * old_scale + 1.0;
+            maximum = score;
+            element = 0;
+            while element < VALUES_PER_LANE {
+                accumulator[element] =
+                    float::fma_rn_f32(1.0, value[element], accumulator[element] * old_scale);
+                element += 1;
+            }
+        } else {
+            let weight = fast_exp(score - maximum);
+            denominator += weight;
+            element = 0;
+            while element < VALUES_PER_LANE {
+                accumulator[element] =
+                    float::fma_rn_f32(weight, value[element], accumulator[element]);
+                element += 1;
+            }
+        }
+        entry += 1;
+    }
+
+    let partial_base = warp_index * DECODE_PARTIAL_VALUES;
+    if lane == 0 {
+        unsafe {
+            *partials.add(partial_base) = maximum;
+            *partials.add(partial_base + 1) = denominator;
+        }
+    }
+    let mut element = 0usize;
+    while element < VALUES_PER_LANE {
+        unsafe { *partials.add(partial_base + 2 + dimension + element) = accumulator[element] };
+        element += 1;
+    }
+    thread::sync_threads();
+    if warp_index != 0 {
+        return;
+    }
+
+    let mut merged = [0.0f32; VALUES_PER_LANE];
+    let mut merged_maximum = -1.0e30f32;
+    let mut merged_denominator = 0.0f32;
+    let mut slice = 0usize;
+    while slice < DECODE_WARPS {
+        let base = slice * DECODE_PARTIAL_VALUES;
+        let slice_denominator = unsafe { *partials.add(base + 1) };
+        if slice_denominator > 0.0 {
+            let slice_maximum = unsafe { *partials.add(base) };
+            let next_maximum = merged_maximum.max(slice_maximum);
+            let old_scale = fast_exp(merged_maximum - next_maximum);
+            let slice_scale = fast_exp(slice_maximum - next_maximum);
+            merged_denominator = merged_denominator * old_scale + slice_denominator * slice_scale;
+            merged_maximum = next_maximum;
+            let mut element = 0usize;
+            while element < VALUES_PER_LANE {
+                merged[element] = float::fma_rn_f32(
+                    unsafe { *partials.add(base + 2 + dimension + element) },
+                    slice_scale,
+                    merged[element] * old_scale,
+                );
+                element += 1;
+            }
+        }
+        slice += 1;
+    }
+
+    let mut element = 0usize;
+    while element < VALUES_PER_LANE {
+        unsafe { *output.add(element) = merged[element] / merged_denominator };
+        element += 1;
+    }
+}
+
+/// Runs one exact prompt tile over per-row selected-position lists.
+///
+/// The body is `paged_gqa_prefill_shared` at `TOKEN_GROUP = 1` with the tile
+/// gathering `PREFILL_KEY_TILE` *selected* positions instead of a contiguous
+/// span. Each row keeps one ascending online-softmax chain, so a list naming
+/// every visible position reproduces the dense route's bits.
+///
+/// # Safety
+///
+/// Carries `paged_gqa_prefill_shared`'s contract, plus: `selected` covers
+/// `[TOKENS, selected_stride]` ascending positions and every named position is
+/// mapped by the token's block-table row.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn selected_paged_gqa_prefill_shared<
+    A: Arch,
+    const TOKENS: usize,
+    const QUERY_WARPS: usize,
+>(
+    query: *const f32,
+    key_pages: *const u8,
+    value_pages: *const u8,
+    block_tables: *const u32,
+    table_rows: *const u32,
+    table_stride: u32,
+    selected: *const u32,
+    selected_counts: *const u32,
+    selected_stride: u32,
+    output: *mut f32,
+    key_scale: f32,
+    value_scale: f32,
+) {
+    let block = thread::blockIdx_x() as usize;
+    let token = block / A::NUM_KV_HEADS;
+    let kv_head = block - token * A::NUM_KV_HEADS;
+    if token >= TOKENS {
+        return;
+    }
+    let tid = thread::threadIdx_x() as usize;
+    let warp_index = tid / WARP_THREADS;
+    let lane = tid & (WARP_THREADS - 1);
+    let query_head = kv_head * QUERY_WARPS + warp_index;
+    let dimension = lane * VALUES_PER_LANE;
+    let query = unsafe {
+        query.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
+    };
+    let output = unsafe {
+        output.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
+    };
+    let table_row = unsafe { *table_rows.add(token) as usize };
+    let block_table = unsafe { block_tables.add(table_row * table_stride as usize) };
+    let selected = unsafe { selected.add(token * selected_stride as usize) };
+    let length = unsafe { *selected_counts.add(token) as usize };
+    let q = unsafe {
+        [
+            *query,
+            *query.add(1),
+            *query.add(2),
+            *query.add(3),
+            *query.add(4),
+            *query.add(5),
+            *query.add(6),
+            *query.add(7),
+        ]
+    };
+    let shared = DynamicSharedArray::<u32, 16>::get();
+    let shared_bytes = shared.cast::<u8>();
+    let mut accumulator = [0.0f32; VALUES_PER_LANE];
+    let mut maximum = -1.0e30f32;
+    let mut denominator = 0.0f32;
+    let mut tile_entry = 0usize;
+
+    while tile_entry < length {
+        let mut task = tid;
+        while task < 2 * PREFILL_KEY_TILE * (A::HEAD_DIM / 16) {
+            let plane = task / (PREFILL_KEY_TILE * (A::HEAD_DIM / 16));
+            let within_plane = task - plane * PREFILL_KEY_TILE * (A::HEAD_DIM / 16);
+            let entry_in_tile = within_plane / (A::HEAD_DIM / 16);
+            let dimension_segment = within_plane - entry_in_tile * (A::HEAD_DIM / 16);
+            let entry = tile_entry + entry_in_tile;
+            let valid = entry < length;
+            let position = if valid {
+                unsafe { *selected.add(entry) as usize }
+            } else {
+                0
+            };
+            let physical_page = if valid {
+                unsafe { *block_table.add(position / PAGE_SIZE) as usize }
+            } else {
+                0
+            };
+            let cache_element = A::HEAD_DIM
+                * ((position & (PAGE_SIZE - 1))
+                    + PAGE_SIZE * (kv_head + A::NUM_KV_HEADS * physical_page))
+                + dimension_segment * 16;
+            let source = if plane == 0 { key_pages } else { value_pages };
+            let destination_word = plane * PREFILL_PLANE_WORDS
+                + entry_in_tile * (A::HEAD_DIM / size_of::<u32>())
+                + dimension_segment * (16 / size_of::<u32>());
+            unsafe {
+                cp_async_cg_zfill_16(
+                    shared.add(destination_word),
+                    source.add(cache_element),
+                    if valid { 16 } else { 0 },
+                );
+            }
+            task += WARP_THREADS * QUERY_WARPS;
+        }
+        unsafe {
+            cp_async_commit_group();
+            cp_async_wait_group(0);
+        }
+        thread::sync_threads();
+
+        let tile_end = core::cmp::min(tile_entry + PREFILL_KEY_TILE, length);
+        let mut entry = tile_entry;
+        while entry < tile_end {
+            let tile_element = (entry - tile_entry) * A::HEAD_DIM + dimension;
+            let key = unsafe { load_e4m3x8(shared_bytes.add(tile_element), key_scale) };
+            let value = unsafe {
+                load_e4m3x8(
+                    shared_bytes.add(PREFILL_PLANE_WORDS * size_of::<u32>() + tile_element),
+                    value_scale,
+                )
+            };
+            let mut score = 0.0f32;
+            let mut element = 0usize;
+            while element < VALUES_PER_LANE {
+                score = float::fma_rn_f32(q[element], key[element], score);
+                element += 1;
+            }
+            score = warp::reduce_sum_f32(score) * 0.0625;
+
+            if score > maximum {
+                let old_scale = fast_exp(maximum - score);
+                denominator = denominator * old_scale + 1.0;
+                maximum = score;
+                element = 0;
+                while element < VALUES_PER_LANE {
+                    accumulator[element] =
+                        float::fma_rn_f32(1.0, value[element], accumulator[element] * old_scale);
+                    element += 1;
+                }
+            } else {
+                let weight = fast_exp(score - maximum);
+                denominator += weight;
+                element = 0;
+                while element < VALUES_PER_LANE {
+                    accumulator[element] =
+                        float::fma_rn_f32(weight, value[element], accumulator[element]);
+                    element += 1;
+                }
+            }
+            entry += 1;
+        }
+        thread::sync_threads();
+        tile_entry += PREFILL_KEY_TILE;
+    }
+
+    let mut element = 0usize;
+    while element < VALUES_PER_LANE {
+        unsafe { *output.add(element) = accumulator[element] / denominator };
+        element += 1;
+    }
+}
