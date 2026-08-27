@@ -7,6 +7,7 @@ use crate::device::paged_gqa::{
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_model::{Arch, Qwen38_27B};
 
@@ -27,10 +28,6 @@ pub const LONG_CONTEXT_GQA_MAX_TOKENS: usize = LONG_CONTEXT_MAX_TOKENS;
 pub const LONG_CONTEXT_GQA_PARTITION_SIZE: usize = LONG_CONTEXT_PARTITION_SIZE;
 /// Maximum partials retained per token and query head.
 pub const LONG_CONTEXT_GQA_MAX_PARTITIONS: usize = LONG_CONTEXT_MAX_PARTITIONS;
-
-fn admitted_batch(batch: usize) -> bool {
-    (1..=MAX_BATCH).contains(&batch)
-}
 
 fn partition_bucket(maximum_length: usize) -> Option<usize> {
     if !(1..=LONG_CONTEXT_MAX_TOKENS).contains(&maximum_length) {
@@ -266,17 +263,37 @@ impl<A: Arch, const TOKENS: usize> PreparedRoute<A, TOKENS> {
     }
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_long_context_paged_gqa),
+    required(1, 2, 3, 4, 5, 6, 7, 8),
+    inventory(false)
+)]
+struct LongContextPagedGqaRoutes<A: Arch> {
+    #[route(1)]
+    b1: PreparedRoute<A, 1>,
+    #[route(2)]
+    b2: PreparedRoute<A, 2>,
+    #[route(3)]
+    b3: PreparedRoute<A, 3>,
+    #[route(4)]
+    b4: PreparedRoute<A, 4>,
+    #[route(5)]
+    b5: PreparedRoute<A, 5>,
+    #[route(6)]
+    b6: PreparedRoute<A, 6>,
+    #[route(7)]
+    b7: PreparedRoute<A, 7>,
+    #[route(8)]
+    b8: PreparedRoute<A, 8>,
+}
+
 /// Prepared partitioned paged GQA decode routes for exact `B=1..8`.
 pub struct LongContextPagedGqaOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
-    b1: PreparedRoute<A, 1>,
-    b2: PreparedRoute<A, 2>,
-    b3: PreparedRoute<A, 3>,
-    b4: PreparedRoute<A, 4>,
-    b5: PreparedRoute<A, 5>,
-    b6: PreparedRoute<A, 6>,
-    b7: PreparedRoute<A, 7>,
-    b8: PreparedRoute<A, 8>,
+    routes: LongContextPagedGqaRoutes<A>,
 }
 
 impl<A: Sm120Arch> LongContextPagedGqaOp<A> {
@@ -289,14 +306,7 @@ impl<A: Sm120Arch> LongContextPagedGqaOp<A> {
             .map_err(|source| GpuError::module("loading long-context paged GQA", source))?;
 
         Ok(Self {
-            b1: PreparedRoute::prepare(&module)?,
-            b2: PreparedRoute::prepare(&module)?,
-            b3: PreparedRoute::prepare(&module)?,
-            b4: PreparedRoute::prepare(&module)?,
-            b5: PreparedRoute::prepare(&module)?,
-            b6: PreparedRoute::prepare(&module)?,
-            b7: PreparedRoute::prepare(&module)?,
-            b8: PreparedRoute::prepare(&module)?,
+            routes: LongContextPagedGqaRoutes::prepare(&module)?,
             module,
         })
     }
@@ -333,7 +343,7 @@ impl<A: Sm120Arch> LongContextPagedGqaOp<A> {
         key_scale: f32,
         value_scale: f32,
     ) -> GpuResult<()> {
-        if !admitted_batch(batch) {
+        if !LongContextPagedGqaRoutes::<A>::contains(batch) {
             return Err(GpuError::invalid_launch(format!(
                 "long-context paged GQA batch {batch} is outside the admitted range 1..={MAX_BATCH}"
             )));
@@ -362,42 +372,31 @@ impl<A: Sm120Arch> LongContextPagedGqaOp<A> {
             ));
         }
 
-        macro_rules! launch {
-            ($route:ident) => {
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        partitions,
-                        query,
-                        key_pages,
-                        value_pages,
-                        block_tables,
-                        table_rows,
-                        table_stride,
-                        lengths,
-                        partial_maximum,
-                        partial_denominator,
-                        partial_numerator,
-                        output,
-                        key_scale,
-                        value_scale,
-                    )
-                }
-            };
-        }
-
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            _ => unreachable!(),
-        }
+        dispatch_long_context_paged_gqa!(
+            &self.routes,
+            batch,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    partitions,
+                    query,
+                    key_pages,
+                    value_pages,
+                    block_tables,
+                    table_rows,
+                    table_stride,
+                    lengths,
+                    partial_maximum,
+                    partial_denominator,
+                    partial_numerator,
+                    output,
+                    key_scale,
+                    value_scale,
+                )
+            },
+            else => unreachable!()
+        )
     }
 }
 
@@ -428,15 +427,17 @@ mod tests {
     use super::{
         LONG_CONTEXT_GQA_MAX_PARTITIONS, LONG_CONTEXT_GQA_MAX_TOKENS,
         LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE,
-        REDUCTION_SHARED_BYTES, admitted_batch, long_context_paged_gqa_ptx_names, partition_bucket,
+        LongContextPagedGqaRoutes, REDUCTION_SHARED_BYTES, long_context_paged_gqa_ptx_names,
+        partition_bucket,
     };
     use std::collections::BTreeSet;
 
     #[test]
     fn batch_and_partition_routes_are_exact() {
-        for (batch, expected) in [(0, false), (1, true), (4, true), (8, true), (9, false)] {
-            assert_eq!(admitted_batch(batch), expected, "batch={batch}");
-        }
+        assert_eq!(
+            LongContextPagedGqaRoutes::<tuisko_model::Qwen38_27B>::admitted_rows(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
         assert_eq!(LONG_CONTEXT_GQA_PARTITION_SIZE, 256);
         assert_eq!(LONG_CONTEXT_GQA_MAX_TOKENS, 220_000);
         assert_eq!(LONG_CONTEXT_GQA_MAX_PARTITIONS, 860);

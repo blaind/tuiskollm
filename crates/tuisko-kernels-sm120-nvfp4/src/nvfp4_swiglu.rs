@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tuisko_gpu::{
     CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, LaunchConfig2D, PreparedLaunch,
 };
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
@@ -2098,6 +2099,52 @@ pub(crate) fn qwen35_nvfp4_swiglu_ptx_names() -> [&'static str; 28] {
     ]
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_nvfp4_swiglu_w4a4_decode),
+    required(1, 2, 3, 4, 5, 6, 7, 8),
+    inventory(false)
+)]
+struct Nvfp4SwiGluW4a4DecodeRoutes<A: Arch, E: Nvfp4SwiGluEntries<A>> {
+    #[route(1)]
+    b1: E::W4a4Decode<1>,
+    #[route(2)]
+    b2: E::W4a4Crossover<2>,
+    #[route(3)]
+    b3: E::W4a4Crossover<3>,
+    #[route(4)]
+    b4: E::W4a4Crossover<4>,
+    #[route(5)]
+    b5: E::W4a4Decode<5>,
+    #[route(6)]
+    b6: E::W4a4Decode<6>,
+    #[route(7)]
+    b7: E::W4a4Decode<7>,
+    #[route(8)]
+    b8: E::W4a4Decode<8>,
+}
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_nvfp4_swiglu_w4a4_prefill),
+    required(32, 64, 128, 1024),
+    inventory(false)
+)]
+struct Nvfp4SwiGluW4a4PrefillRoutes<A: Arch, E: Nvfp4SwiGluEntries<A>> {
+    #[route(32)]
+    t32: E::W4a4Prefill<32>,
+    #[route(64)]
+    t64: E::W4a4Prefill<64>,
+    #[route(128)]
+    t128: E::W4a4Prefill<128>,
+    #[route(1024)]
+    t1024: E::W4a4Prefill<1_024>,
+}
+
 /// Prepared A16 and W4A4 routes for one admitted architecture's exact NVFP4
 /// MLP gate/up operation.
 ///
@@ -2107,18 +2154,8 @@ pub struct Nvfp4SwiGluOp<A: Arch = Qwen38_27B, E: Nvfp4SwiGluEntries<A> = Qwen38
 {
     module: kernels::LoadedModule,
     a16: E::A16,
-    w4a4_b1: E::W4a4Decode<1>,
-    w4a4_b2: E::W4a4Crossover<2>,
-    w4a4_b3: E::W4a4Crossover<3>,
-    w4a4_b4: E::W4a4Crossover<4>,
-    w4a4_b5: E::W4a4Decode<5>,
-    w4a4_b6: E::W4a4Decode<6>,
-    w4a4_b7: E::W4a4Decode<7>,
-    w4a4_b8: E::W4a4Decode<8>,
-    w4a4_t32: E::W4a4Prefill<32>,
-    w4a4_t64: E::W4a4Prefill<64>,
-    w4a4_t128: E::W4a4Prefill<128>,
-    w4a4_t1024: E::W4a4Prefill<1_024>,
+    w4a4_decode: Nvfp4SwiGluW4a4DecodeRoutes<A, E>,
+    w4a4_prefill: Nvfp4SwiGluW4a4PrefillRoutes<A, E>,
 }
 
 /// Prepared production and comparison routes for exact Qwen3.5 NVFP4 gate/up.
@@ -2134,18 +2171,8 @@ impl<A: Arch, E: Nvfp4SwiGluEntries<A>> Nvfp4SwiGluOp<A, E> {
 
         Ok(Self {
             a16: E::A16::prepare(&module)?,
-            w4a4_b1: E::W4a4Decode::<1>::prepare(&module)?,
-            w4a4_b2: E::W4a4Crossover::<2>::prepare(&module)?,
-            w4a4_b3: E::W4a4Crossover::<3>::prepare(&module)?,
-            w4a4_b4: E::W4a4Crossover::<4>::prepare(&module)?,
-            w4a4_b5: E::W4a4Decode::<5>::prepare(&module)?,
-            w4a4_b6: E::W4a4Decode::<6>::prepare(&module)?,
-            w4a4_b7: E::W4a4Decode::<7>::prepare(&module)?,
-            w4a4_b8: E::W4a4Decode::<8>::prepare(&module)?,
-            w4a4_t32: E::W4a4Prefill::<32>::prepare(&module)?,
-            w4a4_t64: E::W4a4Prefill::<64>::prepare(&module)?,
-            w4a4_t128: E::W4a4Prefill::<128>::prepare(&module)?,
-            w4a4_t1024: E::W4a4Prefill::<1_024>::prepare(&module)?,
+            w4a4_decode: Nvfp4SwiGluW4a4DecodeRoutes::prepare(&module)?,
+            w4a4_prefill: Nvfp4SwiGluW4a4PrefillRoutes::prepare(&module)?,
             module,
         })
     }
@@ -2186,11 +2213,11 @@ impl<A: Arch, E: Nvfp4SwiGluEntries<A>> Nvfp4SwiGluOp<A, E> {
         }
         check_weight_divisor::<A, E>(weight_scale_divisor)?;
 
-        macro_rules! w4a4 {
-            ($route:ident) => {
+        macro_rules! launch_w4a4 {
+            ($route:expr) => {
                 // SAFETY: the public method's pointer contract is unchanged by dispatch.
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         input,
@@ -2222,18 +2249,17 @@ impl<A: Arch, E: Nvfp4SwiGluEntries<A>> Nvfp4SwiGluOp<A, E> {
                     )
                 }
             }
-            SwiGluRoute::W4a4B1 => w4a4!(w4a4_b1),
-            SwiGluRoute::W4a4B2 => w4a4!(w4a4_b2),
-            SwiGluRoute::W4a4B3 => w4a4!(w4a4_b3),
-            SwiGluRoute::W4a4B4 => w4a4!(w4a4_b4),
-            SwiGluRoute::W4a4B5 => w4a4!(w4a4_b5),
-            SwiGluRoute::W4a4B6 => w4a4!(w4a4_b6),
-            SwiGluRoute::W4a4B7 => w4a4!(w4a4_b7),
-            SwiGluRoute::W4a4B8 => w4a4!(w4a4_b8),
-            SwiGluRoute::W4a4T32 => w4a4!(w4a4_t32),
-            SwiGluRoute::W4a4T64 => w4a4!(w4a4_t64),
-            SwiGluRoute::W4a4T128 => w4a4!(w4a4_t128),
-            SwiGluRoute::W4a4T1024 => w4a4!(w4a4_t1024),
+            _ => dispatch_nvfp4_swiglu_w4a4_decode!(
+                &self.w4a4_decode,
+                rows,
+                |route| launch_w4a4!(route),
+                else => dispatch_nvfp4_swiglu_w4a4_prefill!(
+                    &self.w4a4_prefill,
+                    rows,
+                    |route| launch_w4a4!(route),
+                    else => unreachable!()
+                )
+            ),
         }
     }
 
@@ -2302,39 +2328,27 @@ impl Qwen35Nvfp4SwiGluOp {
         check_input_divisor::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>(input_scale_divisor)?;
         check_weight_divisor::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>(weight_scale_divisor)?;
 
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: the public method's pointer contract is unchanged by dispatch.
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        activation_codes,
-                        activation_scales,
-                        weight_codes,
-                        weight_scales,
-                        input_scale_divisor,
-                        weight_scale_divisor,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match batch {
-            1 => launch!(w4a4_b1),
-            2 => launch!(w4a4_b2),
-            3 => launch!(w4a4_b3),
-            4 => launch!(w4a4_b4),
-            5 => launch!(w4a4_b5),
-            6 => launch!(w4a4_b6),
-            7 => launch!(w4a4_b7),
-            8 => launch!(w4a4_b8),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_nvfp4_swiglu_w4a4_decode!(
+            &self.w4a4_decode,
+            batch,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    input_scale_divisor,
+                    weight_scale_divisor,
+                    output,
+                )
+            },
+            else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.5 NVFP4 W4A4 batch {batch} is not an exact B=1..={MAX_BATCH} route"
-            ))),
-        }
+            )))
+        )
     }
 
     /// Quantizes and executes W4A4 at exact `T=32,64,128,1024`.
@@ -2364,33 +2378,26 @@ impl Qwen35Nvfp4SwiGluOp {
         check_input_divisor::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>(input_scale_divisor)?;
         check_weight_divisor::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>(weight_scale_divisor)?;
 
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: the public method's pointer contract is unchanged by dispatch.
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        activation_codes,
-                        activation_scales,
-                        weight_codes,
-                        weight_scales,
-                        input_scale_divisor,
-                        weight_scale_divisor,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match route {
-            SwiGluRoute::W4a4T32 => launch!(w4a4_t32),
-            SwiGluRoute::W4a4T64 => launch!(w4a4_t64),
-            SwiGluRoute::W4a4T128 => launch!(w4a4_t128),
-            SwiGluRoute::W4a4T1024 => launch!(w4a4_t1024),
-            _ => unreachable!("prefill_route only selects the exact T routes"),
-        }
+        let _ = route;
+        dispatch_nvfp4_swiglu_w4a4_prefill!(
+            &self.w4a4_prefill,
+            rows,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    input_scale_divisor,
+                    weight_scale_divisor,
+                    output,
+                )
+            },
+            else => unreachable!()
+        )
     }
 }
 
@@ -2428,7 +2435,8 @@ fn check_weight_divisor<A: Arch, E: Nvfp4SwiGluEntries<A>>(divisor: f32) -> GpuR
 #[cfg(test)]
 mod tests {
     use super::{
-        A16Slot, GROUP_K, MAX_BATCH, Nvfp4SwiGluEntries, PREFILL_ROWS, Qwen35Nvfp4SwiGluEntries,
+        A16Slot, GROUP_K, MAX_BATCH, Nvfp4SwiGluEntries, Nvfp4SwiGluW4a4DecodeRoutes,
+        Nvfp4SwiGluW4a4PrefillRoutes, PREFILL_ROWS, Qwen35Nvfp4SwiGluEntries,
         Qwen38Nvfp4SwiGluEntries, ROWS_PER_BRANCH, SwiGluRoute, W4A4_THREADS, a16_launch_config,
         a16_slot, check_input_divisor, check_weight_divisor, nvfp4_swiglu_ptx_names, prefill_route,
         qwen35_nvfp4_swiglu_ptx_names, validates_input_divisor, w4a4_launch_configs,
@@ -2640,6 +2648,14 @@ mod tests {
                 (128, SwiGluRoute::W4a4T128),
                 (1_024, SwiGluRoute::W4a4T1024),
             ]
+        );
+        assert_eq!(
+            Nvfp4SwiGluW4a4DecodeRoutes::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>::admitted_rows(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            Nvfp4SwiGluW4a4PrefillRoutes::<Qwen35_9B, Qwen35Nvfp4SwiGluEntries>::admitted_rows(),
+            PREFILL_ROWS
         );
     }
 

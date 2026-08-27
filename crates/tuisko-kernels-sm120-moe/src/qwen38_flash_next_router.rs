@@ -8,6 +8,7 @@
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_model::{Arch, Qwen38FlashNext};
 
 const MAX_BATCH: usize = 8;
@@ -36,10 +37,6 @@ const _: () = assert!(OWNED == 16);
 const _: () = assert!(HIDDEN.is_multiple_of(64));
 const _: () = assert!(EXPERTS.is_multiple_of(PROJECTION_WARPS));
 const _: () = assert!(EXPERTS.is_multiple_of(SELECT_THREADS as usize));
-
-fn admitted_rows(rows: usize) -> bool {
-    (1..=MAX_BATCH).contains(&rows) || PREFILL_ROWS.contains(&rows)
-}
 
 #[cuda_module]
 mod kernels {
@@ -581,21 +578,45 @@ pub(crate) fn qwen38_flash_next_moe_router_ptx_names() -> Vec<&'static str> {
     names
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen38_flash_next_moe_router),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
+    inventory(false)
+)]
+struct Qwen38FlashNextMoeRouterRoutes {
+    #[route(1)]
+    b1: PreparedBatchRoute<1>,
+    #[route(2)]
+    b2: PreparedBatchRoute<2>,
+    #[route(3)]
+    b3: PreparedBatchRoute<3>,
+    #[route(4)]
+    b4: PreparedBatchRoute<4>,
+    #[route(5)]
+    b5: PreparedBatchRoute<5>,
+    #[route(6)]
+    b6: PreparedBatchRoute<6>,
+    #[route(7)]
+    b7: PreparedBatchRoute<7>,
+    #[route(8)]
+    b8: PreparedBatchRoute<8>,
+    #[route(32)]
+    t32: PreparedPrefillRoute<32>,
+    #[route(64)]
+    t64: PreparedPrefillRoute<64>,
+    #[route(128)]
+    t128: PreparedPrefillRoute<128>,
+    #[route(1024)]
+    t1024: PreparedPrefillRoute<1024>,
+}
+
 /// Prepared exact-batch Qwen3.8-Flash-Next BF16 router routes on SM120.
 pub struct Qwen38FlashNextMoeRouterOp {
     module: kernels::LoadedModule,
-    b1: PreparedBatchRoute<1>,
-    b2: PreparedBatchRoute<2>,
-    b3: PreparedBatchRoute<3>,
-    b4: PreparedBatchRoute<4>,
-    b5: PreparedBatchRoute<5>,
-    b6: PreparedBatchRoute<6>,
-    b7: PreparedBatchRoute<7>,
-    b8: PreparedBatchRoute<8>,
-    t32: PreparedPrefillRoute<32>,
-    t64: PreparedPrefillRoute<64>,
-    t128: PreparedPrefillRoute<128>,
-    t1024: PreparedPrefillRoute<1024>,
+    routes: Qwen38FlashNextMoeRouterRoutes,
 }
 
 impl Qwen38FlashNextMoeRouterOp {
@@ -607,18 +628,7 @@ impl Qwen38FlashNextMoeRouterOp {
         })?;
 
         Ok(Self {
-            b1: PreparedBatchRoute::prepare(&module)?,
-            b2: PreparedBatchRoute::prepare(&module)?,
-            b3: PreparedBatchRoute::prepare(&module)?,
-            b4: PreparedBatchRoute::prepare(&module)?,
-            b5: PreparedBatchRoute::prepare(&module)?,
-            b6: PreparedBatchRoute::prepare(&module)?,
-            b7: PreparedBatchRoute::prepare(&module)?,
-            b8: PreparedBatchRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
-            t1024: PreparedPrefillRoute::prepare(&module)?,
+            routes: Qwen38FlashNextMoeRouterRoutes::prepare(&module)?,
             module,
         })
     }
@@ -647,52 +657,32 @@ impl Qwen38FlashNextMoeRouterOp {
         expert_indices: *mut u16,
         expert_weights: *mut u16,
     ) -> GpuResult<()> {
-        if !admitted_rows(rows) {
-            return Err(GpuError::invalid_launch(format!(
+        dispatch_qwen38_flash_next_moe_router!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    input,
+                    weights,
+                    logits,
+                    expert_indices,
+                    expert_weights,
+                )
+            },
+            else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.8-Flash-Next MoE router row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128,1024"
-            )));
-        }
-        macro_rules! launch {
-            ($route:ident) => {
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        weights,
-                        logits,
-                        expert_indices,
-                        expert_weights,
-                    )
-                }
-            };
-        }
-
-        match rows {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            1_024 => launch!(t1024),
-            _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.8-Flash-Next MoE router row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128,1024"
-            ))),
-        }
+            )))
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPERT_BLOCKS, MAX_BATCH, OWNED, PREFILL_ROWS, WORDS_PER_ROW, admitted_rows,
-        qwen38_flash_next_moe_router_ptx_names,
+        EXPERT_BLOCKS, MAX_BATCH, OWNED, PREFILL_ROWS, Qwen38FlashNextMoeRouterRoutes,
+        WORDS_PER_ROW, qwen38_flash_next_moe_router_ptx_names,
     };
     use std::collections::BTreeSet;
 
@@ -712,23 +702,9 @@ mod tests {
 
     #[test]
     fn row_table_covers_only_exact_decode_and_prefill_routes() {
-        for (rows, expected) in [
-            (0, false),
-            (1, true),
-            (8, true),
-            (9, false),
-            (16, false),
-            (32, true),
-            (33, false),
-            (64, true),
-            (65, false),
-            (128, true),
-            (129, false),
-            (512, false),
-            (1_024, true),
-            (1_025, false),
-        ] {
-            assert_eq!(admitted_rows(rows), expected, "rows={rows}");
-        }
+        assert_eq!(
+            Qwen38FlashNextMoeRouterRoutes::admitted_rows(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]
+        );
     }
 }

@@ -9,6 +9,7 @@ use crate::down_tma::{
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_model::{Arch, Qwen38_27B};
 
@@ -22,10 +23,6 @@ const T32_THREADS: u32 = 128;
 const T64_THREADS: u32 = 256;
 const T32_SHARED_BYTES: u32 = 24_576;
 const T64_SHARED_BYTES: u32 = 32_768;
-
-fn admitted_batch(batch: usize) -> bool {
-    (1..=MAX_BATCH).contains(&batch)
-}
 
 fn require_geometry<A: Arch>() -> GpuResult<()> {
     if A::INTERMEDIATE == 0
@@ -259,23 +256,157 @@ impl<A: Arch, const TOKENS: usize> PreparedRoute<A, TOKENS> {
     }
 }
 
+macro_rules! define_prefill_route {
+    ($name:ident, $tokens:literal, $kernel:ty, $prepare:ident, $block_multiplier:literal, $threads:expr, $shared:expr, $launch:ident) => {
+        struct $name<A: Arch> {
+            quantize: PreparedLaunch<kernels::__fp8_down_quantize_CudaKernel<A>>,
+            projection: PreparedLaunch<$kernel>,
+        }
+
+        impl<A: Arch> $name<A> {
+            fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+                let output_tiles =
+                    u32::try_from(A::HIDDEN / PREFILL_OUTPUT_ROWS).map_err(|_| {
+                        GpuError::invalid_launch("dense-FP8 down rows exceed grid width")
+                    })?;
+
+                Ok(Self {
+                    quantize: prepare_quantize::<A, $tokens>(module)?,
+                    projection: module
+                        .$prepare(LaunchConfig1D::new(
+                            $block_multiplier * output_tiles,
+                            $threads,
+                            $shared,
+                        ))
+                        .map_err(|source| {
+                            GpuError::launch(
+                                concat!("preparing dense-FP8 down T=", stringify!($tokens)),
+                                source,
+                            )
+                        })?,
+                })
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            unsafe fn launch(
+                &self,
+                module: &kernels::LoadedModule,
+                stream: &CudaStream,
+                input: *const u16,
+                activation_codes: *mut u8,
+                activation_scales: *mut f32,
+                weight_codes: *const u8,
+                weight_scales: *const u16,
+                output: *mut u16,
+            ) -> GpuResult<()> {
+                module
+                    .fp8_down_quantize::<A>(
+                        stream,
+                        &self.quantize,
+                        input.cast::<u32>(),
+                        activation_codes.cast::<u16>(),
+                        activation_scales,
+                    )
+                    .map_err(|source| {
+                        GpuError::launch("launching dense-FP8 down quantization", source)
+                    })?;
+                module
+                    .$launch(
+                        stream,
+                        &self.projection,
+                        activation_codes.cast::<u32>(),
+                        activation_scales,
+                        weight_codes.cast::<u32>(),
+                        weight_scales,
+                        output,
+                        (A::INTERMEDIATE / 4 / PREFILL_K_WORDS) as u32,
+                    )
+                    .map_err(|source| GpuError::launch("launching dense-FP8 down tail", source))
+            }
+        }
+    };
+}
+
+define_prefill_route!(
+    PreparedT32Route,
+    32,
+    kernels::__fp8_down_mma_t32_CudaKernel,
+    prepare_fp8_down_mma_t32,
+    1,
+    T32_THREADS,
+    T32_SHARED_BYTES,
+    fp8_down_mma_t32
+);
+define_prefill_route!(
+    PreparedT64Route,
+    64,
+    kernels::__fp8_down_mma_t64_CudaKernel,
+    prepare_fp8_down_mma_t64,
+    1,
+    T64_THREADS,
+    T64_SHARED_BYTES,
+    fp8_down_mma_t64
+);
+define_prefill_route!(
+    PreparedT128Route,
+    128,
+    kernels::__fp8_down_mma_t128_CudaKernel,
+    prepare_fp8_down_mma_t128,
+    2,
+    T64_THREADS,
+    T64_SHARED_BYTES,
+    fp8_down_mma_t128
+);
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_fp8_down_decode),
+    required(1, 2, 3, 4, 5, 6, 7, 8),
+    inventory(false)
+)]
+struct DenseFp8DownDecodeRoutes<A: Arch> {
+    #[route(1)]
+    b1: PreparedRoute<A, 1>,
+    #[route(2)]
+    b2: PreparedRoute<A, 2>,
+    #[route(3)]
+    b3: PreparedRoute<A, 3>,
+    #[route(4)]
+    b4: PreparedRoute<A, 4>,
+    #[route(5)]
+    b5: PreparedRoute<A, 5>,
+    #[route(6)]
+    b6: PreparedRoute<A, 6>,
+    #[route(7)]
+    b7: PreparedRoute<A, 7>,
+    #[route(8)]
+    b8: PreparedRoute<A, 8>,
+}
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_fp8_down_prefill),
+    required(32, 64, 128),
+    inventory(false)
+)]
+struct DenseFp8DownPrefillRoutes<A: Arch> {
+    #[route(32)]
+    t32: PreparedT32Route<A>,
+    #[route(64)]
+    t64: PreparedT64Route<A>,
+    #[route(128)]
+    t128: PreparedT128Route<A>,
+}
+
 /// Prepared source-native dense-FP8 down routes for every exact decode batch.
 pub struct DenseFp8DownOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
-    b1: PreparedRoute<A, 1>,
-    b2: PreparedRoute<A, 2>,
-    b3: PreparedRoute<A, 3>,
-    b4: PreparedRoute<A, 4>,
-    b5: PreparedRoute<A, 5>,
-    b6: PreparedRoute<A, 6>,
-    b7: PreparedRoute<A, 7>,
-    b8: PreparedRoute<A, 8>,
-    t32_quantize: PreparedLaunch<kernels::__fp8_down_quantize_CudaKernel<A>>,
-    t32: PreparedLaunch<kernels::__fp8_down_mma_t32_CudaKernel>,
-    t64_quantize: PreparedLaunch<kernels::__fp8_down_quantize_CudaKernel<A>>,
-    t64: PreparedLaunch<kernels::__fp8_down_mma_t64_CudaKernel>,
-    t128_quantize: PreparedLaunch<kernels::__fp8_down_quantize_CudaKernel<A>>,
-    t128: PreparedLaunch<kernels::__fp8_down_mma_t128_CudaKernel>,
+    decode_routes: DenseFp8DownDecodeRoutes<A>,
+    prefill_routes: DenseFp8DownPrefillRoutes<A>,
     t1024_quantize: PreparedLaunch<kernels::__fp8_down_quantize_CudaKernel<A>>,
     t1024: DenseFp8DownTmaRoute,
 }
@@ -288,42 +419,10 @@ impl<A: Sm120Arch> DenseFp8DownOp<A> {
         // SAFETY: this crate owns the embedded cuda-oxide module artifact.
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module("loading the dense-FP8 down module", source))?;
-        let output_tiles = u32::try_from(A::HIDDEN / PREFILL_OUTPUT_ROWS)
-            .map_err(|_| GpuError::invalid_launch("dense-FP8 down rows exceed grid width"))?;
 
         Ok(Self {
-            b1: PreparedRoute::prepare(&module)?,
-            b2: PreparedRoute::prepare(&module)?,
-            b3: PreparedRoute::prepare(&module)?,
-            b4: PreparedRoute::prepare(&module)?,
-            b5: PreparedRoute::prepare(&module)?,
-            b6: PreparedRoute::prepare(&module)?,
-            b7: PreparedRoute::prepare(&module)?,
-            b8: PreparedRoute::prepare(&module)?,
-            t32_quantize: prepare_quantize::<A, 32>(&module)?,
-            t32: module
-                .prepare_fp8_down_mma_t32(LaunchConfig1D::new(
-                    output_tiles,
-                    T32_THREADS,
-                    T32_SHARED_BYTES,
-                ))
-                .map_err(|source| GpuError::launch("preparing dense-FP8 down T=32", source))?,
-            t64_quantize: prepare_quantize::<A, 64>(&module)?,
-            t64: module
-                .prepare_fp8_down_mma_t64(LaunchConfig1D::new(
-                    output_tiles,
-                    T64_THREADS,
-                    T64_SHARED_BYTES,
-                ))
-                .map_err(|source| GpuError::launch("preparing dense-FP8 down T=64", source))?,
-            t128_quantize: prepare_quantize::<A, 128>(&module)?,
-            t128: module
-                .prepare_fp8_down_mma_t128(LaunchConfig1D::new(
-                    2 * output_tiles,
-                    T64_THREADS,
-                    T64_SHARED_BYTES,
-                ))
-                .map_err(|source| GpuError::launch("preparing dense-FP8 down T=128", source))?,
+            decode_routes: DenseFp8DownDecodeRoutes::prepare(&module)?,
+            prefill_routes: DenseFp8DownPrefillRoutes::prepare(&module)?,
             t1024_quantize: prepare_quantize::<A, MACRO_TOKENS>(&module)?,
             t1024: DenseFp8DownTmaRoute::new(context)?,
             module,
@@ -352,41 +451,25 @@ impl<A: Sm120Arch> DenseFp8DownOp<A> {
         weight_scales: *const u16,
         output: *mut u16,
     ) -> GpuResult<()> {
-        if !admitted_batch(batch) {
-            return Err(GpuError::invalid_launch(format!(
+        dispatch_fp8_down_decode!(
+            &self.decode_routes,
+            batch,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
+            else => Err(GpuError::invalid_launch(format!(
                 "dense-FP8 down batch {batch} is outside the admitted range 1..={MAX_BATCH}"
-            )));
-        }
-
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: exact-batch dispatch preserves the public pointer contract.
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        activation_codes,
-                        activation_scales,
-                        weight_codes,
-                        weight_scales,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            _ => unreachable!(),
-        }
+            )))
+        )
     }
 
     /// Dynamically quantizes and applies an exact T=32/64/128 down tail.
@@ -407,42 +490,25 @@ impl<A: Sm120Arch> DenseFp8DownOp<A> {
         weight_scales: *const u16,
         output: *mut u16,
     ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($quantize:ident, $projection:ident, $method:ident) => {{
-                self.module
-                    .fp8_down_quantize::<A>(
-                        stream,
-                        &self.$quantize,
-                        input.cast::<u32>(),
-                        activation_codes.cast::<u16>(),
-                        activation_scales,
-                    )
-                    .map_err(|source| {
-                        GpuError::launch("launching dense-FP8 down quantization", source)
-                    })?;
-                self.module
-                    .$method(
-                        stream,
-                        &self.$projection,
-                        activation_codes.cast::<u32>(),
-                        activation_scales,
-                        weight_codes.cast::<u32>(),
-                        weight_scales,
-                        output,
-                        (A::INTERMEDIATE / 4 / PREFILL_K_WORDS) as u32,
-                    )
-                    .map_err(|source| GpuError::launch("launching dense-FP8 down tail", source))
-            }};
-        }
-
-        match rows {
-            32 => launch!(t32_quantize, t32, fp8_down_mma_t32),
-            64 => launch!(t64_quantize, t64, fp8_down_mma_t64),
-            128 => launch!(t128_quantize, t128, fp8_down_mma_t128),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_fp8_down_prefill!(
+            &self.prefill_routes,
+            rows,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
+            else => Err(GpuError::invalid_launch(format!(
                 "dense-FP8 down tail row count {rows} is outside the admitted routes 32,64,128"
-            ))),
-        }
+            )))
+        )
     }
 
     /// Dynamically quantizes and applies the exact T=1024 TMA down route.
@@ -510,26 +576,23 @@ pub(crate) fn fp8_down_ptx_names() -> [&'static str; 13] {
 #[cfg(test)]
 mod tests {
     use super::{
-        PREFILL_K_SUBTILES, PREFILL_K_WORDS, T32_SHARED_BYTES, T32_THREADS, T64_SHARED_BYTES,
-        T64_THREADS, THREADS, WARPS, admitted_batch, fp8_down_ptx_names,
+        DenseFp8DownDecodeRoutes, DenseFp8DownPrefillRoutes, PREFILL_K_SUBTILES, PREFILL_K_WORDS,
+        T32_SHARED_BYTES, T32_THREADS, T64_SHARED_BYTES, T64_THREADS, THREADS, WARPS,
+        fp8_down_ptx_names,
     };
     use std::collections::BTreeSet;
     use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
     fn batch_table_covers_only_the_exact_decode_routes() {
-        let cases = [
-            (0, false),
-            (1, true),
-            (4, true),
-            (8, true),
-            (9, false),
-            (16, false),
-        ];
-
-        for (batch, expected) in cases {
-            assert_eq!(admitted_batch(batch), expected, "batch={batch}");
-        }
+        assert_eq!(
+            DenseFp8DownDecodeRoutes::<Qwen38_27B>::admitted_rows(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            DenseFp8DownPrefillRoutes::<Qwen38_27B>::admitted_rows(),
+            vec![32, 64, 128]
+        );
     }
 
     #[test]
