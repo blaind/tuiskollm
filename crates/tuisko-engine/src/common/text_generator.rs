@@ -379,6 +379,12 @@ impl<M: ModelProgram> SingleSlotTextGenerator<M> {
     }
 
     #[cfg(feature = "qualification")]
+    /// The loaded program and its execution stream for an in-process qualification sweep.
+    pub fn qualification_program_and_stream(&mut self) -> (&mut M, &CudaStream) {
+        (&mut self.program, &self.stream)
+    }
+
+    #[cfg(feature = "qualification")]
     /// The stream every replay this generator issues runs on.
     pub const fn qualification_stream(&self) -> &Arc<CudaStream> {
         &self.stream

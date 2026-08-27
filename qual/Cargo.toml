@@ -56,6 +56,11 @@ path = "src/bin/bench_qwen38_flash_next_prompt_prime.rs"
 required-features = ["device"]
 
 [[bin]]
+name = "bench-qwen38-flash-next"
+path = "src/bin/bench_flashnext.rs"
+required-features = ["device"]
+
+[[bin]]
 name = "bench-qwen38-flash-next-resident"
 path = "src/bin/bench_qwen38_flash_next_resident.rs"
 required-features = ["device"]

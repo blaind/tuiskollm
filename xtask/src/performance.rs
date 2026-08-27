@@ -684,7 +684,7 @@ fn validate_environment(
     report: &PerformanceReport,
     baseline: &PerformanceBaseline,
 ) -> Result<(), Box<dyn Error>> {
-    validate_common_environment(report, baseline)?;
+    validate_common_environment(report, baseline, true)?;
     for (name, candidate, authority) in [
         ("case policy", &report.case_policy, &baseline.case_policy),
         (
@@ -708,7 +708,7 @@ fn validate_diagnostic_environment(
     report: &PerformanceReport,
     baseline: &PerformanceBaseline,
 ) -> Result<(), Box<dyn Error>> {
-    validate_common_environment(report, baseline)?;
+    validate_common_environment(report, baseline, false)?;
     if baseline.case_policy != "complete_inventory" {
         return Err(format!(
             "diagnostic comparison requires a complete-inventory authority, found `{}`",
@@ -726,6 +726,9 @@ fn validate_diagnostic_environment(
         )
         .into());
     }
+    if report.samples < 3 {
+        return Err("diagnostic performance reports require at least three samples".into());
+    }
 
     Ok(())
 }
@@ -733,6 +736,7 @@ fn validate_diagnostic_environment(
 fn validate_common_environment(
     report: &PerformanceReport,
     baseline: &PerformanceBaseline,
+    enforce_sample_authority: bool,
 ) -> Result<(), Box<dyn Error>> {
     if baseline.schema_version != BASELINE_SCHEMA {
         return Err(format!(
@@ -759,7 +763,7 @@ fn validate_common_environment(
             .into());
         }
     }
-    if report.samples < baseline.minimum_samples {
+    if enforce_sample_authority && report.samples < baseline.minimum_samples {
         return Err(format!(
             "performance report has {} samples, baseline requires at least {}",
             report.samples, baseline.minimum_samples
@@ -1256,7 +1260,7 @@ mod tests {
             sm_clock_max_mhz: 2_197,
             memory_clock_min_mhz: 14_001,
             memory_clock_max_mhz: 14_001,
-            samples: 40,
+            samples: 9,
             warmup_launches: 1_024,
             case_policy: "diagnostic_subset".to_string(),
             selected_batch_size: Some(1),

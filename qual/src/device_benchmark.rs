@@ -1,16 +1,18 @@
 //! Shared controls and reports for exclusive device measurements.
 
+use crate::benchmark_runner::parse_benchmark_cells;
 use crate::target::{
     CLOCK_LOCK_COMMAND, EXPECTED_COMPUTE_CAPABILITY_TEXT, EXPECTED_DEVICE_NAME,
     MAX_MEMORY_CLOCK_SPREAD_MHZ, MAX_SM_CLOCK_SPREAD_MHZ,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::process::{Command, Output};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tuisko_gpu::{CudaGraph, CudaStream, GpuTimer};
@@ -41,6 +43,31 @@ pub struct DeviceBenchmarkOptions {
     pub batch_size: Option<u32>,
     /// Dedicated power-sampling window per route, when requested.
     pub energy_seconds: Option<f64>,
+    /// Optional exact cells retained for a diagnostic subset run.
+    pub cells: Option<&'static str>,
+    /// Optional convergence policy for diagnostic iteration.
+    pub adaptive_repeats: Option<AdaptiveRepeatOptions>,
+}
+
+/// Median-convergence policy for a diagnostic benchmark run.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct AdaptiveRepeatOptions {
+    /// Minimum samples collected before convergence may stop a cell.
+    pub minimum_samples: usize,
+    /// Running medians whose relative spread must be within the threshold.
+    pub stability_window: usize,
+    /// Maximum relative spread of the running medians.
+    pub relative_spread: f64,
+}
+
+impl Default for AdaptiveRepeatOptions {
+    fn default() -> Self {
+        Self {
+            minimum_samples: 9,
+            stability_window: 5,
+            relative_spread: 0.02,
+        }
+    }
 }
 
 impl DeviceBenchmarkOptions {
@@ -52,6 +79,8 @@ impl DeviceBenchmarkOptions {
             warmup_launches: 1_024,
             batch_size: None,
             energy_seconds: None,
+            cells: None,
+            adaptive_repeats: None,
         }
     }
 
@@ -65,6 +94,8 @@ impl DeviceBenchmarkOptions {
             warmup_launches: 128,
             batch_size: None,
             energy_seconds: None,
+            cells: None,
+            adaptive_repeats: None,
         }
     }
 
@@ -77,6 +108,8 @@ impl DeviceBenchmarkOptions {
             warmup_launches: 16,
             batch_size: None,
             energy_seconds: None,
+            cells: None,
+            adaptive_repeats: None,
         }
     }
 }
@@ -615,10 +648,40 @@ pub struct DeviceBenchmarkMetric {
     pub p90_microseconds: f64,
     /// Operations represented by each raw timing interval.
     pub operations_per_interval: u64,
+    /// Raw timing intervals retained for this metric.
+    pub samples: usize,
     /// Minimum logical bytes read and written by one operation.
     pub logical_bytes_per_operation: u64,
     /// Logical throughput for a device timing.
     pub logical_gib_per_second: Option<f64>,
+}
+
+/// Repeat count retained for one exact cell.
+#[derive(Clone, Debug, Serialize)]
+pub struct BenchmarkCellRepeats {
+    /// Stable slash-separated route.
+    pub route: &'static str,
+    /// Exact compiled shape.
+    pub shape: String,
+    /// Samples retained for the cell.
+    pub samples: usize,
+}
+
+/// Fixed or adaptive repeat policy recorded with a report.
+#[derive(Clone, Debug, Serialize)]
+pub struct BenchmarkRepeatReport {
+    /// Whether every cell used the fixed cap or stopped after convergence.
+    pub mode: &'static str,
+    /// Maximum samples allowed for each cell.
+    pub cap: usize,
+    /// Minimum samples required by adaptive mode.
+    pub minimum_samples: Option<usize>,
+    /// Running-median window used by adaptive mode.
+    pub stability_window: Option<usize>,
+    /// Relative running-median spread accepted by adaptive mode.
+    pub relative_spread: Option<f64>,
+    /// Actual sample count retained for each cell.
+    pub cells: Vec<BenchmarkCellRepeats>,
 }
 
 /// Estimated whole-board energy for one sustained exact route.
@@ -715,6 +778,10 @@ pub struct DeviceBenchmarkReport {
     pub case_policy: &'static str,
     /// Exact decode batch selected for a diagnostic subset report.
     pub selected_batch_size: Option<u32>,
+    /// Exact named cells selected for a diagnostic subset report.
+    pub selected_cells: Vec<String>,
+    /// Fixed or adaptive repeat policy and actual per-cell counts.
+    pub repeats: BenchmarkRepeatReport,
     /// Boundaries represented by the four timing kinds.
     pub timing_scope: &'static str,
     /// Telemetry field and physical scope used for power estimates.
@@ -871,6 +938,14 @@ enum MeasurementTask {
     Repeated(usize),
 }
 
+impl MeasurementTask {
+    fn case_index(self) -> usize {
+        match self {
+            Self::Leaf(index) | Self::Repeated(index) => index,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TelemetrySample {
     sm_clock_mhz: u32,
@@ -883,6 +958,7 @@ struct TelemetrySample {
 
 pub(crate) struct TelemetrySampler {
     stop: Arc<AtomicBool>,
+    sample_count: Arc<AtomicUsize>,
     thread: Option<thread::JoinHandle<Result<Vec<TelemetrySample>, String>>>,
 }
 
@@ -890,6 +966,8 @@ impl TelemetrySampler {
     pub(crate) fn start() -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let sample_count = Arc::new(AtomicUsize::new(0));
+        let thread_sample_count = Arc::clone(&sample_count);
         let thread = thread::spawn(move || {
             let mut samples = Vec::new();
             loop {
@@ -898,6 +976,7 @@ impl TelemetrySampler {
                     break;
                 }
                 samples.push(query_telemetry()?);
+                thread_sample_count.store(samples.len(), Ordering::Release);
             }
 
             Ok(samples)
@@ -905,8 +984,13 @@ impl TelemetrySampler {
 
         Self {
             stop,
+            sample_count,
             thread: Some(thread),
         }
+    }
+
+    fn sample_count(&self) -> usize {
+        self.sample_count.load(Ordering::Acquire)
     }
 
     fn samples(mut self) -> Result<Vec<TelemetrySample>, DeviceBenchmarkError> {
@@ -1285,6 +1369,49 @@ pub(crate) fn finish_report(
     memory: DeviceMemoryReport,
 ) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
     let identity = preflight.identity;
+    let selected_cells = parse_benchmark_cells(options.cells)?
+        .into_iter()
+        .map(|selector| selector.original)
+        .collect::<Vec<_>>();
+    let mut repeat_counts = BTreeMap::<(&'static str, String), usize>::new();
+    for metric in &metrics {
+        repeat_counts
+            .entry((metric.route, metric.shape.clone()))
+            .and_modify(|samples| *samples = (*samples).min(metric.samples))
+            .or_insert(metric.samples);
+    }
+    let repeat_cells = repeat_counts
+        .into_iter()
+        .map(|((route, shape), samples)| BenchmarkCellRepeats {
+            route,
+            shape,
+            samples,
+        })
+        .collect::<Vec<_>>();
+    let samples = repeat_cells
+        .iter()
+        .map(|cell| cell.samples)
+        .min()
+        .unwrap_or(options.samples);
+    let repeats = if let Some(adaptive) = options.adaptive_repeats {
+        BenchmarkRepeatReport {
+            mode: "adaptive",
+            cap: options.samples,
+            minimum_samples: Some(adaptive.minimum_samples),
+            stability_window: Some(adaptive.stability_window),
+            relative_spread: Some(adaptive.relative_spread),
+            cells: repeat_cells,
+        }
+    } else {
+        BenchmarkRepeatReport {
+            mode: "fixed",
+            cap: options.samples,
+            minimum_samples: None,
+            stability_window: None,
+            relative_spread: None,
+            cells: repeat_cells,
+        }
+    };
 
     Ok(DeviceBenchmarkReport {
         schema_version: 7,
@@ -1315,15 +1442,20 @@ pub(crate) fn finish_report(
         power_median_watts: telemetry.power_median_watts,
         power_max_watts: telemetry.power_maximum_watts,
         telemetry_samples: telemetry.samples,
-        samples: options.samples,
+        samples,
         launches_per_sample: options.launches_per_sample,
         warmup_launches: options.warmup_launches,
-        case_policy: if options.batch_size.is_some() {
+        case_policy: if options.batch_size.is_some()
+            || options.cells.is_some()
+            || options.adaptive_repeats.is_some()
+        {
             "diagnostic_subset"
         } else {
             "complete_inventory"
         },
         selected_batch_size: options.batch_size,
+        selected_cells,
+        repeats,
         timing_scope: spec.timing_scope,
         power_scope: "nvidia-smi power.draw.instant, whole board",
         metrics,
@@ -1345,7 +1477,8 @@ pub(crate) fn measure_cases(
     ),
     DeviceBenchmarkError,
 > {
-    let cases = selected_cases(cases, options.batch_size)?;
+    let cases = selected_cases(cases, &options)?;
+    validate_adaptive_repeats(&options)?;
 
     validate_loaded_clock_policy(stream, timer, &cases)?;
 
@@ -1359,10 +1492,17 @@ pub(crate) fn measure_cases(
     let mut samples = (0..cases.len())
         .map(|_| CaseSamples::default())
         .collect::<Vec<_>>();
+    let mut graph_medians = vec![Vec::new(); cases.len()];
+    let mut path_medians = vec![Vec::new(); cases.len()];
+    let mut active = vec![true; cases.len()];
     let telemetry_sampler = TelemetrySampler::start();
     for sample in 0..options.samples {
         for task_index in measurement_order(sample, tasks.len()) {
-            match tasks[task_index] {
+            let task = tasks[task_index];
+            if !active[task.case_index()] {
+                continue;
+            }
+            match task {
                 MeasurementTask::Leaf(case_index) => {
                     let case = &cases[case_index];
                     let timing = if let Some(preparation) = case.preparation_graph {
@@ -1429,7 +1569,55 @@ pub(crate) fn measure_cases(
                 }
             }
         }
+        if let Some(adaptive) = options.adaptive_repeats {
+            for case_index in 0..cases.len() {
+                if !active[case_index] {
+                    continue;
+                }
+                graph_medians[case_index].push(sample_median(&samples[case_index].device_graph));
+                if !samples[case_index].device_path.is_empty() {
+                    path_medians[case_index].push(sample_median(&samples[case_index].device_path));
+                }
+                let count = samples[case_index].device_graph.len();
+                let graph_stable = count >= adaptive.minimum_samples
+                    && median_window_stable(
+                        &graph_medians[case_index],
+                        adaptive.stability_window,
+                        adaptive.relative_spread,
+                    );
+                let path_stable = path_medians[case_index].is_empty()
+                    || (count >= adaptive.minimum_samples
+                        && median_window_stable(
+                            &path_medians[case_index],
+                            adaptive.stability_window,
+                            adaptive.relative_spread,
+                        ));
+                if graph_stable && path_stable {
+                    active[case_index] = false;
+                    eprintln!(
+                        "adaptive repeats: {} {} stabilized at {count}/{} samples",
+                        cases[case_index].route, cases[case_index].shape, options.samples
+                    );
+                }
+            }
+            if active.iter().all(|active| !active) {
+                break;
+            }
+        }
     }
+    if options.adaptive_repeats.is_some() {
+        for (index, case) in cases.iter().enumerate() {
+            if active[index] {
+                eprintln!(
+                    "adaptive repeats: {} {} reached the {}-sample cap",
+                    case.route,
+                    case.shape,
+                    samples[index].device_graph.len()
+                );
+            }
+        }
+    }
+    sustain_telemetry_window(stream, &cases, &telemetry_sampler)?;
     let telemetry = telemetry_sampler.finish_preserving_clock_drift()?;
     require_current_process_exclusive()?;
 
@@ -1475,26 +1663,117 @@ pub(crate) fn measure_cases(
     Ok((metrics, energy_metrics, telemetry))
 }
 
+fn sustain_telemetry_window(
+    stream: &CudaStream,
+    cases: &[ExactDeviceCase<'_>],
+    sampler: &TelemetrySampler,
+) -> Result<(), DeviceBenchmarkError> {
+    let case = cases
+        .iter()
+        .max_by_key(|case| case.logical_bytes)
+        .expect("nonempty cases checked by caller");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while sampler.sample_count() < MIN_TELEMETRY_SAMPLES {
+        launch_clock_probe_unit(stream, case)?;
+        stream.synchronize().map_err(tuisko_gpu::GpuError::from)?;
+        if Instant::now() >= deadline {
+            return Err(DeviceBenchmarkError::Precondition(format!(
+                "telemetry captured only {} samples during two seconds of sustained production work",
+                sampler.sample_count()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn selected_cases<'a>(
     cases: &[ExactDeviceCase<'a>],
-    batch_size: Option<u32>,
+    options: &DeviceBenchmarkOptions,
 ) -> Result<Vec<ExactDeviceCase<'a>>, DeviceBenchmarkError> {
+    let selectors = parse_benchmark_cells(options.cells)?;
     let selected = cases
         .iter()
-        .filter(|case| batch_size.is_none_or(|batch| case.workload.batch_size == Some(batch)))
+        .filter(|case| {
+            options
+                .batch_size
+                .is_none_or(|batch| case.workload.batch_size == Some(batch))
+                && (selectors.is_empty()
+                    || selectors
+                        .iter()
+                        .any(|selector| selector.matches(case.route, &case.shape)))
+        })
         .cloned()
         .collect::<Vec<_>>();
     if selected.is_empty() {
-        let selection = batch_size.map_or_else(
-            || "the complete inventory".to_string(),
+        let selection = options.batch_size.map_or_else(
+            || {
+                options
+                    .cells
+                    .unwrap_or("the complete inventory")
+                    .to_string()
+            },
             |batch| format!("diagnostic B={batch}"),
         );
         return Err(DeviceBenchmarkError::Precondition(format!(
             "device benchmark has no case matching {selection}"
         )));
     }
+    for selector in &selectors {
+        if !cases
+            .iter()
+            .any(|case| selector.matches(case.route, &case.shape))
+        {
+            return Err(DeviceBenchmarkError::Precondition(format!(
+                "device benchmark has no cell matching `{}`",
+                selector.original
+            )));
+        }
+    }
 
     Ok(selected)
+}
+
+fn validate_adaptive_repeats(options: &DeviceBenchmarkOptions) -> Result<(), DeviceBenchmarkError> {
+    let Some(adaptive) = options.adaptive_repeats else {
+        return Ok(());
+    };
+    if adaptive.minimum_samples < 3 || adaptive.minimum_samples > options.samples {
+        return Err(DeviceBenchmarkError::Precondition(format!(
+            "adaptive repeat floor must be in 3..={}",
+            options.samples
+        )));
+    }
+    if adaptive.stability_window < 3 || adaptive.stability_window > adaptive.minimum_samples {
+        return Err(DeviceBenchmarkError::Precondition(
+            "adaptive stability window must be in 3..=repeat floor".to_string(),
+        ));
+    }
+    if !adaptive.relative_spread.is_finite() || adaptive.relative_spread <= 0.0 {
+        return Err(DeviceBenchmarkError::Precondition(
+            "adaptive relative spread must be finite and positive".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn sample_median(samples: &[f64]) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    percentile(&sorted, 5)
+}
+
+fn median_window_stable(history: &[f64], window: usize, relative_spread: f64) -> bool {
+    if history.len() < window {
+        return false;
+    }
+    let recent = &history[history.len() - window..];
+    let minimum = recent.iter().copied().fold(f64::INFINITY, f64::min);
+    let maximum = recent.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let center = sample_median(recent);
+
+    center > 0.0 && (maximum - minimum) / center <= relative_spread
 }
 
 fn validate_loaded_clock_policy(
@@ -1753,6 +2032,7 @@ fn metric(
         )));
     }
 
+    let sample_count = samples.len();
     samples.sort_by(f64::total_cmp);
     let median = percentile(&samples, 5);
     let logical_bytes_per_operation = case.logical_bytes as u64;
@@ -1778,6 +2058,7 @@ fn metric(
         p10_microseconds: percentile(&samples, 1),
         p90_microseconds: percentile(&samples, 9),
         operations_per_interval,
+        samples: sample_count,
         logical_bytes_per_operation,
         logical_gib_per_second,
     })
@@ -1806,6 +2087,7 @@ pub(crate) fn host_completion_metric(
             "{route} {shape} host_completion produced a non-finite or non-positive timing"
         )));
     }
+    let sample_count = samples.len();
     samples.sort_by(f64::total_cmp);
     Ok(DeviceBenchmarkMetric {
         route,
@@ -1816,6 +2098,7 @@ pub(crate) fn host_completion_metric(
         p10_microseconds: percentile(&samples, 1),
         p90_microseconds: percentile(&samples, 9),
         operations_per_interval,
+        samples: sample_count,
         logical_bytes_per_operation,
         logical_gib_per_second: None,
     })
@@ -2183,8 +2466,8 @@ mod tests {
         BenchmarkMemoryKind, BenchmarkMemoryMeasurement, ComputeProcess, DeviceBenchmarkOptions,
         DeviceMemoryMetric, DeviceMemorySnapshot, MemoryComparison, MemoryRecorder,
         TelemetryEvidence, TelemetrySample, idle_background, loaded_clock_probe_replays,
-        measurement_order, parse_compute_processes, parse_process_memory, telemetry_evidence,
-        validate_compute_process_count, warmup_launches,
+        measurement_order, median_window_stable, parse_compute_processes, parse_process_memory,
+        telemetry_evidence, validate_compute_process_count, warmup_launches,
     };
     use std::time::Duration;
 
@@ -2513,5 +2796,20 @@ mod tests {
             order.sort_unstable();
             assert_eq!(order, (0..16).collect::<Vec<_>>());
         }
+    }
+
+    #[test]
+    fn adaptive_repeat_window_tracks_running_median_spread() {
+        assert!(median_window_stable(
+            &[100.0, 100.8, 100.4, 100.5, 100.2],
+            5,
+            0.01
+        ));
+        assert!(!median_window_stable(
+            &[100.0, 102.0, 99.0, 101.0, 100.0],
+            5,
+            0.01
+        ));
+        assert!(!median_window_stable(&[100.0, 100.1], 3, 0.01));
     }
 }

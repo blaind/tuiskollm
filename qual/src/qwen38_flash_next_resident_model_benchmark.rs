@@ -3,7 +3,12 @@
 //! A step includes 49 graph replays and 48 host-resolved streaming rounds, so this measures the
 //! whole host-observed boundary. Results are diagnostic and are not leaf-graph baselines.
 
+use crate::benchmark_runner::{
+    BaselineCacheLookup, BenchmarkCellSelector, BenchmarkFingerprint, read_baseline_cache,
+    write_baseline_cache,
+};
 use crate::device_benchmark::DeviceBenchmarkError;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,6 +107,29 @@ pub struct Qwen38FlashNextResidentBenchmarkReport {
     pub load: Duration,
     /// Every measured route, decode ascending then prefill ascending.
     pub routes: Vec<Qwen38FlashNextResidentRouteReport>,
+    /// Rows reused by an exact diagnostic cache hit.
+    pub cached_baseline: Vec<Qwen38FlashNextCachedResidentRoute>,
+}
+
+/// Serializable row retained by the diagnostic baseline cache.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Qwen38FlashNextCachedResidentRoute {
+    kind: String,
+    rows: usize,
+    median_nanoseconds: u64,
+    tokens_per_second: f64,
+    milliseconds_per_token: f64,
+    microseconds_per_layer: f64,
+    expert_hit_rate: f64,
+    expert_h2d_bytes_per_token: usize,
+}
+
+/// Optional cache identity for a previously measured resident baseline.
+pub struct Qwen38FlashNextResidentBaselineCache<'a> {
+    /// Repository-local cache path.
+    pub path: &'a Path,
+    /// Exact environment and source identity.
+    pub fingerprint: &'a BenchmarkFingerprint,
 }
 
 /// Loads the model once and sweeps every admitted decode batch and prefill tile.
@@ -114,29 +142,81 @@ pub fn benchmark_qwen38_flash_next_resident_model(
     let started = std::time::Instant::now();
     let mut model = Qwen38FlashNextResidentModel::from_snapshot(&context, snapshot)?;
     let load = started.elapsed();
-    let stats = model.load_stats();
-
     let stream = context.new_stream().map_err(GpuError::from)?;
-    let mut routes = Vec::new();
 
-    for route in [
-        Qwen38FlashNextStreamingRoute::Stalling,
-        Qwen38FlashNextStreamingRoute::Overlapped,
-    ] {
-        model.set_streaming_route(route);
-        for batch in DECODE_ROWS {
-            model.reset_state(&stream)?;
-            routes.push(measure_decode(&mut model, &stream, batch)?);
-        }
-        for rows in CAUSAL_ROWS {
-            model.reset_state(&stream)?;
-            routes.push(measure_causal(&mut model, &stream, rows)?);
-        }
-        for tile in QWEN38_FLASH_NEXT_PREFILL_ROWS {
-            model.reset_state(&stream)?;
-            routes.push(measure_prefill(&mut model, &stream, tile)?);
+    benchmark_qwen38_flash_next_resident_model_loaded(&mut model, &stream, load, None, &[])
+}
+
+/// Sweeps an already-constructed model or reuses an exact diagnostic cache hit.
+pub fn benchmark_qwen38_flash_next_resident_model_loaded(
+    model: &mut Qwen38FlashNextResidentModel,
+    stream: &CudaStream,
+    load: Duration,
+    cache: Option<Qwen38FlashNextResidentBaselineCache<'_>>,
+    cells: &[BenchmarkCellSelector],
+) -> Result<Qwen38FlashNextResidentBenchmarkReport, DeviceBenchmarkError> {
+    validate_resident_cells(cells)?;
+    let stats = model.load_stats();
+    let mut routes = Vec::new();
+    let mut cached_baseline = Vec::new();
+
+    if let Some(cache) = &cache {
+        match read_baseline_cache::<Vec<Qwen38FlashNextCachedResidentRoute>>(
+            cache.path,
+            cache.fingerprint,
+        )? {
+            BaselineCacheLookup::Hit(rows) => {
+                let rows = rows
+                    .into_iter()
+                    .filter(|row| resident_cell_selected(cells, &row.kind, row.rows))
+                    .collect::<Vec<_>>();
+                if rows.is_empty() {
+                    eprintln!(
+                        "baseline cache miss: no cached resident row matches the selected cells"
+                    );
+                } else {
+                    eprintln!(
+                        "baseline cache hit: {} resident rows are cached diagnostics",
+                        rows.len()
+                    );
+                    cached_baseline = rows;
+                }
+            }
+            BaselineCacheLookup::Miss(reason) => {
+                eprintln!("baseline cache miss: {reason}; measuring resident rows live");
+            }
         }
     }
+
+    if cached_baseline.is_empty() {
+        measure_streaming_route(
+            model,
+            stream,
+            Qwen38FlashNextStreamingRoute::Stalling,
+            &mut routes,
+            cells,
+        )?;
+        if let Some(cache) = &cache.filter(|_| cells.is_empty()) {
+            let rows = routes
+                .iter()
+                .map(Qwen38FlashNextCachedResidentRoute::from)
+                .collect::<Vec<_>>();
+            write_baseline_cache(cache.path, cache.fingerprint, &rows)?;
+            eprintln!(
+                "baseline cache updated: {} live resident rows at {}",
+                rows.len(),
+                cache.path.display()
+            );
+        }
+    }
+
+    measure_streaming_route(
+        model,
+        stream,
+        Qwen38FlashNextStreamingRoute::Overlapped,
+        &mut routes,
+        cells,
+    )?;
     model.set_streaming_route(Qwen38FlashNextStreamingRoute::Overlapped);
 
     Ok(Qwen38FlashNextResidentBenchmarkReport {
@@ -146,7 +226,96 @@ pub fn benchmark_qwen38_flash_next_resident_model(
         host_pin: stats.host_pin(),
         load,
         routes,
+        cached_baseline,
     })
+}
+
+fn measure_streaming_route(
+    model: &mut Qwen38FlashNextResidentModel,
+    stream: &CudaStream,
+    route: Qwen38FlashNextStreamingRoute,
+    reports: &mut Vec<Qwen38FlashNextResidentRouteReport>,
+    cells: &[BenchmarkCellSelector],
+) -> Result<(), DeviceBenchmarkError> {
+    model.set_streaming_route(route);
+    for batch in DECODE_ROWS {
+        if resident_cell_selected(cells, "decode", batch) {
+            model.reset_state(stream)?;
+            reports.push(measure_decode(model, stream, batch)?);
+        }
+    }
+    for rows in CAUSAL_ROWS {
+        if resident_cell_selected(cells, "verify", rows) {
+            model.reset_state(stream)?;
+            reports.push(measure_causal(model, stream, rows)?);
+        }
+    }
+    for tile in QWEN38_FLASH_NEXT_PREFILL_ROWS {
+        if resident_cell_selected(cells, "prefill", tile) {
+            model.reset_state(stream)?;
+            reports.push(measure_prefill(model, stream, tile)?);
+        }
+    }
+
+    Ok(())
+}
+
+fn resident_cell_selected(cells: &[BenchmarkCellSelector], kind: &str, rows: usize) -> bool {
+    if cells.is_empty() {
+        return true;
+    }
+    let shape = match kind {
+        "decode" => format!("B={rows}"),
+        "verify" | "prefill" => format!("T={rows}"),
+        _ => return false,
+    };
+    cells.iter().any(|cell| cell.matches(kind, &shape))
+}
+
+fn validate_resident_cells(cells: &[BenchmarkCellSelector]) -> Result<(), DeviceBenchmarkError> {
+    for cell in cells {
+        let admitted = match cell.route.as_str() {
+            "decode" => cell
+                .shape
+                .strip_prefix("B=")
+                .and_then(|rows| rows.parse::<usize>().ok())
+                .is_some_and(|rows| DECODE_ROWS.contains(&rows)),
+            "verify" => cell
+                .shape
+                .strip_prefix("T=")
+                .and_then(|rows| rows.parse::<usize>().ok())
+                .is_some_and(|rows| CAUSAL_ROWS.contains(&rows)),
+            "prefill" => cell
+                .shape
+                .strip_prefix("T=")
+                .and_then(|rows| rows.parse::<usize>().ok())
+                .is_some_and(|rows| QWEN38_FLASH_NEXT_PREFILL_ROWS.contains(&rows)),
+            _ => false,
+        };
+        if !admitted {
+            return Err(DeviceBenchmarkError::Precondition(format!(
+                "resident benchmark cell `{}` is not admitted",
+                cell.original
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+impl From<&Qwen38FlashNextResidentRouteReport> for Qwen38FlashNextCachedResidentRoute {
+    fn from(route: &Qwen38FlashNextResidentRouteReport) -> Self {
+        Self {
+            kind: route.kind.to_string(),
+            rows: route.rows,
+            median_nanoseconds: u64::try_from(route.median.as_nanos()).unwrap_or(u64::MAX),
+            tokens_per_second: route.tokens_per_second,
+            milliseconds_per_token: route.milliseconds_per_token,
+            microseconds_per_layer: route.microseconds_per_layer,
+            expert_hit_rate: route.expert_hit_rate,
+            expert_h2d_bytes_per_token: route.expert_h2d_bytes_per_token,
+        }
+    }
 }
 
 fn measure_decode(
@@ -400,6 +569,23 @@ pub fn print_qwen38_flash_next_resident_benchmark(report: &Qwen38FlashNextReside
             route.residency_wait.as_secs_f64() * 1_000.0,
             route.rounds_in_flight
         );
+    }
+    if !report.cached_baseline.is_empty() {
+        println!();
+        println!("  cached baseline — diagnostic rows, not live measurements");
+        for route in &report.cached_baseline {
+            println!(
+                "  {:<8} {:>5} {:>12.3} {:>10.2} {:>12.3} {:>10.1} {:>8.4} {:>14}  CACHED",
+                route.kind,
+                route.rows,
+                route.median_nanoseconds as f64 / 1_000_000.0,
+                route.tokens_per_second,
+                route.milliseconds_per_token,
+                route.microseconds_per_layer,
+                route.expert_hit_rate,
+                route.expert_h2d_bytes_per_token
+            );
+        }
     }
     println!();
     for route in &report.routes {
