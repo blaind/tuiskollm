@@ -14,6 +14,7 @@ use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contra
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext};
 
@@ -1333,6 +1334,25 @@ enum WidthRoute {
     T1024,
 }
 
+impl WidthRoute {
+    const fn rows(self) -> usize {
+        match self {
+            Self::B1 => 1,
+            Self::B2 => 2,
+            Self::B3 => 3,
+            Self::B4 => 4,
+            Self::B5 => 5,
+            Self::B6 => 6,
+            Self::B7 => 7,
+            Self::B8 => 8,
+            Self::T32 => 32,
+            Self::T64 => 64,
+            Self::T128 => 128,
+            Self::T1024 => 1_024,
+        }
+    }
+}
+
 // Transcribed from the four prepared dispatches this module replaces: every
 // admitted table decodes `B=1..=8` and prefills `T=32,64,128`. Qwen3.8 splits
 // the two halves across two public launchers; the other three admit their
@@ -1590,42 +1610,45 @@ pub(crate) fn qwen38_flash_next_paged_gqa_ptx_names() -> Vec<&'static str> {
 
 /// One entry table's prepared decode and shared-prefill entries.
 ///
-/// All four admitted tables prepare the same eleven widths, so both owners
-/// hold this and share one dispatch. Qwen3.8's partitioned prefill tails have
-/// no counterpart and stay on [`PagedGqaOp`].
+/// Every table prepares the shared eleven widths; an entry table can also
+/// admit its own `T=1024` route. Qwen3.8's partitioned prefill tails have no
+/// counterpart and stay on [`PagedGqaOp`].
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_paged_gqa_exact_width),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
+    inventory(false)
+)]
 struct ExactWidthRoutes<A: Arch, E: PagedGqaEntries<A>> {
+    #[route(1)]
     b1: E::Decode<1>,
+    #[route(2)]
     b2: E::Decode<2>,
+    #[route(3)]
     b3: E::Decode<3>,
+    #[route(4)]
     b4: E::Decode<4>,
+    #[route(5)]
     b5: E::Decode<5>,
+    #[route(6)]
     b6: E::Decode<6>,
+    #[route(7)]
     b7: E::Decode<7>,
+    #[route(8)]
     b8: E::Decode<8>,
+    #[route(32)]
     t32: E::Prefill<32>,
+    #[route(64)]
     t64: E::Prefill<64>,
+    #[route(128)]
     t128: E::Prefill<128>,
+    #[route(1024, admitted(E::HAS_T1024))]
     t1024: E::Prefill1024,
 }
 
 impl<A: Arch, E: PagedGqaEntries<A>> ExactWidthRoutes<A, E> {
-    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        Ok(Self {
-            b1: E::Decode::<1>::prepare(module)?,
-            b2: E::Decode::<2>::prepare(module)?,
-            b3: E::Decode::<3>::prepare(module)?,
-            b4: E::Decode::<4>::prepare(module)?,
-            b5: E::Decode::<5>::prepare(module)?,
-            b6: E::Decode::<6>::prepare(module)?,
-            b7: E::Decode::<7>::prepare(module)?,
-            b8: E::Decode::<8>::prepare(module)?,
-            t32: E::Prefill::<32>::prepare(module)?,
-            t64: E::Prefill::<64>::prepare(module)?,
-            t128: E::Prefill::<128>::prepare(module)?,
-            t1024: E::Prefill1024::prepare(module)?,
-        })
-    }
-
     /// Dispatches one prepared width.
     ///
     /// # Safety
@@ -1638,27 +1661,12 @@ impl<A: Arch, E: PagedGqaEntries<A>> ExactWidthRoutes<A, E> {
         route: WidthRoute,
         args: &PagedGqaArgs<E::Cache>,
     ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: the caller's contract reaches the entry unchanged.
-                unsafe { self.$route.launch(module, stream, args) }
-            };
-        }
-
-        match route {
-            WidthRoute::B1 => launch!(b1),
-            WidthRoute::B2 => launch!(b2),
-            WidthRoute::B3 => launch!(b3),
-            WidthRoute::B4 => launch!(b4),
-            WidthRoute::B5 => launch!(b5),
-            WidthRoute::B6 => launch!(b6),
-            WidthRoute::B7 => launch!(b7),
-            WidthRoute::B8 => launch!(b8),
-            WidthRoute::T32 => launch!(t32),
-            WidthRoute::T64 => launch!(t64),
-            WidthRoute::T128 => launch!(t128),
-            WidthRoute::T1024 => launch!(t1024),
-        }
+        dispatch_paged_gqa_exact_width!(
+            self,
+            route.rows(),
+            |entry| unsafe { entry.launch(module, stream, args) },
+            else => unreachable!("WidthRoute always names one exact route")
+        )
     }
 }
 

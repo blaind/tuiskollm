@@ -3,6 +3,7 @@
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_model::{Arch, Qwen36Moe35B};
 
 const MAX_BATCH: usize = 8;
@@ -45,10 +46,6 @@ const _: () = assert!(TOP_K == 8);
 const _: () = assert!(INTERMEDIATE.is_multiple_of(GATE_UP_WARPS));
 const _: () = assert!(HIDDEN.is_multiple_of(DOWN_ROWS_PER_CTA));
 const _: () = assert!(HIDDEN.is_multiple_of(COMBINE_THREADS as usize));
-
-fn admitted_rows(rows: usize) -> bool {
-    (1..=MAX_BATCH).contains(&rows) || PREFILL_ROWS.contains(&rows)
-}
 
 #[allow(clippy::too_many_arguments)]
 #[cuda_module]
@@ -492,20 +489,43 @@ pub(crate) fn qwen36_mtp_bf16_moe_ptx_names() -> Vec<&'static str> {
     names
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen36_mtp_bf16_moe),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
+    inventory(false)
+)]
+struct Qwen36MtpBf16MoeRoutes {
+    #[route(1)]
+    b1: PreparedRoute<1>,
+    #[route(2)]
+    b2: PreparedRoute<2>,
+    #[route(3)]
+    b3: PreparedRoute<3>,
+    #[route(4)]
+    b4: PreparedRoute<4>,
+    #[route(5)]
+    b5: PreparedRoute<5>,
+    #[route(6)]
+    b6: PreparedRoute<6>,
+    #[route(7)]
+    b7: PreparedRoute<7>,
+    #[route(8)]
+    b8: PreparedRoute<8>,
+    #[route(32)]
+    t32: PreparedRoute<32>,
+    #[route(64)]
+    t64: PreparedRoute<64>,
+    #[route(128)]
+    t128: PreparedRoute<128>,
+}
+
 /// Prepared exact-route Qwen3.6 routed/shared BF16 MTP experts.
 pub struct Qwen36MtpBf16MoeOp {
     module: kernels::LoadedModule,
-    b1: PreparedRoute<1>,
-    b2: PreparedRoute<2>,
-    b3: PreparedRoute<3>,
-    b4: PreparedRoute<4>,
-    b5: PreparedRoute<5>,
-    b6: PreparedRoute<6>,
-    b7: PreparedRoute<7>,
-    b8: PreparedRoute<8>,
-    t32: PreparedRoute<32>,
-    t64: PreparedRoute<64>,
-    t128: PreparedRoute<128>,
+    routes: Qwen36MtpBf16MoeRoutes,
 }
 
 impl Qwen36MtpBf16MoeOp {
@@ -515,20 +535,9 @@ impl Qwen36MtpBf16MoeOp {
         // SAFETY: this crate owns the embedded exact-target artifact.
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module("loading Qwen3.6 MTP BF16 experts", source))?;
-        Ok(Self {
-            b1: PreparedRoute::prepare(&module)?,
-            b2: PreparedRoute::prepare(&module)?,
-            b3: PreparedRoute::prepare(&module)?,
-            b4: PreparedRoute::prepare(&module)?,
-            b5: PreparedRoute::prepare(&module)?,
-            b6: PreparedRoute::prepare(&module)?,
-            b7: PreparedRoute::prepare(&module)?,
-            b8: PreparedRoute::prepare(&module)?,
-            t32: PreparedRoute::prepare(&module)?,
-            t64: PreparedRoute::prepare(&module)?,
-            t128: PreparedRoute::prepare(&module)?,
-            module,
-        })
+        let routes = Qwen36MtpBf16MoeRoutes::prepare(&module)?;
+
+        Ok(Self { module, routes })
     }
 
     /// Executes selected routed experts, the shared expert, and fixed-order reduction.
@@ -559,48 +568,32 @@ impl Qwen36MtpBf16MoeOp {
         shared_gate_output: *mut u16,
         output: *mut u16,
     ) -> GpuResult<()> {
-        if !admitted_rows(rows) {
-            return Err(GpuError::invalid_launch(format!(
+        dispatch_qwen36_mtp_bf16_moe!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    input,
+                    expert_indices,
+                    routing_weights,
+                    routed_gate_up,
+                    routed_down,
+                    shared_gate,
+                    shared_up,
+                    shared_down,
+                    shared_gate_weight,
+                    intermediate,
+                    expert_output,
+                    shared_gate_output,
+                    output,
+                )
+            },
+            else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.6 MTP BF16 expert rows {rows} are outside 1..={MAX_BATCH},32,64,128"
-            )));
-        }
-        macro_rules! launch {
-            ($route:ident) => {
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        expert_indices,
-                        routing_weights,
-                        routed_gate_up,
-                        routed_down,
-                        shared_gate,
-                        shared_up,
-                        shared_down,
-                        shared_gate_weight,
-                        intermediate,
-                        expert_output,
-                        shared_gate_output,
-                        output,
-                    )
-                }
-            };
-        }
-        match rows {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            _ => unreachable!("admitted_rows rejected every other route"),
-        }
+            )))
+        )
     }
 }
 
@@ -623,8 +616,16 @@ mod tests {
             (128, true),
             (129, false),
         ] {
-            assert_eq!(admitted_rows(rows), admitted, "rows={rows}");
+            assert_eq!(
+                Qwen36MtpBf16MoeRoutes::contains(rows),
+                admitted,
+                "rows={rows}"
+            );
         }
+        assert_eq!(
+            Qwen36MtpBf16MoeRoutes::admitted_rows(),
+            [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]
+        );
         let names = qwen36_mtp_bf16_moe_ptx_names();
         assert_eq!(names.len(), 33);
         assert_eq!(names.iter().copied().collect::<BTreeSet<_>>().len(), 33);

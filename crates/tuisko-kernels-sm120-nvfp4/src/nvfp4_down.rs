@@ -10,10 +10,12 @@ use std::sync::Arc;
 use tuisko_gpu::{
     CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, LaunchConfig2D, PreparedLaunch,
 };
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
+#[cfg(test)]
 const PREFILL_ROWS: [usize; 4] = [32, 64, 128, 1_024];
 const HIDDEN: usize = Qwen38_27B::HIDDEN;
 const INPUT_COLUMNS: usize = Qwen38_27B::INTERMEDIATE;
@@ -1586,72 +1588,57 @@ pub(crate) fn qwen35_nvfp4_down_ptx_names() -> [&'static str; 16] {
     ]
 }
 
-/// The compiled route one admitted row count selects.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DownRoute {
-    B1,
-    B2,
-    B3,
-    B4,
-    B5,
-    B6,
-    B7,
-    B8,
-    T32,
-    T64,
-    T128,
-    T1024,
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_nvfp4_down_decode),
+    required(1, 2, 3, 4, 5, 6, 7, 8),
+    inventory(false)
+)]
+struct Nvfp4DownDecodeRoutes<A: Arch, E: Nvfp4DownEntries<A>> {
+    #[route(1)]
+    b1: E::DecodeOne,
+    #[route(2)]
+    b2: E::Decode<2>,
+    #[route(3)]
+    b3: E::Decode<3>,
+    #[route(4)]
+    b4: E::Decode<4>,
+    #[route(5)]
+    b5: E::Decode<5>,
+    #[route(6)]
+    b6: E::Decode<6>,
+    #[route(7)]
+    b7: E::Decode<7>,
+    #[route(8)]
+    b8: E::Decode<8>,
 }
 
-// The admitted decode schedule, transcribed from the two prepared dispatches
-// it replaces: both owners project every exact B=1..=8 through the
-// represented-weight A16 entry and admit nothing else.
-fn decode_route(batch: usize) -> Option<DownRoute> {
-    match batch {
-        1 => Some(DownRoute::B1),
-        2 => Some(DownRoute::B2),
-        3 => Some(DownRoute::B3),
-        4 => Some(DownRoute::B4),
-        5 => Some(DownRoute::B5),
-        6 => Some(DownRoute::B6),
-        7 => Some(DownRoute::B7),
-        8 => Some(DownRoute::B8),
-        _ => None,
-    }
-}
-
-// The admitted prefill schedule, transcribed from the same two dispatches:
-// both owners admitted exactly `PREFILL_ROWS` and then matched those four row
-// counts onto their own quantize/W4A4 pairs.
-fn prefill_route(rows: usize) -> Option<DownRoute> {
-    if !PREFILL_ROWS.contains(&rows) {
-        return None;
-    }
-
-    match rows {
-        32 => Some(DownRoute::T32),
-        64 => Some(DownRoute::T64),
-        128 => Some(DownRoute::T128),
-        1_024 => Some(DownRoute::T1024),
-        _ => unreachable!("PREFILL_ROWS admits only the exact T routes"),
-    }
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_nvfp4_down_prefill),
+    required(32, 64, 128, 1024),
+    inventory(false)
+)]
+struct Nvfp4DownPrefillRoutes<A: Arch, E: Nvfp4DownEntries<A>> {
+    #[route(32)]
+    t32: E::Prefill<32>,
+    #[route(64)]
+    t64: E::Prefill<64>,
+    #[route(128)]
+    t128: E::Prefill<128>,
+    #[route(1024)]
+    t1024: E::Prefill<1_024>,
 }
 
 /// Prepared exact-batch NVFP4 down routes for one admitted architecture.
 pub struct Nvfp4DownOp<A: Arch = Qwen38_27B, E: Nvfp4DownEntries<A> = Qwen38Nvfp4DownEntries> {
     module: kernels::LoadedModule,
-    b1: E::DecodeOne,
-    b2: E::Decode<2>,
-    b3: E::Decode<3>,
-    b4: E::Decode<4>,
-    b5: E::Decode<5>,
-    b6: E::Decode<6>,
-    b7: E::Decode<7>,
-    b8: E::Decode<8>,
-    t32: E::Prefill<32>,
-    t64: E::Prefill<64>,
-    t128: E::Prefill<128>,
-    t1024: E::Prefill<1_024>,
+    decode_routes: Nvfp4DownDecodeRoutes<A, E>,
+    prefill_routes: Nvfp4DownPrefillRoutes<A, E>,
 }
 
 /// Prepared exact-batch Qwen3.5 NVFP4 down routes on SM120.
@@ -1666,20 +1653,13 @@ impl<A: Arch, E: Nvfp4DownEntries<A>> Nvfp4DownOp<A, E> {
             GpuError::module("loading the SM120 NVFP4 down projection module", source)
         })?;
 
+        let decode_routes = Nvfp4DownDecodeRoutes::prepare(&module)?;
+        let prefill_routes = Nvfp4DownPrefillRoutes::prepare(&module)?;
+
         Ok(Self {
-            b1: E::DecodeOne::prepare(&module)?,
-            b2: E::Decode::<2>::prepare(&module)?,
-            b3: E::Decode::<3>::prepare(&module)?,
-            b4: E::Decode::<4>::prepare(&module)?,
-            b5: E::Decode::<5>::prepare(&module)?,
-            b6: E::Decode::<6>::prepare(&module)?,
-            b7: E::Decode::<7>::prepare(&module)?,
-            b8: E::Decode::<8>::prepare(&module)?,
-            t32: E::Prefill::<32>::prepare(&module)?,
-            t64: E::Prefill::<64>::prepare(&module)?,
-            t128: E::Prefill::<128>::prepare(&module)?,
-            t1024: E::Prefill::<1_024>::prepare(&module)?,
             module,
+            decode_routes,
+            prefill_routes,
         })
     }
 
@@ -1713,37 +1693,17 @@ impl<A: Arch, E: Nvfp4DownEntries<A>> Nvfp4DownOp<A, E> {
         }
 
         let reciprocal = 1.0 / weight_scale_divisor;
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: the public method's pointer contract is unchanged by dispatch.
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        weight_codes,
-                        weight_scales,
-                        reciprocal,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match decode_route(batch) {
-            Some(DownRoute::B1) => launch!(b1),
-            Some(DownRoute::B2) => launch!(b2),
-            Some(DownRoute::B3) => launch!(b3),
-            Some(DownRoute::B4) => launch!(b4),
-            Some(DownRoute::B5) => launch!(b5),
-            Some(DownRoute::B6) => launch!(b6),
-            Some(DownRoute::B7) => launch!(b7),
-            Some(DownRoute::B8) => launch!(b8),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_nvfp4_down_decode!(
+            &self.decode_routes,
+            batch,
+            |route| unsafe {
+                route.launch(&self.module, stream, input, weight_codes, weight_scales, reciprocal, output)
+            },
+            else => Err(GpuError::invalid_launch(format!(
                 "{} batch {batch} is outside the exact range 1..={MAX_BATCH}",
                 E::OPERATION
-            ))),
-        }
+            )))
+        )
     }
 
     /// Dynamically quantizes and projects exact `T=32,64,128,1024` rows.
@@ -1771,12 +1731,6 @@ impl<A: Arch, E: Nvfp4DownEntries<A>> Nvfp4DownOp<A, E> {
         weight_scale_divisor: f32,
         output: *mut u16,
     ) -> GpuResult<()> {
-        let Some(route) = prefill_route(rows) else {
-            return Err(GpuError::invalid_launch(format!(
-                "{}NVFP4 down prefill row count {rows} is outside the exact T=32,64,128,1024 routes",
-                E::LABEL
-            )));
-        };
         if !input_scale_divisor.is_finite() || input_scale_divisor <= 0.0 {
             return Err(GpuError::invalid_launch(format!(
                 "{}NVFP4 down input scale divisor must be finite and positive",
@@ -1790,43 +1744,30 @@ impl<A: Arch, E: Nvfp4DownEntries<A>> Nvfp4DownOp<A, E> {
             )));
         }
 
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: the public method's pointer contract is unchanged by dispatch.
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        activation_codes,
-                        activation_scales,
-                        weight_codes,
-                        weight_scales,
-                        input_scale_divisor,
-                        weight_scale_divisor,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match route {
-            DownRoute::T32 => launch!(t32),
-            DownRoute::T64 => launch!(t64),
-            DownRoute::T128 => launch!(t128),
-            DownRoute::T1024 => launch!(t1024),
-            _ => unreachable!("prefill_route only selects the exact T routes"),
-        }
+        dispatch_nvfp4_down_prefill!(
+            &self.prefill_routes,
+            rows,
+            |route| unsafe {
+                route.launch(
+                    &self.module, stream, input, activation_codes, activation_scales, weight_codes,
+                    weight_scales, input_scale_divisor, weight_scale_divisor, output,
+                )
+            },
+            else => Err(GpuError::invalid_launch(format!(
+                "{}NVFP4 down prefill row count {rows} is outside the exact T=32,64,128,1024 routes",
+                E::LABEL
+            )))
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CODE_WORDS_PER_PHASE, DownRoute, GROUP_K, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_BATCH,
-        Nvfp4DownEntries, OUTPUT_ROWS, PHASE_GROUPS, PHASES, PREFILL_ROWS, Qwen35Nvfp4DownEntries,
-        Qwen38Nvfp4DownEntries, SHARED_U32, THREADS, W4_BLOCK_N, W4_TILE_M, WARPS,
-        a16_launch_config, decode_route, nvfp4_down_ptx_names, prefill_geometry, prefill_route,
+        CODE_WORDS_PER_PHASE, GROUP_K, GROUPS_PER_ROW, INPUT_COLUMNS, MAX_BATCH,
+        Nvfp4DownDecodeRoutes, Nvfp4DownEntries, Nvfp4DownPrefillRoutes, OUTPUT_ROWS, PHASE_GROUPS,
+        PHASES, PREFILL_ROWS, Qwen35Nvfp4DownEntries, Qwen38Nvfp4DownEntries, SHARED_U32, THREADS,
+        W4_BLOCK_N, W4_TILE_M, WARPS, a16_launch_config, nvfp4_down_ptx_names, prefill_geometry,
         qwen35_nvfp4_down_ptx_names,
     };
     use std::collections::{BTreeMap, BTreeSet};
@@ -1834,33 +1775,10 @@ mod tests {
     use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
     /// The decode routes every admitted architecture selects, in order.
-    const DECODE_SCHEDULE: [(usize, DownRoute); 8] = [
-        (1, DownRoute::B1),
-        (2, DownRoute::B2),
-        (3, DownRoute::B3),
-        (4, DownRoute::B4),
-        (5, DownRoute::B5),
-        (6, DownRoute::B6),
-        (7, DownRoute::B7),
-        (8, DownRoute::B8),
-    ];
+    const DECODE_SCHEDULE: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
     /// The prefill routes every admitted architecture selects, in order.
-    const PREFILL_SCHEDULE: [(usize, DownRoute); 4] = [
-        (32, DownRoute::T32),
-        (64, DownRoute::T64),
-        (128, DownRoute::T128),
-        (1_024, DownRoute::T1024),
-    ];
-
-    /// Every row count a selector admits, swept exhaustively so an unadmitted
-    /// width cannot hide between the transcribed ones.
-    fn admitted(selector: fn(usize) -> Option<DownRoute>) -> Vec<(usize, DownRoute)> {
-        (0..=2_048)
-            .chain([usize::MAX])
-            .filter_map(|rows| selector(rows).map(|route| (rows, route)))
-            .collect()
-    }
+    const PREFILL_SCHEDULE: [usize; 4] = [32, 64, 128, 1_024];
 
     fn base_name(name: &str) -> &str {
         name.split_once("_TID_").map_or(name, |(base, _)| base)
@@ -1983,12 +1901,21 @@ mod tests {
     /// else, and the two domains never overlapped.
     #[test]
     fn row_routing_is_exact_and_disjoint() {
-        assert_eq!(admitted(decode_route), DECODE_SCHEDULE.to_vec());
-        assert_eq!(admitted(prefill_route), PREFILL_SCHEDULE.to_vec());
+        assert_eq!(
+            Nvfp4DownDecodeRoutes::<Qwen38_27B, Qwen38Nvfp4DownEntries>::admitted_rows(),
+            DECODE_SCHEDULE
+        );
+        assert_eq!(
+            Nvfp4DownPrefillRoutes::<Qwen38_27B, Qwen38Nvfp4DownEntries>::admitted_rows(),
+            PREFILL_SCHEDULE
+        );
 
         for rows in (0..=2_048).chain([usize::MAX]) {
             assert!(
-                decode_route(rows).is_none() || prefill_route(rows).is_none(),
+                !Nvfp4DownDecodeRoutes::<Qwen38_27B, Qwen38Nvfp4DownEntries>::contains(rows)
+                    || !Nvfp4DownPrefillRoutes::<Qwen38_27B, Qwen38Nvfp4DownEntries>::contains(
+                        rows
+                    ),
                 "row count {rows} reaches both the decode and prefill schedules"
             );
         }
