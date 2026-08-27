@@ -1,5 +1,5 @@
 [package]
-name = "tuisko-kernels-sm120-lm-head"
+name = "tuisko-kernels-sm120-qwen38-flash-next-projection"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

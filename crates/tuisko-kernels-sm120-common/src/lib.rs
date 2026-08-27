@@ -8,6 +8,7 @@
 
 pub mod attention_output;
 pub mod device;
+pub mod projection;
 
 use tuisko_model::{Arch, Qwen38_27B};
 

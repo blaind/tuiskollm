@@ -20,6 +20,11 @@ pub(crate) use tuisko_kernels_sm120::{
     Qwen38FlashNextHyperConnectionOp, Qwen38FlashNextMoeExpertsOp, Qwen38FlashNextMoeRouterOp,
     Qwen38FlashNextPleStateSnapshotOp, ResidualNormOp, qwen38_flash_next_expert_slot_plane,
 };
+#[cfg(feature = "device")]
+pub(crate) use tuisko_kernels_sm120::{
+    Qwen38FlashNextBf16LmHeadOp, Qwen38FlashNextBlockOutputProjectionOp,
+    Qwen38FlashNextGdnInputProjectionOp, Qwen38FlashNextQsaQkvProjectionOp,
+};
 
 #[cfg(feature = "device")]
 const TARGET_PROFILE: tuisko_targets::TargetProfile = tuisko_targets::TargetProfile::Sm120;

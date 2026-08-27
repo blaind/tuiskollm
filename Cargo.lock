@@ -3460,6 +3460,7 @@ dependencies = [
  "tuisko-kernels-sm120-mtp",
  "tuisko-kernels-sm120-norm",
  "tuisko-kernels-sm120-nvfp4",
+ "tuisko-kernels-sm120-qwen38-flash-next-projection",
 ]
 
 [[package]]
@@ -3565,6 +3566,7 @@ dependencies = [
  "cuda-intrinsics",
  "tuisko-gpu",
  "tuisko-kernels-macros",
+ "tuisko-kernels-sm120-common",
  "tuisko-model",
 ]
 
@@ -3613,6 +3615,20 @@ dependencies = [
 
 [[package]]
 name = "tuisko-kernels-sm120-nvfp4"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+ "cuda-intrinsics",
+ "tuisko-gpu",
+ "tuisko-kernels-macros",
+ "tuisko-kernels-sm120-common",
+ "tuisko-model",
+]
+
+[[package]]
+name = "tuisko-kernels-sm120-qwen38-flash-next-projection"
 version = "0.1.0"
 dependencies = [
  "cuda-core",

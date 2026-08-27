@@ -273,6 +273,10 @@ mod qwen38_flash_next_hyper_connection;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_hyper_connection_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_lm_head;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_lm_head_benchmark;
+#[cfg(feature = "device")]
 mod qwen38_flash_next_moe_experts;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_moe_experts_benchmark;
@@ -284,6 +288,10 @@ mod qwen38_flash_next_moe_router_benchmark;
 mod qwen38_flash_next_ple;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_ple_benchmark;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_projection;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_projection_benchmark;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_qsa_attention;
 #[cfg(feature = "device")]
@@ -762,6 +770,13 @@ pub use qwen38_flash_next_hyper_connection::{
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_hyper_connection_benchmark::benchmark_qwen38_flash_next_hyper_connection;
 #[cfg(feature = "device")]
+pub use qwen38_flash_next_lm_head::{
+    Qwen38FlashNextLmHeadQualification, Qwen38FlashNextLmHeadQualificationError,
+    qualify_qwen38_flash_next_lm_head,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_lm_head_benchmark::benchmark_qwen38_flash_next_lm_head;
+#[cfg(feature = "device")]
 pub use qwen38_flash_next_moe_experts::{
     Qwen38FlashNextMoeExpertsQualification, Qwen38FlashNextMoeExpertsQualificationError,
     SlotAssignment, qualify_qwen38_flash_next_moe_experts,
@@ -782,6 +797,13 @@ pub use qwen38_flash_next_ple::{
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_ple_benchmark::benchmark_qwen38_flash_next_ple;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_projection::{
+    Qwen38FlashNextProjectionQualification, Qwen38FlashNextProjectionQualificationError,
+    qualify_qwen38_flash_next_projections,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_projection_benchmark::benchmark_qwen38_flash_next_projections;
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_qsa_attention::{
     Qwen38FlashNextQsaAttentionQualification, Qwen38FlashNextQsaAttentionQualificationError,

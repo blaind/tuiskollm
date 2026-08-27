@@ -43,7 +43,9 @@ pub use tuisko_kernels_sm120_gdn::{
     Qwen38FlashNextGdnRecurrenceOp, Qwen38FlashNextGdnStateSnapshotOp,
 };
 pub use tuisko_kernels_sm120_hyper_connection::Qwen38FlashNextHyperConnectionOp;
-pub use tuisko_kernels_sm120_lm_head::{Qwen35Bf16LmHeadOp, Qwen36Nvfp4LmHeadOp};
+pub use tuisko_kernels_sm120_lm_head::{
+    Qwen35Bf16LmHeadOp, Qwen36Nvfp4LmHeadOp, Qwen38FlashNextBf16LmHeadOp,
+};
 pub use tuisko_kernels_sm120_moe::{
     QWEN38_FLASH_NEXT_ABSENT_SLOT, QWEN38_FLASH_NEXT_EXPERT_SLOT_BYTES, Qwen36MoeExpertsOp,
     Qwen36MoeRouterOp, Qwen36MtpBf16MoeOp, Qwen38FlashNextExpertDispatch,
@@ -60,4 +62,8 @@ pub use tuisko_kernels_sm120_norm::{Qwen35ResidualNormOp, Qwen36ResidualNormOp, 
 pub use tuisko_kernels_sm120_nvfp4::{
     Nvfp4DownOp, Nvfp4SwiGluOp, Qwen35Nvfp4AttentionOutputOp, Qwen35Nvfp4DownOp,
     Qwen35Nvfp4GdnInputOp, Qwen35Nvfp4GdnOutputOp, Qwen35Nvfp4QkvOp, Qwen35Nvfp4SwiGluOp,
+};
+pub use tuisko_kernels_sm120_qwen38_flash_next_projection::{
+    Qwen38FlashNextBlockOutputProjectionOp, Qwen38FlashNextGdnInputProjectionOp,
+    Qwen38FlashNextQsaQkvProjectionOp,
 };

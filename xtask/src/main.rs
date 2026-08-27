@@ -30,6 +30,8 @@ const QWEN38_FLASH_NEXT_HYPER_CONNECTION_RESOURCE_BASELINE: &str =
 const QWEN38_FLASH_NEXT_PLE_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen38-flash-next-ple-sm120.txt";
 const QWEN38_FLASH_NEXT_PLE_TEST_FILTER: &str = "qwen38_flash_next_ple_suite_";
+const QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER: &str = "qwen38_flash_next_projection";
+const QWEN38_FLASH_NEXT_LM_HEAD_TEST_FILTER: &str = "qwen38_flash_next_lm_head";
 const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-residual-norm-sm120.txt";
 const QWEN35_RESIDUAL_NORM_TEST_FILTER: &str = "qwen35_residual_norm";
@@ -96,6 +98,10 @@ const QWEN38_FLASH_NEXT_MOE_ROUTER_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen38-flash-next-moe-router-sm120.txt";
 const QWEN38_FLASH_NEXT_MOE_EXPERTS_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen38-flash-next-moe-experts-sm120.txt";
+const QWEN38_FLASH_NEXT_PROJECTION_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen38-flash-next-projection-sm120.txt";
+const QWEN38_FLASH_NEXT_LM_HEAD_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen38-flash-next-lm-head-sm120.txt";
 const ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
     "qual/baselines/attention-qk-prepare-sm120.txt";
 const QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE: &str =
@@ -176,6 +182,8 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     QWEN38_FLASH_NEXT_QSA_SELECTION_RESOURCE_BASELINE,
     QWEN38_FLASH_NEXT_MOE_ROUTER_RESOURCE_BASELINE,
     QWEN38_FLASH_NEXT_MOE_EXPERTS_RESOURCE_BASELINE,
+    QWEN38_FLASH_NEXT_PROJECTION_RESOURCE_BASELINE,
+    QWEN38_FLASH_NEXT_LM_HEAD_RESOURCE_BASELINE,
     ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     QWEN35_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
     QWEN36_ATTENTION_QK_PREPARE_RESOURCE_BASELINE,
@@ -434,6 +442,14 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
         &[QWEN38_FLASH_NEXT_MOE_EXPERTS_RESOURCE_BASELINE],
     ),
     (
+        "qwen38-flash-next-projections",
+        &[QWEN38_FLASH_NEXT_PROJECTION_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen38-flash-next-lm-head",
+        &[QWEN38_FLASH_NEXT_LM_HEAD_RESOURCE_BASELINE],
+    ),
+    (
         "qwen36-gdn-recurrence",
         &[QWEN35_GDN_RECURRENCE_RESOURCE_BASELINE],
     ),
@@ -598,12 +614,12 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
 /// The kernel families are separate crates so an edit re-runs cuda-oxide
 /// device codegen only for the family it touched. cargo-oxide accepts the
 /// owners as one comma-separated list and emits one PTX module per crate.
-pub(crate) const SM120_DEVICE_CODEGEN_CRATES: &str = "tuisko-kernels-sm120-attention,tuisko-kernels-sm120-engram,tuisko-kernels-sm120-fp8-mlp,tuisko-kernels-sm120-fp8-projection,tuisko-kernels-sm120-gdn,tuisko-kernels-sm120-hyper-connection,tuisko-kernels-sm120-lm-head,tuisko-kernels-sm120-moe,tuisko-kernels-sm120-mtp,tuisko-kernels-sm120-norm,tuisko-kernels-sm120-nvfp4";
+pub(crate) const SM120_DEVICE_CODEGEN_CRATES: &str = "tuisko-kernels-sm120-attention,tuisko-kernels-sm120-engram,tuisko-kernels-sm120-fp8-mlp,tuisko-kernels-sm120-fp8-projection,tuisko-kernels-sm120-gdn,tuisko-kernels-sm120-hyper-connection,tuisko-kernels-sm120-lm-head,tuisko-kernels-sm120-moe,tuisko-kernels-sm120-mtp,tuisko-kernels-sm120-norm,tuisko-kernels-sm120-nvfp4,tuisko-kernels-sm120-qwen38-flash-next-projection";
 /// Every module the SM120 device build emits, in `SM120_DEVICE_CODEGEN_CRATES`
 /// order. The resource gates read the concatenation: entry names are unique
 /// across the whole artifact, and every module is compiled on its own so the
 /// reported shared-memory footprint is the family's alone.
-const SM120_PTX_MODULES: [&str; 11] = [
+const SM120_PTX_MODULES: [&str; 12] = [
     "target/cuda/tuisko_kernels_sm120_attention.ptx",
     "target/cuda/tuisko_kernels_sm120_engram.ptx",
     "target/cuda/tuisko_kernels_sm120_fp8_mlp.ptx",
@@ -615,6 +631,7 @@ const SM120_PTX_MODULES: [&str; 11] = [
     "target/cuda/tuisko_kernels_sm120_mtp.ptx",
     "target/cuda/tuisko_kernels_sm120_norm.ptx",
     "target/cuda/tuisko_kernels_sm120_nvfp4.ptx",
+    "target/cuda/tuisko_kernels_sm120_qwen38_flash_next_projection.ptx",
 ];
 const CUDA_OXIDE_BUILD_TARGET: &str = "target/cuda-oxide-build-sm120";
 const CUDA_OXIDE_TEST_TARGET: &str = "target/cuda-oxide-test";
@@ -1244,6 +1261,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "qualify-qwen38-flash-next-moe-experts",
         qualify_qwen38_flash_next_moe_experts,
     ),
+    no_args(
+        "qualify-qwen38-flash-next-projections",
+        qualify_qwen38_flash_next_projections,
+    ),
+    no_args(
+        "qualify-qwen38-flash-next-lm-head",
+        qualify_qwen38_flash_next_lm_head,
+    ),
     no_args("qualify-gdn-recurrence", qualify_gdn_recurrence),
     no_args("qualify-gdn-output", qualify_gdn_output),
     no_args("qualify-attention-qk-prepare", qualify_attention_qk_prepare),
@@ -1386,6 +1411,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "bench-qwen38-flash-next-moe-experts",
         bench_qwen38_flash_next_moe_experts,
     ),
+    forwarded(
+        "bench-qwen38-flash-next-projections",
+        bench_qwen38_flash_next_projections,
+    ),
+    forwarded(
+        "bench-qwen38-flash-next-lm-head",
+        bench_qwen38_flash_next_lm_head,
+    ),
     forwarded("bench-gdn-recurrence", bench_gdn_recurrence),
     forwarded("bench-gdn-output", bench_gdn_output),
     forwarded("bench-attention-qk-prepare", bench_attention_qk_prepare),
@@ -1518,6 +1551,14 @@ const SUBCOMMANDS: &[Subcommand] = &[
     no_args(
         "gate-qwen38-flash-next-moe-experts",
         gate_qwen38_flash_next_moe_experts,
+    ),
+    no_args(
+        "gate-qwen38-flash-next-projections",
+        gate_qwen38_flash_next_projections,
+    ),
+    no_args(
+        "gate-qwen38-flash-next-lm-head",
+        gate_qwen38_flash_next_lm_head,
     ),
     no_args("gate-gdn-recurrence", gate_gdn_recurrence),
     no_args("gate-gdn-output", gate_gdn_output),
@@ -1964,6 +2005,8 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_qwen38_flash_next_qsa_selection(root)?;
     gate_qwen38_flash_next_moe_router(root)?;
     gate_qwen38_flash_next_moe_experts(root)?;
+    gate_qwen38_flash_next_projections(root)?;
+    gate_qwen38_flash_next_lm_head(root)?;
     gate_gdn_state_snapshot(root)?;
     gate_gdn_output(root)?;
     gate_attention_qk_prepare(root)?;
@@ -2953,6 +2996,28 @@ fn qualify_qwen38_flash_next_moe_experts(root: &Path) -> Result<(), Box<dyn Erro
     gate_qwen38_flash_next_moe_experts(root)
 }
 
+/// Runs the backbone projection oracles, accounting tests, and artifact gate.
+fn qualify_qwen38_flash_next_projections(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
+    )?;
+    gate_qwen38_flash_next_projections(root)
+}
+
+/// Runs the BF16 LM-head oracle, accounting tests, and artifact gate.
+fn qualify_qwen38_flash_next_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        QWEN38_FLASH_NEXT_LM_HEAD_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
+    )?;
+    gate_qwen38_flash_next_lm_head(root)
+}
+
 fn qualify_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
     run_qualification_test(
         root,
@@ -3827,6 +3892,20 @@ fn bench_qwen38_flash_next_moe_experts(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     run_bench_device(root, "qwen38-flash-next-moe-experts", arguments)
+}
+
+fn bench_qwen38_flash_next_projections(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-projections", arguments)
+}
+
+fn bench_qwen38_flash_next_lm_head(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-lm-head", arguments)
 }
 
 fn bench_qwen36_gdn_recurrence(
@@ -8961,6 +9040,192 @@ fn gate_qwen38_flash_next_moe_experts(root: &Path) -> Result<(), Box<dyn Error>>
 
     println!(
         "Qwen3.8-Flash-Next MoE expert gate passed: 24 routed + 24 shared + 12 combine entries, REG {routed_registers:?} / {shared_registers:?} / {combine_registers:?}, STACK:0 LOCAL:0, E2M1 routed and BF16 shared representations and SASS present"
+    );
+    Ok(())
+}
+
+/// Pins the plain BF16 MMA and store contract for all backbone projections.
+fn gate_qwen38_flash_next_projections(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN38_FLASH_NEXT_PROJECTION_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let entries = &sm120_gate_module(root)?.entries;
+    let named = |prefix: &str| {
+        entries
+            .iter()
+            .filter(|entry| entry.name.starts_with(prefix))
+            .collect::<Vec<_>>()
+    };
+    let shapes = [
+        (
+            "GDN input",
+            named("qwen38_flash_next_gdn_input_projection_TID_"),
+            named("qwen38_flash_next_gdn_input_projection_prefill_TID_"),
+            "gdn_input",
+            256,
+        ),
+        (
+            "QSA QKV",
+            named("qwen38_flash_next_qsa_qkv_projection_TID_"),
+            named("qwen38_flash_next_qsa_qkv_projection_prefill_TID_"),
+            "qsa_qkv",
+            256,
+        ),
+        (
+            "block output",
+            named("qwen38_flash_next_block_output_projection_TID_"),
+            named("qwen38_flash_next_block_output_projection_prefill_TID_"),
+            "block_output",
+            128,
+        ),
+    ];
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    for (label, decode, prefill, key, threads) in &shapes {
+        require_count(
+            &format!("Qwen3.8-Flash-Next {label} projection decode"),
+            decode.len(),
+            8,
+        )?;
+        require_count(
+            &format!("Qwen3.8-Flash-Next {label} projection prefill"),
+            prefill.len(),
+            4,
+        )?;
+
+        let mut registers = Vec::with_capacity(12);
+        for entry in decode.iter().chain(prefill) {
+            if !entry.body.contains(&format!(".reqntid {threads}, 1, 1")) {
+                return Err(format!(
+                    "entry `{}` lost its {threads}-thread launch bounds",
+                    entry.name
+                )
+                .into());
+            }
+            if !entry.body.contains("mma.sync.aligned.m16n8k16")
+                || !entry.body.contains("cvt.rn.bf16x2.f32")
+            {
+                return Err(format!(
+                    "entry `{}` lost its BF16 MMA or nearest-rounded store",
+                    entry.name
+                )
+                .into());
+            }
+            for forbidden in ["ex2.approx.f32", "lg2.approx.f32", "rcp.rn.f32"] {
+                if entry.body.contains(forbidden) {
+                    return Err(format!(
+                        "plain projection `{}` contains epilogue instruction `{forbidden}`",
+                        entry.name
+                    )
+                    .into());
+                }
+            }
+            if sass_function_body(sass, entry.name).is_none() {
+                return Err(format!(
+                    "cuobjdump omitted Qwen3.8-Flash-Next projection SASS `{}`",
+                    entry.name
+                )
+                .into());
+            }
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            if resource.shared != 0 {
+                return Err(format!(
+                    "entry `{}` reserved {} shared bytes",
+                    entry.name, resource.shared
+                )
+                .into());
+            }
+            registers.push(resource.registers);
+        }
+        registers.sort_unstable();
+        require_registers(&baseline, &format!("{key}_registers"), &registers)?;
+    }
+
+    println!(
+        "Qwen3.8-Flash-Next backbone projection gate passed: 36 entries, STACK:0 LOCAL:0 SHARED:0, BF16 MMA/store and SASS present"
+    );
+    Ok(())
+}
+
+/// Pins the exact BF16 LM-head entry inventory and plain projection contract.
+fn gate_qwen38_flash_next_lm_head(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN38_FLASH_NEXT_LM_HEAD_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+
+    let entries = &sm120_gate_module(root)?.entries;
+    let routes = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("qwen38_flash_next_bf16_lm_head_TID_")
+        })
+        .collect::<Vec<_>>();
+    require_count("Qwen3.8-Flash-Next BF16 LM head", routes.len(), 8)?;
+    require_count(
+        "Qwen3.5 BF16 LM head",
+        entries
+            .iter()
+            .filter(|entry| entry.name.starts_with("qwen35_bf16_lm_head_TID_"))
+            .count(),
+        8,
+    )?;
+
+    let artifact = sm120_gate_artifact(root)?;
+    let resources = &artifact.resources;
+    let sass = artifact.sass()?;
+    let mut registers = Vec::with_capacity(routes.len());
+    for entry in &routes {
+        if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+        if !entry.body.contains("mma.sync.aligned.m16n8k16")
+            || !entry.body.contains("cvt.rn.bf16x2.f32")
+        {
+            return Err(format!(
+                "entry `{}` lost its BF16 MMA or nearest-rounded store",
+                entry.name
+            )
+            .into());
+        }
+        if sass_function_body(sass, entry.name).is_none() {
+            return Err(format!(
+                "cuobjdump omitted Qwen3.8-Flash-Next BF16 LM-head SASS `{}`",
+                entry.name
+            )
+            .into());
+        }
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        if resource.shared != 0 {
+            return Err(format!(
+                "entry `{}` reserved {} shared bytes",
+                entry.name, resource.shared
+            )
+            .into());
+        }
+        registers.push(resource.registers);
+    }
+    registers.sort_unstable();
+    require_registers(&baseline, "lm_head_registers", &registers)?;
+
+    println!(
+        "Qwen3.8-Flash-Next BF16 LM-head gate passed: 8 entries, REG {registers:?}, STACK:0 LOCAL:0 SHARED:0, BF16 MMA/store and SASS present"
     );
     Ok(())
 }
@@ -14202,7 +14467,8 @@ mod tests {
         QWEN35_RESIDENT_MTP_TEST_FILTER, QWEN35_RESIDUAL_NORM_TEST_FILTER,
         QWEN35_TEXT_ENDPOINT_TEST_FILTER, QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
         QWEN36_MTP_LAYER_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
-        QWEN38_FLASH_NEXT_ENGRAM_STAGING_TEST_FILTER, QWEN38_FLASH_NEXT_PLE_TEST_FILTER,
+        QWEN38_FLASH_NEXT_ENGRAM_STAGING_TEST_FILTER, QWEN38_FLASH_NEXT_LM_HEAD_TEST_FILTER,
+        QWEN38_FLASH_NEXT_PLE_TEST_FILTER, QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER,
         SM120_DEVICE_CODEGEN_CRATES, SM120_RESOURCE_BASELINES, STREAMING_WEIGHT_POOL_TEST_FILTER,
         SUBCOMMANDS, bench_device_baselines, bench_device_command, concatenated_resource_baselines,
         contains_immediate_operand, device_is_idle, dispatch, dispatch_probe, names_opcode,
@@ -14295,6 +14561,30 @@ mod tests {
             "qwen38_flash_next_ple_benchmark::tests::qwen38_flash_next_ple_suite_benchmark_byte_accounting_covers_every_read_and_write_plane",
         ] {
             assert!(test.contains(QWEN38_FLASH_NEXT_PLE_TEST_FILTER));
+        }
+    }
+
+    #[test]
+    fn qwen38_flash_next_projection_filters_select_oracles_and_accounting() {
+        for (filter, tests) in [
+            (
+                QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER,
+                &[
+                    "qwen38_flash_next_projection::tests::qwen38_flash_next_projection_suite_routes_match_independent_oracles_and_graph_replay",
+                    "qwen38_flash_next_projection_benchmark::tests::qwen38_flash_next_projection_benchmark_inventory_and_accounting_are_exact",
+                ][..],
+            ),
+            (
+                QWEN38_FLASH_NEXT_LM_HEAD_TEST_FILTER,
+                &[
+                    "qwen38_flash_next_lm_head::tests::qwen38_flash_next_lm_head_suite_routes_match_independent_oracles_and_graph_replay",
+                    "qwen38_flash_next_lm_head_benchmark::tests::qwen38_flash_next_lm_head_benchmark_inventory_and_accounting_are_exact",
+                ][..],
+            ),
+        ] {
+            for test in tests {
+                assert!(test.contains(filter));
+            }
         }
     }
 
@@ -14616,6 +14906,8 @@ mod tests {
                 "qual/baselines/qwen38-flash-next-qsa-selection-sm120.txt",
                 "qual/baselines/qwen38-flash-next-moe-router-sm120.txt",
                 "qual/baselines/qwen38-flash-next-moe-experts-sm120.txt",
+                "qual/baselines/qwen38-flash-next-projection-sm120.txt",
+                "qual/baselines/qwen38-flash-next-lm-head-sm120.txt",
                 "qual/baselines/attention-qk-prepare-sm120.txt",
                 "qual/baselines/qwen35-attention-qk-prepare-sm120.txt",
                 "qual/baselines/qwen36-attention-qk-prepare-sm120.txt",
@@ -15387,6 +15679,18 @@ mod tests {
                 NO_SNAPSHOT,
             ),
             (
+                "qualify-qwen38-flash-next-projections",
+                "qwen38_flash_next_projection",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
+                "qualify-qwen38-flash-next-lm-head",
+                "qwen38_flash_next_lm_head",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
                 "qualify-gdn-recurrence",
                 "gdn_recurrence::tests::route_inventory_and_arena_accounting_are_exact",
                 EXACT_SERIAL,
@@ -15593,7 +15897,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 95);
+        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 97);
 
         let snapshot = OsString::from("/snapshot");
         for &(command, filter, trailing, variable) in EXPECTED_QUALIFICATION_ROUTES {
