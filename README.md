@@ -29,9 +29,8 @@ cd tuiskollm-*-linux-x86_64*/
 ./tuiskollm serve unsloth/Qwen3.8-27B-NVFP4
 ```
 
-For Qwen3.8, TuiskoLLM resolves its pinned Hugging Face snapshot, downloading and verifying any
-missing files. Other served model IDs are listed below; Qwen3.5 and Qwen3.6 currently require
-`--snapshot`.
+TuiskoLLM resolves the selected model's pinned Hugging Face revision, downloading and verifying any
+missing files. Pass `--snapshot PATH` to use an explicit checkpoint directory.
 
 After validating and loading the checkpoint, the server listens on `127.0.0.1:8000` by default:
 
