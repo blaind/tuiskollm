@@ -3,6 +3,7 @@
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
@@ -788,17 +789,37 @@ pub(crate) fn qwen35_mtp_bf16_mlp_ptx_names() -> Vec<&'static str> {
     ]
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(E::Module),
+    error(GpuError),
+    dispatch(dispatch_mtp_bf16_mlp),
+    required(1, 2, 3, 4, 5, 6, 7, 8),
+    inventory(false)
+)]
+struct MtpBf16MlpRoutes<A: Arch, E: MtpMlpEntries<A>> {
+    #[route(1)]
+    b1: E::Decode<1>,
+    #[route(2)]
+    b2: E::Decode<2>,
+    #[route(3)]
+    b3: E::Decode<3>,
+    #[route(4)]
+    b4: E::Decode<4>,
+    #[route(5)]
+    b5: E::Decode<5>,
+    #[route(6)]
+    b6: E::Decode<6>,
+    #[route(7)]
+    b7: E::Decode<7>,
+    #[route(8)]
+    b8: E::Decode<8>,
+}
+
 /// Prepared source-BF16 MTP SwiGLU and down-projection routes for `B=1..=8`.
 pub struct MtpBf16MlpOp<A: Arch = Qwen38_27B, E: MtpMlpEntries<A> = Qwen38MtpMlpEntries> {
     module: E::Module,
-    b1: E::Decode<1>,
-    b2: E::Decode<2>,
-    b3: E::Decode<3>,
-    b4: E::Decode<4>,
-    b5: E::Decode<5>,
-    b6: E::Decode<6>,
-    b7: E::Decode<7>,
-    b8: E::Decode<8>,
+    routes: MtpBf16MlpRoutes<A, E>,
 }
 
 /// Prepared source-BF16 Qwen3.5 MTP SwiGLU and down routes for `B=1..=8`.
@@ -812,14 +833,7 @@ impl<A: Arch, E: MtpMlpEntries<A>> MtpBf16MlpOp<A, E> {
         let module = E::load(context)?;
 
         Ok(Self {
-            b1: E::Decode::<1>::prepare(&module)?,
-            b2: E::Decode::<2>::prepare(&module)?,
-            b3: E::Decode::<3>::prepare(&module)?,
-            b4: E::Decode::<4>::prepare(&module)?,
-            b5: E::Decode::<5>::prepare(&module)?,
-            b6: E::Decode::<6>::prepare(&module)?,
-            b7: E::Decode::<7>::prepare(&module)?,
-            b8: E::Decode::<8>::prepare(&module)?,
+            routes: MtpBf16MlpRoutes::prepare(&module)?,
             module,
         })
     }
@@ -846,10 +860,10 @@ impl<A: Arch, E: MtpMlpEntries<A>> MtpBf16MlpOp<A, E> {
         output: *mut u16,
     ) -> GpuResult<()> {
         macro_rules! launch {
-            ($route:ident) => {
+            ($route:expr) => {
                 // SAFETY: exact-B dispatch preserves the public pointer contract.
                 unsafe {
-                    self.$route.launch(
+                    $route.launch(
                         &self.module,
                         stream,
                         input,
@@ -862,20 +876,10 @@ impl<A: Arch, E: MtpMlpEntries<A>> MtpBf16MlpOp<A, E> {
             };
         }
 
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_mtp_bf16_mlp!(&self.routes, batch, |route| launch!(route), else => Err(GpuError::invalid_launch(format!(
                 "{}MTP BF16 MLP batch {batch} is outside exact B=1..={MAX_BATCH}",
                 E::LABEL
-            ))),
-        }
+            ))) )
     }
 }
 
