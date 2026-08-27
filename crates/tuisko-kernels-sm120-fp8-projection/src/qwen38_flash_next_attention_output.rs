@@ -6,6 +6,7 @@
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::attention_output::attention_gate_bf16;
 use tuisko_model::{Arch, Qwen38FlashNext};
 
@@ -182,24 +183,48 @@ pub(crate) fn qwen38_flash_next_attention_output_ptx_names() -> [&'static str; R
     ]
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen38_flash_next_attention_gate),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
+    inventory(false)
+)]
+struct Qwen38FlashNextAttentionGateRoutes {
+    #[route(1)]
+    b1: PreparedGate<1>,
+    #[route(2)]
+    b2: PreparedGate<2>,
+    #[route(3)]
+    b3: PreparedGate<3>,
+    #[route(4)]
+    b4: PreparedGate<4>,
+    #[route(5)]
+    b5: PreparedGate<5>,
+    #[route(6)]
+    b6: PreparedGate<6>,
+    #[route(7)]
+    b7: PreparedGate<7>,
+    #[route(8)]
+    b8: PreparedGate<8>,
+    #[route(32)]
+    t32: PreparedPrefillGate<32>,
+    #[route(64)]
+    t64: PreparedPrefillGate<64>,
+    #[route(128)]
+    t128: PreparedPrefillGate<128>,
+    #[route(1024)]
+    t1024: PreparedPrefillGate<1_024>,
+}
+
 /// Prepared Qwen3.8-Flash-Next QSA sigmoid output-gate routes for exact `B=1..8` and
 /// `T=32,64,128,1024`.
 ///
 /// Stops at the BF16 seam consumed by the `6144 -> 2560` output projection.
 pub struct Qwen38FlashNextAttentionGateOp {
     module: kernels::LoadedModule,
-    b1: PreparedGate<1>,
-    b2: PreparedGate<2>,
-    b3: PreparedGate<3>,
-    b4: PreparedGate<4>,
-    b5: PreparedGate<5>,
-    b6: PreparedGate<6>,
-    b7: PreparedGate<7>,
-    b8: PreparedGate<8>,
-    t32: PreparedPrefillGate<32>,
-    t64: PreparedPrefillGate<64>,
-    t128: PreparedPrefillGate<128>,
-    t1024: PreparedPrefillGate<1_024>,
+    routes: Qwen38FlashNextAttentionGateRoutes,
 }
 
 impl Qwen38FlashNextAttentionGateOp {
@@ -216,18 +241,7 @@ impl Qwen38FlashNextAttentionGateOp {
         })?;
 
         Ok(Self {
-            b1: PreparedGate::prepare(&module)?,
-            b2: PreparedGate::prepare(&module)?,
-            b3: PreparedGate::prepare(&module)?,
-            b4: PreparedGate::prepare(&module)?,
-            b5: PreparedGate::prepare(&module)?,
-            b6: PreparedGate::prepare(&module)?,
-            b7: PreparedGate::prepare(&module)?,
-            b8: PreparedGate::prepare(&module)?,
-            t32: PreparedPrefillGate::prepare(&module)?,
-            t64: PreparedPrefillGate::prepare(&module)?,
-            t128: PreparedPrefillGate::prepare(&module)?,
-            t1024: PreparedPrefillGate::prepare(&module)?,
+            routes: Qwen38FlashNextAttentionGateRoutes::prepare(&module)?,
             module,
         })
     }
@@ -249,33 +263,16 @@ impl Qwen38FlashNextAttentionGateOp {
         activation: *mut u16,
     ) -> GpuResult<()> {
         macro_rules! launch_gate {
-            ($route:ident) => {
+            ($route:expr) => {
                 // SAFETY: the caller's pointer contract reaches the entry
                 // unchanged.
-                unsafe {
-                    self.$route
-                        .launch(&self.module, stream, attention, qkv, activation)
-                }
+                unsafe { $route.launch(&self.module, stream, attention, qkv, activation) }
             };
         }
 
-        match tokens {
-            1 => launch_gate!(b1),
-            2 => launch_gate!(b2),
-            3 => launch_gate!(b3),
-            4 => launch_gate!(b4),
-            5 => launch_gate!(b5),
-            6 => launch_gate!(b6),
-            7 => launch_gate!(b7),
-            8 => launch_gate!(b8),
-            32 => launch_gate!(t32),
-            64 => launch_gate!(t64),
-            128 => launch_gate!(t128),
-            1_024 => launch_gate!(t1024),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_qwen38_flash_next_attention_gate!(&self.routes, tokens, |route| launch_gate!(route), else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.8-Flash-Next QSA attention output tokens {tokens} must be one of 1..={MAX_BATCH}, 32, 64, 128, or 1024"
-            ))),
-        }
+            ))) )
     }
 }
 
