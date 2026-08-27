@@ -117,7 +117,6 @@ See `docs/performance.md` for commands and measurement semantics.
   narrate obvious code. Preserve blank lines between logical blocks.
 - Preserve unrelated working-tree changes. Keep generated PTX, SASS, cubins, profiles, model files,
   benchmark reports, and build products out of Git; repository-local outputs belong under `target/`.
-- Do not commit or push unless the user explicitly requests it.
 - Count skips separately from passes. A deferred fix needs an `#[ignore]`d acceptance test that
   states the missing condition.
 - When implementation reveals a durable repository-wide invariant or recurring failure mode not
