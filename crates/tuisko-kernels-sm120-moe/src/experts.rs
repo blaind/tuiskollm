@@ -5,6 +5,7 @@ use cuda_device::{
 };
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_model::{Arch, Qwen36Moe35B};
 
 const MAX_BATCH: usize = 8;
@@ -55,10 +56,6 @@ const _: () = assert!(INTERMEDIATE.is_multiple_of(GROUP_K));
 const _: () = assert!(INTERMEDIATE.is_multiple_of(GATE_UP_WARPS));
 const _: () = assert!(HIDDEN.is_multiple_of(DOWN_ROWS_PER_CTA));
 const _: () = assert!(HIDDEN.is_multiple_of(COMBINE_THREADS as usize));
-
-fn admitted_rows(rows: usize) -> bool {
-    (1..=MAX_BATCH).contains(&rows) || PREFILL_ROWS.contains(&rows)
-}
 
 #[allow(clippy::too_many_arguments)]
 #[cuda_module]
@@ -722,6 +719,14 @@ impl<const TOKENS: usize> PreparedBatchRoute<TOKENS> {
         })
     }
 
+    fn ptx_names() -> Vec<&'static str> {
+        vec![
+            kernels::qwen36_moe_expert_gate_up_ptx_name::<TOKENS>(),
+            kernels::qwen36_moe_expert_down_ptx_name::<TOKENS>(),
+            kernels::qwen36_moe_expert_combine_ptx_name::<TOKENS>(),
+        ]
+    }
+
     #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
@@ -830,6 +835,14 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
         })
     }
 
+    fn ptx_names() -> Vec<&'static str> {
+        vec![
+            kernels::qwen36_moe_expert_gate_up_prefill_ptx_name::<TOKENS>(),
+            kernels::qwen36_moe_expert_down_prefill_ptx_name::<TOKENS>(),
+            kernels::qwen36_moe_expert_combine_prefill_ptx_name::<TOKENS>(),
+        ]
+    }
+
     #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
@@ -901,53 +914,47 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
     }
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_moe_experts),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128)
+)]
+struct MoeExpertRoutes {
+    #[route(1)]
+    b1: PreparedBatchRoute<1>,
+    #[route(2)]
+    b2: PreparedBatchRoute<2>,
+    #[route(3)]
+    b3: PreparedBatchRoute<3>,
+    #[route(4)]
+    b4: PreparedBatchRoute<4>,
+    #[route(5)]
+    b5: PreparedBatchRoute<5>,
+    #[route(6)]
+    b6: PreparedBatchRoute<6>,
+    #[route(7)]
+    b7: PreparedBatchRoute<7>,
+    #[route(8)]
+    b8: PreparedBatchRoute<8>,
+    #[route(32)]
+    t32: PreparedPrefillRoute<32>,
+    #[route(64)]
+    t64: PreparedPrefillRoute<64>,
+    #[route(128)]
+    t128: PreparedPrefillRoute<128>,
+}
+
 /// PTX symbols retained for every exact Qwen3.6 expert batch.
 pub(crate) fn qwen36_moe_experts_ptx_names() -> Vec<&'static str> {
-    let mut names = Vec::with_capacity(3 * (MAX_BATCH + PREFILL_ROWS.len()));
-
-    macro_rules! push_route {
-        ($tokens:literal) => {
-            names.push(kernels::qwen36_moe_expert_gate_up_ptx_name::<$tokens>());
-            names.push(kernels::qwen36_moe_expert_down_ptx_name::<$tokens>());
-            names.push(kernels::qwen36_moe_expert_combine_ptx_name::<$tokens>());
-        };
-    }
-    macro_rules! push_prefill {
-        ($tokens:literal) => {
-            names.push(kernels::qwen36_moe_expert_gate_up_prefill_ptx_name::<$tokens>());
-            names.push(kernels::qwen36_moe_expert_down_prefill_ptx_name::<$tokens>());
-            names.push(kernels::qwen36_moe_expert_combine_prefill_ptx_name::<$tokens>());
-        };
-    }
-
-    push_route!(1);
-    push_route!(2);
-    push_route!(3);
-    push_route!(4);
-    push_route!(5);
-    push_route!(6);
-    push_route!(7);
-    push_route!(8);
-    push_prefill!(32);
-    push_prefill!(64);
-    push_prefill!(128);
-    names
+    MoeExpertRoutes::ptx_names()
 }
 
 /// Prepared exact-batch Qwen3.6 routed/shared NVFP4 expert routes on SM120.
 pub struct Qwen36MoeExpertsOp {
     module: kernels::LoadedModule,
-    b1: PreparedBatchRoute<1>,
-    b2: PreparedBatchRoute<2>,
-    b3: PreparedBatchRoute<3>,
-    b4: PreparedBatchRoute<4>,
-    b5: PreparedBatchRoute<5>,
-    b6: PreparedBatchRoute<6>,
-    b7: PreparedBatchRoute<7>,
-    b8: PreparedBatchRoute<8>,
-    t32: PreparedPrefillRoute<32>,
-    t64: PreparedPrefillRoute<64>,
-    t128: PreparedPrefillRoute<128>,
+    routes: MoeExpertRoutes,
 }
 
 impl Qwen36MoeExpertsOp {
@@ -957,20 +964,9 @@ impl Qwen36MoeExpertsOp {
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module("loading the Qwen3.6 MoE experts", source))?;
 
-        Ok(Self {
-            b1: PreparedBatchRoute::prepare(&module)?,
-            b2: PreparedBatchRoute::prepare(&module)?,
-            b3: PreparedBatchRoute::prepare(&module)?,
-            b4: PreparedBatchRoute::prepare(&module)?,
-            b5: PreparedBatchRoute::prepare(&module)?,
-            b6: PreparedBatchRoute::prepare(&module)?,
-            b7: PreparedBatchRoute::prepare(&module)?,
-            b8: PreparedBatchRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
-            module,
-        })
+        let routes = MoeExpertRoutes::prepare(&module)?;
+
+        Ok(Self { module, routes })
     }
 
     /// Executes the selected routed experts, shared expert, and fixed-order combine.
@@ -1008,59 +1004,39 @@ impl Qwen36MoeExpertsOp {
         shared_gate: *mut u16,
         output: *mut u16,
     ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        expert_indices,
-                        routing_weights,
-                        routed_gate_up_codes,
-                        routed_gate_up_scales,
-                        routed_gate_up_weight_scales_2,
-                        routed_down_codes,
-                        routed_down_scales,
-                        routed_down_weight_scales_2,
-                        shared_gate_up_codes,
-                        shared_gate_up_scales,
-                        shared_gate_up_weight_scale_2,
-                        shared_down_codes,
-                        shared_down_scales,
-                        shared_down_weight_scale_2,
-                        shared_gate_weight,
-                        intermediate,
-                        expert_output,
-                        shared_gate,
-                        output,
-                    )
-                }
-            };
-        }
-
-        if !admitted_rows(rows) {
-            return Err(GpuError::invalid_launch(format!(
+        dispatch_moe_experts!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    input,
+                    expert_indices,
+                    routing_weights,
+                    routed_gate_up_codes,
+                    routed_gate_up_scales,
+                    routed_gate_up_weight_scales_2,
+                    routed_down_codes,
+                    routed_down_scales,
+                    routed_down_weight_scales_2,
+                    shared_gate_up_codes,
+                    shared_gate_up_scales,
+                    shared_gate_up_weight_scale_2,
+                    shared_down_codes,
+                    shared_down_scales,
+                    shared_down_weight_scale_2,
+                    shared_gate_weight,
+                    intermediate,
+                    expert_output,
+                    shared_gate,
+                    output,
+                )
+            },
+            else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.6 MoE expert row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128"
-            )));
-        }
-
-        match rows {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.6 MoE expert row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128"
-            ))),
-        }
+            )))
+        )
     }
 }
 
@@ -1068,8 +1044,8 @@ impl Qwen36MoeExpertsOp {
 mod tests {
     use super::{
         DOWN_CODE_BYTES_PER_EXPERT, DOWN_SCALE_BYTES_PER_EXPERT, EXPERTS,
-        GATE_UP_CODE_BYTES_PER_EXPERT, GATE_UP_SCALE_BYTES_PER_EXPERT, MAX_BATCH, PREFILL_ROWS,
-        SLOTS_PER_TOKEN, admitted_rows, qwen36_moe_experts_ptx_names,
+        GATE_UP_CODE_BYTES_PER_EXPERT, GATE_UP_SCALE_BYTES_PER_EXPERT, MAX_BATCH, MoeExpertRoutes,
+        PREFILL_ROWS, SLOTS_PER_TOKEN, qwen36_moe_experts_ptx_names,
     };
     use std::collections::BTreeSet;
 
@@ -1105,7 +1081,7 @@ mod tests {
             (128, true),
             (129, false),
         ] {
-            assert_eq!(admitted_rows(rows), expected, "rows={rows}");
+            assert_eq!(MoeExpertRoutes::contains(rows), expected, "rows={rows}");
         }
     }
 }

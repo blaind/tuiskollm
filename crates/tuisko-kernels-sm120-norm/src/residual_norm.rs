@@ -3,6 +3,7 @@
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract, thread};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
@@ -740,7 +741,7 @@ impl<A: Arch> ResidualNormRoute<A> for UnadmittedRoute {
     }
 }
 
-// `row_route` rejects an unadmitted width before dispatch, so this is the
+// Exact-route dispatch rejects an unadmitted width, so this is the
 // defensive tail of a route that owns no entry.
 fn unadmitted_route() -> GpuError {
     GpuError::invalid_launch("RMSNorm route is not admitted for this architecture")
@@ -885,42 +886,39 @@ pub(crate) fn qwen36_residual_norm_ptx_names() -> [&'static str; 22] {
     ]
 }
 
-/// The compiled route one admitted row count selects.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RowRoute {
-    B1,
-    B2,
-    B3,
-    B4,
-    B5,
-    B6,
-    B7,
-    B8,
-    T32,
-    T64,
-    T128,
-    T1024,
-}
-
-// The admitted row schedule, transcribed from the three prepared dispatches
-// it replaces: decode B=1..=8 and prefill T=32,64,128 everywhere, and the
-// T=1024 prefill only where the entry table admits it.
-fn row_route<A: Arch, E: ResidualNormEntries<A>>(rows: usize) -> Option<RowRoute> {
-    match rows {
-        1 => Some(RowRoute::B1),
-        2 => Some(RowRoute::B2),
-        3 => Some(RowRoute::B3),
-        4 => Some(RowRoute::B4),
-        5 => Some(RowRoute::B5),
-        6 => Some(RowRoute::B6),
-        7 => Some(RowRoute::B7),
-        8 => Some(RowRoute::B8),
-        32 => Some(RowRoute::T32),
-        64 => Some(RowRoute::T64),
-        128 => Some(RowRoute::T128),
-        1024 if E::HAS_T1024 => Some(RowRoute::T1024),
-        _ => None,
-    }
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_residual_norm),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
+    inventory(false)
+)]
+struct ResidualNormRoutes<A: Arch, E: ResidualNormEntries<A>> {
+    #[route(1)]
+    b1: E::DecodeOne,
+    #[route(2)]
+    b2: E::Decode<2>,
+    #[route(3)]
+    b3: E::Decode<3>,
+    #[route(4)]
+    b4: E::Decode<4>,
+    #[route(5)]
+    b5: E::Decode<5>,
+    #[route(6)]
+    b6: E::Decode<6>,
+    #[route(7)]
+    b7: E::Decode<7>,
+    #[route(8)]
+    b8: E::Decode<8>,
+    #[route(32)]
+    t32: PreparedPrefillRoute<A, 32>,
+    #[route(64)]
+    t64: PreparedPrefillRoute<A, 64>,
+    #[route(128)]
+    t128: PreparedPrefillRoute<A, 128>,
+    #[route(1024, admitted(E::HAS_T1024))]
+    t1024: E::Prefill1024,
 }
 
 fn admitted_prefill_rows<A: Arch, E: ResidualNormEntries<A>>() -> &'static str {
@@ -946,18 +944,7 @@ pub struct ResidualNormOp<
     E: ResidualNormEntries<A> = Qwen38ResidualNormEntries,
 > {
     module: kernels::LoadedModule,
-    b1: E::DecodeOne,
-    b2: E::Decode<2>,
-    b3: E::Decode<3>,
-    b4: E::Decode<4>,
-    b5: E::Decode<5>,
-    b6: E::Decode<6>,
-    b7: E::Decode<7>,
-    b8: E::Decode<8>,
-    t32: PreparedPrefillRoute<A, 32>,
-    t64: PreparedPrefillRoute<A, 64>,
-    t128: PreparedPrefillRoute<A, 128>,
-    t1024: E::Prefill1024,
+    routes: ResidualNormRoutes<A, E>,
 }
 
 /// Prepared Qwen3.5 RMSNorm routes for decode `B=1..8` and prefill `T=32,64,128`.
@@ -992,21 +979,9 @@ impl<A: Arch, E: ResidualNormEntries<A>> ResidualNormOp<A, E> {
         // T=128 is 128 independent rows. One 128-CTA launch removes 15
         // boundaries versus sixteen B=8 launches while each CTA retains the
         // same 512-thread traversal and reduction order.
-        Ok(Self {
-            b1: E::DecodeOne::prepare(&module)?,
-            b2: E::Decode::<2>::prepare(&module)?,
-            b3: E::Decode::<3>::prepare(&module)?,
-            b4: E::Decode::<4>::prepare(&module)?,
-            b5: E::Decode::<5>::prepare(&module)?,
-            b6: E::Decode::<6>::prepare(&module)?,
-            b7: E::Decode::<7>::prepare(&module)?,
-            b8: E::Decode::<8>::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
-            t1024: E::Prefill1024::prepare(&module)?,
-            module,
-        })
+        let routes = ResidualNormRoutes::prepare(&module)?;
+
+        Ok(Self { module, routes })
     }
 
     /// Launches the plain RMSNorm route for one exact decode or prefill row count.
@@ -1024,31 +999,14 @@ impl<A: Arch, E: ResidualNormEntries<A>> ResidualNormOp<A, E> {
         weight: *const u16,
         output: *mut u16,
     ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: the public method's pointer contract is unchanged by dispatch.
-                unsafe {
-                    self.$route
-                        .launch_plain(&self.module, stream, input, weight, output)
-                }
-            };
-        }
-
-        match row_route::<A, E>(rows) {
-            Some(RowRoute::B1) => launch!(b1),
-            Some(RowRoute::B2) => launch!(b2),
-            Some(RowRoute::B3) => launch!(b3),
-            Some(RowRoute::B4) => launch!(b4),
-            Some(RowRoute::B5) => launch!(b5),
-            Some(RowRoute::B6) => launch!(b6),
-            Some(RowRoute::B7) => launch!(b7),
-            Some(RowRoute::B8) => launch!(b8),
-            Some(RowRoute::T32) => launch!(t32),
-            Some(RowRoute::T64) => launch!(t64),
-            Some(RowRoute::T128) => launch!(t128),
-            Some(RowRoute::T1024) => launch!(t1024),
-            None => Err(unsupported_rows::<A, E>("RMSNorm", rows)),
-        }
+        dispatch_residual_norm!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch_plain(&self.module, stream, input, weight, output)
+            },
+            else => Err(unsupported_rows::<A, E>("RMSNorm", rows))
+        )
     }
 
     /// Publishes BF16 residual sums and launches their next RMSNorm.
@@ -1070,38 +1028,22 @@ impl<A: Arch, E: ResidualNormEntries<A>> ResidualNormOp<A, E> {
         residual_output: *mut u16,
         normalized_output: *mut u16,
     ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: the public method's pointer contract is unchanged by dispatch.
-                unsafe {
-                    self.$route.launch_residual(
-                        &self.module,
-                        stream,
-                        residual_input,
-                        branch,
-                        weight,
-                        residual_output,
-                        normalized_output,
-                    )
-                }
-            };
-        }
-
-        match row_route::<A, E>(rows) {
-            Some(RowRoute::B1) => launch!(b1),
-            Some(RowRoute::B2) => launch!(b2),
-            Some(RowRoute::B3) => launch!(b3),
-            Some(RowRoute::B4) => launch!(b4),
-            Some(RowRoute::B5) => launch!(b5),
-            Some(RowRoute::B6) => launch!(b6),
-            Some(RowRoute::B7) => launch!(b7),
-            Some(RowRoute::B8) => launch!(b8),
-            Some(RowRoute::T32) => launch!(t32),
-            Some(RowRoute::T64) => launch!(t64),
-            Some(RowRoute::T128) => launch!(t128),
-            Some(RowRoute::T1024) => launch!(t1024),
-            None => Err(unsupported_rows::<A, E>("residual RMSNorm", rows)),
-        }
+        dispatch_residual_norm!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch_residual(
+                    &self.module,
+                    stream,
+                    residual_input,
+                    branch,
+                    weight,
+                    residual_output,
+                    normalized_output,
+                )
+            },
+            else => Err(unsupported_rows::<A, E>("residual RMSNorm", rows))
+        )
     }
 }
 
@@ -1109,8 +1051,8 @@ impl<A: Arch, E: ResidualNormEntries<A>> ResidualNormOp<A, E> {
 mod tests {
     use super::{
         MAX_BATCH, Qwen35ResidualNormEntries, Qwen36ResidualNormEntries, Qwen38ResidualNormEntries,
-        ResidualNormEntries, RowRoute, THREADS, WARPS, qwen35_residual_norm_ptx_names,
-        qwen36_residual_norm_ptx_names, residual_norm_geometry, residual_norm_ptx_names, row_route,
+        ResidualNormEntries, ResidualNormRoutes, THREADS, WARPS, qwen35_residual_norm_ptx_names,
+        qwen36_residual_norm_ptx_names, residual_norm_geometry, residual_norm_ptx_names,
         unsupported_rows,
     };
     use std::collections::{BTreeMap, BTreeSet};
@@ -1118,26 +1060,14 @@ mod tests {
     use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
     /// The decode and prefill widths every admitted architecture routes.
-    const SHARED_SCHEDULE: [(usize, RowRoute); 11] = [
-        (1, RowRoute::B1),
-        (2, RowRoute::B2),
-        (3, RowRoute::B3),
-        (4, RowRoute::B4),
-        (5, RowRoute::B5),
-        (6, RowRoute::B6),
-        (7, RowRoute::B7),
-        (8, RowRoute::B8),
-        (32, RowRoute::T32),
-        (64, RowRoute::T64),
-        (128, RowRoute::T128),
-    ];
+    const SHARED_SCHEDULE: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 
     /// Every row count the entry table admits, swept exhaustively so an
     /// unadmitted width cannot hide between the transcribed ones.
-    fn admitted_schedule<A: Arch, E: ResidualNormEntries<A>>() -> Vec<(usize, RowRoute)> {
+    fn admitted_schedule<A: Arch, E: ResidualNormEntries<A>>() -> Vec<usize> {
         (0..=2_048)
             .chain([usize::MAX])
-            .filter_map(|rows| row_route::<A, E>(rows).map(|route| (rows, route)))
+            .filter(|rows| ResidualNormRoutes::<A, E>::contains(*rows))
             .collect()
     }
 
@@ -1287,7 +1217,7 @@ mod tests {
         let qwen38 = SHARED_SCHEDULE
             .iter()
             .copied()
-            .chain([(1_024, RowRoute::T1024)])
+            .chain([1_024])
             .collect::<Vec<_>>();
 
         assert_eq!(

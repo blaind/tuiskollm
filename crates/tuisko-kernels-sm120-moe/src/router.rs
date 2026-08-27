@@ -3,6 +3,7 @@
 use cuda_device::{cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_model::{Arch, Qwen36Moe35B};
 
 const MAX_BATCH: usize = 8;
@@ -29,10 +30,6 @@ const _: () = assert!(EXPERTS == 256);
 const _: () = assert!(TOP_K == 8);
 const _: () = assert!(HIDDEN.is_multiple_of(64));
 const _: () = assert!(EXPERTS.is_multiple_of(PROJECTION_WARPS));
-
-fn admitted_rows(rows: usize) -> bool {
-    (1..=MAX_BATCH).contains(&rows) || PREFILL_ROWS.contains(&rows)
-}
 
 #[cuda_module]
 mod kernels {
@@ -291,6 +288,13 @@ impl<const TOKENS: usize> PreparedBatchRoute<TOKENS> {
         })
     }
 
+    fn ptx_names() -> Vec<&'static str> {
+        vec![
+            kernels::qwen36_moe_router_logits_ptx_name::<TOKENS>(),
+            kernels::qwen36_moe_router_select_ptx_name::<TOKENS>(),
+        ]
+    }
+
     #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
@@ -354,6 +358,13 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
         })
     }
 
+    fn ptx_names() -> Vec<&'static str> {
+        vec![
+            kernels::qwen36_moe_router_logits_prefill_ptx_name::<TOKENS>(),
+            kernels::qwen36_moe_router_select_prefill_ptx_name::<TOKENS>(),
+        ]
+    }
+
     #[allow(clippy::too_many_arguments)]
     unsafe fn launch(
         &self,
@@ -390,51 +401,47 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
     }
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_moe_router),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128)
+)]
+struct MoeRouterRoutes {
+    #[route(1)]
+    b1: PreparedBatchRoute<1>,
+    #[route(2)]
+    b2: PreparedBatchRoute<2>,
+    #[route(3)]
+    b3: PreparedBatchRoute<3>,
+    #[route(4)]
+    b4: PreparedBatchRoute<4>,
+    #[route(5)]
+    b5: PreparedBatchRoute<5>,
+    #[route(6)]
+    b6: PreparedBatchRoute<6>,
+    #[route(7)]
+    b7: PreparedBatchRoute<7>,
+    #[route(8)]
+    b8: PreparedBatchRoute<8>,
+    #[route(32)]
+    t32: PreparedPrefillRoute<32>,
+    #[route(64)]
+    t64: PreparedPrefillRoute<64>,
+    #[route(128)]
+    t128: PreparedPrefillRoute<128>,
+}
+
 /// PTX symbols retained for every exact Qwen3.6 router batch.
 pub(crate) fn qwen36_moe_router_ptx_names() -> Vec<&'static str> {
-    let mut names = Vec::with_capacity(2 * (MAX_BATCH + PREFILL_ROWS.len()));
-
-    macro_rules! push_decode {
-        ($tokens:literal) => {
-            names.push(kernels::qwen36_moe_router_logits_ptx_name::<$tokens>());
-            names.push(kernels::qwen36_moe_router_select_ptx_name::<$tokens>());
-        };
-    }
-    macro_rules! push_prefill {
-        ($tokens:literal) => {
-            names.push(kernels::qwen36_moe_router_logits_prefill_ptx_name::<$tokens>());
-            names.push(kernels::qwen36_moe_router_select_prefill_ptx_name::<$tokens>());
-        };
-    }
-
-    push_decode!(1);
-    push_decode!(2);
-    push_decode!(3);
-    push_decode!(4);
-    push_decode!(5);
-    push_decode!(6);
-    push_decode!(7);
-    push_decode!(8);
-    push_prefill!(32);
-    push_prefill!(64);
-    push_prefill!(128);
-    names
+    MoeRouterRoutes::ptx_names()
 }
 
 /// Prepared exact-batch Qwen3.6 BF16 router routes on SM120.
 pub struct Qwen36MoeRouterOp {
     module: kernels::LoadedModule,
-    b1: PreparedBatchRoute<1>,
-    b2: PreparedBatchRoute<2>,
-    b3: PreparedBatchRoute<3>,
-    b4: PreparedBatchRoute<4>,
-    b5: PreparedBatchRoute<5>,
-    b6: PreparedBatchRoute<6>,
-    b7: PreparedBatchRoute<7>,
-    b8: PreparedBatchRoute<8>,
-    t32: PreparedPrefillRoute<32>,
-    t64: PreparedPrefillRoute<64>,
-    t128: PreparedPrefillRoute<128>,
+    routes: MoeRouterRoutes,
 }
 
 impl Qwen36MoeRouterOp {
@@ -444,20 +451,9 @@ impl Qwen36MoeRouterOp {
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module("loading the Qwen3.6 MoE router", source))?;
 
-        Ok(Self {
-            b1: PreparedBatchRoute::prepare(&module)?,
-            b2: PreparedBatchRoute::prepare(&module)?,
-            b3: PreparedBatchRoute::prepare(&module)?,
-            b4: PreparedBatchRoute::prepare(&module)?,
-            b5: PreparedBatchRoute::prepare(&module)?,
-            b6: PreparedBatchRoute::prepare(&module)?,
-            b7: PreparedBatchRoute::prepare(&module)?,
-            b8: PreparedBatchRoute::prepare(&module)?,
-            t32: PreparedPrefillRoute::prepare(&module)?,
-            t64: PreparedPrefillRoute::prepare(&module)?,
-            t128: PreparedPrefillRoute::prepare(&module)?,
-            module,
-        })
+        let routes = MoeRouterRoutes::prepare(&module)?;
+
+        Ok(Self { module, routes })
     }
 
     /// Projects BF16 logits, selects top eight experts, and emits BF16 routing weights.
@@ -479,50 +475,31 @@ impl Qwen36MoeRouterOp {
         expert_indices: *mut u16,
         expert_weights: *mut u16,
     ) -> GpuResult<()> {
-        if !admitted_rows(rows) {
-            return Err(GpuError::invalid_launch(format!(
+        dispatch_moe_router!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    input,
+                    weights,
+                    logits,
+                    expert_indices,
+                    expert_weights,
+                )
+            },
+            else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.6 MoE router row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128"
-            )));
-        }
-        macro_rules! launch {
-            ($route:ident) => {
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        weights,
-                        logits,
-                        expert_indices,
-                        expert_weights,
-                    )
-                }
-            };
-        }
-
-        match rows {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            32 => launch!(t32),
-            64 => launch!(t64),
-            128 => launch!(t128),
-            _ => Err(GpuError::invalid_launch(format!(
-                "Qwen3.6 MoE router row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128"
-            ))),
-        }
+            )))
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPERT_BLOCKS, MAX_BATCH, PREFILL_ROWS, WORDS_PER_ROW, admitted_rows,
+        EXPERT_BLOCKS, MAX_BATCH, MoeRouterRoutes, PREFILL_ROWS, WORDS_PER_ROW,
         qwen36_moe_router_ptx_names,
     };
     use std::collections::BTreeSet;
@@ -555,7 +532,7 @@ mod tests {
             (128, true),
             (129, false),
         ] {
-            assert_eq!(admitted_rows(rows), expected, "rows={rows}");
+            assert_eq!(MoeRouterRoutes::contains(rows), expected, "rows={rows}");
         }
     }
 }
