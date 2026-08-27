@@ -7,8 +7,9 @@ use crate::gdn_input_tma::{
     DenseFp8GdnInputTmaMaps, DenseFp8GdnInputTmaRoute, ptx_name as gdn_input_tma_ptx_name,
 };
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
-use std::sync::Arc;
+use std::{marker::PhantomData, sync::Arc};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_kernels_sm120_common::device::quantize_activation;
 use tuisko_model::{Arch, Qwen38_27B};
@@ -523,13 +524,14 @@ impl<A: Arch, const TOKENS: usize> PreparedLmHeadRoute<A, TOKENS> {
     }
 }
 
-struct PreparedQkvT16Route {
+struct PreparedQkvT16Route<A: Arch> {
     quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
     projection: PreparedLaunch<kernels::__fp8_qkv_mma_t16_CudaKernel>,
+    architecture: PhantomData<A>,
 }
 
-impl PreparedQkvT16Route {
-    fn prepare<A: Arch>(module: &kernels::LoadedModule) -> GpuResult<Self> {
+impl<A: Arch> PreparedQkvT16Route<A> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         let projection_blocks = A::ATTENTION_QKV_ROWS / QKV_MMA_OUTPUT_ROWS;
         let projection_blocks = u32::try_from(projection_blocks)
             .map_err(|_| GpuError::invalid_launch("FP8 QKV rows exceed CUDA grid width"))?;
@@ -544,11 +546,12 @@ impl PreparedQkvT16Route {
         Ok(Self {
             quantize: prepare_quantize::<QKV_MMA_T16_TOKENS>(module)?,
             projection,
+            architecture: PhantomData,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn launch<A: Arch>(
+    unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
         stream: &CudaStream,
@@ -584,13 +587,14 @@ impl PreparedQkvT16Route {
     }
 }
 
-struct PreparedQkvPrefillRoute<const TOKENS: usize> {
+struct PreparedQkvPrefillRoute<A: Arch, const TOKENS: usize> {
     quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
     projection: PreparedLaunch<kernels::__fp8_qkv_mma_CudaKernel<TOKENS>>,
+    architecture: PhantomData<A>,
 }
 
-impl<const TOKENS: usize> PreparedQkvPrefillRoute<TOKENS> {
-    fn prepare<A: Arch>(module: &kernels::LoadedModule) -> GpuResult<Self> {
+impl<A: Arch, const TOKENS: usize> PreparedQkvPrefillRoute<A, TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         if !QKV_MMA_PREFILL_TOKENS.contains(&TOKENS) {
             return Err(GpuError::invalid_launch(format!(
                 "FP8 QKV prefill route T={TOKENS} is not admitted"
@@ -613,11 +617,12 @@ impl<const TOKENS: usize> PreparedQkvPrefillRoute<TOKENS> {
         Ok(Self {
             quantize: prepare_quantize::<TOKENS>(module)?,
             projection,
+            architecture: PhantomData,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn launch<A: Arch>(
+    unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
         stream: &CudaStream,
@@ -653,13 +658,14 @@ impl<const TOKENS: usize> PreparedQkvPrefillRoute<TOKENS> {
     }
 }
 
-struct PreparedQkvT1024Route {
+struct PreparedQkvT1024Route<A: Arch> {
     quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
     projection: PreparedLaunch<kernels::__fp8_qkv_mma_t1024_CudaKernel>,
+    architecture: PhantomData<A>,
 }
 
-impl PreparedQkvT1024Route {
-    fn prepare<A: Arch>(module: &kernels::LoadedModule) -> GpuResult<Self> {
+impl<A: Arch> PreparedQkvT1024Route<A> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         let token_tiles = QKV_MMA_MACRO_TOKENS / QKV_MMA_PREFILL_BLOCK_ROWS;
         let projection_blocks = A::ATTENTION_QKV_ROWS / QKV_MMA_OUTPUT_ROWS * token_tiles;
         let projection_blocks = u32::try_from(projection_blocks).map_err(|_| {
@@ -678,11 +684,12 @@ impl PreparedQkvT1024Route {
         Ok(Self {
             quantize: prepare_quantize::<QKV_MMA_MACRO_TOKENS>(module)?,
             projection,
+            architecture: PhantomData,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn launch<A: Arch>(
+    unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
         stream: &CudaStream,
@@ -720,13 +727,14 @@ impl PreparedQkvT1024Route {
     }
 }
 
-struct PreparedGdnInputPrefillRoute<const TOKENS: usize> {
+struct PreparedGdnInputPrefillRoute<A: Arch, const TOKENS: usize> {
     quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
     projection: PreparedLaunch<kernels::__fp8_gdn_input_mma_CudaKernel<TOKENS>>,
+    architecture: PhantomData<A>,
 }
 
-impl<const TOKENS: usize> PreparedGdnInputPrefillRoute<TOKENS> {
-    fn prepare<A: Arch>(module: &kernels::LoadedModule) -> GpuResult<Self> {
+impl<A: Arch, const TOKENS: usize> PreparedGdnInputPrefillRoute<A, TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         if !QKV_MMA_PREFILL_TOKENS.contains(&TOKENS) {
             return Err(GpuError::invalid_launch(format!(
                 "FP8 GDN input prefill route T={TOKENS} is not admitted"
@@ -750,11 +758,12 @@ impl<const TOKENS: usize> PreparedGdnInputPrefillRoute<TOKENS> {
         Ok(Self {
             quantize: prepare_quantize::<TOKENS>(module)?,
             projection,
+            architecture: PhantomData,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn launch<A: Arch>(
+    unsafe fn launch(
         &self,
         module: &kernels::LoadedModule,
         stream: &CudaStream,
@@ -886,22 +895,107 @@ pub(crate) fn fp8_lm_head_ptx_names() -> [&'static str; 8] {
     ]
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_fp8_qkv),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128, 1024),
+    inventory(false)
+)]
+struct FullAttentionQkvRoutes<A: Arch> {
+    #[route(1)]
+    b1: PreparedQkvRoute<A, 1>,
+    #[route(2)]
+    b2: PreparedQkvRoute<A, 2>,
+    #[route(3)]
+    b3: PreparedQkvRoute<A, 3>,
+    #[route(4)]
+    b4: PreparedQkvRoute<A, 4>,
+    #[route(5)]
+    b5: PreparedQkvRoute<A, 5>,
+    #[route(6)]
+    b6: PreparedQkvRoute<A, 6>,
+    #[route(7)]
+    b7: PreparedQkvRoute<A, 7>,
+    #[route(8)]
+    b8: PreparedQkvRoute<A, 8>,
+    #[route(16)]
+    t16: PreparedQkvT16Route<A>,
+    #[route(32)]
+    t32: PreparedQkvPrefillRoute<A, 32>,
+    #[route(64)]
+    t64: PreparedQkvPrefillRoute<A, 64>,
+    #[route(128)]
+    t128: PreparedQkvPrefillRoute<A, 128>,
+    #[route(1024)]
+    t1024: PreparedQkvT1024Route<A>,
+}
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_fp8_gdn_input),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
+    inventory(false)
+)]
+struct GdnInputProjectionRoutes<A: Arch> {
+    #[route(1)]
+    b1: PreparedGdnInputRoute<A, 1>,
+    #[route(2)]
+    b2: PreparedGdnInputRoute<A, 2>,
+    #[route(3)]
+    b3: PreparedGdnInputRoute<A, 3>,
+    #[route(4)]
+    b4: PreparedGdnInputRoute<A, 4>,
+    #[route(5)]
+    b5: PreparedGdnInputRoute<A, 5>,
+    #[route(6)]
+    b6: PreparedGdnInputRoute<A, 6>,
+    #[route(7)]
+    b7: PreparedGdnInputRoute<A, 7>,
+    #[route(8)]
+    b8: PreparedGdnInputRoute<A, 8>,
+    #[route(32)]
+    t32: PreparedGdnInputPrefillRoute<A, 32>,
+    #[route(64)]
+    t64: PreparedGdnInputPrefillRoute<A, 64>,
+    #[route(128)]
+    t128: PreparedGdnInputPrefillRoute<A, 128>,
+}
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_fp8_lm_head),
+    required(1, 2, 3, 4, 5, 6, 7, 8),
+    inventory(false)
+)]
+struct LmHeadRoutes<A: Arch> {
+    #[route(1)]
+    b1: PreparedLmHeadRoute<A, 1>,
+    #[route(2)]
+    b2: PreparedLmHeadRoute<A, 2>,
+    #[route(3)]
+    b3: PreparedLmHeadRoute<A, 3>,
+    #[route(4)]
+    b4: PreparedLmHeadRoute<A, 4>,
+    #[route(5)]
+    b5: PreparedLmHeadRoute<A, 5>,
+    #[route(6)]
+    b6: PreparedLmHeadRoute<A, 6>,
+    #[route(7)]
+    b7: PreparedLmHeadRoute<A, 7>,
+    #[route(8)]
+    b8: PreparedLmHeadRoute<A, 8>,
+}
+
 /// Prepared dynamic-quantize plus source-native QKV routes for decode, MTP, and prefill.
 pub struct FullAttentionQkvOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
-    b1: PreparedQkvRoute<A, 1>,
-    b2: PreparedQkvRoute<A, 2>,
-    b3: PreparedQkvRoute<A, 3>,
-    b4: PreparedQkvRoute<A, 4>,
-    b5: PreparedQkvRoute<A, 5>,
-    b6: PreparedQkvRoute<A, 6>,
-    b7: PreparedQkvRoute<A, 7>,
-    b8: PreparedQkvRoute<A, 8>,
-    t16: PreparedQkvT16Route,
-    t32: PreparedQkvPrefillRoute<32>,
-    t64: PreparedQkvPrefillRoute<64>,
-    t128: PreparedQkvPrefillRoute<128>,
-    t1024: PreparedQkvT1024Route,
+    routes: FullAttentionQkvRoutes<A>,
 }
 
 impl<A: Sm120Arch> FullAttentionQkvOp<A> {
@@ -914,19 +1008,7 @@ impl<A: Sm120Arch> FullAttentionQkvOp<A> {
             .map_err(|source| GpuError::module("loading the FP8 QKV module", source))?;
 
         Ok(Self {
-            b1: PreparedQkvRoute::prepare(&module)?,
-            b2: PreparedQkvRoute::prepare(&module)?,
-            b3: PreparedQkvRoute::prepare(&module)?,
-            b4: PreparedQkvRoute::prepare(&module)?,
-            b5: PreparedQkvRoute::prepare(&module)?,
-            b6: PreparedQkvRoute::prepare(&module)?,
-            b7: PreparedQkvRoute::prepare(&module)?,
-            b8: PreparedQkvRoute::prepare(&module)?,
-            t16: PreparedQkvT16Route::prepare::<A>(&module)?,
-            t32: PreparedQkvPrefillRoute::prepare::<A>(&module)?,
-            t64: PreparedQkvPrefillRoute::prepare::<A>(&module)?,
-            t128: PreparedQkvPrefillRoute::prepare::<A>(&module)?,
-            t1024: PreparedQkvT1024Route::prepare::<A>(&module)?,
+            routes: FullAttentionQkvRoutes::prepare(&module)?,
             module,
         })
     }
@@ -954,35 +1036,11 @@ impl<A: Sm120Arch> FullAttentionQkvOp<A> {
         weight_scales: *const u16,
         output: *mut u16,
     ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: exact-B dispatch preserves the public pointer contract.
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        activation_codes,
-                        activation_scales,
-                        weight_codes,
-                        weight_scales,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match rows {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            16 => unsafe {
-                self.t16.launch::<A>(
+        dispatch_fp8_qkv!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch(
                     &self.module,
                     stream,
                     input,
@@ -993,75 +1051,17 @@ impl<A: Sm120Arch> FullAttentionQkvOp<A> {
                     output,
                 )
             },
-            32 => unsafe {
-                self.t32.launch::<A>(
-                    &self.module,
-                    stream,
-                    input,
-                    activation_codes,
-                    activation_scales,
-                    weight_codes,
-                    weight_scales,
-                    output,
-                )
-            },
-            64 => unsafe {
-                self.t64.launch::<A>(
-                    &self.module,
-                    stream,
-                    input,
-                    activation_codes,
-                    activation_scales,
-                    weight_codes,
-                    weight_scales,
-                    output,
-                )
-            },
-            128 => unsafe {
-                self.t128.launch::<A>(
-                    &self.module,
-                    stream,
-                    input,
-                    activation_codes,
-                    activation_scales,
-                    weight_codes,
-                    weight_scales,
-                    output,
-                )
-            },
-            1_024 => unsafe {
-                self.t1024.launch::<A>(
-                    &self.module,
-                    stream,
-                    input,
-                    activation_codes,
-                    activation_scales,
-                    weight_codes,
-                    weight_scales,
-                    output,
-                )
-            },
-            _ => Err(GpuError::invalid_launch(format!(
+            else => Err(GpuError::invalid_launch(format!(
                 "FP8 QKV row count {rows} is outside the admitted routes 1..={MAX_BATCH}, 16, 32, 64, 128, and 1024"
-            ))),
-        }
+            )))
+        )
     }
 }
 
 /// Prepared dynamic-quantize plus source-native GDN Q/K/V/Z decode and prefill routes.
 pub struct GdnInputProjectionOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
-    b1: PreparedGdnInputRoute<A, 1>,
-    b2: PreparedGdnInputRoute<A, 2>,
-    b3: PreparedGdnInputRoute<A, 3>,
-    b4: PreparedGdnInputRoute<A, 4>,
-    b5: PreparedGdnInputRoute<A, 5>,
-    b6: PreparedGdnInputRoute<A, 6>,
-    b7: PreparedGdnInputRoute<A, 7>,
-    b8: PreparedGdnInputRoute<A, 8>,
-    t32: PreparedGdnInputPrefillRoute<32>,
-    t64: PreparedGdnInputPrefillRoute<64>,
-    t128: PreparedGdnInputPrefillRoute<128>,
+    routes: GdnInputProjectionRoutes<A>,
     t1024: PreparedGdnInputT1024Route,
 }
 
@@ -1075,17 +1075,7 @@ impl<A: Sm120Arch> GdnInputProjectionOp<A> {
             .map_err(|source| GpuError::module("loading the FP8 projection module", source))?;
 
         Ok(Self {
-            b1: PreparedGdnInputRoute::prepare(&module)?,
-            b2: PreparedGdnInputRoute::prepare(&module)?,
-            b3: PreparedGdnInputRoute::prepare(&module)?,
-            b4: PreparedGdnInputRoute::prepare(&module)?,
-            b5: PreparedGdnInputRoute::prepare(&module)?,
-            b6: PreparedGdnInputRoute::prepare(&module)?,
-            b7: PreparedGdnInputRoute::prepare(&module)?,
-            b8: PreparedGdnInputRoute::prepare(&module)?,
-            t32: PreparedGdnInputPrefillRoute::prepare::<A>(&module)?,
-            t64: PreparedGdnInputPrefillRoute::prepare::<A>(&module)?,
-            t128: PreparedGdnInputPrefillRoute::prepare::<A>(&module)?,
+            routes: GdnInputProjectionRoutes::prepare(&module)?,
             t1024: PreparedGdnInputT1024Route::prepare(context, &module)?,
             module,
         })
@@ -1155,90 +1145,40 @@ impl<A: Sm120Arch> GdnInputProjectionOp<A> {
         weight_scales: *const u16,
         output: *mut u16,
     ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: exact-B dispatch preserves the public pointer contract.
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        activation_codes,
-                        activation_scales,
-                        weight_codes,
-                        weight_scales,
-                        output,
-                    )
+        dispatch_fp8_gdn_input!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
+            else => {
+                if rows == QKV_MMA_MACRO_TOKENS {
+                    Err(GpuError::invalid_launch(
+                        "FP8 GDN input T=1024 requires launch_macro_prefill with its tensor maps",
+                    ))
+                } else {
+                    Err(GpuError::invalid_launch(format!(
+                        "FP8 GDN input row count {rows} is outside the admitted routes 1..={MAX_BATCH}, 32, 64, 128, and 1024"
+                    )))
                 }
-            };
-        }
-
-        match rows {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            32 => unsafe {
-                self.t32.launch::<A>(
-                    &self.module,
-                    stream,
-                    input,
-                    activation_codes,
-                    activation_scales,
-                    weight_codes,
-                    weight_scales,
-                    output,
-                )
-            },
-            64 => unsafe {
-                self.t64.launch::<A>(
-                    &self.module,
-                    stream,
-                    input,
-                    activation_codes,
-                    activation_scales,
-                    weight_codes,
-                    weight_scales,
-                    output,
-                )
-            },
-            128 => unsafe {
-                self.t128.launch::<A>(
-                    &self.module,
-                    stream,
-                    input,
-                    activation_codes,
-                    activation_scales,
-                    weight_codes,
-                    weight_scales,
-                    output,
-                )
-            },
-            1_024 => Err(GpuError::invalid_launch(
-                "FP8 GDN input T=1024 requires launch_macro_prefill with its tensor maps",
-            )),
-            _ => Err(GpuError::invalid_launch(format!(
-                "FP8 GDN input row count {rows} is outside the admitted routes 1..={MAX_BATCH}, 32, 64, 128, and 1024"
-            ))),
-        }
+            }
+        )
     }
 }
 
 /// Prepared dynamic-quantize plus full-vocabulary LM-head routes for exact `B=1..=8`.
 pub struct LmHeadOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
-    b1: PreparedLmHeadRoute<A, 1>,
-    b2: PreparedLmHeadRoute<A, 2>,
-    b3: PreparedLmHeadRoute<A, 3>,
-    b4: PreparedLmHeadRoute<A, 4>,
-    b5: PreparedLmHeadRoute<A, 5>,
-    b6: PreparedLmHeadRoute<A, 6>,
-    b7: PreparedLmHeadRoute<A, 7>,
-    b8: PreparedLmHeadRoute<A, 8>,
+    routes: LmHeadRoutes<A>,
 }
 
 impl<A: Sm120Arch> LmHeadOp<A> {
@@ -1251,14 +1191,7 @@ impl<A: Sm120Arch> LmHeadOp<A> {
             .map_err(|source| GpuError::module("loading the FP8 projection module", source))?;
 
         Ok(Self {
-            b1: PreparedLmHeadRoute::prepare(&module)?,
-            b2: PreparedLmHeadRoute::prepare(&module)?,
-            b3: PreparedLmHeadRoute::prepare(&module)?,
-            b4: PreparedLmHeadRoute::prepare(&module)?,
-            b5: PreparedLmHeadRoute::prepare(&module)?,
-            b6: PreparedLmHeadRoute::prepare(&module)?,
-            b7: PreparedLmHeadRoute::prepare(&module)?,
-            b8: PreparedLmHeadRoute::prepare(&module)?,
+            routes: LmHeadRoutes::prepare(&module)?,
             module,
         })
     }
@@ -1285,49 +1218,38 @@ impl<A: Sm120Arch> LmHeadOp<A> {
         weight_scales: *const u16,
         output: *mut u16,
     ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:ident) => {
-                // SAFETY: exact-B dispatch preserves the public pointer contract.
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        activation_codes,
-                        activation_scales,
-                        weight_codes,
-                        weight_scales,
-                        output,
-                    )
-                }
-            };
-        }
-
-        match batch {
-            1 => launch!(b1),
-            2 => launch!(b2),
-            3 => launch!(b3),
-            4 => launch!(b4),
-            5 => launch!(b5),
-            6 => launch!(b6),
-            7 => launch!(b7),
-            8 => launch!(b8),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_fp8_lm_head!(
+            &self.routes,
+            batch,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
+            else => Err(GpuError::invalid_launch(format!(
                 "FP8 LM-head batch {batch} is outside the admitted range 1..={MAX_BATCH}"
-            ))),
-        }
+            )))
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DECODE_PROJECTION_THREADS, DECODE_PROJECTION_WARPS, MAX_BATCH, QKV_MMA_K_WORDS,
-        QKV_MMA_MACRO_K_WORDS, QKV_MMA_MACRO_SHARED_BYTES, QKV_MMA_MACRO_TOKENS,
-        QKV_MMA_OUTPUT_ROWS, QKV_MMA_PREFILL_BLOCK_ROWS, QKV_MMA_PREFILL_SHARED_BYTES,
-        QKV_MMA_PREFILL_THREADS, QKV_MMA_PREFILL_TOKENS, QKV_MMA_T16_BLOCK_ROWS,
-        QKV_MMA_T16_SHARED_BYTES, QKV_MMA_T16_THREADS, QKV_MMA_T16_TOKENS, QUANTIZE_THREADS,
-        fp8_gdn_input_ptx_names, fp8_geometry, fp8_lm_head_ptx_names, fp8_qkv_ptx_names,
+        DECODE_PROJECTION_THREADS, DECODE_PROJECTION_WARPS, FullAttentionQkvRoutes,
+        GdnInputProjectionRoutes, LmHeadRoutes, MAX_BATCH, QKV_MMA_K_WORDS, QKV_MMA_MACRO_K_WORDS,
+        QKV_MMA_MACRO_SHARED_BYTES, QKV_MMA_MACRO_TOKENS, QKV_MMA_OUTPUT_ROWS,
+        QKV_MMA_PREFILL_BLOCK_ROWS, QKV_MMA_PREFILL_SHARED_BYTES, QKV_MMA_PREFILL_THREADS,
+        QKV_MMA_PREFILL_TOKENS, QKV_MMA_T16_BLOCK_ROWS, QKV_MMA_T16_SHARED_BYTES,
+        QKV_MMA_T16_THREADS, QKV_MMA_T16_TOKENS, QUANTIZE_THREADS, fp8_gdn_input_ptx_names,
+        fp8_geometry, fp8_lm_head_ptx_names, fp8_qkv_ptx_names,
     };
     use std::collections::BTreeSet;
     use tuisko_kernels_sm120_common::TestArch;
@@ -1350,6 +1272,22 @@ mod tests {
         assert_eq!(Qwen38_27B::VOCAB % (2 * DECODE_PROJECTION_WARPS), 0);
         assert_eq!(Qwen38_27B::HIDDEN % (32 * 16), 0);
         assert_eq!(MAX_BATCH, 8);
+    }
+
+    #[test]
+    fn route_tables_cover_only_the_admitted_widths() {
+        assert_eq!(
+            FullAttentionQkvRoutes::<Qwen38_27B>::admitted_rows(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128, 1_024]
+        );
+        assert_eq!(
+            GdnInputProjectionRoutes::<Qwen38_27B>::admitted_rows(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]
+        );
+        assert_eq!(
+            LmHeadRoutes::<Qwen38_27B>::admitted_rows(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
     }
 
     #[test]

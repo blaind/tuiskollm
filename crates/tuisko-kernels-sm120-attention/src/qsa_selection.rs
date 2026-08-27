@@ -19,6 +19,7 @@ use crate::device::qsa_indexer::{
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_model::{Arch, Qwen38FlashNext};
 
 /// Largest decode batch the selection routes admit.
@@ -565,6 +566,32 @@ impl<const TOKENS: usize> PreparedPrepare<TOKENS> {
                 })?,
         })
     }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        args: IndexerPrepareArgs,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_indexer_prepare_exact::<TOKENS>(
+                stream,
+                &self.decode,
+                args.indexer_qk,
+                args.query_norm,
+                args.rope_cos,
+                args.rope_sin,
+                args.block_tables,
+                args.table_rows,
+                args.table_stride,
+                args.cache_positions,
+                args.query,
+                args.indexer_pages,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching the Qwen3.8-Flash-Next indexer prepare", source)
+            })
+    }
 }
 
 impl<const TOKENS: usize> PreparedPrefillPrepare<TOKENS> {
@@ -587,6 +614,32 @@ impl<const TOKENS: usize> PreparedPrefillPrepare<TOKENS> {
                 })?,
         })
     }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        args: IndexerPrepareArgs,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_indexer_prepare_prefill_exact::<TOKENS>(
+                stream,
+                &self.prefill,
+                args.indexer_qk,
+                args.query_norm,
+                args.rope_cos,
+                args.rope_sin,
+                args.block_tables,
+                args.table_rows,
+                args.table_stride,
+                args.cache_positions,
+                args.query,
+                args.indexer_pages,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching the Qwen3.8-Flash-Next indexer prepare", source)
+            })
+    }
 }
 
 impl<const ROWS: usize, const BLOCKS: usize> PreparedCompress<ROWS, BLOCKS> {
@@ -608,6 +661,35 @@ impl<const ROWS: usize, const BLOCKS: usize> PreparedCompress<ROWS, BLOCKS> {
                     )
                 })?,
         })
+    }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        args: IndexerCompressArgs,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_indexer_block_compress_exact::<ROWS, BLOCKS>(
+                stream,
+                &self.compress,
+                args.indexer_pages,
+                args.key_norm,
+                args.block_rope_cos,
+                args.block_rope_sin,
+                args.block_tables,
+                args.table_rows,
+                args.table_stride,
+                args.first_blocks,
+                args.block_counts,
+                args.block_keys,
+            )
+            .map_err(|source| {
+                GpuError::launch(
+                    "launching the Qwen3.8-Flash-Next indexer block compression",
+                    source,
+                )
+            })
     }
 }
 
@@ -654,6 +736,59 @@ impl<const ROWS: usize> PreparedSelection<ROWS> {
                 })?,
         })
     }
+
+    unsafe fn launch_score(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        index: usize,
+        row_offset: u32,
+        blocks_per_row: u32,
+        args: IndexerSelectionArgs,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_indexer_score_exact::<ROWS>(
+                stream,
+                &self.score[index],
+                args.query,
+                args.block_keys,
+                args.block_tables,
+                args.table_rows,
+                args.table_stride,
+                args.block_counts,
+                args.scores,
+                args.score_stride,
+                row_offset,
+                blocks_per_row,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching the Qwen3.8-Flash-Next indexer scoring", source)
+            })
+    }
+
+    unsafe fn launch_select(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        row_offset: u32,
+        args: IndexerSelectionArgs,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_indexer_select_exact::<ROWS>(
+                stream,
+                &self.select,
+                args.scores.cast_const(),
+                args.visible_lengths,
+                args.block_counts,
+                args.selected,
+                args.selected_counts,
+                args.score_stride,
+                row_offset,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching the Qwen3.8-Flash-Next indexer selection", source)
+            })
+    }
 }
 
 impl<const TOKENS: usize> PreparedSelectedDecode<TOKENS> {
@@ -677,6 +812,37 @@ impl<const TOKENS: usize> PreparedSelectedDecode<TOKENS> {
                     )
                 })?,
         })
+    }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        args: SelectedAttentionArgs,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_paged_gqa_selected_exact::<TOKENS>(
+                stream,
+                &self.attention,
+                args.query,
+                args.key_pages,
+                args.value_pages,
+                args.block_tables,
+                args.table_rows,
+                args.table_stride,
+                args.selected,
+                args.selected_counts,
+                args.selected_stride(),
+                args.output,
+                args.key_scale,
+                args.value_scale,
+            )
+            .map_err(|source| {
+                GpuError::launch(
+                    "launching the Qwen3.8-Flash-Next selected attention",
+                    source,
+                )
+            })
     }
 }
 
@@ -704,6 +870,37 @@ impl<const TOKENS: usize> PreparedSelectedPrefill<TOKENS> {
                 })?,
         })
     }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        args: SelectedAttentionArgs,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_paged_gqa_prefill_selected_exact::<TOKENS>(
+                stream,
+                &self.attention,
+                args.query,
+                args.key_pages,
+                args.value_pages,
+                args.block_tables,
+                args.table_rows,
+                args.table_stride,
+                args.selected,
+                args.selected_counts,
+                args.selected_stride(),
+                args.output,
+                args.key_scale,
+                args.value_scale,
+            )
+            .map_err(|source| {
+                GpuError::launch(
+                    "launching the Qwen3.8-Flash-Next selected attention",
+                    source,
+                )
+            })
+    }
 }
 
 /// Selects the prepared candidate-block grid covering a round's block count.
@@ -714,59 +911,147 @@ pub fn selection_block_bucket(blocks: usize) -> Option<usize> {
         .find(|&bucket| bucket >= blocks)
 }
 
-macro_rules! decode_widths {
-    ($name:ident, $prepared:ident) => {
-        struct $name {
-            b1: $prepared<1>,
-            b2: $prepared<2>,
-            b3: $prepared<3>,
-            b4: $prepared<4>,
-            b5: $prepared<5>,
-            b6: $prepared<6>,
-            b7: $prepared<7>,
-            b8: $prepared<8>,
-        }
-
-        impl $name {
-            fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-                Ok(Self {
-                    b1: $prepared::prepare(module)?,
-                    b2: $prepared::prepare(module)?,
-                    b3: $prepared::prepare(module)?,
-                    b4: $prepared::prepare(module)?,
-                    b5: $prepared::prepare(module)?,
-                    b6: $prepared::prepare(module)?,
-                    b7: $prepared::prepare(module)?,
-                    b8: $prepared::prepare(module)?,
-                })
-            }
-        }
-    };
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_indexer_prepare),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
+    inventory(false)
+)]
+struct IndexerPrepareRoutes {
+    #[route(1)]
+    b1: PreparedPrepare<1>,
+    #[route(2)]
+    b2: PreparedPrepare<2>,
+    #[route(3)]
+    b3: PreparedPrepare<3>,
+    #[route(4)]
+    b4: PreparedPrepare<4>,
+    #[route(5)]
+    b5: PreparedPrepare<5>,
+    #[route(6)]
+    b6: PreparedPrepare<6>,
+    #[route(7)]
+    b7: PreparedPrepare<7>,
+    #[route(8)]
+    b8: PreparedPrepare<8>,
+    #[route(32)]
+    t32: PreparedPrefillPrepare<32>,
+    #[route(64)]
+    t64: PreparedPrefillPrepare<64>,
+    #[route(128)]
+    t128: PreparedPrefillPrepare<128>,
+    #[route(1024)]
+    t1024: PreparedPrefillPrepare<1_024>,
 }
 
-decode_widths!(PrepareWidths, PreparedPrepare);
-decode_widths!(SelectedDecodeWidths, PreparedSelectedDecode);
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_indexer_compress),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
+    inventory(false)
+)]
+struct IndexerCompressRoutes {
+    #[route(1)]
+    b1: PreparedCompress<1, 1>,
+    #[route(2)]
+    b2: PreparedCompress<2, 1>,
+    #[route(3)]
+    b3: PreparedCompress<3, 1>,
+    #[route(4)]
+    b4: PreparedCompress<4, 1>,
+    #[route(5)]
+    b5: PreparedCompress<5, 1>,
+    #[route(6)]
+    b6: PreparedCompress<6, 1>,
+    #[route(7)]
+    b7: PreparedCompress<7, 1>,
+    #[route(8)]
+    b8: PreparedCompress<8, 1>,
+    #[route(32)]
+    t32: PreparedCompress<1, 9>,
+    #[route(64)]
+    t64: PreparedCompress<1, 17>,
+    #[route(128)]
+    t128: PreparedCompress<1, 33>,
+    #[route(1024)]
+    t1024: PreparedCompress<1, 257>,
+}
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_indexer_selection),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64),
+    inventory(false)
+)]
+struct IndexerSelectionRoutes {
+    #[route(1)]
+    b1: PreparedSelection<1>,
+    #[route(2)]
+    b2: PreparedSelection<2>,
+    #[route(3)]
+    b3: PreparedSelection<3>,
+    #[route(4)]
+    b4: PreparedSelection<4>,
+    #[route(5)]
+    b5: PreparedSelection<5>,
+    #[route(6)]
+    b6: PreparedSelection<6>,
+    #[route(7)]
+    b7: PreparedSelection<7>,
+    #[route(8)]
+    b8: PreparedSelection<8>,
+    #[route(32)]
+    t32: PreparedSelection<32>,
+    #[route(64)]
+    t64: PreparedSelection<64>,
+}
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_selected_paged_gqa),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
+    inventory(false)
+)]
+struct SelectedPagedGqaRoutes {
+    #[route(1)]
+    b1: PreparedSelectedDecode<1>,
+    #[route(2)]
+    b2: PreparedSelectedDecode<2>,
+    #[route(3)]
+    b3: PreparedSelectedDecode<3>,
+    #[route(4)]
+    b4: PreparedSelectedDecode<4>,
+    #[route(5)]
+    b5: PreparedSelectedDecode<5>,
+    #[route(6)]
+    b6: PreparedSelectedDecode<6>,
+    #[route(7)]
+    b7: PreparedSelectedDecode<7>,
+    #[route(8)]
+    b8: PreparedSelectedDecode<8>,
+    #[route(32)]
+    t32: PreparedSelectedPrefill<32>,
+    #[route(64)]
+    t64: PreparedSelectedPrefill<64>,
+    #[route(128)]
+    t128: PreparedSelectedPrefill<128>,
+    #[route(1024)]
+    t1024: PreparedSelectedPrefill<1_024>,
+}
 
 /// Prepared Qwen3.8-Flash-Next indexer prepare routes for every admitted width.
 pub struct Qwen38FlashNextIndexerPrepareOp {
     module: kernels::LoadedModule,
-    decode: PrepareWidths,
-    t32: PreparedPrefillPrepare<32>,
-    t64: PreparedPrefillPrepare<64>,
-    t128: PreparedPrefillPrepare<128>,
-    t1024: PreparedPrefillPrepare<1_024>,
-    compress_b1: PreparedCompress<1, 1>,
-    compress_b2: PreparedCompress<2, 1>,
-    compress_b3: PreparedCompress<3, 1>,
-    compress_b4: PreparedCompress<4, 1>,
-    compress_b5: PreparedCompress<5, 1>,
-    compress_b6: PreparedCompress<6, 1>,
-    compress_b7: PreparedCompress<7, 1>,
-    compress_b8: PreparedCompress<8, 1>,
-    compress_t32: PreparedCompress<1, 9>,
-    compress_t64: PreparedCompress<1, 17>,
-    compress_t128: PreparedCompress<1, 33>,
-    compress_t1024: PreparedCompress<1, 257>,
+    prepare_routes: IndexerPrepareRoutes,
+    compress_routes: IndexerCompressRoutes,
 }
 
 impl Qwen38FlashNextIndexerPrepareOp {
@@ -780,23 +1065,8 @@ impl Qwen38FlashNextIndexerPrepareOp {
         })?;
 
         Ok(Self {
-            decode: PrepareWidths::prepare(&module)?,
-            t32: PreparedPrefillPrepare::prepare(&module)?,
-            t64: PreparedPrefillPrepare::prepare(&module)?,
-            t128: PreparedPrefillPrepare::prepare(&module)?,
-            t1024: PreparedPrefillPrepare::prepare(&module)?,
-            compress_b1: PreparedCompress::prepare(&module)?,
-            compress_b2: PreparedCompress::prepare(&module)?,
-            compress_b3: PreparedCompress::prepare(&module)?,
-            compress_b4: PreparedCompress::prepare(&module)?,
-            compress_b5: PreparedCompress::prepare(&module)?,
-            compress_b6: PreparedCompress::prepare(&module)?,
-            compress_b7: PreparedCompress::prepare(&module)?,
-            compress_b8: PreparedCompress::prepare(&module)?,
-            compress_t32: PreparedCompress::prepare(&module)?,
-            compress_t64: PreparedCompress::prepare(&module)?,
-            compress_t128: PreparedCompress::prepare(&module)?,
-            compress_t1024: PreparedCompress::prepare(&module)?,
+            prepare_routes: IndexerPrepareRoutes::prepare(&module)?,
+            compress_routes: IndexerCompressRoutes::prepare(&module)?,
             module,
         })
     }
@@ -817,95 +1087,15 @@ impl Qwen38FlashNextIndexerPrepareOp {
         tokens: usize,
         args: IndexerPrepareArgs,
     ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:expr, $entry:ident, $tokens:literal) => {{
-                self.module
-                    .$entry::<$tokens>(
-                        stream,
-                        $route,
-                        args.indexer_qk,
-                        args.query_norm,
-                        args.rope_cos,
-                        args.rope_sin,
-                        args.block_tables,
-                        args.table_rows,
-                        args.table_stride,
-                        args.cache_positions,
-                        args.query,
-                        args.indexer_pages,
-                    )
-                    .map_err(|source| {
-                        GpuError::launch("launching the Qwen3.8-Flash-Next indexer prepare", source)
-                    })
-            }};
-        }
-
-        match tokens {
-            1 => launch!(
-                &self.decode.b1.decode,
-                qwen38_flash_next_indexer_prepare_exact,
-                1
-            ),
-            2 => launch!(
-                &self.decode.b2.decode,
-                qwen38_flash_next_indexer_prepare_exact,
-                2
-            ),
-            3 => launch!(
-                &self.decode.b3.decode,
-                qwen38_flash_next_indexer_prepare_exact,
-                3
-            ),
-            4 => launch!(
-                &self.decode.b4.decode,
-                qwen38_flash_next_indexer_prepare_exact,
-                4
-            ),
-            5 => launch!(
-                &self.decode.b5.decode,
-                qwen38_flash_next_indexer_prepare_exact,
-                5
-            ),
-            6 => launch!(
-                &self.decode.b6.decode,
-                qwen38_flash_next_indexer_prepare_exact,
-                6
-            ),
-            7 => launch!(
-                &self.decode.b7.decode,
-                qwen38_flash_next_indexer_prepare_exact,
-                7
-            ),
-            8 => launch!(
-                &self.decode.b8.decode,
-                qwen38_flash_next_indexer_prepare_exact,
-                8
-            ),
-            32 => launch!(
-                &self.t32.prefill,
-                qwen38_flash_next_indexer_prepare_prefill_exact,
-                32
-            ),
-            64 => launch!(
-                &self.t64.prefill,
-                qwen38_flash_next_indexer_prepare_prefill_exact,
-                64
-            ),
-            128 => launch!(
-                &self.t128.prefill,
-                qwen38_flash_next_indexer_prepare_prefill_exact,
-                128
-            ),
-            1_024 => launch!(
-                &self.t1024.prefill,
-                qwen38_flash_next_indexer_prepare_prefill_exact,
-                1_024
-            ),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_indexer_prepare!(
+            &self.prepare_routes,
+            tokens,
+            |route| unsafe { route.launch(&self.module, stream, args) },
+            else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.8-Flash-Next indexer prepare tokens {tokens} must be one of \
                  1..={SELECTION_MAX_BATCH},32,64,128,1024"
-            ))),
-        }
+            )))
+        )
     }
 
     /// Compresses this round's newly completed micro-blocks into block keys.
@@ -923,66 +1113,22 @@ impl Qwen38FlashNextIndexerPrepareOp {
         tokens: usize,
         args: IndexerCompressArgs,
     ) -> GpuResult<()> {
-        macro_rules! launch {
-            ($route:expr, $rows:literal, $blocks:literal) => {{
-                self.module
-                    .qwen38_flash_next_indexer_block_compress_exact::<$rows, $blocks>(
-                        stream,
-                        $route,
-                        args.indexer_pages,
-                        args.key_norm,
-                        args.block_rope_cos,
-                        args.block_rope_sin,
-                        args.block_tables,
-                        args.table_rows,
-                        args.table_stride,
-                        args.first_blocks,
-                        args.block_counts,
-                        args.block_keys,
-                    )
-                    .map_err(|source| {
-                        GpuError::launch(
-                            "launching the Qwen3.8-Flash-Next indexer block compression",
-                            source,
-                        )
-                    })
-            }};
-        }
-
-        match tokens {
-            1 => launch!(&self.compress_b1.compress, 1, 1),
-            2 => launch!(&self.compress_b2.compress, 2, 1),
-            3 => launch!(&self.compress_b3.compress, 3, 1),
-            4 => launch!(&self.compress_b4.compress, 4, 1),
-            5 => launch!(&self.compress_b5.compress, 5, 1),
-            6 => launch!(&self.compress_b6.compress, 6, 1),
-            7 => launch!(&self.compress_b7.compress, 7, 1),
-            8 => launch!(&self.compress_b8.compress, 8, 1),
-            32 => launch!(&self.compress_t32.compress, 1, 9),
-            64 => launch!(&self.compress_t64.compress, 1, 17),
-            128 => launch!(&self.compress_t128.compress, 1, 33),
-            1_024 => launch!(&self.compress_t1024.compress, 1, 257),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_indexer_compress!(
+            &self.compress_routes,
+            tokens,
+            |route| unsafe { route.launch(&self.module, stream, args) },
+            else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.8-Flash-Next indexer block compression tokens {tokens} must be one of \
                  1..={SELECTION_MAX_BATCH},32,64,128,1024"
-            ))),
-        }
+            )))
+        )
     }
 }
 
 /// Prepared Qwen3.8-Flash-Next block scoring and selection routes.
 pub struct Qwen38FlashNextIndexerSelectionOp {
     module: kernels::LoadedModule,
-    b1: PreparedSelection<1>,
-    b2: PreparedSelection<2>,
-    b3: PreparedSelection<3>,
-    b4: PreparedSelection<4>,
-    b5: PreparedSelection<5>,
-    b6: PreparedSelection<6>,
-    b7: PreparedSelection<7>,
-    b8: PreparedSelection<8>,
-    t32: PreparedSelection<32>,
-    t64: PreparedSelection<64>,
+    routes: IndexerSelectionRoutes,
 }
 
 impl Qwen38FlashNextIndexerSelectionOp {
@@ -995,16 +1141,7 @@ impl Qwen38FlashNextIndexerSelectionOp {
         })?;
 
         Ok(Self {
-            b1: PreparedSelection::prepare(&module)?,
-            b2: PreparedSelection::prepare(&module)?,
-            b3: PreparedSelection::prepare(&module)?,
-            b4: PreparedSelection::prepare(&module)?,
-            b5: PreparedSelection::prepare(&module)?,
-            b6: PreparedSelection::prepare(&module)?,
-            b7: PreparedSelection::prepare(&module)?,
-            b8: PreparedSelection::prepare(&module)?,
-            t32: PreparedSelection::prepare(&module)?,
-            t64: PreparedSelection::prepare(&module)?,
+            routes: IndexerSelectionRoutes::prepare(&module)?,
             module,
         })
     }
@@ -1065,45 +1202,24 @@ impl Qwen38FlashNextIndexerSelectionOp {
         let blocks_per_row = u32::try_from(bucket)
             .map_err(|_| GpuError::invalid_launch("selection block bucket exceeds u32"))?;
 
-        macro_rules! launch {
-            ($route:expr, $rows:literal) => {{
-                self.module
-                    .qwen38_flash_next_indexer_score_exact::<$rows>(
-                        stream,
-                        &$route.score[index],
-                        args.query,
-                        args.block_keys,
-                        args.block_tables,
-                        args.table_rows,
-                        args.table_stride,
-                        args.block_counts,
-                        args.scores,
-                        args.score_stride,
-                        row_offset,
-                        blocks_per_row,
-                    )
-                    .map_err(|source| {
-                        GpuError::launch("launching the Qwen3.8-Flash-Next indexer scoring", source)
-                    })
-            }};
-        }
-
-        match rows {
-            1 => launch!(self.b1, 1),
-            2 => launch!(self.b2, 2),
-            3 => launch!(self.b3, 3),
-            4 => launch!(self.b4, 4),
-            5 => launch!(self.b5, 5),
-            6 => launch!(self.b6, 6),
-            7 => launch!(self.b7, 7),
-            8 => launch!(self.b8, 8),
-            32 => launch!(self.t32, 32),
-            64 => launch!(self.t64, 64),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_indexer_selection!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch_score(
+                    &self.module,
+                    stream,
+                    index,
+                    row_offset,
+                    blocks_per_row,
+                    args,
+                )
+            },
+            else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.8-Flash-Next indexer selection rows {rows} must be one of \
                  1..={SELECTION_MAX_BATCH},32,64"
-            ))),
-        }
+            )))
+        )
     }
 
     /// Selects one row tile's top-512 blocks from the published score plane.
@@ -1122,56 +1238,24 @@ impl Qwen38FlashNextIndexerSelectionOp {
         let row_offset = u32::try_from(row_offset)
             .map_err(|_| GpuError::invalid_launch("selection row offset exceeds u32"))?;
 
-        macro_rules! launch {
-            ($route:expr, $rows:literal) => {{
-                self.module
-                    .qwen38_flash_next_indexer_select_exact::<$rows>(
-                        stream,
-                        &$route.select,
-                        args.scores.cast_const(),
-                        args.visible_lengths,
-                        args.block_counts,
-                        args.selected,
-                        args.selected_counts,
-                        args.score_stride,
-                        row_offset,
-                    )
-                    .map_err(|source| {
-                        GpuError::launch(
-                            "launching the Qwen3.8-Flash-Next indexer selection",
-                            source,
-                        )
-                    })
-            }};
-        }
-
-        match rows {
-            1 => launch!(self.b1, 1),
-            2 => launch!(self.b2, 2),
-            3 => launch!(self.b3, 3),
-            4 => launch!(self.b4, 4),
-            5 => launch!(self.b5, 5),
-            6 => launch!(self.b6, 6),
-            7 => launch!(self.b7, 7),
-            8 => launch!(self.b8, 8),
-            32 => launch!(self.t32, 32),
-            64 => launch!(self.t64, 64),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_indexer_selection!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch_select(&self.module, stream, row_offset, args)
+            },
+            else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.8-Flash-Next indexer selection rows {rows} must be one of \
                  1..={SELECTION_MAX_BATCH},32,64"
-            ))),
-        }
+            )))
+        )
     }
 }
 
 /// Prepared Qwen3.8-Flash-Next gather attention over selected positions.
 pub struct Qwen38FlashNextSelectedPagedGqaOp {
     module: kernels::LoadedModule,
-    decode: SelectedDecodeWidths,
-    t32: PreparedSelectedPrefill<32>,
-    t64: PreparedSelectedPrefill<64>,
-    t128: PreparedSelectedPrefill<128>,
-    t1024: PreparedSelectedPrefill<1_024>,
+    routes: SelectedPagedGqaRoutes,
 }
 
 impl Qwen38FlashNextSelectedPagedGqaOp {
@@ -1184,11 +1268,7 @@ impl Qwen38FlashNextSelectedPagedGqaOp {
         })?;
 
         Ok(Self {
-            decode: SelectedDecodeWidths::prepare(&module)?,
-            t32: PreparedSelectedPrefill::prepare(&module)?,
-            t64: PreparedSelectedPrefill::prepare(&module)?,
-            t128: PreparedSelectedPrefill::prepare(&module)?,
-            t1024: PreparedSelectedPrefill::prepare(&module)?,
+            routes: SelectedPagedGqaRoutes::prepare(&module)?,
             module,
         })
     }
@@ -1222,100 +1302,15 @@ impl Qwen38FlashNextSelectedPagedGqaOp {
             ));
         }
 
-        macro_rules! launch {
-            ($route:expr, $entry:ident, $tokens:literal) => {{
-                self.module
-                    .$entry::<$tokens>(
-                        stream,
-                        $route,
-                        args.query,
-                        args.key_pages,
-                        args.value_pages,
-                        args.block_tables,
-                        args.table_rows,
-                        args.table_stride,
-                        args.selected,
-                        args.selected_counts,
-                        args.selected_stride(),
-                        args.output,
-                        args.key_scale,
-                        args.value_scale,
-                    )
-                    .map_err(|source| {
-                        GpuError::launch(
-                            "launching the Qwen3.8-Flash-Next selected attention",
-                            source,
-                        )
-                    })
-            }};
-        }
-
-        match tokens {
-            1 => launch!(
-                &self.decode.b1.attention,
-                qwen38_flash_next_paged_gqa_selected_exact,
-                1
-            ),
-            2 => launch!(
-                &self.decode.b2.attention,
-                qwen38_flash_next_paged_gqa_selected_exact,
-                2
-            ),
-            3 => launch!(
-                &self.decode.b3.attention,
-                qwen38_flash_next_paged_gqa_selected_exact,
-                3
-            ),
-            4 => launch!(
-                &self.decode.b4.attention,
-                qwen38_flash_next_paged_gqa_selected_exact,
-                4
-            ),
-            5 => launch!(
-                &self.decode.b5.attention,
-                qwen38_flash_next_paged_gqa_selected_exact,
-                5
-            ),
-            6 => launch!(
-                &self.decode.b6.attention,
-                qwen38_flash_next_paged_gqa_selected_exact,
-                6
-            ),
-            7 => launch!(
-                &self.decode.b7.attention,
-                qwen38_flash_next_paged_gqa_selected_exact,
-                7
-            ),
-            8 => launch!(
-                &self.decode.b8.attention,
-                qwen38_flash_next_paged_gqa_selected_exact,
-                8
-            ),
-            32 => launch!(
-                &self.t32.attention,
-                qwen38_flash_next_paged_gqa_prefill_selected_exact,
-                32
-            ),
-            64 => launch!(
-                &self.t64.attention,
-                qwen38_flash_next_paged_gqa_prefill_selected_exact,
-                64
-            ),
-            128 => launch!(
-                &self.t128.attention,
-                qwen38_flash_next_paged_gqa_prefill_selected_exact,
-                128
-            ),
-            1_024 => launch!(
-                &self.t1024.attention,
-                qwen38_flash_next_paged_gqa_prefill_selected_exact,
-                1_024
-            ),
-            _ => Err(GpuError::invalid_launch(format!(
+        dispatch_selected_paged_gqa!(
+            &self.routes,
+            tokens,
+            |route| unsafe { route.launch(&self.module, stream, args) },
+            else => Err(GpuError::invalid_launch(format!(
                 "Qwen3.8-Flash-Next selected attention tokens {tokens} must be one of \
                  1..={SELECTION_MAX_BATCH},32,64,128,1024"
-            ))),
-        }
+            )))
+        )
     }
 }
 
@@ -1390,9 +1385,11 @@ pub(crate) fn qwen38_flash_next_indexer_ptx_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
+        IndexerCompressRoutes, IndexerPrepareRoutes, IndexerSelectionRoutes,
         SELECTION_BLOCK_BUCKETS, SELECTION_BLOCKS_PER_PAGE, SELECTION_MAX_BLOCKS,
-        SELECTION_MAX_SELECTED, SELECTION_ROW_TILE, qwen38_flash_next_indexer_ptx_names,
-        selection_block_bucket, selection_round_blocks, selection_round_rows,
+        SELECTION_MAX_SELECTED, SELECTION_ROW_TILE, SelectedPagedGqaRoutes,
+        qwen38_flash_next_indexer_ptx_names, selection_block_bucket, selection_round_blocks,
+        selection_round_rows,
     };
     use crate::device::qsa_indexer::{SELECT_SHARED_WORDS, WARPS_PER_CTA};
     use std::collections::BTreeSet;
@@ -1429,6 +1426,19 @@ mod tests {
             assert_eq!(selection_round_rows(tokens), 1);
             assert_eq!(selection_round_blocks(tokens), blocks);
         }
+    }
+
+    #[test]
+    fn route_tables_cover_only_the_admitted_widths() {
+        let full = vec![1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
+
+        assert_eq!(IndexerPrepareRoutes::admitted_rows(), full);
+        assert_eq!(IndexerCompressRoutes::admitted_rows(), full);
+        assert_eq!(
+            IndexerSelectionRoutes::admitted_rows(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 32, 64]
+        );
+        assert_eq!(SelectedPagedGqaRoutes::admitted_rows(), full);
     }
 
     #[test]

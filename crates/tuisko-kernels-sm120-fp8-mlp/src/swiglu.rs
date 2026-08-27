@@ -10,6 +10,7 @@ use crate::swiglu_tma::{
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
+use tuisko_kernels_macros::ExactRoutes;
 use tuisko_kernels_sm120_common::Sm120Arch;
 use tuisko_kernels_sm120_common::device::quantize_activation;
 use tuisko_model::{Arch, Qwen38_27B};
@@ -25,22 +26,6 @@ const PREFILL_K128_WORDS: usize = 32;
 const PREFILL_K64_WORDS: usize = 16;
 const PREFILL_K128_SHARED_BYTES: u32 = 48 * 1024;
 const PREFILL_K64_SHARED_BYTES: u32 = 24 * 1024;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RouteClass {
-    Decode,
-    PrefillK128,
-    PrefillK64,
-}
-
-fn route_class(rows: usize) -> Option<RouteClass> {
-    match rows {
-        1..=MAX_BATCH => Some(RouteClass::Decode),
-        32 | 64 => Some(RouteClass::PrefillK128),
-        128 => Some(RouteClass::PrefillK64),
-        _ => None,
-    }
-}
 
 fn require_geometry<A: Arch>() -> GpuResult<()> {
     if A::HIDDEN == 0
@@ -289,23 +274,147 @@ impl<A: Arch, const TOKENS: usize> PreparedDecodeRoute<A, TOKENS> {
     }
 }
 
+macro_rules! define_prefill_route {
+    ($name:ident, $tokens:literal, $kernel:ty, $prepare:ident, $block_multiplier:literal, $shared:expr, $launch:ident, $k_words:expr) => {
+        struct $name<A: Arch> {
+            quantize: PreparedLaunch<kernels::__fp8_swiglu_quantize_CudaKernel<A>>,
+            projection: PreparedLaunch<$kernel>,
+        }
+
+        impl<A: Arch> $name<A> {
+            fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+                let prefill_blocks =
+                    u32::try_from(A::INTERMEDIATE / PREFILL_OUTPUT_ROWS).map_err(|_| {
+                        GpuError::invalid_launch("dense-FP8 SwiGLU rows exceed grid width")
+                    })?;
+
+                Ok(Self {
+                    quantize: prepare_quantize::<A, $tokens>(module)?,
+                    projection: module
+                        .$prepare(LaunchConfig1D::new(
+                            $block_multiplier * prefill_blocks,
+                            PREFILL_THREADS,
+                            $shared,
+                        ))
+                        .map_err(|source| {
+                            GpuError::launch(
+                                concat!("preparing dense-FP8 SwiGLU T=", stringify!($tokens)),
+                                source,
+                            )
+                        })?,
+                })
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            unsafe fn launch(
+                &self,
+                module: &kernels::LoadedModule,
+                stream: &CudaStream,
+                input: *const u16,
+                activation_codes: *mut u8,
+                activation_scales: *mut f32,
+                weight_codes: *const u8,
+                weight_scales: *const u16,
+                output: *mut u16,
+            ) -> GpuResult<()> {
+                module
+                    .fp8_swiglu_quantize::<A>(
+                        stream,
+                        &self.quantize,
+                        input.cast::<u32>(),
+                        activation_codes.cast::<u16>(),
+                        activation_scales,
+                    )
+                    .map_err(|source| {
+                        GpuError::launch("launching dense-FP8 quantization", source)
+                    })?;
+                module
+                    .$launch(
+                        stream,
+                        &self.projection,
+                        activation_codes.cast::<u32>(),
+                        activation_scales,
+                        weight_codes.cast::<u32>(),
+                        weight_scales,
+                        output,
+                        (A::HIDDEN / 4 / $k_words) as u32,
+                    )
+                    .map_err(|source| {
+                        GpuError::launch("launching dense-FP8 SwiGLU prefill", source)
+                    })
+            }
+        }
+    };
+}
+
+define_prefill_route!(
+    PreparedT32Route,
+    32,
+    kernels::__fp8_swiglu_mma_t32_CudaKernel,
+    prepare_fp8_swiglu_mma_t32,
+    1,
+    PREFILL_K128_SHARED_BYTES,
+    fp8_swiglu_mma_t32,
+    PREFILL_K128_WORDS
+);
+define_prefill_route!(
+    PreparedT64Route,
+    64,
+    kernels::__fp8_swiglu_mma_t64_CudaKernel,
+    prepare_fp8_swiglu_mma_t64,
+    1,
+    PREFILL_K128_SHARED_BYTES,
+    fp8_swiglu_mma_t64,
+    PREFILL_K128_WORDS
+);
+define_prefill_route!(
+    PreparedT128Route,
+    128,
+    kernels::__fp8_swiglu_mma_t128_CudaKernel,
+    prepare_fp8_swiglu_mma_t128,
+    2,
+    PREFILL_K64_SHARED_BYTES,
+    fp8_swiglu_mma_t128,
+    PREFILL_K64_WORDS
+);
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_fp8_swiglu),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
+    inventory(false)
+)]
+struct DenseFp8SwiGluRoutes<A: Arch> {
+    #[route(1)]
+    b1: PreparedDecodeRoute<A, 1>,
+    #[route(2)]
+    b2: PreparedDecodeRoute<A, 2>,
+    #[route(3)]
+    b3: PreparedDecodeRoute<A, 3>,
+    #[route(4)]
+    b4: PreparedDecodeRoute<A, 4>,
+    #[route(5)]
+    b5: PreparedDecodeRoute<A, 5>,
+    #[route(6)]
+    b6: PreparedDecodeRoute<A, 6>,
+    #[route(7)]
+    b7: PreparedDecodeRoute<A, 7>,
+    #[route(8)]
+    b8: PreparedDecodeRoute<A, 8>,
+    #[route(32)]
+    t32: PreparedT32Route<A>,
+    #[route(64)]
+    t64: PreparedT64Route<A>,
+    #[route(128)]
+    t128: PreparedT128Route<A>,
+}
+
 /// Prepared dense-FP8 gate/up plus SwiGLU routes for exact decode and prefill rows.
 pub struct DenseFp8SwiGluOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
-    b1: PreparedDecodeRoute<A, 1>,
-    b2: PreparedDecodeRoute<A, 2>,
-    b3: PreparedDecodeRoute<A, 3>,
-    b4: PreparedDecodeRoute<A, 4>,
-    b5: PreparedDecodeRoute<A, 5>,
-    b6: PreparedDecodeRoute<A, 6>,
-    b7: PreparedDecodeRoute<A, 7>,
-    b8: PreparedDecodeRoute<A, 8>,
-    t32_quantize: PreparedLaunch<kernels::__fp8_swiglu_quantize_CudaKernel<A>>,
-    t32: PreparedLaunch<kernels::__fp8_swiglu_mma_t32_CudaKernel>,
-    t64_quantize: PreparedLaunch<kernels::__fp8_swiglu_quantize_CudaKernel<A>>,
-    t64: PreparedLaunch<kernels::__fp8_swiglu_mma_t64_CudaKernel>,
-    t128_quantize: PreparedLaunch<kernels::__fp8_swiglu_quantize_CudaKernel<A>>,
-    t128: PreparedLaunch<kernels::__fp8_swiglu_mma_t128_CudaKernel>,
+    routes: DenseFp8SwiGluRoutes<A>,
     t1024_quantize: PreparedLaunch<kernels::__fp8_swiglu_quantize_CudaKernel<A>>,
     t1024: DenseFp8SwiGluTmaRoute,
 }
@@ -318,42 +427,9 @@ impl<A: Sm120Arch> DenseFp8SwiGluOp<A> {
         // SAFETY: this crate owns the embedded cuda-oxide module artifact.
         let module = unsafe { kernels::load(context) }
             .map_err(|source| GpuError::module("loading the dense-FP8 SwiGLU module", source))?;
-        let prefill_blocks = u32::try_from(A::INTERMEDIATE / PREFILL_OUTPUT_ROWS)
-            .map_err(|_| GpuError::invalid_launch("dense-FP8 SwiGLU rows exceed grid width"))?;
 
         Ok(Self {
-            b1: PreparedDecodeRoute::prepare(&module)?,
-            b2: PreparedDecodeRoute::prepare(&module)?,
-            b3: PreparedDecodeRoute::prepare(&module)?,
-            b4: PreparedDecodeRoute::prepare(&module)?,
-            b5: PreparedDecodeRoute::prepare(&module)?,
-            b6: PreparedDecodeRoute::prepare(&module)?,
-            b7: PreparedDecodeRoute::prepare(&module)?,
-            b8: PreparedDecodeRoute::prepare(&module)?,
-            t32_quantize: prepare_quantize::<A, 32>(&module)?,
-            t32: module
-                .prepare_fp8_swiglu_mma_t32(LaunchConfig1D::new(
-                    prefill_blocks,
-                    PREFILL_THREADS,
-                    PREFILL_K128_SHARED_BYTES,
-                ))
-                .map_err(|source| GpuError::launch("preparing dense-FP8 SwiGLU T=32", source))?,
-            t64_quantize: prepare_quantize::<A, 64>(&module)?,
-            t64: module
-                .prepare_fp8_swiglu_mma_t64(LaunchConfig1D::new(
-                    prefill_blocks,
-                    PREFILL_THREADS,
-                    PREFILL_K128_SHARED_BYTES,
-                ))
-                .map_err(|source| GpuError::launch("preparing dense-FP8 SwiGLU T=64", source))?,
-            t128_quantize: prepare_quantize::<A, 128>(&module)?,
-            t128: module
-                .prepare_fp8_swiglu_mma_t128(LaunchConfig1D::new(
-                    2 * prefill_blocks,
-                    PREFILL_THREADS,
-                    PREFILL_K64_SHARED_BYTES,
-                ))
-                .map_err(|source| GpuError::launch("preparing dense-FP8 SwiGLU T=128", source))?,
+            routes: DenseFp8SwiGluRoutes::prepare(&module)?,
             t1024_quantize: prepare_quantize::<A, MACRO_TOKENS>(&module)?,
             t1024: DenseFp8SwiGluTmaRoute::new(context)?,
             module,
@@ -384,80 +460,25 @@ impl<A: Sm120Arch> DenseFp8SwiGluOp<A> {
         weight_scales: *const u16,
         output: *mut u16,
     ) -> GpuResult<()> {
-        macro_rules! decode {
-            ($route:ident) => {
-                // SAFETY: exact route dispatch preserves the public pointer contract.
-                unsafe {
-                    self.$route.launch(
-                        &self.module,
-                        stream,
-                        input,
-                        activation_codes,
-                        activation_scales,
-                        weight_codes,
-                        weight_scales,
-                        output,
-                    )
-                }
-            };
-        }
-        macro_rules! prefill {
-            ($quantize:ident, $route:ident, $method:ident, $k_words:expr) => {{
-                self.module
-                    .fp8_swiglu_quantize::<A>(
-                        stream,
-                        &self.$quantize,
-                        input.cast::<u32>(),
-                        activation_codes.cast::<u16>(),
-                        activation_scales,
-                    )
-                    .map_err(|source| {
-                        GpuError::launch("launching dense-FP8 quantization", source)
-                    })?;
-                self.module
-                    .$method(
-                        stream,
-                        &self.$route,
-                        activation_codes.cast::<u32>(),
-                        activation_scales,
-                        weight_codes.cast::<u32>(),
-                        weight_scales,
-                        output,
-                        (A::HIDDEN / 4 / $k_words) as u32,
-                    )
-                    .map_err(|source| {
-                        GpuError::launch("launching dense-FP8 SwiGLU prefill", source)
-                    })
-            }};
-        }
-
-        let Some(class) = route_class(rows) else {
-            return Err(GpuError::invalid_launch(format!(
+        dispatch_fp8_swiglu!(
+            &self.routes,
+            rows,
+            |route| unsafe {
+                route.launch(
+                    &self.module,
+                    stream,
+                    input,
+                    activation_codes,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    output,
+                )
+            },
+            else => Err(GpuError::invalid_launch(format!(
                 "dense-FP8 SwiGLU row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128"
-            )));
-        };
-
-        match class {
-            RouteClass::Decode => match rows {
-                1 => decode!(b1),
-                2 => decode!(b2),
-                3 => decode!(b3),
-                4 => decode!(b4),
-                5 => decode!(b5),
-                6 => decode!(b6),
-                7 => decode!(b7),
-                8 => decode!(b8),
-                _ => unreachable!(),
-            },
-            RouteClass::PrefillK128 => match rows {
-                32 => prefill!(t32_quantize, t32, fp8_swiglu_mma_t32, PREFILL_K128_WORDS),
-                64 => prefill!(t64_quantize, t64, fp8_swiglu_mma_t64, PREFILL_K128_WORDS),
-                _ => unreachable!(),
-            },
-            RouteClass::PrefillK64 => {
-                prefill!(t128_quantize, t128, fp8_swiglu_mma_t128, PREFILL_K64_WORDS)
-            }
-        }
+            )))
+        )
     }
 
     /// Dynamically quantizes and applies the exact T=1024 TMA route.
@@ -525,31 +546,18 @@ pub(crate) fn fp8_swiglu_ptx_names() -> [&'static str; 13] {
 #[cfg(test)]
 mod tests {
     use super::{
-        DECODE_THREADS, DECODE_WARPS, PREFILL_K64_SHARED_BYTES, PREFILL_K128_SHARED_BYTES,
-        RouteClass, fp8_swiglu_ptx_names, route_class,
+        DECODE_THREADS, DECODE_WARPS, DenseFp8SwiGluRoutes, PREFILL_K64_SHARED_BYTES,
+        PREFILL_K128_SHARED_BYTES, fp8_swiglu_ptx_names,
     };
     use std::collections::BTreeSet;
     use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
     fn route_table_covers_only_the_admitted_shapes() {
-        let cases = [
-            (0, None),
-            (1, Some(RouteClass::Decode)),
-            (8, Some(RouteClass::Decode)),
-            (9, None),
-            (16, None),
-            (31, None),
-            (32, Some(RouteClass::PrefillK128)),
-            (64, Some(RouteClass::PrefillK128)),
-            (127, None),
-            (128, Some(RouteClass::PrefillK64)),
-            (129, None),
-        ];
-
-        for (rows, expected) in cases {
-            assert_eq!(route_class(rows), expected, "rows={rows}");
-        }
+        assert_eq!(
+            DenseFp8SwiGluRoutes::<Qwen38_27B>::admitted_rows(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128]
+        );
     }
 
     #[test]
