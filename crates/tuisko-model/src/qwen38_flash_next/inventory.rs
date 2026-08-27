@@ -11,6 +11,7 @@ use crate::common::inventory::{
 };
 use crate::common::naming::{EMBEDDING, LM_HEAD, layer_prefix};
 use crate::common::schema::validate_config;
+use crate::qwen38_flash_next::bindings::HYPER_CONNECTION_MIXER;
 use crate::{Arch, CheckpointError, CheckpointResult, DType, Qwen38FlashNext, SafeTensorFile};
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,8 +22,6 @@ use std::path::Path;
 const EXPERTS_PER_SHARD: usize = 128;
 /// Expert shards owned by one decoder layer.
 const EXPERT_SHARD_BLOCKS: usize = 4;
-/// Root of the model-level hyper-connection mixer, which is this target's only final norm.
-const HYPER_CONNECTION_MIXER: &str = "model.language_model.hyper_connection_mixer";
 /// Root of the MTP draft block.
 const MTP_ROOT: &str = "mtp";
 
@@ -855,6 +854,68 @@ mod tests {
         assert!(!expected.contains_key("model.language_model.layers.0.ple.key_proj.weight"));
         // The MTP pool is ignored by the ModelOpt run and stays BF16 and fused.
         assert!(!expected.contains_key("mtp.layers.0.mlp.experts.0.gate_proj.weight"));
+    }
+
+    /// Partitions every inventory entry by binding family; only 31 MTP tensors remain deferred.
+    #[test]
+    fn every_non_mtp_tensor_is_claimed_by_an_admitted_source_binding() {
+        fn binding_family(name: &str) -> &'static str {
+            if name.starts_with(MTP_ROOT) {
+                return "mtp";
+            }
+            if name.starts_with("model.visual.") {
+                return "vision";
+            }
+            if name == EMBEDDING || name == LM_HEAD || name.starts_with(HYPER_CONNECTION_MIXER) {
+                return "endpoints";
+            }
+            if name.contains("_hyper_connection.") {
+                return "hyper-connections";
+            }
+            if name.contains(".mlp.experts.") {
+                return "routed experts";
+            }
+            if name.contains(".mlp.") {
+                return "moe";
+            }
+            if name.contains(".self_attn.") {
+                return "sparse_attention";
+            }
+            if name.contains(".linear_attn.") {
+                return "gdn";
+            }
+            if name.contains(".ple.") {
+                return "engram";
+            }
+
+            "unclaimed"
+        }
+
+        let expected = qwen38_flash_next_expected_tensors::<Qwen38FlashNext>().unwrap();
+        let mut counts = BTreeMap::new();
+
+        for name in expected.keys() {
+            *counts.entry(binding_family(name)).or_insert(0usize) += 1;
+        }
+
+        assert_eq!(
+            counts,
+            BTreeMap::from([
+                ("endpoints", 5),
+                ("engram", 138),
+                ("gdn", 324),
+                ("hyper-connections", 384),
+                ("moe", 240),
+                ("mtp", 31),
+                ("sparse_attention", 108),
+                ("routed experts", 294_912),
+                ("vision", 333),
+            ])
+        );
+        assert_eq!(
+            counts.values().sum::<usize>(),
+            QWEN38_FLASH_NEXT_INVENTORY.index_entries
+        );
     }
 
     #[test]

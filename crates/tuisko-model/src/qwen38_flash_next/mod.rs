@@ -1,7 +1,11 @@
 //! Source admission for the pinned `RadixArk/Qwen3.8-Flash-Next-NVFP4` checkpoint.
 
+pub(crate) mod bindings;
 pub(crate) mod config;
+pub(crate) mod engram;
+pub(crate) mod engram_hash;
 pub(crate) mod inventory;
+pub(crate) mod materialize;
 
 use crate::common::inventory::CheckpointSnapshot;
 use crate::common::schema::CheckpointSchema;

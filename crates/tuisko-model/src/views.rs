@@ -9,8 +9,8 @@ mod sealed {
 
 /// Source element admitted by a typed view.
 ///
-/// Sealed: the four marker types below are the complete admitted element set, and no other
-/// crate can add a fifth. Admitting a new source element is a checkpoint-contract change,
+/// Sealed: the five marker types below are the complete admitted element set, and no other
+/// crate can add a sixth. Admitting a new source element is a checkpoint-contract change,
 /// never a downstream extension.
 pub trait TensorElement: sealed::Sealed + Copy + 'static {
     /// Exact source dtype every view of this element validates against.
@@ -29,6 +29,10 @@ pub struct F32;
 #[derive(Clone, Copy, Debug)]
 pub struct Fp8E4M3;
 
+/// Little-endian signed 64-bit source words.
+#[derive(Clone, Copy, Debug)]
+pub struct I64;
+
 /// Raw U8 source elements.
 #[derive(Clone, Copy, Debug)]
 pub struct U8;
@@ -36,6 +40,7 @@ pub struct U8;
 impl sealed::Sealed for Bf16 {}
 impl sealed::Sealed for F32 {}
 impl sealed::Sealed for Fp8E4M3 {}
+impl sealed::Sealed for I64 {}
 impl sealed::Sealed for U8 {}
 
 impl TensorElement for Bf16 {
@@ -48,6 +53,10 @@ impl TensorElement for F32 {
 
 impl TensorElement for Fp8E4M3 {
     const DTYPE: DType = DType::Fp8E4M3;
+}
+
+impl TensorElement for I64 {
+    const DTYPE: DType = DType::I64;
 }
 
 impl TensorElement for U8 {
@@ -71,6 +80,9 @@ pub type F32View<'a, const RANK: usize> = TypedView<'a, F32, RANK>;
 
 /// Validated zero-copy view of FP8 E4M3 source codes.
 pub type Fp8E4M3View<'a, const RANK: usize> = TypedView<'a, Fp8E4M3, RANK>;
+
+/// Validated zero-copy view of little-endian signed 64-bit source words.
+pub type I64View<'a, const RANK: usize> = TypedView<'a, I64, RANK>;
 
 /// Validated zero-copy view of raw U8 source elements.
 pub type U8View<'a, const RANK: usize> = TypedView<'a, U8, RANK>;
@@ -223,6 +235,37 @@ impl<'a, const RANK: usize> Fp8E4M3View<'a, RANK> {
     }
 }
 
+impl<'a, const RANK: usize> I64View<'a, RANK> {
+    /// Validates one public tensor descriptor as an exact I64 view.
+    pub fn bind(tensor: TensorView<'a>, expected_shape: [u64; RANK]) -> CheckpointResult<Self> {
+        Self::bind_validated(tensor, expected_shape)
+    }
+
+    /// Returns the unmodified little-endian I64 bytes.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Returns the source I64 value at `index`.
+    pub fn value(&self, index: usize) -> Option<i64> {
+        let begin = index.checked_mul(8)?;
+        let end = begin.checked_add(8)?;
+        let bytes: [u8; 8] = self.bytes.get(begin..end)?.try_into().ok()?;
+
+        Some(i64::from_le_bytes(bytes))
+    }
+
+    /// Iterates over the source I64 values.
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = i64> + ExactSizeIterator + '_ {
+        self.bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .copied()
+            .map(i64::from_le_bytes)
+    }
+}
+
 impl<'a, const RANK: usize> U8View<'a, RANK> {
     /// Binds a validated view from an admitted tensor descriptor.
     pub fn bind(tensor: TensorView<'a>, expected_shape: [u64; RANK]) -> CheckpointResult<Self> {
@@ -237,12 +280,14 @@ impl<'a, const RANK: usize> U8View<'a, RANK> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bf16, Bf16View, F32, F32View, Fp8E4M3, Fp8E4M3View, TensorElement, U8, U8View};
+    use super::{
+        Bf16, Bf16View, F32, F32View, Fp8E4M3, Fp8E4M3View, I64, I64View, TensorElement, U8, U8View,
+    };
     use crate::{CheckpointErrorCode, DType, TensorView};
 
     #[test]
     fn typed_view_elements_pin_their_source_dtype_and_element_width() {
-        const PAYLOAD: [u8; 16] = [0; 16];
+        const PAYLOAD: [u8; 32] = [0; 32];
 
         let descriptor = |dtype: DType| TensorView {
             name: "typed",
@@ -255,16 +300,18 @@ mod tests {
         assert_eq!(Bf16::DTYPE, DType::Bf16);
         assert_eq!(F32::DTYPE, DType::F32);
         assert_eq!(Fp8E4M3::DTYPE, DType::Fp8E4M3);
+        assert_eq!(I64::DTYPE, DType::I64);
         assert_eq!(U8::DTYPE, DType::U8);
 
         let bf16 = Bf16View::bind(descriptor(DType::Bf16), [4]).unwrap();
         let f32 = F32View::bind(descriptor(DType::F32), [4]).unwrap();
         let fp8 = Fp8E4M3View::bind(descriptor(DType::Fp8E4M3), [4]).unwrap();
+        let i64 = I64View::bind(descriptor(DType::I64), [4]).unwrap();
         let u8 = U8View::bind(descriptor(DType::U8), [4]).unwrap();
 
         assert_eq!(
-            [bf16.len(), f32.len(), fp8.len(), u8.len()],
-            [4, 4, 4, 4],
+            [bf16.len(), f32.len(), fp8.len(), i64.len(), u8.len()],
+            [4, 4, 4, 4, 4],
             "element widths must divide the source byte length"
         );
         assert_eq!(
@@ -272,10 +319,59 @@ mod tests {
                 bf16.bytes().len(),
                 f32.bytes().len(),
                 fp8.codes().len(),
+                i64.bytes().len(),
                 u8.bytes().len()
             ],
-            [8, 16, 4, 4]
+            [8, 16, 4, 32, 4]
         );
+    }
+
+    #[test]
+    fn i64_values_preserve_little_endian_source_words() {
+        // Large values expose truncation and sign-extension errors.
+        const MULTIPLIERS: [i64; 3] = [23_703_573_157_769, 20_109_073_645_365, 8_052_911_324_071];
+
+        let payload = MULTIPLIERS
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let view = I64View::bind(
+            TensorView {
+                name: "layer_multipliers",
+                dtype: DType::I64,
+                shape: &[3],
+                bytes: &payload,
+                data_range: 0..24,
+            },
+            [3],
+        )
+        .unwrap();
+
+        assert_eq!(view.value(0), Some(23_703_573_157_769));
+        assert_eq!(view.value(2), Some(8_052_911_324_071));
+        assert_eq!(view.value(3), None);
+        assert_eq!(view.values().collect::<Vec<_>>(), MULTIPLIERS);
+        assert_eq!(view.bytes(), payload.as_slice());
+    }
+
+    #[test]
+    fn i64_view_rejects_a_source_that_is_not_i64() {
+        let payload = [0u8; 24];
+        let error = I64View::bind(
+            TensorView {
+                name: "layer_multipliers",
+                dtype: DType::F32,
+                shape: &[3],
+                bytes: &payload[..12],
+                data_range: 0..12,
+            },
+            [3],
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error.code(), CheckpointErrorCode::Tensor);
+        assert!(error.to_string().contains("dtype `F32`, expected `I64`"));
     }
 
     #[test]
