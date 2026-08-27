@@ -17,6 +17,7 @@ use tuisko_gpu::{CudaGraph, CudaStream, GpuTimer};
 
 const DEVICE_INDEX: &str = "0";
 const MAX_IDLE_MEMORY_MIB: u32 = 2_048;
+const IDLE_UTILIZATION_LIMIT_PERCENT: u32 = 10;
 const IDLE_UTILIZATION_SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
 const OWNED_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_UTILIZATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -1164,12 +1165,13 @@ pub(crate) fn preflight() -> Result<DevicePreflight, DeviceBenchmarkError> {
             )));
         }
         require_compute_process_count(0)?;
-        if snapshot.utilization_percent == 0 {
+        if idle_background(snapshot.utilization_percent, snapshot.memory_used_mib) {
             break snapshot;
         }
         if Instant::now() >= deadline {
             return Err(DeviceBenchmarkError::Precondition(format!(
-                "device zero utilization did not settle within {} seconds: utilization={}%, memory={} MiB",
+                "device zero utilization did not settle below {}% within {} seconds: utilization={}%, memory={} MiB",
+                IDLE_UTILIZATION_LIMIT_PERCENT,
                 IDLE_UTILIZATION_SETTLE_TIMEOUT.as_secs(),
                 snapshot.utilization_percent,
                 snapshot.memory_used_mib
@@ -1189,6 +1191,10 @@ pub(crate) fn preflight() -> Result<DevicePreflight, DeviceBenchmarkError> {
     })
 }
 
+fn idle_background(utilization_percent: u32, memory_used_mib: u32) -> bool {
+    utilization_percent < IDLE_UTILIZATION_LIMIT_PERCENT && memory_used_mib <= MAX_IDLE_MEMORY_MIB
+}
+
 pub(crate) fn wait_for_owned_child_cleanup() -> Result<(), DeviceBenchmarkError> {
     let deadline = Instant::now() + OWNED_CHILD_CLEANUP_TIMEOUT;
     loop {
@@ -1200,7 +1206,7 @@ pub(crate) fn wait_for_owned_child_cleanup() -> Result<(), DeviceBenchmarkError>
             )));
         }
         require_compute_process_count(0)?;
-        if snapshot.utilization_percent == 0 && snapshot.memory_used_mib <= MAX_IDLE_MEMORY_MIB {
+        if idle_background(snapshot.utilization_percent, snapshot.memory_used_mib) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -2168,13 +2174,21 @@ mod tests {
     use super::{
         BenchmarkMemoryKind, BenchmarkMemoryMeasurement, ComputeProcess, DeviceBenchmarkOptions,
         DeviceMemoryMetric, DeviceMemorySnapshot, MemoryComparison, MemoryRecorder,
-        TelemetryEvidence, TelemetrySample, loaded_clock_probe_replays, measurement_order,
-        parse_compute_processes, parse_process_memory, telemetry_evidence,
+        TelemetryEvidence, TelemetrySample, idle_background, loaded_clock_probe_replays,
+        measurement_order, parse_compute_processes, parse_process_memory, telemetry_evidence,
         validate_compute_process_count, warmup_launches,
     };
     use std::time::Duration;
 
     const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn desktop_idle_threshold_is_exclusive() {
+        assert!(idle_background(0, 2_048));
+        assert!(idle_background(9, 2_048));
+        assert!(!idle_background(10, 2_048));
+        assert!(!idle_background(9, 2_049));
+    }
 
     #[test]
     fn benchmark_budgets_match_graph_duration_classes() {

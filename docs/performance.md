@@ -376,8 +376,8 @@ Before any qualification or build work, the wrapper requires device zero to be t
 idle below the admitted memory threshold, free of compute processes, and selected by an unset or
 exactly `0` `CUDA_VISIBLE_DEVICES`. The benchmark process still performs its complete independent
 preflight and telemetry checks immediately before timing. Post-build and benchmark preflights wait
-up to 60 seconds for process-free desktop utilization to settle to exactly zero; the memory,
-process-count, and clock requirements remain unchanged.
+up to 60 seconds for process-free desktop utilization to settle below 10%; the memory, process-count,
+and clock requirements remain unchanged.
 
 `perf iterate` reuses a numerical qualification only when an ignored receipt matches the complete
 device-input fingerprint and the hashed physical-device/driver identity. It reuses a build only
@@ -717,7 +717,7 @@ Before measurement, the runner requires:
 
 - device zero is exactly `NVIDIA GeForce RTX 5090`;
 - `CUDA_VISIBLE_DEVICES` is unset or exactly `0`;
-- GPU utilization is zero;
+- GPU utilization is below 10%;
 - at most 2,048 MiB is already used, admitting the product workstation's desktop footprint;
 - no foreign compute PID is present; and
 - the runtime compute capability is 12.0.
