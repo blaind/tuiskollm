@@ -2,7 +2,7 @@
 
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use std::io::{IsTerminal, Write};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -40,7 +40,12 @@ struct ServeArgs {
     #[arg(long, value_name = "SNAPSHOT")]
     snapshot: Option<PathBuf>,
     /// TCP listen address.
-    #[arg(long, value_name = "ADDRESS", default_value = DEFAULT_ADDRESS)]
+    #[arg(
+        long,
+        value_name = "ADDRESS",
+        default_value = DEFAULT_ADDRESS,
+        value_parser = parse_address
+    )]
     address: SocketAddr,
 }
 
@@ -253,6 +258,18 @@ where
     }
 }
 
+fn parse_address(address: &str) -> Result<SocketAddr, String> {
+    if let Ok(address) = address.parse() {
+        return Ok(address);
+    }
+
+    address
+        .to_socket_addrs()
+        .map_err(|error| format!("invalid ADDRESS `{address}`: {error}"))?
+        .next()
+        .ok_or_else(|| format!("ADDRESS `{address}` resolved to no socket addresses"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -322,6 +339,14 @@ mod tests {
     }
 
     #[test]
+    fn serve_resolves_a_hostname_socket_address() {
+        let Command::Serve(config) =
+            parse(&["serve", QWEN38, "--address", "localhost:8000"]).unwrap();
+        assert!(config.address.ip().is_loopback());
+        assert_eq!(config.address.port(), 8000);
+    }
+
+    #[test]
     fn malformed_or_ambiguous_commands_are_refused() {
         assert_eq!(
             parse(&[]).unwrap_err().kind(),
@@ -344,10 +369,10 @@ mod tests {
                 .contains("AxionML/Qwen3.5-9B-NVFP4 requires --snapshot SNAPSHOT")
         );
         assert!(
-            parse(&["serve", QWEN38, "--address", "localhost:8000"])
+            parse(&["serve", QWEN38, "--address", "localhost"])
                 .unwrap_err()
                 .to_string()
-                .contains("invalid socket address")
+                .contains("invalid ADDRESS")
         );
         assert_eq!(
             parse(&["serve", QWEN38, "snapshot"]).unwrap_err().kind(),
