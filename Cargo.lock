@@ -3450,6 +3450,7 @@ version = "0.1.0"
 dependencies = [
  "tuisko-kernels-sm120-attention",
  "tuisko-kernels-sm120-common",
+ "tuisko-kernels-sm120-engram",
  "tuisko-kernels-sm120-fp8-mlp",
  "tuisko-kernels-sm120-fp8-projection",
  "tuisko-kernels-sm120-gdn",
@@ -3481,6 +3482,21 @@ version = "0.1.0"
 dependencies = [
  "cuda-device",
  "cuda-intrinsics",
+ "tuisko-model",
+]
+
+[[package]]
+name = "tuisko-kernels-sm120-engram"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+ "cuda-intrinsics",
+ "tuisko-gpu",
+ "tuisko-kernels-macros",
+ "tuisko-kernels-sm120-common",
+ "tuisko-kernels-sm120-hyper-connection",
  "tuisko-model",
 ]
 

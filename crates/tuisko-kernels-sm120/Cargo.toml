@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 tuisko-kernels-sm120-attention.workspace = true
 tuisko-kernels-sm120-common.workspace = true
+tuisko-kernels-sm120-engram.workspace = true
 tuisko-kernels-sm120-fp8-mlp.workspace = true
 tuisko-kernels-sm120-fp8-projection.workspace = true
 tuisko-kernels-sm120-gdn.workspace = true

@@ -46,6 +46,10 @@ const FAMILIES: &[Family] = &[
         "tuisko_kernels_sm120_moe",
         tuisko_kernels_sm120_moe::kernel_ptx_names,
     ),
+    (
+        "tuisko_kernels_sm120_engram",
+        tuisko_kernels_sm120_engram::kernel_ptx_names,
+    ),
 ];
 
 /// Stable semantic inventory of every admitted SM120 entry.
@@ -81,10 +85,11 @@ mod tests {
         ("tuisko_kernels_sm120_hyper_connection", 60),
         ("tuisko_kernels_sm120_lm_head", 16),
         ("tuisko_kernels_sm120_moe", 172),
+        ("tuisko_kernels_sm120_engram", 66),
     ];
 
     /// A generic specialization is exported as `base_TID_<type hash>`, and that
-    /// hash is only reproducible inside the compilation that emitted it — a
+    /// hash is only reproducible inside the compilation that emitted it; a
     /// host build of this crate hashes the same kernel differently. The base
     /// name is the part both compilations agree on.
     fn base_name(name: &str) -> &str {

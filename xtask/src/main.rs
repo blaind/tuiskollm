@@ -27,6 +27,9 @@ use std::time::{Duration, Instant};
 const RESIDUAL_NORM_RESOURCE_BASELINE: &str = "qual/baselines/residual-norm-sm120.txt";
 const QWEN38_FLASH_NEXT_HYPER_CONNECTION_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen38-flash-next-hyper-connection-sm120.txt";
+const QWEN38_FLASH_NEXT_PLE_RESOURCE_BASELINE: &str =
+    "qual/baselines/qwen38-flash-next-ple-sm120.txt";
+const QWEN38_FLASH_NEXT_PLE_TEST_FILTER: &str = "qwen38_flash_next_ple_suite_";
 const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-residual-norm-sm120.txt";
 const QWEN35_RESIDUAL_NORM_TEST_FILTER: &str = "qwen35_residual_norm";
@@ -192,6 +195,7 @@ const SM120_RESOURCE_BASELINES: &[&str] = &[
     QWEN35_MTP_RESOURCE_BASELINE,
     QWEN36_MTP_RESOURCE_BASELINE,
     QWEN38_FLASH_NEXT_HYPER_CONNECTION_RESOURCE_BASELINE,
+    QWEN38_FLASH_NEXT_PLE_RESOURCE_BASELINE,
 ];
 const NVFP4_MLP_RESOURCE_BASELINES: &[&str] = &[
     RESIDUAL_NORM_RESOURCE_BASELINE,
@@ -362,6 +366,10 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
     (
         "qwen38-flash-next-hyper-connection",
         &[QWEN38_FLASH_NEXT_HYPER_CONNECTION_RESOURCE_BASELINE],
+    ),
+    (
+        "qwen38-flash-next-ple",
+        &[QWEN38_FLASH_NEXT_PLE_RESOURCE_BASELINE],
     ),
     (
         "qwen35-residual-norm",
@@ -590,13 +598,14 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
 /// The kernel families are separate crates so an edit re-runs cuda-oxide
 /// device codegen only for the family it touched. cargo-oxide accepts the
 /// owners as one comma-separated list and emits one PTX module per crate.
-pub(crate) const SM120_DEVICE_CODEGEN_CRATES: &str = "tuisko-kernels-sm120-attention,tuisko-kernels-sm120-fp8-mlp,tuisko-kernels-sm120-fp8-projection,tuisko-kernels-sm120-gdn,tuisko-kernels-sm120-hyper-connection,tuisko-kernels-sm120-lm-head,tuisko-kernels-sm120-moe,tuisko-kernels-sm120-mtp,tuisko-kernels-sm120-norm,tuisko-kernels-sm120-nvfp4";
+pub(crate) const SM120_DEVICE_CODEGEN_CRATES: &str = "tuisko-kernels-sm120-attention,tuisko-kernels-sm120-engram,tuisko-kernels-sm120-fp8-mlp,tuisko-kernels-sm120-fp8-projection,tuisko-kernels-sm120-gdn,tuisko-kernels-sm120-hyper-connection,tuisko-kernels-sm120-lm-head,tuisko-kernels-sm120-moe,tuisko-kernels-sm120-mtp,tuisko-kernels-sm120-norm,tuisko-kernels-sm120-nvfp4";
 /// Every module the SM120 device build emits, in `SM120_DEVICE_CODEGEN_CRATES`
 /// order. The resource gates read the concatenation: entry names are unique
 /// across the whole artifact, and every module is compiled on its own so the
 /// reported shared-memory footprint is the family's alone.
-const SM120_PTX_MODULES: [&str; 10] = [
+const SM120_PTX_MODULES: [&str; 11] = [
     "target/cuda/tuisko_kernels_sm120_attention.ptx",
+    "target/cuda/tuisko_kernels_sm120_engram.ptx",
     "target/cuda/tuisko_kernels_sm120_fp8_mlp.ptx",
     "target/cuda/tuisko_kernels_sm120_fp8_projection.ptx",
     "target/cuda/tuisko_kernels_sm120_gdn.ptx",
@@ -1092,6 +1101,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "qualify-qwen38-flash-next-hyper-connection",
         qualify_qwen38_flash_next_hyper_connection,
     ),
+    no_args(
+        "qualify-qwen38-flash-next-ple",
+        qualify_qwen38_flash_next_ple,
+    ),
     no_args("qualify-residual-norm", qualify_residual_norm),
     no_args("qualify-qwen35-residual-norm", qualify_qwen35_residual_norm),
     no_args("qualify-qwen36-residual-norm", qualify_qwen36_residual_norm),
@@ -1293,6 +1306,7 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "bench-qwen38-flash-next-hyper-connection",
         bench_qwen38_flash_next_hyper_connection,
     ),
+    forwarded("bench-qwen38-flash-next-ple", bench_qwen38_flash_next_ple),
     forwarded("bench-residual-norm", bench_residual_norm),
     forwarded("bench-qwen35-residual-norm", bench_qwen35_residual_norm),
     forwarded("bench-qwen36-residual-norm", bench_qwen36_residual_norm),
@@ -1436,6 +1450,7 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "gate-qwen38-flash-next-hyper-connection",
         gate_qwen38_flash_next_hyper_connection,
     ),
+    no_args("gate-qwen38-flash-next-ple", gate_qwen38_flash_next_ple),
     no_args("gate-residual-norm", gate_residual_norm),
     no_args("gate-qwen35-residual-norm", gate_qwen35_residual_norm),
     no_args("gate-qwen36-residual-norm", gate_qwen36_residual_norm),
@@ -1969,7 +1984,8 @@ fn gate_sm120_resources(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_mtp_bf16_paged_gqa(root)?;
     gate_qwen35_mtp_resources(root)?;
     gate_qwen36_mtp_resources(root)?;
-    gate_qwen38_flash_next_hyper_connection(root)
+    gate_qwen38_flash_next_hyper_connection(root)?;
+    gate_qwen38_flash_next_ple(root)
 }
 
 fn build_residual_norm(
@@ -2142,6 +2158,16 @@ fn qualify_qwen38_flash_next_hyper_connection(root: &Path) -> Result<(), Box<dyn
         None,
     )?;
     gate_qwen38_flash_next_hyper_connection(root)
+}
+
+fn qualify_qwen38_flash_next_ple(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        QWEN38_FLASH_NEXT_PLE_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
+    )?;
+    gate_qwen38_flash_next_ple(root)
 }
 
 fn qualify_residual_norm(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -3647,6 +3673,13 @@ fn bench_qwen38_flash_next_hyper_connection(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     run_bench_device(root, "qwen38-flash-next-hyper-connection", arguments)
+}
+
+fn bench_qwen38_flash_next_ple(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "qwen38-flash-next-ple", arguments)
 }
 
 fn bench_residual_norm(
@@ -6018,6 +6051,172 @@ fn single_ptx_path(gpu: gpu_target::GpuTarget) -> Result<&'static str, Box<dyn E
         )
         .into()
     })
+}
+
+/// Pins the Qwen3.8-Flash-Next PLE launch and resource contract.
+fn gate_qwen38_flash_next_ple(root: &Path) -> Result<(), Box<dyn Error>> {
+    let baseline = parse_baseline(&fs::read_to_string(
+        root.join(QWEN38_FLASH_NEXT_PLE_RESOURCE_BASELINE),
+    )?)?;
+    verify_generator_stamp(root, &baseline)?;
+    let entries = &sm120_gate_module(root)?.entries;
+    let artifact = sm120_gate_artifact(root)?;
+    let sass = artifact.sass()?;
+    let dequant_ptx = ["cvt.rn.f16x2.e4m3x2", "cvt.rn.bf16x2.f32"];
+    let dequant_sass = ["F2FP.BF16.F32.PACK_AB"];
+    let project_ptx = ["shfl.sync.down.b32", "st.global.b16"];
+    let project_sass = ["SHFL"];
+    let gate_ptx = ["sqrt.rn.f32", "div.rn.f32", "ex2.approx.f32"];
+    let gate_sass = ["MUFU.EX2"];
+    let convolution_ptx = ["fma.rn.f32", "ex2.approx.f32"];
+    let convolution_sass = ["MUFU.EX2"];
+    let inject_ptx = ["cvt.rn.bf16x2.f32"];
+    let inject_sass = ["F2FP.BF16.F32.PACK_AB"];
+    let families = [
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next PLE dequantization",
+            prefix: "qwen38_flash_next_ple_dequant_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "dequant_registers",
+            ptx_instructions: &dequant_ptx,
+            sass_instructions: &dequant_sass,
+            forbidden_sass: &["SHFL"],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next PLE dequantization prefill",
+            prefix: "qwen38_flash_next_ple_dequant_prefill_TID_",
+            count: 4,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "dequant_prefill_registers",
+            ptx_instructions: &dequant_ptx,
+            sass_instructions: &dequant_sass,
+            forbidden_sass: &["SHFL"],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next PLE projection",
+            prefix: "qwen38_flash_next_ple_project_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "project_registers",
+            ptx_instructions: &project_ptx,
+            sass_instructions: &project_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next PLE projection prefill",
+            prefix: "qwen38_flash_next_ple_project_prefill_TID_",
+            count: 4,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "project_prefill_registers",
+            ptx_instructions: &project_ptx,
+            sass_instructions: &project_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next PLE gate",
+            prefix: "qwen38_flash_next_ple_gate_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "gate_registers",
+            ptx_instructions: &gate_ptx,
+            sass_instructions: &gate_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next PLE gate prefill",
+            prefix: "qwen38_flash_next_ple_gate_prefill_TID_",
+            count: 4,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "gate_prefill_registers",
+            ptx_instructions: &gate_ptx,
+            sass_instructions: &gate_sass,
+            forbidden_sass: &[],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next PLE convolution",
+            prefix: "qwen38_flash_next_ple_convolution_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "convolution_registers",
+            ptx_instructions: &convolution_ptx,
+            sass_instructions: &convolution_sass,
+            forbidden_sass: &["SHFL"],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next PLE convolution prefill",
+            prefix: "qwen38_flash_next_ple_convolution_prefill_TID_",
+            count: 4,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "convolution_prefill_registers",
+            ptx_instructions: &convolution_ptx,
+            sass_instructions: &convolution_sass,
+            forbidden_sass: &["SHFL"],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next PLE history publication",
+            prefix: "qwen38_flash_next_ple_convolution_prefill_history_TID_",
+            count: 4,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "history_registers",
+            ptx_instructions: &["st.global.b16"],
+            sass_instructions: &[],
+            forbidden_sass: &["SHFL", "MUFU.EX2"],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next PLE injection",
+            prefix: "qwen38_flash_next_ple_inject_TID_",
+            count: 8,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "inject_registers",
+            ptx_instructions: &inject_ptx,
+            sass_instructions: &inject_sass,
+            forbidden_sass: &["SHFL", "MUFU.EX2"],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next PLE injection prefill",
+            prefix: "qwen38_flash_next_ple_inject_prefill_TID_",
+            count: 4,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "inject_prefill_registers",
+            ptx_instructions: &inject_ptx,
+            sass_instructions: &inject_sass,
+            forbidden_sass: &["SHFL", "MUFU.EX2"],
+        },
+        ExactResourceFamily {
+            label: "Qwen3.8-Flash-Next PLE state copy",
+            prefix: "qwen38_flash_next_ple_state_copy_exact_TID_",
+            count: 2,
+            threads: 256,
+            minimum_ctas_per_sm: 2,
+            register_key: "state_copy_registers",
+            ptx_instructions: &["ld.global.v2.b64", "st.global.v2.b64"],
+            sass_instructions: &[],
+            forbidden_sass: &["SHFL", "MUFU.EX2"],
+        },
+    ];
+
+    let entry_count = gate_exact_resource_families(
+        &baseline,
+        entries,
+        artifact,
+        sass,
+        &families,
+        SharedFootprint::PerEntry,
+    )?;
+    println!("Qwen3.8-Flash-Next PLE resource gate passed: {entry_count} entries, STACK:0 LOCAL:0");
+    Ok(())
 }
 
 /// Pins the Qwen3.8-Flash-Next hyper-connection family's launch shapes, spill-freedom,
@@ -14003,9 +14202,9 @@ mod tests {
         QWEN35_RESIDENT_MTP_TEST_FILTER, QWEN35_RESIDUAL_NORM_TEST_FILTER,
         QWEN35_TEXT_ENDPOINT_TEST_FILTER, QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
         QWEN36_MTP_LAYER_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
-        QWEN38_FLASH_NEXT_ENGRAM_STAGING_TEST_FILTER, SM120_DEVICE_CODEGEN_CRATES,
-        SM120_RESOURCE_BASELINES, STREAMING_WEIGHT_POOL_TEST_FILTER, SUBCOMMANDS,
-        bench_device_baselines, bench_device_command, concatenated_resource_baselines,
+        QWEN38_FLASH_NEXT_ENGRAM_STAGING_TEST_FILTER, QWEN38_FLASH_NEXT_PLE_TEST_FILTER,
+        SM120_DEVICE_CODEGEN_CRATES, SM120_RESOURCE_BASELINES, STREAMING_WEIGHT_POOL_TEST_FILTER,
+        SUBCOMMANDS, bench_device_baselines, bench_device_command, concatenated_resource_baselines,
         contains_immediate_operand, device_is_idle, dispatch, dispatch_probe, names_opcode,
         parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
         parse_performance_device_sample, parse_performance_iteration, parse_resources,
@@ -14079,6 +14278,23 @@ mod tests {
             "qwen38_flash_next_engram_staging_benchmark::tests::qwen38_flash_next_engram_staging_suite_benchmark_times_the_source_backed_owner",
         ] {
             assert!(test.contains(QWEN38_FLASH_NEXT_ENGRAM_STAGING_TEST_FILTER));
+        }
+    }
+
+    #[test]
+    fn qwen38_flash_next_ple_filter_selects_oracles_and_accounting() {
+        for test in [
+            "qwen38_flash_next_ple::tests::qwen38_flash_next_ple_suite_signed_root_keeps_the_sign_and_the_zero",
+            "qwen38_flash_next_ple::tests::qwen38_flash_next_ple_suite_probe_discriminates_the_gate_sign",
+            "qwen38_flash_next_ple::tests::qwen38_flash_next_ple_suite_fixture_keeps_both_residual_terms_visible",
+            "qwen38_flash_next_ple::tests::qwen38_flash_next_ple_suite_every_convolution_slot_is_distinct",
+            "qwen38_flash_next_ple::tests::qwen38_flash_next_ple_suite_engram_codes_and_scale_are_pinned",
+            "qwen38_flash_next_ple::tests::qwen38_flash_next_ple_suite_route_and_arena_inventory_is_exact",
+            "qwen38_flash_next_ple::tests::qwen38_flash_next_ple_suite_exact_routes_match_independent_oracles_and_graph_replay",
+            "qwen38_flash_next_ple_benchmark::tests::qwen38_flash_next_ple_suite_benchmark_arena_accounting_exposes_every_byte",
+            "qwen38_flash_next_ple_benchmark::tests::qwen38_flash_next_ple_suite_benchmark_byte_accounting_covers_every_read_and_write_plane",
+        ] {
+            assert!(test.contains(QWEN38_FLASH_NEXT_PLE_TEST_FILTER));
         }
     }
 
@@ -14419,6 +14635,7 @@ mod tests {
                 "qual/baselines/qwen35-mtp-sm120.txt",
                 "qual/baselines/qwen36-mtp-sm120.txt",
                 "qual/baselines/qwen38-flash-next-hyper-connection-sm120.txt",
+                "qual/baselines/qwen38-flash-next-ple-sm120.txt",
             ]
         );
     }
@@ -15134,6 +15351,12 @@ mod tests {
                 NO_SNAPSHOT,
             ),
             (
+                "qualify-qwen38-flash-next-ple",
+                "qwen38_flash_next_ple_suite_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
                 "qualify-qwen38-flash-next-qsa-prepare",
                 "qwen38_flash_next_qsa_prepare",
                 SERIAL,
@@ -15370,7 +15593,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 94);
+        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 95);
 
         let snapshot = OsString::from("/snapshot");
         for &(command, filter, trailing, variable) in EXPECTED_QUALIFICATION_ROUTES {

@@ -281,6 +281,10 @@ mod qwen38_flash_next_moe_router;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_moe_router_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_ple;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_ple_benchmark;
+#[cfg(feature = "device")]
 mod qwen38_flash_next_qsa_attention;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_qsa_attention_benchmark;
@@ -771,6 +775,13 @@ pub use qwen38_flash_next_moe_router::{
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_moe_router_benchmark::benchmark_qwen38_flash_next_moe_router;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_ple::{
+    Qwen38FlashNextPleQualification, Qwen38FlashNextPleQualificationError,
+    qualify_qwen38_flash_next_ple,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_ple_benchmark::benchmark_qwen38_flash_next_ple;
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_qsa_attention::{
     Qwen38FlashNextQsaAttentionQualification, Qwen38FlashNextQsaAttentionQualificationError,
