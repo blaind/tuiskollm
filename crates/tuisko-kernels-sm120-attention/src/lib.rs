@@ -4,6 +4,7 @@ mod device;
 mod long_context_paged_gqa;
 mod paged_gqa;
 mod qk_prepare;
+mod qsa_selection;
 
 /// Device bodies the MTP BF16 family reuses.
 ///
@@ -37,6 +38,13 @@ pub use qk_prepare::{
     Qwen38FlashNextAttentionQkPrepareOp, Qwen38FlashNextQkPrepareEntries, Qwen38QkPrepareEntries,
     UnadmittedRoute,
 };
+pub use qsa_selection::{
+    IndexerCompressArgs, IndexerPrepareArgs, IndexerSelectionArgs, Qwen38FlashNextIndexerPrepareOp,
+    Qwen38FlashNextIndexerSelectionOp, Qwen38FlashNextSelectedPagedGqaOp, SELECTION_BLOCK_BUCKETS,
+    SELECTION_BLOCKS_PER_PAGE, SELECTION_MAX_BATCH, SELECTION_MAX_BLOCKS, SELECTION_MAX_SELECTED,
+    SELECTION_PREFILL_TOKENS, SELECTION_ROW_TILE, SelectedAttentionArgs, selection_block_bucket,
+    selection_round_blocks, selection_round_rows,
+};
 
 /// Semantic inventory of every entry this family emits.
 pub fn kernel_ptx_names() -> Vec<&'static str> {
@@ -52,6 +60,7 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .chain(paged_gqa::qwen36_fp8_paged_gqa_ptx_names())
         .chain(paged_gqa::qwen38_flash_next_paged_gqa_ptx_names())
         .chain(long_context_paged_gqa::long_context_paged_gqa_ptx_names())
+        .chain(qsa_selection::qwen38_flash_next_indexer_ptx_names())
         .collect()
 }
 
@@ -113,10 +122,17 @@ mod tests {
                 ("qwen36_paged_gqa_prefill_shared_exact", 3),
                 ("qwen38_flash_next_attention_qk_prepare_exact", 8),
                 ("qwen38_flash_next_attention_qk_prepare_prefill_exact", 4),
+                ("qwen38_flash_next_indexer_block_compress_exact", 12),
+                ("qwen38_flash_next_indexer_prepare_exact", 8),
+                ("qwen38_flash_next_indexer_prepare_prefill_exact", 4),
+                ("qwen38_flash_next_indexer_score_exact", 10),
+                ("qwen38_flash_next_indexer_select_exact", 10),
                 ("qwen38_flash_next_paged_gqa_exact", 8),
+                ("qwen38_flash_next_paged_gqa_prefill_selected_exact", 4),
                 ("qwen38_flash_next_paged_gqa_prefill_shared_exact", 4),
+                ("qwen38_flash_next_paged_gqa_selected_exact", 8),
             ]
         );
-        assert_eq!(counts.values().sum::<usize>(), 140);
+        assert_eq!(counts.values().sum::<usize>(), 196);
     }
 }

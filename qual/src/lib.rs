@@ -275,6 +275,10 @@ mod qwen38_flash_next_qsa_attention_benchmark;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_qsa_prepare_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_qsa_selection;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_qsa_selection_benchmark;
+#[cfg(feature = "device")]
 mod resident_batch_generation;
 #[cfg(feature = "device")]
 mod resident_generation;
@@ -746,6 +750,13 @@ pub use qwen38_flash_next_qsa_attention::{
 pub use qwen38_flash_next_qsa_attention_benchmark::benchmark_qwen38_flash_next_qsa_attention;
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_qsa_prepare_benchmark::benchmark_qwen38_flash_next_qsa_prepare;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_qsa_selection::{
+    Qwen38FlashNextQsaSelectionQualification, Qwen38FlashNextQsaSelectionQualificationError,
+    qualify_qwen38_flash_next_qsa_selection,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_qsa_selection_benchmark::benchmark_qwen38_flash_next_qsa_selection;
 #[cfg(feature = "device")]
 pub use resident_batch_generation::{
     ResidentBatchGenerationQualification, ResidentBatchGenerationQualificationError,
