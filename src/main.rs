@@ -7,13 +7,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use tuisko_provision::{Provisioning, ProvisioningProgress, ProvisioningStage, SnapshotResolution};
-use tuisko_serve::ServerConfig;
+use tuisko_serve::{ServerConfig, ServerModel};
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8000";
-const USAGE: &str = "TuiskoLLM exact-target inference server\n\nUsage:\n  tuiskollm serve [SNAPSHOT] [ADDRESS]\n  tuiskollm --help\n  tuiskollm --version\n\nWithout SNAPSHOT, the pinned Hugging Face cache entry is used. ADDRESS defaults to 127.0.0.1:8000.";
+const USAGE: &str = "TuiskoLLM exact-target inference server\n\nUsage:\n  tuiskollm serve MODEL [--snapshot SNAPSHOT] [--address ADDRESS]\n  tuiskollm --help\n  tuiskollm --version\n\nModels:\n  unsloth/Qwen3.8-27B-NVFP4             automatic download\n  AxionML/Qwen3.5-9B-NVFP4              --snapshot required\n  nvidia/Qwen3.6-35B-A3B-NVFP4          --snapshot required\n\nADDRESS defaults to 127.0.0.1:8000.";
 
 #[derive(Debug, Eq, PartialEq)]
 struct ServeArgs {
+    model: ServerModel,
     snapshot: Option<PathBuf>,
     address: SocketAddr,
 }
@@ -56,18 +57,22 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     let resolution = {
         let mut stdout = stdout.lock();
         let mut display = ProvisioningDisplay::new(interactive, color);
-        let resolution = match args.snapshot {
-            // The worker applies the selected model's exact checkpoint inventory;
-            // provisioning owns only the default Qwen3.8 download manifest.
-            Some(path) => Ok(SnapshotResolution {
+        let resolution = match (args.model, args.snapshot) {
+            (_, Some(path)) => Ok(SnapshotResolution {
                 path,
                 provisioning: None,
             }),
-            None => tuisko_provision::resolve_snapshot_with_progress(None, |progress| {
-                display
-                    .update(&mut stdout, progress)
-                    .map_err(|error| format!("writing provisioning progress: {error}"))
-            }),
+            (ServerModel::Qwen38, None) => {
+                tuisko_provision::resolve_snapshot_with_progress(None, |progress| {
+                    display
+                        .update(&mut stdout, progress)
+                        .map_err(|error| format!("writing provisioning progress: {error}"))
+                })
+            }
+            (model, None) => Err(format!(
+                "automatic download is not available for {}; pass --snapshot SNAPSHOT",
+                model.model_id(),
+            )),
         };
         display
             .finish(&mut stdout)
@@ -84,6 +89,7 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         resolution
     };
     tuisko_serve::run(ServerConfig {
+        model: args.model,
         snapshot: resolution.path,
         address: args.address,
     })
@@ -235,19 +241,57 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
         return Err(format!("unknown command `{}`", command.to_string_lossy()));
     }
 
-    let snapshot = args.next().map(PathBuf::from);
-    let address = match args.next() {
-        Some(address) => address
+    let model = args.next().ok_or("serve requires MODEL")?;
+    if model == "--help" || model == "-h" {
+        require_end(args)?;
+        return Ok(Command::Help);
+    }
+    let model = model
+        .to_str()
+        .ok_or_else(|| "MODEL must be valid UTF-8".to_owned())?;
+    if model.starts_with('-') {
+        return Err("serve requires MODEL before options".into());
+    }
+    let model = ServerModel::from_model_id(model)?;
+    let mut snapshot = None;
+    let mut address = None;
+    while let Some(option) = args.next() {
+        let option_text = option
             .to_str()
-            .ok_or_else(|| "ADDRESS must be valid UTF-8".to_owned())?
-            .parse::<SocketAddr>()
-            .map_err(|error| format!("invalid ADDRESS: {error}"))?,
-        None => DEFAULT_ADDRESS
+            .ok_or_else(|| "serve options must be valid UTF-8".to_owned())?;
+        let value = match option_text {
+            "--snapshot" | "--address" => args
+                .next()
+                .ok_or_else(|| format!("{option_text} requires a value"))?,
+            _ => return Err(format!("unknown serve option `{option_text}`")),
+        };
+        match option_text {
+            "--snapshot" if snapshot.is_none() => snapshot = Some(PathBuf::from(value)),
+            "--address" if address.is_none() => {
+                address = Some(
+                    value
+                        .to_str()
+                        .ok_or_else(|| "ADDRESS must be valid UTF-8".to_owned())?
+                        .parse::<SocketAddr>()
+                        .map_err(|error| format!("invalid ADDRESS: {error}"))?,
+                );
+            }
+            _ => return Err(format!("duplicate serve option `{option_text}`")),
+        }
+    }
+    if model != ServerModel::Qwen38 && snapshot.is_none() {
+        return Err(format!("{} requires --snapshot SNAPSHOT", model.model_id(),));
+    }
+    let address = address.unwrap_or_else(|| {
+        DEFAULT_ADDRESS
             .parse()
-            .expect("the checked default address is valid"),
-    };
-    require_end(args)?;
-    Ok(Command::Serve(ServeArgs { snapshot, address }))
+            .expect("the checked default address is valid")
+    });
+    Ok(Command::Serve(ServeArgs {
+        model,
+        snapshot,
+        address,
+    }))
 }
 
 fn require_end(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
@@ -271,58 +315,111 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tuisko_provision::{Provisioning, ProvisioningStage};
+    use tuisko_serve::ServerModel;
+
+    const QWEN38: &str = "unsloth/Qwen3.8-27B-NVFP4";
+    const QWEN35: &str = "AxionML/Qwen3.5-9B-NVFP4";
 
     fn parse(args: &[&str]) -> Result<Command, String> {
         parse_args(args.iter().map(OsString::from))
     }
 
     #[test]
-    fn serve_defaults_to_loopback_and_preserves_the_snapshot_path() {
-        let command = parse(&["serve", "/models/pinned"]).unwrap();
+    fn serve_requires_an_exact_model_and_defaults_to_loopback() {
+        let command = parse(&["serve", QWEN38]).unwrap();
         assert_eq!(
             command,
             Command::Serve(ServeArgs {
-                snapshot: Some(PathBuf::from("/models/pinned")),
+                model: ServerModel::Qwen38,
+                snapshot: None,
                 address: DEFAULT_ADDRESS.parse::<SocketAddr>().unwrap(),
             })
+        );
+        assert!(
+            parse(&["serve"])
+                .unwrap_err()
+                .contains("serve requires MODEL")
         );
     }
 
     #[test]
-    fn serve_accepts_one_explicit_numeric_socket_address() {
-        let command = parse(&["serve", "snapshot", "0.0.0.0:9123"]).unwrap();
-        let Command::Serve(config) = command else {
-            panic!("expected serve command");
-        };
-        assert_eq!(config.address, "0.0.0.0:9123".parse().unwrap());
+    fn serve_accepts_named_options_in_any_order() {
+        for arguments in [
+            vec![
+                "serve",
+                QWEN35,
+                "--snapshot",
+                "/models/pinned",
+                "--address",
+                "0.0.0.0:9123",
+            ],
+            vec![
+                "serve",
+                QWEN35,
+                "--address",
+                "0.0.0.0:9123",
+                "--snapshot",
+                "/models/pinned",
+            ],
+        ] {
+            assert_eq!(
+                parse(&arguments).unwrap(),
+                Command::Serve(ServeArgs {
+                    model: ServerModel::Qwen35,
+                    snapshot: Some(PathBuf::from("/models/pinned")),
+                    address: "0.0.0.0:9123".parse().unwrap(),
+                })
+            );
+        }
     }
 
     #[test]
     fn malformed_or_ambiguous_commands_are_refused() {
         assert!(parse(&[]).unwrap_err().contains("missing command"));
         assert!(parse(&["server"]).unwrap_err().contains("unknown command"));
-        assert_eq!(
-            parse(&["serve"]).unwrap(),
-            Command::Serve(ServeArgs {
-                snapshot: None,
-                address: DEFAULT_ADDRESS.parse().unwrap(),
-            })
+        assert!(
+            parse(&["serve", "unsloth/Qwen3.8-Flash-Next-GGUF"])
+                .unwrap_err()
+                .contains("unsupported model")
         );
         assert!(
-            parse(&["serve", "snapshot", "localhost:8000"])
+            parse(&["serve", QWEN35])
+                .unwrap_err()
+                .contains("AxionML/Qwen3.5-9B-NVFP4 requires --snapshot SNAPSHOT")
+        );
+        assert!(
+            parse(&["serve", QWEN38, "--address", "localhost:8000"])
                 .unwrap_err()
                 .contains("invalid ADDRESS")
         );
         assert!(
-            parse(&["serve", "snapshot", "127.0.0.1:8000", "extra"])
+            parse(&["serve", QWEN38, "snapshot"])
                 .unwrap_err()
-                .contains("unexpected argument")
+                .contains("unknown serve option")
+        );
+        for option in ["--snapshot", "--address"] {
+            assert!(
+                parse(&["serve", QWEN38, option])
+                    .unwrap_err()
+                    .contains("requires a value")
+            );
+        }
+        assert!(
+            parse(&["serve", QWEN38, "--snapshot", "one", "--snapshot", "two",])
+                .unwrap_err()
+                .contains("duplicate serve option `--snapshot`")
+        );
+        assert!(
+            parse(&["serve", "--model", QWEN38])
+                .unwrap_err()
+                .contains("serve requires MODEL before options")
         );
     }
 
     #[test]
     fn informational_commands_accept_no_trailing_arguments() {
         assert_eq!(parse(&["--help"]).unwrap(), Command::Help);
+        assert_eq!(parse(&["serve", "--help"]).unwrap(), Command::Help);
         assert_eq!(parse(&["-V"]).unwrap(), Command::Version);
         assert!(parse(&["--help", "extra"]).is_err());
     }
