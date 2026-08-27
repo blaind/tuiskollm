@@ -184,11 +184,11 @@ impl Qwen38FlashNextEngramRowHasher {
             admit_qwen38_flash_next_engram_token(token)?;
         }
 
-        for (token, destination) in tokens
-            .iter()
-            .copied()
-            .zip(rows.chunks_exact_mut(QWEN38_FLASH_NEXT_ENGRAM_ROWS_PER_TOKEN))
-        {
+        let (destinations, remainder) =
+            rows.as_chunks_mut::<QWEN38_FLASH_NEXT_ENGRAM_ROWS_PER_TOKEN>();
+        debug_assert!(remainder.is_empty());
+
+        for (token, destination) in tokens.iter().copied().zip(destinations.iter_mut()) {
             destination.copy_from_slice(&self.rows(carry, token)?);
         }
 
