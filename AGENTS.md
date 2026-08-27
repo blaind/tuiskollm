@@ -145,6 +145,7 @@ cargo clippy --workspace --exclude tuiskollm --exclude tuisko-engine \
   --exclude tuisko-kernels-sm120-fp8-mlp \
   --exclude tuisko-kernels-sm120-fp8-projection \
   --exclude tuisko-kernels-sm120-gdn \
+  --exclude tuisko-kernels-sm120-hyper-connection \
   --exclude tuisko-kernels-sm120-lm-head \
   --exclude tuisko-kernels-sm120-moe \
   --exclude tuisko-kernels-sm120-mtp \
@@ -159,6 +160,7 @@ cargo test --workspace --exclude tuiskollm --exclude tuisko-engine \
   --exclude tuisko-kernels-sm120-fp8-mlp \
   --exclude tuisko-kernels-sm120-fp8-projection \
   --exclude tuisko-kernels-sm120-gdn \
+  --exclude tuisko-kernels-sm120-hyper-connection \
   --exclude tuisko-kernels-sm120-lm-head \
   --exclude tuisko-kernels-sm120-moe \
   --exclude tuisko-kernels-sm120-mtp \

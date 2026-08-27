@@ -265,6 +265,10 @@ mod qwen38_flash_next_gdn_recurrence;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_gdn_recurrence_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_hyper_connection;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_hyper_connection_benchmark;
+#[cfg(feature = "device")]
 mod resident_batch_generation;
 #[cfg(feature = "device")]
 mod resident_generation;
@@ -720,6 +724,13 @@ pub use qwen38_flash_next_gdn_recurrence::{
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_gdn_recurrence_benchmark::benchmark_qwen38_flash_next_gdn_recurrence;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_hyper_connection::{
+    Qwen38FlashNextHyperConnectionQualification, Qwen38FlashNextHyperConnectionQualificationError,
+    qualify_qwen38_flash_next_hyper_connection,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_hyper_connection_benchmark::benchmark_qwen38_flash_next_hyper_connection;
 #[cfg(feature = "device")]
 pub use resident_batch_generation::{
     ResidentBatchGenerationQualification, ResidentBatchGenerationQualificationError,

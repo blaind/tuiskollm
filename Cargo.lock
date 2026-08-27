@@ -3444,6 +3444,7 @@ dependencies = [
  "tuisko-kernels-sm120-fp8-mlp",
  "tuisko-kernels-sm120-fp8-projection",
  "tuisko-kernels-sm120-gdn",
+ "tuisko-kernels-sm120-hyper-connection",
  "tuisko-kernels-sm120-lm-head",
  "tuisko-kernels-sm120-moe",
  "tuisko-kernels-sm120-mtp",
@@ -3509,6 +3510,18 @@ dependencies = [
  "cuda-intrinsics",
  "tuisko-gpu",
  "tuisko-kernels-sm120-common",
+ "tuisko-model",
+]
+
+[[package]]
+name = "tuisko-kernels-sm120-hyper-connection"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+ "cuda-intrinsics",
+ "tuisko-gpu",
  "tuisko-model",
 ]
 

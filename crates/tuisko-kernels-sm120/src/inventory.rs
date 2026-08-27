@@ -35,6 +35,10 @@ const FAMILIES: &[Family] = &[
         tuisko_kernels_sm120_mtp::kernel_ptx_names,
     ),
     (
+        "tuisko_kernels_sm120_hyper_connection",
+        tuisko_kernels_sm120_hyper_connection::kernel_ptx_names,
+    ),
+    (
         "tuisko_kernels_sm120_lm_head",
         tuisko_kernels_sm120_lm_head::kernel_ptx_names,
     ),
@@ -74,6 +78,7 @@ mod tests {
         ("tuisko_kernels_sm120_fp8_mlp", 26),
         ("tuisko_kernels_sm120_gdn", 134),
         ("tuisko_kernels_sm120_mtp", 187),
+        ("tuisko_kernels_sm120_hyper_connection", 60),
         ("tuisko_kernels_sm120_lm_head", 16),
         ("tuisko_kernels_sm120_moe", 88),
     ];

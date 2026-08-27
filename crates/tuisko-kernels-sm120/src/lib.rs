@@ -33,6 +33,7 @@ pub use tuisko_kernels_sm120_gdn::{
     Qwen36GdnPrepareOp, Qwen36GdnRecurrenceOp, Qwen38FlashNextGdnPrepareOp,
     Qwen38FlashNextGdnRecurrenceOp, Qwen38FlashNextGdnStateSnapshotOp,
 };
+pub use tuisko_kernels_sm120_hyper_connection::Qwen38FlashNextHyperConnectionOp;
 pub use tuisko_kernels_sm120_lm_head::{Qwen35Bf16LmHeadOp, Qwen36Nvfp4LmHeadOp};
 pub use tuisko_kernels_sm120_moe::{Qwen36MoeExpertsOp, Qwen36MoeRouterOp, Qwen36MtpBf16MoeOp};
 pub use tuisko_kernels_sm120_mtp::{
