@@ -5,6 +5,7 @@ mod error;
 mod graph;
 mod memory;
 mod profiler;
+mod streaming;
 mod timer;
 
 pub use arena::{ArenaLayout, ArenaRegion, DeviceArena, LoadingDeviceArena};
@@ -16,4 +17,8 @@ pub use error::{GpuError, GpuErrorCode, GpuResult};
 pub use graph::{CudaGraph, CudaGraphDefinition, CudaGraphVariants};
 pub use memory::{DeviceMemoryInfo, device_memory_info};
 pub use profiler::{profiler_start, profiler_stop};
+pub use streaming::{
+    ABSENT_SLOT, DeviceSlotPool, INDIRECTION_TABLE_GENERATIONS, PinnedBounceRing, PinnedHostPool,
+    RECLAIM_FENCE_GENERATIONS, TransferStream,
+};
 pub use timer::{GpuTimer, GpuTiming};
