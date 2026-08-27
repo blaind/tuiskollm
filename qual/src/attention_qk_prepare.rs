@@ -12,10 +12,11 @@ use tuisko_gpu::{
 };
 use tuisko_kernels_sm120::{
     ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, Qwen35AttentionQkPrepareOp,
-    Qwen36AttentionQkPrepareOp, Qwen36Fp8AttentionQkPrepareOp,
+    Qwen36AttentionQkPrepareOp, Qwen36Fp8AttentionQkPrepareOp, Qwen38FlashNextAttentionQkPrepareOp,
 };
 use tuisko_model::{
     Arch, CheckpointError, CheckpointSnapshot, MtpBindings, Qwen35_9B, Qwen36Moe35B, Qwen38_27B,
+    Qwen38FlashNext,
 };
 
 const MAX_BATCH: usize = 8;
@@ -24,6 +25,10 @@ const ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
 const QWEN36_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
 const QWEN36_MAX_TOKENS: usize = 128;
 const QWEN35_MTP_ROUTES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128];
+/// Qwen3.8-Flash-Next QSA admits the same twelve widths Qwen3.8-27B does.
+const QWEN38_FLASH_NEXT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
+/// Offsets gate values so the packed query and gate halves differ.
+const GATE_PATTERN_ROTATION: usize = 5;
 const QWEN35_MTP_MAX_TOKENS: usize = 128;
 const ALIGNMENT: usize = 256;
 const PHYSICAL_PAGES: usize = 16;
@@ -170,6 +175,13 @@ trait QualifiedQkPrepareOp {
     const MAX_TOKENS: usize;
     const CACHE_ELEMENT_BYTES: usize;
     const CACHE_FORMAT: CacheFormat;
+    /// Whether the fixture gives the packed gate half values that differ from
+    /// the query half beside it.
+    ///
+    /// The pre-existing targets keep their qualified fixture bytes so their
+    /// pinned observables do not move; Qwen3.8-Flash-Next opts in because honoring the
+    /// per-head `[query|gate]` split is a named requirement of its admission.
+    const GATE_DISCRIMINATED: bool = false;
 
     fn new(context: &Arc<CudaContext>) -> GpuResult<Self>
     where
@@ -265,6 +277,64 @@ impl_qualified_op!(
     &QWEN36_ROUTES,
     QWEN36_MAX_TOKENS
 );
+
+impl QualifiedQkPrepareOp for Qwen38FlashNextAttentionQkPrepareOp {
+    type Target = Qwen38FlashNext;
+    const ROUTES: &'static [usize] = &QWEN38_FLASH_NEXT_ROUTES;
+    const MAX_TOKENS: usize = 1_024;
+    const CACHE_ELEMENT_BYTES: usize = size_of::<u8>();
+    const CACHE_FORMAT: CacheFormat = CacheFormat::E4m3;
+    const GATE_DISCRIMINATED: bool = true;
+
+    fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        Qwen38FlashNextAttentionQkPrepareOp::new(context)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &self,
+        stream: &tuisko_gpu::CudaStream,
+        batch: usize,
+        qkv: *const u16,
+        query_norm: *const u16,
+        key_norm: *const u16,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        block_tables: *const u32,
+        table_rows: *const u32,
+        table_stride: usize,
+        cache_positions: *const u32,
+        query: *mut f32,
+        key_pages: *mut u8,
+        value_pages: *mut u8,
+        key_scale: f32,
+        value_scale: f32,
+    ) -> GpuResult<()> {
+        // SAFETY: the qualification arena establishes the complete pointer
+        // contract before dispatching through this safe seam.
+        unsafe {
+            Qwen38FlashNextAttentionQkPrepareOp::launch(
+                self,
+                stream,
+                batch,
+                qkv,
+                query_norm,
+                key_norm,
+                rope_cos,
+                rope_sin,
+                block_tables,
+                table_rows,
+                table_stride,
+                cache_positions,
+                query,
+                key_pages,
+                value_pages,
+                key_scale,
+                value_scale,
+            )
+        }
+    }
+}
 
 impl QualifiedQkPrepareOp for Qwen35AttentionQkPrepareOp {
     type Target = Qwen35_9B;
@@ -507,6 +577,14 @@ pub fn qualify_qwen36_fp8_attention_qk_prepare()
     qualify_target::<Qwen36Fp8AttentionQkPrepareOp>(None)
 }
 
+/// Qualifies Qwen3.8-Flash-Next QSA Q/K preparation at every admitted route.
+///
+/// Distinct query and gate patterns catch reads from the wrong packed half.
+pub fn qualify_qwen38_flash_next_qsa_prepare()
+-> Result<AttentionQkPrepareQualification, AttentionQkPrepareQualificationError> {
+    qualify_target::<Qwen38FlashNextAttentionQkPrepareOp>(None)
+}
+
 /// Qualifies source-backed MTP Q/K preparation at exact `B=1..=8` and prompt tiles.
 pub fn qualify_mtp_bf16_qk_prepare(
     root: &Path,
@@ -554,7 +632,7 @@ where
     let stream = context.new_stream().map_err(GpuError::from)?;
     let (layout, regions) = layout::<O::Target>(O::MAX_TOKENS, O::CACHE_ELEMENT_BYTES)?;
     let arena = DeviceArena::zeroed(&stream, &layout)?;
-    let fixture = fixture::<O::Target>(O::MAX_TOKENS, source_norms);
+    let fixture = fixture::<O::Target>(O::MAX_TOKENS, source_norms, O::GATE_DISCRIMINATED);
     load_fixture(&arena, &stream, regions, &fixture)?;
     let op = O::new(&context)?;
     let stable_addresses = addresses(&arena, regions)?;
@@ -679,12 +757,21 @@ fn layout<A: Arch>(
     ))
 }
 
-fn fixture<A: Arch>(max_tokens: usize, source_norms: Option<&SourceNorms>) -> Fixture {
+fn fixture<A: Arch>(
+    max_tokens: usize,
+    source_norms: Option<&SourceNorms>,
+    gate_discriminated: bool,
+) -> Fixture {
     let qkv = (0..max_tokens * A::ATTENTION_QKV_ROWS)
         .map(|index| {
             let token = index / A::ATTENTION_QKV_ROWS;
             let factor = 1.0 - (token & 7) as f32 / 16.0;
-            f32_to_bf16(INPUT_PATTERN[(index + 3 * token) & 15] * factor)
+            let rotation = if gate_discriminated && is_packed_gate::<A>(index) {
+                GATE_PATTERN_ROTATION
+            } else {
+                0
+            };
+            f32_to_bf16(INPUT_PATTERN[(index + 3 * token + rotation) & 15] * factor)
         })
         .collect();
     let query_norm = source_norms.map_or_else(
@@ -728,6 +815,13 @@ fn fixture<A: Arch>(max_tokens: usize, source_norms: Option<&SourceNorms>) -> Fi
         prefill_table_rows: vec![0; max_tokens],
         prefill_cache_positions: (0..max_tokens as u32).collect(),
     }
+}
+
+/// Whether a flat `qkv` index lands in a packed query head's gate half.
+fn is_packed_gate<A: Arch>(index: usize) -> bool {
+    let row = index % A::ATTENTION_QKV_ROWS;
+
+    row < A::ATTENTION_QUERY_ROWS && row % (2 * A::HEAD_DIM) >= A::HEAD_DIM
 }
 
 fn make_mrope_coefficients(positions: &[Vec<u32>; 3]) -> (Vec<f32>, Vec<f32>) {
@@ -1215,15 +1309,126 @@ fn verify_replay(
 #[cfg(test)]
 mod tests {
     use super::{
+        GATE_PATTERN_ROTATION, INPUT_PATTERN, QWEN38_FLASH_NEXT_ROUTES, Qwen38FlashNext,
+        bf16_to_f32, fixture, is_packed_gate, qualify_qwen38_flash_next_qsa_prepare,
+    };
+    use super::{
         MAX_BATCH, MAX_TOKENS, PHYSICAL_PAGES, QWEN35_MTP_MAX_TOKENS, QWEN35_MTP_ROUTES,
         QWEN36_MAX_TOKENS, QWEN36_ROUTES, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, ROUTES, TABLE_ROWS,
         TABLE_STRIDE, layout, qualify_attention_qk_prepare, qualify_mtp_bf16_qk_prepare,
         qualify_qwen35_attention_qk_prepare, qualify_qwen35_mtp_bf16_qk_prepare,
         qualify_qwen36_attention_qk_prepare, qualify_qwen36_fp8_attention_qk_prepare,
     };
+    use std::collections::BTreeSet;
     use std::{mem::size_of, path::PathBuf};
     use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
     use tuisko_model::Arch;
+
+    /// Proves the fixture distinguishes the two packed halves.
+    #[test]
+    fn qwen38_flash_next_qsa_prepare_fixture_separates_packed_halves() {
+        assert_eq!(
+            INPUT_PATTERN
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            INPUT_PATTERN.len(),
+            "the rotation only discriminates while the pattern entries are distinct"
+        );
+        assert_ne!(GATE_PATTERN_ROTATION % INPUT_PATTERN.len(), 0);
+
+        let tokens = 4;
+        let plain = fixture::<Qwen38FlashNext>(tokens, None, false);
+        let split = fixture::<Qwen38FlashNext>(tokens, None, true);
+
+        // Without discrimination the two halves are byte-identical, which is
+        // exactly the blind spot this flag closes.
+        let mut plain_collisions = 0_usize;
+        let mut split_separations = 0_usize;
+        for token in 0..tokens {
+            let base = token * Qwen38FlashNext::ATTENTION_QKV_ROWS;
+            for head in 0..Qwen38FlashNext::NUM_ATTENTION_HEADS {
+                let query = base + head * 2 * Qwen38FlashNext::HEAD_DIM;
+                let gate = query + Qwen38FlashNext::HEAD_DIM;
+                for dimension in 0..Qwen38FlashNext::HEAD_DIM {
+                    assert!(!is_packed_gate::<Qwen38FlashNext>(query + dimension));
+                    assert!(is_packed_gate::<Qwen38FlashNext>(gate + dimension));
+                    if plain.qkv[query + dimension] == plain.qkv[gate + dimension] {
+                        plain_collisions += 1;
+                    }
+                    if split.qkv[query + dimension] != split.qkv[gate + dimension] {
+                        split_separations += 1;
+                    }
+                }
+            }
+        }
+        let packed = tokens * Qwen38FlashNext::NUM_ATTENTION_HEADS * Qwen38FlashNext::HEAD_DIM;
+        assert_eq!(plain_collisions, packed);
+        assert_eq!(split_separations, packed);
+
+        // The key and value planes are outside the packed region and must keep
+        // their qualified bytes so the cache oracle is unchanged.
+        for token in 0..tokens {
+            let base = token * Qwen38FlashNext::ATTENTION_QKV_ROWS;
+            for row in Qwen38FlashNext::ATTENTION_QUERY_ROWS..Qwen38FlashNext::ATTENTION_QKV_ROWS {
+                assert!(!is_packed_gate::<Qwen38FlashNext>(base + row));
+                assert_eq!(plain.qkv[base + row], split.qkv[base + row]);
+            }
+        }
+        assert!(bf16_to_f32(split.qkv[0]).is_finite());
+    }
+
+    /// Qualifies the exact 24-query-head, 2-KV-head geometry.
+    #[test]
+    #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
+    fn qwen38_flash_next_qsa_prepare_routes_match_independent_oracles_and_graph_replay()
+    -> Result<(), super::AttentionQkPrepareQualificationError> {
+        let report = qualify_qwen38_flash_next_qsa_prepare()?;
+        let active_tokens = QWEN38_FLASH_NEXT_ROUTES.iter().sum::<usize>();
+        let query_per_token = Qwen38FlashNext::ATTENTION_OUTPUT_COLUMNS;
+        let cache_per_token = 2 * Qwen38FlashNext::ATTENTION_KV_ROWS;
+        let plane_bytes = PHYSICAL_PAGES
+            * Qwen38FlashNext::NUM_KV_HEADS
+            * ATTENTION_PAGE_SIZE
+            * Qwen38FlashNext::HEAD_DIM;
+        let replay_per_route = MAX_TOKENS * query_per_token + 2 * plane_bytes;
+        let total_observable = QWEN38_FLASH_NEXT_ROUTES.len() * replay_per_route;
+        let immutable_per_check = MAX_TOKENS * Qwen38FlashNext::ATTENTION_QKV_ROWS
+            + 2 * Qwen38FlashNext::HEAD_DIM
+            + 2 * MAX_TOKENS * super::ROTARY_PAIRS
+            + TABLE_ROWS * TABLE_STRIDE
+            + 2 * MAX_BATCH
+            + 2 * MAX_TOKENS;
+
+        assert_eq!(query_per_token, 6_144);
+        assert_eq!(cache_per_token, 1_024);
+        assert_eq!(report.query_values, active_tokens * query_per_token);
+        assert_eq!(
+            report.appended_cache_values,
+            active_tokens * cache_per_token
+        );
+        assert_eq!(
+            report.untouched_values,
+            total_observable - active_tokens * (query_per_token + cache_per_token)
+        );
+        assert_eq!(
+            report.immutable_input_values,
+            2 * QWEN38_FLASH_NEXT_ROUTES.len() * immutable_per_check
+        );
+        assert_eq!(report.graph_replay_values, total_observable);
+        let (layout, regions) = layout::<Qwen38FlashNext>(MAX_TOKENS, size_of::<u8>())?;
+        assert_eq!(report.arena_bytes, layout.byte_len());
+        assert_eq!(
+            report.arena_bytes - report.padding_bytes,
+            regions.payload_bytes()
+        );
+        assert_eq!(report.weight_bytes, regions.weight_bytes());
+        assert_eq!(report.cache_bytes, regions.cache_bytes());
+        assert_eq!(report.workspace_bytes, regions.workspace_bytes());
+        assert!(report.maximum_query_error <= 0.003);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an NVIDIA compute-capability 12.0 device"]

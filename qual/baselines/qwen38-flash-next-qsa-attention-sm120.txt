@@ -1,0 +1,13 @@
+cuda_oxide_commit=0199e55572ee78cd2cea97335e5b7392a3f9be4a
+rustc_release=1.96.0-nightly
+rustc_commit=55e86c996809902e8bbad512cfb4d2c18be446d9
+cuda_toolkit_release=13.3
+cuda_toolkit_version=13.3.73
+decode_registers=54,54,54,54,54,54,54,54
+decode_shared_bytes=9280
+prefill_registers=53,53,53,53
+prefill_shared_bytes=1024
+gate_registers=20,20,20,20,20,20,20,20
+gate_shared_bytes=1024
+gate_prefill_registers=20,20,20,20
+gate_prefill_shared_bytes=1024
