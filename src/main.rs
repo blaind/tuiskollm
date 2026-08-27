@@ -1,6 +1,6 @@
 //! Rust-owned inference server.
 
-use std::ffi::OsString;
+use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use std::io::{IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -10,43 +10,53 @@ use tuisko_provision::{Provisioning, ProvisioningProgress, ProvisioningStage, Sn
 use tuisko_serve::{ServerConfig, ServerModel};
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8000";
-const USAGE: &str = "TuiskoLLM exact-target inference server\n\nUsage:\n  tuiskollm serve MODEL [--snapshot SNAPSHOT] [--address ADDRESS]\n  tuiskollm --help\n  tuiskollm --version\n\nModels:\n  unsloth/Qwen3.8-27B-NVFP4             automatic download\n  AxionML/Qwen3.5-9B-NVFP4              --snapshot required\n  nvidia/Qwen3.6-35B-A3B-NVFP4          --snapshot required\n\nADDRESS defaults to 127.0.0.1:8000.";
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Parser)]
+#[command(
+    name = "tuiskollm",
+    version,
+    about = "TuiskoLLM exact-target inference server"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand, Eq, PartialEq)]
+enum Command {
+    /// Serves one exact model through the OpenAI-compatible API.
+    Serve(ServeArgs),
+}
+
+#[derive(Debug, Args, Eq, PartialEq)]
 struct ServeArgs {
+    /// Exact Hugging Face model ID.
+    #[arg(
+        value_name = "MODEL",
+        long_help = "Exact Hugging Face model ID.\n\nSupported models:\n  unsloth/Qwen3.8-27B-NVFP4             automatic download\n  AxionML/Qwen3.5-9B-NVFP4              --snapshot required\n  nvidia/Qwen3.6-35B-A3B-NVFP4          --snapshot required"
+    )]
     model: ServerModel,
+    /// Existing admitted snapshot; Qwen3.8 downloads automatically when omitted.
+    #[arg(long, value_name = "SNAPSHOT")]
     snapshot: Option<PathBuf>,
+    /// TCP listen address.
+    #[arg(long, value_name = "ADDRESS", default_value = DEFAULT_ADDRESS)]
     address: SocketAddr,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum Command {
-    Serve(ServeArgs),
-    Help,
-    Version,
-}
-
 fn main() -> ExitCode {
-    match parse_args(std::env::args_os().skip(1)) {
-        Ok(Command::Serve(args)) => match run_serve(args) {
+    let command = match parse_args(std::env::args_os().skip(1)) {
+        Ok(command) => command,
+        Err(error) => error.exit(),
+    };
+    match command {
+        Command::Serve(args) => match run_serve(args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("tuiskollm: {error}");
                 ExitCode::FAILURE
             }
         },
-        Ok(Command::Help) => {
-            println!("{USAGE}");
-            ExitCode::SUCCESS
-        }
-        Ok(Command::Version) => {
-            println!("tuiskollm {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("tuiskollm: {error}\n\n{USAGE}");
-            ExitCode::from(2)
-        }
     }
 }
 
@@ -224,83 +234,22 @@ fn gibibytes(bytes: u64) -> f64 {
     bytes as f64 / (1_u64 << 30) as f64
 }
 
-fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
-    let mut args = args.into_iter();
-    let Some(command) = args.next() else {
-        return Err("missing command".into());
-    };
-    if command == "--help" || command == "-h" {
-        require_end(args)?;
-        return Ok(Command::Help);
-    }
-    if command == "--version" || command == "-V" {
-        require_end(args)?;
-        return Ok(Command::Version);
-    }
-    if command != "serve" {
-        return Err(format!("unknown command `{}`", command.to_string_lossy()));
-    }
-
-    let model = args.next().ok_or("serve requires MODEL")?;
-    if model == "--help" || model == "-h" {
-        require_end(args)?;
-        return Ok(Command::Help);
-    }
-    let model = model
-        .to_str()
-        .ok_or_else(|| "MODEL must be valid UTF-8".to_owned())?;
-    if model.starts_with('-') {
-        return Err("serve requires MODEL before options".into());
-    }
-    let model = ServerModel::from_model_id(model)?;
-    let mut snapshot = None;
-    let mut address = None;
-    while let Some(option) = args.next() {
-        let option_text = option
-            .to_str()
-            .ok_or_else(|| "serve options must be valid UTF-8".to_owned())?;
-        let value = match option_text {
-            "--snapshot" | "--address" => args
-                .next()
-                .ok_or_else(|| format!("{option_text} requires a value"))?,
-            _ => return Err(format!("unknown serve option `{option_text}`")),
-        };
-        match option_text {
-            "--snapshot" if snapshot.is_none() => snapshot = Some(PathBuf::from(value)),
-            "--address" if address.is_none() => {
-                address = Some(
-                    value
-                        .to_str()
-                        .ok_or_else(|| "ADDRESS must be valid UTF-8".to_owned())?
-                        .parse::<SocketAddr>()
-                        .map_err(|error| format!("invalid ADDRESS: {error}"))?,
-                );
-            }
-            _ => return Err(format!("duplicate serve option `{option_text}`")),
+fn parse_args<I, T>(args: I) -> Result<Command, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let arguments = std::iter::once(std::ffi::OsString::from("tuiskollm"))
+        .chain(args.into_iter().map(Into::into));
+    let cli = Cli::try_parse_from(arguments)?;
+    match cli.command {
+        Command::Serve(args) if args.model != ServerModel::Qwen38 && args.snapshot.is_none() => {
+            Err(clap::Error::raw(
+                ErrorKind::MissingRequiredArgument,
+                format!("{} requires --snapshot SNAPSHOT", args.model.model_id()),
+            ))
         }
-    }
-    if model != ServerModel::Qwen38 && snapshot.is_none() {
-        return Err(format!("{} requires --snapshot SNAPSHOT", model.model_id(),));
-    }
-    let address = address.unwrap_or_else(|| {
-        DEFAULT_ADDRESS
-            .parse()
-            .expect("the checked default address is valid")
-    });
-    Ok(Command::Serve(ServeArgs {
-        model,
-        snapshot,
-        address,
-    }))
-}
-
-fn require_end(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
-    match args.next() {
-        None => Ok(()),
-        Some(argument) => Err(format!(
-            "unexpected argument `{}`",
-            argument.to_string_lossy()
-        )),
+        command => Ok(command),
     }
 }
 
@@ -310,7 +259,7 @@ mod tests {
         Command, DEFAULT_ADDRESS, ServeArgs, parse_args, render_provisioning,
         render_provisioning_progress,
     };
-    use std::ffi::OsString;
+    use clap::error::ErrorKind;
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -320,8 +269,8 @@ mod tests {
     const QWEN38: &str = "unsloth/Qwen3.8-27B-NVFP4";
     const QWEN35: &str = "AxionML/Qwen3.5-9B-NVFP4";
 
-    fn parse(args: &[&str]) -> Result<Command, String> {
-        parse_args(args.iter().map(OsString::from))
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        parse_args(args.iter().copied())
     }
 
     #[test]
@@ -335,10 +284,9 @@ mod tests {
                 address: DEFAULT_ADDRESS.parse::<SocketAddr>().unwrap(),
             })
         );
-        assert!(
-            parse(&["serve"])
-                .unwrap_err()
-                .contains("serve requires MODEL")
+        assert_eq!(
+            parse(&["serve"]).unwrap_err().kind(),
+            ErrorKind::MissingRequiredArgument
         );
     }
 
@@ -375,53 +323,74 @@ mod tests {
 
     #[test]
     fn malformed_or_ambiguous_commands_are_refused() {
-        assert!(parse(&[]).unwrap_err().contains("missing command"));
-        assert!(parse(&["server"]).unwrap_err().contains("unknown command"));
+        assert_eq!(
+            parse(&[]).unwrap_err().kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert_eq!(
+            parse(&["server"]).unwrap_err().kind(),
+            ErrorKind::InvalidSubcommand
+        );
         assert!(
             parse(&["serve", "unsloth/Qwen3.8-Flash-Next-GGUF"])
                 .unwrap_err()
+                .to_string()
                 .contains("unsupported model")
         );
         assert!(
             parse(&["serve", QWEN35])
                 .unwrap_err()
+                .to_string()
                 .contains("AxionML/Qwen3.5-9B-NVFP4 requires --snapshot SNAPSHOT")
         );
         assert!(
             parse(&["serve", QWEN38, "--address", "localhost:8000"])
                 .unwrap_err()
-                .contains("invalid ADDRESS")
+                .to_string()
+                .contains("invalid socket address")
         );
-        assert!(
-            parse(&["serve", QWEN38, "snapshot"])
-                .unwrap_err()
-                .contains("unknown serve option")
+        assert_eq!(
+            parse(&["serve", QWEN38, "snapshot"]).unwrap_err().kind(),
+            ErrorKind::UnknownArgument
         );
         for option in ["--snapshot", "--address"] {
-            assert!(
-                parse(&["serve", QWEN38, option])
-                    .unwrap_err()
-                    .contains("requires a value")
+            assert_eq!(
+                parse(&["serve", QWEN38, option]).unwrap_err().kind(),
+                ErrorKind::InvalidValue
             );
         }
-        assert!(
+        assert_eq!(
             parse(&["serve", QWEN38, "--snapshot", "one", "--snapshot", "two",])
                 .unwrap_err()
-                .contains("duplicate serve option `--snapshot`")
+                .kind(),
+            ErrorKind::ArgumentConflict
         );
-        assert!(
-            parse(&["serve", "--model", QWEN38])
-                .unwrap_err()
-                .contains("serve requires MODEL before options")
+        assert_eq!(
+            parse(&["serve", "--model", QWEN38]).unwrap_err().kind(),
+            ErrorKind::UnknownArgument
         );
     }
 
     #[test]
-    fn informational_commands_accept_no_trailing_arguments() {
-        assert_eq!(parse(&["--help"]).unwrap(), Command::Help);
-        assert_eq!(parse(&["serve", "--help"]).unwrap(), Command::Help);
-        assert_eq!(parse(&["-V"]).unwrap(), Command::Version);
-        assert!(parse(&["--help", "extra"]).is_err());
+    fn clap_owns_help_and_version_output() {
+        assert_eq!(
+            parse(&["--help"]).unwrap_err().kind(),
+            ErrorKind::DisplayHelp
+        );
+        let serve_help = parse(&["serve", "--help"]).unwrap_err();
+        assert_eq!(serve_help.kind(), ErrorKind::DisplayHelp);
+        assert!(
+            serve_help
+                .to_string()
+                .contains("Usage: tuiskollm serve [OPTIONS] <MODEL>")
+        );
+        for model in [QWEN38, QWEN35, "nvidia/Qwen3.6-35B-A3B-NVFP4"] {
+            assert!(serve_help.to_string().contains(model));
+        }
+        assert_eq!(
+            parse(&["-V"]).unwrap_err().kind(),
+            ErrorKind::DisplayVersion
+        );
     }
 
     #[test]

@@ -163,6 +163,14 @@ impl ServerModel {
     }
 }
 
+impl std::str::FromStr for ServerModel {
+    type Err = String;
+
+    fn from_str(model_id: &str) -> Result<Self, Self::Err> {
+        Self::from_model_id(model_id)
+    }
+}
+
 /// Loads the exact resident model, then serves health, model, blocking, and SSE routes.
 pub fn run(config: ServerConfig) -> Result<(), ServerError> {
     let startup_start = Instant::now();
