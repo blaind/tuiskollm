@@ -1,12 +1,12 @@
 //! Rust-owned inference server.
 
-use clap::{Args, Parser, Subcommand, error::ErrorKind};
+use clap::{Args, Parser, Subcommand};
 use std::io::{IsTerminal, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
-use tuisko_provision::{Provisioning, ProvisioningProgress, ProvisioningStage, SnapshotResolution};
+use tuisko_provision::{ProvisionedModel, Provisioning, ProvisioningProgress, ProvisioningStage};
 use tuisko_serve::{ServerConfig, ServerModel};
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8000";
@@ -33,10 +33,10 @@ struct ServeArgs {
     /// Exact Hugging Face model ID.
     #[arg(
         value_name = "MODEL",
-        long_help = "Exact Hugging Face model ID.\n\nSupported models:\n  unsloth/Qwen3.8-27B-NVFP4             automatic download\n  AxionML/Qwen3.5-9B-NVFP4              --snapshot required\n  nvidia/Qwen3.6-35B-A3B-NVFP4          --snapshot required"
+        long_help = "Exact Hugging Face model ID.\n\nSupported models:\n  unsloth/Qwen3.8-27B-NVFP4\n  AxionML/Qwen3.5-9B-NVFP4\n  nvidia/Qwen3.6-35B-A3B-NVFP4"
     )]
     model: ServerModel,
-    /// Existing admitted snapshot; Qwen3.8 downloads automatically when omitted.
+    /// Existing admitted snapshot; overrides automatic Hugging Face resolution.
     #[arg(long, value_name = "SNAPSHOT")]
     snapshot: Option<PathBuf>,
     /// TCP listen address.
@@ -72,23 +72,17 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     let resolution = {
         let mut stdout = stdout.lock();
         let mut display = ProvisioningDisplay::new(interactive, color);
-        let resolution = match (args.model, args.snapshot) {
-            (_, Some(path)) => Ok(SnapshotResolution {
-                path,
-                provisioning: None,
-            }),
-            (ServerModel::Qwen38, None) => {
-                tuisko_provision::resolve_snapshot_with_progress(None, |progress| {
-                    display
-                        .update(&mut stdout, progress)
-                        .map_err(|error| format!("writing provisioning progress: {error}"))
-                })
-            }
-            (model, None) => Err(format!(
-                "automatic download is not available for {}; pass --snapshot SNAPSHOT",
-                model.model_id(),
-            )),
+        let model = match args.model {
+            ServerModel::Qwen38 => ProvisionedModel::Qwen38,
+            ServerModel::Qwen35 => ProvisionedModel::Qwen35,
+            ServerModel::Qwen36 => ProvisionedModel::Qwen36,
         };
+        let resolution =
+            tuisko_provision::resolve_snapshot_with_progress(model, args.snapshot, |progress| {
+                display
+                    .update(&mut stdout, progress)
+                    .map_err(|error| format!("writing provisioning progress: {error}"))
+            });
         display
             .finish(&mut stdout)
             .map_err(|error| format!("finishing provisioning progress: {error}"))?;
@@ -246,16 +240,7 @@ where
 {
     let arguments = std::iter::once(std::ffi::OsString::from("tuiskollm"))
         .chain(args.into_iter().map(Into::into));
-    let cli = Cli::try_parse_from(arguments)?;
-    match cli.command {
-        Command::Serve(args) if args.model != ServerModel::Qwen38 && args.snapshot.is_none() => {
-            Err(clap::Error::raw(
-                ErrorKind::MissingRequiredArgument,
-                format!("{} requires --snapshot SNAPSHOT", args.model.model_id()),
-            ))
-        }
-        command => Ok(command),
-    }
+    Ok(Cli::try_parse_from(arguments)?.command)
 }
 
 fn parse_address(address: &str) -> Result<SocketAddr, String> {
@@ -285,6 +270,7 @@ mod tests {
 
     const QWEN38: &str = "unsloth/Qwen3.8-27B-NVFP4";
     const QWEN35: &str = "AxionML/Qwen3.5-9B-NVFP4";
+    const QWEN36: &str = "nvidia/Qwen3.6-35B-A3B-NVFP4";
 
     fn parse(args: &[&str]) -> Result<Command, clap::Error> {
         parse_args(args.iter().copied())
@@ -292,15 +278,21 @@ mod tests {
 
     #[test]
     fn serve_requires_an_exact_model_and_defaults_to_loopback() {
-        let command = parse(&["serve", QWEN38]).unwrap();
-        assert_eq!(
-            command,
-            Command::Serve(ServeArgs {
-                model: ServerModel::Qwen38,
-                snapshot: None,
-                address: DEFAULT_ADDRESS.parse::<SocketAddr>().unwrap(),
-            })
-        );
+        for (model_id, model) in [
+            (QWEN38, ServerModel::Qwen38),
+            (QWEN35, ServerModel::Qwen35),
+            (QWEN36, ServerModel::Qwen36),
+        ] {
+            let command = parse(&["serve", model_id]).unwrap();
+            assert_eq!(
+                command,
+                Command::Serve(ServeArgs {
+                    model,
+                    snapshot: None,
+                    address: DEFAULT_ADDRESS.parse::<SocketAddr>().unwrap(),
+                })
+            );
+        }
         assert_eq!(
             parse(&["serve"]).unwrap_err().kind(),
             ErrorKind::MissingRequiredArgument
@@ -361,12 +353,6 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("unsupported model")
-        );
-        assert!(
-            parse(&["serve", QWEN35])
-                .unwrap_err()
-                .to_string()
-                .contains("AxionML/Qwen3.5-9B-NVFP4 requires --snapshot SNAPSHOT")
         );
         assert!(
             parse(&["serve", QWEN38, "--address", "localhost"])

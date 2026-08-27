@@ -8,10 +8,10 @@ use std::io::{Read, Write};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tuisko_model::{Arch, Qwen38_27B};
+use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
 
 const HUB_ENDPOINT: &str = "https://huggingface.co";
-const REQUIRED_FILES: [RequiredFile; 7] = [
+const QWEN38_REQUIRED_FILES: [RequiredFile; 7] = [
     RequiredFile::new(
         "config.json",
         22_564,
@@ -55,6 +55,94 @@ const REQUIRED_FILES: [RequiredFile; 7] = [
         "d0d0ed2e37cdfafef4a5067d5ea2407b05f4fb50526e47c008a5b235d50240fb",
     ),
 ];
+const QWEN35_REQUIRED_FILES: [RequiredFile; 5] = [
+    RequiredFile::new(
+        "config.json",
+        5_741,
+        "3626408859a3e39b243890ff537e827bfb477991",
+        "777188d9226a13c2e1db183655c10854be290e95e26619e17095bdaa45a5e99e",
+    ),
+    RequiredFile::new(
+        "model.safetensors",
+        9_361_048_680,
+        "a1304acf8325cee90075bf8eb7f5e973ef893c7d497ded92e7d720f0e7178749",
+        "a1304acf8325cee90075bf8eb7f5e973ef893c7d497ded92e7d720f0e7178749",
+    ),
+    RequiredFile::new(
+        "tokenizer.json",
+        12_807_982,
+        "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+        "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    ),
+    RequiredFile::new(
+        "chat_template.jinja",
+        7_756,
+        "a585dec894e63da457d9440ec6aa7caa16d20860",
+        "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    ),
+    RequiredFile::new(
+        "generation_config.json",
+        115,
+        "affcdf188ba614483df3d704e436a8e2da880075",
+        "0c35bb39fbaed1ac0656baabc4f4e9bda20214e12336d0e4e8755aac1f487c2e",
+    ),
+];
+const QWEN36_REQUIRED_FILES: [RequiredFile; 9] = [
+    RequiredFile::new(
+        "config.json",
+        58_110,
+        "ec1f82c006fd5db6d0b5fa1a59e16fbda9a5c1dd",
+        "58aefa1c9eff7989f431d748f2ddec39446cb1fd2a69acc46e285c6a37b0cecc",
+    ),
+    RequiredFile::new(
+        "hf_quant_config.json",
+        35_085,
+        "8deefe44cc69cfab994141ea6b9493b03c864061",
+        "75fe7cc8d5836b58734e05ee67423a4ce91d602aaad45c8173a1b7597cd57663",
+    ),
+    RequiredFile::new(
+        "model.safetensors.index.json",
+        13_726_227,
+        "d67403a4e9793c0ba8a136baf14b3b76ec7b32c822267978084895e07ebd8a3e",
+        "d67403a4e9793c0ba8a136baf14b3b76ec7b32c822267978084895e07ebd8a3e",
+    ),
+    RequiredFile::new(
+        "model-00001-of-00003.safetensors",
+        10_006_877_608,
+        "07141c2db92e47bc08777132cd1a0323faf300eab3a7d7c111bc2bf075fda050",
+        "07141c2db92e47bc08777132cd1a0323faf300eab3a7d7c111bc2bf075fda050",
+    ),
+    RequiredFile::new(
+        "model-00002-of-00003.safetensors",
+        10_003_595_752,
+        "6dea9c759a0f941cf9e1cc1501216b0e107966a66c90425050e212efbd053f02",
+        "6dea9c759a0f941cf9e1cc1501216b0e107966a66c90425050e212efbd053f02",
+    ),
+    RequiredFile::new(
+        "model-00003-of-00003.safetensors",
+        3_413_864_960,
+        "9758875fc55e49561165f4a44342b654c123c3e25c6811b34abb83553fb1a164",
+        "9758875fc55e49561165f4a44342b654c123c3e25c6811b34abb83553fb1a164",
+    ),
+    RequiredFile::new(
+        "tokenizer.json",
+        12_807_982,
+        "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+        "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    ),
+    RequiredFile::new(
+        "chat_template.jinja",
+        7_764,
+        "a8755d827c0a7b614c246c4060dfd58ab352a8ff",
+        "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+    ),
+    RequiredFile::new(
+        "generation_config.json",
+        202,
+        "023756cfadf88e5bf69eefeee3e172f38c448d64",
+        "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+    ),
+];
 
 #[derive(Clone, Copy)]
 struct RequiredFile {
@@ -71,6 +159,48 @@ impl RequiredFile {
             bytes,
             blob,
             sha256,
+        }
+    }
+}
+
+/// Exact served model whose pinned Hugging Face snapshot can be provisioned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProvisionedModel {
+    /// `unsloth/Qwen3.8-27B-NVFP4`.
+    Qwen38,
+    /// `AxionML/Qwen3.5-9B-NVFP4`.
+    Qwen35,
+    /// `nvidia/Qwen3.6-35B-A3B-NVFP4`.
+    Qwen36,
+}
+
+impl ProvisionedModel {
+    /// Every exact model with a pinned download manifest.
+    pub const ALL: [Self; 3] = [Self::Qwen38, Self::Qwen35, Self::Qwen36];
+
+    /// Exact Hugging Face repository identifier.
+    pub const fn model_id(self) -> &'static str {
+        match self {
+            Self::Qwen38 => Qwen38_27B::MODEL_ID,
+            Self::Qwen35 => Qwen35_9B::MODEL_ID,
+            Self::Qwen36 => Qwen36Moe35B::MODEL_ID,
+        }
+    }
+
+    /// Immutable Hugging Face revision.
+    pub const fn revision(self) -> &'static str {
+        match self {
+            Self::Qwen38 => Qwen38_27B::REVISION,
+            Self::Qwen35 => Qwen35_9B::REVISION,
+            Self::Qwen36 => Qwen36Moe35B::REVISION,
+        }
+    }
+
+    const fn required_files(self) -> &'static [RequiredFile] {
+        match self {
+            Self::Qwen38 => &QWEN38_REQUIRED_FILES,
+            Self::Qwen35 => &QWEN35_REQUIRED_FILES,
+            Self::Qwen36 => &QWEN36_REQUIRED_FILES,
         }
     }
 }
@@ -177,27 +307,31 @@ pub struct Provisioning {
     pub bytes: u64,
 }
 
-/// Resolves an explicit snapshot or provisions the pinned Hugging Face revision.
-pub fn resolve_snapshot(explicit: Option<PathBuf>) -> Result<SnapshotResolution, String> {
-    resolve_snapshot_with_progress(explicit, |_| Ok(()))
+/// Resolves an explicit snapshot or provisions one model's pinned Hugging Face revision.
+pub fn resolve_snapshot(
+    model: ProvisionedModel,
+    explicit: Option<PathBuf>,
+) -> Result<SnapshotResolution, String> {
+    resolve_snapshot_with_progress(model, explicit, |_| Ok(()))
 }
 
 /// Resolves or provisions the pinned revision while reporting exact byte progress.
 pub fn resolve_snapshot_with_progress(
+    model: ProvisionedModel,
     explicit: Option<PathBuf>,
     mut report: impl FnMut(ProvisioningProgress) -> Result<(), String>,
 ) -> Result<SnapshotResolution, String> {
     if let Some(path) = explicit {
-        return verified_local_resolution(path);
+        return verified_local_resolution(model, path);
     }
     let environment = |name: &str| std::env::var_os(name);
     if let Some(path) = nonempty_environment(&environment, "TUISKO_SNAPSHOT") {
-        return verified_local_resolution(path.into());
+        return verified_local_resolution(model, path.into());
     }
 
     let cache = hub_cache(&environment)?;
-    let snapshot = snapshot_path(&cache);
-    let missing = match inspect_snapshot(&snapshot)? {
+    let snapshot = snapshot_path(&cache, model);
+    let missing = match inspect_snapshot(&snapshot, model.required_files())? {
         SnapshotState::Complete => return Ok(local_resolution(snapshot)),
         SnapshotState::Missing(missing) => missing,
     };
@@ -214,20 +348,18 @@ pub fn resolve_snapshot_with_progress(
     let total_bytes = missing.iter().map(|file| file.bytes).sum();
     let mut completed_bytes = 0;
     for required in missing.iter().copied() {
-        download_file(
-            &cache,
-            &snapshot,
+        let mut progress = FileProgress {
             required,
-            token.as_deref(),
-            completed_bytes,
+            completed_before: completed_bytes,
             total_bytes,
-            &mut report,
-        )?;
+            report: &mut report,
+        };
+        download_file(model, &cache, &snapshot, token.as_deref(), &mut progress)?;
         completed_bytes = completed_bytes
             .checked_add(required.bytes)
             .ok_or("Hugging Face provisioning byte count overflows")?;
     }
-    let SnapshotState::Complete = inspect_snapshot(&snapshot)? else {
+    let SnapshotState::Complete = inspect_snapshot(&snapshot, model.required_files())? else {
         return Err(format!(
             "the Hugging Face download completed without the exact required files at {}",
             snapshot.display(),
@@ -251,8 +383,11 @@ fn local_resolution(path: PathBuf) -> SnapshotResolution {
     }
 }
 
-fn verified_local_resolution(path: PathBuf) -> Result<SnapshotResolution, String> {
-    match inspect_snapshot(&path)? {
+fn verified_local_resolution(
+    model: ProvisionedModel,
+    path: PathBuf,
+) -> Result<SnapshotResolution, String> {
+    match inspect_snapshot(&path, model.required_files())? {
         SnapshotState::Complete => Ok(local_resolution(path)),
         SnapshotState::Missing(missing) => Err(format!(
             "the explicit snapshot at {} is missing {} required file(s)",
@@ -263,15 +398,14 @@ fn verified_local_resolution(path: PathBuf) -> Result<SnapshotResolution, String
 }
 
 fn download_file(
+    model: ProvisionedModel,
     cache: &Path,
     snapshot: &Path,
-    required: &RequiredFile,
     token: Option<&str>,
-    completed_before: u64,
-    total_bytes: u64,
-    report: &mut impl FnMut(ProvisioningProgress) -> Result<(), String>,
+    progress: &mut FileProgress<'_>,
 ) -> Result<(), String> {
-    let repository = repository_folder();
+    let required = progress.required;
+    let repository = repository_folder(model);
     let repository_root = cache.join(&repository);
     let blob = repository_root.join("blobs").join(required.blob);
     let lock_path = cache
@@ -297,19 +431,12 @@ fn download_file(
             required.name
         )
     })?;
-    let mut progress = FileProgress {
-        required,
-        completed_before,
-        total_bytes,
-        report,
-    };
-
     if exact_file_length(&blob, required.bytes)? {
         progress.emit(ProvisioningStage::Finalizing, required.bytes)?;
         install_snapshot_link(snapshot, required)?;
         return Ok(());
     }
-    validate_remote_metadata(required, token)?;
+    validate_remote_metadata(model, required, token)?;
     create_parent(&blob)?;
     let incomplete = PathBuf::from(format!("{}.incomplete", blob.display()));
     let mut file = OpenOptions::new()
@@ -322,11 +449,11 @@ fn download_file(
 
     let mut hasher = Sha256::new();
     if offset != 0 {
-        hash_prefix(&mut file, offset, &mut hasher, &incomplete, &mut progress)?;
+        hash_prefix(&mut file, offset, &mut hasher, &incomplete, progress)?;
     }
     if offset < required.bytes {
         progress.emit(ProvisioningStage::Downloading, offset)?;
-        append_remote(&mut file, offset, token, &mut hasher, &mut progress)?;
+        append_remote(model, &mut file, offset, token, &mut hasher, progress)?;
     }
     progress.emit(ProvisioningStage::Finalizing, required.bytes)?;
     file.sync_all()
@@ -360,9 +487,13 @@ fn download_file(
     install_snapshot_link(snapshot, required)
 }
 
-fn validate_remote_metadata(required: &RequiredFile, token: Option<&str>) -> Result<(), String> {
+fn validate_remote_metadata(
+    model: ProvisionedModel,
+    required: &RequiredFile,
+    token: Option<&str>,
+) -> Result<(), String> {
     let agent = agent(0);
-    let url = resolve_url(required.name);
+    let url = resolve_url(model, required.name);
     let request = authorize(agent.head(&url), token);
     let response = request.call().map_err(|error| {
         format!(
@@ -377,12 +508,7 @@ fn validate_remote_metadata(required: &RequiredFile, token: Option<&str>) -> Res
             required.name,
         ));
     }
-    require_header(
-        &response,
-        "x-repo-commit",
-        Qwen38_27B::REVISION,
-        required.name,
-    )?;
+    require_header(&response, "x-repo-commit", model.revision(), required.name)?;
     require_pinned_etag(
         header_value(&response, "x-linked-etag"),
         header_value(&response, "etag"),
@@ -416,6 +542,7 @@ fn require_pinned_etag(
 }
 
 fn append_remote(
+    model: ProvisionedModel,
     file: &mut File,
     offset: u64,
     token: Option<&str>,
@@ -424,7 +551,7 @@ fn append_remote(
 ) -> Result<(), String> {
     let required = progress.required;
     let agent = agent(10);
-    let url = resolve_url(required.name);
+    let url = resolve_url(model, required.name);
     let mut request = authorize(agent.get(&url), token);
     if offset != 0 {
         request = request.header("Range", format!("bytes={offset}-"));
@@ -599,23 +726,23 @@ fn create_parent(path: &Path) -> Result<(), String> {
     fs::create_dir_all(parent).map_err(|error| format!("creating {}: {error}", parent.display()))
 }
 
-fn resolve_url(filename: &str) -> String {
+fn resolve_url(model: ProvisionedModel, filename: &str) -> String {
     format!(
         "{HUB_ENDPOINT}/{}/resolve/{}/{filename}",
-        Qwen38_27B::MODEL_ID,
-        Qwen38_27B::REVISION,
+        model.model_id(),
+        model.revision(),
     )
 }
 
-fn repository_folder() -> String {
-    format!("models--{}", Qwen38_27B::MODEL_ID.replace('/', "--"))
+fn repository_folder(model: ProvisionedModel) -> String {
+    format!("models--{}", model.model_id().replace('/', "--"))
 }
 
-fn snapshot_path(cache: &Path) -> PathBuf {
+fn snapshot_path(cache: &Path, model: ProvisionedModel) -> PathBuf {
     cache
-        .join(repository_folder())
+        .join(repository_folder(model))
         .join("snapshots")
-        .join(Qwen38_27B::REVISION)
+        .join(model.revision())
 }
 
 enum SnapshotState {
@@ -623,9 +750,12 @@ enum SnapshotState {
     Missing(Vec<&'static RequiredFile>),
 }
 
-fn inspect_snapshot(snapshot: &Path) -> Result<SnapshotState, String> {
+fn inspect_snapshot(
+    snapshot: &Path,
+    required_files: &'static [RequiredFile],
+) -> Result<SnapshotState, String> {
     let mut missing = Vec::new();
-    for required in &REQUIRED_FILES {
+    for required in required_files {
         let path = snapshot.join(required.name);
         match fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() && metadata.len() == required.bytes => {}
@@ -712,9 +842,9 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileProgress, ProvisioningStage, REQUIRED_FILES, RequiredFile, Sha256, SnapshotState,
-        append_body, exact_file_length, hex_digest, hub_cache, inspect_snapshot, offline,
-        require_pinned_etag, resume_offset, snapshot_path,
+        FileProgress, ProvisionedModel, ProvisioningStage, QWEN38_REQUIRED_FILES, RequiredFile,
+        Sha256, SnapshotState, append_body, exact_file_length, hex_digest, hub_cache,
+        inspect_snapshot, offline, require_pinned_etag, resume_offset, snapshot_path,
     };
     use crate::resolve_snapshot;
     use sha2::Digest;
@@ -755,32 +885,42 @@ mod tests {
             ),
         ] {
             let cache = hub_cache(&environment(&values)).unwrap();
-            let actual = snapshot_path(&cache);
-            let expected = PathBuf::from(root)
-                .join("models--unsloth--Qwen3.8-27B-NVFP4/snapshots")
-                .join("16b6615af3548b88e2d8e382457bc705b00479cf");
-            assert_eq!(actual, expected);
+            for model in ProvisionedModel::ALL {
+                let actual = snapshot_path(&cache, model);
+                let expected = PathBuf::from(root)
+                    .join(format!(
+                        "models--{}/snapshots",
+                        model.model_id().replace('/', "--")
+                    ))
+                    .join(model.revision());
+                assert_eq!(actual, expected);
+            }
         }
     }
 
     #[test]
-    fn exact_allowlist_and_lengths_define_completeness() {
-        let root = TestDirectory::new("complete");
-        for required in REQUIRED_FILES {
-            let file = File::create(root.path().join(required.name)).unwrap();
-            file.set_len(required.bytes).unwrap();
-        }
-        assert!(matches!(
-            inspect_snapshot(root.path()).unwrap(),
-            SnapshotState::Complete
-        ));
+    fn each_exact_allowlist_and_lengths_define_completeness() {
+        for model in ProvisionedModel::ALL {
+            let root = TestDirectory::new(model.model_id().replace('/', "-").as_str());
+            for required in model.required_files() {
+                let file = File::create(root.path().join(required.name)).unwrap();
+                file.set_len(required.bytes).unwrap();
+            }
+            assert!(matches!(
+                inspect_snapshot(root.path(), model.required_files()).unwrap(),
+                SnapshotState::Complete
+            ));
 
-        fs::remove_file(root.path().join("tokenizer.json")).unwrap();
-        let SnapshotState::Missing(missing) = inspect_snapshot(root.path()).unwrap() else {
-            panic!("expected one missing file");
-        };
-        assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].name, "tokenizer.json");
+            let missing_name = model.required_files().last().unwrap().name;
+            fs::remove_file(root.path().join(missing_name)).unwrap();
+            let SnapshotState::Missing(missing) =
+                inspect_snapshot(root.path(), model.required_files()).unwrap()
+            else {
+                panic!("expected one missing file");
+            };
+            assert_eq!(missing.len(), 1);
+            assert_eq!(missing[0].name, missing_name);
+        }
     }
 
     #[test]
@@ -788,7 +928,9 @@ mod tests {
         let root = TestDirectory::new("wrong-length");
         let file = File::create(root.path().join("config.json")).unwrap();
         file.set_len(1).unwrap();
-        let error = inspect_snapshot(root.path()).err().unwrap();
+        let error = inspect_snapshot(root.path(), ProvisionedModel::Qwen38.required_files())
+            .err()
+            .unwrap();
         assert!(error.contains("config.json has 1 bytes, expected 22564"));
     }
 
@@ -807,7 +949,7 @@ mod tests {
 
     #[test]
     fn progress_is_exact_and_refuses_file_overrun() {
-        let required = &REQUIRED_FILES[2];
+        let required = &QWEN38_REQUIRED_FILES[2];
         let mut events = Vec::new();
         let mut report = |progress| {
             events.push(progress);
@@ -848,29 +990,36 @@ mod tests {
 
     #[test]
     fn explicit_snapshot_paths_are_verified() {
-        let root = TestDirectory::new("explicit");
-        for required in REQUIRED_FILES {
-            let file = File::create(root.path().join(required.name)).unwrap();
-            file.set_len(required.bytes).unwrap();
+        for model in ProvisionedModel::ALL {
+            let root = TestDirectory::new(
+                format!("explicit-{}", model.model_id())
+                    .replace('/', "-")
+                    .as_str(),
+            );
+            for required in model.required_files() {
+                let file = File::create(root.path().join(required.name)).unwrap();
+                file.set_len(required.bytes).unwrap();
+            }
+            let resolution = resolve_snapshot(model, Some(root.path().to_path_buf())).unwrap();
+            assert_eq!(resolution.path, root.path());
+            assert!(resolution.provisioning.is_none());
+
+            let first = model.required_files().first().unwrap();
+            File::create(root.path().join(first.name))
+                .unwrap()
+                .set_len(1)
+                .unwrap();
+            let error = resolve_snapshot(model, Some(root.path().to_path_buf()))
+                .err()
+                .unwrap();
+            assert!(error.contains(first.name));
+
+            fs::remove_file(root.path().join(first.name)).unwrap();
+            let error = resolve_snapshot(model, Some(root.path().to_path_buf()))
+                .err()
+                .unwrap();
+            assert!(error.contains("missing 1 required file(s)"));
         }
-        let resolution = resolve_snapshot(Some(root.path().to_path_buf())).unwrap();
-        assert_eq!(resolution.path, root.path());
-        assert!(resolution.provisioning.is_none());
-
-        File::create(root.path().join("config.json"))
-            .unwrap()
-            .set_len(1)
-            .unwrap();
-        let error = resolve_snapshot(Some(root.path().to_path_buf()))
-            .err()
-            .unwrap();
-        assert!(error.contains("config.json has 1 bytes, expected 22564"));
-
-        fs::remove_file(root.path().join("config.json")).unwrap();
-        let error = resolve_snapshot(Some(root.path().to_path_buf()))
-            .err()
-            .unwrap();
-        assert!(error.contains("missing 1 required file(s)"));
     }
 
     #[test]
@@ -937,7 +1086,7 @@ mod tests {
 
     #[test]
     fn plain_etag_backs_up_missing_linked_etag() {
-        let required = &REQUIRED_FILES[0];
+        let required = &QWEN38_REQUIRED_FILES[0];
         let quoted = format!("\"{}\"", required.blob);
         let weak = format!("W/\"{}\"", required.blob);
         require_pinned_etag(Some(&quoted), None, required).unwrap();
