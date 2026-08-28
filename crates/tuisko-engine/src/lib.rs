@@ -142,6 +142,11 @@ pub use qwen38_flash_next::layer_route::{
     QWEN38_FLASH_NEXT_PREFILL_ROWS, Qwen38FlashNextRowRoute, qwen38_flash_next_row_route,
     require_qwen38_flash_next_dense_qsa_round, require_qwen38_flash_next_dense_qsa_visible,
 };
+pub use qwen38_flash_next::mtp_layout::{
+    QWEN38_FLASH_NEXT_MTP_EXPERT_EXTENT_BYTES, QWEN38_FLASH_NEXT_MTP_EXPERT_ITEM_COUNT,
+    QWEN38_FLASH_NEXT_MTP_EXPERT_RESIDENT_SLOTS, QWEN38_FLASH_NEXT_MTP_MAX_ROWS,
+    QWEN38_FLASH_NEXT_MTP_ROUND_ROWS, Qwen38FlashNextMtpLayout,
+};
 #[cfg(feature = "qualification")]
 pub use qwen38_flash_next::qsa_moe_layer::{
     Qwen38FlashNextQsaMoeLayerImmutable, Qwen38FlashNextQsaMoeLayerInputs,
