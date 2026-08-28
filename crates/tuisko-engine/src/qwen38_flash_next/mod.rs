@@ -12,6 +12,7 @@ pub(crate) mod layer_upload;
 pub(crate) mod mtp_generation;
 pub(crate) mod mtp_layout;
 pub(crate) mod mtp_program;
+pub(crate) mod mtp_serving;
 pub(crate) mod persistent_state;
 pub(crate) mod qsa_moe_layer;
 pub(crate) mod qsa_moe_layer_layout;

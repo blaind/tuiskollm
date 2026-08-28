@@ -11,16 +11,18 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext};
 
-const GENERATION_ROUTE: &str = "compact-b1-8";
-const FUNDED_SLOTS: usize = 8;
+const GENERATION_ROUTE: &str = "mtp-draft-3-b1-1";
+const FUNDED_SLOTS: usize = 1;
 /// Queue depth the transport holds in front of the funded slots.
 const INGRESS_QUEUE: usize = 8;
 /// Last visible length served by dense QSA.
 const DENSE_BAND: usize = 2_051;
-/// Served checkpoint and single-slot page-pool ceiling.
-const SERVED_DEPTH: usize = 262_144;
+/// Single-slot depth funded beside the draft block.
+const SERVED_DEPTH: usize = 240_960;
 const COMPLETION_TOKENS: usize = 8;
 const HELLO_MESSAGE_BOUNDARY_TOKENS: usize = 6;
+/// The speculative pair does not retain prefixes between requests.
+const SERVED_CACHED_TOKENS: usize = 0;
 const THROUGHPUT_COMPLETION_TOKENS: usize = 64;
 const CANCEL_COMPLETION_TOKENS: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -535,9 +537,9 @@ impl Qualification {
                 ),
             )?;
             self.check(
-                streamed.completion.usage.cached_tokens == fixture.message_boundary_tokens,
+                streamed.completion.usage.cached_tokens == SERVED_CACHED_TOKENS,
                 format!(
-                    "fixture `{}` reused {} prompt tokens, expected its {}-token message boundary",
+                    "fixture `{}` reported {} cached tokens on the non-retaining speculative route; its target-only boundary is {} tokens",
                     fixture.name,
                     streamed.completion.usage.cached_tokens,
                     fixture.message_boundary_tokens,
@@ -740,9 +742,9 @@ impl Qualification {
                 ),
             )?;
             self.check(
-                recovery.usage.cached_tokens == HELLO_MESSAGE_BOUNDARY_TOKENS,
+                recovery.usage.cached_tokens == SERVED_CACHED_TOKENS,
                 format!(
-                    "cancellation round {round} restored {} cached tokens, expected {HELLO_MESSAGE_BOUNDARY_TOKENS}",
+                    "cancellation round {round} reported {} cached tokens on the non-retaining speculative route; the target-only boundary is {HELLO_MESSAGE_BOUNDARY_TOKENS}",
                     recovery.usage.cached_tokens,
                 ),
             )?;
@@ -815,20 +817,16 @@ impl Qualification {
                         same_completion_semantics(&timing.completion, cold),
                         format!("`{label}` changed between cold and warm measurement passes"),
                     )?;
-                    self.check(
-                        timing.completion.usage.cached_tokens > 0,
-                        format!("`{label}` warm measurement reused no prompt tokens"),
-                    )?;
                 } else {
-                    self.check(
-                        timing.completion.usage.cached_tokens == 0,
-                        format!(
-                            "`{label}` cold measurement reused {} prompt tokens",
-                            timing.completion.usage.cached_tokens
-                        ),
-                    )?;
                     cold = Some(timing.completion.clone());
                 }
+                self.check(
+                    timing.completion.usage.cached_tokens == SERVED_CACHED_TOKENS,
+                    format!(
+                        "`{label}` {pass} measurement reported {} cached tokens on the non-retaining speculative route",
+                        timing.completion.usage.cached_tokens
+                    ),
+                )?;
                 let (median, p90) = quantiles(&timing.inter_token);
                 println!(
                     "| {label} | {pass} | {budget} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
@@ -1131,13 +1129,17 @@ fn millis(duration: Duration) -> String {
 }
 
 fn parse_capacity_refusal(message: &str) -> Result<(usize, usize)> {
-    let body = message
-        .strip_prefix("[engine.generation] prompt plus processed generation requires ")
-        .ok_or_else(|| {
-            QualError::Contract(format!(
-                "the over-band refusal has an unexpected message {message:?}"
-            ))
-        })?;
+    let body = [
+        "[engine.generation] prompt plus processed MTP generation requires ",
+        "[engine.generation] prompt plus processed generation requires ",
+    ]
+    .into_iter()
+    .find_map(|prefix| message.strip_prefix(prefix))
+    .ok_or_else(|| {
+        QualError::Contract(format!(
+            "the over-band refusal has an unexpected message {message:?}"
+        ))
+    })?;
     let (required, capacity) = body
         .split_once(" positions, current resident capacity is ")
         .ok_or_else(|| QualError::Contract("the over-band refusal omitted its limits".into()))?;
@@ -1452,13 +1454,16 @@ mod tests {
 
     #[test]
     fn the_over_depth_refusal_is_parsed_for_both_of_its_numbers() {
-        let message = format!(
-            "[engine.generation] prompt plus processed generation requires 262208 positions, current resident capacity is {SERVED_DEPTH}"
-        );
-        assert_eq!(
-            parse_capacity_refusal(&message).unwrap(),
-            (262_208, 262_144)
-        );
+        for spelling in ["generation", "MTP generation"] {
+            let required = SERVED_DEPTH + 64;
+            let message = format!(
+                "[engine.generation] prompt plus processed {spelling} requires {required} positions, current resident capacity is {SERVED_DEPTH}"
+            );
+            assert_eq!(
+                parse_capacity_refusal(&message).unwrap(),
+                (required, SERVED_DEPTH)
+            );
+        }
         let error = parse_capacity_refusal("something else").unwrap_err();
         assert!(matches!(error, QualError::Contract(_)));
     }

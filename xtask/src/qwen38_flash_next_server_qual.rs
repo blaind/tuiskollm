@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::Command;
 
 /// Health route the Flash-Next server publishes.
-const ROUTE: &str = "compact-b1-8";
+const ROUTE: &str = "mtp-draft-3-b1-1";
 const MODEL: &str = "RadixArk/Qwen3.8-Flash-Next-NVFP4";
 
 pub(super) fn run(root: &Path, arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
@@ -112,8 +112,8 @@ mod tests {
     use std::ffi::OsString;
 
     #[test]
-    fn the_driver_probes_the_compact_route_rather_than_the_mtp_one() {
-        assert_eq!(ROUTE, "compact-b1-8");
+    fn the_driver_probes_the_flash_next_mtp_route() {
+        assert_eq!(ROUTE, "mtp-draft-3-b1-1");
         assert_ne!(ROUTE, crate::server_qual::ROUTE);
     }
 
