@@ -8,4 +8,5 @@ pub(crate) mod paged_kv;
 pub(crate) mod progress;
 pub(crate) mod rope;
 pub(crate) mod slots;
+pub(crate) mod streaming;
 pub(crate) mod text_generator;

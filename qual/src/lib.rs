@@ -287,6 +287,8 @@ mod qwen38_flash_next_qsa_selection;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_qsa_selection_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_streaming_weight_pool_benchmark;
+#[cfg(feature = "device")]
 mod resident_batch_generation;
 #[cfg(feature = "device")]
 mod resident_generation;
@@ -320,6 +322,8 @@ mod speculative_sampling;
 mod startup_benchmark;
 #[cfg(feature = "device")]
 mod startup_h2d;
+#[cfg(feature = "device")]
+mod streaming_weight_pool;
 mod target;
 #[cfg(feature = "device")]
 mod target_mtp_verify;

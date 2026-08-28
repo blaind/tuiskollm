@@ -38,6 +38,7 @@ const QWEN35_MTP_GENERATION_TEST_FILTER: &str = "qwen35_mtp_generation_suite_";
 const QWEN35_MTP_BATCH_GENERATION_TEST_FILTER: &str = "qwen35_mtp_batch_generation_suite_";
 const QWEN36_MTP_LAYER_TEST_FILTER: &str = "qwen36_mtp_layer_suite_";
 const QWEN36_LONG_CONTEXT_KV_TEST_FILTER: &str = "qwen36_long_context_kv::tests";
+const STREAMING_WEIGHT_POOL_TEST_FILTER: &str = "streaming_weight_pool_suite_";
 const MTP_BF16_PAGED_GQA_BENCHMARK_FILTER: &str =
     "bf16_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_";
 const MTP_LAYER_TEST_FILTER: &str = "mtp_layer::tests::mtp_layer_suite_";
@@ -1156,6 +1157,7 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "qualify-qwen36-long-context-kv",
         qualify_qwen36_long_context_kv,
     ),
+    no_args("qualify-streaming-pool", qualify_streaming_pool),
     no_args(
         "qualify-qwen35-nvfp4-gdn-input",
         qualify_qwen35_nvfp4_gdn_input,
@@ -2645,6 +2647,15 @@ fn qualify_qwen36_long_context_kv(root: &Path) -> Result<(), Box<dyn Error>> {
     run_qualification_test(
         root,
         QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        None,
+    )
+}
+
+fn qualify_streaming_pool(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        STREAMING_WEIGHT_POOL_TEST_FILTER,
         QUALIFICATION_IGNORED_SERIAL_FLAGS,
         None,
     )
@@ -13977,12 +13988,12 @@ mod tests {
         QWEN35_RESIDENT_MTP_TEST_FILTER, QWEN35_RESIDUAL_NORM_TEST_FILTER,
         QWEN35_TEXT_ENDPOINT_TEST_FILTER, QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
         QWEN36_MTP_LAYER_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
-        SM120_DEVICE_CODEGEN_CRATES, SM120_RESOURCE_BASELINES, SUBCOMMANDS, bench_device_baselines,
-        bench_device_command, concatenated_resource_baselines, contains_immediate_operand,
-        device_is_idle, dispatch, dispatch_probe, names_opcode, parse_baseline, parse_compute_pids,
-        parse_cuda_toolkit_identity, parse_entries, parse_performance_device_sample,
-        parse_performance_iteration, parse_resources, parse_rustc_identity,
-        preflight_performance_baselines, qualification_test_arguments,
+        SM120_DEVICE_CODEGEN_CRATES, SM120_RESOURCE_BASELINES, STREAMING_WEIGHT_POOL_TEST_FILTER,
+        SUBCOMMANDS, bench_device_baselines, bench_device_command, concatenated_resource_baselines,
+        contains_immediate_operand, device_is_idle, dispatch, dispatch_probe, names_opcode,
+        parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
+        parse_performance_device_sample, parse_performance_iteration, parse_resources,
+        parse_rustc_identity, preflight_performance_baselines, qualification_test_arguments,
         require_consumed_baseline_keys, require_count, require_registers, require_uniform_value,
         resolve_target_output, sass_function_body, workspace_root,
     };
@@ -14019,6 +14030,26 @@ mod tests {
             "residual_norm_benchmark::tests::qwen35_residual_norm_benchmark_arena_accounting_exposes_every_byte",
         ] {
             assert!(test.contains(QWEN35_RESIDUAL_NORM_TEST_FILTER));
+        }
+    }
+
+    #[test]
+    fn streaming_pool_filter_selects_oracles_and_accounting() {
+        for test in [
+            "streaming_weight_pool::tests::streaming_weight_pool_suite_byte_accounting_is_exact",
+            "streaming_weight_pool::tests::streaming_weight_pool_suite_lru_eviction_order_is_deterministic",
+            "streaming_weight_pool::tests::streaming_weight_pool_suite_every_cache_state_holds_identical_bits",
+            "streaming_weight_pool::tests::streaming_weight_pool_suite_a_miss_stalls_instead_of_serving_a_stale_slot",
+            "streaming_weight_pool::tests::streaming_weight_pool_suite_replay_coexists_with_slot_streaming",
+            "streaming_weight_pool::tests::streaming_weight_pool_suite_a_round_window_holds_identical_bits",
+            "streaming_weight_pool::tests::streaming_weight_pool_suite_uploads_overlap_an_in_flight_replay",
+            "streaming_weight_pool::tests::streaming_weight_pool_suite_the_bounce_path_reproduces_the_pinned_path",
+            "streaming_weight_pool::tests::streaming_weight_pool_suite_a_failed_upload_never_commits_residency",
+            "qwen38_flash_next_streaming_weight_pool_benchmark::tests::streaming_weight_pool_suite_benchmark_inventory_and_accounting_are_exact",
+            "qwen38_flash_next_streaming_weight_pool_benchmark::tests::streaming_weight_pool_suite_benchmark_both_host_postures_are_exact",
+            "qwen38_flash_next_streaming_weight_pool_benchmark::tests::streaming_weight_pool_suite_benchmark_big_pool_reports_pinning_and_upload_rate",
+        ] {
+            assert!(test.contains(STREAMING_WEIGHT_POOL_TEST_FILTER));
         }
     }
 
@@ -14957,6 +14988,12 @@ mod tests {
                 NO_SNAPSHOT,
             ),
             (
+                "qualify-streaming-pool",
+                "streaming_weight_pool_suite_",
+                SERIAL,
+                NO_SNAPSHOT,
+            ),
+            (
                 "qualify-qwen35-nvfp4-gdn-input",
                 "qwen35_nvfp4_gdn_input",
                 IGNORED,
@@ -15298,7 +15335,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 92);
+        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 93);
 
         let snapshot = OsString::from("/snapshot");
         for &(command, filter, trailing, variable) in EXPECTED_QUALIFICATION_ROUTES {

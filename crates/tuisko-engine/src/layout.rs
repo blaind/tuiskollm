@@ -23,6 +23,22 @@ pub trait LayerMemoryLayout {
     fn workspace_bytes(&self) -> usize;
 }
 
+/// Residency-class byte accounting for a streaming-resident target.
+///
+/// The three classes remain separate because only the first is device-resident.
+/// Fully resident targets do not implement this trait.
+pub trait StreamingResidencyAccounting {
+    /// Device bytes held for this tier, including the indirection table and
+    /// alignment padding.
+    fn device_resident_bytes(&self) -> usize;
+
+    /// Page-locked host bytes held for this tier, including upload staging.
+    fn host_pinned_bytes(&self) -> usize;
+
+    /// File-backed host bytes gathered per step rather than held pinned.
+    fn host_mapped_bytes(&self) -> usize;
+}
+
 /// Largest admitted compact decode batch.
 pub const MAX_BATCH: usize = 8;
 
