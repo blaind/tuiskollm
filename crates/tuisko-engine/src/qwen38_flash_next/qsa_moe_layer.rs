@@ -1,8 +1,8 @@
-//! Qwen3.8-Flash-Next QSA/MoE decoder layer.
+//! Resident source-backed Qwen3.8-Flash-Next sparse-attention plus MoE decoder layer.
 //!
-//! Dense GQA is exact through 2,051 visible keys and refused above that ceiling. The owner keeps
-//! indexer weights resident for exact checkpoint accounting and captures the same twelve routes
-//! as the GDN/MoE layer.
+//! Dense and selected routes are captured separately. Indexer projection, preparation, and
+//! compression run on both routes because raw keys are discarded after each four-token block.
+//! Scoring, selection, and gathered attention run only on the selected route.
 
 use crate::common::graph::{capture_batch_graphs, capture_route_graphs};
 use crate::common::math::product;
@@ -11,14 +11,16 @@ use crate::qwen38_flash_next::expert_pool_layout::{
 };
 use crate::qwen38_flash_next::gdn_moe_layer_layout::QWEN38_FLASH_NEXT_LAYER_MAX_ROWS;
 use crate::qwen38_flash_next::layer_route::{
-    QWEN38_FLASH_NEXT_PREFILL_ROWS, Qwen38FlashNextRowRoute, qwen38_flash_next_row_route,
+    QWEN38_FLASH_NEXT_PREFILL_ROWS, Qwen38FlashNextQsaRoute, Qwen38FlashNextRowRoute,
+    qwen38_flash_next_qsa_route, qwen38_flash_next_row_route,
 };
 use crate::qwen38_flash_next::layer_upload::{
     HyperConnectionRegions, MoeRegions, bf16_words, upload_expert_pool, upload_hyper_connection,
     upload_moe,
 };
 use crate::qwen38_flash_next::qsa_moe_layer_layout::{
-    QWEN38_FLASH_NEXT_QSA_PHYSICAL_PAGES, QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE,
+    QWEN38_FLASH_NEXT_QSA_CANDIDATE_BLOCKS, QWEN38_FLASH_NEXT_QSA_PHYSICAL_PAGES,
+    QWEN38_FLASH_NEXT_QSA_SCORE_STRIDE, QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE,
     Qwen38FlashNextQsaMoeLayerRegions,
 };
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen38FlashNextQsaMoeLayerLayout};
@@ -27,11 +29,14 @@ use std::sync::Arc;
 use tuisko_gpu::PinnedHostBuffer;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
 use tuisko_kernels_sm120::{
-    Qwen38FlashNextAttentionGateOp, Qwen38FlashNextAttentionQkPrepareOp,
-    Qwen38FlashNextBlockOutputProjectionOp, Qwen38FlashNextExpertDispatch,
-    Qwen38FlashNextHyperConnectionOp, Qwen38FlashNextMoeExpertsOp, Qwen38FlashNextMoeRouterOp,
+    IndexerCompressArgs, IndexerPrepareArgs, IndexerSelectionArgs, Qwen38FlashNextAttentionGateOp,
+    Qwen38FlashNextAttentionQkPrepareOp, Qwen38FlashNextBlockOutputProjectionOp,
+    Qwen38FlashNextExpertDispatch, Qwen38FlashNextHyperConnectionOp,
+    Qwen38FlashNextIndexerPrepareOp, Qwen38FlashNextIndexerQkProjectionOp,
+    Qwen38FlashNextIndexerSelectionOp, Qwen38FlashNextMoeExpertsOp, Qwen38FlashNextMoeRouterOp,
     Qwen38FlashNextPagedGqaOp, Qwen38FlashNextQsaQkvProjectionOp,
-    qwen38_flash_next_expert_slot_plane,
+    Qwen38FlashNextSelectedPagedGqaOp, SELECTION_ROW_TILE, SelectedAttentionArgs,
+    qwen38_flash_next_expert_slot_plane, selection_round_blocks, selection_round_rows,
 };
 use tuisko_model::{
     CheckpointSnapshot, Qwen38FlashNext, Qwen38FlashNextLayerHyperConnections,
@@ -51,10 +56,16 @@ pub struct Qwen38FlashNextQsaMoeLayerProgram {
     // Drop graphs before the arenas and loaded modules whose handles they retain.
     graphs: [CudaGraph; MAX_BATCH],
     prefill_graphs: [CudaGraph; QWEN38_FLASH_NEXT_PREFILL_ROWS.len()],
+    selected_graphs: [CudaGraph; MAX_BATCH],
+    selected_prefill_graphs: [CudaGraph; QWEN38_FLASH_NEXT_PREFILL_ROWS.len()],
     arena: DeviceArena,
     pool_arena: DeviceArena,
     _hyper: Qwen38FlashNextHyperConnectionOp,
     _qkv: Qwen38FlashNextQsaQkvProjectionOp,
+    _indexer_qk: Qwen38FlashNextIndexerQkProjectionOp,
+    _indexer: Qwen38FlashNextIndexerPrepareOp,
+    _selection: Qwen38FlashNextIndexerSelectionOp,
+    _selected_attention: Qwen38FlashNextSelectedPagedGqaOp,
     _prepare: Qwen38FlashNextAttentionQkPrepareOp,
     _attention: Qwen38FlashNextPagedGqaOp,
     _gate: Qwen38FlashNextAttentionGateOp,
@@ -95,6 +106,9 @@ struct Pointers {
     output_weight: *const u16,
     query_norm: *const u16,
     key_norm: *const u16,
+    indexer_qk_weight: *const u16,
+    indexer_query_norm: *const u16,
+    indexer_key_norm: *const u16,
 
     qkv: *mut u16,
     query: *mut f32,
@@ -108,6 +122,21 @@ struct Pointers {
     block_tables: *const u32,
     key_pages: *mut u8,
     value_pages: *mut u8,
+
+    indexer_qk: *mut u16,
+    indexer_query: *mut f32,
+    indexer_ring: *mut u16,
+    indexer_raw_round: *mut u16,
+    block_rope_cos: *const f32,
+    block_rope_sin: *const f32,
+    closing_first_blocks: *const u32,
+    closing_block_counts: *const u32,
+    candidate_blocks: *const u32,
+    scores: *mut f32,
+    select_scratch: *mut u32,
+    selected: *mut u32,
+    selected_counts: *mut u32,
+    block_keys: *mut u16,
 
     router_weight: *const u16,
     expert_weight_scales_2: *const f32,
@@ -161,6 +190,9 @@ impl Pointers {
             output_weight: arena.address(regions.output_weight)?.cast_const(),
             query_norm: arena.address(regions.query_norm)?.cast_const(),
             key_norm: arena.address(regions.key_norm)?.cast_const(),
+            indexer_qk_weight: arena.address(regions.indexer_qk_weight)?.cast_const(),
+            indexer_query_norm: arena.address(regions.indexer_query_norm)?.cast_const(),
+            indexer_key_norm: arena.address(regions.indexer_key_norm)?.cast_const(),
 
             qkv: arena.address(regions.qkv)?,
             query: arena.address(regions.query)?,
@@ -174,6 +206,21 @@ impl Pointers {
             block_tables: arena.address(regions.block_tables)?.cast_const(),
             key_pages: arena.address(regions.key_pages)?,
             value_pages: arena.address(regions.value_pages)?,
+
+            indexer_qk: arena.address(regions.indexer_qk)?,
+            indexer_query: arena.address(regions.indexer_query)?,
+            indexer_ring: arena.address(regions.indexer_ring)?,
+            indexer_raw_round: arena.address(regions.indexer_raw_round)?,
+            block_rope_cos: arena.address(regions.block_rope_cos)?.cast_const(),
+            block_rope_sin: arena.address(regions.block_rope_sin)?.cast_const(),
+            closing_first_blocks: arena.address(regions.closing_first_blocks)?.cast_const(),
+            closing_block_counts: arena.address(regions.closing_block_counts)?.cast_const(),
+            candidate_blocks: arena.address(regions.candidate_blocks)?.cast_const(),
+            scores: arena.address(regions.scores)?,
+            select_scratch: arena.address(regions.select_scratch)?,
+            selected: arena.address(regions.selected)?,
+            selected_counts: arena.address(regions.selected_counts)?,
+            block_keys: arena.address(regions.block_keys)?,
 
             router_weight: arena.address(regions.router_weight)?.cast_const(),
             expert_weight_scales_2: arena.address(regions.expert_weight_scales_2)?.cast_const(),
@@ -222,6 +269,9 @@ impl Pointers {
             self.output_weight.addr(),
             self.query_norm.addr(),
             self.key_norm.addr(),
+            self.indexer_qk_weight.addr(),
+            self.indexer_query_norm.addr(),
+            self.indexer_key_norm.addr(),
             self.qkv.addr(),
             self.query.addr(),
             self.attention.addr(),
@@ -234,6 +284,20 @@ impl Pointers {
             self.block_tables.addr(),
             self.key_pages.addr(),
             self.value_pages.addr(),
+            self.indexer_qk.addr(),
+            self.indexer_query.addr(),
+            self.indexer_ring.addr(),
+            self.indexer_raw_round.addr(),
+            self.block_rope_cos.addr(),
+            self.block_rope_sin.addr(),
+            self.closing_first_blocks.addr(),
+            self.closing_block_counts.addr(),
+            self.candidate_blocks.addr(),
+            self.scores.addr(),
+            self.select_scratch.addr(),
+            self.selected.addr(),
+            self.selected_counts.addr(),
+            self.block_keys.addr(),
             self.router_weight.addr(),
             self.expert_weight_scales_2.addr(),
             self.shared_gate_weight.addr(),
@@ -259,6 +323,10 @@ impl Pointers {
 struct Ops<'a> {
     hyper: &'a Qwen38FlashNextHyperConnectionOp,
     qkv: &'a Qwen38FlashNextQsaQkvProjectionOp,
+    indexer_qk: &'a Qwen38FlashNextIndexerQkProjectionOp,
+    indexer: &'a Qwen38FlashNextIndexerPrepareOp,
+    selection: &'a Qwen38FlashNextIndexerSelectionOp,
+    selected_attention: &'a Qwen38FlashNextSelectedPagedGqaOp,
     prepare: &'a Qwen38FlashNextAttentionQkPrepareOp,
     attention: &'a Qwen38FlashNextPagedGqaOp,
     gate: &'a Qwen38FlashNextAttentionGateOp,
@@ -289,6 +357,10 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
 
         let hyper = Qwen38FlashNextHyperConnectionOp::new(context)?;
         let qkv = Qwen38FlashNextQsaQkvProjectionOp::new(context)?;
+        let indexer_qk = Qwen38FlashNextIndexerQkProjectionOp::new(context)?;
+        let indexer = Qwen38FlashNextIndexerPrepareOp::new(context)?;
+        let selection = Qwen38FlashNextIndexerSelectionOp::new(context)?;
+        let selected_attention = Qwen38FlashNextSelectedPagedGqaOp::new(context)?;
         let prepare = Qwen38FlashNextAttentionQkPrepareOp::new(context)?;
         let attention = Qwen38FlashNextPagedGqaOp::new(context)?;
         let gate = Qwen38FlashNextAttentionGateOp::new(context)?;
@@ -367,6 +439,10 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
         let ops = Ops {
             hyper: &hyper,
             qkv: &qkv,
+            indexer_qk: &indexer_qk,
+            indexer: &indexer,
+            selection: &selection,
+            selected_attention: &selected_attention,
             prepare: &prepare,
             attention: &attention,
             gate: &gate,
@@ -374,25 +450,61 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
             router: &router,
             experts: &experts,
         };
+        // Two captures per width rather than one always-selection capture: the dense route is
+        // already qualified and cheaper inside the band, and the identity proof at or below 2,051
+        // is what makes switching between them safe.
         let graphs = capture_batch_graphs(
             &stream,
             "Qwen3.8-Flash-Next QSA/MoE decode graph inventory has wrong cardinality",
-            |rows| launch_route(&stream, rows, ops, pointers),
+            |rows| launch_route(&stream, rows, Qwen38FlashNextQsaRoute::Dense, ops, pointers),
         )?;
         let prefill_graphs = capture_route_graphs(
             &stream,
             QWEN38_FLASH_NEXT_PREFILL_ROWS,
             "Qwen3.8-Flash-Next QSA/MoE prefill graph inventory has wrong cardinality",
-            |rows| launch_route(&stream, rows, ops, pointers),
+            |rows| launch_route(&stream, rows, Qwen38FlashNextQsaRoute::Dense, ops, pointers),
+        )?;
+        let selected_graphs = capture_batch_graphs(
+            &stream,
+            "Qwen3.8-Flash-Next QSA/MoE selected decode graph inventory has wrong cardinality",
+            |rows| {
+                launch_route(
+                    &stream,
+                    rows,
+                    Qwen38FlashNextQsaRoute::Selected,
+                    ops,
+                    pointers,
+                )
+            },
+        )?;
+        let selected_prefill_graphs = capture_route_graphs(
+            &stream,
+            QWEN38_FLASH_NEXT_PREFILL_ROWS,
+            "Qwen3.8-Flash-Next QSA/MoE selected prefill graph inventory has wrong cardinality",
+            |rows| {
+                launch_route(
+                    &stream,
+                    rows,
+                    Qwen38FlashNextQsaRoute::Selected,
+                    ops,
+                    pointers,
+                )
+            },
         )?;
 
         Ok(Self {
             graphs,
             prefill_graphs,
+            selected_graphs,
+            selected_prefill_graphs,
             arena,
             pool_arena,
             _hyper: hyper,
             _qkv: qkv,
+            _indexer_qk: indexer_qk,
+            _indexer: indexer,
+            _selection: selection,
+            _selected_attention: selected_attention,
             _prepare: prepare,
             _attention: attention,
             _gate: gate,
@@ -430,18 +542,21 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
         Ok(())
     }
 
-    /// Uploads one round's rotary tables and page metadata, refusing an inadmissible round.
+    /// Uploads one round's rotary tables, page metadata, and selection planes.
     ///
-    /// Every visible length is checked against the proven dense-equivalence ceiling and against
-    /// this owner's own page capacity before any of the round reaches the device.
+    /// Returns the attention route the round takes, which is the widest its rows need: a batch
+    /// holding even one above-ceiling sequence runs selection for all of them, and the in-band
+    /// rows are unharmed because their selection is the identity.
+    ///
+    /// Every visible length is classified and checked against this owner's own page capacity
+    /// before any of the round reaches the device.
     pub fn load_round(
         &self,
         stream: &CudaStream,
         rows: usize,
         round: Qwen38FlashNextQsaRound<'_>,
-    ) -> EngineResult<()> {
-        self.require_round(rows, round)?;
-
+    ) -> EngineResult<Qwen38FlashNextQsaRoute> {
+        let plan = self.plan_round(rows, round)?;
         let regions = self.layout.regions();
         self.arena
             .copy_prefix_from_host(stream, regions.table_rows, round.table_rows)?;
@@ -453,11 +568,31 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
             .copy_prefix_from_host(stream, regions.rope_cos, round.rope_cos)?;
         self.arena
             .copy_prefix_from_host(stream, regions.rope_sin, round.rope_sin)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.candidate_blocks, &plan.candidates)?;
+        self.arena.copy_prefix_from_host(
+            stream,
+            regions.closing_first_blocks,
+            &plan.closing.first,
+        )?;
+        self.arena.copy_prefix_from_host(
+            stream,
+            regions.closing_block_counts,
+            &plan.closing.counts,
+        )?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.block_rope_cos, round.block_rope_cos)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.block_rope_sin, round.block_rope_sin)?;
 
-        Ok(())
+        Ok(plan.route)
     }
 
-    fn require_round(&self, rows: usize, round: Qwen38FlashNextQsaRound<'_>) -> EngineResult<()> {
+    fn plan_round(
+        &self,
+        rows: usize,
+        round: Qwen38FlashNextQsaRound<'_>,
+    ) -> EngineResult<RoundPlan> {
         qwen38_flash_next_row_route(rows)?;
         for (role, len) in [
             ("table rows", round.table_rows.len()),
@@ -476,12 +611,25 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
                 "Qwen3.8-Flash-Next QSA rotary tables must each cover {rotary} values"
             )));
         }
-        for &length in round.lengths {
-            crate::require_qwen38_flash_next_dense_qsa_visible(length as usize)?;
+        let mut route = Qwen38FlashNextQsaRoute::Dense;
+        for (&position, &length) in round.cache_positions.iter().zip(round.lengths) {
+            route = route.widen(qwen38_flash_next_qsa_route(length as usize)?);
             if length as usize > self.layout.context_capacity() {
                 return Err(EngineError::route(format!(
                     "Qwen3.8-Flash-Next QSA visible length {length} exceeds this owner's {} page capacity",
                     self.layout.context_capacity()
+                )));
+            }
+            if position as usize >= self.layout.context_capacity() {
+                return Err(EngineError::route(format!(
+                    "Qwen3.8-Flash-Next QSA cache position {position} exceeds this owner's {}-position page mapping",
+                    self.layout.context_capacity()
+                )));
+            }
+            if length != position + 1 {
+                return Err(EngineError::route(format!(
+                    "Qwen3.8-Flash-Next QSA cache position {position} requires visible length {}, got {length}",
+                    position + 1
                 )));
             }
         }
@@ -492,8 +640,25 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
                 )));
             }
         }
+        let block_rotary = product(
+            "Qwen3.8-Flash-Next QSA block rotary",
+            qwen38_flash_next_qsa_block_rotary_rows(rows),
+            ROTARY_ELEMENTS,
+        )?;
+        if round.block_rope_cos.len() != block_rotary || round.block_rope_sin.len() != block_rotary
+        {
+            return Err(EngineError::layout(format!(
+                "Qwen3.8-Flash-Next QSA block rotary tables must each cover {block_rotary} values"
+            )));
+        }
 
-        Ok(())
+        Ok(RoundPlan {
+            route,
+            candidates: candidate_blocks(round.lengths),
+            closing: closing_blocks(rows, round.cache_positions)?,
+            rotary,
+            block_rotary,
+        })
     }
 
     /// Publishes one expert indirection table, refusing a structurally invalid one.
@@ -506,23 +671,26 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
         Ok(())
     }
 
-    /// Clears every paged cache plane, including the reserved indexer keys.
+    /// Clears every cache plane: the pages, the block keys, and the per-sequence raw-key ring.
     pub fn reset_cache(&self, stream: &CudaStream) -> EngineResult<()> {
         let regions = self.layout.regions();
-        for region in [
-            regions.key_pages,
-            regions.value_pages,
-            regions.indexer_pages,
-        ] {
+        for region in [regions.key_pages, regions.value_pages] {
             self.arena.fill(stream, region, 0)?;
         }
+        self.arena.fill(stream, regions.block_keys, 0)?;
+        self.arena.fill(stream, regions.indexer_ring, 0)?;
 
         Ok(())
     }
 
-    /// Replays the immutable graph for one admitted row count.
-    pub fn replay(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
-        let graph = self.graph(rows)?;
+    /// Replays the immutable graph for one admitted row count on one attention route.
+    pub fn replay(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        route: Qwen38FlashNextQsaRoute,
+    ) -> EngineResult<()> {
+        let graph = self.graph(rows, route)?;
         // SAFETY: this program owns every captured allocation (both arenas and the op
         // modules) for its whole life and drops the graphs first.
         unsafe { graph.launch(stream) }?;
@@ -610,12 +778,22 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
         &self.snapshot
     }
 
-    fn graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
-        let route = qwen38_flash_next_row_route(rows)?;
+    fn graph(&self, rows: usize, route: Qwen38FlashNextQsaRoute) -> EngineResult<&CudaGraph> {
+        let width = qwen38_flash_next_row_route(rows)?;
 
-        Ok(match route {
-            Qwen38FlashNextRowRoute::Decode(_) => &self.graphs[route.graph_index()],
-            Qwen38FlashNextRowRoute::Prefill(_) => &self.prefill_graphs[route.graph_index()],
+        Ok(match (width, route) {
+            (Qwen38FlashNextRowRoute::Decode(_), Qwen38FlashNextQsaRoute::Dense) => {
+                &self.graphs[width.graph_index()]
+            }
+            (Qwen38FlashNextRowRoute::Prefill(_), Qwen38FlashNextQsaRoute::Dense) => {
+                &self.prefill_graphs[width.graph_index()]
+            }
+            (Qwen38FlashNextRowRoute::Decode(_), Qwen38FlashNextQsaRoute::Selected) => {
+                &self.selected_graphs[width.graph_index()]
+            }
+            (Qwen38FlashNextRowRoute::Prefill(_), Qwen38FlashNextQsaRoute::Selected) => {
+                &self.selected_prefill_graphs[width.graph_index()]
+            }
         })
     }
 
@@ -634,6 +812,10 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
         Ops {
             hyper: &self._hyper,
             qkv: &self._qkv,
+            indexer_qk: &self._indexer_qk,
+            indexer: &self._indexer,
+            selection: &self._selection,
+            selected_attention: &self._selected_attention,
             prepare: &self._prepare,
             attention: &self._attention,
             gate: &self._gate,
@@ -645,17 +827,26 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
 
     #[cfg(feature = "qualification")]
     /// Launches the production route eagerly, for graph-agreement qualification.
-    pub fn launch_eager(&self, stream: &CudaStream, rows: usize) -> EngineResult<()> {
+    pub fn launch_eager(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        route: Qwen38FlashNextQsaRoute,
+    ) -> EngineResult<()> {
         qwen38_flash_next_row_route(rows)?;
-        launch_route(stream, rows, self.ops(), self.pointers()?)?;
+        launch_route(stream, rows, route, self.ops(), self.pointers()?)?;
 
         Ok(())
     }
 
     #[cfg(feature = "qualification")]
     /// Returns one captured production graph.
-    pub fn qualification_graph(&self, rows: usize) -> EngineResult<&CudaGraph> {
-        self.graph(rows)
+    pub fn qualification_graph(
+        &self,
+        rows: usize,
+        route: Qwen38FlashNextQsaRoute,
+    ) -> EngineResult<&CudaGraph> {
+        self.graph(rows, route)
     }
 
     #[cfg(feature = "qualification")]
@@ -664,6 +855,7 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
         &self,
         stream: &CudaStream,
         rows: usize,
+        route: Qwen38FlashNextQsaRoute,
         operations: u64,
     ) -> EngineResult<CudaGraph> {
         qwen38_flash_next_row_route(rows)?;
@@ -677,21 +869,21 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
 
         Ok(CudaGraph::capture(stream, || {
             for _ in 0..operations {
-                launch_route(stream, rows, ops, pointers)?;
+                launch_route(stream, rows, route, ops, pointers)?;
             }
             Ok(())
         })?)
     }
 
+    /// Captures one admitted round's runtime-input upload for benchmark replay.
     #[cfg(feature = "qualification")]
-    /// Captures one admitted round's metadata upload for benchmark replay.
     pub fn qualification_round_stage_graph(
         &self,
         stream: &CudaStream,
         rows: usize,
         round: Qwen38FlashNextQsaRound<'_>,
     ) -> EngineResult<Qwen38FlashNextQsaRoundStageGraph> {
-        self.require_round(rows, round)?;
+        let plan = self.plan_round(rows, round)?;
         let table_rows = PinnedHostBuffer::from_slice(&self.context, round.table_rows)
             .map_err(GpuError::from)?;
         let cache_positions = PinnedHostBuffer::from_slice(&self.context, round.cache_positions)
@@ -702,10 +894,20 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
             PinnedHostBuffer::from_slice(&self.context, round.rope_cos).map_err(GpuError::from)?;
         let rope_sin =
             PinnedHostBuffer::from_slice(&self.context, round.rope_sin).map_err(GpuError::from)?;
-        let rotary = product("Qwen3.8-Flash-Next QSA rotary", rows, ROTARY_ELEMENTS)?;
+        let block_rope_cos = PinnedHostBuffer::from_slice(&self.context, round.block_rope_cos)
+            .map_err(GpuError::from)?;
+        let block_rope_sin = PinnedHostBuffer::from_slice(&self.context, round.block_rope_sin)
+            .map_err(GpuError::from)?;
+        let candidate_blocks = PinnedHostBuffer::from_slice(&self.context, &plan.candidates)
+            .map_err(GpuError::from)?;
+        let closing_first_blocks = PinnedHostBuffer::from_slice(&self.context, &plan.closing.first)
+            .map_err(GpuError::from)?;
+        let closing_block_counts =
+            PinnedHostBuffer::from_slice(&self.context, &plan.closing.counts)
+                .map_err(GpuError::from)?;
         let regions = self.layout.regions();
         let graph = CudaGraph::capture(stream, || {
-            // SAFETY: the returned owner retains every pinned source through all replays.
+            // SAFETY: the returned owner retains every pinned source through replay.
             unsafe {
                 self.arena.copy_prefix_from_pinned_host_async(
                     stream,
@@ -729,24 +931,60 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
                     stream,
                     regions.rope_cos,
                     &rope_cos,
-                    rotary,
+                    plan.rotary,
                 )?;
                 self.arena.copy_prefix_from_pinned_host_async(
                     stream,
                     regions.rope_sin,
                     &rope_sin,
-                    rotary,
+                    plan.rotary,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    regions.block_rope_cos,
+                    &block_rope_cos,
+                    plan.block_rotary,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    regions.block_rope_sin,
+                    &block_rope_sin,
+                    plan.block_rotary,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    regions.candidate_blocks,
+                    &candidate_blocks,
+                    rows,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    regions.closing_first_blocks,
+                    &closing_first_blocks,
+                    plan.closing.first.len(),
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    regions.closing_block_counts,
+                    &closing_block_counts,
+                    plan.closing.counts.len(),
                 )
             }
         })?;
 
         Ok(Qwen38FlashNextQsaRoundStageGraph {
             graph,
+            route: plan.route,
             _table_rows: table_rows,
             _cache_positions: cache_positions,
             _lengths: lengths,
             _rope_cos: rope_cos,
             _rope_sin: rope_sin,
+            _block_rope_cos: block_rope_cos,
+            _block_rope_sin: block_rope_sin,
+            _candidate_blocks: candidate_blocks,
+            _closing_first_blocks: closing_first_blocks,
+            _closing_block_counts: closing_block_counts,
         })
     }
 
@@ -772,6 +1010,15 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
             block_tables: self.arena.copy_to_host(stream, regions.block_tables)?,
             rope_cos: self.arena.copy_to_host(stream, regions.rope_cos)?,
             rope_sin: self.arena.copy_to_host(stream, regions.rope_sin)?,
+            block_rope_cos: self.arena.copy_to_host(stream, regions.block_rope_cos)?,
+            block_rope_sin: self.arena.copy_to_host(stream, regions.block_rope_sin)?,
+            candidate_blocks: self.arena.copy_to_host(stream, regions.candidate_blocks)?,
+            closing_first_blocks: self
+                .arena
+                .copy_to_host(stream, regions.closing_first_blocks)?,
+            closing_block_counts: self
+                .arena
+                .copy_to_host(stream, regions.closing_block_counts)?,
             slot_table: self
                 .pool_arena
                 .copy_to_host(stream, self.pool_layout.regions().slot_table)?,
@@ -790,6 +1037,7 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
             regions.hc_mixed,
             regions.hc_write_gate,
             regions.qkv,
+            regions.indexer_qk,
             regions.attention_gated,
             regions.router_logits,
             regions.expert_indices,
@@ -803,9 +1051,16 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
         ] {
             self.arena.fill(stream, region, byte)?;
         }
-        for region in [regions.query, regions.attention] {
+        for region in [regions.query, regions.attention, regions.indexer_query] {
             self.arena.fill(stream, region, byte)?;
         }
+        for region in [regions.selected, regions.selected_counts] {
+            self.arena.fill(stream, region, byte)?;
+        }
+        self.arena.fill(stream, regions.scores, byte)?;
+        // The selection scratch is poisoned like every other reused seam: a pass that read a
+        // partial it had not published this round would answer differently under the sentinel.
+        self.arena.fill(stream, regions.select_scratch, byte)?;
 
         Ok(())
     }
@@ -829,7 +1084,12 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
             attention_gated: self.arena.copy_to_host(stream, regions.attention_gated)?,
             key_pages: self.arena.copy_to_host(stream, regions.key_pages)?,
             value_pages: self.arena.copy_to_host(stream, regions.value_pages)?,
-            indexer_pages: self.arena.copy_to_host(stream, regions.indexer_pages)?,
+            block_keys: self.arena.copy_to_host(stream, regions.block_keys)?,
+            indexer_ring: self.arena.copy_to_host(stream, regions.indexer_ring)?,
+            indexer_qk: self.arena.copy_to_host(stream, regions.indexer_qk)?,
+            indexer_query: self.arena.copy_to_host(stream, regions.indexer_query)?,
+            selected: self.arena.copy_to_host(stream, regions.selected)?,
+            selected_counts: self.arena.copy_to_host(stream, regions.selected_counts)?,
             attention_residual: self
                 .arena
                 .copy_to_host(stream, regions.attention_residual)?,
@@ -909,30 +1169,122 @@ pub struct Qwen38FlashNextQsaRound<'a> {
     pub table_rows: &'a [u32],
     /// Absolute cache position each row appends at.
     pub cache_positions: &'a [u32],
-    /// Visible key count each row attends over, checked against the dense ceiling.
+    /// Visible key count each row attends over, which also picks the round's route.
     pub lengths: &'a [u32],
     /// Rotary cosines, `rows * 32` values.
     pub rope_cos: &'a [f32],
     /// Rotary sines, `rows * 32` values.
     pub rope_sin: &'a [f32],
+    /// Rotary cosines at each closing micro-block's first token,
+    /// [`qwen38_flash_next_qsa_block_rotary_rows`] rows of 32.
+    pub block_rope_cos: &'a [f32],
+    /// Rotary sines at each closing micro-block's first token.
+    pub block_rope_sin: &'a [f32],
+}
+
+struct RoundPlan {
+    route: Qwen38FlashNextQsaRoute,
+    candidates: Vec<u32>,
+    closing: ClosingBlocks,
+    rotary: usize,
+    block_rotary: usize,
 }
 
 #[cfg(feature = "qualification")]
-/// Captured round upload retaining its pinned sources.
+/// Captured runtime-input upload retaining every pinned source.
 pub struct Qwen38FlashNextQsaRoundStageGraph {
     graph: CudaGraph,
+    route: Qwen38FlashNextQsaRoute,
     _table_rows: PinnedHostBuffer<u32>,
     _cache_positions: PinnedHostBuffer<u32>,
     _lengths: PinnedHostBuffer<u32>,
     _rope_cos: PinnedHostBuffer<f32>,
     _rope_sin: PinnedHostBuffer<f32>,
+    _block_rope_cos: PinnedHostBuffer<f32>,
+    _block_rope_sin: PinnedHostBuffer<f32>,
+    _candidate_blocks: PinnedHostBuffer<u32>,
+    _closing_first_blocks: PinnedHostBuffer<u32>,
+    _closing_block_counts: PinnedHostBuffer<u32>,
 }
 
 #[cfg(feature = "qualification")]
 impl Qwen38FlashNextQsaRoundStageGraph {
-    /// Immutable graph restoring one exact round's runtime metadata.
+    /// Immutable graph restoring one exact round's runtime inputs.
     pub const fn graph(&self) -> &CudaGraph {
         &self.graph
+    }
+
+    /// Attention route selected by the staged round.
+    pub const fn route(&self) -> Qwen38FlashNextQsaRoute {
+        self.route
+    }
+}
+
+/// Rotary rows one round's block compression indexes, in the kernel's own order.
+///
+/// A decode round owns one row per sequence and closes at most one block each; a prompt tile owns
+/// one sequence and closes many. The compression indexes `row * blocks + slot`, so the plane is
+/// exactly the product and never the round's token count.
+pub const fn qwen38_flash_next_qsa_block_rotary_rows(rows: usize) -> usize {
+    selection_round_rows(rows) * selection_round_blocks(rows)
+}
+
+/// The micro-blocks one round closes, in the compression's own row order.
+struct ClosingBlocks {
+    first: Vec<u32>,
+    counts: Vec<u32>,
+}
+
+/// Complete candidate blocks each token of the round may score.
+///
+/// The reference's `n_blocks` is `V / 4`: an incomplete trailing block carries no pooled key and
+/// is attended through the unconditional tail instead.
+fn candidate_blocks(lengths: &[u32]) -> Vec<u32> {
+    lengths
+        .iter()
+        .map(|&length| length / Qwen38FlashNext::INDEXER_COMPRESS_RATIO as u32)
+        .collect()
+}
+
+/// Resolves completed micro-blocks and checks prompt alignment required by the raw-key plane.
+fn closing_blocks(rows: usize, cache_positions: &[u32]) -> EngineResult<ClosingBlocks> {
+    let ratio = Qwen38FlashNext::INDEXER_COMPRESS_RATIO as u32;
+    match qwen38_flash_next_row_route(rows)? {
+        Qwen38FlashNextRowRoute::Decode(_) => {
+            let mut first = Vec::with_capacity(rows);
+            let mut counts = Vec::with_capacity(rows);
+            for &position in cache_positions {
+                first.push(position / ratio);
+                counts.push(u32::from((position + 1).is_multiple_of(ratio)));
+            }
+
+            Ok(ClosingBlocks { first, counts })
+        }
+        Qwen38FlashNextRowRoute::Prefill(tokens) => {
+            let base = cache_positions[0];
+            if !base.is_multiple_of(ratio) {
+                return Err(EngineError::route(format!(
+                    "a Qwen3.8-Flash-Next QSA prompt tile starting at position {base} is not micro-block \
+                     aligned; the round-local raw-key plane indexes a member by its own tile row, \
+                     so a straddling first block would pool a position this round never wrote"
+                )));
+            }
+            for (offset, &position) in cache_positions.iter().enumerate() {
+                if position != base + offset as u32 {
+                    return Err(EngineError::route(format!(
+                        "a Qwen3.8-Flash-Next QSA prompt tile walks position {position} at row {offset} \
+                         rather than {}; the compression pools by tile row and cannot follow a \
+                         gap",
+                        base + offset as u32
+                    )));
+                }
+            }
+
+            Ok(ClosingBlocks {
+                first: vec![base / ratio],
+                counts: vec![tokens as u32 / ratio],
+            })
+        }
     }
 }
 
@@ -953,6 +1305,16 @@ pub struct Qwen38FlashNextQsaMoeLayerInputs {
     pub rope_cos: Vec<f32>,
     /// Rotary sines for this round.
     pub rope_sin: Vec<f32>,
+    /// Rotary cosines at each closing micro-block's first token.
+    pub block_rope_cos: Vec<f32>,
+    /// Rotary sines at each closing micro-block's first token.
+    pub block_rope_sin: Vec<f32>,
+    /// Complete candidate blocks each token may score.
+    pub candidate_blocks: Vec<u32>,
+    /// First micro-block each compression row closes.
+    pub closing_first_blocks: Vec<u32>,
+    /// Micro-blocks each compression row closes.
+    pub closing_block_counts: Vec<u32>,
     /// Published expert id to slot assignment.
     pub slot_table: Vec<u32>,
 }
@@ -980,8 +1342,18 @@ pub struct Qwen38FlashNextQsaMoeLayerObservables {
     pub key_pages: Vec<u8>,
     /// Represented E4M3 value pages.
     pub value_pages: Vec<u8>,
-    /// Reserved indexer key pages, unwritten while the dense route is the admitted one.
-    pub indexer_pages: Vec<u8>,
+    /// Compressed block keys, one per four cached tokens, on the shared page mapping.
+    pub block_keys: Vec<u16>,
+    /// The per-sequence raw-key ring, holding each slot's open micro-block.
+    pub indexer_ring: Vec<u16>,
+    /// Fused indexer query and key projection rows.
+    pub indexer_qk: Vec<u16>,
+    /// Normed and rotated FP32 indexer query rows.
+    pub indexer_query: Vec<f32>,
+    /// Ascending selected positions, one row per token.
+    pub selected: Vec<u32>,
+    /// Selected position count of each token.
+    pub selected_counts: Vec<u32>,
     /// The stream after the attention write-back.
     pub attention_residual: Vec<u16>,
     /// BF16 logits for all 512 routed experts.
@@ -1033,7 +1405,7 @@ pub struct Qwen38FlashNextQsaMoeLayerImmutable {
     pub query_norm: Vec<u16>,
     /// Per-head key RMSNorm weights.
     pub key_norm: Vec<u16>,
-    /// Indexer projection, resident and unread on the dense route.
+    /// Fused indexer query and key projection.
     pub indexer_qk_weight: Vec<u16>,
     /// Indexer query RMSNorm weights.
     pub indexer_query_norm: Vec<u16>,
@@ -1058,10 +1430,20 @@ pub struct Qwen38FlashNextQsaMoeLayerImmutable {
 fn launch_route(
     stream: &CudaStream,
     rows: usize,
+    route: Qwen38FlashNextQsaRoute,
     ops: Ops<'_>,
     pointers: Pointers,
 ) -> GpuResult<()> {
-    // SAFETY: two arenas own aligned, disjoint 1,024-row working planes, a 264-page cache
+    // A decode round carries its raw indexer key in the sequence's ring so the block it belongs
+    // to can close a later round; a prompt tile closes every block it writes inside this round
+    // and keeps its raw keys round-locally.
+    let raw_keys = if rows <= MAX_BATCH {
+        pointers.indexer_ring
+    } else {
+        pointers.indexer_raw_round
+    };
+
+    // SAFETY: two arenas own aligned, disjoint 1,024-row working planes, a 512-page cache
     // addressed off one block table, and one sealed slot pool. Every leaf in the composition
     // selects the same exact row count.
     unsafe {
@@ -1086,6 +1468,47 @@ fn launch_route(
             pointers.qkv_weight,
             pointers.qkv,
         )?;
+
+        // --- the indexer, on every round: the block-key plane is built incrementally and the
+        // raw keys it pools do not survive their own block ---
+        ops.indexer_qk.launch(
+            stream,
+            rows,
+            pointers.hc_mixed.cast_const(),
+            pointers.indexer_qk_weight,
+            pointers.indexer_qk,
+        )?;
+        ops.indexer.launch_prepare(
+            stream,
+            rows,
+            IndexerPrepareArgs {
+                indexer_qk: pointers.indexer_qk.cast_const(),
+                query_norm: pointers.indexer_query_norm,
+                rope_cos: pointers.rope_cos,
+                rope_sin: pointers.rope_sin,
+                table_rows: pointers.table_rows,
+                cache_positions: pointers.cache_positions,
+                query: pointers.indexer_query,
+                raw_keys,
+            },
+        )?;
+        ops.indexer.launch_compress(
+            stream,
+            rows,
+            IndexerCompressArgs {
+                raw_keys: raw_keys.cast_const(),
+                key_norm: pointers.indexer_key_norm,
+                block_rope_cos: pointers.block_rope_cos,
+                block_rope_sin: pointers.block_rope_sin,
+                block_tables: pointers.block_tables,
+                table_rows: pointers.table_rows,
+                table_stride: QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE as u32,
+                first_blocks: pointers.closing_first_blocks,
+                block_counts: pointers.closing_block_counts,
+                block_keys: pointers.block_keys,
+            },
+        )?;
+
         ops.prepare.launch(
             stream,
             rows,
@@ -1104,20 +1527,78 @@ fn launch_route(
             KEY_CACHE_SCALE,
             VALUE_CACHE_SCALE,
         )?;
-        ops.attention.launch(
-            stream,
-            rows,
-            pointers.query.cast_const(),
-            pointers.key_pages.cast_const(),
-            pointers.value_pages.cast_const(),
-            pointers.block_tables,
-            pointers.table_rows,
-            QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE,
-            pointers.lengths,
-            pointers.attention,
-            KEY_CACHE_SCALE,
-            VALUE_CACHE_SCALE,
-        )?;
+        match route {
+            Qwen38FlashNextQsaRoute::Dense => ops.attention.launch(
+                stream,
+                rows,
+                pointers.query.cast_const(),
+                pointers.key_pages.cast_const(),
+                pointers.value_pages.cast_const(),
+                pointers.block_tables,
+                pointers.table_rows,
+                QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE,
+                pointers.lengths,
+                pointers.attention,
+                KEY_CACHE_SCALE,
+                VALUE_CACHE_SCALE,
+            )?,
+            Qwen38FlashNextQsaRoute::Selected => {
+                // The selection entry owns one row tile per launch, so a prompt tile wider than
+                // the tile walks it in fixed strides. The candidate grid is this owner's own
+                // capacity rather than the round's count: a captured graph cannot resolve a
+                // bucket it will only learn at replay.
+                //
+                // Every tile names the same scratch plane. That is sound because this loop runs
+                // inside one stream capture, so the tiles are a dependency chain at replay and
+                // never concurrent readers of it; see the layout module's note.
+                let tile = if rows <= MAX_BATCH {
+                    rows
+                } else {
+                    SELECTION_ROW_TILE
+                };
+                let mut offset = 0usize;
+                while offset < rows {
+                    ops.selection.launch(
+                        stream,
+                        tile.min(rows - offset),
+                        offset,
+                        QWEN38_FLASH_NEXT_QSA_CANDIDATE_BLOCKS,
+                        IndexerSelectionArgs {
+                            query: pointers.indexer_query.cast_const(),
+                            block_keys: pointers.block_keys.cast_const(),
+                            block_tables: pointers.block_tables,
+                            table_rows: pointers.table_rows,
+                            table_stride: QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE as u32,
+                            visible_lengths: pointers.lengths,
+                            block_counts: pointers.candidate_blocks,
+                            scores: pointers.scores,
+                            score_stride: QWEN38_FLASH_NEXT_QSA_SCORE_STRIDE as u32,
+                            selected: pointers.selected,
+                            selected_counts: pointers.selected_counts,
+                            scratch: pointers.select_scratch,
+                        },
+                    )?;
+                    offset += tile.min(rows - offset);
+                }
+                ops.selected_attention.launch(
+                    stream,
+                    rows,
+                    SelectedAttentionArgs {
+                        query: pointers.query.cast_const(),
+                        key_pages: pointers.key_pages.cast_const(),
+                        value_pages: pointers.value_pages.cast_const(),
+                        block_tables: pointers.block_tables,
+                        table_rows: pointers.table_rows,
+                        table_stride: QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE as u32,
+                        selected: pointers.selected.cast_const(),
+                        selected_counts: pointers.selected_counts.cast_const(),
+                        output: pointers.attention,
+                        key_scale: KEY_CACHE_SCALE,
+                        value_scale: VALUE_CACHE_SCALE,
+                    },
+                )?;
+            }
+        }
         ops.gate.launch(
             stream,
             rows,

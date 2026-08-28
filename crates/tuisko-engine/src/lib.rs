@@ -139,8 +139,10 @@ pub use qwen38_flash_next::gdn_moe_layer::{
 pub use qwen38_flash_next::gdn_moe_layer_layout::Qwen38FlashNextGdnMoeLayerLayout;
 pub use qwen38_flash_next::layer_route::{
     QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING, QWEN38_FLASH_NEXT_MAX_ROWS,
-    QWEN38_FLASH_NEXT_PREFILL_ROWS, Qwen38FlashNextRowRoute, qwen38_flash_next_row_route,
-    require_qwen38_flash_next_dense_qsa_round, require_qwen38_flash_next_dense_qsa_visible,
+    QWEN38_FLASH_NEXT_PREFILL_ROWS, QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING, Qwen38FlashNextQsaRoute,
+    Qwen38FlashNextRowRoute, qwen38_flash_next_qsa_round_route, qwen38_flash_next_qsa_route,
+    qwen38_flash_next_row_route, require_qwen38_flash_next_dense_qsa_round,
+    require_qwen38_flash_next_dense_qsa_visible,
 };
 #[cfg(feature = "qualification")]
 pub use qwen38_flash_next::mtp_generation::Qwen38FlashNextMtpQualificationRun;
@@ -167,6 +169,7 @@ pub use qwen38_flash_next::qsa_moe_layer::{
 };
 pub use qwen38_flash_next::qsa_moe_layer::{
     Qwen38FlashNextQsaMoeLayerProgram, Qwen38FlashNextQsaRound,
+    qwen38_flash_next_qsa_block_rotary_rows,
 };
 pub use qwen38_flash_next::qsa_moe_layer_layout::Qwen38FlashNextQsaMoeLayerLayout;
 pub use qwen38_flash_next::resident_model::{

@@ -1,8 +1,8 @@
-//! Source-backed qualification for the Qwen3.8-Flash-Next QSA/MoE layer.
+//! Source-backed qualification for one composed Qwen3.8-Flash-Next QSA plus MoE decoder layer.
 //!
-//! The `B=1` oracle uses one visible key, making softmax exactly one while still covering cache
-//! round-trip and full layer composition. Every route checks eager/replay agreement and the
-//! suite proves over-ceiling requests are refused before launch.
+//! The one-key oracle makes softmax exactly 1.0 and checks the composition from checkpoint words.
+//! Boundary cases prove dense/selected bit identity at 2,051 keys and the first dropped block at
+//! 2,052 keys. Longer requests must remain within owner and checkpoint capacity.
 
 use crate::device_benchmark::{self, DeviceBenchmarkError};
 use crate::fp8_projection_oracle::{BF16_SENTINEL, BYTE_SENTINEL, bf16_to_f32, f32_to_bf16};
@@ -16,7 +16,8 @@ use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
     EngineError, MAX_BATCH, Qwen38FlashNextQsaMoeLayerObservables,
-    Qwen38FlashNextQsaMoeLayerProgram, Qwen38FlashNextQsaRound,
+    Qwen38FlashNextQsaMoeLayerProgram, Qwen38FlashNextQsaRound, Qwen38FlashNextQsaRoute,
+    qwen38_flash_next_qsa_block_rotary_rows,
 };
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, device_memory_info};
 use tuisko_model::{
@@ -30,15 +31,14 @@ type A = Qwen38FlashNext;
 const MAX_ROWS: usize = 1_024;
 const EXACT_ROUTES: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, MAX_BATCH, 32, 64, 128, MAX_ROWS];
 const WIDTH: usize = A::HC_WIDTH;
-const QKV_ROWS: usize = A::ATTENTION_QKV_ROWS;
-const OUTPUT_COLUMNS: usize = A::ATTENTION_OUTPUT_COLUMNS;
-const HEAD_DIM: usize = <A as Arch>::HEAD_DIM;
-const QUERY_HEADS: usize = <A as Arch>::NUM_ATTENTION_HEADS;
-const KV_HEADS: usize = <A as Arch>::NUM_KV_HEADS;
-const QUERY_ROWS: usize = A::ATTENTION_QUERY_ROWS;
+pub(crate) const QKV_ROWS: usize = A::ATTENTION_QKV_ROWS;
+pub(crate) const OUTPUT_COLUMNS: usize = A::ATTENTION_OUTPUT_COLUMNS;
+pub(crate) const HEAD_DIM: usize = <A as Arch>::HEAD_DIM;
+pub(crate) const QUERY_HEADS: usize = <A as Arch>::NUM_ATTENTION_HEADS;
+pub(crate) const KV_HEADS: usize = <A as Arch>::NUM_KV_HEADS;
+pub(crate) const QUERY_ROWS: usize = A::ATTENTION_QUERY_ROWS;
 const ROTARY_ELEMENTS: usize = 32;
-type RoundInputs = (Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>);
-const VALUE_CACHE_SCALE: f32 = 0.062_5;
+pub(crate) const VALUE_CACHE_SCALE: f32 = 0.062_5;
 
 /// Failure of the complete source-backed Qwen3.8-Flash-Next QSA/MoE layer gate.
 #[derive(Debug, thiserror::Error)]
@@ -77,10 +77,12 @@ pub struct Qwen38FlashNextQsaMoeLayerQualification {
     pub inactive_values: usize,
     /// Runtime-owned graph-input values proved unchanged.
     pub runtime_input_values: usize,
-    /// Rounds refused because they left the proven dense band.
+    /// Rounds refused because they left this owner's mapping or the position ceiling.
     pub refused_rounds: usize,
-    /// Reserved indexer cache bytes proved still unwritten.
-    pub unwritten_indexer_bytes: usize,
+    /// Attention values proved bit-identical across the two routes at the sharp boundary.
+    pub route_switch_values: usize,
+    /// Selected positions compared entry for entry at and past the boundary.
+    pub selected_values: usize,
     /// Complete layer allocation bytes.
     pub arena_bytes: usize,
     /// Exact source-backed device weight bytes.
@@ -120,7 +122,8 @@ pub fn qualify_qwen38_flash_next_qsa_moe_layer(
         inactive_values: 0,
         runtime_input_values: 0,
         refused_rounds: 0,
-        unwritten_indexer_bytes: 0,
+        route_switch_values: 0,
+        selected_values: 0,
         arena_bytes: program.arena_bytes(),
         weight_bytes: program.resident_weight_bytes(),
         cache_bytes: program.cache_bytes(),
@@ -128,18 +131,21 @@ pub fn qualify_qwen38_flash_next_qsa_moe_layer(
         maximum_absolute_error: 0.0,
     };
 
-    verify_dense_band_refusal(&program, &stream, &mut report)?;
+    verify_route_classification(&program, &stream, &mut report)?;
+    verify_route_switch_continuity(&program, &stream, &mut report)?;
+    verify_first_dropped_block(&program, &stream, &mut report)?;
+    verify_selective_replay_agreement(&program, &stream, &mut report)?;
 
     for rows in EXACT_ROUTES {
         let first_input = make_stream(rows, 0);
-        prepare_run(&program, &stream, rows, &first_input)?;
-        program.launch_eager(&stream, rows)?;
+        let route = prepare_run(&program, &stream, rows, &first_input)?;
+        program.launch_eager(&stream, rows, route)?;
         let first = program.qualification_observables(&stream)?;
 
         let input = make_stream(rows, 1);
         prepare_run(&program, &stream, rows, &input)?;
         let before = program.qualification_runtime_inputs(&stream)?;
-        program.replay(&stream, rows)?;
+        program.replay(&stream, rows, route)?;
         let replay = program.qualification_observables(&stream)?;
         report.runtime_input_values += verify_runtime_inputs_unchanged(
             &before,
@@ -147,13 +153,12 @@ pub fn qualify_qwen38_flash_next_qsa_moe_layer(
         )?;
 
         prepare_run(&program, &stream, rows, &input)?;
-        program.launch_eager(&stream, rows)?;
+        program.launch_eager(&stream, rows, route)?;
         let eager = program.qualification_observables(&stream)?;
 
         verify_replay(&eager, &replay, &mut report)?;
         verify_replacement_input(rows, &first, &replay)?;
         verify_inactive(rows, &replay, &mut report)?;
-        verify_indexer_plane_unwritten(&replay, &mut report)?;
 
         if rows == 1 {
             verify_layer_oracle(
@@ -211,14 +216,17 @@ fn make_stream(rows: usize, salt: usize) -> Vec<u16> {
         .collect()
 }
 
-/// Every row of a round appends at its own position and attends over exactly its own key.
-///
-/// One key per row keeps the softmax exact, so the attention arm's oracle is the represented
-/// value rather than a reimplemented reduction.
-fn round_for(rows: usize) -> RoundInputs {
-    let table_rows = (0..rows).map(|row| (row % MAX_BATCH) as u32).collect();
-    let cache_positions = vec![0u32; rows];
-    let lengths = vec![1u32; rows];
+/// Production metadata for an exact decode batch or causal prompt tile.
+fn round_for(rows: usize) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>) {
+    let (table_rows, cache_positions) = if rows <= MAX_BATCH {
+        ((0..rows as u32).collect(), vec![0u32; rows])
+    } else {
+        (vec![0; rows], (0..rows as u32).collect())
+    };
+    let lengths = cache_positions
+        .iter()
+        .map(|&position| position + 1)
+        .collect();
     // Position zero: cos is one and sin is zero, so the rotation is the identity and the
     // oracle does not have to reproduce MRoPE to check the composition around it.
     let rope_cos = vec![1.0f32; rows * ROTARY_ELEMENTS];
@@ -227,16 +235,24 @@ fn round_for(rows: usize) -> RoundInputs {
     (table_rows, cache_positions, lengths, rope_cos, rope_sin)
 }
 
+/// The identity rotary rows one round's block compression indexes.
+fn block_rotary_for(rows: usize) -> (Vec<f32>, Vec<f32>) {
+    let values = qwen38_flash_next_qsa_block_rotary_rows(rows) * ROTARY_ELEMENTS;
+
+    (vec![1.0f32; values], vec![0.0f32; values])
+}
+
 fn prepare_run(
     program: &Qwen38FlashNextQsaMoeLayerProgram,
     stream: &CudaStream,
     rows: usize,
     input: &[u16],
-) -> QualResult<()> {
+) -> QualResult<Qwen38FlashNextQsaRoute> {
     let (table_rows, cache_positions, lengths, rope_cos, rope_sin) = round_for(rows);
+    let (block_rope_cos, block_rope_sin) = block_rotary_for(rows);
     program.reset_cache(stream)?;
     program.load_residual(stream, rows, input)?;
-    program.load_round(
+    let route = program.load_round(
         stream,
         rows,
         Qwen38FlashNextQsaRound {
@@ -245,52 +261,227 @@ fn prepare_run(
             lengths: &lengths,
             rope_cos: &rope_cos,
             rope_sin: &rope_sin,
+            block_rope_cos: &block_rope_cos,
+            block_rope_sin: &block_rope_sin,
         },
     )?;
     program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
 
-    Ok(())
+    Ok(route)
 }
 
-/// A round outside the proven dense band must be refused, not truncated and not run dense.
-fn verify_dense_band_refusal(
+/// One decode row of one sequence at an exact visible length.
+fn boundary_round(
     program: &Qwen38FlashNextQsaMoeLayerProgram,
     stream: &CudaStream,
-    report: &mut Qwen38FlashNextQsaMoeLayerQualification,
-) -> QualResult<()> {
-    for length in [2_052u32, 4_096, 262_144] {
-        let round = Qwen38FlashNextQsaRound {
-            table_rows: &[0],
-            cache_positions: &[0],
-            lengths: &[length],
-            rope_cos: &[1.0; ROTARY_ELEMENTS],
-            rope_sin: &[0.0; ROTARY_ELEMENTS],
-        };
-        let Err(error) = program.load_round(stream, 1, round) else {
-            return Err(mismatch(format!(
-                "a round asking for {length} visible keys was admitted"
-            )));
-        };
-        let message = error.to_string();
-        if !message.contains("2051") || !message.contains("refused rather than truncated") {
-            return Err(mismatch(format!(
-                "the refusal for {length} does not name the ceiling and its reason: {message}"
-            )));
-        }
-        report.refused_rounds += 1;
-    }
-    // And the boundary itself is admitted, so the refusal is a ceiling and not a blanket.
-    program.load_round(
+    visible: u32,
+) -> QualResult<Qwen38FlashNextQsaRoute> {
+    let (block_rope_cos, block_rope_sin) = block_rotary_for(1);
+
+    Ok(program.load_round(
         stream,
         1,
         Qwen38FlashNextQsaRound {
             table_rows: &[0],
-            cache_positions: &[0],
-            lengths: &[2_051],
+            cache_positions: &[visible - 1],
+            lengths: &[visible],
             rope_cos: &[1.0; ROTARY_ELEMENTS],
             rope_sin: &[0.0; ROTARY_ELEMENTS],
+            block_rope_cos: &block_rope_cos,
+            block_rope_sin: &block_rope_sin,
         },
-    )?;
+    )?)
+}
+
+/// Checks eager/graph agreement for selected decode and a prompt straddling the route boundary.
+fn verify_selective_replay_agreement(
+    program: &Qwen38FlashNextQsaMoeLayerProgram,
+    stream: &CudaStream,
+    report: &mut Qwen38FlashNextQsaMoeLayerQualification,
+) -> QualResult<()> {
+    for (rows, base) in [(1usize, 2_599u32), (32, 2_048)] {
+        let input = make_stream(rows, 4);
+        let table_rows = vec![0u32; rows];
+        let cache_positions = (0..rows as u32).map(|row| base + row).collect::<Vec<_>>();
+        let lengths = cache_positions
+            .iter()
+            .map(|&position| position + 1)
+            .collect::<Vec<_>>();
+        let (block_rope_cos, block_rope_sin) = block_rotary_for(rows);
+        let round = Qwen38FlashNextQsaRound {
+            table_rows: &table_rows,
+            cache_positions: &cache_positions,
+            lengths: &lengths,
+            rope_cos: &vec![1.0; rows * ROTARY_ELEMENTS],
+            rope_sin: &vec![0.0; rows * ROTARY_ELEMENTS],
+            block_rope_cos: &block_rope_cos,
+            block_rope_sin: &block_rope_sin,
+        };
+
+        let mut observed = Vec::with_capacity(2);
+        for captured in [false, true] {
+            program.reset_cache(stream)?;
+            program.load_residual(stream, rows, &input)?;
+            let route = program.load_round(stream, rows, round)?;
+            if route != Qwen38FlashNextQsaRoute::Selected {
+                return Err(mismatch(format!(
+                    "a {rows}-row round from position {base} classified as {route:?}; this check \
+                     exists to compare the selection route and would compare nothing"
+                )));
+            }
+            program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+            if captured {
+                program.replay(stream, rows, route)?;
+            } else {
+                program.launch_eager(stream, rows, route)?;
+            }
+            observed.push(program.qualification_observables(stream)?);
+        }
+
+        verify_replay(&observed[0], &observed[1], report)?;
+    }
+
+    Ok(())
+}
+
+/// The route boundary classifies rather than refuses, and what is still refused is checked.
+fn verify_route_classification(
+    program: &Qwen38FlashNextQsaMoeLayerProgram,
+    stream: &CudaStream,
+    report: &mut Qwen38FlashNextQsaMoeLayerQualification,
+) -> QualResult<()> {
+    // At and below 2,051 the dense route is the reference's own function; above it only the
+    // selection is, and this owner's pool reaches 4,096 so both bands are drivable.
+    for (visible, expected) in [
+        (1u32, Qwen38FlashNextQsaRoute::Dense),
+        (2_051, Qwen38FlashNextQsaRoute::Dense),
+        (2_052, Qwen38FlashNextQsaRoute::Selected),
+        (4_096, Qwen38FlashNextQsaRoute::Selected),
+    ] {
+        let route = boundary_round(program, stream, visible)?;
+        if route != expected {
+            return Err(mismatch(format!(
+                "a round of {visible} visible keys classified as {route:?}, expected {expected:?}"
+            )));
+        }
+    }
+
+    // Past this owner's own mapping, and past the checkpoint's position ceiling: both refuse,
+    // and neither truncates.
+    for (visible, needle) in [
+        (4_097u32, "page capacity"),
+        (262_145, "refused rather than truncated"),
+    ] {
+        let Err(error) = boundary_round(program, stream, visible) else {
+            return Err(mismatch(format!(
+                "a round asking for {visible} visible keys was admitted"
+            )));
+        };
+        let message = error.to_string();
+        if !message.contains(needle) {
+            return Err(mismatch(format!(
+                "the refusal for {visible} does not say why: {message}"
+            )));
+        }
+        report.refused_rounds += 1;
+    }
+
+    Ok(())
+}
+
+/// Proves dense and selected routes publish identical bits at 2,051 visible keys.
+fn verify_route_switch_continuity(
+    program: &Qwen38FlashNextQsaMoeLayerProgram,
+    stream: &CudaStream,
+    report: &mut Qwen38FlashNextQsaMoeLayerQualification,
+) -> QualResult<()> {
+    let input = make_stream(1, 2);
+    let mut published: Option<Vec<f32>> = None;
+    for route in [
+        Qwen38FlashNextQsaRoute::Dense,
+        Qwen38FlashNextQsaRoute::Selected,
+    ] {
+        program.reset_cache(stream)?;
+        program.load_residual(stream, 1, &input)?;
+        boundary_round(program, stream, 2_051)?;
+        program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+        program.replay(stream, 1, route)?;
+        let observed = program.qualification_observables(stream)?;
+
+        if route == Qwen38FlashNextQsaRoute::Selected {
+            // The selection at the boundary is the whole visible list, ascending.
+            if observed.selected_counts[0] != 2_051 {
+                return Err(mismatch(format!(
+                    "the selection at 2,051 visible keys named {} positions, expected all of them",
+                    observed.selected_counts[0]
+                )));
+            }
+            for position in 0..2_051usize {
+                if observed.selected[position] != position as u32 {
+                    return Err(mismatch(format!(
+                        "the selection at 2,051 visible keys is not the identity at entry {position}"
+                    )));
+                }
+                report.selected_values += 1;
+            }
+        }
+        // The active row only: the reset fills the whole plane with one sentinel, so comparing
+        // the inactive tail would count 6,285,312 values neither route wrote.
+        let active = observed.attention[..OUTPUT_COLUMNS].to_vec();
+        match &published {
+            None => published = Some(active),
+            Some(dense) => {
+                for (index, (&ours, &theirs)) in dense.iter().zip(active.iter()).enumerate() {
+                    if ours.to_bits() != theirs.to_bits() {
+                        return Err(mismatch(format!(
+                            "the two routes disagree at 2,051 visible keys, attention value \
+                             {index}: dense {ours} against selected {theirs}"
+                        )));
+                    }
+                    report.route_switch_values += 1;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// One key past the boundary the indexer drops exactly one four-token block.
+///
+/// The sharpness of 2,051, observed at the composed layer: at 2,052 the candidate count reaches
+/// 513 against a 512-block budget, so the selection publishes 2,048 positions and not 2,052.
+fn verify_first_dropped_block(
+    program: &Qwen38FlashNextQsaMoeLayerProgram,
+    stream: &CudaStream,
+    report: &mut Qwen38FlashNextQsaMoeLayerQualification,
+) -> QualResult<()> {
+    let input = make_stream(1, 3);
+    program.reset_cache(stream)?;
+    program.load_residual(stream, 1, &input)?;
+    let route = boundary_round(program, stream, 2_052)?;
+    program.qualification_reset_outputs(stream, BYTE_SENTINEL)?;
+    program.replay(stream, 1, route)?;
+    let observed = program.qualification_observables(stream)?;
+
+    if observed.selected_counts[0] != 2_048 {
+        return Err(mismatch(format!(
+            "at 2,052 visible keys the selection named {} positions, expected 2,048: the budget \
+             times the compression ratio, with no tail because 2,052 is block-aligned",
+            observed.selected_counts[0]
+        )));
+    }
+    report.selected_values += observed.selected_counts[0] as usize;
+
+    // The compression published this round's closing block, so the block-key plane is no longer
+    // the zero plane a reserved-and-unwritten cache would still be.
+    if observed.block_keys.iter().all(|&value| value == 0) {
+        return Err(mismatch(
+            "the block-key plane is entirely zero after a round that closed a micro-block; the \
+             compression published nothing"
+                .to_string(),
+        ));
+    }
 
     Ok(())
 }
@@ -354,7 +545,12 @@ fn verify_replay(
     same!(attention_gated, "attention_gated");
     same!(key_pages, "key_pages");
     same!(value_pages, "value_pages");
-    same!(indexer_pages, "indexer_pages");
+    same!(block_keys, "block_keys");
+    same!(indexer_ring, "indexer_ring");
+    same!(indexer_qk, "indexer_qk");
+    same!(indexer_query, "indexer_query");
+    same!(selected, "selected");
+    same!(selected_counts, "selected_counts");
     same!(attention_residual, "attention_residual");
     same!(router_logits, "router_logits");
     same!(expert_indices, "expert_indices");
@@ -412,21 +608,6 @@ fn verify_inactive(
         }
     }
     report.inactive_values += checked;
-
-    Ok(())
-}
-
-/// The indexer key plane is reserved and must stay untouched while the dense route is admitted.
-fn verify_indexer_plane_unwritten(
-    observed: &Qwen38FlashNextQsaMoeLayerObservables,
-    report: &mut Qwen38FlashNextQsaMoeLayerQualification,
-) -> QualResult<()> {
-    if let Some(index) = observed.indexer_pages.iter().position(|&byte| byte != 0) {
-        return Err(mismatch(format!(
-            "the reserved indexer key plane was written at byte {index}"
-        )));
-    }
-    report.unwritten_indexer_bytes = observed.indexer_pages.len();
 
     Ok(())
 }
@@ -560,7 +741,9 @@ fn verify_layer_oracle(
     Ok(())
 }
 
-/// Computes gated QSA attention when exactly one key is visible.
+/// One-key gated attention in represented E4M3 cache precision.
+///
+/// Returns the in-place FP32 gate output; the published plane is its BF16 rounding.
 pub(crate) fn qsa_attention_oracle(qkv: &[u16]) -> Vec<f32> {
     let attended = (0..OUTPUT_COLUMNS)
         .map(|index| {
@@ -592,8 +775,8 @@ fn observed_input(
     Ok(program.qualification_runtime_inputs(stream)?.residual_input)
 }
 
-/// Decodes signed cache data through the unsigned E4M3 scale decoder.
-fn decode_signed_e4m3(code: u8) -> f32 {
+/// Decodes signed cache E4M3 with the unsigned scale decoder.
+pub(crate) fn decode_signed_e4m3(code: u8) -> f32 {
     let magnitude = decode_e4m3(code & 0x7f);
 
     if code & 0x80 == 0 {
@@ -604,7 +787,7 @@ fn decode_signed_e4m3(code: u8) -> f32 {
 }
 
 /// One value's round trip through the represented E4M3 cache plane.
-fn represent_e4m3(value: f32, scale: f32) -> f32 {
+pub(crate) fn represent_e4m3(value: f32, scale: f32) -> f32 {
     let scaled = value / scale;
     let mut best = 0u8;
     let mut best_error = f32::INFINITY;
@@ -623,11 +806,11 @@ fn represent_e4m3(value: f32, scale: f32) -> f32 {
     decode_signed_e4m3(best) * scale
 }
 
-fn logistic(value: f32) -> f32 {
+pub(crate) fn logistic(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
 }
 
-fn bf16_words(bytes: &[u8]) -> QualResult<Vec<u16>> {
+pub(crate) fn bf16_words(bytes: &[u8]) -> QualResult<Vec<u16>> {
     let (words, remainder) = bytes.as_chunks::<2>();
     if !remainder.is_empty() {
         return Err(mismatch(
@@ -701,14 +884,14 @@ fn verify_no_device_allocation(
     // scratch lazily, and a counter taken too early reads that release as drift.
     for _ in 0..3 {
         for rows in EXACT_ROUTES {
-            program.replay(stream, rows)?;
+            program.replay(stream, rows, Qwen38FlashNextQsaRoute::Dense)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
     for _ in 0..2 {
         for rows in EXACT_ROUTES.iter().rev() {
-            program.replay(stream, *rows)?;
+            program.replay(stream, *rows, Qwen38FlashNextQsaRoute::Selected)?;
         }
     }
     stream.synchronize().map_err(GpuError::from)?;
@@ -773,10 +956,12 @@ mod tests {
         let report = qualify_qwen38_flash_next_qsa_moe_layer(std::path::Path::new(&root), 3)?;
 
         assert_eq!(report.weight_bytes, 141_775_360);
-        assert_eq!(report.cache_bytes, 21_626_880);
-        assert_eq!(report.workspace_bytes, 258_669_600);
-        assert_eq!(report.refused_rounds, 3);
-        assert_eq!(report.unwritten_indexer_bytes, 4_325_376);
+        assert_eq!(report.cache_bytes, 35_659_776);
+        // Activations and metadata plus one caller-funded selection scratch plane.
+        assert_eq!(report.workspace_bytes, 272_963_904);
+        assert_eq!(report.refused_rounds, 2);
+        assert_eq!(report.route_switch_values, 6_144);
+        assert_eq!(report.selected_values, 4_099);
         assert!(report.oracle_values > 0);
         assert!(report.graph_replay_values > 0);
         assert!(report.inactive_values > 0);

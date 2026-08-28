@@ -1,7 +1,7 @@
-//! Exact row admission and the dense-QSA visible-length ceiling.
+//! Exact row admission and QSA route selection.
 //!
 //! Composed layers admit only `B=1..8` and `T=32/64/128/1024`. Dense QSA matches selected
-//! attention through 2,051 visible keys; larger requests are refused rather than truncated.
+//! attention through 2,051 visible keys; longer requests take the selected route.
 
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use tuisko_model::Qwen38FlashNext;
@@ -21,7 +21,11 @@ pub const QWEN38_FLASH_NEXT_MAX_ROWS: usize = 1_024;
 pub const QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING: usize =
     Qwen38FlashNext::INDEXER_BUDGET + Qwen38FlashNext::INDEXER_COMPRESS_RATIO - 1;
 
+/// Largest visible key count any QSA route serves.
+pub const QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING: usize = Qwen38FlashNext::MAX_POSITION_EMBEDDINGS;
+
 const _: () = assert!(QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING == 2_051);
+const _: () = assert!(QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING == 262_144);
 
 /// Which admitted graph a row count selects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,61 +96,97 @@ pub fn qwen38_flash_next_causal_route(rows: usize) -> EngineResult<Qwen38FlashNe
     )))
 }
 
-/// Admits one QSA layer request, refusing any visible length dense attention cannot answer.
-///
-/// `visible` is the total count of keys the *last* query in this round may attend: prompt plus
-/// everything already generated, including the token being produced. A round is admitted only if
-/// its widest query stays inside the proven band, because the mask is shared by every query in
-/// the round.
-///
-/// This refuses; it never truncates. The message names the ceiling and the offending length so a
-/// caller can surface a real limit rather than a mysterious short answer.
-pub fn require_qwen38_flash_next_dense_qsa_visible(visible: usize) -> EngineResult<()> {
+/// Attention route that computes the reference function at a visible length.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Qwen38FlashNextQsaRoute {
+    /// Plain causal GQA inside the identity-selection band.
+    Dense,
+    /// Block selection followed by gathered attention.
+    Selected,
+}
+
+impl Qwen38FlashNextQsaRoute {
+    /// Whether the route runs selection and gathered attention.
+    pub const fn selective(self) -> bool {
+        matches!(self, Self::Selected)
+    }
+
+    /// Widens a shared batch route if either input needs selection.
+    pub const fn widen(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Dense, Self::Dense) => Self::Dense,
+            _ => Self::Selected,
+        }
+    }
+}
+
+/// Classifies one QSA layer request by visible key count.
+pub fn qwen38_flash_next_qsa_route(visible: usize) -> EngineResult<Qwen38FlashNextQsaRoute> {
     if visible == 0 {
         return Err(EngineError::route(
             "Qwen3.8-Flash-Next QSA visible length must include at least the current token",
         ));
     }
-    if visible > QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING {
+    if visible > QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING {
         return Err(EngineError::route(format!(
-            "Qwen3.8-Flash-Next QSA visible length {visible} exceeds the dense-equivalent ceiling \
-             {QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING}; above it the reference's indexer drops at \
-             least one four-token block, so a dense route is not numerically admissible and the \
-             request is refused rather than truncated or silently run dense"
+            "Qwen3.8-Flash-Next QSA visible length {visible} exceeds the checkpoint's \
+             {QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING}-position ceiling and is refused rather than \
+             truncated"
         )));
     }
+    if visible > QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING {
+        return Ok(Qwen38FlashNextQsaRoute::Selected);
+    }
 
-    Ok(())
+    Ok(Qwen38FlashNextQsaRoute::Dense)
 }
 
-/// Admits a whole QSA prefill tile by its last query's visible length.
-///
-/// A tile of `rows` tokens ending at absolute position `last_position` (zero-based) makes its
-/// final query see `last_position + 1` keys. Callers hold positions, not visible counts, so this
-/// converts once and keeps the arithmetic in one place.
-pub fn require_qwen38_flash_next_dense_qsa_round(
+/// Classifies a whole QSA tile by its last query's visible length.
+pub fn qwen38_flash_next_qsa_round_route(
     rows: usize,
     last_position: usize,
-) -> EngineResult<()> {
-    let route = qwen38_flash_next_row_route(rows)?;
+) -> EngineResult<Qwen38FlashNextQsaRoute> {
+    qwen38_flash_next_row_route(rows)?;
     let visible = last_position.checked_add(1).ok_or_else(|| {
         EngineError::route(
             "Qwen3.8-Flash-Next QSA position overflows its visible-length conversion",
         )
     })?;
-    require_qwen38_flash_next_dense_qsa_visible(visible)?;
-    let _ = route;
 
-    Ok(())
+    qwen38_flash_next_qsa_route(visible)
+}
+
+/// Admits a dense-only owner while selection wiring remains outside its scope.
+pub fn require_qwen38_flash_next_dense_qsa_visible(visible: usize) -> EngineResult<()> {
+    match qwen38_flash_next_qsa_route(visible)? {
+        Qwen38FlashNextQsaRoute::Dense => Ok(()),
+        Qwen38FlashNextQsaRoute::Selected => Err(EngineError::route(format!(
+            "Qwen3.8-Flash-Next QSA visible length {visible} requires the selected route"
+        ))),
+    }
+}
+
+/// Admits one dense-only tile by its last query position.
+pub fn require_qwen38_flash_next_dense_qsa_round(
+    rows: usize,
+    last_position: usize,
+) -> EngineResult<()> {
+    match qwen38_flash_next_qsa_round_route(rows, last_position)? {
+        Qwen38FlashNextQsaRoute::Dense => Ok(()),
+        Qwen38FlashNextQsaRoute::Selected => Err(EngineError::route(format!(
+            "Qwen3.8-Flash-Next QSA position {last_position} requires the selected route"
+        ))),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         QWEN38_FLASH_NEXT_CAUSAL_ROWS, QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING,
-        QWEN38_FLASH_NEXT_MAX_ROWS, QWEN38_FLASH_NEXT_PREFILL_ROWS, Qwen38FlashNextRowRoute,
-        qwen38_flash_next_causal_route, qwen38_flash_next_row_route,
-        require_qwen38_flash_next_dense_qsa_round, require_qwen38_flash_next_dense_qsa_visible,
+        QWEN38_FLASH_NEXT_MAX_ROWS, QWEN38_FLASH_NEXT_PREFILL_ROWS,
+        QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING, Qwen38FlashNextQsaRoute, Qwen38FlashNextRowRoute,
+        qwen38_flash_next_causal_route, qwen38_flash_next_qsa_round_route,
+        qwen38_flash_next_qsa_route, qwen38_flash_next_row_route,
     };
     use crate::{EngineErrorCode, MAX_BATCH};
 
@@ -210,42 +250,66 @@ mod tests {
     fn the_dense_ceiling_is_sharp_at_2051() {
         assert_eq!(QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING, 2_051);
 
-        // Every visible count the proof covers is admitted, including the exact boundary.
+        // The identity band stays dense, including the exact boundary.
         for visible in [1, 4, 2_048, 2_050, 2_051] {
-            require_qwen38_flash_next_dense_qsa_visible(visible).unwrap();
+            assert_eq!(
+                qwen38_flash_next_qsa_route(visible).unwrap(),
+                Qwen38FlashNextQsaRoute::Dense
+            );
         }
-        // 2,052 is where n_blocks reaches 513 against a 512 budget.
+        // Selection starts when 513 blocks exceed the 512-block budget.
         for visible in [2_052, 2_053, 4_096, 262_144] {
-            let error = require_qwen38_flash_next_dense_qsa_visible(visible).unwrap_err();
-            assert_eq!(error.code(), Some(EngineErrorCode::Route));
+            assert_eq!(
+                qwen38_flash_next_qsa_route(visible).unwrap(),
+                Qwen38FlashNextQsaRoute::Selected
+            );
         }
     }
 
     #[test]
-    fn a_refused_length_is_never_silently_truncated() {
-        let error = require_qwen38_flash_next_dense_qsa_visible(2_052).unwrap_err();
+    fn the_position_ceiling_is_refused_without_truncation() {
+        assert_eq!(QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING, 262_144);
+        let error =
+            qwen38_flash_next_qsa_route(QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING + 1).unwrap_err();
         let message = error.to_string();
 
-        // The refusal names both numbers and says what it refuses to do instead.
-        assert!(message.contains("2052"));
-        assert!(message.contains("2051"));
+        assert_eq!(error.code(), Some(EngineErrorCode::Route));
+        assert!(message.contains("262145"));
+        assert!(message.contains("262144"));
         assert!(message.contains("refused rather than truncated"));
     }
 
     #[test]
     fn a_zero_length_round_is_refused() {
-        let error = require_qwen38_flash_next_dense_qsa_visible(0).unwrap_err();
+        let error = qwen38_flash_next_qsa_route(0).unwrap_err();
         assert_eq!(error.code(), Some(EngineErrorCode::Route));
     }
 
     #[test]
-    fn a_round_is_admitted_by_its_widest_query() {
-        // A T=1024 tile whose last token sits at position 2,050 sees 2,051 keys: admitted.
-        require_qwen38_flash_next_dense_qsa_round(1_024, 2_050).unwrap();
-        // One token later the same tile would need selection.
-        assert!(require_qwen38_flash_next_dense_qsa_round(1_024, 2_051).is_err());
-        // The row count is admitted first, so an unadmitted width fails on its own terms.
-        let error = require_qwen38_flash_next_dense_qsa_round(1_000, 0).unwrap_err();
+    fn a_round_takes_the_route_its_widest_query_needs() {
+        assert_eq!(
+            qwen38_flash_next_qsa_round_route(1_024, 2_050).unwrap(),
+            Qwen38FlashNextQsaRoute::Dense
+        );
+        assert_eq!(
+            qwen38_flash_next_qsa_round_route(1_024, 2_051).unwrap(),
+            Qwen38FlashNextQsaRoute::Selected
+        );
+        let error = qwen38_flash_next_qsa_round_route(1_000, 0).unwrap_err();
         assert!(error.to_string().contains("not an admitted"));
+    }
+
+    #[test]
+    fn a_mixed_batch_widens_to_selection() {
+        let route = [1_usize, 2_051, 2_052, 64]
+            .into_iter()
+            .try_fold(Qwen38FlashNextQsaRoute::Dense, |widest, visible| {
+                qwen38_flash_next_qsa_route(visible).map(|route| widest.widen(route))
+            })
+            .unwrap();
+
+        assert_eq!(route, Qwen38FlashNextQsaRoute::Selected);
+        assert!(route.selective());
+        assert!(!Qwen38FlashNextQsaRoute::Dense.selective());
     }
 }
