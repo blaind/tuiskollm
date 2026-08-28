@@ -696,13 +696,17 @@ mod tests {
     #[test]
     fn compact_owner_byte_inventory_is_exact() {
         let layout = crate::Qwen38FlashNextResidentLayout::build().unwrap();
+        assert_eq!(layout.persistent_state_bytes() % MAX_BATCH, 0);
+        let restore_bank = layout.persistent_state_bytes() / MAX_BATCH;
         let stagers = crate::QWEN38_FLASH_NEXT_RESIDENT_MAX_ROWS
             * (Qwen38FlashNext::HIDDEN * size_of::<u16>()
                 + Qwen38FlashNext::NGRAM_HEADS * Qwen38FlashNext::NGRAM_HEAD_DIM)
-            + 2 * LOGIT_BANK_ROWS * Qwen38FlashNext::VOCAB * size_of::<u16>();
+            + 2 * LOGIT_BANK_ROWS * Qwen38FlashNext::VOCAB * size_of::<u16>()
+            + restore_bank;
 
         assert_eq!(layout.total_device_bytes().unwrap(), 30_675_307_776);
-        assert_eq!(stagers, 23_756_800);
+        assert_eq!(restore_bank, 115_642_368);
+        assert_eq!(stagers, 139_399_168);
     }
 
     #[test]

@@ -142,6 +142,11 @@ pub use qwen38_flash_next::layer_route::{
     QWEN38_FLASH_NEXT_PREFILL_ROWS, Qwen38FlashNextRowRoute, qwen38_flash_next_row_route,
     require_qwen38_flash_next_dense_qsa_round, require_qwen38_flash_next_dense_qsa_visible,
 };
+pub use qwen38_flash_next::mtp_generation::{
+    Qwen38FlashNextMtpAcceptance, Qwen38FlashNextMtpGenerationSession,
+    Qwen38FlashNextMtpRestorePoint, Qwen38FlashNextMtpRoundCost, Qwen38FlashNextMtpRoundState,
+    Qwen38FlashNextMtpTextGenerator,
+};
 pub use qwen38_flash_next::mtp_layout::{
     QWEN38_FLASH_NEXT_MTP_EXPERT_EXTENT_BYTES, QWEN38_FLASH_NEXT_MTP_EXPERT_ITEM_COUNT,
     QWEN38_FLASH_NEXT_MTP_EXPERT_RESIDENT_SLOTS, QWEN38_FLASH_NEXT_MTP_MAX_ROWS,

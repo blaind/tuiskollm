@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(report.engram_carry_checks, 36 + SLOTS + SLOTS + SLOTS);
         assert_eq!(report.stable_addresses, 3);
         assert_eq!(report.arena_bytes, 30_675_307_776);
-        assert_eq!(report.host_stager_bytes, 23_756_800);
+        assert_eq!(report.host_stager_bytes, 139_399_168);
         assert!(report.telemetry.at(SLOTS)?.rounds() > 0);
         Ok(())
     }
