@@ -273,6 +273,11 @@ mod qwen38_flash_next_gdn_recurrence;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_gdn_recurrence_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_generation;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_generation_benchmark;
+mod qwen38_flash_next_golden;
+#[cfg(feature = "device")]
 mod qwen38_flash_next_hyper_connection;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_hyper_connection_benchmark;
@@ -785,6 +790,24 @@ pub use qwen38_flash_next_gdn_recurrence::{
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_gdn_recurrence_benchmark::benchmark_qwen38_flash_next_gdn_recurrence;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_generation::{
+    Qwen38FlashNextBoundaryVerdict, Qwen38FlashNextCaptureVerdict,
+    Qwen38FlashNextGenerationQualification, Qwen38FlashNextGenerationQualificationError,
+    print_qwen38_flash_next_generation_report, qualify_qwen38_flash_next_generation,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_generation_benchmark::{
+    Qwen38FlashNextGenerationBenchmarkReport, Qwen38FlashNextGenerationRouteReport,
+    benchmark_qwen38_flash_next_generation, print_qwen38_flash_next_generation_benchmark,
+};
+pub use qwen38_flash_next_golden::{
+    QWEN38_FLASH_NEXT_GOLDEN_BOUNDARIES, QWEN38_FLASH_NEXT_GOLDEN_DIRECTORY,
+    QWEN38_FLASH_NEXT_GOLDEN_ENV, QWEN38_FLASH_NEXT_GOLDEN_PROMPTS, Qwen38FlashNextGoldenCapture,
+    Qwen38FlashNextGoldenError, Qwen38FlashNextGoldenMeta, Qwen38FlashNextGoldenStep,
+    load_qwen38_flash_next_golden_boundary, load_qwen38_flash_next_golden_capture,
+    load_qwen38_flash_next_golden_meta, qwen38_flash_next_golden_directory,
+};
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_hyper_connection::{
     Qwen38FlashNextHyperConnectionQualification, Qwen38FlashNextHyperConnectionQualificationError,

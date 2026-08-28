@@ -512,6 +512,7 @@ mod device {
             println!("  composition wall time    {composed:?}");
 
             model.reset_state(&stream)?;
+            model.reserve_slot(&stream, 0, 1)?;
             model.decode_step(&stream, &[token], &[0], &[0])?;
             let device = model.read_logits(&stream, 1)?.to_vec();
             if device.len() != oracle.logits.len() {

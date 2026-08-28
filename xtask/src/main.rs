@@ -35,6 +35,7 @@ const QWEN38_FLASH_NEXT_LM_HEAD_TEST_FILTER: &str = "qwen38_flash_next_lm_head";
 const QWEN38_FLASH_NEXT_GDN_LAYER_TEST_FILTER: &str = "qwen38_flash_next_gdn_moe_layer";
 const QWEN38_FLASH_NEXT_QSA_LAYER_TEST_FILTER: &str = "qwen38_flash_next_qsa_moe_layer";
 const QWEN38_FLASH_NEXT_RESIDENT_MODEL_TEST_FILTER: &str = "qwen38_flash_next_resident_model";
+const QWEN38_FLASH_NEXT_GENERATION_TEST_FILTER: &str = "qwen38_flash_next_generation";
 const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-residual-norm-sm120.txt";
 const QWEN35_RESIDUAL_NORM_TEST_FILTER: &str = "qwen35_residual_norm";
@@ -1289,6 +1290,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
         qualify_qwen38_flash_next_gdn_layer,
     ),
     forwarded(
+        "qualify-qwen38-flash-next-generation",
+        qualify_qwen38_flash_next_generation,
+    ),
+    forwarded(
         "qualify-qwen38-flash-next-qsa-layer",
         qualify_qwen38_flash_next_qsa_layer,
     ),
@@ -1449,6 +1454,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
     forwarded(
         "bench-qwen38-flash-next-gdn-layer",
         bench_qwen38_flash_next_gdn_layer,
+    ),
+    forwarded(
+        "bench-qwen38-flash-next-generation",
+        bench_qwen38_flash_next_generation,
     ),
     forwarded(
         "bench-qwen38-flash-next-qsa-layer",
@@ -1964,6 +1973,28 @@ fn build_startup_benchmark(root: &Path) -> Result<(), Box<dyn Error>> {
             "tuisko-qual",
             "--bin",
             "bench-startup",
+            "--release",
+        ],
+    )?;
+    gate_sm120_resources(root)
+}
+
+fn build_qwen38_flash_next_generation_benchmark(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_oxide(
+        root,
+        &[
+            "build",
+            "--arch",
+            "sm_120a",
+            "--cargo-target-dir",
+            CUDA_OXIDE_BUILD_TARGET,
+            "--device-codegen-crate",
+            SM120_DEVICE_CODEGEN_CRATES,
+            "--",
+            "--package",
+            "tuisko-qual",
+            "--bin",
+            "bench-qwen38-flash-next-generation",
             "--release",
         ],
     )?;
@@ -3081,6 +3112,34 @@ fn qualify_qwen38_flash_next_lm_head(root: &Path) -> Result<(), Box<dyn Error>> 
         None,
     )?;
     gate_qwen38_flash_next_lm_head(root)
+}
+
+/// Runs the source-backed generation gate and every resource family it composes.
+fn qualify_qwen38_flash_next_generation(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err(
+            "usage: cargo run -p xtask -- qualify-qwen38-flash-next-generation SNAPSHOT".into(),
+        );
+    };
+    run_qualification_test(
+        root,
+        QWEN38_FLASH_NEXT_GENERATION_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        Some(("TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_qwen38_flash_next_hyper_connection(root)?;
+    gate_qwen38_flash_next_gdn_prepare(root)?;
+    gate_qwen38_flash_next_gdn_recurrence(root)?;
+    gate_qwen38_flash_next_qsa_prepare(root)?;
+    gate_qwen38_flash_next_qsa_attention(root)?;
+    gate_qwen38_flash_next_moe_router(root)?;
+    gate_qwen38_flash_next_moe_experts(root)?;
+    gate_qwen38_flash_next_projections(root)?;
+    gate_qwen38_flash_next_lm_head(root)?;
+    gate_qwen38_flash_next_ple(root)
 }
 
 /// Runs the source-backed GDN/MoE layer gate and every leaf resource gate it composes.
@@ -4516,6 +4575,32 @@ fn bench_resident_prefill(
         "bench-resident-prefill",
         "resident-prefill",
     )
+}
+
+/// Times whole generation requests with production cache state.
+fn bench_qwen38_flash_next_generation(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-qwen38-flash-next-generation SNAPSHOT".into(),
+        );
+    };
+    require_performance_device_idle()?;
+    build_qwen38_flash_next_generation_benchmark(root)?;
+    wait_for_device_idle()?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-qwen38-flash-next-generation");
+    if !executable.is_file() {
+        return Err(format!(
+            "Qwen3.8 Flash-Next generation benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    run_visible(Command::new(executable).arg(snapshot))
 }
 
 /// Times the full host-observed resident step outside the single-graph benchmark harness.
@@ -14656,11 +14741,11 @@ mod tests {
         QWEN35_TEXT_ENDPOINT_TEST_FILTER, QWEN36_LONG_CONTEXT_KV_TEST_FILTER,
         QWEN36_MTP_LAYER_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
         QWEN38_FLASH_NEXT_ENGRAM_STAGING_TEST_FILTER, QWEN38_FLASH_NEXT_GDN_LAYER_TEST_FILTER,
-        QWEN38_FLASH_NEXT_LM_HEAD_TEST_FILTER, QWEN38_FLASH_NEXT_PLE_TEST_FILTER,
-        QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER, QWEN38_FLASH_NEXT_QSA_LAYER_TEST_FILTER,
-        QWEN38_FLASH_NEXT_RESIDENT_MODEL_TEST_FILTER, SM120_DEVICE_CODEGEN_CRATES,
-        SM120_RESOURCE_BASELINES, STREAMING_WEIGHT_POOL_TEST_FILTER, SUBCOMMANDS,
-        bench_device_baselines, bench_device_command, concatenated_resource_baselines,
+        QWEN38_FLASH_NEXT_GENERATION_TEST_FILTER, QWEN38_FLASH_NEXT_LM_HEAD_TEST_FILTER,
+        QWEN38_FLASH_NEXT_PLE_TEST_FILTER, QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER,
+        QWEN38_FLASH_NEXT_QSA_LAYER_TEST_FILTER, QWEN38_FLASH_NEXT_RESIDENT_MODEL_TEST_FILTER,
+        SM120_DEVICE_CODEGEN_CRATES, SM120_RESOURCE_BASELINES, STREAMING_WEIGHT_POOL_TEST_FILTER,
+        SUBCOMMANDS, bench_device_baselines, bench_device_command, concatenated_resource_baselines,
         contains_immediate_operand, device_is_idle, dispatch, dispatch_probe, names_opcode,
         parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
         parse_performance_device_sample, parse_performance_iteration, parse_resources,
@@ -14812,6 +14897,19 @@ mod tests {
             assert!(
                 test.contains(QWEN38_FLASH_NEXT_RESIDENT_MODEL_TEST_FILTER),
                 "resident filter does not select `{test}`"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen38_flash_next_generation_filter_selects_oracle_and_accounting() {
+        for test in [
+            "qwen38_flash_next_generation::tests::qwen38_flash_next_generation_matches_the_external_selection_contract",
+            "qwen38_flash_next_generation_benchmark::tests::qwen38_flash_next_generation_benchmark_accounting_matches_each_swept_route",
+        ] {
+            assert!(
+                test.contains(QWEN38_FLASH_NEXT_GENERATION_TEST_FILTER),
+                "generation filter does not select `{test}`"
             );
         }
     }
@@ -15461,6 +15559,7 @@ mod tests {
         // the startup and server harnesses and the `PerformanceSuite`
         // comparator commands, transcribed from their handlers.
         const HOST_BENCH_SUBCOMMANDS: &[&str] = &[
+            "bench-qwen38-flash-next-generation",
             "bench-qwen38-flash-next-resident-model",
             "bench-startup",
             "bench-server",
@@ -15921,6 +16020,12 @@ mod tests {
                 NO_SNAPSHOT,
             ),
             (
+                "qualify-qwen38-flash-next-generation",
+                "qwen38_flash_next_generation",
+                SERIAL,
+                QWEN38_FLASH_NEXT_SNAPSHOT,
+            ),
+            (
                 "qualify-qwen38-flash-next-gdn-layer",
                 "qwen38_flash_next_gdn_moe_layer",
                 SERIAL,
@@ -16145,7 +16250,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 100);
+        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 101);
 
         let snapshot = OsString::from("/snapshot");
         for &(command, filter, trailing, variable) in EXPECTED_QUALIFICATION_ROUTES {

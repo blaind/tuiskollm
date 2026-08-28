@@ -177,6 +177,7 @@ pub fn qualify_qwen38_flash_next_resident_model(
 
     let stream = context.new_stream().map_err(GpuError::from)?;
     model.reset_state(&stream)?;
+    reserve_probe_slots(&mut model, &stream)?;
 
     let refused_rounds = verify_dense_band_refusal(&mut model, &stream)?;
     let (inspected_logits, peak_absolute_logit) = verify_logits_respond(&mut model, &stream)?;
@@ -195,11 +196,13 @@ pub fn qualify_qwen38_flash_next_resident_model(
     }
 
     model.reset_state(&stream)?;
+    reserve_probe_slots(&mut model, &stream)?;
     for tile in [32usize, 64] {
         let measurement = measure_prefill(&mut model, &stream, tile)?;
         print_measurement(&measurement);
         measurements.push(measurement);
         model.reset_state(&stream)?;
+        reserve_probe_slots(&mut model, &stream)?;
     }
 
     let free_after_sweep = free_device_bytes(&context)?;
@@ -244,6 +247,7 @@ fn verify_cache_state_is_not_numerical(
     const PROBE: u32 = 7_919;
 
     model.reset_state(stream)?;
+    reserve_probe_slots(model, stream)?;
     model.decode_step(stream, &[PROBE], &[0], &[0])?;
     let cold = model.read_logits(stream, 1)?.to_vec();
 
@@ -295,6 +299,18 @@ fn verify_cache_state_is_not_numerical(
     }
 
     Ok(cold.len())
+}
+
+/// Reserves every slot driven directly by this suite.
+fn reserve_probe_slots(
+    model: &mut Qwen38FlashNextResidentModel,
+    stream: &tuisko_gpu::CudaStream,
+) -> QualResult<()> {
+    for slot in 0..MAX_BATCH {
+        model.reserve_slot(stream, slot, QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING)?;
+    }
+
+    Ok(())
 }
 
 /// Checks finite, nondegenerate, input-sensitive logits at the composed boundary.
@@ -428,13 +444,11 @@ fn verify_dense_band_refusal(
         }
         refused += 1;
     }
-    // The boundary itself stays admitted, so the guard is a ceiling rather than a blanket.
-    model.decode_step(
-        stream,
-        &[1],
-        &[QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING as u32 - 1],
-        &[0],
-    )?;
+    if model.generation_capacity() != QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING {
+        return Err(mismatch(
+            "the resident generator does not expose the dense ceiling",
+        ));
+    }
 
     Ok(refused)
 }
@@ -448,6 +462,11 @@ fn measure_decode(
         .map(|row| (1_024 + row * 97) as u32)
         .collect::<Vec<_>>();
     let slots = (0..batch).collect::<Vec<_>>();
+    let rounds = WARM_PASSES + MEASURED_STEPS;
+    for &slot in &slots {
+        model.reset_slot(stream, slot)?;
+        model.reserve_slot(stream, slot, rounds)?;
+    }
 
     for warm in 0..WARM_PASSES {
         let positions = vec![warm as u32; batch];
@@ -471,6 +490,7 @@ fn measure_prefill(
     let prompt = (0..tokens)
         .map(|token| (2_048 + token) as u32)
         .collect::<Vec<_>>();
+    model.reserve_slot(stream, 0, tokens)?;
 
     for _ in 0..WARM_PASSES {
         model.reset_slot(stream, 0)?;

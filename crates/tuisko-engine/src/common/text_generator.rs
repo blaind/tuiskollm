@@ -8,6 +8,8 @@ use crate::{
 #[cfg(feature = "qualification")]
 use crate::{Sampler, SamplingOptions};
 use std::sync::Arc;
+#[cfg(feature = "qualification")]
+use std::time::{Duration, Instant};
 use tuisko_frontend::{GenerationDefaults, PromptEncodingMetrics, TextFrontend};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, PinnedHostBuffer};
 use tuisko_model::{Arch, CheckpointSnapshot};
@@ -74,6 +76,44 @@ pub trait ModelProgram: sealed::Sealed + Sized {
     /// Stable device addresses reported beside the pinned logit bank at `logits`.
     #[cfg(feature = "qualification")]
     fn qualification_addresses(&self, logits: usize) -> Self::QualificationAddresses;
+}
+
+/// What one raw-token qualification run produced.
+#[cfg(feature = "qualification")]
+#[derive(Clone, Debug, PartialEq)]
+pub struct QualificationGeneration {
+    /// Tokens the production sampler selected, in order, including a selected stop token.
+    pub token_ids: Vec<u32>,
+    /// Prompt tokens the target's native prefill graphs carried.
+    pub native_prefill_tokens: usize,
+    /// Index of the generated token that was an admitted stop, when one was selected.
+    pub stopped_at: Option<usize>,
+    /// Host wall time through selection of the first token.
+    pub time_to_first_token: Option<Duration>,
+    /// Ranked `(token, logit)` candidates per step, empty unless the caller asked for them.
+    pub steps: Vec<Vec<(u32, f32)>>,
+}
+
+/// The `count` highest logits of one BF16 vocabulary row, descending, ties to the lower token.
+///
+/// The same order the production sampler's own selection walks, so a gate reporting these is
+/// reporting what the sampler saw rather than a second opinion about it.
+#[cfg(feature = "qualification")]
+fn ranked_candidates(logits: &[u16], count: usize) -> Vec<(u32, f32)> {
+    let mut ranked = logits
+        .iter()
+        .enumerate()
+        .map(|(token, &bits)| (token as u32, f32::from_bits(u32::from(bits) << 16)))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked.truncate(count);
+
+    ranked
 }
 
 /// Concrete frontend, device program, stream, and host-logit owner for one active request.
@@ -196,6 +236,148 @@ impl<M: ModelProgram> SingleSlotTextGenerator<M> {
             sampler.sample(&self.logits)?.token_id,
             native_prefill_tokens,
         ))
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Runs raw-token generation through production admission, replay, and sampling.
+    pub fn qualification_generate_from_tokens(
+        &mut self,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        options: SamplingOptions,
+        record_top: usize,
+    ) -> EngineResult<QualificationGeneration> {
+        let required_positions = require_generation_capacity(
+            token_ids.len(),
+            max_new_tokens,
+            self.program.context_capacity(),
+        )?;
+        let mut sampler = Sampler::new(options, self.frontend.stop_ids())?;
+        if max_new_tokens == 0 {
+            return Ok(QualificationGeneration {
+                token_ids: Vec::new(),
+                native_prefill_tokens: 0,
+                stopped_at: None,
+                time_to_first_token: None,
+                steps: Vec::new(),
+            });
+        }
+        let started = Instant::now();
+        let native_prefill_tokens =
+            self.program
+                .prime_single_slot(&self.stream, token_ids, required_positions)?;
+        self.program
+            .read_logits_into(&self.stream, 1, &mut self.logits)?;
+
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        let mut position = u32::try_from(token_ids.len())
+            .map_err(|_| EngineError::generation("prompt length exceeds the position width"))?;
+        let mut stopped_at = None;
+        let mut time_to_first_token = None;
+        let mut steps = Vec::with_capacity(if record_top == 0 { 0 } else { max_new_tokens });
+        for index in 0..max_new_tokens {
+            if record_top != 0 {
+                steps.push(ranked_candidates(&self.logits, record_top));
+            }
+            let decision = sampler.sample(&self.logits)?;
+            if index == 0 {
+                time_to_first_token = Some(started.elapsed());
+            }
+            generated.push(decision.token_id);
+            if decision.stopped {
+                stopped_at = Some(index);
+                break;
+            }
+            if generated.len() == max_new_tokens {
+                break;
+            }
+            self.program
+                .replay_token(&self.stream, decision.token_id, position)?;
+            self.program
+                .read_logits_into(&self.stream, 1, &mut self.logits)?;
+            position = position
+                .checked_add(1)
+                .ok_or_else(|| EngineError::generation("generation position overflows"))?;
+        }
+
+        Ok(QualificationGeneration {
+            token_ids: generated,
+            native_prefill_tokens,
+            stopped_at,
+            time_to_first_token,
+            steps,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Scores each forced continuation token on the reference context.
+    pub fn qualification_score_forced_tokens(
+        &mut self,
+        token_ids: &[u32],
+        continuation: &[u32],
+        record_top: usize,
+    ) -> EngineResult<Vec<Vec<(u32, f32)>>> {
+        let required_positions = require_generation_capacity(
+            token_ids.len(),
+            continuation.len(),
+            self.program.context_capacity(),
+        )?;
+        if continuation.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.program
+            .prime_single_slot(&self.stream, token_ids, required_positions)?;
+        self.program
+            .read_logits_into(&self.stream, 1, &mut self.logits)?;
+
+        let mut rows = Vec::with_capacity(continuation.len());
+        let mut position = u32::try_from(token_ids.len())
+            .map_err(|_| EngineError::generation("prompt length exceeds the position width"))?;
+        for (index, &token) in continuation.iter().enumerate() {
+            rows.push(ranked_candidates(&self.logits, record_top));
+            if index + 1 == continuation.len() {
+                break;
+            }
+            self.program.replay_token(&self.stream, token, position)?;
+            self.program
+                .read_logits_into(&self.stream, 1, &mut self.logits)?;
+            position = position
+                .checked_add(1)
+                .ok_or_else(|| EngineError::generation("generation position overflows"))?;
+        }
+
+        Ok(rows)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads the row for one raw-token prompt without generating anything from it.
+    pub fn qualification_prime_logits(&mut self, token_ids: &[u32]) -> EngineResult<&[u16]> {
+        let required_positions =
+            require_generation_capacity(token_ids.len(), 1, self.program.context_capacity())?;
+        self.program
+            .prime_single_slot(&self.stream, token_ids, required_positions)?;
+        self.program
+            .read_logits_into(&self.stream, 1, &mut self.logits)?;
+
+        Ok(&self.logits)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// The loaded resident program, for a gate that needs its target-specific evidence.
+    pub const fn qualification_program(&self) -> &M {
+        &self.program
+    }
+
+    #[cfg(feature = "qualification")]
+    /// The loaded resident program, for a gate that drives its lifecycle directly.
+    pub const fn qualification_program_mut(&mut self) -> &mut M {
+        &mut self.program
+    }
+
+    #[cfg(feature = "qualification")]
+    /// The stream every replay this generator issues runs on.
+    pub const fn qualification_stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 
     #[cfg(feature = "qualification")]
