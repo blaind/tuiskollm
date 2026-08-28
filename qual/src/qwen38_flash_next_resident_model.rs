@@ -151,6 +151,8 @@ pub struct Qwen38FlashNextResidentModelQualification {
     pub measurements: Vec<Qwen38FlashNextRouteMeasurement>,
     /// Agreement between a causal span and the same sequential decode.
     pub causal_span: Qwen38FlashNextCausalSpanEvidence,
+    /// Agreement when the same round is replayed after rollback.
+    pub rollback: Qwen38FlashNextRollbackEvidence,
 }
 
 /// Bitwise evidence for one four-row verification span.
@@ -164,6 +166,19 @@ pub struct Qwen38FlashNextCausalSpanEvidence {
     pub peak_represented_step: u16,
     /// Rows with the same argmax.
     pub agreeing_rows: usize,
+}
+
+/// Bitwise evidence that rollback restores every recurrent state family.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Qwen38FlashNextRollbackEvidence {
+    /// Host bytes in one slot restore point.
+    pub snapshot_bytes: usize,
+    /// Prefix length restored.
+    pub restored_tokens: usize,
+    /// Logits compared across rollback.
+    pub compared_logits: usize,
+    /// Logits moved by the no-rollback negative control.
+    pub control_moved_logits: usize,
 }
 
 /// Loads the whole model, captures every segment, and measures a decode and a prefill route.
@@ -226,6 +241,7 @@ pub fn qualify_qwen38_flash_next_resident_model(
     let (inspected_logits, peak_absolute_logit) = verify_logits_respond(&mut model, &stream)?;
     let cache_state_compared_logits = verify_cache_state_is_not_numerical(&mut model, &stream)?;
     let causal_span = verify_causal_span_is_sequential(&mut model, &stream)?;
+    let rollback = verify_rejected_round_rollback(&mut model, &stream)?;
 
     // Preserve completed route timings if a later route fails.
     let mut measurements = Vec::new();
@@ -292,6 +308,7 @@ pub fn qualify_qwen38_flash_next_resident_model(
         cache_state_compared_logits,
         measurements,
         causal_span,
+        rollback,
     })
 }
 
@@ -420,6 +437,73 @@ fn verify_causal_span_is_sequential(
         differing_logits: differing,
         peak_represented_step: peak_step,
         agreeing_rows,
+    })
+}
+
+/// Requires a rejected verification round to leave no recurrent state behind.
+fn verify_rejected_round_rollback(
+    model: &mut Qwen38FlashNextResidentModel,
+    stream: &tuisko_gpu::CudaStream,
+) -> QualResult<Qwen38FlashNextRollbackEvidence> {
+    const SLOT: usize = 0;
+    const PREFIX: [u32; 3] = [1_009, 24_419, 88_651];
+    const SPAN: [u32; 4] = [101, 7_919, 48_127, 199_933];
+
+    model.reset_state(stream)?;
+    reserve_probe_slots(model, stream)?;
+    for (position, &token) in PREFIX.iter().enumerate() {
+        model.decode_step(stream, &[token], &[position as u32], &[SLOT])?;
+    }
+
+    let first_position = PREFIX.len() as u32;
+    let snapshot = model.snapshot_slot(stream, SLOT)?;
+    if snapshot.tokens() != PREFIX.len() {
+        return Err(mismatch(format!(
+            "restore point holds {} tokens, expected {}",
+            snapshot.tokens(),
+            PREFIX.len()
+        )));
+    }
+
+    model.verify_step(stream, &SPAN, first_position, SLOT)?;
+    let rejected = model.read_logits(stream, SPAN.len())?.to_vec();
+
+    model.restore_slot(stream, &snapshot)?;
+    if model.slot_tokens(SLOT)? != PREFIX.len() {
+        return Err(mismatch("rollback did not restore the prefix length"));
+    }
+    model.verify_step(stream, &SPAN, first_position, SLOT)?;
+    let replayed = model.read_logits(stream, SPAN.len())?.to_vec();
+
+    let differing = rejected
+        .iter()
+        .zip(&replayed)
+        .filter(|(first, second)| first != second)
+        .count();
+    if differing != 0 {
+        return Err(mismatch(format!(
+            "round replay after rollback differs in {differing} of {} logits",
+            rejected.len()
+        )));
+    }
+
+    // A no-op restore would pass the equality above without this control.
+    model.verify_step(stream, &SPAN, first_position, SLOT)?;
+    let unrestored = model.read_logits(stream, SPAN.len())?.to_vec();
+    let moved = rejected
+        .iter()
+        .zip(&unrestored)
+        .filter(|(first, second)| first != second)
+        .count();
+    if moved == 0 {
+        return Err(mismatch("no-rollback control did not move any logits"));
+    }
+
+    Ok(Qwen38FlashNextRollbackEvidence {
+        snapshot_bytes: snapshot.byte_len(),
+        restored_tokens: snapshot.tokens(),
+        compared_logits: rejected.len(),
+        control_moved_logits: moved,
     })
 }
 
@@ -791,6 +875,13 @@ pub fn print_qwen38_flash_next_resident_model_report(
         report.causal_span.compared_logits,
         report.causal_span.peak_represented_step
     );
+    println!(
+        "  rollback                   {} logits equal at {} tokens ({} B); {} control moved",
+        report.rollback.compared_logits,
+        report.rollback.restored_tokens,
+        report.rollback.snapshot_bytes,
+        report.rollback.control_moved_logits
+    );
     for measurement in &report.measurements {
         print_measurement(measurement);
     }
@@ -895,6 +986,10 @@ mod tests {
         assert_eq!(report.causal_span.compared_logits, 4 * <A as Arch>::VOCAB);
         assert_eq!(report.causal_span.differing_logits, 0);
         assert_eq!(report.causal_span.peak_represented_step, 0);
+        assert_eq!(report.rollback.restored_tokens, 3);
+        assert_eq!(report.rollback.compared_logits, 4 * <A as Arch>::VOCAB);
+        assert!(report.rollback.snapshot_bytes > 0);
+        assert!(report.rollback.control_moved_logits > 0);
         assert_eq!(report.refused_rounds, 3);
         assert_eq!(report.inspected_logits, 3 * 248_320);
         assert_eq!(report.cache_state_compared_logits, 248_320);
