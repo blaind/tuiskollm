@@ -16,7 +16,8 @@ use std::time::Duration;
 use tuisko_engine::{
     ChatGenerationRequest, EngineError, EngineErrorCode, FinishReason, MAX_BATCH,
     QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING, Qwen38FlashNextGenerationTelemetry,
-    Qwen38FlashNextSlotState, Qwen38FlashNextTextGenerator, SamplingOptions,
+    Qwen38FlashNextQsaRoute, Qwen38FlashNextSlotState, Qwen38FlashNextTextGenerator,
+    SamplingOptions,
 };
 use tuisko_frontend::ChatMessage;
 use tuisko_gpu::GpuError;
@@ -106,18 +107,39 @@ pub struct Qwen38FlashNextBoundaryVerdict {
     pub visible: usize,
     /// Prompt tokens the capture carries.
     pub prompt_tokens: usize,
-    /// Tokens the dense band admits for this prompt.
+    /// Tokens requested and admitted.
     pub admitted_tokens: usize,
     /// Steps whose argmax matched the reference on its own context.
     pub agreed_tokens: usize,
     /// Tokens a free-running production run reproduced.
     pub free_running_tokens: usize,
-    /// Whether the capture's own eight-token request was refused.
-    pub full_request_refused: bool,
-    /// Whether one more token than the band admits was refused.
-    pub over_budget_refused: bool,
-    /// The refusal's own words, when there was one.
-    pub refusal: Option<String>,
+    /// First step outside the dense band.
+    pub selective_step: Option<usize>,
+    /// Steps outside the reference leading pair.
+    pub decisive_disagreements: usize,
+}
+
+/// Evidence from one generation past the old dense ceiling.
+#[derive(Clone, Debug)]
+pub struct Qwen38FlashNextLongContextVerdict {
+    /// Prompt tokens primed.
+    pub prompt_tokens: usize,
+    /// Tokens generated.
+    pub generated_tokens: usize,
+    /// Whole prompt-prime wall time.
+    pub time_to_first_token: Duration,
+    /// Mean decode wall time per token.
+    pub decode_milliseconds_per_token: f64,
+    /// Positions selected on the final decode round.
+    pub selected_positions_at_depth: usize,
+    /// Cache bytes appended by the request.
+    pub kv_append_bytes: usize,
+    /// Decode expert-cache hit rate.
+    pub decode_expert_hit_rate: f64,
+    /// Decode expert upload bytes per token.
+    pub decode_expert_h2d_bytes_per_token: f64,
+    /// Generated token ids.
+    pub tokens: Vec<u32>,
 }
 
 /// Everything the generation gate observed.
@@ -131,6 +153,10 @@ pub struct Qwen38FlashNextGenerationQualification {
     pub executables: usize,
     /// Longest sequence a request may reach.
     pub generation_capacity: usize,
+    /// Vocabulary values equal across both QSA routes at the boundary.
+    pub route_switch_logits: usize,
+    /// One production generation on the selected route.
+    pub long_context: Qwen38FlashNextLongContextVerdict,
     /// Steps scored against the reference across every prompt capture.
     pub compared_tokens: usize,
     /// Steps whose argmax matched the reference on its own context.
@@ -196,11 +222,10 @@ pub fn qualify_qwen38_flash_next_generation(
     let mut generator = Qwen38FlashNextTextGenerator::from_snapshot_device_zero(snapshot)?;
     let load = started.elapsed();
     let generation_capacity = generator.context_capacity();
-    if generation_capacity != QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING {
+    if generation_capacity != A::MAX_POSITION_EMBEDDINGS {
         return Err(mismatch(format!(
-            "generation admits {generation_capacity} tokens, expected the proven dense band \
-             {QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING}; a generator that admits the funded cache \
-             depth would run dense attention outside the band the reference computes"
+            "generation admits {generation_capacity} tokens, expected {}",
+            A::MAX_POSITION_EMBEDDINGS
         )));
     }
     println!("--- construction (diagnostic, nothing blessed) ---");
@@ -271,6 +296,10 @@ pub fn qualify_qwen38_flash_next_generation(
         boundaries.push(verdict);
     }
 
+    let route_switch_logits = verify_route_switch_continuity(&mut generator)?;
+    let long_context = verify_long_context_generation(&mut generator, 8_192, 16)?;
+    print_long_context_verdict(&long_context);
+
     let decode_hit_rate = telemetry.decode_expert_hit_rate();
     let decode_h2d_bytes_per_token = telemetry.decode_expert_h2d_bytes_per_token();
 
@@ -279,6 +308,8 @@ pub fn qualify_qwen38_flash_next_generation(
         load,
         executables: generator.executables(),
         generation_capacity,
+        route_switch_logits,
+        long_context,
         compared_tokens,
         agreed_tokens,
         tied_steps,
@@ -496,16 +527,17 @@ fn require_generation_refusal<T>(result: Result<T, EngineError>, name: &str) -> 
             "{name} failed with {error} instead of a generation-capacity refusal"
         )));
     }
-    if !message.contains(&QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING.to_string()) {
+    if !message.contains(&A::MAX_POSITION_EMBEDDINGS.to_string()) {
         return Err(mismatch(format!(
-            "{name} refusal did not name the {QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING}-token ceiling: {message}"
+            "{name} refusal did not name the {}-token ceiling: {message}",
+            A::MAX_POSITION_EMBEDDINGS
         )));
     }
 
     Ok(message)
 }
 
-/// Replays one boundary capture inside and immediately outside the dense band.
+/// Replays one boundary capture across the QSA route change.
 fn replay_boundary(
     generator: &mut Qwen38FlashNextTextGenerator,
     directory: &Path,
@@ -513,80 +545,149 @@ fn replay_boundary(
 ) -> QualResult<Qwen38FlashNextBoundaryVerdict> {
     let capture = load_qwen38_flash_next_golden_boundary(directory, visible)?;
     let prompt_tokens = capture.prompt_ids.len();
-    let admitted = (QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING + 1).saturating_sub(prompt_tokens);
     let name = format!("boundary-{visible}");
-
-    let full = generator.qualification_generate_from_tokens(
-        &capture.prompt_ids,
-        BOUNDARY_TOKENS,
-        SamplingOptions::greedy(),
-        0,
-    );
-    let refusal = if admitted < BOUNDARY_TOKENS {
-        if full.is_ok() {
-            return Err(mismatch(format!(
-                "{name} admitted {BOUNDARY_TOKENS} tokens with only {admitted} in band"
-            )));
-        }
-        Some(require_generation_refusal(full, &name)?)
-    } else {
-        full?;
-        None
-    };
-
-    if admitted == 0 {
-        let result = generator.qualification_generate_from_tokens(
-            &capture.prompt_ids,
-            1,
-            SamplingOptions::greedy(),
-            0,
-        );
-        if result.is_ok() {
-            return Err(mismatch(format!(
-                "{name} admitted one token from an out-of-band {prompt_tokens}-token prompt"
-            )));
-        }
-        let error = require_generation_refusal(result, &name)?;
-
-        return Ok(Qwen38FlashNextBoundaryVerdict {
-            visible,
-            prompt_tokens,
-            admitted_tokens: 0,
-            agreed_tokens: 0,
-            free_running_tokens: 0,
-            full_request_refused: refusal.is_some(),
-            over_budget_refused: true,
-            refusal: Some(error),
-        });
-    }
-
-    let verdict = replay_capture(generator, &name, &capture, admitted)?;
-
-    let result = generator.qualification_generate_from_tokens(
-        &capture.prompt_ids,
-        admitted + 1,
-        SamplingOptions::greedy(),
-        0,
-    );
-    if result.is_ok() {
+    let selective_step = (0..BOUNDARY_TOKENS)
+        .find(|step| prompt_tokens + step + 1 > QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING);
+    let verdict = replay_capture(generator, &name, &capture, BOUNDARY_TOKENS)?;
+    if verdict.scored_steps != BOUNDARY_TOKENS {
         return Err(mismatch(format!(
-            "{name} admitted {} tokens from a {prompt_tokens}-token prompt, one past the \
-             {admitted} the dense band funds",
-            admitted + 1
+            "{name} scored {} of {BOUNDARY_TOKENS} steps",
+            verdict.scored_steps
         )));
     }
-    require_generation_refusal(result, &name)?;
+
+    let over_ceiling = generator.qualification_generate_from_tokens(
+        &capture.prompt_ids,
+        A::MAX_POSITION_EMBEDDINGS,
+        SamplingOptions::greedy(),
+        0,
+    );
+    require_generation_refusal(over_ceiling, &name)?;
 
     Ok(Qwen38FlashNextBoundaryVerdict {
         visible,
         prompt_tokens,
-        admitted_tokens: admitted,
+        admitted_tokens: BOUNDARY_TOKENS,
         agreed_tokens: verdict.agreed_steps,
         free_running_tokens: verdict.free_running_tokens,
-        full_request_refused: refusal.is_some(),
-        over_budget_refused: true,
-        refusal,
+        selective_step,
+        decisive_disagreements: verdict.decisive_disagreements.len(),
     })
+}
+
+/// Requires both routes to publish identical logits at their shared boundary.
+fn verify_route_switch_continuity(
+    generator: &mut Qwen38FlashNextTextGenerator,
+) -> QualResult<usize> {
+    let seed = boundary_prompt_seed()?;
+    let prompt = repeated_prompt(&seed, QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING - 1);
+    let position = u32::try_from(prompt.len())
+        .map_err(|_| mismatch("the continuity position exceeds the route width"))?;
+    let token = prompt[0];
+    let mut dense = None;
+
+    for route in [
+        Qwen38FlashNextQsaRoute::Dense,
+        Qwen38FlashNextQsaRoute::Selected,
+    ] {
+        generator.qualification_prime_logits(&prompt)?;
+        let stream = Arc::clone(generator.qualification_stream());
+        let model = generator.qualification_program_mut();
+        model.reserve_slot(&stream, 0, QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING)?;
+        model.qualification_decode_step_on_route(&stream, &[token], &[position], &[0], route)?;
+        let counts = model.qualification_selected_counts(&stream, 1)?;
+        if route == Qwen38FlashNextQsaRoute::Selected && counts[0] as usize != prompt.len() + 1 {
+            return Err(mismatch(format!(
+                "the boundary selection published {}, expected {}",
+                counts[0],
+                prompt.len() + 1
+            )));
+        }
+        let mut logits = vec![0u16; <A as Arch>::VOCAB];
+        model.read_logits_into(&stream, 1, &mut logits)?;
+        match dense.take() {
+            None => dense = Some(logits),
+            Some(dense) => {
+                if let Some((index, left, right)) = first_difference(&dense, &logits) {
+                    return Err(mismatch(format!(
+                        "QSA routes disagree at boundary logit {index}: {left:#06x} versus {right:#06x}"
+                    )));
+                }
+                return Ok(logits.len());
+            }
+        }
+    }
+
+    Err(mismatch("the route continuity matrix was incomplete"))
+}
+
+/// Runs a real request wholly above the old dense ceiling.
+fn verify_long_context_generation(
+    generator: &mut Qwen38FlashNextTextGenerator,
+    prompt_tokens: usize,
+    generate: usize,
+) -> QualResult<Qwen38FlashNextLongContextVerdict> {
+    let prompt = repeated_prompt(&boundary_prompt_seed()?, prompt_tokens);
+    let generated = generator.qualification_generate_from_tokens(
+        &prompt,
+        generate,
+        SamplingOptions::greedy(),
+        0,
+    )?;
+    let telemetry = generator.telemetry();
+    let stream = Arc::clone(generator.qualification_stream());
+    let counts = generator
+        .qualification_program()
+        .qualification_selected_counts(&stream, 1)?;
+    if generated.token_ids.len() != generate {
+        return Err(mismatch(format!(
+            "long-context generation produced {} of {generate} tokens",
+            generated.token_ids.len()
+        )));
+    }
+    let time_to_first_token = generated
+        .time_to_first_token
+        .ok_or_else(|| mismatch("long-context generation has no first-token timing"))?;
+    let selected = counts[0] as usize;
+    if !(2_048..=2_051).contains(&selected) {
+        return Err(mismatch(format!(
+            "long-context selection published {selected} positions"
+        )));
+    }
+    let decode_rounds = generate - 1;
+    let decode_closings = (0..decode_rounds)
+        .filter(|step| (prompt_tokens + step + 1).is_multiple_of(A::INDEXER_COMPRESS_RATIO))
+        .count();
+    let expected_kv = prompt_tokens * 16_128 + decode_rounds * 15_360 + decode_closings * 3_072;
+    if telemetry.kv_append_bytes() != expected_kv {
+        return Err(mismatch(format!(
+            "long-context cache appended {}, expected {expected_kv}",
+            telemetry.kv_append_bytes()
+        )));
+    }
+
+    Ok(Qwen38FlashNextLongContextVerdict {
+        prompt_tokens,
+        generated_tokens: generated.token_ids.len(),
+        time_to_first_token,
+        decode_milliseconds_per_token: telemetry.decode_ms_per_token(),
+        selected_positions_at_depth: selected,
+        kv_append_bytes: telemetry.kv_append_bytes(),
+        decode_expert_hit_rate: telemetry.decode_expert_hit_rate(),
+        decode_expert_h2d_bytes_per_token: telemetry.decode_expert_h2d_bytes_per_token(),
+        tokens: generated.token_ids,
+    })
+}
+
+fn boundary_prompt_seed() -> QualResult<Vec<u32>> {
+    Ok(
+        load_qwen38_flash_next_golden_boundary(&qwen38_flash_next_golden_directory(), 2_100)?
+            .prompt_ids,
+    )
+}
+
+fn repeated_prompt(seed: &[u32], tokens: usize) -> Vec<u32> {
+    seed.iter().copied().cycle().take(tokens).collect()
 }
 
 /// Checks tile-ladder invariance and last-row publication.
@@ -1186,24 +1287,38 @@ pub fn print_capture_verdict(verdict: &Qwen38FlashNextCaptureVerdict) {
 /// Prints one boundary verdict.
 pub fn print_boundary_verdict(verdict: &Qwen38FlashNextBoundaryVerdict) {
     println!(
-        "  boundary-{:<5} prompt {:>5}  admitted {}  forced {}  free-running {}  full-request {}  \
-         over-budget {}",
+        "  boundary-{:<5} prompt {:>5}  admitted {}  forced {}  free-running {}  selective {:?}  decisive {}",
         verdict.visible,
         verdict.prompt_tokens,
         verdict.admitted_tokens,
         verdict.agreed_tokens,
         verdict.free_running_tokens,
-        if verdict.full_request_refused {
-            "REFUSED"
-        } else {
-            "admitted"
-        },
-        if verdict.over_budget_refused {
-            "REFUSED"
-        } else {
-            "admitted"
-        }
+        verdict.selective_step,
+        verdict.decisive_disagreements,
     );
+}
+
+/// Prints selected-route generation evidence.
+pub fn print_long_context_verdict(verdict: &Qwen38FlashNextLongContextVerdict) {
+    println!("--- selected-route generation (diagnostic timing) ---");
+    println!(
+        "  prompt / generated       {} / {}",
+        verdict.prompt_tokens, verdict.generated_tokens
+    );
+    println!(
+        "  time to first token      {:?}",
+        verdict.time_to_first_token
+    );
+    println!(
+        "  decode ms/token          {:.3}",
+        verdict.decode_milliseconds_per_token
+    );
+    println!(
+        "  selected positions       {}",
+        verdict.selected_positions_at_depth
+    );
+    println!("  kv append bytes          {}", verdict.kv_append_bytes);
+    println!("  tokens                   {:?}", verdict.tokens);
 }
 
 /// Prints one qualification report in the house's diagnostic shape.
@@ -1214,6 +1329,7 @@ pub fn print_qwen38_flash_next_generation_report(report: &Qwen38FlashNextGenerat
     println!("    total                  {:?}", report.load);
     println!("    executables            {}", report.executables);
     println!("    generation capacity    {}", report.generation_capacity);
+    println!("    route-switch logits    {}", report.route_switch_logits);
     println!("  the gate");
     println!(
         "    steps scored           {} over {} captures",
@@ -1299,19 +1415,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_admitted_budget_is_the_dense_bands_own_arithmetic() {
+    fn the_boundary_sweep_crosses_the_route_change() {
         for (prompt, admitted) in [
-            (2_046usize, 6usize),
-            (2_047, 5),
-            (2_048, 4),
-            (2_049, 3),
-            (2_050, 2),
-            (2_051, 1),
-            (2_055, 0),
-            (2_099, 0),
+            (2_046usize, Some(5usize)),
+            (2_047, Some(4)),
+            (2_048, Some(3)),
+            (2_049, Some(2)),
+            (2_050, Some(1)),
+            (2_051, Some(0)),
+            (2_055, Some(0)),
+            (2_099, Some(0)),
         ] {
-            let budget = (QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING + 1).saturating_sub(prompt);
-            assert_eq!(budget, admitted, "prompt {prompt}");
+            let crossing = (0..BOUNDARY_TOKENS)
+                .find(|step| prompt + step + 1 > QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING);
+            assert_eq!(crossing, admitted, "prompt {prompt}");
         }
     }
 
@@ -1361,19 +1478,12 @@ mod tests {
                 .iter()
                 .all(|capture| capture.decisive_disagreements.is_empty())
         );
-        assert_eq!(
-            report.generation_capacity,
-            QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING
-        );
+        assert_eq!(report.generation_capacity, A::MAX_POSITION_EMBEDDINGS);
 
         assert_eq!(report.boundaries.len(), 8);
         for verdict in &report.boundaries {
-            assert!(
-                verdict.full_request_refused,
-                "boundary-{} admitted its full eight-token request",
-                verdict.visible
-            );
-            assert!(verdict.over_budget_refused, "boundary-{}", verdict.visible);
+            assert_eq!(verdict.decisive_disagreements, 0);
+            assert!(verdict.selective_step.is_some());
             assert_eq!(
                 verdict.agreed_tokens, verdict.admitted_tokens,
                 "boundary-{}",
@@ -1390,7 +1500,29 @@ mod tests {
             .iter()
             .map(|verdict| verdict.admitted_tokens)
             .collect::<Vec<_>>();
-        assert_eq!(admitted, vec![6, 5, 4, 3, 2, 1, 0, 0]);
+        assert_eq!(admitted, vec![8; 8]);
+        let crossings = report
+            .boundaries
+            .iter()
+            .map(|verdict| verdict.selective_step)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            crossings,
+            vec![
+                Some(5),
+                Some(4),
+                Some(3),
+                Some(2),
+                Some(1),
+                Some(0),
+                Some(0),
+                Some(0)
+            ]
+        );
+        assert_eq!(report.route_switch_logits, <A as Arch>::VOCAB);
+        assert_eq!(report.long_context.prompt_tokens, 8_192);
+        assert_eq!(report.long_context.generated_tokens, 16);
+        assert!((2_048..=2_051).contains(&report.long_context.selected_positions_at_depth));
 
         assert_eq!(report.prefill_checks, 8);
         assert_eq!(report.tiling_compared_logits, 11 * <A as Arch>::VOCAB);

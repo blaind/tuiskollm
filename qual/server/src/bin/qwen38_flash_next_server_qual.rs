@@ -15,8 +15,10 @@ const GENERATION_ROUTE: &str = "compact-b1-8";
 const FUNDED_SLOTS: usize = 8;
 /// Queue depth the transport holds in front of the funded slots.
 const INGRESS_QUEUE: usize = 8;
-/// The proven dense band, which is the ceiling every admission is measured against.
+/// Last visible length served by dense QSA.
 const DENSE_BAND: usize = 2_051;
+/// Served checkpoint and single-slot page-pool ceiling.
+const SERVED_DEPTH: usize = 262_144;
 const COMPLETION_TOKENS: usize = 8;
 const HELLO_MESSAGE_BOUNDARY_TOKENS: usize = 6;
 const THROUGHPUT_COMPLETION_TOKENS: usize = 64;
@@ -122,7 +124,7 @@ fn main() {
     };
     match outcome {
         Ok(()) => println!(
-            "PASS qwen38-flash-next-server-http: {} checks over {} live requests; {FUNDED_SLOTS} funded slots, {INGRESS_QUEUE}-deep ingress, dense band {DENSE_BAND}",
+            "PASS qwen38-flash-next-server-http: {} checks over {} live requests; {FUNDED_SLOTS} funded slots, {INGRESS_QUEUE}-deep ingress, served depth {SERVED_DEPTH}",
             qualification.checks, qualification.requests,
         ),
         Err(error) => {
@@ -557,23 +559,30 @@ impl Qualification {
 
     /// Checks refusal boundaries without accepting truncation or state mutation.
     fn run_refusals(&mut self, reference: &Completion) -> Result<()> {
-        let over_band = DENSE_BAND + 160;
-        let message = self.reject(long_prompt_request(over_band), 400, "over-band completion")?;
+        let message = self.reject(
+            exact_length_request(64, SERVED_DEPTH),
+            400,
+            "over-depth completion",
+        )?;
         let (required, capacity) = parse_capacity_refusal(&message)?;
         self.check(
-            capacity == DENSE_BAND,
-            format!(
-                "the over-band refusal named a capacity of {capacity}, expected the proven dense band {DENSE_BAND}"
-            ),
+            capacity == SERVED_DEPTH,
+            format!("the over-depth refusal named {capacity}, expected {SERVED_DEPTH}"),
         )?;
         self.check(
             required > capacity,
-            format!(
-                "the over-band refusal required {required} positions, which is inside {capacity}"
-            ),
+            format!("the over-depth refusal required {required} positions inside {capacity}"),
         )?;
 
-        // Pair the refusal with a successful long request inside the band.
+        let selected = self.request(
+            long_prompt_request(DENSE_BAND + 160),
+            "selected long completion",
+        )?;
+        self.check(
+            selected.usage.prompt_tokens > DENSE_BAND && selected.usage.completion_tokens == 1,
+            format!("a selected long prompt reported {:?}", selected.usage),
+        )?;
+
         let inside = self.request(
             exact_length_request(DENSE_BAND - 64, 1),
             "in-band long completion",
@@ -786,7 +795,7 @@ impl Qualification {
         self.run_surface()?;
         println!("# Flash-Next served-model measurements (diagnostic, nothing blessed)");
         println!(
-            "# route {GENERATION_ROUTE}, {FUNDED_SLOTS} funded slots, dense band {DENSE_BAND}"
+            "# route {GENERATION_ROUTE}, {FUNDED_SLOTS} funded slots, served depth {SERVED_DEPTH}"
         );
         println!();
         println!("## Per-request wall time and token consumption (SSE, greedy)");
@@ -1399,9 +1408,9 @@ fn expect_str_value(value: Option<&Value>, label: &str, expected: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        DENSE_BAND, HELLO_MESSAGE_BOUNDARY_TOKENS, Options, QualError, fixtures, long_prompt_body,
-        measurement_requests, median_of, parse_capacity_refusal, percentile_index, quantiles,
-        same_completion_semantics, validate_blocking, validate_stream,
+        DENSE_BAND, HELLO_MESSAGE_BOUNDARY_TOKENS, Options, QualError, SERVED_DEPTH, fixtures,
+        long_prompt_body, measurement_requests, median_of, parse_capacity_refusal,
+        percentile_index, quantiles, same_completion_semantics, validate_blocking, validate_stream,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -1442,11 +1451,14 @@ mod tests {
     }
 
     #[test]
-    fn the_over_band_refusal_is_parsed_for_both_of_its_numbers() {
+    fn the_over_depth_refusal_is_parsed_for_both_of_its_numbers() {
         let message = format!(
-            "[engine.generation] prompt plus processed generation requires 2212 positions, current resident capacity is {DENSE_BAND}"
+            "[engine.generation] prompt plus processed generation requires 262208 positions, current resident capacity is {SERVED_DEPTH}"
         );
-        assert_eq!(parse_capacity_refusal(&message).unwrap(), (2_212, 2_051));
+        assert_eq!(
+            parse_capacity_refusal(&message).unwrap(),
+            (262_208, 262_144)
+        );
         let error = parse_capacity_refusal("something else").unwrap_err();
         assert!(matches!(error, QualError::Contract(_)));
     }

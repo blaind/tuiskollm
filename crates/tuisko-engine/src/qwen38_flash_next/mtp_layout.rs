@@ -780,13 +780,13 @@ mod tests {
         assert_eq!(target.streaming().slot_count(), 6_144);
         assert_eq!(joint.target().streaming().slot_count(), 5_578);
         assert_eq!(joint.draft().streaming().slot_count(), 128);
-        assert_eq!(target.physical_pages(), 3_672);
-        assert_eq!(joint.physical_pages(), 3_291);
+        assert_eq!(target.physical_pages(), 4_096);
+        assert_eq!(joint.physical_pages(), 3_794);
         assert_eq!(
             joint.physical_pages() * QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE,
-            210_624
+            242_816
         );
-        assert_eq!(joint.draft().total_device_bytes().unwrap(), 1_938_856_448);
+        assert_eq!(joint.draft().total_device_bytes().unwrap(), 1_973_881_344);
 
         let total = joint.total_device_bytes().unwrap();
         let spendable =

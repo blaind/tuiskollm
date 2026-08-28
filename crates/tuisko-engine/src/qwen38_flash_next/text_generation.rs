@@ -1,6 +1,6 @@
 //! Qwen3.8 Flash-Next generation routing and request telemetry.
 //!
-//! Requests stop at the proven 2,051-token dense band even when the paged cache is deeper.
+//! Requests use dense QSA through 2,051 tokens and selection QSA beyond it.
 //! Prompts use T=1024/128/64/32 graphs followed by at most 31 scalar rounds.
 
 use crate::common::mtp::next_native_prefill_tile;
@@ -462,7 +462,8 @@ pub(crate) fn prompt_position(position: usize) -> EngineResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qwen38_flash_next::layer_route::QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING;
+    use crate::qwen38_flash_next::layer_route::QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING;
+    use crate::qwen38_flash_next::qsa_moe_layer_layout::QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE;
 
     /// Every tile the shared planner emits for a prompt of `tokens`, and its scalar tail.
     fn plan(tokens: usize) -> (Vec<usize>, usize) {
@@ -513,28 +514,28 @@ mod tests {
     }
 
     #[test]
-    fn the_generation_ceiling_is_the_dense_band_and_not_the_funded_cache() {
+    fn the_generation_ceiling_is_the_whole_page_pool() {
         let plan = crate::Qwen38FlashNextResidentLayout::build().unwrap();
 
-        assert_eq!(plan.context_tokens_per_slot(), 29_376);
-        assert_eq!(QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING, 2_051);
-        assert!(plan.context_tokens_per_slot() > QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING);
+        assert_eq!(plan.context_tokens_per_slot(), 32_768);
+        assert_eq!(
+            plan.physical_pages() * QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE,
+            QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING
+        );
     }
 
     #[test]
-    fn the_admitted_new_token_budget_is_the_bands_own_arithmetic() {
-        // Admission evaluates `prompt + max_new - 1` against the dense ceiling.
+    fn the_admitted_new_token_budget_uses_the_checkpoint_ceiling() {
         for (prompt, admitted) in [
-            (2_046usize, 6usize),
-            (2_047, 5),
-            (2_048, 4),
-            (2_049, 3),
-            (2_050, 2),
-            (2_051, 1),
-            (2_055, 0),
-            (2_099, 0),
+            (262_139usize, 6usize),
+            (262_140, 5),
+            (262_141, 4),
+            (262_142, 3),
+            (262_143, 2),
+            (262_144, 1),
+            (262_145, 0),
         ] {
-            let budget = (QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING + 1).saturating_sub(prompt);
+            let budget = (QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING + 1).saturating_sub(prompt);
             assert_eq!(budget, admitted, "prompt {prompt}");
         }
     }

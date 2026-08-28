@@ -1509,7 +1509,7 @@ mod tests {
             arena_bytes: 29 * (1 << 30),
             host_stager_bytes: 15 * (1 << 20),
             slot_capacity: MAX_BATCH,
-            context_capacity: 2_051,
+            context_capacity: 262_144,
             detailed_load_timing: true,
         };
         let output = render_startup(
@@ -1521,7 +1521,7 @@ mod tests {
 
         assert!(output.contains("compact-b1-8"));
         assert!(output.contains("8 slots"));
-        assert!(output.contains("context 2051"));
+        assert!(output.contains("context 262144"));
     }
 
     #[test]

@@ -172,7 +172,16 @@ fn measure_decode(
         samples.push(model.decode_step(stream, &tokens, &positions, &slots)?);
     }
 
-    summarize("decode", batch, &samples, model.streaming_route())
+    let closings = (0..MEASURED_STEPS)
+        .map(|step| usize::from((WARM_PASSES + step + 1).is_multiple_of(4)) * batch)
+        .collect::<Vec<_>>();
+    summarize(
+        "decode",
+        batch,
+        &samples,
+        &closings,
+        model.streaming_route(),
+    )
 }
 
 fn measure_causal(
@@ -195,7 +204,13 @@ fn measure_causal(
         samples.push(model.verify_step(stream, &tokens, 0, 0)?);
     }
 
-    summarize("verify", rows, &samples, model.streaming_route())
+    summarize(
+        "verify",
+        rows,
+        &samples,
+        &vec![rows / Qwen38FlashNext::INDEXER_COMPRESS_RATIO; samples.len()],
+        model.streaming_route(),
+    )
 }
 
 fn measure_prefill(
@@ -218,13 +233,20 @@ fn measure_prefill(
         samples.push(model.prefill_tile(stream, &prompt, 0, 0)?);
     }
 
-    summarize("prefill", tile, &samples, model.streaming_route())
+    summarize(
+        "prefill",
+        tile,
+        &samples,
+        &vec![tile / Qwen38FlashNext::INDEXER_COMPRESS_RATIO; samples.len()],
+        model.streaming_route(),
+    )
 }
 
 fn summarize(
     kind: &'static str,
     rows: usize,
     samples: &[Qwen38FlashNextStepTelemetry],
+    closing_blocks: &[usize],
     streaming_route: Qwen38FlashNextStreamingRoute,
 ) -> Result<Qwen38FlashNextResidentRouteReport, DeviceBenchmarkError> {
     if samples.is_empty() {
@@ -232,8 +254,13 @@ fn summarize(
             "resident benchmark route produced no samples".to_string(),
         ));
     }
-    for sample in samples {
-        validate_route_accounting(sample, rows)?;
+    if closing_blocks.len() != samples.len() {
+        return Err(DeviceBenchmarkError::Precondition(
+            "resident benchmark closing-block accounting is incomplete".to_string(),
+        ));
+    }
+    for (sample, &closing) in samples.iter().zip(closing_blocks) {
+        validate_route_accounting(sample, rows, closing)?;
     }
 
     let mut times = samples
@@ -277,7 +304,7 @@ fn summarize(
     })
 }
 
-fn expected_route_accounting(rows: usize) -> RouteAccounting {
+fn expected_route_accounting(rows: usize, closing_blocks: usize) -> RouteAccounting {
     let expert_requests = rows * Qwen38FlashNext::LAYERS * Qwen38FlashNext::NUM_EXPERTS_PER_TOKEN;
 
     RouteAccounting {
@@ -289,9 +316,12 @@ fn expected_route_accounting(rows: usize) -> RouteAccounting {
         engram_rows: rows * Qwen38FlashNext::NGRAM_HEADS,
         kv_append_bytes: rows
             * QWEN38_FLASH_NEXT_ATTENTION_LAYERS
-            * 2
-            * Qwen38FlashNext::NUM_KV_HEADS
-            * Qwen38FlashNext::HEAD_DIM,
+            * (2 * Qwen38FlashNext::NUM_KV_HEADS * Qwen38FlashNext::HEAD_DIM
+                + Qwen38FlashNext::INDEXER_HEAD_DIM * size_of::<u16>())
+            + closing_blocks
+                * QWEN38_FLASH_NEXT_ATTENTION_LAYERS
+                * Qwen38FlashNext::INDEXER_HEAD_DIM
+                * size_of::<u16>(),
         segment_replays: QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS,
         expert_readbacks: Qwen38FlashNext::LAYERS,
     }
@@ -300,6 +330,7 @@ fn expected_route_accounting(rows: usize) -> RouteAccounting {
 fn validate_route_accounting(
     sample: &Qwen38FlashNextStepTelemetry,
     rows: usize,
+    closing_blocks: usize,
 ) -> Result<(), DeviceBenchmarkError> {
     let observed = RouteAccounting {
         layer_rounds: sample.streaming_rounds(),
@@ -312,7 +343,7 @@ fn validate_route_accounting(
         segment_replays: sample.segment_replays(),
         expert_readbacks: sample.expert_readbacks(),
     };
-    let expected = expected_route_accounting(rows);
+    let expected = expected_route_accounting(rows, closing_blocks);
     if sample.rows() != rows || observed != expected {
         return Err(DeviceBenchmarkError::Precondition(format!(
             "resident benchmark accounting mismatch for {rows} rows: observed {observed:?}, expected {expected:?}"
@@ -405,7 +436,7 @@ mod tests {
         assert_eq!(QWEN38_FLASH_NEXT_PREFILL_ROWS, [32, 64, 128, 1_024]);
 
         assert_eq!(
-            expected_route_accounting(1),
+            expected_route_accounting(1, 0),
             RouteAccounting {
                 layer_rounds: 48,
                 expert_requests: 480,
@@ -413,12 +444,15 @@ mod tests {
                 embedding_h2d_bytes: 5_120,
                 engram_h2d_bytes: 2_560,
                 engram_rows: 16,
-                kv_append_bytes: 12_288,
+                kv_append_bytes: 15_360,
                 segment_replays: 49,
                 expert_readbacks: 48,
             }
         );
-        assert_eq!(expected_route_accounting(8).expert_requests, 3_840);
-        assert_eq!(expected_route_accounting(1_024).kv_append_bytes, 12_582_912);
+        assert_eq!(expected_route_accounting(8, 0).expert_requests, 3_840);
+        assert_eq!(
+            expected_route_accounting(1_024, 256).kv_append_bytes,
+            16_515_072
+        );
     }
 }
