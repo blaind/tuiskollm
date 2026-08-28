@@ -11,6 +11,7 @@ tuisko-kernels-sm120-common.workspace = true
 tuisko-kernels-sm120-engram.workspace = true
 tuisko-kernels-sm120-fp8-mlp.workspace = true
 tuisko-kernels-sm120-fp8-projection.workspace = true
+tuisko-kernels-sm120-qwen38-flash-next-projection.workspace = true
 tuisko-kernels-sm120-gdn.workspace = true
 tuisko-kernels-sm120-hyper-connection.workspace = true
 tuisko-kernels-sm120-lm-head.workspace = true

@@ -1,7 +1,7 @@
 /// One device-codegen crate: its PTX module stem and its family inventory.
 type Family = (&'static str, fn() -> Vec<&'static str>);
 
-/// Every SM120 device-codegen crate, in the order `xtask` names them.
+/// Every SM120 device-codegen crate.
 ///
 /// Each entry owns exactly one PTX module, so the aggregate inventory is the
 /// concatenation of the family inventories and never an independent list.
@@ -25,6 +25,10 @@ const FAMILIES: &[Family] = &[
     (
         "tuisko_kernels_sm120_fp8_mlp",
         tuisko_kernels_sm120_fp8_mlp::kernel_ptx_names,
+    ),
+    (
+        "tuisko_kernels_sm120_qwen38_flash_next_projection",
+        tuisko_kernels_sm120_qwen38_flash_next_projection::kernel_ptx_names,
     ),
     (
         "tuisko_kernels_sm120_gdn",
@@ -80,10 +84,11 @@ mod tests {
         ("tuisko_kernels_sm120_nvfp4", 140),
         ("tuisko_kernels_sm120_fp8_projection", 160),
         ("tuisko_kernels_sm120_fp8_mlp", 26),
+        ("tuisko_kernels_sm120_qwen38_flash_next_projection", 36),
         ("tuisko_kernels_sm120_gdn", 134),
         ("tuisko_kernels_sm120_mtp", 187),
         ("tuisko_kernels_sm120_hyper_connection", 60),
-        ("tuisko_kernels_sm120_lm_head", 16),
+        ("tuisko_kernels_sm120_lm_head", 24),
         ("tuisko_kernels_sm120_moe", 172),
         ("tuisko_kernels_sm120_engram", 66),
     ];
@@ -135,7 +140,7 @@ mod tests {
             .iter()
             .map(|(module, names)| (*module, names().len()))
             .collect::<Vec<_>>();
-        let pinned = FAMILY_COUNTS.iter().copied().collect::<Vec<_>>();
+        let pinned = FAMILY_COUNTS.to_vec();
 
         assert_eq!(declared, pinned);
         assert_eq!(

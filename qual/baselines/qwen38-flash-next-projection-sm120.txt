@@ -1,0 +1,8 @@
+cuda_oxide_commit=0199e55572ee78cd2cea97335e5b7392a3f9be4a
+rustc_release=1.96.0-nightly
+rustc_commit=55e86c996809902e8bbad512cfb4d2c18be446d9
+cuda_toolkit_release=13.3
+cuda_toolkit_version=13.3.73
+gdn_input_registers=22,22,22,22,40,42,66,66,66,66,66,86
+qsa_qkv_registers=24,24,24,24,40,42,66,66,66,66,66,86
+block_output_registers=24,24,24,24,40,42,66,66,66,66,66,86
