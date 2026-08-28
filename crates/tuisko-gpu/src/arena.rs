@@ -1,6 +1,10 @@
 //! Typed layout and single-allocation ownership for address-stable workspaces.
 
-use crate::{CudaStream, DeviceBuffer, DeviceCopy, GpuError, GpuResult, PinnedHostBuffer};
+use crate::{
+    CudaContext, CudaStream, DeviceBuffer, DeviceCopy, GpuError, GpuResult, PinnedHostBuffer,
+    VmmSegmentClass, VmmSegmentManifest,
+};
+use cuda_core::vmm::{Mapping, PhysicalAllocation, VirtualReservation};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::mem::{align_of, size_of, size_of_val};
@@ -9,6 +13,13 @@ use std::sync::Arc;
 
 /// The base alignment the CUDA driver guarantees for every device allocation.
 const DRIVER_BASE_ALIGNMENT: usize = 256;
+
+/// Queries the exact device's minimum VMM physical-allocation granularity.
+pub fn vmm_allocation_granularity(stream: &CudaStream) -> GpuResult<usize> {
+    bind_context(stream, "binding the VMM granularity-query context")?;
+    cuda_core::vmm::allocation_granularity(stream.context().cu_device())
+        .map_err(|source| GpuError::driver("querying VMM allocation granularity", source))
+}
 
 #[cfg(debug_assertions)]
 fn next_layout_nonce() -> u64 {
@@ -168,7 +179,8 @@ impl ArenaLayout {
 
 /// One address-stable device allocation partitioned by checked typed regions.
 pub struct DeviceArena {
-    storage: DeviceBuffer<u8>,
+    storage: ArenaStorage,
+    context: Arc<CudaContext>,
     bytes: usize,
     #[cfg(debug_assertions)]
     layout: u64,
@@ -179,12 +191,167 @@ pub struct DeviceArena {
 /// Every write and the final seal run on the retained allocation stream, so no
 /// caller can select a stream that would order them differently.
 pub struct LoadingDeviceArena {
-    storage: DeviceBuffer<u8>,
+    storage: ArenaStorage,
     stream: Arc<CudaStream>,
     bytes: usize,
     initialized: InitializationCoverage,
     #[cfg(debug_assertions)]
     layout: u64,
+}
+
+enum ArenaStorage {
+    Legacy(DeviceBuffer<u8>),
+    Vmm(VmmArenaStorage),
+}
+
+struct VmmArenaStorage {
+    segments: Vec<VmmSegmentBacking>,
+    reservation: VirtualReservation,
+    granularity: usize,
+    parkable_bytes: usize,
+    context: Arc<CudaContext>,
+}
+
+struct VmmSegmentBacking {
+    mapping: Option<Mapping>,
+    allocation: Option<PhysicalAllocation>,
+    offset: usize,
+    bytes: usize,
+    class: VmmSegmentClass,
+}
+
+struct NewVmmBacking {
+    mapping: Mapping,
+    allocation: PhysicalAllocation,
+}
+
+impl ArenaStorage {
+    fn base_address(&self) -> u64 {
+        match self {
+            Self::Legacy(storage) => storage.cu_deviceptr(),
+            Self::Vmm(storage) => storage.reservation.base(),
+        }
+    }
+}
+
+impl VmmArenaStorage {
+    fn allocate(stream: &CudaStream, manifest: &VmmSegmentManifest) -> GpuResult<Self> {
+        bind_context(stream, "binding the VMM arena CUDA context")?;
+        let device = stream.context().cu_device();
+        let granularity = vmm_allocation_granularity(stream)?;
+        if granularity != manifest.granularity() {
+            return Err(GpuError::arena(format!(
+                "VMM manifest granularity {} does not match device granularity {granularity}",
+                manifest.granularity()
+            )));
+        }
+        let reservation = VirtualReservation::new(manifest.reservation_bytes(), granularity)
+            .map_err(|source| GpuError::driver("reserving VMM arena addresses", source))?;
+        let mut segments = Vec::with_capacity(manifest.segments().len());
+        for segment in manifest.segments() {
+            let allocation = PhysicalAllocation::new(device, segment.bytes())
+                .map_err(|source| GpuError::driver("allocating VMM arena backing", source))?;
+            let va = reservation
+                .base()
+                .checked_add(u64::try_from(segment.offset()).map_err(|_| {
+                    GpuError::arena("VMM segment offset exceeds the device address width")
+                })?)
+                .ok_or_else(|| GpuError::arena("VMM segment address overflows"))?;
+            let mapping = Mapping::new(va, segment.bytes(), &allocation, 0)
+                .map_err(|source| GpuError::driver("mapping VMM arena backing", source))?;
+            cuda_core::vmm::set_access(va, segment.bytes(), &[device])
+                .map_err(|source| GpuError::driver("granting VMM arena access", source))?;
+            segments.push(VmmSegmentBacking {
+                mapping: Some(mapping),
+                allocation: Some(allocation),
+                offset: segment.offset(),
+                bytes: segment.bytes(),
+                class: segment.class(),
+            });
+        }
+
+        Ok(Self {
+            segments,
+            reservation,
+            granularity,
+            parkable_bytes: manifest.parkable_bytes(),
+            context: stream.context().clone(),
+        })
+    }
+
+    fn park(&mut self, stream: &CudaStream) -> GpuResult<usize> {
+        stream
+            .synchronize()
+            .map_err(|source| GpuError::driver("synchronizing before VMM arena park", source))?;
+        for segment in &mut self.segments {
+            if segment.class == VmmSegmentClass::Parkable {
+                drop(segment.mapping.take());
+                drop(segment.allocation.take());
+            }
+        }
+        Ok(self.parkable_bytes)
+    }
+
+    fn resume(&mut self, stream: &CudaStream) -> GpuResult<usize> {
+        bind_context(stream, "binding the VMM arena resume context")?;
+        let device = stream.context().cu_device();
+        let mut replacements = Vec::new();
+        let mut resumed_bytes = 0usize;
+        for (index, segment) in self.segments.iter().enumerate() {
+            if segment.class != VmmSegmentClass::Parkable {
+                continue;
+            }
+            if segment.mapping.is_some() && segment.allocation.is_some() {
+                continue;
+            }
+            if segment.mapping.is_some() || segment.allocation.is_some() {
+                return Err(GpuError::arena(
+                    "parkable VMM segment retained partial physical ownership",
+                ));
+            }
+            let allocation = PhysicalAllocation::new(device, segment.bytes)
+                .map_err(|source| GpuError::driver("allocating resumed VMM backing", source))?;
+            let va = self
+                .reservation
+                .base()
+                .checked_add(u64::try_from(segment.offset).map_err(|_| {
+                    GpuError::arena("resumed VMM segment offset exceeds device width")
+                })?)
+                .ok_or_else(|| GpuError::arena("resumed VMM segment address overflows"))?;
+            let mapping = Mapping::new(va, segment.bytes, &allocation, 0)
+                .map_err(|source| GpuError::driver("mapping resumed VMM backing", source))?;
+            cuda_core::vmm::set_access(va, segment.bytes, &[device])
+                .map_err(|source| GpuError::driver("granting resumed VMM access", source))?;
+            replacements.push((
+                index,
+                NewVmmBacking {
+                    mapping,
+                    allocation,
+                },
+            ));
+            resumed_bytes = resumed_bytes
+                .checked_add(segment.bytes)
+                .ok_or_else(|| GpuError::arena("resumed VMM byte count overflows"))?;
+        }
+        for (index, replacement) in replacements {
+            let segment = &mut self.segments[index];
+            segment.mapping = Some(replacement.mapping);
+            segment.allocation = Some(replacement.allocation);
+        }
+        Ok(resumed_bytes)
+    }
+
+    fn is_parked(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|segment| segment.class == VmmSegmentClass::Parkable && segment.mapping.is_none())
+    }
+}
+
+impl Drop for VmmArenaStorage {
+    fn drop(&mut self) {
+        self.context.record_err(self.context.bind_to_thread());
+    }
 }
 
 impl LoadingDeviceArena {
@@ -199,6 +366,31 @@ impl LoadingDeviceArena {
             })?;
         layout.require_base_alignment(storage.cu_deviceptr())?;
 
+        Ok(Self {
+            storage: ArenaStorage::Legacy(storage),
+            stream: stream.clone(),
+            bytes: layout.byte_len(),
+            initialized: InitializationCoverage::new(layout.byte_len()),
+            #[cfg(debug_assertions)]
+            layout: layout.nonce,
+        })
+    }
+
+    /// Allocates checked VMM storage without initializing its typed layout bytes.
+    pub fn allocate_vmm(
+        stream: &Arc<CudaStream>,
+        layout: &ArenaLayout,
+        manifest: &VmmSegmentManifest,
+    ) -> GpuResult<Self> {
+        if manifest.arena_bytes() != layout.byte_len() {
+            return Err(GpuError::arena(format!(
+                "VMM manifest covers {} arena bytes for a {}-byte layout",
+                manifest.arena_bytes(),
+                layout.byte_len()
+            )));
+        }
+        let storage = ArenaStorage::Vmm(VmmArenaStorage::allocate(stream, manifest)?);
+        layout.require_base_alignment(storage.base_address())?;
         Ok(Self {
             storage,
             stream: stream.clone(),
@@ -326,6 +518,7 @@ impl LoadingDeviceArena {
         })?;
         Ok(DeviceArena {
             storage: self.storage,
+            context: self.stream.context().clone(),
             bytes: self.bytes,
             #[cfg(debug_assertions)]
             layout: self.layout,
@@ -342,7 +535,7 @@ impl LoadingDeviceArena {
             GpuError::arena("loading-arena offset exceeds the device address width")
         })?;
         self.storage
-            .cu_deviceptr()
+            .base_address()
             .checked_add(offset)
             .ok_or_else(|| GpuError::arena("loading-arena device address overflows"))
     }
@@ -502,7 +695,47 @@ impl DeviceArena {
             .map_err(|source| GpuError::driver("synchronizing device arena zeroing", source))?;
 
         Ok(Self {
+            storage: ArenaStorage::Legacy(storage),
+            context: stream.context().clone(),
+            bytes: layout.byte_len(),
+            #[cfg(debug_assertions)]
+            layout: layout.nonce,
+        })
+    }
+
+    /// Allocates and zeroes a checked VMM-backed arena.
+    pub fn zeroed_vmm(
+        stream: &CudaStream,
+        layout: &ArenaLayout,
+        manifest: &VmmSegmentManifest,
+    ) -> GpuResult<Self> {
+        if manifest.arena_bytes() != layout.byte_len() {
+            return Err(GpuError::arena(format!(
+                "VMM manifest covers {} arena bytes for a {}-byte layout",
+                manifest.arena_bytes(),
+                layout.byte_len()
+            )));
+        }
+        let storage = ArenaStorage::Vmm(VmmArenaStorage::allocate(stream, manifest)?);
+        layout.require_base_alignment(storage.base_address())?;
+        if layout.byte_len() != 0 {
+            // SAFETY: every byte in the typed layout is mapped and writable on this context.
+            unsafe {
+                cuda_core::memory::memset_d8_async(
+                    storage.base_address(),
+                    0,
+                    layout.byte_len(),
+                    stream.cu_stream(),
+                )
+            }
+            .map_err(|source| GpuError::driver("zeroing a VMM device arena", source))?;
+            stream
+                .synchronize()
+                .map_err(|source| GpuError::driver("synchronizing VMM arena zeroing", source))?;
+        }
+        Ok(Self {
             storage,
+            context: stream.context().clone(),
             bytes: layout.byte_len(),
             #[cfg(debug_assertions)]
             layout: layout.nonce,
@@ -511,7 +744,7 @@ impl DeviceArena {
 
     /// Returns the stable base device address.
     pub fn base_address(&self) -> u64 {
-        self.storage.cu_deviceptr()
+        self.storage.base_address()
     }
 
     /// Returns the allocation size in bytes.
@@ -519,9 +752,61 @@ impl DeviceArena {
         self.bytes
     }
 
+    /// Physical device bytes currently mapped by this arena.
+    pub fn mapped_physical_bytes(&self) -> usize {
+        match &self.storage {
+            ArenaStorage::Legacy(_) => self.bytes,
+            ArenaStorage::Vmm(storage) => storage
+                .segments
+                .iter()
+                .filter(|segment| segment.allocation.is_some())
+                .map(|segment| segment.bytes)
+                .sum(),
+        }
+    }
+
     /// Returns whether this arena owns no device bytes.
     pub const fn is_empty(&self) -> bool {
         self.bytes == 0
+    }
+
+    /// Releases every parkable VMM mapping after draining the supplied stream.
+    pub fn park(&mut self, stream: &CudaStream) -> GpuResult<usize> {
+        self.require_stream_context(stream, "parking a VMM device arena")?;
+        match &mut self.storage {
+            ArenaStorage::Vmm(storage) if !storage.is_parked() => storage.park(stream),
+            ArenaStorage::Vmm(_) => Err(GpuError::arena("VMM device arena is already parked")),
+            ArenaStorage::Legacy(_) => Err(GpuError::arena(
+                "legacy device arena cannot preserve addresses while parked",
+            )),
+        }
+    }
+
+    /// Recreates every released parkable mapping at its retained virtual address.
+    pub fn resume(&mut self, stream: &CudaStream) -> GpuResult<usize> {
+        self.require_stream_context(stream, "resuming a VMM device arena")?;
+        match &mut self.storage {
+            ArenaStorage::Vmm(storage) => storage.resume(stream),
+            ArenaStorage::Legacy(_) => Err(GpuError::arena(
+                "legacy device arena cannot resume retained addresses",
+            )),
+        }
+    }
+
+    /// Minimum allocation granularity when this arena is VMM-backed.
+    pub fn vmm_granularity(&self) -> Option<usize> {
+        match &self.storage {
+            ArenaStorage::Vmm(storage) => Some(storage.granularity),
+            ArenaStorage::Legacy(_) => None,
+        }
+    }
+
+    /// Physical bytes released by [`Self::park`] for a VMM-backed arena.
+    pub fn parkable_bytes(&self) -> usize {
+        match &self.storage {
+            ArenaStorage::Vmm(storage) => storage.parkable_bytes,
+            ArenaStorage::Legacy(_) => 0,
+        }
     }
 
     /// Returns the checked device address of `region`.
@@ -648,11 +933,20 @@ impl DeviceArena {
     /// Copies the complete arena into a host byte vector.
     pub fn to_host_vec(&self, stream: &CudaStream) -> GpuResult<Vec<u8>> {
         self.require_stream_context(stream, "copying a device arena to the host")?;
-        bind_context(stream, "binding the arena CUDA context")?;
-        self.storage.to_host_vec(stream).map_err(|source| {
-            drain_failed_download(stream);
-            GpuError::driver("copying a device arena to the host", source)
-        })
+        let mut host = vec![0u8; self.bytes];
+        if !host.is_empty() {
+            // SAFETY: the host vector and checked live arena both cover `self.bytes` bytes.
+            unsafe {
+                download(
+                    stream,
+                    host.as_mut_ptr(),
+                    self.base_address(),
+                    self.bytes,
+                    "copying a device arena to the host",
+                )?;
+            }
+        }
+        Ok(host)
     }
 
     /// Copies one complete typed region from a host slice.
@@ -1061,7 +1355,7 @@ impl DeviceArena {
     }
 
     fn require_stream_context(&self, stream: &CudaStream, operation: &str) -> GpuResult<()> {
-        if self.storage.context().as_ref() != stream.context().as_ref() {
+        if self.context.as_ref() != stream.context().as_ref() {
             return Err(GpuError::context(format!(
                 "{operation} requires the allocation and stream to share one CUDA context"
             )));
@@ -1074,7 +1368,10 @@ impl DeviceArena {
 #[cfg(test)]
 mod tests {
     use super::{ArenaLayout, DeviceArena, InitializationCoverage, LoadingDeviceArena};
-    use crate::{CudaContext, GpuErrorCode, PinnedHostBuffer};
+    use crate::{
+        CudaContext, CudaGraph, GpuErrorCode, PinnedHostBuffer, VmmSegmentClass,
+        VmmSegmentManifest, device_memory_info, vmm_allocation_granularity,
+    };
 
     #[test]
     fn layout_aligns_non_overlapping_typed_regions() {
@@ -1205,6 +1502,65 @@ mod tests {
             arena
                 .copy_region_bytes_from_host(&stream, words, &[0; 3])
                 .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive NVIDIA compute-capability 12.0 device"]
+    fn vmm_park_resume_preserves_addresses_and_captured_graph_replay() {
+        let context = CudaContext::new(0).unwrap();
+        assert_eq!(context.compute_capability().unwrap(), (12, 0));
+        let stream = context.new_stream().unwrap();
+        let granularity = vmm_allocation_granularity(&stream).unwrap();
+        let mut layout = ArenaLayout::new();
+        let values = layout.reserve::<u32>(granularity / 4, 256).unwrap();
+        let manifest =
+            VmmSegmentManifest::uniform(layout.byte_len(), granularity, VmmSegmentClass::Parkable)
+                .unwrap();
+        let mut arena = DeviceArena::zeroed_vmm(&stream, &layout, &manifest).unwrap();
+        let base_address = arena.base_address();
+        let values_address = arena.address(values).unwrap();
+        let graph = CudaGraph::capture(&stream, || arena.fill(&stream, values, 0x5a)).unwrap();
+
+        // SAFETY: the graph references only `arena`, whose captured virtual address remains
+        // reserved through both launches and is mapped during each replay.
+        unsafe {
+            graph.launch(&stream).unwrap();
+        }
+        stream.synchronize().unwrap();
+        assert!(
+            arena
+                .copy_to_host(&stream, values)
+                .unwrap()
+                .iter()
+                .all(|value| *value == 0x5a5a_5a5a)
+        );
+
+        let mapped_memory = device_memory_info(&context).unwrap();
+        assert_eq!(arena.park(&stream).unwrap(), granularity);
+        let parked_memory = device_memory_info(&context).unwrap();
+        assert!(parked_memory.free_bytes >= mapped_memory.free_bytes + granularity);
+        assert_eq!(arena.mapped_physical_bytes(), 0);
+        assert_eq!(arena.base_address(), base_address);
+        assert_eq!(arena.address(values).unwrap(), values_address);
+        assert_eq!(arena.resume(&stream).unwrap(), granularity);
+        let resumed_memory = device_memory_info(&context).unwrap();
+        assert!(resumed_memory.free_bytes + granularity <= parked_memory.free_bytes);
+        assert_eq!(arena.mapped_physical_bytes(), granularity);
+        assert_eq!(arena.base_address(), base_address);
+        assert_eq!(arena.address(values).unwrap(), values_address);
+
+        // SAFETY: resume remapped the graph's captured virtual address before replay.
+        unsafe {
+            graph.launch(&stream).unwrap();
+        }
+        stream.synchronize().unwrap();
+        assert!(
+            arena
+                .copy_to_host(&stream, values)
+                .unwrap()
+                .iter()
+                .all(|value| *value == 0x5a5a_5a5a)
         );
     }
 

@@ -2,10 +2,12 @@
 
 Status: implementation in progress. Last updated 2026-08-28.
 
-The A1 host lifecycle and B0 checked segment-manifest groundwork are implemented in the current
-working tree. A remains unqualified until A2 runs on an exclusive RTX 5090. B0 still needs the
-device granularity/VMM feasibility gate, and production park/resume ownership and routes have not
-been implemented.
+The A1 host lifecycle and B0 checked segment manifest are implemented. The B0 VMM
+release/remap/same-graph feasibility probe passes on the exact RTX 5090, including the checked
+free-memory delta. The current branch also contains the B1 VMM arena migration, B2 compact pinned
+durable-state owner/type-state transition, and B3 serving routes and host tests. A and B remain
+unqualified until their complete numerical, resource, artifact, failure, and performance gates
+run; implementation or a representative primitive probe is not exact-model device authority.
 
 This plan covers only the complete product target,
 `unsloth/Qwen3.8-27B-NVFP4` at revision
@@ -403,15 +405,20 @@ Remote timing remains diagnostic and cannot bless a baseline.
 
 | Step | Kind | Status |
 | --- | --- | --- |
-| A: MR-A1 host plumbing and tests | host | can start immediately |
-| A: MR-A2 lifecycle qualification | device | **pending — device refused** |
-| B: MR-B0 host manifest work | host | can start immediately |
-| B: MR-B0 VMM feasibility probe | device | **pending — device refused** |
-| B: MR-B1…B3 | host + device | pending A and the B0 decision |
+| A: MR-A1 host plumbing and tests | host | implemented |
+| A: MR-A2 lifecycle qualification | device | pending |
+| B: MR-B0 host manifest work | host | implemented |
+| B: MR-B0 VMM feasibility probe | device | passed locally on the exact RTX 5090 |
+| B: MR-B1 VMM ownership | host + device | host implementation complete; device gate pending |
+| B: MR-B2 engine park/resume | host + device | host implementation complete; device gate pending |
+| B: MR-B3 serving | host + device | host/server tests complete; exact-model device gate pending |
 
 Device refusal recorded 2026-08-28 20:54 UTC: `nvidia-smi` showed 30,404 MiB used and
 96–97% utilization bursts from a process outside this sandbox's PID namespace; its process table
 was empty and no local `:8000` listener existed. That failed both the no-foreign-compute and
-pre-used-memory gates. Host work may proceed, but no device gate is reported passed until the exact
-RTX 5090 is exclusively idle. `xtask remote` requires explicit owner permission, must follow the
-lease and cleanup rules in `docs/remote-gates.md`, and remains non-authoritative for performance.
+pre-used-memory gates. The device later became exclusively idle. `cargo run -p xtask --
+build-sm120` passed its artifact and resource checks, and the isolated B0 probe proved mapping
+release, its free-memory delta, same-address remap, and unchanged CUDA Graph replay. No complete A2
+or exact-model B1/B2/B3 device qualification is reported passed. `xtask remote` requires explicit
+owner permission, must follow the lease and cleanup rules in `docs/remote-gates.md`, and remains
+non-authoritative for performance.

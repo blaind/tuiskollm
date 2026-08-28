@@ -1,4 +1,4 @@
-//! Checked physical-segment planning for a future VMM-backed arena.
+//! Checked physical-segment planning for address-stable VMM-backed arenas.
 
 use crate::{GpuError, GpuResult};
 use std::ops::Range;
@@ -47,6 +47,29 @@ pub struct VmmSegmentManifest {
 }
 
 impl VmmSegmentManifest {
+    /// Declares one complete arena as a single physical-lifetime class.
+    pub fn uniform(
+        arena_bytes: usize,
+        granularity: usize,
+        class: VmmSegmentClass,
+    ) -> GpuResult<Self> {
+        let complete = 0..arena_bytes;
+        match class {
+            VmmSegmentClass::Resident => Self::build(
+                arena_bytes,
+                granularity,
+                std::slice::from_ref(&complete),
+                &[],
+            ),
+            VmmSegmentClass::Parkable => Self::build(
+                arena_bytes,
+                granularity,
+                &[],
+                std::slice::from_ref(&complete),
+            ),
+        }
+    }
+
     /// Classifies every granule from declared resident and parkable byte ranges.
     ///
     /// A mixed granule is resident. Every arena byte must be covered by exactly one class; only
@@ -226,5 +249,18 @@ mod tests {
         let middle = std::iter::once(100..200).collect::<Vec<_>>();
         let after_middle = std::iter::once(256..1_024).collect::<Vec<_>>();
         assert!(VmmSegmentManifest::build(1_024, 256, &middle, &after_middle).is_err());
+    }
+
+    #[test]
+    fn uniform_manifest_rounds_physical_coverage_without_widening_typed_bytes() {
+        let resident = VmmSegmentManifest::uniform(1_000, 256, VmmSegmentClass::Resident).unwrap();
+        assert_eq!(resident.arena_bytes(), 1_000);
+        assert_eq!(resident.reservation_bytes(), 1_024);
+        assert_eq!(resident.parkable_bytes(), 0);
+
+        let parkable = VmmSegmentManifest::uniform(1_000, 256, VmmSegmentClass::Parkable).unwrap();
+        assert_eq!(parkable.arena_bytes(), 1_000);
+        assert_eq!(parkable.reservation_bytes(), 1_024);
+        assert_eq!(parkable.parkable_bytes(), 1_024);
     }
 }

@@ -107,7 +107,8 @@ pub use qwen38::resident_mtp::{
     ResidentMtpRealignRoute,
 };
 pub use qwen38::resident_mtp_batch_generation::{
-    ResidentMtpBatchEvent, ResidentMtpBatchEvents, ResidentMtpBatchGenerator,
+    ParkedQwen38Generator, Qwen38ParkStats, ResidentMtpBatchEvent, ResidentMtpBatchEvents,
+    ResidentMtpBatchGenerator,
 };
 pub use qwen38::resident_mtp_generation::{ResidentMtpGenerationSession, ResidentMtpTextGenerator};
 pub use qwen38::resident_mtp_layout::ResidentMtpLayout;

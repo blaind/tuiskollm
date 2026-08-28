@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tuisko_gpu::{
     CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, PinnedHostBuffer,
+    VmmSegmentClass, VmmSegmentManifest, vmm_allocation_granularity,
 };
 use tuisko_kernels_sm120::{
     ATTENTION_PAGE_SIZE, LmHeadOp, MtpBf16AttentionOutputOp, MtpBf16FusionOp, MtpBf16MlpOp,
@@ -429,6 +430,28 @@ impl ResidentMtpArenaReservation {
         let layout = ResidentMtpLayout::build()?;
         let arena = DeviceArena::zeroed(stream, layout.arena())?;
         let cache_arena = DeviceArena::zeroed(stream, layout.cache_arena())?;
+        Ok(Self {
+            layout,
+            arena,
+            cache_arena,
+        })
+    }
+
+    pub(crate) fn allocate_vmm(stream: &CudaStream) -> EngineResult<Self> {
+        let layout = ResidentMtpLayout::build()?;
+        let granularity = vmm_allocation_granularity(stream)?;
+        let arena_manifest = VmmSegmentManifest::uniform(
+            layout.arena().byte_len(),
+            granularity,
+            VmmSegmentClass::Resident,
+        )?;
+        let cache_manifest = VmmSegmentManifest::uniform(
+            layout.cache_arena().byte_len(),
+            granularity,
+            VmmSegmentClass::Parkable,
+        )?;
+        let arena = DeviceArena::zeroed_vmm(stream, layout.arena(), &arena_manifest)?;
+        let cache_arena = DeviceArena::zeroed_vmm(stream, layout.cache_arena(), &cache_manifest)?;
         Ok(Self {
             layout,
             arena,
@@ -1107,6 +1130,158 @@ impl ResidentMtpProgram {
         Ok(())
     }
 
+    pub(crate) fn park_cache_page_values(&self) -> EngineResult<usize> {
+        product(
+            "resident park MTP cache-page values",
+            product(
+                "resident park MTP cache-page heads",
+                Qwen38_27B::NUM_KV_HEADS,
+                ATTENTION_PAGE_SIZE,
+            )?,
+            Qwen38_27B::HEAD_DIM,
+        )
+    }
+
+    pub(crate) fn capture_cache_page_into(
+        &self,
+        stream: &CudaStream,
+        physical_page: usize,
+        mirror_page: usize,
+        key: &mut PinnedHostBuffer<u16>,
+        value: &mut PinnedHostBuffer<u16>,
+    ) -> EngineResult<()> {
+        if physical_page >= LONG_CONTEXT_PHYSICAL_PAGES {
+            return Err(EngineError::route(format!(
+                "resident MTP cache page {physical_page} is outside 0..{LONG_CONTEXT_PHYSICAL_PAGES}"
+            )));
+        }
+        let page_values = self.park_cache_page_values()?;
+        let source_start = product("resident MTP cache-page offset", physical_page, page_values)?;
+        let destination_start =
+            product("resident MTP mirror-page offset", mirror_page, page_values)?;
+        let destination_end = destination_start
+            .checked_add(page_values)
+            .ok_or_else(|| EngineError::layout("resident MTP mirror range overflows"))?;
+        if destination_end > key.len() || destination_end > value.len() {
+            return Err(EngineError::layout(
+                "resident MTP cache mirror is too small",
+            ));
+        }
+        let cache = self.layout.cache_regions();
+        // SAFETY: the pinned ranges remain unread until the synchronization below completes.
+        unsafe {
+            self.cache_arena.copy_slice_to_pinned_host_async(
+                stream,
+                cache.key_pages,
+                source_start,
+                key,
+                destination_start,
+                page_values,
+            )?;
+            self.cache_arena.copy_slice_to_pinned_host_async(
+                stream,
+                cache.value_pages,
+                source_start,
+                value,
+                destination_start,
+                page_values,
+            )?;
+        }
+        stream.synchronize().map_err(GpuError::from)?;
+        Ok(())
+    }
+
+    pub(crate) fn restore_cache_page_from(
+        &self,
+        stream: &CudaStream,
+        physical_page: usize,
+        mirror_page: usize,
+        key: &PinnedHostBuffer<u16>,
+        value: &PinnedHostBuffer<u16>,
+    ) -> EngineResult<()> {
+        if physical_page >= LONG_CONTEXT_PHYSICAL_PAGES {
+            return Err(EngineError::route(format!(
+                "resident MTP cache page {physical_page} is outside 0..{LONG_CONTEXT_PHYSICAL_PAGES}"
+            )));
+        }
+        let page_values = self.park_cache_page_values()?;
+        let destination_start =
+            product("resident MTP cache-page offset", physical_page, page_values)?;
+        let source_start = product("resident MTP mirror-page offset", mirror_page, page_values)?;
+        let source_end = source_start
+            .checked_add(page_values)
+            .ok_or_else(|| EngineError::layout("resident MTP mirror range overflows"))?;
+        if source_end > key.len() || source_end > value.len() {
+            return Err(EngineError::layout(
+                "resident MTP cache mirror is too small",
+            ));
+        }
+        let cache = self.layout.cache_regions();
+        // SAFETY: the pinned mirror remains immutable through the caller's final stream sync.
+        unsafe {
+            self.cache_arena.copy_slice_from_pinned_host_async(
+                stream,
+                cache.key_pages,
+                destination_start,
+                key,
+                source_start,
+                page_values,
+            )?;
+            self.cache_arena.copy_slice_from_pinned_host_async(
+                stream,
+                cache.value_pages,
+                destination_start,
+                value,
+                source_start,
+                page_values,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mtp_table_checksum_against_host(&self, stream: &CudaStream) -> EngineResult<u64> {
+        let device = self
+            .arena
+            .copy_to_host(stream, self.layout.regions().block_tables)?;
+        for slot in 0..MAX_BATCH {
+            let start = product(
+                "resident MTP table row offset",
+                slot,
+                LONG_CONTEXT_PHYSICAL_PAGES,
+            )?;
+            let end = start + LONG_CONTEXT_PHYSICAL_PAGES;
+            if device[start..end] != *self.target.host_block_table(slot)? {
+                return Err(EngineError::generation(format!(
+                    "resident MTP device table for slot {slot} disagrees with host ownership"
+                )));
+            }
+        }
+        let mut checksum = 0xcbf29ce484222325u64;
+        for word in device {
+            for byte in word.to_ne_bytes() {
+                checksum ^= u64::from(byte);
+                checksum = checksum.wrapping_mul(0x100000001b3);
+            }
+        }
+        Ok(checksum)
+    }
+
+    pub(crate) fn park_device_arenas(&mut self, stream: &CudaStream) -> EngineResult<usize> {
+        let target = self.target.park_device_arenas(stream)?;
+        let cache = self.cache_arena.park(stream)?;
+        target
+            .checked_add(cache)
+            .ok_or_else(|| EngineError::layout("resident MTP parked byte count overflows"))
+    }
+
+    pub(crate) fn resume_device_arenas(&mut self, stream: &CudaStream) -> EngineResult<usize> {
+        let target = self.target.resume_device_arenas(stream)?;
+        let cache = self.cache_arena.resume(stream)?;
+        target
+            .checked_add(cache)
+            .ok_or_else(|| EngineError::layout("resident MTP resumed byte count overflows"))
+    }
+
     /// Clears one assigned slot in both target and MTP persistent owners.
     pub fn reset_slot(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
         self.target.reset_slot(stream, slot)?;
@@ -1196,6 +1371,11 @@ impl ResidentMtpProgram {
     /// Complete incremental MTP device bytes including padding.
     pub const fn owner_bytes(&self) -> usize {
         self.layout.owner_bytes()
+    }
+
+    /// Physical VMM bytes currently mapped by the incremental MTP arenas.
+    pub fn mapped_device_bytes(&self) -> usize {
+        self.arena.mapped_physical_bytes() + self.cache_arena.mapped_physical_bytes()
     }
 
     /// Exact incremental alignment padding.

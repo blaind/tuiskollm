@@ -1,6 +1,7 @@
 //! Compact greedy and sampled MTP generation over the resident target-plus-draft owner.
 
 use crate::common::banks::{compact, row};
+use crate::common::math::product;
 use crate::common::mtp::{
     DRAFT_WINDOW, MtpEventBuilder, VERIFY_ROWS, decide_greedy_lane, decide_sampled_lane,
     require_generation_capacity,
@@ -10,9 +11,9 @@ use crate::common::slots::device_zero_context;
 use crate::qwen38::resident_mtp_generation::prime_prompt;
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, GeneratedText, GenerationSession,
-    GenerationStep, MAX_BATCH, ResidentBatchAdmission, ResidentCancellation, ResidentLoadProgress,
-    ResidentMtpGenerationStats, ResidentMtpLoadStats, ResidentMtpProgram,
-    ResidentMtpSegmentedVerifyRoute, ResidentMtpVerifyRoute, ResidentRequestId,
+    GenerationStep, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, ResidentBatchAdmission,
+    ResidentCancellation, ResidentLoadProgress, ResidentMtpGenerationStats, ResidentMtpLoadStats,
+    ResidentMtpProgram, ResidentMtpSegmentedVerifyRoute, ResidentMtpVerifyRoute, ResidentRequestId,
     SamplingDistribution,
 };
 use std::sync::Arc;
@@ -46,6 +47,49 @@ pub struct ResidentMtpBatchGenerator {
     next_request_id: u64,
     retention_clock: u64,
     stop_ids: [u32; 2],
+}
+
+/// Qwen3.8 generator whose durable mappings are absent and cannot launch graphs.
+pub struct ParkedQwen38Generator {
+    generator: ResidentMtpBatchGenerator,
+    mirror: Qwen38ParkMirror,
+    released_device_bytes: usize,
+}
+
+/// Exact ownership transferred from device to pinned host memory by one park.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen38ParkStats {
+    /// Page-locked mirror bytes plus its fixed typed manifest.
+    pub host_bytes: usize,
+    /// Physical VMM backing bytes released while retaining virtual addresses.
+    pub released_device_bytes: usize,
+    /// Retained slots represented by the mirror.
+    pub retained_slots: usize,
+    /// Shared physical KV pages represented by the mirror.
+    pub retained_pages: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ParkedSlotManifest {
+    slot: usize,
+    token_count: usize,
+    retention_generation: u64,
+    first_page: usize,
+    page_count: usize,
+    checksum: u64,
+}
+
+struct Qwen38ParkMirror {
+    slots: Box<[ParkedSlotManifest]>,
+    physical_pages: Box<[u32]>,
+    target_tables: PinnedHostBuffer<u32>,
+    target_history: PinnedHostBuffer<u16>,
+    target_state: PinnedHostBuffer<f32>,
+    target_key: PinnedHostBuffer<u8>,
+    target_value: PinnedHostBuffer<u8>,
+    mtp_key: PinnedHostBuffer<u16>,
+    mtp_value: PinnedHostBuffer<u16>,
+    mtp_table_checksum: u64,
 }
 
 /// One scheduler event containing every output committed by one MTP transaction.
@@ -545,6 +589,167 @@ impl ResidentMtpBatchGenerator {
         })
     }
 
+    /// Mirrors every retained durable row/page, then releases its VMM physical backing.
+    #[allow(clippy::result_large_err)]
+    pub fn park(self) -> Result<(ParkedQwen38Generator, Qwen38ParkStats), (Self, EngineError)> {
+        if self.active != 0 {
+            return Err((
+                self,
+                EngineError::generation("cannot park an active resident MTP scheduler"),
+            ));
+        }
+        let mut generator = self;
+        let mirror = match generator.capture_park_mirror() {
+            Ok(mirror) => mirror,
+            Err(error) => return Err((generator, error)),
+        };
+        let released_device_bytes = match generator.program.park_device_arenas(&generator.stream) {
+            Ok(bytes) => bytes,
+            Err(error) => return Err((generator, error)),
+        };
+        let stats = Qwen38ParkStats {
+            host_bytes: mirror.host_bytes(),
+            released_device_bytes,
+            retained_slots: mirror.slots.len(),
+            retained_pages: mirror.physical_pages.len(),
+        };
+        Ok((
+            ParkedQwen38Generator {
+                generator,
+                mirror,
+                released_device_bytes,
+            },
+            stats,
+        ))
+    }
+
+    fn capture_park_mirror(&self) -> EngineResult<Qwen38ParkMirror> {
+        let mtp_table_checksum = self.program.mtp_table_checksum_against_host(&self.stream)?;
+        let mut slots = Vec::new();
+        let mut physical_pages = Vec::new();
+        for (slot, retained) in self.retained.iter().enumerate() {
+            let Some(retained) = retained else {
+                continue;
+            };
+            let token_count = self.program.target().mtp_kv_token_count(slot)?;
+            if token_count != retained.tokens.len() {
+                return Err(EngineError::generation(format!(
+                    "retained slot {slot} owns {token_count} device tokens but {} host tokens",
+                    retained.tokens.len()
+                )));
+            }
+            let page_count = self.program.kv_slot_pages(slot)?;
+            let first_page = physical_pages.len();
+            for logical_page in 0..page_count {
+                let physical_page = self
+                    .program
+                    .target()
+                    .mtp_kv_physical_page(slot, logical_page)?;
+                let physical_page = u32::try_from(physical_page)
+                    .map_err(|_| EngineError::layout("resident physical page exceeds u32"))?;
+                if physical_pages.contains(&physical_page) {
+                    return Err(EngineError::generation(format!(
+                        "resident physical page {physical_page} has multiple retained owners"
+                    )));
+                }
+                physical_pages.push(physical_page);
+            }
+            slots.push(ParkedSlotManifest {
+                slot,
+                token_count,
+                retention_generation: retained.last_used,
+                first_page,
+                page_count,
+                checksum: 0,
+            });
+        }
+
+        let context = self.context();
+        let slot_count = slots.len();
+        let page_count = physical_pages.len();
+        let table_values = product(
+            "resident park target table values",
+            slot_count,
+            LONG_CONTEXT_PHYSICAL_PAGES,
+        )?;
+        let history_values = product(
+            "resident park target history values",
+            slot_count,
+            self.program.target().gdn_slot_history_values(),
+        )?;
+        let state_values = product(
+            "resident park target state values",
+            slot_count,
+            self.program.target().gdn_slot_state_values(),
+        )?;
+        let target_page_values = product(
+            "resident park target cache values",
+            page_count,
+            self.program.target().park_cache_page_values()?,
+        )?;
+        let mtp_page_values = product(
+            "resident park MTP cache values",
+            page_count,
+            self.program.park_cache_page_values()?,
+        )?;
+        let mut mirror = Qwen38ParkMirror {
+            slots: slots.into_boxed_slice(),
+            physical_pages: physical_pages.into_boxed_slice(),
+            target_tables: PinnedHostBuffer::zeroed(context, table_values)
+                .map_err(GpuError::from)?,
+            target_history: PinnedHostBuffer::zeroed(context, history_values)
+                .map_err(GpuError::from)?,
+            target_state: PinnedHostBuffer::zeroed(context, state_values)
+                .map_err(GpuError::from)?,
+            target_key: PinnedHostBuffer::zeroed(context, target_page_values)
+                .map_err(GpuError::from)?,
+            target_value: PinnedHostBuffer::zeroed(context, target_page_values)
+                .map_err(GpuError::from)?,
+            mtp_key: PinnedHostBuffer::zeroed(context, mtp_page_values).map_err(GpuError::from)?,
+            mtp_value: PinnedHostBuffer::zeroed(context, mtp_page_values)
+                .map_err(GpuError::from)?,
+            mtp_table_checksum,
+        };
+
+        for mirror_row in 0..mirror.slots.len() {
+            let manifest = mirror.slots[mirror_row];
+            self.program.target().capture_block_table_into(
+                &self.stream,
+                manifest.slot,
+                mirror_row,
+                &mut mirror.target_tables,
+            )?;
+            self.program.target().capture_gdn_slot_into(
+                &self.stream,
+                manifest.slot,
+                mirror_row,
+                &mut mirror.target_history,
+                &mut mirror.target_state,
+            )?;
+        }
+        for (mirror_page, &physical_page) in mirror.physical_pages.iter().enumerate() {
+            let physical_page = physical_page as usize;
+            self.program.target().capture_cache_page_into(
+                &self.stream,
+                physical_page,
+                mirror_page,
+                &mut mirror.target_key,
+                &mut mirror.target_value,
+            )?;
+            self.program.capture_cache_page_into(
+                &self.stream,
+                physical_page,
+                mirror_page,
+                &mut mirror.mtp_key,
+                &mut mirror.mtp_value,
+            )?;
+        }
+        for row in 0..mirror.slots.len() {
+            mirror.slots[row].checksum = mirror.slot_checksum(row, self)?;
+        }
+        Ok(mirror)
+    }
+
     /// Current active request count.
     pub const fn active_requests(&self) -> usize {
         self.active
@@ -561,12 +766,12 @@ impl ResidentMtpBatchGenerator {
     }
 
     /// Complete target and incremental MTP device ownership.
-    pub const fn device_owner_bytes(&self) -> usize {
-        self.program.target().arena_bytes() + self.program.owner_bytes()
+    pub fn device_owner_bytes(&self) -> usize {
+        self.program.target().mapped_device_bytes() + self.program.mapped_device_bytes()
     }
 
     /// Complete target-plus-MTP device ownership reported at server startup.
-    pub const fn arena_bytes(&self) -> usize {
+    pub fn arena_bytes(&self) -> usize {
         self.device_owner_bytes()
     }
 
@@ -1471,6 +1676,233 @@ fn best_retained_prefix(
                 matched.reuse == RetainedReuse::Complete,
             )
         })
+}
+
+impl ParkedQwen38Generator {
+    /// Exact pinned mirror and typed-manifest ownership retained while parked.
+    pub fn host_bytes(&self) -> usize {
+        self.mirror.host_bytes()
+    }
+
+    /// Exact physical allocation bytes released by the completed park.
+    pub const fn released_device_bytes(&self) -> usize {
+        self.released_device_bytes
+    }
+
+    /// Target/MTP VMM physical arena bytes still mapped while parked.
+    pub fn remaining_device_bytes(&self) -> usize {
+        self.generator.device_owner_bytes()
+    }
+
+    /// Recreates the missing physical mappings and restores every durable represented bit.
+    #[allow(clippy::result_large_err)]
+    pub fn resume(self) -> Result<ResidentMtpBatchGenerator, (Self, EngineError)> {
+        let Self {
+            mut generator,
+            mirror,
+            released_device_bytes,
+        } = self;
+        if let Err(error) = restore_park_mirror(&mut generator, &mirror) {
+            return Err((
+                Self {
+                    generator,
+                    mirror,
+                    released_device_bytes,
+                },
+                error,
+            ));
+        }
+        Ok(generator)
+    }
+}
+
+impl Qwen38ParkMirror {
+    fn host_bytes(&self) -> usize {
+        self.target_tables.num_bytes()
+            + self.target_history.num_bytes()
+            + self.target_state.num_bytes()
+            + self.target_key.num_bytes()
+            + self.target_value.num_bytes()
+            + self.mtp_key.num_bytes()
+            + self.mtp_value.num_bytes()
+            + std::mem::size_of_val(self.slots.as_ref())
+            + std::mem::size_of_val(self.physical_pages.as_ref())
+            + std::mem::size_of::<u64>()
+    }
+
+    fn require_checksums(&self, generator: &ResidentMtpBatchGenerator) -> EngineResult<()> {
+        for row in 0..self.slots.len() {
+            let observed = self.slot_checksum(row, generator)?;
+            if observed != self.slots[row].checksum {
+                return Err(EngineError::generation(format!(
+                    "parked Qwen3.8 mirror checksum changed for slot {}",
+                    self.slots[row].slot
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn slot_checksum(
+        &self,
+        row: usize,
+        generator: &ResidentMtpBatchGenerator,
+    ) -> EngineResult<u64> {
+        let manifest = self
+            .slots
+            .get(row)
+            .ok_or_else(|| EngineError::layout("parked Qwen3.8 mirror row is absent"))?;
+        let page_end = manifest
+            .first_page
+            .checked_add(manifest.page_count)
+            .ok_or_else(|| EngineError::layout("parked Qwen3.8 page range overflows"))?;
+        if page_end > self.physical_pages.len() {
+            return Err(EngineError::layout(
+                "parked Qwen3.8 page range exceeds its manifest",
+            ));
+        }
+        let mut checksum = FNV_OFFSET;
+        checksum_usize(&mut checksum, manifest.slot);
+        checksum_usize(&mut checksum, manifest.token_count);
+        checksum_u64(&mut checksum, manifest.retention_generation);
+        checksum_u32(
+            &mut checksum,
+            &self.physical_pages[manifest.first_page..page_end],
+        );
+
+        let table = checked_row_range(row, LONG_CONTEXT_PHYSICAL_PAGES)?;
+        checksum_u32(&mut checksum, &self.target_tables[table]);
+        let history = checked_row_range(row, generator.program.target().gdn_slot_history_values())?;
+        checksum_u16(&mut checksum, &self.target_history[history]);
+        let state = checked_row_range(row, generator.program.target().gdn_slot_state_values())?;
+        checksum_f32(&mut checksum, &self.target_state[state]);
+
+        let target_page_values = generator.program.target().park_cache_page_values()?;
+        let target =
+            checked_page_range(manifest.first_page, manifest.page_count, target_page_values)?;
+        checksum_u8(&mut checksum, &self.target_key[target.clone()]);
+        checksum_u8(&mut checksum, &self.target_value[target]);
+        let mtp_page_values = generator.program.park_cache_page_values()?;
+        let mtp = checked_page_range(manifest.first_page, manifest.page_count, mtp_page_values)?;
+        checksum_u16(&mut checksum, &self.mtp_key[mtp.clone()]);
+        checksum_u16(&mut checksum, &self.mtp_value[mtp]);
+        Ok(checksum)
+    }
+}
+
+fn restore_park_mirror(
+    generator: &mut ResidentMtpBatchGenerator,
+    mirror: &Qwen38ParkMirror,
+) -> EngineResult<()> {
+    mirror.require_checksums(generator)?;
+    generator.program.resume_device_arenas(&generator.stream)?;
+    generator.program.reset_state(&generator.stream)?;
+    generator
+        .program
+        .target()
+        .restore_all_block_tables(&generator.stream)?;
+    for (row, manifest) in mirror.slots.iter().enumerate() {
+        generator.program.target().restore_gdn_slot_from(
+            &generator.stream,
+            manifest.slot,
+            row,
+            &mirror.target_history,
+            &mirror.target_state,
+        )?;
+    }
+    for (mirror_page, &physical_page) in mirror.physical_pages.iter().enumerate() {
+        let physical_page = physical_page as usize;
+        generator.program.target().restore_cache_page_from(
+            &generator.stream,
+            physical_page,
+            mirror_page,
+            &mirror.target_key,
+            &mirror.target_value,
+        )?;
+        generator.program.restore_cache_page_from(
+            &generator.stream,
+            physical_page,
+            mirror_page,
+            &mirror.mtp_key,
+            &mirror.mtp_value,
+        )?;
+    }
+    generator.stream.synchronize().map_err(GpuError::from)?;
+    generator
+        .program
+        .target()
+        .require_device_tables_match_host(&generator.stream)?;
+    let mtp_table_checksum = generator
+        .program
+        .mtp_table_checksum_against_host(&generator.stream)?;
+    if mtp_table_checksum != mirror.mtp_table_checksum {
+        return Err(EngineError::generation(
+            "resident MTP device block tables changed while parked",
+        ));
+    }
+    mirror.require_checksums(generator)?;
+    Ok(())
+}
+
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+fn checksum_byte(checksum: &mut u64, byte: u8) {
+    *checksum ^= u64::from(byte);
+    *checksum = checksum.wrapping_mul(FNV_PRIME);
+}
+
+fn checksum_u8(checksum: &mut u64, values: &[u8]) {
+    for &value in values {
+        checksum_byte(checksum, value);
+    }
+}
+
+fn checksum_u16(checksum: &mut u64, values: &[u16]) {
+    for value in values {
+        checksum_u8(checksum, &value.to_ne_bytes());
+    }
+}
+
+fn checksum_u32(checksum: &mut u64, values: &[u32]) {
+    for value in values {
+        checksum_u8(checksum, &value.to_ne_bytes());
+    }
+}
+
+fn checksum_f32(checksum: &mut u64, values: &[f32]) {
+    for value in values {
+        checksum_u8(checksum, &value.to_bits().to_ne_bytes());
+    }
+}
+
+fn checksum_u64(checksum: &mut u64, value: u64) {
+    checksum_u8(checksum, &value.to_ne_bytes());
+}
+
+fn checksum_usize(checksum: &mut u64, value: usize) {
+    checksum_u64(checksum, value as u64);
+}
+
+fn checked_row_range(row: usize, width: usize) -> EngineResult<std::ops::Range<usize>> {
+    checked_page_range(row, 1, width)
+}
+
+fn checked_page_range(
+    first_page: usize,
+    page_count: usize,
+    page_values: usize,
+) -> EngineResult<std::ops::Range<usize>> {
+    let start = product("parked Qwen3.8 mirror range start", first_page, page_values)?;
+    let values = product(
+        "parked Qwen3.8 mirror range values",
+        page_count,
+        page_values,
+    )?;
+    let end = start
+        .checked_add(values)
+        .ok_or_else(|| EngineError::layout("parked Qwen3.8 mirror range overflows"))?;
+    Ok(start..end)
 }
 
 fn processed_tokens(session: &ResidentMtpBatchSession) -> EngineResult<Vec<u32>> {

@@ -9,7 +9,9 @@ mod streaming;
 mod timer;
 mod vmm_manifest;
 
-pub use arena::{ArenaLayout, ArenaRegion, DeviceArena, LoadingDeviceArena};
+pub use arena::{
+    ArenaLayout, ArenaRegion, DeviceArena, LoadingDeviceArena, vmm_allocation_granularity,
+};
 pub use cuda_core::{
     CudaContext, CudaEvent, CudaStream, DeviceBuffer, DeviceCopy, DriverError, LaunchConfig1D,
     LaunchConfig2D, LaunchContractError, PinnedHostBuffer, PreparedLaunch, SyncPolicy,
