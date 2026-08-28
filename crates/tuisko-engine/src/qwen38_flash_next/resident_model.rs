@@ -10,8 +10,9 @@ use crate::common::streaming::{
 };
 use crate::qwen38_flash_next::engram_stager::gather_qwen38_flash_next_engram_window;
 use crate::qwen38_flash_next::layer_route::{
-    QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING, QWEN38_FLASH_NEXT_PREFILL_ROWS,
-    Qwen38FlashNextRowRoute, qwen38_flash_next_row_route,
+    QWEN38_FLASH_NEXT_CAUSAL_ROWS, QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING,
+    QWEN38_FLASH_NEXT_PREFILL_ROWS, Qwen38FlashNextRoundShape, Qwen38FlashNextRowRoute,
+    qwen38_flash_next_causal_route, qwen38_flash_next_row_route,
     require_qwen38_flash_next_dense_qsa_visible,
 };
 use crate::qwen38_flash_next::layer_upload::{
@@ -63,7 +64,11 @@ const ROTARY_ELEMENTS: usize = 32;
 /// Admitted routes per segment: decode `B=1..8` then prefill `T=32/64/128/1024`.
 const ROUTES_PER_SEGMENT: usize = MAX_BATCH + QWEN38_FLASH_NEXT_PREFILL_ROWS.len();
 
+/// Causal verification routes per segment.
+const CAUSAL_ROUTES_PER_SEGMENT: usize = QWEN38_FLASH_NEXT_CAUSAL_ROWS.len();
+
 const _: () = assert!(ROUTES_PER_SEGMENT == 12);
+const _: () = assert!(CAUSAL_ROUTES_PER_SEGMENT == 4);
 
 /// Flat index with decode at `0..8` and prefill at `8..12`.
 const fn segment_route_index(route: Qwen38FlashNextRowRoute) -> usize {
@@ -502,6 +507,7 @@ struct Ops<'a> {
 pub struct Qwen38FlashNextResidentModel {
     // Drop graphs before the arenas, the pool, and the loaded modules they retain.
     segments: Vec<CudaGraph>,
+    causal_segments: Vec<CudaGraph>,
     arena: DeviceArena,
     kv_arena: DeviceArena,
     pool: StreamingWeightPool,
@@ -545,7 +551,7 @@ pub struct Qwen38FlashNextResidentModel {
 }
 
 impl Qwen38FlashNextResidentModel {
-    /// Loads every layer, stages every expert, and captures all 588 segment executables.
+    /// Loads every layer, stages every expert, and captures all 784 segment executables.
     pub fn from_snapshot(
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38FlashNext>>,
@@ -688,7 +694,7 @@ impl Qwen38FlashNextResidentModel {
 
     /// Captured executables this program retains.
     pub fn executables(&self) -> usize {
-        self.segments.len()
+        self.segments.len() + self.causal_segments.len()
     }
 
     /// Returns the unrecoverable streaming-pool failure, if any.
@@ -759,6 +765,7 @@ fn launch_segment(
     arena: &DeviceArena,
     segment: usize,
     rows: usize,
+    shape: Qwen38FlashNextRoundShape,
     ops: Ops<'_>,
     layers: &[LayerPointers],
     workspace: WorkspacePointers,
@@ -819,35 +826,56 @@ fn launch_segment(
         // --- the head of layer `segment`, up to and including its router ---
         let layer = layers[segment];
         if let Some(ple) = layer.ple {
-            ops.engram.launch_engram(
-                ops.hyper,
-                stream,
-                rows,
-                workspace.ple_codes,
-                workspace.residual_a.cast_const(),
-                Qwen38FlashNextEngramSources {
-                    key_proj: ple.key_proj,
-                    value_proj: ple.value_proj,
-                    norm_key: ple.norm_key,
-                    norm_query: ple.norm_query,
-                    norm_conv: ple.norm_conv,
-                    convolution: ple.convolution,
-                    table_scale_bits,
-                },
-                Qwen38FlashNextEngramWorkspace {
-                    embedding: workspace.ple_embedding,
-                    key: workspace.ple_key,
-                    key_normed: workspace.ple_key_normed,
-                    query_normed: workspace.ple_query_normed,
-                    value: workspace.ple_value,
-                    gated: workspace.ple_gated,
-                    gated_normed: workspace.ple_gated_normed,
-                    delta: workspace.ple_delta,
-                },
-                workspace.state_rows,
-                ple.conv_state,
-                workspace.ple_injected,
-            )?;
+            let sources = Qwen38FlashNextEngramSources {
+                key_proj: ple.key_proj,
+                value_proj: ple.value_proj,
+                norm_key: ple.norm_key,
+                norm_query: ple.norm_query,
+                norm_conv: ple.norm_conv,
+                convolution: ple.convolution,
+                table_scale_bits,
+            };
+            let scratch = Qwen38FlashNextEngramWorkspace {
+                embedding: workspace.ple_embedding,
+                key: workspace.ple_key,
+                key_normed: workspace.ple_key_normed,
+                query_normed: workspace.ple_query_normed,
+                value: workspace.ple_value,
+                gated: workspace.ple_gated,
+                gated_normed: workspace.ple_gated_normed,
+                delta: workspace.ple_delta,
+            };
+            match shape {
+                Qwen38FlashNextRoundShape::Batch => ops.engram.launch_engram(
+                    ops.hyper,
+                    stream,
+                    rows,
+                    workspace.ple_codes,
+                    workspace.residual_a.cast_const(),
+                    sources,
+                    scratch,
+                    workspace.state_rows,
+                    ple.conv_state,
+                    workspace.ple_injected,
+                )?,
+                Qwen38FlashNextRoundShape::Causal => {
+                    // The PLE convolution advances one shared carry per position.
+                    for row in 0..rows {
+                        ops.engram.launch_engram(
+                            ops.hyper,
+                            stream,
+                            1,
+                            workspace.ple_codes.add(row * A::PLE_EMBED_DIM),
+                            workspace.residual_a.cast_const().add(row * A::HC_WIDTH),
+                            sources,
+                            scratch,
+                            workspace.state_rows,
+                            ple.conv_state,
+                            workspace.ple_injected.add(row * A::HC_WIDTH),
+                        )?;
+                    }
+                }
+            }
         }
         let stream_in = match layer.ple {
             Some(_) => workspace.ple_injected.cast_const(),
@@ -885,34 +913,68 @@ fn launch_segment(
                     input_weight,
                     workspace.gdn_projected,
                 )?;
-                ops.gdn_prepare.launch(
-                    stream,
-                    rows,
-                    workspace.hc_mixed.cast_const(),
-                    control_weight,
-                    a_log,
-                    dt_bias,
-                    workspace.gdn_projected.cast_const(),
-                    convolution_weight,
-                    workspace.state_rows,
-                    layer.gdn_history,
-                    workspace.gdn_log_decay,
-                    workspace.gdn_beta,
-                    workspace.gdn_convolved,
-                )?;
-                ops.gdn_recurrence.launch(
-                    stream,
-                    rows,
-                    workspace.gdn_convolved.cast_const(),
-                    workspace.gdn_projected.cast_const(),
-                    workspace.gdn_log_decay.cast_const(),
-                    workspace.gdn_beta.cast_const(),
-                    norm,
-                    workspace.state_rows,
-                    layer.gdn_state,
-                    workspace.gdn_recurrent_plane,
-                    workspace.gdn_recurrent_output,
-                )?;
+                match shape {
+                    Qwen38FlashNextRoundShape::Batch => {
+                        ops.gdn_prepare.launch(
+                            stream,
+                            rows,
+                            workspace.hc_mixed.cast_const(),
+                            control_weight,
+                            a_log,
+                            dt_bias,
+                            workspace.gdn_projected.cast_const(),
+                            convolution_weight,
+                            workspace.state_rows,
+                            layer.gdn_history,
+                            workspace.gdn_log_decay,
+                            workspace.gdn_beta,
+                            workspace.gdn_convolved,
+                        )?;
+                        ops.gdn_recurrence.launch(
+                            stream,
+                            rows,
+                            workspace.gdn_convolved.cast_const(),
+                            workspace.gdn_projected.cast_const(),
+                            workspace.gdn_log_decay.cast_const(),
+                            workspace.gdn_beta.cast_const(),
+                            norm,
+                            workspace.state_rows,
+                            layer.gdn_state,
+                            workspace.gdn_recurrent_plane,
+                            workspace.gdn_recurrent_output,
+                        )?;
+                    }
+                    Qwen38FlashNextRoundShape::Causal => {
+                        ops.gdn_prepare.launch_causal(
+                            stream,
+                            rows,
+                            workspace.hc_mixed.cast_const(),
+                            control_weight,
+                            a_log,
+                            dt_bias,
+                            workspace.gdn_projected.cast_const(),
+                            convolution_weight,
+                            workspace.state_rows,
+                            layer.gdn_history,
+                            workspace.gdn_log_decay,
+                            workspace.gdn_beta,
+                            workspace.gdn_convolved,
+                        )?;
+                        ops.gdn_recurrence.launch_causal(
+                            stream,
+                            rows,
+                            workspace.gdn_convolved.cast_const(),
+                            workspace.gdn_projected.cast_const(),
+                            workspace.gdn_log_decay.cast_const(),
+                            workspace.gdn_beta.cast_const(),
+                            norm,
+                            workspace.state_rows,
+                            layer.gdn_state,
+                            workspace.gdn_recurrent_plane,
+                            workspace.gdn_recurrent_output,
+                        )?;
+                    }
+                }
                 ops.block_output.launch(
                     stream,
                     rows,
@@ -1164,6 +1226,7 @@ impl Qwen38FlashNextResidentModel {
 
         Ok(Self {
             segments: Vec::new(),
+            causal_segments: Vec::new(),
             arena,
             kv_arena,
             pool,
@@ -1467,6 +1530,8 @@ impl Qwen38FlashNextResidentModel {
         let ops = self.ops();
         let mut segments =
             Vec::with_capacity(QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS * ROUTES_PER_SEGMENT);
+        let mut causal_segments =
+            Vec::with_capacity(QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS * CAUSAL_ROUTES_PER_SEGMENT);
 
         for segment in 0..QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS {
             for rows in (1..=MAX_BATCH).chain(QWEN38_FLASH_NEXT_PREFILL_ROWS) {
@@ -1476,6 +1541,25 @@ impl Qwen38FlashNextResidentModel {
                         &self.arena,
                         segment,
                         rows,
+                        Qwen38FlashNextRoundShape::Batch,
+                        ops,
+                        &self.layers,
+                        self.workspace,
+                        self.endpoint,
+                        self.layout.endpoint().embedding_rows,
+                        self.layout.workspace().residual_a,
+                        self.table_scale_bits,
+                    )
+                })?);
+            }
+            for rows in QWEN38_FLASH_NEXT_CAUSAL_ROWS {
+                causal_segments.push(CudaGraph::capture(stream, || {
+                    launch_segment(
+                        stream,
+                        &self.arena,
+                        segment,
+                        rows,
+                        Qwen38FlashNextRoundShape::Causal,
                         ops,
                         &self.layers,
                         self.workspace,
@@ -1489,9 +1573,10 @@ impl Qwen38FlashNextResidentModel {
         }
 
         self.load_stats.graph_capture = started.elapsed();
-        self.load_stats.executables = segments.len();
-        self.load_stats.definitions = segments.len();
+        self.load_stats.executables = segments.len() + causal_segments.len();
+        self.load_stats.definitions = self.load_stats.executables;
         self.segments = segments;
+        self.causal_segments = causal_segments;
 
         Ok(())
     }
@@ -1698,16 +1783,20 @@ impl Qwen38FlashNextResidentModel {
         &mut self,
         stream: &CudaStream,
         rows: usize,
+        shape: Qwen38FlashNextRoundShape,
     ) -> EngineResult<Vec<Qwen38FlashNextLayerStreamTelemetry>> {
         if let Some(reason) = self.pool.poisoned() {
             return Err(EngineError::layout(format!(
                 "Qwen3.8 Flash-Next expert cache is poisoned: {reason}"
             )));
         }
-        let route = qwen38_flash_next_row_route(rows)?;
+        let route = match shape {
+            Qwen38FlashNextRoundShape::Batch => qwen38_flash_next_row_route(rows)?,
+            Qwen38FlashNextRoundShape::Causal => qwen38_flash_next_causal_route(rows)?,
+        };
         let mut telemetry = Vec::with_capacity(<A as Arch>::LAYERS);
 
-        self.replay_segment(stream, 0, route)?;
+        self.replay_segment(stream, 0, route, shape)?;
         for layer in 0..<A as Arch>::LAYERS {
             // (1) the round's identity, read off the plane the router just published.
             let requests = self.read_expert_round(stream, rows, layer)?;
@@ -1716,7 +1805,7 @@ impl Qwen38FlashNextResidentModel {
             // (3) the explicit consumer wait.
             self.pool.fence_replay(stream)?;
             // (4) the only replay that reads this round.
-            self.replay_segment(stream, layer + 1, route)?;
+            self.replay_segment(stream, layer + 1, route, shape)?;
             // (5) the reclaim fence the next round resolves against.
             self.pool.record_replay_release(stream)?;
 
@@ -1732,11 +1821,19 @@ impl Qwen38FlashNextResidentModel {
         stream: &CudaStream,
         segment: usize,
         route: Qwen38FlashNextRowRoute,
+        shape: Qwen38FlashNextRoundShape,
     ) -> EngineResult<()> {
-        let index = segment * ROUTES_PER_SEGMENT + segment_route_index(route);
-        let graph = self.segments.get(index).ok_or_else(|| {
+        let graph = match shape {
+            Qwen38FlashNextRoundShape::Batch => self
+                .segments
+                .get(segment * ROUTES_PER_SEGMENT + segment_route_index(route)),
+            Qwen38FlashNextRoundShape::Causal => self
+                .causal_segments
+                .get(segment * CAUSAL_ROUTES_PER_SEGMENT + route.rows() - 1),
+        }
+        .ok_or_else(|| {
             EngineError::route(format!(
-                "Qwen3.8 Flash-Next segment {segment} has no captured graph for {route:?}"
+                "Qwen3.8 Flash-Next segment {segment} has no captured graph for {route:?} in {shape:?}"
             ))
         })?;
 
@@ -1955,11 +2052,60 @@ impl Qwen38FlashNextResidentModel {
         let embedding_h2d_bytes = self.stage_embeddings(stream, tokens)?;
         let (engram_h2d_bytes, engram_rows) = self.stage_engram(stream, tokens, slots, false)?;
         self.stage_round_inputs(stream, rows, slots, slots, positions)?;
-        let layers = self.forward(stream, rows)?;
+        let layers = self.forward(stream, rows, Qwen38FlashNextRoundShape::Batch)?;
         let forward = started.elapsed();
         for (&slot, &position) in slots.iter().zip(positions) {
             self.slots.commit(slot, position as usize + 1)?;
         }
+
+        Ok(Qwen38FlashNextStepTelemetry {
+            rows,
+            layers,
+            embedding_h2d_bytes,
+            engram_h2d_bytes,
+            engram_rows,
+            kv_append_bytes: kv_append_bytes(rows),
+            forward,
+            segment_replays: QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS,
+            expert_readbacks: <A as Arch>::LAYERS,
+        })
+    }
+
+    /// Verifies `K=1..4` consecutive positions on one sequence.
+    pub fn verify_step(
+        &mut self,
+        stream: &CudaStream,
+        tokens: &[u32],
+        first_position: u32,
+        slot: usize,
+    ) -> EngineResult<Qwen38FlashNextStepTelemetry> {
+        let rows = tokens.len();
+        qwen38_flash_next_causal_route(rows)?;
+        let last = (first_position as usize)
+            .checked_add(rows)
+            .ok_or_else(|| EngineError::route("Qwen3.8 Flash-Next verification span overflows"))?;
+        require_qwen38_flash_next_dense_qsa_visible(last)?;
+        self.admit_round(slot, first_position as usize, last)?;
+
+        let positions = (0..rows as u32)
+            .map(|offset| first_position + offset)
+            .collect::<Vec<_>>();
+        let slots = vec![slot; rows];
+
+        let started = Instant::now();
+        self.flush_block_tables(stream)?;
+        let embedding_h2d_bytes = self.stage_embeddings(stream, tokens)?;
+        let (engram_h2d_bytes, engram_rows) = self.stage_engram(stream, tokens, &slots, true)?;
+        self.stage_round_inputs(
+            stream,
+            rows,
+            &slots,
+            std::slice::from_ref(&slot),
+            &positions,
+        )?;
+        let layers = self.forward(stream, rows, Qwen38FlashNextRoundShape::Causal)?;
+        let forward = started.elapsed();
+        self.slots.commit(slot, last)?;
 
         Ok(Qwen38FlashNextStepTelemetry {
             rows,
@@ -2009,7 +2155,7 @@ impl Qwen38FlashNextResidentModel {
             std::slice::from_ref(&slot),
             &positions,
         )?;
-        let layers = self.forward(stream, rows)?;
+        let layers = self.forward(stream, rows, Qwen38FlashNextRoundShape::Batch)?;
         let forward = started.elapsed();
         self.slots.commit(slot, last)?;
 
@@ -2493,6 +2639,16 @@ mod tests {
             QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS * ROUTES_PER_SEGMENT,
             588
         );
+    }
+
+    #[test]
+    fn the_causal_inventory_is_forty_nine_by_four() {
+        assert_eq!(CAUSAL_ROUTES_PER_SEGMENT, 4);
+        assert_eq!(
+            QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS * CAUSAL_ROUTES_PER_SEGMENT,
+            196
+        );
+        assert_eq!(588 + 196, 784);
     }
 
     #[test]

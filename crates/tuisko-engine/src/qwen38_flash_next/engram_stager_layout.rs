@@ -14,9 +14,9 @@ const ALIGNMENT: usize = 256;
 
 /// Token counts one exact staging round admits.
 ///
-/// `T=1` is decode; the remaining values are prefill tiles. Other widths are
-/// refused because padding would hash tokens outside the sequence.
-pub const QWEN38_FLASH_NEXT_ENGRAM_WIDTHS: [usize; 5] = [1, 32, 64, 128, 1_024];
+/// Decode gathers one row at a time, verification walks `K=1..4`, and the
+/// remaining values are prefill tiles.
+pub const QWEN38_FLASH_NEXT_ENGRAM_WIDTHS: [usize; 8] = [1, 2, 3, 4, 32, 64, 128, 1_024];
 
 /// Checked regions and byte counts for Qwen3.8-Flash-Next engram staging.
 #[derive(Clone, Debug)]
@@ -177,7 +177,7 @@ impl StreamingResidencyAccounting for Qwen38FlashNextEngramStagerLayout {
 pub fn require_qwen38_flash_next_engram_width(tokens: usize) -> EngineResult<()> {
     if !QWEN38_FLASH_NEXT_ENGRAM_WIDTHS.contains(&tokens) {
         return Err(EngineError::route(format!(
-            "Flash-Next engram round of {tokens} tokens is not an admitted T=1/32/64/128/1024 route"
+            "Flash-Next engram round of {tokens} tokens is not an admitted K=1..4 or T=32/64/128/1024 route"
         )));
     }
 
@@ -243,7 +243,7 @@ mod tests {
             assert!(layout.round_bytes(rows).unwrap() <= layout.stager_bytes());
         }
 
-        for rows in [0, 2, 8, 31, 33, 127, 129, 512, 1_023, 1_025, usize::MAX] {
+        for rows in [0, 5, 8, 31, 33, 127, 129, 512, 1_023, 1_025, usize::MAX] {
             let error = require_qwen38_flash_next_engram_width(rows).err().unwrap();
 
             assert_eq!(error.code(), Some(EngineErrorCode::Route));
