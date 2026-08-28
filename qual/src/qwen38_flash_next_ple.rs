@@ -33,13 +33,13 @@ const BRANCHES: usize = Qwen38FlashNext::HC_COUNT;
 const BRANCH: usize = Qwen38FlashNext::HIDDEN;
 const WIDTH: usize = Qwen38FlashNext::HC_WIDTH;
 const EMBED: usize = Qwen38FlashNext::PLE_EMBED_DIM;
-const CONV_TAPS: usize = Qwen38FlashNext::PLE_CONV_KERNEL;
+pub(crate) const CONV_TAPS: usize = Qwen38FlashNext::PLE_CONV_KERNEL;
 const CONV_DILATION: usize = Qwen38FlashNext::PLE_CONV_DILATION;
 const CONV_STATE: usize = Qwen38FlashNext::PLE_CONV_STATE_LEN;
 const EPSILON: f32 = Qwen38FlashNext::RMS_NORM_EPSILON;
 const GATE_FLOOR: f32 = Qwen38FlashNext::PLE_GATE_FLOOR;
 /// The checkpoint's exact BF16 source word for the engram table multiplier.
-const TABLE_SCALE_BITS: u16 = 0x3951;
+pub(crate) const TABLE_SCALE_BITS: u16 = 0x3951;
 
 // Fixture tables. Every BF16 value is exactly representable so the fixture
 // itself contributes no rounding and all observed error belongs to the kernel.
@@ -655,7 +655,7 @@ fn through_bf16(value: f64) -> f64 {
     f64::from(bf16_to_f32(f32_to_bf16(value as f32)))
 }
 
-fn widen(values: &[u16]) -> Vec<f64> {
+pub(crate) fn widen(values: &[u16]) -> Vec<f64> {
     values
         .iter()
         .map(|&bits| f64::from(bf16_to_f32(bits)))
@@ -685,7 +685,7 @@ fn decode_e4m3fn(code: u8) -> f64 {
 
 /// `E = code * table_scale`. Every E4M3 value is exact in BF16, so the
 /// product is the only rounding site.
-fn dequant_oracle(codes: &[u8], scale: f64) -> Vec<u16> {
+pub(crate) fn dequant_oracle(codes: &[u8], scale: f64) -> Vec<u16> {
     codes
         .iter()
         .map(|&code| f32_to_bf16((decode_e4m3fn(code) * scale) as f32))
@@ -700,7 +700,7 @@ fn dot(left: &[f64], right: &[f64]) -> f64 {
 }
 
 /// One `nn.Linear` over the dequantized embedding, rounded to BF16 once.
-fn projection_oracle(embedding: &[f64], weight: &[f64], rows: usize) -> Vec<u16> {
+pub(crate) fn projection_oracle(embedding: &[f64], weight: &[f64], rows: usize) -> Vec<u16> {
     (0..rows)
         .map(|row| f32_to_bf16(dot(&weight[row * EMBED..(row + 1) * EMBED], embedding) as f32))
         .collect()
@@ -713,7 +713,7 @@ fn projection_oracle(embedding: &[f64], weight: &[f64], rows: usize) -> Vec<u16>
 /// the engram routes launch that entry rather than a fourth copy of it. The
 /// oracle is written here independently so the reuse is proved rather than
 /// assumed.
-fn grouped_rms_norm_oracle(row: &[f64], weight: &[f64]) -> Vec<u16> {
+pub(crate) fn grouped_rms_norm_oracle(row: &[f64], weight: &[f64]) -> Vec<u16> {
     let mut normalized = vec![0u16; WIDTH];
     for branch in 0..BRANCHES {
         let begin = branch * BRANCH;
@@ -752,7 +752,7 @@ fn signed_root(scaled: f64) -> f64 {
 ///
 /// The reference materializes `key_normed * query_normed` as a BF16 tensor
 /// before `sum(-1)`, so every product is rounded before the accumulation.
-fn gate_activation(key_normed: &[f64], query_normed: &[f64]) -> f64 {
+pub(crate) fn gate_activation(key_normed: &[f64], query_normed: &[f64]) -> f64 {
     let total = key_normed
         .iter()
         .zip(query_normed)
@@ -764,7 +764,7 @@ fn gate_activation(key_normed: &[f64], query_normed: &[f64]) -> f64 {
 }
 
 /// `sigmoid(gate) * value` broadcast into the four branches, then flattened.
-fn gated_oracle(activation: &[f64], value: &[f64]) -> Vec<u16> {
+pub(crate) fn gated_oracle(activation: &[f64], value: &[f64]) -> Vec<u16> {
     let mut gated = vec![0u16; WIDTH];
     for branch in 0..BRANCHES {
         for column in 0..BRANCH {
@@ -780,7 +780,7 @@ fn gated_oracle(activation: &[f64], value: &[f64]) -> Vec<u16> {
 ///
 /// `F.conv1d` returns a BF16 tensor before `silu` reads it, and the residual add
 /// is a second BF16 tensor op, so both round.
-fn conv_oracle(weights: &[f64], window: [f64; CONV_TAPS], residual: f64) -> u16 {
+pub(crate) fn conv_oracle(weights: &[f64], window: [f64; CONV_TAPS], residual: f64) -> u16 {
     let sum = weights
         .iter()
         .zip(window)

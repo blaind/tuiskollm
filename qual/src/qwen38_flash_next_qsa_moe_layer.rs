@@ -477,26 +477,7 @@ fn verify_layer_oracle(
     // publishing the BF16 `activation`, so both planes hold the gated result after a full
     // launch. Checking them against one oracle at their two precisions is what proves the
     // in-place arm and the published arm agree.
-    let attended = (0..OUTPUT_COLUMNS)
-        .map(|index| {
-            let head = index / HEAD_DIM;
-            let dimension = index % HEAD_DIM;
-            let kv_head = head / (QUERY_HEADS / KV_HEADS);
-            let value =
-                bf16_to_f32(qkv[QUERY_ROWS + KV_HEADS * HEAD_DIM + kv_head * HEAD_DIM + dimension]);
-
-            represent_e4m3(value, VALUE_CACHE_SCALE)
-        })
-        .collect::<Vec<_>>();
-    let gated_f32 = (0..OUTPUT_COLUMNS)
-        .map(|index| {
-            let head = index / HEAD_DIM;
-            let dimension = index % HEAD_DIM;
-            let gate = bf16_to_f32(qkv[head * 2 * HEAD_DIM + HEAD_DIM + dimension]);
-
-            attended[index] * logistic(gate)
-        })
-        .collect::<Vec<_>>();
+    let gated_f32 = qsa_attention_oracle(&qkv);
     compare_f32(
         "attention (gated in place)",
         &observed.attention[..OUTPUT_COLUMNS],
@@ -577,6 +558,31 @@ fn verify_layer_oracle(
     )?;
 
     Ok(())
+}
+
+/// Computes gated QSA attention when exactly one key is visible.
+pub(crate) fn qsa_attention_oracle(qkv: &[u16]) -> Vec<f32> {
+    let attended = (0..OUTPUT_COLUMNS)
+        .map(|index| {
+            let head = index / HEAD_DIM;
+            let dimension = index % HEAD_DIM;
+            let kv_head = head / (QUERY_HEADS / KV_HEADS);
+            let value =
+                bf16_to_f32(qkv[QUERY_ROWS + KV_HEADS * HEAD_DIM + kv_head * HEAD_DIM + dimension]);
+
+            represent_e4m3(value, VALUE_CACHE_SCALE)
+        })
+        .collect::<Vec<_>>();
+
+    (0..OUTPUT_COLUMNS)
+        .map(|index| {
+            let head = index / HEAD_DIM;
+            let dimension = index % HEAD_DIM;
+            let gate = bf16_to_f32(qkv[head * 2 * HEAD_DIM + HEAD_DIM + dimension]);
+
+            attended[index] * logistic(gate)
+        })
+        .collect()
 }
 
 fn observed_input(
