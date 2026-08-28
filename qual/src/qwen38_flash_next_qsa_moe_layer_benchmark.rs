@@ -1,6 +1,6 @@
 //! Direct diagnostic timing for one source-backed Qwen3.8-Flash-Next QSA/MoE layer.
 //!
-//! Each exact graph reads production-shaped decode or causal-prefill metadata.
+//! Every row width is measured on both attention routes with production-shaped metadata.
 
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
@@ -13,9 +13,13 @@ use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
     MAX_BATCH, Qwen38FlashNextQsaMoeLayerProgram, Qwen38FlashNextQsaRound,
-    Qwen38FlashNextQsaRoundStageGraph,
+    Qwen38FlashNextQsaRoundStageGraph, Qwen38FlashNextQsaRoute,
+    qwen38_flash_next_qsa_block_rotary_rows,
 };
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, GpuError, GpuTimer};
+use tuisko_kernels_sm120::{
+    SELECTION_RADIX_PASSES, SELECTION_ROW_TILE, selection_block_bucket, selection_ctas_per_row,
+};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38FlashNext};
 
 type A = Qwen38FlashNext;
@@ -39,6 +43,8 @@ const SOURCE_LAYER: usize = 3;
 
 struct RouteGraph {
     rows: usize,
+    route: Qwen38FlashNextQsaRoute,
+    context: usize,
     preparation: Qwen38FlashNextQsaRoundStageGraph,
     repeated: CudaGraph,
 }
@@ -69,12 +75,19 @@ impl Session {
         let program = Qwen38FlashNextQsaMoeLayerProgram::from_snapshot(&context, snapshot, layer)?;
         program.load_residual(&stream, MAX_ROWS, &benchmark_input())?;
         program.reset_cache(&stream)?;
-        let routes = EXACT_ROUTES
-            .into_iter()
-            .map(|rows| {
-                let (table_rows, cache_positions, lengths) = round_metadata(rows);
+        let mut routes = Vec::with_capacity(2 * EXACT_ROUTES.len());
+        for route in [
+            Qwen38FlashNextQsaRoute::Dense,
+            Qwen38FlashNextQsaRoute::Selected,
+        ] {
+            for rows in EXACT_ROUTES {
+                let (table_rows, cache_positions, lengths) = round_metadata(rows, route);
                 let rope_cos = vec![1.0; rows * ROTARY_ELEMENTS];
                 let rope_sin = vec![0.0; rows * ROTARY_ELEMENTS];
+                let block_rotary_rows =
+                    qwen38_flash_next_qsa_block_rotary_rows(rows) * ROTARY_ELEMENTS;
+                let block_rope_cos = vec![1.0; block_rotary_rows];
+                let block_rope_sin = vec![0.0; block_rotary_rows];
                 let preparation = program.qualification_round_stage_graph(
                     &stream,
                     rows,
@@ -84,19 +97,30 @@ impl Session {
                         lengths: &lengths,
                         rope_cos: &rope_cos,
                         rope_sin: &rope_sin,
+                        block_rope_cos: &block_rope_cos,
+                        block_rope_sin: &block_rope_sin,
                     },
                 )?;
-                Ok(RouteGraph {
+                if preparation.route() != route {
+                    return Err(DeviceBenchmarkError::Precondition(format!(
+                        "QSA benchmark staged {:?}, expected {route:?}",
+                        preparation.route()
+                    )));
+                }
+                routes.push(RouteGraph {
                     rows,
+                    route,
+                    context: lengths.iter().copied().max().unwrap_or(0) as usize,
                     preparation,
                     repeated: program.qualification_repeated_graph(
                         &stream,
                         rows,
+                        route,
                         repeated_operations,
                     )?,
-                })
-            })
-            .collect::<Result<Vec<_>, DeviceBenchmarkError>>()?;
+                });
+            }
+        }
 
         Ok(Self {
             routes,
@@ -114,7 +138,7 @@ impl Session {
                 // SAFETY: the program retains every captured layer allocation through this replay.
                 unsafe {
                     self.program
-                        .qualification_graph(route.rows)?
+                        .qualification_graph(route.rows, route.route)?
                         .launch(&self.stream)
                 }?;
             }
@@ -131,10 +155,13 @@ impl Session {
         self.routes
             .iter()
             .map(|route| {
-                let (shape, workload) = if route.rows <= MAX_BATCH {
+                let (width, mut workload) = if route.rows <= MAX_BATCH {
                     (
                         format!("B={}", route.rows),
-                        BenchmarkWorkload::warm_attention_layer_decode(route.rows as u32, 1),
+                        BenchmarkWorkload::warm_attention_layer_decode(
+                            route.rows as u32,
+                            route.context as u64,
+                        ),
                     )
                 } else {
                     (
@@ -142,12 +169,17 @@ impl Session {
                         BenchmarkWorkload::warm_attention_layer_prefill(route.rows as u64),
                     )
                 };
+                workload.context_tokens = Some(route.context as u64);
                 Ok(ExactDeviceCase::new(
-                    "qwen38_flash_next/qsa_moe/layer",
-                    shape,
+                    route_name(route.route),
+                    format!("{width} ctx={}", route.context),
                     workload,
-                    OperationAccounting::new(logical_bytes(route.rows), route.rows as u64, "token"),
-                    self.program.qualification_graph(route.rows)?,
+                    OperationAccounting::new(
+                        logical_bytes(route.rows, route.route),
+                        route.rows as u64,
+                        "token",
+                    ),
+                    self.program.qualification_graph(route.rows, route.route)?,
                     Some(RepeatedGraph::new(&route.repeated, repeated_operations)),
                 )
                 .with_preparation(route.preparation.graph()))
@@ -163,11 +195,26 @@ fn benchmark_input() -> Vec<u16> {
         .collect()
 }
 
-fn round_metadata(rows: usize) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+fn route_name(route: Qwen38FlashNextQsaRoute) -> &'static str {
+    match route {
+        Qwen38FlashNextQsaRoute::Dense => "qwen38_flash_next/qsa_moe/dense_layer",
+        Qwen38FlashNextQsaRoute::Selected => "qwen38_flash_next/qsa_moe/selected_layer",
+    }
+}
+
+fn round_metadata(rows: usize, route: Qwen38FlashNextQsaRoute) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let base = match (route, rows <= MAX_BATCH) {
+        (Qwen38FlashNextQsaRoute::Dense, _) => 0,
+        (Qwen38FlashNextQsaRoute::Selected, true) => 2_052,
+        (Qwen38FlashNextQsaRoute::Selected, false) => 2_048,
+    };
     let (table_rows, cache_positions) = if rows <= MAX_BATCH {
-        ((0..rows as u32).collect(), vec![0; rows])
+        ((0..rows as u32).collect(), vec![base; rows])
     } else {
-        (vec![0; rows], (0..rows as u32).collect())
+        (
+            vec![0; rows],
+            (base..base + rows as u32).collect::<Vec<_>>(),
+        )
     };
     let lengths = cache_positions
         .iter()
@@ -177,9 +224,33 @@ fn round_metadata(rows: usize) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     (table_rows, cache_positions, lengths)
 }
 
-/// Bytes one launch moves, including every causally visible key.
-fn logical_bytes(rows: usize) -> usize {
+fn selection_partial_bytes(rows: usize, blocks: usize) -> usize {
+    let bucket = selection_block_bucket(blocks).unwrap_or(blocks);
+    let ctas = selection_ctas_per_row(rows, bucket);
+
+    2 * SELECTION_RADIX_PASSES * ctas * 256 * size_of::<u32>()
+}
+
+fn selected_positions(length: usize) -> usize {
+    let ratio = A::INDEXER_COMPRESS_RATIO;
+    let budget_blocks = A::INDEXER_BUDGET / ratio;
+
+    (length / ratio).min(budget_blocks) * ratio + length % ratio
+}
+
+/// Bytes one production launch moves at the staged route and context.
+fn logical_bytes(rows: usize, route: Qwen38FlashNextQsaRoute) -> usize {
     let word = size_of::<u16>();
+    let (_, cache_positions, lengths) = round_metadata(rows, route);
+    let visible_keys = lengths.iter().map(|&length| length as usize).sum::<usize>();
+    let candidate_blocks = lengths
+        .iter()
+        .map(|&length| length as usize / A::INDEXER_COMPRESS_RATIO)
+        .sum::<usize>();
+    let closed_blocks = cache_positions
+        .iter()
+        .filter(|&&position| (position as usize + 1).is_multiple_of(A::INDEXER_COMPRESS_RATIO))
+        .count();
 
     let bracket_weights = WIDTH + 2 * RANK * WIDTH + BRANCHES * WIDTH;
     let bracket = 2
@@ -188,6 +259,21 @@ fn logical_bytes(rows: usize) -> usize {
             + rows * 2 * WIDTH * word);
 
     let qkv_projection = QKV_ROWS * HIDDEN * word + rows * (HIDDEN + QKV_ROWS) * word;
+    let indexer_projection =
+        A::INDEXER_ROWS * HIDDEN * word + rows * (HIDDEN + A::INDEXER_ROWS) * word;
+    let indexer_prepare = A::INDEXER_HEAD_DIM * word
+        + rows
+            * (A::INDEXER_ROWS * word
+                + A::INDEXER_HEADS * A::INDEXER_HEAD_DIM * size_of::<f32>()
+                + A::INDEXER_HEAD_DIM * word
+                + 2 * ROTARY_ELEMENTS * size_of::<f32>()
+                + 2 * size_of::<u32>());
+    let compression_rows = if rows <= MAX_BATCH { rows } else { 1 };
+    let indexer_compress = A::INDEXER_HEAD_DIM * word
+        + closed_blocks
+            * ((A::INDEXER_COMPRESS_RATIO + 1) * A::INDEXER_HEAD_DIM * word
+                + 2 * ROTARY_ELEMENTS * size_of::<f32>())
+        + compression_rows * 3 * size_of::<u32>();
     // Q/K normalization, MRoPE, and the represented E4M3 append of one key and one value.
     let prepare = 2 * HEAD_DIM * word
         + rows
@@ -196,13 +282,36 @@ fn logical_bytes(rows: usize) -> usize {
                 + OUTPUT_COLUMNS * size_of::<f32>()
                 + 2 * KV_HEADS * HEAD_DIM
                 + 2 * size_of::<u32>());
-    let visible_keys = if rows <= MAX_BATCH {
-        rows
-    } else {
-        rows * (rows + 1) / 2
+    let attention = match route {
+        Qwen38FlashNextQsaRoute::Dense => {
+            rows * (2 * OUTPUT_COLUMNS * size_of::<f32>() + 2 * size_of::<u32>())
+                + visible_keys * 2 * KV_HEADS * HEAD_DIM
+        }
+        Qwen38FlashNextQsaRoute::Selected => {
+            let selected = lengths
+                .iter()
+                .map(|&length| selected_positions(length as usize))
+                .sum::<usize>();
+            let score = candidate_blocks * (A::INDEXER_HEAD_DIM * word + size_of::<f32>())
+                + rows * A::INDEXER_HEADS * A::INDEXER_HEAD_DIM * size_of::<f32>();
+            let tile_rows = if rows <= MAX_BATCH {
+                rows
+            } else {
+                SELECTION_ROW_TILE
+            };
+            let select = (SELECTION_RADIX_PASSES + 1) * candidate_blocks * size_of::<f32>()
+                + rows
+                    * selection_partial_bytes(
+                        tile_rows,
+                        A::MAX_POSITION_EMBEDDINGS / A::INDEXER_COMPRESS_RATIO,
+                    )
+                + selected * size_of::<u32>();
+            let gathered = rows * 2 * OUTPUT_COLUMNS * size_of::<f32>()
+                + selected * (2 * <A as Arch>::NUM_ATTENTION_HEADS * HEAD_DIM + size_of::<u32>());
+
+            score + select + gathered
+        }
     };
-    let attention = rows * (2 * OUTPUT_COLUMNS * size_of::<f32>() + 2 * size_of::<u32>())
-        + visible_keys * 2 * KV_HEADS * HEAD_DIM;
     let gate = rows * (OUTPUT_COLUMNS * size_of::<f32>() + QKV_ROWS * word + OUTPUT_COLUMNS * word);
     let output_projection =
         HIDDEN * OUTPUT_COLUMNS * word + rows * (OUTPUT_COLUMNS + HIDDEN) * word;
@@ -222,6 +331,9 @@ fn logical_bytes(rows: usize) -> usize {
 
     bracket
         + qkv_projection
+        + indexer_projection
+        + indexer_prepare
+        + indexer_compress
         + prepare
         + attention
         + gate
@@ -248,16 +360,22 @@ pub fn benchmark_qwen38_flash_next_qsa_moe_layer(
         "one layer's backbone parameters, indexer planes included, expert pool excluded",
     )?;
     memory.register_owned(
+        "qwen38_flash_next/qsa_moe/routed_expert_pool",
+        BenchmarkMemoryKind::Weights,
+        session.program.pool_arena_bytes(),
+        "512 sealed expert slots and their indirection table",
+    )?;
+    memory.register_owned(
         "qwen38_flash_next/qsa_moe/paged_cache",
         BenchmarkMemoryKind::KvCache,
         session.program.cache_bytes(),
-        "264 pages of represented E4M3 key/value planes plus the reserved indexer key plane",
+        "512 pages of represented E4M3 K/V and compressed block keys plus the raw-key ring",
     )?;
     memory.register_owned(
         "qwen38_flash_next/qsa_moe/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.program.workspace_bytes(),
-        "max_rows=1024 working planes, rotary tables, and page metadata",
+        "max_rows=1024 working planes, selection scratch, rotary tables, and metadata",
     )?;
     memory.register_owned(
         "qwen38_flash_next/qsa_moe/alignment_padding",
@@ -266,7 +384,7 @@ pub fn benchmark_qwen38_flash_next_qsa_moe_layer(
             - session.program.resident_weight_bytes()
             - session.program.cache_bytes()
             - session.program.workspace_bytes(),
-        "single 256-byte-aligned arena",
+        "QSA arena 256-byte alignment padding",
     )?;
     memory.capture("after_setup")?;
     session.warm(warmup)?;
@@ -295,7 +413,11 @@ pub fn benchmark_qwen38_flash_next_qsa_moe_layer(
 
 #[cfg(test)]
 mod tests {
-    use super::{EXACT_ROUTES, MAX_BATCH, MAX_ROWS, SOURCE_LAYER, logical_bytes, round_metadata};
+    use super::{
+        EXACT_ROUTES, MAX_BATCH, MAX_ROWS, SOURCE_LAYER, logical_bytes, round_metadata, route_name,
+        selected_positions,
+    };
+    use tuisko_engine::Qwen38FlashNextQsaRoute;
 
     #[test]
     fn the_source_layer_is_a_sparse_attention_one() {
@@ -305,50 +427,84 @@ mod tests {
 
     #[test]
     fn accounting_grows_with_every_admitted_route() {
-        let mut previous = 0;
-        for rows in EXACT_ROUTES {
-            let bytes = logical_bytes(rows);
-            assert!(
-                bytes > previous,
-                "logical bytes did not grow at rows={rows}"
-            );
-            previous = bytes;
+        for route in [
+            Qwen38FlashNextQsaRoute::Dense,
+            Qwen38FlashNextQsaRoute::Selected,
+        ] {
+            let mut previous = 0;
+            for rows in EXACT_ROUTES {
+                let bytes = logical_bytes(rows, route);
+                assert!(
+                    bytes > previous,
+                    "{route:?} logical bytes did not grow at rows={rows}"
+                );
+                previous = bytes;
+            }
         }
         assert_eq!(EXACT_ROUTES, [1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
-        assert!(logical_bytes(MAX_ROWS) > logical_bytes(MAX_BATCH));
+        assert!(
+            logical_bytes(MAX_ROWS, Qwen38FlashNextQsaRoute::Selected)
+                > logical_bytes(MAX_ROWS, Qwen38FlashNextQsaRoute::Dense)
+        );
     }
 
     #[test]
-    fn every_exact_route_has_production_metadata() {
-        for rows in EXACT_ROUTES {
-            let (table_rows, cache_positions, lengths) = round_metadata(rows);
-            assert_eq!(table_rows.len(), rows);
-            assert_eq!(cache_positions.len(), rows);
-            assert_eq!(lengths.len(), rows);
-            assert!(
-                cache_positions
-                    .iter()
-                    .zip(&lengths)
-                    .all(|(&position, &length)| length == position + 1)
-            );
-            if rows <= MAX_BATCH {
-                assert_eq!(table_rows, (0..rows as u32).collect::<Vec<_>>());
-                assert_eq!(cache_positions, vec![0; rows]);
-                assert_eq!(lengths, vec![1; rows]);
-            } else {
-                assert_eq!(table_rows, vec![0; rows]);
-                assert_eq!(cache_positions[0], 0);
-                assert_eq!(cache_positions[rows - 1], (rows - 1) as u32);
+    fn every_route_has_production_metadata() {
+        for route in [
+            Qwen38FlashNextQsaRoute::Dense,
+            Qwen38FlashNextQsaRoute::Selected,
+        ] {
+            for rows in EXACT_ROUTES {
+                let (table_rows, cache_positions, lengths) = round_metadata(rows, route);
+                assert_eq!(table_rows.len(), rows);
+                assert_eq!(cache_positions.len(), rows);
+                assert_eq!(lengths.len(), rows);
                 assert!(
                     cache_positions
-                        .windows(2)
-                        .all(|pair| pair[1] == pair[0] + 1)
+                        .iter()
+                        .zip(&lengths)
+                        .all(|(&position, &length)| length == position + 1)
                 );
-                assert_eq!(
-                    lengths.iter().map(|&length| length as usize).sum::<usize>(),
-                    rows * (rows + 1) / 2
-                );
+                if rows <= MAX_BATCH {
+                    assert_eq!(table_rows, (0..rows as u32).collect::<Vec<_>>());
+                    assert!(cache_positions.iter().all(|&position| {
+                        position
+                            == if route == Qwen38FlashNextQsaRoute::Dense {
+                                0
+                            } else {
+                                2_052
+                            }
+                    }));
+                } else {
+                    assert_eq!(table_rows, vec![0; rows]);
+                    assert!(
+                        cache_positions
+                            .windows(2)
+                            .all(|pair| pair[1] == pair[0] + 1)
+                    );
+                    let expected_base = if route == Qwen38FlashNextQsaRoute::Dense {
+                        0
+                    } else {
+                        2_048
+                    };
+                    assert_eq!(cache_positions[0], expected_base);
+                }
             }
         }
+    }
+
+    #[test]
+    fn selected_accounting_keeps_the_exact_tail() {
+        assert_eq!(selected_positions(2_051), 2_051);
+        assert_eq!(selected_positions(2_052), 2_048);
+        assert_eq!(selected_positions(2_053), 2_049);
+        assert_eq!(
+            route_name(Qwen38FlashNextQsaRoute::Dense),
+            "qwen38_flash_next/qsa_moe/dense_layer"
+        );
+        assert_eq!(
+            route_name(Qwen38FlashNextQsaRoute::Selected),
+            "qwen38_flash_next/qsa_moe/selected_layer"
+        );
     }
 }

@@ -3366,6 +3366,7 @@ fn qualify_qwen38_flash_next_qsa_layer(
     gate_qwen38_flash_next_hyper_connection(root)?;
     gate_qwen38_flash_next_qsa_prepare(root)?;
     gate_qwen38_flash_next_qsa_attention(root)?;
+    gate_qwen38_flash_next_qsa_selection(root)?;
     gate_qwen38_flash_next_moe_router(root)?;
     gate_qwen38_flash_next_moe_experts(root)?;
     gate_qwen38_flash_next_projections(root)

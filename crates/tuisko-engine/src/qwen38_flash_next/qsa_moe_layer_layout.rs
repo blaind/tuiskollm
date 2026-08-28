@@ -1,23 +1,39 @@
-//! Arena layout for one Qwen3.8-Flash-Next QSA/MoE layer.
+//! Single-allocation layout for one Qwen3.8-Flash-Next sparse-attention plus MoE decoder layer.
 //!
-//! The shared page table covers at least 2,051 tokens per slot. Attention and indexer cache
-//! planes share that mapping even before selection runs. Indexer projection weights remain
-//! resident for exact checkpoint accounting.
+//! Twelve decoder layers use this shape: two hyper-connection brackets around QSA and MoE.
+//!
+//! ```text
+//! residual_input  [rows, 10240]
+//!   HC attn Mix   -> hc_mixed [rows, 2560]
+//!   QSA block     -> qkv [rows, 13312] -> qk-prepare (+KV append) -> query [rows, 6144] f32
+//!                 -> paged dense GQA   -> attention [rows, 6144] f32
+//!                 -> sigmoid gate      -> attention_gated [rows, 6144]
+//!                 -> o_proj            -> block_output [rows, 2560]
+//!   HC write-back -> attention_residual
+//!   HC mlp Mix / MoE / HC write-back   -> residual_output
+//! ```
+//!
+//! Dense attention is exact through 2,051 visible keys; longer rounds use selection. Compressed
+//! block keys share K/V page mappings. Raw keys use a four-token ring and one round-local plane.
+//! A single selection scratch plane is safe because every captured tile runs serially on one
+//! stream; a multi-stream capture would require separate scratch ownership.
 
 use crate::common::math::{product, sum};
 use crate::qwen38_flash_next::gdn_moe_layer_layout::QWEN38_FLASH_NEXT_LAYER_MAX_ROWS;
 use crate::qwen38_flash_next::persistent_state::{ALIGNMENT, Qwen38FlashNextPersistentState};
 use crate::{EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
+use tuisko_kernels_sm120::{
+    SELECTION_BLOCKS_PER_PAGE, SELECTION_MAX_SELECTED, SELECTION_RING_SLOTS, SELECTION_ROW_TILE,
+    SELECTION_SCRATCH_WORDS, selection_block_bucket, selection_round_blocks,
+};
 use tuisko_model::{Arch, Qwen38FlashNext};
 
 /// Tokens one physical page holds, the house paged-attention page size.
 pub(crate) const QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE: usize = 64;
 
-/// Pages this owner reserves: the smallest count covering the dense band at `MAX_BATCH`.
-///
-/// `ceil(2051 / 64) = 33` pages per slot, across eight slots.
-pub(crate) const QWEN38_FLASH_NEXT_QSA_PHYSICAL_PAGES: usize = 264;
+/// Pages reserved so every slot can drive the selected route to 4,096 visible keys.
+pub(crate) const QWEN38_FLASH_NEXT_QSA_PHYSICAL_PAGES: usize = 512;
 
 /// Pages one decode slot owns.
 pub(crate) const QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE: usize =
@@ -27,6 +43,25 @@ pub(crate) const QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE: usize =
 pub(crate) const QWEN38_FLASH_NEXT_QSA_CONTEXT_CAPACITY: usize =
     QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE * QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE;
 
+/// Candidate blocks the widest round this owner admits can present.
+pub(crate) const QWEN38_FLASH_NEXT_QSA_CANDIDATE_BLOCKS: usize =
+    QWEN38_FLASH_NEXT_QSA_CONTEXT_CAPACITY / Qwen38FlashNext::INDEXER_COMPRESS_RATIO;
+
+/// Values between two rows of this owner's score scratch.
+///
+/// The prepared scoring grid is a bucket rather than an exact count, and the scorer indexes its
+/// plane by candidate, so the stride is the bucket the capture picked and never the round's own
+/// block count.
+pub(crate) const QWEN38_FLASH_NEXT_QSA_SCORE_STRIDE: usize =
+    match selection_block_bucket(QWEN38_FLASH_NEXT_QSA_CANDIDATE_BLOCKS) {
+        Some(bucket) => bucket,
+        None => panic!("this owner's context is inside the widest prepared scoring grid"),
+    };
+
+/// Micro-blocks one round of the widest admitted width can close.
+pub(crate) const QWEN38_FLASH_NEXT_QSA_ROUND_BLOCKS: usize =
+    selection_round_blocks(QWEN38_FLASH_NEXT_LAYER_MAX_ROWS);
+
 /// Rotary elements one token carries: `rotary_dim / 2` with `partial_rotary_factor = 0.25`.
 const ROTARY_ELEMENTS: usize = 32;
 
@@ -35,7 +70,9 @@ const EXPERT_WEIGHT_SCALES: usize = 3;
 
 const _: () =
     assert!(MAX_BATCH * QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE == QWEN38_FLASH_NEXT_QSA_PHYSICAL_PAGES);
-const _: () = assert!(QWEN38_FLASH_NEXT_QSA_CONTEXT_CAPACITY == 2_112);
+const _: () = assert!(QWEN38_FLASH_NEXT_QSA_CONTEXT_CAPACITY == 4_096);
+const _: () = assert!(QWEN38_FLASH_NEXT_QSA_SCORE_STRIDE == 4_096);
+const _: () = assert!(QWEN38_FLASH_NEXT_QSA_ROUND_BLOCKS == 257);
 
 /// Every region one Qwen3.8-Flash-Next QSA/MoE layer owns, in launch order.
 #[derive(Clone, Copy, Debug)]
@@ -63,7 +100,6 @@ pub(crate) struct Qwen38FlashNextQsaMoeLayerRegions {
     pub(crate) output_weight: ArenaRegion<u16>,
     pub(crate) query_norm: ArenaRegion<u16>,
     pub(crate) key_norm: ArenaRegion<u16>,
-    /// Reserved for the selection route; the dense route does not read it.
     pub(crate) indexer_qk_weight: ArenaRegion<u16>,
     pub(crate) indexer_query_norm: ArenaRegion<u16>,
     pub(crate) indexer_key_norm: ArenaRegion<u16>,
@@ -80,11 +116,39 @@ pub(crate) struct Qwen38FlashNextQsaMoeLayerRegions {
     pub(crate) lengths: ArenaRegion<u32>,
     pub(crate) block_tables: ArenaRegion<u32>,
 
+    // --- selection stage planes ---
+    /// Fused indexer query and key projection rows `[rows, 640]`.
+    pub(crate) indexer_qk: ArenaRegion<u16>,
+    /// Prepared indexer queries `[rows, 4, 128]`, normed and rotated at each query's position.
+    pub(crate) indexer_query: ArenaRegion<f32>,
+    /// Per-sequence raw-key ring, four slots wide: one open micro-block.
+    pub(crate) indexer_ring: ArenaRegion<u16>,
+    /// Round-local raw keys, one row per position a prompt tile carries.
+    pub(crate) indexer_raw_round: ArenaRegion<u16>,
+    /// Rotary cosines at each closing block's first token.
+    pub(crate) block_rope_cos: ArenaRegion<f32>,
+    /// Rotary sines at each closing block's first token.
+    pub(crate) block_rope_sin: ArenaRegion<f32>,
+    /// First micro-block each compression row closes this round.
+    pub(crate) closing_first_blocks: ArenaRegion<u32>,
+    /// Micro-blocks each compression row closes this round.
+    pub(crate) closing_block_counts: ArenaRegion<u32>,
+    /// Complete candidate blocks each token of the round may score.
+    pub(crate) candidate_blocks: ArenaRegion<u32>,
+    /// Score scratch, one row tile at a time.
+    pub(crate) scores: ArenaRegion<f32>,
+    /// Selection scratch for one row tile; serialized graph launches share this plane.
+    pub(crate) select_scratch: ArenaRegion<u32>,
+    /// Selected positions `[rows, 2051]`, ascending.
+    pub(crate) selected: ArenaRegion<u32>,
+    /// Selected position count of each token.
+    pub(crate) selected_counts: ArenaRegion<u32>,
+
     // --- paged cache planes ---
     pub(crate) key_pages: ArenaRegion<u8>,
     pub(crate) value_pages: ArenaRegion<u8>,
-    /// Raw 128-wide indexer keys sharing this layer's page mapping.
-    pub(crate) indexer_pages: ArenaRegion<u8>,
+    /// Compressed 128-wide block keys, one per four cached tokens, on this layer's page mapping.
+    pub(crate) block_keys: ArenaRegion<u16>,
 
     // --- MoE, identical to the GDN layer's half ---
     pub(crate) router_weight: ArenaRegion<u16>,
@@ -187,19 +251,57 @@ impl Qwen38FlashNextQsaMoeLayerLayout {
                 <A as Arch>::HEAD_DIM,
             )?,
         )?;
-        let indexer_plane = product(
-            "Qwen3.8-Flash-Next indexer cache plane",
+        let block_key_plane = product(
+            "Qwen3.8-Flash-Next block-key cache plane",
             product(
-                "Qwen3.8-Flash-Next indexer cache page tokens",
+                "Qwen3.8-Flash-Next block-key cache page blocks",
                 QWEN38_FLASH_NEXT_QSA_PHYSICAL_PAGES,
-                QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE,
+                SELECTION_BLOCKS_PER_PAGE,
             )?,
-            // BF16 keys, addressed as bytes so the plane is one contiguous cache class.
+            A::INDEXER_HEAD_DIM,
+        )?;
+        let indexer_qk = product(
+            "Qwen3.8-Flash-Next indexer projection rows",
+            rows,
+            A::INDEXER_ROWS,
+        )?;
+        let indexer_query = product(
+            "Qwen3.8-Flash-Next indexer query rows",
             product(
-                "Qwen3.8-Flash-Next indexer key bytes",
-                A::INDEXER_HEAD_DIM,
-                2,
+                "Qwen3.8-Flash-Next indexer query heads",
+                rows,
+                A::INDEXER_HEADS,
             )?,
+            A::INDEXER_HEAD_DIM,
+        )?;
+        let indexer_ring = product(
+            "Qwen3.8-Flash-Next indexer ring",
+            product(
+                "Qwen3.8-Flash-Next indexer ring slots",
+                MAX_BATCH,
+                SELECTION_RING_SLOTS,
+            )?,
+            A::INDEXER_HEAD_DIM,
+        )?;
+        let indexer_raw_round = product(
+            "Qwen3.8-Flash-Next indexer round keys",
+            rows,
+            A::INDEXER_HEAD_DIM,
+        )?;
+        let block_rotary = product(
+            "Qwen3.8-Flash-Next block rotary rows",
+            QWEN38_FLASH_NEXT_QSA_ROUND_BLOCKS,
+            ROTARY_ELEMENTS,
+        )?;
+        let score_plane = product(
+            "Qwen3.8-Flash-Next score scratch",
+            SELECTION_ROW_TILE,
+            QWEN38_FLASH_NEXT_QSA_SCORE_STRIDE,
+        )?;
+        let selected_plane = product(
+            "Qwen3.8-Flash-Next selected positions",
+            rows,
+            SELECTION_MAX_SELECTED,
         )?;
 
         let router_weight = product(
@@ -274,9 +376,23 @@ impl Qwen38FlashNextQsaMoeLayerLayout {
             lengths: builder.reserve(rows, ALIGNMENT)?,
             block_tables: builder.reserve(QWEN38_FLASH_NEXT_QSA_PHYSICAL_PAGES, ALIGNMENT)?,
 
+            indexer_qk: builder.reserve(indexer_qk, ALIGNMENT)?,
+            indexer_query: builder.reserve(indexer_query, ALIGNMENT)?,
+            indexer_ring: builder.reserve(indexer_ring, ALIGNMENT)?,
+            indexer_raw_round: builder.reserve(indexer_raw_round, ALIGNMENT)?,
+            block_rope_cos: builder.reserve(block_rotary, ALIGNMENT)?,
+            block_rope_sin: builder.reserve(block_rotary, ALIGNMENT)?,
+            closing_first_blocks: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+            closing_block_counts: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+            candidate_blocks: builder.reserve(rows, ALIGNMENT)?,
+            scores: builder.reserve(score_plane, ALIGNMENT)?,
+            select_scratch: builder.reserve(SELECTION_SCRATCH_WORDS, ALIGNMENT)?,
+            selected: builder.reserve(selected_plane, ALIGNMENT)?,
+            selected_counts: builder.reserve(rows, ALIGNMENT)?,
+
             key_pages: builder.reserve(cache_plane, ALIGNMENT)?,
             value_pages: builder.reserve(cache_plane, ALIGNMENT)?,
-            indexer_pages: builder.reserve(indexer_plane, ALIGNMENT)?,
+            block_keys: builder.reserve(block_key_plane, ALIGNMENT)?,
 
             router_weight: builder.reserve(router_weight, ALIGNMENT)?,
             expert_weight_scales_2: builder.reserve(expert_weight_scales_2, ALIGNMENT)?,
@@ -330,12 +446,16 @@ impl Qwen38FlashNextQsaMoeLayerLayout {
                 regions.shared_gate_logit_weight.byte_len(),
             ],
         )?;
+        // The ring counts as cache and not workspace: it carries the open micro-block's raw keys
+        // between rounds, so a slot recycle has to clear it like any other per-sequence plane.
+        // It is not a *page* class, which is exactly why the page cost dropped.
         let cache_bytes = sum(
             "Qwen3.8-Flash-Next QSA cache",
             &[
                 regions.key_pages.byte_len(),
                 regions.value_pages.byte_len(),
-                regions.indexer_pages.byte_len(),
+                regions.block_keys.byte_len(),
+                regions.indexer_ring.byte_len(),
             ],
         )?;
         let workspace_bytes = sum(
@@ -358,6 +478,18 @@ impl Qwen38FlashNextQsaMoeLayerLayout {
                 regions.cache_positions.byte_len(),
                 regions.lengths.byte_len(),
                 regions.block_tables.byte_len(),
+                regions.indexer_qk.byte_len(),
+                regions.indexer_query.byte_len(),
+                regions.indexer_raw_round.byte_len(),
+                regions.block_rope_cos.byte_len(),
+                regions.block_rope_sin.byte_len(),
+                regions.closing_first_blocks.byte_len(),
+                regions.closing_block_counts.byte_len(),
+                regions.candidate_blocks.byte_len(),
+                regions.scores.byte_len(),
+                regions.select_scratch.byte_len(),
+                regions.selected.byte_len(),
+                regions.selected_counts.byte_len(),
                 regions.router_logits.byte_len(),
                 regions.expert_indices.byte_len(),
                 regions.routing_weights.byte_len(),
@@ -408,7 +540,7 @@ impl Qwen38FlashNextQsaMoeLayerLayout {
         self.resident_weight_bytes
     }
 
-    /// Exact represented E4M3 key/value bytes plus the reserved indexer key plane.
+    /// Exact represented E4M3 key/value bytes, the block-key plane, and the raw-key ring.
     pub const fn cache_bytes(&self) -> usize {
         self.cache_bytes
     }
@@ -509,11 +641,16 @@ mod tests {
         let layout = Qwen38FlashNextQsaMoeLayerLayout::build(3).unwrap();
 
         assert_eq!(layout.resident_weight_bytes(), 141_775_360);
-        assert_eq!(layout.cache_bytes(), 21_626_880);
-        assert_eq!(layout.workspace_bytes(), 258_669_600);
-        assert_eq!(layout.owner_bytes(), 422_071_840);
-        assert_eq!(layout.arena_bytes(), 422_072_064);
-        assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 224);
+        assert_eq!(layout.cache_bytes(), 35_659_776);
+        // 271,864,128 of activations and metadata plus the one selection scratch plane this
+        // owner funds for the split selection: 274,944 u32 words = 1,099,776 B, a multiple of
+        // the 256-byte alignment, so it costs its own size and no padding.
+        assert_eq!(layout.workspace_bytes(), 272_963_904);
+        assert_eq!(layout.workspace_bytes(), 271_864_128 + 1_099_776);
+        assert_eq!(layout.regions().select_scratch.byte_len(), 1_099_776);
+        assert_eq!(layout.owner_bytes(), 450_399_040);
+        assert_eq!(layout.arena_bytes(), 450_399_744);
+        assert_eq!(layout.arena_bytes() - layout.owner_bytes(), 704);
         assert_eq!(layout.row_capacity(), QWEN38_FLASH_NEXT_LAYER_MAX_ROWS);
 
         // The inspection trait reports the same three classes the inherent accessors do, and
@@ -537,18 +674,20 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_covers_the_whole_dense_band_at_every_slot() {
+    fn the_cache_covers_both_routes_at_every_slot() {
         let layout = Qwen38FlashNextQsaMoeLayerLayout::build(3).unwrap();
 
-        assert_eq!(QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE, 33);
-        assert_eq!(QWEN38_FLASH_NEXT_QSA_CONTEXT_CAPACITY, 2_112);
-        assert!(layout.context_capacity() >= QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING);
-        // And it is the *smallest* such page count: the stride is the ceiling divided by the
-        // page size, rounded up, so one page fewer per slot would fall short.
+        assert_eq!(QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE, 64);
+        assert_eq!(QWEN38_FLASH_NEXT_QSA_CONTEXT_CAPACITY, 4_096);
+        assert!(layout.context_capacity() > QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING);
+        // Twice the dense floor, and the doubling is what this owner's second route needs: the
+        // selection only runs once a query sees more than 2,051 keys, so a pool sized to
+        // `ceil(2051 / 64)` per slot would leave it unreachable and unqualifiable.
         assert_eq!(
             QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE,
-            QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING
+            2 * QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING
                 .div_ceil(QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE)
+                - 2
         );
         assert_eq!(
             MAX_BATCH * QWEN38_FLASH_NEXT_QSA_TABLE_STRIDE,
@@ -557,11 +696,12 @@ mod tests {
     }
 
     #[test]
-    fn the_indexer_key_plane_is_reserved_beside_the_kv_planes() {
+    fn the_indexer_pays_for_block_keys_per_page_and_raw_keys_per_sequence() {
         let layout = Qwen38FlashNextQsaMoeLayerLayout::build(3).unwrap();
         let regions = layout.regions();
 
-        // Per-page bytes: 32,768 K, 32,768 V, and 16,384 indexer keys.
+        // 32,768 B per page for K, the same for V, and 4,096 B for compressed block keys:
+        // one BF16 vector per four cached tokens rather than one per token.
         assert_eq!(
             regions.key_pages.byte_len() / QWEN38_FLASH_NEXT_QSA_PHYSICAL_PAGES,
             32_768
@@ -571,15 +711,25 @@ mod tests {
             32_768
         );
         assert_eq!(
-            regions.indexer_pages.byte_len() / QWEN38_FLASH_NEXT_QSA_PHYSICAL_PAGES,
-            16_384
+            regions.block_keys.byte_len() / QWEN38_FLASH_NEXT_QSA_PHYSICAL_PAGES,
+            4_096
         );
-        let per_page = layout.cache_bytes() / QWEN38_FLASH_NEXT_QSA_PHYSICAL_PAGES;
-        assert_eq!(per_page, 81_920);
-        // 12 QSA layers x 1,280 B/token, of which 3,072 is the indexer plane.
+
+        // The raw keys are not a page class at all: the ring is `MAX_BATCH * 4` vectors however
+        // deep the pool runs, which is what took 16,384 B off every page.
+        assert_eq!(regions.indexer_ring.byte_len(), 8_192);
+        assert_eq!(
+            regions.indexer_ring.byte_len(),
+            MAX_BATCH * 4 * A::INDEXER_HEAD_DIM * 2
+        );
+
+        let per_page = (layout.cache_bytes() - regions.indexer_ring.byte_len())
+            / QWEN38_FLASH_NEXT_QSA_PHYSICAL_PAGES;
+        assert_eq!(per_page, 69_632);
+        // 12 QSA layers x 1,088 B/token, of which 64 is the block-key plane's share.
         assert_eq!(
             per_page / QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE * 12,
-            15_360
+            13_056
         );
     }
 
@@ -638,9 +788,22 @@ mod tests {
             span(regions.cache_positions),
             span(regions.lengths),
             span(regions.block_tables),
+            span(regions.indexer_qk),
+            span(regions.indexer_query),
+            span(regions.indexer_ring),
+            span(regions.indexer_raw_round),
+            span(regions.block_rope_cos),
+            span(regions.block_rope_sin),
+            span(regions.closing_first_blocks),
+            span(regions.closing_block_counts),
+            span(regions.candidate_blocks),
+            span(regions.scores),
+            span(regions.select_scratch),
+            span(regions.selected),
+            span(regions.selected_counts),
             span(regions.key_pages),
             span(regions.value_pages),
-            span(regions.indexer_pages),
+            span(regions.block_keys),
             span(regions.router_weight),
             span(regions.expert_weight_scales_2),
             span(regions.shared_gate_weight),
@@ -729,8 +892,20 @@ mod tests {
         );
     }
 
+    /// The same backbone projections the GDN owner records, in this layer's two shapes.
+    ///
+    /// `Qwen38FlashNextAttentionQkPrepareOp::launch` and `Qwen38FlashNextAttentionGateOp::launch` both read
+    /// `qkv` covering `[tokens, 13312]`, and the gate publishes `activation` covering
+    /// `[tokens, 6144]`. So this layer needs
+    ///
+    /// * `q || k || v`: `[rows, 2560] x [13312, 2560]^T -> [rows, 13312]`, and
+    /// * `o_proj`: `[rows, 6144] x [ 2560, 6144]^T -> [rows,  2560]`.
+    ///
+    /// `o_proj` and the GDN layer's `out_proj` are the **same shape**, so one entry family
+    /// serves both layer kinds and this owner names the same reduction entry the GDN owner
+    /// does, with its own weight plane.
     #[test]
-    fn backbone_projection_planes_have_exact_routes() {
+    fn the_backbone_projections_have_reserved_planes_and_admitted_producers() {
         let layout = Qwen38FlashNextQsaMoeLayerLayout::build(3).unwrap();
         let regions = layout.regions();
         let rows = QWEN38_FLASH_NEXT_LAYER_MAX_ROWS;
@@ -738,6 +913,8 @@ mod tests {
         assert_eq!(regions.qkv.len(), rows * A::ATTENTION_QKV_ROWS);
         assert_eq!(regions.block_output.len(), rows * <A as Arch>::HIDDEN);
 
+        // The output projection this layer needs is byte-for-byte the shape the GDN layer's
+        // out_proj needs, which is why the family is three shapes and not four.
         use crate::Qwen38FlashNextGdnMoeLayerLayout;
         let gdn = Qwen38FlashNextGdnMoeLayerLayout::build(0).unwrap();
         assert_eq!(
@@ -754,17 +931,23 @@ mod tests {
             "qwen38_flash_next_qsa_qkv_projection",
             "qwen38_flash_next_block_output_projection",
         ] {
+            let routes = entries.iter().filter(|name| name.starts_with(base)).count();
             assert_eq!(
-                entries.iter().filter(|name| name.starts_with(base)).count(),
-                12,
-                "{base} does not cover every admitted route"
+                routes, 12,
+                "{base} does not cover the twelve admitted routes"
             );
         }
     }
 
+    /// The arena this layout describes is the one the composed program allocates.
+    ///
+    /// The program that consumes it is qualified against real weights in
+    /// `qual/src/qwen38_flash_next_qsa_moe_layer.rs`, which supersedes the placeholder this test used
+    /// to be.
     #[test]
-    fn builder_covers_the_composed_qsa_arena() {
+    fn the_builder_describes_the_whole_arena_the_program_allocates() {
         let layout = Qwen38FlashNextQsaMoeLayerLayout::build(3).unwrap();
+
         assert_eq!(layout.builder().byte_len(), layout.arena_bytes());
         assert!(layout.arena_bytes() >= layout.owner_bytes());
     }
