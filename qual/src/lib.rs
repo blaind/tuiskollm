@@ -310,6 +310,8 @@ mod qwen38_flash_next_projection;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_projection_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_prompt_prime_benchmark;
+#[cfg(feature = "device")]
 mod qwen38_flash_next_qsa_attention;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_qsa_attention_benchmark;
@@ -875,6 +877,12 @@ pub use qwen38_flash_next_projection::{
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_projection_benchmark::benchmark_qwen38_flash_next_projections;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_prompt_prime_benchmark::{
+    Qwen38FlashNextPrimePair, Qwen38FlashNextPrimeSample, Qwen38FlashNextPromptPrimeBenchmark,
+    Qwen38FlashNextPromptPrimeBenchmarkError, benchmark_qwen38_flash_next_prompt_prime,
+    print_qwen38_flash_next_prompt_prime_benchmark,
+};
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_qsa_attention::{
     Qwen38FlashNextQsaAttentionQualification, Qwen38FlashNextQsaAttentionQualificationError,

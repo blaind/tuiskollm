@@ -49,6 +49,14 @@ pub(crate) trait TextGenerator {
         request: &ChatGenerationRequest,
     ) -> Result<ResidentBatchAdmission, EngineError>;
 
+    /// Admits queued requests in ingress order.
+    fn admit_batch(
+        &mut self,
+        requests: &[&ChatGenerationRequest],
+    ) -> Vec<Result<ResidentBatchAdmission, EngineError>> {
+        requests.iter().map(|request| self.admit(request)).collect()
+    }
+
     /// Advances every active request by exactly one scheduler round.
     fn step(&mut self) -> Result<Self::Events, EngineError>;
 
@@ -246,6 +254,13 @@ impl TextGenerator for Qwen38FlashNextResidentBatchGenerator {
         request: &ChatGenerationRequest,
     ) -> Result<ResidentBatchAdmission, EngineError> {
         Qwen38FlashNextResidentBatchGenerator::admit(self, request)
+    }
+
+    fn admit_batch(
+        &mut self,
+        requests: &[&ChatGenerationRequest],
+    ) -> Vec<Result<ResidentBatchAdmission, EngineError>> {
+        Qwen38FlashNextResidentBatchGenerator::admit_batch(self, requests)
     }
 
     fn step(&mut self) -> Result<Self::Events, EngineError> {

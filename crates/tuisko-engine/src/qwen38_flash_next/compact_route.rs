@@ -284,6 +284,31 @@ mod tests {
     }
 
     #[test]
+    fn a_grouped_prompt_prime_narrows_as_prompts_finish() {
+        let slots = [0usize, 1, 2];
+        let tails = [11usize, 3, 7];
+        let mut widths = Vec::new();
+        let mut rounds = Vec::new();
+        for position in 0..11 {
+            let pending = tails.map(|tail| position < tail);
+            let round = qwen38_flash_next_compact_round(&slots, &pending).unwrap();
+            widths.push(round.rows());
+            rounds.push(round.slots().to_vec());
+        }
+
+        assert_eq!(widths, [3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1]);
+        assert_eq!(rounds[0], [0, 1, 2]);
+        assert_eq!(rounds[3], [0, 2]);
+        assert_eq!(rounds[7], [0]);
+        assert!(widths.windows(2).all(|pair| pair[0] >= pair[1]));
+        assert!(
+            qwen38_flash_next_compact_round(&[0, 1], &[false, false])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn a_retirement_and_the_round_that_produced_it_agree_on_their_lengths() {
         let error = qwen38_flash_next_compact_survivors(&[0, 1], &[true]).unwrap_err();
         assert_eq!(error.code(), Some(EngineErrorCode::Route));

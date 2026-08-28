@@ -61,7 +61,7 @@ impl Qwen38FlashNextGenerationTelemetry {
         self.prime_tiles
     }
 
-    /// Single-row rounds the prompt prime's scalar tail replayed.
+    /// Decode rounds the prompt prime's scalar tail replayed.
     pub const fn prime_scalar_rounds(self) -> usize {
         self.prime_scalar_rounds
     }
@@ -395,6 +395,24 @@ pub(crate) fn prime_prompt(
     token_ids: &[u32],
     slot: usize,
 ) -> EngineResult<usize> {
+    let cursor = prime_prompt_tiles(model, stream, token_ids, slot)?;
+
+    for (offset, &token) in token_ids[cursor..].iter().enumerate() {
+        let position = prompt_position(cursor + offset)?;
+        let step = model.decode_step(stream, &[token], &[position], &[slot])?;
+        model.observe_prime_round(&step, false);
+    }
+
+    Ok(cursor)
+}
+
+/// Replays one slot's tile ladder and returns the native tokens it covered.
+pub(crate) fn prime_prompt_tiles(
+    model: &mut Qwen38FlashNextResidentModel,
+    stream: &CudaStream,
+    token_ids: &[u32],
+    slot: usize,
+) -> EngineResult<usize> {
     if token_ids.is_empty() {
         return Err(EngineError::generation(
             "Flash-Next generation requires a nonempty prompt",
@@ -403,23 +421,18 @@ pub(crate) fn prime_prompt(
     let mut cursor = 0usize;
 
     while let Some(tokens) = next_native_prefill_tile(token_ids.len() - cursor) {
-        let first = u32::try_from(cursor).map_err(|_| {
-            EngineError::generation("Flash-Next prompt position exceeds the route width")
-        })?;
+        let first = prompt_position(cursor)?;
         let step = model.prefill_tile(stream, &token_ids[cursor..cursor + tokens], first, slot)?;
         model.observe_prime_round(&step, true);
         cursor += tokens;
     }
 
-    for (offset, &token) in token_ids[cursor..].iter().enumerate() {
-        let position = u32::try_from(cursor + offset).map_err(|_| {
-            EngineError::generation("Flash-Next prompt position exceeds the route width")
-        })?;
-        let step = model.decode_step(stream, &[token], &[position], &[slot])?;
-        model.observe_prime_round(&step, false);
-    }
-
     Ok(cursor)
+}
+
+pub(crate) fn prompt_position(position: usize) -> EngineResult<u32> {
+    u32::try_from(position)
+        .map_err(|_| EngineError::generation("Flash-Next prompt position exceeds the route width"))
 }
 
 #[cfg(test)]
