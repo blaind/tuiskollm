@@ -16,6 +16,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 struct ServerProfile {
     label: &'static str,
     model: &'static str,
+    revision: &'static str,
     generation_route: &'static str,
     reasoning: &'static str,
     tensor_count: usize,
@@ -24,6 +25,7 @@ struct ServerProfile {
 const QWEN35: ServerProfile = ServerProfile {
     label: "Qwen3.5",
     model: "AxionML/Qwen3.5-9B-NVFP4",
+    revision: "97aef92393f126bf649f310cd40861be8dad3279",
     generation_route: "mtp-b1-compact-b2-8",
     reasoning: "Thinking Process",
     tensor_count: 1_519,
@@ -32,10 +34,14 @@ const QWEN35: ServerProfile = ServerProfile {
 const QWEN36: ServerProfile = ServerProfile {
     label: "Qwen3.6",
     model: "nvidia/Qwen3.6-35B-A3B-NVFP4",
+    revision: "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
     generation_route: "compact-b1-8",
     reasoning: "Here's",
     tensor_count: 124_468,
 };
+
+/// Every sibling target this module can put through its own server qualification.
+const SIBLINGS: [ServerProfile; 2] = [QWEN35, QWEN36];
 
 pub(crate) fn qualify_qwen35(executable: &Path, snapshot: &Path) -> Result<(), Box<dyn Error>> {
     qualify(QWEN35, executable, snapshot)
@@ -43,6 +49,28 @@ pub(crate) fn qualify_qwen35(executable: &Path, snapshot: &Path) -> Result<(), B
 
 pub(crate) fn qualify_qwen36(executable: &Path, snapshot: &Path) -> Result<(), Box<dyn Error>> {
     qualify(QWEN36, executable, snapshot)
+}
+
+/// Runs whichever sibling target's qualification the snapshot's pinned revision names.
+///
+/// The revision lives beside the rest of that target's server facts rather than in the caller,
+/// so a checkpoint bump moves one row instead of two files. The server itself resolves the same
+/// revision independently from `tuisko-model`, which is what makes a stale row here a visible
+/// startup mismatch rather than a silent one.
+pub(crate) fn qualify_sibling(executable: &Path, snapshot: &Path) -> Result<(), Box<dyn Error>> {
+    let revision = snapshot.file_name().and_then(|name| name.to_str());
+    let profile = SIBLINGS
+        .into_iter()
+        .find(|profile| revision == Some(profile.revision))
+        .ok_or_else(|| {
+            format!(
+                "sibling snapshot revision {revision:?} is not {} or {}; the cross-target check \
+                 runs a sibling's own server qualification, so it needs a snapshot that has one",
+                QWEN35.revision, QWEN36.revision
+            )
+        })?;
+
+    qualify(profile, executable, snapshot)
 }
 
 fn qualify(
@@ -66,7 +94,10 @@ fn qualify(
 
     let child = Command::new(executable)
         .arg("serve")
+        .arg(profile.model)
+        .arg("--snapshot")
         .arg(&snapshot)
+        .arg("--address")
         .arg(address.to_string())
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
@@ -384,8 +415,8 @@ impl Drop for ServerProcess {
 #[cfg(test)]
 mod tests {
     use super::{
-        QWEN35, QWEN36, ServerProfile, validate_blocking, validate_health, validate_models,
-        validate_streaming,
+        QWEN35, QWEN36, SIBLINGS, ServerProfile, validate_blocking, validate_health,
+        validate_models, validate_streaming,
     };
     use serde_json::json;
 
@@ -483,6 +514,22 @@ mod tests {
                 }),
             );
             validate_streaming(profile, &body).unwrap();
+        }
+    }
+
+    #[test]
+    fn every_sibling_profile_is_reachable_by_its_own_revision() {
+        // Dispatch must identify one non-empty revision.
+        assert_eq!(SIBLINGS.len(), 2);
+        assert_ne!(QWEN35.revision, QWEN36.revision);
+        for profile in SIBLINGS {
+            assert_eq!(profile.revision.len(), 40);
+            assert!(
+                profile
+                    .revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            );
         }
     }
 

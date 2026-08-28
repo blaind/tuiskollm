@@ -25,12 +25,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
 use tokio::sync::oneshot;
 use tuisko_engine::{
-    EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, Qwen35ResidentMtpBatchGenerator,
-    Qwen36ResidentBatchGenerator, ResidentBatchAdmission, ResidentLoadPhase, ResidentLoadProgress,
-    ResidentMtpBatchGenerator, ResidentRequestId,
+    EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, QWEN38_FLASH_NEXT_SERVING_SLOTS,
+    Qwen35ResidentMtpBatchGenerator, Qwen36ResidentBatchGenerator,
+    Qwen38FlashNextResidentGenerator, ResidentBatchAdmission, ResidentLoadPhase,
+    ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentRequestId,
 };
 use tuisko_frontend::GenerationDefaults;
-use tuisko_model::{Arch, CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
+use tuisko_model::{
+    Arch, CheckpointSnapshot, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext,
+};
 
 const REQUEST_BODY_LIMIT: usize = 2 * 1024 * 1024;
 const DEFAULT_SEED_SCRAMBLE: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -40,6 +43,8 @@ const GENERATION_REPLY_BUFFER: usize = 32;
 const MTP_GENERATION_ROUTE: &str = "mtp-draft-3";
 const QWEN35_MTP_GENERATION_ROUTE: &str = "mtp-b1-compact-b2-8";
 const QWEN36_COMPACT_GENERATION_ROUTE: &str = "compact-b1-8";
+const QWEN38_FLASH_NEXT_SINGLE_SLOT_GENERATION_ROUTE: &str = "single-slot-b1-1";
+const QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT: &str = "medium";
 
 /// Startup configuration for the one exact resident server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +83,7 @@ struct AppState {
     model_id: &'static str,
     generation_route: &'static str,
     generation_defaults: GenerationDefaults,
+    reasoning_effort: Option<&'static str>,
 }
 
 struct Job {
@@ -102,6 +108,7 @@ struct Ready {
     model_id: &'static str,
     generation_route: &'static str,
     generation_defaults: GenerationDefaults,
+    reasoning_effort: Option<&'static str>,
     device_name: String,
     checkpoint_admission: Duration,
     weight_load: Duration,
@@ -126,11 +133,18 @@ pub enum ServerModel {
     Qwen35,
     /// `nvidia/Qwen3.6-35B-A3B-NVFP4`.
     Qwen36,
+    /// `RadixArk/Qwen3.8-Flash-Next-NVFP4`.
+    Qwen38FlashNext,
 }
 
 impl ServerModel {
     /// Every exact model currently served by this executable.
-    pub const ALL: [Self; 3] = [Self::Qwen38, Self::Qwen35, Self::Qwen36];
+    pub const ALL: [Self; 4] = [
+        Self::Qwen38,
+        Self::Qwen35,
+        Self::Qwen36,
+        Self::Qwen38FlashNext,
+    ];
 
     /// Resolves one exact Hugging Face model ID without aliases or discovery.
     pub fn from_model_id(model_id: &str) -> Result<Self, String> {
@@ -138,6 +152,7 @@ impl ServerModel {
             Qwen38_27B::MODEL_ID => Ok(Self::Qwen38),
             Qwen35_9B::MODEL_ID => Ok(Self::Qwen35),
             Qwen36Moe35B::MODEL_ID => Ok(Self::Qwen36),
+            Qwen38FlashNext::MODEL_ID => Ok(Self::Qwen38FlashNext),
             _ => Err(format!(
                 "unsupported model `{model_id}`; expected one of: {}",
                 Self::ALL.map(Self::model_id).join(", ")
@@ -151,6 +166,7 @@ impl ServerModel {
             Self::Qwen38 => Qwen38_27B::MODEL_ID,
             Self::Qwen35 => Qwen35_9B::MODEL_ID,
             Self::Qwen36 => Qwen36Moe35B::MODEL_ID,
+            Self::Qwen38FlashNext => Qwen38FlashNext::MODEL_ID,
         }
     }
 
@@ -159,6 +175,14 @@ impl ServerModel {
             Self::Qwen38 => MTP_GENERATION_ROUTE,
             Self::Qwen35 => QWEN35_MTP_GENERATION_ROUTE,
             Self::Qwen36 => QWEN36_COMPACT_GENERATION_ROUTE,
+            Self::Qwen38FlashNext => QWEN38_FLASH_NEXT_SINGLE_SLOT_GENERATION_ROUTE,
+        }
+    }
+
+    const fn reasoning_effort(self) -> Option<&'static str> {
+        match self {
+            Self::Qwen38 | Self::Qwen35 | Self::Qwen36 => None,
+            Self::Qwen38FlashNext => Some(QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT),
         }
     }
 }
@@ -286,6 +310,7 @@ fn start_worker(
             model_id: ready.model_id,
             generation_route: ready.generation_route,
             generation_defaults: ready.generation_defaults,
+            reasoning_effort: ready.reasoning_effort,
         },
         ready,
         failure_rx,
@@ -321,6 +346,13 @@ fn engine_worker(
         ServerModel::Qwen36 => {
             start_generator(load_qwen36(&snapshot), jobs, ready, failure, &worker_ready)
         }
+        ServerModel::Qwen38FlashNext => start_generator(
+            load_qwen38_flash_next(&snapshot, progress.as_ref()),
+            jobs,
+            ready,
+            failure,
+            &worker_ready,
+        ),
     }
 }
 
@@ -347,6 +379,7 @@ fn load_qwen38(
         model_id: Qwen38_27B::MODEL_ID,
         generation_route: ServerModel::Qwen38.generation_route(),
         generation_defaults: generator.generation_defaults(),
+        reasoning_effort: ServerModel::Qwen38.reasoning_effort(),
         device_name,
         checkpoint_admission,
         weight_load: Duration::from_nanos(load_stats.weight_load_ns()),
@@ -385,6 +418,7 @@ fn load_qwen35(snapshot: &Path) -> Result<(Qwen35ResidentMtpBatchGenerator, Read
         model_id: Qwen35_9B::MODEL_ID,
         generation_route: ServerModel::Qwen35.generation_route(),
         generation_defaults: generator.generation_defaults(),
+        reasoning_effort: ServerModel::Qwen35.reasoning_effort(),
         device_name,
         checkpoint_admission,
         weight_load: resident_load,
@@ -423,6 +457,7 @@ fn load_qwen36(snapshot: &Path) -> Result<(Qwen36ResidentBatchGenerator, Ready),
         model_id: Qwen36Moe35B::MODEL_ID,
         generation_route: ServerModel::Qwen36.generation_route(),
         generation_defaults: generator.generation_defaults(),
+        reasoning_effort: ServerModel::Qwen36.reasoning_effort(),
         device_name,
         checkpoint_admission,
         weight_load: resident_load,
@@ -436,6 +471,57 @@ fn load_qwen36(snapshot: &Path) -> Result<(Qwen36ResidentBatchGenerator, Ready),
         slot_capacity: MAX_BATCH,
         context_capacity: generator.context_capacity(),
         detailed_load_timing: false,
+    };
+
+    Ok((generator, startup))
+}
+
+fn load_qwen38_flash_next(
+    snapshot: &Path,
+    progress: &ResidentLoadProgress,
+) -> Result<(Qwen38FlashNextResidentGenerator, Ready), String> {
+    let checkpoint_start = Instant::now();
+    let admitted = CheckpointSnapshot::<Qwen38FlashNext>::open(snapshot)
+        .map(Arc::new)
+        .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
+    let checkpoint_admission = checkpoint_start.elapsed();
+    let tensor_count = admitted.tensor_count();
+    let generator = Qwen38FlashNextResidentGenerator::from_snapshot_device_zero_with_progress(
+        admitted, progress,
+    )
+    .map_err(|error| format!("loading the resident Qwen3.8 Flash-Next program: {error}"))?;
+    let device_name = generator
+        .context()
+        .device_name()
+        .map_err(|error| format!("reading the CUDA device name: {error}"))?;
+    let arena_bytes = generator
+        .arena_bytes()
+        .map_err(|error| format!("accounting the Qwen3.8 Flash-Next device arenas: {error}"))?;
+    if !generator.mapped_primary() {
+        return Err("Qwen3.8 Flash-Next serving requires mapped primary expert weights".into());
+    }
+    let load_stats = generator.load_stats();
+
+    let startup = Ready {
+        model_id: Qwen38FlashNext::MODEL_ID,
+        generation_route: ServerModel::Qwen38FlashNext.generation_route(),
+        generation_defaults: generator.generation_defaults(),
+        reasoning_effort: ServerModel::Qwen38FlashNext.reasoning_effort(),
+        device_name,
+        checkpoint_admission,
+        weight_load: load_stats
+            .weight_upload()
+            .saturating_sub(load_stats.expert_stage()),
+        source_prefault: load_stats.expert_stage(),
+        graph_capture: load_stats.graph_capture(),
+        tensor_count,
+        upload_bytes: generator.resident_weight_bytes(),
+        prefault_bytes: load_stats.staged_bytes(),
+        arena_bytes,
+        host_stager_bytes: generator.host_stager_bytes(),
+        slot_capacity: QWEN38_FLASH_NEXT_SERVING_SLOTS,
+        context_capacity: generator.context_capacity(),
+        detailed_load_timing: true,
     };
 
     Ok((generator, startup))
@@ -487,7 +573,7 @@ fn serve_requests<G: TextGenerator>(
                 None => jobs_open = false,
             }
         }
-        while jobs_open && generator.active_requests() < MAX_BATCH {
+        while jobs_open && generator.active_requests() < generator.slot_capacity() {
             match jobs.try_recv() {
                 Ok(job) => admit_job(&mut generator, &mut replies, job),
                 Err(TryRecvError::Empty) => break,
@@ -889,6 +975,7 @@ async fn chat_completions(
         numeric_id ^ DEFAULT_SEED_SCRAMBLE,
         state.model_id,
         state.generation_defaults,
+        state.reasoning_effort,
     ) {
         Ok(request) => request,
         Err(ChatRequestError::ModelNotFound { requested }) => {
@@ -1004,7 +1091,8 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, EnqueueError, Job, Ready, ServerError, ServerModel, chat_completions,
+        AppState, EnqueueError, Job, QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT,
+        QWEN38_FLASH_NEXT_SERVING_SLOTS, Ready, ServerError, ServerModel, chat_completions,
         enqueue_job, fail_queued, health, models, record_admission, render_loading, render_startup,
         render_weight_progress, router, serve_until_worker_failure, try_send_generation_steps,
     };
@@ -1026,7 +1114,7 @@ mod tests {
         MAX_BATCH,
     };
     use tuisko_frontend::{ChatMessage, GenerationDefaults};
-    use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext};
 
     fn runtime() -> tokio::runtime::Runtime {
         Builder::new_current_thread().enable_all().build().unwrap()
@@ -1058,6 +1146,7 @@ mod tests {
                 top_p: 0.95,
                 top_k: 20,
             },
+            reasoning_effort: ServerModel::Qwen38.reasoning_effort(),
         }
     }
 
@@ -1071,6 +1160,7 @@ mod tests {
                 top_p: 0.95,
                 top_k: 20,
             },
+            reasoning_effort: ServerModel::Qwen38.reasoning_effort(),
             device_name: "NVIDIA GeForce RTX 5090".into(),
             checkpoint_admission: Duration::from_micros(2_500),
             weight_load: Duration::from_micros(1_604_600),
@@ -1138,6 +1228,7 @@ mod tests {
                 top_p: 1.0,
                 top_k: 1,
             },
+            reasoning_effort: ServerModel::Qwen35.reasoning_effort(),
             device_name: "NVIDIA GeForce RTX 5090".into(),
             checkpoint_admission: Duration::from_millis(11),
             weight_load: Duration::from_millis(725),
@@ -1353,6 +1444,11 @@ mod tests {
                 "mtp-b1-compact-b2-8",
             ),
             (Qwen36Moe35B::MODEL_ID, ServerModel::Qwen36, "compact-b1-8"),
+            (
+                Qwen38FlashNext::MODEL_ID,
+                ServerModel::Qwen38FlashNext,
+                "single-slot-b1-1",
+            ),
         ] {
             let target = ServerModel::from_model_id(model).unwrap();
             assert_eq!(target, expected);
@@ -1364,6 +1460,59 @@ mod tests {
         for model in ServerModel::ALL {
             assert!(error.contains(model.model_id()));
         }
+    }
+
+    #[test]
+    fn qwen38_flash_next_uses_the_zero_preamble_reasoning_default() {
+        assert_eq!(QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, "medium");
+        assert_eq!(
+            ServerModel::Qwen38FlashNext.reasoning_effort(),
+            Some("medium")
+        );
+        for model in [
+            ServerModel::Qwen38,
+            ServerModel::Qwen35,
+            ServerModel::Qwen36,
+        ] {
+            assert_eq!(model.reasoning_effort(), None);
+        }
+    }
+
+    #[test]
+    fn qwen38_flash_next_startup_reports_its_admitted_route() {
+        let ready = Ready {
+            model_id: Qwen38FlashNext::MODEL_ID,
+            generation_route: ServerModel::Qwen38FlashNext.generation_route(),
+            generation_defaults: GenerationDefaults {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+            },
+            reasoning_effort: ServerModel::Qwen38FlashNext.reasoning_effort(),
+            device_name: "NVIDIA GeForce RTX 5090".into(),
+            checkpoint_admission: Duration::ZERO,
+            weight_load: Duration::ZERO,
+            source_prefault: Duration::ZERO,
+            graph_capture: Duration::ZERO,
+            tensor_count: 2_003,
+            upload_bytes: 0,
+            prefault_bytes: 0,
+            arena_bytes: 29 * (1 << 30),
+            host_stager_bytes: 15 * (1 << 20),
+            slot_capacity: QWEN38_FLASH_NEXT_SERVING_SLOTS,
+            context_capacity: 2_051,
+            detailed_load_timing: true,
+        };
+        let output = render_startup(
+            &ready,
+            Duration::ZERO,
+            "127.0.0.1:8000".parse().unwrap(),
+            false,
+        );
+
+        assert!(output.contains("single-slot-b1-1"));
+        assert!(output.contains("1 slots"));
+        assert!(output.contains("context 2051"));
     }
 
     #[test]

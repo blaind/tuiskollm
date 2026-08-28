@@ -156,6 +156,9 @@ pub use qwen38_flash_next::resident_model_layout::{
     QWEN38_FLASH_NEXT_REQUIRED_HEADROOM_BYTES, QWEN38_FLASH_NEXT_RESIDENT_MAX_ROWS,
     QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS, Qwen38FlashNextResidentLayout,
 };
+pub use qwen38_flash_next::serving::{
+    QWEN38_FLASH_NEXT_SERVING_SLOTS, Qwen38FlashNextResidentGenerator,
+};
 pub use qwen38_flash_next::slot_lifecycle::{
     QWEN38_FLASH_NEXT_SLOT_PAGE_TOKENS, QWEN38_FLASH_NEXT_UNMAPPED_PAGE, Qwen38FlashNextSlotChange,
     Qwen38FlashNextSlotPool, Qwen38FlashNextSlotRelease, Qwen38FlashNextSlotState,

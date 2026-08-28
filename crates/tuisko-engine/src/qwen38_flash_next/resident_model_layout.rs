@@ -406,6 +406,23 @@ impl Qwen38FlashNextResidentLayout {
     pub(crate) const fn kv_builder(&self) -> &ArenaLayout {
         &self.kv
     }
+
+    /// Source-backed bytes uploaded for one layer.
+    pub(crate) fn layer_weight_bytes(&self, layer: usize) -> EngineResult<usize> {
+        let regions = self.layers.get(layer..=layer).ok_or_else(|| {
+            EngineError::layout(format!(
+                "Flash-Next layer {layer} is outside the planned 0..{}",
+                self.layers.len()
+            ))
+        })?;
+
+        layer_weight_bytes(regions)
+    }
+
+    /// Source-backed weight bytes the endpoint's own upload writes.
+    pub(crate) fn endpoint_weight_bytes(&self) -> EngineResult<usize> {
+        endpoint_weight_bytes(self.endpoint)
+    }
 }
 
 impl LayerMemoryLayout for Qwen38FlashNextResidentLayout {

@@ -3769,6 +3769,7 @@ name = "tuiskollm"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "tuisko-model",
  "tuisko-provision",
  "tuisko-serve",
 ]
