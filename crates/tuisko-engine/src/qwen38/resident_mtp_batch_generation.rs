@@ -80,7 +80,23 @@ struct ResidentMtpBatchSession {
 
 struct RetainedMtpSlot {
     tokens: Vec<u32>,
+    message_boundary_tokens: usize,
     last_used: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedReuse {
+    None,
+    Complete,
+    MessageBoundary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetainedMatch {
+    slot: usize,
+    tokens: usize,
+    last_used: u64,
+    reuse: RetainedReuse,
 }
 
 struct LaneDrafts {
@@ -302,11 +318,14 @@ impl ResidentMtpBatchGenerator {
             });
         }
 
-        let (slot, reused, reset) = self.select_slot(control.prompt_token_ids())?;
+        let (slot, reused, reset, reuse) = self.select_slot(control.prompt_token_ids())?;
         if reused > message_boundary_tokens {
             return Err(EngineError::generation(format!(
                 "resident MTP reused prefix {reused} exceeds message boundary {message_boundary_tokens}"
             )));
+        }
+        if reuse == RetainedReuse::MessageBoundary {
+            self.restore_retained_message_boundary(slot, reused)?;
         }
         self.prepare_kv_slot(slot, reset, required_positions)?;
         self.program.activate_kv_slot(slot)?;
@@ -512,7 +531,7 @@ impl ResidentMtpBatchGenerator {
         self.target_boundary_hidden[hidden_slot(slot)]
             .copy_from_slice(&self.message_boundary_hidden[hidden_slot(slot)]);
         let device_retained_tokens = retained.len();
-        self.store_retained(slot, retained)?;
+        self.store_retained(slot, retained, device_retained_tokens)?;
         for position in index..self.active - 1 {
             self.active_slots[position] = self.active_slots[position + 1];
         }
@@ -629,6 +648,15 @@ impl ResidentMtpBatchGenerator {
             .get(slot)
             .and_then(Option::as_ref)
             .map(|retained| retained.tokens.len())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Complete-message fallback retained beneath one optimistic generated prefix.
+    pub fn qualification_retained_message_boundary(&self, slot: usize) -> Option<usize> {
+        self.retained
+            .get(slot)
+            .and_then(Option::as_ref)
+            .map(|retained| retained.message_boundary_tokens)
     }
 
     #[cfg(feature = "qualification")]
@@ -1228,7 +1256,7 @@ impl ResidentMtpBatchGenerator {
                     .take()
                     .expect("terminal resident MTP session exists");
                 let retained = processed_tokens(&session)?;
-                self.store_retained(slot, retained)?;
+                self.store_retained(slot, retained, session.message_boundary_tokens)?;
                 Some(session.control.into_output()?)
             } else {
                 survivors[surviving] = slot;
@@ -1251,28 +1279,14 @@ impl ResidentMtpBatchGenerator {
         })
     }
 
-    fn select_slot(&mut self, prompt: &[u32]) -> EngineResult<(usize, usize, bool)> {
-        let prefix = self
-            .retained
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, retained)| {
-                retained.as_ref().and_then(|retained| {
-                    prompt.starts_with(&retained.tokens).then_some((
-                        slot,
-                        retained.tokens.len(),
-                        retained.last_used,
-                    ))
-                })
-            })
-            .max_by_key(|&(_, tokens, last_used)| (tokens, last_used));
-        if let Some((slot, tokens, _)) = prefix {
-            return Ok((slot, tokens, false));
+    fn select_slot(&mut self, prompt: &[u32]) -> EngineResult<(usize, usize, bool, RetainedReuse)> {
+        if let Some(prefix) = best_retained_prefix(&self.retained, prompt) {
+            return Ok((prefix.slot, prefix.tokens, false, prefix.reuse));
         }
         if let Some(slot) = (0..MAX_BATCH)
             .find(|&slot| self.sessions[slot].is_none() && self.retained[slot].is_none())
         {
-            return Ok((slot, 0, true));
+            return Ok((slot, 0, true, RetainedReuse::None));
         }
         let eviction = self
             .retained
@@ -1284,7 +1298,45 @@ impl ResidentMtpBatchGenerator {
             .min_by_key(|&(_, last_used)| last_used)
             .map(|(slot, _)| slot)
             .ok_or_else(|| EngineError::capacity("all eight resident MTP slots are active"))?;
-        Ok((eviction, 0, true))
+        Ok((eviction, 0, true, RetainedReuse::None))
+    }
+
+    fn restore_retained_message_boundary(
+        &mut self,
+        slot: usize,
+        message_boundary_tokens: usize,
+    ) -> EngineResult<()> {
+        let retained = self.retained[slot].as_ref().ok_or_else(|| {
+            EngineError::generation("resident MTP fallback slot has no retained prefix")
+        })?;
+        if retained.message_boundary_tokens != message_boundary_tokens
+            || message_boundary_tokens >= retained.tokens.len()
+            || !self.message_boundary_valid[slot]
+        {
+            return Err(EngineError::generation(format!(
+                "resident MTP slot {slot} cannot restore {message_boundary_tokens} fallback tokens from retained {}/{}",
+                retained.message_boundary_tokens,
+                retained.tokens.len()
+            )));
+        }
+
+        self.program.target().restore_gdn_slot(
+            &self.stream,
+            slot,
+            &self.message_boundary_history,
+            &self.message_boundary_state,
+        )?;
+        self.target_boundary_hidden[hidden_slot(slot)]
+            .copy_from_slice(&self.message_boundary_hidden[hidden_slot(slot)]);
+        self.program
+            .truncate_kv_slot_tokens(&self.stream, slot, message_boundary_tokens)?;
+        self.retained[slot]
+            .as_mut()
+            .expect("validated retained MTP fallback exists")
+            .tokens
+            .truncate(message_boundary_tokens);
+
+        Ok(())
     }
 
     fn prepare_kv_slot(
@@ -1356,7 +1408,21 @@ impl ResidentMtpBatchGenerator {
         Ok(())
     }
 
-    fn store_retained(&mut self, slot: usize, tokens: Vec<u32>) -> EngineResult<()> {
+    fn store_retained(
+        &mut self,
+        slot: usize,
+        tokens: Vec<u32>,
+        message_boundary_tokens: usize,
+    ) -> EngineResult<()> {
+        if message_boundary_tokens == 0
+            || message_boundary_tokens > tokens.len()
+            || !self.message_boundary_valid[slot]
+        {
+            return Err(EngineError::generation(format!(
+                "resident MTP slot {slot} cannot retain message boundary {message_boundary_tokens} inside {} processed tokens",
+                tokens.len()
+            )));
+        }
         let next_clock = self
             .retention_clock
             .checked_add(1)
@@ -1367,10 +1433,44 @@ impl ResidentMtpBatchGenerator {
         self.retention_clock = next_clock;
         self.retained[slot] = Some(RetainedMtpSlot {
             tokens,
+            message_boundary_tokens,
             last_used: self.retention_clock,
         });
         Ok(())
     }
+}
+
+fn best_retained_prefix(
+    retained: &[Option<RetainedMtpSlot>; MAX_BATCH],
+    prompt: &[u32],
+) -> Option<RetainedMatch> {
+    retained
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, retained)| {
+            let retained = retained.as_ref()?;
+            let (tokens, reuse) = if prompt.starts_with(&retained.tokens) {
+                (retained.tokens.len(), RetainedReuse::Complete)
+            } else {
+                let boundary = retained.tokens.get(..retained.message_boundary_tokens)?;
+                prompt
+                    .starts_with(boundary)
+                    .then_some((boundary.len(), RetainedReuse::MessageBoundary))?
+            };
+            Some(RetainedMatch {
+                slot,
+                tokens,
+                last_used: retained.last_used,
+                reuse,
+            })
+        })
+        .max_by_key(|matched| {
+            (
+                matched.tokens,
+                matched.last_used,
+                matched.reuse == RetainedReuse::Complete,
+            )
+        })
 }
 
 fn processed_tokens(session: &ResidentMtpBatchSession) -> EngineResult<Vec<u32>> {
@@ -1436,7 +1536,10 @@ fn compact_hidden_row(row_index: usize) -> std::ops::Range<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DRAFT_HIDDEN_ROWS, DRAFT_LOGIT_ROWS, TARGET_LOGIT_ROWS};
+    use super::{
+        DRAFT_HIDDEN_ROWS, DRAFT_LOGIT_ROWS, RetainedMtpSlot, RetainedReuse, TARGET_LOGIT_ROWS,
+        best_retained_prefix,
+    };
     use crate::MAX_BATCH;
 
     #[test]
@@ -1444,5 +1547,43 @@ mod tests {
         assert_eq!(TARGET_LOGIT_ROWS, MAX_BATCH + 4 * MAX_BATCH);
         assert_eq!(DRAFT_LOGIT_ROWS, 2 * MAX_BATCH);
         assert_eq!(DRAFT_HIDDEN_ROWS, 2 * MAX_BATCH);
+    }
+
+    #[test]
+    fn retained_lookup_falls_back_to_the_complete_message_boundary() {
+        let mut retained = std::array::from_fn(|_| None);
+        retained[0] = Some(RetainedMtpSlot {
+            tokens: vec![1, 2, 3, 4],
+            message_boundary_tokens: 2,
+            last_used: 7,
+        });
+
+        let exact = best_retained_prefix(&retained, &[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!((exact.slot, exact.tokens), (0, 4));
+        assert_eq!(exact.reuse, RetainedReuse::Complete);
+
+        let fallback = best_retained_prefix(&retained, &[1, 2, 9, 5]).unwrap();
+        assert_eq!((fallback.slot, fallback.tokens), (0, 2));
+        assert_eq!(fallback.reuse, RetainedReuse::MessageBoundary);
+        assert!(best_retained_prefix(&retained, &[1, 9]).is_none());
+    }
+
+    #[test]
+    fn retained_lookup_prefers_the_longest_safe_prefix() {
+        let mut retained = std::array::from_fn(|_| None);
+        retained[0] = Some(RetainedMtpSlot {
+            tokens: vec![1, 2, 8],
+            message_boundary_tokens: 2,
+            last_used: 9,
+        });
+        retained[1] = Some(RetainedMtpSlot {
+            tokens: vec![1, 2, 3, 7],
+            message_boundary_tokens: 3,
+            last_used: 1,
+        });
+
+        let matched = best_retained_prefix(&retained, &[1, 2, 3, 6]).unwrap();
+        assert_eq!((matched.slot, matched.tokens), (1, 3));
+        assert_eq!(matched.reuse, RetainedReuse::MessageBoundary);
     }
 }
