@@ -148,6 +148,11 @@ pub use qwen38_flash_next::mtp_layout::{
     QWEN38_FLASH_NEXT_MTP_ROUND_ROWS, QWEN38_FLASH_NEXT_MTP_TARGET_RESIDENT_SLOTS,
     Qwen38FlashNextMtpLayout, Qwen38FlashNextMtpResidency,
 };
+pub use qwen38_flash_next::mtp_program::{
+    QWEN38_FLASH_NEXT_MTP_ROUTED_ROWS, QWEN38_FLASH_NEXT_MTP_ROUTES,
+    QWEN38_FLASH_NEXT_MTP_SEGMENTS, QWEN38_FLASH_NEXT_PROPOSAL_ROWS, Qwen38FlashNextMtpLoadStats,
+    Qwen38FlashNextMtpProgram, Qwen38FlashNextMtpStepTelemetry, Qwen38FlashNextMtpStream,
+};
 #[cfg(feature = "qualification")]
 pub use qwen38_flash_next::qsa_moe_layer::{
     Qwen38FlashNextQsaMoeLayerImmutable, Qwen38FlashNextQsaMoeLayerInputs,

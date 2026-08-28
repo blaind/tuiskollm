@@ -487,20 +487,20 @@ struct EndpointPointers {
 }
 
 #[derive(Clone, Copy)]
-struct Ops<'a> {
-    hyper: &'a Qwen38FlashNextHyperConnectionOp,
-    gdn_input: &'a Qwen38FlashNextGdnInputProjectionOp,
-    gdn_prepare: &'a Qwen38FlashNextGdnPrepareOp,
-    gdn_recurrence: &'a Qwen38FlashNextGdnRecurrenceOp,
-    qsa_qkv: &'a Qwen38FlashNextQsaQkvProjectionOp,
-    qsa_prepare: &'a Qwen38FlashNextAttentionQkPrepareOp,
-    qsa_attention: &'a tuisko_kernels_sm120::Qwen38FlashNextPagedGqaOp,
-    qsa_gate: &'a Qwen38FlashNextAttentionGateOp,
-    block_output: &'a Qwen38FlashNextBlockOutputProjectionOp,
-    router: &'a Qwen38FlashNextMoeRouterOp,
-    experts: &'a Qwen38FlashNextMoeExpertsOp,
-    engram: &'a Qwen38FlashNextEngramOp,
-    lm_head: &'a Qwen38FlashNextBf16LmHeadOp,
+pub(crate) struct Ops<'a> {
+    pub(crate) hyper: &'a Qwen38FlashNextHyperConnectionOp,
+    pub(crate) gdn_input: &'a Qwen38FlashNextGdnInputProjectionOp,
+    pub(crate) gdn_prepare: &'a Qwen38FlashNextGdnPrepareOp,
+    pub(crate) gdn_recurrence: &'a Qwen38FlashNextGdnRecurrenceOp,
+    pub(crate) qsa_qkv: &'a Qwen38FlashNextQsaQkvProjectionOp,
+    pub(crate) qsa_prepare: &'a Qwen38FlashNextAttentionQkPrepareOp,
+    pub(crate) qsa_attention: &'a tuisko_kernels_sm120::Qwen38FlashNextPagedGqaOp,
+    pub(crate) qsa_gate: &'a Qwen38FlashNextAttentionGateOp,
+    pub(crate) block_output: &'a Qwen38FlashNextBlockOutputProjectionOp,
+    pub(crate) router: &'a Qwen38FlashNextMoeRouterOp,
+    pub(crate) experts: &'a Qwen38FlashNextMoeExpertsOp,
+    pub(crate) engram: &'a Qwen38FlashNextEngramOp,
+    pub(crate) lm_head: &'a Qwen38FlashNextBf16LmHeadOp,
 }
 
 /// The whole Qwen3.8 Flash-Next model, resident over one shared expert cache.
@@ -565,7 +565,23 @@ impl Qwen38FlashNextResidentModel {
         snapshot: Arc<CheckpointSnapshot<Qwen38FlashNext>>,
         progress: Option<&ResidentLoadProgress>,
     ) -> EngineResult<Self> {
-        let layout = Qwen38FlashNextResidentLayout::build()?;
+        Self::from_plan_with_progress(
+            context,
+            snapshot,
+            Qwen38FlashNextResidentLayout::build()?,
+            progress,
+            0,
+        )
+    }
+
+    /// Builds against a joint plan with `pending_upload_bytes` owned by its caller.
+    pub(crate) fn from_plan_with_progress(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen38FlashNext>>,
+        layout: Qwen38FlashNextResidentLayout,
+        progress: Option<&ResidentLoadProgress>,
+        pending_upload_bytes: usize,
+    ) -> EngineResult<Self> {
         let stream = context.new_stream().map_err(GpuError::from)?;
 
         let arena = DeviceArena::zeroed(&stream, layout.resident_builder())?;
@@ -623,8 +639,13 @@ impl Qwen38FlashNextResidentModel {
             engram,
             lm_head,
         )?;
-        model.upload(&stream, progress)?;
+        model.upload(&stream, progress, pending_upload_bytes)?;
         model.capture(&stream)?;
+        if pending_upload_bytes == 0
+            && let Some(progress) = progress
+        {
+            progress.finish();
+        }
 
         Ok(model)
     }
@@ -652,6 +673,31 @@ impl Qwen38FlashNextResidentModel {
     /// Stable base address of the resident arena.
     pub const fn base_address(&self) -> u64 {
         self.base_address
+    }
+
+    /// Pre-mixer stream published by the last target segment.
+    pub(crate) const fn published_stream(&self) -> (&DeviceArena, tuisko_gpu::ArenaRegion<u16>) {
+        (&self.arena, self.layout.workspace().residual_a)
+    }
+
+    /// Shared page mapping used by the target and draft mirrors.
+    pub(crate) const fn block_tables(&self) -> (&DeviceArena, tuisko_gpu::ArenaRegion<u32>) {
+        (&self.kv_arena, self.layout.kv_regions().block_tables)
+    }
+
+    /// Resident arena containing the shared LM head.
+    pub(crate) const fn resident_arena(&self) -> &DeviceArena {
+        &self.arena
+    }
+
+    /// Admitted checkpoint shared by the target and draft.
+    pub(crate) const fn snapshot(&self) -> &Arc<CheckpointSnapshot<Qwen38FlashNext>> {
+        &self.snapshot
+    }
+
+    /// Tokens covered by one slot's current page mapping.
+    pub(crate) fn mapped_tokens(&self, slot: usize) -> EngineResult<usize> {
+        Ok(self.slots.pages(slot)?.len() * QWEN38_FLASH_NEXT_SLOT_PAGE_TOKENS)
     }
 
     /// Stable base address of the paged cache arena.
@@ -1285,6 +1331,7 @@ impl Qwen38FlashNextResidentModel {
         &mut self,
         stream: &CudaStream,
         progress: Option<&ResidentLoadProgress>,
+        pending_upload_bytes: usize,
     ) -> EngineResult<()> {
         let started = Instant::now();
         let snapshot = Arc::clone(&self.snapshot);
@@ -1292,7 +1339,12 @@ impl Qwen38FlashNextResidentModel {
         let mut staged_bytes = 0usize;
         let mut staged = Duration::ZERO;
         if let Some(progress) = progress {
-            progress.begin_upload(self.layout.resident_weight_bytes());
+            let total = self
+                .layout
+                .resident_weight_bytes()
+                .checked_add(pending_upload_bytes)
+                .ok_or_else(|| EngineError::layout("resident upload byte count overflows"))?;
+            progress.begin_upload(total);
         }
 
         for (layer, plan) in regions.iter().enumerate() {
@@ -1458,7 +1510,9 @@ impl Qwen38FlashNextResidentModel {
         )?;
         if let Some(progress) = progress {
             progress.submit(self.layout.endpoint_weight_bytes()?)?;
-            progress.finish_upload()?;
+            if pending_upload_bytes == 0 {
+                progress.finish_upload()?;
+            }
         }
 
         // Reservations populate the initially unmapped block table.
@@ -1581,7 +1635,7 @@ impl Qwen38FlashNextResidentModel {
         Ok(())
     }
 
-    const fn ops(&self) -> Ops<'_> {
+    pub(crate) const fn ops(&self) -> Ops<'_> {
         Ops {
             hyper: &self._hyper,
             gdn_input: &self._gdn_input,
@@ -2588,7 +2642,7 @@ fn require_distinct_decode_slots(slots: &[usize]) -> EngineResult<()> {
     Ok(())
 }
 
-fn layer_telemetry(
+pub(crate) fn layer_telemetry(
     layer: usize,
     requests: usize,
     round: StreamingRound,
