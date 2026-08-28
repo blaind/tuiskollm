@@ -66,6 +66,8 @@ pub struct Qwen38FlashNextModelOracle {
     pub engram_rows: usize,
     /// Largest absolute logit the composition produced.
     pub peak_absolute_logit: f32,
+    /// Pre-mixer four-branch stream consumed by MTP.
+    pub pre_mixer_stream: Vec<u16>,
 }
 
 impl Qwen38FlashNextModelOracle {
@@ -257,6 +259,7 @@ pub fn qwen38_flash_next_model_oracle(
         expert_selections,
         engram_rows,
         peak_absolute_logit,
+        pre_mixer_stream: stream,
     })
 }
 
@@ -391,7 +394,7 @@ fn routed_pool(
     Ok((pool, table, scales))
 }
 
-fn embedding_row(source: &[u8], token: u32) -> OracleResult<Vec<u16>> {
+pub(crate) fn embedding_row(source: &[u8], token: u32) -> OracleResult<Vec<u16>> {
     let begin = token as usize * HIDDEN * size_of::<u16>();
     let bytes = source
         .get(begin..begin + HIDDEN * size_of::<u16>())
