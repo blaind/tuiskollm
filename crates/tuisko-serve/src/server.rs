@@ -1,7 +1,7 @@
 //! Concrete HTTP server and resident scheduler worker.
 
 use crate::request_log::RequestLog;
-use crate::response::{overloaded_response, unavailable_response};
+use crate::response::{overloaded_response, resume_unavailable_response, unavailable_response};
 use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
 use crate::{
     ChatCompletionRequest, ChatRequestError, GenerationReply, PreparedChatRequest,
@@ -905,8 +905,12 @@ fn serve_reloadable<G: ReloadableGenerator>(
                             }
                             Err((owner, error)) => {
                                 parked = Some(owner);
-                                *lifecycle.lock().expect("lifecycle mutex poisoned") =
-                                    LifecycleState::Parked;
+                                {
+                                    let mut state =
+                                        lifecycle.lock().expect("lifecycle mutex poisoned");
+                                    *state = LifecycleState::Parked;
+                                    fail_resume_queued(&mut jobs, &error);
+                                }
                                 let _ = admin.reply.send(AdminReply::Failed(error));
                             }
                         }
@@ -942,14 +946,24 @@ fn serve_reloadable<G: ReloadableGenerator>(
                         ));
                     }
                 },
-                Job::Chat(job) => {
-                    parked = Some(parked_owner);
-                    let message = "parked model must be explicitly resumed";
-                    let _ = job
-                        .reply
-                        .try_send(GenerationReply::Unavailable(message.into()));
-                    job.log.finish(None, 0, 0, "error", Some(message));
-                }
+                Job::Chat(job) => match G::resume(parked_owner) {
+                    Ok(loaded) => {
+                        generator = Some(loaded);
+                        *lifecycle.lock().expect("lifecycle mutex poisoned") =
+                            LifecycleState::Loaded;
+                        hold_job(&mut waiting, *job);
+                    }
+                    Err((owner, error)) => {
+                        parked = Some(owner);
+                        let _ = job
+                            .reply
+                            .try_send(GenerationReply::ResumeUnavailable(error.clone()));
+                        job.log.finish(None, 0, 0, "error", Some(&error));
+                        let mut state = lifecycle.lock().expect("lifecycle mutex poisoned");
+                        *state = LifecycleState::Parked;
+                        fail_resume_queued(&mut jobs, &error);
+                    }
+                },
             }
             continue;
         }
@@ -1488,6 +1502,22 @@ fn fail_load_queued(jobs: &mut Receiver<Job>, message: &str) {
     }
 }
 
+fn fail_resume_queued(jobs: &mut Receiver<Job>, message: &str) {
+    while let Ok(job) = jobs.try_recv() {
+        match job {
+            Job::Chat(job) => {
+                let _ = job
+                    .reply
+                    .try_send(GenerationReply::ResumeUnavailable(message.to_owned()));
+                job.log.finish(None, 0, 0, "error", Some(message));
+            }
+            Job::Admin(job) => {
+                let _ = job.reply.send(AdminReply::Failed(message.to_owned()));
+            }
+        }
+    }
+}
+
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -1816,6 +1846,9 @@ async fn chat_completions(
             }
             Some(GenerationReply::Overloaded(message)) => overloaded_response(message),
             Some(GenerationReply::Unavailable(message)) => unavailable_response(message),
+            Some(GenerationReply::ResumeUnavailable(message)) => {
+                resume_unavailable_response(message)
+            }
             Some(first) => streaming_response(
                 first,
                 reply_rx,
@@ -1857,22 +1890,34 @@ fn completion_id(namespace: u128, numeric_id: u64) -> String {
 
 fn enqueue_chat_job(state: &AppState, job: ChatJob) -> Result<(), EnqueueError> {
     let mut lifecycle = state.lifecycle.lock().expect("lifecycle mutex poisoned");
-    let started_load = if state.lifecycle_supported && *lifecycle == LifecycleState::Unloaded {
-        *lifecycle = LifecycleState::Loading;
-        true
+    let rollback = if state.lifecycle_supported {
+        match *lifecycle {
+            LifecycleState::Unloaded => {
+                *lifecycle = LifecycleState::Loading;
+                Some(LifecycleState::Unloaded)
+            }
+            LifecycleState::Parked => {
+                *lifecycle = LifecycleState::Resuming;
+                Some(LifecycleState::Parked)
+            }
+            _ => None,
+        }
     } else {
-        false
+        None
     };
     if state.lifecycle_supported
-        && !matches!(*lifecycle, LifecycleState::Loaded | LifecycleState::Loading)
+        && !matches!(
+            *lifecycle,
+            LifecycleState::Loaded | LifecycleState::Loading | LifecycleState::Resuming
+        )
     {
         return Err(EnqueueError::Transition(*lifecycle));
     }
     match state.jobs.try_send(Job::Chat(Box::new(job))) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(Job::Chat(job))) => {
-            if started_load {
-                *lifecycle = LifecycleState::Unloaded;
+            if let Some(previous) = rollback {
+                *lifecycle = previous;
             }
             job.log.finish(
                 None,
@@ -1884,8 +1929,8 @@ fn enqueue_chat_job(state: &AppState, job: ChatJob) -> Result<(), EnqueueError> 
             Err(EnqueueError::Full)
         }
         Err(TrySendError::Closed(Job::Chat(job))) => {
-            if started_load {
-                *lifecycle = LifecycleState::Unloaded;
+            if let Some(previous) = rollback {
+                *lifecycle = previous;
             }
             job.log.finish(
                 None,
@@ -1911,18 +1956,10 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
             "server_error",
         ),
         EnqueueError::Transition(state) => {
-            let message = if state == LifecycleState::Parked {
-                "parked model must be explicitly resumed".to_owned()
-            } else {
-                format!("model lifecycle is {}", state.as_str())
-            };
+            let message = format!("model lifecycle is {}", state.as_str());
             let mut response = lifecycle_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                if state == LifecycleState::Parked {
-                    "model_parked"
-                } else {
-                    "model_unavailable"
-                },
+                "model_unavailable",
                 &message,
             );
             response
@@ -1939,8 +1976,9 @@ mod tests {
         AppState, ChatJob, EnqueueError, Job, LifecycleState,
         QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, Ready, ServerConfig, ServerError, ServerModel,
         chat_completions, completion_id, enqueue_chat_job, fail_queued, health, load, models,
-        readiness, record_admission, render_loading, render_startup, render_weight_progress, router,
-        run, serve_reloadable, serve_until_worker_failure, try_send_generation_steps, unload,
+        readiness, record_admission, render_loading, render_startup, render_weight_progress,
+        router, run, serve_reloadable, serve_until_worker_failure, try_send_generation_steps,
+        unload,
     };
     use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
@@ -2037,6 +2075,7 @@ mod tests {
 
     struct FakeReloadableGenerator {
         drops: Arc<AtomicU64>,
+        resume_failures: Arc<AtomicU64>,
     }
 
     impl Drop for FakeReloadableGenerator {
@@ -2094,7 +2133,17 @@ mod tests {
         }
 
         fn resume(parked: Self::Parked) -> Result<Self, (Self::Parked, String)> {
-            Ok(parked)
+            if parked
+                .resume_failures
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |failures| {
+                    failures.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Err((parked, "fixture resume failed".into()))
+            } else {
+                Ok(parked)
+            }
         }
 
         fn parked_ownership(_parked: &Self::Parked) -> (usize, usize, usize) {
@@ -2233,6 +2282,26 @@ mod tests {
         drop(receiver);
         let closed = enqueue_chat_job(&app, job().0).unwrap_err();
         assert_eq!(closed, EnqueueError::Closed);
+    }
+
+    #[test]
+    fn parked_chat_starts_one_resume_and_concurrent_chats_share_it() {
+        let (jobs, mut receiver) = channel(2);
+        let app = state(jobs, true);
+        *app.lifecycle.lock().unwrap() = LifecycleState::Parked;
+
+        enqueue_chat_job(&app, job().0).unwrap();
+        assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Resuming);
+        enqueue_chat_job(&app, job().0).unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Job::Chat(_))));
+        assert!(matches!(receiver.try_recv(), Ok(Job::Chat(_))));
+
+        let (jobs, _receiver) = channel(1);
+        let app = state(jobs, true);
+        enqueue_chat_job(&app, job().0).unwrap();
+        *app.lifecycle.lock().unwrap() = LifecycleState::Parked;
+        assert_eq!(enqueue_chat_job(&app, job().0), Err(EnqueueError::Full));
+        assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Parked);
     }
 
     #[test]
@@ -2437,6 +2506,7 @@ mod tests {
             serve_reloadable(
                 FakeReloadableGenerator {
                     drops: Arc::clone(&worker_drops),
+                    resume_failures: Arc::new(AtomicU64::new(0)),
                 },
                 receiver,
                 failure,
@@ -2447,6 +2517,7 @@ mod tests {
                     } else {
                         Ok(FakeReloadableGenerator {
                             drops: Arc::clone(&worker_drops),
+                            resume_failures: Arc::new(AtomicU64::new(0)),
                         })
                     }
                 },
@@ -2536,7 +2607,7 @@ mod tests {
     }
 
     #[test]
-    fn park_and_resume_publish_exact_fences_and_parked_chat_is_retryable() {
+    fn park_and_resume_publish_exact_fences_and_parked_chat_starts_resume() {
         runtime().block_on(async {
             let (jobs, mut receiver) = channel(2);
             let app = state(jobs, true);
@@ -2569,11 +2640,28 @@ mod tests {
             assert_eq!(body["host_bytes"], 45);
             assert_eq!(body["device_allocation_bytes_released"], 67);
 
-            let blocked = chat_completions(State(app.clone()), Ok(Json(streaming_request()))).await;
+            let auto_resume = tokio::spawn(chat_completions(
+                State(app.clone()),
+                Ok(Json(streaming_request())),
+            ));
+            tokio::task::yield_now().await;
+            assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Resuming);
+            let Job::Chat(auto_chat) = receiver.recv().await.unwrap() else {
+                panic!("parked chat queued an admin job")
+            };
+            *app.lifecycle.lock().unwrap() = LifecycleState::Parked;
+            auto_chat
+                .reply
+                .try_send(GenerationReply::ResumeUnavailable(
+                    "fixture resume failed".into(),
+                ))
+                .unwrap();
+            let blocked = auto_resume.await.unwrap();
             assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(blocked.headers()[RETRY_AFTER], "1");
             let body = to_bytes(blocked.into_body(), 1 << 20).await.unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["error"]["type"], "model_parked");
+            assert_eq!(body["error"]["type"], "model_resume_failed");
 
             let handler = tokio::spawn(super::resume(State(app.clone()), HeaderMap::new()));
             tokio::task::yield_now().await;
@@ -2601,17 +2689,20 @@ mod tests {
     }
 
     #[test]
-    fn reloadable_worker_owns_parked_state_without_dropping_and_resumes_it() {
+    fn reloadable_worker_auto_resumes_parked_state_for_chat_without_dropping_it() {
         let (jobs, receiver) = channel(MAX_BATCH);
         let lifecycle = Arc::new(Mutex::new(LifecycleState::Loaded));
         let drops = Arc::new(AtomicU64::new(0));
         let (failure, _failure_receiver) = tokio::sync::oneshot::channel();
         let worker_lifecycle = Arc::clone(&lifecycle);
         let worker_drops = Arc::clone(&drops);
+        let resume_failures = Arc::new(AtomicU64::new(1));
+        let worker_resume_failures = Arc::clone(&resume_failures);
         let worker = std::thread::spawn(move || {
             serve_reloadable(
                 FakeReloadableGenerator {
                     drops: worker_drops,
+                    resume_failures: worker_resume_failures,
                 },
                 receiver,
                 failure,
@@ -2639,15 +2730,23 @@ mod tests {
         assert_eq!(drops.load(Ordering::Relaxed), 0);
 
         *lifecycle.lock().unwrap() = LifecycleState::Resuming;
-        let (reply, receiver) = std_mpsc::sync_channel(1);
-        jobs.blocking_send(Job::Admin(super::AdminJob {
-            kind: super::AdminKind::Resume,
-            reply,
-        }))
-        .unwrap();
+        let (failed_chat, mut failed_reply) = job();
+        jobs.blocking_send(Job::Chat(Box::new(failed_chat)))
+            .unwrap();
         assert!(matches!(
-            receiver.recv().unwrap(),
-            super::AdminReply::Resumed { resumed: true, .. }
+            failed_reply.blocking_recv(),
+            Some(GenerationReply::ResumeUnavailable(message)) if message == "fixture resume failed"
+        ));
+        assert_eq!(*lifecycle.lock().unwrap(), LifecycleState::Parked);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        *lifecycle.lock().unwrap() = LifecycleState::Resuming;
+        let (resumed_chat, mut resumed_reply) = job();
+        jobs.blocking_send(Job::Chat(Box::new(resumed_chat)))
+            .unwrap();
+        assert!(matches!(
+            resumed_reply.blocking_recv(),
+            Some(GenerationReply::Overloaded(message)) if message == "fixture admission reached"
         ));
         assert_eq!(*lifecycle.lock().unwrap(), LifecycleState::Loaded);
         assert_eq!(drops.load(Ordering::Relaxed), 0);

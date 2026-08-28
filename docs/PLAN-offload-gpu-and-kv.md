@@ -105,7 +105,10 @@ behavior while the model is unloaded, loading, parked, or transitioning.
 
 An unloaded chat triggers one load attempt. Failure maps to retryable `503 model_load_failed` for
 that chat and every chat admitted during the attempt; the explicit `/v1/load` caller receives the
-administrative `500 load_failed` response in the table above.
+administrative `500 load_failed` response in the table above. A parked chat similarly triggers one
+resume attempt. Failure maps to retryable `503 model_resume_failed` for every chat admitted during
+that attempt, returns to `Parked`, and retains the mirror for a later retry; an explicit
+`/v1/resume` caller receives `500 resume_failed`.
 
 The default listener is loopback. If the configured listener is non-loopback, lifecycle routes
 must be disabled unless an explicit admin bearer token is configured; chat authorization is a
@@ -129,13 +132,14 @@ arriving chat therefore have a single defined order.
 | `Unloaded` | load | enter `Loading`, then `Loaded` or return to `Unloaded` on failure |
 | `Unloaded` | unload | idempotent `200 was_loaded:false` |
 | `Unloaded` | park/resume | `409` |
-| `Parked` | chat | `503 model_parked`; never auto-resume |
+| `Parked` | chat | first chat starts one resume; chats admitted during `Resuming` pend |
 | `Parked` | resume | enter `Resuming`, then `Loaded` or return to `Parked` on failure |
 | `Parked` | park | idempotent `200` |
 | `Parked` | unload | drop host mirror and remaining device/VA ownership, then `Unloaded` |
 | `Parked` | load | `409 model_parked`; caller must resume or unload first |
 | any transition | lifecycle operation | `409 transition_in_progress` |
-| any transition | chat | `503` with the current transition and `Retry-After` |
+| `Loading`/`Resuming` | chat | pend behind the one active load/resume attempt |
+| any other transition | chat | `503` with the current transition and `Retry-After` |
 
 The transient states are `Loading`, `Unloading`, `Parking`, and `Resuming`. A worker failure is a
 terminal `Dead` state and preserves the existing process-exit behavior.
@@ -148,7 +152,8 @@ An admin job therefore cannot rely on being dequeued only at idle.
 `AppState` instead owns `Arc<Mutex<Ingress>>`, containing the published lifecycle state and job
 sender. Under this mutex:
 
-1. a chat checks the state and enqueues only if that state admits chats;
+1. a chat changes `Unloaded` to `Loading` or `Parked` to `Resuming`, then enqueues; later chats may
+   enqueue behind either shared transition;
 2. unload/park changes `Loaded` to its transition state before enqueueing its admin job;
 3. a failed admin enqueue rolls the state back before releasing the mutex; and
 4. no later chat can land behind the unload/park fence.
@@ -158,11 +163,11 @@ may dequeue the admin job while chats are active, stores it as `held_admin`, sto
 it, and processes it only after `active_requests() == 0`. This preserves continuous batching and
 gives unload/park a race-free boundary without draining unrelated concurrent arrivals.
 
-During auto-reload, the triggering chat is held locally and the bounded channel can hold
-`MAX_BATCH` additional chats, so that path permits at most `MAX_BATCH + 1` pending chats. An
-explicit `/v1/load` holds an admin job locally and permits at most `MAX_BATCH` pended chats. Both
-limits are recorded in tests and API documentation. Making every path total exactly eight would
-require a separate admission permit and is not part of A.
+During auto-load or auto-resume, the triggering chat is held locally and the bounded channel can
+hold `MAX_BATCH` additional chats, so those paths permit at most `MAX_BATCH + 1` pending chats. An
+explicit `/v1/load` or `/v1/resume` holds an admin job locally and permits at most `MAX_BATCH`
+pended chats. Both limits are recorded in tests and API documentation. Making every path total
+exactly eight would require a separate admission permit and is not part of this feature.
 
 ## 3. Feature A — complete unload/load and auto-reload
 
@@ -217,7 +222,8 @@ Use the existing crate-private fake-generator pattern and HTTP router tests. Req
 - auto-reload admits the triggering chat after a successful load;
 - auto-reload admits at most `MAX_BATCH + 1` chats, explicit load admits at most `MAX_BATCH`, and
   excess ingress receives `429`;
-- chat while parked returns `503` without starting resume;
+- chat while parked starts one resume, pends concurrent chats, and returns all of them to a
+  retryable error without losing the mirror when that attempt fails;
 - unload while parked reaches `Unloaded` and drops the host mirror;
 - `/health` tests liveness while `/ready` tests model readiness;
 - unsupported targets reject lifecycle routes without changing their existing worker path;
@@ -399,8 +405,8 @@ Remote timing remains diagnostic and cannot bless a baseline.
   claims of OpenAI-standard lifecycle behavior.
 - Unload and park finish chats accepted before their ingress fence. Later chats are rejected during
   the transition; no racy channel drain is used.
-- Auto-reload is enabled only from `Unloaded`. Park never auto-resumes.
-- Auto-reload admits at most `MAX_BATCH + 1` chats; explicit load admits at most `MAX_BATCH`.
+- Auto-load from `Unloaded` and auto-resume from `Parked` each admit at most `MAX_BATCH + 1` chats;
+  explicit load/resume admits at most `MAX_BATCH`.
 - B phase 1 parks the whole generator's retained durable state. Per-slot park is deferred.
 - The parked mirror is process-local and is destroyed by unload or process exit.
 - Workspace offload and persistence of parked state across restarts are separate features.

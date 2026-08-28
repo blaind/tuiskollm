@@ -95,7 +95,9 @@ target/cuda-oxide-build-sm120/release/tuiskollm serve \
 `--address ADDRESS` overrides the default `127.0.0.1:8000` listener.
 The lifecycle routes are enabled only for the exact Qwen3.8 target. A non-loopback listener also
 requires `--admin-token-env NAME`; requests then authenticate with `Authorization: Bearer ...`.
-Park is accepted only after previously admitted chats drain, and a parked model never auto-resumes.
+Park is accepted only after previously admitted chats drain. The first chat submitted while parked
+starts one resume attempt; concurrent chats pend behind that same attempt. Explicit `/v1/resume`
+remains available for administrative warmup.
 
 For qualification commands and engineering constraints, see
 [`docs/performance.md`](docs/performance.md) and [`AGENTS.md`](AGENTS.md). The optional
