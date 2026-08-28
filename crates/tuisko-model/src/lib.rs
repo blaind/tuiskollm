@@ -45,9 +45,11 @@ pub use qwen38::bindings::{
 };
 pub use qwen38::materialize::MaterializedFullAttentionQkv;
 pub use qwen38_flash_next::bindings::{
-    Qwen38FlashNextEngramBindings, Qwen38FlashNextExpertBindings, Qwen38FlashNextGdnBindings,
+    Qwen38FlashNextEngramBindings, Qwen38FlashNextExpertBindings,
+    Qwen38FlashNextFusedExpertPoolBindings, Qwen38FlashNextGdnBindings,
     Qwen38FlashNextHyperConnectionBindings, Qwen38FlashNextIndexerBindings,
-    Qwen38FlashNextLayerHyperConnections, Qwen38FlashNextMoeBindings,
+    Qwen38FlashNextLayerHyperConnections, Qwen38FlashNextMoeBindings, Qwen38FlashNextMtpBindings,
+    Qwen38FlashNextMtpLayerBindings, Qwen38FlashNextMtpMoeBindings,
     Qwen38FlashNextSharedExpertBindings, Qwen38FlashNextSparseAttentionBindings,
     Qwen38FlashNextTextEndpointBindings,
 };
@@ -62,8 +64,10 @@ pub use qwen38_flash_next::engram_hash::{
 };
 pub use qwen38_flash_next::materialize::{
     MaterializedQwen38FlashNextEngram, MaterializedQwen38FlashNextExpert,
-    MaterializedQwen38FlashNextExpertPool, MaterializedQwen38FlashNextGdn,
-    MaterializedQwen38FlashNextHyperConnections, MaterializedQwen38FlashNextMoe,
+    MaterializedQwen38FlashNextExpertPool, MaterializedQwen38FlashNextFusedExpertPool,
+    MaterializedQwen38FlashNextGdn, MaterializedQwen38FlashNextHyperConnections,
+    MaterializedQwen38FlashNextMoe, MaterializedQwen38FlashNextMtp,
+    MaterializedQwen38FlashNextMtpLayer, MaterializedQwen38FlashNextMtpMoe,
     MaterializedQwen38FlashNextSparseAttention, MaterializedQwen38FlashNextTextEndpoint,
     Qwen38FlashNextPlaneExtent,
 };
@@ -720,7 +724,7 @@ mod tests {
     /// Dilation 3 makes the state nine columns rather than three and moves every
     /// tap, so a route that reused the GDN convolution here would be wrong.
     #[test]
-    fn flashnext_engram_convolution_is_dilated_and_gdn_is_not() {
+    fn qwen38_flash_next_engram_convolution_is_dilated_and_gdn_is_not() {
         type A = Qwen38FlashNext;
 
         assert_eq!(A::PLE_CONV_KERNEL, A::LINEAR_CONV_KERNEL_DIM);

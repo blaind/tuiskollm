@@ -21,6 +21,9 @@ type F = Qwen38FlashNext;
 /// Root of the model-level hyper-connection mixer, this target's only final normalization.
 pub(crate) const HYPER_CONNECTION_MIXER: &str = "model.language_model.hyper_connection_mixer";
 
+/// Root of the draft block.
+pub(crate) const MTP_ROOT: &str = "mtp";
+
 /// Named geometry used by production bindings and shrunken fixtures.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Qwen38FlashNextGeometry {
@@ -302,7 +305,7 @@ pub struct Qwen38FlashNextSparseAttentionBindings<'a> {
     pub key_norm: Bf16View<'a, 1>,
     /// Block-selection indexer sharing this layer's mixed block input.
     pub indexer: Qwen38FlashNextIndexerBindings<'a>,
-    /// Decoder layer owning these sources.
+    /// Layer within the decoder or draft stack.
     pub layer: usize,
 }
 
@@ -324,7 +327,21 @@ impl<'a> Qwen38FlashNextSparseAttentionBindings<'a> {
     ) -> CheckpointResult<Self> {
         require_full_attention_layer(layer, geometry.layers, geometry.full_attention_interval)?;
 
-        let prefix = format!("{}.self_attn", layer_prefix(layer));
+        Self::bind_under(
+            &format!("{}.self_attn", layer_prefix(layer)),
+            layer,
+            geometry,
+            &mut tensor,
+        )
+    }
+
+    /// Binds sparse attention under a caller-admitted root.
+    pub(crate) fn bind_under(
+        prefix: &str,
+        layer: usize,
+        geometry: &Qwen38FlashNextGeometry,
+        tensor: &mut impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
         let hidden = geometry.hidden as u64;
         let head_dim = geometry.head_dim as u64;
         let kv_rows = geometry.attention_kv_rows as u64;
@@ -426,30 +443,8 @@ impl<'a> Qwen38FlashNextMoeBindings<'a> {
         require_qwen38_flash_next_layer(layer, geometry.layers, "MoE")?;
 
         let prefix = format!("{}.mlp", layer_prefix(layer));
-        let hidden = geometry.hidden as u64;
-        let shared = geometry.shared_intermediate as u64;
-        let router_weight = Bf16View::bind(
-            tensor(&format!("{prefix}.gate.weight"))?,
-            [geometry.expert_count as u64, hidden],
-        )?;
-        let shared_expert = Qwen38FlashNextSharedExpertBindings {
-            gate_weight: Bf16View::bind(
-                tensor(&format!("{prefix}.shared_expert_gate.weight"))?,
-                [1, hidden],
-            )?,
-            gate_proj_weight: Bf16View::bind(
-                tensor(&format!("{prefix}.shared_expert.gate_proj.weight"))?,
-                [shared, hidden],
-            )?,
-            up_proj_weight: Bf16View::bind(
-                tensor(&format!("{prefix}.shared_expert.up_proj.weight"))?,
-                [shared, hidden],
-            )?,
-            down_proj_weight: Bf16View::bind(
-                tensor(&format!("{prefix}.shared_expert.down_proj.weight"))?,
-                [hidden, shared],
-            )?,
-        };
+        let (router_weight, shared_expert) =
+            bind_router_and_shared_expert(&prefix, geometry, &mut tensor)?;
         let mut experts = Vec::new();
 
         experts
@@ -478,6 +473,40 @@ impl<'a> Qwen38FlashNextMoeBindings<'a> {
             layer,
         })
     }
+}
+
+/// Binds the BF16 router and shared expert common to both MoE layouts.
+fn bind_router_and_shared_expert<'a>(
+    prefix: &str,
+    geometry: &Qwen38FlashNextGeometry,
+    tensor: &mut impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+) -> CheckpointResult<(Bf16View<'a, 2>, Qwen38FlashNextSharedExpertBindings<'a>)> {
+    let hidden = geometry.hidden as u64;
+    let shared = geometry.shared_intermediate as u64;
+    let router_weight = Bf16View::bind(
+        tensor(&format!("{prefix}.gate.weight"))?,
+        [geometry.expert_count as u64, hidden],
+    )?;
+    let shared_expert = Qwen38FlashNextSharedExpertBindings {
+        gate_weight: Bf16View::bind(
+            tensor(&format!("{prefix}.shared_expert_gate.weight"))?,
+            [1, hidden],
+        )?,
+        gate_proj_weight: Bf16View::bind(
+            tensor(&format!("{prefix}.shared_expert.gate_proj.weight"))?,
+            [shared, hidden],
+        )?,
+        up_proj_weight: Bf16View::bind(
+            tensor(&format!("{prefix}.shared_expert.up_proj.weight"))?,
+            [shared, hidden],
+        )?,
+        down_proj_weight: Bf16View::bind(
+            tensor(&format!("{prefix}.shared_expert.down_proj.weight"))?,
+            [hidden, shared],
+        )?,
+    };
+
+    Ok((router_weight, shared_expert))
 }
 
 fn bind_qwen38_flash_next_expert<'a>(
@@ -679,6 +708,174 @@ impl<'a> Qwen38FlashNextTextEndpointBindings<'a> {
             lm_head: Bf16View::bind(tensor(LM_HEAD)?, shape)?,
             mixer: Qwen38FlashNextHyperConnectionBindings::bind_from(
                 HYPER_CONNECTION_MIXER,
+                geometry,
+                false,
+                &mut tensor,
+            )?,
+        })
+    }
+}
+
+/// Fused BF16 expert source pool for the draft block.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen38FlashNextFusedExpertPoolBindings<'a> {
+    /// Gate rows over up rows `[expert_count, 2 * expert_intermediate, hidden]`.
+    pub gate_up: Bf16View<'a, 3>,
+    /// Down projection, per expert `[expert_count, hidden, expert_intermediate]`.
+    pub down: Bf16View<'a, 3>,
+}
+
+impl Qwen38FlashNextFusedExpertPoolBindings<'_> {
+    /// Bytes one expert occupies across both contiguous planes.
+    pub fn expert_stride_bytes(&self) -> usize {
+        let &[_, gate_up_rows, hidden] = self.gate_up.shape();
+        let &[_, _, intermediate] = self.down.shape();
+
+        (gate_up_rows as usize * hidden as usize + hidden as usize * intermediate as usize)
+            * size_of::<u16>()
+    }
+}
+
+/// MoE source family for the draft block.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen38FlashNextMtpMoeBindings<'a> {
+    /// Full 512-way router weights `[expert_count, hidden]`.
+    pub router_weight: Bf16View<'a, 2>,
+    /// Shared expert and its gate.
+    pub shared_expert: Qwen38FlashNextSharedExpertBindings<'a>,
+    /// Routed experts, fused rather than split.
+    pub experts: Qwen38FlashNextFusedExpertPoolBindings<'a>,
+}
+
+/// Source bindings for one MTP decoder layer.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen38FlashNextMtpLayerBindings<'a> {
+    /// Gated residual read before the attention block.
+    pub attention_hyper_connection: Qwen38FlashNextHyperConnectionBindings<'a>,
+    /// Gated residual read before the MoE block.
+    pub mlp_hyper_connection: Qwen38FlashNextHyperConnectionBindings<'a>,
+    /// Sparse attention and its block-selection indexer.
+    pub attention: Qwen38FlashNextSparseAttentionBindings<'a>,
+    /// This layer's own 512-expert MoE.
+    pub mlp: Qwen38FlashNextMtpMoeBindings<'a>,
+}
+
+/// Complete 31-tensor source family for the MTP draft block.
+#[derive(Clone, Debug)]
+pub struct Qwen38FlashNextMtpBindings<'a> {
+    /// RMSNorm weights over the embedding term of the input fusion `[hidden]`.
+    pub pre_fc_norm_embedding: Bf16View<'a, 1>,
+    /// Grouped RMSNorm weights over the target's pre-mixer stream `[hc_width]`.
+    pub pre_fc_norm_hidden: Bf16View<'a, 1>,
+    /// Embedding-term input projection `[hidden, hidden]`.
+    pub fc_embedding: Bf16View<'a, 2>,
+    /// Stream-term input projection `[hidden, hidden]`, applied per branch.
+    pub fc_hidden: Bf16View<'a, 2>,
+    /// The draft's decoder layers, in stack order.
+    pub layers: Vec<Qwen38FlashNextMtpLayerBindings<'a>>,
+    /// Collapse from the draft stream to the shared LM head.
+    pub mixer: Qwen38FlashNextHyperConnectionBindings<'a>,
+}
+
+impl<'a> Qwen38FlashNextMtpBindings<'a> {
+    /// Binds the exact MTP draft block.
+    pub fn bind(snapshot: &'a CheckpointSnapshot<Qwen38FlashNext>) -> CheckpointResult<Self> {
+        Self::bind_from(F::MTP_LAYERS, &Qwen38FlashNextGeometry::target(), |name| {
+            snapshot.tensor(name)
+        })
+    }
+
+    pub(crate) fn bind_from(
+        mtp_layers: usize,
+        geometry: &Qwen38FlashNextGeometry,
+        mut tensor: impl FnMut(&str) -> CheckpointResult<TensorView<'a>>,
+    ) -> CheckpointResult<Self> {
+        if mtp_layers == 0 {
+            return Err(CheckpointError::source_binding(
+                "Qwen3.8-Flash-Next declares no MTP layer, so its draft block has no source \
+                 contract to bind",
+            ));
+        }
+
+        let hidden = geometry.hidden as u64;
+        let square = [hidden, hidden];
+        let pre_fc_norm_embedding = Bf16View::bind(
+            tensor(&format!("{MTP_ROOT}.pre_fc_norm_embedding.weight"))?,
+            [hidden],
+        )?;
+        let pre_fc_norm_hidden = Bf16View::bind(
+            tensor(&format!("{MTP_ROOT}.pre_fc_norm_hidden.weight"))?,
+            [geometry.hc_width as u64],
+        )?;
+        let fc_embedding =
+            Bf16View::bind(tensor(&format!("{MTP_ROOT}.fc_embedding.weight"))?, square)?;
+        let fc_hidden = Bf16View::bind(tensor(&format!("{MTP_ROOT}.fc_hidden.weight"))?, square)?;
+        let mut layers = Vec::new();
+
+        layers.try_reserve_exact(mtp_layers).map_err(|_| {
+            CheckpointError::source_binding(format!(
+                "cannot reserve {mtp_layers} Flash-Next MTP layer bindings"
+            ))
+        })?;
+
+        for layer in 0..mtp_layers {
+            let prefix = format!("{MTP_ROOT}.layers.{layer}");
+            let mlp_prefix = format!("{prefix}.mlp");
+            let (router_weight, shared_expert) =
+                bind_router_and_shared_expert(&mlp_prefix, geometry, &mut tensor)?;
+
+            layers.push(Qwen38FlashNextMtpLayerBindings {
+                attention_hyper_connection: Qwen38FlashNextHyperConnectionBindings::bind_from(
+                    &format!("{prefix}.attn_hyper_connection"),
+                    geometry,
+                    true,
+                    &mut tensor,
+                )?,
+                mlp_hyper_connection: Qwen38FlashNextHyperConnectionBindings::bind_from(
+                    &format!("{prefix}.mlp_hyper_connection"),
+                    geometry,
+                    true,
+                    &mut tensor,
+                )?,
+                attention: Qwen38FlashNextSparseAttentionBindings::bind_under(
+                    &format!("{prefix}.self_attn"),
+                    layer,
+                    geometry,
+                    &mut tensor,
+                )?,
+                mlp: Qwen38FlashNextMtpMoeBindings {
+                    router_weight,
+                    shared_expert,
+                    experts: Qwen38FlashNextFusedExpertPoolBindings {
+                        gate_up: Bf16View::bind(
+                            tensor(&format!("{mlp_prefix}.experts.gate_up_proj"))?,
+                            [
+                                geometry.expert_count as u64,
+                                2 * geometry.expert_intermediate as u64,
+                                hidden,
+                            ],
+                        )?,
+                        down: Bf16View::bind(
+                            tensor(&format!("{mlp_prefix}.experts.down_proj"))?,
+                            [
+                                geometry.expert_count as u64,
+                                hidden,
+                                geometry.expert_intermediate as u64,
+                            ],
+                        )?,
+                    },
+                },
+            });
+        }
+
+        Ok(Self {
+            pre_fc_norm_embedding,
+            pre_fc_norm_hidden,
+            fc_embedding,
+            fc_hidden,
+            layers,
+            mixer: Qwen38FlashNextHyperConnectionBindings::bind_from(
+                &format!("{MTP_ROOT}.hyper_connection_mixer"),
                 geometry,
                 false,
                 &mut tensor,
@@ -915,6 +1112,111 @@ pub(crate) mod tests {
         fixture
     }
 
+    /// The complete 31-tensor draft block at fixture scale.
+    pub(crate) fn mtp_fixture(geometry: &Qwen38FlashNextGeometry) -> SafeTensorTestBuilder {
+        let mut fixture = SafeTensorTestBuilder::new();
+
+        fixture
+            .add_bf16_ordinal(
+                format!("{MTP_ROOT}.pre_fc_norm_embedding.weight"),
+                &[geometry.hidden],
+            )
+            .add_bf16_ordinal(
+                format!("{MTP_ROOT}.pre_fc_norm_hidden.weight"),
+                &[geometry.hc_width],
+            )
+            .add_bf16_ordinal(
+                format!("{MTP_ROOT}.fc_embedding.weight"),
+                &[geometry.hidden, geometry.hidden],
+            )
+            .add_bf16_ordinal(
+                format!("{MTP_ROOT}.fc_hidden.weight"),
+                &[geometry.hidden, geometry.hidden],
+            );
+
+        let prefix = format!("{MTP_ROOT}.layers.0");
+
+        for module in ["attn_hyper_connection", "mlp_hyper_connection"] {
+            append_hyper_connection(&mut fixture, &format!("{prefix}.{module}"), geometry, true);
+        }
+
+        let attention = format!("{prefix}.self_attn");
+
+        for (projection, rows, columns) in [
+            ("q_proj", geometry.attention_query_rows, geometry.hidden),
+            ("k_proj", geometry.attention_kv_rows, geometry.hidden),
+            ("v_proj", geometry.attention_kv_rows, geometry.hidden),
+            ("o_proj", geometry.hidden, geometry.attention_output_columns),
+        ] {
+            fixture.add_bf16_ordinal(format!("{attention}.{projection}.weight"), &[rows, columns]);
+        }
+
+        fixture
+            .add_bf16_ordinal(format!("{attention}.q_norm.weight"), &[geometry.head_dim])
+            .add_bf16_ordinal(format!("{attention}.k_norm.weight"), &[geometry.head_dim])
+            .add_bf16_ordinal(
+                format!("{attention}.indexer.index_qk_proj.weight"),
+                &[geometry.indexer_rows, geometry.hidden],
+            )
+            .add_bf16_ordinal(
+                format!("{attention}.indexer.q_layernorm.weight"),
+                &[geometry.indexer_head_dim],
+            )
+            .add_bf16_ordinal(
+                format!("{attention}.indexer.k_layernorm.weight"),
+                &[geometry.indexer_head_dim],
+            );
+
+        let mlp = format!("{prefix}.mlp");
+
+        fixture
+            .add_bf16_ordinal(
+                format!("{mlp}.gate.weight"),
+                &[geometry.expert_count, geometry.hidden],
+            )
+            .add_bf16_ordinal(
+                format!("{mlp}.shared_expert_gate.weight"),
+                &[1, geometry.hidden],
+            )
+            .add_bf16_ordinal(
+                format!("{mlp}.shared_expert.gate_proj.weight"),
+                &[geometry.shared_intermediate, geometry.hidden],
+            )
+            .add_bf16_ordinal(
+                format!("{mlp}.shared_expert.up_proj.weight"),
+                &[geometry.shared_intermediate, geometry.hidden],
+            )
+            .add_bf16_ordinal(
+                format!("{mlp}.shared_expert.down_proj.weight"),
+                &[geometry.hidden, geometry.shared_intermediate],
+            )
+            .add_bf16_ordinal(
+                format!("{mlp}.experts.gate_up_proj"),
+                &[
+                    geometry.expert_count,
+                    2 * geometry.expert_intermediate,
+                    geometry.hidden,
+                ],
+            )
+            .add_bf16_ordinal(
+                format!("{mlp}.experts.down_proj"),
+                &[
+                    geometry.expert_count,
+                    geometry.hidden,
+                    geometry.expert_intermediate,
+                ],
+            );
+
+        append_hyper_connection(
+            &mut fixture,
+            &format!("{MTP_ROOT}.hyper_connection_mixer"),
+            geometry,
+            false,
+        );
+
+        fixture
+    }
+
     pub(crate) fn engram_fixture(
         layer: usize,
         geometry: &Qwen38FlashNextGeometry,
@@ -1039,6 +1341,64 @@ pub(crate) mod tests {
 
         assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
         assert!(error.to_string().contains("GDN source contract"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn binds_the_exact_qwen38_flash_next_mtp_source_family() {
+        let geometry = test_geometry();
+        let path = fixture_path("qwen38-flash-next-mtp");
+        mtp_fixture(&geometry).write(&path);
+        let file = SafeTensorFile::open(&path).unwrap();
+
+        let mut requested = Vec::new();
+        let bindings = Qwen38FlashNextMtpBindings::bind_from(1, &geometry, |name| {
+            requested.push(name.to_string());
+            file.tensor(name)
+        })
+        .unwrap();
+
+        assert_eq!(bindings.pre_fc_norm_embedding.shape(), &[128]);
+        assert_eq!(bindings.pre_fc_norm_hidden.shape(), &[512]);
+        assert_eq!(bindings.fc_embedding.shape(), &[128, 128]);
+        assert_eq!(bindings.fc_hidden.shape(), &[128, 128]);
+        assert_eq!(bindings.layers.len(), 1);
+
+        let layer = &bindings.layers[0];
+
+        assert_eq!(layer.attention.query_gate_weight.shape(), &[16, 128]);
+        assert_eq!(layer.attention.indexer.qk_weight.shape(), &[12, 128]);
+        assert_eq!(layer.attention.layer, 0);
+
+        assert!(layer.attention_hyper_connection.block_inject.is_some());
+        assert!(layer.mlp_hyper_connection.block_inject.is_some());
+        assert!(bindings.mixer.block_inject.is_none());
+
+        assert_eq!(layer.mlp.experts.gate_up.shape(), &[3, 128, 128]);
+        assert_eq!(layer.mlp.experts.down.shape(), &[3, 128, 64]);
+        assert_eq!(
+            layer.mlp.experts.expert_stride_bytes(),
+            (128 * 128 + 128 * 64) * 2
+        );
+
+        // The draft shares target endpoints and has no PLE or linear attention.
+        assert_eq!(requested.len(), 31);
+        assert!(!requested.iter().any(|name| name.contains("embed_tokens")));
+        assert!(!requested.iter().any(|name| name.contains("lm_head")));
+        assert!(
+            !requested
+                .iter()
+                .any(|name| name.contains(".ple.") || name.contains("linear_attn"))
+        );
+
+        let error = Qwen38FlashNextMtpBindings::bind_from(0, &geometry, |_| {
+            panic!("the layer count check must reject before tensor lookup")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), CheckpointErrorCode::SourceBinding);
+        assert!(error.to_string().contains("no MTP layer"));
 
         fs::remove_file(path).unwrap();
     }
