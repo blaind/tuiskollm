@@ -11,7 +11,7 @@ use crate::common::inventory::{
 };
 use crate::common::naming::{EMBEDDING, LM_HEAD, layer_prefix};
 use crate::common::schema::validate_config;
-use crate::qwen38_flash_next::bindings::HYPER_CONNECTION_MIXER;
+use crate::qwen38_flash_next::bindings::{HYPER_CONNECTION_MIXER, MTP_ROOT};
 use crate::{Arch, CheckpointError, CheckpointResult, DType, Qwen38FlashNext, SafeTensorFile};
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,8 +22,6 @@ use std::path::Path;
 const EXPERTS_PER_SHARD: usize = 128;
 /// Expert shards owned by one decoder layer.
 const EXPERT_SHARD_BLOCKS: usize = 4;
-/// Root of the MTP draft block.
-const MTP_ROOT: &str = "mtp";
 
 const QWEN38_FLASH_NEXT_FIXED_SHARDS: [FixedShardSpec; 14] = [
     FixedShardSpec::new("model-bf16-00001.safetensors", 1_273_114_461, 385),
@@ -856,9 +854,9 @@ mod tests {
         assert!(!expected.contains_key("mtp.layers.0.mlp.experts.0.gate_proj.weight"));
     }
 
-    /// Partitions every inventory entry by binding family; only 31 MTP tensors remain deferred.
+    /// Every inventory entry belongs to one admitted binding family.
     #[test]
-    fn every_non_mtp_tensor_is_claimed_by_an_admitted_source_binding() {
+    fn every_tensor_is_claimed_by_an_admitted_source_binding() {
         fn binding_family(name: &str) -> &'static str {
             if name.starts_with(MTP_ROOT) {
                 return "mtp";
@@ -916,6 +914,21 @@ mod tests {
             counts.values().sum::<usize>(),
             QWEN38_FLASH_NEXT_INVENTORY.index_entries
         );
+
+        // The 4.69 GiB expert pool dominates the draft block's 4.86 GiB payload.
+        let mtp: BTreeMap<_, _> = expected
+            .iter()
+            .filter(|(name, _)| name.starts_with(MTP_ROOT))
+            .map(|(name, tensor)| (name.clone(), tensor.clone()))
+            .collect();
+        let pool: BTreeMap<_, _> = mtp
+            .iter()
+            .filter(|(name, _)| name.contains(".experts."))
+            .map(|(name, tensor)| (name.clone(), tensor.clone()))
+            .collect();
+
+        assert_eq!(expected_payload_bytes(&mtp).unwrap(), 5_214_301_696);
+        assert_eq!(expected_payload_bytes(&pool).unwrap(), 5_033_164_800);
     }
 
     #[test]

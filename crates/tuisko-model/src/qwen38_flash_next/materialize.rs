@@ -18,7 +18,7 @@ use crate::qwen38_flash_next::bindings::{
     Qwen38FlashNextEngramBindings, Qwen38FlashNextExpertBindings, Qwen38FlashNextGdnBindings,
     Qwen38FlashNextGeometry, Qwen38FlashNextHyperConnectionBindings,
     Qwen38FlashNextIndexerBindings, Qwen38FlashNextLayerHyperConnections,
-    Qwen38FlashNextMoeBindings, Qwen38FlashNextSharedExpertBindings,
+    Qwen38FlashNextMoeBindings, Qwen38FlashNextMtpBindings, Qwen38FlashNextSharedExpertBindings,
     Qwen38FlashNextSparseAttentionBindings, Qwen38FlashNextTextEndpointBindings,
 };
 use crate::qwen38_flash_next::engram::Qwen38FlashNextEngramHashConstants;
@@ -930,6 +930,202 @@ impl<'a> Qwen38FlashNextTextEndpointBindings<'a> {
     }
 }
 
+/// Borrowed expert-major BF16 planes for the MTP routed pool.
+#[derive(Clone, Copy, Debug)]
+pub struct MaterializedQwen38FlashNextFusedExpertPool<'a> {
+    /// Gate-over-up rows in expert order.
+    pub gate_up: &'a [u8],
+    /// Down-projection rows in expert order.
+    pub down: &'a [u8],
+    /// Routed experts in the pool.
+    pub expert_count: usize,
+    /// Bytes one expert occupies in `gate_up`.
+    pub gate_up_stride_bytes: usize,
+    /// Bytes one expert occupies in `down`.
+    pub down_stride_bytes: usize,
+}
+
+impl<'a> MaterializedQwen38FlashNextFusedExpertPool<'a> {
+    /// Bytes one expert occupies across both planes.
+    pub fn expert_stride_bytes(&self) -> usize {
+        self.gate_up_stride_bytes + self.down_stride_bytes
+    }
+
+    /// Bytes the borrowed pool occupies.
+    pub fn borrowed_weight_bytes(&self) -> usize {
+        self.gate_up.len() + self.down.len()
+    }
+
+    /// Returns both borrowed planes for one expert.
+    pub fn expert(&self, expert: usize) -> Option<(&'a [u8], &'a [u8])> {
+        if expert >= self.expert_count {
+            return None;
+        }
+
+        let gate_up = self
+            .gate_up
+            .get(expert * self.gate_up_stride_bytes..(expert + 1) * self.gate_up_stride_bytes)?;
+        let down = self
+            .down
+            .get(expert * self.down_stride_bytes..(expert + 1) * self.down_stride_bytes)?;
+
+        Some((gate_up, down))
+    }
+}
+
+/// Runtime-native MoE planes for one draft layer.
+#[derive(Clone, Copy, Debug)]
+pub struct MaterializedQwen38FlashNextMtpMoe<'a> {
+    /// Full 512-way router weights retained zero-copy.
+    pub router_weight: Bf16View<'a, 2>,
+    /// Shared expert and its gate, all retained zero-copy.
+    pub shared_expert: Qwen38FlashNextSharedExpertBindings<'a>,
+    /// The fused BF16 routed pool.
+    pub experts: MaterializedQwen38FlashNextFusedExpertPool<'a>,
+}
+
+/// Runtime-native planes for one draft decoder layer.
+#[derive(Debug)]
+pub struct MaterializedQwen38FlashNextMtpLayer<'a> {
+    /// Gated residual read before the attention block.
+    pub attention_hyper_connection: Qwen38FlashNextHyperConnectionBindings<'a>,
+    /// Gated residual read before the MoE block.
+    pub mlp_hyper_connection: Qwen38FlashNextHyperConnectionBindings<'a>,
+    /// Sparse attention, fused exactly as a target layer's is.
+    pub attention: MaterializedQwen38FlashNextSparseAttention<'a>,
+    /// This layer's own MoE.
+    pub mlp: MaterializedQwen38FlashNextMtpMoe<'a>,
+}
+
+/// Runtime layout for the MTP draft block.
+///
+/// Attention QKV is fused; the BF16 expert pool remains borrowed.
+#[derive(Debug)]
+pub struct MaterializedQwen38FlashNextMtp<'a> {
+    /// RMSNorm weights over the fusion's embedding term, borrowed.
+    pub pre_fc_norm_embedding: Bf16View<'a, 1>,
+    /// Grouped RMSNorm weights over the target's pre-mixer stream, borrowed.
+    pub pre_fc_norm_hidden: Bf16View<'a, 1>,
+    /// Embedding-term input projection, borrowed.
+    pub fc_embedding: Bf16View<'a, 2>,
+    /// Stream-term input projection, borrowed.
+    pub fc_hidden: Bf16View<'a, 2>,
+    /// The draft's decoder layers, in stack order.
+    pub layers: Vec<MaterializedQwen38FlashNextMtpLayer<'a>>,
+    /// Collapse from the draft's own stream to the shared LM head, borrowed.
+    pub mixer: Qwen38FlashNextHyperConnectionBindings<'a>,
+}
+
+impl sealed::Sealed for MaterializedQwen38FlashNextMtp<'_> {}
+
+impl MaterializedMemory for MaterializedQwen38FlashNextMtp<'_> {
+    fn host_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| layer.attention.host_bytes())
+            .sum()
+    }
+}
+
+impl<'a> Qwen38FlashNextMtpBindings<'a> {
+    /// Admits the draft block: fuses each layer's attention QKV, borrows everything else.
+    pub fn materialize(self) -> CheckpointResult<MaterializedQwen38FlashNextMtp<'a>> {
+        self.materialize_with(&Qwen38FlashNextGeometry::target())
+    }
+
+    pub(crate) fn materialize_with(
+        self,
+        geometry: &Qwen38FlashNextGeometry,
+    ) -> CheckpointResult<MaterializedQwen38FlashNextMtp<'a>> {
+        if self.pre_fc_norm_embedding.shape() != &[geometry.hidden as u64]
+            || self.pre_fc_norm_hidden.shape() != &[geometry.hc_width as u64]
+        {
+            return Err(CheckpointError::source_binding(
+                "the Flash-Next draft block's input-fusion norms differ from their contract",
+            ));
+        }
+
+        if self.mixer.block_inject.is_some() {
+            return Err(CheckpointError::source_binding(
+                "the Flash-Next draft block's mixer collapses the stream and must not write back",
+            ));
+        }
+
+        let mut layers = Vec::new();
+
+        layers.try_reserve_exact(self.layers.len()).map_err(|_| {
+            CheckpointError::source_binding(format!(
+                "cannot reserve {} Flash-Next MTP layer layouts",
+                self.layers.len()
+            ))
+        })?;
+
+        for (layer, sources) in self.layers.into_iter().enumerate() {
+            if sources.attention_hyper_connection.block_inject.is_none()
+                || sources.mlp_hyper_connection.block_inject.is_none()
+            {
+                return Err(CheckpointError::source_binding(format!(
+                    "mtp-layer-{layer} Flash-Next hyper-connections must both write back into \
+                     the stream"
+                )));
+            }
+
+            let experts = sources.mlp.experts;
+            let expert_count = geometry.expert_count;
+            let hidden = geometry.hidden as u64;
+            let intermediate = geometry.expert_intermediate as u64;
+
+            if experts.gate_up.shape() != &[expert_count as u64, 2 * intermediate, hidden]
+                || experts.down.shape() != &[expert_count as u64, hidden, intermediate]
+            {
+                return Err(CheckpointError::source_binding(format!(
+                    "mtp-layer-{layer} Flash-Next fused expert pool differs from its contract"
+                )));
+            }
+
+            let gate_up_bytes = experts.gate_up.bytes();
+            let down_bytes = experts.down.bytes();
+
+            // Expert-major addressing requires exact plane divisibility.
+            if expert_count == 0
+                || gate_up_bytes.len() % expert_count != 0
+                || down_bytes.len() % expert_count != 0
+            {
+                return Err(CheckpointError::source_binding(format!(
+                    "mtp-layer-{layer} Flash-Next fused expert pool does not divide into \
+                     {expert_count} experts"
+                )));
+            }
+
+            layers.push(MaterializedQwen38FlashNextMtpLayer {
+                attention_hyper_connection: sources.attention_hyper_connection,
+                mlp_hyper_connection: sources.mlp_hyper_connection,
+                attention: sources.attention.materialize_with(geometry)?,
+                mlp: MaterializedQwen38FlashNextMtpMoe {
+                    router_weight: sources.mlp.router_weight,
+                    shared_expert: sources.mlp.shared_expert,
+                    experts: MaterializedQwen38FlashNextFusedExpertPool {
+                        gate_up: gate_up_bytes,
+                        down: down_bytes,
+                        expert_count,
+                        gate_up_stride_bytes: gate_up_bytes.len() / expert_count,
+                        down_stride_bytes: down_bytes.len() / expert_count,
+                    },
+                },
+            });
+        }
+
+        Ok(MaterializedQwen38FlashNextMtp {
+            pre_fc_norm_embedding: self.pre_fc_norm_embedding,
+            pre_fc_norm_hidden: self.pre_fc_norm_hidden,
+            fc_embedding: self.fc_embedding,
+            fc_hidden: self.fc_hidden,
+            layers,
+            mixer: self.mixer,
+        })
+    }
+}
+
 fn checked(value: Option<usize>, layer: usize, role: &str) -> CheckpointResult<usize> {
     value.ok_or_else(|| {
         CheckpointError::source_binding(format!("layer-{layer} Flash-Next {role} overflows"))
@@ -946,7 +1142,8 @@ mod tests {
     use crate::common::test_support::sources::{block_scale_oracle, fixture_path};
     use crate::qwen38_flash_next::bindings::tests::{
         endpoint_fixture, engram_fixture, engram_fixture_with, gdn_fixture,
-        hyper_connection_fixture, moe_fixture, sparse_attention_fixture, test_geometry,
+        hyper_connection_fixture, moe_fixture, mtp_fixture, sparse_attention_fixture,
+        test_geometry,
     };
     use crate::{CheckpointErrorCode, MaterializedMemory, SafeTensorFile};
     use std::fs;
@@ -1426,12 +1623,69 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "deferred: mtp.* has no \
-                Qwen38FlashNextMtpBindings, so the draft block's BF16 fused expert pool \
-                (mtp.layers.0.mlp.experts.{gate_up_proj, down_proj}) cannot be bound or \
-                materialized, and this target's MTP route is unreachable"]
     fn qwen38_flash_next_mtp_block_binds_its_fused_bf16_expert_pool() {
-        unreachable!("no Flash-Next MTP binding exists yet");
+        let geometry = test_geometry();
+        let path = fixture_path("qwen38-flash-next-mtp-materialize");
+        mtp_fixture(&geometry).write(&path);
+        let file = SafeTensorFile::open(&path).unwrap();
+        let bindings =
+            Qwen38FlashNextMtpBindings::bind_from(1, &geometry, |name| file.tensor(name)).unwrap();
+        let pool_sources = (
+            bindings.layers[0].mlp.experts.gate_up.bytes().as_ptr(),
+            bindings.layers[0].mlp.experts.down.bytes().as_ptr(),
+        );
+        let mtp = bindings.materialize_with(&geometry).unwrap();
+
+        assert_eq!(mtp.layers.len(), 1);
+
+        let pool = mtp.layers[0].mlp.experts;
+        let gate_up_stride = 2 * geometry.expert_intermediate * geometry.hidden * 2;
+        let down_stride = geometry.hidden * geometry.expert_intermediate * 2;
+
+        assert_eq!(pool.expert_count, geometry.expert_count);
+        assert_eq!(pool.gate_up_stride_bytes, gate_up_stride);
+        assert_eq!(pool.down_stride_bytes, down_stride);
+        assert_eq!(pool.expert_stride_bytes(), gate_up_stride + down_stride);
+        assert_eq!(
+            pool.borrowed_weight_bytes(),
+            geometry.expert_count * (gate_up_stride + down_stride)
+        );
+
+        for expert in 0..geometry.expert_count {
+            let (gate_up, down) = pool.expert(expert).unwrap();
+
+            assert_eq!(gate_up.len(), gate_up_stride);
+            assert_eq!(down.len(), down_stride);
+        }
+
+        assert!(pool.expert(geometry.expert_count).is_none());
+
+        assert_eq!(
+            (pool.gate_up.as_ptr(), pool.down.as_ptr()),
+            pool_sources,
+            "the fused pool must be borrowed, never staged"
+        );
+
+        assert_eq!(
+            mtp.host_bytes(),
+            (geometry.attention_query_rows + 2 * geometry.attention_kv_rows) * geometry.hidden * 2
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn qwen38_flash_next_mtp_pool_strides_match_the_target_budget() {
+        let geometry = Qwen38FlashNextGeometry::target();
+        let gate_up_stride = 2 * geometry.expert_intermediate * geometry.hidden * 2;
+        let down_stride = geometry.hidden * geometry.expert_intermediate * 2;
+
+        assert_eq!((gate_up_stride, down_stride), (6_553_600, 3_276_800));
+        assert_eq!(gate_up_stride + down_stride, 9_830_400);
+        assert_eq!(
+            geometry.expert_count * (gate_up_stride + down_stride),
+            5_033_164_800
+        );
     }
 
     #[test]
@@ -1505,6 +1759,19 @@ mod tests {
             assert_eq!(planes.gate_weight_e2m1.len(), 819_200);
             assert_eq!(planes.down_weight_e2m1.len(), 819_200);
         }
+
+        let mtp = Qwen38FlashNextMtpBindings::bind(&snapshot)
+            .unwrap()
+            .materialize()
+            .unwrap();
+
+        assert_eq!(mtp.layers.len(), 1);
+        assert_eq!(mtp.host_bytes(), 68_157_440);
+        assert_eq!(mtp.layers[0].mlp.experts.expert_count, 512);
+        assert_eq!(
+            mtp.layers[0].mlp.experts.borrowed_weight_bytes(),
+            5_033_164_800
+        );
 
         // The vision tower is bind-only: admitted, never executed.
         let vision = crate::VisionBindings::bind::<Qwen38FlashNext>(&snapshot).unwrap();
