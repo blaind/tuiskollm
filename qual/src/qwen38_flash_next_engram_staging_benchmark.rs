@@ -63,7 +63,10 @@ mod tests {
     fn qwen38_flash_next_engram_staging_suite_benchmark_accounting_is_exact() {
         let layout = Qwen38FlashNextEngramStagerLayout::build().unwrap();
 
-        assert_eq!(QWEN38_FLASH_NEXT_ENGRAM_WIDTHS, [1, 32, 64, 128, 1_024]);
+        assert_eq!(
+            QWEN38_FLASH_NEXT_ENGRAM_WIDTHS,
+            [1, 2, 3, 4, 32, 64, 128, 1_024]
+        );
         assert_eq!(layout.max_tokens(), 1_024);
         assert_eq!(layout.token_bytes(), 2_560);
         assert_eq!(layout.round_rows(1_024).unwrap(), 16_384);

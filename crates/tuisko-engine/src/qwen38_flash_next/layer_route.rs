@@ -9,6 +9,9 @@ use tuisko_model::Qwen38FlashNext;
 /// Prefill tile widths every Qwen3.8-Flash-Next kernel family admits, ascending.
 pub const QWEN38_FLASH_NEXT_PREFILL_ROWS: [usize; 4] = [32, 64, 128, 1_024];
 
+/// Consecutive rows one speculative verification round admits.
+pub const QWEN38_FLASH_NEXT_CAUSAL_ROWS: [usize; 4] = [1, 2, 3, 4];
+
 /// Largest row count any admitted Qwen3.8-Flash-Next route carries.
 pub const QWEN38_FLASH_NEXT_MAX_ROWS: usize = 1_024;
 
@@ -27,6 +30,15 @@ pub enum Qwen38FlashNextRowRoute {
     Decode(usize),
     /// Exact prefill tile, one of [`QWEN38_FLASH_NEXT_PREFILL_ROWS`].
     Prefill(usize),
+}
+
+/// Whether rows are independent sequences or consecutive positions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Qwen38FlashNextRoundShape {
+    /// Independent one-token sequences.
+    Batch,
+    /// Consecutive positions of one sequence.
+    Causal,
 }
 
 impl Qwen38FlashNextRowRoute {
@@ -66,6 +78,17 @@ pub fn qwen38_flash_next_row_route(rows: usize) -> EngineResult<Qwen38FlashNextR
 
     Err(EngineError::route(format!(
         "Qwen3.8-Flash-Next row count {rows} is not an admitted B=1..={MAX_BATCH} or T=32/64/128/1024 route"
+    )))
+}
+
+/// Resolves one admitted causal verification span.
+pub fn qwen38_flash_next_causal_route(rows: usize) -> EngineResult<Qwen38FlashNextRowRoute> {
+    if QWEN38_FLASH_NEXT_CAUSAL_ROWS.contains(&rows) {
+        return Ok(Qwen38FlashNextRowRoute::Decode(rows));
+    }
+
+    Err(EngineError::route(format!(
+        "Qwen3.8-Flash-Next causal round {rows} is outside the admitted K=1..=4 span"
     )))
 }
 
@@ -120,8 +143,9 @@ pub fn require_qwen38_flash_next_dense_qsa_round(
 #[cfg(test)]
 mod tests {
     use super::{
-        QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING, QWEN38_FLASH_NEXT_MAX_ROWS,
-        QWEN38_FLASH_NEXT_PREFILL_ROWS, Qwen38FlashNextRowRoute, qwen38_flash_next_row_route,
+        QWEN38_FLASH_NEXT_CAUSAL_ROWS, QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING,
+        QWEN38_FLASH_NEXT_MAX_ROWS, QWEN38_FLASH_NEXT_PREFILL_ROWS, Qwen38FlashNextRowRoute,
+        qwen38_flash_next_causal_route, qwen38_flash_next_row_route,
         require_qwen38_flash_next_dense_qsa_round, require_qwen38_flash_next_dense_qsa_visible,
     };
     use crate::{EngineErrorCode, MAX_BATCH};
@@ -155,6 +179,21 @@ mod tests {
         assert_eq!(admitted, vec![1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]);
         assert_eq!(admitted.len(), 12);
         assert_eq!(*admitted.last().unwrap(), QWEN38_FLASH_NEXT_MAX_ROWS);
+    }
+
+    #[test]
+    fn causal_routes_are_exactly_the_verification_span() {
+        let admitted = (0..=8)
+            .filter(|rows| qwen38_flash_next_causal_route(*rows).is_ok())
+            .collect::<Vec<_>>();
+
+        assert_eq!(admitted, QWEN38_FLASH_NEXT_CAUSAL_ROWS);
+        for rows in QWEN38_FLASH_NEXT_CAUSAL_ROWS {
+            assert_eq!(
+                qwen38_flash_next_causal_route(rows).unwrap(),
+                Qwen38FlashNextRowRoute::Decode(rows)
+            );
+        }
     }
 
     #[test]

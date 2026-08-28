@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(carry, saved_carry);
         assert_eq!(destination, saved_destination);
 
-        for width in [0, 2, 31, 33, 1_025] {
+        for width in [0, 5, 31, 33, 1_025] {
             assert!(!QWEN38_FLASH_NEXT_ENGRAM_WIDTHS.contains(&width));
         }
     }

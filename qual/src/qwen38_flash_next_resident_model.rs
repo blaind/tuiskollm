@@ -121,6 +121,21 @@ pub struct Qwen38FlashNextResidentModelQualification {
     pub peak_absolute_logit: f32,
     /// Measured routes, decode first then prefill.
     pub measurements: Vec<Qwen38FlashNextRouteMeasurement>,
+    /// Agreement between a causal span and the same sequential decode.
+    pub causal_span: Qwen38FlashNextCausalSpanEvidence,
+}
+
+/// Bitwise evidence for one four-row verification span.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Qwen38FlashNextCausalSpanEvidence {
+    /// Logit values compared.
+    pub compared_logits: usize,
+    /// Values whose represented bits differ.
+    pub differing_logits: usize,
+    /// Largest represented BF16 step observed.
+    pub peak_represented_step: u16,
+    /// Rows with the same argmax.
+    pub agreeing_rows: usize,
 }
 
 /// Loads the whole model, captures every segment, and measures a decode and a prefill route.
@@ -148,9 +163,9 @@ pub fn qualify_qwen38_flash_next_resident_model(
     let load = started.elapsed();
     let stats = model.load_stats();
 
-    if stats.executables() != QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS * 12 {
+    if stats.executables() != QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS * 16 {
         return Err(mismatch(format!(
-            "the resident program captured {} executables, expected {} segments times twelve routes",
+            "the resident program captured {} executables, expected {} segments times sixteen routes",
             stats.executables(),
             QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS
         )));
@@ -182,6 +197,7 @@ pub fn qualify_qwen38_flash_next_resident_model(
     let refused_rounds = verify_dense_band_refusal(&mut model, &stream)?;
     let (inspected_logits, peak_absolute_logit) = verify_logits_respond(&mut model, &stream)?;
     let cache_state_compared_logits = verify_cache_state_is_not_numerical(&mut model, &stream)?;
+    let causal_span = verify_causal_span_is_sequential(&mut model, &stream)?;
 
     // Preserve completed route timings if a later route fails.
     let mut measurements = Vec::new();
@@ -236,6 +252,7 @@ pub fn qualify_qwen38_flash_next_resident_model(
         peak_absolute_logit,
         cache_state_compared_logits,
         measurements,
+        causal_span,
     })
 }
 
@@ -299,6 +316,84 @@ fn verify_cache_state_is_not_numerical(
     }
 
     Ok(cold.len())
+}
+
+/// Requires the causal span to match four decode steps bit for bit.
+fn verify_causal_span_is_sequential(
+    model: &mut Qwen38FlashNextResidentModel,
+    stream: &tuisko_gpu::CudaStream,
+) -> QualResult<Qwen38FlashNextCausalSpanEvidence> {
+    const SLOT: usize = 0;
+    const TOKENS: [u32; 4] = [101, 7_919, 48_127, 199_933];
+
+    let vocab = <A as Arch>::VOCAB;
+    let mut sequential = Vec::with_capacity(TOKENS.len() * vocab);
+
+    model.reset_state(stream)?;
+    reserve_probe_slots(model, stream)?;
+    for (position, &token) in TOKENS.iter().enumerate() {
+        model.decode_step(stream, &[token], &[position as u32], &[SLOT])?;
+        sequential.extend_from_slice(model.read_logits(stream, 1)?);
+    }
+
+    model.reset_state(stream)?;
+    reserve_probe_slots(model, stream)?;
+    model.verify_step(stream, &TOKENS, 0, SLOT)?;
+    let span = model.read_logits(stream, TOKENS.len())?.to_vec();
+    if span.len() != sequential.len() {
+        return Err(mismatch(format!(
+            "the causal span published {} logits, expected {}",
+            span.len(),
+            sequential.len()
+        )));
+    }
+
+    let mut differing = 0usize;
+    let mut peak_step = 0u16;
+    for (&expected, &observed) in sequential.iter().zip(&span) {
+        if expected != observed {
+            differing += 1;
+            peak_step = peak_step.max(expected.abs_diff(observed));
+        }
+    }
+    if differing != 0 {
+        return Err(mismatch(format!(
+            "the causal span differs in {differing} of {} logits, by up to {peak_step} represented BF16 steps",
+            span.len()
+        )));
+    }
+
+    let mut agreeing_rows = 0usize;
+    for row in 0..TOKENS.len() {
+        let begin = row * vocab;
+        let expected = argmax_row(&sequential[begin..begin + vocab]);
+        let observed = argmax_row(&span[begin..begin + vocab]);
+        if expected != observed {
+            return Err(mismatch(format!(
+                "causal span row {row} chose token {observed}, expected {expected}"
+            )));
+        }
+        agreeing_rows += 1;
+    }
+
+    Ok(Qwen38FlashNextCausalSpanEvidence {
+        compared_logits: span.len(),
+        differing_logits: differing,
+        peak_represented_step: peak_step,
+        agreeing_rows,
+    })
+}
+
+fn argmax_row(row: &[u16]) -> usize {
+    let value = |bits: u16| f32::from_bits(u32::from(bits) << 16);
+    let mut best = 0usize;
+    for (index, &bits) in row.iter().enumerate().skip(1) {
+        if value(bits) > value(row[best]) {
+            best = index;
+        }
+    }
+
+    best
 }
 
 /// Reserves every slot driven directly by this suite.
@@ -587,6 +682,13 @@ pub fn print_qwen38_flash_next_resident_model_report(
         "  peak |logit|               {:.4}",
         report.peak_absolute_logit
     );
+    println!(
+        "  causal span                {} rows, {}/{} differing, peak step {}",
+        report.causal_span.agreeing_rows,
+        report.causal_span.differing_logits,
+        report.causal_span.compared_logits,
+        report.causal_span.peak_represented_step
+    );
     for measurement in &report.measurements {
         print_measurement(measurement);
     }
@@ -655,6 +757,7 @@ mod tests {
     fn the_segment_inventory_is_the_one_the_plan_derives() {
         assert_eq!(QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS, <A as Arch>::LAYERS + 1);
         assert_eq!(QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS * 12, 588);
+        assert_eq!(QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS * 4, 196);
     }
 
     #[test]
@@ -681,7 +784,11 @@ mod tests {
         let report = qualify_qwen38_flash_next_resident_model(std::path::Path::new(&root))?;
         print_qwen38_flash_next_resident_model_report(&report);
 
-        assert_eq!(report.executables, 588);
+        assert_eq!(report.executables, 784);
+        assert_eq!(report.causal_span.agreeing_rows, 4);
+        assert_eq!(report.causal_span.compared_logits, 4 * <A as Arch>::VOCAB);
+        assert_eq!(report.causal_span.differing_logits, 0);
+        assert_eq!(report.causal_span.peak_represented_step, 0);
         assert_eq!(report.refused_rounds, 3);
         assert_eq!(report.inspected_logits, 3 * 248_320);
         assert_eq!(report.cache_state_compared_logits, 248_320);
