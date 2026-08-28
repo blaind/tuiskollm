@@ -20,6 +20,7 @@ members = [
     "crates/tuisko-kernels-sm120",
     "crates/tuisko-kernels-sm120-attention",
     "crates/tuisko-kernels-sm120-common",
+    "crates/tuisko-kernels-sm120-engram",
     "crates/tuisko-kernels-sm120-fp8-mlp",
     "crates/tuisko-kernels-sm120-fp8-projection",
     "crates/tuisko-kernels-sm120-gdn",
@@ -81,6 +82,7 @@ tuisko-kernels-sm89 = { version = "0.1.0", path = "crates/tuisko-kernels-sm89" }
 tuisko-kernels-sm120 = { version = "0.1.0", path = "crates/tuisko-kernels-sm120" }
 tuisko-kernels-sm120-attention = { version = "0.1.0", path = "crates/tuisko-kernels-sm120-attention" }
 tuisko-kernels-sm120-common = { version = "0.1.0", path = "crates/tuisko-kernels-sm120-common" }
+tuisko-kernels-sm120-engram = { version = "0.1.0", path = "crates/tuisko-kernels-sm120-engram" }
 tuisko-kernels-sm120-fp8-mlp = { version = "0.1.0", path = "crates/tuisko-kernels-sm120-fp8-mlp" }
 tuisko-kernels-sm120-fp8-projection = { version = "0.1.0", path = "crates/tuisko-kernels-sm120-fp8-projection" }
 tuisko-kernels-sm120-gdn = { version = "0.1.0", path = "crates/tuisko-kernels-sm120-gdn" }

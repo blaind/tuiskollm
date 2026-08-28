@@ -25,6 +25,10 @@ pub use tuisko_kernels_sm120_attention::{
     selection_block_bucket, selection_round_blocks, selection_round_rows,
 };
 pub use tuisko_kernels_sm120_common::Sm120Arch;
+pub use tuisko_kernels_sm120_engram::{
+    Qwen38FlashNextEngramOp, Qwen38FlashNextEngramSources, Qwen38FlashNextEngramWorkspace,
+    Qwen38FlashNextPleStateSnapshotOp,
+};
 pub use tuisko_kernels_sm120_fp8_mlp::{
     DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps,
 };

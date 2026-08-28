@@ -14,8 +14,9 @@ const BENCHMARK_EXECUTABLE: &str = "target/cuda-oxide-build-sm120/release/bench-
 /// Every PTX module the split SM120 device build emits, in the order that
 /// binds `ptx_sha256`. A receipt covers the whole artifact, so a missing or
 /// reordered module is a different build, not a partial match.
-const PTX_MODULES: [&str; 10] = [
+const PTX_MODULES: [&str; 11] = [
     "target/cuda/tuisko_kernels_sm120_attention.ptx",
+    "target/cuda/tuisko_kernels_sm120_engram.ptx",
     "target/cuda/tuisko_kernels_sm120_fp8_mlp.ptx",
     "target/cuda/tuisko_kernels_sm120_fp8_projection.ptx",
     "target/cuda/tuisko_kernels_sm120_gdn.ptx",

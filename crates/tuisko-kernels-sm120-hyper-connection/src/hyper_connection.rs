@@ -1538,6 +1538,32 @@ impl Qwen38FlashNextHyperConnectionOp {
         dispatch_qwen38_flash_next_hyper_connection!(&self.routes, rows, |route| launch!(route), else => Err(unsupported_rows("hyper-connection input mix", rows)))
     }
 
+    /// Runs the grouped `hc_norm` reused by the PLE module.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer must be four-byte aligned. `input` and `normalized` must
+    /// cover `rows * HC_WIDTH` BF16 values and `weight` `HC_WIDTH` values.
+    /// Allocations must belong to `stream`'s context, remain live through
+    /// stream completion, and must not overlap.
+    pub unsafe fn launch_grouped_norm(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        input: *const u16,
+        weight: *const u16,
+        normalized: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($route:expr) => {
+                // SAFETY: the public method's pointer contract is unchanged by dispatch.
+                unsafe { $route.launch_norm(&self.module, stream, input, weight, normalized) }
+            };
+        }
+
+        dispatch_qwen38_flash_next_hyper_connection!(&self.routes, rows, |route| launch!(route), else => Err(unsupported_rows("hyper-connection grouped norm", rows)))
+    }
+
     /// Runs the model-level mixer without `block_inject_weight`; this is the
     /// target's only final norm.
     ///

@@ -340,6 +340,22 @@ impl Qwen38FlashNext {
     pub const PLE_CONV_KERNEL: usize = 4;
     /// Longest n-gram hashed by the engram table.
     pub const NGRAM_SIZE: usize = 3;
+    /// Tap spacing of the engram short convolution: the n-gram width.
+    pub const PLE_CONV_DILATION: usize = Self::NGRAM_SIZE;
+    /// Columns of engram convolution history one sequence carries.
+    ///
+    /// `(kernel - 1) * dilation`, so the four taps land at `t-9, t-6, t-3, t`.
+    pub const PLE_CONV_STATE_LEN: usize = (Self::PLE_CONV_KERNEL - 1) * Self::PLE_CONV_DILATION;
+    /// Cache states the engram layer owns: GDN conv, PLE conv, then token history.
+    pub const LAYER_CONV_STATES: usize = 3;
+    /// Cache slot holding the engram convolution history.
+    pub const PLE_CONV_STATE_SLOT: usize = 1;
+    /// Cache slot holding the two-token engram hash carry.
+    pub const PLE_TOKEN_HISTORY_SLOT: usize = 2;
+    /// Tokens of hash carry the engram layer keeps: `ngram_size - 1`.
+    pub const PLE_CONTEXT_LEN: usize = Self::NGRAM_SIZE - 1;
+    /// Magnitude floor for the engram gate's signed square root.
+    pub const PLE_GATE_FLOOR: f32 = 1.0e-6;
     /// Independently hashed lookups per n-gram order.
     pub const HEADS_PER_NGRAM: usize = 8;
     /// Engram lookup heads: `HEADS_PER_NGRAM` per hashed n-gram order.
@@ -641,6 +657,12 @@ mod tests {
             ("ple_layer", A::PLE_LAYER, 1),
             ("ple_embed_dim", A::PLE_EMBED_DIM, 2_560),
             ("ple_conv_kernel", A::PLE_CONV_KERNEL, 4),
+            ("ple_conv_dilation", A::PLE_CONV_DILATION, 3),
+            ("ple_conv_state_len", A::PLE_CONV_STATE_LEN, 9),
+            ("layer_conv_states", A::LAYER_CONV_STATES, 3),
+            ("ple_conv_state_slot", A::PLE_CONV_STATE_SLOT, 1),
+            ("ple_token_history_slot", A::PLE_TOKEN_HISTORY_SLOT, 2),
+            ("ple_context_len", A::PLE_CONTEXT_LEN, 2),
             ("ngram_size", A::NGRAM_SIZE, 3),
             ("heads_per_ngram", A::HEADS_PER_NGRAM, 8),
             ("ngram_heads", A::NGRAM_HEADS, 16),
@@ -690,6 +712,26 @@ mod tests {
         assert_eq!(A::MROPE_SECTION, [11, 11, 10]);
         assert_eq!(A::GDN_OUTPUT_GATE, "sigmoid");
         assert_eq!(A::PLE_EMBEDDING_DTYPE, "float8_e4m3fn");
+        assert_eq!(A::PLE_GATE_FLOOR, 1.0e-6);
+    }
+
+    /// The engram convolution shares only its kernel width with the GDN one.
+    ///
+    /// Dilation 3 makes the state nine columns rather than three and moves every
+    /// tap, so a route that reused the GDN convolution here would be wrong.
+    #[test]
+    fn flashnext_engram_convolution_is_dilated_and_gdn_is_not() {
+        type A = Qwen38FlashNext;
+
+        assert_eq!(A::PLE_CONV_KERNEL, A::LINEAR_CONV_KERNEL_DIM);
+        assert_eq!(A::PLE_CONV_DILATION, 3);
+        assert_eq!(A::PLE_CONV_STATE_LEN, 9);
+        assert_ne!(A::PLE_CONV_STATE_LEN, A::LINEAR_CONV_KERNEL_DIM - 1);
+        assert_eq!(A::PLE_CONV_STATE_SLOT, 1);
+        assert_eq!(A::PLE_TOKEN_HISTORY_SLOT, A::PLE_CONV_STATE_SLOT + 1);
+        const {
+            assert!(A::PLE_TOKEN_HISTORY_SLOT < A::LAYER_CONV_STATES);
+        }
     }
 
     #[test]
