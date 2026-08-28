@@ -128,6 +128,16 @@ impl StreamingMappedPrimary for Qwen38FlashNextExpertSource {
     }
 }
 
+/// How a streamed expert round is ordered before its consumer replay.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Qwen38FlashNextStreamingRoute {
+    /// Enqueue the publication wait on the consumer stream.
+    #[default]
+    Overlapped,
+    /// Wait for publication on the host before enqueueing the consumer.
+    Stalling,
+}
+
 /// Per-layer streaming evidence one forward step produced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen38FlashNextLayerStreamTelemetry {
@@ -137,6 +147,9 @@ pub struct Qwen38FlashNextLayerStreamTelemetry {
     misses: usize,
     uploaded_bytes: usize,
     stalled: bool,
+    readback_wait: Duration,
+    residency_wait: Duration,
+    transfer_in_flight: bool,
 }
 
 impl Qwen38FlashNextLayerStreamTelemetry {
@@ -168,6 +181,21 @@ impl Qwen38FlashNextLayerStreamTelemetry {
     /// Whether the round took the stalling `require` route.
     pub const fn stalled(self) -> bool {
         self.stalled
+    }
+
+    /// Host time blocked reading the router's selections.
+    pub const fn readback_wait(self) -> Duration {
+        self.readback_wait
+    }
+
+    /// Host time spent resolving this round's residency.
+    pub const fn residency_wait(self) -> Duration {
+        self.residency_wait
+    }
+
+    /// Whether publication remained in flight after consumer submission.
+    pub const fn transfer_in_flight(self) -> bool {
+        self.transfer_in_flight
     }
 
     /// Fraction of this round's distinct items that were already resident.
@@ -235,6 +263,29 @@ impl Qwen38FlashNextStepTelemetry {
     /// Streaming rounds this step issued: one per MoE layer.
     pub fn streaming_rounds(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Rounds that blocked the host on publication.
+    pub fn stalled_rounds(&self) -> usize {
+        self.layers.iter().filter(|layer| layer.stalled).count()
+    }
+
+    /// Rounds whose publication remained in flight after consumer submission.
+    pub fn overlapped_rounds(&self) -> usize {
+        self.layers
+            .iter()
+            .filter(|layer| layer.transfer_in_flight)
+            .count()
+    }
+
+    /// Host time blocked reading router selections.
+    pub fn expert_readback_wait(&self) -> Duration {
+        self.layers.iter().map(|layer| layer.readback_wait).sum()
+    }
+
+    /// Host time spent resolving expert residency.
+    pub fn expert_residency_wait(&self) -> Duration {
+        self.layers.iter().map(|layer| layer.residency_wait).sum()
     }
 
     /// Token-embedding bytes the host stager uploaded.
@@ -560,6 +611,7 @@ pub struct Qwen38FlashNextResidentModel {
     slots: Qwen38FlashNextSlotPool,
     snapshot_owner: Arc<()>,
     generation: Qwen38FlashNextGenerationTelemetry,
+    streaming_route: Qwen38FlashNextStreamingRoute,
 
     layers: Vec<LayerPointers>,
     workspace: WorkspacePointers,
@@ -747,6 +799,16 @@ impl Qwen38FlashNextResidentModel {
     /// Whole-request streaming and timing evidence accumulated since the last reset.
     pub const fn generation_telemetry(&self) -> Qwen38FlashNextGenerationTelemetry {
         self.generation
+    }
+
+    /// Current expert-publication ordering route.
+    pub const fn streaming_route(&self) -> Qwen38FlashNextStreamingRoute {
+        self.streaming_route
+    }
+
+    /// Selects the expert-publication ordering route.
+    pub const fn set_streaming_route(&mut self, route: Qwen38FlashNextStreamingRoute) {
+        self.streaming_route = route;
     }
 
     /// Starts a fresh request's accounting.
@@ -1339,6 +1401,7 @@ impl Qwen38FlashNextResidentModel {
             slots: Qwen38FlashNextSlotPool::new(layout.physical_pages())?,
             snapshot_owner: Arc::new(()),
             generation: Qwen38FlashNextGenerationTelemetry::default(),
+            streaming_route: Qwen38FlashNextStreamingRoute::default(),
             layers,
             workspace,
             endpoint,
@@ -1888,17 +1951,34 @@ impl Qwen38FlashNextResidentModel {
         self.replay_segment(stream, 0, route, shape)?;
         for layer in 0..<A as Arch>::LAYERS {
             // (1) the round's identity, read off the plane the router just published.
+            let reading = Instant::now();
             let requests = self.read_expert_round(stream, rows, layer)?;
-            // (2) the correctness route: a miss stalls, never skips.
-            let round = self.pool.require(&self.round_items)?;
+            let readback_wait = reading.elapsed();
+            // (2) resolve residency without changing the publication law.
+            let resolving = Instant::now();
+            let round = match self.streaming_route {
+                Qwen38FlashNextStreamingRoute::Overlapped => {
+                    self.pool.prefetch(&self.round_items)?
+                }
+                Qwen38FlashNextStreamingRoute::Stalling => self.pool.require(&self.round_items)?,
+            };
+            let residency_wait = resolving.elapsed();
             // (3) the explicit consumer wait.
             self.pool.fence_replay(stream)?;
             // (4) the only replay that reads this round.
             self.replay_segment(stream, layer + 1, route, shape)?;
             // (5) the reclaim fence the next round resolves against.
             self.pool.record_replay_release(stream)?;
+            let transfer_in_flight = !self.pool.publication_completed()?;
 
-            telemetry.push(layer_telemetry(layer, requests, round));
+            telemetry.push(layer_telemetry(
+                layer,
+                requests,
+                round,
+                readback_wait,
+                residency_wait,
+                transfer_in_flight,
+            ));
         }
         stream.synchronize().map_err(GpuError::from)?;
 
@@ -2694,6 +2774,9 @@ pub(crate) fn layer_telemetry(
     layer: usize,
     requests: usize,
     round: StreamingRound,
+    readback_wait: Duration,
+    residency_wait: Duration,
+    transfer_in_flight: bool,
 ) -> Qwen38FlashNextLayerStreamTelemetry {
     Qwen38FlashNextLayerStreamTelemetry {
         layer,
@@ -2702,6 +2785,9 @@ pub(crate) fn layer_telemetry(
         misses: round.misses(),
         uploaded_bytes: round.uploaded_bytes(),
         stalled: round.stalled(),
+        readback_wait,
+        residency_wait,
+        transfer_in_flight,
     }
 }
 

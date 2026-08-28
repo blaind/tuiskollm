@@ -172,7 +172,7 @@ pub use qwen38_flash_next::qsa_moe_layer_layout::Qwen38FlashNextQsaMoeLayerLayou
 pub use qwen38_flash_next::resident_model::{
     Qwen38FlashNextLayerStreamTelemetry, Qwen38FlashNextResidentLoadStats,
     Qwen38FlashNextResidentModel, Qwen38FlashNextSlotSnapshot, Qwen38FlashNextStepTelemetry,
-    qwen38_flash_next_rope,
+    Qwen38FlashNextStreamingRoute, qwen38_flash_next_rope,
 };
 pub use qwen38_flash_next::resident_model_layout::{
     QWEN38_FLASH_NEXT_ATTENTION_LAYERS, QWEN38_FLASH_NEXT_DEVICE_BUDGET_BYTES,
