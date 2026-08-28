@@ -55,10 +55,38 @@ fn mismatch(message: impl Into<String>) -> Qwen38FlashNextResidentModelQualifica
     Qwen38FlashNextResidentModelQualificationError::Mismatch(message.into())
 }
 
-/// One measured route's diagnostic timing and the telemetry that explains it.
+/// Measurement case used by the resident-model diagnostic sweep.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Qwen38FlashNextMeasurementCase {
+    /// Decode while positions advance across samples.
+    DecodeSweep,
+    /// One-row decode reset before every sample.
+    DecodeControl,
+    /// Causal verification reset before every sample.
+    Causal,
+    /// Prefill reset before every sample.
+    Prefill,
+}
+
+impl Qwen38FlashNextMeasurementCase {
+    /// Stable report label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DecodeSweep => "decode-sweep",
+            Self::DecodeControl => "decode-control",
+            Self::Causal => "causal",
+            Self::Prefill => "prefill",
+        }
+    }
+}
+
+/// One diagnostic timing and the telemetry that explains it.
 #[derive(Clone, Debug)]
 pub struct Qwen38FlashNextRouteMeasurement {
-    /// Rows the route carried: `B` for decode, `T` for a prefill tile.
+    /// Route and harness being measured.
+    pub case: Qwen38FlashNextMeasurementCase,
+    /// Rows carried: `B` for decode, `K` for causal, or `T` for prefill.
     pub rows: usize,
     /// Median forward wall time across the measured steps.
     pub median: Duration,
@@ -119,7 +147,7 @@ pub struct Qwen38FlashNextResidentModelQualification {
     pub cache_state_compared_logits: usize,
     /// Largest finite absolute logit the stack produced.
     pub peak_absolute_logit: f32,
-    /// Measured routes, decode first then prefill.
+    /// Measured cases in execution order.
     pub measurements: Vec<Qwen38FlashNextRouteMeasurement>,
     /// Agreement between a causal span and the same sequential decode.
     pub causal_span: Qwen38FlashNextCausalSpanEvidence,
@@ -207,6 +235,17 @@ pub fn qualify_qwen38_flash_next_resident_model(
     let free_after_warmup = free_device_bytes(&context)?;
     for batch in [1usize, MAX_BATCH] {
         let measurement = measure_decode(&mut model, &stream, batch)?;
+        print_measurement(&measurement);
+        measurements.push(measurement);
+    }
+
+    model.reset_state(&stream)?;
+    reserve_probe_slots(&mut model, &stream)?;
+    let measurement = measure_decode_control(&mut model, &stream)?;
+    print_measurement(&measurement);
+    measurements.push(measurement);
+    for rows in [1usize, 4] {
+        let measurement = measure_causal(&mut model, &stream, rows)?;
         print_measurement(&measurement);
         measurements.push(measurement);
     }
@@ -574,7 +613,64 @@ fn measure_decode(
         samples.push(model.decode_step(stream, &tokens, &positions, &slots)?);
     }
 
-    Ok(summarize(batch, &samples))
+    Ok(summarize(
+        Qwen38FlashNextMeasurementCase::DecodeSweep,
+        batch,
+        &samples,
+    ))
+}
+
+/// Times one-row decode under the causal span's reset-per-sample harness.
+fn measure_decode_control(
+    model: &mut Qwen38FlashNextResidentModel,
+    stream: &tuisko_gpu::CudaStream,
+) -> QualResult<Qwen38FlashNextRouteMeasurement> {
+    let token = [4_096u32];
+
+    for _ in 0..WARM_PASSES {
+        model.reset_slot(stream, 0)?;
+        model.decode_step(stream, &token, &[0], &[0])?;
+    }
+
+    let mut samples = Vec::with_capacity(MEASURED_STEPS);
+    for _ in 0..MEASURED_STEPS {
+        model.reset_slot(stream, 0)?;
+        samples.push(model.decode_step(stream, &token, &[0], &[0])?);
+    }
+
+    Ok(summarize(
+        Qwen38FlashNextMeasurementCase::DecodeControl,
+        1,
+        &samples,
+    ))
+}
+
+/// Times a causal verification span under the same reset-per-sample harness.
+fn measure_causal(
+    model: &mut Qwen38FlashNextResidentModel,
+    stream: &tuisko_gpu::CudaStream,
+    rows: usize,
+) -> QualResult<Qwen38FlashNextRouteMeasurement> {
+    let span = (0..rows)
+        .map(|row| (4_096 + row * 131) as u32)
+        .collect::<Vec<_>>();
+
+    for _ in 0..WARM_PASSES {
+        model.reset_slot(stream, 0)?;
+        model.verify_step(stream, &span, 0, 0)?;
+    }
+
+    let mut samples = Vec::with_capacity(MEASURED_STEPS);
+    for _ in 0..MEASURED_STEPS {
+        model.reset_slot(stream, 0)?;
+        samples.push(model.verify_step(stream, &span, 0, 0)?);
+    }
+
+    Ok(summarize(
+        Qwen38FlashNextMeasurementCase::Causal,
+        rows,
+        &samples,
+    ))
 }
 
 fn measure_prefill(
@@ -598,10 +694,15 @@ fn measure_prefill(
         samples.push(model.prefill_tile(stream, &prompt, 0, 0)?);
     }
 
-    Ok(summarize(tokens, &samples))
+    Ok(summarize(
+        Qwen38FlashNextMeasurementCase::Prefill,
+        tokens,
+        &samples,
+    ))
 }
 
 fn summarize(
+    case: Qwen38FlashNextMeasurementCase,
     rows: usize,
     samples: &[Qwen38FlashNextStepTelemetry],
 ) -> Qwen38FlashNextRouteMeasurement {
@@ -617,6 +718,7 @@ fn summarize(
         .expect("a measured route has at least one step");
 
     Qwen38FlashNextRouteMeasurement {
+        case,
         rows,
         median,
         fastest,
@@ -694,10 +796,14 @@ pub fn print_qwen38_flash_next_resident_model_report(
     }
 }
 
-/// Prints one measured route, used both live and in the summary.
+/// Prints one measured case, used both live and in the summary.
 pub fn print_measurement(measurement: &Qwen38FlashNextRouteMeasurement) {
     {
-        println!("  route rows={}", measurement.rows);
+        println!(
+            "  route case={} rows={}",
+            measurement.case.as_str(),
+            measurement.rows
+        );
         println!("    median forward           {:?}", measurement.median);
         println!("    fastest forward          {:?}", measurement.fastest);
         println!(
@@ -796,7 +902,22 @@ mod tests {
         assert!(report.peak_absolute_logit > 0.0);
         assert_eq!(report.host_pinned_bytes, 7_585_611_776);
         assert_eq!(report.host_mapped_bytes, 112_869_621_760);
-        assert!(report.measurements.len() >= 3);
+        assert_eq!(
+            report
+                .measurements
+                .iter()
+                .map(|measurement| (measurement.case, measurement.rows))
+                .collect::<Vec<_>>(),
+            [
+                (Qwen38FlashNextMeasurementCase::DecodeSweep, 1),
+                (Qwen38FlashNextMeasurementCase::DecodeSweep, MAX_BATCH),
+                (Qwen38FlashNextMeasurementCase::DecodeControl, 1),
+                (Qwen38FlashNextMeasurementCase::Causal, 1),
+                (Qwen38FlashNextMeasurementCase::Causal, 4),
+                (Qwen38FlashNextMeasurementCase::Prefill, 32),
+                (Qwen38FlashNextMeasurementCase::Prefill, 64),
+            ]
+        );
         assert!(
             report
                 .measurements
