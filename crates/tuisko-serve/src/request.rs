@@ -345,7 +345,6 @@ fn validate_tools(tools: &[FunctionTool]) -> Result<(), ChatRequestError> {
 
 fn validate_messages(messages: &[ChatMessage]) -> Result<(), ChatRequestError> {
     let mut content_started = false;
-    let mut seen_tool_calls = HashSet::new();
     let mut pending_tool_calls = HashSet::new();
     for (index, message) in messages.iter().enumerate() {
         let role = message.role.as_str();
@@ -405,12 +404,11 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), ChatRequestError> {
                             "message {index} has a tool call without an id"
                         ))
                     })?;
-                if !seen_tool_calls.insert(id) {
+                if !pending_tool_calls.insert(id) {
                     return Err(ChatRequestError::Invalid(format!(
-                        "message {index} repeats tool-call id `{id}`"
+                        "message {index} repeats pending tool-call id `{id}`"
                     )));
                 }
-                pending_tool_calls.insert(id);
             }
         } else if !message.tool_calls.is_empty() {
             return Err(ChatRequestError::Invalid(format!(
@@ -747,6 +745,10 @@ mod tests {
                 "tool-call type",
             ),
             (
+                r#"[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"x","arguments":{}}},{"id":"call_1","type":"function","function":{"name":"y","arguments":{}}}]}]"#,
+                "repeats pending tool-call id",
+            ),
+            (
                 r#"[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"x","arguments":{}}}]},{"role":"tool","tool_call_id":"other","content":"x"}]"#,
                 "unknown or duplicate",
             ),
@@ -764,6 +766,31 @@ mod tests {
             .expect_err("invalid message sequence must fail before enqueue");
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn completed_tool_turns_may_reuse_opaque_ids() {
+        let request = request(&format!(
+            r#"{{
+                "model":"{SERVED_MODEL}",
+                "messages":[
+                    {{"role":"user","content":"inspect"}},
+                    {{"role":"assistant","content":null,"tool_calls":[{{
+                        "id":"call_restarted_17","type":"function",
+                        "function":{{"name":"inspect","arguments":"{{}}"}}
+                    }}]}},
+                    {{"role":"tool","tool_call_id":"call_restarted_17","content":"ok"}},
+                    {{"role":"assistant","content":null,"tool_calls":[{{
+                        "id":"call_restarted_17","type":"function",
+                        "function":{{"name":"inspect_again","arguments":"{{}}"}}
+                    }}]}},
+                    {{"role":"tool","tool_call_id":"call_restarted_17","content":"still ok"}},
+                    {{"role":"user","content":"continue"}}
+                ]
+            }}"#
+        ));
+
+        request.prepare(1).unwrap();
     }
 
     #[test]
