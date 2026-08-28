@@ -841,7 +841,8 @@ mod tests {
                         || name.contains("_projection"))
             })
             .count();
-        assert_eq!(projections, 36);
+        // Decoder routes plus the MTP fusion's five-entry schedule.
+        assert_eq!(projections, 36 + 5);
 
         for base in [
             "qwen38_flash_next_gdn_input_projection",

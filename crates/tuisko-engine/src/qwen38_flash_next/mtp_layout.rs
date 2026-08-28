@@ -11,8 +11,10 @@ use crate::qwen38_flash_next::layer_upload::{HyperConnectionRegions, MoeRegions}
 use crate::qwen38_flash_next::persistent_state::ALIGNMENT;
 use crate::qwen38_flash_next::qsa_moe_layer_layout::QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE;
 use crate::qwen38_flash_next::resident_model_layout::{
-    QWEN38_FLASH_NEXT_PRIMARY_SOURCE, QWEN38_FLASH_NEXT_RESIDENT_MAX_ROWS,
-    Qwen38FlashNextQsaWeightRegions,
+    QWEN38_FLASH_NEXT_DEVICE_BUDGET_BYTES, QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES,
+    QWEN38_FLASH_NEXT_PRIMARY_SOURCE, QWEN38_FLASH_NEXT_REQUIRED_HEADROOM_BYTES,
+    QWEN38_FLASH_NEXT_RESIDENT_MAX_ROWS, Qwen38FlashNextQsaWeightRegions,
+    Qwen38FlashNextResidentLayout,
 };
 use crate::{EngineError, EngineResult, MAX_BATCH, StreamingResidencyAccounting};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
@@ -32,6 +34,9 @@ pub const QWEN38_FLASH_NEXT_MTP_EXPERT_EXTENT_BYTES: usize =
 
 /// Device slots the draft pool funds: the same 25 % posture the main pool runs at.
 pub const QWEN38_FLASH_NEXT_MTP_EXPERT_RESIDENT_SLOTS: usize = 128;
+
+/// Target expert slots funded when MTP is present.
+pub const QWEN38_FLASH_NEXT_MTP_TARGET_RESIDENT_SLOTS: usize = 5_578;
 
 /// One mapped-primary bounce extent per decode row.
 const QWEN38_FLASH_NEXT_MTP_BOUNCE_RING_SLOTS: usize = MAX_BATCH;
@@ -261,6 +266,112 @@ impl Qwen38FlashNextMtpLayout {
     pub(crate) const fn kv_planes(&self) -> Qwen38FlashNextMtpKvPlanes {
         self.kv_planes
     }
+}
+
+/// Joint target and MTP memory plan.
+#[derive(Clone, Debug)]
+pub struct Qwen38FlashNextMtpResidency {
+    target: Qwen38FlashNextResidentLayout,
+    draft: Qwen38FlashNextMtpLayout,
+}
+
+impl Qwen38FlashNextMtpResidency {
+    /// Solves the pair at the admitted expert-slot budgets.
+    pub fn build() -> EngineResult<Self> {
+        Self::plan(
+            QWEN38_FLASH_NEXT_MTP_TARGET_RESIDENT_SLOTS,
+            QWEN38_FLASH_NEXT_MTP_EXPERT_RESIDENT_SLOTS,
+        )
+    }
+
+    /// Solves the pair at explicit target and MTP slot budgets.
+    pub fn plan(target_slots: usize, draft_slots: usize) -> EngineResult<Self> {
+        let mut low = MAX_BATCH;
+        let mut high = QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES;
+        if !joint_plan_fits(target_slots, draft_slots, low)? {
+            return Err(EngineError::layout(format!(
+                "Qwen3.8 Flash-Next MTP at {draft_slots} slots leaves fewer than {MAX_BATCH} KV \
+                 pages at {target_slots} target slots"
+            )));
+        }
+
+        while low < high {
+            let probe = low + (high - low).div_ceil(2);
+            if joint_plan_fits(target_slots, draft_slots, probe)? {
+                low = probe;
+            } else {
+                high = probe - 1;
+            }
+        }
+
+        Ok(Self {
+            target: Qwen38FlashNextResidentLayout::plan(
+                target_slots,
+                QWEN38_FLASH_NEXT_PRIMARY_SOURCE,
+                Some(low),
+            )?,
+            draft: Qwen38FlashNextMtpLayout::plan(draft_slots, low)?,
+        })
+    }
+
+    /// Target plan under the joint solve.
+    pub const fn target(&self) -> &Qwen38FlashNextResidentLayout {
+        &self.target
+    }
+
+    /// MTP plan under the joint solve.
+    pub const fn draft(&self) -> &Qwen38FlashNextMtpLayout {
+        &self.draft
+    }
+
+    /// Physical pages shared by the target and MTP cache mirrors.
+    pub const fn physical_pages(&self) -> usize {
+        self.target.physical_pages()
+    }
+
+    /// Total device bytes occupied by both plans.
+    pub fn total_device_bytes(&self) -> EngineResult<usize> {
+        sum(
+            "Qwen3.8 Flash-Next MTP residency",
+            &[
+                target_fixed_bytes(&self.target)?,
+                self.target.kv_arena_bytes(),
+                self.draft.total_device_bytes()?,
+            ],
+        )
+    }
+}
+
+fn target_fixed_bytes(target: &Qwen38FlashNextResidentLayout) -> EngineResult<usize> {
+    sum(
+        "Qwen3.8 Flash-Next target fixed bytes",
+        &[
+            target.resident_arena_bytes(),
+            target.streaming().device_resident_bytes(),
+            target.engram().device_resident_bytes(),
+        ],
+    )
+}
+
+fn joint_plan_fits(target_slots: usize, draft_slots: usize, pages: usize) -> EngineResult<bool> {
+    let target = Qwen38FlashNextResidentLayout::plan(
+        target_slots,
+        QWEN38_FLASH_NEXT_PRIMARY_SOURCE,
+        Some(pages),
+    )?;
+    let draft = Qwen38FlashNextMtpLayout::plan(draft_slots, pages)?;
+    let total = sum(
+        "Qwen3.8 Flash-Next MTP residency probe",
+        &[
+            target_fixed_bytes(&target)?,
+            target.kv_arena_bytes(),
+            draft.total_device_bytes()?,
+        ],
+    )?;
+
+    Ok(total
+        .checked_add(QWEN38_FLASH_NEXT_REQUIRED_HEADROOM_BYTES)
+        .is_some_and(|required| required <= QWEN38_FLASH_NEXT_DEVICE_BUDGET_BYTES))
 }
 
 fn reserve_fusion(builder: &mut ArenaLayout) -> EngineResult<Qwen38FlashNextMtpFusionRegions> {
@@ -646,6 +757,45 @@ mod tests {
         );
 
         assert_eq!(wide.resident_arena_bytes(), narrow.resident_arena_bytes());
+    }
+
+    #[test]
+    fn the_joint_solve_prices_target_slots_and_shared_pages() {
+        let target = Qwen38FlashNextResidentLayout::build().unwrap();
+        let joint = Qwen38FlashNextMtpResidency::build().unwrap();
+
+        assert_eq!(target.streaming().slot_count(), 6_144);
+        assert_eq!(joint.target().streaming().slot_count(), 5_578);
+        assert_eq!(joint.draft().streaming().slot_count(), 128);
+        assert_eq!(target.physical_pages(), 3_672);
+        assert_eq!(joint.physical_pages(), 3_303);
+        assert_eq!(
+            joint.physical_pages() * QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE,
+            211_392
+        );
+        assert_eq!(joint.draft().total_device_bytes().unwrap(), 1_927_438_336);
+
+        let total = joint.total_device_bytes().unwrap();
+        let spendable =
+            QWEN38_FLASH_NEXT_DEVICE_BUDGET_BYTES - QWEN38_FLASH_NEXT_REQUIRED_HEADROOM_BYTES;
+        assert!(total <= spendable);
+        assert!(
+            !joint_plan_fits(
+                QWEN38_FLASH_NEXT_MTP_TARGET_RESIDENT_SLOTS,
+                QWEN38_FLASH_NEXT_MTP_EXPERT_RESIDENT_SLOTS,
+                joint.physical_pages() + 1,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn the_joint_solve_refuses_an_unfunded_draft_pool() {
+        let error =
+            Qwen38FlashNextMtpResidency::plan(6_144, QWEN38_FLASH_NEXT_MTP_EXPERT_ITEM_COUNT)
+                .expect_err("a fully resident MTP pool cannot fit beside the target");
+
+        assert!(format!("{error}").contains("KV pages"), "{error}");
     }
 
     #[test]

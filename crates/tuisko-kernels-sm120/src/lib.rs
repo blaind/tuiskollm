@@ -68,5 +68,5 @@ pub use tuisko_kernels_sm120_nvfp4::{
 };
 pub use tuisko_kernels_sm120_qwen38_flash_next_projection::{
     Qwen38FlashNextBlockOutputProjectionOp, Qwen38FlashNextGdnInputProjectionOp,
-    Qwen38FlashNextQsaQkvProjectionOp,
+    Qwen38FlashNextMtpFusionProjectionOp, Qwen38FlashNextQsaQkvProjectionOp,
 };
