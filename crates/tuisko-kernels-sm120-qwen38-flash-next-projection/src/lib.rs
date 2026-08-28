@@ -10,7 +10,7 @@ mod backbone;
 
 pub use backbone::{
     Qwen38FlashNextBlockOutputProjectionOp, Qwen38FlashNextGdnInputProjectionOp,
-    Qwen38FlashNextQsaQkvProjectionOp,
+    Qwen38FlashNextMtpFusionProjectionOp, Qwen38FlashNextQsaQkvProjectionOp,
 };
 
 /// Semantic inventory of every entry this family emits.
@@ -19,6 +19,7 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .into_iter()
         .chain(backbone::qwen38_flash_next_qsa_qkv_projection_ptx_names())
         .chain(backbone::qwen38_flash_next_block_output_projection_ptx_names())
+        .chain(backbone::qwen38_flash_next_mtp_fusion_projection_ptx_names())
         .collect()
 }
 
@@ -57,10 +58,12 @@ mod tests {
                 ("qwen38_flash_next_block_output_projection_prefill", 4),
                 ("qwen38_flash_next_gdn_input_projection", 8),
                 ("qwen38_flash_next_gdn_input_projection_prefill", 4),
+                ("qwen38_flash_next_mtp_fusion_projection", 1),
+                ("qwen38_flash_next_mtp_fusion_projection_prefill", 4),
                 ("qwen38_flash_next_qsa_qkv_projection", 8),
                 ("qwen38_flash_next_qsa_qkv_projection_prefill", 4),
             ]
         );
-        assert_eq!(counts.values().sum::<usize>(), 36);
+        assert_eq!(counts.values().sum::<usize>(), 41);
     }
 }

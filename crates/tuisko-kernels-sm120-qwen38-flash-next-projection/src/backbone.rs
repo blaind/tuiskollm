@@ -55,6 +55,8 @@ const NARROW_THREADS: u32 = (NARROW_WARPS * 32) as u32;
 const GDN_INPUT_BLOCKS: u32 = (GDN_INPUT_ROWS / ROWS_PER_TILE / WIDE_WARPS) as u32;
 const QSA_QKV_BLOCKS: u32 = (QSA_QKV_ROWS / ROWS_PER_TILE / WIDE_WARPS) as u32;
 const BLOCK_OUTPUT_BLOCKS: u32 = (HIDDEN / ROWS_PER_TILE / NARROW_WARPS) as u32;
+const MTP_FUSION_DECODE_ROWS: usize = Qwen38FlashNext::HC_COUNT;
+const MTP_FUSION_BLOCKS: u32 = (HIDDEN / ROWS_PER_TILE / WIDE_WARPS) as u32;
 
 const _: () = assert!(HIDDEN == 2_560);
 const _: () = assert!(GDN_INPUT_ROWS == 16_384);
@@ -67,6 +69,9 @@ const _: () = assert!(GDN_VALUE_ROWS == ATTENTION_OUTPUT_COLUMNS);
 const _: () = assert!(tiles_exactly(HIDDEN, GDN_INPUT_ROWS, WIDE_WARPS));
 const _: () = assert!(tiles_exactly(HIDDEN, QSA_QKV_ROWS, WIDE_WARPS));
 const _: () = assert!(tiles_exactly(BLOCK_COLUMNS, HIDDEN, NARROW_WARPS));
+const _: () = assert!(MTP_FUSION_DECODE_ROWS == 4);
+const _: () = assert!(tiles_exactly(HIDDEN, HIDDEN, WIDE_WARPS));
+const _: () = assert!(MTP_FUSION_BLOCKS == 40);
 
 #[cuda_module]
 mod kernels {
@@ -207,6 +212,44 @@ mod kernels {
             bf16_projection_prefill::<BLOCK_COLUMNS, HIDDEN, NARROW_WARPS, TOKENS>(
                 input, weight, output,
             )
+        }
+    }
+
+    /// Projects the MTP branch rows through one square BF16 plane.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen38_flash_next_mtp_fusion_projection<const ROWS: usize>(
+        input: *const u32,
+        weight: *const u32,
+        output: *mut u32,
+    ) {
+        unsafe { bf16_projection_decode::<HIDDEN, HIDDEN, WIDE_WARPS, ROWS>(input, weight, output) }
+    }
+
+    /// Projects one MTP prompt tile's branch rows.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen38_flash_next_mtp_fusion_projection_prefill<const ROWS: usize>(
+        input: *const u32,
+        weight: *const u32,
+        output: *mut u32,
+    ) {
+        unsafe {
+            bf16_projection_prefill::<HIDDEN, HIDDEN, WIDE_WARPS, ROWS>(input, weight, output)
         }
     }
 }
@@ -575,6 +618,88 @@ impl<const TOKENS: usize> ProjectionRoute for PreparedBlockOutputPrefillRoute<TO
     }
 }
 
+struct PreparedMtpFusionDecodeRoute<const ROWS: usize> {
+    projection: PreparedLaunch<kernels::__qwen38_flash_next_mtp_fusion_projection_CudaKernel<ROWS>>,
+}
+
+struct PreparedMtpFusionPrefillRoute<const ROWS: usize> {
+    projection:
+        PreparedLaunch<kernels::__qwen38_flash_next_mtp_fusion_projection_prefill_CudaKernel<ROWS>>,
+}
+
+impl<const ROWS: usize> PreparedMtpFusionDecodeRoute<ROWS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        Ok(Self {
+            projection: module
+                .prepare_qwen38_flash_next_mtp_fusion_projection::<ROWS>(LaunchConfig1D::new(
+                    MTP_FUSION_BLOCKS,
+                    WIDE_THREADS,
+                    0,
+                ))
+                .map_err(|source| {
+                    GpuError::launch("preparing the Qwen3.8 Flash-Next MTP fusion", source)
+                })?,
+        })
+    }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_mtp_fusion_projection::<ROWS>(
+                stream,
+                &self.projection,
+                input.cast::<u32>(),
+                weight.cast::<u32>(),
+                output.cast::<u32>(),
+            )
+            .map_err(|source| {
+                GpuError::launch("launching the Qwen3.8 Flash-Next MTP fusion", source)
+            })
+    }
+}
+
+impl<const ROWS: usize> PreparedMtpFusionPrefillRoute<ROWS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        let blocks = prefill_blocks(MTP_FUSION_BLOCKS, ROWS, "Qwen3.8 Flash-Next MTP fusion")?;
+        Ok(Self {
+            projection: module
+                .prepare_qwen38_flash_next_mtp_fusion_projection_prefill::<ROWS>(
+                    LaunchConfig1D::new(blocks, WIDE_THREADS, 0),
+                )
+                .map_err(|source| {
+                    GpuError::launch("preparing the Qwen3.8 Flash-Next MTP prompt fusion", source)
+                })?,
+        })
+    }
+
+    unsafe fn launch(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        input: *const u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_mtp_fusion_projection_prefill::<ROWS>(
+                stream,
+                &self.projection,
+                input.cast::<u32>(),
+                weight.cast::<u32>(),
+                output.cast::<u32>(),
+            )
+            .map_err(|source| {
+                GpuError::launch("launching the Qwen3.8 Flash-Next MTP prompt fusion", source)
+            })
+    }
+}
+
 /// Grid of one prompt tile: the shape's output blocks once per sixteen tokens.
 fn prefill_blocks(output_blocks: u32, tokens: usize, label: &str) -> GpuResult<u32> {
     let token_tiles = tokens / TOKENS_PER_TILE;
@@ -733,6 +858,90 @@ pub(crate) fn qwen38_flash_next_block_output_projection_ptx_names() -> Vec<&'sta
     ]
 }
 
+/// Stable PTX symbol inventory of every MTP input-fusion route.
+pub(crate) fn qwen38_flash_next_mtp_fusion_projection_ptx_names() -> Vec<&'static str> {
+    vec![
+        kernels::qwen38_flash_next_mtp_fusion_projection_ptx_name::<MTP_FUSION_DECODE_ROWS>(),
+        kernels::qwen38_flash_next_mtp_fusion_projection_prefill_ptx_name::<128>(),
+        kernels::qwen38_flash_next_mtp_fusion_projection_prefill_ptx_name::<256>(),
+        kernels::qwen38_flash_next_mtp_fusion_projection_prefill_ptx_name::<512>(),
+        kernels::qwen38_flash_next_mtp_fusion_projection_prefill_ptx_name::<4_096>(),
+    ]
+}
+
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen38_flash_next_mtp_fusion),
+    required(1, 32, 64, 128, 1024),
+    inventory(false)
+)]
+struct Qwen38FlashNextMtpFusionRoutes {
+    #[route(1)]
+    decode: PreparedMtpFusionDecodeRoute<MTP_FUSION_DECODE_ROWS>,
+    #[route(32)]
+    t32: PreparedMtpFusionPrefillRoute<128>,
+    #[route(64)]
+    t64: PreparedMtpFusionPrefillRoute<256>,
+    #[route(128)]
+    t128: PreparedMtpFusionPrefillRoute<512>,
+    #[route(1024)]
+    t1024: PreparedMtpFusionPrefillRoute<4_096>,
+}
+
+/// Prepared square projections for the MTP input fusion.
+pub struct Qwen38FlashNextMtpFusionProjectionOp {
+    module: kernels::LoadedModule,
+    routes: Qwen38FlashNextMtpFusionRoutes,
+}
+
+impl Qwen38FlashNextMtpFusionProjectionOp {
+    /// Loads the module and prepares every admitted MTP route.
+    pub fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+        if !tiles_exactly(HIDDEN, HIDDEN, WIDE_WARPS) {
+            return Err(GpuError::invalid_launch(
+                "Qwen3.8 Flash-Next MTP fusion does not tile the exact BF16 MMA shape",
+            ));
+        }
+        let _ = qwen38_flash_next_mtp_fusion_projection_ptx_names();
+        // SAFETY: this crate owns the embedded projection artifact.
+        let module = unsafe { kernels::load(context) }
+            .map_err(|source| GpuError::module("loading Qwen3.8 Flash-Next MTP fusion", source))?;
+        let routes = Qwen38FlashNextMtpFusionRoutes::prepare(&module)?;
+
+        Ok(Self { module, routes })
+    }
+
+    /// Projects each draft row's four branch rows.
+    ///
+    /// # Safety
+    ///
+    /// `input` and `output` cover `rows * HC_WIDTH` BF16 values. `weight`
+    /// covers one `[HIDDEN, HIDDEN]` BF16 plane. Pointers are aligned,
+    /// non-overlapping, context-local, and live through stream completion.
+    pub unsafe fn launch(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        input: *const u16,
+        weight: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        macro_rules! launch {
+            ($route:expr) => {
+                unsafe { $route.launch(&self.module, stream, input, weight, output) }
+            };
+        }
+
+        dispatch_qwen38_flash_next_mtp_fusion!(&self.routes, rows, |route| launch!(route), else => Err(
+            GpuError::invalid_launch(format!(
+                "Qwen3.8 Flash-Next MTP fusion rows {rows} are outside 1 or T={PREFILL_ROUTES:?}"
+            ))
+        ))
+    }
+}
+
 #[derive(ExactRoutes)]
 #[exact_routes(
     module(kernels::LoadedModule),
@@ -843,11 +1052,13 @@ impl<E: ProjectionEntries> Qwen38FlashNextProjectionOp<E> {
 mod tests {
     use super::{
         BLOCK_COLUMNS, BLOCK_OUTPUT_BLOCKS, GDN_INPUT_BLOCKS, GDN_INPUT_ROWS, HIDDEN, MAX_BATCH,
-        NARROW_THREADS, NARROW_WARPS, PREFILL_ROUTES, ProjectionEntries, QSA_QKV_BLOCKS,
-        QSA_QKV_ROWS, Qwen38FlashNextBlockOutputEntries, Qwen38FlashNextGdnInputEntries,
+        MTP_FUSION_BLOCKS, MTP_FUSION_DECODE_ROWS, NARROW_THREADS, NARROW_WARPS, PREFILL_ROUTES,
+        ProjectionEntries, QSA_QKV_BLOCKS, QSA_QKV_ROWS, Qwen38FlashNextBlockOutputEntries,
+        Qwen38FlashNextGdnInputEntries, Qwen38FlashNextMtpFusionRoutes,
         Qwen38FlashNextProjectionRoutes, Qwen38FlashNextQsaQkvEntries, WIDE_THREADS, WIDE_WARPS,
         prefill_blocks, qwen38_flash_next_block_output_projection_ptx_names,
         qwen38_flash_next_gdn_input_projection_ptx_names,
+        qwen38_flash_next_mtp_fusion_projection_ptx_names,
         qwen38_flash_next_qsa_qkv_projection_ptx_names, unsupported_rows,
     };
     use std::collections::BTreeSet;
@@ -873,6 +1084,8 @@ mod tests {
         assert_eq!(GDN_INPUT_BLOCKS, 256);
         assert_eq!(QSA_QKV_BLOCKS, 208);
         assert_eq!(BLOCK_OUTPUT_BLOCKS, 80);
+        assert_eq!(MTP_FUSION_DECODE_ROWS, 4);
+        assert_eq!(MTP_FUSION_BLOCKS, 40);
         assert_eq!(WIDE_THREADS, 256);
         assert_eq!(NARROW_THREADS, 128);
         assert_eq!(
@@ -904,6 +1117,12 @@ mod tests {
                 );
             }
         }
+        for rows in PREFILL_ROUTES.map(|rows| rows * MTP_FUSION_DECODE_ROWS) {
+            assert_eq!(
+                prefill_blocks(MTP_FUSION_BLOCKS, rows, "mtp fusion").unwrap(),
+                MTP_FUSION_BLOCKS * (rows / 16) as u32
+            );
+        }
     }
 
     /// Each table publishes exactly the twelve names retaining its own
@@ -933,17 +1152,32 @@ mod tests {
         }
     }
 
-    /// The three inventories are disjoint: no shape names another's entry.
+    /// The four inventories are disjoint: no shape names another's entry.
     #[test]
-    fn the_three_shapes_share_no_entry() {
+    fn the_four_shapes_share_no_entry() {
         let names = qwen38_flash_next_gdn_input_projection_ptx_names()
             .into_iter()
             .chain(qwen38_flash_next_qsa_qkv_projection_ptx_names())
             .chain(qwen38_flash_next_block_output_projection_ptx_names())
+            .chain(qwen38_flash_next_mtp_fusion_projection_ptx_names())
             .collect::<Vec<_>>();
 
-        assert_eq!(names.len(), 36);
-        assert_eq!(names.iter().copied().collect::<BTreeSet<_>>().len(), 36);
+        assert_eq!(names.len(), 41);
+        assert_eq!(names.iter().copied().collect::<BTreeSet<_>>().len(), 41);
+    }
+
+    #[test]
+    fn mtp_fusion_admits_only_its_five_draft_routes() {
+        assert_eq!(
+            Qwen38FlashNextMtpFusionRoutes::admitted_rows(),
+            [1, 32, 64, 128, 1_024]
+        );
+        for rows in 0..=1_024 {
+            assert_eq!(
+                Qwen38FlashNextMtpFusionRoutes::contains(rows),
+                [1, 32, 64, 128, 1_024].contains(&rows)
+            );
+        }
     }
 
     #[test]

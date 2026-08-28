@@ -9435,6 +9435,7 @@ fn gate_qwen38_flash_next_projections(root: &Path) -> Result<(), Box<dyn Error>>
             named("qwen38_flash_next_gdn_input_projection_prefill_TID_"),
             "gdn_input",
             256,
+            8,
         ),
         (
             "QSA QKV",
@@ -9442,6 +9443,7 @@ fn gate_qwen38_flash_next_projections(root: &Path) -> Result<(), Box<dyn Error>>
             named("qwen38_flash_next_qsa_qkv_projection_prefill_TID_"),
             "qsa_qkv",
             256,
+            8,
         ),
         (
             "block output",
@@ -9449,17 +9451,26 @@ fn gate_qwen38_flash_next_projections(root: &Path) -> Result<(), Box<dyn Error>>
             named("qwen38_flash_next_block_output_projection_prefill_TID_"),
             "block_output",
             128,
+            8,
+        ),
+        (
+            "MTP fusion",
+            named("qwen38_flash_next_mtp_fusion_projection_TID_"),
+            named("qwen38_flash_next_mtp_fusion_projection_prefill_TID_"),
+            "mtp_fusion",
+            256,
+            1,
         ),
     ];
 
     let artifact = sm120_gate_artifact(root)?;
     let resources = &artifact.resources;
     let sass = artifact.sass()?;
-    for (label, decode, prefill, key, threads) in &shapes {
+    for (label, decode, prefill, key, threads, decode_entries) in &shapes {
         require_count(
             &format!("Qwen3.8-Flash-Next {label} projection decode"),
             decode.len(),
-            8,
+            *decode_entries,
         )?;
         require_count(
             &format!("Qwen3.8-Flash-Next {label} projection prefill"),
@@ -9519,7 +9530,7 @@ fn gate_qwen38_flash_next_projections(root: &Path) -> Result<(), Box<dyn Error>>
     }
 
     println!(
-        "Qwen3.8-Flash-Next backbone projection gate passed: 36 entries, STACK:0 LOCAL:0 SHARED:0, BF16 MMA/store and SASS present"
+        "Qwen3.8-Flash-Next backbone projection gate passed: 41 entries, STACK:0 LOCAL:0 SHARED:0, BF16 MMA/store and SASS present"
     );
     Ok(())
 }
