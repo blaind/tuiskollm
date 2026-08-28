@@ -257,6 +257,8 @@ mod qwen36_text_endpoint;
 #[cfg(feature = "device")]
 mod qwen36_text_endpoint_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_compact_generation;
+#[cfg(feature = "device")]
 mod qwen38_flash_next_engram_staging;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_engram_staging_benchmark;
@@ -769,6 +771,13 @@ pub use qwen36_text_endpoint::{
 };
 #[cfg(feature = "device")]
 pub use qwen36_text_endpoint_benchmark::benchmark_qwen36_text_endpoint;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_compact_generation::{
+    Qwen38FlashNextCompactGenerationQualification,
+    Qwen38FlashNextCompactGenerationQualificationError,
+    print_qwen38_flash_next_compact_generation_report,
+    qualify_qwen38_flash_next_compact_generation,
+};
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_gdn_moe_layer::{
     Qwen38FlashNextGdnMoeLayerQualification, Qwen38FlashNextGdnMoeLayerQualificationError,

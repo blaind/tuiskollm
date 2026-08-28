@@ -2128,6 +2128,22 @@ impl Qwen38FlashNextResidentModel {
         self.slots.tokens(slot)
     }
 
+    /// Host engram carry for qualification.
+    #[cfg(feature = "qualification")]
+    pub fn qualification_engram_carry(
+        &self,
+        slot: usize,
+    ) -> EngineResult<[u32; tuisko_model::QWEN38_FLASH_NEXT_ENGRAM_CONTEXT_LEN]> {
+        self.carries
+            .get(slot)
+            .map(Qwen38FlashNextEngramCarry::previous)
+            .ok_or_else(|| {
+                EngineError::route(format!(
+                    "Qwen3.8 Flash-Next slot {slot} is outside 0..{MAX_BATCH}"
+                ))
+            })
+    }
+
     /// Snapshots overwritten recurrent state. Append-only paged K/V remains in place.
     pub fn snapshot_slot(
         &self,

@@ -1299,6 +1299,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
         qualify_qwen38_flash_next_generation,
     ),
     forwarded(
+        "qualify-qwen38-flash-next-compact-generation",
+        qualify_qwen38_flash_next_compact_generation,
+    ),
+    forwarded(
         "qualify-qwen38-flash-next-qsa-layer",
         qualify_qwen38_flash_next_qsa_layer,
     ),
@@ -3149,6 +3153,25 @@ fn qualify_qwen38_flash_next_generation(
     gate_qwen38_flash_next_projections(root)?;
     gate_qwen38_flash_next_lm_head(root)?;
     gate_qwen38_flash_next_ple(root)
+}
+
+/// Runs the source-backed compact-scheduler gate.
+fn qualify_qwen38_flash_next_compact_generation(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err(
+            "usage: cargo run -p xtask -- qualify-qwen38-flash-next-compact-generation SNAPSHOT"
+                .into(),
+        );
+    };
+    run_qualification_test(
+        root,
+        "qwen38_flash_next_compact_generation",
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        Some(("TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT", snapshot.as_os_str())),
+    )
 }
 
 /// Runs the source-backed GDN/MoE layer gate and every leaf resource gate it composes.
@@ -16036,6 +16059,12 @@ mod tests {
                 QWEN38_FLASH_NEXT_SNAPSHOT,
             ),
             (
+                "qualify-qwen38-flash-next-compact-generation",
+                "qwen38_flash_next_compact_generation",
+                SERIAL,
+                QWEN38_FLASH_NEXT_SNAPSHOT,
+            ),
+            (
                 "qualify-qwen38-flash-next-gdn-layer",
                 "qwen38_flash_next_gdn_moe_layer",
                 SERIAL,
@@ -16260,7 +16289,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 101);
+        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 102);
 
         let snapshot = OsString::from("/snapshot");
         for &(command, filter, trailing, variable) in EXPECTED_QUALIFICATION_ROUTES {

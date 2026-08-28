@@ -11,13 +11,14 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext};
 
-const GENERATION_ROUTE: &str = "single-slot-b1-1";
-const FUNDED_SLOTS: usize = 1;
-/// Queue depth the transport holds in front of the funded slot.
+const GENERATION_ROUTE: &str = "compact-b1-8";
+const FUNDED_SLOTS: usize = 8;
+/// Queue depth the transport holds in front of the funded slots.
 const INGRESS_QUEUE: usize = 8;
 /// The proven dense band, which is the ceiling every admission is measured against.
 const DENSE_BAND: usize = 2_051;
 const COMPLETION_TOKENS: usize = 8;
+const THROUGHPUT_COMPLETION_TOKENS: usize = 64;
 const CANCEL_COMPLETION_TOKENS: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -110,7 +111,7 @@ fn main() {
     };
     match outcome {
         Ok(()) => println!(
-            "PASS qwen38-flash-next-server-http: {} checks over {} live requests; {FUNDED_SLOTS} funded slot, {INGRESS_QUEUE}-deep ingress, dense band {DENSE_BAND}",
+            "PASS qwen38-flash-next-server-http: {} checks over {} live requests; {FUNDED_SLOTS} funded slots, {INGRESS_QUEUE}-deep ingress, dense band {DENSE_BAND}",
             qualification.checks, qualification.requests,
         ),
         Err(error) => {
@@ -414,6 +415,7 @@ impl Qualification {
         self.run_parity()?;
         self.run_refusals(&reference)?;
         self.run_concurrency(&reference)?;
+        self.run_batch_independence()?;
         self.run_backpressure()?;
         self.run_cancellation(&reference)?;
         self.run_sibling_models(&reference)
@@ -616,7 +618,7 @@ impl Qualification {
         )
     }
 
-    /// Checks that queued callers preserve the single-request answer.
+    /// Checks concurrent copies preserve the single-request answer.
     fn run_concurrency(&mut self, reference: &Completion) -> Result<()> {
         for lanes in [1usize, 2, 4, 8] {
             let completions = concurrent(self.client.clone(), lanes)?;
@@ -629,6 +631,28 @@ impl Qualification {
                     ),
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    /// Checks each distinct prompt still produces its solo answer in one batch.
+    fn run_batch_independence(&mut self) -> Result<()> {
+        let prompts = independence_prompts();
+        let mut alone = Vec::with_capacity(prompts.len());
+        for prompt in &prompts {
+            alone.push(self.request(independence_request(prompt), prompt)?);
+        }
+
+        let batched = concurrent_prompts(self.client.clone(), &prompts)?;
+        self.requests += prompts.len();
+        for ((prompt, expected), actual) in prompts.iter().zip(&alone).zip(&batched) {
+            self.check(
+                actual == expected,
+                format!(
+                    "`{prompt}` changed under {}-way batching: alone={expected:?}, batched={actual:?}",
+                    prompts.len(),
+                ),
+            )?;
         }
         Ok(())
     }
@@ -647,13 +671,13 @@ impl Qualification {
         self.check(
             refused > 0,
             format!(
-                "{lanes} simultaneous callers against {FUNDED_SLOTS} slot and a {INGRESS_QUEUE}-deep queue produced no 429; ingress is not bounded"
+                "{lanes} simultaneous callers against {FUNDED_SLOTS} slots and a {INGRESS_QUEUE}-deep queue produced no 429; ingress is not bounded"
             ),
         )?;
         self.check(
             admitted <= FUNDED_SLOTS + INGRESS_QUEUE,
             format!(
-                "bounded ingress admitted {admitted} callers, above the funded slot plus its {INGRESS_QUEUE}-deep queue"
+                "bounded ingress admitted {admitted} callers, above the funded slots plus their {INGRESS_QUEUE}-deep queue"
             ),
         )
     }
@@ -683,7 +707,7 @@ impl Qualification {
         Ok(())
     }
 
-    /// Checks sibling IDs are refused without consuming the served slot.
+    /// Checks sibling IDs are refused without consuming served capacity.
     fn run_sibling_models(&mut self, reference: &Completion) -> Result<()> {
         for sibling in [
             Qwen38_27B::MODEL_ID,
@@ -727,7 +751,9 @@ impl Qualification {
     fn measure(&mut self) -> Result<()> {
         self.run_surface()?;
         println!("# Flash-Next served-model measurements (diagnostic, nothing blessed)");
-        println!("# route {GENERATION_ROUTE}, {FUNDED_SLOTS} funded slot, dense band {DENSE_BAND}");
+        println!(
+            "# route {GENERATION_ROUTE}, {FUNDED_SLOTS} funded slots, dense band {DENSE_BAND}"
+        );
         println!();
         println!("## Per-request wall time and token consumption (SSE, greedy)");
         println!(
@@ -757,32 +783,51 @@ impl Qualification {
         }
 
         println!();
-        println!("## Aggregate throughput against one funded slot");
+        println!("## Throughput across the funded slots");
         println!(
-            "One warm-up round precedes the sweep, so no row is paying for the sweep's own first \
-             request."
+            "| budget | concurrency | wall | completion tok | aggregate tok/s | per-stream tok/s (min / median / max) | TTFT median | ITL median |"
         );
-        println!(
-            "| concurrency | requests | wall | completion tok | aggregate tok/s | slowest lane |"
-        );
-        println!("| --: | --: | --: | --: | --: | --: |");
+        println!("| --: | --: | --: | --: | --: | :-- | --: | --: |");
         let warmup = concurrent(self.client.clone(), 1)?;
         self.requests += warmup.len();
-        for lanes in [1usize, 2, 4, 8] {
-            let started = Instant::now();
-            let completions = concurrent(self.client.clone(), lanes)?;
-            let wall = started.elapsed();
-            self.requests += lanes;
-            let tokens = completions
-                .iter()
-                .map(|completion| completion.usage.completion_tokens)
-                .sum::<usize>();
-            println!(
-                "| {lanes} | {lanes} | {} | {tokens} | {:.2} | {} |",
-                millis(wall),
-                tokens as f64 / wall.as_secs_f64(),
-                millis(wall),
-            );
+        for budget in [COMPLETION_TOKENS, THROUGHPUT_COMPLETION_TOKENS] {
+            for lanes in [1usize, 2, 4, 8] {
+                let started = Instant::now();
+                let timings = concurrent_streams(self.client.clone(), lanes, budget)?;
+                let wall = started.elapsed();
+                self.requests += lanes;
+                let tokens = timings
+                    .iter()
+                    .map(|timing| timing.completion.usage.completion_tokens)
+                    .sum::<usize>();
+                let mut rates = timings
+                    .iter()
+                    .map(|timing| {
+                        timing.completion.usage.completion_tokens as f64 / timing.wall.as_secs_f64()
+                    })
+                    .collect::<Vec<_>>();
+                rates.sort_by(f64::total_cmp);
+                let mut first_token = timings
+                    .iter()
+                    .map(|timing| timing.time_to_first_token)
+                    .collect::<Vec<_>>();
+                first_token.sort_unstable();
+                let mut inter_token = timings
+                    .iter()
+                    .map(|timing| quantiles(&timing.inter_token).0)
+                    .collect::<Vec<_>>();
+                inter_token.sort_unstable();
+                println!(
+                    "| {budget} | {lanes} | {} | {tokens} | {:.2} | {:.2} / {:.2} / {:.2} | {} | {} |",
+                    millis(wall),
+                    tokens as f64 / wall.as_secs_f64(),
+                    rates.first().copied().unwrap_or_default(),
+                    median_of(&rates),
+                    rates.last().copied().unwrap_or_default(),
+                    millis(duration_median(&first_token)),
+                    millis(duration_median(&inter_token)),
+                );
+            }
         }
 
         println!();
@@ -887,6 +932,10 @@ fn exact_length_request_streaming(tokens: usize, budget: usize) -> Value {
 }
 
 fn concurrent(client: Client, count: usize) -> Result<Vec<Completion>> {
+    concurrent_prompts(client, &vec!["Hello".to_owned(); count])
+}
+
+fn concurrent_streams(client: Client, count: usize, budget: usize) -> Result<Vec<StreamTiming>> {
     let barrier = Arc::new(Barrier::new(count));
     let handles = (0..count)
         .map(|_| {
@@ -894,7 +943,7 @@ fn concurrent(client: Client, count: usize) -> Result<Vec<Completion>> {
             let client = client.clone();
             thread::spawn(move || {
                 barrier.wait();
-                client.blocking(hello(false, COMPLETION_TOKENS), "concurrent completion")
+                client.streaming(hello(true, budget), "concurrent stream")
             })
         })
         .collect::<Vec<_>>();
@@ -902,6 +951,49 @@ fn concurrent(client: Client, count: usize) -> Result<Vec<Completion>> {
         .into_iter()
         .map(|handle| handle.join().map_err(|_| QualError::ThreadPanic)?)
         .collect()
+}
+
+fn concurrent_prompts(client: Client, prompts: &[String]) -> Result<Vec<Completion>> {
+    let barrier = Arc::new(Barrier::new(prompts.len()));
+    let handles = prompts
+        .iter()
+        .map(|prompt| {
+            let barrier = Arc::clone(&barrier);
+            let client = client.clone();
+            let prompt = prompt.clone();
+            thread::spawn(move || {
+                let request = independence_request(&prompt);
+                barrier.wait();
+                client.blocking(request, "concurrent completion")
+            })
+        })
+        .collect::<Vec<_>>();
+    handles
+        .into_iter()
+        .map(|handle| handle.join().map_err(|_| QualError::ThreadPanic)?)
+        .collect()
+}
+
+fn independence_prompts() -> Vec<String> {
+    [
+        "Name one primary color.",
+        "Say hello.",
+        "Describe a river in one sentence.",
+        "What is two plus two?",
+        "List three fruits, separated by commas.",
+        "Give one fact about the moon.",
+        "Write one short sentence about rain.",
+        "Name the largest ocean.",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn independence_request(prompt: &str) -> Value {
+    let mut request = hello(false, COMPLETION_TOKENS);
+    request["messages"] = json!([{"role": "user", "content": prompt}]);
+    request
 }
 
 fn concurrent_statuses(client: Client, count: usize) -> Result<Vec<u16>> {
@@ -934,9 +1026,26 @@ fn quantiles(samples: &[Duration]) -> (Duration, Duration) {
     }
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
-    let median = sorted[sorted.len() / 2];
-    let p90 = sorted[(sorted.len() * 9 / 10).min(sorted.len() - 1)];
+    let median = duration_median(&sorted);
+    let p90_index = sorted.len().saturating_mul(9).div_ceil(10) - 1;
+    let p90 = sorted[p90_index];
     (median, p90)
+}
+
+fn duration_median(sorted: &[Duration]) -> Duration {
+    match sorted.len() {
+        0 => Duration::ZERO,
+        len if len % 2 == 0 => (sorted[len / 2 - 1] + sorted[len / 2]) / 2,
+        len => sorted[len / 2],
+    }
+}
+
+fn median_of(sorted: &[f64]) -> f64 {
+    match sorted.len() {
+        0 => 0.0,
+        len if len % 2 == 0 => (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0,
+        len => sorted[len / 2],
+    }
 }
 
 fn millis(duration: Duration) -> String {
@@ -1221,8 +1330,8 @@ fn expect_str_value(value: Option<&Value>, label: &str, expected: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        DENSE_BAND, Options, QualError, fixtures, long_prompt_body, parse_capacity_refusal,
-        quantiles, validate_blocking, validate_stream,
+        DENSE_BAND, Options, QualError, fixtures, long_prompt_body, median_of,
+        parse_capacity_refusal, quantiles, validate_blocking, validate_stream,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -1345,7 +1454,13 @@ mod tests {
         assert_eq!(quantiles(&[]), (Duration::ZERO, Duration::ZERO));
         let samples = (1..=10).map(Duration::from_millis).collect::<Vec<_>>();
         let (median, p90) = quantiles(&samples);
-        assert_eq!(median, Duration::from_millis(6));
-        assert_eq!(p90, Duration::from_millis(10));
+        assert_eq!(
+            median,
+            Duration::from_millis(5) + Duration::from_micros(500)
+        );
+        assert_eq!(p90, Duration::from_millis(9));
+        assert_eq!(median_of(&[1.0, 2.0, 3.0, 4.0]), 2.5);
+        assert_eq!(median_of(&[1.0, 2.0, 3.0]), 2.0);
+        assert_eq!(median_of(&[]), 0.0);
     }
 }

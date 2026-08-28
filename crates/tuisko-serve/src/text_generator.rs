@@ -12,7 +12,7 @@
 use tuisko_engine::{
     ChatGenerationRequest, EngineError, GeneratedText, GenerationStep, MAX_BATCH,
     Qwen35ResidentMtpBatchEvent, Qwen35ResidentMtpBatchEvents, Qwen35ResidentMtpBatchGenerator,
-    Qwen36ResidentBatchGenerator, Qwen38FlashNextResidentGenerator, ResidentBatchAdmission,
+    Qwen36ResidentBatchGenerator, Qwen38FlashNextResidentBatchGenerator, ResidentBatchAdmission,
     ResidentBatchEvent, ResidentBatchEvents, ResidentCancellation, ResidentMtpBatchEvent,
     ResidentMtpBatchEvents, ResidentMtpBatchGenerator, ResidentRequestId,
 };
@@ -238,37 +238,36 @@ impl TextGenerator for Qwen36ResidentBatchGenerator {
     }
 }
 
-// This owner schedules one event per round until compact batching is admitted.
-impl TextGenerator for Qwen38FlashNextResidentGenerator {
+impl TextGenerator for Qwen38FlashNextResidentBatchGenerator {
     type Events = ResidentBatchEvents;
 
     fn admit(
         &mut self,
         request: &ChatGenerationRequest,
     ) -> Result<ResidentBatchAdmission, EngineError> {
-        Qwen38FlashNextResidentGenerator::admit(self, request)
+        Qwen38FlashNextResidentBatchGenerator::admit(self, request)
     }
 
     fn step(&mut self) -> Result<Self::Events, EngineError> {
-        Qwen38FlashNextResidentGenerator::step(self)
+        Qwen38FlashNextResidentBatchGenerator::step(self)
     }
 
     fn cancel(
         &mut self,
         request_id: ResidentRequestId,
     ) -> Result<ResidentCancellation, EngineError> {
-        Qwen38FlashNextResidentGenerator::cancel(self, request_id)
+        Qwen38FlashNextResidentBatchGenerator::cancel(self, request_id)
     }
 
     fn active_requests(&self) -> usize {
-        Qwen38FlashNextResidentGenerator::active_requests(self)
+        Qwen38FlashNextResidentBatchGenerator::active_requests(self)
     }
 
     fn active_request_ids(&self) -> impl Iterator<Item = ResidentRequestId> {
-        Qwen38FlashNextResidentGenerator::active_request_ids(self)
+        Qwen38FlashNextResidentBatchGenerator::active_request_ids(self)
     }
 
     fn slot_capacity(&self) -> usize {
-        Qwen38FlashNextResidentGenerator::slot_capacity(self)
+        Qwen38FlashNextResidentBatchGenerator::slot_capacity(self)
     }
 }
