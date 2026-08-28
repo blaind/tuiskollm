@@ -833,6 +833,216 @@ impl Qwen38FlashNextMtpGenerationSession<'_> {
 /// Restore point taken before each speculative span.
 pub type Qwen38FlashNextMtpRestorePoint = Qwen38FlashNextSlotSnapshot;
 
+/// One qualification run through the plain or speculative schedule.
+#[cfg(feature = "qualification")]
+#[derive(Clone, Debug)]
+pub struct Qwen38FlashNextMtpQualificationRun {
+    /// Prompt tokens consumed by the run.
+    pub prompt_tokens: usize,
+    /// Selected tokens in order.
+    pub token_ids: Vec<u32>,
+    /// Prompt tokens handled by native prefill graphs.
+    pub native_prefill_tokens: usize,
+    /// Speculative counters, zero for the plain schedule.
+    pub stats: ResidentMtpGenerationStats,
+    /// Speculative stage timings, zero for the plain schedule.
+    pub cost: Qwen38FlashNextMtpRoundCost,
+    /// Committed-output distribution, empty for the plain schedule.
+    pub acceptance: Qwen38FlashNextMtpAcceptance,
+    /// Whole-run wall time including prompt prime.
+    pub elapsed: Duration,
+    /// Generation wall time after prompt prime.
+    pub decode: Duration,
+}
+
+#[cfg(feature = "qualification")]
+impl Qwen38FlashNextMtpTextGenerator {
+    /// Runs raw prompt IDs through the target's plain greedy schedule.
+    pub fn qualification_plain_tokens(
+        &mut self,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+    ) -> EngineResult<Qwen38FlashNextMtpQualificationRun> {
+        let required_positions = require_generation_capacity(
+            token_ids.len(),
+            max_new_tokens,
+            self.program.target().generation_capacity(),
+        )?;
+        let mut sampler =
+            crate::Sampler::new(crate::SamplingOptions::greedy(), self.frontend.stop_ids())?;
+        let started = Instant::now();
+        self.program
+            .target_mut()
+            .recycle_slot(&self.stream, SINGLE_SLOT)?;
+        self.program.target_mut().reset_generation_telemetry();
+        self.program
+            .target_mut()
+            .reserve_slot(&self.stream, SINGLE_SLOT, required_positions)?;
+        let native_prefill_tokens = crate::qwen38_flash_next::text_generation::prime_prompt(
+            self.program.target_mut(),
+            &self.stream,
+            token_ids,
+            SINGLE_SLOT,
+        )?;
+        let vocab = <A as Arch>::VOCAB;
+        self.program
+            .target()
+            .read_logits_into(&self.stream, 1, &mut self.logits[..vocab])?;
+        let primed = Instant::now();
+
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        let mut position = u32::try_from(token_ids.len()).map_err(|_| {
+            EngineError::generation("Qwen3.8 Flash-Next prompt length exceeds the position width")
+        })?;
+        for _ in 0..max_new_tokens {
+            let decision = sampler.sample(&self.logits[..vocab])?;
+            generated.push(decision.token_id);
+            if decision.stopped || generated.len() == max_new_tokens {
+                break;
+            }
+            self.program.target_mut().decode_step(
+                &self.stream,
+                &[decision.token_id],
+                &[position],
+                &[SINGLE_SLOT],
+            )?;
+            self.program
+                .target()
+                .read_logits_into(&self.stream, 1, &mut self.logits[..vocab])?;
+            position = position.checked_add(1).ok_or_else(|| {
+                EngineError::generation("Qwen3.8 Flash-Next generation position overflows")
+            })?;
+        }
+
+        Ok(Qwen38FlashNextMtpQualificationRun {
+            prompt_tokens: token_ids.len(),
+            token_ids: generated,
+            native_prefill_tokens,
+            stats: ResidentMtpGenerationStats::default(),
+            cost: Qwen38FlashNextMtpRoundCost::default(),
+            acceptance: Qwen38FlashNextMtpAcceptance::default(),
+            elapsed: started.elapsed(),
+            decode: primed.elapsed(),
+        })
+    }
+
+    /// Runs raw prompt IDs through the speculative greedy schedule.
+    pub fn qualification_mtp_tokens(
+        &mut self,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+    ) -> EngineResult<Qwen38FlashNextMtpQualificationRun> {
+        let started = Instant::now();
+        let mut session = self.qualification_start_from_tokens(token_ids, max_new_tokens)?;
+        let primed = Instant::now();
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        while session.finish_reason().is_none() {
+            generated.push(session.step()?.token_id);
+        }
+
+        Ok(Qwen38FlashNextMtpQualificationRun {
+            prompt_tokens: token_ids.len(),
+            token_ids: generated,
+            native_prefill_tokens: session.native_prefill_tokens(),
+            stats: session.stats(),
+            cost: session.cost(),
+            acceptance: session.acceptance(),
+            elapsed: started.elapsed(),
+            decode: primed.elapsed(),
+        })
+    }
+
+    /// Runs one rendered chat request through the production speculative owner.
+    pub fn qualification_chat_run(
+        &mut self,
+        request: &ChatGenerationRequest,
+    ) -> EngineResult<Qwen38FlashNextMtpQualificationRun> {
+        let started = Instant::now();
+        let mut session = self.start(request)?;
+        let prompt_tokens = session.prompt_token_ids().len();
+        let primed = Instant::now();
+        let mut generated = Vec::with_capacity(request.max_new_tokens);
+        while session.finish_reason().is_none() {
+            generated.push(session.step()?.token_id);
+        }
+
+        Ok(Qwen38FlashNextMtpQualificationRun {
+            prompt_tokens,
+            token_ids: generated,
+            native_prefill_tokens: session.native_prefill_tokens(),
+            stats: session.stats(),
+            cost: session.cost(),
+            acceptance: session.acceptance(),
+            elapsed: started.elapsed(),
+            decode: primed.elapsed(),
+        })
+    }
+
+    /// Opens a speculative greedy session over raw prompt IDs.
+    pub fn qualification_start_from_tokens(
+        &mut self,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+    ) -> EngineResult<Qwen38FlashNextMtpGenerationSession<'_>> {
+        let stop_ids = self.frontend.stop_ids().to_vec();
+        let Self {
+            frontend,
+            program,
+            stream,
+            logits,
+        } = self;
+        let control = GenerationSession::qualification_from_tokens(
+            frontend,
+            token_ids,
+            max_new_tokens,
+            crate::SamplingOptions::greedy(),
+        )?;
+        let required_positions = require_generation_capacity(
+            token_ids.len(),
+            max_new_tokens,
+            program.target().generation_capacity(),
+        )?
+        .saturating_add(DRAFT_WINDOW)
+        .min(program.target().generation_capacity());
+        let mut native_prefill_tokens = 0;
+
+        if control.finish_reason().is_none() {
+            program.target_mut().recycle_slot(stream, SINGLE_SLOT)?;
+            program.reset_carry(stream)?;
+            program.target_mut().reset_generation_telemetry();
+            program
+                .target_mut()
+                .reserve_slot(stream, SINGLE_SLOT, required_positions)?;
+            native_prefill_tokens = prime_pair(program, stream, token_ids, SINGLE_SLOT)?;
+            program
+                .target()
+                .read_logits_into(stream, 1, &mut logits[..<A as Arch>::VOCAB])?;
+        }
+
+        Ok(Qwen38FlashNextMtpGenerationSession {
+            program,
+            stream,
+            logits,
+            state: Qwen38FlashNextMtpRoundState {
+                control,
+                maximum_new_tokens: max_new_tokens,
+                stop_ids,
+                next_position: token_ids.len(),
+                reserved_positions: required_positions,
+                started: false,
+                queued: std::array::from_fn(|_| None),
+                queue_start: 0,
+                queue_len: 0,
+                native_prefill_tokens,
+                greedy: true,
+                stats: ResidentMtpGenerationStats::default(),
+                cost: Qwen38FlashNextMtpRoundCost::default(),
+                acceptance: Qwen38FlashNextMtpAcceptance::default(),
+            },
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Qwen38FlashNextMtpAcceptance, Qwen38FlashNextMtpRoundCost};

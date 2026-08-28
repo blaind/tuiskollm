@@ -126,6 +126,38 @@ impl GenerationSession {
         })
     }
 
+    /// Starts a qualification session from already-tokenized prompt IDs.
+    #[cfg(feature = "qualification")]
+    pub fn qualification_from_tokens(
+        frontend: &TextFrontend,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        sampling: SamplingOptions,
+    ) -> EngineResult<Self> {
+        let sampler = Sampler::new(sampling, frontend.stop_ids())?;
+
+        Ok(Self {
+            prompt: PromptEncoding {
+                token_ids: token_ids.to_vec(),
+                message_boundary_tokens: token_ids.len(),
+                reused_tokens: 0,
+                rendered_bytes: 0,
+                fresh_bytes: 0,
+            },
+            prompt_metrics: PromptEncodingMetrics::default(),
+            sampler,
+            decoder: frontend.streaming_decoder(),
+            generated: Vec::with_capacity(max_new_tokens.min(4_096)),
+            occurrences: HashMap::with_capacity(if sampling.penalties.is_identity() {
+                0
+            } else {
+                max_new_tokens.min(Qwen38_27B::VOCAB)
+            }),
+            max_new_tokens,
+            finish_reason: (max_new_tokens == 0).then_some(FinishReason::Length),
+        })
+    }
+
     /// Exact prompt IDs to prefill before the first logit row is consumed.
     pub fn prompt_token_ids(&self) -> &[u32] {
         &self.prompt.token_ids

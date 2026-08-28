@@ -298,6 +298,8 @@ mod qwen38_flash_next_moe_router;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_moe_router_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_mtp_generation;
+#[cfg(feature = "device")]
 mod qwen38_flash_next_mtp_oracle;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_ple;
@@ -847,6 +849,13 @@ pub use qwen38_flash_next_moe_router::{
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_moe_router_benchmark::benchmark_qwen38_flash_next_moe_router;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_mtp_generation::{
+    Qwen38FlashNextMtpCodingCase, Qwen38FlashNextMtpGenerationQualification,
+    Qwen38FlashNextMtpGenerationQualificationError, Qwen38FlashNextMtpIdentityCase,
+    Qwen38FlashNextMtpWarmComparison, print_qwen38_flash_next_mtp_generation_report,
+    qualify_qwen38_flash_next_mtp_generation,
+};
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_mtp_oracle::{
     Qwen38FlashNextMtpHiddenNorm, Qwen38FlashNextMtpOracle, print_qwen38_flash_next_mtp_oracle,
