@@ -163,7 +163,7 @@ pub use qwen38_flash_next::mtp_program::{
 #[cfg(feature = "qualification")]
 pub use qwen38_flash_next::qsa_moe_layer::{
     Qwen38FlashNextQsaMoeLayerImmutable, Qwen38FlashNextQsaMoeLayerInputs,
-    Qwen38FlashNextQsaMoeLayerObservables,
+    Qwen38FlashNextQsaMoeLayerObservables, Qwen38FlashNextQsaRoundStageGraph,
 };
 pub use qwen38_flash_next::qsa_moe_layer::{
     Qwen38FlashNextQsaMoeLayerProgram, Qwen38FlashNextQsaRound,
