@@ -1394,7 +1394,7 @@ mod tests {
             + MAX_BATCH * restore_bank
             + MAX_BATCH * Qwen38FlashNext::VOCAB * size_of::<u16>();
 
-        assert_eq!(layout.total_device_bytes().unwrap(), 30_675_307_776);
+        assert_eq!(layout.total_device_bytes().unwrap(), 30_518_257_920);
         assert_eq!(restore_bank, 115_642_368);
         assert_eq!(stagers, 1_068_511_232);
     }

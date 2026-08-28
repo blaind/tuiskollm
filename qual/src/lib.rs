@@ -809,6 +809,7 @@ pub use qwen38_flash_next_gdn_recurrence_benchmark::benchmark_qwen38_flash_next_
 pub use qwen38_flash_next_generation::{
     Qwen38FlashNextBoundaryVerdict, Qwen38FlashNextCaptureVerdict,
     Qwen38FlashNextGenerationQualification, Qwen38FlashNextGenerationQualificationError,
+    Qwen38FlashNextLongContextVerdict, print_long_context_verdict,
     print_qwen38_flash_next_generation_report, qualify_qwen38_flash_next_generation,
 };
 #[cfg(feature = "device")]

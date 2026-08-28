@@ -8,11 +8,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tuisko_engine::{
-    EngineError, MAX_BATCH, QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING,
-    QWEN38_FLASH_NEXT_EXPERT_ITEM_COUNT, QWEN38_FLASH_NEXT_EXPERT_RESIDENT_SLOTS,
-    QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS, Qwen38FlashNextResidentLayout,
-    Qwen38FlashNextResidentModel, Qwen38FlashNextStepTelemetry, Qwen38FlashNextStreamingRoute,
-    StreamingPrimarySource, StreamingResidencyAccounting,
+    EngineError, MAX_BATCH, QWEN38_FLASH_NEXT_ATTENTION_LAYERS,
+    QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING, QWEN38_FLASH_NEXT_EXPERT_ITEM_COUNT,
+    QWEN38_FLASH_NEXT_EXPERT_RESIDENT_SLOTS, QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES,
+    QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS, QWEN38_FLASH_NEXT_SLOT_PAGE_TOKENS,
+    Qwen38FlashNextResidentLayout, Qwen38FlashNextResidentModel, Qwen38FlashNextStepTelemetry,
+    Qwen38FlashNextStreamingRoute, StreamingPrimarySource, StreamingResidencyAccounting,
 };
 use tuisko_gpu::{CudaContext, GpuError, device_memory_info};
 use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, Qwen38FlashNext};
@@ -139,8 +140,10 @@ pub struct Qwen38FlashNextResidentModelQualification {
     pub free_device_bytes_after_warmup: usize,
     /// Free device bytes the driver reported after the measured sweep.
     pub free_device_bytes_after_sweep: usize,
-    /// Rounds the model-level dense-band guard refused.
+    /// Rounds refused by the mapping and position guards.
     pub refused_rounds: usize,
+    /// Logits unchanged for a shallow row beside a selected deep row.
+    pub isolated_logits: usize,
     /// Logit values inspected for finiteness and responsiveness.
     pub inspected_logits: usize,
     /// Logit values compared across two different cache states.
@@ -221,11 +224,11 @@ pub fn qualify_qwen38_flash_next_resident_model(
     let load = started.elapsed();
     let stats = model.load_stats();
 
-    if stats.executables() != QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS * 16 {
+    let expected = (QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS + QWEN38_FLASH_NEXT_ATTENTION_LAYERS) * 16;
+    if stats.executables() != expected {
         return Err(mismatch(format!(
-            "the resident program captured {} executables, expected {} segments times sixteen routes",
+            "the resident program captured {} executables, expected {expected}",
             stats.executables(),
-            QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS
         )));
     }
     println!("--- construction (diagnostic, nothing blessed) ---");
@@ -252,7 +255,8 @@ pub fn qualify_qwen38_flash_next_resident_model(
     model.reset_state(&stream)?;
     reserve_probe_slots(&mut model, &stream)?;
 
-    let refused_rounds = verify_dense_band_refusal(&mut model, &stream)?;
+    let refused_rounds = verify_route_boundary(&mut model, &stream)?;
+    let isolated_logits = verify_route_level_isolation(&mut model, &stream)?;
     let (inspected_logits, peak_absolute_logit) = verify_logits_respond(&mut model, &stream)?;
     let cache_state_compared_logits = verify_cache_state_is_not_numerical(&mut model, &stream)?;
     let streaming_route = verify_streaming_routes(&mut model, &stream)?;
@@ -321,6 +325,7 @@ pub fn qualify_qwen38_flash_next_resident_model(
         free_device_bytes_after_warmup: free_after_warmup,
         free_device_bytes_after_sweep: free_after_sweep,
         refused_rounds,
+        isolated_logits,
         inspected_logits,
         peak_absolute_logit,
         cache_state_compared_logits,
@@ -694,50 +699,125 @@ fn verify_plan(plan: &Qwen38FlashNextResidentLayout) -> QualResult<()> {
             plan.host_mapped_bytes()
         )));
     }
-    if plan.context_tokens_per_slot() < QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING {
+    if plan.physical_pages() != QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES
+        || plan.context_tokens_per_slot() != 32_768
+    {
         return Err(mismatch(format!(
-            "the funded KV pool reaches {} tokens per slot, short of the {} the dense band needs",
+            "the funded KV pool is {} pages reaching {} tokens per slot, expected {} and 32,768",
+            plan.physical_pages(),
             plan.context_tokens_per_slot(),
-            QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING
+            QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES
         )));
+    }
+    if plan.context_tokens_per_slot() <= QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING {
+        return Err(mismatch(
+            "the funded KV pool never reaches the selected route",
+        ));
     }
 
     Ok(())
 }
 
-/// Proves that dense QSA refuses, rather than truncates, above its exact visible band.
-fn verify_dense_band_refusal(
+/// Proves isolation when one batch mixes dense-band and selected rows.
+fn verify_route_level_isolation(
+    model: &mut Qwen38FlashNextResidentModel,
+    stream: &tuisko_gpu::CudaStream,
+) -> QualResult<usize> {
+    const SHALLOW_POSITION: u32 = 64;
+    const DEEP_POSITION: u32 = 2_060;
+    let deep = 0usize;
+    let shallow = 1usize;
+
+    model.reserve_slot(stream, deep, DEEP_POSITION as usize + 1)?;
+    model.reserve_slot(stream, shallow, SHALLOW_POSITION as usize + 1)?;
+
+    model.reset_slot(stream, shallow)?;
+    model.prefill_tile(stream, &[7; 64], 0, shallow)?;
+    model.decode_step(stream, &[7], &[SHALLOW_POSITION], &[shallow])?;
+    let mut alone = vec![0u16; <A as Arch>::VOCAB];
+    model.read_logits_into(stream, 1, &mut alone)?;
+
+    model.reset_slot(stream, shallow)?;
+    model.prefill_tile(stream, &[7; 64], 0, shallow)?;
+    model.decode_step(
+        stream,
+        &[7, 7],
+        &[DEEP_POSITION, SHALLOW_POSITION],
+        &[deep, shallow],
+    )?;
+    let counts = model.qualification_selected_counts(stream, 2)?;
+    if counts[1] as usize != SHALLOW_POSITION as usize + 1 || counts[0] < 2_048 {
+        return Err(mismatch(format!(
+            "mixed-depth selection published counts {:?}, expected deep >= 2,048 and shallow {}",
+            counts,
+            SHALLOW_POSITION + 1
+        )));
+    }
+
+    let mut beside = vec![0u16; 2 * <A as Arch>::VOCAB];
+    model.read_logits_into(stream, 2, &mut beside)?;
+    for (index, (&left, &right)) in alone.iter().zip(&beside[<A as Arch>::VOCAB..]).enumerate() {
+        if left != right {
+            return Err(mismatch(format!(
+                "a deep neighbor changed shallow logit {index}: {left:#06x} versus {right:#06x}"
+            )));
+        }
+    }
+
+    Ok(alone.len())
+}
+
+/// Proves selected routing and the remaining exact refusals.
+fn verify_route_boundary(
     model: &mut Qwen38FlashNextResidentModel,
     stream: &tuisko_gpu::CudaStream,
 ) -> QualResult<usize> {
     let mut refused = 0usize;
-    for position in [
-        QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING as u32,
-        4_096,
-        262_143,
-    ] {
-        let error = model
-            .decode_step(stream, &[1], &[position], &[0])
-            .err()
-            .ok_or_else(|| {
-                mismatch(format!(
-                    "a decode step at position {position} was admitted, but its visible length \
-                     leaves the proven dense band"
-                ))
-            })?;
-        let message = error.to_string();
-        if !message.contains("2051") || !message.contains("refused rather than truncated") {
-            return Err(mismatch(format!(
-                "the dense-band refusal at position {position} did not name the ceiling and what \
-                 it refuses to do instead: {message}"
-            )));
-        }
-        refused += 1;
+    let slot = 0usize;
+    let depth = QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING + QWEN38_FLASH_NEXT_SLOT_PAGE_TOKENS;
+
+    model.recycle_slot(stream, slot)?;
+    let error = model
+        .decode_step(stream, &[1], &[0], &[slot])
+        .err()
+        .ok_or_else(|| mismatch("a step on an unmapped slot was admitted"))?;
+    let message = error.to_string();
+    if !message.contains("slot 0") || !message.contains("Free") {
+        return Err(mismatch(format!(
+            "the mapping refusal is incomplete: {error}"
+        )));
     }
-    if model.generation_capacity() != QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING {
-        return Err(mismatch(
-            "the resident generator does not expose the dense ceiling",
-        ));
+    refused += 1;
+
+    let error = model
+        .decode_step(stream, &[1], &[A::MAX_POSITION_EMBEDDINGS as u32], &[slot])
+        .err()
+        .ok_or_else(|| mismatch("a step past the position ceiling was admitted"))?;
+    let message = error.to_string();
+    if !message.contains(&A::MAX_POSITION_EMBEDDINGS.to_string())
+        || !message.contains("refused rather than truncated")
+    {
+        return Err(mismatch(format!(
+            "the position-ceiling refusal is incomplete: {message}"
+        )));
+    }
+    refused += 1;
+
+    model.reserve_slot(stream, slot, depth)?;
+    let prompt = vec![1u32; 1_024];
+    model.prefill_tile(stream, &prompt, 0, slot)?;
+    model.prefill_tile(stream, &prompt, 1_024, slot)?;
+    for position in 2_048..=2_059 {
+        model.decode_step(stream, &[1], &[position], &[slot])?;
+    }
+    let selected = model.qualification_selected_counts(stream, 1)?;
+    if selected != [2_048] {
+        return Err(mismatch(format!(
+            "the selected route published {selected:?}, expected [2048]"
+        )));
+    }
+    if model.generation_capacity() != A::MAX_POSITION_EMBEDDINGS {
+        return Err(mismatch("the resident generator hides funded context"));
     }
 
     Ok(refused)
@@ -930,7 +1010,8 @@ pub fn print_qwen38_flash_next_resident_model_report(
         "    free device after sweep  {}",
         report.free_device_bytes_after_sweep
     );
-    println!("  refused out-of-band rounds {}", report.refused_rounds);
+    println!("  refused rounds             {}", report.refused_rounds);
+    println!("  isolated logits            {}", report.isolated_logits);
     println!("  logits inspected           {}", report.inspected_logits);
     println!(
         "  cache-state logits equal   {}",
@@ -1059,7 +1140,7 @@ mod tests {
         let report = qualify_qwen38_flash_next_resident_model(std::path::Path::new(&root))?;
         print_qwen38_flash_next_resident_model_report(&report);
 
-        assert_eq!(report.executables, 784);
+        assert_eq!(report.executables, 588 + 144 + 196 + 48);
         assert_eq!(report.causal_span.agreeing_rows, 4);
         assert_eq!(report.causal_span.compared_logits, 4 * <A as Arch>::VOCAB);
         assert_eq!(report.causal_span.differing_logits, 0);
@@ -1068,7 +1149,8 @@ mod tests {
         assert_eq!(report.rollback.compared_logits, 4 * <A as Arch>::VOCAB);
         assert!(report.rollback.snapshot_bytes > 0);
         assert!(report.rollback.control_moved_logits > 0);
-        assert_eq!(report.refused_rounds, 3);
+        assert_eq!(report.refused_rounds, 2);
+        assert_eq!(report.isolated_logits, <A as Arch>::VOCAB);
         assert_eq!(report.inspected_logits, 3 * 248_320);
         assert_eq!(report.cache_state_compared_logits, 248_320);
         assert!(report.peak_absolute_logit.is_finite());

@@ -3241,6 +3241,7 @@ fn qualify_qwen38_flash_next_generation(
     gate_qwen38_flash_next_gdn_recurrence(root)?;
     gate_qwen38_flash_next_qsa_prepare(root)?;
     gate_qwen38_flash_next_qsa_attention(root)?;
+    gate_qwen38_flash_next_qsa_selection(root)?;
     gate_qwen38_flash_next_moe_router(root)?;
     gate_qwen38_flash_next_moe_experts(root)?;
     gate_qwen38_flash_next_projections(root)?;
@@ -3340,6 +3341,7 @@ fn qualify_qwen38_flash_next_resident_model(
     gate_qwen38_flash_next_gdn_recurrence(root)?;
     gate_qwen38_flash_next_qsa_prepare(root)?;
     gate_qwen38_flash_next_qsa_attention(root)?;
+    gate_qwen38_flash_next_qsa_selection(root)?;
     gate_qwen38_flash_next_moe_router(root)?;
     gate_qwen38_flash_next_moe_experts(root)?;
     gate_qwen38_flash_next_projections(root)?;

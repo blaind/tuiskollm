@@ -7,9 +7,9 @@ use crate::{DeviceBenchmarkError, device_benchmark};
 use std::path::Path;
 use std::sync::Arc;
 use tuisko_engine::{
-    ChatGenerationRequest, EngineError, GeneratedText, Qwen38FlashNextBatchTelemetry,
-    Qwen38FlashNextResidentBatchGenerator, ResidentBatchEvent, ResidentBatchEvents,
-    ResidentRequestId, SamplingOptions,
+    ChatGenerationRequest, EngineError, GeneratedText, QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING,
+    Qwen38FlashNextBatchTelemetry, Qwen38FlashNextResidentBatchGenerator, ResidentBatchEvent,
+    ResidentBatchEvents, ResidentRequestId, SamplingOptions,
 };
 use tuisko_frontend::{ChatMessage, ChatTemplateOptions, FrontendError, TextFrontend};
 use tuisko_gpu::{CudaContext, GpuError, device_memory_info};
@@ -845,10 +845,10 @@ fn verify_compact_owner(generator: &Qwen38FlashNextResidentBatchGenerator) -> Qu
             generator.slot_capacity()
         )));
     }
-    if generator.context_capacity() != 2_051 {
+    if generator.context_capacity() != QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING {
         return Err(mismatch(format!(
-            "the compact owner admits {} context tokens rather than the proven dense band",
-            generator.context_capacity()
+            "the compact owner admits {} context tokens, expected {QWEN38_FLASH_NEXT_QSA_VISIBLE_CEILING}",
+            generator.context_capacity(),
         )));
     }
     if !generator.mapped_primary() {
@@ -985,7 +985,7 @@ mod tests {
         assert_eq!(report.restored_boundaries, 2);
         assert_eq!(report.cold_prefix_fallbacks, 1);
         assert_eq!(report.stable_addresses, 7);
-        assert_eq!(report.arena_bytes, 30_675_307_776);
+        assert_eq!(report.arena_bytes, 30_518_257_920);
         assert_eq!(report.host_stager_bytes, 1_068_511_232);
         assert!(report.telemetry.at(SLOTS)?.rounds() > 0);
         Ok(())

@@ -13,6 +13,10 @@ use crate::{
     EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH, StreamingResidencyAccounting,
 };
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
+use tuisko_kernels_sm120::{
+    SELECTION_BLOCKS_PER_PAGE, SELECTION_MAX_SELECTED, SELECTION_RING_SLOTS, SELECTION_ROW_TILE,
+    SELECTION_SCRATCH_WORDS, selection_block_bucket, selection_round_blocks,
+};
 use tuisko_model::{Arch, Qwen38FlashNext};
 
 type A = Qwen38FlashNext;
@@ -53,6 +57,21 @@ pub const QWEN38_FLASH_NEXT_REQUIRED_HEADROOM_BYTES: usize = 1_000_000_000;
 /// Physical pages required by the full 262,144-token context.
 pub const QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES: usize =
     262_144 / QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE;
+
+/// Candidate blocks a slot borrowing the whole pool can present.
+pub const QWEN38_FLASH_NEXT_RESIDENT_CANDIDATE_BLOCKS: usize =
+    Qwen38FlashNext::MAX_POSITION_EMBEDDINGS / Qwen38FlashNext::INDEXER_COMPRESS_RATIO;
+
+/// Values between two rows of resident score scratch.
+pub(crate) const QWEN38_FLASH_NEXT_RESIDENT_SCORE_STRIDE: usize =
+    match selection_block_bucket(QWEN38_FLASH_NEXT_RESIDENT_CANDIDATE_BLOCKS) {
+        Some(bucket) => bucket,
+        None => panic!("the position ceiling is inside the widest prepared scoring grid"),
+    };
+
+/// Micro-blocks the widest admitted round can close.
+pub(crate) const QWEN38_FLASH_NEXT_RESIDENT_ROUND_BLOCKS: usize =
+    selection_round_blocks(QWEN38_FLASH_NEXT_RESIDENT_MAX_ROWS);
 
 /// Decoder layers that run dense gated GQA, at `(layer + 1) % 4 == 0`.
 pub const QWEN38_FLASH_NEXT_ATTENTION_LAYERS: usize = A::LAYERS / A::FULL_ATTENTION_INTERVAL;
@@ -150,6 +169,14 @@ pub(crate) struct Qwen38FlashNextResidentWorkspace {
     pub(crate) attention: ArenaRegion<f32>,
     pub(crate) attention_gated: ArenaRegion<u16>,
 
+    pub(crate) indexer_qk: ArenaRegion<u16>,
+    pub(crate) indexer_query: ArenaRegion<f32>,
+    pub(crate) indexer_raw_round: ArenaRegion<u16>,
+    pub(crate) scores: ArenaRegion<f32>,
+    pub(crate) select_scratch: ArenaRegion<u32>,
+    pub(crate) selected: ArenaRegion<u32>,
+    pub(crate) selected_counts: ArenaRegion<u32>,
+
     pub(crate) router_logits: ArenaRegion<u16>,
     pub(crate) expert_indices: ArenaRegion<u16>,
     pub(crate) routing_weights: ArenaRegion<u16>,
@@ -169,6 +196,11 @@ pub(crate) struct Qwen38FlashNextResidentWorkspace {
     pub(crate) lengths: ArenaRegion<u32>,
     pub(crate) rope_cos: ArenaRegion<f32>,
     pub(crate) rope_sin: ArenaRegion<f32>,
+    pub(crate) block_rope_cos: ArenaRegion<f32>,
+    pub(crate) block_rope_sin: ArenaRegion<f32>,
+    pub(crate) candidate_blocks: ArenaRegion<u32>,
+    pub(crate) closing_first_blocks: ArenaRegion<u32>,
+    pub(crate) closing_block_counts: ArenaRegion<u32>,
 
     // --- engram staging, reserved once for the one layer that runs the module ---
     pub(crate) ple_codes: ArenaRegion<u8>,
@@ -203,13 +235,13 @@ pub(crate) struct Qwen38FlashNextResidentEndpoint {
     pub(crate) logits: ArenaRegion<u16>,
 }
 
-/// One QSA layer's three paged cache planes, all off the same block table.
+/// One QSA layer's cache planes, all off the same block table.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Qwen38FlashNextKvPlanes {
     pub(crate) key_pages: ArenaRegion<u8>,
     pub(crate) value_pages: ArenaRegion<u8>,
-    /// Raw 128-wide indexer keys sharing this layer's page mapping.
-    pub(crate) indexer_pages: ArenaRegion<u8>,
+    pub(crate) block_keys: ArenaRegion<u16>,
+    pub(crate) indexer_ring: ArenaRegion<u16>,
 }
 
 /// The shared paged cache: one block table, twelve layers of planes.
@@ -516,7 +548,7 @@ fn solve_physical_pages(fixed_non_kv: usize) -> EngineResult<usize> {
     Ok(pages)
 }
 
-/// K, V, and indexer bytes one physical page holds across all twelve QSA layers.
+/// K, V, and compressed block-key bytes in one physical page across all QSA layers.
 fn cache_bytes_per_physical_page() -> EngineResult<usize> {
     let kv = product(
         "Qwen3.8 Flash-Next KV page",
@@ -527,19 +559,15 @@ fn cache_bytes_per_physical_page() -> EngineResult<usize> {
         )?,
         <A as Arch>::HEAD_DIM,
     )?;
-    let indexer = product(
-        "Qwen3.8 Flash-Next indexer page",
-        QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE,
-        product(
-            "Qwen3.8 Flash-Next indexer key bytes",
-            A::INDEXER_HEAD_DIM,
-            2,
-        )?,
+    let block_keys = product(
+        "Qwen3.8 Flash-Next block-key page",
+        SELECTION_BLOCKS_PER_PAGE,
+        product("Qwen3.8 Flash-Next block key bytes", A::INDEXER_HEAD_DIM, 2)?,
     )?;
 
     product(
         "Qwen3.8 Flash-Next cache page",
-        checked_sum("Qwen3.8 Flash-Next cache page planes", 2 * kv, indexer)?,
+        checked_sum("Qwen3.8 Flash-Next cache page planes", 2 * kv, block_keys)?,
         QWEN38_FLASH_NEXT_ATTENTION_LAYERS,
     )
 }
@@ -743,6 +771,40 @@ fn reserve_workspace(builder: &mut ArenaLayout) -> EngineResult<Qwen38FlashNextR
         A::ATTENTION_OUTPUT_COLUMNS,
     )?;
     let row_rotary = product("Qwen3.8 Flash-Next rotary rows", rows, ROTARY_ELEMENTS)?;
+    let row_indexer_qk = product(
+        "Qwen3.8 Flash-Next indexer projection rows",
+        rows,
+        A::INDEXER_ROWS,
+    )?;
+    let row_indexer_query = product(
+        "Qwen3.8 Flash-Next indexer query rows",
+        product(
+            "Qwen3.8 Flash-Next indexer query heads",
+            rows,
+            A::INDEXER_HEADS,
+        )?,
+        A::INDEXER_HEAD_DIM,
+    )?;
+    let row_indexer_raw = product(
+        "Qwen3.8 Flash-Next indexer round keys",
+        rows,
+        A::INDEXER_HEAD_DIM,
+    )?;
+    let block_rotary = product(
+        "Qwen3.8 Flash-Next block rotary rows",
+        QWEN38_FLASH_NEXT_RESIDENT_ROUND_BLOCKS,
+        ROTARY_ELEMENTS,
+    )?;
+    let score_plane = product(
+        "Qwen3.8 Flash-Next score scratch",
+        SELECTION_ROW_TILE,
+        QWEN38_FLASH_NEXT_RESIDENT_SCORE_STRIDE,
+    )?;
+    let selected_plane = product(
+        "Qwen3.8 Flash-Next selected positions",
+        rows,
+        SELECTION_MAX_SELECTED,
+    )?;
     let row_router_logits = product("Qwen3.8 Flash-Next router logits", rows, A::NUM_EXPERTS)?;
     let row_routed = product("Qwen3.8 Flash-Next routed ranks", rows, ROUTED_SLOTS)?;
     let row_routed_intermediate = product(
@@ -792,6 +854,14 @@ fn reserve_workspace(builder: &mut ArenaLayout) -> EngineResult<Qwen38FlashNextR
         attention: builder.reserve(row_attention, ALIGNMENT)?,
         attention_gated: builder.reserve(row_attention, ALIGNMENT)?,
 
+        indexer_qk: builder.reserve(row_indexer_qk, ALIGNMENT)?,
+        indexer_query: builder.reserve(row_indexer_query, ALIGNMENT)?,
+        indexer_raw_round: builder.reserve(row_indexer_raw, ALIGNMENT)?,
+        scores: builder.reserve(score_plane, ALIGNMENT)?,
+        select_scratch: builder.reserve(SELECTION_SCRATCH_WORDS, ALIGNMENT)?,
+        selected: builder.reserve(selected_plane, ALIGNMENT)?,
+        selected_counts: builder.reserve(rows, ALIGNMENT)?,
+
         router_logits: builder.reserve(row_router_logits, ALIGNMENT)?,
         expert_indices: builder.reserve(row_routed, ALIGNMENT)?,
         routing_weights: builder.reserve(row_routed, ALIGNMENT)?,
@@ -809,6 +879,11 @@ fn reserve_workspace(builder: &mut ArenaLayout) -> EngineResult<Qwen38FlashNextR
         lengths: builder.reserve(rows, ALIGNMENT)?,
         rope_cos: builder.reserve(row_rotary, ALIGNMENT)?,
         rope_sin: builder.reserve(row_rotary, ALIGNMENT)?,
+        block_rope_cos: builder.reserve(block_rotary, ALIGNMENT)?,
+        block_rope_sin: builder.reserve(block_rotary, ALIGNMENT)?,
+        candidate_blocks: builder.reserve(rows, ALIGNMENT)?,
+        closing_first_blocks: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+        closing_block_counts: builder.reserve(MAX_BATCH, ALIGNMENT)?,
 
         ple_codes: builder.reserve(ple_codes, ALIGNMENT)?,
         ple_injected: builder.reserve(row_stream, ALIGNMENT)?,
@@ -891,18 +966,23 @@ fn reserve_kv(builder: &mut ArenaLayout, pages: usize) -> EngineResult<Qwen38Fla
             <A as Arch>::HEAD_DIM,
         )?,
     )?;
-    let indexer_plane = product(
-        "Qwen3.8 Flash-Next indexer cache plane",
+    let block_key_plane = product(
+        "Qwen3.8 Flash-Next block-key cache plane",
         product(
-            "Qwen3.8 Flash-Next indexer cache tokens",
+            "Qwen3.8 Flash-Next block-key cache blocks",
             pages,
-            QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE,
+            SELECTION_BLOCKS_PER_PAGE,
         )?,
+        A::INDEXER_HEAD_DIM,
+    )?;
+    let ring_plane = product(
+        "Qwen3.8 Flash-Next indexer ring",
         product(
-            "Qwen3.8 Flash-Next indexer key bytes",
-            A::INDEXER_HEAD_DIM,
-            2,
+            "Qwen3.8 Flash-Next indexer ring slots",
+            MAX_BATCH,
+            SELECTION_RING_SLOTS,
         )?,
+        A::INDEXER_HEAD_DIM,
     )?;
 
     let block_tables = builder.reserve(block_tables, ALIGNMENT)?;
@@ -911,7 +991,8 @@ fn reserve_kv(builder: &mut ArenaLayout, pages: usize) -> EngineResult<Qwen38Fla
         layers.push(Qwen38FlashNextKvPlanes {
             key_pages: builder.reserve(cache_plane, ALIGNMENT)?,
             value_pages: builder.reserve(cache_plane, ALIGNMENT)?,
-            indexer_pages: builder.reserve(indexer_plane, ALIGNMENT)?,
+            block_keys: builder.reserve(block_key_plane, ALIGNMENT)?,
+            indexer_ring: builder.reserve(ring_plane, ALIGNMENT)?,
         });
     }
 
@@ -1010,6 +1091,13 @@ fn workspace_byte_len(
             workspace.query.byte_len(),
             workspace.attention.byte_len(),
             workspace.attention_gated.byte_len(),
+            workspace.indexer_qk.byte_len(),
+            workspace.indexer_query.byte_len(),
+            workspace.indexer_raw_round.byte_len(),
+            workspace.scores.byte_len(),
+            workspace.select_scratch.byte_len(),
+            workspace.selected.byte_len(),
+            workspace.selected_counts.byte_len(),
             workspace.router_logits.byte_len(),
             workspace.expert_indices.byte_len(),
             workspace.routing_weights.byte_len(),
@@ -1025,6 +1113,11 @@ fn workspace_byte_len(
             workspace.lengths.byte_len(),
             workspace.rope_cos.byte_len(),
             workspace.rope_sin.byte_len(),
+            workspace.block_rope_cos.byte_len(),
+            workspace.block_rope_sin.byte_len(),
+            workspace.candidate_blocks.byte_len(),
+            workspace.closing_first_blocks.byte_len(),
+            workspace.closing_block_counts.byte_len(),
             workspace.ple_codes.byte_len(),
             workspace.ple_injected.byte_len(),
             workspace.ple_embedding.byte_len(),
@@ -1194,10 +1287,11 @@ mod tests {
                 * <A as Arch>::HEAD_DIM,
             32_768
         );
-        assert_eq!(cache_bytes_per_physical_page().unwrap(), 983_040);
-        // 786,432 K/V plus 196,608 indexer, across all twelve QSA layers.
-        assert_eq!(cache_bytes_per_physical_page().unwrap() / 12 * 12, 983_040);
-        assert_eq!(cache_bytes_per_physical_page().unwrap() / 64, 15_360);
+        assert_eq!(cache_bytes_per_physical_page().unwrap(), 835_584);
+        assert_eq!(cache_bytes_per_physical_page().unwrap() / 64, 13_056);
+        assert_eq!(QWEN38_FLASH_NEXT_RESIDENT_CANDIDATE_BLOCKS, 65_536);
+        assert_eq!(QWEN38_FLASH_NEXT_RESIDENT_SCORE_STRIDE, 65_536);
+        assert_eq!(QWEN38_FLASH_NEXT_RESIDENT_ROUND_BLOCKS, 257);
         assert_eq!(
             QWEN38_FLASH_NEXT_EXPERT_ITEM_COUNT * 2_764_800,
             67_947_724_800
@@ -1206,34 +1300,30 @@ mod tests {
     }
 
     #[test]
-    fn the_kv_solver_spends_every_spare_byte_and_clears_the_dense_band() {
+    fn the_block_table_caps_the_pool_before_the_device_budget() {
         let plan = Qwen38FlashNextResidentLayout::build().unwrap();
 
-        // The 25% posture funds 3,672 pages against the dense band's 264-page floor.
-        assert!(plan.physical_pages() >= 264);
-        assert!(
-            plan.context_tokens_per_slot() >= crate::QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING
+        assert_eq!(plan.physical_pages(), 4_096);
+        assert_eq!(plan.context_tokens_per_slot(), 32_768);
+        assert_eq!(
+            plan.physical_pages() * QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE,
+            A::MAX_POSITION_EMBEDDINGS
         );
-        assert_eq!(plan.physical_pages(), 3_672);
-        assert_eq!(plan.context_tokens_per_slot(), 29_376);
 
-        // Every arena together stays inside the admitted budget with the house headroom held
-        // back, and the remainder is smaller than one more page.
         let total = plan.total_device_bytes().unwrap();
         let spendable =
             QWEN38_FLASH_NEXT_DEVICE_BUDGET_BYTES - QWEN38_FLASH_NEXT_REQUIRED_HEADROOM_BYTES;
         assert!(total <= spendable);
-        assert!(spendable - total < cache_bytes_per_physical_page().unwrap());
+        assert!(spendable - total > 100 * cache_bytes_per_physical_page().unwrap());
     }
 
     #[test]
     fn a_thirty_percent_cache_no_longer_funds_the_dense_band_on_this_workspace() {
-        // The wider workspace leaves only 215 pages at 30% expert residency, below the floor.
         let thirty =
             Qwen38FlashNextResidentLayout::plan(7_373, StreamingPrimarySource::Mapped, None)
                 .unwrap();
 
-        assert_eq!(thirty.physical_pages(), 215);
+        assert_eq!(thirty.physical_pages(), 217);
         assert!(thirty.physical_pages() < 264);
         assert!(
             thirty.context_tokens_per_slot() < crate::QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING
@@ -1246,7 +1336,22 @@ mod tests {
         let workspace = plan.workspace();
         let endpoint = plan.endpoint();
 
-        assert_eq!(plan.workspace_bytes(), 526_358_560);
+        assert_eq!(plan.workspace_bytes(), 556_380_512);
+
+        let selection = workspace.indexer_qk.byte_len()
+            + workspace.indexer_query.byte_len()
+            + workspace.indexer_raw_round.byte_len()
+            + workspace.scores.byte_len()
+            + workspace.select_scratch.byte_len()
+            + workspace.selected.byte_len()
+            + workspace.selected_counts.byte_len()
+            + workspace.block_rope_cos.byte_len()
+            + workspace.block_rope_sin.byte_len()
+            + workspace.candidate_blocks.byte_len()
+            + workspace.closing_first_blocks.byte_len()
+            + workspace.closing_block_counts.byte_len();
+        assert_eq!(selection, 30_021_952);
+        assert_eq!(workspace.select_scratch.byte_len(), 1_099_776);
 
         // Ten caller-owned engram staging planes.
         let ple = workspace.ple_codes.byte_len()
@@ -1281,7 +1386,7 @@ mod tests {
         // Alignment padding is the only difference, and it is small: 256 B per region
         // boundary at worst, against a 10 GiB arena.
         assert!(plan.resident_arena_bytes() >= represented);
-        assert_eq!(plan.resident_arena_bytes() - represented, 11_744);
+        assert_eq!(plan.resident_arena_bytes() - represented, 12_448);
         assert!(plan.resident_arena_bytes() - represented < 32 * 1_024);
     }
 

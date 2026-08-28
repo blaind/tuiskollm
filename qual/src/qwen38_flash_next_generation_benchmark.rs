@@ -2,7 +2,8 @@
 
 use crate::device_benchmark::{self, DeviceBenchmarkError};
 use crate::qwen38_flash_next_golden::{
-    load_qwen38_flash_next_golden_capture, qwen38_flash_next_golden_directory,
+    load_qwen38_flash_next_golden_boundary, load_qwen38_flash_next_golden_capture,
+    qwen38_flash_next_golden_directory,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -24,6 +25,13 @@ const GENERATED_TOKENS: usize = 24;
 
 /// Prompt lengths the sweep distinguishes, chosen so each exercises a different tile ladder.
 const SWEPT_PROMPTS: [usize; 5] = [16, 64, 160, 512, 1_120];
+
+/// Selected-route prompt depths.
+const LONG_PROMPTS: [usize; 3] = [8_192, 32_768, 131_072];
+
+const LONG_WARM_REQUESTS: usize = 1;
+const LONG_MEASURED_REQUESTS: usize = 2;
+const LONG_GENERATED_TOKENS: usize = 8;
 
 #[derive(Clone, Copy)]
 struct RequestSample {
@@ -101,20 +109,29 @@ pub fn benchmark_qwen38_flash_next_generation(
     let mut generator = Qwen38FlashNextTextGenerator::from_snapshot_device_zero(snapshot)?;
     let load = started.elapsed();
 
-    let loaded_prompt = synthetic_prompt(*SWEPT_PROMPTS.last().expect("nonempty prompt sweep"));
-    for _ in 0..WARM_REQUESTS {
-        run_request(&mut generator, &loaded_prompt)?;
+    let boundary =
+        load_qwen38_flash_next_golden_boundary(&qwen38_flash_next_golden_directory(), 2_100)
+            .map_err(|error| DeviceBenchmarkError::Precondition(error.to_string()))?;
+    let loaded_prompt = repeated_prompt(&boundary.prompt_ids, LONG_PROMPTS[0]);
+    for _ in 0..LONG_WARM_REQUESTS {
+        run_request(&mut generator, &loaded_prompt, LONG_GENERATED_TOKENS)?;
     }
     device_benchmark::require_current_process_exclusive()?;
     device_benchmark::validate_loaded_host_clock_policy(
         "qwen3_8_flash_next/generation/request",
-        || run_request(&mut generator, &loaded_prompt).map(|_| ()),
+        || run_request(&mut generator, &loaded_prompt, LONG_GENERATED_TOKENS).map(|_| ()),
     )?;
 
     let sampler = device_benchmark::TelemetrySampler::start();
-    let mut routes = Vec::with_capacity(SWEPT_PROMPTS.len());
+    let mut routes = Vec::with_capacity(SWEPT_PROMPTS.len() + LONG_PROMPTS.len());
     for prompt_tokens in SWEPT_PROMPTS {
         let report = measure_prompt(&mut generator, prompt_tokens)?;
+        print_route(&report);
+        routes.push(report);
+    }
+    println!("--- selected route ---");
+    for prompt_tokens in LONG_PROMPTS {
+        let report = measure_long_prompt(&mut generator, &boundary.prompt_ids, prompt_tokens)?;
         print_route(&report);
         routes.push(report);
     }
@@ -154,14 +171,44 @@ fn measure_prompt(
     generator: &mut Qwen38FlashNextTextGenerator,
     prompt_tokens: usize,
 ) -> Result<Qwen38FlashNextGenerationRouteReport, DeviceBenchmarkError> {
-    let prompt = synthetic_prompt(prompt_tokens);
-    for _ in 0..WARM_REQUESTS {
-        run_request(generator, &prompt)?;
+    measure_requests(
+        generator,
+        synthetic_prompt(prompt_tokens),
+        WARM_REQUESTS,
+        MEASURED_REQUESTS,
+        GENERATED_TOKENS,
+    )
+}
+
+fn measure_long_prompt(
+    generator: &mut Qwen38FlashNextTextGenerator,
+    seed: &[u32],
+    prompt_tokens: usize,
+) -> Result<Qwen38FlashNextGenerationRouteReport, DeviceBenchmarkError> {
+    measure_requests(
+        generator,
+        repeated_prompt(seed, prompt_tokens),
+        LONG_WARM_REQUESTS,
+        LONG_MEASURED_REQUESTS,
+        LONG_GENERATED_TOKENS,
+    )
+}
+
+fn measure_requests(
+    generator: &mut Qwen38FlashNextTextGenerator,
+    prompt: Vec<u32>,
+    warm_requests: usize,
+    measured_requests: usize,
+    generated_tokens: usize,
+) -> Result<Qwen38FlashNextGenerationRouteReport, DeviceBenchmarkError> {
+    let prompt_tokens = prompt.len();
+    for _ in 0..warm_requests {
+        run_request(generator, &prompt, generated_tokens)?;
     }
 
-    let mut samples = Vec::with_capacity(MEASURED_REQUESTS);
-    for _ in 0..MEASURED_REQUESTS {
-        samples.push(run_request(generator, &prompt)?);
+    let mut samples = Vec::with_capacity(measured_requests);
+    for _ in 0..measured_requests {
+        samples.push(run_request(generator, &prompt, generated_tokens)?);
     }
 
     let mut times = samples
@@ -190,7 +237,7 @@ fn measure_prompt(
 
     Ok(Qwen38FlashNextGenerationRouteReport {
         prompt_tokens,
-        generated_tokens: GENERATED_TOKENS,
+        generated_tokens,
         native_prefill_tokens,
         prime_tiles: last.prime_tiles(),
         prime_scalar_rounds: last.prime_scalar_rounds(),
@@ -212,16 +259,17 @@ fn measure_prompt(
 fn run_request(
     generator: &mut Qwen38FlashNextTextGenerator,
     prompt: &[u32],
+    generated_tokens: usize,
 ) -> Result<RequestSample, DeviceBenchmarkError> {
     let run = generator.qualification_generate_from_tokens(
         prompt,
-        GENERATED_TOKENS,
+        generated_tokens,
         SamplingOptions::greedy(),
         0,
     )?;
-    if run.token_ids.len() != GENERATED_TOKENS {
+    if run.token_ids.len() != generated_tokens {
         return Err(DeviceBenchmarkError::Precondition(format!(
-            "generation stopped after {} of {GENERATED_TOKENS} benchmark tokens",
+            "generation stopped after {} of {generated_tokens} benchmark tokens",
             run.token_ids.len()
         )));
     }
@@ -231,7 +279,12 @@ fn run_request(
         )
     })?;
     let telemetry = generator.telemetry();
-    validate_request_telemetry(prompt.len(), run.native_prefill_tokens, telemetry)?;
+    validate_request_telemetry(
+        prompt.len(),
+        generated_tokens,
+        run.native_prefill_tokens,
+        telemetry,
+    )?;
 
     Ok(RequestSample {
         telemetry,
@@ -256,12 +309,13 @@ fn prompt_plan(tokens: usize) -> (usize, usize, usize) {
 
 fn validate_request_telemetry(
     prompt_tokens: usize,
+    generated_tokens: usize,
     native_prefill_tokens: usize,
     telemetry: Qwen38FlashNextGenerationTelemetry,
 ) -> Result<(), DeviceBenchmarkError> {
     validate_request_telemetry_for_tokens(
         prompt_tokens,
-        GENERATED_TOKENS,
+        generated_tokens,
         native_prefill_tokens,
         telemetry,
     )
@@ -314,11 +368,8 @@ fn validate_request_telemetry_for_tokens(
         ),
         (
             telemetry.kv_append_bytes(),
-            rows * QWEN38_FLASH_NEXT_ATTENTION_LAYERS
-                * 2
-                * <Qwen38FlashNext as Arch>::NUM_KV_HEADS
-                * <Qwen38FlashNext as Arch>::HEAD_DIM,
-            "K/V append bytes",
+            expected_kv_append_bytes(rows),
+            "cache append bytes",
         ),
     ];
     for (actual, expected, name) in expected {
@@ -330,6 +381,16 @@ fn validate_request_telemetry_for_tokens(
     }
 
     Ok(())
+}
+
+fn expected_kv_append_bytes(rows: usize) -> usize {
+    let per_token = QWEN38_FLASH_NEXT_ATTENTION_LAYERS
+        * (2 * <Qwen38FlashNext as Arch>::NUM_KV_HEADS * <Qwen38FlashNext as Arch>::HEAD_DIM
+            + Qwen38FlashNext::INDEXER_HEAD_DIM * size_of::<u16>());
+    let per_block =
+        QWEN38_FLASH_NEXT_ATTENTION_LAYERS * Qwen38FlashNext::INDEXER_HEAD_DIM * size_of::<u16>();
+
+    rows * per_token + rows / Qwen38FlashNext::INDEXER_COMPRESS_RATIO * per_block
 }
 
 /// Replays the committed captures from a reset expert cache.
@@ -376,6 +437,10 @@ fn synthetic_prompt(tokens: usize) -> Vec<u32> {
     (0..tokens as u32)
         .map(|index| 2_048 + index.wrapping_mul(97) % 200_000)
         .collect()
+}
+
+fn repeated_prompt(seed: &[u32], tokens: usize) -> Vec<u32> {
+    seed.iter().copied().cycle().take(tokens).collect()
 }
 
 fn print_route(report: &Qwen38FlashNextGenerationRouteReport) {
@@ -499,11 +564,17 @@ mod tests {
 
         let rows = SWEPT_PROMPTS[0] + GENERATED_TOKENS - 1;
         assert_eq!(
-            rows * QWEN38_FLASH_NEXT_ATTENTION_LAYERS
-                * 2
-                * <Qwen38FlashNext as Arch>::NUM_KV_HEADS
-                * <Qwen38FlashNext as Arch>::HEAD_DIM,
-            rows * 12_288
+            expected_kv_append_bytes(rows),
+            rows * 15_360 + rows / 4 * 3_072
+        );
+        for prompt in LONG_PROMPTS {
+            let (native, tiles, scalar) = prompt_plan(prompt);
+            assert_eq!((native, scalar), (prompt, 0));
+            assert_eq!(tiles, prompt / 1_024);
+        }
+        assert_eq!(
+            repeated_prompt(&[7, 11, 13], 8),
+            [7, 11, 13, 7, 11, 13, 7, 11]
         );
         assert_eq!(WARM_REQUESTS, 3);
         assert_eq!(MEASURED_REQUESTS, 4);
