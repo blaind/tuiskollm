@@ -17,6 +17,7 @@ use crate::qwen38_flash_next::resident_model_layout::{
     Qwen38FlashNextResidentLayout,
 };
 use crate::{EngineError, EngineResult, MAX_BATCH, StreamingResidencyAccounting};
+use std::mem::size_of;
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::{
     QWEN38_FLASH_NEXT_MTP_DOWN_EXTENT_BYTES, QWEN38_FLASH_NEXT_MTP_GATE_UP_EXTENT_BYTES,
@@ -24,6 +25,8 @@ use tuisko_kernels_sm120::{
 use tuisko_model::{Arch, Qwen38FlashNext};
 
 type A = Qwen38FlashNext;
+
+const ROTARY_ELEMENTS: usize = 32;
 
 /// Routed experts in the draft block's pool.
 pub const QWEN38_FLASH_NEXT_MTP_EXPERT_ITEM_COUNT: usize = A::NUM_EXPERTS;
@@ -55,7 +58,7 @@ const _: () = assert!(QWEN38_FLASH_NEXT_MTP_ROUND_ROWS == 32);
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 pub(crate) struct Qwen38FlashNextMtpFusionRegions {
-    /// RMSNorm gain over the embedding term `[HIDDEN]`.
+    /// Replicated RMSNorm gain over the four embedding branches.
     pub(crate) norm_embedding: ArenaRegion<u16>,
     /// Grouped RMSNorm gain over the stream term `[HC_WIDTH]`.
     pub(crate) norm_hidden: ArenaRegion<u16>,
@@ -81,16 +84,16 @@ pub(crate) struct Qwen38FlashNextMtpLayerRegions {
 pub(crate) struct Qwen38FlashNextMtpWorkspace {
     /// The draft's own four-branch stream, published by the input fusion.
     pub(crate) residual_a: ArenaRegion<u16>,
-    /// The stream the attention write-back publishes.
+    /// The stream the attention write-back publishes and the fusion reads.
     pub(crate) residual_b: ArenaRegion<u16>,
+    /// Final target stream row retained across rounds.
+    pub(crate) stream_carry: ArenaRegion<u16>,
 
     /// Host-gathered embedding rows of the tokens being drafted.
     pub(crate) embedding_rows: ArenaRegion<u16>,
-    /// The normalized embedding term, before `fc_embedding`.
-    pub(crate) fusion_embedding: ArenaRegion<u16>,
     /// The grouped-normalized stream term, before `fc_hidden`.
     pub(crate) fusion_hidden: ArenaRegion<u16>,
-    /// `fc_embedding(enorm(e))`, one 2,560-wide row broadcast to every branch.
+    /// Projected embedding term, already widened across four branches.
     pub(crate) fusion_projected: ArenaRegion<u16>,
 
     pub(crate) hc_normalized: ArenaRegion<u16>,
@@ -122,6 +125,9 @@ pub(crate) struct Qwen38FlashNextMtpWorkspace {
     pub(crate) mixer_normalized: ArenaRegion<u16>,
     pub(crate) mixer_low_rank: ArenaRegion<u16>,
     pub(crate) mixer_mixed: ArenaRegion<u16>,
+
+    /// Proposal logits, separate from target verification output.
+    pub(crate) logits: ArenaRegion<u16>,
 
     // Runtime inputs staged per round.
     pub(crate) table_rows: ArenaRegion<u32>,
@@ -223,6 +229,14 @@ impl Qwen38FlashNextMtpLayout {
     /// The draft pool's plan.
     pub const fn streaming(&self) -> &StreamingWeightLayout {
         &self.streaming
+    }
+
+    pub(crate) const fn resident_builder(&self) -> &ArenaLayout {
+        &self.resident
+    }
+
+    pub(crate) const fn kv_builder(&self) -> &ArenaLayout {
+        &self.kv
     }
 
     /// Resident weight bytes, excluding workspace and cache.
@@ -382,7 +396,7 @@ fn reserve_fusion(builder: &mut ArenaLayout) -> EngineResult<Qwen38FlashNextMtpF
     )?;
 
     Ok(Qwen38FlashNextMtpFusionRegions {
-        norm_embedding: builder.reserve(<A as Arch>::HIDDEN, ALIGNMENT)?,
+        norm_embedding: builder.reserve(A::HC_WIDTH, ALIGNMENT)?,
         norm_hidden: builder.reserve(A::HC_WIDTH, ALIGNMENT)?,
         fc_embedding: builder.reserve(square, ALIGNMENT)?,
         fc_hidden: builder.reserve(square, ALIGNMENT)?,
@@ -505,6 +519,7 @@ fn reserve_workspace(builder: &mut ArenaLayout) -> EngineResult<Qwen38FlashNextM
         )?,
     )?;
     let indexer_raw = product("Flash-Next MTP indexer raw rows", rows, A::INDEXER_HEAD_DIM)?;
+    let logits = product("Flash-Next MTP proposal logits", VERIFY_ROWS, A::VOCAB)?;
     let routed = product(
         "Flash-Next MTP routed rows",
         rows,
@@ -529,11 +544,11 @@ fn reserve_workspace(builder: &mut ArenaLayout) -> EngineResult<Qwen38FlashNextM
     Ok(Qwen38FlashNextMtpWorkspace {
         residual_a: builder.reserve(row_stream, ALIGNMENT)?,
         residual_b: builder.reserve(row_stream, ALIGNMENT)?,
+        stream_carry: builder.reserve(A::HC_WIDTH, ALIGNMENT)?,
 
         embedding_rows: builder.reserve(row_hidden, ALIGNMENT)?,
-        fusion_embedding: builder.reserve(row_hidden, ALIGNMENT)?,
         fusion_hidden: builder.reserve(row_stream, ALIGNMENT)?,
-        fusion_projected: builder.reserve(row_hidden, ALIGNMENT)?,
+        fusion_projected: builder.reserve(row_stream, ALIGNMENT)?,
 
         hc_normalized: builder.reserve(row_stream, ALIGNMENT)?,
         hc_low_rank: builder.reserve(row_low_rank, ALIGNMENT)?,
@@ -564,23 +579,17 @@ fn reserve_workspace(builder: &mut ArenaLayout) -> EngineResult<Qwen38FlashNextM
         mixer_low_rank: builder.reserve(row_low_rank, ALIGNMENT)?,
         mixer_mixed: builder.reserve(row_hidden, ALIGNMENT)?,
 
-        table_rows: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+        logits: builder.reserve(logits, ALIGNMENT)?,
+
+        table_rows: builder.reserve(rows, ALIGNMENT)?,
         cache_positions: builder.reserve(rows, ALIGNMENT)?,
-        lengths: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+        lengths: builder.reserve(rows, ALIGNMENT)?,
         rope_cos: builder.reserve(
-            product(
-                "Flash-Next MTP rotary rows",
-                rows,
-                <A as Arch>::HEAD_DIM / 4,
-            )?,
+            product("Flash-Next MTP rotary rows", rows, ROTARY_ELEMENTS)?,
             ALIGNMENT,
         )?,
         rope_sin: builder.reserve(
-            product(
-                "Flash-Next MTP rotary rows",
-                rows,
-                <A as Arch>::HEAD_DIM / 4,
-            )?,
+            product("Flash-Next MTP rotary rows", rows, ROTARY_ELEMENTS)?,
             ALIGNMENT,
         )?,
     })
@@ -644,7 +653,11 @@ fn weight_bytes(
     sum(
         "Flash-Next MTP resident weight bytes",
         &[
-            fusion.norm_embedding.byte_len(),
+            product(
+                "Flash-Next MTP embedding gain bytes",
+                <A as Arch>::HIDDEN,
+                size_of::<u16>(),
+            )?,
             fusion.norm_hidden.byte_len(),
             fusion.fc_embedding.byte_len(),
             fusion.fc_hidden.byte_len(),
@@ -768,12 +781,12 @@ mod tests {
         assert_eq!(joint.target().streaming().slot_count(), 5_578);
         assert_eq!(joint.draft().streaming().slot_count(), 128);
         assert_eq!(target.physical_pages(), 3_672);
-        assert_eq!(joint.physical_pages(), 3_303);
+        assert_eq!(joint.physical_pages(), 3_291);
         assert_eq!(
             joint.physical_pages() * QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE,
-            211_392
+            210_624
         );
-        assert_eq!(joint.draft().total_device_bytes().unwrap(), 1_927_438_336);
+        assert_eq!(joint.draft().total_device_bytes().unwrap(), 1_938_856_448);
 
         let total = joint.total_device_bytes().unwrap();
         let spendable =
