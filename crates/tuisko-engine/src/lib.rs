@@ -23,6 +23,8 @@ pub use common::streaming::{
     StreamingRound, StreamingSlotAssignment, StreamingSlotCache, StreamingWeightLayout,
     StreamingWeightPool,
 };
+#[cfg(feature = "qualification")]
+pub use common::text_generator::QualificationGeneration;
 pub use common::text_generator::{
     ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentCancellation,
     ResidentRequestId,
@@ -143,7 +145,8 @@ pub use qwen38_flash_next::qsa_moe_layer::{
 pub use qwen38_flash_next::qsa_moe_layer_layout::Qwen38FlashNextQsaMoeLayerLayout;
 pub use qwen38_flash_next::resident_model::{
     Qwen38FlashNextLayerStreamTelemetry, Qwen38FlashNextResidentLoadStats,
-    Qwen38FlashNextResidentModel, Qwen38FlashNextStepTelemetry, qwen38_flash_next_rope,
+    Qwen38FlashNextResidentModel, Qwen38FlashNextSlotSnapshot, Qwen38FlashNextStepTelemetry,
+    qwen38_flash_next_rope,
 };
 pub use qwen38_flash_next::resident_model_layout::{
     QWEN38_FLASH_NEXT_ATTENTION_LAYERS, QWEN38_FLASH_NEXT_DEVICE_BUDGET_BYTES,
@@ -152,6 +155,10 @@ pub use qwen38_flash_next::resident_model_layout::{
     QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES, QWEN38_FLASH_NEXT_PRIMARY_SOURCE,
     QWEN38_FLASH_NEXT_REQUIRED_HEADROOM_BYTES, QWEN38_FLASH_NEXT_RESIDENT_MAX_ROWS,
     QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS, Qwen38FlashNextResidentLayout,
+};
+pub use qwen38_flash_next::slot_lifecycle::{
+    QWEN38_FLASH_NEXT_SLOT_PAGE_TOKENS, QWEN38_FLASH_NEXT_UNMAPPED_PAGE, Qwen38FlashNextSlotChange,
+    Qwen38FlashNextSlotPool, Qwen38FlashNextSlotRelease, Qwen38FlashNextSlotState,
 };
 /// Single-slot Qwen3.5 streaming request over the resident text program.
 pub type Qwen35ResidentGenerationSession<'a> =
@@ -165,6 +172,13 @@ pub type Qwen36ResidentGenerationSession<'a> =
 /// Single-slot Qwen3.6 frontend, resident program, stream, and host-logit owner.
 pub type Qwen36ResidentTextGenerator =
     common::text_generator::SingleSlotTextGenerator<Qwen36ResidentModelProgram>;
+pub use qwen38_flash_next::text_generation::Qwen38FlashNextGenerationTelemetry;
+/// Single-slot Qwen3.8 Flash-Next streaming request.
+pub type Qwen38FlashNextGenerationSession<'a> =
+    common::text_generator::SingleSlotGenerationSession<'a, Qwen38FlashNextResidentModel>;
+/// Single-slot Qwen3.8 Flash-Next generator.
+pub type Qwen38FlashNextTextGenerator =
+    common::text_generator::SingleSlotTextGenerator<Qwen38FlashNextResidentModel>;
 /// Single-slot Qwen3.8 streaming request over the resident text program.
 pub type ResidentGenerationSession<'a> =
     common::text_generator::SingleSlotGenerationSession<'a, ResidentModelProgram>;

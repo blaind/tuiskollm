@@ -1,0 +1,12 @@
+{
+ "model": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+ "revision": "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
+ "engine": "sglang",
+ "engine_version": "0.0.0.dev1+gd91c3682b",
+ "tensor_parallel_size": 1,
+ "hardware": "1x NVIDIA B300 SXM6 AC",
+ "ple_cpu_offload": null,
+ "topk_logprobs": 32,
+ "greedy": true,
+ "max_model_len": 8192
+}

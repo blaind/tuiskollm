@@ -136,6 +136,10 @@ fn measure_decode(
         .map(|row| (1_024 + row * 97) as u32)
         .collect::<Vec<_>>();
     let slots = (0..batch).collect::<Vec<_>>();
+    let rounds = WARM_PASSES + MEASURED_STEPS;
+    for &slot in &slots {
+        model.reserve_slot(stream, slot, rounds)?;
+    }
 
     for warm in 0..WARM_PASSES {
         model.decode_step(stream, &tokens, &vec![warm as u32; batch], &slots)?;
@@ -157,6 +161,7 @@ fn measure_prefill(
     let prompt = (0..tile)
         .map(|token| (2_048 + token) as u32)
         .collect::<Vec<_>>();
+    model.reserve_slot(stream, 0, tile)?;
 
     for _ in 0..WARM_PASSES {
         model.reset_slot(stream, 0)?;
@@ -343,7 +348,7 @@ mod tests {
                 layer_rounds: 48,
                 expert_requests: 480,
                 expert_bytes_routed: 1_327_104_000,
-                embedding_h2d_bytes: 10_240,
+                embedding_h2d_bytes: 5_120,
                 engram_h2d_bytes: 2_560,
                 engram_rows: 16,
                 kv_append_bytes: 12_288,

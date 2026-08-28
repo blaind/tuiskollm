@@ -12,3 +12,5 @@ pub(crate) mod qsa_moe_layer;
 pub(crate) mod qsa_moe_layer_layout;
 pub(crate) mod resident_model;
 pub(crate) mod resident_model_layout;
+pub(crate) mod slot_lifecycle;
+pub(crate) mod text_generation;

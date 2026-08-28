@@ -9,7 +9,8 @@ use crate::common::streaming::{
 };
 use crate::qwen38_flash_next::engram_stager::gather_qwen38_flash_next_engram_window;
 use crate::qwen38_flash_next::layer_route::{
-    QWEN38_FLASH_NEXT_PREFILL_ROWS, Qwen38FlashNextRowRoute, qwen38_flash_next_row_route,
+    QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING, QWEN38_FLASH_NEXT_PREFILL_ROWS,
+    Qwen38FlashNextRowRoute, qwen38_flash_next_row_route,
     require_qwen38_flash_next_dense_qsa_visible,
 };
 use crate::qwen38_flash_next::layer_upload::{
@@ -21,6 +22,11 @@ use crate::qwen38_flash_next::resident_model_layout::{
     QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS, Qwen38FlashNextBlockWeightRegions,
     Qwen38FlashNextResidentEndpoint, Qwen38FlashNextResidentLayout,
 };
+use crate::qwen38_flash_next::slot_lifecycle::{
+    QWEN38_FLASH_NEXT_SLOT_PAGE_TOKENS, QWEN38_FLASH_NEXT_UNMAPPED_PAGE, Qwen38FlashNextSlotChange,
+    Qwen38FlashNextSlotPool, Qwen38FlashNextSlotRelease, Qwen38FlashNextSlotState,
+};
+use crate::qwen38_flash_next::text_generation::Qwen38FlashNextGenerationTelemetry;
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -244,6 +250,39 @@ impl Qwen38FlashNextStepTelemetry {
     /// Tokens per second this step sustained.
     pub fn tokens_per_second(&self) -> f64 {
         self.rows as f64 / self.forward.as_secs_f64()
+    }
+}
+
+/// A complete restore point for one slot's sequence state.
+#[derive(Clone, Debug)]
+pub struct Qwen38FlashNextSlotSnapshot {
+    owner: Arc<()>,
+    slot: usize,
+    sequence: u64,
+    tokens: usize,
+    carry: Qwen38FlashNextEngramCarry,
+    gdn_history: Vec<u16>,
+    gdn_state: Vec<f32>,
+    ple_conv_state: Vec<u16>,
+}
+
+impl Qwen38FlashNextSlotSnapshot {
+    /// Slot this snapshot belongs to.
+    pub const fn slot(&self) -> usize {
+        self.slot
+    }
+
+    /// Tokens covered by the snapshot.
+    pub const fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// Recurrent payload bytes held by the snapshot.
+    pub fn byte_len(&self) -> usize {
+        size_of::<Qwen38FlashNextEngramCarry>()
+            + self.gdn_history.len() * size_of::<u16>()
+            + self.gdn_state.len() * size_of::<f32>()
+            + self.ple_conv_state.len() * size_of::<u16>()
     }
 }
 
@@ -487,6 +526,9 @@ pub struct Qwen38FlashNextResidentModel {
     engram_rows: Vec<i64>,
     carries: [Qwen38FlashNextEngramCarry; MAX_BATCH],
     round_items: Vec<u32>,
+    slots: Qwen38FlashNextSlotPool,
+    snapshot_owner: Arc<()>,
+    generation: Qwen38FlashNextGenerationTelemetry,
 
     layers: Vec<LayerPointers>,
     workspace: WorkspacePointers,
@@ -601,9 +643,37 @@ impl Qwen38FlashNextResidentModel {
         self.kv_base_address
     }
 
-    /// Context depth one decode slot reaches.
+    /// Context depth one decode slot reaches, as the KV solver funded it.
     pub const fn context_capacity(&self) -> usize {
         self.layout.context_tokens_per_slot()
+    }
+
+    /// Longest sequence admitted by both the funded cache and dense QSA.
+    pub const fn generation_capacity(&self) -> usize {
+        let funded = self.layout.context_tokens_per_slot();
+        if funded < QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING {
+            funded
+        } else {
+            QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING
+        }
+    }
+
+    /// Whole-request streaming and timing evidence accumulated since the last reset.
+    pub const fn generation_telemetry(&self) -> Qwen38FlashNextGenerationTelemetry {
+        self.generation
+    }
+
+    /// Starts a fresh request's accounting.
+    pub fn reset_generation_telemetry(&mut self) {
+        self.generation = Qwen38FlashNextGenerationTelemetry::default();
+    }
+
+    pub(crate) fn observe_prime_round(&mut self, step: &Qwen38FlashNextStepTelemetry, tile: bool) {
+        self.generation.observe_prime(step, tile);
+    }
+
+    pub(crate) fn observe_decode_round(&mut self, step: &Qwen38FlashNextStepTelemetry) {
+        self.generation.observe_decode(step);
     }
 
     /// Captured executables this program retains.
@@ -1112,6 +1182,9 @@ impl Qwen38FlashNextResidentModel {
             round_items: Vec::with_capacity(
                 QWEN38_FLASH_NEXT_RESIDENT_MAX_ROWS * A::NUM_EXPERTS_PER_TOKEN,
             ),
+            slots: Qwen38FlashNextSlotPool::new(layout.physical_pages())?,
+            snapshot_owner: Arc::new(()),
+            generation: Qwen38FlashNextGenerationTelemetry::default(),
             layers,
             workspace,
             endpoint,
@@ -1298,18 +1371,11 @@ impl Qwen38FlashNextResidentModel {
             &endpoint.lm_head.words().collect::<Vec<_>>(),
         )?;
 
-        // The block table is an identity over the funded pages: slot `s` owns the contiguous
-        // run `[s * stride, (s + 1) * stride)`, which is what makes the KV cache addressable
-        // from a captured graph without a per-step table rewrite.
-        let stride = crate::QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES;
-        let pages = self.layout.physical_pages();
-        let per_slot = pages / MAX_BATCH;
-        let mut table = vec![u32::MAX; MAX_BATCH * stride];
-        for slot in 0..MAX_BATCH {
-            for page in 0..per_slot {
-                table[slot * stride + page] = (slot * per_slot + page) as u32;
-            }
-        }
+        // Reservations populate the initially unmapped block table.
+        let table = vec![
+            QWEN38_FLASH_NEXT_UNMAPPED_PAGE;
+            MAX_BATCH * crate::QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES
+        ];
         self.kv_arena
             .copy_from_host(stream, self.layout.kv_regions().block_tables, &table)?;
         stream.synchronize().map_err(GpuError::from)?;
@@ -1848,16 +1914,24 @@ impl Qwen38FlashNextResidentModel {
                 "a Qwen3.8 Flash-Next decode step needs one position and one slot per token",
             ));
         }
+        require_distinct_decode_slots(slots)?;
         for &position in positions {
             require_qwen38_flash_next_dense_qsa_visible(position as usize + 1)?;
         }
+        for (&slot, &position) in slots.iter().zip(positions) {
+            self.admit_round(slot, position as usize, position as usize + 1)?;
+        }
 
         let started = Instant::now();
+        self.flush_block_tables(stream)?;
         let embedding_h2d_bytes = self.stage_embeddings(stream, tokens)?;
         let (engram_h2d_bytes, engram_rows) = self.stage_engram(stream, tokens, slots, false)?;
         self.stage_round_inputs(stream, rows, slots, slots, positions)?;
         let layers = self.forward(stream, rows)?;
         let forward = started.elapsed();
+        for (&slot, &position) in slots.iter().zip(positions) {
+            self.slots.commit(slot, position as usize + 1)?;
+        }
 
         Ok(Qwen38FlashNextStepTelemetry {
             rows,
@@ -1888,6 +1962,7 @@ impl Qwen38FlashNextResidentModel {
         }
         let last = first_position as usize + rows;
         require_qwen38_flash_next_dense_qsa_visible(last)?;
+        self.admit_round(slot, first_position as usize, last)?;
 
         let positions = (0..rows as u32)
             .map(|offset| first_position + offset)
@@ -1895,6 +1970,7 @@ impl Qwen38FlashNextResidentModel {
         let slots = vec![slot; rows];
 
         let started = Instant::now();
+        self.flush_block_tables(stream)?;
         let embedding_h2d_bytes = self.stage_embeddings(stream, tokens)?;
         let (engram_h2d_bytes, engram_rows) = self.stage_engram(stream, tokens, &slots, true)?;
         // One carry slot for the whole causal tile, not one per token.
@@ -1907,6 +1983,7 @@ impl Qwen38FlashNextResidentModel {
         )?;
         let layers = self.forward(stream, rows)?;
         let forward = started.elapsed();
+        self.slots.commit(slot, last)?;
 
         Ok(Qwen38FlashNextStepTelemetry {
             rows,
@@ -1935,6 +2012,289 @@ impl Qwen38FlashNextResidentModel {
         Ok(&self.logit_bank[..values])
     }
 
+    /// Reads this step's logits into a caller-owned row bank.
+    pub fn read_logits_into(
+        &self,
+        stream: &CudaStream,
+        batch: usize,
+        destination: &mut [u16],
+    ) -> EngineResult<()> {
+        let values = product("Flash-Next logit readback", batch, <A as Arch>::VOCAB)?;
+        let offered = destination.len();
+        let destination = destination.get_mut(..values).ok_or_else(|| {
+            EngineError::route(format!(
+                "a Flash-Next logit readback of {batch} rows needs {values} values, the caller \
+                 offered {offered}"
+            ))
+        })?;
+        self.arena
+            .copy_prefix_to_host_slice(stream, self.layout.endpoint().logits, destination)?;
+
+        Ok(())
+    }
+
+    /// Page-locked host bytes this program owns for staging and readback.
+    pub fn host_stager_bytes(&self) -> usize {
+        self.embedding_stager.num_bytes()
+            + self.engram_stager.num_bytes()
+            + self.logit_bank.num_bytes()
+    }
+
+    /// The shared page pool behind the eight block-table rows.
+    pub const fn slots(&self) -> &Qwen38FlashNextSlotPool {
+        &self.slots
+    }
+
+    /// Grows one slot's mapping to cover `tokens`, drawing from the shared pool.
+    pub fn reserve_slot(
+        &mut self,
+        stream: &CudaStream,
+        slot: usize,
+        tokens: usize,
+    ) -> EngineResult<Qwen38FlashNextSlotChange> {
+        let change = self.slots.reserve(slot, tokens)?;
+        self.flush_block_tables(stream)?;
+
+        Ok(change)
+    }
+
+    /// Truncates paged cache for lifecycle qualification only.
+    #[cfg(feature = "qualification")]
+    pub fn qualification_truncate_slot(
+        &mut self,
+        stream: &CudaStream,
+        slot: usize,
+        tokens: usize,
+    ) -> EngineResult<Qwen38FlashNextSlotChange> {
+        let change = self.slots.truncate(slot, tokens)?;
+        self.flush_block_tables(stream)?;
+
+        Ok(change)
+    }
+
+    /// Holds one slot's committed prefix for reuse after its request finished.
+    pub fn retain_slot(&mut self, slot: usize) -> EngineResult<usize> {
+        self.slots.retain(slot)
+    }
+
+    /// Returns a slot's pages and clears its sequence carries.
+    pub fn recycle_slot(
+        &mut self,
+        stream: &CudaStream,
+        slot: usize,
+    ) -> EngineResult<Qwen38FlashNextSlotRelease> {
+        let release = self.slots.recycle(slot)?;
+        self.reset_slot(stream, slot)?;
+        self.flush_block_tables(stream)?;
+
+        Ok(release)
+    }
+
+    /// Lifecycle position of one slot.
+    pub fn slot_state(&self, slot: usize) -> EngineResult<Qwen38FlashNextSlotState> {
+        self.slots.state(slot)
+    }
+
+    /// Tokens one slot's cache currently covers.
+    pub fn slot_tokens(&self, slot: usize) -> EngineResult<usize> {
+        self.slots.tokens(slot)
+    }
+
+    /// Snapshots overwritten recurrent state. Append-only paged K/V remains in place.
+    pub fn snapshot_slot(
+        &self,
+        stream: &CudaStream,
+        slot: usize,
+    ) -> EngineResult<Qwen38FlashNextSlotSnapshot> {
+        if slot >= MAX_BATCH {
+            return Err(EngineError::route(format!(
+                "Flash-Next slot {slot} is outside 0..{MAX_BATCH}"
+            )));
+        }
+        if self.slots.state(slot)? != Qwen38FlashNextSlotState::Active {
+            return Err(EngineError::route(format!(
+                "Flash-Next slot {slot} must be active before it can be snapshotted"
+            )));
+        }
+        let mut gdn_history = Vec::new();
+        let mut gdn_state = Vec::new();
+        let mut ple_conv_state = Vec::new();
+
+        for plan in self.layout.layers() {
+            if let Some(gdn) = plan.persistent.gdn() {
+                let (history, state) = gdn.slot_widths();
+                let base = gdn_history.len();
+                gdn_history.resize(base + history, 0u16);
+                self.arena.copy_slice_to_host_slice(
+                    stream,
+                    gdn.history,
+                    slot * history,
+                    &mut gdn_history[base..],
+                )?;
+                let base = gdn_state.len();
+                gdn_state.resize(base + state, 0.0f32);
+                self.arena.copy_slice_to_host_slice(
+                    stream,
+                    gdn.state,
+                    slot * state,
+                    &mut gdn_state[base..],
+                )?;
+            }
+            if let Some(ple) = plan.persistent.ple() {
+                let width = ple.slot_width();
+                ple_conv_state.resize(width, 0u16);
+                self.arena.copy_slice_to_host_slice(
+                    stream,
+                    ple.conv_state,
+                    slot * width,
+                    &mut ple_conv_state,
+                )?;
+            }
+        }
+        stream.synchronize().map_err(GpuError::from)?;
+
+        Ok(Qwen38FlashNextSlotSnapshot {
+            owner: Arc::clone(&self.snapshot_owner),
+            slot,
+            sequence: self.slots.sequence(slot)?,
+            tokens: self.slots.tokens(slot)?,
+            carry: self.carries[slot],
+            gdn_history,
+            gdn_state,
+            ple_conv_state,
+        })
+    }
+
+    /// Restores recurrent state and cache length for the snapshot's slot.
+    pub fn restore_slot(
+        &mut self,
+        stream: &CudaStream,
+        snapshot: &Qwen38FlashNextSlotSnapshot,
+    ) -> EngineResult<()> {
+        let slot = snapshot.slot;
+        if slot >= MAX_BATCH {
+            return Err(EngineError::route(format!(
+                "Flash-Next slot {slot} is outside 0..{MAX_BATCH}"
+            )));
+        }
+        if !Arc::ptr_eq(&snapshot.owner, &self.snapshot_owner) {
+            return Err(EngineError::route(
+                "a Flash-Next slot snapshot belongs to another resident model",
+            ));
+        }
+        if self.slots.sequence(slot)? != snapshot.sequence {
+            return Err(EngineError::route(format!(
+                "Flash-Next slot {slot} has restarted since this snapshot was taken"
+            )));
+        }
+        let current = self.slots.tokens(slot)?;
+        if current < snapshot.tokens {
+            return Err(EngineError::route(format!(
+                "Flash-Next slot {slot} covers {current} tokens, short of the snapshot's {}; \
+                 released K/V pages cannot be restored from recurrent state",
+                snapshot.tokens
+            )));
+        }
+        let mut history_cursor = 0usize;
+        let mut state_cursor = 0usize;
+
+        for plan in self.layout.layers().clone() {
+            if let Some(gdn) = plan.persistent.gdn() {
+                let (history, state) = gdn.slot_widths();
+                let source = snapshot
+                    .gdn_history
+                    .get(history_cursor..history_cursor + history)
+                    .ok_or_else(|| {
+                        EngineError::layout(
+                            "a Flash-Next slot snapshot is short of one layer's GDN history",
+                        )
+                    })?;
+                self.arena
+                    .copy_slice_from_host(stream, gdn.history, slot * history, source)?;
+                history_cursor += history;
+
+                let source = snapshot
+                    .gdn_state
+                    .get(state_cursor..state_cursor + state)
+                    .ok_or_else(|| {
+                        EngineError::layout(
+                            "a Flash-Next slot snapshot is short of one layer's GDN state",
+                        )
+                    })?;
+                self.arena
+                    .copy_slice_from_host(stream, gdn.state, slot * state, source)?;
+                state_cursor += state;
+            }
+            if let Some(ple) = plan.persistent.ple() {
+                let width = ple.slot_width();
+                if snapshot.ple_conv_state.len() != width {
+                    return Err(EngineError::layout(
+                        "a Flash-Next slot snapshot carries the wrong PLE conv-state width",
+                    ));
+                }
+                self.arena.copy_slice_from_host(
+                    stream,
+                    ple.conv_state,
+                    slot * width,
+                    &snapshot.ple_conv_state,
+                )?;
+            }
+        }
+        self.carries[slot] = snapshot.carry;
+        if current > snapshot.tokens {
+            self.slots.rollback(slot, snapshot.tokens)?;
+        }
+        self.slots.reserve(slot, snapshot.tokens)?;
+        self.flush_block_tables(stream)?;
+        stream.synchronize().map_err(GpuError::from)?;
+
+        Ok(())
+    }
+
+    /// Refuses a round that is not an active, exactly append-only write.
+    fn admit_round(&self, slot: usize, first: usize, visible: usize) -> EngineResult<()> {
+        let state = self.slots.state(slot)?;
+        let committed = self.slots.tokens(slot)?;
+        require_append_position(slot, state, committed, first)?;
+        let mapped = self.slots.pages(slot)?.len() * QWEN38_FLASH_NEXT_SLOT_PAGE_TOKENS;
+        if visible > mapped {
+            return Err(EngineError::route(format!(
+                "a Flash-Next round on slot {slot} reaches visible length {visible} against \
+                 {mapped} mapped tokens; reserve the slot before the round rather than letting \
+                 it attend through an unmapped page"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Uploads block-table entries changed since the last flush.
+    fn flush_block_tables(&mut self, stream: &CudaStream) -> EngineResult<()> {
+        if !self.slots.has_dirty() {
+            return Ok(());
+        }
+        let stride = crate::QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES;
+        let region = self.layout.kv_regions().block_tables;
+        for slot in 0..MAX_BATCH {
+            let Some(entries) = self.slots.dirty_range(slot)? else {
+                continue;
+            };
+            let row = self.slots.table_row(slot)?;
+            let source = row.get(entries.clone()).ok_or_else(|| {
+                EngineError::layout("a Flash-Next block-table flush named entries outside its row")
+            })?;
+            self.kv_arena.copy_slice_from_host(
+                stream,
+                region,
+                slot * stride + entries.start,
+                source,
+            )?;
+            self.slots.clear_dirty(slot)?;
+        }
+
+        Ok(())
+    }
+
     /// Clears every slot-owned carry and the whole expert cache.
     pub fn reset_state(&mut self, stream: &CudaStream) -> EngineResult<()> {
         for plan in self.layout.layers() {
@@ -1953,12 +2313,14 @@ impl Qwen38FlashNextResidentModel {
         }
         self.carries = [Qwen38FlashNextEngramCarry::start(); MAX_BATCH];
         self.pool.reset()?;
+        self.slots.reset()?;
+        self.flush_block_tables(stream)?;
         stream.synchronize().map_err(GpuError::from)?;
 
         Ok(())
     }
 
-    /// Clears one slot's carries without touching any other sequence's bytes.
+    /// Restarts one slot without releasing its pages or touching another sequence.
     pub fn reset_slot(&mut self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
         if slot >= MAX_BATCH {
             return Err(EngineError::route(format!(
@@ -1981,6 +2343,7 @@ impl Qwen38FlashNextResidentModel {
         }
         self.carries[slot] = Qwen38FlashNextEngramCarry::start();
         stream.synchronize().map_err(GpuError::from)?;
+        self.slots.restart(slot)?;
 
         Ok(())
     }
@@ -1994,6 +2357,45 @@ impl Qwen38FlashNextResidentModel {
 
         Ok(())
     }
+}
+
+fn require_append_position(
+    slot: usize,
+    state: Qwen38FlashNextSlotState,
+    committed: usize,
+    first: usize,
+) -> EngineResult<()> {
+    if state != Qwen38FlashNextSlotState::Active {
+        return Err(EngineError::route(format!(
+            "a Flash-Next round cannot append to slot {slot} while it is {state:?}"
+        )));
+    }
+    if first != committed {
+        return Err(EngineError::route(format!(
+            "a Flash-Next round on slot {slot} starts at {first}, but its append position is \
+             {committed}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn require_distinct_decode_slots(slots: &[usize]) -> EngineResult<()> {
+    let mut seen = [false; MAX_BATCH];
+    for &slot in slots {
+        if slot >= MAX_BATCH {
+            return Err(EngineError::route(format!(
+                "Qwen3.8 Flash-Next slot {slot} is outside 0..{MAX_BATCH}"
+            )));
+        }
+        if std::mem::replace(&mut seen[slot], true) {
+            return Err(EngineError::route(format!(
+                "Qwen3.8 Flash-Next slot {slot} appears more than once in one decode batch"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn layer_telemetry(
@@ -2022,6 +2424,22 @@ fn kv_append_bytes(rows: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_decode_batch_requires_distinct_in_range_slots() {
+        assert!(require_distinct_decode_slots(&[0, 3, 7]).is_ok());
+        assert!(require_distinct_decode_slots(&[2, 2]).is_err());
+        assert!(require_distinct_decode_slots(&[MAX_BATCH]).is_err());
+    }
+
+    #[test]
+    fn a_round_is_active_and_exactly_append_only() {
+        assert!(require_append_position(0, Qwen38FlashNextSlotState::Active, 17, 17).is_ok());
+        assert!(require_append_position(0, Qwen38FlashNextSlotState::Free, 0, 0).is_err());
+        assert!(require_append_position(0, Qwen38FlashNextSlotState::Retained, 17, 17).is_err());
+        assert!(require_append_position(0, Qwen38FlashNextSlotState::Active, 17, 18).is_err());
+        assert!(require_append_position(0, Qwen38FlashNextSlotState::Active, 17, 16).is_err());
+    }
 
     #[test]
     fn the_segment_inventory_is_forty_nine_by_twelve() {
