@@ -23,6 +23,8 @@ use crate::qwen38_flash_next::qsa_moe_layer_layout::{
 };
 use crate::{EngineError, EngineResult, MAX_BATCH, Qwen38FlashNextQsaMoeLayerLayout};
 use std::sync::Arc;
+#[cfg(feature = "qualification")]
+use tuisko_gpu::PinnedHostBuffer;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
 use tuisko_kernels_sm120::{
     Qwen38FlashNextAttentionGateOp, Qwen38FlashNextAttentionQkPrepareOp,
@@ -438,6 +440,24 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
         rows: usize,
         round: Qwen38FlashNextQsaRound<'_>,
     ) -> EngineResult<()> {
+        self.require_round(rows, round)?;
+
+        let regions = self.layout.regions();
+        self.arena
+            .copy_prefix_from_host(stream, regions.table_rows, round.table_rows)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.cache_positions, round.cache_positions)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.lengths, round.lengths)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.rope_cos, round.rope_cos)?;
+        self.arena
+            .copy_prefix_from_host(stream, regions.rope_sin, round.rope_sin)?;
+
+        Ok(())
+    }
+
+    fn require_round(&self, rows: usize, round: Qwen38FlashNextQsaRound<'_>) -> EngineResult<()> {
         qwen38_flash_next_row_route(rows)?;
         for (role, len) in [
             ("table rows", round.table_rows.len()),
@@ -472,18 +492,6 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
                 )));
             }
         }
-
-        let regions = self.layout.regions();
-        self.arena
-            .copy_prefix_from_host(stream, regions.table_rows, round.table_rows)?;
-        self.arena
-            .copy_prefix_from_host(stream, regions.cache_positions, round.cache_positions)?;
-        self.arena
-            .copy_prefix_from_host(stream, regions.lengths, round.lengths)?;
-        self.arena
-            .copy_prefix_from_host(stream, regions.rope_cos, round.rope_cos)?;
-        self.arena
-            .copy_prefix_from_host(stream, regions.rope_sin, round.rope_sin)?;
 
         Ok(())
     }
@@ -676,6 +684,73 @@ impl Qwen38FlashNextQsaMoeLayerProgram {
     }
 
     #[cfg(feature = "qualification")]
+    /// Captures one admitted round's metadata upload for benchmark replay.
+    pub fn qualification_round_stage_graph(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        round: Qwen38FlashNextQsaRound<'_>,
+    ) -> EngineResult<Qwen38FlashNextQsaRoundStageGraph> {
+        self.require_round(rows, round)?;
+        let table_rows = PinnedHostBuffer::from_slice(&self.context, round.table_rows)
+            .map_err(GpuError::from)?;
+        let cache_positions = PinnedHostBuffer::from_slice(&self.context, round.cache_positions)
+            .map_err(GpuError::from)?;
+        let lengths =
+            PinnedHostBuffer::from_slice(&self.context, round.lengths).map_err(GpuError::from)?;
+        let rope_cos =
+            PinnedHostBuffer::from_slice(&self.context, round.rope_cos).map_err(GpuError::from)?;
+        let rope_sin =
+            PinnedHostBuffer::from_slice(&self.context, round.rope_sin).map_err(GpuError::from)?;
+        let rotary = product("Qwen3.8-Flash-Next QSA rotary", rows, ROTARY_ELEMENTS)?;
+        let regions = self.layout.regions();
+        let graph = CudaGraph::capture(stream, || {
+            // SAFETY: the returned owner retains every pinned source through all replays.
+            unsafe {
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    regions.table_rows,
+                    &table_rows,
+                    rows,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    regions.cache_positions,
+                    &cache_positions,
+                    rows,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    regions.lengths,
+                    &lengths,
+                    rows,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    regions.rope_cos,
+                    &rope_cos,
+                    rotary,
+                )?;
+                self.arena.copy_prefix_from_pinned_host_async(
+                    stream,
+                    regions.rope_sin,
+                    &rope_sin,
+                    rotary,
+                )
+            }
+        })?;
+
+        Ok(Qwen38FlashNextQsaRoundStageGraph {
+            graph,
+            _table_rows: table_rows,
+            _cache_positions: cache_positions,
+            _lengths: lengths,
+            _rope_cos: rope_cos,
+            _rope_sin: rope_sin,
+        })
+    }
+
+    #[cfg(feature = "qualification")]
     /// Returns every stable arena address in layout order, both arenas included.
     pub fn qualification_addresses(&self) -> EngineResult<Vec<usize>> {
         Ok(self.pointers()?.addresses())
@@ -840,6 +915,25 @@ pub struct Qwen38FlashNextQsaRound<'a> {
     pub rope_cos: &'a [f32],
     /// Rotary sines, `rows * 32` values.
     pub rope_sin: &'a [f32],
+}
+
+#[cfg(feature = "qualification")]
+/// Captured round upload retaining its pinned sources.
+pub struct Qwen38FlashNextQsaRoundStageGraph {
+    graph: CudaGraph,
+    _table_rows: PinnedHostBuffer<u32>,
+    _cache_positions: PinnedHostBuffer<u32>,
+    _lengths: PinnedHostBuffer<u32>,
+    _rope_cos: PinnedHostBuffer<f32>,
+    _rope_sin: PinnedHostBuffer<f32>,
+}
+
+#[cfg(feature = "qualification")]
+impl Qwen38FlashNextQsaRoundStageGraph {
+    /// Immutable graph restoring one exact round's runtime metadata.
+    pub const fn graph(&self) -> &CudaGraph {
+        &self.graph
+    }
 }
 
 #[cfg(feature = "qualification")]

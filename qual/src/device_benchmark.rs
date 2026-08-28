@@ -1408,10 +1408,17 @@ pub(crate) fn measure_cases(
                         .push(microseconds_per(timing.device, divisor));
                 }
                 MeasurementTask::Repeated(case_index) => {
-                    let repeated = cases[case_index]
+                    let case = &cases[case_index];
+                    let repeated = case
                         .repeated
                         .as_ref()
                         .expect("repeated task requires a repeated graph");
+                    if let Some(preparation) = case.preparation_graph {
+                        // SAFETY: the live case borrow proves every captured
+                        // allocation outlives this replay (see ExactDeviceCase).
+                        unsafe { preparation.launch(stream) }?;
+                        stream.synchronize().map_err(tuisko_gpu::GpuError::from)?;
+                    }
                     // SAFETY: the live case borrow proves every captured
                     // allocation outlives this replay (see ExactDeviceCase).
                     let elapsed =
@@ -1547,15 +1554,16 @@ fn launch_clock_probe_unit(
     stream: &CudaStream,
     case: &ExactDeviceCase<'_>,
 ) -> Result<(), tuisko_gpu::GpuError> {
+    if let Some(preparation) = case.preparation_graph {
+        // SAFETY: the live case borrow proves every captured allocation
+        // outlives this replay (see ExactDeviceCase).
+        unsafe { preparation.launch(stream) }?;
+    }
     if let Some(repeated) = &case.repeated {
         // SAFETY: the live case borrow proves every captured allocation
         // outlives this replay (see ExactDeviceCase).
         unsafe { repeated.graph.launch(stream) }
     } else {
-        if let Some(preparation) = case.preparation_graph {
-            // SAFETY: as above via the same live case borrow.
-            unsafe { preparation.launch(stream) }?;
-        }
         // SAFETY: as above via the same live case borrow.
         unsafe { case.leaf_graph.launch(stream) }
     }
