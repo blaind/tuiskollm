@@ -25,10 +25,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
 use tokio::sync::oneshot;
 use tuisko_engine::{
-    EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, QWEN38_FLASH_NEXT_SERVING_SLOTS,
-    Qwen35ResidentMtpBatchGenerator, Qwen36ResidentBatchGenerator,
-    Qwen38FlashNextResidentGenerator, ResidentBatchAdmission, ResidentLoadPhase,
-    ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentRequestId,
+    EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, Qwen35ResidentMtpBatchGenerator,
+    Qwen36ResidentBatchGenerator, Qwen38FlashNextResidentBatchGenerator, ResidentBatchAdmission,
+    ResidentLoadPhase, ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentRequestId,
 };
 use tuisko_frontend::GenerationDefaults;
 use tuisko_model::{
@@ -42,8 +41,7 @@ const DEFAULT_SEED_SCRAMBLE: u64 = 0x9e37_79b9_7f4a_7c15;
 const GENERATION_REPLY_BUFFER: usize = 32;
 const MTP_GENERATION_ROUTE: &str = "mtp-draft-3";
 const QWEN35_MTP_GENERATION_ROUTE: &str = "mtp-b1-compact-b2-8";
-const QWEN36_COMPACT_GENERATION_ROUTE: &str = "compact-b1-8";
-const QWEN38_FLASH_NEXT_SINGLE_SLOT_GENERATION_ROUTE: &str = "single-slot-b1-1";
+const COMPACT_GENERATION_ROUTE: &str = "compact-b1-8";
 const QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT: &str = "medium";
 
 /// Startup configuration for the one exact resident server.
@@ -174,8 +172,7 @@ impl ServerModel {
         match self {
             Self::Qwen38 => MTP_GENERATION_ROUTE,
             Self::Qwen35 => QWEN35_MTP_GENERATION_ROUTE,
-            Self::Qwen36 => QWEN36_COMPACT_GENERATION_ROUTE,
-            Self::Qwen38FlashNext => QWEN38_FLASH_NEXT_SINGLE_SLOT_GENERATION_ROUTE,
+            Self::Qwen36 | Self::Qwen38FlashNext => COMPACT_GENERATION_ROUTE,
         }
     }
 
@@ -479,14 +476,14 @@ fn load_qwen36(snapshot: &Path) -> Result<(Qwen36ResidentBatchGenerator, Ready),
 fn load_qwen38_flash_next(
     snapshot: &Path,
     progress: &ResidentLoadProgress,
-) -> Result<(Qwen38FlashNextResidentGenerator, Ready), String> {
+) -> Result<(Qwen38FlashNextResidentBatchGenerator, Ready), String> {
     let checkpoint_start = Instant::now();
     let admitted = CheckpointSnapshot::<Qwen38FlashNext>::open(snapshot)
         .map(Arc::new)
         .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
     let checkpoint_admission = checkpoint_start.elapsed();
     let tensor_count = admitted.tensor_count();
-    let generator = Qwen38FlashNextResidentGenerator::from_snapshot_device_zero_with_progress(
+    let generator = Qwen38FlashNextResidentBatchGenerator::from_snapshot_device_zero_with_progress(
         admitted, progress,
     )
     .map_err(|error| format!("loading the resident Qwen3.8 Flash-Next program: {error}"))?;
@@ -519,7 +516,7 @@ fn load_qwen38_flash_next(
         prefault_bytes: load_stats.staged_bytes(),
         arena_bytes,
         host_stager_bytes: generator.host_stager_bytes(),
-        slot_capacity: QWEN38_FLASH_NEXT_SERVING_SLOTS,
+        slot_capacity: generator.slot_capacity(),
         context_capacity: generator.context_capacity(),
         detailed_load_timing: true,
     };
@@ -1091,10 +1088,10 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, EnqueueError, Job, QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT,
-        QWEN38_FLASH_NEXT_SERVING_SLOTS, Ready, ServerError, ServerModel, chat_completions,
-        enqueue_job, fail_queued, health, models, record_admission, render_loading, render_startup,
-        render_weight_progress, router, serve_until_worker_failure, try_send_generation_steps,
+        AppState, EnqueueError, Job, QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, Ready, ServerError,
+        ServerModel, chat_completions, enqueue_job, fail_queued, health, models, record_admission,
+        render_loading, render_startup, render_weight_progress, router, serve_until_worker_failure,
+        try_send_generation_steps,
     };
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
     use axum::Json;
@@ -1447,7 +1444,7 @@ mod tests {
             (
                 Qwen38FlashNext::MODEL_ID,
                 ServerModel::Qwen38FlashNext,
-                "single-slot-b1-1",
+                "compact-b1-8",
             ),
         ] {
             let target = ServerModel::from_model_id(model).unwrap();
@@ -1499,7 +1496,7 @@ mod tests {
             prefault_bytes: 0,
             arena_bytes: 29 * (1 << 30),
             host_stager_bytes: 15 * (1 << 20),
-            slot_capacity: QWEN38_FLASH_NEXT_SERVING_SLOTS,
+            slot_capacity: MAX_BATCH,
             context_capacity: 2_051,
             detailed_load_timing: true,
         };
@@ -1510,8 +1507,8 @@ mod tests {
             false,
         );
 
-        assert!(output.contains("single-slot-b1-1"));
-        assert!(output.contains("1 slots"));
+        assert!(output.contains("compact-b1-8"));
+        assert!(output.contains("8 slots"));
         assert!(output.contains("context 2051"));
     }
 

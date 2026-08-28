@@ -114,6 +114,14 @@ pub use qwen38::resident_mtp_layout::ResidentMtpLayout;
 pub use qwen38::upload_plan::{
     ResidentUploadArena, ResidentUploadEntry, ResidentUploadPlan, ResidentUploadPreparation,
 };
+pub use qwen38_flash_next::batch_generation::{
+    Qwen38FlashNextBatchTelemetry, Qwen38FlashNextBatchWidthTelemetry,
+    Qwen38FlashNextResidentBatchGenerator,
+};
+pub use qwen38_flash_next::compact_route::{
+    Qwen38FlashNextCompactRound, qwen38_flash_next_admission_slot, qwen38_flash_next_compact_round,
+    qwen38_flash_next_compact_survivors,
+};
 pub use qwen38_flash_next::engram_stager::{
     Qwen38FlashNextEngramStager, gather_qwen38_flash_next_engram_window,
 };
@@ -155,9 +163,6 @@ pub use qwen38_flash_next::resident_model_layout::{
     QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES, QWEN38_FLASH_NEXT_PRIMARY_SOURCE,
     QWEN38_FLASH_NEXT_REQUIRED_HEADROOM_BYTES, QWEN38_FLASH_NEXT_RESIDENT_MAX_ROWS,
     QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS, Qwen38FlashNextResidentLayout,
-};
-pub use qwen38_flash_next::serving::{
-    QWEN38_FLASH_NEXT_SERVING_SLOTS, Qwen38FlashNextResidentGenerator,
 };
 pub use qwen38_flash_next::slot_lifecycle::{
     QWEN38_FLASH_NEXT_SLOT_PAGE_TOKENS, QWEN38_FLASH_NEXT_UNMAPPED_PAGE, Qwen38FlashNextSlotChange,
