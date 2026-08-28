@@ -11,8 +11,8 @@ use tuisko_engine::{
     EngineError, MAX_BATCH, QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING,
     QWEN38_FLASH_NEXT_EXPERT_ITEM_COUNT, QWEN38_FLASH_NEXT_EXPERT_RESIDENT_SLOTS,
     QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS, Qwen38FlashNextResidentLayout,
-    Qwen38FlashNextResidentModel, Qwen38FlashNextStepTelemetry, StreamingPrimarySource,
-    StreamingResidencyAccounting,
+    Qwen38FlashNextResidentModel, Qwen38FlashNextStepTelemetry, Qwen38FlashNextStreamingRoute,
+    StreamingPrimarySource, StreamingResidencyAccounting,
 };
 use tuisko_gpu::{CudaContext, GpuError, device_memory_info};
 use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, Qwen38FlashNext};
@@ -153,6 +153,8 @@ pub struct Qwen38FlashNextResidentModelQualification {
     pub causal_span: Qwen38FlashNextCausalSpanEvidence,
     /// Agreement when the same round is replayed after rollback.
     pub rollback: Qwen38FlashNextRollbackEvidence,
+    /// Agreement between host-stalled and consumer-stream publication waits.
+    pub streaming_route: Qwen38FlashNextStreamingRouteEvidence,
 }
 
 /// Bitwise evidence for one four-row verification span.
@@ -179,6 +181,19 @@ pub struct Qwen38FlashNextRollbackEvidence {
     pub compared_logits: usize,
     /// Logits moved by the no-rollback negative control.
     pub control_moved_logits: usize,
+}
+
+/// Bitwise and residency evidence for the two publication routes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Qwen38FlashNextStreamingRouteEvidence {
+    /// Logit values compared.
+    pub compared_logits: usize,
+    /// Cold uploads observed on the host-stalled route.
+    pub stalling_misses: usize,
+    /// Cold uploads observed on the consumer-stream route.
+    pub overlapped_misses: usize,
+    /// Consumer-stream rounds observed while publication was still in flight.
+    pub rounds_in_flight: usize,
 }
 
 /// Loads the whole model, captures every segment, and measures a decode and a prefill route.
@@ -240,6 +255,9 @@ pub fn qualify_qwen38_flash_next_resident_model(
     let refused_rounds = verify_dense_band_refusal(&mut model, &stream)?;
     let (inspected_logits, peak_absolute_logit) = verify_logits_respond(&mut model, &stream)?;
     let cache_state_compared_logits = verify_cache_state_is_not_numerical(&mut model, &stream)?;
+    let streaming_route = verify_streaming_routes(&mut model, &stream)?;
+    model.reset_state(&stream)?;
+    reserve_probe_slots(&mut model, &stream)?;
     let causal_span = verify_causal_span_is_sequential(&mut model, &stream)?;
     let rollback = verify_rejected_round_rollback(&mut model, &stream)?;
 
@@ -309,6 +327,7 @@ pub fn qualify_qwen38_flash_next_resident_model(
         measurements,
         causal_span,
         rollback,
+        streaming_route,
     })
 }
 
@@ -372,6 +391,58 @@ fn verify_cache_state_is_not_numerical(
     }
 
     Ok(cold.len())
+}
+
+/// Requires both publication routes to produce identical cold-cache logits.
+fn verify_streaming_routes(
+    model: &mut Qwen38FlashNextResidentModel,
+    stream: &tuisko_gpu::CudaStream,
+) -> QualResult<Qwen38FlashNextStreamingRouteEvidence> {
+    const PROBE: u32 = 4_637;
+
+    if model.streaming_route() != Qwen38FlashNextStreamingRoute::Overlapped {
+        return Err(mismatch("the production streaming route is not overlapped"));
+    }
+
+    let run = |model: &mut Qwen38FlashNextResidentModel,
+               route: Qwen38FlashNextStreamingRoute|
+     -> QualResult<(Vec<u16>, usize, usize)> {
+        model.set_streaming_route(route);
+        model.reset_state(stream)?;
+        reserve_probe_slots(model, stream)?;
+        let step = model.decode_step(stream, &[PROBE], &[0], &[0])?;
+        let logits = model.read_logits(stream, 1)?.to_vec();
+        let misses = step.layers().iter().map(|layer| layer.misses()).sum();
+
+        Ok((logits, misses, step.overlapped_rounds()))
+    };
+
+    let (stalling, stalling_misses, _) = run(model, Qwen38FlashNextStreamingRoute::Stalling)?;
+    let (overlapped, overlapped_misses, rounds_in_flight) =
+        run(model, Qwen38FlashNextStreamingRoute::Overlapped)?;
+
+    if overlapped_misses == 0 || stalling_misses != overlapped_misses {
+        return Err(mismatch(format!(
+            "streaming routes observed {stalling_misses} and {overlapped_misses} cold uploads"
+        )));
+    }
+    if let Some((index, (&left, &right))) = stalling
+        .iter()
+        .zip(&overlapped)
+        .enumerate()
+        .find(|(_, (left, right))| left != right)
+    {
+        return Err(mismatch(format!(
+            "streaming route changed vocabulary logit {index}: {left:#06x} versus {right:#06x}"
+        )));
+    }
+
+    Ok(Qwen38FlashNextStreamingRouteEvidence {
+        compared_logits: stalling.len(),
+        stalling_misses,
+        overlapped_misses,
+        rounds_in_flight,
+    })
 }
 
 /// Requires the causal span to match four decode steps bit for bit.
@@ -488,7 +559,8 @@ fn verify_rejected_round_rollback(
     }
 
     // A no-op restore would pass the equality above without this control.
-    model.verify_step(stream, &SPAN, first_position, SLOT)?;
+    let control_position = first_position + SPAN.len() as u32;
+    model.verify_step(stream, &SPAN, control_position, SLOT)?;
     let unrestored = model.read_logits(stream, SPAN.len())?.to_vec();
     let moved = rejected
         .iter()
@@ -863,6 +935,12 @@ pub fn print_qwen38_flash_next_resident_model_report(
     println!(
         "  cache-state logits equal   {}",
         report.cache_state_compared_logits
+    );
+    println!(
+        "  streaming-route logits eq  {} over {} cold uploads, {} rounds in flight",
+        report.streaming_route.compared_logits,
+        report.streaming_route.overlapped_misses,
+        report.streaming_route.rounds_in_flight
     );
     println!(
         "  peak |logit|               {:.4}",

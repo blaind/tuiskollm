@@ -10,7 +10,7 @@ use std::time::Duration;
 use tuisko_engine::{
     MAX_BATCH, QWEN38_FLASH_NEXT_ATTENTION_LAYERS, QWEN38_FLASH_NEXT_PREFILL_ROWS,
     QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS, Qwen38FlashNextResidentModel,
-    Qwen38FlashNextStepTelemetry,
+    Qwen38FlashNextStepTelemetry, Qwen38FlashNextStreamingRoute,
 };
 use tuisko_gpu::{CudaContext, CudaStream, GpuError};
 use tuisko_kernels_sm120::QWEN38_FLASH_NEXT_EXPERT_SLOT_BYTES;
@@ -23,6 +23,7 @@ const WARM_PASSES: usize = 3;
 const MEASURED_STEPS: usize = 16;
 
 const DECODE_ROWS: [usize; MAX_BATCH] = [1, 2, 3, 4, 5, 6, 7, 8];
+const CAUSAL_ROWS: [usize; 2] = [1, 4];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RouteAccounting {
@@ -40,8 +41,10 @@ struct RouteAccounting {
 /// One measured route's wall-clock summary and the telemetry that explains it.
 #[derive(Clone, Debug)]
 pub struct Qwen38FlashNextResidentRouteReport {
-    /// `"decode"` or `"prefill"`.
+    /// `"decode"`, `"verify"`, or `"prefill"`.
     pub kind: &'static str,
+    /// Expert-publication ordering route.
+    pub streaming_route: Qwen38FlashNextStreamingRoute,
     /// Rows the route carried.
     pub rows: usize,
     /// Median whole-step wall time.
@@ -74,6 +77,14 @@ pub struct Qwen38FlashNextResidentRouteReport {
     pub engram_h2d_bytes: usize,
     /// Bytes appended to the paged K/V planes.
     pub kv_append_bytes: usize,
+    /// Host time blocked reading router selections.
+    pub readback_wait: Duration,
+    /// Host time spent resolving expert residency.
+    pub residency_wait: Duration,
+    /// Rounds whose publication remained in flight after consumer submission.
+    pub rounds_in_flight: usize,
+    /// Rounds that blocked the host on publication.
+    pub stalled_rounds: usize,
 }
 
 /// The whole diagnostic sweep.
@@ -108,14 +119,25 @@ pub fn benchmark_qwen38_flash_next_resident_model(
     let stream = context.new_stream().map_err(GpuError::from)?;
     let mut routes = Vec::new();
 
-    for batch in DECODE_ROWS {
-        model.reset_state(&stream)?;
-        routes.push(measure_decode(&mut model, &stream, batch)?);
+    for route in [
+        Qwen38FlashNextStreamingRoute::Stalling,
+        Qwen38FlashNextStreamingRoute::Overlapped,
+    ] {
+        model.set_streaming_route(route);
+        for batch in DECODE_ROWS {
+            model.reset_state(&stream)?;
+            routes.push(measure_decode(&mut model, &stream, batch)?);
+        }
+        for rows in CAUSAL_ROWS {
+            model.reset_state(&stream)?;
+            routes.push(measure_causal(&mut model, &stream, rows)?);
+        }
+        for tile in QWEN38_FLASH_NEXT_PREFILL_ROWS {
+            model.reset_state(&stream)?;
+            routes.push(measure_prefill(&mut model, &stream, tile)?);
+        }
     }
-    for tile in QWEN38_FLASH_NEXT_PREFILL_ROWS {
-        model.reset_state(&stream)?;
-        routes.push(measure_prefill(&mut model, &stream, tile)?);
-    }
+    model.set_streaming_route(Qwen38FlashNextStreamingRoute::Overlapped);
 
     Ok(Qwen38FlashNextResidentBenchmarkReport {
         executables: stats.executables(),
@@ -150,7 +172,30 @@ fn measure_decode(
         samples.push(model.decode_step(stream, &tokens, &positions, &slots)?);
     }
 
-    summarize("decode", batch, &samples)
+    summarize("decode", batch, &samples, model.streaming_route())
+}
+
+fn measure_causal(
+    model: &mut Qwen38FlashNextResidentModel,
+    stream: &CudaStream,
+    rows: usize,
+) -> Result<Qwen38FlashNextResidentRouteReport, DeviceBenchmarkError> {
+    let tokens = (0..rows)
+        .map(|row| (4_096 + row * 131) as u32)
+        .collect::<Vec<_>>();
+    model.reserve_slot(stream, 0, rows)?;
+
+    for _ in 0..WARM_PASSES {
+        model.reset_slot(stream, 0)?;
+        model.verify_step(stream, &tokens, 0, 0)?;
+    }
+    let mut samples = Vec::with_capacity(MEASURED_STEPS);
+    for _ in 0..MEASURED_STEPS {
+        model.reset_slot(stream, 0)?;
+        samples.push(model.verify_step(stream, &tokens, 0, 0)?);
+    }
+
+    summarize("verify", rows, &samples, model.streaming_route())
 }
 
 fn measure_prefill(
@@ -173,13 +218,14 @@ fn measure_prefill(
         samples.push(model.prefill_tile(stream, &prompt, 0, 0)?);
     }
 
-    summarize("prefill", tile, &samples)
+    summarize("prefill", tile, &samples, model.streaming_route())
 }
 
 fn summarize(
     kind: &'static str,
     rows: usize,
     samples: &[Qwen38FlashNextStepTelemetry],
+    streaming_route: Qwen38FlashNextStreamingRoute,
 ) -> Result<Qwen38FlashNextResidentRouteReport, DeviceBenchmarkError> {
     if samples.is_empty() {
         return Err(DeviceBenchmarkError::Precondition(
@@ -203,6 +249,7 @@ fn summarize(
 
     Ok(Qwen38FlashNextResidentRouteReport {
         kind,
+        streaming_route,
         rows,
         median,
         fastest: times[0],
@@ -223,6 +270,10 @@ fn summarize(
         embedding_h2d_bytes: last.embedding_h2d_bytes(),
         engram_h2d_bytes: last.engram_h2d_bytes(),
         kv_append_bytes: last.kv_append_bytes(),
+        readback_wait: last.expert_readback_wait(),
+        residency_wait: last.expert_residency_wait(),
+        rounds_in_flight: last.overlapped_rounds(),
+        stalled_rounds: last.stalled_rounds(),
     })
 }
 
@@ -282,12 +333,18 @@ fn validate_route_accounting(
     Ok(())
 }
 
+const fn streaming_route_name(route: Qwen38FlashNextStreamingRoute) -> &'static str {
+    match route {
+        Qwen38FlashNextStreamingRoute::Overlapped => "overlap",
+        Qwen38FlashNextStreamingRoute::Stalling => "stalling",
+    }
+}
+
 /// Prints one sweep in the house's diagnostic shape.
 pub fn print_qwen38_flash_next_resident_benchmark(report: &Qwen38FlashNextResidentBenchmarkReport) {
     println!("Qwen3.8 Flash-Next resident model - end-to-end sweep");
     println!("  DIAGNOSTIC ONLY. This command cannot bless a performance baseline.");
-    println!("  Host-observed wall times: they include the per-round readback and the require");
-    println!("  stall, so they are not comparable with per-layer captured-replay medians.");
+    println!("  Host-observed wall times include readback and residency ordering.");
     println!();
     println!("  construction");
     println!("    total                    {:?}", report.load);
@@ -297,25 +354,30 @@ pub fn print_qwen38_flash_next_resident_benchmark(report: &Qwen38FlashNextReside
     println!("    capture wall time        {:?}", report.capture);
     println!();
     println!(
-        "  {:<8} {:>5} {:>12} {:>10} {:>12} {:>10} {:>8} {:>14}",
-        "route", "rows", "median ms", "tok/s", "ms/token", "us/layer", "hit", "h2d/token"
+        "  {:<9} {:<8} {:>5} {:>12} {:>12} {:>8} {:>12} {:>9}",
+        "ordering", "route", "rows", "median ms", "ms/token", "hit", "residency", "in flight"
     );
     for route in &report.routes {
         println!(
-            "  {:<8} {:>5} {:>12.3} {:>10.2} {:>12.3} {:>10.1} {:>8.4} {:>14}",
+            "  {:<9} {:<8} {:>5} {:>12.3} {:>12.3} {:>8.4} {:>12.3} {:>9}",
+            streaming_route_name(route.streaming_route),
             route.kind,
             route.rows,
             route.median.as_secs_f64() * 1_000.0,
-            route.tokens_per_second,
             route.milliseconds_per_token,
-            route.microseconds_per_layer,
             route.expert_hit_rate,
-            route.expert_h2d_bytes_per_token
+            route.residency_wait.as_secs_f64() * 1_000.0,
+            route.rounds_in_flight
         );
     }
     println!();
     for route in &report.routes {
-        println!("  {} rows={} per-layer streaming", route.kind, route.rows);
+        println!(
+            "  {} {} rows={} per-layer streaming",
+            streaming_route_name(route.streaming_route),
+            route.kind,
+            route.rows
+        );
         let weakest = route
             .layer_hit_rates
             .iter()

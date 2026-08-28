@@ -10,7 +10,7 @@ use crate::common::text_generator::{
     sealed::Sealed as ModelProgramSealed,
 };
 use crate::qwen38_flash_next::resident_model::{
-    Qwen38FlashNextResidentModel, Qwen38FlashNextStepTelemetry,
+    Qwen38FlashNextResidentModel, Qwen38FlashNextStepTelemetry, Qwen38FlashNextStreamingRoute,
 };
 use crate::{EngineError, EngineResult};
 use std::sync::Arc;
@@ -45,6 +45,9 @@ pub struct Qwen38FlashNextGenerationTelemetry {
     engram_rows: usize,
     kv_append_bytes: usize,
     publication_stalls: usize,
+    overlapped_rounds: usize,
+    readback_wait: Duration,
+    residency_wait: Duration,
 }
 
 impl Qwen38FlashNextGenerationTelemetry {
@@ -160,6 +163,21 @@ impl Qwen38FlashNextGenerationTelemetry {
         self.publication_stalls
     }
 
+    /// Rounds whose publication overlapped host work.
+    pub const fn overlapped_rounds(self) -> usize {
+        self.overlapped_rounds
+    }
+
+    /// Host time blocked reading router selections.
+    pub const fn readback_wait(self) -> Duration {
+        self.readback_wait
+    }
+
+    /// Host time spent resolving expert residency.
+    pub const fn residency_wait(self) -> Duration {
+        self.residency_wait
+    }
+
     /// Adds another request's counts and durations.
     pub fn absorb(&mut self, other: Self) {
         self.prime_rounds += other.prime_rounds;
@@ -182,6 +200,9 @@ impl Qwen38FlashNextGenerationTelemetry {
         self.engram_rows += other.engram_rows;
         self.kv_append_bytes += other.kv_append_bytes;
         self.publication_stalls += other.publication_stalls;
+        self.overlapped_rounds += other.overlapped_rounds;
+        self.readback_wait += other.readback_wait;
+        self.residency_wait += other.residency_wait;
     }
 
     /// Folds one prompt-prime round into the request.
@@ -217,11 +238,16 @@ impl Qwen38FlashNextGenerationTelemetry {
         self.engram_h2d_bytes += step.engram_h2d_bytes();
         self.engram_rows += step.engram_rows();
         self.kv_append_bytes += step.kv_append_bytes();
+        self.readback_wait += step.expert_readback_wait();
+        self.residency_wait += step.expert_residency_wait();
         for layer in step.layers() {
             self.expert_hits += layer.hits();
             self.expert_misses += layer.misses();
             if layer.stalled() {
                 self.publication_stalls += 1;
+            }
+            if layer.transfer_in_flight() {
+                self.overlapped_rounds += 1;
             }
         }
     }
@@ -337,6 +363,16 @@ impl SingleSlotTextGenerator<Qwen38FlashNextResidentModel> {
     /// Captured executables the resident program retains.
     pub fn executables(&self) -> usize {
         self.program().executables()
+    }
+
+    /// Current expert-publication ordering route.
+    pub const fn streaming_route(&self) -> Qwen38FlashNextStreamingRoute {
+        self.program().streaming_route()
+    }
+
+    /// Selects the expert-publication ordering route.
+    pub const fn set_streaming_route(&mut self, route: Qwen38FlashNextStreamingRoute) {
+        self.program_mut().set_streaming_route(route);
     }
 }
 

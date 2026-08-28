@@ -17,8 +17,8 @@ use crate::qwen38_flash_next::mtp_layout::{
     Qwen38FlashNextMtpWorkspace,
 };
 use crate::qwen38_flash_next::resident_model::{
-    Ops, Qwen38FlashNextLayerStreamTelemetry, Qwen38FlashNextResidentModel, layer_telemetry,
-    qwen38_flash_next_rope,
+    Ops, Qwen38FlashNextLayerStreamTelemetry, Qwen38FlashNextResidentModel,
+    Qwen38FlashNextStreamingRoute, layer_telemetry, qwen38_flash_next_rope,
 };
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use std::sync::Arc;
@@ -297,6 +297,7 @@ pub struct Qwen38FlashNextMtpProgram {
     logit_bank: PinnedHostBuffer<u16>,
     expert_readback: Vec<u16>,
     round_items: Vec<u32>,
+    streaming_route: Qwen38FlashNextStreamingRoute,
 
     weights: DraftWeights,
     pointers: DraftPointers,
@@ -392,6 +393,7 @@ impl Qwen38FlashNextMtpProgram {
             round_items: Vec::with_capacity(
                 QWEN38_FLASH_NEXT_MTP_MAX_ROWS * A::NUM_EXPERTS_PER_TOKEN,
             ),
+            streaming_route: Qwen38FlashNextStreamingRoute::default(),
             weights,
             pointers,
             target,
@@ -427,6 +429,16 @@ impl Qwen38FlashNextMtpProgram {
     /// The draft's own expert cache.
     pub const fn pool(&self) -> &StreamingWeightPool {
         &self.pool
+    }
+
+    /// Current draft expert-publication ordering route.
+    pub const fn streaming_route(&self) -> Qwen38FlashNextStreamingRoute {
+        self.streaming_route
+    }
+
+    /// Selects the draft expert-publication ordering route.
+    pub const fn set_streaming_route(&mut self, route: Qwen38FlashNextStreamingRoute) {
+        self.streaming_route = route;
     }
 
     /// Construction evidence the draft added beside the target's.
@@ -1317,8 +1329,15 @@ impl Qwen38FlashNextMtpProgram {
         // SAFETY: the program owns all captured storage until graph drop.
         unsafe { head.launch(stream) }?;
 
+        let reading = Instant::now();
         let requests = self.read_expert_round(stream, rows)?;
-        let round = self.pool.require(&self.round_items)?;
+        let readback_wait = reading.elapsed();
+        let resolving = Instant::now();
+        let round = match self.streaming_route {
+            Qwen38FlashNextStreamingRoute::Overlapped => self.pool.prefetch(&self.round_items)?,
+            Qwen38FlashNextStreamingRoute::Stalling => self.pool.require(&self.round_items)?,
+        };
+        let residency_wait = resolving.elapsed();
         self.pool.fence_replay(stream)?;
         let tail = self.tail_segments.first().ok_or_else(|| {
             EngineError::route("the Flash-Next draft block captured no routed tail")
@@ -1326,6 +1345,7 @@ impl Qwen38FlashNextMtpProgram {
         // SAFETY: as above.
         unsafe { tail.launch(stream) }?;
         self.pool.record_replay_release(stream)?;
+        let transfer_in_flight = !self.pool.publication_completed()?;
 
         if propose {
             let head = self.head.first().ok_or_else(|| {
@@ -1336,7 +1356,14 @@ impl Qwen38FlashNextMtpProgram {
         }
         stream.synchronize().map_err(GpuError::from)?;
 
-        Ok(layer_telemetry(0, requests, round))
+        Ok(layer_telemetry(
+            0,
+            requests,
+            round,
+            readback_wait,
+            residency_wait,
+            transfer_in_flight,
+        ))
     }
 
     fn forward_prime(
@@ -1354,7 +1381,14 @@ impl Qwen38FlashNextMtpProgram {
         unsafe { prime.launch(stream) }?;
         stream.synchronize().map_err(GpuError::from)?;
 
-        Ok(layer_telemetry(0, 0, StreamingRound::default()))
+        Ok(layer_telemetry(
+            0,
+            0,
+            StreamingRound::default(),
+            Duration::ZERO,
+            Duration::ZERO,
+            false,
+        ))
     }
 
     /// Converts router output to unique expert-pool item IDs.

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tuisko_engine::{
     QWEN38_FLASH_NEXT_ATTENTION_LAYERS, Qwen38FlashNextGenerationTelemetry,
-    Qwen38FlashNextTextGenerator, SamplingOptions,
+    Qwen38FlashNextStreamingRoute, Qwen38FlashNextTextGenerator, SamplingOptions,
 };
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38FlashNext};
 
@@ -77,6 +77,10 @@ pub struct Qwen38FlashNextGenerationBenchmarkReport {
     pub real_traffic: Qwen38FlashNextGenerationTelemetry,
     /// Tokens the real-traffic pass generated.
     pub real_traffic_tokens: usize,
+    /// The same captures on the host-stalled reference route.
+    pub stalling_traffic: Qwen38FlashNextGenerationTelemetry,
+    /// Tokens the host-stalled pass generated.
+    pub stalling_traffic_tokens: usize,
     /// Minimum, median, and maximum SM clocks during the measured sweep.
     pub sm_clocks_mhz: (u32, u32, u32),
     /// Minimum, median, and maximum memory clocks during the measured sweep.
@@ -115,6 +119,9 @@ pub fn benchmark_qwen38_flash_next_generation(
         routes.push(report);
     }
 
+    generator.set_streaming_route(Qwen38FlashNextStreamingRoute::Stalling);
+    let (stalling_traffic, stalling_traffic_tokens) = measure_real_traffic(&mut generator)?;
+    generator.set_streaming_route(Qwen38FlashNextStreamingRoute::Overlapped);
     let (real_traffic, real_traffic_tokens) = measure_real_traffic(&mut generator)?;
     let clocks = sampler.finish()?;
     device_benchmark::require_current_process_exclusive()?;
@@ -126,6 +133,8 @@ pub fn benchmark_qwen38_flash_next_generation(
         routes,
         real_traffic,
         real_traffic_tokens,
+        stalling_traffic,
+        stalling_traffic_tokens,
         sm_clocks_mhz: (
             clocks.sm_minimum_mhz,
             clocks.sm_median_mhz,
@@ -451,6 +460,24 @@ pub fn print_qwen38_flash_next_generation_benchmark(
         report.real_traffic.prime_tiles(),
         report.real_traffic.prime_scalar_rounds()
     );
+    println!("  real traffic by publication route");
+    println!("    route       tokens  ms/token  residency ms  stalled  in flight");
+    for (name, traffic, tokens) in [
+        (
+            "stalling",
+            report.stalling_traffic,
+            report.stalling_traffic_tokens,
+        ),
+        ("overlap", report.real_traffic, report.real_traffic_tokens),
+    ] {
+        println!(
+            "    {name:<10} {tokens:>6} {:>9.3} {:>13.3} {:>8} {:>10}",
+            traffic.decode_ms_per_token(),
+            traffic.residency_wait().as_secs_f64() * 1_000.0,
+            traffic.publication_stalls(),
+            traffic.overlapped_rounds()
+        );
+    }
     println!(
         "    engram rows hashed     {}",
         report.real_traffic.engram_rows()

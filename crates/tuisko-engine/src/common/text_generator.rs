@@ -144,6 +144,10 @@ impl<M> SingleSlotTextGenerator<M> {
     pub(crate) const fn program(&self) -> &M {
         &self.program
     }
+
+    pub(crate) const fn program_mut(&mut self) -> &mut M {
+        &mut self.program
+    }
 }
 
 impl<M: ModelProgram> SingleSlotTextGenerator<M> {
