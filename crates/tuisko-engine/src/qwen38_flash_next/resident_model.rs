@@ -70,6 +70,30 @@ const CAUSAL_ROUTES_PER_SEGMENT: usize = QWEN38_FLASH_NEXT_CAUSAL_ROWS.len();
 const _: () = assert!(ROUTES_PER_SEGMENT == 12);
 const _: () = assert!(CAUSAL_ROUTES_PER_SEGMENT == 4);
 
+fn snapshot_widths(layout: &Qwen38FlashNextResidentLayout) -> EngineResult<(usize, usize, usize)> {
+    let mut history = 0usize;
+    let mut state = 0usize;
+    let mut ple = 0usize;
+    for plan in layout.layers() {
+        if let Some(gdn) = plan.persistent.gdn() {
+            let (layer_history, layer_state) = gdn.slot_widths();
+            history = history.checked_add(layer_history).ok_or_else(|| {
+                EngineError::layout("Qwen3.8 Flash-Next snapshot history width overflows")
+            })?;
+            state = state.checked_add(layer_state).ok_or_else(|| {
+                EngineError::layout("Qwen3.8 Flash-Next snapshot state width overflows")
+            })?;
+        }
+        if let Some(layer_ple) = plan.persistent.ple() {
+            ple = ple.checked_add(layer_ple.slot_width()).ok_or_else(|| {
+                EngineError::layout("Qwen3.8 Flash-Next snapshot PLE width overflows")
+            })?;
+        }
+    }
+
+    Ok((history, state, ple))
+}
+
 /// Flat index with decode at `0..8` and prefill at `8..12`.
 const fn segment_route_index(route: Qwen38FlashNextRowRoute) -> usize {
     match route {
@@ -267,9 +291,8 @@ pub struct Qwen38FlashNextSlotSnapshot {
     sequence: u64,
     tokens: usize,
     carry: Qwen38FlashNextEngramCarry,
-    gdn_history: Vec<u16>,
-    gdn_state: Vec<f32>,
-    ple_conv_state: Vec<u16>,
+    bytes: usize,
+    generation: u64,
 }
 
 impl Qwen38FlashNextSlotSnapshot {
@@ -283,12 +306,9 @@ impl Qwen38FlashNextSlotSnapshot {
         self.tokens
     }
 
-    /// Recurrent payload bytes held by the snapshot.
-    pub fn byte_len(&self) -> usize {
-        size_of::<Qwen38FlashNextEngramCarry>()
-            + self.gdn_history.len() * size_of::<u16>()
-            + self.gdn_state.len() * size_of::<f32>()
-            + self.ple_conv_state.len() * size_of::<u16>()
+    /// Recurrent payload bytes held in the resident restore bank.
+    pub const fn byte_len(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -529,6 +549,10 @@ pub struct Qwen38FlashNextResidentModel {
     embedding_stager: PinnedHostBuffer<u16>,
     engram_stager: PinnedHostBuffer<u8>,
     logit_bank: PinnedHostBuffer<u16>,
+    snapshot_history: PinnedHostBuffer<u16>,
+    snapshot_state: PinnedHostBuffer<f32>,
+    snapshot_ple: PinnedHostBuffer<u16>,
+    snapshot_generation: u64,
     expert_readback: Vec<u16>,
     engram_rows: Vec<i64>,
     carries: [Qwen38FlashNextEngramCarry; MAX_BATCH],
@@ -1261,6 +1285,13 @@ impl Qwen38FlashNextResidentModel {
             )?,
         )
         .map_err(GpuError::from)?;
+        let (snapshot_history, snapshot_state, snapshot_ple) = snapshot_widths(&layout)?;
+        let snapshot_history =
+            PinnedHostBuffer::zeroed(context, snapshot_history).map_err(GpuError::from)?;
+        let snapshot_state =
+            PinnedHostBuffer::zeroed(context, snapshot_state).map_err(GpuError::from)?;
+        let snapshot_ple =
+            PinnedHostBuffer::zeroed(context, snapshot_ple).map_err(GpuError::from)?;
 
         let table_scale_bits =
             Qwen38FlashNextEngramBindings::bind(snapshot.as_ref(), A::PLE_LAYER)?
@@ -1292,6 +1323,10 @@ impl Qwen38FlashNextResidentModel {
             embedding_stager,
             engram_stager,
             logit_bank,
+            snapshot_history,
+            snapshot_state,
+            snapshot_ple,
+            snapshot_generation: 0,
             expert_readback: vec![
                 0u16;
                 QWEN38_FLASH_NEXT_RESIDENT_MAX_ROWS * A::NUM_EXPERTS_PER_TOKEN
@@ -2266,6 +2301,9 @@ impl Qwen38FlashNextResidentModel {
         self.embedding_stager.num_bytes()
             + self.engram_stager.num_bytes()
             + self.logit_bank.num_bytes()
+            + self.snapshot_history.num_bytes()
+            + self.snapshot_state.num_bytes()
+            + self.snapshot_ple.num_bytes()
     }
 
     /// The shared page pool behind the eight block-table rows.
@@ -2344,9 +2382,12 @@ impl Qwen38FlashNextResidentModel {
             })
     }
 
-    /// Snapshots overwritten recurrent state. Append-only paged K/V remains in place.
+    /// Snapshots recurrent state into the resident pinned restore bank.
+    ///
+    /// Append-only K/V needs only a length rollback. One generation-stamped bank is sufficient
+    /// because speculative rounds never retain concurrent restore points.
     pub fn snapshot_slot(
-        &self,
+        &mut self,
         stream: &CudaStream,
         slot: usize,
     ) -> EngineResult<Qwen38FlashNextSlotSnapshot> {
@@ -2360,42 +2401,53 @@ impl Qwen38FlashNextResidentModel {
                 "Flash-Next slot {slot} must be active before it can be snapshotted"
             )));
         }
-        let mut gdn_history = Vec::new();
-        let mut gdn_state = Vec::new();
-        let mut ple_conv_state = Vec::new();
+        let generation = self.snapshot_generation.checked_add(1).ok_or_else(|| {
+            EngineError::layout("Qwen3.8 Flash-Next snapshot generation overflows")
+        })?;
+        self.snapshot_generation = generation;
+        let mut history_cursor = 0usize;
+        let mut state_cursor = 0usize;
+        let mut ple_cursor = 0usize;
 
-        for plan in self.layout.layers() {
+        for plan in self.layout.layers().clone() {
             if let Some(gdn) = plan.persistent.gdn() {
                 let (history, state) = gdn.slot_widths();
-                let base = gdn_history.len();
-                gdn_history.resize(base + history, 0u16);
                 self.arena.copy_slice_to_host_slice(
                     stream,
                     gdn.history,
                     slot * history,
-                    &mut gdn_history[base..],
+                    &mut self.snapshot_history[history_cursor..history_cursor + history],
                 )?;
-                let base = gdn_state.len();
-                gdn_state.resize(base + state, 0.0f32);
+                history_cursor += history;
                 self.arena.copy_slice_to_host_slice(
                     stream,
                     gdn.state,
                     slot * state,
-                    &mut gdn_state[base..],
+                    &mut self.snapshot_state[state_cursor..state_cursor + state],
                 )?;
+                state_cursor += state;
             }
             if let Some(ple) = plan.persistent.ple() {
                 let width = ple.slot_width();
-                ple_conv_state.resize(width, 0u16);
                 self.arena.copy_slice_to_host_slice(
                     stream,
                     ple.conv_state,
                     slot * width,
-                    &mut ple_conv_state,
+                    &mut self.snapshot_ple[ple_cursor..ple_cursor + width],
                 )?;
+                ple_cursor += width;
             }
         }
         stream.synchronize().map_err(GpuError::from)?;
+        debug_assert_eq!(history_cursor, self.snapshot_history.len());
+        debug_assert_eq!(state_cursor, self.snapshot_state.len());
+        debug_assert_eq!(ple_cursor, self.snapshot_ple.len());
+        let bytes = self
+            .snapshot_history
+            .num_bytes()
+            .checked_add(self.snapshot_state.num_bytes())
+            .and_then(|bytes| bytes.checked_add(self.snapshot_ple.num_bytes()))
+            .ok_or_else(|| EngineError::layout("Qwen3.8 Flash-Next snapshot bytes overflow"))?;
 
         Ok(Qwen38FlashNextSlotSnapshot {
             owner: Arc::clone(&self.snapshot_owner),
@@ -2403,9 +2455,8 @@ impl Qwen38FlashNextResidentModel {
             sequence: self.slots.sequence(slot)?,
             tokens: self.slots.tokens(slot)?,
             carry: self.carries[slot],
-            gdn_history,
-            gdn_state,
-            ple_conv_state,
+            bytes,
+            generation,
         })
     }
 
@@ -2426,6 +2477,12 @@ impl Qwen38FlashNextResidentModel {
                 "a Flash-Next slot snapshot belongs to another resident model",
             ));
         }
+        if snapshot.generation != self.snapshot_generation {
+            return Err(EngineError::route(format!(
+                "Qwen3.8 Flash-Next snapshot generation {} was overwritten by generation {}",
+                snapshot.generation, self.snapshot_generation
+            )));
+        }
         if self.slots.sequence(slot)? != snapshot.sequence {
             return Err(EngineError::route(format!(
                 "Flash-Next slot {slot} has restarted since this snapshot was taken"
@@ -2441,49 +2498,40 @@ impl Qwen38FlashNextResidentModel {
         }
         let mut history_cursor = 0usize;
         let mut state_cursor = 0usize;
+        let mut ple_cursor = 0usize;
 
         for plan in self.layout.layers().clone() {
             if let Some(gdn) = plan.persistent.gdn() {
                 let (history, state) = gdn.slot_widths();
-                let source = snapshot
-                    .gdn_history
-                    .get(history_cursor..history_cursor + history)
-                    .ok_or_else(|| {
-                        EngineError::layout(
-                            "a Flash-Next slot snapshot is short of one layer's GDN history",
-                        )
-                    })?;
-                self.arena
-                    .copy_slice_from_host(stream, gdn.history, slot * history, source)?;
+                self.arena.copy_slice_from_host(
+                    stream,
+                    gdn.history,
+                    slot * history,
+                    &self.snapshot_history[history_cursor..history_cursor + history],
+                )?;
                 history_cursor += history;
-
-                let source = snapshot
-                    .gdn_state
-                    .get(state_cursor..state_cursor + state)
-                    .ok_or_else(|| {
-                        EngineError::layout(
-                            "a Flash-Next slot snapshot is short of one layer's GDN state",
-                        )
-                    })?;
-                self.arena
-                    .copy_slice_from_host(stream, gdn.state, slot * state, source)?;
+                self.arena.copy_slice_from_host(
+                    stream,
+                    gdn.state,
+                    slot * state,
+                    &self.snapshot_state[state_cursor..state_cursor + state],
+                )?;
                 state_cursor += state;
             }
             if let Some(ple) = plan.persistent.ple() {
                 let width = ple.slot_width();
-                if snapshot.ple_conv_state.len() != width {
-                    return Err(EngineError::layout(
-                        "a Flash-Next slot snapshot carries the wrong PLE conv-state width",
-                    ));
-                }
                 self.arena.copy_slice_from_host(
                     stream,
                     ple.conv_state,
                     slot * width,
-                    &snapshot.ple_conv_state,
+                    &self.snapshot_ple[ple_cursor..ple_cursor + width],
                 )?;
+                ple_cursor += width;
             }
         }
+        debug_assert_eq!(history_cursor, self.snapshot_history.len());
+        debug_assert_eq!(state_cursor, self.snapshot_state.len());
+        debug_assert_eq!(ple_cursor, self.snapshot_ple.len());
         self.carries[slot] = snapshot.carry;
         if current > snapshot.tokens {
             self.slots.rollback(slot, snapshot.tokens)?;
@@ -2752,6 +2800,15 @@ mod tests {
         // The reserved indexer plane is not written by the dense QSA route.
         assert_eq!(kv_append_bytes(1), 12_288);
         assert_eq!(kv_append_bytes(8), 98_304);
+    }
+
+    #[test]
+    fn the_restore_bank_covers_one_slot_of_every_recurrent_family() {
+        let layout = Qwen38FlashNextResidentLayout::build().unwrap();
+        let (history, state, ple) = snapshot_widths(&layout).unwrap();
+        let bytes = history * size_of::<u16>() + state * size_of::<f32>() + ple * size_of::<u16>();
+
+        assert_eq!(bytes, 115_642_368);
     }
 
     #[test]

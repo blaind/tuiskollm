@@ -9,6 +9,7 @@ pub(crate) mod gdn_moe_layer;
 pub(crate) mod gdn_moe_layer_layout;
 pub(crate) mod layer_route;
 pub(crate) mod layer_upload;
+pub(crate) mod mtp_generation;
 pub(crate) mod mtp_layout;
 pub(crate) mod mtp_program;
 pub(crate) mod persistent_state;
