@@ -46,6 +46,11 @@ path = "src/bin/bench_device.rs"
 required-features = ["residual-benchmark"]
 
 [[bin]]
+name = "bench-qwen38-flash-next-resident"
+path = "src/bin/bench_qwen38_flash_next_resident.rs"
+required-features = ["device"]
+
+[[bin]]
 name = "bench-startup"
 path = "src/bin/bench_startup.rs"
 required-features = ["device"]

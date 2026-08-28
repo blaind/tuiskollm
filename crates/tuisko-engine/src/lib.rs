@@ -141,6 +141,18 @@ pub use qwen38_flash_next::qsa_moe_layer::{
     Qwen38FlashNextQsaMoeLayerProgram, Qwen38FlashNextQsaRound,
 };
 pub use qwen38_flash_next::qsa_moe_layer_layout::Qwen38FlashNextQsaMoeLayerLayout;
+pub use qwen38_flash_next::resident_model::{
+    Qwen38FlashNextLayerStreamTelemetry, Qwen38FlashNextResidentLoadStats,
+    Qwen38FlashNextResidentModel, Qwen38FlashNextStepTelemetry, qwen38_flash_next_rope,
+};
+pub use qwen38_flash_next::resident_model_layout::{
+    QWEN38_FLASH_NEXT_ATTENTION_LAYERS, QWEN38_FLASH_NEXT_DEVICE_BUDGET_BYTES,
+    QWEN38_FLASH_NEXT_EXPERT_ITEM_COUNT, QWEN38_FLASH_NEXT_EXPERT_PRIMARY_EXTENT_BYTES,
+    QWEN38_FLASH_NEXT_EXPERT_RESIDENT_SLOTS, QWEN38_FLASH_NEXT_EXPERT_SECONDARY_EXTENT_BYTES,
+    QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES, QWEN38_FLASH_NEXT_PRIMARY_SOURCE,
+    QWEN38_FLASH_NEXT_REQUIRED_HEADROOM_BYTES, QWEN38_FLASH_NEXT_RESIDENT_MAX_ROWS,
+    QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS, Qwen38FlashNextResidentLayout,
+};
 /// Single-slot Qwen3.5 streaming request over the resident text program.
 pub type Qwen35ResidentGenerationSession<'a> =
     common::text_generator::SingleSlotGenerationSession<'a, Qwen35ResidentModelProgram>;

@@ -313,6 +313,12 @@ mod qwen38_flash_next_qsa_selection;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_qsa_selection_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_resident_model;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_resident_model_benchmark;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_resident_model_oracle;
+#[cfg(feature = "device")]
 mod qwen38_flash_next_streaming_weight_pool_benchmark;
 #[cfg(feature = "device")]
 mod resident_batch_generation;
@@ -844,6 +850,22 @@ pub use qwen38_flash_next_qsa_selection::{
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_qsa_selection_benchmark::benchmark_qwen38_flash_next_qsa_selection;
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_resident_model::{
+    Qwen38FlashNextResidentModelQualification, Qwen38FlashNextResidentModelQualificationError,
+    Qwen38FlashNextRouteMeasurement, print_qwen38_flash_next_resident_model_report,
+    qualify_qwen38_flash_next_resident_model,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_resident_model_benchmark::{
+    Qwen38FlashNextResidentBenchmarkReport, Qwen38FlashNextResidentRouteReport,
+    benchmark_qwen38_flash_next_resident_model, print_qwen38_flash_next_resident_benchmark,
+};
+#[cfg(feature = "device")]
+pub use qwen38_flash_next_resident_model_oracle::{
+    Qwen38FlashNextModelOracle, Qwen38FlashNextModelOracleError,
+    print_qwen38_flash_next_model_oracle, qwen38_flash_next_model_oracle,
+};
 #[cfg(feature = "device")]
 pub use resident_batch_generation::{
     ResidentBatchGenerationQualification, ResidentBatchGenerationQualificationError,

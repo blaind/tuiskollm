@@ -14,7 +14,7 @@ use tuisko_model::{
 };
 
 /// The four device planes one gated residual occupies.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct HyperConnectionRegions {
     pub(crate) norm: ArenaRegion<u16>,
     pub(crate) down: ArenaRegion<u16>,
@@ -23,7 +23,7 @@ pub(crate) struct HyperConnectionRegions {
 }
 
 /// The six device planes one layer's MoE half occupies, excluding the routed pool.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct MoeRegions {
     pub(crate) router_weight: ArenaRegion<u16>,
     pub(crate) shared_gate_weight: ArenaRegion<u16>,

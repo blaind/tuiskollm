@@ -10,3 +10,5 @@ pub(crate) mod layer_upload;
 pub(crate) mod persistent_state;
 pub(crate) mod qsa_moe_layer;
 pub(crate) mod qsa_moe_layer_layout;
+pub(crate) mod resident_model;
+pub(crate) mod resident_model_layout;

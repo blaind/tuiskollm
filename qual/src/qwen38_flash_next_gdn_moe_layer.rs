@@ -646,7 +646,7 @@ fn verify_layer_oracle(
 }
 
 /// The gated DeltaNet block for one decode token against a zeroed carry.
-fn gdn_block_oracle(
+pub(crate) fn gdn_block_oracle(
     mixed: &[u16],
     projected: &[u16],
     gdn: &tuisko_model::MaterializedQwen38FlashNextGdn<'_>,
@@ -749,7 +749,7 @@ fn l2_normalize(values: &[f64]) -> Vec<f64> {
     widened.iter().map(|value| value * inverse).collect()
 }
 
-fn bf16_words(bytes: &[u8]) -> QualResult<Vec<u16>> {
+pub(crate) fn bf16_words(bytes: &[u8]) -> QualResult<Vec<u16>> {
     let (words, remainder) = bytes.as_chunks::<2>();
     if !remainder.is_empty() {
         return Err(mismatch(
