@@ -78,6 +78,7 @@ pub enum ServerError {
 struct AppState {
     jobs: Sender<Job>,
     request_ids: Arc<AtomicU64>,
+    response_namespace: u128,
     worker_ready: Arc<AtomicBool>,
     server_started: Instant,
     model_id: &'static str,
@@ -199,6 +200,11 @@ impl std::str::FromStr for ServerModel {
 pub fn run(config: ServerConfig) -> Result<(), ServerError> {
     let startup_start = Instant::now();
     let target = config.model;
+    let response_namespace = new_response_namespace().map_err(|error| {
+        ServerError::Startup(format!(
+            "creating a restart-unique response namespace: {error}"
+        ))
+    })?;
     let stdout = std::io::stdout();
     let interactive = stdout.is_terminal();
     let color = interactive && std::env::var_os("NO_COLOR").is_none();
@@ -213,6 +219,7 @@ pub fn run(config: ServerConfig) -> Result<(), ServerError> {
             interactive,
             color,
             startup_start,
+            response_namespace,
         )?
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -248,6 +255,7 @@ fn start_worker(
     interactive: bool,
     color: bool,
     server_started: Instant,
+    response_namespace: u128,
 ) -> Result<(AppState, Ready, oneshot::Receiver<String>), ServerError> {
     let (jobs_tx, jobs_rx) = channel(MAX_BATCH);
     let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
@@ -305,6 +313,7 @@ fn start_worker(
         AppState {
             jobs: jobs_tx,
             request_ids: Arc::new(AtomicU64::new(1)),
+            response_namespace,
             worker_ready,
             server_started,
             model_id: ready.model_id,
@@ -1027,7 +1036,7 @@ async fn chat_completions(
         return enqueue_error_response(error);
     }
 
-    let id = format!("chatcmpl-tuisko-{numeric_id:016x}");
+    let id = completion_id(state.response_namespace, numeric_id);
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1065,6 +1074,16 @@ async fn chat_completions(
         )
         .await
     }
+}
+
+fn new_response_namespace() -> Result<u128, getrandom::Error> {
+    let mut bytes = [0u8; size_of::<u128>()];
+    getrandom::fill(&mut bytes)?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
+fn completion_id(namespace: u128, numeric_id: u64) -> String {
+    format!("chatcmpl-tuisko-{namespace:032x}-{numeric_id:016x}")
 }
 
 fn enqueue_job(jobs: &Sender<Job>, job: Job) -> Result<(), EnqueueError> {
@@ -1108,9 +1127,9 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
 mod tests {
     use super::{
         AppState, EnqueueError, Job, QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, Ready, ServerError,
-        ServerModel, chat_completions, enqueue_job, fail_queued, health, models, record_admission,
-        render_loading, render_startup, render_weight_progress, router, serve_until_worker_failure,
-        try_send_generation_steps,
+        ServerModel, chat_completions, completion_id, enqueue_job, fail_queued, health, models,
+        record_admission, render_loading, render_startup, render_weight_progress, router,
+        serve_until_worker_failure, try_send_generation_steps,
     };
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
     use axum::Json;
@@ -1153,6 +1172,7 @@ mod tests {
         AppState {
             jobs,
             request_ids: Arc::new(AtomicU64::new(1)),
+            response_namespace: 0x5a17,
             worker_ready: Arc::new(AtomicBool::new(ready)),
             server_started: std::time::Instant::now(),
             model_id: SERVED_MODEL,
@@ -1164,6 +1184,18 @@ mod tests {
             },
             reasoning_effort: ServerModel::Qwen38.reasoning_effort(),
         }
+    }
+
+    #[test]
+    fn response_ids_do_not_repeat_after_a_request_counter_restart() {
+        let before_restart = completion_id(0x5a17, 0x17);
+        let after_restart = completion_id(0x6b28, 0x17);
+
+        assert_ne!(before_restart, after_restart);
+        assert_eq!(
+            before_restart,
+            "chatcmpl-tuisko-00000000000000000000000000005a17-0000000000000017"
+        );
     }
 
     #[test]

@@ -400,7 +400,9 @@ fn stream_chunk(mut chunk: Value, include_usage: bool) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{GenerationReply, STREAM_EVENT_BUFFER, blocking_response, streaming_response};
+    use super::{
+        GenerationReply, STREAM_EVENT_BUFFER, blocking_response, streaming_response, tool_call_id,
+    };
     use axum::body::to_bytes;
     use axum::http::{StatusCode, header};
     use serde_json::{Value, json};
@@ -433,6 +435,21 @@ mod tests {
 
     fn runtime() -> tokio::runtime::Runtime {
         Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    #[test]
+    fn tool_call_ids_preserve_the_restart_unique_completion_namespace() {
+        let before = tool_call_id(
+            "chatcmpl-tuisko-00000000000000000000000000005a17-0000000000000017",
+            0,
+        );
+        let after = tool_call_id(
+            "chatcmpl-tuisko-00000000000000000000000000006b28-0000000000000017",
+            0,
+        );
+
+        assert_ne!(before, after);
+        assert_eq!(before.len(), 63);
     }
 
     #[test]

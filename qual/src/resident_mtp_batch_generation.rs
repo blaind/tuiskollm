@@ -48,6 +48,8 @@ pub struct ResidentMtpBatchGenerationQualification {
     pub cancellations: usize,
     /// Exact full-prefix restores exercised.
     pub exact_prefix_reuses: usize,
+    /// Completed raw generations restored through their complete-message fallback.
+    pub message_boundary_fallbacks: usize,
     /// Retained spans rejected after divergence before their complete boundary.
     pub safe_cold_fallbacks: usize,
     /// Full-pool admissions that evicted an unrelated inactive prefix.
@@ -107,6 +109,8 @@ pub fn qualify_resident_mtp_batch_generation(
     let (cancellations, exact_prefix_reuses, safe_cold_fallbacks) =
         qualify_reuse_cancellation_and_recycling(&mut generator)?;
     generator.qualification_clear_retained()?;
+    let message_boundary_fallbacks = qualify_completed_message_fallback(&mut generator)?;
+    generator.qualification_clear_retained()?;
     let (page_pressure_evictions, page_pressure_refusals) =
         qualify_page_pressure_eviction(&mut generator)?;
     generator.qualification_clear_retained()?;
@@ -136,6 +140,7 @@ pub fn qualify_resident_mtp_batch_generation(
         oracle_rows,
         cancellations,
         exact_prefix_reuses,
+        message_boundary_fallbacks,
         safe_cold_fallbacks,
         page_pressure_evictions,
         page_pressure_refusals,
@@ -146,6 +151,81 @@ pub fn qualify_resident_mtp_batch_generation(
         message_boundary_snapshot_bytes: generator.message_boundary_snapshot_bytes(),
         kv_route_host_bytes: generator.kv_route_host_bytes(),
     })
+}
+
+fn qualify_completed_message_fallback(
+    generator: &mut ResidentMtpBatchGenerator,
+) -> Result<usize, ResidentMtpBatchGenerationQualificationError> {
+    let opening = greedy_request("Give a brief greeting.", 8);
+    let mut divergent = greedy_request("Give a brief greeting.", 8);
+    divergent.messages.push(ChatMessage::new(
+        "assistant",
+        "This deliberately differs from the generated assistant turn.",
+    ));
+    divergent
+        .messages
+        .push(ChatMessage::new("user", "Now name one primary color."));
+
+    let cold = generator.admit(&divergent)?;
+    let cold_anchor = one_token(&generator.step()?, cold.request_id)?;
+    let _ = generator.cancel(cold.request_id)?;
+    generator.qualification_clear_retained()?;
+
+    let admitted = generator.admit(&opening)?;
+    let slot = generator
+        .qualification_slot(admitted.request_id)
+        .ok_or_else(|| mismatch("completed-prefix seed has no physical slot"))?;
+    let mut output = None;
+    while generator
+        .active_request_ids()
+        .any(|request| request == admitted.request_id)
+    {
+        let events = generator.step()?;
+        if let Some(completed) = events
+            .iter()
+            .find(|event| event.request_id == admitted.request_id)
+            .and_then(|event| event.completed.as_ref())
+        {
+            output = Some(completed.clone());
+        }
+    }
+    let output = output.ok_or_else(|| mismatch("completed-prefix seed returned no output"))?;
+    let boundary = output.prompt.message_boundary_tokens;
+    let retained = generator
+        .qualification_retained_tokens(slot)
+        .ok_or_else(|| mismatch("normal completion retained no processed prefix"))?;
+    if retained <= boundary
+        || generator.qualification_retained_message_boundary(slot) != Some(boundary)
+    {
+        return Err(mismatch(format!(
+            "normal completion retained {retained} tokens without its {boundary}-token message boundary"
+        )));
+    }
+
+    let resumed = generator.admit(&divergent)?;
+    if resumed.device_reused_tokens != boundary
+        || generator.qualification_slot(resumed.request_id) != Some(slot)
+    {
+        return Err(mismatch(format!(
+            "divergent history reused {}/{} tokens on slot {:?}/{slot}",
+            resumed.device_reused_tokens,
+            boundary,
+            generator.qualification_slot(resumed.request_id)
+        )));
+    }
+    let warm_anchor = one_token(&generator.step()?, resumed.request_id)?;
+    if warm_anchor != cold_anchor {
+        return Err(mismatch(format!(
+            "message-boundary fallback changed the next token: cold {cold_anchor}, warm {warm_anchor}"
+        )));
+    }
+    let _ = generator.cancel(resumed.request_id)?;
+
+    Ok(1)
+}
+
+fn mismatch(message: impl Into<String>) -> ResidentMtpBatchGenerationQualificationError {
+    ResidentMtpBatchGenerationQualificationError::Mismatch(message.into())
 }
 
 fn qualify_exact_route(
@@ -674,6 +754,7 @@ mod tests {
         assert!(report.oracle_rows >= 32);
         assert_eq!(report.cancellations, 7);
         assert_eq!(report.exact_prefix_reuses, 2);
+        assert_eq!(report.message_boundary_fallbacks, 1);
         assert_eq!(report.safe_cold_fallbacks, 1);
         assert_eq!(report.page_pressure_evictions, 1);
         assert_eq!(report.page_pressure_refusals, 1);

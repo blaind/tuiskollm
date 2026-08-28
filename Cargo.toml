@@ -60,6 +60,7 @@ cuda-device = { version = "0.2.1", git = "https://github.com/blaind/cuda-oxide.g
 cuda-host = { version = "0.2.1", git = "https://github.com/blaind/cuda-oxide.git", rev = "0199e55572ee78cd2cea97335e5b7392a3f9be4a" }
 cuda-intrinsics = { version = "0.1.0", git = "https://github.com/blaind/cuda-oxide.git", rev = "0199e55572ee78cd2cea97335e5b7392a3f9be4a" }
 flate2 = "1.1"
+getrandom = "0.4"
 memmap2 = "0.9"
 page_size = "0.6"
 minijinja = { version = "2", features = ["json"] }
