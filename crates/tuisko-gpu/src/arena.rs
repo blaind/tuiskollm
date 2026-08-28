@@ -283,13 +283,26 @@ impl VmmArenaStorage {
         stream
             .synchronize()
             .map_err(|source| GpuError::driver("synchronizing before VMM arena park", source))?;
-        for segment in &mut self.segments {
-            if segment.class == VmmSegmentClass::Parkable {
-                drop(segment.mapping.take());
-                drop(segment.allocation.take());
+        for segment in &self.segments {
+            if segment.class == VmmSegmentClass::Parkable
+                && (segment.mapping.is_some() != segment.allocation.is_some())
+            {
+                return Err(GpuError::arena(
+                    "parkable VMM segment retained partial physical ownership",
+                ));
             }
         }
-        Ok(self.parkable_bytes)
+        let mut released = 0usize;
+        for segment in &mut self.segments {
+            if segment.class == VmmSegmentClass::Parkable && segment.mapping.is_some() {
+                drop(segment.mapping.take());
+                drop(segment.allocation.take());
+                released = released
+                    .checked_add(segment.bytes)
+                    .ok_or_else(|| GpuError::arena("parked VMM byte count overflows"))?;
+            }
+        }
+        Ok(released)
     }
 
     fn resume(&mut self, stream: &CudaStream) -> GpuResult<usize> {
@@ -339,12 +352,6 @@ impl VmmArenaStorage {
             segment.allocation = Some(replacement.allocation);
         }
         Ok(resumed_bytes)
-    }
-
-    fn is_parked(&self) -> bool {
-        self.segments
-            .iter()
-            .any(|segment| segment.class == VmmSegmentClass::Parkable && segment.mapping.is_none())
     }
 }
 
@@ -774,8 +781,7 @@ impl DeviceArena {
     pub fn park(&mut self, stream: &CudaStream) -> GpuResult<usize> {
         self.require_stream_context(stream, "parking a VMM device arena")?;
         match &mut self.storage {
-            ArenaStorage::Vmm(storage) if !storage.is_parked() => storage.park(stream),
-            ArenaStorage::Vmm(_) => Err(GpuError::arena("VMM device arena is already parked")),
+            ArenaStorage::Vmm(storage) => storage.park(stream),
             ArenaStorage::Legacy(_) => Err(GpuError::arena(
                 "legacy device arena cannot preserve addresses while parked",
             )),
@@ -928,6 +934,26 @@ impl DeviceArena {
         // SAFETY: the typed element subrange was checked inside the live region.
         unsafe { cuda_core::memory::memset_d8_async(address, value, bytes, stream.cu_stream()) }
             .map_err(|source| GpuError::driver("filling a device arena subrange", source))
+    }
+
+    /// Enqueues a zero fill over every typed-layout byte in this arena.
+    pub fn zero_all(&self, stream: &CudaStream) -> GpuResult<()> {
+        self.require_stream_context(stream, "zeroing a complete device arena")?;
+        if self.bytes == 0 {
+            return Ok(());
+        }
+
+        bind_context(stream, "binding the arena CUDA context")?;
+        // SAFETY: the complete typed-layout range is mapped and owned by this arena.
+        unsafe {
+            cuda_core::memory::memset_d8_async(
+                self.base_address(),
+                0,
+                self.bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|source| GpuError::driver("zeroing a complete device arena", source))
     }
 
     /// Copies the complete arena into a host byte vector.
@@ -1541,9 +1567,11 @@ mod tests {
         let parked_memory = device_memory_info(&context).unwrap();
         assert!(parked_memory.free_bytes >= mapped_memory.free_bytes + granularity);
         assert_eq!(arena.mapped_physical_bytes(), 0);
+        assert_eq!(arena.park(&stream).unwrap(), 0);
         assert_eq!(arena.base_address(), base_address);
         assert_eq!(arena.address(values).unwrap(), values_address);
         assert_eq!(arena.resume(&stream).unwrap(), granularity);
+        assert_eq!(arena.resume(&stream).unwrap(), 0);
         let resumed_memory = device_memory_info(&context).unwrap();
         assert!(resumed_memory.free_bytes + granularity <= parked_memory.free_bytes);
         assert_eq!(arena.mapped_physical_bytes(), granularity);

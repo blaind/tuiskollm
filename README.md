@@ -68,8 +68,9 @@ targets, not fallback servers. Vision is not served yet.
   `GET /v1/models`.
 - Qwen3.8 lifecycle administration: `/v1/unload`/`load` release and recreate the complete model;
   `/v1/park`/`resume` preserve retained-prefix KV and recurrent state in pinned host memory while
-  releasing its VMM physical backing. Park/resume device qualification remains pending an
-  exclusive RTX 5090.
+  releasing all target/MTP arena backing. Resume reloads represented weights from the admitted
+  snapshot at the retained graph addresses before restoring the mirror. Exact-model park/resume
+  device qualification remains pending.
 - Request logs with queue-inclusive latency, TTFT, decode rate, cache reuse, and route identity.
 
 ## Build from source

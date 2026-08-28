@@ -49,7 +49,7 @@ pub struct ResidentMtpBatchGenerator {
     stop_ids: [u32; 2],
 }
 
-/// Qwen3.8 generator whose durable mappings are absent and cannot launch graphs.
+/// Qwen3.8 generator whose target/MTP arena mappings are absent and cannot launch graphs.
 pub struct ParkedQwen38Generator {
     generator: ResidentMtpBatchGenerator,
     mirror: Qwen38ParkMirror,
@@ -1694,7 +1694,7 @@ impl ParkedQwen38Generator {
         self.generator.device_owner_bytes()
     }
 
-    /// Recreates the missing physical mappings and restores every durable represented bit.
+    /// Recreates all arena mappings, reloads weights, and restores every durable represented bit.
     #[allow(clippy::result_large_err)]
     pub fn resume(self) -> Result<ResidentMtpBatchGenerator, (Self, EngineError)> {
         let Self {
@@ -1703,6 +1703,12 @@ impl ParkedQwen38Generator {
             released_device_bytes,
         } = self;
         if let Err(error) = restore_park_mirror(&mut generator, &mirror) {
+            let error = match generator.program.park_device_arenas(&generator.stream) {
+                Ok(_) => error,
+                Err(rollback) => EngineError::generation(format!(
+                    "resume failed: {error}; remapping rollback also failed: {rollback}"
+                )),
+            };
             return Err((
                 Self {
                     generator,
@@ -1796,11 +1802,14 @@ fn restore_park_mirror(
 ) -> EngineResult<()> {
     mirror.require_checksums(generator)?;
     generator.program.resume_device_arenas(&generator.stream)?;
-    generator.program.reset_state(&generator.stream)?;
+    generator
+        .program
+        .reload_released_arenas(&generator.stream)?;
     generator
         .program
         .target()
         .restore_all_block_tables(&generator.stream)?;
+    generator.program.restore_block_tables(&generator.stream)?;
     for (row, manifest) in mirror.slots.iter().enumerate() {
         generator.program.target().restore_gdn_slot_from(
             &generator.stream,

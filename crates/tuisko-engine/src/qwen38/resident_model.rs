@@ -567,6 +567,7 @@ pub struct ResidentModelProgram {
     snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     context: Arc<CudaContext>,
     layout: ResidentModelLayout,
+    scalars: Vec<LayerScalars>,
     _pointers: ProgramPointers,
     base_address: u64,
     kv_base_address: u64,
@@ -745,7 +746,11 @@ impl ResidentModelProgram {
             },
             ResidentLoadMode::Selective => {
                 let granularity = vmm_allocation_granularity(&stream)?;
-                let arena_manifest = layout.vmm_segment_manifest(granularity)?;
+                let arena_manifest = VmmSegmentManifest::uniform(
+                    layout.builder.byte_len(),
+                    granularity,
+                    VmmSegmentClass::Parkable,
+                )?;
                 let kv_manifest = VmmSegmentManifest::uniform(
                     layout.kv_layout.builder().byte_len(),
                     granularity,
@@ -1061,6 +1066,7 @@ impl ResidentModelProgram {
                 snapshot,
                 context: context.clone(),
                 layout,
+                scalars,
                 _pointers: pointers,
                 base_address,
                 kv_base_address,
@@ -1908,6 +1914,36 @@ impl ResidentModelProgram {
         let cache = self.kv_arena.resume(stream)?;
         main.checked_add(cache)
             .ok_or_else(|| EngineError::layout("resident resumed byte count overflows"))
+    }
+
+    pub(crate) fn reload_released_arenas(&self, stream: &CudaStream) -> EngineResult<()> {
+        self.arena.zero_all(stream)?;
+        self.kv_arena.zero_all(stream)?;
+        let mut sink = LegacyWeightSink {
+            arena: &self.arena,
+            copy_ns: 0,
+        };
+        let mut preparation = ResidentPreparationStats::default();
+        let scalars = load_source_weights(
+            &mut sink,
+            stream,
+            &self.layout,
+            self.snapshot.as_ref(),
+            &mut preparation,
+        )?;
+        if scalars.len() != self.scalars.len()
+            || !scalars
+                .iter()
+                .zip(&self.scalars)
+                .all(|(reloaded, original)| reloaded.same_bits(*original))
+        {
+            return Err(EngineError::layout(
+                "reloaded resident scalar inventory differs from graph capture",
+            ));
+        }
+        initialize_metadata(&self.arena, &self.kv_arena, stream, &self.layout)?;
+        stream.synchronize().map_err(GpuError::from)?;
+        Ok(())
     }
 
     fn clear_slot_cache(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
@@ -4252,6 +4288,30 @@ enum MlpScalars {
 struct LayerScalars {
     mixer: MixerScalars,
     mlp: MlpScalars,
+}
+
+impl LayerScalars {
+    fn same_bits(self, other: Self) -> bool {
+        let mixer = match (self.mixer, other.mixer) {
+            (MixerScalars::Gdn, MixerScalars::Gdn) => true,
+            (MixerScalars::Attention(left), MixerScalars::Attention(right)) => {
+                left.key_cache_scale.to_bits() == right.key_cache_scale.to_bits()
+                    && left.value_cache_scale.to_bits() == right.value_cache_scale.to_bits()
+            }
+            _ => false,
+        };
+        let mlp = match (self.mlp, other.mlp) {
+            (MlpScalars::DenseFp8, MlpScalars::DenseFp8) => true,
+            (MlpScalars::Nvfp4(left), MlpScalars::Nvfp4(right)) => {
+                left.gate_up_input.to_bits() == right.gate_up_input.to_bits()
+                    && left.gate_up_weight.to_bits() == right.gate_up_weight.to_bits()
+                    && left.down_input.to_bits() == right.down_input.to_bits()
+                    && left.down_weight.to_bits() == right.down_weight.to_bits()
+            }
+            _ => false,
+        };
+        mixer && mlp
+    }
 }
 
 #[derive(Clone, Copy)]

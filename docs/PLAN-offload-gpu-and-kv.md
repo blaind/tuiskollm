@@ -24,8 +24,10 @@ state and pays the complete reload cost. This plan adds two distinct capabilitie
   stagers, frontend, and admitted snapshot; explicitly reload them later or auto-reload for the
   first new chat request.
 - **B — park/resume**: preserve the generator and its captured virtual addresses while copying
-  only durable target/MTP cache and recurrent state to pinned host memory, releasing the
-  corresponding physical device mappings, and leaving weights plus scratch mapped.
+  only durable target/MTP cache and recurrent state to pinned host memory, then release every
+  target/MTP arena's physical backing. Resume reloads represented weights losslessly from the
+  retained checkpoint snapshot, resets scratch, and restores the durable mirror at the original
+  graph addresses.
 
 `unload` does not preserve prefix-cache state. `park` does. Neither feature claims persistence
 across process exit.
@@ -43,18 +45,18 @@ Sources:
 
 | Region | Allocation bytes | GiB | Park treatment |
 | --- | ---: | ---: | --- |
-| Target represented weights | 19,103,682,560 | 17.792 | stays mapped |
-| Target GDN causal history | 23,592,960 | 0.022 | mirror live rows; release eligible granules |
-| Target GDN recurrent state | 1,207,959,552 | 1.125 | mirror live rows; release eligible granules |
-| Target shared scratch | 948,860,932 | 0.884 | stays mapped; not durable state |
-| Target resident-arena allocation, including padding | 21,284,111,616 | 19.822 | mixed |
-| Target E4M3 KV data | 7,210,008,576 | 6.715 | mirror in-use pages |
-| Target KV tables | 110,016 | 0.0001 | mirror or reconstruct and verify exactly |
+| Target represented weights | 19,103,682,560 | 17.792 | release; losslessly reload from snapshot |
+| Target GDN causal history | 23,592,960 | 0.022 | mirror live rows; release |
+| Target GDN recurrent state | 1,207,959,552 | 1.125 | mirror live rows; release |
+| Target shared scratch | 948,860,932 | 0.884 | release; reset on resume |
+| Target resident-arena allocation, including padding | 21,284,111,616 | 19.822 | release whole backing |
+| Target E4M3 KV data | 7,210,008,576 | 6.715 | mirror in-use pages; release |
+| Target KV tables | 110,016 | 0.0001 | reconstruct and verify exactly |
 | Target KV-arena allocation, including padding | 7,210,118,656 | 6.715 | release whole backing |
 | **Target allocation total** | **28,494,230,272** | **26.537** | — |
-| MTP represented weights | 849,398,784 | 0.791 | stays mapped |
-| MTP scratch and route metadata | 122,904,032 | 0.114 | stays mapped |
-| MTP main-arena allocation, including padding | 972,303,104 | 0.906 | stays mapped |
+| MTP represented weights | 849,398,784 | 0.791 | release; losslessly reload from snapshot |
+| MTP scratch and route metadata | 122,904,032 | 0.114 | release; reset/reconstruct on resume |
+| MTP main-arena allocation, including padding | 972,303,104 | 0.906 | release whole backing |
 | MTP BF16 KV-arena allocation | 901,251,072 | 0.839 | mirror in-use pages; release whole backing |
 | **MTP allocation total** | **1,873,554,176** | **1.745** | — |
 | **Production generator allocation total** | **30,367,784,448** | **28.282** | — |
@@ -74,9 +76,11 @@ MTP KV allocation            901,251,072
                            9,342,922,240 bytes = 8.701 GiB
 ```
 
-The exact parkable allocation count is not declared until MR-B0 queries the RTX 5090's minimum
-VMM granularity and classifies every target resident-arena granule. Granules containing any weight
-byte remain mapped. Target and MTP KV arenas are separate allocations and can be released in full.
+The four VMM reservations are wholly parkable. Their exact physical allocation count is the sum of
+their typed arena sizes rounded independently to the RTX 5090's queried minimum VMM granularity.
+The response reports that checked count. CUDA context, module, graph executable, pinned-host, and
+virtual-reservation ownership remains alive, so `nvidia-smi` does not fall to process-free usage;
+the large target/MTP arena backing does.
 
 An observed loaded process used 30,404 MiB in `nvidia-smi`. The exact arena ownership above is
 28,961 MiB when rounded to the nearest MiB, leaving about 1,443 MiB for context, modules, graph
@@ -264,17 +268,18 @@ The pinned mirror contains a typed manifest and only semantically live data:
 - the physical page identifiers, slot generations, token counts, and checksums required to restore
   those bytes to the same logical ownership.
 
-MTP device block tables live in the always-mapped MTP main arena. They are not copied, but park and
-resume checksum them against the independent host page-route owner and require them to remain
-unchanged.
+MTP device block tables are not copied. Park checksums them against the independent host page-route
+owner. Resume reconstructs target tables from that host owner, copies the complete table plane to
+the remapped MTP arena, and requires the pre-park checksum to match.
 
 The host `RetainedMtpSlot` token vectors, LRU clock, page-route owners, and frontend remain inside
 the parked generator. Unused cache pages and inactive state rows are not copied; resume initializes
 them to the production reset value before they can become observable.
 
-Target and MTP scratch workspaces are not durable state and are not mirrored in phase 1. They stay
-mapped. A later workspace-offload optimization is a separate measured feature with an explicit
-initialization/liveness manifest.
+Target and MTP weights and scratch are not mirrored. Park releases their physical backing along
+with the durable-state arenas. Resume zeros all remapped typed-layout bytes, losslessly reloads
+source-native represented weights from the retained admitted snapshot, reconstructs metadata, and
+only then restores the durable mirror. No weight is decoded and requantized.
 
 Pinned allocation is all-or-nothing and occurs before any mapping is removed. Park failure leaves
 the original loaded generator usable and publishes `Loaded`; it never exposes a partial mirror.
@@ -304,31 +309,28 @@ The invariant is relative, not equality with a pointer from an earlier `cuMemAll
 typed region must still resolve to `reserved_base + its checked layout offset`. Graphs are captured
 only after the VMM-backed owner is fully mapped and initialized.
 
-The target KV arena and MTP KV arena each have separate backing and are wholly releasable. Target
-GDN history/state are interleaved with layer weights at 256-byte layout alignment. MR-B0 classifies
-minimum-granularity chunks as:
-
-- **resident:** contains any weight or always-mapped workspace byte;
-- **parkable:** contains only history/state bytes and padding; or
-- **invalid:** overlaps an unowned gap in a way the checked manifest did not declare.
-
-Mixed weight/state boundary granules remain resident. The exact releasable byte count is therefore:
+All four production arenas use separate, wholly parkable backing. Their typed layouts remain the
+exact allocation and reconstruction authority; VMM tail padding exists only to satisfy the queried
+physical granularity. The exact releasable byte count is therefore:
 
 ```
-target KV allocation
-+ MTP KV allocation
-+ target resident-arena granules classified parkable
+rounded target main reservation
++ rounded target KV reservation
++ rounded MTP main reservation
++ rounded MTP KV reservation
 ```
 
 Park performs, in order: idle/fence confirmation, complete mirror allocation, D2H copies,
 stream/context synchronization, checksum validation, mapping drop, and physical-handle drop. The
-VA reservations and resident mappings remain alive.
+VA reservations, CUDA context, modules, graphs, checkpoint snapshot, frontend, and pinned host
+owners remain alive; no arena mapping remains.
 
-Resume creates new physical backing, maps it at the retained VAs, sets access, initializes all
-non-restored bytes to the production reset value, restores mirrored bytes to their original
-physical-page/state-row positions, synchronizes, validates checksums and device tables, and only
-then exposes a loaded generator. A resume failure drops only newly created partial backing and
-retains the complete host mirror so a later resume can retry.
+Resume creates new physical backing, maps it at the retained VAs, sets access, zeros every arena,
+reloads represented target and MTP weights from the admitted snapshot, reconstructs device tables,
+restores mirrored bytes to their original physical-page/state-row positions, synchronizes,
+validates checksums and device tables, and only then exposes a loaded generator. A resume failure
+releases any newly remapped backing, retains the complete host mirror, and leaves the type-state
+non-launchable so a later resume can retry from a fully parked owner.
 
 The fallback is full arena reallocation plus complete graph recapture. It is not selected merely
 because capture appears cheap: MR-B0 must first prove VMM unsupported or invalid on the exact
@@ -340,8 +342,9 @@ current no-recapture and parked-owner invariants would no longer apply.
 Park/resume does not widen the shared `TextGenerator` trait. Qwen3.8 uses target-specific owners:
 
 - `ResidentMtpBatchGenerator` is the loaded, launch-capable owner;
-- `ParkedQwen38Generator` owns graphs, stable VA reservations, resident mappings, host metadata,
-  and the complete mirror, but exposes no admission or replay method; and
+- `ParkedQwen38Generator` owns graphs, stable VA reservations, modules, checkpoint snapshot, host
+  metadata, and the complete mirror, but no arena physical mappings and no admission or replay
+  method; and
 - consuming `park`/`resume` transitions are the only way to move between them.
 
 This prevents a kernel or graph replay from being constructed while a required VA range is
@@ -356,7 +359,8 @@ MR-B0 and every production B MR require an exclusive RTX 5090 preflight. The gat
   set access, restore, and replay the unchanged graph.
 - **Independent byte oracle:** compare independently packed host bytes with every restored in-use
   target E4M3 page, MTP BF16 page, target block-table word, GDN BF16 history value, and GDN FP32
-  state value. No decode or requantization occurs.
+  state value, plus source-backed represented target/MTP weight samples after reload. No decode or
+  requantization occurs.
 - **Numerical:** eager and CUDA Graph replay agree after resume at every observable boundary;
   pre-park and post-resume greedy logits and token output are bit-identical.
 - **Inventory:** all admitted target and MTP exact routes, including every `B=1..8` entry, remain

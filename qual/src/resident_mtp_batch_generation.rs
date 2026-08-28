@@ -724,11 +724,14 @@ fn verify_owner(
 
 #[cfg(test)]
 mod tests {
-    use super::{EXACT_BATCHES, EXACT_VERIFY_TOKENS, qualify_page_pressure_eviction};
+    use super::{
+        EXACT_BATCHES, EXACT_VERIFY_TOKENS, greedy_request, one_token,
+        qualify_page_pressure_eviction,
+    };
     use std::path::Path;
     use std::sync::Arc;
     use tuisko_engine::ResidentMtpBatchGenerator;
-    use tuisko_gpu::CudaContext;
+    use tuisko_gpu::{CudaContext, device_memory_info};
     use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
     #[test]
@@ -782,6 +785,66 @@ mod tests {
             qualify_page_pressure_eviction(&mut generator).unwrap(),
             (1, 1)
         );
+        generator.qualification_clear_retained().unwrap();
+        crate::device_benchmark::require_current_process_exclusive().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires the admitted source snapshot and an exclusive RTX 5090"]
+    fn resident_mtp_batch_suite_park_releases_all_arenas_and_restores_prefix() {
+        let _preflight = crate::device_benchmark::preflight().unwrap();
+        let root = std::env::var_os("TUISKO_SNAPSHOT")
+            .expect("TUISKO_SNAPSHOT must name the admitted snapshot");
+        let snapshot = Arc::new(
+            CheckpointSnapshot::<Qwen38_27B>::open(Path::new(&root))
+                .expect("snapshot must be admitted"),
+        );
+        let context = CudaContext::new(0).unwrap();
+        let mut generator = ResidentMtpBatchGenerator::from_snapshot(&context, snapshot).unwrap();
+        let request = greedy_request("Give a brief greeting.", 8);
+
+        let first = generator.admit(&request).unwrap();
+        let first_events = generator.step().unwrap();
+        let _ = one_token(&first_events, first.request_id).unwrap();
+        let cancelled = generator.cancel(first.request_id).unwrap();
+        let retained_tokens = cancelled.device_retained_tokens;
+        assert_ne!(retained_tokens, 0);
+
+        let replay = generator.admit(&request).unwrap();
+        assert_eq!(replay.device_reused_tokens, retained_tokens);
+        let replay_events = generator.step().unwrap();
+        let expected_anchor = one_token(&replay_events, replay.request_id).unwrap();
+        let replay_cancelled = generator.cancel(replay.request_id).unwrap();
+        assert_eq!(replay_cancelled.device_retained_tokens, retained_tokens);
+
+        let loaded_bytes = generator.device_owner_bytes();
+        let addresses = generator.qualification_addresses().unwrap();
+        let before_park = device_memory_info(&context).unwrap();
+        let (parked, stats) = match generator.park() {
+            Ok(parked) => parked,
+            Err((_, error)) => panic!("park failed: {error}"),
+        };
+        let after_park = device_memory_info(&context).unwrap();
+        assert_eq!(stats.released_device_bytes, loaded_bytes);
+        assert_eq!(parked.remaining_device_bytes(), 0);
+        assert!(stats.host_bytes > 0);
+        assert!(after_park.free_bytes >= before_park.free_bytes + loaded_bytes);
+        crate::device_benchmark::require_current_process_exclusive().unwrap();
+
+        let mut generator = match parked.resume() {
+            Ok(generator) => generator,
+            Err((_, error)) => panic!("resume failed: {error}"),
+        };
+        assert_eq!(generator.device_owner_bytes(), loaded_bytes);
+        assert_eq!(generator.qualification_addresses().unwrap(), addresses);
+        let restored = generator.admit(&request).unwrap();
+        assert_eq!(restored.device_reused_tokens, retained_tokens);
+        let restored_events = generator.step().unwrap();
+        assert_eq!(
+            one_token(&restored_events, restored.request_id).unwrap(),
+            expected_anchor
+        );
+        let _ = generator.cancel(restored.request_id).unwrap();
         generator.qualification_clear_retained().unwrap();
         crate::device_benchmark::require_current_process_exclusive().unwrap();
     }

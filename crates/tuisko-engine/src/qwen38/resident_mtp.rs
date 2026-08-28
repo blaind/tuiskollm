@@ -443,7 +443,7 @@ impl ResidentMtpArenaReservation {
         let arena_manifest = VmmSegmentManifest::uniform(
             layout.arena().byte_len(),
             granularity,
-            VmmSegmentClass::Resident,
+            VmmSegmentClass::Parkable,
         )?;
         let cache_manifest = VmmSegmentManifest::uniform(
             layout.cache_arena().byte_len(),
@@ -458,6 +458,45 @@ impl ResidentMtpArenaReservation {
             cache_arena,
         })
     }
+}
+
+fn load_mtp_source_weights(
+    arena: &DeviceArena,
+    stream: &CudaStream,
+    regions: ResidentMtpRegions,
+    snapshot: &CheckpointSnapshot<Qwen38_27B>,
+) -> EngineResult<()> {
+    let mtp = MtpBindings::bind(snapshot)?;
+    let qkv = mtp.materialize_qkv()?;
+    arena.copy_region_bytes_from_host(
+        stream,
+        regions.embedding_norm,
+        mtp.embedding_norm.bytes(),
+    )?;
+    arena.copy_region_bytes_from_host(stream, regions.hidden_norm, mtp.hidden_norm.bytes())?;
+    arena.copy_region_bytes_from_host(
+        stream,
+        regions.input_projection,
+        mtp.input_projection.bytes(),
+    )?;
+    arena.copy_region_bytes_from_host(stream, regions.input_norm, mtp.input_norm.bytes())?;
+    arena.copy_region_bytes_from_host(stream, regions.qkv_weight, &qkv.weight_bf16)?;
+    arena.copy_region_bytes_from_host(stream, regions.query_norm, mtp.query_norm.bytes())?;
+    arena.copy_region_bytes_from_host(stream, regions.key_norm, mtp.key_norm.bytes())?;
+    arena.copy_region_bytes_from_host(
+        stream,
+        regions.attention_output_weight,
+        mtp.attention_output_weight.bytes(),
+    )?;
+    arena.copy_region_bytes_from_host(
+        stream,
+        regions.post_attention_norm,
+        mtp.post_attention_norm.bytes(),
+    )?;
+    arena.copy_region_bytes_from_host(stream, regions.gate_up_weight, mtp.gate_up_weight_bf16)?;
+    arena.copy_region_bytes_from_host(stream, regions.down_weight, mtp.down_weight.bytes())?;
+    arena.copy_region_bytes_from_host(stream, regions.final_norm, mtp.final_norm.bytes())?;
+    Ok(())
 }
 
 impl ResidentMtpProgram {
@@ -503,8 +542,6 @@ impl ResidentMtpProgram {
     ) -> EngineResult<Self> {
         let weight_start = Instant::now();
         let context = target.context().clone();
-        let mtp = MtpBindings::bind(target.snapshot().as_ref())?;
-        let qkv = mtp.materialize_qkv()?;
         let ResidentMtpArenaReservation {
             layout,
             arena,
@@ -514,38 +551,7 @@ impl ResidentMtpProgram {
         let cache_regions = layout.cache_regions();
         let stream = context.new_stream().map_err(GpuError::from)?;
 
-        arena.copy_region_bytes_from_host(
-            &stream,
-            regions.embedding_norm,
-            mtp.embedding_norm.bytes(),
-        )?;
-        arena.copy_region_bytes_from_host(&stream, regions.hidden_norm, mtp.hidden_norm.bytes())?;
-        arena.copy_region_bytes_from_host(
-            &stream,
-            regions.input_projection,
-            mtp.input_projection.bytes(),
-        )?;
-        arena.copy_region_bytes_from_host(&stream, regions.input_norm, mtp.input_norm.bytes())?;
-        arena.copy_region_bytes_from_host(&stream, regions.qkv_weight, &qkv.weight_bf16)?;
-        arena.copy_region_bytes_from_host(&stream, regions.query_norm, mtp.query_norm.bytes())?;
-        arena.copy_region_bytes_from_host(&stream, regions.key_norm, mtp.key_norm.bytes())?;
-        arena.copy_region_bytes_from_host(
-            &stream,
-            regions.attention_output_weight,
-            mtp.attention_output_weight.bytes(),
-        )?;
-        arena.copy_region_bytes_from_host(
-            &stream,
-            regions.post_attention_norm,
-            mtp.post_attention_norm.bytes(),
-        )?;
-        arena.copy_region_bytes_from_host(
-            &stream,
-            regions.gate_up_weight,
-            mtp.gate_up_weight_bf16,
-        )?;
-        arena.copy_region_bytes_from_host(&stream, regions.down_weight, mtp.down_weight.bytes())?;
-        arena.copy_region_bytes_from_host(&stream, regions.final_norm, mtp.final_norm.bytes())?;
+        load_mtp_source_weights(&arena, &stream, regions, target.snapshot().as_ref())?;
         if let Some(progress) = progress {
             progress.submit(layout.resident_weight_bytes())?;
             progress.finish_upload()?;
@@ -1268,18 +1274,50 @@ impl ResidentMtpProgram {
 
     pub(crate) fn park_device_arenas(&mut self, stream: &CudaStream) -> EngineResult<usize> {
         let target = self.target.park_device_arenas(stream)?;
+        let main = self.arena.park(stream)?;
         let cache = self.cache_arena.park(stream)?;
         target
-            .checked_add(cache)
+            .checked_add(main)
+            .and_then(|bytes| bytes.checked_add(cache))
             .ok_or_else(|| EngineError::layout("resident MTP parked byte count overflows"))
     }
 
     pub(crate) fn resume_device_arenas(&mut self, stream: &CudaStream) -> EngineResult<usize> {
         let target = self.target.resume_device_arenas(stream)?;
         let cache = self.cache_arena.resume(stream)?;
+        let main = self.arena.resume(stream)?;
         target
             .checked_add(cache)
+            .and_then(|bytes| bytes.checked_add(main))
             .ok_or_else(|| EngineError::layout("resident MTP resumed byte count overflows"))
+    }
+
+    pub(crate) fn reload_released_arenas(&self, stream: &CudaStream) -> EngineResult<()> {
+        self.target.reload_released_arenas(stream)?;
+        self.arena.zero_all(stream)?;
+        self.cache_arena.zero_all(stream)?;
+        load_mtp_source_weights(
+            &self.arena,
+            stream,
+            self.layout.regions(),
+            self.target.snapshot().as_ref(),
+        )?;
+        stream.synchronize().map_err(GpuError::from)?;
+        Ok(())
+    }
+
+    pub(crate) fn restore_block_tables(&self, stream: &CudaStream) -> EngineResult<()> {
+        // SAFETY: both complete table regions remain owned at stable addresses and the following
+        // synchronization completes the copy before either owner can transition again.
+        unsafe {
+            self.target.enqueue_mtp_block_table_handoff(
+                stream,
+                &self.arena,
+                self.layout.regions().block_tables,
+            )?;
+        }
+        stream.synchronize().map_err(GpuError::from)?;
+        Ok(())
     }
 
     /// Clears one assigned slot in both target and MTP persistent owners.
