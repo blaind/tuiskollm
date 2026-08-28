@@ -555,6 +555,7 @@ fn serve_requests<G: TextGenerator>(
 ) {
     let mut replies = HashMap::new();
     let mut jobs_open = true;
+    let mut waiting = Vec::new();
     loop {
         if let Err(error) = cancel_disconnected(&mut generator, &mut replies) {
             fail_all(&mut replies, error.clone());
@@ -566,19 +567,22 @@ fn serve_requests<G: TextGenerator>(
 
         if generator.active_requests() == 0 && jobs_open {
             match jobs.blocking_recv() {
-                Some(job) => admit_job(&mut generator, &mut replies, job),
+                Some(job) => hold_job(&mut waiting, job),
                 None => jobs_open = false,
             }
         }
-        while jobs_open && generator.active_requests() < generator.slot_capacity() {
+        while jobs_open && generator.active_requests() + waiting.len() < generator.slot_capacity() {
             match jobs.try_recv() {
-                Ok(job) => admit_job(&mut generator, &mut replies, job),
+                Ok(job) => hold_job(&mut waiting, job),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     jobs_open = false;
                     break;
                 }
             }
+        }
+        if !waiting.is_empty() {
+            admit_group(&mut generator, &mut replies, &mut waiting);
         }
         if generator.active_requests() == 0 {
             if jobs_open {
@@ -788,17 +792,25 @@ fn mebibytes(bytes: usize) -> f64 {
     bytes as f64 / (1_u64 << 20) as f64
 }
 
-fn admit_job<G: TextGenerator>(
-    generator: &mut G,
-    replies: &mut HashMap<ResidentRequestId, ActiveReply>,
-    job: Job,
-) {
+fn hold_job(waiting: &mut Vec<Job>, job: Job) {
     if job.reply.is_closed() {
         job.log.finish(None, 0, 0, "cancelled", None);
         return;
     }
-    let admission = generator.admit(&job.request);
-    record_admission(replies, job, admission);
+    waiting.push(job);
+}
+
+fn admit_group<G: TextGenerator>(
+    generator: &mut G,
+    replies: &mut HashMap<ResidentRequestId, ActiveReply>,
+    waiting: &mut Vec<Job>,
+) {
+    let requests = waiting.iter().map(|job| &job.request).collect::<Vec<_>>();
+    let admissions = generator.admit_batch(&requests);
+    debug_assert_eq!(admissions.len(), waiting.len());
+    for (job, admission) in waiting.drain(..).zip(admissions) {
+        record_admission(replies, job, admission);
+    }
 }
 
 fn record_admission(

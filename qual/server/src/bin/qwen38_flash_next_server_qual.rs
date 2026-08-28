@@ -785,9 +785,9 @@ impl Qualification {
         println!();
         println!("## Throughput across the funded slots");
         println!(
-            "| budget | concurrency | wall | completion tok | aggregate tok/s | per-stream tok/s (min / median / max) | TTFT median | ITL median |"
+            "| budget | concurrency | wall | completion tok | aggregate tok/s | per-stream tok/s (min / median / max) | TTFT p50 | TTFT p95 | ITL median |"
         );
-        println!("| --: | --: | --: | --: | --: | :-- | --: | --: |");
+        println!("| --: | --: | --: | --: | --: | :-- | --: | --: | --: |");
         let warmup = concurrent(self.client.clone(), 1)?;
         self.requests += warmup.len();
         for budget in [COMPLETION_TOKENS, THROUGHPUT_COMPLETION_TOKENS] {
@@ -818,13 +818,14 @@ impl Qualification {
                     .collect::<Vec<_>>();
                 inter_token.sort_unstable();
                 println!(
-                    "| {budget} | {lanes} | {} | {tokens} | {:.2} | {:.2} / {:.2} / {:.2} | {} | {} |",
+                    "| {budget} | {lanes} | {} | {tokens} | {:.2} | {:.2} / {:.2} / {:.2} | {} | {} | {} |",
                     millis(wall),
                     tokens as f64 / wall.as_secs_f64(),
                     rates.first().copied().unwrap_or_default(),
                     median_of(&rates),
                     rates.last().copied().unwrap_or_default(),
-                    millis(duration_median(&first_token)),
+                    millis(first_token[percentile_index(first_token.len(), 50)]),
+                    millis(first_token[percentile_index(first_token.len(), 95)]),
                     millis(duration_median(&inter_token)),
                 );
             }
@@ -900,7 +901,7 @@ fn measurement_requests() -> Vec<(String, Value, usize)> {
             (prompt.to_owned(), request, budget)
         })
         .collect::<Vec<_>>();
-    for tokens in [512usize, 1_024] {
+    for tokens in [512usize, 1_024, 2_048] {
         requests.push((
             format!("{tokens}-token prompt"),
             exact_length_request_streaming(tokens, 32),
@@ -1030,6 +1031,17 @@ fn quantiles(samples: &[Duration]) -> (Duration, Duration) {
     let p90_index = sorted.len().saturating_mul(9).div_ceil(10) - 1;
     let p90 = sorted[p90_index];
     (median, p90)
+}
+
+fn percentile_index(len: usize, percentile: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    (len * percentile)
+        .div_ceil(100)
+        .saturating_sub(1)
+        .min(len - 1)
 }
 
 fn duration_median(sorted: &[Duration]) -> Duration {
@@ -1331,7 +1343,7 @@ fn expect_str_value(value: Option<&Value>, label: &str, expected: &str) -> Resul
 mod tests {
     use super::{
         DENSE_BAND, Options, QualError, fixtures, long_prompt_body, median_of,
-        parse_capacity_refusal, quantiles, validate_blocking, validate_stream,
+        parse_capacity_refusal, percentile_index, quantiles, validate_blocking, validate_stream,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -1447,6 +1459,16 @@ mod tests {
         assert!(long_prompt_body(20).ends_with(" blue"));
         assert_eq!(long_prompt_body(20).matches(" blue").count(), 8);
         assert_eq!(long_prompt_body(4).matches(" blue").count(), 0);
+    }
+
+    #[test]
+    fn burst_percentiles_use_nearest_rank() {
+        assert_eq!(percentile_index(0, 95), 0);
+        for lanes in [1usize, 2, 4, 8] {
+            assert_eq!(percentile_index(lanes, 95), lanes - 1);
+        }
+        assert_eq!(percentile_index(100, 95), 94);
+        assert_eq!(percentile_index(8, 50), 3);
     }
 
     #[test]

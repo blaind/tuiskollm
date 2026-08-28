@@ -14,10 +14,12 @@ use crate::qwen38_flash_next::compact_route::{
 use crate::qwen38_flash_next::resident_model::{
     Qwen38FlashNextResidentLoadStats, Qwen38FlashNextResidentModel, Qwen38FlashNextStepTelemetry,
 };
-use crate::qwen38_flash_next::text_generation::{Qwen38FlashNextGenerationTelemetry, prime_prompt};
+use crate::qwen38_flash_next::text_generation::{
+    Qwen38FlashNextGenerationTelemetry, prime_prompt_tiles, prompt_position,
+};
 use crate::{
-    ChatGenerationRequest, EngineError, EngineResult, GenerationSession, LayerMemoryLayout,
-    MAX_BATCH, ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents,
+    ChatGenerationRequest, EngineError, EngineErrorCode, EngineResult, GenerationSession,
+    LayerMemoryLayout, MAX_BATCH, ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents,
     ResidentCancellation, ResidentRequestId,
 };
 use std::ops::Range;
@@ -250,6 +252,73 @@ struct Qwen38FlashNextBatchSession {
     next_position: u32,
 }
 
+struct Qwen38FlashNextPrimingAdmission {
+    request_id: ResidentRequestId,
+    control: GenerationSession,
+    slot: usize,
+    native_prefill_tokens: usize,
+    primed: usize,
+}
+
+enum Qwen38FlashNextAdmissionOutcome {
+    Settled(EngineResult<ResidentBatchAdmission>),
+    Priming(Qwen38FlashNextPrimingAdmission),
+}
+
+fn terminal_admission(
+    request_id: ResidentRequestId,
+    control: GenerationSession,
+) -> EngineResult<ResidentBatchAdmission> {
+    let prompt_tokens = control.prompt_token_ids().len();
+    let prompt_metrics = control.prompt_metrics().clone();
+
+    Ok(ResidentBatchAdmission {
+        request_id,
+        prompt_tokens,
+        device_reused_tokens: 0,
+        native_prefill_tokens: 0,
+        prompt_metrics,
+        completed: Some(control.into_output()?),
+    })
+}
+
+fn release_slot(
+    program: &mut Qwen38FlashNextResidentModel,
+    stream: &CudaStream,
+    slot: usize,
+    error: EngineError,
+) -> Qwen38FlashNextAdmissionOutcome {
+    Qwen38FlashNextAdmissionOutcome::Settled(match program.recycle_slot(stream, slot) {
+        Ok(_) => Err(error),
+        Err(release) => Err(release),
+    })
+}
+
+fn fail_group(
+    program: &mut Qwen38FlashNextResidentModel,
+    stream: &CudaStream,
+    outcomes: &mut [Qwen38FlashNextAdmissionOutcome],
+    error: &EngineError,
+) {
+    for outcome in outcomes {
+        let Qwen38FlashNextAdmissionOutcome::Priming(priming) = outcome else {
+            continue;
+        };
+        *outcome = release_slot(program, stream, priming.slot, shared_round_failure(error));
+    }
+}
+
+fn shared_round_failure(error: &EngineError) -> EngineError {
+    match error.code() {
+        Some(EngineErrorCode::Route) => EngineError::route(error.to_string()),
+        Some(EngineErrorCode::Layout) => EngineError::layout(error.to_string()),
+        Some(EngineErrorCode::Sampling) => EngineError::sampling(error.to_string()),
+        Some(EngineErrorCode::Generation) => EngineError::generation(error.to_string()),
+        Some(EngineErrorCode::Capacity) => EngineError::capacity(error.to_string()),
+        None => EngineError::generation(error.to_string()),
+    }
+}
+
 impl Qwen38FlashNextResidentBatchGenerator {
     /// Opens the served Flash-Next program on device zero, reporting load progress.
     pub fn from_snapshot_device_zero_with_progress(
@@ -299,74 +368,247 @@ impl Qwen38FlashNextResidentBatchGenerator {
         })
     }
 
-    /// Admits the lowest free slot and primes it without mutating siblings.
+    /// Admits one request through the grouped prompt-prime path.
     pub fn admit(
         &mut self,
         request: &ChatGenerationRequest,
     ) -> EngineResult<ResidentBatchAdmission> {
-        let control = GenerationSession::start(&self.frontend, request)?;
-        // Admission follows the qualified route, not the deeper KV allocation.
-        let required_positions = require_generation_capacity(
+        self.admit_batch(std::slice::from_ref(&request))
+            .pop()
+            .expect("one request produces one admission")
+    }
+
+    /// Admits queued requests in order and composes their scalar prompt tails.
+    pub fn admit_batch(
+        &mut self,
+        requests: &[&ChatGenerationRequest],
+    ) -> Vec<EngineResult<ResidentBatchAdmission>> {
+        let mut outcomes = Vec::with_capacity(requests.len());
+        let mut taken = [false; MAX_BATCH];
+        for request in requests {
+            outcomes.push(self.reserve_admission(request, &mut taken));
+        }
+        self.prime_group_tiles(&mut outcomes);
+        self.prime_group_tails(&mut outcomes);
+
+        outcomes
+            .into_iter()
+            .map(|outcome| match outcome {
+                Qwen38FlashNextAdmissionOutcome::Settled(result) => result,
+                Qwen38FlashNextAdmissionOutcome::Priming(priming) => self.install_session(priming),
+            })
+            .collect()
+    }
+
+    fn reserve_admission(
+        &mut self,
+        request: &ChatGenerationRequest,
+        taken: &mut [bool; MAX_BATCH],
+    ) -> Qwen38FlashNextAdmissionOutcome {
+        let control = match GenerationSession::start(&self.frontend, request) {
+            Ok(control) => control,
+            Err(error) => return Qwen38FlashNextAdmissionOutcome::Settled(Err(error)),
+        };
+        let required_positions = match require_generation_capacity(
             control.prompt_token_ids().len(),
             request.max_new_tokens,
             ModelProgram::context_capacity(&self.program),
-        )?;
-        let request_id = ResidentRequestId::from_raw(self.next_request_id);
-        self.next_request_id = self
-            .next_request_id
-            .checked_add(1)
-            .ok_or_else(|| EngineError::generation("Flash-Next request identity overflows"))?;
-        let prompt_tokens = control.prompt_token_ids().len();
-        let prompt_metrics = control.prompt_metrics().clone();
+        ) {
+            Ok(positions) => positions,
+            Err(error) => return Qwen38FlashNextAdmissionOutcome::Settled(Err(error)),
+        };
+        let request_id = match self.next_identity() {
+            Ok(request_id) => request_id,
+            Err(error) => return Qwen38FlashNextAdmissionOutcome::Settled(Err(error)),
+        };
         if control.finish_reason().is_some() {
-            return Ok(ResidentBatchAdmission {
-                request_id,
-                prompt_tokens,
-                device_reused_tokens: 0,
-                native_prefill_tokens: 0,
-                prompt_metrics,
-                completed: Some(control.into_output()?),
-            });
+            return Qwen38FlashNextAdmissionOutcome::Settled(terminal_admission(
+                request_id, control,
+            ));
+        }
+        if let Err(error) = prompt_position(control.prompt_token_ids().len()) {
+            return Qwen38FlashNextAdmissionOutcome::Settled(Err(error));
         }
 
-        let occupied = std::array::from_fn(|slot| self.sessions[slot].is_some());
-        let slot = qwen38_flash_next_admission_slot(occupied).ok_or_else(|| {
-            EngineError::route(format!(
+        let occupied = std::array::from_fn(|slot| self.sessions[slot].is_some() || taken[slot]);
+        let Some(slot) = qwen38_flash_next_admission_slot(occupied) else {
+            return Qwen38FlashNextAdmissionOutcome::Settled(Err(EngineError::capacity(format!(
                 "all {MAX_BATCH} Flash-Next generation slots are active"
-            ))
-        })?;
-        // Clear every slot-owned state family left by the previous tenant.
-        self.program.recycle_slot(&self.stream, slot)?;
-        let native_prefill_tokens = match self
-            .program
-            .reserve_slot(&self.stream, slot, required_positions)
-            .and_then(|_| {
-                prime_prompt(
-                    &mut self.program,
-                    &self.stream,
-                    control.prompt_token_ids(),
-                    slot,
-                )
-            }) {
-            Ok(tokens) => {
-                if let Err(error) = self.program.read_logits_into(
-                    &self.stream,
-                    1,
-                    &mut self.logits[slot_logits(slot)],
-                ) {
-                    self.program.recycle_slot(&self.stream, slot)?;
-                    return Err(error);
-                }
-                tokens
-            }
-            Err(error) => {
-                // Reservation or prime failure may leave pages owned.
-                self.program.recycle_slot(&self.stream, slot)?;
-                return Err(error);
-            }
+            ))));
         };
-        let next_position = u32::try_from(prompt_tokens)
-            .map_err(|_| EngineError::generation("prompt length exceeds the position width"))?;
+        taken[slot] = true;
+        if let Err(error) = self.program.recycle_slot(&self.stream, slot).and_then(|_| {
+            self.program
+                .reserve_slot(&self.stream, slot, required_positions)
+        }) {
+            taken[slot] = false;
+            return release_slot(&mut self.program, &self.stream, slot, error);
+        }
+
+        Qwen38FlashNextAdmissionOutcome::Priming(Qwen38FlashNextPrimingAdmission {
+            request_id,
+            control,
+            slot,
+            native_prefill_tokens: 0,
+            primed: 0,
+        })
+    }
+
+    fn prime_group_tiles(&mut self, outcomes: &mut [Qwen38FlashNextAdmissionOutcome]) {
+        for outcome in outcomes {
+            let Qwen38FlashNextAdmissionOutcome::Priming(priming) = outcome else {
+                continue;
+            };
+            let slot = priming.slot;
+            let prompt_tokens = priming.control.prompt_token_ids().len();
+            let tiled = prime_prompt_tiles(
+                &mut self.program,
+                &self.stream,
+                priming.control.prompt_token_ids(),
+                slot,
+            )
+            .and_then(|tiled| {
+                if tiled == prompt_tokens {
+                    self.program.read_logits_into(
+                        &self.stream,
+                        1,
+                        &mut self.logits[slot_logits(slot)],
+                    )?;
+                }
+                Ok(tiled)
+            });
+            match tiled {
+                Ok(tiled) => {
+                    priming.native_prefill_tokens = tiled;
+                    priming.primed = tiled;
+                }
+                Err(error) => {
+                    *outcome = release_slot(&mut self.program, &self.stream, slot, error);
+                }
+            }
+        }
+    }
+
+    fn prime_group_tails(&mut self, outcomes: &mut [Qwen38FlashNextAdmissionOutcome]) {
+        let mut tokens = [0u32; MAX_BATCH];
+        let mut positions = [0u32; MAX_BATCH];
+        loop {
+            let mut group = [0usize; MAX_BATCH];
+            let mut pending = [false; MAX_BATCH];
+            let mut owners = [usize::MAX; MAX_BATCH];
+            let mut entries = 0;
+            for (index, outcome) in outcomes.iter().enumerate() {
+                let Qwen38FlashNextAdmissionOutcome::Priming(priming) = outcome else {
+                    continue;
+                };
+                group[entries] = priming.slot;
+                pending[entries] = priming.primed < priming.control.prompt_token_ids().len();
+                entries += 1;
+                owners[priming.slot] = index;
+            }
+            let planned =
+                match qwen38_flash_next_compact_round(&group[..entries], &pending[..entries]) {
+                    Ok(planned) => planned,
+                    Err(error) => {
+                        fail_group(&mut self.program, &self.stream, outcomes, &error);
+                        return;
+                    }
+                };
+            if planned.is_empty() {
+                return;
+            }
+            let rows = planned.rows();
+            let slots = planned.slots();
+            for (row, &slot) in slots.iter().enumerate() {
+                let Qwen38FlashNextAdmissionOutcome::Priming(priming) = &outcomes[owners[slot]]
+                else {
+                    unreachable!("a prime row names a priming slot")
+                };
+                tokens[row] = priming.control.prompt_token_ids()[priming.primed];
+                positions[row] = prompt_position(priming.primed)
+                    .expect("admission already checked the prompt position range");
+            }
+
+            let step = match self.program.decode_step(
+                &self.stream,
+                &tokens[..rows],
+                &positions[..rows],
+                slots,
+            ) {
+                Ok(step) => step,
+                Err(error) => {
+                    for &slot in slots {
+                        outcomes[owners[slot]] = release_slot(
+                            &mut self.program,
+                            &self.stream,
+                            slot,
+                            shared_round_failure(&error),
+                        );
+                    }
+                    continue;
+                }
+            };
+            self.program.observe_prime_round(&step, false);
+
+            let mut published = 0;
+            for (row, &slot) in slots.iter().enumerate() {
+                let Qwen38FlashNextAdmissionOutcome::Priming(priming) = &mut outcomes[owners[slot]]
+                else {
+                    continue;
+                };
+                priming.primed += 1;
+                if priming.primed == priming.control.prompt_token_ids().len() {
+                    published = row + 1;
+                }
+            }
+            if published == 0 {
+                continue;
+            }
+            let readback = self.program.read_logits_into(
+                &self.stream,
+                published,
+                &mut self.logits[compact_logits(published)],
+            );
+            for (row, &slot) in slots[..published].iter().enumerate() {
+                let Qwen38FlashNextAdmissionOutcome::Priming(priming) = &outcomes[owners[slot]]
+                else {
+                    continue;
+                };
+                if priming.primed != priming.control.prompt_token_ids().len() {
+                    continue;
+                }
+                match &readback {
+                    Ok(()) => self
+                        .logits
+                        .copy_within(compact_row(row), slot * Qwen38FlashNext::VOCAB),
+                    Err(error) => {
+                        outcomes[owners[slot]] = release_slot(
+                            &mut self.program,
+                            &self.stream,
+                            slot,
+                            shared_round_failure(error),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn install_session(
+        &mut self,
+        priming: Qwen38FlashNextPrimingAdmission,
+    ) -> EngineResult<ResidentBatchAdmission> {
+        let Qwen38FlashNextPrimingAdmission {
+            request_id,
+            control,
+            slot,
+            native_prefill_tokens,
+            ..
+        } = priming;
+        let prompt_tokens = control.prompt_token_ids().len();
+        let next_position = prompt_position(prompt_tokens)
+            .expect("admission already checked the prompt position range");
+        let prompt_metrics = control.prompt_metrics().clone();
         self.sessions[slot] = Some(Qwen38FlashNextBatchSession {
             request_id,
             control,
@@ -385,6 +627,16 @@ impl Qwen38FlashNextResidentBatchGenerator {
             prompt_metrics,
             completed: None,
         })
+    }
+
+    fn next_identity(&mut self) -> EngineResult<ResidentRequestId> {
+        let request_id = ResidentRequestId::from_raw(self.next_request_id);
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| EngineError::generation("Flash-Next request identity overflows"))?;
+
+        Ok(request_id)
     }
 
     /// Replays every pending token in one compact round, then samples one event per request.
@@ -688,8 +940,9 @@ fn compact_row(row: usize) -> Range<usize> {
 mod tests {
     use super::{
         LOGIT_BANK_ROWS, MAX_BATCH, Qwen38FlashNextBatchTelemetry, compact_logits, compact_row,
-        slot_logits,
+        shared_round_failure, slot_logits,
     };
+    use crate::{EngineError, EngineErrorCode};
     use std::mem::size_of;
     use tuisko_model::{Arch, Qwen38FlashNext};
 
@@ -760,5 +1013,13 @@ mod tests {
         assert_eq!(width.expert_hit_rate(), 0.0);
         assert_eq!(width.expert_h2d_bytes_per_token(), 0.0);
         assert_eq!(width.h2d_bytes_per_token(), 0.0);
+    }
+
+    #[test]
+    fn shared_round_failures_preserve_retryable_capacity() {
+        let failure = shared_round_failure(&EngineError::capacity("pages remain active"));
+
+        assert_eq!(failure.code(), Some(EngineErrorCode::Capacity));
+        assert!(failure.to_string().contains("pages remain active"));
     }
 }
