@@ -9307,6 +9307,12 @@ fn gate_qwen38_flash_next_moe_experts(root: &Path) -> Result<(), Box<dyn Error>>
         family("qwen38_flash_next_moe_expert_combine_TID_"),
         family("qwen38_flash_next_moe_expert_combine_prefill_TID_"),
     ];
+    let mtp = [
+        family("qwen38_flash_next_mtp_expert_gate_up_TID_"),
+        family("qwen38_flash_next_mtp_expert_gate_up_prefill_TID_"),
+        family("qwen38_flash_next_mtp_expert_down_TID_"),
+        family("qwen38_flash_next_mtp_expert_down_prefill_TID_"),
+    ];
     for (label, group) in [
         ("routed gate/up decode", &routed[0]),
         ("routed gate/up prefill", &routed[1]),
@@ -9318,6 +9324,10 @@ fn gate_qwen38_flash_next_moe_experts(root: &Path) -> Result<(), Box<dyn Error>>
         ("shared down prefill", &shared[3]),
         ("combine decode", &combine[0]),
         ("combine prefill", &combine[1]),
+        ("MTP gate/up decode", &mtp[0]),
+        ("MTP gate/up prefill", &mtp[1]),
+        ("MTP down decode", &mtp[2]),
+        ("MTP down prefill", &mtp[3]),
     ] {
         require_count(
             &format!("Qwen3.8-Flash-Next MoE {label}"),
@@ -9340,6 +9350,29 @@ fn gate_qwen38_flash_next_moe_experts(root: &Path) -> Result<(), Box<dyn Error>>
             .into());
         }
     }
+    for entry in mtp.iter().flatten() {
+        if entry.body.contains("cvt.rn.f16x2.e2m1x2") {
+            return Err(
+                format!("MTP entry `{}` decodes E2M1 from its BF16 pool", entry.name).into(),
+            );
+        }
+        if !entry.body.contains("9830400") {
+            return Err(format!(
+                "MTP entry `{}` lost its 9,830,400-byte slot stride",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in mtp[2..].iter().flatten() {
+        if !entry.body.contains("6553600") {
+            return Err(format!(
+                "MTP down entry `{}` lost its 6,553,600-byte plane offset",
+                entry.name
+            )
+            .into());
+        }
+    }
 
     let artifact = sm120_gate_artifact(root)?;
     let resources = &artifact.resources;
@@ -9347,10 +9380,12 @@ fn gate_qwen38_flash_next_moe_experts(root: &Path) -> Result<(), Box<dyn Error>>
     let mut routed_registers = Vec::new();
     let mut shared_registers = Vec::new();
     let mut combine_registers = Vec::new();
+    let mut mtp_registers = Vec::new();
     for (groups, registers) in [
         (&routed[..], &mut routed_registers),
         (&shared[..], &mut shared_registers),
         (&combine[..], &mut combine_registers),
+        (&mtp[..], &mut mtp_registers),
     ] {
         for entry in groups.iter().flatten() {
             if sass_function_body(sass, entry.name).is_none() {
@@ -9371,9 +9406,10 @@ fn gate_qwen38_flash_next_moe_experts(root: &Path) -> Result<(), Box<dyn Error>>
     require_registers(&baseline, "routed_registers", &routed_registers)?;
     require_registers(&baseline, "shared_registers", &shared_registers)?;
     require_registers(&baseline, "combine_registers", &combine_registers)?;
+    require_registers(&baseline, "mtp_registers", &mtp_registers)?;
 
     println!(
-        "Qwen3.8-Flash-Next MoE expert gate passed: 24 routed + 24 shared + 12 combine entries, REG {routed_registers:?} / {shared_registers:?} / {combine_registers:?}, STACK:0 LOCAL:0, E2M1 routed and BF16 shared representations and SASS present"
+        "Qwen3.8-Flash-Next MoE expert gate passed: 24 routed + 24 shared + 12 combine + 24 MTP entries, REG {routed_registers:?} / {shared_registers:?} / {combine_registers:?} / {mtp_registers:?}, STACK:0 LOCAL:0, E2M1 routed and BF16 shared/MTP representations, MTP slot stride, and SASS present"
     );
     Ok(())
 }
