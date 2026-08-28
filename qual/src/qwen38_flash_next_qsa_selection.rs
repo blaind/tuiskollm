@@ -1,9 +1,8 @@
 //! Numerical and graph qualification for Qwen3.8-Flash-Next QSA selection.
 //!
-//! The suite proves dense-band bit identity through 2,051 positions, FP64
-//! prepare/compress/score agreement above that band, exact top-512 selection,
-//! per-sequence page-table isolation, and eager/CUDA Graph replay agreement.
-//! Score ties select the lowest block index.
+//! The suite checks dense-band identity, FP64 block scoring above the dense
+//! band, exact top-512 selection, per-sequence isolation, and the lowest-index
+//! tie-break. Eager and graph replay must agree at every output boundary.
 
 use crate::fp8_projection_oracle::{
     BYTE_SENTINEL, F32_SENTINEL_BITS, bf16_to_f32, decode_e4m3fn, f32_to_bf16,
@@ -16,7 +15,7 @@ use tuisko_kernels_sm120::{
     ATTENTION_PAGE_SIZE, IndexerCompressArgs, IndexerPrepareArgs, IndexerSelectionArgs,
     Qwen38FlashNextIndexerPrepareOp, Qwen38FlashNextIndexerSelectionOp, Qwen38FlashNextPagedGqaOp,
     Qwen38FlashNextSelectedPagedGqaOp, SELECTION_BLOCKS_PER_PAGE, SELECTION_MAX_SELECTED,
-    SELECTION_ROW_TILE, SelectedAttentionArgs,
+    SELECTION_ROW_TILE, SELECTION_SCRATCH_WORDS, SelectedAttentionArgs,
 };
 use tuisko_model::{Arch, Qwen38FlashNext};
 
@@ -61,6 +60,9 @@ const _: () = assert!(ROW_CONTEXT == 5_632);
 const _: () = assert!(ROW_BLOCKS == 1_408);
 const _: () = assert!(APPEND_BASE == 4_608);
 
+/// The `BYTE_SENTINEL` fill seen as one BF16 word.
+const RING_SENTINEL: u16 = u16::from_ne_bytes([BYTE_SENTINEL, BYTE_SENTINEL]);
+
 const KEY_SCALE: f32 = 32.0;
 const VALUE_SCALE: f32 = 0.0625;
 /// `head_dim**-0.5` for head_dim 256.
@@ -83,6 +85,8 @@ const DENSE_BAND_CONTEXTS: [usize; 8] = [1, 4, 63, 64, 65, 127, 2_050, 2_051];
 const SELECTED_CONTEXTS: [usize; 8] = [2_052, 2_053, 2_054, 2_055, 2_100, 3_000, 3_500, 4_096];
 /// Prompt widths the gather attention admits.
 const PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1_024];
+/// Prompt width the tile ladder drives, sixteen row tiles wide.
+const TILE_LADDER_TOKENS: usize = 1_024;
 /// First position of the above-budget prompt sweep.
 ///
 /// Row `t` then sees `2048 + t + 1` visible positions, so the sweep starts one
@@ -204,6 +208,10 @@ pub struct Qwen38FlashNextQsaSelectionQualification {
     /// Blocks where the FP64 and device rankings disagreed, each proved to sit
     /// within the acceptance tolerance of the threshold.
     pub threshold_ambiguous_blocks: usize,
+    /// Selected entries and counts proved equal between a sixteen-tile round
+    /// sharing one selection scratch plane and the same tiles driven alone over
+    /// a poisoned one.
+    pub tile_ladder_values: usize,
     /// Arena bytes the suite allocated.
     pub arena_bytes: usize,
     /// Alignment padding inside the arena.
@@ -228,9 +236,13 @@ struct Regions {
     block_counts: ArenaRegion<u32>,
     first_blocks: ArenaRegion<u32>,
     indexer_query: ArenaRegion<f32>,
-    indexer_pages: ArenaRegion<u16>,
+    /// Per-sequence raw-key ring, four slots wide: one open micro-block.
+    raw_ring: ArenaRegion<u16>,
+    /// Round-local raw keys, one row per position a prompt width carries.
+    raw_round: ArenaRegion<u16>,
     block_keys: ArenaRegion<u16>,
     scores: ArenaRegion<f32>,
+    select_scratch: ArenaRegion<u32>,
     selected: ArenaRegion<u32>,
     selected_counts: ArenaRegion<u32>,
     query: ArenaRegion<f32>,
@@ -256,9 +268,11 @@ impl Regions {
             + self.block_counts.byte_len()
             + self.first_blocks.byte_len()
             + self.indexer_query.byte_len()
-            + self.indexer_pages.byte_len()
+            + self.raw_ring.byte_len()
+            + self.raw_round.byte_len()
             + self.block_keys.byte_len()
             + self.scores.byte_len()
+            + self.select_scratch.byte_len()
             + self.selected.byte_len()
             + self.selected_counts.byte_len()
             + self.query.byte_len()
@@ -278,8 +292,10 @@ struct Fixture {
     full_cos: Vec<f32>,
     full_sin: Vec<f32>,
     block_tables: Vec<u32>,
-    /// Raw indexer keys the cache holds, `[pages, 64, 128]` BF16.
-    indexer_pages: Vec<u16>,
+    /// Raw indexer keys of the whole synthetic history, `[pages, 64, 128]`
+    /// BF16. Host-only: the device never holds a paged raw plane, so every
+    /// compression stages the four members of the blocks it is about to close.
+    raw_history: Vec<u16>,
     query: Vec<f32>,
     key_pages: Vec<u8>,
     value_pages: Vec<u8>,
@@ -345,6 +361,27 @@ impl Round {
     fn maximum_blocks(&self) -> usize {
         self.blocks().iter().copied().max().unwrap_or(0) as usize
     }
+
+    /// The `(offset, rows)` row tiles one selection stage of this round drives.
+    ///
+    /// The same division a composed owner makes: a decode width is one tile, and a prompt
+    /// wider than [`SELECTION_ROW_TILE`] walks it in fixed strides.
+    fn tiles(&self) -> Vec<(usize, usize)> {
+        let tile = if self.tokens <= MAX_BATCH {
+            self.tokens
+        } else {
+            SELECTION_ROW_TILE.min(self.tokens)
+        };
+        let mut tiles = Vec::new();
+        let mut offset = 0usize;
+        while offset < self.tokens {
+            let rows = tile.min(self.tokens - offset);
+            tiles.push((offset, rows));
+            offset += rows;
+        }
+
+        tiles
+    }
 }
 
 /// Qualifies the Qwen3.8-Flash-Next QSA selection route at every admitted width.
@@ -386,6 +423,7 @@ pub fn qualify_qwen38_flash_next_qsa_selection() -> Outcome<Qwen38FlashNextQsaSe
         graph_replay_values: 0,
         tie_broken_blocks: 0,
         threshold_ambiguous_blocks: 0,
+        tile_ladder_values: 0,
         arena_bytes: layout.byte_len(),
         padding_bytes: layout.byte_len() - regions.payload_bytes(),
         maximum_absolute_error: 0.0,
@@ -451,6 +489,9 @@ pub fn qualify_qwen38_flash_next_qsa_selection() -> Outcome<Qwen38FlashNextQsaSe
     // Stage five: two sequences, one pool, disjoint page maps.
     verify_isolation(&ops, &arena, &stream, regions, &fixture, &mut report)?;
 
+    // Stage six: one scratch plane, sixteen row tiles, and the same answer either way.
+    verify_tile_ladder(&ops, &arena, &stream, regions, &fixture, &mut report)?;
+
     if addresses(&arena, regions)? != stable_addresses {
         return Err(Failure::Mismatch(
             "device addresses changed while qualifying the selection route".into(),
@@ -487,15 +528,14 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
         MAX_TOKENS * Qwen38FlashNext::INDEXER_HEADS * indexer_dim,
         ALIGNMENT,
     )?;
-    let indexer_pages = layout.reserve(
-        PHYSICAL_PAGES * ATTENTION_PAGE_SIZE * indexer_dim,
-        ALIGNMENT,
-    )?;
+    let raw_ring = layout.reserve(TABLE_ROWS * RATIO * indexer_dim, ALIGNMENT)?;
+    let raw_round = layout.reserve(COMPRESS_CHUNK * RATIO * indexer_dim, ALIGNMENT)?;
     let block_keys = layout.reserve(
         PHYSICAL_PAGES * SELECTION_BLOCKS_PER_PAGE * indexer_dim,
         ALIGNMENT,
     )?;
     let scores = layout.reserve(SELECTION_ROW_TILE * SCORE_STRIDE, ALIGNMENT)?;
+    let select_scratch = layout.reserve(SELECTION_SCRATCH_WORDS, ALIGNMENT)?;
     let selected = layout.reserve(MAX_TOKENS * SELECTION_MAX_SELECTED, ALIGNMENT)?;
     let selected_counts = layout.reserve(MAX_TOKENS, ALIGNMENT)?;
     let query = layout.reserve(attention_plane, ALIGNMENT)?;
@@ -521,9 +561,11 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
             block_counts,
             first_blocks,
             indexer_query,
-            indexer_pages,
+            raw_ring,
+            raw_round,
             block_keys,
             scores,
+            select_scratch,
             selected,
             selected_counts,
             query,
@@ -555,6 +597,17 @@ fn rotary_row(position: usize) -> (Vec<f32>, Vec<f32>) {
     }
 
     (cos, sin)
+}
+
+/// Element offset of one position's raw key inside the host-side history.
+///
+/// The history keeps the page layout the K/V planes use so the fixture and the
+/// FP64 reference address a position the same way the block table does; the
+/// device never holds this plane.
+fn history_element(row: usize, position: usize, dimension: usize) -> usize {
+    let indexer_dim = Qwen38FlashNext::INDEXER_HEAD_DIM;
+    let page = row * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE;
+    indexer_dim * (position % ATTENTION_PAGE_SIZE + ATTENTION_PAGE_SIZE * page) + dimension
 }
 
 /// Raw indexer key of one cached position, before the append landing zone.
@@ -609,13 +662,12 @@ fn fixture() -> Fixture {
         .map(|index| index as u32)
         .collect::<Vec<_>>();
 
-    let mut indexer_pages = vec![0u16; PHYSICAL_PAGES * ATTENTION_PAGE_SIZE * indexer_dim];
+    let mut raw_history = vec![0u16; PHYSICAL_PAGES * ATTENTION_PAGE_SIZE * indexer_dim];
     for row in 0..TABLE_ROWS {
         for position in 0..ROW_CONTEXT {
-            let page = row * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE;
-            let base = indexer_dim * (position % ATTENTION_PAGE_SIZE + ATTENTION_PAGE_SIZE * page);
+            let base = history_element(row, position, 0);
             for dimension in 0..indexer_dim {
-                indexer_pages[base + dimension] = history_key(row, position, dimension);
+                raw_history[base + dimension] = history_key(row, position, dimension);
             }
         }
     }
@@ -659,7 +711,7 @@ fn fixture() -> Fixture {
         full_cos,
         full_sin,
         block_tables,
-        indexer_pages,
+        raw_history,
         query,
         key_pages,
         value_pages,
@@ -687,14 +739,13 @@ fn load_fixture(
     arena.copy_from_host(stream, regions.query_norm, &fixture.query_norm)?;
     arena.copy_from_host(stream, regions.key_norm, &fixture.key_norm)?;
     arena.copy_from_host(stream, regions.block_tables, &fixture.block_tables)?;
-    arena.copy_from_host(stream, regions.indexer_pages, &fixture.indexer_pages)?;
     arena.copy_from_host(stream, regions.query, &fixture.query)?;
     arena.copy_from_host(stream, regions.key_pages, &fixture.key_pages)?;
     arena.copy_from_host(stream, regions.value_pages, &fixture.value_pages)?;
     stream.synchronize().map_err(GpuError::from)
 }
 
-fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 24]> {
+fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 26]> {
     Ok([
         arena.address(regions.indexer_qk)?.addr(),
         arena.address(regions.query_norm)?.addr(),
@@ -710,9 +761,11 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 24]> {
         arena.address(regions.block_counts)?.addr(),
         arena.address(regions.first_blocks)?.addr(),
         arena.address(regions.indexer_query)?.addr(),
-        arena.address(regions.indexer_pages)?.addr(),
+        arena.address(regions.raw_ring)?.addr(),
+        arena.address(regions.raw_round)?.addr(),
         arena.address(regions.block_keys)?.addr(),
         arena.address(regions.scores)?.addr(),
+        arena.address(regions.select_scratch)?.addr(),
         arena.address(regions.selected)?.addr(),
         arena.address(regions.selected_counts)?.addr(),
         arena.address(regions.query)?.addr(),
@@ -785,11 +838,9 @@ fn reference_block_key(fixture: &Fixture, table_row: usize, block: usize) -> Vec
     let indexer_dim = Qwen38FlashNext::INDEXER_HEAD_DIM;
     let mut pooled = vec![0.0f64; indexer_dim];
     for member in 0..RATIO {
-        let position = block * RATIO + member;
-        let page = table_row * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE;
-        let base = indexer_dim * (position % ATTENTION_PAGE_SIZE + ATTENTION_PAGE_SIZE * page);
+        let base = history_element(table_row, block * RATIO + member, 0);
         for (dimension, value) in pooled.iter_mut().enumerate() {
-            *value += bf16_to_f32(fixture.indexer_pages[base + dimension]) as f64;
+            *value += bf16_to_f32(fixture.raw_history[base + dimension]) as f64;
         }
     }
     for value in pooled.iter_mut() {
@@ -917,6 +968,38 @@ fn require_close(
     Ok(())
 }
 
+/// Stages the four raw keys of every block one compression launch will close.
+///
+/// This is what a prompt tile does for itself: the tile carries the positions of
+/// the blocks it closes, so member `m` of the launch's block `slot` occupies row
+/// `4 * slot + m` of the round-local plane. The suite drives its synthetic
+/// history through the same door rather than through a paged plane, because a
+/// paged plane is exactly what the ring removed.
+fn stage_raw_chunk(
+    arena: &DeviceArena,
+    stream: &CudaStream,
+    regions: Regions,
+    history: &[u16],
+    table_row: usize,
+    first: usize,
+    count: usize,
+) -> GpuResult<()> {
+    let indexer_dim = Qwen38FlashNext::INDEXER_HEAD_DIM;
+    let mut staged = vec![0u16; COMPRESS_CHUNK * RATIO * indexer_dim];
+    for slot in 0..count {
+        for member in 0..RATIO {
+            let position = (first + slot) * RATIO + member;
+            let source = history_element(table_row, position, 0);
+            let destination = indexer_dim * (RATIO * slot + member);
+            staged[destination..destination + indexer_dim]
+                .copy_from_slice(&history[source..source + indexer_dim]);
+        }
+    }
+    arena.copy_from_host(stream, regions.raw_round, &staged)?;
+
+    Ok(())
+}
+
 /// Closes every micro-block the fixture's cached history completes, then proves
 /// each published block key against the FP64 pooling reference.
 fn compress_history(
@@ -943,6 +1026,15 @@ fn compress_history(
             }
             arena.copy_from_host(stream, regions.block_rope_cos, &cos)?;
             arena.copy_from_host(stream, regions.block_rope_sin, &sin)?;
+            stage_raw_chunk(
+                arena,
+                stream,
+                regions,
+                &fixture.raw_history,
+                table_row,
+                first,
+                count,
+            )?;
             load_plane(arena, stream, regions.table_rows, &[table_row as u32], 0)?;
             load_plane(arena, stream, regions.first_blocks, &[first as u32], 0)?;
             load_plane(arena, stream, regions.block_counts, &[count as u32], 0)?;
@@ -983,8 +1075,14 @@ fn compress_history(
     Ok(())
 }
 
-/// Proves the raw append lands where the shared page mapping says, carries the
+/// Proves the raw append lands in its own sequence's ring slot, carries the
 /// untouched projection row, and writes nothing else.
+///
+/// The ring slot is `position % 4` inside the row the token's table entry names,
+/// so two sequences at the same absolute position land in different slots and
+/// one sequence's four members of a block land in all four of its own. That is
+/// the property the block-key pooling depends on, and it is checked here rather
+/// than assumed by the compression.
 fn verify_prepare(
     ops: &Ops,
     arena: &DeviceArena,
@@ -998,47 +1096,48 @@ fn verify_prepare(
     let round = Round::decode(&rows, &[64usize; MAX_BATCH]);
     load_round(arena, stream, regions, fixture, &round)?;
     arena.fill(stream, regions.indexer_query, BYTE_SENTINEL)?;
+    arena.fill(stream, regions.raw_ring, BYTE_SENTINEL)?;
     stream.synchronize().map_err(GpuError::from)?;
     launch_prepare(ops, arena, stream, regions, round.tokens)?;
     stream.synchronize().map_err(GpuError::from)?;
 
-    let pages = arena.copy_to_host(stream, regions.indexer_pages)?;
+    let ring = arena.copy_to_host(stream, regions.raw_ring)?;
+    let mut written = vec![false; ring.len()];
     for token in 0..round.tokens {
         let table_row = round.table_rows[token] as usize;
         let position = round.positions[token] as usize;
-        let page = table_row * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE;
-        let base = indexer_dim * (position % ATTENTION_PAGE_SIZE + ATTENTION_PAGE_SIZE * page);
+        let base = indexer_dim * (table_row * RATIO + position % RATIO);
         let source =
             token * Qwen38FlashNext::INDEXER_ROWS + Qwen38FlashNext::INDEXER_HEADS * indexer_dim;
         for dimension in 0..indexer_dim {
             // Bitwise: the cached vector is the raw projection row, so a norm
             // or a rotation anywhere on this path would move the bits.
-            if pages[base + dimension] != fixture.indexer_qk[source + dimension] {
+            if ring[base + dimension] != fixture.indexer_qk[source + dimension] {
                 return Err(Failure::Mismatch(format!(
                     "the appended indexer key at row {table_row} position {position} \
                      dimension {dimension} was not the raw projection row"
                 )));
             }
+            written[base + dimension] = true;
             report.immutable_input_values += 1;
         }
     }
 
-    // Everything outside the landing zone still holds the uploaded history.
+    // Every slot this round did not name still holds the sentinel, so a prepare
+    // that widened its ring stride would be caught rather than absorbed.
     let mut untouched = 0usize;
-    for (index, (&observed, &expected)) in
-        pages.iter().zip(fixture.indexer_pages.iter()).enumerate()
-    {
-        let position_in_page = (index / indexer_dim) % ATTENTION_PAGE_SIZE;
-        let page = index / (indexer_dim * ATTENTION_PAGE_SIZE);
-        let position = (page % TABLE_STRIDE) * ATTENTION_PAGE_SIZE + position_in_page;
-        if position < APPEND_BASE && observed != expected {
+    for (index, &observed) in ring.iter().enumerate() {
+        if written[index] {
+            continue;
+        }
+        if observed != RING_SENTINEL {
             return Err(Failure::Mismatch(format!(
-                "the indexer prepare wrote outside its landing zone at value {index}"
+                "the indexer prepare wrote ring slot {} of row {}, which its round never named",
+                (index / indexer_dim) % RATIO,
+                index / (indexer_dim * RATIO)
             )));
         }
-        if position < APPEND_BASE {
-            untouched += 1;
-        }
+        untouched += 1;
     }
     report.untouched_values += untouched;
 
@@ -1062,11 +1161,6 @@ fn verify_prepare(
             }
         }
     }
-
-    // Restore the history so the block keys the later stages read stay the ones
-    // this suite already proved.
-    arena.copy_from_host(stream, regions.indexer_pages, &fixture.indexer_pages)?;
-    stream.synchronize().map_err(GpuError::from)?;
 
     Ok(())
 }
@@ -1113,6 +1207,14 @@ fn launch_prepare(
     regions: Regions,
     tokens: usize,
 ) -> GpuResult<()> {
+    // A decode width carries its raw key into the sequence's ring; a prompt
+    // width writes the round-local plane its own compression reads.
+    let raw_keys = if tokens <= MAX_BATCH {
+        arena.address(regions.raw_ring)?
+    } else {
+        arena.address(regions.raw_round)?
+    };
+
     // SAFETY: the qualification arena establishes the complete pointer
     // contract; every plane is aligned, disjoint, and outlives the stream.
     unsafe {
@@ -1124,12 +1226,10 @@ fn launch_prepare(
                 query_norm: arena.address(regions.query_norm)?.cast_const(),
                 rope_cos: arena.address(regions.rope_cos)?.cast_const(),
                 rope_sin: arena.address(regions.rope_sin)?.cast_const(),
-                block_tables: arena.address(regions.block_tables)?.cast_const(),
                 table_rows: arena.address(regions.table_rows)?.cast_const(),
-                table_stride: TABLE_STRIDE as u32,
                 cache_positions: arena.address(regions.cache_positions)?.cast_const(),
                 query: arena.address(regions.indexer_query)?,
-                indexer_pages: arena.address(regions.indexer_pages)?,
+                raw_keys,
             },
         )
     }
@@ -1147,7 +1247,7 @@ fn launch_compress(
             stream,
             COMPRESS_ROUTE,
             IndexerCompressArgs {
-                indexer_pages: arena.address(regions.indexer_pages)?.cast_const(),
+                raw_keys: arena.address(regions.raw_round)?.cast_const(),
                 key_norm: arena.address(regions.key_norm)?.cast_const(),
                 block_rope_cos: arena.address(regions.block_rope_cos)?.cast_const(),
                 block_rope_sin: arena.address(regions.block_rope_sin)?.cast_const(),
@@ -1157,6 +1257,41 @@ fn launch_compress(
                 first_blocks: arena.address(regions.first_blocks)?.cast_const(),
                 block_counts: arena.address(regions.block_counts)?.cast_const(),
                 block_keys: arena.address(regions.block_keys)?,
+            },
+        )
+    }
+}
+
+/// Launches one row tile's scoring and selection pair.
+fn launch_selection_tile(
+    ops: &Ops,
+    arena: &DeviceArena,
+    stream: &CudaStream,
+    regions: Regions,
+    round: &Round,
+    offset: usize,
+    rows: usize,
+) -> GpuResult<()> {
+    // SAFETY: as `launch_prepare`.
+    unsafe {
+        ops.selection.launch(
+            stream,
+            rows,
+            offset,
+            round.maximum_blocks(),
+            IndexerSelectionArgs {
+                query: arena.address(regions.indexer_query)?.cast_const(),
+                block_keys: arena.address(regions.block_keys)?.cast_const(),
+                block_tables: arena.address(regions.block_tables)?.cast_const(),
+                table_rows: arena.address(regions.table_rows)?.cast_const(),
+                table_stride: TABLE_STRIDE as u32,
+                visible_lengths: arena.address(regions.lengths)?.cast_const(),
+                block_counts: arena.address(regions.block_counts)?.cast_const(),
+                scores: arena.address(regions.scores)?,
+                score_stride: SCORE_STRIDE as u32,
+                selected: arena.address(regions.selected)?,
+                selected_counts: arena.address(regions.selected_counts)?,
+                scratch: arena.address(regions.select_scratch)?,
             },
         )
     }
@@ -1174,38 +1309,8 @@ fn launch_round(
 ) -> GpuResult<()> {
     launch_prepare(ops, arena, stream, regions, round.tokens)?;
 
-    let maximum_blocks = round.maximum_blocks();
-    let tile = if round.tokens <= MAX_BATCH {
-        round.tokens
-    } else {
-        SELECTION_ROW_TILE.min(round.tokens)
-    };
-    let mut offset = 0usize;
-    while offset < round.tokens {
-        let rows = tile.min(round.tokens - offset);
-        // SAFETY: as `launch_prepare`.
-        unsafe {
-            ops.selection.launch(
-                stream,
-                rows,
-                offset,
-                maximum_blocks,
-                IndexerSelectionArgs {
-                    query: arena.address(regions.indexer_query)?.cast_const(),
-                    block_keys: arena.address(regions.block_keys)?.cast_const(),
-                    block_tables: arena.address(regions.block_tables)?.cast_const(),
-                    table_rows: arena.address(regions.table_rows)?.cast_const(),
-                    table_stride: TABLE_STRIDE as u32,
-                    visible_lengths: arena.address(regions.lengths)?.cast_const(),
-                    block_counts: arena.address(regions.block_counts)?.cast_const(),
-                    scores: arena.address(regions.scores)?,
-                    score_stride: SCORE_STRIDE as u32,
-                    selected: arena.address(regions.selected)?,
-                    selected_counts: arena.address(regions.selected_counts)?,
-                },
-            )?;
-        }
-        offset += rows;
+    for (offset, rows) in round.tiles() {
+        launch_selection_tile(ops, arena, stream, regions, round, offset, rows)?;
     }
 
     // SAFETY: as `launch_prepare`.
@@ -1265,6 +1370,9 @@ fn observe(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> Outcom
 fn reset_outputs(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> GpuResult<()> {
     arena.fill(stream, regions.indexer_query, BYTE_SENTINEL)?;
     arena.fill(stream, regions.scores, BYTE_SENTINEL)?;
+    // The selection scratch is poisoned like any other reused seam: a pass that read a partial
+    // it had not published this round would answer differently under the sentinel.
+    arena.fill(stream, regions.select_scratch, BYTE_SENTINEL)?;
     arena.fill(stream, regions.selected, BYTE_SENTINEL)?;
     arena.fill(stream, regions.selected_counts, BYTE_SENTINEL)?;
     arena.fill(stream, regions.dense_attention, BYTE_SENTINEL)?;
@@ -1682,7 +1790,7 @@ fn verify_inputs(
 /// Row one's cached history is rewritten wholesale; row zero's scores,
 /// selection and attention output must not move by a bit. Their page maps are
 /// disjoint, so a block key resolved inside the sequence's own mapping cannot
-/// see the change, while an absolute-position lookup across the pool
+/// see the change, and one resolved by absolute position across the pool
 /// would.
 fn verify_isolation(
     ops: &Ops,
@@ -1703,18 +1811,15 @@ fn verify_isolation(
     // Rewrite the foreign row's raw history, then close its blocks again so the
     // block-key plane follows. Both planes now differ everywhere row one owns.
     let foreign = ISOLATION_ROWS[1];
-    let mut pages = fixture.indexer_pages.clone();
+    let mut rewritten = fixture.raw_history.clone();
     for position in 0..ROW_CONTEXT {
-        let page = foreign * TABLE_STRIDE + position / ATTENTION_PAGE_SIZE;
-        let base = indexer_dim * (position % ATTENTION_PAGE_SIZE + ATTENTION_PAGE_SIZE * page);
+        let base = history_element(foreign, position, 0);
         for dimension in 0..indexer_dim {
-            pages[base + dimension] = f32_to_bf16(
+            rewritten[base + dimension] = f32_to_bf16(
                 -INDEXER_PATTERN[(position + 3 * dimension) % INDEXER_PATTERN.len()] * 0.5,
             );
         }
     }
-    arena.copy_from_host(stream, regions.indexer_pages, &pages)?;
-    stream.synchronize().map_err(GpuError::from)?;
     let mut first = 0usize;
     while first < ROW_BLOCKS {
         let count = COMPRESS_CHUNK.min(ROW_BLOCKS - first);
@@ -1730,6 +1835,7 @@ fn verify_isolation(
         }
         arena.copy_from_host(stream, regions.block_rope_cos, &cos)?;
         arena.copy_from_host(stream, regions.block_rope_sin, &sin)?;
+        stage_raw_chunk(arena, stream, regions, &rewritten, foreign, first, count)?;
         load_plane(arena, stream, regions.table_rows, &[foreign as u32], 0)?;
         load_plane(arena, stream, regions.first_blocks, &[first as u32], 0)?;
         load_plane(arena, stream, regions.block_counts, &[count as u32], 0)?;
@@ -1792,8 +1898,86 @@ fn verify_isolation(
         ));
     }
 
-    arena.copy_from_host(stream, regions.indexer_pages, &fixture.indexer_pages)?;
+    Ok(())
+}
+
+/// Proves that shared selection scratch carries no state between row tiles.
+///
+/// The widest prompt route runs once as a dependency chain and once with the
+/// scratch poisoned and synchronized between tiles. The selected lists must match.
+fn verify_tile_ladder(
+    ops: &Ops,
+    arena: &DeviceArena,
+    stream: &CudaStream,
+    regions: Regions,
+    fixture: &Fixture,
+    report: &mut Qwen38FlashNextQsaSelectionQualification,
+) -> Outcome<()> {
+    let round = Round::prompt(1, TILE_LADDER_TOKENS, PREFILL_SELECTED_BASE);
+    let tiles = round.tiles();
+    if tiles.len() < 2 {
+        return Err(Failure::Mismatch(format!(
+            "the tile ladder drives {} tile(s), so it cannot observe tile-to-tile carry",
+            tiles.len()
+        )));
+    }
+
+    load_round(arena, stream, regions, fixture, &round)?;
+    reset_outputs(arena, stream, regions)?;
     stream.synchronize().map_err(GpuError::from)?;
+    launch_prepare(ops, arena, stream, regions, round.tokens)?;
+    for &(offset, rows) in &tiles {
+        launch_selection_tile(ops, arena, stream, regions, &round, offset, rows)?;
+    }
+    let together = observe(arena, stream, regions)?;
+
+    reset_outputs(arena, stream, regions)?;
+    stream.synchronize().map_err(GpuError::from)?;
+    launch_prepare(ops, arena, stream, regions, round.tokens)?;
+    stream.synchronize().map_err(GpuError::from)?;
+    for &(offset, rows) in &tiles {
+        arena.fill(stream, regions.select_scratch, BYTE_SENTINEL)?;
+        stream.synchronize().map_err(GpuError::from)?;
+        launch_selection_tile(ops, arena, stream, regions, &round, offset, rows)?;
+        stream.synchronize().map_err(GpuError::from)?;
+    }
+    let apart = observe(arena, stream, regions)?;
+
+    for token in 0..round.tokens {
+        if together.selected_counts[token] != apart.selected_counts[token] {
+            return Err(Failure::Mismatch(format!(
+                "row {token} selected {} positions inside a sixteen-tile round and {} on its \
+                 own, so the tiles share more than the plane",
+                together.selected_counts[token], apart.selected_counts[token]
+            )));
+        }
+        report.tile_ladder_values += 1;
+
+        let base = token * SELECTION_MAX_SELECTED;
+        for index in 0..together.selected_counts[token] as usize {
+            if together.selected[base + index] != apart.selected[base + index] {
+                return Err(Failure::Mismatch(format!(
+                    "row {token} entry {index} differs between the tiled and the isolated drive"
+                )));
+            }
+            report.tile_ladder_values += 1;
+        }
+    }
+
+    // The ladder has to be reading a selection that a residue could plausibly move: every row
+    // of this round is above the budget except the first three, and their lists differ.
+    let first = &together.selected[..together.selected_counts[0] as usize];
+    let last = {
+        let base = (round.tokens - 1) * SELECTION_MAX_SELECTED;
+        &together.selected[base..base + together.selected_counts[round.tokens - 1] as usize]
+    };
+    if first == last {
+        return Err(Failure::Mismatch(
+            "every row of the tile ladder selected the same list, so the comparison does not \
+             discriminate"
+                .into(),
+        ));
+    }
 
     Ok(())
 }
@@ -1803,8 +1987,8 @@ mod tests {
     use super::{
         APPEND_BASE, DENSE_BAND_CONTEXTS, MAX_VISIBLE, PARTIAL_TIE_POSITION, PREFILL_ROUTES,
         PREFILL_SELECTED_BASE, RATIO, ROTARY_DIM, ROTARY_PAIRS, ROW_BLOCKS, ROW_CONTEXT,
-        SCORE_STRIDE, SELECTED_CONTEXTS, TABLE_ROWS, TABLE_STRIDE, VERIFIED_HEADS, layout,
-        rotary_row, select,
+        SCORE_STRIDE, SELECTED_CONTEXTS, TABLE_ROWS, TABLE_STRIDE, TILE_LADDER_TOKENS,
+        VERIFIED_HEADS, layout, rotary_row, select,
     };
     use tuisko_kernels_sm120::{
         ATTENTION_PAGE_SIZE, SELECTION_BLOCKS_PER_PAGE, SELECTION_MAX_SELECTED, SELECTION_ROW_TILE,
@@ -1979,12 +2163,33 @@ mod tests {
         assert_eq!(cos[0].to_bits(), rotary_row(11).0[0].to_bits());
     }
 
+    /// The ladder's discriminating power is its tile count, so it is checked on the host.
+    #[test]
+    fn the_tile_ladder_round_really_is_many_tiles_over_one_scratch_plane() {
+        let round = super::Round::prompt(1, TILE_LADDER_TOKENS, PREFILL_SELECTED_BASE);
+        let tiles = round.tiles();
+
+        assert_eq!(tiles.len(), TILE_LADDER_TOKENS / SELECTION_ROW_TILE);
+        assert_eq!(tiles.len(), 16);
+        assert_eq!(tiles[0], (0, SELECTION_ROW_TILE));
+        assert_eq!(
+            tiles.iter().map(|&(_, rows)| rows).sum::<usize>(),
+            TILE_LADDER_TOKENS
+        );
+
+        // A decode width is one tile, which is why the ladder cannot be a decode round.
+        assert_eq!(
+            super::Round::decode(&[0, 1], &[3_000, 3_000]).tiles().len(),
+            1
+        );
+    }
+
     #[test]
     #[ignore = "requires an NVIDIA compute-capability 12.0 device"]
     fn qwen38_flash_next_qsa_selection_matches_its_oracles_and_graph_replay()
     -> Result<(), super::Qwen38FlashNextQsaSelectionQualificationError> {
         let report = super::qualify_qwen38_flash_next_qsa_selection()?;
-        println!("qwen38-flash-next-qsa-selection: {report:#?}");
+        println!("qwen38_flash_next-qsa-selection: {report:#?}");
 
         // Every block of every row is pooled, normed, rotated and compared.
         assert_eq!(
@@ -2007,6 +2212,13 @@ mod tests {
         assert!(
             report.tie_broken_blocks > 0,
             "no selection was decided by the pinned tie-break, so the rule is untested"
+        );
+        // The tile ladder compares a whole `T=1024` round's counts and lists, so the number is
+        // the round's selected entries plus one count per row and not a sample of them.
+        assert!(
+            report.tile_ladder_values > TILE_LADDER_TOKENS,
+            "the tile ladder compared {} values, which is fewer than one per row",
+            report.tile_ladder_values
         );
         assert!(
             report.maximum_absolute_error <= 0.05,

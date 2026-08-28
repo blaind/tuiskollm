@@ -1,6 +1,6 @@
 //! Paired timings for every exact Qwen3.8-Flash-Next backbone projection route.
 //!
-//! These three shapes are the whole per-token weight stream of a decoder layer
+//! These four shapes are the whole per-token weight stream of a QSA decoder layer
 //! outside the expert pool, so the accounting names the weight plane every route
 //! reads in full and the activation planes it moves across it.
 
@@ -11,8 +11,8 @@ use crate::device_benchmark::{
     preflight, require_current_process_exclusive, warmup_launches,
 };
 use crate::qwen38_flash_next_projection::{
-    BlockOutputShape, EXACT_ROUTES, GdnInputShape, MAX_BATCH, ProjectionShape, QsaQkvShape,
-    Regions, launch, layout, make_fixture,
+    BlockOutputShape, EXACT_ROUTES, GdnInputShape, IndexerQkShape, MAX_BATCH, ProjectionShape,
+    QsaQkvShape, Regions, launch, layout, make_fixture,
 };
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, GpuTimer};
@@ -92,10 +92,11 @@ impl<S: ProjectionShape> ShapeSession<S> {
     }
 }
 
-/// The three shape sessions, each owning its own arena.
+/// The four shape sessions, each owning its own arena.
 struct Session {
     gdn_input: ShapeSession<GdnInputShape>,
     qsa_qkv: ShapeSession<QsaQkvShape>,
+    indexer_qk: ShapeSession<IndexerQkShape>,
     block_output: ShapeSession<BlockOutputShape>,
     stream: Arc<CudaStream>,
     _context: Arc<CudaContext>,
@@ -115,11 +116,13 @@ impl Session {
         let stream = context.new_stream().map_err(GpuError::from)?;
         let gdn_input = ShapeSession::new(&context, &stream, repeated_operations)?;
         let qsa_qkv = ShapeSession::new(&context, &stream, repeated_operations)?;
+        let indexer_qk = ShapeSession::new(&context, &stream, repeated_operations)?;
         let block_output = ShapeSession::new(&context, &stream, repeated_operations)?;
 
         Ok(Self {
             gdn_input,
             qsa_qkv,
+            indexer_qk,
             block_output,
             stream,
             _context: context,
@@ -133,6 +136,7 @@ impl Session {
                 .routes
                 .iter()
                 .chain(&self.qsa_qkv.routes)
+                .chain(&self.indexer_qk.routes)
                 .chain(&self.block_output.routes)
             {
                 // SAFETY: every captured allocation is retained by its shape
@@ -146,6 +150,7 @@ impl Session {
     fn cases(&self, repeated_operations: u64) -> Vec<ExactDeviceCase<'_>> {
         let mut cases = self.gdn_input.cases(repeated_operations);
         cases.extend(self.qsa_qkv.cases(repeated_operations));
+        cases.extend(self.indexer_qk.cases(repeated_operations));
         cases.extend(self.block_output.cases(repeated_operations));
 
         cases
@@ -154,12 +159,14 @@ impl Session {
     fn weight_bytes(&self) -> usize {
         self.gdn_input.regions.weight_bytes()
             + self.qsa_qkv.regions.weight_bytes()
+            + self.indexer_qk.regions.weight_bytes()
             + self.block_output.regions.weight_bytes()
     }
 
     fn workspace_bytes(&self) -> usize {
         self.gdn_input.regions.workspace_bytes()
             + self.qsa_qkv.regions.workspace_bytes()
+            + self.indexer_qk.regions.workspace_bytes()
             + self.block_output.regions.workspace_bytes()
     }
 
@@ -167,6 +174,8 @@ impl Session {
         self.gdn_input.arena.byte_len() - self.gdn_input.regions.payload_bytes()
             + self.qsa_qkv.arena.byte_len()
             - self.qsa_qkv.regions.payload_bytes()
+            + self.indexer_qk.arena.byte_len()
+            - self.indexer_qk.regions.payload_bytes()
             + self.block_output.arena.byte_len()
             - self.block_output.regions.payload_bytes()
     }
@@ -218,13 +227,13 @@ pub fn benchmark_qwen38_flash_next_projections(
         "qwen38_flash_next/projection/weights",
         BenchmarkMemoryKind::Weights,
         session.weight_bytes(),
-        "materialized source BF16 [16384,2560], [13312,2560], and [2560,6144] planes",
+        "materialized source BF16 [16384,2560], [13312,2560], [640,2560], and [2560,6144] planes",
     )?;
     memory.register_owned(
         "qwen38_flash_next/projection/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         session.workspace_bytes(),
-        "max_rows=1024 activation inputs and projected outputs for all three shapes",
+        "max_rows=1024 activation inputs and projected outputs for all four shapes",
     )?;
     memory.register_owned(
         "qwen38_flash_next/projection/alignment_padding",
@@ -262,7 +271,8 @@ mod tests {
     use super::logical_bytes;
     use crate::qwen38_flash_next_projection::{
         BLOCK_COLUMNS, BlockOutputShape, EXACT_ROUTES, GDN_INPUT_ROWS, GdnInputShape, HIDDEN,
-        MAX_BATCH, MAX_ROWS, ProjectionShape, QSA_QKV_ROWS, QsaQkvShape, layout,
+        INDEXER_QK_ROWS, IndexerQkShape, MAX_BATCH, MAX_ROWS, ProjectionShape, QSA_QKV_ROWS,
+        QsaQkvShape, layout,
     };
 
     /// A route reads its whole weight plane once; the activations are what the
@@ -282,6 +292,11 @@ mod tests {
                 QsaQkvShape::OUTPUT_ROWS,
             ),
             (
+                logical_bytes::<IndexerQkShape>(0),
+                IndexerQkShape::COLUMNS,
+                IndexerQkShape::OUTPUT_ROWS,
+            ),
+            (
                 logical_bytes::<BlockOutputShape>(0),
                 BlockOutputShape::COLUMNS,
                 BlockOutputShape::OUTPUT_ROWS,
@@ -297,6 +312,10 @@ mod tests {
         assert_eq!(
             logical_bytes::<QsaQkvShape>(MAX_ROWS),
             68_157_440 + MAX_ROWS * (HIDDEN + QSA_QKV_ROWS) * size_of::<u16>()
+        );
+        assert_eq!(
+            logical_bytes::<IndexerQkShape>(MAX_ROWS),
+            3_276_800 + MAX_ROWS * (HIDDEN + INDEXER_QK_ROWS) * size_of::<u16>()
         );
         assert_eq!(
             logical_bytes::<BlockOutputShape>(MAX_ROWS),
@@ -318,22 +337,27 @@ mod tests {
             "qwen38_flash_next/projection/qsa_qkv_bf16"
         );
         assert_eq!(
+            IndexerQkShape::OPERATION,
+            "qwen38_flash_next/projection/indexer_qk_bf16"
+        );
+        assert_eq!(
             BlockOutputShape::OPERATION,
             "qwen38_flash_next/projection/block_output_bf16"
         );
 
         let (gdn, gdn_regions) = layout::<GdnInputShape>().unwrap();
         let (qsa, qsa_regions) = layout::<QsaQkvShape>().unwrap();
+        let (indexer, indexer_regions) = layout::<IndexerQkShape>().unwrap();
         let (block, block_regions) = layout::<BlockOutputShape>().unwrap();
 
         assert_eq!(gdn.byte_len(), gdn_regions.payload_bytes());
         assert_eq!(qsa.byte_len(), qsa_regions.payload_bytes());
+        assert_eq!(indexer.byte_len(), indexer_regions.payload_bytes());
         assert_eq!(block.byte_len(), block_regions.payload_bytes());
         assert_eq!(
-            gdn.byte_len() + qsa.byte_len() + block.byte_len(),
-            272_629_760
+            gdn.byte_len() + qsa.byte_len() + indexer.byte_len() + block.byte_len(),
+            282_460_160
         );
-        // Thirty-six timed cases: three shapes at twelve routes each.
-        assert_eq!(3 * EXACT_ROUTES.len(), 36);
+        assert_eq!(4 * EXACT_ROUTES.len(), 48);
     }
 }

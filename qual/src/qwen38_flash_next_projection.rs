@@ -1,6 +1,6 @@
 //! Qualification for the Qwen3.8-Flash-Next BF16 backbone projections.
 //!
-//! Three shapes, twelve routes each. Every one is a plain `nn.Linear` over the
+//! Four shapes, twelve routes each. Every one is a plain `nn.Linear` over the
 //! plane the model lane materializes: FP32 accumulation across the whole
 //! contraction and one round to BF16 at the store. Nothing rounds between a
 //! projection and its consumer; the ops that read these planes take BF16 words,
@@ -15,7 +15,7 @@ use crate::device_benchmark;
 use crate::fp8_projection_oracle::{BF16_SENTINEL, bf16_to_f32, f32_to_bf16};
 use crate::target::{
     Qwen38FlashNextBlockOutputProjectionOp, Qwen38FlashNextGdnInputProjectionOp,
-    Qwen38FlashNextQsaQkvProjectionOp,
+    Qwen38FlashNextIndexerQkProjectionOp, Qwen38FlashNextQsaQkvProjectionOp,
 };
 use crate::{DeviceBenchmarkError, harness::immutable_sentinel::first_difference};
 use std::sync::Arc;
@@ -37,6 +37,8 @@ pub(crate) const HIDDEN: usize = <Qwen38FlashNext as Arch>::HIDDEN;
 pub(crate) const GDN_INPUT_ROWS: usize = <Qwen38FlashNext as Arch>::GDN_INPUT_ROWS;
 /// Fused query/gate, key, and value rows the sparse-attention prepare reads.
 pub(crate) const QSA_QKV_ROWS: usize = <Qwen38FlashNext as Arch>::ATTENTION_QKV_ROWS;
+/// Indexer query/key rows used by QSA selection.
+pub(crate) const INDEXER_QK_ROWS: usize = Qwen38FlashNext::INDEXER_ROWS;
 /// Block width both output projection call sites contract over.
 pub(crate) const BLOCK_COLUMNS: usize = <Qwen38FlashNext as Arch>::ATTENTION_OUTPUT_COLUMNS;
 
@@ -71,7 +73,7 @@ pub enum Qwen38FlashNextProjectionQualificationError {
 
 type QualificationResult<T> = Result<T, Qwen38FlashNextProjectionQualificationError>;
 
-/// Observable counts, ownership, and worst oracle error across the three shapes.
+/// Observable counts, ownership, and worst oracle error across the four shapes.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Qwen38FlashNextProjectionQualification {
     /// Active BF16 outputs checked against their exact single-row reference.
@@ -86,9 +88,9 @@ pub struct Qwen38FlashNextProjectionQualification {
     pub immutable_values: usize,
     /// Probe outputs whose word separates nearest rounding from truncation.
     pub rne_separated_values: usize,
-    /// Materialized source-BF16 weight bytes across the three shapes.
+    /// Materialized source-BF16 weight bytes across the four shapes.
     pub weight_bytes: usize,
-    /// Address-stable activation bytes across the three shapes.
+    /// Address-stable activation bytes across the four shapes.
     pub workspace_bytes: usize,
     /// One-allocation arena bytes.
     pub arena_bytes: usize,
@@ -156,6 +158,8 @@ pub(crate) trait ProjectionShape {
 pub(crate) struct GdnInputShape;
 /// The fused sparse-attention query/key/value projection.
 pub(crate) struct QsaQkvShape;
+/// The fused indexer query/key projection.
+pub(crate) struct IndexerQkShape;
 /// The block output projection shared by both layer kinds.
 pub(crate) struct BlockOutputShape;
 
@@ -203,6 +207,14 @@ impl_projection_shape!(
     "qwen38_flash_next/projection/qsa_qkv_bf16",
     HIDDEN,
     QSA_QKV_ROWS
+);
+impl_projection_shape!(
+    IndexerQkShape,
+    Qwen38FlashNextIndexerQkProjectionOp,
+    "indexer_qk",
+    "qwen38_flash_next/projection/indexer_qk_bf16",
+    HIDDEN,
+    INDEXER_QK_ROWS
 );
 impl_projection_shape!(
     BlockOutputShape,
@@ -396,7 +408,7 @@ pub(crate) fn output_tolerance(expected: f64) -> f32 {
     (expected.abs() as f32 * 0.003_906_25).max(0.007_812_5)
 }
 
-/// Qualifies every admitted route of all three backbone shapes.
+/// Qualifies every admitted route of all four backbone shapes.
 pub fn qualify_qwen38_flash_next_projections()
 -> QualificationResult<Qwen38FlashNextProjectionQualification> {
     let _preflight = device_benchmark::preflight()?;
@@ -415,6 +427,7 @@ pub fn qualify_qwen38_flash_next_projections()
     let mut report = Qwen38FlashNextProjectionQualification::default();
     qualify_shape::<GdnInputShape>(&context, &stream, &mut report)?;
     qualify_shape::<QsaQkvShape>(&context, &stream, &mut report)?;
+    qualify_shape::<IndexerQkShape>(&context, &stream, &mut report)?;
     qualify_shape::<BlockOutputShape>(&context, &stream, &mut report)?;
     device_benchmark::require_current_process_exclusive()?;
 
@@ -714,9 +727,10 @@ fn verify_no_post_warmup_allocation<S: ProjectionShape>(
 mod tests {
     use super::{
         BLOCK_COLUMNS, BlockOutputShape, EXACT_ROUTES, GDN_INPUT_ROWS, GdnInputShape, HIDDEN,
-        MAX_BATCH, MAX_ROWS, PROBE_NEAREST, PROBE_TRUNCATED, ProjectionShape, QSA_QKV_ROWS,
-        QsaQkvShape, layout, make_fixture, make_input, oracle, output_tolerance, probe_plane,
-        probe_value, probe_weight, qualify_qwen38_flash_next_projections,
+        INDEXER_QK_ROWS, IndexerQkShape, MAX_BATCH, MAX_ROWS, PROBE_NEAREST, PROBE_TRUNCATED,
+        ProjectionShape, QSA_QKV_ROWS, QsaQkvShape, layout, make_fixture, make_input, oracle,
+        output_tolerance, probe_plane, probe_value, probe_weight,
+        qualify_qwen38_flash_next_projections,
     };
     use crate::fp8_projection_oracle::f32_to_bf16;
     use std::collections::BTreeSet;
@@ -841,6 +855,7 @@ mod tests {
         assert_eq!(HIDDEN, 2_560);
         assert_eq!(GDN_INPUT_ROWS, 16_384);
         assert_eq!(QSA_QKV_ROWS, 13_312);
+        assert_eq!(INDEXER_QK_ROWS, 640);
         assert_eq!(BLOCK_COLUMNS, 6_144);
 
         assert_eq!(
@@ -852,6 +867,10 @@ mod tests {
             (68_157_440, 32_505_856, 100_663_296)
         );
         assert_eq!(
+            shape_bytes::<IndexerQkShape>(),
+            (3_276_800, 6_553_600, 9_830_400)
+        );
+        assert_eq!(
             shape_bytes::<BlockOutputShape>(),
             (31_457_280, 17_825_792, 49_283_072)
         );
@@ -860,6 +879,7 @@ mod tests {
         for (weight, workspace, arena) in [
             shape_bytes::<GdnInputShape>(),
             shape_bytes::<QsaQkvShape>(),
+            shape_bytes::<IndexerQkShape>(),
             shape_bytes::<BlockOutputShape>(),
         ] {
             assert_eq!(arena, weight + workspace);
@@ -882,6 +902,7 @@ mod tests {
         // is what makes the three a closed backbone.
         assert_eq!(BlockOutputShape::OUTPUT_ROWS, GdnInputShape::COLUMNS);
         assert_eq!(BlockOutputShape::OUTPUT_ROWS, QsaQkvShape::COLUMNS);
+        assert_eq!(BlockOutputShape::OUTPUT_ROWS, IndexerQkShape::COLUMNS);
     }
 
     #[test]
@@ -894,7 +915,7 @@ mod tests {
             .iter()
             .map(|&rows| MAX_ROWS - rows)
             .sum::<usize>();
-        let output_rows = GDN_INPUT_ROWS + QSA_QKV_ROWS + HIDDEN;
+        let output_rows = GDN_INPUT_ROWS + QSA_QKV_ROWS + INDEXER_QK_ROWS + HIDDEN;
 
         assert_eq!(report.output_values, active * output_rows);
         assert_eq!(report.oracle_values, output_rows);
@@ -902,10 +923,10 @@ mod tests {
         assert_eq!(report.inactive_values, 2 * inactive * output_rows);
         // Every shape names the store's rule at one decode row and a whole
         // prompt tile.
-        assert_eq!(report.rne_separated_values, 3 * (1 + 32));
-        assert_eq!(report.weight_bytes, 183_500_800);
-        assert_eq!(report.workspace_bytes, 89_128_960);
-        assert_eq!(report.arena_bytes, 272_629_760);
+        assert_eq!(report.rne_separated_values, 4 * (1 + 32));
+        assert_eq!(report.weight_bytes, 186_777_600);
+        assert_eq!(report.workspace_bytes, 95_682_560);
+        assert_eq!(report.arena_bytes, 282_460_160);
         assert_eq!(report.padding_bytes, 0);
         assert!(report.immutable_values > 0);
         assert!(report.maximum_absolute_error.is_finite());

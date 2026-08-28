@@ -5,5 +5,6 @@ cuda_toolkit_release=13.3
 cuda_toolkit_version=13.3.73
 gdn_input_registers=22,22,22,22,40,42,66,66,66,66,66,86
 qsa_qkv_registers=24,24,24,24,40,42,66,66,66,66,66,86
+indexer_qk_registers=24,24,24,24,40,42,66,66,66,66,66,86
 block_output_registers=24,24,24,24,40,42,66,66,66,66,66,86
 mtp_fusion_registers=24,24,24,24,68

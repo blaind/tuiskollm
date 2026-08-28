@@ -20,9 +20,10 @@ pub use tuisko_kernels_sm120_attention::{
     Qwen38FlashNextAttentionQkPrepareOp, Qwen38FlashNextIndexerPrepareOp,
     Qwen38FlashNextIndexerSelectionOp, Qwen38FlashNextPagedGqaOp,
     Qwen38FlashNextSelectedPagedGqaOp, SELECTION_BLOCK_BUCKETS, SELECTION_BLOCKS_PER_PAGE,
-    SELECTION_MAX_BATCH, SELECTION_MAX_BLOCKS, SELECTION_MAX_SELECTED, SELECTION_PREFILL_TOKENS,
-    SELECTION_ROW_TILE, SelectedAttentionArgs, paged_gqa_prefill_partitions,
-    selection_block_bucket, selection_round_blocks, selection_round_rows,
+    SELECTION_MAX_BATCH, SELECTION_MAX_BLOCKS, SELECTION_MAX_CTAS_PER_ROW, SELECTION_MAX_SELECTED,
+    SELECTION_PREFILL_TOKENS, SELECTION_RADIX_PASSES, SELECTION_RING_SLOTS, SELECTION_ROW_TILE,
+    SELECTION_SCRATCH_WORDS, SelectedAttentionArgs, paged_gqa_prefill_partitions,
+    selection_block_bucket, selection_ctas_per_row, selection_round_blocks, selection_round_rows,
 };
 pub use tuisko_kernels_sm120_common::Sm120Arch;
 pub use tuisko_kernels_sm120_engram::{
@@ -68,5 +69,6 @@ pub use tuisko_kernels_sm120_nvfp4::{
 };
 pub use tuisko_kernels_sm120_qwen38_flash_next_projection::{
     Qwen38FlashNextBlockOutputProjectionOp, Qwen38FlashNextGdnInputProjectionOp,
-    Qwen38FlashNextMtpFusionProjectionOp, Qwen38FlashNextQsaQkvProjectionOp,
+    Qwen38FlashNextIndexerQkProjectionOp, Qwen38FlashNextMtpFusionProjectionOp,
+    Qwen38FlashNextQsaQkvProjectionOp,
 };

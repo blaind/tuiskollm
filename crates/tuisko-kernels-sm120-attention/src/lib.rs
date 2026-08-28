@@ -41,9 +41,11 @@ pub use qk_prepare::{
 pub use qsa_selection::{
     IndexerCompressArgs, IndexerPrepareArgs, IndexerSelectionArgs, Qwen38FlashNextIndexerPrepareOp,
     Qwen38FlashNextIndexerSelectionOp, Qwen38FlashNextSelectedPagedGqaOp, SELECTION_BLOCK_BUCKETS,
-    SELECTION_BLOCKS_PER_PAGE, SELECTION_MAX_BATCH, SELECTION_MAX_BLOCKS, SELECTION_MAX_SELECTED,
-    SELECTION_PREFILL_TOKENS, SELECTION_ROW_TILE, SelectedAttentionArgs, selection_block_bucket,
-    selection_round_blocks, selection_round_rows,
+    SELECTION_BLOCKS_PER_PAGE, SELECTION_MAX_BATCH, SELECTION_MAX_BLOCKS,
+    SELECTION_MAX_CTAS_PER_ROW, SELECTION_MAX_SELECTED, SELECTION_PREFILL_TOKENS,
+    SELECTION_RADIX_PASSES, SELECTION_RING_SLOTS, SELECTION_ROW_TILE, SELECTION_SCRATCH_WORDS,
+    SelectedAttentionArgs, selection_block_bucket, selection_ctas_per_row, selection_round_blocks,
+    selection_round_rows,
 };
 
 /// Semantic inventory of every entry this family emits.
@@ -77,8 +79,7 @@ mod tests {
     }
 
     /// The declared count `tuisko-kernels-sm120` pins for this family, split
-    /// per entry. A wrapper change that instantiates one more specialization —
-    /// or drops one — moves exactly one of these rows, which is what keeps an
+    /// per entry. Adding or dropping a specialization moves one row, so an
     /// owner merge from silently changing the emitted artifact.
     #[test]
     fn family_inventory_is_pinned_per_base_name() {
@@ -126,13 +127,14 @@ mod tests {
                 ("qwen38_flash_next_indexer_prepare_exact", 8),
                 ("qwen38_flash_next_indexer_prepare_prefill_exact", 4),
                 ("qwen38_flash_next_indexer_score_exact", 10),
-                ("qwen38_flash_next_indexer_select_exact", 10),
+                ("qwen38_flash_next_indexer_select_expand_exact", 10),
+                ("qwen38_flash_next_indexer_select_pass_exact", 10),
                 ("qwen38_flash_next_paged_gqa_exact", 8),
                 ("qwen38_flash_next_paged_gqa_prefill_selected_exact", 4),
                 ("qwen38_flash_next_paged_gqa_prefill_shared_exact", 4),
                 ("qwen38_flash_next_paged_gqa_selected_exact", 8),
             ]
         );
-        assert_eq!(counts.values().sum::<usize>(), 196);
+        assert_eq!(counts.values().sum::<usize>(), 206);
     }
 }
