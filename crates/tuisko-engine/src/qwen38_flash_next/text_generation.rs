@@ -418,9 +418,33 @@ pub(crate) fn prime_prompt_tiles(
             "Flash-Next generation requires a nonempty prompt",
         ));
     }
-    let mut cursor = 0usize;
 
-    while let Some(tokens) = next_native_prefill_tile(token_ids.len() - cursor) {
+    prime_prompt_tiles_from(model, stream, token_ids, slot, 0, token_ids.len())
+}
+
+pub(crate) fn prime_prompt_tiles_from(
+    model: &mut Qwen38FlashNextResidentModel,
+    stream: &CudaStream,
+    token_ids: &[u32],
+    slot: usize,
+    mut cursor: usize,
+    end: usize,
+) -> EngineResult<usize> {
+    if cursor > end || end > token_ids.len() {
+        return Err(EngineError::generation(
+            "Flash-Next prompt-prime range is outside its token ids",
+        ));
+    }
+    if cursor == end {
+        return Ok(cursor);
+    }
+    if !cursor.is_multiple_of(Qwen38FlashNext::INDEXER_COMPRESS_RATIO) {
+        return Err(EngineError::generation(
+            "Flash-Next native prompt prime must start at an aligned position",
+        ));
+    }
+
+    while let Some(tokens) = next_native_prefill_tile(end - cursor) {
         let first = prompt_position(cursor)?;
         let step = model.prefill_tile(stream, &token_ids[cursor..cursor + tokens], first, slot)?;
         model.observe_prime_round(&step, true);

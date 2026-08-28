@@ -346,6 +346,19 @@ pub struct Qwen38FlashNextSlotSnapshot {
     generation: u64,
 }
 
+/// Caller-owned restore point for one retained stable prefix.
+#[derive(Clone, Debug)]
+pub(crate) struct Qwen38FlashNextDurableSlotSnapshot {
+    owner: Arc<()>,
+    slot: usize,
+    sequence: u64,
+    tokens: usize,
+    carry: Qwen38FlashNextEngramCarry,
+    history_values: usize,
+    state_values: usize,
+    ple_values: usize,
+}
+
 impl Qwen38FlashNextSlotSnapshot {
     /// Slot this snapshot belongs to.
     pub const fn slot(&self) -> usize {
@@ -360,6 +373,19 @@ impl Qwen38FlashNextSlotSnapshot {
     /// Recurrent payload bytes held in the resident restore bank.
     pub const fn byte_len(&self) -> usize {
         self.bytes
+    }
+}
+
+impl Qwen38FlashNextDurableSlotSnapshot {
+    pub(crate) const fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    #[cfg(feature = "qualification")]
+    pub(crate) const fn byte_len(&self) -> usize {
+        self.history_values * size_of::<u16>()
+            + self.state_values * size_of::<f32>()
+            + self.ple_values * size_of::<u16>()
     }
 }
 
@@ -2460,6 +2486,199 @@ impl Qwen38FlashNextResidentModel {
                     "Qwen3.8 Flash-Next slot {slot} is outside 0..{MAX_BATCH}"
                 ))
             })
+    }
+
+    pub(crate) fn durable_slot_snapshot_values(&self) -> (usize, usize, usize) {
+        (
+            self.snapshot_history.len(),
+            self.snapshot_state.len(),
+            self.snapshot_ple.len(),
+        )
+    }
+
+    pub(crate) fn capture_durable_slot(
+        &mut self,
+        stream: &CudaStream,
+        slot: usize,
+        history: &mut [u16],
+        state: &mut [f32],
+        ple: &mut [u16],
+    ) -> EngineResult<Qwen38FlashNextDurableSlotSnapshot> {
+        if slot >= MAX_BATCH {
+            return Err(EngineError::route(format!(
+                "Flash-Next slot {slot} is outside 0..{MAX_BATCH}"
+            )));
+        }
+        if self.slots.state(slot)? != Qwen38FlashNextSlotState::Active {
+            return Err(EngineError::route(format!(
+                "Flash-Next slot {slot} must be active before it can be captured"
+            )));
+        }
+        let expected = self.durable_slot_snapshot_values();
+        if (history.len(), state.len(), ple.len()) != expected {
+            return Err(EngineError::layout(format!(
+                "durable Flash-Next slot bank has widths {:?}, expected {expected:?}",
+                (history.len(), state.len(), ple.len())
+            )));
+        }
+
+        let mut history_cursor = 0usize;
+        let mut state_cursor = 0usize;
+        let mut ple_cursor = 0usize;
+        for plan in self.layout.layers().clone() {
+            if let Some(gdn) = plan.persistent.gdn() {
+                let (history_width, state_width) = gdn.slot_widths();
+                self.arena.copy_slice_to_host_slice(
+                    stream,
+                    gdn.history,
+                    slot * history_width,
+                    &mut history[history_cursor..history_cursor + history_width],
+                )?;
+                history_cursor += history_width;
+                self.arena.copy_slice_to_host_slice(
+                    stream,
+                    gdn.state,
+                    slot * state_width,
+                    &mut state[state_cursor..state_cursor + state_width],
+                )?;
+                state_cursor += state_width;
+            }
+            if let Some(persistent) = plan.persistent.ple() {
+                let width = persistent.slot_width();
+                self.arena.copy_slice_to_host_slice(
+                    stream,
+                    persistent.conv_state,
+                    slot * width,
+                    &mut ple[ple_cursor..ple_cursor + width],
+                )?;
+                ple_cursor += width;
+            }
+        }
+        stream.synchronize().map_err(GpuError::from)?;
+
+        Ok(Qwen38FlashNextDurableSlotSnapshot {
+            owner: Arc::clone(&self.snapshot_owner),
+            slot,
+            sequence: self.slots.sequence(slot)?,
+            tokens: self.slots.tokens(slot)?,
+            carry: self.carries[slot],
+            history_values: history_cursor,
+            state_values: state_cursor,
+            ple_values: ple_cursor,
+        })
+    }
+
+    pub(crate) fn restore_durable_slot(
+        &mut self,
+        stream: &CudaStream,
+        snapshot: &Qwen38FlashNextDurableSlotSnapshot,
+        history: &[u16],
+        state: &[f32],
+        ple: &[u16],
+    ) -> EngineResult<()> {
+        let expected = (
+            snapshot.history_values,
+            snapshot.state_values,
+            snapshot.ple_values,
+        );
+        if (history.len(), state.len(), ple.len()) != expected {
+            return Err(EngineError::layout(format!(
+                "durable Flash-Next restore bank has widths {:?}, expected {expected:?}",
+                (history.len(), state.len(), ple.len())
+            )));
+        }
+        let slot = snapshot.slot;
+        if slot >= MAX_BATCH {
+            return Err(EngineError::route(format!(
+                "Flash-Next slot {slot} is outside 0..{MAX_BATCH}"
+            )));
+        }
+        if !Arc::ptr_eq(&snapshot.owner, &self.snapshot_owner) {
+            return Err(EngineError::route(
+                "a durable Flash-Next slot snapshot belongs to another resident model",
+            ));
+        }
+        if self.slots.sequence(slot)? != snapshot.sequence {
+            return Err(EngineError::route(format!(
+                "Flash-Next slot {slot} has restarted since its stable prefix was captured"
+            )));
+        }
+        let current = self.slots.tokens(slot)?;
+        if current < snapshot.tokens {
+            return Err(EngineError::route(format!(
+                "Flash-Next slot {slot} covers {current} tokens, short of its retained {}-token boundary",
+                snapshot.tokens
+            )));
+        }
+
+        let mut history_cursor = 0usize;
+        let mut state_cursor = 0usize;
+        let mut ple_cursor = 0usize;
+        for plan in self.layout.layers().clone() {
+            if let Some(gdn) = plan.persistent.gdn() {
+                let (history_width, state_width) = gdn.slot_widths();
+                self.arena.copy_slice_from_host(
+                    stream,
+                    gdn.history,
+                    slot * history_width,
+                    &history[history_cursor..history_cursor + history_width],
+                )?;
+                history_cursor += history_width;
+                self.arena.copy_slice_from_host(
+                    stream,
+                    gdn.state,
+                    slot * state_width,
+                    &state[state_cursor..state_cursor + state_width],
+                )?;
+                state_cursor += state_width;
+            }
+            if let Some(persistent) = plan.persistent.ple() {
+                let width = persistent.slot_width();
+                self.arena.copy_slice_from_host(
+                    stream,
+                    persistent.conv_state,
+                    slot * width,
+                    &ple[ple_cursor..ple_cursor + width],
+                )?;
+                ple_cursor += width;
+            }
+        }
+        self.carries[slot] = snapshot.carry;
+        if current > snapshot.tokens {
+            self.slots.rollback(slot, snapshot.tokens)?;
+        }
+        self.slots.reserve(slot, snapshot.tokens)?;
+        self.flush_block_tables(stream)?;
+        stream.synchronize().map_err(GpuError::from)?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "qualification")]
+    pub(crate) fn qualification_durable_slot_matches(
+        &mut self,
+        stream: &CudaStream,
+        durable: &Qwen38FlashNextDurableSlotSnapshot,
+        history: &[u16],
+        state: &[f32],
+        ple: &[u16],
+    ) -> EngineResult<bool> {
+        let retained = self.slots.state(durable.slot)? == Qwen38FlashNextSlotState::Retained;
+        if retained {
+            self.slots.reserve(durable.slot, durable.tokens)?;
+        }
+        let live = self.snapshot_slot(stream, durable.slot);
+        if retained {
+            self.slots.retain(durable.slot)?;
+        }
+        let live = live?;
+
+        Ok(live.tokens == durable.tokens
+            && live.carry == durable.carry
+            && live.bytes == durable.byte_len()
+            && self.snapshot_history[..durable.history_values] == *history
+            && self.snapshot_state[..durable.state_values] == *state
+            && self.snapshot_ple[..durable.ple_values] == *ple)
     }
 
     /// Snapshots recurrent state into the resident pinned restore bank.

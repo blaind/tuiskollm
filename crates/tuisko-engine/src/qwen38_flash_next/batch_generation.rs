@@ -8,14 +8,17 @@ use crate::common::progress::ResidentLoadProgress;
 use crate::common::slots::{device_zero_context, require_generation_capacity};
 use crate::common::text_generator::ModelProgram;
 use crate::qwen38_flash_next::compact_route::{
-    Qwen38FlashNextCompactRound, qwen38_flash_next_admission_slot, qwen38_flash_next_compact_round,
+    Qwen38FlashNextCompactRound, qwen38_flash_next_compact_round,
     qwen38_flash_next_compact_survivors,
 };
+use crate::qwen38_flash_next::layer_route::QWEN38_FLASH_NEXT_PREFILL_ROWS;
 use crate::qwen38_flash_next::resident_model::{
-    Qwen38FlashNextResidentLoadStats, Qwen38FlashNextResidentModel, Qwen38FlashNextStepTelemetry,
+    Qwen38FlashNextDurableSlotSnapshot, Qwen38FlashNextResidentLoadStats,
+    Qwen38FlashNextResidentModel, Qwen38FlashNextStepTelemetry,
 };
+use crate::qwen38_flash_next::slot_lifecycle::QWEN38_FLASH_NEXT_SLOT_PAGE_TOKENS;
 use crate::qwen38_flash_next::text_generation::{
-    Qwen38FlashNextGenerationTelemetry, prime_prompt_tiles, prompt_position,
+    Qwen38FlashNextGenerationTelemetry, prime_prompt_tiles_from, prompt_position,
 };
 use crate::{
     ChatGenerationRequest, EngineError, EngineErrorCode, EngineResult, GenerationSession,
@@ -238,10 +241,13 @@ pub struct Qwen38FlashNextResidentBatchGenerator {
     program: Qwen38FlashNextResidentModel,
     stream: Arc<CudaStream>,
     logits: PinnedHostBuffer<u16>,
+    boundary: Qwen38FlashNextBoundaryBank,
     sessions: [Option<Qwen38FlashNextBatchSession>; MAX_BATCH],
+    retained: [Option<Qwen38FlashNextRetainedSlot>; MAX_BATCH],
     active_slots: [usize; MAX_BATCH],
     active: usize,
     next_request_id: u64,
+    retention_clock: u64,
     batch: Qwen38FlashNextBatchTelemetry,
 }
 
@@ -252,12 +258,53 @@ struct Qwen38FlashNextBatchSession {
     next_position: u32,
 }
 
+struct Qwen38FlashNextBoundaryBank {
+    history: PinnedHostBuffer<u16>,
+    state: PinnedHostBuffer<f32>,
+    ple: PinnedHostBuffer<u16>,
+    logits: PinnedHostBuffer<u16>,
+    snapshots: [Option<Qwen38FlashNextDurableSlotSnapshot>; MAX_BATCH],
+    history_width: usize,
+    state_width: usize,
+    ple_width: usize,
+}
+
+struct Qwen38FlashNextRetainedSlot {
+    tokens: Vec<u32>,
+    last_used: u64,
+}
+
+struct Qwen38FlashNextAdmissionPlan {
+    slot: usize,
+    reused: usize,
+    reset: bool,
+    victims: [usize; MAX_BATCH],
+    victims_len: usize,
+}
+
 struct Qwen38FlashNextPrimingAdmission {
     request_id: ResidentRequestId,
     control: GenerationSession,
     slot: usize,
+    device_reused_tokens: usize,
+    retained_prefix_tokens: usize,
     native_prefill_tokens: usize,
     primed: usize,
+}
+
+#[derive(Clone, Copy)]
+enum Qwen38FlashNextPrimePhase {
+    StablePrefix,
+    FullPrompt,
+}
+
+impl Qwen38FlashNextPrimingAdmission {
+    fn phase_end(&self, phase: Qwen38FlashNextPrimePhase) -> usize {
+        match phase {
+            Qwen38FlashNextPrimePhase::StablePrefix => self.retained_prefix_tokens,
+            Qwen38FlashNextPrimePhase::FullPrompt => self.control.prompt_token_ids().len(),
+        }
+    }
 }
 
 enum Qwen38FlashNextAdmissionOutcome {
@@ -292,20 +339,6 @@ fn release_slot(
         Ok(_) => Err(error),
         Err(release) => Err(release),
     })
-}
-
-fn fail_group(
-    program: &mut Qwen38FlashNextResidentModel,
-    stream: &CudaStream,
-    outcomes: &mut [Qwen38FlashNextAdmissionOutcome],
-    error: &EngineError,
-) {
-    for outcome in outcomes {
-        let Qwen38FlashNextAdmissionOutcome::Priming(priming) = outcome else {
-            continue;
-        };
-        *outcome = release_slot(program, stream, priming.slot, shared_round_failure(error));
-    }
 }
 
 fn shared_round_failure(error: &EngineError) -> EngineError {
@@ -354,16 +387,50 @@ impl Qwen38FlashNextResidentBatchGenerator {
             .checked_mul(LOGIT_BANK_ROWS)
             .ok_or_else(|| EngineError::layout("Flash-Next compact logit banks overflow"))?;
         let logits = PinnedHostBuffer::zeroed(context, logit_values).map_err(GpuError::from)?;
+        let (history_width, state_width, ple_width) = program.durable_slot_snapshot_values();
+        let boundary = Qwen38FlashNextBoundaryBank {
+            history: PinnedHostBuffer::zeroed(
+                context,
+                checked_rows("Flash-Next boundary history", MAX_BATCH, history_width)?,
+            )
+            .map_err(GpuError::from)?,
+            state: PinnedHostBuffer::zeroed(
+                context,
+                checked_rows("Flash-Next boundary state", MAX_BATCH, state_width)?,
+            )
+            .map_err(GpuError::from)?,
+            ple: PinnedHostBuffer::zeroed(
+                context,
+                checked_rows("Flash-Next boundary PLE", MAX_BATCH, ple_width)?,
+            )
+            .map_err(GpuError::from)?,
+            logits: PinnedHostBuffer::zeroed(
+                context,
+                checked_rows(
+                    "Flash-Next boundary logits",
+                    MAX_BATCH,
+                    Qwen38FlashNext::VOCAB,
+                )?,
+            )
+            .map_err(GpuError::from)?,
+            snapshots: std::array::from_fn(|_| None),
+            history_width,
+            state_width,
+            ple_width,
+        };
 
         Ok(Self {
             frontend,
             program,
             stream,
             logits,
+            boundary,
             sessions: std::array::from_fn(|_| None),
+            retained: std::array::from_fn(|_| None),
             active_slots: [usize::MAX; MAX_BATCH],
             active: 0,
             next_request_id: 1,
+            retention_clock: 0,
             batch: Qwen38FlashNextBatchTelemetry::default(),
         })
     }
@@ -388,8 +455,9 @@ impl Qwen38FlashNextResidentBatchGenerator {
         for request in requests {
             outcomes.push(self.reserve_admission(request, &mut taken));
         }
-        self.prime_group_tiles(&mut outcomes);
-        self.prime_group_tails(&mut outcomes);
+        self.prime_group(&mut outcomes, Qwen38FlashNextPrimePhase::StablePrefix);
+        self.capture_stable_prefixes(&mut outcomes);
+        self.prime_group(&mut outcomes, Qwen38FlashNextPrimePhase::FullPrompt);
 
         outcomes
             .into_iter()
@@ -429,46 +497,209 @@ impl Qwen38FlashNextResidentBatchGenerator {
         if let Err(error) = prompt_position(control.prompt_token_ids().len()) {
             return Qwen38FlashNextAdmissionOutcome::Settled(Err(error));
         }
+        let retained_prefix_tokens = retained_prefix_tokens(
+            control.message_boundary_token_ids().len(),
+            control.prompt_token_ids().len(),
+        );
 
-        let occupied = std::array::from_fn(|slot| self.sessions[slot].is_some() || taken[slot]);
-        let Some(slot) = qwen38_flash_next_admission_slot(occupied) else {
-            return Qwen38FlashNextAdmissionOutcome::Settled(Err(EngineError::capacity(format!(
-                "all {MAX_BATCH} Flash-Next generation slots are active"
-            ))));
+        let plan = match self.plan_admission(
+            &control.prompt_token_ids()[..retained_prefix_tokens],
+            required_positions,
+            taken,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return Qwen38FlashNextAdmissionOutcome::Settled(Err(error)),
         };
-        taken[slot] = true;
-        if let Err(error) = self.program.recycle_slot(&self.stream, slot).and_then(|_| {
-            self.program
-                .reserve_slot(&self.stream, slot, required_positions)
-        }) {
-            taken[slot] = false;
-            return release_slot(&mut self.program, &self.stream, slot, error);
+        let slot = plan.slot;
+        if let Err(error) = self.apply_admission_plan(&plan, required_positions) {
+            return self.release_priming_slot(slot, error);
         }
+        taken[slot] = true;
+        self.retained[slot] = None;
 
         Qwen38FlashNextAdmissionOutcome::Priming(Qwen38FlashNextPrimingAdmission {
             request_id,
             control,
             slot,
+            device_reused_tokens: plan.reused,
+            retained_prefix_tokens,
             native_prefill_tokens: 0,
-            primed: 0,
+            primed: plan.reused,
         })
     }
 
-    fn prime_group_tiles(&mut self, outcomes: &mut [Qwen38FlashNextAdmissionOutcome]) {
+    fn plan_admission(
+        &self,
+        prompt: &[u32],
+        required_positions: usize,
+        taken: &[bool; MAX_BATCH],
+    ) -> EngineResult<Qwen38FlashNextAdmissionPlan> {
+        let prefix = self
+            .retained
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| !taken[*slot])
+            .filter_map(|(slot, retained)| {
+                retained.as_ref().and_then(|retained| {
+                    prompt.starts_with(&retained.tokens).then_some((
+                        slot,
+                        retained.tokens.len(),
+                        retained.last_used,
+                    ))
+                })
+            })
+            .max_by_key(|&(slot, tokens, last_used)| (tokens, last_used, usize::MAX - slot));
+        let (slot, reused, reset) = if let Some((slot, tokens, _)) = prefix {
+            (slot, tokens, false)
+        } else if let Some(slot) = (0..MAX_BATCH).find(|&slot| {
+            !taken[slot] && self.sessions[slot].is_none() && self.retained[slot].is_none()
+        }) {
+            (slot, 0, false)
+        } else {
+            let slot = self
+                .retained
+                .iter()
+                .enumerate()
+                .filter(|(slot, retained)| !taken[*slot] && retained.is_some())
+                .min_by_key(|(slot, retained)| {
+                    (
+                        retained
+                            .as_ref()
+                            .expect("retained admission victim exists")
+                            .last_used,
+                        *slot,
+                    )
+                })
+                .map(|(slot, _)| slot)
+                .ok_or_else(|| {
+                    EngineError::capacity(format!(
+                        "all {MAX_BATCH} Flash-Next generation slots are active"
+                    ))
+                })?;
+            (slot, 0, true)
+        };
+
+        if reused != 0 && self.boundary.snapshots[slot].is_none() {
+            return Err(EngineError::generation(
+                "retained Flash-Next prefix has no durable state",
+            ));
+        }
+        let required_pages = required_positions.div_ceil(QWEN38_FLASH_NEXT_SLOT_PAGE_TOKENS);
+        let existing_pages = self.program.slots().pages(slot)?.len();
+        let retained_pages = if reset { 0 } else { existing_pages };
+        let additional_pages = required_pages.checked_sub(retained_pages).ok_or_else(|| {
+            EngineError::generation(format!(
+                "Flash-Next slot {slot} retains {retained_pages} pages but admission requires only {required_pages}"
+            ))
+        })?;
+        let available = self
+            .program
+            .slots()
+            .free_pages()
+            .checked_add(if reset { existing_pages } else { 0 })
+            .ok_or_else(|| EngineError::generation("available Flash-Next pages overflow"))?;
+        let mut candidates = Vec::new();
+        for (victim, retained) in self.retained.iter().enumerate() {
+            if victim == slot || taken[victim] || retained.is_none() {
+                continue;
+            }
+            candidates.push((
+                victim,
+                retained
+                    .as_ref()
+                    .expect("retained admission victim exists")
+                    .last_used,
+                self.program.slots().pages(victim)?.len(),
+            ));
+        }
+        let (victims, victims_len) =
+            plan_reclaim_victims(available, additional_pages, &mut candidates)?;
+
+        Ok(Qwen38FlashNextAdmissionPlan {
+            slot,
+            reused,
+            reset,
+            victims,
+            victims_len,
+        })
+    }
+
+    fn apply_admission_plan(
+        &mut self,
+        plan: &Qwen38FlashNextAdmissionPlan,
+        required_positions: usize,
+    ) -> EngineResult<()> {
+        if plan.reset {
+            self.program.recycle_slot(&self.stream, plan.slot)?;
+            self.retained[plan.slot] = None;
+            self.boundary.snapshots[plan.slot] = None;
+        }
+        for &victim in &plan.victims[..plan.victims_len] {
+            self.program.recycle_slot(&self.stream, victim)?;
+            self.retained[victim] = None;
+            self.boundary.snapshots[victim] = None;
+        }
+        self.program
+            .reserve_slot(&self.stream, plan.slot, required_positions)?;
+
+        Ok(())
+    }
+
+    fn release_priming_slot(
+        &mut self,
+        slot: usize,
+        error: EngineError,
+    ) -> Qwen38FlashNextAdmissionOutcome {
+        self.retained[slot] = None;
+        self.boundary.snapshots[slot] = None;
+        release_slot(&mut self.program, &self.stream, slot, error)
+    }
+
+    fn fail_priming_group(
+        &mut self,
+        outcomes: &mut [Qwen38FlashNextAdmissionOutcome],
+        error: &EngineError,
+    ) {
+        for outcome in outcomes {
+            let Qwen38FlashNextAdmissionOutcome::Priming(priming) = outcome else {
+                continue;
+            };
+            *outcome = self.release_priming_slot(priming.slot, shared_round_failure(error));
+        }
+    }
+
+    fn prime_group(
+        &mut self,
+        outcomes: &mut [Qwen38FlashNextAdmissionOutcome],
+        phase: Qwen38FlashNextPrimePhase,
+    ) {
+        self.prime_group_scalars(outcomes, phase, true);
+        self.prime_group_tiles(outcomes, phase);
+        self.prime_group_scalars(outcomes, phase, false);
+    }
+
+    fn prime_group_tiles(
+        &mut self,
+        outcomes: &mut [Qwen38FlashNextAdmissionOutcome],
+        phase: Qwen38FlashNextPrimePhase,
+    ) {
         for outcome in outcomes {
             let Qwen38FlashNextAdmissionOutcome::Priming(priming) = outcome else {
                 continue;
             };
             let slot = priming.slot;
-            let prompt_tokens = priming.control.prompt_token_ids().len();
-            let tiled = prime_prompt_tiles(
+            let end = priming.phase_end(phase);
+            let begin = priming.primed;
+            let tiled = prime_prompt_tiles_from(
                 &mut self.program,
                 &self.stream,
                 priming.control.prompt_token_ids(),
                 slot,
+                begin,
+                end,
             )
             .and_then(|tiled| {
-                if tiled == prompt_tokens {
+                if tiled == end && begin != end {
                     self.program.read_logits_into(
                         &self.stream,
                         1,
@@ -479,17 +710,22 @@ impl Qwen38FlashNextResidentBatchGenerator {
             });
             match tiled {
                 Ok(tiled) => {
-                    priming.native_prefill_tokens = tiled;
+                    priming.native_prefill_tokens += tiled - begin;
                     priming.primed = tiled;
                 }
                 Err(error) => {
-                    *outcome = release_slot(&mut self.program, &self.stream, slot, error);
+                    *outcome = self.release_priming_slot(slot, error);
                 }
             }
         }
     }
 
-    fn prime_group_tails(&mut self, outcomes: &mut [Qwen38FlashNextAdmissionOutcome]) {
+    fn prime_group_scalars(
+        &mut self,
+        outcomes: &mut [Qwen38FlashNextAdmissionOutcome],
+        phase: Qwen38FlashNextPrimePhase,
+        alignment_only: bool,
+    ) {
         let mut tokens = [0u32; MAX_BATCH];
         let mut positions = [0u32; MAX_BATCH];
         loop {
@@ -502,7 +738,11 @@ impl Qwen38FlashNextResidentBatchGenerator {
                     continue;
                 };
                 group[entries] = priming.slot;
-                pending[entries] = priming.primed < priming.control.prompt_token_ids().len();
+                pending[entries] = priming.primed < priming.phase_end(phase)
+                    && (!alignment_only
+                        || !priming
+                            .primed
+                            .is_multiple_of(Qwen38FlashNext::INDEXER_COMPRESS_RATIO));
                 entries += 1;
                 owners[priming.slot] = index;
             }
@@ -510,7 +750,7 @@ impl Qwen38FlashNextResidentBatchGenerator {
                 match qwen38_flash_next_compact_round(&group[..entries], &pending[..entries]) {
                     Ok(planned) => planned,
                     Err(error) => {
-                        fail_group(&mut self.program, &self.stream, outcomes, &error);
+                        self.fail_priming_group(outcomes, &error);
                         return;
                     }
                 };
@@ -538,12 +778,8 @@ impl Qwen38FlashNextResidentBatchGenerator {
                 Ok(step) => step,
                 Err(error) => {
                     for &slot in slots {
-                        outcomes[owners[slot]] = release_slot(
-                            &mut self.program,
-                            &self.stream,
-                            slot,
-                            shared_round_failure(&error),
-                        );
+                        outcomes[owners[slot]] =
+                            self.release_priming_slot(slot, shared_round_failure(&error));
                     }
                     continue;
                 }
@@ -557,7 +793,7 @@ impl Qwen38FlashNextResidentBatchGenerator {
                     continue;
                 };
                 priming.primed += 1;
-                if priming.primed == priming.control.prompt_token_ids().len() {
+                if priming.primed == priming.phase_end(phase) {
                     published = row + 1;
                 }
             }
@@ -574,7 +810,7 @@ impl Qwen38FlashNextResidentBatchGenerator {
                 else {
                     continue;
                 };
-                if priming.primed != priming.control.prompt_token_ids().len() {
+                if priming.primed != priming.phase_end(phase) {
                     continue;
                 }
                 match &readback {
@@ -582,14 +818,64 @@ impl Qwen38FlashNextResidentBatchGenerator {
                         .logits
                         .copy_within(compact_row(row), slot * Qwen38FlashNext::VOCAB),
                     Err(error) => {
-                        outcomes[owners[slot]] = release_slot(
-                            &mut self.program,
-                            &self.stream,
-                            slot,
-                            shared_round_failure(error),
-                        );
+                        outcomes[owners[slot]] =
+                            self.release_priming_slot(slot, shared_round_failure(error));
                     }
                 }
+            }
+        }
+    }
+
+    fn capture_stable_prefixes(&mut self, outcomes: &mut [Qwen38FlashNextAdmissionOutcome]) {
+        for outcome in outcomes {
+            let Qwen38FlashNextAdmissionOutcome::Priming(priming) = outcome else {
+                continue;
+            };
+            let slot = priming.slot;
+            if priming.primed != priming.retained_prefix_tokens {
+                *outcome = self.release_priming_slot(
+                    slot,
+                    EngineError::generation("Flash-Next stable prefix was not fully primed"),
+                );
+                continue;
+            }
+            if priming.device_reused_tokens == priming.retained_prefix_tokens {
+                if self.boundary.snapshots[slot].is_none() {
+                    *outcome = self.release_priming_slot(
+                        slot,
+                        EngineError::generation("reused Flash-Next prefix has no durable state"),
+                    );
+                }
+                continue;
+            }
+
+            let history = row(slot, self.boundary.history_width);
+            let state = row(slot, self.boundary.state_width);
+            let ple = row(slot, self.boundary.ple_width);
+            let captured = self.program.capture_durable_slot(
+                &self.stream,
+                slot,
+                &mut self.boundary.history[history],
+                &mut self.boundary.state[state],
+                &mut self.boundary.ple[ple],
+            );
+            match captured {
+                Ok(snapshot) if snapshot.tokens() == priming.retained_prefix_tokens => {
+                    self.boundary.snapshots[slot] = Some(snapshot);
+                    self.boundary.logits[slot_logits(slot)]
+                        .copy_from_slice(&self.logits[slot_logits(slot)]);
+                }
+                Ok(snapshot) => {
+                    *outcome = self.release_priming_slot(
+                        slot,
+                        EngineError::generation(format!(
+                            "Flash-Next boundary captured {} tokens, expected {}",
+                            snapshot.tokens(),
+                            priming.retained_prefix_tokens
+                        )),
+                    );
+                }
+                Err(error) => *outcome = self.release_priming_slot(slot, error),
             }
         }
     }
@@ -602,6 +888,7 @@ impl Qwen38FlashNextResidentBatchGenerator {
             request_id,
             control,
             slot,
+            device_reused_tokens,
             native_prefill_tokens,
             ..
         } = priming;
@@ -622,7 +909,7 @@ impl Qwen38FlashNextResidentBatchGenerator {
         Ok(ResidentBatchAdmission {
             request_id,
             prompt_tokens,
-            device_reused_tokens: 0,
+            device_reused_tokens,
             native_prefill_tokens,
             prompt_metrics,
             completed: None,
@@ -672,7 +959,8 @@ impl Qwen38FlashNextResidentBatchGenerator {
                 let session = self.sessions[slot]
                     .take()
                     .expect("terminal Flash-Next session exists");
-                self.program.recycle_slot(&self.stream, slot)?;
+                let retained = retained_tokens(&session.control);
+                self.store_retained(slot, retained)?;
                 retired[index] = true;
                 self.batch.retirements += 1;
                 Some(session.control.into_output()?)
@@ -693,7 +981,7 @@ impl Qwen38FlashNextResidentBatchGenerator {
         Ok(ResidentBatchEvents::from_events(events, active))
     }
 
-    /// Cancels one request, releases its pages, and clears its carries.
+    /// Cancels one request at its retained stable message prefix.
     pub fn cancel(&mut self, request_id: ResidentRequestId) -> EngineResult<ResidentCancellation> {
         let index = self.active_slots[..self.active]
             .iter()
@@ -717,13 +1005,15 @@ impl Qwen38FlashNextResidentBatchGenerator {
         )?;
         self.active_slots = survivors;
         self.active = surviving;
-        self.program.recycle_slot(&self.stream, slot)?;
+        let retained = retained_tokens(&session.control);
+        let device_retained_tokens = retained.len();
+        self.store_retained(slot, retained)?;
         self.batch.cancellations += 1;
 
         Ok(ResidentCancellation {
             request_id,
             output: session.control.cancel()?,
-            device_retained_tokens: 0,
+            device_retained_tokens,
         })
     }
 
@@ -764,7 +1054,12 @@ impl Qwen38FlashNextResidentBatchGenerator {
 
     /// Page-locked staging, engram, and logit-bank bytes this owner holds.
     pub fn host_stager_bytes(&self) -> usize {
-        self.program.host_stager_bytes() + self.logits.num_bytes()
+        self.program.host_stager_bytes()
+            + self.logits.num_bytes()
+            + self.boundary.history.num_bytes()
+            + self.boundary.state.num_bytes()
+            + self.boundary.ple.num_bytes()
+            + self.boundary.logits.num_bytes()
     }
 
     /// Construction evidence: upload, expert staging, and graph capture.
@@ -847,12 +1142,98 @@ impl Qwen38FlashNextResidentBatchGenerator {
 
     #[cfg(feature = "qualification")]
     /// Stable retained device and pinned-logit addresses.
-    pub fn qualification_addresses(&self) -> [usize; 3] {
+    pub fn qualification_addresses(&self) -> [usize; 7] {
         [
             self.program.base_address() as usize,
             self.program.kv_base_address() as usize,
             self.logits.as_ptr().addr(),
+            self.boundary.history.as_ptr().addr(),
+            self.boundary.state.as_ptr().addr(),
+            self.boundary.ple.as_ptr().addr(),
+            self.boundary.logits.as_ptr().addr(),
         ]
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Exact tokens retained at one inactive stable prefix.
+    pub fn qualification_retained_tokens(&self, slot: usize) -> Option<usize> {
+        self.retained
+            .get(slot)
+            .and_then(Option::as_ref)
+            .map(|retained| retained.tokens.len())
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Whether one retained slot matches every durable prefix plane.
+    pub fn qualification_retained_prefix_matches(&mut self, slot: usize) -> EngineResult<bool> {
+        let snapshot = self
+            .boundary
+            .snapshots
+            .get(slot)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| EngineError::generation("Flash-Next slot has no retained prefix"))?;
+        let history = row(slot, self.boundary.history_width);
+        let state = row(slot, self.boundary.state_width);
+        let ple = row(slot, self.boundary.ple_width);
+        let recurrent = self.program.qualification_durable_slot_matches(
+            &self.stream,
+            snapshot,
+            &self.boundary.history[history],
+            &self.boundary.state[state],
+            &self.boundary.ple[ple],
+        )?;
+
+        Ok(recurrent && self.logits[slot_logits(slot)] == self.boundary.logits[slot_logits(slot)])
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Returns every retained prefix to the shared page pool.
+    pub fn qualification_clear_retained(&mut self) -> EngineResult<()> {
+        for slot in 0..MAX_BATCH {
+            if self.retained[slot].is_some() {
+                self.program.recycle_slot(&self.stream, slot)?;
+                self.retained[slot] = None;
+                self.boundary.snapshots[slot] = None;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn store_retained(&mut self, slot: usize, tokens: Vec<u32>) -> EngineResult<()> {
+        let next_clock = self
+            .retention_clock
+            .checked_add(1)
+            .ok_or_else(|| EngineError::generation("Flash-Next retention clock overflows"))?;
+        let snapshot = self.boundary.snapshots[slot].as_ref().ok_or_else(|| {
+            EngineError::generation("Flash-Next request has no captured stable prefix")
+        })?;
+        if snapshot.tokens() != tokens.len() {
+            return Err(EngineError::generation(format!(
+                "Flash-Next retained {} tokens against a {}-token boundary",
+                tokens.len(),
+                snapshot.tokens()
+            )));
+        }
+        let history = row(slot, self.boundary.history_width);
+        let state = row(slot, self.boundary.state_width);
+        let ple = row(slot, self.boundary.ple_width);
+        self.program.restore_durable_slot(
+            &self.stream,
+            snapshot,
+            &self.boundary.history[history],
+            &self.boundary.state[state],
+            &self.boundary.ple[ple],
+        )?;
+        self.logits[slot_logits(slot)].copy_from_slice(&self.boundary.logits[slot_logits(slot)]);
+        self.program.retain_slot(slot)?;
+        self.retention_clock = next_clock;
+        self.retained[slot] = Some(Qwen38FlashNextRetainedSlot {
+            tokens,
+            last_used: next_clock,
+        });
+
+        Ok(())
     }
 
     /// The dense round the pending subset of the active order describes.
@@ -923,6 +1304,60 @@ impl Qwen38FlashNextResidentBatchGenerator {
     }
 }
 
+fn retained_prefix_tokens(message_boundary: usize, prompt_tokens: usize) -> usize {
+    debug_assert!(message_boundary <= prompt_tokens);
+    let alignment = QWEN38_FLASH_NEXT_PREFILL_ROWS[0];
+    let remainder = message_boundary % alignment;
+    if remainder == 0
+        || message_boundary < alignment
+        || prompt_tokens - message_boundary < alignment - remainder
+    {
+        message_boundary
+    } else {
+        message_boundary - remainder
+    }
+}
+
+fn retained_tokens(control: &GenerationSession) -> Vec<u32> {
+    let tokens = retained_prefix_tokens(
+        control.message_boundary_token_ids().len(),
+        control.prompt_token_ids().len(),
+    );
+    control.prompt_token_ids()[..tokens].to_vec()
+}
+
+fn plan_reclaim_victims(
+    mut available: usize,
+    required: usize,
+    candidates: &mut [(usize, u64, usize)],
+) -> EngineResult<([usize; MAX_BATCH], usize)> {
+    candidates.sort_unstable_by_key(|&(slot, last_used, _)| (last_used, slot));
+    let mut victims = [usize::MAX; MAX_BATCH];
+    let mut len = 0usize;
+    for &(slot, _, pages) in candidates.iter() {
+        if available >= required {
+            break;
+        }
+        available = available
+            .checked_add(pages)
+            .ok_or_else(|| EngineError::generation("available Flash-Next pages overflow"))?;
+        victims[len] = slot;
+        len += 1;
+    }
+    if available < required {
+        return Err(EngineError::capacity(format!(
+            "Flash-Next KV admission requires {required} additional pages, but free plus reclaimable pages provide {available}"
+        )));
+    }
+
+    Ok((victims, len))
+}
+
+fn checked_rows(label: &str, rows: usize, columns: usize) -> EngineResult<usize> {
+    rows.checked_mul(columns)
+        .ok_or_else(|| EngineError::layout(format!("{label} overflows")))
+}
+
 fn slot_logits(slot: usize) -> Range<usize> {
     row(slot, Qwen38FlashNext::VOCAB)
 }
@@ -940,7 +1375,7 @@ fn compact_row(row: usize) -> Range<usize> {
 mod tests {
     use super::{
         LOGIT_BANK_ROWS, MAX_BATCH, Qwen38FlashNextBatchTelemetry, compact_logits, compact_row,
-        shared_round_failure, slot_logits,
+        plan_reclaim_victims, retained_prefix_tokens, shared_round_failure, slot_logits,
     };
     use crate::{EngineError, EngineErrorCode};
     use std::mem::size_of;
@@ -955,11 +1390,33 @@ mod tests {
             * (Qwen38FlashNext::HIDDEN * size_of::<u16>()
                 + Qwen38FlashNext::NGRAM_HEADS * Qwen38FlashNext::NGRAM_HEAD_DIM)
             + 2 * LOGIT_BANK_ROWS * Qwen38FlashNext::VOCAB * size_of::<u16>()
-            + restore_bank;
+            + restore_bank
+            + MAX_BATCH * restore_bank
+            + MAX_BATCH * Qwen38FlashNext::VOCAB * size_of::<u16>();
 
         assert_eq!(layout.total_device_bytes().unwrap(), 30_675_307_776);
         assert_eq!(restore_bank, 115_642_368);
-        assert_eq!(stagers, 139_399_168);
+        assert_eq!(stagers, 1_068_511_232);
+    }
+
+    #[test]
+    fn page_reclaim_is_planned_in_lru_then_slot_order_before_mutation() {
+        let mut candidates = [(4, 30, 2), (3, 10, 3), (2, 10, 1)];
+        let (victims, len) = plan_reclaim_victims(0, 4, &mut candidates).unwrap();
+
+        assert_eq!(&victims[..len], &[2, 3]);
+        let error = plan_reclaim_victims(0, 7, &mut candidates).unwrap_err();
+        assert_eq!(error.code(), Some(EngineErrorCode::Capacity));
+        let (_, len) = plan_reclaim_victims(4, 4, &mut candidates).unwrap();
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn retained_prefix_alignment_never_adds_a_scalar_prime_round() {
+        assert_eq!(retained_prefix_tokens(6, 13), 6);
+        assert_eq!(retained_prefix_tokens(48, 53), 48);
+        assert_eq!(retained_prefix_tokens(121, 128), 96);
+        assert_eq!(retained_prefix_tokens(128, 128), 128);
     }
 
     #[test]
