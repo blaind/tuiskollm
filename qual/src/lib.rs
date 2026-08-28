@@ -257,6 +257,10 @@ mod qwen36_text_endpoint;
 #[cfg(feature = "device")]
 mod qwen36_text_endpoint_benchmark;
 #[cfg(feature = "device")]
+mod qwen38_flash_next_engram_staging;
+#[cfg(feature = "device")]
+mod qwen38_flash_next_engram_staging_benchmark;
+#[cfg(feature = "device")]
 mod qwen38_flash_next_gdn_prepare;
 #[cfg(feature = "device")]
 mod qwen38_flash_next_gdn_prepare_benchmark;
