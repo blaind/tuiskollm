@@ -13,7 +13,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tuisko_engine::{
-    ChatGenerationRequest, EngineError, QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING,
+    ChatGenerationRequest, EngineError, QWEN38_FLASH_NEXT_ATTENTION_LAYERS,
+    QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING, QWEN38_FLASH_NEXT_MTP_ATTENTION_ROUTES,
     QWEN38_FLASH_NEXT_MTP_ROUTES, QWEN38_FLASH_NEXT_MTP_SEGMENTS,
     QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS, Qwen38FlashNextMtpAcceptance, Qwen38FlashNextMtpResidency,
     Qwen38FlashNextMtpRoundCost, Qwen38FlashNextMtpTextGenerator, ResidentMtpGenerationStats,
@@ -21,6 +22,7 @@ use tuisko_engine::{
 };
 use tuisko_frontend::{ChatMessage, ChatTemplateOptions};
 use tuisko_gpu::{CudaContext, GpuError};
+use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_model::{Arch, CheckpointError, CheckpointSnapshot, Qwen38FlashNext};
 
 type A = Qwen38FlashNext;
@@ -157,6 +159,23 @@ pub struct Qwen38FlashNextMtpCodingCase {
     pub cost: Qwen38FlashNextMtpRoundCost,
 }
 
+/// One shared-index comparison against the draft's own selection.
+#[derive(Clone, Debug)]
+pub struct Qwen38FlashNextMtpIndexShareTrial {
+    /// Prompt tokens primed by both runs.
+    pub prompt_tokens: usize,
+    /// Acceptance with the target selection reused.
+    pub shared: Qwen38FlashNextMtpAcceptance,
+    /// Acceptance with draft-side selection.
+    pub own: Qwen38FlashNextMtpAcceptance,
+    /// Shared-index wall time.
+    pub shared_elapsed: Duration,
+    /// Draft-selection wall time.
+    pub own_elapsed: Duration,
+    /// Whether both policies committed identical tokens.
+    pub identical: bool,
+}
+
 impl Qwen38FlashNextMtpCodingCase {
     /// Whole-request generated-token rate.
     pub fn tokens_per_second(&self) -> f64 {
@@ -191,6 +210,8 @@ pub struct Qwen38FlashNextMtpGenerationQualification {
     pub acceptance: Qwen38FlashNextMtpAcceptance,
     /// Stage timings across every identity case.
     pub cost: Qwen38FlashNextMtpRoundCost,
+    /// IndexShare comparisons above the dense ceiling.
+    pub index_share: Vec<Qwen38FlashNextMtpIndexShareTrial>,
     /// Tokens compared across repeated speculative runs.
     pub replay_compared: usize,
     /// Tokens that changed across repeated speculative runs.
@@ -213,6 +234,17 @@ impl Qwen38FlashNextMtpGenerationQualification {
     /// Tokens compared across all identity cases.
     pub fn compared_tokens(&self) -> usize {
         self.cases.iter().map(|case| case.tokens).sum()
+    }
+
+    /// Cases whose request crosses into selected QSA.
+    pub fn selective_cases(&self) -> usize {
+        self.cases
+            .iter()
+            .filter(|case| {
+                case.prompt_tokens + case.requested_tokens.saturating_sub(1)
+                    > QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING
+            })
+            .count()
     }
 
     /// Aggregate target-only rate over the identity matrix.
@@ -260,18 +292,21 @@ pub fn qualify_qwen38_flash_next_mtp_generation(
     let started = Instant::now();
     let mut generator = Qwen38FlashNextMtpTextGenerator::from_snapshot(&context, snapshot)?;
     let load = started.elapsed();
-    if generator.context_capacity() != QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING {
+    let expected_capacity = physical_pages * ATTENTION_PAGE_SIZE;
+    if generator.context_capacity() != expected_capacity {
         return Err(mismatch(format!(
-            "MTP generation capacity is {}, expected the admitted dense ceiling {}",
+            "MTP generation capacity is {}, expected the funded {expected_capacity}",
             generator.context_capacity(),
-            QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING
         )));
     }
     let draft_stats = generator.program().load_stats();
     let draft_executables = generator.program().executables();
     let target_executables = generator.program().target().executables();
-    let expected_draft = QWEN38_FLASH_NEXT_MTP_ROUTES.len() + QWEN38_FLASH_NEXT_MTP_SEGMENTS + 1;
-    let expected_target = QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS * 16;
+    let expected_draft = QWEN38_FLASH_NEXT_MTP_ROUTES.len()
+        + QWEN38_FLASH_NEXT_MTP_ATTENTION_ROUTES.len()
+        + QWEN38_FLASH_NEXT_MTP_SEGMENTS;
+    let expected_target =
+        (QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS + QWEN38_FLASH_NEXT_ATTENTION_LAYERS) * 16;
     if draft_executables != expected_draft || target_executables != expected_target {
         return Err(mismatch(format!(
             "captured draft/target inventory is {draft_executables}/{target_executables}, expected \
@@ -299,17 +334,13 @@ pub fn qualify_qwen38_flash_next_mtp_generation(
             IDENTITY_TOKENS,
         )?);
     }
-    for visible in QWEN38_FLASH_NEXT_GOLDEN_BOUNDARIES
-        .into_iter()
-        .filter(|visible| *visible <= QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING)
-    {
+    for visible in QWEN38_FLASH_NEXT_GOLDEN_BOUNDARIES {
         let capture = load_qwen38_flash_next_golden_boundary(&golden, visible)?;
-        let budget = dense_budget(capture.prompt_ids.len(), BOUNDARY_TOKENS);
         cases.push(run_identity_case(
             &mut generator,
             format!("boundary-{visible}"),
             &capture.prompt_ids,
-            budget,
+            BOUNDARY_TOKENS,
         )?);
     }
 
@@ -351,6 +382,7 @@ pub fn qualify_qwen38_flash_next_mtp_generation(
     let replay_moved = divergence_count(&replay_a.token_ids, &replay_b.token_ids);
     let warm = run_warm_comparison(&mut generator, &source.prompt_ids[..WARM_PROMPT_TOKENS])?;
     let coding = run_coding_cases(&mut generator)?;
+    let index_share = run_index_share_trials(&mut generator, &source.prompt_ids)?;
     device_benchmark::require_current_process_exclusive()?;
 
     Ok(Qwen38FlashNextMtpGenerationQualification {
@@ -366,6 +398,7 @@ pub fn qualify_qwen38_flash_next_mtp_generation(
         cases,
         acceptance,
         cost,
+        index_share,
         replay_compared,
         replay_moved,
         warm,
@@ -447,6 +480,38 @@ fn run_coding_cases(
     }
 
     Ok(cases)
+}
+
+fn run_index_share_trials(
+    generator: &mut Qwen38FlashNextMtpTextGenerator,
+    prompt_ids: &[u32],
+) -> QualResult<Vec<Qwen38FlashNextMtpIndexShareTrial>> {
+    let mut trials = Vec::new();
+    for prompt_tokens in [prompt_ids.len().min(2_048), prompt_ids.len()] {
+        if prompt_tokens <= QWEN38_FLASH_NEXT_DENSE_QSA_VISIBLE_CEILING {
+            continue;
+        }
+        let prompt = &prompt_ids[..prompt_tokens];
+        let warm_shared = generator.qualification_mtp_tokens_with_index_share(prompt, 32, true)?;
+        let warm_own = generator.qualification_mtp_tokens_with_index_share(prompt, 32, false)?;
+        require_equal(
+            "IndexShare warmup",
+            &warm_shared.token_ids,
+            &warm_own.token_ids,
+        )?;
+        let shared = generator.qualification_mtp_tokens_with_index_share(prompt, 32, true)?;
+        let own = generator.qualification_mtp_tokens_with_index_share(prompt, 32, false)?;
+        trials.push(Qwen38FlashNextMtpIndexShareTrial {
+            prompt_tokens,
+            shared: shared.acceptance,
+            own: own.acceptance,
+            shared_elapsed: shared.elapsed,
+            own_elapsed: own.elapsed,
+            identical: shared.token_ids == own.token_ids,
+        });
+    }
+
+    Ok(trials)
 }
 
 fn coding_request(content: &str) -> ChatGenerationRequest {
@@ -577,6 +642,18 @@ pub fn print_qwen38_flash_next_mtp_generation_report(
             case.acceptance.mean(),
         );
     }
+    println!("--- IndexShare ---");
+    for trial in &report.index_share {
+        println!(
+            "  prompt {:>4}  shared {:.3} in {:?}  own {:.3} in {:?}  identical {}",
+            trial.prompt_tokens,
+            trial.shared.mean(),
+            trial.shared_elapsed,
+            trial.own.mean(),
+            trial.own_elapsed,
+            trial.identical,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -599,8 +676,10 @@ mod tests {
             .count();
         assert_eq!(dense_boundaries, 5);
         assert_eq!(
-            QWEN38_FLASH_NEXT_GOLDEN_PROMPTS.len() + dense_boundaries + FRESH_PROMPTS.len(),
-            19
+            QWEN38_FLASH_NEXT_GOLDEN_PROMPTS.len()
+                + QWEN38_FLASH_NEXT_GOLDEN_BOUNDARIES.len()
+                + FRESH_PROMPTS.len(),
+            22
         );
         assert_eq!(
             [2_046, 2_047, 2_048, 2_049, 2_050].map(|prompt| dense_budget(prompt, BOUNDARY_TOKENS)),
@@ -618,10 +697,15 @@ mod tests {
         assert_eq!(CODING_TOKENS, 32);
         assert_eq!(CODING_CASES.len(), 3);
         assert_eq!(
-            QWEN38_FLASH_NEXT_MTP_ROUTES.len() + QWEN38_FLASH_NEXT_MTP_SEGMENTS + 1,
-            8
+            QWEN38_FLASH_NEXT_MTP_ROUTES.len()
+                + QWEN38_FLASH_NEXT_MTP_ATTENTION_ROUTES.len()
+                + QWEN38_FLASH_NEXT_MTP_SEGMENTS,
+            10
         );
-        assert_eq!(QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS * 16, 784);
+        assert_eq!(
+            (QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS + QWEN38_FLASH_NEXT_ATTENTION_LAYERS) * 16,
+            976
+        );
     }
 }
 
@@ -638,16 +722,17 @@ mod device_tests {
         let report = qualify_qwen38_flash_next_mtp_generation(Path::new(&root))?;
         print_qwen38_flash_next_mtp_generation_report(&report);
 
-        assert_eq!(report.identical_cases(), 19);
-        assert_eq!(report.cases.len(), 19);
+        assert_eq!(report.identical_cases(), 22);
+        assert_eq!(report.cases.len(), 22);
+        assert_eq!(report.selective_cases(), 8);
         assert!(report.compared_tokens() > 0);
         assert_eq!(report.replay_moved, 0);
         assert!(report.replay_compared > 0);
-        assert_eq!(report.draft_executables, 8);
-        assert_eq!(report.target_executables, 784);
+        assert_eq!(report.draft_executables, 10);
+        assert_eq!(report.target_executables, 976);
         assert_eq!(report.target_slots, 5_578);
         assert_eq!(report.draft_slots, 128);
-        assert_eq!(report.physical_pages, 3_291);
+        assert_eq!(report.physical_pages, 3_765);
         assert!(report.device_bytes > 0);
         assert!(report.acceptance.rounds() > 0);
         assert_eq!(
@@ -667,6 +752,8 @@ mod device_tests {
                 .iter()
                 .all(|case| case.tokens_per_second() > 0.0)
         );
+        assert!(!report.index_share.is_empty());
+        assert!(report.index_share.iter().all(|trial| trial.identical));
 
         Ok(())
     }
