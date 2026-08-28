@@ -1,5 +1,6 @@
 //! Diagnostic whole-request Qwen3.8 Flash-Next generation sweep.
 
+use crate::CellWallBudget;
 use crate::device_benchmark::{self, DeviceBenchmarkError};
 use crate::qwen38_flash_next_golden::{
     load_qwen38_flash_next_golden_boundary, load_qwen38_flash_next_golden_capture,
@@ -99,6 +100,15 @@ pub struct Qwen38FlashNextGenerationBenchmarkReport {
     pub clock_comparable: bool,
 }
 
+/// Diagnostic selection and wall controls for the generation sweep.
+#[derive(Clone, Debug, Default)]
+pub struct Qwen38FlashNextGenerationBenchmarkOptions {
+    /// Exact prompt lengths retained; all admitted lengths are the default.
+    pub prompt_tokens: Option<Vec<usize>>,
+    /// Optional wall limit for one prompt cell.
+    pub max_cell_wall: Option<Duration>,
+}
+
 /// Loads the model once and sweeps whole generation requests.
 pub fn benchmark_qwen38_flash_next_generation(
     root: &Path,
@@ -109,37 +119,79 @@ pub fn benchmark_qwen38_flash_next_generation(
     let mut generator = Qwen38FlashNextTextGenerator::from_snapshot_device_zero(snapshot)?;
     let load = started.elapsed();
 
+    benchmark_qwen38_flash_next_generation_loaded(
+        &mut generator,
+        load,
+        &Qwen38FlashNextGenerationBenchmarkOptions::default(),
+    )
+}
+
+/// Sweeps whole requests on an already-constructed generator.
+pub fn benchmark_qwen38_flash_next_generation_loaded(
+    generator: &mut Qwen38FlashNextTextGenerator,
+    load: Duration,
+    options: &Qwen38FlashNextGenerationBenchmarkOptions,
+) -> Result<Qwen38FlashNextGenerationBenchmarkReport, DeviceBenchmarkError> {
+    validate_prompt_selection(options.prompt_tokens.as_deref())?;
+
     let boundary =
         load_qwen38_flash_next_golden_boundary(&qwen38_flash_next_golden_directory(), 2_100)
             .map_err(|error| DeviceBenchmarkError::Precondition(error.to_string()))?;
     let loaded_prompt = repeated_prompt(&boundary.prompt_ids, LONG_PROMPTS[0]);
     for _ in 0..LONG_WARM_REQUESTS {
-        run_request(&mut generator, &loaded_prompt, LONG_GENERATED_TOKENS)?;
+        run_request(generator, &loaded_prompt, LONG_GENERATED_TOKENS)?;
     }
     device_benchmark::require_current_process_exclusive()?;
     device_benchmark::validate_loaded_host_clock_policy(
         "qwen3_8_flash_next/generation/request",
-        || run_request(&mut generator, &loaded_prompt, LONG_GENERATED_TOKENS).map(|_| ()),
+        || run_request(generator, &loaded_prompt, LONG_GENERATED_TOKENS).map(|_| ()),
     )?;
 
     let sampler = device_benchmark::TelemetrySampler::start();
     let mut routes = Vec::with_capacity(SWEPT_PROMPTS.len() + LONG_PROMPTS.len());
-    for prompt_tokens in SWEPT_PROMPTS {
-        let report = measure_prompt(&mut generator, prompt_tokens)?;
+    let mut previous_route = None;
+    for prompt_tokens in SWEPT_PROMPTS
+        .into_iter()
+        .filter(|prompt| prompt_selected(*prompt, options.prompt_tokens.as_deref()))
+    {
+        let estimate = scaled_request_estimate(previous_route, prompt_tokens);
+        let report = measure_prompt(generator, prompt_tokens, options.max_cell_wall, estimate)?;
         print_route(&report);
+        previous_route = Some((prompt_tokens, report.median_ttft));
         routes.push(report);
     }
-    println!("--- selected route ---");
-    for prompt_tokens in LONG_PROMPTS {
-        let report = measure_long_prompt(&mut generator, &boundary.prompt_ids, prompt_tokens)?;
+    for prompt_tokens in LONG_PROMPTS
+        .into_iter()
+        .filter(|prompt| prompt_selected(*prompt, options.prompt_tokens.as_deref()))
+    {
+        let estimate = scaled_request_estimate(previous_route, prompt_tokens);
+        let report = measure_long_prompt(
+            generator,
+            &boundary.prompt_ids,
+            prompt_tokens,
+            options.max_cell_wall,
+            estimate,
+        )?;
         print_route(&report);
+        previous_route = Some((prompt_tokens, report.median_ttft));
         routes.push(report);
     }
 
-    generator.set_streaming_route(Qwen38FlashNextStreamingRoute::Stalling);
-    let (stalling_traffic, stalling_traffic_tokens) = measure_real_traffic(&mut generator)?;
-    generator.set_streaming_route(Qwen38FlashNextStreamingRoute::Overlapped);
-    let (real_traffic, real_traffic_tokens) = measure_real_traffic(&mut generator)?;
+    let (stalling_traffic, stalling_traffic_tokens, real_traffic, real_traffic_tokens) =
+        if options.prompt_tokens.is_some() {
+            (
+                Qwen38FlashNextGenerationTelemetry::default(),
+                0,
+                Qwen38FlashNextGenerationTelemetry::default(),
+                0,
+            )
+        } else {
+            generator.set_streaming_route(Qwen38FlashNextStreamingRoute::Stalling);
+            let (stalling, stalling_tokens) = measure_real_traffic(generator)?;
+            generator.set_streaming_route(Qwen38FlashNextStreamingRoute::Overlapped);
+            let (overlap, overlap_tokens) = measure_real_traffic(generator)?;
+            (stalling, stalling_tokens, overlap, overlap_tokens)
+        };
     let clocks = sampler.finish()?;
     device_benchmark::require_current_process_exclusive()?;
 
@@ -170,6 +222,8 @@ pub fn benchmark_qwen38_flash_next_generation(
 fn measure_prompt(
     generator: &mut Qwen38FlashNextTextGenerator,
     prompt_tokens: usize,
+    max_cell_wall: Option<Duration>,
+    estimated_request: Option<Duration>,
 ) -> Result<Qwen38FlashNextGenerationRouteReport, DeviceBenchmarkError> {
     measure_requests(
         generator,
@@ -177,6 +231,8 @@ fn measure_prompt(
         WARM_REQUESTS,
         MEASURED_REQUESTS,
         GENERATED_TOKENS,
+        max_cell_wall,
+        estimated_request,
     )
 }
 
@@ -184,6 +240,8 @@ fn measure_long_prompt(
     generator: &mut Qwen38FlashNextTextGenerator,
     seed: &[u32],
     prompt_tokens: usize,
+    max_cell_wall: Option<Duration>,
+    estimated_request: Option<Duration>,
 ) -> Result<Qwen38FlashNextGenerationRouteReport, DeviceBenchmarkError> {
     measure_requests(
         generator,
@@ -191,6 +249,8 @@ fn measure_long_prompt(
         LONG_WARM_REQUESTS,
         LONG_MEASURED_REQUESTS,
         LONG_GENERATED_TOKENS,
+        max_cell_wall,
+        estimated_request,
     )
 }
 
@@ -200,15 +260,24 @@ fn measure_requests(
     warm_requests: usize,
     measured_requests: usize,
     generated_tokens: usize,
+    max_cell_wall: Option<Duration>,
+    mut estimated_request: Option<Duration>,
 ) -> Result<Qwen38FlashNextGenerationRouteReport, DeviceBenchmarkError> {
     let prompt_tokens = prompt.len();
+    let budget = CellWallBudget::new(format!("generation:T={prompt_tokens}"), max_cell_wall);
     for _ in 0..warm_requests {
+        budget.admit_next(estimated_request)?;
+        let started = std::time::Instant::now();
         run_request(generator, &prompt, generated_tokens)?;
+        estimated_request = Some(started.elapsed());
     }
 
     let mut samples = Vec::with_capacity(measured_requests);
     for _ in 0..measured_requests {
+        budget.admit_next(estimated_request)?;
+        let started = std::time::Instant::now();
         samples.push(run_request(generator, &prompt, generated_tokens)?);
+        estimated_request = Some(started.elapsed());
     }
 
     let mut times = samples
@@ -254,6 +323,38 @@ fn measure_requests(
         request_hit_rate: last.expert_hit_rate(),
         publication_stalls: last.publication_stalls(),
     })
+}
+
+fn prompt_selected(prompt: usize, selected: Option<&[usize]>) -> bool {
+    selected.is_none_or(|selected| selected.contains(&prompt))
+}
+
+fn validate_prompt_selection(selected: Option<&[usize]>) -> Result<(), DeviceBenchmarkError> {
+    let Some(selected) = selected else {
+        return Ok(());
+    };
+    if selected.is_empty() {
+        return Err(DeviceBenchmarkError::Precondition(
+            "generation cell selection is empty".to_string(),
+        ));
+    }
+    for &prompt in selected {
+        if !SWEPT_PROMPTS.contains(&prompt) && !LONG_PROMPTS.contains(&prompt) {
+            return Err(DeviceBenchmarkError::Precondition(format!(
+                "generation prompt T={prompt} is not admitted by this sweep"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn scaled_request_estimate(
+    previous: Option<(usize, Duration)>,
+    prompt_tokens: usize,
+) -> Option<Duration> {
+    let (previous_tokens, duration) = previous?;
+    duration.checked_mul(u32::try_from(prompt_tokens.div_ceil(previous_tokens)).ok()?)
 }
 
 fn run_request(
@@ -501,6 +602,10 @@ pub fn print_qwen38_flash_next_generation_benchmark(
     );
     for route in &report.routes {
         print_route(route);
+    }
+    if report.real_traffic_tokens == 0 {
+        println!("  real traffic omitted by the diagnostic cell filter");
+        return;
     }
     println!("  real traffic: eight unrelated captures from a reset cache");
     println!("    tokens generated       {}", report.real_traffic_tokens);

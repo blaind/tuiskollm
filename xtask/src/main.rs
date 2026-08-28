@@ -1483,6 +1483,7 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "bench-qwen38-flash-next-gdn-layer",
         bench_qwen38_flash_next_gdn_layer,
     ),
+    forwarded("bench-qwen38-flash-next", bench_qwen38_flash_next),
     forwarded(
         "bench-qwen38-flash-next-generation",
         bench_qwen38_flash_next_generation,
@@ -2011,7 +2012,8 @@ fn build_startup_benchmark(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_sm120_resources(root)
 }
 
-fn build_qwen38_flash_next_generation_benchmark(root: &Path) -> Result<(), Box<dyn Error>> {
+fn build_qwen38_flash_next_benchmark(root: &Path) -> Result<(), Box<dyn Error>> {
+    build_sm120(root)?;
     run_oxide(
         root,
         &[
@@ -2026,11 +2028,11 @@ fn build_qwen38_flash_next_generation_benchmark(root: &Path) -> Result<(), Box<d
             "--package",
             "tuisko-qual",
             "--bin",
-            "bench-qwen38-flash-next-generation",
+            "bench-qwen38-flash-next",
             "--release",
         ],
     )?;
-    gate_sm120_resources(root)
+    build_sm120(root)
 }
 
 fn build_qwen38_flash_next_prompt_prime_benchmark(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -2049,28 +2051,6 @@ fn build_qwen38_flash_next_prompt_prime_benchmark(root: &Path) -> Result<(), Box
             "tuisko-qual",
             "--bin",
             "bench-qwen38-flash-next-prompt-prime",
-            "--release",
-        ],
-    )?;
-    gate_sm120_resources(root)
-}
-
-fn build_qwen38_flash_next_resident_benchmark(root: &Path) -> Result<(), Box<dyn Error>> {
-    run_oxide(
-        root,
-        &[
-            "build",
-            "--arch",
-            "sm_120a",
-            "--cargo-target-dir",
-            CUDA_OXIDE_BUILD_TARGET,
-            "--device-codegen-crate",
-            SM120_DEVICE_CODEGEN_CRATES,
-            "--",
-            "--package",
-            "tuisko-qual",
-            "--bin",
-            "bench-qwen38-flash-next-resident",
             "--release",
         ],
     )?;
@@ -4733,22 +4713,96 @@ fn bench_resident_prefill(
     )
 }
 
+/// Runs requested Qwen3.8 Flash-Next sweeps from one resident model construction.
+fn bench_qwen38_flash_next(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let Some((snapshot, options)) = arguments.split_first() else {
+        return Err(
+            "usage: cargo run -p xtask -- bench-qwen38-flash-next SNAPSHOT [--sweeps resident,generation] [options]"
+                .into(),
+        );
+    };
+    require_performance_device_idle()?;
+    build_qwen38_flash_next_benchmark(root)?;
+    wait_for_device_idle()?;
+    let executable = root
+        .join(CUDA_OXIDE_BUILD_TARGET)
+        .join("release/bench-qwen38-flash-next");
+    if !executable.is_file() {
+        return Err(format!(
+            "Qwen3.8 Flash-Next benchmark executable is missing at {}",
+            executable.display()
+        )
+        .into());
+    }
+    let mut command = Command::new(executable);
+    command
+        .arg(snapshot)
+        .args(options)
+        .arg("--cuda-oxide-commit")
+        .arg(CUDA_OXIDE_REVISION);
+    append_benchmark_cache_source_identity(root, options, &mut command)?;
+    run_visible(&mut command)
+}
+
+fn append_benchmark_cache_source_identity(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+    command: &mut Command,
+) -> Result<(), Box<dyn Error>> {
+    if !arguments
+        .iter()
+        .any(|argument| argument == "--baseline-cache")
+    {
+        return Ok(());
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument == "--base-sha" || argument == "--device-input-sha256")
+    {
+        return Err("benchmark cache source stamps are supplied by xtask".into());
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let base_sha = String::from_utf8(output.stdout)?.trim().to_string();
+    let device_inputs = perf_artifact::device_input_sha256(root)?;
+    command
+        .arg("--base-sha")
+        .arg(base_sha)
+        .arg("--device-input-sha256")
+        .arg(device_inputs);
+
+    Ok(())
+}
+
 /// Times whole generation requests with production cache state.
 fn bench_qwen38_flash_next_generation(
     root: &Path,
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
-    let [snapshot] = arguments else {
+    let Some((snapshot, options)) = arguments.split_first() else {
         return Err(
-            "usage: cargo run -p xtask -- bench-qwen38-flash-next-generation SNAPSHOT".into(),
+            "usage: cargo run -p xtask -- bench-qwen38-flash-next-generation SNAPSHOT [options]"
+                .into(),
         );
     };
     require_performance_device_idle()?;
-    build_qwen38_flash_next_generation_benchmark(root)?;
+    build_qwen38_flash_next_benchmark(root)?;
     wait_for_device_idle()?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-qwen38-flash-next-generation");
+        .join("release/bench-qwen38-flash-next");
     if !executable.is_file() {
         return Err(format!(
             "Qwen3.8 Flash-Next generation benchmark executable is missing at {}",
@@ -4756,7 +4810,13 @@ fn bench_qwen38_flash_next_generation(
         )
         .into());
     }
-    run_visible(Command::new(executable).arg(snapshot))
+    run_visible(
+        Command::new(executable)
+            .arg(snapshot)
+            .args(["--sweeps", "generation"])
+            .args(options)
+            .args(["--cuda-oxide-commit", CUDA_OXIDE_REVISION]),
+    )
 }
 
 /// Times sequential and grouped admission on the production owner.
@@ -4796,11 +4856,11 @@ fn bench_qwen38_flash_next_resident_model(
         );
     };
     require_performance_device_idle()?;
-    build_qwen38_flash_next_resident_benchmark(root)?;
+    build_qwen38_flash_next_benchmark(root)?;
     wait_for_device_idle()?;
     let executable = root
         .join(CUDA_OXIDE_BUILD_TARGET)
-        .join("release/bench-qwen38-flash-next-resident");
+        .join("release/bench-qwen38-flash-next");
     if !executable.is_file() {
         return Err(format!(
             "Qwen3.8 Flash-Next resident benchmark executable is missing at {}",
@@ -4808,7 +4868,14 @@ fn bench_qwen38_flash_next_resident_model(
         )
         .into());
     }
-    run_visible(Command::new(executable).arg(snapshot).args(options))
+    let mut command = Command::new(executable);
+    command
+        .arg(snapshot)
+        .args(["--sweeps", "resident"])
+        .args(options)
+        .args(["--cuda-oxide-commit", CUDA_OXIDE_REVISION]);
+    append_benchmark_cache_source_identity(root, options, &mut command)?;
+    run_visible(&mut command)
 }
 
 fn bench_startup(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
@@ -15846,6 +15913,7 @@ mod tests {
         // comparator commands, transcribed from their handlers.
         const HOST_BENCH_SUBCOMMANDS: &[&str] = &[
             "bench-qwen38-flash-next-server",
+            "bench-qwen38-flash-next",
             "bench-qwen38-flash-next-generation",
             "bench-qwen38-flash-next-prompt-prime",
             "bench-qwen38-flash-next-resident-model",

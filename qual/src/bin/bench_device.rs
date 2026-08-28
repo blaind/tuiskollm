@@ -10,7 +10,9 @@ use tuisko_qual::benchmark_fp8_qkv;
 use tuisko_qual::benchmark_nvfp4_down;
 #[cfg(any(feature = "device", feature = "sm89", feature = "sm86"))]
 use tuisko_qual::benchmark_nvfp4_swiglu;
-use tuisko_qual::{DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_residual_norm};
+use tuisko_qual::{
+    AdaptiveRepeatOptions, DeviceBenchmarkOptions, DeviceBenchmarkReport, benchmark_residual_norm,
+};
 #[cfg(feature = "device")]
 use tuisko_qual::{
     benchmark_attention_output, benchmark_attention_qk_prepare, benchmark_dense_fp8_gdn_layer,
@@ -1039,6 +1041,12 @@ fn parse_options(
 ) -> Result<(DeviceBenchmarkOptions, Option<PathBuf>), Box<dyn Error>> {
     let mut json_path = None;
     while let Some(argument) = arguments.next() {
+        if argument == "--adaptive" {
+            options
+                .adaptive_repeats
+                .get_or_insert_with(AdaptiveRepeatOptions::default);
+            continue;
+        }
         let value = arguments
             .next()
             .ok_or_else(|| format!("`{argument}` requires a value"))?;
@@ -1048,6 +1056,25 @@ fn parse_options(
             "--warmup-launches" => options.warmup_launches = value.parse()?,
             "--batch" => options.batch_size = Some(value.parse()?),
             "--energy-seconds" => options.energy_seconds = Some(value.parse()?),
+            "--cells" => options.cells = Some(Box::leak(value.into_boxed_str())),
+            "--repeat-floor" => {
+                options
+                    .adaptive_repeats
+                    .get_or_insert_with(AdaptiveRepeatOptions::default)
+                    .minimum_samples = value.parse()?;
+            }
+            "--stability-window" => {
+                options
+                    .adaptive_repeats
+                    .get_or_insert_with(AdaptiveRepeatOptions::default)
+                    .stability_window = value.parse()?;
+            }
+            "--stability-percent" => {
+                options
+                    .adaptive_repeats
+                    .get_or_insert_with(AdaptiveRepeatOptions::default)
+                    .relative_spread = value.parse::<f64>()? / 100.0;
+            }
             "--json" => json_path = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown argument `{argument}`").into()),
         }
@@ -1072,6 +1099,20 @@ fn parse_options(
         .is_some_and(|seconds| !seconds.is_finite() || seconds < 2.0)
     {
         return Err("`--energy-seconds` must be finite and at least 2".into());
+    }
+    if options.cells.as_ref().is_some_and(|cells| cells.is_empty()) {
+        return Err("`--cells` must be nonempty".into());
+    }
+    if let Some(adaptive) = options.adaptive_repeats {
+        if adaptive.minimum_samples < 3 || adaptive.minimum_samples > options.samples {
+            return Err(format!("`--repeat-floor` must be in 3..={}", options.samples).into());
+        }
+        if adaptive.stability_window < 3 || adaptive.stability_window > adaptive.minimum_samples {
+            return Err("`--stability-window` must be in 3..=repeat floor".into());
+        }
+        if !adaptive.relative_spread.is_finite() || adaptive.relative_spread <= 0.0 {
+            return Err("`--stability-percent` must be finite and positive".into());
+        }
     }
 
     Ok((options, json_path))

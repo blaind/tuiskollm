@@ -19,6 +19,7 @@ mod attention_output_prefill;
 mod attention_qk_prepare;
 #[cfg(feature = "device")]
 mod attention_qk_prepare_benchmark;
+mod benchmark_runner;
 #[cfg(feature = "device")]
 mod bf16_paged_gqa_benchmark;
 #[cfg(feature = "device")]
@@ -403,6 +404,11 @@ pub use attention_qk_prepare_benchmark::{
     benchmark_qwen35_attention_qk_prepare, benchmark_qwen36_attention_qk_prepare,
     benchmark_qwen36_fp8_attention_qk_prepare,
 };
+pub use benchmark_runner::{
+    BaselineCacheLookup, BenchmarkCellSelector, BenchmarkFingerprint, BenchmarkSweepTiming,
+    CellWallBudget, benchmark_device_preflight, parse_benchmark_cells, read_baseline_cache,
+    run_benchmark_sweeps, write_baseline_cache,
+};
 #[cfg(feature = "device")]
 pub use bf16_paged_gqa_benchmark::{
     benchmark_mtp_bf16_paged_gqa, benchmark_qwen35_paged_gqa, benchmark_qwen36_fp8_paged_gqa,
@@ -421,11 +427,11 @@ pub use dense_fp8_mlp::{
 #[cfg(feature = "device")]
 pub use dense_fp8_mlp_benchmark::benchmark_dense_fp8_mlp;
 pub use device_benchmark::{
-    BenchmarkExecution, BenchmarkMeasurement, BenchmarkMemoryKind, BenchmarkMemoryMeasurement,
-    BenchmarkPhase, BenchmarkScope, BenchmarkWorkload, DeviceBenchmarkError, DeviceBenchmarkMetric,
-    DeviceBenchmarkOptions, DeviceBenchmarkReport, DeviceCacheRegime, DeviceEnergyMetric,
-    DeviceMemoryMetric, DeviceMemoryReport, DeviceMemorySnapshot, MemoryComparison,
-    PrefixCacheRegime,
+    AdaptiveRepeatOptions, BenchmarkExecution, BenchmarkMeasurement, BenchmarkMemoryKind,
+    BenchmarkMemoryMeasurement, BenchmarkPhase, BenchmarkScope, BenchmarkWorkload,
+    DeviceBenchmarkError, DeviceBenchmarkMetric, DeviceBenchmarkOptions, DeviceBenchmarkReport,
+    DeviceCacheRegime, DeviceEnergyMetric, DeviceMemoryMetric, DeviceMemoryReport,
+    DeviceMemorySnapshot, MemoryComparison, PrefixCacheRegime,
 };
 #[cfg(feature = "device")]
 pub use fp8_down::{Fp8DownQualification, Fp8DownQualificationError, qualify_fp8_down};
@@ -814,8 +820,9 @@ pub use qwen38_flash_next_generation::{
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_generation_benchmark::{
-    Qwen38FlashNextGenerationBenchmarkReport, Qwen38FlashNextGenerationRouteReport,
-    benchmark_qwen38_flash_next_generation, print_qwen38_flash_next_generation_benchmark,
+    Qwen38FlashNextGenerationBenchmarkOptions, Qwen38FlashNextGenerationBenchmarkReport,
+    Qwen38FlashNextGenerationRouteReport, benchmark_qwen38_flash_next_generation,
+    benchmark_qwen38_flash_next_generation_loaded, print_qwen38_flash_next_generation_benchmark,
 };
 pub use qwen38_flash_next_golden::{
     QWEN38_FLASH_NEXT_GOLDEN_BOUNDARIES, QWEN38_FLASH_NEXT_GOLDEN_DIRECTORY,
@@ -916,8 +923,10 @@ pub use qwen38_flash_next_resident_model::{
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_resident_model_benchmark::{
+    Qwen38FlashNextCachedResidentRoute, Qwen38FlashNextResidentBaselineCache,
     Qwen38FlashNextResidentBenchmarkReport, Qwen38FlashNextResidentRouteReport,
-    benchmark_qwen38_flash_next_resident_model, print_qwen38_flash_next_resident_benchmark,
+    benchmark_qwen38_flash_next_resident_model, benchmark_qwen38_flash_next_resident_model_loaded,
+    print_qwen38_flash_next_resident_benchmark,
 };
 #[cfg(feature = "device")]
 pub use qwen38_flash_next_resident_model_oracle::{
