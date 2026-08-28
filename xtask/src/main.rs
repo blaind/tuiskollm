@@ -37,6 +37,7 @@ const QWEN38_FLASH_NEXT_GDN_LAYER_TEST_FILTER: &str = "qwen38_flash_next_gdn_moe
 const QWEN38_FLASH_NEXT_QSA_LAYER_TEST_FILTER: &str = "qwen38_flash_next_qsa_moe_layer";
 const QWEN38_FLASH_NEXT_RESIDENT_MODEL_TEST_FILTER: &str = "qwen38_flash_next_resident_model";
 const QWEN38_FLASH_NEXT_GENERATION_TEST_FILTER: &str = "qwen38_flash_next_generation";
+const QWEN38_FLASH_NEXT_MTP_GENERATION_TEST_FILTER: &str = "qwen38_flash_next_mtp_generation";
 const QWEN38_FLASH_NEXT_MTP_ORACLE_TEST_FILTER: &str = "qwen38_flash_next_mtp_oracle";
 const QWEN35_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen35-residual-norm-sm120.txt";
@@ -1298,6 +1299,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
     forwarded(
         "qualify-qwen38-flash-next-mtp-oracle",
         qualify_qwen38_flash_next_mtp_oracle,
+    ),
+    forwarded(
+        "qualify-qwen38-flash-next-mtp-generation",
+        qualify_qwen38_flash_next_mtp_generation,
     ),
     forwarded(
         "qualify-qwen38-flash-next-generation",
@@ -3121,6 +3126,34 @@ fn qualify_qwen38_flash_next_mtp_oracle(
     gate_qwen38_flash_next_moe_router(root)?;
     gate_qwen38_flash_next_projections(root)?;
     gate_qwen38_flash_next_lm_head(root)
+}
+
+/// Runs the source-backed MTP identity and every composed artifact gate.
+fn qualify_qwen38_flash_next_mtp_generation(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    let [snapshot] = arguments else {
+        return Err(
+            "usage: cargo run -p xtask -- qualify-qwen38-flash-next-mtp-generation SNAPSHOT".into(),
+        );
+    };
+    run_qualification_test(
+        root,
+        QWEN38_FLASH_NEXT_MTP_GENERATION_TEST_FILTER,
+        QUALIFICATION_IGNORED_SERIAL_FLAGS,
+        Some(("TUISKO_QWEN38_FLASH_NEXT_SNAPSHOT", snapshot.as_os_str())),
+    )?;
+    gate_qwen38_flash_next_hyper_connection(root)?;
+    gate_qwen38_flash_next_gdn_prepare(root)?;
+    gate_qwen38_flash_next_gdn_recurrence(root)?;
+    gate_qwen38_flash_next_qsa_prepare(root)?;
+    gate_qwen38_flash_next_qsa_attention(root)?;
+    gate_qwen38_flash_next_moe_router(root)?;
+    gate_qwen38_flash_next_moe_experts(root)?;
+    gate_qwen38_flash_next_projections(root)?;
+    gate_qwen38_flash_next_lm_head(root)?;
+    gate_qwen38_flash_next_ple(root)
 }
 
 /// Runs the MoE expert oracle, accounting tests, and artifact gate.
@@ -14850,11 +14883,11 @@ mod tests {
         QWEN36_MTP_LAYER_TEST_FILTER, QWEN36_RESIDENT_MODEL_TEST_FILTER,
         QWEN38_FLASH_NEXT_ENGRAM_STAGING_TEST_FILTER, QWEN38_FLASH_NEXT_GDN_LAYER_TEST_FILTER,
         QWEN38_FLASH_NEXT_GENERATION_TEST_FILTER, QWEN38_FLASH_NEXT_LM_HEAD_TEST_FILTER,
-        QWEN38_FLASH_NEXT_MTP_ORACLE_TEST_FILTER, QWEN38_FLASH_NEXT_PLE_TEST_FILTER,
-        QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER, QWEN38_FLASH_NEXT_QSA_LAYER_TEST_FILTER,
-        QWEN38_FLASH_NEXT_RESIDENT_MODEL_TEST_FILTER, SM120_DEVICE_CODEGEN_CRATES,
-        SM120_RESOURCE_BASELINES, STREAMING_WEIGHT_POOL_TEST_FILTER, SUBCOMMANDS,
-        bench_device_baselines, bench_device_command, concatenated_resource_baselines,
+        QWEN38_FLASH_NEXT_MTP_GENERATION_TEST_FILTER, QWEN38_FLASH_NEXT_MTP_ORACLE_TEST_FILTER,
+        QWEN38_FLASH_NEXT_PLE_TEST_FILTER, QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER,
+        QWEN38_FLASH_NEXT_QSA_LAYER_TEST_FILTER, QWEN38_FLASH_NEXT_RESIDENT_MODEL_TEST_FILTER,
+        SM120_DEVICE_CODEGEN_CRATES, SM120_RESOURCE_BASELINES, STREAMING_WEIGHT_POOL_TEST_FILTER,
+        SUBCOMMANDS, bench_device_baselines, bench_device_command, concatenated_resource_baselines,
         contains_immediate_operand, device_is_idle, dispatch, dispatch_probe, names_opcode,
         parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
         parse_performance_device_sample, parse_performance_iteration, parse_resources,
@@ -14928,6 +14961,18 @@ mod tests {
             "qwen38_flash_next_engram_staging_benchmark::tests::qwen38_flash_next_engram_staging_suite_benchmark_times_the_source_backed_owner",
         ] {
             assert!(test.contains(QWEN38_FLASH_NEXT_ENGRAM_STAGING_TEST_FILTER));
+        }
+    }
+
+    #[test]
+    fn qwen38_flash_next_mtp_generation_filter_selects_identity_and_accounting() {
+        for test in [
+            "qwen38_flash_next_mtp_generation::tests::qwen38_flash_next_mtp_generation_list_identity_is_exact",
+            "qwen38_flash_next_mtp_generation::tests::qwen38_flash_next_mtp_generation_case_inventory_is_exact",
+            "qwen38_flash_next_mtp_generation::tests::qwen38_flash_next_mtp_generation_benchmark_accounting_is_pinned",
+            "qwen38_flash_next_mtp_generation::device_tests::qwen38_flash_next_mtp_generation_source_backed_identity",
+        ] {
+            assert!(test.contains(QWEN38_FLASH_NEXT_MTP_GENERATION_TEST_FILTER));
         }
     }
 
@@ -16166,6 +16211,12 @@ mod tests {
                 QWEN38_FLASH_NEXT_SNAPSHOT,
             ),
             (
+                "qualify-qwen38-flash-next-mtp-generation",
+                QWEN38_FLASH_NEXT_MTP_GENERATION_TEST_FILTER,
+                SERIAL,
+                QWEN38_FLASH_NEXT_SNAPSHOT,
+            ),
+            (
                 "qualify-gdn-recurrence",
                 "gdn_recurrence::tests::route_inventory_and_arena_accounting_are_exact",
                 EXACT_SERIAL,
@@ -16372,7 +16423,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 103);
+        assert_eq!(EXPECTED_QUALIFICATION_ROUTES.len(), 104);
 
         let snapshot = OsString::from("/snapshot");
         for &(command, filter, trailing, variable) in EXPECTED_QUALIFICATION_ROUTES {
