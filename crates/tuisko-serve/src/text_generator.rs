@@ -10,10 +10,11 @@
 //! target inside `tuisko-engine`.
 
 use tuisko_engine::{
-    ChatGenerationRequest, EngineError, GeneratedText, GenerationStep, Qwen35ResidentMtpBatchEvent,
-    Qwen35ResidentMtpBatchEvents, Qwen35ResidentMtpBatchGenerator, Qwen36ResidentBatchGenerator,
-    ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentCancellation,
-    ResidentMtpBatchEvent, ResidentMtpBatchEvents, ResidentMtpBatchGenerator, ResidentRequestId,
+    ChatGenerationRequest, EngineError, GeneratedText, GenerationStep, MAX_BATCH,
+    Qwen35ResidentMtpBatchEvent, Qwen35ResidentMtpBatchEvents, Qwen35ResidentMtpBatchGenerator,
+    Qwen36ResidentBatchGenerator, Qwen38FlashNextResidentGenerator, ResidentBatchAdmission,
+    ResidentBatchEvent, ResidentBatchEvents, ResidentCancellation, ResidentMtpBatchEvent,
+    ResidentMtpBatchEvents, ResidentMtpBatchGenerator, ResidentRequestId,
 };
 
 /// One request's committed steps and terminal output from a scheduler round.
@@ -62,6 +63,9 @@ pub(crate) trait TextGenerator {
 
     /// Active request identities in compact scheduler order.
     fn active_request_ids(&self) -> impl Iterator<Item = ResidentRequestId>;
+
+    /// Concurrent requests this target schedules on the device.
+    fn slot_capacity(&self) -> usize;
 }
 
 impl GenerationEvent for ResidentMtpBatchEvent {
@@ -114,6 +118,10 @@ impl TextGenerator for ResidentMtpBatchGenerator {
     fn active_request_ids(&self) -> impl Iterator<Item = ResidentRequestId> {
         ResidentMtpBatchGenerator::active_request_ids(self)
     }
+
+    fn slot_capacity(&self) -> usize {
+        MAX_BATCH
+    }
 }
 
 impl GenerationEvent for Qwen35ResidentMtpBatchEvent {
@@ -165,6 +173,10 @@ impl TextGenerator for Qwen35ResidentMtpBatchGenerator {
 
     fn active_request_ids(&self) -> impl Iterator<Item = ResidentRequestId> {
         Qwen35ResidentMtpBatchGenerator::active_request_ids(self)
+    }
+
+    fn slot_capacity(&self) -> usize {
+        MAX_BATCH
     }
 }
 
@@ -219,5 +231,44 @@ impl TextGenerator for Qwen36ResidentBatchGenerator {
 
     fn active_request_ids(&self) -> impl Iterator<Item = ResidentRequestId> {
         Qwen36ResidentBatchGenerator::active_request_ids(self)
+    }
+
+    fn slot_capacity(&self) -> usize {
+        MAX_BATCH
+    }
+}
+
+// This owner schedules one event per round until compact batching is admitted.
+impl TextGenerator for Qwen38FlashNextResidentGenerator {
+    type Events = ResidentBatchEvents;
+
+    fn admit(
+        &mut self,
+        request: &ChatGenerationRequest,
+    ) -> Result<ResidentBatchAdmission, EngineError> {
+        Qwen38FlashNextResidentGenerator::admit(self, request)
+    }
+
+    fn step(&mut self) -> Result<Self::Events, EngineError> {
+        Qwen38FlashNextResidentGenerator::step(self)
+    }
+
+    fn cancel(
+        &mut self,
+        request_id: ResidentRequestId,
+    ) -> Result<ResidentCancellation, EngineError> {
+        Qwen38FlashNextResidentGenerator::cancel(self, request_id)
+    }
+
+    fn active_requests(&self) -> usize {
+        Qwen38FlashNextResidentGenerator::active_requests(self)
+    }
+
+    fn active_request_ids(&self) -> impl Iterator<Item = ResidentRequestId> {
+        Qwen38FlashNextResidentGenerator::active_request_ids(self)
+    }
+
+    fn slot_capacity(&self) -> usize {
+        Qwen38FlashNextResidentGenerator::slot_capacity(self)
     }
 }

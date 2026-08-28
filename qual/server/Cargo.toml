@@ -20,3 +20,7 @@ workspace = true
 [[bin]]
 name = "bench-server"
 path = "src/bin/bench_server.rs"
+
+[[bin]]
+name = "qwen38-flash-next-server-qual"
+path = "src/bin/qwen38_flash_next_server_qual.rs"

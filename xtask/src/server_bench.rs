@@ -1,5 +1,6 @@
 //! Clock-authoritative production server timing and energy envelope.
 
+use super::server_qual::{MODEL, ROUTE};
 use super::{parse_compute_pids, run_visible, server_performance, server_qual};
 use serde::Serialize;
 use serde_json::Value;
@@ -29,8 +30,13 @@ pub(super) fn run(root: &Path, arguments: &[OsString]) -> Result<(), Box<dyn Err
     if options.baseline_action == Some(BaselineAction::Check) {
         server_performance::preflight(&baseline)?;
     }
-    let (tools, mut server) =
-        server_qual::start(root, &options.snapshot, "server performance setup")?;
+    let (tools, mut server) = server_qual::start(
+        root,
+        &options.snapshot,
+        MODEL,
+        ROUTE,
+        "server performance setup",
+    )?;
     let result = run_authority(root, &options, &tools, &server);
     let stop = server.stop_and_wait();
     result?;

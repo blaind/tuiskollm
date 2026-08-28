@@ -4,6 +4,7 @@ mod gpu_target;
 mod perf_artifact;
 mod perf_iteration;
 mod performance;
+mod qwen38_flash_next_server_qual;
 mod remote;
 mod server_bench;
 mod server_performance;
@@ -1182,6 +1183,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
     ),
     forwarded("qualify-qwen36-generation", qualify_qwen36_generation),
     forwarded("qualify-qwen36-server", qualify_qwen36_server),
+    forwarded(
+        "qualify-qwen38-flash-next-server",
+        qwen38_flash_next_server_qual::run,
+    ),
     forwarded("qualify-qwen35-server", qualify_qwen35_server),
     forwarded(
         "qualify-qwen35-resident-model",
@@ -1359,6 +1364,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
     forwarded("qualify-text-endpoint", qualify_text_endpoint),
     forwarded("bench-startup", bench_startup),
     forwarded("bench-server", server_bench::run),
+    forwarded(
+        "bench-qwen38-flash-next-server",
+        qwen38_flash_next_server_qual::bench,
+    ),
     forwarded(
         "bench-qwen38-flash-next-hyper-connection",
         bench_qwen38_flash_next_hyper_connection,
@@ -15559,6 +15568,7 @@ mod tests {
         // the startup and server harnesses and the `PerformanceSuite`
         // comparator commands, transcribed from their handlers.
         const HOST_BENCH_SUBCOMMANDS: &[&str] = &[
+            "bench-qwen38-flash-next-server",
             "bench-qwen38-flash-next-generation",
             "bench-qwen38-flash-next-resident-model",
             "bench-startup",

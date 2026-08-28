@@ -6,7 +6,10 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
-use tuisko_provision::{ProvisionedModel, Provisioning, ProvisioningProgress, ProvisioningStage};
+use tuisko_model::{Arch, Qwen38FlashNext};
+use tuisko_provision::{
+    ProvisionedModel, Provisioning, ProvisioningProgress, ProvisioningStage, SnapshotResolution,
+};
 use tuisko_serve::{ServerConfig, ServerModel};
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8000";
@@ -33,7 +36,7 @@ struct ServeArgs {
     /// Exact Hugging Face model ID.
     #[arg(
         value_name = "MODEL",
-        long_help = "Exact Hugging Face model ID.\n\nSupported models:\n  unsloth/Qwen3.8-27B-NVFP4\n  AxionML/Qwen3.5-9B-NVFP4\n  nvidia/Qwen3.6-35B-A3B-NVFP4"
+        long_help = "Exact Hugging Face model ID.\n\nSupported models:\n  unsloth/Qwen3.8-27B-NVFP4\n  AxionML/Qwen3.5-9B-NVFP4\n  nvidia/Qwen3.6-35B-A3B-NVFP4\n  RadixArk/Qwen3.8-Flash-Next-NVFP4"
     )]
     model: ServerModel,
     /// Existing admitted snapshot; overrides automatic Hugging Face resolution.
@@ -72,17 +75,22 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     let resolution = {
         let mut stdout = stdout.lock();
         let mut display = ProvisioningDisplay::new(interactive, color);
-        let model = match args.model {
-            ServerModel::Qwen38 => ProvisionedModel::Qwen38,
-            ServerModel::Qwen35 => ProvisionedModel::Qwen35,
-            ServerModel::Qwen36 => ProvisionedModel::Qwen36,
+        let resolution = match args.model {
+            ServerModel::Qwen38FlashNext => resolve_qwen38_flash_next_snapshot(args.snapshot),
+            ServerModel::Qwen38 | ServerModel::Qwen35 | ServerModel::Qwen36 => {
+                let model = match args.model {
+                    ServerModel::Qwen38 => ProvisionedModel::Qwen38,
+                    ServerModel::Qwen35 => ProvisionedModel::Qwen35,
+                    ServerModel::Qwen36 => ProvisionedModel::Qwen36,
+                    ServerModel::Qwen38FlashNext => unreachable!(),
+                };
+                tuisko_provision::resolve_snapshot_with_progress(model, args.snapshot, |progress| {
+                    display
+                        .update(&mut stdout, progress)
+                        .map_err(|error| format!("writing provisioning progress: {error}"))
+                })
+            }
         };
-        let resolution =
-            tuisko_provision::resolve_snapshot_with_progress(model, args.snapshot, |progress| {
-                display
-                    .update(&mut stdout, progress)
-                    .map_err(|error| format!("writing provisioning progress: {error}"))
-            });
         display
             .finish(&mut stdout)
             .map_err(|error| format!("finishing provisioning progress: {error}"))?;
@@ -103,6 +111,33 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         address: args.address,
     })
     .map_err(|error| error.to_string())
+}
+
+fn resolve_qwen38_flash_next_snapshot(
+    snapshot: Option<PathBuf>,
+) -> Result<SnapshotResolution, String> {
+    let path = snapshot.ok_or_else(|| {
+        format!(
+            "{} requires --snapshot at pinned revision {}",
+            Qwen38FlashNext::MODEL_ID,
+            Qwen38FlashNext::REVISION
+        )
+    })?;
+    if !path.is_dir() {
+        return Err(format!("snapshot `{}` is not a directory", path.display()));
+    }
+    let revision = path.file_name().and_then(|name| name.to_str());
+    if revision != Some(Qwen38FlashNext::REVISION) {
+        return Err(format!(
+            "snapshot revision {revision:?} is not {}",
+            Qwen38FlashNext::REVISION
+        ));
+    }
+
+    Ok(SnapshotResolution {
+        path,
+        provisioning: None,
+    })
 }
 
 struct ProvisioningDisplay {
@@ -259,7 +294,7 @@ fn parse_address(address: &str) -> Result<SocketAddr, String> {
 mod tests {
     use super::{
         Command, DEFAULT_ADDRESS, ServeArgs, parse_args, render_provisioning,
-        render_provisioning_progress,
+        render_provisioning_progress, resolve_qwen38_flash_next_snapshot,
     };
     use clap::error::ErrorKind;
     use std::net::SocketAddr;
@@ -271,6 +306,7 @@ mod tests {
     const QWEN38: &str = "unsloth/Qwen3.8-27B-NVFP4";
     const QWEN35: &str = "AxionML/Qwen3.5-9B-NVFP4";
     const QWEN36: &str = "nvidia/Qwen3.6-35B-A3B-NVFP4";
+    const QWEN38_FLASH_NEXT: &str = "RadixArk/Qwen3.8-Flash-Next-NVFP4";
 
     fn parse(args: &[&str]) -> Result<Command, clap::Error> {
         parse_args(args.iter().copied())
@@ -282,6 +318,7 @@ mod tests {
             (QWEN38, ServerModel::Qwen38),
             (QWEN35, ServerModel::Qwen35),
             (QWEN36, ServerModel::Qwen36),
+            (QWEN38_FLASH_NEXT, ServerModel::Qwen38FlashNext),
         ] {
             let command = parse(&["serve", model_id]).unwrap();
             assert_eq!(
@@ -328,6 +365,13 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn qwen38_flash_next_requires_an_explicit_pinned_snapshot() {
+        let error = resolve_qwen38_flash_next_snapshot(None).err().unwrap();
+        assert!(error.contains(QWEN38_FLASH_NEXT));
+        assert!(error.contains("--snapshot"));
     }
 
     #[test]
@@ -395,7 +439,7 @@ mod tests {
                 .to_string()
                 .contains("Usage: tuiskollm serve [OPTIONS] <MODEL>")
         );
-        for model in [QWEN38, QWEN35, "nvidia/Qwen3.6-35B-A3B-NVFP4"] {
+        for model in [QWEN38, QWEN35, QWEN36, QWEN38_FLASH_NEXT] {
             assert!(serve_help.to_string().contains(model));
         }
         assert_eq!(

@@ -4,6 +4,7 @@
 //! routes, and each layer reads its 512-entry view of the global streaming slot table.
 
 use crate::common::math::product;
+use crate::common::progress::ResidentLoadProgress;
 use crate::common::streaming::{
     StreamingMappedPrimary, StreamingPrimarySource, StreamingRound, StreamingWeightPool,
 };
@@ -27,7 +28,7 @@ use crate::qwen38_flash_next::slot_lifecycle::{
     Qwen38FlashNextSlotPool, Qwen38FlashNextSlotRelease, Qwen38FlashNextSlotState,
 };
 use crate::qwen38_flash_next::text_generation::Qwen38FlashNextGenerationTelemetry;
-use crate::{EngineError, EngineResult, MAX_BATCH};
+use crate::{EngineError, EngineResult, LayerMemoryLayout, MAX_BATCH};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tuisko_gpu::{
@@ -300,7 +301,7 @@ pub struct Qwen38FlashNextResidentLoadStats {
 }
 
 impl Qwen38FlashNextResidentLoadStats {
-    /// Wall time the backbone weight sweep took.
+    /// Wall time for resident uploads and expert staging together.
     pub const fn weight_upload(self) -> Duration {
         self.weight_upload
     }
@@ -549,6 +550,15 @@ impl Qwen38FlashNextResidentModel {
         context: &Arc<CudaContext>,
         snapshot: Arc<CheckpointSnapshot<Qwen38FlashNext>>,
     ) -> EngineResult<Self> {
+        Self::from_snapshot_with_progress(context, snapshot, None)
+    }
+
+    /// Loads the resident program while reporting source-backed upload progress.
+    pub fn from_snapshot_with_progress(
+        context: &Arc<CudaContext>,
+        snapshot: Arc<CheckpointSnapshot<Qwen38FlashNext>>,
+        progress: Option<&ResidentLoadProgress>,
+    ) -> EngineResult<Self> {
         let layout = Qwen38FlashNextResidentLayout::build()?;
         let stream = context.new_stream().map_err(GpuError::from)?;
 
@@ -607,7 +617,7 @@ impl Qwen38FlashNextResidentModel {
             engram,
             lm_head,
         )?;
-        model.upload(&stream)?;
+        model.upload(&stream, progress)?;
         model.capture(&stream)?;
 
         Ok(model)
@@ -1208,11 +1218,19 @@ impl Qwen38FlashNextResidentModel {
     }
 
     /// Sweeps every backbone weight into the resident arena, then stages every expert.
-    fn upload(&mut self, stream: &CudaStream) -> EngineResult<()> {
+    fn upload(
+        &mut self,
+        stream: &CudaStream,
+        progress: Option<&ResidentLoadProgress>,
+    ) -> EngineResult<()> {
         let started = Instant::now();
         let snapshot = Arc::clone(&self.snapshot);
         let regions = self.layout.layers().clone();
         let mut staged_bytes = 0usize;
+        let mut staged = Duration::ZERO;
+        if let Some(progress) = progress {
+            progress.begin_upload(self.layout.resident_weight_bytes());
+        }
 
         for (layer, plan) in regions.iter().enumerate() {
             let hyper = Qwen38FlashNextLayerHyperConnections::bind(snapshot.as_ref(), layer)?;
@@ -1227,7 +1245,9 @@ impl Qwen38FlashNextResidentModel {
                 &moe,
             )?;
             // Reuse this materialization because it swizzles 157 MB of scales per layer.
+            let staging = Instant::now();
             staged_bytes += self.stage_layer_experts(layer, &moe)?;
+            staged += staging.elapsed();
 
             match plan.block {
                 Qwen38FlashNextBlockWeightRegions::Gdn(regions) => {
@@ -1346,6 +1366,9 @@ impl Qwen38FlashNextResidentModel {
                 )?;
             }
             stream.synchronize().map_err(GpuError::from)?;
+            if let Some(progress) = progress {
+                progress.submit(self.layout.layer_weight_bytes(layer)?)?;
+            }
         }
 
         let endpoint = Qwen38FlashNextTextEndpointBindings::bind(snapshot.as_ref())?;
@@ -1370,6 +1393,10 @@ impl Qwen38FlashNextResidentModel {
             regions.lm_head,
             &endpoint.lm_head.words().collect::<Vec<_>>(),
         )?;
+        if let Some(progress) = progress {
+            progress.submit(self.layout.endpoint_weight_bytes()?)?;
+            progress.finish_upload()?;
+        }
 
         // Reservations populate the initially unmapped block table.
         let table = vec![
@@ -1385,6 +1412,7 @@ impl Qwen38FlashNextResidentModel {
             ));
         }
         self.load_stats.weight_upload = started.elapsed();
+        self.load_stats.expert_stage = staged;
         self.load_stats.staged_items = QWEN38_FLASH_NEXT_EXPERT_ITEM_COUNT;
         self.load_stats.staged_bytes = staged_bytes;
 

@@ -136,14 +136,17 @@ impl ChatCompletionRequest {
                 top_p: 0.95,
                 top_k: 20,
             },
+            None,
         )
     }
 
+    /// Applies the process default reasoning effort only when the caller omitted one.
     pub(crate) fn prepare_for(
         self,
         default_seed: u64,
         served_model: &str,
         defaults: GenerationDefaults,
+        served_reasoning_effort: Option<&str>,
     ) -> Result<PreparedChatRequest, ChatRequestError> {
         if self.model != served_model {
             return Err(ChatRequestError::ModelNotFound {
@@ -222,11 +225,15 @@ impl ChatCompletionRequest {
             .unwrap_or(DEFAULT_MAX_NEW_TOKENS);
         let split_reasoning = self.chat_template_kwargs.enable_thinking.unwrap_or(true);
         let parse_tools = !tools.is_empty();
+        let reasoning_effort = self
+            .chat_template_kwargs
+            .reasoning_effort
+            .or_else(|| served_reasoning_effort.map(str::to_owned));
         let mut generation = ChatGenerationRequest::new(self.messages);
         generation.template = ChatTemplateOptions {
             enable_thinking: self.chat_template_kwargs.enable_thinking,
             preserve_thinking: self.chat_template_kwargs.preserve_thinking,
-            reasoning_effort: self.chat_template_kwargs.reasoning_effort,
+            reasoning_effort,
             tools,
         };
         let sampling = SamplingOptions {
@@ -561,6 +568,7 @@ mod tests {
                 top_p: 1.0,
                 top_k: 1,
             },
+            None,
         )
         .unwrap();
 
@@ -568,6 +576,39 @@ mod tests {
         assert_eq!(prepared.generation.sampling.top_p, 1.0);
         assert_eq!(prepared.generation.sampling.top_k, 1);
         assert_eq!(prepared.generation.sampling.seed, 37);
+        assert_eq!(prepared.generation.template.reasoning_effort, None);
+    }
+
+    #[test]
+    fn a_served_reasoning_effort_fills_a_bare_request_and_yields_to_the_caller() {
+        let defaults = GenerationDefaults {
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 20,
+        };
+        let bare = request(r#"{"model":"m","messages":[{"role":"user","content":"hello"}]}"#)
+            .prepare_for(1, "m", defaults, Some("medium"))
+            .unwrap();
+        assert_eq!(
+            bare.generation.template.reasoning_effort.as_deref(),
+            Some("medium")
+        );
+
+        let overridden = request(
+            r#"{"model":"m","messages":[{"role":"user","content":"hello"}],
+                "chat_template_kwargs":{"reasoning_effort":"low"}}"#,
+        )
+        .prepare_for(1, "m", defaults, Some("medium"))
+        .unwrap();
+        assert_eq!(
+            overridden.generation.template.reasoning_effort.as_deref(),
+            Some("low")
+        );
+
+        let unnamed = request(r#"{"model":"m","messages":[{"role":"user","content":"hello"}]}"#)
+            .prepare_for(1, "m", defaults, None)
+            .unwrap();
+        assert_eq!(unnamed.generation.template.reasoning_effort, None);
     }
 
     #[test]

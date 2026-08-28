@@ -6,7 +6,7 @@ use super::{
 };
 use serde_json::Value;
 use std::error::Error;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
-const ROUTE: &str = "mtp-draft-3";
+/// The Qwen3.8 target's generation route, which is the one `qualify-server` drives.
+pub(super) const ROUTE: &str = "mtp-draft-3";
+pub(super) const MODEL: &str = "unsloth/Qwen3.8-27B-NVFP4";
 
 pub(super) fn run(root: &Path, arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
     run_mode(root, arguments, false)
@@ -34,7 +36,7 @@ fn run_mode(root: &Path, arguments: &[OsString], long_context: bool) -> Result<(
         "qualify-server"
     };
     let snapshot = parse_snapshot(arguments, command)?;
-    let (tools, mut server) = start(root, snapshot, "server qualification setup")?;
+    let (tools, mut server) = start(root, snapshot, MODEL, ROUTE, "server qualification setup")?;
     let mut qualification = Command::new(tools.qualifier());
     qualification.arg(server.base_url()).current_dir(root);
     if long_context {
@@ -70,6 +72,7 @@ pub(super) fn parse_snapshot<'a>(
 pub(super) struct HostTools {
     qualifier: PathBuf,
     benchmark: PathBuf,
+    qwen38_flash_next_qualifier: PathBuf,
 }
 
 impl HostTools {
@@ -79,6 +82,10 @@ impl HostTools {
 
     pub(super) fn benchmark(&self) -> &Path {
         &self.benchmark
+    }
+
+    pub(super) fn qwen38_flash_next_qualifier(&self) -> &Path {
+        &self.qwen38_flash_next_qualifier
     }
 }
 
@@ -91,23 +98,25 @@ fn build_host_tools(root: &Path) -> Result<HostTools, Box<dyn Error>> {
     )?;
     let qualifier = root.join("target/release/tuisko-server-qual");
     let benchmark = root.join("target/release/bench-server");
-    if !qualifier.is_file() || !benchmark.is_file() {
-        return Err(format!(
-            "host build omitted server tools `{}` or `{}`",
-            qualifier.display(),
-            benchmark.display()
-        )
-        .into());
+    let qwen38_flash_next_qualifier = root.join("target/release/qwen38-flash-next-server-qual");
+    if let Some(missing) = [&qualifier, &benchmark, &qwen38_flash_next_qualifier]
+        .into_iter()
+        .find(|tool| !tool.is_file())
+    {
+        return Err(format!("host build omitted server tool `{}`", missing.display()).into());
     }
     Ok(HostTools {
         qualifier,
         benchmark,
+        qwen38_flash_next_qualifier,
     })
 }
 
 pub(super) fn start(
     root: &Path,
     snapshot: &Path,
+    model: &'static str,
+    route: &'static str,
     activity: &str,
 ) -> Result<(HostTools, ProductionServer), Box<dyn Error>> {
     require_device_idle(activity)?;
@@ -121,8 +130,10 @@ pub(super) fn start(
         root,
         &root.join(CUDA_OXIDE_BUILD_TARGET).join("release/tuiskollm"),
         snapshot,
+        model,
         address,
         log_path,
+        route,
     )?;
     if let Err(error) = server.wait_ready() {
         server.stop_and_wait()?;
@@ -143,6 +154,7 @@ pub(super) struct ProductionServer {
     executable: PathBuf,
     address: SocketAddr,
     log_path: PathBuf,
+    route: &'static str,
 }
 
 impl ProductionServer {
@@ -150,8 +162,10 @@ impl ProductionServer {
         root: &Path,
         executable: &Path,
         snapshot: &Path,
+        model: &'static str,
         address: SocketAddr,
         log_path: PathBuf,
+        route: &'static str,
     ) -> Result<Self, Box<dyn Error>> {
         fs::create_dir_all(
             log_path
@@ -162,7 +176,11 @@ impl ProductionServer {
         let stderr = stdout.try_clone()?;
         let child = Command::new(executable)
             .current_dir(root)
-            .args([OsStr::new("serve"), snapshot.as_os_str()])
+            .arg("serve")
+            .arg(model)
+            .arg("--snapshot")
+            .arg(snapshot)
+            .arg("--address")
             .arg(address.to_string())
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
@@ -174,6 +192,7 @@ impl ProductionServer {
             executable: executable.to_path_buf(),
             address,
             log_path,
+            route,
         })
     }
 
@@ -187,7 +206,7 @@ impl ProductionServer {
                 )
                 .into());
             }
-            if probe_health(self.address)? {
+            if probe_health(self.address, self.route)? {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -253,7 +272,7 @@ impl Drop for ProductionServer {
     }
 }
 
-fn probe_health(address: SocketAddr) -> Result<bool, Box<dyn Error>> {
+fn probe_health(address: SocketAddr, route: &str) -> Result<bool, Box<dyn Error>> {
     let mut stream = match TcpStream::connect_timeout(&address, PROBE_TIMEOUT) {
         Ok(stream) => stream,
         Err(error)
@@ -276,11 +295,11 @@ fn probe_health(address: SocketAddr) -> Result<bool, Box<dyn Error>> {
     )?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
-    validate_health_response(&response)?;
+    validate_health_response(&response, route)?;
     Ok(true)
 }
 
-fn validate_health_response(response: &[u8]) -> Result<(), Box<dyn Error>> {
+fn validate_health_response(response: &[u8], route: &str) -> Result<(), Box<dyn Error>> {
     let boundary = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -291,14 +310,14 @@ fn validate_health_response(response: &[u8]) -> Result<(), Box<dyn Error>> {
         return Err(format!("health probe returned `{status}`").into());
     }
     let body: Value = serde_json::from_slice(&response[boundary + 4..])?;
-    let expected = serde_json::json!({"status": "ok", "generation_route": ROUTE});
+    let expected = serde_json::json!({"status": "ok", "generation_route": route});
     if body != expected {
         return Err(format!("health probe returned {body}, expected {expected}").into());
     }
     Ok(())
 }
 
-fn validate_request_log(log: &str) -> Result<(), Box<dyn Error>> {
+pub(super) fn validate_request_log(log: &str) -> Result<(), Box<dyn Error>> {
     const REQUIRED: [&str; 10] = [
         " ms (+",
         "), prompt ",
@@ -332,19 +351,34 @@ mod tests {
     fn health_probe_requires_the_exact_ready_route() {
         validate_health_response(
             b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"generation_route\":\"mtp-draft-3\",\"status\":\"ok\"}",
+            "mtp-draft-3",
         )
         .unwrap();
         let error = validate_health_response(
             b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"generation_route\":\"target-only\",\"status\":\"ok\"}",
+            "mtp-draft-3",
         )
         .unwrap_err();
         assert!(error.to_string().contains("mtp-draft-3"));
+
+        validate_health_response(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"generation_route\":\"single-slot-b1-1\",\"status\":\"ok\"}",
+            "single-slot-b1-1",
+        )
+        .unwrap();
+        let crossed = validate_health_response(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"generation_route\":\"mtp-draft-3\",\"status\":\"ok\"}",
+            "single-slot-b1-1",
+        )
+        .unwrap_err();
+        assert!(crossed.to_string().contains("single-slot-b1-1"));
     }
 
     #[test]
     fn health_probe_rejects_non_success_status() {
         let error = validate_health_response(
             b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n",
+            "mtp-draft-3",
         )
         .unwrap_err();
         assert!(error.to_string().contains("503 Service Unavailable"));
