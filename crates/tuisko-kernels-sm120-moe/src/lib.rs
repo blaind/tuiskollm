@@ -14,8 +14,11 @@ pub use experts::Qwen36MoeExpertsOp;
 pub use qwen36_mtp_bf16_moe::Qwen36MtpBf16MoeOp;
 pub use qwen38_flash_next_experts::{
     QWEN38_FLASH_NEXT_ABSENT_SLOT, QWEN38_FLASH_NEXT_EXPERT_SLOT_BYTES,
-    Qwen38FlashNextExpertDispatch, Qwen38FlashNextMoeExpertsOp, Qwen38FlashNextSlotPlane,
-    qwen38_flash_next_expert_slot_plane,
+    QWEN38_FLASH_NEXT_MTP_DOWN_EXTENT_BYTES, QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES,
+    QWEN38_FLASH_NEXT_MTP_GATE_UP_EXTENT_BYTES, Qwen38FlashNextExpertDispatch,
+    Qwen38FlashNextMoeExpertsOp, Qwen38FlashNextMtpExpertDispatch, Qwen38FlashNextMtpSlotPlane,
+    Qwen38FlashNextSlotPlane, qwen38_flash_next_expert_slot_plane,
+    qwen38_flash_next_mtp_expert_slot_plane,
 };
 pub use qwen38_flash_next_router::Qwen38FlashNextMoeRouterOp;
 pub use router::Qwen36MoeRouterOp;

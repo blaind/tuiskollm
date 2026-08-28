@@ -89,7 +89,7 @@ mod tests {
         ("tuisko_kernels_sm120_mtp", 187),
         ("tuisko_kernels_sm120_hyper_connection", 60),
         ("tuisko_kernels_sm120_lm_head", 24),
-        ("tuisko_kernels_sm120_moe", 172),
+        ("tuisko_kernels_sm120_moe", 196),
         ("tuisko_kernels_sm120_engram", 66),
     ];
 

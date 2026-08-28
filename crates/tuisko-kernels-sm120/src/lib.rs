@@ -47,10 +47,13 @@ pub use tuisko_kernels_sm120_lm_head::{
     Qwen35Bf16LmHeadOp, Qwen36Nvfp4LmHeadOp, Qwen38FlashNextBf16LmHeadOp,
 };
 pub use tuisko_kernels_sm120_moe::{
-    QWEN38_FLASH_NEXT_ABSENT_SLOT, QWEN38_FLASH_NEXT_EXPERT_SLOT_BYTES, Qwen36MoeExpertsOp,
-    Qwen36MoeRouterOp, Qwen36MtpBf16MoeOp, Qwen38FlashNextExpertDispatch,
-    Qwen38FlashNextMoeExpertsOp, Qwen38FlashNextMoeRouterOp, Qwen38FlashNextSlotPlane,
-    qwen38_flash_next_expert_slot_plane,
+    QWEN38_FLASH_NEXT_ABSENT_SLOT, QWEN38_FLASH_NEXT_EXPERT_SLOT_BYTES,
+    QWEN38_FLASH_NEXT_MTP_DOWN_EXTENT_BYTES, QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES,
+    QWEN38_FLASH_NEXT_MTP_GATE_UP_EXTENT_BYTES, Qwen36MoeExpertsOp, Qwen36MoeRouterOp,
+    Qwen36MtpBf16MoeOp, Qwen38FlashNextExpertDispatch, Qwen38FlashNextMoeExpertsOp,
+    Qwen38FlashNextMoeRouterOp, Qwen38FlashNextMtpExpertDispatch, Qwen38FlashNextMtpSlotPlane,
+    Qwen38FlashNextSlotPlane, qwen38_flash_next_expert_slot_plane,
+    qwen38_flash_next_mtp_expert_slot_plane,
 };
 pub use tuisko_kernels_sm120_mtp::{
     MtpBf16AttentionOutputOp, MtpBf16FusionOp, MtpBf16MlpOp, MtpBf16PagedGqaOp, MtpBf16QkPrepareOp,

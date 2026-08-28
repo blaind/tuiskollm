@@ -16,6 +16,9 @@ use crate::qwen38_flash_next::resident_model_layout::{
 };
 use crate::{EngineError, EngineResult, MAX_BATCH, StreamingResidencyAccounting};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
+use tuisko_kernels_sm120::{
+    QWEN38_FLASH_NEXT_MTP_DOWN_EXTENT_BYTES, QWEN38_FLASH_NEXT_MTP_GATE_UP_EXTENT_BYTES,
+};
 use tuisko_model::{Arch, Qwen38FlashNext};
 
 type A = Qwen38FlashNext;
@@ -25,11 +28,7 @@ pub const QWEN38_FLASH_NEXT_MTP_EXPERT_ITEM_COUNT: usize = A::NUM_EXPERTS;
 
 /// Contiguous BF16 bytes one draft expert occupies.
 pub const QWEN38_FLASH_NEXT_MTP_EXPERT_EXTENT_BYTES: usize =
-    MTP_GATE_UP_EXTENT_BYTES + MTP_DOWN_EXTENT_BYTES;
-
-const MTP_GATE_UP_EXTENT_BYTES: usize =
-    2 * A::INTERMEDIATE * <A as Arch>::HIDDEN * size_of::<u16>();
-const MTP_DOWN_EXTENT_BYTES: usize = <A as Arch>::HIDDEN * A::INTERMEDIATE * size_of::<u16>();
+    QWEN38_FLASH_NEXT_MTP_GATE_UP_EXTENT_BYTES + QWEN38_FLASH_NEXT_MTP_DOWN_EXTENT_BYTES;
 
 /// Device slots the draft pool funds: the same 25 % posture the main pool runs at.
 pub const QWEN38_FLASH_NEXT_MTP_EXPERT_RESIDENT_SLOTS: usize = 128;
@@ -166,7 +165,7 @@ impl Qwen38FlashNextMtpLayout {
     pub fn plan(slot_count: usize, physical_pages: usize) -> EngineResult<Self> {
         require_geometry()?;
 
-        // BF16 experts have no secondary scale extent.
+        // The source tensors form separate mapped and staged extents in one slot image.
         let streaming = match QWEN38_FLASH_NEXT_PRIMARY_SOURCE {
             StreamingPrimarySource::Pinned => StreamingWeightLayout::build(
                 QWEN38_FLASH_NEXT_MTP_EXPERT_ITEM_COUNT,
@@ -176,8 +175,8 @@ impl Qwen38FlashNextMtpLayout {
             )?,
             StreamingPrimarySource::Mapped => StreamingWeightLayout::build_mapped_primary(
                 QWEN38_FLASH_NEXT_MTP_EXPERT_ITEM_COUNT,
-                MTP_GATE_UP_EXTENT_BYTES,
-                Some(MTP_DOWN_EXTENT_BYTES),
+                QWEN38_FLASH_NEXT_MTP_GATE_UP_EXTENT_BYTES,
+                Some(QWEN38_FLASH_NEXT_MTP_DOWN_EXTENT_BYTES),
                 slot_count,
                 QWEN38_FLASH_NEXT_MTP_BOUNCE_RING_SLOTS,
             )?,
@@ -576,6 +575,7 @@ fn require_geometry() -> EngineResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tuisko_kernels_sm120::QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES;
 
     #[test]
     fn the_draft_pool_streams_because_holding_it_costs_the_target_cache() {
@@ -583,8 +583,19 @@ mod tests {
         let pool = layout.streaming();
 
         assert_eq!(pool.item_count(), 512);
-        assert_eq!(pool.primary_extent_bytes(), 6_553_600);
-        assert_eq!(pool.secondary_extent_bytes(), 3_276_800);
+        assert_eq!(
+            pool.primary_extent_bytes(),
+            QWEN38_FLASH_NEXT_MTP_GATE_UP_EXTENT_BYTES
+        );
+        assert_eq!(
+            pool.secondary_extent_bytes(),
+            QWEN38_FLASH_NEXT_MTP_DOWN_EXTENT_BYTES
+        );
+        assert_eq!(
+            pool.primary_extent_bytes() + pool.secondary_extent_bytes(),
+            QWEN38_FLASH_NEXT_MTP_EXPERT_EXTENT_BYTES
+        );
+        assert_eq!(pool.stride_bytes(), QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES);
         assert_eq!(pool.slot_count(), 128);
         assert_eq!(pool.host_pool_bytes(), 1_677_721_600);
         assert_eq!(pool.host_mapped_bytes(), 3_355_443_200);

@@ -54,6 +54,22 @@ const DOWN_SCALE_BYTES: usize = HIDDEN * DOWN_GROUPS;
 /// Byte stride between two slots in the sealed pool.
 pub const QWEN38_FLASH_NEXT_EXPERT_SLOT_BYTES: usize = DOWN_SCALE_OFFSET + DOWN_SCALE_BYTES;
 
+// MTP uses separate expert-major BF16 gate/up and down tensors. Streaming joins
+// the mapped gate/up and staged down extents into one address-stable slot image.
+const MTP_GATE_UP_OFFSET: usize = 0;
+const MTP_GATE_UP_BYTES: usize = GATE_UP_ROWS * HIDDEN * size_of::<u16>();
+const MTP_DOWN_OFFSET: usize = MTP_GATE_UP_OFFSET + MTP_GATE_UP_BYTES;
+const MTP_DOWN_BYTES: usize = HIDDEN * INTERMEDIATE * size_of::<u16>();
+
+/// Bytes in one MTP expert's mapped gate/up extent.
+pub const QWEN38_FLASH_NEXT_MTP_GATE_UP_EXTENT_BYTES: usize = MTP_GATE_UP_BYTES;
+
+/// Bytes in one MTP expert's staged down extent.
+pub const QWEN38_FLASH_NEXT_MTP_DOWN_EXTENT_BYTES: usize = MTP_DOWN_BYTES;
+
+/// Byte stride between MTP expert slots.
+pub const QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES: usize = MTP_DOWN_OFFSET + MTP_DOWN_BYTES;
+
 /// Per-expert F32 globals: gate, up, and down `weight_scale_2`, in that order.
 const GLOBAL_SCALES_PER_EXPERT: usize = 3;
 
@@ -92,6 +108,11 @@ const _: () = assert!(GATE_UP_CODE_OFFSET + GATE_UP_CODE_BYTES == 2_457_600);
 const _: () = assert!(GATE_UP_SCALE_BYTES == 204_800);
 const _: () = assert!(DOWN_SCALE_BYTES == 102_400);
 const _: () = assert!(QWEN38_FLASH_NEXT_EXPERT_SLOT_BYTES == 2_764_800);
+const _: () = assert!(MTP_GATE_UP_BYTES == 6_553_600);
+const _: () = assert!(MTP_DOWN_BYTES == 3_276_800);
+const _: () = assert!(QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES == 9_830_400);
+const _: () =
+    assert!(QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES > 3 * QWEN38_FLASH_NEXT_EXPERT_SLOT_BYTES);
 const _: () = assert!(HIDDEN.is_multiple_of(GROUP_K));
 const _: () = assert!(INTERMEDIATE.is_multiple_of(GROUP_K));
 const _: () = assert!(INTERMEDIATE.is_multiple_of(GATE_UP_WARPS));
@@ -906,6 +927,261 @@ mod kernels {
             )
         }
     }
+
+    /// Resolves one MTP expert through its dedicated slot table and pool.
+    #[inline(always)]
+    unsafe fn mtp_slot_base(
+        expert: usize,
+        slot_table: *const u32,
+        slot_pool: *const u8,
+    ) -> *const u8 {
+        let slot = unsafe { *slot_table.add(expert) } as usize;
+
+        unsafe { slot_pool.add(slot * QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES) }
+    }
+
+    /// Runs one BF16 MTP gate/up row per warp.
+    #[inline(always)]
+    unsafe fn mtp_expert_gate_up<const TOKENS: usize>(
+        input: *const u32,
+        expert_indices: *const u16,
+        slot_table: *const u32,
+        slot_pool: *const u8,
+        intermediate_output: *mut u16,
+    ) {
+        static mut SHARED_INPUT: SharedArray<u32, GATE_UP_SHARED_U32, 16> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_index = tid >> 5;
+        let flat_row = thread::blockIdx_x() as usize * GATE_UP_WARPS + warp_index;
+        let slot = flat_row / INTERMEDIATE;
+        let row = flat_row - slot * INTERMEDIATE;
+        let token = slot / TOP_K;
+        let position = slot - token * TOP_K;
+        let expert = unsafe { *expert_indices.add(token * TOP_K + position) } as usize;
+        let input_row = unsafe { input.add(token * (HIDDEN / 2)) };
+        let shared_input = core::ptr::addr_of_mut!(SHARED_INPUT).cast::<u32>();
+        let mut word = tid;
+
+        while word < GATE_UP_SHARED_U32 {
+            unsafe { *shared_input.add(word) = *input_row.add(word) };
+            word += GATE_UP_THREADS as usize;
+        }
+        thread::sync_threads();
+
+        let base = unsafe { mtp_slot_base(expert, slot_table, slot_pool) };
+        let plane = unsafe { base.add(MTP_GATE_UP_OFFSET).cast::<u32>() };
+        let row_words = HIDDEN / 2;
+        let gate_row = unsafe { plane.add(row * row_words) };
+        let up_row = unsafe { plane.add((row + INTERMEDIATE) * row_words) };
+        let mut gate = 0.0f32;
+        let mut up = 0.0f32;
+        let mut word = lane;
+
+        while word < row_words {
+            let activation_bits = unsafe { *shared_input.add(word) };
+            let (activation_low, activation_high) = convert::cvt_f32x2_bf16x2(activation_bits);
+            let (gate_low, gate_high) = convert::cvt_f32x2_bf16x2(unsafe { *gate_row.add(word) });
+            let (up_low, up_high) = convert::cvt_f32x2_bf16x2(unsafe { *up_row.add(word) });
+            gate = float::fma_rn_f32(gate_low, activation_low, gate);
+            gate = float::fma_rn_f32(gate_high, activation_high, gate);
+            up = float::fma_rn_f32(up_low, activation_low, up);
+            up = float::fma_rn_f32(up_high, activation_high, up);
+            word += 32;
+        }
+
+        let gate = reduce_sum_lane_zero(gate);
+        let up = reduce_sum_lane_zero(up);
+        if lane == 0 {
+            unsafe {
+                *intermediate_output.add(slot * INTERMEDIATE + row) =
+                    tcgen05::f32_to_bf16_rne(silu(gate) * up);
+            }
+        }
+    }
+
+    /// Runs one MTP decode batch's routed gate/up projection.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen38_flash_next_mtp_expert_gate_up<const TOKENS: usize>(
+        input: *const u32,
+        expert_indices: *const u16,
+        slot_table: *const u32,
+        slot_pool: *const u8,
+        intermediate_output: *mut u16,
+    ) {
+        unsafe {
+            mtp_expert_gate_up::<TOKENS>(
+                input,
+                expert_indices,
+                slot_table,
+                slot_pool,
+                intermediate_output,
+            )
+        }
+    }
+
+    /// Runs one MTP prompt tile's routed gate/up projection.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen38_flash_next_mtp_expert_gate_up_prefill<const TOKENS: usize>(
+        input: *const u32,
+        expert_indices: *const u16,
+        slot_table: *const u32,
+        slot_pool: *const u8,
+        intermediate_output: *mut u16,
+    ) {
+        unsafe {
+            mtp_expert_gate_up::<TOKENS>(
+                input,
+                expert_indices,
+                slot_table,
+                slot_pool,
+                intermediate_output,
+            )
+        }
+    }
+
+    /// Runs two BF16 MTP down-projection rows per warp.
+    #[inline(always)]
+    unsafe fn mtp_expert_down<const TOKENS: usize>(
+        intermediate_input: *const u32,
+        expert_indices: *const u16,
+        slot_table: *const u32,
+        slot_pool: *const u8,
+        expert_output: *mut u16,
+    ) {
+        static mut SHARED_INPUT: SharedArray<u32, DOWN_SHARED_U32, 16> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid & 31;
+        let warp_index = tid >> 5;
+        let flat_pair =
+            thread::blockIdx_x() as usize * DOWN_ROWS_PER_CTA + DOWN_ROWS_PER_WARP * warp_index;
+        let slot = flat_pair / HIDDEN;
+        let first_row = flat_pair - slot * HIDDEN;
+        let second_row = first_row + 1;
+        let token = slot / TOP_K;
+        let position = slot - token * TOP_K;
+        let expert = unsafe { *expert_indices.add(token * TOP_K + position) } as usize;
+        let input_row = unsafe { intermediate_input.add(slot * (INTERMEDIATE / 2)) };
+        let shared_input = core::ptr::addr_of_mut!(SHARED_INPUT).cast::<u32>();
+
+        // A strided load covers the 320-word row with 256 threads.
+        let mut word = tid;
+        while word < DOWN_SHARED_U32 {
+            unsafe { *shared_input.add(word) = *input_row.add(word) };
+            word += DOWN_THREADS as usize;
+        }
+        thread::sync_threads();
+
+        let base = unsafe { mtp_slot_base(expert, slot_table, slot_pool) };
+        let plane = unsafe { base.add(MTP_DOWN_OFFSET).cast::<u32>() };
+        let row_words = INTERMEDIATE / 2;
+        let first_source = unsafe { plane.add(first_row * row_words) };
+        let second_source = unsafe { plane.add(second_row * row_words) };
+        let mut first = 0.0f32;
+        let mut second = 0.0f32;
+        let mut word = lane;
+
+        while word < row_words {
+            let activation_bits = unsafe { *shared_input.add(word) };
+            let (activation_low, activation_high) = convert::cvt_f32x2_bf16x2(activation_bits);
+            let (first_low, first_high) =
+                convert::cvt_f32x2_bf16x2(unsafe { *first_source.add(word) });
+            let (second_low, second_high) =
+                convert::cvt_f32x2_bf16x2(unsafe { *second_source.add(word) });
+            first = float::fma_rn_f32(first_low, activation_low, first);
+            first = float::fma_rn_f32(first_high, activation_high, first);
+            second = float::fma_rn_f32(second_low, activation_low, second);
+            second = float::fma_rn_f32(second_high, activation_high, second);
+            word += 32;
+        }
+
+        let first = reduce_sum_lane_zero(first);
+        let second = reduce_sum_lane_zero(second);
+        if lane == 0 {
+            unsafe {
+                *expert_output.add(slot * HIDDEN + first_row) = tcgen05::f32_to_bf16_rne(first);
+                *expert_output.add(slot * HIDDEN + second_row) = tcgen05::f32_to_bf16_rne(second);
+            }
+        }
+    }
+
+    /// Runs one MTP decode batch's routed down projection.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen38_flash_next_mtp_expert_down<const TOKENS: usize>(
+        intermediate_input: *const u32,
+        expert_indices: *const u16,
+        slot_table: *const u32,
+        slot_pool: *const u8,
+        expert_output: *mut u16,
+    ) {
+        unsafe {
+            mtp_expert_down::<TOKENS>(
+                intermediate_input,
+                expert_indices,
+                slot_table,
+                slot_pool,
+                expert_output,
+            )
+        }
+    }
+
+    /// Runs one MTP prompt tile's routed down projection.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen38_flash_next_mtp_expert_down_prefill<const TOKENS: usize>(
+        intermediate_input: *const u32,
+        expert_indices: *const u16,
+        slot_table: *const u32,
+        slot_pool: *const u8,
+        expert_output: *mut u16,
+    ) {
+        unsafe {
+            mtp_expert_down::<TOKENS>(
+                intermediate_input,
+                expert_indices,
+                slot_table,
+                slot_pool,
+                expert_output,
+            )
+        }
+    }
 }
 
 /// Geometry of one sealed Qwen3.8-Flash-Next expert slot pool, and its host gate.
@@ -1207,6 +1483,47 @@ impl<const TOKENS: usize> PreparedBatchRoute<TOKENS> {
             )
             .map_err(|source| GpuError::launch("launching the expert combine", source))
     }
+
+    /// Runs the shared expert and combine entries reused by MTP.
+    unsafe fn launch_draft_tail(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        dispatch: &Qwen38FlashNextMtpExpertDispatch,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_moe_shared_expert_gate_up::<TOKENS>(
+                stream,
+                &self.shared_gate_up,
+                dispatch.input.cast::<u32>(),
+                dispatch.shared_gate_weight.cast::<u32>(),
+                dispatch.shared_up_weight.cast::<u32>(),
+                dispatch.shared_gate_logit_weight.cast::<u32>(),
+                dispatch.shared_intermediate,
+                dispatch.shared_gate_logit,
+            )
+            .map_err(|source| GpuError::launch("launching the draft shared gate/up", source))?;
+        module
+            .qwen38_flash_next_moe_shared_expert_down::<TOKENS>(
+                stream,
+                &self.shared_down,
+                dispatch.shared_intermediate.cast_const().cast::<u32>(),
+                dispatch.shared_down_weight.cast::<u32>(),
+                dispatch.shared_output,
+            )
+            .map_err(|source| GpuError::launch("launching the draft shared down", source))?;
+        module
+            .qwen38_flash_next_moe_expert_combine::<TOKENS>(
+                stream,
+                &self.combine,
+                dispatch.routed_output.cast_const(),
+                dispatch.routing_weights,
+                dispatch.shared_output.cast_const(),
+                dispatch.shared_gate_logit.cast_const(),
+                dispatch.output,
+            )
+            .map_err(|source| GpuError::launch("launching the draft expert combine", source))
+    }
 }
 
 impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
@@ -1322,11 +1639,228 @@ impl<const TOKENS: usize> PreparedPrefillRoute<TOKENS> {
             )
             .map_err(|source| GpuError::launch("launching the prompt expert combine", source))
     }
+
+    /// The prompt-tile twin of [`PreparedBatchRoute::launch_draft_tail`].
+    unsafe fn launch_draft_tail(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        dispatch: &Qwen38FlashNextMtpExpertDispatch,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_moe_shared_expert_gate_up_prefill::<TOKENS>(
+                stream,
+                &self.shared_gate_up,
+                dispatch.input.cast::<u32>(),
+                dispatch.shared_gate_weight.cast::<u32>(),
+                dispatch.shared_up_weight.cast::<u32>(),
+                dispatch.shared_gate_logit_weight.cast::<u32>(),
+                dispatch.shared_intermediate,
+                dispatch.shared_gate_logit,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching the draft prompt shared gate/up", source)
+            })?;
+        module
+            .qwen38_flash_next_moe_shared_expert_down_prefill::<TOKENS>(
+                stream,
+                &self.shared_down,
+                dispatch.shared_intermediate.cast_const().cast::<u32>(),
+                dispatch.shared_down_weight.cast::<u32>(),
+                dispatch.shared_output,
+            )
+            .map_err(|source| GpuError::launch("launching the draft prompt shared down", source))?;
+        module
+            .qwen38_flash_next_moe_expert_combine_prefill::<TOKENS>(
+                stream,
+                &self.combine,
+                dispatch.routed_output.cast_const(),
+                dispatch.routing_weights,
+                dispatch.shared_output.cast_const(),
+                dispatch.shared_gate_logit.cast_const(),
+                dispatch.output,
+            )
+            .map_err(|source| GpuError::launch("launching the draft prompt combine", source))
+    }
+}
+
+/// Every device pointer one draft dispatch reads or writes.
+///
+/// MTP expert dispatch omits the target pool's ModelOpt scale plane.
+///
+/// # Safety
+///
+/// As [`Qwen38FlashNextExpertDispatch`], with a dedicated MTP pool and table.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen38FlashNextMtpExpertDispatch {
+    /// BF16 `[rows, 2_560]` residual-stream rows entering the block.
+    pub input: *const u16,
+    /// Ascending routed expert ids, BF16-paired with `routing_weights`.
+    pub expert_indices: *const u16,
+    /// Renormalized BF16 routing weights, ascending by expert index.
+    pub routing_weights: *const u16,
+    /// Device-visible expert id -> slot index table, 512 `u32` entries.
+    pub slot_table: *const u32,
+    /// Base of the draft pool's sealed, address-stable slot arena.
+    pub slot_pool: *const u8,
+    /// Resident BF16 shared `gate_proj` `[640, 2_560]`.
+    pub shared_gate_weight: *const u16,
+    /// Resident BF16 shared `up_proj` `[640, 2_560]`.
+    pub shared_up_weight: *const u16,
+    /// Resident BF16 shared `down_proj` `[2_560, 640]`.
+    pub shared_down_weight: *const u16,
+    /// Resident BF16 `shared_expert_gate` `[1, 2_560]`.
+    pub shared_gate_logit_weight: *const u16,
+    /// Scratch BF16 `[rows, 10, 640]` routed SwiGLU intermediates.
+    pub routed_intermediate: *mut u16,
+    /// Scratch BF16 `[rows, 10, 2_560]` per-expert outputs.
+    pub routed_output: *mut u16,
+    /// Scratch BF16 `[rows, 640]` shared SwiGLU intermediate.
+    pub shared_intermediate: *mut u16,
+    /// Scratch BF16 `[rows, 2_560]` shared expert output.
+    pub shared_output: *mut u16,
+    /// Scratch BF16 `[rows]` shared gate logits.
+    pub shared_gate_logit: *mut u16,
+    /// BF16 `[rows, 2_560]` block output.
+    pub output: *mut u16,
+}
+
+struct PreparedMtpBatchRoute<const TOKENS: usize> {
+    gate_up: PreparedLaunch<kernels::__qwen38_flash_next_mtp_expert_gate_up_CudaKernel<TOKENS>>,
+    down: PreparedLaunch<kernels::__qwen38_flash_next_mtp_expert_down_CudaKernel<TOKENS>>,
+}
+
+struct PreparedMtpPrefillRoute<const TOKENS: usize> {
+    gate_up:
+        PreparedLaunch<kernels::__qwen38_flash_next_mtp_expert_gate_up_prefill_CudaKernel<TOKENS>>,
+    down: PreparedLaunch<kernels::__qwen38_flash_next_mtp_expert_down_prefill_CudaKernel<TOKENS>>,
+}
+
+impl<const TOKENS: usize> PreparedMtpBatchRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !(1..=MAX_BATCH).contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.8 Flash-Next MTP expert decode row count {TOKENS} is not admitted"
+            )));
+        }
+        Ok(Self {
+            gate_up: module
+                .prepare_qwen38_flash_next_mtp_expert_gate_up::<TOKENS>(gate_up_config::<TOKENS>())
+                .map_err(|source| GpuError::launch("preparing the draft routed gate/up", source))?,
+            down: module
+                .prepare_qwen38_flash_next_mtp_expert_down::<TOKENS>(down_config::<TOKENS>())
+                .map_err(|source| GpuError::launch("preparing the draft routed down", source))?,
+        })
+    }
+
+    unsafe fn launch_gate_up(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        dispatch: &Qwen38FlashNextMtpExpertDispatch,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_mtp_expert_gate_up::<TOKENS>(
+                stream,
+                &self.gate_up,
+                dispatch.input.cast::<u32>(),
+                dispatch.expert_indices,
+                dispatch.slot_table,
+                dispatch.slot_pool,
+                dispatch.routed_intermediate,
+            )
+            .map_err(|source| GpuError::launch("launching the draft routed gate/up", source))
+    }
+
+    unsafe fn launch_down(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        dispatch: &Qwen38FlashNextMtpExpertDispatch,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_mtp_expert_down::<TOKENS>(
+                stream,
+                &self.down,
+                dispatch.routed_intermediate.cast_const().cast::<u32>(),
+                dispatch.expert_indices,
+                dispatch.slot_table,
+                dispatch.slot_pool,
+                dispatch.routed_output,
+            )
+            .map_err(|source| GpuError::launch("launching the draft routed down", source))
+    }
+}
+
+impl<const TOKENS: usize> PreparedMtpPrefillRoute<TOKENS> {
+    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+        if !PREFILL_ROWS.contains(&TOKENS) {
+            return Err(GpuError::invalid_launch(format!(
+                "Qwen3.8 Flash-Next MTP expert prefill row count {TOKENS} is not admitted"
+            )));
+        }
+        Ok(Self {
+            gate_up: module
+                .prepare_qwen38_flash_next_mtp_expert_gate_up_prefill::<TOKENS>(gate_up_config::<
+                    TOKENS,
+                >())
+                .map_err(|source| {
+                    GpuError::launch("preparing the draft prompt routed gate/up", source)
+                })?,
+            down:
+                module
+                    .prepare_qwen38_flash_next_mtp_expert_down_prefill::<TOKENS>(down_config::<
+                        TOKENS,
+                    >(
+                    ))
+                    .map_err(|source| {
+                        GpuError::launch("preparing the draft prompt routed down", source)
+                    })?,
+        })
+    }
+
+    unsafe fn launch_gate_up(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        dispatch: &Qwen38FlashNextMtpExpertDispatch,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_mtp_expert_gate_up_prefill::<TOKENS>(
+                stream,
+                &self.gate_up,
+                dispatch.input.cast::<u32>(),
+                dispatch.expert_indices,
+                dispatch.slot_table,
+                dispatch.slot_pool,
+                dispatch.routed_intermediate,
+            )
+            .map_err(|source| GpuError::launch("launching the draft prompt gate/up", source))
+    }
+
+    unsafe fn launch_down(
+        &self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        dispatch: &Qwen38FlashNextMtpExpertDispatch,
+    ) -> GpuResult<()> {
+        module
+            .qwen38_flash_next_mtp_expert_down_prefill::<TOKENS>(
+                stream,
+                &self.down,
+                dispatch.routed_intermediate.cast_const().cast::<u32>(),
+                dispatch.expert_indices,
+                dispatch.slot_table,
+                dispatch.slot_pool,
+                dispatch.routed_output,
+            )
+            .map_err(|source| GpuError::launch("launching the draft prompt down", source))
+    }
 }
 
 /// PTX symbols retained for every exact Qwen3.8-Flash-Next expert route.
 pub(crate) fn qwen38_flash_next_moe_experts_ptx_names() -> Vec<&'static str> {
-    let mut names = Vec::with_capacity(5 * (MAX_BATCH + PREFILL_ROWS.len()));
+    let mut names = Vec::with_capacity(7 * (MAX_BATCH + PREFILL_ROWS.len()));
 
     macro_rules! push_decode {
         ($tokens:literal) => {
@@ -1339,6 +1873,10 @@ pub(crate) fn qwen38_flash_next_moe_experts_ptx_names() -> Vec<&'static str> {
             names.push(kernels::qwen38_flash_next_moe_expert_combine_ptx_name::<
                 $tokens,
             >());
+            names.push(kernels::qwen38_flash_next_mtp_expert_gate_up_ptx_name::<
+                $tokens,
+            >());
+            names.push(kernels::qwen38_flash_next_mtp_expert_down_ptx_name::<$tokens>());
         };
     }
     macro_rules! push_prefill {
@@ -1352,6 +1890,8 @@ pub(crate) fn qwen38_flash_next_moe_experts_ptx_names() -> Vec<&'static str> {
                 kernels::qwen38_flash_next_moe_shared_expert_down_prefill_ptx_name::<$tokens>(),
             );
             names.push(kernels::qwen38_flash_next_moe_expert_combine_prefill_ptx_name::<$tokens>());
+            names.push(kernels::qwen38_flash_next_mtp_expert_gate_up_prefill_ptx_name::<$tokens>());
+            names.push(kernels::qwen38_flash_next_mtp_expert_down_prefill_ptx_name::<$tokens>());
         };
     }
 
@@ -1405,10 +1945,46 @@ struct Qwen38FlashNextMoeExpertsRoutes {
     t1024: PreparedPrefillRoute<1024>,
 }
 
+#[derive(ExactRoutes)]
+#[exact_routes(
+    module(kernels::LoadedModule),
+    error(GpuError),
+    dispatch(dispatch_qwen38_flash_next_mtp_experts),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
+    inventory(false)
+)]
+struct Qwen38FlashNextMtpExpertsRoutes {
+    #[route(1)]
+    b1: PreparedMtpBatchRoute<1>,
+    #[route(2)]
+    b2: PreparedMtpBatchRoute<2>,
+    #[route(3)]
+    b3: PreparedMtpBatchRoute<3>,
+    #[route(4)]
+    b4: PreparedMtpBatchRoute<4>,
+    #[route(5)]
+    b5: PreparedMtpBatchRoute<5>,
+    #[route(6)]
+    b6: PreparedMtpBatchRoute<6>,
+    #[route(7)]
+    b7: PreparedMtpBatchRoute<7>,
+    #[route(8)]
+    b8: PreparedMtpBatchRoute<8>,
+    #[route(32)]
+    t32: PreparedMtpPrefillRoute<32>,
+    #[route(64)]
+    t64: PreparedMtpPrefillRoute<64>,
+    #[route(128)]
+    t128: PreparedMtpPrefillRoute<128>,
+    #[route(1024)]
+    t1024: PreparedMtpPrefillRoute<1024>,
+}
+
 /// Prepared exact-batch Qwen3.8-Flash-Next slot-indirected expert routes on SM120.
 pub struct Qwen38FlashNextMoeExpertsOp {
     module: kernels::LoadedModule,
     routes: Qwen38FlashNextMoeExpertsRoutes,
+    draft_routes: Qwen38FlashNextMtpExpertsRoutes,
 }
 
 impl Qwen38FlashNextMoeExpertsOp {
@@ -1421,6 +1997,7 @@ impl Qwen38FlashNextMoeExpertsOp {
 
         Ok(Self {
             routes: Qwen38FlashNextMoeExpertsRoutes::prepare(&module)?,
+            draft_routes: Qwen38FlashNextMtpExpertsRoutes::prepare(&module)?,
             module,
         })
     }
@@ -1449,16 +2026,87 @@ impl Qwen38FlashNextMoeExpertsOp {
             )))
         )
     }
+
+    /// Runs MTP routed experts, the shared expert, and their combine.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer in `dispatch` satisfies the contract on
+    /// [`Qwen38FlashNextMtpExpertDispatch`], with every routed expert resident.
+    pub unsafe fn launch_draft(
+        &self,
+        stream: &CudaStream,
+        rows: usize,
+        dispatch: &Qwen38FlashNextMtpExpertDispatch,
+    ) -> GpuResult<()> {
+        dispatch_qwen38_flash_next_mtp_experts!(
+            &self.draft_routes,
+            rows,
+            |draft_route| {
+                unsafe {
+                    draft_route.launch_gate_up(&self.module, stream, dispatch)?;
+                    draft_route.launch_down(&self.module, stream, dispatch)?;
+                }
+                dispatch_qwen38_flash_next_moe_experts!(
+                    &self.routes,
+                    rows,
+                    |tail_route| unsafe {
+                        tail_route.launch_draft_tail(&self.module, stream, dispatch)
+                    },
+                    else => unreachable!()
+                )
+            },
+            else => Err(GpuError::invalid_launch(format!(
+                "Qwen3.8 Flash-Next MTP expert row count {rows} is outside the admitted routes \
+                 1..={MAX_BATCH},32,64,128,1024"
+            )))
+        )
+    }
+}
+
+/// Describes the MTP expert pool at its dedicated stride.
+pub fn qwen38_flash_next_mtp_expert_slot_plane(slot_count: usize) -> Qwen38FlashNextMtpSlotPlane {
+    Qwen38FlashNextMtpSlotPlane { slot_count }
+}
+
+/// Geometry and host admission for the dedicated MTP expert pool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen38FlashNextMtpSlotPlane {
+    slot_count: usize,
+}
+
+impl Qwen38FlashNextMtpSlotPlane {
+    /// Slots this pool owns.
+    pub fn slot_count(self) -> usize {
+        self.slot_count
+    }
+
+    /// Bytes the sealed slot arena occupies, excluding the table.
+    pub fn slot_bytes(self) -> usize {
+        self.slot_count * QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES
+    }
+
+    /// Checks a published draft table is structurally well-formed.
+    pub fn validate_published_table(self, table: &[u32]) -> GpuResult<()> {
+        qwen38_flash_next_expert_slot_plane(self.slot_count).validate_published_table(table)
+    }
+
+    /// Checks every routed draft expert of one round has a resident slot.
+    pub fn validate_routed_presence(self, table: &[u32], routed: &[u16]) -> GpuResult<()> {
+        qwen38_flash_next_expert_slot_plane(self.slot_count).validate_routed_presence(table, routed)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         DOWN_CODE_OFFSET, DOWN_SCALE_BYTES, DOWN_SCALE_OFFSET, EXPERTS, GATE_UP_CODE_OFFSET,
-        GATE_UP_SCALE_BYTES, GATE_UP_SCALE_OFFSET, MAX_BATCH, PREFILL_ROWS,
-        QWEN38_FLASH_NEXT_ABSENT_SLOT, QWEN38_FLASH_NEXT_EXPERT_SLOT_BYTES,
-        Qwen38FlashNextMoeExpertsRoutes, qwen38_flash_next_expert_slot_plane,
-        qwen38_flash_next_moe_experts_ptx_names,
+        GATE_UP_SCALE_BYTES, GATE_UP_SCALE_OFFSET, MAX_BATCH, MTP_DOWN_OFFSET, MTP_GATE_UP_OFFSET,
+        PREFILL_ROWS, QWEN38_FLASH_NEXT_ABSENT_SLOT, QWEN38_FLASH_NEXT_EXPERT_SLOT_BYTES,
+        QWEN38_FLASH_NEXT_MTP_DOWN_EXTENT_BYTES, QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES,
+        QWEN38_FLASH_NEXT_MTP_GATE_UP_EXTENT_BYTES, Qwen38FlashNextMoeExpertsRoutes,
+        Qwen38FlashNextMtpExpertsRoutes, qwen38_flash_next_expert_slot_plane,
+        qwen38_flash_next_moe_experts_ptx_names, qwen38_flash_next_mtp_expert_slot_plane,
     };
     use std::collections::BTreeSet;
 
@@ -1473,9 +2121,29 @@ mod tests {
     }
 
     #[test]
+    fn the_mtp_slot_holds_the_fused_pair_at_its_own_stride() {
+        assert_eq!(MTP_GATE_UP_OFFSET, 0);
+        assert_eq!(QWEN38_FLASH_NEXT_MTP_GATE_UP_EXTENT_BYTES, 6_553_600);
+        assert_eq!(MTP_DOWN_OFFSET, 6_553_600);
+        assert_eq!(QWEN38_FLASH_NEXT_MTP_DOWN_EXTENT_BYTES, 3_276_800);
+        assert_eq!(QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES, 9_830_400);
+
+        assert_eq!(
+            QWEN38_FLASH_NEXT_MTP_GATE_UP_EXTENT_BYTES + QWEN38_FLASH_NEXT_MTP_DOWN_EXTENT_BYTES,
+            QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES
+        );
+        assert_eq!(
+            QWEN38_FLASH_NEXT_EXPERT_SLOT_BYTES - (GATE_UP_SCALE_BYTES + DOWN_SCALE_BYTES),
+            2_457_600
+        );
+        assert!(QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES.is_multiple_of(256));
+    }
+
+    #[test]
     fn geometry_and_inventory_are_exact() {
         let names = qwen38_flash_next_moe_experts_ptx_names();
-        assert_eq!(names.len(), 5 * (MAX_BATCH + PREFILL_ROWS.len()));
+        assert_eq!(names.len(), 7 * (MAX_BATCH + PREFILL_ROWS.len()));
+        assert_eq!(names.len(), 84);
         assert_eq!(
             names.iter().copied().collect::<BTreeSet<_>>().len(),
             names.len()
@@ -1483,10 +2151,31 @@ mod tests {
     }
 
     #[test]
-    fn row_table_covers_only_exact_decode_and_prefill_routes() {
+    fn the_mtp_pool_gate_refuses_what_the_target_pool_gate_refuses() {
+        let plane = qwen38_flash_next_mtp_expert_slot_plane(4);
+        let mut table = vec![QWEN38_FLASH_NEXT_ABSENT_SLOT; EXPERTS];
+        table[1] = 2;
+        table[6] = 2;
+
+        assert_eq!(plane.slot_count(), 4);
         assert_eq!(
-            Qwen38FlashNextMoeExpertsRoutes::admitted_rows(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024]
+            plane.slot_bytes(),
+            4 * QWEN38_FLASH_NEXT_MTP_EXPERT_SLOT_BYTES
+        );
+        assert!(plane.validate_published_table(&table).is_err());
+        table[6] = QWEN38_FLASH_NEXT_ABSENT_SLOT;
+        plane.validate_published_table(&table).unwrap();
+        assert!(plane.validate_routed_presence(&table, &[1, 6]).is_err());
+        plane.validate_routed_presence(&table, &[1]).unwrap();
+    }
+
+    #[test]
+    fn row_table_covers_only_exact_decode_and_prefill_routes() {
+        let expected = vec![1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
+        assert_eq!(Qwen38FlashNextMoeExpertsRoutes::admitted_rows(), expected);
+        assert_eq!(
+            Qwen38FlashNextMtpExpertsRoutes::admitted_rows(),
+            Qwen38FlashNextMoeExpertsRoutes::admitted_rows()
         );
     }
 
