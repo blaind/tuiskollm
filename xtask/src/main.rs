@@ -9151,7 +9151,8 @@ fn gate_qwen38_flash_next_qsa_selection(root: &Path) -> Result<(), Box<dyn Error
     let prepare_prefill = family("qwen38_flash_next_indexer_prepare_prefill_exact_TID_");
     let compress = family("qwen38_flash_next_indexer_block_compress_exact_TID_");
     let score = family("qwen38_flash_next_indexer_score_exact_TID_");
-    let select = family("qwen38_flash_next_indexer_select_exact_TID_");
+    let select_pass = family("qwen38_flash_next_indexer_select_pass_exact_TID_");
+    let select_expand = family("qwen38_flash_next_indexer_select_expand_exact_TID_");
     let attention = family("qwen38_flash_next_paged_gqa_selected_exact_TID_");
     let attention_prefill = family("qwen38_flash_next_paged_gqa_prefill_selected_exact_TID_");
     require_count("Qwen3.8-Flash-Next indexer prepare", prepare.len(), 8)?;
@@ -9166,7 +9167,16 @@ fn gate_qwen38_flash_next_qsa_selection(root: &Path) -> Result<(), Box<dyn Error
         12,
     )?;
     require_count("Qwen3.8-Flash-Next indexer scoring", score.len(), 10)?;
-    require_count("Qwen3.8-Flash-Next indexer selection", select.len(), 10)?;
+    require_count(
+        "Qwen3.8-Flash-Next indexer selection pass",
+        select_pass.len(),
+        10,
+    )?;
+    require_count(
+        "Qwen3.8-Flash-Next indexer selection expansion",
+        select_expand.len(),
+        10,
+    )?;
     require_count(
         "Qwen3.8-Flash-Next selected decode attention",
         attention.len(),
@@ -9219,12 +9229,22 @@ fn gate_qwen38_flash_next_qsa_selection(root: &Path) -> Result<(), Box<dyn Error
         }
     }
 
-    for entry in select.iter() {
+    for entry in &select_pass {
         if !entry.body.contains("match.any.sync.b32") {
             return Err(format!("entry `{}` lost its conflict-free histogram", entry.name).into());
         }
+    }
+
+    for entry in select_pass.iter().chain(&select_expand) {
         if names_opcode(entry.body, "atom.") || names_opcode(entry.body, "red.") {
-            return Err(format!("entry `{}` uses an atomic histogram", entry.name).into());
+            return Err(format!("entry `{}` uses atomic selection accounting", entry.name).into());
+        }
+        if !entry.body.contains("bar.sync") || !entry.body.contains("shfl.sync.up.b32") {
+            return Err(format!(
+                "entry `{}` lost its CTA-wide ascending prefix count",
+                entry.name
+            )
+            .into());
         }
     }
 
@@ -9246,7 +9266,8 @@ fn gate_qwen38_flash_next_qsa_selection(root: &Path) -> Result<(), Box<dyn Error
         .chain(&prepare_prefill)
         .chain(&compress)
         .chain(&score)
-        .chain(&select)
+        .chain(&select_pass)
+        .chain(&select_expand)
         .chain(&attention)
         .chain(&attention_prefill)
     {
@@ -9265,7 +9286,8 @@ fn gate_qwen38_flash_next_qsa_selection(root: &Path) -> Result<(), Box<dyn Error
         ("prepare_prefill", &prepare_prefill),
         ("compress", &compress),
         ("score", &score),
-        ("select", &select),
+        ("select_pass", &select_pass),
+        ("select_expand", &select_expand),
         ("attention", &attention),
         ("attention_prefill", &attention_prefill),
     ] {
@@ -9286,7 +9308,7 @@ fn gate_qwen38_flash_next_qsa_selection(root: &Path) -> Result<(), Box<dyn Error
     }
 
     println!(
-        "Qwen3.8-Flash-Next QSA selection gate passed: 56 entries, STACK:0 LOCAL:0, {measured:?}, exact indexer instruction shapes and SASS present"
+        "Qwen3.8-Flash-Next QSA selection gate passed: 66 entries, STACK:0 LOCAL:0, {measured:?}, exact indexer instruction shapes and SASS present"
     );
 
     Ok(())
@@ -9564,6 +9586,14 @@ fn gate_qwen38_flash_next_projections(root: &Path) -> Result<(), Box<dyn Error>>
             8,
         ),
         (
+            "indexer QK",
+            named("qwen38_flash_next_indexer_qk_projection_TID_"),
+            named("qwen38_flash_next_indexer_qk_projection_prefill_TID_"),
+            "indexer_qk",
+            128,
+            8,
+        ),
+        (
             "block output",
             named("qwen38_flash_next_block_output_projection_TID_"),
             named("qwen38_flash_next_block_output_projection_prefill_TID_"),
@@ -9648,7 +9678,7 @@ fn gate_qwen38_flash_next_projections(root: &Path) -> Result<(), Box<dyn Error>>
     }
 
     println!(
-        "Qwen3.8-Flash-Next backbone projection gate passed: 41 entries, STACK:0 LOCAL:0 SHARED:0, BF16 MMA/store and SASS present"
+        "Qwen3.8-Flash-Next backbone projection gate passed: 53 entries, STACK:0 LOCAL:0 SHARED:0, BF16 MMA/store and SASS present"
     );
     Ok(())
 }

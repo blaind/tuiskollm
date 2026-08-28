@@ -1,7 +1,16 @@
-//! Direct timings for each Qwen3.8-Flash-Next QSA selection stage.
+//! Direct timings for the exact Qwen3.8-Flash-Next QSA selection graph routes.
 //!
-//! Every route is above the dense-equivalent ceiling. The context ladder is
-//! 32,768 / 131,072 / 262,144, ending at the pinned position limit.
+//! The four indexer stages are timed **separately**, not as one composed graph,
+//! because they answer different questions and scale differently. The scorer
+//! reads every candidate block and so grows linearly with the context; the
+//! selection reads only the score plane; and the gather attention reads at most
+//! 2,051 positions however long the context is, which is the whole point of the
+//! route. Timing them together would hide exactly the shape a reader wants.
+//!
+//! Every route is driven at a context **above** the dense-equivalent ceiling,
+//! so the radix select's outer passes run rather than its fast path. The ladder
+//! is 32,768 / 131,072 / 262,144; the last is the pinned config's own
+//! `max_position_embeddings`.
 
 use crate::device_benchmark::{
     BenchmarkMemoryKind, BenchmarkReportSpec, BenchmarkWorkload, DeviceBenchmarkError,
@@ -19,7 +28,8 @@ use tuisko_kernels_sm120::{
     ATTENTION_PAGE_SIZE, IndexerCompressArgs, IndexerPrepareArgs, IndexerSelectionArgs,
     Qwen38FlashNextIndexerPrepareOp, Qwen38FlashNextIndexerSelectionOp,
     Qwen38FlashNextSelectedPagedGqaOp, SELECTION_BLOCKS_PER_PAGE, SELECTION_MAX_SELECTED,
-    SELECTION_ROW_TILE, SelectedAttentionArgs, selection_round_blocks, selection_round_rows,
+    SELECTION_RADIX_PASSES, SELECTION_ROW_TILE, SELECTION_SCRATCH_WORDS, SelectedAttentionArgs,
+    selection_block_bucket, selection_ctas_per_row,
 };
 use tuisko_model::{Arch, Qwen38FlashNext};
 
@@ -98,11 +108,11 @@ impl Stage {
 
     fn operation(self) -> &'static str {
         match self {
-            Stage::Prepare => "qwen38-flash-next/qsa-selection/indexer_prepare",
-            Stage::Compress => "qwen38-flash-next/qsa-selection/block_compress",
-            Stage::Score => "qwen38-flash-next/qsa-selection/block_score",
-            Stage::Select => "qwen38-flash-next/qsa-selection/block_select",
-            Stage::Attention => "qwen38-flash-next/qsa-selection/gather_attention",
+            Stage::Prepare => "qwen38_flash_next/qsa_selection/indexer_prepare",
+            Stage::Compress => "qwen38_flash_next/qsa_selection/block_compress",
+            Stage::Score => "qwen38_flash_next/qsa_selection/block_score",
+            Stage::Select => "qwen38_flash_next/qsa_selection/block_select",
+            Stage::Attention => "qwen38_flash_next/qsa_selection/gather_attention",
         }
     }
 }
@@ -123,9 +133,13 @@ struct Regions {
     block_counts: ArenaRegion<u32>,
     first_blocks: ArenaRegion<u32>,
     indexer_query: ArenaRegion<f32>,
-    indexer_pages: ArenaRegion<u16>,
+    /// Per-sequence raw-key ring: one open micro-block per table row.
+    raw_ring: ArenaRegion<u16>,
+    /// Round-local raw keys, one row per position a prompt width carries.
+    raw_round: ArenaRegion<u16>,
     block_keys: ArenaRegion<u16>,
     scores: ArenaRegion<f32>,
+    select_scratch: ArenaRegion<u32>,
     selected: ArenaRegion<u32>,
     selected_counts: ArenaRegion<u32>,
     query: ArenaRegion<f32>,
@@ -150,9 +164,11 @@ impl Regions {
             + self.block_counts.byte_len()
             + self.first_blocks.byte_len()
             + self.indexer_query.byte_len()
-            + self.indexer_pages.byte_len()
+            + self.raw_ring.byte_len()
+            + self.raw_round.byte_len()
             + self.block_keys.byte_len()
             + self.scores.byte_len()
+            + self.select_scratch.byte_len()
             + self.selected.byte_len()
             + self.selected_counts.byte_len()
             + self.query.byte_len()
@@ -161,13 +177,20 @@ impl Regions {
             + self.attention.byte_len()
     }
 
-    /// Bytes the paged cache classes occupy: K, V, raw indexer keys, and the
-    /// compressed block keys.
+    /// Bytes the paged cache classes occupy: K, V, and the compressed block
+    /// keys.
+    ///
+    /// The raw indexer keys are deliberately absent. They live in a four-slot
+    /// per-sequence ring and a round-local plane, neither of which scales with
+    /// the page pool, so counting them here would report a page cost the cache
+    /// does not have.
     fn cache_bytes(self) -> usize {
-        self.key_pages.byte_len()
-            + self.value_pages.byte_len()
-            + self.indexer_pages.byte_len()
-            + self.block_keys.byte_len()
+        self.key_pages.byte_len() + self.value_pages.byte_len() + self.block_keys.byte_len()
+    }
+
+    /// Bytes the raw indexer keys occupy, which is not a per-page class.
+    fn raw_key_bytes(self) -> usize {
+        self.raw_ring.byte_len() + self.raw_round.byte_len()
     }
 }
 
@@ -187,9 +210,11 @@ struct Addresses {
     block_counts: *const u32,
     first_blocks: *const u32,
     indexer_query: *mut f32,
-    indexer_pages: *mut u16,
+    raw_ring: *mut u16,
+    raw_round: *mut u16,
     block_keys: *mut u16,
     scores: *mut f32,
+    select_scratch: *mut u32,
     selected: *mut u32,
     selected_counts: *mut u32,
     query: *const f32,
@@ -377,15 +402,14 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
         MAX_TOKENS * Qwen38FlashNext::INDEXER_HEADS * indexer_dim,
         ALIGNMENT,
     )?;
-    let indexer_pages = layout.reserve(
-        PHYSICAL_PAGES * ATTENTION_PAGE_SIZE * indexer_dim,
-        ALIGNMENT,
-    )?;
+    let raw_ring = layout.reserve(TABLE_ROWS * RATIO * indexer_dim, ALIGNMENT)?;
+    let raw_round = layout.reserve(MAX_TOKENS.max(257 * RATIO) * indexer_dim, ALIGNMENT)?;
     let block_keys = layout.reserve(
         PHYSICAL_PAGES * SELECTION_BLOCKS_PER_PAGE * indexer_dim,
         ALIGNMENT,
     )?;
     let scores = layout.reserve(SELECTION_ROW_TILE * maximum_blocks, ALIGNMENT)?;
+    let select_scratch = layout.reserve(SELECTION_SCRATCH_WORDS, ALIGNMENT)?;
     let selected = layout.reserve(MAX_TOKENS * SELECTION_MAX_SELECTED, ALIGNMENT)?;
     let selected_counts = layout.reserve(MAX_TOKENS, ALIGNMENT)?;
     let query = layout.reserve(attention_plane, ALIGNMENT)?;
@@ -410,9 +434,11 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
             block_counts,
             first_blocks,
             indexer_query,
-            indexer_pages,
+            raw_ring,
+            raw_round,
             block_keys,
             scores,
+            select_scratch,
             selected,
             selected_counts,
             query,
@@ -460,7 +486,10 @@ fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> G
     let block_tables = (0..TABLE_ROWS * TABLE_STRIDE)
         .map(|index| physical_page(index / TABLE_STRIDE, index % TABLE_STRIDE))
         .collect::<Vec<_>>();
-    let indexer_pages = (0..PHYSICAL_PAGES * ATTENTION_PAGE_SIZE * indexer_dim)
+    let raw_ring = (0..TABLE_ROWS * RATIO * indexer_dim)
+        .map(|index| f32_to_bf16(INDEXER_PATTERN[index % INDEXER_PATTERN.len()] * 0.25))
+        .collect::<Vec<_>>();
+    let raw_round = (0..MAX_TOKENS.max(257 * RATIO) * indexer_dim)
         .map(|index| f32_to_bf16(INDEXER_PATTERN[index % INDEXER_PATTERN.len()] * 0.25))
         .collect::<Vec<_>>();
     // The block-key plane is filled directly: this suite times the stages, and
@@ -491,17 +520,18 @@ fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> G
     arena.copy_from_host(stream, regions.block_rope_cos, &block_rope(0.013))?;
     arena.copy_from_host(stream, regions.block_rope_sin, &block_rope(0.017))?;
     arena.copy_from_host(stream, regions.block_tables, &block_tables)?;
-    arena.copy_from_host(stream, regions.indexer_pages, &indexer_pages)?;
+    arena.copy_from_host(stream, regions.raw_ring, &raw_ring)?;
+    arena.copy_from_host(stream, regions.raw_round, &raw_round)?;
     arena.copy_from_host(stream, regions.block_keys, &block_keys)?;
     arena.copy_from_host(stream, regions.query, &query)?;
     arena.copy_from_host(stream, regions.key_pages, &key_pages)?;
     arena.copy_from_host(stream, regions.value_pages, &value_pages)?;
-    let metadata = metadata_planes();
-    arena.copy_from_host(stream, regions.table_rows, &metadata.table_rows)?;
-    arena.copy_from_host(stream, regions.cache_positions, &metadata.cache_positions)?;
-    arena.copy_from_host(stream, regions.lengths, &metadata.visible_lengths)?;
-    arena.copy_from_host(stream, regions.block_counts, &metadata.block_counts)?;
-    arena.copy_from_host(stream, regions.first_blocks, &metadata.first_blocks)?;
+    let (rows, positions, lengths, blocks, first) = metadata_planes();
+    arena.copy_from_host(stream, regions.table_rows, &rows)?;
+    arena.copy_from_host(stream, regions.cache_positions, &positions)?;
+    arena.copy_from_host(stream, regions.lengths, &lengths)?;
+    arena.copy_from_host(stream, regions.block_counts, &blocks)?;
+    arena.copy_from_host(stream, regions.first_blocks, &first)?;
 
     Ok(())
 }
@@ -512,24 +542,12 @@ fn load_fixture(arena: &DeviceArena, stream: &CudaStream, regions: Regions) -> G
 /// and the deep ladder measures context scaling alone. The three deep sets put
 /// every token on the row that owns the 262,144-position span; the batched set
 /// spreads them over the eight rows, each of which owns [`WIDE_CONTEXT`].
-struct MetadataPlanes {
-    table_rows: Vec<u32>,
-    cache_positions: Vec<u32>,
-    visible_lengths: Vec<u32>,
-    block_counts: Vec<u32>,
-    first_blocks: Vec<u32>,
-}
-
-fn metadata_planes() -> MetadataPlanes {
+fn metadata_planes() -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
     let mut rows = Vec::with_capacity(METADATA_SETS * MAX_TOKENS);
     let mut positions = Vec::with_capacity(METADATA_SETS * MAX_TOKENS);
     let mut lengths = Vec::with_capacity(METADATA_SETS * MAX_TOKENS);
     let mut blocks = Vec::with_capacity(METADATA_SETS * MAX_TOKENS);
-    for (set, context) in DEEP_CONTEXTS
-        .into_iter()
-        .chain(std::iter::once(WIDE_CONTEXT))
-        .enumerate()
-    {
+    for (set, context) in DEEP_CONTEXTS.into_iter().chain([WIDE_CONTEXT]).enumerate() {
         for token in 0..MAX_TOKENS {
             rows.push(if set == BATCH_METADATA {
                 (token % TABLE_ROWS) as u32
@@ -542,13 +560,13 @@ fn metadata_planes() -> MetadataPlanes {
         }
     }
 
-    MetadataPlanes {
-        table_rows: rows,
-        cache_positions: positions,
-        visible_lengths: lengths,
-        block_counts: blocks,
-        first_blocks: vec![0u32; METADATA_SETS * MAX_TOKENS],
-    }
+    (
+        rows,
+        positions,
+        lengths,
+        blocks,
+        vec![0u32; METADATA_SETS * MAX_TOKENS],
+    )
 }
 
 fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<Addresses> {
@@ -567,9 +585,11 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<Addresses> {
         block_counts: arena.address(regions.block_counts)?.cast_const(),
         first_blocks: arena.address(regions.first_blocks)?.cast_const(),
         indexer_query: arena.address(regions.indexer_query)?,
-        indexer_pages: arena.address(regions.indexer_pages)?,
+        raw_ring: arena.address(regions.raw_ring)?,
+        raw_round: arena.address(regions.raw_round)?,
         block_keys: arena.address(regions.block_keys)?,
         scores: arena.address(regions.scores)?,
+        select_scratch: arena.address(regions.select_scratch)?,
         selected: arena.address(regions.selected)?,
         selected_counts: arena.address(regions.selected_counts)?,
         query: arena.address(regions.query)?.cast_const(),
@@ -650,19 +670,25 @@ fn launch(
                     query_norm: addresses.query_norm,
                     rope_cos: addresses.rope_cos,
                     rope_sin: addresses.rope_sin,
-                    block_tables: addresses.block_tables,
                     table_rows,
-                    table_stride: TABLE_STRIDE as u32,
                     cache_positions,
                     query: addresses.indexer_query,
-                    indexer_pages: addresses.indexer_pages,
+                    raw_keys: if route.tokens <= MAX_BATCH {
+                        addresses.raw_ring
+                    } else {
+                        addresses.raw_round
+                    },
                 },
             ),
             Stage::Compress => prepare_op.launch_compress(
                 stream,
                 route.tokens,
                 IndexerCompressArgs {
-                    indexer_pages: addresses.indexer_pages.cast_const(),
+                    raw_keys: if route.tokens <= MAX_BATCH {
+                        addresses.raw_ring.cast_const()
+                    } else {
+                        addresses.raw_round.cast_const()
+                    },
                     key_norm: addresses.key_norm,
                     block_rope_cos: addresses.block_rope_cos,
                     block_rope_sin: addresses.block_rope_sin,
@@ -695,6 +721,7 @@ fn launch(
                         score_stride: (DEEP_CONTEXTS[DEEP_CONTEXTS.len() - 1] / RATIO) as u32,
                         selected: addresses.selected,
                         selected_counts: addresses.selected_counts,
+                        scratch: addresses.select_scratch,
                     };
                     // The two stages are timed apart because only one of them
                     // grows with the context. A composed route calls `launch`,
@@ -702,7 +729,7 @@ fn launch(
                     if route.stage == Stage::Score {
                         selection_op.launch_score(stream, rows, offset, blocks, args)?;
                     } else {
-                        selection_op.launch_select(stream, rows, offset, args)?;
+                        selection_op.launch_select(stream, rows, offset, blocks, args)?;
                     }
                     offset += rows;
                 }
@@ -730,7 +757,35 @@ fn launch(
     }
 }
 
-/// Bytes one timed configuration moves at its selected stage.
+/// Rows one launch of the scoring and selection pair owns.
+fn tile_rows(route: Route) -> usize {
+    if route.tokens <= MAX_BATCH {
+        route.tokens
+    } else {
+        SELECTION_ROW_TILE
+    }
+}
+
+/// Bytes the partial-histogram plane of one row moves across the whole select.
+///
+/// Every pass publishes 256 bins per CTA of the row, and every reduction - the
+/// three later passes and the expansion - reads that plane back. Each CTA of
+/// the row reads the whole plane so that all of them derive the same digit from
+/// the same integers; that re-read is 64 KiB of L2-resident traffic per CTA and
+/// is left out here for the same reason a cache-served re-read is left out of
+/// every other stage's model.
+fn partial_bytes(rows: usize, blocks: usize) -> usize {
+    let ctas = selection_ctas_per_row(rows, selection_block_bucket(blocks).unwrap_or(blocks));
+    let plane = ctas * 256 * size_of::<u32>();
+
+    2 * SELECTION_RADIX_PASSES * plane
+}
+
+/// Bytes one timed configuration moves, per stage.
+///
+/// The four stages have genuinely different byte models, and the point of the
+/// route is that only one of them grows with the context while the attention
+/// does not: writing one shared model would have hidden that.
 fn logical_bytes(route: Route) -> usize {
     let indexer_dim = Qwen38FlashNext::INDEXER_HEAD_DIM;
     let head_dim = Qwen38FlashNext::HEAD_DIM;
@@ -738,40 +793,42 @@ fn logical_bytes(route: Route) -> usize {
     let blocks = route.context / RATIO;
     let selected = SELECTION_MAX_SELECTED.min(route.context);
 
-    match route.stage {
+    let per_token = match route.stage {
         // The fused projection row in, the four prepared query heads and one
         // raw cached key out.
         Stage::Prepare => {
-            route.tokens
-                * (Qwen38FlashNext::INDEXER_ROWS * size_of::<u16>()
-                    + Qwen38FlashNext::INDEXER_HEADS * indexer_dim * size_of::<f32>()
-                    + indexer_dim * size_of::<u16>())
+            Qwen38FlashNext::INDEXER_ROWS * size_of::<u16>()
+                + Qwen38FlashNext::INDEXER_HEADS * indexer_dim * size_of::<f32>()
+                + indexer_dim * size_of::<u16>()
         }
+        // One round closes at most a quarter of its own positions, each pooling
+        // four raw keys into one published block key.
         Stage::Compress => {
-            selection_round_rows(route.tokens)
-                * selection_round_blocks(route.tokens)
-                * (RATIO * indexer_dim * size_of::<u16>() + indexer_dim * size_of::<u16>())
+            (RATIO * indexer_dim * size_of::<u16>() + indexer_dim * size_of::<u16>()) / RATIO
         }
         // Every candidate block key, once per row, plus the four query heads.
         Stage::Score => {
-            route.tokens
-                * (blocks * indexer_dim * size_of::<u16>()
-                    + Qwen38FlashNext::INDEXER_HEADS * indexer_dim * size_of::<f32>()
-                    + blocks * size_of::<f32>())
+            blocks * indexer_dim * size_of::<u16>()
+                + Qwen38FlashNext::INDEXER_HEADS * indexer_dim * size_of::<f32>()
+                + blocks * size_of::<f32>()
         }
-        // Four radix passes over the score plane, then one expansion pass.
+        // Four radix passes over the score plane, then one expansion pass,
+        // plus the partial histograms the split publishes and reduces.
         Stage::Select => {
-            route.tokens * (5 * blocks * size_of::<f32>() + selected * size_of::<u32>())
+            (SELECTION_RADIX_PASSES + 1) * blocks * size_of::<f32>()
+                + partial_bytes(tile_rows(route), blocks)
+                + selected * size_of::<u32>()
         }
         // The selected positions only: this is the number that does *not* grow
         // with the context, which is what the route buys.
         Stage::Attention => {
-            route.tokens
-                * (2 * columns * size_of::<f32>()
-                    + 2 * Qwen38FlashNext::NUM_ATTENTION_HEADS * selected * head_dim
-                    + selected * size_of::<u32>())
+            2 * columns * size_of::<f32>()
+                + 2 * Qwen38FlashNext::NUM_ATTENTION_HEADS * selected * head_dim
+                + selected * size_of::<u32>()
         }
-    }
+    };
+
+    route.tokens * per_token
 }
 
 /// Times every exact Qwen3.8-Flash-Next QSA selection stage over its context ladder.
@@ -786,18 +843,25 @@ pub fn benchmark_qwen38_flash_next_qsa_selection(
     let mut timer = GpuTimer::new(session.stream.context())?;
     let padding_bytes = session.padding_bytes();
     let cache_bytes = session.regions.cache_bytes();
-    let workspace_bytes = session.arena.byte_len() - cache_bytes - padding_bytes;
+    let raw_key_bytes = session.regions.raw_key_bytes();
+    let workspace_bytes = session.arena.byte_len() - cache_bytes - padding_bytes - raw_key_bytes;
     memory.register_owned(
         "qwen38_flash_next_qsa_selection/kv_cache",
         BenchmarkMemoryKind::KvCache,
         cache_bytes,
-        "7,680 physical pages: represented E4M3 K/V, raw BF16 indexer keys, and BF16 block keys",
+        "7,680 physical pages: represented E4M3 K/V and BF16 block keys",
     )?;
     memory.register_owned(
         "qwen38_flash_next_qsa_selection/address_stable_workspace",
         BenchmarkMemoryKind::Workspace,
         workspace_bytes,
-        "max_tokens=1024 query and attention planes, the indexer query plane, the 65,536-block score scratch, the selected-position plane, and page metadata",
+        "max_tokens=1024 query and attention planes, the indexer query plane, the 65,536-block score scratch, the selected-position plane, the raw-key ring and its round-local plane, and page metadata",
+    )?;
+    memory.register_owned(
+        "qwen38_flash_next_qsa_selection/raw_indexer_keys",
+        BenchmarkMemoryKind::Workspace,
+        raw_key_bytes,
+        "the four-slot per-sequence ring and one prompt round's raw keys, neither of which scales with the page pool",
     )?;
     memory.register_owned(
         "qwen38_flash_next_qsa_selection/alignment_padding",
@@ -816,7 +880,7 @@ pub fn benchmark_qwen38_flash_next_qsa_selection(
 
     finish_report(
         BenchmarkReportSpec {
-            suite: "bench-qwen38-flash-next-qsa-selection",
+            suite: "bench-qwen38_flash_next-qsa-selection",
             classification: "performance_sensitive_leaf_pair",
             timing_scope: "paired Rust submission/completion, production graph, and repeated-operation graph, per indexer stage over a 32K/131K/262K context ladder",
         },
@@ -837,14 +901,15 @@ mod tests {
         TABLE_STRIDE, WIDE_CONTEXT, WIDE_ROUTES, layout, logical_bytes, physical_page, routes,
     };
     use std::collections::BTreeSet;
-    use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, SELECTION_MAX_SELECTED};
+    use tuisko_kernels_sm120::{
+        ATTENTION_PAGE_SIZE, SELECTION_MAX_SELECTED, selection_block_bucket, selection_ctas_per_row,
+    };
     use tuisko_model::{Arch, Qwen38FlashNext};
 
     #[test]
-    fn qwen38_flash_next_qsa_selection_byte_accounting_separates_the_five_stages() {
+    fn qwen38_flash_next_qsa_selection_byte_accounting_separates_the_four_stages() {
         let indexer_dim = Qwen38FlashNext::INDEXER_HEAD_DIM;
         let columns = Qwen38FlashNext::ATTENTION_OUTPUT_COLUMNS;
-        let block_bytes = 4 * indexer_dim * 2 + indexer_dim * 2;
 
         // Derived a second way rather than read back from the function, so a
         // throughput number that quietly changed shape fails here.
@@ -860,14 +925,20 @@ mod tests {
                 logical_bytes(route(Stage::Prepare)),
                 640 * 2 + 4 * 128 * 4 + 128 * 2
             );
-            assert_eq!(logical_bytes(route(Stage::Compress)), block_bytes);
             assert_eq!(
                 logical_bytes(route(Stage::Score)),
                 blocks * indexer_dim * 2 + 4 * indexer_dim * 4 + blocks * 4
             );
+            // Stated rather than read back: every rung of the deep ladder maps
+            // one row onto the widest prepared split, so all three publish and
+            // reduce the same 64 KiB partial plane four times over.
+            assert_eq!(
+                selection_ctas_per_row(1, selection_block_bucket(blocks).unwrap()),
+                64
+            );
             assert_eq!(
                 logical_bytes(route(Stage::Select)),
-                5 * blocks * 4 + SELECTION_MAX_SELECTED * 4
+                5 * blocks * 4 + 8 * 64 * 1_024 + SELECTION_MAX_SELECTED * 4
             );
             assert_eq!(
                 logical_bytes(route(Stage::Attention)),
@@ -876,17 +947,6 @@ mod tests {
                     + SELECTION_MAX_SELECTED * 4
             );
         }
-
-        let compress = |tokens| {
-            logical_bytes(Route {
-                tokens,
-                context: WIDE_CONTEXT,
-                stage: Stage::Compress,
-                metadata: 0,
-            })
-        };
-        assert_eq!(compress(8), 8 * block_bytes);
-        assert_eq!(compress(1_024), 257 * block_bytes);
 
         // The claim the route exists for: the scorer grows with the context and
         // the gather attention does not.
@@ -949,5 +1009,14 @@ mod tests {
         // stopped being counted from hiding inside the remainder.
         assert_eq!(layout.byte_len() - regions.payload_bytes(), 256);
         assert!(regions.cache_bytes() < layout.byte_len());
+
+        // The raw indexer keys are not a page class. Their size is the ring plus
+        // one prompt round, whatever the pool holds, which is the whole reason
+        // `cache_bytes` no longer counts them.
+        assert_eq!(
+            regions.raw_key_bytes(),
+            (TABLE_ROWS * RATIO + 257 * RATIO) * Qwen38FlashNext::INDEXER_HEAD_DIM * 2
+        );
+        assert!(regions.raw_key_bytes() < regions.cache_bytes() / 1_000);
     }
 }

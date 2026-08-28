@@ -1,16 +1,22 @@
 //! Source-BF16 backbone projection operators for the Qwen3.8-Flash-Next target on SM120.
 //!
 //! Every decoder layer moves activations between four widths through plain
-//! `nn.Linear`s. This crate owns the three shapes that sit inside a layer; the
+//! `nn.Linear`s. This crate owns the four shapes that sit inside a layer; the
 //! vocabulary projection that closes the stack belongs to the LM-head family
-//! beside the other heads. All four instantiate one device body, so an edit to
+//! beside the other heads. All five instantiate one device body, so an edit to
 //! the projection arithmetic reaches them together.
 
 mod backbone;
 
 pub use backbone::{
-    Qwen38FlashNextBlockOutputProjectionOp, Qwen38FlashNextGdnInputProjectionOp,
-    Qwen38FlashNextMtpFusionProjectionOp, Qwen38FlashNextQsaQkvProjectionOp,
+    PreparedBlockOutputPrefillRoute, PreparedBlockOutputRoute, PreparedGdnInputPrefillRoute,
+    PreparedGdnInputRoute, PreparedIndexerQkPrefillRoute, PreparedIndexerQkRoute,
+    PreparedMtpFusionPrefillRoute, PreparedMtpFusionRoute, PreparedQsaQkvPrefillRoute,
+    PreparedQsaQkvRoute, ProjectionEntries, ProjectionRoute, Qwen38FlashNextBlockOutputEntries,
+    Qwen38FlashNextBlockOutputProjectionOp, Qwen38FlashNextGdnInputEntries,
+    Qwen38FlashNextGdnInputProjectionOp, Qwen38FlashNextIndexerQkEntries,
+    Qwen38FlashNextIndexerQkProjectionOp, Qwen38FlashNextMtpFusionProjectionOp,
+    Qwen38FlashNextProjectionOp, Qwen38FlashNextQsaQkvEntries, Qwen38FlashNextQsaQkvProjectionOp,
 };
 
 /// Semantic inventory of every entry this family emits.
@@ -18,6 +24,7 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
     backbone::qwen38_flash_next_gdn_input_projection_ptx_names()
         .into_iter()
         .chain(backbone::qwen38_flash_next_qsa_qkv_projection_ptx_names())
+        .chain(backbone::qwen38_flash_next_indexer_qk_projection_ptx_names())
         .chain(backbone::qwen38_flash_next_block_output_projection_ptx_names())
         .chain(backbone::qwen38_flash_next_mtp_fusion_projection_ptx_names())
         .collect()
@@ -36,7 +43,7 @@ mod tests {
     }
 
     /// The declared count `tuisko-kernels-sm120` pins for this family, split
-    /// per entry. Adding or dropping a specialization moves exactly one row.
+    /// per entry. Adding or dropping a specialization moves one row.
     #[test]
     fn family_inventory_is_pinned_per_base_name() {
         let names = kernel_ptx_names();
@@ -58,12 +65,14 @@ mod tests {
                 ("qwen38_flash_next_block_output_projection_prefill", 4),
                 ("qwen38_flash_next_gdn_input_projection", 8),
                 ("qwen38_flash_next_gdn_input_projection_prefill", 4),
+                ("qwen38_flash_next_indexer_qk_projection", 8),
+                ("qwen38_flash_next_indexer_qk_projection_prefill", 4),
                 ("qwen38_flash_next_mtp_fusion_projection", 1),
                 ("qwen38_flash_next_mtp_fusion_projection_prefill", 4),
                 ("qwen38_flash_next_qsa_qkv_projection", 8),
                 ("qwen38_flash_next_qsa_qkv_projection_prefill", 4),
             ]
         );
-        assert_eq!(counts.values().sum::<usize>(), 41);
+        assert_eq!(counts.values().sum::<usize>(), 53);
     }
 }

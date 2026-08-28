@@ -841,8 +841,8 @@ mod tests {
                         || name.contains("_projection"))
             })
             .count();
-        // Decoder routes plus the MTP fusion's five-entry schedule.
-        assert_eq!(projections, 36 + 5);
+        // Three decoder families, indexer QK, and the MTP fusion schedule.
+        assert_eq!(projections, 36 + 12 + 5);
 
         for base in [
             "qwen38_flash_next_gdn_input_projection",

@@ -23,7 +23,8 @@ pub(crate) use tuisko_kernels_sm120::{
 #[cfg(feature = "device")]
 pub(crate) use tuisko_kernels_sm120::{
     Qwen38FlashNextBf16LmHeadOp, Qwen38FlashNextBlockOutputProjectionOp,
-    Qwen38FlashNextGdnInputProjectionOp, Qwen38FlashNextQsaQkvProjectionOp,
+    Qwen38FlashNextGdnInputProjectionOp, Qwen38FlashNextIndexerQkProjectionOp,
+    Qwen38FlashNextQsaQkvProjectionOp,
 };
 
 #[cfg(feature = "device")]

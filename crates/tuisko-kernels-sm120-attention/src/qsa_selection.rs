@@ -1,4 +1,4 @@
-//! Qwen3.8-Flash-Next sparse-attention selection: indexer, block scoring, and
+//! Qwen3.8-Flash-Next sparse-attention selection: indexer, block scoring, and the
 //! gather attention that reads the positions the indexer named.
 //!
 //! The dense route in `paged_gqa` remains authoritative while a query's visible
@@ -12,14 +12,14 @@ use crate::device::paged_gqa::{
     selected_paged_gqa_partitioned, selected_paged_gqa_prefill_shared,
 };
 use crate::device::qsa_indexer::{
-    COMPRESS_RATIO, INDEXER_HEADS, MAX_SELECTED, SELECT_ROW_TILE, SELECT_SHARED_WORDS,
-    THREADS_PER_CTA, WARPS_PER_CTA, indexer_block_compress, indexer_prepare, indexer_score,
-    indexer_select,
+    COMPRESS_RATIO, INDEXER_HEADS, MAX_SELECTED, SELECT_EXPAND_SHARED_WORDS,
+    SELECT_MAX_CTAS_PER_ROW, SELECT_PARTIAL_SLOTS, SELECT_PASS_SHARED_WORDS, SELECT_ROW_TILE,
+    SELECT_SCRATCH_WORDS, THREADS_PER_CTA, WARPS_PER_CTA, indexer_block_compress, indexer_prepare,
+    indexer_score, indexer_select_expand, indexer_select_pass,
 };
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
-use tuisko_kernels_macros::ExactRoutes;
 use tuisko_model::{Arch, Qwen38FlashNext};
 
 /// Largest decode batch the selection routes admit.
@@ -32,6 +32,12 @@ pub const SELECTION_MAX_SELECTED: usize = MAX_SELECTED;
 pub const SELECTION_ROW_TILE: usize = SELECT_ROW_TILE;
 /// Micro-blocks the block-key plane holds per physical cache page.
 pub const SELECTION_BLOCKS_PER_PAGE: usize = 64 / COMPRESS_RATIO;
+/// Raw indexer keys one sequence carries between decode rounds.
+///
+/// Exactly one open micro-block: once a block closes its raw keys are dead, so
+/// the raw vectors never occupy a paged plane. A prompt tile writes its raw
+/// keys round-locally instead and needs `[tokens, 128]` of scratch.
+pub const SELECTION_RING_SLOTS: usize = COMPRESS_RATIO;
 /// Candidate-block grids the scorer prepares, in ascending order.
 ///
 /// Each is a multiple of the warps per CTA, so a bucket divides into whole CTAs
@@ -39,6 +45,12 @@ pub const SELECTION_BLOCKS_PER_PAGE: usize = 64 / COMPRESS_RATIO;
 pub const SELECTION_BLOCK_BUCKETS: [usize; 5] = [64, 512, 4_096, 32_768, 65_536];
 /// Candidate blocks the widest prepared grid scores.
 pub const SELECTION_MAX_BLOCKS: usize = Qwen38FlashNext::MAX_POSITION_EMBEDDINGS / COMPRESS_RATIO;
+/// Words the selection scratch plane a caller must fund holds.
+pub const SELECTION_SCRATCH_WORDS: usize = SELECT_SCRATCH_WORDS;
+/// Widest per-row CTA split the selection schedule prepares.
+pub const SELECTION_MAX_CTAS_PER_ROW: usize = SELECT_MAX_CTAS_PER_ROW;
+/// Radix passes the selection spends before its expansion.
+pub const SELECTION_RADIX_PASSES: usize = 4;
 
 const _: () = assert!(SELECTION_MAX_BLOCKS == 65_536);
 const _: () = assert!(SELECTION_BLOCK_BUCKETS[4] == SELECTION_MAX_BLOCKS);
@@ -118,28 +130,27 @@ mod kernels {
         query_norm: *const u16,
         rope_cos: *const f32,
         rope_sin: *const f32,
-        block_tables: *const u32,
         table_rows: *const u32,
-        table_stride: u32,
         cache_positions: *const u32,
         query: *mut f32,
-        indexer_pages: *mut u16,
+        raw_keys: *mut u16,
     ) {
         // Five head-warps per token: four indexer query heads and the single
         // shared key head, one warp per complete 128-wide vector so the RMS
         // reduction and the half-split lane exchange stay inside one warp.
+        //
+        // A decode row advances one position of its own sequence, so its raw
+        // key lands in that sequence's four-slot ring.
         unsafe {
-            indexer_prepare::<TOKENS>(
+            indexer_prepare::<TOKENS, true>(
                 indexer_qk,
                 query_norm,
                 rope_cos,
                 rope_sin,
-                block_tables,
                 table_rows,
-                table_stride,
                 cache_positions,
                 query,
-                indexer_pages,
+                raw_keys,
             );
         }
     }
@@ -160,25 +171,23 @@ mod kernels {
         query_norm: *const u16,
         rope_cos: *const f32,
         rope_sin: *const f32,
-        block_tables: *const u32,
         table_rows: *const u32,
-        table_stride: u32,
         cache_positions: *const u32,
         query: *mut f32,
-        indexer_pages: *mut u16,
+        raw_keys: *mut u16,
     ) {
+        // One prompt tile belongs to one sequence and closes every block it
+        // writes, so its raw keys are round-local: the tile row is the slot.
         unsafe {
-            indexer_prepare::<TOKENS>(
+            indexer_prepare::<TOKENS, false>(
                 indexer_qk,
                 query_norm,
                 rope_cos,
                 rope_sin,
-                block_tables,
                 table_rows,
-                table_stride,
                 cache_positions,
                 query,
-                indexer_pages,
+                raw_keys,
             );
         }
     }
@@ -198,7 +207,7 @@ mod kernels {
         const ROWS: usize,
         const BLOCKS: usize,
     >(
-        indexer_pages: *const u16,
+        raw_keys: *const u16,
         key_norm: *const u16,
         block_rope_cos: *const f32,
         block_rope_sin: *const f32,
@@ -213,7 +222,7 @@ mod kernels {
         // them in FP32, norms and rotates, and publishes one BF16 vector.
         unsafe {
             indexer_block_compress::<ROWS, BLOCKS>(
-                indexer_pages,
+                raw_keys,
                 key_norm,
                 block_rope_cos,
                 block_rope_sin,
@@ -269,7 +278,7 @@ mod kernels {
         }
     }
 
-    /// Selects the top-512 blocks of one row tile and expands them to positions.
+    /// Resolves one radix digit of a row tile's top-512 block selection.
     #[kernel]
     #[launch_bounds(256, 2)]
     #[allow(clippy::too_many_arguments)]
@@ -280,30 +289,75 @@ mod kernels {
         dynamic_shared = 0,
         min_compute_capability = (12, 0),
     )]
-    pub fn qwen38_flash_next_indexer_select_exact<const ROWS: usize>(
+    pub fn qwen38_flash_next_indexer_select_pass_exact<const ROWS: usize>(
+        scores: *const f32,
+        block_counts: *const u32,
+        scratch: *mut u32,
+        score_stride: u32,
+        row_offset: u32,
+        ctas_per_row: u32,
+        pass: u32,
+    ) {
+        // Up to sixty-four CTAs share one row: the eight private histograms,
+        // the two alternating scan rows and the pass scalars are static shared,
+        // so the entry carries no dynamic shared allocation.
+        static mut SELECT_SCRATCH: SharedArray<u32, SELECT_PASS_SHARED_WORDS, 16> =
+            SharedArray::UNINIT;
+        let shared = core::ptr::addr_of_mut!(SELECT_SCRATCH).cast::<u32>();
+
+        unsafe {
+            indexer_select_pass::<ROWS>(
+                scores,
+                block_counts,
+                scratch,
+                score_stride,
+                row_offset,
+                ctas_per_row,
+                pass,
+                shared,
+            );
+        }
+    }
+
+    /// Expands a resolved threshold into one row tile's selected positions.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[allow(clippy::too_many_arguments)]
+    #[launch_contract(
+        domain = 1,
+        coordinates = u32,
+        block = (256, 1, 1),
+        dynamic_shared = 0,
+        min_compute_capability = (12, 0),
+    )]
+    pub fn qwen38_flash_next_indexer_select_expand_exact<const ROWS: usize>(
         scores: *const f32,
         visible_lengths: *const u32,
         block_counts: *const u32,
         selected: *mut u32,
         selected_counts: *mut u32,
+        scratch: *const u32,
         score_stride: u32,
         row_offset: u32,
+        ctas_per_row: u32,
     ) {
-        // One CTA owns one row. The eight private histograms and the scan row
-        // are static shared: the radix select's four passes reuse them, and the
-        // entry carries no dynamic shared allocation.
-        static mut SELECT_SCRATCH: SharedArray<u32, SELECT_SHARED_WORDS, 16> = SharedArray::UNINIT;
-        let shared = core::ptr::addr_of_mut!(SELECT_SCRATCH).cast::<u32>();
+        // The expansion keeps no histogram: two alternating scan rows and the
+        // scalars the last digit publishes are the whole shared envelope.
+        static mut EXPAND_SCRATCH: SharedArray<u32, SELECT_EXPAND_SHARED_WORDS, 16> =
+            SharedArray::UNINIT;
+        let shared = core::ptr::addr_of_mut!(EXPAND_SCRATCH).cast::<u32>();
 
         unsafe {
-            indexer_select::<ROWS>(
+            indexer_select_expand::<ROWS>(
                 scores,
                 visible_lengths,
                 block_counts,
                 selected,
                 selected_counts,
+                scratch,
                 score_stride,
                 row_offset,
+                ctas_per_row,
                 shared,
             );
         }
@@ -420,25 +474,22 @@ pub struct IndexerPrepareArgs {
     pub rope_cos: *const f32,
     /// Rotary sines `[tokens, 32]` at the launched positions.
     pub rope_sin: *const f32,
-    /// Page table shared with the K/V planes.
-    pub block_tables: *const u32,
-    /// Table row each token's sequence owns.
+    /// Table row each token's sequence owns, which is its ring row on decode.
     pub table_rows: *const u32,
-    /// Entries between two table rows.
-    pub table_stride: u32,
     /// Absolute cache position of each token.
     pub cache_positions: *const u32,
     /// Prepared indexer queries `[tokens, 4, 128]`.
     pub query: *mut f32,
-    /// Raw indexer key plane, one 128-wide BF16 vector per cached token.
-    pub indexer_pages: *mut u16,
+    /// Raw indexer keys: the `[rows, 4, 128]` ring on decode, the
+    /// `[tokens, 128]` round-local plane on a prompt tile.
+    pub raw_keys: *mut u16,
 }
 
 /// Addresses one block-compression launch reads and writes.
 #[derive(Clone, Copy)]
 pub struct IndexerCompressArgs {
-    /// Raw indexer key plane.
-    pub indexer_pages: *const u16,
+    /// Raw indexer keys, in the same shape the round's prepare wrote.
+    pub raw_keys: *const u16,
     /// Indexer key RMSNorm weights `[128]`.
     pub key_norm: *const u16,
     /// Rotary cosines `[rows, blocks, 32]` at each block's first token.
@@ -484,6 +535,8 @@ pub struct IndexerSelectionArgs {
     pub selected: *mut u32,
     /// Selected position count of each token.
     pub selected_counts: *mut u32,
+    /// Selection scratch `[SELECTION_SCRATCH_WORDS]`, private to one tile.
+    pub scratch: *mut u32,
 }
 
 /// Addresses one gather attention launch reads and writes.
@@ -532,7 +585,11 @@ struct PreparedCompress<const ROWS: usize, const BLOCKS: usize> {
 struct PreparedSelection<const ROWS: usize> {
     score: [PreparedLaunch<kernels::__qwen38_flash_next_indexer_score_exact_CudaKernel<ROWS>>;
         SELECTION_BLOCK_BUCKETS.len()],
-    select: PreparedLaunch<kernels::__qwen38_flash_next_indexer_select_exact_CudaKernel<ROWS>>,
+    pass: [PreparedLaunch<kernels::__qwen38_flash_next_indexer_select_pass_exact_CudaKernel<ROWS>>;
+        SELECTION_BLOCK_BUCKETS.len()],
+    expand: [PreparedLaunch<
+        kernels::__qwen38_flash_next_indexer_select_expand_exact_CudaKernel<ROWS>,
+    >; SELECTION_BLOCK_BUCKETS.len()],
 }
 
 struct PreparedSelectedDecode<const TOKENS: usize> {
@@ -566,32 +623,6 @@ impl<const TOKENS: usize> PreparedPrepare<TOKENS> {
                 })?,
         })
     }
-
-    unsafe fn launch(
-        &self,
-        module: &kernels::LoadedModule,
-        stream: &CudaStream,
-        args: IndexerPrepareArgs,
-    ) -> GpuResult<()> {
-        module
-            .qwen38_flash_next_indexer_prepare_exact::<TOKENS>(
-                stream,
-                &self.decode,
-                args.indexer_qk,
-                args.query_norm,
-                args.rope_cos,
-                args.rope_sin,
-                args.block_tables,
-                args.table_rows,
-                args.table_stride,
-                args.cache_positions,
-                args.query,
-                args.indexer_pages,
-            )
-            .map_err(|source| {
-                GpuError::launch("launching the Qwen3.8-Flash-Next indexer prepare", source)
-            })
-    }
 }
 
 impl<const TOKENS: usize> PreparedPrefillPrepare<TOKENS> {
@@ -613,32 +644,6 @@ impl<const TOKENS: usize> PreparedPrefillPrepare<TOKENS> {
                     )
                 })?,
         })
-    }
-
-    unsafe fn launch(
-        &self,
-        module: &kernels::LoadedModule,
-        stream: &CudaStream,
-        args: IndexerPrepareArgs,
-    ) -> GpuResult<()> {
-        module
-            .qwen38_flash_next_indexer_prepare_prefill_exact::<TOKENS>(
-                stream,
-                &self.prefill,
-                args.indexer_qk,
-                args.query_norm,
-                args.rope_cos,
-                args.rope_sin,
-                args.block_tables,
-                args.table_rows,
-                args.table_stride,
-                args.cache_positions,
-                args.query,
-                args.indexer_pages,
-            )
-            .map_err(|source| {
-                GpuError::launch("launching the Qwen3.8-Flash-Next indexer prepare", source)
-            })
     }
 }
 
@@ -662,40 +667,13 @@ impl<const ROWS: usize, const BLOCKS: usize> PreparedCompress<ROWS, BLOCKS> {
                 })?,
         })
     }
-
-    unsafe fn launch(
-        &self,
-        module: &kernels::LoadedModule,
-        stream: &CudaStream,
-        args: IndexerCompressArgs,
-    ) -> GpuResult<()> {
-        module
-            .qwen38_flash_next_indexer_block_compress_exact::<ROWS, BLOCKS>(
-                stream,
-                &self.compress,
-                args.indexer_pages,
-                args.key_norm,
-                args.block_rope_cos,
-                args.block_rope_sin,
-                args.block_tables,
-                args.table_rows,
-                args.table_stride,
-                args.first_blocks,
-                args.block_counts,
-                args.block_keys,
-            )
-            .map_err(|source| {
-                GpuError::launch(
-                    "launching the Qwen3.8-Flash-Next indexer block compression",
-                    source,
-                )
-            })
-    }
 }
 
 impl<const ROWS: usize> PreparedSelection<ROWS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
         let mut score = Vec::with_capacity(SELECTION_BLOCK_BUCKETS.len());
+        let mut pass = Vec::with_capacity(SELECTION_BLOCK_BUCKETS.len());
+        let mut expand = Vec::with_capacity(SELECTION_BLOCK_BUCKETS.len());
         for bucket in SELECTION_BLOCK_BUCKETS {
             let blocks = u32::try_from(ROWS * (bucket / WARPS_PER_CTA)).map_err(|_| {
                 GpuError::invalid_launch("Qwen3.8-Flash-Next indexer scoring grid exceeds u32")
@@ -712,82 +690,50 @@ impl<const ROWS: usize> PreparedSelection<ROWS> {
                         )
                     })?,
             );
+
+            let split =
+                u32::try_from(ROWS * selection_ctas_per_row(ROWS, bucket)).map_err(|_| {
+                    GpuError::invalid_launch(
+                        "Qwen3.8-Flash-Next indexer selection grid exceeds u32",
+                    )
+                })?;
+            pass.push(
+                module
+                    .prepare_qwen38_flash_next_indexer_select_pass_exact::<ROWS>(
+                        LaunchConfig1D::new(split, THREADS, 0),
+                    )
+                    .map_err(|source| {
+                        GpuError::launch(
+                            "preparing the Qwen3.8-Flash-Next indexer selection pass",
+                            source,
+                        )
+                    })?,
+            );
+            expand.push(
+                module
+                    .prepare_qwen38_flash_next_indexer_select_expand_exact::<ROWS>(
+                        LaunchConfig1D::new(split, THREADS, 0),
+                    )
+                    .map_err(|source| {
+                        GpuError::launch(
+                            "preparing the Qwen3.8-Flash-Next indexer selection expansion",
+                            source,
+                        )
+                    })?,
+            );
         }
 
         Ok(Self {
             score: score
                 .try_into()
                 .map_err(|_| GpuError::invalid_launch("indexer scoring bucket count changed"))?,
-            select: module
-                .prepare_qwen38_flash_next_indexer_select_exact::<ROWS>(LaunchConfig1D::new(
-                    u32::try_from(ROWS).map_err(|_| {
-                        GpuError::invalid_launch(
-                            "Qwen3.8-Flash-Next indexer selection grid exceeds u32",
-                        )
-                    })?,
-                    THREADS,
-                    0,
-                ))
-                .map_err(|source| {
-                    GpuError::launch(
-                        "preparing the Qwen3.8-Flash-Next indexer selection route",
-                        source,
-                    )
-                })?,
+            pass: pass
+                .try_into()
+                .map_err(|_| GpuError::invalid_launch("indexer selection bucket count changed"))?,
+            expand: expand
+                .try_into()
+                .map_err(|_| GpuError::invalid_launch("indexer selection bucket count changed"))?,
         })
-    }
-
-    unsafe fn launch_score(
-        &self,
-        module: &kernels::LoadedModule,
-        stream: &CudaStream,
-        index: usize,
-        row_offset: u32,
-        blocks_per_row: u32,
-        args: IndexerSelectionArgs,
-    ) -> GpuResult<()> {
-        module
-            .qwen38_flash_next_indexer_score_exact::<ROWS>(
-                stream,
-                &self.score[index],
-                args.query,
-                args.block_keys,
-                args.block_tables,
-                args.table_rows,
-                args.table_stride,
-                args.block_counts,
-                args.scores,
-                args.score_stride,
-                row_offset,
-                blocks_per_row,
-            )
-            .map_err(|source| {
-                GpuError::launch("launching the Qwen3.8-Flash-Next indexer scoring", source)
-            })
-    }
-
-    unsafe fn launch_select(
-        &self,
-        module: &kernels::LoadedModule,
-        stream: &CudaStream,
-        row_offset: u32,
-        args: IndexerSelectionArgs,
-    ) -> GpuResult<()> {
-        module
-            .qwen38_flash_next_indexer_select_exact::<ROWS>(
-                stream,
-                &self.select,
-                args.scores.cast_const(),
-                args.visible_lengths,
-                args.block_counts,
-                args.selected,
-                args.selected_counts,
-                args.score_stride,
-                row_offset,
-            )
-            .map_err(|source| {
-                GpuError::launch("launching the Qwen3.8-Flash-Next indexer selection", source)
-            })
     }
 }
 
@@ -812,37 +758,6 @@ impl<const TOKENS: usize> PreparedSelectedDecode<TOKENS> {
                     )
                 })?,
         })
-    }
-
-    unsafe fn launch(
-        &self,
-        module: &kernels::LoadedModule,
-        stream: &CudaStream,
-        args: SelectedAttentionArgs,
-    ) -> GpuResult<()> {
-        module
-            .qwen38_flash_next_paged_gqa_selected_exact::<TOKENS>(
-                stream,
-                &self.attention,
-                args.query,
-                args.key_pages,
-                args.value_pages,
-                args.block_tables,
-                args.table_rows,
-                args.table_stride,
-                args.selected,
-                args.selected_counts,
-                args.selected_stride(),
-                args.output,
-                args.key_scale,
-                args.value_scale,
-            )
-            .map_err(|source| {
-                GpuError::launch(
-                    "launching the Qwen3.8-Flash-Next selected attention",
-                    source,
-                )
-            })
     }
 }
 
@@ -870,188 +785,107 @@ impl<const TOKENS: usize> PreparedSelectedPrefill<TOKENS> {
                 })?,
         })
     }
-
-    unsafe fn launch(
-        &self,
-        module: &kernels::LoadedModule,
-        stream: &CudaStream,
-        args: SelectedAttentionArgs,
-    ) -> GpuResult<()> {
-        module
-            .qwen38_flash_next_paged_gqa_prefill_selected_exact::<TOKENS>(
-                stream,
-                &self.attention,
-                args.query,
-                args.key_pages,
-                args.value_pages,
-                args.block_tables,
-                args.table_rows,
-                args.table_stride,
-                args.selected,
-                args.selected_counts,
-                args.selected_stride(),
-                args.output,
-                args.key_scale,
-                args.value_scale,
-            )
-            .map_err(|source| {
-                GpuError::launch(
-                    "launching the Qwen3.8-Flash-Next selected attention",
-                    source,
-                )
-            })
-    }
 }
 
 /// Selects the prepared candidate-block grid covering a round's block count.
-pub fn selection_block_bucket(blocks: usize) -> Option<usize> {
-    SELECTION_BLOCK_BUCKETS
+///
+/// `const` so a composed owner can size its score scratch to the bucket its own
+/// capacity picks, in the same expression that picks it.
+pub const fn selection_block_bucket(blocks: usize) -> Option<usize> {
+    let mut index = 0usize;
+    while index < SELECTION_BLOCK_BUCKETS.len() {
+        if SELECTION_BLOCK_BUCKETS[index] >= blocks {
+            return Some(SELECTION_BLOCK_BUCKETS[index]);
+        }
+        index += 1;
+    }
+
+    None
+}
+
+/// Position in the prepared bucket table covering a round's block count.
+fn selection_bucket_index(blocks: usize) -> GpuResult<usize> {
+    let bucket = selection_block_bucket(blocks).ok_or_else(|| {
+        GpuError::invalid_launch(format!(
+            "Qwen3.8-Flash-Next indexer candidate blocks {blocks} exceed {SELECTION_MAX_BLOCKS}"
+        ))
+    })?;
+
+    Ok(SELECTION_BLOCK_BUCKETS
         .iter()
-        .copied()
-        .find(|&bucket| bucket >= blocks)
+        .position(|&candidate| candidate == bucket)
+        .expect("the bucket came from the table"))
 }
 
-#[derive(ExactRoutes)]
-#[exact_routes(
-    module(kernels::LoadedModule),
-    error(GpuError),
-    dispatch(dispatch_indexer_prepare),
-    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
-    inventory(false)
-)]
-struct IndexerPrepareRoutes {
-    #[route(1)]
-    b1: PreparedPrepare<1>,
-    #[route(2)]
-    b2: PreparedPrepare<2>,
-    #[route(3)]
-    b3: PreparedPrepare<3>,
-    #[route(4)]
-    b4: PreparedPrepare<4>,
-    #[route(5)]
-    b5: PreparedPrepare<5>,
-    #[route(6)]
-    b6: PreparedPrepare<6>,
-    #[route(7)]
-    b7: PreparedPrepare<7>,
-    #[route(8)]
-    b8: PreparedPrepare<8>,
-    #[route(32)]
-    t32: PreparedPrefillPrepare<32>,
-    #[route(64)]
-    t64: PreparedPrefillPrepare<64>,
-    #[route(128)]
-    t128: PreparedPrefillPrepare<128>,
-    #[route(1024)]
-    t1024: PreparedPrefillPrepare<1_024>,
+/// CTAs the selection splits one row's score plane across.
+///
+/// Three limits, in the order they bind. A row must not claim more partial
+/// slots than the scratch plane funds, no split may exceed
+/// [`SELECTION_MAX_CTAS_PER_ROW`], and a CTA whose slice is shorter than its
+/// own 256 threads only adds a partial histogram to reduce. At `B=1` over
+/// 262,144 positions the first two leave 64 CTAs against a single one before,
+/// which is what the stage's cost was bound by; at a 64-row prompt tile the
+/// grid already covers the device and the split narrows to 8.
+pub fn selection_ctas_per_row(rows: usize, blocks: usize) -> usize {
+    let funded = (SELECT_PARTIAL_SLOTS / rows.max(1)).max(1);
+    let useful = blocks.div_ceil(THREADS_PER_CTA).max(1);
+
+    funded.min(SELECTION_MAX_CTAS_PER_ROW).min(useful)
 }
 
-#[derive(ExactRoutes)]
-#[exact_routes(
-    module(kernels::LoadedModule),
-    error(GpuError),
-    dispatch(dispatch_indexer_compress),
-    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
-    inventory(false)
-)]
-struct IndexerCompressRoutes {
-    #[route(1)]
-    b1: PreparedCompress<1, 1>,
-    #[route(2)]
-    b2: PreparedCompress<2, 1>,
-    #[route(3)]
-    b3: PreparedCompress<3, 1>,
-    #[route(4)]
-    b4: PreparedCompress<4, 1>,
-    #[route(5)]
-    b5: PreparedCompress<5, 1>,
-    #[route(6)]
-    b6: PreparedCompress<6, 1>,
-    #[route(7)]
-    b7: PreparedCompress<7, 1>,
-    #[route(8)]
-    b8: PreparedCompress<8, 1>,
-    #[route(32)]
-    t32: PreparedCompress<1, 9>,
-    #[route(64)]
-    t64: PreparedCompress<1, 17>,
-    #[route(128)]
-    t128: PreparedCompress<1, 33>,
-    #[route(1024)]
-    t1024: PreparedCompress<1, 257>,
+macro_rules! decode_widths {
+    ($name:ident, $prepared:ident) => {
+        struct $name {
+            b1: $prepared<1>,
+            b2: $prepared<2>,
+            b3: $prepared<3>,
+            b4: $prepared<4>,
+            b5: $prepared<5>,
+            b6: $prepared<6>,
+            b7: $prepared<7>,
+            b8: $prepared<8>,
+        }
+
+        impl $name {
+            fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
+                Ok(Self {
+                    b1: $prepared::prepare(module)?,
+                    b2: $prepared::prepare(module)?,
+                    b3: $prepared::prepare(module)?,
+                    b4: $prepared::prepare(module)?,
+                    b5: $prepared::prepare(module)?,
+                    b6: $prepared::prepare(module)?,
+                    b7: $prepared::prepare(module)?,
+                    b8: $prepared::prepare(module)?,
+                })
+            }
+        }
+    };
 }
 
-#[derive(ExactRoutes)]
-#[exact_routes(
-    module(kernels::LoadedModule),
-    error(GpuError),
-    dispatch(dispatch_indexer_selection),
-    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64),
-    inventory(false)
-)]
-struct IndexerSelectionRoutes {
-    #[route(1)]
-    b1: PreparedSelection<1>,
-    #[route(2)]
-    b2: PreparedSelection<2>,
-    #[route(3)]
-    b3: PreparedSelection<3>,
-    #[route(4)]
-    b4: PreparedSelection<4>,
-    #[route(5)]
-    b5: PreparedSelection<5>,
-    #[route(6)]
-    b6: PreparedSelection<6>,
-    #[route(7)]
-    b7: PreparedSelection<7>,
-    #[route(8)]
-    b8: PreparedSelection<8>,
-    #[route(32)]
-    t32: PreparedSelection<32>,
-    #[route(64)]
-    t64: PreparedSelection<64>,
-}
-
-#[derive(ExactRoutes)]
-#[exact_routes(
-    module(kernels::LoadedModule),
-    error(GpuError),
-    dispatch(dispatch_selected_paged_gqa),
-    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
-    inventory(false)
-)]
-struct SelectedPagedGqaRoutes {
-    #[route(1)]
-    b1: PreparedSelectedDecode<1>,
-    #[route(2)]
-    b2: PreparedSelectedDecode<2>,
-    #[route(3)]
-    b3: PreparedSelectedDecode<3>,
-    #[route(4)]
-    b4: PreparedSelectedDecode<4>,
-    #[route(5)]
-    b5: PreparedSelectedDecode<5>,
-    #[route(6)]
-    b6: PreparedSelectedDecode<6>,
-    #[route(7)]
-    b7: PreparedSelectedDecode<7>,
-    #[route(8)]
-    b8: PreparedSelectedDecode<8>,
-    #[route(32)]
-    t32: PreparedSelectedPrefill<32>,
-    #[route(64)]
-    t64: PreparedSelectedPrefill<64>,
-    #[route(128)]
-    t128: PreparedSelectedPrefill<128>,
-    #[route(1024)]
-    t1024: PreparedSelectedPrefill<1_024>,
-}
+decode_widths!(PrepareWidths, PreparedPrepare);
+decode_widths!(SelectedDecodeWidths, PreparedSelectedDecode);
 
 /// Prepared Qwen3.8-Flash-Next indexer prepare routes for every admitted width.
 pub struct Qwen38FlashNextIndexerPrepareOp {
     module: kernels::LoadedModule,
-    prepare_routes: IndexerPrepareRoutes,
-    compress_routes: IndexerCompressRoutes,
+    decode: PrepareWidths,
+    t32: PreparedPrefillPrepare<32>,
+    t64: PreparedPrefillPrepare<64>,
+    t128: PreparedPrefillPrepare<128>,
+    t1024: PreparedPrefillPrepare<1_024>,
+    compress_b1: PreparedCompress<1, 1>,
+    compress_b2: PreparedCompress<2, 1>,
+    compress_b3: PreparedCompress<3, 1>,
+    compress_b4: PreparedCompress<4, 1>,
+    compress_b5: PreparedCompress<5, 1>,
+    compress_b6: PreparedCompress<6, 1>,
+    compress_b7: PreparedCompress<7, 1>,
+    compress_b8: PreparedCompress<8, 1>,
+    compress_t32: PreparedCompress<1, 9>,
+    compress_t64: PreparedCompress<1, 17>,
+    compress_t128: PreparedCompress<1, 33>,
+    compress_t1024: PreparedCompress<1, 257>,
 }
 
 impl Qwen38FlashNextIndexerPrepareOp {
@@ -1065,8 +899,23 @@ impl Qwen38FlashNextIndexerPrepareOp {
         })?;
 
         Ok(Self {
-            prepare_routes: IndexerPrepareRoutes::prepare(&module)?,
-            compress_routes: IndexerCompressRoutes::prepare(&module)?,
+            decode: PrepareWidths::prepare(&module)?,
+            t32: PreparedPrefillPrepare::prepare(&module)?,
+            t64: PreparedPrefillPrepare::prepare(&module)?,
+            t128: PreparedPrefillPrepare::prepare(&module)?,
+            t1024: PreparedPrefillPrepare::prepare(&module)?,
+            compress_b1: PreparedCompress::prepare(&module)?,
+            compress_b2: PreparedCompress::prepare(&module)?,
+            compress_b3: PreparedCompress::prepare(&module)?,
+            compress_b4: PreparedCompress::prepare(&module)?,
+            compress_b5: PreparedCompress::prepare(&module)?,
+            compress_b6: PreparedCompress::prepare(&module)?,
+            compress_b7: PreparedCompress::prepare(&module)?,
+            compress_b8: PreparedCompress::prepare(&module)?,
+            compress_t32: PreparedCompress::prepare(&module)?,
+            compress_t64: PreparedCompress::prepare(&module)?,
+            compress_t128: PreparedCompress::prepare(&module)?,
+            compress_t1024: PreparedCompress::prepare(&module)?,
             module,
         })
     }
@@ -1076,36 +925,114 @@ impl Qwen38FlashNextIndexerPrepareOp {
     /// # Safety
     ///
     /// `indexer_qk` covers `[tokens, 640]` BF16 rows and `query` `[tokens, 4,
-    /// 128]` FP32 values. `indexer_pages` covers `[pages, 64, 128]` BF16
-    /// values addressed through the same block table the K/V planes use. Every
-    /// cache position is mapped by its token's table row. Allocations are
-    /// aligned, disjoint, live through completion, and belong to `stream`'s
-    /// context.
+    /// 128]` FP32 values. On a decode width `raw_keys` covers `[rows, 4, 128]`
+    /// BF16 values indexed by each token's table row; on a prompt width it
+    /// covers `[tokens, 128]`. Allocations are aligned, disjoint, live through
+    /// completion, and belong to `stream`'s context.
     pub unsafe fn launch_prepare(
         &self,
         stream: &CudaStream,
         tokens: usize,
         args: IndexerPrepareArgs,
     ) -> GpuResult<()> {
-        dispatch_indexer_prepare!(
-            &self.prepare_routes,
-            tokens,
-            |route| unsafe { route.launch(&self.module, stream, args) },
-            else => Err(GpuError::invalid_launch(format!(
+        macro_rules! launch {
+            ($route:expr, $entry:ident, $tokens:literal) => {{
+                self.module
+                    .$entry::<$tokens>(
+                        stream,
+                        $route,
+                        args.indexer_qk,
+                        args.query_norm,
+                        args.rope_cos,
+                        args.rope_sin,
+                        args.table_rows,
+                        args.cache_positions,
+                        args.query,
+                        args.raw_keys,
+                    )
+                    .map_err(|source| {
+                        GpuError::launch("launching the Qwen3.8-Flash-Next indexer prepare", source)
+                    })
+            }};
+        }
+
+        match tokens {
+            1 => launch!(
+                &self.decode.b1.decode,
+                qwen38_flash_next_indexer_prepare_exact,
+                1
+            ),
+            2 => launch!(
+                &self.decode.b2.decode,
+                qwen38_flash_next_indexer_prepare_exact,
+                2
+            ),
+            3 => launch!(
+                &self.decode.b3.decode,
+                qwen38_flash_next_indexer_prepare_exact,
+                3
+            ),
+            4 => launch!(
+                &self.decode.b4.decode,
+                qwen38_flash_next_indexer_prepare_exact,
+                4
+            ),
+            5 => launch!(
+                &self.decode.b5.decode,
+                qwen38_flash_next_indexer_prepare_exact,
+                5
+            ),
+            6 => launch!(
+                &self.decode.b6.decode,
+                qwen38_flash_next_indexer_prepare_exact,
+                6
+            ),
+            7 => launch!(
+                &self.decode.b7.decode,
+                qwen38_flash_next_indexer_prepare_exact,
+                7
+            ),
+            8 => launch!(
+                &self.decode.b8.decode,
+                qwen38_flash_next_indexer_prepare_exact,
+                8
+            ),
+            32 => launch!(
+                &self.t32.prefill,
+                qwen38_flash_next_indexer_prepare_prefill_exact,
+                32
+            ),
+            64 => launch!(
+                &self.t64.prefill,
+                qwen38_flash_next_indexer_prepare_prefill_exact,
+                64
+            ),
+            128 => launch!(
+                &self.t128.prefill,
+                qwen38_flash_next_indexer_prepare_prefill_exact,
+                128
+            ),
+            1_024 => launch!(
+                &self.t1024.prefill,
+                qwen38_flash_next_indexer_prepare_prefill_exact,
+                1_024
+            ),
+            _ => Err(GpuError::invalid_launch(format!(
                 "Qwen3.8-Flash-Next indexer prepare tokens {tokens} must be one of \
                  1..={SELECTION_MAX_BATCH},32,64,128,1024"
-            )))
-        )
+            ))),
+        }
     }
 
     /// Compresses this round's newly completed micro-blocks into block keys.
     ///
     /// # Safety
     ///
-    /// `block_keys` covers `[pages, 16, 128]` BF16 values on the same block
-    /// table as `indexer_pages`, and every block the count plane names already
-    /// holds all four of its raw keys. The rotary planes cover `[rows, blocks,
-    /// 32]` FP32 values at the block-start positions. Allocations are aligned,
+    /// `block_keys` covers `[pages, 16, 128]` BF16 values on the block table
+    /// this launch names, and every block the count plane names already holds
+    /// all four of its raw keys in the shape its width writes. A prompt round's
+    /// first block is tile-aligned. The rotary planes cover `[rows, blocks, 32]`
+    /// FP32 values at the block-start positions. Allocations are aligned,
     /// disjoint, live through completion, and belong to `stream`'s context.
     pub unsafe fn launch_compress(
         &self,
@@ -1113,22 +1040,66 @@ impl Qwen38FlashNextIndexerPrepareOp {
         tokens: usize,
         args: IndexerCompressArgs,
     ) -> GpuResult<()> {
-        dispatch_indexer_compress!(
-            &self.compress_routes,
-            tokens,
-            |route| unsafe { route.launch(&self.module, stream, args) },
-            else => Err(GpuError::invalid_launch(format!(
+        macro_rules! launch {
+            ($route:expr, $rows:literal, $blocks:literal) => {{
+                self.module
+                    .qwen38_flash_next_indexer_block_compress_exact::<$rows, $blocks>(
+                        stream,
+                        $route,
+                        args.raw_keys,
+                        args.key_norm,
+                        args.block_rope_cos,
+                        args.block_rope_sin,
+                        args.block_tables,
+                        args.table_rows,
+                        args.table_stride,
+                        args.first_blocks,
+                        args.block_counts,
+                        args.block_keys,
+                    )
+                    .map_err(|source| {
+                        GpuError::launch(
+                            "launching the Qwen3.8-Flash-Next indexer block compression",
+                            source,
+                        )
+                    })
+            }};
+        }
+
+        match tokens {
+            1 => launch!(&self.compress_b1.compress, 1, 1),
+            2 => launch!(&self.compress_b2.compress, 2, 1),
+            3 => launch!(&self.compress_b3.compress, 3, 1),
+            4 => launch!(&self.compress_b4.compress, 4, 1),
+            5 => launch!(&self.compress_b5.compress, 5, 1),
+            6 => launch!(&self.compress_b6.compress, 6, 1),
+            7 => launch!(&self.compress_b7.compress, 7, 1),
+            8 => launch!(&self.compress_b8.compress, 8, 1),
+            32 => launch!(&self.compress_t32.compress, 1, 9),
+            64 => launch!(&self.compress_t64.compress, 1, 17),
+            128 => launch!(&self.compress_t128.compress, 1, 33),
+            1_024 => launch!(&self.compress_t1024.compress, 1, 257),
+            _ => Err(GpuError::invalid_launch(format!(
                 "Qwen3.8-Flash-Next indexer block compression tokens {tokens} must be one of \
                  1..={SELECTION_MAX_BATCH},32,64,128,1024"
-            )))
-        )
+            ))),
+        }
     }
 }
 
 /// Prepared Qwen3.8-Flash-Next block scoring and selection routes.
 pub struct Qwen38FlashNextIndexerSelectionOp {
     module: kernels::LoadedModule,
-    routes: IndexerSelectionRoutes,
+    b1: PreparedSelection<1>,
+    b2: PreparedSelection<2>,
+    b3: PreparedSelection<3>,
+    b4: PreparedSelection<4>,
+    b5: PreparedSelection<5>,
+    b6: PreparedSelection<6>,
+    b7: PreparedSelection<7>,
+    b8: PreparedSelection<8>,
+    t32: PreparedSelection<32>,
+    t64: PreparedSelection<64>,
 }
 
 impl Qwen38FlashNextIndexerSelectionOp {
@@ -1141,7 +1112,16 @@ impl Qwen38FlashNextIndexerSelectionOp {
         })?;
 
         Ok(Self {
-            routes: IndexerSelectionRoutes::prepare(&module)?,
+            b1: PreparedSelection::prepare(&module)?,
+            b2: PreparedSelection::prepare(&module)?,
+            b3: PreparedSelection::prepare(&module)?,
+            b4: PreparedSelection::prepare(&module)?,
+            b5: PreparedSelection::prepare(&module)?,
+            b6: PreparedSelection::prepare(&module)?,
+            b7: PreparedSelection::prepare(&module)?,
+            b8: PreparedSelection::prepare(&module)?,
+            t32: PreparedSelection::prepare(&module)?,
+            t64: PreparedSelection::prepare(&module)?,
             module,
         })
     }
@@ -1152,8 +1132,9 @@ impl Qwen38FlashNextIndexerSelectionOp {
     ///
     /// `scores` covers `[rows, score_stride]` FP32 values with `score_stride`
     /// at least the round's candidate count, `selected` covers `[tokens,
-    /// 2051]` and `selected_counts` `[tokens]`. Every named block is resident
-    /// in the block-key plane. Allocations are aligned, disjoint, live through
+    /// 2051]`, `selected_counts` `[tokens]` and `scratch`
+    /// [`SELECTION_SCRATCH_WORDS`]. Every named block is resident in the
+    /// block-key plane. Allocations are aligned, disjoint, live through
     /// completion, and belong to `stream`'s context.
     pub unsafe fn launch(
         &self,
@@ -1166,7 +1147,7 @@ impl Qwen38FlashNextIndexerSelectionOp {
         // SAFETY: the caller's plane contract reaches both stages unchanged.
         unsafe {
             self.launch_score(stream, rows, row_offset, maximum_blocks, args)?;
-            self.launch_select(stream, rows, row_offset, args)
+            self.launch_select(stream, rows, row_offset, maximum_blocks, args)
         }
     }
 
@@ -1187,42 +1168,59 @@ impl Qwen38FlashNextIndexerSelectionOp {
         maximum_blocks: usize,
         args: IndexerSelectionArgs,
     ) -> GpuResult<()> {
-        let bucket = selection_block_bucket(maximum_blocks).ok_or_else(|| {
-            GpuError::invalid_launch(format!(
-                "Qwen3.8-Flash-Next indexer candidate blocks {maximum_blocks} exceed \
-                 {SELECTION_MAX_BLOCKS}"
-            ))
-        })?;
-        let index = SELECTION_BLOCK_BUCKETS
-            .iter()
-            .position(|&candidate| candidate == bucket)
-            .expect("the bucket came from the table");
+        let index = selection_bucket_index(maximum_blocks)?;
         let row_offset = u32::try_from(row_offset)
             .map_err(|_| GpuError::invalid_launch("selection row offset exceeds u32"))?;
-        let blocks_per_row = u32::try_from(bucket)
+        let blocks_per_row = u32::try_from(SELECTION_BLOCK_BUCKETS[index])
             .map_err(|_| GpuError::invalid_launch("selection block bucket exceeds u32"))?;
 
-        dispatch_indexer_selection!(
-            &self.routes,
-            rows,
-            |route| unsafe {
-                route.launch_score(
-                    &self.module,
-                    stream,
-                    index,
-                    row_offset,
-                    blocks_per_row,
-                    args,
-                )
-            },
-            else => Err(GpuError::invalid_launch(format!(
+        macro_rules! launch {
+            ($route:expr, $rows:literal) => {{
+                self.module
+                    .qwen38_flash_next_indexer_score_exact::<$rows>(
+                        stream,
+                        &$route.score[index],
+                        args.query,
+                        args.block_keys,
+                        args.block_tables,
+                        args.table_rows,
+                        args.table_stride,
+                        args.block_counts,
+                        args.scores,
+                        args.score_stride,
+                        row_offset,
+                        blocks_per_row,
+                    )
+                    .map_err(|source| {
+                        GpuError::launch("launching the Qwen3.8-Flash-Next indexer scoring", source)
+                    })
+            }};
+        }
+
+        match rows {
+            1 => launch!(self.b1, 1),
+            2 => launch!(self.b2, 2),
+            3 => launch!(self.b3, 3),
+            4 => launch!(self.b4, 4),
+            5 => launch!(self.b5, 5),
+            6 => launch!(self.b6, 6),
+            7 => launch!(self.b7, 7),
+            8 => launch!(self.b8, 8),
+            32 => launch!(self.t32, 32),
+            64 => launch!(self.t64, 64),
+            _ => Err(GpuError::invalid_launch(format!(
                 "Qwen3.8-Flash-Next indexer selection rows {rows} must be one of \
                  1..={SELECTION_MAX_BATCH},32,64"
-            )))
-        )
+            ))),
+        }
     }
 
     /// Selects one row tile's top-512 blocks from the published score plane.
+    ///
+    /// Five launches: one per radix digit, then the expansion. The digit a pass
+    /// resolves is the prefix its successor filters on, and a partitioned
+    /// histogram is only complete once every CTA of the row has published its
+    /// bins, so the sequence points are the launches themselves.
     ///
     /// # Safety
     ///
@@ -1233,29 +1231,89 @@ impl Qwen38FlashNextIndexerSelectionOp {
         stream: &CudaStream,
         rows: usize,
         row_offset: usize,
+        maximum_blocks: usize,
         args: IndexerSelectionArgs,
     ) -> GpuResult<()> {
+        let index = selection_bucket_index(maximum_blocks)?;
         let row_offset = u32::try_from(row_offset)
             .map_err(|_| GpuError::invalid_launch("selection row offset exceeds u32"))?;
+        let ctas_per_row =
+            u32::try_from(selection_ctas_per_row(rows, SELECTION_BLOCK_BUCKETS[index]))
+                .map_err(|_| GpuError::invalid_launch("selection split exceeds u32"))?;
 
-        dispatch_indexer_selection!(
-            &self.routes,
-            rows,
-            |route| unsafe {
-                route.launch_select(&self.module, stream, row_offset, args)
-            },
-            else => Err(GpuError::invalid_launch(format!(
+        macro_rules! launch {
+            ($route:expr, $rows:literal) => {{
+                for pass in 0..SELECTION_RADIX_PASSES as u32 {
+                    self.module
+                        .qwen38_flash_next_indexer_select_pass_exact::<$rows>(
+                            stream,
+                            &$route.pass[index],
+                            args.scores.cast_const(),
+                            args.block_counts,
+                            args.scratch,
+                            args.score_stride,
+                            row_offset,
+                            ctas_per_row,
+                            pass,
+                        )
+                        .map_err(|source| {
+                            GpuError::launch(
+                                "launching the Qwen3.8-Flash-Next indexer selection pass",
+                                source,
+                            )
+                        })?;
+                }
+
+                self.module
+                    .qwen38_flash_next_indexer_select_expand_exact::<$rows>(
+                        stream,
+                        &$route.expand[index],
+                        args.scores.cast_const(),
+                        args.visible_lengths,
+                        args.block_counts,
+                        args.selected,
+                        args.selected_counts,
+                        args.scratch.cast_const(),
+                        args.score_stride,
+                        row_offset,
+                        ctas_per_row,
+                    )
+                    .map_err(|source| {
+                        GpuError::launch(
+                            "launching the Qwen3.8-Flash-Next indexer selection expansion",
+                            source,
+                        )
+                    })
+            }};
+        }
+
+        match rows {
+            1 => launch!(self.b1, 1),
+            2 => launch!(self.b2, 2),
+            3 => launch!(self.b3, 3),
+            4 => launch!(self.b4, 4),
+            5 => launch!(self.b5, 5),
+            6 => launch!(self.b6, 6),
+            7 => launch!(self.b7, 7),
+            8 => launch!(self.b8, 8),
+            32 => launch!(self.t32, 32),
+            64 => launch!(self.t64, 64),
+            _ => Err(GpuError::invalid_launch(format!(
                 "Qwen3.8-Flash-Next indexer selection rows {rows} must be one of \
                  1..={SELECTION_MAX_BATCH},32,64"
-            )))
-        )
+            ))),
+        }
     }
 }
 
 /// Prepared Qwen3.8-Flash-Next gather attention over selected positions.
 pub struct Qwen38FlashNextSelectedPagedGqaOp {
     module: kernels::LoadedModule,
-    routes: SelectedPagedGqaRoutes,
+    decode: SelectedDecodeWidths,
+    t32: PreparedSelectedPrefill<32>,
+    t64: PreparedSelectedPrefill<64>,
+    t128: PreparedSelectedPrefill<128>,
+    t1024: PreparedSelectedPrefill<1_024>,
 }
 
 impl Qwen38FlashNextSelectedPagedGqaOp {
@@ -1268,7 +1326,11 @@ impl Qwen38FlashNextSelectedPagedGqaOp {
         })?;
 
         Ok(Self {
-            routes: SelectedPagedGqaRoutes::prepare(&module)?,
+            decode: SelectedDecodeWidths::prepare(&module)?,
+            t32: PreparedSelectedPrefill::prepare(&module)?,
+            t64: PreparedSelectedPrefill::prepare(&module)?,
+            t128: PreparedSelectedPrefill::prepare(&module)?,
+            t1024: PreparedSelectedPrefill::prepare(&module)?,
             module,
         })
     }
@@ -1302,15 +1364,100 @@ impl Qwen38FlashNextSelectedPagedGqaOp {
             ));
         }
 
-        dispatch_selected_paged_gqa!(
-            &self.routes,
-            tokens,
-            |route| unsafe { route.launch(&self.module, stream, args) },
-            else => Err(GpuError::invalid_launch(format!(
+        macro_rules! launch {
+            ($route:expr, $entry:ident, $tokens:literal) => {{
+                self.module
+                    .$entry::<$tokens>(
+                        stream,
+                        $route,
+                        args.query,
+                        args.key_pages,
+                        args.value_pages,
+                        args.block_tables,
+                        args.table_rows,
+                        args.table_stride,
+                        args.selected,
+                        args.selected_counts,
+                        args.selected_stride(),
+                        args.output,
+                        args.key_scale,
+                        args.value_scale,
+                    )
+                    .map_err(|source| {
+                        GpuError::launch(
+                            "launching the Qwen3.8-Flash-Next selected attention",
+                            source,
+                        )
+                    })
+            }};
+        }
+
+        match tokens {
+            1 => launch!(
+                &self.decode.b1.attention,
+                qwen38_flash_next_paged_gqa_selected_exact,
+                1
+            ),
+            2 => launch!(
+                &self.decode.b2.attention,
+                qwen38_flash_next_paged_gqa_selected_exact,
+                2
+            ),
+            3 => launch!(
+                &self.decode.b3.attention,
+                qwen38_flash_next_paged_gqa_selected_exact,
+                3
+            ),
+            4 => launch!(
+                &self.decode.b4.attention,
+                qwen38_flash_next_paged_gqa_selected_exact,
+                4
+            ),
+            5 => launch!(
+                &self.decode.b5.attention,
+                qwen38_flash_next_paged_gqa_selected_exact,
+                5
+            ),
+            6 => launch!(
+                &self.decode.b6.attention,
+                qwen38_flash_next_paged_gqa_selected_exact,
+                6
+            ),
+            7 => launch!(
+                &self.decode.b7.attention,
+                qwen38_flash_next_paged_gqa_selected_exact,
+                7
+            ),
+            8 => launch!(
+                &self.decode.b8.attention,
+                qwen38_flash_next_paged_gqa_selected_exact,
+                8
+            ),
+            32 => launch!(
+                &self.t32.attention,
+                qwen38_flash_next_paged_gqa_prefill_selected_exact,
+                32
+            ),
+            64 => launch!(
+                &self.t64.attention,
+                qwen38_flash_next_paged_gqa_prefill_selected_exact,
+                64
+            ),
+            128 => launch!(
+                &self.t128.attention,
+                qwen38_flash_next_paged_gqa_prefill_selected_exact,
+                128
+            ),
+            1_024 => launch!(
+                &self.t1024.attention,
+                qwen38_flash_next_paged_gqa_prefill_selected_exact,
+                1_024
+            ),
+            _ => Err(GpuError::invalid_launch(format!(
                 "Qwen3.8-Flash-Next selected attention tokens {tokens} must be one of \
                  1..={SELECTION_MAX_BATCH},32,64,128,1024"
-            )))
-        )
+            ))),
+        }
     }
 }
 
@@ -1357,16 +1504,26 @@ pub(crate) fn qwen38_flash_next_indexer_ptx_names() -> Vec<&'static str> {
         kernels::qwen38_flash_next_indexer_score_exact_ptx_name::<8>(),
         kernels::qwen38_flash_next_indexer_score_exact_ptx_name::<32>(),
         kernels::qwen38_flash_next_indexer_score_exact_ptx_name::<64>(),
-        kernels::qwen38_flash_next_indexer_select_exact_ptx_name::<1>(),
-        kernels::qwen38_flash_next_indexer_select_exact_ptx_name::<2>(),
-        kernels::qwen38_flash_next_indexer_select_exact_ptx_name::<3>(),
-        kernels::qwen38_flash_next_indexer_select_exact_ptx_name::<4>(),
-        kernels::qwen38_flash_next_indexer_select_exact_ptx_name::<5>(),
-        kernels::qwen38_flash_next_indexer_select_exact_ptx_name::<6>(),
-        kernels::qwen38_flash_next_indexer_select_exact_ptx_name::<7>(),
-        kernels::qwen38_flash_next_indexer_select_exact_ptx_name::<8>(),
-        kernels::qwen38_flash_next_indexer_select_exact_ptx_name::<32>(),
-        kernels::qwen38_flash_next_indexer_select_exact_ptx_name::<64>(),
+        kernels::qwen38_flash_next_indexer_select_pass_exact_ptx_name::<1>(),
+        kernels::qwen38_flash_next_indexer_select_pass_exact_ptx_name::<2>(),
+        kernels::qwen38_flash_next_indexer_select_pass_exact_ptx_name::<3>(),
+        kernels::qwen38_flash_next_indexer_select_pass_exact_ptx_name::<4>(),
+        kernels::qwen38_flash_next_indexer_select_pass_exact_ptx_name::<5>(),
+        kernels::qwen38_flash_next_indexer_select_pass_exact_ptx_name::<6>(),
+        kernels::qwen38_flash_next_indexer_select_pass_exact_ptx_name::<7>(),
+        kernels::qwen38_flash_next_indexer_select_pass_exact_ptx_name::<8>(),
+        kernels::qwen38_flash_next_indexer_select_pass_exact_ptx_name::<32>(),
+        kernels::qwen38_flash_next_indexer_select_pass_exact_ptx_name::<64>(),
+        kernels::qwen38_flash_next_indexer_select_expand_exact_ptx_name::<1>(),
+        kernels::qwen38_flash_next_indexer_select_expand_exact_ptx_name::<2>(),
+        kernels::qwen38_flash_next_indexer_select_expand_exact_ptx_name::<3>(),
+        kernels::qwen38_flash_next_indexer_select_expand_exact_ptx_name::<4>(),
+        kernels::qwen38_flash_next_indexer_select_expand_exact_ptx_name::<5>(),
+        kernels::qwen38_flash_next_indexer_select_expand_exact_ptx_name::<6>(),
+        kernels::qwen38_flash_next_indexer_select_expand_exact_ptx_name::<7>(),
+        kernels::qwen38_flash_next_indexer_select_expand_exact_ptx_name::<8>(),
+        kernels::qwen38_flash_next_indexer_select_expand_exact_ptx_name::<32>(),
+        kernels::qwen38_flash_next_indexer_select_expand_exact_ptx_name::<64>(),
         kernels::qwen38_flash_next_paged_gqa_selected_exact_ptx_name::<1>(),
         kernels::qwen38_flash_next_paged_gqa_selected_exact_ptx_name::<2>(),
         kernels::qwen38_flash_next_paged_gqa_selected_exact_ptx_name::<3>(),
@@ -1385,13 +1542,14 @@ pub(crate) fn qwen38_flash_next_indexer_ptx_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexerCompressRoutes, IndexerPrepareRoutes, IndexerSelectionRoutes,
         SELECTION_BLOCK_BUCKETS, SELECTION_BLOCKS_PER_PAGE, SELECTION_MAX_BLOCKS,
-        SELECTION_MAX_SELECTED, SELECTION_ROW_TILE, SelectedPagedGqaRoutes,
-        qwen38_flash_next_indexer_ptx_names, selection_block_bucket, selection_round_blocks,
-        selection_round_rows,
+        SELECTION_MAX_CTAS_PER_ROW, SELECTION_MAX_SELECTED, SELECTION_ROW_TILE,
+        SELECTION_SCRATCH_WORDS, qwen38_flash_next_indexer_ptx_names, selection_block_bucket,
+        selection_ctas_per_row, selection_round_blocks, selection_round_rows,
     };
-    use crate::device::qsa_indexer::{SELECT_SHARED_WORDS, WARPS_PER_CTA};
+    use crate::device::qsa_indexer::{
+        SELECT_EXPAND_SHARED_WORDS, SELECT_PARTIAL_SLOTS, SELECT_PASS_SHARED_WORDS, WARPS_PER_CTA,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -1400,9 +1558,20 @@ mod tests {
         assert_eq!(SELECTION_MAX_BLOCKS, 65_536);
         assert_eq!(SELECTION_BLOCKS_PER_PAGE, 16);
         assert_eq!(SELECTION_ROW_TILE, 64);
-        // Eight private histograms of 256 bins, the warp scan row, and the two
-        // scalars a radix pass publishes.
-        assert_eq!(SELECT_SHARED_WORDS * size_of::<u32>(), 8_232);
+        // Eight private histograms of 256 bins, two alternating warp scan rows,
+        // and the scalars a radix pass publishes.
+        assert_eq!(SELECT_PASS_SHARED_WORDS * size_of::<u32>(), 8_272);
+        // The expansion keeps no histogram at all.
+        assert_eq!(SELECT_EXPAND_SHARED_WORDS * size_of::<u32>(), 80);
+        // Two partial-histogram buffers, the four-pass state chain per row, and
+        // the three above-the-digit counts a split publishes per row.
+        assert_eq!(
+            SELECTION_SCRATCH_WORDS,
+            2 * SELECT_PARTIAL_SLOTS * 256
+                + SELECTION_ROW_TILE * 4 * 2
+                + SELECTION_ROW_TILE * 3 * 64
+        );
+        assert_eq!(SELECTION_SCRATCH_WORDS * size_of::<u32>(), 1_099_776);
 
         for bucket in SELECTION_BLOCK_BUCKETS {
             assert_eq!(bucket % WARPS_PER_CTA, 0, "bucket {bucket} splits unevenly");
@@ -1414,6 +1583,37 @@ mod tests {
         assert_eq!(selection_block_bucket(32_769), Some(65_536));
         assert_eq!(selection_block_bucket(65_536), Some(65_536));
         assert_eq!(selection_block_bucket(65_537), None);
+    }
+
+    /// The split is a launch shape, so its three limits are pinned rather than
+    /// inferred: no launch may claim more partial slots than the scratch funds,
+    /// none may exceed the prepared ceiling, and a CTA is never given a slice
+    /// shorter than its own thread count.
+    #[test]
+    fn the_selection_split_stays_inside_the_scratch_it_is_given() {
+        for rows in [1usize, 2, 3, 4, 5, 6, 7, 8, 32, 64] {
+            for bucket in SELECTION_BLOCK_BUCKETS {
+                let ctas = selection_ctas_per_row(rows, bucket);
+                assert!(ctas >= 1);
+                assert!(ctas <= SELECTION_MAX_CTAS_PER_ROW);
+                assert!(
+                    rows * ctas <= SELECT_PARTIAL_SLOTS,
+                    "rows {rows} bucket {bucket} claims {} slots",
+                    rows * ctas
+                );
+                assert!(bucket.div_ceil(ctas) >= 256 || ctas == bucket.div_ceil(256).max(1));
+            }
+        }
+
+        // The shapes the deep ladder drives, stated rather than derived: one row
+        // over 262,144 positions takes the widest split, and a full prompt tile
+        // already covers the device with eight.
+        assert_eq!(selection_ctas_per_row(1, 65_536), 64);
+        assert_eq!(selection_ctas_per_row(1, 32_768), 64);
+        assert_eq!(selection_ctas_per_row(1, 8_192), 32);
+        assert_eq!(selection_ctas_per_row(8, 8_192), 32);
+        assert_eq!(selection_ctas_per_row(64, 8_192), 8);
+        assert_eq!(selection_ctas_per_row(1, 64), 1);
     }
 
     #[test]
@@ -1429,24 +1629,11 @@ mod tests {
     }
 
     #[test]
-    fn route_tables_cover_only_the_admitted_widths() {
-        let full = vec![1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1_024];
-
-        assert_eq!(IndexerPrepareRoutes::admitted_rows(), full);
-        assert_eq!(IndexerCompressRoutes::admitted_rows(), full);
-        assert_eq!(
-            IndexerSelectionRoutes::admitted_rows(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 32, 64]
-        );
-        assert_eq!(SelectedPagedGqaRoutes::admitted_rows(), full);
-    }
-
-    #[test]
     fn ptx_inventory_covers_every_admitted_selection_route() {
         let names = qwen38_flash_next_indexer_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 56);
+        assert_eq!(names.len(), 66);
         assert_eq!(unique.len(), names.len());
     }
 }
