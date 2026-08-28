@@ -163,6 +163,9 @@ pub use qwen38_flash_next::mtp_program::{
     Qwen38FlashNextMtpAttention, Qwen38FlashNextMtpLoadStats, Qwen38FlashNextMtpProgram,
     Qwen38FlashNextMtpStepTelemetry, Qwen38FlashNextMtpStream,
 };
+pub use qwen38_flash_next::mtp_serving::{
+    QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS, Qwen38FlashNextMtpResidentGenerator,
+};
 #[cfg(feature = "qualification")]
 pub use qwen38_flash_next::qsa_moe_layer::{
     Qwen38FlashNextQsaMoeLayerImmutable, Qwen38FlashNextQsaMoeLayerInputs,

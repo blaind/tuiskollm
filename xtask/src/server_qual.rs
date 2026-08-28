@@ -362,16 +362,16 @@ mod tests {
         assert!(error.to_string().contains("mtp-draft-3"));
 
         validate_health_response(
-            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"generation_route\":\"compact-b1-8\",\"status\":\"ok\"}",
-            "compact-b1-8",
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"generation_route\":\"mtp-draft-3-b1-1\",\"status\":\"ok\"}",
+            "mtp-draft-3-b1-1",
         )
         .unwrap();
         let crossed = validate_health_response(
             b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"generation_route\":\"mtp-draft-3\",\"status\":\"ok\"}",
-            "compact-b1-8",
+            "mtp-draft-3-b1-1",
         )
         .unwrap_err();
-        assert!(crossed.to_string().contains("compact-b1-8"));
+        assert!(crossed.to_string().contains("mtp-draft-3-b1-1"));
     }
 
     #[test]

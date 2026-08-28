@@ -25,9 +25,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
 use tokio::sync::oneshot;
 use tuisko_engine::{
-    EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, Qwen35ResidentMtpBatchGenerator,
-    Qwen36ResidentBatchGenerator, Qwen38FlashNextResidentBatchGenerator, ResidentBatchAdmission,
-    ResidentLoadPhase, ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentRequestId,
+    EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS,
+    Qwen35ResidentMtpBatchGenerator, Qwen36ResidentBatchGenerator,
+    Qwen38FlashNextMtpResidentGenerator, ResidentBatchAdmission, ResidentLoadPhase,
+    ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentRequestId,
 };
 use tuisko_frontend::GenerationDefaults;
 use tuisko_model::{
@@ -42,6 +43,7 @@ const GENERATION_REPLY_BUFFER: usize = 32;
 const MTP_GENERATION_ROUTE: &str = "mtp-draft-3";
 const QWEN35_MTP_GENERATION_ROUTE: &str = "mtp-b1-compact-b2-8";
 const COMPACT_GENERATION_ROUTE: &str = "compact-b1-8";
+const QWEN38_FLASH_NEXT_MTP_GENERATION_ROUTE: &str = "mtp-draft-3-b1-1";
 const QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT: &str = "medium";
 
 /// Startup configuration for the one exact resident server.
@@ -172,7 +174,8 @@ impl ServerModel {
         match self {
             Self::Qwen38 => MTP_GENERATION_ROUTE,
             Self::Qwen35 => QWEN35_MTP_GENERATION_ROUTE,
-            Self::Qwen36 | Self::Qwen38FlashNext => COMPACT_GENERATION_ROUTE,
+            Self::Qwen36 => COMPACT_GENERATION_ROUTE,
+            Self::Qwen38FlashNext => QWEN38_FLASH_NEXT_MTP_GENERATION_ROUTE,
         }
     }
 
@@ -476,17 +479,19 @@ fn load_qwen36(snapshot: &Path) -> Result<(Qwen36ResidentBatchGenerator, Ready),
 fn load_qwen38_flash_next(
     snapshot: &Path,
     progress: &ResidentLoadProgress,
-) -> Result<(Qwen38FlashNextResidentBatchGenerator, Ready), String> {
+) -> Result<(Qwen38FlashNextMtpResidentGenerator, Ready), String> {
     let checkpoint_start = Instant::now();
     let admitted = CheckpointSnapshot::<Qwen38FlashNext>::open(snapshot)
         .map(Arc::new)
         .map_err(|error| format!("admitting {}: {error}", snapshot.display()))?;
     let checkpoint_admission = checkpoint_start.elapsed();
     let tensor_count = admitted.tensor_count();
-    let generator = Qwen38FlashNextResidentBatchGenerator::from_snapshot_device_zero_with_progress(
+    let generator = Qwen38FlashNextMtpResidentGenerator::from_snapshot_device_zero_with_progress(
         admitted, progress,
     )
-    .map_err(|error| format!("loading the resident Qwen3.8 Flash-Next program: {error}"))?;
+    .map_err(|error| {
+        format!("loading the resident Qwen3.8 Flash-Next target and draft: {error}")
+    })?;
     let device_name = generator
         .context()
         .device_name()
@@ -497,7 +502,8 @@ fn load_qwen38_flash_next(
     if !generator.mapped_primary() {
         return Err("Qwen3.8 Flash-Next serving requires mapped primary expert weights".into());
     }
-    let load_stats = generator.load_stats();
+    let load_stats = generator.target_load_stats();
+    let draft_stats = generator.load_stats();
 
     let startup = Ready {
         model_id: Qwen38FlashNext::MODEL_ID,
@@ -508,15 +514,16 @@ fn load_qwen38_flash_next(
         checkpoint_admission,
         weight_load: load_stats
             .weight_upload()
-            .saturating_sub(load_stats.expert_stage()),
+            .saturating_sub(load_stats.expert_stage())
+            + draft_stats.upload(),
         source_prefault: load_stats.expert_stage(),
-        graph_capture: load_stats.graph_capture(),
+        graph_capture: load_stats.graph_capture() + draft_stats.capture(),
         tensor_count,
         upload_bytes: generator.resident_weight_bytes(),
-        prefault_bytes: load_stats.staged_bytes(),
+        prefault_bytes: load_stats.staged_bytes() + draft_stats.staged_bytes(),
         arena_bytes,
         host_stager_bytes: generator.host_stager_bytes(),
-        slot_capacity: generator.slot_capacity(),
+        slot_capacity: QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS,
         context_capacity: generator.context_capacity(),
         detailed_load_timing: true,
     };
@@ -1120,7 +1127,7 @@ mod tests {
     use tokio::sync::mpsc::channel;
     use tuisko_engine::{
         ChatGenerationRequest, EngineError, EngineErrorCode, FinishReason, GenerationStep,
-        MAX_BATCH,
+        MAX_BATCH, QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS,
     };
     use tuisko_frontend::{ChatMessage, GenerationDefaults};
     use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext};
@@ -1456,7 +1463,7 @@ mod tests {
             (
                 Qwen38FlashNext::MODEL_ID,
                 ServerModel::Qwen38FlashNext,
-                "compact-b1-8",
+                "mtp-draft-3-b1-1",
             ),
         ] {
             let target = ServerModel::from_model_id(model).unwrap();
@@ -1464,6 +1471,10 @@ mod tests {
             assert_eq!(target.model_id(), model);
             assert_eq!(target.generation_route(), route);
         }
+        assert_ne!(
+            ServerModel::Qwen36.generation_route(),
+            ServerModel::Qwen38FlashNext.generation_route()
+        );
         let error = ServerModel::from_model_id("moving/model").unwrap_err();
         assert!(error.contains("unsupported model `moving/model`"));
         for model in ServerModel::ALL {
@@ -1508,8 +1519,8 @@ mod tests {
             prefault_bytes: 0,
             arena_bytes: 29 * (1 << 30),
             host_stager_bytes: 15 * (1 << 20),
-            slot_capacity: MAX_BATCH,
-            context_capacity: 262_144,
+            slot_capacity: QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS,
+            context_capacity: 240_960,
             detailed_load_timing: true,
         };
         let output = render_startup(
@@ -1519,9 +1530,9 @@ mod tests {
             false,
         );
 
-        assert!(output.contains("compact-b1-8"));
-        assert!(output.contains("8 slots"));
-        assert!(output.contains("context 262144"));
+        assert!(output.contains("mtp-draft-3-b1-1"));
+        assert!(output.contains("1 slots"));
+        assert!(output.contains("context 240960"));
     }
 
     #[test]
