@@ -13,7 +13,8 @@ use crate::qwen38_flash_next::qsa_moe_layer_layout::QWEN38_FLASH_NEXT_ATTENTION_
 use crate::qwen38_flash_next::resident_model_layout::{
     QWEN38_FLASH_NEXT_DEVICE_BUDGET_BYTES, QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES,
     QWEN38_FLASH_NEXT_PRIMARY_SOURCE, QWEN38_FLASH_NEXT_REQUIRED_HEADROOM_BYTES,
-    QWEN38_FLASH_NEXT_RESIDENT_MAX_ROWS, Qwen38FlashNextQsaWeightRegions,
+    QWEN38_FLASH_NEXT_RESIDENT_MAX_ROWS, QWEN38_FLASH_NEXT_RESIDENT_ROUND_BLOCKS,
+    QWEN38_FLASH_NEXT_RESIDENT_SCORE_STRIDE, Qwen38FlashNextQsaWeightRegions,
     Qwen38FlashNextResidentLayout,
 };
 use crate::{EngineError, EngineResult, MAX_BATCH, StreamingResidencyAccounting};
@@ -21,6 +22,7 @@ use std::mem::size_of;
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
 use tuisko_kernels_sm120::{
     QWEN38_FLASH_NEXT_MTP_DOWN_EXTENT_BYTES, QWEN38_FLASH_NEXT_MTP_GATE_UP_EXTENT_BYTES,
+    SELECTION_MAX_SELECTED, SELECTION_ROW_TILE, SELECTION_SCRATCH_WORDS,
 };
 use tuisko_model::{Arch, Qwen38FlashNext};
 
@@ -109,6 +111,10 @@ pub(crate) struct Qwen38FlashNextMtpWorkspace {
     pub(crate) indexer_qk: ArenaRegion<u16>,
     pub(crate) indexer_query: ArenaRegion<f32>,
     pub(crate) indexer_raw_round: ArenaRegion<u16>,
+    pub(crate) scores: ArenaRegion<f32>,
+    pub(crate) select_scratch: ArenaRegion<u32>,
+    pub(crate) selected: ArenaRegion<u32>,
+    pub(crate) selected_counts: ArenaRegion<u32>,
 
     pub(crate) router_logits: ArenaRegion<u16>,
     pub(crate) expert_indices: ArenaRegion<u16>,
@@ -135,6 +141,11 @@ pub(crate) struct Qwen38FlashNextMtpWorkspace {
     pub(crate) lengths: ArenaRegion<u32>,
     pub(crate) rope_cos: ArenaRegion<f32>,
     pub(crate) rope_sin: ArenaRegion<f32>,
+    pub(crate) block_rope_cos: ArenaRegion<f32>,
+    pub(crate) block_rope_sin: ArenaRegion<f32>,
+    pub(crate) candidate_blocks: ArenaRegion<u32>,
+    pub(crate) closing_first_blocks: ArenaRegion<u32>,
+    pub(crate) closing_block_counts: ArenaRegion<u32>,
 }
 
 /// Draft-only K/V, block-key, and indexer planes.
@@ -519,6 +530,22 @@ fn reserve_workspace(builder: &mut ArenaLayout) -> EngineResult<Qwen38FlashNextM
         )?,
     )?;
     let indexer_raw = product("Flash-Next MTP indexer raw rows", rows, A::INDEXER_HEAD_DIM)?;
+    let score_plane = product(
+        "Flash-Next MTP score scratch",
+        SELECTION_ROW_TILE,
+        QWEN38_FLASH_NEXT_RESIDENT_SCORE_STRIDE,
+    )?;
+    let selected_plane = product(
+        "Flash-Next MTP selected positions",
+        rows,
+        SELECTION_MAX_SELECTED,
+    )?;
+    let block_rotary = product(
+        "Flash-Next MTP block rotary rows",
+        QWEN38_FLASH_NEXT_RESIDENT_ROUND_BLOCKS,
+        ROTARY_ELEMENTS,
+    )?;
+    let rotary = product("Flash-Next MTP rotary rows", rows, ROTARY_ELEMENTS)?;
     let logits = product("Flash-Next MTP proposal logits", VERIFY_ROWS, A::VOCAB)?;
     let routed = product(
         "Flash-Next MTP routed rows",
@@ -563,6 +590,10 @@ fn reserve_workspace(builder: &mut ArenaLayout) -> EngineResult<Qwen38FlashNextM
         indexer_qk: builder.reserve(indexer_qk, ALIGNMENT)?,
         indexer_query: builder.reserve(indexer_query, ALIGNMENT)?,
         indexer_raw_round: builder.reserve(indexer_raw, ALIGNMENT)?,
+        scores: builder.reserve(score_plane, ALIGNMENT)?,
+        select_scratch: builder.reserve(SELECTION_SCRATCH_WORDS, ALIGNMENT)?,
+        selected: builder.reserve(selected_plane, ALIGNMENT)?,
+        selected_counts: builder.reserve(rows, ALIGNMENT)?,
 
         router_logits: builder.reserve(router_logits, ALIGNMENT)?,
         expert_indices: builder.reserve(experts_selected, ALIGNMENT)?,
@@ -584,14 +615,13 @@ fn reserve_workspace(builder: &mut ArenaLayout) -> EngineResult<Qwen38FlashNextM
         table_rows: builder.reserve(rows, ALIGNMENT)?,
         cache_positions: builder.reserve(rows, ALIGNMENT)?,
         lengths: builder.reserve(rows, ALIGNMENT)?,
-        rope_cos: builder.reserve(
-            product("Flash-Next MTP rotary rows", rows, ROTARY_ELEMENTS)?,
-            ALIGNMENT,
-        )?,
-        rope_sin: builder.reserve(
-            product("Flash-Next MTP rotary rows", rows, ROTARY_ELEMENTS)?,
-            ALIGNMENT,
-        )?,
+        rope_cos: builder.reserve(rotary, ALIGNMENT)?,
+        rope_sin: builder.reserve(rotary, ALIGNMENT)?,
+        block_rope_cos: builder.reserve(block_rotary, ALIGNMENT)?,
+        block_rope_sin: builder.reserve(block_rotary, ALIGNMENT)?,
+        candidate_blocks: builder.reserve(rows, ALIGNMENT)?,
+        closing_first_blocks: builder.reserve(MAX_BATCH, ALIGNMENT)?,
+        closing_block_counts: builder.reserve(MAX_BATCH, ALIGNMENT)?,
     })
 }
 
@@ -781,12 +811,12 @@ mod tests {
         assert_eq!(joint.target().streaming().slot_count(), 5_578);
         assert_eq!(joint.draft().streaming().slot_count(), 128);
         assert_eq!(target.physical_pages(), 4_096);
-        assert_eq!(joint.physical_pages(), 3_794);
+        assert_eq!(joint.physical_pages(), 3_765);
         assert_eq!(
             joint.physical_pages() * QWEN38_FLASH_NEXT_ATTENTION_PAGE_SIZE,
-            242_816
+            240_960
         );
-        assert_eq!(joint.draft().total_device_bytes().unwrap(), 1_973_881_344);
+        assert_eq!(joint.draft().total_device_bytes().unwrap(), 1_998_214_432);
 
         let total = joint.total_device_bytes().unwrap();
         let spendable =

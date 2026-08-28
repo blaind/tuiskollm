@@ -46,8 +46,8 @@ use tuisko_kernels_sm120::{
     Qwen38FlashNextGdnRecurrenceOp, Qwen38FlashNextHyperConnectionOp,
     Qwen38FlashNextIndexerPrepareOp, Qwen38FlashNextIndexerQkProjectionOp,
     Qwen38FlashNextIndexerSelectionOp, Qwen38FlashNextMoeExpertsOp, Qwen38FlashNextMoeRouterOp,
-    Qwen38FlashNextQsaQkvProjectionOp, Qwen38FlashNextSelectedPagedGqaOp, SELECTION_RING_SLOTS,
-    SELECTION_ROW_TILE, SelectedAttentionArgs,
+    Qwen38FlashNextQsaQkvProjectionOp, Qwen38FlashNextSelectedPagedGqaOp, SELECTION_MAX_SELECTED,
+    SELECTION_RING_SLOTS, SELECTION_ROW_TILE, SelectedAttentionArgs,
 };
 use tuisko_model::{
     Arch, CheckpointSnapshot, Qwen38FlashNext, Qwen38FlashNextEngramBindings,
@@ -2665,6 +2665,37 @@ impl Qwen38FlashNextResidentModel {
             segment_replays: QWEN38_FLASH_NEXT_RESIDENT_SEGMENTS,
             expert_readbacks: <A as Arch>::LAYERS,
         })
+    }
+
+    /// Reads one row of the last QSA selection published by the target.
+    pub(crate) fn read_selection_row(
+        &self,
+        stream: &CudaStream,
+        row: usize,
+        positions: &mut [u32],
+    ) -> EngineResult<usize> {
+        let workspace = self.layout.workspace();
+        let mut count = [0u32; 1];
+        self.arena
+            .copy_slice_to_host_slice(stream, workspace.selected_counts, row, &mut count)?;
+        let count = count[0] as usize;
+        if count > SELECTION_MAX_SELECTED || count > positions.len() {
+            return Err(EngineError::layout(format!(
+                "a Qwen3.8 Flash-Next selection row has {count} positions, but its stride is \
+                 {SELECTION_MAX_SELECTED} and the destination holds {}",
+                positions.len()
+            )));
+        }
+        if count != 0 {
+            self.arena.copy_slice_to_host_slice(
+                stream,
+                workspace.selected,
+                row * SELECTION_MAX_SELECTED,
+                &mut positions[..count],
+            )?;
+        }
+
+        Ok(count)
     }
 
     /// Reads the selected-position count published for each row of the last round.

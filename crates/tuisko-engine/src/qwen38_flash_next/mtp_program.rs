@@ -7,7 +7,7 @@ use crate::common::streaming::{
     StreamingMappedPrimary, StreamingPrimarySource, StreamingRound, StreamingWeightPool,
 };
 use crate::qwen38_flash_next::layer_route::{
-    QWEN38_FLASH_NEXT_PREFILL_ROWS, require_qwen38_flash_next_dense_qsa_visible,
+    QWEN38_FLASH_NEXT_PREFILL_ROWS, Qwen38FlashNextQsaRoute, qwen38_flash_next_qsa_route,
 };
 use crate::qwen38_flash_next::layer_upload::{bf16_words, upload_hyper_connection};
 use crate::qwen38_flash_next::mtp_layout::{
@@ -18,7 +18,10 @@ use crate::qwen38_flash_next::mtp_layout::{
 };
 use crate::qwen38_flash_next::resident_model::{
     Ops, Qwen38FlashNextLayerStreamTelemetry, Qwen38FlashNextResidentModel,
-    Qwen38FlashNextStreamingRoute, layer_telemetry, qwen38_flash_next_rope,
+    Qwen38FlashNextStreamingRoute, closing_blocks, layer_telemetry, qwen38_flash_next_rope,
+};
+use crate::qwen38_flash_next::resident_model_layout::{
+    QWEN38_FLASH_NEXT_RESIDENT_CANDIDATE_BLOCKS, QWEN38_FLASH_NEXT_RESIDENT_SCORE_STRIDE,
 };
 use crate::{EngineError, EngineResult, MAX_BATCH};
 use std::sync::Arc;
@@ -27,7 +30,9 @@ use tuisko_gpu::{
     CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, PinnedHostBuffer,
 };
 use tuisko_kernels_sm120::{
-    Qwen38FlashNextMtpExpertDispatch, Qwen38FlashNextMtpFusionProjectionOp,
+    IndexerCompressArgs, IndexerPrepareArgs, IndexerSelectionArgs,
+    Qwen38FlashNextMtpExpertDispatch, Qwen38FlashNextMtpFusionProjectionOp, SELECTION_MAX_SELECTED,
+    SELECTION_ROW_TILE, SelectedAttentionArgs,
 };
 use tuisko_model::{
     Arch, CheckpointSnapshot, Qwen38FlashNext, Qwen38FlashNextMtpBindings,
@@ -52,6 +57,13 @@ pub const QWEN38_FLASH_NEXT_MTP_SEGMENTS: usize = 2;
 
 /// Rows carried by one proposal.
 pub const QWEN38_FLASH_NEXT_PROPOSAL_ROWS: usize = 1;
+
+/// Captured draft attention routes, in inventory order.
+pub const QWEN38_FLASH_NEXT_MTP_ATTENTION_ROUTES: [Qwen38FlashNextMtpAttention; 3] = [
+    Qwen38FlashNextMtpAttention::Dense,
+    Qwen38FlashNextMtpAttention::Selected,
+    Qwen38FlashNextMtpAttention::Shared,
+];
 
 /// Maximum routed rows supported by the draft expert pool.
 pub const QWEN38_FLASH_NEXT_MTP_ROUTED_ROWS: usize =
@@ -81,6 +93,38 @@ enum Qwen38FlashNextMtpStage {
     Prime,
     Head,
     Tail,
+}
+
+/// Attention policy for one draft proposal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Qwen38FlashNextMtpAttention {
+    /// Dense causal attention inside the identity-selection band.
+    Dense,
+    /// The draft computes its own selected positions.
+    Selected,
+    /// The draft reuses the target's last selection.
+    Shared,
+}
+
+impl Qwen38FlashNextMtpAttention {
+    const fn gather(self) -> Qwen38FlashNextQsaRoute {
+        match self {
+            Self::Dense => Qwen38FlashNextQsaRoute::Dense,
+            Self::Selected | Self::Shared => Qwen38FlashNextQsaRoute::Selected,
+        }
+    }
+
+    const fn selects(self) -> bool {
+        matches!(self, Self::Selected)
+    }
+
+    const fn inventory(self) -> usize {
+        match self {
+            Self::Dense => 0,
+            Self::Selected => 1,
+            Self::Shared => 2,
+        }
+    }
 }
 
 /// Source of the target stream at `position - 1`.
@@ -219,6 +263,9 @@ struct DraftWeights {
     output_weight: *const u16,
     query_norm: *const u16,
     key_norm: *const u16,
+    indexer_qk_weight: *const u16,
+    indexer_query_norm: *const u16,
+    indexer_key_norm: *const u16,
     router_weight: *const u16,
     shared_gate_weight: *const u16,
     shared_up_weight: *const u16,
@@ -252,6 +299,14 @@ struct DraftPointers {
     attention: *mut f32,
     attention_gated: *mut u16,
 
+    indexer_qk: *mut u16,
+    indexer_query: *mut f32,
+    indexer_raw_round: *mut u16,
+    scores: *mut f32,
+    select_scratch: *mut u32,
+    selected: *mut u32,
+    selected_counts: *mut u32,
+
     router_logits: *mut u16,
     expert_indices: *mut u16,
     routing_weights: *mut u16,
@@ -273,10 +328,17 @@ struct DraftPointers {
     lengths: *const u32,
     rope_cos: *const f32,
     rope_sin: *const f32,
+    block_rope_cos: *const f32,
+    block_rope_sin: *const f32,
+    candidate_blocks: *const u32,
+    closing_first_blocks: *const u32,
+    closing_block_counts: *const u32,
     block_tables: *const u32,
 
     key_pages: *mut u8,
     value_pages: *mut u8,
+    block_keys: *mut u16,
+    indexer_ring: *mut u16,
 }
 
 /// The Flash-Next draft block, resident beside the target it proposes for.
@@ -301,6 +363,10 @@ pub struct Qwen38FlashNextMtpProgram {
 
     weights: DraftWeights,
     pointers: DraftPointers,
+
+    index_share: bool,
+    frozen: Vec<u32>,
+    frozen_visible: usize,
 
     target: Qwen38FlashNextResidentModel,
     layout: Qwen38FlashNextMtpLayout,
@@ -396,6 +462,9 @@ impl Qwen38FlashNextMtpProgram {
             streaming_route: Qwen38FlashNextStreamingRoute::default(),
             weights,
             pointers,
+            index_share: true,
+            frozen: Vec::new(),
+            frozen_visible: 0,
             target,
             layout,
             base_address,
@@ -529,6 +598,15 @@ fn bind_weights(
         output_weight: arena.address(layer.attention.output_weight)?.cast_const(),
         query_norm: arena.address(layer.attention.query_norm)?.cast_const(),
         key_norm: arena.address(layer.attention.key_norm)?.cast_const(),
+        indexer_qk_weight: arena
+            .address(layer.attention.indexer_qk_weight)?
+            .cast_const(),
+        indexer_query_norm: arena
+            .address(layer.attention.indexer_query_norm)?
+            .cast_const(),
+        indexer_key_norm: arena
+            .address(layer.attention.indexer_key_norm)?
+            .cast_const(),
 
         router_weight: arena.address(layer.moe.router_weight)?.cast_const(),
         shared_gate_weight: arena.address(layer.moe.shared_gate_weight)?.cast_const(),
@@ -575,6 +653,14 @@ fn bind_pointers(
         attention: arena.address(workspace.attention)?,
         attention_gated: arena.address(workspace.attention_gated)?,
 
+        indexer_qk: arena.address(workspace.indexer_qk)?,
+        indexer_query: arena.address(workspace.indexer_query)?,
+        indexer_raw_round: arena.address(workspace.indexer_raw_round)?,
+        scores: arena.address(workspace.scores)?,
+        select_scratch: arena.address(workspace.select_scratch)?,
+        selected: arena.address(workspace.selected)?,
+        selected_counts: arena.address(workspace.selected_counts)?,
+
         router_logits: arena.address(workspace.router_logits)?,
         expert_indices: arena.address(workspace.expert_indices)?,
         routing_weights: arena.address(workspace.routing_weights)?,
@@ -596,11 +682,18 @@ fn bind_pointers(
         lengths: arena.address(workspace.lengths)?.cast_const(),
         rope_cos: arena.address(workspace.rope_cos)?.cast_const(),
         rope_sin: arena.address(workspace.rope_sin)?.cast_const(),
+        block_rope_cos: arena.address(workspace.block_rope_cos)?.cast_const(),
+        block_rope_sin: arena.address(workspace.block_rope_sin)?.cast_const(),
+        candidate_blocks: arena.address(workspace.candidate_blocks)?.cast_const(),
+        closing_first_blocks: arena.address(workspace.closing_first_blocks)?.cast_const(),
+        closing_block_counts: arena.address(workspace.closing_block_counts)?.cast_const(),
         // Draft K/V uses the target's physical-page mapping.
         block_tables: target_kv_arena.address(block_tables)?.cast_const(),
 
         key_pages: kv_arena.address(kv.key_pages)?,
         value_pages: kv_arena.address(kv.value_pages)?,
+        block_keys: kv_arena.address(kv.block_keys)?,
+        indexer_ring: kv_arena.address(kv.indexer_ring)?,
     })
 }
 
@@ -695,6 +788,7 @@ fn launch_draft_segment(
     arena: &DeviceArena,
     stage: Qwen38FlashNextMtpStage,
     rows: usize,
+    route: Qwen38FlashNextMtpAttention,
     ops: Ops<'_>,
     fusion: &Qwen38FlashNextMtpFusionProjectionOp,
     weights: DraftWeights,
@@ -754,12 +848,55 @@ fn launch_draft_segment(
             pointers.hc_write_gate,
         )?;
 
+        let raw_keys = if rows <= MAX_BATCH {
+            pointers.indexer_ring
+        } else {
+            pointers.indexer_raw_round
+        };
+
         ops.qsa_qkv.launch(
             stream,
             rows,
             pointers.hc_mixed.cast_const(),
             weights.qkv_weight,
             pointers.qkv,
+        )?;
+        ops.qsa_indexer_qk.launch(
+            stream,
+            rows,
+            pointers.hc_mixed.cast_const(),
+            weights.indexer_qk_weight,
+            pointers.indexer_qk,
+        )?;
+        ops.qsa_indexer.launch_prepare(
+            stream,
+            rows,
+            IndexerPrepareArgs {
+                indexer_qk: pointers.indexer_qk.cast_const(),
+                query_norm: weights.indexer_query_norm,
+                rope_cos: pointers.rope_cos,
+                rope_sin: pointers.rope_sin,
+                table_rows: pointers.table_rows,
+                cache_positions: pointers.cache_positions,
+                query: pointers.indexer_query,
+                raw_keys,
+            },
+        )?;
+        ops.qsa_indexer.launch_compress(
+            stream,
+            rows,
+            IndexerCompressArgs {
+                raw_keys: raw_keys.cast_const(),
+                key_norm: weights.indexer_key_norm,
+                block_rope_cos: pointers.block_rope_cos,
+                block_rope_sin: pointers.block_rope_sin,
+                block_tables: pointers.block_tables,
+                table_rows: pointers.table_rows,
+                table_stride: crate::QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES as u32,
+                first_blocks: pointers.closing_first_blocks,
+                block_counts: pointers.closing_block_counts,
+                block_keys: pointers.block_keys,
+            },
         )?;
         ops.qsa_prepare.launch(
             stream,
@@ -782,20 +919,72 @@ fn launch_draft_segment(
         if stage == Qwen38FlashNextMtpStage::Prime {
             return Ok(());
         }
-        ops.qsa_attention.launch(
-            stream,
-            rows,
-            pointers.query.cast_const(),
-            pointers.key_pages.cast_const(),
-            pointers.value_pages.cast_const(),
-            pointers.block_tables,
-            pointers.table_rows,
-            crate::QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES,
-            pointers.lengths,
-            pointers.attention,
-            KEY_CACHE_SCALE,
-            VALUE_CACHE_SCALE,
-        )?;
+        match route.gather() {
+            Qwen38FlashNextQsaRoute::Dense => ops.qsa_attention.launch(
+                stream,
+                rows,
+                pointers.query.cast_const(),
+                pointers.key_pages.cast_const(),
+                pointers.value_pages.cast_const(),
+                pointers.block_tables,
+                pointers.table_rows,
+                crate::QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES,
+                pointers.lengths,
+                pointers.attention,
+                KEY_CACHE_SCALE,
+                VALUE_CACHE_SCALE,
+            )?,
+            Qwen38FlashNextQsaRoute::Selected => {
+                let tile = if rows <= MAX_BATCH {
+                    rows
+                } else {
+                    SELECTION_ROW_TILE
+                };
+                let mut offset = 0usize;
+                while route.selects() && offset < rows {
+                    let tile_rows = tile.min(rows - offset);
+                    ops.qsa_selection.launch(
+                        stream,
+                        tile_rows,
+                        offset,
+                        QWEN38_FLASH_NEXT_RESIDENT_CANDIDATE_BLOCKS,
+                        IndexerSelectionArgs {
+                            query: pointers.indexer_query.cast_const(),
+                            block_keys: pointers.block_keys.cast_const(),
+                            block_tables: pointers.block_tables,
+                            table_rows: pointers.table_rows,
+                            table_stride: crate::QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES
+                                as u32,
+                            visible_lengths: pointers.lengths,
+                            block_counts: pointers.candidate_blocks,
+                            scores: pointers.scores,
+                            score_stride: QWEN38_FLASH_NEXT_RESIDENT_SCORE_STRIDE as u32,
+                            selected: pointers.selected,
+                            selected_counts: pointers.selected_counts,
+                            scratch: pointers.select_scratch,
+                        },
+                    )?;
+                    offset += tile_rows;
+                }
+                ops.qsa_selected_attention.launch(
+                    stream,
+                    rows,
+                    SelectedAttentionArgs {
+                        query: pointers.query.cast_const(),
+                        key_pages: pointers.key_pages.cast_const(),
+                        value_pages: pointers.value_pages.cast_const(),
+                        block_tables: pointers.block_tables,
+                        table_rows: pointers.table_rows,
+                        table_stride: crate::QWEN38_FLASH_NEXT_LONG_CONTEXT_PHYSICAL_PAGES as u32,
+                        selected: pointers.selected.cast_const(),
+                        selected_counts: pointers.selected_counts.cast_const(),
+                        output: pointers.attention,
+                        key_scale: KEY_CACHE_SCALE,
+                        value_scale: VALUE_CACHE_SCALE,
+                    },
+                )?;
+            }
+        }
         ops.qsa_gate.launch(
             stream,
             rows,
@@ -898,10 +1087,41 @@ fn launch_draft_head(
     }
 }
 
-fn kv_append_bytes(rows: usize) -> usize {
+fn shared_selection_row(
+    frozen: &[u32],
+    frozen_visible: usize,
+    visible: usize,
+) -> EngineResult<Vec<u32>> {
+    if visible < frozen_visible {
+        return Err(EngineError::route(format!(
+            "a Qwen3.8 Flash-Next selection frozen at {frozen_visible} keys cannot serve \
+             {visible} visible keys"
+        )));
+    }
+    let appended = visible - frozen_visible;
+    let dropped = (frozen.len() + appended).saturating_sub(SELECTION_MAX_SELECTED);
+    let mut row = Vec::with_capacity(frozen.len() + appended - dropped);
+    row.extend_from_slice(&frozen[dropped.min(frozen.len())..]);
+    for position in frozen_visible..visible {
+        row.push(u32::try_from(position).map_err(|_| {
+            EngineError::route("a Qwen3.8 Flash-Next drafted position exceeds u32")
+        })?);
+    }
+    if row.len() > SELECTION_MAX_SELECTED {
+        return Err(EngineError::layout(format!(
+            "a shared Qwen3.8 Flash-Next selection has {} positions, above \
+             {SELECTION_MAX_SELECTED}",
+            row.len()
+        )));
+    }
+
+    Ok(row)
+}
+
+fn kv_append_bytes(rows: usize, closing: usize) -> usize {
     let cache_row = <A as Arch>::NUM_KV_HEADS * <A as Arch>::HEAD_DIM;
 
-    rows * 2 * cache_row
+    rows * 2 * cache_row + (rows + closing) * A::INDEXER_HEAD_DIM * size_of::<u16>()
 }
 
 impl Qwen38FlashNextMtpProgram {
@@ -1076,7 +1296,7 @@ impl Qwen38FlashNextMtpProgram {
         Ok(())
     }
 
-    /// Captures the prime ladder, one routed pair, and the proposal head.
+    /// Captures the prime ladder, routed attention, tail, and proposal head.
     fn capture(&mut self, stream: &CudaStream) -> EngineResult<()> {
         let started = Instant::now();
         let arena = &self.arena;
@@ -1086,13 +1306,14 @@ impl Qwen38FlashNextMtpProgram {
         let pointers = self.pointers;
         let workspace = self.layout.workspace();
 
-        let capture = |stage, rows| {
+        let capture = |stage, rows, route| {
             CudaGraph::capture(stream, || {
                 launch_draft_segment(
                     stream,
                     arena,
                     stage,
                     rows,
+                    route,
                     ops,
                     fusion,
                     weights,
@@ -1105,15 +1326,24 @@ impl Qwen38FlashNextMtpProgram {
 
         let mut primes = Vec::with_capacity(QWEN38_FLASH_NEXT_MTP_ROUTES.len());
         for rows in QWEN38_FLASH_NEXT_MTP_ROUTES {
-            primes.push(capture(Qwen38FlashNextMtpStage::Prime, rows)?);
+            primes.push(capture(
+                Qwen38FlashNextMtpStage::Prime,
+                rows,
+                Qwen38FlashNextMtpAttention::Dense,
+            )?);
         }
-        let segments = vec![capture(
-            Qwen38FlashNextMtpStage::Head,
-            QWEN38_FLASH_NEXT_PROPOSAL_ROWS,
-        )?];
+        let mut segments = Vec::with_capacity(QWEN38_FLASH_NEXT_MTP_ATTENTION_ROUTES.len());
+        for route in QWEN38_FLASH_NEXT_MTP_ATTENTION_ROUTES {
+            segments.push(capture(
+                Qwen38FlashNextMtpStage::Head,
+                QWEN38_FLASH_NEXT_PROPOSAL_ROWS,
+                route,
+            )?);
+        }
         let tails = vec![capture(
             Qwen38FlashNextMtpStage::Tail,
             QWEN38_FLASH_NEXT_PROPOSAL_ROWS,
+            Qwen38FlashNextMtpAttention::Dense,
         )?];
 
         let lm_head = self
@@ -1271,26 +1501,43 @@ impl Qwen38FlashNextMtpProgram {
         Ok(values * size_of::<u16>())
     }
 
-    /// Stages dense-attention inputs for one draft round.
+    /// Stages attention inputs and indexer metadata for one draft round.
     fn stage_round_inputs(
         &self,
         stream: &CudaStream,
         rows: usize,
         slot: usize,
         positions: &[u32],
-    ) -> EngineResult<()> {
+    ) -> EngineResult<Qwen38FlashNextQsaRoute> {
         let workspace = self.layout.workspace();
         let table_rows = vec![slot as u32; rows];
         let lengths = positions
             .iter()
             .map(|&position| position + 1)
             .collect::<Vec<_>>();
+        let mut route = Qwen38FlashNextQsaRoute::Dense;
+        for &length in &lengths {
+            route = route.widen(qwen38_flash_next_qsa_route(length as usize)?);
+        }
         let mut cosines = Vec::with_capacity(rows * ROTARY_ELEMENTS);
         let mut sines = Vec::with_capacity(rows * ROTARY_ELEMENTS);
         for &position in positions {
             let (cos, sin) = qwen38_flash_next_rope(position);
             cosines.extend_from_slice(&cos);
             sines.extend_from_slice(&sin);
+        }
+        let candidates = lengths
+            .iter()
+            .map(|&length| length / A::INDEXER_COMPRESS_RATIO as u32)
+            .collect::<Vec<_>>();
+        let closing = closing_blocks(rows, positions)?;
+        let mut block_cosines = Vec::with_capacity(closing.rotary_rows * ROTARY_ELEMENTS);
+        let mut block_sines = Vec::with_capacity(closing.rotary_rows * ROTARY_ELEMENTS);
+        for row in 0..closing.rotary_rows {
+            let block = closing.rotary_block(row);
+            let (cos, sin) = qwen38_flash_next_rope(block * A::INDEXER_COMPRESS_RATIO as u32);
+            block_cosines.extend_from_slice(&cos);
+            block_sines.extend_from_slice(&sin);
         }
         self.arena
             .copy_prefix_from_host(stream, workspace.table_rows, &table_rows)?;
@@ -1302,7 +1549,21 @@ impl Qwen38FlashNextMtpProgram {
             .copy_prefix_from_host(stream, workspace.rope_cos, &cosines)?;
         self.arena
             .copy_prefix_from_host(stream, workspace.rope_sin, &sines)?;
-        Ok(())
+        self.arena
+            .copy_prefix_from_host(stream, workspace.candidate_blocks, &candidates)?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.closing_first_blocks, &closing.first)?;
+        self.arena.copy_prefix_from_host(
+            stream,
+            workspace.closing_block_counts,
+            &closing.counts,
+        )?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.block_rope_cos, &block_cosines)?;
+        self.arena
+            .copy_prefix_from_host(stream, workspace.block_rope_sin, &block_sines)?;
+
+        Ok(route)
     }
 
     /// Runs the routed head, expert round, tail, and optional LM head.
@@ -1310,6 +1571,7 @@ impl Qwen38FlashNextMtpProgram {
         &mut self,
         stream: &CudaStream,
         rows: usize,
+        route: Qwen38FlashNextMtpAttention,
         propose: bool,
     ) -> EngineResult<Qwen38FlashNextLayerStreamTelemetry> {
         if let Some(reason) = self.pool.poisoned() {
@@ -1323,8 +1585,10 @@ impl Qwen38FlashNextMtpProgram {
                  not {rows}; its pool ceiling is {QWEN38_FLASH_NEXT_MTP_ROUTED_ROWS} rows"
             )));
         }
-        let head = self.segments.first().ok_or_else(|| {
-            EngineError::route("the Flash-Next draft block captured no routed head")
+        let head = self.segments.get(route.inventory()).ok_or_else(|| {
+            EngineError::route(format!(
+                "the Flash-Next draft block captured no {route:?} routed head"
+            ))
         })?;
         // SAFETY: the program owns all captured storage until graph drop.
         unsafe { head.launch(stream) }?;
@@ -1500,7 +1764,7 @@ impl Qwen38FlashNextMtpProgram {
         let rows = tokens.len();
         draft_route_index(rows)?;
         let last = first_position as usize + rows;
-        require_qwen38_flash_next_dense_qsa_visible(last)?;
+        qwen38_flash_next_qsa_route(last)?;
         self.admit_draft_round(slot, last)?;
 
         let positions = (0..rows as u32)
@@ -1510,19 +1774,24 @@ impl Qwen38FlashNextMtpProgram {
         let started = Instant::now();
         let embedding_h2d_bytes = self.stage_embeddings(stream, tokens)?;
         self.stage_stream(stream, rows, source)?;
-        self.stage_round_inputs(stream, rows, slot, &positions)?;
+        let route = self.stage_round_inputs(stream, rows, slot, &positions)?;
         let layer = if propose {
-            self.forward(stream, rows, true)?
+            let attention = self.classify(stream, rows, route, last)?;
+            self.forward(stream, rows, attention, true)?
         } else {
             self.forward_prime(stream, rows)?
         };
         let forward = started.elapsed();
+        let closing = positions
+            .iter()
+            .filter(|&&position| (position + 1).is_multiple_of(A::INDEXER_COMPRESS_RATIO as u32))
+            .count();
 
         Ok(Qwen38FlashNextMtpStepTelemetry {
             rows,
             layer,
             embedding_h2d_bytes,
-            kv_append_bytes: kv_append_bytes(rows),
+            kv_append_bytes: kv_append_bytes(rows, closing),
             forward,
             proposed: propose,
         })
@@ -1547,14 +1816,97 @@ impl Qwen38FlashNextMtpProgram {
 
         Ok(())
     }
+
+    /// Enables or disables reuse of the target's last selected positions.
+    pub fn set_index_share(&mut self, enabled: bool) {
+        self.index_share = enabled;
+        if !enabled {
+            self.frozen.clear();
+            self.frozen_visible = 0;
+        }
+    }
+
+    /// Whether target selection reuse is enabled.
+    pub const fn index_share(&self) -> bool {
+        self.index_share
+    }
+
+    /// Retains the target selection at its last verified row.
+    pub fn freeze_target_selection(
+        &mut self,
+        stream: &CudaStream,
+        row: usize,
+        visible: usize,
+    ) -> EngineResult<usize> {
+        if !self.index_share
+            || qwen38_flash_next_qsa_route(visible)? == Qwen38FlashNextQsaRoute::Dense
+        {
+            self.frozen.clear();
+            self.frozen_visible = 0;
+            return Ok(0);
+        }
+        self.frozen.resize(SELECTION_MAX_SELECTED, 0);
+        let count = self
+            .target
+            .read_selection_row(stream, row, &mut self.frozen)?;
+        self.frozen.truncate(count);
+        self.frozen_visible = if count == 0 { 0 } else { visible };
+
+        Ok(count)
+    }
+
+    fn classify(
+        &mut self,
+        stream: &CudaStream,
+        rows: usize,
+        route: Qwen38FlashNextQsaRoute,
+        visible: usize,
+    ) -> EngineResult<Qwen38FlashNextMtpAttention> {
+        if route == Qwen38FlashNextQsaRoute::Dense {
+            return Ok(Qwen38FlashNextMtpAttention::Dense);
+        }
+        if !self.index_share
+            || rows != 1
+            || self.frozen.is_empty()
+            || self.frozen_visible == 0
+            || visible < self.frozen_visible
+        {
+            return Ok(Qwen38FlashNextMtpAttention::Selected);
+        }
+        self.publish_shared_selection(stream, visible)?;
+
+        Ok(Qwen38FlashNextMtpAttention::Shared)
+    }
+
+    fn publish_shared_selection(
+        &mut self,
+        stream: &CudaStream,
+        visible: usize,
+    ) -> EngineResult<()> {
+        let row = shared_selection_row(&self.frozen, self.frozen_visible, visible)?;
+        let workspace = self.layout.workspace();
+        self.arena
+            .copy_prefix_from_host(stream, workspace.selected, &row)?;
+        let count = u32::try_from(row.len()).map_err(|_| {
+            EngineError::layout("a Qwen3.8 Flash-Next shared selection count exceeds u32")
+        })?;
+        self.arena.copy_prefix_from_host(
+            stream,
+            workspace.selected_counts,
+            std::slice::from_ref(&count),
+        )?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        QWEN38_FLASH_NEXT_MTP_ROUTED_ROWS, QWEN38_FLASH_NEXT_MTP_ROUTES,
-        QWEN38_FLASH_NEXT_MTP_SEGMENTS, QWEN38_FLASH_NEXT_PROPOSAL_ROWS, draft_route_index,
-        kv_append_bytes,
+        QWEN38_FLASH_NEXT_MTP_ATTENTION_ROUTES, QWEN38_FLASH_NEXT_MTP_ROUTED_ROWS,
+        QWEN38_FLASH_NEXT_MTP_ROUTES, QWEN38_FLASH_NEXT_MTP_SEGMENTS,
+        QWEN38_FLASH_NEXT_PROPOSAL_ROWS, Qwen38FlashNextMtpAttention, SELECTION_MAX_SELECTED,
+        draft_route_index, kv_append_bytes, shared_selection_row,
     };
     use crate::qwen38_flash_next::layer_route::{
         QWEN38_FLASH_NEXT_PREFILL_ROWS, qwen38_flash_next_row_route,
@@ -1581,11 +1933,13 @@ mod tests {
     }
 
     #[test]
-    fn the_draft_inventory_is_the_prime_ladder_plus_one_routed_pair() {
-        let executables = QWEN38_FLASH_NEXT_MTP_ROUTES.len() + QWEN38_FLASH_NEXT_MTP_SEGMENTS + 1;
+    fn the_draft_inventory_covers_prime_attention_tail_and_head() {
+        let executables = QWEN38_FLASH_NEXT_MTP_ROUTES.len()
+            + QWEN38_FLASH_NEXT_MTP_ATTENTION_ROUTES.len()
+            + QWEN38_FLASH_NEXT_MTP_SEGMENTS;
 
         assert_eq!(QWEN38_FLASH_NEXT_MTP_SEGMENTS, 2);
-        assert_eq!(executables, 8);
+        assert_eq!(executables, 10);
     }
 
     #[test]
@@ -1607,8 +1961,28 @@ mod tests {
     #[test]
     fn the_kv_append_figure_counts_dense_cache_writes() {
         let cache_row = 2 * 2 * 256;
+        let raw = 128 * 2;
 
-        assert_eq!(kv_append_bytes(1), cache_row);
-        assert_eq!(kv_append_bytes(32), 32 * cache_row);
+        assert_eq!(kv_append_bytes(1, 0), cache_row + raw);
+        assert_eq!(kv_append_bytes(1, 1), cache_row + 2 * raw);
+        assert_eq!(kv_append_bytes(32, 8), 32 * (cache_row + raw) + 8 * raw);
+    }
+
+    #[test]
+    fn shared_selection_appends_new_columns_and_drops_oldest_first() {
+        let frozen = vec![0, 4, 8, 12];
+        assert_eq!(
+            shared_selection_row(&frozen, 16, 19).unwrap(),
+            vec![0, 4, 8, 12, 16, 17, 18]
+        );
+
+        let full = (0..SELECTION_MAX_SELECTED as u32).collect::<Vec<_>>();
+        let row = shared_selection_row(&full, SELECTION_MAX_SELECTED, 2_054).unwrap();
+        assert_eq!(row.len(), SELECTION_MAX_SELECTED);
+        assert_eq!(&row[..3], &[3, 4, 5]);
+        assert_eq!(&row[row.len() - 3..], &[2_051, 2_052, 2_053]);
+        assert!(shared_selection_row(&[0, 4], 8, 7).is_err());
+        assert_eq!(QWEN38_FLASH_NEXT_MTP_ATTENTION_ROUTES.len(), 3);
+        assert_eq!(Qwen38FlashNextMtpAttention::Shared.inventory(), 2);
     }
 }

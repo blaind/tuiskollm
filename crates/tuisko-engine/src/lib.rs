@@ -158,9 +158,10 @@ pub use qwen38_flash_next::mtp_layout::{
     Qwen38FlashNextMtpLayout, Qwen38FlashNextMtpResidency,
 };
 pub use qwen38_flash_next::mtp_program::{
-    QWEN38_FLASH_NEXT_MTP_ROUTED_ROWS, QWEN38_FLASH_NEXT_MTP_ROUTES,
-    QWEN38_FLASH_NEXT_MTP_SEGMENTS, QWEN38_FLASH_NEXT_PROPOSAL_ROWS, Qwen38FlashNextMtpLoadStats,
-    Qwen38FlashNextMtpProgram, Qwen38FlashNextMtpStepTelemetry, Qwen38FlashNextMtpStream,
+    QWEN38_FLASH_NEXT_MTP_ATTENTION_ROUTES, QWEN38_FLASH_NEXT_MTP_ROUTED_ROWS,
+    QWEN38_FLASH_NEXT_MTP_ROUTES, QWEN38_FLASH_NEXT_MTP_SEGMENTS, QWEN38_FLASH_NEXT_PROPOSAL_ROWS,
+    Qwen38FlashNextMtpAttention, Qwen38FlashNextMtpLoadStats, Qwen38FlashNextMtpProgram,
+    Qwen38FlashNextMtpStepTelemetry, Qwen38FlashNextMtpStream,
 };
 #[cfg(feature = "qualification")]
 pub use qwen38_flash_next::qsa_moe_layer::{

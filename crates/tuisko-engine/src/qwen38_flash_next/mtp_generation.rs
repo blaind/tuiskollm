@@ -357,6 +357,7 @@ impl Qwen38FlashNextMtpTextGenerator {
         let mut native_prefill_tokens = 0;
 
         if control.finish_reason().is_none() {
+            program.set_index_share(true);
             program.target_mut().recycle_slot(stream, SINGLE_SLOT)?;
             program.reset_carry(stream)?;
             program.target_mut().reset_generation_telemetry();
@@ -423,6 +424,7 @@ fn prime_pair(
         program.prime_tile(stream, tile, first, slot)?;
         program.carry_target_row(stream, tokens - 1)?;
         cursor += tokens;
+        program.freeze_target_selection(stream, tokens - 1, cursor)?;
     }
 
     for (offset, &token) in token_ids[cursor..].iter().enumerate() {
@@ -443,6 +445,7 @@ fn prime_pair(
             Qwen38FlashNextMtpStream::Carry,
         )?;
         program.carry_target_row(stream, 0)?;
+        program.freeze_target_selection(stream, 0, position as usize + 1)?;
     }
 
     Ok(cursor)
@@ -570,6 +573,16 @@ impl Qwen38FlashNextMtpGenerationSession<'_> {
     /// Outputs per speculative round, as a distribution.
     pub const fn acceptance(&self) -> Qwen38FlashNextMtpAcceptance {
         self.state.acceptance
+    }
+
+    /// Enables or disables target selection reuse for this request.
+    pub fn set_index_share(&mut self, enabled: bool) {
+        self.program.set_index_share(enabled);
+    }
+
+    /// Whether target selection reuse is enabled.
+    pub const fn index_share(&self) -> bool {
+        self.program.index_share()
     }
 
     /// Converts a terminal, fully drained session into its complete decoded result.
@@ -783,6 +796,11 @@ impl Qwen38FlashNextMtpGenerationSession<'_> {
             self.state.cost.realign_launches += 1;
         }
         self.program.carry_target_row(self.stream, accepted)?;
+        self.program.freeze_target_selection(
+            self.stream,
+            accepted,
+            self.state.next_position + accepted + 1,
+        )?;
         self.state.cost.realign += started.elapsed();
 
         self.state.next_position += committed;
@@ -932,8 +950,20 @@ impl Qwen38FlashNextMtpTextGenerator {
         token_ids: &[u32],
         max_new_tokens: usize,
     ) -> EngineResult<Qwen38FlashNextMtpQualificationRun> {
+        self.qualification_mtp_tokens_with_index_share(token_ids, max_new_tokens, true)
+    }
+
+    /// Runs raw prompt IDs with an explicit IndexShare policy.
+    pub fn qualification_mtp_tokens_with_index_share(
+        &mut self,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        index_share: bool,
+    ) -> EngineResult<Qwen38FlashNextMtpQualificationRun> {
+        self.program.set_index_share(index_share);
         let started = Instant::now();
         let mut session = self.qualification_start_from_tokens(token_ids, max_new_tokens)?;
+        session.set_index_share(index_share);
         let primed = Instant::now();
         let mut generated = Vec::with_capacity(max_new_tokens);
         while session.finish_reason().is_none() {
