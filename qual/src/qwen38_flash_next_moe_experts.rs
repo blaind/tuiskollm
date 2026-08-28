@@ -221,14 +221,14 @@ pub(crate) struct Fixture {
     pub(crate) expected_mass: Vec<f32>,
 }
 
-fn decode_e2m1(code: u8) -> f32 {
+pub(crate) fn decode_e2m1(code: u8) -> f32 {
     const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let magnitude = MAGNITUDES[(code & 7) as usize];
 
     if code & 8 == 0 { magnitude } else { -magnitude }
 }
 
-fn decode_e4m3(code: u8) -> f32 {
+pub(crate) fn decode_e4m3(code: u8) -> f32 {
     let exponent = (code >> 3) & 15;
     let fraction = code & 7;
 
@@ -240,7 +240,7 @@ fn decode_e4m3(code: u8) -> f32 {
 }
 
 /// Independent `BlockScaleK16M128x4` offset oracle.
-fn scale_offset(row: usize, group: usize, groups: usize) -> usize {
+pub(crate) fn scale_offset(row: usize, group: usize, groups: usize) -> usize {
     let tile_base = (row / 128) * (groups / 4) * 512;
     let group_tile = (group / 4) * 512;
     let row_lane = (row % 32) * 16 + ((row % 128) / 32) * 4;
@@ -313,7 +313,7 @@ fn build_slot_image(expert: usize) -> Vec<u8> {
 
 /// The `f64` dot of one packed E2M1 row against a BF16 activation row.
 #[allow(clippy::too_many_arguments)]
-fn nvfp4_dot(
+pub(crate) fn nvfp4_dot(
     activation: &[u16],
     image: &[u8],
     code_base: usize,
@@ -349,7 +349,12 @@ fn nvfp4_dot(
     (sum as f32, mass as f32)
 }
 
-fn bf16_dot(activation: &[u16], weights: &[u16], row: usize, columns: usize) -> (f32, f32) {
+pub(crate) fn bf16_dot(
+    activation: &[u16],
+    weights: &[u16],
+    row: usize,
+    columns: usize,
+) -> (f32, f32) {
     let mut sum = 0.0f64;
     let mut mass = 0.0f64;
     for column in 0..columns {
@@ -362,11 +367,11 @@ fn bf16_dot(activation: &[u16], weights: &[u16], row: usize, columns: usize) -> 
     (sum as f32, mass as f32)
 }
 
-fn silu(value: f32) -> f32 {
+pub(crate) fn silu(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
 }
 
-fn sigmoid(value: f32) -> f32 {
+pub(crate) fn sigmoid(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
 }
 
@@ -543,7 +548,7 @@ pub(crate) fn make_fixture() -> Fixture {
 
 /// The device writes each expert output as BF16 before the combine reads it, so
 /// the oracle rounds at the same place.
-fn f32_to_bf16_roundtrip(value: f32) -> f32 {
+pub(crate) fn f32_to_bf16_roundtrip(value: f32) -> f32 {
     bf16_to_f32(f32_to_bf16(value))
 }
 

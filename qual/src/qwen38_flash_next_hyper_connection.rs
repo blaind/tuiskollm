@@ -19,11 +19,11 @@ const MAX_ROWS: usize = 1_024;
 const ALIGNMENT: usize = 256;
 const INACTIVE_SENTINEL: u16 = 0xa5a5;
 
-const BRANCHES: usize = Qwen38FlashNext::HC_COUNT;
-const BRANCH: usize = Qwen38FlashNext::HIDDEN;
-const WIDTH: usize = Qwen38FlashNext::HC_WIDTH;
-const RANK: usize = Qwen38FlashNext::HC_LOWRANK;
-const EPSILON: f32 = Qwen38FlashNext::RMS_NORM_EPSILON;
+pub(crate) const BRANCHES: usize = Qwen38FlashNext::HC_COUNT;
+pub(crate) const BRANCH: usize = Qwen38FlashNext::HIDDEN;
+pub(crate) const WIDTH: usize = Qwen38FlashNext::HC_WIDTH;
+pub(crate) const RANK: usize = Qwen38FlashNext::HC_LOWRANK;
+pub(crate) const EPSILON: f32 = Qwen38FlashNext::RMS_NORM_EPSILON;
 
 // Fixture tables. Every value is exactly representable in BF16 so the fixture
 // itself contributes no rounding and all observed error belongs to the kernel.
@@ -550,16 +550,16 @@ fn truncate(observed: &Observed, rows: usize) -> Observed {
 // Independent oracle
 // ---------------------------------------------------------------------------
 
-fn logistic(value: f64) -> f64 {
+pub(crate) fn logistic(value: f64) -> f64 {
     1.0 / (1.0 + (-value).exp())
 }
 
 /// Rounds through the BF16 grid the reference's intermediate tensors carry.
-fn through_bf16(value: f64) -> f64 {
+pub(crate) fn through_bf16(value: f64) -> f64 {
     f64::from(bf16_to_f32(f32_to_bf16(value as f32)))
 }
 
-fn widen(values: &[u16]) -> Vec<f64> {
+pub(crate) fn widen(values: &[u16]) -> Vec<f64> {
     values
         .iter()
         .map(|&bits| f64::from(bf16_to_f32(bits)))
@@ -568,7 +568,7 @@ fn widen(values: &[u16]) -> Vec<f64> {
 
 /// `hc_norm`: four independent 2,560-wide RMSNorms, flattened, then one
 /// 10,240-wide `(1 + w)`. The checkpoint ships the gamma unfolded.
-fn grouped_rms_norm_oracle(row: &[f64], weight: &[f64]) -> Vec<u16> {
+pub(crate) fn grouped_rms_norm_oracle(row: &[f64], weight: &[f64]) -> Vec<u16> {
     let mut normalized = vec![0u16; WIDTH];
     for branch in 0..BRANCHES {
         let begin = branch * BRANCH;
@@ -586,7 +586,7 @@ fn grouped_rms_norm_oracle(row: &[f64], weight: &[f64]) -> Vec<u16> {
     normalized
 }
 
-fn dot(left: &[f64], right: &[f64]) -> f64 {
+pub(crate) fn dot(left: &[f64], right: &[f64]) -> f64 {
     left.iter()
         .zip(right)
         .map(|(left, right)| left * right)
@@ -594,7 +594,7 @@ fn dot(left: &[f64], right: &[f64]) -> f64 {
 }
 
 /// `silu(down(hn) / 4)` for every rank.
-fn low_rank_oracle(normalized: &[f64], down: &[f64]) -> Vec<u16> {
+pub(crate) fn low_rank_oracle(normalized: &[f64], down: &[f64]) -> Vec<u16> {
     (0..RANK)
         .map(|rank| {
             let scaled = through_bf16(dot(&down[rank * WIDTH..(rank + 1) * WIDTH], normalized))
@@ -605,7 +605,7 @@ fn low_rank_oracle(normalized: &[f64], down: &[f64]) -> Vec<u16> {
 }
 
 /// `2 * sigmoid(inject(hn) / 4)` for every branch.
-fn write_gate_oracle(normalized: &[f64], inject: &[f64]) -> Vec<u16> {
+pub(crate) fn write_gate_oracle(normalized: &[f64], inject: &[f64]) -> Vec<u16> {
     (0..BRANCHES)
         .map(|branch| {
             let scaled = through_bf16(dot(
@@ -619,7 +619,7 @@ fn write_gate_oracle(normalized: &[f64], inject: &[f64]) -> Vec<u16> {
 }
 
 /// `mean_c(sigmoid(up(t)) * hn)` for every mixed column.
-fn mixed_oracle(normalized: &[f64], up: &[f64], low_rank: &[u16]) -> Vec<u16> {
+pub(crate) fn mixed_oracle(normalized: &[f64], up: &[f64], low_rank: &[u16]) -> Vec<u16> {
     let low_rank = widen(low_rank);
     (0..BRANCH)
         .map(|column| {
@@ -642,7 +642,11 @@ fn mixed_oracle(normalized: &[f64], up: &[f64], low_rank: &[u16]) -> Vec<u16> {
 ///
 /// Every operand is BF16 and there is no reduction, so this arm is exact in
 /// FP32 and is compared bit-exactly rather than with a tolerance.
-fn write_back_oracle(residual: &[u16], block_output: &[u16], write_gate: &[u16]) -> Vec<u16> {
+pub(crate) fn write_back_oracle(
+    residual: &[u16],
+    block_output: &[u16],
+    write_gate: &[u16],
+) -> Vec<u16> {
     let mut injected = vec![0u16; WIDTH];
     for branch in 0..BRANCHES {
         let gate = bf16_to_f32(write_gate[branch]);

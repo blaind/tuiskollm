@@ -35,11 +35,12 @@ use tuisko_qual::{
     benchmark_qwen36_gdn_recurrence, benchmark_qwen36_moe_experts, benchmark_qwen36_moe_router,
     benchmark_qwen36_mtp_layer, benchmark_qwen36_nvfp4_lm_head, benchmark_qwen36_paged_gqa,
     benchmark_qwen36_resident_model, benchmark_qwen36_residual_norm,
-    benchmark_qwen36_text_endpoint, benchmark_qwen38_flash_next_gdn_prepare,
-    benchmark_qwen38_flash_next_gdn_recurrence, benchmark_qwen38_flash_next_hyper_connection,
-    benchmark_qwen38_flash_next_lm_head, benchmark_qwen38_flash_next_moe_experts,
-    benchmark_qwen38_flash_next_moe_router, benchmark_qwen38_flash_next_ple,
-    benchmark_qwen38_flash_next_projections, benchmark_qwen38_flash_next_qsa_attention,
+    benchmark_qwen36_text_endpoint, benchmark_qwen38_flash_next_gdn_moe_layer,
+    benchmark_qwen38_flash_next_gdn_prepare, benchmark_qwen38_flash_next_gdn_recurrence,
+    benchmark_qwen38_flash_next_hyper_connection, benchmark_qwen38_flash_next_lm_head,
+    benchmark_qwen38_flash_next_moe_experts, benchmark_qwen38_flash_next_moe_router,
+    benchmark_qwen38_flash_next_ple, benchmark_qwen38_flash_next_projections,
+    benchmark_qwen38_flash_next_qsa_attention, benchmark_qwen38_flash_next_qsa_moe_layer,
     benchmark_qwen38_flash_next_qsa_prepare, benchmark_qwen38_flash_next_qsa_selection,
     benchmark_resident_long_context_model, benchmark_resident_model, benchmark_resident_mtp,
     benchmark_resident_mtp_batch_generation, benchmark_resident_mtp_generation,
@@ -667,6 +668,46 @@ fn run() -> Result<(), Box<dyn Error>> {
                 parse_options(arguments, DeviceBenchmarkOptions::long_graph())?;
             (
                 benchmark_qwen35_gdn_layer(&PathBuf::from(snapshot), options)?,
+                json_path,
+            )
+        }
+        #[cfg(feature = "device")]
+        "qwen38-flash-next-gdn-layer" => {
+            let snapshot = arguments
+                .next()
+                .ok_or("qwen38-flash-next-gdn-layer requires the admitted snapshot path")?;
+            let (options, json_path) =
+                parse_options(arguments, DeviceBenchmarkOptions::long_graph())?;
+            (
+                benchmark_qwen38_flash_next_gdn_moe_layer(&PathBuf::from(snapshot), 0, options)?,
+                json_path,
+            )
+        }
+        #[cfg(feature = "device")]
+        "qwen38-flash-next-ple-layer" => {
+            let snapshot = arguments
+                .next()
+                .ok_or("qwen38-flash-next-ple-layer requires the admitted snapshot path")?;
+            let (options, json_path) =
+                parse_options(arguments, DeviceBenchmarkOptions::long_graph())?;
+            (
+                benchmark_qwen38_flash_next_gdn_moe_layer(
+                    &PathBuf::from(snapshot),
+                    tuisko_model::Qwen38FlashNext::PLE_LAYER,
+                    options,
+                )?,
+                json_path,
+            )
+        }
+        #[cfg(feature = "device")]
+        "qwen38-flash-next-qsa-layer" => {
+            let snapshot = arguments
+                .next()
+                .ok_or("qwen38-flash-next-qsa-layer requires the admitted snapshot path")?;
+            let (options, json_path) =
+                parse_options(arguments, DeviceBenchmarkOptions::long_graph())?;
+            (
+                benchmark_qwen38_flash_next_qsa_moe_layer(&PathBuf::from(snapshot), options)?,
                 json_path,
             )
         }
