@@ -18,6 +18,7 @@ const INGRESS_QUEUE: usize = 8;
 /// The proven dense band, which is the ceiling every admission is measured against.
 const DENSE_BAND: usize = 2_051;
 const COMPLETION_TOKENS: usize = 8;
+const HELLO_MESSAGE_BOUNDARY_TOKENS: usize = 6;
 const THROUGHPUT_COMPLETION_TOKENS: usize = 64;
 const CANCEL_COMPLETION_TOKENS: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -29,6 +30,7 @@ struct PromptFixture {
     reasoning_effort: Option<&'static str>,
     enable_thinking: Option<bool>,
     prompt_tokens: usize,
+    message_boundary_tokens: usize,
 }
 
 type Result<T> = std::result::Result<T, QualError>;
@@ -67,6 +69,15 @@ struct Completion {
     content: String,
     finish_reason: String,
     usage: Usage,
+}
+
+fn same_completion_semantics(left: &Completion, right: &Completion) -> bool {
+    left.reasoning == right.reasoning
+        && left.content == right.content
+        && left.finish_reason == right.finish_reason
+        && left.usage.prompt_tokens == right.usage.prompt_tokens
+        && left.usage.completion_tokens == right.usage.completion_tokens
+        && left.usage.total_tokens == right.usage.total_tokens
 }
 
 /// What one streamed request cost, measured at the caller's own socket.
@@ -170,6 +181,7 @@ fn fixtures() -> Vec<PromptFixture> {
             reasoning_effort: None,
             enable_thinking: None,
             prompt_tokens: 11,
+            message_boundary_tokens: HELLO_MESSAGE_BOUNDARY_TOKENS,
         },
         PromptFixture {
             name: "hello-medium",
@@ -177,6 +189,7 @@ fn fixtures() -> Vec<PromptFixture> {
             reasoning_effort: Some("medium"),
             enable_thinking: None,
             prompt_tokens: 11,
+            message_boundary_tokens: HELLO_MESSAGE_BOUNDARY_TOKENS,
         },
         PromptFixture {
             name: "hello-xhigh",
@@ -184,6 +197,7 @@ fn fixtures() -> Vec<PromptFixture> {
             reasoning_effort: Some("xhigh"),
             enable_thinking: None,
             prompt_tokens: 53,
+            message_boundary_tokens: 48,
         },
         PromptFixture {
             name: "hello-low",
@@ -191,6 +205,7 @@ fn fixtures() -> Vec<PromptFixture> {
             reasoning_effort: Some("low"),
             enable_thinking: None,
             prompt_tokens: 41,
+            message_boundary_tokens: 36,
         },
         PromptFixture {
             name: "hello-no-thinking",
@@ -198,6 +213,7 @@ fn fixtures() -> Vec<PromptFixture> {
             reasoning_effort: None,
             enable_thinking: Some(false),
             prompt_tokens: 13,
+            message_boundary_tokens: 6,
         },
         PromptFixture {
             name: "unicode",
@@ -205,6 +221,7 @@ fn fixtures() -> Vec<PromptFixture> {
             reasoning_effort: None,
             enable_thinking: None,
             prompt_tokens: 17,
+            message_boundary_tokens: 12,
         },
         PromptFixture {
             name: "multi-turn",
@@ -221,6 +238,7 @@ fn fixtures() -> Vec<PromptFixture> {
             reasoning_effort: None,
             enable_thinking: None,
             prompt_tokens: 43,
+            message_boundary_tokens: 38,
         },
     ]
 }
@@ -508,10 +526,19 @@ impl Qualification {
                 &format!("{} streaming", fixture.name),
             )?;
             self.check(
-                streamed.completion == blocking,
+                same_completion_semantics(&streamed.completion, &blocking),
                 format!(
                     "fixture `{}` differs between transports: blocking={blocking:?}, streaming={:?}",
                     fixture.name, streamed.completion
+                ),
+            )?;
+            self.check(
+                streamed.completion.usage.cached_tokens == fixture.message_boundary_tokens,
+                format!(
+                    "fixture `{}` reused {} prompt tokens, expected its {}-token message boundary",
+                    fixture.name,
+                    streamed.completion.usage.cached_tokens,
+                    fixture.message_boundary_tokens,
                 ),
             )?;
             self.check(
@@ -613,7 +640,7 @@ impl Qualification {
 
         let recovery = self.request(hello(false, COMPLETION_TOKENS), "post-refusal completion")?;
         self.check(
-            &recovery == reference,
+            same_completion_semantics(&recovery, reference),
             format!("the served answer changed after the refusal sweep: {recovery:?}"),
         )
     }
@@ -625,7 +652,7 @@ impl Qualification {
             self.requests += lanes;
             for (lane, completion) in completions.iter().enumerate() {
                 self.check(
-                    completion == reference,
+                    same_completion_semantics(completion, reference),
                     format!(
                         "lane {lane} of {lanes} concurrent callers changed the answer: {completion:?}"
                     ),
@@ -647,7 +674,7 @@ impl Qualification {
         self.requests += prompts.len();
         for ((prompt, expected), actual) in prompts.iter().zip(&alone).zip(&batched) {
             self.check(
-                actual == expected,
+                same_completion_semantics(actual, expected),
                 format!(
                     "`{prompt}` changed under {}-way batching: alone={expected:?}, batched={actual:?}",
                     prompts.len(),
@@ -682,7 +709,7 @@ impl Qualification {
         )
     }
 
-    /// Checks that cancellation leaves no request state behind.
+    /// Checks that cancellation restores the admitted message boundary.
     fn run_cancellation(&mut self, reference: &Completion) -> Result<()> {
         for round in 0..3 {
             self.client.disconnect_stream()?;
@@ -698,9 +725,16 @@ impl Qualification {
                 &format!("post-cancellation completion {round}"),
             )?;
             self.check(
-                &recovery == reference,
+                same_completion_semantics(&recovery, reference),
                 format!(
                     "the served answer changed after cancellation round {round}: expected={reference:?}, actual={recovery:?}"
+                ),
+            )?;
+            self.check(
+                recovery.usage.cached_tokens == HELLO_MESSAGE_BOUNDARY_TOKENS,
+                format!(
+                    "cancellation round {round} restored {} cached tokens, expected {HELLO_MESSAGE_BOUNDARY_TOKENS}",
+                    recovery.usage.cached_tokens,
                 ),
             )?;
         }
@@ -726,7 +760,7 @@ impl Qualification {
 
         let after = self.request(hello(false, COMPLETION_TOKENS), "post-sibling completion")?;
         self.check(
-            &after == reference,
+            same_completion_semantics(&after, reference),
             format!("the served answer changed after the sibling-model sweep: {after:?}"),
         )?;
 
@@ -740,7 +774,7 @@ impl Qualification {
                 &format!("interleaved completion {round}"),
             )?;
             self.check(
-                &served == reference,
+                same_completion_semantics(&served, reference),
                 format!("interleaving sibling refusals changed round {round}: {served:?}"),
             )?;
         }
@@ -760,20 +794,41 @@ impl Qualification {
             "Each prompt is measured cold, then immediately warm. Both include expert streaming."
         );
         println!(
-            "| prompt | pass | budget | wall | TTFT | ITL median | ITL p90 | prompt tok | completion tok | reasoning deltas | content deltas | finish |"
+            "| prompt | pass | budget | wall | TTFT | ITL median | ITL p90 | prompt tok | cached tok | completion tok | reasoning deltas | content deltas | finish |"
         );
-        println!("| :-- | :-- | --: | --: | --: | --: | --: | --: | --: | --: | --: | :-- |");
+        println!("| :-- | :-- | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | :-- |");
         for (label, request, budget) in measurement_requests() {
+            let mut cold = None;
             for pass in ["cold", "warm"] {
                 let timing = self.stream(request.clone(), &label)?;
+                if let Some(cold) = &cold {
+                    self.check(
+                        same_completion_semantics(&timing.completion, cold),
+                        format!("`{label}` changed between cold and warm measurement passes"),
+                    )?;
+                    self.check(
+                        timing.completion.usage.cached_tokens > 0,
+                        format!("`{label}` warm measurement reused no prompt tokens"),
+                    )?;
+                } else {
+                    self.check(
+                        timing.completion.usage.cached_tokens == 0,
+                        format!(
+                            "`{label}` cold measurement reused {} prompt tokens",
+                            timing.completion.usage.cached_tokens
+                        ),
+                    )?;
+                    cold = Some(timing.completion.clone());
+                }
                 let (median, p90) = quantiles(&timing.inter_token);
                 println!(
-                    "| {label} | {pass} | {budget} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {label} | {pass} | {budget} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     millis(timing.wall),
                     millis(timing.time_to_first_token),
                     millis(median),
                     millis(p90),
                     timing.completion.usage.prompt_tokens,
+                    timing.completion.usage.cached_tokens,
                     timing.completion.usage.completion_tokens,
                     timing.reasoning_deltas,
                     timing.content_deltas,
@@ -901,7 +956,9 @@ fn measurement_requests() -> Vec<(String, Value, usize)> {
             (prompt.to_owned(), request, budget)
         })
         .collect::<Vec<_>>();
-    for tokens in [512usize, 1_024, 2_048] {
+    // Descending lengths keep a retained repeated-word prompt from becoming the
+    // next case's cold prefix authority.
+    for tokens in [DENSE_BAND - 32, 1_024, 512] {
         requests.push((
             format!("{tokens}-token prompt"),
             exact_length_request_streaming(tokens, 32),
@@ -1342,8 +1399,9 @@ fn expect_str_value(value: Option<&Value>, label: &str, expected: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        DENSE_BAND, Options, QualError, fixtures, long_prompt_body, median_of,
-        parse_capacity_refusal, percentile_index, quantiles, validate_blocking, validate_stream,
+        DENSE_BAND, HELLO_MESSAGE_BOUNDARY_TOKENS, Options, QualError, fixtures, long_prompt_body,
+        measurement_requests, median_of, parse_capacity_refusal, percentile_index, quantiles,
+        same_completion_semantics, validate_blocking, validate_stream,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -1395,9 +1453,15 @@ mod tests {
 
     #[test]
     fn blocking_and_streamed_fixtures_decode_to_the_same_completion() {
-        let usage = json!({
+        let blocking_usage = json!({
             "prompt_tokens": 11,
             "prompt_tokens_details": {"cached_tokens": 0},
+            "completion_tokens": 2,
+            "total_tokens": 13
+        });
+        let streamed_usage = json!({
+            "prompt_tokens": 11,
+            "prompt_tokens_details": {"cached_tokens": HELLO_MESSAGE_BOUNDARY_TOKENS},
             "completion_tokens": 2,
             "total_tokens": 13
         });
@@ -1415,7 +1479,7 @@ mod tests {
                 },
                 "finish_reason": "length"
             }],
-            "usage": usage
+            "usage": blocking_usage
         }))
         .unwrap();
 
@@ -1440,7 +1504,7 @@ mod tests {
                     "created": 2,
                     "model": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
                     "choices": [],
-                    "usage": usage
+                    "usage": streamed_usage
                 })),
                 None,
             ],
@@ -1448,7 +1512,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(streamed.completion, blocking);
+        assert_ne!(streamed.completion, blocking);
+        assert!(same_completion_semantics(&streamed.completion, &blocking));
+        let mut changed = streamed.completion.clone();
+        changed.reasoning.push('!');
+        assert!(!same_completion_semantics(&changed, &blocking));
         assert_eq!(streamed.reasoning_deltas, 2);
         assert_eq!(streamed.content_deltas, 0);
         assert!(validate_stream(&[chunk(json!({}), json!(null))], "no DONE").is_err());
@@ -1459,6 +1527,25 @@ mod tests {
         assert!(long_prompt_body(20).ends_with(" blue"));
         assert_eq!(long_prompt_body(20).matches(" blue").count(), 8);
         assert_eq!(long_prompt_body(4).matches(" blue").count(), 0);
+    }
+
+    #[test]
+    fn measured_long_prompts_descend_and_fit_the_served_capacity() {
+        let long = measurement_requests()
+            .into_iter()
+            .filter_map(|(label, _, budget)| {
+                label
+                    .strip_suffix("-token prompt")
+                    .and_then(|tokens| tokens.parse::<usize>().ok())
+                    .map(|tokens| (tokens, budget))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(long, [(DENSE_BAND - 32, 32), (1_024, 32), (512, 32)]);
+        assert!(
+            long.iter()
+                .all(|&(prompt, budget)| prompt + budget <= DENSE_BAND)
+        );
     }
 
     #[test]

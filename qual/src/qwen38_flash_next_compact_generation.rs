@@ -82,6 +82,12 @@ pub struct Qwen38FlashNextCompactGenerationQualification {
     pub capacity_refusals: usize,
     /// Per-slot engram carries compared against their own sequence's tokens.
     pub engram_carry_checks: usize,
+    /// Admissions that restored an exact complete-message prefix.
+    pub exact_prefix_reuses: usize,
+    /// Cancellation and completion boundaries matched against their durable banks.
+    pub restored_boundaries: usize,
+    /// Divergent prompts that correctly stayed on the cold path.
+    pub cold_prefix_fallbacks: usize,
     /// Exact bytes across all retained device arenas.
     pub arena_bytes: usize,
     /// Exact page-locked staging and double-logit-bank bytes.
@@ -126,6 +132,7 @@ pub fn qualify_qwen38_flash_next_compact_generation(
     if generator.active_requests() != 0 {
         return Err(mismatch("solo runs left a slot active"));
     }
+    generator.qualification_clear_retained()?;
 
     let before = device_memory_info(generator.context())?;
     generator.reset_telemetry();
@@ -135,6 +142,8 @@ pub fn qualify_qwen38_flash_next_compact_generation(
     let recycled_slot =
         verify_hole_reuse(&mut generator, &short, &short_solo, &tiled, &tiled_solo)?;
     let capacity_refusals = verify_capacity_refusal(&mut generator, &short, &short_solo)?;
+    let (exact_prefix_reuses, restored_boundaries, cold_prefix_fallbacks) =
+        verify_prefix_reuse(&mut generator)?;
     let after = device_memory_info(generator.context())?;
     if before != after {
         return Err(mismatch(format!(
@@ -155,6 +164,9 @@ pub fn qualify_qwen38_flash_next_compact_generation(
         cancellations: 1,
         capacity_refusals,
         engram_carry_checks,
+        exact_prefix_reuses,
+        restored_boundaries,
+        cold_prefix_fallbacks,
         arena_bytes: generator.arena_bytes()?,
         host_stager_bytes: generator.host_stager_bytes(),
         stable_addresses: stable_addresses.len(),
@@ -292,6 +304,7 @@ fn verify_route_inventory(
                 "B={batch} left completed requests active"
             )));
         }
+        generator.qualification_clear_retained()?;
     }
 
     Ok(())
@@ -390,6 +403,7 @@ fn verify_batch_independence(
             "the mixed drain never narrowed, so no round ran beside a hole: widths {widths:?}"
         )));
     }
+    generator.qualification_clear_retained()?;
 
     Ok(widths)
 }
@@ -399,10 +413,9 @@ fn verify_engram_carries(
     generator: &mut Qwen38FlashNextResidentBatchGenerator,
     frontend: &TextFrontend,
 ) -> QualResult<usize> {
-    // Retired slots restart while surviving carries advance independently.
+    // Retired slots return to their stable prefix while live carries advance independently.
     let requests = MIXED_FIXTURES.map(|(content, _)| greedy_request(content, CARRY_BUDGET));
     let restart = Qwen38FlashNextEngramCarry::start().previous();
-    let mut retired = [false; SLOTS];
     let mut checks = 0;
     let mut identities = Vec::with_capacity(SLOTS);
     let mut prompts: Vec<Vec<u32>> = Vec::with_capacity(SLOTS);
@@ -431,15 +444,13 @@ fn verify_engram_carries(
         .iter()
         .map(|event| event.step.token_id)
         .collect::<Vec<_>>();
-    for (slot, event) in first.iter().enumerate() {
-        retired[slot] = event.completed.is_some();
-    }
-    // Sampling prime logits does not replay or advance carries.
+    // Sampling prime logits does not replay or advance live carries. A completed
+    // slot returns to its retained prefix boundary.
     for (slot, prompt) in prompts.iter().enumerate() {
-        let expected = if retired[slot] {
-            restart
-        } else {
+        let expected = if generator.qualification_slot(identities[slot]).is_some() {
             tail_of(prompt)?
+        } else {
+            retained_carry(generator, slot, prompt)?
         };
         require_carry(generator, slot, expected)?;
         checks += 1;
@@ -448,19 +459,13 @@ fn verify_engram_carries(
     generator.step()?;
     // One replay advances each surviving carry by its own sampled token.
     for (slot, prompt) in prompts.iter().enumerate() {
-        if retired[slot] {
-            require_carry(generator, slot, restart)?;
-            checks += 1;
-            continue;
-        }
         let mut advanced = prompt.clone();
         advanced.push(sampled[slot]);
         let expected = tail_of(&advanced)?;
         let expected = if generator.qualification_slot(identities[slot]).is_some() {
             expected
         } else {
-            // Retirement clears the carry after replay.
-            restart
+            retained_carry(generator, slot, prompt)?
         };
         require_carry(generator, slot, expected)?;
         checks += 1;
@@ -471,7 +476,8 @@ fn verify_engram_carries(
             generator.cancel(identity)?;
         }
     }
-    // Every recycled slot returns to the segment boundary.
+    generator.qualification_clear_retained()?;
+    // Explicit cold reset returns every carry to the segment boundary.
     for slot in 0..SLOTS {
         require_carry(generator, slot, restart)?;
         checks += 1;
@@ -486,6 +492,21 @@ fn verify_engram_carries(
 /// The carry a sequence holds once its whole prompt has been staged.
 fn tail_of(prompt: &[u32]) -> QualResult<[u32; 2]> {
     Ok(Qwen38FlashNextEngramCarry::after(prompt)?.previous())
+}
+
+fn retained_carry(
+    generator: &Qwen38FlashNextResidentBatchGenerator,
+    slot: usize,
+    prompt: &[u32],
+) -> QualResult<[u32; 2]> {
+    let tokens = generator
+        .qualification_retained_tokens(slot)
+        .ok_or_else(|| mismatch(format!("retired slot {slot} retained no stable prefix")))?;
+    let prefix = prompt
+        .get(..tokens)
+        .ok_or_else(|| mismatch(format!("slot {slot} retained beyond its prompt")))?;
+
+    tail_of(prefix)
 }
 
 fn require_carry(
@@ -534,11 +555,11 @@ fn verify_hole_reuse(
     )?;
 
     let cancellation = generator.cancel(cancelled.request_id)?;
-    if cancellation.device_retained_tokens != 0
+    if cancellation.device_retained_tokens != cancellation.output.prompt.message_boundary_tokens
         || cancellation.output.token_ids != short_solo.token_ids[..1]
     {
         return Err(mismatch(
-            "cancellation changed its host boundary or retained device state",
+            "cancellation changed its host or retained message boundary",
         ));
     }
     // Cancellation releases only the cancelled slot's pages.
@@ -547,9 +568,10 @@ fn verify_hole_reuse(
     {
         return Err(mismatch("cancellation moved a surviving request's slot"));
     }
-    if generator.qualification_slot_tokens(1)? != 0 {
-        return Err(mismatch("a cancelled slot kept its committed length"));
+    if generator.qualification_slot_tokens(1)? != cancellation.device_retained_tokens {
+        return Err(mismatch("a cancelled slot kept the wrong retained length"));
     }
+    generator.qualification_clear_retained()?;
 
     let joined = generator.admit(tiled)?;
     if joined.native_prefill_tokens != TILED_PROMPT_TOKENS
@@ -581,7 +603,8 @@ fn verify_hole_reuse(
     while generator.active_requests() > 0 {
         generator.step()?;
     }
-    // Finished and cancelled requests must return every reserved page.
+    generator.qualification_clear_retained()?;
+    // Explicit cold reset returns every reserved page.
     if generator.qualification_free_pages() != free_before {
         return Err(mismatch(format!(
             "the shared pool holds {} free pages after four admissions and one cancellation, and \
@@ -630,8 +653,135 @@ fn verify_capacity_refusal(
     if generator.active_requests() != 0 {
         return Err(mismatch("the capacity scenario left a request active"));
     }
+    generator.qualification_clear_retained()?;
 
     Ok(1)
+}
+
+fn verify_prefix_reuse(
+    generator: &mut Qwen38FlashNextResidentBatchGenerator,
+) -> QualResult<(usize, usize, usize)> {
+    generator.qualification_clear_retained()?;
+    let opening = greedy_request("Give a brief greeting.", 8);
+    let mut followup = greedy_request("Give a brief greeting.", 8);
+    followup
+        .messages
+        .push(ChatMessage::new("assistant", "Hello."));
+    followup
+        .messages
+        .push(ChatMessage::new("user", "Now name one primary color."));
+
+    let (cold_reused, _, _, cold) = run_alone_accounted(generator, &followup)?;
+    if cold_reused != 0 {
+        return Err(mismatch("the cold prefix authority reused device state"));
+    }
+    generator.qualification_clear_retained()?;
+
+    let admission = generator.admit(&opening)?;
+    let slot = generator
+        .qualification_slot(admission.request_id)
+        .ok_or_else(|| mismatch("the prefix seed has no physical slot"))?;
+    let first = generator.step()?;
+    if !first
+        .iter()
+        .any(|event| event.request_id == admission.request_id)
+    {
+        return Err(mismatch("the prefix seed produced no first token"));
+    }
+    let cancelled = generator.cancel(admission.request_id)?;
+    let boundary = cancelled.device_retained_tokens;
+    if boundary == 0
+        || boundary > cancelled.output.prompt.message_boundary_tokens
+        || cancelled.output.prompt.message_boundary_tokens
+            >= cancelled.output.prompt.token_ids.len()
+        || generator.qualification_retained_tokens(slot) != Some(boundary)
+        || !generator.qualification_retained_prefix_matches(slot)?
+    {
+        return Err(mismatch(
+            "cancellation did not restore every durable prefix plane",
+        ));
+    }
+
+    let (reused, _, reused_slot, warm) = run_alone_accounted(generator, &followup)?;
+    if reused != boundary || reused_slot != slot || !same_output(&cold, &warm) {
+        return Err(mismatch(format!(
+            "fresh and reused continuations differ: cached {reused}/{boundary}, slots {reused_slot}/{slot}, first tokens {}/{}, byte equality {}",
+            cold.token_ids.first().copied().unwrap_or_default(),
+            warm.token_ids.first().copied().unwrap_or_default(),
+            same_output(&cold, &warm)
+        )));
+    }
+    let completed_boundary = generator
+        .qualification_retained_tokens(reused_slot)
+        .ok_or_else(|| mismatch("normal completion retained no stable prefix"))?;
+    if completed_boundary > warm.prompt.message_boundary_tokens {
+        return Err(mismatch(
+            "normal completion retained beyond its complete message",
+        ));
+    }
+    if generator.qualification_retained_tokens(reused_slot) != Some(completed_boundary)
+        || !generator.qualification_retained_prefix_matches(reused_slot)?
+    {
+        return Err(mismatch(
+            "normal completion did not restore its durable prefix",
+        ));
+    }
+
+    let (repeat_reused, _, repeat_slot, repeated) = run_alone_accounted(generator, &followup)?;
+    if repeat_reused != completed_boundary
+        || repeat_slot != reused_slot
+        || !same_output(&warm, &repeated)
+    {
+        return Err(mismatch(
+            "a completed prefix did not reproduce its exact continuation",
+        ));
+    }
+
+    let divergent = greedy_request("A wholly unrelated prompt.", 2);
+    let (divergent_reused, _, _, _) = run_alone_accounted(generator, &divergent)?;
+    if divergent_reused != 0 {
+        return Err(mismatch("a divergent prompt reused stale device state"));
+    }
+    generator.qualification_clear_retained()?;
+
+    Ok((2, 2, 1))
+}
+
+fn run_alone_accounted(
+    generator: &mut Qwen38FlashNextResidentBatchGenerator,
+    request: &ChatGenerationRequest,
+) -> QualResult<(usize, usize, usize, GeneratedText)> {
+    if generator.active_requests() != 0 {
+        return Err(mismatch("an accounted run started beside a live request"));
+    }
+    let admission = generator.admit(request)?;
+    let reused = admission.device_reused_tokens;
+    let native = admission.native_prefill_tokens;
+    let slot = generator
+        .qualification_slot(admission.request_id)
+        .ok_or_else(|| mismatch("an accounted run has no physical slot"))?;
+    if let Some(output) = admission.completed {
+        return Ok((reused, native, slot, output));
+    }
+    loop {
+        let events = generator.step()?;
+        let event = events
+            .iter()
+            .find(|event| event.request_id == admission.request_id)
+            .ok_or_else(|| mismatch("an accounted run produced no matching event"))?;
+        if let Some(output) = &event.completed {
+            return Ok((reused, native, slot, output.clone()));
+        }
+    }
+}
+
+fn same_output(left: &GeneratedText, right: &GeneratedText) -> bool {
+    left.prompt.token_ids == right.prompt.token_ids
+        && left.prompt.message_boundary_tokens == right.prompt.message_boundary_tokens
+        && left.prompt.rendered_bytes == right.prompt.rendered_bytes
+        && left.token_ids == right.token_ids
+        && left.text.as_bytes() == right.text.as_bytes()
+        && left.finish_reason == right.finish_reason
 }
 
 fn require_round(
@@ -737,6 +887,10 @@ pub fn print_qwen38_flash_next_compact_generation_report(
         report.engram_carry_checks,
     );
     println!(
+        "  prefix reuse {} exact, {} restored boundaries, {} cold fallbacks",
+        report.exact_prefix_reuses, report.restored_boundaries, report.cold_prefix_fallbacks
+    );
+    println!(
         "  arenas {} B, pinned {} B, {} stable addresses",
         report.arena_bytes, report.host_stager_bytes, report.stable_addresses
     );
@@ -770,7 +924,18 @@ mod tests {
         print_qwen38_flash_next_compact_generation_report,
         qualify_qwen38_flash_next_compact_generation,
     };
+    use std::mem::size_of;
     use std::path::PathBuf;
+    use tuisko_model::{Arch, Qwen38FlashNext};
+
+    #[test]
+    fn prefix_reuse_accounting_covers_every_durable_slot_bank() {
+        let recurrent = 115_642_368usize;
+        let boundary = SLOTS * recurrent + SLOTS * Qwen38FlashNext::VOCAB * size_of::<u16>();
+
+        assert_eq!(boundary, 929_112_064);
+        assert_eq!(139_399_168 + boundary, 1_068_511_232);
+    }
 
     #[test]
     fn the_mixed_fixtures_retire_from_the_middle_of_the_active_order() {
@@ -816,9 +981,12 @@ mod tests {
         assert_eq!(report.cancellations, 1);
         assert_eq!(report.capacity_refusals, 1);
         assert_eq!(report.engram_carry_checks, 36 + SLOTS + SLOTS + SLOTS);
-        assert_eq!(report.stable_addresses, 3);
+        assert_eq!(report.exact_prefix_reuses, 2);
+        assert_eq!(report.restored_boundaries, 2);
+        assert_eq!(report.cold_prefix_fallbacks, 1);
+        assert_eq!(report.stable_addresses, 7);
         assert_eq!(report.arena_bytes, 30_675_307_776);
-        assert_eq!(report.host_stager_bytes, 139_399_168);
+        assert_eq!(report.host_stager_bytes, 1_068_511_232);
         assert!(report.telemetry.at(SLOTS)?.rounds() > 0);
         Ok(())
     }
