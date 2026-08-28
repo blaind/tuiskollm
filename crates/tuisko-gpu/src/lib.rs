@@ -7,6 +7,7 @@ mod memory;
 mod profiler;
 mod streaming;
 mod timer;
+mod vmm_manifest;
 
 pub use arena::{ArenaLayout, ArenaRegion, DeviceArena, LoadingDeviceArena};
 pub use cuda_core::{
@@ -22,3 +23,4 @@ pub use streaming::{
     RECLAIM_FENCE_GENERATIONS, TransferStream,
 };
 pub use timer::{GpuTimer, GpuTiming};
+pub use vmm_manifest::{VmmSegment, VmmSegmentClass, VmmSegmentManifest};

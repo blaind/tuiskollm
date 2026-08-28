@@ -5,7 +5,7 @@ use crate::{
     EngineError, EngineResult, KvCacheCodec, LayerMemoryLayout, MAX_BATCH, SharedPagedKvLayout,
     qwen38::long_context_kv_layout::MAX_CONTEXT_TOKENS,
 };
-use tuisko_gpu::{ArenaLayout, ArenaRegion};
+use tuisko_gpu::{ArenaLayout, ArenaRegion, VmmSegmentManifest};
 use tuisko_kernels_sm120::{
     LONG_CONTEXT_GQA_MAX_PARTITIONS, PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES,
 };
@@ -403,6 +403,15 @@ impl ResidentLayerLayout {
     fn push_spans(self, spans: &mut Vec<Span>) {
         self.mixer.push_spans(spans);
         self.mlp.push_spans(spans);
+        self.persistent.push_spans(spans);
+    }
+
+    fn push_resident_spans(self, spans: &mut Vec<Span>) {
+        self.mixer.push_spans(spans);
+        self.mlp.push_spans(spans);
+    }
+
+    fn push_parkable_spans(self, spans: &mut Vec<Span>) {
         self.persistent.push_spans(spans);
     }
 }
@@ -814,6 +823,56 @@ impl ResidentModelLayout {
         MAX_CONTEXT_TOKENS
     }
 
+    /// Classifies the resident arena at an exact device VMM granularity.
+    ///
+    /// Weight and workspace granules remain resident. A granule is parkable only when it contains
+    /// no byte from either class, so mixed weight/state boundary granules cannot be released.
+    pub fn vmm_segment_manifest(&self, granularity: usize) -> EngineResult<VmmSegmentManifest> {
+        let mut resident_spans = Vec::new();
+        let mut parkable_spans = Vec::new();
+        let mut owned_spans = Vec::new();
+        for layer in &self.layers {
+            layer.push_resident_spans(&mut resident_spans);
+            layer.push_parkable_spans(&mut parkable_spans);
+            layer.push_spans(&mut owned_spans);
+        }
+        self.endpoint.push_spans(&mut resident_spans);
+        self.endpoint.push_spans(&mut owned_spans);
+        self.workspace.push_spans(&mut resident_spans);
+        self.workspace.push_spans(&mut owned_spans);
+        let resident_ranges = resident_spans
+            .into_iter()
+            .map(|span| span.offset..span.offset + span.bytes)
+            .collect::<Vec<_>>();
+        owned_spans.sort_unstable_by_key(|span| span.offset);
+        let mut cursor = 0;
+        for span in owned_spans {
+            if cursor < span.offset {
+                parkable_spans.push(Span {
+                    offset: cursor,
+                    bytes: span.offset - cursor,
+                });
+            }
+            cursor = span.offset + span.bytes;
+        }
+        if cursor < self.resident_arena_bytes() {
+            parkable_spans.push(Span {
+                offset: cursor,
+                bytes: self.resident_arena_bytes() - cursor,
+            });
+        }
+        let parkable_ranges = parkable_spans
+            .into_iter()
+            .map(|span| span.offset..span.offset + span.bytes)
+            .collect::<Vec<_>>();
+        Ok(VmmSegmentManifest::build(
+            self.resident_arena_bytes(),
+            granularity,
+            &resident_ranges,
+            &parkable_ranges,
+        )?)
+    }
+
     fn validate_regions(&self) -> EngineResult<()> {
         let mut spans = Vec::new();
         for layer in &self.layers {
@@ -972,6 +1031,7 @@ fn gdn_state_bytes() -> EngineResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::{PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES, ResidentLayerKind, ResidentModelLayout};
+    use tuisko_gpu::VmmSegmentClass;
 
     #[test]
     fn exact_layer_route_inventory_is_complete() {
@@ -1055,5 +1115,31 @@ mod tests {
         assert_eq!(layout.kv_arena_bytes(), 7_210_118_656);
         assert_eq!(layout.padding_bytes(), 15_676);
         assert_eq!(layout.arena_bytes(), 28_494_230_272);
+    }
+
+    #[test]
+    fn vmm_manifest_keeps_every_mixed_weight_state_granule_resident() {
+        let layout = ResidentModelLayout::build().unwrap();
+        let manifest = layout.vmm_segment_manifest(64 * 1_024).unwrap();
+
+        assert_eq!(manifest.arena_bytes(), layout.resident_arena_bytes());
+        assert!(manifest.reservation_bytes() >= manifest.arena_bytes());
+        assert_eq!(manifest.reservation_bytes() % manifest.granularity(), 0);
+        assert!(manifest.parkable_bytes() > 0);
+        assert!(manifest.parkable_bytes() <= layout.history_bytes() + layout.state_bytes());
+        assert_eq!(
+            manifest
+                .segments()
+                .iter()
+                .map(|segment| segment.bytes())
+                .sum::<usize>(),
+            manifest.reservation_bytes()
+        );
+        assert!(
+            manifest
+                .segments()
+                .iter()
+                .any(|segment| segment.class() == VmmSegmentClass::Parkable)
+        );
     }
 }
