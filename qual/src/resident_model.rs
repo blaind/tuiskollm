@@ -30,9 +30,13 @@ const TABLE_STRIDE: usize = 3;
 const LONG_ROUTE_LENGTHS: [usize; 6] = [193, 1_025, 4_097, 16_385, 65_537, 131_073];
 const LONG_ORACLE_DIMENSIONS: [usize; 8] = [0, 31, 32, 127, 128, 223, 224, 255];
 const PREFILL_ROUTES: [usize; 4] = [32, 64, 128, 1_024];
-const PREFILL_TAIL_ROUTES: [(usize, usize, Option<usize>); 5] = [
+const PREFILL_TAIL_ROUTES: [(usize, usize, Option<usize>); 9] = [
     (32, 160, None),
+    (32, 8_160, Some(16)),
+    (32, 219_968, Some(16)),
     (64, 192, None),
+    (64, 8_128, Some(16)),
+    (64, 219_936, Some(16)),
     (128, 1, Some(8)),
     (128, 32_768, Some(16)),
     (1_024, 1_024, Some(4)),
@@ -267,7 +271,7 @@ fn verify_prefill_routes(
             &replay,
             report,
         )?;
-        verify_prefill_inactive(replay_route, &replay, report)?;
+        verify_prefill_inactive(program, replay_route, &replay, report)?;
         report.graph_replay_values += replay_pages
             .iter()
             .map(|(key, value)| key.len() + value.len())
@@ -329,6 +333,15 @@ fn verify_prefill_tail_routes(
     stable_route_addresses: &[usize; 2],
     report: &mut ResidentModelQualification,
 ) -> Result<(), ResidentModelQualificationError> {
+    for slot in 1..MAX_BATCH {
+        let released = program.recycle_kv_slot(stream, slot)?;
+        if released != TABLE_STRIDE {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "resident deep-prefill qualification released {released} pages from slot {slot}, expected {TABLE_STRIDE}"
+            )));
+        }
+    }
+
     let maximum_context = PREFILL_TAIL_ROUTES
         .iter()
         .map(|&(tokens, first_position, _)| first_position + tokens)
@@ -403,7 +416,7 @@ fn verify_prefill_tail_routes(
             &replay,
             report,
         )?;
-        verify_prefill_inactive(replay_route, &replay, report)?;
+        verify_prefill_inactive(program, replay_route, &replay, report)?;
         report.graph_replay_values += replay_pages
             .iter()
             .map(|(key, value)| key.len() + value.len())
@@ -422,6 +435,15 @@ fn verify_prefill_tail_routes(
     }
 
     program.truncate_kv_slot_tokens(stream, 0, 192)?;
+    for slot in 1..MAX_BATCH {
+        program.activate_kv_slot(slot)?;
+        let update = program.reserve_kv_slot_tokens(stream, slot, 192)?;
+        if update.first_entry() != 0 || update.entry_count() != TABLE_STRIDE {
+            return Err(ResidentModelQualificationError::Mismatch(format!(
+                "resident deep-prefill qualification restored slot {slot} with update {update:?}, expected entries 0..{TABLE_STRIDE}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1513,7 +1535,11 @@ fn verify_inactive(
     inactive += sentinel_u16!(swiglu, Qwen38_27B::INTERMEDIATE);
     inactive += sentinel_u16!(mlp_branch, Qwen38_27B::HIDDEN);
     inactive += sentinel_u16!(logits, Qwen38_27B::VOCAB);
-    let persistent = verify_persistent_inactive(batch, slots, observed, true)?;
+    let active_cache_pages = slots
+        .iter()
+        .flat_map(|&slot| slot * TABLE_STRIDE..(slot + 1) * TABLE_STRIDE)
+        .collect::<Vec<_>>();
+    let persistent = verify_persistent_inactive(batch, slots, &active_cache_pages, observed, true)?;
     inactive += persistent;
     report.slot_control_values += persistent;
     report.inactive_values += inactive;
@@ -1521,6 +1547,7 @@ fn verify_inactive(
 }
 
 fn verify_prefill_inactive(
+    program: &ResidentModelProgram,
     route: ResidentPrefillRoute,
     observed: &ResidentModelObservables,
     report: &mut ResidentModelQualification,
@@ -1630,7 +1657,23 @@ fn verify_prefill_inactive(
         &observed.logits,
         Qwen38_27B::VOCAB,
     )?;
-    let persistent = verify_persistent_inactive(tokens, &[0], observed, false)?;
+    let observed_cache_pages = MAX_BATCH * TABLE_STRIDE;
+    let mut active_cache_pages = Vec::new();
+    for logical_page in 0..program.qualification_kv_page_count(0)? {
+        let physical_page = usize::try_from(
+            program.qualification_kv_physical_page(0, logical_page * ATTENTION_PAGE_SIZE)?,
+        )
+        .map_err(|_| {
+            ResidentModelQualificationError::Mismatch(
+                "resident prefill physical cache page exceeds host width".to_string(),
+            )
+        })?;
+        if physical_page < observed_cache_pages {
+            active_cache_pages.push(physical_page);
+        }
+    }
+    let persistent =
+        verify_persistent_inactive(tokens, &[0], &active_cache_pages, observed, false)?;
     report.slot_control_values += persistent;
     report.inactive_values += inactive + persistent;
     Ok(())
@@ -1702,14 +1745,15 @@ fn require_f32_sentinel_tail(
 fn verify_persistent_inactive(
     batch: usize,
     active_slots: &[usize],
+    active_cache_pages: &[usize],
     observed: &ResidentModelObservables,
     check_guard_pages: bool,
 ) -> Result<usize, ResidentModelQualificationError> {
     let history_per_slot = Qwen38_27B::GDN_QKV_ROWS * (Qwen38_27B::LINEAR_CONV_KERNEL_DIM - 1);
     let state_per_slot =
         Qwen38_27B::GDN_CONTROL_ROWS * Qwen38_27B::LINEAR_HEAD_DIM * Qwen38_27B::LINEAR_HEAD_DIM;
-    let cache_per_slot =
-        TABLE_STRIDE * Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM;
+    let cache_per_page = Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM;
+    let observed_cache_pages = MAX_BATCH * TABLE_STRIDE;
     let mut inactive = 0;
     for (layer, values) in observed
         .history
@@ -1753,19 +1797,22 @@ fn verify_persistent_inactive(
         ("key", &observed.key_pages),
         ("value", &observed.value_pages),
     ] {
-        for (layer, values) in all.chunks_exact(MAX_BATCH * cache_per_slot).enumerate() {
-            for slot in 0..MAX_BATCH {
-                if active_slots.contains(&slot) {
+        for (layer, values) in all
+            .chunks_exact(observed_cache_pages * cache_per_page)
+            .enumerate()
+        {
+            for physical_page in 0..observed_cache_pages {
+                if active_cache_pages.contains(&physical_page) {
                     continue;
                 }
-                let begin = slot * cache_per_slot;
-                let end = begin + cache_per_slot;
+                let begin = physical_page * cache_per_page;
+                let end = begin + cache_per_page;
                 if values[begin..end].iter().any(|&value| value != 0) {
                     return Err(ResidentModelQualificationError::Mismatch(format!(
-                        "B={batch} modified inactive {role} cache slot {slot} at inventory layer {layer}"
+                        "B={batch} modified inactive {role} physical cache page {physical_page} at inventory layer {layer}"
                     )));
                 }
-                inactive += cache_per_slot;
+                inactive += cache_per_page;
             }
         }
     }
@@ -2091,13 +2138,13 @@ mod tests {
         assert_eq!(report.source_scalars, 256);
         assert_eq!(
             report.oracle_values,
-            (active + 9) * (3 * 5_120 + 1 + SELECTED_LOGIT_ROWS.len())
+            (active + 13) * (3 * 5_120 + 1 + SELECTED_LOGIT_ROWS.len())
         );
         assert!(report.graph_replay_values > 0);
         assert!(report.inactive_values > 0);
         assert!(report.slot_control_values > 0);
         assert_eq!(report.long_route_cases, 49);
-        assert_eq!(report.prefill_route_cases, 9);
+        assert_eq!(report.prefill_route_cases, 13);
         assert!(report.long_oracle_values > 0);
         assert!(report.maximum_absolute_error.is_finite());
     }

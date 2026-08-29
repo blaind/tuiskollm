@@ -581,7 +581,7 @@ mod kernels {
         dynamic_shared_alignment = 16,
         min_compute_capability = (12, 0),
     )]
-    pub fn paged_gqa_prefill_flash_p8_exact<A: Arch>(
+    pub fn paged_gqa_prefill_flash_p8_exact<A: Arch, const TOKENS: usize>(
         query: *const f32,
         key_pages: *const u8,
         value_pages: *const u8,
@@ -625,7 +625,7 @@ mod kernels {
         dynamic_shared_alignment = 16,
         min_compute_capability = (12, 0),
     )]
-    pub fn paged_gqa_prefill_flash_p16_exact<A: Arch>(
+    pub fn paged_gqa_prefill_flash_p16_exact<A: Arch, const TOKENS: usize>(
         query: *const f32,
         key_pages: *const u8,
         value_pages: *const u8,
@@ -657,7 +657,7 @@ mod kernels {
         }
     }
 
-    /// Merges exact FP32 T=128 partition states into the public output seam.
+    /// Merges exact FP32 partition states into the public output seam.
     #[kernel]
     #[launch_bounds(32, 16)]
     #[launch_contract(
@@ -667,12 +667,16 @@ mod kernels {
         dynamic_shared = 0,
         min_compute_capability = (12, 0),
     )]
-    pub fn paged_gqa_prefill_partitioned_reduce_exact<A: Arch, const PARTITIONS: usize>(
+    pub fn paged_gqa_prefill_partitioned_reduce_exact<
+        A: Arch,
+        const TOKENS: usize,
+        const PARTITIONS: usize,
+    >(
         partials: *const f32,
         output: *mut f32,
     ) {
         unsafe {
-            paged_gqa_prefill_partitioned_reduce::<A, 128, PARTITIONS>(partials, output);
+            paged_gqa_prefill_partitioned_reduce::<A, TOKENS, PARTITIONS>(partials, output);
         }
     }
 
@@ -1670,21 +1674,28 @@ impl<A: Arch, E: PagedGqaEntries<A>> ExactWidthRoutes<A, E> {
     }
 }
 
-struct PreparedPartitionedPrefillP8<A: Arch> {
-    partial: PreparedLaunch<kernels::__paged_gqa_prefill_flash_p8_exact_CudaKernel<A>>,
-    reduce: PreparedLaunch<kernels::__paged_gqa_prefill_partitioned_reduce_exact_CudaKernel<A, 8>>,
+struct PreparedPartitionedPrefillP8<A: Arch, const TOKENS: usize> {
+    partial: PreparedLaunch<kernels::__paged_gqa_prefill_flash_p8_exact_CudaKernel<A, TOKENS>>,
+    reduce: PreparedLaunch<
+        kernels::__paged_gqa_prefill_partitioned_reduce_exact_CudaKernel<A, TOKENS, 8>,
+    >,
 }
 
-impl<A: Arch> PreparedPartitionedPrefillP8<A> {
+impl<A: Arch, const TOKENS: usize> PreparedPartitionedPrefillP8<A, TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let partial_blocks = u32::try_from(128 / 32 * A::NUM_ATTENTION_HEADS * 8)
+        if !matches!(TOKENS, 32 | 64 | 128) {
+            return Err(GpuError::invalid_launch(format!(
+                "P8 flash paged GQA tokens {TOKENS} are outside the admitted set 32, 64, 128"
+            )));
+        }
+        let partial_blocks = u32::try_from(TOKENS / 32 * A::NUM_ATTENTION_HEADS * 8)
             .map_err(|_| GpuError::invalid_launch("P8 flash paged GQA grid exceeds u32"))?;
-        let reduce_blocks = u32::try_from(128 * A::NUM_ATTENTION_HEADS)
+        let reduce_blocks = u32::try_from(TOKENS * A::NUM_ATTENTION_HEADS)
             .map_err(|_| GpuError::invalid_launch("paged GQA reduction grid exceeds u32"))?;
 
         Ok(Self {
             partial: module
-                .prepare_paged_gqa_prefill_flash_p8_exact::<A>(LaunchConfig1D::new(
+                .prepare_paged_gqa_prefill_flash_p8_exact::<A, TOKENS>(LaunchConfig1D::new(
                     partial_blocks,
                     FLASH_PREFILL_THREADS as u32,
                     FLASH_PREFILL_P8_SHARED_BYTES_U32,
@@ -1693,11 +1704,9 @@ impl<A: Arch> PreparedPartitionedPrefillP8<A> {
                     GpuError::launch("preparing P8 flash paged GQA prefill", source)
                 })?,
             reduce: module
-                .prepare_paged_gqa_prefill_partitioned_reduce_exact::<A, 8>(LaunchConfig1D::new(
-                    reduce_blocks,
-                    THREADS,
-                    0,
-                ))
+                .prepare_paged_gqa_prefill_partitioned_reduce_exact::<A, TOKENS, 8>(
+                    LaunchConfig1D::new(reduce_blocks, THREADS, 0),
+                )
                 .map_err(|source| GpuError::launch("preparing P8 paged GQA reduction", source))?,
         })
     }
@@ -1720,7 +1729,7 @@ impl<A: Arch> PreparedPartitionedPrefillP8<A> {
         value_scale: f32,
     ) -> GpuResult<()> {
         module
-            .paged_gqa_prefill_flash_p8_exact::<A>(
+            .paged_gqa_prefill_flash_p8_exact::<A, TOKENS>(
                 stream,
                 &self.partial,
                 query,
@@ -1737,7 +1746,7 @@ impl<A: Arch> PreparedPartitionedPrefillP8<A> {
             )
             .map_err(|source| GpuError::launch("launching P8 flash paged GQA prefill", source))?;
         module
-            .paged_gqa_prefill_partitioned_reduce_exact::<A, 8>(
+            .paged_gqa_prefill_partitioned_reduce_exact::<A, TOKENS, 8>(
                 stream,
                 &self.reduce,
                 partials,
@@ -1747,21 +1756,28 @@ impl<A: Arch> PreparedPartitionedPrefillP8<A> {
     }
 }
 
-struct PreparedPartitionedPrefillP16<A: Arch> {
-    partial: PreparedLaunch<kernels::__paged_gqa_prefill_flash_p16_exact_CudaKernel<A>>,
-    reduce: PreparedLaunch<kernels::__paged_gqa_prefill_partitioned_reduce_exact_CudaKernel<A, 16>>,
+struct PreparedPartitionedPrefillP16<A: Arch, const TOKENS: usize> {
+    partial: PreparedLaunch<kernels::__paged_gqa_prefill_flash_p16_exact_CudaKernel<A, TOKENS>>,
+    reduce: PreparedLaunch<
+        kernels::__paged_gqa_prefill_partitioned_reduce_exact_CudaKernel<A, TOKENS, 16>,
+    >,
 }
 
-impl<A: Arch> PreparedPartitionedPrefillP16<A> {
+impl<A: Arch, const TOKENS: usize> PreparedPartitionedPrefillP16<A, TOKENS> {
     fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let partial_blocks = u32::try_from(128 / 32 * A::NUM_ATTENTION_HEADS * 16)
+        if !matches!(TOKENS, 32 | 64 | 128) {
+            return Err(GpuError::invalid_launch(format!(
+                "P16 flash paged GQA tokens {TOKENS} are outside the admitted set 32, 64, 128"
+            )));
+        }
+        let partial_blocks = u32::try_from(TOKENS / 32 * A::NUM_ATTENTION_HEADS * 16)
             .map_err(|_| GpuError::invalid_launch("P16 flash paged GQA grid exceeds u32"))?;
-        let reduce_blocks = u32::try_from(128 * A::NUM_ATTENTION_HEADS)
+        let reduce_blocks = u32::try_from(TOKENS * A::NUM_ATTENTION_HEADS)
             .map_err(|_| GpuError::invalid_launch("paged GQA reduction grid exceeds u32"))?;
 
         Ok(Self {
             partial: module
-                .prepare_paged_gqa_prefill_flash_p16_exact::<A>(LaunchConfig1D::new(
+                .prepare_paged_gqa_prefill_flash_p16_exact::<A, TOKENS>(LaunchConfig1D::new(
                     partial_blocks,
                     FLASH_PREFILL_THREADS as u32,
                     FLASH_PREFILL_P16_SHARED_BYTES_U32,
@@ -1770,11 +1786,9 @@ impl<A: Arch> PreparedPartitionedPrefillP16<A> {
                     GpuError::launch("preparing P16 flash paged GQA prefill", source)
                 })?,
             reduce: module
-                .prepare_paged_gqa_prefill_partitioned_reduce_exact::<A, 16>(LaunchConfig1D::new(
-                    reduce_blocks,
-                    THREADS,
-                    0,
-                ))
+                .prepare_paged_gqa_prefill_partitioned_reduce_exact::<A, TOKENS, 16>(
+                    LaunchConfig1D::new(reduce_blocks, THREADS, 0),
+                )
                 .map_err(|source| GpuError::launch("preparing P16 paged GQA reduction", source))?,
         })
     }
@@ -1797,7 +1811,7 @@ impl<A: Arch> PreparedPartitionedPrefillP16<A> {
         value_scale: f32,
     ) -> GpuResult<()> {
         module
-            .paged_gqa_prefill_flash_p16_exact::<A>(
+            .paged_gqa_prefill_flash_p16_exact::<A, TOKENS>(
                 stream,
                 &self.partial,
                 query,
@@ -1814,7 +1828,7 @@ impl<A: Arch> PreparedPartitionedPrefillP16<A> {
             )
             .map_err(|source| GpuError::launch("launching P16 flash paged GQA prefill", source))?;
         module
-            .paged_gqa_prefill_partitioned_reduce_exact::<A, 16>(
+            .paged_gqa_prefill_partitioned_reduce_exact::<A, TOKENS, 16>(
                 stream,
                 &self.reduce,
                 partials,
@@ -1906,17 +1920,48 @@ impl<A: Arch, const PARTITIONS: usize> PreparedMacroPrefill<A, PARTITIONS> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PartitionedPrefillRoute {
+    T32P8,
+    T32P16,
+    T64P8,
+    T64P16,
+    T128P8,
+    T128P16,
+}
+
+fn partitioned_prefill_route(
+    tokens: usize,
+    partitions: usize,
+) -> GpuResult<PartitionedPrefillRoute> {
+    match (tokens, partitions) {
+        (32, 8) => Ok(PartitionedPrefillRoute::T32P8),
+        (32, 16) => Ok(PartitionedPrefillRoute::T32P16),
+        (64, 8) => Ok(PartitionedPrefillRoute::T64P8),
+        (64, 16) => Ok(PartitionedPrefillRoute::T64P16),
+        (128, 8) => Ok(PartitionedPrefillRoute::T128P8),
+        (128, 16) => Ok(PartitionedPrefillRoute::T128P16),
+        _ => Err(GpuError::invalid_launch(format!(
+            "partitioned paged GQA prefill T={tokens}/P={partitions} is outside the admitted T=32/64/128, P=8/16 matrix"
+        ))),
+    }
+}
+
 /// Prepared paged GQA routes for exact `B=1..8` decode and early prefill tails.
 ///
 /// Qwen3.8 keeps its own owner: beyond the eleven widths every table shares it
-/// admits the P8/P16 partitioned `T=128` tails and the five `T=1024` macro
+/// admits P8/P16 partitioned `T=32/64/128` tails and the five `T=1024` macro
 /// routes, whose two-stage partial/reduce launches take a partials workspace
 /// the shared width dispatch does not carry.
 pub struct PagedGqaOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
     widths: ExactWidthRoutes<A, Qwen38PagedGqaEntries>,
-    p8: PreparedPartitionedPrefillP8<A>,
-    p16: PreparedPartitionedPrefillP16<A>,
+    t32_p8: PreparedPartitionedPrefillP8<A, 32>,
+    t32_p16: PreparedPartitionedPrefillP16<A, 32>,
+    t64_p8: PreparedPartitionedPrefillP8<A, 64>,
+    t64_p16: PreparedPartitionedPrefillP16<A, 64>,
+    t128_p8: PreparedPartitionedPrefillP8<A, 128>,
+    t128_p16: PreparedPartitionedPrefillP16<A, 128>,
     macro_p1: PreparedMacroPrefill<A, 1>,
     macro_p2: PreparedMacroPrefill<A, 2>,
     macro_p4: PreparedMacroPrefill<A, 4>,
@@ -1939,8 +1984,12 @@ impl<A: Sm120Arch> PagedGqaOp<A> {
 
         Ok(Self {
             widths: ExactWidthRoutes::prepare(&module)?,
-            p8: PreparedPartitionedPrefillP8::prepare(&module)?,
-            p16: PreparedPartitionedPrefillP16::prepare(&module)?,
+            t32_p8: PreparedPartitionedPrefillP8::prepare(&module)?,
+            t32_p16: PreparedPartitionedPrefillP16::prepare(&module)?,
+            t64_p8: PreparedPartitionedPrefillP8::prepare(&module)?,
+            t64_p16: PreparedPartitionedPrefillP16::prepare(&module)?,
+            t128_p8: PreparedPartitionedPrefillP8::prepare(&module)?,
+            t128_p16: PreparedPartitionedPrefillP16::prepare(&module)?,
             macro_p1: PreparedMacroPrefill::prepare(&module)?,
             macro_p2: PreparedMacroPrefill::prepare(&module)?,
             macro_p4: PreparedMacroPrefill::prepare(&module)?,
@@ -2078,7 +2127,7 @@ impl<A: Sm120Arch> PagedGqaOp<A> {
         })
     }
 
-    /// Applies exact partitioned paged GQA to a deep `T=128` prefill tail.
+    /// Applies exact partitioned paged GQA to a deep `T=32/64/128` prefill tail.
     ///
     /// # Safety
     ///
@@ -2092,7 +2141,8 @@ impl<A: Sm120Arch> PagedGqaOp<A> {
     pub unsafe fn launch_prefill_partitioned(
         &self,
         stream: &CudaStream,
-        context_tokens: usize,
+        tokens: usize,
+        partitions: usize,
         query: *const f32,
         key_pages: *const u8,
         value_pages: *const u8,
@@ -2105,7 +2155,6 @@ impl<A: Sm120Arch> PagedGqaOp<A> {
         key_scale: f32,
         value_scale: f32,
     ) -> GpuResult<()> {
-        let partitions = paged_gqa_prefill_partitions(context_tokens)?;
         let table_stride = validate_launch(table_stride, key_scale, value_scale)?;
 
         macro_rules! launch {
@@ -2130,10 +2179,13 @@ impl<A: Sm120Arch> PagedGqaOp<A> {
             };
         }
 
-        match partitions {
-            8 => launch!(p8),
-            16 => launch!(p16),
-            _ => unreachable!(),
+        match partitioned_prefill_route(tokens, partitions)? {
+            PartitionedPrefillRoute::T32P8 => launch!(t32_p8),
+            PartitionedPrefillRoute::T32P16 => launch!(t32_p16),
+            PartitionedPrefillRoute::T64P8 => launch!(t64_p8),
+            PartitionedPrefillRoute::T64P16 => launch!(t64_p16),
+            PartitionedPrefillRoute::T128P8 => launch!(t128_p8),
+            PartitionedPrefillRoute::T128P16 => launch!(t128_p16),
         }
     }
 
@@ -2389,10 +2441,18 @@ pub(crate) fn paged_gqa_ptx_names() -> Vec<&'static str> {
         kernels::paged_gqa_prefill_shared_exact_ptx_name::<Qwen38_27B, 32>(),
         kernels::paged_gqa_prefill_shared_exact_ptx_name::<Qwen38_27B, 64>(),
         kernels::paged_gqa_prefill_shared_exact_ptx_name::<Qwen38_27B, 128>(),
-        kernels::paged_gqa_prefill_flash_p8_exact_ptx_name::<Qwen38_27B>(),
-        kernels::paged_gqa_prefill_partitioned_reduce_exact_ptx_name::<Qwen38_27B, 8>(),
-        kernels::paged_gqa_prefill_flash_p16_exact_ptx_name::<Qwen38_27B>(),
-        kernels::paged_gqa_prefill_partitioned_reduce_exact_ptx_name::<Qwen38_27B, 16>(),
+        kernels::paged_gqa_prefill_flash_p8_exact_ptx_name::<Qwen38_27B, 32>(),
+        kernels::paged_gqa_prefill_partitioned_reduce_exact_ptx_name::<Qwen38_27B, 32, 8>(),
+        kernels::paged_gqa_prefill_flash_p16_exact_ptx_name::<Qwen38_27B, 32>(),
+        kernels::paged_gqa_prefill_partitioned_reduce_exact_ptx_name::<Qwen38_27B, 32, 16>(),
+        kernels::paged_gqa_prefill_flash_p8_exact_ptx_name::<Qwen38_27B, 64>(),
+        kernels::paged_gqa_prefill_partitioned_reduce_exact_ptx_name::<Qwen38_27B, 64, 8>(),
+        kernels::paged_gqa_prefill_flash_p16_exact_ptx_name::<Qwen38_27B, 64>(),
+        kernels::paged_gqa_prefill_partitioned_reduce_exact_ptx_name::<Qwen38_27B, 64, 16>(),
+        kernels::paged_gqa_prefill_flash_p8_exact_ptx_name::<Qwen38_27B, 128>(),
+        kernels::paged_gqa_prefill_partitioned_reduce_exact_ptx_name::<Qwen38_27B, 128, 8>(),
+        kernels::paged_gqa_prefill_flash_p16_exact_ptx_name::<Qwen38_27B, 128>(),
+        kernels::paged_gqa_prefill_partitioned_reduce_exact_ptx_name::<Qwen38_27B, 128, 16>(),
         kernels::paged_gqa_prefill_flash_macro_exact_ptx_name::<Qwen38_27B>(),
         kernels::paged_gqa_prefill_macro_reduce_exact_ptx_name::<Qwen38_27B, 1>(),
         kernels::paged_gqa_prefill_macro_reduce_exact_ptx_name::<Qwen38_27B, 2>(),
@@ -2466,8 +2526,8 @@ mod tests {
         QWEN36_PREFILL_TOKENS, Qwen35PagedGqaEntries, Qwen36Fp8PagedGqaEntries,
         Qwen36PagedGqaEntries, Qwen38PagedGqaEntries, THREADS, WidthRoute,
         admitted_macro_partitions, checked_cache_scales, checked_table_stride, decode_blocks,
-        decode_route, paged_gqa_prefill_partitions, paged_gqa_ptx_names, prefill_blocks,
-        prefill_route, qwen35_paged_gqa_ptx_names, qwen36_fp8_paged_gqa_ptx_names,
+        decode_route, paged_gqa_prefill_partitions, paged_gqa_ptx_names, partitioned_prefill_route,
+        prefill_blocks, prefill_route, qwen35_paged_gqa_ptx_names, qwen36_fp8_paged_gqa_ptx_names,
         qwen36_paged_gqa_ptx_names, width_route,
     };
     use super::{
@@ -2686,7 +2746,7 @@ mod tests {
         let names = paged_gqa_ptx_names();
         let unique = names.iter().copied().collect::<BTreeSet<_>>();
 
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 29);
         assert_eq!(unique.len(), names.len());
 
         let qwen35 = qwen35_paged_gqa_ptx_names();
@@ -2747,10 +2807,10 @@ mod tests {
             vec![
                 ("paged_gqa_exact", 8),
                 ("paged_gqa_prefill_flash_macro_exact", 1),
-                ("paged_gqa_prefill_flash_p16_exact", 1),
-                ("paged_gqa_prefill_flash_p8_exact", 1),
+                ("paged_gqa_prefill_flash_p16_exact", 3),
+                ("paged_gqa_prefill_flash_p8_exact", 3),
                 ("paged_gqa_prefill_macro_reduce_exact", 5),
-                ("paged_gqa_prefill_partitioned_reduce_exact", 2),
+                ("paged_gqa_prefill_partitioned_reduce_exact", 6),
                 ("paged_gqa_prefill_shared_exact", 3),
                 ("qwen35_paged_gqa_exact", 8),
                 ("qwen35_paged_gqa_prefill_shared_exact", 3),
@@ -2762,7 +2822,7 @@ mod tests {
                 ("qwen38_flash_next_paged_gqa_prefill_shared_exact", 4),
             ]
         );
-        assert_eq!(counts.values().sum::<usize>(), 66);
+        assert_eq!(counts.values().sum::<usize>(), 74);
     }
 
     /// Each owner keeps the rejection wording its launcher published, which is
@@ -2870,6 +2930,19 @@ mod tests {
             16
         );
         assert!(paged_gqa_prefill_partitions(220_001).is_err());
+    }
+
+    #[test]
+    fn partitioned_prefill_width_inventory_is_the_exact_six_route_matrix() {
+        for tokens in [31, 32, 33, 63, 64, 65, 127, 128, 129] {
+            for partitions in [7, 8, 9, 15, 16, 17] {
+                assert_eq!(
+                    partitioned_prefill_route(tokens, partitions).is_ok(),
+                    matches!(tokens, 32 | 64 | 128) && matches!(partitions, 8 | 16),
+                    "T={tokens}/P={partitions}"
+                );
+            }
+        }
     }
 
     #[test]

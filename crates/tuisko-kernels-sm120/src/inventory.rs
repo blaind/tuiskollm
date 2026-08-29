@@ -80,7 +80,7 @@ mod tests {
     /// table, which is what makes the move visible in review.
     const FAMILY_COUNTS: &[(&str, usize)] = &[
         ("tuisko_kernels_sm120_norm", 68),
-        ("tuisko_kernels_sm120_attention", 212),
+        ("tuisko_kernels_sm120_attention", 220),
         ("tuisko_kernels_sm120_nvfp4", 140),
         ("tuisko_kernels_sm120_fp8_projection", 159),
         ("tuisko_kernels_sm120_fp8_mlp", 26),

@@ -23,8 +23,9 @@ use tuisko_qual::{
     benchmark_mtp_bf16_fusion, benchmark_mtp_bf16_mlp, benchmark_mtp_bf16_paged_gqa,
     benchmark_mtp_bf16_qk_prepare, benchmark_mtp_bf16_qkv, benchmark_mtp_bf16_split_kv_paged_gqa,
     benchmark_mtp_layer, benchmark_mtp_prompt_prime, benchmark_nvfp4_mlp, benchmark_paged_gqa,
-    benchmark_qwen35_attention_qk_prepare, benchmark_qwen35_full_attention_layer,
-    benchmark_qwen35_gdn_layer, benchmark_qwen35_gdn_prepare, benchmark_qwen35_gdn_recurrence,
+    benchmark_paged_gqa_deep_prefill, benchmark_qwen35_attention_qk_prepare,
+    benchmark_qwen35_full_attention_layer, benchmark_qwen35_gdn_layer,
+    benchmark_qwen35_gdn_prepare, benchmark_qwen35_gdn_recurrence,
     benchmark_qwen35_mtp_batch_generation, benchmark_qwen35_mtp_generation,
     benchmark_qwen35_mtp_layer, benchmark_qwen35_nvfp4_attention_output,
     benchmark_qwen35_nvfp4_down, benchmark_qwen35_nvfp4_gdn_input,
@@ -72,7 +73,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
     let suite = arguments
         .next()
-        .ok_or("usage: bench-device <attention-qk-prepare|qwen35-attention-qk-prepare|qwen36-attention-qk-prepare|qwen36-fp8-attention-qk-prepare|paged-gqa|qwen35-paged-gqa|qwen36-paged-gqa|qwen36-fp8-paged-gqa|long-context-paged-gqa|attention-output|qwen35-nvfp4-attention-output|qwen36-attention-output|mtp-bf16-fusion|mtp-bf16-qkv|mtp-bf16-qk-prepare|mtp-bf16-paged-gqa|mtp-bf16-attention-output|mtp-bf16-mlp|mtp-layer|qwen35-mtp-layer|qwen36-mtp-layer|mtp-prompt-prime|resident-mtp|qwen35-resident-mtp|qwen35-mtp-generation|generation-mtp-greedy|generation-mtp-sampling|generation-mtp-batch|prompt-scoring|target-mtp-verify|qwen38-flash-next-hyper-connection|qwen38-flash-next-ple|residual-norm|qwen35-residual-norm|qwen35-nvfp4-swiglu|qwen35-nvfp4-down|qwen35-nvfp4-qkv|qwen35-nvfp4-gdn-input|qwen35-gdn-prepare|qwen35-gdn-recurrence|qwen35-nvfp4-gdn-output|qwen35-nvfp4-mlp|qwen35-text-endpoint|qwen35-resident-model|qwen36-residual-norm|qwen36-moe-router|qwen36-moe-experts|qwen36-nvfp4-lm-head|qwen36-text-endpoint|qwen36-resident-model|qwen36-fp8-qkv|qwen36-gdn-input|qwen36-gdn-prepare|qwen36-gdn-recurrence|qwen36-gdn-output|qwen36-gdn-moe-layer|qwen36-full-attention-layer|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|nvfp4-swiglu|nvfp4-down|nvfp4-mlp|gdn-prepare|gdn-recurrence|gdn-output|qwen38-flash-next-gdn-prepare|qwen38-flash-next-gdn-recurrence|qwen38-flash-next-qsa-prepare|qwen38-flash-next-qsa-attention|qwen38-flash-next-qsa-selection|qwen38-flash-next-moe-router|qwen38-flash-next-moe-experts|qwen38-flash-next-projections|qwen38-flash-next-lm-head|dense-fp8-mlp|dense-fp8-gdn-layer|full-attention-layer|qwen35-full-attention-layer|qwen35-gdn-layer|resident-model|resident-prefill|resident-long-context-model|text-endpoint|profile-resident-model|profile-resident-prefill|qualify-fp8-lm-head> [SNAPSHOT] [options]")?;
+        .ok_or("usage: bench-device <attention-qk-prepare|qwen35-attention-qk-prepare|qwen36-attention-qk-prepare|qwen36-fp8-attention-qk-prepare|paged-gqa|paged-gqa-deep-prefill|qwen35-paged-gqa|qwen36-paged-gqa|qwen36-fp8-paged-gqa|long-context-paged-gqa|attention-output|qwen35-nvfp4-attention-output|qwen36-attention-output|mtp-bf16-fusion|mtp-bf16-qkv|mtp-bf16-qk-prepare|mtp-bf16-paged-gqa|mtp-bf16-split-kv-paged-gqa|mtp-bf16-attention-output|mtp-bf16-mlp|mtp-layer|qwen35-mtp-layer|qwen36-mtp-layer|mtp-prompt-prime|resident-mtp|qwen35-resident-mtp|qwen35-mtp-generation|generation-mtp-greedy|generation-mtp-sampling|generation-mtp-batch|prompt-scoring|target-mtp-verify|qwen38-flash-next-hyper-connection|qwen38-flash-next-ple|residual-norm|qwen35-residual-norm|qwen35-nvfp4-swiglu|qwen35-nvfp4-down|qwen35-nvfp4-qkv|qwen35-nvfp4-gdn-input|qwen35-gdn-prepare|qwen35-gdn-recurrence|qwen35-nvfp4-gdn-output|qwen35-nvfp4-mlp|qwen35-text-endpoint|qwen35-resident-model|qwen36-residual-norm|qwen36-moe-router|qwen36-moe-experts|qwen36-nvfp4-lm-head|qwen36-text-endpoint|qwen36-resident-model|qwen36-fp8-qkv|qwen36-gdn-input|qwen36-gdn-prepare|qwen36-gdn-recurrence|qwen36-gdn-output|qwen36-gdn-moe-layer|qwen36-full-attention-layer|fp8-qkv|fp8-gdn-input|fp8-lm-head|fp8-swiglu|fp8-down|nvfp4-swiglu|nvfp4-down|nvfp4-mlp|gdn-prepare|gdn-recurrence|gdn-output|qwen38-flash-next-gdn-prepare|qwen38-flash-next-gdn-recurrence|qwen38-flash-next-qsa-prepare|qwen38-flash-next-qsa-attention|qwen38-flash-next-qsa-selection|qwen38-flash-next-moe-router|qwen38-flash-next-moe-experts|qwen38-flash-next-projections|qwen38-flash-next-lm-head|dense-fp8-mlp|dense-fp8-gdn-layer|full-attention-layer|qwen35-full-attention-layer|qwen35-gdn-layer|resident-model|resident-prefill|resident-long-context-model|text-endpoint|profile-resident-model|profile-resident-prefill|qualify-fp8-lm-head> [SNAPSHOT] [options]")?;
     #[cfg(feature = "device")]
     if suite == "profile-resident-model" {
         return run_resident_profile(arguments);
@@ -123,6 +124,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             let (options, json_path) =
                 parse_options(arguments, DeviceBenchmarkOptions::long_graph())?;
             (benchmark_paged_gqa(options)?, json_path)
+        }
+        #[cfg(feature = "device")]
+        "paged-gqa-deep-prefill" => {
+            let (options, json_path) =
+                parse_options(arguments, DeviceBenchmarkOptions::resident_model())?;
+            (benchmark_paged_gqa_deep_prefill(options)?, json_path)
         }
         #[cfg(feature = "device")]
         "qwen35-paged-gqa" => {

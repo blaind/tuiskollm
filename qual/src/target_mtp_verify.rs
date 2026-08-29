@@ -805,8 +805,8 @@ fn verify_owner(program: &ResidentModelProgram) -> Result<(), TargetMtpVerifyQua
         15_676,
         228,
         88,
-        290,
-        150,
+        292,
+        152,
     );
     if actual != expected {
         return Err(TargetMtpVerifyQualificationError::Mismatch(format!(

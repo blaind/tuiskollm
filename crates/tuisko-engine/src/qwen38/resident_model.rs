@@ -51,12 +51,15 @@ const SHORT_CONTEXT_PAGES_PER_SLOT: usize = SHORT_CONTEXT_CAPACITY / ATTENTION_P
 #[cfg(feature = "qualification")]
 const SHORT_CONTEXT_PHYSICAL_PAGES: usize = MAX_BATCH * SHORT_CONTEXT_PAGES_PER_SLOT;
 const LONG_CONTEXT_ROUTE_COUNT: usize = LONG_CONTEXT_GQA_PARTITION_BUCKETS.len();
-const PREFILL_GRAPH_ROUTE_COUNT: usize = 6;
+const PREFILL_GRAPH_ROUTE_COUNT: usize = 8;
 const TARGET_VERIFY_ROUTE_COUNT: usize = 4;
 const TARGET_SEGMENTED_BATCH_ROUTES: usize = MAX_BATCH - 1;
 const TARGET_VERIFY_ROWS: usize = MAX_BATCH * TARGET_VERIFY_ROUTE_COUNT;
 // The shared-tile route wins at 65K and above; the generic row-parallel route wins at 8K.
 const LONG_CONTEXT_MTP_CACHE_REUSE_MIN_CONTEXT: usize = 65_536;
+// P16 won the controlled T32/T64 crossover matrix from the first 8,192-token
+// context through the 220,000-token ceiling.
+const DEEP_PREFILL_P16_MIN_CONTEXT: usize = 8_192;
 const GDN_LAYER_COUNT: usize =
     Qwen38_27B::LAYERS - Qwen38_27B::LAYERS / Qwen38_27B::FULL_ATTENTION_INTERVAL;
 const DENSE_MLP_LAYER_COUNT: usize = Qwen38_27B::LAYERS - NVFP4_MLP_LAYER_END;
@@ -6274,7 +6277,8 @@ fn launch_prefill_mixer(
                         debug_assert_eq!(partitions, route.partition_capacity().unwrap());
                         ops.paged_gqa.launch_prefill_partitioned(
                             stream,
-                            route.context_tokens,
+                            rows,
+                            partitions,
                             workspace.query,
                             p.key_pages,
                             p.value_pages,
@@ -7163,10 +7167,22 @@ const fn prefill_graph_routes() -> [ResidentPrefillRoute; PREFILL_GRAPH_ROUTE_CO
             attention: PrefillAttentionRoute::Shared,
         },
         ResidentPrefillRoute {
+            tokens: 32,
+            first_position: DEEP_PREFILL_P16_MIN_CONTEXT - 32,
+            context_tokens: DEEP_PREFILL_P16_MIN_CONTEXT,
+            attention: PrefillAttentionRoute::Partitioned { partitions: 16 },
+        },
+        ResidentPrefillRoute {
             tokens: 64,
             first_position: 0,
             context_tokens: 64,
             attention: PrefillAttentionRoute::Shared,
+        },
+        ResidentPrefillRoute {
+            tokens: 64,
+            first_position: DEEP_PREFILL_P16_MIN_CONTEXT - 64,
+            context_tokens: DEEP_PREFILL_P16_MIN_CONTEXT,
+            attention: PrefillAttentionRoute::Partitioned { partitions: 16 },
         },
         ResidentPrefillRoute {
             tokens: 128,
@@ -7215,7 +7231,8 @@ fn select_prefill_route(
     }
 
     let attention = match tokens {
-        32 | 64 => PrefillAttentionRoute::Shared,
+        32 | 64 if context_tokens < DEEP_PREFILL_P16_MIN_CONTEXT => PrefillAttentionRoute::Shared,
+        32 | 64 => PrefillAttentionRoute::Partitioned { partitions: 16 },
         128 if context_tokens == 128 => PrefillAttentionRoute::Shared,
         128 if context_tokens < PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT => {
             // Eight K64 partitions expose 768 producer CTAs without the P16
@@ -7245,14 +7262,16 @@ fn select_prefill_route(
 fn prefill_graph_index(route: ResidentPrefillRoute) -> EngineResult<usize> {
     match (route.tokens, route.attention) {
         (32, PrefillAttentionRoute::Shared) => Ok(0),
-        (64, PrefillAttentionRoute::Shared) => Ok(1),
-        (128, PrefillAttentionRoute::Shared) => Ok(2),
-        (128, PrefillAttentionRoute::Partitioned { partitions: 8 }) => Ok(3),
-        (128, PrefillAttentionRoute::Partitioned { partitions: 16 }) => Ok(4),
+        (32, PrefillAttentionRoute::Partitioned { partitions: 16 }) => Ok(1),
+        (64, PrefillAttentionRoute::Shared) => Ok(2),
+        (64, PrefillAttentionRoute::Partitioned { partitions: 16 }) => Ok(3),
+        (128, PrefillAttentionRoute::Shared) => Ok(4),
+        (128, PrefillAttentionRoute::Partitioned { partitions: 8 }) => Ok(5),
+        (128, PrefillAttentionRoute::Partitioned { partitions: 16 }) => Ok(6),
         (
             super::resident_model_layout::MAX_ROWS,
             PrefillAttentionRoute::Macro { partitions: 4 },
-        ) => Ok(5),
+        ) => Ok(7),
         _ => Err(EngineError::route(format!(
             "resident prefill T={} context {} has no exact attention graph",
             route.tokens, route.context_tokens
@@ -7513,13 +7532,13 @@ fn measure_preparation<T>(
 #[cfg(test)]
 mod tests {
     use super::{
-        LONG_CONTEXT_MTP_CACHE_REUSE_MIN_CONTEXT, LONG_CONTEXT_ROUTE_COUNT,
-        PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PREFILL_GRAPH_ROUTE_COUNT,
-        PRODUCTION_LOAD_MODE, ResidentLoadMode, TARGET_VERIFY_ROUTE_COUNT, bf16_to_f32,
-        decode_lengths, prefill_graph_index, prefill_graph_routes, prefill_index, require_batch,
-        require_rows, require_segmented_commit, require_target_verify_tokens, select_decode_route,
-        select_prefill_route, select_segmented_target_route, slot_rows,
-        use_long_context_mtp_cache_reuse,
+        DEEP_PREFILL_P16_MIN_CONTEXT, LONG_CONTEXT_MTP_CACHE_REUSE_MIN_CONTEXT,
+        LONG_CONTEXT_ROUTE_COUNT, PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT,
+        PREFILL_GRAPH_ROUTE_COUNT, PRODUCTION_LOAD_MODE, ResidentLoadMode,
+        TARGET_VERIFY_ROUTE_COUNT, bf16_to_f32, decode_lengths, prefill_graph_index,
+        prefill_graph_routes, prefill_index, require_batch, require_rows, require_segmented_commit,
+        require_target_verify_tokens, select_decode_route, select_prefill_route,
+        select_segmented_target_route, slot_rows, use_long_context_mtp_cache_reuse,
     };
     use crate::EngineErrorCode;
 
@@ -7639,9 +7658,13 @@ mod tests {
 
         for (tokens, first_position, partitions) in [
             (32, 0, None),
-            (32, 219_968, None),
+            (32, DEEP_PREFILL_P16_MIN_CONTEXT - 33, None),
+            (32, DEEP_PREFILL_P16_MIN_CONTEXT - 32, Some(16)),
+            (32, 219_968, Some(16)),
             (64, 0, None),
-            (64, 219_936, None),
+            (64, DEEP_PREFILL_P16_MIN_CONTEXT - 65, None),
+            (64, DEEP_PREFILL_P16_MIN_CONTEXT - 64, Some(16)),
+            (64, 219_936, Some(16)),
             (128, 0, None),
             (128, 1, Some(8)),
             (
