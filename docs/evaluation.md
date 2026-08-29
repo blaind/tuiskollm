@@ -33,24 +33,94 @@ during active generation returns a retryable capacity error.
 
 ## lm-eval smoke run
 
-Use the exact pinned checkpoint tokenizer and tokenized requests. Start with a small limit because
-multiple-choice tasks score every answer alternative:
+Use the exact pinned checkpoint tokenizer and tokenized requests. The verified lean environment is
+lm-evaluation-harness 0.4.12 with its API dependencies and tokenizer-only Transformers support;
+PyTorch is not required because the Rust server owns inference:
 
 ```bash
-lm_eval \
+python3 -m venv target/lm-eval-venv
+target/lm-eval-venv/bin/python -m pip install \
+  'lm_eval[api]==0.4.12' 'transformers==5.16.1'
+```
+
+The harness writes task data and tokenizer metadata through the Hugging Face cache. Keep that cache
+under the ignored `target/` tree when the global cache is read-only or when evaluation artifacts
+must remain worktree-local:
+
+```bash
+export HF_HOME="$PWD/target/lm-eval-hf"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+```
+
+Stage the tokenizer and HellaSwag before loading the resident model. This avoids holding the GPU
+while the harness downloads or prepares host-only inputs:
+
+```bash
+target/lm-eval-venv/bin/python - <<'PY'
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
+revision = "16b6615af3548b88e2d8e382457bc705b00479cf"
+AutoTokenizer.from_pretrained("unsloth/Qwen3.8-27B-NVFP4", revision=revision)
+load_dataset("Rowan/hellaswag")
+PY
+```
+
+Then start the server and begin with one example. Multiple-choice tasks score every answer
+alternative, so one HellaSwag example produces four prompt-scoring requests:
+
+```bash
+target/lm-eval-venv/bin/lm_eval run \
   --model local-completions \
   --model_args model=unsloth/Qwen3.8-27B-NVFP4,base_url=http://127.0.0.1:8000/v1/completions,tokenizer=unsloth/Qwen3.8-27B-NVFP4,revision=16b6615af3548b88e2d8e382457bc705b00479cf,tokenizer_backend=huggingface,tokenized_requests=true,max_length=220000,num_concurrent=1 \
   --tasks hellaswag \
   --batch_size 4 \
-  --limit 10 \
+  --limit 1 \
   --log_samples \
-  --output_path target/lm-eval/hellaswag-smoke
+  --output_path target/lm-eval/hellaswag-smoke-limit-1
 ```
 
 Keep `num_concurrent=1`: one HTTP scoring job may carry up to eight prompts, while concurrent
 jobs would contend for the one scoring scratch slot. Full MMLU and HellaSwag runs contain tens of
-thousands of alternative prompts and can take hours; establish a measured examples/second rate
-with `--limit 10`, then `--limit 100`, before scheduling a full suite.
+thousands of alternative prompts and can take hours. A limited result proves plumbing only; its
+accuracy is not evaluation authority. On an exclusive GPU, establish a measured examples/second
+rate with `--limit 10`, then `--limit 100`, before scheduling a full suite. On a shared GPU, keep
+the cases sequential and bounded, then stop the server promptly to release resident memory.
+
+### MMLU planning estimate
+
+The harness's `mmlu` group contains 14,042 test questions across 57 subjects and scores four
+choices per question. On the exact RTX 5090 target, a ten-question `mmlu_abstract_algebra` pilot
+with `batch_size=4` and `num_concurrent=1` measured:
+
+| Setting | Complete pilot wall time | API scoring time | Full-suite planning estimate |
+| --- | ---: | ---: | ---: |
+| zero-shot | 25.78 s | about 17 s | about 6.5–7 hours |
+| five-shot | 37.30 s | about 31 s | about 12–13 hours |
+
+These are single-subject diagnostic extrapolations, not controlled performance results. Subject
+prompt lengths vary substantially, so reserve additional time and run the full group only during
+an exclusive GPU window. Pin `--num_fewshot 0` or `5` explicitly; otherwise a harness-default
+change can alter both the quality result and duration.
+
+MMLU time is prompt scoring, not a one-token generation loop. Each of a question's four choice
+prompts is scored independently. The engine replays native prefill tiles, uses B=1 target decode
+graphs only for the residual tail shorter than 32 tokens and the final greedy-token row, and then
+projects and downloads a full 248,320-entry BF16 logit row for every causal prompt position. Each
+download synchronizes the scoring stream, after which the host performs the stable FP64 softmax.
+
+Reconstructing the exact ten-question pilot prompts from the harness samples gives this diagnostic
+work inventory:
+
+| Setting | Mean tokens/choice | Prefill tiles/choice | Decode replays/choice | Downloaded logits | Host-softmax rows |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| zero-shot | 83.4 | 1.2 | 19.4 | 1.54 GiB | 3,336 |
+| five-shot | 369.4 | 3.6 | 17.4 | 6.83 GiB | 14,776 |
+
+The five-shot API phase increased from about 17 to 31 seconds while its residual decode count
+slightly decreased. The incremental cost is therefore tiled prefill plus the LM-head,
+device-to-host, and host-softmax scoring path. An exact percentage attribution still requires a
+directly instrumented scoring-owner benchmark; do not infer it from these request-level timings.
 
 Generation-only tasks continue to use `local-chat-completions` and
 `http://127.0.0.1:8000/v1/chat/completions`.

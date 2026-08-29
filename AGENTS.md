@@ -72,6 +72,10 @@ respect the represented output dtype and magnitude; they cannot be stricter than
 acceptance contract at the observed ULP.
 Remote source-backed fixtures must stage and explicitly admit every pinned artifact opened by the
 production path, including frontend files when tokenizer or template ownership is exercised.
+Live-server evaluation must stage its tokenizer and task data before loading the resident model.
+On a shared local GPU, run bounded evaluation cases sequentially with `num_concurrent=1`, stop the
+server promptly after the selected cases, and report limited-run metrics as diagnostics rather than
+accuracy authority. See `docs/evaluation.md` for the verified harness environment and commands.
 For a reused workspace, inactive-tail checks begin after the widest surviving writer, not
 necessarily the final writer. If an owner's output aliases its next input, a repeated benchmark
 must restore the production input before every measured replay.
