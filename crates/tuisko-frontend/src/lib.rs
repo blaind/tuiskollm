@@ -1,6 +1,7 @@
 //! Exact tokenizer and text-only chat-template boundary.
 
 mod error;
+mod tool_call;
 
 use minijinja::{Environment, Error as TemplateError, ErrorKind};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -15,6 +16,10 @@ use tuisko_model::{
 };
 
 pub use error::{FrontendError, FrontendErrorCode, FrontendResult};
+pub use tool_call::{
+    ToolCallConstraint, ToolCallConstraintSpec, ToolCallState, ToolConstraintSpec,
+    ToolParameterSpec,
+};
 
 const TOKENIZER_FILE: &str = "tokenizer.json";
 const TEMPLATE_FILE: &str = "chat_template.jinja";
@@ -428,6 +433,7 @@ struct DecodeState {
     byte_table: HashMap<char, u8>,
     special_decode_ids: HashSet<u32>,
     special_encode_tokens: Vec<(String, u32)>,
+    tool_token_bytes: Mutex<Option<Arc<tool_call::TokenByteInventory>>>,
 }
 
 struct MarkedMessageText {
@@ -528,6 +534,7 @@ impl TextFrontend {
                 byte_table,
                 special_decode_ids,
                 special_encode_tokens,
+                tool_token_bytes: std::sync::Mutex::new(None),
             }),
             template,
             stop_ids,
@@ -687,6 +694,14 @@ impl TextFrontend {
             pending: Vec::new(),
             finished: false,
         }
+    }
+
+    /// Binds one admitted tool-call specification to the pinned tokenizer.
+    pub fn tool_call_constraint(
+        &self,
+        spec: Arc<ToolCallConstraintSpec>,
+    ) -> FrontendResult<ToolCallConstraint> {
+        ToolCallConstraint::new(self.decode.clone(), self.stop_ids.clone(), spec)
     }
 
     fn encode_rendered_with_prefix(
@@ -1480,7 +1495,8 @@ mod tests {
         ChatToolCall, END_OF_TEXT_ID, FrontendErrorCode, FrontendResult, GENERATION_CONFIG_FILE,
         GenerationAdmission, GenerationDefaults, IM_START_ID, PROMPT_BLOCK_START,
         PromptPrefixEntry, SPECIAL_TOKEN_LITERALS, TextFrontend, TextFrontendOptions,
-        TokenizedSchema, best_cached_prefix, byte_level_table, common_prefix_bytes, finish_pending,
+        TokenizedSchema, ToolCallConstraintSpec, ToolConstraintSpec, ToolParameterSpec,
+        best_cached_prefix, byte_level_table, common_prefix_bytes, finish_pending,
         is_valid_utf8_prefix, parse_generation_defaults, parse_stop_ids, push_stream_byte,
         read_json, utf8_sequence_length, validate_added_token_alphabet, validate_tokenizer,
     };
@@ -1792,6 +1808,7 @@ mod tests {
                 byte_table,
                 special_decode_ids: HashSet::from([3]),
                 special_encode_tokens: vec![("<special>".into(), 3)],
+                tool_token_bytes: std::sync::Mutex::new(None),
             }),
             template: String::new(),
             stop_ids: vec![3],
@@ -2062,6 +2079,43 @@ mod tests {
             .unwrap();
         assert_eq!(repeated.reused_tokens, repeated.token_ids.len());
         assert_eq!(repeated.token_ids, extended.token_ids);
+    }
+
+    #[test]
+    #[ignore = "requires TUISKO_CHECKPOINT with the pinned complete Qwen3.8 checkpoint"]
+    fn qwen38_snapshot_constrains_actual_tool_tokens() {
+        let snapshot = pinned_snapshot::<Qwen38_27B>("TUISKO_CHECKPOINT");
+        let frontend = TextFrontend::open(&snapshot).unwrap();
+        let specification = std::sync::Arc::new(
+            ToolCallConstraintSpec::new(vec![
+                ToolConstraintSpec::new(
+                    "bash".into(),
+                    vec![ToolParameterSpec::new("command".into(), true).unwrap()],
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+
+        let valid = "<tool_call>\n<function=bash>\n<parameter=command>ls -la</parameter>\n</function>\n</tool_call>";
+        let mut constraint = frontend
+            .tool_call_constraint(specification.clone())
+            .unwrap();
+        for token in frontend.encode(valid).unwrap() {
+            constraint.commit_token(token).unwrap();
+        }
+        assert!(!constraint.has_incomplete_call());
+
+        let malformed =
+            "<tool_call>\n<function=command>\n\n</parameter>\n</function>\n</tool_call>";
+        let mut constraint = frontend.tool_call_constraint(specification).unwrap();
+        assert!(
+            frontend
+                .encode(malformed)
+                .unwrap()
+                .into_iter()
+                .any(|token| constraint.commit_token(token).is_err())
+        );
     }
 
     #[test]

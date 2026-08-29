@@ -1,11 +1,13 @@
 //! Concrete HTTP server and resident scheduler worker.
 
 use crate::request_log::RequestLog;
-use crate::response::{ClientStatus, connected_streaming_response, overloaded_response};
+use crate::response::{
+    ClientStatus, blocking_response_with_constraint, connected_streaming_response,
+    connected_streaming_response_with_constraint, overloaded_response,
+};
 use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
 use crate::{
-    ChatCompletionRequest, ChatRequestError, GenerationReply, PreparedChatRequest,
-    blocking_response, openai_error,
+    ChatCompletionRequest, ChatRequestError, GenerationReply, PreparedChatRequest, openai_error,
 };
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
@@ -2455,6 +2457,7 @@ async fn chat_completions(
         stream,
         split_reasoning,
         parse_tools,
+        tool_constraint,
         include_usage,
     } = match request.prepare_for(
         numeric_id ^ DEFAULT_SEED_SCRAMBLE,
@@ -2504,24 +2507,37 @@ async fn chat_completions(
         .unwrap_or_default()
         .as_secs();
     if stream {
-        connected_streaming_response(
-            reply_rx,
-            id,
-            created,
-            state.model_id,
-            split_reasoning,
-            parse_tools,
-            include_usage,
-            connection,
-        )
+        match tool_constraint {
+            Some(tool_constraint) => connected_streaming_response_with_constraint(
+                reply_rx,
+                id,
+                created,
+                state.model_id,
+                split_reasoning,
+                include_usage,
+                connection,
+                tool_constraint,
+            ),
+            None => connected_streaming_response(
+                reply_rx,
+                id,
+                created,
+                state.model_id,
+                split_reasoning,
+                parse_tools,
+                include_usage,
+                connection,
+            ),
+        }
     } else {
-        let response = blocking_response(
+        let response = blocking_response_with_constraint(
             reply_rx,
             id,
             created,
             state.model_id,
             split_reasoning,
             parse_tools,
+            tool_constraint,
         )
         .await;
         drop(connection);

@@ -3,9 +3,11 @@
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tuisko_engine::{ChatGenerationRequest, SamplingOptions, SamplingPenalties};
 use tuisko_frontend::{
     ChatMessage, ChatTemplateOptions, GenerationDefaults, SPECIAL_TOKEN_LITERALS,
+    ToolCallConstraintSpec, ToolConstraintSpec, ToolParameterSpec,
 };
 use tuisko_model::{Arch, Qwen38_27B};
 
@@ -107,6 +109,8 @@ pub struct PreparedChatRequest {
     pub split_reasoning: bool,
     /// Whether generated Qwen tool XML is parsed into OpenAI tool calls.
     pub parse_tools: bool,
+    /// Immutable tool-call contract shared with response validation.
+    pub tool_constraint: Option<Arc<ToolCallConstraintSpec>>,
     /// Whether SSE output ends with the OpenAI usage-only chunk.
     pub include_usage: bool,
 }
@@ -195,7 +199,7 @@ impl ChatCompletionRequest {
             )));
         }
 
-        validate_tools(&self.tools)?;
+        let mut tool_constraint = validate_tools(&self.tools)?;
         let mut tools = self
             .tools
             .into_iter()
@@ -210,7 +214,10 @@ impl ChatCompletionRequest {
         match self.tool_choice.as_ref() {
             None | Some(Value::Null) => {}
             Some(Value::String(choice)) if choice == "auto" => {}
-            Some(Value::String(choice)) if choice == "none" => tools.clear(),
+            Some(Value::String(choice)) if choice == "none" => {
+                tools.clear();
+                tool_constraint = None;
+            }
             Some(_) => {
                 return Err(ChatRequestError::Invalid(
                     "required or named tool_choice is not admitted without constrained decoding"
@@ -257,12 +264,14 @@ impl ChatCompletionRequest {
             .map_err(|error| ChatRequestError::Invalid(error.to_string()))?;
         generation.sampling = sampling;
         generation.max_new_tokens = max_new_tokens;
+        generation.tool_constraint = tool_constraint.clone();
 
         Ok(PreparedChatRequest {
             generation,
             stream: self.stream,
             split_reasoning,
             parse_tools,
+            tool_constraint,
             include_usage: self
                 .stream_options
                 .is_some_and(|options| options.include_usage),
@@ -290,8 +299,11 @@ fn has_custom_stop(stop: &Value) -> bool {
     }
 }
 
-fn validate_tools(tools: &[FunctionTool]) -> Result<(), ChatRequestError> {
+fn validate_tools(
+    tools: &[FunctionTool],
+) -> Result<Option<Arc<ToolCallConstraintSpec>>, ChatRequestError> {
     let mut names = HashSet::new();
+    let mut constrained_tools = Vec::with_capacity(tools.len());
     for (index, tool) in tools.iter().enumerate() {
         if tool.kind != "function" {
             return Err(ChatRequestError::Invalid(format!(
@@ -336,11 +348,83 @@ fn validate_tools(tools: &[FunctionTool]) -> Result<(), ChatRequestError> {
         }
         if tool.function.strict == Some(true) {
             return Err(ChatRequestError::Invalid(format!(
-                "tool {index} requests strict schema adherence without a constrained-decoding route"
+                "tool {index} requests strict JSON-Schema value adherence; TuiskoLLM currently constrains tool structure and declared names only"
             )));
         }
+        constrained_tools.push(tool_constraint_spec(index, tool)?);
     }
-    Ok(())
+    if constrained_tools.is_empty() {
+        Ok(None)
+    } else {
+        ToolCallConstraintSpec::new(constrained_tools)
+            .map(Arc::new)
+            .map(Some)
+            .map_err(|error| ChatRequestError::Invalid(error.to_string()))
+    }
+}
+
+fn tool_constraint_spec(
+    index: usize,
+    tool: &FunctionTool,
+) -> Result<ToolConstraintSpec, ChatRequestError> {
+    let schema = tool.function.parameters.as_ref().and_then(Value::as_object);
+    if let Some(kind) = schema.and_then(|schema| schema.get("type"))
+        && kind != "object"
+    {
+        return Err(ChatRequestError::Invalid(format!(
+            "tool {index} parameters type must be `object` when present"
+        )));
+    }
+    let properties = match schema.and_then(|schema| schema.get("properties")) {
+        None => serde_json::Map::new(),
+        Some(Value::Object(properties)) => properties.clone(),
+        Some(_) => {
+            return Err(ChatRequestError::Invalid(format!(
+                "tool {index} parameters properties must be an object"
+            )));
+        }
+    };
+    let required = match schema.and_then(|schema| schema.get("required")) {
+        None => HashSet::new(),
+        Some(Value::Array(required)) => {
+            let mut names = HashSet::with_capacity(required.len());
+            for value in required {
+                let Some(name) = value.as_str() else {
+                    return Err(ChatRequestError::Invalid(format!(
+                        "tool {index} required parameters must be strings"
+                    )));
+                };
+                if !names.insert(name.to_owned()) {
+                    return Err(ChatRequestError::Invalid(format!(
+                        "tool {index} repeats required parameter `{name}`"
+                    )));
+                }
+            }
+            names
+        }
+        Some(_) => {
+            return Err(ChatRequestError::Invalid(format!(
+                "tool {index} required parameters must be an array"
+            )));
+        }
+    };
+    if let Some(missing) = required
+        .iter()
+        .find(|name| !properties.contains_key(name.as_str()))
+    {
+        return Err(ChatRequestError::Invalid(format!(
+            "tool {index} requires undeclared parameter `{missing}`"
+        )));
+    }
+    let parameters = properties
+        .keys()
+        .map(|name| {
+            ToolParameterSpec::new(name.clone(), required.contains(name))
+                .map_err(|error| ChatRequestError::Invalid(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ToolConstraintSpec::new(tool.function.name.clone(), parameters)
+        .map_err(|error| ChatRequestError::Invalid(error.to_string()))
 }
 
 fn validate_messages(messages: &[ChatMessage]) -> Result<(), ChatRequestError> {
@@ -519,6 +603,9 @@ mod tests {
         assert!(prepared.stream);
         assert!(prepared.split_reasoning);
         assert!(prepared.parse_tools);
+        let constraint = prepared.tool_constraint.as_ref().unwrap();
+        assert_eq!(constraint.tools()[0].name(), "bash");
+        assert!(prepared.generation.tool_constraint.is_some());
         assert!(prepared.include_usage);
     }
 
@@ -539,6 +626,8 @@ mod tests {
         assert_eq!(prepared.generation.sampling.seed, 91);
         assert!(prepared.generation.template.tools.is_empty());
         assert!(!prepared.parse_tools);
+        assert!(prepared.tool_constraint.is_none());
+        assert!(prepared.generation.tool_constraint.is_none());
         assert!(prepared.split_reasoning);
     }
 
@@ -635,6 +724,55 @@ mod tests {
             let error = request(&format!(r#"{{"model":"{SERVED_MODEL}",{fields}}}"#))
                 .prepare(1)
                 .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn compiles_declared_and_required_tool_parameters() {
+        let prepared = request(&format!(
+            r#"{{
+                "model":"{SERVED_MODEL}",
+                "messages":[{{"role":"user","content":"inspect"}}],
+                "tools":[{{"type":"function","function":{{
+                    "name":"bash",
+                    "parameters":{{
+                        "type":"object",
+                        "properties":{{"command":{{"type":"string"}},"timeout":{{"type":"number"}}}},
+                        "required":["command"]
+                    }}
+                }}}}]
+            }}"#
+        ))
+        .prepare(1)
+        .unwrap();
+
+        let constraint = prepared.tool_constraint.unwrap();
+        let tool = &constraint.tools()[0];
+        assert!(tool.parameter("command").unwrap().required());
+        assert!(!tool.parameter("timeout").unwrap().required());
+    }
+
+    #[test]
+    fn rejects_ambiguous_structural_tool_schemas() {
+        let cases = [
+            (r#"{"type":"array"}"#, "parameters type must be `object`"),
+            (r#"{"properties":[]}"#, "properties must be an object"),
+            (
+                r#"{"properties":{"command":{"type":"string"}},"required":["missing"]}"#,
+                "requires undeclared parameter",
+            ),
+            (
+                r#"{"properties":{"bad/name":{"type":"string"}}}"#,
+                "name must contain",
+            ),
+        ];
+        for (schema, expected) in cases {
+            let error = request(&format!(
+                r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"x"}}],"tools":[{{"type":"function","function":{{"name":"bash","parameters":{schema}}}}}]}}"#
+            ))
+            .prepare(1)
+            .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
         }
     }
@@ -862,7 +1000,7 @@ mod tests {
             ),
             (
                 r#"[{"type":"function","function":{"name":"x","strict":true}}]"#,
-                "constrained-decoding route",
+                "strict JSON-Schema value adherence",
             ),
             (
                 r#"[{"type":"function","function":{"name":"x"}},{"type":"function","function":{"name":"x"}}]"#,

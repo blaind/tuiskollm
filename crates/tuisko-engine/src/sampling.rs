@@ -296,6 +296,39 @@ impl Sampler {
         self.decision_for_token(token)
     }
 
+    pub(crate) fn sample_with_counts_where<F>(
+        &mut self,
+        logits: &[u16],
+        committed: &HashMap<u32, u32>,
+        provisional: &[u32],
+        mut allowed: F,
+    ) -> EngineResult<SampleDecision>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        require_vocabulary_row(logits)?;
+        let token = match sampling_route(self.options) {
+            SamplingRoute::Greedy => conditioned_greedy_index_where(
+                logits,
+                self.options.penalties,
+                committed,
+                provisional,
+                &mut allowed,
+            )?,
+            SamplingRoute::TopKTopP => sampling_distribution_where(
+                logits,
+                self.options,
+                committed,
+                provisional,
+                &mut allowed,
+            )?
+            .draw_at(self.random.unit_f64())? as usize,
+        };
+        let token =
+            u32::try_from(token).map_err(|_| EngineError::sampling("sampled token exceeds u32"))?;
+        self.decision_for_token(token)
+    }
+
     /// Validated controls used by this request.
     pub const fn options(&self) -> SamplingOptions {
         self.options
@@ -313,6 +346,53 @@ impl Sampler {
             ));
         }
         sampling_distribution(logits, self.options, committed, provisional)
+    }
+
+    pub(crate) fn distribution_where<F>(
+        &self,
+        logits: &[u16],
+        committed: &HashMap<u32, u32>,
+        provisional: &[u32],
+        mut allowed: F,
+    ) -> EngineResult<SamplingDistribution>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        if self.options.is_greedy() {
+            return Err(EngineError::sampling(
+                "a probabilistic distribution requires temperature>0 and top_k>1",
+            ));
+        }
+        sampling_distribution_where(logits, self.options, committed, provisional, &mut allowed)
+    }
+
+    pub(crate) fn distribution_if_top_k_allowed<F>(
+        &self,
+        logits: &[u16],
+        committed: &HashMap<u32, u32>,
+        provisional: &[u32],
+        mut allowed: F,
+    ) -> EngineResult<Option<SamplingDistribution>>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        if self.options.is_greedy() {
+            return Err(EngineError::sampling(
+                "a probabilistic distribution requires temperature>0 and top_k>1",
+            ));
+        }
+        require_vocabulary_row(logits)?;
+        let top = conditioned_top_k(
+            logits,
+            self.options.top_k,
+            self.options.penalties,
+            committed,
+            provisional,
+        )?;
+        if !top.iter().all(|&(token, _)| allowed(token as u32)) {
+            return Ok(None);
+        }
+        distribution_from_top(top, self.options).map(Some)
     }
 
     pub(crate) fn draw(&mut self, distribution: &SamplingDistribution) -> EngineResult<u32> {
@@ -448,6 +528,22 @@ fn conditioned_greedy_index(
         .ok_or_else(|| EngineError::sampling("penalized greedy selection has no candidate"))
 }
 
+fn conditioned_greedy_index_where<F>(
+    logits: &[u16],
+    penalties: SamplingPenalties,
+    committed: &HashMap<u32, u32>,
+    provisional: &[u32],
+    allowed: &mut F,
+) -> EngineResult<usize>
+where
+    F: FnMut(u32) -> bool,
+{
+    conditioned_top_k_where(logits, 1, penalties, committed, provisional, allowed)?
+        .first()
+        .map(|&(token, _)| token)
+        .ok_or_else(|| EngineError::sampling("tool-call constraint has no allowed candidate"))
+}
+
 fn sampling_distribution(
     logits: &[u16],
     options: SamplingOptions,
@@ -467,7 +563,39 @@ fn sampling_distribution(
             provisional,
         )?
     };
-    let maximum = top[0].1;
+    distribution_from_top(top, options)
+}
+
+fn sampling_distribution_where<F>(
+    logits: &[u16],
+    options: SamplingOptions,
+    committed: &HashMap<u32, u32>,
+    provisional: &[u32],
+    allowed: &mut F,
+) -> EngineResult<SamplingDistribution>
+where
+    F: FnMut(u32) -> bool,
+{
+    require_vocabulary_row(logits)?;
+    let top = conditioned_top_k_where(
+        logits,
+        options.top_k,
+        options.penalties,
+        committed,
+        provisional,
+        allowed,
+    )?;
+    distribution_from_top(top, options)
+}
+
+fn distribution_from_top(
+    top: Vec<(usize, f32)>,
+    options: SamplingOptions,
+) -> EngineResult<SamplingDistribution> {
+    let maximum = top
+        .first()
+        .map(|&(_, value)| value)
+        .ok_or_else(|| EngineError::sampling("tool-call constraint has no allowed candidate"))?;
     let weights = top
         .iter()
         .map(|&(_, value)| ((value - maximum) / options.temperature).exp() as f64)
@@ -519,6 +647,55 @@ fn conditioned_top_k(
     for (token, &bits) in logits.iter().enumerate() {
         let raw = finite_logit(bits, token)?;
         let token_id = token as u32;
+        let count = committed.get(&token_id).copied().unwrap_or(0)
+            + provisional
+                .iter()
+                .filter(|&&candidate| candidate == token_id)
+                .count() as u32;
+        let value = penalties.apply(raw, count);
+        if !value.is_finite() {
+            return Err(EngineError::sampling(format!(
+                "sampling penalties produced a non-finite logit at token {token}"
+            )));
+        }
+        if top.len() == k && !value.total_cmp(&top[top.len() - 1].1).is_gt() {
+            continue;
+        }
+        let insertion =
+            top.partition_point(|&(_, retained)| retained.total_cmp(&value) != Ordering::Less);
+        top.insert(insertion, (token, value));
+        if top.len() > k {
+            top.pop();
+        }
+    }
+    Ok(top)
+}
+
+fn conditioned_top_k_where<F>(
+    logits: &[u16],
+    k: usize,
+    penalties: SamplingPenalties,
+    committed: &HashMap<u32, u32>,
+    provisional: &[u32],
+    allowed: &mut F,
+) -> EngineResult<Vec<(usize, f32)>>
+where
+    F: FnMut(u32) -> bool,
+{
+    for &token in provisional {
+        if token as usize >= VOCABULARY {
+            return Err(EngineError::sampling(format!(
+                "sampling history token {token} is outside vocabulary 0..{VOCABULARY}"
+            )));
+        }
+    }
+    let mut top: Vec<(usize, f32)> = Vec::with_capacity(k);
+    for (token, &bits) in logits.iter().enumerate() {
+        let raw = finite_logit(bits, token)?;
+        let token_id = token as u32;
+        if !allowed(token_id) {
+            continue;
+        }
         let count = committed.get(&token_id).copied().unwrap_or(0)
             + provisional
                 .iter()
@@ -780,6 +957,95 @@ mod tests {
             .unwrap();
             assert!(matches!(sampler.sample(&row).unwrap().token_id, 3 | 5));
         }
+    }
+
+    #[test]
+    fn constrained_greedy_selects_the_highest_allowed_token() {
+        let mut row = logits();
+        row[3] = bf16(3.0);
+        row[5] = bf16(2.0);
+        let mut sampler = Sampler::new(SamplingOptions::greedy(), &STOP_IDS).unwrap();
+
+        let selected = sampler
+            .sample_with_counts_where(&row, &HashMap::new(), &[], |token| token != 3)
+            .unwrap();
+
+        assert_eq!(selected.token_id, 5);
+    }
+
+    #[test]
+    fn constrained_top_k_refills_before_top_p() {
+        let mut row = logits();
+        row[3] = bf16(4.0);
+        row[5] = bf16(3.0);
+        row[7] = bf16(2.0);
+        let sampler = Sampler::new(
+            SamplingOptions {
+                top_k: 2,
+                top_p: 1.0,
+                ..SamplingOptions::default()
+            },
+            &STOP_IDS,
+        )
+        .unwrap();
+
+        let law = sampler
+            .distribution_where(&row, &HashMap::new(), &[], |token| token != 3)
+            .unwrap();
+
+        assert_eq!(
+            law.probabilities()
+                .map(|(token, _)| token)
+                .collect::<Vec<_>>(),
+            vec![5, 7]
+        );
+        assert_eq!(law.probability(3), 0.0);
+    }
+
+    #[test]
+    fn sampled_fast_path_checks_raw_top_k_before_top_p() {
+        let mut row = logits();
+        row[3] = bf16(3.0);
+        row[5] = bf16(2.0);
+        row[7] = bf16(1.0);
+        let sampler = Sampler::new(
+            SamplingOptions {
+                top_k: 3,
+                top_p: 0.7,
+                ..SamplingOptions::default()
+            },
+            &STOP_IDS,
+        )
+        .unwrap();
+
+        let fast = sampler
+            .distribution_if_top_k_allowed(&row, &HashMap::new(), &[], |token| token != 7)
+            .unwrap();
+        let masked = sampler
+            .distribution_where(&row, &HashMap::new(), &[], |token| token != 7)
+            .unwrap();
+
+        assert!(fast.is_none());
+        assert_eq!(
+            masked
+                .probabilities()
+                .map(|(token, _)| token)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn constrained_distribution_refuses_empty_support() {
+        let row = logits();
+        let sampler = Sampler::new(SamplingOptions::default(), &STOP_IDS).unwrap();
+
+        let error = sampler
+            .distribution_where(&row, &HashMap::new(), &[], |_| false)
+            .unwrap_err();
+
+        assert_eq!(error.code(), Some(EngineErrorCode::Sampling));
+        assert!(error.to_string().contains("no allowed candidate"));
     }
 
     #[test]

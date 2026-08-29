@@ -9,7 +9,7 @@ mod text_generator;
 
 pub use assistant::{
     AssistantDelta, AssistantStreamFinish, AssistantStreamParser, ParsedAssistantOutput,
-    ParsedToolCall, parse_assistant_output,
+    ParsedToolCall, parse_assistant_output, parse_assistant_output_constrained,
 };
 pub use request::{ChatCompletionRequest, ChatRequestError, PreparedChatRequest, SERVED_MODEL};
 pub use response::{GenerationReply, blocking_response, openai_error, streaming_response};

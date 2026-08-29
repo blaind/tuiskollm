@@ -1,6 +1,8 @@
 //! Incremental Qwen reasoning and tool-call parsing.
 
 use serde_json::{Map, Value};
+use std::sync::Arc;
+use tuisko_frontend::ToolCallConstraintSpec;
 
 const THINK_END: &str = "</think>";
 const CALL_OPEN: &str = "<tool_call>";
@@ -38,6 +40,10 @@ pub struct ParsedAssistantOutput {
     pub content: String,
     /// Structured tool calls, when a complete Qwen tool span was emitted.
     pub tool_calls: Vec<ParsedToolCall>,
+    /// Whether a constrained tool span violated the generation invariant.
+    pub malformed_tool_call: bool,
+    /// Whether the hard token limit ended an incomplete buffered tool span.
+    pub truncated_tool_call: bool,
 }
 
 /// Final delayed text and parsed calls produced when a stream ends.
@@ -47,6 +53,10 @@ pub struct AssistantStreamFinish {
     pub delta: AssistantDelta,
     /// Structured calls retained until their closing tags were available.
     pub tool_calls: Vec<ParsedToolCall>,
+    /// Whether a constrained tool span violated the generation invariant.
+    pub malformed_tool_call: bool,
+    /// Whether the hard token limit ended an incomplete buffered tool span.
+    pub truncated_tool_call: bool,
 }
 
 struct ReasoningStreamParser {
@@ -128,6 +138,7 @@ pub struct AssistantStreamParser {
     parse_tools: bool,
     pending_marker: String,
     tool_text: Option<String>,
+    tool_constraint: Option<Arc<ToolCallConstraintSpec>>,
 }
 
 impl AssistantStreamParser {
@@ -138,6 +149,21 @@ impl AssistantStreamParser {
             parse_tools,
             pending_marker: String::new(),
             tool_text: None,
+            tool_constraint: None,
+        }
+    }
+
+    /// Creates a parser that validates generated calls against the request contract.
+    pub fn with_constraint(
+        split_reasoning: bool,
+        tool_constraint: Arc<ToolCallConstraintSpec>,
+    ) -> Self {
+        Self {
+            reasoning: ReasoningStreamParser::new(split_reasoning),
+            parse_tools: true,
+            pending_marker: String::new(),
+            tool_text: None,
+            tool_constraint: Some(tool_constraint),
         }
     }
 
@@ -170,17 +196,50 @@ impl AssistantStreamParser {
 
     /// Flushes partial markers and returns any complete structured calls.
     pub fn finish(&mut self) -> AssistantStreamFinish {
+        self.finish_with_truncation(false)
+    }
+
+    /// Flushes the stream, discarding an incomplete tool span at the hard token limit.
+    pub fn finish_with_truncation(&mut self, truncated: bool) -> AssistantStreamFinish {
         if let Some(tool_text) = self.tool_text.take() {
-            if let Some((prefix, tool_calls)) = parse_qwen_tool_calls(&tool_text) {
+            if let Some((prefix, tool_calls)) =
+                parse_qwen_tool_calls(&tool_text, self.tool_constraint.as_deref())
+            {
                 let mut delta = self.reasoning.push(&prefix);
                 append_delta(&mut delta, self.reasoning.finish());
-                return AssistantStreamFinish { delta, tool_calls };
+                return AssistantStreamFinish {
+                    delta,
+                    tool_calls,
+                    malformed_tool_call: false,
+                    truncated_tool_call: false,
+                };
+            }
+            let structurally_complete = parse_qwen_tool_calls(&tool_text, None).is_some();
+            if truncated && !structurally_complete {
+                let delta = self.reasoning.finish();
+                return AssistantStreamFinish {
+                    delta,
+                    tool_calls: Vec::new(),
+                    malformed_tool_call: false,
+                    truncated_tool_call: true,
+                };
+            }
+            if self.tool_constraint.is_some() {
+                let delta = self.reasoning.finish();
+                return AssistantStreamFinish {
+                    delta,
+                    tool_calls: Vec::new(),
+                    malformed_tool_call: true,
+                    truncated_tool_call: false,
+                };
             }
             let mut delta = self.reasoning.push(&tool_text);
             append_delta(&mut delta, self.reasoning.finish());
             return AssistantStreamFinish {
                 delta,
                 tool_calls: Vec::new(),
+                malformed_tool_call: false,
+                truncated_tool_call: false,
             };
         }
 
@@ -190,6 +249,8 @@ impl AssistantStreamParser {
         AssistantStreamFinish {
             delta,
             tool_calls: Vec::new(),
+            malformed_tool_call: false,
+            truncated_tool_call: false,
         }
     }
 }
@@ -207,6 +268,27 @@ pub fn parse_assistant_output(
         reasoning: first.reasoning + &tail.delta.reasoning,
         content: first.content + &tail.delta.content,
         tool_calls: tail.tool_calls,
+        malformed_tool_call: tail.malformed_tool_call,
+        truncated_tool_call: tail.truncated_tool_call,
+    }
+}
+
+/// Parses one complete constrained generation, retaining hard-limit truncation separately.
+pub fn parse_assistant_output_constrained(
+    text: &str,
+    split_reasoning: bool,
+    tool_constraint: Arc<ToolCallConstraintSpec>,
+    truncated: bool,
+) -> ParsedAssistantOutput {
+    let mut parser = AssistantStreamParser::with_constraint(split_reasoning, tool_constraint);
+    let first = parser.push(text);
+    let tail = parser.finish_with_truncation(truncated);
+    ParsedAssistantOutput {
+        reasoning: first.reasoning + &tail.delta.reasoning,
+        content: first.content + &tail.delta.content,
+        tool_calls: tail.tool_calls,
+        malformed_tool_call: tail.malformed_tool_call,
+        truncated_tool_call: tail.truncated_tool_call,
     }
 }
 
@@ -222,7 +304,10 @@ fn append_delta(destination: &mut AssistantDelta, source: AssistantDelta) {
     destination.content.push_str(&source.content);
 }
 
-fn parse_qwen_tool_calls(text: &str) -> Option<(String, Vec<ParsedToolCall>)> {
+fn parse_qwen_tool_calls(
+    text: &str,
+    contract: Option<&ToolCallConstraintSpec>,
+) -> Option<(String, Vec<ParsedToolCall>)> {
     const CALL_CLOSE: &str = "</tool_call>";
     const FUNCTION_OPEN: &str = "<function=";
     const FUNCTION_CLOSE: &str = "</function>";
@@ -247,6 +332,10 @@ fn parse_qwen_tool_calls(text: &str) -> Option<(String, Vec<ParsedToolCall>)> {
         if name.is_empty() || name.contains('<') {
             return None;
         }
+        let contract_tool = match contract {
+            Some(contract) => Some(contract.tool(name)?),
+            None => None,
+        };
         remaining = &remaining[name_end + 1..];
         let function_end = remaining.find(FUNCTION_CLOSE)?;
         let mut parameters = &remaining[..function_end];
@@ -260,6 +349,9 @@ fn parse_qwen_tool_calls(text: &str) -> Option<(String, Vec<ParsedToolCall>)> {
                 || parameter_name.contains('<')
                 || arguments.contains_key(parameter_name)
             {
+                return None;
+            }
+            if contract_tool.is_some_and(|tool| tool.parameter(parameter_name).is_none()) {
                 return None;
             }
             parameters = &parameters[parameter_name_end + 1..];
@@ -280,6 +372,13 @@ fn parse_qwen_tool_calls(text: &str) -> Option<(String, Vec<ParsedToolCall>)> {
             arguments.insert(parameter_name.to_owned(), value);
             parameters = &parameters[parameter_end + PARAMETER_CLOSE.len()..];
         }
+        if contract_tool.is_some_and(|tool| {
+            tool.parameters()
+                .iter()
+                .any(|parameter| parameter.required() && !arguments.contains_key(parameter.name()))
+        }) {
+            return None;
+        }
         remaining = &remaining[function_end + FUNCTION_CLOSE.len()..];
         remaining = remaining.trim_start();
         remaining = remaining.strip_prefix(CALL_CLOSE)?;
@@ -294,8 +393,25 @@ fn parse_qwen_tool_calls(text: &str) -> Option<(String, Vec<ParsedToolCall>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssistantStreamParser, parse_assistant_output};
+    use super::{
+        AssistantStreamParser, parse_assistant_output, parse_assistant_output_constrained,
+    };
     use serde_json::Value;
+    use std::sync::Arc;
+    use tuisko_frontend::{ToolCallConstraintSpec, ToolConstraintSpec, ToolParameterSpec};
+
+    fn bash_constraint() -> Arc<ToolCallConstraintSpec> {
+        Arc::new(
+            ToolCallConstraintSpec::new(vec![
+                ToolConstraintSpec::new(
+                    "bash".into(),
+                    vec![ToolParameterSpec::new("command".into(), true).unwrap()],
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        )
+    }
 
     #[test]
     fn reasoning_parser_handles_split_end_tags() {
@@ -332,6 +448,51 @@ mod tests {
         let parsed = parse_assistant_output(text, false, true);
 
         assert_eq!(parsed.content, text);
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn constrained_parser_rejects_the_observed_transposition() {
+        let text = "<tool_call><function=command>\n</parameter></function></tool_call>";
+        let parsed = parse_assistant_output_constrained(text, false, bash_constraint(), false);
+
+        assert!(parsed.malformed_tool_call);
+        assert!(parsed.content.is_empty());
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn constrained_parser_discards_a_length_truncated_span() {
+        let text = "prefix<tool_call><function=bash><parameter=command>ls";
+        let parsed = parse_assistant_output_constrained(text, false, bash_constraint(), true);
+
+        assert!(!parsed.malformed_tool_call);
+        assert!(parsed.truncated_tool_call);
+        assert_eq!(parsed.content, "prefix");
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn constrained_parser_does_not_hide_a_complete_invalid_call_at_length() {
+        let text = "<tool_call><function=bash></function></tool_call>";
+        let parsed = parse_assistant_output_constrained(text, false, bash_constraint(), true);
+
+        assert!(parsed.malformed_tool_call);
+        assert!(!parsed.truncated_tool_call);
+        assert!(parsed.content.is_empty());
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn constrained_parser_requires_declared_parameters() {
+        let parsed = parse_assistant_output_constrained(
+            "<tool_call><function=bash></function></tool_call>",
+            false,
+            bash_constraint(),
+            false,
+        );
+
+        assert!(parsed.malformed_tool_call);
         assert!(parsed.tool_calls.is_empty());
     }
 

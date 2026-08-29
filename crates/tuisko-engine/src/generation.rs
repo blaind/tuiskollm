@@ -4,9 +4,10 @@ use crate::{
     EngineError, EngineResult, SampleDecision, Sampler, SamplingDistribution, SamplingOptions,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 use tuisko_frontend::{
     ChatMessage, ChatTemplateOptions, PromptEncoding, PromptEncodingMetrics, StreamingDecoder,
-    TextFrontend,
+    TextFrontend, ToolCallConstraint, ToolCallConstraintSpec, ToolCallState,
 };
 use tuisko_model::{Arch, Qwen38_27B};
 
@@ -23,6 +24,8 @@ pub struct ChatGenerationRequest {
     pub sampling: SamplingOptions,
     /// Maximum generated tokens, including a selected stop token.
     pub max_new_tokens: usize,
+    /// Lazy Qwen tool-call structure admitted for this request.
+    pub tool_constraint: Option<Arc<ToolCallConstraintSpec>>,
 }
 
 impl ChatGenerationRequest {
@@ -33,6 +36,7 @@ impl ChatGenerationRequest {
             template: ChatTemplateOptions::default(),
             sampling: SamplingOptions::default(),
             max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
+            tool_constraint: None,
         }
     }
 }
@@ -101,6 +105,7 @@ pub struct GenerationSession {
     occurrences: HashMap<u32, u32>,
     max_new_tokens: usize,
     finish_reason: Option<FinishReason>,
+    tool_constraint: Option<ToolCallConstraint>,
 }
 
 impl GenerationSession {
@@ -109,6 +114,11 @@ impl GenerationSession {
         let (prompt, prompt_metrics) =
             frontend.encode_chat_with_metrics(&request.messages, &request.template)?;
         let sampler = Sampler::new(request.sampling, frontend.stop_ids())?;
+        let tool_constraint = request
+            .tool_constraint
+            .clone()
+            .map(|spec| frontend.tool_call_constraint(spec))
+            .transpose()?;
 
         Ok(Self {
             prompt,
@@ -123,6 +133,7 @@ impl GenerationSession {
             }),
             max_new_tokens: request.max_new_tokens,
             finish_reason: (request.max_new_tokens == 0).then_some(FinishReason::Length),
+            tool_constraint,
         })
     }
 
@@ -155,6 +166,7 @@ impl GenerationSession {
             }),
             max_new_tokens,
             finish_reason: (max_new_tokens == 0).then_some(FinishReason::Length),
+            tool_constraint: None,
         })
     }
 
@@ -196,9 +208,7 @@ impl GenerationSession {
             ));
         }
 
-        let decision = self
-            .sampler
-            .sample_with_counts(logits, &self.occurrences, &[])?;
+        let decision = self.propose_logits(logits, &[])?;
         self.accept_decision(decision)
     }
 
@@ -207,8 +217,33 @@ impl GenerationSession {
         logits: &[u16],
         provisional: &[u32],
     ) -> EngineResult<SampleDecision> {
-        self.sampler
-            .sample_with_counts(logits, &self.occurrences, provisional)
+        let Some(state) = self.constraint_state(provisional)? else {
+            return self
+                .sampler
+                .sample_with_counts(logits, &self.occurrences, provisional);
+        };
+        if self.sampler.options().is_greedy() {
+            let candidate =
+                self.sampler
+                    .sample_with_counts(logits, &self.occurrences, provisional)?;
+            if self.constraint_allows(&state, candidate.token_id) {
+                return Ok(candidate);
+            }
+            let constraint = self
+                .tool_constraint
+                .as_ref()
+                .expect("constraint state requires a constraint");
+            return self.sampler.sample_with_counts_where(
+                logits,
+                &self.occurrences,
+                provisional,
+                |token| constraint.allows_token(&state, token),
+            );
+        }
+
+        let distribution = self.constrained_distribution(logits, provisional, &state)?;
+        let token = self.sampler.draw(&distribution)?;
+        self.sampler.decision_for_token(token)
     }
 
     pub(crate) fn sampling_distribution(
@@ -216,8 +251,12 @@ impl GenerationSession {
         logits: &[u16],
         provisional: &[u32],
     ) -> EngineResult<SamplingDistribution> {
-        self.sampler
-            .distribution(logits, &self.occurrences, provisional)
+        let Some(state) = self.constraint_state(provisional)? else {
+            return self
+                .sampler
+                .distribution(logits, &self.occurrences, provisional);
+        };
+        self.constrained_distribution(logits, provisional, &state)
     }
 
     pub(crate) fn draw_distribution(
@@ -242,6 +281,9 @@ impl GenerationSession {
     }
 
     fn accept_decision(&mut self, decision: SampleDecision) -> EngineResult<GenerationStep> {
+        if let Some(constraint) = &mut self.tool_constraint {
+            constraint.commit_token(decision.token_id)?;
+        }
         let mut delta = if decision.stopped {
             None
         } else {
@@ -269,6 +311,47 @@ impl GenerationSession {
             delta,
             finish_reason,
         })
+    }
+
+    fn constraint_state(&self, provisional: &[u32]) -> EngineResult<Option<ToolCallState>> {
+        self.tool_constraint
+            .as_ref()
+            .map(|constraint| {
+                constraint
+                    .provisional_state(provisional)
+                    .map_err(EngineError::from)
+            })
+            .transpose()
+    }
+
+    fn constraint_allows(&self, state: &ToolCallState, token: u32) -> bool {
+        self.tool_constraint
+            .as_ref()
+            .is_none_or(|constraint| constraint.allows_token(state, token))
+    }
+
+    fn constrained_distribution(
+        &self,
+        logits: &[u16],
+        provisional: &[u32],
+        state: &ToolCallState,
+    ) -> EngineResult<SamplingDistribution> {
+        let constraint = self
+            .tool_constraint
+            .as_ref()
+            .expect("constraint state requires a constraint");
+        if let Some(distribution) = self.sampler.distribution_if_top_k_allowed(
+            logits,
+            &self.occurrences,
+            provisional,
+            |token| constraint.allows_token(state, token),
+        )? {
+            return Ok(distribution);
+        }
+        self.sampler
+            .distribution_where(logits, &self.occurrences, provisional, |token| {
+                constraint.allows_token(state, token)
+            })
     }
 
     /// Converts a terminal session into its owned output.
