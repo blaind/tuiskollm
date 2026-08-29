@@ -33,6 +33,8 @@ pub(crate) struct ScoringRequestLog {
     min_prompt_tokens: usize,
     max_prompt_tokens: usize,
     common_prefix_tokens: usize,
+    evaluated_tokens: usize,
+    route: &'static str,
 }
 
 impl RequestLog {
@@ -255,6 +257,8 @@ impl ScoringRequestLog {
         accepted: Instant,
         server_started: Instant,
         prompts: &[Vec<u32>],
+        evaluated_tokens: usize,
+        route: &'static str,
     ) -> Self {
         let prompt_tokens = prompts.iter().map(Vec::len).sum();
         let min_prompt_tokens = prompts.iter().map(Vec::len).min().unwrap_or_default();
@@ -284,6 +288,33 @@ impl ScoringRequestLog {
             min_prompt_tokens,
             max_prompt_tokens,
             common_prefix_tokens,
+            evaluated_tokens,
+            route,
+        }
+    }
+
+    pub(crate) fn native(
+        id: u64,
+        accepted: Instant,
+        server_started: Instant,
+        context_tokens: usize,
+        continuations: &[Vec<u32>],
+    ) -> Self {
+        let continuation_tokens = continuations.iter().map(Vec::len).sum::<usize>();
+        let min_continuation_tokens = continuations.iter().map(Vec::len).min().unwrap_or_default();
+        let max_continuation_tokens = continuations.iter().map(Vec::len).max().unwrap_or_default();
+
+        Self {
+            id,
+            accepted,
+            accepted_offset: accepted.saturating_duration_since(server_started),
+            batch: continuations.len(),
+            prompt_tokens: context_tokens * continuations.len() + continuation_tokens,
+            min_prompt_tokens: context_tokens + min_continuation_tokens,
+            max_prompt_tokens: context_tokens + max_continuation_tokens,
+            common_prefix_tokens: context_tokens,
+            evaluated_tokens: context_tokens + continuation_tokens,
+            route: "native-loglikelihood",
         }
     }
 
@@ -333,7 +364,7 @@ impl ScoringRequestLog {
             let tokens_per_second = if scoring.is_zero() {
                 0.0
             } else {
-                self.prompt_tokens as f64 / scoring.as_secs_f64()
+                self.evaluated_tokens as f64 / scoring.as_secs_f64()
             };
             details.push(format!(
                 "score {} ({} tok/s)",
@@ -358,7 +389,7 @@ impl ScoringRequestLog {
                 compact_count(self.min_prompt_tokens),
             ));
         }
-        details.push("route prompt-scoring".into());
+        details.push(format!("route {}", self.route));
         if let Some(error) = error {
             details.push(format!("error {}", error.replace(['\r', '\n'], " ")));
         }
@@ -528,7 +559,7 @@ mod tests {
         let accepted = started + Duration::from_millis(125);
         let scoring_started = accepted + Duration::from_millis(10);
         let prompts = vec![vec![1, 2, 3, 4], vec![1, 2, 3, 5]];
-        let log = ScoringRequestLog::new(11, accepted, started, &prompts);
+        let log = ScoringRequestLog::new(11, accepted, started, &prompts, 8, "prompt-scoring");
         let line = log.render_at(
             scoring_started + Duration::from_millis(40),
             Some(scoring_started),
@@ -545,9 +576,26 @@ mod tests {
     }
 
     #[test]
+    fn native_scoring_line_uses_shared_context_work_and_truthful_route() {
+        let started = Instant::now();
+        let log = ScoringRequestLog::native(13, started, started, 2, &[vec![3], vec![3, 5]]);
+        let line = log.render_at(
+            started + Duration::from_millis(100),
+            Some(started),
+            "length",
+            None,
+            false,
+        );
+
+        assert!(line.contains("score 0.1s (50 tok/s)"));
+        assert!(line.contains("lengths 3..4 · common 2/3 (66.7%)"));
+        assert!(line.contains("route native-loglikelihood"));
+    }
+
+    #[test]
     fn rejected_scoring_line_sanitizes_errors_and_has_no_score_phase() {
         let started = Instant::now();
-        let log = ScoringRequestLog::new(12, started, started, &[vec![7, 8]]);
+        let log = ScoringRequestLog::new(12, started, started, &[vec![7, 8]], 2, "prompt-scoring");
         let line = log.render_at(
             started + Duration::from_millis(3),
             None,

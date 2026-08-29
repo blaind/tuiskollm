@@ -798,6 +798,34 @@ mod tests {
                 &independent,
             );
 
+            // Multi-token references are bitwise only where independent prompt tiling reaches the
+            // explicit context boundary without crossing it.
+            let continuations = if matches!(common, 32 | 33 | 64 | 65 | 128 | 129) {
+                vec![vec![2_001], vec![2_002, 2_011], vec![2_003]]
+            } else {
+                vec![vec![2_001], vec![2_002], vec![2_003]]
+            };
+            let native = generator
+                .score_continuations(&prefix, &continuations)
+                .unwrap();
+            let independent = continuations
+                .iter()
+                .map(|continuation| {
+                    let prompt = prefix
+                        .iter()
+                        .copied()
+                        .chain(continuation.iter().copied())
+                        .collect::<Vec<_>>();
+                    generator.score_prompt(&prompt).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_continuation_scoring_equal(
+                &format!("native common={common}"),
+                prefix.len(),
+                &native,
+                &independent,
+            );
+
             if common <= 129 {
                 let suffixes = [
                     [2_010, 2_011, 2_012],
@@ -907,6 +935,42 @@ mod tests {
             {
                 panic!("{case}: prompt {prompt_index} token text differs at {position}");
             }
+        }
+    }
+
+    fn assert_continuation_scoring_equal(
+        case: &str,
+        context_tokens: usize,
+        native: &[tuisko_engine::ContinuationLogprobs],
+        independent: &[tuisko_engine::PromptLogprobs],
+    ) {
+        assert_eq!(native.len(), independent.len(), "{case}: result count");
+        for (branch, (native, independent)) in native.iter().zip(independent).enumerate() {
+            let expected = independent.prompt[context_tokens..]
+                .iter()
+                .map(|token| {
+                    token
+                        .clone()
+                        .expect("continuation has a causal predecessor")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(native.tokens, expected, "{case}: branch {branch} tokens");
+            assert_eq!(
+                native.logprob.to_bits(),
+                expected
+                    .iter()
+                    .map(|token| f64::from(token.logprob))
+                    .sum::<f64>()
+                    .to_bits(),
+                "{case}: branch {branch} total"
+            );
+            assert_eq!(
+                native.is_greedy,
+                expected
+                    .iter()
+                    .all(|token| token.token_id == token.top_token_id),
+                "{case}: branch {branch} greedy"
+            );
         }
     }
 

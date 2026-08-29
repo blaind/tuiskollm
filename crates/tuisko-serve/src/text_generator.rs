@@ -10,9 +10,9 @@
 //! target inside `tuisko-engine`.
 
 use tuisko_engine::{
-    ChatGenerationRequest, EngineError, EngineErrorCode, GeneratedText, GenerationStep, MAX_BATCH,
-    PromptLogprobs, Qwen35ResidentMtpBatchEvent, Qwen35ResidentMtpBatchEvents,
-    Qwen35ResidentMtpBatchGenerator, Qwen36ResidentBatchGenerator,
+    ChatGenerationRequest, ContinuationLogprobs, EngineError, EngineErrorCode, GeneratedText,
+    GenerationStep, MAX_BATCH, PromptLogprobs, Qwen35ResidentMtpBatchEvent,
+    Qwen35ResidentMtpBatchEvents, Qwen35ResidentMtpBatchGenerator, Qwen36ResidentBatchGenerator,
     Qwen38FlashNextMtpResidentGenerator, Qwen38FlashNextResidentBatchGenerator,
     ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentCancellation,
     ResidentMtpBatchEvent, ResidentMtpBatchEvents, ResidentMtpBatchGenerator,
@@ -99,6 +99,18 @@ pub(crate) trait TextGenerator {
         Err(EngineError::Contract {
             code: EngineErrorCode::Generation,
             message: "prompt scoring is unsupported for this exact target".into(),
+        })
+    }
+
+    /// Scores native token-ID continuation branches when this exact target admits it.
+    fn score_continuations(
+        &mut self,
+        _context: &[u32],
+        _continuations: &[Vec<u32>],
+    ) -> Result<Vec<ContinuationLogprobs>, EngineError> {
+        Err(EngineError::Contract {
+            code: EngineErrorCode::Generation,
+            message: "continuation scoring is unsupported for this exact target".into(),
         })
     }
 }
@@ -198,6 +210,14 @@ impl TextGenerator for ResidentMtpBatchGenerator {
 
     fn score_prompts(&mut self, prompts: &[Vec<u32>]) -> Result<Vec<PromptLogprobs>, EngineError> {
         ResidentMtpBatchGenerator::score_prompts(self, prompts)
+    }
+
+    fn score_continuations(
+        &mut self,
+        context: &[u32],
+        continuations: &[Vec<u32>],
+    ) -> Result<Vec<ContinuationLogprobs>, EngineError> {
+        ResidentMtpBatchGenerator::score_continuations(self, context, continuations)
     }
 }
 

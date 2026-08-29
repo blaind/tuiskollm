@@ -64,9 +64,10 @@ targets, not fallback servers. Vision is not served yet.
 - Address-stable resident arenas and immutable whole-model CUDA Graphs.
 - Exact compact scheduling for every admitted B=1..8 route.
 - Paged KV ownership, retained-prefix reuse, cancellation, and retryable overload.
-- Blocking and SSE `POST /v1/chat/completions`; scoring-only OpenAI echo logprobs at
-  `POST /v1/completions`; plus `GET /health`, `GET /ready`, and `GET /v1/models`. See
-  [`docs/evaluation.md`](docs/evaluation.md) for the exact lm-eval contract.
+- Blocking and SSE `POST /v1/chat/completions`; native continuation scoring at
+  `POST /v1/evals/loglikelihood`; scoring-only OpenAI echo logprobs at `POST /v1/completions`;
+  plus `GET /health`, `GET /ready`, and `GET /v1/models`. See [`docs/evaluation.md`](docs/evaluation.md)
+  for the exact lm-eval contracts.
 - Qwen3.8 lifecycle administration: `/v1/unload`/`load` release and recreate the complete model;
   `/v1/park`/`resume` preserve retained-prefix KV and recurrent state in pinned host memory while
   releasing all target/MTP arena backing. Resume reloads represented weights from the admitted

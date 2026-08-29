@@ -1,5 +1,34 @@
 # Live-server evaluation
 
+## Native lm-eval route
+
+The preferred Qwen3.8 evaluation boundary is `POST /v1/evals/loglikelihood`. It accepts an exact
+token-ID context and one to eight token-ID continuations, shares the context once, and returns the
+natural-log probability and greedy agreement for each continuation. The repository launcher pins
+lm-eval 0.4.12 and the checkpoint tokenizer boundary; it sends HTTP requests sequentially and
+groups adjacent requests with identical context IDs into groups of at most eight.
+
+Create the lean environment and stage tokenizer/task data as described below, then invoke the
+launcher from the repository root:
+
+```bash
+target/lm-eval-venv/bin/python scripts/lm_eval_tuisko_native.py \
+  --model tuisko-native \
+  --model_args model=unsloth/Qwen3.8-27B-NVFP4,base_url=http://127.0.0.1:8000/v1/evals/loglikelihood,tokenizer=unsloth/Qwen3.8-27B-NVFP4,revision=16b6615af3548b88e2d8e382457bc705b00479cf,max_length=220000 \
+  --tasks mmlu_abstract_algebra \
+  --num_fewshot 0 \
+  --batch_size 8 \
+  --limit 1 \
+  --log_samples \
+  --output_path target/lm-eval/native-mmlu-abstract-algebra-smoke
+```
+
+The adapter uses lm-eval's exact concatenated context/continuation tokenization rule, including
+moving trailing context spaces across the token boundary and using the tokenizer EOS token for an
+empty text context. Rolling-loglikelihood and generation tasks fail with an explicit unsupported
+operation; use the chat adapter for generation. The existing `/v1/completions` scoring subset
+below remains available as a compatibility path.
+
 TuiskoLLM exposes a scoring-only subset of `POST /v1/completions` for the
 `local-completions` adapter in lm-evaluation-harness. This is separate from generation, which
 remains owned by `POST /v1/chat/completions`.

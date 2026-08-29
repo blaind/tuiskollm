@@ -8,7 +8,8 @@ use crate::response::{
 use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
 use crate::{
     ChatCompletionRequest, ChatRequestError, CompletionRequest, GenerationReply,
-    PreparedChatRequest, PreparedCompletionRequest, openai_error,
+    LoglikelihoodRequest, PreparedChatRequest, PreparedCompletionRequest,
+    PreparedLoglikelihoodRequest, openai_error,
 };
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
@@ -29,11 +30,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
 use tokio::sync::oneshot;
 use tuisko_engine::{
-    EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, ParkedQwen38Generator, PromptLogprobs,
-    QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS, Qwen35ResidentMtpBatchGenerator,
-    Qwen36ResidentBatchGenerator, Qwen38FlashNextMtpResidentGenerator, ResidentBatchAdmission,
-    ResidentLoadPhase, ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentMtpGenerationStats,
-    ResidentRequestId,
+    ContinuationLogprobs, EngineError, EngineErrorCode, GenerationStep, MAX_BATCH,
+    ParkedQwen38Generator, PromptLogprobs, QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS,
+    Qwen35ResidentMtpBatchGenerator, Qwen36ResidentBatchGenerator,
+    Qwen38FlashNextMtpResidentGenerator, ResidentBatchAdmission, ResidentLoadPhase,
+    ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentMtpGenerationStats, ResidentRequestId,
 };
 use tuisko_frontend::GenerationDefaults;
 use tuisko_model::{
@@ -100,6 +101,7 @@ struct AppState {
     generation_route: &'static str,
     generation_defaults: GenerationDefaults,
     reasoning_effort: Option<&'static str>,
+    context_capacity: usize,
 }
 
 struct ChatJob {
@@ -110,9 +112,22 @@ struct ChatJob {
 }
 
 struct ScoreJob {
-    prompts: Vec<Vec<u32>>,
-    reply: oneshot::Sender<Result<Vec<PromptLogprobs>, ScoreFailure>>,
+    request: ScoreRequest,
+    reply: oneshot::Sender<Result<ScoreResult, ScoreFailure>>,
     log: ScoringRequestLog,
+}
+
+enum ScoreRequest {
+    Prompts(Vec<Vec<u32>>),
+    Continuations {
+        context: Vec<u32>,
+        continuations: Vec<Vec<u32>>,
+    },
+}
+
+enum ScoreResult {
+    Prompts(Vec<PromptLogprobs>),
+    Continuations(Vec<ContinuationLogprobs>),
 }
 
 #[derive(Debug)]
@@ -880,6 +895,7 @@ fn start_worker(
             generation_route: ready.generation_route,
             generation_defaults: ready.generation_defaults,
             reasoning_effort: ready.reasoning_effort,
+            context_capacity: ready.context_capacity,
         },
         ready,
         failure_rx,
@@ -2174,17 +2190,26 @@ fn fail_all(replies: &mut HashMap<ResidentRequestId, ActiveReply>, message: Stri
 
 fn run_score_job<G: TextGenerator>(generator: &mut G, job: ScoreJob) {
     let ScoreJob {
-        prompts,
+        request,
         reply,
         log,
     } = job;
     let scoring_started = Instant::now();
-    let result = generator
-        .score_prompts(&prompts)
-        .map_err(|error| ScoreFailure {
-            code: error.code(),
-            message: error.to_string(),
-        });
+    let result = match request {
+        ScoreRequest::Prompts(prompts) => {
+            generator.score_prompts(&prompts).map(ScoreResult::Prompts)
+        }
+        ScoreRequest::Continuations {
+            context,
+            continuations,
+        } => generator
+            .score_continuations(&context, &continuations)
+            .map(ScoreResult::Continuations),
+    }
+    .map_err(|error| ScoreFailure {
+        code: error.code(),
+        message: error.to_string(),
+    });
     match &result {
         Ok(_) => log.finish(Some(scoring_started), "length", None),
         Err(error) => log.finish(Some(scoring_started), "error", Some(&error.message)),
@@ -2193,11 +2218,13 @@ fn run_score_job<G: TextGenerator>(generator: &mut G, job: ScoreJob) {
 }
 
 fn reject_busy_score(job: ScoreJob) {
-    fail_score_job(
-        job,
-        Some(EngineErrorCode::Capacity),
-        "prompt scoring requires an idle resident scheduler".into(),
-    );
+    let message = match &job.request {
+        ScoreRequest::Prompts(_) => "prompt scoring requires an idle resident scheduler",
+        ScoreRequest::Continuations { .. } => {
+            "continuation scoring requires an idle resident scheduler"
+        }
+    };
+    fail_score_job(job, Some(EngineErrorCode::Capacity), message.into());
 }
 
 fn fail_score_job(job: ScoreJob, code: Option<EngineErrorCode>, message: String) {
@@ -2266,6 +2293,7 @@ fn router(state: AppState) -> Router {
         .route("/v1/park", post(park))
         .route("/v1/resume", post(resume))
         .route("/v1/completions", post(completions))
+        .route("/v1/evals/loglikelihood", post(loglikelihood))
         .route("/v1/chat/completions", post(chat_completions))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         .with_state(state)
@@ -2654,11 +2682,19 @@ async fn completions(
     let numeric_id = state.request_ids.fetch_add(1, Ordering::Relaxed);
     let accepted = Instant::now();
     let (reply, receiver) = oneshot::channel();
-    let log = ScoringRequestLog::new(numeric_id, accepted, state.server_started, &prompts);
+    let evaluated_tokens = prompts.iter().map(Vec::len).sum();
+    let log = ScoringRequestLog::new(
+        numeric_id,
+        accepted,
+        state.server_started,
+        &prompts,
+        evaluated_tokens,
+        "prompt-scoring",
+    );
     if let Err(error) = enqueue_score_job(
         &state,
         ScoreJob {
-            prompts,
+            request: ScoreRequest::Prompts(prompts),
             reply,
             log,
         },
@@ -2666,10 +2702,15 @@ async fn completions(
         return enqueue_error_response(error);
     }
     match receiver.await {
-        Ok(Ok(scores)) => completion_logprob_response(
+        Ok(Ok(ScoreResult::Prompts(scores))) => completion_logprob_response(
             scores,
             completion_score_id(state.response_namespace, numeric_id),
             state.model_id,
+        ),
+        Ok(Ok(ScoreResult::Continuations(_))) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "resident engine returned continuation scores for a completions request".into(),
+            "server_error",
         ),
         Ok(Err(error)) if error.code == Some(EngineErrorCode::Capacity) => {
             overloaded_response(error.message)
@@ -2690,6 +2731,142 @@ async fn completions(
             "server_error",
         ),
     }
+}
+
+async fn loglikelihood(
+    State(state): State<AppState>,
+    payload: Result<Json<LoglikelihoodRequest>, JsonRejection>,
+) -> Response {
+    let request = match payload {
+        Ok(Json(request)) => request,
+        Err(error) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                error.body_text(),
+                "invalid_request_error",
+            );
+        }
+    };
+    let PreparedLoglikelihoodRequest {
+        context,
+        continuations,
+    } = match request.prepare_for(state.model_id, state.context_capacity) {
+        Ok(request) => request,
+        Err(ChatRequestError::ModelNotFound { requested }) => {
+            return openai_error(
+                StatusCode::NOT_FOUND,
+                format!("model `{requested}` is not served by this process"),
+                "model_not_found",
+            );
+        }
+        Err(error) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                "invalid_request_error",
+            );
+        }
+    };
+    let numeric_id = state.request_ids.fetch_add(1, Ordering::Relaxed);
+    let accepted = Instant::now();
+    let context_tokens = context.len();
+    let continuation_tokens = continuations.iter().map(Vec::len).sum::<usize>();
+    let (reply, receiver) = oneshot::channel();
+    let log = ScoringRequestLog::native(
+        numeric_id,
+        accepted,
+        state.server_started,
+        context_tokens,
+        &continuations,
+    );
+    if let Err(error) = enqueue_score_job(
+        &state,
+        ScoreJob {
+            request: ScoreRequest::Continuations {
+                context,
+                continuations,
+            },
+            reply,
+            log,
+        },
+    ) {
+        return enqueue_error_response(error);
+    }
+    match receiver.await {
+        Ok(Ok(ScoreResult::Continuations(scores))) => loglikelihood_response(
+            scores,
+            eval_score_id(state.response_namespace, numeric_id),
+            state.model_id,
+            context_tokens,
+            continuation_tokens,
+        ),
+        Ok(Ok(ScoreResult::Prompts(_))) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "resident engine returned prompt scores for a loglikelihood request".into(),
+            "server_error",
+        ),
+        Ok(Err(error)) if error.code == Some(EngineErrorCode::Capacity) => {
+            overloaded_response(error.message)
+        }
+        Ok(Err(error)) if error.code.is_some() => openai_error(
+            StatusCode::BAD_REQUEST,
+            error.message,
+            "invalid_request_error",
+        ),
+        Ok(Err(error)) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.message,
+            "server_error",
+        ),
+        Err(_) => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "resident engine worker disconnected".into(),
+            "server_error",
+        ),
+    }
+}
+
+fn loglikelihood_response(
+    scores: Vec<ContinuationLogprobs>,
+    id: String,
+    model_id: &'static str,
+    context_tokens: usize,
+    continuation_tokens: usize,
+) -> Response {
+    let data = scores
+        .into_iter()
+        .enumerate()
+        .map(|(index, score)| {
+            json!({
+                "index": index,
+                "logprob": score.logprob,
+                "is_greedy": score.is_greedy,
+                "tokens": score.tokens.into_iter().map(|token| json!({
+                    "token_id": token.token_id,
+                    "logprob": token.logprob,
+                    "top_token_id": token.top_token_id,
+                    "top_logprob": token.top_logprob,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Json(json!({
+        "id": id,
+        "object": "eval.loglikelihood",
+        "created": created,
+        "model": model_id,
+        "data": data,
+        "usage": {
+            "context_tokens": context_tokens,
+            "continuation_tokens": continuation_tokens,
+            "evaluated_tokens": context_tokens + continuation_tokens,
+        }
+    }))
+    .into_response()
 }
 
 fn completion_logprob_response(
@@ -2768,6 +2945,10 @@ fn completion_id(namespace: u128, numeric_id: u64) -> String {
 
 fn completion_score_id(namespace: u128, numeric_id: u64) -> String {
     format!("cmpl-tuisko-{namespace:032x}-{numeric_id:016x}")
+}
+
+fn eval_score_id(namespace: u128, numeric_id: u64) -> String {
+    format!("eval-tuisko-{namespace:032x}-{numeric_id:016x}")
 }
 
 fn enqueue_chat_job(state: &AppState, job: ChatJob) -> Result<(), EnqueueError> {
@@ -2913,10 +3094,10 @@ mod tests {
         AppState, ChatJob, ClientStatus, EnqueueError, InferencePhase, InferenceProgress, Job,
         LifecycleState, QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, Ready, ServerConfig,
         ServerError, ServerModel, chat_completions, completion_id, completion_logprob_response,
-        enqueue_chat_job, fail_queued, health, load, models, readiness, record_admission,
-        render_forced_shutdown, render_inference_progress, render_load_progress, render_loading,
-        render_shutdown, render_startup, render_weight_progress, router, run, serve_reloadable,
-        serve_until_worker_failure, serve_until_worker_failure_or_shutdown,
+        enqueue_chat_job, fail_queued, health, load, loglikelihood_response, models, readiness,
+        record_admission, render_forced_shutdown, render_inference_progress, render_load_progress,
+        render_loading, render_shutdown, render_startup, render_weight_progress, router, run,
+        serve_reloadable, serve_until_worker_failure, serve_until_worker_failure_or_shutdown,
         try_send_generation_steps, unload,
     };
     use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
@@ -2937,8 +3118,8 @@ mod tests {
     use tokio::runtime::Builder;
     use tokio::sync::mpsc::channel;
     use tuisko_engine::{
-        ChatGenerationRequest, EngineError, EngineErrorCode, FinishReason, GeneratedText,
-        GenerationStep, MAX_BATCH, PromptLogprobs, PromptTokenLogprob,
+        ChatGenerationRequest, ContinuationLogprobs, EngineError, EngineErrorCode, FinishReason,
+        GeneratedText, GenerationStep, MAX_BATCH, PromptLogprobs, PromptTokenLogprob,
         QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS, ResidentBatchAdmission, ResidentCancellation,
         ResidentLoadPhase, ResidentMtpGenerationStats, ResidentRequestId,
     };
@@ -2996,6 +3177,51 @@ mod tests {
         assert_eq!(body["usage"]["completion_tokens"], 1);
     }
 
+    #[test]
+    fn native_loglikelihood_response_preserves_order_tokens_and_totals() {
+        let response = loglikelihood_response(
+            vec![
+                ContinuationLogprobs {
+                    logprob: -0.75,
+                    is_greedy: true,
+                    tokens: vec![PromptTokenLogprob {
+                        token_id: 362,
+                        logprob: -0.75,
+                        top_token_id: 362,
+                        top_logprob: -0.75,
+                    }],
+                },
+                ContinuationLogprobs {
+                    logprob: -2.0,
+                    is_greedy: false,
+                    tokens: vec![PromptTokenLogprob {
+                        token_id: 426,
+                        logprob: -2.0,
+                        top_token_id: 3,
+                        top_logprob: -0.25,
+                    }],
+                },
+            ],
+            "eval-tuisko-fixture".into(),
+            SERVED_MODEL,
+            3,
+            2,
+        );
+        let bytes = runtime()
+            .block_on(to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body["object"], "eval.loglikelihood");
+        assert_eq!(body["data"][0]["index"], 0);
+        assert_eq!(body["data"][0]["tokens"][0]["token_id"], 362);
+        assert_eq!(body["data"][1]["index"], 1);
+        assert_eq!(body["data"][1]["is_greedy"], false);
+        assert_eq!(body["usage"]["context_tokens"], 3);
+        assert_eq!(body["usage"]["continuation_tokens"], 2);
+        assert_eq!(body["usage"]["evaluated_tokens"], 5);
+    }
+
     fn job() -> (ChatJob, tokio::sync::mpsc::Receiver<GenerationReply>) {
         let (reply, receiver) = channel(8);
         let client = ClientStatus::fixture_connected();
@@ -3033,6 +3259,7 @@ mod tests {
                 top_k: 20,
             },
             reasoning_effort: ServerModel::Qwen38.reasoning_effort(),
+            context_capacity: 4096,
         }
     }
 

@@ -12,11 +12,12 @@ use crate::qwen38::resident_mtp_generation::{
     prime_prompt_with_progress, replay_prefill_tile, replay_target_token,
 };
 use crate::{
-    ChatGenerationRequest, EngineError, EngineResult, GeneratedText, GenerationSession,
-    GenerationStep, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, PromptLogprobs, PromptTokenLogprob,
-    ResidentBatchAdmission, ResidentCancellation, ResidentLoadProgress, ResidentMtpGenerationStats,
-    ResidentMtpLoadStats, ResidentMtpProgram, ResidentMtpSegmentedVerifyRoute,
-    ResidentMtpVerifyRoute, ResidentRequestId, SamplingDistribution,
+    ChatGenerationRequest, ContinuationLogprobs, EngineError, EngineResult, GeneratedText,
+    GenerationSession, GenerationStep, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, PromptLogprobs,
+    PromptTokenLogprob, ResidentBatchAdmission, ResidentCancellation, ResidentLoadProgress,
+    ResidentMtpGenerationStats, ResidentMtpLoadStats, ResidentMtpProgram,
+    ResidentMtpSegmentedVerifyRoute, ResidentMtpVerifyRoute, ResidentRequestId,
+    SamplingDistribution,
 };
 use std::sync::Arc;
 use tuisko_frontend::{GenerationDefaults, TextFrontend};
@@ -444,6 +445,167 @@ impl ResidentMtpBatchGenerator {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
         }
+    }
+
+    /// Scores one context against one to eight independent continuation branches.
+    ///
+    /// The context is replayed once. Every branch then starts from the captured context boundary
+    /// and uses only the exact B=1 target path; the final continuation token is scored but is not
+    /// replayed for an unused next-token row.
+    pub fn score_continuations(
+        &mut self,
+        context: &[u32],
+        continuations: &[Vec<u32>],
+    ) -> EngineResult<Vec<ContinuationLogprobs>> {
+        if self.active != 0 {
+            return Err(EngineError::capacity(
+                "continuation scoring requires an idle resident scheduler",
+            ));
+        }
+        let required_positions = validate_continuation_scoring(
+            context,
+            continuations,
+            self.program.target().context_capacity(),
+        )?;
+
+        let slot = 0;
+        self.prepare_kv_slot(slot, true, required_positions)?;
+        self.program.activate_kv_slot(slot)?;
+        if let Err(error) =
+            self.program
+                .reserve_kv_slot_tokens(&self.stream, slot, required_positions)
+        {
+            self.program.recycle_kv_slot(&self.stream, slot)?;
+            return Err(error);
+        }
+        if let Err(error) = self
+            .program
+            .target()
+            .load_slot_routes(&self.stream, &[slot])
+        {
+            self.program.recycle_kv_slot(&self.stream, slot)?;
+            return Err(error);
+        }
+
+        let scored = self.score_continuations_in_slot(context, continuations, slot);
+        let recycled = self.program.recycle_kv_slot(&self.stream, slot);
+        self.retained[slot] = None;
+        self.message_boundary_valid[slot] = false;
+        match (scored, recycled) {
+            (Ok(scored), Ok(_)) => Ok(scored),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn score_continuations_in_slot(
+        &mut self,
+        context: &[u32],
+        continuations: &[Vec<u32>],
+        slot: usize,
+    ) -> EngineResult<Vec<ContinuationLogprobs>> {
+        self.replay_scoring_context(context, slot)?;
+        let first_scores = score_tokens_in_row(
+            &self.target_logits[target_download_row(0)],
+            continuations.iter().map(|continuation| continuation[0]),
+        )?;
+        if continuations
+            .iter()
+            .any(|continuation| continuation.len() > 1)
+        {
+            self.program
+                .truncate_kv_slot_tokens(&self.stream, slot, context.len())?;
+            self.program.target().capture_gdn_slot(
+                &self.stream,
+                slot,
+                &mut self.message_boundary_history,
+                &mut self.message_boundary_state,
+            )?;
+        }
+
+        let mut results = Vec::with_capacity(continuations.len());
+        for (continuation, first_score) in continuations.iter().zip(first_scores) {
+            let mut tokens = Vec::with_capacity(continuation.len());
+            tokens.push(first_score);
+            if continuation.len() == 1 {
+                results.push(finish_continuation_logprobs(tokens));
+                continue;
+            }
+
+            self.program.target().restore_gdn_slot(
+                &self.stream,
+                slot,
+                &self.message_boundary_history,
+                &self.message_boundary_state,
+            )?;
+            self.program
+                .truncate_kv_slot_tokens(&self.stream, slot, context.len())?;
+            self.program.reserve_kv_slot_tokens(
+                &self.stream,
+                slot,
+                context.len() + continuation.len(),
+            )?;
+            self.program
+                .target()
+                .load_slot_routes(&self.stream, &[slot])?;
+
+            for index in 0..continuation.len() - 1 {
+                replay_target_token(
+                    &mut self.program,
+                    &self.stream,
+                    continuation[index],
+                    context.len() + index,
+                )?;
+                self.program.target().read_logits_into(
+                    &self.stream,
+                    1,
+                    &mut self.target_logits[target_download_logits(1)],
+                )?;
+                tokens.push(score_logit_row(
+                    &self.target_logits[target_download_row(0)],
+                    continuation[index + 1],
+                )?);
+            }
+            results.push(finish_continuation_logprobs(tokens));
+        }
+        Ok(results)
+    }
+
+    fn replay_scoring_context(&mut self, context: &[u32], slot: usize) -> EngineResult<()> {
+        let mut cursor = 0usize;
+        let mut cosine = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+        let mut sine = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+
+        while let Some(tokens) = next_native_prefill_tile(context.len() - cursor) {
+            let rotary_values = fill_contiguous_rope(cursor, tokens, &mut cosine, &mut sine)?;
+            replay_prefill_tile(
+                &mut self.program,
+                &self.stream,
+                &context[cursor..cursor + tokens],
+                slot,
+                cursor,
+                &cosine[..rotary_values],
+                &sine[..rotary_values],
+            )?;
+            cursor += tokens;
+            if cursor == context.len() {
+                self.program.target().launch_prefill_lm_head_rows(
+                    &self.stream,
+                    tokens - 1,
+                    1,
+                    tokens,
+                )?;
+            }
+        }
+        while cursor < context.len() {
+            replay_target_token(&mut self.program, &self.stream, context[cursor], cursor)?;
+            cursor += 1;
+        }
+        self.program.target().read_logits_into(
+            &self.stream,
+            1,
+            &mut self.target_logits[target_download_logits(1)],
+        )
     }
 
     fn score_prompts_with_common_prefix(
@@ -2449,6 +2611,65 @@ fn validate_prompt_scoring_batch<T: AsRef<[u32]>>(
     Ok(plan_prompt_scoring_batch(prompts))
 }
 
+fn validate_continuation_scoring(
+    context: &[u32],
+    continuations: &[Vec<u32>],
+    context_capacity: usize,
+) -> EngineResult<usize> {
+    if context.is_empty() {
+        return Err(EngineError::generation(
+            "continuation scoring context requires at least one token",
+        ));
+    }
+    if continuations.is_empty() || continuations.len() > MAX_BATCH {
+        return Err(EngineError::capacity(format!(
+            "continuation scoring branch count {} is outside 1..={MAX_BATCH}",
+            continuations.len()
+        )));
+    }
+    for (position, &token) in context.iter().enumerate() {
+        validate_scored_token(token, "context", 0, position)?;
+    }
+
+    let mut required_positions = context.len();
+    for (branch, continuation) in continuations.iter().enumerate() {
+        if continuation.is_empty() {
+            return Err(EngineError::generation(format!(
+                "continuation scoring branch {branch} requires at least one token"
+            )));
+        }
+        for (position, &token) in continuation.iter().enumerate() {
+            validate_scored_token(token, "continuation", branch, position)?;
+        }
+        let positions = context
+            .len()
+            .checked_add(continuation.len())
+            .ok_or_else(|| EngineError::capacity("continuation scoring positions overflow"))?;
+        required_positions = required_positions.max(positions);
+    }
+    if required_positions > context_capacity {
+        return Err(EngineError::capacity(format!(
+            "continuation scoring requires {required_positions} positions, current resident capacity is {context_capacity}"
+        )));
+    }
+    Ok(required_positions)
+}
+
+fn validate_scored_token(
+    token: u32,
+    kind: &str,
+    branch: usize,
+    position: usize,
+) -> EngineResult<()> {
+    if usize::try_from(token).map_or(true, |token| token >= Qwen38_27B::VOCAB) {
+        return Err(EngineError::generation(format!(
+            "continuation scoring token {token} in {kind} {branch} at position {position} is outside vocabulary 0..{}",
+            Qwen38_27B::VOCAB
+        )));
+    }
+    Ok(())
+}
+
 fn longest_common_token_prefix<T: AsRef<[u32]>>(prompts: &[T]) -> usize {
     let first = prompts[0].as_ref();
     (0..first.len())
@@ -2562,12 +2783,33 @@ fn finish_prompt_logprobs(
     })
 }
 
+fn finish_continuation_logprobs(tokens: Vec<PromptTokenLogprob>) -> ContinuationLogprobs {
+    ContinuationLogprobs {
+        logprob: tokens.iter().map(|token| f64::from(token.logprob)).sum(),
+        is_greedy: tokens
+            .iter()
+            .all(|token| token.token_id == token.top_token_id),
+        tokens,
+    }
+}
+
 fn score_logit_row(logits: &[u16], token_id: u32) -> EngineResult<PromptTokenLogprob> {
     NormalizedLogitRow::new(logits)?.score_token(logits, token_id)
 }
 
 fn score_greedy_row(logits: &[u16]) -> EngineResult<PromptTokenLogprob> {
     Ok(NormalizedLogitRow::new(logits)?.score_greedy())
+}
+
+fn score_tokens_in_row(
+    logits: &[u16],
+    token_ids: impl IntoIterator<Item = u32>,
+) -> EngineResult<Vec<PromptTokenLogprob>> {
+    let normalized = NormalizedLogitRow::new(logits)?;
+    token_ids
+        .into_iter()
+        .map(|token| normalized.score_token(logits, token))
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2682,8 +2924,9 @@ mod tests {
     use super::{
         ATTENTION_PAGE_SIZE, DRAFT_HIDDEN_ROWS, DRAFT_LOGIT_ROWS, NormalizedLogitRow,
         RetainedMtpSlot, RetainedReuse, TARGET_LOGIT_ROWS, best_retained_prefix,
-        longest_common_token_prefix, plan_prompt_scoring_batch, prompt_scoring_routes,
-        score_greedy_row, score_logit_row, target_download_logits, target_download_row,
+        finish_continuation_logprobs, longest_common_token_prefix, plan_prompt_scoring_batch,
+        prompt_scoring_routes, score_greedy_row, score_logit_row, score_tokens_in_row,
+        target_download_logits, target_download_row, validate_continuation_scoring,
         validate_prompt_scoring_batch,
     };
     use crate::MAX_BATCH;
@@ -2712,6 +2955,49 @@ mod tests {
     }
 
     #[test]
+    fn continuation_results_sum_in_fp64_and_require_every_greedy_token() {
+        let tokens = vec![
+            crate::PromptTokenLogprob {
+                token_id: 7,
+                logprob: -0.25,
+                top_token_id: 7,
+                top_logprob: -0.25,
+            },
+            crate::PromptTokenLogprob {
+                token_id: 9,
+                logprob: -1.5,
+                top_token_id: 3,
+                top_logprob: -0.5,
+            },
+        ];
+        let result = finish_continuation_logprobs(tokens.clone());
+
+        assert_eq!(result.logprob.to_bits(), (-1.75f64).to_bits());
+        assert!(!result.is_greedy);
+        assert_eq!(result.tokens, tokens);
+    }
+
+    #[test]
+    fn continuation_scoring_admission_covers_branch_capacity_and_vocabulary() {
+        assert_eq!(
+            validate_continuation_scoring(&[1, 2], &[vec![3], vec![4, 5]], 4).unwrap(),
+            4
+        );
+        assert!(validate_continuation_scoring(&[], &[vec![1]], 4).is_err());
+        assert!(validate_continuation_scoring(&[1], &[], 4).is_err());
+        assert!(validate_continuation_scoring(&[1], &[vec![]], 4).is_err());
+        assert!(validate_continuation_scoring(&[1], &[vec![2, 3, 4, 5]], 4).is_err());
+        assert!(
+            validate_continuation_scoring(
+                &[u32::try_from(Qwen38_27B::VOCAB).unwrap()],
+                &[vec![1]],
+                4,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn reused_logit_normalizer_is_bitwise_identical_to_independent_scoring() {
         let mut logits = vec![((-37.0f32).to_bits() >> 16) as u16; Qwen38_27B::VOCAB];
         logits[0] = (0.0f32.to_bits() >> 16) as u16;
@@ -2728,6 +3014,29 @@ mod tests {
         assert_eq!(reused[0].top_token_id, 0);
         assert_eq!(reused[0].logprob.to_bits(), 0.0f32.to_bits());
         assert_eq!(reused[1].logprob.to_bits(), (-37.0f32).to_bits());
+    }
+
+    #[test]
+    fn continuation_first_scores_survive_the_reused_download_buffer() {
+        let context_logits = [0.0f32, 1.0, -2.0].map(|value| (value.to_bits() >> 16) as u16);
+        let first_scores = score_tokens_in_row(&context_logits, [0, 2]).unwrap();
+        let overwritten_logits = [9.0f32, -9.0, 3.0].map(|value| (value.to_bits() >> 16) as u16);
+
+        assert_eq!(
+            first_scores[0],
+            score_logit_row(&context_logits, 0).unwrap()
+        );
+        assert_eq!(
+            first_scores[1],
+            score_logit_row(&context_logits, 2).unwrap()
+        );
+        assert_ne!(
+            first_scores[1].logprob.to_bits(),
+            score_logit_row(&overwritten_logits, 2)
+                .unwrap()
+                .logprob
+                .to_bits()
+        );
     }
 
     #[test]
