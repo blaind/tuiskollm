@@ -14,7 +14,9 @@ use tuisko_engine::{
     ResidentModelLayout, ResidentModelProgram, ResidentPrefillRoute, ResidentPrefillStageGraph,
 };
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuTimer, profiler_start, profiler_stop};
-use tuisko_kernels_sm120::{LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE};
+use tuisko_kernels_sm120::{
+    ATTENTION_PAGE_SIZE, LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE,
+};
 use tuisko_model::{Arch, CheckpointSnapshot, Qwen38_27B};
 
 const CACHE_POSITION: u32 = 130;
@@ -22,13 +24,21 @@ const CONTEXT_TOKENS: usize = CACHE_POSITION as usize + 1;
 const LONG_CONTEXT_TOKENS: usize = 131_073;
 const ROTARY_PAIRS: usize = 32;
 const LONG_ROUTE_SLOTS: [usize; MAX_BATCH] = [7, 0, 6, 1, 5, 2, 4, 3];
-const PREFILL_CASES: [(usize, usize); 9] = [
+const PREFILL_CASES: [(usize, usize); 17] = [
     (32, 0),
     (64, 0),
     (128, 0),
     (1_024, 0),
     (32, 160),
+    (32, 8_160),
+    (32, 108_063),
+    (32, 144_968),
+    (32, 219_968),
     (64, 192),
+    (64, 8_128),
+    (64, 108_031),
+    (64, 144_936),
+    (64, 219_936),
     (128, 1),
     (128, 32_768),
     (1_024, 1_024),
@@ -118,10 +128,11 @@ impl PrefillSession {
             .map(|&(tokens, first_position)| tokens + first_position)
             .max()
             .expect("prefill benchmark inventory is nonempty");
+        let expected_pages = maximum_context.div_ceil(ATTENTION_PAGE_SIZE);
         let update = program.reserve_kv_slot_tokens(&stream, 0, maximum_context)?;
-        if update.first_entry() != 0 || update.entry_count() != 514 {
+        if update.first_entry() != 0 || update.entry_count() != expected_pages {
             return Err(DeviceBenchmarkError::Precondition(format!(
-                "resident prefill benchmark reserved {update:?}, expected pages 0..514"
+                "resident prefill benchmark reserved {update:?}, expected pages 0..{expected_pages}"
             )));
         }
         program.stage_embeddings(&stream, &prefill_token_ids())?;
@@ -1191,8 +1202,8 @@ fn benchmark_resident_profile(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_TOKENS, LONG_CONTEXT_TOKENS, MAX_BATCH, logical_bytes, prefill_logical_bytes,
-        resident_prefill_profile_manifest, resident_profile_manifest,
+        CONTEXT_TOKENS, LONG_CONTEXT_TOKENS, MAX_BATCH, PREFILL_CASES, logical_bytes,
+        prefill_logical_bytes, resident_prefill_profile_manifest, resident_profile_manifest,
     };
     use std::path::Path;
     use tuisko_engine::ResidentModelLayout;
@@ -1222,6 +1233,28 @@ mod tests {
 
     #[test]
     fn prefill_accounting_tracks_every_exact_causal_route() {
+        assert_eq!(
+            PREFILL_CASES,
+            [
+                (32, 0),
+                (64, 0),
+                (128, 0),
+                (1_024, 0),
+                (32, 160),
+                (32, 8_160),
+                (32, 108_063),
+                (32, 144_968),
+                (32, 219_968),
+                (64, 192),
+                (64, 8_128),
+                (64, 108_031),
+                (64, 144_936),
+                (64, 219_936),
+                (128, 1),
+                (128, 32_768),
+                (1_024, 1_024),
+            ]
+        );
         let routes = [
             prefill_logical_bytes(32, 0, None),
             prefill_logical_bytes(64, 0, None),
@@ -1233,6 +1266,14 @@ mod tests {
         assert!(routes[3] - weights > 8 * (routes[2] - weights));
         assert!(
             prefill_logical_bytes(128, 32_768, Some(16)) > prefill_logical_bytes(128, 1, Some(8))
+        );
+        assert!(
+            prefill_logical_bytes(32, 219_968, Some(16))
+                > prefill_logical_bytes(32, 8_160, Some(16))
+        );
+        assert!(
+            prefill_logical_bytes(64, 219_936, Some(16))
+                > prefill_logical_bytes(64, 8_128, Some(16))
         );
     }
 
