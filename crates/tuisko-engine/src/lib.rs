@@ -32,7 +32,7 @@ pub use common::text_generator::{
 pub use error::{EngineError, EngineErrorCode, EngineResult};
 pub use generation::{
     CancelledText, ChatGenerationRequest, FinishReason, GeneratedText, GenerationSession,
-    GenerationStep,
+    GenerationStep, PromptLogprobs, PromptTokenLogprob,
 };
 pub use layout::{EndpointLayout, LayerMemoryLayout, MAX_BATCH, StreamingResidencyAccounting};
 pub use paged_kv_slots::{PagedKvRoute, PagedKvSlotPool, PagedKvSlotState, PagedKvTableUpdate};

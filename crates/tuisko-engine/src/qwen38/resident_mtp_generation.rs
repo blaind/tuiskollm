@@ -586,7 +586,7 @@ pub(crate) fn prime_prompt_with_progress(
     Ok(native)
 }
 
-fn replay_target_token(
+pub(crate) fn replay_target_token(
     program: &mut ResidentMtpProgram,
     stream: &CudaStream,
     token: u32,
@@ -602,7 +602,7 @@ fn replay_target_token(
     program.target().replay(stream, route)
 }
 
-fn replay_prefill_tile(
+pub(crate) fn replay_prefill_tile(
     program: &mut ResidentMtpProgram,
     stream: &CudaStream,
     token_ids: &[u32],

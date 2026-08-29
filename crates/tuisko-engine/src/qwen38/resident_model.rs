@@ -2263,6 +2263,46 @@ impl ResidentModelProgram {
         )?)
     }
 
+    /// Projects a retained contiguous prefill-row window through the admitted B=1..8 LM head.
+    pub(crate) fn launch_prefill_lm_head_rows(
+        &self,
+        stream: &CudaStream,
+        first_row: usize,
+        rows: usize,
+        prefill_rows: usize,
+    ) -> EngineResult<()> {
+        require_batch(rows)?;
+        let end = first_row
+            .checked_add(rows)
+            .ok_or_else(|| EngineError::layout("prefill scoring row range overflows"))?;
+        if prefill_rows == 0 || end > prefill_rows {
+            return Err(EngineError::route(format!(
+                "prefill scoring rows {first_row}..{end} exceed retained T={prefill_rows}"
+            )));
+        }
+        let row_offset = product(
+            "prefill scoring normalized row offset",
+            first_row,
+            Qwen38_27B::HIDDEN,
+        )?;
+        let workspace = self._pointers.workspace;
+        // SAFETY: `launch_prefill_route` retains T final-normalized rows in this address-stable
+        // plane. The checked window selects at most one admitted B=1..8 LM-head route.
+        unsafe {
+            self._lm_head.launch(
+                stream,
+                rows,
+                workspace.mixer_normalized.add(row_offset),
+                workspace.activation_codes,
+                workspace.activation_scales,
+                self._pointers.endpoint.lm_head_codes,
+                self._pointers.endpoint.lm_head_scales,
+                workspace.logits,
+            )?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "qualification")]
     /// Reads every raw target residual row produced by one exact prefill route.
     pub fn qualification_prefill_residual(

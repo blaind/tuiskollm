@@ -7,7 +7,8 @@ use crate::response::{
 };
 use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
 use crate::{
-    ChatCompletionRequest, ChatRequestError, GenerationReply, PreparedChatRequest, openai_error,
+    ChatCompletionRequest, ChatRequestError, CompletionRequest, GenerationReply,
+    PreparedChatRequest, PreparedCompletionRequest, openai_error,
 };
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
@@ -28,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
 use tokio::sync::oneshot;
 use tuisko_engine::{
-    EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, ParkedQwen38Generator,
+    EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, ParkedQwen38Generator, PromptLogprobs,
     QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS, Qwen35ResidentMtpBatchGenerator,
     Qwen36ResidentBatchGenerator, Qwen38FlashNextMtpResidentGenerator, ResidentBatchAdmission,
     ResidentLoadPhase, ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentMtpGenerationStats,
@@ -108,8 +109,20 @@ struct ChatJob {
     log: RequestLog,
 }
 
+struct ScoreJob {
+    prompts: Vec<Vec<u32>>,
+    reply: oneshot::Sender<Result<Vec<PromptLogprobs>, ScoreFailure>>,
+}
+
+#[derive(Debug)]
+struct ScoreFailure {
+    code: Option<EngineErrorCode>,
+    message: String,
+}
+
 enum Job {
     Chat(Box<ChatJob>),
+    Score(ScoreJob),
     Admin(AdminJob),
 }
 
@@ -1189,6 +1202,7 @@ fn serve_requests<G: TextGenerator>(
         if generator.active_requests() == 0 && jobs_open {
             match jobs.blocking_recv() {
                 Some(Job::Chat(job)) => hold_job(&mut waiting, *job, &mut display),
+                Some(Job::Score(job)) => run_score_job(&mut generator, job),
                 Some(Job::Admin(job)) => {
                     let _ = job.reply.send(AdminReply::Failed(
                         "model lifecycle is unsupported for this exact target".into(),
@@ -1200,6 +1214,7 @@ fn serve_requests<G: TextGenerator>(
         while jobs_open && generator.active_requests() + waiting.len() < generator.slot_capacity() {
             match jobs.try_recv() {
                 Ok(Job::Chat(job)) => hold_job(&mut waiting, *job, &mut display),
+                Ok(Job::Score(job)) => reject_busy_score(job),
                 Ok(Job::Admin(job)) => {
                     let _ = job.reply.send(AdminReply::Failed(
                         "model lifecycle is unsupported for this exact target".into(),
@@ -1403,6 +1418,21 @@ fn serve_reloadable<G: ReloadableGenerator>(
                         fail_resume_queued(&mut jobs, &error);
                     }
                 },
+                Job::Score(job) => match G::resume(parked_owner) {
+                    Ok(mut loaded) => {
+                        *lifecycle.lock().expect("lifecycle mutex poisoned") =
+                            LifecycleState::Loaded;
+                        run_score_job(&mut loaded, job);
+                        generator = Some(loaded);
+                    }
+                    Err((owner, error)) => {
+                        parked = Some(owner);
+                        fail_score_job(job, None, error.clone());
+                        let mut state = lifecycle.lock().expect("lifecycle mutex poisoned");
+                        *state = LifecycleState::Parked;
+                        fail_resume_queued(&mut jobs, &error);
+                    }
+                },
             }
             continue;
         }
@@ -1423,6 +1453,10 @@ fn serve_reloadable<G: ReloadableGenerator>(
                     *lifecycle.lock().expect("lifecycle mutex poisoned") = LifecycleState::Loaded;
                     match job {
                         Job::Chat(job) => hold_job(&mut waiting, *job, &mut display),
+                        Job::Score(job) => {
+                            let loaded = generator.as_mut().expect("reload installed generator");
+                            run_score_job(loaded, job);
+                        }
                         Job::Admin(job) => {
                             debug_assert_eq!(job.kind, AdminKind::Load);
                             let _ = job.reply.send(AdminReply::Loaded {
@@ -1440,6 +1474,7 @@ fn serve_reloadable<G: ReloadableGenerator>(
                                 .try_send(GenerationReply::Unavailable(error.clone()));
                             job.log.finish(None, 0, 0, "error", Some(&error));
                         }
+                        Job::Score(job) => fail_score_job(job, None, error.clone()),
                         Job::Admin(job) => {
                             let _ = job.reply.send(AdminReply::Failed(error.clone()));
                         }
@@ -1457,6 +1492,7 @@ fn serve_reloadable<G: ReloadableGenerator>(
         {
             match jobs.blocking_recv() {
                 Some(Job::Chat(job)) => hold_job(&mut waiting, *job, &mut display),
+                Some(Job::Score(job)) => run_score_job(loaded, job),
                 Some(Job::Admin(job)) => held_admin = Some(job),
                 None => jobs_open = false,
             }
@@ -1467,6 +1503,7 @@ fn serve_reloadable<G: ReloadableGenerator>(
         {
             match jobs.try_recv() {
                 Ok(Job::Chat(job)) => hold_job(&mut waiting, *job, &mut display),
+                Ok(Job::Score(job)) => reject_busy_score(job),
                 Ok(Job::Admin(job)) => held_admin = Some(job),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -2134,6 +2171,28 @@ fn fail_all(replies: &mut HashMap<ResidentRequestId, ActiveReply>, message: Stri
     }
 }
 
+fn run_score_job<G: TextGenerator>(generator: &mut G, job: ScoreJob) {
+    let result = generator
+        .score_prompts(&job.prompts)
+        .map_err(|error| ScoreFailure {
+            code: error.code(),
+            message: error.to_string(),
+        });
+    let _ = job.reply.send(result);
+}
+
+fn reject_busy_score(job: ScoreJob) {
+    fail_score_job(
+        job,
+        Some(EngineErrorCode::Capacity),
+        "prompt scoring requires an idle resident scheduler".into(),
+    );
+}
+
+fn fail_score_job(job: ScoreJob, code: Option<EngineErrorCode>, message: String) {
+    let _ = job.reply.send(Err(ScoreFailure { code, message }));
+}
+
 fn fail_queued(jobs: &mut Receiver<Job>, message: &str) {
     while let Ok(job) = jobs.try_recv() {
         match job {
@@ -2143,6 +2202,7 @@ fn fail_queued(jobs: &mut Receiver<Job>, message: &str) {
                     .try_send(GenerationReply::Failed(message.to_owned()));
                 job.log.finish(None, 0, 0, "error", Some(message));
             }
+            Job::Score(job) => fail_score_job(job, None, message.to_owned()),
             Job::Admin(job) => {
                 let _ = job.reply.send(AdminReply::Failed(message.to_owned()));
             }
@@ -2159,6 +2219,7 @@ fn fail_load_queued(jobs: &mut Receiver<Job>, message: &str) {
                     .try_send(GenerationReply::Unavailable(message.to_owned()));
                 job.log.finish(None, 0, 0, "error", Some(message));
             }
+            Job::Score(job) => fail_score_job(job, None, message.to_owned()),
             Job::Admin(job) => {
                 let _ = job.reply.send(AdminReply::Failed(message.to_owned()));
             }
@@ -2175,6 +2236,7 @@ fn fail_resume_queued(jobs: &mut Receiver<Job>, message: &str) {
                     .try_send(GenerationReply::ResumeUnavailable(message.to_owned()));
                 job.log.finish(None, 0, 0, "error", Some(message));
             }
+            Job::Score(job) => fail_score_job(job, None, message.to_owned()),
             Job::Admin(job) => {
                 let _ = job.reply.send(AdminReply::Failed(message.to_owned()));
             }
@@ -2191,6 +2253,7 @@ fn router(state: AppState) -> Router {
         .route("/v1/load", post(load))
         .route("/v1/park", post(park))
         .route("/v1/resume", post(resume))
+        .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         .with_state(state)
@@ -2545,6 +2608,133 @@ async fn chat_completions(
     }
 }
 
+async fn completions(
+    State(state): State<AppState>,
+    payload: Result<Json<CompletionRequest>, JsonRejection>,
+) -> Response {
+    let request = match payload {
+        Ok(Json(request)) => request,
+        Err(error) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                error.body_text(),
+                "invalid_request_error",
+            );
+        }
+    };
+    let PreparedCompletionRequest { prompts } = match request.prepare_for(state.model_id) {
+        Ok(request) => request,
+        Err(ChatRequestError::ModelNotFound { requested }) => {
+            return openai_error(
+                StatusCode::NOT_FOUND,
+                format!("model `{requested}` is not served by this process"),
+                "model_not_found",
+            );
+        }
+        Err(error) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                "invalid_request_error",
+            );
+        }
+    };
+    let numeric_id = state.request_ids.fetch_add(1, Ordering::Relaxed);
+    let (reply, receiver) = oneshot::channel();
+    if let Err(error) = enqueue_score_job(&state, ScoreJob { prompts, reply }) {
+        return enqueue_error_response(error);
+    }
+    match receiver.await {
+        Ok(Ok(scores)) => completion_logprob_response(
+            scores,
+            completion_score_id(state.response_namespace, numeric_id),
+            state.model_id,
+        ),
+        Ok(Err(error)) if error.code == Some(EngineErrorCode::Capacity) => {
+            overloaded_response(error.message)
+        }
+        Ok(Err(error)) if error.code.is_some() => openai_error(
+            StatusCode::BAD_REQUEST,
+            error.message,
+            "invalid_request_error",
+        ),
+        Ok(Err(error)) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.message,
+            "server_error",
+        ),
+        Err(_) => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "resident engine worker disconnected".into(),
+            "server_error",
+        ),
+    }
+}
+
+fn completion_logprob_response(
+    scores: Vec<PromptLogprobs>,
+    id: String,
+    model_id: &'static str,
+) -> Response {
+    let prompt_tokens = scores
+        .iter()
+        .map(|score| score.prompt_token_ids.len())
+        .sum::<usize>();
+    let completion_tokens = scores.len();
+    let choices = scores
+        .into_iter()
+        .enumerate()
+        .map(|(index, score)| {
+            let mut token_logprobs = score
+                .prompt
+                .iter()
+                .map(|score| score.as_ref().map(|score| score.logprob))
+                .collect::<Vec<_>>();
+            token_logprobs.push(Some(score.completion.logprob));
+            let mut top_logprobs = score
+                .prompt
+                .iter()
+                .map(|score| score.as_ref().map(top_logprob_json))
+                .collect::<Vec<_>>();
+            top_logprobs.push(Some(top_logprob_json(&score.completion)));
+            json!({
+                "index": index,
+                "text": score.echoed_text,
+                "finish_reason": "length",
+                "logprobs": {
+                    "tokens": score.token_text,
+                    "token_logprobs": token_logprobs,
+                    "top_logprobs": top_logprobs,
+                    "text_offset": vec![0usize; score.prompt_token_ids.len() + 1],
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Json(json!({
+        "id": id,
+        "object": "text_completion",
+        "created": created,
+        "model": model_id,
+        "choices": choices,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+    }))
+    .into_response()
+}
+
+fn top_logprob_json(score: &tuisko_engine::PromptTokenLogprob) -> Value {
+    let mut top = serde_json::Map::new();
+    top.insert(score.top_token_id.to_string(), json!(score.top_logprob));
+    Value::Object(top)
+}
+
 fn new_response_namespace() -> Result<u128, getrandom::Error> {
     let mut bytes = [0u8; size_of::<u128>()];
     getrandom::fill(&mut bytes)?;
@@ -2553,6 +2743,10 @@ fn new_response_namespace() -> Result<u128, getrandom::Error> {
 
 fn completion_id(namespace: u128, numeric_id: u64) -> String {
     format!("chatcmpl-tuisko-{namespace:032x}-{numeric_id:016x}")
+}
+
+fn completion_score_id(namespace: u128, numeric_id: u64) -> String {
+    format!("cmpl-tuisko-{namespace:032x}-{numeric_id:016x}")
 }
 
 fn enqueue_chat_job(state: &AppState, job: ChatJob) -> Result<(), EnqueueError> {
@@ -2611,6 +2805,55 @@ fn enqueue_chat_job(state: &AppState, job: ChatJob) -> Result<(), EnqueueError> 
         Err(TrySendError::Full(Job::Admin(_)) | TrySendError::Closed(Job::Admin(_))) => {
             unreachable!("chat enqueue constructed an admin job")
         }
+        Err(TrySendError::Full(Job::Score(_)) | TrySendError::Closed(Job::Score(_))) => {
+            unreachable!("chat enqueue constructed a scoring job")
+        }
+    }
+}
+
+fn enqueue_score_job(state: &AppState, job: ScoreJob) -> Result<(), EnqueueError> {
+    let mut lifecycle = state.lifecycle.lock().expect("lifecycle mutex poisoned");
+    let rollback = if state.lifecycle_supported {
+        match *lifecycle {
+            LifecycleState::Unloaded => {
+                *lifecycle = LifecycleState::Loading;
+                Some(LifecycleState::Unloaded)
+            }
+            LifecycleState::Parked => {
+                *lifecycle = LifecycleState::Resuming;
+                Some(LifecycleState::Parked)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if state.lifecycle_supported
+        && !matches!(
+            *lifecycle,
+            LifecycleState::Loaded | LifecycleState::Loading | LifecycleState::Resuming
+        )
+    {
+        return Err(EnqueueError::Transition(*lifecycle));
+    }
+    match state.jobs.try_send(Job::Score(job)) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(Job::Score(_))) => {
+            if let Some(previous) = rollback {
+                *lifecycle = previous;
+            }
+            Err(EnqueueError::Full)
+        }
+        Err(TrySendError::Closed(Job::Score(_))) => {
+            if let Some(previous) = rollback {
+                *lifecycle = previous;
+            }
+            Err(EnqueueError::Closed)
+        }
+        Err(
+            TrySendError::Full(Job::Chat(_) | Job::Admin(_))
+            | TrySendError::Closed(Job::Chat(_) | Job::Admin(_)),
+        ) => unreachable!("score enqueue constructed another job kind"),
     }
 }
 
@@ -2642,10 +2885,10 @@ mod tests {
     use super::{
         AppState, ChatJob, ClientStatus, EnqueueError, InferencePhase, InferenceProgress, Job,
         LifecycleState, QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, Ready, ServerConfig,
-        ServerError, ServerModel, chat_completions, completion_id, enqueue_chat_job, fail_queued,
-        health, load, models, readiness, record_admission, render_forced_shutdown,
-        render_inference_progress, render_load_progress, render_loading, render_shutdown,
-        render_startup, render_weight_progress, router, run, serve_reloadable,
+        ServerError, ServerModel, chat_completions, completion_id, completion_logprob_response,
+        enqueue_chat_job, fail_queued, health, load, models, readiness, record_admission,
+        render_forced_shutdown, render_inference_progress, render_load_progress, render_loading,
+        render_shutdown, render_startup, render_weight_progress, router, run, serve_reloadable,
         serve_until_worker_failure, serve_until_worker_failure_or_shutdown,
         try_send_generation_steps, unload,
     };
@@ -2668,14 +2911,62 @@ mod tests {
     use tokio::sync::mpsc::channel;
     use tuisko_engine::{
         ChatGenerationRequest, EngineError, EngineErrorCode, FinishReason, GeneratedText,
-        GenerationStep, MAX_BATCH, QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS, ResidentBatchAdmission,
-        ResidentCancellation, ResidentLoadPhase, ResidentMtpGenerationStats, ResidentRequestId,
+        GenerationStep, MAX_BATCH, PromptLogprobs, PromptTokenLogprob,
+        QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS, ResidentBatchAdmission, ResidentCancellation,
+        ResidentLoadPhase, ResidentMtpGenerationStats, ResidentRequestId,
     };
     use tuisko_frontend::{ChatMessage, GenerationDefaults};
     use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext};
 
     fn runtime() -> tokio::runtime::Runtime {
         Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    #[test]
+    fn completion_logprob_response_matches_the_lm_eval_parser_shape() {
+        let response = completion_logprob_response(
+            vec![PromptLogprobs {
+                prompt_token_ids: vec![11, 12],
+                prompt: vec![
+                    None,
+                    Some(PromptTokenLogprob {
+                        token_id: 12,
+                        logprob: -2.0,
+                        top_token_id: 7,
+                        top_logprob: -0.25,
+                    }),
+                ],
+                completion: PromptTokenLogprob {
+                    token_id: 7,
+                    logprob: -0.25,
+                    top_token_id: 7,
+                    top_logprob: -0.25,
+                },
+                echoed_text: "echo".into(),
+                token_text: vec!["a".into(), "b".into(), "c".into()],
+            }],
+            "cmpl-fixture".into(),
+            SERVED_MODEL,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = runtime()
+            .block_on(to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body["object"], "text_completion");
+        assert_eq!(
+            body["choices"][0]["logprobs"]["token_logprobs"][0],
+            Value::Null
+        );
+        assert_eq!(body["choices"][0]["logprobs"]["token_logprobs"][1], -2.0);
+        assert_eq!(body["choices"][0]["logprobs"]["token_logprobs"][2], -0.25);
+        assert_eq!(
+            body["choices"][0]["logprobs"]["top_logprobs"][1]["7"],
+            -0.25
+        );
+        assert_eq!(body["usage"]["prompt_tokens"], 2);
+        assert_eq!(body["usage"]["completion_tokens"], 1);
     }
 
     fn job() -> (ChatJob, tokio::sync::mpsc::Receiver<GenerationReply>) {
