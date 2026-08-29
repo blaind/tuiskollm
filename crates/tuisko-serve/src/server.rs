@@ -1,7 +1,7 @@
 //! Concrete HTTP server and resident scheduler worker.
 
 use crate::request_log::RequestLog;
-use crate::response::overloaded_response;
+use crate::response::{overloaded_response, resume_unavailable_response, unavailable_response};
 use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
 use crate::{
     ChatCompletionRequest, ChatRequestError, GenerationReply, PreparedChatRequest,
@@ -9,7 +9,7 @@ use crate::{
 };
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header::AUTHORIZATION, header::RETRY_AFTER};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -20,15 +20,15 @@ use std::io::{IsTerminal, Write as IoWrite};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc as std_mpsc};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
 use tokio::sync::oneshot;
 use tuisko_engine::{
-    EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS,
-    Qwen35ResidentMtpBatchGenerator, Qwen36ResidentBatchGenerator,
-    Qwen38FlashNextMtpResidentGenerator, ResidentBatchAdmission, ResidentLoadPhase,
-    ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentRequestId,
+    EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, ParkedQwen38Generator,
+    QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS, Qwen35ResidentMtpBatchGenerator,
+    Qwen36ResidentBatchGenerator, Qwen38FlashNextMtpResidentGenerator, ResidentBatchAdmission,
+    ResidentLoadPhase, ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentRequestId,
 };
 use tuisko_frontend::GenerationDefaults;
 use tuisko_model::{
@@ -55,6 +55,8 @@ pub struct ServerConfig {
     pub snapshot: PathBuf,
     /// TCP address on which the OpenAI routes listen.
     pub address: SocketAddr,
+    /// Environment variable containing the lifecycle-route bearer token.
+    pub admin_token_env: Option<String>,
 }
 
 /// Startup or listener failure from the concrete server.
@@ -72,6 +74,9 @@ pub enum ServerError {
     /// Resident worker loop stopped after startup; serving would leave a zombie listener.
     #[error("resident engine worker failed: {0}")]
     WorkerFailed(String),
+    /// Unsafe or incomplete administrative listener configuration.
+    #[error("invalid server configuration: {0}")]
+    Configuration(String),
 }
 
 #[derive(Clone)]
@@ -79,7 +84,10 @@ struct AppState {
     jobs: Sender<Job>,
     request_ids: Arc<AtomicU64>,
     response_namespace: u128,
-    worker_ready: Arc<AtomicBool>,
+    worker_alive: Arc<AtomicBool>,
+    lifecycle: Arc<Mutex<LifecycleState>>,
+    lifecycle_supported: bool,
+    admin_token: Option<Arc<str>>,
     server_started: Instant,
     model_id: &'static str,
     generation_route: &'static str,
@@ -87,10 +95,78 @@ struct AppState {
     reasoning_effort: Option<&'static str>,
 }
 
-struct Job {
+struct ChatJob {
     request: tuisko_engine::ChatGenerationRequest,
     reply: Sender<GenerationReply>,
     log: RequestLog,
+}
+
+enum Job {
+    Chat(Box<ChatJob>),
+    Admin(AdminJob),
+}
+
+struct AdminJob {
+    kind: AdminKind,
+    reply: std_mpsc::SyncSender<AdminReply>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdminKind {
+    Unload,
+    Load,
+    Park,
+    Resume,
+}
+
+#[derive(Debug)]
+enum AdminReply {
+    Unloaded {
+        was_loaded: bool,
+        was_parked: bool,
+        device_bytes: usize,
+    },
+    Loaded {
+        reloaded: bool,
+        load_ms: u128,
+    },
+    Parked {
+        host_bytes: usize,
+        device_bytes: usize,
+        park_ms: u128,
+    },
+    Resumed {
+        resumed: bool,
+        restore_ms: u128,
+    },
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleState {
+    Loaded,
+    Parked,
+    Unloaded,
+    Loading,
+    Unloading,
+    Parking,
+    Resuming,
+    Dead,
+}
+
+impl LifecycleState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Parked => "parked",
+            Self::Unloaded => "unloaded",
+            Self::Loading => "loading",
+            Self::Unloading => "unloading",
+            Self::Parking => "parking",
+            Self::Resuming => "resuming",
+            Self::Dead => "dead",
+        }
+    }
 }
 
 struct ActiveReply {
@@ -103,6 +179,7 @@ struct ActiveReply {
 enum EnqueueError {
     Full,
     Closed,
+    Transition(LifecycleState),
 }
 
 struct Ready {
@@ -123,6 +200,49 @@ struct Ready {
     slot_capacity: usize,
     context_capacity: usize,
     detailed_load_timing: bool,
+}
+
+struct WorkerControl {
+    alive: Arc<AtomicBool>,
+    lifecycle: Arc<Mutex<LifecycleState>>,
+    progress: Arc<ResidentLoadProgress>,
+}
+
+trait ReloadableGenerator: TextGenerator + Sized {
+    type Parked;
+
+    fn device_owner_bytes(&self) -> usize;
+    fn park(self) -> Result<(Self::Parked, usize, usize), (Self, String)>;
+    fn resume(parked: Self::Parked) -> Result<Self, (Self::Parked, String)>;
+    fn parked_ownership(parked: &Self::Parked) -> (usize, usize, usize);
+}
+
+impl ReloadableGenerator for ResidentMtpBatchGenerator {
+    type Parked = ParkedQwen38Generator;
+
+    fn device_owner_bytes(&self) -> usize {
+        ResidentMtpBatchGenerator::device_owner_bytes(self)
+    }
+
+    fn park(self) -> Result<(Self::Parked, usize, usize), (Self, String)> {
+        ResidentMtpBatchGenerator::park(self)
+            .map(|(parked, stats)| (parked, stats.host_bytes, stats.released_device_bytes))
+            .map_err(|(generator, error)| (generator, error.to_string()))
+    }
+
+    fn resume(parked: Self::Parked) -> Result<Self, (Self::Parked, String)> {
+        parked
+            .resume()
+            .map_err(|(parked, error)| (parked, error.to_string()))
+    }
+
+    fn parked_ownership(parked: &Self::Parked) -> (usize, usize, usize) {
+        (
+            parked.host_bytes(),
+            parked.released_device_bytes(),
+            parked.remaining_device_bytes(),
+        )
+    }
 }
 
 /// Exact model loaders compiled into the server.
@@ -198,6 +318,19 @@ impl std::str::FromStr for ServerModel {
 
 /// Loads the exact resident model, then serves health, model, blocking, and SSE routes.
 pub fn run(config: ServerConfig) -> Result<(), ServerError> {
+    let admin_token = match config.admin_token_env.as_deref() {
+        Some(variable) => Some(std::env::var(variable).map_err(|_| {
+            ServerError::Configuration(format!(
+                "admin token environment variable `{variable}` is unset or not Unicode"
+            ))
+        })?),
+        None if config.address.ip().is_loopback() => None,
+        None => {
+            return Err(ServerError::Configuration(
+                "a non-loopback listener requires --admin-token-env".into(),
+            ));
+        }
+    };
     let startup_start = Instant::now();
     let target = config.model;
     let response_namespace = new_response_namespace().map_err(|error| {
@@ -220,6 +353,7 @@ pub fn run(config: ServerConfig) -> Result<(), ServerError> {
             color,
             startup_start,
             response_namespace,
+            admin_token,
         )?
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -256,14 +390,17 @@ fn start_worker(
     color: bool,
     server_started: Instant,
     response_namespace: u128,
+    admin_token: Option<String>,
 ) -> Result<(AppState, Ready, oneshot::Receiver<String>), ServerError> {
     let (jobs_tx, jobs_rx) = channel(MAX_BATCH);
     let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
     let (failure_tx, failure_rx) = oneshot::channel();
-    let worker_ready = Arc::new(AtomicBool::new(false));
+    let worker_alive = Arc::new(AtomicBool::new(false));
+    let lifecycle = Arc::new(Mutex::new(LifecycleState::Loading));
     let progress = Arc::new(ResidentLoadProgress::new());
     let snapshot = snapshot.to_owned();
-    let worker_ready_clone = Arc::clone(&worker_ready);
+    let worker_alive_clone = Arc::clone(&worker_alive);
+    let worker_lifecycle = Arc::clone(&lifecycle);
     let worker_progress = Arc::clone(&progress);
     std::thread::Builder::new()
         .name("tuiskollm-engine".into())
@@ -274,8 +411,11 @@ fn start_worker(
                 jobs_rx,
                 ready_tx,
                 failure_tx,
-                worker_ready_clone,
-                worker_progress,
+                WorkerControl {
+                    alive: worker_alive_clone,
+                    lifecycle: worker_lifecycle,
+                    progress: worker_progress,
+                },
             )
         })?;
     let mut displayed = None;
@@ -314,7 +454,10 @@ fn start_worker(
             jobs: jobs_tx,
             request_ids: Arc::new(AtomicU64::new(1)),
             response_namespace,
-            worker_ready,
+            worker_alive,
+            lifecycle,
+            lifecycle_supported: target == ServerModel::Qwen38,
+            admin_token: admin_token.map(Arc::from),
             server_started,
             model_id: ready.model_id,
             generation_route: ready.generation_route,
@@ -331,36 +474,55 @@ fn engine_worker(
     jobs: Receiver<Job>,
     ready: std_mpsc::SyncSender<Result<Ready, String>>,
     failure: oneshot::Sender<String>,
-    worker_ready: Arc<AtomicBool>,
-    progress: Arc<ResidentLoadProgress>,
+    control: WorkerControl,
 ) {
-    struct ReadinessGuard(Arc<AtomicBool>);
+    struct ReadinessGuard {
+        alive: Arc<AtomicBool>,
+        lifecycle: Arc<Mutex<LifecycleState>>,
+    }
     impl Drop for ReadinessGuard {
         fn drop(&mut self) {
-            self.0.store(false, Ordering::Release);
+            self.alive.store(false, Ordering::Release);
+            *self.lifecycle.lock().expect("lifecycle mutex poisoned") = LifecycleState::Dead;
         }
     }
-    let _readiness_guard = ReadinessGuard(Arc::clone(&worker_ready));
+    let _readiness_guard = ReadinessGuard {
+        alive: Arc::clone(&control.alive),
+        lifecycle: Arc::clone(&control.lifecycle),
+    };
     match target {
-        ServerModel::Qwen38 => start_generator(
-            load_qwen38(&snapshot, progress.as_ref()),
+        ServerModel::Qwen38 => start_reloadable_qwen38(
+            snapshot,
+            control.progress,
             jobs,
             ready,
             failure,
-            &worker_ready,
+            &control.alive,
+            control.lifecycle,
         ),
-        ServerModel::Qwen35 => {
-            start_generator(load_qwen35(&snapshot), jobs, ready, failure, &worker_ready)
-        }
-        ServerModel::Qwen36 => {
-            start_generator(load_qwen36(&snapshot), jobs, ready, failure, &worker_ready)
-        }
-        ServerModel::Qwen38FlashNext => start_generator(
-            load_qwen38_flash_next(&snapshot, progress.as_ref()),
+        ServerModel::Qwen35 => start_generator(
+            load_qwen35(&snapshot),
             jobs,
             ready,
             failure,
-            &worker_ready,
+            &control.alive,
+            &control.lifecycle,
+        ),
+        ServerModel::Qwen36 => start_generator(
+            load_qwen36(&snapshot),
+            jobs,
+            ready,
+            failure,
+            &control.alive,
+            &control.lifecycle,
+        ),
+        ServerModel::Qwen38FlashNext => start_generator(
+            load_qwen38_flash_next(&snapshot, control.progress.as_ref()),
+            jobs,
+            ready,
+            failure,
+            &control.alive,
+            &control.lifecycle,
         ),
     }
 }
@@ -546,7 +708,8 @@ fn start_generator<G: TextGenerator>(
     jobs: Receiver<Job>,
     ready: std_mpsc::SyncSender<Result<Ready, String>>,
     failure: oneshot::Sender<String>,
-    worker_ready: &AtomicBool,
+    worker_alive: &AtomicBool,
+    lifecycle: &Mutex<LifecycleState>,
 ) {
     let (generator, startup) = match loaded {
         Ok(loaded) => loaded,
@@ -555,12 +718,40 @@ fn start_generator<G: TextGenerator>(
             return;
         }
     };
-    worker_ready.store(true, Ordering::Release);
+    *lifecycle.lock().expect("lifecycle mutex poisoned") = LifecycleState::Loaded;
+    worker_alive.store(true, Ordering::Release);
     if ready.send(Ok(startup)).is_err() {
         return;
     }
 
     serve_requests(generator, jobs, failure);
+}
+
+fn start_reloadable_qwen38(
+    snapshot: PathBuf,
+    progress: Arc<ResidentLoadProgress>,
+    jobs: Receiver<Job>,
+    ready: std_mpsc::SyncSender<Result<Ready, String>>,
+    failure: oneshot::Sender<String>,
+    worker_alive: &AtomicBool,
+    lifecycle: Arc<Mutex<LifecycleState>>,
+) {
+    let (generator, startup) = match load_qwen38(&snapshot, progress.as_ref()) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    *lifecycle.lock().expect("lifecycle mutex poisoned") = LifecycleState::Loaded;
+    worker_alive.store(true, Ordering::Release);
+    if ready.send(Ok(startup)).is_err() {
+        return;
+    }
+
+    serve_reloadable(generator, jobs, failure, lifecycle, move || {
+        reload_qwen38(&snapshot).map(|(generator, _)| generator)
+    });
 }
 
 /// One resident scheduler round loop, identical for every admitted target.
@@ -583,13 +774,23 @@ fn serve_requests<G: TextGenerator>(
 
         if generator.active_requests() == 0 && jobs_open {
             match jobs.blocking_recv() {
-                Some(job) => hold_job(&mut waiting, job),
+                Some(Job::Chat(job)) => hold_job(&mut waiting, *job),
+                Some(Job::Admin(job)) => {
+                    let _ = job.reply.send(AdminReply::Failed(
+                        "model lifecycle is unsupported for this exact target".into(),
+                    ));
+                }
                 None => jobs_open = false,
             }
         }
         while jobs_open && generator.active_requests() + waiting.len() < generator.slot_capacity() {
             match jobs.try_recv() {
-                Ok(job) => hold_job(&mut waiting, job),
+                Ok(Job::Chat(job)) => hold_job(&mut waiting, *job),
+                Ok(Job::Admin(job)) => {
+                    let _ = job.reply.send(AdminReply::Failed(
+                        "model lifecycle is unsupported for this exact target".into(),
+                    ));
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     jobs_open = false;
@@ -631,6 +832,297 @@ fn serve_requests<G: TextGenerator>(
             });
             if failed && let Some(reply) = replies.get_mut(&request_id) {
                 // The active log remains owned until cancellation or completion.
+                reply.sender = None;
+            }
+            if let Some(output) = event.completed()
+                && let Some(mut reply) = replies.remove(&request_id)
+            {
+                if let Some(sender) = reply.sender.take() {
+                    let _ = sender.try_send(GenerationReply::Done {
+                        output: output.clone(),
+                        cached_prompt_tokens: reply.cached_prompt_tokens,
+                    });
+                }
+                reply.log.finish(
+                    Some(&output.prompt),
+                    output.token_ids.len(),
+                    reply.cached_prompt_tokens,
+                    output.finish_reason.as_str(),
+                    None,
+                );
+            }
+        }
+    }
+}
+
+fn serve_reloadable<G: ReloadableGenerator>(
+    generator: G,
+    mut jobs: Receiver<Job>,
+    failure: oneshot::Sender<String>,
+    lifecycle: Arc<Mutex<LifecycleState>>,
+    mut reload: impl FnMut() -> Result<G, String>,
+) {
+    let mut generator = Some(generator);
+    let mut parked = None;
+    let mut replies = HashMap::new();
+    let mut waiting = Vec::new();
+    let mut held_admin = None;
+    let mut jobs_open = true;
+
+    loop {
+        if let Some(loaded) = generator.as_mut()
+            && let Err(error) = cancel_disconnected(loaded, &mut replies)
+        {
+            fail_all(&mut replies, error.clone());
+            jobs.close();
+            fail_queued(&mut jobs, &error);
+            let _ = failure.send(error);
+            break;
+        }
+
+        if let Some(parked_owner) = parked.take() {
+            let job = if jobs_open {
+                match jobs.blocking_recv() {
+                    Some(job) => job,
+                    None => break,
+                }
+            } else {
+                break;
+            };
+            match job {
+                Job::Admin(admin) => match admin.kind {
+                    AdminKind::Resume => {
+                        let started = Instant::now();
+                        match G::resume(parked_owner) {
+                            Ok(loaded) => {
+                                generator = Some(loaded);
+                                *lifecycle.lock().expect("lifecycle mutex poisoned") =
+                                    LifecycleState::Loaded;
+                                let _ = admin.reply.send(AdminReply::Resumed {
+                                    resumed: true,
+                                    restore_ms: started.elapsed().as_millis(),
+                                });
+                            }
+                            Err((owner, error)) => {
+                                parked = Some(owner);
+                                {
+                                    let mut state =
+                                        lifecycle.lock().expect("lifecycle mutex poisoned");
+                                    *state = LifecycleState::Parked;
+                                    fail_resume_queued(&mut jobs, &error);
+                                }
+                                let _ = admin.reply.send(AdminReply::Failed(error));
+                            }
+                        }
+                    }
+                    AdminKind::Unload => {
+                        let (_, _, remaining_device_bytes) = G::parked_ownership(&parked_owner);
+                        drop(parked_owner);
+                        *lifecycle.lock().expect("lifecycle mutex poisoned") =
+                            LifecycleState::Unloaded;
+                        let _ = admin.reply.send(AdminReply::Unloaded {
+                            was_loaded: false,
+                            was_parked: true,
+                            device_bytes: remaining_device_bytes,
+                        });
+                    }
+                    AdminKind::Park => {
+                        let (host_bytes, device_bytes, _) = G::parked_ownership(&parked_owner);
+                        parked = Some(parked_owner);
+                        *lifecycle.lock().expect("lifecycle mutex poisoned") =
+                            LifecycleState::Parked;
+                        let _ = admin.reply.send(AdminReply::Parked {
+                            host_bytes,
+                            device_bytes,
+                            park_ms: 0,
+                        });
+                    }
+                    AdminKind::Load => {
+                        parked = Some(parked_owner);
+                        *lifecycle.lock().expect("lifecycle mutex poisoned") =
+                            LifecycleState::Parked;
+                        let _ = admin.reply.send(AdminReply::Failed(
+                            "parked model must be resumed or unloaded".into(),
+                        ));
+                    }
+                },
+                Job::Chat(job) => match G::resume(parked_owner) {
+                    Ok(loaded) => {
+                        generator = Some(loaded);
+                        *lifecycle.lock().expect("lifecycle mutex poisoned") =
+                            LifecycleState::Loaded;
+                        hold_job(&mut waiting, *job);
+                    }
+                    Err((owner, error)) => {
+                        parked = Some(owner);
+                        let _ = job
+                            .reply
+                            .try_send(GenerationReply::ResumeUnavailable(error.clone()));
+                        job.log.finish(None, 0, 0, "error", Some(&error));
+                        let mut state = lifecycle.lock().expect("lifecycle mutex poisoned");
+                        *state = LifecycleState::Parked;
+                        fail_resume_queued(&mut jobs, &error);
+                    }
+                },
+            }
+            continue;
+        }
+
+        if generator.is_none() {
+            let job = if jobs_open {
+                match jobs.blocking_recv() {
+                    Some(job) => job,
+                    None => break,
+                }
+            } else {
+                break;
+            };
+            let started = Instant::now();
+            match reload() {
+                Ok(loaded) => {
+                    generator = Some(loaded);
+                    *lifecycle.lock().expect("lifecycle mutex poisoned") = LifecycleState::Loaded;
+                    match job {
+                        Job::Chat(job) => hold_job(&mut waiting, *job),
+                        Job::Admin(job) => {
+                            debug_assert_eq!(job.kind, AdminKind::Load);
+                            let _ = job.reply.send(AdminReply::Loaded {
+                                reloaded: true,
+                                load_ms: started.elapsed().as_millis(),
+                            });
+                        }
+                    }
+                }
+                Err(error) => {
+                    match job {
+                        Job::Chat(job) => {
+                            let _ = job
+                                .reply
+                                .try_send(GenerationReply::Unavailable(error.clone()));
+                            job.log.finish(None, 0, 0, "error", Some(&error));
+                        }
+                        Job::Admin(job) => {
+                            let _ = job.reply.send(AdminReply::Failed(error.clone()));
+                        }
+                    }
+                    let mut state = lifecycle.lock().expect("lifecycle mutex poisoned");
+                    *state = LifecycleState::Unloaded;
+                    fail_load_queued(&mut jobs, &error);
+                }
+            }
+            continue;
+        }
+
+        let loaded = generator.as_mut().expect("loaded state owns a generator");
+        if loaded.active_requests() == 0 && waiting.is_empty() && held_admin.is_none() && jobs_open
+        {
+            match jobs.blocking_recv() {
+                Some(Job::Chat(job)) => hold_job(&mut waiting, *job),
+                Some(Job::Admin(job)) => held_admin = Some(job),
+                None => jobs_open = false,
+            }
+        }
+        while jobs_open
+            && held_admin.is_none()
+            && loaded.active_requests() + waiting.len() < loaded.slot_capacity()
+        {
+            match jobs.try_recv() {
+                Ok(Job::Chat(job)) => hold_job(&mut waiting, *job),
+                Ok(Job::Admin(job)) => held_admin = Some(job),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    jobs_open = false;
+                    break;
+                }
+            }
+        }
+        if !waiting.is_empty() {
+            admit_group(loaded, &mut replies, &mut waiting);
+        }
+        if loaded.active_requests() == 0 {
+            if let Some(admin) = held_admin.take() {
+                match admin.kind {
+                    AdminKind::Unload => {
+                        let device_bytes = loaded.device_owner_bytes();
+                        drop(generator.take());
+                        *lifecycle.lock().expect("lifecycle mutex poisoned") =
+                            LifecycleState::Unloaded;
+                        let _ = admin.reply.send(AdminReply::Unloaded {
+                            was_loaded: true,
+                            was_parked: false,
+                            device_bytes,
+                        });
+                    }
+                    AdminKind::Load => {
+                        *lifecycle.lock().expect("lifecycle mutex poisoned") =
+                            LifecycleState::Loaded;
+                        let _ = admin.reply.send(AdminReply::Loaded {
+                            reloaded: false,
+                            load_ms: 0,
+                        });
+                    }
+                    AdminKind::Park => {
+                        let started = Instant::now();
+                        let owner = generator.take().expect("loaded state owns a generator");
+                        match G::park(owner) {
+                            Ok((owner, host_bytes, device_bytes)) => {
+                                parked = Some(owner);
+                                *lifecycle.lock().expect("lifecycle mutex poisoned") =
+                                    LifecycleState::Parked;
+                                let _ = admin.reply.send(AdminReply::Parked {
+                                    host_bytes,
+                                    device_bytes,
+                                    park_ms: started.elapsed().as_millis(),
+                                });
+                            }
+                            Err((owner, error)) => {
+                                generator = Some(owner);
+                                *lifecycle.lock().expect("lifecycle mutex poisoned") =
+                                    LifecycleState::Loaded;
+                                let _ = admin.reply.send(AdminReply::Failed(error));
+                            }
+                        }
+                    }
+                    AdminKind::Resume => {
+                        *lifecycle.lock().expect("lifecycle mutex poisoned") =
+                            LifecycleState::Loaded;
+                        let _ = admin.reply.send(AdminReply::Resumed {
+                            resumed: false,
+                            restore_ms: 0,
+                        });
+                    }
+                }
+                continue;
+            }
+            if jobs_open {
+                continue;
+            }
+            break;
+        }
+
+        let events = match loaded.step() {
+            Ok(events) => events,
+            Err(error) => {
+                let error = error.to_string();
+                fail_all(&mut replies, error.clone());
+                jobs.close();
+                fail_queued(&mut jobs, &error);
+                let _ = failure.send(error);
+                break;
+            }
+        };
+        for event in events.iter() {
+            let request_id = event.request_id();
+            let failed = replies.get_mut(&request_id).is_some_and(|reply| {
+                if event.steps().any(|step| step.delta.is_some()) {
+                    reply.log.observe_output();
+                }
+                reply
+                    .sender
+                    .as_ref()
+                    .is_none_or(|sender| !try_send_generation_steps(sender, event.steps()))
+            });
+            if failed && let Some(reply) = replies.get_mut(&request_id) {
                 reply.sender = None;
             }
             if let Some(output) = event.completed()
@@ -808,7 +1300,7 @@ fn mebibytes(bytes: usize) -> f64 {
     bytes as f64 / (1_u64 << 20) as f64
 }
 
-fn hold_job(waiting: &mut Vec<Job>, job: Job) {
+fn hold_job(waiting: &mut Vec<ChatJob>, job: ChatJob) {
     if job.reply.is_closed() {
         job.log.finish(None, 0, 0, "cancelled", None);
         return;
@@ -819,7 +1311,7 @@ fn hold_job(waiting: &mut Vec<Job>, job: Job) {
 fn admit_group<G: TextGenerator>(
     generator: &mut G,
     replies: &mut HashMap<ResidentRequestId, ActiveReply>,
-    waiting: &mut Vec<Job>,
+    waiting: &mut Vec<ChatJob>,
 ) {
     let requests = waiting.iter().map(|job| &job.request).collect::<Vec<_>>();
     let admissions = generator.admit_batch(&requests);
@@ -831,10 +1323,10 @@ fn admit_group<G: TextGenerator>(
 
 fn record_admission(
     replies: &mut HashMap<ResidentRequestId, ActiveReply>,
-    job: Job,
+    job: ChatJob,
     admission: Result<ResidentBatchAdmission, EngineError>,
 ) {
-    let Job { reply, mut log, .. } = job;
+    let ChatJob { reply, mut log, .. } = job;
     match admission {
         Ok(admission) => {
             log.observe_prompt(admission.prompt_metrics);
@@ -929,6 +1421,46 @@ fn try_send_generation_steps<'a>(
     true
 }
 
+fn reload_qwen38(snapshot: &Path) -> Result<(ResidentMtpBatchGenerator, Ready), String> {
+    let progress = ResidentLoadProgress::new();
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let reporter = scope.spawn(|| {
+            let mut displayed = None;
+            while !finished.load(Ordering::Acquire) {
+                let current = progress.snapshot();
+                if Some(current) != displayed {
+                    let (phase, submitted, total) = current;
+                    match phase {
+                        ResidentLoadPhase::Preparing => {
+                            eprintln!("tuiskollm: runtime model load: preparing");
+                        }
+                        ResidentLoadPhase::Uploading => eprintln!(
+                            "tuiskollm: runtime model load: uploading {submitted}/{total} bytes"
+                        ),
+                        ResidentLoadPhase::Finalizing => {
+                            eprintln!("tuiskollm: runtime model load: finalizing");
+                        }
+                        ResidentLoadPhase::Ready => {
+                            eprintln!("tuiskollm: runtime model load: ready");
+                        }
+                    }
+                    displayed = Some(current);
+                }
+                std::thread::park_timeout(Duration::from_millis(250));
+            }
+        });
+        let reporter_thread = reporter.thread().clone();
+        let loaded = load_qwen38(snapshot, &progress);
+        finished.store(true, Ordering::Release);
+        reporter_thread.unpark();
+        reporter
+            .join()
+            .expect("runtime load progress reporter panicked");
+        loaded
+    })
+}
+
 fn fail_all(replies: &mut HashMap<ResidentRequestId, ActiveReply>, message: String) {
     for (_, mut reply) in replies.drain() {
         if let Some(sender) = reply.sender.take() {
@@ -940,32 +1472,298 @@ fn fail_all(replies: &mut HashMap<ResidentRequestId, ActiveReply>, message: Stri
 
 fn fail_queued(jobs: &mut Receiver<Job>, message: &str) {
     while let Ok(job) = jobs.try_recv() {
-        let _ = job
-            .reply
-            .try_send(GenerationReply::Failed(message.to_owned()));
-        job.log.finish(None, 0, 0, "error", Some(message));
+        match job {
+            Job::Chat(job) => {
+                let _ = job
+                    .reply
+                    .try_send(GenerationReply::Failed(message.to_owned()));
+                job.log.finish(None, 0, 0, "error", Some(message));
+            }
+            Job::Admin(job) => {
+                let _ = job.reply.send(AdminReply::Failed(message.to_owned()));
+            }
+        }
+    }
+}
+
+fn fail_load_queued(jobs: &mut Receiver<Job>, message: &str) {
+    while let Ok(job) = jobs.try_recv() {
+        match job {
+            Job::Chat(job) => {
+                let _ = job
+                    .reply
+                    .try_send(GenerationReply::Unavailable(message.to_owned()));
+                job.log.finish(None, 0, 0, "error", Some(message));
+            }
+            Job::Admin(job) => {
+                let _ = job.reply.send(AdminReply::Failed(message.to_owned()));
+            }
+        }
+    }
+}
+
+fn fail_resume_queued(jobs: &mut Receiver<Job>, message: &str) {
+    while let Ok(job) = jobs.try_recv() {
+        match job {
+            Job::Chat(job) => {
+                let _ = job
+                    .reply
+                    .try_send(GenerationReply::ResumeUnavailable(message.to_owned()));
+                job.log.finish(None, 0, 0, "error", Some(message));
+            }
+            Job::Admin(job) => {
+                let _ = job.reply.send(AdminReply::Failed(message.to_owned()));
+            }
+        }
     }
 }
 
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .route("/v1/models", get(models))
+        .route("/v1/unload", post(unload))
+        .route("/v1/load", post(load))
+        .route("/v1/park", post(park))
+        .route("/v1/resume", post(resume))
         .route("/v1/chat/completions", post(chat_completions))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         .with_state(state)
 }
 
 async fn health(State(state): State<AppState>) -> Response {
-    if state.worker_ready.load(Ordering::Acquire) {
-        Json(json!({"status": "ok", "generation_route": state.generation_route})).into_response()
+    let model_state = state
+        .lifecycle
+        .lock()
+        .expect("lifecycle mutex poisoned")
+        .as_str();
+    if state.worker_alive.load(Ordering::Acquire) {
+        Json(json!({
+            "status": "ok",
+            "generation_route": state.generation_route,
+            "model_state": model_state,
+        }))
+        .into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status": "unavailable"})),
+            Json(json!({"status": "unavailable", "model_state": model_state})),
         )
             .into_response()
     }
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    let model_state = *state.lifecycle.lock().expect("lifecycle mutex poisoned");
+    if state.worker_alive.load(Ordering::Acquire) && model_state == LifecycleState::Loaded {
+        Json(json!({"status": "ready", "model_state": model_state.as_str()})).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "not_ready", "model_state": model_state.as_str()})),
+        )
+            .into_response()
+    }
+}
+
+async fn unload(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    lifecycle_request(&state, &headers, AdminKind::Unload).await
+}
+
+async fn load(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    lifecycle_request(&state, &headers, AdminKind::Load).await
+}
+
+async fn park(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    lifecycle_request(&state, &headers, AdminKind::Park).await
+}
+
+async fn resume(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    lifecycle_request(&state, &headers, AdminKind::Resume).await
+}
+
+async fn lifecycle_request(state: &AppState, headers: &HeaderMap, kind: AdminKind) -> Response {
+    if let Some(expected) = state.admin_token.as_deref() {
+        let authorized = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|provided| provided == expected);
+        if !authorized {
+            return lifecycle_error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "a valid lifecycle-route bearer token is required",
+            );
+        }
+    }
+    if !state.lifecycle_supported {
+        return lifecycle_error(
+            StatusCode::CONFLICT,
+            "unsupported_target",
+            "model lifecycle is unsupported for this exact target",
+        );
+    }
+    let (reply, receiver) = std_mpsc::sync_channel(1);
+    {
+        let mut lifecycle = state.lifecycle.lock().expect("lifecycle mutex poisoned");
+        let previous = *lifecycle;
+        match (*lifecycle, kind) {
+            (LifecycleState::Loaded, AdminKind::Load) => {
+                return Json(json!({
+                    "object": "model_load",
+                    "model": state.model_id,
+                    "state": "loaded",
+                    "reloaded": false,
+                    "load_ms": 0,
+                }))
+                .into_response();
+            }
+            (LifecycleState::Unloaded, AdminKind::Unload) => {
+                return Json(json!({
+                    "object": "model_unload",
+                    "model": state.model_id,
+                    "state": "unloaded",
+                    "was_loaded": false,
+                    "was_parked": false,
+                    "device_allocation_bytes_released": 0,
+                }))
+                .into_response();
+            }
+            (LifecycleState::Loaded, AdminKind::Resume) => {
+                return Json(json!({
+                    "object": "model_resume",
+                    "model": state.model_id,
+                    "state": "loaded",
+                    "resumed": false,
+                    "restore_ms": 0,
+                }))
+                .into_response();
+            }
+            (LifecycleState::Loaded, AdminKind::Unload) => *lifecycle = LifecycleState::Unloading,
+            (LifecycleState::Unloaded, AdminKind::Load) => *lifecycle = LifecycleState::Loading,
+            (LifecycleState::Loaded, AdminKind::Park) => *lifecycle = LifecycleState::Parking,
+            (LifecycleState::Parked, AdminKind::Park) => *lifecycle = LifecycleState::Parking,
+            (LifecycleState::Parked, AdminKind::Resume) => *lifecycle = LifecycleState::Resuming,
+            (LifecycleState::Parked, AdminKind::Unload) => *lifecycle = LifecycleState::Unloading,
+            (LifecycleState::Parked, AdminKind::Load) => {
+                return lifecycle_error(
+                    StatusCode::CONFLICT,
+                    "model_parked",
+                    "parked model must be resumed or unloaded before load",
+                );
+            }
+            (LifecycleState::Unloaded, AdminKind::Park | AdminKind::Resume) => {
+                return lifecycle_error(
+                    StatusCode::CONFLICT,
+                    "model_unloaded",
+                    "unloaded model cannot be parked or resumed",
+                );
+            }
+            (LifecycleState::Dead, _) => {
+                return lifecycle_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "worker_dead",
+                    "resident engine worker is unavailable",
+                );
+            }
+            (transition, _) => {
+                return lifecycle_error(
+                    StatusCode::CONFLICT,
+                    "transition_in_progress",
+                    &format!("model lifecycle is {}", transition.as_str()),
+                );
+            }
+        }
+        if let Err(error) = state.jobs.try_send(Job::Admin(AdminJob { kind, reply })) {
+            *lifecycle = previous;
+            return match error {
+                TrySendError::Full(_) => lifecycle_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "server_overloaded",
+                    "resident inference queue is full",
+                ),
+                TrySendError::Closed(_) => lifecycle_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "worker_dead",
+                    "resident engine worker is unavailable",
+                ),
+            };
+        }
+    }
+
+    let reply = tokio::task::spawn_blocking(move || receiver.recv()).await;
+    match reply {
+        Ok(Ok(AdminReply::Unloaded {
+            was_loaded,
+            was_parked,
+            device_bytes,
+        })) => Json(json!({
+            "object": "model_unload",
+            "model": state.model_id,
+            "state": "unloaded",
+            "was_loaded": was_loaded,
+            "was_parked": was_parked,
+            "device_allocation_bytes_released": device_bytes,
+        }))
+        .into_response(),
+        Ok(Ok(AdminReply::Parked {
+            host_bytes,
+            device_bytes,
+            park_ms,
+        })) => Json(json!({
+            "object": "model_park",
+            "model": state.model_id,
+            "state": "parked",
+            "host_bytes": host_bytes,
+            "device_allocation_bytes_released": device_bytes,
+            "park_ms": park_ms,
+        }))
+        .into_response(),
+        Ok(Ok(AdminReply::Resumed {
+            resumed,
+            restore_ms,
+        })) => Json(json!({
+            "object": "model_resume",
+            "model": state.model_id,
+            "state": "loaded",
+            "resumed": resumed,
+            "restore_ms": restore_ms,
+        }))
+        .into_response(),
+        Ok(Ok(AdminReply::Loaded { reloaded, load_ms })) => Json(json!({
+            "object": "model_load",
+            "model": state.model_id,
+            "state": "loaded",
+            "reloaded": reloaded,
+            "load_ms": load_ms,
+        }))
+        .into_response(),
+        Ok(Ok(AdminReply::Failed(message))) => lifecycle_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            match kind {
+                AdminKind::Load => "load_failed",
+                AdminKind::Unload => "unload_failed",
+                AdminKind::Park => "park_failed",
+                AdminKind::Resume => "resume_failed",
+            },
+            &message,
+        ),
+        Ok(Err(_)) | Err(_) => lifecycle_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker_dead",
+            "resident engine worker disconnected",
+        ),
+    }
+}
+
+fn lifecycle_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(json!({"error": {"message": message, "type": code}})),
+    )
+        .into_response()
 }
 
 async fn models(State(state): State<AppState>) -> Json<Value> {
@@ -1020,9 +1818,9 @@ async fn chat_completions(
     };
     let accepted = Instant::now();
     let (reply_tx, mut reply_rx) = channel(GENERATION_REPLY_BUFFER);
-    if let Err(error) = enqueue_job(
-        &state.jobs,
-        Job {
+    if let Err(error) = enqueue_chat_job(
+        &state,
+        ChatJob {
             request: generation,
             reply: reply_tx,
             log: RequestLog::new(
@@ -1047,6 +1845,10 @@ async fn chat_completions(
                 openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error")
             }
             Some(GenerationReply::Overloaded(message)) => overloaded_response(message),
+            Some(GenerationReply::Unavailable(message)) => unavailable_response(message),
+            Some(GenerationReply::ResumeUnavailable(message)) => {
+                resume_unavailable_response(message)
+            }
             Some(first) => streaming_response(
                 first,
                 reply_rx,
@@ -1086,10 +1888,37 @@ fn completion_id(namespace: u128, numeric_id: u64) -> String {
     format!("chatcmpl-tuisko-{namespace:032x}-{numeric_id:016x}")
 }
 
-fn enqueue_job(jobs: &Sender<Job>, job: Job) -> Result<(), EnqueueError> {
-    match jobs.try_send(job) {
+fn enqueue_chat_job(state: &AppState, job: ChatJob) -> Result<(), EnqueueError> {
+    let mut lifecycle = state.lifecycle.lock().expect("lifecycle mutex poisoned");
+    let rollback = if state.lifecycle_supported {
+        match *lifecycle {
+            LifecycleState::Unloaded => {
+                *lifecycle = LifecycleState::Loading;
+                Some(LifecycleState::Unloaded)
+            }
+            LifecycleState::Parked => {
+                *lifecycle = LifecycleState::Resuming;
+                Some(LifecycleState::Parked)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if state.lifecycle_supported
+        && !matches!(
+            *lifecycle,
+            LifecycleState::Loaded | LifecycleState::Loading | LifecycleState::Resuming
+        )
+    {
+        return Err(EnqueueError::Transition(*lifecycle));
+    }
+    match state.jobs.try_send(Job::Chat(Box::new(job))) {
         Ok(()) => Ok(()),
-        Err(TrySendError::Full(job)) => {
+        Err(TrySendError::Full(Job::Chat(job))) => {
+            if let Some(previous) = rollback {
+                *lifecycle = previous;
+            }
             job.log.finish(
                 None,
                 0,
@@ -1099,7 +1928,10 @@ fn enqueue_job(jobs: &Sender<Job>, job: Job) -> Result<(), EnqueueError> {
             );
             Err(EnqueueError::Full)
         }
-        Err(TrySendError::Closed(job)) => {
+        Err(TrySendError::Closed(Job::Chat(job))) => {
+            if let Some(previous) = rollback {
+                *lifecycle = previous;
+            }
             job.log.finish(
                 None,
                 0,
@@ -1108,6 +1940,9 @@ fn enqueue_job(jobs: &Sender<Job>, job: Job) -> Result<(), EnqueueError> {
                 Some("resident engine worker is unavailable"),
             );
             Err(EnqueueError::Closed)
+        }
+        Err(TrySendError::Full(Job::Admin(_)) | TrySendError::Closed(Job::Admin(_))) => {
+            unreachable!("chat enqueue constructed an admin job")
         }
     }
 }
@@ -1120,33 +1955,52 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
             "resident engine worker is unavailable".into(),
             "server_error",
         ),
+        EnqueueError::Transition(state) => {
+            let message = format!("model lifecycle is {}", state.as_str());
+            let mut response = lifecycle_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_unavailable",
+                &message,
+            );
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+            response
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, EnqueueError, Job, QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, Ready, ServerError,
-        ServerModel, chat_completions, completion_id, enqueue_job, fail_queued, health, models,
-        record_admission, render_loading, render_startup, render_weight_progress, router,
-        serve_until_worker_failure, try_send_generation_steps,
+        AppState, ChatJob, EnqueueError, Job, LifecycleState,
+        QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, Ready, ServerConfig, ServerError, ServerModel,
+        chat_completions, completion_id, enqueue_chat_job, fail_queued, health, load, models,
+        readiness, record_admission, render_loading, render_startup, render_weight_progress,
+        router, run, serve_reloadable, serve_until_worker_failure, try_send_generation_steps,
+        unload,
     };
+    use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
     use axum::Json;
     use axum::body::to_bytes;
     use axum::extract::State;
-    use axum::http::{StatusCode, header::RETRY_AFTER};
+    use axum::http::{
+        HeaderMap, HeaderValue, StatusCode, header::AUTHORIZATION, header::RETRY_AFTER,
+    };
     use serde_json::Value;
     use std::collections::HashMap;
     use std::net::SocketAddr;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, mpsc as std_mpsc};
     use std::time::Duration;
     use tokio::runtime::Builder;
     use tokio::sync::mpsc::channel;
     use tuisko_engine::{
-        ChatGenerationRequest, EngineError, EngineErrorCode, FinishReason, GenerationStep,
-        MAX_BATCH, QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS,
+        ChatGenerationRequest, EngineError, EngineErrorCode, FinishReason, GeneratedText,
+        GenerationStep, MAX_BATCH, QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS, ResidentBatchAdmission,
+        ResidentCancellation, ResidentRequestId,
     };
     use tuisko_frontend::{ChatMessage, GenerationDefaults};
     use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext};
@@ -1155,11 +2009,11 @@ mod tests {
         Builder::new_current_thread().enable_all().build().unwrap()
     }
 
-    fn job() -> (Job, tokio::sync::mpsc::Receiver<GenerationReply>) {
+    fn job() -> (ChatJob, tokio::sync::mpsc::Receiver<GenerationReply>) {
         let (reply, receiver) = channel(8);
         let started = std::time::Instant::now();
         (
-            Job {
+            ChatJob {
                 request: ChatGenerationRequest::new(vec![ChatMessage::new("user", "hello")]),
                 reply,
                 log: crate::request_log::RequestLog::new(1, started, started, "mtp-draft-3"),
@@ -1173,7 +2027,14 @@ mod tests {
             jobs,
             request_ids: Arc::new(AtomicU64::new(1)),
             response_namespace: 0x5a17,
-            worker_ready: Arc::new(AtomicBool::new(ready)),
+            worker_alive: Arc::new(AtomicBool::new(ready)),
+            lifecycle: Arc::new(Mutex::new(if ready {
+                LifecycleState::Loaded
+            } else {
+                LifecycleState::Dead
+            })),
+            lifecycle_supported: true,
+            admin_token: None,
             server_started: std::time::Instant::now(),
             model_id: SERVED_MODEL,
             generation_route: ServerModel::Qwen38.generation_route(),
@@ -1183,6 +2044,110 @@ mod tests {
                 top_k: 20,
             },
             reasoning_effort: ServerModel::Qwen38.reasoning_effort(),
+        }
+    }
+
+    struct EmptyEvent;
+
+    impl GenerationEvent for EmptyEvent {
+        fn request_id(&self) -> ResidentRequestId {
+            unreachable!("empty fixture emits no events")
+        }
+
+        fn steps(&self) -> impl Iterator<Item = &GenerationStep> {
+            std::iter::empty()
+        }
+
+        fn completed(&self) -> Option<&GeneratedText> {
+            None
+        }
+    }
+
+    struct EmptyEvents;
+
+    impl GenerationEvents for EmptyEvents {
+        type Event = EmptyEvent;
+
+        fn iter(&self) -> impl Iterator<Item = &Self::Event> {
+            std::iter::empty()
+        }
+    }
+
+    struct FakeReloadableGenerator {
+        drops: Arc<AtomicU64>,
+        resume_failures: Arc<AtomicU64>,
+    }
+
+    impl Drop for FakeReloadableGenerator {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl TextGenerator for FakeReloadableGenerator {
+        type Events = EmptyEvents;
+
+        fn admit(
+            &mut self,
+            _request: &ChatGenerationRequest,
+        ) -> Result<ResidentBatchAdmission, EngineError> {
+            Err(EngineError::Contract {
+                code: EngineErrorCode::Capacity,
+                message: "fixture admission reached".into(),
+            })
+        }
+
+        fn step(&mut self) -> Result<Self::Events, EngineError> {
+            unreachable!("fixture has no active requests")
+        }
+
+        fn cancel(
+            &mut self,
+            _request_id: ResidentRequestId,
+        ) -> Result<ResidentCancellation, EngineError> {
+            unreachable!("fixture has no active requests")
+        }
+
+        fn active_requests(&self) -> usize {
+            0
+        }
+
+        fn active_request_ids(&self) -> impl Iterator<Item = ResidentRequestId> {
+            std::iter::empty()
+        }
+
+        fn slot_capacity(&self) -> usize {
+            MAX_BATCH
+        }
+    }
+
+    impl super::ReloadableGenerator for FakeReloadableGenerator {
+        type Parked = Self;
+
+        fn device_owner_bytes(&self) -> usize {
+            123
+        }
+
+        fn park(self) -> Result<(Self::Parked, usize, usize), (Self, String)> {
+            Ok((self, 45, 67))
+        }
+
+        fn resume(parked: Self::Parked) -> Result<Self, (Self::Parked, String)> {
+            if parked
+                .resume_failures
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |failures| {
+                    failures.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Err((parked, "fixture resume failed".into()))
+            } else {
+                Ok(parked)
+            }
+        }
+
+        fn parked_ownership(_parked: &Self::Parked) -> (usize, usize, usize) {
+            (45, 67, 56)
         }
     }
 
@@ -1309,13 +2274,48 @@ mod tests {
     #[test]
     fn bounded_ingress_distinguishes_overload_and_worker_shutdown() {
         let (jobs, receiver) = channel(1);
-        enqueue_job(&jobs, job().0).unwrap();
-        let full = enqueue_job(&jobs, job().0).unwrap_err();
+        let app = state(jobs, true);
+        enqueue_chat_job(&app, job().0).unwrap();
+        let full = enqueue_chat_job(&app, job().0).unwrap_err();
         assert_eq!(full, EnqueueError::Full);
 
         drop(receiver);
-        let closed = enqueue_job(&jobs, job().0).unwrap_err();
+        let closed = enqueue_chat_job(&app, job().0).unwrap_err();
         assert_eq!(closed, EnqueueError::Closed);
+    }
+
+    #[test]
+    fn parked_chat_starts_one_resume_and_concurrent_chats_share_it() {
+        let (jobs, mut receiver) = channel(2);
+        let app = state(jobs, true);
+        *app.lifecycle.lock().unwrap() = LifecycleState::Parked;
+
+        enqueue_chat_job(&app, job().0).unwrap();
+        assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Resuming);
+        enqueue_chat_job(&app, job().0).unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Job::Chat(_))));
+        assert!(matches!(receiver.try_recv(), Ok(Job::Chat(_))));
+
+        let (jobs, _receiver) = channel(1);
+        let app = state(jobs, true);
+        enqueue_chat_job(&app, job().0).unwrap();
+        *app.lifecycle.lock().unwrap() = LifecycleState::Parked;
+        assert_eq!(enqueue_chat_job(&app, job().0), Err(EnqueueError::Full));
+        assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Parked);
+    }
+
+    #[test]
+    fn non_loopback_listener_without_admin_token_is_rejected_before_startup() {
+        let error = run(ServerConfig {
+            model: ServerModel::Qwen38,
+            snapshot: PathBuf::from("/snapshot/must/not/be/opened"),
+            address: "0.0.0.0:8000".parse().unwrap(),
+            admin_token_env: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, ServerError::Configuration(_)));
+        assert!(error.to_string().contains("--admin-token-env"));
     }
 
     #[test]
@@ -1344,8 +2344,8 @@ mod tests {
         let (jobs, mut queued) = channel(2);
         let (first, mut first_reply) = job();
         let (second, mut second_reply) = job();
-        jobs.try_send(first).unwrap();
-        jobs.try_send(second).unwrap();
+        jobs.try_send(Job::Chat(Box::new(first))).unwrap();
+        jobs.try_send(Job::Chat(Box::new(second))).unwrap();
 
         fail_queued(&mut queued, "device launch failed");
 
@@ -1367,9 +2367,9 @@ mod tests {
     fn overloaded_handler_paces_retries() {
         runtime().block_on(async {
             let (jobs, _receiver) = channel(1);
-            enqueue_job(&jobs, job().0).unwrap();
-            let response =
-                chat_completions(State(state(jobs, true)), Ok(Json(streaming_request()))).await;
+            let app = state(jobs, true);
+            enqueue_chat_job(&app, job().0).unwrap();
+            let response = chat_completions(State(app), Ok(Json(streaming_request()))).await;
 
             assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
             assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1");
@@ -1461,6 +2461,7 @@ mod tests {
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["status"], "ok");
             assert_eq!(body["generation_route"], "mtp-draft-3");
+            assert_eq!(body["model_state"], "loaded");
 
             let (jobs, _receiver) = channel(1);
             let unavailable = health(State(state(jobs, false))).await;
@@ -1469,6 +2470,338 @@ mod tests {
             let models = models(State(state(jobs, true))).await.0;
             assert_eq!(models["data"][0]["id"], SERVED_MODEL);
             assert_eq!(models["data"][0]["owned_by"], "tuiskollm");
+        });
+    }
+
+    #[test]
+    fn health_is_liveness_and_readiness_tracks_model_state() {
+        runtime().block_on(async {
+            let (jobs, _receiver) = channel(1);
+            let app = state(jobs, true);
+            *app.lifecycle.lock().unwrap() = LifecycleState::Unloaded;
+
+            assert_eq!(health(State(app.clone())).await.status(), StatusCode::OK);
+            let response = readiness(State(app.clone())).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model_state"], "unloaded");
+
+            *app.lifecycle.lock().unwrap() = LifecycleState::Loaded;
+            assert_eq!(readiness(State(app)).await.status(), StatusCode::OK);
+        });
+    }
+
+    #[test]
+    fn reloadable_worker_drops_before_unload_reply_and_retries_one_failed_load() {
+        let (jobs, receiver) = channel(MAX_BATCH);
+        let lifecycle = Arc::new(Mutex::new(LifecycleState::Loaded));
+        let drops = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::new(AtomicU64::new(0));
+        let (failure, _failure_receiver) = tokio::sync::oneshot::channel();
+        let worker_lifecycle = Arc::clone(&lifecycle);
+        let worker_drops = Arc::clone(&drops);
+        let worker_attempts = Arc::clone(&attempts);
+        let worker = std::thread::spawn(move || {
+            serve_reloadable(
+                FakeReloadableGenerator {
+                    drops: Arc::clone(&worker_drops),
+                    resume_failures: Arc::new(AtomicU64::new(0)),
+                },
+                receiver,
+                failure,
+                worker_lifecycle,
+                move || {
+                    if worker_attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                        Err("fixture reload failed".into())
+                    } else {
+                        Ok(FakeReloadableGenerator {
+                            drops: Arc::clone(&worker_drops),
+                            resume_failures: Arc::new(AtomicU64::new(0)),
+                        })
+                    }
+                },
+            );
+        });
+
+        *lifecycle.lock().unwrap() = LifecycleState::Unloading;
+        let (unload_reply, unload_receiver) = std_mpsc::sync_channel(1);
+        jobs.blocking_send(Job::Admin(super::AdminJob {
+            kind: super::AdminKind::Unload,
+            reply: unload_reply,
+        }))
+        .unwrap();
+        assert!(matches!(
+            unload_receiver.recv().unwrap(),
+            super::AdminReply::Unloaded {
+                was_loaded: true,
+                was_parked: false,
+                device_bytes: 123
+            }
+        ));
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(*lifecycle.lock().unwrap(), LifecycleState::Unloaded);
+
+        *lifecycle.lock().unwrap() = LifecycleState::Loading;
+        let (failed_chat, mut failed_reply) = job();
+        jobs.blocking_send(Job::Chat(Box::new(failed_chat)))
+            .unwrap();
+        assert!(matches!(
+            failed_reply.blocking_recv(),
+            Some(GenerationReply::Unavailable(message)) if message == "fixture reload failed"
+        ));
+        assert_eq!(*lifecycle.lock().unwrap(), LifecycleState::Unloaded);
+
+        *lifecycle.lock().unwrap() = LifecycleState::Loading;
+        let (retried_chat, mut retried_reply) = job();
+        jobs.blocking_send(Job::Chat(Box::new(retried_chat)))
+            .unwrap();
+        assert!(matches!(
+            retried_reply.blocking_recv(),
+            Some(GenerationReply::Overloaded(message)) if message == "fixture admission reached"
+        ));
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(*lifecycle.lock().unwrap(), LifecycleState::Loaded);
+
+        drop(jobs);
+        worker.join().unwrap();
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn unload_reserves_an_ingress_fence_before_the_worker_replies() {
+        runtime().block_on(async {
+            let (jobs, mut receiver) = channel(2);
+            let app = state(jobs, true);
+            let handler = tokio::spawn(unload(State(app.clone()), HeaderMap::new()));
+            tokio::task::yield_now().await;
+
+            assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Unloading);
+            assert_eq!(
+                enqueue_chat_job(&app, job().0).unwrap_err(),
+                EnqueueError::Transition(LifecycleState::Unloading)
+            );
+            let blocked = chat_completions(State(app.clone()), Ok(Json(streaming_request()))).await;
+            assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(blocked.headers()[RETRY_AFTER], "1");
+            let Job::Admin(admin) = receiver.recv().await.unwrap() else {
+                panic!("unload handler queued a chat")
+            };
+            *app.lifecycle.lock().unwrap() = LifecycleState::Unloaded;
+            admin
+                .reply
+                .send(super::AdminReply::Unloaded {
+                    was_loaded: true,
+                    was_parked: false,
+                    device_bytes: 123,
+                })
+                .unwrap();
+
+            let response = handler.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["state"], "unloaded");
+            assert_eq!(body["device_allocation_bytes_released"], 123);
+        });
+    }
+
+    #[test]
+    fn park_and_resume_publish_exact_fences_and_parked_chat_starts_resume() {
+        runtime().block_on(async {
+            let (jobs, mut receiver) = channel(2);
+            let app = state(jobs, true);
+            let handler = tokio::spawn(super::park(State(app.clone()), HeaderMap::new()));
+            tokio::task::yield_now().await;
+
+            assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Parking);
+            assert_eq!(
+                enqueue_chat_job(&app, job().0).unwrap_err(),
+                EnqueueError::Transition(LifecycleState::Parking)
+            );
+            let Job::Admin(admin) = receiver.recv().await.unwrap() else {
+                panic!("park handler queued a chat")
+            };
+            assert_eq!(admin.kind, super::AdminKind::Park);
+            *app.lifecycle.lock().unwrap() = LifecycleState::Parked;
+            admin
+                .reply
+                .send(super::AdminReply::Parked {
+                    host_bytes: 45,
+                    device_bytes: 67,
+                    park_ms: 8,
+                })
+                .unwrap();
+            let response = handler.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["state"], "parked");
+            assert_eq!(body["host_bytes"], 45);
+            assert_eq!(body["device_allocation_bytes_released"], 67);
+
+            let auto_resume = tokio::spawn(chat_completions(
+                State(app.clone()),
+                Ok(Json(streaming_request())),
+            ));
+            tokio::task::yield_now().await;
+            assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Resuming);
+            let Job::Chat(auto_chat) = receiver.recv().await.unwrap() else {
+                panic!("parked chat queued an admin job")
+            };
+            *app.lifecycle.lock().unwrap() = LifecycleState::Parked;
+            auto_chat
+                .reply
+                .try_send(GenerationReply::ResumeUnavailable(
+                    "fixture resume failed".into(),
+                ))
+                .unwrap();
+            let blocked = auto_resume.await.unwrap();
+            assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(blocked.headers()[RETRY_AFTER], "1");
+            let body = to_bytes(blocked.into_body(), 1 << 20).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "model_resume_failed");
+
+            let handler = tokio::spawn(super::resume(State(app.clone()), HeaderMap::new()));
+            tokio::task::yield_now().await;
+            assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Resuming);
+            let Job::Admin(admin) = receiver.recv().await.unwrap() else {
+                panic!("resume handler queued a chat")
+            };
+            assert_eq!(admin.kind, super::AdminKind::Resume);
+            *app.lifecycle.lock().unwrap() = LifecycleState::Loaded;
+            admin
+                .reply
+                .send(super::AdminReply::Resumed {
+                    resumed: true,
+                    restore_ms: 11,
+                })
+                .unwrap();
+            let response = handler.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["state"], "loaded");
+            assert_eq!(body["resumed"], true);
+            assert_eq!(body["restore_ms"], 11);
+        });
+    }
+
+    #[test]
+    fn reloadable_worker_auto_resumes_parked_state_for_chat_without_dropping_it() {
+        let (jobs, receiver) = channel(MAX_BATCH);
+        let lifecycle = Arc::new(Mutex::new(LifecycleState::Loaded));
+        let drops = Arc::new(AtomicU64::new(0));
+        let (failure, _failure_receiver) = tokio::sync::oneshot::channel();
+        let worker_lifecycle = Arc::clone(&lifecycle);
+        let worker_drops = Arc::clone(&drops);
+        let resume_failures = Arc::new(AtomicU64::new(1));
+        let worker_resume_failures = Arc::clone(&resume_failures);
+        let worker = std::thread::spawn(move || {
+            serve_reloadable(
+                FakeReloadableGenerator {
+                    drops: worker_drops,
+                    resume_failures: worker_resume_failures,
+                },
+                receiver,
+                failure,
+                worker_lifecycle,
+                || unreachable!("park/resume fixture never reloads"),
+            );
+        });
+
+        *lifecycle.lock().unwrap() = LifecycleState::Parking;
+        let (reply, receiver) = std_mpsc::sync_channel(1);
+        jobs.blocking_send(Job::Admin(super::AdminJob {
+            kind: super::AdminKind::Park,
+            reply,
+        }))
+        .unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            super::AdminReply::Parked {
+                host_bytes: 45,
+                device_bytes: 67,
+                ..
+            }
+        ));
+        assert_eq!(*lifecycle.lock().unwrap(), LifecycleState::Parked);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        *lifecycle.lock().unwrap() = LifecycleState::Resuming;
+        let (failed_chat, mut failed_reply) = job();
+        jobs.blocking_send(Job::Chat(Box::new(failed_chat)))
+            .unwrap();
+        assert!(matches!(
+            failed_reply.blocking_recv(),
+            Some(GenerationReply::ResumeUnavailable(message)) if message == "fixture resume failed"
+        ));
+        assert_eq!(*lifecycle.lock().unwrap(), LifecycleState::Parked);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        *lifecycle.lock().unwrap() = LifecycleState::Resuming;
+        let (resumed_chat, mut resumed_reply) = job();
+        jobs.blocking_send(Job::Chat(Box::new(resumed_chat)))
+            .unwrap();
+        assert!(matches!(
+            resumed_reply.blocking_recv(),
+            Some(GenerationReply::Overloaded(message)) if message == "fixture admission reached"
+        ));
+        assert_eq!(*lifecycle.lock().unwrap(), LifecycleState::Loaded);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        drop(jobs);
+        worker.join().unwrap();
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn explicit_load_is_idempotent_and_publishes_loading_before_enqueue() {
+        runtime().block_on(async {
+            let (jobs, mut receiver) = channel(2);
+            let app = state(jobs, true);
+            let loaded = load(State(app.clone()), HeaderMap::new()).await;
+            assert_eq!(loaded.status(), StatusCode::OK);
+            assert!(receiver.try_recv().is_err());
+
+            *app.lifecycle.lock().unwrap() = LifecycleState::Unloaded;
+            let handler = tokio::spawn(load(State(app.clone()), HeaderMap::new()));
+            tokio::task::yield_now().await;
+            assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Loading);
+            let Job::Admin(admin) = receiver.recv().await.unwrap() else {
+                panic!("load handler queued a chat")
+            };
+            *app.lifecycle.lock().unwrap() = LifecycleState::Loaded;
+            admin
+                .reply
+                .send(super::AdminReply::Loaded {
+                    reloaded: true,
+                    load_ms: 17,
+                })
+                .unwrap();
+            let response = handler.await.unwrap();
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["reloaded"], true);
+            assert_eq!(body["load_ms"], 17);
+        });
+    }
+
+    #[test]
+    fn lifecycle_routes_require_the_configured_bearer_token() {
+        runtime().block_on(async {
+            let (jobs, _receiver) = channel(1);
+            let mut app = state(jobs, true);
+            app.admin_token = Some(Arc::from("secret"));
+
+            let unauthorized = load(State(app.clone()), HeaderMap::new()).await;
+            assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+            let authorized = load(State(app), headers).await;
+            assert_eq!(authorized.status(), StatusCode::OK);
         });
     }
 
@@ -1577,7 +2910,9 @@ mod tests {
                 Ok(Json(streaming_request())),
             ));
 
-            let queued = receiver.recv().await.unwrap();
+            let Job::Chat(queued) = receiver.recv().await.unwrap() else {
+                panic!("chat handler queued an admin job")
+            };
             assert_eq!(queued.request.max_new_tokens, 7);
             queued
                 .reply
@@ -1608,7 +2943,9 @@ mod tests {
                 Ok(Json(streaming_request())),
             ));
 
-            let queued = receiver.recv().await.unwrap();
+            let Job::Chat(queued) = receiver.recv().await.unwrap() else {
+                panic!("chat handler queued an admin job")
+            };
             queued
                 .reply
                 .try_send(GenerationReply::Rejected(
@@ -1637,7 +2974,9 @@ mod tests {
                 Ok(Json(streaming_request())),
             ));
 
-            let queued = receiver.recv().await.unwrap();
+            let Job::Chat(queued) = receiver.recv().await.unwrap() else {
+                panic!("chat handler queued an admin job")
+            };
             queued
                 .reply
                 .try_send(GenerationReply::Overloaded(
@@ -1654,6 +2993,34 @@ mod tests {
     }
 
     #[test]
+    fn streaming_reload_failure_is_retryable_not_a_stream() {
+        runtime().block_on(async {
+            let (jobs, mut receiver) = channel(1);
+            let state = state(jobs, true);
+            let handler = tokio::spawn(chat_completions(
+                State(state),
+                Ok(Json(streaming_request())),
+            ));
+
+            let Job::Chat(queued) = receiver.recv().await.unwrap() else {
+                panic!("chat handler queued an admin job")
+            };
+            queued
+                .reply
+                .try_send(GenerationReply::Unavailable(
+                    "checkpoint reload failed".into(),
+                ))
+                .unwrap();
+            let response = handler.await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[RETRY_AFTER], "1");
+            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let error: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error["error"]["type"], "model_load_failed");
+        });
+    }
+
+    #[test]
     fn streaming_worker_disconnect_before_admission_is_unavailable() {
         runtime().block_on(async {
             let (jobs, mut receiver) = channel(1);
@@ -1663,7 +3030,9 @@ mod tests {
                 Ok(Json(streaming_request())),
             ));
 
-            let queued = receiver.recv().await.unwrap();
+            let Job::Chat(queued) = receiver.recv().await.unwrap() else {
+                panic!("chat handler queued an admin job")
+            };
             drop(queued);
             let response = handler.await.unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

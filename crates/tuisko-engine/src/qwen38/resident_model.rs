@@ -26,6 +26,7 @@ use std::time::Instant;
 use tuisko_gpu::{
     ArenaRegion, CudaContext, CudaGraph, CudaGraphDefinition, CudaGraphVariants, CudaStream,
     DeviceArena, DeviceCopy, GpuError, GpuResult, LoadingDeviceArena, PinnedHostBuffer,
+    VmmSegmentClass, VmmSegmentManifest, vmm_allocation_granularity,
 };
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_kernels_sm120::{
@@ -566,6 +567,7 @@ pub struct ResidentModelProgram {
     snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
     context: Arc<CudaContext>,
     layout: ResidentModelLayout,
+    scalars: Vec<LayerScalars>,
     _pointers: ProgramPointers,
     base_address: u64,
     kv_base_address: u64,
@@ -742,15 +744,39 @@ impl ResidentModelProgram {
                 arena: DeviceArena::zeroed(&stream, &layout.builder)?,
                 kv_arena: DeviceArena::zeroed(&stream, layout.kv_layout.builder())?,
             },
-            ResidentLoadMode::Selective => ArenaLoading::Selective {
-                arena: LoadingDeviceArena::allocate(&stream, &layout.builder)?,
-                kv_arena: LoadingDeviceArena::allocate(&stream, layout.kv_layout.builder())?,
-            },
+            ResidentLoadMode::Selective => {
+                let granularity = vmm_allocation_granularity(&stream)?;
+                let arena_manifest = VmmSegmentManifest::uniform(
+                    layout.builder.byte_len(),
+                    granularity,
+                    VmmSegmentClass::Parkable,
+                )?;
+                let kv_manifest = VmmSegmentManifest::uniform(
+                    layout.kv_layout.builder().byte_len(),
+                    granularity,
+                    VmmSegmentClass::Parkable,
+                )?;
+                ArenaLoading::Selective {
+                    arena: LoadingDeviceArena::allocate_vmm(
+                        &stream,
+                        &layout.builder,
+                        &arena_manifest,
+                    )?,
+                    kv_arena: LoadingDeviceArena::allocate_vmm(
+                        &stream,
+                        layout.kv_layout.builder(),
+                        &kv_manifest,
+                    )?,
+                }
+            }
         };
         stream.synchronize().map_err(GpuError::from)?;
         let arena_allocation_ns = elapsed_ns("resident arena allocation", allocation_start)?;
         let mtp_reservation = reserve_mtp
-            .then(|| ResidentMtpArenaReservation::allocate(&stream))
+            .then(|| match mode {
+                ResidentLoadMode::Legacy => ResidentMtpArenaReservation::allocate(&stream),
+                ResidentLoadMode::Selective => ResidentMtpArenaReservation::allocate_vmm(&stream),
+            })
             .transpose()?;
         stream.synchronize().map_err(GpuError::from)?;
 
@@ -1040,6 +1066,7 @@ impl ResidentModelProgram {
                 snapshot,
                 context: context.clone(),
                 layout,
+                scalars,
                 _pointers: pointers,
                 base_address,
                 kv_base_address,
@@ -1539,16 +1566,29 @@ impl ResidentModelProgram {
         history: &mut PinnedHostBuffer<u16>,
         state: &mut PinnedHostBuffer<f32>,
     ) -> EngineResult<()> {
-        require_slot(slot)?;
         require_gdn_snapshot_buffers(self, history, state)?;
+        self.capture_gdn_slot_into(stream, slot, slot, history, state)
+    }
+
+    /// Captures one slot's exact GDN state into one compact pinned mirror row.
+    pub(crate) fn capture_gdn_slot_into(
+        &self,
+        stream: &CudaStream,
+        slot: usize,
+        mirror_row: usize,
+        history: &mut PinnedHostBuffer<u16>,
+        state: &mut PinnedHostBuffer<f32>,
+    ) -> EngineResult<()> {
+        require_slot(slot)?;
+        require_compact_gdn_snapshot_buffers(self, mirror_row, history, state)?;
         let mut history_offset = product(
             "resident GDN snapshot history slot offset",
-            slot,
+            mirror_row,
             self.gdn_slot_history_values(),
         )?;
         let mut state_offset = product(
             "resident GDN snapshot state slot offset",
-            slot,
+            mirror_row,
             self.gdn_slot_state_values(),
         )?;
         for layer in &self.layout.layers {
@@ -1581,8 +1621,14 @@ impl ResidentModelProgram {
             history_offset += history_values;
             state_offset += state_values;
         }
-        debug_assert_eq!(history_offset, (slot + 1) * self.gdn_slot_history_values());
-        debug_assert_eq!(state_offset, (slot + 1) * self.gdn_slot_state_values());
+        debug_assert_eq!(
+            history_offset,
+            (mirror_row + 1) * self.gdn_slot_history_values()
+        );
+        debug_assert_eq!(
+            state_offset,
+            (mirror_row + 1) * self.gdn_slot_state_values()
+        );
         stream.synchronize().map_err(GpuError::from)?;
         Ok(())
     }
@@ -1595,16 +1641,29 @@ impl ResidentModelProgram {
         history: &PinnedHostBuffer<u16>,
         state: &PinnedHostBuffer<f32>,
     ) -> EngineResult<()> {
-        require_slot(slot)?;
         require_gdn_snapshot_buffers(self, history, state)?;
+        self.restore_gdn_slot_from(stream, slot, slot, history, state)
+    }
+
+    /// Restores one slot's exact GDN state from one compact pinned mirror row.
+    pub(crate) fn restore_gdn_slot_from(
+        &self,
+        stream: &CudaStream,
+        slot: usize,
+        mirror_row: usize,
+        history: &PinnedHostBuffer<u16>,
+        state: &PinnedHostBuffer<f32>,
+    ) -> EngineResult<()> {
+        require_slot(slot)?;
+        require_compact_gdn_snapshot_buffers(self, mirror_row, history, state)?;
         let mut history_offset = product(
             "resident GDN restore history slot offset",
-            slot,
+            mirror_row,
             self.gdn_slot_history_values(),
         )?;
         let mut state_offset = product(
             "resident GDN restore state slot offset",
-            slot,
+            mirror_row,
             self.gdn_slot_state_values(),
         )?;
         for layer in &self.layout.layers {
@@ -1637,8 +1696,253 @@ impl ResidentModelProgram {
             history_offset += history_values;
             state_offset += state_values;
         }
-        debug_assert_eq!(history_offset, (slot + 1) * self.gdn_slot_history_values());
-        debug_assert_eq!(state_offset, (slot + 1) * self.gdn_slot_state_values());
+        debug_assert_eq!(
+            history_offset,
+            (mirror_row + 1) * self.gdn_slot_history_values()
+        );
+        debug_assert_eq!(
+            state_offset,
+            (mirror_row + 1) * self.gdn_slot_state_values()
+        );
+        Ok(())
+    }
+
+    pub(crate) fn park_cache_page_values(&self) -> EngineResult<usize> {
+        product(
+            "resident park target cache-page values",
+            self.layout.kv_layout.layers().len(),
+            cache_values(1)?,
+        )
+    }
+
+    pub(crate) fn capture_cache_page_into(
+        &self,
+        stream: &CudaStream,
+        physical_page: usize,
+        mirror_page: usize,
+        key: &mut PinnedHostBuffer<u8>,
+        value: &mut PinnedHostBuffer<u8>,
+    ) -> EngineResult<()> {
+        if physical_page >= LONG_CONTEXT_PHYSICAL_PAGES {
+            return Err(EngineError::route(format!(
+                "resident cache page {physical_page} is outside 0..{LONG_CONTEXT_PHYSICAL_PAGES}"
+            )));
+        }
+        let layer_values = cache_values(1)?;
+        let source_start = cache_values(physical_page)?;
+        let page_values = self.park_cache_page_values()?;
+        let destination_start = product(
+            "resident target mirror page offset",
+            mirror_page,
+            page_values,
+        )?;
+        let destination_end = destination_start
+            .checked_add(page_values)
+            .ok_or_else(|| EngineError::layout("resident target mirror range overflows"))?;
+        if destination_end > key.len() || destination_end > value.len() {
+            return Err(EngineError::layout(
+                "resident target cache mirror is too small",
+            ));
+        }
+        for (layer, cache) in self.layout.kv_layout.layers().iter().enumerate() {
+            let offset = destination_start + layer * layer_values;
+            // SAFETY: the buffers are pinned, disjoint layer ranges and remain unread until the
+            // synchronization below completes.
+            unsafe {
+                self.kv_arena.copy_slice_to_pinned_host_async(
+                    stream,
+                    cache.key.data,
+                    source_start,
+                    key,
+                    offset,
+                    layer_values,
+                )?;
+                self.kv_arena.copy_slice_to_pinned_host_async(
+                    stream,
+                    cache.value.data,
+                    source_start,
+                    value,
+                    offset,
+                    layer_values,
+                )?;
+            }
+        }
+        stream.synchronize().map_err(GpuError::from)?;
+        Ok(())
+    }
+
+    pub(crate) fn restore_cache_page_from(
+        &self,
+        stream: &CudaStream,
+        physical_page: usize,
+        mirror_page: usize,
+        key: &PinnedHostBuffer<u8>,
+        value: &PinnedHostBuffer<u8>,
+    ) -> EngineResult<()> {
+        if physical_page >= LONG_CONTEXT_PHYSICAL_PAGES {
+            return Err(EngineError::route(format!(
+                "resident cache page {physical_page} is outside 0..{LONG_CONTEXT_PHYSICAL_PAGES}"
+            )));
+        }
+        let layer_values = cache_values(1)?;
+        let destination_start = cache_values(physical_page)?;
+        let page_values = self.park_cache_page_values()?;
+        let source_start = product(
+            "resident target mirror page offset",
+            mirror_page,
+            page_values,
+        )?;
+        let source_end = source_start
+            .checked_add(page_values)
+            .ok_or_else(|| EngineError::layout("resident target mirror range overflows"))?;
+        if source_end > key.len() || source_end > value.len() {
+            return Err(EngineError::layout(
+                "resident target cache mirror is too small",
+            ));
+        }
+        for (layer, cache) in self.layout.kv_layout.layers().iter().enumerate() {
+            let offset = source_start + layer * layer_values;
+            // SAFETY: the pinned mirror remains immutable through the caller's final stream sync.
+            unsafe {
+                self.kv_arena.copy_slice_from_pinned_host_async(
+                    stream,
+                    cache.key.data,
+                    destination_start,
+                    key,
+                    offset,
+                    layer_values,
+                )?;
+                self.kv_arena.copy_slice_from_pinned_host_async(
+                    stream,
+                    cache.value.data,
+                    destination_start,
+                    value,
+                    offset,
+                    layer_values,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn capture_block_table_into(
+        &self,
+        stream: &CudaStream,
+        slot: usize,
+        mirror_row: usize,
+        tables: &mut PinnedHostBuffer<u32>,
+    ) -> EngineResult<()> {
+        require_slot(slot)?;
+        let destination_start = product(
+            "resident target mirror table offset",
+            mirror_row,
+            LONG_CONTEXT_PHYSICAL_PAGES,
+        )?;
+        let destination_end = destination_start
+            .checked_add(LONG_CONTEXT_PHYSICAL_PAGES)
+            .ok_or_else(|| EngineError::layout("resident target mirror table range overflows"))?;
+        if destination_end > tables.len() {
+            return Err(EngineError::layout(
+                "resident target table mirror is too small",
+            ));
+        }
+        let source_start = product(
+            "resident block-table row offset",
+            slot,
+            LONG_CONTEXT_PHYSICAL_PAGES,
+        )?;
+        // SAFETY: the pinned row remains unread until the synchronization below completes.
+        unsafe {
+            self.kv_arena.copy_slice_to_pinned_host_async(
+                stream,
+                self.layout.kv_layout.block_tables(),
+                source_start,
+                tables,
+                destination_start,
+                LONG_CONTEXT_PHYSICAL_PAGES,
+            )?;
+        }
+        stream.synchronize().map_err(GpuError::from)?;
+        if tables[destination_start..destination_end] != *self.kv_slots.page_table(slot)? {
+            return Err(EngineError::generation(format!(
+                "resident target device table for slot {slot} disagrees with host ownership"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_all_block_tables(&self, stream: &CudaStream) -> EngineResult<()> {
+        for slot in 0..MAX_BATCH {
+            self.sync_kv_table_row(stream, slot)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn require_device_tables_match_host(&self, stream: &CudaStream) -> EngineResult<()> {
+        let device = self
+            .kv_arena
+            .copy_to_host(stream, self.layout.kv_layout.block_tables())?;
+        for slot in 0..MAX_BATCH {
+            let start = product(
+                "resident target table verification offset",
+                slot,
+                LONG_CONTEXT_PHYSICAL_PAGES,
+            )?;
+            let end = start + LONG_CONTEXT_PHYSICAL_PAGES;
+            if device[start..end] != *self.kv_slots.page_table(slot)? {
+                return Err(EngineError::generation(format!(
+                    "resident target device table for slot {slot} disagrees with host ownership"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn host_block_table(&self, slot: usize) -> EngineResult<&[u32]> {
+        self.kv_slots.page_table(slot)
+    }
+
+    pub(crate) fn park_device_arenas(&mut self, stream: &CudaStream) -> EngineResult<usize> {
+        let main = self.arena.park(stream)?;
+        let cache = self.kv_arena.park(stream)?;
+        main.checked_add(cache)
+            .ok_or_else(|| EngineError::layout("resident parked byte count overflows"))
+    }
+
+    pub(crate) fn resume_device_arenas(&mut self, stream: &CudaStream) -> EngineResult<usize> {
+        let main = self.arena.resume(stream)?;
+        let cache = self.kv_arena.resume(stream)?;
+        main.checked_add(cache)
+            .ok_or_else(|| EngineError::layout("resident resumed byte count overflows"))
+    }
+
+    pub(crate) fn reload_released_arenas(&self, stream: &CudaStream) -> EngineResult<()> {
+        self.arena.zero_all(stream)?;
+        self.kv_arena.zero_all(stream)?;
+        let mut sink = LegacyWeightSink {
+            arena: &self.arena,
+            copy_ns: 0,
+        };
+        let mut preparation = ResidentPreparationStats::default();
+        let scalars = load_source_weights(
+            &mut sink,
+            stream,
+            &self.layout,
+            self.snapshot.as_ref(),
+            &mut preparation,
+        )?;
+        if scalars.len() != self.scalars.len()
+            || !scalars
+                .iter()
+                .zip(&self.scalars)
+                .all(|(reloaded, original)| reloaded.same_bits(*original))
+        {
+            return Err(EngineError::layout(
+                "reloaded resident scalar inventory differs from graph capture",
+            ));
+        }
+        initialize_metadata(&self.arena, &self.kv_arena, stream, &self.layout)?;
+        stream.synchronize().map_err(GpuError::from)?;
         Ok(())
     }
 
@@ -2213,6 +2517,11 @@ impl ResidentModelProgram {
     /// Complete device arena bytes, including exact alignment padding.
     pub const fn arena_bytes(&self) -> usize {
         self.layout.arena_bytes()
+    }
+
+    /// Physical VMM bytes currently mapped by both target arenas.
+    pub fn mapped_device_bytes(&self) -> usize {
+        self.arena.mapped_physical_bytes() + self.kv_arena.mapped_physical_bytes()
     }
 
     /// Weight, GDN-state, and shared-workspace allocation bytes.
@@ -3979,6 +4288,30 @@ enum MlpScalars {
 struct LayerScalars {
     mixer: MixerScalars,
     mlp: MlpScalars,
+}
+
+impl LayerScalars {
+    fn same_bits(self, other: Self) -> bool {
+        let mixer = match (self.mixer, other.mixer) {
+            (MixerScalars::Gdn, MixerScalars::Gdn) => true,
+            (MixerScalars::Attention(left), MixerScalars::Attention(right)) => {
+                left.key_cache_scale.to_bits() == right.key_cache_scale.to_bits()
+                    && left.value_cache_scale.to_bits() == right.value_cache_scale.to_bits()
+            }
+            _ => false,
+        };
+        let mlp = match (self.mlp, other.mlp) {
+            (MlpScalars::DenseFp8, MlpScalars::DenseFp8) => true,
+            (MlpScalars::Nvfp4(left), MlpScalars::Nvfp4(right)) => {
+                left.gate_up_input.to_bits() == right.gate_up_input.to_bits()
+                    && left.gate_up_weight.to_bits() == right.gate_up_weight.to_bits()
+                    && left.down_input.to_bits() == right.down_input.to_bits()
+                    && left.down_weight.to_bits() == right.down_weight.to_bits()
+            }
+            _ => false,
+        };
+        mixer && mlp
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -6612,6 +6945,35 @@ fn require_gdn_snapshot_buffers(
     if history.len() != expected_history || state.len() != expected_state {
         return Err(EngineError::layout(format!(
             "resident GDN snapshot buffers have {}/{} history/state values, expected {expected_history}/{expected_state}",
+            history.len(),
+            state.len()
+        )));
+    }
+    Ok(())
+}
+
+fn require_compact_gdn_snapshot_buffers(
+    program: &ResidentModelProgram,
+    row: usize,
+    history: &PinnedHostBuffer<u16>,
+    state: &PinnedHostBuffer<f32>,
+) -> EngineResult<()> {
+    let rows = row
+        .checked_add(1)
+        .ok_or_else(|| EngineError::layout("resident compact GDN row overflows"))?;
+    let required_history = product(
+        "resident compact GDN history values",
+        rows,
+        program.gdn_slot_history_values(),
+    )?;
+    let required_state = product(
+        "resident compact GDN state values",
+        rows,
+        program.gdn_slot_state_values(),
+    )?;
+    if history.len() < required_history || state.len() < required_state {
+        return Err(EngineError::layout(format!(
+            "resident compact GDN buffers have {}/{} values, need at least {required_history}/{required_state}",
             history.len(),
             state.len()
         )));

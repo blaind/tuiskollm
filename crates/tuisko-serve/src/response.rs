@@ -31,6 +31,10 @@ pub enum GenerationReply {
     Rejected(String),
     /// Request admission must be retried after resident capacity is released.
     Overloaded(String),
+    /// Runtime model loading failed before request admission.
+    Unavailable(String),
+    /// Runtime model resume failed before request admission.
+    ResumeUnavailable(String),
     /// Resident execution failed after admission.
     Failed(String),
 }
@@ -105,6 +109,10 @@ pub async fn blocking_response(
                 return openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
             }
             GenerationReply::Overloaded(message) => return overloaded_response(message),
+            GenerationReply::Unavailable(message) => return unavailable_response(message),
+            GenerationReply::ResumeUnavailable(message) => {
+                return resume_unavailable_response(message);
+            }
             GenerationReply::Failed(message) => {
                 return openai_error(StatusCode::INTERNAL_SERVER_ERROR, message, "server_error");
             }
@@ -236,6 +244,10 @@ pub fn streaming_response(
                     let (message, error_type) = match error {
                         GenerationReply::Rejected(message) => (message, "invalid_request_error"),
                         GenerationReply::Overloaded(message) => (message, "server_overloaded"),
+                        GenerationReply::Unavailable(message) => (message, "model_load_failed"),
+                        GenerationReply::ResumeUnavailable(message) => {
+                            (message, "model_resume_failed")
+                        }
                         GenerationReply::Failed(message) => (message, "server_error"),
                         _ => unreachable!("delta and terminal replies were handled above"),
                     };
@@ -289,6 +301,30 @@ pub fn openai_error(status: StatusCode, message: String, error_type: &'static st
 
 pub(crate) fn overloaded_response(message: String) -> Response {
     let mut response = openai_error(StatusCode::TOO_MANY_REQUESTS, message, "server_overloaded");
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+pub(crate) fn unavailable_response(message: String) -> Response {
+    let mut response = openai_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        message,
+        "model_load_failed",
+    );
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+pub(crate) fn resume_unavailable_response(message: String) -> Response {
+    let mut response = openai_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        message,
+        "model_resume_failed",
+    );
     response
         .headers_mut()
         .insert(RETRY_AFTER, HeaderValue::from_static("1"));
@@ -594,6 +630,32 @@ mod tests {
             assert_eq!(response.headers()[header::RETRY_AFTER], "1");
             let error: Value = serde_json::from_str(&body(response).await).unwrap();
             assert_eq!(error["error"]["type"], "server_overloaded");
+
+            let (sender, receiver) = channel(8);
+            sender
+                .try_send(GenerationReply::Unavailable(
+                    "checkpoint reload failed".into(),
+                ))
+                .unwrap();
+            let response =
+                blocking_response(receiver, "id".into(), 1, TEST_MODEL, false, false).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            let error: Value = serde_json::from_str(&body(response).await).unwrap();
+            assert_eq!(error["error"]["type"], "model_load_failed");
+
+            let (sender, receiver) = channel(8);
+            sender
+                .try_send(GenerationReply::ResumeUnavailable(
+                    "checkpoint resume failed".into(),
+                ))
+                .unwrap();
+            let response =
+                blocking_response(receiver, "id".into(), 1, TEST_MODEL, false, false).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            let error: Value = serde_json::from_str(&body(response).await).unwrap();
+            assert_eq!(error["error"]["type"], "model_resume_failed");
 
             let (sender, receiver) = channel::<GenerationReply>(8);
             drop(sender);

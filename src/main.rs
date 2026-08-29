@@ -50,6 +50,9 @@ struct ServeArgs {
         value_parser = parse_address
     )]
     address: SocketAddr,
+    /// Environment variable containing the lifecycle-route bearer token.
+    #[arg(long, value_name = "ENV")]
+    admin_token_env: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -69,6 +72,14 @@ fn main() -> ExitCode {
 }
 
 fn run_serve(args: ServeArgs) -> Result<(), String> {
+    if !args.address.ip().is_loopback() && args.admin_token_env.is_none() {
+        return Err("a non-loopback listener requires --admin-token-env".into());
+    }
+    if let Some(variable) = args.admin_token_env.as_deref() {
+        std::env::var(variable).map_err(|_| {
+            format!("admin token environment variable `{variable}` is unset or not Unicode")
+        })?;
+    }
     let stdout = std::io::stdout();
     let interactive = stdout.is_terminal();
     let color = interactive && std::env::var_os("NO_COLOR").is_none();
@@ -109,6 +120,7 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         model: args.model,
         snapshot: resolution.path,
         address: args.address,
+        admin_token_env: args.admin_token_env,
     })
     .map_err(|error| error.to_string())
 }
@@ -327,6 +339,7 @@ mod tests {
                     model,
                     snapshot: None,
                     address: DEFAULT_ADDRESS.parse::<SocketAddr>().unwrap(),
+                    admin_token_env: None,
                 })
             );
         }
@@ -346,6 +359,8 @@ mod tests {
                 "/models/pinned",
                 "--address",
                 "0.0.0.0:9123",
+                "--admin-token-env",
+                "TUISKO_ADMIN_TOKEN",
             ],
             vec![
                 "serve",
@@ -354,6 +369,8 @@ mod tests {
                 "0.0.0.0:9123",
                 "--snapshot",
                 "/models/pinned",
+                "--admin-token-env",
+                "TUISKO_ADMIN_TOKEN",
             ],
         ] {
             assert_eq!(
@@ -362,6 +379,7 @@ mod tests {
                     model: ServerModel::Qwen35,
                     snapshot: Some(PathBuf::from("/models/pinned")),
                     address: "0.0.0.0:9123".parse().unwrap(),
+                    admin_token_env: Some("TUISKO_ADMIN_TOKEN".into()),
                 })
             );
         }

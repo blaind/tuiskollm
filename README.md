@@ -64,7 +64,13 @@ targets, not fallback servers. Vision is not served yet.
 - Address-stable resident arenas and immutable whole-model CUDA Graphs.
 - Exact compact scheduling for every admitted B=1..8 route.
 - Paged KV ownership, retained-prefix reuse, cancellation, and retryable overload.
-- Blocking and SSE `POST /v1/chat/completions`, plus `GET /health` and `GET /v1/models`.
+- Blocking and SSE `POST /v1/chat/completions`, plus `GET /health`, `GET /ready`, and
+  `GET /v1/models`.
+- Qwen3.8 lifecycle administration: `/v1/unload`/`load` release and recreate the complete model;
+  `/v1/park`/`resume` preserve retained-prefix KV and recurrent state in pinned host memory while
+  releasing all target/MTP arena backing. Resume reloads represented weights from the admitted
+  snapshot at the retained graph addresses before restoring the mirror. Exact-model park/resume
+  device qualification remains pending.
 - Request logs with queue-inclusive latency, TTFT, decode rate, cache reuse, and route identity.
 
 ## Build from source
@@ -87,6 +93,11 @@ target/cuda-oxide-build-sm120/release/tuiskollm serve \
 ```
 
 `--address ADDRESS` overrides the default `127.0.0.1:8000` listener.
+The lifecycle routes are enabled only for the exact Qwen3.8 target. A non-loopback listener also
+requires `--admin-token-env NAME`; requests then authenticate with `Authorization: Bearer ...`.
+Park is accepted only after previously admitted chats drain. The first chat submitted while parked
+starts one resume attempt; concurrent chats pend behind that same attempt. Explicit `/v1/resume`
+remains available for administrative warmup.
 
 For qualification commands and engineering constraints, see
 [`docs/performance.md`](docs/performance.md) and [`AGENTS.md`](AGENTS.md). The optional
