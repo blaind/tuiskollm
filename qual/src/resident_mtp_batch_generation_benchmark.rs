@@ -21,6 +21,7 @@ const OUTPUT_TOKENS: usize = 8;
 const SCORING_BATCH: u32 = 4;
 const SHARED_SCORING_METRIC: &str = "qwen3_8/scoring/prompt_batch_shared_prefix";
 const INDEPENDENT_SCORING_METRIC: &str = "qwen3_8/scoring/prompt_batch_independent";
+const NATIVE_SCORING_METRIC: &str = "qwen3_8/scoring/native_loglikelihood";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RoundOutcome {
@@ -314,6 +315,11 @@ pub fn benchmark_resident_mtp_prompt_scoring(
     })?;
     let prompts = scoring_prompts(&frontend)?;
     let (prompt_tokens, common_tokens) = scoring_prompt_shape(&prompts)?;
+    let native_context = prompts[0][..common_tokens].to_vec();
+    let native_continuations = prompts
+        .iter()
+        .map(|prompt| prompt[common_tokens..].to_vec())
+        .collect::<Vec<_>>();
     let input_reference = prompts.clone();
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     if context.compute_capability().map_err(GpuError::from)? != (12, 0) {
@@ -327,16 +333,31 @@ pub fn benchmark_resident_mtp_prompt_scoring(
     let stable_addresses = generator.qualification_addresses()?;
 
     let mut reference = None;
+    let mut native_reference = None;
     for _ in 0..warmup {
         let (_, shared) = run_shared_scoring(&mut generator, &prompts)?;
         let (_, independent) = run_independent_scoring(&mut generator, &prompts)?;
         require_scoring_output(reference.as_ref(), &shared, &independent)?;
         reference.get_or_insert(shared);
+        let (_, native) =
+            run_native_scoring(&mut generator, &native_context, &native_continuations)?;
+        require_native_scoring_output(
+            native_reference.as_ref(),
+            &native,
+            &independent,
+            common_tokens,
+        )?;
+        native_reference.get_or_insert(native);
         require_scoring_input(&prompts, &input_reference)?;
     }
     let reference = reference.ok_or_else(|| {
         DeviceBenchmarkError::Precondition(
             "prompt scoring benchmark requires at least one warmup".to_string(),
+        )
+    })?;
+    let native_reference = native_reference.ok_or_else(|| {
+        DeviceBenchmarkError::Precondition(
+            "native loglikelihood benchmark requires at least one warmup".to_string(),
         )
     })?;
     require_stable_addresses(&generator, &stable_addresses)?;
@@ -347,6 +368,14 @@ pub fn benchmark_resident_mtp_prompt_scoring(
         let (_, shared) = run_shared_scoring(&mut generator, &prompts)?;
         let (_, independent) = run_independent_scoring(&mut generator, &prompts)?;
         require_scoring_output(Some(&reference), &shared, &independent)?;
+        let (_, native) =
+            run_native_scoring(&mut generator, &native_context, &native_continuations)?;
+        require_native_scoring_output(
+            Some(&native_reference),
+            &native,
+            &independent,
+            common_tokens,
+        )?;
         require_stable_addresses(&generator, &stable_addresses)
     })?;
 
@@ -354,21 +383,33 @@ pub fn benchmark_resident_mtp_prompt_scoring(
     let mut samples = [
         Vec::with_capacity(options.samples),
         Vec::with_capacity(options.samples),
+        Vec::with_capacity(options.samples),
     ];
     for sample in 0..options.samples {
         for case in measurement_order(sample, samples.len()) {
             let mut elapsed = Duration::ZERO;
             for _ in 0..options.launches_per_sample {
-                let (iteration, outcome) = if case == 0 {
-                    run_shared_scoring(&mut generator, &prompts)?
+                if case == 2 {
+                    let (iteration, outcome) =
+                        run_native_scoring(&mut generator, &native_context, &native_continuations)?;
+                    elapsed += iteration;
+                    if outcome != native_reference {
+                        return Err(DeviceBenchmarkError::Precondition(
+                            "native loglikelihood output changed between samples".to_string(),
+                        ));
+                    }
                 } else {
-                    run_independent_scoring(&mut generator, &prompts)?
-                };
-                elapsed += iteration;
-                if outcome != reference {
-                    return Err(DeviceBenchmarkError::Precondition(format!(
-                        "prompt scoring case {case} changed output between samples"
-                    )));
+                    let (iteration, outcome) = if case == 0 {
+                        run_shared_scoring(&mut generator, &prompts)?
+                    } else {
+                        run_independent_scoring(&mut generator, &prompts)?
+                    };
+                    elapsed += iteration;
+                    if outcome != reference {
+                        return Err(DeviceBenchmarkError::Precondition(format!(
+                            "prompt scoring case {case} changed output between samples"
+                        )));
+                    }
                 }
             }
             samples[case]
@@ -390,6 +431,13 @@ pub fn benchmark_resident_mtp_prompt_scoring(
             DeviceBenchmarkError::Precondition("prompt length exceeds u64".to_string())
         })?,
     );
+    let native_workload = BenchmarkWorkload::warm_model_native_loglikelihood(
+        SCORING_BATCH,
+        u64::try_from(common_tokens).map_err(|_| {
+            DeviceBenchmarkError::Precondition("native context length exceeds u64".to_string())
+        })?,
+        u64::from(SCORING_BATCH),
+    );
     let metrics = vec![
         host_completion_metric(
             SHARED_SCORING_METRIC,
@@ -407,13 +455,23 @@ pub fn benchmark_resident_mtp_prompt_scoring(
             0,
             std::mem::take(&mut samples[1]),
         )?,
+        host_completion_metric(
+            NATIVE_SCORING_METRIC,
+            format!(
+                "B={SCORING_BATCH},branches={SCORING_BATCH},context={common_tokens},continuations={SCORING_BATCH}"
+            ),
+            native_workload,
+            options.launches_per_sample,
+            0,
+            std::mem::take(&mut samples[2]),
+        )?,
     ];
     let memory = memory.finish(&telemetry)?;
     finish_report(
         BenchmarkReportSpec {
             suite: "bench-prompt-scoring",
             classification: "performance_sensitive_model",
-            timing_scope: "separate direct Rust host completion for one production four-choice shared-prefix batch and the complete four-prompt independent reference",
+            timing_scope: "separate direct Rust host completion for native four-branch loglikelihood, one compatibility four-choice shared-prefix batch, and the complete four-prompt independent reference",
         },
         preflight,
         baseline_sha256,
@@ -498,6 +556,46 @@ fn run_independent_scoring(
         .map(|prompt| generator.score_prompt(prompt))
         .collect::<Result<Vec<_>, _>>()?;
     Ok((started.elapsed(), output))
+}
+
+fn run_native_scoring(
+    generator: &mut ResidentMtpBatchGenerator,
+    context: &[u32],
+    continuations: &[Vec<u32>],
+) -> Result<(Duration, Vec<tuisko_engine::ContinuationLogprobs>), DeviceBenchmarkError> {
+    let started = Instant::now();
+    let output = generator.score_continuations(context, continuations)?;
+    Ok((started.elapsed(), output))
+}
+
+fn require_native_scoring_output(
+    expected: Option<&Vec<tuisko_engine::ContinuationLogprobs>>,
+    native: &[tuisko_engine::ContinuationLogprobs],
+    independent: &[PromptLogprobs],
+    context_tokens: usize,
+) -> Result<(), DeviceBenchmarkError> {
+    let reference = independent
+        .iter()
+        .map(|score| {
+            let tokens = score.prompt[context_tokens..]
+                .iter()
+                .map(|token| token.clone().expect("continuation score exists"))
+                .collect::<Vec<_>>();
+            tuisko_engine::ContinuationLogprobs {
+                logprob: tokens.iter().map(|token| f64::from(token.logprob)).sum(),
+                is_greedy: tokens
+                    .iter()
+                    .all(|token| token.token_id == token.top_token_id),
+                tokens,
+            }
+        })
+        .collect::<Vec<_>>();
+    if native != reference || expected.is_some_and(|expected| expected != native) {
+        return Err(DeviceBenchmarkError::Precondition(
+            "native and independent continuation scoring outputs are not invariant".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn require_scoring_output(
@@ -829,6 +927,13 @@ mod tests {
             super::SHARED_SCORING_METRIC,
             super::INDEPENDENT_SCORING_METRIC
         );
+        assert_ne!(super::NATIVE_SCORING_METRIC, super::SHARED_SCORING_METRIC);
+        let native = BenchmarkWorkload::warm_model_native_loglikelihood(4, 95, 4);
+        assert_eq!(native.batch_size, Some(4));
+        assert_eq!(native.concurrency, Some(1));
+        assert_eq!(native.active_tokens, Some(99));
+        assert_eq!(native.prompt_tokens, Some(95));
+        assert_eq!(native.output_tokens, Some(4));
     }
 
     #[test]

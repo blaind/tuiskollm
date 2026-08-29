@@ -76,6 +76,15 @@ pub struct CompletionRequest {
     echo: bool,
 }
 
+/// Token-ID-only native continuation log-likelihood request.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoglikelihoodRequest {
+    model: String,
+    context: Vec<u32>,
+    continuations: Vec<Vec<u32>>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum CompletionPrompt {
@@ -145,6 +154,15 @@ pub struct PreparedChatRequest {
 pub struct PreparedCompletionRequest {
     /// One to eight nonempty token-ID prompts in response-choice order.
     pub prompts: Vec<Vec<u32>>,
+}
+
+/// Exact token-ID context and continuation branches admitted for native evaluation.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PreparedLoglikelihoodRequest {
+    /// Nonempty shared context.
+    pub context: Vec<u32>,
+    /// One to eight nonempty continuations in response order.
+    pub continuations: Vec<Vec<u32>>,
 }
 
 /// Rejection at the OpenAI transport boundary.
@@ -362,6 +380,79 @@ impl CompletionRequest {
         }
         Ok(PreparedCompletionRequest { prompts })
     }
+}
+
+impl LoglikelihoodRequest {
+    /// Validates the exact model, vocabulary, branch count, and resident position capacity.
+    pub fn prepare_for(
+        self,
+        served_model: &str,
+        context_capacity: usize,
+    ) -> Result<PreparedLoglikelihoodRequest, ChatRequestError> {
+        if self.model != served_model {
+            return Err(ChatRequestError::ModelNotFound {
+                requested: self.model,
+            });
+        }
+        if served_model != SERVED_MODEL {
+            return Err(ChatRequestError::Invalid(
+                "native loglikelihood is unsupported for this exact target".into(),
+            ));
+        }
+        if self.context.is_empty() {
+            return Err(ChatRequestError::Invalid(
+                "loglikelihood context must not be empty".into(),
+            ));
+        }
+        if self.continuations.is_empty() || self.continuations.len() > 8 {
+            return Err(ChatRequestError::Invalid(
+                "loglikelihood requires 1..=8 continuations".into(),
+            ));
+        }
+        validate_token_ids("context", 0, &self.context)?;
+        for (index, continuation) in self.continuations.iter().enumerate() {
+            if continuation.is_empty() {
+                return Err(ChatRequestError::Invalid(format!(
+                    "loglikelihood continuation {index} is empty"
+                )));
+            }
+            validate_token_ids("continuation", index, continuation)?;
+            let positions = self
+                .context
+                .len()
+                .checked_add(continuation.len())
+                .ok_or_else(|| {
+                    ChatRequestError::Invalid("loglikelihood token count overflows".into())
+                })?;
+            if positions > context_capacity {
+                return Err(ChatRequestError::Invalid(format!(
+                    "loglikelihood continuation {index} requires {positions} positions, current resident capacity is {context_capacity}"
+                )));
+            }
+        }
+        Ok(PreparedLoglikelihoodRequest {
+            context: self.context,
+            continuations: self.continuations,
+        })
+    }
+}
+
+fn validate_token_ids(
+    kind: &str,
+    branch: usize,
+    token_ids: &[u32],
+) -> Result<(), ChatRequestError> {
+    if let Some((position, token)) =
+        token_ids.iter().copied().enumerate().find(|(_, token)| {
+            usize::try_from(*token).map_or(true, |token| token >= Qwen38_27B::VOCAB)
+        })
+    {
+        return Err(ChatRequestError::Invalid(format!(
+            "loglikelihood token {token} in {kind} {branch} at position {position} is outside vocabulary 0..{}",
+            Qwen38_27B::VOCAB
+        )));
+    }
+    Ok(())
 }
 
 fn deserialize_positive_token_limit<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
@@ -626,10 +717,11 @@ fn require_no_special_tokens(what: &str, text: &str) -> Result<(), ChatRequestEr
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatCompletionRequest, ChatRequestError, CompletionRequest, SERVED_MODEL, SamplingPenalties,
+        ChatCompletionRequest, ChatRequestError, CompletionRequest, LoglikelihoodRequest,
+        SERVED_MODEL, SamplingPenalties,
     };
     use tuisko_frontend::GenerationDefaults;
-    use tuisko_model::{Arch, Qwen35_9B};
+    use tuisko_model::{Arch, Qwen35_9B, Qwen38_27B};
 
     fn request(body: &str) -> ChatCompletionRequest {
         serde_json::from_str(body).unwrap()
@@ -637,6 +729,59 @@ mod tests {
 
     fn completion(body: &str) -> CompletionRequest {
         serde_json::from_str(body).unwrap()
+    }
+
+    fn loglikelihood(body: &str) -> LoglikelihoodRequest {
+        serde_json::from_str(body).unwrap()
+    }
+
+    #[test]
+    fn admits_native_loglikelihood_and_rejects_every_wire_boundary() {
+        let admitted = loglikelihood(&format!(
+            r#"{{"model":"{SERVED_MODEL}","context":[1,2],"continuations":[[3],[4,5]]}}"#
+        ))
+        .prepare_for(SERVED_MODEL, 4)
+        .unwrap();
+        assert_eq!(admitted.context, vec![1, 2]);
+        assert_eq!(admitted.continuations, vec![vec![3], vec![4, 5]]);
+
+        for (context, continuations, capacity, expected) in [
+            ("[]", "[[1]]", 8, "context must not be empty"),
+            ("[1]", "[]", 8, "1..=8 continuations"),
+            ("[1]", "[[]]", 8, "continuation 0 is empty"),
+            ("[1,2]", "[[3,4,5]]", 4, "requires 5 positions"),
+        ] {
+            let error = loglikelihood(&format!(
+                r#"{{"model":"{SERVED_MODEL}","context":{context},"continuations":{continuations}}}"#
+            ))
+            .prepare_for(SERVED_MODEL, capacity)
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        let unknown = format!(
+            r#"{{"model":"{SERVED_MODEL}","context":[1],"continuations":[[2]],"text":"no"}}"#
+        );
+        assert!(serde_json::from_str::<LoglikelihoodRequest>(&unknown).is_err());
+
+        let too_many = vec![vec![1]; 9];
+        let body = serde_json::json!({
+            "model": SERVED_MODEL,
+            "context": [1],
+            "continuations": too_many,
+        });
+        let error = serde_json::from_value::<LoglikelihoodRequest>(body)
+            .unwrap()
+            .prepare_for(SERVED_MODEL, 16)
+            .unwrap_err();
+        assert!(error.to_string().contains("1..=8 continuations"));
+
+        let outside = u32::try_from(Qwen38_27B::VOCAB).unwrap();
+        let error = loglikelihood(&format!(
+            r#"{{"model":"{SERVED_MODEL}","context":[{outside}],"continuations":[[1]]}}"#
+        ))
+        .prepare_for(SERVED_MODEL, 4)
+        .unwrap_err();
+        assert!(error.to_string().contains("outside vocabulary"));
     }
 
     #[test]

@@ -526,6 +526,26 @@ impl BenchmarkWorkload {
         }
     }
 
+    pub(crate) fn warm_model_native_loglikelihood(
+        branches: u32,
+        context_tokens: u64,
+        continuation_tokens: u64,
+    ) -> Self {
+        Self {
+            scope: BenchmarkScope::Model,
+            phase: BenchmarkPhase::Request,
+            batch_size: Some(branches),
+            concurrency: Some(1),
+            active_tokens: Some(context_tokens + continuation_tokens),
+            prompt_tokens: Some(context_tokens),
+            context_tokens: Some(context_tokens),
+            output_tokens: Some(continuation_tokens),
+            device_cache: DeviceCacheRegime::Warm,
+            prefix_cache: None,
+            execution: BenchmarkExecution::HostSynchronized,
+        }
+    }
+
     pub(crate) fn warm_model_cancellation_resume(
         prompt_tokens: u64,
         message_boundary_tokens: u64,

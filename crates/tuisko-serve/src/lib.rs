@@ -12,8 +12,8 @@ pub use assistant::{
     ParsedToolCall, parse_assistant_output, parse_assistant_output_constrained,
 };
 pub use request::{
-    ChatCompletionRequest, ChatRequestError, CompletionRequest, PreparedChatRequest,
-    PreparedCompletionRequest, SERVED_MODEL,
+    ChatCompletionRequest, ChatRequestError, CompletionRequest, LoglikelihoodRequest,
+    PreparedChatRequest, PreparedCompletionRequest, PreparedLoglikelihoodRequest, SERVED_MODEL,
 };
 pub use response::{GenerationReply, blocking_response, openai_error, streaming_response};
 pub use server::{ServerConfig, ServerError, ServerModel, run};

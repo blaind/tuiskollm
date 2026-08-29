@@ -56,6 +56,17 @@ pub struct PromptLogprobs {
     pub token_text: Vec<String>,
 }
 
+/// Exact native evaluation score for one continuation branch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContinuationLogprobs {
+    /// FP64 host sum of the per-token natural-log probabilities.
+    pub logprob: f64,
+    /// Whether every continuation token was the first argmax for its row.
+    pub is_greedy: bool,
+    /// Per-token scores in teacher-forced continuation order.
+    pub tokens: Vec<PromptTokenLogprob>,
+}
+
 impl ChatGenerationRequest {
     /// Creates a request with the admitted checkpoint defaults.
     pub fn new(messages: Vec<ChatMessage>) -> Self {

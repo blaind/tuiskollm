@@ -77,6 +77,10 @@ On a shared local GPU, run bounded evaluation cases sequentially with `num_concu
 limited-run metrics as diagnostics rather than accuracy authority. If the evaluation runner owns
 the server lifecycle, stop it promptly after the selected cases; never stop a reused server unless
 its owner asks. See `docs/evaluation.md` for the verified harness environment and commands.
+Native continuation scoring keeps the tokenizer-supplied context boundary explicit, replays that
+context once, and scores one-token alternatives from its one exact B=1 boundary row without a
+fabricated completion. Qualify it against route-aligned independent scoring and time the complete
+native owner directly; the OpenAI echo-logprob compatibility route is not its performance proxy.
 For a reused workspace, inactive-tail checks begin after the widest surviving writer, not
 necessarily the final writer. If an owner's output aliases its next input, a repeated benchmark
 must restore the production input before every measured replay.
