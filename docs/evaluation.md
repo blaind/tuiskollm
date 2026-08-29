@@ -87,6 +87,22 @@ accuracy is not evaluation authority. On an exclusive GPU, establish a measured 
 rate with `--limit 10`, then `--limit 100`, before scheduling a full suite. On a shared GPU, keep
 the cases sequential and bounded, then stop the server promptly to release resident memory.
 
+### MMLU planning estimate
+
+The harness's `mmlu` group contains 14,042 test questions across 57 subjects and scores four
+choices per question. On the exact RTX 5090 target, a ten-question `mmlu_abstract_algebra` pilot
+with `batch_size=4` and `num_concurrent=1` measured:
+
+| Setting | Complete pilot wall time | API scoring time | Full-suite planning estimate |
+| --- | ---: | ---: | ---: |
+| zero-shot | 25.78 s | about 17 s | about 6.5–7 hours |
+| five-shot | 37.30 s | about 31 s | about 12–13 hours |
+
+These are single-subject diagnostic extrapolations, not controlled performance results. Subject
+prompt lengths vary substantially, so reserve additional time and run the full group only during
+an exclusive GPU window. Pin `--num_fewshot 0` or `5` explicitly; otherwise a harness-default
+change can alter both the quality result and duration.
+
 Generation-only tasks continue to use `local-chat-completions` and
 `http://127.0.0.1:8000/v1/chat/completions`.
 
