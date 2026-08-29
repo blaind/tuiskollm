@@ -963,7 +963,9 @@ pub use resident_mtp_batch_generation::{
     qualify_resident_mtp_batch_generation,
 };
 #[cfg(feature = "device")]
-pub use resident_mtp_batch_generation_benchmark::benchmark_resident_mtp_batch_generation;
+pub use resident_mtp_batch_generation_benchmark::{
+    benchmark_resident_mtp_batch_generation, benchmark_resident_mtp_prompt_scoring,
+};
 #[cfg(feature = "device")]
 pub use resident_mtp_benchmark::benchmark_resident_mtp;
 #[cfg(feature = "device")]
