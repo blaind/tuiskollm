@@ -3713,6 +3713,7 @@ impl ResidentModelProgram {
                 route.tokens,
                 0,
                 route.maximum_length,
+                true,
                 route.attention,
                 self.ops(),
                 workspace,
@@ -3871,6 +3872,7 @@ impl ResidentModelProgram {
                     route.tokens,
                     0,
                     route.maximum_length,
+                    true,
                     route.attention,
                     self.ops(),
                     workspace,
@@ -5441,6 +5443,7 @@ fn launch_target_mtp_verify(
         stream,
         route.tokens,
         0,
+        true,
         route.maximum_length,
         route.attention,
         ops,
@@ -5461,6 +5464,7 @@ fn launch_target_mtp_segmented_verify(
             stream,
             route.tokens,
             lane,
+            route.batch == 1,
             route.maximum_length,
             route.attention,
             ops,
@@ -5476,6 +5480,7 @@ fn launch_target_mtp_verify_lane(
     stream: &CudaStream,
     tokens: usize,
     lane: usize,
+    allow_long_context_mtp_cache_reuse: bool,
     maximum_length: usize,
     attention: AttentionRoute,
     ops: Ops<'_>,
@@ -5508,6 +5513,7 @@ fn launch_target_mtp_verify_lane(
             tokens,
             lane,
             maximum_length,
+            allow_long_context_mtp_cache_reuse,
             attention,
             ops,
             workspace,
@@ -5584,6 +5590,7 @@ fn launch_target_mtp_mixer(
     tokens: usize,
     lane: usize,
     maximum_length: usize,
+    allow_long_context_mtp_cache_reuse: bool,
     attention: AttentionRoute,
     ops: Ops<'_>,
     workspace: WorkspacePointers,
@@ -5727,7 +5734,9 @@ fn launch_target_mtp_mixer(
                         p.scalars.value_cache_scale,
                     )?,
                     AttentionRoute::Long { .. } => {
-                        if !use_long_context_mtp_cache_reuse(tokens, maximum_length) {
+                        if !allow_long_context_mtp_cache_reuse
+                            || !use_long_context_mtp_cache_reuse(tokens, maximum_length)
+                        {
                             ops.long_context_paged_gqa.launch(
                                 stream,
                                 tokens,

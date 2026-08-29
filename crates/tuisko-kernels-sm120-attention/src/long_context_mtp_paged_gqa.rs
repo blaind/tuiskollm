@@ -49,7 +49,7 @@ fn require_geometry<A: Arch>() -> GpuResult<()> {
 mod kernels {
     use super::*;
 
-    /// Reuses each represented 64-position K/V tile across K provisional rows.
+    /// Uses native FP8 QK while reusing each represented K/V tile across provisional rows.
     #[kernel]
     #[launch_bounds(256, 2)]
     #[allow(clippy::too_many_arguments)]
@@ -57,7 +57,7 @@ mod kernels {
         domain = 1,
         coordinates = u32,
         block = (256, 1, 1),
-        dynamic_shared = 32768,
+        dynamic_shared = 47232,
         dynamic_shared_alignment = 16,
         min_compute_capability = (12, 0),
     )]
@@ -411,7 +411,7 @@ mod tests {
             vec![2, 3, 4]
         );
         assert_eq!(LONG_CONTEXT_MTP_THREADS, 256);
-        assert_eq!(LONG_CONTEXT_MTP_SHARED_BYTES, 32_768);
+        assert_eq!(LONG_CONTEXT_MTP_SHARED_BYTES, 47_232);
     }
 
     #[test]

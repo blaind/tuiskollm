@@ -1180,7 +1180,7 @@ fn compare_observables(
     Ok(())
 }
 
-fn compare_exact<T: Eq>(
+fn compare_exact<T: Eq + std::fmt::Debug>(
     role: &str,
     actual: &[T],
     expected: &[T],
@@ -1194,7 +1194,8 @@ fn compare_exact<T: Eq>(
     }
     if let Some(index) = actual.iter().zip(expected).position(|(a, b)| a != b) {
         return Err(TargetMtpVerifyQualificationError::Mismatch(format!(
-            "{role} differs at value {index}"
+            "{role} differs at value {index}: actual={:?}, expected={:?}",
+            actual[index], expected[index]
         )));
     }
     Ok(())

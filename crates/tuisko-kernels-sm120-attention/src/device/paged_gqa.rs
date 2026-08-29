@@ -73,8 +73,19 @@ pub(crate) const LONG_CONTEXT_MAX_PARTITIONS: usize =
     LONG_CONTEXT_MAX_TOKENS.div_ceil(LONG_CONTEXT_PARTITION_SIZE);
 pub(crate) const LONG_CONTEXT_MTP_THREADS: usize = 256;
 pub(crate) const LONG_CONTEXT_MTP_TILE: usize = PAGE_SIZE;
-pub(crate) const LONG_CONTEXT_MTP_SHARED_BYTES: usize = 2 * LONG_CONTEXT_MTP_TILE * 256;
 const LONG_CONTEXT_MTP_WARPS: usize = LONG_CONTEXT_MTP_THREADS / WARP_THREADS;
+const LONG_CONTEXT_MTP_QUERY_ROWS: usize = 32;
+const LONG_CONTEXT_MTP_MAX_ROWS: usize = 24;
+const LONG_CONTEXT_MTP_QUERY_BYTES: usize = LONG_CONTEXT_MTP_QUERY_ROWS * 256;
+const LONG_CONTEXT_MTP_PLANE_BYTES: usize = LONG_CONTEXT_MTP_TILE * 256;
+const LONG_CONTEXT_MTP_SCORE_BYTES: usize =
+    LONG_CONTEXT_MTP_MAX_ROWS * LONG_CONTEXT_MTP_TILE * size_of::<f32>();
+const LONG_CONTEXT_MTP_SCALE_BYTES: usize = LONG_CONTEXT_MTP_QUERY_ROWS * size_of::<f32>();
+pub(crate) const LONG_CONTEXT_MTP_SHARED_BYTES: usize = LONG_CONTEXT_MTP_QUERY_BYTES
+    + 2 * LONG_CONTEXT_MTP_PLANE_BYTES
+    + LONG_CONTEXT_MTP_SCORE_BYTES
+    + LONG_CONTEXT_MTP_SCALE_BYTES;
+const _: () = assert!(LONG_CONTEXT_MTP_SHARED_BYTES == 47_232);
 
 #[inline(always)]
 unsafe fn load_e4m3x8(source: *const u8, scale: f32) -> [f32; VALUES_PER_LANE] {
@@ -2226,26 +2237,17 @@ pub(crate) unsafe fn long_context_paged_gqa_partial<A: Arch, const TOKENS: usize
 
 #[inline(always)]
 fn update_long_context_mtp_row(
-    query: &[f32; VALUES_PER_LANE],
-    key: &[f32; VALUES_PER_LANE],
+    score: f32,
     value: &[f32; VALUES_PER_LANE],
     maximum: &mut f32,
     denominator: &mut f32,
     accumulator: &mut [f32; VALUES_PER_LANE],
 ) {
-    let mut score = 0.0f32;
-    let mut element = 0usize;
-    while element < VALUES_PER_LANE {
-        score = float::fma_rn_f32(query[element], key[element], score);
-        element += 1;
-    }
-    score = warp::reduce_sum_f32(score) * 0.0625;
-
     if score > *maximum {
         let old_scale = fast_exp(*maximum - score);
         *denominator = *denominator * old_scale + 1.0;
         *maximum = score;
-        element = 0;
+        let mut element = 0usize;
         while element < VALUES_PER_LANE {
             accumulator[element] =
                 float::fma_rn_f32(1.0, value[element], accumulator[element] * old_scale);
@@ -2254,12 +2256,52 @@ fn update_long_context_mtp_row(
     } else {
         let weight = fast_exp(score - *maximum);
         *denominator += weight;
-        element = 0;
+        let mut element = 0usize;
         while element < VALUES_PER_LANE {
             accumulator[element] = float::fma_rn_f32(weight, value[element], accumulator[element]);
             element += 1;
         }
     }
+}
+
+#[inline(always)]
+unsafe fn store_long_context_mtp_score_fragment(
+    scores: *mut f32,
+    row0: usize,
+    row1: usize,
+    key_base: usize,
+    lane_in_group: usize,
+    row_count: usize,
+    fragment: [f32; 4],
+) {
+    let key = key_base + lane_in_group * 2;
+    if row0 < row_count {
+        unsafe {
+            *scores.add(row0 * LONG_CONTEXT_MTP_TILE + key) = fragment[0];
+            *scores.add(row0 * LONG_CONTEXT_MTP_TILE + key + 1) = fragment[1];
+        }
+    }
+    if row1 < row_count {
+        unsafe {
+            *scores.add(row1 * LONG_CONTEXT_MTP_TILE + key) = fragment[2];
+            *scores.add(row1 * LONG_CONTEXT_MTP_TILE + key + 1) = fragment[3];
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn load_long_context_mtp_score(
+    scores: *const f32,
+    row: usize,
+    position: usize,
+    lane: usize,
+) -> f32 {
+    let score = if lane == 0 {
+        unsafe { *scores.add(row * LONG_CONTEXT_MTP_TILE + position) }
+    } else {
+        0.0
+    };
+    warp::shuffle_f32_sync(u32::MAX, score, 0)
 }
 
 #[inline(always)]
@@ -2320,7 +2362,7 @@ unsafe fn store_long_context_mtp_partial<A: Arch>(
     unsafe { store_aligned_f32x8(numerator, accumulator) };
 }
 
-/// Reuses one represented K/V tile across all provisional rows and six GQA heads.
+/// Uses packed QK while reusing one represented K/V tile across all provisional rows.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn long_context_mtp_paged_gqa_partial<A: Arch, const TOKENS: usize>(
@@ -2366,18 +2408,6 @@ pub(crate) unsafe fn long_context_mtp_paged_gqa_partial<A: Arch, const TOKENS: u
     let row0 = warp_index;
     let row1 = warp_index + LONG_CONTEXT_MTP_WARPS;
     let row2 = warp_index + 2 * LONG_CONTEXT_MTP_WARPS;
-
-    let query0 = unsafe { load_long_context_mtp_query::<A>(query, row0, kv_head, dimension) };
-    let query1 = if row1 < row_count {
-        unsafe { load_long_context_mtp_query::<A>(query, row1, kv_head, dimension) }
-    } else {
-        [0.0; VALUES_PER_LANE]
-    };
-    let query2 = if row2 < row_count {
-        unsafe { load_long_context_mtp_query::<A>(query, row2, kv_head, dimension) }
-    } else {
-        [0.0; VALUES_PER_LANE]
-    };
     let length0 = unsafe { *lengths.add(row0 / query_heads_per_kv) as usize };
     let length1 = if row1 < row_count {
         unsafe { *lengths.add(row1 / query_heads_per_kv) as usize }
@@ -2404,7 +2434,67 @@ pub(crate) unsafe fn long_context_mtp_paged_gqa_partial<A: Arch, const TOKENS: u
     let block_table = unsafe { block_tables.add(table_row * table_stride as usize) };
     let shared_words = DynamicSharedArray::<u32, 16>::get();
     let shared = shared_words.cast::<u8>();
-    let plane_words = LONG_CONTEXT_MTP_TILE * A::HEAD_DIM / size_of::<u32>();
+    let q_shared = shared;
+    let k_shared = unsafe { q_shared.add(LONG_CONTEXT_MTP_QUERY_BYTES) };
+    let v_shared = unsafe { k_shared.add(LONG_CONTEXT_MTP_PLANE_BYTES) };
+    let scores = unsafe { v_shared.add(LONG_CONTEXT_MTP_PLANE_BYTES) }.cast::<f32>();
+    let q_scales = unsafe {
+        scores
+            .cast::<u8>()
+            .add(LONG_CONTEXT_MTP_SCORE_BYTES)
+            .cast::<f32>()
+    };
+
+    let mut clear_word = tid;
+    while clear_word < LONG_CONTEXT_MTP_QUERY_BYTES / size_of::<u32>() {
+        unsafe { *q_shared.cast::<u32>().add(clear_word) = 0 };
+        clear_word += LONG_CONTEXT_MTP_THREADS;
+    }
+    thread::sync_threads();
+
+    let mut query_row = warp_index;
+    while query_row < row_count {
+        let values =
+            unsafe { load_long_context_mtp_query::<A>(query, query_row, kv_head, dimension) };
+        let mut absolute_maximum = values[0].abs();
+        let mut element = 1usize;
+        while element < VALUES_PER_LANE {
+            absolute_maximum = absolute_maximum.max(values[element].abs());
+            element += 1;
+        }
+        absolute_maximum = warp_max(absolute_maximum);
+        let scale = if absolute_maximum > 0.0 {
+            absolute_maximum / 448.0
+        } else {
+            1.0
+        };
+        if lane == 0 {
+            unsafe { *q_scales.add(query_row) = scale };
+        }
+        let inverse = 1.0 / scale;
+        let logical_word = lane * 2;
+        let destination = unsafe {
+            q_shared.add(
+                query_row * A::HEAD_DIM + flash_qk_word(query_row, logical_word) * size_of::<u32>(),
+            )
+        }
+        .cast::<u32>();
+        let packed0 =
+            convert::cvt_rn_satfinite_e4m3x2_f32(values[0] * inverse, values[1] * inverse);
+        let packed1 =
+            convert::cvt_rn_satfinite_e4m3x2_f32(values[2] * inverse, values[3] * inverse);
+        let packed2 =
+            convert::cvt_rn_satfinite_e4m3x2_f32(values[4] * inverse, values[5] * inverse);
+        let packed3 =
+            convert::cvt_rn_satfinite_e4m3x2_f32(values[6] * inverse, values[7] * inverse);
+        unsafe {
+            *destination = u32::from(packed0) | (u32::from(packed1) << 16);
+            *destination.add(1) = u32::from(packed2) | (u32::from(packed3) << 16);
+        }
+        query_row += LONG_CONTEXT_MTP_WARPS;
+    }
+    thread::sync_threads();
+
     let chunks_per_plane = LONG_CONTEXT_MTP_TILE * (A::HEAD_DIM / 16);
     let partition_end =
         core::cmp::min(first_position + LONG_CONTEXT_PARTITION_SIZE, maximum_length);
@@ -2422,12 +2512,19 @@ pub(crate) unsafe fn long_context_mtp_paged_gqa_partial<A: Arch, const TOKENS: u
                 * (position_in_tile + PAGE_SIZE * (kv_head + A::NUM_KV_HEADS * physical_page))
                 + dimension_segment * 16;
             let source = if plane == 0 { key_pages } else { value_pages };
-            let destination = plane * plane_words
-                + position_in_tile * (A::HEAD_DIM / size_of::<u32>())
-                + dimension_segment * (16 / size_of::<u32>());
+            let destination = if plane == 0 {
+                unsafe {
+                    k_shared.add(
+                        position_in_tile * A::HEAD_DIM
+                            + (dimension_segment ^ (position_in_tile & 7)) * 16,
+                    )
+                }
+            } else {
+                unsafe { v_shared.add(position_in_tile * A::HEAD_DIM + dimension_segment * 16) }
+            };
             unsafe {
                 cp_async_cg_16(
-                    shared_words.add(destination),
+                    destination.cast::<u32>(),
                     source.add(cache_element).cast::<u32>(),
                 );
             }
@@ -2439,23 +2536,95 @@ pub(crate) unsafe fn long_context_mtp_paged_gqa_partial<A: Arch, const TOKENS: u
         }
         thread::sync_threads();
 
+        let lane_group = lane >> 2;
+        let lane_in_group = lane & 3;
+        let mma_row_base = warp_index * FLASH_PREFILL_MMA_ROWS;
+        if warp_index < 2 && mma_row_base < row_count {
+            let mma_row0 = mma_row_base + lane_group;
+            let mma_row1 = mma_row0 + 8;
+            let score_scale0 = if mma_row0 < row_count {
+                (unsafe { *q_scales.add(mma_row0) }) * key_scale * 0.0625
+            } else {
+                0.0
+            };
+            let score_scale1 = if mma_row1 < row_count {
+                (unsafe { *q_scales.add(mma_row1) }) * key_scale * 0.0625
+            } else {
+                0.0
+            };
+            let q_words = q_shared.cast::<u32>();
+            let k_words = k_shared.cast::<u32>();
+            let mut key_base = 0usize;
+            while key_base < LONG_CONTEXT_MTP_TILE {
+                let mut score = [0.0f32; 4];
+                let mut k_subtile = 0usize;
+                while k_subtile < A::HEAD_DIM / 32 {
+                    let k_offset = k_subtile * 8;
+                    let activation_fragment = unsafe {
+                        [
+                            *q_words.add(
+                                mma_row0 * (A::HEAD_DIM / size_of::<u32>())
+                                    + flash_qk_word(mma_row0, k_offset + lane_in_group),
+                            ),
+                            *q_words.add(
+                                mma_row1 * (A::HEAD_DIM / size_of::<u32>())
+                                    + flash_qk_word(mma_row1, k_offset + lane_in_group),
+                            ),
+                            *q_words.add(
+                                mma_row0 * (A::HEAD_DIM / size_of::<u32>())
+                                    + flash_qk_word(mma_row0, k_offset + lane_in_group + 4),
+                            ),
+                            *q_words.add(
+                                mma_row1 * (A::HEAD_DIM / size_of::<u32>())
+                                    + flash_qk_word(mma_row1, k_offset + lane_in_group + 4),
+                            ),
+                        ]
+                    };
+                    score = unsafe {
+                        cuda_intrinsics::matrix::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                            score,
+                            activation_fragment,
+                            load_flash_k_fragment::<A>(
+                                k_words,
+                                key_base,
+                                k_offset,
+                                lane_group,
+                                lane_in_group,
+                            ),
+                        )
+                    };
+                    k_subtile += 1;
+                }
+                let score = scale_flash_fragment(score, score_scale0, score_scale1);
+                unsafe {
+                    store_long_context_mtp_score_fragment(
+                        scores,
+                        mma_row0,
+                        mma_row1,
+                        key_base,
+                        lane_in_group,
+                        row_count,
+                        score,
+                    );
+                }
+                key_base += 8;
+            }
+        }
+        thread::sync_threads();
+
         let tile_end = core::cmp::min(tile_position + LONG_CONTEXT_MTP_TILE, partition_end);
         let mut position = tile_position;
-        // Decode represented K/V once per warp while each independent row keeps position order.
+        // FP32 softmax and PV retain independent row order after packed QK materializes the tile.
         while position < tile_end {
             let tile_element = (position - tile_position) * A::HEAD_DIM + dimension;
-            let key = unsafe { load_aligned_e4m3x8(shared.add(tile_element), key_scale) };
-            let value = unsafe {
-                load_aligned_e4m3x8(
-                    shared.add(LONG_CONTEXT_MTP_TILE * A::HEAD_DIM + tile_element),
-                    value_scale,
-                )
-            };
+            let score_position = position - tile_position;
+            let value = unsafe { load_aligned_e4m3x8(v_shared.add(tile_element), value_scale) };
 
             if position < length0 {
+                let score =
+                    unsafe { load_long_context_mtp_score(scores, row0, score_position, lane) };
                 update_long_context_mtp_row(
-                    &query0,
-                    &key,
+                    score,
                     &value,
                     &mut maximum0,
                     &mut denominator0,
@@ -2463,9 +2632,10 @@ pub(crate) unsafe fn long_context_mtp_paged_gqa_partial<A: Arch, const TOKENS: u
                 );
             }
             if row1 < row_count && position < length1 {
+                let score =
+                    unsafe { load_long_context_mtp_score(scores, row1, score_position, lane) };
                 update_long_context_mtp_row(
-                    &query1,
-                    &key,
+                    score,
                     &value,
                     &mut maximum1,
                     &mut denominator1,
@@ -2473,9 +2643,10 @@ pub(crate) unsafe fn long_context_mtp_paged_gqa_partial<A: Arch, const TOKENS: u
                 );
             }
             if row2 < row_count && position < length2 {
+                let score =
+                    unsafe { load_long_context_mtp_score(scores, row2, score_position, lane) };
                 update_long_context_mtp_row(
-                    &query2,
-                    &key,
+                    score,
                     &value,
                     &mut maximum2,
                     &mut denominator2,

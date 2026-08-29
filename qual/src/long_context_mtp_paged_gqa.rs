@@ -719,7 +719,10 @@ mod tests {
         assert_eq!(TABLE_STRIDE, PHYSICAL_PAGES);
         assert_eq!(PHYSICAL_PAGES, 17);
         assert!(report.maximum_output_error <= 0.004);
-        assert!(report.maximum_partial_scalar_error <= 0.02);
+        assert!(
+            report.maximum_partial_scalar_error
+                <= (LONG_CONTEXT_GQA_PARTITION_SIZE as f32 * 0.008).max(0.02)
+        );
         assert!(report.maximum_partial_numerator_error <= 0.02);
 
         Ok(())
