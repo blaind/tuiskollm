@@ -37,6 +37,7 @@ const PREFILL_TAIL_ROUTES: [(usize, usize, Option<usize>); 5] = [
     (128, 32_768, Some(16)),
     (1_024, 1_024, Some(4)),
 ];
+const PREFILL_REPEATABILITY_RUNS: usize = 20;
 const SELECTED_LOGIT_ROWS: [usize; 5] = [0, 1, 31_337, 131_071, Qwen38_27B::VOCAB - 1];
 
 /// Failure of the complete source-backed resident-model gate.
@@ -350,6 +351,25 @@ fn verify_prefill_tail_routes(
         let eager = program.qualification_observables(stream)?;
         let eager_pages =
             read_prefill_tail_cache_pages(program, stream, 0, first_position, tokens)?;
+
+        if tokens == 1_024 {
+            for run in 1..PREFILL_REPEATABILITY_RUNS {
+                let repeated_route =
+                    prepare_prefill_tail_run(program, stream, tokens, first_position, 0)?;
+                program.launch_prefill_eager(stream, repeated_route)?;
+                let repeated = program.qualification_observables(stream)?;
+                if let Some(index) = repeated
+                    .residual_a
+                    .iter()
+                    .zip(&eager.residual_a)
+                    .position(|(actual, expected)| actual != expected)
+                {
+                    return Err(ResidentModelQualificationError::Mismatch(format!(
+                        "T={tokens} first={first_position} eager repeat {run} differs at residual value {index}"
+                    )));
+                }
+            }
+        }
 
         let replay_route = prepare_prefill_tail_run(program, stream, tokens, first_position, 0)?;
         if replay_route != eager_route {

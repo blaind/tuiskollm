@@ -285,6 +285,17 @@ fn launch(
                 arena.address(regions.output)?,
                 maps,
             )
+        } else if rows == 128 {
+            op.launch_t128_prefill(
+                stream,
+                arena.address(regions.input)?,
+                arena.address(regions.codes)?,
+                arena.address(regions.scales)?,
+                arena.address(regions.weight_codes)?,
+                arena.address(regions.weight_scales)?,
+                arena.address(regions.output)?,
+                maps,
+            )
         } else {
             op.launch(
                 stream,

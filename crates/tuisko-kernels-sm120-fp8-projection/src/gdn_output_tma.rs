@@ -23,7 +23,7 @@ const KDIM: usize = Qwen38_27B::GDN_VALUE_ROWS;
 const BLOCK_M: usize = 128;
 const BLOCK_N: usize = 64;
 const BLOCK_K: usize = 64;
-const STAGES: usize = 3;
+const STAGES: usize = 1;
 const PRODUCER_THREADS: usize = 32;
 const CONSUMER_WARPS: usize = 8;
 const CONSUMER_THREADS: usize = CONSUMER_WARPS * 32;
@@ -45,9 +45,15 @@ const WEIGHT_CODE_OFFSET: usize = A_CODE_OFFSET + A_CODE_BYTES;
 const WEIGHT_CODE_BYTES: usize = STAGES * BLOCK_N * CODE_ROW_BYTES;
 const FULL_BARRIER_OFFSET: usize = WEIGHT_CODE_OFFSET + WEIGHT_CODE_BYTES;
 const EMPTY_BARRIER_OFFSET: usize = FULL_BARRIER_OFFSET + STAGES * 8;
-const SHARED_BYTES: usize = EMPTY_BARRIER_OFFSET + STAGES * 8;
+const PIPELINE_BYTES: usize = EMPTY_BARRIER_OFFSET + STAGES * 8;
+const OUTPUT_BYTES: usize = BLOCK_M * OUTPUT_STRIDE * size_of::<u16>();
+const SHARED_BYTES: usize = if PIPELINE_BYTES > OUTPUT_BYTES {
+    PIPELINE_BYTES
+} else {
+    OUTPUT_BYTES
+};
 const TRANSACTION_BYTES: u32 = (BLOCK_M * CODE_ROW_BYTES + BLOCK_N * CODE_ROW_BYTES) as u32;
-const _: () = assert!(SHARED_BYTES == 36_912);
+const _: () = assert!(SHARED_BYTES == 18_432);
 const _: () = assert!(KDIM == 6_144);
 const _: () = assert!(KDIM.is_multiple_of(BLOCK_K));
 const _: () = assert!(Qwen38_27B::HIDDEN.is_multiple_of(BLOCK_N));
@@ -104,7 +110,7 @@ mod kernels {
         domain = 1,
         coordinates = u32,
         block = (288, 1, 1),
-        dynamic_shared = 36912,
+        dynamic_shared = 18432,
         dynamic_shared_alignment = 128,
         min_compute_capability = (12, 0),
     )]
@@ -609,7 +615,7 @@ mod tests {
         assert_eq!((BLOCK_M, BLOCK_N, BLOCK_K), (128, 64, 64));
         assert_eq!(PRODUCER_THREADS + CONSUMER_WARPS * 32, THREADS);
         assert_eq!(THREADS, 288);
-        assert_eq!(SHARED_BYTES, 36_912);
+        assert_eq!(SHARED_BYTES, 18_432);
         assert_eq!(K_TILES, KDIM / 64);
     }
 }

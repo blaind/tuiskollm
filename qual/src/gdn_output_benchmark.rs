@@ -261,6 +261,21 @@ fn capture_route(
                 )
             };
         }
+        if rows == 128 {
+            // SAFETY: every pointer names its complete, aligned arena region.
+            return unsafe {
+                op.launch_t128_prefill(
+                    stream,
+                    addresses.input,
+                    addresses.activation_codes,
+                    addresses.activation_scales,
+                    addresses.weight_codes,
+                    addresses.weight_scales,
+                    addresses.output,
+                    maps,
+                )
+            };
+        }
         launch(op, stream, addresses, rows)
     };
     let leaf = CudaGraph::capture(stream, launch_once)?;
