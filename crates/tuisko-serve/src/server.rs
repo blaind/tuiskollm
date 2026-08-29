@@ -1709,7 +1709,7 @@ fn render_inference_progress(
                         0.0
                     };
                     format!(
-                        "B{} {}/{} · left {} · {} · {:.1}s",
+                        "B{} {}/{} · remaining {} · {} · {:.1}s",
                         progress.active,
                         compact_count(completed),
                         compact_count(total),
@@ -3122,7 +3122,7 @@ mod tests {
         );
         assert_eq!(
             prefill,
-            "\r\x1b[2KPREFILL ⠋       B2 32.8K/159.0K · left 126.3K · 5.3K tok/s · 6.2s…"
+            "\r\x1b[2KPREFILL ⠋       B2 32.8K/159.0K · remaining 126.3K · 5.3K tok/s · 6.2s…"
         );
 
         let progress_line = render_inference_progress(

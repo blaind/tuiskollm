@@ -1,5 +1,6 @@
 //! Terminal request timing and cache-accounting log lines.
 
+use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 use tuisko_engine::ResidentMtpGenerationStats;
 use tuisko_frontend::{PromptEncoding, PromptEncodingMetrics};
@@ -82,7 +83,11 @@ impl RequestLog {
         finish_reason: &str,
         error: Option<&str>,
     ) {
-        eprintln!(
+        let stderr = std::io::stderr();
+        let color = stderr.is_terminal() && std::env::var_os("NO_COLOR").is_none();
+        let mut stderr = stderr.lock();
+        let _ = writeln!(
+            stderr,
             "{}",
             self.render_at(
                 Instant::now(),
@@ -91,6 +96,7 @@ impl RequestLog {
                 cached_prompt_tokens,
                 finish_reason,
                 error,
+                color,
             )
         );
     }
@@ -103,6 +109,7 @@ impl RequestLog {
         cached_prompt_tokens: usize,
         finish_reason: &str,
         error: Option<&str>,
+        color: bool,
     ) -> String {
         let total_ms = finished
             .saturating_duration_since(self.accepted)
@@ -130,7 +137,7 @@ impl RequestLog {
         let queue_ms = self
             .prefill
             .map_or(0.0, |prefill| prefill.queue.as_secs_f64() * 1_000.0);
-        let prefill = self.prefill.map_or_else(String::new, |prefill| {
+        let prefill = self.prefill.map(|prefill| {
             let milliseconds = prefill.elapsed.as_secs_f64() * 1_000.0;
             let tokens_per_second = if prefill.elapsed.is_zero() {
                 0.0
@@ -138,12 +145,15 @@ impl RequestLog {
                 prefill.native_tokens as f64 / prefill.elapsed.as_secs_f64()
             };
             format!(
-                ", queue {queue_ms:.1} ms, prefill B={} {} tok/{milliseconds:.1} ms ({tokens_per_second:.1} tok/s)",
-                prefill.batch, prefill.native_tokens,
+                "prefill B{} {}/{} ({} tok/s) · queue {queue_ms:.1}ms",
+                prefill.batch,
+                compact_count(prefill.native_tokens),
+                compact_seconds(milliseconds),
+                compact_count(tokens_per_second.round() as usize),
             )
         });
         let bpe_tail_tokens = prompt_tokens.saturating_sub(frontend_reused);
-        let mtp = self.mtp_stats.map_or_else(String::new, |stats| {
+        let mtp = self.mtp_stats.map(|stats| {
             let verifications = stats.verification_routes.iter().sum::<usize>();
             let decode_ms = ttft_ms.map_or(0.0, |ttft| (total_ms - ttft).max(0.0));
             let milliseconds_per_verification = if verifications == 0 {
@@ -161,14 +171,17 @@ impl RequestLog {
             } else {
                 100.0 * stats.accepted_drafts as f64 / stats.draft_proposals as f64
             };
-            format!(
-                ", verify {verifications} (K={}/{}/{}/{}), {milliseconds_per_verification:.1} wall ms/v, {outputs_per_verification:.2} tok/v, mtp accept {}/{} ({percent:.1}%)",
-                stats.verification_routes[0],
-                stats.verification_routes[1],
-                stats.verification_routes[2],
-                stats.verification_routes[3],
-                stats.accepted_drafts,
-                stats.draft_proposals,
+            (
+                format!(" · MTP {percent:.1}%"),
+                format!(
+                    "verify {verifications} K={}/{}/{}/{} · {milliseconds_per_verification:.1}ms/v · {outputs_per_verification:.2} tok/v · MTP {}/{}",
+                    stats.verification_routes[0],
+                    stats.verification_routes[1],
+                    stats.verification_routes[2],
+                    stats.verification_routes[3],
+                    stats.accepted_drafts,
+                    stats.draft_proposals,
+                ),
             )
         });
         let miss = if self.prompt_metrics.miss_reason.is_empty() {
@@ -176,20 +189,67 @@ impl RequestLog {
         } else {
             format!(" miss:{}", self.prompt_metrics.miss_reason)
         };
-        let error = error.map_or_else(String::new, |message| {
-            format!(" ({})", message.replace(['\r', '\n'], " "))
-        });
-
-        format!(
-            "TuiskoLLM request {}: {:.0} ms (+{total_ms:.1} ms), prompt {prompt_tokens} tok, cached {cached_prompt_tokens} tok ({cached_percent:.1}%), input {input_tokens} tok{prefill}, gen {generated_tokens} tok, ttft {:.1} ms, decode {decode_tokens_per_second:.1} tok/s{mtp}, route {}, render {:.1} ms, encode {:.1} ms, bpe-tail {bpe_tail_tokens} tok{miss}, finish {finish_reason}{error}",
-            self.id,
-            self.accepted_offset.as_secs_f64() * 1_000.0,
-            ttft_ms.unwrap_or(-1.0),
-            self.route,
+        let error = error.map(|message| message.replace(['\r', '\n'], " "));
+        let ttft = ttft_ms.map_or_else(
+            || "TTFT pending".into(),
+            |milliseconds| format!("TTFT {}", compact_seconds(milliseconds)),
+        );
+        let (request_color, reset) = if color {
+            ("\x1b[1;36m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
+        let mtp_summary = mtp
+            .as_ref()
+            .map_or_else(String::new, |(summary, _)| summary.clone());
+        let mut details = vec![
+            format!(
+                "accepted +{}",
+                compact_seconds(self.accepted_offset.as_secs_f64() * 1_000.0)
+            ),
+            format!("input {}", compact_count(input_tokens)),
+        ];
+        if let Some(prefill) = prefill {
+            details.push(prefill);
+        }
+        if let Some((_, mtp)) = mtp {
+            details.push(mtp);
+        }
+        details.push(format!("route {}", self.route));
+        details.push(format!(
+            "frontend {:.1}ms render + {:.1}ms encode",
             self.prompt_metrics.render_us as f64 / 1_000.0,
             self.prompt_metrics.encode_us as f64 / 1_000.0,
+        ));
+        details.push(format!("BPE tail {}{miss}", compact_count(bpe_tail_tokens)));
+        if let Some(error) = error {
+            details.push(format!("error {error}"));
+        }
+
+        format!(
+            "{request_color}REQUEST{reset} {:<7} {} prompt · {} cached ({cached_percent:.1}%) · {} output · {ttft} · {decode_tokens_per_second:.1} tok/s{mtp_summary} · {} · {finish_reason}\n                {}",
+            self.id,
+            compact_count(prompt_tokens),
+            compact_count(cached_prompt_tokens),
+            compact_count(generated_tokens),
+            compact_seconds(total_ms),
+            details.join(" · "),
         )
     }
+}
+
+fn compact_count(value: usize) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn compact_seconds(milliseconds: f64) -> String {
+    format!("{:.1}s", milliseconds / 1_000.0)
 }
 
 #[cfg(test)]
@@ -239,12 +299,24 @@ mod tests {
             80,
             "length",
             None,
+            false,
         );
 
         assert_eq!(
             line,
-            "TuiskoLLM request 7: 125 ms (+1200.0 ms), prompt 100 tok, cached 80 tok (80.0%), input 20 tok, queue 10.0 ms, prefill B=1 20 tok/100.0 ms (200.0 tok/s), gen 11 tok, ttft 200.0 ms, decode 10.0 tok/s, verify 10 (K=0/0/0/10), 100.0 wall ms/v, 2.90 tok/v, mtp accept 23/30 (76.7%), route mtp-draft-3, render 1.5 ms, encode 2.2 ms, bpe-tail 25 tok, finish length"
+            "REQUEST 7       100 prompt · 80 cached (80.0%) · 11 output · TTFT 0.2s · 10.0 tok/s · MTP 76.7% · 1.2s · length\n                accepted +0.1s · input 20 · prefill B1 20/0.1s (200 tok/s) · queue 10.0ms · verify 10 K=0/0/0/10 · 100.0ms/v · 2.90 tok/v · MTP 23/30 · route mtp-draft-3 · frontend 1.5ms render + 2.2ms encode · BPE tail 25"
         );
+
+        let colored = log.render_at(
+            accepted + Duration::from_millis(1_200),
+            Some(&output().prompt),
+            11,
+            80,
+            "length",
+            None,
+            true,
+        );
+        assert!(colored.starts_with("\x1b[1;36mREQUEST\x1b[0m 7       "));
     }
 
     #[test]
@@ -260,9 +332,11 @@ mod tests {
             0,
             "length",
             None,
+            false,
         );
 
-        assert!(line.contains("mtp accept 0/0 (0.0%)"));
+        assert!(line.contains("MTP 0.0%"));
+        assert!(line.contains("MTP 0/0"));
     }
 
     #[test]
@@ -276,13 +350,14 @@ mod tests {
             0,
             "error",
             Some("capacity\nrefused"),
+            false,
         );
 
-        assert!(line.contains("prompt 0 tok, cached 0 tok (0.0%), input 0 tok"));
-        assert!(line.contains("ttft -1.0 ms, decode 0.0 tok/s"));
-        assert!(line.ends_with("finish error (capacity refused)"));
-        assert!(!line.contains("mtp accept"));
-        assert!(!line.contains(['\r', '\n']));
+        assert!(line.contains("0 prompt · 0 cached (0.0%) · 0 output"));
+        assert!(line.contains("TTFT pending · 0.0 tok/s"));
+        assert!(line.ends_with("error capacity refused"));
+        assert!(!line.contains("MTP"));
+        assert!(!line.contains('\r'));
     }
 
     #[test]
@@ -303,8 +378,10 @@ mod tests {
             0,
             "stop",
             None,
+            false,
         );
 
-        assert!(line.contains("bpe-tail 100 tok miss:cache-empty, finish stop"));
+        assert!(line.contains("BPE tail 100 miss:cache-empty"));
+        assert!(line.contains(" · stop\n"));
     }
 }
