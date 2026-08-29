@@ -33,9 +33,6 @@ const QKV_MMA_OUTPUT_ROWS: usize = 64;
 const QKV_MMA_T16_BLOCK_ROWS: usize = 16;
 const QKV_MMA_PREFILL_BLOCK_ROWS: usize = 64;
 const QKV_MMA_K_WORDS: usize = 32;
-// The 1,024-row route halves the staged K words. It keeps the same ordered sequence
-// of m16n8k32 operations while reducing dynamic shared memory from 32 KiB to 16 KiB.
-const QKV_MMA_MACRO_K_WORDS: usize = 16;
 const QKV_MMA_T16_THREADS: u32 = 64;
 const QKV_MMA_PREFILL_THREADS: u32 = 256;
 const QKV_MMA_T16_SHARED_BYTES: u32 =
@@ -44,10 +41,6 @@ const QKV_MMA_T16_SHARED_BYTES: u32 =
 const QKV_MMA_PREFILL_SHARED_BYTES: u32 =
     (2 * (QKV_MMA_PREFILL_BLOCK_ROWS + QKV_MMA_OUTPUT_ROWS) * QKV_MMA_K_WORDS * size_of::<u32>())
         as u32;
-const QKV_MMA_MACRO_SHARED_BYTES: u32 = (2
-    * (QKV_MMA_PREFILL_BLOCK_ROWS + QKV_MMA_OUTPUT_ROWS)
-    * QKV_MMA_MACRO_K_WORDS
-    * size_of::<u32>()) as u32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Fp8Geometry {
@@ -1329,12 +1322,11 @@ impl<A: Sm120Arch> LmHeadOp<A> {
 mod tests {
     use super::{
         DECODE_PROJECTION_THREADS, DECODE_PROJECTION_WARPS, FullAttentionQkvRoutes,
-        GdnInputProjectionRoutes, LmHeadRoutes, MAX_BATCH, QKV_MMA_K_WORDS, QKV_MMA_MACRO_K_WORDS,
-        QKV_MMA_MACRO_SHARED_BYTES, QKV_MMA_MACRO_TOKENS, QKV_MMA_OUTPUT_ROWS,
-        QKV_MMA_PREFILL_BLOCK_ROWS, QKV_MMA_PREFILL_SHARED_BYTES, QKV_MMA_PREFILL_THREADS,
-        QKV_MMA_PREFILL_TOKENS, QKV_MMA_T16_BLOCK_ROWS, QKV_MMA_T16_SHARED_BYTES,
-        QKV_MMA_T16_THREADS, QKV_MMA_T16_TOKENS, QUANTIZE_THREADS, fp8_gdn_input_ptx_names,
-        fp8_geometry, fp8_lm_head_ptx_names, fp8_qkv_ptx_names,
+        GdnInputProjectionRoutes, LmHeadRoutes, MAX_BATCH, QKV_MMA_K_WORDS, QKV_MMA_MACRO_TOKENS,
+        QKV_MMA_OUTPUT_ROWS, QKV_MMA_PREFILL_BLOCK_ROWS, QKV_MMA_PREFILL_SHARED_BYTES,
+        QKV_MMA_PREFILL_THREADS, QKV_MMA_PREFILL_TOKENS, QKV_MMA_T16_BLOCK_ROWS,
+        QKV_MMA_T16_SHARED_BYTES, QKV_MMA_T16_THREADS, QKV_MMA_T16_TOKENS, QUANTIZE_THREADS,
+        fp8_gdn_input_ptx_names, fp8_geometry, fp8_lm_head_ptx_names, fp8_qkv_ptx_names,
     };
     use std::collections::BTreeSet;
     use tuisko_kernels_sm120_common::TestArch;
@@ -1385,16 +1377,13 @@ mod tests {
         assert_eq!(QKV_MMA_T16_BLOCK_ROWS, 16);
         assert_eq!(QKV_MMA_PREFILL_BLOCK_ROWS, 64);
         assert_eq!(QKV_MMA_K_WORDS, 32);
-        assert_eq!(QKV_MMA_MACRO_K_WORDS, 16);
         assert_eq!(QKV_MMA_T16_THREADS, 64);
         assert_eq!(QKV_MMA_PREFILL_THREADS, 256);
         assert_eq!(QKV_MMA_T16_SHARED_BYTES, 20_480);
         assert_eq!(QKV_MMA_PREFILL_SHARED_BYTES, 32_768);
-        assert_eq!(QKV_MMA_MACRO_SHARED_BYTES, 16_384);
         assert_eq!(Qwen38_27B::ATTENTION_QKV_ROWS % QKV_MMA_OUTPUT_ROWS, 0);
         assert_eq!(Qwen38_27B::GDN_INPUT_ROWS % QKV_MMA_OUTPUT_ROWS, 0);
         assert_eq!((Qwen38_27B::HIDDEN / 4) % QKV_MMA_K_WORDS, 0);
-        assert_eq!((Qwen38_27B::HIDDEN / 4) % QKV_MMA_MACRO_K_WORDS, 0);
     }
 
     #[test]

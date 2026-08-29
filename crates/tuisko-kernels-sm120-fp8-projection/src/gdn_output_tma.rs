@@ -156,8 +156,8 @@ mod kernels {
             if tid == 0 {
                 let mut k_tile = 0usize;
                 while k_tile < K_TILES {
-                    let stage = k_tile % STAGES;
-                    let empty_phase = 1 ^ ((k_tile / STAGES) & 1);
+                    let stage = 0;
+                    let empty_phase = 1 ^ (k_tile & 1);
                     // SAFETY: descriptors, phases, and exact tiles are admitted.
                     unsafe {
                         while !mbarrier_try_wait_parity(empty.add(stage), empty_phase as u32) {}
@@ -198,8 +198,8 @@ mod kernels {
 
         let mut k_tile = 0usize;
         while k_tile < K_TILES {
-            let stage = k_tile % STAGES;
-            let full_phase = (k_tile / STAGES) & 1;
+            let stage = 0;
+            let full_phase = k_tile & 1;
             // SAFETY: every consumer waits for the current stage before reading.
             unsafe { while !mbarrier_try_wait_parity(full.add(stage), full_phase as u32) {} }
             let mut local_k32 = 0usize;
