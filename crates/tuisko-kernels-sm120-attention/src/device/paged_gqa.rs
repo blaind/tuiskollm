@@ -1,7 +1,7 @@
 use cuda_device::async_copy::{
     cp_async_cg_16, cp_async_cg_zfill_16, cp_async_commit_group, cp_async_wait_group,
 };
-use cuda_device::{DynamicSharedArray, convert, f16x2, float, thread, warp, wmma};
+use cuda_device::{DynamicSharedArray, convert, f16x2, float, ptx_asm, thread, warp, wmma};
 use tuisko_kernels_sm120_common::device::e4m3x2_to_f32;
 use tuisko_model::Arch;
 
@@ -114,6 +114,26 @@ unsafe fn load_aligned_e4m3x8(source: *const u8, scale: f32) -> [f32; VALUES_PER
         x6 * scale,
         x7 * scale,
     ]
+}
+
+#[inline(always)]
+unsafe fn store_aligned_f32x8(destination: *mut f32, values: &[f32; VALUES_PER_LANE]) {
+    unsafe {
+        ptx_asm!(
+            "st.global.v4.f32 [%0], {%1, %2, %3, %4}; \
+             st.global.v4.f32 [%0+16], {%5, %6, %7, %8};",
+            in("l") destination,
+            in("f") values[0],
+            in("f") values[1],
+            in("f") values[2],
+            in("f") values[3],
+            in("f") values[4],
+            in("f") values[5],
+            in("f") values[6],
+            in("f") values[7],
+            clobber("memory"),
+        );
+    }
 }
 
 #[inline(always)]
@@ -2297,11 +2317,7 @@ unsafe fn store_long_context_mtp_partial<A: Arch>(
         }
     }
     let numerator = unsafe { partial_numerator.add(partial * A::HEAD_DIM + dimension) };
-    let mut element = 0usize;
-    while element < VALUES_PER_LANE {
-        unsafe { *numerator.add(element) = accumulator[element] };
-        element += 1;
-    }
+    unsafe { store_aligned_f32x8(numerator, accumulator) };
 }
 
 /// Reuses one represented K/V tile across all provisional rows and six GQA heads.
