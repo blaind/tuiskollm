@@ -785,11 +785,30 @@ mod tests {
             let prefix = (0..common)
                 .map(|position| 100 + u32::try_from(position % 1_000).unwrap())
                 .collect::<Vec<_>>();
-            let mut one_token_suffix = prefix.clone();
-            one_token_suffix.push(2_001);
+            let choices = [2_001, 2_002, 2_001, 2_003]
+                .map(|choice| prefix.iter().copied().chain([choice]).collect::<Vec<_>>());
+            let shared = generator.score_prompts(&choices).unwrap();
+            let independent = choices
+                .iter()
+                .map(|prompt| generator.score_prompt(prompt).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                shared, independent,
+                "equal-length shared-prefix scoring differed at common length {common}"
+            );
+
+            let mut exact_prefix = prefix.clone();
+            exact_prefix.push(2_010);
+            let mut one_token_suffix = exact_prefix.clone();
+            one_token_suffix.push(2_011);
             let mut unequal_suffix = prefix.clone();
-            unequal_suffix.extend([2_002, 2_003, 2_004]);
-            let prompts = vec![prefix.clone(), prefix, one_token_suffix, unequal_suffix];
+            unequal_suffix.extend([2_010, 2_012, 2_013]);
+            let prompts = vec![
+                exact_prefix.clone(),
+                exact_prefix,
+                one_token_suffix,
+                unequal_suffix,
+            ];
 
             let shared = generator.score_prompts(&prompts).unwrap();
             let independent = prompts
@@ -798,7 +817,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 shared, independent,
-                "shared-prefix scoring differed at common length {common}"
+                "unequal shared-prefix scoring differed after common length {common}"
             );
         }
         crate::device_benchmark::require_current_process_exclusive().unwrap();

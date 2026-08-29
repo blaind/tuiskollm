@@ -160,6 +160,13 @@ enum TargetRoundRoute {
     Segmented(ResidentMtpSegmentedVerifyRoute),
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct PromptScoringBatchPlan {
+    common_prefix: usize,
+    shared_boundary: usize,
+    shared_routes: Vec<usize>,
+}
+
 impl LaneDrafts {
     fn new() -> Self {
         Self {
@@ -399,9 +406,9 @@ impl ResidentMtpBatchGenerator {
                 "prompt scoring requires an idle resident scheduler",
             ));
         }
-        let common =
+        let plan =
             validate_prompt_scoring_batch(prompts, self.program.target().context_capacity())?;
-        if prompts.len() == 1 || common == 0 {
+        if prompts.len() == 1 || plan.shared_boundary == 0 {
             return prompts
                 .iter()
                 .map(|prompt| self.score_prompt(prompt))
@@ -417,9 +424,9 @@ impl ResidentMtpBatchGenerator {
         // Reclaim for the widest branch now, but publish only the exact shared boundary.
         self.prepare_kv_slot(slot, true, required_positions)?;
         self.program.activate_kv_slot(slot)?;
-        if let Err(error) = self
-            .program
-            .reserve_kv_slot_tokens(&self.stream, slot, common)
+        if let Err(error) =
+            self.program
+                .reserve_kv_slot_tokens(&self.stream, slot, plan.shared_boundary)
         {
             self.program.recycle_kv_slot(&self.stream, slot)?;
             return Err(error);
@@ -433,7 +440,7 @@ impl ResidentMtpBatchGenerator {
             return Err(error);
         }
 
-        let scored = self.score_prompts_with_common_prefix(prompts, common, slot);
+        let scored = self.score_prompts_with_common_prefix(prompts, &plan, slot);
         let recycled = self.program.recycle_kv_slot(&self.stream, slot);
         self.retained[slot] = None;
         self.message_boundary_valid[slot] = false;
@@ -447,21 +454,13 @@ impl ResidentMtpBatchGenerator {
     fn score_prompts_with_common_prefix(
         &mut self,
         prompts: &[Vec<u32>],
-        common: usize,
+        plan: &PromptScoringBatchPlan,
         slot: usize,
     ) -> EngineResult<Vec<PromptLogprobs>> {
+        let common = plan.shared_boundary;
         let common_prompt = &prompts[0][..common];
-        let common_scores = self.score_token_prefix_in_slot(common_prompt, slot)?;
-        let boundary_scores = prompts
-            .iter()
-            .map(|prompt| {
-                if prompt.len() == common {
-                    score_greedy_row(&self.target_logits[target_download_row(0)])
-                } else {
-                    score_logit_row(&self.target_logits[target_download_row(0)], prompt[common])
-                }
-            })
-            .collect::<EngineResult<Vec<_>>>()?;
+        let (common_scores, boundary_scores) =
+            self.score_shared_prefix_in_slot(common_prompt, prompts, &plan.shared_routes, slot)?;
         self.program.target().capture_gdn_slot(
             &self.stream,
             slot,
@@ -508,6 +507,116 @@ impl ResidentMtpBatchGenerator {
             )?);
         }
         Ok(scored)
+    }
+
+    fn score_shared_prefix_in_slot(
+        &mut self,
+        common_prompt: &[u32],
+        prompts: &[Vec<u32>],
+        routes: &[usize],
+        slot: usize,
+    ) -> EngineResult<(Vec<Option<PromptTokenLogprob>>, Vec<PromptTokenLogprob>)> {
+        let boundary = common_prompt.len();
+        let mut prompt = vec![None; boundary];
+        let mut boundary_scores = vec![None; prompts.len()];
+        let mut cursor = 0usize;
+        let mut cosine = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+        let mut sine = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+
+        for &tokens in routes {
+            if tokens == 1 {
+                replay_target_token(
+                    &mut self.program,
+                    &self.stream,
+                    common_prompt[cursor],
+                    cursor,
+                )?;
+                self.program.target().read_logits_into(
+                    &self.stream,
+                    1,
+                    &mut self.target_logits[target_download_logits(1)],
+                )?;
+                self.score_shared_row(
+                    common_prompt,
+                    prompts,
+                    cursor + 1,
+                    0,
+                    &mut prompt,
+                    &mut boundary_scores,
+                )?;
+            } else {
+                let rotary_values = fill_contiguous_rope(cursor, tokens, &mut cosine, &mut sine)?;
+                replay_prefill_tile(
+                    &mut self.program,
+                    &self.stream,
+                    &common_prompt[cursor..cursor + tokens],
+                    slot,
+                    cursor,
+                    &cosine[..rotary_values],
+                    &sine[..rotary_values],
+                )?;
+                for first_row in (0..tokens).step_by(MAX_BATCH) {
+                    let rows = MAX_BATCH.min(tokens - first_row);
+                    self.program.target().launch_prefill_lm_head_rows(
+                        &self.stream,
+                        first_row,
+                        rows,
+                        tokens,
+                    )?;
+                    self.program.target().read_logits_into(
+                        &self.stream,
+                        rows,
+                        &mut self.target_logits[target_download_logits(rows)],
+                    )?;
+                    for row_index in 0..rows {
+                        self.score_shared_row(
+                            common_prompt,
+                            prompts,
+                            cursor + first_row + row_index + 1,
+                            row_index,
+                            &mut prompt,
+                            &mut boundary_scores,
+                        )?;
+                    }
+                }
+            }
+            cursor += tokens;
+        }
+        if cursor != boundary {
+            return Err(EngineError::generation(format!(
+                "prompt scoring routes cover {cursor} shared tokens instead of {boundary}"
+            )));
+        }
+        let boundary_scores = boundary_scores
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| EngineError::generation("prompt scoring boundary has no logits"))?;
+        Ok((prompt, boundary_scores))
+    }
+
+    fn score_shared_row(
+        &self,
+        common_prompt: &[u32],
+        prompts: &[Vec<u32>],
+        target_position: usize,
+        row_index: usize,
+        prompt: &mut [Option<PromptTokenLogprob>],
+        boundary_scores: &mut [Option<PromptTokenLogprob>],
+    ) -> EngineResult<()> {
+        let logits = &self.target_logits[target_download_row(row_index)];
+        if target_position < common_prompt.len() {
+            prompt[target_position] =
+                Some(score_logit_row(logits, common_prompt[target_position])?);
+        } else if target_position == common_prompt.len() {
+            for (score, branch) in boundary_scores.iter_mut().zip(prompts) {
+                *score = Some(if branch.len() == target_position {
+                    score_greedy_row(logits)?
+                } else {
+                    score_logit_row(logits, branch[target_position])?
+                });
+            }
+        }
+        Ok(())
     }
 
     fn score_prompt_in_slot(
@@ -2309,7 +2418,7 @@ fn checked_rows(label: &str, rows: usize, columns: usize) -> EngineResult<usize>
 fn validate_prompt_scoring_batch<T: AsRef<[u32]>>(
     prompts: &[T],
     context_capacity: usize,
-) -> EngineResult<usize> {
+) -> EngineResult<PromptScoringBatchPlan> {
     if prompts.is_empty() || prompts.len() > MAX_BATCH {
         return Err(EngineError::capacity(format!(
             "prompt scoring batch size {} is outside 1..={MAX_BATCH}",
@@ -2339,7 +2448,7 @@ fn validate_prompt_scoring_batch<T: AsRef<[u32]>>(
         }
     }
 
-    Ok(longest_common_token_prefix(prompts))
+    Ok(plan_prompt_scoring_batch(prompts))
 }
 
 fn longest_common_token_prefix<T: AsRef<[u32]>>(prompts: &[T]) -> usize {
@@ -2351,6 +2460,60 @@ fn longest_common_token_prefix<T: AsRef<[u32]>>(prompts: &[T]) -> usize {
                 .all(|prompt| prompt.as_ref().get(position) == Some(&first[position]))
         })
         .count()
+}
+
+fn plan_prompt_scoring_batch<T: AsRef<[u32]>>(prompts: &[T]) -> PromptScoringBatchPlan {
+    let common_prefix = longest_common_token_prefix(prompts);
+    let routes = prompts
+        .iter()
+        .map(|prompt| prompt_scoring_routes(prompt.as_ref().len()))
+        .collect::<Vec<_>>();
+    let mut route_indices = vec![0usize; prompts.len()];
+    let mut shared_boundary = 0usize;
+    let mut shared_routes = Vec::new();
+
+    loop {
+        let Some(&next) = routes[0].get(route_indices[0]) else {
+            break;
+        };
+        if routes
+            .iter()
+            .zip(&route_indices)
+            .any(|(routes, &index)| routes.get(index) != Some(&next))
+        {
+            break;
+        }
+        let Some(boundary) = shared_boundary.checked_add(next) else {
+            break;
+        };
+        if boundary > common_prefix {
+            break;
+        }
+        shared_routes.push(next);
+        shared_boundary = boundary;
+        for index in &mut route_indices {
+            *index += 1;
+        }
+    }
+
+    PromptScoringBatchPlan {
+        common_prefix,
+        shared_boundary,
+        shared_routes,
+    }
+}
+
+fn prompt_scoring_routes(prompt_tokens: usize) -> Vec<usize> {
+    let primed = prompt_tokens - 1;
+    let mut routes = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < primed {
+        let tokens = next_native_prefill_tile(primed - cursor).unwrap_or(1);
+        routes.push(tokens);
+        cursor += tokens;
+    }
+    routes.push(1);
+    routes
 }
 
 fn finish_prompt_logprobs(
@@ -2473,8 +2636,9 @@ fn compact_hidden_row(row_index: usize) -> std::ops::Range<usize> {
 mod tests {
     use super::{
         DRAFT_HIDDEN_ROWS, DRAFT_LOGIT_ROWS, RetainedMtpSlot, RetainedReuse, TARGET_LOGIT_ROWS,
-        best_retained_prefix, longest_common_token_prefix, score_greedy_row, score_logit_row,
-        target_download_logits, target_download_row, validate_prompt_scoring_batch,
+        best_retained_prefix, longest_common_token_prefix, plan_prompt_scoring_batch,
+        prompt_scoring_routes, score_greedy_row, score_logit_row, target_download_logits,
+        target_download_row, validate_prompt_scoring_batch,
     };
     use crate::MAX_BATCH;
     use crate::common::banks::row;
@@ -2518,7 +2682,44 @@ mod tests {
         assert_eq!(longest_common_token_prefix(&unequal), 2);
         assert_eq!(longest_common_token_prefix(&identical), 3);
         assert_eq!(longest_common_token_prefix(&disjoint), 0);
-        assert_eq!(validate_prompt_scoring_batch(&unequal, 8).unwrap(), 2);
+        assert_eq!(
+            validate_prompt_scoring_batch(&unequal, 8)
+                .unwrap()
+                .common_prefix,
+            2
+        );
+    }
+
+    #[test]
+    fn prompt_scoring_batch_reuses_only_exact_shared_route_boundaries() {
+        for boundary in [31, 32, 33, 63, 64, 65, 127, 128, 129, 1023, 1024, 1025] {
+            let prefix = vec![7; boundary];
+            let mut left = prefix.clone();
+            left.push(8);
+            let mut right = prefix;
+            right.push(9);
+            let plan = plan_prompt_scoring_batch(&[left, right]);
+            assert_eq!(plan.common_prefix, boundary);
+            assert_eq!(plan.shared_boundary, boundary);
+            assert_eq!(
+                plan.shared_routes,
+                prompt_scoring_routes(boundary + 1)[..plan.shared_routes.len()]
+            );
+        }
+
+        for seam in [32, 64, 128, 1024] {
+            let shorter = vec![7; seam];
+            let longer = vec![7; seam + 1];
+            let incompatible = plan_prompt_scoring_batch(&[shorter, longer]);
+            assert_eq!(incompatible.common_prefix, seam);
+            assert_eq!(incompatible.shared_boundary, 0);
+
+            let shorter = vec![7; seam + 1];
+            let longer = vec![7; seam + 2];
+            let compatible = plan_prompt_scoring_batch(&[shorter, longer]);
+            assert_eq!(compatible.common_prefix, seam + 1);
+            assert_eq!(compatible.shared_boundary, seam + 1);
+        }
     }
 
     #[test]
