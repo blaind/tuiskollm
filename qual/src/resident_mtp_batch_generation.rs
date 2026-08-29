@@ -770,6 +770,148 @@ mod tests {
 
     #[test]
     #[ignore = "requires the admitted source snapshot and an exclusive RTX 5090"]
+    fn resident_mtp_batch_suite_shared_prefix_scoring_matches_independent_scoring() {
+        let _preflight = crate::device_benchmark::preflight().unwrap();
+        let root = std::env::var_os("TUISKO_SNAPSHOT")
+            .expect("TUISKO_SNAPSHOT must name the admitted snapshot");
+        let snapshot = Arc::new(
+            CheckpointSnapshot::<Qwen38_27B>::open(Path::new(&root))
+                .expect("snapshot must be admitted"),
+        );
+        let context = CudaContext::new(0).unwrap();
+        let mut generator = ResidentMtpBatchGenerator::from_snapshot(&context, snapshot).unwrap();
+
+        for common in [31, 32, 33, 63, 64, 65, 127, 128, 129, 1023] {
+            let prefix = (0..common)
+                .map(|position| 100 + u32::try_from(position % 1_000).unwrap())
+                .collect::<Vec<_>>();
+            let choices = [2_001, 2_002, 2_001, 2_003]
+                .map(|choice| prefix.iter().copied().chain([choice]).collect::<Vec<_>>());
+            let shared = generator.score_prompts(&choices).unwrap();
+            let independent = choices
+                .iter()
+                .map(|prompt| generator.score_prompt(prompt).unwrap())
+                .collect::<Vec<_>>();
+            assert_prompt_scoring_equal(
+                &format!("equal-length common={common}"),
+                &shared,
+                &independent,
+            );
+
+            if common <= 129 {
+                let suffixes = [
+                    [2_010, 2_011, 2_012],
+                    [2_010, 2_021, 2_022],
+                    [2_010, 2_011, 2_023],
+                    [2_010, 2_024, 2_025],
+                ];
+                let prompts =
+                    suffixes.map(|suffix| prefix.iter().copied().chain(suffix).collect::<Vec<_>>());
+                let shared = generator.score_prompts(&prompts).unwrap();
+                let independent = prompts
+                    .iter()
+                    .map(|prompt| generator.score_prompt(prompt).unwrap())
+                    .collect::<Vec<_>>();
+                assert_prompt_scoring_equal(
+                    &format!("equal-length multi-token common={common}"),
+                    &shared,
+                    &independent,
+                );
+            }
+        }
+        crate::device_benchmark::require_current_process_exclusive().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires repeatable ordinary T=1024 macro scoring on the admitted snapshot"]
+    fn resident_mtp_batch_t1024_macro_scoring_repeatability_acceptance() {
+        let _preflight = crate::device_benchmark::preflight().unwrap();
+        let root = std::env::var_os("TUISKO_SNAPSHOT")
+            .expect("TUISKO_SNAPSHOT must name the admitted snapshot");
+        let snapshot = Arc::new(
+            CheckpointSnapshot::<Qwen38_27B>::open(Path::new(&root))
+                .expect("snapshot must be admitted"),
+        );
+        let context = CudaContext::new(0).unwrap();
+        let mut generator = ResidentMtpBatchGenerator::from_snapshot(&context, snapshot).unwrap();
+        let prefix = (0..1_024)
+            .map(|position| 100 + u32::try_from(position % 1_000).unwrap())
+            .collect::<Vec<_>>();
+        let exact_prefix = prefix.iter().copied().chain([2_010]).collect::<Vec<_>>();
+        let prompts = vec![
+            exact_prefix.clone(),
+            exact_prefix,
+            prefix.iter().copied().chain([2_010, 2_011]).collect(),
+            prefix
+                .iter()
+                .copied()
+                .chain([2_010, 2_012, 2_013])
+                .collect(),
+        ];
+
+        let first = generator.score_prompts(&prompts).unwrap();
+        let second = prompts
+            .iter()
+            .map(|prompt| generator.score_prompt(prompt).unwrap())
+            .collect::<Vec<_>>();
+        assert_prompt_scoring_equal("ordinary T=1024 repeatability", &first, &second);
+        crate::device_benchmark::require_current_process_exclusive().unwrap();
+    }
+
+    fn assert_prompt_scoring_equal(
+        case: &str,
+        shared: &[tuisko_engine::PromptLogprobs],
+        independent: &[tuisko_engine::PromptLogprobs],
+    ) {
+        assert_eq!(shared.len(), independent.len(), "{case}: result count");
+        for (prompt_index, (shared, independent)) in shared.iter().zip(independent).enumerate() {
+            if shared.prompt_token_ids != independent.prompt_token_ids {
+                let position = shared
+                    .prompt_token_ids
+                    .iter()
+                    .zip(&independent.prompt_token_ids)
+                    .position(|(left, right)| left != right);
+                panic!("{case}: prompt {prompt_index} token IDs differ at {position:?}");
+            }
+            assert_eq!(
+                shared.prompt.len(),
+                independent.prompt.len(),
+                "{case}: prompt {prompt_index} causal score count"
+            );
+            for (position, (shared, independent)) in
+                shared.prompt.iter().zip(&independent.prompt).enumerate()
+            {
+                assert_eq!(
+                    shared, independent,
+                    "{case}: prompt {prompt_index} causal score at position {position}"
+                );
+            }
+            assert_eq!(
+                shared.completion, independent.completion,
+                "{case}: prompt {prompt_index} completion"
+            );
+            assert!(
+                shared.echoed_text == independent.echoed_text,
+                "{case}: prompt {prompt_index} echoed text"
+            );
+            assert_eq!(
+                shared.token_text.len(),
+                independent.token_text.len(),
+                "{case}: prompt {prompt_index} token-text count"
+            );
+            if let Some(position) = shared
+                .token_text
+                .iter()
+                .zip(&independent.token_text)
+                .position(|(left, right)| left != right)
+            {
+                panic!("{case}: prompt {prompt_index} token text differs at {position}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the admitted source snapshot and an exclusive RTX 5090"]
     fn resident_mtp_batch_suite_reclaims_inactive_pages_before_refusing_capacity() {
         let _preflight = crate::device_benchmark::preflight().unwrap();
         let root = std::env::var_os("TUISKO_SNAPSHOT")

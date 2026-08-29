@@ -10,12 +10,17 @@ use crate::resident_mtp_generation_benchmark::register_program_memory;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tuisko_engine::{ChatGenerationRequest, ResidentMtpBatchGenerator, SamplingOptions};
-use tuisko_frontend::{ChatMessage, ChatTemplateOptions};
+use tuisko_engine::{
+    ChatGenerationRequest, PromptLogprobs, ResidentMtpBatchGenerator, SamplingOptions,
+};
+use tuisko_frontend::{ChatMessage, ChatTemplateOptions, TextFrontend};
 use tuisko_gpu::{CudaContext, GpuError};
 use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
 const OUTPUT_TOKENS: usize = 8;
+const SCORING_BATCH: u32 = 4;
+const SHARED_SCORING_METRIC: &str = "qwen3_8/scoring/prompt_batch_shared_prefix";
+const INDEPENDENT_SCORING_METRIC: &str = "qwen3_8/scoring/prompt_batch_independent";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RoundOutcome {
@@ -280,6 +285,256 @@ pub fn benchmark_resident_mtp_batch_generation(
         telemetry,
         memory,
     )
+}
+
+/// Directly measures the production four-choice scoring owner and its independent reference.
+pub fn benchmark_resident_mtp_prompt_scoring(
+    root: &Path,
+    options: DeviceBenchmarkOptions,
+) -> Result<DeviceBenchmarkReport, DeviceBenchmarkError> {
+    if options.energy_seconds.is_some() {
+        return Err(DeviceBenchmarkError::Precondition(
+            "prompt scoring energy is deferred to the full-server gate".to_string(),
+        ));
+    }
+    if options.batch_size != Some(SCORING_BATCH) {
+        return Err(DeviceBenchmarkError::Precondition(format!(
+            "prompt scoring benchmark requires production batch_size={SCORING_BATCH}"
+        )));
+    }
+    let baseline_sha256 = generator_baseline_sha256()?;
+    let warmup = warmup_launches(options)?;
+    let preflight = preflight()?;
+    let mut memory = MemoryRecorder::new(&preflight)?;
+    let snapshot = Arc::new(CheckpointSnapshot::<Qwen38_27B>::open(root)?);
+    let frontend = TextFrontend::open(snapshot.as_ref()).map_err(|error| {
+        DeviceBenchmarkError::Precondition(format!(
+            "prompt scoring benchmark frontend admission failed: {error}"
+        ))
+    })?;
+    let prompts = scoring_prompts(&frontend)?;
+    let (prompt_tokens, common_tokens) = scoring_prompt_shape(&prompts)?;
+    let input_reference = prompts.clone();
+    let context = CudaContext::new(0).map_err(GpuError::from)?;
+    if context.compute_capability().map_err(GpuError::from)? != (12, 0) {
+        return Err(DeviceBenchmarkError::Precondition(
+            "device zero is not compute capability 12.0".to_string(),
+        ));
+    }
+    let mut generator = ResidentMtpBatchGenerator::from_snapshot(&context, snapshot)?;
+    register_program_memory(&mut memory, generator.qualification_program())?;
+    memory.capture("after_setup")?;
+    let stable_addresses = generator.qualification_addresses()?;
+
+    let mut reference = None;
+    for _ in 0..warmup {
+        let (_, shared) = run_shared_scoring(&mut generator, &prompts)?;
+        let (_, independent) = run_independent_scoring(&mut generator, &prompts)?;
+        require_scoring_output(reference.as_ref(), &shared, &independent)?;
+        reference.get_or_insert(shared);
+        require_scoring_input(&prompts, &input_reference)?;
+    }
+    let reference = reference.ok_or_else(|| {
+        DeviceBenchmarkError::Precondition(
+            "prompt scoring benchmark requires at least one warmup".to_string(),
+        )
+    })?;
+    require_stable_addresses(&generator, &stable_addresses)?;
+    memory.capture("after_warmup")?;
+    require_current_process_exclusive()?;
+
+    validate_loaded_host_clock_policy(SHARED_SCORING_METRIC, || {
+        let (_, shared) = run_shared_scoring(&mut generator, &prompts)?;
+        let (_, independent) = run_independent_scoring(&mut generator, &prompts)?;
+        require_scoring_output(Some(&reference), &shared, &independent)?;
+        require_stable_addresses(&generator, &stable_addresses)
+    })?;
+
+    let sampler = TelemetrySampler::start();
+    let mut samples = [
+        Vec::with_capacity(options.samples),
+        Vec::with_capacity(options.samples),
+    ];
+    for sample in 0..options.samples {
+        for case in measurement_order(sample, samples.len()) {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..options.launches_per_sample {
+                let (iteration, outcome) = if case == 0 {
+                    run_shared_scoring(&mut generator, &prompts)?
+                } else {
+                    run_independent_scoring(&mut generator, &prompts)?
+                };
+                elapsed += iteration;
+                if outcome != reference {
+                    return Err(DeviceBenchmarkError::Precondition(format!(
+                        "prompt scoring case {case} changed output between samples"
+                    )));
+                }
+            }
+            samples[case]
+                .push(elapsed.as_secs_f64() * 1_000_000.0 / options.launches_per_sample as f64);
+            require_scoring_input(&prompts, &input_reference)?;
+            require_stable_addresses(&generator, &stable_addresses)?;
+        }
+    }
+    let telemetry = sampler.finish()?;
+    require_current_process_exclusive()?;
+    memory.capture("after_measurement")?;
+
+    let shape = format!(
+        "B={SCORING_BATCH},choices={SCORING_BATCH},prompt={prompt_tokens},common={common_tokens}"
+    );
+    let workload = BenchmarkWorkload::warm_model_prompt_scoring(
+        SCORING_BATCH,
+        u64::try_from(prompt_tokens).map_err(|_| {
+            DeviceBenchmarkError::Precondition("prompt length exceeds u64".to_string())
+        })?,
+    );
+    let metrics = vec![
+        host_completion_metric(
+            SHARED_SCORING_METRIC,
+            shape.clone(),
+            workload.clone(),
+            options.launches_per_sample,
+            0,
+            std::mem::take(&mut samples[0]),
+        )?,
+        host_completion_metric(
+            INDEPENDENT_SCORING_METRIC,
+            shape,
+            workload,
+            options.launches_per_sample,
+            0,
+            std::mem::take(&mut samples[1]),
+        )?,
+    ];
+    let memory = memory.finish(&telemetry)?;
+    finish_report(
+        BenchmarkReportSpec {
+            suite: "bench-prompt-scoring",
+            classification: "performance_sensitive_model",
+            timing_scope: "separate direct Rust host completion for one production four-choice shared-prefix batch and the complete four-prompt independent reference",
+        },
+        preflight,
+        baseline_sha256,
+        options,
+        metrics,
+        Vec::new(),
+        telemetry,
+        memory,
+    )
+}
+
+fn scoring_prompts(frontend: &TextFrontend) -> Result<Vec<Vec<u32>>, DeviceBenchmarkError> {
+    let stem = "The following is a multiple choice question. Select the best answer.\n\nWhich property must every prime number greater than two have?\nA. It is even.\nB. It is odd.\nC. It is divisible by three.\nD. It is a perfect square.\nAnswer:";
+    let mut prompts = Vec::with_capacity(SCORING_BATCH as usize);
+    for choice in [" A", " B", " C", " D"] {
+        let prompt = frontend
+            .encode(&format!("{stem}{choice}"))
+            .map_err(|error| {
+                DeviceBenchmarkError::Precondition(format!(
+                    "prompt scoring benchmark full choice encoding failed: {error}"
+                ))
+            })?;
+        prompts.push(prompt);
+    }
+    scoring_prompt_shape(&prompts)?;
+    Ok(prompts)
+}
+
+fn scoring_prompt_shape(prompts: &[Vec<u32>]) -> Result<(usize, usize), DeviceBenchmarkError> {
+    if prompts.len() != SCORING_BATCH as usize {
+        return Err(DeviceBenchmarkError::Precondition(
+            "prompt scoring benchmark requires exactly four choices".to_string(),
+        ));
+    }
+    let prompt_tokens = prompts[0].len();
+    if prompt_tokens < 2 || prompts.iter().any(|prompt| prompt.len() != prompt_tokens) {
+        return Err(DeviceBenchmarkError::Precondition(
+            "prompt scoring benchmark choices are not equal nontrivial lengths".to_string(),
+        ));
+    }
+    let common_tokens = (0..prompt_tokens)
+        .take_while(|&position| {
+            prompts[1..]
+                .iter()
+                .all(|prompt| prompt[position] == prompts[0][position])
+        })
+        .count();
+    if common_tokens != prompt_tokens - 1 {
+        return Err(DeviceBenchmarkError::Precondition(format!(
+            "prompt scoring benchmark common prefix is {common_tokens}, expected {}",
+            prompt_tokens - 1
+        )));
+    }
+    let final_choices = prompts
+        .iter()
+        .map(|prompt| prompt[prompt_tokens - 1])
+        .collect::<std::collections::BTreeSet<_>>();
+    if final_choices.len() != SCORING_BATCH as usize {
+        return Err(DeviceBenchmarkError::Precondition(
+            "prompt scoring benchmark final choice token IDs are not distinct".to_string(),
+        ));
+    }
+    Ok((prompt_tokens, common_tokens))
+}
+
+fn run_shared_scoring(
+    generator: &mut ResidentMtpBatchGenerator,
+    prompts: &[Vec<u32>],
+) -> Result<(Duration, Vec<PromptLogprobs>), DeviceBenchmarkError> {
+    let started = Instant::now();
+    let output = generator.score_prompts(prompts)?;
+    Ok((started.elapsed(), output))
+}
+
+fn run_independent_scoring(
+    generator: &mut ResidentMtpBatchGenerator,
+    prompts: &[Vec<u32>],
+) -> Result<(Duration, Vec<PromptLogprobs>), DeviceBenchmarkError> {
+    let started = Instant::now();
+    let output = prompts
+        .iter()
+        .map(|prompt| generator.score_prompt(prompt))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((started.elapsed(), output))
+}
+
+fn require_scoring_output(
+    expected: Option<&Vec<PromptLogprobs>>,
+    shared: &[PromptLogprobs],
+    independent: &[PromptLogprobs],
+) -> Result<(), DeviceBenchmarkError> {
+    if shared != independent || expected.is_some_and(|expected| expected != shared) {
+        return Err(DeviceBenchmarkError::Precondition(
+            "shared and independent prompt scoring outputs are not invariant".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_scoring_input(
+    prompts: &[Vec<u32>],
+    expected: &[Vec<u32>],
+) -> Result<(), DeviceBenchmarkError> {
+    if prompts != expected {
+        return Err(DeviceBenchmarkError::Precondition(
+            "prompt scoring benchmark input changed between replays".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_stable_addresses(
+    generator: &ResidentMtpBatchGenerator,
+    expected: &[usize],
+) -> Result<(), DeviceBenchmarkError> {
+    if generator.qualification_addresses()? != expected {
+        return Err(DeviceBenchmarkError::Precondition(
+            "prompt scoring owner addresses changed after setup".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn run_completion_fallback(
@@ -549,5 +804,53 @@ mod tests {
         }
         assert!(super::selected_batches(Some(0)).is_err());
         assert!(super::selected_batches(Some(9)).is_err());
+    }
+
+    #[test]
+    fn resident_mtp_batch_suite_prompt_scoring_benchmark_accounting_is_exact() {
+        use crate::device_benchmark::{BenchmarkWorkload, DeviceBenchmarkOptions};
+
+        let options = DeviceBenchmarkOptions::prompt_scoring();
+        assert_eq!(
+            (
+                options.samples,
+                options.launches_per_sample,
+                options.warmup_launches,
+                options.batch_size,
+            ),
+            (9, 1, 1, Some(super::SCORING_BATCH))
+        );
+        let workload = BenchmarkWorkload::warm_model_prompt_scoring(super::SCORING_BATCH, 96);
+        assert_eq!(workload.batch_size, Some(4));
+        assert_eq!(workload.active_tokens, Some(384));
+        assert_eq!(workload.prompt_tokens, Some(96));
+        assert_eq!(workload.output_tokens, Some(4));
+        assert_ne!(
+            super::SHARED_SCORING_METRIC,
+            super::INDEPENDENT_SCORING_METRIC
+        );
+    }
+
+    #[test]
+    fn resident_mtp_batch_suite_prompt_scoring_shape_requires_one_distinct_choice_token() {
+        let valid = vec![
+            vec![10, 11, 20],
+            vec![10, 11, 21],
+            vec![10, 11, 22],
+            vec![10, 11, 23],
+        ];
+        assert_eq!(super::scoring_prompt_shape(&valid).unwrap(), (3, 2));
+
+        let mut duplicate = valid.clone();
+        duplicate[3][2] = 22;
+        assert!(super::scoring_prompt_shape(&duplicate).is_err());
+
+        let mut short_prefix = valid.clone();
+        short_prefix[3][1] = 12;
+        assert!(super::scoring_prompt_shape(&short_prefix).is_err());
+
+        let mut unequal = valid;
+        unequal[3].push(24);
+        assert!(super::scoring_prompt_shape(&unequal).is_err());
     }
 }

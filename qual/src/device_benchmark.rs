@@ -112,6 +112,19 @@ impl DeviceBenchmarkOptions {
             adaptive_repeats: None,
         }
     }
+
+    /// Defaults for a seconds-scale resident scoring request.
+    pub const fn prompt_scoring() -> Self {
+        Self {
+            samples: 9,
+            launches_per_sample: 1,
+            warmup_launches: 1,
+            batch_size: Some(4),
+            energy_seconds: None,
+            cells: None,
+            adaptive_repeats: None,
+        }
+    }
 }
 
 impl Default for DeviceBenchmarkOptions {
@@ -491,6 +504,22 @@ impl BenchmarkWorkload {
             prompt_tokens: None,
             context_tokens: Some(context_tokens),
             output_tokens: Some(active_tokens),
+            device_cache: DeviceCacheRegime::Warm,
+            prefix_cache: None,
+            execution: BenchmarkExecution::HostSynchronized,
+        }
+    }
+
+    pub(crate) fn warm_model_prompt_scoring(batch_size: u32, prompt_tokens: u64) -> Self {
+        Self {
+            scope: BenchmarkScope::Model,
+            phase: BenchmarkPhase::Request,
+            batch_size: Some(batch_size),
+            concurrency: None,
+            active_tokens: Some(prompt_tokens * u64::from(batch_size)),
+            prompt_tokens: Some(prompt_tokens),
+            context_tokens: Some(prompt_tokens),
+            output_tokens: Some(u64::from(batch_size)),
             device_cache: DeviceCacheRegime::Warm,
             prefix_cache: None,
             execution: BenchmarkExecution::HostSynchronized,

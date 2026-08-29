@@ -197,10 +197,7 @@ impl TextGenerator for ResidentMtpBatchGenerator {
     }
 
     fn score_prompts(&mut self, prompts: &[Vec<u32>]) -> Result<Vec<PromptLogprobs>, EngineError> {
-        prompts
-            .iter()
-            .map(|prompt| ResidentMtpBatchGenerator::score_prompt(self, prompt))
-            .collect()
+        ResidentMtpBatchGenerator::score_prompts(self, prompts)
     }
 }
 

@@ -49,6 +49,7 @@ const QWEN35_RESIDENT_MODEL_TEST_FILTER: &str = "qwen35_resident_model_suite_";
 const QWEN35_RESIDENT_MTP_TEST_FILTER: &str = "qwen35_resident_mtp_suite_";
 const QWEN35_MTP_GENERATION_TEST_FILTER: &str = "qwen35_mtp_generation_suite_";
 const QWEN35_MTP_BATCH_GENERATION_TEST_FILTER: &str = "qwen35_mtp_batch_generation_suite_";
+const RESIDENT_MTP_BATCH_TEST_FILTER: &str = "resident_mtp_batch_suite_";
 const QWEN36_MTP_LAYER_TEST_FILTER: &str = "qwen36_mtp_layer_suite_";
 const QWEN36_LONG_CONTEXT_KV_TEST_FILTER: &str = "qwen36_long_context_kv::tests";
 const STREAMING_WEIGHT_POOL_TEST_FILTER: &str = "streaming_weight_pool_suite_";
@@ -580,6 +581,7 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
     ("generation-mtp-greedy", RESIDENT_MTP_RESOURCE_BASELINES),
     ("generation-mtp-sampling", RESIDENT_MTP_RESOURCE_BASELINES),
     ("generation-mtp-batch", RESIDENT_MTP_RESOURCE_BASELINES),
+    ("prompt-scoring", RESIDENT_MTP_RESOURCE_BASELINES),
     (
         "qwen35-full-attention-layer",
         QWEN35_FULL_ATTENTION_LAYER_RESOURCE_BASELINES,
@@ -1543,6 +1545,7 @@ const SUBCOMMANDS: &[Subcommand] = &[
         bench_generation_mtp_sampling,
     ),
     forwarded("bench-generation-mtp-batch", bench_generation_mtp_batch),
+    forwarded("bench-prompt-scoring", bench_prompt_scoring),
     forwarded(
         "bench-qwen35-full-attention-layer",
         bench_qwen35_full_attention_layer,
@@ -3820,7 +3823,7 @@ fn qualify_generation_mtp_batch(
     };
     run_qualification_test(
         root,
-        "resident_mtp_batch_suite_",
+        RESIDENT_MTP_BATCH_TEST_FILTER,
         QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
@@ -4642,6 +4645,16 @@ fn bench_generation_mtp_batch(
         );
     }
     run_bench_device(root, "generation-mtp-batch", arguments)
+}
+
+fn bench_prompt_scoring(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    if arguments.is_empty() {
+        return Err("usage: cargo run -p xtask -- bench-prompt-scoring SNAPSHOT [options]".into());
+    }
+    run_bench_device(root, "prompt-scoring", arguments)
 }
 
 fn bench_qwen35_full_attention_layer(
@@ -15091,9 +15104,9 @@ mod tests {
         QWEN38_FLASH_NEXT_MTP_GENERATION_TEST_FILTER, QWEN38_FLASH_NEXT_MTP_ORACLE_TEST_FILTER,
         QWEN38_FLASH_NEXT_PLE_TEST_FILTER, QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER,
         QWEN38_FLASH_NEXT_PROMPT_PRIME_TEST_FILTER, QWEN38_FLASH_NEXT_QSA_LAYER_TEST_FILTER,
-        QWEN38_FLASH_NEXT_RESIDENT_MODEL_TEST_FILTER, SM120_DEVICE_CODEGEN_CRATES,
-        SM120_RESOURCE_BASELINES, STREAMING_WEIGHT_POOL_TEST_FILTER, SUBCOMMANDS,
-        bench_device_baselines, bench_device_command, concatenated_resource_baselines,
+        QWEN38_FLASH_NEXT_RESIDENT_MODEL_TEST_FILTER, RESIDENT_MTP_BATCH_TEST_FILTER,
+        SM120_DEVICE_CODEGEN_CRATES, SM120_RESOURCE_BASELINES, STREAMING_WEIGHT_POOL_TEST_FILTER,
+        SUBCOMMANDS, bench_device_baselines, bench_device_command, concatenated_resource_baselines,
         contains_immediate_operand, device_is_idle, dispatch, dispatch_probe, names_opcode,
         parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
         parse_performance_device_sample, parse_performance_iteration, parse_resources,
@@ -15283,6 +15296,19 @@ mod tests {
             assert!(
                 test.contains(QWEN38_FLASH_NEXT_PROMPT_PRIME_TEST_FILTER),
                 "prompt-prime filter does not select `{test}`"
+            );
+        }
+    }
+
+    #[test]
+    fn resident_mtp_batch_filter_selects_scoring_equality_and_benchmark_accounting() {
+        for test in [
+            "resident_mtp_batch_generation::tests::resident_mtp_batch_suite_shared_prefix_scoring_matches_independent_scoring",
+            "resident_mtp_batch_generation_benchmark::tests::resident_mtp_batch_suite_prompt_scoring_benchmark_accounting_is_exact",
+        ] {
+            assert!(
+                test.contains(RESIDENT_MTP_BATCH_TEST_FILTER),
+                "resident MTP batch filter does not select `{test}`"
             );
         }
     }
